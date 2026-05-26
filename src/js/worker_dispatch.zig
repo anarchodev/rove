@@ -2097,6 +2097,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     const sessions = server.request_out.column(h2.Session);
     const req_hdrs = server.request_out.column(h2.ReqHeaders);
     const req_bodies = server.request_out.column(h2.ReqBody);
+    // Phase 4 park-on-durability: surfaced on every iteration so
+    // we can detect resumes (entity returning from body_pending
+    // after `drainBodyPending` released it). The column slice is
+    // pinned to the snapshot above — `reg.move` mutates the
+    // underlying collection but the local slices stay valid for
+    // this dispatch tick.
+    const body_waits = server.request_out.column(worker_mod.BodyDurabilityWait);
 
     // Leader-only request handling. Followers serve no client traffic
     // — they just replicate the leader's raft entries. Any request
@@ -2170,7 +2177,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
 
     var processed: usize = 0;
 
-    for (entities, sids, sessions, req_hdrs, req_bodies) |ent, sid, sess, rh, req_body| {
+    for (entities, sids, sessions, req_hdrs, req_bodies, body_waits) |ent, sid, sess, rh, req_body, body_wait| {
         if (!is_leader) {
             try respb.setSimpleResponse(server, ent, sid, sess, 503, "not leader; retry against the cluster leader\n", allocator);
             processed += 1;
@@ -2406,27 +2413,54 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // BodyRef in Phase 3). Bodies-less requests skip the
         // append + the tape entry — channel is empty on the
         // wire (zero entries).
-        // §5 callback gate: when the request has a body, append it
-        // to the per-tenant BodyBuffer AND wait synchronously for
-        // the bytes to become durable in S3 before running the
-        // handler. The invariant: a handler may not read bytes
-        // that aren't in stable storage
-        // (`docs/readset-replication-plan.md` §5.1).
+        // §5 callback gate: when the request has a body, the
+        // handler may not run until the body is durable in S3
+        // (plan §5.1 invariant — no handler reads bytes that
+        // aren't in stable storage).
         //
-        // Performance: the flush call below is a synchronous S3
-        // PUT on the worker thread — ~5–50 ms typical. Every
-        // body-bearing request pays this cost; coalescing across
-        // multiple body-bearing requests in the same dispatch
-        // batch (plan §5.2 priority flush) is a follow-up
-        // optimization.
+        // Park-on-durability flow (slice 4-park-2 replaced the
+        // earlier sync-block):
+        //   1. Fresh dispatch with a non-empty body:
+        //      a. Append to per-tenant `BodyBuffer` → mint
+        //         `BodyRef`.
+        //      b. If the ref is already durable (rare race vs
+        //         the periodic flusher tick), fall through to
+        //         the normal dispatch path with the ref captured
+        //         into `readset.trigger_payload` inline.
+        //      c. Otherwise: `reg.set` the `BodyDurabilityWait`
+        //         component carrying the ref + tenant id,
+        //         `reg.move` the entity to `body_pending`,
+        //         signal `flusher_wake` to trigger a priority
+        //         flush (plan §5.2). Worker thread `continue`s
+        //         to the next entity — no S3 RTT on the dispatch
+        //         hot path. `drainBodyPending` releases the
+        //         entity on the next tick after the flush PUT
+        //         acks.
+        //   2. Resume from park: the entity arrives in
+        //      request_out carrying a non-sentinel
+        //      `BodyDurabilityWait`. Use the saved `body_ref`
+        //      directly — re-appending would mint a new batch
+        //      and require another park cycle.
         //
-        // Failure (S3 unavailable, append OOM): return 503
-        // immediately. The handler doesn't run, no readset is
-        // captured, the request is logged with `.fault`. Matches
-        // §6.2 partial-outage posture: fetch-using handlers are
-        // blocked when the backend can't accept new bytes.
+        // Failure (`getOrOpenTenantBodies` / `append` errors):
+        // return 503 with `.fault` outcome. Matches §6.2 partial-
+        // outage posture: fetch-using handlers are blocked when
+        // the backend can't accept new bytes.
+        const resumed_from_park = body_wait.body_ref.batch_id != bodies_mod.NO_BATCH;
         var body_gate_failed = false;
-        if (body.len > 0) {
+        if (resumed_from_park) {
+            // Resume — drainBodyPending verified durability before
+            // moving the entity back, so the saved body_ref is
+            // durable in S3 by construction. Skip the append +
+            // flush entirely; record the BodyRef on the readset
+            // so the raft entry carries it.
+            readset.trigger_payload.appendTriggerPayload(body_wait.body_ref, "") catch |err| {
+                std.log.warn(
+                    "rove-js inbound: readset.trigger_payload append (resume) tenant={s}: {s}",
+                    .{ scope_inst.id, @errorName(err) },
+                );
+            };
+        } else if (body.len > 0) {
             const tb = worker_mod.getOrOpenTenantBodies(worker, scope_inst) catch |err| blk: {
                 std.log.warn(
                     "rove-js inbound: getOrOpenTenantBodies tenant={s}: {s}",
@@ -2445,29 +2479,31 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     break :blk bodies_mod.BodyRef{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 0 };
                 };
                 if (!body_gate_failed) {
-                    // Synchronous flush — block the worker thread until
-                    // S3 acks the PUT. `flush` releases the buffer mutex
-                    // around the slow PUT (slice 2c-1's lock-release
-                    // pattern), so other workers / the flusher tick
-                    // aren't blocked. After this call returns,
-                    // `body_ref` is durable in S3 by construction
-                    // (the batch it lives in was just published).
-                    const flush_now_ns: i64 = @intCast(std.time.nanoTimestamp());
-                    _ = t.buffer.flush(t.backend.blobStore(), flush_now_ns) catch |err| blk2: {
-                        std.log.warn(
-                            "rove-js inbound: body-buffer flush tenant={s}: {s}",
-                            .{ scope_inst.id, @errorName(err) },
-                        );
-                        body_gate_failed = true;
-                        break :blk2 0;
-                    };
+                    if (t.buffer.isDurable(body_ref)) {
+                        // Rare: a flusher tick landed between
+                        // append and this check, so the batch
+                        // is already durable. Skip the park and
+                        // continue with normal dispatch.
+                        readset.trigger_payload.appendTriggerPayload(body_ref, "") catch |err| {
+                            std.log.warn(
+                                "rove-js inbound: readset.trigger_payload append (fast-durable) tenant={s}: {s}",
+                                .{ scope_inst.id, @errorName(err) },
+                            );
+                        };
+                    } else {
+                        // Park — set the wait component, move to
+                        // body_pending, signal the flusher for a
+                        // priority flush, advance to the next entity.
+                        try server.reg.set(ent, &server.request_out, worker_mod.BodyDurabilityWait, .{
+                            .body_ref = body_ref,
+                            .tenant_id = scope_inst.id,
+                        });
+                        try server.reg.move(ent, &server.request_out, &worker.body_pending);
+                        worker.flusher_wake.set();
+                        processed += 1;
+                        continue;
+                    }
                 }
-                readset.trigger_payload.appendTriggerPayload(body_ref, "") catch |err| {
-                    std.log.warn(
-                        "rove-js inbound: readset.trigger_payload append tenant={s}: {s}",
-                        .{ scope_inst.id, @errorName(err) },
-                    );
-                };
             }
         }
         if (body_gate_failed) {
