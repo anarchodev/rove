@@ -55,6 +55,7 @@
 
 const std = @import("std");
 const kv = @import("rove-kv");
+const tape_mod = @import("rove-tape");
 const panic_mod = @import("panic.zig");
 const deployment_loader_mod = @import("deployment_loader.zig");
 const worker_mod = @import("worker.zig");
@@ -105,14 +106,72 @@ pub const EnvelopeType = enum(u8) {
     //            SendDispatch kernel either (PR-3 deleted it).
 };
 
-/// Build a writeset envelope. `id_len` and `id` plus a leading type=0
-/// byte; payload is the writeset bytes.
+/// Type-0 envelope payload layout
+/// (`docs/readset-replication-plan.md` Phase 3). The original layout
+/// was just the writeset bytes; the extended layout interleaves the
+/// writeset with the request's serialized readset so the tape can
+/// be reconstructed on any follower that ever applies this entry.
+///
+/// Wire format:
+///   `[u32 LE ws_len][ws_bytes][u32 LE rs_len][rs_bytes]`
+///
+/// `rs_len == 0` is valid + frequent — non-handler producers (ACME,
+/// background trampolines) and the secondary inner envelopes of a
+/// batched propose carry an empty readset section. The anchor
+/// envelope in a batch carries the dispatch's readset; targets and
+/// root_writeset in the same batch carry empty (the readset is
+/// per-dispatch, not per-envelope).
+pub const WriteSetPayload = struct {
+    /// Borrowed slice into the input payload — the writeset bytes.
+    ws_bytes: []const u8,
+    /// Borrowed slice into the input payload — the readset bytes
+    /// (empty for non-handler producers). When non-empty, the bytes
+    /// are a `tape_mod.Readset.serialize` blob; `tape_mod.parseReadset`
+    /// validates the shape.
+    rs_bytes: []const u8,
+};
+
+pub fn decodeWriteSetPayload(payload: []const u8) Error!WriteSetPayload {
+    if (payload.len < 4) return Error.Truncated;
+    const ws_len = std.mem.readInt(u32, payload[0..4], .little);
+    if (payload.len < 4 + ws_len + 4) return Error.Truncated;
+    const ws_bytes = payload[4 .. 4 + ws_len];
+    const rs_len = std.mem.readInt(u32, payload[4 + ws_len ..][0..4], .little);
+    const rs_start: usize = 4 + ws_len + 4;
+    if (payload.len != rs_start + rs_len) return Error.Truncated;
+    return .{
+        .ws_bytes = ws_bytes,
+        .rs_bytes = payload[rs_start .. rs_start + rs_len],
+    };
+}
+
+pub fn encodeWriteSetPayload(
+    allocator: std.mem.Allocator,
+    ws_bytes: []const u8,
+    rs_bytes: []const u8,
+) ![]u8 {
+    const total = 4 + ws_bytes.len + 4 + rs_bytes.len;
+    const out = try allocator.alloc(u8, total);
+    std.mem.writeInt(u32, out[0..4], @intCast(ws_bytes.len), .little);
+    @memcpy(out[4..][0..ws_bytes.len], ws_bytes);
+    std.mem.writeInt(u32, out[4 + ws_bytes.len ..][0..4], @intCast(rs_bytes.len), .little);
+    @memcpy(out[4 + ws_bytes.len + 4 ..][0..rs_bytes.len], rs_bytes);
+    return out;
+}
+
+/// Build a type-0 writeset envelope. `id_len` and `id` plus a leading
+/// type=0 byte; payload is `encodeWriteSetPayload(ws_bytes, rs_bytes)`.
+/// Pass `rs_bytes == ""` for non-handler producers (ACME, secondary
+/// inner envelopes of a batched propose).
 pub fn encodeWriteSetEnvelope(
     allocator: std.mem.Allocator,
     id: []const u8,
     ws_bytes: []const u8,
+    rs_bytes: []const u8,
 ) ![]u8 {
-    return encodeTyped(allocator, .writeset, id, ws_bytes);
+    const payload = try encodeWriteSetPayload(allocator, ws_bytes, rs_bytes);
+    defer allocator.free(payload);
+    return encodeTyped(allocator, .writeset, id, payload);
 }
 
 /// Build a root writeset envelope. type=2, no per-tenant id (id_len=0).
@@ -120,6 +179,13 @@ pub fn encodeWriteSetEnvelope(
 /// that update platform-level tables (tenant registry, domain
 /// mappings) — signup's `tenant.createInstance` and the admin JS
 /// handler's `platform.root.set/delete` collect their ops here.
+///
+/// Type 2 stays writeset-only — its producers include non-handler
+/// flows (ACME cert renewal in `acme.zig`) that have no readset to
+/// attach. The handler-originated producers (signup, admin
+/// `platform.root.*`) ride alongside type-0 envelopes in a batched
+/// propose, and the readset lives on the anchor type-0 of the same
+/// batch — same dispatch, same readset.
 pub fn encodeRootWriteSetEnvelope(
     allocator: std.mem.Allocator,
     ws_bytes: []const u8,
@@ -307,7 +373,26 @@ pub fn applyWriteSet(
         else => return kv.ClusterApplyError.Sqlite,
     };
 
-    kv.applyEncodedWriteSet(store, 0, env.payload) catch |err| panic_mod.invariantViolated(
+    // Phase 3 (`docs/readset-replication-plan.md`): the type-0
+    // payload now carries `[u32 ws_len][ws][u32 rs_len][rs]`. Extract
+    // the writeset half + validate the readset half's shape. Phase 5
+    // will materialize tapes from `payload.rs_bytes` for follower
+    // tape upload; for now followers just verify the wire shape and
+    // discard.
+    const payload = decodeWriteSetPayload(env.payload) catch |err| panic_mod.invariantViolated(
+        "applyWriteSet.decodeWriteSetPayload",
+        "tenant={s} err={s}",
+        .{ env.id, @errorName(err) },
+    );
+    if (payload.rs_bytes.len > 0) {
+        _ = tape_mod.parseReadset(payload.rs_bytes) catch |err| panic_mod.invariantViolated(
+            "applyWriteSet.parseReadset",
+            "tenant={s} rs_len={d} err={s}",
+            .{ env.id, payload.rs_bytes.len, @errorName(err) },
+        );
+    }
+
+    kv.applyEncodedWriteSet(store, 0, payload.ws_bytes) catch |err| panic_mod.invariantViolated(
         "applyWriteSet.applyEncodedWriteSet",
         "tenant={s} err={s}",
         .{ env.id, @errorName(err) },
@@ -331,7 +416,7 @@ pub fn applyWriteSet(
     // `sweepOwedRetriesOnPromotion` running on the new leader.
 
     if (ctx.deployment_loader) |loader| {
-        if (kv.scanWriteSetPutValue(env.payload, "_deploy/current")) |hex_bytes| {
+        if (kv.scanWriteSetPutValue(payload.ws_bytes, "_deploy/current")) |hex_bytes| {
             const dep_id = std.fmt.parseInt(u64, hex_bytes, 16) catch return;
             loader.enqueue(env.id, dep_id) catch |err| std.log.warn(
                 "applyWriteSet: deployment loader enqueue {s}/{d} failed: {s}",
@@ -361,7 +446,7 @@ pub fn applyWriteSet(
     if (ctx.node_state) |opaque_node| {
         var ops: std.ArrayListUnmanaged(kv.WriteSetOp) = .empty;
         defer ops.deinit(ctx.allocator);
-        kv.decodeWriteSetOps(env.payload, ctx.allocator, &ops) catch |derr| {
+        kv.decodeWriteSetOps(payload.ws_bytes, ctx.allocator, &ops) catch |derr| {
             std.log.warn(
                 "applyWriteSet: kv-wake decode tenant={s}: {s}; skipping wake fan-out",
                 .{ env.id, @errorName(derr) },
@@ -423,16 +508,32 @@ pub fn applyRootWriteSet(
 
 const testing = std.testing;
 
-test "writeset envelope encode/decode round trip" {
+test "writeset envelope encode/decode round trip (empty readset)" {
     const id = "acme";
     const ws = "ws bytes here";
-    const enc = try encodeWriteSetEnvelope(testing.allocator, id, ws);
+    const enc = try encodeWriteSetEnvelope(testing.allocator, id, ws, "");
     defer testing.allocator.free(enc);
 
     const dec = try decodeEnvelope(enc);
     try testing.expectEqual(EnvelopeType.writeset, dec.type);
     try testing.expectEqualStrings(id, dec.instance_id);
-    try testing.expectEqualStrings(ws, dec.payload);
+
+    const payload = try decodeWriteSetPayload(dec.payload);
+    try testing.expectEqualStrings(ws, payload.ws_bytes);
+    try testing.expectEqual(@as(usize, 0), payload.rs_bytes.len);
+}
+
+test "writeset envelope encode/decode round trip (with readset)" {
+    const id = "acme";
+    const ws = "ws bytes here";
+    const rs = "fake readset blob";
+    const enc = try encodeWriteSetEnvelope(testing.allocator, id, ws, rs);
+    defer testing.allocator.free(enc);
+
+    const dec = try decodeEnvelope(enc);
+    const payload = try decodeWriteSetPayload(dec.payload);
+    try testing.expectEqualStrings(ws, payload.ws_bytes);
+    try testing.expectEqualStrings(rs, payload.rs_bytes);
 }
 
 test "root writeset envelope encode/decode round trip" {
@@ -464,18 +565,22 @@ test "decodeEnvelope rejects unknown type" {
     );
 }
 
-test "decodeEnvelope handles empty payload" {
-    const enc = try encodeWriteSetEnvelope(testing.allocator, "x", "");
+test "decodeEnvelope handles empty payload (empty ws + empty rs)" {
+    const enc = try encodeWriteSetEnvelope(testing.allocator, "x", "", "");
     defer testing.allocator.free(enc);
     const dec = try decodeEnvelope(enc);
     try testing.expectEqual(EnvelopeType.writeset, dec.type);
     try testing.expectEqualStrings("x", dec.instance_id);
-    try testing.expectEqualStrings("", dec.payload);
+    // payload is now `[u32 ws_len=0][u32 rs_len=0]` = 8 bytes.
+    try testing.expectEqual(@as(usize, 8), dec.payload.len);
+    const p = try decodeWriteSetPayload(dec.payload);
+    try testing.expectEqual(@as(usize, 0), p.ws_bytes.len);
+    try testing.expectEqual(@as(usize, 0), p.rs_bytes.len);
 }
 
 test "multi envelope wraps + unwraps several inner envelopes" {
     const a = testing.allocator;
-    const inner_ws = try encodeWriteSetEnvelope(a, "acme", "ws bytes");
+    const inner_ws = try encodeWriteSetEnvelope(a, "acme", "ws bytes", "");
     defer a.free(inner_ws);
     const inner_root = try encodeRootWriteSetEnvelope(a, "root bytes");
     defer a.free(inner_root);
@@ -494,7 +599,9 @@ test "multi envelope wraps + unwraps several inner envelopes" {
     const e0 = try decodeEnvelope(inner[0]);
     try testing.expectEqual(EnvelopeType.writeset, e0.type);
     try testing.expectEqualStrings("acme", e0.instance_id);
-    try testing.expectEqualStrings("ws bytes", e0.payload);
+    const p0 = try decodeWriteSetPayload(e0.payload);
+    try testing.expectEqualStrings("ws bytes", p0.ws_bytes);
+    try testing.expectEqual(@as(usize, 0), p0.rs_bytes.len);
 
     const e1 = try decodeEnvelope(inner[1]);
     try testing.expectEqual(EnvelopeType.root_writeset, e1.type);

@@ -2869,10 +2869,14 @@ fn mirrorDeployConfig(
         return; // no `_config/*` churn → don't burn a raft entry
     }
     try txn.commit();
+    // config-mirror is a non-handler producer (cold-start /
+    // deployment-loader thread); no dispatched-handler readset to
+    // attach.
     if (raft_propose.proposeWriteSet(
         .{ .allocator = allocator, .raft = raft },
         &ws,
         slot.instance_id,
+        "",
     )) |_| {} else |err| {
         // Local commit is already durable on the leader; followers
         // re-derive on their next reload. Log, don't fail the deploy.
