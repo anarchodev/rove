@@ -381,7 +381,7 @@ A dedicated `batch.*` primitive (background drainer, progress tracking, cascade-
 
 > **Current shape (2026-05-24, post durability-as-JS-shim).** The
 > platform's only native outbound primitive is `http.fetch` (transient,
-> non-durable; `docs/upstream-streaming-plan.md`). `webhook.send` and
+> non-durable; `docs/streaming-model.md` §4 + §4.A). `webhook.send` and
 > `email.send` are pure-JS libraries that compose durability on top:
 > `src/js/bindings/webhook.send.js` writes a `_send/owed/{id}` marker
 > atomic with the handler's writeset (envelope-0), then drives the
@@ -1724,7 +1724,7 @@ What lives where, after Phase 5.5:
 
 Native bindings (Zig → QJS):
 
-- **Outbound HTTP**: `http.fetch(opts)` — the only native outbound primitive (`docs/upstream-streaming-plan.md`). Durable variants (`webhook.send` / `email.send`) are JS shims (`src/js/bindings/webhook.send.js` etc.) composing on `http.fetch` + `kv.set("_send/owed/{id}", ...)` markers.
+- **Outbound HTTP**: `http.fetch(opts)` — the only native outbound primitive (`docs/streaming-model.md` §4 + §4.A). Durable variants (`webhook.send` / `email.send`) are JS shims (`src/js/bindings/webhook.send.js` etc.) composing on `http.fetch` + `kv.set("_send/owed/{id}", ...)` markers.
 - **kv**: `kv.get`, `kv.set`, `kv.delete`, `kv.prefix(prefix, cursor, limit)`.
 - **streaming**: `__rove_stream({status?, headers?, write?, waitFor?, ctx?})` — iterative streaming handler return (streaming-handlers-plan §3.3). Replaced the retired `events.emit` global as the platform's live-push primitive. Customer SSE composes on top.
 - **crypto**: `crypto.getRandomValues`, `crypto.randomUUID`, `crypto.randomBytes`, `crypto.sha256`, `crypto.hmacSha1` / `hmacSha256`, `crypto.verifyRsa` (RS256/RS384/RS512), `crypto.verifyEcdsa` (ES256/ES384/ES512 — for Sign in with Apple), `crypto.timingSafeEqual`.

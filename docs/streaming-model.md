@@ -1,11 +1,11 @@
 # The streaming model — the chain processes streams
 
-**Status:** Model. Supersedes `inbound-streaming-plan.md`; reframes
-`upstream-streaming-plan.md` (Gap 2.3, shipped) and the §2.3/§2.4/
-§2.5 framing of `primitive-gaps.md`. No behaviour change to
-anything already shipped — this is a re-derivation that makes the
-existing surface a set of cases under one model, plus the design
-for what's left.
+**Status:** Canonical streaming reference (model + as-built). Hosts
+the design for both directions. Inbound (§3): design locked,
+implementation pending (gap 2.4). Outbound (§4 + §4.A): shipped
+2026-05-21 as `http.fetch` (gap 2.3); §4.A absorbs the former
+`upstream-streaming-plan.md` as the as-built option-set + Msg shape +
+caps reference. Gap 2.5 (`http.subscribe`) shipped 2026-05-24 — see §6.
 
 ---
 
@@ -201,14 +201,93 @@ export default function () {
   tapes nothing — `project_pipe_to_untaped`). It is not a separate
   concept; it is the degenerate transform of §4's first example.
 
-The durable-vs-transient axis (`http.send` vs `http.fetch`) is
+The durable-vs-transient axis (`webhook.send` vs `http.fetch`) is
 **orthogonal** to the coalesce axis. The model does not force those
 two to merge; it observes they sit on one matrix:
 
 |              | coalesced result | streamed result |
 |--------------|------------------|-----------------|
-| **durable**  | `http.send` + `send_callback` | — |
-| **transient**| `http.fetch` (coalesced) | `http.fetch` (`bind`/`on_chunk`/`pipe_to`) |
+| **durable**  | `webhook.send` + `send_callback` (JS shim over `http.fetch` + kv markers) | — |
+| **transient**| `http.fetch` (coalesced) | `http.fetch` (`on_chunk` / `pipe_to`) |
+
+### 4.A `http.fetch` — the as-built reference
+
+Shipped 2026-05-21. Customer-facing surface for outbound HTTP.
+Transient + best-effort: no `_send/owed/<id>` row, no retry on
+worker crash, fires immediately. The durable composition
+(`webhook.send`, `email.send`) is a JS shim that layers a
+`_send/owed/{id}` marker, retry, and on_result chain hop on top of
+`http.fetch` — see `effect-reification-plan.md` Phase 5.
+
+**Option set** (`http.fetch(opts) → fetch_id`):
+
+```jsonc
+{
+  url, method, headers, body, timeout_ms,
+  on_chunk: "module/path.mjs",            // Pattern A: fires fetch_chunk per chunk
+  on_done:  "module/path.mjs",            // both patterns: fires fetch_done / fetch_pipe_done terminal
+  pipe_to:  "held_response" | null,       // Pattern B: bypasses handler, pipes upstream → held client
+  headers_passthrough: false,             // pipe_to + this = upstream headers → response headers
+  max_response_chunk_bytes: 64*1024,      // per-chunk cap; libcurl writeback chunks past this split
+  max_total_response_bytes: 50*1024*1024, // overall cap; cancels the fetch on exceed
+  ctx: {...},                             // threaded forward to each activation as request.ctx
+}
+```
+
+`on_chunk` and `pipe_to` are mutually exclusive — combining them
+errors at the binding. Setting `pipe_to` without a held client (no
+held entity to write to) also errors. Returns a `fetch_id` for
+`http.cancelFetch({id})`.
+
+**Activation Msg shape:**
+
+- **`fetch_chunk`** — `{ fetch_id, seq, byte_offset, bytes, ctx,
+  fetch_headers? }`. `bytes` is a `Uint8Array` view; runtime owns
+  the buffer; handler must copy to retain past return.
+  `fetch_headers` (status + flat header object) on `seq == 0` only.
+- **`fetch_done`** — `{ fetch_id, ok, status, trailers, ctx }`.
+  Pattern A terminal; no `body` (the body arrived in chunks).
+- **`fetch_pipe_done`** — `{ fetch_id, ok, status, bytes_piped,
+  dropped_chunks }`. Pattern B terminal (handler isn't invoked
+  per-chunk in this path); see `project_pipe_to_untaped`.
+
+**Cancellation:**
+
+- `http.cancelFetch({id})` — cooperative; cancels the libcurl
+  handle, fires the terminal activation with `ok: false`.
+- `max_total_response_bytes` exceeded — auto-cancels.
+- Held entity (pipe target) disconnected — auto-cancels; pipe
+  terminates silently, `fetch_pipe_done` fires with `ok: false`.
+
+**Backpressure:**
+
+- `StreamChunks` cap on the held entity (Gap 2.2). The `pipe_to`
+  path drives chunks into this same queue; overflow drops + counts
+  via `dropped_chunks` on `fetch_pipe_done`.
+- `max_response_chunk_bytes` re-chunks libcurl writeback (no drop —
+  just smaller activations); `max_total_response_bytes` cancels.
+- The per-worker `fetch_chunk_inbox` has its own soft cap;
+  overflow drops oldest with a `dropped_chunks` counter on the
+  chain.
+
+**Out of scope (v1):**
+
+- **Backpressure to upstream (TCP-level).** v1 buffers in-flight
+  chunks at the inbox; doesn't pace libcurl reads. Pace-back via
+  `CURLOPT_READFUNCTION` returning `CURL_READFUNC_PAUSE` is a
+  follow-up if real customer pull appears.
+- **Bidirectional streaming** (handler sends body chunks AND
+  receives response chunks) — requires inbound streaming (§3) +
+  outbound streaming together + a different binding shape.
+- **Multiplexed sends** (one handler tracking N concurrent
+  streaming sends with cross-send coordination) — the shape allows
+  it (each send has its own `fetch_id`), the ergonomics aren't
+  specified.
+
+Implementation lives in `src/js/fetch_pool.zig` (libcurl writeback +
+re-chunking), `src/js/worker.zig` (`fireFetchEventActivation`),
+`src/js/bindings/http.zig` (the binding). See
+`project_gap_2_3_http_fetch` for the shipped-state narrative.
 
 ---
 
