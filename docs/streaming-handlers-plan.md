@@ -460,8 +460,8 @@ against its recorded kv reads).
 
 The same primitive shape covers other long-poll / streaming patterns:
 - WebSocket-shaped handlers, modulo the deferred-to-v2 WS transport
-  (`connection-actor-plan.md` §6.3 / §10.2 — this plan does not change
-  that deferral; when WS lands, it rides this).
+  (see [`docs/websocket-plan.md`](websocket-plan.md) — this plan does
+  not change that deferral; when WS lands, it rides this).
 - Long-poll endpoints (a degenerate single-wake `__rove_stream`).
 - The atproto firehose *consumer* (§6.5 — a different connection-actor
   projection; uses the same trigger registry).
@@ -948,10 +948,9 @@ in the diff; no `sse_server`/`events.emit` references remain in
 
 ## 13. Out of scope (explicitly)
 
-- **WebSocket transport (§6.3 / connection-actor-plan §10.2).** When
-  WS transport finally lands, WS-shaped handlers ride this plan's
-  primitives. WS *transport* (RFC 6455 / 8441 / Cloudflare-downgrade
-  stack) stays the deferred-to-v2 cost PLAN already documents.
+- **WebSocket transport.** WS-shaped handlers will ride this plan's
+  primitives when transport lands. Transport plan: see
+  [`docs/websocket-plan.md`](websocket-plan.md).
 - **Durable SSE / `_events/`-style platform replay log (§10.1).**
   Rejected, stays rejected. Customers who want replay write events
   to their own kv (worked example §7 — "initial snapshot from

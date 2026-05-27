@@ -656,11 +656,11 @@ Revised 2026-05-22 in light of two prior decisions:
     `leader_failover` / `files_server` / `http_send` (the
     pre-existing `wb/last_tag` stale check is unrelated).
 - **Phase 4.1.4 — `conn_write` Cmd: deferred to inbound-WS.**
-  Add the variant when the inbound-WS producer ships (separate
-  plan). Don't park the typed slot in advance — the
-  `respond_deferred` failure mode the 2026-05-24
-  audit-for-half-done-refactors pass ruled out applies here too:
-  union arms without producers are Option-1 scaffolding.
+  Add the variant when the inbound-WS producer ships
+  ([`docs/websocket-plan.md`](websocket-plan.md)). Don't park the
+  typed slot in advance — the `respond_deferred` failure mode the
+  2026-05-24 audit-for-half-done-refactors pass ruled out applies
+  here too: union arms without producers are Option-1 scaffolding.
 - **Gate**: streaming smokes (for 4.0's pre-commit decision);
   `http_send` smokes + streaming smokes (for 4.1.2);
   full smoke set + new fault-injection gate (for 4.1.3).

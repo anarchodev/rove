@@ -621,7 +621,8 @@ auto-reconnect with `Last-Event-ID` resume built in. WebSockets and
 HTTP/2 don't compose cleanly (RFC 6455 is HTTP/1.1 `Upgrade:`, RFC 8441
 extended-CONNECT bridge isn't supported through Cloudflare). A parallel
 h1 stack would add several thousand LOC and a two-stack maintenance
-burden. WS stays in §4 deferred-to-v2.
+burden. WS stays in §4 deferred-to-v2 — consolidated WS plan at
+[`docs/websocket-plan.md`](websocket-plan.md).
 
 **Surviving locked decisions.** Carry into streaming-handlers §10.3:
 notification ≠ state store; ephemeral with no platform-managed durable

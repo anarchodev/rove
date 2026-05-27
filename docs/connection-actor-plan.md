@@ -238,11 +238,11 @@ on a shared connection-holder is an explicitly deferred, separate question
 
 The complete primitive: inbound frontier + pended frames + wakes. Chat,
 presence, collaborative editing. Large binary frames take the §8
-content-addressed path. **The WebSocket *transport* remains the
-deferred-to-v2 cost PLAN documents** (§10.2) — this projection specifies the
-*execution/determinism model* WS rides *when* that transport lands; it does
-not make the RFC 6455 / RFC 8441 / Cloudflare-downgrade / parallel-HTTP/1.1
-problem cheaper.
+content-addressed path. **See [`docs/websocket-plan.md`](websocket-plan.md)
+for transport choices + sequencing.** The connection-actor projection
+specified here is the execution/determinism model WS rides when
+transport lands; the v2 transport-stack cost (RFC 6455 / RFC 8441 /
+Cloudflare-downgrade / parallel-HTTP/1.1) lives in that plan.
 
 ### 6.4 Held-synchronous third-party call (parked one-shot HTTP)
 
@@ -360,21 +360,17 @@ app.db to refetch from — not "SSE made durable". The §7 rejection's own thesi
 (notification ≠ state store; refetch beats replay) is the argument for keeping
 them separate primitives, which this doc does.
 
-### 10.2 WebSockets (deferred-to-v2) — transport cost unchanged
+### 10.2 WebSockets (deferred-to-v2) — see websocket-plan.md
 
-PLAN "Why SSE not WebSockets" defers WS to v2 on a transport-stack rationale
-(RFC 6455 is HTTP/1.1 `Upgrade`, forbidden in h2; RFC 8441 extended CONNECT;
-Cloudflare downgrades WS to HTTP/1.1 to origin; a parallel HTTP/1.1 server
-stack — several thousand LOC, two-stack maintenance). **This doc does not
-contradict that.** The connection-actor is the *execution and determinism
-model*, not a transport. It delivers value *now* through projections that need
-no WS transport at all — SSE (§6.2, already shipped), held-synchronous calls
-(§6.4, plain HTTP), and the firehose backing (§6.5). The "new information"
-relative to §7 is not "WS is now cheap" — it is "there is a unifying
-execution primitive under which the non-WS projections pay off immediately and
-WS slots in at the already-understood v2 transport cost rather than inventing
-its own model." When WS transport is built, it rides this; until then, it does
-not block anything here.
+PLAN "Why SSE not WebSockets" defers WS on a transport-stack rationale;
+the consolidated WS plan now lives at
+[`docs/websocket-plan.md`](websocket-plan.md) (transport choices for
+both directions + sequencing + use cases). The connection-actor is the
+*execution and determinism model*, not a transport — it delivers value
+*now* through projections that need no WS transport at all (SSE, the
+held-synchronous calls of §6.4, the firehose backing of §6.5 modulo
+WS framing). When WS transport ships, it rides this primitive
+unchanged.
 
 ### 10.3 "External result inline is impossible" (Cmd bet) — preserved verbatim internally
 
