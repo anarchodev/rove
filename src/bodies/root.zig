@@ -58,9 +58,15 @@ const blob_mod = @import("rove-blob");
 /// batch ids start at 1.
 pub const NO_BATCH: u64 = 0;
 
-/// Default size threshold (1 MB) — per
-/// `docs/readset-replication-plan.md` §4.3.
-pub const DEFAULT_FLUSH_SIZE_BYTES: usize = 1 * 1024 * 1024;
+/// Default size threshold (4 MB) — per
+/// `docs/readset-replication-plan.md` §4.3. Originally 1 MB; bumped
+/// after the OVH S3 throughput sweep (see
+/// [[project-s3-throughput-ceiling]]) showed K=8 PUTs at 1 MB hit
+/// only 29% of wire while K=8 at 4 MB hit 88%. Time threshold stays
+/// at 100 ms so parked-request p99 latency is unchanged; only hot
+/// tenants (>40 MB/s of body bytes) see the bigger batches, exactly
+/// the workload the size-trigger exists for.
+pub const DEFAULT_FLUSH_SIZE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Default time threshold (100 ms in nanoseconds) — per §4.3.
 pub const DEFAULT_FLUSH_INTERVAL_NS: i64 = 100 * std.time.ns_per_ms;
@@ -270,7 +276,17 @@ pub const BodyBuffer = struct {
 
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.last_flushed_batch_id = flushed_id;
+        // Max-only: today's flusher serializes per-buffer (one
+        // submitAndWait at a time), so flushed_id is always greater
+        // than the previous one. But the field is the durability
+        // predicate (`ref.batch_id <= last_flushed_batch_id`) and a
+        // future change that overlaps two flushes on the same buffer
+        // would let an out-of-order completion regress this and brick
+        // an already-acked BodyRef. Defending now is cheaper than
+        // debugging later.
+        if (flushed_id > self.last_flushed_batch_id) {
+            self.last_flushed_batch_id = flushed_id;
+        }
         self.last_flush_ns = now_ns;
         return flushed_id;
     }

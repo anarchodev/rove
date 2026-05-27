@@ -2158,6 +2158,15 @@ pub fn Worker(comptime opts: Options) type {
         flusher_should_stop: std.atomic.Value(bool) = .init(false),
         flusher_wake: std.Thread.ResetEvent = .{},
 
+        /// Per-worker thread pool that runs body-buffer S3 PUTs in
+        /// parallel across tenants ready to flush. The flusher_thread
+        /// submits the per-tick batch via `submitAndWait`. Sized at
+        /// `ROVE_BODY_FLUSH_POOL_SIZE` (default 4); 8 workers × 4 = K=32
+        /// matches the OVH wire-saturation knee at 4 MB batches per the
+        /// throughput sweep. `null` only during early init or test
+        /// fixtures (flushBodiesTick has a serial fallback).
+        body_flush_pool: ?*worker_bodies.BodyFlushPool = null,
+
         /// Async batched log-server push. Flushers append the S3 batch
         /// key they just PUT to `push_queue`; the `push_thread` drains
         /// the queue and POSTs all queued keys as one body to
@@ -2299,6 +2308,15 @@ pub fn Worker(comptime opts: Options) type {
                 try self.tenant_logs.put(allocator, try TenantLog.open(self, inst));
             }
 
+            // Body-flush pool must exist before the flusher_thread
+            // starts (its first tick may submit work). errdefer not
+            // needed: any failure after this point is unwound by the
+            // explicit teardown in `destroy`, which checks for null.
+            self.body_flush_pool = try worker_bodies.BodyFlushPool.init(
+                allocator,
+                worker_bodies.poolSizeFromEnv(),
+            );
+
             self.flusher_thread = try std.Thread.spawn(.{}, flusherLoop, .{self});
 
             // Spawn the push thread only if a libcurl handle was
@@ -2383,6 +2401,14 @@ pub fn Worker(comptime opts: Options) type {
                 self.flusher_wake.set();
                 t.join();
                 self.flusher_thread = null;
+            }
+            // Tear down the body-flush pool AFTER the flusher_thread
+            // is joined: the flusher is the pool's only submitter, so
+            // stopping it first guarantees no in-flight submitAndWait
+            // when we shut the pool down.
+            if (self.body_flush_pool) |pool| {
+                pool.deinit();
+                self.body_flush_pool = null;
             }
             // Stop the push thread AFTER the flusher: the flusher
             // enqueues to push_queue, so stopping push first would
