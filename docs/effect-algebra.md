@@ -194,24 +194,13 @@ findings rather than excusing them:
   path (pattern-match the shim, dispatch native) is a post-launch
   optimization that does not change the customer-facing API.
   See `effect-reification-plan.md` Phase 5 for the migration steps.
-- **`blob.put` / `blob.get` are JS shims, not Cmd primitives.**
-  Earlier drafts of `effect-reification-plan.md` Phase 7 specced
-  `blob.put` as a Zig `Cmd.blob_put` variant; revised 2026-05-25
-  to the shim form per the same composition discipline as
-  `webhook.send`. The shape: customer-facing `blob.put(hash, bytes)`
-  resolves via a callback Msg (transport is `http.fetch` PUT to the
-  configured BlobBackend's URL); a `_blob/owed/{hash}` marker rides
-  the activation's writeset for durability. The marker cannot carry
-  the bytes (potentially many MB), so recovery uses re-execution —
-  retry-cron / boot-sub finds the marker, re-runs the source
-  activation against its recorded readset (§2.5), extracts the
-  bytes from the matching `blob.put` call by index, and re-issues
-  the PUT (idempotent via content-addressing). `blob.get` is even
-  simpler — a direct `http.fetch(blob_url(hash))` with no marker
-  (failed read = client retries). Full recovery semantics depend on
-  `readset-replication-plan.md` shipping; until then, `blob.put`
-  degrades to at-most-once with transient retry, matching the
-  pre-revision Cmd-primitive's semantics.
+- **`blob.put` / `blob.get` deferred.** Customer-facing blob primitives
+  were specced and then canceled 2026-05-27 alongside
+  `effect-reification-plan.md` Phase 7 (files-server-standalone stays
+  separate; the JS-shim composition pattern doesn't get exercised on
+  this surface). No customer demand established; defer until concrete
+  use case forces it. The input/output asymmetry the design rested on
+  still holds — see `primitive-gaps.md` §7.4.
 
 ## 4. The contract — six questions every effect answers
 
@@ -335,21 +324,9 @@ What the algebra predicts, each collapsing N runtimes to 1:
    handler's writes) + outbound HTTP + a retry cron subscription + a
    boot subscription on leader-promotion. No new store, no new
    envelope type, no new Zig primitive. The composition is part of
-   the standard library (`webhook.send.js`, `email.send.js`,
-   `blob.put.js`) — the platform dogfoods its own primitives, and
-   customers can read or fork the policy.
-
-   **The marker holds bytes when it can; otherwise it holds a
-   re-execution pointer.** `webhook.send` / `email.send` markers carry
-   the request body inline because it's small. `blob.put` markers can't
-   — payloads are arbitrary size. Instead the marker holds
-   `{correlation_id, seq, call_index, dest_key}`, and recovery
-   re-executes the source activation against its recorded readset
-   (§2.5) to re-derive the bytes. The pattern accommodates both via the
-   same retry-cron + boot-sub plumbing; only the marker shape differs.
-   This dependency on the readset being durable makes
-   `readset-replication-plan.md` the prerequisite for `blob.put`'s full
-   recovery story.
+   the standard library (`webhook.send.js`, `email.send.js`) — the
+   platform dogfoods its own primitives, and customers can read or
+   fork the policy.
 
    A paid-tier fast path that pattern-matches a shim and dispatches
    native is a post-launch optimization, not part of the model.
@@ -410,26 +387,6 @@ plan is the systematic way to clear this list.
    collapse. **Supersedes** the closed-by-retirement
    `events.emit` worklist item (previously #7) — that surface is
    already gone.
-8. **Ship `blob.put.js` / `blob.get.js` shims instead of Phase 7's
-   `Cmd.blob_put` primitive** (2026-05-25 decision; revises
-   `effect-reification-plan.md` Phase 7 PR-1). `blob.put.js`
-   composes `kv.set("_blob/owed/{hash}", {correlation_id, seq,
-   call_index, dest_key})` + `http.fetch` PUT to the BlobBackend
-   URL + the existing retry-cron / boot-sub plumbing.
-   `blob.get.js` is a direct `http.fetch(blob_url(hash))` shim with
-   the same response-disposition options as outbound HTTP (whole /
-   on_chunk / pipe_to). Recovery for `blob.put` uses re-execution
-   per §2.5 — the marker doesn't carry bytes (potentially MB), so
-   the cron sweep re-runs the source activation against its readset
-   to re-derive the bytes and re-issue the PUT (idempotent via
-   content-addressing). **Depends on readset-replication landing**
-   for full recovery semantics; without it, `blob.put` degrades to
-   at-most-once-with-transient-retry (matching the pre-revision
-   Cmd-primitive's semantics — same delivery class, simpler engine
-   surface). Phase 7's `compile.queue` Cmd + `compile_done` Msg
-   stay as Zig primitives — compile is CPU-bound in-process work
-   with no underlying primitive to shim over.
-
 Known catalog gaps, *not* incoherence: streaming inbound body
 (gap 2.4 — design path: `readset-replication-plan.md` §4 + the
 inbound side of `primitive-gaps.md` §7's persist-before-observe
@@ -462,8 +419,4 @@ of.
   wake / disconnect Msg origins, as one instantiation.
 - **`connection-actor-plan.md`** — the duplex connection effect:
   connection-write Cmd runtime + frame Msg origin on one Continuation.
-- **`effect-reification-plan.md` Phase 7** — Phase 7's PR-1
-  (`Cmd.blob_put` primitive) is revised by §7 worklist item 8 above
-  to ship as a JS shim instead; Phase 7's compile-worker (PR-2)
-  remains a Zig primitive.
 - **`docs/PLAN.md` §13** — the live process / surface map.
