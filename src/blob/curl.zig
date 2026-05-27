@@ -83,12 +83,22 @@ pub const Response = struct {
 
     pub fn deinit(self: *Response, allocator: std.mem.Allocator) void {
         if (self.body) |b| allocator.free(b);
+        self.deinitHeaders(allocator);
+        self.* = undefined;
+    }
+
+    /// Free just the headers (each name/value + the backing slice),
+    /// leaving `self.body` untouched. For callers that take ownership
+    /// of `body` and translate the rest into their own struct (the
+    /// S3 blob + log batch stores do this); without it those callers
+    /// silently leaked every response header.
+    pub fn deinitHeaders(self: *Response, allocator: std.mem.Allocator) void {
         for (self.headers) |h| {
             allocator.free(h.name);
             allocator.free(h.value);
         }
         allocator.free(self.headers);
-        self.* = undefined;
+        self.headers = &.{};
     }
 };
 

@@ -413,7 +413,7 @@ pub const S3BatchStore = struct {
 
         std.log.debug("log s3: → {s} {s} body_size={d}", .{ methodName(method), url, body.len });
 
-        const resp = self.curl.request(body_allocator, .{
+        var resp = self.curl.request(body_allocator, .{
             .method = method,
             .url = url,
             .headers = &headers,
@@ -426,6 +426,9 @@ pub const S3BatchStore = struct {
             );
             return Error.Io;
         };
+        // HttpResp only carries status + body; headers would silently
+        // leak otherwise.
+        resp.deinitHeaders(body_allocator);
 
         return .{
             .status = resp.status,
