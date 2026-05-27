@@ -163,245 +163,52 @@ patterns become unambiguous.
 
 ---
 
-### 2.3 Streaming response bytes from `http.send` — **DONE 2026-05-21**
+### 2.3 / 2.4 / 2.5 — streaming surface, both directions
 
-**Shipped as a new primitive, not an `http.send` extension.** The
-durable / at-least-once semantics of `http.send` are wrong for
-streaming (a re-fire on crash = a duplicated LLM bill); the gap was
-reframed to **`http.fetch`** — a transient, best-effort outbound
-sibling. Pattern A (`on_chunk`) + Pattern B (`pipe_to`) + a
-`CURLOPT_WRITEFUNCTION` streaming transport all shipped. See
-`docs/upstream-streaming-plan.md` (all phases SHIPPED) and
-[[project_gap_2_3_http_fetch]]. Original motivation/options below
-kept for the record.
+**See [`docs/streaming-model.md`](streaming-model.md) — it is the
+unifying model for all three.** The held chain processes a stream of
+Msgs and emits a stream of Cmds; bytes ride as chunks; "buffered" is
+the runtime coalescing that stream by default. Each individual gap
+below is a case of that model rather than a standalone design.
 
-**Motivation.** Today `http.send` delivers a single buffered
-response in the `send_callback` Msg (bounded by `max_body_bytes`).
-Use cases that need per-chunk visibility — proxying an LLM's SSE
-token stream to a held client, consuming a long-poll feed,
-tailing logs from upstream — are unrepresentable. Two sub-patterns:
-
-- **(a) Per-chunk transformation.** Handler wants to see each
-  upstream chunk, decide what to forward / aggregate / transform,
-  emit a frame on its held client.
-- **(b) Transparent proxy.** Handler wants upstream bytes piped to
-  the held client with zero per-chunk Msg invocation — fire once,
-  return, let the runtime plumb upstream → outbound.
-
-**Additive (option A).** Two new Msg variants:
-
-- `upstream_chunk` — fires per upstream chunk. Carries `{ chunks:
-  [bytes], byte_offset, send_id }`. The handler's return is the
-  same Cmd vocabulary (`Response` / `__rove_next` / `__rove_stream`).
-- `upstream_end` — fires when the upstream connection closes
-  (success or error). Carries `{ ok, status, trailers, send_id }`.
-
-Opted into via `http.send({ ..., stream_response: true })`. Without
-the flag, today's `send_callback` shape is unchanged.
-
-For pattern (b), the pipe is an **`http.send` option, not a new
-Cmd** — `http.send({ url, pipe_to: 'held_response', headers? })`.
-The handler then returns `__rove_stream` (no chunks; the upstream
-pipe IS the chunks) or `__rove_next` (wait for `upstream_end`
-before flushing a terminal `Response`). Keeps the Cmd cap at three
-(`streaming-handlers-plan.md` §3.4 — "deliberately capped"); the
-pipe is an effect parameter, like `fire_at_ns` or `on_result`.
-
-**Decomposition (option B).** Recognize that an upstream connection
-is the *symmetric* shape of an inbound connection — both are a
-stream of chunks + an end. Generalize the inbound dispatcher's
-body-handling to be the universal "stream of chunks" machinery,
-parameterized by direction. `http.send` with `stream_response`
-returns an "upstream chain" that is itself a wake-driven chain
-(with its own correlation_id), and the per-chunk handler is just
-another chain projection. The "pipe" pattern is then "two chains
-sharing a chunk queue."
-
-**Recommendation: A.** The pure decomposition (B) is principled
-but reshapes a lot of existing code; the additive shape (A) adds
-two Msg variants (`upstream_chunk`, `upstream_end`) and one
-`http.send` option (`pipe_to`) without disturbing the Cmd cap or
-the per-chain identity model. Pattern-(b) — the more common
-customer demand (LLM proxy, log tail) — ships as the `pipe_to`
-effect; pattern-(a) ships behind the `stream_response` flag.
-
-**Blast radius.** New tape entries for upstream chunks (replay
-records the bytes; deterministic). h2 client-side chunk-watch in
-the http.send dispatcher. New cap (`max_response_chunk_bytes`,
-`max_total_response_bytes`). Bytes go content-addressed past a
-threshold to avoid `REQUEST_BODY_CAP`-style truncation
-(connection-actor-plan §8). ~1500–2000 LOC est.
-
-**Composability unlocked:** LLM SSE proxy, log tailing,
-streaming-API consumption, large-response handling without
-`max_body_bytes` blowups.
-
----
-
-### 2.4 Streaming request body in
-
-**Motivation.** Inbound request body is buffered up to
-`REQUEST_BODY_CAP`. Large multipart uploads, duplex protocols,
-chunked progress reporting — all unrepresentable from a customer
-handler. The files-server multipart endpoint exists as a platform
-shortcut but customers can't write their own equivalent.
-
-**Symmetric to 2.3.** Same shape, inbound direction.
-
-**Additive (option A).** New Msg variant `inbound_chunk` carrying
-`{ chunks: [bytes], byte_offset }`. Opted into via response header
-on the first activation, or by the handler returning `__rove_stream`
-from an `inbound` Msg before the body has fully arrived. The
-default buffered-body shape is preserved when the handler doesn't
-opt in.
-
-**Decomposition (option B).** Same as 2.3 — generalize the chunk
-machinery and treat inbound body as one direction of it.
-
-**Recommendation: A, paired with 2.3.** The two gaps share an
-implementation (chunked-bytes dispatch through h2) and probably
-ship together. If 2.3 picks the decomposition (B), 2.4 must too.
-
-**Blast radius.** h2 inbound chunk demux; `REQUEST_BODY_CAP` becomes
-an opt-out for streaming-mode handlers; tape per-chunk recording.
-~1000–1500 LOC est. (smaller than 2.3 because outbound chunk
-plumbing has more knobs).
-
-**Composability unlocked:** customer multipart, customer
-duplex-shaped endpoints, large-payload ingest without the platform
-files-server.
-
----
-
-### 2.5 Held outbound subscription (external-push wake) — **DONE 2026-05-24**
-
-**Shipped 2026-05-24** via `src/js/fetch_engine.zig` + `http.subscribe`
-binding (`src/js/bindings/http.zig`). Distinct surface from the
-option-B "decompose into `__rove_stream` with direction parameter"
-recommendation below: the JS binding is `http.subscribe` (a thin shim
-sibling of `http.fetch`) wrapping a `held: bool` flag on the existing
-`PendingFetch` shape. The unified-Cmd refactor is deferred to the
-eventual reification Phase 4.X where the Cmd union's `held_subscribe`
-variant gets the direction-parameter treatment.
-
-Engine machinery: `FetchEngine` (curl_multi-driven transport) treats
-`held=true` PendingFetches with no timeout, counted against a
-per-tenant cap (`HELD_MAX_PER_TENANT=16` in `src/js/fetch_engine.zig`).
-Cap rejection fires a defined `final: true, ok: false` event so the
-customer's `on_chunk` handler runs once and can surface the condition.
-
-Cancellation via `http.cancelSubscription({id})` — cooperative.
-
-Smokes: `scripts/subscription_smoke.py` +
-`scripts/subscription_cap_smoke.py`.
-
-Federation prerequisites (atproto firehose CONSUMER) now satisfied
-on the transport side; the WS server / framing pieces remain in
-separate plans.
-
-
-
-**Motivation.** Five Msg variants, only one comes from outside our
-control plane (`send_callback`, the completion of *our* outbound
-send). Real-time push from third parties — atproto firehose
-CONSUMER (`connection-actor-plan.md` §6.5), Pub/Sub long-poll
-consumer, AMQP/Kafka bridge, OAuth-provider webhooks where the
-provider holds the connection — has no expression. The customer
-would need to hold an outbound socket whose lifecycle is
-independent of any client connection.
-
-This is the *symmetric* projection of `__rove_stream` — instead of
-holding a downstream client socket, hold an upstream provider
-socket.
-
-**Additive (option A).** New Cmd variant `__rove_subscribe({ url,
-headers?, reconnect?, on_chunk? })` opens a long-lived outbound
-connection bound to the chain. Each upstream chunk fires an
-`upstream_event` Msg (analogous to `kv_wake` but with the upstream
-bytes). Reconnect / catch-up / cursor management is the customer's
-problem — they record progress in their own kv.
-
-**Decomposition (option B).** Recognize that `__rove_subscribe` is
-just `__rove_stream` with the connection direction flipped:
-held-outbound instead of held-inbound. Unify both into one Cmd
-parametrized by direction. The runtime's connection-holder owns
-both kinds of sockets; the handler's Cmd vocabulary doesn't
-distinguish.
-
-**Recommendation: B (decomposition).** The framework principle
-that motivated `__rove_stream` is "every held connection is the
-same primitive, the direction is a parameter." `__rove_subscribe`
-as a separate Cmd repeats the connection-actor-plan §4
-copyable-handle mistake (treating projections as distinct
-primitives). Same wake-source machinery (the new `upstream_event`
-Msg is just `chunk_arrived` with a direction tag), same chunk
-queue model, same backpressure surfaces. The Cmd surface stays at
-three (Response / next / stream), with `stream` gaining a
-direction parameter.
-
-**Blast radius.** Largest of the five. Outbound long-lived socket
-infrastructure (libcurl async-mode or a dedicated holder), upstream
-auth threading, reconnect/backoff bookkeeping, cap model (per-tenant
-simultaneous upstream subscriptions, per-subscription max lifetime
-— mirror §9.2). Tape determinism: upstream chunks are taped inputs
-the same way inbound message bytes are (`connection-actor-plan.md`
-§2). Likely the only gap that justifies a new persistent process
-or a major rove-h2 surface change.
-
-This gap is the v1 hard-question for *both* WS transport and
-inbound HTTP/1.1 origin — once the upstream-socket machinery exists,
-the WS transport cost is "RFC 6455 framing on top of an existing
-outbound socket type" rather than "build outbound-socket
-machinery + WS framing simultaneously." That's not justification to
-do them together; it IS justification to design with the join in
-mind. **Federation (`project_fediverse_libs`) is the most likely
-forcing function** — atproto consumer + inbound-WS-origin are both
-gated on this primitive.
-
-**Composability unlocked:** atproto firehose consumer, Pub/Sub
-consumer, third-party webhook receivers where the provider holds
-the socket, federation inbound (paired with the WS-transport v2
-cost).
+- **2.3 Streaming response bytes from outbound HTTP** — **DONE
+  2026-05-21**. Reframed to `http.fetch` (transient + best-effort
+  sibling of the durable `webhook.send`); Pattern A (`on_chunk`) +
+  Pattern B (`pipe_to`) + `CURLOPT_WRITEFUNCTION` streaming transport
+  all shipped. See streaming-model.md §4 (the conceptual model) and
+  `docs/upstream-streaming-plan.md` (the as-built `http.fetch`
+  reference, slated for fold into streaming-model.md).
+- **2.4 Streaming request body in** — **DESIGN LOCKED, IMPLEMENTATION
+  PENDING.** Streaming-model.md §3 specifies the resolution: handler
+  is dispatched at a coalesce-budget boundary (default 64 KiB) with
+  `request.body_complete = false` and a body prefix; it returns one of
+  three Cmds — terminal `Response` (drain and discard), `__rove_next()`
+  (wait for whole body up to a hard ceiling, then re-dispatch coalesced),
+  or `__rove_stream({accept_body: true})` (per-chunk `inbound_chunk`
+  Msgs + `inbound_end` terminator, unbounded body). Implementation is
+  h2-wire + activation-Msg + per-chunk coord submit; the blob
+  coordinator is the substrate.
+- **2.5 Held outbound subscription (external-push wake)** — **DONE
+  2026-05-24**. `http.subscribe` binding + `FetchEngine` curl_multi
+  transport in `src/js/fetch_engine.zig`; per-tenant cap
+  `HELD_MAX_PER_TENANT=16`; cooperative `http.cancelSubscription`.
+  Smokes: `scripts/subscription_smoke.py` + `subscription_cap_smoke.py`.
+  Federation transport prereq (atproto firehose CONSUMER) satisfied;
+  WS framing remains separate.
 
 ---
 
 ## 3. Sequencing
 
-Recommended order, smallest-design-debt first:
+All five gaps are either DONE or design-locked. Status snapshot:
 
-| # | Gap | Effort | Customer pull | Blocks | Status |
-|---|---|---|---|---|---|
-| 1 | 2.2 backpressure | S | medium | clean §9.4 story | **DONE 2026-05-20** |
-| 2 | 2.1 chain origins | M | high | crons, inboxes, reconcilers | **DONE 2026-05-20** — kv-react + boot + cron all shipped |
-| 3 | 2.3 streaming outbound (`http.fetch`) | L | high | LLM proxy, log tail | **DONE 2026-05-21** — reframed to `http.fetch`; see `docs/upstream-streaming-plan.md` |
-| 4 | 2.4 streaming inbound body | L | medium | uploads, duplex | pending — unified under `docs/streaming-model.md` |
-| 5 | 2.5 held outbound subscription | XL | high (federation) | atproto, WS-origin | pending — unified under `docs/streaming-model.md` |
-
-> **2.3 / 2.4 / 2.5 are one primitive.** The held chain processes a
-> stream of Msgs and emits a stream of Cmds; bytes ride as chunks;
-> "buffered" is the runtime coalescing that stream by default.
-> `docs/streaming-model.md` is the unifying model — 2.3 (shipped) is
-> a case of it, 2.4 / 2.5 are derived from it rather than designed
-> standalone.
-
-**Rationale for the order:**
-
-- **2.2 first** because it's the smallest, finishes a
-  documented-but-incomplete surface, and any gap downstream that
-  adds Msg variants benefits from the wake-batch + write-pressure
-  shape being already settled.
-- **2.1 next** because it unblocks the largest set of customer
-  patterns (cron, inboxes, reconcilers) for the smallest impl
-  footprint after 2.2. It also de-risks the manifest shape that
-  2.5 will reuse.
-- **2.3 and 2.4 together** as a single project — the
-  chunk-dispatch machinery is shared; doing one without the other
-  is wasted scaffolding.
-- **2.5 last** because it's the largest impl lift, the spec
-  questions (reconnect policy, cursor model) are the deepest, and
-  it benefits from every prior gap landing first (2.2's
-  backpressure surfaces, 2.1's manifest shape, 2.3/2.4's chunk
-  machinery).
+| # | Gap | Status |
+|---|---|---|
+| 1 | 2.2 backpressure | **DONE 2026-05-20** |
+| 2 | 2.1 chain origins | **DONE 2026-05-20** (kv-react + boot + cron) |
+| 3 | 2.3 streaming outbound (`http.fetch`) | **DONE 2026-05-21** |
+| 4 | 2.4 streaming inbound body | design locked in `streaming-model.md` §3; implementation pending |
+| 5 | 2.5 held outbound subscription | **DONE 2026-05-24** |
 
 ---
 
