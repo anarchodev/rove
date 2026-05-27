@@ -8,17 +8,15 @@ recommendation column picks one per gap; the sequencing section
 proposes an order.
 
 This doc is upstream of the sub-plans that will be written when each
-gap is picked up (`docs/upstream-streaming-plan.md`,
-`docs/subscriptions-plan.md`, etc.). Nothing here ships until that
-per-gap plan exists.
+gap is picked up (`docs/upstream-streaming-plan.md`, etc.). Nothing
+here ships until that per-gap plan exists.
 
 ---
 
 ## 1. The primitive surface today (vocabulary recap)
 
 Handler is `update : (Msg, Ctx) → (Effects, Cmd Msg)` (the TEA
-shape — `docs/handler-cmds-refactor-plan.md` Outcome; the
-runtime IS the Elm runtime).
+shape — the runtime IS the Elm runtime).
 
 | Slot | Variants today | Where defined |
 |---|---|---|
@@ -37,8 +35,7 @@ the gap is a parametric case.
 
 ### 2.1 Chain origins without an inbound request — **DONE 2026-05-20**
 
-**Shipped.** See `docs/subscriptions-plan.md` §10 for the per-phase
-status + load-bearing details. Three chain-origin kinds:
+**Shipped.** Three chain-origin kinds:
 
 - **kv-react** — apply-time hook fires on the worker that
   committed the writeset; leader-only by construction.
@@ -376,7 +373,7 @@ Recommended order, smallest-design-debt first:
 | # | Gap | Effort | Customer pull | Blocks | Status |
 |---|---|---|---|---|---|
 | 1 | 2.2 backpressure | S | medium | clean §9.4 story | **DONE 2026-05-20** |
-| 2 | 2.1 chain origins | M | high | crons, inboxes, reconcilers | **DONE 2026-05-20** — kv-react + boot + cron all shipped (see `docs/subscriptions-plan.md` §10) |
+| 2 | 2.1 chain origins | M | high | crons, inboxes, reconcilers | **DONE 2026-05-20** — kv-react + boot + cron all shipped |
 | 3 | 2.3 streaming outbound (`http.fetch`) | L | high | LLM proxy, log tail | **DONE 2026-05-21** — reframed to `http.fetch`; see `docs/upstream-streaming-plan.md` |
 | 4 | 2.4 streaming inbound body | L | medium | uploads, duplex | pending — unified under `docs/streaming-model.md` |
 | 5 | 2.5 held outbound subscription | XL | high (federation) | atproto, WS-origin | pending — unified under `docs/streaming-model.md` |
