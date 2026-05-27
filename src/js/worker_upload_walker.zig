@@ -308,21 +308,32 @@ pub fn walkAndUploadCatchup(worker: anytype) !void {
 
 // ── Orphan-blob GC (Phase 5d) ─────────────────────────────────────────
 
-/// One `(tenant_id, batch_id)` BodyRef extracted from a raft entry's
-/// readset list. `tenant_id` is allocator-owned by the caller's
-/// passed-in list (every `append` dups the slice into the allocator
-/// the list uses).
+/// One BodyRef + its containing readset's version, extracted from a
+/// raft entry's readset list. The (version, tenant_id, batch_id)
+/// tuple lets the GC orchestrator pick the matching key template
+/// when deciding which S3 object to delete —
+/// `docs/blob-coordinator-plan.md` Phase 5 split v4 (per-tenant
+/// lane) from v5 (cross-tenant `_pool/`).
+///
+/// `tenant_id` is allocator-owned by the caller's passed-in list
+/// (every `append` dups the slice into the allocator the list uses);
+/// for v5 entries it's the *containing envelope's* tenant which
+/// surfaces for diagnostics but is NOT part of the S3 key.
 ///
 /// Phase 5d: GC orchestrator scans the live raft log, accumulates
 /// referenced batches via `collectReferencedBatchesIntoList`, then
-/// deletes any `{tenant_id}/readset-blobs/{batch_id}` NOT in the
-/// referenced set (subject to a retention floor — the batch must be
-/// older than the longest tolerable propose-to-apply gap, otherwise
-/// in-flight references would race the sweep). See
+/// deletes any matching pool object NOT in the referenced set
+/// (subject to a retention floor — the batch must be older than the
+/// longest tolerable propose-to-apply gap, otherwise in-flight
+/// references would race the sweep). See
 /// `docs/readset-replication-plan.md` §9 Phase 5d for the full
 /// algorithm + the operator-side S3 lifecycle-rule alternative
 /// (preferred pre-launch).
 pub const ReferencedBatch = struct {
+    /// On-wire readset version this BodyRef came from. v4 →
+    /// `{tenant_id}/readset-blobs/w*/{batch_id:0>20}`; v5 →
+    /// `_pool/{batch_id:0>20}`.
+    version: u16,
     tenant_id: []const u8,
     batch_id: u64,
 
@@ -394,12 +405,14 @@ fn collectFromWriteSetEnvelope(
         const trigger_idx: usize = @intFromEnum(tape_mod.Channel.trigger_payload);
         try collectBatchesFromChannelBlob(
             allocator,
+            parsed.version,
             env.instance_id,
             parsed.blobs[fetch_idx],
             out,
         );
         try collectBatchesFromChannelBlob(
             allocator,
+            parsed.version,
             env.instance_id,
             parsed.blobs[trigger_idx],
             out,
@@ -409,6 +422,7 @@ fn collectFromWriteSetEnvelope(
 
 fn collectBatchesFromChannelBlob(
     allocator: std.mem.Allocator,
+    version: u16,
     instance_id: []const u8,
     channel_blob: []const u8,
     out: *std.ArrayListUnmanaged(ReferencedBatch),
@@ -426,6 +440,7 @@ fn collectBatchesFromChannelBlob(
         const tenant_dup = try allocator.dupe(u8, instance_id);
         errdefer allocator.free(tenant_dup);
         try out.append(allocator, .{
+            .version = version,
             .tenant_id = tenant_dup,
             .batch_id = body_ref.batch_id,
         });

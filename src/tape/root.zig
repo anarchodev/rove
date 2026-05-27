@@ -97,7 +97,22 @@ pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
 /// drops 5 → 4. The header's `seed` + `timestamp_ns` scalars are
 /// now the entire input for the random + clock sources.
 /// Pre-launch — no v3 raft logs to migrate, hard cutover.
-pub const READSET_VERSION: u16 = 4;
+/// Current writer version. Parser accepts both this and
+/// `READSET_VERSION_MIN_SUPPORTED`. 4 → 5 by
+/// `docs/blob-coordinator-plan.md` Phase 5: BodyRef wire shape is
+/// unchanged (`{u64 batch_id, u64 offset, u32 len}`), but the key
+/// template it resolves to switches from per-(tenant, worker)
+/// (`{tenant}/readset-blobs/w{worker_id}/{batch_id:0>20}`) to the
+/// cross-tenant pool (`_pool/{batch_id:0>20}`). Readers carry
+/// `ParsedReadset.version` so the GC / replay paths pick the
+/// matching template.
+pub const READSET_VERSION: u16 = 5;
+/// Oldest version the parser accepts. Pre-launch only — once
+/// production raft logs exist for any version below this we add a
+/// compatibility band here. Today the only pre-launch state worth
+/// reading is local-bench `_pool/` data, so we keep v4 as a fallback
+/// for any leftover dev clusters running Phase 3.
+pub const READSET_VERSION_MIN_SUPPORTED: u16 = 4;
 pub const READSET_CHANNEL_COUNT: usize = 4;
 
 /// Renumbered contiguously by `docs/primitive-gaps.md` §9 +
@@ -601,7 +616,7 @@ pub const Readset = struct {
     /// Serialize the whole readset to a single blob suitable for the
     /// raft entry's readset section
     /// (`docs/readset-replication-plan.md` Phase 3 + 5a). Wire format
-    /// (READSET_VERSION = 4):
+    /// (READSET_VERSION = 5):
     ///
     /// ```
     /// [u32  magic = READSET_MAGIC ('RREA')]
@@ -683,6 +698,11 @@ pub const Readset = struct {
 /// validation today and a future slice will materialize tapes for
 /// follower-side tape upload.
 pub const ParsedReadset = struct {
+    /// On-wire version this readset was serialized with. Carried so
+    /// `BodyRef` resolvers (GC, replay) can pick the matching key
+    /// template — `docs/blob-coordinator-plan.md` Phase 5 split
+    /// v4 (per-tenant lane) from v5 (cross-tenant `_pool/`).
+    version: u16,
     timestamp_ns: i64,
     seed: u64,
     /// Borrowed slices into the input bytes, one per channel in
@@ -701,7 +721,9 @@ pub fn parseReadset(bytes: []const u8) (ParseError || log_mod.LogHeaderParseErro
     const magic = std.mem.readInt(u32, bytes[0..4], .big);
     if (magic != READSET_MAGIC) return ParseError.BadMagic;
     const version = std.mem.readInt(u16, bytes[4..6], .big);
-    if (version != READSET_VERSION) return ParseError.UnsupportedVersion;
+    if (version > READSET_VERSION or version < READSET_VERSION_MIN_SUPPORTED) {
+        return ParseError.UnsupportedVersion;
+    }
     const timestamp_ns = std.mem.readInt(i64, bytes[6..14], .big);
     const seed = std.mem.readInt(u64, bytes[14..22], .big);
 
@@ -729,6 +751,7 @@ pub fn parseReadset(bytes: []const u8) (ParseError || log_mod.LogHeaderParseErro
     else
         try log_mod.parseLogHeader(lh_slice);
     return .{
+        .version = version,
         .timestamp_ns = timestamp_ns,
         .seed = seed,
         .blobs = blobs,

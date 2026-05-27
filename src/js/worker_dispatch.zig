@@ -2516,7 +2516,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // the BodyRef once the seq is durable.
             if (worker.node.blob_coordinator) |coord| {
                 const wid: u8 = @intCast(worker.log_worker_id);
-                if (coord.submit(wid, scope_inst.id, body)) |seq| {
+                if (coord.submit(wid, body)) |seq| {
                     try server.reg.set(ent, &server.request_out, worker_mod.BodyDurabilityWait, .{
                         .worker_seq = seq,
                         .worker_id = wid,
