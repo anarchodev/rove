@@ -1,7 +1,11 @@
 # Effect reification plan
 
-> **Status**: Phases 0–5 SHIPPED 2026-05-24 (commit `b908953`); Phase
-> 4.1 is the next active sub-phase. See §6 for per-phase status.
+> **Status**: Phases 0–6 substantially SHIPPED. Phase 0–5 (commit
+> `b908953`, 2026-05-24) reified the four primitives + retired
+> `http.send`. Phase 6 cleanup tail shipped 2026-05-27 (4 of 5 steps;
+> cron_state migration deferred — see §6 Phase 6). Phase 4.1.4
+> (`conn_write` Cmd slot) + Phase 7 (files-server collapse) cancelled
+> 2026-05-27 — see §6 phase status.
 > **Prerequisite reading**: `docs/effect-algebra.md` (the model this plan
 > reifies). The Option-A/B framing this plan *is* the convergence of is
 > folded into §3.3 + §4.
@@ -1081,14 +1085,33 @@ the shim's `kv.set` + `http.fetch` sequence and bypasses to native
 dispatch) restores the latency profile without changing the
 customer API. Out of scope here; tracked separately.
 
-### Phase 6 — Cleanup tail
+### Phase 6 — Cleanup tail — substantially shipped 2026-05-27
 
 - **Goal**: `effect-algebra.md §7` worklist empty.
-- **Steps**: delete `src/connection_holder/` dead scaffold; move
-  `cron_state` onto a collection (#5); resolve the boot double-fire
-  UNCLEAR (#6); rewrite `effect-algebra.md §5` audit + §6 to reflect the
-  reified state; update `CLAUDE.md` if dispatch wording drifted.
-- **Done**: audit re-run shows the reified state; worklist clear.
+- **Steps + status:**
+  - ✅ Delete `src/connection_holder/` dead scaffold — done; ~1645 LOC
+    removed across `src/connection_holder/{root,standalone,wake_dispatch}.zig`,
+    `examples/connection_holder_standalone.zig`, + build.zig module +
+    standalone binary entries.
+  - ⏸ Move `cron_state` onto a collection (#5) — **deferred** pending
+    an architectural decision: today any worker can sweep with a
+    shared mutex; collection-based requires picking single-worker
+    ownership OR per-worker partitioning by `hash(tenant_id) % N`.
+    Current implementation works correctly; the migration is for ECS
+    purity, not bug-fix. Defer until partition decision is made.
+  - ✅ Resolve boot double-fire UNCLEAR (#6) — already resolved by the
+    impl: `_boot_fired/<dep_id>` marker rides the handler's writeset
+    (`worker_streaming.zig:1105`), so marker + handler effects commit
+    atomically through raft. No "fired-but-not-marked" window. Updated
+    the stale `enqueueBootSubscriptions` doc comment to match.
+  - ✅ Rewrite `effect-algebra.md` §5 audit + §6 + §7 worklist — done;
+    audit table updated, minimal-set predictions marked SHIPPED,
+    worklist items 1/2/4/6/7 marked DONE.
+  - ✅ Update `CLAUDE.md` dispatch wording — done; replaced
+    `dispatchPending` with `dispatchOnce` + `Dispatcher.runOutcome`
+    reference.
+- **Done**: 4 of 5 steps shipped; cron_state migration deferred with
+  rationale.
 
 ## 7. Test & perf strategy
 
