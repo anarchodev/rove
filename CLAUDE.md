@@ -82,8 +82,10 @@ Systems are pure functions called between `poll()` and `reg.flush()`, not method
 ### Request lifecycle (rove-js worker)
 
 ```
-h2.request_out → dispatchPending → [drainRaftPending if writes] → h2.response_in → h2.response_out
+h2.request_out → dispatchOnce → [drainRaftPending if writes] → h2.response_in → h2.response_out
 ```
+
+`dispatchOnce` invokes the handler via `Dispatcher.runOutcome` (`src/js/dispatcher.zig`) — the single re-entry point for every activation (inbound, send_callback, fetch_chunk, kv_wake, disconnect, subscription_fire). See `docs/effect-reification-plan.md` §3.3 for the Continuation primitive that backs the parked Msg queue.
 
 Each JS request gets a fresh JS context via arenajs's dual-arena reset (one cursor write per request — see `vendor/arenajs/README.md`). The base arena is built once at worker startup and shared across all requests on the thread; the per-request arena is reset between handler invocations.
 

@@ -250,31 +250,6 @@ pub fn build(b: *std.Build) void {
     log_server_mod.addImport("rove-log", log_mod);
     log_server_mod.addImport("rove-jwt", jwt_mod);
 
-    // ── rove-connection-holder: held-socket subsystem ───────────────
-    //
-    // The plan §9 sibling of sse-server: owns long-lived held sockets
-    // so handlers never do (`docs/connection-actor-plan.md`). Phase 1
-    // is the subsystem skeleton — listener, connection table keyed by
-    // a serializable connection-id, readiness queue, accept + park
-    // with a holder-level deadline. Wakes into the JS handler land in
-    // Phase 2; the held-synchronous projection (§6.4) in Phase 3.
-    const conn_holder_mod = b.addModule("rove-connection-holder", .{
-        .root_source_file = b.path("src/connection_holder/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    conn_holder_mod.link_libc = true;
-    conn_holder_mod.linkSystemLibrary("nghttp2", .{});
-    conn_holder_mod.linkSystemLibrary("ssl", .{});
-    conn_holder_mod.linkSystemLibrary("crypto", .{});
-    conn_holder_mod.addImport("rove", rove_mod);
-    conn_holder_mod.addImport("rove-io", io_mod);
-    conn_holder_mod.addImport("rove-h2", h2_mod);
-    // Phase 2b: the holder forwards the parked request to a worker
-    // (the §6.1 degenerate wake) over libcurl, mirroring
-    // `src/js/sse_dispatch.zig` — reverse direction.
-    conn_holder_mod.addImport("rove-blob", blob_mod);
-
     // ── rove-ssrf: SSRF blocklist + dev-only test overrides ─────────
     //
     // What's left after the http.send N-way re-platform + the
@@ -390,10 +365,6 @@ pub fn build(b: *std.Build) void {
     // rove-jwt tests
     const jwt_tests = b.addTest(.{ .root_module = jwt_mod });
     test_step.dependOn(&b.addRunArtifact(jwt_tests).step);
-
-    // rove-connection-holder tests
-    const conn_holder_tests = b.addTest(.{ .root_module = conn_holder_mod });
-    test_step.dependOn(&b.addRunArtifact(conn_holder_tests).step);
 
     // rove-ssrf tests
     const ssrf_tests = b.addTest(.{ .root_module = ssrf_mod });
@@ -623,23 +594,6 @@ pub fn build(b: *std.Build) void {
     // via the in-process `Handle.enqueueEmit` queue — no cross-process
     // rendezvous, no `--sse-public-base`, no `SSE_INTERNAL_TOKEN`.
     // See `docs/sse-plan.md` + `docs/connection-actor-plan.md` §6.2.
-
-    // connection-holder-standalone: Phase 1 — runs the held-socket
-    // subsystem as a separate process. See
-    // `docs/connection-actor-plan.md` §9. Stands up alongside the
-    // other standalones; does not participate in raft.
-    const ch_standalone_mod = b.addModule("connection-holder-standalone", .{
-        .root_source_file = b.path("examples/connection_holder_standalone.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    ch_standalone_mod.addImport("rove-connection-holder", conn_holder_mod);
-    ch_standalone_mod.addImport("rove-h2", h2_mod);
-    const ch_standalone = b.addExecutable(.{
-        .name = "connection-holder-standalone",
-        .root_module = ch_standalone_mod,
-    });
-    b.installArtifact(ch_standalone);
 
     // log-server-standalone: Phase 5.5 (a) step 2 — runs the new
     // S3-direct logs indexer + h2 query API as a standalone process.

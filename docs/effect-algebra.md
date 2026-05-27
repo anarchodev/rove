@@ -258,7 +258,7 @@ Ten effect-shapes scored against §4. `✓` conforms, `✗` diverges.
 | `webhook.send` / `email.send` (JS shims) | marker taped via the ordinary env-0 writeset; the shim's `on_result` activation is taped like every other chain hop ✓ | retry-cron rate ✓ ; first-attempt rides handler dispatch; subsequent attempts ride the cron sweep ✓ | at-least-once at the *attempt* level (M1) via marker-write/clear; **NOT** retry-to-success — that is the shim's policy choice | `_send/owed/{id}` kv (durable, replicated) + the shim's per-attempt scratch state |
 | `blob.put` (JS shim) | marker taped via env-0 writeset ✓; PUT request itself rides http-out's taping; `on_result` is taped like any chain hop ✓ | retry-cron rate ✓; bytes ride the activation's QJS arena until first PUT completes (not held across retries — recovery re-derives) | transient-loss-tolerant; **eventually recoverable** from inputs via re-execution per §2.5 — content-addressing makes retry idempotent; readset-replication is the recovery prerequisite | `_blob/owed/{hash}` kv (durable, replicated) carries only `{correlation_id, seq, call_index, dest_key}`; bytes themselves live in BlobStore at `{tenant}/blobs/{hash}` (cache; transiently absent OK) |
 | `blob.get` (JS shim) | http-out taping applies ✓ | http-out's `fetch_pending` cap ✓ | at-most-once read; transient backend miss surfaces as 503 — caller retries; no recovery, no marker | none |
-| subscriptions | taped per fire ✓ | cron 1 Hz ✓; kv-react no limit ✗; per-tenant cap maybe NOT BUILT | at-most-once; boot double-fire UNCLEAR | `subscription_fire_pending` collection ✓; `cron_state` plain hashmap ✗ |
+| subscriptions | taped per fire ✓ | cron 1 Hz ✓; kv-react no limit ✗; per-tenant cap maybe NOT BUILT | boot: single-fire via writeset-bundled `_boot_fired/<dep_id>` marker (`worker_streaming.zig:1105`) ✓; cron + kv-react: at-most-once | `subscription_fire_pending` collection ✓; `cron_state` plain hashmap ✗ |
 | streaming out | taped per activation ✓ (cap 10 MB / 50k) | wake ring K=32 + `StreamChunks` 256 KB — lossy, surfaced ✓ | at-most-once stream; chunks may ship pre-commit ✗ | stream collections ✓ |
 | conn-actor out | taped per activation ✓ | `StreamChunks` 256 KB ✓ | at-most-once flush; cross-worker resume = linear scan + requeue ✗ | `parked_continuations` collection ✓ |
 
@@ -279,47 +279,40 @@ is already a primitive.
 
 ## 6. Toward the minimal set
 
-Every divergent cell in §5 has one root cause: **the four primitives are
-not factored out.** Each effect hand-rolls its own slice of Continuation,
-of taping, of backpressure — and the hand-rolled copies drift. The
-minimal-set work is therefore not cosmetic; it is the single fix for
-every incoherence the audit found.
+Every divergent cell in §5 had one root cause: **the four primitives
+were not factored out.** Each effect hand-rolled its own slice of
+Continuation, of taping, of backpressure — and the hand-rolled copies
+drifted. The reification work in `docs/effect-reification-plan.md`
+landed the consolidation (Phases 0–5 SHIPPED 2026-05-24, `b908953`).
 
-What the algebra predicts, each collapsing N runtimes to 1:
+The four predictions the algebra made, against current state:
 
-1. **One Continuation runtime.** Today: `raft_pending_response` /
-   `_cont` / `_stream`, `parked_continuations`, `stream_data_out` /
-   `stream_response_in`, `fetch_event_pending` — roughly seven
-   collections, park/wake/resume hand-rolled in each. The destination
-   (the **Option-A one-request-lifecycle convergence**; realized by
-   `effect-reification-plan.md`) is one parametric Continuation,
-   instantiated per resume-behavior (the *collections*
-   stay — distinct behavior is distinct state, which is ECS-idiomatic;
-   the *code* is shared). This auto-fixes backpressure unevenness (the
-   wake ring becomes universal) and the cross-worker scan (the primitive
-   owns a wake-correlation index, so resume is O(1), not O(workers ×
-   parked)).
+1. **One Continuation runtime — SHIPPED.** The seven hand-rolled park
+   collections (`raft_pending_response` / `_cont` / `_stream`,
+   `parked_continuations`, `stream_data_out` / `stream_response_in`,
+   `fetch_event_pending`) now share one parametric Continuation
+   primitive (`effect.Continuation`), with per-resume-behavior
+   collections retaining distinct state but sharing the park/wake/
+   resume code. Cross-worker resume is O(1) via the wake-correlation
+   index. The wake ring is universal.
 
-2. **One outbound-HTTP runtime.** `http.send` retires as a primitive
-   (2026-05-22 decision); the only outbound HTTP runtime is the one
-   that drives `http.fetch` today — `FetchPool` parameterized by
-   response-disposition (whole / `on_chunk` / `pipe_to`). `SendDispatch`
-   + `InflightSet` + `send_outbox` + the apply-time special-casing of
-   `_send/owed` / `_send/proof` markers all *delete* — they composed a
-   durable-intent verb that needn't be a Zig primitive. Durability
-   reconstitutes as a JS-shim composition (rule 4 below).
+2. **One outbound-HTTP runtime — SHIPPED.** `http.send` retired as a
+   primitive (Phase 5, 2026-05-24). The only outbound HTTP runtime
+   is `fetch_pool` (now `fetch_engine`, the curl_multi engine)
+   parameterized by response-disposition (whole / `on_chunk` /
+   `pipe_to`). `SendDispatch` + `InflightSet` + `send_outbox` + the
+   apply-time special-cases for `_send/owed` / `_send/proof` all
+   deleted. Durability reconstitutes as JS-shim composition (rule 4).
 
-3. **One Msg-origin runtime, taping built in.** cron / boot / kv-react /
-   inbound-HTTP / send-callback / fetch-chunk / frame are instances of
-   "trigger → recorded Msg." When taping is a property of the primitive,
-   the `http.fetch` Pattern A replay bug becomes *unconstructible* — you
-   cannot instantiate a Msg origin without the tape hook.
+3. **One Msg-origin runtime, taping built in — SHIPPED.** Phase 2D
+   wired the tape hook into the Msg-origin primitive; the Pattern A
+   chunk-tape bug is *unconstructible* — you can't instantiate a Msg
+   origin without the tape hook.
 
-4. **Durability stays in one home — and that home is JS.** Proven by
-   the `schedules.db` retirement (2026-05-19), extended by the
-   `http.send` → JS-shim decision (2026-05-22), and extended again by
-   the `blob.put` → JS-shim decision (2026-05-25). The standing rule:
-   a durable-intent effect is *always* the JS composition `kv.set(
+4. **Durability stays in one home — and that home is JS — SHIPPED.**
+   Proven by the `schedules.db` retirement (2026-05-19) + the
+   `http.send` → JS-shim cutover (2026-05-24). The standing rule: a
+   durable-intent effect is *always* the JS composition `kv.set(
    "_<verb>/owed/{key}", ...)` (rides envelope-0 atomic with the
    handler's writes) + outbound HTTP + a retry cron subscription + a
    boot subscription on leader-promotion. No new store, no new
@@ -341,59 +334,47 @@ substrate itself must change — rare, and worth stopping for.
 
 ## 7. Worklist
 
-Ranked; the first two are correctness, not cleanup. Reifying the four
-primitives (`docs/effect-reification-plan.md`) makes items 1, 3, 4, 5
-structurally impossible and forces 2 into one decision point — that
-plan is the systematic way to clear this list.
+Substantially cleared by `docs/effect-reification-plan.md` Phases 0–5
+(SHIPPED 2026-05-24, `b908953`).
 
-1. **Tape outbound-HTTP Pattern A chunk bytes** — replay-correctness
-   bug; `fireFetchEventActivation` passes empty `TapePayloads`.
-   Content-address past a threshold (`primitive-gaps.md` §6, also
-   NOT BUILT). Fixed by reification Phase 2D.
-2. **Resolve the streaming pre-commit invariant** — **DECIDED
-   2026-05-22: fix the code.** The §2 rule
-   ("chunk reaches the wire only after the activation that produced
-   it has committed") IS the model. The pre-commit-ship path in
-   `proposeForgetfulWrites` (`worker.zig:5377-5380` + sibling sites)
-   is removed in `effect-reification-plan.md` Phase 4.0.b: resume-hop
-   chunks stage on the entity until the writeset commits, then move
-   into `StreamChunks` for h2 to ship. Per
-   [[feedback_model_simplicity_safety]]: ship one safe semantic;
-   `__rove_stream({eager_ship: true})` reserved for real customer
-   demand. Latency cost ≈ one raft-cycle (~ms) per resume hop with
-   writes — accepted.
-3. **Adopt the streaming backpressure template** across outbound HTTP
-   (`fetch_pending`), the `WriteSet`, and kv-react — three unbounded
-   queues. (Down from four: `http.send` retires per §6 rule 2.)
-4. **Cross-worker Continuation resume is a scan, not a route** — no
-   durable/indexed locator; falls out of refactor #1.
+1. ~~**Tape outbound-HTTP Pattern A chunk bytes**~~ — **DONE** via
+   reification Phase 2D (`fireFetchEventActivation` now passes
+   populated `TapePayloads`; chunks content-addressed past a threshold).
+2. ~~**Resolve the streaming pre-commit invariant**~~ — **DONE** via
+   Phase 4.0.b. The pre-commit-ship path in `proposeForgetfulWrites`
+   is removed; resume-hop chunks stage on the entity until commit, then
+   move into `StreamChunks`. Per [[feedback_model_simplicity_safety]]
+   ship-one-safe-semantic; `__rove_stream({eager_ship: true})` reserved
+   for customer demand.
+3. **Backpressure template across remaining unbounded queues** —
+   `StreamChunks` cap shipped (Gap 2.2); `fetch_pending` + `WriteSet`
+   + kv-react remain unbounded. Smaller cleanup item; ship when a
+   real overflow shows up.
+4. ~~**Cross-worker Continuation resume scan**~~ — **DONE** via the
+   continuation-affinity routing per `project_callback_execution_model`
+   (callbacks route to the worker holding the continuation via a
+   pointer, not via hash(tenant)); no scan.
 5. **`cron_state` lives in a plain `StringHashMap`** — right durability
-   class, wrong home; the one clear two-places drift. Move to a
-   collection.
-6. **Boot subscription double-fire is UNCLEAR** — crash between
-   marker-write and propose may re-fire and partially duplicate
-   non-marker writes. Needs a definite answer. *Becomes higher-impact*
-   under the durability-as-JS-shim model since boot subscriptions
-   participate in send-recovery; the answer must hold for
-   `webhook.send`/`email.send` reliability.
-7. **Retire `http.send` as a Zig primitive** (2026-05-22 decision).
-   Ship `webhook.send.js` + `email.send.js` durability shims that
-   compose `kv.set("_send/owed/{id}", ...)` + outbound HTTP +
-   retry-cron subscription + boot subscription. Delete
-   `src/js/send_dispatch.zig`, `send_inflight.zig`, `send_outbox.zig`,
-   the apply-time special-cases for `_send/owed` and `_send/proof`,
-   `parkSendOps` / `firePendingSendOps`, and the `send_callback`
-   Msg variant (it merges into the unified `http_done`). The §6 rule 2
-   collapse. **Supersedes** the closed-by-retirement
-   `events.emit` worklist item (previously #7) — that surface is
-   already gone.
+   class, wrong home. Move to a collection. Mechanical; defers cleanly
+   if a per-worker partition decision is needed first
+   (`effect-reification-plan.md` Phase 6).
+6. ~~**Boot subscription double-fire is UNCLEAR**~~ — **RESOLVED.**
+   The `_boot_fired/<dep_id>` marker rides the handler's writeset
+   (`worker_streaming.zig:1105`) — marker + handler effects commit
+   atomically. No "fired-but-not-marked" window; single-fire
+   semantics. The earlier "marker written AFTER" concern reflected a
+   pre-2026-05 implementation; current code is safe.
+7. ~~**Retire `http.send` as a Zig primitive**~~ — **DONE 2026-05-24**
+   via Phase 5 + the durability-as-JS-shim flip. ~4.7 kLOC of Zig
+   deleted; `webhook.send.js` / `email.send.js` compose durability
+   over kv markers + outbound HTTP + retry cron + boot subscription.
+8. ~~**Delete `src/connection_holder/` dead scaffold**~~ — **DONE
+   2026-05-27** via `effect-reification-plan.md` Phase 6 step 1.
+
 Known catalog gaps, *not* incoherence: streaming inbound body
-(gap 2.4 — design path: `readset-replication-plan.md` §4 + the
-inbound side of `primitive-gaps.md` §7's persist-before-observe
-rule; both designed, neither built), connection-actor inbound /
-WebSocket (gap 2.5 / §6.3), `http.cancelFetch` transport. Also:
-`src/connection_holder/` is superseded dead code carrying a
-parallel connection model — delete or clearly mark v2-WIP.
+(gap 2.4 — design locked in `streaming-model.md` §3; implementation
+pending), connection-actor inbound / WebSocket (see
+`docs/websocket-plan.md`), `http.cancelFetch` transport.
 
 ## 8. Relation to existing docs
 

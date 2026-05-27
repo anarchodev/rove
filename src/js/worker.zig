@@ -3484,13 +3484,16 @@ fn sweepTenantCron(
 /// Gap 2.1 Phase D: leader-side scan of new snapshot's `.boot`
 /// subscriptions; enqueue each one that hasn't fired yet (no
 /// `_boot_fired/<dep_id>` marker in tenant kv). The actual firing
-/// runs on a worker that drains the cross-thread inbox; that
-/// worker writes the marker post-fire via `writeBootFiredMarker`.
+/// runs on a worker that drains the cross-thread inbox.
 ///
-/// Idempotency contract: marker is written AFTER the activation;
-/// a crash between fire + marker leaves "fired-but-not-marked"
-/// state and the next reload refires. Customers' boot handlers
-/// must be idempotent (treat double-fire as benign).
+/// Idempotency contract: the `_boot_fired/<dep_id>` marker is
+/// injected into the handler's writeset BEFORE the handler runs
+/// (`worker_streaming.zig:1105`) so marker + handler effects
+/// commit atomically through raft. A crash before commit leaves
+/// nothing applied — next reload sees no marker, refires once.
+/// A crash after commit leaves marker + handler effects both
+/// applied — next reload skips. Single-fire semantics; no
+/// "fired-but-not-marked" window.
 fn enqueueBootSubscriptions(slot: *TenantSlot, snap: *TenantFilesSnapshot) !void {
     const node = slot.node orelse return; // unit-test slot: no node, no enqueue
     for (snap.subscriptions) |sub| {
