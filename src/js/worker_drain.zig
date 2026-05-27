@@ -1057,20 +1057,19 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
 ///
 /// Walks `worker.body_pending`, checks each parked entity's
 /// `BodyDurabilityWait.body_ref` against the owning tenant's
-/// `TenantBodies.buffer.last_flushed_batch_id`, and moves entities
-/// whose body is now durable back to `request_out` for re-dispatch.
-/// The next `dispatchOnce` tick picks them up; `dispatchPending`'s
-/// body-gate detects the non-sentinel `BodyDurabilityWait`
-/// component and skips the re-append, using the saved `body_ref`
-/// for `readset.trigger_payload`.
+/// docs/blob-coordinator-plan.md Phase 3: durability poll uses
+/// `node.blob_coordinator.durableSeq(worker_id)` instead of the
+/// per-tenant `BodyBuffer.isDurable`. Once the seq is durable, we
+/// materialize the wire `BodyRef` via `coord.bodyRef()` and stamp
+/// it onto the entity's `BodyDurabilityWait` so `dispatchPending`
+/// can stamp the readset on resume.
 ///
-/// Best-effort: a `tenant_bodies` map miss (tenant evicted between
-/// park and drain — shouldn't happen in practice) leaves the
-/// entity parked; the next tick re-checks. A `reg.move` failure
-/// panics (rove invariant — the entity must be in `body_pending`
-/// or the column slice is stale).
+/// Best-effort: missing coord (shouldn't happen post-init) skips
+/// the entity. A `reg.move` failure panics (rove invariant — the
+/// entity must be in `body_pending` or the column slice is stale).
 pub fn drainBodyPending(worker: anytype) !void {
     const server = worker.h2;
+    const coord = worker.node.blob_coordinator orelse return;
 
     const ents = worker.body_pending.entitySlice();
     const waits = worker.body_pending.column(BodyDurabilityWait);
@@ -1081,19 +1080,40 @@ pub fn drainBodyPending(worker: anytype) !void {
     var i: usize = 0;
     while (i < ents.len) : (i += 1) {
         const ent = ents[i];
-        const wait = waits[i];
-        // Sentinel: a default-empty `BodyDurabilityWait` means the
-        // entity got into `body_pending` without going through the
-        // park branch (shouldn't happen). Skip + leave for the
-        // next tick; the only way out is `reg.move`.
-        if (wait.body_ref.batch_id == bodies_mod.NO_BATCH) continue;
+        const wait = &waits[i];
+        // If already materialized (body_ref non-sentinel), skip —
+        // we already released this entity, just waiting for the
+        // dispatcher to pick it up.
+        if (wait.body_ref.batch_id != bodies_mod.NO_BATCH) continue;
 
-        const tb = worker.tenant_bodies.get(wait.tenant_id) orelse continue;
-        if (!tb.buffer.isDurable(wait.body_ref)) continue;
+        // Durability check via coord HWM (count semantics:
+        // worker_seq < durableSeq → resolved).
+        if (wait.worker_seq >= coord.durableSeq(wait.worker_id)) continue;
 
-        // Durable — release back to `request_out`. The component
-        // stays on the entity so `dispatchPending` detects the
-        // resume + skips re-append (plan §4 park flow).
+        // Resolved — look up the BodyRef. PutFailed → drop the
+        // request loudly; the customer needs to see the error
+        // rather than wait silently forever. UnknownSeq shouldn't
+        // happen for a seq we know is < durable_seq.
+        const ref = coord.bodyRef(wait.worker_id, wait.worker_seq) catch |err| {
+            std.log.warn(
+                "rove-js body-gate: coord.bodyRef tenant={s} seq={d}: {s}",
+                .{ wait.tenant_id, wait.worker_seq, @errorName(err) },
+            );
+            // Still release back to dispatch — the resume path
+            // sees NO_BATCH and treats it as the body-gate-failed
+            // branch, which writes a 500 response.
+            try server.reg.move(ent, &worker.body_pending, &server.request_out);
+            continue;
+        };
+        // Stamp the wire BodyRef. `batch_id` is the coord's
+        // per-(tenant, worker) wire_batch_id — replay constructs
+        // the S3 key as `{tenant}/readset-blobs/w{worker_id}/{batch_id:0>20}`
+        // identically to today.
+        wait.body_ref = .{
+            .batch_id = ref.wire_batch_id,
+            .offset = ref.offset,
+            .len = ref.len,
+        };
         try server.reg.move(ent, &worker.body_pending, &server.request_out);
     }
 }
@@ -1115,22 +1135,34 @@ pub fn drainBodyPending(worker: anytype) !void {
 /// `fireFetchEventActivation` takes ownership of the released
 /// event (deinit fires via its top-level `defer` on completion).
 pub fn drainFetchPendingDurability(worker: anytype) !void {
-    const allocator = worker.allocator;
+    const coord = worker.node.blob_coordinator orelse return;
     var i: usize = 0;
     while (i < worker.fetch_pending_durability.items.len) {
         const pe = &worker.fetch_pending_durability.items[i];
-        const tb = worker.tenant_bodies.get(pe.tenant_id_view);
-        const durable = if (tb) |t| t.buffer.isDurable(pe.body_ref) else false;
-        if (!durable) {
+        if (pe.worker_seq >= coord.durableSeq(pe.worker_id)) {
             i += 1;
             continue;
         }
-        // Take ownership: swapRemove returns the value, list
-        // shrinks. We pass &released.event to fireFetchEventActivation
-        // which takes ownership of the event bytes.
+        const ref = coord.bodyRef(pe.worker_id, pe.worker_seq) catch |err| {
+            std.log.warn(
+                "rove-js fetch-gate: coord.bodyRef tenant={s} seq={d}: {s}",
+                .{ pe.tenant_id_view, pe.worker_seq, @errorName(err) },
+            );
+            // Drop the parked event: free it and continue. Better
+            // surface would be to fire with a transport-error
+            // terminal, but Phase 3 keeps the existing "skip on
+            // body-gate failure" posture.
+            var released = worker.fetch_pending_durability.swapRemove(i);
+            components_mod.UpstreamFetchEvent.deinitItem(&released.event, worker.allocator);
+            continue;
+        };
         var released = worker.fetch_pending_durability.swapRemove(i);
-        worker_mod.fireFetchEventActivation(worker, &released.event, released.body_ref);
-        _ = allocator; // silence unused (might use for diagnostics later)
+        const wire_ref: bodies_mod.BodyRef = .{
+            .batch_id = ref.wire_batch_id,
+            .offset = ref.offset,
+            .len = ref.len,
+        };
+        worker_mod.fireFetchEventActivation(worker, &released.event, wire_ref);
         // Don't advance i — swapRemove placed a new element at this index.
     }
 }

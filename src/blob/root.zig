@@ -29,6 +29,8 @@ pub const env = @import("env.zig");
 pub const BlobBackendOwned = env.BlobBackendOwned;
 pub const http_blob = @import("http_blob.zig");
 pub const HttpBlobStore = http_blob.HttpBlobStore;
+pub const coordinator = @import("coordinator.zig");
+pub const BlobCoordinator = coordinator.BlobCoordinator;
 
 pub const Error = error{
     /// The key contained characters that could escape the blob store's
@@ -40,6 +42,12 @@ pub const Error = error{
     /// the interface surface is deliberately coarse so callers treat all
     /// backends uniformly.
     Io,
+    /// Transient backpressure from the backend — typically HTTP 503
+    /// (S3 SlowDown / sharding events) or 429 (rate limit). Callers
+    /// that retry (the blob coordinator's executor) should distinguish
+    /// these from terminal failures; callers without retry semantics
+    /// can treat this the same as `Io`.
+    SlowDown,
     OutOfMemory,
 };
 
@@ -153,4 +161,5 @@ test {
     _ = @import("backend.zig");
     _ = @import("http_blob.zig");
     _ = @import("curl_multi.zig");
+    _ = @import("coordinator.zig");
 }
