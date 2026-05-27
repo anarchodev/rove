@@ -679,14 +679,15 @@ Not done (intentional, out of scope for "lean"):
 
 ## Quality-of-life / risk tightening
 
-### 9. Raft-replicated `inflight_until_ns` lease on schedule rows
+### 9. Raft-replicated `inflight_until_ns` lease on schedule rows (~~retired 2026-05-24~~)
 
-Today it's in-memory per leader; double-fire window during leader
-change is wider than necessary.
-[`http-send-plan.md`](http-send-plan.md) §7 lists this as a v2
-candidate (~5-15ms extra propose per fire — batched amortization
-makes it cheaper). Not a blocker since at-least-once is the
-contract, but tightens the duplicate-delivery rate.
+Was on the v2 candidate list pre-2026-05-24: tightening the
+double-fire window during leader change by raft-replicating the
+in-memory inflight lease (~5-15ms extra propose per fire). Mooted by
+durability-as-JS-shim: the live `webhook.send` shim composes
+arming + retry in JS over ordinary envelope-0 kv writes; the
+boot-scan-on-leader-promotion pattern recovers without a per-fire
+lease propose. At-least-once remains the contract.
 
 ### 10. Cross-process metrics + health — **partially done 2026-05-11**
 

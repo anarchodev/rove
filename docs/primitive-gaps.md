@@ -22,7 +22,7 @@ shape — the runtime IS the Elm runtime).
 |---|---|---|
 | **Msg** (wake source) | `inbound_request`, `send_callback`, `timer`, `kv_wake`, `disconnect` | `streaming-handlers-plan.md` §2 + §4 |
 | **Cmd** (return shape) | `Response`, `__rove_next`, `__rove_stream` | `streaming-handlers-plan.md` §3 |
-| **Effects** (accumulated in batch) | kv writeset (env-0), `http.send` / `http.cancel` (env-0 `_send/owed/{id}` + leader-local SendDispatch) | `http-send-plan.md`, `apply.zig` |
+| **Effects** (accumulated in batch) | kv writeset (env-0), `webhook.send` (env-0 `_send/owed/{id}` marker via JS shim) | `src/js/bindings/webhook.send.js`, `effect-reification-plan.md` Phase 5 |
 | **Inline-synchronous side primitive** | kv triggers (BEFORE/AFTER prefix hooks) | `src/js/trigger_dispatch.zig` |
 | **Chain identity** | `correlation_id`, `ctx` | `streaming-handlers-plan.md` §5–§6 |
 

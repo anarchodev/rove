@@ -111,7 +111,6 @@ examples/       loop46-demo-tenants/ + bench drivers + standalones
 - [`docs/files-server-plan.md`](docs/files-server-plan.md),
   [`docs/logs-plan.md`](docs/logs-plan.md),
   [`docs/snapshot-plan.md`](docs/snapshot-plan.md),
-  [`docs/http-send-plan.md`](docs/http-send-plan.md),
   [`docs/observability-plan.md`](docs/observability-plan.md) — sub-plans
   for individual subsystems.
 - [`CLAUDE.md`](CLAUDE.md) — agent instructions including build

@@ -1,11 +1,20 @@
 # Raft snapshot plan — per-tenant indices, S3 transport, no global pause
 
+> **Status: SHIPPED 2026-05-11** (Phase 5.5(c)). Operator CLIs,
+> in-process periodic capture loop (`--snapshot-interval-ms`),
+> by-reference reuse for unchanged tenants, willemt raft log-compaction
+> (+ incremental_vacuum), stamp-and-compact (replacing the byte-capture
+> model originally specified here), and peer-to-peer catchup +
+> boot-time install all shipped. This doc is the architectural
+> reference; the original "what gets removed" + "migration order"
+> tracker sections have been pruned. The 2026-05-13 stamp-and-compact
+> pivot is reflected in `src/kv/cluster.zig`; see
+> `docs/snapshot-bench-results.md` for the bench arc.
+
 This document expands `docs/PLAN.md` Phase 5.5 item 3 ("Raft snapshot
-+ log compaction") into an implementable plan. It supersedes the
-delta-row snapshot wire protocol that exists in
-`src/kv/raft_snapshot.zig` today (which only fires meaningfully in
-`.kv` apply mode; the loop46 binary uses `.opaque_bytes` mode where
-snapshots currently capture no application state).
++ log compaction"). It superseded the delta-row snapshot wire protocol
+that existed in `src/kv/raft_snapshot.zig` (`.kv` apply mode only; the
+loop46 binary uses `.opaque_bytes` mode).
 
 Note: post-kvexp-cutover loop46 uses `kv.Cluster`, not
 `RaftNode`+`ApplyCtx`; `raft_snapshot.zig` is no longer the loop46
@@ -343,18 +352,19 @@ and their target stores are:
 
 (Envelope types 1 `log_batch` and 3 `files_writeset` go away per
 `logs-plan.md` and `files-server-plan.md` respectively. Envelope
-types 4 `webhook_enqueue`, 5 `webhook_complete`, and 6
-`webhook_retry_schedule` were retired 2026-05-09 — see
-`docs/http-send-plan.md`.)
+types 4/5/6 (webhook subsystem, 2026-05-06 generation) and 8/9/10/11
+(`schedules.db` generation, 2026-05-09) are all retired. See
+PLAN.md §10.2 envelope table for the full retirement record.)
 
-`schedules.db` is the cluster-wide consolidated schedule state.
 The compaction floor is `min(snapshot_idx)` across all entries —
-tenants + root + schedules.
+tenants + root.
 
 ### 4.5 Cross-db apply for envelope 5
 
-Superseded — see `docs/http-send-plan.md` for the `schedules.db`
-cross-db apply (envelopes 9/11).
+Superseded — webhook subsystem envelopes 4/5/6 retired 2026-05-09;
+the `schedules.db` generation that replaced it (envelopes 8/9/10/11)
+itself retired 2026-05-19; durability is now JS-shim composition over
+envelope-0 kv writes (no cross-db apply needed). See PLAN.md §10.2.
 
 ---
 
@@ -377,10 +387,11 @@ Read on apply-loop startup. Updated inside every apply transaction
 (same SQLite tx as the writeset). The follower uses this to filter
 applies: "only apply entry I to store S if I > S.last_applied".
 
-For envelopes that target multiple stores (envelope 9; see
-`docs/http-send-plan.md`), each target store's `_apply_state` is
-checked independently — the apply does only the parts that haven't
-been done yet.
+For envelopes that target multiple stores (historically envelope 9,
+now retired), each target store's `_apply_state` was checked
+independently — the apply does only the parts that haven't been done
+yet. The current envelope set (0 writeset / 1 multi / 2 root_writeset)
+is single-store per envelope, so this branch is dormant.
 
 ### 5.2 Snapshot load flow
 
@@ -496,75 +507,6 @@ loop46 restore-from-snapshot --snap-id <01HMx... matching Monday 11pm>
 
 Picks an older snapshot from S3. Same flow as §6.2. Any raft state
 past the snapshot's floor is discarded (operator confirms).
-
----
-
-## 7. What gets removed
-
-Note: post-kvexp-cutover loop46 uses `kv.Cluster`, not
-`RaftNode`+`ApplyCtx`; `raft_snapshot.zig` is no longer the loop46
-snapshot path.
-
-After this lands:
-
-- The current `raft_snapshot.zig` delta-row protocol
-  (`buildSnapData` / `applySnapData` / `kv.delta()`) becomes
-  irrelevant for `.opaque_bytes` mode (the only mode the loop46
-  binary uses). It can stay in place for any future `.kv`-mode user,
-  but it's not exercised by loop46.
-- The 500ms `SNAPSHOT_INTERVAL_NS` in `raft_snapshot.zig:31`
-  (constant still exists but is irrelevant — the periodic path is
-  `cluster.tickSnapshot` driven by `--snapshot-interval-ms`) —
-  replaced by a longer interval (5-15 min) appropriate for file
-  shipping.
-- The `kv_store.checkpoint()` call in `doSnapshot` — replaced by the
-  per-tenant VACUUM INTO captures.
-
-What's added:
-
-- `tenant_apply_idx` tracking in `ApplyCtx` (in-memory + persisted to
-  `_apply_state` per tenant).
-- The capture loop (above), running on the leader's raft thread on
-  the snapshot interval.
-- The S3 bucket layout for snapshots.
-- The follower's `applySnapData` replacement that downloads + atomic-
-  renames db files instead of installing rows.
-- The per-entry filter `if I <= T_last: skip` in the apply path.
-- A `loop46 restore-from-snapshot` admin CLI subcommand.
-
----
-
-## 8. Migration order
-
-Each step independently shippable + testable.
-
-Steps 1–7 (operator CLIs, follower load, `_apply_state` filter) are
-done. Only by-reference reuse for unchanged tenants and willemt
-log-compaction wiring remain deferred.
-
-1. **Add `_apply_state` table to KvStore schema** + the per-entry
-   filter in `applyOne`. Default behavior unchanged because the table
-   starts empty and `last_applied = 0` means everything applies.
-2. **Add `tenant_apply_idx` tracking to ApplyCtx.** Updated on every
-   apply; persisted to `_apply_state` in the same writeset
-   transaction.
-3. **Build the S3 snapshot capture loop** behind a feature flag
-   (`raft.snapshot_backend = none | s3`). Default `none` (current
-   delta protocol stays). Smoke: trigger snapshot, verify S3 layout
-   + manifest correctness.
-4. **Build the follower load path** for S3 snapshots — feature-flagged
-   to match the capture side. Smoke: hand-craft a snapshot in S3,
-   point a fresh follower at it, verify catch-up.
-5. **Switch the snapshot backend default to `s3`.** Validate in dev
-   that periodic snapshots happen, S3 grows correctly, manifest
-   references are stable across passes.
-6. **Bump snapshot interval from 500ms to 10min.** Validates that
-   the 500ms cadence isn't relied on anywhere else.
-7. **Build `loop46 restore-from-snapshot` CLI subcommand.** Smoke:
-   wipe a node's data, restore, verify it joins a running cluster.
-8. **Mark the existing delta protocol as `.kv`-mode-only** in the
-   doc comment; no code removal (it remains for any future `.kv`
-   mode use).
 
 ---
 
