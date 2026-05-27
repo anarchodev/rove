@@ -1057,7 +1057,7 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
 ///
 /// Walks `worker.body_pending`, checks each parked entity's
 /// `BodyDurabilityWait.body_ref` against the owning tenant's
-/// docs/blob-coordinator-plan.md Phase 3: durability poll uses
+/// docs/streaming-model.md §7: durability poll uses
 /// `node.blob_coordinator.durableSeq(worker_id)` instead of the
 /// per-tenant `BodyBuffer.isDurable`. Once the seq is durable, we
 /// materialize the wire `BodyRef` via `coord.bodyRef()` and stamp

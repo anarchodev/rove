@@ -2510,7 +2510,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             };
         } else if (body.len > 0) {
             // Large body (> INBOUND_INLINE_THRESHOLD) — coord
-            // submit + park. docs/blob-coordinator-plan.md
+            // submit + park. docs/streaming-model.md §7
             // Phase 3: bytes flow to the process-global coord,
             // we park on the resulting seq, drain materializes
             // the BodyRef once the seq is durable.

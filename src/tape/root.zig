@@ -99,7 +99,7 @@ pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
 /// Pre-launch — no v3 raft logs to migrate, hard cutover.
 /// Current writer version. Parser accepts both this and
 /// `READSET_VERSION_MIN_SUPPORTED`. 4 → 5 by
-/// `docs/blob-coordinator-plan.md` Phase 5: BodyRef wire shape is
+/// `docs/streaming-model.md §7` Phase 5: BodyRef wire shape is
 /// unchanged (`{u64 batch_id, u64 offset, u32 len}`), but the key
 /// template it resolves to switches from per-(tenant, worker)
 /// (`{tenant}/readset-blobs/w{worker_id}/{batch_id:0>20}`) to the
@@ -700,7 +700,7 @@ pub const Readset = struct {
 pub const ParsedReadset = struct {
     /// On-wire version this readset was serialized with. Carried so
     /// `BodyRef` resolvers (GC, replay) can pick the matching key
-    /// template — `docs/blob-coordinator-plan.md` Phase 5 split
+    /// template — `docs/streaming-model.md §7` Phase 5 split
     /// v4 (per-tenant lane) from v5 (cross-tenant `_pool/`).
     version: u16,
     timestamp_ns: i64,

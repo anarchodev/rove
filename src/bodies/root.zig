@@ -2,7 +2,7 @@
 //!
 //! Historically this module also held the per-tenant `BodyBuffer`
 //! that accumulated bytes in RAM and periodically PUT to S3. As of
-//! `docs/blob-coordinator-plan.md` Phase 3 (2026-05-27), body flush
+//! `docs/streaming-model.md §7` Phase 3 (2026-05-27), body flush
 //! moved to the process-global `blob.BlobCoordinator`; the only
 //! survivors here are the on-wire shape (`BodyRef`, `NO_BATCH`) and
 //! the leaf-key formatter (`batchKey`) that replay + upload-walker

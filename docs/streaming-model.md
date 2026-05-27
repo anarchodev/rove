@@ -374,6 +374,206 @@ No step changes a shipped buffered handler, a shipped
 
 ---
 
+## 7.X Substrate — the blob coordinator
+
+The blob coordinator is **the deterministic streaming-bytes substrate
+for handler activations**. Its job is to make the bytes a handler sees
+addressable + durable so replay can reconstruct them. Storage
+efficiency (coalescing, S3 batching) is the means to that end.
+
+Every handler-visible byte stream goes through it: inbound bodies
+(>16 KB whole-body or per-chunk streaming), outbound `http.fetch`
+chunks (`on_chunk`). The inline path (≤16 KB bodies riding in the
+raft entry) and `pipe_to` (bytes flow runtime-to-wire without entering
+a handler activation) deliberately bypass — they don't need the
+substrate's services.
+
+### 7.1 API
+
+```zig
+pub const BlobCoordinator = struct {
+    /// One queue entry per Msg the handler would otherwise receive
+    /// directly (§7.5). Returns the submission's monotonic sequence
+    /// number on the worker's own queue. Ownership of `bytes`
+    /// transfers to the coordinator.
+    pub fn submit(self: *BlobCoordinator, worker_id: u8, bytes: []u8) !u64;
+
+    /// Per-worker high water mark — every submission on `worker_id`'s
+    /// queue with seq <= return value is durable in S3. Atomic load.
+    pub fn durableSeq(self: *BlobCoordinator, worker_id: u8) u64;
+
+    /// Lookup the BodyRef for a durable submission. Only valid after
+    /// observing seq <= durableSeq(worker_id). PutFailed on terminal
+    /// batch failure.
+    pub fn bodyRef(self: *BlobCoordinator, worker_id: u8, seq: u64) !BodyRef;
+};
+
+pub const BodyRef = struct {
+    batch_id: u64,   // globally unique via raft reservation (§7.3)
+    offset: u64,
+    len: u32,
+};
+```
+
+The model mirrors raft's `commit_index` exactly: per-worker
+`submission_seq` is the analog of `log_index`; per-worker
+`durable_seq` is the analog of `commit_index`. The worker's existing
+readiness loop polls `durableSeq` (cheap atomic) and walks its
+parked-Msg list when the HWM advances. One condvar per worker,
+batched wakeup, no per-submission metadata. The park-on-durability
+gate IS the HWM check.
+
+### 7.2 Architecture — raft-thread pattern
+
+Three thread classes per node:
+
+- **Worker threads** (N≈4): receive H2 / curl_multi events, assemble
+  Msgs, push submissions, park Msgs locally, walk parked list on HWM
+  advance.
+- **Batch builder** (1, the drainer): single thread, raft-proposer
+  pattern. Waits on a single eventfd; on wake, round-robin drains
+  every worker's MPSC queue and hands sealed batches to the executor.
+- **Executor pool** (K=32 default): one PUT per thread; bounded
+  exponential backoff for 503/429 (`Error.SlowDown`); terminal failure
+  surfaces via `bodyRef(seq)` returning `PutFailed`.
+
+Total new threads: 1 drainer + 32 executors = 33 per node. K is tuned
+to OVH's 117 MB/s wire ceiling (K=32 saturates without timeouts; K=64
+saturates with ~7 timeouts/2000; K=128 past the knee). Env override
+`ROVE_BLOB_COORDINATOR_K`.
+
+Why this shape:
+- No global pending-queue mutex contention (one producer + one
+  consumer per queue).
+- Matches the existing raft-proposer / fetch-engine convention.
+- Worker thread never touches the executor or any cross-process lock.
+
+### 7.3 Object key + batch-id reservation
+
+```
+_pool/{batch_id:0>20}     — cross-tenant pool object
+```
+
+`batch_id` is globally unique via raft reservation. The leader
+reserves a block of N=10000 ids in one raft propose
+(`_system/coord_next_pool_batch`), mints from the local block, and
+asynchronously prefetches the next block when the current hits 80%
+low-watermark. Submit never waits on raft. On leadership change, the
+new leader reads the committed counter and reserves strictly above —
+old block's unused ids are orphaned gaps (harmless; bucket lifecycle
+reaps unreferenced objects).
+
+Cross-tenant pool keys are zipf-tail-friendly: most tenants are small;
+per-tenant lanes overrun OVH's ~135 req/s small-object request cap
+well before bytes/sec is the bottleneck. The flat prefix surfaces the
+per-account request-rate cap instead.
+
+Encryption-at-rest for cross-tenant pools is a deferred design;
+callers submit plaintext until an encryption-at-submitter layer slots
+between caller and coord.
+
+### 7.4 Batching policy — executor-driven
+
+Body-flush bench data showed fixed size/time thresholds barely matter
+at high arrival rates: the implicit batch is "everything that arrived
+while the previous PUT was in flight." Threshold approaches misjudge
+across workloads.
+
+The coordinator seals on **executor backpressure**:
+
+```
+loop {
+    wait until executor has a free slot
+    drain all currently-pending submissions into a batch
+    seal + hand to executor
+}
+```
+
+Self-tuning: under load, batches naturally grow (more arrivals per
+executor cycle); under light load, batches shrink (a single
+submission gets PUT immediately). The only bound: per-batch byte cap
+(~16 MB) so a single batch doesn't pin too much RAM or exceed a
+per-PUT timeout budget. Safety cap, not a tuning knob.
+
+### 7.5 Submission boundary = handler activation boundary
+
+One queue entry per Msg the handler would otherwise receive directly:
+
+| Source | Submission boundary | Notes |
+|---|---|---|
+| Inbound body (>16 KB, buffered) | Whole body, after H2 END_STREAM | One Msg, one submission |
+| Inbound body (streaming, §3) | Each chunk, as H2 DATA frames arrive | Per-chunk activation after durability |
+| Outbound `on_chunk` | Each chunk, as curl_multi delivers it | Many Msgs per fetch |
+| Outbound `pipe_to` | n/a — bypasses coordinator | Bytes don't enter handler (`project_pipe_to_untaped`) |
+| Inline path (≤16 KB body) | n/a — bypasses coordinator | Bytes ride in raft entry directly |
+
+Sub-Msg submissions (one per H2 DATA frame within a buffered body) are
+forbidden — they don't correspond to anything the handler sees.
+Super-Msg submissions (accumulating across multiple chunks) are also
+forbidden — they delay the natural delivery boundary and break the
+HWM-advance unpark mechanism.
+
+This is the load-bearing invariant: when worker W's `durable_seq`
+advances to N, every parked Msg on W with `seq <= N` becomes
+deliverable. Walk the list, fire the callback. No additional metadata
+to consult. Replay tape determinism follows: each handler activation
+corresponds to exactly one taped Msg, regardless of how coord chose
+to batch the underlying bytes.
+
+### 7.6 Invariants
+
+1. **Per-worker `durable_seq` is monotonic non-decreasing.** The
+   in_flight tracker uses a sorted set; on batch commit, remove
+   completed seqs and advance to `min(in_flight) - 1`. Analog of
+   raft's "commit_index only advances over contiguous quorum'd prefix."
+2. **BodyRef once issued is stable.** Bytes at
+   `(batch_id, offset, offset+len)` are immutable for the BodyRef's
+   lifetime. Pool objects never overwritten in place.
+3. **Within-worker ordering preserved.** A < B in push order ⇒
+   A's seq < B's seq, and `durable_seq` reaches A before B. Across
+   workers: no ordering guarantee.
+4. **Globally unique batch_id.** Reserved via raft. New-leader-after-
+   election starts strictly higher than any prior reservation.
+5. **PUT failure surfaces visibly.** Terminal failure does NOT advance
+   `durable_seq` past the failed seq; `bodyRef(seq)` returns
+   `PutFailed`; the request fails loudly.
+
+### 7.7 Locked rejections (do not re-propose)
+
+- **Compaction of pool objects.** Pool objects are immutable.
+  Lifecycle rules expire them after the retention period.
+  Compaction-with-reference-rewrite requires a logical-id-indirection
+  layer (essentially "rebuild CAS for pool objects") — its own plan.
+- **MPU (multipart upload).** Our 16 MB safety cap means we'll never
+  produce a single object big enough to benefit. If a future workload
+  changes that, MPU goes here as a new subsection.
+- **curl_multi migration for blob.** S3 PUTs are bulk-blocking; the
+  thread-per-PUT model fits the workload (decided 2026-05-24).
+- **Multi-node coordinator coordination.** Each rove process has its
+  own coordinator. The 117 MB/s ceiling is per-server; multi-node
+  aggregation happens via the obvious "each node uses its own wire"
+  pattern.
+- **Log batches through the coordinator** (descoped 2026-05-27). Log
+  objects are self-describing (sidecar header + deflated frames); the
+  indexer discovers them by LIST and parses each as a standalone batch.
+  Coord's coalescing model can't preserve that shape without
+  redesigning both formats. `log_server/batch_store_s3.zig` keeps
+  owning log PUTs.
+
+### 7.8 Open work
+
+**Phase 6 cleanup** (pending): delete dead per-source batching /
+threshold code; remove the `ROVE_BODY_FLUSH_POOL_SIZE` env var;
+sweep stale comments in worker.zig / worker_dispatch.zig /
+worker_drain.zig that still describe the pre-coord per-tenant
+BodyBuffer flow.
+
+History: per-tenant lanes (Phases 0-3 shipped 2026-05-27) →
+cross-tenant `_pool/` + raft-reserved batch_id (Phase 5 shipped
+2026-05-27); see `project_blob_coordinator_state` memory entry.
+
+---
+
 ## 8. Open questions
 
 - **Coalesce budget above the 64 KiB floor.** The 64 KiB

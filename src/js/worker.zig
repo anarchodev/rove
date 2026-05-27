@@ -156,7 +156,7 @@ pub const RaftWait = struct {
 /// worker_seq)` durability key and the owning tenant id, then
 /// `reg.move`s the entity from `request_out` to `body_pending`.
 ///
-/// docs/blob-coordinator-plan.md Phase 3: durability is observed
+/// docs/streaming-model.md §7: durability is observed
 /// via `node.blob_coordinator.durableSeq(worker_id) > worker_seq`.
 /// `drainBodyPending` polls that atomic and, on advance, looks up
 /// `coord.bodyRef(worker_id, worker_seq)` to materialize the wire
@@ -195,7 +195,7 @@ pub const BodyDurabilityWait = struct {
 /// when `fireFetchEventActivation` flipped its `parked_to_durability`
 /// flag).
 ///
-/// docs/blob-coordinator-plan.md Phase 3: durability is observed
+/// docs/streaming-model.md §7: durability is observed
 /// via the process-global coordinator. `drainFetchPendingDurability`
 /// polls `coord.durableSeq(worker_id) > worker_seq` each tick. On
 /// advance, it looks up `coord.bodyRef(worker_id, worker_seq)`,
@@ -1128,7 +1128,7 @@ pub const ManifestPrefetchMap = std.StringHashMapUnmanaged(PrefetchedManifest);
 /// `RequestIdMinter` bakes the worker_id into the request id's upper
 /// 16 bits — sharing the minter would alias request ids across
 /// workers.
-/// `docs/blob-coordinator-plan.md` Phase 5: reservation provider
+/// `docs/streaming-model.md §7` Phase 5: reservation provider
 /// context. Stored on `NodeState`; lives as long as the
 /// `BlobCoordinator` it backs. Refill thread inside the coord calls
 /// `reserveFn` whenever its block runs low — we read the latest
@@ -1319,7 +1319,7 @@ pub const NodeState = struct {
     /// the response + calls `enqueueFetchEventForTenant`.
     fetch_engine: ?*fetch_engine_mod.FetchEngine = null,
 
-    /// `docs/blob-coordinator-plan.md` Phase 3: process-global write
+    /// `docs/streaming-model.md §7` Phase 3: process-global write
     /// coordinator for readset blob PUTs. Replaces the per-worker
     /// `BodyFlushPool`. All worker bodies (inbound + outbound fetch
     /// chunks > 16 KB) submit here; the coord runs one drainer + K=32
@@ -1327,13 +1327,13 @@ pub const NodeState = struct {
     /// NodeState is wired + `num_workers` is known.
     blob_coordinator: ?*blob_mod.BlobCoordinator = null,
 
-    /// `docs/blob-coordinator-plan.md` Phase 5: backend that owns
+    /// `docs/streaming-model.md §7` Phase 5: backend that owns
     /// the cross-tenant `_pool/` prefix the coordinator writes
     /// against. Opened once in `startBlobCoordinator`, deinit'd in
     /// `deinit` (after the coord itself shuts down + joins).
     pool_backend: ?blob_mod.BlobBackend = null,
 
-    /// `docs/blob-coordinator-plan.md` Phase 5: heap-owned reservation
+    /// `docs/streaming-model.md §7` Phase 5: heap-owned reservation
     /// provider context. Lives as long as `blob_coordinator` does so
     /// the coord's refill thread can resolve cluster + raft handles
     /// after init returns.
@@ -1683,7 +1683,7 @@ pub const NodeState = struct {
         self.fetch_engine = fe;
     }
 
-    /// `docs/blob-coordinator-plan.md` Phase 3 + Phase 5: spawn the
+    /// `docs/streaming-model.md §7` Phase 3 + Phase 5: spawn the
     /// process-global blob coordinator. Idempotent. Called once from
     /// `main.zig` after NodeState is wired + `num_workers` is known
     /// (the coord allocates per-worker queues up front).
@@ -1754,7 +1754,7 @@ pub const NodeState = struct {
         self.coord_reservation_ctx = res_ctx;
     }
 
-    /// `docs/blob-coordinator-plan.md` Phase 5: wire the cluster
+    /// `docs/streaming-model.md §7` Phase 5: wire the cluster
     /// handle so `startBlobCoordinator` can install the raft-backed
     /// reservation provider. MUST be called before
     /// `startBlobCoordinator`; once the coord is running this is a
@@ -2459,7 +2459,7 @@ pub fn Worker(comptime opts: Options) type {
                 try self.tenant_logs.put(allocator, try TenantLog.open(self, inst));
             }
 
-            // docs/blob-coordinator-plan.md Phase 3: body flush
+            // docs/streaming-model.md §7: body flush
             // moved to the process-global BlobCoordinator
             // (NodeState.blob_coordinator). The per-worker
             // body_flush_pool is gone; the flusher_thread still
@@ -2498,7 +2498,7 @@ pub fn Worker(comptime opts: Options) type {
         fn flusherLoop(self: *Self) void {
             const FLUSHER_TICK_NS: u64 = 50 * std.time.ns_per_ms;
             while (!self.flusher_should_stop.load(.acquire)) {
-                // docs/blob-coordinator-plan.md Phase 3: body flush
+                // docs/streaming-model.md §7: body flush
                 // is now driven by the process-global coordinator's
                 // own drainer + executor threads — no per-tick call
                 // from the worker. Log flush + upload-walker still
@@ -2543,7 +2543,7 @@ pub fn Worker(comptime opts: Options) type {
                 t.join();
                 self.flusher_thread = null;
             }
-            // docs/blob-coordinator-plan.md Phase 3: body_flush_pool
+            // docs/streaming-model.md §7: body_flush_pool
             // removed; coord lives on NodeState and shuts down there.
             // Stop the push thread AFTER the flusher: the flusher
             // enqueues to push_queue, so stopping push first would
@@ -4190,7 +4190,7 @@ pub fn fireFetchEventActivation(
         inline_bytes_for_tape = event.bytes;
     } else if (event.bytes.len > 0) {
         // Larger-than-threshold chunk — coord submit + park.
-        // docs/blob-coordinator-plan.md Phase 3: submit returns a
+        // docs/streaming-model.md §7: submit returns a
         // seq; durability is observed via the coord's per-worker
         // HWM. Always park (no fast-durable bypass — submit is
         // strictly async, durable_seq can't have advanced past
