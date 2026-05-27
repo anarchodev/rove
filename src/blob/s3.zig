@@ -324,7 +324,7 @@ pub const S3BlobStore = struct {
 
         const easy = self.pool.acquire();
         defer self.pool.release(easy);
-        const resp = easy.request(body_allocator, .{
+        var resp = easy.request(body_allocator, .{
             .method = method,
             .url = url,
             .headers = &headers,
@@ -336,6 +336,9 @@ pub const S3BlobStore = struct {
             );
             return Error.Io;
         };
+        // HttpResp only carries status + body; headers would silently
+        // leak otherwise.
+        resp.deinitHeaders(body_allocator);
 
         return .{
             .status = resp.status,
