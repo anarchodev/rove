@@ -658,14 +658,9 @@ wire-format change.
 - **E1**: K thread pool, each calling synchronous `BlobStore.put`.
   Matches today's blob-side model. Predictable, simple.
 - **E2**: One executor thread driving `curl_multi` with K transfers.
-  Matches the eventual unified transport story
-  (`docs/curl-multi-plan.md`).
-- **Recommendation: E1.** `curl-multi-plan.md` §7.B explicitly
-  rejected multi-migration for blob ("S3 PUTs are bulk-blocking,
-  many cores each pushing one big body fits the workload"). The
-  coordinator doesn't change that calculus — same workload, same
-  per-PUT shape. E1 also means we don't block on curl_multi work
-  shipping first.
+- **Recommendation: E1.** S3 PUTs are bulk-blocking; many cores each
+  pushing one big body fits the workload. curl_multi migration for
+  blob is explicitly out of scope (decided 2026-05-24).
 
 ### F. Where the coordinator lives — process-global or per-worker?
 
@@ -760,8 +755,9 @@ big-PUT latency for one small request. Bench at low load to verify.
   its own coordinator. Per [[project-s3-throughput-ceiling]] the
   117 MB/s ceiling is per-server; multi-node aggregation happens
   via the obvious "each node uses its own wire" pattern.
-- **curl_multi migration for blob.** Per `curl-multi-plan.md` §7.B,
-  explicitly rejected; this plan inherits that rejection.
+- **curl_multi migration for blob.** Explicitly out of scope —
+  S3 PUTs are bulk-blocking; the thread-per-PUT model fits the
+  workload (decided 2026-05-24).
 
 ## 10. Interaction with adjacent plans
 
@@ -805,13 +801,7 @@ wrapper around `flush_writer.writeBatch`'s `store.put(obj_key, obj)`
 using the `Error.SlowDown` variant rove-blob already emits (Phase 2);
 no coord dependency.
 
-### 10.4 `docs/curl-multi-plan.md`
-
-§7.B locked out blob migration to curl_multi. This plan inherits
-that. The coordinator drives the existing `Easy` pool, same as
-today's flusher.
-
-### 10.5 [[project-inputs-durable-outputs-derivable]]
+### 10.4 [[project-inputs-durable-outputs-derivable]]
 
 Pool objects are **input-cache** for the system — they hold bytes
 the system depends on for replay. They are NOT outputs (handler
@@ -819,7 +809,7 @@ results, derived data). The compaction story for input-cache is
 "keep forever" or "lifecycle-policy-expire after replay window";
 both are consistent with this plan's "no compaction in v1" choice.
 
-### 10.6 [[project-s3-throughput-ceiling]]
+### 10.5 [[project-s3-throughput-ceiling]]
 
 The 117 MB/s ceiling stands. The coordinator's job is to reach
 that ceiling more consistently across workload shapes, not to

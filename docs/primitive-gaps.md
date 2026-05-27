@@ -275,23 +275,22 @@ files-server.
 
 ### 2.5 Held outbound subscription (external-push wake) — **DONE 2026-05-24**
 
-**Shipped via `docs/curl-multi-plan.md` Phase 3.** Distinct surface
-from the option-B "decompose into `__rove_stream` with direction
-parameter" recommendation below: the JS binding is `http.subscribe`
-(a thin shim sibling of `http.fetch`) wrapping a `held: bool` flag
-on the existing `PendingFetch` shape. The unified-Cmd refactor is
-deferred to the eventual reification Phase 4.X where the Cmd union's
-`held_subscribe` variant gets the direction-parameter treatment.
+**Shipped 2026-05-24** via `src/js/fetch_engine.zig` + `http.subscribe`
+binding (`src/js/bindings/http.zig`). Distinct surface from the
+option-B "decompose into `__rove_stream` with direction parameter"
+recommendation below: the JS binding is `http.subscribe` (a thin shim
+sibling of `http.fetch`) wrapping a `held: bool` flag on the existing
+`PendingFetch` shape. The unified-Cmd refactor is deferred to the
+eventual reification Phase 4.X where the Cmd union's `held_subscribe`
+variant gets the direction-parameter treatment.
 
-Engine machinery: `FetchEngine` (Phase 2's curl_multi-driven
-transport) treats `held=true` PendingFetches with no timeout,
-counted against a per-tenant cap (`HELD_MAX_PER_TENANT=16` in
-`src/js/fetch_engine.zig`). Cap rejection fires a defined
-`final: true, ok: false` event so the customer's `on_chunk`
-handler runs once and can surface the condition.
+Engine machinery: `FetchEngine` (curl_multi-driven transport) treats
+`held=true` PendingFetches with no timeout, counted against a
+per-tenant cap (`HELD_MAX_PER_TENANT=16` in `src/js/fetch_engine.zig`).
+Cap rejection fires a defined `final: true, ok: false` event so the
+customer's `on_chunk` handler runs once and can surface the condition.
 
-Cancellation via `http.cancelSubscription({id})` — cooperative, per
-`curl-multi-plan.md` §5 invariant 3.
+Cancellation via `http.cancelSubscription({id})` — cooperative.
 
 Smokes: `scripts/subscription_smoke.py` +
 `scripts/subscription_cap_smoke.py`.
