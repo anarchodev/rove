@@ -574,6 +574,16 @@ Encryption-at-submitter is **deferred** to a later phase (callers
 submit plaintext; once an encryption layer lands, it slots between
 caller and `coord.submit` with no wire change).
 
+**Shipped 2026-05-27.** Cross-tenant pool live; `_system/coord_next_pool_batch`
+replicated via envelope-2 root-writeset (mirrors `acme.zig`'s local-put-
+then-propose pattern). Reservation block size 10 000 with 80% low-water-
+mark prefetch on a background refill thread; drainer never blocks on
+raft. `READSET_VERSION = 5` (parser accepts v4 + v5; v4 path retained for
+existing raft-log entries). All 644+ unit tests green; `ctl_smoke`,
+`files_server_smoke`, `leader_failover_smoke` (critical for cross-leader
+uniqueness via `proposeAndWait`), `penalty_smoke`, `body_throughput_probe`,
+`fetch_chunk_smoke` all PASS against S3 backend.
+
 ### Phase 6 — cleanup
 
 Delete dead per-source batching / threshold code. Remove

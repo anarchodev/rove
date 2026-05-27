@@ -1105,12 +1105,11 @@ pub fn drainBodyPending(worker: anytype) !void {
             try server.reg.move(ent, &worker.body_pending, &server.request_out);
             continue;
         };
-        // Stamp the wire BodyRef. `batch_id` is the coord's
-        // per-(tenant, worker) wire_batch_id — replay constructs
-        // the S3 key as `{tenant}/readset-blobs/w{worker_id}/{batch_id:0>20}`
-        // identically to today.
+        // Stamp the wire BodyRef. Phase 5: `batch_id` is the coord's
+        // globally-unique pool batch_id; the S3 key is
+        // `{key_prefix_base}_pool/{batch_id:0>20}`.
         wait.body_ref = .{
-            .batch_id = ref.wire_batch_id,
+            .batch_id = ref.batch_id,
             .offset = ref.offset,
             .len = ref.len,
         };
@@ -1158,7 +1157,7 @@ pub fn drainFetchPendingDurability(worker: anytype) !void {
         };
         var released = worker.fetch_pending_durability.swapRemove(i);
         const wire_ref: bodies_mod.BodyRef = .{
-            .batch_id = ref.wire_batch_id,
+            .batch_id = ref.batch_id,
             .offset = ref.offset,
             .len = ref.len,
         };

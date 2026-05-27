@@ -1497,12 +1497,16 @@ pub fn main() !void {
     // once + drops).
     try node_state.startFetchEngine();
 
-    // docs/blob-coordinator-plan.md Phase 3: process-global write
-    // coordinator for readset blob PUTs. Spawned before workers
+    // docs/blob-coordinator-plan.md Phase 3 + Phase 5: process-global
+    // write coordinator for readset blob PUTs. Spawned before workers
     // because they reach into `node.blob_coordinator` from their
-    // body-flush path. `num_workers` caps at u8 (255) — bench
-    // sweeps run up to 32, so plenty of headroom.
+    // body-flush path. `num_workers` caps at u8 (255) — bench sweeps
+    // run up to 32, so plenty of headroom. Phase 5: wire the cluster
+    // handle BEFORE `startBlobCoordinator` so the coord's reservation
+    // provider can read root + propose envelope-2 to mint globally-
+    // unique `batch_id` blocks.
     std.debug.assert(num_workers <= std.math.maxInt(u8));
+    node_state.setCluster(cluster);
     try node_state.startBlobCoordinator(@intCast(num_workers));
 
     // streaming-handlers-plan §4.6: hand the apply path a pointer
