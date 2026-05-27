@@ -190,8 +190,9 @@ handler — not a new return-value variant. Adding a new return
 shape (which we don't anticipate) would be a new Cmd — those are
 the customer-facing surface and are deliberately capped at three.
 
-The handler-cmds structural refactor (`docs/handler-cmds-refactor-plan.md`,
-shipped 2026-05-20) made this framing the literal architecture:
+The handler-cmds structural refactor (shipped 2026-05-20,
+`streaming-handlers-foundation` `f231a8e`→`6c3f60a`) made this framing
+the literal architecture:
 chain-level state lives on the entity's components (no side
 tables), the entity's collection IS the dispatch state (no enum
 flags), and the runtime's three resume engines (`resumeContinuation`
