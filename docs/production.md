@@ -7,7 +7,7 @@
 > prod" vs "nice to have."
 >
 > Read alongside [`PLAN.md`](PLAN.md) §13 (live process map) and
-> [`phase-5.5-rollout.md`](phase-5.5-rollout.md) (Phase 5.5 status).
+> §9 Phase 5.5 (shipped-status summary).
 
 ## Hard blockers — without these, the cluster won't survive sustained traffic
 
