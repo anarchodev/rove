@@ -999,9 +999,6 @@ Resolved items moved to §10. Open items:
   per-tenant snapshot indices, S3 transport, no global
   write-pause. Replaces the row-level delta protocol in
   `src/kv/raft_snapshot.zig`.
-- `docs/phase-5.5-rollout.md` — orchestration plan across the
-  five Phase 5.5 sub-plans (a/b/c/d/e), with per-piece status.
-  The right place to start when picking up Phase 5.5 work.
 - `docs/sim-test-framework.md` — §10.7 + §10.8 expansion: simulator
   module, `_tests/` directory, `loop46 test` / `loop46 simulate`.
 - `docs/fixture-lifecycle.md` — §10.9 + §10.11 expansion: fixture
@@ -1167,7 +1164,7 @@ Build sessions between 2026-04-17 and 2026-04-30 shipped Phases 1–4, 6, and 8 
 - (d) **webhook subsystem — done 2026-05-06, then superseded 2026-05-09.** Phase 5.5 (d) shipped exactly as planned: cluster-wide `webhooks.db`, envelopes 4/5/6, multi-envelope wrapper (envelope 7), leader-pinned `webhook-server` thread, dispatcher cutover. The customer-facing `webhook.send` API was preserved. **2026-05-09 generalization** (commits `deb5bba` → `cf375bf`): the dedicated webhook subsystem was deleted in favor of a more general `http.send` / `http.cancel` primitive (`src/schedule_server/`, envelopes 8/9/10/11, `schedules.db`) — same architectural shape (cluster-wide raft-replicated row store, leader-pinned thread, atomic with the writeset via the type-7 multi), broader semantics (arbitrary scheduled HTTP, not just webhook delivery). `webhook.send` is now a JS polyfill (`src/js/bindings/webhook.js`); retry policy is a customer-side library (`src/js/bindings/retry.js`). `webhooks.db` and the `webhook_server` module are gone. The customer-visible API is preserved by composition. See `docs/http-send-plan.md`.
 - (a) **logs — done 2026-05-06.** `log-server-standalone` runs on `logs.{public_suffix}` with TLS + JWT-handoff auth. Workers batch in memory and PUT `.ndjson` (gzip-deflated + sidecar prefixed) directly to the configured `BatchStore` (S3 or fs). The standalone polls + maintains a local SQLite `log_index.db`. Per-tenant `log.db`, envelope type 1, and the worker's `/_system/log/*` proxy all gone. Tape body GETs land via range read on the inline ndjson blob (`66861d1`). Detail in `docs/logs-plan.md`.
 - (e) **files-server — done 2026-05-06 (F1 + F2-push + F2-storage + process split).** `files-server-standalone` runs on `https://files.{public_suffix}` with TLS + JWT-gated routes. Manifest JSON lives in a per-tenant `deployments/` BlobBackend; runtime release pointer (`_deploy/current`) lands in the tenant's app.db and rides envelope 0 through raft. Worker has no `files.db`, no `/_system/files/*` proxy, no `code_proxy`. Dashboard / CLI POST `/_system/release {tenant_id, dep_id}` on the worker after a deploy; a process-wide `ReleaseTable` carries the signal across worker threads and `applyPendingReleases` triggers bytecode reload on next dispatch tick. files-server-standalone owns the **admin + replay deploys** too — bootstrap PUTs the embedded JS to S3 + raft-replicates `_deploy/current` via a JWT with `cap=release`. Envelope type 3 retired. Detail in `docs/files-server-plan.md`.
-- (c) **snapshot — done 2026-05-11.** Operator CLIs, in-process periodic capture loop (`--snapshot-interval-ms`), by-reference reuse for unchanged tenants, willemt raft log-compaction (+ incremental_vacuum), stamp-and-compact replacing byte-capture, and peer-to-peer catchup + boot-time install all shipped. See `docs/production.md` §1.1/§1.2/§3 and `docs/phase-5.5-rollout.md`.
+- (c) **snapshot — done 2026-05-11.** Operator CLIs, in-process periodic capture loop (`--snapshot-interval-ms`), by-reference reuse for unchanged tenants, willemt raft log-compaction (+ incremental_vacuum), stamp-and-compact replacing byte-capture, and peer-to-peer catchup + boot-time install all shipped. See `docs/production.md` §1.1/§1.2/§3 and `docs/snapshot-plan.md`.
 
 **The big architectural payoff from Phase 5.5**: the loop46 binary now ships only what *participates in raft* (workers + raft node + schedule-server thread + the snapshot capture loop). Two external services run as separate processes on their own subdomains (`files-server-standalone`, `log-server-standalone`); neither participates in raft and both carry their state in S3. This matches §6b's separability principle, and §10.13's "post-1.0 detach" is now mostly *complete* — see §13 for the live process map.
 
@@ -1410,7 +1407,7 @@ What's gone from the worker: `/_system/files/*` and `/_system/log/*` route handl
 
 What's left of the original §10.13 sketch: the proposed "admin's JS handler integrates with files-server / log-server via `http.send` and SSE-pushed callbacks" composition is **not** how the dashboard talks to those services today — the dashboard fetches them directly with the services-token JWT. That sketch was about avoiding worker-mediated proxying; the proxy is already gone, so the sketch is moot.
 
-Detail in `docs/files-server-plan.md` §11 + `docs/phase-5.5-rollout.md` §"(a) logs" / §"(e) files-server".
+Detail in `docs/files-server-plan.md` §11 + `docs/logs-plan.md`.
 
 ### 10.14 Distributed Elm ports: webhook + callback + streaming (decided 2026-04-30; SSE port re-shaped 2026-05-19)
 
