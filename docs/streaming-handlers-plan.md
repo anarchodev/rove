@@ -1,16 +1,15 @@
 # Streaming handlers — `__rove_stream`, wake-driven activations, customer-arbitrary SSE
 
-**Status:** Design exploration (pre-freeze). The shipped primitive is the
-one-shot §6.4 trampoline (`__rove_next` + http.send-completion wake + deadline);
-this doc describes the **iterative generalization + wake-source extension**
-that lets customer-arbitrary SSE endpoints — and more — be expressible as
-ordinary handlers. Conceptually, it is the implementation of
-`docs/connection-actor-plan.md` **§6.2 (SSE projection)**, which §12 deferred.
+**Status:** SHIPPED. Phases 1–5 landed across 2026-05; the structural
+refactor was committed on `streaming-handlers-foundation` (`f231a8e` →
+`6c3f60a`) and Phase 5 dissolved the platform-managed SSE pipe
+(2026-05-19). This doc is now the reference for the as-built primitive.
+Originally framed as the implementation of `docs/connection-actor-plan.md`
+**§6.2 (SSE projection)**, which §12 deferred.
 
-The previous "platform SSE" subsystem (`src/sse_server/`, collapsed in-process
-by task #10 Phases 1–5 — see connection-actor-plan §12.4) is downstream:
-once this lands, the platform-managed SSE pipe dissolves into a JS layer over
-the new primitive (§8).
+The previous "platform SSE" subsystem (`src/sse_server/`, deleted by
+task #10 Phase 5 — see connection-actor-plan §12.4) has dissolved into
+the JS layer described in §8.
 
 ---
 
