@@ -265,10 +265,10 @@ is already computing.
 
 This does not change the proposer tally (it is not a proposer);
 it adds one **read-derived** escaped-effect site that the
-invariant must also cover. `unified-effect-gating.md` §2's
-invariant is hereby read to bind **effects derived from a read of
-speculative state**, not only effects released by their own
-proposer. The clean-read path (`saw_speculation == false`, the
+invariant must also cover. The commit-gate invariant
+(`docs/effect-reification-plan.md`'s L4) is hereby read to bind
+**effects derived from a read of speculative state**, not only
+effects released by their own proposer. The clean-read path (`saw_speculation == false`, the
 overwhelming common case — a clean read of applied state) is
 unaffected and keeps its zero-cost fast path; the ~100k-req/s
 single-tenant readonly floor does not regress.
@@ -479,7 +479,7 @@ no entity; see below).
 |---|---|---|
 | Shape | The per-request root writeset rides the **same atomic raft entry** as the batch (a type-2 inner in the existing type-7 multi — `apply` already routes inners per-target). One seq, parked by the existing `finalizeBatch` machinery verbatim. Removes the fire-and-forget entirely. | Capture the `proposeRootWriteSet` seq; gate the request's response on `max(batch_seq, root_seq)`. |
 | Correctness | Atomic admin op (all-or-nothing), single gate, **zero** `drainRaftPending` change. | Correct, but needs a second seq on `RaftWait` + drain logic to wait on both. |
-| Blast radius | Touches batch **accumulation** — per-request root writesets must accumulate into a batch-level root writeset parallel to the app.db writeset (multiple admin requests per batch). This *is* the "one-request-lifecycle" / envelope-merge refactor `unified-effect-gating.md` §4 calls Option A. | Touches the **core `RaftWait`/`drainRaftPending` park struct** every H2 request depends on — the "dragon" §7 warns against (Stage-5-class). |
+| Blast radius | Touches batch **accumulation** — per-request root writesets must accumulate into a batch-level root writeset parallel to the app.db writeset (multiple admin requests per batch). This *is* the Option-A "one-request-lifecycle" / envelope-merge refactor now realized in `docs/effect-reification-plan.md`. | Touches the **core `RaftWait`/`drainRaftPending` park struct** every H2 request depends on — the "dragon" §7 warns against (Stage-5-class). |
 | Verdict | **Recommended.** Strictly better correctness and removes code, but it is a *deliberate* refactor, not a session-tail patch. Subsumes idiom-2's caller-seq-threading and idiom-2-scopeKv for free (same accumulate-into-the-batch mechanism). | Smaller-looking but modifies the most sensitive shared machinery for a narrower win; not recommended as the primary path. |
 
 ### ACME (idiom-3's other half) is a different animal

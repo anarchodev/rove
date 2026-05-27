@@ -1,10 +1,10 @@
 # The effect algebra
 
 > **Status**: synthesis, 2026-05-22. Built from the effect-system audit
-> in §5. This is the cross-cutting frame that `unified-effect-gating.md`,
-> `primitive-gaps.md` §5, `streaming-model.md`, and
-> `connection-actor-plan.md` are each a facet of — see §8. It is the
-> ground truth for the question "does this new effect fit the model?"
+> in §5. This is the cross-cutting frame that `primitive-gaps.md` §5,
+> `streaming-model.md`, and `connection-actor-plan.md` are each a facet
+> of — see §8. It is the ground truth for the question "does this new
+> effect fit the model?"
 
 ## 1. The model in one paragraph
 
@@ -93,7 +93,7 @@ connection-write, response-write, `events.emit`. Also an open family.
 > only after the Model write of the same activation has committed
 > (`committedSeq() >= seq`).
 
-L4 is the `unified-effect-gating.md` invariant. A Cmd is durable only by
+L4 is the commit-gate invariant: no externally-observable effect may be released until `committedSeq() >= seq`. A Cmd is durable only by
 *being, or writing, a Model key* — there is no other route to durability
 (corollary of L1). kv-write is the degenerate Cmd runtime whose target
 *is* the Model.
@@ -302,8 +302,9 @@ What the algebra predicts, each collapsing N runtimes to 1:
    `_cont` / `_stream`, `parked_continuations`, `stream_data_out` /
    `stream_response_in`, `fetch_event_pending` — roughly seven
    collections, park/wake/resume hand-rolled in each. The destination
-   is `unified-effect-gating.md` §4 **Option A**: one parametric
-   Continuation, instantiated per resume-behavior (the *collections*
+   (the **Option-A one-request-lifecycle convergence**; realized by
+   `effect-reification-plan.md`) is one parametric Continuation,
+   instantiated per resume-behavior (the *collections*
    stay — distinct behavior is distinct state, which is ECS-idiomatic;
    the *code* is shared). This auto-fixes backpressure unevenness (the
    wake ring becomes universal) and the cross-worker scan (the primitive
@@ -442,10 +443,10 @@ parallel connection model — delete or clearly mark v2-WIP.
 This doc does not replace any of these — it is the frame they are facets
 of.
 
-- **`unified-effect-gating.md`** — the Continuation singleton (Option A)
-  and the L4 commit-gate (the `ParkedUnit` reconciler). Option B
-  (mechanism) shipped; Option A (the one-request-lifecycle collapse) is
-  the open destination this doc calls "one Continuation runtime."
+- **`effect-reification-plan.md`** — the realization of "one Continuation
+  runtime" (the Option-A one-request-lifecycle convergence) and the L4
+  commit-gate as a generalized `ParkedUnit` reconciler. Option-B
+  mechanism shipped; the Option-A collapse is the active phasing.
 - **`primitive-gaps.md` §5** — four of the laws stated as per-gap
   disciplines (affine, commit-gated, replayability, bounded tape). §6
   is the bound on L3's tape; §7 is the customer-facing surface

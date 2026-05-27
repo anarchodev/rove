@@ -1,14 +1,10 @@
 # Effect reification plan
 
-> **Status**: planned, not started — 2026-05-22.
+> **Status**: Phases 0–5 SHIPPED 2026-05-24 (commit `b908953`); Phase
+> 4.1 is the next active sub-phase. See §6 for per-phase status.
 > **Prerequisite reading**: `docs/effect-algebra.md` (the model this plan
-> reifies) and `docs/unified-effect-gating.md` (the Option-A/B framing —
-> this plan *is* the Option-A convergence).
-> **Hard prerequisite**: the `streaming-model` branch must be merged to
-> main first. Reification is a tree-wide refactor of the dispatch core;
-> running it concurrently with a major feature branch guarantees merge
-> conflict. Phase 0 (read-only inventory) can be done anytime; Phase 1+
-> starts post-merge.
+> reifies). The Option-A/B framing this plan *is* the convergence of is
+> folded into §3.3 + §4.
 
 ## 1. Goal
 
@@ -98,8 +94,8 @@ audit against.
 
 ### 3.3 The Continuation + reconciler
 
-Generalizes the already-shipped `ParkedUnit` (`unified-effect-gating.md`
-Option B) into the universal primitive.
+Generalizes the already-shipped Option-B `ParkedUnit` mechanism into
+the universal primitive.
 
 ```zig
 // effect/continuation.zig
@@ -148,7 +144,9 @@ reconcile tick → commit ? interpret(cmds) + resume : discard + rollback
 ```
 
 A released Cmd whose transport completes calls `enqueueMsg` — the loop
-closes on itself. This is `unified-effect-gating.md §4` Option A.
+closes on itself. This is the Option-A one-request-lifecycle
+convergence — every Msg-driven activation runs through the same
+park/drain/release machinery, regardless of origin.
 
 ## 4. Current state — the bespoke sites to collapse
 
@@ -175,8 +173,8 @@ returns a Cmd-list (`project_handler_returns_cmds`, shipped 2026-05-20);
 the `ParkedUnit` commit-gated reconciler mechanism (Option B).
 
 **Option-B `ParkedUnit` migration state — substantially complete for
-the externally-observable-effect class.** Against
-`unified-effect-gating.md §5`:
+the externally-observable-effect class.** Against the idiom-1 through
+idiom-4 classification:
 
 - **idiom-1** (`tenant_batch` internal + callback) — MIGRATED. Registrants:
   anchor path `worker_dispatch.zig:697-709` (`parkSendOps` +
@@ -206,8 +204,8 @@ the externally-observable-effect class.** Against
   streaming-handlers Phase 5 (note at `loop46/main.zig:1325-1340`).
   `ParkedUnit` carries no `emits` field because the surface no longer
   exists; customers compose SSE on `__rove_stream` + kv-write wakes.
-  `effect-algebra.md §7` worklist #7 and `unified-effect-gating.md §6`'s
-  systemic SSE-emit fix should both be marked closed-by-retirement.
+  `effect-algebra.md §7` worklist #7 (the systemic SSE-emit fix) is
+  closed-by-retirement.
 
 Remaining fire-and-forget proposers (ACME, proof, config-mirror) sit
 in the re-derivable / self-healing class, not the
@@ -245,8 +243,9 @@ interleave. Phase 4 needs 3; Phase 5 needs 3+4.
 
 - **Goal**: remove all unknowns before touching code.
 - **Steps**: fill §4's table with exact `file:line`; establish the
-  Option-B `ParkedUnit` migration state against `unified-effect-gating.md
-  §5`; run the gating smoke set (§7) and record green; run kv-bench (hot
+  Option-B `ParkedUnit` migration state against §4's idiom
+  classification; run the gating smoke set (§7) and record green; run
+  kv-bench (hot
   single-tenant + 8w sharded) and record the baseline numbers *into this
   doc*.
 - **Done**: §4 table exact; baseline numbers recorded here; smoke set
@@ -1543,8 +1542,8 @@ Deferred (no trigger yet):
 
 If picking up a different sub-phase entirely:
 
-1. Read `docs/effect-algebra.md`, then this doc, then
-   `docs/unified-effect-gating.md §4–§5`.
+1. Read `docs/effect-algebra.md`, then this doc — especially §3.3 +
+   §4 for the Option-A/B framing.
 2. Check `git log main..effect-reification` for the current branch
    state — every shipped phase has a commit message explaining what
    landed.

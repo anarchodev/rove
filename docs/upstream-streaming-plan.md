@@ -1,7 +1,10 @@
 # Upstream streaming — `http.fetch` (a new non-durable primitive)
 
-**Status:** Phase A shipped (types + enum variants) under the
-reframe. Implements `docs/primitive-gaps.md` §2.3.
+**Status:** DONE 2026-05-21 (`docs/primitive-gaps.md` §2.3 closed).
+Pattern A (`on_chunk`) + Pattern B (`pipe_to`) + `CURLOPT_WRITEFUNCTION`
+streaming transport all shipped. This doc is now the reference for the
+as-built `http.fetch` primitive; the phased-build section (§10) was
+removed when the last phase landed.
 
 **Reframe note (2026-05-20):** the original framing extended
 `http.send` with streaming options. That's the wrong host —
@@ -345,141 +348,7 @@ activation.
 
 ---
 
-## 10. Phased build
-
-Each phase keeps build + all 13 streaming/heldsync/ctl smokes green.
-
-### Phase A — Wire-format & types — **SHIPPED**
-
-- 3 new `ActivationSource` variants: `fetch_chunk`, `fetch_done`,
-  `fetch_pipe_done`.
-- `UpstreamFetchEvent` component (bytes + offset + seq +
-  fetch_id + fetch_headers + ctx + variant-specific terminal
-  fields).
-- Build clean, no behavior change yet.
-
-(Tape encoding for chunk payloads stays as Phase G work, paired
-with the §6 tape cap that already covers replay determinism for
-both fetch and held-subscription cases.)
-
-### Phase B — `http.fetch` JS binding — **next**
-
-- New `globals.zig` binding: `jsHttpFetch(ctx, opts) -> fetch_id`.
-- Option extraction + validation: `on_chunk` vs `pipe_to`
-  exclusivity, `pipe_to == "held_response"` only, defaults for
-  `max_response_chunk_bytes` / `max_total_response_bytes`.
-- `BuiltFetch` carrier struct (separate from `BuiltSend` —
-  `http.fetch` is non-durable, so no `_send/owed/` write).
-- Returns a `fetch_id` (sha256 of request_id + http_fetch_index,
-  deterministic for replay).
-- Binding queues the fetch into `NodeState.fetch_pending`
-  (a transient list — no kv, no raft). Phase C drains it.
-- `http.cancelFetch({id})` binding for cancellation.
-
-### Phase C — Fetch-pool thread + cross-thread chunk inbox — SHIPPED
-
-C1 (`f69fd57`) — producer: `http.fetch` binding → `PendingFetch`
-carrier → per-`DispatchState` accumulator → flushed to
-`NodeState.fetch_pending` at handler success.
-
-C2 (`3e71cde`) — consumer: `NodeState.fetch_pool` — 8 dedicated
-threads (separate `EasyPool` from `SendDispatch`, separate
-saturation domain). Each drains `fetch_pending`, fires libcurl,
-re-chunks the response into `≤ max_response_chunk_bytes` units,
-hash-routes one `UpstreamFetchEvent` per chunk + a terminal to a
-per-worker `fetch_chunk_inbox` (mirrors `SubscriptionFireInbox`).
-
-**Streaming transport (shipped after E):** the libcurl call is
-`Easy.requestStreaming` — a `CURLOPT_WRITEFUNCTION`-driven
-transfer that hands each writeback to `fetch_pool.onBody` as it
-arrives. `onBody` emits a chunk event per writeback immediately
-(splitting only a writeback larger than `max_response_chunk_bytes`)
-— so an SSE / LLM-token upstream drives `on_chunk` / the pipe in
-real time. `max_response_chunk_bytes` is a per-chunk size *ceiling*,
-not a batching threshold — small frames are never buffered waiting
-for it. Verified by `scripts/fetch_streaming_smoke.py`: an
-infinite-drip upstream + a 2 s `timeout_ms` delivers ~17 chunks
-before the timeout (a buffered transport would deliver 0).
-
-### Phase D — `fetch_chunk` / `fetch_done` activations (Pattern A) — SHIPPED
-
-- New per-worker rove collection `fetch_event_pending`
-  (`UpstreamFetchEvent` component) + `serviceFetchEvents` =
-  `drainFetchChunkInbox` (inbox → collection, slices MOVE, no
-  re-dup) + `dispatchFetchEvents` (stable-snapshot, `BATCH=64`).
-- `fireFetchEventActivation` — twin of `fireSubscriptionActivation`
-  (no held socket, forgetful writes); resolves `on_chunk` /
-  `on_done` module by kind, correlation_id `fetch-<id>`,
-  `request.activation = { kind, fetch_id, seq, byteOffset, bytes
-  (Uint8Array), headers? }` (chunk) or `{ kind, fetch_id, ok,
-  status }` (terminal).
-- `UpstreamFetchEvent` carries `tenant_id` + `on_chunk_module` +
-  `on_done_module` so each event is self-describing (no fetch_id
-  → module registry).
-- Smoke (`scripts/fetch_chunk_smoke.py`): customer GET fires
-  `http.fetch({url, on_chunk, on_done})` against a 170-byte
-  upstream with a 64-byte chunk cap; verifies 3 `fetch_chunk`
-  activations (seq order, byteOffset, ctx round-trip, headers on
-  seq 0 only) + one `fetch_done` + byte-exact body reconstruction.
-
-### Phase E — `pipe_to` Pattern B — SHIPPED
-
-- `http.fetch({pipe_to:"held_response"})` stamps the issuing
-  chain's `correlation_id` onto the `PendingFetch`; the
-  `FetchPool` carries it + a `pipe_to_held` flag onto every
-  `UpstreamFetchEvent`. The pipe terminal uses `kind = .pipe_done`.
-- New `PipeState` component on the StreamRow: `awaiting_pipe`
-  (set by a `__rove_stream({waitFor:{fetch_pipe_done}})` return —
-  keeps `serviceParkedStreams` from closing the stream while the
-  upstream still feeds it), `bytes_piped`, `done` + terminal
-  fields.
-- `dispatchFetchEvents` routes `pipe_to_held` events:
-  `.chunk` → `pipeAppendChunk` finds the held stream by
-  `correlation_id` (scans the 5 h2 stream collections +
-  `raft_pending_stream`) and `StreamChunks.tryAppend`s the bytes
-  — **no handler activation, no tape** ([[project_pipe_to_untaped]]);
-  `.pipe_done` → `pipeMarkDone` stamps `PipeState`.
-- `serviceParkedStreams`: once a pipe stream's chunks have
-  shipped and `PipeState.done`, fires the single
-  `fetch_pipe_done` activation (`resumeStream`); `awaiting_pipe`
-  cleared first so it is one-shot.
-- `request.activation` for `fetch_pipe_done`: `{ kind, ok,
-  status, bytes_piped, dropped_chunks }`.
-- Smoke (`scripts/pipe_smoke.py`): customer GET →
-  `http.fetch({url, pipe_to})` + `__rove_stream` → the client
-  receives the upstream's 170 bytes byte-for-byte; `fetch_pipe_done`
-  fires once with `ok=true, status=200, bytes_piped=170,
-  dropped_chunks=0`.
-
-**The pipe path is structurally untaped:** piped bytes never
-enter a handler `runOutcome`, so there is no activation for the
-replay tape to record. The §6 per-chain tape cap is therefore an
-`on_chunk` (Pattern A) concern only.
-
-### Phase F — caps + backpressure
-
-- `max_response_chunk_bytes` / `max_total_response_bytes`
-  enforced libcurl-side; cancellation path on exceed.
-- Send-chunk inbox cap + `dropped_chunks` counter on the chain.
-- Smoke: huge upstream response → `dropped_chunks > 0` surfaces
-  on `send_pipe_done`.
-
-### Phase G — Replay determinism
-
-- Tape per-chunk entries (small inline, large content-addressed).
-- Replay shell consumes them in order.
-- Smoke: capture a tape, replay it, byte-identical chunks.
-
-### Phase H — Docs + framing
-
-- Update `streaming-handlers-plan.md` §6 / §4 to reference
-  upstream-chunk wakes.
-- Update `primitive-gaps.md` §2.3 row to DONE.
-- Memory pointer.
-
----
-
-## 11. Out of scope (v1)
+## 10. Out of scope (v1)
 
 - **Streaming inbound request body (Gap 2.4).** Symmetric
   but covered by its own gap; shares chunk dispatch
