@@ -1497,7 +1497,7 @@ pub fn main() !void {
     // once + drops).
     try node_state.startFetchEngine();
 
-    // docs/blob-coordinator-plan.md Phase 3 + Phase 5: process-global
+    // docs/streaming-model.md §7 + Phase 5: process-global
     // write coordinator for readset blob PUTs. Spawned before workers
     // because they reach into `node.blob_coordinator` from their
     // body-flush path. `num_workers` caps at u8 (255) — bench sweeps

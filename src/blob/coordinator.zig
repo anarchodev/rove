@@ -1,6 +1,6 @@
 //! Process-global write coordinator for object-storage PUTs.
 //!
-//! See `docs/blob-coordinator-plan.md` for the full design. As of
+//! See `docs/streaming-model.md §7` for the full design. As of
 //! Phase 5 (2026-05-27), submissions land in a single cross-tenant
 //! pool under `{key_prefix_base}_pool/{batch_id:0>20}`; the per-
 //! (tenant, worker) lane shape Phase 3 shipped is gone. `batch_id`

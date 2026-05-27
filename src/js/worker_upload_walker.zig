@@ -312,7 +312,7 @@ pub fn walkAndUploadCatchup(worker: anytype) !void {
 /// raft entry's readset list. The (version, tenant_id, batch_id)
 /// tuple lets the GC orchestrator pick the matching key template
 /// when deciding which S3 object to delete —
-/// `docs/blob-coordinator-plan.md` Phase 5 split v4 (per-tenant
+/// `docs/streaming-model.md §7` Phase 5 split v4 (per-tenant
 /// lane) from v5 (cross-tenant `_pool/`).
 ///
 /// `tenant_id` is allocator-owned by the caller's passed-in list
