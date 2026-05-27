@@ -1437,7 +1437,3 @@ always-on. Do not re-litigate without new evidence.
 - [`webhook-server-plan.md`](webhook-server-plan.md) — the
   webhook-specific subsystem this design replaces. Kept in tree for
   history; will be pruned after migration step 5.
-- [`notifications.md`](notifications.md) — the customer-facing
-  notifications channel. `http.send` and notifications cover
-  different jobs (outbound vs inbound; durable scheduled vs
-  ephemeral push); both compose well.

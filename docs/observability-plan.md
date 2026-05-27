@@ -298,7 +298,6 @@ Each standalone gets:
 - **Common:** `rove_http_requests_total`, `rove_http_request_duration_seconds`, `rove_panics_total`, `rove_build_info`.
 - **files-server:** `rove_files_server_compile_seconds` (histogram), `rove_files_server_uploads_total{outcome}`, `rove_files_server_deploys_total{outcome}`.
 - **log-server:** `rove_log_server_query_seconds` (histogram, exemplars), `rove_log_server_query_bytes_scanned_total{backend}` — the S3 list/get amplification signal.
-- **sse-server:** `rove_sse_connections_active`, `rove_sse_emits_total{outcome}`, `rove_sse_resync_total` (the cache-miss signal from `docs/sse-plan.md`).
 
 ## 7. Sequencing
 
