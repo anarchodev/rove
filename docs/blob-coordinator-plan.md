@@ -36,6 +36,15 @@ for body submissions specifically. Log flush stays on its direct
 `_logs/{node_hex}/` and parses each object's self-describing sidecar)
 is incompatible with coord's coalescing — see §6 Phase 4 + §10.3.
 
+**Scope revised 2026-05-27 (cross-tenant pool):** Phase 3 shipped
+per-(tenant, worker) keys as a transitional shape; Phase 5 collapses
+all body submissions into a single flat pool (`_pool/{batch_id:0>20}`)
+with `batch_id` made globally unique via raft reservation (§3.5b). The
+forcing function is zipf — most tenants are small, and per-tenant
+lanes produce too many tiny S3 objects vs the per-account request-rate
+cap (~135 req/s small-objects per [[project-s3-throughput-ceiling]]).
+Encryption-at-rest for cross-tenant pools is its own phase, deferred.
+
 ## 2. Why now — what the per-tenant lane model can't reach
 
 The body-flush fan-out shipped 2026-05-26 (commit `c8a864d`) parallelizes
@@ -211,16 +220,62 @@ Why this shape:
 ### 3.3 Object key shape
 
 ```
-{tenant_id}/_pool/{batch_id}     — when batch contains one tenant's bytes
-_pool/{node_id}/{batch_id}       — when batch coalesces multiple tenants
-                                   (v2; needs encryption — see §7.A)
+_pool/{batch_id:0>20}            — cross-tenant pool object
 ```
 
-Tenant-leftmost preserves OVH's prefix-sharding distribution invariant
-(per [[project-s3-throughput-ceiling]] the cap is per-account not
-per-prefix on this bucket, but tenant-leftmost is still the right
-shape for sharding at scale and matches the existing file-blobs /
-log-blobs / readset-blobs convention).
+**Revised 2026-05-27.** Phase 3 shipped per-(tenant, worker) prefix
+(`{tenant}/readset-blobs/w{worker_id}/{batch_id:0>20}`) as a
+transitional shape so the wire format could stay
+`{batch_id, offset, len}` against the existing readset wire. Phase 5
+moves to a single flat pool: one S3 object holds bytes from many
+tenants, demuxed by `BodyRef.(offset, len)`. The forcing function is
+zipf-distributed tenant traffic — most tenants are small, so the
+per-tenant lane keeps producing tiny objects whose count overruns the
+~135 req/s small-object cap (per [[project-s3-throughput-ceiling]])
+well before bytes/sec is the bottleneck.
+
+`batch_id` is globally unique by construction via raft reservation
+(§3.5b), so no node_id or per-tenant scoping is needed in the path.
+The flat prefix means OVH's per-account request-rate cap is the
+relevant ceiling, not per-prefix sharding (which is what
+tenant-leftmost would have given us — moot once we're not per-tenant).
+
+**Encryption-at-rest** for cross-tenant pools is its own design
+(deferred to a later phase). For now, callers submit plaintext bytes;
+when an encryption-at-submitter scheme lands, the same wire format
+holds — encryption is a transparent layer between caller and coord.
+
+### 3.5b Batch-id reservation via raft
+
+The single globally unique `batch_id` counter lives in cluster state.
+Adding a raft round-trip per body PUT would be unacceptable latency;
+instead the leader **reserves a block** of N ids in one raft propose
+and mints from it locally:
+
+```
+1. At startup (and as block runs low), coord proposes a
+   root-writeset envelope advancing _system/coord_next_pool_batch
+   by N. On commit, coord owns [base, base + N).
+2. Each coord.submit mints batch_id = next++ from the local block.
+3. Low-watermark trigger: when next >= base + 0.8 × N, coord
+   asynchronously proposes the next reservation in the background.
+   By the time the current block exhausts, the next is already
+   committed — no submit ever waits on raft.
+4. On leadership change / process restart, the new leader reads
+   _system/coord_next_pool_batch and reserves a fresh block strictly
+   above all previously-reserved blocks. Old block's unused ids are
+   orphaned (gap), which is harmless — no key collisions because
+   the new base is monotonically higher.
+```
+
+- Default N = 10000. Default low-watermark = 0.8 (= 8000). At sustained
+  100 batches/sec the prefetch fires every ~80 s.
+- Followers' coord never reserves (only the leader writes bodies; the
+  raft propose path is leader-gated anyway).
+- The "reservation block lost on leadership change" gap is the only
+  permanent waste — at N = 10000 and one election per day, that's
+  ≤10000 batch_ids/day of sparse keys in S3. Bucket lifecycle reaps
+  unreferenced objects.
 
 ### 3.4 Batching policy — executor-driven, not threshold-driven
 
@@ -369,10 +424,12 @@ plus those = within 64-slot budget.
    A's seq is less than B's, and `durable_seq` reaches A before B.
    (Across workers: no ordering guarantee — each worker has its own
    queue and HWM.)
-5. **Per-tenant prefix preserved for v1.** Single-tenant batches go to
-   `{tenant}/_pool/{batch_id}`. Multi-tenant batches go to
-   `_pool/{node}/{batch_id}` but only when v2 (encryption-at-submitter)
-   lands.
+5. **Globally unique batch_id.** Reserved via raft (§3.5b); the
+   leader cannot mint a batch_id below any previously-committed
+   reservation. Same-node restart skips the old block (gap is fine);
+   different-leader-after-election starts strictly higher. Eliminates
+   the silent-overwrite hazard the per-(tenant, worker) scoping
+   covered transitionally in Phase 3.
 6. **PUT failure surfaces visibly.** A batch that terminally fails
    does NOT advance `durable_seq` past its seqs. The worker's
    `bodyRef(seq)` lookup returns `error.PutFailed`. The parked Msg
@@ -474,18 +531,48 @@ task if metrics show 503s in production.
 
 The coordinator's purpose is now **body coalescing specifically**.
 
-### Phase 5 — BodyRef format change
+### Phase 5 — cross-tenant pool + raft-reserved batch_id
 
-Extend `BodyRef` in raft entries: `{batch_id, offset, len}` →
-`{object_key, offset, len}`. Either:
-- (a) **Version byte** prepended: 0 = old shape (existing entries
-  still readable), 1 = new shape. Both readers handle both versions.
-- (b) **Coordinated cutover**: new code reads both formats, old code
-  errors on new format; deploy new code everywhere before any new
-  entries are produced. Simpler if we can stop-the-world; impossible
-  if not.
+**Revised 2026-05-27.** Originally framed as "BodyRef format change
+to `{object_key, offset, len}`." Refined after the zipf-distribution
+discussion (most tenants are small, per-tenant lanes produce too many
+tiny S3 objects) and the realization that node_id / object_key
+strings aren't needed if `batch_id` is globally unique by raft
+reservation (§3.5b). Net wire change is just a `READSET_VERSION` bump
+and a key-template switch on the reader side.
 
-Lock in §7.D.
+Concrete scope:
+
+1. **Add `_system/coord_next_pool_batch` to apply.zig** — a root-
+   writeset-replicated u64. Coord proposes increments via the
+   existing type-2 envelope path (same machinery as ACME
+   `cert/{host}`).
+2. **Coord refactor:**
+   - Open one shared backend with prefix `_pool/`. Drop
+     `BackendKind.per_tenant`, `PerTenantConfig`, `getOrOpenSlot`,
+     `TenantWorkerSlot`, the per-(tenant, worker) `next_batch_id`
+     map, and `sealByTenant`'s tenant bucketing.
+   - Add `BatchIdReservation { base, next, end }` block state +
+     low-watermark prefetch (§3.5b).
+   - `submit(worker_id, bytes) → seq` (drop `tenant_id` — coord no
+     longer routes on it).
+   - Drainer seals one batch per cycle across all submissions.
+   - `BodyRef` drops `wire_batch_id` (it's just `batch_id` now).
+3. **Tape wire format:**
+   - `READSET_VERSION = 5`.
+   - Parser branches: v4 = old per-tenant template
+     (`{tenant}/readset-blobs/w{worker_id}/{id:0>20}`), v5 = pool
+     template (`_pool/{id:0>20}`).
+   - BodyRef wire shape unchanged: `{u64 id, u64 offset, u32 len}`.
+4. **Worker call sites:** `coord.submit(worker_id, bytes)` (no
+   tenant_id); drain materializes wire BodyRef as before.
+5. **Upload walker:** v5 entries → walk `_pool/` and cross-reference
+   batch_ids. v4 entries → keep the existing per-tenant walk path
+   for as long as v4 entries exist in the raft log.
+
+Encryption-at-submitter is **deferred** to a later phase (callers
+submit plaintext; once an encryption layer lands, it slots between
+caller and `coord.submit` with no wire change).
 
 ### Phase 6 — cleanup
 
@@ -504,11 +591,18 @@ Delete dead per-source batching / threshold code. Remove
   align with tenant boundaries).
 - **A2**: v1 batches mix tenants. Encryption-at-submitter required
   upfront. Cleaner end state, slower to ship.
-- **Recommendation: A1.** Defers the encryption question to a
-  separate plan. Still gets the K=32 parallelism + 503 centralization
-  + cross-source coalescing wins. Cross-tenant coalescing earns its
-  keep on many-low-volume-tenant workloads which we don't have at
-  launch.
+
+**Initial recommendation: A1** (Phase 3 shipped under this).
+
+**Revised 2026-05-27: A2** (Phase 5 ships this). The "many-low-volume-
+tenant workloads which we don't have at launch" reasoning was wrong:
+launch *is* the zipf tail. Per-(tenant, worker) lanes produce one tiny
+S3 object per low-traffic tenant per flush window, overrunning the
+~135 req/s small-object cap before bytes/sec is the bottleneck.
+
+Encryption-at-submitter is **deferred** — callers submit plaintext for
+now; an encryption layer slots between caller and coord later with no
+wire-format change.
 
 ### B. Batching policy — executor-driven or threshold-driven?
 
@@ -635,8 +729,10 @@ big-PUT latency for one small request. Bench at low load to verify.
 
 ## 9. Out of scope — locked rejections (do not re-propose)
 
-- **Cross-tenant coalescing in v1.** Locked by §7.A. v2 only, gated
-  on encryption-at-submitter plan.
+- ~~**Cross-tenant coalescing in v1.**~~ Reversed 2026-05-27 — now
+  the Phase 5 target (§7.A revised). Encryption-at-submitter is
+  deferred (callers submit plaintext until an encryption layer slots
+  in between caller and coord).
 - **Compaction of pool objects.** Pool objects are immutable.
   Lifecycle rule on the bucket expires them after retention period.
   Compaction-with-reference-rewrite is the killer problem we
