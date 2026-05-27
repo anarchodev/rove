@@ -54,7 +54,6 @@ Each decision includes the **why**, often with notes on alternatives that were c
 
 - **C1 auth (admin)**: HttpOnly + Secure + SameSite=Lax session cookies on `app.rewindjs.com`. Opaque session tokens, stored server-side in root.db, revocable.
 - **C2 auth (customer's end users)**: customer's problem. We expose primitives (HMAC helper, cookie parse/serialize, encrypted KV). Customer's handler code mints and verifies whatever token/cookie shape it wants. Because customer UI and customer API share one origin, cookies are first-party out of the box.
-- **C2 sessions for SSE (`_rove_sess`)**: a separate platform-managed cookie (HttpOnly + Secure + SameSite=Lax) eagerly minted on handler invocations to give every browser a stable identity for the SSE/events stream (§2.12). NOT an auth claim — just an opaque id. Customer binds session→user themselves if they need that link. Distinct namespace from the customer's own auth cookies above.
 - **Magic-link signup**:
   1. `POST /v1/signup` with name + email.
   2. Server validates name available, creates instance, deploys starter content, assigns `{name}.rewindjs.app`, mints magic token (32 bytes, 15-min TTL, single-use, hashed under `_magic/{hash}`), fires `email.send`.
@@ -69,7 +68,7 @@ Each decision includes the **why**, often with notes on alternatives that were c
 **Handlers are pure functions of `(request, kv_snapshot)`.** Deterministic only.
 
 - No `fetch`, no `setTimeout`, no uncaptured `Date.now()` / `Math.random()`.
-- All external effects route through declarative Cmd-style primitives: `webhook.send` (§2.6) for outbound HTTP, `email.send` (§2.6) for transactional mail, `events.emit` (§2.12) for live UI push to the customer's connected clients. Each accumulates a deterministic Cmd record on the dispatch state during the handler's transaction; at commit, the Cmds ride alongside the kv writeset through raft, and a separate delivery loop carries them out.
+- All external effects route through declarative Cmd-style primitives: `webhook.send` (§2.6) for outbound HTTP, `email.send` (§2.6) for transactional mail. Each accumulates a deterministic Cmd record on the dispatch state during the handler's transaction; at commit, the Cmds ride alongside the kv writeset through raft, and a separate delivery loop carries them out. Live UI push composes on `__rove_stream` + kv-write wakes (see §2.12).
 - All nondeterministic inputs are tape-captured.
 - Every request gets a fresh QuickJS context via snapshot-restore (existing mechanism in `src/js/worker.zig`).
 - **CPU budget: one 10ms envelope covers the whole request — handler body + every trigger it fires (BEFORE and AFTER) + every cascade those triggers trigger.** No per-trigger or per-cascade sub-budgets. Exceeding 10ms terminates the request and rolls back the transaction. Callbacks run as independent handler invocations in their own transactions and get their own fresh 10ms envelope when they fire.
@@ -600,128 +599,31 @@ Designed as a general primitive from day one — also the knob used to different
 - Wire protocol: content-addressed two-phase (see 2.4). Incremental deploys upload only changed bytes.
 - **Future**: `loop46 kv get/put`, `loop46 logs tail`, `loop46 init`, `loop46 dev` (local mini-rove).
 
-### 2.12 Server-sent events (live UI updates)
+### 2.12 Live UI updates — customer-defined SSE on `__rove_stream`
 
-> **2026-05-19 RETIREMENT NOTICE.** The platform-managed SSE pipe
-> (`events.emit`, `_session/sse-token`, in-process sse-server
-> thread, `_events/*` storage, per-(tenant,sid) ring cache) has been
-> **deleted entirely** in streaming-handlers Phase 5. There is no
-> `events.emit` JS global, no `--sse-listen` flag, no
-> `sse-server-standalone` binary, no platform-decided event wire
-> format. The §2.12 body below is **archival**.
->
-> **Replacement: customer-arbitrary SSE on `__rove_stream` +
-> kv-write wakes (`docs/streaming-handlers-plan.md` §7 / §8).**
-> Customers write their own SSE endpoint, emit events by writing to
-> their own kv under a watched prefix, and the wake-driven handler
-> renders frames. The platform never decides what an "event" is or
-> where it lives; the customer's kv is the event log they choose to
-> maintain. Cross-node correctness rides raft (every node's apply
-> scans the writeset against its locally-held streams) instead of
-> the pre-retirement single-node in-process fan-out.
->
-> The locked decisions that DO survive (notification ≠ state store;
-> ephemeral / no platform-managed durable replay log; reconnect →
-> state-refetch from kv) carry into the streaming-handlers plan as
-> §10.3.
+The platform-managed SSE pipe (`events.emit`, in-process sse-server,
+JWT handoff, `_events/*` storage, per-(tenant,sid) ring cache) was
+**deleted 2026-05-19** in streaming-handlers Phase 5. There is no
+platform-decided event wire format and no platform-managed durable
+event log.
 
+**Replacement.** Customers write their own SSE endpoint as a streaming
+handler returning `__rove_stream(...)`, with watched-prefix kv-write
+wakes driving frame emission. The customer's kv IS the event log they
+choose to maintain; cross-node correctness rides raft (every node's
+apply scans the writeset against its locally-held streams).
+Implementation: `docs/streaming-handlers-plan.md` §7/§8.
 
-The companion to webhooks (§2.6): handlers fire events from inside their transaction, connected clients receive them over a long-lived SSE stream. Same Cmd / replay / determinism story; same "pure handler + declarative side effects" model. Different direction — webhooks push out to the world, events push out to *this customer's clients*.
+**Why SSE not WebSockets.** HTTP/2, server→client only, browsers
+auto-reconnect with `Last-Event-ID` resume built in. WebSockets and
+HTTP/2 don't compose cleanly (RFC 6455 is HTTP/1.1 `Upgrade:`, RFC 8441
+extended-CONNECT bridge isn't supported through Cloudflare). A parallel
+h1 stack would add several thousand LOC and a two-stack maintenance
+burden. WS stays in §4 deferred-to-v2.
 
-**Why SSE not WebSockets**: HTTP/2, server→client only, browsers auto-reconnect with `Last-Event-ID` resume built in. WebSockets and HTTP/2 don't naturally compose — RFC 6455 is HTTP/1.1 `Upgrade:` (forbidden in h2), RFC 8441 bridges via extended CONNECT but Cloudflare in front (per §2.1) downgrades WS traffic to HTTP/1.1 to the origin. Adding WS support would require a parallel HTTP/1.1 server stack alongside our nghttp2-based h2 stack: separate parser, separate framing (RFC 6455 masking + fragmentation + ping/pong), separate connection lifecycle, ALPN negotiation. Several thousand LOC and a two-stack maintenance burden. WS stays in §4 deferred-to-v2; SSE covers ~90% of "server pushes to client" use cases.
-
-#### Sessions (platform-managed)
-
-A new server-managed cookie `_rove_sess` (parallel to admin's `rove_session` but in customer namespace):
-- 64-hex-char opaque token, HttpOnly + Secure + SameSite=Lax. No server-side validation table — the cookie value IS the id.
-- **Eagerly minted** on any handler invocation that arrives without one. Static asset serving short-circuits before the handler, so `favicon.ico` etc. don't pollute. `Set-Cookie` added to the response when a new id was minted during the request.
-- **One logical stream per session, N concurrent EventSource connections under that session, all receive every event.** Multi-tab works naturally.
-- Customer binds session→user themselves: `kv.set('sessions/${request.session.id}/user', user_id)`.
-
-#### API
-
-```javascript
-events.emit("hello");                                 // current session, type="message"
-events.emit({ data: { count: 42 }, type: "tick" });  // current session, custom type
-events.emit({ to: someSessionId, data: ... });        // explicit target
-events.emit({ to: [sid1, sid2], data: ... });         // fan-out by enumeration
-```
-
-`request.session.id` is always a string when the handler was invoked by a browser request (eager mint). For handlers invoked outside a browser context (webhook callbacks, signup, system maintenance), `request.session === null` and the implicit-target form throws — explicit `to:` required.
-
-Cross-session fan-out is the customer's job: they keep their own subscription map (`subs/{post_id}/{sid}`) and iterate on emit. The platform deliberately doesn't ship a topics / rooms / channels abstraction — every chat-app vendor reinvents it differently, and the customer's subscription model usually needs domain shape (per-post, per-team) anyway.
-
-#### Storage
-
-**No `_events/*` rows in tenant app.db.** SSE is a notification channel, not a durable state store; the customer's `app.db` is the source of truth and SSE just tells the UI "something changed, refetch." `events.emit()` appends to an in-memory **emit buffer** on the request's execution context. After the kv writeset commits, the worker fires the buffer fire-and-forget to sse-service. Event ids are deterministic (`{request_id:020d}-{call_index:06d}`) so tape replay synthesizes the same sequence.
-
-#### Connection endpoint
-
-```
-GET https://sse.{public_suffix}/v1/{tenant_id}/sse?token=<jwt>
-                                  [?last_event_id=<id>]   (optional cursor)
-                                  [Last-Event-ID: <id>]   (header, EventSource standard)
-```
-
-Lives on **sse-service**, a separate process on its own subdomain (`sse.{public_suffix}`) with its own TLS listener. JWT is signed by the platform key with payload `{tenant_id, sid, caps, exp}`; the customer's app fetches it from a same-origin endpoint `/_session/sse-token` (worker-served, reads `_rove_sess` cookie, mints the JWT). Single platform-managed hostname for all customers — no per-tenant SSE subdomain, no per-tenant TLS provisioning. EventSource opens with `withCredentials: false` so it's a "simple" cross-origin request — no preflight, no `Access-Control-*` headers needed, `__Host-` cookies stay safely pinned to the customer's app domain.
-
-#### Pump (worker → sse-service)
-
-After the writeset commits, the worker spawns a fire-and-forget POST to `sse-internal/v1/emit` with the emit buffer (auth via shared `SSE_INTERNAL_TOKEN`). 1s timeout cap; on failure the worker logs and moves on — the customer response is never blocked. sse-service appends events to a per-(tenant, sid) **ring cache** (30 entries, sized for brief reconnect catch-up — network blip, page hidden for 30s) and pushes to any open EventSource connections for the target sids.
-
-On reconnect with `Last-Event-ID`: if the id is in the ring, replay from there; if it's been evicted, emit a `rove:resync` sentinel event telling the client to refetch state. The ring is bounded by entry count, not time — there's no "retention" concept beyond reconnect-window catch-up.
-
-#### Caps (plan-tier, single-struct interface)
-
-```zig
-pub const EventsCaps = struct {
-    max_concurrent_connections_per_instance: u32,
-    max_concurrent_connections_per_session: u32,
-    max_emits_per_request: u32,
-    max_event_payload_bytes: u32,
-};
-pub fn eventsCapsForPlan(plan: tenant.PlanTier) EventsCaps;
-```
-
-Starting numbers:
-
-| Cap | Free | Paid | Notes |
-|---|---|---|---|
-| Concurrent SSE connections / instance | 100 | 10,000 | Enforced at sse-service connect |
-| Concurrent SSE connections / session | 16 | 16 | Multi-tab sanity guard, not plan-tiered |
-| Emits per request | 100 | 1,000 | Enforced on the worker at `events.emit` time |
-| Event payload bytes | 64 KB | 256 KB | Enforced on the worker; inherits kv value cap as floor |
-
-Caps that bound persistent state (`retention_seconds`, `max_events_per_session_in_retention`) go away — there's no persistent state to retain. The 30-entry ring cache is fixed by sse-service and not plan-tiered.
-
-Caps are embedded in the JWT at mint time (1h TTL), so cap changes propagate within the token lifetime. Saves an HTTP roundtrip per connect; eliminates a sse-service → worker dependency on the connect path.
-
-#### Authorization
-
-JWT in the connect URL is the auth. The token endpoint `/_session/sse-token` on the customer's app domain reads the `_rove_sess` cookie, mints a JWT scoped to `(tenant_id, sid, caps)` for 1h, and returns it. Customer's responsibility to bind session→user themselves (via their `/login` handler writing `sessions/{sid}/user = X`) and to refuse to emit to sessions that aren't authorized.
-
-#### Draft mode + tape
-
-`?__draft=` deploys: worker swaps in a "capture, don't fire" emit binding — appends to a captured-emits list visible in the dashboard sidebar but never POSTs to sse-service. Tape replay uses the same hook so step-through debug doesn't fan out events to live connections.
-
-#### Failover
-
-Single sse-service process per cluster. If it dies: all EventSource connections die (TCP reset), browsers auto-reconnect to whatever sse-service is now answering the LB, the new process has empty rings → any `Last-Event-ID` hits the sentinel path → clients refetch state and catch up. Worker emit POSTs during the dead window fail with connection refused → worker logs and drops → events lost (acceptable; SSE is best-effort by design).
-
-No election protocol, no state migration, no raft for sse-service. Operator (or k8s/systemd) handles "process died, restart it."
-
-#### What's gone (vs the v1 model)
-
-The earlier v1 SSE plan stored events as `_events/{sid}/{seq}` rows in customer app.db, replicated via raft, with a per-tenant retention sweep. All of that is rejected (see §7) and replaced by the response-attached-emit-buffer + sse-service model above. Notably gone: `events_pump.zig`, `events_sweep.zig`, the `_events/` reserved prefix, `markDirtyFromWriteset`'s `_events/` scan, the `pumpEvents` worker phase, and the SSE retention sweep timer.
-
-#### Deferred
-
-- Multi-instance sse-service with cross-instance fan-out (single process is the v1 bet).
-- Customer-defined `_events/auth.mjs` connect-time auth (JWT scope is enough for v1).
-- Topic / room / channel abstraction (customers compose with their own kv subscription maps).
-- Per-message client acknowledgment (would require WS).
-- Binary message types (SSE is text-only).
-- mTLS between worker and sse-service (shared bearer token suffices for v1).
+**Surviving locked decisions.** Carry into streaming-handlers §10.3:
+notification ≠ state store; ephemeral with no platform-managed durable
+replay log; reconnect → state-refetch from kv.
 
 ### 2.13 Raft snapshot strategy
 
@@ -963,19 +865,13 @@ the worker proxying) is **post-1.0** — see §10.13 + `files-server-plan.md`
 - Billing hookup (Stripe) — implement via `webhook.send` + callbacks to dogfood the Cmd path. Customer id stored at `account/{hash}/stripe_customer_id`.
 - **PSL submission** for `rewindjs.app` (GitHub PR to `publicsuffix/list`). Fire-and-wait; propagation can take weeks-to-months across browser releases. Defense-in-depth only — server-side `Set-Cookie Domain=` stripping from Phase 1 is the authoritative guard.
 
-### Phase 11 — Server-sent events (§2.12)
+### Phase 11 — Live UI updates — superseded by streaming-handlers
 
-Detail in `docs/sse-plan.md`. sse-service is a separate process on its own subdomain from inception — there is no "in-worker SSE then detach later" intermediate phase.
-
-- `_rove_sess` cookie: 64-hex-char opaque token, HttpOnly + Secure + SameSite=Lax. Eager mint on handler invocations that arrive without one; `Set-Cookie` added on response. Static asset serving short-circuits before mint.
-- `request.session: { id }` global. Null when handler invoked outside browser context (callbacks, signup, system).
-- `events.emit(...)` JS global. Implicit-target form (no `to:`) routes to current session; explicit `to: sid | [sid, ...]` for fan-out. Appends to in-memory emit buffer on the request's execution context — no kv writes, no `_events/*` rows.
-- **sse-service** (new module `src/sse_server/`): own subdomain `sse.{public_suffix}`, own TLS listener, own h2 server. Routes `GET /v1/{tenant_id}/sse?token=<jwt>` (EventSource connect, JWT-validated) and `POST /v1/emit` (worker → sse-service, fire-and-forget, internal bearer token). Holds per-(tenant, sid) ring cache (30 entries) for reconnect catch-up; emits `rove:resync` sentinel when `Last-Event-ID` hits an evicted entry.
-- `pumpEmitsForContext` worker phase: after kv commit, fire-and-forget POST emit buffer to sse-service. 1s timeout; never blocks the customer response.
-- `/_session/sse-token` token-handoff endpoint on the customer's app domain (worker-served): reads `_rove_sess`, mints JWT scoped to `(tenant_id, sid, caps)` for 1h, returns it. Customer JS uses the token in the EventSource URL — keeps `__Host-` cookies pinned to the app domain, makes the EventSource a "simple" cross-origin request (no CORS preflight).
-- `EventsCaps` struct + `eventsCapsForPlan(plan)` lookup — caps embedded in JWT at mint time. Same shape used for future plan-tiered caps in other subsystems.
-- Single sse-service process per cluster. Failover is "process dies, LB picks a replacement, clients reconnect, sentinel triggers refetch." No raft for sse-service, no state migration, no election protocol.
-- Has no hard predecessor — depends on §2.6 webhooks (done) + existing kv/h2/handler infra. **Sequencing per §10.16 (2026-04-30): NOT in beta, IS in 1.0** as launch path item #1 — needed for the live use cases (Stripe Checkout, OAuth, AI-agent results) that beta deliberately omits.
+Phase 11 originally specified a platform-managed SSE primitive
+(`events.emit`, sse-server, JWT handoff). That subsystem shipped
+2026-04 and was **deleted 2026-05-19** in streaming-handlers Phase 5;
+customer-arbitrary SSE handlers on `__rove_stream` + kv-write wakes
+replace it. See §2.12 + `docs/streaming-handlers-plan.md`.
 
 ### Phase 12 — Sim test framework + simulator library (§10.7, §10.8)
 
@@ -1089,16 +985,6 @@ Resolved items moved to §10. Open items:
 - `docs/logs-plan.md` — §2.9 + Phase 5.5 (a) expansion: S3-direct
   batches with `.idx.json` sidecars, log-server on
   `logs.{public_suffix}`. Envelope type 1 retires.
-- `docs/sse-plan.md` — §2.12 + Phase 11 expansion: centralized
-  sse-service singleton on `sse.{public_suffix}` from inception
-  (no in-worker phase), response-attached emit buffers,
-  `rove:resync` sentinel for cache eviction, JWT token handoff
-  from `/_session/sse-token`.
-- `docs/notifications.md` — customer-facing reference for
-  `events.emit` + the browser `rove.events` client. Recipes for
-  live updates, RPC-with-correlation-id (Stripe Checkout etc.),
-  multi-tab sync. Read this if you want to know what the customer
-  sees; read sse-plan.md if you want to know how it's built.
 - `docs/http-send-plan.md` — §2.6 + Phase 5.5 (d) replacement:
   generalizes webhook delivery to `http.send` /
   `http.cancel`. Introduces envelope types 8/9/10/11
@@ -1153,7 +1039,6 @@ envelopes, OR is leader-pinned by definition.
 | worker (customer kv path) | yes (proposes envelope 0; leader-only) | loop46 binary |
 | files-server | no (state in S3) | own binary, own subdomain, separable to its own machine |
 | log-server | no (state in S3 + local index cache) | own binary, own subdomain, separable to its own machine |
-| sse-service | no (state in memory only — ring cache + connection table; no persistence) | own binary, own subdomain, separable to its own machine |
 | webhook-server | yes (reads webhooks.db; proposes 4/5/6; leader-pinned) | thread in loop46 binary |
 | (future) anything else needing raft state | yes by definition | thread in loop46 binary |
 | (future) anything else stateless wrt raft | no | candidate for separate binary |
@@ -1166,17 +1051,16 @@ without re-litigating the tradeoffs case by case.
 Related architectural property: **only the raft leader accepts
 customer requests.** Workers run only on the leader; followers are
 pure raft replicas with no public listeners. Customer-facing LBs
-route the worker subdomain (and the files-server / log-server /
-sse-service subdomains) to the current leader; on raft election,
-the LB switches.
+route the worker subdomain (and the files-server / log-server
+subdomains) to the current leader; on raft election, the LB switches.
 
 Implication for the separable subsystems: while files-server /
-log-server / sse-service CAN run on different machines from any
-raft node (their state is in S3), they're typically deployed on
-every node with a leader-pinned active state — same pattern as
-webhook-server but at process granularity instead of thread
-granularity. Operators who want to scale them independently can,
-because nothing in their architecture requires co-location.
+log-server CAN run on different machines from any raft node (their
+state is in S3), they're typically deployed on every node with a
+leader-pinned active state — same pattern as webhook-server but at
+process granularity instead of thread granularity. Operators who want
+to scale them independently can, because nothing in their architecture
+requires co-location.
 
 ## 7. Superseded decisions (do not re-propose)
 
@@ -1195,7 +1079,7 @@ The following were explored during the 2026-04-17 design conversation and ruled 
 - **Strict FIFO ordering guarantees for webhooks.** Rejected: impossible to deliver meaningfully across destinations with different latencies; customers who need ordering chain via callbacks.
 - **Fan-in of multiple webhooks into one callback.** Rejected for v1. Customers build saga patterns by hand with triggers/callback-chaining.
 - **Auto-resend on expired-but-recent magic-link click** (15-min validity + 15-min grace window with `resend_grace_until_ns`, `magic_resend` rate-limit action, "we sent a fresh link" UI page). Rejected: trades a friendly page for an extra email round-trip that's strictly worse than just bumping the magic TTL. Replaced by 30-minute flat validity + an `email` URL hint on the signup form pre-fill for the 401-page case. Also avoids a name-squat amplification in the original design — the resend chain renews `pending/{name}` lifecycle, letting one signup hold a name for hours within the 3/hr per-email rate limit; flat TTL caps the reservation at 30 min.
-- **SSE rows in customer's `app.db` under reserved prefix `_events/{sid}/{seq}`**, replicated through raft envelope 0, with a per-tenant retention sweep + Last-Event-ID catch-up over the persisted rows. Rejected (2026-05): SSE is a notification channel, not a source-of-truth state store; the reserved-prefix storage entangled SSE state with customer kv writesets, raft replication, the markDirtyFromWriteset scan, and a 365-line retention sweep — for semantics that are explicitly losable and recoverable via replay. Replaced by `docs/sse-plan.md`: centralized sse-service singleton, response-attached emit buffers, in-memory ring cache with sentinel-on-eviction.
+- **SSE rows in customer's `app.db` under reserved prefix `_events/{sid}/{seq}`**, replicated through raft envelope 0, with a per-tenant retention sweep + Last-Event-ID catch-up over the persisted rows. Rejected (2026-05): SSE is a notification channel, not a source-of-truth state store; the reserved-prefix storage entangled SSE state with customer kv writesets, raft replication, the markDirtyFromWriteset scan, and a 365-line retention sweep — for semantics that are explicitly losable and recoverable via replay. The "notification ≠ state store" decision carried first into a platform-managed sse-service (deleted 2026-05-19) and now into customer-arbitrary `__rove_stream` handlers backed by the customer's own kv watched prefixes (see `docs/streaming-handlers-plan.md`).
 - **Log batches replicated through raft (envelope type 1) + per-tenant `log.db` apply on every node.** Rejected (2026-05): logs are best-effort and lossy by design (PLAN §2.9), don't need raft's strong durability, and forcing them through the raft log dominates cluster bandwidth at scale. Replaced by `docs/logs-plan.md`: per-node S3-direct batch upload + a single log-server process polling S3 to maintain a local SQLite index.
 - **Per-tenant `files.db` on every worker mirroring the manifest via raft envelope type 3.** Rejected (2026-05): worker-as-read-only-consumer model is cleaner. Replaced by `docs/files-server-plan.md`: manifest lives in S3, runtime release signal is a `_deploy/current` kv marker written by a `POST /_system/release` worker route and picked up via apply.zig's writeset-value scan into a process-wide ReleaseTable, worker reads on demand.
 - **Worker hairpin proxy `/_system/files/*` and `/_system/log/*`.** Rejected (2026-05): these subsystems should be on their own subdomains (`files.{public_suffix}`, `logs.{public_suffix}`), terminating their own TLS, with token-handoff auth from the customer's app domain. Worker stops mediating their traffic entirely. Per `docs/files-server-plan.md` and `docs/logs-plan.md`.
@@ -1285,7 +1169,7 @@ Build sessions between 2026-04-17 and 2026-04-30 shipped Phases 1–4, 6, and 8 
 - (e) **files-server — done 2026-05-06 (F1 + F2-push + F2-storage + process split).** `files-server-standalone` runs on `https://files.{public_suffix}` with TLS + JWT-gated routes. Manifest JSON lives in a per-tenant `deployments/` BlobBackend; runtime release pointer (`_deploy/current`) lands in the tenant's app.db and rides envelope 0 through raft. Worker has no `files.db`, no `/_system/files/*` proxy, no `code_proxy`. Dashboard / CLI POST `/_system/release {tenant_id, dep_id}` on the worker after a deploy; a process-wide `ReleaseTable` carries the signal across worker threads and `applyPendingReleases` triggers bytecode reload on next dispatch tick. files-server-standalone owns the **admin + replay deploys** too — bootstrap PUTs the embedded JS to S3 + raft-replicates `_deploy/current` via a JWT with `cap=release`. Envelope type 3 retired. Detail in `docs/files-server-plan.md`.
 - (c) **snapshot — done 2026-05-11.** Operator CLIs, in-process periodic capture loop (`--snapshot-interval-ms`), by-reference reuse for unchanged tenants, willemt raft log-compaction (+ incremental_vacuum), stamp-and-compact replacing byte-capture, and peer-to-peer catchup + boot-time install all shipped. See `docs/production.md` §1.1/§1.2/§3 and `docs/phase-5.5-rollout.md`.
 
-**The big architectural payoff from Phase 5.5**: the loop46 binary now ships only what *participates in raft* (workers + raft node + schedule-server thread + the snapshot capture loop). Three external services run as separate processes on their own subdomains (`files-server-standalone`, `log-server-standalone`, `sse-server-standalone`); none of them participate in raft, all of them carry their state in S3 (or in-memory for sse-service). This matches §6b's separability principle, and §10.13's "post-1.0 detach" is now mostly *complete* — see §13 for the live process map.
+**The big architectural payoff from Phase 5.5**: the loop46 binary now ships only what *participates in raft* (workers + raft node + schedule-server thread + the snapshot capture loop). Two external services run as separate processes on their own subdomains (`files-server-standalone`, `log-server-standalone`); neither participates in raft and both carry their state in S3. This matches §6b's separability principle, and §10.13's "post-1.0 detach" is now mostly *complete* — see §13 for the live process map.
 
 ### Phase 6 — Triggers — **done 2026-04-27**
 - Path-based registration (PLAN §2.5): `_triggers/users/sessions/index.mjs` fires on writes to `users/sessions/*`. Tree-traversal order across overlapping prefixes — outermost-first BEFORE, innermost-first AFTER. Catch-all via top-level `_triggers/index.mjs` (prefix `""`).
@@ -1308,7 +1192,7 @@ Build sessions between 2026-04-17 and 2026-04-30 shipped Phases 1–4, 6, and 8 
 
 ### Phases 7, 9, 10 — **not started**
 
-### Phase 11 — Server-sent events — **done.** sse-server standalone process + worker emit POST + JWT token mint shipped (commits 7c5b949, e056bea); see §13 and `docs/sse-plan.md`.
+### Phase 11 — Live UI updates — **shipped then retired.** sse-server standalone process + worker emit POST + JWT token mint shipped 2026-04 (commits 7c5b949, e056bea); deleted 2026-05-19 in streaming-handlers Phase 5. Customer-arbitrary SSE on `__rove_stream` + kv-write wakes is the live primitive.
 
 ### Phase 12 — Sim test framework + simulator library — **not started; partially absorbed into beta + 1.0**
 - Locked in §10.7 + §10.8 (2026-04-28); scope narrowed by the §10.12 two-path replay wedge (2026-04-30) and the beta-first sequencing in §10.16 / §10.17 (2026-04-30). Detailed plan in `docs/sim-test-framework.md`. **Pure client-side**: simulator module (`src/simulator/`) library-linked into the `loop46` CLI; `ReplaySource`; bundle module extraction; bundle JSON additions; module tape wiring; request body capture; `_tests/` directory + `loop46 test` and `loop46 simulate` CLI subcommands; snapshot machinery; sibling-file fixture export; production strip of `_tests/`. **No server endpoints, no thread pool, no rate-limit action** — worker is unchanged.
@@ -1522,15 +1406,15 @@ The detach landed in two waves:
 1. **Phase 5.5 (a) + (e) F1** moved files-server and log-server to their own subdomains with state in S3. Worker still proxied dashboard / CLI traffic to them via `/_system/files/*` and `/_system/log/*`.
 2. **Tasks #61 + #62** (commits leading up to and including `ee68323`) split each into a separate operator-deployed process (`files-server-standalone`, `log-server-standalone`) and dropped the worker's hairpin proxies entirely. Operators run each binary alongside loop46 and wire `--files-public-base` / `--log-public-base` so the worker's `/_system/services-token` endpoint can hand the dashboard a JWT pointing at the correct origin.
 
-What's gone from the worker: `/_system/files/*` and `/_system/log/*` route handlers, `code_proxy` / `log_proxy` collections, the cross-thread h2 client, the in-process `files_server.thread.spawn` from `loop46/main.zig`. Admin / dashboard / CLI now hit `files.{public_suffix}` and `logs.{public_suffix}` directly with a JWT minted by the worker after admin auth (the JWT carries `cap=release` / `cap=admin-kv` for the cluster-internal cases where files-server pushes platform deploys + config back into the worker). sse-server-standalone followed the same template (separate binary, separate subdomain, JWT-handoff auth) from inception.
+What's gone from the worker: `/_system/files/*` and `/_system/log/*` route handlers, `code_proxy` / `log_proxy` collections, the cross-thread h2 client, the in-process `files_server.thread.spawn` from `loop46/main.zig`. Admin / dashboard / CLI now hit `files.{public_suffix}` and `logs.{public_suffix}` directly with a JWT minted by the worker after admin auth (the JWT carries `cap=release` / `cap=admin-kv` for the cluster-internal cases where files-server pushes platform deploys + config back into the worker).
 
 What's left of the original §10.13 sketch: the proposed "admin's JS handler integrates with files-server / log-server via `http.send` and SSE-pushed callbacks" composition is **not** how the dashboard talks to those services today — the dashboard fetches them directly with the services-token JWT. That sketch was about avoiding worker-mediated proxying; the proxy is already gone, so the sketch is moot.
 
 Detail in `docs/files-server-plan.md` §11 + `docs/phase-5.5-rollout.md` §"(a) logs" / §"(e) files-server".
 
-### 10.14 Distributed Elm ports: webhook + callback + SSE (decided 2026-04-30)
+### 10.14 Distributed Elm ports: webhook + callback + streaming (decided 2026-04-30; SSE port re-shaped 2026-05-19)
 
-**Framing**: rewind.js's customer model is **Elm with distribution**. Pure handler functions (`request × kv → response × cmds`); explicit Cmd-shaped side effects via `webhook.send` and `email.send`; Sub-shaped reactive intake via triggers (kv-write subscriptions), callback handlers (webhook-result subscriptions), and SSE (server-pushed events to client). The combination is **distributed Elm ports** — typed channels between pure-functional handlers and the imperative world.
+**Framing**: rewind.js's customer model is **Elm with distribution**. Pure handler functions (`request × kv → response × cmds`); explicit Cmd-shaped side effects via `webhook.send` and `email.send`; Sub-shaped reactive intake via triggers (kv-write subscriptions), callback handlers (webhook-result subscriptions), and `__rove_stream` (held streaming responses with kv-watch wakes — server-pushed events to client). The combination is **distributed Elm ports** — typed channels between pure-functional handlers and the imperative world.
 
 This isn't just a metaphor. The architectural claim is: real-world reactive applications can be expressed in rewind.js's pure-functional handler model *without escape hatches*, because every imperative concern (HTTP I/O, time, retries, browser updates, third-party integrations) has a port-shaped primitive.
 
@@ -1538,7 +1422,7 @@ This isn't just a metaphor. The architectural claim is: real-world reactive appl
 
 |  | Best-effort | Guaranteed |
 |---|---|---|
-| **Unbatched** | `events.emit` (SSE — push to current connections, lost if no listener) | `webhook.send` (HTTP POST with retry / DLQ / callback) |
+| **Unbatched** | `__rove_stream` (SSE — push to currently-held connections, lost if no listener) | `webhook.send` (HTTP POST with retry / DLQ / callback) |
 | **Batched** | log emit (auto-captured per request, lossy on node failure per `docs/logs-plan.md`) | `analytics.track(transacted)` (post-1.0 sketch in §10.15 — commits with writeset, drained to OLAP) |
 
 **Ports are platform-declared, not customer-declared.** Each named verb IS a port — it's just declared by the platform rather than by customer code. The (batched, guaranteed) tuple is a property of the destination's *nature* (an OLAP sink wants batches; an arbitrary HTTP webhook can't be batched across destinations; a browser EventSource has no ack channel so guaranteed delivery is undefined), not a property the caller picks per-call. Letting customers declare arbitrary ports would push that decision onto them without the context to make it well — they don't know whether a given platform destination is per-record HTTP or columnar batch ingest. So ports stay platform-declared; if a fifth use case emerges that doesn't fit the four named verbs, we add a fifth named verb (and platform-decide its tuple).
@@ -1595,12 +1479,13 @@ The framings differ but the product is identical: **Story 1 hears "ship in minut
 
 **1.0 launch path** (Story 2 audience adds, builds on top of operating beta):
 
-1. **SSE primitive (Phase 11 / §2.12).** Single sse-service process on its own subdomain (`sse.{public_suffix}`); long-lived HTTP/2 streams from customer browsers; per-(tenant, sid) ring cache for reconnect catch-up. Worker `events.emit(...)` appends to an in-memory emit buffer; after kv commit, worker fire-and-forget POSTs the buffer to sse-service. JWT token handoff from the customer's app domain (`/_session/sse-token`) keeps `__Host-` cookies pinned. Browser uses native `EventSource`. Single-process v1: failover is "process dies, LB swap, clients reconnect, sentinel triggers refetch." Detail in `docs/sse-plan.md`. ~3 weeks. **The "first patterns sticky" risk dissolves under beta sequencing**: beta docs deliberately omit live use cases (Stripe Checkout, OAuth, AI-agent results, slow API calls) entirely, so SSE arrives at 1.0 as the *first* answer for those flows, not as a replacement for established polling.
-2. **Tape-replay DAP CLI** (§10.12 Story 2 path) — `loop46 replay <request_id>` CLI fetching bundle + tape, writing a Node entry script with stubs preloaded, spawning under `--inspect-brk`, printing attach instructions for VS Code / JetBrains / nvim-dap / dap-mode. Reuses the stubs library shipped in beta. ~1-2 weeks.
-3. **rewind.js-the-project Stripe integration for supporter payments** — *the real production integration that doubles as the customer-facing docs example.* rewind.js's admin handler exposes a "support rewind.js" page that creates a Stripe Checkout session via `webhook.send`, returns a tiny shell page that subscribes via SSE, the callback `events.emit`s the session URL to the connected client, browser navigates. Receives `checkout.session.completed` webhook with timing-safe HMAC signature verification, writes a `supporter/{email}` row in admin's app.db, fires another SSE event so the originating tab updates to "Thanks!" without a refresh. **Docs example is extracted from this**: the patterns we actually use become the patterns we teach. ~1.5-2 weeks, plus the small primitives audit (`crypto.timingSafeEqual` confirmed; `base64Encode/Decode` and `hmacSha1` if needed).
-4. **Phase 7 `loop46 deploy` CLI** subset — content-addressed two-phase upload, `loop46.json` parsing, deploy-token issuance UI in dashboard. ~1-2 weeks for v1 scope; later CLI subcommands (`kv`, `logs`, `init`) deferred.
-5. **Plan tiers + paid pricing** — first paid tier, plan-tier branching in rate limiter caps, billing wiring via Stripe (uses item 3's primitives). ~1-2 weeks.
-6. **Custom domains** (Phase 10) — customer CNAME + per-domain Let's Encrypt. ~2 weeks.
+1. **Tape-replay DAP CLI** (§10.12 Story 2 path) — `loop46 replay <request_id>` CLI fetching bundle + tape, writing a Node entry script with stubs preloaded, spawning under `--inspect-brk`, printing attach instructions for VS Code / JetBrains / nvim-dap / dap-mode. Reuses the stubs library shipped in beta. ~1-2 weeks.
+2. **rewind.js-the-project Stripe integration for supporter payments** — *the real production integration that doubles as the customer-facing docs example.* rewind.js's admin handler exposes a "support rewind.js" page that creates a Stripe Checkout session via `webhook.send`, returns a tiny shell page that opens a `__rove_stream` connection, the callback writes a kv key that wakes the stream which emits the session URL to the connected client, browser navigates. Receives `checkout.session.completed` webhook with timing-safe HMAC signature verification, writes a `supporter/{email}` row in admin's app.db, the same stream wakes a second time and emits "Thanks!" so the originating tab updates without a refresh. **Docs example is extracted from this**: the patterns we actually use become the patterns we teach. ~1.5-2 weeks, plus the small primitives audit (`crypto.timingSafeEqual` confirmed; `base64Encode/Decode` and `hmacSha1` if needed).
+3. **Phase 7 `loop46 deploy` CLI** subset — content-addressed two-phase upload, `loop46.json` parsing, deploy-token issuance UI in dashboard. ~1-2 weeks for v1 scope; later CLI subcommands (`kv`, `logs`, `init`) deferred.
+4. **Plan tiers + paid pricing** — first paid tier, plan-tier branching in rate limiter caps, billing wiring via Stripe (uses item 2's primitives). ~1-2 weeks.
+5. **Custom domains** (Phase 10) — customer CNAME + per-domain Let's Encrypt. ~2 weeks.
+
+Live UI delivery — originally planned as item #1 (platform-managed SSE primitive, ~3 weeks) — landed earlier as the streaming-handlers framework (2026-05-20). It's no longer a 1.0 launch-path line item; live updates are a baseline capability.
 
 **1.0 additional**: ~9-13 weeks serialized; ~5-7 weeks parallelized.
 
@@ -1615,7 +1500,6 @@ Phase 9 encryption at rest joins the 1.0 path only if B2B compliance demand surf
 - **Failure-mode audit**: real money is real stakes. The webhook signature timing-safe-equal becomes load-bearing when it's *our* customers' card charges flowing through it. We'll discover the actual gaps in the toolkit far faster than a contrived example would surface them.
 
 **What's NOT in beta but lands at 1.0**:
-- SSE primitive
 - DAP CLI replay (`loop46 replay`)
 - Stripe-on-rewind.js supporter payments
 - `loop46 deploy` CLI
@@ -1624,9 +1508,8 @@ Phase 9 encryption at rest joins the 1.0 path only if B2B compliance demand surf
 - Phase 9 encryption (only if B2B compliance demand surfaces during beta)
 
 **What's NOT in either beta or 1.0** (recorded so future-us doesn't second-guess):
-- §10.13 / §10.14 file-server + log-server detach + bearer-auth dogfooding. Multi-week refactor that makes the architecture purer but doesn't make the product more useful to a first user. **Post-1.0** when the dashboard-to-file-server path's in-process proxy starts hurting (it doesn't yet). With SSE shipping at 1.0, §10.14's prerequisite is satisfied — the detach is gated only on engineering bandwidth, not blocking primitives.
+- §10.13 / §10.14 file-server + log-server detach + bearer-auth dogfooding. Multi-week refactor that makes the architecture purer but doesn't make the product more useful to a first user. **Post-1.0** when the dashboard-to-file-server path's in-process proxy starts hurting (it doesn't yet). The detach is gated only on engineering bandwidth, not blocking primitives.
 - §10.15 `analytics.track` + `metrics.*` primitives. Their absence is workable (customers `webhook.send` to their OLAP / TSDB of choice). **Post-1.0** alongside the loop46-olap / loop46-tsdb pseudo-third-party companion services that motivate them.
-- **Multi-instance sse-service + persistent emit buffering**. The 1.0 SSE is a single sse-service process with a 30-entry ring cache for reconnect catch-up; cross-instance fan-out and replay-after-restart wait until usage exposes whether they actually matter. The single-process bet matches "customers fit on dedicated bare metal" and lets the `rove:resync` sentinel handle reconnect cases where the ring's been evicted.
 - Phase 5.5 storage scalability (log batch offload, tape body capture, raft snapshot, centralized webhook subsystem, files-server architectural move). Matters when sustained production traffic forces it; not at beta or first-1.0 volumes.
 - **Phase 12 / 13 sim test framework + fixture lifecycle + worker dry-run**. Beta absorbs the bundle JSON shape, stubs library, and request body capture (§10.12); the Zig + QuickJS strict-determinism `ReplaySource` + sim test framework + fixtures wait. Post-1.0.
 
@@ -1722,7 +1605,7 @@ See §13.3 for the canonical list. Quick summary:
 Shipped (native bindings):
 - `kv.get/set/delete/prefix`
 - `http.send`, `http.cancel` (the only native outbound primitives — `webhook.send` / `email.send` / `retry.*` are JS polyfills on top)
-- `events.emit({to, type, data})`
+- `__rove_stream({status?, headers?, write?, waitFor?, ctx?})` (held streaming responses with kv-watch wakes; the live-push primitive after `events.emit` retired 2026-05-19)
 - `crypto.getRandomValues`, `crypto.randomUUID`, `crypto.randomBytes`, `crypto.sha256`, `crypto.hmacSha1`, `crypto.hmacSha256`, `crypto.verifyRsa`, `crypto.verifyEcdsa`, `crypto.timingSafeEqual`
 - `console.log`
 - `Date.now`, `Math.random` (seeded/deterministic; captured for tape replay)
@@ -1784,10 +1667,9 @@ Not available:
 ### Operational
 
 - `LOOP46_ROOT_TOKEN=<hex>` env var supplies the operator bearer token. Workers read it at startup and validate `Authorization: Bearer <hex>` via constant-time compare — no SQLite write, no rotation API. Must be ≥32 chars; rotate by restarting workers with a new value.
-- `LOOP46_SERVICES_JWT_SECRET=<hex>` (32 bytes hex, HS256) is the shared HMAC key the worker mints services-tokens with at `/_system/services-token` and every standalone (`files-server-standalone`, `log-server-standalone`, `sse-server-standalone`) verifies with. Required when running standalones as separate processes; without it the worker generates a random per-process secret and the standalones reject every token (by design).
-- `SSE_INTERNAL_TOKEN=<value>` is the shared bearer the worker stamps on its emit POST to sse-server (`POST /v1/emit`); set to the same value on both processes.
+- `LOOP46_SERVICES_JWT_SECRET=<hex>` (32 bytes hex, HS256) is the shared HMAC key the worker mints services-tokens with at `/_system/services-token` and every standalone (`files-server-standalone`, `log-server-standalone`) verifies with. Required when running standalones as separate processes; without it the worker generates a random per-process secret and the standalones reject every token (by design).
 - `--bootstrap-resend-key <key>` seeds the platform Resend key into `__admin__/app.db` (admin's email handler reads it; customer handlers don't see it).
-- `--public-suffix <domain>` enables wildcard `{id}.<domain>` → instance routing. Without it, every host needs an explicit `assignDomain` entry. Also drives auto-derivation of `--log-public-base` / `--files-public-base` / `--sse-public-base` when those aren't passed explicitly (`https://logs.{suffix}` etc.).
+- `--public-suffix <domain>` enables wildcard `{id}.<domain>` → instance routing. Without it, every host needs an explicit `assignDomain` entry. Also drives auto-derivation of `--log-public-base` / `--files-public-base` when those aren't passed explicitly (`https://logs.{suffix}` etc.).
 - `--admin-api-domain <domain>` routes that host's traffic through the `__admin__` handler with auth. Separate from `--public-suffix`.
 - `--snapshot-interval-ms <N>` enables the periodic raft-thread snapshot capture loop (off by default). Captures land in S3 (or fs at `{data_dir}/.snapshots/`) per `BLOB_BACKEND` and `SNAPSHOT_S3_KEY_PREFIX`.
 - `--dev-webhook-unsafe` enables loopback + plaintext targets for local smokes — applies to schedule-server's outbound HTTP path (`http.send`) and is the only knob that bypasses SSRF / HTTPS-only. NEVER set in production.
@@ -1898,6 +1780,6 @@ The phased plan in §3 still describes the *content* of each phase, but several 
 - **§3 Phase 3 (Webhooks + email)** — the on-disk shape (`_outbox/*`, `_outbox_inflight/*`, `_dlq/*`, `webhooks.db`, envelopes 4/5/6) is gone. The customer-visible API survived two cutovers (drainer → webhook-server → http.send-polyfill).
 - **§3 Phase 5.5 (a)/(b)/(c)/(d)/(e)** — all done. See §9 Phase 5.5 status.
 - **§3 Phase 7 (CLI)** — deferred to 1.0 per §10.16. Beta is dashboard-only.
-- **§3 Phase 11 (SSE)** — done as a standalone process from inception (no in-worker phase). See `docs/notifications.md` for the customer-facing reference and `docs/sse-plan.md` for the design.
+- **§3 Phase 11 (Live UI updates)** — originally a platform-managed sse-server (shipped 2026-04, retired 2026-05-19); the live primitive is customer-arbitrary SSE handlers on `__rove_stream` + kv-write wakes. See `docs/streaming-handlers-plan.md`.
 
 When reading §3 phases for content, check §9 status blocks and §13 here for what actually exists.
