@@ -49,7 +49,7 @@
 //! `rove-js-ctl`.
 
 const std = @import("std");
-const kv_mod = @import("rove-kv");
+const kv_mod = @import("raft-kv");
 
 pub const Error = error{
     InvalidInstanceId,

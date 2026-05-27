@@ -18,7 +18,7 @@
 //! semantics.
 
 const std = @import("std");
-const kv_mod = @import("rove-kv");
+const kv_mod = @import("raft-kv");
 const apply_mod = @import("apply.zig");
 
 fn proposeEncoded(

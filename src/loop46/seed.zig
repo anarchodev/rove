@@ -5,7 +5,7 @@
 //! customers use, and seeds optional KV. Run before `loop46 worker`.
 
 const std = @import("std");
-const kv = @import("rove-kv");
+const kv = @import("raft-kv");
 const blob_mod = @import("rove-blob");
 const tenant_mod = @import("rove-tenant");
 const files_server = @import("rove-files-server");

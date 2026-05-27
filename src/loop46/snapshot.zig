@@ -37,7 +37,7 @@
 //! additions go behind feature fields the decoder ignores.
 
 const std = @import("std");
-const kv = @import("rove-kv");
+const kv = @import("raft-kv");
 const apply_mod = @import("rove-js").apply;
 const ls = @import("rove-log-server");
 const blob_mod = @import("rove-blob");

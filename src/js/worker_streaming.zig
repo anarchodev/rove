@@ -31,7 +31,7 @@
 const std = @import("std");
 const rove = @import("rove");
 const h2 = @import("rove-h2");
-const kv_mod = @import("rove-kv");
+const kv_mod = @import("raft-kv");
 const log_mod = @import("rove-log");
 const tape_mod = @import("rove-tape");
 

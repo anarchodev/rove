@@ -26,7 +26,7 @@
 
 const std = @import("std");
 const posix = std.posix;
-const rove_kv = @import("rove-kv");
+const rove_kv = @import("raft-kv");
 const raft_node_mod = rove_kv.raft_node;
 const raft_net_mod = rove_kv.raft_net;
 

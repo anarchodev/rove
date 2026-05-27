@@ -44,7 +44,7 @@ const rio = @import("rove-io");
 const h2 = @import("rove-h2");
 const blob_mod = @import("rove-blob");
 const jwt = @import("rove-jwt");
-const kv = @import("rove-kv");
+const kv = @import("raft-kv");
 
 const files_server = @import("root.zig");
 const files_mod = @import("rove-files");

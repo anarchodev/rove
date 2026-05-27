@@ -35,7 +35,7 @@
 
 const std = @import("std");
 const blob_mod = @import("rove-blob");
-const kv_mod = @import("rove-kv");
+const kv_mod = @import("raft-kv");
 const files_mod = @import("rove-files");
 const qjs = @import("rove-qjs");
 const jwt = @import("rove-jwt");
