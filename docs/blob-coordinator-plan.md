@@ -15,20 +15,26 @@
 
 ## 1. Goal
 
-One per-process write coordinator that submitters hand in-RAM byte
-buffers to and receive back a `BodyRef = {object_key, offset, len}`
-once the bytes are durable in object storage. The coordinator:
+One per-process write coordinator for **body bytes** (inbound request
+bodies > 16 KB, outbound fetch chunks > 16 KB). Submitters hand it
+in-RAM byte buffers and receive back a `BodyRef = {object_key, offset,
+len}` once the bytes are durable in object storage. The coordinator:
 
-- Coalesces submissions across sources (body bytes, log batches, future
-  append-style storage paths) into shared pool objects.
-- Owns the **PUT parallelism budget** — one K, one place to tune
-  against the link, one place to handle 503 SLOWDOWN backoff.
-- Returns location receipts that callers store wherever they want
-  (raft entries, manifests, indexes).
+- Coalesces body submissions into shared pool objects (multiple bodies
+  inside one S3 object, demuxed via `BodyRef.(offset, len)`).
+- Owns the **PUT parallelism budget for body PUTs** — one K, one place
+  to tune against the link, one place to handle 503 SLOWDOWN backoff.
+- Returns location receipts that callers store on the readset wire.
 
 After this work, throughput against the S3 link is bounded by the link
 and the executor pool size, **not by how customer tenants happen to
 hash across leader workers**.
+
+**Scope sharpened 2026-05-27 (Phase 4 descoped):** the coordinator is
+for body submissions specifically. Log flush stays on its direct
+`BatchStore.put` path because the log read model (indexer LISTs
+`_logs/{node_hex}/` and parses each object's self-describing sidecar)
+is incompatible with coord's coalescing — see §6 Phase 4 + §10.3.
 
 ## 2. Why now — what the per-tenant lane model can't reach
 
@@ -67,11 +73,14 @@ Three structural limits the fan-out left intact, in order:
    expected during bucket sharding events. Today they're silent data
    loss. The fix is the same code at every call site — exactly what
    "centralize in one place" exists for.
-3. **Per-source duplication.** Body flush has its own BodyBuffer +
-   thresholds + per-worker pool. Log flush has its own LogBuffer +
-   thresholds + flusher thread. Both want batching, both want
-   parallelism, both want retry. Today they each implement it
-   incompletely.
+3. **Per-source duplication (body side).** Body flush has its own
+   BodyBuffer + thresholds + per-worker pool. The body-side flush /
+   batching / parallelism / retry was incompletely implemented and
+   re-collapses into the coordinator.
+
+   *Update 2026-05-27:* log flush also had its own batching layer but
+   it can't fold in — coord's coalescing breaks the log read model
+   (§10.3, §6 Phase 4). Logs keep their own path.
 
 ## 3. Target shape
 
@@ -296,7 +305,7 @@ otherwise receive directly**. Concretely:
 | Outbound fetch chunk (on_chunk) | Each chunk, as `curl_multi` delivers it | Many Msgs per fetch, many submissions |
 | Outbound fetch pipe_to | n/a — bypasses coordinator | Per [[project-pipe-to-untaped]]: pipe_to bytes don't enter handler, no submission |
 | Inline path (≤16 KB body) | n/a — bypasses coordinator | Bytes ride in raft entry directly |
-| Log batch flush | Each batch (post-migration, Phase 4) | The implicit "Msg" is the batch itself |
+| Log batch flush | n/a — bypasses coordinator | Phase 4 descoped (§6, §10.3); log indexer's discovery model is incompatible with coalescing |
 
 Sub-Msg submissions (e.g. one per H2 DATA frame within a body) are
 forbidden — they don't correspond to anything the handler sees and
@@ -423,11 +432,47 @@ Bench against the same `body_throughput_probe.py` cells. **Target:
 don't see ≥1.5× over the fan-out shipped, the design didn't deliver
 what we expected; pause and re-examine before continuing.
 
-### Phase 4 — migrate log flush
+**Shipped 2026-05-27.** Bench:
 
-Same shape. Removes log_buffer's batching logic; logs become a
-submitter alongside bodies. Cross-source coalescing engages here
-(both go through the same K=32 pool).
+| Cell | Pre-coord | Post-coord | Δ |
+|---|---|---|---|
+| 8t × 32w × 1 MB | 36 MB/s | 69.5 MB/s | +93% |
+| 2t × 80w × 1 MB | 52 MB/s | 81.5 MB/s | +57% |
+
+Both cleared the 1.5× exit gate; 2-tenant cell hit the 80 MB/s
+aspiration. 641/643 tests pass.
+
+### Phase 4 — ~~migrate log flush~~ DESCOPED 2026-05-27
+
+Original plan: route log flush through the coordinator alongside
+bodies; cross-source coalescing engages on the shared K=32 pool.
+
+Why descoped: **coord's value is coalescing**, and the log read
+model can't accept coalesced objects.
+
+- Body read path is **pointer-based** — the readset records
+  `(object_key, offset, len)`; replay does `getRange`. Multiple bodies
+  inside one S3 object are demuxed by the BodyRef. Coalescing is
+  invisible to the reader.
+- Log read path is **discovery-based** — the indexer LISTs
+  `_logs/{node_hex}/` and parses each object's self-describing
+  sidecar (`src/log_server/flush_writer.zig:152-171`). The sidecar
+  format binds records into one monolithic object with byte offsets
+  into a deflated frames region. Coord coalescing would silently
+  break the indexer.
+
+Forcing prebatched submissions with caller-supplied keys (one log
+batch = one S3 object, no merging) reduces coord to a thin pass-
+through over `BlobStore.put` + retry — no coalescing benefit. The
+PUT parallelism wasn't a bottleneck anyway: one PUT/sec/worker × 8
+workers is well under K=32.
+
+**Decision:** logs keep their direct `BatchStore.put` path. The
+`Error.SlowDown` variant on rove-blob (Phase 2) is already plumbed;
+a thin retry wrapper around the log PUT site is a separate small
+task if metrics show 503s in production.
+
+The coordinator's purpose is now **body coalescing specifically**.
 
 ### Phase 5 — BodyRef format change
 
@@ -575,9 +620,9 @@ same three cells as today:
 | 2t × 80w × 1 MB | 52 MB/s | ≥80 MB/s |
 | 8t × 128w × 64 KB | 11.6 MB/s | ≥30 MB/s (request-rate bound but should improve via coalescing) |
 
-If Phase 3 doesn't deliver, **stop and re-examine before Phase 4**.
+If Phase 3 doesn't deliver, **stop and re-examine before Phase 5**.
 The plan is wrong about something and adding more consumers won't
-fix it.
+fix it. *(Phase 4 was descoped 2026-05-27; see §6.)*
 
 ### Perf — tail latency (Phase 3)
 
@@ -639,10 +684,20 @@ serialization needs the version byte.
 
 ### 10.3 `docs/logs-plan.md`
 
-LogBuffer becomes a submitter alongside body bytes. The implicit
-"log batches are also S3 objects" stays true; the explicit
-"log_server/batch_store_s3.zig handles their PUTs" goes away —
-they ride the coordinator.
+**No integration — logs stay separate (2026-05-27).** The original
+Phase 4 plan to route LogBuffer through the coordinator was descoped
+(see §6 Phase 4). Log objects are self-describing (sidecar header +
+deflated frames region); the indexer discovers them by LIST and
+parses each as a standalone batch. Coord's coalescing model can't
+preserve that shape without redesigning both the log object format
+and the indexer's read path.
+
+`log_server/batch_store_s3.zig` keeps owning log PUTs.
+
+If 503 retries become a measured concern, the small fix is a retry
+wrapper around `flush_writer.writeBatch`'s `store.put(obj_key, obj)`
+using the `Error.SlowDown` variant rove-blob already emits (Phase 2);
+no coord dependency.
 
 ### 10.4 `docs/curl-multi-plan.md`
 
