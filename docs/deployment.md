@@ -83,9 +83,7 @@ forwarding `/.well-known/acme-challenge/*` to it).
 
    The worker logs a warning at startup-plus-N-requests if no
    `X-Forwarded-For` header is observed in the first 100 requests —
-   that's the most common "operator forgot the proxy" shape. See
-   [`http-send-plan.md`](http-send-plan.md) §3.1 for the
-   underlying h2-only design rationale.
+   that's the most common "operator forgot the proxy" shape.
 
    **Minimum proxy configuration:**
 

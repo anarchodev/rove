@@ -272,12 +272,12 @@ Honest scope, so you know the edges:
   with C2S is a natural follow-on.
 - **No media / attachments / threading.** `publishNote` takes HTML
   content and an optional `inReplyTo`; that's it.
-- **Inbox is at-least-once.** `http.send` callbacks can double-deliver
-  and leadership change can re-fire (http-send-plan §7). `Follow`/
-  `Undo` are idempotent as written (set/delete by signer id); if you
-  add activity types with non-idempotent effects, dedupe on the
-  activity `id` yourself — idempotency is the customer's
-  responsibility here, consistently with `http.send`.
+- **Inbox is at-least-once.** `webhook.send` callbacks can
+  double-deliver and leadership change can re-fire. `Follow`/`Undo`
+  are idempotent as written (set/delete by signer id); if you add
+  activity types with non-idempotent effects, dedupe on the activity
+  `id` yourself — idempotency is the customer's responsibility here,
+  consistently with `webhook.send`.
 - **One actor per config.** Multi-actor (one app hosting many
   accounts) means one config per actor via
   `activitypub.fromConfig("name")` reading `_config/activitypub/name`.
@@ -286,6 +286,6 @@ Honest scope, so you know the edges:
   deliberately v2. ActivityPub needs none of it.
 
 Reference: `src/js/globals/activitypub.js` (full JSDoc + `@example` on
-every method), `docs/http-send-plan.md` (the durable outbound Cmd this
-rides), `docs/connection-actor-plan.md` (where the held-connection
-work goes when it's time).
+every method), `src/js/bindings/webhook.send.js` (the durable outbound
+Cmd this rides), `docs/connection-actor-plan.md` (where the
+held-connection work goes when it's time).

@@ -266,9 +266,8 @@ HTTP-01 in a **multi-node** cluster. The CA fetches
 `http://{host}/.well-known/acme-challenge/{tok}` via the customer's
 DNS → the edge → **one** origin; the duplicate-cert rate limit
 (5/exact-cert/week) punishes N nodes racing the same order. So
-issuance must be **leader-pinned** — the exact pattern PLAN §6 /
-http-send-plan §7 already use for the scheduler/webhook subsystems
-(`if (raft.isLeader())`). That yields the real question: the issued
+issuance must be **leader-pinned** — the standard `if (raft.isLeader())`
+pattern. That yields the real question: the issued
 cert must end up on **every** node that terminates TLS for `{host}`,
 but `--custom-cert-dir` is a node-local path.
 
@@ -656,13 +655,12 @@ is in exactly one phase:
 JWKS publishes the public half of every `next`/`current`/`retiring`
 key; RPs match by `kid` and never need to know which is `current`.
 
-**Scheduled rotation drives all keyset mutation** (verified against
-`docs/http-send-plan.md` 2026-05-15). One serialized path: a
-self-rescheduling timer using the §10.4-cron / §10.5-order-timeout
-cookbook pattern — `http.send({ handle: "oidc-rot-<issuer>", url:
+**Scheduled rotation drives all keyset mutation.** One serialized
+path: a self-rescheduling timer using the cron / order-timeout
+cookbook pattern — `webhook.send({ handle: "oidc-rot-<issuer>", url:
 "https://<issuer-host>/_oidc/rotate", fire_at_ns: <next deadline>
-})`. The issuer host resolves cluster-local, so apply stamps
-`is_internal` and `dispatchInternalSchedules` runs the rotate handler
+})`. The issuer host resolves cluster-local, so the JS shim's arm
+takes the in-process fast path and runs the rotate handler
 **in-process** at fire time — no outbound HTTP (http.send-plan §3.2).
 The stable `handle` makes re-arming an idempotent overwrite
 (http.send-plan §1.1); arming the next timer rides the rotate
@@ -680,7 +678,7 @@ reached, and no-ops.
 > **Grounded correction (2026-05-16, step 3-5).** The original
 > design above made a *concurrent* (leadership-change) double-fire
 > safe via a schedule-`version`-keyed `_processed/oidc-rot/<version>`
-> marker, citing http-send-plan §7. Grounding the implementation
+> marker. Grounding the implementation
 > showed `X-Rove-Schedule-Id`/`-Version` are stamped **only on the
 > libcurl/external path** — the internal-routed in-process fire
 > (`internal_schedules.zig`) synthesizes a Request with **no headers
@@ -1418,12 +1416,11 @@ envelope-2 row. Was held until Phases 1–3 landed.
 
 ## 9. Open questions
 
-- Key rotation: **resolved in §4.6**. Self-scheduling **verified
-  against `docs/http-send-plan.md` 2026-05-15** — it is the §10.4-cron
-  / §10.5-order-timeout cookbook pattern (stable handle +
+- Key rotation: **resolved in §4.6**. Self-scheduling uses the
+  cron / order-timeout cookbook pattern (stable handle +
   internal-routed self-`url` + future `fire_at_ns`; arm atomic with
   the keyset writeset per §6). One correctness finding folded into
-  §4.6: "duplicate fire is a no-op" only holds with a §7-style
+  §4.6: "duplicate fire is a no-op" only holds with a
   `version`-keyed `_processed` dedupe marker, because a
   leadership-change concurrent double-fire would otherwise mint two
   RSA keys. No remaining blocker for Phase 3b.

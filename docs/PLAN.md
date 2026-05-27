@@ -379,19 +379,21 @@ A dedicated `batch.*` primitive (background drainer, progress tracking, cascade-
 
 ### 2.6 Webhooks / outbound HTTP (Cmd pattern)
 
-> **2026-05-09 reframe — see `docs/http-send-plan.md`.** The platform's
-> only native outbound primitive is now `http.send` / `http.cancel`
-> (envelopes 8/9/10/11, cluster-wide raft-replicated `schedules.db`,
-> leader-pinned schedule-server thread inside the loop46 binary).
-> `webhook.send` and `email.send` are pure-JS libraries layered on
-> top — `webhook.send` lives in `src/js/bindings/webhook.js`, retry
-> policy in `src/js/bindings/retry.js`, `email.send` in
-> `src/js/bindings/email.js`. The earlier dedicated webhook
-> subsystem (`webhooks.db`, envelopes 4/5/6, the
-> `webhook_server` module) was deleted in commit `cf375bf`.
-> Customer-facing API shape + at-least-once + `X-Rove-Schedule-Id`
-> (renamed from `X-Rove-Webhook-Id`) contract carry forward
-> unchanged.
+> **Current shape (2026-05-24, post durability-as-JS-shim).** The
+> platform's only native outbound primitive is `http.fetch` (transient,
+> non-durable; `docs/upstream-streaming-plan.md`). `webhook.send` and
+> `email.send` are pure-JS libraries that compose durability on top:
+> `src/js/bindings/webhook.send.js` writes a `_send/owed/{id}` marker
+> atomic with the handler's writeset (envelope-0), then drives the
+> `http.fetch` + retry + `_subscriptions/_send_retry/` cron + boot
+> subscription. `email.send` wraps `webhook.send` with Resend's
+> headers. Customer-facing API + at-least-once + `X-Rove-Schedule-Id`
+> contract carry forward unchanged. See `effect-reification-plan.md`
+> Phase 5 + memory `project_durability_as_js_shim` for the design.
+> Historical generations (cluster-wide `webhooks.db` envelopes 4/5/6
+> shipped 2026-05-06; `http.send` + `schedules.db` envelopes 8/9/10/11
+> shipped 2026-05-09; per-tenant `_send/owed/` + leader-local
+> `SendDispatch` shipped 2026-05-19) are all retired.
 
 
 The only path to the outside world. Directly inspired by Elm's `Cmd` model.
@@ -450,7 +452,7 @@ No per-tenant `_outbox/{id}`, no `_outbox_inflight/{id}`, no `_dlq/{id}`. Failed
 
 #### Delivery loop
 
-- Runs as a leader-pinned thread inside the loop46 binary (now schedule-server, after the §2.6 admonition's reframe — see `docs/http-send-plan.md`). Single instance per cluster, guaranteed by raft leader uniqueness.
+- Runs as a leader-pinned thread inside the loop46 binary (now schedule-server, after the §2.6 admonition's reframe). Single instance per cluster, guaranteed by raft leader uniqueness.
 - Reads `webhooks.db` directly: `WHERE state = 'pending' AND next_attempt_at_ns <= now()`. Apply-side wakeup on envelope-4 commit signals new rows (no polling).
 - POSTs the customer URL with the row's body + headers + `X-Rove-Webhook-Id` + `X-Rove-Webhook-Attempt`.
 - On 2xx: propose envelope 5 (`webhook_complete`, outcome=delivered). Apply removes from `webhooks.db` + writes `_callback/{id}` to tenant app.db.
@@ -739,10 +741,10 @@ ops intervention.
 > `docs/snapshot-plan.md` covers item 3 (per-tenant snapshot indices with
 > S3 transport — replaces the original "raft snapshot + log compaction" with
 > a no-pause file-shipping model).
-> `docs/http-send-plan.md` covers item 4 (originally a webhook-shaped
-> subsystem; reframed 2026-05-09 as the more general `http.send` /
-> `http.cancel` primitive on a cluster-wide raft-replicated
-> `schedules.db` with a leader-pinned schedule-server thread).
+> Item 4 (originally a webhook-shaped subsystem) shipped through three
+> generations and finally landed as durability-as-JS-shim — see
+> `effect-reification-plan.md` Phase 5 + memory
+> `project_durability_as_js_shim`.
 > `docs/files-server-plan.md` covers item 5 (files-server moves to its own
 > subdomain with manifest-in-S3, marker-driven release).
 > Item 2 (tape body capture) is straightforward and remains an
@@ -789,9 +791,10 @@ state moves out of raft where stronger guarantees aren't needed):
    `_outbox/{id}` row, no apply-hook forwarding, no drainer. Delivery
    runs from a leader-pinned webhook-server thread inside the loop46
    binary; on leader change, the new leader inherits all in-flight
-   state via `webhooks.db` with zero scan cost. Detail in
-   `docs/http-send-plan.md` (which superseded the earlier
-   `webhook-server-plan.md` framing 2026-05-09).
+   state via `webhooks.db` with zero scan cost. The current generation
+   (durability-as-JS-shim, shipped 2026-05-24) replaces all of this
+   with composition over `kv.set` + `http.fetch` — see
+   `effect-reification-plan.md` Phase 5.
 
    The earlier "leader-local in v1, raft-replicate later" and
    "transactional `_outbox/*` handoff with apply-hook forwarding"
@@ -985,16 +988,14 @@ Resolved items moved to §10. Open items:
 - `docs/logs-plan.md` — §2.9 + Phase 5.5 (a) expansion: S3-direct
   batches with `.idx.json` sidecars, log-server on
   `logs.{public_suffix}`. Envelope type 1 retires.
-- `docs/http-send-plan.md` — §2.6 + Phase 5.5 (d) replacement:
-  generalizes webhook delivery to `http.send` /
-  `http.cancel`. Introduces envelope types 8/9/10/11
-  (`schedule_upsert` / `schedule_complete` / `schedule_cancel` /
-  `schedule_demote`), the cluster-wide `schedules.db`, and the
-  leader-pinned schedule-server thread. The earlier
-  `webhook-server-plan.md` (which described the `webhooks.db` +
-  envelope-4/5/6 design that shipped 2026-05-06 and was deleted
-  2026-05-09 in commit `cf375bf`) was removed once it had no
-  forward-looking content left.
+- `docs/effect-reification-plan.md` — covers §2.6 outbound HTTP after
+  the 2026-05-24 durability-as-JS-shim retirement. Customer-facing
+  `webhook.send` / `email.send` API preserved as JS shims composing
+  on `http.fetch` + `kv.set("_send/owed/{id}", ...)`. Earlier
+  generations (`webhooks.db` envelopes 4/5/6 shipped 2026-05-06,
+  `schedules.db` envelopes 8/9/10/11 shipped 2026-05-09, per-tenant
+  `_send/owed/` + leader-local `SendDispatch` shipped 2026-05-19) are
+  all retired; the sub-plan docs were removed.
 - `docs/snapshot-plan.md` — §2.13 + Phase 5.5 (c) expansion:
   per-tenant snapshot indices, S3 transport, no global
   write-pause. Replaces the row-level delta protocol in
@@ -1080,7 +1081,7 @@ The following were explored during the 2026-04-17 design conversation and ruled 
 - **Log batches replicated through raft (envelope type 1) + per-tenant `log.db` apply on every node.** Rejected (2026-05): logs are best-effort and lossy by design (PLAN §2.9), don't need raft's strong durability, and forcing them through the raft log dominates cluster bandwidth at scale. Replaced by `docs/logs-plan.md`: per-node S3-direct batch upload + a single log-server process polling S3 to maintain a local SQLite index.
 - **Per-tenant `files.db` on every worker mirroring the manifest via raft envelope type 3.** Rejected (2026-05): worker-as-read-only-consumer model is cleaner. Replaced by `docs/files-server-plan.md`: manifest lives in S3, runtime release signal is a `_deploy/current` kv marker written by a `POST /_system/release` worker route and picked up via apply.zig's writeset-value scan into a process-wide ReleaseTable, worker reads on demand.
 - **Worker hairpin proxy `/_system/files/*` and `/_system/log/*`.** Rejected (2026-05): these subsystems should be on their own subdomains (`files.{public_suffix}`, `logs.{public_suffix}`), terminating their own TLS, with token-handoff auth from the customer's app domain. Worker stops mediating their traffic entirely. Per `docs/files-server-plan.md` and `docs/logs-plan.md`.
-- **Webhook subsystem leader-local in v1 with per-tenant `_outbox/*` scan recovery on leader change.** Rejected (2026-05): the per-tenant scan is exactly the cost we're trying to eliminate; replicating recovery state via raft from day one removes it. Replaced first by a cluster-wide `webhooks.db` raft-replicated via envelope types 4/5/6 (shipped 2026-05-06), then 2026-05-09 by the more general `http.send` primitive with `schedules.db` and envelope types 8/9/10/11 (`docs/http-send-plan.md`).
+- **Webhook subsystem leader-local in v1 with per-tenant `_outbox/*` scan recovery on leader change.** Rejected (2026-05): the per-tenant scan is exactly the cost we're trying to eliminate; replicating recovery state via raft from day one removes it. Replaced first by a cluster-wide `webhooks.db` raft-replicated via envelope types 4/5/6 (shipped 2026-05-06), then 2026-05-09 by `http.send` with `schedules.db` and envelope types 8/9/10/11, then 2026-05-19 by per-tenant `_send/owed/{id}` markers + leader-local `SendDispatch`, then 2026-05-24 by durability-as-JS-shim (see `effect-reification-plan.md` Phase 5).
 - **Per-tenant `_outbox/{id}` as the transactional handoff point, with an apply-hook forwarding committed outbox rows into `webhooks.db`.** Rejected (2026-05): the only thing the per-tenant row could buy was customer-visible kv inspection of pending webhooks, which isn't a real customer benefit (customers observe webhook state via callbacks, not by peeking kv). And once envelope 4 can ride in the same raft entry as envelope 0 (the writeset), the handoff happens atomically at propose time — by the time the customer response gates on raft commit, `webhooks.db` is already durable cluster-wide. Replaced by direct envelope 0 + envelope 4 propose at handler-batch commit; the dispatcher accumulates `webhook.send` calls in a per-handler list parallel to the writeset, and the per-tenant `_outbox/*` prefix is gone entirely.
 - **Drainer thread doing the actual webhook delivery.** Rejected (2026-05): with `webhooks.db` raft-replicated and webhook-server as a leader-pinned thread, there is nothing left for a drainer to do. No orphan recovery (every committed writeset already has its corresponding webhook rows committed cluster-wide), no fall-back delivery (webhook-server owns delivery), no retry scheduling (envelope 6 covers it). Replaced by deleting `src/outbox/drainer.zig` outright.
 - **Webhook-server as a separate binary `rove-webhook-server`.** Considered (2026-05) and rejected. Webhook-server participates in raft (reads `webhooks.db`, proposes envelopes, leader-pinned) — separating across a process boundary forces RPC for proposes and file-share or learner-replication for `webhooks.db` reads, re-introducing the very plumbing the consolidation was supposed to eliminate. The right separability axis is raft participation, not public-TLS-surface presence. Webhook-server lives as a leader-pinned thread inside the loop46 binary; the cluster-wide `webhooks.db` design (envelope types 4/5/6) stays. Architectural principle captured in §6.
@@ -1138,7 +1139,7 @@ Build sessions between 2026-04-17 and 2026-04-30 shipped Phases 1–4, 6, and 8 
 - **Current shape (commit `cf375bf`+)**: `http.send` / `http.cancel` C bindings (`src/js/bindings/http.zig`) accumulate into the dispatcher's per-batch list; envelope 8 (`schedule_upsert`) rides atomically with envelope 0 via the type-7 multi; cluster-wide `schedules.db` (raft-replicated); leader-pinned schedule-server thread inside `loop46` reads + fires via libcurl (or hands in-cluster targets to the worker-0 `dispatchInternalSchedules` fast path); envelope 9 (`schedule_complete`) writes `_callback/{id}` to the calling tenant's app.db; existing `dispatchCallbacks` worker phase invokes the customer's `on_result` module.
 - `webhook.send` is now a JS polyfill (`src/js/bindings/webhook.js`) wrapping `http.send`; vendor-neutral (no platform-owned signing header). `email.send` (`src/js/bindings/email.js`) wraps `webhook.send` with the Resend URL + auth headers; customer passes the Resend `key` explicitly. `retry.*` (`src/js/bindings/retry.js`) is a pure customer-side library managing retry state in customer kv — no system tenant, no cross-tenant write privileges.
 - `crypto.hmacSha256` / `hmacSha1` / `verifyRsa` / `verifyEcdsa` / `timingSafeEqual` all shipped as native bindings so customers can stamp Stripe / Slack / SigV4 / OIDC signatures themselves.
-- `X-Rove-Schedule-Id` + `X-Rove-Schedule-Version` headers on every outbound fire (renamed from the prior `X-Rove-Webhook-Id` / `X-Rove-Webhook-Attempt`; the version counter is what enables dedup of overwrite-while-firing per `docs/http-send-plan.md` §7).
+- `X-Rove-Schedule-Id` + `X-Rove-Schedule-Version` headers on every outbound fire (renamed from the prior `X-Rove-Webhook-Id` / `X-Rove-Webhook-Attempt`; the version counter is what enables dedup of overwrite-while-firing — semantics preserved by the current `webhook.send` JS shim).
 - End-to-end smoke in `scripts/http_send_smoke.py` (replaces `webhook_smoke.py` against the http.send path).
 
 ### Phase 4 — Signup + auth — **done** (modulo deferred sweep)
@@ -1161,7 +1162,7 @@ Build sessions between 2026-04-17 and 2026-04-30 shipped Phases 1–4, 6, and 8 
 
 ### Phase 5.5 — Storage scalability — **shipped (a/b/c/d/e done)**
 - (b) **tape body capture — done 2026-05-05.** `LogRecord.tape_refs` carries request + response body hashes + truncation flags. `uploadTapes` writes the bytes to the per-tenant `log-blobs/` BlobBackend after kv commit. Bundle JSON (`src/tape/bundle.zig`) emits `request.body_b64` / `response.body_b64`. Log-server show endpoint serves bytes via range GET on the inline `.ndjson` blob (Phase 5.5 (a) Step B-2 `66861d1`). Smoke `scripts/replay_smoke.py` covers it.
-- (d) **webhook subsystem — done 2026-05-06, then superseded 2026-05-09.** Phase 5.5 (d) shipped exactly as planned: cluster-wide `webhooks.db`, envelopes 4/5/6, multi-envelope wrapper (envelope 7), leader-pinned `webhook-server` thread, dispatcher cutover. The customer-facing `webhook.send` API was preserved. **2026-05-09 generalization** (commits `deb5bba` → `cf375bf`): the dedicated webhook subsystem was deleted in favor of a more general `http.send` / `http.cancel` primitive (`src/schedule_server/`, envelopes 8/9/10/11, `schedules.db`) — same architectural shape (cluster-wide raft-replicated row store, leader-pinned thread, atomic with the writeset via the type-7 multi), broader semantics (arbitrary scheduled HTTP, not just webhook delivery). `webhook.send` is now a JS polyfill (`src/js/bindings/webhook.js`); retry policy is a customer-side library (`src/js/bindings/retry.js`). `webhooks.db` and the `webhook_server` module are gone. The customer-visible API is preserved by composition. See `docs/http-send-plan.md`.
+- (d) **webhook subsystem — three cutovers, final shape is JS-shim composition.** Phase 5.5 (d) shipped 2026-05-06 (`webhooks.db`, envelopes 4/5/6, leader-pinned `webhook-server` thread); 2026-05-09 generalized to `http.send` + `schedules.db` + envelopes 8/9/10/11 (commits `deb5bba` → `cf375bf`); 2026-05-19 re-platformed to per-tenant `_send/owed/{id}` markers + leader-local `SendDispatch` (Option (b)); 2026-05-24 retired the native primitive entirely in favour of JS-shim durability (commit `b908953`, ~4.7 kLOC of Zig deleted). Customer-facing `webhook.send` / `email.send` API preserved throughout. See `effect-reification-plan.md` Phase 5 + memory `project_durability_as_js_shim`.
 - (a) **logs — done 2026-05-06.** `log-server-standalone` runs on `logs.{public_suffix}` with TLS + JWT-handoff auth. Workers batch in memory and PUT `.ndjson` (gzip-deflated + sidecar prefixed) directly to the configured `BatchStore` (S3 or fs). The standalone polls + maintains a local SQLite `log_index.db`. Per-tenant `log.db`, envelope type 1, and the worker's `/_system/log/*` proxy all gone. Tape body GETs land via range read on the inline ndjson blob (`66861d1`). Detail in `docs/logs-plan.md`.
 - (e) **files-server — done 2026-05-06 (F1 + F2-push + F2-storage + process split).** `files-server-standalone` runs on `https://files.{public_suffix}` with TLS + JWT-gated routes. Manifest JSON lives in a per-tenant `deployments/` BlobBackend; runtime release pointer (`_deploy/current`) lands in the tenant's app.db and rides envelope 0 through raft. Worker has no `files.db`, no `/_system/files/*` proxy, no `code_proxy`. Dashboard / CLI POST `/_system/release {tenant_id, dep_id}` on the worker after a deploy; a process-wide `ReleaseTable` carries the signal across worker threads and `applyPendingReleases` triggers bytecode reload on next dispatch tick. files-server-standalone owns the **admin + replay deploys** too — bootstrap PUTs the embedded JS to S3 + raft-replicates `_deploy/current` via a JWT with `cap=release`. Envelope type 3 retired. Detail in `docs/files-server-plan.md`.
 - (c) **snapshot — done 2026-05-11.** Operator CLIs, in-process periodic capture loop (`--snapshot-interval-ms`), by-reference reuse for unchanged tenants, willemt raft log-compaction (+ incremental_vacuum), stamp-and-compact replacing byte-capture, and peer-to-peer catchup + boot-time install all shipped. See `docs/production.md` §1.1/§1.2/§3 and `docs/snapshot-plan.md`.
@@ -1234,9 +1235,8 @@ Architectural calls captured here so future sessions don't re-derive them. §10.
 
 ### 10.2 Root replication via raft envelope type 2
 
-Envelopes today (in shipped code, as of 2026-05-19 — post the
-http.send Option (b) N-way re-platform; see `docs/http-send-plan.md`
-§15):
+Envelopes today (in shipped code, as of 2026-05-24 — post the
+durability-as-JS-shim retirement of `http.send`):
 
 | Type | Target store | Producer | Status |
 |---|---|---|---|
@@ -1246,7 +1246,7 @@ http.send Option (b) N-way re-platform; see `docs/http-send-plan.md`
 | `3` files_writeset | — | (retired) | retired in Phase 5.5 (e) F2-storage — manifest moved to a per-tenant `deployments/` BlobBackend; decoder rejects type=3 |
 | `4`–`6` webhook_* | — | (retired) | retired 2026-05-09 in commit `cf375bf` along with the `webhook_server` module — `http.send` superseded the dedicated webhook envelope shapes; decoder rejects type=4/5/6 |
 | `7` multi | per-inner-envelope target | Worker dispatcher (rides envelope 0 + admin-side envelope 2 atomically) | active (shipped 2026-05-05) |
-| `8`–`11` schedule_* | — | (retired) | retired 2026-05-19 in the http.send **Option (b)** N-way re-platform (5b-2 sweep). `schedules.db`, the leader-pinned schedule-server thread, `dispatchCallbacks`/`dispatchInternalSchedules`, and `ScheduleStore`/`ScheduleRow`/`CallbackRow` are deleted. A send's only firing record is the per-tenant `_send/owed/{id}` marker riding envelope-0, fired by a leader-local per-node in-memory `SendDispatch`. Decoder rejects type=8/9/10/11. See `docs/http-send-plan.md` §15. |
+| `8`–`11` schedule_* | — | (retired) | retired 2026-05-19 in the http.send **Option (b)** N-way re-platform (5b-2 sweep). `schedules.db`, the leader-pinned schedule-server thread, `dispatchCallbacks`/`dispatchInternalSchedules`, and `ScheduleStore`/`ScheduleRow`/`CallbackRow` are deleted. Option (b) itself retired 2026-05-24 in the durability-as-JS-shim cutover; a send's only firing record is now the per-tenant `_send/owed/{id}` marker riding envelope-0, written by the `webhook.send.js` shim as an ordinary kv write (no apply-time special-case). Decoder rejects type=8/9/10/11. See `effect-reification-plan.md` Phase 5. |
 
 Multi-envelope-per-raft-entry support shipped in Phase 5.5 (d) step 2 (envelope type 7); the dispatcher uses it to propose the customer's writeset (envelope 0) atomically with the admin handler's cross-tenant trampoline + `platform.root.*` side writes (Option-A; envelope 2) in one raft entry. (It also carried the now-retired `http.send` schedule envelopes 8/10 before Option (b).)
 
@@ -1658,7 +1658,7 @@ Not available:
 - Running more than one node requires either a shared filesystem mount at `{data_dir}` (NFS/EFS/Ceph) or the shipped `S3BlobStore` backend (`BLOB_BACKEND=s3` + the `S3_*` / `AWS_*` env vars). Both work today.
 - Tape bodies (Phase 5.5 b) write through `LogStore.blob` to the configured `BlobStore`. With `BLOB_BACKEND=s3` or a shared FS mount, all nodes serve the same bytes; with single-host `fs`, bodies are leader-local and replay 404s after leader change for old request IDs.
 - On leader failover, the new leader has full manifests but may 503 on any blob not yet served by the shared backend (FS mount serves them transparently; S3 backend serves them on first read).
-- Outbound HTTP delivery (`http.send`): leader-pinned schedule-server thread reads `schedules.db` (raft-replicated). On leader change, the new leader inherits committed state with no per-tenant scan — at-least-once with version-counter dedup of duplicate fires, per `docs/http-send-plan.md` §7.
+- Outbound HTTP delivery (`webhook.send` JS shim): per-tenant `_send/owed/{id}` markers ride envelope-0 atomic with handler writes. On leader change, the new leader's boot-scan subscription replays unresolved markers — at-least-once with version-counter dedup of duplicate fires. See `effect-reification-plan.md` Phase 5.
 - `raft.log.db` is compacted by Phase 5.5 (c) (done 2026-05-11): `--snapshot-interval-ms` triggers periodic capture + willemt `raft_begin_snapshot` / `raft_end_snapshot` log-compaction. Operators should set this flag in production to bound log growth.
 
 ### Operational
@@ -1692,7 +1692,7 @@ on `__rove_stream` + kv-write wakes):
 
 The two standalones (files-server, log-server) are each a single process per cluster (single-process bet, §10.16). Failover is "LB picks a new node, clients reconnect". None of them participates in raft — that's the §6b principle that lets them live outside the loop46 binary. Operator-deployed; they're typically co-located with a `loop46` worker on each node, but can scale independently.
 
-**Connection-actor (held-synchronous §6.4, `docs/connection-actor-plan.md`, shipped 2026-05-18) adds NO process.** Unlike sse/files/log, it is **worker-internal**: a handler that returns `__rove_next(...)` parks its own h2 stream entity in a `parked_continuations` sibling collection (a `reg.move`, not a socket handoff); the bound `http.send` completion routes through `dispatchSendCompletions`' §6.4 Part-B peel into an in-worker resume that flushes to the still-open socket. The original plan §9 envisioned a standalone sibling; the unified trampoline model (no exposed handle, single-tenant, node-local) collapsed it into the worker — see that doc's §12 Freeze Addendum. `src/connection_holder/` is the now-superseded experimental scaffold, not a deployed process. The `http.send` best-effort / cross-worker node-affinity re-platform (Option (b), task #8) **shipped 2026-05-19** — see `docs/http-send-plan.md` §15.
+**Connection-actor (held-synchronous §6.4, `docs/connection-actor-plan.md`, shipped 2026-05-18) adds NO process.** Unlike files/log, it is **worker-internal**: a handler that returns `__rove_next(...)` parks its own h2 stream entity in a `parked_continuations` sibling collection (a `reg.move`, not a socket handoff); the bound outbound HTTP completion routes through `dispatchSendCompletions`' §6.4 Part-B peel into an in-worker resume that flushes to the still-open socket. The original plan §9 envisioned a standalone sibling; the unified trampoline model (no exposed handle, single-tenant, node-local) collapsed it into the worker — see that doc's §12 Freeze Addendum. `src/connection_holder/` is the now-superseded experimental scaffold, not a deployed process.
 
 **Auth/domain (Phases 1–3 of `docs/auth-domain-plan.md`, landed 2026-05-16).** Customer tenants resolve on `*.{public_suffix}` (`rewindjs.app`); platform surfaces resolve on a **distinct registrable domain** `{system_suffix}` (`rewindjs.com`): `app.` → `__admin__`, `replay.` → `__replay__`, `auth.` → `__auth__`, plus the `files./logs./sse.` standalones. The different eTLD+1 is the security-isolation boundary (§7 superseding note). **`__auth__` is a full OIDC IdP** — an ordinary tenant running the customer-facing `oidc.provider()` library; **admin/replay/logs are pure OIDC relying parties** of it (`oidc.rp()`), so there is no privileged platform-only auth path and no bearer/root-token *human* login (the admin RPC surface is OIDC-session-only; `/_system/*` keeps root-token for M2M). Operator `is_root` = an OIDC `sub` in the `_admin/operator/*` allowlist (seeded from `LOOP46_OPERATOR_EMAILS`). Cross-tenant admin reads/writes are the explicit `platform.scope(id).kv` accessor — `X-Rove-Scope` no longer rebinds the global `kv` (so admin's own home store, incl. sessions, is scope-independent). §0 host-relative invariant holds throughout: `iss`/JWKS/endpoints/`redirect_uris` derive from the request host, never a compiled platform literal.
 
@@ -1724,7 +1724,7 @@ What lives where, after Phase 5.5:
 
 Native bindings (Zig → QJS):
 
-- **Outbound HTTP**: `http.send(opts) → id`, `http.cancel({handle?, id?})` — the only native outbound primitive (`docs/http-send-plan.md`).
+- **Outbound HTTP**: `http.fetch(opts)` — the only native outbound primitive (`docs/upstream-streaming-plan.md`). Durable variants (`webhook.send` / `email.send`) are JS shims (`src/js/bindings/webhook.send.js` etc.) composing on `http.fetch` + `kv.set("_send/owed/{id}", ...)` markers.
 - **kv**: `kv.get`, `kv.set`, `kv.delete`, `kv.prefix(prefix, cursor, limit)`.
 - **streaming**: `__rove_stream({status?, headers?, write?, waitFor?, ctx?})` — iterative streaming handler return (streaming-handlers-plan §3.3). Replaced the retired `events.emit` global as the platform's live-push primitive. Customer SSE composes on top.
 - **crypto**: `crypto.getRandomValues`, `crypto.randomUUID`, `crypto.randomBytes`, `crypto.sha256`, `crypto.hmacSha1` / `hmacSha256`, `crypto.verifyRsa` (RS256/RS384/RS512), `crypto.verifyEcdsa` (ES256/ES384/ES512 — for Sign in with Apple), `crypto.timingSafeEqual`.
@@ -1736,7 +1736,7 @@ JS polyfills evaluated into every QJS context at startup (live in `src/js/bindin
 
 - `webhook.send` — wraps `http.send`. Vendor-neutral — no platform-owned signing header. Customers stamp HMAC / Stripe-Signature / SigV4 in `headers` themselves via `crypto.hmacSha256`.
 - `email.send({key, from, to, subject, text|html, ...})` — wraps `webhook.send` with the Resend URL + auth headers; customer passes the Resend `key` explicitly (§10.4).
-- `retry.{send, shouldRetry, next, stripContext}` — customer-side retry library on top of `http.send`. Retry state lives in the customer's own kv; no platform privileges (`docs/http-send-plan.md` §1 corrigendum).
+- `retry.{send, shouldRetry, next, stripContext}` — customer-side retry library on top of `http.fetch` + the `webhook.send` marker pattern. Retry state lives in the customer's own kv; no platform privileges.
 - `base64` / `base64url` (encode/decode), `hex` — byte ↔ string codecs (no `atob` / `btoa` in QJS-ng).
 - `URLSearchParams` — minimal polyfill.
 - `TextEncoder` / `TextDecoder` (UTF-8 only).

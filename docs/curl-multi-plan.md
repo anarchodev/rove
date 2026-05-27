@@ -3,8 +3,8 @@
 > **Status**: planned, not started — 2026-05-24.
 > **Prerequisite reading**: `docs/primitive-gaps.md` §2.5 (held outbound
 > subscription — the forcing function), `docs/connection-actor-plan.md`
-> §6.5 (atproto firehose — the first customer), `docs/http-send-plan.md`
-> §3 (existing libcurl outbound path).
+> §6.5 (atproto firehose — the first customer), `src/blob/curl.zig` and
+> `src/js/fetch_pool.zig` (the existing libcurl outbound paths).
 > **Hard prerequisite**: none. This work is upstream of gap 2.5 and
 > Phase 4 of `effect-reification-plan.md`. It can start independently
 > of the effect-reification trajectory.

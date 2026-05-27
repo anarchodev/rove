@@ -129,7 +129,7 @@ Wake reasons:
   coalesced).
 - **`timeout`** — a deadline the handler armed (reuses the schedule
   machinery; the connection handle is the schedule target instead of an
-  `http.send` URL — see http-send-plan §3).
+  `http.fetch` URL).
 - **`signal`** — an external nudge (a callback addressed at the handle, a
   durable-topic advance, an operator signal).
 - **`open`** — the initial wake (carries the upgrade/connect request).
@@ -271,11 +271,11 @@ effort eliminating):
   <60s). A mandatory `timeout` wake must produce a real 504-class response
   before any intermediary gives up. "Hold until the callback" is incomplete
   without "…or the deadline, whichever first".
-- **Resolve-once.** `http.send` is at-least-once (http-send-plan §7);
-  callbacks can double-deliver and leadership change can re-fire. First
-  resolution wins; the rest are dropped because the connection is already
-  completed — hooked into the existing version-counter defense, not a
-  parallel invention.
+- **Resolve-once.** `webhook.send` is at-least-once (see
+  `effect-reification-plan.md` Phase 5); callbacks can double-deliver
+  and leadership change can re-fire. First resolution wins; the rest
+  are dropped because the connection is already completed — hooked
+  into the existing version-counter defense, not a parallel invention.
 - **The synchrony is cosmetic.** Failover/at-least-once/ambiguity caveats of
   the underlying Cmd remain, now surfaced to an HTTP client that may not
   expect them. Safe only for retry/idempotency-aware callers or idempotent
