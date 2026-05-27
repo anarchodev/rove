@@ -772,6 +772,26 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(s3_blob_smoke);
 
+    // s3-throughput-bench: K concurrent threads each looping PUTs to
+    // S3 to find the concurrency × size knee where bandwidth stops
+    // scaling. No rove server, no raft, no h2 stack — isolates the
+    // S3 link from everything else.
+    const s3_throughput_bench_mod = b.addModule("s3-throughput-bench", .{
+        .root_source_file = b.path("examples/s3_throughput_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    s3_throughput_bench_mod.addImport("rove-blob", blob_mod);
+    s3_throughput_bench_mod.link_libc = true;
+    s3_throughput_bench_mod.linkSystemLibrary("ssl", .{});
+    s3_throughput_bench_mod.linkSystemLibrary("crypto", .{});
+
+    const s3_throughput_bench = b.addExecutable(.{
+        .name = "s3-throughput-bench",
+        .root_module = s3_throughput_bench_mod,
+    });
+    b.installArtifact(s3_throughput_bench);
+
     // h2 TLS test
     const h2_tls_mod = b.addModule("h2-tls-test", .{
         .root_source_file = b.path("examples/h2_tls_test.zig"),
