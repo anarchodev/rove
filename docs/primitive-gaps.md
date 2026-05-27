@@ -7,9 +7,9 @@ primitive so the gap becomes a parametric case of it). The
 recommendation column picks one per gap; the sequencing section
 proposes an order.
 
-This doc is upstream of the sub-plans that will be written when each
-gap is picked up (`docs/upstream-streaming-plan.md`, etc.). Nothing
-here ships until that per-gap plan exists.
+Streaming gaps (2.3 / 2.4 / 2.5) consolidated under
+`docs/streaming-model.md`; remaining gaps are sized for in-tree
+implementation without further design docs.
 
 ---
 
@@ -175,9 +175,8 @@ below is a case of that model rather than a standalone design.
   2026-05-21**. Reframed to `http.fetch` (transient + best-effort
   sibling of the durable `webhook.send`); Pattern A (`on_chunk`) +
   Pattern B (`pipe_to`) + `CURLOPT_WRITEFUNCTION` streaming transport
-  all shipped. See streaming-model.md §4 (the conceptual model) and
-  `docs/upstream-streaming-plan.md` (the as-built `http.fetch`
-  reference, slated for fold into streaming-model.md).
+  all shipped. See streaming-model.md §4 + §4.A (model + as-built
+  `http.fetch` reference).
 - **2.4 Streaming request body in** — **DESIGN LOCKED, IMPLEMENTATION
   PENDING.** Streaming-model.md §3 specifies the resolution: handler
   is dispatched at a coalesce-budget boundary (default 64 KiB) with
