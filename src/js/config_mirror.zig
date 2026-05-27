@@ -18,7 +18,7 @@
 //! (see oauth.js, sessions.js).
 
 const std = @import("std");
-const kv_mod = @import("rove-kv");
+const kv_mod = @import("raft-kv");
 const blob_mod = @import("rove-blob");
 const files_mod = @import("rove-files");
 const manifest_json = files_mod.manifest_json;

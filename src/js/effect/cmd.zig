@@ -32,7 +32,7 @@
 //! `respond_deferred` failure mode the Phase 4.1 reframe ruled out.
 
 const std = @import("std");
-const kv_mod = @import("rove-kv");
+const kv_mod = @import("raft-kv");
 const rove = @import("rove");
 const h2 = @import("rove-h2");
 const globals_mod = @import("../globals.zig");

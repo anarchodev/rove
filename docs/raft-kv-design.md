@@ -1,10 +1,20 @@
 # raft-kv: a multi-store raft library
 
-> Design note for the consolidation discussed 2026-05-10 in
-> `docs/production.md` #1.0 + #1.4. Replaces the de facto
+> **Status: SHIPPED.** Substance landed via the natural evolution of
+> the kv module (2026-04 → 2026-05). Two live consumers: **loop46**
+> (`src/loop46/main.zig` + `src/js/apply.zig`) drives a raft group
+> servicing per-tenant `app.db` + singleton `__root__.db` with
+> multi-envelope atomicity via `encodeMultiEnvelope`;
+> **files-server-standalone** (`src/files_server/thread.zig` +
+> `examples/files_server_standalone.zig`) drives its own raft group
+> for manifest writes, using `Cluster.proposeAndWait`. Package
+> renamed `rove-kv` → `raft-kv` 2026-05-27 in a build-system sweep.
+>
+> Original design note for the consolidation discussed 2026-05-10 in
+> `docs/production.md` #1.0 + #1.4. Replaced the de facto
 > "one KvStore + one raft group" framing of `rove-kv` with
 > the abstraction rewind.js already uses in practice and that
-> files-server will adopt as the second consumer.
+> files-server adopted as the second consumer.
 
 ## Motivation
 
@@ -282,29 +292,31 @@ Inherited from #1.2 step 1 (already shipped):
   per-customer-deploy entries as customers actually deploy.
 - DR: learner replica in another region (#1.2 pattern).
 
-## Migration order
+## Shipped, not as a single project
 
-1. Survey current `src/js/apply.zig` + `src/kv/raft_node.zig`.
-   Identify what moves to library vs stays in rewind.js.
-2. Introduce `Cluster` type in raft-kv. Move generic apply
-   dispatch + snapshot tick + multi-envelope wrapper.
-3. Define `Backend` interface + ship `SqliteBackend` as the
-   default (wraps existing kvstore.zig).
-4. Migrate rewind.js to the new API. rewind.js's apply.zig shrinks
-   to handler registrations. Existing snapshot smoke +
-   scalability bench should pass unchanged.
-5. files-server adopts a Cluster instance. Its
-   bootstrap/manifest paths get rewritten against the
-   library. The 10k-tenant bench gets rerun + numbers
-   captured in `docs/snapshot-bench-results.md`.
-6. (Optional) Rename `rove-kv` package to `raft-kv` as a
-   cleanup commit. All consumer imports rewrite.
+The consolidation happened incrementally rather than as one named
+migration. By 2026-05 the kv module already exposed `Cluster`
+(`src/kv/cluster.zig`) with envelope registration + multi-envelope
+encoding + snapshot tick + learner peer mode + send_snapshot
+streaming. loop46 and files-server-standalone both opened their own
+`Cluster` instances against it. The package rename `rove-kv` →
+`raft-kv` happened 2026-05-27 in one mechanical sed pass across
+build.zig + 22 source files; build clean, tests green.
 
 ## What's deferred
 
-- The future custom in-memory-pending backend. Backend
-  interface keeps the door open; implementation is later.
-- Cross-cluster coordination (rewind.js ↔ files-server). They
-  remain independent raft groups with their own elections.
-  Workers reach files-server via its HTTP API the same way
-  they do today.
+- **`LeaderTxn` as a named primitive.** The capability exists today
+  via `TrackedTxn` (per-store, `src/kv/kvstore.zig:734`) +
+  `Cluster.proposeAndWait` (`src/kv/cluster.zig:743`) +
+  `encodeMultiEnvelope` (`src/js/apply.zig:209`). loop46 uses the
+  three pieces directly at 4 sites; files-server is single-store and
+  doesn't use multi at all. A wrapper would centralize loop46's
+  pattern but adds API surface no consumer asks for. Defer per
+  `feedback_compose_from_primitives` until a third consumer or a
+  proliferation of multi-store callsites makes the wrapper pay for
+  itself.
+- **Custom in-memory-pending backend.** Backend interface keeps the
+  door open; no implementation candidate yet.
+- **Cross-cluster coordination (loop46 ↔ files-server).** They
+  remain independent raft groups with their own elections. Workers
+  reach files-server via its HTTP API.

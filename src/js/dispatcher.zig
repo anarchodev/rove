@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const qjs = @import("rove-qjs");
-const kv_mod = @import("rove-kv");
+const kv_mod = @import("raft-kv");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");

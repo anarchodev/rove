@@ -61,7 +61,7 @@ pub fn build(b: *std.Build) void {
     // State engine is kvexp (vendored). raft_log persistence is still
     // sqlite for now (raft log is its own concern, separate from the
     // KV state path); follow-up cutover will migrate it.
-    const kv_mod = b.addModule("rove-kv", .{
+    const kv_mod = b.addModule("raft-kv", .{
         .root_source_file = b.path("src/kv/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -114,7 +114,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    files_mod.addImport("rove-kv", kv_mod);
+    files_mod.addImport("raft-kv", kv_mod);
     files_mod.addImport("rove-blob", blob_mod);
 
     // ── rove-log: per-tenant request log store ──
@@ -128,7 +128,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    log_mod.addImport("rove-kv", kv_mod);
+    log_mod.addImport("raft-kv", kv_mod);
     log_mod.addImport("rove-blob", blob_mod);
 
     // ── rove-bodies: transport-layer body streaming buffer ──
@@ -172,7 +172,7 @@ pub fn build(b: *std.Build) void {
     tape_mod.addImport("rove-bodies", bodies_mod);
     // rove-kv is only used in bundle.zig's tests (to open a fresh
     // LogStore). Production bundle code never touches kv directly.
-    tape_mod.addImport("rove-kv", kv_mod);
+    tape_mod.addImport("raft-kv", kv_mod);
 
     // ── rove-qjs: arenajs (quickjs-ng fork) wrapper ──
     //
@@ -245,7 +245,7 @@ pub fn build(b: *std.Build) void {
     log_server_mod.addImport("rove", rove_mod);
     log_server_mod.addImport("rove-io", io_mod);
     log_server_mod.addImport("rove-h2", h2_mod);
-    log_server_mod.addImport("rove-kv", kv_mod);
+    log_server_mod.addImport("raft-kv", kv_mod);
     log_server_mod.addImport("rove-blob", blob_mod);
     log_server_mod.addImport("rove-log", log_mod);
     log_server_mod.addImport("rove-jwt", jwt_mod);
@@ -324,7 +324,7 @@ pub fn build(b: *std.Build) void {
     files_server_mod.addImport("rove", rove_mod);
     files_server_mod.addImport("rove-io", io_mod);
     files_server_mod.addImport("rove-h2", h2_mod);
-    files_server_mod.addImport("rove-kv", kv_mod);
+    files_server_mod.addImport("raft-kv", kv_mod);
     files_server_mod.addImport("rove-blob", blob_mod);
     files_server_mod.addImport("rove-files", files_mod);
     files_server_mod.addImport("rove-qjs", qjs_mod);
@@ -409,7 +409,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    tenant_mod.addImport("rove-kv", kv_mod);
+    tenant_mod.addImport("raft-kv", kv_mod);
 
     const tenant_tests = b.addTest(.{ .root_module = tenant_mod });
     test_step.dependOn(&b.addRunArtifact(tenant_tests).step);
@@ -429,7 +429,7 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-io", io_mod);
     js_mod.addImport("rove-h2", h2_mod);
     js_mod.addImport("rove-qjs", qjs_mod);
-    js_mod.addImport("rove-kv", kv_mod);
+    js_mod.addImport("raft-kv", kv_mod);
     js_mod.addImport("rove-blob", blob_mod);
     js_mod.addImport("rove-files", files_mod);
     js_mod.addImport("rove-log", log_mod);
@@ -511,7 +511,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    snapshot_mod.addImport("rove-kv", kv_mod);
+    snapshot_mod.addImport("raft-kv", kv_mod);
     snapshot_mod.addImport("rove-js", js_mod);
     snapshot_mod.addImport("rove-log-server", log_server_mod);
     snapshot_mod.link_libc = true;
@@ -531,7 +531,7 @@ pub fn build(b: *std.Build) void {
     });
     loop46_mod.addImport("rove", rove_mod);
     loop46_mod.addImport("rove-js", js_mod);
-    loop46_mod.addImport("rove-kv", kv_mod);
+    loop46_mod.addImport("raft-kv", kv_mod);
     loop46_mod.addImport("rove-blob", blob_mod);
     loop46_mod.addImport("rove-jwt", jwt_mod);
     loop46_mod.addImport("rove-files", files_mod);
@@ -609,7 +609,7 @@ pub fn build(b: *std.Build) void {
     cs_standalone_mod.addImport("rove-files-server", files_server_mod);
     cs_standalone_mod.addImport("rove-blob", blob_mod);
     cs_standalone_mod.addImport("rove-h2", h2_mod);
-    cs_standalone_mod.addImport("rove-kv", kv_mod);
+    cs_standalone_mod.addImport("raft-kv", kv_mod);
     const cs_standalone = b.addExecutable(.{
         .name = "files-server-standalone",
         .root_module = cs_standalone_mod,
@@ -667,7 +667,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    kv_maelstrom_mod.addImport("rove-kv", kv_mod);
+    kv_maelstrom_mod.addImport("raft-kv", kv_mod);
     kv_maelstrom_mod.link_libc = true;
 
     const kv_maelstrom = b.addExecutable(.{

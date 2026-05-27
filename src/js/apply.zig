@@ -54,7 +54,7 @@
 //! tenant state, so there is no contention to coordinate with.
 
 const std = @import("std");
-const kv = @import("rove-kv");
+const kv = @import("raft-kv");
 const tape_mod = @import("rove-tape");
 const panic_mod = @import("panic.zig");
 const deployment_loader_mod = @import("deployment_loader.zig");

@@ -27,7 +27,7 @@ const std = @import("std");
 const cs = @import("rove-files-server");
 const blob_mod = @import("rove-blob");
 const h2 = @import("rove-h2");
-const kv = @import("rove-kv");
+const kv = @import("raft-kv");
 
 var stop_flag: std.atomic.Value(bool) = .init(false);
 

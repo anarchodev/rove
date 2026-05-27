@@ -53,7 +53,7 @@
 
 const std = @import("std");
 
-const kv = @import("rove-kv");
+const kv = @import("raft-kv");
 const blob_mod = @import("rove-blob");
 
 pub const KvStore = kv.KvStore;

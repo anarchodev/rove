@@ -35,7 +35,7 @@
 //! app.db and rides envelope 0 through raft.
 
 const std = @import("std");
-const kv_mod = @import("rove-kv");
+const kv_mod = @import("raft-kv");
 const blob_mod = @import("rove-blob");
 const files_mod = @import("rove-files");
 const qjs = @import("rove-qjs");

@@ -19,7 +19,7 @@
 //! set: zero behavior change for existing deploys.
 
 const std = @import("std");
-const kv_mod = @import("rove-kv");
+const kv_mod = @import("raft-kv");
 const acme = @import("rove-acme");
 const tenant_mod = @import("rove-tenant");
 const blob = @import("rove-blob");
