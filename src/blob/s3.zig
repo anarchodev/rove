@@ -185,6 +185,11 @@ pub const S3BlobStore = struct {
                 "rove-blob s3: PUT {s}/{s} → status={d} body={s}",
                 .{ self.config.bucket, key, resp.status, resp.bodySnippet() },
             );
+            // 503 (SlowDown — OVH bucket sharding, AWS throttling) and
+            // 429 (rate limit) are transient — surface as SlowDown so
+            // the blob coordinator's retry path can distinguish them
+            // from terminal failures. Everything else stays Error.Io.
+            if (resp.status == 503 or resp.status == 429) return Error.SlowDown;
             return Error.Io;
         }
     }

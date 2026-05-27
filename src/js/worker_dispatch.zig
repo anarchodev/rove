@@ -2509,51 +2509,36 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 );
             };
         } else if (body.len > 0) {
-            // Large body (> INBOUND_INLINE_THRESHOLD) — buffer +
-            // park flow.
-            const tb = worker_mod.getOrOpenTenantBodies(worker, scope_inst) catch |err| blk: {
-                std.log.warn(
-                    "rove-js inbound: getOrOpenTenantBodies tenant={s}: {s}",
-                    .{ scope_inst.id, @errorName(err) },
-                );
-                body_gate_failed = true;
-                break :blk null;
-            };
-            if (tb) |t| {
-                const body_ref = t.buffer.append(body) catch |err| blk: {
+            // Large body (> INBOUND_INLINE_THRESHOLD) — coord
+            // submit + park. docs/blob-coordinator-plan.md
+            // Phase 3: bytes flow to the process-global coord,
+            // we park on the resulting seq, drain materializes
+            // the BodyRef once the seq is durable.
+            if (worker.node.blob_coordinator) |coord| {
+                const wid: u8 = @intCast(worker.log_worker_id);
+                if (coord.submit(wid, scope_inst.id, body)) |seq| {
+                    try server.reg.set(ent, &server.request_out, worker_mod.BodyDurabilityWait, .{
+                        .worker_seq = seq,
+                        .worker_id = wid,
+                        .body_ref = .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 0 },
+                        .tenant_id = scope_inst.id,
+                    });
+                    try server.reg.move(ent, &server.request_out, &worker.body_pending);
+                    processed += 1;
+                    continue;
+                } else |err| {
                     std.log.warn(
-                        "rove-js inbound: body-buffer append tenant={s} bytes={d}: {s}",
+                        "rove-js inbound: coord.submit tenant={s} bytes={d}: {s}",
                         .{ scope_inst.id, body.len, @errorName(err) },
                     );
                     body_gate_failed = true;
-                    break :blk bodies_mod.BodyRef{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 0 };
-                };
-                if (!body_gate_failed) {
-                    if (t.buffer.isDurable(body_ref)) {
-                        // Rare: a flusher tick landed between
-                        // append and this check, so the batch
-                        // is already durable. Skip the park and
-                        // continue with normal dispatch.
-                        readset.trigger_payload.appendTriggerPayload(body_ref, "", "") catch |err| {
-                            std.log.warn(
-                                "rove-js inbound: readset.trigger_payload append (fast-durable) tenant={s}: {s}",
-                                .{ scope_inst.id, @errorName(err) },
-                            );
-                        };
-                    } else {
-                        // Park — set the wait component, move to
-                        // body_pending, signal the flusher for a
-                        // priority flush, advance to the next entity.
-                        try server.reg.set(ent, &server.request_out, worker_mod.BodyDurabilityWait, .{
-                            .body_ref = body_ref,
-                            .tenant_id = scope_inst.id,
-                        });
-                        try server.reg.move(ent, &server.request_out, &worker.body_pending);
-                        worker.flusher_wake.set();
-                        processed += 1;
-                        continue;
-                    }
                 }
+            } else {
+                std.log.warn(
+                    "rove-js inbound: node.blob_coordinator not initialized tenant={s}",
+                    .{scope_inst.id},
+                );
+                body_gate_failed = true;
             }
         }
         if (body_gate_failed) {

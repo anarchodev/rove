@@ -78,7 +78,6 @@ const dispatch = @import("worker_dispatch.zig");
 const worker_log = @import("worker_log.zig");
 const worker_upload_checkpoint = @import("worker_upload_checkpoint.zig");
 const worker_upload_walker = @import("worker_upload_walker.zig");
-const worker_bodies = @import("worker_bodies.zig");
 const worker_streaming = @import("worker_streaming.zig");
 const worker_drain = @import("worker_drain.zig");
 const panic_mod = @import("panic.zig");
@@ -153,22 +152,31 @@ pub const RaftWait = struct {
 /// Per-entity park record for `docs/readset-replication-plan.md`
 /// Phase 4 (park-on-durability). When `dispatchPending` parks an
 /// entity waiting for its inbound request body's batch to flush,
-/// it sets this component with the body's `BodyRef` and the owning
-/// tenant id, then `reg.move`s the entity from `request_out` to
-/// `body_pending`.
+/// it sets this component with the coordinator's `(worker_id,
+/// worker_seq)` durability key and the owning tenant id, then
+/// `reg.move`s the entity from `request_out` to `body_pending`.
+///
+/// docs/blob-coordinator-plan.md Phase 3: durability is observed
+/// via `node.blob_coordinator.durableSeq(worker_id) > worker_seq`.
+/// `drainBodyPending` polls that atomic and, on advance, looks up
+/// `coord.bodyRef(worker_id, worker_seq)` to materialize the wire
+/// `BodyRef` (batch_id + offset + len) into `body_ref`. Resume
+/// path in `dispatchPending`'s body-gate reads `body_ref` and
+/// stamps it on the readset.
 ///
 /// Sentinel: `body_ref.batch_id == bodies_mod.NO_BATCH` (the
-/// default) means "not parked". `drainBodyPending` releases
-/// entities whose `body_ref.batch_id <= last_flushed_batch_id` on
-/// their tenant's `TenantBodies.buffer` back to `request_out`;
-/// `dispatchPending`'s body-gate detects the non-sentinel component
-/// on resume and uses the saved `body_ref` directly instead of
-/// re-appending (which would mint a new batch and re-park).
+/// default) means "not parked / not materialized." Drain sets
+/// `body_ref.batch_id != NO_BATCH` once it has resolved the coord
+/// BodyRef, signalling the resume path.
 ///
 /// `tenant_id` is a borrowed slice into the per-tenant
 /// `tenant_mod.Instance.id` — owned by the NodeState's tenant
 /// registry, lives for the process lifetime.
 pub const BodyDurabilityWait = struct {
+    /// Coord durability key — opaque to the dispatch path.
+    worker_seq: u64 = 0,
+    worker_id: u8 = 0,
+    /// Materialized BodyRef. NO_BATCH sentinel = not yet resolved.
     body_ref: bodies_mod.BodyRef = .{
         .batch_id = bodies_mod.NO_BATCH,
         .offset = 0,
@@ -187,16 +195,17 @@ pub const BodyDurabilityWait = struct {
 /// when `fireFetchEventActivation` flipped its `parked_to_durability`
 /// flag).
 ///
-/// `drainFetchPendingDurability` walks the list each main-loop
-/// tick, looks up the owning tenant's `TenantBodies.buffer`, and
-/// checks `buffer.isDurable(body_ref)`. Durable entries are
-/// removed from the list and re-fired via
-/// `fireFetchEventActivation(_, _, body_ref)` with the saved
-/// BodyRef so the gate skips the re-append and proceeds straight
-/// to dispatch.
+/// docs/blob-coordinator-plan.md Phase 3: durability is observed
+/// via the process-global coordinator. `drainFetchPendingDurability`
+/// polls `coord.durableSeq(worker_id) > worker_seq` each tick. On
+/// advance, it looks up `coord.bodyRef(worker_id, worker_seq)`,
+/// materializes the wire `BodyRef`, and re-fires
+/// `fireFetchEventActivation(_, _, body_ref)`.
 pub const ParkedFetchEvent = struct {
     event: components_mod.UpstreamFetchEvent,
-    body_ref: bodies_mod.BodyRef,
+    /// Coord durability key.
+    worker_seq: u64,
+    worker_id: u8,
     /// Borrowed slice into `event.tenant_id` (or the owning
     /// `tenant_mod.Instance.id` — both are stable for the
     /// process lifetime). Cached so drain doesn't have to dereference
@@ -987,32 +996,6 @@ pub const TenantLog = struct {
     }
 };
 
-/// Per-tenant body-buffer state held by the worker
-/// (`docs/readset-replication-plan.md` Phase 2b). Owns the
-/// `readset-blobs` BlobBackend opened against the node's shared
-/// `blob_backend_cfg` plus a single-tenant `bodies_mod.BodyBuffer`
-/// that accepts streaming appends from the H2 / curl_multi paths
-/// and periodically flushes to S3.
-///
-/// Lazy-opened on first body via `getOrOpenTenantBodies` —
-/// tenants that never receive a body pay no per-tenant RAM /
-/// backend-handle cost. Closed in `Worker.destroy` via the
-/// `TenantMap` deinit walk.
-pub const TenantBodies = struct {
-    allocator: std.mem.Allocator,
-    instance_id: []u8,
-    backend: blob_mod.BlobBackend,
-    buffer: bodies_mod.BodyBuffer,
-
-    pub fn open(worker: anytype, inst: *const tenant_mod.Instance) !*TenantBodies {
-        return worker_bodies.openTenantBodies(worker, inst);
-    }
-
-    pub fn free(allocator: std.mem.Allocator, tb: *TenantBodies) void {
-        worker_bodies.freeTenantBodies(allocator, tb);
-    }
-};
-
 /// Cache wrapper around `StringHashMapUnmanaged(*Entry)` that drives
 /// the lifecycle through `Entry.open(worker, inst)` and `Entry.free(
 /// allocator, *Entry)`. `TenantFiles` and `TenantLog` had eight
@@ -1259,6 +1242,14 @@ pub const NodeState = struct {
     /// engine drains its internal queue + fires libcurl + chunks
     /// the response + calls `enqueueFetchEventForTenant`.
     fetch_engine: ?*fetch_engine_mod.FetchEngine = null,
+
+    /// `docs/blob-coordinator-plan.md` Phase 3: process-global write
+    /// coordinator for readset blob PUTs. Replaces the per-worker
+    /// `BodyFlushPool`. All worker bodies (inbound + outbound fetch
+    /// chunks > 16 KB) submit here; the coord runs one drainer + K=32
+    /// executor pool. Lazy init via `startBlobCoordinator` after
+    /// NodeState is wired + `num_workers` is known.
+    blob_coordinator: ?*blob_mod.BlobCoordinator = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -1526,6 +1517,10 @@ pub const NodeState = struct {
             fe.deinit();
             self.fetch_engine = null;
         }
+        if (self.blob_coordinator) |c| {
+            c.deinit();
+            self.blob_coordinator = null;
+        }
         // Drop the inbox registry first — workers destroy their
         // inboxes in their own deinit, so by the time NodeState
         // tears down, every inbox should already be unregistered.
@@ -1585,6 +1580,23 @@ pub const NodeState = struct {
         errdefer fe.deinit();
         try fe.start();
         self.fetch_engine = fe;
+    }
+
+    /// `docs/blob-coordinator-plan.md` Phase 3: spawn the process-
+    /// global blob coordinator. Idempotent. Called once from
+    /// `main.zig` after NodeState is wired + `num_workers` is known
+    /// (the coord allocates per-worker queues up front).
+    pub fn startBlobCoordinator(self: *NodeState, worker_count: u8) !void {
+        if (self.blob_coordinator != null) return;
+        const coord = try blob_mod.BlobCoordinator.init(
+            self.allocator,
+            .{ .per_tenant = .{
+                .cfg = self.blob_backend_cfg,
+                .subdir = "readset-blobs",
+            } },
+            .{ .worker_count = worker_count },
+        );
+        self.blob_coordinator = coord;
     }
 
     /// Lookup-or-lazy-open under `tenant_files_lock`.
@@ -2047,21 +2059,7 @@ pub fn Worker(comptime opts: Options) type {
         /// ids across workers. Same lazy-open lifecycle as
         /// `tenant_files_map` but populated per-worker.
         tenant_logs: TenantMap(TenantLog),
-        /// Per-tenant body-buffer state
-        /// (`docs/readset-replication-plan.md` Phase 2b). Per-worker
-        /// (not NodeState) because bodies arrive on the worker thread
-        /// that owns H2 frame delivery + curl_multi events;
-        /// kv-affinity hashing pins each tenant to one worker, so
-        /// per-worker matches the natural data ownership. Lazy-opened
-        /// on first body via `worker_bodies.getOrOpenTenantBodies`.
-        tenant_bodies: TenantMap(TenantBodies),
-        /// Guards `tenant_bodies` map structure: the worker main
-        /// thread inserts via `getOrOpenTenantBodies` (Phase 2c
-        /// append site), and the log-flusher thread iterates via
-        /// `flushBodiesTick`. Each `TenantBodies.buffer` has its
-        /// own internal mutex; this one protects the map itself.
-        tenant_bodies_mu: std.Thread.Mutex = .{},
-        /// Per-node in-memory `LogRecord` buffer. Every tenant's
+/// Per-node in-memory `LogRecord` buffer. Every tenant's
         /// dispatch tick appends here; `flushLogs` drains the whole
         /// buffer into one combined batch per flush window. Replaces
         /// the per-tenant `LogStore.buffer` from before Phase 5.5(a-2).
@@ -2158,16 +2156,7 @@ pub fn Worker(comptime opts: Options) type {
         flusher_should_stop: std.atomic.Value(bool) = .init(false),
         flusher_wake: std.Thread.ResetEvent = .{},
 
-        /// Per-worker thread pool that runs body-buffer S3 PUTs in
-        /// parallel across tenants ready to flush. The flusher_thread
-        /// submits the per-tick batch via `submitAndWait`. Sized at
-        /// `ROVE_BODY_FLUSH_POOL_SIZE` (default 4); 8 workers × 4 = K=32
-        /// matches the OVH wire-saturation knee at 4 MB batches per the
-        /// throughput sweep. `null` only during early init or test
-        /// fixtures (flushBodiesTick has a serial fallback).
-        body_flush_pool: ?*worker_bodies.BodyFlushPool = null,
-
-        /// Async batched log-server push. Flushers append the S3 batch
+/// Async batched log-server push. Flushers append the S3 batch
         /// key they just PUT to `push_queue`; the `push_thread` drains
         /// the queue and POSTs all queued keys as one body to
         /// `/v1/_internal/batch-pushed`. Decouples the synchronous-
@@ -2234,7 +2223,6 @@ pub fn Worker(comptime opts: Options) type {
                 .node = config.node,
                 .raft = config.raft,
                 .tenant_logs = .empty,
-                .tenant_bodies = .empty,
                 .log_buffer = log_mod.NodeLogBuffer.init(allocator),
                 .penalty_box = penalty_mod.PenaltyBox.init(allocator, .{}),
                 .limiter = limiter_mod.RateLimiter.init(allocator, config.rate_limit_caps),
@@ -2270,7 +2258,6 @@ pub fn Worker(comptime opts: Options) type {
             errdefer self.parked_continuations.deinit();
             errdefer self.parked_units.deinit();
             errdefer self.tenant_logs.clearAllEntries(allocator);
-            errdefer self.tenant_bodies.clearAllEntries(allocator);
             errdefer self.wake_inbox.deinit();
 
             reg.registerCollection(&self.raft_pending_response);
@@ -2308,15 +2295,11 @@ pub fn Worker(comptime opts: Options) type {
                 try self.tenant_logs.put(allocator, try TenantLog.open(self, inst));
             }
 
-            // Body-flush pool must exist before the flusher_thread
-            // starts (its first tick may submit work). errdefer not
-            // needed: any failure after this point is unwound by the
-            // explicit teardown in `destroy`, which checks for null.
-            self.body_flush_pool = try worker_bodies.BodyFlushPool.init(
-                allocator,
-                worker_bodies.poolSizeFromEnv(),
-            );
-
+            // docs/blob-coordinator-plan.md Phase 3: body flush
+            // moved to the process-global BlobCoordinator
+            // (NodeState.blob_coordinator). The per-worker
+            // body_flush_pool is gone; the flusher_thread still
+            // runs for log flush + upload-walker.
             self.flusher_thread = try std.Thread.spawn(.{}, flusherLoop, .{self});
 
             // Spawn the push thread only if a libcurl handle was
@@ -2351,17 +2334,11 @@ pub fn Worker(comptime opts: Options) type {
         fn flusherLoop(self: *Self) void {
             const FLUSHER_TICK_NS: u64 = 50 * std.time.ns_per_ms;
             while (!self.flusher_should_stop.load(.acquire)) {
-                // Phase 4 park-on-durability: bodies flush FIRST.
-                // `dispatchPending`'s priority-flush wake is the
-                // dominant `flusher_wake.set()` caller now, and
-                // every parked entity blocks until its body's
-                // batch lands in S3. Running flushLogs ahead of
-                // flushBodiesTick added that PUT's RTT (~30–100 ms)
-                // to every parked dispatch's handler-run latency.
-                // Reordered so bodies PUT unblocks parked
-                // entities while logs continue piggy-backing the
-                // 50 ms tick (slice 4-park-2).
-                worker_bodies.flushBodiesTick(self);
+                // docs/blob-coordinator-plan.md Phase 3: body flush
+                // is now driven by the process-global coordinator's
+                // own drainer + executor threads — no per-tick call
+                // from the worker. Log flush + upload-walker still
+                // ride this tick.
                 // Phase 5c order: flushLogs FIRST (drains the local
                 // fast path's records + advances `last_uploaded_seq`),
                 // walker SECOND. On a healthy leader the walker then
@@ -2402,14 +2379,8 @@ pub fn Worker(comptime opts: Options) type {
                 t.join();
                 self.flusher_thread = null;
             }
-            // Tear down the body-flush pool AFTER the flusher_thread
-            // is joined: the flusher is the pool's only submitter, so
-            // stopping it first guarantees no in-flight submitAndWait
-            // when we shut the pool down.
-            if (self.body_flush_pool) |pool| {
-                pool.deinit();
-                self.body_flush_pool = null;
-            }
+            // docs/blob-coordinator-plan.md Phase 3: body_flush_pool
+            // removed; coord lives on NodeState and shuts down there.
             // Stop the push thread AFTER the flusher: the flusher
             // enqueues to push_queue, so stopping push first would
             // leak whatever the flusher emitted on its final tick.
@@ -2429,7 +2400,6 @@ pub fn Worker(comptime opts: Options) type {
             self.limiter.deinit();
             self.penalty_box.deinit();
             self.tenant_logs.deinit(allocator);
-            self.tenant_bodies.deinit(allocator);
             self.log_buffer.deinit();
             // Phase 3.2.c: SharedTxnPool.deinit walks any leftover
             // txns (best-effort rollback) before freeing the
@@ -2922,7 +2892,6 @@ pub fn getOrOpenTenantSlot(
 // in this file use `worker_log.X` directly.
 pub const REQUEST_BODY_CAP = worker_log.REQUEST_BODY_CAP;
 pub const getOrOpenTenantLog = worker_log.getOrOpenTenantLog;
-pub const getOrOpenTenantBodies = worker_bodies.getOrOpenTenantBodies;
 pub const captureTapes = worker_log.captureTapes;
 pub const captureTapesWithActivation = worker_log.captureTapesWithActivation;
 pub const captureLog = worker_log.captureLog;
@@ -4056,56 +4025,45 @@ pub fn fireFetchEventActivation(
         };
         inline_bytes_for_tape = event.bytes;
     } else if (event.bytes.len > 0) {
-        // Larger-than-threshold chunk — BodyRef path. Append to
-        // the per-tenant BodyBuffer; if the chunk isn't already
-        // durable (it usually isn't on first append), park the
-        // event in `fetch_pending_durability` until the flusher
-        // tick lands its batch in S3, then re-fire from
-        // drainFetchPendingDurability.
-        const tb = worker_bodies.getOrOpenTenantBodies(worker, inst) catch |err| blk: {
-            std.log.warn(
-                "rove-js fetch-event: getOrOpenTenantBodies tenant={s}: {s}",
-                .{ tenant_id, @errorName(err) },
-            );
-            break :blk null;
-        };
-        if (tb) |t| {
-            body_ref = t.buffer.append(event.bytes) catch |err| blk: {
+        // Larger-than-threshold chunk — coord submit + park.
+        // docs/blob-coordinator-plan.md Phase 3: submit returns a
+        // seq; durability is observed via the coord's per-worker
+        // HWM. Always park (no fast-durable bypass — submit is
+        // strictly async, durable_seq can't have advanced past
+        // this seq before the executor lands the PUT).
+        if (worker.node.blob_coordinator) |coord| {
+            const wid: u8 = @intCast(worker.log_worker_id);
+            const seq = coord.submit(wid, tenant_id, event.bytes) catch |err| blk: {
                 std.log.warn(
-                    "rove-js fetch-event: body-buffer append tenant={s} bytes={d}: {s}",
+                    "rove-js fetch-event: coord.submit tenant={s} bytes={d}: {s}",
                     .{ tenant_id, event.bytes.len, @errorName(err) },
                 );
-                break :blk .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 0 };
+                break :blk @as(?u64, null);
             };
-            // Park unless the periodic flusher already landed
-            // this body's batch (rare race — slice 4-park-2's
-            // fast-durable bypass equivalent).
-            if (body_ref.batch_id != bodies_mod.NO_BATCH and !t.buffer.isDurable(body_ref)) {
-                // Transfer ownership of `event` into the park list.
-                // The top-level `defer if (!parked_to_durability)
-                // deinit` skips on this branch.
+            if (seq) |s| {
                 worker.fetch_pending_durability.append(worker.allocator, .{
                     .event = event.*,
-                    .body_ref = body_ref,
+                    .worker_seq = s,
+                    .worker_id = wid,
                     .tenant_id_view = inst.id,
                 }) catch |err| {
                     std.log.warn(
                         "rove-js fetch-event: fetch_pending_durability.append tenant={s}: {s}",
                         .{ tenant_id, @errorName(err) },
                     );
-                    // Append failed — fall through and run the
-                    // activation against the (not-yet-durable)
-                    // bytes. Same effective behavior as pre-park.
                     txn.rollback() catch {};
                     txn_done = true;
                     return;
                 };
                 parked_to_durability = true;
-                worker.flusher_wake.set();
                 txn.rollback() catch {};
                 txn_done = true;
                 return;
             }
+            // submit failed — fall through with empty body_ref.
+            // The activation runs but the tape entry has no
+            // BodyRef. Same posture as the pre-coord append-failed
+            // branch.
         }
     }
     readset.fetch_responses.appendFetchResponse(
