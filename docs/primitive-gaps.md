@@ -192,8 +192,8 @@ below is a case of that model rather than a standalone design.
   transport in `src/js/fetch_engine.zig`; per-tenant cap
   `HELD_MAX_PER_TENANT=16`; cooperative `http.cancelSubscription`.
   Smokes: `scripts/subscription_smoke.py` + `subscription_cap_smoke.py`.
-  Federation transport prereq (atproto firehose CONSUMER) satisfied;
-  WS framing remains separate.
+  Federation transport prereq (atproto firehose CONSUMER) satisfied
+  modulo WS framing — see [`docs/websocket-plan.md`](websocket-plan.md).
 
 ---
 
