@@ -1,16 +1,16 @@
 # Readset replication plan
 
-> **Status**: design, 2026-05-24. Strategic plan, no code yet. Came out
-> of a design conversation that explicitly considered and rejected two
-> adjacent shapes (intents-only eager re-execution; intents-only lazy
-> with on-promotion re-exec); see §7 for the discarded alternatives and
-> why. Revised 2026-05-24 to remove the dual inline/blob routing —
-> per [[feedback_no_half_refactors]] + [[feedback_model_simplicity_safety]],
-> ship one safe semantic (every body streams to S3, every callback
-> gates on durability), no inline path. Touches the consensus path —
-> coordinate with `effect-reification-plan.md` Phase 4.1 (commit-gated
-> Cmd buffer) and the V2 multi-raft direction (memory:
-> `project_v2_multiraft_direction`) before scheduling.
+> **Status**: Phases 1–6 SHIPPED 2026-05-25/26/27. Substantively done;
+> only `5d-deferred` (operator-side S3 GC) remains, recommended as a
+> bucket-lifecycle rule pre-launch (no code work). The design
+> conversation explicitly considered and rejected two adjacent shapes
+> (intents-only eager re-execution; intents-only lazy with
+> on-promotion re-exec) — see §7 for the discarded alternatives and
+> why. The 2026-05-24 revision that removed the inline-body path for
+> simplicity was walked back in 4-inline once measured (see §9). The
+> §11 open questions are defer-until-observed items, not blocking work.
+> §1–§8 are the load-bearing reference for the readset wire format,
+> callback-gating semantics, and failure modes.
 
 ## 1. The problem in one sentence
 
@@ -384,420 +384,43 @@ hydrate fetch bodies. One GET per referenced batch, amortized across
 all requests pointing into it. Roughly the same I/O shape as today's
 direct S3 upload, just via an intermediate batch object.
 
-## 9. Phases
+## 9. Phase history (all shipped or resolved)
 
-### Phase 1 — readset capture on leader
+| Phase | What | Status |
+|---|---|---|
+| **1** | Readset capture on leader — structural lift (single `*tape_mod.Readset` on dispatch state) + scalar inputs (timestamp_ns, seed) folded in | SHIPPED — `Readset.init(allocator, timestamp_ns, seed)` |
+| **2** | Per-tenant streaming buffer + S3 batched flush — `rove-bodies` module, `BodyBuffer`, channels 5 (`fetch_responses`) + 6 (`trigger_payload`) on tape | SHIPPED — bytes flow through BlobBackend; tape carries BodyRefs |
+| **3** | Readset bytes (`rs_bytes`) in raft entry — type-0 envelope payload `[u32 ws_len][ws][u32 rs_len][rs]`; multi-readset aggregation via `tape_mod.encodeReadsetList` for batched dispatches | SHIPPED — apply-side validates each readset via `parseReadset` |
+| **4-inline** | Bodies ≤ 16 KB ride inline in readset (raft fsync IS durability); discriminator `batch_id == NO_BATCH`. Heldsync per-request 0.16s → 0.01s. | SHIPPED — walks back the pre-2026-05-24 "no inline path" simplification once measured |
+| **4-park** | Bodies > 16 KB use park-on-durability — `BodyDurabilityWait` component, `body_pending` collection, `drainBodyPending`. Worker thread no longer stalls during S3 PUTs. | SHIPPED |
+| **4-fetch-inline + 4-fetch-park** | Same inline/park split for outbound `http.fetch` chunks via `proposeForgetfulWrites` | SHIPPED |
+| **4.x** | Priority-flush coalescing + cross-tenant batching | RESOLVED via blob-coordinator Phase 5 — body-flush path migrated through process-global coord (`streaming-model.md` §7); cross-tenant `_pool/` layout coalesces across tenants; executor-driven batching makes priority-flush wake mechanism unnecessary |
+| **5a** | `LogHeader` on readset wire (request_id, deployment_id, duration_ns, status, outcome, method, path, host, correlation_id); `READSET_VERSION = 2` | SHIPPED |
+| **5b** (base + 5b-1) | Per-worker `last_uploaded_seq` checkpoint + idempotent push; cont-resume / streaming / fetch_chunk paths all stamp real `raft_seq` | SHIPPED |
+| **5c** | Promotion-time tape upload walker on `log_worker_id == 0`; hydrates LogRecords from raft entries via `parseReadset`; WALKER_BATCH_CAP=256 bounds latency during catchup | SHIPPED — body-bytes hydration *not* needed; `captureTapes` only inlines ≤16 KB in normal operation either (2026-05-27); large bodies live in BlobBackend via BodyRef, dashboard/replay fetches on demand |
+| **5d-base** | `collectReferencedBatchesIntoList` — extracts every live `(tenant_id, batch_id)` BodyRef from the raft log (the algorithmic core of GC) | SHIPPED |
+| **5d-deferred** | Operator-side S3 LIST + DELETE | DEFERRED pre-launch — bucket lifecycle expiration rule on `*/readset-blobs/*` is the recommended setup. In-code sweeper ships when: backend doesn't support lifecycle rules, customer needs sub-day GC latency, or tenant-eviction needs synchronous cleanup. None hold today. |
+| **6** | Verification — `leader_failover_smoke.py` extended to assert log records appear post-failover (proves walker recovery + indexer idempotency work end-to-end) | SHIPPED, 5/5 on the new assertion |
 
-Plumb the readset through the handler execution path. Today the tape
-generator already captures these fields on the leader; the change is
-making the readset a first-class structural value rather than a
-serialization-side concern. No raft changes.
+Per-phase commits on the readset-replication branch have the
+implementation detail. The 2026-05-24 plan revision that briefly
+removed the inline-body path is reflected in 4-inline above (walked
+back once measured — both inline-in-raft and inline-in-S3 deliver the
+same "handler runs against durable bytes" guarantee, and the latency
+win was worth the bounded wire complexity).
 
-Increments shipped:
+---
 
-- **1a — structural lift** (commit `7421dcc`): five per-channel `Tape`
-  fields on `DispatchState` / `Request` collapsed to a single
-  `?*tape_mod.Readset` owned by the tape module.
-- **1b — scalar inputs onto Readset**: `timestamp_ns: i64` and
-  `seed: u64` are now Readset fields, captured once at dispatch
-  entry. The standalone `Request.prng_seed` was dropped; the
-  dispatcher sources the PRNG seed from `request.readset.?.seed`
-  with a 0 fallback for the test paths that pass no readset. The
-  `Readset.init(allocator)` signature becomes
-  `init(allocator, timestamp_ns, seed)`.
+### Historical note — Phase 2 incidentally
 
-### Phase 2 — per-tenant streaming buffer + S3 batched flush
-
-Add the per-tenant buffer + flusher in the worker. Fetch responses
-and inbound bodies stream into the buffer as bytes arrive; engine
-emits `BodyRef = {batch_id, offset, len}` for every body. Flush on
-time/size threshold. `durable_offset` exposed as a per-tenant value.
-Backend: existing BlobBackend (per-tenant S3 path
-`{tenant_id}/readset-blobs/{batch_id}`).
-
-Testable in isolation: tape upload starts using `BodyRef`; no
-replication change yet, no callback gating yet.
-
-Increments:
-
-- **2a — bodies module + single-tenant buffer**: new `rove-bodies`
-  module (`src/bodies/root.zig`) defining `BodyRef`, `BodyBuffer`
-  (append / flush / threshold predicates), and the durability
-  gate predicate `isDurable(ref)`. Resolved §11.6 to "batch is
-  the unit of durability": a `BodyRef` is durable iff its
-  `batch_id ≤ last_flushed_batch_id`, no per-byte global counter
-  required. Resolved §11.7 to "single-tenant buffer
-  encapsulated, multiplex happens one layer up." Unit tests
-  cover append → flush → key shape, threshold triggers, and the
-  durability gate. No wiring to the request hot path yet.
-- **2b — per-worker plumbing**: per-tenant sub-buffers keyed by
-  tenant id + the worker's kv-affinity hash. Wired to
-  `NodeState.blob_backend_cfg` so each tenant opens against the
-  same shared store via
-  `BlobBackend.openPerTenant(cfg, tenant_id, "readset-blobs")`.
-  Lifecycle only — open on first body, close on tenant eviction.
-  Shipped as a `TenantMap(TenantBodies)` field on `Worker` next
-  to `tenant_logs`; lifecycle code lives in
-  `src/js/worker_bodies.zig` mirroring `worker_log.zig`. No call
-  sites yet — first append in slice 2c.
-- **2c — outbound (fetch) bodies**: chunks from curl_multi append
-  to the buffer; engine emits BodyRef. Routes via the existing
-  fetch_chunk activation path. Split into:
-    - **2c-1**: data plumbing — append on chunk arrival;
-      log-flusher thread piggybacks per-tenant body flush on its
-      50ms tick; `BodyBuffer` made thread-safe with lock-release
-      pattern around the slow PUT; `worker.tenant_bodies_mu`
-      protects the map structure. No tape capture yet — bytes
-      flow through S3 but the BodyRef is unused.
-    - **2c-2**: tape capture — extend `tape_mod.Readset` with a
-      `fetch_responses` channel (channel id 5) recording one
-      entry per fetch chunk activation:
-      `(fetch_id, seq, byte_offset, body_ref, final,
-        terminal_status, terminal_ok, body_truncated, headers)`.
-      `TapePayloads.fetch_responses_tape_bytes` carries the
-      serialized blob through the per-batch log object;
-      `flush_writer.writeTapePayloads` emits it as
-      `fetch_responses_tape_b64`. The inline `activation_bytes`
-      capture continues to ride alongside during the Phase 2 →
-      Phase 3 transition (both coexist); the inline bytes drop
-      out when the raft entry adopts the BodyRef in Phase 3.
-- **2d — inbound bodies**: H2 DATA frames append to the buffer;
-  engine emits BodyRef for the trigger payload position.
-  Shipped as channel id 6 `trigger_payload` on the tape module:
-  zero-or-one entry per dispatch carrying `(body_ref, headers)`.
-  `headers` is reserved for a follow-up capture; replay reads
-  the inbound method / path / host / wire headers from the log
-  record's dedicated fields today. Wired at the dispatch site
-  in `worker_dispatch.zig` after `Readset.init` —
-  `getOrOpenTenantBodies` + `buffer.append(body)` + the new
-  `appendTriggerPayload(body_ref, "")`. Body-less requests skip
-  the append; the channel serializes as empty.
-
-### Phase 3 — readset in raft entry
-
-Extend envelope type 0 to carry readset bytes alongside writeset. New
-type byte if the wire format isn't extensible cleanly. Apply path is
-unchanged (followers still apply writeset; readset is stored alongside
-or ignored at apply time).
-
-Bodies never ride in the entry — only `BodyRef` pointers do. Per-entry
-size growth is bounded by §8.1 (typically <2KB).
-
-Increments:
-
-- **3a — wire format**: type-0 envelope's payload becomes
-  `[u32 LE ws_len][ws_bytes][u32 LE rs_len][rs_bytes]`. Atomic flip
-  per `feedback_no_half_refactors` — clean-slate before launch.
-  `tape_mod.Readset` gets `serialize` / `parseReadset` with a
-  fixed 7-channel layout (one length-prefixed blob per channel,
-  always in canonical order) so the apply path can validate the
-  shape without parsing the channels themselves. `applyWriteSet`
-  splits the payload via `decodeWriteSetPayload`, validates
-  `rs_bytes` via `parseReadset` (panics on malformed), uses
-  `ws_bytes` for the existing apply / scan / decode operations.
-  *Note (3d-multi follow-up):* `rs_bytes` was later promoted from
-  a single `Readset.serialize` blob to a
-  `tape_mod.encodeReadsetList` blob — `[u32 count BE]
-  ([u32 blob_len BE][Readset.serialize bytes]){count}` — so a
-  batched dispatch's multiple successful requests can each ride
-  their own readset. Empty `rs_bytes` remains the "no readsets"
-  sentinel; non-handler producers are unchanged.
-- **3b — propose plumbing**: `proposeWriteSet` / `proposeBatch` /
-  `encodeWriteSetEnvelope` take `rs_bytes: []const u8` (required).
-  Every call site updated. Non-handler producers (config-mirror,
-  ACME, the system / release endpoints) pass `""`. The
-  dispatched-handler call sites
-  (worker_dispatch finalizeBatch + worker_drain + worker_streaming)
-  also pass `""` here — wired to real `Readset.serialize(...)` bytes
-  in slice 3d.
-- **3c — follower decode (validate)**: subsumed into 3a. Followers
-  apply `payload.ws_bytes` and validate `payload.rs_bytes` shape;
-  materialization for Phase 5's follower tape upload is a later
-  slice.
-- **3d — leader-side actual serialize**: `dispatchPending`
-  serializes each successful request's `Readset` via
-  `Readset.serialize(allocator)` and accumulates the blobs into
-  a `batch_readset_blobs` list; at end-of-walk it wraps the list
-  via `tape_mod.encodeReadsetList` and the resulting `rs_bytes`
-  rides `finalizeBatch` to both the main `proposeBatch` and the
-  read-only barrier `proposeWriteSet`. Drain + streaming
-  resume paths still pass `""` and TODO their own readset
-  attachment (closed by 3d-fetch).
-
-- **3d-multi (shipped)**: multi-readset aggregation. The raft
-  envelope's `rs_bytes` payload is now a
-  `tape_mod.encodeReadsetList` blob — `[u32 count BE]
-  ([u32 blob_len BE][Readset.serialize bytes]){count}`. Empty
-  bytes remain the "no readsets" sentinel for non-handler
-  producers (ACME, secondary inner envelopes of a batched
-  propose, root_writeset). Apply-side validation
-  (`applyWriteSet`) walks the list and validates each entry
-  with `tape_mod.parseReadset`. `proposeForgetfulWrites`
-  (single-activation paths in worker_streaming.zig +
-  worker.zig) wraps its one readset as a 1-item list, keeping
-  the wire shape uniform across producers. Closes the slice-3d
-  "first readset only" TODO; multi-request batches now carry
-  every successful request's readset.
-
-### Phase 4 — callback gating
-
-Hold response Msgs (and chunk Msgs, and inbound activation
-invocations) until `durable_offset` has advanced past their
-`(offset, len)` range. Park continuations on a "durable past
-offset X" wake source; advance fires all eligible resumes in one
-pass. Priority flush (§5.2) when a callback is parked on unflushed
-bytes.
-
-Builds on the parked-activation primitive already used by
-`effect-reification-plan.md`; the wake source is new but mechanically
-the same shape as existing continuation parking.
-
-Increments shipped:
-
-- **4 — inbound callback gating (sync-block, superseded by
-  4-park)**: original shape — `dispatchPending` synchronously
-  flushed the per-tenant `BodyBuffer` right after the inbound
-  body append, blocking the worker thread on the S3 PUT until
-  the bytes were durable. On flush failure: 503 + `.fault`
-  log outcome + skip the handler. Replaced by 4-park (below)
-  because the sync block pinned the worker thread on every
-  body-bearing dispatch, blocking concurrent requests on the
-  same worker. Failure handling (503 + `.fault`) carries
-  forward unchanged.
-
-- **3d-fetch + 4-fetch-inline (shipped)**: `proposeForgetfulWrites`
-  now takes a `?*const Readset` and serializes it for the
-  anchor envelope's rs_bytes — every fetch-chunk / cont-resume /
-  stream-resume / disconnect / subscription-fire activation
-  contributes its readset to the raft entry. Closes the
-  slice-3b TODO across worker_streaming + worker_drain +
-  worker.zig's fireFetchEventActivation.
-
-  `FetchResponseEntry` gets `inline_bytes` (channel 5 wire
-  format grows one length-prefixed field). Small fetch chunks
-  (≤ 16 KB) ride inline — no `BodyBuffer.append`, no S3 RTT,
-  handler runs immediately. Heldsync per-request elapsed went
-  from 0.97 s (always-buffer) to 0.17 s (small chunks inline).
-  Discriminator: `body_ref.batch_id == NO_BATCH` ⇒ inline.
-
-- **4-fetch-park (shipped)**: park large fetch chunks until
-  durable. New `ParkedFetchEvent` (event + body_ref +
-  tenant_id_view) and `worker.fetch_pending_durability:
-  ArrayListUnmanaged(ParkedFetchEvent)` field. Plain list
-  rather than a rove collection because UpstreamFetchEvents
-  arrive via the msg_inbox with no h2 entity to host a
-  component on.
-  `fireFetchEventActivation` takes ownership of the event
-  (deinit via top-level defer unless park flips the
-  `parked_to_durability` flag). The park branch transfers
-  ownership to the list + sets `flusher_wake`.
-  `drainFetchPendingDurability` walks the list each
-  main-loop tick, calls `fireFetchEventActivation(_, _,
-  saved_body_ref)` for durable entries — the gate detects
-  the saved ref and uses it directly instead of re-appending.
-  Outbound fetch responses now have the same end-to-end
-  durability-before-handler guarantee as inbound POST bodies.
-- **4-inline (shipped, revisits §5.3 rejection)**: small-body
-  inline fast path. Bodies ≤ 16 KB ride inline in the
-  readset's `trigger_payload.inline_bytes` field —
-  no buffer append, no park, no S3 RTT. The raft entry's
-  fsync IS the durability substrate (every replica sees the
-  bytes when the entry replicates), giving a *stronger*
-  guarantee than the BodyRef→S3 path. Discriminator on the
-  entry: `body_ref.batch_id == bodies_mod.NO_BATCH` means
-  "inline; bytes are in `inline_bytes`."
-  Bodies > 16 KB take the 4-park flow unchanged. The
-  threshold is chosen so typical JSON RPC / OAuth callback /
-  webhook payloads (well under 16 KB) skip the gate while
-  large uploads (file/image uploads) still go S3. Smokes:
-  heldsync per-request elapsed went from 0.16 s (park
-  always) to 0.01 s (inline), matching pre-Phase-4 baseline.
-
-  Walks back the 2026-05-24 plan revision that removed the
-  inline path for simplicity. The rationale at the time —
-  "ship one safe semantic" — still applies in that both
-  paths deliver the same property: handler runs against
-  durable bytes. The two implementations differ in WHERE
-  durability lives (raft log vs S3) but the customer-facing
-  guarantee is identical. The latency win is large enough
-  for typical workloads to revisit; the wire complexity is
-  bounded (one extra length-prefixed field on the entry).
-
-- **4-park (shipped)**: park-on-durability replaces the sync
-  block. New `BodyDurabilityWait` component (sibling to
-  `RaftWait`) and `body_pending` collection on `Worker`. On
-  fresh dispatch with a body: append to BodyBuffer, set the
-  component with the `BodyRef` + tenant id, `reg.move` to
-  `body_pending`, signal `flusher_wake` (priority flush),
-  worker continues with the next entity — no S3 RTT on the
-  worker hot path. `drainBodyPending` (run at the top of every
-  main-loop tick) checks each parked entity's
-  `BodyRef.batch_id` against the tenant buffer's
-  `last_flushed_batch_id` and moves durable ones back to
-  `request_out`. dispatchPending detects the non-sentinel
-  component on resume and uses the saved `body_ref` directly
-  (no re-append → no re-park cycle). Flusher loop reordered
-  to flush bodies before logs so the priority wake unblocks
-  parked entities immediately, not behind a log PUT.
-
-  Per-request latency for an isolated body POST goes UP vs
-  the sync-block predecessor (smokes observe ~80 ms vs
-  ~40 ms) due to thread coordination + flusher cycle
-  overhead. The win is that the **worker thread no longer
-  stalls**: concurrent requests on the same worker are
-  served while a parked request's body is in flight.
-
-- **4.x (resolved by blob-coordinator Phase 5)**: priority-flush
-  coalescing + cross-tenant batching (plan §5.2). The body-flush
-  path was migrated through the process-global blob coordinator
-  (`streaming-model.md` §7), which absorbed both concerns:
-  - **Cross-tenant coalescing** via the `_pool/{batch_id}` layout —
-    N tenants submitting bodies simultaneously ride one S3 PUT;
-    distinct BodyRefs point into different ranges of the same
-    pool object.
-  - **Priority flush for blocked handlers** is structurally
-    automatic — coord's drainer is executor-driven (fires whenever
-    an executor slot is free, no time/size threshold), so a parked
-    handler's body PUTs immediately on submit if there's executor
-    headroom. The per-tenant flush-interval that motivated §5.2's
-    early-wake mechanism doesn't exist anymore.
-
-### Phase 5 — follower tape upload + GC
-
-Followers (or any node) can serve tape upload duty: walk recent raft
-entries, hydrate fetch bodies from blob batches, push to the tape
-S3 path. Orphan-blob GC sweep.
-
-The customer log record carries metadata the readset doesn't —
-request_id, deployment_id, method/path/host, status, outcome,
-activation source, correlation_id. Without those, a follower can
-parse the readset but can't synthesize a LogRecord to push. Slice 5a
-adds a `LogHeader` to the readset wire. Console + exception stdout
-bytes are deliberately excluded — those are handler stdout that a
-follower would have to re-execute the handler to recover; rebuilt
-records leave both empty and the customer recovers console via tape
-replay if they need it.
-
-Increments (planned, smallest-first):
-
-- **5a — LogHeader on Readset wire**: extend the readset blob with
-  a per-request metadata header (request_id, deployment_id,
-  duration_ns, status, outcome, activation, method, path, host,
-  correlation_id) so any node can reconstruct the customer log
-  record from the raft entry alone. Bumps `READSET_VERSION` to 2.
-  Leader stamps the header at serialize time; followers parse +
-  validate at apply time and discard until 5c.
-- **5b — last_uploaded_seq checkpoint + idempotent push**: per-node
-  durable "log records I've already pushed through seq X" mark.
-  Indexer idempotency is already in place via PRIMARY KEY
-  (tenant_id, request_id) + INSERT OR IGNORE so a Phase-5c walker
-  re-uploading entries the prior leader already pushed is
-  harmless. Pre-requisite for 5c's promotion-time walk.
-
-  - **5b-base (shipped)**: `raft_seq: u64` on LogRecord; captureLog
-    plumbed through; per-worker checkpoint file at
-    `{data_dir}/_meta/last_uploaded_seq_w{log_worker_id:0>4}.txt`
-    (atomic write, empty/missing reads as 0). `flushLogs` advances
-    the checkpoint by `max(raft_seq across drained records)` after
-    each successful flush. Inbound dispatch
-    (worker_dispatch.zig finalizeBatch) is the only path stamping a
-    real seq today; cont-resume / streaming / fetch_chunk pass 0.
-  - **5b-1 (shipped)**: stamp real `raft_seq` on the cont-resume +
-    streaming + fetch_chunk paths. `proposeForgetfulWrites` and
-    `proposeAndParkContResume` now return `!u64` (the propose seq);
-    each call site captures the returned seq (`const fw_seq = ...`
-    / `const cont_seq = ...` / `const repark_seq = ...`) and
-    threads it through to the post-propose success captureLog.
-    Failure-path captureLogs (catch closures) continue to pass 0
-    — the entry never reached raft. The resumeStream `.stream` arm
-    hoists `var fw_seq: u64 = 0` outside its `if (wrote)` block so
-    the unified post-block captureLog stamps the seq on the wrote
-    branch and 0 on the read-only branch.
-- **5c — promotion-time tape upload walk (shipped)**: the leader's
-  first worker (`log_worker_id == 0`) runs an upload-catchup walker
-  from the flusher loop on every tick. The walker iterates raft
-  entries by index from `worker.upload_walker_idx + 1`, hydrates
-  per-request LogRecords from each entry's readset list via
-  `tape_mod.parseReadset` (extracting the `LogHeader` + each
-  channel's tape blob) and appends them to the worker's log_buffer.
-  Entries with `seq <= last_uploaded_seq` short-circuit without
-  hydrating (the leader's local fast path already covered them).
-  Multi-envelope (type-1) and root_writeset (type-2) are walked
-  correctly: type-1 recurses into every inner, type-2 has no
-  per-request LogHeader and is skipped.
-
-  Per-tick cap of `WALKER_BATCH_CAP = 256` entries bounds latency
-  during long catchups (post-promotion fresh leader has its
-  `last_uploaded_seq = 0` and walks every entry to advance). The
-  flusher-loop ordering is `flushLogs → walker` so on a healthy
-  leader the walker sees every entry already covered and
-  no-ops; only the catchup case does real work. Indexer
-  idempotency (PRIMARY KEY (tenant_id, request_id) + INSERT OR
-  IGNORE) absorbs any narrow-window duplicate against a record the
-  original leader had already pushed.
-
-  `request_body_bytes` + `activation_bytes` are NOT hydrated by the
-  walker, and as of 2026-05-27 they're not pre-inlined into LogRecord
-  for >16 KB bodies in normal operation either: `worker_log.captureTapes`
-  inlines only ≤ `REQUEST_BODY_CAP` (16 KB, matching the raft-inline
-  threshold). Large bodies live in BlobBackend via the readset's
-  `trigger_payload` / `fetch_responses` BodyRefs, and the dashboard /
-  replay fetches on demand. The walker doesn't need a separate
-  hydration path — rebuilt records carry the BodyRef the same way
-  normal-operation records do for the >16 KB case. Small bodies
-  (≤ 16 KB) inline into LogRecord at normal-operation time + survive
-  raft compaction via the log batch's 30-day retention; walker
-  recovery reconstructs them from the raft entry's `inline_bytes`
-  the same way.
-- **5d — orphan-blob GC (algorithmic core shipped; operator-side
-  delete deferred)**:
-  - **5d-base (shipped)**: `collectReferencedBatchesIntoList`
-    in `worker_upload_walker.zig` extracts every
-    `(tenant_id, batch_id)` BodyRef the live raft log
-    references. Walks type-0 / type-1 (recursively) / skips
-    type-2; parses each readset blob's fetch_responses +
-    trigger_payload channels; skips `body_ref.batch_id ==
-    bodies_mod.NO_BATCH` (small-body inline path — no blob
-    exists). 5 unit tests cover fetch / trigger / inline-skip /
-    multi-envelope / empty+malformed.
-  - **5d-deferred — operator-side delete**: the actual S3
-    `LIST` + `DELETE` is NOT wired today. The `BlobStore`
-    vtable would need a `list(prefix, after, max)` op
-    (~150 LOC of `ListObjectsV2` + XML parse + sigv4, mirroring
-    the existing implementation in
-    `src/log_server/batch_store_s3.zig`). Pre-launch, the
-    recommended setup is a **bucket lifecycle expiration rule**
-    on `*/readset-blobs/*` matching the operator's longest
-    expected raft-log retention window (1–7 days for typical
-    deploys). This trades the in-code sweep — and its read-side
-    list cost — for one cron job on the S3 control plane.
-    Trigger conditions for actually shipping in-code GC:
-      * an S3 backend that doesn't support lifecycle rules
-        (rare — AWS / OVH / R2 / B2 / MinIO all do);
-      * a customer needs sub-day GC latency for cost reasons;
-      * tenant-eviction-on-delete needs synchronous cleanup.
-    None of these conditions hold pre-launch. The algorithmic
-    core ships today so a future in-code sweeper has a tested
-    reference for "what's live."
-
-### Phase 6 — verification (shipped)
-
-`scripts/leader_failover_smoke.py` extended to spawn the log-server,
-mint a services-token JWT, and query `GET /v1/acme/list?limit=50`
-post-failover. Asserts at least one record exists for the acme
-tenant — proves the LogRecord for the original POST (that scheduled
-the webhook on the dead leader) reached S3 either via the dead
-leader's pre-crash flush OR via 5c's upload-catchup walker on the
-new leader. Indexer's `INSERT OR IGNORE (tenant_id, request_id)`
-makes both paths idempotent; the assertion is structural ("a record
-exists") rather than path-specific.
-
-Verified 5/5 on the new assertion across multi-run smoke (the
-pre-existing `~40%` on_result flake — webhook routing race per
-`project_leader_failover_smoke_flake` memory — is orthogonal and
-continues to surface at the same rate; Phase 6's assertion has been
-green on every run so far including the runs where on_result
-flaked).
+The original Phase 2 introduced a per-tenant `BodyBuffer` at
+`{tenant_id}/readset-blobs/{batch_id}` (per-tenant S3 prefix). The
+blob coordinator's Phase 5 (2026-05-27) generalized the substrate to
+a cross-tenant `_pool/{batch_id}` layout with raft-reserved unique
+batch_ids. The BodyRef wire shape is unchanged (`{u64 batch_id, u64
+offset, u32 len}`); the readset's `READSET_VERSION` tracks which
+key template to resolve against (v4 = per-tenant lane, v5 =
+`_pool/`). See `streaming-model.md` §7 for the substrate.
 
 ## 10. Relation to other plans
 
