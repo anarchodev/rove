@@ -291,6 +291,14 @@ pub const UpstreamFetchEvent = struct {
     /// `request.activation.body_truncated`.
     body_truncated: bool = false,
 
+    /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
+    /// §5.5: this event belongs to a bound fetch
+    /// (`http.fetch({bind: true})`). The dispatcher routes bound
+    /// events into the held chain's `onFetchChunk` resume instead
+    /// of firing a separate `fireFetchEventActivation` chain.
+    /// Carried from `PendingFetch.bind` by the FetchEngine.
+    bind: bool = false,
+
     pub fn deinit(allocator: std.mem.Allocator, items: []UpstreamFetchEvent) void {
         for (items) |*item| deinitItem(item, allocator);
     }

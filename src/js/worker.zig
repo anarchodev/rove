@@ -2234,6 +2234,22 @@ pub fn Worker(comptime opts: Options) type {
         /// tick drains this after `dispatchPendingMsgs` — by then
         /// the shim's txn is committed.
         pending_bound_resumes: std.ArrayListUnmanaged(PendingBoundResume) = .empty,
+        /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
+        /// §5.5: registry for `http.fetch({bind: true})` — maps
+        /// `fetch_id` to the entity that issued the fetch. Populated
+        /// in the http.fetch binding when `bind: true` (via the
+        /// `register_bound_fetch` trampoline on `Request`); consulted
+        /// in `dispatchPendingMsgs`'s `.fetch_chunk` arm to route
+        /// upstream chunks into the held chain's `onFetchChunk`
+        /// resume; cleared on terminal (`ev.final`) or on held-client
+        /// disconnect.
+        ///
+        /// Keys are allocator-owned dupes of the fetch_id; freed
+        /// when the entry is removed (or by `destroy` on shutdown).
+        /// Entity handles are stable across `reg.move` per
+        /// rove-library principle #8, so a chain transitioning
+        /// cont→stream doesn't invalidate the map entry.
+        bound_fetch_entities: std.StringHashMapUnmanaged(rove.Entity) = .empty,
         /// Phase 5 PR-3: this worker's slot index in
         /// `node.msg_inboxes`. Set from `registerMsgInbox`'s
         /// return value at `create`. The per-worker partitioned
@@ -2653,6 +2669,16 @@ pub fn Worker(comptime opts: Options) type {
             // be defensive.
             for (self.pending_bound_resumes.items) |*p| p.deinit(allocator);
             self.pending_bound_resumes.deinit(allocator);
+            // Free every fetch_id key in the bound-fetch registry.
+            // Values are entity handles (POD), no per-value cleanup.
+            // The registry never owns the underlying fetch in
+            // FetchEngine — that's released through normal terminal
+            // events or http.cancelFetch.
+            {
+                var it = self.bound_fetch_entities.iterator();
+                while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+                self.bound_fetch_entities.deinit(allocator);
+            }
             self.parked_continuations.deinit();
             self.parked_units.deinit();
             self.cron_state.deinit();
@@ -2946,6 +2972,58 @@ pub fn Worker(comptime opts: Options) type {
             const self: *Self = @ptrCast(@alignCast(ctx));
             const engine = self.node.fetch_engine orelse return;
             engine.cancel(id);
+        }
+
+        /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
+        /// §5.5: trampoline wired into `DispatchState.register_bound_fetch`.
+        /// The http.fetch binding calls this when `bind: true` is
+        /// passed; we dupe `fetch_id` (the registry owns the key)
+        /// and stamp the entity handle. Subsequent
+        /// `dispatchPendingMsgs` `.fetch_chunk` arrivals look up
+        /// `fetch_id` here to find the held entity.
+        ///
+        /// Returns false on allocator failure or if the fetch_id
+        /// is already registered (a previous bind that wasn't
+        /// drained — should be impossible in normal flow, log + drop).
+        pub fn registerBoundFetchTrampoline(
+            ctx: *anyopaque,
+            fetch_id: []const u8,
+            entity: rove.Entity,
+        ) bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            const a = self.allocator;
+            const gop = self.bound_fetch_entities.getOrPut(a, fetch_id) catch return false;
+            if (gop.found_existing) {
+                std.log.warn(
+                    "rove-js bound-fetch: registry collision for fetch_id={s}; dropping new bind",
+                    .{fetch_id},
+                );
+                return false;
+            }
+            const key_dup = a.dupe(u8, fetch_id) catch {
+                _ = self.bound_fetch_entities.remove(fetch_id);
+                return false;
+            };
+            gop.key_ptr.* = key_dup;
+            gop.value_ptr.* = entity;
+            return true;
+        }
+
+        /// Lookup a bound fetch's held entity. Returns `null` if
+        /// the fetch isn't registered as bound (the chunk should
+        /// fall through to `fireFetchEventActivation`'s separate-chain
+        /// path) — robust against late-arriving chunks for a chain
+        /// whose terminal already drained the registry.
+        pub fn lookupBoundFetch(self: *Self, fetch_id: []const u8) ?rove.Entity {
+            return self.bound_fetch_entities.get(fetch_id);
+        }
+
+        /// Unregister + free the registry key. Idempotent — a no-op
+        /// when the id isn't present (the cleanup path runs on every
+        /// terminal chunk; double-fire is benign).
+        pub fn unregisterBoundFetch(self: *Self, fetch_id: []const u8) void {
+            const entry = self.bound_fetch_entities.fetchRemove(fetch_id) orelse return;
+            self.allocator.free(entry.key);
         }
 
     };
@@ -4698,7 +4776,37 @@ pub fn cleanupResponses(worker: anytype) !void {
         if (chain.module_path.len > 0) {
             worker_streaming.fireDisconnectActivation(worker, ent);
         }
+        // `docs/streaming-model.md` §7 item 1: cancel any bound
+        // fetches still associated with this entity. The held
+        // client is gone; upstream chunks would land on a destroyed
+        // entity. cancel_fetch is cooperative — the FetchEngine
+        // tears down the libcurl handle; the unregister drops the
+        // registry entry. Walk + collect first so we don't mutate
+        // the map mid-iteration.
+        scanAndCancelBoundFetches(worker, ent);
         try server.reg.destroy(ent);
+    }
+}
+
+/// Walk the worker's `bound_fetch_entities` map, cancel + unregister
+/// every entry pointing at `ent`. Called from the disconnect cleanup
+/// path and from any future "held entity destroyed" site. Idempotent —
+/// repeated calls with the same entity see an empty match set.
+fn scanAndCancelBoundFetches(worker: anytype, ent: rove.Entity) void {
+    var doomed: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer doomed.deinit(worker.allocator);
+    var it = worker.bound_fetch_entities.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.*.eql(ent)) {
+            doomed.append(worker.allocator, entry.key_ptr.*) catch break;
+        }
+    }
+    for (doomed.items) |fetch_id| {
+        if (worker.node.fetch_engine) |engine| engine.cancel(fetch_id);
+        // unregisterBoundFetch frees the key via fetchRemove. The
+        // slice in `doomed` borrows the same bytes — read fetch_id
+        // BEFORE the unregister call.
+        worker.unregisterBoundFetch(fetch_id);
     }
 }
 

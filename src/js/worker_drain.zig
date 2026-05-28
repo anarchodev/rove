@@ -434,6 +434,38 @@ const ContResumeNext = union(enum) {
         new_cont: Continuation,
         new_bound_sched_id: ?[]u8,
     },
+    /// `docs/streaming-model.md` §7 item 1: cont→stream resume.
+    /// The handler returned `stream({write, status?, headers?})`
+    /// from a cont-parked entity (bound-fetch onFetchChunk
+    /// resume that opens a streaming response). All slices owned
+    /// and transferred onto the entity's stream components +
+    /// h2 components. Module path is duped from the resume's
+    /// cont module path (the chain's named-export module stays
+    /// fixed across activations).
+    stream: struct {
+        status: u16,
+        /// Response headers parsed from the stream Cmd. Caller-
+        /// allocated slice + entries; ownership transfers into the
+        /// h2 RespHeaders pack built by `setSimpleHeaders` /
+        /// equivalent. Empty slice = no extra headers.
+        resp_headers: []dispatcher_mod.ResponseHeader,
+        /// Initial chunks the stream emits before the first wake.
+        /// Spine + entries allocator-owned; transferred into the
+        /// entity's `StreamChunks.queue` via
+        /// `setStreamComponents`-equivalent staging.
+        chunks: [][]u8,
+        /// Customer ctx_json — threaded forward into the next
+        /// activation's request body.
+        ctx_json: []u8,
+        /// Module path for resume — typically the same path the
+        /// cont was parked against. Allocator-owned dup.
+        module_path: []u8,
+        /// kv-react wake prefixes. Spine + entries owned.
+        kv_prefixes: [][]u8,
+        /// Timer-wake interval (0 = no timer wake — fetch chunks
+        /// are the wake source).
+        interval_ms: i64,
+    },
 };
 
 fn proposeAndParkContResume(
@@ -507,6 +539,22 @@ fn proposeAndParkContResume(
                 var c = r.new_cont;
                 c.deinit(allocator);
             },
+            .stream => |*s| {
+                // Caller passed ownership of every slice into the
+                // .stream payload; we own freeing them on the
+                // propose-fail path.
+                for (s.resp_headers) |h| {
+                    allocator.free(h.name);
+                    allocator.free(h.value);
+                }
+                if (s.resp_headers.len > 0) allocator.free(s.resp_headers);
+                for (s.chunks) |c| allocator.free(c);
+                if (s.chunks.len > 0) allocator.free(s.chunks);
+                allocator.free(s.ctx_json);
+                allocator.free(s.module_path);
+                for (s.kv_prefixes) |p| allocator.free(p);
+                if (s.kv_prefixes.len > 0) allocator.free(s.kv_prefixes);
+            },
         }
         return err;
     };
@@ -522,16 +570,21 @@ fn proposeAndParkContResume(
     // inbound H2 dispatch's `Request`).
     //
     // Phase 4.1.3 Option-2: also emit Cmd.respond so the
-    // commit-arm move (raft_pending_cont → parked_continuations)
-    // routes through `interpretCmd` instead of `drainEntityArm`'s
-    // inline move. Same `source` / `dest` for both switch arms
-    // below (terminal + repark both land in raft_pending_cont
-    // and commit back to parked_continuations).
+    // commit-arm move (raft_pending_cont → {parked_continuations,
+    // stream_response_in}) routes through `interpretCmd` instead
+    // of `drainEntityArm`'s inline move. Terminal + repark
+    // commit back to `parked_continuations`; cont→stream
+    // (Phase 2b lift) commits to `stream_response_in` so h2 picks
+    // up the streaming pipeline.
+    const respond_dest: effect_mod.cmd.RespondOut.DestColl = switch (next) {
+        .terminal, .repark => .parked_continuations,
+        .stream => .stream_response_in,
+    };
     var cont_cmds: effect_mod.cmd.BufferedCmds = .{};
     cont_cmds.items.append(allocator, .{ .respond = .{
         .entity = ent,
         .source = .raft_pending_cont,
-        .dest = .parked_continuations,
+        .dest = respond_dest,
     } }) catch {};
     worker_mod.parkKvWakes(worker, seq, tenant_id, writeset, cont_cmds) catch |perr|
         std.log.warn("rove-js cont-resume parkKvWakes (tenant={s}) failed: {s}", .{ tenant_id, @errorName(perr) });
@@ -580,6 +633,95 @@ fn proposeAndParkContResume(
             // trampoline open hop's parking.
             const refreshed_deadline_ns: i64 = @as(i64, @intCast(std.time.nanoTimestamp())) + CONT_HOLD_DEADLINE_NS;
             desc.deadline_ns = refreshed_deadline_ns;
+            try server.reg.set(ent, &worker.parked_continuations, RaftWait, .{
+                .seq = seq,
+                .deadline_ns = deadline_ns,
+            });
+            try server.reg.move(ent, &worker.parked_continuations, &worker.raft_pending_cont);
+        },
+        .stream => |s| {
+            // `docs/streaming-model.md` §7 item 1 + Phase 2b lift:
+            // cont→stream transition. The entity moves from
+            // parked_continuations → raft_pending_cont → (commit
+            // Cmd.respond) → stream_response_in. We install the
+            // stream components (StreamChain / StreamChunks /
+            // StreamWakes) on the entity in parked_continuations;
+            // they ride the move into raft_pending_cont and onward
+            // into stream_response_in via the merged Row.
+            //
+            // The existing ContDescriptor on the entity becomes
+            // stale — deinit its Continuation and clear the fields.
+            // ChainContext stays — same tenant / correlation id;
+            // only the deployment_id and slices are reused unchanged.
+            const desc = try server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor);
+            if (desc.cont) |*old_c| old_c.deinit(allocator);
+            if (desc.bound_schedule_id) |old_b| allocator.free(old_b);
+            desc.* = .{};
+
+            // Stamp h2 response components: Status + RespHeaders
+            // (built from the customer-provided ResponseHeader list)
+            // + empty RespBody (first-hop "empty body" — actual
+            // bytes ride via StreamChunks) + H2IoResult OK +
+            // identity.
+            const handler_resp_hdrs: h2.RespHeaders = try respb.buildHandlerRespHeaders(
+                allocator,
+                null, // no CORS at this layer; the held inbound's response already set CORS via the original handler return path (not modeled here for the read-only first-hop)
+                null,
+                &.{},
+                null,
+                s.resp_headers,
+            );
+            // Free the customer-allocated ResponseHeader list now
+            // that buildHandlerRespHeaders has packed its bytes.
+            for (s.resp_headers) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            if (s.resp_headers.len > 0) allocator.free(s.resp_headers);
+
+            try server.reg.set(ent, &worker.parked_continuations, h2.Status, .{ .code = s.status });
+            try server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, handler_resp_hdrs);
+            try server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = null, .len = 0 });
+            try server.reg.set(ent, &worker.parked_continuations, h2.H2IoResult, .{ .err = 0 });
+            try server.reg.set(ent, &worker.parked_continuations, h2.StreamId, sid);
+            try server.reg.set(ent, &worker.parked_continuations, h2.Session, sess);
+
+            // Install StreamChain on the entity (already in
+            // parked_continuations). Module path + ctx_json transfer
+            // ownership into the component.
+            try server.reg.set(ent, &worker.parked_continuations, components_mod.StreamChain, .{
+                .module_path = s.module_path,
+                .ctx_json = s.ctx_json,
+                .activation_count = 1,
+            });
+
+            // Stage chunks through a temporary StreamChunks so the
+            // §9.4 cap check fires on the first-hop chunks too —
+            // identical to `setStreamComponents`'s pattern.
+            {
+                var staged: components_mod.StreamChunks = .{};
+                errdefer components_mod.StreamChunks.deinit(allocator, (&staged)[0..1]);
+                try staged.queue.ensureUnusedCapacity(allocator, s.chunks.len);
+                for (s.chunks) |chunk| try staged.tryAppend(allocator, chunk);
+                try server.reg.set(ent, &worker.parked_continuations, components_mod.StreamChunks, staged);
+            }
+            // The spine of s.chunks held pointers transferred into
+            // StreamChunks via tryAppend; free the outer spine.
+            if (s.chunks.len > 0) allocator.free(s.chunks);
+
+            // Install StreamWakes (kv-prefixes spine + entries
+            // transfer ownership). interval_ms = 0 = no timer wake;
+            // bound-fetch chunks are the wake source.
+            const next_wake_ns: i64 = if (s.interval_ms > 0)
+                @as(i64, @intCast(std.time.nanoTimestamp())) + s.interval_ms * std.time.ns_per_ms
+            else
+                std.math.maxInt(i64);
+            try server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{
+                .interval_ms = s.interval_ms,
+                .next_wake_ns = next_wake_ns,
+                .kv_prefixes = s.kv_prefixes,
+            });
+
             try server.reg.set(ent, &worker.parked_continuations, RaftWait, .{
                 .seq = seq,
                 .deadline_ns = deadline_ns,
@@ -923,15 +1065,613 @@ fn resumeContinuation(
             desc.deadline_ns = refreshed_deadline_ns;
         },
         .stream => |*s| {
-            // Phase 2a: a resume hop returning `__rove_stream(...)` is
-            // not yet wired — Phase 2b lands chunked-write resume.
-            // Treat as a defined 501 so the held socket releases
-            // cleanly rather than hanging.
-            s.deinit(allocator);
-            txn.rollback() catch {};
+            // `docs/streaming-model.md` §7 item 1 (Phase 2b lift):
+            // cont→stream transition on resume. Install stream
+            // components on the entity (still in
+            // parked_continuations); on a write path propose +
+            // park via raft + Cmd.respond(dest=stream_response_in);
+            // on read-only path commit inline + move directly to
+            // stream_response_in. Either way the held socket
+            // transitions from "cont awaiting one wake" to
+            // "stream emitting chunks per wake" — bound-fetch
+            // chunks become the wake source.
+            //
+            // Parse the customer's stream({headers}) wire-format
+            // buffer (`Key: Val\r\n…`) into the typed list shape
+            // proposeAndParkContResume expects. Empty / null →
+            // empty list.
+            const parsed_headers: []dispatcher_mod.ResponseHeader = if (s.headers) |hbuf|
+                @import("worker_dispatch.zig").parseStreamHeaders(allocator, hbuf) catch &.{}
+            else
+                &.{};
+            // headers buffer consumed (parseStreamHeaders copied
+            // bytes onto its return entries); free the original.
+            if (s.headers) |h| allocator.free(h);
+            s.headers = null;
+
+            // Module path for resume — duped from the cont's
+            // current path so subsequent fetch chunks find the
+            // same module.
+            const module_path_dup = allocator.dupe(u8, cont_path) catch {
+                // Allocator failure: free what we have, 500.
+                for (parsed_headers) |h| { allocator.free(h.name); allocator.free(h.value); }
+                if (parsed_headers.len > 0) allocator.free(parsed_headers);
+                s.deinit(allocator);
+                txn.rollback() catch {};
+                txn_done = true;
+                try resolveParked(worker, ent, sid, sess, 500, "stream resume alloc failed\n");
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, correlation_id, .send_callback, 0);
+                return;
+            };
+
+            // Transfer ownership of every slice OUT of `s` into
+            // the .stream ContResumeNext payload. Clear `s`'s
+            // fields so its remaining lifetime is a no-op deinit
+            // — we don't call s.deinit() (the payload is now in
+            // the variant).
+            const stream_status = s.status;
+            const stream_chunks = s.chunks;
+            const stream_ctx_json = s.ctx_json;
+            const stream_kv_prefixes = s.kv_prefixes;
+            const stream_interval = s.interval_ms orelse 0;
+            s.chunks = &.{};
+            s.ctx_json = &.{};
+            s.kv_prefixes = &.{};
+
+            if (wrote) {
+                const lh_stream: log_mod.LogHeader = .{
+                    .request_id = request_id,
+                    .deployment_id = tc.snap.deployment_id,
+                    .duration_ns = 0,
+                    .status = 0, // parked-hop convention (matches repark)
+                    .outcome = .ok,
+                    .activation = .send_callback,
+                    .method = "POST",
+                    .path = cont_path,
+                    .host = "",
+                    .correlation_id = correlation_id orelse "",
+                };
+                const stream_seq = proposeAndParkContResume(
+                    worker,
+                    ent,
+                    sid,
+                    sess,
+                    &ws,
+                    txn,
+                    tenant_id,
+                    .{ .stream = .{
+                        .status = stream_status,
+                        .resp_headers = parsed_headers,
+                        .chunks = stream_chunks,
+                        .ctx_json = stream_ctx_json,
+                        .module_path = module_path_dup,
+                        .kv_prefixes = stream_kv_prefixes,
+                        .interval_ms = stream_interval,
+                    } },
+                    &readset,
+                    lh_stream,
+                ) catch |perr| {
+                    // proposeAndParkContResume's failure arm freed
+                    // every payload slice + destroyed the txn.
+                    std.log.warn("rove-js cont-resume (stream): propose failed: {s}", .{@errorName(perr)});
+                    txn_owned = false;
+                    txn_done = true;
+                    resolveParked(worker, ent, sid, sess, 500, "stream resume write replication failed\n") catch {};
+                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, correlation_id, .send_callback, 0);
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, .send_callback, stream_seq);
+                return;
+            }
+
+            // Read-only stream resume: commit inline (nothing to
+            // replicate), install stream components, ship initial
+            // response, move parked_continuations →
+            // stream_response_in directly. The §2 one-rule still
+            // holds — read-only commits before the chunk reaches
+            // the wire (h2 ships from stream_data_out, which the
+            // entity reaches only after this move).
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "resumeContinuation.commit(stream_read_only)",
+                "err={s}",
+                .{@errorName(e)},
+            );
             txn_done = true;
-            try resolveParked(worker, ent, sid, sess, 501, "streams not yet wired in the resume path (Phase 2b)\n");
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, correlation_id, .send_callback, 0);
+
+            // Clear the stale ContDescriptor (the chain is no
+            // longer a cont). ChainContext stays.
+            const stale_desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch null;
+            if (stale_desc) |d| {
+                if (d.cont) |*old_c| old_c.deinit(allocator);
+                if (d.bound_schedule_id) |b| allocator.free(b);
+                d.* = .{};
+            }
+
+            const handler_resp_hdrs: h2.RespHeaders = respb.buildHandlerRespHeaders(
+                allocator,
+                null,
+                null,
+                &.{},
+                null,
+                parsed_headers,
+            ) catch {
+                for (parsed_headers) |h| { allocator.free(h.name); allocator.free(h.value); }
+                if (parsed_headers.len > 0) allocator.free(parsed_headers);
+                allocator.free(module_path_dup);
+                allocator.free(stream_ctx_json);
+                for (stream_chunks) |chunk_bytes| allocator.free(chunk_bytes);
+                if (stream_chunks.len > 0) allocator.free(stream_chunks);
+                for (stream_kv_prefixes) |p| allocator.free(p);
+                if (stream_kv_prefixes.len > 0) allocator.free(stream_kv_prefixes);
+                resolveParked(worker, ent, sid, sess, 500, "stream resume header build failed\n") catch {};
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, correlation_id, .send_callback, 0);
+                return;
+            };
+            for (parsed_headers) |h| { allocator.free(h.name); allocator.free(h.value); }
+            if (parsed_headers.len > 0) allocator.free(parsed_headers);
+
+            server.reg.set(ent, &worker.parked_continuations, h2.Status, .{ .code = stream_status }) catch {};
+            server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, handler_resp_hdrs) catch {};
+            server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = null, .len = 0 }) catch {};
+            server.reg.set(ent, &worker.parked_continuations, h2.H2IoResult, .{ .err = 0 }) catch {};
+            server.reg.set(ent, &worker.parked_continuations, h2.StreamId, sid) catch {};
+            server.reg.set(ent, &worker.parked_continuations, h2.Session, sess) catch {};
+            server.reg.set(ent, &worker.parked_continuations, components_mod.StreamChain, .{
+                .module_path = module_path_dup,
+                .ctx_json = stream_ctx_json,
+                .activation_count = 1,
+            }) catch {};
+
+            var staged: components_mod.StreamChunks = .{};
+            staged.queue.ensureUnusedCapacity(allocator, stream_chunks.len) catch {};
+            for (stream_chunks) |chunk| staged.tryAppend(allocator, chunk) catch {};
+            server.reg.set(ent, &worker.parked_continuations, components_mod.StreamChunks, staged) catch {};
+            if (stream_chunks.len > 0) allocator.free(stream_chunks);
+
+            const next_wake_ns: i64 = if (stream_interval > 0)
+                @as(i64, @intCast(std.time.nanoTimestamp())) + stream_interval * std.time.ns_per_ms
+            else
+                std.math.maxInt(i64);
+            server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{
+                .interval_ms = stream_interval,
+                .next_wake_ns = next_wake_ns,
+                .kv_prefixes = stream_kv_prefixes,
+            }) catch {};
+
+            server.reg.move(ent, &worker.parked_continuations, &server.stream_response_in) catch |merr|
+                std.log.warn("rove-js cont→stream move: {s}", .{@errorName(merr)});
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, .send_callback, 0);
+        },
+    }
+}
+
+/// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
+/// §5.5: bound-fetch resume engine. Sibling of `resumeContinuation`:
+/// an upstream chunk for a fetch issued from a held chain wakes the
+/// chain via its module's `onFetchChunk` named export.
+///
+/// V1 scope — handles only chunks arriving on a chain still in
+/// `parked_continuations` (first-chunk-on-cont). Subsequent chunks
+/// on a chain that already transitioned cont→stream (returned
+/// `stream({write})` on a prior chunk) need to wake the stream
+/// chain instead; that path is a follow-up (the stream-resume
+/// engine needs to grow a `.fetch_chunk` activation source). For
+/// now, lookups that find the entity outside `parked_continuations`
+/// fall through to the unbound `fireFetchEventActivation` path
+/// with a warning.
+///
+/// Owns `ev` — every exit path deinits the event (mirrors
+/// `fireFetchEventActivation`'s ownership contract).
+pub fn resumeBoundFetchChain(
+    worker: anytype,
+    ent: rove.Entity,
+    ev: *components_mod.UpstreamFetchEvent,
+) void {
+    var deinit_event = true;
+    defer if (deinit_event) components_mod.UpstreamFetchEvent.deinitItem(ev, worker.allocator);
+
+    const allocator = worker.allocator;
+    const server = worker.h2;
+    if (!server.reg.isInCollection(ent, &worker.parked_continuations)) {
+        // V1 limitation: bound chunks arriving for a chain that's
+        // already transitioned to stream aren't wired yet. Log and
+        // fall through to the unbound path by handing the event
+        // back to the caller's normal dispatch. We return the
+        // event with the bind flag cleared so the caller routes
+        // to `fireFetchEventActivation`.
+        std.log.info(
+            "rove-js bound-fetch: entity not in parked_continuations for fetch_id={s}; stream-chain bound resume is a follow-up. Falling back to unbound dispatch.",
+            .{ev.fetch_id},
+        );
+        deinit_event = false;
+        ev.bind = false;
+        worker_mod.fireFetchEventActivation(worker, ev, null);
+        return;
+    }
+    const desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return;
+    const chain = server.reg.get(ent, &worker.parked_continuations, components_mod.ChainContext) catch return;
+    const c = desc.cont orelse return;
+    const tenant_id = chain.tenant_id;
+    const correlation_id = chain.correlation_id;
+    const cont_path = c.path;
+    const path = cont_path;
+    var dep = resolveDeployment(worker, allocator, tenant_id, path) catch |err| {
+        std.log.warn(
+            "rove-js bound-fetch resume: resolveDeployment tenant={s} module={s}: {s}",
+            .{ tenant_id, path, @errorName(err) },
+        );
+        return;
+    };
+    defer dep.tc.release();
+    const inst = dep.inst;
+    const tc = dep.tc;
+    const bc = dep.bc;
+
+    // Build the resume request: target the `onFetchChunk` named
+    // export via ?fn=onFetchChunk (the standard named-export
+    // dispatch shape resumeContinuation already uses). Body is
+    // `{ctx: <ctx_json>}` — handler reads `request.body` for the
+    // chunk bytes from the activation_fetch_bytes slot, not from
+    // request.body.
+    const ctx_src: []const u8 = if (ev.ctx_json.len > 0) ev.ctx_json else "{}";
+    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{ctx_src}) catch return;
+    defer allocator.free(body);
+    const spath = std.fmt.allocPrint(allocator, "/{s}?fn=onFetchChunk", .{path}) catch return;
+    defer allocator.free(spath);
+
+    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
+    var txn_owned = true;
+    defer if (txn_owned) allocator.destroy(txn);
+    txn.* = inst.kv.beginTrackedImmediate() catch return;
+    var txn_done = false;
+    defer if (!txn_done) txn.rollback() catch {};
+
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    defer readset.deinit();
+    const request_id: u64 = blk: {
+        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
+        break :blk tl.id_minter.nextRequestId() catch 0;
+    };
+
+    var req: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = body,
+        .query = "fn=onFetchChunk",
+        .readset = &readset,
+        .request_id = request_id,
+        .platform = inst.platform,
+        .limiter = &worker.limiter,
+        .instance_id = inst.id,
+        .correlation_id = correlation_id,
+        .activation_source = .fetch_chunk,
+        .activation_fetch_id = ev.fetch_id,
+        .is_system_module = builtin_modules_mod.isBuiltinPath(path),
+        .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
+        .resume_if_bound_ctx = @ptrCast(worker),
+        .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
+        .cancel_fetch_ctx = @ptrCast(worker),
+        .register_bound_fetch = &@TypeOf(worker.*).registerBoundFetchTrampoline,
+        .register_bound_fetch_ctx = @ptrCast(worker),
+        .activation_entity = ent,
+    };
+    req.activation_fetch_seq = ev.seq;
+    req.activation_fetch_byte_offset = ev.byte_offset;
+    req.activation_fetch_bytes = ev.bytes;
+    req.activation_fetch_headers = ev.fetch_headers;
+    req.activation_fetch_final = ev.final;
+    if (ev.final) {
+        req.activation_fetch_terminal_status = ev.terminal_status;
+        req.activation_fetch_terminal_ok = ev.terminal_ok;
+        req.activation_fetch_body_truncated = ev.body_truncated;
+    }
+
+    // Read sid/sess from the entity's components BEFORE dispatch
+    // so the error path can resolve the held socket cleanly.
+    // resumeContinuation reads them from caller-supplied locals;
+    // here we pull from the parked_continuations collection.
+    const sid_ptr = server.reg.get(ent, &worker.parked_continuations, h2.StreamId) catch return;
+    const sess_ptr = server.reg.get(ent, &worker.parked_continuations, h2.Session) catch return;
+    const sid = sid_ptr.*;
+    const sess = sess_ptr.*;
+
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    var oc = worker.dispatcher.runOutcome(
+        inst.kv,
+        txn,
+        &ws,
+        bc,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        tc.snap.triggers,
+        req,
+        &budget,
+    ) catch {
+        txn.rollback() catch {};
+        txn_done = true;
+        resolveParked(worker, ent, sid, sess, 500, "bound-fetch handler error\n") catch {};
+        return;
+    };
+
+    const wrote = ws.ops.items.len > 0;
+
+    switch (oc) {
+        .terminal => |*r| {
+            defer r.deinit(allocator);
+            if (r.exception.len > 0) {
+                txn.rollback() catch {};
+                txn_done = true;
+                resolveParked(worker, ent, sid, sess, 500, "bound-fetch handler exception\n") catch {};
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, .fetch_chunk, 0);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+            if (wrote) {
+                const body_dup = allocator.dupe(u8, r.body) catch {
+                    txn.rollback() catch {};
+                    txn_done = true;
+                    resolveParked(worker, ent, sid, sess, 500, "bound-fetch alloc failed\n") catch {};
+                    return;
+                };
+                const lh: log_mod.LogHeader = .{
+                    .request_id = request_id,
+                    .deployment_id = tc.snap.deployment_id,
+                    .duration_ns = 0,
+                    .status = st,
+                    .outcome = .ok,
+                    .activation = .fetch_chunk,
+                    .method = "POST",
+                    .path = cont_path,
+                    .host = "",
+                    .correlation_id = correlation_id orelse "",
+                };
+                const console_owned = r.console;
+                const exception_owned = r.exception;
+                r.console = &.{};
+                r.exception = &.{};
+                const seq = proposeAndParkContResume(
+                    worker,
+                    ent,
+                    sid,
+                    sess,
+                    &ws,
+                    txn,
+                    tenant_id,
+                    .{ .terminal = .{ .status = st, .body = body_dup } },
+                    &readset,
+                    lh,
+                ) catch |perr| {
+                    std.log.warn("rove-js bound-fetch propose failed: {s}", .{@errorName(perr)});
+                    allocator.free(body_dup);
+                    txn_owned = false;
+                    txn_done = true;
+                    resolveParked(worker, ent, sid, sess, 500, "bound-fetch replication failed\n") catch {};
+                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, correlation_id, .fetch_chunk, 0);
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, .{}, correlation_id, .fetch_chunk, seq);
+                return;
+            }
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "resumeBoundFetchChain.commit(terminal_ro)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            resolveParked(worker, ent, sid, sess, st, r.body) catch {};
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, .fetch_chunk, 0);
+            r.console = &.{};
+            r.exception = &.{};
+        },
+        .continuation => |c2| {
+            // Re-park: refresh the cont descriptor + deadline. The
+            // chain stays awaiting the next bound-fetch chunk.
+            const c2m = c2;
+            const new_bound_sched_id: ?[]u8 = blk: {
+                var only: ?[]const u8 = null;
+                var nputs: usize = 0;
+                for (ws.ops.items) |op| switch (op) {
+                    .put => |p| if (std.mem.startsWith(u8, p.key, OWED_PREFIX)) {
+                        nputs += 1;
+                        only = p.key[OWED_PREFIX.len..];
+                    },
+                    .delete => {},
+                };
+                if (nputs != 1) break :blk null;
+                break :blk allocator.dupe(u8, only.?) catch null;
+            };
+            if (wrote) {
+                const lh: log_mod.LogHeader = .{
+                    .request_id = request_id,
+                    .deployment_id = tc.snap.deployment_id,
+                    .duration_ns = 0,
+                    .status = 0,
+                    .outcome = .ok,
+                    .activation = .fetch_chunk,
+                    .method = "POST",
+                    .path = cont_path,
+                    .host = "",
+                    .correlation_id = correlation_id orelse "",
+                };
+                const seq = proposeAndParkContResume(
+                    worker,
+                    ent,
+                    sid,
+                    sess,
+                    &ws,
+                    txn,
+                    tenant_id,
+                    .{ .repark = .{ .new_cont = c2m, .new_bound_sched_id = new_bound_sched_id } },
+                    &readset,
+                    lh,
+                ) catch |perr| {
+                    std.log.warn("rove-js bound-fetch repark: propose failed: {s}", .{@errorName(perr)});
+                    txn_owned = false;
+                    txn_done = true;
+                    resolveParked(worker, ent, sid, sess, 500, "bound-fetch replication failed\n") catch {};
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, .fetch_chunk, seq);
+                return;
+            }
+            // Read-only repark — refresh cont in place.
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "resumeBoundFetchChain.commit(repark_ro)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            const mutable_desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return;
+            if (mutable_desc.cont) |*old_c| old_c.deinit(allocator);
+            mutable_desc.cont = c2m;
+            if (mutable_desc.bound_schedule_id) |old_b| allocator.free(old_b);
+            mutable_desc.bound_schedule_id = new_bound_sched_id;
+            mutable_desc.deadline_ns = now_ns + CONT_HOLD_DEADLINE_NS;
+        },
+        .stream => |*s| {
+            // cont→stream transition. Parse headers, take ownership
+            // of stream payload slices, route through
+            // proposeAndParkContResume(.stream) on write path or
+            // inline on read-only.
+            const parsed_headers: []dispatcher_mod.ResponseHeader = if (s.headers) |hbuf|
+                @import("worker_dispatch.zig").parseStreamHeaders(allocator, hbuf) catch &.{}
+            else
+                &.{};
+            if (s.headers) |h| allocator.free(h);
+            s.headers = null;
+            const module_path_dup = allocator.dupe(u8, cont_path) catch {
+                for (parsed_headers) |h| { allocator.free(h.name); allocator.free(h.value); }
+                if (parsed_headers.len > 0) allocator.free(parsed_headers);
+                s.deinit(allocator);
+                txn.rollback() catch {};
+                txn_done = true;
+                resolveParked(worker, ent, sid, sess, 500, "bound-fetch stream alloc failed\n") catch {};
+                return;
+            };
+            const stream_status = s.status;
+            const stream_chunks = s.chunks;
+            const stream_ctx_json = s.ctx_json;
+            const stream_kv_prefixes = s.kv_prefixes;
+            const stream_interval = s.interval_ms orelse 0;
+            s.chunks = &.{};
+            s.ctx_json = &.{};
+            s.kv_prefixes = &.{};
+
+            if (wrote) {
+                const lh: log_mod.LogHeader = .{
+                    .request_id = request_id,
+                    .deployment_id = tc.snap.deployment_id,
+                    .duration_ns = 0,
+                    .status = 0,
+                    .outcome = .ok,
+                    .activation = .fetch_chunk,
+                    .method = "POST",
+                    .path = cont_path,
+                    .host = "",
+                    .correlation_id = correlation_id orelse "",
+                };
+                const seq = proposeAndParkContResume(
+                    worker,
+                    ent,
+                    sid,
+                    sess,
+                    &ws,
+                    txn,
+                    tenant_id,
+                    .{ .stream = .{
+                        .status = stream_status,
+                        .resp_headers = parsed_headers,
+                        .chunks = stream_chunks,
+                        .ctx_json = stream_ctx_json,
+                        .module_path = module_path_dup,
+                        .kv_prefixes = stream_kv_prefixes,
+                        .interval_ms = stream_interval,
+                    } },
+                    &readset,
+                    lh,
+                ) catch |perr| {
+                    std.log.warn("rove-js bound-fetch stream: propose failed: {s}", .{@errorName(perr)});
+                    txn_owned = false;
+                    txn_done = true;
+                    resolveParked(worker, ent, sid, sess, 500, "bound-fetch stream replication failed\n") catch {};
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, .fetch_chunk, seq);
+                return;
+            }
+            // Read-only stream resume. Mirror resumeContinuation's
+            // inline path: commit, stamp components, move to
+            // stream_response_in.
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "resumeBoundFetchChain.commit(stream_ro)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            const stale_desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch null;
+            if (stale_desc) |d| {
+                if (d.cont) |*old_c| old_c.deinit(allocator);
+                if (d.bound_schedule_id) |b| allocator.free(b);
+                d.* = .{};
+            }
+            const handler_resp_hdrs: h2.RespHeaders = respb.buildHandlerRespHeaders(
+                allocator, null, null, &.{}, null, parsed_headers,
+            ) catch {
+                for (parsed_headers) |h| { allocator.free(h.name); allocator.free(h.value); }
+                if (parsed_headers.len > 0) allocator.free(parsed_headers);
+                allocator.free(module_path_dup);
+                allocator.free(stream_ctx_json);
+                for (stream_chunks) |chunk_bytes| allocator.free(chunk_bytes);
+                if (stream_chunks.len > 0) allocator.free(stream_chunks);
+                for (stream_kv_prefixes) |p| allocator.free(p);
+                if (stream_kv_prefixes.len > 0) allocator.free(stream_kv_prefixes);
+                resolveParked(worker, ent, sid, sess, 500, "bound-fetch stream header build failed\n") catch {};
+                return;
+            };
+            for (parsed_headers) |h| { allocator.free(h.name); allocator.free(h.value); }
+            if (parsed_headers.len > 0) allocator.free(parsed_headers);
+
+            server.reg.set(ent, &worker.parked_continuations, h2.Status, .{ .code = stream_status }) catch {};
+            server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, handler_resp_hdrs) catch {};
+            server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = null, .len = 0 }) catch {};
+            server.reg.set(ent, &worker.parked_continuations, h2.H2IoResult, .{ .err = 0 }) catch {};
+            server.reg.set(ent, &worker.parked_continuations, h2.StreamId, sid) catch {};
+            server.reg.set(ent, &worker.parked_continuations, h2.Session, sess) catch {};
+            server.reg.set(ent, &worker.parked_continuations, components_mod.StreamChain, .{
+                .module_path = module_path_dup,
+                .ctx_json = stream_ctx_json,
+                .activation_count = 1,
+            }) catch {};
+            var staged: components_mod.StreamChunks = .{};
+            staged.queue.ensureUnusedCapacity(allocator, stream_chunks.len) catch {};
+            for (stream_chunks) |chunk| staged.tryAppend(allocator, chunk) catch {};
+            server.reg.set(ent, &worker.parked_continuations, components_mod.StreamChunks, staged) catch {};
+            if (stream_chunks.len > 0) allocator.free(stream_chunks);
+            const next_wake_ns: i64 = if (stream_interval > 0)
+                @as(i64, @intCast(std.time.nanoTimestamp())) + stream_interval * std.time.ns_per_ms
+            else
+                std.math.maxInt(i64);
+            server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{
+                .interval_ms = stream_interval,
+                .next_wake_ns = next_wake_ns,
+                .kv_prefixes = stream_kv_prefixes,
+            }) catch {};
+            server.reg.move(ent, &worker.parked_continuations, &server.stream_response_in) catch |merr|
+                std.log.warn("rove-js bound-fetch stream move: {s}", .{@errorName(merr)});
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, .fetch_chunk, 0);
         },
     }
 }

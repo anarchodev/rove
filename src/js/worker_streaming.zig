@@ -44,6 +44,7 @@ const panic_mod = @import("panic.zig");
 const builtin_modules_mod = @import("builtin_modules.zig");
 
 const worker_mod = @import("worker.zig");
+const worker_drain = @import("worker_drain.zig");
 const ParkedUnit = worker_mod.ParkedUnit;
 const KvWakeOp = worker_mod.KvWakeOp;
 const KvWakeEvent = worker_mod.KvWakeEvent;
@@ -2008,7 +2009,44 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
                 // the event — internal defer deinits it OR transfers
                 // to worker.fetch_pending_durability for the park
                 // branch. No external deinit needed.
+                //
+                // `docs/streaming-model.md` §7 item 1: bound fetch
+                // refit. When `ev.bind`, route the chunk into the
+                // calling chain's `onFetchChunk` resume instead of
+                // firing a separate `fetch-<id>` activation. The
+                // worker's bound-fetch registry maps `fetch_id →
+                // entity`; lookup misses fall through to the
+                // separate-chain path (registry already drained on
+                // a prior terminal, or registration failed at
+                // bind-call time — either way the chunk should
+                // still tape via the unbound path).
                 var ev = ev_const;
+                if (ev.bind) {
+                    if (worker.lookupBoundFetch(ev.fetch_id)) |held_ent| {
+                        const final = ev.final;
+                        // Copy the fetch_id BEFORE the resume call:
+                        // `resumeBoundFetchChain` consumes `ev` and
+                        // frees its slices on every exit path; reading
+                        // `ev.fetch_id` afterward is use-after-free.
+                        const fid_copy: ?[]u8 = if (final)
+                            allocator.dupe(u8, ev.fetch_id) catch null
+                        else
+                            null;
+                        worker_drain.resumeBoundFetchChain(worker, held_ent, &ev);
+                        if (fid_copy) |fid| {
+                            worker.unregisterBoundFetch(fid);
+                            allocator.free(fid);
+                        }
+                        fired += 1;
+                        continue;
+                    }
+                    // Lookup miss: log + fall through to unbound path
+                    // so the chunk still tapes.
+                    std.log.info(
+                        "rove-js bound-fetch: no held entity for fetch_id={s}; falling through to separate-chain dispatch",
+                        .{ev.fetch_id},
+                    );
+                }
                 worker_mod.fireFetchEventActivation(worker, &ev, null);
                 fired += 1;
             },

@@ -20,6 +20,7 @@ const kv_mod = @import("raft-kv");
 const tape_mod = @import("rove-tape");
 const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");
+const rove = @import("rove");
 const limiter_mod = @import("limiter.zig");
 const crypto_b = @import("bindings/crypto.zig");
 const email_rate_b = @import("bindings/email_rate.zig");
@@ -165,6 +166,17 @@ pub const PendingFetch = struct {
     /// completion as "subscription ended; reconnect if you want
     /// it back." Held=false → normal `http.fetch` semantics.
     held: bool = false,
+
+    /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
+    /// §5.5: bound fetch. When true, upstream chunks resume the
+    /// **calling chain** (the entity that issued the fetch from a
+    /// handler returning `next()`/`stream()`) instead of firing a
+    /// separate `fetch-<id>` chain. The held client's response
+    /// socket stays open across the bound fetch's lifetime; the
+    /// resume engine dispatches the held module's `onFetchChunk`
+    /// named export per chunk. `bind=false` → today's Pattern A
+    /// (`fireFetchEventActivation`, separate chain, no held socket).
+    bind: bool = false,
 
     pub fn deinit(self: *PendingFetch, allocator: std.mem.Allocator) void {
         allocator.free(self.tenant_id);
@@ -379,6 +391,24 @@ pub const DispatchState = struct {
         id: []const u8,
     ) void = null,
     cancel_fetch_ctx: ?*anyopaque = null,
+
+    /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
+    /// §5.5: register-bound-fetch trampoline. The http.fetch
+    /// binding calls this when `bind: true` to record a
+    /// `fetch_id → entity` mapping on the worker. Returns false
+    /// on registry failure. Null on test paths.
+    register_bound_fetch: ?*const fn (
+        ctx: *anyopaque,
+        fetch_id: []const u8,
+        entity: rove.Entity,
+    ) bool = null,
+    register_bound_fetch_ctx: ?*anyopaque = null,
+    /// The entity owning the chain this dispatch runs against —
+    /// what the binding registers under `fetch_id` when `bind:
+    /// true`. Null when the activation has no held socket
+    /// (subscription / cron / boot / test paths); the binding
+    /// rejects bind:true in that case.
+    activation_entity: ?rove.Entity = null,
 
     pub fn deinit(self: *DispatchState, ctx: ?*c.JSContext) void {
         var it = self.trigger_module_ns.iterator();
@@ -1975,6 +2005,31 @@ pub fn installRequest(
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "status", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_terminal_status)));
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "ok", if (request.activation_fetch_terminal_ok) js_true else js_false);
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "body_truncated", if (request.activation_fetch_body_truncated) js_true else js_false);
+        }
+        // `docs/handler-shape.md` §3 + §7: the customer's
+        // onFetchChunk handler (BOUND fetch path — bind:true) reads
+        // `request.body` (chunk bytes), `request.done` (final),
+        // `request.fetchId`, `request.chunkSeq` at the TOP LEVEL of
+        // request. The UNBOUND fetch path (Pattern A
+        // `on_chunk: "module"`, separate chain) keeps
+        // `request.body` as the synthesized `{"ctx":...}` JSON —
+        // existing handlers read `request.activation.bytes` for the
+        // chunk and `JSON.parse(request.body).ctx.*` for ctx
+        // round-trip. The discriminator is `activation_entity`: set
+        // only by `resumeBoundFetchChain`, null in
+        // `fireFetchEventActivation`'s unbound path.
+        if (request.activation_entity != null) {
+            _ = c.JS_SetPropertyStr(
+                ctx,
+                req_obj,
+                "body",
+                c.JS_NewUint8ArrayCopy(ctx, request.activation_fetch_bytes.ptr, request.activation_fetch_bytes.len),
+            );
+            _ = c.JS_SetPropertyStr(ctx, req_obj, "done", if (request.activation_fetch_final) js_true else js_false);
+            if (request.activation_fetch_id) |fid| {
+                _ = c.JS_SetPropertyStr(ctx, req_obj, "fetchId", c.JS_NewStringLen(ctx, fid.ptr, fid.len));
+            }
+            _ = c.JS_SetPropertyStr(ctx, req_obj, "chunkSeq", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_seq)));
         }
     }
 
