@@ -92,34 +92,48 @@ def main() -> int:
                 break
             time.sleep(0.2)
 
-        # 3. THE bound fetch. The held socket should receive a JSON
-        #    response shaped by `onFetchChunk` — fetchId / chunkSeq /
-        #    done / body. The handler returns on the first upstream
-        #    chunk (V1 scope: terminal Response, no multi-chunk
-        #    stream({write})).
+        # 3. THE bound fetch. The held socket should receive a
+        #    streaming response: onFetchChunk fires per upstream
+        #    chunk, each returning __rove_stream with a
+        #    "chunk:<text>" frame. The terminal chunk (done=true)
+        #    returns "" to close. With max_response_chunk_bytes=64
+        #    on a 170-byte upstream body, libcurl re-chunks into
+        #    3 events (64 + 64 + 42 bytes) + 1 terminal final event;
+        #    the held client sees 3 "chunk:" frames before close.
+        #
+        #    This exercises BOTH bound-fetch paths:
+        #      - First chunk: entity in parked_continuations →
+        #        resumeBoundFetchChain → cont→stream transition.
+        #      - Subsequent chunks: entity in stream_data_out →
+        #        resumeBoundFetchStream (Gap #1 lift).
         r = curl(cc, f"{acme_origin}/boundproxy?url={bulk_url}", method="GET")
         if r.status != 200:
             sys.exit(f"FAIL /boundproxy status={r.status} body={r.body!r}")
-        try:
-            payload = json.loads(r.body)
-        except Exception as e:
-            sys.exit(f"FAIL /boundproxy non-JSON body ({e}): {r.body!r}")
 
-        if not payload.get("fetchId"):
-            sys.exit(f"FAIL onFetchChunk: missing fetchId: {payload!r}")
-        if payload.get("done") is not True:
-            sys.exit(f"FAIL onFetchChunk: expected done=true (single-chunk fetch): {payload!r}")
-        body_field = payload.get("body", "")
-        if EXPECTED_BODY not in body_field:
+        body = r.body
+        # Each frame starts with "chunk:". Split on that marker.
+        # The first part is empty (body starts with "chunk:"); drop it.
+        parts = body.split("chunk:")
+        if parts and parts[0] == "":
+            parts = parts[1:]
+        if len(parts) < 3:
             sys.exit(
-                f"FAIL onFetchChunk: upstream body not visible in `body`:\n"
-                f"  got:  {body_field!r}\n"
-                f"  want substring: {EXPECTED_BODY!r}"
+                f"FAIL expected >= 3 chunk frames, got {len(parts)}.\n"
+                f"  body ({len(body)} bytes): {body!r}"
+            )
+
+        # Reconstruct the upstream body by concatenating frame
+        # payloads in order.
+        rebuilt = "".join(parts)
+        if rebuilt != EXPECTED_BODY:
+            sys.exit(
+                f"FAIL reconstructed body mismatch:\n"
+                f"  got ({len(rebuilt)} bytes):  {rebuilt!r}\n"
+                f"  want ({len(EXPECTED_BODY)} bytes): {EXPECTED_BODY!r}"
             )
         print(
-            f"ok  bound chunk fired onFetchChunk on held chain "
-            f"(fetchId={payload['fetchId'][:16]}…, done={payload['done']}, "
-            f"body={len(body_field)} bytes)"
+            f"ok  bound fetch streamed {len(parts)} chunks via onFetchChunk → __rove_stream "
+            f"({len(rebuilt)} bytes reconstructed byte-exact)"
         )
 
     print()

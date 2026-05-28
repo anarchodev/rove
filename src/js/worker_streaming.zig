@@ -65,6 +65,23 @@ fn markStreamDraining(server: anytype, ent: rove.Entity) void {
     drain_ptr.is_draining = true;
 }
 
+/// Like `markStreamDraining` but tries `stream_response_in` first
+/// (where bound-fetch streams briefly live post-commit, before h2
+/// moves them to stream_data_out — see `resumeBoundFetchStream`'s
+/// dual-collection support). Falls through to stream_data_out for
+/// the steady-state case. Same defensive posture: if neither
+/// matches, the entity isn't a live stream — silent no-op.
+fn markStreamDrainingAnywhere(server: anytype, ent: rove.Entity) void {
+    if (server.reg.get(ent, &server.stream_response_in, components_mod.StreamDraining)) |dp| {
+        dp.is_draining = true;
+        return;
+    } else |_| {}
+    if (server.reg.get(ent, &server.stream_data_out, components_mod.StreamDraining)) |dp| {
+        dp.is_draining = true;
+        return;
+    } else |_| {}
+}
+
 /// Handler-cmds Phase 3: populate the four stream-side components on
 /// the entity. After Phase 7, this is the SOLE site that allocates
 /// the stream-chain slices; ownership stays on the components for
@@ -758,6 +775,314 @@ fn resumeStream(
             s2.kv_prefixes = &.{};
             chain_st.activation_count += 1;
             captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation, fw_seq);
+        },
+    }
+}
+
+/// `docs/streaming-model.md` §7 item 1 (Gap #1 follow-up):
+/// bound-fetch chunk arriving on an entity that already transitioned
+/// cont→stream. Sibling of `resumeStream` — same stream-chain
+/// machinery, but the activation kind is `.fetch_chunk` (carrying
+/// the chunk bytes/seq/done payload on the Request) and the dispatch
+/// targets the module's `onFetchChunk` named export via
+/// `?fn=onFetchChunk`.
+///
+/// Per rove-library principle 1, the caller has already established
+/// the entity's state (it's in `stream_data_out`); this function
+/// assumes that and reads chain components from there. Outcome
+/// handling mirrors `resumeStream`: Response → terminal chunk-drain
+/// then close; stream → append chunks + update wakes; continuation
+/// → 501 (stream → cont transition is out of scope, same as the
+/// existing stream-resume `.continuation` arm).
+///
+/// `ev` is consumed — every exit path deinits via the caller's
+/// outer defer (mirrors `resumeBoundFetchChain`'s ownership).
+pub fn resumeBoundFetchStream(
+    worker: anytype,
+    ent: rove.Entity,
+    ev: *components_mod.UpstreamFetchEvent,
+) void {
+    // Mirror resumeBoundFetchChain's ownership contract: own the
+    // event's deinit on every exit path.
+    defer components_mod.UpstreamFetchEvent.deinitItem(ev, worker.allocator);
+
+    const allocator = worker.allocator;
+    const server = worker.h2;
+
+    // The entity can be in either stream_response_in (post-commit,
+    // h2 hasn't moved it to stream_data_out yet — typically a one-
+    // tick window) or stream_data_out (steady-state). Both share
+    // the StreamRow so components are accessible from either. The
+    // caller verified isInCollection before dispatching here;
+    // we re-probe to pick the right collection for component reads.
+    //
+    // markStreamDraining is hardcoded against stream_data_out — when
+    // entity is in stream_response_in, we set is_draining directly
+    // against the current collection.
+    const in_data_out = server.reg.isInCollection(ent, &server.stream_data_out);
+    const chain_ctx = if (in_data_out)
+        server.reg.get(ent, &server.stream_data_out, components_mod.ChainContext) catch return
+    else
+        server.reg.get(ent, &server.stream_response_in, components_mod.ChainContext) catch return;
+    const chain_st = if (in_data_out)
+        server.reg.get(ent, &server.stream_data_out, components_mod.StreamChain) catch return
+    else
+        server.reg.get(ent, &server.stream_response_in, components_mod.StreamChain) catch return;
+    const chunks_st = if (in_data_out)
+        server.reg.get(ent, &server.stream_data_out, components_mod.StreamChunks) catch return
+    else
+        server.reg.get(ent, &server.stream_response_in, components_mod.StreamChunks) catch return;
+    const wakes_st = if (in_data_out)
+        server.reg.get(ent, &server.stream_data_out, components_mod.StreamWakes) catch return
+    else
+        server.reg.get(ent, &server.stream_response_in, components_mod.StreamWakes) catch return;
+
+    const path = chain_st.module_path;
+    var dep = resolveDeployment(worker, allocator, chain_ctx.tenant_id, path) catch |err| {
+        std.log.warn(
+            "rove-js bound-fetch stream resume: resolveDeployment tenant={s} module={s}: {s}",
+            .{ chain_ctx.tenant_id, path, @errorName(err) },
+        );
+        return;
+    };
+    defer dep.tc.release();
+    const inst = dep.inst;
+    const tc = dep.tc;
+    const bc = dep.bc;
+
+    // Resume body: `{ctx: <ctx_json>}` matching the other resume
+    // engines — request.body is overridden in globals.zig with the
+    // chunk bytes for bound fetch_chunk activations
+    // (`activation_entity != null` gate).
+    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json}) catch return;
+    defer allocator.free(body);
+    const spath = std.fmt.allocPrint(allocator, "/{s}?fn=onFetchChunk", .{path}) catch return;
+    defer allocator.free(spath);
+
+    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
+    var txn_owned = true;
+    defer if (txn_owned) allocator.destroy(txn);
+    txn.* = inst.kv.beginTrackedImmediate() catch return;
+    var txn_done = false;
+    defer if (!txn_done) txn.rollback() catch {};
+
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    defer readset.deinit();
+    const request_id: u64 = blk: {
+        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
+        break :blk tl.id_minter.nextRequestId() catch 0;
+    };
+
+    const dropped_chunks_snapshot = chunks_st.takeDropped();
+    var req: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = body,
+        .query = "fn=onFetchChunk",
+        .readset = &readset,
+        .request_id = request_id,
+        .platform = inst.platform,
+        .limiter = &worker.limiter,
+        .instance_id = inst.id,
+        .correlation_id = chain_ctx.correlation_id,
+        .activation_source = .fetch_chunk,
+        .activation_fetch_id = ev.fetch_id,
+        .is_system_module = builtin_modules_mod.isBuiltinPath(path),
+        .activation_write_pressure_dropped = dropped_chunks_snapshot,
+        .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
+        .resume_if_bound_ctx = @ptrCast(worker),
+        .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
+        .cancel_fetch_ctx = @ptrCast(worker),
+        .register_bound_fetch = &@TypeOf(worker.*).registerBoundFetchTrampoline,
+        .register_bound_fetch_ctx = @ptrCast(worker),
+        .activation_entity = ent,
+    };
+    req.activation_fetch_seq = ev.seq;
+    req.activation_fetch_byte_offset = ev.byte_offset;
+    req.activation_fetch_bytes = ev.bytes;
+    req.activation_fetch_headers = ev.fetch_headers;
+    req.activation_fetch_final = ev.final;
+    if (ev.final) {
+        req.activation_fetch_terminal_status = ev.terminal_status;
+        req.activation_fetch_terminal_ok = ev.terminal_ok;
+        req.activation_fetch_body_truncated = ev.body_truncated;
+    }
+
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    var oc = worker.dispatcher.runOutcome(
+        inst.kv,
+        txn,
+        &ws,
+        bc,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        tc.snap.triggers,
+        req,
+        &budget,
+    ) catch {
+        txn.rollback() catch {};
+        txn_done = true;
+        markStreamDrainingAnywhere(server, ent);
+        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+        return;
+    };
+
+    const wrote = ws.ops.items.len > 0;
+    switch (oc) {
+        .terminal => |*r| {
+            defer r.deinit(allocator);
+            if (r.exception.len > 0) {
+                txn.rollback() catch {};
+                txn_done = true;
+                markStreamDrainingAnywhere(server, ent);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            if (wrote) {
+                var stage: StreamResumeStage = .{ .entity = ent, .mark_draining = true };
+                defer {
+                    for (stage.chunks.items) |c| allocator.free(c);
+                    stage.chunks.deinit(allocator);
+                }
+                if (r.body.len > 0) {
+                    const owned = allocator.dupe(u8, r.body) catch return;
+                    errdefer allocator.free(owned);
+                    stage.chunks.append(allocator, owned) catch return;
+                }
+                const lh_term: log_mod.LogHeader = .{
+                    .request_id = request_id,
+                    .deployment_id = tc.snap.deployment_id,
+                    .duration_ns = 0,
+                    .status = @intCast(@max(@min(r.status, 599), 100)),
+                    .outcome = .ok,
+                    .activation = .fetch_chunk,
+                    .method = "POST",
+                    .path = chain_st.module_path,
+                    .host = "",
+                    .correlation_id = chain_ctx.correlation_id orelse "",
+                };
+                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &readset, lh_term) catch |perr| {
+                    std.log.warn("rove-js bound-fetch stream (terminal + writes): propose failed: {s}", .{@errorName(perr)});
+                    txn_owned = false;
+                    txn_done = true;
+                    markStreamDrainingAnywhere(server, ent);
+                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+                    r.console = &.{};
+                    r.exception = &.{};
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                chain_st.activation_count += 1;
+                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .fetch_chunk, fw_seq);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            // Read-only terminal: flush + drain-then-close.
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "resumeBoundFetchStream.commit(terminal_ro)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            if (r.body.len > 0) {
+                const owned = allocator.dupe(u8, r.body) catch return;
+                chunks_st.tryAppend(allocator, owned) catch {};
+            }
+            markStreamDrainingAnywhere(server, ent);
+            chain_st.activation_count += 1;
+            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+            r.console = &.{};
+            r.exception = &.{};
+        },
+        .continuation => |*cval| {
+            // Stream→cont transition out of scope (same as
+            // resumeStream's .continuation arm — 501 + draining).
+            cval.deinit(allocator);
+            txn.rollback() catch {};
+            txn_done = true;
+            markStreamDrainingAnywhere(server, ent);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+        },
+        .stream => |*s2| {
+            // stream({write}) on a stream-state chain: append write
+            // bytes to StreamChunks (commit-gated on the wrote path,
+            // immediate on read-only). Mirrors resumeStream's
+            // .stream arm exactly.
+            var stage: StreamResumeStage = .{ .entity = ent, .mark_draining = false };
+            defer {
+                for (stage.chunks.items) |c| allocator.free(c);
+                stage.chunks.deinit(allocator);
+            }
+            var fw_seq: u64 = 0;
+            if (wrote) {
+                if (s2.chunks.len > 0) {
+                    stage.chunks.ensureUnusedCapacity(allocator, s2.chunks.len) catch {};
+                    for (s2.chunks) |c| stage.chunks.appendAssumeCapacity(c);
+                    allocator.free(s2.chunks);
+                    s2.chunks = &.{};
+                }
+                const lh_stream: log_mod.LogHeader = .{
+                    .request_id = request_id,
+                    .deployment_id = tc.snap.deployment_id,
+                    .duration_ns = 0,
+                    .status = 200,
+                    .outcome = .ok,
+                    .activation = .fetch_chunk,
+                    .method = "POST",
+                    .path = chain_st.module_path,
+                    .host = "",
+                    .correlation_id = chain_ctx.correlation_id orelse "",
+                };
+                fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &readset, lh_stream) catch |perr| {
+                    std.log.warn("rove-js bound-fetch stream (stream + writes): propose failed: {s}", .{@errorName(perr)});
+                    s2.deinit(allocator);
+                    txn_owned = false;
+                    txn_done = true;
+                    markStreamDrainingAnywhere(server, ent);
+                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+            } else {
+                txn.commit() catch |e| panic_mod.invariantViolated(
+                    "resumeBoundFetchStream.commit(stream_ro)",
+                    "err={s}",
+                    .{@errorName(e)},
+                );
+                txn_done = true;
+            }
+            // Headers on subsequent hops ignored; free.
+            if (s2.headers) |h| allocator.free(h);
+            s2.headers = null;
+            for (s2.chunks) |c| chunks_st.tryAppend(allocator, c) catch {};
+            if (s2.chunks.len > 0) allocator.free(s2.chunks);
+            s2.chunks = &.{};
+            if (chain_st.ctx_json.len > 0) allocator.free(chain_st.ctx_json);
+            chain_st.ctx_json = s2.ctx_json;
+            s2.ctx_json = &.{};
+            if (s2.interval_ms) |iv| {
+                wakes_st.interval_ms = iv;
+                wakes_st.next_wake_ns = now_ns + iv * std.time.ns_per_ms;
+            } else {
+                wakes_st.interval_ms = 0;
+                wakes_st.next_wake_ns = std.math.maxInt(i64);
+            }
+            for (wakes_st.kv_prefixes) |p| allocator.free(p);
+            if (wakes_st.kv_prefixes.len > 0) allocator.free(wakes_st.kv_prefixes);
+            wakes_st.kv_prefixes = s2.kv_prefixes;
+            s2.kv_prefixes = &.{};
+            chain_st.activation_count += 1;
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .fetch_chunk, fw_seq);
         },
     }
 }
@@ -2025,14 +2350,54 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
                     if (worker.lookupBoundFetch(ev.fetch_id)) |held_ent| {
                         const final = ev.final;
                         // Copy the fetch_id BEFORE the resume call:
-                        // `resumeBoundFetchChain` consumes `ev` and
-                        // frees its slices on every exit path; reading
+                        // the resume engines consume `ev` and free
+                        // its slices on every exit path; reading
                         // `ev.fetch_id` afterward is use-after-free.
                         const fid_copy: ?[]u8 = if (final)
                             allocator.dupe(u8, ev.fetch_id) catch null
                         else
                             null;
-                        worker_drain.resumeBoundFetchChain(worker, held_ent, &ev);
+                        // rove-library principle 1: dispatch by
+                        // collection membership. The held entity's
+                        // state IS where it lives:
+                        //   - parked_continuations: first chunk on
+                        //     a still-cont chain → resumeBoundFetchChain
+                        //   - stream_data_out: subsequent chunk on a
+                        //     chain that already cont→streamed →
+                        //     resumeBoundFetchStream
+                        //   - anything else (raft_pending_*, in
+                        //     transition): defer one tick by
+                        //     re-enqueueing the Msg at the back of
+                        //     the queue (it'll re-arrive after the
+                        //     pending move commits).
+                        const server = worker.h2;
+                        if (server.reg.isInCollection(held_ent, &worker.parked_continuations)) {
+                            worker_drain.resumeBoundFetchChain(worker, held_ent, &ev);
+                        } else if (server.reg.isInCollection(held_ent, &server.stream_data_out) or
+                            server.reg.isInCollection(held_ent, &server.stream_response_in))
+                        {
+                            // Steady-state stream chain (stream_data_out)
+                            // OR the brief post-commit window before h2's
+                            // consumeStreamResponses ships headers + moves
+                            // to stream_data_out (stream_response_in).
+                            // resumeBoundFetchStream picks the right
+                            // collection internally for component reads.
+                            resumeBoundFetchStream(worker, held_ent, &ev);
+                        } else {
+                            // Transient state — entity is in some
+                            // raft_pending_* awaiting commit. Drop
+                            // for now (best-effort, like the
+                            // existing wake_batch on a draining
+                            // stream). Logging at info so an
+                            // operator can spot it if a tenant's
+                            // bound fetches ever start dropping in
+                            // bulk.
+                            std.log.info(
+                                "rove-js bound-fetch: entity for fetch_id={s} mid-transition (not in parked_continuations or stream_data_out); dropping chunk",
+                                .{ev.fetch_id},
+                            );
+                            components_mod.UpstreamFetchEvent.deinitItem(&ev, allocator);
+                        }
                         if (fid_copy) |fid| {
                             worker.unregisterBoundFetch(fid);
                             allocator.free(fid);
