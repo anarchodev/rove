@@ -1759,6 +1759,14 @@ The handler model maps to The Elm Architecture's `update` 1:1. The **Msg** is th
 - **`__rove_next(...)`** — `Cmd.continuation(next-Msg-source)`. One-shot resume: the runtime invokes `path` with `{ctx, outcome}` once the bound condition fires (an `http.send` completes by default, or the §6.4 deadline expires).
 - **`__rove_stream(...)`** — `Cmd.stream(initial-chunks, wake-conditions)`. Iterative chain: ship `write` chunks, park awaiting `waitFor`, re-enter the handler on each wake.
 
+> **Customer-facing surface** (named-export dispatch per Msg kind,
+> `stream()` / `next()` Cmd verbs imported from `rove`,
+> module-level pattern match instead of `request.activation.kind`
+> switch) is specified in [`docs/handler-shape.md`](handler-shape.md).
+> The Cmd tags above (`__rove_next`, `__rove_stream`) are the
+> engine's internal names; the customer-typed surface uses `next`
+> and `stream` without changing the engine semantics.
+
 The runtime IS the Elm runtime. It ferries Msgs to the handler, applies Effects (writeset → raft → kv + `_send/owed/` arms; broadcast kv-write events match registered prefixes on held streams), routes the Cmd to the next state (`response_in` / `parked_continuations` / `stream_*` pipeline / structural cleanup for disconnect). The dispatch surface is *one* function — `Dispatcher.runOutcome` — re-entered for every activation across cont chains, stream chains, and disconnect activations.
 
 The principle-#2 fix that landed in the handler-cmds refactor (2026-05-20, `streaming-handlers-foundation` `f231a8e`→`6c3f60a`) is what makes "the entity carries its own state" the literal architecture: the cont's `Continuation` + `bound_schedule_id` + `deadline_ns` live on a `ContDescriptor` component on the entity; the stream's chain identity + chunks + wakes live on `ChainContext` + `StreamChain` + `StreamChunks` + `StreamWakes`; rove's `Collection.deinit` invokes each component's `deinit` on entity destroy. The handler-as-`update` framing maps 1:1 to the entity-component model — no side stores, no manual cleanup per Msg type.

@@ -1,11 +1,21 @@
 # The streaming model — the chain processes streams
 
-**Status:** Canonical streaming reference (model + as-built). Hosts
-the design for both directions. Inbound (§3): design locked,
-implementation pending (gap 2.4). Outbound (§4 + §4.A): shipped
-2026-05-21 as `http.fetch` (gap 2.3); §4.A absorbs the former
-`upstream-streaming-plan.md` as the as-built option-set + Msg shape +
-caps reference. Gap 2.5 (`http.subscribe`) shipped 2026-05-24 — see §6.
+**Status:** Engine substrate + as-built reference. Hosts the model
+rules (§1–§2), outbound as-built (§4 + §4.A), gap 2.5 lifecycle
+note (§6), the implementation honesty / phasing detail (§7), and
+the blob coordinator substrate (§7.X).
+**Customer-facing handler API moved to
+[`handler-shape.md`](handler-shape.md)** — that doc supersedes §3's
+three-way-choice surface, §4's per-chunk return shape, and §5's
+`__rove_*` Msg/Cmd naming. Sections kept here for engine context;
+where surface details are referenced they're cross-linked to
+`handler-shape.md`.
+Inbound (§3): substrate design locked, implementation pending (gap
+2.4); customer surface fixed in handler-shape.md. Outbound (§4 +
+§4.A): shipped 2026-05-21 as `http.fetch` (gap 2.3); §4.A absorbs
+the former `upstream-streaming-plan.md` as the as-built option-set
++ Msg shape + caps reference. Gap 2.5 (`http.subscribe`) shipped
+2026-05-24 — see §6.
 
 ---
 
@@ -81,84 +91,68 @@ with one step.
 
 ---
 
-## 3. Inbound: the coalesce budget + the handler's three-way choice
+## 3. Inbound: substrate — coalesce budget + size ceilings
+
+> **Customer-facing handler shape lives in
+> [`handler-shape.md`](handler-shape.md).** This section covers the
+> engine substrate: the coalesce budget, the buffered/streaming
+> ceiling, and how the runtime decides which named export to
+> dispatch.
 
 The runtime accumulates the request body up to a **coalesce
-budget**, then dispatches the chain's first `inbound` step.
+budget** before invoking the handler.
 
-> **The 64 KiB guarantee.** A request body of **64 KiB or smaller
-> is always delivered in a single `inbound` activation** with
-> `request.body_complete === true`. This is the stable contract a
-> customer designs against: keep bodies under 64 KiB and the
-> three-way choice below never concerns you — you are
-> unconditionally in the one-step world. The runtime's coalesce
-> budget may in practice be higher, but 64 KiB is the floor that
-> will not regress. (64 KiB also matches the outbound per-chunk
-> default, `max_response_chunk_bytes` — one number, both
-> directions.)
+> **The 1 MB buffered ceiling.** A request body of **1 MB or
+> smaller is delivered in a single `default` activation** with
+> `request.body` containing the full bytes. This is the customer-
+> facing hard guarantee a `default` handler designs against: keep
+> bodies under 1 MB and you are unconditionally in the one-step
+> world.
+>
+> Above 1 MB, two paths:
+> - If the module exports `onChunk`, the body is dispatched per
+>   chunk (internal coalesce budget per chunk: 64 KiB).
+> - If the module does NOT export `onChunk`, the runtime returns
+>   `413 Payload Too Large` before invoking the handler.
+>
+> `onChunk` is strictly more general than `default` — it handles
+> the small-body case as "one chunk that happens to be the whole
+> body" (`request.done = true` on the first fire). `default` is
+> the optimization for handlers that opt out of the chunk
+> machinery entirely. Full surface in
+> [`handler-shape.md` §4](handler-shape.md).
 
-Two outcomes:
+The internal 64 KiB per-chunk coalesce budget matches the
+outbound per-chunk default (`max_response_chunk_bytes` in §4.A) —
+one number, both directions, never customer-visible for `default`
+handlers.
 
-- **Body fit the budget** → `request.body` is the whole body,
-  `request.body_complete === true`. The overwhelmingly common case,
-  and *guaranteed* whenever the body is ≤ 64 KiB.
-  Nothing below applies; the handler returns a `Response` and the
-  one-step chain ends. **Identical to today.**
-- **Body exceeded the budget** → `request.body` is the prefix
-  received so far, `request.body_complete === false`. The handler
-  is dispatched anyway — with the prefix and the flag — and
-  **decides at runtime** what its relationship to the rest of the
-  body is. Three replies:
+The runtime decides which export to dispatch by introspecting
+`module.exports` at load time:
 
-```js
-export default function () {
-  if (request.body_complete) return process(request.body);  // common case
+- inbound HTTP → `default` if body fits the 1 MB ceiling and
+  `default` exists; else `onChunk` if exported; else 413.
+- chunk arrivals → `onChunk`.
+- I/O resume → `onSendCallback` / `onFetchResult` / `onFetchChunk`
+  / `onFetchDone` depending on the Effect that parked the chain.
+- chain origins (cron, kv-react, boot, subscription) → `onCron` /
+  `onKvWake` / `onBoot` / `onSubscription`.
 
-  // body exceeded the coalesce budget — request.body is a prefix.
-  if (!authorized(request.headers)) return { status: 401 };  // (a)
-  if (wantWholeThing())             return __rove_next();     // (b)
-  return __rove_stream({ accept_body: true });                // (c)
-}
-```
+See [`handler-shape.md` §3](handler-shape.md) for the full
+activation-kind → export-name table and `request` shape per kind.
 
-- **(a) Respond now.** The handler returns a terminal `Response`.
-  It has decided it does not need the rest — an auth reject, a
-  content-type reject, a handler that only needed the headers. The
-  runtime drains and discards the unread body (or `RST_STREAM`s).
-- **(b) "Call me back with the whole body."** The handler returns
-  `__rove_next`. The runtime keeps coalescing — up to a higher
-  **hard ceiling** — and re-dispatches the chain when the body is
-  complete, now with `body_complete === true` and the full
-  `request.body`. The handler that hit the soft budget but is
-  willing to wait for (and can hold) the whole body upgrades to it
-  with one line. Beyond the hard ceiling it is a real `413`.
-- **(c) Stream me the rest.** The handler returns `__rove_stream`.
-  Coalescing for the inbound direction is now **off**: each body
-  `DATA` frame is an `inbound_chunk` Msg, an `inbound_end` Msg
-  closes it. No whole-body buffering; body size is unbounded.
+### What this section used to specify
 
-This is the resolution of the opt-in chicken-and-egg that sank
-`inbound-streaming-plan.md`'s static `streaming_body` manifest
-flag: **the handler does not need to declare anything.** It is
-dispatched with a partial body and a flag, and chooses. Most
-handlers never see `body_complete === false` and never think about
-any of this.
-
-`__rove_next` here is the *same* `__rove_next` as §6.4's: "park,
-await one named resolution, resume." The resolution it awaits is
-just "the body is complete" instead of "a bound `http.send`
-returned." The Cmd surface stays at three.
-
-A streaming upload is then the one-handler shape:
-
-```js
-export default function () {
-  const a = request.activation;
-  if (a.kind === "inbound")       return __rove_stream({ accept_body: true });
-  if (a.kind === "inbound_chunk") { blob.append(a.bytes); return __rove_stream({ accept_body: true }); }
-  if (a.kind === "inbound_end")   return { status: 201, body: blob.finish() };
-}
-```
+Before [`handler-shape.md`](handler-shape.md), this section
+proposed the surface itself — a "three-way choice" returned by the
+handler when the body exceeded a soft 64 KiB budget: respond now,
+park-until-body-complete, or switch to per-chunk streaming.
+That surface (and its `__rove_next` / `__rove_stream` /
+`request.activation.kind` plumbing) is superseded by the
+two-shape (`default` or `onChunk`) named-export design. The
+underlying engine — body accumulation through the readset blob
+substrate, per-chunk dispatch, the one-rule commit semantics —
+is unchanged; only the customer-visible API changed.
 
 ---
 
@@ -178,16 +172,23 @@ is an outbound byte-stream, and it too is coalesce-budgeted:
   Binding closes the gap:
 
 ```js
+import { stream, next } from 'rove';
+
 export default function () {
-  const a = request.activation;
-  if (a.kind === "inbound") {
-    http.fetch({ url: LLM_URL, body: a.body, bind: true });
-    return __rove_stream({ status: 200 });            // hold the client
-  }
-  if (a.kind === "fetch_chunk") return __rove_stream({ write: [transform(a.bytes)] });
-  if (a.kind === "fetch_done")  return "";            // close
+  http.fetch({ url: LLM_URL, body: request.body, bind: true });
+  return next();                                       // hold the client
+}
+
+export function onFetchChunk() {
+  if (request.done) return "";                         // close held response
+  return stream({ write: transform(request.body) });
 }
 ```
+
+(Surface shape — `default` / `onFetchChunk` named exports,
+`stream()` / `next()` Cmds — defined in
+[`handler-shape.md`](handler-shape.md). The substrate below is
+unchanged.)
 
 - **Coalesced fetch.** A fetch the handler does *not* need
   streamed delivers a single coalesced `fetch_result` Msg with the
@@ -293,29 +294,39 @@ re-chunking), `src/js/worker.zig` (`fireFetchEventActivation`),
 
 ## 5. The Msg / Cmd vocabulary under the model
 
-**Cmd — three, unchanged.**
+> Customer-visible names live in
+> [`handler-shape.md` §2 (Cmds) and §3 (activation kinds)](handler-shape.md).
+> The table below is the engine vocabulary — the Msg union the
+> dispatcher pattern-matches over and the Cmd values handlers
+> return. Renames in the customer surface (`__rove_stream` →
+> `stream()`, `__rove_next` → `next()`, no `request.activation.kind`
+> switch) are surface-only; the engine's discriminator tags are
+> unchanged.
 
-| Cmd | Meaning |
-|---|---|
-| `Response` | terminal — emit a final chunk (or the coalesced whole), close |
-| `__rove_stream` | stay held; coalescing off for the directions in play; emit `write` chunks, declare `waitFor` |
-| `__rove_next` | park, await one named resolution (a `send_callback`, or "body complete"), resume |
+**Cmd — three.**
+
+| Engine Cmd tag | Customer surface | Meaning |
+|---|---|---|
+| `Response` | string / `{status?, body?, headers?}` return | terminal — emit a final chunk (or the coalesced whole), close |
+| `stream` | `stream()` / `stream({write})` | stay held; coalescing off for the directions in play; emit `write` chunks |
+| `next` | `next()` | park, await one named resolution (a resume Msg), reinvoke matching `on…` export |
 
 **Msg — every entry is a taped input; bytes content-addressed when large.**
 
-| Msg | The stream it is a step of |
-|---|---|
-| `inbound` | the request — `body` coalesced to the budget, `body_complete` flag |
-| `inbound_chunk` / `inbound_end` | the request body, coalescing off (chose (c)) |
-| `fetch_result` | a bound fetch's response, coalesced |
-| `fetch_chunk` / `fetch_done` | a bound fetch's response, coalescing off |
-| `send_callback` | a durable `http.send` result (a coalesced outbound) |
-| `wake_batch` | kv-write + timer fan-in (§9.4) |
-| `disconnect` | the held connection closed |
+| Engine Msg tag | Dispatched to export | The stream it is a step of |
+|---|---|---|
+| `inbound` (≤ 1 MB) | `default` (or `onChunk` once) | the request — full `body`, no chunk machinery |
+| `inbound_chunk` / `inbound_end` | `onChunk` | the request body, per-chunk delivery (any size when `onChunk` is exported; > 1 MB when `default` is also exported) |
+| `fetch_result` | `onFetchResult` | a non-bound fetch's response, coalesced |
+| `fetch_chunk` / `fetch_done` | `onFetchChunk` / `onFetchDone` | a bound fetch's response, coalescing off |
+| `send_callback` | `onSendCallback` | a durable `webhook.send` result (a coalesced outbound) |
+| `wake_batch` | `onKvWake` | kv-write + timer fan-in (§9.4) |
+| `disconnect` | `onDisconnect` | the held connection closed |
 
 `fetch_pipe_done` (shipped) is the terminal of the `pipe_to` fast
-path. `subscription_fire` (Gap 2.1) is a chain *origin*, not a
-stream step — orthogonal to this model.
+path. `subscription_fire` (Gap 2.1) dispatches to `onSubscription`
+/ `onCron` / `onBoot` depending on origin — chain *origins*, not
+stream steps, orthogonal to this model.
 
 ---
 

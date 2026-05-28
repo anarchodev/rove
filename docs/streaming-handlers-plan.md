@@ -7,6 +7,18 @@ refactor was committed on `streaming-handlers-foundation` (`f231a8e` →
 Originally framed as the implementation of `docs/connection-actor-plan.md`
 **§6.2 (SSE projection)**, which §12 deferred.
 
+> **Customer-facing surface superseded.** The customer-typed names
+> `__rove_stream` / `__rove_next` / `request.activation.kind` were
+> replaced by `stream()` / `next()` named imports and
+> module-level named exports (`onChunk`, `onSendCallback`,
+> `onFetchChunk`, etc.) — see
+> [`handler-shape.md`](handler-shape.md). The engine semantics
+> below are unchanged: the Cmd ADT, the activation Msg union, the
+> commit-then-flush rule, the parked-entity machinery. Only the
+> JS surface customers type was renamed. References below to
+> `__rove_stream` / `__rove_next` are the engine's internal Cmd
+> tags; the surface verbs are `stream` / `next`.
+
 The previous "platform SSE" subsystem (`src/sse_server/`, deleted by
 task #10 Phase 5 — see connection-actor-plan §12.4) has dissolved into
 the JS layer described in §8.
