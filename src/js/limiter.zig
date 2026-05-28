@@ -38,13 +38,13 @@ const ACTION_COUNT: usize = std.meta.fields(Action).len;
 pub const RateLimitCaps = struct {
     /// Burst cap: max requests we'll accept in a single instant
     /// from one instance.
-    request_capacity: u32 = 100,
+    request_capacity: u32 = 1000,
     /// Sustained rate: requests per second the bucket refills at.
-    request_refill_per_sec: u32 = 50,
+    request_refill_per_sec: u32 = 500,
     /// Burst cap on `email.send` calls from a handler.
-    email_capacity: u32 = 10,
-    /// 1/sec → 60/min sustained — well under any sane Resend quota.
-    email_refill_per_sec: u32 = 1,
+    email_capacity: u32 = 100,
+    /// 10/sec → 600/min sustained — well under any sane Resend quota.
+    email_refill_per_sec: u32 = 10,
 };
 
 pub fn defaultCaps() RateLimitCaps {

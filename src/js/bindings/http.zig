@@ -166,6 +166,7 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
         .max_total_response_bytes = row.max_total_response_bytes,
         .held = row.held,
         .bind = row.bind,
+        .bound_send_id = row.bound_send_id,
     });
     // Ownership transferred — clear the carrier's slices so its
     // deinit is a no-op.
@@ -176,6 +177,7 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
     row.body = &.{};
     row.on_chunk_module = &.{};
     row.ctx_json = &.{};
+    row.bound_send_id = &.{};
 }
 
 /// `http.cancelFetch({id})` — cancel a not-yet-completed fetch.
@@ -325,6 +327,14 @@ const BuiltFetch = struct {
     /// `PendingFetch.bind` → `UpstreamFetchEvent.bind` → the
     /// dispatcher's bound-resume branch.
     bind: bool = false,
+    /// `docs/cross-worker-held-state-plan.md` Phase 2B: webhook.send
+    /// shim passes the send_id (the `_send/owed/{id}` suffix) so the
+    /// FetchEngine's chunk router can consult `bound_send_owners` to
+    /// route the callback to the cont's owning worker. Platform-only
+    /// (the webhook.send JS shim sets it); customers don't reach
+    /// for this option directly. Empty / null when the caller is
+    /// plain `http.fetch` (no held-sync attachment).
+    bound_send_id: []u8 = &.{},
 
     fn deinit(self: *BuiltFetch, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -334,6 +344,7 @@ const BuiltFetch = struct {
         allocator.free(self.body);
         allocator.free(self.on_chunk_module);
         allocator.free(self.ctx_json);
+        if (self.bound_send_id.len > 0) allocator.free(self.bound_send_id);
         self.* = undefined;
     }
 };
@@ -357,6 +368,10 @@ fn buildFetchRow(
     fetched.headers_json = try dupeJsObjectAsJson(ctx, a, opts, "headers", "{}");
     fetched.ctx_json = try dupeJsObjectAsJson(ctx, a, opts, "ctx", "null");
     fetched.on_chunk_module = try dupeJsString(ctx, a, opts, "on_chunk", "");
+    // Phase 2B: platform-internal `bound_send_id` option used by the
+    // `webhook.send` JS shim. Empty when absent — customers' plain
+    // `http.fetch` never sets this.
+    fetched.bound_send_id = try dupeJsString(ctx, a, opts, "bound_send_id", "");
 
     if (fetched.on_chunk_module.?.len == 0) {
         _ = c.JS_ThrowTypeError(ctx, "http.fetch: `on_chunk` (module path) is required");
@@ -382,6 +397,7 @@ fn buildFetchRow(
         .max_response_chunk_bytes = @intCast(@max(max_chunk_i32, 1)),
         .max_total_response_bytes = if (max_total_i64 < 1) 1 else @intCast(max_total_i64),
         .bind = bind,
+        .bound_send_id = fetched.bound_send_id.?,
     };
     fetched = .{}; // ownership transferred
     return row;
@@ -395,6 +411,7 @@ const FetchExtracted = struct {
     body: ?[]u8 = null,
     ctx_json: ?[]u8 = null,
     on_chunk_module: ?[]u8 = null,
+    bound_send_id: ?[]u8 = null,
 
     fn deinit(self: *FetchExtracted, a: std.mem.Allocator) void {
         if (self.id) |s| a.free(s);
@@ -404,6 +421,7 @@ const FetchExtracted = struct {
         if (self.body) |s| a.free(s);
         if (self.ctx_json) |s| a.free(s);
         if (self.on_chunk_module) |s| a.free(s);
+        if (self.bound_send_id) |s| a.free(s);
     }
 };
 

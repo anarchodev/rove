@@ -177,6 +177,14 @@ pub const PendingFetch = struct {
     /// named export per chunk. `bind=false` → today's Pattern A
     /// (`fireFetchEventActivation`, separate chain, no held socket).
     bind: bool = false,
+    /// `docs/cross-worker-held-state-plan.md` Phase 2B: when the
+    /// `webhook.send` JS shim issues an `http.fetch` to drive a
+    /// held-sync send, it stamps the send_id here so the chunk
+    /// router (`enqueueFetchEventForTenant`) can consult
+    /// `bound_send_owners[send_id]` and route the response to the
+    /// cont's owning worker. Empty for plain (non-webhook) fetches.
+    /// Allocator-owned dupe.
+    bound_send_id: []u8 = &.{},
 
     pub fn deinit(self: *PendingFetch, allocator: std.mem.Allocator) void {
         allocator.free(self.tenant_id);
@@ -187,6 +195,7 @@ pub const PendingFetch = struct {
         allocator.free(self.body);
         allocator.free(self.on_chunk_module);
         allocator.free(self.ctx_json);
+        if (self.bound_send_id.len > 0) allocator.free(self.bound_send_id);
         self.* = undefined;
     }
 };

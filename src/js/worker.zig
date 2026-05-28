@@ -1668,25 +1668,37 @@ pub const NodeState = struct {
         // event's `final` flag distinguishes streaming intermediates
         // from the terminal.
         const msg: effect_mod.Msg = .{ .fetch_chunk = ev };
-        if (ev.bind) {
-            if (self.lookupBoundFetchOwner(ev.fetch_id)) |owner_idx| {
-                // Phase 2A instrumentation: count cross-worker
-                // routes so smokes can assert the path actually
-                // fires. A "same-worker" route is correct but
-                // doesn't exercise the cross-worker bug fix —
-                // smokes need at least one cross-worker hit to be
-                // meaningful.
-                self.msg_inboxes_mutex.lock();
-                const n = self.msg_inboxes.items.len;
-                self.msg_inboxes_mutex.unlock();
-                const hash_idx = if (n > 0) std.hash.Wyhash.hash(0, tenant_id) % n else 0;
-                if (owner_idx != hash_idx) {
-                    _ = self.bound_fetch_cross_worker_routes.fetchAdd(1, .monotonic);
-                } else {
-                    _ = self.bound_fetch_same_worker_routes.fetchAdd(1, .monotonic);
-                }
-                return self.enqueueMsgToWorker(owner_idx, msg);
+        // Phase 2A: bound fetch chunks route to the held-state owner
+        // via `bound_fetch_owners`. Phase 2B: webhook.send callback
+        // chunks (the fetch has no bind:true, but its bound_send_id
+        // names the cont's send_id) route via `bound_send_owners`.
+        // Either path skips `hash(tenant_id)` to land on the worker
+        // that holds the resume target. Unbound / non-webhook
+        // fetches fall through to today's hash routing.
+        const owner_opt: ?usize = blk: {
+            if (ev.bind) {
+                if (self.lookupBoundFetchOwner(ev.fetch_id)) |idx| break :blk idx;
             }
+            if (ev.bound_send_id.len > 0) {
+                if (self.lookupBoundSendOwner(ev.bound_send_id)) |idx| break :blk idx;
+            }
+            break :blk null;
+        };
+        if (owner_opt) |owner_idx| {
+            // Instrumentation: count cross-worker vs same-worker
+            // routes so smokes can assert the path actually fires.
+            // A "same-worker" route is correct but doesn't exercise
+            // the cross-worker bug fix.
+            self.msg_inboxes_mutex.lock();
+            const n = self.msg_inboxes.items.len;
+            self.msg_inboxes_mutex.unlock();
+            const hash_idx = if (n > 0) std.hash.Wyhash.hash(0, tenant_id) % n else 0;
+            if (owner_idx != hash_idx) {
+                _ = self.bound_fetch_cross_worker_routes.fetchAdd(1, .monotonic);
+            } else {
+                _ = self.bound_fetch_same_worker_routes.fetchAdd(1, .monotonic);
+            }
+            return self.enqueueMsgToWorker(owner_idx, msg);
         }
         try self.enqueueMsgForTenant(tenant_id, msg);
     }
@@ -4175,6 +4187,13 @@ fn buildRetryFetch(
     errdefer a.free(on_chunk_dup);
     const tenant_dup = try a.dupe(u8, tenant_id);
     errdefer a.free(tenant_dup);
+    // `docs/cross-worker-held-state-plan.md` Phase 2B: retry-sweep
+    // PendingFetches are webhook.send callbacks — same routing
+    // contract as the JS-shim's direct fetch (carry the owed_id
+    // as bound_send_id so chunks route to the cont's owning
+    // worker via bound_send_owners).
+    const bound_send_id_dup = try a.dupe(u8, owed_id);
+    errdefer a.free(bound_send_id_dup);
 
     try out.ensureUnusedCapacity(a, 1);
     out.appendAssumeCapacity(.{
@@ -4190,6 +4209,7 @@ fn buildRetryFetch(
         .stream = false,
         .max_response_chunk_bytes = 256 * 1024,
         .max_total_response_bytes = 50 * 1024 * 1024,
+        .bound_send_id = bound_send_id_dup,
     });
 }
 
