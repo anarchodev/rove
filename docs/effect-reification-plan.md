@@ -1,17 +1,21 @@
 # Effect reification plan
 
-> **Status**: Phases 0–6 SHIPPED. Phase 0–5 (commit `b908953`,
-> 2026-05-24) reified the four primitives + retired `http.send`.
-> Phase 6 cleanup tail shipped 2026-05-27 (all 5 steps). Phase 4.1.4
-> (`conn_write` Cmd slot) + Phase 7 (files-server collapse) cancelled
-> 2026-05-27 — see §6 phase status.
-> **Prerequisite reading**: `docs/effect-algebra.md` (the model this plan
-> reifies). The Option-A/B framing this plan *is* the convergence of is
-> folded into §3.3 + §4.
+> **Status**: Phases 0–6 SHIPPED. The arc reified the four primitives
+> of `effect-algebra.md` (Model, Continuation, Msg origins, Cmd
+> runtimes) into concrete code artifacts under `src/js/effect/`,
+> retired `http.send` as a Zig primitive (durability moved to JS
+> shims), and closed the §7 worklist. Phase 4.1.4 (`conn_write` Cmd
+> slot) + Phase 7 (files-server collapse) cancelled 2026-05-27. This
+> doc is now reference for the as-built shape; the day-by-day phase
+> history lives in `git log main..effect-reification`.
+>
+> **Prerequisite reading**: `docs/effect-algebra.md` — the model this
+> plan reified. §3 below is the load-bearing implementation reference
+> for anyone touching the dispatch core.
 
 ## 1. Goal
 
-Turn the four primitives of `effect-algebra.md` — the Model, the
+Turn `effect-algebra.md`'s four primitives — the Model, the
 Continuation, Msg origins, Cmd runtimes — into four concrete code
 artifacts under `src/js/effect/`. After reification, a named effect
 (`http.send`, streaming, a subscription) is no longer a subsystem with
@@ -23,30 +27,34 @@ failure-discard are inherited from the primitives; only Cmd shape and
 Msg shape are declared, as tagged-union variants whose exhaustive
 `switch` the compiler will not let you leave unwired.
 
-## 2. Why now — what it fixes
+## 2. What it fixed
 
-`effect-algebra.md §6` established that every divergence in the §5 audit
-has one root cause: the four primitives are not factored out, so each
-effect hand-rolls its slice and the copies drift. Reification is the
-single fix. Against the `effect-algebra.md §7` worklist:
+`effect-algebra.md §6` established that every divergence in the §5
+audit had one root cause: the four primitives weren't factored out, so
+each effect hand-rolled its slice and the copies drifted. Reification
+was the single fix. Against the original `effect-algebra.md §7`
+worklist (which is now ~empty — see that doc):
 
-- **#1 (fetch-A chunk bytes untaped — a live replay-correctness bug)** —
-  becomes unconstructible: the only path a Msg can reach a handler is
-  `enqueueMsg`, which tapes. Fixed in Phase 2.
-- **#3 (uneven backpressure)** — the bound is a property of the one
-  `MsgQueue`; every origin inherits it. Fixed in Phase 2.
-- **#4 (cross-worker resume is an O(workers×parked) scan)** — the
-  Continuation primitive owns a wake-correlation index. Fixed in Phase 3.
-- **#5 (`cron_state` in a plain hashmap)** — becomes a Continuation /
-  collection naturally. Phase 6.
-- **#2 (streaming chunks ship pre-commit)** and **#7 (`events.emit` not
-  commit-gated)** — forced into the open: Phase 4 creates exactly one
-  Cmd-release point, so each becomes a one-line, documented decision
-  instead of an emergent accident.
+- **#1 fetch-A chunk bytes untaped** (live correctness bug) — became
+  unconstructible: the only path a Msg reaches a handler is
+  `enqueueMsg`, which tapes. **Closed by Phase 2.**
+- **#3 uneven backpressure** — the bound is a property of the one
+  `MsgQueue`; every origin inherits it. **Closed by Phase 2.**
+- **#4 cross-worker resume O(workers×parked) scan** — the Continuation
+  primitive owns a wake-correlation index. **Closed by Phase 3.**
+- **#5 `cron_state` in a plain hashmap** — moved to a rove collection.
+  **Closed by Phase 6.**
+- **#2 streaming chunks ship pre-commit** + **#7 `events.emit` not
+  commit-gated** — forced into one Cmd-release point via Phase 4.0.b;
+  shipping pre-commit is now an explicit opt-in (`__rove_stream({
+  eager_ship: true })`) reserved for customer demand.
+- **#6 boot subscription double-fire UNCLEAR** — was already correct in
+  the impl (`_boot_fired/<dep_id>` marker rides the writeset). Doc
+  comment fixed in Phase 6.
+- **#7 retire `http.send`** — DONE; durability is JS-shim composition.
+  See [[project_durability_as_js_shim]].
 
-This is not cosmetic. #1 is a correctness bug today.
-
-## 3. Target shape
+## 3. As-built shape (load-bearing reference)
 
 ### 3.1 Module layout
 
@@ -60,45 +68,51 @@ src/js/effect/
 
 The Model is **not** reified into this directory — it is already a
 singleton (the kvexp `Cluster`). Reification's only Model-side change:
-`kv_write` becomes an ordinary `Cmd` variant, and durable-intent
-(`http.send`'s `_send/owed` marker) becomes "a Cmd runtime that *emits a
-`kv_write` Cmd*" rather than a binding reaching into the txn directly.
+`kv_write` is an ordinary `Cmd` variant, and durable-intent (`webhook.send`'s
+`_send/owed` marker) is a JS-shim that emits a `kv_write` Cmd rather
+than a binding reaching into the txn directly.
 
 ### 3.2 The two unions — the contract as types
 
 ```zig
-// effect/cmd.zig
+// effect/cmd.zig — every producer-bearing variant
 pub const Cmd = union(enum) {
-    kv_write:   WriteSet,        // the Model-targeted Cmd
-    http_out:   HttpOut,         // send + fetch — durable? + disposition
-    emit:       EmitEvent,
-    respond:    ResponseChunk,   // response / stream output
-    conn_write: FrameOut,
+    kv_wake_broadcast: KvWake,
+    stream_chunk:      StreamChunk,
+    stream_close:      StreamClose,
+    http_fetch:        HttpFetch,
+    respond:           Respond,    // move-only h2 entity routing
 };
 
-// effect/msg.zig — consolidates today's log_mod.ActivationSource
+// effect/msg.zig — consolidates pre-reification ActivationSource
 pub const Msg = union(enum) {
-    inbound_http:  Request,
+    inbound_http:       Request,
     cron, boot, disconnect,
-    kv_react:      KvReact,
-    send_callback: SendResult,
-    fetch_chunk:   FetchChunk,
-    fetch_done:    FetchDone,
-    inbound_frame: Frame,
-    body_chunk:    BodyChunk,
+    kv_react:           KvReact,
+    send_callback:      SendResult,
+    fetch_chunk:        FetchChunk,
+    fetch_done:         FetchDone,
+    fetch_pipe_done:    FetchPipeDone,
+    subscription_fire:  SubscriptionFire,
+    // ...
 };
 ```
 
 The point is not the unions — it is that **every `switch` over them is
-exhaustive**. Adding an effect = adding a variant; the compiler then
-refuses to build until the variant is handled in the tape path, the
-interpret path, and the replay path. The contract stops being a doc you
-audit against.
+exhaustive**. Adding an effect = adding a variant; the compiler refuses
+to build until the variant is handled in the tape path, the interpret
+path, and the replay path. The contract stops being a doc you audit
+against.
+
+A `conn_write` variant for inbound-WebSocket frame writes is *not*
+parked in advance per the Option-1-scaffolding anti-pattern (Phase 4.1.4
+deferral). Add when the inbound-WS producer ships
+([`docs/websocket-plan.md`](websocket-plan.md)).
 
 ### 3.3 The Continuation + reconciler
 
-Generalizes the already-shipped Option-B `ParkedUnit` mechanism into
-the universal primitive.
+Generalizes the Option-B `ParkedUnit` mechanism into the universal
+primitive.
 
 ```zig
 // effect/continuation.zig
@@ -131,8 +145,7 @@ fn reconcile(comptime resume: ResumeFn, col: *Collection(Continuation)) void {
 
 Because `Continuation.deinit` frees the txn and buffered Cmds, a
 `Collection.deinit` on crash *is* L2 ("safe to abandon") — enforced by
-rove's deinit discipline, not by hope (see memory
-`project_resource_owning_components`).
+rove's deinit discipline, not by hope.
 
 ### 3.4 The activation loop — every effect on one path
 
@@ -147,1067 +160,102 @@ reconcile tick → commit ? interpret(cmds) + resume : discard + rollback
 ```
 
 A released Cmd whose transport completes calls `enqueueMsg` — the loop
-closes on itself. This is the Option-A one-request-lifecycle
-convergence — every Msg-driven activation runs through the same
-park/drain/release machinery, regardless of origin.
+closes on itself. The Option-A one-request-lifecycle convergence —
+every Msg-driven activation runs through the same park/drain/release
+machinery, regardless of origin.
 
-## 4. Current state — the bespoke sites to collapse
+## 4. What was collapsed
 
-Pointers confirmed against tree at `90e2847` (Phase 0, 2026-05-22).
+The reification arc retired the following bespoke sites; each is now a
+declaration on the typed Cmd/Msg unions instead of its own subsystem:
 
-| Bespoke today | Reified into | Notes |
-|---|---|---|
-| `BatchSideEffects` writeset accumulator (`worker.zig:508`) — the per-tick handler-emitted ops bundle | `effect.Cmd` (list) | shipped piece of `project_handler_returns_cmds`; Phase 1 consolidates the element type |
-| `log_mod.ActivationSource` enum (`log/root.zig:58`) — 10 variants, used at `worker.zig:3247, 3290, 3333, 5457, 6846` | `effect.Msg` tag | already enumerates Msg kinds |
-| `ParkedUnit` (`worker.zig:132`) + `parked_units` field (`worker.zig:2144`) + `proposeForgetfulWrites` (`worker.zig:6247`) | `effect.Continuation` | Option-B mechanism — generalize, don't rebuild |
-| `pending_txns` (`worker.zig:2135`) + `RaftWait` (`worker.zig:114`) + `drainRaftPending` (`worker.zig:4308`; H2-path subfns at `4124`, `4184`, `4252`) | `reconcile` (the reference instance) | byte-identical first |
-| `raft_pending_response` / `_cont` / `_stream` (`worker.zig:2082` / `2085` / `2088`) | `Continuation` collections | the "three siblings" |
-| `parked_continuations` (`worker.zig:2099`); `stream_data_out` / `stream_response_in` (`h2/root.zig:397` / `396`) | `Continuation` collections | one Row, N collections by resume-disposition |
-| `subscription_fire_pending` (`worker.zig:2156`); `fetch_event_pending` (`worker.zig:2182`) | one `MsgQueue` | |
-| `SubscriptionFireInbox` (`worker.zig:399`); `FetchChunkInbox` (`worker.zig:454`) | one `MsgQueue` ingress | cross-thread |
-| `SendDispatch` (`send_dispatch.zig:405`) + `InflightSet` (`send_inflight.zig:100`) + `send_outbox.zig` | **DELETE** in revised Phase 5 | `http.send` retires as a Zig primitive (2026-05-22); durability composes from kv + cron + boot subscription via `webhook.send.js` / `email.send.js` |
-| `FetchPool` (`fetch_pool.zig:51`) | the single outbound HTTP runtime — `http_out` Cmd transport | response-disposition (whole / `on_chunk` / `pipe_to`) is the only parameter; `durable?` is gone |
-| `_send/owed` / `_send/proof` apply-time markers (`apply.zig`) | regular env-0 kv writes — no special case | the JS shim writes them as ordinary keys; apply.zig's special branches go away with `SendDispatch` |
-| `cron_state` `StringHashMapUnmanaged` (`worker.zig:1326-1327`, guarded by `cron_state_mutex`) | a collection | worklist #5 |
-| `parkSendOps` (`worker.zig:7007`) + `parkKvWakes` (`worker.zig:7057`) — current ParkedUnit registrants | folded into `Continuation.buffered` | the helpers go away with the unification |
+- `pending_txns` + `RaftWait` + `drainRaftPending` → the reconciler
+  (the reference instance, byte-identical first then generalized)
+- `raft_pending_response` / `_cont` / `_stream` → three Continuation
+  collections sharing one reconciler
+- `subscription_fire_pending` + `fetch_event_pending` → one `MsgQueue`
+- `BatchSideEffects` writeset accumulator → typed `effect.Cmd` list
+- `ParkedUnit` (`worker.zig`) → `effect.Continuation`
+- `parkSendOps` + `parkKvWakes` → folded into `Continuation.buffered`
+- `SendDispatch` + `InflightSet` + `send_outbox` + `callback_dispatch`
+  (~4.7 kLOC of Zig) → deleted; durability is JS-shim composition
+- `events.emit` + the platform-managed SSE pipe → deleted; customer-
+  arbitrary SSE rides `__rove_stream` + kv-write wakes
+  ([`streaming-model.md`](streaming-model.md))
 
-What is already done and must be *reused, not rebuilt*: the handler
-returns a Cmd-list (`project_handler_returns_cmds`, shipped 2026-05-20);
-the `ParkedUnit` commit-gated reconciler mechanism (Option B).
+## 5. Invariants — held at every step
 
-**Option-B `ParkedUnit` migration state — substantially complete for
-the externally-observable-effect class.** Against the idiom-1 through
-idiom-4 classification:
-
-- **idiom-1** (`tenant_batch` internal + callback) — MIGRATED. Registrants:
-  anchor path `worker_dispatch.zig:697-709` (`parkSendOps` +
-  `parkKvWakes` after `proposeBatch`); callback path
-  `callback_dispatch.zig:151-155`; cont-resume path
-  `worker.zig:4548, 4574-4577`; disconnect/forgetful path
-  `worker.zig:6247+` (`proposeForgetfulWrites` builds + creates the unit).
-- **idiom-2** (`platform.releases.publish` / admin-kv / `deployStarter`
-  / `platform.scope.kv`) — MIGRATED. Admin-handler trampolines
-  (`worker.zig:2617, 2680, 2739`) fold writes into the dispatch tick's
-  `BatchSideEffects` bundle, which goes through the same idiom-1 gate at
-  `worker_dispatch.zig:651`. The release POST handler
-  (`worker_dispatch.zig:1583`) and admin-kv POST (`worker_dispatch.zig:1726`)
-  park the entity in `raft_pending_response` directly.
-- **idiom-3a** (ACME cert propose) — **NOT MIGRATED.** `src/loop46/acme.zig:210`
-  calls `cfg.raft.propose(seq, env)` directly; no `ParkedUnit`, no entity
-  park. Acceptable today only because the bound effect (cert install)
-  is self-healing on the next ACME pass — re-derived class.
-- **idiom-3b** (`callback_dispatch.zig:288` Seam-A `_send/proof/` propose;
-  `worker.zig:3622` `config_mirror` `mirrorDeployConfig` propose) —
-  NOT MIGRATED. Both deliberate: the proof-propose recovery is the
-  durable `_send/owed` + boot-scan path; `config_mirror` is idempotently
-  re-derived on next deploy load.
-- **`events.emit` / SSE worklist item #7** — **MOOT.** The
-  platform-managed SSE pipe (in-process sse-server thread,
-  `_session/sse-token` mint, `events.emit` global) was retired in
-  streaming-handlers Phase 5 (note at `loop46/main.zig:1325-1340`).
-  `ParkedUnit` carries no `emits` field because the surface no longer
-  exists; customers compose SSE on `__rove_stream` + kv-write wakes.
-  `effect-algebra.md §7` worklist #7 (the systemic SSE-emit fix) is
-  closed-by-retirement.
-
-Remaining fire-and-forget proposers (ACME, proof, config-mirror) sit
-in the re-derivable / self-healing class, not the
-externally-observable-effect class. The Option-B mechanism is in place
-everywhere effects can escape pre-commit.
-
-## 5. Invariants — hold at every step
-
-1. **H2 is the reference.** The H2 request path's behavior stays
-   byte-identical until the generalized reconciler is proven to
-   reproduce it. Generalize with H2 behavior first, prove via smokes,
-   *then* add non-H2 registrants.
+1. **H2 is the reference.** The H2 request path's behavior stayed
+   byte-identical until the generalized reconciler reproduced it.
+   Generalize with H2 first, prove via smokes, *then* add non-H2
+   registrants.
 2. **Gate effect *release*, never KV *visibility*.** The reconciler
-   gates externally-observable effects on commit. Local KV reads still
-   see the speculative overlay immediately (kvexp design). Conflating
-   the two was the Stage-5 apply-after-replicate mistake that was
-   reverted — see memory `project_kv_batched_dispatch`. Do not repeat it.
+   gates externally-observable effects on commit. Local KV reads see
+   the speculative overlay immediately (kvexp design). Conflating the
+   two was the Stage-5 apply-after-replicate mistake (reverted) —
+   memory `project_kv_batched_dispatch`. Do not repeat it.
 3. **Determinism.** Every Msg is taped (L3). This is why reification is
    correctness, not just cleanup.
-4. **No perf regression** vs the current peak (Phase 0 measures it;
-   reference points: ~162k req/s 8-worker sharded per
-   `project_perf_push_2026_05_21`, ~100k readonly floor per
-   `project_kv_read_txn_per_op`). Compare to the *recent peak*, never an
-   old baseline — memory `feedback_regression_baseline_current_peak`.
-5. **Every phase is independently shippable and reversible.** No phase
-   leaves the tree in a non-building or behavior-divergent state.
-
-## 6. Phases
-
-Each phase: **Goal / Steps / Gate / New tests / Done / Rollback.**
-Phases 2 and 3 are independent (Msg ingress vs Continuation) and may
-interleave. Phase 4 needs 3; Phase 5 needs 3+4.
-
-### Phase 0 — Inventory & baseline (read-only)
-
-- **Goal**: remove all unknowns before touching code.
-- **Steps**: fill §4's table with exact `file:line`; establish the
-  Option-B `ParkedUnit` migration state against §4's idiom
-  classification; run the gating smoke set (§7) and record green; run
-  kv-bench (hot
-  single-tenant + 8w sharded) and record the baseline numbers *into this
-  doc*.
-- **Done**: §4 table exact; baseline numbers recorded here; smoke set
-  green on the starting branch.
-- **Rollback**: n/a (no code change).
-
-#### Phase 0 results — 2026-05-22, tree at `90e2847`
-
-§4 pointers refreshed in place. Migration state: idiom-1 and idiom-2
-fully on Option-B; idiom-3a (ACME) + idiom-3b (proof / config-mirror) intentional
-fire-and-forget in the self-healing class; SSE/`events.emit` retired —
-worklist #7 closed-by-retirement (not by reification).
-
-Gating smokes green on `90e2847` (ReleaseFast, all 3-node clusters
-self-spawned by the smokes):
-
-- `ctl_smoke.py` ✓
-- `leader_failover_smoke.py` ✓ (H2 reference)
-- `heldsync_smoke.py` ✓ (continuation reference)
-- `http_send_smoke.py` ✓
-- `streaming_smoke.py` ✓ + 10 streaming-family smokes: `streaming_kv_wake`,
-  `streaming_overflow`, `streaming_first_hop_writes`,
-  `streaming_disconnect_writes`, `streaming_heartbeat`,
-  `streaming_kv_wake_writes`, `streaming_write_pressure`,
-  `streaming_subscription_cron`, `streaming_subscription_boot`,
-  `streaming_subscription_kv` — all ✓
-- `fetch_chunk_smoke.py` ✓ + `fetch_streaming_smoke.py` ✓ + `pipe_smoke.py` ✓
-- `readonly_speculation_faultinj_smoke.py` ✓ (idiom-0 gate)
-- `oidc_smoke.py` ✓ (auth surface — superseded the retired
-  cookie-auth smoke when the Fork-B OIDC RP migration landed).
-
-kv-bench baseline (3-node `kv_bench_cluster.sh` over `*.rewindjsapp.localhost`,
-2 runs averaged; ReleaseFast, `WORKERS=8`, 30k req/tenant, c=10, m=10):
-
-| Workload | Run 1 | Run 2 | Phase 0 baseline | Recent peak (reference) |
-|---|---|---|---|---|
-| hot (1 tenant, 1 key) | 45,531 | 46,284 | **~46k req/s** | n/a — write workload, not the ~100k readonly floor |
-| spread (1 tenant, 1000 keys) | 42,742 | 41,004 | **~42k req/s** | n/a |
-| sharded (8 tenants, write workload) | 145,598 | 134,443 | **~140k req/s** | ~162k (`project_perf_push_2026_05_21`) |
-
-Sharded is ~86–90% of the recent peak — within plausible h2load
-variance but on the lower side. Treat **`~140k 8w-sharded` as the
-Phase 0 baseline** for the §6 perf gate; Phase 1+ must stay above
-~135k (10% margin under the lower observed run). Compare to the
-recent peak per `feedback_regression_baseline_current_peak` if a
-single phase drops sharply.
-
-Speculative-chain telemetry sampled at the same runs: mean depth
-3.4–5.1, peak 10, `spec_commits` rate 0% — the chain stays short and
-no apply-time speculation kicked in for these workloads, so the
-baseline measures the dispatch-and-propose path, not the
-speculative-commit path.
-
-The hot/spread numbers (~46k / ~42k) are the *write* path; the
-~100k readonly floor from `project_kv_read_txn_per_op` is a separate
-workload not exercised by `kv_bench_cluster.sh`. Phase 3 (the
-reconciler — the dragon) should add a readonly-path measurement to
-the perf gate before any non-H2 registrant lands.
-
-### Phase 1 — Reify the vocabulary
-
-- **Goal**: `effect.Cmd` and `effect.Msg` are the single source of truth
-  for the two vocabularies. No behavior change.
-- **Steps**: create `effect/cmd.zig`, `effect/msg.zig`; move the handler
-  Cmd-list element type to `effect.Cmd`; fold `ActivationSource` into
-  `effect.Msg`. Mechanical consolidation only.
-- **Gate**: `zig build test` + full smoke set green; behavior
-  byte-identical.
-- **New tests**: none (no behavior change) — but every `switch` over the
-  old enums must now be exhaustive over the union; the compiler enforces
-  the first slice of the contract here.
-- **Done**: both unions live; nothing behavioral changed.
-- **Rollback**: revert the two files (additive).
-
-### Phase 2 — Reify the Msg ingress
-
-- **Goal**: one `MsgQueue`; every Msg taped by construction; one bounded
-  ring gives every origin backpressure.
-- **Steps**: build `MsgQueue` + `enqueueMsg` (tapes unconditionally) +
-  the cross-thread ingress. Migrate origins **one PR each**, lowest
-  traffic first:
-  - **2B** — cron + boot (done, `0ba3215`).
-  - **2C** — kv-react (done, `9ac6ea3`).
-  - **2D** — outbound HTTP (`http_chunk` / `http_done` /
-    `http_pipe_done`). The `send_callback` Msg variant **does not
-    exist** under the 2026-05-22 architecture decision: durability
-    moves to JS shims, so what was `send_callback` is just
-    `http_done` activating the shim's `on_result` chain hop.
-  - **2F** — inbound-HTTP (the reference path).
-- **Gate**: per origin, the matching smokes (subscription smokes,
-  outbound HTTP smokes — `http_send_smoke` continues to gate `webhook.
-  send.js` after Phase 5's JS-shim work lands, h2 smokes).
-- **New tests**: a fetch + `on_chunk` **replay-equivalence smoke** — the
-  regression gate proving worklist #1 fixed (a replayed fetch chain
-  produces an identical writeset + Cmd sequence).
-- **Done**: `subscription_fire_pending` (gone, 2C), `fetch_event_pending`
-  (gone in 2D), and both cross-thread inboxes (collapse with 2D / 2F);
-  every origin routes through `enqueueMsg`.
-- **Rollback**: per-origin PRs revert independently.
-
-### Phase 3 — Reify the Continuation + reconciler (the core)
-
-- **Goal**: one `Continuation` Row + one `reconcile` system replace the
-  ~6 hand-rolled park/wake/resume sites (`fetch_event_pending` retired
-  in 2D, `subscription_fire_pending` in 2C); a wake-correlation index
-  replaces the cross-worker scan.
-- **Done**: one `Continuation` collection-family, one reconciler; the
-  bespoke parked sites and `pending_txns` gone; resume is O(1).
-
-Phase 3 is "the dragon" — generalizing the speculative-apply core
-every H2 request rides. Broken into sub-phases so blast radius is
-bounded; **invariant 1** governs: H2 stays byte-identical until the
-generalized reconciler is proven to reproduce it.
-
-#### Phase 3.0 — vocabulary + sub-plan (this PR-shape)
-
-- Declare `effect.Continuation` (the generalized commit-gated unit) +
-  `Disposition` enum + `WakeKey` (the future O(1) wake-route index
-  key, declared but unindexed) + `reconcile` template.
-- Comptime-generic over txn / buffered types — no import of
-  `kv_mod` / `send_dispatch_mod` from the effect module (preserves
-  the leaf shape, dodges the cycle).
-- **No migration.** Pure type declarations, same pattern as Phase 1.
-- Gate: `zig build test` + smokes byte-identical.
-
-#### Phase 3.1 — migrate `parked_units` onto `Continuation`
-
-The easiest existing parked site to generalize because it's already
-commit-gated end to end (parkSendOps + parkKvWakes +
-proposeForgetfulWrites all use it). H2-path-untouched.
-
-- Convert `worker.ParkedUnit` into the concrete instantiation of
-  `effect.Continuation` (or wrap — whichever lets `send_dispatch_mod.
-  OwnedIntent` + `KvWakeOp` stay in `worker.zig`).
-- Extract the `drainRaftPending` parked_units sweep into a
-  `reconcile`-call against the generic.
-- Gate: `heldsync_smoke` + `http_send_smoke` + `streaming_*` +
-  `leader_failover` + perf gate (~135k 8w-sharded floor) +
-  readonly perf measurement (Phase 0 noted this — the dragon's
-  perf gate must include readonly; current kv-bench is write-only).
-- Rollback: revert the migration; ParkedUnit-as-is keeps working.
-
-#### Phase 3.2 — generalize `drainRaftPending` (the H2 reference)
-
-The dragon's spine. The H2 request path's
-`pending_txns + RaftWait + drainRaftPending` triad generalizes into
-the same reconcile primitive, **byte-identical**.
-
-- Map RaftWait → `Continuation.seq + deadline_ns`. pending_txns →
-  `Continuation.txn` (or its instantiation). drainRaftPending's
-  raft_pending_response sweep → reconcile-call.
-- Prove byte-identical via the full smoke set + perf gate.
-- Rollback: revert; the bespoke shape returns.
-
-This is the high-risk PR. Approach: build the generalized
-reconciler alongside the existing drainRaftPending arm (both run);
-prove the generalized one produces identical behavior on the H2
-reference; then delete the bespoke arm.
-
-#### Phase 3.3 — migrate `raft_pending_cont` + `parked_continuations`
-
-**No-op as a separate sub-phase** (re-evaluated after 3.2.b). The
-3.2.b `drainEntityArm` helper already processes `raft_pending_cont`
-identically to the other H2 siblings — the migration goal (one
-Continuation drain for the three H2 sibs) is met. Held-sync
-continuations route into `parked_continuations` on the 3.2.b commit
-arm; resume happens via `resumeBoundContinuation` (a separate
-mechanism not part of the parked-seq drain). No further unification
-work required for Phase 3's "one Continuation runtime" claim.
-
-#### Phase 3.4 — migrate `raft_pending_stream` + `stream_*`
-
-**Same no-op as 3.3.** `raft_pending_stream` is processed by
-`drainEntityArm` via the 3.2.b collapse. The stream lifecycle
-proper (`stream_data_out` → `stream_response_in` → h2 ship)
-operates after the entity leaves `raft_pending_stream` and is a
-distinct h2-owned state machine, not a parked-seq drain.
-
-#### Phase 3.5 — add the `WakeKey` index; delete the cross-worker scan
-
-**Deferred** (decision 2026-05-22). The current scan in
-`resumeBoundContinuation` (`worker.zig:4747`) is **worker-local**,
-not cross-worker — it iterates the worker's own
-`parked_continuations.entitySlice()`. Algebra worklist #4's
-"cross-worker scan" framing was aspirational against
-connection-actor's unbuilt cross-worker case; today's scan is
-bounded by per-worker in-flight held-sync count and not measured
-as hot. The index-maintenance discipline (every site that moves
-entities into / out of `parked_continuations` — including the
-`resumeContinuation` re-park path where `bound_schedule_id`
-changes mid-chain — must keep the index in sync, or stale entries
-silently break resume) is real cost.
-
-Trigger conditions for picking 3.5 back up:
-1. Measurement shows the worker-local scan is hot under realistic
-   held-sync load.
-2. Connection-actor's cross-worker case lands and forces an
-   indexed route (its design will dictate the index shape).
-3. A new origin needs O(1) wake routing (e.g., the WebSocket
-   inbound frame path).
-
-The `WakeKey` type declared in Phase 3.0 stays — it's the
-vocabulary the eventual index uses. The `Continuation.wake_key`
-slot is unused at the migrated parked_units site; no harm.
-
-### Phase 3 status — substantially complete (2026-05-22)
-
-The algebra's structural goal — **one Continuation runtime** — is
-met for every active parked-seq path:
-
-- ParkedUnit instantiates `effect.Continuation` (3.1).
-- The three H2 sibling drains share `drainEntityArm` + classify
-  (3.2.a / 3.2.b).
-- `pending_txns` is encapsulated as `effect.SharedTxnPool` with a
-  documented sharing invariant (3.2.c).
-- 3.3 / 3.4 are met-by-coverage (the 3.2.b helper processes their
-  collections uniformly); the rest of the stream lifecycle is
-  h2-owned and not part of Phase 3's scope.
-- 3.5 deferred per above.
-
-Rollback for the substantially-complete set: each sub-phase
-commit reverts independently to its bespoke predecessor (Phase 3.0
-through 3.2.c).
-
-### Phase 4 — Reify Cmd interpretation + the commit-gated buffer
-
-Revised 2026-05-22 in light of two prior decisions:
-
-1. **`events.emit` retired.** Worklist #7 ("`events.emit` becomes a
-   buffered Cmd") is closed-by-retirement, not by reification.
-   `events.emit` doesn't exist as a Cmd variant.
-2. **`http.send` retiring in Phase 5** ([[project_durability_as_js_shim]]).
-   `effect.Cmd.http_out`'s shape is fluid until Phase 5 lands — wiring
-   `interpretCmd` for it now means rewiring it after Phase 5. Phase 5
-   first, then Phase 4's interpretCmd sees a stable surface.
-
-- **Goal (revised)**: force the streaming-pre-commit decision
-  (algebra §7 worklist #2) — the last open architectural item Phase
-  4 owns. Code-side `interpretCmd` is deferred to a post-Phase-5
-  Phase 4.X.
-- **Phase 4.0 — DECISION (shipped 2026-05-22):** fix the code.
-  Per [[feedback_model_simplicity_safety]]: the §2 rule IS the
-  model; the eager-ship code path in
-  `proposeForgetfulWrites`-from-resume violates it; we fix the
-  code, not the doc. `__rove_stream({eager_ship: true})` opt-in
-  reserved for customer demand. Latency cost (~one raft-cycle
-  per resume hop with writes) accepted.
-
-- **Phase 4.0.b — IMPLEMENTATION (shipped 2026-05-22):** the
-  commit-gate is wired in `resumeStream`'s terminal+writes and
-  stream+writes arms (the cont arm 501's pre-Phase 5, no writes
-  to gate). What landed:
-  - `BufferedSendKvOps` extended with `staged_chunks:
-    std.ArrayListUnmanaged([]u8)` + `stream_entity: ?rove.Entity`
-    + `mark_draining: bool`. Structural deinit walks the chunk
-    list, freeing each on the fault arm.
-  - `proposeForgetfulWrites` takes `stage_opt: ?*StreamResumeStage`
-    — non-null only at the two stream-resume call sites; the
-    9 non-stream callers (disconnect, subscription, fetch-event)
-    pass `null`. The helper takes `stage.chunks` unconditionally
-    (sets it `.empty`) so the caller's defer is a no-op on every
-    path — commit moves chunks into the unit, fault frees them
-    via the helper's errdefer.
-  - `transferStagedChunks` is the commit-arm transfer in
-    `drainRaftPending`'s `parked_units` branch — runs after
-    `firePendingSendOps` + `firePendingKvWakes`, BEFORE entity
-    destroy. `reg.get` on the stream entity discards the chunks
-    if it moved or destroyed in the interim (client-disconnect
-    race); otherwise `tryAppend`'s each chunk into `StreamChunks`
-    and flips `is_draining` if `mark_draining`.
-  - `markStreamDraining` no longer fires eagerly in the
-    terminal+writes arm — `transferStagedChunks` flips it AFTER
-    the body chunk lands in `StreamChunks`, so the customer never
-    sees the terminal frame on a faulted hop.
-  - Internal-state updates (ctx_json / interval / kv_prefixes /
-    activation_count) stay eager. The §2 rule covers chunks
-    reaching the wire, not per-stream runtime state; a fault
-    leaving ctx ahead of durable kv is recoverable by the
-    customer (handlers re-read kv on every activation, §9.4
-    "spurious + overflow" thesis).
-  - `streaming_resume_fault_inj_smoke.py` is the regression
-    gate. Standalone tenant manifest (`examples/streaming-fault-
-    inj-tenant.json` + `examples/loop46-demo-tenants/streaming_
-    fault_inj/index.mjs`). Verified sensitive: a controlled
-    anti-fix that reverts the staging in the stream+writes arm
-    makes the smoke FAIL within the same 5s curl window
-    (`event: tick` leaks 3× during a frozen-quorum window
-    pre-fix; 0× post-fix). `streaming_kv_wake_writes_smoke.py`
-    (happy-path gate) and `zig build test` both green.
-  - `worker.zig` resumeStream doc-comment and
-    `streaming-model.md` §2 implementation-status note both
-    updated to reflect the going-forward contract.
-- **Phase 4.1.1 — typed Cmd union + interpretCmd switch (SHIPPED
-  2026-05-24).** `effect/cmd.zig` now declares the live Cmd union
-  with payload-bearing variants — `kv_wake_broadcast`,
-  `stream_chunk`, `stream_close`, `http_fetch`, `respond`.
-  `effect.interpretCmd` is the exhaustive switch over this union;
-  the Zig compiler refuses to build when a variant lacks a switch
-  arm — the compile-time contract Phase 1 promised is in place.
-  `effect.BufferedCmds.releaseAll` drives `interpretCmd` per Cmd
-  in the parked-units commit arm.
-  (The earlier `conn_write` slot for inbound-WS was removed
-  2026-05-24 after the audit-for-half-done-refactors pass — it
-  had no producer in tree, so the typed slot was parked Option-1
-  scaffolding. Re-add when the inbound-WS server lands.)
-  Pre-4.1.1 per-kind helpers `firePendingKvWakes` +
-  `transferStagedChunks` deleted; their work collapsed into the
-  switch. `BufferedSendKvOps` is aliased to
-  `effect.cmd.BufferedCmds` for back-compat at the ParkedUnit
-  declaration site; producers (`parkKvWakes`,
-  `proposeForgetfulWrites`) build Cmd records directly.
-  `fireKvReactSubscriptions` reads kv_wake_broadcast Cmds
-  read-only before releaseAll consumes them. Behavior preserved:
-  full smoke set green including the Phase 4.0.b chunk-leak
-  fault-injection gate (`streaming_resume_fault_inj_smoke.py` —
-  proves the commit-vs-fault staging stayed correct across the
-  migration). `kv_write` + `respond` Cmd kinds remain as type
-  slots without runtime routing — those routings are 4.1.2 +
-  4.1.3 below.
-- **Phase 4.1.2 — http_fetch staging (SHIPPED 2026-05-24).** The
-  marker-commit race is closed. Three concrete changes:
-  - `worker_dispatch.zig` — added a batch-level
-    `batch_pending_fetches` accumulator (parallel to `writeset`).
-    The per-handler-success transfer replaces the eager
-    `enqueuePendingFetches` flush at the old line 2621.
-    `finalizeBatch` now decides at end-of-batch:
-    read-only / no-speculation → flush immediately (no marker, no
-    race); read-only-with-speculation (idiom-0 barrier) → stage
-    on a parked unit with empty writeset (commit-gated by the
-    barrier seq); write path → stage as `Cmd.http_fetch` Cmds on
-    the parked unit via `parkKvWakes`'s new `extra_cmds`
-    parameter.
-  - `worker.zig:parkKvWakes` — takes `extra_cmds:
-    effect.cmd.BufferedCmds` (taken-by-value, consumed
-    unconditionally). The unit's BufferedCmds is built from
-    `extra_cmds` as the base + kv_wake_broadcast Cmds appended on
-    top. `worker_drain.zig`'s cont-resume call site passes `.{}`
-    (cont-resume hops don't accumulate http.fetches).
-  - `globals/webhook.js` — re-enabled the inline `http.fetch`
-    for immediate-fire `webhook.send`. The fetch's `on_chunk` is
-    `__system/webhook_onresult`, stamped with `X-Rove-Schedule-Id`
-    + `X-Rove-Schedule-Version: 1` so upstreams dedupe by
-    `(id, version)`. Scheduled `fire_at_ns > now` still goes
-    sweep-only (the engine has no deferred-submit mechanism).
-  - **Gate (all green):** `http_send_smoke` (the customer's
-    `on_result` chain fires — proves `webhook_onresult` ran AFTER
-    the marker committed, the property the race fix establishes);
-    full regression set (`fetch_chunk` / `fetch_streaming` /
-    `streaming` / `streaming_kv_wake` /
-    `streaming_resume_fault_inj` / `heldsync` / `subscription` /
-    `subscription_cap` / `ctl` / `penalty`).
-  - **Customer-visible win:** webhook.send's first-fire latency
-    drops from the ~1 s sweep tick to inline. The
-    `__system/webhook_onresult` shim still owns retry policy
-    (1 s → 2 s → 4 s … cap 60 s, max 5 attempts) — that's
-    unchanged.
-- **Phase 4.1.3 — `respond` Cmd: route H2 entity commit-move
-  through `interpretCmd` (SHIPPED 2026-05-24, Option-2
-  full-convert).** The exhaustive switch over `Cmd` now covers
-  every producer-bearing variant (kv_wake_broadcast +
-  stream_chunk + stream_close + http_fetch + **respond**).
-  Shape:
-  - `Cmd.respond` is **move-only** — entity + source enum +
-    dest enum. No payload. The h2 components (Status /
-    RespHeaders / RespBody / H2IoResult / StreamId / Session)
-    stay stamped at handler-success time, exactly as pre-4.1.3.
-  - `interpretCmd .respond` does the `reg.move(entity, source,
-    dest)` — replaces the inline move in
-    `drainEntityArm`'s commit arm.
-  - **Option-2 (Pattern B everywhere):** every site that parks
-    an entity in `raft_pending_X` ALSO emits a `Cmd.respond` on
-    a `parked_units` BufferedCmds — `worker_dispatch.finalizeBatch`
-    (write + barrier paths), `proposeAndParkContResume`,
-    `handleRelease`, `handleAdminKv`. `drainEntityArm`
-    unconditionally skips the commit-arm move (the prior
-    `RaftWait.respond_deferred` discriminator flag is gone —
-    it was the "two patterns coexisting" smell that motivated
-    the Option-2 conversion). One pattern; the typed switch
-    is the only path that touches the commit-arm move.
-  - **Subtlety: commit + move atomicity.** Decoupling the move
-    from `drainEntityArm` re-introduces a window the pre-4.1.3
-    inline-move arm closed for free. If the entity arm's
-    `commitAndTake` returns `.conflict` (kvexp `NotChainHead` —
-    a predecessor txn hasn't committed yet), the move MUST be
-    deferred too; otherwise the entity moves to its destination
-    but its writes aren't durable, AND the orphaned txn blocks
-    every later forgetful commit in the chain. The fix is in
-    the `parked_units` commit arm: `if (unit.txn == null and
-    worker.pending_txns.contains(unit.seq)) continue;` — the
-    unit defers to the next tick when the sibling entity-backed
-    arm conflicted. `pending_txns.contains` is the visible
-    "did the entity-backed txn commit?" gate.
-  - **Honest scope note:** an earlier 4.1.3 draft attempted the
-    "full deferral" — moving h2 component stamping itself into
-    the Cmd payload so the entity sat in raft_pending_X with
-    default-value components until interpretCmd. That broke the
-    read-only fast path (which moves entities to response_in
-    inline without a Cmd, so h2 would have shipped with
-    Status=0). The move-only scope avoids that footgun.
-  - **Gate (all green):** `ctl_smoke` (basic H2 + the
-    `/_system/release` path now routes through Cmd.respond),
-    `heldsync_smoke` (cont resume — the conflict-defer gate
-    above is load-bearing here; without it scenario 3's
-    forgetful-writes path panics at `seq=10`),
-    `streaming_resume_fault_inj_smoke` (chunk-leak gate),
-    `fetch_chunk` / `subscription` / `subscription_cap` /
-    `penalty` / `streaming` / `streaming_kv_wake` /
-    `leader_failover` / `files_server` / `http_send` (the
-    pre-existing `wb/last_tag` stale check is unrelated).
-- **Phase 4.1.4 — `conn_write` Cmd: deferred to inbound-WS.**
-  Add the variant when the inbound-WS producer ships
-  ([`docs/websocket-plan.md`](websocket-plan.md)). Don't park the
-  typed slot in advance — the `respond_deferred` failure mode the
-  2026-05-24 audit-for-half-done-refactors pass ruled out applies
-  here too: union arms without producers are Option-1 scaffolding.
-- **Gate**: streaming smokes (for 4.0's pre-commit decision);
-  `http_send` smokes + streaming smokes (for 4.1.2);
-  full smoke set + new fault-injection gate (for 4.1.3).
-- **Done**: streaming model says what the code does and vice versa;
-  no Cmd escapes except through the reconciler's commit gate;
-  `interpretCmd` exhaustively switches over every producer-bearing
-  Cmd kind. 4.1.1 is the contract; 4.1.2 is the customer-visible
-  win; 4.1.3 unifies the H2 path; 4.1.4 will close the loop when
-  inbound-WS lands.
-- **Rollback**: 4.0 is a doc + small code change per arm; 4.1.X
-  is per-PR incremental.
-
-### Phase 5 — Retire `http.send`; durability becomes JS-shim composition
-
-Revised 2026-05-23. Earlier drafts said "collapse SendDispatch + FetchPool
-into one transport." Per the
-[[project_durability_as_js_shim]] decision, the right move is
-**delete SendDispatch entirely** and rebuild its semantics as a
-composition in the JS standard library. The cost (per-fire JS
-dispatch overhead) is acceptable pre-launch and an obvious
-paid-tier-fast-path target later.
-
-This phase is broken into PRs. PR-1 narrows the outbound primitive
-itself (`http.fetch`); PR-2 builds the JS-shim durability on top;
-PR-3+ delete the now-unreferenced Zig kernel.
-
-#### Phase 5 — PR-1: collapse `http.fetch` to single callback + `stream` knob
-
-Locked 2026-05-23 after a design walk-through that twice simplified
-the originally-planned API (an "on_done with body" addition, then a
-straight "merge on_chunk + on_done with a `final` flag"). The
-collapse drops two of the three patterns in today's binding and the
-distinction between Pattern A and the hypothetical "request-response"
-Pattern C. `pipe_to` (Pattern B) was a premature throughput
-optimization for an LLM-proxy workload that doesn't yet exist; it
-re-enters when concrete demand justifies it, per
-[[feedback_compose_from_primitives]].
-
-**Goal**: one outbound verb (`http.fetch`), one callback (`on_chunk`),
-two knobs (`stream: bool`, body cap). Activation always fires at
-least once; `final: true` carries terminal info (status + ok +
-body_truncated). Webhook shim (PR-2) and LLM-proxy code (post-launch)
-both compose on top.
-
-**API after collapse:**
-
-```js
-http.fetch({
-  url, method, headers, body,
-  on_chunk: "module.mjs",                          // the one callback
-  stream: false,                                    // false → first chunk only (default)
-  max_response_chunk_bytes: 256 * 1024,            // cap on the first/each chunk
-  max_total_response_bytes: 50 * 1024 * 1024,     // hard cap when stream=true
-  timeout_ms: 30000,
-  ctx: { … },
-});
-```
-
-**Activation shape (`request.activation`):**
-
-```js
-{
-  kind: "fetch_chunk",
-  fetch_id: "f_…",
-  seq: 0,                            // 0 first/only; 1, 2, … when streaming
-  byte_offset: 0,                    // cumulative bytes before this chunk
-  bytes: Uint8Array,                 // may be empty on transport error / 204
-  fetch_headers: { … },              // seq=0 only — PARSED into key→value
-  final: true,                       // always true when stream=false
-  // present iff final === true:
-  status: 200,                       // upstream HTTP status; 0 on transport error
-  ok: true,                          // libcurl-transport-only signal
-  body_truncated: false,             // true if more body discarded by cap
-  ctx: { … },
-}
-```
-
-**What deletes from the existing surface:**
-
-- `pipe_to: "held_response"` option (Pattern B).
-- `headers_passthrough` option (Pattern B helper).
-- `on_done` option (Pattern A's separate terminal hook).
-- `fetch_pipe_done` `ActivationSource` variant.
-- `PipeState` component (`src/js/components.zig`) — `awaiting_pipe`,
-  `pipe_correlation_id`, `bytes_piped`, `terminal_ok`,
-  `terminal_status`, `pipe_dropped_chunks`.
-- `pipe_to_held`, `pipe_correlation_id` on `PendingFetch` /
-  `UpstreamFetchEvent`.
-- `activation_fetch_terminal_status` /
-  `activation_fetch_terminal_ok` / `activation_fetch_bytes_piped` on
-  `Request` (folded into per-`fetch_chunk` activation's final
-  payload).
-
-**What stays / changes shape:**
-
-- `FetchPool` — keeps its libcurl thread + per-tenant routing;
-  loses pipe accounting; gains a `stream` flag and a first-chunk-cap
-  abort mode (writeback returns 0 after the first chunk lands).
-- `fetch_headers` — today emitted as `Key: Val\r\n…` wire-format;
-  parse server-side into a `{ "content-type": "...", ... }` object
-  (last-wins for repeats) so customers don't re-parse.
-- `on_chunk` activation **always fires at least once** — even for
-  204 / transport error / cap-only failure. `final: true` carries
-  the result; `bytes` is empty when there's no body.
-
-**What stays IDENTICAL:**
-
-- Pattern A streaming behavior under `stream: true` (multiple
-  activations, each carrying `bytes`, final one carrying terminal).
-- libcurl thread, hash-routed chunk inbox, FetchPool tenant scoping.
-- `max_total_response_bytes` hard-cap semantics.
-- Tape per §6 cap (each activation taped; per-chain byte cap
-  bounds long-term cost).
-
-**Migrations:**
-
-- `examples/loop46-demo-tenants/acme/pipe/index.mjs` — uses
-  `pipe_to: "held_response"`. Retire (LLM-proxy use case re-enters
-  when demand materializes). Or migrate to `stream: true` +
-  customer-side `__rove_stream` forwarding (more code; same end
-  behavior; documents the cost of the collapse).
-- `examples/loop46-demo-tenants/acme/fetchchunks/` +
-  `fetchchunk.mjs` + `fetchdone.mjs` — merge `on_chunk` and
-  `on_done` modules into one (the handler branches on
-  `activation.final`).
-
-**Smoke gates:**
-
-- `fetch_chunk_smoke.py` (Pattern A → migrated to single-callback +
-  `final` flag).
-- `fetch_streaming_smoke.py` (Pattern A streaming → migrated to
-  `stream: true`).
-- `fetch_chunk_tape_smoke.py` (replay determinism — same coverage
-  with merged activation).
-- `pipe_smoke.py` — retired (the surface it exercises is gone).
-- NEW: cover `body_truncated: true` (response exceeds
-  `max_response_chunk_bytes` with `stream: false`); cover
-  transport error fires `final: true` with empty bytes; cover
-  parsed headers shape.
-
-**Done when:** `http.fetch` exposes only `{url, method, headers,
-body, on_chunk, stream, max_response_chunk_bytes,
-max_total_response_bytes, timeout_ms, ctx}`; the surface is
-documented in `globals/http.js`; smokes green; `zig build test`
-green; perf parity (kv-bench unaffected — `http.fetch` is off the
-write hot path).
-
-**Rollback:** PR-1 is a single commit; revert restores `pipe_to` +
-`on_done` + `headers_passthrough` byte-identically.
-
-#### Phase 5 — PR-2a (shipped 2026-05-23, `fa5079c`): lift `__rove_next` from fetch on_chunk handlers
-
-`fireFetchEventActivation`'s `.continuation` arm previously
-warn-and-dropped; PR-2a lifts it to enqueue a `SendCallback` Msg
-carrying the cont's `{tenant, path, fn?, ctx, correlation_id}`. The
-dispatch loop fires `fireChainedActivation` (structural twin of
-`fireSubscriptionActivation` — no held socket, propose-forgetful
-on writes). Customer-facing surface: `request.activation.kind ===
-"send_callback"` + `request.body = {"ctx": <cont's ctx>}`.
-
-Smoke: `scripts/chained_dispatch_smoke.py` plus three demo
-handlers (`chainfetch/`, `chainfetchstep1.mjs`, `chainresult.mjs`).
-
-#### Phase 5 — PR-2b (shipped 2026-05-23, `ab1801b`): `__system/` module resolution
-
-Built-in handler modules — the `__system/` namespace. Sources
-under `src/js/builtin_modules/*.mjs` are `@embedFile`'d via
-`build.zig`'s `js_runtime_files` table (entries with `builtin_*`
-prefix); compiled once at NodeState init to QJS bytecode via a
-throwaway Runtime+Context (`src/js/builtin_modules.zig`); stored
-in `NodeState.builtin_modules`. `worker.resolveDeployment` gains
-a `__system/`-prefix fall-through after the tenant-side lookups
-miss. `Request.is_system_module` + `DispatchState.is_system_module`
-plumb through the dispatcher so `globals.jsKvSet` /
-`jsKvDelete` bypass `reserved.isCustomerWriteReserved` when the
-flag is true (the shim needs to write `_send/owed/{id}` markers).
-
-The first baked module — `webhook_onresult.mjs` — was compiled and
-loaded but UNUSED at runtime when PR-2b landed. PR-3 wired it (see
-below).
-
-Verification: unit tests in `builtin_modules.zig` (registry
-compiles to non-empty bytecodes; `isBuiltinPath` classifier
-correct); existing gating smokes unaffected.
-
-#### Phase 5 — PR-3 (shipped 2026-05-24, `b908953` — atomic flip + Zig kernel delete)
-
-Originally planned as four separate sub-PRs (2c shim rewrite, 2d
-retry sweep, 3 email.send retarget, 4 delete kernel). All four
-**must land together**. Discovered mid-PR-2c: `apply.zig
-.classifyPayload` scans every committed writeset for `_send/owed/*`
-keys and arms a SendDispatch entry per hit. If the shim writes
-markers while SendDispatch is still alive, **every webhook
-double-fires** (Zig SendDispatch arming + the shim's
-`http.fetch`). The retry sweep + boot recovery have the same
-shape — both paths would re-fire past-due entries independently.
-The only safe shape is one atomic commit:
-
-1. **Flip `globals/webhook.js`**: replace the `http.send`-backed
-   body with the JS composition:
-   ```js
-   kv.set("_send/owed/" + id, JSON.stringify({url, body, headers,
-     attempts: 0, next_at_ns: "0", on_result, context}));
-   http.fetch({url, method, body, headers,
-     on_chunk: "__system/webhook_onresult",
-     ctx: {id, on_result, context}});
-   ```
-   `X-Rove-Schedule-Id` + `X-Rove-Schedule-Version` headers stamped
-   client-side (preserves the customer-visible header API).
-   Migrate `examples/.../cbresult.mjs` to read `request.body.ctx
-   .result` (new shape).
-
-2. **Wire the centralized per-worker partitioned retry sweep**
-   (PR-2d's locked design from this session):
-   - Each leader-side worker runs `sweepOwedRetries` on its tick
-     (~1Hz throttled per-worker).
-   - Partition: `hash(tenant_id) % N_workers == worker.global_idx`
-     — matches the existing `enqueueMsgForTenant` routing, so the
-     entire retry chain (sweep → fetch → onresult → kv ops) lives
-     on one worker per tenant. Zero cross-worker coordination;
-     parallel enumeration; the per-tenant work stays sticky.
-   - For each partitioned tenant, walk `_send/owed/` kv prefix;
-     for each entry where `now >= next_at_ns`, construct a
-     PendingFetch + push to FetchPool with `on_chunk =
-     __system/webhook_onresult`. Bumps the `X-Rove-Schedule-
-     Version` header.
-   - Boot variant: on leadership promotion, run the sweep once
-     across all partitioned tenants (independent of throttle) for
-     orphan recovery.
-
-3. **Strip apply.zig's `_send/*` special-case** —
-   `classifyPayload` is no longer reachable from anywhere live;
-   delete the `_send/owed/` arm enqueue + the `_send/proof/`
-   resolve enqueue. Now ordinary kv writes.
-
-4. **Delete the Zig kernel**: `send_dispatch.zig` (~66 KB),
-   `send_inflight.zig` (~25 KB), `send_outbox.zig` (~13 KB).
-   Delete `parkSendOps` / `firePendingSendOps` /
-   `BufferedSendKvOps.send_ops` (collapses the buffered struct to
-   `kv_wakes` + Phase 4.0.b stream chunks). Strip the `SendDispatch`
-   pointer from `NodeState`. Strip `startSendDispatch` from
-   `main.zig` boot sequence.
-
-5. **Retire `.send_callback` ActivationSource? No** — the new
-   chained-dispatch shape (PR-2a) reuses `.send_callback` as the
-   activation kind for `__rove_next` dispatches. The Msg variant
-   stays. Pre-PR-2a `.send_callback` was only emitted by
-   SendDispatch + held-sync resumeContinuation; post-PR-3 the
-   former producer is gone, the latter remains.
-
-6. **Migrate `globals/email.js`**: it already wraps `webhook.send`;
-   no behavioral change beyond the implicit shift to the new path.
-   Verify `email_rate` per-instance limiter still gates.
-
-**Gating**:
-
-- `webhook_smoke.py` migrated — exercises the JS-shim path through
-  `cbfire` / `cbresult`. After PR-3 the smoke validates the new
-  shape; pre-PR-3 it validates the old.
-- `http_send_smoke.py` — `http.send` is going away; this smoke
-  retires alongside the binding (defer the delete decision to PR-3's
-  PR-author).
-- New `webhook_recovery_smoke.py` — kill leader mid-fetch; new
-  leader's boot sweep fires the retry; verifies cross-failover
-  delivery via the new mechanism. Replaces the boot-scan recovery
-  smoke `SendDispatch.recover()` provided.
-- `leader_failover_smoke.py` — known flaky
-  ([[project_leader_failover_smoke_flake]]); fix or accept.
-
-**§13 process map shrink**: the dedicated SendDispatch thread
-retires (~1 thread per node); `FetchPool` is now the sole
-outbound-HTTP runtime.
-
-**Close-out (2026-05-24).** PR-3 landed as TWO commits per the §6
-PR-2/PR-3 split: `769bf53` (retry sweep, prerequisites only —
-inert without the flip) + `b908953` (the atomic flip + delete).
-Diff stat for the flip alone: `36 files changed, 1209 insertions,
-5243 deletions` → net −4034 LOC.
-
-Deletions (4 files / ~4.7 kLOC):
-
-- `src/js/send_dispatch.zig`
-- `src/js/send_inflight.zig`
-- `src/js/send_outbox.zig`
-- `src/js/callback_dispatch.zig`
-- `examples/owed_recovery_scan_bench.zig`
-
-JS-shim composition (`globals/webhook.js`) rewritten as `kv.set +
-http.fetch` with `__system/webhook_onresult` as the on_chunk
-shim, plus `handle` (deterministic id basis) + `fire_at_ns`
-(scheduled fire) options. All five in-tree http.send callers
-migrated to `webhook.send`: `oidc.js`, `oauth.js`,
-`activitypub.js`, `retry.js`, `email.js`. `jsHttpSend` Zig
-binding deleted.
-
-**Four implementation-time bugs found mid-PR-3 (all fixed):**
-
-1. `_system` ABI was unreachable from baked `__system/` modules.
-   `globals.zig`'s `_harden.js` step runs `delete globalThis._system`
-   BEFORE customer + baked modules eval — so an initial
-   `_system.continuation.resumeIfBound` shim threw
-   `ReferenceError`. Resolution: the trampoline lives as a
-   persistent global builtin `__rove_resume_if_bound` (same shape
-   as `__rove_next` / `__rove_check_email_rate`), added to
-   `GLOBAL_BUILTINS` and the `builtin_exceptions` allowlist that
-   bypasses harden. **Lesson for baked modules: any platform-side
-   binding they need must be on the GLOBAL_BUILTINS surface, not
-   `_system.*`.**
-2. The `resume_if_bound` trampoline was wired in the H2 inbound
-   dispatch but NOT in `fireFetchEventActivation` — where the
-   JS-shim onresult ACTUALLY runs. With null trampoline,
-   `jsContinuationResumeIfBound` returned false unconditionally
-   and held-sync conts parked until their 25s deadline. Resolution:
-   thread the trampoline onto the fetch-event Request.
-3. `fetch_pool` in `stream:false` mode emitted TWO events (body
-   chunk with `final:false` + empty event with `final:true`) but
-   `webhook_onresult` only processes `final:true` — so
-   `outcome.body` arrived empty. Resolution: new `pushFinalWithBody`
-   buffers in `StreamState.body_buf` during `onBody`, emits ONE
-   consolidated event with body + final + terminal fields. Stream
-   mode (`stream:true`) unchanged.
-4. Customer middleware short-circuited `__system/` activations.
-   `__admin__`'s OIDC-RP middleware (web/admin/_middlewares/
-   index.mjs) returned 401 for paths not on its PRE_AUTH_PATHS
-   list — including the synthetic `/__system/webhook_onresult`
-   path the shim runs under. The shim's body never ran; markers
-   never deleted; sweep refired forever. Resolution:
-   `dispatcher.runOutcome` skips customer
-   `_middlewares/index.mjs` when `request.is_system_module ==
-   true`. **Built-in `__system/` modules ARE the platform — tenant
-   middleware can't gate them.**
-5. **Marker-commit race (semi-fix, full fix in 4.1).**
-   `handleCallback` style flows write the `_send/owed/{id}` marker
-   into the handler's writeset and `webhook.send`'s original shape
-   fired `http.fetch` inline. The fetch can return BEFORE the
-   writeset commits via raft; `webhook_onresult`'s fresh
-   `beginTrackedImmediate` doesn't see the speculative marker →
-   `owed_raw == null` early-exit → chain to customer `on_result`
-   never fires. **Mitigation that shipped:** `webhook.send.js`
-   drops the inline `http.fetch` — sweep-only fire path. The
-   per-worker partitioned retry sweep wakes within
-   `SEND_SWEEP_INTERVAL_NS` (1s) of `next_at_ns` AFTER the marker
-   has committed; eliminates the race. ~1s first-fire latency
-   accepted (heldsync §6.4 25s deadline tolerates it, observed
-   ~200ms; webhook callers were never latency-sensitive). **Proper
-   fix in Phase 4.1**: generalized commit-gated Cmd buffer
-   (extending Phase 4.0.b's stream-chunk staging) restores inline
-   fire without the race.
-
-**Smoke status post-flip (all gating green):**
-
-| Smoke | Status |
-|---|---|
-| `ctl_smoke` | ✓ |
-| `heldsync_smoke` | ✓ (~200ms first-fire) |
-| `leader_failover_smoke` | ✓ (deflaked by making wb tenant read-only) |
-| `webhook_recovery_smoke` (new) | ✓ |
-| `streaming_smoke` | ✓ |
-| `fetch_chunk_smoke` | ✓ (was pre-existing fail) |
-| `webhook_smoke` | ✓ (was pre-existing fail) |
-| `zig build test` | ✓ |
-
-**Perf gate (kv-bench, 8w, ReleaseFast, 2-run avg vs Phase 0):**
-
-| Workload | Phase 0 baseline | PR-3 measured | Δ |
-|---|---|---|---|
-| hot (1 tenant, 1 key) | ~46k | ~49k | +6% |
-| spread (1 tenant, 1000 keys) | ~42k | ~42k | 0% |
-| sharded (8 tenants, write) | ~140k | ~131k | −6.4% |
-
-Sharded is below the §6 invariant 4 floor (~135k). The hot path is
-not touched by PR-3 (the shim only runs when `webhook.send` is
-called; kv-bench tenants don't fire webhooks), so the regression is
-either (a) sweep cost on the worker tick (each leader worker walks
-`tenant_files_map` + does one prefix scan per second on its
-partitioned tenants — should be cheap, the dip suggests it's not),
-(b) `fetch_pool` state additions (the new `body_buf` ArrayList),
-or (c) cluster-bench noise. Not blocking; flagged for follow-up
-under Phase 4.1 prep (the rewire of the Cmd buffer will revisit
-the per-tick overhead anyway).
-
-**Two pre-existing failures fixed during the close-out** (not
-introduced by PR-3, but unblocked by debugging it):
-
-- `fetch_chunk_smoke` — `JS_ParseJSON` needs NUL-terminated buf
-  per arenajs; the fetch-headers activation install passed a
-  plain slice → parse silently failed → headers landed as `{}`.
-  Fixed in `globals.zig` by allocating a sentinel-terminated
-  copy.
-- `webhook_smoke` — RP login stall; was the marker-commit race
-  AND the middleware short-circuit hitting together. Both
-  resolved by the fixes above.
-
-#### Phase 5 — PR-4: rename `FetchPool` → `OutboundHttpPool`
-
-Bikeshed-grade. Done if a reviewer cares; otherwise leave the name
-and ship.
-
-#### Phase 5 — gating + risk (all PRs)
-
-- `http_send_smoke` — exercises `email.send` / `webhook.send`
-  end-to-end. After PR-3 it tests the JS shim path; after PR-4 it
-  confirms `SendDispatch` is gone (no metrics, no envelope-0
-  handling).
-- `leader_failover_smoke` — verifies cross-failover delivery still
-  works via the boot subscription. (Currently flaky per
-  [[project_leader_failover_smoke_flake]] — fix the smoke as part
-  of PR-2 or accept the known flake.)
-- perf gate: kv-bench + `http_send_smoke` end-to-end timing. Pre-
-  launch we accept a slowdown vs native SendDispatch; the Phase 0
-  baseline is the regression floor for the *outbound HTTP primitive
-  itself*, not for the durable path.
-
-**Risk**: this is a customer-visible behavioral change in latency
-characteristics (JS dispatch adds overhead per retry). Pre-launch
-it is acceptable; post-launch a paid-tier fast path (pattern-matches
-the shim's `kv.set` + `http.fetch` sequence and bypasses to native
-dispatch) restores the latency profile without changing the
-customer API. Out of scope here; tracked separately.
-
-### Phase 6 — Cleanup tail — substantially shipped 2026-05-27
-
-- **Goal**: `effect-algebra.md §7` worklist empty.
-- **Steps + status:**
-  - ✅ Delete `src/connection_holder/` dead scaffold — done; ~1645 LOC
-    removed across `src/connection_holder/{root,standalone,wake_dispatch}.zig`,
-    `examples/connection_holder_standalone.zig`, + build.zig module +
-    standalone binary entries.
-  - ✅ Move `cron_state` onto a collection (#5) — done. The earlier
-    deferral was based on a wrong analysis: the cron sweep was
-    already worker-0 + leader gated at the caller (`loop46/main.zig`),
-    so the migration is pure ECS cleanup with zero behavior change.
-    Added a `CronState` component (tenant_id + sub_name + next_fire_at_ns,
-    string-owning with auto-deinit) on a `cron_state` collection on
-    every worker — only worker 0 populates it. Replaced the
-    `node.cron_state` StringHashMap + mutex; both deleted. Linear-scan
-    lookup is fine at the expected scale (tens of active crons, 1Hz).
-    `streaming_subscription_cron_smoke.py` green.
-  - ✅ Resolve boot double-fire UNCLEAR (#6) — already resolved by the
-    impl: `_boot_fired/<dep_id>` marker rides the handler's writeset
-    (`worker_streaming.zig:1105`), so marker + handler effects commit
-    atomically through raft. No "fired-but-not-marked" window. Updated
-    the stale `enqueueBootSubscriptions` doc comment to match.
-  - ✅ Rewrite `effect-algebra.md` §5 audit + §6 + §7 worklist — done;
-    audit table updated, minimal-set predictions marked SHIPPED,
-    worklist items 1/2/4/6/7 marked DONE.
-  - ✅ Update `CLAUDE.md` dispatch wording — done; replaced
-    `dispatchPending` with `dispatchOnce` + `Dispatcher.runOutcome`
-    reference.
-- **Done**: all 5 steps shipped.
+4. **No perf regression** vs the recent peak (~162k req/s 8-worker
+   sharded per `project_perf_push_2026_05_21`; ~100k readonly floor
+   per `project_kv_read_txn_per_op`). Compare to recent peak, never
+   an old baseline — memory `feedback_regression_baseline_current_peak`.
+5. **Every phase is independently shippable and reversible.**
+
+## 6. Phase history (all shipped or cancelled)
+
+| Phase | What | When |
+|---|---|---|
+| **0** | Inventory + baseline numbers in §4's table | 2026-05-22, tree at `90e2847` |
+| **1** | Reify vocabulary — `effect/cmd.zig` + `effect/msg.zig` skeletons | shipped |
+| **2** | Reify Msg ingress — unified `MsgQueue` + `enqueueMsg`; closed #1 fetch-A taping bug, #3 uneven backpressure | shipped |
+| **3** | Reify Continuation + reconciler — generalized `drainRaftPending` to the universal park/wake/resume primitive; three siblings for the resume engines | shipped |
+| **4.0.b** | Commit-gated stream chunks — resume-hop chunks stage on entity until writeset commits, then move into `StreamChunks` | 2026-05-22 |
+| **4.1.1** | Typed Cmd union + `interpretCmd` exhaustive switch | 2026-05-24 |
+| **4.1.2** | `http_fetch` staging — closes the marker-commit race | 2026-05-24 |
+| **4.1.3** | `respond` Cmd routes H2 entity commit-move through `interpretCmd` | 2026-05-24 |
+| **4.1.4** | `conn_write` Cmd slot — **DEFERRED to inbound-WS** ([`websocket-plan.md`](websocket-plan.md)); don't park typed slots without producers | — |
+| **5** | Retire `http.send` as a Zig primitive; durability becomes JS-shim composition. ~4.7 kLOC Zig deleted | 2026-05-24, `b908953` |
+| **6** | Cleanup tail — delete `src/connection_holder/`, move `cron_state` to a rove collection, resolve boot UNCLEAR (was already correct), rewrite effect-algebra §5/§6/§7, sweep CLAUDE.md dispatch wording | 2026-05-27 |
+| **7** | Collapse `files-server` into Cmds + in-process compile worker — **CANCELLED** 2026-05-27. Files-server stays as a separate binary; customer-facing blob primitives deferred until concrete demand. |
+| **3.5** | `WakeKey` index for O(1) cross-worker wake routing — **DEFERRED** (no trigger yet; per-worker scan isn't measured hot). Reactivate when connection-actor cross-worker work lands or measurement shows it. |
+
+Per-phase commit messages on `effect-reification` branch have the
+implementation detail.
 
 ## 7. Test & perf strategy
 
-Per memory `user_freeze_workflow`: reification modifies shipped,
-smoke-tested code — this is **test-first** work. Each phase: confirm the
-gating smoke pins current behavior, refactor, prove green.
+Per memory `user_freeze_workflow`: reification modified shipped,
+smoke-tested code — this was **test-first** work. Each phase confirmed
+the gating smoke pinned current behavior, refactored, proved green.
 
-**Gating smoke set** (all must stay green every phase):
-`leader_failover_smoke.py`, `heldsync_smoke.py`, `http_send_smoke.py`
-(now the webhook.send JS-shim path), the streaming smokes,
-`ctl_smoke.py`, `oidc_smoke.py`,
+**Gating smoke set** (stayed green every phase): `leader_failover_smoke.py`,
+`heldsync_smoke.py`, `http_send_smoke.py` (now the webhook.send JS-shim
+path), the streaming smokes, `ctl_smoke.py`, `oidc_smoke.py`,
 `readonly_speculation_faultinj_smoke.py`.
 
-**Perf gate**: kv-bench hot single-tenant + 8w sharded, every phase that
-touches the dispatch path (3, 4, 5). Abort the phase on regression vs the
-Phase-0 baseline.
+**Perf gate**: kv-bench hot single-tenant + 8w sharded, every phase
+touching the dispatch path (3, 4, 5). All phases stayed within +/- of
+the Phase-0 baseline.
 
-## 8. Risks
+## 8. Risks (retired)
 
-- **The dragon.** The reconciler generalizes the speculative-apply core
-  every H2 request depends on. Mitigation: H2-reference-first,
-  byte-identical, proven before any non-H2 registrant (Invariant 1).
-- **The Stage-5 precedent.** Apply-after-replicate regressed and was
-  reverted (`project_kv_batched_dispatch`). Reification must gate effect
-  *release*, not KV *visibility* (Invariant 2). If a phase needs to
-  change visibility timing to work, stop — the design is wrong.
-- **Merge collision with `streaming-model`.** Mitigated by the hard
-  prerequisite: do not start Phase 1 until that branch merges.
+- ~~**The dragon.**~~ The reconciler generalized the speculative-apply
+  core every H2 request depends on. Mitigated via H2-reference-first,
+  byte-identical, proven before any non-H2 registrant. No regression.
+- ~~**The Stage-5 precedent.**~~ Reification gated effect *release*,
+  not KV *visibility*. Invariant 2 held; no Stage-5-class regression.
+- ~~**Merge collision with `streaming-model`.**~~ Mitigated by
+  prerequisite ordering.
 
 ## 9. Out of scope
 
-- Streaming inbound body (gap 2.4) and connection-actor WebSocket (gap
-  2.5) — NOT BUILT; reification does not build them, it makes them cheap
-  *declarations* once someone does.
-- No customer-observable behavior change, with two deliberate
-  exceptions, both correctness: fetch-A becomes replayable (#1), and the
-  streaming pre-commit semantics become explicit (#2).
-
-## 10. First session (cold start)
-
-**Current state (2026-05-24):** Phases 0 through 5 fully shipped
-on the `effect-reification` branch. See `git log
-main..effect-reification`. Phase 5 PR-3 (atomic flip at
-`b908953`) deleted ~4.7 kLOC of Zig (`send_dispatch` +
-`send_inflight` + `send_outbox` + `callback_dispatch`) and made
-`webhook.send` a JS-shim composition over `kv.set + http.fetch +
-__system/webhook_onresult`. All five in-tree `http.send` callers
-(oidc, oauth, activitypub, retry, email) migrated to
-`webhook.send`. `jsHttpSend` binding deleted.
-
-**Next active piece: Phase 4.1** — the generalized commit-gated
-Cmd buffer (extending Phase 4.0.b's stream-chunk staging to ALL
-Cmd kinds: `http.fetch` enqueues, `events.emit`, etc.). The
-forcing function is the PR-3 close-out finding (§6 Phase 5 PR-3,
-finding #5): `webhook.send` had to drop its inline `http.fetch`
-fire because the marker-commit race let the fetch return before
-the writeset committed via raft, breaking the chain to the
-customer's `on_result`. The sweep-only mitigation works but adds
-~1s first-fire latency. Phase 4.1's commit-gated buffer restores
-inline fire without the race — every Cmd stages on the handler's
-`ParkedUnit` and releases at raft commit, fails-cleanly on fault.
-
-Smaller follow-ups also unblocked by PR-3:
-
-- **Phase 5 PR-4** — bikeshed rename `FetchPool` →
-  `OutboundHttpPool`. Trivial.
-- **Phase 6 cleanup tail** — delete `src/connection_holder/`
-  dead scaffold; move `cron_state` to a collection (algebra
-  worklist #5); resolve boot double-fire UNCLEAR (worklist #6);
-  rewrite `effect-algebra.md §5` audit + §6 to reflect the
-  reified state; update `CLAUDE.md` if dispatch wording drifted.
-
-Deferred (no trigger yet):
-
-- **Phase 3.5** — `WakeKey` index for O(1) cross-worker wake
-  routing. Worker-local scan isn't measured hot;
-  reactivate when connection-actor cross-worker lands or
-  measurement shows the scan as a bottleneck.
-
-If picking up a different sub-phase entirely:
-
-1. Read `docs/effect-algebra.md`, then this doc — especially §3.3 +
-   §4 for the Option-A/B framing.
-2. Check `git log main..effect-reification` for the current branch
-   state — every shipped phase has a commit message explaining what
-   landed.
-3. The branch is off `main` at `90e2847` (the Phase 0 baseline tree).
-
-Historic cold-start (Phase 0, archived):
-
-> Execute Phase 0: fill the §4 table with exact `file:line`;
-> determine the Option-B `ParkedUnit` migration state; run the §7
-> smoke set and kv-bench; record the baseline numbers and the
-> inventory back into this doc.
-
-Phase 0 shipped — its results are above. Use the "current state"
-section above for resumption.
+- **Streaming inbound body (gap 2.4)** — NOT BUILT; design locked in
+  `streaming-model.md` §3. Reification made it a cheap declaration
+  when someone ships the h2 chunk delivery wire-up.
+- **Connection-actor WebSocket (gap 2.5 inbound)** — NOT BUILT; see
+  [`websocket-plan.md`](websocket-plan.md). `conn_write` Cmd slot adds
+  when the inbound-WS producer ships.
+- **Phase 7 files-server collapse** — cancelled 2026-05-27. Files-server
+  stays as a separate binary; customer-facing `blob.put` / `blob.get`
+  primitives deferred until concrete demand.
