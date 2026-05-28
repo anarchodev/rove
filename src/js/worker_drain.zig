@@ -1180,6 +1180,13 @@ fn resumeContinuation(
             );
             txn_done = true;
 
+            // Dupe cont_path BEFORE clearing the ContDescriptor —
+            // cont_path borrows into desc.cont.path; the deinit
+            // frees that backing memory and any later read (e.g.
+            // captureLogWithId below) would be use-after-free.
+            const cont_path_for_log = allocator.dupe(u8, cont_path) catch &.{};
+            defer if (cont_path_for_log.len > 0) allocator.free(cont_path_for_log);
+
             // Clear the stale ContDescriptor (the chain is no
             // longer a cont). ChainContext stays.
             const stale_desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch null;
@@ -1206,7 +1213,7 @@ fn resumeContinuation(
                 for (stream_kv_prefixes) |p| allocator.free(p);
                 if (stream_kv_prefixes.len > 0) allocator.free(stream_kv_prefixes);
                 resolveParked(worker, ent, sid, sess, 500, "stream resume header build failed\n") catch {};
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, correlation_id, .send_callback, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_for_log, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, correlation_id, .send_callback, 0);
                 return;
             };
             for (parsed_headers) |h| { allocator.free(h.name); allocator.free(h.value); }
@@ -1240,9 +1247,16 @@ fn resumeContinuation(
                 .kv_prefixes = stream_kv_prefixes,
             }) catch {};
 
-            server.reg.move(ent, &worker.parked_continuations, &server.stream_response_in) catch |merr|
+            // moveImmediate so subsequent fetch chunks arriving in
+            // the same worker tick see the entity in
+            // stream_response_in (chunks 0..N from the same bound
+            // fetch typically arrive in one batch — see Gap #1
+            // smoke). reg.move (deferred) would leave the entity in
+            // parked_continuations until the next flush, causing
+            // chunks 1+ to dispatch against stale state.
+            server.reg.moveImmediate(ent, &worker.parked_continuations, &server.stream_response_in) catch |merr|
                 std.log.warn("rove-js cont→stream move: {s}", .{@errorName(merr)});
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, .send_callback, 0);
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_for_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, .send_callback, 0);
         },
     }
 }
@@ -1621,6 +1635,13 @@ pub fn resumeBoundFetchChain(
                 .{@errorName(e)},
             );
             txn_done = true;
+            // Dupe cont_path BEFORE deinit'ing the ContDescriptor —
+            // cont_path borrows into desc.cont.path; the deinit
+            // below frees it, and a later captureLogWithId would
+            // read freed memory. The dupe gives us a stable slice
+            // for log + cleanup. Free at end of arm.
+            const cont_path_for_log = allocator.dupe(u8, cont_path) catch &.{};
+            defer if (cont_path_for_log.len > 0) allocator.free(cont_path_for_log);
             const stale_desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch null;
             if (stale_desc) |d| {
                 if (d.cont) |*old_c| old_c.deinit(allocator);
@@ -1669,9 +1690,12 @@ pub fn resumeBoundFetchChain(
                 .next_wake_ns = next_wake_ns,
                 .kv_prefixes = stream_kv_prefixes,
             }) catch {};
-            server.reg.move(ent, &worker.parked_continuations, &server.stream_response_in) catch |merr|
+            // moveImmediate — same reasoning as resumeContinuation's
+            // .stream arm: subsequent bound-fetch chunks arriving in
+            // the same worker tick need to see the new collection.
+            server.reg.moveImmediate(ent, &worker.parked_continuations, &server.stream_response_in) catch |merr|
                 std.log.warn("rove-js bound-fetch stream move: {s}", .{@errorName(merr)});
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, .fetch_chunk, 0);
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_for_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, .fetch_chunk, 0);
         },
     }
 }
