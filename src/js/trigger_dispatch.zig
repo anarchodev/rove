@@ -66,9 +66,9 @@ fn loadTriggerModuleNs(
     }
 
     const map = state.bytecodes orelse return null;
-    const bytes = map.get(module_path) orelse return null;
+    const bb = map.get(module_path) orelse return null;
 
-    const obj = c.JS_ReadObject(ctx, bytes.ptr, bytes.len, c.JS_READ_OBJ_BYTECODE);
+    const obj = c.JS_ReadObject(ctx, bb.bytes.ptr, bb.bytes.len, c.JS_READ_OBJ_BYTECODE);
     if (c.JS_IsException(obj)) {
         _ = c.JS_GetException(ctx); // discard
         return null;

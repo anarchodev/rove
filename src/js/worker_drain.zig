@@ -336,13 +336,13 @@ pub fn resolveDeployment(
     const inst = (worker.node.tenant.getInstance(tenant_id) catch return error.ResumeNoInstance) orelse
         return error.ResumeNoInstance;
     const bc = blk: {
-        if (tc.snap.bytecodes.get(module_path)) |b| break :blk b;
+        if (tc.snap.bytecodes.get(module_path)) |bb| break :blk bb.bytes;
         const mjs = try std.fmt.allocPrint(allocator, "{s}.mjs", .{module_path});
         defer allocator.free(mjs);
-        if (tc.snap.bytecodes.get(mjs)) |b| break :blk b;
+        if (tc.snap.bytecodes.get(mjs)) |bb| break :blk bb.bytes;
         const js = try std.fmt.allocPrint(allocator, "{s}.js", .{module_path});
         defer allocator.free(js);
-        if (tc.snap.bytecodes.get(js)) |b| break :blk b;
+        if (tc.snap.bytecodes.get(js)) |bb| break :blk bb.bytes;
         // Phase 5 PR-2b: `__system/<name>` falls through to the
         // node-level built-in registry. Bytecode compiled once at
         // NodeState init from sources baked into the binary; shared

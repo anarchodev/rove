@@ -28,6 +28,7 @@ const cont_b = @import("bindings/continuation.zig");
 const stream_b = @import("bindings/stream.zig");
 const td = @import("trigger_dispatch.zig");
 const reserved = @import("reserved.zig");
+const bytecode_cache_mod = @import("bytecode_cache.zig");
 
 
 const c = qjs.c;
@@ -272,7 +273,7 @@ pub const DispatchState = struct {
     /// their `_triggers/.../index.{mjs,js}` paths. Needed by the
     /// trigger fire path to load module bytecode lazily on first
     /// fire and look up named exports.
-    bytecodes: ?*const std.StringHashMapUnmanaged([]u8) = null,
+    bytecodes: ?*const std.StringHashMapUnmanaged(*bytecode_cache_mod.BlobBytes) = null,
     /// Cascade depth: how many trigger frames are currently on the
     /// JS call stack. 0 = user-initiated write. Incremented before
     /// a trigger fires, decremented after. Throws if a fire would

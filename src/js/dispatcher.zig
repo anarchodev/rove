@@ -21,6 +21,8 @@ const h2 = @import("rove-h2");
 const log_mod = @import("rove-log");
 
 const globals = @import("globals.zig");
+const bytecode_cache_mod = @import("bytecode_cache.zig");
+const BlobBytes = bytecode_cache_mod.BlobBytes;
 const limiter_mod = @import("limiter.zig");
 const continuation_mod = @import("bindings/continuation.zig");
 const stream_mod = @import("bindings/stream.zig");
@@ -464,10 +466,10 @@ pub const Dispatcher = struct {
     ///     `response` global (`response.status = 404`, etc.). Body is
     ///     NOT settable via `response` — it always comes from return.
     ///
-    /// `bytecodes` is the per-deployment map of path → bytecode bytes
-    /// used by the module loader to resolve `import` statements the
-    /// entry module pulls in. `null` is valid if the entry has no
-    /// imports.
+    /// `bytecodes` is the per-deployment map of path → bytecode lease
+    /// (`*BlobBytes` from `worker.BytecodeCache`) used by the module
+    /// loader to resolve `import` statements the entry module pulls
+    /// in. `null` is valid if the entry has no imports.
     /// The dispatch core. `run` (back-compat: returns `Response`,
     /// collapses `.continuation`→501) wraps this; the
     /// continuation-aware worker path (Phase 3b-ii/iii) calls
@@ -480,7 +482,7 @@ pub const Dispatcher = struct {
         txn: *kv_mod.TrackedTxn,
         writeset: *kv_mod.WriteSet,
         bytecode: []const u8,
-        bytecodes: ?*const std.StringHashMapUnmanaged([]u8),
+        bytecodes: ?*const std.StringHashMapUnmanaged(*BlobBytes),
         source_hashes: ?*const std.StringHashMapUnmanaged([64]u8),
         triggers: ?[]const globals.TriggerEntry,
         request: Request,
@@ -582,8 +584,8 @@ pub const Dispatcher = struct {
         const mw_bytecode_opt: ?[]const u8 = blk: {
             if (request.is_system_module) break :blk null;
             if (bytecodes) |bcs| {
-                if (bcs.get("_middlewares/index.mjs")) |bc| break :blk bc;
-                if (bcs.get("_middlewares/index.js")) |bc| break :blk bc;
+                if (bcs.get("_middlewares/index.mjs")) |bb| break :blk bb.bytes;
+                if (bcs.get("_middlewares/index.js")) |bb| break :blk bb.bytes;
             }
             break :blk null;
         };
@@ -628,7 +630,7 @@ pub const Dispatcher = struct {
         txn: *kv_mod.TrackedTxn,
         writeset: *kv_mod.WriteSet,
         bytecode: []const u8,
-        bytecodes: ?*const std.StringHashMapUnmanaged([]u8),
+        bytecodes: ?*const std.StringHashMapUnmanaged(*BlobBytes),
         source_hashes: ?*const std.StringHashMapUnmanaged([64]u8),
         triggers: ?[]const globals.TriggerEntry,
         request: Request,
@@ -1507,9 +1509,10 @@ pub fn sanitizeSetCookie(
 pub const module_loader = struct {
     pub const Ctx = struct {
         allocator: std.mem.Allocator,
-        /// Path → compiled module bytecode. Null means the caller
-        /// opted out of imports (tests, trivial single-file handlers).
-        bytecodes: ?*const std.StringHashMapUnmanaged([]u8),
+        /// Path → bytecode lease into the node-wide cache. Null
+        /// means the caller opted out of imports (tests, trivial
+        /// single-file handlers).
+        bytecodes: ?*const std.StringHashMapUnmanaged(*BlobBytes),
         /// Path → source-blob hash hex (64 chars). Parallel to
         /// `bytecodes` and populated by the same TenantFiles refresh
         /// path. Read by `load` to populate the module-resolution
@@ -1549,8 +1552,8 @@ pub const module_loader = struct {
         const self: *const Ctx = @ptrCast(@alignCast(opaque_ptr.?));
         const map = self.bytecodes orelse return null;
         const name_s = std.mem.span(name);
-        const bytes = map.get(name_s) orelse return null;
-        const obj = c.JS_ReadObject(ctx, bytes.ptr, bytes.len, c.JS_READ_OBJ_BYTECODE);
+        const bb = map.get(name_s) orelse return null;
+        const obj = c.JS_ReadObject(ctx, bb.bytes.ptr, bb.bytes.len, c.JS_READ_OBJ_BYTECODE);
         if (c.JS_IsException(obj)) return null;
         if (obj.tag != c.JS_TAG_MODULE) {
             c.JS_FreeValue(ctx, obj);
@@ -1711,6 +1714,33 @@ fn jsValueToOwned(
 // ── Tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+/// Phase 3 test fixture helper: the production snapshot stores
+/// bytecodes as `*BlobBytes` leases into the node-wide cache, but
+/// tests run without a NodeState. Each `put` heap-allocates a
+/// `BlobBytes` wrapper that aliases the caller's already-allocated
+/// bytecode slice (the test already has a `defer allocator.free(bc)`
+/// for the bytes themselves); `deinitTestBytecodes` frees the
+/// wrappers.
+fn putTestBytecode(
+    map: *std.StringHashMapUnmanaged(*BlobBytes),
+    key: []const u8,
+    bc: []const u8,
+) !void {
+    const bb = try testing.allocator.create(BlobBytes);
+    bb.* = .{
+        .bytes = @constCast(bc),
+        .hash_hex = [_]u8{'0'} ** 64,
+        .refcount = .{ .raw = 1 },
+    };
+    try map.put(testing.allocator, key, bb);
+}
+
+fn deinitTestBytecodes(map: *std.StringHashMapUnmanaged(*BlobBytes)) void {
+    var it = map.iterator();
+    while (it.next()) |e| testing.allocator.destroy(e.value_ptr.*);
+    map.deinit(testing.allocator);
+}
 
 test "sanitizeSetCookie strips Domain attribute" {
     const a = testing.allocator;
@@ -3003,9 +3033,9 @@ fn runWithMiddleware(
     const mw_bc = try ctx.compileToBytecode(middleware_src, "_middlewares/index.mjs", testing.allocator, .{ .kind = .module });
     defer testing.allocator.free(mw_bc);
 
-    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
-    defer bytecodes.deinit(testing.allocator);
-    try bytecodes.put(testing.allocator, "_middlewares/index.mjs", @constCast(mw_bc));
+    var bytecodes: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
+    defer deinitTestBytecodes(&bytecodes);
+    try putTestBytecode(&bytecodes, "_middlewares/index.mjs", mw_bc);
 
     var txn = try kv.beginTrackedImmediate();
     errdefer txn.rollback() catch {};
@@ -5362,9 +5392,9 @@ test "trigger: afterPut fires after a kv.set inside the handler" {
     , "_triggers/users/sessions/index.mjs", testing.allocator, .{ .kind = .module });
     defer testing.allocator.free(trigger_bc);
 
-    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
-    defer bytecodes.deinit(testing.allocator);
-    try bytecodes.put(testing.allocator, "_triggers/users/sessions/index.mjs", trigger_bc);
+    var bytecodes: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
+    defer deinitTestBytecodes(&bytecodes);
+    try putTestBytecode(&bytecodes, "_triggers/users/sessions/index.mjs", trigger_bc);
 
     const triggers = [_]globals.TriggerEntry{.{
         .prefix = @constCast("users/sessions/"),
@@ -5425,9 +5455,9 @@ test "trigger: afterDelete fires with previousValue" {
     , "_triggers/orders/index.mjs", testing.allocator, .{ .kind = .module });
     defer testing.allocator.free(trigger_bc);
 
-    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
-    defer bytecodes.deinit(testing.allocator);
-    try bytecodes.put(testing.allocator, "_triggers/orders/index.mjs", trigger_bc);
+    var bytecodes: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
+    defer deinitTestBytecodes(&bytecodes);
+    try putTestBytecode(&bytecodes, "_triggers/orders/index.mjs", trigger_bc);
 
     const triggers = [_]globals.TriggerEntry{.{
         .prefix = @constCast("orders/"),
@@ -5495,10 +5525,10 @@ test "trigger: tree-traversal order — outer + inner both fire on AFTER" {
     , "_triggers/users/index.mjs", testing.allocator, .{ .kind = .module });
     defer testing.allocator.free(outer_bc);
 
-    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
-    defer bytecodes.deinit(testing.allocator);
-    try bytecodes.put(testing.allocator, "_triggers/users/sessions/index.mjs", inner_bc);
-    try bytecodes.put(testing.allocator, "_triggers/users/index.mjs", outer_bc);
+    var bytecodes: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
+    defer deinitTestBytecodes(&bytecodes);
+    try putTestBytecode(&bytecodes, "_triggers/users/sessions/index.mjs", inner_bc);
+    try putTestBytecode(&bytecodes, "_triggers/users/index.mjs", outer_bc);
 
     // Sorted longest-first → forward iteration is innermost-first.
     const triggers = [_]globals.TriggerEntry{
@@ -5558,9 +5588,9 @@ test "trigger: cascade depth limit halts runaway recursion" {
     , "_triggers/loop/index.mjs", testing.allocator, .{ .kind = .module });
     defer testing.allocator.free(trigger_bc);
 
-    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
-    defer bytecodes.deinit(testing.allocator);
-    try bytecodes.put(testing.allocator, "_triggers/loop/index.mjs", trigger_bc);
+    var bytecodes: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
+    defer deinitTestBytecodes(&bytecodes);
+    try putTestBytecode(&bytecodes, "_triggers/loop/index.mjs", trigger_bc);
 
     const triggers = [_]globals.TriggerEntry{.{
         .prefix = @constCast("loop/"),
@@ -5616,9 +5646,9 @@ test "trigger: platform-key writes do not fire customer triggers" {
     , "_triggers/index.mjs", testing.allocator, .{ .kind = .module });
     defer testing.allocator.free(trigger_bc);
 
-    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
-    defer bytecodes.deinit(testing.allocator);
-    try bytecodes.put(testing.allocator, "_triggers/index.mjs", trigger_bc);
+    var bytecodes: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
+    defer deinitTestBytecodes(&bytecodes);
+    try putTestBytecode(&bytecodes, "_triggers/index.mjs", trigger_bc);
 
     const triggers = [_]globals.TriggerEntry{.{
         .prefix = @constCast(""),
@@ -5679,9 +5709,9 @@ test "trigger: beforePut throw is catchable in handler with code='trigger_reject
     , "_triggers/users/sessions/index.mjs", testing.allocator, .{ .kind = .module });
     defer testing.allocator.free(trigger_bc);
 
-    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
-    defer bytecodes.deinit(testing.allocator);
-    try bytecodes.put(testing.allocator, "_triggers/users/sessions/index.mjs", trigger_bc);
+    var bytecodes: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
+    defer deinitTestBytecodes(&bytecodes);
+    try putTestBytecode(&bytecodes, "_triggers/users/sessions/index.mjs", trigger_bc);
 
     const triggers = [_]globals.TriggerEntry{.{
         .prefix = @constCast("users/sessions/"),
@@ -5740,9 +5770,9 @@ test "trigger: beforePut return-value mutates the written value" {
     , "_triggers/users/index.mjs", testing.allocator, .{ .kind = .module });
     defer testing.allocator.free(trigger_bc);
 
-    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
-    defer bytecodes.deinit(testing.allocator);
-    try bytecodes.put(testing.allocator, "_triggers/users/index.mjs", trigger_bc);
+    var bytecodes: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
+    defer deinitTestBytecodes(&bytecodes);
+    try putTestBytecode(&bytecodes, "_triggers/users/index.mjs", trigger_bc);
 
     const triggers = [_]globals.TriggerEntry{.{
         .prefix = @constCast("users/"),
@@ -5803,9 +5833,9 @@ test "trigger: beforePut throw rolls back trigger-internal writes (the audit got
     , "_triggers/orders/index.mjs", testing.allocator, .{ .kind = .module });
     defer testing.allocator.free(trigger_bc);
 
-    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
-    defer bytecodes.deinit(testing.allocator);
-    try bytecodes.put(testing.allocator, "_triggers/orders/index.mjs", trigger_bc);
+    var bytecodes: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
+    defer deinitTestBytecodes(&bytecodes);
+    try putTestBytecode(&bytecodes, "_triggers/orders/index.mjs", trigger_bc);
 
     const triggers = [_]globals.TriggerEntry{.{
         .prefix = @constCast("orders/"),
@@ -5868,9 +5898,9 @@ test "trigger: afterPut throw is catchable AND rolls back the originating write"
     , "_triggers/orders/index.mjs", testing.allocator, .{ .kind = .module });
     defer testing.allocator.free(trigger_bc);
 
-    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
-    defer bytecodes.deinit(testing.allocator);
-    try bytecodes.put(testing.allocator, "_triggers/orders/index.mjs", trigger_bc);
+    var bytecodes: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
+    defer deinitTestBytecodes(&bytecodes);
+    try putTestBytecode(&bytecodes, "_triggers/orders/index.mjs", trigger_bc);
 
     const triggers = [_]globals.TriggerEntry{.{
         .prefix = @constCast("orders/"),
@@ -5936,10 +5966,10 @@ test "trigger: BEFORE chain runs outermost-first (broad validates before narrow)
     , "_triggers/users/index.mjs", testing.allocator, .{ .kind = .module });
     defer testing.allocator.free(outer_bc);
 
-    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
-    defer bytecodes.deinit(testing.allocator);
-    try bytecodes.put(testing.allocator, "_triggers/users/sessions/index.mjs", inner_bc);
-    try bytecodes.put(testing.allocator, "_triggers/users/index.mjs", outer_bc);
+    var bytecodes: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
+    defer deinitTestBytecodes(&bytecodes);
+    try putTestBytecode(&bytecodes, "_triggers/users/sessions/index.mjs", inner_bc);
+    try putTestBytecode(&bytecodes, "_triggers/users/index.mjs", outer_bc);
 
     // Sorted longest-first → reverse iteration is outermost-first
     // (correct for BEFORE chain).
@@ -6003,9 +6033,9 @@ test "trigger: default export is the catchall when no named export matches" {
     , "_triggers/orders/index.mjs", testing.allocator, .{ .kind = .module });
     defer testing.allocator.free(trigger_bc);
 
-    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
-    defer bytecodes.deinit(testing.allocator);
-    try bytecodes.put(testing.allocator, "_triggers/orders/index.mjs", trigger_bc);
+    var bytecodes: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
+    defer deinitTestBytecodes(&bytecodes);
+    try putTestBytecode(&bytecodes, "_triggers/orders/index.mjs", trigger_bc);
 
     const triggers = [_]globals.TriggerEntry{.{
         .prefix = @constCast("orders/"),
@@ -6070,9 +6100,9 @@ test "trigger: BEFORE sees previousValue on update" {
     , "_triggers/docs/index.mjs", testing.allocator, .{ .kind = .module });
     defer testing.allocator.free(trigger_bc);
 
-    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
-    defer bytecodes.deinit(testing.allocator);
-    try bytecodes.put(testing.allocator, "_triggers/docs/index.mjs", trigger_bc);
+    var bytecodes: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
+    defer deinitTestBytecodes(&bytecodes);
+    try putTestBytecode(&bytecodes, "_triggers/docs/index.mjs", trigger_bc);
 
     const triggers = [_]globals.TriggerEntry{.{
         .prefix = @constCast("docs/"),
@@ -6142,10 +6172,10 @@ test "trigger: well-bounded cascade (depth 2, no runaway)" {
     , "_triggers/b/index.mjs", testing.allocator, .{ .kind = .module });
     defer testing.allocator.free(b_trigger_bc);
 
-    var bytecodes: std.StringHashMapUnmanaged([]u8) = .empty;
-    defer bytecodes.deinit(testing.allocator);
-    try bytecodes.put(testing.allocator, "_triggers/a/index.mjs", a_trigger_bc);
-    try bytecodes.put(testing.allocator, "_triggers/b/index.mjs", b_trigger_bc);
+    var bytecodes: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
+    defer deinitTestBytecodes(&bytecodes);
+    try putTestBytecode(&bytecodes, "_triggers/a/index.mjs", a_trigger_bc);
+    try putTestBytecode(&bytecodes, "_triggers/b/index.mjs", b_trigger_bc);
 
     const triggers = [_]globals.TriggerEntry{
         .{ .prefix = @constCast("a/"), .module_path = @constCast("_triggers/a/index.mjs") },
