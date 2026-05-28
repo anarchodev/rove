@@ -91,11 +91,20 @@ pub fn getOrOpenTenantLog(
 // scalars are stamped onto arenajs's per-context state by the
 // dispatcher (`JS_SetRandomSeed` + `JS_SetDateNow`).
 
-/// Maximum captured body length (request OR response). Anything
-/// bigger gets truncated to this prefix and the corresponding
-/// `*_truncated` flag set on the log record's tape payloads. Mirrors
-/// PLAN §2.4's body-cap default.
-pub const REQUEST_BODY_CAP: usize = 256 * 1024;
+/// Body-size threshold for inlining `request_body` / `activation_bytes`
+/// directly into the LogRecord (vs leaving the caller to retrieve via
+/// the readset's BodyRef on demand).
+///
+/// Matches `worker_dispatch.INBOUND_INLINE_THRESHOLD` (16 KB) — the
+/// same threshold that gates inline-in-raft-entry for inbound bodies.
+/// Bodies ≤ this cap ride inline in the LogRecord (also tiny, and
+/// already inline in the raft entry, so the duplicate is cheap and
+/// survives raft compaction via the log batch's separate retention).
+/// Bodies > this cap are NOT inlined into the LogRecord — they live
+/// in BlobBackend via the readset's BodyRef, and the dashboard /
+/// replay fetches on demand. Eliminates the pre-2026-05-27
+/// "inline up to 256 KB into the log record" duplicate path.
+pub const REQUEST_BODY_CAP: usize = 16 * 1024;
 
 /// Serialize each non-empty tape into the request's `TapePayloads`,
 /// owned by the caller's allocator. The bytes ride inline in the
@@ -146,19 +155,19 @@ pub fn captureTapes(
 
     // Request body — captured into the log record so the replay
     // shell's `request.body` is non-empty for POST / PUT requests.
-    // Bodies bigger than `REQUEST_BODY_CAP` get truncated to that
-    // prefix; the truncation flag is preserved so the simulator (and
-    // the replay shell) know the captured bytes are a prefix.
+    // Bodies ≤ `REQUEST_BODY_CAP` (16 KB) ride inline; larger bodies
+    // are NOT inlined here. They live in BlobBackend via the
+    // readset's `trigger_payload` BodyRef; the dashboard / replay
+    // fetches on demand. `request_body_truncated` is never set on
+    // this path (large bodies are absent, not truncated).
     //
     // Response body is intentionally NOT captured: deterministic
     // replay re-produces the response by re-running the handler with
     // the same request body + tapes, so storing the original would
     // be pure duplication on every S3 batch PUT.
-    if (request_body.len > 0) {
-        const captured_len = @min(request_body.len, REQUEST_BODY_CAP);
-        if (allocator.dupe(u8, request_body[0..captured_len])) |captured| {
+    if (request_body.len > 0 and request_body.len <= REQUEST_BODY_CAP) {
+        if (allocator.dupe(u8, request_body)) |captured| {
             payloads.request_body_bytes = captured;
-            payloads.request_body_truncated = captured_len < request_body.len;
         } else |err| {
             std.log.warn("rove-js request-body capture failed: {s}", .{@errorName(err)});
         }
@@ -170,10 +179,12 @@ pub fn captureTapes(
 /// `captureTapes` + activation-input bytes capture (effect-reification
 /// Phase 2D). Used by activations whose Msg payload carries bytes the
 /// handler reads as `request.activation.bytes` — today only
-/// `fetch_chunk`. The activation bytes ride
-/// `TapePayloads.activation_bytes` (capped at `REQUEST_BODY_CAP`,
-/// mirroring the body capture). L3 (algebra): closes worklist #1 —
-/// every Msg is recorded, including its bytes.
+/// `fetch_chunk`. Same inline rule as `request_body`: bytes ≤
+/// `REQUEST_BODY_CAP` (16 KB) ride inline in
+/// `TapePayloads.activation_bytes`; larger chunks live in BlobBackend
+/// via the readset's `fetch_responses` BodyRef and are fetched on
+/// demand. L3 (algebra): closes worklist #1 — every Msg is recorded
+/// (the BodyRef IS the record for the >16 KB case).
 pub fn captureTapesWithActivation(
     worker: anytype,
     readset: *tape_mod.Readset,
@@ -181,12 +192,10 @@ pub fn captureTapesWithActivation(
     activation_bytes: []const u8,
 ) log_mod.TapePayloads {
     var payloads = captureTapes(worker, readset, request_body);
-    if (activation_bytes.len == 0) return payloads;
+    if (activation_bytes.len == 0 or activation_bytes.len > REQUEST_BODY_CAP) return payloads;
     const allocator = worker.allocator;
-    const captured_len = @min(activation_bytes.len, REQUEST_BODY_CAP);
-    if (allocator.dupe(u8, activation_bytes[0..captured_len])) |captured| {
+    if (allocator.dupe(u8, activation_bytes)) |captured| {
         payloads.activation_bytes = captured;
-        payloads.activation_bytes_truncated = captured_len < activation_bytes.len;
     } else |err| {
         std.log.warn("rove-js activation-bytes capture failed: {s}", .{@errorName(err)});
     }
