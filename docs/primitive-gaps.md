@@ -1,15 +1,14 @@
 # Primitive gaps — proposals for systematic removal
 
-**Status:** Catalog. No code yet. Each gap below is paired with an
-additive option (a new Msg/Cmd/Effect variant grafted onto the
-existing model) and a decomposition option (reshape an existing
-primitive so the gap becomes a parametric case of it). The
-recommendation column picks one per gap; the sequencing section
-proposes an order.
-
+**Status:** All five gaps DONE or design-locked (2026-05-20 → 2026-05-27).
 Streaming gaps (2.3 / 2.4 / 2.5) consolidated under
-`docs/streaming-model.md`; remaining gaps are sized for in-tree
-implementation without further design docs.
+`docs/streaming-model.md`. Tape-minimization arc: §6 considered-and-
+removed; §7 design-only (unbuilt — gated on customer LLM-stream demand);
+§7.4 cancelled with effect-reification Phase 7; §8 + §9 shipped
+2026-05-26; §10 summarizes. The load-bearing value is §4
+(do-not-re-propose), §5 (cross-cutting constraint), §7 (the design for
+streamed-byte capture when LLM-replay matters), and §10 (the four-kind
+minimal tape).
 
 ---
 
@@ -35,131 +34,39 @@ the gap is a parametric case.
 
 ### 2.1 Chain origins without an inbound request — **DONE 2026-05-20**
 
-**Shipped.** Three chain-origin kinds:
+Three chain-origin kinds shipped:
 
-- **kv-react** — apply-time hook fires on the worker that
-  committed the writeset; leader-only by construction.
-- **boot** — `NodeState` cross-thread inbox + leadership-gained
-  sweep; marker injected into handler's writeset for atomicity.
+- **kv-react** — apply-time hook fires on the worker that committed
+  the writeset; leader-only by construction.
+- **boot** — `NodeState` cross-thread inbox + leadership-gained sweep;
+  `_boot_fired/<dep_id>` marker injected into handler's writeset for
+  atomicity (single-fire even across leader change).
 - **cron** — throttled 1Hz in-memory sweep on worker 0 + leader;
-  `next_fire_at_ns` per `<tenant>|<name>` is NOT raft-replicated
-  (leader change resets the clock by design — missed-tick
-  tolerance over false-fidelity).
+  `next_fire_at_ns` lives on a `CronState` rove collection
+  (effect-reification Phase 6); not raft-replicated, leader change
+  resets the clock by design (missed-tick tolerance over false fidelity).
 
-All three share one collection (`subscription_fire_pending`) +
-one fire path (`fireSubscriptionActivation` via the worker's own
-dispatcher). The 3 smokes (`streaming_subscription_{boot,kv,cron}_smoke.py`)
-gate each path. 12 streaming smokes + heldsync green.
-
-Original motivation + recommendation below for the record.
-
-**Motivation.** Today every chain begins with an `inbound_request`
-Msg — even cron runs (`http.send({url:self, fire_at_ns})` is an
-`inbound_request` to your own endpoint) and kv-wake reactivity
-(only fires against an *already-parked* stream that was opened by
-an inbound request). The "fire-and-forget multi-step state
-machine" use case — react to a kv write with no client connected;
-run a background reconciler on a timer; consume jobs from an inbox
-prefix — has no first-class shape. Streaming-handlers-plan §5
-documents this as designed and §5/§6 of the unified activation
-model anticipates it, but only inbound-rooted chains are built.
-
-**Sub-shapes:**
-
-- `cron` — fire module M at schedule S (one-shot or recurring).
-- `kv-react` — fire module M when any key under prefix P is
-  put/deleted (matches the §4.6 wake but originating, not resuming).
-- `boot` — fire module M once on deployment activation (run-once
-  migrations, index rebuilds).
-
-**Additive (option A).** Add an `activation_source` to the inbound
-dispatcher: a per-tenant manifest at `_subscriptions/{name}` →
-`{wake: WakeSpec, module: Path}`. Apply-time matches the same way
-parked-stream wakes do (`src/js/worker_dispatch.zig` kv-wake
-fan-out scan) but instead of resuming a parked chain, it spawns a
-fresh chain with no held entity. Msg variants stay the five;
-chain origin is just one more entry in the activation-source
-union.
-
-**Decomposition (option B).** Realize that a parked stream watching
-prefix P with no chunks ever flushed IS the registration. Lift
-`_subscriptions/{name}` to be a synthetic "permanently-parked
-stream" the runtime owns — registration writes a stream entity to
-`parked_streams_active` directly (not via inbound). The §3.3
-`__rove_stream` first-hop becomes the registration mechanism: a
-deploy hook calls `subscribe(prefix, module)` which writes the
-entity. Same code path as customer-arbitrary SSE, just with no
-client socket.
-
-**Recommendation: A.** Decomposition (B) tangles deploy-time
-registration into the per-request dispatcher in a way that obscures
-both ("why is there a parked stream with no socket?"). A is the
-honest framing — a chain origin is a different category from a
-chain resume; making it explicit costs a small registration
-manifest and clarifies the lifecycle (no socket, no disconnect Msg,
-no `__rove_next` because there's nothing to flush).
-
-**Blast radius.** New per-tenant manifest, new apply-time
-registration scan (folds into the existing kv-wake fan-out scan,
-keyed differently). One new Msg sub-variant or `activation.kind`
-value (`subscription_fire`). No customer JS surface change
-(handlers see `request.activation.kind = "kv" | "timer" | "boot"`
-as today). `__rove_next` / `__rove_stream` from a no-socket
-origin record but don't flush — already specced in §5.
-
-**Composability unlocked:** customer-built cron, customer-built
-queues / inboxes / workflows, customer-built reconcilers,
-deploy-time migrations.
+All three share one collection (`subscription_fire_pending`) + one
+fire path (`fireSubscriptionActivation`). Smokes:
+`streaming_subscription_{boot,kv,cron}_smoke.py`. **Composability
+unlocked:** customer-built cron, queues, inboxes, workflows,
+reconcilers, deploy-time migrations.
 
 ---
 
-### 2.2 Backpressure surfaces — implement what's documented — **DONE 2026-05-20**
+### 2.2 Backpressure surfaces — **DONE 2026-05-20**
 
-**Motivation.** `streaming-handlers-plan.md` §9.4 specifies the
-wake accumulator (cap-K ring, `overflow.lost_oldest`) and
-`write_pressure.dropped_chunks` as the rate-limit surface — both
-are the "notify, refetch" thesis applied to pressure. The shipped
-implementation was "most-recent-wins" (`PendingKvWake` single slot)
-and there was no `write_pressure` field. High-write-rate tenants
-got silently aliased wakes.
+`PendingWakes` ring (K=32) + `lost_oldest` counter on `StreamWakes`;
+`StreamChunks` 256 KB byte cap + `dropped_chunks` counter. The
+activation Msg surface unified `kv|timer` wakes into a single
+`wake_batch` carrying `wakes: [...]` + `overflow.lost_oldest`; every
+wake-driven activation also surfaces `write_pressure.dropped_chunks`.
+Legacy single-slot `PendingKvWake` deleted. Smokes:
+`streaming_overflow_smoke.py` + `streaming_write_pressure_smoke.py`.
+See `project_gap_2_2_backpressure` memory for the commit map.
 
-This was purely a follow-through, not a design question.
-
-**Shipped (Phases A–J, single session).** `PendingWakes` ring
-(K=32) + `lost_oldest` counter on `StreamWakes`; `StreamChunks`
-gained a 256 KB byte cap + `dropped_chunks` counter; the activation
-Msg surface for held streams collapsed from `kv|timer` into a
-unified `wake_batch` carrying `wakes: [{kind:"kv"|"timer", …}]` +
-`overflow.lost_oldest`; every wake-driven activation also surfaces
-`write_pressure.dropped_chunks`. Legacy single-slot `PendingKvWake`
-deleted. Two new smokes (`streaming_overflow_smoke.py`,
-`streaming_write_pressure_smoke.py`) plus the seven existing
-streaming smokes all green. See `project_gap_2_2_backpressure`
-memory for the per-phase commit map.
-
-**Additive (option A).** Replace `PendingKvWake` with `PendingWakes`:
-ring buffer of K (default 32) wake events + a `lost_oldest`
-counter. The activation Msg's `request.activation` grows from `{kv:
-{key, op}}` to `{kind: "wake_batch", wakes: [...], overflow: {...}}`
-when K>1. Existing single-event consumers stay forward-compatible
-because K=1 looks identical (one wake, no overflow).
-
-Chunk queue gets its own bound + `write_pressure.dropped_chunks`
-counter exposed on the next activation's request.
-
-**Decomposition.** N/A — this is implementation.
-
-**Recommendation: A.** Direct port of §9.4.
-
-**Blast radius.** `PendingKvWake` → `PendingWakes` component;
-serviceParkedStreams accumulation logic; smoke test verifying a
-high-write-rate burst surfaces `lost_oldest > 0`. Tape entry
-schema grows the wake-batch shape (replay determinism preserved
-because the batch IS recorded). ~200–300 LOC.
-
-**Composability unlocked:** customers can tell "rate limited" from
-"client slow" from "everything fine" without guessing; refetch
-patterns become unambiguous.
+**Composability unlocked:** customers distinguish "rate limited" from
+"client slow" from "everything fine" without guessing.
 
 ---
 
@@ -332,112 +239,37 @@ already live*:
   page-encryption story, content-addressed-everything), but this
   is relocation, not elimination.
 
-### 7.1 LLM stream tapes (Tier 3, opt-in)
+### 7.1 The LLM stream case — Tier 3, opt-in, not built
 
 Proxying an LLM token stream is the worst Tier-3 case and the most
-valuable one at once. Worst: remote, large, long-lived SSE,
-nothing content-addressed at source. Most valuable: an LLM
-response is **non-reproducible by re-execution** — re-calling the
-API on replay costs money and returns different tokens (even
-providers that expose a `seed` parameter document it as
-best-effort and void it on any model-version change — there is
-no seed we could store and re-run). For a static asset you could
-re-fetch; for an LLM stream the tape is the
-*only* path to a faithful replay. Without it the chain is not
-expensive to replay, it is unreplayable.
+valuable at once. **Non-reproducible by re-execution** — re-calling
+the API on replay costs money and returns different tokens (even
+provider `seed` parameters are best-effort + void on model-version
+change). For an LLM stream, the tape is the *only* path to faithful
+replay. Without it the chain isn't expensive to replay, it's
+unreplayable.
 
-That asymmetry is the product argument: LLM-stream tapes are an
-**opt-in, plausibly billed** primitive — Tier 3 adds a CAS write
-to the streaming hot path, a real cost the customer elects for
-replay fidelity available no other way.
+LLM-stream tape capture is an **opt-in, plausibly billed** primitive
+when it ships — Tier 3 adds a CAS write to the streaming hot path,
+a real cost the customer elects for replay fidelity available no
+other way. Persist-before-observe at chunk grain; local hash + async
+PUT keeps first-token latency intact. Pattern A also needs a
+boundary-offset list since activation sequence depends on network
+chunking; Pattern B is a single whole-body extent.
 
-**"Write to S3 before calling the handler" — per chunk, not per
-stream.** Buffering the whole response before the first activation
-destroys streaming: first-token latency becomes last-token
-latency, defeating the point of streaming an LLM. The faithful
-shape is **persist-before-observe at chunk grain** — each chunk
-lands in CAS before its `on_chunk` activation (Pattern A) or
-before it is forwarded to the held client (Pattern B).
+The retention coupling — a blob referenced by a live tape must be
+pinned against GC — is the only new infrastructure obligation, and
+`rove-files`'s `TenantFilesSnapshot` already does refcount-pinned
+snapshots; this is a refcount edge, not new machinery.
 
-The hot-path cost is contained by computing the hash **locally**
-the instant the chunk is buffered (the tape records the hash at
-once) while the S3 PUT runs **async** in the background — the
-activation is never gated on the PUT. This mirrors rove's
-durability model: local KV commit is fast, raft replication is
-the async tail. Tape durability is gated on the flush completing,
-the way a write's durability is gated on raft commit.
+**Status: design-only, unbuilt.** Trigger to ship: customer with
+real LLM-stream replay demand. Tier 1 (zero-copy extents for
+CAS-sourced `pipe_to`) is a cheap incidental that closes the
+static-serve replay gap if anyone wants it. Tier 2 (Pattern A
+against remote upstream, copy chunk to blob + tape the hash) needs
+no new work — falls out of the per-chunk capture once Tier 3 ships.
 
-### 7.2 Caveats
-
-**Self-containment — losing it is not a regression.** The tape
-records each non-deterministic boundary input in its minimal
-reproducible form, and two forms exist:
-
-- *Generative* — a seed the runtime re-runs to recompute the
-  input (arenajs's deterministic PRNG init; a captured clock
-  read is the degenerate case). The bytes are stored nowhere,
-  the tape stays fully self-contained, total storage shrinks.
-- *Referential* — a `{hash, offset, length}` extent the runtime
-  *resolves* against a content-addressed store. The hash
-  addresses the bytes; it does not generate them, so they must
-  persist in CAS.
-
-An extent is referential. A tape carrying extents replays only
-while those blobs survive — self-containment is genuinely lost.
-But it is lost only for inputs that were never generative to
-begin with (an LLM stream, a remote fetch body): there is no
-self-contained option for non-reproducible external bytes. The
-choice is *inline in the tape* vs *in CAS + hash in tape*, and
-the latter is strictly better — dedup, plus retention as an axis
-separate from tape size. This is picking the better of two
-non-self-contained options, not regressing from a self-contained
-one.
-
-The one real obligation is the retention coupling: a blob
-referenced by a live tape must be pinned against GC. `rove-files`
-already does refcount-pinned snapshots (`TenantFilesSnapshot`),
-so this is a refcount edge, not new infrastructure. Tape size
-(pointer bytes) and blob retention are separate axes — the
-former scales with hash entries, the latter with the bytes those
-hashes name.
-
-**Chunk-boundary determinism splits by pattern.** Boundaries are
-network-timing-non-deterministic.
-
-- **Pattern B (`pipe_to`):** the handler never observes
-  boundaries, so a single whole-body `{hash, offset, length}`
-  extent replays faithfully however the network chunked it. The
-  cleanest tape is for the case that has none today.
-- **Pattern A (`on_chunk`):** the handler gets a Msg per chunk,
-  so the activation sequence depends on the boundaries. The tape
-  must also record the **boundary offset list** — still tiny (a
-  list of ints), but more than one extent.
-
-### 7.3 Recommendation, blast radius
-
-**Recommendation.** Adopt tape-by-reference as the recording
-shape for all streamed bytes; it subsumes §6's per-chunk blob
-pattern. Ship **Tier 1 first** (zero-copy extents for CAS-sourced
-`pipe_to` — closes the static-serve gap for no copy cost, pure
-transport-layer change), then **Tier 3 / LLM** behind a per-call
-opt-in flag with the local-hash / async-flush shape above. Tier 2
-needs no new work.
-
-**Blast radius.** Extent tape-entry type (`{hash, offset,
-length}` + optional boundary-offset list for Pattern A);
-transport-layer recording hook in the `pipe_to` path (no
-activation); refcount edge from live tape → blob; per-call opt-in
-flag + local-hash-then-async-flush staging buffer for Tier 3. The
-replay shell's "re-fetch from blob" affordance generalizes
-to "resolve extent from CAS." No Msg/Cmd surface change; no
-customer JS surface change beyond the Tier-3 flag.
-
-**Composability unlocked:** replayable `pipe_to` proxies,
-replayable static-asset streaming, and full-fidelity LLM-stream
-replay as an opt-in premium — the one streaming case where the
-tape is the sole path to determinism.
-
-### 7.4 ~~Customer-facing blob primitives~~ — canceled with effect-reification Phase 7
+### 7.2 ~~Customer-facing blob primitives~~ — canceled with effect-reification Phase 7
 
 Originally specced as `blob.put` / `blob.get` JS shims giving customer
 handlers direct access to the BlobBackend, with bytes-as-derivable-output
@@ -473,77 +305,21 @@ through to the tape only on miss (foreign-read path).
 overlay writes is fiddly enough that the v1 minimization stops at
 `.get`. Old §8 write-up below.
 
----
+The principle the change rests on: replay re-runs the handler, so the
+tape only needs inputs re-execution *cannot* reproduce. Writes (`.set` /
+`.delete`) are outputs — re-issued by re-running. Own-reads (a `.get`
+of a key in the same activation's writeset) read a value the activation
+itself produced. What remains is the **minimal read set**: gets +
+prefix scans resolving to state committed before the activation began,
+plus date/random/crypto/module channels.
 
-Where §7 minimizes the *bytes* of a taped input, §8 minimizes
-*which operations* are taped at all. The goal: the tape carries
-exactly the minimal read set needed to replay the handler.
+Divergence detection is preserved: a diverging write can only be the
+symptom of a diverging read or bytecode mismatch — both caught by the
+remaining input-channel coverage.
 
-**Current state.** The `.kv` tape channel records every `kv.get`,
-`kv.set`, `kv.delete`, and `kv.prefix` (`src/tape/root.zig`
-`KvOp`; the `appendKv` call sites in `src/js/globals.zig`).
-Writes carry the written value inline; a `kv.get` of a key the
-same activation just wrote is recorded as a full `.get` entry.
-The tape is a complete linear transcript, not a minimal one —
-inherited from shift-js, where the extra entries fed a
-mutation-history view.
-
-**The principle.** Replay re-runs the handler; the tape only
-needs the inputs re-execution *cannot* reproduce. Two classes on
-the `.kv` channel are reproducible, hence redundant:
-
-- **Writes.** `kv.set` / `kv.delete` are *outputs*. Replay
-  re-issues them by re-running the handler; their values are a
-  pure function of the recorded reads + the pinned bytecode (the
-  `.module` channel's source hash). Nothing about a write is a
-  replay input.
-- **Own-reads.** A `kv.get(k)` where `k` is in the activation's
-  own writeset reads a value the activation itself produced —
-  reproducible the same way the write is, not a foreign input.
-
-What remains is the **minimal read set**: gets and prefix scans
-resolving to state *committed before the activation began*. That,
-plus the date / random / crypto / module channels, is the
-complete non-deterministic frontier.
-
-**Capture side.** The activation already accumulates its writeset
-for the raft envelope-0 (`TrackedTxn` + writeset). Gate the
-`.get` tape append on `key ∉ writeset`; drop the `.set` /
-`.delete` appends entirely. One predicate plus two deletions.
-
-**Replay side — the real cost.** Today replay walks the tape
-linearly: each `kv.get` consumes the next `.get` entry. With
-own-reads dropped, replay must model the writeset overlay
-*symmetrically* — re-run the handler, route its `kv.set` /
-`kv.delete` into a scratch overlay, resolve each `kv.get` against
-the overlay first and fall through to the next tape entry only
-when the key is absent. The smarts move from a dumb linear tape
-into the replay engine. Consistent with the model (replay already
-re-runs the handler), but this is the part that is not free.
-
-**The objection it survives — divergence detection.** Writes on
-the tape today let replay diff "did the handler write the same
-value?" That check is redundant: with the `.module` source hash
-pinned and every *read* channel diffable, a write can only
-diverge if a read diverged (caught) or the bytecode differs
-(caught). A diverging write is always a symptom of an upstream
-input or code mismatch — the real guarantee is complete
-input-channel coverage, not a stored output to compare against.
-
-**Wrinkle — `kv.prefix`.** A prefix scan's result is a merge of
-committed rows and the activation's own in-range writes. Truly
-minimal would record only the committed rows and let replay
-re-merge the overlay; that merge logic is fiddly. v1 minimizes
-`.get` only and keeps `.prefix` recording the full result list —
-follow-up, not v1 scope.
-
-**Blast radius.** Capture: one writeset-membership check on the
-`.get` path, remove `.set` / `.delete` appends. Replay: a
-writeset overlay in the replay engine + get-resolution order.
-Tape size drops to a genuinely minimal set, which matters when
-the per-tenant retention/sampling lever (§6) eventually ships. The `KvOp.set` / `.delete` wire variants
-stay readable for old tapes but stop being written. No customer
-surface change.
+`kv.prefix` is unminimized in v1 (the merge of committed rows +
+in-range overlay writes is fiddly). `KvOp.set` / `.delete` wire
+variants stay readable for old tapes but stop being written.
 
 ---
 
@@ -555,67 +331,26 @@ resolved against a store). `math_random` is generative — but only
 if the PRNG is **bit-identical between the capture engine and the
 replay engine**. That precondition is now met.
 
-**Current state.** `Math.random` is already a rove override
-(`jsMathRandom`, `src/js/globals.zig`), not qjs's stock random.
-It draws from `state.prng` — a rove-owned `std.Random` PRNG
-seeded per request — and records *every draw* to the
-`math_random` channel as raw f64 bits (one `MathRandomEntry` per
-call). The seed and the PRNG already exist; the per-call
-recording is the redundant part.
+The principle: `Math.random` is a rove override drawing from a
+rove-owned PRNG seeded per request. Record the **seed**, not the
+draws — replay re-seeds identically and re-runs; every draw
+reproduces bit-for-bit. Same argument as §8's writes: given pinned
+bytecode and faithful other channels, control flow is identical, so
+the PRNG is called the same number of times in the same order. The
+unlock: the WASM replay engine runs rove's *own* JS host compiled to
+WASM (arenajs + globals.zig overrides), so the same PRNG executes
+on replay — value-recording's engine-drift safety isn't lost,
+because both sides ship in lockstep.
 
-**The unlock.** The client replay engine runs rove's JS *host*
-compiled to WASM — arenajs plus the `globals.zig` overrides — so
-the same `jsMathRandom` and the same `state.prng` execute on
-replay. This matters precisely because `Math.random` is a rove
-override: a stock-arenajs replay would run a different PRNG and
-not match. `std.Random` PRNGs are pure integer arithmetic, and
-WASM's integer semantics are bit-identical to native; the
-integer→float scaling is strict IEEE-754 binary64, which WASM
-also mandates. So a draw is reproducible from the per-request
-seed alone.
-
-**The change.** Collapse `math_random` from O(draws) entries to
-**one** — the per-request `state.prng` seed. Replay re-seeds
-`state.prng` identically and re-runs; every draw reproduces
-bit-for-bit. §7.2's generative form, precondition satisfied.
-
-**Why it is safe.** Same argument as §8's writes: given pinned
-bytecode (`.module` source hash) and faithful other channels,
-control flow is identical, so `Math.random` is called the same
-number of times in the same order and the seed reproduces the
-exact sequence. A draw can only diverge if control flow diverged
-— which an upstream channel already catches. Per-draw recording
-buys no divergence coverage the seed does not.
-
-**The caveat — engine coupling.** Value-recording was robust
-against engine drift: a recorded value is the value regardless of
-who replays it. Seed-only is not — it assumes the PRNG algorithm
-is identical on both sides. Two things contain this: the PRNG is
-rove's *own* code, not a third-party black box, so rove controls
-whether it ever changes; and capture and replay ship in lockstep
-(server vX, client vX), so same-version is the normal path.
 Cross-version replay needs an engine/PRNG-version pin on the tape
-header (sibling to the `.module` source-hash pin) — replay warns
-or refuses on mismatch. A PRNG-algorithm change becomes a
+header (sibling to `.module` source-hash). PRNG-algorithm change =
 tape-format version bump.
 
-**`crypto.*` — same shape, check the security framing.**
-`crypto.getRandomValues` / `randomUUID` can move to seed-only on
-the same reasoning *if* rove's crypto RNG is a rove-controlled
-deterministic PRNG. The recorded seed then regenerates the
-"secure" bytes — but the `crypto_random` channel already stores
-those bytes directly, so the secret-in-tape exposure is unchanged
-and page-encryption-at-rest stays the mitigation. Follow-up,
-gated on confirming the crypto path is rove-owned and
-deterministic; `Math.random` is the v1 case.
-
-**Blast radius.** Capture: one seed entry at request start
-instead of per-draw appends. Replay: seed `state.prng` from the
-tape before running. Tape: `math_random` goes O(draws) → O(1);
-the per-draw `MathRandomEntry` wire variant stays readable for
-old tapes. Engine/PRNG-version field on the tape header.
-`Date.now` is unaffected — a clock read is genuinely external,
-not generative, and stays value-recorded.
+`crypto.*` follows the same shape via the seed entry; secret-in-tape
+exposure is unchanged from the prior value-recording (page-encryption
+at rest remains the mitigation). `Date.now` is unaffected — a clock
+read is genuinely external, not generative; stays value-recorded as
+the `timestamp_ns` scalar.
 
 ---
 
