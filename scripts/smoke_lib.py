@@ -178,8 +178,20 @@ def curl(
     headers: Optional[dict[str, str]] = None,
     data: Optional[bytes | str] = None,
     timeout: float = 30.0,
+    follow_redirects: bool = False,
 ) -> HttpResponse:
     args = ctx.args() + ["-D", "-", "-o", "-", "-X", method]
+    if follow_redirects:
+        # Follow up to 5 hops; preserves method on 301/302 so HEAD
+        # stays HEAD across the worker → S3 hop. Used by the static
+        # smoke to verify end-to-end behavior of the worker's 302 +
+        # S3 presigned URL.
+        #
+        # `-k` because the smoke's --cacert only signs the worker's
+        # self-signed cert; when curl follows to a real S3 endpoint
+        # the public-CA chain wouldn't match that bundle. Smokes are
+        # not the place to assert TLS chain validation across hosts.
+        args += ["-L", "--max-redirs", "5", "-k"]
     if headers:
         for k, v in headers.items():
             args += ["-H", f"{k}: {v}"]

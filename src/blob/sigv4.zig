@@ -4,12 +4,18 @@
 //! Pure function — no I/O, no clock, no allocator beyond what
 //! the caller provides for the returned header strings.
 //!
-//! Scope is deliberately narrow: enough for our `S3BlobStore` to
-//! hit OVH / AWS / MinIO / Cloudflare R2 / any S3-compatible
-//! endpoint with `PUT` (with body), `GET`, `HEAD`, `DELETE`. No
-//! query-string signing, no presigned URLs, no chunked uploads.
-//! Signs exactly three headers (`host`, `x-amz-content-sha256`,
-//! `x-amz-date`) — the minimum to satisfy SigV4 + S3 spec.
+//! Two signing modes:
+//! 1. **Header-mode** (`sign`) — `Authorization` + `x-amz-date` +
+//!    `x-amz-content-sha256` headers. Used by `S3BlobStore` for
+//!    `PUT` / `GET` / `HEAD` / `DELETE` against any S3-compatible
+//!    endpoint. Signs exactly three headers.
+//! 2. **Query-mode** (`presignGet`) — the signature rides in the
+//!    query string. Used by Phase 4 of the deployment-snapshots
+//!    plan to 302-redirect static asset requests directly to S3,
+//!    so the worker never proxies the bytes. Body payload-hash is
+//!    `UNSIGNED-PAYLOAD`; the only signed header is `host`. Caller
+//!    can sign `response-content-type` into the URL to override
+//!    whatever Content-Type S3 has stored for the object.
 //!
 //! Algorithm reference:
 //!   https://docs.aws.amazon.com/general/latest/gr/sigv4_signing.html
@@ -204,6 +210,165 @@ pub fn sign(allocator: std.mem.Allocator, in: SignInput) !SignedHeaders {
         .x_amz_date = date_owned,
         .x_amz_content_sha256 = sha_owned,
     };
+}
+
+/// Inputs for a SigV4 query-string presigning operation.
+pub const PresignInput = struct {
+    /// HTTP method the URL will be used for. Almost always "GET";
+    /// "HEAD" is also valid (browsers reuse the same URL for both).
+    method: []const u8 = "GET",
+    /// URL path including the leading slash, NOT URI-encoded.
+    /// e.g. `/my-bucket/abc123`.
+    path: []const u8,
+    /// HTTP `Host` header value (e.g. `s3.gra.io.cloud.ovh.net`).
+    host: []const u8,
+    access_key: []const u8,
+    secret_key: []const u8,
+    region: []const u8,
+    service: []const u8 = "s3",
+    /// UTC timestamp as `YYYYMMDDTHHMMSSZ` (16 chars).
+    timestamp: []const u8,
+    /// URL validity window in seconds. Min 1, max 604800 (7 days)
+    /// per the SigV4 spec. Caller picks; typical values are 300
+    /// (5 min) for short-lived links and 3600 (1 hr) for asset URLs
+    /// that may be cached by browsers.
+    expires_secs: u32,
+    /// Optional `response-content-type` override. Signed into the
+    /// URL; S3 returns this Content-Type regardless of what's
+    /// stored on the object. Lets the worker pick the MIME type
+    /// from its static manifest without needing to backfill PUTs
+    /// that didn't set Content-Type.
+    response_content_type: ?[]const u8 = null,
+};
+
+/// Build a presigned S3 URL. Returns the full URL (scheme + host +
+/// path + query + signature) owned by `allocator`. Caller frees.
+///
+/// SigV4 query-mode differences from header-mode:
+///   - Payload hash is the literal string `UNSIGNED-PAYLOAD` (the
+///     URL holder may not even know the bytes).
+///   - Only `host` is in the signed-headers list.
+///   - The signing query params themselves (X-Amz-Algorithm,
+///     X-Amz-Credential, X-Amz-Date, X-Amz-Expires,
+///     X-Amz-SignedHeaders, plus any response-* overrides) go in
+///     the canonical query — they're signed.
+///   - Final URL appends `&X-Amz-Signature=<hex>` after the
+///     canonical query.
+pub fn presignGet(
+    allocator: std.mem.Allocator,
+    scheme: []const u8,
+    in: PresignInput,
+) ![]u8 {
+    if (in.timestamp.len != 16) return error.BadTimestamp;
+    if (in.expires_secs == 0 or in.expires_secs > 604800) return error.BadExpiresSecs;
+    const date = in.timestamp[0..8];
+
+    // ── Canonical query (alphabetical by encoded key).
+    // X-Amz-* names + `response-content-type` contain only ASCII
+    // unreserved chars, so raw == encoded for the keys; values get
+    // uriEncodeComponent'd. Sort order: 'X' (0x58) < 'r' (0x72), so
+    // every X-Amz-* sorts before response-content-type.
+    var canon_query: std.ArrayList(u8) = .{};
+    defer canon_query.deinit(allocator);
+
+    try canon_query.appendSlice(allocator, "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=");
+    // Credential value: <ak>/<date>/<region>/<service>/aws4_request.
+    // The slashes encode to %2F when in a query value.
+    var cred_buf: std.ArrayList(u8) = .{};
+    defer cred_buf.deinit(allocator);
+    try cred_buf.appendSlice(allocator, in.access_key);
+    try cred_buf.append(allocator, '/');
+    try cred_buf.appendSlice(allocator, date);
+    try cred_buf.append(allocator, '/');
+    try cred_buf.appendSlice(allocator, in.region);
+    try cred_buf.append(allocator, '/');
+    try cred_buf.appendSlice(allocator, in.service);
+    try cred_buf.appendSlice(allocator, "/aws4_request");
+    try uriEncodeComponent(allocator, &canon_query, cred_buf.items);
+
+    try canon_query.appendSlice(allocator, "&X-Amz-Date=");
+    try canon_query.appendSlice(allocator, in.timestamp);
+
+    try canon_query.appendSlice(allocator, "&X-Amz-Expires=");
+    var exp_buf: [16]u8 = undefined;
+    const exp_s = std.fmt.bufPrint(&exp_buf, "{d}", .{in.expires_secs}) catch unreachable;
+    try canon_query.appendSlice(allocator, exp_s);
+
+    try canon_query.appendSlice(allocator, "&X-Amz-SignedHeaders=host");
+
+    if (in.response_content_type) |ct| {
+        try canon_query.appendSlice(allocator, "&response-content-type=");
+        try uriEncodeComponent(allocator, &canon_query, ct);
+    }
+
+    // ── Canonical URI.
+    var canon_path: std.ArrayList(u8) = .{};
+    defer canon_path.deinit(allocator);
+    try uriEncodePath(allocator, &canon_path, in.path);
+
+    // ── Canonical request:
+    //     <method>\n<canon_uri>\n<canon_query>\n<canon_headers>\n\n<signed_headers>\nUNSIGNED-PAYLOAD
+    var canon_req: std.ArrayList(u8) = .{};
+    defer canon_req.deinit(allocator);
+    try canon_req.appendSlice(allocator, in.method);
+    try canon_req.append(allocator, '\n');
+    try canon_req.appendSlice(allocator, canon_path.items);
+    try canon_req.append(allocator, '\n');
+    try canon_req.appendSlice(allocator, canon_query.items);
+    try canon_req.append(allocator, '\n');
+    try canon_req.appendSlice(allocator, "host:");
+    try canon_req.appendSlice(allocator, in.host);
+    try canon_req.append(allocator, '\n');
+    try canon_req.append(allocator, '\n');
+    try canon_req.appendSlice(allocator, "host\n");
+    try canon_req.appendSlice(allocator, "UNSIGNED-PAYLOAD");
+
+    // ── String to sign.
+    var canon_digest: [32]u8 = undefined;
+    Sha256.hash(canon_req.items, &canon_digest, .{});
+    const canon_hash_hex = std.fmt.bytesToHex(canon_digest, .lower);
+
+    var sts: std.ArrayList(u8) = .{};
+    defer sts.deinit(allocator);
+    try sts.appendSlice(allocator, "AWS4-HMAC-SHA256\n");
+    try sts.appendSlice(allocator, in.timestamp);
+    try sts.append(allocator, '\n');
+    try sts.appendSlice(allocator, date);
+    try sts.append(allocator, '/');
+    try sts.appendSlice(allocator, in.region);
+    try sts.append(allocator, '/');
+    try sts.appendSlice(allocator, in.service);
+    try sts.appendSlice(allocator, "/aws4_request\n");
+    try sts.appendSlice(allocator, &canon_hash_hex);
+
+    // ── Signing-key derivation — identical to header-mode `sign`.
+    var k_secret_buf: [128]u8 = undefined;
+    if (4 + in.secret_key.len > k_secret_buf.len) return error.SecretTooLong;
+    @memcpy(k_secret_buf[0..4], "AWS4");
+    @memcpy(k_secret_buf[4 .. 4 + in.secret_key.len], in.secret_key);
+    const k_secret = k_secret_buf[0 .. 4 + in.secret_key.len];
+
+    var k_date: [32]u8 = undefined;
+    HmacSha256.create(&k_date, date, k_secret);
+    var k_region: [32]u8 = undefined;
+    HmacSha256.create(&k_region, in.region, &k_date);
+    var k_service: [32]u8 = undefined;
+    HmacSha256.create(&k_service, in.service, &k_region);
+    var k_signing: [32]u8 = undefined;
+    HmacSha256.create(&k_signing, "aws4_request", &k_service);
+
+    var sig: [32]u8 = undefined;
+    HmacSha256.create(&sig, sts.items, &k_signing);
+    const sig_hex = std.fmt.bytesToHex(sig, .lower);
+
+    // ── Final URL. Use the URI-encoded path so e.g. spaces stay
+    // `%20`. Browsers and S3 expect the wire URL to match the
+    // canonical-request path byte-for-byte.
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}://{s}{s}?{s}&X-Amz-Signature={s}",
+        .{ scheme, in.host, canon_path.items, canon_query.items, &sig_hex },
+    );
 }
 
 /// Format a UTC timestamp as `YYYYMMDDTHHMMSSZ` (16 chars). The
@@ -536,4 +701,129 @@ test "sign: rejects malformed timestamp" {
         .region = "r",
         .timestamp = "too-short",
     }));
+}
+
+// ── presignGet ───────────────────────────────────────────────────────
+
+test "presignGet: known-good vector matches independent openssl computation" {
+    // Inputs follow the standard AWS get-object test credentials. The
+    // expected signature was computed independently with `openssl
+    // dgst -sha256 -mac HMAC` against the same canonical request
+    // structure produced here (sigv4 HMAC chain: kSecret → kDate →
+    // kRegion → kService → kSigning → final HMAC of string-to-sign).
+    const url = try presignGet(testing.allocator, "https", .{
+        .method = "GET",
+        .path = "/test.txt",
+        .host = "examplebucket.s3.amazonaws.com",
+        .access_key = "AKIAIOSFODNN7EXAMPLE",
+        .secret_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        .region = "us-east-1",
+        .service = "s3",
+        .timestamp = "20130524T000000Z",
+        .expires_secs = 86400,
+    });
+    defer testing.allocator.free(url);
+
+    try testing.expectEqualStrings(
+        "https://examplebucket.s3.amazonaws.com/test.txt?" ++
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256" ++
+            "&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request" ++
+            "&X-Amz-Date=20130524T000000Z" ++
+            "&X-Amz-Expires=86400" ++
+            "&X-Amz-SignedHeaders=host" ++
+            "&X-Amz-Signature=3ed0be64024db54d5574a27da223529635c383f911f80e636f0ccc13890053d2",
+        url,
+    );
+}
+
+test "presignGet: response-content-type override sorts after X-Amz-* and signs" {
+    const url = try presignGet(testing.allocator, "https", .{
+        .method = "GET",
+        .path = "/bucket/blob",
+        .host = "s3.example.com",
+        .access_key = "AKIA0000000000000000",
+        .secret_key = "secretSECRETsecretSECRETsecretSECRETsecre",
+        .region = "us-east-1",
+        .timestamp = "20240101T000000Z",
+        .expires_secs = 300,
+        .response_content_type = "text/css",
+    });
+    defer testing.allocator.free(url);
+
+    // Order check + percent-encoding of `/` in `text/css`.
+    try testing.expect(std.mem.indexOf(u8, url, "&X-Amz-SignedHeaders=host&response-content-type=text%2Fcss&X-Amz-Signature=") != null);
+}
+
+test "presignGet: determinism" {
+    const url_a = try presignGet(testing.allocator, "https", .{
+        .path = "/b/k",
+        .host = "h",
+        .access_key = "ak",
+        .secret_key = "sk",
+        .region = "r",
+        .timestamp = "20240101T000000Z",
+        .expires_secs = 600,
+    });
+    defer testing.allocator.free(url_a);
+    const url_b = try presignGet(testing.allocator, "https", .{
+        .path = "/b/k",
+        .host = "h",
+        .access_key = "ak",
+        .secret_key = "sk",
+        .region = "r",
+        .timestamp = "20240101T000000Z",
+        .expires_secs = 600,
+    });
+    defer testing.allocator.free(url_b);
+    try testing.expectEqualStrings(url_a, url_b);
+}
+
+test "presignGet: different content-type override → different signature" {
+    const url_a = try presignGet(testing.allocator, "https", .{
+        .path = "/b/k",
+        .host = "h",
+        .access_key = "ak",
+        .secret_key = "sk",
+        .region = "r",
+        .timestamp = "20240101T000000Z",
+        .expires_secs = 600,
+        .response_content_type = "text/css",
+    });
+    defer testing.allocator.free(url_a);
+    const url_b = try presignGet(testing.allocator, "https", .{
+        .path = "/b/k",
+        .host = "h",
+        .access_key = "ak",
+        .secret_key = "sk",
+        .region = "r",
+        .timestamp = "20240101T000000Z",
+        .expires_secs = 600,
+        .response_content_type = "image/png",
+    });
+    defer testing.allocator.free(url_b);
+    try testing.expect(!std.mem.eql(u8, url_a, url_b));
+}
+
+test "presignGet: rejects 0 and >7-day expires_secs" {
+    const bad_zero = presignGet(testing.allocator, "https", .{
+        .path = "/k",
+        .host = "h",
+        .access_key = "a",
+        .secret_key = "s",
+        .region = "r",
+        .timestamp = "20240101T000000Z",
+        .expires_secs = 0,
+    });
+    try testing.expectError(error.BadExpiresSecs, bad_zero);
+
+    const bad_huge = presignGet(testing.allocator, "https", .{
+        .path = "/k",
+        .host = "h",
+        .access_key = "a",
+        .secret_key = "s",
+        .region = "r",
+        .timestamp = "20240101T000000Z",
+        .expires_secs = 604801,
+    });
+    try testing.expectError(error.BadExpiresSecs, bad_huge);
 }

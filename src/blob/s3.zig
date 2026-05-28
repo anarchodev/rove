@@ -250,6 +250,48 @@ pub const S3BlobStore = struct {
         .delete = vDelete,
     };
 
+    /// Build a presigned GET URL the caller can hand to a browser
+    /// (typically as a `Location:` 302 target). The browser fetches
+    /// directly from S3, so the worker never reads or buffers the
+    /// bytes. Optional `response_content_type` is signed into the
+    /// URL — S3 returns that exact Content-Type, overriding whatever
+    /// is stored on the object (lets the worker pick the MIME type
+    /// from its static manifest without re-PUTting historical blobs
+    /// that didn't set Content-Type).
+    ///
+    /// Returns the full URL owned by `body_allocator`. Caller frees.
+    pub fn presignGet(
+        self: *S3BlobStore,
+        key: []const u8,
+        expires_secs: u32,
+        response_content_type: ?[]const u8,
+        body_allocator: std.mem.Allocator,
+    ) ![]u8 {
+        const scheme = if (self.config.use_tls) "https" else "http";
+        const path = try std.fmt.allocPrint(
+            body_allocator,
+            "/{s}/{s}{s}",
+            .{ self.config.bucket, self.config.key_prefix, key },
+        );
+        defer body_allocator.free(path);
+
+        var ts_buf: [16]u8 = undefined;
+        sigv4.formatAmzDate(&ts_buf, std.time.timestamp());
+
+        return sigv4.presignGet(body_allocator, scheme, .{
+            .method = "GET",
+            .path = path,
+            .host = self.config.endpoint,
+            .access_key = self.config.access_key,
+            .secret_key = self.config.secret_key,
+            .region = self.config.region,
+            .service = "s3",
+            .timestamp = &ts_buf,
+            .expires_secs = expires_secs,
+            .response_content_type = response_content_type,
+        });
+    }
+
     // ── Wire transport ───────────────────────────────────────────────
 
     /// Internal response wrapper. `body_owned` is null when the

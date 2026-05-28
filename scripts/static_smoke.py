@@ -126,52 +126,69 @@ def main() -> int:
         wait_loaded(dep, statics=1)
         print("ok  PUT _static/index.html → 201")
 
-        # 2. GET / → 200 + html + ETag + Cache-Control.
+        # 2a. GET / → 302 to presigned S3 URL, with ETag + Location.
+        # Phase 4 of deployment-snapshots-plan.md: the worker emits a
+        # redirect so the browser fetches bytes directly from S3.
         r = curl(cc, f"{customer}/")
-        expect_status("GET / status", 200, r)
-        ct = r.headers.get("content-type", "")
-        if not ct.startswith("text/html"):
-            sys.exit(f"FAIL content-type: {ct}")
+        expect_status("GET / status", 302, r)
+        loc = r.headers.get("location", "")
+        if not loc.startswith("https://") or "X-Amz-Signature=" not in loc:
+            sys.exit(f"FAIL Location not a presigned S3 URL: {loc!r}")
+        if "response-content-type=text%2Fhtml" not in loc:
+            sys.exit(f"FAIL Location missing content-type override: {loc!r}")
         etag = r.headers.get("etag", "")
         if not etag:
-            sys.exit(f"FAIL etag missing: {r.headers}")
+            sys.exit(f"FAIL etag missing on 302: {r.headers}")
         if "public" not in r.headers.get("cache-control", ""):
-            sys.exit(f"FAIL cache-control: {r.headers}")
-        if "<h1>home</h1>" not in r.body:
-            sys.exit(f"FAIL body: {r.body}")
-        print("ok  GET / returns index.html with ETag + Cache-Control")
+            sys.exit(f"FAIL cache-control on 302: {r.headers}")
+        print("ok  GET / → 302 with presigned S3 URL + ETag")
 
-        # 2b. HEAD / matches GET headers, no body.
+        # 2b. Following the redirect → 200 from S3 with the bytes
+        # and the worker's content-type override.
+        r = curl(cc, f"{customer}/", follow_redirects=True)
+        expect_status("GET / followed status", 200, r)
+        ct = r.headers.get("content-type", "")
+        if not ct.startswith("text/html"):
+            sys.exit(f"FAIL S3 content-type after follow: {ct}")
+        if "<h1>home</h1>" not in r.body:
+            sys.exit(f"FAIL S3 body after follow: {r.body!r}")
+        print("ok  GET / followed → S3 200 with html body")
+
+        # 2c. HEAD / → 302 with the same headers a GET would emit.
+        # (We don't follow with HEAD because curl -X HEAD -L hangs
+        # waiting for a body that HEAD responses never carry; the
+        # GET-follow above already proved S3 serves the bytes.)
         r = curl(cc, f"{customer}/", method="HEAD")
-        expect_status("HEAD / status", 200, r)
-        if "etag" not in r.headers:
-            sys.exit(f"FAIL HEAD / etag missing: {r.headers}")
+        expect_status("HEAD / status", 302, r)
+        if r.headers.get("location", "") != loc:
+            sys.exit(f"FAIL HEAD / Location mismatch with GET")
         if r.body:
             sys.exit(f"FAIL HEAD / returned body of {len(r.body)} bytes")
-        print("ok  HEAD / matches GET headers but omits body")
+        print("ok  HEAD / emits same 302 as GET, no body")
 
-        # 3. If-None-Match matching → 304.
+        # 3. If-None-Match matching → 304 (worker short-circuits, no
+        # redirect, no S3 hop).
         r = curl(cc, f"{customer}/", headers={"If-None-Match": etag})
         expect_status("If-None-Match match → 304", 304, r)
 
-        # 4. If-None-Match mismatch → 200.
+        # 4. If-None-Match mismatch → 302 (worker emits a fresh redirect).
         r = curl(cc, f"{customer}/", headers={"If-None-Match": '"different"'})
-        expect_status("If-None-Match mismatch → 200", 200, r)
+        expect_status("If-None-Match mismatch → 302", 302, r)
 
-        # 5. .html fallback.
+        # 5. .html fallback (follow to verify body).
         dep = put_static("_static/about.html", "text/html", "<p>about</p>")
         wait_loaded(dep, statics=2)
-        r = curl(cc, f"{customer}/about")
+        r = curl(cc, f"{customer}/about", follow_redirects=True)
         if "<p>about</p>" not in r.body:
-            sys.exit(f"FAIL .html fallback body: {r.body}")
+            sys.exit(f"FAIL .html fallback body: {r.body!r}")
         print("ok  .html fallback: /about → _static/about.html")
 
-        # 6. Dir-index fallback.
+        # 6. Dir-index fallback (follow to verify body).
         dep = put_static("_static/blog/index.html", "text/html", "<p>blog</p>")
         wait_loaded(dep, statics=3)
-        r = curl(cc, f"{customer}/blog")
+        r = curl(cc, f"{customer}/blog", follow_redirects=True)
         if "<p>blog</p>" not in r.body:
-            sys.exit(f"FAIL dir index body: {r.body}")
+            sys.exit(f"FAIL dir index body: {r.body!r}")
         print("ok  dir-index fallback: /blog → _static/blog/index.html")
 
         # 7. Trailing slash → 301.
