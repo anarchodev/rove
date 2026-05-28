@@ -12,6 +12,14 @@ Zig. Not in scope: the per-tenant raft group orchestration above
 raft-rs, the segmented log, the control plane, or the migration
 protocol — those are V2 plan content, not vendoring.
 
+> **See also `docs/v2-multiraft-scaling-learnings.md`** — measured findings
+> from a working prototype of this exact substrate (raft-rs hosting one
+> group per tenant, shared per-node WAL, detach/attach migration), built in
+> `~/src/rewind2` + `~/src/raft-rs-zig`. It flags concrete gaps in the FFI
+> surface sketched below (single-group → needs a mailbox `poll_ready`,
+> batched tick, group lifecycle for migration, an allocator) and quantifies
+> what each scaling fix was worth at K=10k tenants.
+
 ## What lives in `vendor/raft-rs/`
 
 ```

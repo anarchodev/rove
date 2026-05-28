@@ -2391,6 +2391,32 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
                         //     the queue (it'll re-arrive after the
                         //     pending move commits).
                         const server = worker.h2;
+                        // Same-tick chunk race: if a prior chunk
+                        // for this entity in this tick called
+                        // proposeAndParkContResume, the entity has
+                        // a pending (deferred) move that won't
+                        // flush until the next reg.flush boundary.
+                        // A second chunk attempting reg.set /
+                        // reg.move on it would error PendingMove.
+                        // Re-enqueue the chunk at the tail; the
+                        // next tick's drainRaftPending will commit
+                        // the predecessor's writes + flush the
+                        // move, then dispatch picks this chunk up
+                        // cleanly. BATCH-bounded so it can't spin
+                        // indefinitely.
+                        if (server.reg.isMoving(held_ent)) {
+                            const ev_copy = ev; // Msg owns its slices; copy by value.
+                            effect_mod.enqueueMsg(&worker.msg_queue, .{ .fetch_chunk = ev_copy }) catch |eerr| {
+                                std.log.warn(
+                                    "rove-js bound-fetch: re-enqueue dropped (fetch_id={s}): {s}",
+                                    .{ ev.fetch_id, @errorName(eerr) },
+                                );
+                                components_mod.UpstreamFetchEvent.deinitItem(&ev, allocator);
+                            };
+                            if (fid_copy) |fid| allocator.free(fid);
+                            fired += 1;
+                            continue;
+                        }
                         if (server.reg.isInCollection(held_ent, &worker.parked_continuations)) {
                             worker_drain.resumeBoundFetchChain(worker, held_ent, &ev);
                         } else if (server.reg.isInCollection(held_ent, &server.stream_data_out) or
@@ -2403,17 +2429,35 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
                             // resumeBoundFetchStream picks the right
                             // collection internally for component reads.
                             resumeBoundFetchStream(worker, held_ent, &ev);
+                        } else if (server.reg.isInCollection(held_ent, &worker.raft_pending_cont) or
+                            server.reg.isInCollection(held_ent, &worker.raft_pending_stream))
+                        {
+                            // Entity awaiting commit in raft_pending —
+                            // a prior chunk's writes haven't landed
+                            // yet. Defer until next tick (same idea
+                            // as the isMoving branch above — the
+                            // commit-arm Cmd.respond will move the
+                            // entity back to its receivable state).
+                            const ev_copy = ev;
+                            effect_mod.enqueueMsg(&worker.msg_queue, .{ .fetch_chunk = ev_copy }) catch |eerr| {
+                                std.log.warn(
+                                    "rove-js bound-fetch: re-enqueue dropped (fetch_id={s}): {s}",
+                                    .{ ev.fetch_id, @errorName(eerr) },
+                                );
+                                components_mod.UpstreamFetchEvent.deinitItem(&ev, allocator);
+                            };
+                            if (fid_copy) |fid| allocator.free(fid);
+                            fired += 1;
+                            continue;
                         } else {
-                            // Transient state — entity is in some
-                            // raft_pending_* awaiting commit. Drop
-                            // for now (best-effort, like the
-                            // existing wake_batch on a draining
-                            // stream). Logging at info so an
-                            // operator can spot it if a tenant's
-                            // bound fetches ever start dropping in
-                            // bulk.
+                            // Transient state — entity not in any
+                            // known collection. Drop. (Different
+                            // from the raft_pending case above:
+                            // there's no commit that would move it
+                            // back. Likely a destroyed/recycled
+                            // entity.)
                             std.log.info(
-                                "rove-js bound-fetch: entity for fetch_id={s} mid-transition (not in parked_continuations or stream_data_out); dropping chunk",
+                                "rove-js bound-fetch: entity for fetch_id={s} not in any tracked collection; dropping chunk",
                                 .{ev.fetch_id},
                             );
                             components_mod.UpstreamFetchEvent.deinitItem(&ev, allocator);
