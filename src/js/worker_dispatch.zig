@@ -2866,6 +2866,17 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             if (n != 1) break :blk null;
             break :blk only;
         };
+        // `docs/cross-worker-held-state-plan.md` Phase 1: when this
+        // open hop bound to exactly one send, register the
+        // (send_id → this worker's idx) owner mapping on NodeState.
+        // Phase 2's wake routing will consult this to send the
+        // webhook callback's resume to the cont's owning worker
+        // instead of hash(tenant_id). Failure is non-fatal — Phase
+        // 2 falls back to today's per-worker scan when the registry
+        // misses.
+        if (cont_bound_sched_id) |send_id| {
+            _ = worker.node.registerBoundSendOwner(send_id, worker.msg_inbox_idx);
+        }
         // `resp.console` / `resp.exception` are freed here unless we
         // transfer them into a SuccessRec below.
         defer {
