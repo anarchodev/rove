@@ -729,13 +729,19 @@ Increments (planned, smallest-first):
   IGNORE) absorbs any narrow-window duplicate against a record the
   original leader had already pushed.
 
-  `request_body_bytes` + `activation_bytes` are NOT yet hydrated
-  — the BodyRefs in the trigger_payload + fetch_responses
-  channels would need a BlobStore fetch round-trip. Slice 5c-1 may
-  add it; for now rebuilt records carry the structural tape
-  channels and the customer log surface shows method / path /
-  status / outcome / correlation_id / activation without inline
-  body bytes.
+  `request_body_bytes` + `activation_bytes` are NOT hydrated by the
+  walker, and as of 2026-05-27 they're not pre-inlined into LogRecord
+  for >16 KB bodies in normal operation either: `worker_log.captureTapes`
+  inlines only ≤ `REQUEST_BODY_CAP` (16 KB, matching the raft-inline
+  threshold). Large bodies live in BlobBackend via the readset's
+  `trigger_payload` / `fetch_responses` BodyRefs, and the dashboard /
+  replay fetches on demand. The walker doesn't need a separate
+  hydration path — rebuilt records carry the BodyRef the same way
+  normal-operation records do for the >16 KB case. Small bodies
+  (≤ 16 KB) inline into LogRecord at normal-operation time + survive
+  raft compaction via the log batch's 30-day retention; walker
+  recovery reconstructs them from the raft entry's `inline_bytes`
+  the same way.
 - **5d — orphan-blob GC (algorithmic core shipped; operator-side
   delete deferred)**:
   - **5d-base (shipped)**: `collectReferencedBatchesIntoList`
