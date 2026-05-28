@@ -37,18 +37,14 @@ PUBLIC_SUFFIX = "rewindjsapp.localhost"
 ACME_HOST = f"acme.{PUBLIC_SUFFIX}"
 WB_HOST = f"wb.{PUBLIC_SUFFIX}"
 
-# Concurrency level: each request is dispatched sequentially (one
-# at a time) to dodge the pre-existing batched-writeset issue —
-# `worker_dispatch.zig`'s `cont_bound_sched_id` scan looks at the
-# whole tenant batch's writeset, so concurrent same-tenant
-# requests in one dispatch tick see N>1 `_send/owed/` puts and
-# get a null binding. That bug is independent of Phase 2B and
-# manifests even at workers_per_node=1. We still validate Phase
-# 2B's cross-worker routing by issuing the requests in series
-# but letting each one land on a different worker via repeated
-# fresh TCP connections (SO_REUSEPORT picks a worker per
-# connection; 4 workers + 20 sequential connections statistically
-# spreads).
+# Sequential burst: each request gets its own fresh TCP connection
+# so SO_REUSEPORT spreads across the 4 workers. Sequential to
+# dodge a separate kv-conflict at parked_units.commit that surfaces
+# under multi-worker + concurrent same-tenant load (independent of
+# Phase 2B; tracked as a follow-up). Concurrent same-tenant load
+# IS validated in `heldsync_concurrent_smoke.py` against a
+# single-worker cluster, which exercises the cont_bound_sched_id
+# scan-fix path.
 N_REQUESTS = 20
 
 
@@ -138,11 +134,10 @@ def main() -> int:
         print(f"ok  warm-up held-sync resumed in {warmup_el:.2f}s")
 
         # 4. Sequential burst. Each request gets a fresh TCP
-        #    connection (curl process); SO_REUSEPORT picks a
-        #    worker per connection. With 4 workers and 20
-        #    requests, statistically most requests land on a
-        #    worker ≠ hash(tenant_id) — exactly the cross-worker
-        #    case Phase 2B fixes.
+        #    connection so SO_REUSEPORT picks a worker per
+        #    connection — exercises Phase 2B's cross-worker
+        #    routing without provoking the separate
+        #    multi-worker-concurrent kv-conflict bug.
         t0 = time.monotonic()
         failures: list[tuple[int, str, float]] = []
         elapsed_per: list[float] = []
