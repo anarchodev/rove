@@ -2240,6 +2240,7 @@ pub fn Worker(comptime opts: Options) type {
         components_mod.StreamChunks,
         components_mod.StreamWakes,
         components_mod.StreamDraining,
+        components_mod.BoundFetchCount,
     }).merge(opts.request_row);
 
     const H2Type = h2.H2(.{
@@ -3291,6 +3292,21 @@ pub fn Worker(comptime opts: Options) type {
             // routing falls back to hash(tenant_id) when the
             // registry misses, which is the same behavior as today.
             _ = self.node.registerBoundFetchOwner(fetch_id, self.msg_inbox_idx);
+            // Increment the per-chain bound-fetch counter. The
+            // entity is in request_out at this point; the merged
+            // Row includes BoundFetchCount so the component is
+            // accessible. Surfaces as request.fetchesPending on
+            // every subsequent onFetchChunk activation. Survives
+            // entity moves (rove principle 8).
+            if (self.h2.reg.get(entity, &self.h2.request_out, components_mod.BoundFetchCount)) |cnt| {
+                cnt.pending +%= 1;
+            } else |_| {
+                // Entity not in request_out — set fails. This is
+                // a soft failure: the count stays at 0 and the
+                // customer's fetchesPending reads as 0. Functional
+                // gap (the count is wrong) but the chain still
+                // works.
+            }
             return true;
         }
 
@@ -3308,10 +3324,40 @@ pub fn Worker(comptime opts: Options) type {
         /// terminal chunk; double-fire is benign).
         pub fn unregisterBoundFetch(self: *Self, fetch_id: []const u8) void {
             const entry = self.bound_fetch_entities.fetchRemove(fetch_id) orelse return;
+            const entity = entry.value;
             self.allocator.free(entry.key);
             // Mirror the NodeState owner-map drop. Same Phase 1
             // pairing as the registration site above.
             self.node.unregisterBoundFetchOwner(fetch_id);
+            // Decrement the per-chain pending count. Naturally
+            // saturates at 0 (defensive — register/unregister
+            // pairs balance in normal flow). Surfaces as
+            // request.fetchesPending on subsequent activations.
+            self.decrementBoundFetchCount(entity);
+        }
+
+        /// Walk every collection that can host a held chain to
+        /// find this entity's BoundFetchCount component and
+        /// decrement it. The entity flows
+        /// request_out → parked_continuations → raft_pending_*
+        /// → stream_response_in → stream_data_out → response_in
+        /// → response_out across its lifecycle; the merged
+        /// StreamRow carries BoundFetchCount on every one of them.
+        fn decrementBoundFetchCount(self: *Self, entity: rove.Entity) void {
+            const server = self.h2;
+            if (server.reg.getAny(entity, .{
+                &server.request_out,
+                &self.parked_continuations,
+                &self.raft_pending_cont,
+                &self.raft_pending_stream,
+                &self.raft_pending_response,
+                &server.stream_response_in,
+                &server.stream_data_out,
+                &server.response_in,
+                &server.response_out,
+            }, components_mod.BoundFetchCount)) |cnt| {
+                if (cnt.pending > 0) cnt.pending -= 1;
+            } else |_| {}
         }
 
         /// Phase 3: register a `send_id → entity` mapping on this
@@ -5127,9 +5173,12 @@ pub fn cleanupResponses(worker: anytype) !void {
 
 /// Walk the worker's `bound_fetch_entities` map, cancel + unregister
 /// every entry pointing at `ent`. Called from the disconnect cleanup
-/// path and from any future "held entity destroyed" site. Idempotent —
-/// repeated calls with the same entity see an empty match set.
-fn scanAndCancelBoundFetches(worker: anytype, ent: rove.Entity) void {
+/// path, from `resumeBoundFetchChain` / `resumeBoundFetchStream`'s
+/// `.terminal` arms (auto-cancel siblings when the chain itself
+/// terminates), and from any future "held entity destroyed" site.
+/// Idempotent — repeated calls with the same entity see an empty
+/// match set.
+pub fn scanAndCancelBoundFetches(worker: anytype, ent: rove.Entity) void {
     var doomed: std.ArrayListUnmanaged([]const u8) = .empty;
     defer doomed.deinit(worker.allocator);
     var it = worker.bound_fetch_entities.iterator();

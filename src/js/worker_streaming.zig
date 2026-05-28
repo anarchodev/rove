@@ -856,8 +856,13 @@ pub fn resumeBoundFetchStream(
     // (`activation_entity != null` gate).
     const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json}) catch return;
     defer allocator.free(body);
-    const spath = std.fmt.allocPrint(allocator, "/{s}?fn=onFetchChunk", .{path}) catch return;
+    // Custom `name:` override (matches resumeBoundFetchChain's
+    // first-chunk handling) — falls back to `onFetchChunk`.
+    const fn_name: []const u8 = if (ev.name.len > 0) ev.name else "onFetchChunk";
+    const spath = std.fmt.allocPrint(allocator, "/{s}?fn={s}", .{ path, fn_name }) catch return;
     defer allocator.free(spath);
+    const query = std.fmt.allocPrint(allocator, "fn={s}", .{fn_name}) catch return;
+    defer allocator.free(query);
 
     const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
     var txn_owned = true;
@@ -877,11 +882,22 @@ pub fn resumeBoundFetchStream(
     };
 
     const dropped_chunks_snapshot = chunks_st.takeDropped();
+    // Snapshot fetchesPending — same shape as resumeBoundFetchChain.
+    // Entity is in `stream_data_out` or `stream_response_in` at
+    // this point; both carry BoundFetchCount via the merged Row.
+    const fetches_pending: u32 = blk: {
+        const cnt_data = server.reg.get(ent, &server.stream_data_out, components_mod.BoundFetchCount) catch null;
+        if (cnt_data) |c| break :blk c.pending;
+        const cnt_in = server.reg.get(ent, &server.stream_response_in, components_mod.BoundFetchCount) catch null;
+        if (cnt_in) |c| break :blk c.pending;
+        break :blk 0;
+    };
+
     var req: Request = .{
         .method = "POST",
         .path = spath,
         .body = body,
-        .query = "fn=onFetchChunk",
+        .query = query,
         .readset = &readset,
         .request_id = request_id,
         .platform = inst.platform,
@@ -899,6 +915,7 @@ pub fn resumeBoundFetchStream(
         .register_bound_fetch = &@TypeOf(worker.*).registerBoundFetchTrampoline,
         .register_bound_fetch_ctx = @ptrCast(worker),
         .activation_entity = ent,
+        .activation_fetches_pending = fetches_pending,
     };
     req.activation_fetch_seq = ev.seq;
     req.activation_fetch_byte_offset = ev.byte_offset;
@@ -934,6 +951,9 @@ pub fn resumeBoundFetchStream(
     switch (oc) {
         .terminal => |*r| {
             defer r.deinit(allocator);
+            // Chain going terminal — cancel sibling binds (same
+            // pattern as resumeBoundFetchChain's terminal arm).
+            worker_mod.scanAndCancelBoundFetches(worker, ent);
             if (r.exception.len > 0) {
                 txn.rollback() catch {};
                 txn_done = true;

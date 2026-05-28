@@ -306,6 +306,11 @@ pub const UpstreamFetchEvent = struct {
     /// to the cont's owning worker. Allocator-owned dupe; freed
     /// in `deinitItem`.
     bound_send_id: []u8 = &.{},
+    /// Customer-facing `name:` override (see `PendingFetch.name`).
+    /// Empty → resume dispatches to `onFetchChunk`; non-empty →
+    /// resume dispatches to the supplied identifier. Allocator-
+    /// owned dupe; freed in `deinitItem`.
+    name: []u8 = &.{},
 
     pub fn deinit(allocator: std.mem.Allocator, items: []UpstreamFetchEvent) void {
         for (items) |*item| deinitItem(item, allocator);
@@ -324,6 +329,7 @@ pub const UpstreamFetchEvent = struct {
         if (item.bytes.len > 0) allocator.free(item.bytes);
         if (item.fetch_headers) |h| allocator.free(h);
         if (item.bound_send_id.len > 0) allocator.free(item.bound_send_id);
+        if (item.name.len > 0) allocator.free(item.name);
         item.* = .{};
     }
 };
@@ -378,6 +384,24 @@ pub const SubscriptionFireDescriptor = struct {
             item.* = .{};
         }
     }
+};
+
+/// Per-chain count of in-flight bound fetches. Incremented at
+/// `http.fetch({bind: true})` register time; decremented at the
+/// matching `unregisterBoundFetch` site (i.e. either a `final:
+/// true` chunk arriving at the dispatch, or the auto-cancel
+/// sibling sweep when the chain goes terminal).
+///
+/// Surfaced to the customer as `request.fetchesPending` on every
+/// `onFetchChunk` activation — they branch on it for "is this the
+/// last chunk of the last fetch?" logic. Default 0 is the natural
+/// "no binds yet" state. Lives on the merged Row so it survives
+/// entity moves between parked_continuations → raft_pending_cont →
+/// stream_response_in → stream_data_out etc.
+pub const BoundFetchCount = struct {
+    pending: u32 = 0,
+
+    pub fn deinit(_: std.mem.Allocator, _: []BoundFetchCount) void {}
 };
 
 /// Phase 7: replaces the Phase-6 `parked_streams_active` /
