@@ -216,11 +216,26 @@ pub fn drainRaftPending(worker: anytype) !void {
                     // path. Null `txn` after commit so ParkedUnit.deinit
                     // doesn't try to rollback on destroy.
                     if (unit.txn) |t| {
-                        t.commit() catch |cerr| panic_mod.invariantViolated(
-                            "drainRaftPending.parked_units.commit",
-                            "seq={d} tenant={s} err={s}",
-                            .{ unit.seq, unit.tenant_id, @errorName(cerr) },
-                        );
+                        t.commit() catch |cerr| switch (cerr) {
+                            // kvexp NotChainHead: predecessor hasn't
+                            // committed its head yet. Retry next tick
+                            // — same posture as the entity-backed
+                            // branch below (and as
+                            // `worker_streaming.proposeForgetfulWrites`
+                            // documents). Leave unit.txn attached and
+                            // the unit parked; classify on the next
+                            // tick still says `.commit` once the
+                            // predecessor lands. Pre-fix this aborted
+                            // every concurrent same-tenant heldsync
+                            // under multi-worker load (kv_shard_bench /
+                            // heldsync_multiworker_smoke).
+                            error.Conflict => continue,
+                            else => panic_mod.invariantViolated(
+                                "drainRaftPending.parked_units.commit",
+                                "seq={d} tenant={s} err={s}",
+                                .{ unit.seq, unit.tenant_id, @errorName(cerr) },
+                            ),
+                        };
                         allocator.destroy(t);
                         unit.txn = null;
                     } else if (worker.pending_txns.contains(unit.seq)) {
