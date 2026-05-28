@@ -478,59 +478,62 @@ fn serveStaticByKey(
     // Match = any one of them equals our etag.
     const inm = findHeader(rh, "if-none-match");
     if (inm != null and etagMatches(inm.?, etag)) {
-        try emitStaticResponse(
-            server,
-            allocator,
-            ent,
-            sid,
-            sess,
-            304,
-            "",
-            "",
-            etag,
-        );
+        try emitStatic304(server, allocator, ent, sid, sess, etag);
         return 304;
     }
 
-    const bytes = tc.slot.blob_backend.blobStore().get(&entry.hash_hex, allocator) catch |err| {
+    // Phase 4 of `docs/deployment-snapshots-plan.md`: 302-redirect
+    // to a presigned S3 URL instead of proxying bytes through the
+    // worker. The browser fetches directly from S3 — the worker
+    // never reads or buffers the asset. Cache-Control on the
+    // redirect itself matches the signed-URL TTL so a re-request
+    // inside that window doesn't even round-trip to the worker.
+    //
+    // Hash-addressed assets are immutable, so the browser caches
+    // them indefinitely via etag once fetched. The signed URL just
+    // gates blob-store access — after expiry the browser re-asks
+    // the worker for a fresh redirect, gets a new signed URL, and
+    // re-validates via If-None-Match.
+    const presign_expires_secs: u32 = 3600;
+    const url = (tc.slot.blob_backend.presignGet(
+        &entry.hash_hex,
+        presign_expires_secs,
+        entry.content_type,
+        allocator,
+    ) catch |err| {
         std.log.warn(
-            "rove-js: static blob fetch for {s} failed: {s}",
+            "rove-js: static presign for {s} failed: {s}",
             .{ key, @errorName(err) },
         );
         return err;
-    };
-    // HEAD: emit the same headers GET would, but no body. Per RFC
-    // 9110 §9.3.2 "the server SHOULD send the same header fields
-    // in response to a HEAD request as it would have sent if the
-    // request method had been GET". Browsers + curl handle absent
-    // content-length on HTTP/2 fine (END_STREAM marks body end).
-    if (is_head) {
-        defer allocator.free(bytes);
-        try emitStaticResponse(
-            server,
-            allocator,
-            ent,
-            sid,
-            sess,
-            200,
-            "",
-            entry.content_type,
-            etag,
+    }) orelse {
+        // Worker invariant: `blob_backend` is always the S3 variant
+        // (see `openTenantSlotNode` → `BlobBackend.openPerTenant`),
+        // which always returns Some. A null here means someone
+        // wired an `http` variant for file-blobs — that's an
+        // architectural bug, not a request-level failure.
+        std.log.err(
+            "rove-js: static presign for {s} returned null — blob_backend variant doesn't support presigning",
+            .{key},
         );
-        return 200;
-    }
-    try emitStaticResponse(
+        return error.PresignNotSupported;
+    };
+    defer allocator.free(url);
+
+    // HEAD and GET both emit the same 302 (no body either way per
+    // RFC 9110 §9.3.2 — and 302 doesn't carry one).
+    _ = is_head;
+    try emitStaticRedirectWithEtag(
         server,
         allocator,
         ent,
         sid,
         sess,
-        200,
-        bytes,
-        entry.content_type,
+        url,
         etag,
+        presign_expires_secs,
     );
-    return 200;
+    return 302;
 }
 
 /// True if `inm` (If-None-Match header value) contains a tag equal to
@@ -560,47 +563,51 @@ pub fn etagMatches(inm: []const u8, etag: []const u8) bool {
     return false;
 }
 
-/// Write a 200/304 static response. Body is duped into the response
-/// entity (so caller's `bytes` can be freed by its allocator immediately
-/// after). Passes an empty body for 304.
-fn emitStaticResponse(
+/// Write a 304 Not Modified for a successful If-None-Match. ETag is
+/// echoed so subsequent revalidations work; cache-control matches
+/// today's static posture (revalidate every time, but the etag
+/// short-circuits the body fetch). No content-type — RFC 9110 §15.4.5
+/// "If a 304 response indicates an entity ... the response MUST NOT
+/// include other than headers already listed".
+fn emitStatic304(
     server: anytype,
     allocator: std.mem.Allocator,
     ent: rove.Entity,
     sid: h2.StreamId,
     sess: h2.Session,
-    status_code: u16,
-    body: []const u8,
-    content_type: []const u8,
     etag: []const u8,
 ) !void {
-    const hdrs = try buildStaticRespHeaders(allocator, content_type, etag);
-    var body_ptr: ?[*]u8 = null;
-    var body_len: u32 = 0;
-    if (body.len > 0) {
-        const copy = try allocator.dupe(u8, body);
-        body_ptr = copy.ptr;
-        body_len = @intCast(copy.len);
-    }
-    try finalizeResponse(server, ent, sid, sess, status_code, hdrs, body_ptr, body_len);
+    const hdrs = try packRespHeaders(allocator, &.{
+        .{ .name = "etag", .value = etag },
+        .{ .name = "cache-control", .value = "public, max-age=0, must-revalidate" },
+    });
+    try finalizeResponse(server, ent, sid, sess, 304, hdrs, null, 0);
 }
 
-fn buildStaticRespHeaders(
+/// Write a 302 Found redirecting to a presigned S3 URL. The browser
+/// follows the Location and fetches the bytes directly from S3.
+/// Etag is echoed so the next request's If-None-Match still works
+/// (the browser caches the redirect's headers alongside the
+/// resolved body). `redirect_max_age` matches the signed URL's TTL
+/// so cached redirects don't outlive their signature.
+fn emitStaticRedirectWithEtag(
+    server: anytype,
     allocator: std.mem.Allocator,
-    content_type: []const u8,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    location: []const u8,
     etag: []const u8,
-) !h2.RespHeaders {
-    var pairs: [3]RespHeaderPair = undefined;
-    var n: usize = 0;
-    if (content_type.len > 0) {
-        pairs[n] = .{ .name = "content-type", .value = content_type };
-        n += 1;
-    }
-    pairs[n] = .{ .name = "etag", .value = etag };
-    n += 1;
-    pairs[n] = .{ .name = "cache-control", .value = "public, max-age=0, must-revalidate" };
-    n += 1;
-    return packRespHeaders(allocator, pairs[0..n]);
+    redirect_max_age: u32,
+) !void {
+    var cc_buf: [64]u8 = undefined;
+    const cc = std.fmt.bufPrint(&cc_buf, "public, max-age={d}", .{redirect_max_age}) catch unreachable;
+    const hdrs = try packRespHeaders(allocator, &.{
+        .{ .name = "location", .value = location },
+        .{ .name = "etag", .value = etag },
+        .{ .name = "cache-control", .value = cc },
+    });
+    try finalizeResponse(server, ent, sid, sess, 302, hdrs, null, 0);
 }
 
 /// If the tenant has `_static/_404.html`, emit it as a 404 response

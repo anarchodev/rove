@@ -285,17 +285,65 @@ Pre-Phase-3 the loader re-fetched every bytecode on every release —
 a regression vs Phase 1's in-memory reuse that Phase 3's diff-fetch
 restores AND extends with cross-tenant sharing.
 
-### Phase 4 — Same model for sources and statics
+### Phase 4 — Static assets: 302 to presigned S3 — **shipped 2026-05-27**
 
-`source_hashes` already keys by content hash; the source-blob fetch
-that QuickJS's module loader uses on cache miss can go through the
-same `BytecodeCache` (rename to `BlobCache` at this point). Statics
-too. After this phase, every byte payload the worker holds in memory
-is shared via the cache.
+**Premise revision.** The original plan said "extend the
+`BytecodeCache` to source bytes + statics (rename to `BlobCache`),
+after which every byte payload the worker holds in memory is shared
+via the cache." On implementation that was the wrong default for
+statics: MB-sized images would pin the snapshot's resident memory
+indefinitely, and the worker would still pay full S3 latency on the
+first request per blob. Sources were also a no-op — the worker never
+fetches source bytes today (the module loader only consumes
+bytecode; `source_hashes` is read-only metadata stamped into the
+replay tape).
 
-(`source_hashes` themselves are 64-byte fixed-size keys; the
-`StringHashMapUnmanaged([64]u8)` stays. Only the SOURCE BYTES move
-into the cache.)
+**What shipped.** Static asset requests are answered with a 302
+redirect to a SigV4-presigned S3 URL. The worker never reads or
+buffers the bytes. The browser fetches directly from S3.
+
+- `src/blob/sigv4.zig`: added `presignGet` (query-mode signer).
+  Body payload is the constant `UNSIGNED-PAYLOAD`; only `host`
+  is in the signed-headers list. Verified against AWS's reference
+  vector cross-checked with `openssl dgst -mac HMAC`.
+- `src/blob/s3.zig` + `backend.zig`: `presignGet(key, expires_secs,
+  response_content_type, allocator) → ?[]u8`. Returns null for the
+  `http` variant (read-through colocated files-server, not used for
+  static-blob backends in the worker). Always Some for `s3`.
+- `src/js/response_builder.zig`: `serveStaticByKey` mints the URL
+  + emits a 302 with `Location:`, `etag:`, and
+  `cache-control: public, max-age=3600` matching the signed URL
+  TTL. The 304 (If-None-Match short-circuit) path is preserved —
+  worker still answers without redirecting when the client already
+  has the bytes. `serveConvention404` keeps its fetch-and-emit
+  path (4xx + redirect is semantically odd; 404 bodies are small
+  and rare).
+
+**Content-Type override.** Today's S3 PUTs don't set Content-Type,
+so the stored objects would deliver as `application/octet-stream`
+on direct GET. Fix without backfill: the presigned URL signs
+`response-content-type=<mime>` from the static manifest's
+`content_type`; S3 honors the override on the response.
+
+**ETag stays meaningful.** Hash-addressed assets are immutable, so
+the worker's etag on the 302 (the static manifest's `hash_hex`) is
+the right revalidation key — a subsequent `If-None-Match` against
+the worker short-circuits to 304 without re-signing or redirecting.
+The browser's local cache of resolved bytes lives indefinitely;
+only the signed-URL TTL is short.
+
+**Smoke verification.** `scripts/static_smoke.py` was updated to
+test both halves: the worker's 302 + Location + etag, plus a
+`curl -L` follow that proves S3 actually accepts the signed URL
+and returns the bytes with the overridden content-type.
+
+**What did NOT happen.** No `BytecodeCache` → `BlobCache` rename
+(the cache only ever holds bytecode, which is what should be in
+worker RAM: small, hot, executed-not-served). No source-bytes
+caching (no source-byte fetches exist in the worker path). The
+plan's "every byte payload shared via the cache" framing was
+wrong for the static-asset axis — see the corresponding feedback
+memory on storage origins vs worker RAM.
 
 ## Edge cases + decisions
 

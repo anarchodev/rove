@@ -112,6 +112,30 @@ pub const BlobBackend = struct {
             .http => |*h| h.blobStore(),
         };
     }
+
+    /// Build a presigned GET URL for `key`. Returns null when the
+    /// backend variant can't presign — today only the `http` (read
+    /// through colocated files-server) variant; an S3 backend always
+    /// produces a URL. Caller frees on success.
+    ///
+    /// Used by Phase 4 of deployment-snapshots-plan to 302-redirect
+    /// static asset requests directly to S3. `expires_secs` caps the
+    /// URL's lifetime (max 604800 = 7 days per the SigV4 spec).
+    /// `response_content_type` overrides whatever Content-Type S3
+    /// has stored for the object — set it from the static
+    /// manifest's `content_type`.
+    pub fn presignGet(
+        self: *BlobBackend,
+        key: []const u8,
+        expires_secs: u32,
+        response_content_type: ?[]const u8,
+        body_allocator: std.mem.Allocator,
+    ) !?[]u8 {
+        return switch (self.inner) {
+            .s3 => |*s| try s.presignGet(key, expires_secs, response_content_type, body_allocator),
+            .http => null,
+        };
+    }
 };
 
 // ── Tests ──────────────────────────────────────────────────────────
