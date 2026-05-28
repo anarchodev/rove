@@ -246,6 +246,14 @@ pub const Request = struct {
     /// on test paths and on subscription/cron/boot fires (those
     /// have no held socket to bind a fetch's lifecycle to).
     activation_entity: ?rove.Entity = null,
+    /// Bound-fetch count snapshot at activation-build time —
+    /// surfaces to JS as `request.fetchesPending` on every
+    /// onFetchChunk activation. Includes the current fetch (i.e.
+    /// `1` on the last chunk of a single bind; `N` on the first
+    /// chunk of N concurrent binds). Customer branches on
+    /// `request.done && request.fetchesPending === 1` to detect
+    /// "this is the last chunk of the last fetch."
+    activation_fetches_pending: u32 = 0,
     /// Per-chain identifier; the same string on every activation of
     /// one logical interaction (streaming-handlers-plan §5/§6). Set
     /// by the runtime — inbound mints it (accepts an inbound
@@ -548,6 +556,7 @@ pub const Dispatcher = struct {
             .register_bound_fetch = request.register_bound_fetch,
             .register_bound_fetch_ctx = request.register_bound_fetch_ctx,
             .activation_entity = request.activation_entity,
+            .activation_fetches_pending = request.activation_fetches_pending,
             .pending_fetches = request.pending_fetches,
             .is_system_module = request.is_system_module,
         };

@@ -749,6 +749,7 @@ fn buildChunkEvent(
     ev.on_chunk_module = try a.dupe(u8, pf.on_chunk_module);
     ev.bytes = try a.dupe(u8, bytes);
     if (pf.bound_send_id.len > 0) ev.bound_send_id = try a.dupe(u8, pf.bound_send_id);
+    if (pf.name.len > 0) ev.name = try a.dupe(u8, pf.name);
     return ev;
 }
 

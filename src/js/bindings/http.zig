@@ -167,6 +167,7 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
         .held = row.held,
         .bind = row.bind,
         .bound_send_id = row.bound_send_id,
+        .name = row.name,
     });
     // Ownership transferred — clear the carrier's slices so its
     // deinit is a no-op.
@@ -178,6 +179,7 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
     row.on_chunk_module = &.{};
     row.ctx_json = &.{};
     row.bound_send_id = &.{};
+    row.name = &.{};
 }
 
 /// `http.cancelFetch({id})` — cancel a not-yet-completed fetch.
@@ -335,6 +337,14 @@ const BuiltFetch = struct {
     /// for this option directly. Empty / null when the caller is
     /// plain `http.fetch` (no held-sync attachment).
     bound_send_id: []u8 = &.{},
+    /// Customer-facing override for the bound-fetch dispatch
+    /// target. Empty (default) → chunks dispatch to the
+    /// `onFetchChunk` named export. Non-empty → chunks dispatch
+    /// to the export named here. Lets multi-bind handlers split
+    /// per-fetch logic into distinct exports without a
+    /// switch(request.fetchId) at the top of one shared handler.
+    /// Allocator-owned dupe.
+    name: []u8 = &.{},
 
     fn deinit(self: *BuiltFetch, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -345,6 +355,7 @@ const BuiltFetch = struct {
         allocator.free(self.on_chunk_module);
         allocator.free(self.ctx_json);
         if (self.bound_send_id.len > 0) allocator.free(self.bound_send_id);
+        if (self.name.len > 0) allocator.free(self.name);
         self.* = undefined;
     }
 };
@@ -372,6 +383,18 @@ fn buildFetchRow(
     // `webhook.send` JS shim. Empty when absent — customers' plain
     // `http.fetch` never sets this.
     fetched.bound_send_id = try dupeJsString(ctx, a, opts, "bound_send_id", "");
+    // Customer-facing `name:` override — see BuiltFetch.name. Empty
+    // = use the default `onFetchChunk` export.
+    fetched.name = try dupeJsString(ctx, a, opts, "name", "");
+    if (fetched.name.?.len > 0) {
+        if (!isValidExportName(fetched.name.?)) {
+            _ = c.JS_ThrowTypeError(
+                ctx,
+                "http.fetch: `name` must be a JS identifier (alphanumeric/underscore/$, first char non-digit)",
+            );
+            return error.JsException;
+        }
+    }
 
     if (fetched.on_chunk_module.?.len == 0) {
         _ = c.JS_ThrowTypeError(ctx, "http.fetch: `on_chunk` (module path) is required");
@@ -398,9 +421,23 @@ fn buildFetchRow(
         .max_total_response_bytes = if (max_total_i64 < 1) 1 else @intCast(max_total_i64),
         .bind = bind,
         .bound_send_id = fetched.bound_send_id.?,
+        .name = fetched.name.?,
     };
     fetched = .{}; // ownership transferred
     return row;
+}
+
+/// JS-identifier validator. Used to gate the customer-supplied
+/// `name:` on http.fetch so a stray space or colon doesn't end up
+/// in a `?fn=` query and silently mis-dispatch.
+fn isValidExportName(s: []const u8) bool {
+    if (s.len == 0) return false;
+    const first = s[0];
+    if (!std.ascii.isAlphabetic(first) and first != '_' and first != '$') return false;
+    for (s[1..]) |b| {
+        if (!std.ascii.isAlphanumeric(b) and b != '_' and b != '$') return false;
+    }
+    return true;
 }
 
 const FetchExtracted = struct {
@@ -412,6 +449,7 @@ const FetchExtracted = struct {
     ctx_json: ?[]u8 = null,
     on_chunk_module: ?[]u8 = null,
     bound_send_id: ?[]u8 = null,
+    name: ?[]u8 = null,
 
     fn deinit(self: *FetchExtracted, a: std.mem.Allocator) void {
         if (self.id) |s| a.free(s);
@@ -422,6 +460,7 @@ const FetchExtracted = struct {
         if (self.ctx_json) |s| a.free(s);
         if (self.on_chunk_module) |s| a.free(s);
         if (self.bound_send_id) |s| a.free(s);
+        if (self.name) |s| a.free(s);
     }
 };
 

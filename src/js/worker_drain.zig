@@ -1365,17 +1365,19 @@ pub fn resumeBoundFetchChain(
     const tc = dep.tc;
     const bc = dep.bc;
 
-    // Build the resume request: target the `onFetchChunk` named
-    // export via ?fn=onFetchChunk (the standard named-export
-    // dispatch shape resumeContinuation already uses). Body is
-    // `{ctx: <ctx_json>}` — handler reads `request.body` for the
-    // chunk bytes from the activation_fetch_bytes slot, not from
-    // request.body.
+    // Build the resume request. Target the customer's chosen
+    // named export — `ev.name` if the bind specified `name:`,
+    // else default `onFetchChunk`. Body is `{ctx: <ctx_json>}` —
+    // handler reads `request.body` for the chunk bytes from the
+    // activation_fetch_bytes slot, not from request.body.
     const ctx_src: []const u8 = if (ev.ctx_json.len > 0) ev.ctx_json else "{}";
     const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{ctx_src}) catch return;
     defer allocator.free(body);
-    const spath = std.fmt.allocPrint(allocator, "/{s}?fn=onFetchChunk", .{path}) catch return;
+    const fn_name: []const u8 = if (ev.name.len > 0) ev.name else "onFetchChunk";
+    const spath = std.fmt.allocPrint(allocator, "/{s}?fn={s}", .{ path, fn_name }) catch return;
     defer allocator.free(spath);
+    const query = std.fmt.allocPrint(allocator, "fn={s}", .{fn_name}) catch return;
+    defer allocator.free(query);
 
     const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
     var txn_owned = true;
@@ -1394,11 +1396,22 @@ pub fn resumeBoundFetchChain(
         break :blk tl.id_minter.nextRequestId() catch 0;
     };
 
+    // Snapshot the per-chain pending-bound-fetch count BEFORE the
+    // activation runs. The component lives on the entity (still
+    // in parked_continuations here); the merged Row guarantees
+    // it's accessible. `0` is the safe default when the
+    // component read fails (corrupt entity / wrong collection —
+    // both shouldn't happen but we don't want to panic on it).
+    const fetches_pending: u32 = blk: {
+        const cnt = server.reg.get(ent, &worker.parked_continuations, components_mod.BoundFetchCount) catch break :blk 0;
+        break :blk cnt.pending;
+    };
+
     var req: Request = .{
         .method = "POST",
         .path = spath,
         .body = body,
-        .query = "fn=onFetchChunk",
+        .query = query,
         .readset = &readset,
         .request_id = request_id,
         .platform = inst.platform,
@@ -1415,6 +1428,7 @@ pub fn resumeBoundFetchChain(
         .register_bound_fetch = &@TypeOf(worker.*).registerBoundFetchTrampoline,
         .register_bound_fetch_ctx = @ptrCast(worker),
         .activation_entity = ent,
+        .activation_fetches_pending = fetches_pending,
     };
     req.activation_fetch_seq = ev.seq;
     req.activation_fetch_byte_offset = ev.byte_offset;
@@ -1459,6 +1473,14 @@ pub fn resumeBoundFetchChain(
     switch (oc) {
         .terminal => |*r| {
             defer r.deinit(allocator);
+            // Chain is going terminal — cancel any sibling binds
+            // pointing at this entity so their in-flight chunks
+            // don't tail-drop into the "mid-transition" branch.
+            // Idempotent + safe for the single-bind case (the
+            // dispatch wrapper's `if (final) unregisterBoundFetch`
+            // would have done it anyway). Per-fetch counter (4)
+            // will hook the same call path.
+            worker_mod.scanAndCancelBoundFetches(worker, ent);
             if (r.exception.len > 0) {
                 txn.rollback() catch {};
                 txn_done = true;

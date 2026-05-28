@@ -185,6 +185,12 @@ pub const PendingFetch = struct {
     /// cont's owning worker. Empty for plain (non-webhook) fetches.
     /// Allocator-owned dupe.
     bound_send_id: []u8 = &.{},
+    /// Customer-facing `name:` override — see
+    /// `bindings/http.zig` BuiltFetch.name. Empty → dispatcher
+    /// uses `onFetchChunk` (default). Non-empty → dispatcher
+    /// uses the supplied identifier as the named-export target.
+    /// Allocator-owned.
+    name: []u8 = &.{},
 
     pub fn deinit(self: *PendingFetch, allocator: std.mem.Allocator) void {
         allocator.free(self.tenant_id);
@@ -196,6 +202,7 @@ pub const PendingFetch = struct {
         allocator.free(self.on_chunk_module);
         allocator.free(self.ctx_json);
         if (self.bound_send_id.len > 0) allocator.free(self.bound_send_id);
+        if (self.name.len > 0) allocator.free(self.name);
         self.* = undefined;
     }
 };
@@ -418,6 +425,10 @@ pub const DispatchState = struct {
     /// (subscription / cron / boot / test paths); the binding
     /// rejects bind:true in that case.
     activation_entity: ?rove.Entity = null,
+    /// Per-chain bound-fetch pending count snapshot — surfaced
+    /// to JS as `request.fetchesPending` on onFetchChunk
+    /// activations.
+    activation_fetches_pending: u32 = 0,
 
     pub fn deinit(self: *DispatchState, ctx: ?*c.JSContext) void {
         var it = self.trigger_module_ns.iterator();
@@ -2039,6 +2050,23 @@ pub fn installRequest(
                 _ = c.JS_SetPropertyStr(ctx, req_obj, "fetchId", c.JS_NewStringLen(ctx, fid.ptr, fid.len));
             }
             _ = c.JS_SetPropertyStr(ctx, req_obj, "chunkSeq", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_seq)));
+            // Pending bound-fetch count including this one.
+            // Customer branches on
+            // `request.done && request.fetchesPending === 1` to
+            // detect "last chunk of last fetch."
+            _ = c.JS_SetPropertyStr(ctx, req_obj, "fetchesPending", c.JS_NewInt64(ctx, @intCast(request.activation_fetches_pending)));
+            // Terminal-only fields. Customer's onFetchChunk
+            // branches on `request.done` and inspects these to
+            // decide between "all good" and "transport / upstream
+            // failure." Mirrors handler-shape.md §3 — these are
+            // the same fields that ride on the unbound
+            // `request.activation.{ok,status,body_truncated}` but
+            // hoisted to the top level for the bound surface.
+            if (request.activation_fetch_final) {
+                _ = c.JS_SetPropertyStr(ctx, req_obj, "ok", if (request.activation_fetch_terminal_ok) js_true else js_false);
+                _ = c.JS_SetPropertyStr(ctx, req_obj, "status", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_terminal_status)));
+                _ = c.JS_SetPropertyStr(ctx, req_obj, "body_truncated", if (request.activation_fetch_body_truncated) js_true else js_false);
+            }
         }
     }
 
