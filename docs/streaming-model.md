@@ -144,15 +144,15 @@ activation-kind → export-name table and `request` shape per kind.
 ### What this section used to specify
 
 Before [`handler-shape.md`](handler-shape.md), this section
-proposed the surface itself — a "three-way choice" returned by the
-handler when the body exceeded a soft 64 KiB budget: respond now,
-park-until-body-complete, or switch to per-chunk streaming.
-That surface (and its `__rove_next` / `__rove_stream` /
-`request.activation.kind` plumbing) is superseded by the
-two-shape (`default` or `onChunk`) named-export design. The
-underlying engine — body accumulation through the readset blob
-substrate, per-chunk dispatch, the one-rule commit semantics —
-is unchanged; only the customer-visible API changed.
+proposed the customer surface — a soft 64 KiB coalesce budget
+with the handler returning one of several options when the body
+exceeded it. That surface (and its `__rove_next` / `__rove_stream`
+/ `request.activation.kind` plumbing) is superseded by the
+two-shape (`default` or `onChunk`) named-export design with a
+hard 1 MB ceiling on `default`. The underlying engine — body
+accumulation through the readset blob substrate, per-chunk
+dispatch, the one-rule commit semantics — is unchanged; only the
+customer-visible API changed.
 
 ---
 
@@ -369,16 +369,18 @@ impl keeps the fast-path. Both statements are true at once.
    chain (`fetch_chunk` as a real `__rove_stream` wake source).
    Retrofit of the shipped Pattern A; `pipe_to` + transport +
    transient/durable split all untouched.
-2. `request.body_complete` + the coalesce budget producing a
-   partial first `inbound` dispatch instead of a `413`.
-3. The (b) path — `__rove_next` from an incomplete-body `inbound`
-   re-dispatches the chain on body-complete.
-4. The (c) path — `inbound_chunk` / `inbound_end` Msgs; inbound
+2. The 1 MB buffered ceiling — coalesce the request body up to the
+   ceiling; > 1 MB without `onChunk` exported → 413 from the
+   runtime before any handler invocation.
+3. The `onChunk` path — `inbound_chunk` / `inbound_end` engine
+   Msgs dispatched to the module's `onChunk` export; inbound
    coalescing off; h2 `DATA`-frame → cross-thread chunk inbox
-   (reuses Gap 2.3's shape).
-5. Inbound backpressure — h2 `WINDOW_UPDATE` gating (real flow
+   (reuses Gap 2.3's shape). Small bodies (≤ 1 MB) with no
+   `default` export fire `onChunk` once with the whole body and
+   `request.done = true`.
+4. Inbound backpressure — h2 `WINDOW_UPDATE` gating (real flow
    control); `RST_STREAM` a non-conformant client.
-6. Gap 2.5 — bound outbound with no terminal + reconnect policy.
+5. Gap 2.5 — bound outbound with no terminal + reconnect policy.
 
 No step changes a shipped buffered handler, a shipped
 `__rove_stream` handler, or `http.fetch` Pattern B.
@@ -587,25 +589,19 @@ cross-tenant `_pool/` + raft-reserved batch_id (Phase 5 shipped
 
 ## 8. Open questions
 
-- **Coalesce budget above the 64 KiB floor.** The 64 KiB
-  single-activation guarantee (§3) is fixed. The *budget* — the
-  point past which a body is dispatched partial — may sit higher;
-  v1 keeps one budget and `REQUEST_BODY_CAP` is the candidate. A
-  handler wanting body chunk #1 with *zero* buffering needs budget
-  0 (dispatch on headers); defer that per-route knob. v1's fixed
-  budget means "first budget-worth buffered, rest streamed," fine
-  for uploads and adequate for proxies.
+- **`onChunk` per-chunk coalesce sizing.** The 64 KiB per-chunk
+  default for `onChunk` matches outbound `max_response_chunk_bytes`
+  and is a reasonable starting point; a per-route knob for "small
+  chunks for low-latency proxies" vs "large chunks for throughput"
+  may be useful later. Defer until a customer needs it.
 - **Duplex.** A chain receiving `inbound_chunk`s *and* emitting
-  `write` chunks concurrently is expressible in the model (both are
-  just steps). v1 may still restrict to "receive fully, then
-  respond" by convention — the mechanism does not forbid duplex, so
-  lifting the restriction later costs nothing. Decide before the
-  (c)-path response wiring.
+  `write` chunks concurrently is expressible in the model (both
+  are just steps). v1 may still restrict to "receive fully, then
+  respond" by convention — the mechanism does not forbid duplex,
+  so lifting the restriction later costs nothing. Decide before
+  the `onChunk` response wiring.
 - **`fetch_result` vs keeping `http.fetch` streaming-only.** The
   model says a coalesced fetch is natural; whether to actually
   surface `fetch_result` or tell customers "use `http.send` for
-  coalesced, `http.fetch` for streamed" is an ergonomics call, not
-  a model question.
-- **The flag's name.** `request.body_complete` (bool, `true` in
-  the common case so `if (!request.body_complete)` reads right) —
-  vs `body_chunked` / a richer `request.body` object. Naming only.
+  coalesced, `http.fetch` for streamed" is an ergonomics call,
+  not a model question.
