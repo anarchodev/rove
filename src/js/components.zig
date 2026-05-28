@@ -298,6 +298,14 @@ pub const UpstreamFetchEvent = struct {
     /// of firing a separate `fireFetchEventActivation` chain.
     /// Carried from `PendingFetch.bind` by the FetchEngine.
     bind: bool = false,
+    /// `docs/cross-worker-held-state-plan.md` Phase 2B: webhook.send
+    /// shim's send_id. Set when the fetch was issued by
+    /// `webhook.send` (via the `bound_send_id` option); empty
+    /// otherwise. The chunk router consults
+    /// `bound_send_owners[bound_send_id]` to route the callback
+    /// to the cont's owning worker. Allocator-owned dupe; freed
+    /// in `deinitItem`.
+    bound_send_id: []u8 = &.{},
 
     pub fn deinit(allocator: std.mem.Allocator, items: []UpstreamFetchEvent) void {
         for (items) |*item| deinitItem(item, allocator);
@@ -315,6 +323,7 @@ pub const UpstreamFetchEvent = struct {
         if (item.on_chunk_module.len > 0) allocator.free(item.on_chunk_module);
         if (item.bytes.len > 0) allocator.free(item.bytes);
         if (item.fetch_headers) |h| allocator.free(h);
+        if (item.bound_send_id.len > 0) allocator.free(item.bound_send_id);
         item.* = .{};
     }
 };

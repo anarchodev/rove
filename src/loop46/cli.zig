@@ -130,10 +130,10 @@ pub const Cli = struct {
     /// `limiter.RateLimitCaps`'s defaults; flags below let
     /// operators tune them at launch + smoke tests dial them
     /// down to small values to provoke 429s in a few requests.
-    rate_limit_request_capacity: u32 = 100,
-    rate_limit_request_refill: u32 = 50,
-    rate_limit_email_capacity: u32 = 10,
-    rate_limit_email_refill: u32 = 1,
+    rate_limit_request_capacity: u32 = 1000,
+    rate_limit_request_refill: u32 = 500,
+    rate_limit_email_capacity: u32 = 100,
+    rate_limit_email_refill: u32 = 10,
     /// Public origin the dashboard hits to call the log-server
     /// process. Auto-derived to `https://logs.{public_suffix}` when
     /// only `--public-suffix` is set (the common single-cluster

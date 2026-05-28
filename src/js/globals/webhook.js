@@ -217,6 +217,14 @@ globalThis.webhook = {
           "X-Rove-Schedule-Version": "1",
         }),
         on_chunk: "__system/webhook_onresult",
+        // docs/cross-worker-held-state-plan.md Phase 2B: stamp the
+        // send_id so the chunk router (Zig) consults
+        // bound_send_owners[id] and routes the callback to the
+        // cont's owning worker (instead of hash(tenant_id), which
+        // may differ from the SO_REUSEPORT-chosen accept worker).
+        // Platform-internal option — customers don't use it
+        // directly.
+        bound_send_id: id,
         ctx: {
           id: id,
           on_result: on_result,
