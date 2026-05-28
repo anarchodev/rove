@@ -359,6 +359,83 @@ fn isSha256Hex(s: []const u8) bool {
     return true;
 }
 
+/// Heuristic predicate: does this source use
+/// `http.fetch({bind: true})` (or one of its whitespace variants)
+/// without an `onFetchChunk` symbol anywhere? Substring-based;
+/// returns true when the lint would warn. Public so a unit test
+/// can drive it.
+pub fn sourceViolatesBindOnFetchChunkRule(src: []const u8) bool {
+    const has_bind_true =
+        std.mem.indexOf(u8, src, "bind: true") != null or
+        std.mem.indexOf(u8, src, "bind:true") != null or
+        std.mem.indexOf(u8, src, "bind : true") != null;
+    if (!has_bind_true) return false;
+    return std.mem.indexOf(u8, src, "onFetchChunk") == null;
+}
+
+/// Deploy-time lint: when the predicate above fires, emit a
+/// `std.log.warn` so operators see the violation in deploy logs.
+///
+/// The patterns are deliberately loose (substring match). False
+/// positives in unusual code (e.g. a bare `bind: true` in a
+/// comment, or `onFetchChunk` mentioned but not exported) are
+/// acceptable for a deploy-time linter; the cost of the warning
+/// is low and the cost of a missing-export footgun in production
+/// (25s deadline → 504 with no signal to the customer) is high.
+///
+/// Per `docs/handler-shape.md` §6.
+fn lintHandlerSource(path: []const u8, src: []const u8) void {
+    if (!sourceViolatesBindOnFetchChunkRule(src)) return;
+    std.log.warn(
+        "files-server lint ({s}): http.fetch({{bind: true}}) detected without onFetchChunk export. " ++
+            "Bound fetch chunks will not resume a held chain — see docs/handler-shape.md §5.5.",
+        .{path},
+    );
+}
+
+test "sourceViolatesBindOnFetchChunkRule: violates when bind:true present + no onFetchChunk" {
+    const t = std.testing;
+    try t.expect(sourceViolatesBindOnFetchChunkRule(
+        \\export default function () {
+        \\  http.fetch({ url: "x", bind: true });
+        \\  return __rove_next("path");
+        \\}
+    ));
+    try t.expect(sourceViolatesBindOnFetchChunkRule(
+        \\http.fetch({bind:true, url:"x"});
+    ));
+    try t.expect(sourceViolatesBindOnFetchChunkRule(
+        \\http.fetch({ bind : true });
+    ));
+}
+
+test "sourceViolatesBindOnFetchChunkRule: clean when both present" {
+    const t = std.testing;
+    try t.expect(!sourceViolatesBindOnFetchChunkRule(
+        \\export default function () {
+        \\  http.fetch({ url: "x", bind: true });
+        \\  return __rove_next("path");
+        \\}
+        \\export function onFetchChunk() { return ""; }
+    ));
+}
+
+test "sourceViolatesBindOnFetchChunkRule: clean when no bind:true at all" {
+    const t = std.testing;
+    try t.expect(!sourceViolatesBindOnFetchChunkRule(
+        \\export default function () {
+        \\  http.fetch({ url: "x", on_chunk: "module" });
+        \\  return "ok";
+        \\}
+    ));
+    // `obj.bind(this)` is NOT the http.fetch bind: option — that's
+    // a method call. Our substring check doesn't see `bind: true`
+    // here, so no false positive.
+    try t.expect(!sourceViolatesBindOnFetchChunkRule(
+        \\setTimeout(fn.bind(this), 100);
+    ));
+}
+
 /// Entry for `deployManifest`: one row in the incoming manifest,
 /// referencing a blob by its content hash. `content_type` is
 /// ignored for handlers (they always compile) and falls back to
@@ -454,6 +531,12 @@ pub fn deployManifest(
         };
         owned_sources.append(allocator, src) catch return Error.OutOfMemory;
         compiler.putSource(entry.path, src) catch return Error.OutOfMemory;
+        // `docs/handler-shape.md` §6 deploy-time lint: surface a
+        // warning when bind:true is used without a matching
+        // onFetchChunk export. Heuristic textual scan — false
+        // positives possible (e.g. unrelated `bind: true` in a
+        // comment) but cheap and low-stakes.
+        lintHandlerSource(entry.path, src);
     }
 
     // ── Stamp each entry. putSourceByHash fetches the source blob
@@ -609,6 +692,7 @@ pub fn putFileAndDeploy(
         try h.init(allocator, data_dir, files_root_kv, blob_cfg, instance_id, InlineCompiler.compile, &compiler);
         defer h.deinit();
         h.store.putSource(path, body) catch |err| return mapCodeError(err);
+        lintHandlerSource(path, body);
         const cur = h.store.currentDeploymentId() catch |err| return mapCodeError(err);
         return writeManifestFromWorkingTree(allocator, &h, blob_cfg, instance_id, cur);
     } else {
