@@ -1303,6 +1303,24 @@ fn handleMetrics(
     try writeCountHistogram(w, "raft_proposal_batch_size_writesets", worker.raft.proposalBatchSizeSnapshot());
     try writeMicrosHistogram(w, "raft_proposal_linger_wait_us", worker.raft.proposalLingerWaitSnapshot());
 
+    // `docs/cross-worker-held-state-plan.md` Phase 2A: routing
+    // observability. cross_worker counts wake events routed to a
+    // worker different from hash(tenant_id) — the path that would
+    // have silently failed pre-Phase-2A. A non-zero count means the
+    // SO_REUSEPORT vs hash(tenant_id) gap is being closed in practice.
+    try w.print(
+        \\# HELP bound_fetch_cross_worker_routes_total bound fetch chunks routed to owner worker ≠ hash(tenant_id) % N (the Phase 2A path).
+        \\# TYPE bound_fetch_cross_worker_routes_total counter
+        \\bound_fetch_cross_worker_routes_total {d}
+        \\# HELP bound_fetch_same_worker_routes_total bound fetch chunks where owner worker == hash(tenant_id) % N (correct but doesn't exercise the bug fix).
+        \\# TYPE bound_fetch_same_worker_routes_total counter
+        \\bound_fetch_same_worker_routes_total {d}
+        \\
+    , .{
+        worker.node.bound_fetch_cross_worker_routes.load(.monotonic),
+        worker.node.bound_fetch_same_worker_routes.load(.monotonic),
+    });
+
     // Move the writer's accumulated bytes back into the ArrayList,
     // then transfer ownership to the response body. `toArrayList`
     // does NOT free the writer's buffer — it hands it back to us.

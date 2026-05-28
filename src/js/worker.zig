@@ -1341,6 +1341,21 @@ pub const NodeState = struct {
     bound_fetch_owners: std.StringHashMapUnmanaged(usize) = .empty,
     bound_send_owners: std.StringHashMapUnmanaged(usize) = .empty,
 
+    /// Phase 2A instrumentation — observability for the
+    /// owner-routing path. `cross_worker_routes` counts decisions
+    /// where the owner worker differs from `hash(tenant_id) % N`
+    /// (i.e., the path that would have failed pre-Phase-2A);
+    /// `same_worker_routes` counts decisions where they happen to
+    /// coincide (correct but doesn't exercise the bug fix). A
+    /// smoke that sees zero cross-worker routes hasn't actually
+    /// tested the routing — its kernel SO_REUSEPORT spread
+    /// happened to coincide with the tenant hash. Counters never
+    /// reset; surfaced on `/_system/metrics` as
+    /// `bound_fetch_cross_worker_routes_total` /
+    /// `bound_fetch_same_worker_routes_total`.
+    bound_fetch_cross_worker_routes: std.atomic.Value(u64) = .init(0),
+    bound_fetch_same_worker_routes: std.atomic.Value(u64) = .init(0),
+
     /// Phase 5 PR-2b: built-in `__system/*` module bytecodes,
     /// compiled once at `init` from sources baked into the binary
     /// (see `src/js/builtin_modules.zig`). Shared across every
@@ -1624,12 +1639,26 @@ pub const NodeState = struct {
         for (items) |pf| try engine.submit(pf);
     }
 
-    /// Gap 2.3 Phase C2 + effect-reification Phase 2E: hash-route a
+    /// Gap 2.3 Phase C2 + effect-reification Phase 2E: route a
     /// fetch event (chunk / end / pipe_done) to the destination
     /// worker's unified `MsgInbox` as the matching `effect.Msg`
     /// variant. Caller-side ownership of every owned slice in `ev`
     /// transfers in on success; on `error.NoWorkers` the caller
     /// retains and is responsible for `UpstreamFetchEvent.deinitItem`.
+    ///
+    /// `docs/cross-worker-held-state-plan.md` Phase 2A: when
+    /// `ev.bind` is true AND `bound_fetch_owners[ev.fetch_id]`
+    /// resolves, route directly to the owning worker's inbox.
+    /// Otherwise fall back to `hash(tenant_id)` — the existing
+    /// behavior for unbound (Pattern A) fetches, subscription
+    /// fires, cron, kv-react, etc.
+    ///
+    /// The owner-routing path closes the cross-worker bind gap:
+    /// the inbound that registered the bound fetch may live on a
+    /// kernel-chosen worker (SO_REUSEPORT) different from
+    /// `hash(tenant_id) % N`; without owner routing the chunk
+    /// arrives on the wrong worker and the bound resume fails
+    /// silently until the §6.4 25s deadline.
     pub fn enqueueFetchEventForTenant(
         self: *NodeState,
         tenant_id: []const u8,
@@ -1639,7 +1668,49 @@ pub const NodeState = struct {
         // event's `final` flag distinguishes streaming intermediates
         // from the terminal.
         const msg: effect_mod.Msg = .{ .fetch_chunk = ev };
+        if (ev.bind) {
+            if (self.lookupBoundFetchOwner(ev.fetch_id)) |owner_idx| {
+                // Phase 2A instrumentation: count cross-worker
+                // routes so smokes can assert the path actually
+                // fires. A "same-worker" route is correct but
+                // doesn't exercise the cross-worker bug fix —
+                // smokes need at least one cross-worker hit to be
+                // meaningful.
+                self.msg_inboxes_mutex.lock();
+                const n = self.msg_inboxes.items.len;
+                self.msg_inboxes_mutex.unlock();
+                const hash_idx = if (n > 0) std.hash.Wyhash.hash(0, tenant_id) % n else 0;
+                if (owner_idx != hash_idx) {
+                    _ = self.bound_fetch_cross_worker_routes.fetchAdd(1, .monotonic);
+                } else {
+                    _ = self.bound_fetch_same_worker_routes.fetchAdd(1, .monotonic);
+                }
+                return self.enqueueMsgToWorker(owner_idx, msg);
+            }
+        }
         try self.enqueueMsgForTenant(tenant_id, msg);
+    }
+
+    /// `docs/cross-worker-held-state-plan.md` Phase 2A: push a
+    /// Msg directly to the worker at `worker_idx` (bypassing
+    /// `hash(tenant_id)`). Used by the held-state owner routing
+    /// path: when a bound fetch's chunk arrives, we know which
+    /// worker holds the receiving entity and route the event
+    /// there. Returns `error.NoWorkers` if the registry has no
+    /// inbox at that index (cold start, or registry torn down).
+    pub fn enqueueMsgToWorker(
+        self: *NodeState,
+        worker_idx: usize,
+        msg: effect_mod.Msg,
+    ) !void {
+        self.msg_inboxes_mutex.lock();
+        if (worker_idx >= self.msg_inboxes.items.len) {
+            self.msg_inboxes_mutex.unlock();
+            return error.NoWorkers;
+        }
+        const inbox = self.msg_inboxes.items[worker_idx];
+        self.msg_inboxes_mutex.unlock();
+        try inbox.push(msg);
     }
 
     /// Gap 2.1 Phase D + effect-reification Phase 2E: hash-route a
