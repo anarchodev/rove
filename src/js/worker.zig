@@ -63,6 +63,9 @@ const bodies_mod = @import("rove-bodies");
 const tenant_mod = @import("rove-tenant");
 
 const dispatcher_mod = @import("dispatcher.zig");
+const bytecode_cache_mod = @import("bytecode_cache.zig");
+pub const BlobBytes = bytecode_cache_mod.BlobBytes;
+pub const BytecodeCache = bytecode_cache_mod.BytecodeCache;
 const continuation_mod = @import("bindings/continuation.zig");
 const Continuation = continuation_mod.Continuation;
 const stream_mod = @import("bindings/stream.zig");
@@ -804,12 +807,20 @@ test "subscriptionPathParts: handler + spec + rejects" {
 /// another completely, never a mid-reload mix.
 pub const TenantFilesSnapshot = struct {
     allocator: std.mem.Allocator,
+    /// Borrowed pointer to the node-wide content-addressed cache.
+    /// Snapshot `deinit` releases every bytecode lease through it.
+    /// Always non-null in production — `reloadDeployment` is the
+    /// only constructor and it pulls the cache from `slot.node`,
+    /// which `openTenantSlotNode` always sets.
+    cache: *BytecodeCache,
     /// Deployment id this snapshot represents. Equal to the
     /// `_deploy/current` hex value at the moment the loader built it.
     deployment_id: u64,
     /// All handler bytecodes from this deployment, keyed by full
-    /// deployment path. Keys and values are allocator-owned.
-    bytecodes: std.StringHashMapUnmanaged([]u8),
+    /// deployment path. Keys are allocator-owned; values are leases
+    /// into the node-wide `BytecodeCache` (Phase 3) — snapshot
+    /// `deinit` releases each via `cache.release`.
+    bytecodes: std.StringHashMapUnmanaged(*BlobBytes),
     /// Source-blob hash hex (64 chars) per handler path. Parallel to
     /// `bytecodes`. Read by the QuickJS module loader for per-request
     /// module-resolution tapes.
@@ -849,7 +860,7 @@ pub const TenantFilesSnapshot = struct {
         var bc_it = self.bytecodes.iterator();
         while (bc_it.next()) |entry| {
             allocator.free(entry.key_ptr.*);
-            allocator.free(entry.value_ptr.*);
+            self.cache.release(entry.value_ptr.*);
         }
         self.bytecodes.deinit(allocator);
         var sh_it = self.source_hashes.iterator();
@@ -1239,6 +1250,14 @@ pub const NodeState = struct {
     tenant_files_map: TenantMap(TenantSlot) = .empty,
     tenant_files_lock: std.Thread.Mutex = .{},
 
+    /// Phase 3 of `docs/deployment-snapshots-plan.md`: content-
+    /// addressed cache of bytecode blobs shared across every tenant
+    /// snapshot on this node. Loader does `acquire(hash)` per
+    /// manifest entry; only fetches the misses. Cross-tenant blob
+    /// sharing falls out automatically. Snapshot `deinit` releases
+    /// leases through this cache.
+    bytecode_cache: BytecodeCache = .{ .allocator = undefined },
+
     /// Single deployment loader thread for the whole process.
     /// `_deploy/current` changes from any worker / apply path enqueue
     /// here; one reload reaches every worker. Replaces the per-worker
@@ -1371,6 +1390,7 @@ pub const NodeState = struct {
             .blob_backend_cfg = blob_backend_cfg,
             .raft = raft,
             .builtin_modules = builtins,
+            .bytecode_cache = .{ .allocator = allocator },
         };
     }
 
@@ -1646,6 +1666,14 @@ pub const NodeState = struct {
             self.deployment_loader = null;
         }
         self.tenant_files_map.deinit(self.allocator);
+        // Bytecode cache must die AFTER every slot — slots release
+        // their snapshots' leases through the cache on free. Once
+        // tenant_files_map.deinit returns, every snapshot the node
+        // ever held has dropped its slot reference. In-flight pinned
+        // requests should already be drained by the worker shutdown
+        // path; any surviving entry trips the assert in
+        // `BytecodeCache.deinit`.
+        self.bytecode_cache.deinit();
         if (self.manifest_prefetch) |*map| {
             var it = map.iterator();
             while (it.next()) |entry| {
@@ -3218,12 +3246,20 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
 
     // Build the new maps in locals before installing, so if any fetch
     // fails mid-way the slot keeps serving the old deployment.
-    var next_bc: std.StringHashMapUnmanaged([]u8) = .empty;
+    //
+    // Phase 3: bytecode values are leases (`*BlobBytes`) into the
+    // node-wide `BytecodeCache`. The errdefer releases each partial
+    // lease so a mid-build fetch failure doesn't leak refcount on
+    // any cache entry we already touched (either reused or fresh-
+    // inserted).
+    const node = slot.node orelse return error.SlotNotOpenedThroughNode;
+    const cache: *BytecodeCache = &node.bytecode_cache;
+    var next_bc: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
     errdefer {
         var it = next_bc.iterator();
         while (it.next()) |e| {
             allocator.free(e.key_ptr.*);
-            allocator.free(e.value_ptr.*);
+            cache.release(e.value_ptr.*);
         }
         next_bc.deinit(allocator);
     }
@@ -3259,9 +3295,18 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
         errdefer allocator.free(path_copy);
         switch (entry.kind) {
             .handler => {
-                const bytecode = try bs.get(&entry.bytecode_hex, allocator);
-                errdefer allocator.free(bytecode);
-                try next_bc.put(allocator, path_copy, bytecode);
+                // Phase 3 diff-fetch: try the cache first; only the
+                // misses hit S3. Two tenants with the same bytecode
+                // hash share one cache entry — the second tenant's
+                // load sees the existing `*BlobBytes` and just bumps
+                // refcount.
+                const bb: *BlobBytes = if (cache.acquire(&entry.bytecode_hex)) |hit| hit else blk: {
+                    const bytes = try bs.get(&entry.bytecode_hex, allocator);
+                    errdefer allocator.free(bytes);
+                    break :blk try cache.insert(&entry.bytecode_hex, bytes);
+                };
+                errdefer cache.release(bb);
+                try next_bc.put(allocator, path_copy, bb);
 
                 // Mirror the path → source-hash mapping so the per-
                 // request module loader can stamp `appendModule(name,
@@ -3341,6 +3386,7 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
     errdefer allocator.destroy(new_snap);
     new_snap.* = .{
         .allocator = allocator,
+        .cache = cache,
         .deployment_id = manifest.id,
         .bytecodes = next_bc,
         .source_hashes = next_source_hashes,
@@ -4684,8 +4730,8 @@ pub fn findBytecode(
         defer allocator.free(mjs_key);
         const js_key = try std.fmt.allocPrint(allocator, "{s}.js", .{cur});
         defer allocator.free(js_key);
-        if (tc.snap.bytecodes.get(mjs_key)) |bc| return bc;
-        if (tc.snap.bytecodes.get(js_key)) |bc| return bc;
+        if (tc.snap.bytecodes.get(mjs_key)) |bb| return bb.bytes;
+        if (tc.snap.bytecodes.get(js_key)) |bb| return bb.bytes;
 
         // At the root? Done — nothing matched.
         if (std.mem.eql(u8, cur, "index")) return null;

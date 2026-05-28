@@ -262,15 +262,28 @@ Snapshot construction in phase 2 *still re-fetches every bytecode*.
 That's a regression vs phase 1 (which reused the in-memory map). The
 phase 3 cache restores reuse and goes beyond it.
 
-### Phase 3 — Content-addressed BytecodeCache
+### Phase 3 — Content-addressed BytecodeCache — **shipped 2026-05-27**
 
-Replace `TenantFilesSnapshot.bytecodes` value type from `[]u8` to
-`*BlobBytes`. Add the process-wide `BytecodeCache`. Loader diffs the
-new manifest's hashes against what the cache already holds; only
-fetches the misses.
+`TenantFilesSnapshot.bytecodes` value type changed from `[]u8` to
+`*BlobBytes`. Process-wide `BytecodeCache` lives on `NodeState`
+(extracted to `src/js/bytecode_cache.zig` to keep the
+worker ↔ dispatcher import graph acyclic — both modules and
+`globals.zig` now import the cache module directly). Loader calls
+`cache.acquire(bytecode_hex)` per manifest entry; only the misses
+go through `bs.get` + `cache.insert`. Snapshot deinit releases
+every lease through the cache; last release removes the entry and
+frees the bytes.
 
-Storage and bandwidth become O(changed files). Cross-tenant blob
-sharing falls out for free.
+Storage and bandwidth are now O(changed files). Cross-tenant blob
+sharing falls out: two tenants pulling the same bytecode hash share
+one cache entry. Concurrent-insert race handled (second caller's
+bytes freed, existing entry returned with bumped refcount).
+NodeState.deinit tears down the cache AFTER the tenant slot map so
+every lease is released before the cache's empty-map assert.
+
+Pre-Phase-3 the loader re-fetched every bytecode on every release —
+a regression vs Phase 1's in-memory reuse that Phase 3's diff-fetch
+restores AND extends with cross-tenant sharing.
 
 ### Phase 4 — Same model for sources and statics
 
