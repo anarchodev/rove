@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""End-to-end smoke for `docs/streaming-model.md` §7 item 1 +
+`docs/handler-shape.md` §5.5 — `http.fetch({bind: true})`.
+
+What it proves:
+
+  client ──GET /boundproxy?url=<wb/bulk>──▶ acme entry handler
+     entry: http.fetch({url, bind:true, on_chunk:'boundproxy', ...})
+       → registers fetch_id → entity in worker.bound_fetch_entities
+       → returns __rove_next('boundproxy', {ctx}) — chain parks in
+         parked_continuations, held client stays open
+     FetchPool: drains, libcurl-GETs wb/bulk, builds an
+       UpstreamFetchEvent with bind=true
+     worker tick: dispatchPendingMsgs `.fetch_chunk` arm sees
+       ev.bind, looks up the held entity, calls
+       resumeBoundFetchChain — dispatches /boundproxy?fn=onFetchChunk
+     handler: onFetchChunk returns JSON encoding fetchId/chunkSeq/
+       done/body → terminal Response on the held socket.
+
+The smoke asserts the held client receives the JSON, with
+`done: true` (single-chunk fetch) and the upstream body bytes
+visible in `body`. The whole flow rides one HTTP/2 connection.
+
+V1 scope: stream=false on the fetch so one chunk delivers (final).
+Multi-chunk stream({write}) per upstream chunk is the follow-up
+(needs the stream-chain wake-on-fetch path).
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from smoke_lib import Cluster, curl  # noqa: E402
+
+TOKEN = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+PUBLIC_SUFFIX = "rewindjsapp.localhost"
+ACME_HOST = f"acme.{PUBLIC_SUFFIX}"
+WB_HOST = f"wb.{PUBLIC_SUFFIX}"
+
+EXPECTED_BODY = "".join(f"bulk-line-{i:02d}-zzz\n" for i in range(10))
+
+
+def main() -> int:
+    repo_root = Path(__file__).resolve().parent.parent
+    cluster = Cluster.spawn(
+        tag="bound-fetch-smoke",
+        http_base=8350,
+        raft_base=40450,
+        public_suffix=PUBLIC_SUFFIX,
+        root_token=TOKEN,
+        # Single worker — bound fetch chunks hash-route by tenant; with
+        # one worker per node the chunks land where the inbound's held
+        # entity lives. (Cross-worker bind is an explicit open follow-up
+        # per the plan; the dispatcher's lookup-miss path logs + falls
+        # through to unbound dispatch.)
+        workers_per_node=1,
+        with_log_files_bases=False,
+        seed_manifest=repo_root / "examples" / "loop46-demo-tenants.json",
+        worker_extra_args=["--dev-webhook-unsafe"],
+    )
+    with cluster as c:
+        c.discover_leader()
+        leader_port = c.leader_port()
+        print(f"ok  leader elected: node {c.leader_idx} at {c.addrs.http[c.leader_idx]}")
+
+        cc = c.curl_ctx(ACME_HOST, WB_HOST)
+        acme_origin = f"https://{ACME_HOST}:{leader_port}"
+        bulk_url = f"https://{WB_HOST}:{leader_port}/bulk"
+
+        # 1. Sanity: upstream reachable + deterministic body.
+        deadline = time.monotonic() + 20.0
+        ok = False
+        while time.monotonic() < deadline:
+            r = curl(cc, bulk_url, method="GET")
+            if r.status == 200 and r.body == EXPECTED_BODY:
+                ok = True
+                break
+            time.sleep(0.2)
+        if not ok:
+            sys.exit(f"FAIL wb/bulk sanity: status={r.status} body={r.body!r}")
+        print(f"ok  wb/bulk upstream reachable; {len(EXPECTED_BODY)}-byte body")
+
+        # 2. acme reachable.
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            if curl(cc, f"{acme_origin}/", method="GET").status in (200, 404):
+                break
+            time.sleep(0.2)
+
+        # 3. THE bound fetch. The held socket should receive a JSON
+        #    response shaped by `onFetchChunk` — fetchId / chunkSeq /
+        #    done / body. The handler returns on the first upstream
+        #    chunk (V1 scope: terminal Response, no multi-chunk
+        #    stream({write})).
+        r = curl(cc, f"{acme_origin}/boundproxy?url={bulk_url}", method="GET")
+        if r.status != 200:
+            sys.exit(f"FAIL /boundproxy status={r.status} body={r.body!r}")
+        try:
+            payload = json.loads(r.body)
+        except Exception as e:
+            sys.exit(f"FAIL /boundproxy non-JSON body ({e}): {r.body!r}")
+
+        if not payload.get("fetchId"):
+            sys.exit(f"FAIL onFetchChunk: missing fetchId: {payload!r}")
+        if payload.get("done") is not True:
+            sys.exit(f"FAIL onFetchChunk: expected done=true (single-chunk fetch): {payload!r}")
+        body_field = payload.get("body", "")
+        if EXPECTED_BODY not in body_field:
+            sys.exit(
+                f"FAIL onFetchChunk: upstream body not visible in `body`:\n"
+                f"  got:  {body_field!r}\n"
+                f"  want substring: {EXPECTED_BODY!r}"
+            )
+        print(
+            f"ok  bound chunk fired onFetchChunk on held chain "
+            f"(fetchId={payload['fetchId'][:16]}…, done={payload['done']}, "
+            f"body={len(body_field)} bytes)"
+        )
+
+    print()
+    print(
+        "bound-fetch smoke passed (docs/streaming-model.md §7 item 1: "
+        "http.fetch({bind:true}) wakes the calling chain's onFetchChunk "
+        "named export instead of firing a separate fetch-<id> chain)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
