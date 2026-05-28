@@ -258,7 +258,7 @@ Ten effect-shapes scored against §4. `✓` conforms, `✗` diverges.
 | `webhook.send` / `email.send` (JS shims) | marker taped via the ordinary env-0 writeset; the shim's `on_result` activation is taped like every other chain hop ✓ | retry-cron rate ✓ ; first-attempt rides handler dispatch; subsequent attempts ride the cron sweep ✓ | at-least-once at the *attempt* level (M1) via marker-write/clear; **NOT** retry-to-success — that is the shim's policy choice | `_send/owed/{id}` kv (durable, replicated) + the shim's per-attempt scratch state |
 | `blob.put` (JS shim) | marker taped via env-0 writeset ✓; PUT request itself rides http-out's taping; `on_result` is taped like any chain hop ✓ | retry-cron rate ✓; bytes ride the activation's QJS arena until first PUT completes (not held across retries — recovery re-derives) | transient-loss-tolerant; **eventually recoverable** from inputs via re-execution per §2.5 — content-addressing makes retry idempotent; readset-replication is the recovery prerequisite | `_blob/owed/{hash}` kv (durable, replicated) carries only `{correlation_id, seq, call_index, dest_key}`; bytes themselves live in BlobStore at `{tenant}/blobs/{hash}` (cache; transiently absent OK) |
 | `blob.get` (JS shim) | http-out taping applies ✓ | http-out's `fetch_pending` cap ✓ | at-most-once read; transient backend miss surfaces as 503 — caller retries; no recovery, no marker | none |
-| subscriptions | taped per fire ✓ | cron 1 Hz ✓; kv-react no limit ✗; per-tenant cap maybe NOT BUILT | boot: single-fire via writeset-bundled `_boot_fired/<dep_id>` marker (`worker_streaming.zig:1105`) ✓; cron + kv-react: at-most-once | `subscription_fire_pending` collection ✓; `cron_state` plain hashmap ✗ |
+| subscriptions | taped per fire ✓ | cron 1 Hz ✓; kv-react no limit ✗; per-tenant cap maybe NOT BUILT | boot: single-fire via writeset-bundled `_boot_fired/<dep_id>` marker (`worker_streaming.zig:1105`) ✓; cron + kv-react: at-most-once | `subscription_fire_pending` collection ✓; `cron_state` collection ✓ (worker-0 owned) |
 | streaming out | taped per activation ✓ (cap 10 MB / 50k) | wake ring K=32 + `StreamChunks` 256 KB — lossy, surfaced ✓ | at-most-once stream; chunks may ship pre-commit ✗ | stream collections ✓ |
 | conn-actor out | taped per activation ✓ | `StreamChunks` 256 KB ✓ | at-most-once flush; cross-worker resume = linear scan + requeue ✗ | `parked_continuations` collection ✓ |
 
@@ -354,10 +354,12 @@ Substantially cleared by `docs/effect-reification-plan.md` Phases 0–5
    continuation-affinity routing per `project_callback_execution_model`
    (callbacks route to the worker holding the continuation via a
    pointer, not via hash(tenant)); no scan.
-5. **`cron_state` lives in a plain `StringHashMap`** — right durability
-   class, wrong home. Move to a collection. Mechanical; defers cleanly
-   if a per-worker partition decision is needed first
-   (`effect-reification-plan.md` Phase 6).
+5. ~~**`cron_state` lives in a plain `StringHashMap`**~~ — **DONE
+   2026-05-27** via `effect-reification-plan.md` Phase 6 step 2.
+   Moved to a `CronState` component on a `cron_state` collection on
+   every worker (only worker 0 populates it; the sweep was already
+   worker-0 + leader gated at the caller). `node.cron_state` +
+   mutex deleted.
 6. ~~**Boot subscription double-fire is UNCLEAR**~~ — **RESOLVED.**
    The `_boot_fired/<dep_id>` marker rides the handler's writeset
    (`worker_streaming.zig:1105`) — marker + handler effects commit

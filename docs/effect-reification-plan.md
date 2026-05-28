@@ -1,9 +1,8 @@
 # Effect reification plan
 
-> **Status**: Phases 0–6 substantially SHIPPED. Phase 0–5 (commit
-> `b908953`, 2026-05-24) reified the four primitives + retired
-> `http.send`. Phase 6 cleanup tail shipped 2026-05-27 (4 of 5 steps;
-> cron_state migration deferred — see §6 Phase 6). Phase 4.1.4
+> **Status**: Phases 0–6 SHIPPED. Phase 0–5 (commit `b908953`,
+> 2026-05-24) reified the four primitives + retired `http.send`.
+> Phase 6 cleanup tail shipped 2026-05-27 (all 5 steps). Phase 4.1.4
 > (`conn_write` Cmd slot) + Phase 7 (files-server collapse) cancelled
 > 2026-05-27 — see §6 phase status.
 > **Prerequisite reading**: `docs/effect-algebra.md` (the model this plan
@@ -1093,12 +1092,16 @@ customer API. Out of scope here; tracked separately.
     removed across `src/connection_holder/{root,standalone,wake_dispatch}.zig`,
     `examples/connection_holder_standalone.zig`, + build.zig module +
     standalone binary entries.
-  - ⏸ Move `cron_state` onto a collection (#5) — **deferred** pending
-    an architectural decision: today any worker can sweep with a
-    shared mutex; collection-based requires picking single-worker
-    ownership OR per-worker partitioning by `hash(tenant_id) % N`.
-    Current implementation works correctly; the migration is for ECS
-    purity, not bug-fix. Defer until partition decision is made.
+  - ✅ Move `cron_state` onto a collection (#5) — done. The earlier
+    deferral was based on a wrong analysis: the cron sweep was
+    already worker-0 + leader gated at the caller (`loop46/main.zig`),
+    so the migration is pure ECS cleanup with zero behavior change.
+    Added a `CronState` component (tenant_id + sub_name + next_fire_at_ns,
+    string-owning with auto-deinit) on a `cron_state` collection on
+    every worker — only worker 0 populates it. Replaced the
+    `node.cron_state` StringHashMap + mutex; both deleted. Linear-scan
+    lookup is fine at the expected scale (tens of active crons, 1Hz).
+    `streaming_subscription_cron_smoke.py` green.
   - ✅ Resolve boot double-fire UNCLEAR (#6) — already resolved by the
     impl: `_boot_fired/<dep_id>` marker rides the handler's writeset
     (`worker_streaming.zig:1105`), so marker + handler effects commit
@@ -1110,8 +1113,7 @@ customer API. Out of scope here; tracked separately.
   - ✅ Update `CLAUDE.md` dispatch wording — done; replaced
     `dispatchPending` with `dispatchOnce` + `Dispatcher.runOutcome`
     reference.
-- **Done**: 4 of 5 steps shipped; cron_state migration deferred with
-  rationale.
+- **Done**: all 5 steps shipped.
 
 ## 7. Test & perf strategy
 
