@@ -23,6 +23,7 @@ parking worker. The cont resume fires correctly.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import sys
 import time
@@ -37,14 +38,12 @@ PUBLIC_SUFFIX = "rewindjsapp.localhost"
 ACME_HOST = f"acme.{PUBLIC_SUFFIX}"
 WB_HOST = f"wb.{PUBLIC_SUFFIX}"
 
-# Sequential burst: each request gets its own fresh TCP connection
-# so SO_REUSEPORT spreads across the 4 workers. Sequential to
-# dodge a separate kv-conflict at parked_units.commit that surfaces
-# under multi-worker + concurrent same-tenant load (independent of
-# Phase 2B; tracked as a follow-up). Concurrent same-tenant load
-# IS validated in `heldsync_concurrent_smoke.py` against a
-# single-worker cluster, which exercises the cont_bound_sched_id
-# scan-fix path.
+# Concurrent burst: each request gets its own fresh TCP connection
+# so SO_REUSEPORT spreads across the 4 workers. Tests Phase 2B's
+# cross-worker bound-send routing AND the kvexp NotChainHead
+# retry path (concurrent same-tenant commits stack into one
+# kvexp chain; only the head can commit each tick — successors
+# park for retry on the next tick).
 N_REQUESTS = 20
 
 
@@ -133,19 +132,23 @@ def main() -> int:
             sys.exit(f"FAIL warm-up: {warmup_err} ({warmup_el:.1f}s)")
         print(f"ok  warm-up held-sync resumed in {warmup_el:.2f}s")
 
-        # 4. Sequential burst. Each request gets a fresh TCP
-        #    connection so SO_REUSEPORT picks a worker per
-        #    connection — exercises Phase 2B's cross-worker
-        #    routing without provoking the separate
-        #    multi-worker-concurrent kv-conflict bug.
+        # 4. Concurrent burst. N_REQUESTS in parallel, each on its
+        #    own fresh TCP connection. SO_REUSEPORT spreads them
+        #    across workers — exercises both Phase 2B cross-worker
+        #    routing AND the concurrent multi-worker commit path.
         t0 = time.monotonic()
         failures: list[tuple[int, str, float]] = []
         elapsed_per: list[float] = []
-        for i in range(N_REQUESTS):
-            _, err, el = one_request(cc, acme_origin, wb_echo, i)
-            elapsed_per.append(el)
-            if err:
-                failures.append((i, err, el))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=N_REQUESTS) as pool:
+            futures = [
+                pool.submit(one_request, cc, acme_origin, wb_echo, i)
+                for i in range(N_REQUESTS)
+            ]
+            for f in concurrent.futures.as_completed(futures):
+                i, err, el = f.result()
+                elapsed_per.append(el)
+                if err:
+                    failures.append((i, err, el))
         wall = time.monotonic() - t0
 
         if failures:
@@ -157,7 +160,7 @@ def main() -> int:
             )
         slowest = max(elapsed_per)
         print(
-            f"ok  {N_REQUESTS}/{N_REQUESTS} sequential held-syncs "
+            f"ok  {N_REQUESTS}/{N_REQUESTS} concurrent held-syncs "
             f"resumed in {wall:.2f}s wall (slowest {slowest:.2f}s — well under "
             f"§6.4 deadline)"
         )
