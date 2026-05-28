@@ -626,7 +626,14 @@ fn proposeAndParkContResume(
             const desc = try server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor);
             if (desc.cont) |*old_c| old_c.deinit(allocator);
             desc.cont = r.new_cont;
-            if (desc.bound_schedule_id) |old_b| allocator.free(old_b);
+            if (desc.bound_schedule_id) |old_b| {
+                // `docs/cross-worker-held-state-plan.md` Phase 1:
+                // drop the NodeState owner mirror for the OLD
+                // send_id; the new one was registered above when
+                // the repark scanned the writeset.
+                worker.node.unregisterBoundSendOwner(old_b);
+                allocator.free(old_b);
+            }
             desc.bound_schedule_id = r.new_bound_sched_id;
             // §6.4 mandatory-timeout refresh: each new hop gets the
             // standard hold deadline, identical to the inbound
@@ -655,7 +662,12 @@ fn proposeAndParkContResume(
             // only the deployment_id and slices are reused unchanged.
             const desc = try server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor);
             if (desc.cont) |*old_c| old_c.deinit(allocator);
-            if (desc.bound_schedule_id) |old_b| allocator.free(old_b);
+            if (desc.bound_schedule_id) |old_b| {
+                // Phase 1 NodeState cleanup — chain is no longer
+                // a cont, drop the send owner.
+                worker.node.unregisterBoundSendOwner(old_b);
+                allocator.free(old_b);
+            }
             desc.* = .{};
 
             // Stamp h2 response components: Status + RespHeaders
@@ -997,6 +1009,13 @@ fn resumeContinuation(
                     if (nputs != 1) break :blk null;
                     break :blk try allocator.dupe(u8, only.?);
                 };
+                // `docs/cross-worker-held-state-plan.md` Phase 1:
+                // repark re-binds to a (possibly new) send_id —
+                // stamp the owner. Same Phase 2 dependency as the
+                // open-hop site in worker_dispatch.zig.
+                if (new_bound_sched_id) |send_id| {
+                    _ = worker.node.registerBoundSendOwner(send_id, worker.msg_inbox_idx);
+                }
                 const lh_repark: log_mod.LogHeader = .{
                     .request_id = request_id,
                     .deployment_id = dep_id,
@@ -1192,7 +1211,10 @@ fn resumeContinuation(
             const stale_desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch null;
             if (stale_desc) |d| {
                 if (d.cont) |*old_c| old_c.deinit(allocator);
-                if (d.bound_schedule_id) |b| allocator.free(b);
+                if (d.bound_schedule_id) |b| {
+                    worker.node.unregisterBoundSendOwner(b);
+                    allocator.free(b);
+                }
                 d.* = .{};
             }
 
@@ -1503,6 +1525,12 @@ pub fn resumeBoundFetchChain(
                 if (nputs != 1) break :blk null;
                 break :blk allocator.dupe(u8, only.?) catch null;
             };
+            // Phase 1 NodeState owner registration for the new
+            // bound send (same as the worker_dispatch open-hop and
+            // resumeContinuation repark sites).
+            if (new_bound_sched_id) |send_id| {
+                _ = worker.node.registerBoundSendOwner(send_id, worker.msg_inbox_idx);
+            }
             if (wrote) {
                 const lh: log_mod.LogHeader = .{
                     .request_id = request_id,
@@ -1549,7 +1577,10 @@ pub fn resumeBoundFetchChain(
             const mutable_desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return;
             if (mutable_desc.cont) |*old_c| old_c.deinit(allocator);
             mutable_desc.cont = c2m;
-            if (mutable_desc.bound_schedule_id) |old_b| allocator.free(old_b);
+            if (mutable_desc.bound_schedule_id) |old_b| {
+                worker.node.unregisterBoundSendOwner(old_b);
+                allocator.free(old_b);
+            }
             mutable_desc.bound_schedule_id = new_bound_sched_id;
             mutable_desc.deadline_ns = now_ns + CONT_HOLD_DEADLINE_NS;
         },
@@ -1645,7 +1676,10 @@ pub fn resumeBoundFetchChain(
             const stale_desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch null;
             if (stale_desc) |d| {
                 if (d.cont) |*old_c| old_c.deinit(allocator);
-                if (d.bound_schedule_id) |b| allocator.free(b);
+                if (d.bound_schedule_id) |b| {
+                    worker.node.unregisterBoundSendOwner(b);
+                    allocator.free(b);
+                }
                 d.* = .{};
             }
             const handler_resp_hdrs: h2.RespHeaders = respb.buildHandlerRespHeaders(

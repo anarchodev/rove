@@ -1314,6 +1314,33 @@ pub const NodeState = struct {
     msg_inboxes_mutex: std.Thread.Mutex = .{},
     msg_inboxes: std.ArrayListUnmanaged(*effect_mod.MsgInbox) = .empty,
 
+    /// `docs/cross-worker-held-state-plan.md` Phase 1: held-state
+    /// ownership registries. The accept worker (SO_REUSEPORT pick)
+    /// can differ from the async-wake worker (`hash(tenant_id) % N`).
+    /// These maps record which worker holds the held state for a
+    /// given async-effect id, so Phase 2's wake routing can target
+    /// the owning worker directly instead of the tenant-hashed one.
+    ///
+    /// `bound_fetch_owners` is keyed by `fetch_id` and populated at
+    /// `http.fetch({bind: true})` binding-call time (via
+    /// `registerBoundFetchTrampoline`); drained on terminal chunk /
+    /// held-client disconnect.
+    ///
+    /// `bound_send_owners` is keyed by `send_id` (the
+    /// `_send/owed/{id}` suffix) and populated when a
+    /// `webhook.send` + `next()` writes the `_send/owed/` marker;
+    /// drained when the cont resumes or its §6.4 deadline fires.
+    ///
+    /// Keys are allocator-owned dupes. Values are the owning
+    /// worker's `msg_inbox_idx`. Mutex-guarded; same lock shape as
+    /// `msg_inboxes`.
+    ///
+    /// Phase 1 (this commit) populates only — readers are wired in
+    /// Phase 2 once routing consults the registry.
+    held_owners_mutex: std.Thread.Mutex = .{},
+    bound_fetch_owners: std.StringHashMapUnmanaged(usize) = .empty,
+    bound_send_owners: std.StringHashMapUnmanaged(usize) = .empty,
+
     /// Phase 5 PR-2b: built-in `__system/*` module bytecodes,
     /// compiled once at `init` from sources baked into the binary
     /// (see `src/js/builtin_modules.zig`). Shared across every
@@ -1469,6 +1496,99 @@ pub const NodeState = struct {
         const inbox = self.msg_inboxes.items[inbox_idx];
         self.msg_inboxes_mutex.unlock();
         try inbox.push(msg);
+    }
+
+    // ── docs/cross-worker-held-state-plan.md Phase 1 ───────────────
+    // Held-state ownership registries. Population only in Phase 1;
+    // Phase 2 wires the read-path (wake routing consults these to
+    // target the owning worker instead of hash(tenant_id)).
+
+    /// Register `fetch_id → owner_worker_idx` for a bound
+    /// `http.fetch({bind: true})`. Idempotent on owner-collision
+    /// (logs + drops the second registration — fetch_ids are
+    /// supposed to be unique within a node). Duping the key here
+    /// so the caller's slice can be freed independently. Returns
+    /// false on allocator failure / collision; the caller doesn't
+    /// need to act on the failure (Phase 2's wake routing falls
+    /// back to hash(tenant_id) when the registry misses).
+    pub fn registerBoundFetchOwner(
+        self: *NodeState,
+        fetch_id: []const u8,
+        worker_idx: usize,
+    ) bool {
+        self.held_owners_mutex.lock();
+        defer self.held_owners_mutex.unlock();
+        const gop = self.bound_fetch_owners.getOrPut(self.allocator, fetch_id) catch return false;
+        if (gop.found_existing) {
+            std.log.warn(
+                "rove-js held-state: bound_fetch_owners collision for fetch_id={s} (old={d}, new={d}); keeping old",
+                .{ fetch_id, gop.value_ptr.*, worker_idx },
+            );
+            return false;
+        }
+        const key_dup = self.allocator.dupe(u8, fetch_id) catch {
+            _ = self.bound_fetch_owners.remove(fetch_id);
+            return false;
+        };
+        gop.key_ptr.* = key_dup;
+        gop.value_ptr.* = worker_idx;
+        return true;
+    }
+
+    /// Lookup the owning worker for a bound fetch. Returns null on
+    /// miss (Phase 2 falls back to hash(tenant_id) routing).
+    pub fn lookupBoundFetchOwner(self: *NodeState, fetch_id: []const u8) ?usize {
+        self.held_owners_mutex.lock();
+        defer self.held_owners_mutex.unlock();
+        return self.bound_fetch_owners.get(fetch_id);
+    }
+
+    /// Drop the registry entry. Idempotent (no-op on miss).
+    pub fn unregisterBoundFetchOwner(self: *NodeState, fetch_id: []const u8) void {
+        self.held_owners_mutex.lock();
+        defer self.held_owners_mutex.unlock();
+        const entry = self.bound_fetch_owners.fetchRemove(fetch_id) orelse return;
+        self.allocator.free(entry.key);
+    }
+
+    /// Sibling of `registerBoundFetchOwner` for held-sync sends.
+    /// Keyed by the `_send/owed/{id}` suffix. Same semantics:
+    /// duped key, mutex-guarded, idempotent on collision.
+    pub fn registerBoundSendOwner(
+        self: *NodeState,
+        send_id: []const u8,
+        worker_idx: usize,
+    ) bool {
+        self.held_owners_mutex.lock();
+        defer self.held_owners_mutex.unlock();
+        const gop = self.bound_send_owners.getOrPut(self.allocator, send_id) catch return false;
+        if (gop.found_existing) {
+            std.log.warn(
+                "rove-js held-state: bound_send_owners collision for send_id={s} (old={d}, new={d}); keeping old",
+                .{ send_id, gop.value_ptr.*, worker_idx },
+            );
+            return false;
+        }
+        const key_dup = self.allocator.dupe(u8, send_id) catch {
+            _ = self.bound_send_owners.remove(send_id);
+            return false;
+        };
+        gop.key_ptr.* = key_dup;
+        gop.value_ptr.* = worker_idx;
+        return true;
+    }
+
+    pub fn lookupBoundSendOwner(self: *NodeState, send_id: []const u8) ?usize {
+        self.held_owners_mutex.lock();
+        defer self.held_owners_mutex.unlock();
+        return self.bound_send_owners.get(send_id);
+    }
+
+    pub fn unregisterBoundSendOwner(self: *NodeState, send_id: []const u8) void {
+        self.held_owners_mutex.lock();
+        defer self.held_owners_mutex.unlock();
+        const entry = self.bound_send_owners.fetchRemove(send_id) orelse return;
+        self.allocator.free(entry.key);
     }
 
     /// `docs/curl-multi-plan.md` Phase 2: hand each PendingFetch to
@@ -1656,6 +1776,23 @@ pub const NodeState = struct {
         // The list itself is owned by NodeState's allocator.
         self.wake_inboxes.deinit(self.allocator);
         self.msg_inboxes.deinit(self.allocator);
+
+        // `docs/cross-worker-held-state-plan.md` Phase 1: free
+        // every owned key in the held-state registries. Values are
+        // POD usize, no per-entry cleanup. The owning workers'
+        // local registries (bound_fetch_entities) were drained in
+        // their own deinit paths; this is the NodeState mirror's
+        // catchall for any straggler keys at shutdown.
+        {
+            self.held_owners_mutex.lock();
+            defer self.held_owners_mutex.unlock();
+            var it_f = self.bound_fetch_owners.iterator();
+            while (it_f.next()) |entry| self.allocator.free(entry.key_ptr.*);
+            self.bound_fetch_owners.deinit(self.allocator);
+            var it_s = self.bound_send_owners.iterator();
+            while (it_s.next()) |entry| self.allocator.free(entry.key_ptr.*);
+            self.bound_send_owners.deinit(self.allocator);
+        }
         builtin_modules_mod.deinit(&self.builtin_modules, self.allocator);
         // Phase 2 of curl-multi work: pending-fetches queue
         // moved into the FetchEngine; its shutdown above already
@@ -3006,6 +3143,13 @@ pub fn Worker(comptime opts: Options) type {
             };
             gop.key_ptr.* = key_dup;
             gop.value_ptr.* = entity;
+            // `docs/cross-worker-held-state-plan.md` Phase 1: mirror
+            // the registration onto the NodeState owner map so a
+            // future chunk arriving on a different worker can find
+            // the owner. Failures here are non-fatal — Phase 2's
+            // routing falls back to hash(tenant_id) when the
+            // registry misses, which is the same behavior as today.
+            _ = self.node.registerBoundFetchOwner(fetch_id, self.msg_inbox_idx);
             return true;
         }
 
@@ -3024,6 +3168,9 @@ pub fn Worker(comptime opts: Options) type {
         pub fn unregisterBoundFetch(self: *Self, fetch_id: []const u8) void {
             const entry = self.bound_fetch_entities.fetchRemove(fetch_id) orelse return;
             self.allocator.free(entry.key);
+            // Mirror the NodeState owner-map drop. Same Phase 1
+            // pairing as the registration site above.
+            self.node.unregisterBoundFetchOwner(fetch_id);
         }
 
     };
