@@ -85,15 +85,16 @@ below is a case of that model rather than a standalone design.
   all shipped. See streaming-model.md §4 + §4.A (model + as-built
   `http.fetch` reference).
 - **2.4 Streaming request body in** — **DESIGN LOCKED, IMPLEMENTATION
-  PENDING.** Streaming-model.md §3 specifies the resolution: handler
-  is dispatched at a coalesce-budget boundary (default 64 KiB) with
-  `request.body_complete = false` and a body prefix; it returns one of
-  three Cmds — terminal `Response` (drain and discard), `__rove_next()`
-  (wait for whole body up to a hard ceiling, then re-dispatch coalesced),
-  or `__rove_stream({accept_body: true})` (per-chunk `inbound_chunk`
-  Msgs + `inbound_end` terminator, unbounded body). Implementation is
-  h2-wire + activation-Msg + per-chunk coord submit; the blob
-  coordinator is the substrate.
+  PENDING.** Customer surface in `handler-shape.md`: a module exports
+  `default` (buffered, ≤ 1 MB hard ceiling) and/or `onChunk` (per-chunk
+  delivery, any size, the small-body case fires once with the whole
+  body and `request.done = true`). Bodies > 1 MB without `onChunk`
+  exported → 413 from the runtime before the handler runs. The
+  superseded "park-until-body-complete" middle tier is gone — there's
+  no buffered-but-bigger path; you either fit in 1 MB or stream.
+  Implementation is h2-wire + activation-Msg + per-chunk coord submit;
+  the blob coordinator is the substrate. See `streaming-model.md` §3
+  for substrate detail and `handler-shape.md` for the surface.
 - **2.5 Held outbound subscription (external-push wake)** — **DONE
   2026-05-24**. `http.subscribe` binding + `FetchEngine` curl_multi
   transport in `src/js/fetch_engine.zig`; per-tenant cap
