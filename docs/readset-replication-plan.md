@@ -647,13 +647,20 @@ Increments shipped:
   stalls**: concurrent requests on the same worker are
   served while a parked request's body is in flight.
 
-- **4.x (open)**: priority-flush coalescing
-  (plan §5.2). Multi-request dispatch batches today still
-  issue N S3 PUTs for N body-bearing tenants. With park, the
-  per-tenant buffer naturally coalesces N appends FOR THE SAME
-  TENANT into one PUT (no per-request flush). Cross-tenant
-  coalescing into a single batch object would require a
-  different blob layout — out of scope for now.
+- **4.x (resolved by blob-coordinator Phase 5)**: priority-flush
+  coalescing + cross-tenant batching (plan §5.2). The body-flush
+  path was migrated through the process-global blob coordinator
+  (`streaming-model.md` §7), which absorbed both concerns:
+  - **Cross-tenant coalescing** via the `_pool/{batch_id}` layout —
+    N tenants submitting bodies simultaneously ride one S3 PUT;
+    distinct BodyRefs point into different ranges of the same
+    pool object.
+  - **Priority flush for blocked handlers** is structurally
+    automatic — coord's drainer is executor-driven (fires whenever
+    an executor slot is free, no time/size threshold), so a parked
+    handler's body PUTs immediately on submit if there's executor
+    headroom. The per-tenant flush-interval that motivated §5.2's
+    early-wake mechanism doesn't exist anymore.
 
 ### Phase 5 — follower tape upload + GC
 
@@ -840,12 +847,13 @@ flaked).
    match raft log retention so orphan recovery from a delayed propose
    (network partition + late commit) doesn't false-positive into GC.
 
-5. **Per-tenant priority-flush ceiling.** A pathological handler
-   doing many tiny sequential fetches can drive the per-tenant S3
-   PUT rate arbitrarily high under priority-flush. Need a rate cap
-   (PUTs/sec/tenant) above which priority flushes coalesce back into
-   the normal interval, with the latency cost visible to the customer
-   as a metric. Defer until observed.
+5. **Per-tenant submission rate ceiling.** Post-coord, the concern
+   shifts from "per-tenant PUT rate" to "one tenant filling the
+   K=32 executor pool and starving others." A per-tenant submission
+   rate cap or fair-queueing layer in coord would address it. Defer
+   until observed; the cross-tenant `_pool/` layout makes single-
+   tenant burst less impactful than the pre-coord per-tenant
+   model would have suggested.
 
 6. **RAM cost ceiling per tenant.** §4.3's "bytes live in RAM
    between arrival and writeset commit" gives a bound of
