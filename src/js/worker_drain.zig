@@ -647,6 +647,7 @@ fn proposeAndParkContResume(
                 // send_id; the new one was registered above when
                 // the repark scanned the writeset.
                 worker.node.unregisterBoundSendOwner(old_b);
+                worker.unregisterBoundSendEntity(old_b);
                 allocator.free(old_b);
             }
             desc.bound_schedule_id = r.new_bound_sched_id;
@@ -681,6 +682,7 @@ fn proposeAndParkContResume(
                 // Phase 1 NodeState cleanup — chain is no longer
                 // a cont, drop the send owner.
                 worker.node.unregisterBoundSendOwner(old_b);
+                worker.unregisterBoundSendEntity(old_b);
                 allocator.free(old_b);
             }
             desc.* = .{};
@@ -1030,6 +1032,8 @@ fn resumeContinuation(
                 // open-hop site in worker_dispatch.zig.
                 if (new_bound_sched_id) |send_id| {
                     _ = worker.node.registerBoundSendOwner(send_id, worker.msg_inbox_idx);
+                    // Phase 3 mirror.
+                    worker.registerBoundSendEntity(send_id, ent);
                 }
                 const lh_repark: log_mod.LogHeader = .{
                     .request_id = request_id,
@@ -1228,6 +1232,7 @@ fn resumeContinuation(
                 if (d.cont) |*old_c| old_c.deinit(allocator);
                 if (d.bound_schedule_id) |b| {
                     worker.node.unregisterBoundSendOwner(b);
+                    worker.unregisterBoundSendEntity(b);
                     allocator.free(b);
                 }
                 d.* = .{};
@@ -1545,6 +1550,8 @@ pub fn resumeBoundFetchChain(
             // resumeContinuation repark sites).
             if (new_bound_sched_id) |send_id| {
                 _ = worker.node.registerBoundSendOwner(send_id, worker.msg_inbox_idx);
+                // Phase 3 mirror.
+                worker.registerBoundSendEntity(send_id, ent);
             }
             if (wrote) {
                 const lh: log_mod.LogHeader = .{
@@ -1594,6 +1601,7 @@ pub fn resumeBoundFetchChain(
             mutable_desc.cont = c2m;
             if (mutable_desc.bound_schedule_id) |old_b| {
                 worker.node.unregisterBoundSendOwner(old_b);
+                worker.unregisterBoundSendEntity(old_b);
                 allocator.free(old_b);
             }
             mutable_desc.bound_schedule_id = new_bound_sched_id;
@@ -1693,6 +1701,7 @@ pub fn resumeBoundFetchChain(
                 if (d.cont) |*old_c| old_c.deinit(allocator);
                 if (d.bound_schedule_id) |b| {
                     worker.node.unregisterBoundSendOwner(b);
+                    worker.unregisterBoundSendEntity(b);
                     allocator.free(b);
                 }
                 d.* = .{};
@@ -1766,11 +1775,45 @@ pub fn resumeBoundContinuation(
     sched_id: []const u8,
     outcome_json: []const u8,
 ) bool {
-    // bound_schedule_id + tenant_id read from the entity's
-    // ContDescriptor + ChainContext components. The empty-collection
-    // check is the cont-state discriminant — membership in
-    // `parked_continuations` IS the gate (principle #1), no separate
-    // count check needed.
+    // Phase 3: O(1) map lookup via the worker-local
+    // `bound_send_entities` registry, populated alongside the
+    // NodeState owner map at the cont_bound_sched_id scan sites.
+    // Phase 2B routing guarantees the cont is on this worker if
+    // it's anywhere; the map gives the entity directly without
+    // scanning every parked cont.
+    //
+    // Lookup miss → fall back to the linear scan over
+    // `parked_continuations` as a safety net (registry stale /
+    // wrong / lost). Same scan that pre-Phase-3 ran on every
+    // call.
+    const server = worker.h2;
+    if (worker.lookupBoundSendEntity(sched_id)) |ent| {
+        if (server.reg.isInCollection(ent, &worker.parked_continuations)) {
+            const chain = server.reg.get(ent, &worker.parked_continuations, components_mod.ChainContext) catch null;
+            const desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch null;
+            if (chain != null and desc != null and std.mem.eql(u8, chain.?.tenant_id, tenant_id)) {
+                const bsid = desc.?.bound_schedule_id;
+                if (bsid != null and std.mem.eql(u8, bsid.?, sched_id)) {
+                    const sid = server.reg.get(ent, &worker.parked_continuations, h2.StreamId) catch return false;
+                    const sess = server.reg.get(ent, &worker.parked_continuations, h2.Session) catch return false;
+                    resumeContinuation(worker, ent, sid.*, sess.*, outcome_json, true) catch |err| {
+                        std.log.warn(
+                            "rove-js cont-resume: {s}/{s}: {s}; 502",
+                            .{ tenant_id, sched_id, @errorName(err) },
+                        );
+                        resolveParked(worker, ent, sid.*, sess.*, 502, "continuation resume failed\n") catch {};
+                    };
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Fallback scan. The bound_send_entities map is supposed to
+    // be canonical; a hit here means the registry got out of sync
+    // (component freed without unregister, double-bind collision,
+    // etc.) and the scan is the safety net per the
+    // cross-worker-held-state-plan §3 Phase 3 design.
     const ents = worker.parked_continuations.entitySlice();
     if (ents.len == 0) return false;
     const sids = worker.parked_continuations.column(h2.StreamId);
@@ -1781,11 +1824,10 @@ pub fn resumeBoundContinuation(
         const bsid = desc.bound_schedule_id orelse continue;
         if (!std.mem.eql(u8, chain.tenant_id, tenant_id)) continue;
         if (!std.mem.eql(u8, bsid, sched_id)) continue;
-        // Matched. resumeContinuation either flushes+drops (terminal)
-        // or re-parks (keeps the entity) — either way we return
-        // immediately, so iterating the now-possibly-mutated slice is
-        // not a hazard. Infra failure → 502 + drop (the call result
-        // is lost, but the held socket must not hang).
+        std.log.info(
+            "rove-js cont-resume: registry miss; fallback scan matched send_id={s} tenant={s}",
+            .{ sched_id, tenant_id },
+        );
         resumeContinuation(worker, ent, sid, sess, outcome_json, true) catch |err| {
             std.log.warn(
                 "rove-js cont-resume: {s}/{s}: {s}; 502",

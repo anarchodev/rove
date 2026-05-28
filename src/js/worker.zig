@@ -2470,6 +2470,25 @@ pub fn Worker(comptime opts: Options) type {
         /// rove-library principle #8, so a chain transitioning
         /// cont→stream doesn't invalidate the map entry.
         bound_fetch_entities: std.StringHashMapUnmanaged(rove.Entity) = .empty,
+        /// `docs/cross-worker-held-state-plan.md` Phase 3: worker-
+        /// local mirror of NodeState's `bound_send_owners`. Maps
+        /// send_id → the parked cont entity bound to it.
+        /// Populated alongside `bound_send_owners` (the
+        /// cont_bound_sched_id scan sites in `worker_dispatch.zig`
+        /// + `worker_drain.zig`); read in `resumeIfBoundTrampoline`
+        /// + `resumeBoundContinuation` for O(1) lookup instead of
+        /// scanning every entity in `parked_continuations`.
+        ///
+        /// Phase 2B routing guarantees: a chunk arriving here has
+        /// `bound_send_owners[send_id] == this worker's idx`, so
+        /// the entity IS in this worker's `parked_continuations`
+        /// (modulo the brief window between unregister and entity
+        /// destroy). Lookup miss falls back to the linear scan as
+        /// a safety net — costs O(N parked) only on the rare
+        /// stale-registry case.
+        ///
+        /// Keys allocator-owned; freed on remove + on shutdown.
+        bound_send_entities: std.StringHashMapUnmanaged(rove.Entity) = .empty,
         /// Phase 5 PR-3: this worker's slot index in
         /// `node.msg_inboxes`. Set from `registerMsgInbox`'s
         /// return value at `create`. The per-worker partitioned
@@ -2899,6 +2918,12 @@ pub fn Worker(comptime opts: Options) type {
                 while (it.next()) |entry| allocator.free(entry.key_ptr.*);
                 self.bound_fetch_entities.deinit(allocator);
             }
+            // Phase 3: same pattern for the bound_send_entities map.
+            {
+                var it = self.bound_send_entities.iterator();
+                while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+                self.bound_send_entities.deinit(allocator);
+            }
             self.parked_continuations.deinit();
             self.parked_units.deinit();
             self.cron_state.deinit();
@@ -3150,20 +3175,53 @@ pub fn Worker(comptime opts: Options) type {
         ) bool {
             const self: *Self = @ptrCast(@alignCast(ctx));
             // Probe: does the worker hold a parked cont bound to
-            // this send-id? `entitySlice` + the column scan
-            // mirrors `resumeBoundContinuation`'s lookup but
-            // read-only — no txn opened, no mutation.
-            const ents = self.parked_continuations.entitySlice();
-            if (ents.len == 0) return false;
-            const descs = self.parked_continuations.column(components_mod.ContDescriptor);
-            const chains = self.parked_continuations.column(components_mod.ChainContext);
+            // this send-id?
+            //
+            // Phase 3: fast-path via the worker-local
+            // `bound_send_entities` map. Phase 2B's owner routing
+            // guarantees that if a parked cont exists anywhere, it
+            // exists on the worker the chunk landed on — so the
+            // map hit is the common case. Verify the entity is
+            // still in `parked_continuations` (tenant + bsid both
+            // checked indirectly: tenant matches because the
+            // chunk hash-routes by tenant; bsid matches because
+            // the map is keyed by send_id).
+            //
+            // Lookup-miss falls back to the linear scan as a
+            // safety net for the registry-empty edge case (entry
+            // was unregistered between the lookup and now, etc.).
+            // Same `entitySlice` + column scan as pre-Phase-3.
+            const server = self.h2;
+            const map_hit = self.lookupBoundSendEntity(send_id);
             var matched = false;
-            for (descs, chains) |desc, chain| {
-                const bsid = desc.bound_schedule_id orelse continue;
-                if (!std.mem.eql(u8, chain.tenant_id, tenant_id)) continue;
-                if (!std.mem.eql(u8, bsid, send_id)) continue;
-                matched = true;
-                break;
+            if (map_hit) |ent| {
+                if (server.reg.isInCollection(ent, &self.parked_continuations)) {
+                    // Verify the chain context matches the
+                    // claimed tenant. (Defense in depth: a stale
+                    // entry could conceivably point at a recycled
+                    // entity from another tenant — gen check
+                    // covers most of this; the tenant equality
+                    // covers the residual.)
+                    if (server.reg.get(ent, &self.parked_continuations, components_mod.ChainContext)) |chain| {
+                        if (std.mem.eql(u8, chain.tenant_id, tenant_id)) {
+                            matched = true;
+                        }
+                    } else |_| {}
+                }
+            }
+            if (!matched) {
+                const ents = self.parked_continuations.entitySlice();
+                if (ents.len > 0) {
+                    const descs = self.parked_continuations.column(components_mod.ContDescriptor);
+                    const chains = self.parked_continuations.column(components_mod.ChainContext);
+                    for (descs, chains) |desc, chain| {
+                        const bsid = desc.bound_schedule_id orelse continue;
+                        if (!std.mem.eql(u8, chain.tenant_id, tenant_id)) continue;
+                        if (!std.mem.eql(u8, bsid, send_id)) continue;
+                        matched = true;
+                        break;
+                    }
+                }
             }
             if (!matched) return false;
 
@@ -3254,6 +3312,47 @@ pub fn Worker(comptime opts: Options) type {
             // Mirror the NodeState owner-map drop. Same Phase 1
             // pairing as the registration site above.
             self.node.unregisterBoundFetchOwner(fetch_id);
+        }
+
+        /// Phase 3: register a `send_id → entity` mapping on this
+        /// worker. Paired with `NodeState.registerBoundSendOwner`
+        /// — every site that stamps the owner map also stamps
+        /// this. Collision (same send_id, already present) logs +
+        /// drops (send_ids are supposed to be unique within a
+        /// chain). Caller's slice is duped; the registry owns the
+        /// key.
+        pub fn registerBoundSendEntity(self: *Self, send_id: []const u8, entity: rove.Entity) void {
+            const gop = self.bound_send_entities.getOrPut(self.allocator, send_id) catch return;
+            if (gop.found_existing) {
+                std.log.warn(
+                    "rove-js bound-send: registry collision for send_id={s}; dropping new bind",
+                    .{send_id},
+                );
+                return;
+            }
+            const key_dup = self.allocator.dupe(u8, send_id) catch {
+                _ = self.bound_send_entities.remove(send_id);
+                return;
+            };
+            gop.key_ptr.* = key_dup;
+            gop.value_ptr.* = entity;
+        }
+
+        /// Phase 3: O(1) lookup. Replaces the linear scan in
+        /// `resumeIfBoundTrampoline` / `resumeBoundContinuation`.
+        /// Returns null on miss → caller falls back to the scan
+        /// (stale-registry safety net).
+        pub fn lookupBoundSendEntity(self: *Self, send_id: []const u8) ?rove.Entity {
+            return self.bound_send_entities.get(send_id);
+        }
+
+        /// Phase 3: remove + free the registry key. Idempotent.
+        /// Paired with `NodeState.unregisterBoundSendOwner` —
+        /// fires alongside the bsid free sites in
+        /// `worker_drain.zig`'s repark + stream-transition arms.
+        pub fn unregisterBoundSendEntity(self: *Self, send_id: []const u8) void {
+            const entry = self.bound_send_entities.fetchRemove(send_id) orelse return;
+            self.allocator.free(entry.key);
         }
 
     };

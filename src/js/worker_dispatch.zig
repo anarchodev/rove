@@ -2910,6 +2910,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // misses.
         if (cont_bound_sched_id) |send_id| {
             _ = worker.node.registerBoundSendOwner(send_id, worker.msg_inbox_idx);
+            // Phase 3: also stamp the worker-local send_id → entity
+            // map so `resumeBoundContinuation` can skip its scan of
+            // every parked cont and lookup directly.
+            worker.registerBoundSendEntity(send_id, ent);
         }
         // `resp.console` / `resp.exception` are freed here unless we
         // transfer them into a SuccessRec below.
