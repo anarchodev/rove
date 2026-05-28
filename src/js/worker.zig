@@ -308,6 +308,26 @@ pub const KvWakeEvent = struct {
     }
 };
 
+/// Rove component owning a cron subscription's next-fire timestamp.
+/// One entity per `(tenant_id, sub_name)` pair, living on worker 0's
+/// `cron_state` collection. Strings dup'd at create-time, freed on
+/// entity destroy via the collection's auto-deinit (rove principle
+/// #2). Created lazily by `sweepCronSubscriptions` on first sight
+/// (matches the pre-collection hashmap's first-sight initialization).
+/// Destroyed on tenant unload.
+pub const CronState = struct {
+    tenant_id: []u8,
+    sub_name: []u8,
+    next_fire_at_ns: i64,
+
+    pub fn deinit(allocator: std.mem.Allocator, items: []CronState) void {
+        for (items) |*item| {
+            allocator.free(item.tenant_id);
+            allocator.free(item.sub_name);
+        }
+    }
+};
+
 /// Thread-safe per-worker inbox of kv-write events awaiting prefix-
 /// match scan against the worker's local `parked_streams_meta`.
 /// Producers (apply thread + leader-side worker_dispatch) call
@@ -1275,18 +1295,6 @@ pub const NodeState = struct {
     msg_inboxes_mutex: std.Thread.Mutex = .{},
     msg_inboxes: std.ArrayListUnmanaged(*effect_mod.MsgInbox) = .empty,
 
-    /// Gap 2.1 Phase F: in-memory `next_fire_at_ns` per cron
-    /// subscription. Keyed by `<tenant_id>|<sub_name>`. NOT raft-
-    /// replicated — leader change resets the cron clock; the next
-    /// fire happens roughly `interval_ms` after leadership is
-    /// gained on the new leader (rebuilt by the sweep's first
-    /// pass). Trade-off: long-interval crons may pause up to an
-    /// interval after failover. Acceptable for v1; customer
-    /// idempotency / missed-tick tolerance per
-    /// `docs/subscriptions-plan.md` §7. Owned by NodeState.
-    cron_state_mutex: std.Thread.Mutex = .{},
-    cron_state: std.StringHashMapUnmanaged(i64) = .empty,
-
     /// Phase 5 PR-2b: built-in `__system/*` module bytecodes,
     /// compiled once at `init` from sources baked into the binary
     /// (see `src/js/builtin_modules.zig`). Shared across every
@@ -1629,12 +1637,7 @@ pub const NodeState = struct {
         self.wake_inboxes.deinit(self.allocator);
         self.msg_inboxes.deinit(self.allocator);
         builtin_modules_mod.deinit(&self.builtin_modules, self.allocator);
-        {
-            var cs_it = self.cron_state.iterator();
-            while (cs_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
-            self.cron_state.deinit(self.allocator);
-        }
-        // `docs/curl-multi-plan.md` Phase 2: pending-fetches queue
+        // Phase 2 of curl-multi work: pending-fetches queue
         // moved into the FetchEngine; its shutdown above already
         // drained + freed any queued + in-flight entries.
         if (self.deployment_loader) |l| {
@@ -2019,6 +2022,15 @@ pub fn Worker(comptime opts: Options) type {
     const ParkedUnitRow = rove.Row(&.{ParkedUnit});
     const ParkedUnitColl = rove.Collection(ParkedUnitRow, .{});
 
+    // Worker-0-only collection for cron subscription next-fire state.
+    // Replaces the pre-2026-05-27 `node.cron_state` StringHashMap +
+    // mutex. Single ownership is intrinsic (the cron sweep already
+    // runs only on worker 0 + leader — see `loop46/main.zig`); the
+    // mutex was defensive but effectively unused. Per-entity strings
+    // own their allocation; auto-deinit on entity destroy.
+    const CronStateRow = rove.Row(&.{CronState});
+    const CronStateColl = rove.Collection(CronStateRow, .{});
+
     // Effect-reification Phase 2D: the `fetch_event_pending`
     // collection that lived here is gone. Inbox messages drain
     // directly onto `Worker.msg_queue` (the unified ingress);
@@ -2147,6 +2159,12 @@ pub fn Worker(comptime opts: Options) type {
         /// State-as-membership: presence in the collection IS the
         /// "awaiting raft commit" state.
         parked_units: ParkedUnitColl,
+        /// Cron subscription next-fire-at-ns state. Lives on every
+        /// worker for uniformity but only worker 0 ever populates /
+        /// reads it (sweep is gated to `args.worker_idx == 0 and
+        /// is_leader_now` in `loop46/main.zig`). Replaces the pre-
+        /// 2026-05-27 node-level StringHashMap + mutex.
+        cron_state: CronStateColl,
         /// Effect-reification Phase 2 ingress
         /// (`docs/effect-algebra.md` §2.3; `effect-reification-plan.md`
         /// Phase 2). One bounded queue per worker; every migrated
@@ -2375,6 +2393,7 @@ pub fn Worker(comptime opts: Options) type {
                 .body_pending = try StreamColl.init(allocator),
                 .parked_continuations = try StreamColl.init(allocator),
                 .parked_units = try ParkedUnitColl.init(allocator),
+                .cron_state = try CronStateColl.init(allocator),
                 .msg_inbox = effect_mod.MsgInbox.init(allocator),
                 // Effect-reification Phase 2 ingress. Cap chosen
                 // well above the typical per-tick fire rate (cron
@@ -2421,6 +2440,7 @@ pub fn Worker(comptime opts: Options) type {
             errdefer self.body_pending.deinit();
             errdefer self.parked_continuations.deinit();
             errdefer self.parked_units.deinit();
+            errdefer self.cron_state.deinit();
             errdefer self.tenant_logs.clearAllEntries(allocator);
             errdefer self.wake_inbox.deinit();
 
@@ -2430,6 +2450,7 @@ pub fn Worker(comptime opts: Options) type {
             reg.registerCollection(&self.body_pending);
             reg.registerCollection(&self.parked_continuations);
             reg.registerCollection(&self.parked_units);
+            reg.registerCollection(&self.cron_state);
 
             // Register the inbox with the node so apply.zig +
             // worker_dispatch.zig can broadcast kv-write events to
@@ -2606,6 +2627,7 @@ pub fn Worker(comptime opts: Options) type {
             self.pending_bound_resumes.deinit(allocator);
             self.parked_continuations.deinit();
             self.parked_units.deinit();
+            self.cron_state.deinit();
             self.raft_pending_response.deinit();
             self.raft_pending_cont.deinit();
             self.raft_pending_stream.deinit();
@@ -3389,12 +3411,13 @@ pub fn sweepBootSubscriptions(worker: anytype) void {
 /// `CRON_SWEEP_INTERVAL_NS` from worker 0 when leader. Walks every
 /// loaded tenant slot's cron subscriptions and fires any that are
 /// due (or initializes the next-fire time on first sight).
-/// In-memory state in `NodeState.cron_state` keyed by
-/// `<tenant>|<name>`; not raft-replicated, so leader change resets
-/// the cron clock (next fire = now + interval_ms on the new
-/// leader). For long-interval crons this can pause up to one
-/// interval after failover; customer-side missed-tick tolerance
-/// is the documented contract.
+///
+/// State lives on `worker.cron_state` (rove collection of `CronState`
+/// components, one entity per `(tenant_id, sub_name)`). Not raft-
+/// replicated, so leader change resets the cron clock (next fire =
+/// now + interval_ms on the new leader). For long-interval crons
+/// this can pause up to one interval after failover; customer-side
+/// missed-tick tolerance is the documented contract.
 pub const CRON_SWEEP_INTERVAL_NS: i64 = 1 * std.time.ns_per_s;
 
 pub fn sweepCronSubscriptions(worker: anytype) void {
@@ -3408,22 +3431,35 @@ pub fn sweepCronSubscriptions(worker: anytype) void {
         const snap = slot.pinCurrent() orelse continue;
         defer snap.release();
         if (snap.subscriptions.len == 0) continue;
-        sweepTenantCron(worker.node, slot, snap, now_ns);
+        sweepTenantCron(worker, slot, snap, now_ns);
     }
 }
 
-/// Walk one tenant's cron subscriptions; for each that's due,
-/// enqueue a fire and advance the in-memory `next_fire_at_ns`.
-/// First-sight initializes to `now_ns + interval_ms_ns`
+/// Find the `CronState` entity for `(tenant_id, sub_name)` in the
+/// collection, or null if not yet created. Linear scan — fine at the
+/// expected scale (tens of active crons, 1Hz sweep).
+fn findCronState(worker: anytype, tenant_id: []const u8, sub_name: []const u8) ?*CronState {
+    const states = worker.cron_state.column(CronState);
+    for (states) |*s| {
+        if (std.mem.eql(u8, s.tenant_id, tenant_id) and std.mem.eql(u8, s.sub_name, sub_name)) {
+            return s;
+        }
+    }
+    return null;
+}
+
+/// Walk one tenant's cron subscriptions; for each that's due, enqueue
+/// a fire and advance `next_fire_at_ns` on the entity. First-sight
+/// creates a new entity initialized to `now_ns + interval_ms_ns`
 /// (interval-delay before the FIRST fire — keeps cron behavior
 /// natural across deploy + restart).
 fn sweepTenantCron(
-    node: *NodeState,
+    worker: anytype,
     slot: *TenantSlot,
     snap: *TenantFilesSnapshot,
     now_ns: i64,
 ) void {
-    const allocator = node.allocator;
+    const allocator = worker.allocator;
     for (snap.subscriptions) |sub| {
         const interval_ms: i64 = switch (sub.spec) {
             .cron => |c| c.interval_ms,
@@ -3431,45 +3467,43 @@ fn sweepTenantCron(
         };
         const interval_ns: i64 = interval_ms * std.time.ns_per_ms;
 
-        // Key = "<tenant>|<sub_name>". Owned by cron_state on
-        // first insert; reused on subsequent lookups.
-        var key_buf: [128]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "{s}|{s}", .{ slot.instance_id, sub.name }) catch continue;
-
-        node.cron_state_mutex.lock();
-        const gop = node.cron_state.getOrPut(allocator, key) catch {
-            node.cron_state_mutex.unlock();
-            continue;
-        };
-        if (!gop.found_existing) {
-            // First sight: initialize the next-fire time and don't
-            // fire this round. The customer sees the first fire
-            // roughly `interval_ms` after this sweep.
-            gop.key_ptr.* = allocator.dupe(u8, key) catch {
-                _ = node.cron_state.remove(key);
-                node.cron_state_mutex.unlock();
+        if (findCronState(worker, slot.instance_id, sub.name)) |state| {
+            if (now_ns < state.next_fire_at_ns) continue;
+            // Advance to next interval. Use cumulative drift
+            // (`next + interval`) when within an interval of now;
+            // otherwise (long pause / failover) reset to `now +
+            // interval` to avoid pile-up.
+            state.next_fire_at_ns = if (state.next_fire_at_ns + interval_ns > now_ns)
+                state.next_fire_at_ns + interval_ns
+            else
+                now_ns + interval_ns;
+        } else {
+            // First sight: create an entity with the next-fire time
+            // initialized; don't fire this round. The customer sees
+            // the first fire roughly `interval_ms` after this sweep.
+            const tenant_dup = allocator.dupe(u8, slot.instance_id) catch continue;
+            const sub_dup = allocator.dupe(u8, sub.name) catch {
+                allocator.free(tenant_dup);
                 continue;
             };
-            gop.value_ptr.* = now_ns + interval_ns;
-            node.cron_state_mutex.unlock();
+            const ent = worker.h2.reg.create(&worker.cron_state) catch {
+                allocator.free(tenant_dup);
+                allocator.free(sub_dup);
+                continue;
+            };
+            worker.h2.reg.set(ent, &worker.cron_state, CronState, .{
+                .tenant_id = tenant_dup,
+                .sub_name = sub_dup,
+                .next_fire_at_ns = now_ns + interval_ns,
+            }) catch {
+                allocator.free(tenant_dup);
+                allocator.free(sub_dup);
+                continue;
+            };
             continue;
         }
-        const next_fire_at_ns = gop.value_ptr.*;
-        if (now_ns < next_fire_at_ns) {
-            node.cron_state_mutex.unlock();
-            continue;
-        }
-        // Advance to next interval. Use cumulative drift
-        // (`next + interval`) when within an interval of now;
-        // otherwise (long pause / failover) reset to `now +
-        // interval` to avoid pile-up.
-        gop.value_ptr.* = if (next_fire_at_ns + interval_ns > now_ns)
-            next_fire_at_ns + interval_ns
-        else
-            now_ns + interval_ns;
-        node.cron_state_mutex.unlock();
 
-        node.enqueueSubscriptionFireForTenant(.{
+        worker.node.enqueueSubscriptionFireForTenant(.{
             .tenant_id = slot.instance_id,
             .subscription_name = sub.name,
             .module_path = sub.module_path,
