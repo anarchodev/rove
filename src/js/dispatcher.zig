@@ -1667,9 +1667,14 @@ fn finishResponse(
 ) DispatchError!RunOutcome {
     if (state.pending_kv_error) |err| {
         d.last_kv_error = err;
-        // pending.deinit fires via the caller's errdefer when we
-        // return an error — don't double-free here.
-        console_buf.deinit(d.allocator);
+        // Return an error → caller's `errdefer console_buf.deinit`
+        // (runOutcome) handles the cleanup. Don't deinit here, or
+        // we'd double-free: ArrayList.deinit sets self.* =
+        // undefined, and the errdefer's second deinit call frees
+        // a garbage slice. Pre-fix that landed crashes in
+        // multi-worker concurrent heldsync where kv races into
+        // pending_kv_error and the panic surfaces as a GPF inside
+        // @memset under std.mem.Allocator.free.
         return DispatchError.KvFailed;
     }
 

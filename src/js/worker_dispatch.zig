@@ -2715,6 +2715,15 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             "tenant={s} err={s}",
             .{ scope_inst.id, @errorName(err) },
         );
+        // Per-handler writeset boundary. The `writeset` is shared
+        // across every handler-bound request in this batch (kv-
+        // batched-dispatch): the `cont_bound_sched_id` scan below
+        // MUST look only at ops THIS handler contributed, not
+        // the cumulative batch. Concurrent same-tenant heldsync
+        // requests each write one `_send/owed/{id}`; without this
+        // boundary the scan sees N puts → returns null → all
+        // conts deadline to 504.
+        const ws_pre_len = writeset.ops.items.len;
 
         // Admin tenant requests get a longer budget — signup + deploy
         // legitimately block on S3 PUTs for a few seconds. Customer
@@ -2874,7 +2883,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // `ParkedCont`.
             var only: ?[]const u8 = null;
             var n: usize = 0;
-            for (writeset.ops.items) |op| switch (op) {
+            // Scope the scan to THIS request's contribution only —
+            // ops appended since `ws_pre_len` was captured above
+            // (before runOutcome). The writeset accumulates across
+            // every handler in the batch; without the slice cut a
+            // concurrent same-tenant heldsync sees the other
+            // requests' `_send/owed/` puts and falls into the
+            // "ambiguous → null" branch.
+            for (writeset.ops.items[ws_pre_len..]) |op| switch (op) {
                 .put => |p| if (std.mem.startsWith(u8, p.key, worker_mod.OWED_PREFIX)) {
                     n += 1;
                     only = p.key[worker_mod.OWED_PREFIX.len..];
