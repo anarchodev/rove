@@ -5,6 +5,13 @@
 > `streaming-model.md`, and `connection-actor-plan.md` are each a facet
 > of — see §8. It is the ground truth for the question "does this new
 > effect fit the model?"
+>
+> The customer-facing handler surface (named exports per Msg kind,
+> `stream()` / `next()` Cmd verbs) is specified in
+> [`handler-shape.md`](handler-shape.md). The Cmd / Msg tables
+> below use the engine's internal names (`__rove_stream` /
+> `__rove_next` / `request.activation.kind`); the customer-typed
+> surface renames these without changing the engine semantics.
 
 ## 1. The model in one paragraph
 
