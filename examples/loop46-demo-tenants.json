@@ -29,6 +29,9 @@
         {"path": "fetchchunks/index.mjs", "source": "loop46-demo-tenants/acme/fetchchunks/index.mjs"},
         {"path": "fetchchunk.mjs", "source": "loop46-demo-tenants/acme/fetchchunk.mjs"},
         {"path": "boundproxy/index.mjs", "source": "loop46-demo-tenants/acme/boundproxy/index.mjs"},
+        {"path": "spoolsink/index.mjs", "source": "loop46-demo-tenants/acme/spoolsink/index.mjs"},
+        {"path": "multibind/index.mjs", "source": "loop46-demo-tenants/acme/multibind/index.mjs"},
+        {"path": "spoolcancel/index.mjs", "source": "loop46-demo-tenants/acme/spoolcancel/index.mjs"},
         {"path": "benchfetch/index.mjs", "source": "loop46-demo-tenants/acme/benchfetch/index.mjs"},
         {"path": "benchfetch_oc.mjs", "source": "loop46-demo-tenants/acme/benchfetch_oc.mjs"},
         {"path": "subscribe/index.mjs", "source": "loop46-demo-tenants/acme/subscribe/index.mjs"},
@@ -60,7 +63,8 @@
       "files": [
         {"path": "index.mjs", "source": "loop46-demo-tenants/wb/index.mjs"},
         {"path": "bulk/index.mjs", "source": "loop46-demo-tenants/wb/bulk/index.mjs"},
-        {"path": "drip/index.mjs", "source": "loop46-demo-tenants/wb/drip/index.mjs"}
+        {"path": "drip/index.mjs", "source": "loop46-demo-tenants/wb/drip/index.mjs"},
+        {"path": "bigbody/index.mjs", "source": "loop46-demo-tenants/wb/bigbody/index.mjs"}
       ]
     },
     {

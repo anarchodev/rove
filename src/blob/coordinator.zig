@@ -173,8 +173,20 @@ const Submission = struct {
 };
 
 const RefSlot = union(enum) {
-    durable: BodyRef,
+    durable: DurableSlot,
     failed,
+};
+
+/// A committed submission's outcome: the wire `BodyRef` plus a
+/// borrowed view of the bytes, retained in the owning `SealedBatch`'s
+/// `SealedSubEntry.bytes` (alive for the coordinator's lifetime).
+/// `readBody` dupes from `bytes` so callers needing the chunk back —
+/// e.g. the bound-fetch chunk spool reading an evicted entry
+/// (`docs/chunk-spool-plan.md` Phase 3) — get it from RAM, with no
+/// `store.get` / S3 round-trip.
+const DurableSlot = struct {
+    ref: BodyRef,
+    bytes: []const u8,
 };
 
 /// One drained-and-sealed batch handed from drainer to executor.
@@ -417,6 +429,23 @@ pub const BlobCoordinator = struct {
         const bytes_copy = self.allocator.dupe(u8, bytes) catch return error.PutFailed;
         errdefer self.allocator.free(bytes_copy);
 
+        // Count the submission BEFORE it becomes collectable (appended
+        // to `w.pending`). The drainer collects from `w.pending` under
+        // `w.mu` and decrements `pending_count` by the count collected;
+        // if the count were bumped AFTER the append, the drainer could
+        // collect a submission before it was counted and underflow
+        // `pending_count` (a fatal `integer overflow` panic in
+        // `drainRoundRobin`). Bumping first keeps the invariant
+        // `pending_count >= (collectable submissions)`. `pending_count`
+        // is only a wake hint — a transient over-count (incremented but
+        // not yet appended) just risks one empty drain pass, which
+        // early-returns without decrementing. See
+        // `docs/chunk-spool-plan.md` (the high-rate per-chunk
+        // bound-fetch submits first exposed this).
+        self.drain_mu.lock();
+        self.pending_count += 1;
+        self.drain_mu.unlock();
+
         const w = &self.workers[worker_id];
         w.mu.lock();
         const seq = w.next_seq;
@@ -426,23 +455,37 @@ pub const BlobCoordinator = struct {
             .bytes = bytes_copy,
         }) catch {
             w.mu.unlock();
+            self.undoPendingCount();
             return error.PutFailed;
         };
         // Insert into `unfinished` in sorted order (always at the
         // end, since seqs are monotonic per worker).
         w.unfinished.append(self.allocator, seq) catch {
+            // Roll back the pending append so `w.pending` doesn't carry
+            // a submission `unfinished` never tracked.
+            _ = w.pending.pop();
             w.mu.unlock();
+            self.undoPendingCount();
             return error.PutFailed;
         };
         w.mu.unlock();
 
-        // Wake drainer.
+        // Wake the drainer now that the submission is collectable.
         self.drain_mu.lock();
-        self.pending_count += 1;
         self.drain_cond.signal();
         self.drain_mu.unlock();
 
         return seq;
+    }
+
+    /// Roll back a speculative `pending_count` bump when the submission
+    /// it counted failed to append. Saturating — a concurrent drainer
+    /// pass may already have decremented for other collected
+    /// submissions; never wrap below zero.
+    fn undoPendingCount(self: *Self) void {
+        self.drain_mu.lock();
+        if (self.pending_count > 0) self.pending_count -= 1;
+        self.drain_mu.unlock();
     }
 
     /// Per-worker high water mark — every submission on this
@@ -465,7 +508,36 @@ pub const BlobCoordinator = struct {
         defer w.mu.unlock();
         const slot = w.refs.get(seq) orelse return Error.UnknownSeq;
         return switch (slot) {
-            .durable => |ref| ref,
+            .durable => |d| d.ref,
+            .failed => Error.PutFailed,
+        };
+    }
+
+    /// Return an owned copy of the bytes a submission stored, read
+    /// from the coordinator's retained in-RAM batch — no `store.get`
+    /// / S3 round-trip. Caller frees with `allocator.free`. Caller
+    /// must only invoke this AFTER observing `seq < durableSeq(worker_id)`
+    /// (same contract as `bodyRef`); the durability HWM guarantees the
+    /// slot is populated. `Error.PutFailed` if the seq terminally
+    /// failed, `Error.UnknownSeq` if it was never submitted.
+    ///
+    /// `docs/chunk-spool-plan.md` Phase 3: the bound-fetch chunk spool
+    /// evicts inline bytes for chunks beyond its K-deep RAM window and
+    /// reads them back through here when the held chain is finally
+    /// ready to consume them.
+    pub fn readBody(
+        self: *Self,
+        worker_id: u8,
+        seq: u64,
+        allocator: std.mem.Allocator,
+    ) Error![]u8 {
+        std.debug.assert(worker_id < self.config.worker_count);
+        const w = &self.workers[worker_id];
+        w.mu.lock();
+        defer w.mu.unlock();
+        const slot = w.refs.get(seq) orelse return Error.UnknownSeq;
+        return switch (slot) {
+            .durable => |d| allocator.dupe(u8, d.bytes) catch Error.PutFailed,
             .failed => Error.PutFailed,
         };
     }
@@ -808,9 +880,16 @@ pub const BlobCoordinator = struct {
             w.mu.lock();
             const slot: RefSlot = if (ok)
                 .{ .durable = .{
-                    .batch_id = batch.batch_id,
-                    .offset = entry.offset,
-                    .len = @intCast(entry.bytes.len),
+                    .ref = .{
+                        .batch_id = batch.batch_id,
+                        .offset = entry.offset,
+                        .len = @intCast(entry.bytes.len),
+                    },
+                    // Borrowed view of the retained submission bytes
+                    // (the SealedSubEntry owns them until coord deinit;
+                    // the batch is retained just below, so this slice
+                    // stays valid for every later `readBody`).
+                    .bytes = entry.bytes,
                 } }
             else
                 .failed;
@@ -1129,6 +1208,38 @@ test "coordinator: terminal failure stalls durable_seq + bodyRef returns PutFail
 
     try testing.expectEqual(@as(u64, 0), coord.durableSeq(0));
     try testing.expectError(Error.PutFailed, coord.bodyRef(0, 0));
+}
+
+test "coordinator: readBody returns submitted bytes from RAM" {
+    var store = TestStore.init(testing.allocator);
+    defer store.deinit();
+    const coord = try BlobCoordinator.init(testing.allocator, store.blobStore(), .{
+        .worker_count = 2,
+        .executor_size = 2,
+    });
+    defer coord.deinit();
+
+    const s0 = try coord.submit(0, "hello chunk zero");
+    const s1 = try coord.submit(0, "second chunk!!");
+    const sw = try coord.submit(1, "other worker");
+
+    try coord.waitForSeq(0, 2, 5 * std.time.ns_per_s);
+    try coord.waitForSeq(1, 1, 5 * std.time.ns_per_s);
+
+    const b0 = try coord.readBody(0, s0, testing.allocator);
+    defer testing.allocator.free(b0);
+    try testing.expectEqualStrings("hello chunk zero", b0);
+
+    const b1 = try coord.readBody(0, s1, testing.allocator);
+    defer testing.allocator.free(b1);
+    try testing.expectEqualStrings("second chunk!!", b1);
+
+    const bw = try coord.readBody(1, sw, testing.allocator);
+    defer testing.allocator.free(bw);
+    try testing.expectEqualStrings("other worker", bw);
+
+    // Never-submitted seq → UnknownSeq.
+    try testing.expectError(Error.UnknownSeq, coord.readBody(0, 999, testing.allocator));
 }
 
 test "coordinator: per-worker HWMs are independent" {

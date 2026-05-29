@@ -585,14 +585,24 @@ fn proposeAndParkContResume(
     // inbound H2 dispatch's `Request`).
     //
     // Phase 4.1.3 Option-2: also emit Cmd.respond so the
-    // commit-arm move (raft_pending_cont → {parked_continuations,
-    // stream_response_in}) routes through `interpretCmd` instead
-    // of `drainEntityArm`'s inline move. Terminal + repark
-    // commit back to `parked_continuations`; cont→stream
-    // (Phase 2b lift) commits to `stream_response_in` so h2 picks
-    // up the streaming pipeline.
+    // commit-arm move (raft_pending_cont → {response_in,
+    // parked_continuations, stream_response_in}) routes through
+    // `interpretCmd` instead of `drainEntityArm`'s inline move.
+    //   - terminal → `response_in`: the chain is DONE; h2 ships the
+    //     stamped Status/RespBody + closes. This mirrors the
+    //     wrote=false terminal branch (which `resolveParked`s straight
+    //     to `response_in`). Routing terminal-with-writes back to
+    //     `parked_continuations` instead relied on "a subsequent
+    //     resume/sweep ships the body" — true for chains that get a
+    //     follow-up event, but a bound-fetch chain whose fetches are
+    //     all done has none, so the response never shipped (the
+    //     multi-bind writes-per-chunk case, docs/chunk-spool-plan.md).
+    //   - repark → `parked_continuations`: the chain awaits its next
+    //     bound-fetch chunk / callback.
+    //   - cont→stream → `stream_response_in`: h2 picks up the stream.
     const respond_dest: effect_mod.cmd.RespondOut.DestColl = switch (next) {
-        .terminal, .repark => .parked_continuations,
+        .terminal => .response_in,
+        .repark => .parked_continuations,
         .stream => .stream_response_in,
     };
     var cont_cmds: effect_mod.cmd.BufferedCmds = .{};

@@ -1321,6 +1321,34 @@ fn handleMetrics(
         worker.node.bound_fetch_same_worker_routes.load(.monotonic),
     });
 
+    // `docs/chunk-spool-plan.md` Phase 3: peak inline RAM held by this
+    // worker's bound-fetch chunk spools. Bounded by K × chunk_size per
+    // in-flight fetch — the large-body smoke asserts the watermark
+    // stays under the window cap even for a multi-MB upstream body.
+    // Worker-local (SO_REUSEPORT): single-worker deployments / smokes
+    // read the exact value; multi-worker reads whichever worker served
+    // the scrape.
+    try w.print(
+        \\# HELP bound_fetch_spool_inline_bytes_peak peak inline (un-evicted) bytes held across this worker's bound-fetch chunk spools.
+        \\# TYPE bound_fetch_spool_inline_bytes_peak gauge
+        \\bound_fetch_spool_inline_bytes_peak {d}
+        \\# HELP bound_fetch_spool_readback_total spool-head chunks whose evicted bytes were read back from the coordinator at dispatch.
+        \\# TYPE bound_fetch_spool_readback_total counter
+        \\bound_fetch_spool_readback_total {d}
+        \\# HELP bound_fetch_spool_dropped_total spooled-but-unconsumed chunks discarded on bound-fetch cancel / held-client disconnect.
+        \\# TYPE bound_fetch_spool_dropped_total counter
+        \\bound_fetch_spool_dropped_total {d}
+        \\# HELP bound_fetch_spool_depth_peak peak queued spool entries (producer-ahead-of-consumer depth) across this worker's bound-fetch spools.
+        \\# TYPE bound_fetch_spool_depth_peak gauge
+        \\bound_fetch_spool_depth_peak {d}
+        \\
+    , .{
+        worker.bound_fetch_spool_inline_bytes_peak,
+        worker.bound_fetch_spool_readback_total,
+        worker.bound_fetch_spool_dropped_total,
+        worker.bound_fetch_spool_depth_peak,
+    });
+
     // Move the writer's accumulated bytes back into the ArrayList,
     // then transfer ownership to the response body. `toArrayList`
     // does NOT free the writer's buffer — it hands it back to us.

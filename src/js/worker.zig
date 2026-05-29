@@ -70,6 +70,7 @@ const continuation_mod = @import("bindings/continuation.zig");
 const Continuation = continuation_mod.Continuation;
 const stream_mod = @import("bindings/stream.zig");
 const components_mod = @import("components.zig");
+const chunk_spool_mod = @import("chunk_spool.zig");
 const effect_mod = @import("effect/root.zig");
 const globals = @import("globals.zig");
 const apply_mod = @import("apply.zig");
@@ -385,6 +386,25 @@ pub const KvWakeInbox = struct {
 /// `serviceParkedStreams` forces `close_pending` and the entity
 /// shuts down cleanly. Configurable per-tenant lands in Phase 2c.
 pub const MAX_STREAM_ACTIVATIONS: u32 = 1000;
+
+/// `docs/chunk-spool-plan.md` Phase 3: default per-fetch chunk-spool
+/// RAM window depth (K). At the 64KB default `max_response_chunk_bytes`
+/// this caps inline RAM at ~256KB per in-flight bound fetch; chunks
+/// beyond the window read their bytes back from the coordinator.
+/// Override via `ROVE_BOUND_FETCH_SPOOL_DEPTH`.
+pub const DEFAULT_BOUND_FETCH_SPOOL_DEPTH: usize = 4;
+
+/// Read the `ROVE_BOUND_FETCH_SPOOL_DEPTH` env override, falling back
+/// to `DEFAULT_BOUND_FETCH_SPOOL_DEPTH`. A 0 / unparseable value is
+/// clamped to 1 (depth 0 would evict the head itself, forcing a coord
+/// read on every single dispatch — never what an operator wants).
+fn readBoundFetchSpoolDepth() usize {
+    const raw = std.posix.getenv("ROVE_BOUND_FETCH_SPOOL_DEPTH") orelse
+        return DEFAULT_BOUND_FETCH_SPOOL_DEPTH;
+    const parsed = std.fmt.parseInt(usize, std.mem.trim(u8, raw, " \t\r\n"), 10) catch
+        return DEFAULT_BOUND_FETCH_SPOOL_DEPTH;
+    return @max(parsed, 1);
+}
 
 // Effect-reification Phase 2E: SubscriptionFireInbox + FetchChunkInbox
 // + PendingFireMessage retired. The unified `effect.MsgInbox` carries
@@ -2471,6 +2491,50 @@ pub fn Worker(comptime opts: Options) type {
         /// rove-library principle #8, so a chain transitioning
         /// cont→stream doesn't invalidate the map entry.
         bound_fetch_entities: std.StringHashMapUnmanaged(rove.Entity) = .empty,
+        /// `docs/chunk-spool-plan.md` Phase 2: per-fetch chunk spool,
+        /// keyed by `fetch_id`, sibling to `bound_fetch_entities`.
+        /// Decouples bound-fetch chunk arrival from the held chain's
+        /// raft commit cadence — arriving chunks push onto the spool;
+        /// `worker_streaming.dispatchSpoolHead` / `drainSpools` pop
+        /// the head once the held entity is back in a receivable
+        /// collection. Heap-allocated `*ChunkSpool` for pointer
+        /// stability across rehash. Keys are allocator-owned fetch_id
+        /// dupes; freed on `dropSpool` + on shutdown (`destroy`).
+        bound_fetch_spools: std.StringHashMapUnmanaged(*chunk_spool_mod.ChunkSpool) = .empty,
+        /// `docs/chunk-spool-plan.md` Phase 3: K, the per-fetch RAM
+        /// window depth. Chunks within K of a spool's head keep their
+        /// inline bytes; chunks pushed beyond K evict their inline
+        /// bytes (read back from the coordinator at dispatch). Default
+        /// `DEFAULT_BOUND_FETCH_SPOOL_DEPTH` (≈ K×64KB inline RAM per
+        /// fetch); overridable via `ROVE_BOUND_FETCH_SPOOL_DEPTH`.
+        bound_fetch_spool_depth: usize = DEFAULT_BOUND_FETCH_SPOOL_DEPTH,
+        /// Peak `inlineBytes()` summed across all live spools observed
+        /// on this worker. Diagnostic for the K-window RAM bound;
+        /// exposed via `/_system/metrics` (`bound_fetch_spool_inline_bytes_peak`).
+        /// Never reset (per the diagnostic-state-stays convention).
+        bound_fetch_spool_inline_bytes_peak: usize = 0,
+        /// Peak total queued entries summed across all live spools —
+        /// how far the producer (upstream chunk arrival) ran ahead of
+        /// the raft-rate consumer. A peak ≫ K is the decoupling
+        /// evidence (`docs/chunk-spool-plan.md` Phase 5): chunks pile
+        /// into the spool at upstream rate while activations drain at
+        /// raft rate. Exposed as `bound_fetch_spool_depth_peak`.
+        bound_fetch_spool_depth_peak: usize = 0,
+        /// Count of spool-head chunks whose evicted inline bytes were
+        /// read back from the coordinator (`coord.readBody`) at
+        /// dispatch. Non-zero proves the Phase 3 eviction → coord
+        /// read-back path actually ran (vs. the consumer keeping up so
+        /// the window never overflowed). Exposed on `/_system/metrics`
+        /// as `bound_fetch_spool_readback_total`. Never reset.
+        bound_fetch_spool_readback_total: u64 = 0,
+        /// Count of spooled-but-unconsumed chunks discarded by
+        /// `dropSpool` when a bound fetch is cancelled
+        /// (`http.cancelFetch`) or its held client disconnects
+        /// (`scanAndCancelBoundFetches`) — `docs/chunk-spool-plan.md`
+        /// Phase 4. Excludes the clean terminal drop (the spool is
+        /// empty by then). Exposed as
+        /// `bound_fetch_spool_dropped_total`. Never reset.
+        bound_fetch_spool_dropped_total: u64 = 0,
         /// `docs/cross-worker-held-state-plan.md` Phase 3: worker-
         /// local mirror of NodeState's `bound_send_owners`. Maps
         /// send_id → the parked cont entity bound to it.
@@ -2583,6 +2647,23 @@ pub fn Worker(comptime opts: Options) type {
         /// hydrating). Only the designated walker worker
         /// (`log_worker_id == 0`) on the current leader advances it.
         upload_walker_idx: u64 = 0,
+        /// `docs/chunk-spool-plan.md` Phase 5 walker-race fix: the
+        /// upload walker now runs ONLY during post-promotion catchup,
+        /// not every flusher tick — a healthy leader's logs already
+        /// come from dispatch capture, so the steady-state per-tick
+        /// `raft_log` reads (which raced the raft thread + were pure
+        /// waste) are gone. These two fields, touched ONLY by the
+        /// flusher thread, drive that gating:
+        ///   - `walker_is_leader`: the flusher's own view of leadership,
+        ///     so it can detect the false→true edge and arm a catchup.
+        ///   - `upload_catchup_target`: raft index to catch up to,
+        ///     snapshotted (via the reader connection) when the flusher
+        ///     observes promotion. The walker walks up to it, then
+        ///     idles until the next promotion. Entries committed after
+        ///     promotion are this leader's own (dispatch-captured), so
+        ///     they don't need the walker.
+        walker_is_leader: bool = false,
+        upload_catchup_target: u64 = 0,
         /// Compile callback used by signup to deploy starter content.
         /// Borrowed from `WorkerConfig.compile_fn` / `compile_ctx`.
         compile_fn: ?files_mod.CompileFn,
@@ -2689,6 +2770,7 @@ pub fn Worker(comptime opts: Options) type {
                 .dispatcher = try Dispatcher.init(allocator),
                 .node = config.node,
                 .raft = config.raft,
+                .bound_fetch_spool_depth = readBoundFetchSpoolDepth(),
                 .tenant_logs = .empty,
                 .log_buffer = log_mod.NodeLogBuffer.init(allocator),
                 .penalty_box = penalty_mod.PenaltyBox.init(allocator, .{}),
@@ -2918,6 +3000,19 @@ pub fn Worker(comptime opts: Options) type {
                 var it = self.bound_fetch_entities.iterator();
                 while (it.next()) |entry| allocator.free(entry.key_ptr.*);
                 self.bound_fetch_entities.deinit(allocator);
+            }
+            // `docs/chunk-spool-plan.md` Phase 2: free every spool +
+            // its still-pending entries + the duped fetch_id key.
+            // Best-effort drain at shutdown, same lossy posture as
+            // `fetch_pending_durability` below.
+            {
+                var it = self.bound_fetch_spools.iterator();
+                while (it.next()) |entry| {
+                    entry.value_ptr.*.deinit(allocator);
+                    allocator.destroy(entry.value_ptr.*);
+                    allocator.free(entry.key_ptr.*);
+                }
+                self.bound_fetch_spools.deinit(allocator);
             }
             // Phase 3: same pattern for the bound_send_entities map.
             {
@@ -3249,8 +3344,19 @@ pub fn Worker(comptime opts: Options) type {
         /// match an in-flight transfer (already complete).
         pub fn cancelFetchTrampoline(ctx: *anyopaque, id: []const u8) void {
             const self: *Self = @ptrCast(@alignCast(ctx));
-            const engine = self.node.fetch_engine orelse return;
-            engine.cancel(id);
+            // `docs/chunk-spool-plan.md` Phase 4: a customer
+            // `http.cancelFetch(id)` tears down the libcurl transfer
+            // AND retires the held-state for the fetch — unregister the
+            // bound-fetch registry entry (decrements fetchesPending,
+            // drops the owner mirror) and drop any spooled-but-unconsumed
+            // chunks. Both are idempotent + no-ops for an unbound fetch
+            // (cancel works on unbound fetches too). `id` is the
+            // customer-held fetch-id string, independent of either map
+            // key, so ordering between the two is unconstrained.
+            // dropSpool BEFORE unregister to mirror scanAndCancelBoundFetches.
+            if (self.node.fetch_engine) |engine| engine.cancel(id);
+            worker_streaming.dropSpool(self, id);
+            self.unregisterBoundFetch(id);
         }
 
         /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
@@ -4533,6 +4639,7 @@ pub const fireSubscriptionActivation = worker_streaming.fireSubscriptionActivati
 pub const proposeForgetfulWrites = worker_streaming.proposeForgetfulWrites;
 pub const serviceSubscriptionFires = worker_streaming.serviceSubscriptionFires;
 pub const dispatchPendingMsgs = worker_streaming.dispatchPendingMsgs;
+pub const drainSpools = worker_streaming.drainSpools;
 pub const dispatchSubscriptionFires = worker_streaming.dispatchSubscriptionFires;
 pub const dispatchFetchEvents = worker_streaming.dispatchFetchEvents;
 
@@ -5189,6 +5296,14 @@ pub fn scanAndCancelBoundFetches(worker: anytype, ent: rove.Entity) void {
     }
     for (doomed.items) |fetch_id| {
         if (worker.node.fetch_engine) |engine| engine.cancel(fetch_id);
+        // `docs/chunk-spool-plan.md` Phase 4: drop any spooled chunks
+        // for this fetch — the held client is gone (disconnect) or the
+        // chain is terminating, so they'll never be consumed. Done
+        // BEFORE `unregisterBoundFetch`: `fetch_id` aliases the
+        // bound_fetch_entities key that `unregisterBoundFetch` frees,
+        // while `dropSpool` frees the (separate) spool-map key — so
+        // `fetch_id` must still be valid here.
+        worker_streaming.dropSpool(worker, fetch_id);
         // unregisterBoundFetch frees the key via fetchRemove. The
         // slice in `doomed` borrows the same bytes — read fetch_id
         // BEFORE the unregister call.

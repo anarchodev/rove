@@ -38,6 +38,7 @@ const tape_mod = @import("rove-tape");
 const dispatcher_mod = @import("dispatcher.zig");
 const Request = dispatcher_mod.Request;
 const components_mod = @import("components.zig");
+const chunk_spool_mod = @import("chunk_spool.zig");
 const effect_mod = @import("effect/root.zig");
 const raft_propose = @import("raft_propose.zig");
 const panic_mod = @import("panic.zig");
@@ -2304,6 +2305,258 @@ pub fn serviceSubscriptionFires(worker: anytype) void {
     dispatchPendingMsgs(worker);
 }
 
+// ── Bound-fetch chunk spool ───────────────────────────────────────────
+//
+// `docs/chunk-spool-plan.md`. The data structure lives in
+// `chunk_spool.zig`; the push/dispatch/drain policy lives here next to
+// the resume engines it drives.
+
+/// Append a bound-fetch chunk onto its per-fetch spool, creating the
+/// spool (+ duping the fetch_id key) on the first chunk. On success
+/// ownership of `ev`'s slices transfers into the spool and the spool
+/// pointer is returned; on error the caller retains ownership of `ev`.
+fn pushToSpool(
+    worker: anytype,
+    ev: components_mod.UpstreamFetchEvent,
+) !*chunk_spool_mod.ChunkSpool {
+    const allocator = worker.allocator;
+    const gop = try worker.bound_fetch_spools.getOrPut(allocator, ev.fetch_id);
+    if (!gop.found_existing) {
+        const sp = allocator.create(chunk_spool_mod.ChunkSpool) catch |e| {
+            _ = worker.bound_fetch_spools.remove(ev.fetch_id);
+            return e;
+        };
+        sp.* = .{};
+        const key_dup = allocator.dupe(u8, ev.fetch_id) catch |e| {
+            allocator.destroy(sp);
+            _ = worker.bound_fetch_spools.remove(ev.fetch_id);
+            return e;
+        };
+        gop.key_ptr.* = key_dup;
+        gop.value_ptr.* = sp;
+    }
+    const sp = gop.value_ptr.*;
+    try sp.push(allocator, ev, worker.bound_fetch_spool_depth);
+    // Track peak inline RAM (K-window bound, Phase 3) + peak queued
+    // depth (decoupling evidence: how far the producer ran ahead of
+    // the raft-rate consumer, Phase 5) across all spools.
+    updateSpoolPeaks(worker);
+    return sp;
+}
+
+/// Recompute summed inline bytes + summed entry count across every
+/// live spool and bump the worker's peak watermarks. O(total spool
+/// entries) — only walked on push, which is bounded by the upstream
+/// chunk rate.
+fn updateSpoolPeaks(worker: anytype) void {
+    var total_bytes: usize = 0;
+    var total_entries: usize = 0;
+    var it = worker.bound_fetch_spools.valueIterator();
+    while (it.next()) |sp_ptr| {
+        total_bytes += sp_ptr.*.inlineBytes();
+        total_entries += sp_ptr.*.len();
+    }
+    if (total_bytes > worker.bound_fetch_spool_inline_bytes_peak) {
+        worker.bound_fetch_spool_inline_bytes_peak = total_bytes;
+    }
+    if (total_entries > worker.bound_fetch_spool_depth_peak) {
+        worker.bound_fetch_spool_depth_peak = total_entries;
+    }
+}
+
+/// Drop a spool: free its still-pending entries, the `ChunkSpool`
+/// itself, and the duped fetch_id key. Idempotent (no-op on miss).
+/// Pub so the cleanup paths in `worker.zig`
+/// (`scanAndCancelBoundFetches`, `cancelFetchTrampoline`) can drop a
+/// spool when its bound fetch is cancelled / its held entity is
+/// destroyed (`docs/chunk-spool-plan.md` Phase 4).
+pub fn dropSpool(worker: anytype, fetch_id: []const u8) void {
+    const entry = worker.bound_fetch_spools.fetchRemove(fetch_id) orelse return;
+    // Count chunks discarded unconsumed (cancel / disconnect). A clean
+    // terminal drop has already popped every entry, so this is 0 there.
+    worker.bound_fetch_spool_dropped_total += entry.value.len();
+    entry.value.deinit(worker.allocator);
+    worker.allocator.destroy(entry.value);
+    worker.allocator.free(entry.key);
+}
+
+/// Pop + resume every spool-head chunk the held entity is currently
+/// ready for, in seq order, stopping at the first head it isn't ready
+/// for (mid-move / awaiting raft commit) — those stay spooled and are
+/// retried by `drainSpools` on a later tick once the prior chunk's
+/// writeset commits and moves the entity back to a receivable
+/// collection. This is the back-pressure point: chunk consumption
+/// runs at the held chain's raft cadence, while arrival ran at
+/// upstream rate into the spool.
+///
+/// Readiness is collection membership (rove principle 1), mirroring
+/// the pre-spool inline `.fetch_chunk` dispatch:
+///   - `parked_continuations`           → `resumeBoundFetchChain`
+///   - `stream_data_out`/`_response_in` → `resumeBoundFetchStream`
+///   - `raft_pending_cont`/`_stream`    → not ready, retry later
+///   - `isMoving` (deferred move)       → not ready, retry later
+///   - none of the above (destroyed)    → drop the whole spool
+fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
+    const server = worker.h2;
+    // Dupe the key into a function-local buffer and match all map ops
+    // by content. The caller's `fetch_id` may alias a spooled entry's
+    // slice (freed when the entry is popped/resumed), and — worse — a
+    // resume can drop THIS spool out from under us: a handler may call
+    // `http.cancelFetch(its-own-id)` (Phase 4) or go terminal
+    // (`scanAndCancelBoundFetches`), either of which frees the spool-map
+    // key. A private dupe is immune to all of these; `dropSpool` frees
+    // the map's own key, never this one.
+    const key: []u8 = blk: {
+        const e = worker.bound_fetch_spools.getEntry(fetch_id) orelse return;
+        break :blk worker.allocator.dupe(u8, e.key_ptr.*) catch return;
+    };
+    defer worker.allocator.free(key);
+    while (true) {
+        const sp = worker.bound_fetch_spools.get(key) orelse return;
+        if (sp.isEmpty()) return;
+
+        const held_ent = worker.lookupBoundFetch(key) orelse {
+            // Held chain gone (terminal already drained, or client
+            // disconnected) but chunks still spooled — drop them.
+            // Matches the stale-registry posture in
+            // `docs/chunk-spool-plan.md` §Risks.
+            std.log.info(
+                "rove-js chunk-spool: no held entity for fetch_id={s}; dropping {d} spooled chunk(s)",
+                .{ key, sp.len() },
+            );
+            dropSpool(worker, key);
+            return;
+        };
+
+        // Same-tick / pre-commit defer: a prior chunk's writeset move
+        // hasn't flushed (`isMoving`) or hasn't committed
+        // (`raft_pending_*`). Leave the head spooled; `drainSpools`
+        // retries after the commit lands.
+        if (server.reg.isMoving(held_ent)) return;
+        const ready_cont = server.reg.isInCollection(held_ent, &worker.parked_continuations);
+        const ready_stream = server.reg.isInCollection(held_ent, &server.stream_data_out) or
+            server.reg.isInCollection(held_ent, &server.stream_response_in);
+        if (!ready_cont and !ready_stream) {
+            if (server.reg.isInCollection(held_ent, &worker.raft_pending_cont) or
+                server.reg.isInCollection(held_ent, &worker.raft_pending_stream))
+            {
+                return;
+            }
+            // Entity not in any tracked collection — destroyed /
+            // recycled, no commit will move it back. Drop the spool.
+            std.log.info(
+                "rove-js chunk-spool: entity for fetch_id={s} not in any tracked collection; dropping {d} spooled chunk(s)",
+                .{ key, sp.len() },
+            );
+            dropSpool(worker, key);
+            return;
+        }
+
+        // Head entity is ready. If the head chunk's inline bytes were
+        // evicted to honour the K-window, read them back from the
+        // coordinator first — durability-gated: the bytes are only
+        // resolvable once the submission seq is durable. If not yet
+        // durable, leave the head spooled; `drainSpools` retries once
+        // the coord HWM advances (docs/chunk-spool-plan.md Phase 3).
+        {
+            const h = sp.head().?;
+            if (h.evicted) {
+                const coord = worker.node.blob_coordinator orelse {
+                    // No coord but an evicted entry — unreachable in
+                    // production (eviction only happens for submitted
+                    // chunks, which require a coord). Drop loudly.
+                    std.log.warn(
+                        "rove-js chunk-spool: evicted head for fetch_id={s} but no coordinator; dropping spool",
+                        .{key},
+                    );
+                    dropSpool(worker, key);
+                    return;
+                };
+                const wid = h.event.coord_worker_id;
+                if (coord.durableSeq(wid) <= h.event.coord_seq) {
+                    // Bytes not durable yet — defer this head.
+                    return;
+                }
+                const bytes = coord.readBody(wid, h.event.coord_seq, worker.allocator) catch |err| {
+                    std.log.warn(
+                        "rove-js chunk-spool: coord.readBody fetch_id={s} wid={d} seq={d}: {s}; dropping chunk",
+                        .{ key, wid, h.event.coord_seq, @errorName(err) },
+                    );
+                    // Drop just this chunk (free + remove), keep the
+                    // rest of the spool.
+                    var bad = sp.popHead();
+                    components_mod.UpstreamFetchEvent.deinitItem(&bad, worker.allocator);
+                    continue;
+                };
+                // Materialize: the event now owns `bytes` inline again
+                // (resume frees it on consume).
+                h.event.bytes = bytes;
+                h.evicted = false;
+                worker.bound_fetch_spool_readback_total += 1;
+            }
+        }
+
+        // Head is dispatchable: pop + resume (resume consumes `ev`).
+        // The resume may itself drop this spool (handler cancels its
+        // own fetch, or goes terminal → `scanAndCancelBoundFetches`);
+        // that's fine — `key` is our private dupe, and the cleanup
+        // below is idempotent (a no-op if the spool/registry are
+        // already gone).
+        var ev = sp.popHead();
+        const final = ev.final;
+        if (ready_cont) {
+            worker_drain.resumeBoundFetchChain(worker, held_ent, &ev);
+        } else {
+            // Steady-state stream (stream_data_out) OR the brief
+            // post-commit window in stream_response_in before h2's
+            // consumeStreamResponses ships headers + moves to
+            // stream_data_out; resumeBoundFetchStream picks the right
+            // collection internally.
+            resumeBoundFetchStream(worker, held_ent, &ev);
+        }
+        if (final) {
+            worker.unregisterBoundFetch(key);
+            dropSpool(worker, key);
+            return;
+        }
+        // Non-final: loop. If the resume wrote + moved the entity,
+        // the next iteration's isMoving / raft_pending check defers
+        // the following head.
+    }
+}
+
+/// Worker-tick system (`docs/chunk-spool-plan.md` Phase 2): retry
+/// dispatch for every spool whose held entity has returned to a
+/// receivable state since the last tick (e.g. after a prior chunk's
+/// writeset committed in `drainRaftPending`). Snapshots duped keys
+/// up front because `dispatchSpoolHead` can `dropSpool` (mutating the
+/// map) and the resume engines can register new bound fetches
+/// mid-walk. Cheap no-op when no bound fetch is streaming.
+pub fn drainSpools(worker: anytype) void {
+    const allocator = worker.allocator;
+    if (worker.bound_fetch_spools.count() == 0) return;
+
+    var keys: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (keys.items) |k| allocator.free(k);
+        keys.deinit(allocator);
+    }
+    var it = worker.bound_fetch_spools.iterator();
+    while (it.next()) |entry| {
+        const kd = allocator.dupe(u8, entry.key_ptr.*) catch return;
+        keys.append(allocator, kd) catch {
+            allocator.free(kd);
+            return;
+        };
+    }
+    for (keys.items) |k| {
+        // Skip spools dropped by an earlier iteration; the duped key
+        // is safe to hash even after the live spool/key was freed.
+        if (worker.bound_fetch_spools.get(k) == null) continue;
+        dispatchSpoolHead(worker, k);
+    }
+}
+
 /// Worker-tick system: dequeue Msgs from `worker.msg_queue` (up to
 /// `BATCH` per tick) and dispatch each by variant. Per-tick cap
 /// bounds tail latency on the request hot path: a misbehaving
@@ -2367,104 +2620,30 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
                 // still tape via the unbound path).
                 var ev = ev_const;
                 if (ev.bind) {
-                    if (worker.lookupBoundFetch(ev.fetch_id)) |held_ent| {
-                        const final = ev.final;
-                        // Copy the fetch_id BEFORE the resume call:
-                        // the resume engines consume `ev` and free
-                        // its slices on every exit path; reading
-                        // `ev.fetch_id` afterward is use-after-free.
-                        const fid_copy: ?[]u8 = if (final)
-                            allocator.dupe(u8, ev.fetch_id) catch null
-                        else
-                            null;
-                        // rove-library principle 1: dispatch by
-                        // collection membership. The held entity's
-                        // state IS where it lives:
-                        //   - parked_continuations: first chunk on
-                        //     a still-cont chain → resumeBoundFetchChain
-                        //   - stream_data_out: subsequent chunk on a
-                        //     chain that already cont→streamed →
-                        //     resumeBoundFetchStream
-                        //   - anything else (raft_pending_*, in
-                        //     transition): defer one tick by
-                        //     re-enqueueing the Msg at the back of
-                        //     the queue (it'll re-arrive after the
-                        //     pending move commits).
-                        const server = worker.h2;
-                        // Same-tick chunk race: if a prior chunk
-                        // for this entity in this tick called
-                        // proposeAndParkContResume, the entity has
-                        // a pending (deferred) move that won't
-                        // flush until the next reg.flush boundary.
-                        // A second chunk attempting reg.set /
-                        // reg.move on it would error PendingMove.
-                        // Re-enqueue the chunk at the tail; the
-                        // next tick's drainRaftPending will commit
-                        // the predecessor's writes + flush the
-                        // move, then dispatch picks this chunk up
-                        // cleanly. BATCH-bounded so it can't spin
-                        // indefinitely.
-                        if (server.reg.isMoving(held_ent)) {
-                            const ev_copy = ev; // Msg owns its slices; copy by value.
-                            effect_mod.enqueueMsg(&worker.msg_queue, .{ .fetch_chunk = ev_copy }) catch |eerr| {
-                                std.log.warn(
-                                    "rove-js bound-fetch: re-enqueue dropped (fetch_id={s}): {s}",
-                                    .{ ev.fetch_id, @errorName(eerr) },
-                                );
-                                components_mod.UpstreamFetchEvent.deinitItem(&ev, allocator);
-                            };
-                            if (fid_copy) |fid| allocator.free(fid);
-                            fired += 1;
-                            continue;
-                        }
-                        if (server.reg.isInCollection(held_ent, &worker.parked_continuations)) {
-                            worker_drain.resumeBoundFetchChain(worker, held_ent, &ev);
-                        } else if (server.reg.isInCollection(held_ent, &server.stream_data_out) or
-                            server.reg.isInCollection(held_ent, &server.stream_response_in))
-                        {
-                            // Steady-state stream chain (stream_data_out)
-                            // OR the brief post-commit window before h2's
-                            // consumeStreamResponses ships headers + moves
-                            // to stream_data_out (stream_response_in).
-                            // resumeBoundFetchStream picks the right
-                            // collection internally for component reads.
-                            resumeBoundFetchStream(worker, held_ent, &ev);
-                        } else if (server.reg.isInCollection(held_ent, &worker.raft_pending_cont) or
-                            server.reg.isInCollection(held_ent, &worker.raft_pending_stream))
-                        {
-                            // Entity awaiting commit in raft_pending —
-                            // a prior chunk's writes haven't landed
-                            // yet. Defer until next tick (same idea
-                            // as the isMoving branch above — the
-                            // commit-arm Cmd.respond will move the
-                            // entity back to its receivable state).
-                            const ev_copy = ev;
-                            effect_mod.enqueueMsg(&worker.msg_queue, .{ .fetch_chunk = ev_copy }) catch |eerr| {
-                                std.log.warn(
-                                    "rove-js bound-fetch: re-enqueue dropped (fetch_id={s}): {s}",
-                                    .{ ev.fetch_id, @errorName(eerr) },
-                                );
-                                components_mod.UpstreamFetchEvent.deinitItem(&ev, allocator);
-                            };
-                            if (fid_copy) |fid| allocator.free(fid);
-                            fired += 1;
-                            continue;
-                        } else {
-                            // Transient state — entity not in any
-                            // known collection. Drop. (Different
-                            // from the raft_pending case above:
-                            // there's no commit that would move it
-                            // back. Likely a destroyed/recycled
-                            // entity.)
-                            std.log.info(
-                                "rove-js bound-fetch: entity for fetch_id={s} not in any tracked collection; dropping chunk",
-                                .{ev.fetch_id},
+                    if (worker.lookupBoundFetch(ev.fetch_id) != null) {
+                        // `docs/chunk-spool-plan.md` Phase 2: a bound
+                        // chunk for a live held chain goes onto the
+                        // per-fetch spool instead of dispatching (or
+                        // re-enqueueing a Msg) inline. `pushToSpool`
+                        // takes ownership of `ev`; `dispatchSpoolHead`
+                        // then pops + resumes every head the entity is
+                        // currently ready for. Heads the entity isn't
+                        // ready for (mid-move / awaiting raft commit)
+                        // stay spooled and are retried by `drainSpools`
+                        // on the next tick — superseding the old
+                        // re-enqueue-to-tail defer.
+                        if (pushToSpool(worker, ev)) |_| {
+                            // Ownership transferred. `ev.fetch_id`
+                            // still aliases the spooled entry's slice
+                            // (valid until dispatched); dispatchSpoolHead
+                            // re-anchors to the stable map key.
+                            dispatchSpoolHead(worker, ev.fetch_id);
+                        } else |err| {
+                            std.log.warn(
+                                "rove-js chunk-spool: pushToSpool fetch_id={s}: {s}",
+                                .{ ev.fetch_id, @errorName(err) },
                             );
                             components_mod.UpstreamFetchEvent.deinitItem(&ev, allocator);
-                        }
-                        if (fid_copy) |fid| {
-                            worker.unregisterBoundFetch(fid);
-                            allocator.free(fid);
                         }
                         fired += 1;
                         continue;
