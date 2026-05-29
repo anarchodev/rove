@@ -920,12 +920,32 @@ pub const RaftNode = struct {
         };
     }
 
+    /// `getRaftEntry`, but through the raft log's dedicated reader
+    /// connection — MUST be called only from the flusher thread (the
+    /// upload walker). Keeps the walker's reads off the raft thread's
+    /// primary connection. See `RaftLog.getFromReader`.
+    pub fn getRaftEntryReader(self: *RaftNode, index: u64) !?raft_log_mod.Entry {
+        const rl = self.raft_log orelse return null;
+        return rl.getFromReader(index) catch |err| switch (err) {
+            error.NotFound => null,
+            else => err,
+        };
+    }
+
     /// Highest raft-log index present locally. Used by Phase 5c's
     /// upload walker to bound its scan. Returns 0 when the log
     /// is empty or not persisted.
     pub fn raftLogLastIndex(self: *RaftNode) !u64 {
         const rl = self.raft_log orelse return 0;
         const last = try rl.last();
+        return last.index;
+    }
+
+    /// `raftLogLastIndex`, but through the dedicated reader connection
+    /// — flusher-thread-only (upload walker). See `getRaftEntryReader`.
+    pub fn raftLogLastIndexReader(self: *RaftNode) !u64 {
+        const rl = self.raft_log orelse return 0;
+        const last = try rl.lastFromReader();
         return last.index;
     }
 

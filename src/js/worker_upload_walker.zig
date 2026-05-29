@@ -206,41 +206,68 @@ fn buildLogRecord(
 /// indexer's `INSERT OR IGNORE (tenant_id, request_id)` dedups any
 /// record the original leader already pushed.
 ///
-/// Gated to the leader's first worker (`log_worker_id == 0`) so
-/// multiple workers on the same node don't multiply the dedupe
-/// load. The walker is otherwise idempotent: each `worker.upload_walker_idx`
-/// advance is monotonic, and re-running across a process restart
-/// just rescans from `idx = 1` (cheap on small logs; bounded by
-/// the per-tick cap).
+/// `docs/chunk-spool-plan.md` Phase 5 walker-race fix — two changes
+/// from the original per-tick design:
+///
+///  1. **Promotion-catchup-only.** The walker exists solely to
+///     recover the gap a *previous* leader left when it crashed
+///     pre-flush. A healthy leader's own requests are logged via
+///     dispatch capture, so re-deriving them from the raft log every
+///     tick was pure waste (it read + skipped every new entry). Now
+///     the walker only runs after this node observes a false→true
+///     leadership edge, walking up to the raft index snapshotted at
+///     promotion, then idling until the next promotion. Entries
+///     committed after promotion are this leader's own → dispatch-
+///     captured → never walked.
+///  2. **Dedicated reader connection.** The catchup reads go through
+///     `RaftNode.getRaftEntryReader` / `raftLogLastIndexReader` (the
+///     raft log's second SQLite connection), never the raft thread's
+///     primary connection. Together with (1) this eliminates the
+///     flusher-vs-raft-thread `raft_log` data race (the SIGSEGV /
+///     kvexp-corruption seen under high cont-resume write rates).
+///
+/// Gated to the leader's first worker (`log_worker_id == 0`). All
+/// state here (`walker_is_leader`, `upload_catchup_target`,
+/// `upload_walker_idx`) + the reader connection are touched ONLY by
+/// the flusher thread.
 pub fn walkAndUploadCatchup(worker: anytype) !void {
-    // Only the leader pushes log records. Followers' flushLogs
-    // early-returns on `!isLeader`, so any records the walker
-    // appended there would just sit in the buffer until the worker
-    // either becomes leader or shuts down (the buffer drops them
-    // on shutdown).
-    if (!worker.raft.isLeader()) return;
-    // Single designated walker per node — `log_worker_id == 0` is
-    // the first worker thread. Other workers on the same node
-    // skip; the indexer's idempotency would absorb the duplicates
-    // but the extra raft_log GETs + per-record alloc work is pure
-    // waste.
+    // Single designated walker per node — `log_worker_id == 0` is the
+    // first worker thread. Other workers skip (the indexer's
+    // idempotency would absorb duplicates, but the work is waste).
     if (worker.log_worker_id != 0) return;
 
-    const last_idx = worker.raft.raftLogLastIndex() catch |err| {
-        std.log.warn(
-            "rove-js upload walker: raftLogLastIndex failed: {s}",
-            .{@errorName(err)},
-        );
+    const is_leader = worker.raft.isLeader();
+    if (!is_leader) {
+        // Track leadership on the flusher side so we can detect the
+        // next false→true edge. Followers never walk (their flushLogs
+        // drops drained records anyway).
+        worker.walker_is_leader = false;
         return;
-    };
-    if (last_idx <= worker.upload_walker_idx) return;
+    }
+    // false→true promotion edge, observed on the flusher thread:
+    // snapshot the catchup target (the gap end) via the reader
+    // connection. Everything past it is this leader's own work.
+    if (!worker.walker_is_leader) {
+        worker.walker_is_leader = true;
+        worker.upload_catchup_target = worker.raft.raftLogLastIndexReader() catch |err| blk: {
+            std.log.warn(
+                "rove-js upload walker: raftLogLastIndexReader on promotion failed: {s}",
+                .{@errorName(err)},
+            );
+            break :blk worker.upload_walker_idx; // nothing to catch up
+        };
+    }
+    // Steady state: catchup complete (or nothing to catch up). The
+    // common case on a healthy leader — a cheap early return, no
+    // raft_log reads.
+    if (worker.upload_walker_idx >= worker.upload_catchup_target) return;
 
     const allocator = worker.allocator;
     var processed: u64 = 0;
     var idx: u64 = worker.upload_walker_idx + 1;
-    const stop_at: u64 = @min(last_idx, worker.upload_walker_idx + WALKER_BATCH_CAP);
+    const stop_at: u64 = @min(worker.upload_catchup_target, worker.upload_walker_idx + WALKER_BATCH_CAP);
     while (idx <= stop_at) : (idx += 1) {
-        const entry_opt = worker.raft.getRaftEntry(idx) catch |err| {
+        const entry_opt = worker.raft.getRaftEntryReader(idx) catch |err| {
             std.log.warn(
                 "rove-js upload walker: getRaftEntry({d}) failed: {s}",
                 .{ idx, @errorName(err) },

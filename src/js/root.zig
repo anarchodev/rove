@@ -49,6 +49,7 @@ pub const effect = @import("effect/root.zig");
 pub const globals = @import("globals.zig");
 pub const worker = @import("worker.zig");
 pub const components = @import("components.zig");
+pub const chunk_spool = @import("chunk_spool.zig");
 pub const apply = @import("apply.zig");
 pub const penalty = @import("penalty.zig");
 pub const limiter = @import("limiter.zig");
@@ -98,6 +99,7 @@ pub const sweepCronSubscriptions = worker.sweepCronSubscriptions;
 pub const sweepOwedRetries = worker.sweepOwedRetries;
 pub const sweepOwedRetriesOnPromotion = worker.sweepOwedRetriesOnPromotion;
 pub const serviceFetchEvents = worker.serviceFetchEvents;
+pub const drainSpools = worker.drainSpools;
 
 test {
     _ = dispatcher;
@@ -105,6 +107,7 @@ test {
     _ = globals;
     _ = worker;
     _ = components;
+    _ = chunk_spool;
     _ = apply;
     _ = penalty;
     _ = limiter;

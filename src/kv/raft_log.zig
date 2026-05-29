@@ -108,6 +108,23 @@ pub const RaftLog = struct {
     stmt_save_state: *c.sqlite3_stmt,
     stmt_load_state: *c.sqlite3_stmt,
 
+    /// Dedicated read-only connection for the flusher-thread upload
+    /// walker (`docs/readset-replication-plan.md` Phase 5c + the
+    /// chunk-spool Phase 5 walker-race fix). The primary `db` /
+    /// statements above are `SQLITE_OPEN_NOMUTEX` (no internal locking)
+    /// and are owned exclusively by the **raft thread**. The upload
+    /// walker runs on the **flusher thread** and must never touch them.
+    /// WAL mode (pinned in `pinDurability`) permits a second connection
+    /// to read concurrently with the writer, so the walker reads
+    /// through `db_reader` / `stmt_*_reader` instead — touched only by
+    /// the flusher thread. Two single-threaded connections, no shared
+    /// state ⇒ no race. (Post-Phase-5 the walker also runs only during
+    /// post-promotion catchup, not every tick, so this connection is
+    /// idle in steady state.)
+    db_reader: *c.sqlite3,
+    stmt_get_reader: *c.sqlite3_stmt,
+    stmt_last_reader: *c.sqlite3_stmt,
+
     pub fn open(allocator: std.mem.Allocator, db_path: [:0]const u8) Error!*RaftLog {
         const self = try allocator.create(RaftLog);
         errdefer allocator.destroy(self);
@@ -171,6 +188,27 @@ pub const RaftLog = struct {
             prepared += 1;
         }
 
+        // Second, read-only-use connection for the flusher-thread
+        // upload walker (see the field doc above). Opened READWRITE so
+        // it can participate in the WAL/-shm protocol (a pure READONLY
+        // connection can't), but only ever issues SELECTs. NOMUTEX +
+        // flusher-thread-only ⇒ single-threaded per connection, like
+        // the primary. `busy_timeout` because a second connection makes
+        // `SQLITE_BUSY` possible (checkpoint restarts) where it wasn't
+        // before.
+        var rdb: ?*c.sqlite3 = null;
+        const rflags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_NOMUTEX;
+        if (c.sqlite3_open_v2(db_path.ptr, &rdb, rflags, null) != c.SQLITE_OK) {
+            if (rdb) |d| _ = c.sqlite3_close(d);
+            return Error.Sqlite;
+        }
+        errdefer _ = c.sqlite3_close(rdb.?);
+        _ = c.sqlite3_exec(rdb, "PRAGMA busy_timeout=5000;", null, null, null);
+        self.db_reader = rdb.?;
+        self.stmt_get_reader = try prepare(self.db_reader, SQL_GET);
+        errdefer _ = c.sqlite3_finalize(self.stmt_get_reader);
+        self.stmt_last_reader = try prepare(self.db_reader, SQL_LAST);
+
         return self;
     }
 
@@ -183,6 +221,9 @@ pub const RaftLog = struct {
         _ = c.sqlite3_finalize(self.stmt_save_state);
         _ = c.sqlite3_finalize(self.stmt_load_state);
         _ = c.sqlite3_close(self.db);
+        _ = c.sqlite3_finalize(self.stmt_get_reader);
+        _ = c.sqlite3_finalize(self.stmt_last_reader);
+        _ = c.sqlite3_close(self.db_reader);
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -283,6 +324,51 @@ pub const RaftLog = struct {
     /// Returns (index, term) of the last entry, or (0, 0) if the log is empty.
     pub fn last(self: *RaftLog) Error!struct { index: u64, term: u64 } {
         const st = self.stmt_last;
+        _ = c.sqlite3_reset(st);
+        const rc = c.sqlite3_step(st);
+        defer _ = c.sqlite3_reset(st);
+
+        if (rc == c.SQLITE_ROW) {
+            return .{
+                .index = @bitCast(c.sqlite3_column_int64(st, 0)),
+                .term = @bitCast(c.sqlite3_column_int64(st, 1)),
+            };
+        }
+        if (rc == c.SQLITE_DONE) return .{ .index = 0, .term = 0 };
+        return Error.Sqlite;
+    }
+
+    /// `get`, but via the dedicated reader connection (`db_reader`).
+    /// MUST be called only from the flusher thread — never concurrently
+    /// with itself or `lastFromReader`. See the `db_reader` field doc:
+    /// this keeps the upload walker's reads off the raft thread's
+    /// primary connection. Identical semantics + ownership to `get`.
+    pub fn getFromReader(self: *RaftLog, index: u64) Error!Entry {
+        const st = self.stmt_get_reader;
+        _ = c.sqlite3_reset(st);
+        _ = c.sqlite3_bind_int64(st, 1, @bitCast(index));
+
+        const rc = c.sqlite3_step(st);
+        defer _ = c.sqlite3_reset(st);
+
+        if (rc == c.SQLITE_ROW) {
+            const term: u64 = @bitCast(c.sqlite3_column_int64(st, 0));
+            const blob = c.sqlite3_column_blob(st, 1);
+            const blen: usize = @intCast(c.sqlite3_column_bytes(st, 1));
+            const copy = try self.allocator.alloc(u8, blen);
+            if (blen > 0) {
+                @memcpy(copy, @as([*]const u8, @ptrCast(blob))[0..blen]);
+            }
+            return .{ .index = index, .term = term, .data = copy };
+        }
+        if (rc == c.SQLITE_DONE) return Error.NotFound;
+        return Error.Sqlite;
+    }
+
+    /// `last`, but via the dedicated reader connection (`db_reader`).
+    /// Flusher-thread-only — see `getFromReader`.
+    pub fn lastFromReader(self: *RaftLog) Error!struct { index: u64, term: u64 } {
+        const st = self.stmt_last_reader;
         _ = c.sqlite3_reset(st);
         const rc = c.sqlite3_step(st);
         defer _ = c.sqlite3_reset(st);

@@ -463,7 +463,16 @@ pub const FetchEngine = struct {
     }
 
     fn routeEvent(self: *FetchEngine, tenant_id: []const u8, ev: UpstreamFetchEvent) !void {
-        self.node.enqueueFetchEventForTenant(tenant_id, ev) catch |err| {
+        var event = ev;
+        // `docs/chunk-spool-plan.md` Phase 1: bound-fetch chunk bytes
+        // become durable via the process-global blob coordinator at
+        // upstream rate, decoupled from the held chain's raft commit
+        // cadence. This stamps `coord_seq`/`coord_worker_id` on the
+        // event; the consumer still reads inline `bytes` (no behavior
+        // change). Phases 2-3 switch the consumer onto a spool that
+        // reads bytes back from the coordinator.
+        self.submitBoundChunkToCoord(&event);
+        self.node.enqueueFetchEventForTenant(tenant_id, event) catch |err| {
             if (err == error.NoWorkers and
                 !self.no_inbox_warned.swap(true, .acq_rel))
             {
@@ -474,6 +483,39 @@ pub const FetchEngine = struct {
             }
             return err;
         };
+    }
+
+    /// `docs/chunk-spool-plan.md` Phase 1: write a bound-fetch chunk's
+    /// bytes to the process-global blob coordinator and stamp the
+    /// resulting `(worker_id, seq)` on the event. The coordinator dups
+    /// the bytes internally, so the event retains ownership of `bytes`
+    /// and the inline copy stays the consumer's source of truth for
+    /// Phase 1.
+    ///
+    /// Best-effort and side-effect-free on the read path: if this is
+    /// not a bound chunk, the coordinator isn't up, the owner isn't
+    /// registered yet, or the submit fails, the fields stay 0 and the
+    /// consumer simply uses `bytes`. We submit under the owning
+    /// worker's id (== its coord queue id, == its `log_worker_id`) so
+    /// the consumer can later gate on `durableSeq(coord_worker_id)`;
+    /// that's the same owner the slim Msg routes to via
+    /// `bound_fetch_owners`.
+    fn submitBoundChunkToCoord(self: *FetchEngine, ev: *UpstreamFetchEvent) void {
+        if (!ev.bind) return;
+        if (ev.bytes.len == 0) return;
+        const coord = self.node.blob_coordinator orelse return;
+        const owner_idx = self.node.lookupBoundFetchOwner(ev.fetch_id) orelse return;
+        const wid = std.math.cast(u8, owner_idx) orelse return;
+        const seq = coord.submit(wid, ev.bytes) catch |err| {
+            std.log.warn(
+                "rove-js chunk-spool: coord.submit fetch_id={s} seq={d} bytes={d}: {s}",
+                .{ ev.fetch_id, ev.seq, ev.bytes.len, @errorName(err) },
+            );
+            return;
+        };
+        ev.coord_seq = seq;
+        ev.coord_worker_id = wid;
+        ev.coord_submitted = true;
     }
 };
 

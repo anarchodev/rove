@@ -361,38 +361,195 @@ Tests:
 
 ## Phasing
 
-Phase 1 — **Producer-side coord submit + slim Msg**.
+Phase 1 — **Producer-side coord submit + slim Msg**. ✅ SHIPPED
 - Add `coord_seq` + `coord_worker_id` to `UpstreamFetchEvent`.
+  (`components.zig`; plain integers, no `deinitItem` change.)
 - Fetch_engine submits bound chunks to coord, attaches seq to Msg.
+  (`fetch_engine.zig` `routeEvent` → `submitBoundChunkToCoord`:
+  bound + non-empty + coord-up + owner-registered → `coord.submit`
+  under the owner worker's id, stamp `coord_seq`/`coord_worker_id`;
+  best-effort, falls back to inline `bytes` on any miss.)
 - Consumer ignores the new fields for now (continues to use
   `bytes` inline as today). No behavior change; ground truth
   becomes coord.
-- Tests: existing bound-fetch smokes green.
+- Tests: `bound_fetch_smoke`, `bound_fetch_multiworker_smoke`
+  (60 cross-worker routes exercised), `fetch_chunk_smoke` all green;
+  `zig build test` green.
 
-Phase 2 — **Spool data structure + push path**.
+Phase 2 — **Spool data structure + push path**. ✅ SHIPPED
 - Land `ChunkSpool` struct + `bound_fetch_spools` map.
+  (New `src/js/chunk_spool.zig` — FIFO of full chunk events, each
+  still holding inline `bytes` as the Msg queue did, no K-window /
+  coord reads yet. Map on the Worker struct, sibling to
+  `bound_fetch_entities`; init `.empty`, freed in `destroy`.)
 - Consumer's `.fetch_chunk` arm pushes to spool, immediately pops
   head if entity ready. Single-entry-at-a-time behavior is
   identical to today.
-- Tests: existing bound-fetch smokes + heldsync_multiworker still
-  green.
+  (`worker_streaming.zig`: `pushToSpool` + `dispatchSpoolHead` +
+  `dropSpool` + `drainSpools`. The arm now `pushToSpool` +
+  `dispatchSpoolHead` on a registry hit; lookup-miss still falls
+  through to `fireFetchEventActivation`. The old
+  `isMoving`/`raft_pending_*` re-enqueue-to-tail defer is GONE —
+  not-ready heads stay spooled and `drainSpools` retries them. The
+  `8bd53bb` PendingMove safety net is now the spool's `isMoving`
+  branch.)
+- `drainSpools(worker)` wired into the tick right after
+  `drainRaftPending` + flush (where prior chunk writesets commit and
+  move held entities back to a receivable collection). Snapshots
+  duped keys (dispatch can `dropSpool` mid-walk).
+- Tests: `ChunkSpool` unit tests; `bound_fetch_smoke`,
+  `bound_fetch_multiworker_smoke` (52 cross-worker routes),
+  `heldsync_smoke`/`_concurrent`/`_multiworker`, `fetch_chunk_smoke`,
+  `fetch_chunk_tape_smoke` all green; `zig build test` green.
+- NOTE for Phase 3: `dispatchSpoolHead` loops dispatching *all*
+  consecutive ready heads (matches today's multi-no-write-chunk
+  batching); a writing chunk moves the entity and the loop's
+  next-iteration `isMoving`/`raft_pending` check defers the rest.
 
-Phase 3 — **K-deep ring + eviction**.
-- Inline-bytes eviction on push when window > K.
-- Consumer reads via `coord.bodyRef` for evicted entries.
-- New `drainSpools` system in the post-commit drain pass.
-- Smokes: large-body smoke (peak RAM bound), multi-bind smoke
-  (throughput at upstream rate).
+Phase 3 — **K-deep ring + eviction**. ✅ SHIPPED
+- Inline-bytes eviction on push when window > K (`chunk_spool.zig`:
+  `SpoolEntry{event, evicted}`; on push, if `len > K` free the
+  just-pushed tail entry's `bytes` — keeps the K entries nearest the
+  head warm, evicts the rest). Gated on `coord_submitted` (added to
+  `UpstreamFetchEvent` — `coord_seq`/`coord_worker_id` are both
+  legitimately 0, so an explicit submitted-marker is required); never
+  evicts the terminal chunk. K via `ROVE_BOUND_FETCH_SPOOL_DEPTH`
+  (default `DEFAULT_BOUND_FETCH_SPOOL_DEPTH = 4`, clamped ≥ 1).
+- Consumer reads evicted entries back from the **coordinator's
+  retained RAM** (no `store.get` / S3 round-trip): new
+  `BlobCoordinator.readBody(worker_id, seq, alloc)`. `RefSlot.durable`
+  now carries a borrowed view of the retained `SealedSubEntry.bytes`
+  (alive for the coordinator's lifetime) alongside the `BodyRef`.
+  Durability-gated in `dispatchSpoolHead`: if the head is evicted and
+  `durableSeq(wid) <= coord_seq`, defer; else `readBody` materializes
+  the bytes inline and resume consumes them.
+- `drainSpools` (landed Phase 2) is the retry pass; it now also drives
+  the durability-gated read-back.
+- Metrics on `/_system/metrics`: `bound_fetch_spool_inline_bytes_peak`
+  (peak summed inline RAM across spools — bounded ~K×chunk) and
+  `bound_fetch_spool_readback_total` (evicted chunks read back from
+  the coordinator — non-zero proves the path ran).
+- Smokes: `bound_fetch_large_body_smoke.py` (single bind, K=2,
+  3800B/64B body → read-back=57, peak=128B ≪ body, byte-exact) +
+  `bound_fetch_spool_smoke.py` (two bound fetches on one entity,
+  writes-per-chunk, interleaved, both byte-exact, no drops/panic).
+  New fixtures: `wb/bigbody`, `acme/spoolsink`, `acme/multibind`.
 
-Phase 4 — **Cleanup hooks**.
-- Extend `scanAndCancelBoundFetches` to drop spools.
-- Disconnect path drops spools.
-- Smokes: disconnect mid-stream, cancel mid-stream.
+  **Two findings worth carrying forward:**
+  1. The coordinator retains every submission's bytes in RAM until
+     deinit (the `_pool/` retained list — "P6 cleanup pending" per
+     [[project-blob-coordinator-state]]). So the spool eviction bounds
+     the *spool's* inline copy (proven: peak ≈ K chunks), but the
+     *process*-wide RAM for a large body is still held once in the
+     coordinator. The full process-RAM bound additionally needs coord
+     retention release (P6). Read-back reads from that retained RAM,
+     which is also why it's S3-free.
+  2. **Fixed a latent held-chain bug** exposed by multi-bind: a
+     cont-resume returning `terminal` *with kv writes* parked the
+     stamped response back into `parked_continuations` (via
+     `Cmd.respond` dest) and relied on "a subsequent resume/sweep
+     ships it" — but a bound-fetch chain whose fetches are all done
+     has no follow-up event, so it hung. Routed `.terminal` →
+     `response_in` (mirrors the `wrote=false` branch's
+     `resolveParked`). Pre-existing; never hit because no prior smoke
+     returned terminal-with-writes from a held chain. heldsync +
+     streaming + webhook smokes stay green.
 
-Phase 5 — **Measure + tune K**.
-- benchfetch with bound mode + writes-per-chunk.
-- Compare arrival rate vs activation rate; assert decoupled.
-- Tune K based on memory profile + dispatch latency.
+Phase 4 — **Cleanup hooks**. ✅ SHIPPED
+- `scanAndCancelBoundFetches` now `dropSpool`s each cancelled fetch
+  (before `unregisterBoundFetch`, while the fetch_id slice is still
+  valid). This covers BOTH the chain-going-terminal sibling-cancel
+  (resume `.terminal` arm) AND the held-client disconnect
+  (`cleanupResponses` walks `response_out` → `scanAndCancelBoundFetches`
+  + destroy).
+- `cancelFetchTrampoline` (`http.cancelFetch(id)`) now unregisters +
+  `dropSpool`s the fetch (was cancel-engine-only), so a customer cancel
+  retires the held-state + discards spooled-but-unconsumed chunks.
+- `dropSpool` is `pub`; `bound_fetch_spool_dropped_total` metric counts
+  chunks discarded unconsumed (cancel / disconnect).
+- Reentrancy hardening: `dispatchSpoolHead` now dupes the spool key
+  into a function-local buffer and matches all map ops by content —
+  because a resume can drop THIS spool mid-flight (handler calls
+  `http.cancelFetch(its-own-id)`, or goes terminal →
+  `scanAndCancelBoundFetches`), which frees the map key. The dupe is
+  immune; cleanup is idempotent.
+- Smoke `bound_fetch_spool_cleanup_smoke.py`: cancel-mid-stream
+  (writes-per-chunk backs the spool up, `http.cancelFetch` on the
+  handler's own fetch → 58 tail chunks dropped) + disconnect on a held
+  bound-fetch stream (drip upstream, client close → drip fetch + spool
+  torn down) + node-survives. Fixture: `acme/spoolcancel`.
+
+  **Found + fixed a fatal pre-existing coordinator race** that the
+  high-rate per-chunk bound-fetch submits (Phase 1) are the first to
+  expose: `submit()` appended to `w.pending` (under `w.mu`) and bumped
+  `pending_count` (under `drain_mu`) AFTERWARD, so the drainer could
+  collect a submission before it was counted → `pending_count -=
+  collected.len` underflowed → `integer overflow` panic in
+  `drainRoundRobin` (crashed the leader under the cleanup smoke's burst
+  of ~60–600 submits). Fix: bump `pending_count` BEFORE the append (it
+  is only a wake hint; a transient over-count just costs one empty
+  drain pass, which early-returns without decrementing) + saturating
+  rollback on append failure. The single-body-per-request inbound coord
+  use never hit this.
+
+  **Note on disconnect timing:** a held *cont* chain's client
+  disconnect is NOT observable promptly (h2 doesn't track parked
+  conts), so its spool drop rides the §6.4 hold deadline (25s) →
+  `resolveParked` → `cleanupResponses` → `scanAndCancelBoundFetches`.
+  *Stream* chains are torn down immediately on disconnect (the smoke's
+  path). A backed-up spool only exists on a cont chain (writes-per-
+  chunk), so "disconnect drops a backed-up spool promptly" isn't
+  reachable without the deadline; the cancel path covers prompt
+  backed-up-spool drop instead.
+
+Phase 5 — **Measure + tune K**. ✅ SHIPPED
+- `scripts/bound_fetch_spool_bench.py`: sweeps K ∈ {1,2,4,8,16} for a
+  bound writes-per-chunk fetch (`/spoolsink`, raft RTT per chunk),
+  reporting act_rate / peak_depth / peak_RAM / readback per K.
+  Metrics added: `bound_fetch_spool_depth_peak` (decoupling evidence).
+- Results: **decoupled** — peak_depth ≈ all chunks (≫ K), so the
+  producer runs fully ahead of the raft-rate consumer; **K is a linear
+  memory knob** (peak_RAM = K × chunk); **readback is depth-bound**
+  (≈ peak_depth − K), the unavoidable-but-cheap cost of the consumer
+  falling behind; activation rate is raft-bound, ~K-independent (K=1
+  can pay a coord-read-on-every-dispatch penalty, but it's within
+  single-run noise at small chunk counts). **Default K=4 validated** —
+  full throughput, head + small prefetch window warm, modest RAM.
+- Read-path reference (ReleaseFast, single tenant): read fast path
+  `readonly` ≈ 101k req/s vs raft-write `hot` ≈ 38k — context for the
+  "don't make reads pay consensus" discussion that came out of this.
+
+  **The bench surfaced a fatal pre-existing bug** (not chunk-spool's,
+  but the spool's high cont-resume write rate is the first to trigger
+  it): the log-upload walker (`worker_upload_walker.walkAndUploadCatchup`,
+  readset-replication Phase 5c) ran on the **flusher thread** and read
+  `raft_log` (`getRaftEntry` → SQLite `get`) **every tick**, racing the
+  **raft thread**'s `append` on the same `NOMUTEX` single connection +
+  shared prepared statements → heap corruption (SQLite SIGSEGV /
+  kvexp-overlay alignment panics, crashing the leader).
+
+  **Fix (chosen over apply-time projection, which would have added
+  standing follower RAM):** keep the walker's zero-RAM on-disk recovery
+  (the raft log IS the recovery buffer), but
+  1. **gate it to post-promotion catchup only** — a healthy leader's
+     logs come from dispatch capture, so the per-tick steady-state
+     reads were pure waste; the walker now arms on the flusher-observed
+     `false→true` leadership edge, walks to the raft index snapshotted
+     at promotion (the gap a crashed predecessor left), then idles. New
+     `Worker.walker_is_leader` / `upload_catchup_target` (flusher-only).
+  2. **read through a dedicated reader connection** — `RaftLog` opens a
+     second SQLite connection (`db_reader`, WAL permits a concurrent
+     reader) with `getFromReader`/`lastFromReader`, exposed as
+     `RaftNode.getRaftEntryReader`/`raftLogLastIndexReader`. The walker
+     uses only these; the primary connection stays raft-thread-only.
+     Two single-threaded connections ⇒ no race even during catchup.
+
+  Verified: the crash repro (spoolsink n=1000 ×12) went 1/12→12/12 no
+  crash; `leader_failover_smoke` still recovers the killed leader's
+  unflushed logs post-failover (gating preserves recovery);
+  `snap_catchup`, the bound-fetch/heldsync/streaming/webhook/ctl/
+  files-server smokes + `zig build test` all green; the K-sweep bench
+  now completes all 5 K reliably.
 
 ## Risks
 

@@ -474,6 +474,14 @@ fn workerMain(args: *WorkerCtx) !void {
         }
         try rjs.drainRaftPending(worker);
         try reg.flush();
+        // docs/chunk-spool-plan.md Phase 2: retry bound-fetch chunk
+        // dispatch now that drainRaftPending has committed any prior
+        // chunk's writeset + moved its held entity back to a
+        // receivable collection. Pops every newly-ready spool head;
+        // chunks the entity still isn't ready for stay spooled for a
+        // later tick.
+        rjs.drainSpools(worker);
+        try reg.flush();
         try rjs.sweepParkedContinuations(worker);
         try reg.flush();
         try rjs.serviceParkedStreams(worker);

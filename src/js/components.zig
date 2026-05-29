@@ -312,6 +312,35 @@ pub const UpstreamFetchEvent = struct {
     /// owned dupe; freed in `deinitItem`.
     name: []u8 = &.{},
 
+    /// `docs/chunk-spool-plan.md` Phase 1: for bound-fetch chunks,
+    /// the producer (`fetch_engine`) writes the chunk bytes to the
+    /// process-global blob coordinator at upstream rate — durable
+    /// ground truth decoupled from the held chain's raft cadence —
+    /// and stamps the resulting per-worker submission seq here.
+    /// `coord_seq == 0` with `coord_worker_id == 0` and a non-empty
+    /// `bytes` means "not submitted" (unbound chunk, coord absent, or
+    /// owner unresolved); the consumer falls back to inline `bytes`.
+    /// Phase 1 consumers IGNORE these fields entirely — `bytes`
+    /// remains the source of truth. Phases 2-3 introduce the spool
+    /// that reads bytes back via `coord.bodyRef(coord_worker_id,
+    /// coord_seq)` once the chunk is durable. Plain integers — no
+    /// allocation, so `deinitItem` needs no change.
+    coord_seq: u64 = 0,
+    /// Companion to `coord_seq`: which coordinator per-worker queue
+    /// the bytes were submitted under (the bound-fetch owner worker's
+    /// id). The consumer polls `coord.durableSeq(coord_worker_id)`
+    /// against `coord_seq` to gate the spool head. See `coord_seq`.
+    coord_worker_id: u8 = 0,
+    /// True iff the producer successfully submitted this chunk's bytes
+    /// to the coordinator (so `coord_seq`/`coord_worker_id` are
+    /// meaningful and the bytes can be read back via
+    /// `coord.readBody`). Needed because `coord_seq == 0` /
+    /// `coord_worker_id == 0` are both legitimate values — there is no
+    /// in-band sentinel. The Phase 3 spool only evicts inline bytes
+    /// for chunks where this is set; un-submitted chunks (coord
+    /// absent, owner unresolved) stay inline.
+    coord_submitted: bool = false,
+
     pub fn deinit(allocator: std.mem.Allocator, items: []UpstreamFetchEvent) void {
         for (items) |*item| deinitItem(item, allocator);
     }
