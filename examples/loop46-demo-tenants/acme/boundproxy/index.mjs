@@ -3,15 +3,16 @@
 //
 //   GET /boundproxy?url=<upstream>
 //
-// Issues an http.fetch with `bind: true` so upstream chunks resume
-// THIS chain (instead of firing a separate `fetch-<id>` chain) via
-// the module's `onFetchChunk` named export. The default returns
-// `__rove_next("boundproxy/index")` to park the held client; each
-// upstream chunk fires `onFetchChunk`, which streams a transformed
-// "chunk:<text>" frame back to the held socket via __rove_stream.
-// On the terminal chunk (done=true) the handler returns "" to close.
+// Issues an http.fetch from a handler that returns next()/stream(), so
+// the fetch AUTO-BINDS (docs/auto-bind-plan.md) — upstream chunks
+// resume THIS chain via the module's `onFetchChunk` export instead of
+// firing a separate `fetch-<id>` chain. No `bind` keyword needed. The
+// default returns `__rove_next("boundproxy/index")` to park the held
+// client; each upstream chunk fires `onFetchChunk`, which streams a
+// transformed "chunk:<text>" frame back to the held socket via
+// __rove_stream. On the terminal chunk (done=true) it returns "".
 //
-// Tests the full bind:true + Gap #1 path: first chunk arrives with
+// Tests the full auto-bind + Gap #1 path: first chunk arrives with
 // the entity in parked_continuations (cont→stream transition fires);
 // subsequent chunks arrive with the entity in stream_data_out
 // (stream wake via resumeBoundFetchStream).
@@ -32,7 +33,8 @@ export default function () {
     http.fetch({
         url: url,
         method: "GET",
-        bind: true,
+        // Auto-binds: this handler returns next()/stream() (held), so
+        // chunks resume onFetchChunk — no `bind` keyword needed.
         // stream:true splits the upstream body into multiple
         // fetch_chunk events at max_response_chunk_bytes granularity
         // — this is what exercises the multi-chunk Gap #1 path.

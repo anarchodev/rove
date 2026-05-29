@@ -3126,6 +3126,27 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 );
                 break :transfer;
             };
+            // `docs/auto-bind-plan.md`: decide bind at handler SUCCESS,
+            // when the outcome is known. A fetch **auto-binds** (chunks
+            // resume this chain's `onFetchChunk`) iff the handler held
+            // the chain (`next()`/`stream()`) AND the customer didn't
+            // opt out with `detach: true`. A terminal handler has no
+            // chain, so its fetches are always detached (Pattern A).
+            // The outcome ISN'T known at the `http.fetch` call, so the
+            // decision (and registration) can only live here — a
+            // handler that throws never reaches this block, so it never
+            // registers (no register-then-cleanup churn either).
+            const held = cont_opt != null or stream_meta_opt != null;
+            for (pending_fetches.items) |*pf| {
+                // A `webhook.send` fetch (bound_send_id set) uses the
+                // §6.4 bound_send_owners callback routing, NOT auto-bind
+                // — never bind it (it would steal chunks from the
+                // webhook_onresult shim). docs/auto-bind-plan.md.
+                pf.bind = held and !pf.detach and pf.bound_send_id.len == 0;
+                if (pf.bind) {
+                    _ = @TypeOf(worker.*).registerBoundFetchTrampoline(@ptrCast(worker), pf.id, ent);
+                }
+            }
             for (pending_fetches.items) |pf| batch_pending_fetches.appendAssumeCapacity(pf);
             pending_fetches.clearRetainingCapacity();
         }

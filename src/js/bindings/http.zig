@@ -71,22 +71,15 @@ pub fn jsHttpFetch(
             return js_exception;
         },
     };
-    // `docs/streaming-model.md` §7 item 1: `bind: true` requires a
-    // held chain (an `activation_entity` on the dispatch + the
-    // worker's registration trampoline wired). Reject early before
-    // the row's id mints — the customer gets a clear TypeError
-    // instead of a silently-orphaned bound fetch that never
-    // resumes anything.
-    if (row.bind) {
-        if (state.activation_entity == null or state.register_bound_fetch == null) {
-            row.deinit(state.allocator);
-            _ = c.JS_ThrowTypeError(
-                ctx,
-                "http.fetch({bind: true}) requires a held chain (call it from a handler that returns next() or stream())",
-            );
-            return js_exception;
-        }
-    }
+    // `docs/auto-bind-plan.md`: bound-fetch registration moved OUT of
+    // the binding call to the handler-success seam in
+    // `worker_dispatch.zig` — it can only be decided once the handler's
+    // outcome (held vs terminal) is known, which is exactly what makes
+    // auto-bind possible. The binding just records the customer's
+    // `detach` opt-out on the `PendingFetch`; the success seam computes
+    // `bind = held and !detach` and registers `fetch_id → entity`. No
+    // call-time `activation_entity` requirement, no register-then-
+    // cleanup churn for a handler that throws after the call.
     state.http_fetch_index += 1;
     // Build the id JS string NOW — `appendPendingFetch` transfers
     // ownership of `row.id` into the PendingFetch and clears the
@@ -94,12 +87,6 @@ pub fn jsHttpFetch(
     // empty slice. `JS_NewStringLen` copies the bytes, so `res`
     // is independent of `row`'s subsequent fate.
     const res = c.JS_NewStringLen(ctx, row.id.ptr, row.id.len);
-    // Capture the fetch_id slice BEFORE `appendPendingFetch`
-    // clears `row.id`. The bytes themselves stay alive through
-    // the ownership transfer (the PendingFetch now owns them),
-    // so the captured slice remains valid past the call. Only
-    // used on the bind:true path.
-    const fetch_id_for_bind: []const u8 = if (row.bind) row.id else &.{};
     // Gap 2.3 Phase C1: accumulate into the per-DispatchState
     // pending-fetches list. The worker's batch-finalize phase
     // flushes the list to NodeState.fetch_pending; the fetch-pool
@@ -115,17 +102,6 @@ pub fn jsHttpFetch(
         state.pending_kv_error = err;
         return js_exception;
     };
-    // bind:true post-append: stamp the fetch_id → entity mapping
-    // on the worker's registry. Failure here is non-fatal at the
-    // binding level — the fetch will still issue, just as an
-    // unbound chain (terminal chunks fall through to
-    // fireFetchEventActivation). The trampoline logs on failure.
-    if (row.bind) {
-        const fn_ptr = state.register_bound_fetch.?;
-        const fn_ctx = state.register_bound_fetch_ctx.?;
-        const entity = state.activation_entity.?;
-        _ = fn_ptr(fn_ctx, fetch_id_for_bind, entity);
-    }
     // `appendPendingFetch` transferred ownership of every owned
     // slice on `row` into the PendingFetch (or, on the null-
     // accumulator path, left them for this `deinit` to free).
@@ -165,7 +141,11 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
         .max_response_chunk_bytes = row.max_response_chunk_bytes,
         .max_total_response_bytes = row.max_total_response_bytes,
         .held = row.held,
-        .bind = row.bind,
+        // `bind` is COMPUTED at the handler-success seam
+        // (`worker_dispatch.zig`: `bind = held and !detach`); the
+        // binding only records the customer's `detach` opt-out here.
+        .bind = false,
+        .detach = row.detach,
         .bound_send_id = row.bound_send_id,
         .name = row.name,
     });
@@ -321,14 +301,15 @@ const BuiltFetch = struct {
     /// `jsHttpSubscribe`; false for `jsHttpFetch`. Threaded into
     /// the `PendingFetch` the engine reads.
     held: bool = false,
-    /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
-    /// §5.5: `bind: true` makes upstream chunks resume the **calling
-    /// chain** (the entity that returned `next()`/`stream()` after
-    /// issuing the fetch) instead of firing a separate
-    /// `fireFetchEventActivation` chain. Threaded into
-    /// `PendingFetch.bind` → `UpstreamFetchEvent.bind` → the
-    /// dispatcher's bound-resume branch.
-    bind: bool = false,
+    /// `docs/auto-bind-plan.md`: `detach: true` is the opt-OUT from
+    /// auto-bind. By default a fetch issued from a handler that ends up
+    /// *held* (`next()`/`stream()`) auto-binds — upstream chunks resume
+    /// the calling chain's `onFetchChunk`. `detach: true` instead fires
+    /// a separate `fireFetchEventActivation` chain (the `on_chunk`
+    /// module), i.e. fire-and-forget. The bind decision itself is made
+    /// at handler-success in `worker_dispatch.zig` (it needs the
+    /// outcome): `PendingFetch.bind = held and !detach`.
+    detach: bool = false,
     /// `docs/cross-worker-held-state-plan.md` Phase 2B: webhook.send
     /// shim passes the send_id (the `_send/owed/{id}` suffix) so the
     /// FetchEngine's chunk router can consult `bound_send_owners` to
@@ -402,7 +383,7 @@ fn buildFetchRow(
     }
 
     const stream = try getBoolField(ctx, opts, "stream", false);
-    const bind = try getBoolField(ctx, opts, "bind", false);
+    const detach = try getBoolField(ctx, opts, "detach", false);
     const timeout_ms_i32 = try getIntField(ctx, opts, "timeout_ms", 30_000);
     const max_chunk_i32 = try getIntField(ctx, opts, "max_response_chunk_bytes", 256 * 1024);
     const max_total_i64 = try getInt64Field(ctx, opts, "max_total_response_bytes", 50 * 1024 * 1024);
@@ -419,7 +400,7 @@ fn buildFetchRow(
         .stream = stream,
         .max_response_chunk_bytes = @intCast(@max(max_chunk_i32, 1)),
         .max_total_response_bytes = if (max_total_i64 < 1) 1 else @intCast(max_total_i64),
-        .bind = bind,
+        .detach = detach,
         .bound_send_id = fetched.bound_send_id.?,
         .name = fetched.name.?,
     };
