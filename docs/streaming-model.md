@@ -161,21 +161,23 @@ customer-visible API changed.
 Symmetric to the inbound side. An `http.fetch` started by a chain
 is an outbound byte-stream, and it too is coalesce-budgeted:
 
-- **Bound to the chain.** `http.fetch({ url, bind: true })` — the
-  fetch's chunks become `Msg`s *on the calling chain*
-  (`correlation_id` shared), not a disconnected module. This is the
-  fix for the shipped Pattern A: today `on_chunk: "module"` fires a
-  separate chain with no held socket, so the LLM-proxy use case
-  (transform each chunk **and** forward it to the held client)
-  falls between Pattern A and Pattern B — A sees chunks but can't
-  reach the client, B reaches the client but can't see chunks.
-  Binding closes the gap:
+- **Bound to the chain (the default for a held handler).** A
+  `http.fetch` issued from a handler that returns `next()`/`stream()`
+  auto-binds (`docs/auto-bind-plan.md`) — the fetch's chunks become
+  `Msg`s *on the calling chain* (`correlation_id` shared), resuming
+  `onFetchChunk`, not a disconnected module. This is the fix for the
+  shipped Pattern A: `on_chunk: "module"` (now the `detach: true`
+  path) fires a separate chain with no held socket, so the LLM-proxy
+  use case (transform each chunk **and** forward it to the held
+  client) falls between Pattern A and Pattern B — A sees chunks but
+  can't reach the client, B reaches the client but can't see chunks.
+  Binding closes the gap, and is now the default:
 
 ```js
 import { stream, next } from 'rove';
 
 export default function () {
-  http.fetch({ url: LLM_URL, body: request.body, bind: true });
+  http.fetch({ url: LLM_URL, body: request.body });   // auto-binds
   return next();                                       // hold the client
 }
 
@@ -334,7 +336,7 @@ stream steps, orthogonal to this model.
 
 A held outbound subscription (atproto firehose, Pub/Sub consumer —
 `primitive-gaps.md` §2.5) is, in this model, **a bound outbound
-stream that never ends.** Same `bind: true`, same `fetch_chunk`
+stream that never ends.** Same auto-bind, same `fetch_chunk`
 Msgs on the chain; it simply has no `fetch_done`. Reconnect/cursor
 policy is the remaining real design (the customer records progress
 in their own kv) — but it is no longer a *new primitive*, it is a
@@ -365,9 +367,9 @@ impl keeps the fast-path. Both statements are true at once.
 
 **What is genuinely new work, smallest-first:**
 
-1. `http.fetch({ bind: true })` — fetch chunks wake the calling
-   chain (`fetch_chunk` as a real `__rove_stream` wake source).
-   Retrofit of the shipped Pattern A; `pipe_to` + transport +
+1. auto-bound `http.fetch` (`docs/auto-bind-plan.md`) — fetch chunks
+   wake the calling chain (`fetch_chunk` as a real `__rove_stream`
+   wake source). Retrofit of the shipped Pattern A; `pipe_to` + transport +
    transient/durable split all untouched.
 2. The 1 MB buffered ceiling — coalesce the request body up to the
    ceiling; > 1 MB without `onChunk` exported → 413 from the

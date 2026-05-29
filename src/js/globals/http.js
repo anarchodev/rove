@@ -56,11 +56,21 @@
      * @param {Object<string,string>} [opts.headers] - Request headers.
      * @param {string} [opts.body] - Request body.
      * @param {number} [opts.timeout_ms=30000] - Per-request timeout.
-     * @param {string} opts.on_chunk - Module path for the
+     * @param {string} opts.on_chunk - Module path for the detached
      *   `on_chunk` callback (REQUIRED). The activation shape is
      *   `{ kind: "fetch_chunk", fetch_id, seq, byteOffset, bytes,
      *   headers? (seq=0), final, status? (final), ok? (final),
-     *   body_truncated? (final), ctx }`.
+     *   body_truncated? (final), ctx }`. NOTE: this fires only for a
+     *   DETACHED fetch (see `detach`). When the calling handler holds
+     *   the chain (returns `next()`/`stream()`), the fetch auto-binds
+     *   and chunks resume the chain's `onFetchChunk` export instead —
+     *   `on_chunk` is ignored.
+     * @param {boolean} [opts.detach=false] - Opt OUT of auto-bind.
+     *   By default a fetch from a held handler binds to that chain
+     *   (chunks → its `onFetchChunk`). `detach: true` fires a separate
+     *   `on_chunk` chain (fire-and-forget) — use it when you don't want
+     *   the fetch to drive the held response. A fetch from a terminal
+     *   handler is always detached (no chain to bind to).
      * @param {boolean} [opts.stream=false] - false → one event
      *   with `final: true` (default; first chunk only). true →
      *   one event per upstream writeback, last one carries
@@ -85,15 +95,18 @@
      * });
      *
      * @example
-     * // Streaming LLM tokens — handler forwards each chunk to its
-     * // held client (the calling chain is a __rove_stream).
+     * // Streaming LLM tokens. The handler returns next()/stream(), so
+     * // the fetch AUTO-BINDS: each upstream chunk resumes this module's
+     * // `onFetchChunk` export (no `bind` keyword needed). `on_chunk` is
+     * // still required by the binding but ignored on the bound path.
      * http.fetch({
      *   url: "https://api.openai.com/v1/chat/completions",
      *   method: "POST",
      *   body: JSON.stringify({ model, messages, stream: true }),
-     *   on_chunk: "transform.mjs",
+     *   on_chunk: "onFetchChunk",
      *   stream: true,
      * });
+     * // export function onFetchChunk() { return stream({ write: transform(request.body) }); }
      */
     fetch(opts) {
       return sys.fetch(opts);

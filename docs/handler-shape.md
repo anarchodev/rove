@@ -73,7 +73,7 @@ streaming and parking require the explicit verbs.
 | inbound HTTP chunk | `onChunk` | request arrived; fires per chunk for any body size (≤ 1 MB → fires once with the whole body) | `request.body` = this chunk's bytes (or whole body if it fits); `request.done` = true on last/only chunk; `request.chunkSeq` = monotonic |
 | webhook.send resume | `onSendCallback` | a `webhook.send` you kicked off returned | `request.result` = `{status, body, headers, sendId}` |
 | http.fetch resume (coalesced) | `onFetchResult` | a non-bound `http.fetch` returned its whole body | `request.result` = `{status, body, headers, fetchId}` |
-| http.fetch chunk (bound + streamed) | `onFetchChunk` | per chunk from a `http.fetch({bind: true})` | `request.body` = chunk bytes; `request.done` on last; `request.fetchId` |
+| http.fetch chunk (bound + streamed) | `onFetchChunk` | per chunk from an auto-bound `http.fetch` (held handler; opt out with `detach: true`) | `request.body` = chunk bytes; `request.done` on last; `request.fetchId` |
 | http.fetch end (bound + streamed) | `onFetchDone` | a bound+streamed fetch terminated | `request.result` = `{ok, status, fetchId}` |
 | subscription fire (generic) | `onSubscription` | external push (atproto firehose, etc.) | `request.event` = subscription-specific payload |
 | cron fire | `onCron` | scheduled cron entry triggered | `request.cronName`, `request.scheduledTime` |
@@ -194,7 +194,6 @@ export default function () {
     url: LLM_URL,
     method: 'POST',
     body: request.body,
-    bind: true,
   });
   return next();                            // hold the client; wait for first upstream chunk
 }
@@ -207,7 +206,10 @@ export function onFetchChunk() {
 
 Same `default` + `next()` pattern as 5.4, but the resume kind is
 `onFetchChunk` (per upstream chunk) instead of `onSendCallback`
-(one-shot).
+(one-shot). **Auto-bind** (`docs/auto-bind-plan.md`): because the
+handler holds the chain (`next()`/`stream()`), the fetch binds to it
+by default — chunks resume `onFetchChunk`, no keyword required. Pass
+`detach: true` to opt out (fire a separate `on_chunk` chain instead).
 
 ### 5.6 Chain origins (no inbound HTTP)
 
@@ -242,8 +244,8 @@ sharing the module's kv namespace.
 import { stream, next } from 'rove';
 
 export default function () {
-  http.fetch({ url: API_A, bind: true });   // fetchId: 'a' (auto-assigned or via name option)
-  http.fetch({ url: API_B, bind: true });
+  http.fetch({ url: API_A });   // auto-binds (held handler); fetchId: 'a'
+  http.fetch({ url: API_B });   // auto-binds too
   return next();
 }
 
@@ -278,8 +280,11 @@ module's effects could trigger:
   `onSendCallback`, the loader emits a deploy-time warning: "your
   module calls webhook.send but doesn't export onSendCallback —
   the send's callback will be discarded."
-- If any handler calls `http.fetch({bind: true})` without `onFetchChunk`
-  (streamed) or `onFetchResult` (coalesced) exported, same warning.
+- If any handler calls `http.fetch` and could be held (`next()`/
+  `stream()`) without `onFetchChunk` (streamed) or `onFetchResult`
+  (coalesced) exported AND without `detach: true`, same warning — the
+  fetch auto-binds but has no chunk handler. Add `onFetchChunk`, or
+  `detach: true` for fire-and-forget (`docs/auto-bind-plan.md`).
 - If `onChunk` is exported but no `default` and no other dispatchable
   origin (`onCron`, `onSubscription`, etc.), the loader emits: "your
   module exports `onChunk` but nothing can trigger a streaming

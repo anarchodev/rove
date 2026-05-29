@@ -36,11 +36,11 @@ export default function () {
         return "missing ?u1=&u2=";
     }
     const id1 = http.fetch({
-        url: u1, method: "GET", bind: true, stream: true,
+        url: u1, method: "GET", stream: true,
         max_response_chunk_bytes: 64, on_chunk: "multibind", ctx: {},
     });
     const id2 = http.fetch({
-        url: u2, method: "GET", bind: true, stream: true,
+        url: u2, method: "GET", stream: true,
         max_response_chunk_bytes: 64, on_chunk: "multibind", ctx: {},
     });
     // Remember the two fetch ids (in issue order) + reset state.

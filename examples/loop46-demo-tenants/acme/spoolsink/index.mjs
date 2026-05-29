@@ -38,7 +38,7 @@ export default function () {
     http.fetch({
         url: url,
         method: "GET",
-        bind: true,
+        // Auto-binds (held handler) → chunks resume onFetchChunk.
         stream: true,
         max_response_chunk_bytes: 64,
         on_chunk: "spoolsink",
