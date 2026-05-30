@@ -1989,6 +1989,9 @@ pub fn drainBodyPending(worker: anytype) !void {
             // Still release back to dispatch — the resume path
             // sees NO_BATCH and treats it as the body-gate-failed
             // branch, which writes a 500 response.
+            // P6: the body-gate is done with this seq (PutFailed/
+            // UnknownSeq); release its coordinator state.
+            _ = coord.release(wait.worker_id, wait.worker_seq);
             try server.reg.move(ent, &worker.body_pending, &server.request_out);
             continue;
         };
@@ -2000,6 +2003,13 @@ pub fn drainBodyPending(worker: anytype) !void {
             .offset = ref.offset,
             .len = ref.len,
         };
+        // P6 (docs/chunk-spool-plan.md): the body-gate has extracted
+        // the wire BodyRef value (now cached on the entity + headed
+        // into the readset); it never reads this seq from the
+        // coordinator again. Replay reads the body from S3 via the
+        // BodyRef, not the coordinator — so free the coordinator's
+        // retained RAM for it.
+        _ = coord.release(wait.worker_id, wait.worker_seq);
         try server.reg.move(ent, &worker.body_pending, &server.request_out);
     }
 }
@@ -2025,6 +2035,10 @@ pub fn drainFetchPendingDurability(worker: anytype) !void {
     var i: usize = 0;
     while (i < worker.fetch_pending_durability.items.len) {
         const pe = &worker.fetch_pending_durability.items[i];
+        // Capture the coord identity BEFORE any swapRemove (which moves
+        // `pe`), so the P6 release below uses the right (worker, seq).
+        const pe_wid = pe.worker_id;
+        const pe_seq = pe.worker_seq;
         if (pe.worker_seq >= coord.durableSeq(pe.worker_id)) {
             i += 1;
             continue;
@@ -2040,6 +2054,7 @@ pub fn drainFetchPendingDurability(worker: anytype) !void {
             // body-gate failure" posture.
             var released = worker.fetch_pending_durability.swapRemove(i);
             components_mod.UpstreamFetchEvent.deinitItem(&released.event, worker.allocator);
+            _ = coord.release(pe_wid, pe_seq); // P6: done with this seq
             continue;
         };
         var released = worker.fetch_pending_durability.swapRemove(i);
@@ -2049,6 +2064,10 @@ pub fn drainFetchPendingDurability(worker: anytype) !void {
             .len = ref.len,
         };
         worker_mod.fireFetchEventActivation(worker, &released.event, wire_ref);
+        // P6: the wire BodyRef value is extracted; the event carries
+        // its chunk bytes inline (replay reads the body from S3 via the
+        // BodyRef, not the coordinator) — free the coordinator copy.
+        _ = coord.release(pe_wid, pe_seq);
         // Don't advance i — swapRemove placed a new element at this index.
     }
 }

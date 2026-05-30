@@ -421,6 +421,19 @@ pub const BlobCoordinator = struct {
     /// observing seq <= durableSeq(worker_id). PutFailed on terminal
     /// batch failure.
     pub fn bodyRef(self: *BlobCoordinator, worker_id: u8, seq: u64) !BodyRef;
+
+    /// Copy the submitted bytes back from the retained in-RAM batch (no
+    /// S3 RTT) — used by the bound-fetch spool to read evicted chunks.
+    pub fn readBody(self: *BlobCoordinator, worker_id: u8, seq: u64, a) ![]u8;
+
+    /// `docs/chunk-spool-plan.md` P6: consumer is DONE with a
+    /// submission. Drops the ref, frees its bytes, frees the whole
+    /// batch when all its entries are released. Returns false if the
+    /// submit isn't durable yet (ref unset) → caller retries. Without
+    /// this, retained batches grew forever (every submission ever);
+    /// with it, coordinator RAM stays at the live submitted-but-
+    /// unconsumed backlog. `coord_retained_batches` metric tracks it.
+    pub fn release(self: *BlobCoordinator, worker_id: u8, seq: u64) bool;
 };
 
 pub const BodyRef = struct {

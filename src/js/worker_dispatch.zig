@@ -1349,6 +1349,18 @@ fn handleMetrics(
         worker.bound_fetch_spool_depth_peak,
     });
 
+    // `docs/chunk-spool-plan.md` P6: live retained (sealed-but-not-
+    // fully-consumed) coordinator batches. Refcount-release keeps this
+    // at the live backlog; pre-P6 it grew without bound.
+    if (worker.node.blob_coordinator) |coord| {
+        try w.print(
+            \\# HELP coord_retained_batches live retained (sealed, not fully consumed) blob-coordinator batches.
+            \\# TYPE coord_retained_batches gauge
+            \\coord_retained_batches {d}
+            \\
+        , .{coord.retainedBatchCount()});
+    }
+
     // Move the writer's accumulated bytes back into the ArrayList,
     // then transfer ownership to the response body. `toArrayList`
     // does NOT free the writer's buffer — it hands it back to us.
