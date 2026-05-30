@@ -799,6 +799,25 @@ pub fn encodeReadsetList(
     return out;
 }
 
+/// Serialize ONE activation's readset (with `log_header` stamped in)
+/// directly into a `rs_bytes` payload — i.e. `serialize` followed by
+/// `encodeReadsetList(&.{blob})`, with the intermediate blob freed
+/// internally. The single owner of the "wrap a lone readset as the
+/// 1-item list the wire expects" step that every single-readset
+/// producer (cont-resume, proposeForgetfulWrites) needs after
+/// 3d-multi promoted `rs_bytes` to a list. Returns freshly-allocated
+/// bytes the caller owns. On any failure the caller's convention is
+/// to log + fall back to empty `rs_bytes` (best-effort replication).
+pub fn encodeSingleReadset(
+    allocator: std.mem.Allocator,
+    readset: *const Readset,
+    log_header: ?log_mod.LogHeader,
+) ![]u8 {
+    const blob = try readset.serialize(allocator, log_header);
+    defer allocator.free(blob);
+    return encodeReadsetList(allocator, &.{blob});
+}
+
 /// Parse a `rs_bytes` payload as a list of readset blobs. Empty
 /// input returns an empty list (caller still calls `deinit`, which
 /// is a no-op for the empty case). Allocates a `[]const []const u8`
