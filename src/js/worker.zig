@@ -377,7 +377,8 @@ pub const CronState = struct {
 };
 
 /// Thread-safe per-worker inbox of kv-write events awaiting prefix-
-/// match scan against the worker's local `parked_streams_meta`.
+/// match scan against the worker's local parked stream chains'
+/// `kv_prefixes` wake conditions.
 /// Producers (apply thread + leader-side worker_dispatch) call
 /// `push`; the owning worker drains at the start of every
 /// `serviceParkedStreams` tick. Mutex held only during enqueue /
@@ -2373,15 +2374,15 @@ pub fn Worker(comptime opts: Options) type {
         /// Handler-cmds Phase 5: `raft_pending` was split into three
         /// siblings (`raft_pending_response` / `raft_pending_cont` /
         /// `raft_pending_stream`) — the entity's collection IS the
-        /// dispatch state, no `desc.cont != null` or
-        /// `pending_stream_meta.contains` field-check needed
+        /// dispatch state, no membership field-check needed
         /// (principle #1, state-via-collection-membership).
         raft_pending_response: StreamColl,
         /// Continuation-bound raft park. Commits route to
         /// `parked_continuations`. Same Row as `raft_pending_response`.
         raft_pending_cont: StreamColl,
         /// Stream-first-hop raft park. Commits route to
-        /// `stream_response_in` (after registerStreamCell). Same Row.
+        /// `stream_response_in` (after the entity's stream components
+        /// are set). Same Row.
         raft_pending_stream: StreamColl,
         /// `docs/readset-replication-plan.md` Phase 4 park-on-
         /// durability. Entities `dispatchPending` parked after
@@ -2448,8 +2449,8 @@ pub fn Worker(comptime opts: Options) type {
         /// Producers (apply.zig + leader-side worker_dispatch) push
         /// events here via `worker.node.broadcastKvWake`;
         /// `serviceParkedStreams` drains it at the start of each
-        /// tick and matches events against `parked_streams_meta`
-        /// cells' `kv_prefixes`. Pointer registered with
+        /// tick and matches events against the parked stream chains'
+        /// `kv_prefixes`. Pointer registered with
         /// `worker.node.registerWakeInbox` in `Worker.create`;
         /// unregistered + deinit'd in `Worker.destroy`.
         wake_inbox: KvWakeInbox,
@@ -5272,21 +5273,22 @@ pub fn drainOnLeadershipLoss(worker: anytype) !void {
 
     // Phase 5: downgrade every entry across the three raft-pending
     // siblings to 503 + move to response_in.
-    try drainLeadershipLossColl(worker, server, allocator, &worker.raft_pending_response, .response);
-    try drainLeadershipLossColl(worker, server, allocator, &worker.raft_pending_cont, .cont);
-    try drainLeadershipLossColl(worker, server, allocator, &worker.raft_pending_stream, .stream);
+    try drainLeadershipLossColl(worker, server, allocator, &worker.raft_pending_response);
+    try drainLeadershipLossColl(worker, server, allocator, &worker.raft_pending_cont);
+    try drainLeadershipLossColl(worker, server, allocator, &worker.raft_pending_stream);
 }
 
 /// Phase 5 helper: walk one raft-pending sibling, 503 every entry,
-/// move to response_in. `kind` tells us which side-table to clean —
-/// cont needs `parked_meta`, stream needs `pending_stream_meta`;
-/// response has no side store to free.
+/// move to response_in. No per-kind cleanup arg: all cont and stream
+/// state lives on the entity's components and deinits structurally
+/// when `cleanupResponses` destroys the entity (Phase 7 folded the
+/// old `parked_meta` / `pending_stream_meta` side-tables onto the
+/// entity, so there is no side store to free per kind).
 fn drainLeadershipLossColl(
     worker: anytype,
     server: anytype,
     allocator: std.mem.Allocator,
     coll: anytype,
-    kind: enum { response, cont, stream },
 ) !void {
     const entities = coll.entitySlice();
     const resp_bodies = coll.column(h2.RespBody);
@@ -5295,10 +5297,6 @@ fn drainLeadershipLossColl(
         i -= 1;
         const ent = entities[i];
         const resp_body = resp_bodies[i];
-        // Phase 7: no per-kind side-table cleanup — all cont and
-        // stream state lives on the entity's components and deinits
-        // structurally when cleanupResponses destroys the entity.
-        _ = kind;
         const old_body_ptr: ?[*]u8 = resp_body.data;
         const old_body_len: u32 = resp_body.len;
         try respb.overwrite503InPending(worker, coll, ent, allocator);

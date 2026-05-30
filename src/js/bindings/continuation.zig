@@ -73,20 +73,6 @@ pub const Continuation = struct {
         if (self.fn_name) |f| allocator.free(f);
         allocator.free(self.ctx_json);
     }
-
-    /// Deep copy. Used by the handler-cmds Phase 2b dual-write —
-    /// `worker.parked_meta` and the entity's `ContDescriptor`
-    /// component each need their own independent copy while the
-    /// migration is in flight (Phase 7 deletes the side-table
-    /// copy and the double-allocation goes away).
-    pub fn clone(self: Continuation, allocator: std.mem.Allocator) !Continuation {
-        const path = try allocator.dupe(u8, self.path);
-        errdefer allocator.free(path);
-        const fn_name: ?[]u8 = if (self.fn_name) |f| try allocator.dupe(u8, f) else null;
-        errdefer if (fn_name) |f| allocator.free(f);
-        const ctx_json = try allocator.dupe(u8, self.ctx_json);
-        return .{ .path = path, .fn_name = fn_name, .ctx_json = ctx_json };
-    }
 };
 
 // ── `_system.next(path, opts?)` ────────────────────────────────────
