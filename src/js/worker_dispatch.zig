@@ -2508,8 +2508,9 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         //     the `BodyRef`, and re-dispatches once durable.
         //
         // Resume from park: the entity arrives back in `request_out`
-        // with a non-sentinel `BodyDurabilityWait.body_ref`; use it
-        // directly (re-submitting would mint a new batch + re-park).
+        // with `BodyDurabilityWait.status` set to `.resolved` (use the
+        // saved `body_ref` directly — re-submitting would mint a new
+        // batch + re-park) or `.failed` (return 503, do not re-submit).
         //
         // Coord-submit failure: 503 with `.fault` (§6.2 partial-outage
         // posture — fetch-using handlers are blocked when the backend
@@ -2523,66 +2524,77 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // without unduly inflating the per-entry size.
         const INBOUND_INLINE_THRESHOLD: usize = 16 * 1024;
 
-        const resumed_from_park = body_wait.body_ref.batch_id != bodies_mod.NO_BATCH;
         var body_gate_failed = false;
-        if (resumed_from_park) {
-            // Resume from park — drainBodyPending verified
-            // durability before moving the entity back; the saved
-            // body_ref points into S3. Skip append + flush;
-            // record the BodyRef on the readset.
-            readset.trigger_payload.appendTriggerPayload(body_wait.body_ref, "", "") catch |err| {
-                std.log.warn(
-                    "rove-js inbound: readset.trigger_payload append (resume) tenant={s}: {s}",
-                    .{ scope_inst.id, @errorName(err) },
-                );
-            };
-        } else if (body.len > 0 and body.len <= INBOUND_INLINE_THRESHOLD) {
-            // Inline path — no buffer append, no park. Bytes ride
-            // inline in the readset; the raft entry's fsync IS
-            // durability. Handler runs immediately.
-            const inline_ref: bodies_mod.BodyRef = .{
-                .batch_id = bodies_mod.NO_BATCH,
-                .offset = 0,
-                .len = @intCast(body.len),
-            };
-            readset.trigger_payload.appendTriggerPayload(inline_ref, "", body) catch |err| {
-                std.log.warn(
-                    "rove-js inbound: readset.trigger_payload append (inline) tenant={s} bytes={d}: {s}",
-                    .{ scope_inst.id, body.len, @errorName(err) },
-                );
-            };
-        } else if (body.len > 0) {
-            // Large body (> INBOUND_INLINE_THRESHOLD) — coord
-            // submit + park. docs/streaming-model.md §7
-            // Phase 3: bytes flow to the process-global coord,
-            // we park on the resulting seq, drain materializes
-            // the BodyRef once the seq is durable.
-            if (worker.node.blob_coordinator) |coord| {
-                const wid: u8 = @intCast(worker.log_worker_id);
-                if (coord.submit(wid, body)) |seq| {
-                    try server.reg.set(ent, &server.request_out, worker_mod.BodyDurabilityWait, .{
-                        .worker_seq = seq,
-                        .worker_id = wid,
-                        .body_ref = .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 0 },
-                        .tenant_id = scope_inst.id,
-                    });
-                    try server.reg.move(ent, &server.request_out, &worker.body_pending);
-                    processed += 1;
-                    continue;
-                } else |err| {
+        switch (body_wait.status) {
+            .resolved => {
+                // Resume from park — drainBodyPending verified
+                // durability before moving the entity back; the saved
+                // body_ref points into S3. Skip append + flush;
+                // record the BodyRef on the readset.
+                readset.trigger_payload.appendTriggerPayload(body_wait.body_ref, "", "") catch |err| {
                     std.log.warn(
-                        "rove-js inbound: coord.submit tenant={s} bytes={d}: {s}",
-                        .{ scope_inst.id, body.len, @errorName(err) },
+                        "rove-js inbound: readset.trigger_payload append (resume) tenant={s}: {s}",
+                        .{ scope_inst.id, @errorName(err) },
                     );
-                    body_gate_failed = true;
-                }
-            } else {
-                std.log.warn(
-                    "rove-js inbound: node.blob_coordinator not initialized tenant={s}",
-                    .{scope_inst.id},
-                );
+                };
+            },
+            .failed => {
+                // Resume from a FAILED park — the submitted body never
+                // became durable. Return 503; do NOT re-submit (the old
+                // body_ref-based discriminator did, looping forever on a
+                // genuinely-failing backend).
                 body_gate_failed = true;
-            }
+            },
+            .fresh => {
+                if (body.len > 0 and body.len <= INBOUND_INLINE_THRESHOLD) {
+                    // Inline path — no buffer append, no park. Bytes
+                    // ride inline in the readset; the raft entry's
+                    // fsync IS durability. Handler runs immediately.
+                    const inline_ref: bodies_mod.BodyRef = .{
+                        .batch_id = bodies_mod.NO_BATCH,
+                        .offset = 0,
+                        .len = @intCast(body.len),
+                    };
+                    readset.trigger_payload.appendTriggerPayload(inline_ref, "", body) catch |err| {
+                        std.log.warn(
+                            "rove-js inbound: readset.trigger_payload append (inline) tenant={s} bytes={d}: {s}",
+                            .{ scope_inst.id, body.len, @errorName(err) },
+                        );
+                    };
+                } else if (body.len > 0) {
+                    // Large body (> INBOUND_INLINE_THRESHOLD) — coord
+                    // submit + park. docs/streaming-model.md §7
+                    // Phase 3: bytes flow to the process-global coord,
+                    // we park on the resulting seq, drain materializes
+                    // the BodyRef once the seq is durable.
+                    if (worker.node.blob_coordinator) |coord| {
+                        const wid: u8 = @intCast(worker.log_worker_id);
+                        if (coord.submit(wid, body)) |seq| {
+                            try server.reg.set(ent, &server.request_out, worker_mod.BodyDurabilityWait, .{
+                                .worker_seq = seq,
+                                .worker_id = wid,
+                                .status = .fresh,
+                                .tenant_id = scope_inst.id,
+                            });
+                            try server.reg.move(ent, &server.request_out, &worker.body_pending);
+                            processed += 1;
+                            continue;
+                        } else |err| {
+                            std.log.warn(
+                                "rove-js inbound: coord.submit tenant={s} bytes={d}: {s}",
+                                .{ scope_inst.id, body.len, @errorName(err) },
+                            );
+                            body_gate_failed = true;
+                        }
+                    } else {
+                        std.log.warn(
+                            "rove-js inbound: node.blob_coordinator not initialized tenant={s}",
+                            .{scope_inst.id},
+                        );
+                        body_gate_failed = true;
+                    }
+                }
+            },
         }
         if (body_gate_failed) {
             try respb.setSimpleResponse(server, ent, sid, sess, 503, "body durability gate failed\n", allocator);

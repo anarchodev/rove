@@ -192,19 +192,39 @@ pub const RaftWait = struct {
 /// path in `dispatchPending`'s body-gate reads `body_ref` and
 /// stamps it on the readset.
 ///
-/// Sentinel: `body_ref.batch_id == bodies_mod.NO_BATCH` (the
-/// default) means "not parked / not materialized." Drain sets
-/// `body_ref.batch_id != NO_BATCH` once it has resolved the coord
-/// BodyRef, signalling the resume path.
+/// `status` is the lifecycle discriminator the dispatch body-gate
+/// reads on resume — NOT `body_ref.batch_id`. A failed park leaves
+/// `body_ref` at the `NO_BATCH` default, which is byte-identical to a
+/// fresh (never-parked) request's default component; keying the resume
+/// off `body_ref` alone silently re-submits+re-parks a permanently-
+/// failing body instead of returning 503. The explicit `status` makes
+/// the three states distinguishable by construction.
 ///
 /// `tenant_id` is a borrowed slice into the per-tenant
 /// `tenant_mod.Instance.id` — owned by the NodeState's tenant
 /// registry, lives for the process lifetime.
+pub const BodyDurabilityStatus = enum {
+    /// Default: entity was never parked (a fresh request_out entity
+    /// carries the component default). The dispatch body-gate runs the
+    /// normal size-based inline/park/none logic.
+    fresh,
+    /// Park succeeded: `body_ref` is the materialized wire ref. The
+    /// dispatch body-gate stamps it on the readset and proceeds.
+    resolved,
+    /// Park failed: the submitted body never became durable
+    /// (`coord.bodyRef` errored). The dispatch body-gate returns 503;
+    /// `body_ref` is meaningless (stays at the NO_BATCH default).
+    failed,
+};
+
 pub const BodyDurabilityWait = struct {
     /// Coord durability key — opaque to the dispatch path.
     worker_seq: u64 = 0,
     worker_id: u8 = 0,
-    /// Materialized BodyRef. NO_BATCH sentinel = not yet resolved.
+    /// Park outcome. `.fresh` until `drainBodyPending` resolves the
+    /// coord seq to `.resolved` (with a real `body_ref`) or `.failed`.
+    status: BodyDurabilityStatus = .fresh,
+    /// Materialized BodyRef — meaningful only when `status == .resolved`.
     body_ref: bodies_mod.BodyRef = .{
         .batch_id = bodies_mod.NO_BATCH,
         .offset = 0,

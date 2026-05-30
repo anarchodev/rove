@@ -1982,23 +1982,27 @@ pub fn drainBodyPending(worker: anytype) !void {
     while (i < ents.len) : (i += 1) {
         const ent = ents[i];
         const wait = &waits[i];
-        // If already materialized (body_ref non-sentinel), skip —
-        // we already released this entity, just waiting for the
-        // dispatcher to pick it up.
-        if (wait.body_ref.batch_id != bodies_mod.NO_BATCH) continue;
+        // If already resolved/failed, skip — the entity's move back to
+        // request_out is deferred until flush(), so a second drain pass
+        // in the same tick would otherwise re-poll (and double-move).
+        if (wait.status != .fresh) continue;
 
         // Durability gate (shared with drainFetchPendingDurability) —
         // poll the coord HWM, materialize + release on terminal.
         switch (pollDurableBodyRef(coord, wait.worker_id, wait.worker_seq, "body-gate", wait.tenant_id)) {
             .not_yet => continue,
-            // Body never became durable: leave body_ref at NO_BATCH.
-            // The resume path sees NO_BATCH and writes a 500.
-            .failed => {},
+            // Body never became durable: mark failed. The dispatch
+            // body-gate sees `.failed` and returns 503 (it does NOT
+            // re-submit, which keying off the NO_BATCH body_ref would).
+            .failed => wait.status = .failed,
             // Stamp the wire BodyRef. Phase 5: `batch_id` is the
             // coord's globally-unique pool batch_id; the S3 key is
             // `{key_prefix_base}_pool/{batch_id:0>20}`. The dispatcher
             // serializes it into the readset on resume.
-            .ready => |ref| wait.body_ref = ref,
+            .ready => |ref| {
+                wait.body_ref = ref;
+                wait.status = .resolved;
+            },
         }
         try server.reg.move(ent, &worker.body_pending, &server.request_out);
     }
