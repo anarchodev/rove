@@ -412,17 +412,6 @@ pub const DispatchState = struct {
     ) void = null,
     cancel_fetch_ctx: ?*anyopaque = null,
 
-    /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
-    /// §5.5: register-bound-fetch trampoline. The http.fetch
-    /// binding calls this when `bind: true` to record a
-    /// `fetch_id → entity` mapping on the worker. Returns false
-    /// on registry failure. Null on test paths.
-    register_bound_fetch: ?*const fn (
-        ctx: *anyopaque,
-        fetch_id: []const u8,
-        entity: rove.Entity,
-    ) bool = null,
-    register_bound_fetch_ctx: ?*anyopaque = null,
     /// The entity owning the chain this dispatch runs against —
     /// what the binding registers under `fetch_id` when `bind:
     /// true`. Null when the activation has no held socket

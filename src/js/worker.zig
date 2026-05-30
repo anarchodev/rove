@@ -2528,8 +2528,9 @@ pub fn Worker(comptime opts: Options) type {
         /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
         /// §5.5: registry for `http.fetch({bind: true})` — maps
         /// `fetch_id` to the entity that issued the fetch. Populated
-        /// in the http.fetch binding when `bind: true` (via the
-        /// `register_bound_fetch` trampoline on `Request`); consulted
+        /// at the handler-success seam (`worker_dispatch`'s direct
+        /// `registerBoundFetchTrampoline` call, where `bind = held and
+        /// !detach` is computed — docs/auto-bind-plan.md); consulted
         /// in `dispatchPendingMsgs`'s `.fetch_chunk` arm to route
         /// upstream chunks into the held chain's `onFetchChunk`
         /// resume; cleared on terminal (`ev.final`) or on held-client
@@ -3431,10 +3432,12 @@ pub fn Worker(comptime opts: Options) type {
         }
 
         /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
-        /// §5.5: trampoline wired into `DispatchState.register_bound_fetch`.
-        /// The http.fetch binding calls this when `bind: true` is
-        /// passed; we dupe `fetch_id` (the registry owns the key)
-        /// and stamp the entity handle. Subsequent
+        /// §5.5: bound-fetch registration. Called DIRECTLY at the
+        /// handler-success seam (`worker_dispatch`, where `bind = held
+        /// and !detach` is computed per docs/auto-bind-plan.md) — not
+        /// via a Request/DispatchState fn-pointer field. We dupe
+        /// `fetch_id` (the registry owns the key) and stamp the entity
+        /// handle. Subsequent
         /// `dispatchPendingMsgs` `.fetch_chunk` arrivals look up
         /// `fetch_id` here to find the held entity.
         ///

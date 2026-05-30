@@ -210,18 +210,6 @@ pub const Request = struct {
     /// paths; the JS `http.cancelFetch` becomes a no-op then.
     cancel_fetch: ?*const fn (ctx: *anyopaque, id: []const u8) void = null,
     cancel_fetch_ctx: ?*anyopaque = null,
-    /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
-    /// §5.5: register-bound-fetch trampoline. The http.fetch
-    /// binding calls this when `bind: true` to record a
-    /// `fetch_id → entity` mapping on the worker. Returns false
-    /// on registry failure (allocator OOM, fetch_id collision).
-    /// Null on test paths / non-worker dispatches.
-    register_bound_fetch: ?*const fn (
-        ctx: *anyopaque,
-        fetch_id: []const u8,
-        entity: rove.Entity,
-    ) bool = null,
-    register_bound_fetch_ctx: ?*anyopaque = null,
     /// `docs/streaming-model.md` §7 item 1: the entity owning the
     /// chain that this activation runs against. The http.fetch
     /// binding reads this when `bind: true` to register the held
@@ -516,8 +504,6 @@ pub const Dispatcher = struct {
             .resume_if_bound_ctx = request.resume_if_bound_ctx,
             .cancel_fetch = request.cancel_fetch,
             .cancel_fetch_ctx = request.cancel_fetch_ctx,
-            .register_bound_fetch = request.register_bound_fetch,
-            .register_bound_fetch_ctx = request.register_bound_fetch_ctx,
             .activation_entity = request.activation_entity,
             .activation_fetches_pending = request.activation_fetches_pending,
             .pending_fetches = request.pending_fetches,
