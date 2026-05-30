@@ -1374,11 +1374,10 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
 /// One variant per `SubscriptionEntry.Spec`. Borrowed slices —
 /// caller (the firing site in Phases D/E/F) owns the bytes for
 /// the duration of `fireSubscriptionActivation`.
-pub const SubscriptionFireSource = union(enum) {
-    cron: struct { fired_at_ns: i64 },
-    kv: struct { key: []const u8, op: u8 },
-    boot: struct { deployment_id: u64 },
-};
+/// Canonical definition lives in `dispatcher.zig` (next to `Request`,
+/// which carries it). Aliased here so this module's callers + the
+/// `worker.SubscriptionFireSource` re-export are unchanged.
+pub const SubscriptionFireSource = dispatcher_mod.SubscriptionFireSource;
 
 /// Gap 2.1 Phase C: fire a subscription handler as a fresh chain
 /// origin. Structural twin of `fireDisconnectActivation` (no held
@@ -1487,9 +1486,9 @@ pub fn fireSubscriptionActivation(
         .{ subscription_name[0..name_prefix_len], request_id },
     ) catch corr_buf[0..0];
 
-    // Synthesize the Request with the activation payload populated
-    // per the source variant.
-    var req: Request = .{
+    // Synthesize the Request carrying the subscription source union
+    // (the variant IS the activation payload).
+    const req: Request = .{
         .method = "POST",
         .path = spath,
         .body = body,
@@ -1502,15 +1501,8 @@ pub fn fireSubscriptionActivation(
         .correlation_id = corr_full,
         .activation_source = .subscription_fire,
         .activation_subscription_name = subscription_name,
+        .activation_subscription_source = source,
     };
-    switch (source) {
-        .cron => |cs| req.activation_subscription_cron_fired_at_ns = cs.fired_at_ns,
-        .kv => |kvs| {
-            req.activation_subscription_kv_key = kvs.key;
-            req.activation_subscription_kv_op = kvs.op;
-        },
-        .boot => |bs2| req.activation_subscription_boot_deployment_id = bs2.deployment_id,
-    }
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     const run_oc = worker.dispatcher.runOutcome(

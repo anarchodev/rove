@@ -1935,30 +1935,34 @@ pub fn installRequest(
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "name", c.JS_NewStringLen(ctx, n.ptr, n.len));
         }
         const source_obj = c.JS_NewObject(ctx);
-        if (request.activation_subscription_kv_key) |k| {
-            _ = c.JS_SetPropertyStr(ctx, source_obj, "kind", c.JS_NewStringLen(ctx, "kv", 2));
-            _ = c.JS_SetPropertyStr(ctx, source_obj, "key", c.JS_NewStringLen(ctx, k.ptr, k.len));
-            const op_str: []const u8 = switch (request.activation_subscription_kv_op) {
-                'p' => "put",
-                'd' => "delete",
-                else => "",
-            };
-            if (op_str.len > 0) {
-                _ = c.JS_SetPropertyStr(ctx, source_obj, "op", c.JS_NewStringLen(ctx, op_str.ptr, op_str.len));
-            }
-        } else if (request.activation_subscription_boot_deployment_id > 0) {
-            _ = c.JS_SetPropertyStr(ctx, source_obj, "kind", c.JS_NewStringLen(ctx, "boot", 4));
-            // deployment_id is a u64 derived from sha256 — values
-            // routinely exceed 2^53 (losing precision as a JS Number)
-            // AND exceed 2^63 (flipping sign as a `JS_NewBigInt64`
-            // signed BigInt). `JS_NewBigUint64` preserves the
-            // unsigned semantics so `String(dep_id)` matches the
-            // Zig-side `{d}` formatting of the same u64.
-            _ = c.JS_SetPropertyStr(ctx, source_obj, "deployment_id", c.JS_NewBigUint64(ctx, request.activation_subscription_boot_deployment_id));
-        } else if (request.activation_subscription_cron_fired_at_ns > 0) {
-            _ = c.JS_SetPropertyStr(ctx, source_obj, "kind", c.JS_NewStringLen(ctx, "cron", 4));
-            _ = c.JS_SetPropertyStr(ctx, source_obj, "firedAt", c.JS_NewInt64(ctx, request.activation_subscription_cron_fired_at_ns));
-        }
+        if (request.activation_subscription_source) |src| switch (src) {
+            .kv => |kv| {
+                _ = c.JS_SetPropertyStr(ctx, source_obj, "kind", c.JS_NewStringLen(ctx, "kv", 2));
+                _ = c.JS_SetPropertyStr(ctx, source_obj, "key", c.JS_NewStringLen(ctx, kv.key.ptr, kv.key.len));
+                const op_str: []const u8 = switch (kv.op) {
+                    'p' => "put",
+                    'd' => "delete",
+                    else => "",
+                };
+                if (op_str.len > 0) {
+                    _ = c.JS_SetPropertyStr(ctx, source_obj, "op", c.JS_NewStringLen(ctx, op_str.ptr, op_str.len));
+                }
+            },
+            .boot => |boot| {
+                _ = c.JS_SetPropertyStr(ctx, source_obj, "kind", c.JS_NewStringLen(ctx, "boot", 4));
+                // deployment_id is a u64 derived from sha256 — values
+                // routinely exceed 2^53 (losing precision as a JS Number)
+                // AND exceed 2^63 (flipping sign as a `JS_NewBigInt64`
+                // signed BigInt). `JS_NewBigUint64` preserves the
+                // unsigned semantics so `String(dep_id)` matches the
+                // Zig-side `{d}` formatting of the same u64.
+                _ = c.JS_SetPropertyStr(ctx, source_obj, "deployment_id", c.JS_NewBigUint64(ctx, boot.deployment_id));
+            },
+            .cron => |cron| {
+                _ = c.JS_SetPropertyStr(ctx, source_obj, "kind", c.JS_NewStringLen(ctx, "cron", 4));
+                _ = c.JS_SetPropertyStr(ctx, source_obj, "firedAt", c.JS_NewInt64(ctx, cron.fired_at_ns));
+            },
+        };
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "source", source_obj);
     }
 
