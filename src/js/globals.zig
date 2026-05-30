@@ -213,6 +213,48 @@ pub const PendingFetch = struct {
     }
 };
 
+/// Admin-tenant platform-capability trampolines, bundled so they are
+/// set all-or-nothing (a request either has platform caps or it does
+/// not — see `worker_dispatch`'s single `platform != null` gate). The
+/// worker provides concrete fns that cast `ctx` back to their specific
+/// `*Worker(opts)` type, keeping that generic type out of globals.zig.
+/// One shared `ctx` (the opaque worker pointer) backs all three — they
+/// are always set together from the same worker. Each fn stays
+/// optional so the JS callable can throw a precise "not configured"
+/// error on test/misconfigured paths (and so a test can wire just one).
+pub const PlatformCaps = struct {
+    ctx: *anyopaque,
+    /// `platform.instances.deployStarter(name)`: deploy the embedded
+    /// starter into the target tenant's manifest_backend + propose
+    /// `_deploy/current = 1` through raft envelope 0.
+    deploy_starter: ?*const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        target_id: []const u8,
+    ) anyerror!void = null,
+    /// `platform.releases.publish(tenant_id, dep_id)`: stamp
+    /// `_deploy/current = dep_id` on the target's app.db, propose
+    /// envelope-0 (fire-and-forget), enqueue the deployment loader.
+    release_publish: ?*const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        target_id: []const u8,
+        dep_id: u64,
+    ) anyerror!void = null,
+    /// `platform.scope(id).kv.{set,delete}`: self-contained cross-
+    /// tenant write+commit+raft-propose to the target (envelope-0),
+    /// deliberately OUTSIDE the dispatch batch txn (auth-domain-plan
+    /// §4.7). Reads go direct via `state.platform.getInstance`.
+    scope_kv_write: ?*const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        target_id: []const u8,
+        op: ScopeKvOp,
+        key: []const u8,
+        value: []const u8,
+    ) anyerror!void = null,
+};
+
 pub const DispatchState = struct {
     allocator: std.mem.Allocator,
     /// Per-request KV store. `kv.get("x")` reads from this handle,
@@ -334,56 +376,12 @@ pub const DispatchState = struct {
     /// `ChainContext.correlation_id`. Empty on test paths / when
     /// the dispatch carries no correlation_id.
     correlation_id: []const u8 = "",
-    /// Trampoline backing `platform.instances.deployStarter(name)`.
-    /// Worker provides a concrete fn that can cast `ctx` back to
-    /// its specific `*Worker(opts)` type, deploys the embedded
-    /// starter content into the target tenant's manifest_backend,
-    /// and proposes `_deploy/current = 1` through raft envelope 0.
-    /// Null on test paths without a worker; the JS callable throws
-    /// a clear error in that case.
-    deploy_starter: ?*const fn (
-        ctx: *anyopaque,
-        allocator: std.mem.Allocator,
-        target_id: []const u8,
-    ) anyerror!void = null,
-    deploy_starter_ctx: ?*anyopaque = null,
-
-    /// Trampoline backing `platform.releases.publish(tenant_id,
-    /// dep_id)`. Stamps `_deploy/current = dep_id` on the target
-    /// tenant's app.db, proposes envelope-0 through raft (fire-
-    /// and-forget — does not block on consensus), and enqueues
-    /// the deployment loader so it starts fetching dep_id's
-    /// manifest + bytecodes immediately. The customer-visible
-    /// effect: a release POST returns in <10ms after one local
-    /// fsync + two queue inserts. Raft consensus + bytecode
-    /// load happen async. Null on test paths without a worker;
-    /// the JS callable throws.
-    release_publish: ?*const fn (
-        ctx: *anyopaque,
-        allocator: std.mem.Allocator,
-        target_id: []const u8,
-        dep_id: u64,
-    ) anyerror!void = null,
-    release_publish_ctx: ?*anyopaque = null,
-
-    /// Trampoline backing `platform.scope(id).kv.{set,delete}` — a
-    /// self-contained cross-tenant write+commit+raft-propose to the
-    /// target tenant (envelope-0), mirroring releasePublishTrampoline.
-    /// Deliberately OUTSIDE the dispatch batch txn so there is no
-    /// two-open-txns-in-one-dispatch hazard (auth-domain-plan §4.7
-    /// "Primitive-fix pivot"; the proven `handleAdminKv` shape).
-    /// Reads (get/prefix) go direct via `state.platform.getInstance`
-    /// and need no trampoline. Null on test/non-admin paths; the JS
-    /// callable throws a clear error then.
-    scope_kv_write: ?*const fn (
-        ctx: *anyopaque,
-        allocator: std.mem.Allocator,
-        target_id: []const u8,
-        op: ScopeKvOp,
-        key: []const u8,
-        value: []const u8,
-    ) anyerror!void = null,
-    scope_kv_ctx: ?*anyopaque = null,
+    /// Admin-tenant platform-capability trampolines (deployStarter /
+    /// releases.publish / scope().kv writes). Non-null only on admin-
+    /// handler requests (gated by `platform != null` in
+    /// `worker_dispatch`); customer requests have none and the JS
+    /// callables reject at the gate. See `PlatformCaps`.
+    platform_caps: ?PlatformCaps = null,
 
     /// Phase 5 PR-3: trampoline backing
     /// `_system.continuation.resumeIfBound(send_id, event_json)`.
@@ -1121,14 +1119,15 @@ fn jsPlatformInstancesDeployStarter(
         _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
         return js_exception;
     }
-    const fn_ptr = state.deploy_starter orelse {
+    const caps = state.platform_caps orelse {
         _ = c.JS_ThrowTypeError(ctx, "platform.instances.deployStarter is not configured (no compile callback)");
         return js_exception;
     };
-    const fn_ctx = state.deploy_starter_ctx orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform.instances.deployStarter context missing");
+    const fn_ptr = caps.deploy_starter orelse {
+        _ = c.JS_ThrowTypeError(ctx, "platform.instances.deployStarter is not configured (no compile callback)");
         return js_exception;
     };
+    const fn_ctx = caps.ctx;
 
     const name = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
     defer state.allocator.free(name);
@@ -1183,14 +1182,15 @@ fn jsPlatformReleasesPublish(
         _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
         return js_exception;
     }
-    const fn_ptr = state.release_publish orelse {
+    const caps = state.platform_caps orelse {
         _ = c.JS_ThrowTypeError(ctx, "platform.releases.publish is not configured on this worker");
         return js_exception;
     };
-    const fn_ctx = state.release_publish_ctx orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform.releases.publish context missing");
+    const fn_ptr = caps.release_publish orelse {
+        _ = c.JS_ThrowTypeError(ctx, "platform.releases.publish is not configured on this worker");
         return js_exception;
     };
+    const fn_ctx = caps.ctx;
 
     const tenant_id = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
     defer state.allocator.free(tenant_id);
@@ -1380,14 +1380,15 @@ fn scopeKvWrite(
     const min_args: c_int = if (op == .put) 2 else 1;
     if (argc < min_args) return js_undefined;
 
-    const fn_ptr = state.scope_kv_write orelse {
+    const caps = state.platform_caps orelse {
         _ = c.JS_ThrowTypeError(ctx, "platform.scope().kv writes are not configured on this worker");
         return js_exception;
     };
-    const fn_ctx = state.scope_kv_ctx orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform.scope().kv write context missing");
+    const fn_ptr = caps.scope_kv_write orelse {
+        _ = c.JS_ThrowTypeError(ctx, "platform.scope().kv writes are not configured on this worker");
         return js_exception;
     };
+    const fn_ctx = caps.ctx;
 
     const id = scopeIdFromThis(state, ctx, this) catch return js_exception;
     defer state.allocator.free(id);
