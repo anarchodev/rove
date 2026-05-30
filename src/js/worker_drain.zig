@@ -780,6 +780,72 @@ fn proposeAndParkContResume(
 ///         (`proposeAndParkContResume(.repark)` — recipe-1 real-retry).
 ///       • continuation + !allow_repark → defined 504 (deadline).
 ///       • stream → defined 501 (`cont → stream` is a later phase).
+/// Install the cont→stream transition's components on a held entity
+/// (still in `parked_continuations`) and move it into the streaming
+/// pipeline (`stream_response_in`). Shared read-only-path tail of both
+/// stream-resume arms (`resumeContinuation` / `resumeBoundFetchChain`),
+/// which were byte-identical here.
+///
+/// Takes ownership of every passed slice: `resp_headers` /
+/// `module_path` / `ctx_json` / `kv_prefixes` transfer into the
+/// entity's h2 + stream components; each of `chunks` is staged into
+/// `StreamChunks` and the spine is freed. The caller logs the hop
+/// afterward under its own activation kind (`.send_callback` /
+/// `.fetch_chunk`).
+///
+/// `moveImmediate` (not deferred `move`) so subsequent fetch chunks
+/// arriving in the same worker tick see the entity in
+/// `stream_response_in` — chunks 0..N from one bound fetch typically
+/// arrive in a single batch (Gap #1 smoke); a deferred move would leave
+/// the entity in `parked_continuations` until the next flush, so chunks
+/// 1+ would dispatch against stale state.
+fn installStreamComponentsInline(
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    status: u16,
+    resp_headers: h2.RespHeaders,
+    module_path: []u8,
+    ctx_json: []u8,
+    chunks: [][]u8,
+    kv_prefixes: [][]u8,
+    interval_ms: i64,
+) void {
+    const server = worker.h2;
+    const allocator = worker.allocator;
+    server.reg.set(ent, &worker.parked_continuations, h2.Status, .{ .code = status }) catch {};
+    server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, resp_headers) catch {};
+    server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = null, .len = 0 }) catch {};
+    server.reg.set(ent, &worker.parked_continuations, h2.H2IoResult, .{ .err = 0 }) catch {};
+    server.reg.set(ent, &worker.parked_continuations, h2.StreamId, sid) catch {};
+    server.reg.set(ent, &worker.parked_continuations, h2.Session, sess) catch {};
+    server.reg.set(ent, &worker.parked_continuations, components_mod.StreamChain, .{
+        .module_path = module_path,
+        .ctx_json = ctx_json,
+        .activation_count = 1,
+    }) catch {};
+
+    var staged: components_mod.StreamChunks = .{};
+    staged.queue.ensureUnusedCapacity(allocator, chunks.len) catch {};
+    for (chunks) |chunk| staged.tryAppend(allocator, chunk) catch {};
+    server.reg.set(ent, &worker.parked_continuations, components_mod.StreamChunks, staged) catch {};
+    if (chunks.len > 0) allocator.free(chunks);
+
+    const next_wake_ns: i64 = if (interval_ms > 0)
+        @as(i64, @intCast(std.time.nanoTimestamp())) + interval_ms * std.time.ns_per_ms
+    else
+        std.math.maxInt(i64);
+    server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{
+        .interval_ms = interval_ms,
+        .next_wake_ns = next_wake_ns,
+        .kv_prefixes = kv_prefixes,
+    }) catch {};
+
+    server.reg.moveImmediate(ent, &worker.parked_continuations, &server.stream_response_in) catch |merr|
+        std.log.warn("rove-js cont→stream move: {s}", .{@errorName(merr)});
+}
+
 /// The deadline trigger passes `allow_repark = false`.
 /// `error.Resume*` → caller falls back to a hard 504.
 fn resumeContinuation(
@@ -1250,43 +1316,7 @@ fn resumeContinuation(
             for (parsed_headers) |h| { allocator.free(h.name); allocator.free(h.value); }
             if (parsed_headers.len > 0) allocator.free(parsed_headers);
 
-            server.reg.set(ent, &worker.parked_continuations, h2.Status, .{ .code = stream_status }) catch {};
-            server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, handler_resp_hdrs) catch {};
-            server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = null, .len = 0 }) catch {};
-            server.reg.set(ent, &worker.parked_continuations, h2.H2IoResult, .{ .err = 0 }) catch {};
-            server.reg.set(ent, &worker.parked_continuations, h2.StreamId, sid) catch {};
-            server.reg.set(ent, &worker.parked_continuations, h2.Session, sess) catch {};
-            server.reg.set(ent, &worker.parked_continuations, components_mod.StreamChain, .{
-                .module_path = module_path_dup,
-                .ctx_json = stream_ctx_json,
-                .activation_count = 1,
-            }) catch {};
-
-            var staged: components_mod.StreamChunks = .{};
-            staged.queue.ensureUnusedCapacity(allocator, stream_chunks.len) catch {};
-            for (stream_chunks) |chunk| staged.tryAppend(allocator, chunk) catch {};
-            server.reg.set(ent, &worker.parked_continuations, components_mod.StreamChunks, staged) catch {};
-            if (stream_chunks.len > 0) allocator.free(stream_chunks);
-
-            const next_wake_ns: i64 = if (stream_interval > 0)
-                @as(i64, @intCast(std.time.nanoTimestamp())) + stream_interval * std.time.ns_per_ms
-            else
-                std.math.maxInt(i64);
-            server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{
-                .interval_ms = stream_interval,
-                .next_wake_ns = next_wake_ns,
-                .kv_prefixes = stream_kv_prefixes,
-            }) catch {};
-
-            // moveImmediate so subsequent fetch chunks arriving in
-            // the same worker tick see the entity in
-            // stream_response_in (chunks 0..N from the same bound
-            // fetch typically arrive in one batch — see Gap #1
-            // smoke). reg.move (deferred) would leave the entity in
-            // parked_continuations until the next flush, causing
-            // chunks 1+ to dispatch against stale state.
-            server.reg.moveImmediate(ent, &worker.parked_continuations, &server.stream_response_in) catch |merr|
-                std.log.warn("rove-js cont→stream move: {s}", .{@errorName(merr)});
+            installStreamComponentsInline(worker, ent, sid, sess, stream_status, handler_resp_hdrs, module_path_dup, stream_ctx_json, stream_chunks, stream_kv_prefixes, stream_interval);
             captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_for_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, .send_callback, 0);
         },
     }
@@ -1725,36 +1755,7 @@ pub fn resumeBoundFetchChain(
             for (parsed_headers) |h| { allocator.free(h.name); allocator.free(h.value); }
             if (parsed_headers.len > 0) allocator.free(parsed_headers);
 
-            server.reg.set(ent, &worker.parked_continuations, h2.Status, .{ .code = stream_status }) catch {};
-            server.reg.set(ent, &worker.parked_continuations, h2.RespHeaders, handler_resp_hdrs) catch {};
-            server.reg.set(ent, &worker.parked_continuations, h2.RespBody, .{ .data = null, .len = 0 }) catch {};
-            server.reg.set(ent, &worker.parked_continuations, h2.H2IoResult, .{ .err = 0 }) catch {};
-            server.reg.set(ent, &worker.parked_continuations, h2.StreamId, sid) catch {};
-            server.reg.set(ent, &worker.parked_continuations, h2.Session, sess) catch {};
-            server.reg.set(ent, &worker.parked_continuations, components_mod.StreamChain, .{
-                .module_path = module_path_dup,
-                .ctx_json = stream_ctx_json,
-                .activation_count = 1,
-            }) catch {};
-            var staged: components_mod.StreamChunks = .{};
-            staged.queue.ensureUnusedCapacity(allocator, stream_chunks.len) catch {};
-            for (stream_chunks) |chunk| staged.tryAppend(allocator, chunk) catch {};
-            server.reg.set(ent, &worker.parked_continuations, components_mod.StreamChunks, staged) catch {};
-            if (stream_chunks.len > 0) allocator.free(stream_chunks);
-            const next_wake_ns: i64 = if (stream_interval > 0)
-                @as(i64, @intCast(std.time.nanoTimestamp())) + stream_interval * std.time.ns_per_ms
-            else
-                std.math.maxInt(i64);
-            server.reg.set(ent, &worker.parked_continuations, components_mod.StreamWakes, .{
-                .interval_ms = stream_interval,
-                .next_wake_ns = next_wake_ns,
-                .kv_prefixes = stream_kv_prefixes,
-            }) catch {};
-            // moveImmediate — same reasoning as resumeContinuation's
-            // .stream arm: subsequent bound-fetch chunks arriving in
-            // the same worker tick need to see the new collection.
-            server.reg.moveImmediate(ent, &worker.parked_continuations, &server.stream_response_in) catch |merr|
-                std.log.warn("rove-js bound-fetch stream move: {s}", .{@errorName(merr)});
+            installStreamComponentsInline(worker, ent, sid, sess, stream_status, handler_resp_hdrs, module_path_dup, stream_ctx_json, stream_chunks, stream_kv_prefixes, stream_interval);
             captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_for_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, .fetch_chunk, 0);
         },
     }
