@@ -2734,13 +2734,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .resume_if_bound_ctx = @ptrCast(worker),
             .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
             .cancel_fetch_ctx = @ptrCast(worker),
-            // `docs/streaming-model.md` §7 item 1: bind:true wiring.
-            // The inbound entity owns the held chain; the binding
-            // stamps `(fetch_id → ent)` into the worker's registry
-            // so upstream chunks resume this chain instead of
-            // firing a separate `fetch-<id>` activation.
-            .register_bound_fetch = &@TypeOf(worker.*).registerBoundFetchTrampoline,
-            .register_bound_fetch_ctx = @ptrCast(worker),
             .activation_entity = ent,
         };
 

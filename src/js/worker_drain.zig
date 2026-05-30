@@ -1499,8 +1499,6 @@ pub fn resumeBoundFetchChain(
         .resume_if_bound_ctx = @ptrCast(worker),
         .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
         .cancel_fetch_ctx = @ptrCast(worker),
-        .register_bound_fetch = &@TypeOf(worker.*).registerBoundFetchTrampoline,
-        .register_bound_fetch_ctx = @ptrCast(worker),
         .activation_entity = ent,
         .activation_fetches_pending = fetches_pending,
     };
