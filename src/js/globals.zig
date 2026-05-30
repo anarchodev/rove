@@ -1866,9 +1866,10 @@ pub fn installRequest(
     // request shape the handler can branch on. The `wake_batch`
     // variant (§9.4, Gap 2.2 Phase E) carries a temporal-order
     // `wakes: [{kind:"kv",key,op,firedAt} | {kind:"timer",firedAt}]`
-    // array + an `overflow: { lost_oldest }` counter. The legacy
-    // `kv` and `timer` variants are retained for replay-tape
-    // decode but no longer fire on live dispatch.
+    // array + an `overflow: { lost_oldest }` counter. The singular
+    // `.kv_wake` source still maps to `kind:"kv"` but carries no
+    // key/op payload (the pre-Gap-2.2 single-slot fields had no
+    // producer and were dropped); live kv fan-out rides `.wake_batch`.
     const activation_obj = c.JS_NewObject(ctx);
     const kind: []const u8 = switch (request.activation_source) {
         .inbound => "inbound",
@@ -1883,19 +1884,7 @@ pub fn installRequest(
         .fetch_chunk => "fetch_chunk",
     };
     _ = c.JS_SetPropertyStr(ctx, activation_obj, "kind", c.JS_NewStringLen(ctx, kind.ptr, kind.len));
-    if (request.activation_source == .kv_wake) {
-        if (request.activation_kv_key) |k| {
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "key", c.JS_NewStringLen(ctx, k.ptr, k.len));
-        }
-        const op_str: []const u8 = switch (request.activation_kv_op) {
-            'p' => "put",
-            'd' => "delete",
-            else => "",
-        };
-        if (op_str.len > 0) {
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "op", c.JS_NewStringLen(ctx, op_str.ptr, op_str.len));
-        }
-    } else if (request.activation_source == .wake_batch) {
+    if (request.activation_source == .wake_batch) {
         // wakes: [{kind:"kv",key,op,firedAt}|{kind:"timer",firedAt}, ...]
         const wakes_arr = c.JS_NewArray(ctx);
         for (request.activation_wakes, 0..) |w, i| {
