@@ -397,10 +397,6 @@ pub const SubscriptionFireDescriptor = struct {
     /// activation triggered the fire (the runtime gates re-fire on
     /// `_boot_fired/<dep_id>` post-fire).
     boot_deployment_id: u64 = 0,
-    /// Earned-its-keep field: retry count on transient failures.
-    /// V1 doesn't retry; the field is here so adding retry doesn't
-    /// re-shape the component.
-    retry_count: u8 = 0,
 
     pub const SourceKind = enum(u8) { cron, kv, boot };
 
