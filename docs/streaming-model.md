@@ -590,11 +590,14 @@ to batch the underlying bytes.
 
 ### 7.8 Open work
 
-**Phase 6 cleanup** (pending): delete dead per-source batching /
-threshold code; remove the `ROVE_BODY_FLUSH_POOL_SIZE` env var;
-sweep stale comments in worker.zig / worker_dispatch.zig /
-worker_drain.zig that still describe the pre-coord per-tenant
-BodyBuffer flow.
+**Phase 6 cleanup** (DONE 2026-05-30): the per-source batching /
+threshold code and the `ROVE_BODY_FLUSH_POOL_SIZE` env var are gone;
+the stale pre-coord per-tenant `BodyBuffer` comments in worker.zig /
+worker_dispatch.zig / worker_drain.zig were swept (`ab75e7a`). The
+two surviving `BodyBuffer` mentions in worker.zig are accurate
+history — the `blob_coordinator` doc comment noting it *replaces* the
+per-worker `BodyFlushPool`, and an append-failed branch comparing
+itself to the pre-coord posture — not stale descriptions.
 
 History: per-tenant lanes (Phases 0-3 shipped 2026-05-27) →
 cross-tenant `_pool/` + raft-reserved batch_id (Phase 5 shipped

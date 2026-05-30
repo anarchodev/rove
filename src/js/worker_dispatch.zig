@@ -110,8 +110,8 @@ const SuccessRec = struct {
     /// terminal success; the only divergence is the final entity
     /// destination — `parked_continuations` instead of `response_in`,
     /// no response stamped. Transient (consumed in `finalizeBatch` /
-    /// `drainRaftPending` into `worker.parked_meta`); never a
-    /// persisted per-entity discriminant.
+    /// `drainRaftPending` into the entity's `ContDescriptor`
+    /// component); never a persisted per-entity discriminant.
     cont: ?continuation_mod.Continuation = null,
     /// Absolute §6.4 mandatory-timeout deadline for the parked
     /// stream; meaningful only when `cont != null`.
@@ -121,36 +121,34 @@ const SuccessRec = struct {
     /// `_send/owed/{id}` put at the run-site (the customer never
     /// receives it — `http.send` returns undefined — so the binding
     /// is runtime-internal). Borrows the writeset put key; duped into
-    /// `ParkedCont` by the cont helpers. null = hop fired 0 or >1
-    /// sends → deadline-only resume.
+    /// the entity's `ContDescriptor` (`bound_schedule_id`) by the cont
+    /// helpers. null = hop fired 0 or >1 sends → deadline-only resume.
     cont_bound_sched_id: ?[]const u8 = null,
     /// Per-chain correlation id (streaming-handlers-plan §6). Borrows
-    /// from the dispatch `Request`; duped into `ParkedCont` by the
-    /// cont helpers so the resume inherits the same chain id.
+    /// from the dispatch `Request`; duped into the entity's
+    /// `ChainContext` component by the cont helpers so the resume
+    /// inherits the same chain id.
     correlation_id: ?[]const u8 = null,
     /// Set when the handler returned `__rove_stream(...)` (streaming-
     /// handlers-plan §3.3). Carries the chain-level state forward to
     /// `finalizeBatch`, which redirects the entity into h2's stream
     /// pipeline (`stream_response_in` instead of `response_in`) and
-    /// hands ownership to `worker.parked_streams_meta` via
-    /// `worker.registerStreamCell`. Transient — consumed in
+    /// sets the entity's stream components via
+    /// `worker.setStreamComponents`. Transient — consumed in
     /// finalizeBatch; never persisted on the entity.
     stream: ?StreamFirstHopMeta = null,
 };
 
 /// Stream first-hop chain metadata held on a `SuccessRec` between the
 /// `.stream` dispatch outcome and `finalizeBatch`. All slices are
-/// owned; `deinit` frees them in the discard path. Public so
-/// `worker.zig`'s `pending_stream_meta` side-store (Phase 4d) can
-/// reference the same type when threading through the raft propose
-/// path.
+/// owned; `deinit` frees them in the discard path.
 ///
 /// `tenant_id` / `correlation_id` / `deployment_id` are populated by
-/// `streamRecordIfAny` (Phase 4d) right before the meta moves into
-/// `pending_stream_meta`. The fields are unused on the read-only
-/// commit fast path where `streamParkIfAny` reads them off the
-/// caller's local context instead.
-pub const StreamFirstHopMeta = struct {
+/// `streamRecordIfAnyAt` right before it sets them as entity stream
+/// components (via `setStreamComponents`). The fields are unused on
+/// the read-only commit fast path where `streamParkIfAny` reads them
+/// off the caller's local context instead.
+const StreamFirstHopMeta = struct {
     /// Owned. Initial chunks the chain emits before the first wake.
     /// Each chunk byte buffer is allocator-owned; the outer spine
     /// (the `[][]u8`) is too.
@@ -172,10 +170,10 @@ pub const StreamFirstHopMeta = struct {
     /// allocator-owned dup; the outer spine is owned too.
     kv_prefixes: [][]u8,
     /// Owned. Tenant id the chain is scoped to. Set by
-    /// `streamRecordIfAny` before the meta enters
-    /// `pending_stream_meta`. Empty on the read-only commit
-    /// fast path (`streamParkIfAny` reads tenant_id off the
-    /// SuccessRec / anchor_id directly).
+    /// `streamRecordIfAnyAt` before it sets the entity's stream
+    /// components. Empty on the read-only commit fast path
+    /// (`streamParkIfAny` reads tenant_id off the SuccessRec /
+    /// anchor_id directly).
     tenant_id: []u8 = &.{},
     /// Owned. Correlation id from the originating inbound request.
     /// Same population rule as `tenant_id`.
@@ -346,8 +344,9 @@ fn contDiscardIfAny(allocator: std.mem.Allocator, s: *SuccessRec) void {
 // ── Streaming-handlers Phase 2b-ii finalize helpers ────────────────
 // Symmetric to the cont helpers: redirect the FINAL entity
 // destination (`stream_response_in` instead of `response_in`) and
-// hand the chain-level descriptor to `worker.registerStreamCell` —
-// `parked_streams_meta` is the data side-store, the entity's
+// set the chain-level stream components on the entity (via
+// `worker.setStreamComponents`) — Phase 7 folded the old
+// `parked_streams_meta` side-store onto the entity, and its
 // membership in the stream pipeline is the lifecycle discriminant
 // (`feedback_state_is_collection`).
 
@@ -597,8 +596,8 @@ fn finalizeBatch(
             for (successes.items) |*s| {
                 const is_stream = s.stream != null;
                 const is_cont = s.cont != null;
-                try contRecordIfAny(worker, server, allocator, anchor_id, s); // sets ContDescriptor + parked_meta entry
-                try streamRecordIfAnyAt(worker, server, allocator, anchor_id, s); // sets stream components + pending_stream_meta
+                try contRecordIfAny(worker, server, allocator, anchor_id, s); // sets the entity's ContDescriptor component
+                try streamRecordIfAnyAt(worker, server, allocator, anchor_id, s); // sets the entity's stream components
                 try server.reg.set(s.ent, &server.request_out, RaftWait, .{
                     .seq = seq,
                     .deadline_ns = deadline_ns,
@@ -862,8 +861,8 @@ fn finalizeBatch(
     for (successes.items) |*s| {
         const is_stream = s.stream != null;
         const is_cont = s.cont != null;
-        try contRecordIfAny(worker, server, allocator, anchor_id, s); // sets ContDescriptor + parked_meta entry
-        try streamRecordIfAnyAt(worker, server, allocator, anchor_id, s); // sets stream components + pending_stream_meta
+        try contRecordIfAny(worker, server, allocator, anchor_id, s); // sets the entity's ContDescriptor component
+        try streamRecordIfAnyAt(worker, server, allocator, anchor_id, s); // sets the entity's stream components
         try server.reg.set(s.ent, &server.request_out, RaftWait, .{
             .seq = seq,
             .deadline_ns = deadline_ns,
@@ -2824,12 +2823,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // unchanged ~150-line response/SuccessRec block below run
         // verbatim (empty body/console/exception is already a
         // supported terminal shape — handlers may return nothing).
-        // Phase 4d: `stream + writes` IS supported. The
-        // `pending_stream_meta` side-store (set by
-        // `streamRecordIfAny` in finalizeBatch's write path) lets
-        // `drainRaftPending` redirect the committed entity into
-        // `stream_response_in`. The old read-only guard that
-        // rewrote `.stream + wrote` into a 500 is gone.
+        // Phase 4d: `stream + writes` IS supported. The entity's
+        // stream components (set by `streamRecordIfAnyAt` in
+        // finalizeBatch's write path) let `drainRaftPending` redirect
+        // the committed entity into `stream_response_in`. The old
+        // read-only guard that rewrote `.stream + wrote` into a 500
+        // is gone.
 
         var cont_opt: ?continuation_mod.Continuation = null;
         var stream_meta_opt: ?StreamFirstHopMeta = null;
@@ -2860,8 +2859,9 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 // and (b) a `StreamFirstHopMeta` recorded on the
                 // SuccessRec — `finalizeBatch` redirects the entity
                 // into `stream_response_in` (instead of
-                // `response_in`) after commit and hands chunks /
-                // interval / ctx to `worker.registerStreamCell`.
+                // `response_in`) after commit and sets chunks /
+                // interval / ctx as entity components via
+                // `worker.setStreamComponents`.
                 // `worker.serviceParkedStreams` then drives the
                 // chunked-write lifecycle + timer-wake re-activation.
                 var s = sval;
@@ -2904,7 +2904,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // the resume outcome — 3c increment 2). 0 or >1 sends → null
         // (deadline-only resume; >1 is ambiguous, no implicit pick).
         // Borrowed from the pending ScheduleRow; the cont helpers dupe
-        // it into ParkedCont before finalizeBatch consumes the list.
+        // it into the entity's ContDescriptor (`bound_schedule_id`)
+        // before finalizeBatch consumes the list.
         const cont_bound_sched_id: ?[]const u8 = blk: {
             _ = cont_opt orelse break :blk null;
             // 5b-1: §6.4 binding source is the single `_send/owed/{id}`
@@ -2917,7 +2918,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // implicit pick — same semantics as the old ScheduleRow
             // rule). The id borrows into the writeset put key — valid
             // through finalizeBatch; the cont helper dupes it into
-            // `ParkedCont`.
+            // the entity's `ContDescriptor` (`bound_schedule_id`).
             // Scope the scan to THIS request's contribution only —
             // ops appended since `ws_pre_len` was captured above
             // (before runOutcome). The writeset accumulates across

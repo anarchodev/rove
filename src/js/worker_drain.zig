@@ -178,8 +178,8 @@ pub fn drainRaftPending(worker: anytype) !void {
     // Handler-cmds Phase 5: raft_pending is THREE sibling collections.
     // Each entity is parked on the sibling matching its commit
     // destination, so the dispatch in each loop is direct — no
-    // `desc.cont != null` field check, no `pending_stream_meta.contains`
-    // probe. Whichever loop processes a given seq first commits the
+    // membership field-check or side-table probe. Whichever loop
+    // processes a given seq first commits the
     // shared TrackedTxn; later siblings find the map empty and just
     // queue moves. Forward-iter preserves per-tenant chain order
     // (entities enter the siblings in propose-seq order from

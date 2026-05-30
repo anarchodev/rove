@@ -80,11 +80,11 @@ pub const ContDescriptor = struct {
 };
 
 /// Stream-chain identity + per-activation state. Populated on
-/// entities holding an active `__rove_stream(...)` chain (Phase 5
-/// targets: `parked_streams_active` / `parked_streams_draining` /
-/// `raft_pending_stream`). The module path stays fixed across the
-/// chain's lifetime; `ctx_json` is replaced on every
-/// `__rove_stream(...)` return.
+/// entities holding an active `__rove_stream(...)` chain — during the
+/// raft park (`raft_pending_stream`) and then across h2's stream
+/// pipeline (`stream_response_in` → `stream_data_out`). The module
+/// path stays fixed across the chain's lifetime; `ctx_json` is
+/// replaced on every `__rove_stream(...)` return.
 pub const StreamChain = struct {
     /// Module path the resume engine invokes on each wake.
     /// Allocator-owned when set; empty slice = inactive.
