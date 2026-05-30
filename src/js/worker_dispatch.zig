@@ -1341,12 +1341,16 @@ fn handleMetrics(
         \\# HELP bound_fetch_spool_depth_peak peak queued spool entries (producer-ahead-of-consumer depth) across this worker's bound-fetch spools.
         \\# TYPE bound_fetch_spool_depth_peak gauge
         \\bound_fetch_spool_depth_peak {d}
+        \\# HELP log_records_dropped_total per-request log records permanently lost in flushLogs (writeBatch failure / lost-leadership mid-tick) — lossy-on-failure by design.
+        \\# TYPE log_records_dropped_total counter
+        \\log_records_dropped_total {d}
         \\
     , .{
         worker.bound_fetch_spool_inline_bytes_peak,
         worker.bound_fetch_spool_readback_total,
         worker.bound_fetch_spool_dropped_total,
         worker.bound_fetch_spool_depth_peak,
+        worker.log_records_dropped_total,
     });
 
     // `docs/chunk-spool-plan.md` P6: live retained (sealed-but-not-

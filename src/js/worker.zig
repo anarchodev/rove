@@ -2550,6 +2550,15 @@ pub fn Worker(comptime opts: Options) type {
         /// empty by then). Exposed as
         /// `bound_fetch_spool_dropped_total`. Never reset.
         bound_fetch_spool_dropped_total: u64 = 0,
+        /// Count of per-request log records permanently dropped by
+        /// `flushLogs` — the batch was drained from `log_buffer` before
+        /// the S3 PUT, so a writeBatch failure or a lost-leadership
+        /// mid-tick loses those records for good (lossy-on-failure by
+        /// design — `docs/logs-plan.md` §1). Logged AND counted so the
+        /// permanent data-loss volume is visible over time, not just a
+        /// transient warn line. Exposed as `log_records_dropped_total`.
+        /// Never reset.
+        log_records_dropped_total: u64 = 0,
         /// `docs/cross-worker-held-state-plan.md` Phase 3: worker-
         /// local mirror of NodeState's `bound_send_owners`. Maps
         /// send_id → the parked cont entity bound to it.
