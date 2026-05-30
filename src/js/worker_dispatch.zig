@@ -2906,24 +2906,16 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // rule). The id borrows into the writeset put key — valid
             // through finalizeBatch; the cont helper dupes it into
             // `ParkedCont`.
-            var only: ?[]const u8 = null;
-            var n: usize = 0;
             // Scope the scan to THIS request's contribution only —
             // ops appended since `ws_pre_len` was captured above
             // (before runOutcome). The writeset accumulates across
             // every handler in the batch; without the slice cut a
             // concurrent same-tenant heldsync sees the other
             // requests' `_send/owed/` puts and falls into the
-            // "ambiguous → null" branch.
-            for (writeset.ops.items[ws_pre_len..]) |op| switch (op) {
-                .put => |p| if (std.mem.startsWith(u8, p.key, worker_mod.OWED_PREFIX)) {
-                    n += 1;
-                    only = p.key[worker_mod.OWED_PREFIX.len..];
-                },
-                .delete => {},
-            };
-            if (n != 1) break :blk null;
-            break :blk only;
+            // "ambiguous → null" branch. Borrowed return — the open
+            // hop uses it directly (registerBoundSendOwner) without
+            // duping.
+            break :blk worker_mod.scanLoneOwedSendId(writeset.ops.items[ws_pre_len..]);
         };
         // `docs/cross-worker-held-state-plan.md` Phase 1: when this
         // open hop bound to exactly one send, register the
