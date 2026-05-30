@@ -184,41 +184,13 @@ pub const Request = struct {
     /// Null means writes land locally only — fine for tests and
     /// single-node setups, not for multi-node correctness.
     root_writeset: ?*kv_mod.WriteSet = null,
-    /// Trampoline for `platform.instances.deployStarter(name)`.
-    /// Non-null on admin-tenant requests when the worker has a
-    /// compile callback wired (signup/dev path). The pair (`fn`,
-    /// `ctx`) lets the worker pass an opaque `*Worker(opts)`
-    /// pointer + a concrete trampoline that knows how to cast it,
-    /// without leaking the worker's generic type into globals.zig.
-    deploy_starter: ?*const fn (
-        ctx: *anyopaque,
-        allocator: std.mem.Allocator,
-        target_id: []const u8,
-    ) anyerror!void = null,
-    deploy_starter_ctx: ?*anyopaque = null,
-    /// Trampoline for `platform.releases.publish(tenant_id,
-    /// dep_id)`. Same admin-only / opaque-worker-ptr pattern as
-    /// `deploy_starter`. Stamps `_deploy/current` + proposes raft
-    /// (fire-and-forget) + enqueues the deployment loader.
-    release_publish: ?*const fn (
-        ctx: *anyopaque,
-        allocator: std.mem.Allocator,
-        target_id: []const u8,
-        dep_id: u64,
-    ) anyerror!void = null,
-    release_publish_ctx: ?*anyopaque = null,
-    /// `platform.scope(id).kv.{set,delete}` cross-tenant write
-    /// trampoline (the explicit accessor that replaced the
-    /// X-Rove-Scope global-kv rebind — auth-domain-plan §4.7).
-    scope_kv_write: ?*const fn (
-        ctx: *anyopaque,
-        allocator: std.mem.Allocator,
-        target_id: []const u8,
-        op: globals.ScopeKvOp,
-        key: []const u8,
-        value: []const u8,
-    ) anyerror!void = null,
-    scope_kv_ctx: ?*anyopaque = null,
+    /// Admin-tenant platform-capability trampolines (deployStarter /
+    /// releases.publish / scope().kv writes), bundled all-or-nothing.
+    /// Non-null on admin-handler requests; the worker passes opaque
+    /// `*Worker(opts)` ctx + concrete trampolines so its generic type
+    /// never leaks into globals.zig. Copied verbatim into
+    /// `DispatchState`. See `globals.PlatformCaps`.
+    platform_caps: ?globals.PlatformCaps = null,
     /// Phase 5 PR-3: trampoline backing
     /// `_system.continuation.resumeIfBound(send_id, event_json)` —
     /// the §6.4 held-sync resume hook called by the JS-shim
@@ -539,12 +511,7 @@ pub const Dispatcher = struct {
             .limiter = request.limiter,
             .instance_id = request.instance_id,
             .correlation_id = request.correlation_id orelse "",
-            .deploy_starter = request.deploy_starter,
-            .deploy_starter_ctx = request.deploy_starter_ctx,
-            .release_publish = request.release_publish,
-            .release_publish_ctx = request.release_publish_ctx,
-            .scope_kv_write = request.scope_kv_write,
-            .scope_kv_ctx = request.scope_kv_ctx,
+            .platform_caps = request.platform_caps,
             .resume_if_bound = request.resume_if_bound,
             .resume_if_bound_ctx = request.resume_if_bound_ctx,
             .cancel_fetch = request.cancel_fetch,
@@ -5302,8 +5269,10 @@ test "dispatch: platform.instances.deployStarter invokes trampoline with name" {
             .path = "/",
             .platform = pf.tenant,
             .root_writeset = &root_ws,
-            .deploy_starter = &DeployStarterRecorder.trampoline,
-            .deploy_starter_ctx = &rec,
+            .platform_caps = .{
+                .ctx = &rec,
+                .deploy_starter = &DeployStarterRecorder.trampoline,
+            },
         },
     );
     defer resp.deinit(testing.allocator);
@@ -5344,8 +5313,10 @@ test "dispatch: platform.instances.deployStarter throws coded InstanceNotFound" 
             .path = "/",
             .platform = pf.tenant,
             .root_writeset = &root_ws,
-            .deploy_starter = &DeployStarterRecorder.trampoline,
-            .deploy_starter_ctx = &rec,
+            .platform_caps = .{
+                .ctx = &rec,
+                .deploy_starter = &DeployStarterRecorder.trampoline,
+            },
         },
     );
     defer resp.deinit(testing.allocator);

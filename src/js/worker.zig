@@ -3128,11 +3128,11 @@ pub fn Worker(comptime opts: Options) type {
 
         /// Trampoline for `platform.instances.deployStarter(name)`.
         /// Wired into the admin-handler request via
-        /// `Request.deploy_starter` + `.deploy_starter_ctx`. The
-        /// pair lets globals.zig invoke this without depending on
-        /// the generic `Worker(opts)` type — the caller passes the
-        /// `*anyopaque` it received as `ctx`, we cast back to
-        /// `*Self`, and run starter-deploy with envelope-0 propose
+        /// `Request.platform_caps` (the `deploy_starter` fn + shared
+        /// `ctx`). The bundle lets globals.zig invoke this without
+        /// depending on the generic `Worker(opts)` type — the caller
+        /// passes the `*anyopaque` it received as `ctx`, we cast back
+        /// to `*Self`, and run starter-deploy with envelope-0 propose
         /// for the `_deploy/current` release pointer.
         ///
         /// Option-A shared tail for the 3 cross-tenant trampolines:

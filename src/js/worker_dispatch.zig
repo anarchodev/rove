@@ -2694,40 +2694,17 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // from acme's email bucket, not __admin__'s.
             .limiter = &worker.limiter,
             .instance_id = scope_inst.id,
-            // Deploy-starter trampoline. Only meaningful on admin-
-            // handler requests; customer requests have no platform
-            // capability, and the JS callable rejects them at the
-            // gate before ever reaching this fn pointer.
-            .deploy_starter = if (handler_inst.platform != null)
-                &@TypeOf(worker.*).deployStarterTrampoline
-            else
-                null,
-            .deploy_starter_ctx = if (handler_inst.platform != null)
-                @ptrCast(worker)
-            else
-                null,
-            // Release-publish trampoline. Admin-handler only —
-            // customer handlers don't see `platform.releases.publish`
-            // and the JS callable rejects pre-trampoline.
-            .release_publish = if (handler_inst.platform != null)
-                &@TypeOf(worker.*).releasePublishTrampoline
-            else
-                null,
-            .release_publish_ctx = if (handler_inst.platform != null)
-                @ptrCast(worker)
-            else
-                null,
-            // platform.scope(id).kv.{set,delete} cross-tenant write
-            // trampoline. Admin-handler only (gated same as the
-            // others). Reads go direct in globals.zig, no trampoline.
-            .scope_kv_write = if (handler_inst.platform != null)
-                &@TypeOf(worker.*).scopeKvWriteTrampoline
-            else
-                null,
-            .scope_kv_ctx = if (handler_inst.platform != null)
-                @ptrCast(worker)
-            else
-                null,
+            // Admin-handler platform capabilities, all-or-nothing:
+            // present iff this is an admin-handler request. Customer
+            // requests get none, and the JS callables reject at the
+            // gate before reaching any trampoline. Scope reads go
+            // direct in globals.zig (no trampoline).
+            .platform_caps = if (handler_inst.platform != null) .{
+                .ctx = @ptrCast(worker),
+                .deploy_starter = &@TypeOf(worker.*).deployStarterTrampoline,
+                .release_publish = &@TypeOf(worker.*).releasePublishTrampoline,
+                .scope_kv_write = &@TypeOf(worker.*).scopeKvWriteTrampoline,
+            } else null,
             // Phase 5 PR-3: §6.4 held-sync resume hook trampoline.
             // Available to every dispatch (the JS-shim
             // `__system/webhook_onresult` calls it on terminal);
