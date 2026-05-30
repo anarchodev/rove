@@ -409,6 +409,7 @@ pub fn flushLogs(worker: anytype) !void {
             "rove-js flushLogs: dropping {d}-record batch — lost leadership mid-tick",
             .{records.len},
         );
+        worker.log_records_dropped_total += records.len;
         return;
     }
 
@@ -427,6 +428,7 @@ pub fn flushLogs(worker: anytype) !void {
             "rove-js flushLogs: writeBatch ({d} records) failed: {s}",
             .{ records.len, @errorName(err) },
         );
+        worker.log_records_dropped_total += records.len;
         break :blk null;
     };
     const batch_key = batch_key_opt orelse return;
