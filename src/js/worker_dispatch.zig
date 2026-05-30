@@ -486,6 +486,97 @@ fn captureSuccess(
     worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, status, outcome, console_owned, exception_owned, s.tapes, s.correlation_id, .inbound, raft_seq);
 }
 
+/// The raft-pending sibling an in-flight success parks on, keyed by
+/// handler outcome: a stream first-hop → the stream sibling, else a
+/// continuation → the cont sibling, else a plain response. Stream
+/// takes priority over cont (a stream hop may also have opened a
+/// continuation, but it parks as a stream). One owner for the 3-way
+/// routing the finalize arms below otherwise hand-rolled four times.
+const ParkRoute = enum {
+    response,
+    cont,
+    stream,
+
+    fn of(s: *const SuccessRec) ParkRoute {
+        if (s.stream != null) return .stream;
+        if (s.cont != null) return .cont;
+        return .response;
+    }
+
+    /// Move the parked entity out of `request_out` into its sibling.
+    fn moveToSibling(self: ParkRoute, worker: anytype, server: anytype, ent: rove.Entity) !void {
+        try server.reg.move(ent, &server.request_out, switch (self) {
+            .stream => &worker.raft_pending_stream,
+            .cont => &worker.raft_pending_cont,
+            .response => &worker.raft_pending_response,
+        });
+    }
+
+    fn respondSource(self: ParkRoute) effect_mod.cmd.RespondOut.SourceColl {
+        return switch (self) {
+            .stream => .raft_pending_stream,
+            .cont => .raft_pending_cont,
+            .response => .raft_pending_response,
+        };
+    }
+
+    fn respondDest(self: ParkRoute) effect_mod.cmd.RespondOut.DestColl {
+        return switch (self) {
+            .stream => .stream_response_in,
+            .cont => .parked_continuations,
+            .response => .response_in,
+        };
+    }
+};
+
+/// Park every batch success on its raft-pending sibling: record cont/
+/// stream components, stamp `RaftWait`, move to the sibling, log the
+/// success. Shared by the barrier (read-only) and write-path finalize
+/// arms — both park identically once the propose is accepted. Returns
+/// the count parked (caller folds into `processed`).
+fn parkSuccessesOnSiblings(
+    worker: anytype,
+    server: anytype,
+    allocator: std.mem.Allocator,
+    anchor_id: []const u8,
+    successes: *std.ArrayList(SuccessRec),
+    seq: u64,
+) !usize {
+    const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
+    for (successes.items) |*s| {
+        // Capture the route BEFORE the record helpers null `s.cont` /
+        // `s.stream` (contRecordIfAny:307 / streamRecordIfAnyAt:421);
+        // the move must see the pre-record outcome.
+        const route = ParkRoute.of(s);
+        try contRecordIfAny(worker, server, allocator, anchor_id, s); // sets the entity's ContDescriptor component
+        try streamRecordIfAnyAt(worker, server, allocator, anchor_id, s); // sets the entity's stream components
+        try server.reg.set(s.ent, &server.request_out, RaftWait, .{ .seq = seq, .deadline_ns = deadline_ns });
+        try route.moveToSibling(worker, server, s.ent);
+        captureSuccess(worker, anchor_id, s, s.status_code, .ok, seq);
+    }
+    return successes.items.len;
+}
+
+/// Emit a move-only `Cmd.respond` per success onto `cmds`, routing
+/// each entity's raft_pending sibling → its commit-time destination
+/// (response_in / parked_continuations / stream_response_in) so
+/// `interpretCmd` performs the move at commit. Append-failure skips
+/// that entity (same `catch continue` posture both arms had).
+fn appendRespondCmds(
+    allocator: std.mem.Allocator,
+    cmds: *effect_mod.cmd.BufferedCmds,
+    successes: *std.ArrayList(SuccessRec),
+) void {
+    for (successes.items) |*s| {
+        const route = ParkRoute.of(s);
+        cmds.items.append(allocator, .{ .respond = .{
+            .entity = s.ent,
+            .source = route.respondSource(),
+            .dest = route.respondDest(),
+        } }) catch continue;
+    }
+}
+
 fn finalizeBatch(
     worker: anytype,
     anchor: *const tenant_mod.Instance,
@@ -587,31 +678,17 @@ fn finalizeBatch(
                 return processed;
             };
             // Propose accepted: transfer txn ownership to the drain
-            // (parked on the barrier seq), park each success entity
-            // on the right raft-pending sibling. Phase 5: the entity's
-            // collection encodes its commit destination (no
-            // discriminator field check in drainRaftPending).
+            // (parked on the barrier seq). Mirror the write-path branch
+            // below exactly — stage commands, park the kv-wake unit,
+            // THEN park the success entities. Order matters: the
+            // respond Cmds must be built from live handler outcomes
+            // (`appendRespondCmds`) BEFORE `parkSuccessesOnSiblings`
+            // nulls `s.cont`/`s.stream`, so a stream/cont in the
+            // barrier path gets `source`/`dest` matching where it
+            // parks — not the stale `raft_pending_response` →
+            // `response_in` the pre-null read used to emit.
             try worker.pending_txns.park(allocator, seq, txn);
-            const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
-            for (successes.items) |*s| {
-                const is_stream = s.stream != null;
-                const is_cont = s.cont != null;
-                try contRecordIfAny(worker, server, allocator, anchor_id, s); // sets the entity's ContDescriptor component
-                try streamRecordIfAnyAt(worker, server, allocator, anchor_id, s); // sets the entity's stream components
-                try server.reg.set(s.ent, &server.request_out, RaftWait, .{
-                    .seq = seq,
-                    .deadline_ns = deadline_ns,
-                });
-                if (is_stream) {
-                    try server.reg.move(s.ent, &server.request_out, &worker.raft_pending_stream);
-                } else if (is_cont) {
-                    try server.reg.move(s.ent, &server.request_out, &worker.raft_pending_cont);
-                } else {
-                    try server.reg.move(s.ent, &server.request_out, &worker.raft_pending_response);
-                }
-                captureSuccess(worker, anchor_id, s, s.status_code, .ok, seq);
-                processed += 1;
-            }
+
             // Effect-reification Phase 4.1.2: the barrier path's
             // batch had no writes BUT did read speculative state;
             // the http.fetch'es it issued may have computed on
@@ -636,27 +713,7 @@ fn finalizeBatch(
                     break;
                 };
             }
-            for (successes.items) |*s| {
-                const is_stream2 = s.stream != null;
-                const is_cont2 = s.cont != null;
-                const r_src: effect_mod.cmd.RespondOut.SourceColl = if (is_stream2)
-                    .raft_pending_stream
-                else if (is_cont2)
-                    .raft_pending_cont
-                else
-                    .raft_pending_response;
-                const r_dest: effect_mod.cmd.RespondOut.DestColl = if (is_stream2)
-                    .stream_response_in
-                else if (is_cont2)
-                    .parked_continuations
-                else
-                    .response_in;
-                barrier_cmds.items.append(allocator, .{ .respond = .{
-                    .entity = s.ent,
-                    .source = r_src,
-                    .dest = r_dest,
-                } }) catch continue;
-            }
+            appendRespondCmds(allocator, &barrier_cmds, successes);
             // Items that successfully moved to barrier_cmds are
             // now owned by it; clear the source so the caller's
             // defer doesn't double-free.
@@ -669,6 +726,12 @@ fn finalizeBatch(
             // parkKvWakes consumes barrier_cmds unconditionally
             // (success or its errdefer). Caller-side copy is now
             // stale; do not free.
+
+            // Phase 5: now park each success on the raft-pending
+            // sibling matching its outcome (drainRaftPending dispatches
+            // by collection membership). Last, because it nulls the
+            // cont/stream flags the respond loop above just read.
+            processed += try parkSuccessesOnSiblings(worker, server, allocator, anchor_id, successes, seq);
             successes.clearRetainingCapacity();
             return processed;
         }
@@ -832,57 +895,15 @@ fn finalizeBatch(
     // Post-Option-2 every path that parks an entity in
     // raft_pending_X also emits Cmd.respond, so `drainEntityArm`
     // unconditionally skips the move on commit.
-    for (successes.items) |*s| {
-        const is_stream = s.stream != null;
-        const is_cont = s.cont != null;
-        const respond_src: effect_mod.cmd.RespondOut.SourceColl = if (is_stream)
-            .raft_pending_stream
-        else if (is_cont)
-            .raft_pending_cont
-        else
-            .raft_pending_response;
-        const respond_dest: effect_mod.cmd.RespondOut.DestColl = if (is_stream)
-            .stream_response_in
-        else if (is_cont)
-            .parked_continuations
-        else
-            .response_in;
-        write_path_cmds.items.append(allocator, .{ .respond = .{
-            .entity = s.ent,
-            .source = respond_src,
-            .dest = respond_dest,
-        } }) catch continue;
-    }
+    appendRespondCmds(allocator, &write_path_cmds, successes);
     worker_mod.parkKvWakes(worker, seq, anchor_id, writeset, write_path_cmds) catch |perr|
         std.log.warn("rove-js parkKvWakes (tenant={s}) failed: {s}", .{ anchor_id, @errorName(perr) });
     // parkKvWakes consumed write_path_cmds unconditionally.
 
-    const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
-    for (successes.items) |*s| {
-        const is_stream = s.stream != null;
-        const is_cont = s.cont != null;
-        try contRecordIfAny(worker, server, allocator, anchor_id, s); // sets the entity's ContDescriptor component
-        try streamRecordIfAnyAt(worker, server, allocator, anchor_id, s); // sets the entity's stream components
-        try server.reg.set(s.ent, &server.request_out, RaftWait, .{
-            .seq = seq,
-            .deadline_ns = deadline_ns,
-        });
-        // Phase 5: park on the right raft-pending sibling so
-        // drainRaftPending's dispatch is collection-membership, not a
-        // discriminator field-check.
-        if (is_stream) {
-            try server.reg.move(s.ent, &server.request_out, &worker.raft_pending_stream);
-        } else if (is_cont) {
-            try server.reg.move(s.ent, &server.request_out, &worker.raft_pending_cont);
-        } else {
-            try server.reg.move(s.ent, &server.request_out, &worker.raft_pending_response);
-        }
-
-        // Write-path success — stamp the propose seq so flushLogs can
-        // advance the per-worker `last_uploaded_seq` checkpoint.
-        captureSuccess(worker, anchor_id, s, s.status_code, .ok, seq);
-        processed += 1;
-    }
+    // Phase 5: each success parks on the raft-pending sibling matching
+    // its outcome so drainRaftPending's dispatch is collection-
+    // membership, not a discriminator field-check.
+    processed += try parkSuccessesOnSiblings(worker, server, allocator, anchor_id, successes, seq);
     successes.clearRetainingCapacity();
     return processed;
 }
