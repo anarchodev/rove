@@ -96,23 +96,14 @@ pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
 /// (Date.now is pinned per-request via JS_SetDateNow); count
 /// drops 5 → 4. The header's `seed` + `timestamp_ns` scalars are
 /// now the entire input for the random + clock sources.
-/// Pre-launch — no v3 raft logs to migrate, hard cutover.
-/// Current writer version. Parser accepts both this and
-/// `READSET_VERSION_MIN_SUPPORTED`. 4 → 5 by
-/// `docs/streaming-model.md §7` Phase 5: BodyRef wire shape is
-/// unchanged (`{u64 batch_id, u64 offset, u32 len}`), but the key
-/// template it resolves to switches from per-(tenant, worker)
-/// (`{tenant}/readset-blobs/w{worker_id}/{batch_id:0>20}`) to the
-/// cross-tenant pool (`_pool/{batch_id:0>20}`). Readers carry
-/// `ParsedReadset.version` so the GC / replay paths pick the
-/// matching template.
+/// Pre-launch — hard cutover, no old raft logs to migrate. The parser
+/// accepts exactly this version and rejects anything else loudly; the
+/// version byte is a format guard, not a compatibility band. BodyRefs
+/// resolve through the one cross-tenant pool key template
+/// (`_pool/{batch_id:0>20}`). When the format changes, bump this and
+/// delete the old shape in the same change — do not add a
+/// min-supported fallback.
 pub const READSET_VERSION: u16 = 5;
-/// Oldest version the parser accepts. Pre-launch only — once
-/// production raft logs exist for any version below this we add a
-/// compatibility band here. Today the only pre-launch state worth
-/// reading is local-bench `_pool/` data, so we keep v4 as a fallback
-/// for any leftover dev clusters running Phase 3.
-pub const READSET_VERSION_MIN_SUPPORTED: u16 = 4;
 pub const READSET_CHANNEL_COUNT: usize = 4;
 
 /// Renumbered contiguously by `docs/primitive-gaps.md` §9 +
@@ -127,14 +118,14 @@ pub const Channel = enum(u16) {
     module = 1,
     /// `docs/readset-replication-plan.md` Phase 2c-2. One entry per
     /// `http.fetch` chunk activation; each entry records the
-    /// `BodyRef` naming the bytes in the per-tenant readset-blob
-    /// (`{tenant}/readset-blobs/{batch_id}`). Replay resolves the
-    /// bytes via `BlobStore.getRange` rather than reading them
-    /// inline from the log blob.
+    /// `BodyRef` naming the bytes in the cross-tenant pool blob
+    /// (`_pool/{batch_id}`). Replay resolves the bytes via
+    /// `BlobStore.getRange` rather than reading them inline from the
+    /// log blob.
     fetch_responses = 2,
     /// `docs/readset-replication-plan.md` Phase 2d. Zero or one entry
     /// per inbound dispatch. Captures the request body's `BodyRef`
-    /// (the bytes streamed into the per-tenant readset-blob) so
+    /// (the bytes streamed into the cross-tenant pool blob) so
     /// replay can resolve `request.body` via `BlobStore.getRange`
     /// instead of the inline `request_body_bytes` capture.
     /// Zero entries when the request had no body.
@@ -276,13 +267,13 @@ pub const Entry = union(Channel) {
     };
 
     /// One inbound request's body — either by-reference into the
-    /// per-tenant readset-blob OR carried inline in the entry
+    /// cross-tenant pool blob OR carried inline in the entry
     /// itself (`docs/readset-replication-plan.md` Phase 4 inline
     /// small-body path). The two modes are discriminated by
     /// `body_ref.batch_id`:
     ///
     /// - `body_ref.batch_id != bodies_mod.NO_BATCH`: bytes live
-    ///   at `(tenant)/readset-blobs/{batch_id}` at the given
+    ///   at `_pool/{batch_id}` at the given
     ///   offset+len; `inline_bytes` is empty. Used for bodies
     ///   over the inline threshold (16 KB today); the dispatch
     ///   loop parks the request until the buffer's batch is
@@ -484,7 +475,7 @@ pub const Tape = struct {
     /// caller chose the small-body inline path (`body_ref.batch_id
     /// == bodies_mod.NO_BATCH`); empty for the by-reference path
     /// (`body_ref.batch_id != NO_BATCH`, bytes live in
-    /// `(tenant)/readset-blobs/{batch_id}`). Both slices are
+    /// `_pool/{batch_id}`). Both slices are
     /// dup'd into tape storage.
     pub fn appendTriggerPayload(
         self: *Tape,
@@ -698,11 +689,6 @@ pub const Readset = struct {
 /// validation today and a future slice will materialize tapes for
 /// follower-side tape upload.
 pub const ParsedReadset = struct {
-    /// On-wire version this readset was serialized with. Carried so
-    /// `BodyRef` resolvers (GC, replay) can pick the matching key
-    /// template — `docs/streaming-model.md §7` Phase 5 split
-    /// v4 (per-tenant lane) from v5 (cross-tenant `_pool/`).
-    version: u16,
     timestamp_ns: i64,
     seed: u64,
     /// Borrowed slices into the input bytes, one per channel in
@@ -721,9 +707,7 @@ pub fn parseReadset(bytes: []const u8) (ParseError || log_mod.LogHeaderParseErro
     const magic = std.mem.readInt(u32, bytes[0..4], .big);
     if (magic != READSET_MAGIC) return ParseError.BadMagic;
     const version = std.mem.readInt(u16, bytes[4..6], .big);
-    if (version > READSET_VERSION or version < READSET_VERSION_MIN_SUPPORTED) {
-        return ParseError.UnsupportedVersion;
-    }
+    if (version != READSET_VERSION) return ParseError.UnsupportedVersion;
     const timestamp_ns = std.mem.readInt(i64, bytes[6..14], .big);
     const seed = std.mem.readInt(u64, bytes[14..22], .big);
 
@@ -751,7 +735,6 @@ pub fn parseReadset(bytes: []const u8) (ParseError || log_mod.LogHeaderParseErro
     else
         try log_mod.parseLogHeader(lh_slice);
     return .{
-        .version = version,
         .timestamp_ns = timestamp_ns,
         .seed = seed,
         .blobs = blobs,
