@@ -601,9 +601,11 @@ pub const BlobCoordinator = struct {
         const removed = w.refs.fetchRemove(seq);
         w.mu.unlock();
         // Ref not set yet ⇒ not durable ⇒ caller should retry. (An
-        // already-released seq also lands here, but a correct consumer
-        // releases each seq once-to-success, so this is the not-yet
-        // case.)
+        // already-released seq also lands here, by contract — see the
+        // "already-released / unknown seq returns false" test. The
+        // double-QUEUE regression that would make a caller retry such
+        // a false forever is caught worker-side in `queueCoordRelease`,
+        // not here, so this stays a pure value query.)
         const kv = removed orelse return false;
         const batch_id: u64 = switch (kv.value) {
             .durable => |d| d.ref.batch_id,

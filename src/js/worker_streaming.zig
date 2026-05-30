@@ -2553,6 +2553,22 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
 /// because in-window chunks are consumed before their submit is
 /// durable; `drainSpools` retries `coord.release` until it succeeds.
 fn queueCoordRelease(worker: anytype, worker_id: u8, seq: u64) void {
+    // Once-to-queue guard (runtime-safety builds only): each consumed/
+    // dropped chunk is released exactly once. Queueing the same
+    // (worker_id, seq) twice would make `drainCoordReleases` retry the
+    // second copy forever — `coord.release` returns `false` for an
+    // already-released seq by contract (indistinguishable from
+    // not-yet-durable), so the duplicate never drains, growing
+    // `coord_pending_releases` unboundedly. Catch the double-queue at
+    // the source rather than chasing the symptom downstream.
+    if (std.debug.runtime_safety) {
+        for (worker.coord_pending_releases.items) |p| {
+            if (p.worker_id == worker_id and p.seq == seq) std.debug.panic(
+                "queueCoordRelease: double queue of worker={d} seq={d} (would retry forever)",
+                .{ worker_id, seq },
+            );
+        }
+    }
     worker.coord_pending_releases.append(worker.allocator, .{ .worker_id = worker_id, .seq = seq }) catch {
         // OOM: drop the deferred release. The coordinator batch leaks
         // until coord deinit — rare, bounded by this one chunk.
