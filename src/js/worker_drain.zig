@@ -513,30 +513,18 @@ fn proposeAndParkContResume(
     txn.releaseLease();
 
     // Slice 3d-fetch: serialize the cont-resume's readset (with the
-    // caller-supplied LogHeader stamped into it, slice 5a-1) and
-    // wrap as a 1-item readset list for the anchor envelope so the
-    // resumed activation is replayable on any follower (3d-multi
-    // promoted the wire to a list, so single-readset producers
-    // must wrap). Best-effort — any failure logs and we propose
-    // with empty rs_bytes (same as pre-3d behavior).
-    const rs_blob: []u8 = readset.serialize(allocator, log_header_opt) catch |serr| blk: {
+    // caller-supplied LogHeader stamped into it, slice 5a-1) wrapped
+    // as the 1-item readset list the anchor envelope expects, so the
+    // resumed activation is replayable on any follower. Best-effort —
+    // any failure logs and we propose with empty rs_bytes (same as
+    // pre-3d behavior).
+    const rs_bytes: []u8 = tape_mod.encodeSingleReadset(allocator, readset, log_header_opt) catch |err| blk: {
         std.log.warn(
-            "rove-js cont-resume: readset.serialize tenant={s}: {s}",
-            .{ tenant_id, @errorName(serr) },
+            "rove-js cont-resume: encodeSingleReadset tenant={s}: {s}",
+            .{ tenant_id, @errorName(err) },
         );
         break :blk &.{};
     };
-    defer if (rs_blob.len > 0) allocator.free(rs_blob);
-    const rs_bytes: []u8 = if (rs_blob.len > 0)
-        tape_mod.encodeReadsetList(allocator, &.{rs_blob}) catch |err| blk: {
-            std.log.warn(
-                "rove-js cont-resume: encodeReadsetList tenant={s}: {s}",
-                .{ tenant_id, @errorName(err) },
-            );
-            break :blk &.{};
-        }
-    else
-        &.{};
     defer if (rs_bytes.len > 0) allocator.free(rs_bytes);
     const seq = raft_propose.proposeBatch(worker, writeset, tenant_id, rs_bytes) catch |err| {
         // On propose failure: rollback txn, destroy it (caller's
