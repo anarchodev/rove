@@ -185,6 +185,38 @@ def main() -> int:
             f"inline RAM peak={peak}B (≤ {peak_cap}B cap, body={len(EXPECTED_BODY)}B)"
         )
 
+        # 5. P6 (docs/chunk-spool-plan.md): coordinator retained-RAM
+        #    cleanup. Fire several more spool requests; each submits its
+        #    chunks to the coordinator, which the spool then consumes +
+        #    releases. With refcount-release the coordinator's retained
+        #    batch count must stay BOUNDED (drains back to ~0), not
+        #    accumulate one-batch-per-request-forever as it did pre-P6.
+        def retained_batches() -> int:
+            rrx = curl(admin_cc, metrics_url, method="GET",
+                       headers={"Authorization": f"Bearer {TOKEN}"})
+            for line in rrx.body.splitlines() if rrx.status == 200 else []:
+                if line.startswith("coord_retained_batches "):
+                    return int(line.split()[-1])
+            sys.exit("FAIL coord_retained_batches missing from metrics")
+
+        for _ in range(5):
+            rp = curl(cc, f"{acme_origin}/spoolsink?url={big_url}", method="GET", timeout=60.0)
+            if rp.status != 200 or rp.body != EXPECTED_BODY:
+                sys.exit(f"FAIL P6 repeat /spoolsink status={rp.status}")
+        time.sleep(0.5)  # let in-flight releases settle
+        retained = retained_batches()
+        # Generous bound: a handful of in-flight batches is fine; the
+        # failure mode (pre-P6) is unbounded growth (≥ one per request).
+        if retained > 4:
+            sys.exit(
+                f"FAIL coord_retained_batches={retained} after 6 spool requests — "
+                "coordinator batches are accumulating (P6 release not freeing them)"
+            )
+        print(
+            f"ok  P6: coord_retained_batches={retained} after 6 requests — "
+            "bounded (refcount-release drains consumed batches)"
+        )
+
     print()
     print(
         "bound-fetch large-body smoke passed (docs/chunk-spool-plan.md Phase 3: "

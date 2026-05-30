@@ -2375,6 +2375,13 @@ pub fn dropSpool(worker: anytype, fetch_id: []const u8) void {
     // Count chunks discarded unconsumed (cancel / disconnect). A clean
     // terminal drop has already popped every entry, so this is 0 there.
     worker.bound_fetch_spool_dropped_total += entry.value.len();
+    // P6 (docs/chunk-spool-plan.md): release the coordinator-retained
+    // copy of every still-spooled chunk we're discarding, so a
+    // cancel/disconnect of a backed-up fetch doesn't leak its backlog
+    // in coordinator RAM.
+    for (entry.value.entries.items) |*e| {
+        if (e.event.coord_submitted) queueCoordRelease(worker, e.event.coord_worker_id, e.event.coord_seq);
+    }
     entry.value.deinit(worker.allocator);
     worker.allocator.destroy(entry.value);
     worker.allocator.free(entry.key);
@@ -2483,8 +2490,10 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
                         .{ key, wid, h.event.coord_seq, @errorName(err) },
                     );
                     // Drop just this chunk (free + remove), keep the
-                    // rest of the spool.
+                    // rest of the spool. P6: queue its coord copy for
+                    // release (deferred — see queueCoordRelease).
                     var bad = sp.popHead();
+                    if (bad.coord_submitted) queueCoordRelease(worker, bad.coord_worker_id, bad.coord_seq);
                     components_mod.UpstreamFetchEvent.deinitItem(&bad, worker.allocator);
                     continue;
                 };
@@ -2504,6 +2513,14 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
         // already gone).
         var ev = sp.popHead();
         const final = ev.final;
+        // P6 (docs/chunk-spool-plan.md): capture the coord identity
+        // before resume consumes `ev`, so we can release the
+        // coordinator's retained copy of this chunk after it's
+        // consumed (every bound chunk was submitted in Phase 1, inline
+        // or evicted — releasing bounds coord RAM to the live backlog).
+        const rel_submitted = ev.coord_submitted;
+        const rel_wid = ev.coord_worker_id;
+        const rel_seq = ev.coord_seq;
         if (ready_cont) {
             worker_drain.resumeBoundFetchChain(worker, held_ent, &ev);
         } else {
@@ -2514,6 +2531,12 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
             // collection internally.
             resumeBoundFetchStream(worker, held_ent, &ev);
         }
+        // P6: chunk consumed — queue its coordinator-retained copy for
+        // release. Deferred (not direct) because an in-window chunk is
+        // consumed from inline bytes BEFORE its submit is durable, so a
+        // direct release would miss the not-yet-set ref. `drainSpools`
+        // retries until durable.
+        if (rel_submitted) queueCoordRelease(worker, rel_wid, rel_seq);
         if (final) {
             worker.unregisterBoundFetch(key);
             dropSpool(worker, key);
@@ -2522,6 +2545,34 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
         // Non-final: loop. If the resume wrote + moved the entity,
         // the next iteration's isMoving / raft_pending check defers
         // the following head.
+    }
+}
+
+/// `docs/chunk-spool-plan.md` P6: queue a consumed/dropped bound
+/// chunk's coordinator release for retry. Deferred (not direct)
+/// because in-window chunks are consumed before their submit is
+/// durable; `drainSpools` retries `coord.release` until it succeeds.
+fn queueCoordRelease(worker: anytype, worker_id: u8, seq: u64) void {
+    worker.coord_pending_releases.append(worker.allocator, .{ .worker_id = worker_id, .seq = seq }) catch {
+        // OOM: drop the deferred release. The coordinator batch leaks
+        // until coord deinit — rare, bounded by this one chunk.
+        std.log.warn("rove-js chunk-spool: coord_pending_releases append OOM; release dropped", .{});
+    };
+}
+
+/// Retry every deferred coordinator release; keep the ones whose
+/// submit isn't durable yet (`release` returns false). Drained each
+/// tick from `drainSpools` regardless of whether any spool is active.
+fn drainCoordReleases(worker: anytype) void {
+    const coord = worker.node.blob_coordinator orelse return;
+    var i: usize = 0;
+    while (i < worker.coord_pending_releases.items.len) {
+        const p = worker.coord_pending_releases.items[i];
+        if (coord.release(p.worker_id, p.seq)) {
+            _ = worker.coord_pending_releases.swapRemove(i); // freed — drop
+        } else {
+            i += 1; // not durable yet — retry next tick
+        }
     }
 }
 
@@ -2534,6 +2585,9 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
 /// mid-walk. Cheap no-op when no bound fetch is streaming.
 pub fn drainSpools(worker: anytype) void {
     const allocator = worker.allocator;
+    // P6: always retry deferred coord releases (a dropped spool may
+    // have queued some even when no spool is currently active).
+    drainCoordReleases(worker);
     if (worker.bound_fetch_spools.count() == 0) return;
 
     var keys: std.ArrayListUnmanaged([]u8) = .empty;

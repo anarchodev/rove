@@ -394,6 +394,11 @@ pub const MAX_STREAM_ACTIVATIONS: u32 = 1000;
 /// Override via `ROVE_BOUND_FETCH_SPOOL_DEPTH`.
 pub const DEFAULT_BOUND_FETCH_SPOOL_DEPTH: usize = 4;
 
+/// `docs/chunk-spool-plan.md` P6: a deferred `coord.release(worker_id,
+/// seq)` for a consumed/dropped bound chunk whose coordinator submit
+/// wasn't durable yet at consume time. Retried in `drainSpools`.
+pub const CoordPendingRelease = struct { worker_id: u8, seq: u64 };
+
 /// Read the `ROVE_BOUND_FETCH_SPOOL_DEPTH` env override, falling back
 /// to `DEFAULT_BOUND_FETCH_SPOOL_DEPTH`. A 0 / unparseable value is
 /// clamped to 1 (depth 0 would evict the head itself, forcing a coord
@@ -2501,6 +2506,16 @@ pub fn Worker(comptime opts: Options) type {
         /// stability across rehash. Keys are allocator-owned fetch_id
         /// dupes; freed on `dropSpool` + on shutdown (`destroy`).
         bound_fetch_spools: std.StringHashMapUnmanaged(*chunk_spool_mod.ChunkSpool) = .empty,
+        /// `docs/chunk-spool-plan.md` P6: deferred coordinator releases
+        /// for consumed/dropped bound chunks. The spool consumes
+        /// in-window chunks from their inline bytes BEFORE their
+        /// coordinator submit is durable (its ref isn't set yet), so a
+        /// release-at-consume can't free them. Instead the (worker_id,
+        /// seq) is queued here and `drainSpools` retries `coord.release`
+        /// each tick until it succeeds (durableSeq advances). Leftovers
+        /// at shutdown are dropped (lossy-on-shutdown, like the log
+        /// flusher). Touched only by the worker thread.
+        coord_pending_releases: std.ArrayListUnmanaged(CoordPendingRelease) = .empty,
         /// `docs/chunk-spool-plan.md` Phase 3: K, the per-fetch RAM
         /// window depth. Chunks within K of a spool's head keep their
         /// inline bytes; chunks pushed beyond K evict their inline
@@ -3014,6 +3029,9 @@ pub fn Worker(comptime opts: Options) type {
                 }
                 self.bound_fetch_spools.deinit(allocator);
             }
+            // P6: deferred coord releases — drop at shutdown (the coord
+            // is torn down separately; lossy-on-shutdown is fine).
+            self.coord_pending_releases.deinit(allocator);
             // Phase 3: same pattern for the bound_send_entities map.
             {
                 var it = self.bound_send_entities.iterator();

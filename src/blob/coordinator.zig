@@ -174,7 +174,10 @@ const Submission = struct {
 
 const RefSlot = union(enum) {
     durable: DurableSlot,
-    failed,
+    /// Terminal PUT failure. Carries the owning `SealedBatch.batch_id`
+    /// (or 0 for a `failCollected` submission that never reached a
+    /// batch) so `release` can still find + refcount-free the batch.
+    failed: u64,
 };
 
 /// A committed submission's outcome: the wire `BodyRef` plus a
@@ -211,10 +214,19 @@ const SealedBatch = struct {
     /// passed to BlobStore.put. Freed after PUT completes
     /// (committed OR failed — no longer needed).
     payload: ?[]u8 = null,
+    /// `docs/chunk-spool-plan.md` P6 (coordinator retained-RAM
+    /// cleanup): count of entries not yet `release`d by their
+    /// consumer. Initialized to `entries.len` at retain; each
+    /// `release` decrements it and frees that entry's bytes; when it
+    /// hits 0 the whole batch is freed (it's the unbounded leak today
+    /// — `retained` kept every batch forever). Guarded by `retained_mu`.
+    live: usize = 0,
 
     fn deinit(self: *SealedBatch, allocator: std.mem.Allocator) void {
         for (self.entries.items) |*e| {
-            allocator.free(e.bytes);
+            // `release` frees consumed entries' bytes + clears them to
+            // empty, so only free what's left.
+            if (e.bytes.len > 0) allocator.free(e.bytes);
         }
         self.entries.deinit(allocator);
         if (self.payload) |p| allocator.free(p);
@@ -271,11 +283,16 @@ pub const BlobCoordinator = struct {
     /// executor_size, waking the drainer to seal another batch.
     exec_slack_cond: std.Thread.Condition = .{},
 
-    /// All sealed batches ever produced, retained for BodyRef
-    /// dereference. Phase 1 keeps them forever; production needs
-    /// a release/refcount mechanism (out of scope here).
+    /// Sealed batches awaiting consumption, retained for `bodyRef` /
+    /// `readBody` dereference. `docs/chunk-spool-plan.md` P6: each
+    /// batch is refcounted by its un-`release`d entries (`SealedBatch
+    /// .live`) and freed when fully consumed — no longer kept forever.
+    /// `retained_by_batch` is the O(1) `batch_id → *SealedBatch` index
+    /// `release` uses (the `retained` list is the iteration/shutdown
+    /// set). Both guarded by `retained_mu`.
     retained_mu: std.Thread.Mutex = .{},
     retained: std.ArrayListUnmanaged(*SealedBatch) = .empty,
+    retained_by_batch: std.AutoHashMapUnmanaged(u64, *SealedBatch) = .empty,
 
     /// Local-mode batch_id source — used when `config.reservation`
     /// is null. Starts at 1 (skips the `NO_BATCH = 0` sentinel).
@@ -400,12 +417,13 @@ pub const BlobCoordinator = struct {
         }
         self.exec_queue.deinit(self.allocator);
 
-        // Free retained batches (BodyRef storage).
+        // Free any still-retained (un-consumed) batches + the index.
         for (self.retained.items) |b| {
             b.deinit(self.allocator);
             self.allocator.destroy(b);
         }
         self.retained.deinit(self.allocator);
+        self.retained_by_batch.deinit(self.allocator);
 
         self.allocator.free(self.executor_threads);
         self.allocator.destroy(self);
@@ -488,6 +506,17 @@ pub const BlobCoordinator = struct {
         self.drain_mu.unlock();
     }
 
+    /// Count of retained (sealed-but-not-fully-consumed) batches —
+    /// `docs/chunk-spool-plan.md` P6 RAM diagnostic. With refcount
+    /// release this stays at the live submitted-but-unconsumed
+    /// backlog; pre-P6 it grew without bound (every batch ever).
+    /// Exposed on `/_system/metrics` as `coord_retained_batches`.
+    pub fn retainedBatchCount(self: *Self) usize {
+        self.retained_mu.lock();
+        defer self.retained_mu.unlock();
+        return self.retained.items.len;
+    }
+
     /// Per-worker high water mark — every submission on this
     /// worker's queue with `seq < return value` is durable (or
     /// terminally failed; check `bodyRef(seq)` to distinguish).
@@ -540,6 +569,75 @@ pub const BlobCoordinator = struct {
             .durable => |d| allocator.dupe(u8, d.bytes) catch Error.PutFailed,
             .failed => Error.PutFailed,
         };
+    }
+
+    /// `docs/chunk-spool-plan.md` P6: a consumer is DONE with a
+    /// submission — it has called `bodyRef`/`readBody` for the last
+    /// time. Drop the `refs` entry, free the submission's retained
+    /// bytes, and free the whole `SealedBatch` once all its entries are
+    /// released. This is the retained-RAM bound: coordinator memory
+    /// stays at the live submitted-but-unconsumed backlog instead of
+    /// growing forever.
+    ///
+    /// Returns `true` if the submission's ref was found + freed;
+    /// `false` if its ref isn't set yet (the batch hasn't been PUT, so
+    /// `durableSeq` hasn't passed `seq`) — the caller must RETRY later
+    /// (e.g. the spool consumes in-window chunks from their inline
+    /// bytes *before* their coordinator submit is durable; it defers
+    /// the release and retries once durable). A `false` return is NOT a
+    /// no-op-forever: durableSeq always advances, so a retry eventually
+    /// succeeds.
+    ///
+    /// MUST be called at most once-to-success per submission, by its
+    /// consumer. The durable copy lives in S3, so releasing never
+    /// affects replay.
+    pub fn release(self: *Self, worker_id: u8, seq: u64) bool {
+        if (worker_id >= self.config.worker_count) return true;
+        const w = &self.workers[worker_id];
+
+        // Drop the ref first (no future bodyRef/readBody can read the
+        // soon-to-be-freed bytes), capturing the owning batch_id.
+        w.mu.lock();
+        const removed = w.refs.fetchRemove(seq);
+        w.mu.unlock();
+        // Ref not set yet ⇒ not durable ⇒ caller should retry. (An
+        // already-released seq also lands here, but a correct consumer
+        // releases each seq once-to-success, so this is the not-yet
+        // case.)
+        const kv = removed orelse return false;
+        const batch_id: u64 = switch (kv.value) {
+            .durable => |d| d.ref.batch_id,
+            .failed => |bid| bid, // 0 ⇒ no batch (failCollected)
+        };
+        if (batch_id == 0) return true;
+
+        // Free this submission's bytes; free the batch when fully
+        // consumed.
+        self.retained_mu.lock();
+        defer self.retained_mu.unlock();
+        // Ref existed but batch already gone (shouldn't happen — the
+        // ref is dropped only here) — treat as released.
+        const batch = self.retained_by_batch.get(batch_id) orelse return true;
+        for (batch.entries.items) |*e| {
+            if (e.worker_id == worker_id and e.seq == seq) {
+                if (e.bytes.len > 0) self.allocator.free(e.bytes);
+                e.bytes = &.{};
+                break;
+            }
+        }
+        if (batch.live > 0) batch.live -= 1;
+        if (batch.live == 0) {
+            _ = self.retained_by_batch.remove(batch_id);
+            for (self.retained.items, 0..) |b, i| {
+                if (b == batch) {
+                    _ = self.retained.swapRemove(i);
+                    break;
+                }
+            }
+            batch.deinit(self.allocator);
+            self.allocator.destroy(batch);
+        }
+        return true;
     }
 
     /// Test helper: block until seqs `0..target_exclusive` are all
@@ -727,7 +825,10 @@ pub const BlobCoordinator = struct {
         for (subs) |sub| {
             const w = &self.workers[sub.worker_id];
             w.mu.lock();
-            w.refs.put(self.allocator, sub.seq, .failed) catch {};
+            // batch_id 0: this submission never reached a SealedBatch
+            // (failed at drain/seal), and its bytes are freed right
+            // below — `release` finds no batch to refcount.
+            w.refs.put(self.allocator, sub.seq, .{ .failed = 0 }) catch {};
             self.recomputeDurableSeqLocked(w);
             w.cond.broadcast();
             w.mu.unlock();
@@ -872,6 +973,21 @@ pub const BlobCoordinator = struct {
         self.allocator.free(payload);
         batch.payload = null;
 
+        // P6 ordering: retain + index the batch BEFORE advancing any
+        // worker's `durable_seq` below. A consumer that observes the
+        // HWM advance may call `release` immediately; if the batch
+        // weren't indexed yet, that release would miss it and `live`
+        // would never reach 0 (a leak). Retaining first closes that
+        // race — the batch is always findable by the time its seqs
+        // are durable.
+        batch.live = batch.entries.items.len;
+        self.retained_mu.lock();
+        self.retained.append(self.allocator, batch) catch
+            std.log.warn("rove-blob coordinator: retained.append OOM", .{});
+        self.retained_by_batch.put(self.allocator, batch.batch_id, batch) catch
+            std.log.warn("rove-blob coordinator: retained_by_batch.put OOM", .{});
+        self.retained_mu.unlock();
+
         // Per-entry: update each (worker_id, seq) refs slot + advance
         // durable_seq. Cross-tenant pool intentionally mixes workers
         // inside one batch so we walk per-entry, not per-batch.
@@ -885,29 +1001,21 @@ pub const BlobCoordinator = struct {
                         .offset = entry.offset,
                         .len = @intCast(entry.bytes.len),
                     },
-                    // Borrowed view of the retained submission bytes
-                    // (the SealedSubEntry owns them until coord deinit;
-                    // the batch is retained just below, so this slice
-                    // stays valid for every later `readBody`).
+                    // Borrowed view of the retained submission bytes.
+                    // The SealedSubEntry owns them until the entry is
+                    // `release`d (or coord deinit); the batch was
+                    // retained just above, so this slice is valid for
+                    // every `readBody` until release.
                     .bytes = entry.bytes,
                 } }
             else
-                .failed;
+                .{ .failed = batch.batch_id };
             w.refs.put(self.allocator, entry.seq, slot) catch {};
             if (ok) removeFromSorted(&w.unfinished, entry.seq);
             self.recomputeDurableSeqLocked(w);
             w.cond.broadcast();
             w.mu.unlock();
         }
-
-        // Retain the batch for BodyRef dereference.
-        self.retained_mu.lock();
-        self.retained.append(self.allocator, batch) catch {
-            // OOM appending: drop the batch on the floor. BodyRefs
-            // now dangle. Rare — log loudly.
-            std.log.warn("rove-blob coordinator: retained.append OOM", .{});
-        };
-        self.retained_mu.unlock();
 
         // Free an executor slot — wake drainer if waiting.
         self.exec_mu.lock();
@@ -1240,6 +1348,63 @@ test "coordinator: readBody returns submitted bytes from RAM" {
 
     // Never-submitted seq → UnknownSeq.
     try testing.expectError(Error.UnknownSeq, coord.readBody(0, 999, testing.allocator));
+}
+
+test "coordinator: release frees retained batch when fully consumed" {
+    var store = TestStore.init(testing.allocator);
+    defer store.deinit();
+    const coord = try BlobCoordinator.init(testing.allocator, store.blobStore(), .{
+        .worker_count = 2,
+        .executor_size = 1, // one executor → both submits seal into one batch
+    });
+    defer coord.deinit();
+
+    const s0 = try coord.submit(0, "alpha");
+    const s1 = try coord.submit(0, "bravo");
+    const sw = try coord.submit(1, "charlie");
+    try coord.waitForSeq(0, 2, 5 * std.time.ns_per_s);
+    try coord.waitForSeq(1, 1, 5 * std.time.ns_per_s);
+
+    // All readable before release; some batch(es) retained. (Whether
+    // the three submits seal into one or several batches is timing-
+    // dependent, so don't assert an exact count here.)
+    const b0 = try coord.readBody(0, s0, testing.allocator);
+    testing.allocator.free(b0);
+    coord.retained_mu.lock();
+    try testing.expect(coord.retained.items.len >= 1);
+    coord.retained_mu.unlock();
+
+    // Releasing a durable seq succeeds + drops its ref (readBody →
+    // UnknownSeq) but leaves the others consumable.
+    try testing.expect(coord.release(0, s0));
+    try testing.expectError(Error.UnknownSeq, coord.readBody(0, s0, testing.allocator));
+    const b1 = try coord.readBody(0, s1, testing.allocator);
+    testing.allocator.free(b1);
+
+    // Releasing EVERY submitted seq frees all retained state — the P6
+    // invariant: no batch outlives consumption (regardless of how they
+    // were batched).
+    try testing.expect(coord.release(0, s1));
+    try testing.expect(coord.release(1, sw));
+    coord.retained_mu.lock();
+    try testing.expectEqual(@as(usize, 0), coord.retained.items.len);
+    try testing.expectEqual(@as(usize, 0), coord.retained_by_batch.count());
+    coord.retained_mu.unlock();
+    try testing.expectError(Error.UnknownSeq, coord.readBody(0, s1, testing.allocator));
+
+    // Releasing an already-released / unknown seq returns false (the
+    // "retry later" signal — here it's terminal, but the caller treats
+    // false as "not yet").
+    try testing.expect(!coord.release(0, s0));
+    try testing.expect(!coord.release(1, 12345));
+
+    // A never-durable seq: release returns false (retry later), and a
+    // later retry after it becomes durable succeeds.
+    const s2 = try coord.submit(0, "delta");
+    // Before durability the ref isn't set → release defers.
+    if (coord.durableSeq(0) <= s2) try testing.expect(!coord.release(0, s2));
+    try coord.waitForSeq(0, s2 + 1, 5 * std.time.ns_per_s);
+    try testing.expect(coord.release(0, s2));
 }
 
 test "coordinator: per-worker HWMs are independent" {
