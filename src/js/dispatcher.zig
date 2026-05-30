@@ -97,6 +97,19 @@ fn interruptHandler(_: ?*c.JSRuntime, opaque_ctx: ?*anyopaque) callconv(.c) c_in
 /// log record).
 pub const ActivationSource = log_mod.ActivationSource;
 
+/// Gap 2.1 subscription-fire payload, discriminated by origin kind.
+/// Carried on `Request.activation_subscription_source` when
+/// `activation_source == .subscription_fire`; the variant IS the
+/// `source.kind` the JS surface reports (no "whichever slot is set"
+/// re-derivation). Borrowed slices — the caller
+/// (`fireSubscriptionActivation`) owns the bytes for the dispatch.
+/// `worker_streaming.SubscriptionFireSource` aliases this.
+pub const SubscriptionFireSource = union(enum) {
+    cron: struct { fired_at_ns: i64 },
+    kv: struct { key: []const u8, op: u8 },
+    boot: struct { deployment_id: u64 },
+};
+
 pub const Request = struct {
     method: []const u8,
     path: []const u8,
@@ -296,20 +309,14 @@ pub const Request = struct {
     /// Gap 2.1 subscription_fire payload (catalog §2.1 +
     /// `docs/subscriptions-plan.md`). Set only when
     /// `activation_source == .subscription_fire`; surfaces as
-    /// `request.activation.{name, source}`. The discriminator
-    /// `source.kind` is determined by which of the three slots
-    /// below is populated:
-    ///   - `subscription_cron_fired_at_ns > 0` → kind = "cron"
-    ///   - `subscription_kv_key != null`       → kind = "kv"
-    ///   - `subscription_boot_deployment_id > 0` → kind = "boot"
-    /// (Mutually exclusive; only one is set per fire.) Borrowed
-    /// slice — caller (`fireSubscriptionActivation`) owns the
-    /// bytes for the duration of the dispatch.
+    /// `request.activation.{name, source}`. `name` is the
+    /// subscription's directory name (common to all kinds);
+    /// `source` is the kind-discriminated payload — the tagged
+    /// union makes "exactly one kind per fire" structural. Borrowed
+    /// slices — caller (`fireSubscriptionActivation`) owns the bytes
+    /// for the duration of the dispatch.
     activation_subscription_name: ?[]const u8 = null,
-    activation_subscription_cron_fired_at_ns: i64 = 0,
-    activation_subscription_kv_key: ?[]const u8 = null,
-    activation_subscription_kv_op: u8 = 0,
-    activation_subscription_boot_deployment_id: u64 = 0,
+    activation_subscription_source: ?SubscriptionFireSource = null,
     /// Gap 2.3 / Phase 5 PR-1 `http.fetch` activation payload. Set
     /// when `activation_source == .fetch_chunk`. `fetch_id`
     /// correlates every activation of one fetch; surfaces as
