@@ -1012,17 +1012,8 @@ fn resumeContinuation(
                 // for the single _send/owed/{id} put. 0 / >1 → null
                 // (deadline-only resume).
                 const new_bound_sched_id: ?[]u8 = blk: {
-                    var only: ?[]const u8 = null;
-                    var nputs: usize = 0;
-                    for (ws.ops.items) |op| switch (op) {
-                        .put => |p| if (std.mem.startsWith(u8, p.key, OWED_PREFIX)) {
-                            nputs += 1;
-                            only = p.key[OWED_PREFIX.len..];
-                        },
-                        .delete => {},
-                    };
-                    if (nputs != 1) break :blk null;
-                    break :blk try allocator.dupe(u8, only.?);
+                    const only = worker_mod.scanLoneOwedSendId(ws.ops.items) orelse break :blk null;
+                    break :blk try allocator.dupe(u8, only);
                 };
                 // `docs/cross-worker-held-state-plan.md` Phase 1:
                 // repark re-binds to a (possibly new) send_id —
@@ -1553,17 +1544,8 @@ pub fn resumeBoundFetchChain(
             // chain stays awaiting the next bound-fetch chunk.
             const c2m = c2;
             const new_bound_sched_id: ?[]u8 = blk: {
-                var only: ?[]const u8 = null;
-                var nputs: usize = 0;
-                for (ws.ops.items) |op| switch (op) {
-                    .put => |p| if (std.mem.startsWith(u8, p.key, OWED_PREFIX)) {
-                        nputs += 1;
-                        only = p.key[OWED_PREFIX.len..];
-                    },
-                    .delete => {},
-                };
-                if (nputs != 1) break :blk null;
-                break :blk allocator.dupe(u8, only.?) catch null;
+                const only = worker_mod.scanLoneOwedSendId(ws.ops.items) orelse break :blk null;
+                break :blk allocator.dupe(u8, only) catch null;
             };
             // Phase 1 NodeState owner registration for the new
             // bound send (same as the worker_dispatch open-hop and

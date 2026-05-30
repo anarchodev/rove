@@ -101,6 +101,30 @@ const builtin_modules_mod = @import("builtin_modules.zig");
 /// (Zig → JS) and the consumer (SendDispatch → `sweepOwedRetries`).
 pub const OWED_PREFIX: []const u8 = "_send/owed/";
 
+/// §6.4 binding source: scan a writeset op-slice for exactly one
+/// `_send/owed/{id}` put and return the borrowed `{id}` suffix (a slice
+/// into the matched op's key). Returns null when zero or more-than-one
+/// owed-puts are present — the "ambiguous / deadline-only" case where
+/// the resume binds to no send. Allocation-free: the returned slice
+/// borrows into `ops`; callers that need it to outlive the writeset
+/// dupe it themselves. Shared by the inbound open-hop
+/// (`worker_dispatch`) and the cont / bound-fetch repark hops
+/// (`worker_drain`); pass a pre-sliced `ops` to scope the scan to one
+/// request's contribution (the open-hop cuts at `ws_pre_len`).
+pub fn scanLoneOwedSendId(ops: []const kv_mod.WriteSetOp) ?[]const u8 {
+    var only: ?[]const u8 = null;
+    var n: usize = 0;
+    for (ops) |op| switch (op) {
+        .put => |p| if (std.mem.startsWith(u8, p.key, OWED_PREFIX)) {
+            n += 1;
+            only = p.key[OWED_PREFIX.len..];
+        },
+        .delete => {},
+    };
+    if (n != 1) return null;
+    return only;
+}
+
 /// Phase 5 PR-3: deferred §6.4 held-sync resume entry. The baked
 /// `__system/webhook_onresult` shim calls
 /// `_system.continuation.resumeIfBound`; the trampoline appends
