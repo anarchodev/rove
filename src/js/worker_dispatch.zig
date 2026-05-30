@@ -2487,48 +2487,29 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         var readset = tape_mod.Readset.init(allocator, received_ns, @bitCast(received_ns));
         defer readset.deinit();
 
-        // Phase 2d: stream the inbound request body into the
-        // per-tenant BodyBuffer; capture the resulting BodyRef
-        // onto `readset.trigger_payload`. The inline
-        // `request_body_bytes` capture still rides alongside
-        // during the Phase 2 → Phase 3 transition (both coexist;
-        // inline drops out when the raft entry adopts the
-        // BodyRef in Phase 3). Bodies-less requests skip the
-        // append + the tape entry — channel is empty on the
-        // wire (zero entries).
-        // §5 callback gate: when the request has a body, the
-        // handler may not run until the body is durable in S3
-        // (plan §5.1 invariant — no handler reads bytes that
-        // aren't in stable storage).
+        // Inbound body → readset BodyRef. §5.1 invariant: a handler
+        // must not read body bytes that aren't yet in stable storage.
+        // Bodies-less requests skip this entirely (empty channel).
         //
-        // Park-on-durability flow (slice 4-park-2 replaced the
-        // earlier sync-block):
-        //   1. Fresh dispatch with a non-empty body:
-        //      a. Append to per-tenant `BodyBuffer` → mint
-        //         `BodyRef`.
-        //      b. If the ref is already durable (rare race vs
-        //         the periodic flusher tick), fall through to
-        //         the normal dispatch path with the ref captured
-        //         into `readset.trigger_payload` inline.
-        //      c. Otherwise: `reg.set` the `BodyDurabilityWait`
-        //         component carrying the ref + tenant id,
-        //         `reg.move` the entity to `body_pending`,
-        //         signal `flusher_wake` to trigger a priority
-        //         flush (plan §5.2). Worker thread `continue`s
-        //         to the next entity — no S3 RTT on the dispatch
-        //         hot path. `drainBodyPending` releases the
-        //         entity on the next tick after the flush PUT
-        //         acks.
-        //   2. Resume from park: the entity arrives in
-        //      request_out carrying a non-sentinel
-        //      `BodyDurabilityWait`. Use the saved `body_ref`
-        //      directly — re-appending would mint a new batch
-        //      and require another park cycle.
+        // Two paths by size (docs/streaming-model.md §7 + the
+        // INBOUND_INLINE_THRESHOLD below):
+        //   - Inline (≤ 16 KB): the bytes ride inline in the readset's
+        //     `trigger_payload` entry. The raft entry's fsync IS the
+        //     durability substrate, so the handler runs immediately.
+        //   - Large (> 16 KB): `coord.submit` to the process-global
+        //     blob coordinator → seq, then `reg.set` a
+        //     `BodyDurabilityWait` + `reg.move` to `body_pending` and
+        //     `continue` (no S3 RTT on the dispatch hot path).
+        //     `drainBodyPending` polls `coord.durableSeq`, materializes
+        //     the `BodyRef`, and re-dispatches once durable.
         //
-        // Failure (`getOrOpenTenantBodies` / `append` errors):
-        // return 503 with `.fault` outcome. Matches §6.2 partial-
-        // outage posture: fetch-using handlers are blocked when
-        // the backend can't accept new bytes.
+        // Resume from park: the entity arrives back in `request_out`
+        // with a non-sentinel `BodyDurabilityWait.body_ref`; use it
+        // directly (re-submitting would mint a new batch + re-park).
+        //
+        // Coord-submit failure: 503 with `.fault` (§6.2 partial-outage
+        // posture — fetch-using handlers are blocked when the backend
+        // can't accept new bytes).
         // Small-body inline fast path: bodies under the threshold
         // ride inline in the readset's `trigger_payload` entry
         // (no buffer append, no park, no S3 RTT). The raft entry

@@ -2341,13 +2341,13 @@ pub fn Worker(comptime opts: Options) type {
         raft_pending_stream: StreamColl,
         /// `docs/readset-replication-plan.md` Phase 4 park-on-
         /// durability. Entities `dispatchPending` parked after
-        /// appending their inbound body to the per-tenant
-        /// `BodyBuffer`, waiting for the buffer's batch holding
-        /// their body to flush to S3. `drainBodyPending` walks this
-        /// collection on each main-loop tick, checking each entity's
-        /// `BodyDurabilityWait.body_ref.batch_id` against the tenant
-        /// buffer's `last_flushed_batch_id`; matches move back to
-        /// `request_out` for re-dispatch (handler runs against the
+        /// submitting their inbound body (> 16 KB) to the process-
+        /// global blob coordinator (`coord.submit` → seq), waiting for
+        /// it to land in S3. `drainBodyPending` walks this collection
+        /// on each main-loop tick, polling `coord.durableSeq(worker_id)`
+        /// against each entity's parked seq; once durable it stamps the
+        /// materialized `BodyRef` and moves the entity back to
+        /// `request_out` for re-dispatch (the handler runs against the
         /// already-durable body).
         ///
         /// Same `StreamRow` as `raft_pending_*` / `request_out` so
@@ -2861,11 +2861,10 @@ pub fn Worker(comptime opts: Options) type {
                 try self.tenant_logs.put(allocator, try TenantLog.open(self, inst));
             }
 
-            // docs/streaming-model.md §7: body flush
-            // moved to the process-global BlobCoordinator
-            // (NodeState.blob_coordinator). The per-worker
-            // body_flush_pool is gone; the flusher_thread still
-            // runs for log flush + upload-walker.
+            // docs/streaming-model.md §7: body flush is the process-
+            // global BlobCoordinator's job (NodeState.blob_coordinator);
+            // this per-worker flusher_thread runs only log flush + the
+            // upload-walker.
             self.flusher_thread = try std.Thread.spawn(.{}, flusherLoop, .{self});
 
             // Spawn the push thread only if a libcurl handle was
@@ -2945,8 +2944,8 @@ pub fn Worker(comptime opts: Options) type {
                 t.join();
                 self.flusher_thread = null;
             }
-            // docs/streaming-model.md §7: body_flush_pool
-            // removed; coord lives on NodeState and shuts down there.
+            // docs/streaming-model.md §7: the blob coordinator lives on
+            // NodeState and shuts down there (not here).
             // Stop the push thread AFTER the flusher: the flusher
             // enqueues to push_queue, so stopping push first would
             // leak whatever the flusher emitted on its final tick.
@@ -4820,11 +4819,11 @@ pub fn fireFetchEventActivation(
     // replica sees the bytes when the entry replicates).
     // Discriminator: `body_ref.batch_id == NO_BATCH` ⇒ inline.
     //
-    // Larger chunks still go through the BodyBuffer (slice 2c-1
-    // path); the resulting BodyRef rides the entry instead.
-    // Slice 4-fetch-park will gate those on durability —
-    // currently they fire immediately, leaving the
-    // unreplayability gap §5.1 documents for outbound bodies.
+    // Larger chunks submit to the process-global blob coordinator
+    // (`coord.submit` → seq) and park in `fetch_pending_durability`;
+    // `drainFetchPendingDurability` re-fires the activation with the
+    // materialized `BodyRef` once durable (closing the §5.1 outbound
+    // unreplayability gap), then `coord.release`s the retained copy.
     //
     // The bytes still ride alongside on `activation_fetch_bytes`
     // for the handler's `request.activation.bytes` view; the

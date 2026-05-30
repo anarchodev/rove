@@ -1942,14 +1942,13 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
 /// `docs/readset-replication-plan.md` Phase 4 park-on-durability
 /// drain.
 ///
-/// Walks `worker.body_pending`, checks each parked entity's
-/// `BodyDurabilityWait.body_ref` against the owning tenant's
-/// docs/streaming-model.md §7: durability poll uses
-/// `node.blob_coordinator.durableSeq(worker_id)` instead of the
-/// per-tenant `BodyBuffer.isDurable`. Once the seq is durable, we
-/// materialize the wire `BodyRef` via `coord.bodyRef()` and stamp
-/// it onto the entity's `BodyDurabilityWait` so `dispatchPending`
-/// can stamp the readset on resume.
+/// Walks `worker.body_pending`, polling each parked entity's
+/// submission against the process-global blob coordinator's HWM
+/// (`node.blob_coordinator.durableSeq(worker_id)` — docs/streaming-model.md
+/// §7). Once the seq is durable we materialize the wire `BodyRef` via
+/// `coord.bodyRef()`, stamp it onto the entity's `BodyDurabilityWait`
+/// (so `dispatchPending` can stamp the readset on resume), and
+/// `coord.release()` the coordinator's retained copy (P6).
 ///
 /// Best-effort: missing coord (shouldn't happen post-init) skips
 /// the entity. A `reg.move` failure panics (rove invariant — the
@@ -2017,9 +2016,10 @@ pub fn drainBodyPending(worker: anytype) !void {
 /// `docs/readset-replication-plan.md` Phase 4-fetch-park drain.
 ///
 /// Walks `worker.fetch_pending_durability` (parked outbound-fetch
-/// chunk activations), looks up each entry's tenant `BodyBuffer`,
-/// and re-fires the activation when the saved `body_ref` becomes
-/// durable. Symmetric to `drainBodyPending` but for events
+/// chunk activations), polls the blob coordinator's HWM, and re-fires
+/// each activation with its materialized `BodyRef` once durable (then
+/// `coord.release`s the retained copy, P6). Symmetric to
+/// `drainBodyPending` but for events
 /// instead of entities — fetch chunks arrive via the msg_inbox
 /// without an h2 entity, so the park list is a plain
 /// `ArrayListUnmanaged(ParkedFetchEvent)` instead of a rove
