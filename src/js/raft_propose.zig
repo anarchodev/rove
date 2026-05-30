@@ -82,15 +82,19 @@ pub fn proposeWriteSet(
 ///  - 0 inners      → no-op, returns seq 0
 ///  - 1 inner        → bare propose (no multi-wrapper overhead — the
 ///                      common case, e.g. just a writeset)
-///  - 2..255 inners  → one multi-envelope propose (atomic)
+///  - 2..255 inners  → one multi-envelope propose (atomic at the raft-
+///                      LOG level; apply is per-inner — see below)
 ///  - >255 inners    → ⌈N/255⌉ multi proposes. By caller convention
 ///    the writeset rides `inner[0]` so it lands in chunk 0. Each
-///    chunk applies atomically; **cross-chunk is NOT atomic**. This
-///    is reachable only in the extreme >255-ops-for-one-tenant-in-
-///    one-pass case: a mid-chunk leader change can re-apply the not-
-///    yet-resolved `_send/owed/` markers, which Option-(b) resolve-
-///    once (proof-presence + send-id dedup) makes idempotent — the
-///    same at-least-once posture as the existing http.send contract.
+///    chunk replicates as one raft entry, but **neither cross-chunk
+///    nor cross-inner apply is transactional** — `applyMulti` commits
+///    each inner in its own kvexp txn, so recovery leans on idempotent
+///    replay, not rollback. This only bites in the extreme >255-ops-
+///    for-one-tenant-in-one-pass case: a mid-chunk leader change can
+///    re-apply the not-yet-resolved `_send/owed/` markers, which
+///    Option-(b) resolve-once (proof-presence + send-id dedup) makes
+///    idempotent — the same at-least-once posture as the existing
+///    http.send contract.
 ///
 /// Returns the LAST propose's seq (the batch watermark). The H2
 /// dispatch path parks its txn on this seq and never exceeds the
@@ -157,7 +161,10 @@ pub fn proposeBatch(
     // ride the SAME multi-envelope → one raft seq the calling admin
     // request is parked on by finalizeBatch. Replaces the per-site
     // fire-and-forget proposes the caller never gated on. `apply`
-    // routes each inner to its per-target store atomically.
+    // routes each inner to its per-target store; the inners share one
+    // raft entry (atomic replication), but each commits its own kvexp
+    // txn — apply is not cross-inner transactional, so recovery is via
+    // idempotent replay, not rollback.
     //
     // Target + root envelopes carry empty rs_bytes — the readset
     // lives on the anchor envelope (inner[0]) above; one readset
