@@ -11,20 +11,12 @@
 //! Phase 5 (2026-05-27): the coordinator collapsed per-(tenant,
 //! worker) lanes into a single cross-tenant `_pool/` prefix, and
 //! `batch_id` became globally unique via raft reservation. The wire
-//! `BodyRef` shape is unchanged — still `{batch_id, offset, len}` —
-//! but the S3 key it resolves to depends on the readset's version:
+//! `BodyRef` shape is `{batch_id, offset, len}`; it resolves to one
+//! key template — `{key_prefix_base}_pool/{batch_id:0>20}`, a
+//! cross-tenant pool under one backend prefix.
 //!
-//!   - `READSET_VERSION = 4` (Phase 3 layout): key is
-//!     `{tenant}/readset-blobs/w{worker_id}/{batch_id:0>20}`. The
-//!     worker_id is NOT carried on the wire — pre-launch caveat
-//!     that's effectively moot because no reader has hydrated v4
-//!     bodies in production.
-//!   - `READSET_VERSION = 5` (Phase 5 layout): key is
-//!     `{key_prefix_base}_pool/{batch_id:0>20}`. Cross-tenant pool
-//!     under one backend prefix.
-//!
-//! Use `poolKey` to format a v5 leaf; `batchKey` is the generic
-//! zero-padded formatter both versions share.
+//! Use `poolKey` to format a pool leaf; `batchKey` is the generic
+//! zero-padded formatter it builds on.
 
 const std = @import("std");
 
