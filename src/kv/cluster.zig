@@ -23,8 +23,14 @@
 //! - Envelope wire format + decode dispatch.
 //! - Built-in writeset envelope (`registerWriteSetEnvelope`):
 //!   leader-skip, snapshot-replay filter, `_apply_state` stamp.
-//! - Multi-envelope wrapper (`registerMultiEnvelope`): atomic
-//!   apply of N inner envelopes per raft entry.
+//! - Multi-envelope wrapper (`registerMultiEnvelope`): N inner
+//!   envelopes ride one raft entry — atomic at the LOG level (they
+//!   replicate together, all-or-nothing). Apply is NOT transactional
+//!   across inners: `applyMulti` loops `dispatch` and each inner
+//!   commits its own kvexp txn, so a mid-loop failure leaves the
+//!   committed prefix durable and panics (an invariant violation,
+//!   never a recoverable error). Recovery leans on idempotent replay,
+//!   not rollback.
 //! - Per-store cache + lazy lifecycle (`openStore` / `getStore` /
 //!   `closeStore`).
 //! - In-memory `last_applied_idx` mirror per store, used by the

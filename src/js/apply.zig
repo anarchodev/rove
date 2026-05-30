@@ -68,7 +68,8 @@ pub const Error = error{
     NestedMulti,
 };
 
-pub const MAX_ID_LEN: usize = 256;
+/// Single-sourced from the shared cluster codec.
+pub const MAX_ID_LEN: usize = kv.MAX_ID_LEN;
 
 pub const EnvelopeType = enum(u8) {
     writeset = 0,
@@ -197,62 +198,35 @@ pub fn encodeRootWriteSetEnvelope(
 }
 
 
-/// Build a multi-envelope wrapper (type=7) carrying `inner` as already-
+/// Build a multi-envelope wrapper (type=1) carrying `inner` as already-
 /// encoded inner envelopes. The wrapper's `instance_id` is empty;
 /// real targets live on each inner envelope's id.
 ///
-/// Inner envelopes must NOT themselves be type=7. The apply path
+/// Inner envelopes must NOT themselves be type=1. The apply path
 /// panics on nested multi to keep the recursion bounded.
 ///
-/// Wire format (after the standard `[1B type=7][2B id_len=0]` header):
-///   `[u8 count][ [u32 len][len bytes inner_envelope] ]{count}`
+/// Thin wrapper over the shared `kv.encodeMulti` codec — the
+/// `[1B type=1][2B id_len=0][u8 count]([u32 len][inner]){count}` byte
+/// layout lives once in `kv/cluster.zig`.
 pub fn encodeMultiEnvelope(
     allocator: std.mem.Allocator,
     inner: []const []const u8,
 ) ![]u8 {
-    if (inner.len > 0xff) return error.OutOfMemory;
-    var inner_total: usize = 0;
-    for (inner) |b| inner_total += 4 + b.len;
-    const payload_len = 1 + inner_total;
-    const total = 3 + payload_len;
-    const out = try allocator.alloc(u8, total);
-    out[0] = @intFromEnum(EnvelopeType.multi);
-    std.mem.writeInt(u16, out[1..3], 0, .big);
-    out[3] = @intCast(inner.len);
-    var pos: usize = 4;
-    for (inner) |b| {
-        std.mem.writeInt(u32, out[pos..][0..4], @intCast(b.len), .little);
-        pos += 4;
-        @memcpy(out[pos..][0..b.len], b);
-        pos += b.len;
-    }
-    return out;
+    return kv.encodeMulti(allocator, inner);
 }
 
-/// Decode the inner-envelope byte slices from a type=7 wrapper's
+/// Decode the inner-envelope byte slices from a type=1 wrapper's
 /// payload (i.e., `Envelope.payload` for an envelope whose type is
 /// `multi`). Returned slices alias the caller's payload buffer; do
 /// not free individually. Caller frees the outer slice with
 /// `allocator.free`.
+///
+/// Thin wrapper over the shared `kv.decodeMultiInner` codec.
 pub fn decodeMultiInner(
     allocator: std.mem.Allocator,
     payload: []const u8,
 ) ![][]const u8 {
-    if (payload.len < 1) return Error.Truncated;
-    const count = payload[0];
-    const out = try allocator.alloc([]const u8, count);
-    errdefer allocator.free(out);
-    var pos: usize = 1;
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        if (payload.len < pos + 4) return Error.Truncated;
-        const len = std.mem.readInt(u32, payload[pos..][0..4], .little);
-        pos += 4;
-        if (payload.len < pos + len) return Error.Truncated;
-        out[i] = payload[pos .. pos + len];
-        pos += len;
-    }
-    return out;
+    return kv.decodeMultiInner(allocator, payload);
 }
 
 fn encodeTyped(
@@ -261,14 +235,10 @@ fn encodeTyped(
     id: []const u8,
     payload: []const u8,
 ) ![]u8 {
-    if (id.len > MAX_ID_LEN) return error.OutOfMemory;
-    const total = 1 + 2 + id.len + payload.len;
-    const out = try allocator.alloc(u8, total);
-    out[0] = @intFromEnum(t);
-    std.mem.writeInt(u16, out[1..3], @intCast(id.len), .big);
-    @memcpy(out[3 .. 3 + id.len], id);
-    @memcpy(out[3 + id.len ..], payload);
-    return out;
+    // Thin wrapper over the shared `kv.encodeEnvelope` header codec;
+    // the `[1B type][2B id_len BE][id][payload]` layout (and the
+    // `id.len > MAX_ID_LEN` guard) live once in `kv/cluster.zig`.
+    return kv.encodeEnvelope(allocator, @intFromEnum(t), id, payload);
 }
 
 pub const Envelope = struct {
@@ -277,20 +247,60 @@ pub const Envelope = struct {
     payload: []const u8,
 };
 
-/// Decode an envelope. Slices into the input buffer; valid until the
-/// caller drops `payload`.
+/// Decode an envelope into the enum-typed loop46 view. Slices into the
+/// input buffer; valid until the caller drops `payload`.
+///
+/// Thin wrapper over the shared `kv.decodeEnvelope` header codec: the
+/// raw `u8` type is mapped to `EnvelopeType`, so any stale retired-type
+/// byte trips `UnknownEnvelopeType` here (the propose / upload-walker /
+/// test side). NB: the *live* apply path decodes through
+/// `kv.decodeEnvelope` directly inside the cluster — the retired-type
+/// guard for that path lives there (see the cluster's handler table).
 pub fn decodeEnvelope(payload: []const u8) Error!Envelope {
-    if (payload.len < 3) return Error.Truncated;
-    const type_byte = payload[0];
-    const t = std.meta.intToEnum(EnvelopeType, type_byte) catch
+    const raw = kv.decodeEnvelope(payload) catch return Error.Truncated;
+    const t = std.meta.intToEnum(EnvelopeType, raw.type) catch
         return Error.UnknownEnvelopeType;
-    const id_len = std.mem.readInt(u16, payload[1..3], .big);
-    if (payload.len < 3 + @as(usize, id_len)) return Error.Truncated;
     return .{
         .type = t,
-        .instance_id = payload[3 .. 3 + id_len],
-        .payload = payload[3 + id_len ..],
+        .instance_id = raw.id,
+        .payload = raw.payload,
     };
+}
+
+/// Visit every writeset (type-0) envelope in a committed raft-log
+/// entry, whether top-level or unwrapped from a multi (type-1).
+/// Root-writeset (type-2) envelopes carry no per-tenant readset and
+/// are skipped, as is an (illegal) nested multi. A decode failure on
+/// the outer entry or the multi payload aborts quietly — callers treat
+/// a corrupt / foreign entry as "nothing to extract"; a bad inner
+/// envelope is skipped.
+///
+/// `ctx` is any value exposing
+/// `fn visitWriteSet(self, instance_id: []const u8, payload: []const u8) !void`.
+/// The slices alias `entry_bytes` / the decoded multi buffer and are
+/// valid only for the duration of the call. This is the single owner
+/// of the read-only envelope-tree shape; `Cluster.applyOne` /
+/// `applyMulti` is the write-side twin.
+pub fn forEachWriteSetEnvelope(
+    allocator: std.mem.Allocator,
+    entry_bytes: []const u8,
+    ctx: anytype,
+) !void {
+    const env = decodeEnvelope(entry_bytes) catch return;
+    switch (env.type) {
+        .writeset => try ctx.visitWriteSet(env.instance_id, env.payload),
+        .multi => {
+            const inner_slice = decodeMultiInner(allocator, env.payload) catch return;
+            defer allocator.free(inner_slice);
+            for (inner_slice) |inner_bytes| {
+                const inner_env = decodeEnvelope(inner_bytes) catch continue;
+                if (inner_env.type == .writeset)
+                    try ctx.visitWriteSet(inner_env.instance_id, inner_env.payload);
+                // nested multi + root_writeset carry no readset: skip.
+            }
+        },
+        .root_writeset => {},
+    }
 }
 
 /// Loop46-specific apply state — auxiliary fields the library's

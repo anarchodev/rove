@@ -70,23 +70,27 @@ fn hydrateInto(
     env_bytes: []const u8,
     raft_seq: u64,
 ) !void {
-    const env = apply_mod.decodeEnvelope(env_bytes) catch return;
-    switch (env.type) {
-        .writeset => try hydrateWriteSetEnvelope(allocator, out, env, raft_seq),
-        .multi => {
-            const inner_slice = apply_mod.decodeMultiInner(allocator, env.payload) catch return;
-            defer allocator.free(inner_slice);
-            for (inner_slice) |inner| {
-                try hydrateInto(allocator, out, inner, raft_seq);
-            }
-        },
-        .root_writeset => {
-            // No per-tenant id, no per-request LogHeader — platform-
-            // level writes (ACME cert renewal, signup's
-            // `platform.root.*`). Customer log surface doesn't show
-            // these.
-        },
-    }
+    // Walk every writeset envelope (top-level or unwrapped from a
+    // multi) via the shared `apply_mod.forEachWriteSetEnvelope` tree
+    // walker — root_writeset envelopes carry no per-request LogHeader
+    // and are skipped there.
+    const Visitor = struct {
+        a: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(log_mod.LogRecord),
+        raft_seq: u64,
+        pub fn visitWriteSet(v: @This(), instance_id: []const u8, payload: []const u8) !void {
+            try hydrateWriteSetEnvelope(v.a, v.out, .{
+                .type = .writeset,
+                .instance_id = instance_id,
+                .payload = payload,
+            }, v.raft_seq);
+        }
+    };
+    try apply_mod.forEachWriteSetEnvelope(
+        allocator,
+        env_bytes,
+        Visitor{ .a = allocator, .out = out, .raft_seq = raft_seq },
+    );
 }
 
 fn hydrateWriteSetEnvelope(
@@ -394,18 +398,24 @@ fn collectFromEnvelope(
     env_bytes: []const u8,
     out: *std.ArrayListUnmanaged(ReferencedBatch),
 ) !void {
-    const env = apply_mod.decodeEnvelope(env_bytes) catch return;
-    switch (env.type) {
-        .writeset => try collectFromWriteSetEnvelope(allocator, env, out),
-        .multi => {
-            const inner_slice = apply_mod.decodeMultiInner(allocator, env.payload) catch return;
-            defer allocator.free(inner_slice);
-            for (inner_slice) |inner| {
-                try collectFromEnvelope(allocator, inner, out);
-            }
-        },
-        .root_writeset => {},
-    }
+    // Shared envelope-tree walker (see `hydrateInto`): visits every
+    // writeset envelope, skips root_writeset / nested multi.
+    const Visitor = struct {
+        a: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(ReferencedBatch),
+        pub fn visitWriteSet(v: @This(), instance_id: []const u8, payload: []const u8) !void {
+            try collectFromWriteSetEnvelope(v.a, .{
+                .type = .writeset,
+                .instance_id = instance_id,
+                .payload = payload,
+            }, v.out);
+        }
+    };
+    try apply_mod.forEachWriteSetEnvelope(
+        allocator,
+        env_bytes,
+        Visitor{ .a = allocator, .out = out },
+    );
 }
 
 fn collectFromWriteSetEnvelope(

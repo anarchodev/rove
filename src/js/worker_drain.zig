@@ -1953,6 +1953,51 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
 /// Best-effort: missing coord (shouldn't happen post-init) skips
 /// the entity. A `reg.move` failure panics (rove invariant — the
 /// entity must be in `body_pending` or the column slice is stale).
+/// Result of polling the blob coordinator for one parked body
+/// submission (`pollDurableBodyRef`).
+const DurableBody = union(enum) {
+    /// Seq still in flight — leave it parked; coordinator copy retained.
+    not_yet,
+    /// Terminal `coord.bodyRef` error — logged, retained copy released.
+    failed,
+    /// Durable in S3 — wire `BodyRef` ready, retained copy released.
+    ready: bodies_mod.BodyRef,
+};
+
+/// Poll the blob coordinator's durability HWM for one parked
+/// `(worker_id, seq)` body submission. Single owner of the
+/// `durableSeq → bodyRef → release` (P6) gate shared by
+/// `drainBodyPending` (inbound bodies) and
+/// `drainFetchPendingDurability` (outbound fetch chunks) — the two
+/// callers differ only in park-container bookkeeping and what they do
+/// with the `.ready` ref. On both terminal outcomes (`.ready` /
+/// `.failed`) the coordinator's retained RAM copy is released here;
+/// `.not_yet` keeps it retained. `what` / `tenant` are log context for
+/// the failure path. The returned `BodyRef` is a plain value (the wire
+/// `batch_id`/`offset`/`len`), so releasing the coordinator copy before
+/// the caller consumes it is safe.
+fn pollDurableBodyRef(
+    coord: anytype,
+    worker_id: u8,
+    seq: u64,
+    what: []const u8,
+    tenant: []const u8,
+) DurableBody {
+    // Count semantics: durableSeq is the exclusive HWM (lowest
+    // not-yet-durable seq), so `seq < durableSeq` ⇒ resolved.
+    if (seq >= coord.durableSeq(worker_id)) return .not_yet;
+    const ref = coord.bodyRef(worker_id, seq) catch |err| {
+        std.log.warn(
+            "rove-js {s}: coord.bodyRef tenant={s} seq={d}: {s}",
+            .{ what, tenant, seq, @errorName(err) },
+        );
+        _ = coord.release(worker_id, seq);
+        return .failed;
+    };
+    _ = coord.release(worker_id, seq);
+    return .{ .ready = .{ .batch_id = ref.batch_id, .offset = ref.offset, .len = ref.len } };
+}
+
 pub fn drainBodyPending(worker: anytype) !void {
     const server = worker.h2;
     const coord = worker.node.blob_coordinator orelse return;
@@ -1972,43 +2017,19 @@ pub fn drainBodyPending(worker: anytype) !void {
         // dispatcher to pick it up.
         if (wait.body_ref.batch_id != bodies_mod.NO_BATCH) continue;
 
-        // Durability check via coord HWM (count semantics:
-        // worker_seq < durableSeq → resolved).
-        if (wait.worker_seq >= coord.durableSeq(wait.worker_id)) continue;
-
-        // Resolved — look up the BodyRef. PutFailed → drop the
-        // request loudly; the customer needs to see the error
-        // rather than wait silently forever. UnknownSeq shouldn't
-        // happen for a seq we know is < durable_seq.
-        const ref = coord.bodyRef(wait.worker_id, wait.worker_seq) catch |err| {
-            std.log.warn(
-                "rove-js body-gate: coord.bodyRef tenant={s} seq={d}: {s}",
-                .{ wait.tenant_id, wait.worker_seq, @errorName(err) },
-            );
-            // Still release back to dispatch — the resume path
-            // sees NO_BATCH and treats it as the body-gate-failed
-            // branch, which writes a 500 response.
-            // P6: the body-gate is done with this seq (PutFailed/
-            // UnknownSeq); release its coordinator state.
-            _ = coord.release(wait.worker_id, wait.worker_seq);
-            try server.reg.move(ent, &worker.body_pending, &server.request_out);
-            continue;
-        };
-        // Stamp the wire BodyRef. Phase 5: `batch_id` is the coord's
-        // globally-unique pool batch_id; the S3 key is
-        // `{key_prefix_base}_pool/{batch_id:0>20}`.
-        wait.body_ref = .{
-            .batch_id = ref.batch_id,
-            .offset = ref.offset,
-            .len = ref.len,
-        };
-        // P6 (docs/chunk-spool-plan.md): the body-gate has extracted
-        // the wire BodyRef value (now cached on the entity + headed
-        // into the readset); it never reads this seq from the
-        // coordinator again. Replay reads the body from S3 via the
-        // BodyRef, not the coordinator — so free the coordinator's
-        // retained RAM for it.
-        _ = coord.release(wait.worker_id, wait.worker_seq);
+        // Durability gate (shared with drainFetchPendingDurability) —
+        // poll the coord HWM, materialize + release on terminal.
+        switch (pollDurableBodyRef(coord, wait.worker_id, wait.worker_seq, "body-gate", wait.tenant_id)) {
+            .not_yet => continue,
+            // Body never became durable: leave body_ref at NO_BATCH.
+            // The resume path sees NO_BATCH and writes a 500.
+            .failed => {},
+            // Stamp the wire BodyRef. Phase 5: `batch_id` is the
+            // coord's globally-unique pool batch_id; the S3 key is
+            // `{key_prefix_base}_pool/{batch_id:0>20}`. The dispatcher
+            // serializes it into the readset on resume.
+            .ready => |ref| wait.body_ref = ref,
+        }
         try server.reg.move(ent, &worker.body_pending, &server.request_out);
     }
 }
@@ -2035,39 +2056,29 @@ pub fn drainFetchPendingDurability(worker: anytype) !void {
     var i: usize = 0;
     while (i < worker.fetch_pending_durability.items.len) {
         const pe = &worker.fetch_pending_durability.items[i];
-        // Capture the coord identity BEFORE any swapRemove (which moves
-        // `pe`), so the P6 release below uses the right (worker, seq).
-        const pe_wid = pe.worker_id;
-        const pe_seq = pe.worker_seq;
-        if (pe.worker_seq >= coord.durableSeq(pe.worker_id)) {
-            i += 1;
-            continue;
+        // Durability gate (shared with drainBodyPending) — poll the
+        // coord HWM, materialize + release on terminal. The helper
+        // releases the coord copy before we swapRemove `pe`, so no
+        // pre-capture of (worker_id, seq) is needed.
+        switch (pollDurableBodyRef(coord, pe.worker_id, pe.worker_seq, "fetch-gate", pe.tenant_id_view)) {
+            // Not durable yet — advance; the swapRemove cases below
+            // stay at `i` so the swapped-in element is examined next.
+            .not_yet => i += 1,
+            // Drop the parked event. Better surface would be to fire
+            // with a transport-error terminal, but Phase 3 keeps the
+            // existing "skip on body-gate failure" posture.
+            .failed => {
+                var released = worker.fetch_pending_durability.swapRemove(i);
+                components_mod.UpstreamFetchEvent.deinitItem(&released.event, worker.allocator);
+            },
+            // Re-fire with the durable ref. The event carries its
+            // chunk bytes inline; replay reads the body from S3 via
+            // the BodyRef. fireFetchEventActivation takes ownership of
+            // the released event (deinit fires via its own defer).
+            .ready => |wire_ref| {
+                var released = worker.fetch_pending_durability.swapRemove(i);
+                worker_mod.fireFetchEventActivation(worker, &released.event, wire_ref);
+            },
         }
-        const ref = coord.bodyRef(pe.worker_id, pe.worker_seq) catch |err| {
-            std.log.warn(
-                "rove-js fetch-gate: coord.bodyRef tenant={s} seq={d}: {s}",
-                .{ pe.tenant_id_view, pe.worker_seq, @errorName(err) },
-            );
-            // Drop the parked event: free it and continue. Better
-            // surface would be to fire with a transport-error
-            // terminal, but Phase 3 keeps the existing "skip on
-            // body-gate failure" posture.
-            var released = worker.fetch_pending_durability.swapRemove(i);
-            components_mod.UpstreamFetchEvent.deinitItem(&released.event, worker.allocator);
-            _ = coord.release(pe_wid, pe_seq); // P6: done with this seq
-            continue;
-        };
-        var released = worker.fetch_pending_durability.swapRemove(i);
-        const wire_ref: bodies_mod.BodyRef = .{
-            .batch_id = ref.batch_id,
-            .offset = ref.offset,
-            .len = ref.len,
-        };
-        worker_mod.fireFetchEventActivation(worker, &released.event, wire_ref);
-        // P6: the wire BodyRef value is extracted; the event carries
-        // its chunk bytes inline (replay reads the body from S3 via the
-        // BodyRef, not the coordinator) — free the coordinator copy.
-        _ = coord.release(pe_wid, pe_seq);
-        // Don't advance i — swapRemove placed a new element at this index.
     }
 }
