@@ -1730,7 +1730,7 @@ fn handleRelease(
         defer allocator.free(current_hex);
         const current_id = std.fmt.parseInt(u64, current_hex, 16) catch 0;
         if (current_id == parsed.value.dep_id) {
-            if (worker.node.deployment_loader) |loader| {
+            if (worker.node.deploy.deployment_loader) |loader| {
                 loader.enqueue(parsed.value.tenant_id, parsed.value.dep_id) catch |err| std.log.warn(
                     "release fast-path: loader.enqueue {s}/{d} failed: {s}",
                     .{ parsed.value.tenant_id, parsed.value.dep_id, @errorName(err) },
@@ -1838,7 +1838,7 @@ fn handleRelease(
     // do this for us on this node. On follower nodes, apply.zig's
     // _deploy/current detector enqueues automatically when the
     // writeset commits.
-    if (worker.node.deployment_loader) |loader| {
+    if (worker.node.deploy.deployment_loader) |loader| {
         loader.enqueue(parsed.value.tenant_id, parsed.value.dep_id) catch |err| {
             std.log.warn(
                 "release: deployment loader enqueue {s}/{d} failed: {s}",

@@ -345,7 +345,7 @@ pub fn resolveDeployment(
     tenant_id: []const u8,
     module_path: []const u8,
 ) !ChainDeployment {
-    const slot = worker.node.tenant_files_map.get(tenant_id) orelse return error.ResumeNoTenant;
+    const slot = worker.node.deploy.tenant_files_map.get(tenant_id) orelse return error.ResumeNoTenant;
     const snap = slot.pinCurrent() orelse return error.ResumeNoDeployment;
     var tc = TenantFiles{ .slot = slot, .snap = snap };
     errdefer tc.release();
