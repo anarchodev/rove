@@ -56,6 +56,7 @@ pub const WakeKey = continuation.WakeKey;
 pub const Watermarks = continuation.Watermarks;
 pub const SweepClass = continuation.SweepClass;
 pub const classify = continuation.classify;
+pub const reconcile = continuation.reconcile;
 pub const SharedTxnPool = continuation.SharedTxnPool;
 pub const CommitOutcome = continuation.CommitOutcome;
 pub const RollbackOutcome = continuation.RollbackOutcome;

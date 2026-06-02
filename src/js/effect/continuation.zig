@@ -262,6 +262,42 @@ pub fn classify(seq: u64, deadline_ns: i64, w: Watermarks) SweepClass {
     return .pending;
 }
 
+/// The shared per-tick iteration kernel for a parked-seq collection.
+/// Replaces the hand-rolled `while` loops that each re-implemented
+/// "classify every unit; commit / fault / skip". Phase 3.0
+/// deliberately left this undeclared until the iteration shape
+/// stabilized (see the design note below `ReconcileCtx`); Phase 3.2.a
+/// fills it for the H2 reference path (`worker_drain.drainEntityArm`).
+///
+/// `ctx` is `anytype` so the effect module stays a leaf — it imports
+/// no host type. The caller supplies a context exposing four methods:
+///
+///   - `seqAt(i) u64`      — the i-th unit's parked raft seq
+///   - `deadlineAt(i) i64` — its absolute timeout deadline (ns)
+///   - `commitAt(i) !void` — take the txn through commit + the unit's
+///     on-commit action (release buffered Cmds / move / destroy)
+///   - `faultAt(i) !void`  — roll the txn back + the unit's on-fault
+///     action (discard buffered / 503-downgrade / destroy)
+///
+/// `count` is snapshotted by the caller BEFORE the loop. Entity
+/// `reg.move`/`reg.destroy` are deferred to `reg.flush` (rove's
+/// poll/flush model), so moving units out inside `commitAt`/`faultAt`
+/// does not shift the slices a ctx caches — the same property the
+/// pre-3.2.a fault arm already relied on. Callers whose action can
+/// CREATE new units in the same collection (the kv-react re-entrancy
+/// in the `parked_units` arm) still pass a snapshot-backed ctx; that
+/// guard is the caller's, not reconcile's.
+pub fn reconcile(ctx: anytype, count: usize, wm: Watermarks) !void {
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        switch (classify(ctx.seqAt(i), ctx.deadlineAt(i), wm)) {
+            .pending => {},
+            .commit => try ctx.commitAt(i),
+            .fault => try ctx.faultAt(i),
+        }
+    }
+}
+
 /// The Msg / route key a Continuation parks on (Phase 3.5 — the
 /// O(1) wake-correlation index). Today's resume is a cross-worker
 /// scan (`docs/effect-algebra.md` §7 worklist #4). The indexed
@@ -576,6 +612,63 @@ test "Continuation: WakeKey variants construct" {
 
     c.wake_key = .{ .msg = .fetch_chunk };
     try testing.expectEqual(msg_mod.ActivationSource.fetch_chunk, c.wake_key.?.msg);
+}
+
+test "reconcile: dispatches commit / fault / pending per classify" {
+    const testing = std.testing;
+
+    // A ctx with three parked units at seqs 5, 7, 9. Watermarks
+    // commit through 6 (→ unit0 commits), fault at 8 (→ unit1 faults),
+    // unit2 (seq 9, not committed/faulted, not timed out) stays pending.
+    const Ctx = struct {
+        seqs: [3]u64 = .{ 5, 7, 9 },
+        deadlines: [3]i64 = .{ 1_000, 1_000, 1_000 },
+        committed: std.ArrayListUnmanaged(usize) = .empty,
+        faulted: std.ArrayListUnmanaged(usize) = .empty,
+
+        fn seqAt(self: *@This(), i: usize) u64 {
+            return self.seqs[i];
+        }
+        fn deadlineAt(self: *@This(), i: usize) i64 {
+            return self.deadlines[i];
+        }
+        fn commitAt(self: *@This(), i: usize) !void {
+            try self.committed.append(testing.allocator, i);
+        }
+        fn faultAt(self: *@This(), i: usize) !void {
+            try self.faulted.append(testing.allocator, i);
+        }
+    };
+
+    var ctx = Ctx{};
+    defer ctx.committed.deinit(testing.allocator);
+    defer ctx.faulted.deinit(testing.allocator);
+
+    try reconcile(&ctx, 3, .{ .committed = 6, .faulted = 8, .now_ns = 0 });
+
+    try testing.expectEqualSlices(usize, &.{0}, ctx.committed.items);
+    try testing.expectEqualSlices(usize, &.{1}, ctx.faulted.items);
+}
+
+test "reconcile: propagates a commitAt error" {
+    const testing = std.testing;
+
+    const Ctx = struct {
+        fn seqAt(_: *@This(), _: usize) u64 {
+            return 1;
+        }
+        fn deadlineAt(_: *@This(), _: usize) i64 {
+            return 1_000;
+        }
+        fn commitAt(_: *@This(), _: usize) !void {
+            return error.Boom;
+        }
+        fn faultAt(_: *@This(), _: usize) !void {}
+    };
+
+    var ctx = Ctx{};
+    // committed >= seq → .commit → commitAt returns error, reconcile propagates.
+    try testing.expectError(error.Boom, reconcile(&ctx, 1, .{ .committed = 5, .faulted = 0, .now_ns = 0 }));
 }
 
 test "Disposition is a two-variant enum" {
