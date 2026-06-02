@@ -48,11 +48,14 @@ const builtin_modules_mod = @import("builtin_modules.zig");
 
 const worker_mod = @import("worker.zig");
 const worker_drain = @import("worker_drain.zig");
+const dispatch = @import("worker_dispatch.zig");
+const bodies_mod = @import("rove-bodies");
 const ParkedUnit = worker_mod.ParkedUnit;
 const KvWakeOp = worker_mod.KvWakeOp;
 const KvWakeEvent = worker_mod.KvWakeEvent;
 const MAX_STREAM_ACTIVATIONS = worker_mod.MAX_STREAM_ACTIVATIONS;
 const captureLogWithId = worker_mod.captureLogWithId;
+const captureTapesWithActivation = worker_mod.captureTapesWithActivation;
 const resolveDeployment = worker_mod.resolveDeployment;
 
 // ── Stream lifecycle ──────────────────────────────────────────────────
@@ -180,7 +183,6 @@ pub fn setStreamComponents(
             .kv_prefixes = spine,
         });
     }
-
 }
 
 // Phase 7: `registerStreamCell` removed — stream state lives on
@@ -2706,7 +2708,7 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
                         .{ev.fetch_id},
                     );
                 }
-                worker_mod.fireFetchEventActivation(worker, &ev, null);
+                fireFetchEventActivation(worker, &ev, null);
                 fired += 1;
             },
             .send_callback => |sc_const| {
@@ -2743,4 +2745,451 @@ pub fn dispatchSubscriptionFires(worker: anytype) void {
 /// Backward-compat alias — see `dispatchSubscriptionFires`.
 pub fn dispatchFetchEvents(worker: anytype) void {
     dispatchPendingMsgs(worker);
+}
+
+// ── Gap 2.3 Phase D — http.fetch chunk/done activations ──────────
+
+/// Effect-reification Phase 2E: backward-compat alias of
+/// `serviceSubscriptionFires` — both now drain the unified
+/// `msg_inbox` and dispatch the queue. The second-to-call sees an
+/// empty inbox + queue and is a cheap no-op. main.zig + the
+/// parked_units call site keep their existing call shape.
+pub fn serviceFetchEvents(worker: anytype) void {
+    drainMsgInbox(worker);
+    dispatchPendingMsgs(worker);
+}
+
+/// Dispatch one upstream fetch event as a chain activation.
+/// Structural twin of `fireSubscriptionActivation` — no held socket,
+/// writes commit forgetfully — but the activation source + payload
+/// differ.
+///
+/// **TEA framing (Phase 5 PR-1):**
+///   - **Msg**: `(fetch_chunk, {seq, bytes, final, ...})` per
+///     event. `final == true` marks the last event of the fetch
+///     and carries terminal fields (status / ok / body_truncated);
+///     intermediates have `final == false`.
+///   - **prep**: resolve the `on_chunk` module on the event's
+///     tenant; correlation_id `fetch-<id>` so every activation of
+///     one fetch shares a chain identity; body `{ctx: <ctx_json>}`.
+///   - **run**: `dispatcher.runOutcome`.
+///   - **apply**: terminal → propose writes (if any) + log;
+///     continuation / stream → recorded + logged + ignored (a
+///     fetch chain has no held socket, same as subscription_fire).
+///
+/// Errors return `void` — `dispatchFetchEvents` is best-effort. An
+/// event with an empty `on_chunk_module` (binding-side regression)
+/// is a silent no-op.
+/// Slice 4-fetch-park: takes ownership of `event` — internal
+/// defer deinits it on exit unless the gate logic parks it
+/// (slice 4-fetch-park transfers ownership to
+/// `worker.fetch_pending_durability`).
+///
+/// `parked_body_ref` is non-null when called from a parked
+/// resume: it carries the BodyRef minted at the original
+/// append site, and the gate uses it directly instead of
+/// re-appending (which would mint a new batch + re-park).
+/// Fresh-arrival callers pass `null`.
+pub fn fireFetchEventActivation(
+    worker: anytype,
+    event: *components_mod.UpstreamFetchEvent,
+    parked_body_ref: ?bodies_mod.BodyRef,
+) void {
+    // Ownership handling: deinit the event on every exit path
+    // except the park branch (which transfers to
+    // fetch_pending_durability).
+    var parked_to_durability = false;
+    defer if (!parked_to_durability)
+        components_mod.UpstreamFetchEvent.deinitItem(event, worker.allocator);
+
+    const module_path = event.on_chunk_module;
+    if (module_path.len == 0) {
+        std.log.warn(
+            "rove-js fetch-event: fetch_id={s} has no on_chunk module; dropping",
+            .{event.fetch_id},
+        );
+        return;
+    }
+    const tenant_id = event.tenant_id;
+    const allocator = worker.allocator;
+
+    var dep = resolveDeployment(worker, allocator, tenant_id, module_path) catch |err| {
+        std.log.warn(
+            "rove-js fetch-event: tenant={s} module={s} resolveDeployment failed: {s}; skipping",
+            .{ tenant_id, module_path, @errorName(err) },
+        );
+        return;
+    };
+    defer dep.tc.release();
+    const inst = dep.inst;
+    const tc = dep.tc;
+    const bc = dep.bc;
+
+    // Body `{ctx: <ctx_json>}`. `ctx_json` is the chain ctx the
+    // originating `http.fetch` call passed; empty → `{}`.
+    const ctx_src: []const u8 = if (event.ctx_json.len > 0) event.ctx_json else "{}";
+    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{ctx_src}) catch return;
+    defer allocator.free(body);
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
+    defer allocator.free(spath);
+
+    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
+    var txn_owned = true;
+    defer if (txn_owned) allocator.destroy(txn);
+    txn.* = inst.kv.beginTrackedImmediate() catch return;
+    var txn_done = false;
+    defer if (!txn_done) txn.rollback() catch {};
+
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    defer readset.deinit();
+    const request_id: u64 = blk: {
+        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
+        break :blk tl.id_minter.nextRequestId() catch 0;
+    };
+
+    // Correlation: all activations of one fetch share `fetch-<id>`
+    // so the replay UX groups the chunk chain with its terminal.
+    var corr_buf: [80]u8 = undefined;
+    const id_len: usize = @min(event.fetch_id.len, 64);
+    const corr_full = std.fmt.bufPrint(
+        &corr_buf,
+        "fetch-{s}",
+        .{event.fetch_id[0..id_len]},
+    ) catch corr_buf[0..0];
+
+    const act_source: log_mod.ActivationSource = .fetch_chunk;
+
+    var req: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = body,
+        .query = null,
+        .readset = &readset,
+        .request_id = request_id,
+        .platform = inst.platform,
+        .limiter = &worker.limiter,
+        .instance_id = inst.id,
+        .correlation_id = corr_full,
+        .activation_source = act_source,
+        .activation_fetch_id = event.fetch_id,
+        .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
+        // Phase 5 PR-3: §6.4 held-sync resume hook. The baked
+        // `__system/webhook_onresult` shim calls `__rove_resume_if_bound`
+        // on terminal to wake any parked cont bound to this send-id.
+        // Set on every fetch-event activation (the H2 path sets it
+        // too, in `worker_dispatch.zig`); without this the JS builtin
+        // sees a null trampoline + returns false, leaving the cont
+        // parked until its 25s deadline.
+        .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
+        .resume_if_bound_ctx = @ptrCast(worker),
+        .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
+        .cancel_fetch_ctx = @ptrCast(worker),
+    };
+    req.activation_fetch_seq = event.seq;
+    req.activation_fetch_byte_offset = event.byte_offset;
+    req.activation_fetch_bytes = event.bytes;
+    req.activation_fetch_headers = event.fetch_headers;
+    req.activation_fetch_final = event.final;
+    if (event.final) {
+        req.activation_fetch_terminal_status = event.terminal_status;
+        req.activation_fetch_terminal_ok = event.terminal_ok;
+        req.activation_fetch_body_truncated = event.body_truncated;
+    }
+
+    // Phase 4-fetch-inline: small fetch chunks ride inline in
+    // the readset's `fetch_responses.inline_bytes` field — no
+    // buffer append, no S3 PUT, handler runs immediately. The
+    // raft entry's fsync IS the durability substrate (every
+    // replica sees the bytes when the entry replicates).
+    // Discriminator: `body_ref.batch_id == NO_BATCH` ⇒ inline.
+    //
+    // Larger chunks submit to the process-global blob coordinator
+    // (`coord.submit` → seq) and park in `fetch_pending_durability`;
+    // `drainFetchPendingDurability` re-fires the activation with the
+    // materialized `BodyRef` once durable (closing the §5.1 outbound
+    // unreplayability gap), then `coord.release`s the retained copy.
+    //
+    // The bytes still ride alongside on `activation_fetch_bytes`
+    // for the handler's `request.activation.bytes` view; the
+    // tape's `activation_bytes` still captures them too. Both
+    // coexist during the Phase 2 → Phase 3 transition; the
+    // inline bytes drop out when the raft entry adopts the
+    // BodyRef in Phase 3.
+    //
+    // Terminal-only events (final=true with no body bytes) still
+    // capture a tape entry so the chain has the closing seq +
+    // terminal status / ok / body_truncated for replay; both
+    // body_ref and inline_bytes are empty.
+    const FETCH_INLINE_THRESHOLD: usize = 16 * 1024;
+    var body_ref: bodies_mod.BodyRef = .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = 0 };
+    var inline_bytes_for_tape: []const u8 = "";
+    if (parked_body_ref) |saved| {
+        // Slice 4-fetch-park: resume from a previous park. The
+        // body's batch was confirmed durable by
+        // drainFetchPendingDurability before this re-fire; use
+        // the saved ref directly + skip append. Re-appending
+        // would mint a new batch and re-trigger park.
+        body_ref = saved;
+    } else if (event.bytes.len > 0 and event.bytes.len <= FETCH_INLINE_THRESHOLD) {
+        // Inline fast path — no buffer append, the chunk bytes
+        // ride on the tape entry directly. Raft entry fsync IS
+        // the durability substrate.
+        body_ref = .{
+            .batch_id = bodies_mod.NO_BATCH,
+            .offset = 0,
+            .len = @intCast(event.bytes.len),
+        };
+        inline_bytes_for_tape = event.bytes;
+    } else if (event.bytes.len > 0) {
+        // Larger-than-threshold chunk — coord submit + park.
+        // docs/streaming-model.md §7: submit returns a
+        // seq; durability is observed via the coord's per-worker
+        // HWM. Always park (no fast-durable bypass — submit is
+        // strictly async, durable_seq can't have advanced past
+        // this seq before the executor lands the PUT).
+        if (worker.node.blob_coord.coordinator) |coord| {
+            const wid: u8 = @intCast(worker.log_worker_id);
+            const seq = coord.submit(wid, event.bytes) catch |err| blk: {
+                std.log.warn(
+                    "rove-js fetch-event: coord.submit tenant={s} bytes={d}: {s}",
+                    .{ tenant_id, event.bytes.len, @errorName(err) },
+                );
+                break :blk @as(?u64, null);
+            };
+            if (seq) |s| {
+                worker.fetch_pending_durability.append(worker.allocator, .{
+                    .event = event.*,
+                    .worker_seq = s,
+                    .worker_id = wid,
+                    .tenant_id_view = inst.id,
+                }) catch |err| {
+                    std.log.warn(
+                        "rove-js fetch-event: fetch_pending_durability.append tenant={s}: {s}",
+                        .{ tenant_id, @errorName(err) },
+                    );
+                    txn.rollback() catch {};
+                    txn_done = true;
+                    return;
+                };
+                parked_to_durability = true;
+                txn.rollback() catch {};
+                txn_done = true;
+                return;
+            }
+            // submit failed — fall through with empty body_ref.
+            // The activation runs but the tape entry has no
+            // BodyRef. Same posture as the pre-coord append-failed
+            // branch.
+        }
+    }
+    readset.fetch_responses.appendFetchResponse(
+        event.fetch_id,
+        event.seq,
+        event.byte_offset,
+        body_ref,
+        event.final,
+        if (event.final) event.terminal_status else 0,
+        if (event.final) event.terminal_ok else false,
+        if (event.final) event.body_truncated else false,
+        event.fetch_headers orelse "",
+        inline_bytes_for_tape,
+    ) catch |err| {
+        // Tape capture failures must never kill the request. Same
+        // posture as `captureTapes`'s per-channel serialize
+        // errors: log + skip.
+        std.log.warn(
+            "rove-js fetch-event: readset.fetch_responses append tenant={s} fetch_id={s}: {s}",
+            .{ tenant_id, event.fetch_id, @errorName(err) },
+        );
+    };
+
+    // Phase 2D: the activation's input bytes (the upstream chunk
+    // payload) get taped on `TapePayloads.activation_bytes`.
+    // Closes algebra §7 worklist #1 — replay reconstitutes the same
+    // handler invocation from the same captured bytes.
+    const activation_bytes_for_tape: []const u8 = event.bytes;
+
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    const run_oc = worker.dispatcher.runOutcome(
+        inst.kv,
+        txn,
+        &ws,
+        bc,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        tc.snap.triggers,
+        req,
+        &budget,
+    ) catch {
+        txn.rollback() catch {};
+        txn_done = true;
+        const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
+        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
+        return;
+    };
+
+    const wrote = ws.ops.items.len > 0;
+    var oc = run_oc;
+    // Fetch chains have no held socket — terminal commits/proposes;
+    // continuation/stream returns are deinit'd + recorded with a
+    // warning. Identical posture to `fireSubscriptionActivation`.
+    switch (oc) {
+        .terminal => |*r| {
+            defer r.deinit(allocator);
+            if (r.exception.len > 0) {
+                txn.rollback() catch {};
+                txn_done = true;
+                const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, tape_payloads, corr_full, act_source, 0);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            if (wrote) {
+                const lh_fetch_term: log_mod.LogHeader = .{
+                    .request_id = request_id,
+                    .deployment_id = tc.snap.deployment_id,
+                    .duration_ns = 0,
+                    .status = @intCast(@max(@min(r.status, 599), 100)),
+                    .outcome = .ok,
+                    .activation = act_source,
+                    .method = "POST",
+                    .path = module_path,
+                    .host = "",
+                    .correlation_id = corr_full,
+                };
+                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_fetch_term) catch |perr| {
+                    std.log.warn("rove-js fetch-event ({s}): propose failed: {s}", .{ module_path, @errorName(perr) });
+                    txn_owned = false;
+                    txn_done = true;
+                    const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, tape_payloads, corr_full, act_source, 0);
+                    r.console = &.{};
+                    r.exception = &.{};
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+                const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, tape_payloads, corr_full, act_source, fw_seq);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "fireFetchEventActivation.commit(terminal)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+            const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, tape_payloads, corr_full, act_source, 0);
+            r.console = &.{};
+            r.exception = &.{};
+        },
+        .continuation => |*cval| {
+            // Phase 5 PR-2: lift the cont arm to actually dispatch
+            // the named module. The fetch handler returned
+            // `__rove_next(path, {fn, ctx})` — enqueue a SendCallback
+            // Msg so the named handler runs as a fire-and-forget
+            // chain hop on the next worker tick. Inherits the
+            // current chain's correlation_id so replay UX groups
+            // the whole flow (inbound → fetch → chained hop) under
+            // one umbrella.
+            defer cval.deinit(allocator);
+            const enqueue_err = worker.node.router.enqueueChainedDispatchForTenant(
+                tenant_id,
+                cval.path,
+                cval.ctx_json,
+                cval.fn_name,
+                corr_full,
+            );
+            if (enqueue_err) |_| {} else |err| std.log.warn(
+                "rove-js fetch-event ({s}): chained dispatch enqueue failed: {s}",
+                .{ module_path, @errorName(err) },
+            );
+            if (wrote) {
+                const lh_fetch_cont: log_mod.LogHeader = .{
+                    .request_id = request_id,
+                    .deployment_id = tc.snap.deployment_id,
+                    .duration_ns = 0,
+                    .status = 200,
+                    .outcome = .ok,
+                    .activation = act_source,
+                    .method = "POST",
+                    .path = module_path,
+                    .host = "",
+                    .correlation_id = corr_full,
+                };
+                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_fetch_cont) catch |perr| {
+                    std.log.warn("rove-js fetch-event ({s}) cont-return propose failed: {s}", .{ module_path, @errorName(perr) });
+                    txn_owned = false;
+                    txn_done = true;
+                    const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, fw_seq);
+                return;
+            }
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "fireFetchEventActivation.commit(cont)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
+        },
+        .stream => |*s2| {
+            s2.deinit(allocator);
+            std.log.warn(
+                "rove-js fetch-event ({s}): __rove_stream from a fetch activation is a no-op (v1)",
+                .{module_path},
+            );
+            if (wrote) {
+                const lh_fetch_stream: log_mod.LogHeader = .{
+                    .request_id = request_id,
+                    .deployment_id = tc.snap.deployment_id,
+                    .duration_ns = 0,
+                    .status = 200,
+                    .outcome = .ok,
+                    .activation = act_source,
+                    .method = "POST",
+                    .path = module_path,
+                    .host = "",
+                    .correlation_id = corr_full,
+                };
+                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_fetch_stream) catch |perr| {
+                    std.log.warn("rove-js fetch-event ({s}) stream-return propose failed: {s}", .{ module_path, @errorName(perr) });
+                    txn_owned = false;
+                    txn_done = true;
+                    const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, fw_seq);
+                return;
+            }
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "fireFetchEventActivation.commit(stream)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
+        },
+    }
 }
