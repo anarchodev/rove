@@ -30,6 +30,7 @@ const http_b = @import("bindings/http.zig");
 const cont_b = @import("bindings/continuation.zig");
 const stream_b = @import("bindings/stream.zig");
 const scheduler_b = @import("bindings/scheduler.zig");
+const on_b = @import("bindings/on.zig");
 const td = @import("trigger_dispatch.zig");
 const reserved = @import("reserved.zig");
 const bytecode_cache_mod = @import("bytecode_cache.zig");
@@ -281,6 +282,33 @@ pub const FireWakeInput = struct {
     cleanup_keys: []const []const u8,
 };
 
+/// Handler-surface Phase 1: one `on.timer(ms)` / `on.kv(prefix,{to?})`
+/// registration accumulated during the body. Mirrors the
+/// `pending_fetches` accumulator shape — the binding appends, the
+/// worker drains at end-of-activation and arms the held entity's
+/// `StreamWakes` (`docs/handler-surface-impl-plan.md` Phase 1). A
+/// connection wake; inert (the accumulator is null) on connectionless
+/// activations.
+pub const PendingWakeReg = struct {
+    pub const Kind = enum { timer, kv };
+    kind: Kind,
+    /// `.timer`: wake interval in ms.
+    interval_ms: i64 = 0,
+    /// `.kv`: tenant-scoped key prefix to watch. Allocator-owned by the
+    /// accumulator list; the worker dups what it keeps onto the entity
+    /// and the list's deinit frees the rest.
+    prefix: []u8 = &.{},
+    /// Resume export selector ("module.method" or a bare "method"), or
+    /// null → the default `onWake` export. Allocator-owned.
+    to: ?[]u8 = null,
+
+    pub fn deinit(self: *PendingWakeReg, allocator: std.mem.Allocator) void {
+        if (self.prefix.len > 0) allocator.free(self.prefix);
+        if (self.to) |t| allocator.free(t);
+        self.* = undefined;
+    }
+};
+
 pub const DispatchState = struct {
     allocator: std.mem.Allocator,
     /// Per-request KV store. `kv.get("x")` reads from this handle,
@@ -340,6 +368,13 @@ pub const DispatchState = struct {
     /// frees any leftovers on error paths (no orphan fetches).
     /// Null on test paths that don't care.
     pending_fetches: ?*std.ArrayListUnmanaged(PendingFetch) = null,
+    /// Handler-surface Phase 1: caller-owned accumulator for `on.timer`
+    /// / `on.kv` registrations during this activation (same ownership
+    /// model as `pending_fetches`). The `_system.on.*` bindings append;
+    /// the worker arms them onto the held entity's `StreamWakes` at
+    /// park time and frees the list. Null on connectionless / test
+    /// paths — `on.*` is then inert (the model: connection-only wakes).
+    pending_wakes: ?*std.ArrayListUnmanaged(PendingWakeReg) = null,
     /// Phase 5 PR-2b: true ⇒ the dispatched module is a `__system/`
     /// built-in (e.g. the webhook shim's `webhook_onresult.mjs`).
     /// `isCustomerWriteReserved` is skipped so the shim can write
@@ -1549,6 +1584,12 @@ pub fn installStatic(ctx: *c.JSContext) void {
     evalSnippet(ctx, "retry.js", RETRY_JS);
     // §2.6 durable scheduled wake. After base64/crypto/kv (its deps).
     evalSnippet(ctx, "scheduler.js", SCHEDULER_JS);
+    // Handler-surface Phase 5: connectionless `schedule` verb (after
+    // scheduler.js + cron.js — reuses cron.parseDuration). `cron` the
+    // recurring verb lives in cron.js (already eval'd above).
+    evalSnippet(ctx, "schedule.js", SCHEDULE_JS);
+    // Handler-surface Phase 1: connection wake triggers.
+    evalSnippet(ctx, "on.js", ON_JS);
     evalSnippet(ctx, "webhook.js", WEBHOOK_JS);
     evalSnippet(ctx, "email.js", EMAIL_JS);
     // users is standalone (kv + crypto.{randomBytes,sha256}).
@@ -1608,6 +1649,14 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     } },
     .{ .path = &.{ "_system", "console" }, .fns = &.{
         .{ .name = "log", .cfunc = jsConsoleLog, .argc = 1 },
+    } },
+    // Handler-surface Phase 1: connection wake triggers. `on.timer` /
+    // `on.kv` accumulate onto `DispatchState.pending_wakes`; the worker
+    // arms them on the held entity at park. Inert when there's no held
+    // connection (the accumulator is null).
+    .{ .path = &.{ "_system", "on" }, .fns = &.{
+        .{ .name = "timer", .cfunc = on_b.jsOnTimer, .argc = 2 },
+        .{ .name = "kv",    .cfunc = on_b.jsOnKv,    .argc = 2 },
     } },
     // crypto. No crypto global in qjs-ng by default, so we fabricate
     // one. hmacSha256 is the vendor-neutral primitive for building
@@ -1755,6 +1804,8 @@ const SESSIONS_JS = @embedFile("sessions_js");
 const CRON_JS = @embedFile("cron_js");
 const RETRY_JS = @embedFile("retry_js");
 const SCHEDULER_JS = @embedFile("scheduler_js");
+const SCHEDULE_JS = @embedFile("schedule_js");
+const ON_JS = @embedFile("on_js");
 const WEBHOOK_JS = @embedFile("webhook_js");
 const EMAIL_JS = @embedFile("email_js");
 const TEXTCODEC_JS = @embedFile("textcodec_js");
@@ -1783,6 +1834,8 @@ const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "cron", .src = CRON_JS },
     .{ .name = "retry", .src = RETRY_JS },
     .{ .name = "scheduler", .src = SCHEDULER_JS },
+    .{ .name = "schedule", .src = SCHEDULE_JS },
+    .{ .name = "on", .src = ON_JS },
     .{ .name = "webhook", .src = WEBHOOK_JS },
     .{ .name = "email", .src = EMAIL_JS },
     .{ .name = "textcodec", .src = TEXTCODEC_JS },

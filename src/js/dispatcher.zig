@@ -275,6 +275,11 @@ pub const Request = struct {
     /// any leftovers at handler-error time. Null on test paths
     /// that don't care.
     pending_fetches: ?*std.ArrayListUnmanaged(globals.PendingFetch) = null,
+    /// Handler-surface Phase 1: caller-owned `on.timer`/`on.kv`
+    /// accumulator (threaded to `DispatchState.pending_wakes`). Set by
+    /// the worker only on connection activations; null elsewhere
+    /// (`on.*` inert). See `globals.PendingWakeReg`.
+    pending_wakes: ?*std.ArrayListUnmanaged(globals.PendingWakeReg) = null,
     /// Gap 2.1 subscription_fire payload (catalog §2.1 +
     /// `docs/subscriptions-plan.md`). Set only when
     /// `activation_source == .subscription_fire`; surfaces as
@@ -532,6 +537,7 @@ pub const Dispatcher = struct {
             .activation_entity = request.activation_entity,
             .activation_fetches_pending = request.activation_fetches_pending,
             .pending_fetches = request.pending_fetches,
+            .pending_wakes = request.pending_wakes,
             .is_system_module = request.is_system_module,
         };
 

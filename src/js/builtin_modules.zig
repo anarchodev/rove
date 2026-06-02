@@ -63,6 +63,11 @@ const MODULES = [_]struct {
         .path = "__system/scheduler_tick.mjs",
         .src = @embedFile("builtin_scheduler_tick_mjs"),
     },
+    .{
+        // Handler-surface Phase 5: the `cron(...)` recurrence engine.
+        .path = "__system/cron_tick.mjs",
+        .src = @embedFile("builtin_cron_tick_mjs"),
+    },
 };
 
 /// Compile every built-in module to QJS bytecode and return an

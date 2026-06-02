@@ -1,42 +1,33 @@
-// @rove/cron — time helpers for scheduling http.send fires.
+// @rove/cron — recurring durable schedule verb (handler-surface §2.4),
+// plus the crontab/time helpers it carries as statics.
 //
-// The platform's `http.send({fire_at_ns: BigInt})` already does
-// scheduled delivery; this module is just convenience for converting
-// human time inputs (durations, "tomorrow at 3am", crontab strings)
-// to the BigInt nanosecond-since-epoch the binding expects.
+// `cron(spec, target, ctx?)` registers a recurring connectionless
+// durable fire over the gap-2.6 scheduler: each crontab occurrence runs
+// `target` (a fresh durable activation, no held socket, surviving leader
+// change) and re-arms for the next occurrence. The callable also exposes
+// the time/expr helpers (`cron.next`, `cron.dailyAt`, …) used to compute
+// fire times — handy with the one-shot `schedule({ at })` verb.
 //
-//   // Daily cleanup, self-rescheduling.
-//   // tasks/cleanup.mjs
-//   export default function () {
-//     // ...do the daily work...
-//     http.send({
-//       url: `https://${request.host}${request.path}`,
-//       fire_at_ns: cron.dailyAt(3, 0),  // tomorrow at 03:00
-//     });
-//   }
+//   // tasks/cleanup.mjs — runs nightly, durably.
+//   export default function () { /* register once */ cron("0 3 * * *", "tasks/cleanup"); }
 //
-//   // Fire once in 30 minutes.
-//   http.send({ url, fire_at_ns: cron.fromNow("30m") });
+//   // One-shot:
+//   schedule({ in: "30m" }, "tasks/poll");
+//   schedule({ at: cron.dailyAt(3, 0) }, "tasks/cleanup");
 //
-//   // Fire on the next cron expression match.
-//   http.send({ url, fire_at_ns: cron.next("0 3 * * *") }); // daily 3am
+// IIFE-wrapped (like every other globals/ shim): the arenajs base-
+// snapshot freeze corrupts on bare top-level function declarations /
+// `Object.assign` left in the script's global lexical scope — scope it.
 
+(function () {
 const NS_PER_MS = 1_000_000n;
 
-/**
- * Time helpers that convert human inputs (durations, daily/weekly
- * slots, crontab strings) into the BigInt nanoseconds-since-epoch
- * that `http.send({fire_at_ns})` expects. All slot math is UTC.
- *
- * @namespace cron
- * @example
- * // Daily 03:00 UTC cleanup, self-rescheduling.
- * http.send({ url, fire_at_ns: cron.dailyAt(3, 0) });
- * @example
- * http.send({ url, fire_at_ns: cron.fromNow("30m") }); // in 30 min
- * http.send({ url, fire_at_ns: cron.next("0 3 * * *") }); // daily 3am
- */
-globalThis.cron = {
+// Time helpers that convert human inputs (durations, daily/weekly
+// slots, crontab strings) into the BigInt nanoseconds-since-epoch the
+// scheduler verbs work in. All slot math is UTC. Attached as statics
+// on the callable `cron` verb below, so `cron.next(expr)` /
+// `cron.dailyAt(3, 0)` stay available alongside `cron(spec, target)`.
+const _cronHelpers = {
   /**
    * Coerce a time input to BigInt nanoseconds-since-epoch.
    *
@@ -295,3 +286,55 @@ function _parseField(field, min, max) {
   }
   return out;
 }
+
+/**
+ * Register a **recurring durable** schedule: run `target` on every
+ * occurrence of the crontab `spec` (docs/handler-shape.md §2.4). A
+ * connectionless trigger — the fire is a fresh durable activation with
+ * no held socket, surviving leader changes (it rides the gap-2.6
+ * scheduler). Idempotent: re-calling with the same `(spec, target)`
+ * (e.g. on every request or boot) keeps exactly one cron registration.
+ *
+ * The callable `cron` also carries the time/expr helpers as statics
+ * (`cron.next`, `cron.dailyAt`, `cron.parseDuration`, …).
+ *
+ * @function cron
+ * @param {string} spec - 5-field crontab expression (see
+ *   {@link cron.next}), e.g. `"0 3 * * *"` (daily 03:00 UTC).
+ * @param {string} target - Module specifier to run each occurrence,
+ *   e.g. `"jobs/cleanup"`.
+ * @param {*} [ctx] - JSON-serializable value delivered to the target as
+ *   `request.activation.msg`.
+ * @returns {string} The stable registration id (cancel via
+ *   `scheduler.cancel(id)`).
+ * @throws {TypeError} On a non-string `spec`/`target` or malformed spec.
+ * @example
+ * cron("0 3 * * *", "jobs/cleanup");        // nightly cleanup
+ * cron("*\/15 * * * *", "jobs/poll", { src }); // every 15 min
+ */
+function cron(spec, target, ctx) {
+  if (typeof spec !== "string") {
+    throw new TypeError("cron(spec, target, ctx?): spec must be a crontab string");
+  }
+  if (typeof target !== "string" || target.length === 0) {
+    throw new TypeError("cron(spec, target, ctx?): target must be a non-empty module specifier");
+  }
+  // Validate the spec + compute the first occurrence (throws on a
+  // malformed expression — fail at registration, not at fire time).
+  const firstNs = cron.next(spec);
+  // Stable id from (spec, target) so re-registering is idempotent —
+  // base64url(no pad)(sha256(...)), mirroring webhook/scheduler ids.
+  const key = "cron/" + spec + " " + target;
+  // Return the scheduler ID (not the key) — that's what scheduler.get /
+  // scheduler.cancel take and what `_sched/by_id/{id}` is keyed by.
+  return scheduler.at(
+    firstNs,
+    "__system/cron_tick",
+    { spec, target, ctx: ctx === undefined ? null : ctx },
+    { key },
+  );
+}
+
+Object.assign(cron, _cronHelpers);
+globalThis.cron = cron;
+})();
