@@ -237,7 +237,62 @@ convergence; §3/§4 `stream()` edges → `stream.start()` effect; drop
   convention, and (c) generalizing wakes onto held continuations. The
   only genuinely *new* substrate is gap 2.6 (Phase 5).
 
-## 6. Relation
+## 6. App-manifest seam (reserve now, consume post-launch)
+
+Distributable (marketplace) apps — apps written for the hosted product
+that a self-hoster installs on a personal rewind install
+(`project_self_host_marketplace`) — need a per-deployment **app
+manifest**: install-time **config schema** + listing **metadata**
+(author-declared) and the **capability set** (the effect verbs the
+deployment uses — *derived*, the install-time grant prompt is built from
+it). The marketplace itself is post-launch; the only thing that must be
+done *while the surface is being built* is leaving the seam, because the
+capability set is a byproduct of code that exists only during this
+redesign. The two halves map onto two seams that already exist:
+
+**Half 1 — config schema + metadata (author-declared data).** Rides the
+existing `_config/` deploy-mirror pattern: `config_mirror.zig`
+(`mirrorConfigToKv`) already walks a release's manifest for
+`_config/*.json` and stages it into app.db in the **same `TrackedTxn`
+that flips `_deploy/current`**, wired at `worker_dispatch.zig`
+`handleRelease` (~:1671). A reserved `_app/manifest.json` bundle file
+mirrors the same way to the `_app/manifest` key — a sibling walker
+(`manifest_app.zig`) at the same seam. No new deploy machinery; it rides
+the atomic release commit. (`_app/` is reserved in `reserved.zig`.)
+
+**Half 2 — capability set (derived, NOT author-declared).** Phase 4's §6
+export-coverage validator (`handler-shape.md` §6;
+`dispatcher.zig` + loader) **must already enumerate the effect verbs each
+handler uses** to check resume-export coverage. That enumeration *is* the
+capability manifest. The precedent is `deployment_cache.zig`'s
+`buildSubscriptionRegistry` (~:140), which already derives structured
+runtime data from the manifest at deploy. Record the used-effect set into
+the deployment record beside it.
+
+**The one non-deferrable action — do it in Phase 4:**
+
+> When the §6 validator walks exports and computes the used-effect set for
+> coverage validation, **also persist that set into the deployment
+> record** (`deployment_cache.zig`, alongside the subscription registry).
+
+The effect-enumeration code is written exactly once — here, in Phase 4.
+Retrofitting an effect-enumeration pass after the surface ships is the
+expensive part this seam avoids. It is a few lines on a pass already
+being written, nothing consumes the output yet, and every app deployed
+from that point carries a derived capability manifest.
+
+Cheap companions (anytime, not gated on Phase 4): the `handleRelease`
+walk can accept-and-store `_app/manifest.json` so authors declare
+metadata/config-schema today.
+
+**Out of scope now (post-launch):** the install/grant UI, the registry,
+bundle signing/provenance (the shipped ECDSA primitive), the update flow.
+Grant *enforcement* needs almost nothing new — the effect algebra already
+enforces least privilege at runtime, so a "grant" is a deploy-time
+allow-list diffed against the derived capability set, not new isolation
+machinery.
+
+## 7. Relation
 
 - `handler-shape.md` — target surface (needs the `stream.*` rewrite,
   Phase 6).
