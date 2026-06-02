@@ -886,7 +886,7 @@ pub const TenantFilesSnapshot = struct {
     /// Borrowed pointer to the node-wide content-addressed cache.
     /// Snapshot `deinit` releases every bytecode lease through it.
     /// Always non-null in production — `reloadDeployment` is the
-    /// only constructor and it pulls the cache from `slot.node`,
+    /// only constructor and it pulls the cache from `slot.bytecode_cache`,
     /// which `openTenantSlotNode` always sets.
     cache: *BytecodeCache,
     /// Deployment id this snapshot represents. Equal to the
@@ -990,12 +990,20 @@ pub const TenantSlot = struct {
     /// Optional/`null` only in unit-test slot literals — a slot with
     /// no raft handle just skips the config mirror.
     raft: ?*kv_mod.RaftNode = null,
-    /// Borrowed back-pointer to the owning NodeState. Set by
-    /// `openTenantSlotNode`. Used by the deployment loader for
-    /// cross-thread enqueues (Gap 2.1 Phase D boot firing →
-    /// `node.enqueueSubscriptionFireForTenant`). Optional only in
+    /// Borrowed pointer to the node-wide content-addressed bytecode
+    /// cache. Set by `openTenantSlotNode`; `reloadAllBytecodes` builds
+    /// each snapshot's lease set through it. Optional only in unit-test
+    /// slot literals. (Phase A of the TenantSlot/DeploymentCache split:
+    /// replaces the former `node: *NodeState` god-pointer — a slot now
+    /// borrows only the two subsystems it actually uses, `bytecode_cache`
+    /// + `router`, decoupling it from NodeState entirely.)
+    bytecode_cache: ?*BytecodeCache = null,
+    /// Borrowed pointer to the node's async-activation router. Set by
+    /// `openTenantSlotNode`; used for cross-thread boot-subscription
+    /// firing (Gap 2.1 Phase D boot firing →
+    /// `router.enqueueSubscriptionFireForTenant`). Optional only in
     /// unit-test slot literals.
-    node: ?*NodeState = null,
+    router: ?*MsgRouter = null,
     /// Owned blob backend for file-blobs (source + bytecode bytes).
     blob_backend: blob_mod.BlobBackend,
     /// Owned blob backend for per-deployment manifest JSON.
@@ -3070,7 +3078,8 @@ fn openTenantSlotNode(node: *NodeState, inst: *const tenant_mod.Instance) !*Tena
         .instance_id = id_copy,
         .app_kv = inst.kv,
         .raft = node.raft,
-        .node = node,
+        .bytecode_cache = &node.bytecode_cache,
+        .router = &node.router,
         .blob_backend = blob_backend,
         .manifest_backend = manifest_backend,
         .prefetched_manifest = prefetched,
@@ -3282,8 +3291,7 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
     // lease so a mid-build fetch failure doesn't leak refcount on
     // any cache entry we already touched (either reused or fresh-
     // inserted).
-    const node = slot.node orelse return error.SlotNotOpenedThroughNode;
-    const cache: *BytecodeCache = &node.bytecode_cache;
+    const cache: *BytecodeCache = slot.bytecode_cache orelse return error.SlotNotOpenedThroughNode;
     var next_bc: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
     errdefer {
         var it = next_bc.iterator();
@@ -3605,7 +3613,7 @@ fn sweepTenantCron(
 /// applied — next reload skips. Single-fire semantics; no
 /// "fired-but-not-marked" window.
 fn enqueueBootSubscriptions(slot: *TenantSlot, snap: *TenantFilesSnapshot) !void {
-    const node = slot.node orelse return; // unit-test slot: no node, no enqueue
+    const router = slot.router orelse return; // unit-test slot: no router, no enqueue
     for (snap.subscriptions) |sub| {
         if (sub.spec != .boot) continue;
 
@@ -3636,7 +3644,7 @@ fn enqueueBootSubscriptions(slot: *TenantSlot, snap: *TenantFilesSnapshot) !void
         // message onto an `effect.SubscriptionFire` payload (via
         // `effect.enqueueMsg`) and `dispatchSubscriptionFires` fires
         // it on the next tick.
-        node.router.enqueueSubscriptionFireForTenant(.{
+        router.enqueueSubscriptionFireForTenant(.{
             .tenant_id = slot.instance_id,
             .subscription_name = sub.name,
             .module_path = sub.module_path,
