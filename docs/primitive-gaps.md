@@ -203,6 +203,70 @@ It makes `webhook.send` a clean composition immediately, sidesteps the
 index hazard, and many-timers + ordered-index can land later behind the
 same `scheduleWake` surface if a customer earns it.
 
+**The contract fork — firing vs completion — RESOLVED: firing.** The
+second axis is what the wake *guarantees*, and it decides whether
+`_send/owed/` survives at all:
+
+- **At-least-once firing** (weaker): the wake guarantees the handler
+  *runs* (possibly twice); the handler/library owns the retry loop and
+  the dedup. The obligation record (`_send/owed/`) survives as ordinary
+  library kv — de-privileged, but present.
+- **At-least-once completion** (stronger, the Cloudflare DO `alarm()`
+  model): the wake persists until the handler returns terminal-success;
+  the *engine* re-arms on throw/retry and clears the wake on success. The
+  wake record IS the obligation, so the separate marker **collapses** —
+  no `_send/owed/` at all. Cost: retry/backoff policy moves into the
+  engine (Zig), a bigger privileged surface.
+
+**Resolve in favor of firing.** The apparent dilemma — "engine-owned
+retry lets us rate-limit; customer-owned retry is flexible + less special
+code" — is false, because retry **policy** and retry **budget** separate
+cleanly across layers:
+
+- **Policy** (attempts, backoff curve, give-up) is a *composition* —
+  lives in JS. Customer picks it; the library
+  (`globals/webhook.js` + `webhook_onresult`) ships a safe default
+  (`max_attempts=5`, 1→60s backoff) so safe-by-default needs no engine
+  retry.
+- **Budget** (how fast wakes fire, how much outbound a tenant gets) is a
+  *resource bound* — lives in the engine **regardless of who owns the
+  policy.** Every wake flows through the engine's wake dispatcher and
+  every attempt through `http.fetch`; both are strike-bound Cmd runtimes
+  (§5). A pathological "re-arm every 1ms forever" policy is just wake
+  records the dispatcher fires at *its* budgeted pace under *its*
+  per-tenant `http.fetch` cap.
+
+So you keep all three properties at once: **you** control the rate (the
+caps below), **customers** decide the policy (JS), and there's **less
+special engine code** (no retry kernel — retry stays in the shim).
+
+The tiebreaker: **completion walks back the durability-as-JS-shim
+decision** ([[project_durability_as_js_shim]], `b908953`) that deleted
+~4.7 kLOC of Zig (`SendDispatch` + the send retry kernel) precisely to
+move the retry loop into JS. Firing is continuous with that direction and
+with the "compose from primitives / new Zig is a smell" priors
+([[feedback_compose_from_primitives]], [[feedback_stop_before_zig]]);
+completion re-absorbs a composition into the engine.
+
+Consequence for the original question: **`_send/owed/` does not
+disappear — it is de-privileged.** The marker was never the problem; the
+*privileged sweep* was. Under firing it survives as ordinary
+library-owned kv with no reserved-prefix / apply-time / baked-handler
+semantics.
+
+The two structural caps firing requires (wanted anyway — a runaway engine
+retry loop or a million single-retry tenants needs an aggregate bound
+either way):
+
+1. a **per-tenant wake-dispatch budget** (rate + max outstanding wakes —
+   sibling of `HELD_MAX_PER_TENANT=16`), bounding queued wake activations
+   so one tenant's retry storm can't starve others or run O(N) on a tick
+   ([[feedback_no_n_tenants_hot_path]]); and
+2. the **per-tenant `http.fetch` resource bound** already required.
+
+Cap #1 is real strike-posture work, not free — but it *is* the control
+surface, not a tax paid for the firing contract.
+
 **Preserves all of §5.** Commit-gated (the wake Cmd writes a Model key,
 released post-commit per L4); replayable (the `durable_wake` Msg is a
 taped input per L3; `at_ns` is a recorded scalar); affine + strike posture
@@ -223,7 +287,7 @@ proposal. Status snapshot:
 | 3 | 2.3 streaming outbound (`http.fetch`) | **DONE 2026-05-21** |
 | 4 | 2.4 streaming inbound body | design locked in `streaming-model.md` §3; implementation pending |
 | 5 | 2.5 held outbound subscription | **DONE 2026-05-24** |
-| 6 | 2.6 durable scheduled wake | **PROPOSED 2026-06-01** — unbuilt; one-vs-many-timer fork open |
+| 6 | 2.6 durable scheduled wake | **PROPOSED 2026-06-01** — unbuilt; contract fork resolved (firing, not completion); one-vs-many-timer fork still open |
 
 ---
 
