@@ -45,6 +45,7 @@ const effect_mod = @import("effect/root.zig");
 const raft_propose = @import("raft_propose.zig");
 const panic_mod = @import("panic.zig");
 const builtin_modules_mod = @import("builtin_modules.zig");
+const deployment_cache = @import("deployment_cache.zig");
 
 const worker_mod = @import("worker.zig");
 const worker_drain = @import("worker_drain.zig");
@@ -1666,6 +1667,384 @@ pub fn fireSubscriptionActivation(
     }
 }
 
+/// §2.6 durable-wake (P1): fire the baked `__system/scheduler_tick`
+/// for one tenant. Structural twin of `fireSubscriptionActivation`
+/// but: (1) the module is the node-level baked `__system/scheduler_tick`
+/// (so `is_system_module` ⇒ it may call the capability-scoped
+/// `__rove_set_wake` / `__rove_fire_wake`); (2) it installs the
+/// durable-wake trampolines — `set_wake` → THIS tenant's slot,
+/// `fire_wake` → the router; (3) no boot-marker injection.
+/// `scheduler_tick` writes no kv of its own (the per-entry deletes
+/// ride with each fired target's writeset via `__rove_fire_wake`), so
+/// its writeset is normally empty → empty commit.
+///
+/// Fired inline by `durable_wake.sweepDurableWakes` on the
+/// partition-owner worker (steady state, when `next_wake_ns` is due)
+/// and by the post-commit bootstrap hook (P2). Errors log + skip —
+/// the next sweep / promotion re-fires. `scheduler_tick` is our own
+/// module and always returns terminal; a continuation/stream return
+/// is treated as a bug (rolled back + logged).
+pub fn fireSchedulerTick(worker: anytype, tenant_id: []const u8) void {
+    const allocator = worker.allocator;
+    const module_path = "__system/scheduler_tick";
+
+    var dep = resolveDeployment(worker, allocator, tenant_id, module_path) catch |err| {
+        std.log.warn(
+            "rove-js scheduler_tick: tenant={s} resolveDeployment failed: {s}; skipping",
+            .{ tenant_id, @errorName(err) },
+        );
+        return;
+    };
+    defer dep.tc.release();
+    const inst = dep.inst;
+    const tc = dep.tc;
+    const bc = dep.bc;
+    const slot = dep.tc.slot;
+
+    const body = allocator.dupe(u8, "{\"ctx\":{}}") catch return;
+    defer allocator.free(body);
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
+    defer allocator.free(spath);
+
+    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
+    var txn_owned = true;
+    defer if (txn_owned) allocator.destroy(txn);
+    txn.* = inst.kv.beginTrackedImmediate() catch return;
+    var txn_done = false;
+    defer if (!txn_done) txn.rollback() catch {};
+
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    defer readset.deinit();
+    const request_id: u64 = blk: {
+        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
+        break :blk tl.id_minter.nextRequestId() catch 0;
+    };
+
+    var corr_buf: [48]u8 = undefined;
+    const corr_full = std.fmt.bufPrint(&corr_buf, "sched-{x:0>16}", .{request_id}) catch corr_buf[0..0];
+
+    const req: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = body,
+        .query = null,
+        .readset = &readset,
+        .request_id = request_id,
+        .platform = inst.platform,
+        .limiter = &worker.limiter,
+        .instance_id = inst.id,
+        .correlation_id = corr_full,
+        .activation_source = .subscription_fire,
+        .activation_subscription_name = "__scheduler_tick",
+        .activation_subscription_source = null,
+        .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
+        .set_wake = &deployment_cache.TenantSlot.setWakeTrampoline,
+        .set_wake_ctx = @ptrCast(slot),
+        .fire_wake = &@TypeOf(worker.*).fireWakeTrampoline,
+        .fire_wake_ctx = @ptrCast(worker),
+    };
+
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    const run_oc = worker.dispatcher.runOutcome(
+        inst.kv,
+        txn,
+        &ws,
+        bc,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        tc.snap.triggers,
+        req,
+        &budget,
+    ) catch {
+        txn.rollback() catch {};
+        txn_done = true;
+        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, corr_full, .subscription_fire, 0);
+        return;
+    };
+
+    const wrote = ws.ops.items.len > 0;
+    var oc = run_oc;
+    switch (oc) {
+        .terminal => |*r| {
+            defer r.deinit(allocator);
+            if (r.exception.len > 0) {
+                txn.rollback() catch {};
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, corr_full, .subscription_fire, 0);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            if (wrote) {
+                const lh: log_mod.LogHeader = .{
+                    .request_id = request_id,
+                    .deployment_id = tc.snap.deployment_id,
+                    .duration_ns = 0,
+                    .status = @intCast(@max(@min(r.status, 599), 100)),
+                    .outcome = .ok,
+                    .activation = .subscription_fire,
+                    .method = "POST",
+                    .path = module_path,
+                    .host = "",
+                    .correlation_id = corr_full,
+                };
+                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh) catch |perr| {
+                    std.log.warn("rove-js scheduler_tick ({s}): propose failed: {s}", .{ tenant_id, @errorName(perr) });
+                    txn_owned = false;
+                    txn_done = true;
+                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, corr_full, .subscription_fire, 0);
+                    r.console = &.{};
+                    r.exception = &.{};
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, r.console, r.exception, .{}, corr_full, .subscription_fire, fw_seq);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "fireSchedulerTick.commit(terminal)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, r.console, r.exception, .{}, corr_full, .subscription_fire, 0);
+            r.console = &.{};
+            r.exception = &.{};
+        },
+        .continuation => |*cval| {
+            cval.deinit(allocator);
+            std.log.warn("rove-js scheduler_tick ({s}): unexpected __rove_next return (no-op)", .{tenant_id});
+            txn.rollback() catch {};
+            txn_done = true;
+        },
+        .stream => |*s2| {
+            s2.deinit(allocator);
+            std.log.warn("rove-js scheduler_tick ({s}): unexpected __rove_stream return (no-op)", .{tenant_id});
+            txn.rollback() catch {};
+            txn_done = true;
+        },
+    }
+}
+
+/// §2.6 durable-wake (P1): dispatch one due `_sched/by_time` entry's
+/// `target` handler as a `durable_wake` activation. Structural twin of
+/// `fireSubscriptionActivation` but: (1) it injects the entry's
+/// `cleanup_keys` as deletes into the handler's writeset BEFORE the
+/// handler runs, so the entry's removal commits atomically with the
+/// handler's effects (exactly-once on the normal path; a crash between
+/// fire and commit leaves the keys for a boot/promotion re-fire — the
+/// at-least-once *firing* contract); (2) the activation surface is
+/// `request.activation = { kind:"durable_wake", id, key,
+/// scheduled_at_ns, msg }`. No held socket; writes commit forgetfully.
+///
+/// Injecting the deletes means `wrote` is always true, so the cleanup
+/// always proposes through raft even for a target that itself writes
+/// nothing. Errors log + skip — the entry survives for the next
+/// tick (its `_sched` keys weren't committed).
+fn fireDurableWakeActivation(worker: anytype, dw: *effect_mod.msg.DurableWake) void {
+    const allocator = worker.allocator;
+    const tenant_id = dw.tenant_id;
+    const module_path = dw.module_path;
+
+    var dep = resolveDeployment(worker, allocator, tenant_id, module_path) catch |err| {
+        std.log.warn(
+            "rove-js durable-wake: tenant={s} target={s} resolveDeployment failed: {s}; skipping",
+            .{ tenant_id, module_path, @errorName(err) },
+        );
+        return;
+    };
+    defer dep.tc.release();
+    const inst = dep.inst;
+    const tc = dep.tc;
+    const bc = dep.bc;
+
+    // The customer target reads `request.activation.msg`; also surface
+    // the msg as `request.body = {"ctx": <msg>}` for uniformity with
+    // the other fire paths (`JSON.parse(request.body).ctx`).
+    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{dw.msg_json}) catch return;
+    defer allocator.free(body);
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
+    defer allocator.free(spath);
+
+    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
+    var txn_owned = true;
+    defer if (txn_owned) allocator.destroy(txn);
+    txn.* = inst.kv.beginTrackedImmediate() catch return;
+    var txn_done = false;
+    defer if (!txn_done) txn.rollback() catch {};
+
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    defer readset.deinit();
+    const request_id: u64 = blk: {
+        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
+        break :blk tl.id_minter.nextRequestId() catch 0;
+    };
+
+    // Inject the fired entry's `_sched/` deletes BEFORE the handler
+    // runs — they commit atomically with the handler's effects.
+    for (dw.cleanup_keys) |k| {
+        txn.delete(k) catch |err| {
+            std.log.warn("rove-js durable-wake ({s}/{s}): cleanup txn.delete failed: {s}", .{ tenant_id, dw.id, @errorName(err) });
+            return;
+        };
+        ws.addDelete(k) catch |err| {
+            std.log.warn("rove-js durable-wake ({s}/{s}): cleanup ws.addDelete failed: {s}", .{ tenant_id, dw.id, @errorName(err) });
+            return;
+        };
+    }
+
+    var corr_buf: [80]u8 = undefined;
+    const id_prefix_len: usize = @min(dw.id.len, 32);
+    const corr_full = std.fmt.bufPrint(&corr_buf, "wake-{s}-{x:0>16}", .{ dw.id[0..id_prefix_len], request_id }) catch corr_buf[0..0];
+
+    const req: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = body,
+        .query = null,
+        .readset = &readset,
+        .request_id = request_id,
+        .platform = inst.platform,
+        .limiter = &worker.limiter,
+        .instance_id = inst.id,
+        .correlation_id = corr_full,
+        .activation_source = .durable_wake,
+        .activation_wake_id = dw.id,
+        .activation_wake_key = dw.key,
+        .activation_wake_scheduled_at_ns = dw.scheduled_at_ns,
+        .activation_wake_msg_json = dw.msg_json,
+        .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
+    };
+
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    const run_oc = worker.dispatcher.runOutcome(
+        inst.kv,
+        txn,
+        &ws,
+        bc,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        tc.snap.triggers,
+        req,
+        &budget,
+    ) catch {
+        txn.rollback() catch {};
+        txn_done = true;
+        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, corr_full, .durable_wake, 0);
+        return;
+    };
+
+    // `wrote` is always true (cleanup deletes were injected), so we
+    // always propose. A handler exception still rolls back — including
+    // the cleanup deletes — so the entry survives for a re-fire.
+    var oc = run_oc;
+    switch (oc) {
+        .terminal => |*r| {
+            defer r.deinit(allocator);
+            if (r.exception.len > 0) {
+                txn.rollback() catch {};
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, corr_full, .durable_wake, 0);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            const lh: log_mod.LogHeader = .{
+                .request_id = request_id,
+                .deployment_id = tc.snap.deployment_id,
+                .duration_ns = 0,
+                .status = @intCast(@max(@min(r.status, 599), 100)),
+                .outcome = .ok,
+                .activation = .durable_wake,
+                .method = "POST",
+                .path = module_path,
+                .host = "",
+                .correlation_id = corr_full,
+            };
+            const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh) catch |perr| {
+                std.log.warn("rove-js durable-wake ({s}/{s}): propose failed: {s}", .{ tenant_id, dw.id, @errorName(perr) });
+                txn_owned = false;
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, corr_full, .durable_wake, 0);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            };
+            txn_owned = false;
+            txn_done = true;
+            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .durable_wake, fw_seq);
+            r.console = &.{};
+            r.exception = &.{};
+        },
+        .continuation => |*cval| {
+            // No held socket on a durable-wake origin; the cont is
+            // recorded but ignored (v1) — but the cleanup deletes
+            // still commit. Customers compose multi-step via
+            // webhook.send / a follow-up scheduler.at.
+            cval.deinit(allocator);
+            std.log.warn("rove-js durable-wake ({s}/{s}): __rove_next from wake origin is a no-op (v1)", .{ tenant_id, dw.id });
+            const lh: log_mod.LogHeader = .{
+                .request_id = request_id,
+                .deployment_id = tc.snap.deployment_id,
+                .duration_ns = 0,
+                .status = 200,
+                .outcome = .ok,
+                .activation = .durable_wake,
+                .method = "POST",
+                .path = module_path,
+                .host = "",
+                .correlation_id = corr_full,
+            };
+            const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh) catch |perr| {
+                std.log.warn("rove-js durable-wake ({s}/{s}) cont-return propose failed: {s}", .{ tenant_id, dw.id, @errorName(perr) });
+                txn_owned = false;
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .durable_wake, 0);
+                return;
+            };
+            txn_owned = false;
+            txn_done = true;
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .durable_wake, fw_seq);
+        },
+        .stream => |*s2| {
+            s2.deinit(allocator);
+            std.log.warn("rove-js durable-wake ({s}/{s}): __rove_stream from wake origin is a no-op (v1)", .{ tenant_id, dw.id });
+            const lh: log_mod.LogHeader = .{
+                .request_id = request_id,
+                .deployment_id = tc.snap.deployment_id,
+                .duration_ns = 0,
+                .status = 200,
+                .outcome = .ok,
+                .activation = .durable_wake,
+                .method = "POST",
+                .path = module_path,
+                .host = "",
+                .correlation_id = corr_full,
+            };
+            const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh) catch |perr| {
+                std.log.warn("rove-js durable-wake ({s}/{s}) stream-return propose failed: {s}", .{ tenant_id, dw.id, @errorName(perr) });
+                txn_owned = false;
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .durable_wake, 0);
+                return;
+            };
+            txn_owned = false;
+            txn_done = true;
+            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .durable_wake, fw_seq);
+        },
+    }
+}
+
 /// Phase 5 PR-2: dispatch a chained handler activation produced by
 /// `__rove_next` from a fetch handler (and post-PR-2c, from the
 /// shim's onresult to invoke the customer's `on_result`). Structural
@@ -2721,6 +3100,17 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
                 var sc = sc_const;
                 fireChainedActivation(worker, &sc);
                 sc.deinit(allocator);
+                fired += 1;
+            },
+            .durable_wake => |dw_const| {
+                // §2.6 durable-wake: one due `_sched/by_time` entry,
+                // fanned out by `scheduler_tick` via `__rove_fire_wake`.
+                // `fireDurableWakeActivation` injects the entry's
+                // `_sched/` deletes into the target's writeset so the
+                // removal commits atomically with the handler's effects.
+                var dw = dw_const;
+                fireDurableWakeActivation(worker, &dw);
+                dw.deinit(allocator);
                 fired += 1;
             },
             else => {

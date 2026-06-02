@@ -19,6 +19,8 @@
         {"path": "watch/index.mjs", "source": "loop46-demo-tenants/acme/watch/index.mjs"},
         {"path": "writekey/index.mjs", "source": "loop46-demo-tenants/acme/writekey/index.mjs"},
         {"path": "readkey/index.mjs", "source": "loop46-demo-tenants/acme/readkey/index.mjs"},
+        {"path": "schedfire/index.mjs", "source": "loop46-demo-tenants/acme/schedfire/index.mjs"},
+        {"path": "schedtarget.mjs", "source": "loop46-demo-tenants/acme/schedtarget.mjs"},
         {"path": "disc_writer/index.mjs", "source": "loop46-demo-tenants/acme/disc_writer/index.mjs"},
         {"path": "watchwrite/index.mjs", "source": "loop46-demo-tenants/acme/watchwrite/index.mjs"},
         {"path": "writekv/index.mjs", "source": "loop46-demo-tenants/acme/writekv/index.mjs"},

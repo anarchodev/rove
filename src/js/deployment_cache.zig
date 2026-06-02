@@ -469,6 +469,48 @@ pub const TenantSlot = struct {
     /// runs unlocked.
     pin_lock: std.Thread.Mutex = .{},
 
+    /// §2.6 durable scheduled wake: this tenant's single next-fire
+    /// timestamp (absolute wall-clock ns), or 0 for "no wake pending."
+    /// The engine's only durable-wake state — the queue/ordering lives
+    /// in the `scheduler` JS lib's `_sched/` kv (`docs/durable-wake-plan.md`).
+    /// Written only by the baked `__system/scheduler_tick` via
+    /// `__rove_set_wake` (steady state, on the partition-owner worker)
+    /// and by the post-commit bootstrap hook (P2, on the committing
+    /// worker — possibly a *different* worker), so the slot is atomic.
+    /// Read by `durable_wake.sweepDurableWakes` (1 Hz, partition-owner
+    /// worker). Volatile — reconstructed on leadership gain by
+    /// `sweepDurableWakesOnPromotion`.
+    next_wake_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+
+    /// Lower the next-fire watermark to `when_ns` iff it's sooner than
+    /// the current pending wake (or there is none). `when_ns == 0`
+    /// clears the wake. Used by the post-commit bootstrap hook (P2):
+    /// a freshly-committed `_sched/by_time` entry only ever needs to
+    /// pull the watermark *earlier*; `scheduler_tick` recomputes the
+    /// exact min when it next fires. Monotone-min so concurrent
+    /// committing workers converge without a lock.
+    pub fn lowerWake(self: *TenantSlot, when_ns: i64) void {
+        if (when_ns == 0) return;
+        while (true) {
+            const cur = self.next_wake_ns.load(.acquire);
+            if (cur != 0 and cur <= when_ns) return; // already sooner-or-equal
+            if (self.next_wake_ns.cmpxchgWeak(cur, when_ns, .acq_rel, .acquire) == null) return;
+        }
+    }
+
+    /// `DispatchState.set_wake` trampoline (ctx = `*TenantSlot`). The
+    /// baked `__system/scheduler_tick`'s `__rove_set_wake(whenNs)`
+    /// lands here and stores the exact next-fire watermark `tick`
+    /// computed from committed `_sched/by_time` state. Passing the
+    /// slot pointer as the trampoline ctx keeps this lock-free and
+    /// works regardless of which worker hosts the tick (the slot is
+    /// node-shared); the redundant `tenant_id` arg is ignored.
+    pub fn setWakeTrampoline(ctx: *anyopaque, tenant_id: []const u8, when_ns: i64) void {
+        _ = tenant_id;
+        const self: *TenantSlot = @ptrCast(@alignCast(ctx));
+        self.next_wake_ns.store(when_ns, .release);
+    }
+
     // Note: no `open`/`free` lifecycle wrappers here. Slots are opened
     // via `DeploymentCache.getOrOpenTenantSlot` (which open-codes the
     // unlocked-open + re-check race) and freed via `freeTenantSlot`.

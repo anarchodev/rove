@@ -180,6 +180,56 @@ pub const SubscriptionFire = struct {
 /// terminal `status` / `ok` / `body_truncated` fields.
 pub const FetchChunk = components_mod.UpstreamFetchEvent;
 
+/// Durable scheduled-wake activation (`docs/primitive-gaps.md` §2.6 +
+/// `docs/durable-wake-plan.md`). Produced by the baked
+/// `__system/scheduler_tick`'s `__rove_fire_wake` fan-out: one of
+/// these per due `_sched/by_time` entry, enqueued for the entry's
+/// owning tenant. The dispatch path (`fireDurableWakeActivation`)
+/// injects `cleanup_keys` as deletes into the target handler's
+/// writeset BEFORE running it, so the entry's removal commits
+/// atomically with the handler's effects (exactly-once on the normal
+/// path; a crash between fire and commit leaves the keys for a
+/// boot/promotion re-fire — the at-least-once *firing* contract).
+///
+/// Customer-facing shape (`fireDurableWakeActivation` surfaces it):
+/// `request.activation = { kind: "durable_wake", id, key,
+/// scheduled_at_ns, msg }`, where `msg` is the parsed `msg_json`.
+/// Owns its strings; `deinit` is called by `MsgQueue.deinit`
+/// (drop-on-shutdown) and by the dispatch path after the fire.
+pub const DurableWake = struct {
+    /// Owning tenant. Allocator-owned.
+    tenant_id: []u8,
+    /// Target handler module path (the scheduler entry's `target`),
+    /// same shape as `__rove_next` / a subscription module path.
+    module_path: []u8,
+    /// Stable scheduler id (`base64url(sha256(key))` or a uuid).
+    id: []u8,
+    /// Idempotency key, or null when `at()` was called without one.
+    key: ?[]u8 = null,
+    /// The customer `msg`, JSON-serialized ("null" when omitted).
+    msg_json: []u8,
+    /// Absolute scheduled fire time (ns). Surfaces as
+    /// `request.activation.scheduled_at_ns`.
+    scheduled_at_ns: i64,
+    /// The fired entry's `_sched/` keys (by_id + by_time), deleted in
+    /// the dispatched activation's own writeset. The JS lib owns the
+    /// key format (`scheduler_tick` passes the exact keys), so the
+    /// engine never reconstructs the padded-timestamp shape. Owned
+    /// slice of owned slices.
+    cleanup_keys: [][]u8,
+
+    pub fn deinit(self: *DurableWake, allocator: std.mem.Allocator) void {
+        allocator.free(self.tenant_id);
+        allocator.free(self.module_path);
+        allocator.free(self.id);
+        if (self.key) |k| allocator.free(k);
+        allocator.free(self.msg_json);
+        for (self.cleanup_keys) |k| allocator.free(k);
+        allocator.free(self.cleanup_keys);
+        self.* = undefined;
+    }
+};
+
 /// The tagged union over the wire-stable activation tag. The tag IS
 /// `ActivationSource` so `@as(ActivationSource, msg)` is the
 /// projection to the tape's representation.
@@ -192,6 +242,7 @@ pub const Msg = union(ActivationSource) {
     wake_batch: WakeBatch,
     subscription_fire: SubscriptionFire,
     fetch_chunk: FetchChunk,
+    durable_wake: DurableWake,
 
     /// Project to the tape's wire-stable activation tag.
     pub fn kind(self: Msg) ActivationSource {
@@ -239,6 +290,17 @@ test "Msg covers every ActivationSource variant exhaustively" {
     };
     defer sc.deinit(testing.allocator);
 
+    var dw: DurableWake = .{
+        .tenant_id = try testing.allocator.dupe(u8, "t"),
+        .module_path = try testing.allocator.dupe(u8, "jobs/reminder"),
+        .id = try testing.allocator.dupe(u8, "abc"),
+        .key = null,
+        .msg_json = try testing.allocator.dupe(u8, "null"),
+        .scheduled_at_ns = 0,
+        .cleanup_keys = try testing.allocator.alloc([]u8, 0),
+    };
+    defer dw.deinit(testing.allocator);
+
     inline for (@typeInfo(ActivationSource).@"enum".fields) |f| {
         const tag: ActivationSource = @enumFromInt(f.value);
         const m: Msg = switch (tag) {
@@ -250,6 +312,7 @@ test "Msg covers every ActivationSource variant exhaustively" {
             .wake_batch => .{ .wake_batch = .{} },
             .subscription_fire => .{ .subscription_fire = sf },
             .fetch_chunk => .{ .fetch_chunk = .{} },
+            .durable_wake => .{ .durable_wake = dw },
         };
         try testing.expectEqual(tag, m.kind());
     }

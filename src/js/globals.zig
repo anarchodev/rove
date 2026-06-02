@@ -29,6 +29,7 @@ const email_rate_b = @import("bindings/email_rate.zig");
 const http_b = @import("bindings/http.zig");
 const cont_b = @import("bindings/continuation.zig");
 const stream_b = @import("bindings/stream.zig");
+const scheduler_b = @import("bindings/scheduler.zig");
 const td = @import("trigger_dispatch.zig");
 const reserved = @import("reserved.zig");
 const bytecode_cache_mod = @import("bytecode_cache.zig");
@@ -257,6 +258,29 @@ pub const PlatformCaps = struct {
     ) anyerror!void = null,
 };
 
+/// §2.6 durable-wake fan-out input: one due `_sched/by_time` entry the
+/// baked `__system/scheduler_tick` hands to `__rove_fire_wake`. All
+/// slices borrow into the calling JS context's strings — valid only
+/// for the duration of the builtin call; the trampoline
+/// (`enqueueDurableWakeForTenant`) dupes everything it keeps.
+pub const FireWakeInput = struct {
+    /// Owning tenant (set by the builtin from `state.instance_id`).
+    tenant_id: []const u8,
+    /// Target handler module path (the scheduler entry's `target`).
+    target: []const u8,
+    /// Stable scheduler id.
+    id: []const u8,
+    /// Idempotency key, or null when scheduled without one.
+    key: ?[]const u8,
+    /// Absolute scheduled fire time (ns).
+    scheduled_at_ns: i64,
+    /// Customer `msg`, JSON-encoded ("null" when omitted).
+    msg_json: []const u8,
+    /// The entry's `_sched/` keys to delete in the target activation's
+    /// writeset (the JS lib owns the exact key format).
+    cleanup_keys: []const []const u8,
+};
+
 pub const DispatchState = struct {
     allocator: std.mem.Allocator,
     /// Per-request KV store. `kv.get("x")` reads from this handle,
@@ -413,6 +437,36 @@ pub const DispatchState = struct {
         id: []const u8,
     ) void = null,
     cancel_fetch_ctx: ?*anyopaque = null,
+
+    /// §2.6 durable-wake: trampoline backing `__rove_set_wake(when_ns)`.
+    /// Sets THIS tenant's single next-fire watermark on its slot
+    /// (`TenantSlot.next_wake_ns`). The worker provides a fn that casts
+    /// `ctx` back to `*Worker(opts)` and stores the value on the slot
+    /// for `tenant_id` (= `state.instance_id`). Capability-scoped: the
+    /// `__rove_set_wake` builtin throws unless `is_system_module`, so
+    /// only the baked `__system/scheduler_tick` reaches this. Null on
+    /// test paths / non-worker dispatches — the builtin then no-ops.
+    set_wake: ?*const fn (
+        ctx: *anyopaque,
+        tenant_id: []const u8,
+        when_ns: i64,
+    ) void = null,
+    set_wake_ctx: ?*anyopaque = null,
+
+    /// §2.6 durable-wake: trampoline backing
+    /// `__rove_fire_wake(target, id, key, scheduledAtNs, msg, cleanupKeys)`.
+    /// Enqueues one `durable_wake` activation for THIS tenant (routed
+    /// to its owning worker via `enqueueDurableWakeForTenant`). The
+    /// dispatch path injects `cleanup_keys` as deletes into the target
+    /// handler's writeset. Same capability-scoping + null semantics as
+    /// `set_wake`. Returns false when no worker is registered (the
+    /// builtin surfaces that as a thrown error so a fire is never
+    /// silently dropped).
+    fire_wake: ?*const fn (
+        ctx: *anyopaque,
+        input: FireWakeInput,
+    ) bool = null,
+    fire_wake_ctx: ?*anyopaque = null,
 
     /// The entity owning the chain this dispatch runs against —
     /// what the binding registers under `fetch_id` when `bind:
@@ -1493,6 +1547,8 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // cron is standalone.
     evalSnippet(ctx, "cron.js", CRON_JS);
     evalSnippet(ctx, "retry.js", RETRY_JS);
+    // §2.6 durable scheduled wake. After base64/crypto/kv (its deps).
+    evalSnippet(ctx, "scheduler.js", SCHEDULER_JS);
     evalSnippet(ctx, "webhook.js", WEBHOOK_JS);
     evalSnippet(ctx, "email.js", EMAIL_JS);
     // users is standalone (kv + crypto.{randomBytes,sha256}).
@@ -1672,6 +1728,15 @@ const GLOBAL_BUILTINS = [_]FnBinding{
     // bypass the `_harden.js` deletion via the `builtin_exceptions`
     // list in the globals-lint allowlist.
     .{ .name = "__rove_resume_if_bound", .cfunc = cont_b.jsContinuationResumeIfBound, .argc = 2 },
+    // §2.6 durable scheduled wake (docs/durable-wake-plan.md P0).
+    // Capability-scoped (throw unless is_system_module) so only the
+    // baked `__system/scheduler_tick` reaches them — that scoping
+    // closes the clobber footgun. Persistent globals like the others
+    // above (survive `_harden.js`'s `delete globalThis._system`).
+    // `set_wake` sets this tenant's single next-fire watermark;
+    // `fire_wake` enqueues one `durable_wake` activation per due entry.
+    .{ .name = "__rove_set_wake", .cfunc = scheduler_b.jsSetWake, .argc = 1 },
+    .{ .name = "__rove_fire_wake", .cfunc = scheduler_b.jsFireWake, .argc = 6 },
 };
 
 // Public shims (docs/builtin-libs-docs-plan.md Phase A). JSDoc-carrying
@@ -1689,6 +1754,7 @@ const OIDC_JS = @embedFile("oidc_js");
 const SESSIONS_JS = @embedFile("sessions_js");
 const CRON_JS = @embedFile("cron_js");
 const RETRY_JS = @embedFile("retry_js");
+const SCHEDULER_JS = @embedFile("scheduler_js");
 const WEBHOOK_JS = @embedFile("webhook_js");
 const EMAIL_JS = @embedFile("email_js");
 const TEXTCODEC_JS = @embedFile("textcodec_js");
@@ -1716,6 +1782,7 @@ const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "sessions", .src = SESSIONS_JS },
     .{ .name = "cron", .src = CRON_JS },
     .{ .name = "retry", .src = RETRY_JS },
+    .{ .name = "scheduler", .src = SCHEDULER_JS },
     .{ .name = "webhook", .src = WEBHOOK_JS },
     .{ .name = "email", .src = EMAIL_JS },
     .{ .name = "textcodec", .src = TEXTCODEC_JS },
@@ -1874,6 +1941,8 @@ pub fn installRequest(
         // Phase 5 PR-1: single fetch activation kind; `final` flag
         // distinguishes streaming intermediates from the terminal.
         .fetch_chunk => "fetch_chunk",
+        // §2.6 durable scheduled wake.
+        .durable_wake => "durable_wake",
     };
     _ = c.JS_SetPropertyStr(ctx, activation_obj, "kind", c.JS_NewStringLen(ctx, kind.ptr, kind.len));
     if (request.activation_source == .wake_batch) {
@@ -2061,6 +2130,38 @@ pub fn installRequest(
         }
     }
 
+    // §2.6 durable-wake payload: `{ id, key, scheduled_at_ns, msg }`.
+    // `msg` is the customer payload, JSON-decoded back to a JS value
+    // (mirrors the fetch-headers decode above). `key` is omitted (not
+    // null) when `at()` was called without one — matches the JS lib's
+    // `get()` shape.
+    if (request.activation_source == .durable_wake) {
+        if (request.activation_wake_id) |id| {
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "id", c.JS_NewStringLen(ctx, id.ptr, id.len));
+        }
+        if (request.activation_wake_key) |k| {
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "key", c.JS_NewStringLen(ctx, k.ptr, k.len));
+        }
+        // Scheduled fire time fits comfortably in a JS Number until
+        // the year 2262 (Date.now()*1e6); surface as a plain number
+        // for ergonomic `scheduled_at_ns` math.
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "scheduled_at_ns", c.JS_NewInt64(ctx, request.activation_wake_scheduled_at_ns));
+        const mjson = request.activation_wake_msg_json orelse "null";
+        if (state.allocator.allocSentinel(u8, mjson.len, 0)) |buf| {
+            defer state.allocator.free(buf);
+            @memcpy(buf, mjson);
+            const msg_val = c.JS_ParseJSON(ctx, buf.ptr, mjson.len, "<durable_wake msg>");
+            if (c.JS_IsException(msg_val)) {
+                _ = c.JS_GetException(ctx); // clear; fall through with null
+                _ = c.JS_SetPropertyStr(ctx, activation_obj, "msg", js_null);
+            } else {
+                _ = c.JS_SetPropertyStr(ctx, activation_obj, "msg", msg_val);
+            }
+        } else |_| {
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "msg", js_null);
+        }
+    }
+
     _ = c.JS_SetPropertyStr(ctx, req_obj, "activation", activation_obj);
 
     _ = c.JS_SetPropertyStr(ctx, global, "request", req_obj);
@@ -2214,7 +2315,7 @@ test "lint(c): every native binding has a globals/ shim (Phase A)" {
     // Math.random are INTRINSIC_EXTENSIONS (out of scope — intrinsic
     // determinism overrides); __rove_check_email_rate is an internal
     // GLOBAL_BUILTIN (called only by globals/email.js).
-    const builtin_exceptions = [_][]const u8{ "__rove_check_email_rate", "__rove_next", "__rove_stream", "__rove_resume_if_bound" };
+    const builtin_exceptions = [_][]const u8{ "__rove_check_email_rate", "__rove_next", "__rove_stream", "__rove_resume_if_bound", "__rove_set_wake", "__rove_fire_wake" };
 
     // Documented namespace exceptions: `_system.continuation` is an
     // internal binding called only by the baked

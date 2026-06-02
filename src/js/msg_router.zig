@@ -31,6 +31,7 @@ const effect_mod = @import("effect/root.zig");
 const components_mod = @import("components.zig");
 const worker_mod = @import("worker.zig");
 const worker_streaming = @import("worker_streaming.zig");
+const globals = @import("globals.zig");
 
 const KvWakeInbox = worker_mod.KvWakeInbox;
 const SubscriptionFireQueueInput = worker_streaming.SubscriptionFireQueueInput;
@@ -452,6 +453,56 @@ pub const MsgRouter = struct {
             .correlation_id = corr_dup,
         };
         try self.enqueueMsgForTenant(tenant_id, .{ .send_callback = payload });
+    }
+
+    /// §2.6 durable-wake: hash-route a `durable_wake` activation — one
+    /// due `_sched/by_time` entry the baked `__system/scheduler_tick`
+    /// fanned out via `__rove_fire_wake` — to the entry's owning
+    /// worker's MsgInbox. The target handler runs there with
+    /// `request.activation.kind == "durable_wake"`; the dispatch path
+    /// (`fireDurableWakeActivation`) injects the entry's `cleanup_keys`
+    /// as deletes into the handler's writeset. All borrowed slices in
+    /// `input` are dup'd onto the payload here; on `error.NoWorkers`
+    /// the caller (the builtin) surfaces a throw and `scheduler_tick`
+    /// leaves the entry for the next tick.
+    pub fn enqueueDurableWakeForTenant(
+        self: *MsgRouter,
+        input: globals.FireWakeInput,
+    ) !void {
+        const a = self.allocator;
+        const tid = try a.dupe(u8, input.tenant_id);
+        errdefer a.free(tid);
+        const target = try a.dupe(u8, input.target);
+        errdefer a.free(target);
+        const id = try a.dupe(u8, input.id);
+        errdefer a.free(id);
+        const key: ?[]u8 = if (input.key) |k| try a.dupe(u8, k) else null;
+        errdefer if (key) |k| a.free(k);
+        const msg_json = try a.dupe(u8, input.msg_json);
+        errdefer a.free(msg_json);
+
+        // Dup the cleanup-key slices into an owned slice-of-owned-slices.
+        var cleanup = try a.alloc([]u8, input.cleanup_keys.len);
+        var dup_count: usize = 0;
+        errdefer {
+            for (cleanup[0..dup_count]) |k| a.free(k);
+            a.free(cleanup);
+        }
+        for (input.cleanup_keys, 0..) |k, i| {
+            cleanup[i] = try a.dupe(u8, k);
+            dup_count = i + 1;
+        }
+
+        const payload: effect_mod.msg.DurableWake = .{
+            .tenant_id = tid,
+            .module_path = target,
+            .id = id,
+            .key = key,
+            .msg_json = msg_json,
+            .scheduled_at_ns = input.scheduled_at_ns,
+            .cleanup_keys = cleanup,
+        };
+        try self.enqueueMsgForTenant(input.tenant_id, .{ .durable_wake = payload });
     }
 
     /// Fan out one kv-write event to every registered worker inbox.
