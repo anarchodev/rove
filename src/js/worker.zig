@@ -1022,8 +1022,8 @@ pub const TenantSlot = struct {
     /// runs unlocked.
     pin_lock: std.Thread.Mutex = .{},
 
-    pub fn open(node: *NodeState, inst: *const tenant_mod.Instance) !*TenantSlot {
-        return openTenantSlotNode(node, inst);
+    pub fn open(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*TenantSlot {
+        return openTenantSlotNode(dc, inst);
     }
 
     pub fn free(allocator: std.mem.Allocator, slot: *TenantSlot) void {
@@ -1220,6 +1220,188 @@ pub const ManifestHttpConfig = struct {
 /// transition from "main spawns workers" to "each worker boots".
 pub const ManifestPrefetchMap = std.StringHashMapUnmanaged(PrefetchedManifest);
 
+/// Per-tenant deployment cache subsystem — the tenant-slot map, the
+/// node-wide content-addressed bytecode cache, the single
+/// deployment-loader thread, and the manifest-fetch config. Extracted
+/// from NodeState (Phase B of the TenantSlot/DeploymentCache split).
+///
+/// Borrows the handles it needs rather than the whole node: `tenant`,
+/// `raft`, and `blob_backend_cfg` are captured at `init`; `router` is
+/// wired post-init via `NodeState.wireInternal` (it's a self-pointer
+/// into NodeState, which can't be taken during the by-value `init`).
+/// Keeping the dependency surface narrow is what lets Phase C relocate
+/// this + the TenantSlot family into their own module without a cycle
+/// back to NodeState.
+pub const DeploymentCache = struct {
+    allocator: std.mem.Allocator,
+
+    /// Shared tenant resolver. Borrowed; owned by `main.zig`.
+    tenant: *tenant_mod.Tenant,
+
+    /// Process raft node (= `cluster.raft`). Borrowed; owned by
+    /// `main.zig`. Copied into each `TenantSlot` so `reloadDeployment`
+    /// can leader-gate + propose the `_config/**.json` mirror.
+    raft: *kv_mod.RaftNode,
+
+    /// Process-wide blob backend config consumed by `openTenantSlotNode`
+    /// when opening each tenant's file-blob + manifest backends.
+    blob_backend_cfg: blob_mod.BackendConfig,
+
+    /// Borrowed pointer to the node's async-activation router. Stamped
+    /// onto each `TenantSlot.router` at open time for boot-subscription
+    /// firing. Wired post-init (`NodeState.wireInternal`) because it's a
+    /// self-pointer into NodeState; null only before wiring / in unit
+    /// contexts.
+    router: ?*MsgRouter = null,
+
+    /// Per-tenant slot cache. `tenant_files_lock` guards `getOrOpen`
+    /// puts; the TenantSlot entries' deployment-version content is
+    /// served via an atomic-pointer-swapped `TenantFilesSnapshot`
+    /// (phase 2 of `docs/deployment-snapshots-plan.md`), so reload
+    /// no longer races with the dispatcher.
+    tenant_files_map: TenantMap(TenantSlot) = .empty,
+    tenant_files_lock: std.Thread.Mutex = .{},
+
+    /// Phase 3 of `docs/deployment-snapshots-plan.md`: content-
+    /// addressed cache of bytecode blobs shared across every tenant
+    /// snapshot on this node. Loader does `acquire(hash)` per
+    /// manifest entry; only fetches the misses. Cross-tenant blob
+    /// sharing falls out automatically. Snapshot `deinit` releases
+    /// leases through this cache.
+    bytecode_cache: BytecodeCache,
+
+    /// Single deployment loader thread for the whole process.
+    /// `_deploy/current` changes from any worker / apply path enqueue
+    /// here; one reload reaches every worker. Allocated in
+    /// `startDeploymentLoader`; the load function thunk is
+    /// `deploymentLoadFnNode`.
+    deployment_loader: ?*deployment_loader_mod.DeploymentLoader = null,
+
+    /// Process-wide manifest-fetch config consumed by
+    /// `openTenantSlotNode`. Shared pointers (libcurl Easy, prefetch
+    /// map) live for the lifetime of the cache.
+    manifest_http: ?ManifestHttpConfig = null,
+    manifest_easy: ?*blob_mod.curl.Easy = null,
+    manifest_prefetch: ?ManifestPrefetchMap = null,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        tenant: *tenant_mod.Tenant,
+        raft: *kv_mod.RaftNode,
+        blob_backend_cfg: blob_mod.BackendConfig,
+    ) DeploymentCache {
+        return .{
+            .allocator = allocator,
+            .tenant = tenant,
+            .raft = raft,
+            .blob_backend_cfg = blob_backend_cfg,
+            .bytecode_cache = .{ .allocator = allocator },
+        };
+    }
+
+    pub fn deinit(self: *DeploymentCache) void {
+        if (self.deployment_loader) |l| {
+            l.shutdown();
+            l.deinit();
+            self.deployment_loader = null;
+        }
+        self.tenant_files_map.deinit(self.allocator);
+        // Bytecode cache must die AFTER every slot — slots release
+        // their snapshots' leases through the cache on free. Once
+        // tenant_files_map.deinit returns, every snapshot the node ever
+        // held has dropped its slot reference. In-flight pinned requests
+        // should already be drained by the worker shutdown path; any
+        // surviving entry trips the assert in `BytecodeCache.deinit`.
+        self.bytecode_cache.deinit();
+        if (self.manifest_prefetch) |*map| {
+            var it = map.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.*.bytes);
+            }
+            map.deinit(self.allocator);
+            self.manifest_prefetch = null;
+        }
+    }
+
+    /// Spawn the single deployment loader thread. Idempotent. Called
+    /// once from `main.zig` after the cache is wired; the loader's thunk
+    /// casts `ctx_opaque` back to `*DeploymentCache`.
+    pub fn startDeploymentLoader(self: *DeploymentCache) !void {
+        if (self.deployment_loader != null) return;
+        const loader = try deployment_loader_mod.DeploymentLoader.init(
+            self.allocator,
+            @as(?*anyopaque, @ptrCast(self)),
+            deploymentLoadFnNode,
+        );
+        errdefer loader.deinit();
+        try loader.start();
+        self.deployment_loader = loader;
+    }
+
+    /// Lookup-or-lazy-open under `tenant_files_lock`.
+    /// Idempotent: concurrent callers may race on `openTenantSlotNode`
+    /// (slow, runs unlocked); the loser frees its in-flight slot and
+    /// returns the winner's.
+    pub fn getOrOpenTenantSlot(
+        self: *DeploymentCache,
+        inst: *const tenant_mod.Instance,
+    ) !*TenantSlot {
+        // Fast path: already cached.
+        self.tenant_files_lock.lock();
+        if (self.tenant_files_map.get(inst.id)) |existing| {
+            self.tenant_files_lock.unlock();
+            return existing;
+        }
+        self.tenant_files_lock.unlock();
+
+        // Slow path: open without holding the lock (libcurl + blob
+        // backend init may do I/O). Re-check under the lock before
+        // inserting — another worker may have raced ahead.
+        const opened = try openTenantSlotNode(self, inst);
+        errdefer freeTenantSlot(self.allocator, opened);
+
+        self.tenant_files_lock.lock();
+        defer self.tenant_files_lock.unlock();
+        if (self.tenant_files_map.get(inst.id)) |winner| {
+            // Lost the race; drop our duplicate and use the winner.
+            freeTenantSlot(self.allocator, opened);
+            return winner;
+        }
+        try self.tenant_files_map.put(self.allocator, opened);
+        return opened;
+    }
+
+    /// Cold-start eager-open: walk every known tenant, populate the
+    /// map, enqueue the loader to fetch every deployment in parallel.
+    /// Called once from `main.zig` after the loader is up. Returns the
+    /// count of tenants opened.
+    pub fn eagerOpenTenants(self: *DeploymentCache) !usize {
+        var count: usize = 0;
+        var it = self.tenant.instances.iterator();
+        while (it.next()) |entry| {
+            const inst = entry.value_ptr.*;
+            const slot = try self.getOrOpenTenantSlot(inst);
+            count += 1;
+            // Enqueue a deployment load for any tenant whose
+            // `_deploy/current` is set.
+            if (self.deployment_loader) |l| {
+                const cur_bytes = slot.app_kv.get("_deploy/current") catch continue;
+                defer self.allocator.free(cur_bytes);
+                const dep_id = std.fmt.parseInt(u64, cur_bytes, 16) catch continue;
+                if (dep_id == 0) continue;
+                l.enqueue(slot.instance_id, dep_id) catch |err| {
+                    std.log.warn(
+                        "rove-js: cold-start enqueue {s}/{d} failed: {s}",
+                        .{ slot.instance_id, dep_id, @errorName(err) },
+                    );
+                };
+            }
+        }
+        return count;
+    }
+};
+
 /// Process-wide state shared across every worker on a node.
 /// Owned by `main.zig`; workers borrow `*NodeState`.
 ///
@@ -1250,53 +1432,23 @@ pub const NodeState = struct {
     /// Borrowed; owned by `main.zig`.
     tenant: *tenant_mod.Tenant,
 
-    /// Per-tenant slot cache. `tenant_files_lock` guards `getOrOpen`
-    /// puts; the TenantSlot entries' deployment-version content is
-    /// served via an atomic-pointer-swapped `TenantFilesSnapshot`
-    /// (phase 2 of `docs/deployment-snapshots-plan.md`), so reload
-    /// no longer races with the dispatcher.
-    tenant_files_map: TenantMap(TenantSlot) = .empty,
-    tenant_files_lock: std.Thread.Mutex = .{},
-
-    /// Phase 3 of `docs/deployment-snapshots-plan.md`: content-
-    /// addressed cache of bytecode blobs shared across every tenant
-    /// snapshot on this node. Loader does `acquire(hash)` per
-    /// manifest entry; only fetches the misses. Cross-tenant blob
-    /// sharing falls out automatically. Snapshot `deinit` releases
-    /// leases through this cache.
-    bytecode_cache: BytecodeCache = .{ .allocator = undefined },
-
-    /// Single deployment loader thread for the whole process.
-    /// `_deploy/current` changes from any worker / apply path enqueue
-    /// here; one reload reaches every worker. Replaces the per-worker
-    /// loader + `deployment_loader_publish` atomic plumbing in
-    /// `main.zig`. Allocated in `NodeState.init`; the load function
-    /// thunk is `deploymentLoadFnNode`.
-    deployment_loader: ?*deployment_loader_mod.DeploymentLoader = null,
-
-    /// Single leader-local http.send dispatch component for the whole
-    /// process (Option (b), FORK-6). Owns the in-memory in-flight set
-    /// fed worker-side at commit (4b-ii) and reconstructed via
-    /// boot-scan on raft promotion (4b-iii); the dedicated thread
-    /// fires due owed sends (4c). NOT replicated/durable — the
-    /// durable truth is the per-tenant `_send/owed/` kv. Allocated in
-    // Phase 5 PR-3: the per-node `SendDispatch` slot retired with
-    // the kernel. Outbound durability lives in the JS shim now
-    // (`globals/webhook.js`) — see `sweepOwedRetries` for the
-    // leader-side fire mechanism.
-
-    /// Process-wide config consumed by TenantFiles.open. Shared
-    /// pointers (libcurl Easy, prefetch map) live for the lifetime
-    /// of NodeState.
+    /// Process-wide blob backend config. Borrowed slices owned by
+    /// `main.zig`/env. Consumed by the deployment cache (per-tenant
+    /// backend opens) and the blob coordinator; stays on NodeState
+    /// because both subsystems read it.
     blob_backend_cfg: blob_mod.BackendConfig,
-    manifest_http: ?ManifestHttpConfig = null,
-    manifest_easy: ?*blob_mod.curl.Easy = null,
-    manifest_prefetch: ?ManifestPrefetchMap = null,
 
     /// Process raft node (= `cluster.raft`). Borrowed; owned by
-    /// `main.zig`. Copied into each `TenantSlot` so the loader's
+    /// `main.zig`. Also copied into `deploy` + each `TenantSlot` so
     /// `reloadDeployment` can leader-gate + propose the config mirror.
     raft: *kv_mod.RaftNode,
+
+    /// Per-tenant deployment cache subsystem — tenant-slot map +
+    /// node-wide bytecode cache + deployment-loader thread + manifest
+    /// config. Extracted into `DeploymentCache` (`deployment_cache`
+    /// concern); borrows `tenant`/`raft`/`blob_backend_cfg` at init and
+    /// `router` via `wireInternal`. `node.deploy.*`.
+    deploy: DeploymentCache,
 
     /// Async-activation routing subsystem — the per-worker inbox
     /// registries (unified `effect.MsgInbox` + kv-wake `KvWakeInbox`)
@@ -1368,10 +1520,21 @@ pub const NodeState = struct {
             .blob_backend_cfg = blob_backend_cfg,
             .raft = raft,
             .builtin_modules = builtins,
-            .bytecode_cache = .{ .allocator = allocator },
             .router = MsgRouter.init(allocator),
             .blob_coord = BlobCoordination.init(allocator, blob_backend_cfg),
+            .deploy = DeploymentCache.init(allocator, tenant, raft, blob_backend_cfg),
         };
+    }
+
+    /// Wire self-referential internal handles after NodeState is at its
+    /// final, stable address. `NodeState.init` returns by value, so a
+    /// pointer like `&self.router` can't be captured during init — the
+    /// struct still moves to its home afterward. The owner (`main.zig`)
+    /// MUST call this once before opening any tenant slot so
+    /// `deploy.router` (used to stamp `TenantSlot.router` for
+    /// boot-subscription firing) is live.
+    pub fn wireInternal(self: *NodeState) void {
+        self.deploy.router = &self.router;
     }
 
     /// `docs/curl-multi-plan.md` Phase 2: hand each PendingFetch to
@@ -1435,45 +1598,12 @@ pub const NodeState = struct {
         // Phase 2 of curl-multi work: pending-fetches queue
         // moved into the FetchEngine; its shutdown above already
         // drained + freed any queued + in-flight entries.
-        if (self.deployment_loader) |l| {
-            l.shutdown();
-            l.deinit();
-            self.deployment_loader = null;
-        }
-        self.tenant_files_map.deinit(self.allocator);
-        // Bytecode cache must die AFTER every slot — slots release
-        // their snapshots' leases through the cache on free. Once
-        // tenant_files_map.deinit returns, every snapshot the node
-        // ever held has dropped its slot reference. In-flight pinned
-        // requests should already be drained by the worker shutdown
-        // path; any surviving entry trips the assert in
-        // `BytecodeCache.deinit`.
-        self.bytecode_cache.deinit();
-        if (self.manifest_prefetch) |*map| {
-            var it = map.iterator();
-            while (it.next()) |entry| {
-                self.allocator.free(entry.key_ptr.*);
-                self.allocator.free(entry.value_ptr.*.bytes);
-            }
-            map.deinit(self.allocator);
-            self.manifest_prefetch = null;
-        }
-    }
-
-    /// Spawn the single deployment loader thread. Idempotent.
-    /// Called once from `main.zig` after NodeState is fully wired
-    /// (tenant + blob backends in place); the loader's thunk casts
-    /// `ctx_opaque` back to `*NodeState`.
-    pub fn startDeploymentLoader(self: *NodeState) !void {
-        if (self.deployment_loader != null) return;
-        const loader = try deployment_loader_mod.DeploymentLoader.init(
-            self.allocator,
-            @as(?*anyopaque, @ptrCast(self)),
-            deploymentLoadFnNode,
-        );
-        errdefer loader.deinit();
-        try loader.start();
-        self.deployment_loader = loader;
+        //
+        // Deployment cache last: stops the loader thread, frees every
+        // tenant slot, then the bytecode cache (after the slots, which
+        // release their snapshot leases through it), then the manifest
+        // prefetch map. Ordering lives inside `DeploymentCache.deinit`.
+        self.deploy.deinit();
     }
 
     /// `docs/curl-multi-plan.md` Phase 2: spawn the outbound
@@ -1489,74 +1619,12 @@ pub const NodeState = struct {
         self.fetch_engine = fe;
     }
 
-    /// Lookup-or-lazy-open under `tenant_files_lock`.
-    /// Idempotent: concurrent callers may race on `openTenantSlotNode`
-    /// (slow, runs unlocked); the loser frees its in-flight slot and
-    /// returns the winner's.
-    pub fn getOrOpenTenantSlot(
-        self: *NodeState,
-        inst: *const tenant_mod.Instance,
-    ) !*TenantSlot {
-        // Fast path: already cached.
-        self.tenant_files_lock.lock();
-        if (self.tenant_files_map.get(inst.id)) |existing| {
-            self.tenant_files_lock.unlock();
-            return existing;
-        }
-        self.tenant_files_lock.unlock();
-
-        // Slow path: open without holding the lock (libcurl + blob
-        // backend init may do I/O). Re-check under the lock before
-        // inserting — another worker may have raced ahead.
-        const opened = try openTenantSlotNode(self, inst);
-        errdefer freeTenantSlot(self.allocator, opened);
-
-        self.tenant_files_lock.lock();
-        defer self.tenant_files_lock.unlock();
-        if (self.tenant_files_map.get(inst.id)) |winner| {
-            // Lost the race; drop our duplicate and use the winner.
-            freeTenantSlot(self.allocator, opened);
-            return winner;
-        }
-        try self.tenant_files_map.put(self.allocator, opened);
-        return opened;
-    }
-
-    /// Cold-start eager-open: walk every known tenant, populate the
-    /// map, enqueue the loader to fetch every deployment in
-    /// parallel. Called once from `main.zig` after the loader is
-    /// up. Returns the count of tenants opened.
-    pub fn eagerOpenTenants(self: *NodeState) !usize {
-        var count: usize = 0;
-        var it = self.tenant.instances.iterator();
-        while (it.next()) |entry| {
-            const inst = entry.value_ptr.*;
-            const slot = try self.getOrOpenTenantSlot(inst);
-            count += 1;
-            // Enqueue a deployment load for any tenant whose
-            // `_deploy/current` is set — mirrors the old Worker.create
-            // cold-start loop.
-            if (self.deployment_loader) |l| {
-                const cur_bytes = slot.app_kv.get("_deploy/current") catch continue;
-                defer self.allocator.free(cur_bytes);
-                const dep_id = std.fmt.parseInt(u64, cur_bytes, 16) catch continue;
-                if (dep_id == 0) continue;
-                l.enqueue(slot.instance_id, dep_id) catch |err| {
-                    std.log.warn(
-                        "rove-js: cold-start enqueue {s}/{d} failed: {s}",
-                        .{ slot.instance_id, dep_id, @errorName(err) },
-                    );
-                };
-            }
-        }
-        return count;
-    }
 };
 
 /// Loader thunk for the single per-process loader. `ctx_opaque` is a
-/// `*NodeState`. Looks up the tenant's TenantSlot (skip if absent),
-/// short-circuits when the current snapshot already has this dep_id
-/// (content-addressed: same id ⇒ same content), and calls
+/// `*DeploymentCache`. Looks up the tenant's TenantSlot (skip if
+/// absent), short-circuits when the current snapshot already has this
+/// dep_id (content-addressed: same id ⇒ same content), and calls
 /// `reloadDeployment` otherwise. Phase 2: readers either see the old
 /// snapshot or the new one, never a half-written mix.
 fn deploymentLoadFnNode(
@@ -1564,19 +1632,19 @@ fn deploymentLoadFnNode(
     tenant_id: []const u8,
     dep_id: u64,
 ) anyerror!void {
-    const node: *NodeState = @ptrCast(@alignCast(ctx_opaque.?));
-    node.tenant_files_lock.lock();
-    const slot_opt = node.tenant_files_map.get(tenant_id);
-    node.tenant_files_lock.unlock();
+    const dc: *DeploymentCache = @ptrCast(@alignCast(ctx_opaque.?));
+    dc.tenant_files_lock.lock();
+    const slot_opt = dc.tenant_files_map.get(tenant_id);
+    dc.tenant_files_lock.unlock();
     const slot = slot_opt orelse blk: {
         // Runtime-created tenant (signup, admin createInstance):
         // the apply.zig enqueue fires before any request has
         // lazy-opened the slot. Open it here so the snapshot
         // lands; otherwise the first request to the new tenant
         // 503s until the next reload event.
-        const inst_opt = node.tenant.getInstance(tenant_id) catch null;
+        const inst_opt = dc.tenant.getInstance(tenant_id) catch null;
         const inst = inst_opt orelse return; // tenant not on this node
-        break :blk node.getOrOpenTenantSlot(inst) catch |err| {
+        break :blk dc.getOrOpenTenantSlot(inst) catch |err| {
             std.log.warn(
                 "rove-js: lazy slot-open for runtime tenant {s} failed: {s}",
                 .{ tenant_id, @errorName(err) },
@@ -2194,7 +2262,7 @@ pub fn Worker(comptime opts: Options) type {
 
         // Background deployment loader lives on `node` (single per
         // process, shared across workers). Reach via
-        // `worker.node.deployment_loader`.
+        // `worker.node.deploy.deployment_loader`.
 
         /// Heap-allocate a worker, construct the inner `H2` (which in
         /// turn constructs its own `Io`), and eagerly open a
@@ -2616,7 +2684,7 @@ pub fn Worker(comptime opts: Options) type {
             // the first customer request to this fresh tenant. Belt-and-
             // braces: the loader's enqueue is per-tenant dedup'd, so double-
             // enqueue is harmless.
-            if (self.node.deployment_loader) |loader| {
+            if (self.node.deploy.deployment_loader) |loader| {
                 loader.enqueue(target_id, starter_dep_id) catch |err| std.log.warn(
                     "deployStarter: loader.enqueue {s}/{x:0>16} failed: {s}",
                     .{ target_id, starter_dep_id, @errorName(err) },
@@ -2679,7 +2747,7 @@ pub fn Worker(comptime opts: Options) type {
             try release_ws.addPut("_deploy/current", hex);
             try self.applyTargetWrite(allocator, inst, target_id, &release_ws);
 
-            if (self.node.deployment_loader) |loader| {
+            if (self.node.deploy.deployment_loader) |loader| {
                 loader.enqueue(target_id, dep_id) catch |err| {
                     std.log.warn(
                         "releases.publish: enqueue loader for {s}/{d} failed: {s}",
@@ -3008,8 +3076,8 @@ pub fn Worker(comptime opts: Options) type {
 /// pre-quorum crash loses the volatile speculative overlay, so
 /// there are no orphan rows to recover. The pre-kvexp SQLite sweep
 /// was removed.)
-fn openTenantSlotNode(node: *NodeState, inst: *const tenant_mod.Instance) !*TenantSlot {
-    const allocator = node.allocator;
+fn openTenantSlotNode(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*TenantSlot {
+    const allocator = dc.allocator;
 
     // (No startup orphan sweep: kvexp has no kv_undo table — a
     // pre-quorum crash loses the volatile speculative overlay, so
@@ -3018,7 +3086,7 @@ fn openTenantSlotNode(node: *NodeState, inst: *const tenant_mod.Instance) !*Tena
 
     var blob_backend = try blob_mod.BlobBackend.openPerTenant(
         allocator,
-        node.blob_backend_cfg,
+        dc.blob_backend_cfg,
         inst.id,
         "file-blobs",
     );
@@ -3031,23 +3099,23 @@ fn openTenantSlotNode(node: *NodeState, inst: *const tenant_mod.Instance) !*Tena
     // works as long as files-server's bootstrap path keeps the dual
     // S3 PUT alive. The S3 PUT goes away once every loop46 worker
     // in the deployment uses the HTTP backend.
-    var manifest_backend = if (node.manifest_http) |mh|
+    var manifest_backend = if (dc.manifest_http) |mh|
         try blob_mod.BlobBackend.openHttp(allocator, .{
             .base_url = mh.base_url,
             .instance_id = inst.id,
             .mint_jwt = mh.mint_jwt,
             .mint_ctx = mh.mint_ctx,
             // Shared Easy across all per-tenant manifest backends
-            // on this node — see `NodeState.manifest_easy`. Falls
+            // on this node — see `DeploymentCache.manifest_easy`. Falls
             // back to per-tenant Easy when shared init failed.
-            .easy = node.manifest_easy,
+            .easy = dc.manifest_easy,
             .ca_bundle_path = mh.ca_bundle_path,
             .verify_tls = mh.verify_tls,
         })
     else
         try blob_mod.BlobBackend.openPerTenant(
             allocator,
-            node.blob_backend_cfg,
+            dc.blob_backend_cfg,
             inst.id,
             "deployments",
         );
@@ -3065,7 +3133,7 @@ fn openTenantSlotNode(node: *NodeState, inst: *const tenant_mod.Instance) !*Tena
     // map's key was a copy of the tenant id, not the same alloc
     // as `id_copy` above).
     var prefetched: ?PrefetchedManifest = null;
-    if (node.manifest_prefetch) |*map| {
+    if (dc.manifest_prefetch) |*map| {
         if (map.fetchRemove(inst.id)) |kv| {
             allocator.free(kv.key);
             prefetched = kv.value;
@@ -3077,9 +3145,9 @@ fn openTenantSlotNode(node: *NodeState, inst: *const tenant_mod.Instance) !*Tena
         .allocator = allocator,
         .instance_id = id_copy,
         .app_kv = inst.kv,
-        .raft = node.raft,
-        .bytecode_cache = &node.bytecode_cache,
-        .router = &node.router,
+        .raft = dc.raft,
+        .bytecode_cache = &dc.bytecode_cache,
+        .router = dc.router,
         .blob_backend = blob_backend,
         .manifest_backend = manifest_backend,
         .prefetched_manifest = prefetched,
@@ -3127,13 +3195,13 @@ fn freeTenantSlot(allocator: std.mem.Allocator, slot: *TenantSlot) void {
 }
 
 /// Lookup-or-lazy-open the process-shared TenantSlot for `inst`.
-/// Wraps `worker.node.getOrOpenTenantSlot` for callers that only
+/// Wraps `worker.node.deploy.getOrOpenTenantSlot` for callers that only
 /// hold a worker pointer.
 pub fn getOrOpenTenantSlot(
     worker: anytype,
     inst: *const tenant_mod.Instance,
 ) !*TenantSlot {
-    return worker.node.getOrOpenTenantSlot(inst);
+    return worker.node.deploy.getOrOpenTenantSlot(inst);
 }
 
 // ── Per-tenant log loading ────────────────────────────────────────────
@@ -3479,7 +3547,7 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
 /// false` and skipped. Gated to worker 0 to avoid duplicate
 /// enqueues across the leader's local workers.
 pub fn sweepBootSubscriptions(worker: anytype) void {
-    var it = worker.node.tenant_files_map.iterator();
+    var it = worker.node.deploy.tenant_files_map.iterator();
     while (it.next()) |entry| {
         const slot = entry.value_ptr.*;
         const snap = slot.pinCurrent() orelse continue;
@@ -3509,7 +3577,7 @@ pub fn sweepCronSubscriptions(worker: anytype) void {
     if (now_ns - worker.last_cron_sweep_ns < CRON_SWEEP_INTERVAL_NS) return;
     worker.last_cron_sweep_ns = now_ns;
 
-    var it = worker.node.tenant_files_map.iterator();
+    var it = worker.node.deploy.tenant_files_map.iterator();
     while (it.next()) |entry| {
         const slot = entry.value_ptr.*;
         const snap = slot.pinCurrent() orelse continue;
@@ -3723,7 +3791,7 @@ fn sweepOwedRetriesAllPartitioned(worker: anytype, now_ns: i64) void {
     };
     if (n_inboxes == 0) return; // pre-registration cold start
 
-    var it = worker.node.tenant_files_map.iterator();
+    var it = worker.node.deploy.tenant_files_map.iterator();
     while (it.next()) |entry| {
         const slot = entry.value_ptr.*;
         const inbox_idx = std.hash.Wyhash.hash(0, slot.instance_id) % n_inboxes;

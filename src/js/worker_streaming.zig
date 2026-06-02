@@ -2154,7 +2154,7 @@ pub fn proposeForgetfulWrites(
 /// Leader-only by caller convention (this site only runs on the
 /// worker that committed the original writeset).
 pub fn fireKvReactSubscriptions(worker: anytype, unit: *ParkedUnit) !void {
-    const slot = worker.node.tenant_files_map.get(unit.tenant_id) orelse return;
+    const slot = worker.node.deploy.tenant_files_map.get(unit.tenant_id) orelse return;
     const snap = slot.pinCurrent() orelse return;
     defer snap.release();
     if (snap.subscriptions.len == 0) return;

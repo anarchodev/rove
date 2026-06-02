@@ -1482,15 +1482,20 @@ pub fn main() !void {
         blob_owned.cfg,
         raft_node,
     );
-    node_state.manifest_http = node_manifest_http;
-    node_state.manifest_easy = node_manifest_easy;
-    node_state.manifest_prefetch = node_manifest_prefetch;
+    node_state.deploy.manifest_http = node_manifest_http;
+    node_state.deploy.manifest_easy = node_manifest_easy;
+    node_state.deploy.manifest_prefetch = node_manifest_prefetch;
     defer node_state.deinit();
 
-    try node_state.startDeploymentLoader();
+    // Wire self-referential internal handles now that `node_state` is at
+    // its final, stable address (init returned by value). Must precede
+    // any tenant-slot open so `deploy.router` is live for boot-fire.
+    node_state.wireInternal();
+
+    try node_state.deploy.startDeploymentLoader();
     // Wire the apply path to the shared loader (replaces the
     // worker-0-publishes-its-loader atomic dance).
-    loop46_ctx.deployment_loader = node_state.deployment_loader;
+    loop46_ctx.deployment_loader = node_state.deploy.deployment_loader;
 
     // Phase 5 PR-3: the leader-local SendDispatch kernel retired
     // with the atomic flip to the JS-shim webhook composition. The
@@ -1524,7 +1529,7 @@ pub fn main() !void {
     // worker.zig — both sides agree on the cast (same module).
     loop46_ctx.node_state = @ptrCast(&node_state);
 
-    _ = try node_state.eagerOpenTenants();
+    _ = try node_state.deploy.eagerOpenTenants();
 
     // ── Spawn worker threads ───────────────────────────────────────────
     const http_addr = try parseHostPort(allocator, cli.http);
@@ -1577,7 +1582,7 @@ pub fn main() !void {
         threads[i] = try std.Thread.spawn(.{}, workerThreadEntry, .{&ctxs[i]});
     }
     for (ready_events) |*ev| ev.wait();
-    // (loop46_ctx.deployment_loader was wired to node_state.deployment_loader
+    // (loop46_ctx.deployment_loader was wired to node_state.deploy.deployment_loader
     // before workers spawned — no per-worker publish step needed.)
 
     std.debug.print(
