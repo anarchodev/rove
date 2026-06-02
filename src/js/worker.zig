@@ -1022,13 +1022,11 @@ pub const TenantSlot = struct {
     /// runs unlocked.
     pin_lock: std.Thread.Mutex = .{},
 
-    pub fn open(dc: *DeploymentCache, inst: *const tenant_mod.Instance) !*TenantSlot {
-        return openTenantSlotNode(dc, inst);
-    }
-
-    pub fn free(allocator: std.mem.Allocator, slot: *TenantSlot) void {
-        freeTenantSlot(allocator, slot);
-    }
+    // Note: no `open`/`free` lifecycle wrappers here. Slots are opened
+    // via `DeploymentCache.getOrOpenTenantSlot` (which open-codes the
+    // unlocked-open + re-check race) and freed via `freeTenantSlot`.
+    // The old `TenantMap` `Entry.open`/`Entry.free` convention no
+    // longer applies — the slot cache is a plain map.
 
     /// Try to pin the current snapshot for a request. Returns null
     /// if no deployment has loaded yet. Caller MUST `snap.release()`
@@ -1111,12 +1109,18 @@ pub const TenantLog = struct {
     }
 };
 
-/// Cache wrapper around `StringHashMapUnmanaged(*Entry)` that drives
-/// the lifecycle through `Entry.open(worker, inst)` and `Entry.free(
-/// allocator, *Entry)`. `TenantFiles` and `TenantLog` had eight
-/// near-identical helpers (open / free / destroyAll / getOrOpen × 2);
-/// only open and free are domain-specific, so this generic absorbs
-/// destroyAll and getOrOpen.
+/// Lazy-open lifecycle cache: a `StringHashMapUnmanaged(*Entry)` that
+/// drives entry lifecycle through `Entry.open(worker, inst)` /
+/// `Entry.free(allocator, *Entry)`, with `getOrOpen` as the lazy
+/// constructor and `clearAllEntries`/`deinit` as bulk teardown.
+///
+/// Now used only by `tenant_logs` (`TenantMap(TenantLog)`). The
+/// per-tenant *slot* cache used to share this generic but no longer
+/// does: opening a slot performs blob/libcurl I/O that must run without
+/// holding the cache lock, which `getOrOpen` can't express — so
+/// `DeploymentCache` open-codes that path and uses a plain
+/// `StringHashMapUnmanaged(*TenantSlot)` instead. This generic stays
+/// for the log cache, whose open is cheap and fits the convention.
 fn TenantMap(comptime Entry: type) type {
     return struct {
         const Self = @This();
@@ -1254,12 +1258,21 @@ pub const DeploymentCache = struct {
     /// contexts.
     router: ?*MsgRouter = null,
 
-    /// Per-tenant slot cache. `tenant_files_lock` guards `getOrOpen`
-    /// puts; the TenantSlot entries' deployment-version content is
-    /// served via an atomic-pointer-swapped `TenantFilesSnapshot`
-    /// (phase 2 of `docs/deployment-snapshots-plan.md`), so reload
-    /// no longer races with the dispatcher.
-    tenant_files_map: TenantMap(TenantSlot) = .empty,
+    /// Per-tenant slot cache, keyed by instance id (the slot's owned
+    /// `instance_id`). `tenant_files_lock` guards inserts; the
+    /// TenantSlot entries' deployment-version content is served via an
+    /// atomic-pointer-swapped `TenantFilesSnapshot` (phase 2 of
+    /// `docs/deployment-snapshots-plan.md`), so reload no longer races
+    /// with the dispatcher.
+    ///
+    /// A plain map (not the `TenantMap` lifecycle generic): slot
+    /// open/free is open-coded in `getOrOpenTenantSlot` /
+    /// `freeTenantSlot` because opening a slot does blob/libcurl I/O
+    /// that must run *without* holding `tenant_files_lock` (the generic
+    /// `getOrOpen` can't express that unlocked-open + re-check race).
+    /// So this consumer only ever uses get/put/iterate/deinit —
+    /// `TenantMap`'s `getOrOpen` convention buys it nothing.
+    tenant_files_map: std.StringHashMapUnmanaged(*TenantSlot) = .empty,
     tenant_files_lock: std.Thread.Mutex = .{},
 
     /// Phase 3 of `docs/deployment-snapshots-plan.md`: content-
@@ -1305,13 +1318,22 @@ pub const DeploymentCache = struct {
             l.deinit();
             self.deployment_loader = null;
         }
-        self.tenant_files_map.deinit(self.allocator);
+        // Free every slot, then the map's internal storage. The map
+        // key is each slot's owned `instance_id`, freed by
+        // `freeTenantSlot`, so `map.deinit` (which only releases the
+        // hashmap's arrays) must run after — and we must not touch keys
+        // once freed.
+        {
+            var it = self.tenant_files_map.iterator();
+            while (it.next()) |entry| freeTenantSlot(self.allocator, entry.value_ptr.*);
+            self.tenant_files_map.deinit(self.allocator);
+        }
         // Bytecode cache must die AFTER every slot — slots release
-        // their snapshots' leases through the cache on free. Once
-        // tenant_files_map.deinit returns, every snapshot the node ever
-        // held has dropped its slot reference. In-flight pinned requests
-        // should already be drained by the worker shutdown path; any
-        // surviving entry trips the assert in `BytecodeCache.deinit`.
+        // their snapshots' leases through the cache on free. Once the
+        // slots are freed above, every snapshot the node ever held has
+        // dropped its slot reference. In-flight pinned requests should
+        // already be drained by the worker shutdown path; any surviving
+        // entry trips the assert in `BytecodeCache.deinit`.
         self.bytecode_cache.deinit();
         if (self.manifest_prefetch) |*map| {
             var it = map.iterator();
@@ -1368,7 +1390,7 @@ pub const DeploymentCache = struct {
             freeTenantSlot(self.allocator, opened);
             return winner;
         }
-        try self.tenant_files_map.put(self.allocator, opened);
+        try self.tenant_files_map.put(self.allocator, opened.instance_id, opened);
         return opened;
     }
 
