@@ -472,7 +472,7 @@ pub const FetchEngine = struct {
         // change). Phases 2-3 switch the consumer onto a spool that
         // reads bytes back from the coordinator.
         self.submitBoundChunkToCoord(&event);
-        self.node.enqueueFetchEventForTenant(tenant_id, event) catch |err| {
+        self.node.router.enqueueFetchEventForTenant(tenant_id, event) catch |err| {
             if (err == error.NoWorkers and
                 !self.no_inbox_warned.swap(true, .acq_rel))
             {
@@ -503,8 +503,8 @@ pub const FetchEngine = struct {
     fn submitBoundChunkToCoord(self: *FetchEngine, ev: *UpstreamFetchEvent) void {
         if (!ev.bind) return;
         if (ev.bytes.len == 0) return;
-        const coord = self.node.blob_coordinator orelse return;
-        const owner_idx = self.node.lookupBoundFetchOwner(ev.fetch_id) orelse return;
+        const coord = self.node.blob_coord.coordinator orelse return;
+        const owner_idx = self.node.router.lookupBoundFetchOwner(ev.fetch_id) orelse return;
         const wid = std.math.cast(u8, owner_idx) orelse return;
         const seq = coord.submit(wid, ev.bytes) catch |err| {
             std.log.warn(

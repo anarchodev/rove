@@ -8,18 +8,23 @@
 //!
 //! `type=0` → per-tenant writeset (payload is `WriteSet.encode` bytes,
 //!           target store = `{data_dir}/{id}/app.db`)
+//! `type=1` → multi-envelope wrapper — bundles N inner writeset
+//!           envelopes into one raft entry; each inner envelope
+//!           applies in order against its own target (see
+//!           `EnvelopeType.multi`)
 //! `type=2` → ROOT writeset (payload is `WriteSet.encode` bytes,
 //!           target store = `{data_dir}/__root__.db`, id_len must
 //!           be 0 — the envelope carries no per-tenant id)
 //!
-//! Types 1 (`log_batch`) and 3 (`files_writeset`) were retired in
-//! Phase 5.5 (a) and 5.5 (e) F2-storage respectively. Log records
-//! flow worker → S3 (sidecar + ndjson) directly; per-tenant
-//! manifests live in a per-tenant `deployments/` BlobBackend, with
-//! the runtime release pointer riding envelope 0 in the customer's
-//! own app.db. The decoder rejects both values as
-//! `UnknownEnvelopeType` so any stale entry in an old raft log
-//! surfaces loudly instead of silently mis-applying.
+//! `log_batch` (originally type 1) and `files_writeset` (type 3) were
+//! retired in Phase 5.5 (a) and 5.5 (e) F2-storage respectively; type
+//! 1 was later reused for `multi`. Log records flow worker → S3
+//! (sidecar + ndjson) directly; per-tenant manifests live in a
+//! per-tenant `deployments/` BlobBackend, with the runtime release
+//! pointer riding envelope 0 in the customer's own app.db. The decoder
+//! rejects every retired type byte as `UnknownEnvelopeType` so any
+//! stale entry in an old raft log surfaces loudly instead of silently
+//! mis-applying — the full retired-slot list lives on `EnvelopeType`.
 //!
 //! The `id` is the tenant `instance_id`. `id_len` caps at 64KB. The
 //! trailing `payload` is whatever the dispatch callback for that
@@ -480,11 +485,11 @@ pub fn applyWriteSet(
         var fired: usize = 0;
         for (ops.items) |op| switch (op) {
             .put => |p| {
-                ns.broadcastKvWake(env.id, p.key, 'p');
+                ns.router.broadcastKvWake(env.id, p.key, 'p');
                 fired += 1;
             },
             .delete => |d| {
-                ns.broadcastKvWake(env.id, d.key, 'd');
+                ns.router.broadcastKvWake(env.id, d.key, 'd');
                 fired += 1;
             },
         };

@@ -248,7 +248,7 @@ pub const BufferedCmds = struct {
     /// so the parent unit's structural deinit no-ops.
     ///
     /// `worker: anytype` — interpretCmd reads `worker.h2`,
-    /// `worker.allocator`, `worker.node.broadcastKvWake` /
+    /// `worker.allocator`, `worker.node.router.broadcastKvWake` /
     /// `node.fetch_engine`, so the host worker type plumbs through
     /// structurally. Same `anytype` pattern every worker-side
     /// system uses.
@@ -279,7 +279,7 @@ pub fn interpretCmd(
     const allocator = worker.allocator;
     switch (cmd) {
         .kv_wake_broadcast => |w| {
-            worker.node.broadcastKvWake(tenant_id, w.key, w.op);
+            worker.node.router.broadcastKvWake(tenant_id, w.key, w.op);
             // Broadcast just reads the key; release it after.
             allocator.free(w.key);
         },

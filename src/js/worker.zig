@@ -14,15 +14,15 @@
 //! ## Request lifecycle
 //!
 //! ```
-//! h2.request_out  ── dispatchPending ──▶  raft_pending (if writes)
-//!                                     │
-//!                                     └▶  h2.response_in (no writes)
+//! h2.request_out  ── dispatchOnce ──▶  raft_pending (if writes)
+//!                                   │
+//!                                   └▶  h2.response_in (no writes)
 //!
 //! raft_pending    ── drainRaftPending ──▶  h2.response_in
 //!                                      ── or 503 on fault/timeout ──▶
 //! ```
 //!
-//! `dispatchPending` runs the handler, stamps response components onto
+//! `dispatchOnce` runs the handler, stamps response components onto
 //! the entity, and either (a) moves it directly to `response_in` if no
 //! writes were captured, or (b) sets `RaftWait{seq, deadline}` + kicks
 //! off a raft propose + moves to `raft_pending`. `drainRaftPending`
@@ -36,10 +36,12 @@
 //! commit. Concurrent requests are the whole reason this collection
 //! exists.
 //!
-//! M1 scope: one hard-coded handler source per worker. Reading the
-//! source from a files-server, route tables, and per-route bytecode
-//! caching land once the worker's code-client is designed alongside
-//! the files-server's HTTP/2 surface.
+//! Handler bytecode is loaded per deployment, not hard-coded: each
+//! tenant's `TenantFilesSnapshot` holds a path→bytecode map backed by
+//! the node-wide `BytecodeCache`, populated from the files-server's
+//! deployment manifest. Routes and triggers come from that manifest;
+//! `reloadDeployment` refreshes the snapshot when a new release rolls
+//! out.
 //!
 //! The dispatch systems are plain functions, not methods — they take
 //! `*Worker(...)` and are called by the user's poll loop between
@@ -73,7 +75,6 @@ const components_mod = @import("components.zig");
 const chunk_spool_mod = @import("chunk_spool.zig");
 const effect_mod = @import("effect/root.zig");
 const globals = @import("globals.zig");
-const apply_mod = @import("apply.zig");
 const raft_propose = @import("raft_propose.zig");
 const config_mirror = @import("config_mirror.zig");
 const respb = @import("response_builder.zig");
@@ -92,6 +93,11 @@ const reserved = @import("reserved.zig");
 const deployment_loader_mod = @import("deployment_loader.zig");
 const fetch_engine_mod = @import("fetch_engine.zig");
 const builtin_modules_mod = @import("builtin_modules.zig");
+const msg_router_mod = @import("msg_router.zig");
+pub const MsgRouter = msg_router_mod.MsgRouter;
+const blob_coordination_mod = @import("blob_coordination.zig");
+pub const BlobCoordination = blob_coordination_mod.BlobCoordination;
+pub const CoordReservationCtx = blob_coordination_mod.CoordReservationCtx;
 
 /// `_send/owed/` kv prefix — the durable marker key the JS-shim
 /// `webhook.send` writes (Phase 5 PR-3). Inlined here (and in
@@ -1229,82 +1235,6 @@ pub const ManifestPrefetchMap = std.StringHashMapUnmanaged(PrefetchedManifest);
 /// `RequestIdMinter` bakes the worker_id into the request id's upper
 /// 16 bits — sharing the minter would alias request ids across
 /// workers.
-/// `docs/streaming-model.md §7` Phase 5: reservation provider
-/// context. Stored on `NodeState`; lives as long as the
-/// `BlobCoordinator` it backs. Refill thread inside the coord calls
-/// `reserveFn` whenever its block runs low — we read the latest
-/// committed `_system/coord_next_pool_batch` from root, advance it
-/// by `count`, propose envelope-2 for replication, and block until
-/// commit. Returning the new "next" pointer; the coord owns
-/// `[returned - count, returned)`.
-pub const CoordReservationCtx = struct {
-    cluster: *kv_mod.Cluster,
-
-    /// Key in `__root__.db` that holds the cluster-wide "next
-    /// unreserved batch_id" pointer. Treated as 0 when absent; the
-    /// reserve path advances it by the requested block size.
-    const RESERVATION_KEY: []const u8 = "_system/coord_next_pool_batch";
-
-    /// Total time we'll wait for a single reservation propose to
-    /// commit. On timeout the coord's refill loop retries after a
-    /// 100ms backoff.
-    const RESERVATION_PROPOSE_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
-
-    pub fn reserveFn(ctx: *anyopaque, prev_end: u64, count: u32) anyerror!u64 {
-        const self: *CoordReservationCtx = @ptrCast(@alignCast(ctx));
-        const cluster = self.cluster;
-        const root_store = cluster.openRoot() catch |err| return err;
-
-        // Read the latest committed pointer. Absent → 0.
-        const stored: u64 = blk: {
-            const buf = root_store.get(RESERVATION_KEY) catch |err| switch (err) {
-                error.NotFound => break :blk 0,
-                else => return err,
-            };
-            defer cluster.allocator.free(buf);
-            if (buf.len != 8) return error.MalformedReservationPointer;
-            break :blk std.mem.readInt(u64, buf[0..8], .big);
-        };
-
-        // Floor at prev_end so back-to-back local refills can't
-        // overlap even if the committed pointer is stale (rare —
-        // would only happen if a previous propose failed to land).
-        // Floor at 1 so batch_id 0 (NO_BATCH sentinel) is never
-        // minted.
-        const base = @max(stored, prev_end, @as(u64, 1));
-        const new_end = base + count;
-
-        // Build the writeset that bumps the pointer. The leader's
-        // local applyRootWriteSet is leader-skip — we must apply
-        // locally before proposing so the next refill on this node
-        // (and any concurrent reader) sees the new value.
-        var ws = kv_mod.WriteSet.init(cluster.allocator);
-        defer ws.deinit();
-        var new_end_be: [8]u8 = undefined;
-        std.mem.writeInt(u64, &new_end_be, new_end, .big);
-        try ws.addPut(RESERVATION_KEY, &new_end_be);
-
-        // Local apply on the leader. On a follower this races — but
-        // followers never reserve (no submissions arrive), so the
-        // race window is empty in practice.
-        try root_store.put(RESERVATION_KEY, &new_end_be);
-
-        // Replicate via envelope-2 root_writeset, wait for commit.
-        const ws_bytes = try ws.encode(cluster.allocator);
-        defer cluster.allocator.free(ws_bytes);
-        const env = try apply_mod.encodeRootWriteSetEnvelope(cluster.allocator, ws_bytes);
-        defer cluster.allocator.free(env);
-
-        _ = cluster.proposeAndWait(env, RESERVATION_PROPOSE_TIMEOUT_NS) catch |err| switch (err) {
-            error.NotLeader => return error.NotLeader,
-            error.ProposalTimedOut => return error.ProposalTimedOut,
-            else => return err,
-        };
-
-        return new_end;
-    }
-};
-
 pub const NodeState = struct {
     allocator: std.mem.Allocator,
 
@@ -1360,71 +1290,15 @@ pub const NodeState = struct {
     /// `reloadDeployment` can leader-gate + propose the config mirror.
     raft: *kv_mod.RaftNode,
 
-    /// streaming-handlers-plan §4.6: registry of per-worker kv-wake
-    /// inboxes. Workers register their inbox at startup; producers
-    /// (apply.zig writeset apply on followers + worker_dispatch.zig
-    /// leader-side eager fire) call `broadcastKvWake` to fan out.
-    /// Per-worker (not node-wide) so each worker only scans cells it
-    /// owns — matches plan §4.1's "registry is per-worker" rule. The
-    /// `mutex` guards the registry vector itself (registration races
-    /// at worker startup); individual inboxes have their own mutex.
-    wake_inboxes_mutex: std.Thread.Mutex = .{},
-    wake_inboxes: std.ArrayListUnmanaged(*KvWakeInbox) = .empty,
-
-    /// Effect-reification Phase 2E: unified per-worker Msg inbox
-    /// registry. Replaces the pre-2E pair (`sub_fire_inboxes` +
-    /// `fetch_chunk_inboxes`) — one registry, one push path,
-    /// `hash(tenant_id) % N_inboxes` for hash-by-tenant stickiness.
-    /// Producers from non-worker threads (`deployment_loader` for
-    /// boot, the cron sweeper, the `FetchPool` libcurl threads) call
-    /// `enqueueMsgForTenant`; the typed wrappers
-    /// `enqueueSubscriptionFireForTenant` /
-    /// `enqueueFetchEventForTenant` build the matching `effect.Msg`
-    /// variant and route through it.
-    msg_inboxes_mutex: std.Thread.Mutex = .{},
-    msg_inboxes: std.ArrayListUnmanaged(*effect_mod.MsgInbox) = .empty,
-
-    /// `docs/cross-worker-held-state-plan.md` Phase 1: held-state
-    /// ownership registries. The accept worker (SO_REUSEPORT pick)
-    /// can differ from the async-wake worker (`hash(tenant_id) % N`).
-    /// These maps record which worker holds the held state for a
-    /// given async-effect id, so Phase 2's wake routing can target
-    /// the owning worker directly instead of the tenant-hashed one.
-    ///
-    /// `bound_fetch_owners` is keyed by `fetch_id` and populated at
-    /// `http.fetch({bind: true})` binding-call time (via
-    /// `registerBoundFetchTrampoline`); drained on terminal chunk /
-    /// held-client disconnect.
-    ///
-    /// `bound_send_owners` is keyed by `send_id` (the
-    /// `_send/owed/{id}` suffix) and populated when a
-    /// `webhook.send` + `next()` writes the `_send/owed/` marker;
-    /// drained when the cont resumes or its §6.4 deadline fires.
-    ///
-    /// Keys are allocator-owned dupes. Values are the owning
-    /// worker's `msg_inbox_idx`. Mutex-guarded; same lock shape as
-    /// `msg_inboxes`.
-    ///
-    /// Phase 1 (this commit) populates only — readers are wired in
-    /// Phase 2 once routing consults the registry.
-    held_owners_mutex: std.Thread.Mutex = .{},
-    bound_fetch_owners: std.StringHashMapUnmanaged(usize) = .empty,
-    bound_send_owners: std.StringHashMapUnmanaged(usize) = .empty,
-
-    /// Phase 2A instrumentation — observability for the
-    /// owner-routing path. `cross_worker_routes` counts decisions
-    /// where the owner worker differs from `hash(tenant_id) % N`
-    /// (i.e., the path that would have failed pre-Phase-2A);
-    /// `same_worker_routes` counts decisions where they happen to
-    /// coincide (correct but doesn't exercise the bug fix). A
-    /// smoke that sees zero cross-worker routes hasn't actually
-    /// tested the routing — its kernel SO_REUSEPORT spread
-    /// happened to coincide with the tenant hash. Counters never
-    /// reset; surfaced on `/_system/metrics` as
-    /// `bound_fetch_cross_worker_routes_total` /
-    /// `bound_fetch_same_worker_routes_total`.
-    bound_fetch_cross_worker_routes: std.atomic.Value(u64) = .init(0),
-    bound_fetch_same_worker_routes: std.atomic.Value(u64) = .init(0),
+    /// Async-activation routing subsystem — the per-worker inbox
+    /// registries (unified `effect.MsgInbox` + kv-wake `KvWakeInbox`)
+    /// and the cross-worker held-state owner registries, plus every
+    /// `enqueue*` / `broadcast*` / `register*` path that routes a
+    /// cross-thread `effect.Msg` to the worker that should service it.
+    /// Extracted from NodeState into `msg_router.zig`; depends only on
+    /// `allocator`. See that file for the routing rules (hash-by-tenant
+    /// default vs held-state owner override).
+    router: MsgRouter,
 
     /// Phase 5 PR-2b: built-in `__system/*` module bytecodes,
     /// compiled once at `init` from sources baked into the binary
@@ -1458,30 +1332,14 @@ pub const NodeState = struct {
     /// the response + calls `enqueueFetchEventForTenant`.
     fetch_engine: ?*fetch_engine_mod.FetchEngine = null,
 
-    /// `docs/streaming-model.md §7` Phase 3: process-global write
-    /// coordinator for readset blob PUTs. Replaces the per-worker
-    /// `BodyFlushPool`. All worker bodies (inbound + outbound fetch
-    /// chunks > 16 KB) submit here; the coord runs one drainer + K=32
-    /// executor pool. Lazy init via `startBlobCoordinator` after
-    /// NodeState is wired + `num_workers` is known.
-    blob_coordinator: ?*blob_mod.BlobCoordinator = null,
-
-    /// `docs/streaming-model.md §7` Phase 5: backend that owns
-    /// the cross-tenant `_pool/` prefix the coordinator writes
-    /// against. Opened once in `startBlobCoordinator`, deinit'd in
-    /// `deinit` (after the coord itself shuts down + joins).
-    pool_backend: ?blob_mod.BlobBackend = null,
-
-    /// `docs/streaming-model.md §7` Phase 5: heap-owned reservation
-    /// provider context. Lives as long as `blob_coordinator` does so
-    /// the coord's refill thread can resolve cluster + raft handles
-    /// after init returns.
-    coord_reservation_ctx: ?*CoordReservationCtx = null,
-
-    /// `kv.Cluster` handle — borrowed; owned by `main.zig`. Threaded
-    /// in via `setCluster` after `init` so the coord's reservation
-    /// provider can read root state + propose envelope-2.
-    cluster: ?*kv_mod.Cluster = null,
+    /// Readset-blob write subsystem — the process-global
+    /// `BlobCoordinator`, the shared `_pool/` S3 backend, the
+    /// raft-backed reservation context, and the borrowed `kv.Cluster`
+    /// handle the reservation provider needs. Extracted from NodeState
+    /// into `blob_coordination.zig`. Lazy-started via
+    /// `blob_coord.start(num_workers)` after `blob_coord.setCluster`.
+    /// See `docs/streaming-model.md §7` Phases 3 + 5.
+    blob_coord: BlobCoordination,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -1503,177 +1361,9 @@ pub const NodeState = struct {
             .raft = raft,
             .builtin_modules = builtins,
             .bytecode_cache = .{ .allocator = allocator },
+            .router = MsgRouter.init(allocator),
+            .blob_coord = BlobCoordination.init(allocator, blob_backend_cfg),
         };
-    }
-
-    /// Register a worker's wake inbox at worker startup. Worker
-    /// keeps the inbox; this registry just borrows the pointer so
-    /// producers can fan out. The pointer must outlive every
-    /// `broadcastKvWake` call — workers must `unregisterWakeInbox`
-    /// from their destroy path before tearing down.
-    pub fn registerWakeInbox(self: *NodeState, inbox: *KvWakeInbox) !void {
-        self.wake_inboxes_mutex.lock();
-        defer self.wake_inboxes_mutex.unlock();
-        try self.wake_inboxes.append(self.allocator, inbox);
-    }
-
-    pub fn unregisterWakeInbox(self: *NodeState, inbox: *KvWakeInbox) void {
-        self.wake_inboxes_mutex.lock();
-        defer self.wake_inboxes_mutex.unlock();
-        var i: usize = 0;
-        while (i < self.wake_inboxes.items.len) : (i += 1) {
-            if (self.wake_inboxes.items[i] == inbox) {
-                _ = self.wake_inboxes.swapRemove(i);
-                return;
-            }
-        }
-    }
-
-    /// Gap 2.1 Phase D: register a worker's subscription-fire
-    /// inbox. Same lifecycle as `registerWakeInbox` — worker keeps
-    /// the inbox; this registry borrows the pointer for hash-routed
-    /// fire enqueues.
-    /// Effect-reification Phase 2E: register a worker's unified Msg
-    /// inbox. The producer-side enqueueXxxForTenant functions
-    /// hash-route to one of these by `hash(tenant_id) % N`. Returns
-    /// the inbox's slot index in `msg_inboxes` — workers store it so
-    /// the per-worker partitioned sweeps (Phase 5 PR-3:
-    /// `sweepOwedRetries`) can match the same `hash(tenant_id) % N`
-    /// that `enqueueMsgForTenant` would route to.
-    pub fn registerMsgInbox(self: *NodeState, inbox: *effect_mod.MsgInbox) !usize {
-        self.msg_inboxes_mutex.lock();
-        defer self.msg_inboxes_mutex.unlock();
-        const idx = self.msg_inboxes.items.len;
-        try self.msg_inboxes.append(self.allocator, inbox);
-        return idx;
-    }
-
-    pub fn unregisterMsgInbox(self: *NodeState, inbox: *effect_mod.MsgInbox) void {
-        self.msg_inboxes_mutex.lock();
-        defer self.msg_inboxes_mutex.unlock();
-        var i: usize = 0;
-        while (i < self.msg_inboxes.items.len) : (i += 1) {
-            if (self.msg_inboxes.items[i] == inbox) {
-                _ = self.msg_inboxes.swapRemove(i);
-                return;
-            }
-        }
-    }
-
-    /// Hash-route `msg` onto the destination worker's `MsgInbox` by
-    /// `hash(tenant_id) % N`. The typed wrappers
-    /// (`enqueueSubscriptionFireForTenant`, `enqueueFetchEventForTenant`)
-    /// build the variant + call this. On success ownership of `msg`'s
-    /// owned bytes transfers to the inbox; on error.NoWorkers the
-    /// caller retains and MUST `effect.freeOwnedMsg` to free.
-    pub fn enqueueMsgForTenant(
-        self: *NodeState,
-        tenant_id: []const u8,
-        msg: effect_mod.Msg,
-    ) !void {
-        self.msg_inboxes_mutex.lock();
-        const n = self.msg_inboxes.items.len;
-        if (n == 0) {
-            self.msg_inboxes_mutex.unlock();
-            return error.NoWorkers;
-        }
-        const inbox_idx = std.hash.Wyhash.hash(0, tenant_id) % n;
-        const inbox = self.msg_inboxes.items[inbox_idx];
-        self.msg_inboxes_mutex.unlock();
-        try inbox.push(msg);
-    }
-
-    // ── docs/cross-worker-held-state-plan.md Phase 1 ───────────────
-    // Held-state ownership registries. Population only in Phase 1;
-    // Phase 2 wires the read-path (wake routing consults these to
-    // target the owning worker instead of hash(tenant_id)).
-
-    /// Register `fetch_id → owner_worker_idx` for a bound
-    /// `http.fetch({bind: true})`. Idempotent on owner-collision
-    /// (logs + drops the second registration — fetch_ids are
-    /// supposed to be unique within a node). Duping the key here
-    /// so the caller's slice can be freed independently. Returns
-    /// false on allocator failure / collision; the caller doesn't
-    /// need to act on the failure (Phase 2's wake routing falls
-    /// back to hash(tenant_id) when the registry misses).
-    pub fn registerBoundFetchOwner(
-        self: *NodeState,
-        fetch_id: []const u8,
-        worker_idx: usize,
-    ) bool {
-        self.held_owners_mutex.lock();
-        defer self.held_owners_mutex.unlock();
-        const gop = self.bound_fetch_owners.getOrPut(self.allocator, fetch_id) catch return false;
-        if (gop.found_existing) {
-            std.log.warn(
-                "rove-js held-state: bound_fetch_owners collision for fetch_id={s} (old={d}, new={d}); keeping old",
-                .{ fetch_id, gop.value_ptr.*, worker_idx },
-            );
-            return false;
-        }
-        const key_dup = self.allocator.dupe(u8, fetch_id) catch {
-            _ = self.bound_fetch_owners.remove(fetch_id);
-            return false;
-        };
-        gop.key_ptr.* = key_dup;
-        gop.value_ptr.* = worker_idx;
-        return true;
-    }
-
-    /// Lookup the owning worker for a bound fetch. Returns null on
-    /// miss (Phase 2 falls back to hash(tenant_id) routing).
-    pub fn lookupBoundFetchOwner(self: *NodeState, fetch_id: []const u8) ?usize {
-        self.held_owners_mutex.lock();
-        defer self.held_owners_mutex.unlock();
-        return self.bound_fetch_owners.get(fetch_id);
-    }
-
-    /// Drop the registry entry. Idempotent (no-op on miss).
-    pub fn unregisterBoundFetchOwner(self: *NodeState, fetch_id: []const u8) void {
-        self.held_owners_mutex.lock();
-        defer self.held_owners_mutex.unlock();
-        const entry = self.bound_fetch_owners.fetchRemove(fetch_id) orelse return;
-        self.allocator.free(entry.key);
-    }
-
-    /// Sibling of `registerBoundFetchOwner` for held-sync sends.
-    /// Keyed by the `_send/owed/{id}` suffix. Same semantics:
-    /// duped key, mutex-guarded, idempotent on collision.
-    pub fn registerBoundSendOwner(
-        self: *NodeState,
-        send_id: []const u8,
-        worker_idx: usize,
-    ) bool {
-        self.held_owners_mutex.lock();
-        defer self.held_owners_mutex.unlock();
-        const gop = self.bound_send_owners.getOrPut(self.allocator, send_id) catch return false;
-        if (gop.found_existing) {
-            std.log.warn(
-                "rove-js held-state: bound_send_owners collision for send_id={s} (old={d}, new={d}); keeping old",
-                .{ send_id, gop.value_ptr.*, worker_idx },
-            );
-            return false;
-        }
-        const key_dup = self.allocator.dupe(u8, send_id) catch {
-            _ = self.bound_send_owners.remove(send_id);
-            return false;
-        };
-        gop.key_ptr.* = key_dup;
-        gop.value_ptr.* = worker_idx;
-        return true;
-    }
-
-    pub fn lookupBoundSendOwner(self: *NodeState, send_id: []const u8) ?usize {
-        self.held_owners_mutex.lock();
-        defer self.held_owners_mutex.unlock();
-        return self.bound_send_owners.get(send_id);
-    }
-
-    pub fn unregisterBoundSendOwner(self: *NodeState, send_id: []const u8) void {
-        self.held_owners_mutex.lock();
-        defer self.held_owners_mutex.unlock();
-        const entry = self.bound_send_owners.fetchRemove(send_id) orelse return;
-        self.allocator.free(entry.key);
     }
 
     /// `docs/curl-multi-plan.md` Phase 2: hand each PendingFetch to
@@ -1709,197 +1399,6 @@ pub const NodeState = struct {
         for (items) |pf| try engine.submit(pf);
     }
 
-    /// Gap 2.3 Phase C2 + effect-reification Phase 2E: route a
-    /// fetch event (chunk / end / pipe_done) to the destination
-    /// worker's unified `MsgInbox` as the matching `effect.Msg`
-    /// variant. Caller-side ownership of every owned slice in `ev`
-    /// transfers in on success; on `error.NoWorkers` the caller
-    /// retains and is responsible for `UpstreamFetchEvent.deinitItem`.
-    ///
-    /// `docs/cross-worker-held-state-plan.md` Phase 2A: when
-    /// `ev.bind` is true AND `bound_fetch_owners[ev.fetch_id]`
-    /// resolves, route directly to the owning worker's inbox.
-    /// Otherwise fall back to `hash(tenant_id)` — the existing
-    /// behavior for unbound (Pattern A) fetches, subscription
-    /// fires, cron, kv-react, etc.
-    ///
-    /// The owner-routing path closes the cross-worker bind gap:
-    /// the inbound that registered the bound fetch may live on a
-    /// kernel-chosen worker (SO_REUSEPORT) different from
-    /// `hash(tenant_id) % N`; without owner routing the chunk
-    /// arrives on the wrong worker and the bound resume fails
-    /// silently until the §6.4 25s deadline.
-    pub fn enqueueFetchEventForTenant(
-        self: *NodeState,
-        tenant_id: []const u8,
-        ev: components_mod.UpstreamFetchEvent,
-    ) !void {
-        // Phase 5 PR-1: single `fetch_chunk` Msg variant; the
-        // event's `final` flag distinguishes streaming intermediates
-        // from the terminal.
-        const msg: effect_mod.Msg = .{ .fetch_chunk = ev };
-        // Phase 2A: bound fetch chunks route to the held-state owner
-        // via `bound_fetch_owners`. Phase 2B: webhook.send callback
-        // chunks (the fetch has no bind:true, but its bound_send_id
-        // names the cont's send_id) route via `bound_send_owners`.
-        // Either path skips `hash(tenant_id)` to land on the worker
-        // that holds the resume target. Unbound / non-webhook
-        // fetches fall through to today's hash routing.
-        const owner_opt: ?usize = blk: {
-            if (ev.bind) {
-                if (self.lookupBoundFetchOwner(ev.fetch_id)) |idx| break :blk idx;
-            }
-            if (ev.bound_send_id.len > 0) {
-                if (self.lookupBoundSendOwner(ev.bound_send_id)) |idx| break :blk idx;
-            }
-            break :blk null;
-        };
-        if (owner_opt) |owner_idx| {
-            // Instrumentation: count cross-worker vs same-worker
-            // routes so smokes can assert the path actually fires.
-            // A "same-worker" route is correct but doesn't exercise
-            // the cross-worker bug fix.
-            self.msg_inboxes_mutex.lock();
-            const n = self.msg_inboxes.items.len;
-            self.msg_inboxes_mutex.unlock();
-            const hash_idx = if (n > 0) std.hash.Wyhash.hash(0, tenant_id) % n else 0;
-            if (owner_idx != hash_idx) {
-                _ = self.bound_fetch_cross_worker_routes.fetchAdd(1, .monotonic);
-            } else {
-                _ = self.bound_fetch_same_worker_routes.fetchAdd(1, .monotonic);
-            }
-            return self.enqueueMsgToWorker(owner_idx, msg);
-        }
-        try self.enqueueMsgForTenant(tenant_id, msg);
-    }
-
-    /// `docs/cross-worker-held-state-plan.md` Phase 2A: push a
-    /// Msg directly to the worker at `worker_idx` (bypassing
-    /// `hash(tenant_id)`). Used by the held-state owner routing
-    /// path: when a bound fetch's chunk arrives, we know which
-    /// worker holds the receiving entity and route the event
-    /// there. Returns `error.NoWorkers` if the registry has no
-    /// inbox at that index (cold start, or registry torn down).
-    pub fn enqueueMsgToWorker(
-        self: *NodeState,
-        worker_idx: usize,
-        msg: effect_mod.Msg,
-    ) !void {
-        self.msg_inboxes_mutex.lock();
-        if (worker_idx >= self.msg_inboxes.items.len) {
-            self.msg_inboxes_mutex.unlock();
-            return error.NoWorkers;
-        }
-        const inbox = self.msg_inboxes.items[worker_idx];
-        self.msg_inboxes_mutex.unlock();
-        try inbox.push(msg);
-    }
-
-    /// Gap 2.1 Phase D + effect-reification Phase 2E: hash-route a
-    /// subscription fire (cron / kv-react / boot) to the destination
-    /// worker's unified `MsgInbox` as a `SubscriptionFire` variant.
-    /// Producer (loader / sweeper) owns the input slices borrowed;
-    /// this fn dupes onto the payload before pushing.
-    /// Returns `error.NoWorkers` if no inbox is registered yet
-    /// (cold start before any worker spawned).
-    pub fn enqueueSubscriptionFireForTenant(
-        self: *NodeState,
-        in: SubscriptionFireQueueInput,
-    ) !void {
-        const allocator = self.allocator;
-        const tid = try allocator.dupe(u8, in.tenant_id);
-        errdefer allocator.free(tid);
-        const name = try allocator.dupe(u8, in.subscription_name);
-        errdefer allocator.free(name);
-        const path = try allocator.dupe(u8, in.module_path);
-        errdefer allocator.free(path);
-
-        const source: effect_mod.msg.SubscriptionFire.Source = switch (in.source) {
-            .cron => |c| .{ .cron = .{ .fired_at_ns = c.fired_at_ns } },
-            .kv => |k| blk: {
-                const key_dup = try allocator.dupe(u8, k.key);
-                break :blk .{ .kv = .{ .key = key_dup, .op = k.op } };
-            },
-            .boot => |b| .{ .boot = .{ .deployment_id = b.deployment_id } },
-        };
-        errdefer switch (source) {
-            .kv => |kv| allocator.free(kv.key),
-            else => {},
-        };
-
-        const payload: effect_mod.msg.SubscriptionFire = .{
-            .tenant_id = tid,
-            .subscription_name = name,
-            .module_path = path,
-            .source = source,
-        };
-        try self.enqueueMsgForTenant(in.tenant_id, .{ .subscription_fire = payload });
-    }
-
-    /// Phase 5 PR-2: hash-route a chained dispatch — a `__rove_next`
-    /// returned from a `fetch_chunk` handler — to the destination
-    /// worker's MsgInbox as a `SendCallback` variant. The customer's
-    /// next-hop handler runs there with `request.activation.kind ==
-    /// "send_callback"` and the cont's ctx wrapped as
-    /// `request.body = {"ctx": <ctx>}`. Producer-owned slices are
-    /// dup'd onto the payload; on `error.NoWorkers` the caller
-    /// retains and frees them.
-    pub fn enqueueChainedDispatchForTenant(
-        self: *NodeState,
-        tenant_id: []const u8,
-        module_path: []const u8,
-        ctx_json: []const u8,
-        fn_name: ?[]const u8,
-        correlation_id: ?[]const u8,
-    ) !void {
-        const allocator = self.allocator;
-        const tid = try allocator.dupe(u8, tenant_id);
-        errdefer allocator.free(tid);
-        const mod = try allocator.dupe(u8, module_path);
-        errdefer allocator.free(mod);
-        const ctx = try allocator.dupe(u8, ctx_json);
-        errdefer allocator.free(ctx);
-        const fn_dup: ?[]u8 = if (fn_name) |f| try allocator.dupe(u8, f) else null;
-        errdefer if (fn_dup) |f| allocator.free(f);
-        const corr_dup: ?[]u8 = if (correlation_id) |c| try allocator.dupe(u8, c) else null;
-        errdefer if (corr_dup) |c| allocator.free(c);
-
-        const payload: effect_mod.msg.SendCallback = .{
-            .tenant_id = tid,
-            .module_path = mod,
-            .ctx_json = ctx,
-            .fn_name = fn_dup,
-            .correlation_id = corr_dup,
-        };
-        try self.enqueueMsgForTenant(tenant_id, .{ .send_callback = payload });
-    }
-
-    /// Fan out one kv-write event to every registered worker
-    /// inbox. Called from `apply.zig` (follower path) and
-    /// `worker_dispatch.zig` (leader path) so a write on any node
-    /// reaches every locally-held stream regardless of which node
-    /// + worker hosts it. A per-inbox push failure is logged and
-    /// swallowed — the §9.4 "spurious + overflow" thesis lets us
-    /// drop a wake; the worker that lost it will refetch authoritative
-    /// state on its next activation anyway.
-    pub fn broadcastKvWake(
-        self: *NodeState,
-        tenant_id: []const u8,
-        key: []const u8,
-        op: u8,
-    ) void {
-        self.wake_inboxes_mutex.lock();
-        defer self.wake_inboxes_mutex.unlock();
-        for (self.wake_inboxes.items) |inbox| {
-            inbox.push(tenant_id, key, op) catch |err| {
-                std.log.warn(
-                    "rove-js kv-wake broadcast: push tenant={s} key={s}: {s}",
-                    .{ tenant_id, key, @errorName(err) },
-                );
-            };
-        }
-    }
-
     pub fn deinit(self: *NodeState) void {
         // Gap 2.3 Phase C2: stop + join the fetch pool BEFORE any
         // other tear-down so its threads don't observe half-freed
@@ -1911,41 +1410,19 @@ pub const NodeState = struct {
             fe.deinit();
             self.fetch_engine = null;
         }
-        if (self.blob_coordinator) |c| {
-            c.deinit();
-            self.blob_coordinator = null;
-        }
-        if (self.pool_backend) |*be| {
-            be.deinit();
-            self.pool_backend = null;
-        }
-        if (self.coord_reservation_ctx) |ctx| {
-            self.allocator.destroy(ctx);
-            self.coord_reservation_ctx = null;
-        }
-        // Drop the inbox registry first — workers destroy their
-        // inboxes in their own deinit, so by the time NodeState
-        // tears down, every inbox should already be unregistered.
-        // The list itself is owned by NodeState's allocator.
-        self.wake_inboxes.deinit(self.allocator);
-        self.msg_inboxes.deinit(self.allocator);
-
-        // `docs/cross-worker-held-state-plan.md` Phase 1: free
-        // every owned key in the held-state registries. Values are
-        // POD usize, no per-entry cleanup. The owning workers'
-        // local registries (bound_fetch_entities) were drained in
-        // their own deinit paths; this is the NodeState mirror's
-        // catchall for any straggler keys at shutdown.
-        {
-            self.held_owners_mutex.lock();
-            defer self.held_owners_mutex.unlock();
-            var it_f = self.bound_fetch_owners.iterator();
-            while (it_f.next()) |entry| self.allocator.free(entry.key_ptr.*);
-            self.bound_fetch_owners.deinit(self.allocator);
-            var it_s = self.bound_send_owners.iterator();
-            while (it_s.next()) |entry| self.allocator.free(entry.key_ptr.*);
-            self.bound_send_owners.deinit(self.allocator);
-        }
+        // Tear down the blob-coord subsystem AFTER the fetch engine —
+        // the engine's libcurl thread reaches `blob_coord.coordinator`,
+        // so it must be joined first (above) before the coordinator +
+        // pool backend + reservation ctx are freed here.
+        self.blob_coord.deinit();
+        // Drop the inbox registries + held-state owner maps. Workers
+        // destroy their own inboxes in their deinit, so by the time
+        // NodeState tears down every inbox should already be
+        // unregistered; the registry lists + owned owner-keys are
+        // freed here as the catchall for any straggler at shutdown.
+        // Ordered after the fetch engine + coordinator shut down so
+        // no producer thread touches the registries mid-teardown.
+        self.router.deinit();
         builtin_modules_mod.deinit(&self.builtin_modules, self.allocator);
         // Phase 2 of curl-multi work: pending-fetches queue
         // moved into the FetchEngine; its shutdown above already
@@ -2002,86 +1479,6 @@ pub const NodeState = struct {
         errdefer fe.deinit();
         try fe.start();
         self.fetch_engine = fe;
-    }
-
-    /// `docs/streaming-model.md §7` Phase 3 + Phase 5: spawn the
-    /// process-global blob coordinator. Idempotent. Called once from
-    /// `main.zig` after NodeState is wired + `num_workers` is known
-    /// (the coord allocates per-worker queues up front).
-    ///
-    /// Phase 5: opens a single shared S3 backend at the
-    /// `{key_prefix_base}_pool/` prefix; submissions land in that one
-    /// pool, demuxed by `BodyRef.(offset, len)`. When `cluster` is
-    /// non-null the coord uses raft-backed `batch_id` reservation
-    /// (`_system/coord_next_pool_batch`); when null the coord falls
-    /// back to a local atomic counter (single-process / test paths).
-    pub fn startBlobCoordinator(self: *NodeState, worker_count: u8) !void {
-        if (self.blob_coordinator != null) return;
-
-        // Open the pool backend — one BlobBackend, prefix
-        // `{key_prefix_base}_pool/`, identical layout across leader +
-        // followers. We thread the prefix through `s3.Config`
-        // directly so the existing `openS3` factory can produce it
-        // without per-tenant gymnastics.
-        const cfg = self.blob_backend_cfg;
-        const pool_prefix = try std.fmt.allocPrint(
-            self.allocator,
-            "{s}_pool/",
-            .{cfg.key_prefix_base},
-        );
-        defer self.allocator.free(pool_prefix);
-
-        var pool_backend = try blob_mod.BlobBackend.openS3(self.allocator, .{
-            .endpoint = cfg.endpoint,
-            .region = cfg.region,
-            .bucket = cfg.bucket,
-            .key_prefix = pool_prefix,
-            .access_key = cfg.access_key,
-            .secret_key = cfg.secret_key,
-            .use_tls = cfg.use_tls,
-        });
-        errdefer pool_backend.deinit();
-        self.pool_backend = pool_backend;
-
-        // Build the reservation provider only when a cluster handle
-        // is wired in (production path). Without it the coord falls
-        // back to a local atomic counter — fine for tests, not safe
-        // across leader switches in a multi-node deploy.
-        var reservation: ?blob_mod.coordinator.ReservationProvider = null;
-        var res_ctx: ?*CoordReservationCtx = null;
-        if (self.cluster) |cl| {
-            const ctx = try self.allocator.create(CoordReservationCtx);
-            errdefer self.allocator.destroy(ctx);
-            ctx.* = .{ .cluster = cl };
-            res_ctx = ctx;
-            reservation = .{
-                .ctx = ctx,
-                .reserveFn = CoordReservationCtx.reserveFn,
-            };
-        }
-
-        const coord = blob_mod.BlobCoordinator.init(
-            self.allocator,
-            self.pool_backend.?.blobStore(),
-            .{
-                .worker_count = worker_count,
-                .reservation = reservation,
-            },
-        ) catch |err| {
-            if (res_ctx) |c| self.allocator.destroy(c);
-            return err;
-        };
-        self.blob_coordinator = coord;
-        self.coord_reservation_ctx = res_ctx;
-    }
-
-    /// `docs/streaming-model.md §7` Phase 5: wire the cluster
-    /// handle so `startBlobCoordinator` can install the raft-backed
-    /// reservation provider. MUST be called before
-    /// `startBlobCoordinator`; once the coord is running this is a
-    /// no-op (the reservation is captured at coord init).
-    pub fn setCluster(self: *NodeState, cluster: *kv_mod.Cluster) void {
-        self.cluster = cluster;
     }
 
     /// Lookup-or-lazy-open under `tenant_files_lock`.
@@ -2451,7 +1848,7 @@ pub fn Worker(comptime opts: Options) type {
         /// `serviceParkedStreams` drains it at the start of each
         /// tick and matches events against the parked stream chains'
         /// `kv_prefixes`. Pointer registered with
-        /// `worker.node.registerWakeInbox` in `Worker.create`;
+        /// `worker.node.router.registerWakeInbox` in `Worker.create`;
         /// unregistered + deinit'd in `Worker.destroy`.
         wake_inbox: KvWakeInbox,
         /// Deferred TrackedTxn commits keyed by raft seq. Per kvexp
@@ -2892,8 +2289,8 @@ pub fn Worker(comptime opts: Options) type {
             // worker_dispatch.zig can broadcast kv-write events to
             // this worker's locally-held streams. Address is stable
             // (`self` is heap-allocated above).
-            try config.node.registerWakeInbox(&self.wake_inbox);
-            errdefer config.node.unregisterWakeInbox(&self.wake_inbox);
+            try config.node.router.registerWakeInbox(&self.wake_inbox);
+            errdefer config.node.router.unregisterWakeInbox(&self.wake_inbox);
 
             // Effect-reification Phase 2E: register the unified Msg
             // inbox with the node so every cross-thread producer
@@ -2902,8 +2299,8 @@ pub fn Worker(comptime opts: Options) type {
             // `node.enqueueMsgForTenant`. The returned slot index is
             // this worker's partition key for the per-worker
             // partitioned sweeps (`sweepOwedRetries` — Phase 5 PR-3).
-            self.msg_inbox_idx = try config.node.registerMsgInbox(&self.msg_inbox);
-            errdefer config.node.unregisterMsgInbox(&self.msg_inbox);
+            self.msg_inbox_idx = try config.node.router.registerMsgInbox(&self.msg_inbox);
+            errdefer config.node.router.unregisterMsgInbox(&self.msg_inbox);
 
             // Eagerly open per-worker tenant_logs (request_id minters
             // bake the worker_id into the upper 16 bits; can't share).
@@ -3041,7 +2438,7 @@ pub fn Worker(comptime opts: Options) type {
             // Unregister + tear down the kv-wake inbox. Order
             // matters: unregister FIRST so no producer can still
             // be pushing into it while we walk + free the queue.
-            self.node.unregisterWakeInbox(&self.wake_inbox);
+            self.node.router.unregisterWakeInbox(&self.wake_inbox);
             self.wake_inbox.deinit();
             // Effect-reification Phase 2E: one unified Msg inbox
             // replaces the pre-2E pair. Unregister BEFORE deinit so
@@ -3049,7 +2446,7 @@ pub fn Worker(comptime opts: Options) type {
             // cron sweeper, FetchPool) can push after we start
             // freeing entries. `MsgInbox.deinit` walks the items
             // variant-aware via `freeOwnedMsg`.
-            self.node.unregisterMsgInbox(&self.msg_inbox);
+            self.node.router.unregisterMsgInbox(&self.msg_inbox);
             self.msg_inbox.deinit();
             // MsgQueue.deinit walks variants (subscription_fire +
             // fetch_chunk / fetch_done / fetch_pipe_done) to free
@@ -3471,7 +2868,7 @@ pub fn Worker(comptime opts: Options) type {
             // the owner. Failures here are non-fatal — Phase 2's
             // routing falls back to hash(tenant_id) when the
             // registry misses, which is the same behavior as today.
-            _ = self.node.registerBoundFetchOwner(fetch_id, self.msg_inbox_idx);
+            _ = self.node.router.registerBoundFetchOwner(fetch_id, self.msg_inbox_idx);
             // Increment the per-chain bound-fetch counter. The
             // entity is in request_out at this point; the merged
             // Row includes BoundFetchCount so the component is
@@ -3508,7 +2905,7 @@ pub fn Worker(comptime opts: Options) type {
             self.allocator.free(entry.key);
             // Mirror the NodeState owner-map drop. Same Phase 1
             // pairing as the registration site above.
-            self.node.unregisterBoundFetchOwner(fetch_id);
+            self.node.router.unregisterBoundFetchOwner(fetch_id);
             // Decrement the per-chain pending count. Naturally
             // saturates at 0 (defensive — register/unregister
             // pairs balance in normal flow). Surfaces as
@@ -4182,7 +3579,7 @@ fn sweepTenantCron(
             continue;
         }
 
-        worker.node.enqueueSubscriptionFireForTenant(.{
+        worker.node.router.enqueueSubscriptionFireForTenant(.{
             .tenant_id = slot.instance_id,
             .subscription_name = sub.name,
             .module_path = sub.module_path,
@@ -4239,7 +3636,7 @@ fn enqueueBootSubscriptions(slot: *TenantSlot, snap: *TenantFilesSnapshot) !void
         // message onto an `effect.SubscriptionFire` payload (via
         // `effect.enqueueMsg`) and `dispatchSubscriptionFires` fires
         // it on the next tick.
-        node.enqueueSubscriptionFireForTenant(.{
+        node.router.enqueueSubscriptionFireForTenant(.{
             .tenant_id = slot.instance_id,
             .subscription_name = sub.name,
             .module_path = sub.module_path,
@@ -4312,9 +3709,9 @@ pub fn sweepOwedRetriesOnPromotion(worker: anytype) void {
 
 fn sweepOwedRetriesAllPartitioned(worker: anytype, now_ns: i64) void {
     const n_inboxes = blk: {
-        worker.node.msg_inboxes_mutex.lock();
-        defer worker.node.msg_inboxes_mutex.unlock();
-        break :blk worker.node.msg_inboxes.items.len;
+        worker.node.router.msg_inboxes_mutex.lock();
+        defer worker.node.router.msg_inboxes_mutex.unlock();
+        break :blk worker.node.router.msg_inboxes.items.len;
     };
     if (n_inboxes == 0) return; // pre-registration cold start
 
@@ -4920,7 +4317,7 @@ pub fn fireFetchEventActivation(
         // HWM. Always park (no fast-durable bypass — submit is
         // strictly async, durable_seq can't have advanced past
         // this seq before the executor lands the PUT).
-        if (worker.node.blob_coordinator) |coord| {
+        if (worker.node.blob_coord.coordinator) |coord| {
             const wid: u8 = @intCast(worker.log_worker_id);
             const seq = coord.submit(wid, event.bytes) catch |err| blk: {
                 std.log.warn(
@@ -5072,7 +4469,7 @@ pub fn fireFetchEventActivation(
             // the whole flow (inbound → fetch → chained hop) under
             // one umbrella.
             defer cval.deinit(allocator);
-            const enqueue_err = worker.node.enqueueChainedDispatchForTenant(
+            const enqueue_err = worker.node.router.enqueueChainedDispatchForTenant(
                 tenant_id,
                 cval.path,
                 cval.ctx_json,

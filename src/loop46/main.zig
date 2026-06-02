@@ -1514,8 +1514,8 @@ pub fn main() !void {
     // provider can read root + propose envelope-2 to mint globally-
     // unique `batch_id` blocks.
     std.debug.assert(num_workers <= std.math.maxInt(u8));
-    node_state.setCluster(cluster);
-    try node_state.startBlobCoordinator(@intCast(num_workers));
+    node_state.blob_coord.setCluster(cluster);
+    try node_state.blob_coord.start(@intCast(num_workers));
 
     // streaming-handlers-plan §4.6: hand the apply path a pointer
     // to NodeState so `applyWriteSet` can `broadcastKvWake` across

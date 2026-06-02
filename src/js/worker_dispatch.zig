@@ -1337,8 +1337,8 @@ fn handleMetrics(
         \\bound_fetch_same_worker_routes_total {d}
         \\
     , .{
-        worker.node.bound_fetch_cross_worker_routes.load(.monotonic),
-        worker.node.bound_fetch_same_worker_routes.load(.monotonic),
+        worker.node.router.bound_fetch_cross_worker_routes.load(.monotonic),
+        worker.node.router.bound_fetch_same_worker_routes.load(.monotonic),
     });
 
     // `docs/chunk-spool-plan.md` Phase 3: peak inline RAM held by this
@@ -1376,7 +1376,7 @@ fn handleMetrics(
     // `docs/chunk-spool-plan.md` P6: live retained (sealed-but-not-
     // fully-consumed) coordinator batches. Refcount-release keeps this
     // at the live backlog; pre-P6 it grew without bound.
-    if (worker.node.blob_coordinator) |coord| {
+    if (worker.node.blob_coord.coordinator) |coord| {
         try w.print(
             \\# HELP coord_retained_batches live retained (sealed, not fully consumed) blob-coordinator batches.
             \\# TYPE coord_retained_batches gauge
@@ -2587,7 +2587,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     // Phase 3: bytes flow to the process-global coord,
                     // we park on the resulting seq, drain materializes
                     // the BodyRef once the seq is durable.
-                    if (worker.node.blob_coordinator) |coord| {
+                    if (worker.node.blob_coord.coordinator) |coord| {
                         const wid: u8 = @intCast(worker.log_worker_id);
                         if (coord.submit(wid, body)) |seq| {
                             try server.reg.set(ent, &server.request_out, worker_mod.BodyDurabilityWait, .{
@@ -2930,7 +2930,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // 2 falls back to today's per-worker scan when the registry
         // misses.
         if (cont_bound_sched_id) |send_id| {
-            _ = worker.node.registerBoundSendOwner(send_id, worker.msg_inbox_idx);
+            _ = worker.node.router.registerBoundSendOwner(send_id, worker.msg_inbox_idx);
             // Phase 3: also stamp the worker-local send_id → entity
             // map so `resumeBoundContinuation` can skip its scan of
             // every parked cont and lookup directly.

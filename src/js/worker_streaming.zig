@@ -15,9 +15,11 @@
 //!     "Gap 2.3 http.fetch" section; the four are near-duplicate
 //!     today and collapse together in Phase 4.1.
 //!   - Commit-gated buffer: `StreamResumeStage`, `proposeForgetfulWrites`,
-//!     `transferStagedChunks`, `firePendingKvWakes`,
-//!     `fireKvReactSubscriptions` — the parked-unit commit-arm runtime
-//!     `drainRaftPending` invokes for each unit when its raft seq lands.
+//!     `fireKvReactSubscriptions` + `unit.buffered.releaseAll` — the
+//!     parked-unit commit-arm runtime `drainRaftPending` invokes for
+//!     each unit when its raft seq lands. (The pre-4.1 helpers
+//!     `transferStagedChunks` + `firePendingKvWakes` collapsed into
+//!     this pair.)
 //!   - Msg ingress + dispatch: `drainMsgInbox`,
 //!     `serviceSubscriptionFires`, `dispatchPendingMsgs` (+ two
 //!     back-compat aliases) — cross-thread inbox drain → in-thread queue
@@ -1845,7 +1847,7 @@ fn fireChainedActivation(
             // recursion via the dispatch BATCH cap). Inherits the
             // same correlation_id.
             defer cval.deinit(allocator);
-            const enqueue_err = worker.node.enqueueChainedDispatchForTenant(
+            const enqueue_err = worker.node.router.enqueueChainedDispatchForTenant(
                 tenant_id,
                 cval.path,
                 cval.ctx_json,
@@ -2447,7 +2449,7 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
         {
             const h = sp.head().?;
             if (h.evicted) {
-                const coord = worker.node.blob_coordinator orelse {
+                const coord = worker.node.blob_coord.coordinator orelse {
                     // No coord but an evicted entry — unreachable in
                     // production (eviction only happens for submitted
                     // chunks, which require a coord). Drop loudly.
@@ -2559,7 +2561,7 @@ fn queueCoordRelease(worker: anytype, worker_id: u8, seq: u64) void {
 /// submit isn't durable yet (`release` returns false). Drained each
 /// tick from `drainSpools` regardless of whether any spool is active.
 fn drainCoordReleases(worker: anytype) void {
-    const coord = worker.node.blob_coordinator orelse return;
+    const coord = worker.node.blob_coord.coordinator orelse return;
     var i: usize = 0;
     while (i < worker.coord_pending_releases.items.len) {
         const p = worker.coord_pending_releases.items[i];
