@@ -181,27 +181,68 @@ guard in `webhook_onresult` is exactly that, content-addressing is its
 `blob.put` analog). The primitive gives durable *scheduling*, not durable
 *dedup*.
 
-**The fork to decide before building.** The granularity choice shapes the
-implementation:
+**The locus fork — two naive options** (both superseded; resolution
+below). The granularity / queue-locus choice shapes the implementation:
 
-- **One durable alarm per tenant** (Cloudflare DO model). Dodges the index
-  problem entirely — next-fire lives on the tenant slot, O(tenants) max —
-  but forces the customer to multiplex (keep their own queue, set the
-  alarm to the earliest due). Smallest, safest surface; the DO precedent
-  is strong evidence one alarm suffices to build everything.
-- **Many timers per tenant.** Richer, but the sweep now needs a
-  time-ordered due-index (`_wake/due/{ts}/{id}`) so it pops **O(due)**, not
-  the O(all-pending) prefix paging the owed sweep does today — and the
-  steady-state tick must stay off the O(N_tenants) path (today's owed
-  sweep iterates every loaded tenant each second; fine at tens of timers,
-  not at scale — [[feedback_no_n_tenants_hot_path]],
+- **One raw durable alarm per tenant** (Cloudflare DO's exact API shape).
+  Dodges the index problem — next-fire lives on the tenant slot,
+  O(tenants) max — but exposes a single mutable slot, which forces
+  independent libraries (cron, webhook, email, retry) to **share and
+  clobber** it: webhook sets its retry at T+2s, cron overwrites to T+60s,
+  the retry silently never fires. That is the silent-failure /
+  hidden-coupling class this whole effort exists to kill.
+- **Engine owns the per-tenant ordered queue.** Closes the clobber — the
+  engine merges everyone's timers onto one cached next-fire — but puts the
+  queue + ordering + min-heap in **Zig**: a time-ordered due-index
+  (`_wake/due/{ts}/{id}`) popped **O(due)**, with the steady-state tick
+  kept off the O(N_tenants) path ([[feedback_no_n_tenants_hot_path]],
   [[project_owed_recovery_strategy]]).
 
-**Lean (per the simplicity-over-flexibility prior,
-[[feedback_model_simplicity_safety]]): start with one-alarm-per-tenant.**
-It makes `webhook.send` a clean composition immediately, sidesteps the
-index hazard, and many-timers + ordered-index can land later behind the
-same `scheduleWake` surface if a customer earns it.
+**RESOLVED: a canonical JS `scheduler` lib over a capability-scoped
+minimal primitive.** Both naive options miss the project's grain. The
+clobber hazard is a property of *exposing the raw slot*, not of the
+one-next-fire-per-tenant efficiency — so don't conflate them. And the
+ordering/queue logic is a *composition*, which by the durability-as-JS-shim
+direction ([[project_durability_as_js_shim]]) and the "compose from
+primitives / new Zig is a smell" priors ([[feedback_compose_from_primitives]],
+[[feedback_stop_before_zig]]) belongs in JS, not the engine. Three layers:
+
+- **Engine** — one durable next-fire per tenant (a single timestamp; fire
+  one `durable_wake` Msg when due — almost exactly today's owed-sweep
+  mechanism, generalized + feature-agnostic) plus the resource caps. The
+  raw single-slot primitive is a **scoped capability**, reachable only by
+  the `scheduler` baked lib (the `__system/` privilege), never by ordinary
+  customer handler code — so customers *cannot* clobber the slot.
+- **One canonical `scheduler` JS lib** — owns the per-tenant queue,
+  ordering, and fan-out (ordinary kv; taped + replayed like any handler
+  state). Exposes the public `scheduler.at(at_ns, msg)`; everyone — stdlib
+  and customers — composes timer features on it. cron / webhook / email
+  *do* cooperate, but only by sharing this one dependency, encapsulated so
+  the feature authors never think about it.
+- **Feature libs** (cron, email, webhook, retry) — policy only, composed
+  on `scheduler.at()`.
+
+This gets the **composability** of the engine-owned-queue (everyone
+composes on `scheduler.at()`; the clobber footgun closed by
+capability-scoping the raw slot, not by the engine owning the queue) with
+the **minimal-engine** posture of the JS-shim direction (queue, ordering,
+backoff are inspectable, replaceable JS).
+
+**Replaceability — opt-in, deferred.** Because the feature libs hard-depend
+on `scheduler`, a customer cannot swap the low-level slot without breaking
+them. Default = the shared canonical `scheduler`. If a customer genuinely
+needs different low-level behavior, provide an override seam ("bring your
+own scheduler satisfying interface X; you now own the single-slot
+invariant") — a sharp escape hatch, opt-in, **not built until a customer
+asks** ([[feedback_compose_from_primitives]],
+[[feedback_model_simplicity_safety]]).
+
+**Honest residual.** This is not zero-privileged-code — it is **one generic
+privileged JS lib instead of N feature-specific Zig sweeps**. `scheduler`
+becomes a shared critical-path dependency, so a bug in it breaks every
+timer feature at once; the trade is the usual centralization one (one
+well-tested lib over N hand-rolled copies) and it stays fully replayable.
+A large win over today's per-feature Zig, not a free one.
 
 **The contract fork — firing vs completion — RESOLVED: firing.** The
 second axis is what the wake *guarantees*, and it decides whether
@@ -287,7 +328,7 @@ proposal. Status snapshot:
 | 3 | 2.3 streaming outbound (`http.fetch`) | **DONE 2026-05-21** |
 | 4 | 2.4 streaming inbound body | design locked in `streaming-model.md` §3; implementation pending |
 | 5 | 2.5 held outbound subscription | **DONE 2026-05-24** |
-| 6 | 2.6 durable scheduled wake | **PROPOSED 2026-06-01** — unbuilt; contract fork resolved (firing, not completion); one-vs-many-timer fork still open |
+| 6 | 2.6 durable scheduled wake | **PROPOSED 2026-06-01** — unbuilt; both forks resolved (firing contract; canonical JS `scheduler` lib over a capability-scoped minimal primitive) |
 
 ---
 
