@@ -15,14 +15,18 @@
 //!   "/foo/bar/"        → "foo/bar/index"
 //!   "/foo?x=1"         → "foo/index"
 //!
-//! The returned module base has no file extension. Callers append
-//! `.js` (or `.mjs` later) and look the full key up in the deployment's
-//! bytecode map. The router is pure and owns no state — the only
-//! allocation is for the returned module string, which the caller frees.
+//! The returned module base has no file extension. Callers append the
+//! extension (`.mjs` for handlers) and look the full key up in the
+//! deployment's bytecode map. The router is pure and owns no state — the
+//! only allocation is for the returned module string, which the caller
+//! frees.
 //!
-//! The "function name from URL path segment" field that shift-js's
-//! `sjs_route_t` reserves is NOT populated here yet. `.mjs` + `?fn=`
-//! dispatch lands with module support.
+//! The router is intentionally function-name-agnostic. Unlike shift-js's
+//! `sjs_route_t`, it does not resolve which export to call — it only
+//! splits the path from the query string and stores the raw query on the
+//! `Route`. The dispatcher (`dispatcher.zig`'s `parseDispatch`) extracts
+//! `?fn=<name>` (and `&args=`) from that query downstream when invoking a
+//! module export.
 
 const std = @import("std");
 
@@ -31,8 +35,9 @@ pub const Route = struct {
     /// Owned by `allocator`. Caller frees via `deinit`.
     module_base: []const u8,
     /// Query string (everything after `?`), or null if the URL had
-    /// none. Owned by `allocator`. Stored on the route so the handler
-    /// globals can expose it later without re-parsing the URL.
+    /// none. Owned by `allocator`. Consumed downstream by the dispatcher
+    /// (`parseDispatch`) to extract `?fn=`/`&args=` for module-export
+    /// dispatch.
     query: ?[]const u8,
 
     allocator: std.mem.Allocator,

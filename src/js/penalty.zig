@@ -15,11 +15,11 @@
 //! the entry to closed. That's the escape hatch: a customer who ships
 //! a fix gets their traffic back without operator intervention.
 //!
-//! **Thread safety.** Not internally synchronized. The rove-js worker
-//! is single-threaded (h2 thread does all dispatch), so the PenaltyBox
-//! lives on that thread only. Migrating to shift-js's per-worker model
-//! later will want one PenaltyBox per worker thread, not a shared one —
-//! sharing would reintroduce the contention we're trying to avoid.
+//! **Thread safety.** Not internally synchronized, and doesn't need to
+//! be: the `PenaltyBox` is a per-`Worker` field, touched only by that
+//! worker's own dispatch thread. The multi-worker model already gives
+//! each worker its own box, so there is no shared box and no
+//! cross-worker contention to coordinate.
 
 const std = @import("std");
 

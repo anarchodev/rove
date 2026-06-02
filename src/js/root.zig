@@ -1,46 +1,42 @@
 //! rove-js — the worker-side JS dispatch layer.
 //!
-//! Phase 2 session 1 (this file's current scope):
+//! This module owns everything between an inbound activation and the
+//! customer JS handler that services it: the per-request JS context, the
+//! global surface the handler sees, the effect/Cmd machinery that makes
+//! external effects durable, and the worker-level dispatch loop that
+//! drives it all.
 //!
-//! - `Request` / `Response` — plain Zig types the HTTP layer will feed
-//!   in and read back out. Session 2 bridges these to `rove-h2`.
-//! - `Dispatcher` — creates a fresh quickjs `Runtime`+`Context` per
-//!   request, installs the minimal global surface (`kv`, `console`,
-//!   `request`, `response`), evaluates a handler source, and extracts
-//!   the response. A fresh runtime per request is correct but slow; the
-//!   snapshot/restore fast path (memcpy into a reused arena) lands in a
-//!   later session once the request/response shape is stable.
-//! - Minimal JS globals: `kv.get`/`kv.set`/`kv.delete`, `console.log`,
-//!   a read-only `request` object, a writable `response` object.
+//! ## Dispatch model
 //!
-//! **Deferred to the next sessions:**
+//! The handler is `update : (Msg, Ctx) -> (Effects, Cmd Msg)` — the Elm
+//! Architecture (TEA) shape. Every activation (inbound request,
+//! send/fetch callback, kv wake, disconnect, subscription fire) is a
+//! `Msg` routed through `Dispatcher.runOutcome` (`dispatcher.zig`), the
+//! single re-entry point. The handler returns a list of `Cmd`s; external
+//! effects are reified rather than performed inline, so they can be made
+//! durable (parked until raft-committed) and replayed. See
+//! `docs/effect-algebra.md` for the four-primitive effect frame and
+//! `docs/effect-reification-plan.md` §3.3 for the Continuation primitive
+//! backing the parked Msg queue.
 //!
-//! - HTTP/2 wiring (`rove-h2` accept loop + router). Session 2.
-//! - HTTP/2 client to `rove-files-server` for on-demand bytecode fetch.
-//!   Session 2 builds both ends of this wire.
-//! - Tenant resolution + per-instance KV prefixing. Session 2 adds
-//!   `rove-tenant` and plumbs it through the router.
-//! - Raft wiring (3-node worker cluster). Session 3.
+//! ## Per-request context
 //!
-//! ## Handler convention (M1 shape)
+//! Each request runs against a fresh JS context via arenajs's dual-arena
+//! reset — one cursor write per request, not a fresh runtime (see
+//! `vendor/arenajs/README.md`). The base arena is built once at worker
+//! startup and shared across all requests on the thread.
 //!
-//! A handler is a plain script that reads `request` and writes
-//! `response`:
+//! ## Request lifecycle
 //!
-//! ```js
-//! const name = kv.get("name") ?? "world";
-//! kv.set("last_name", name);
-//! console.log("greeting " + name);
-//! response.status = 200;
-//! response.body = "hello " + name;
+//! ```
+//! h2.request_out → dispatchOnce → [drainRaftPending if writes]
+//!                → h2.response_in → h2.response_out
 //! ```
 //!
-//! No `export default`, no function export — the script body runs once
-//! per request against a fresh context. This is deliberately simple so
-//! session 1 doesn't commit us to an async model before we know what
-//! the globals look like. The "modern" handler shape (`export default
-//! async function(req)`) will land alongside snapshot/restore in
-//! session 3 where we can afford the added complexity.
+//! The `drain*` / `sweep*` / `service*` helpers re-exported below are the
+//! worker tick's phase-based dispatch stages — parked continuations,
+//! durability gates, subscription/cron/boot fires, owed-retry sweeps, and
+//! response/log cleanup. They run between `poll()` and `reg.flush()`.
 
 const std = @import("std");
 
