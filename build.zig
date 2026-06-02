@@ -438,6 +438,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "cron_js", .path = "src/js/globals/cron.js" },
         .{ .name = "retry_js", .path = "src/js/globals/retry.js" },
         .{ .name = "scheduler_js", .path = "src/js/globals/scheduler.js" },
+        .{ .name = "schedule_js", .path = "src/js/globals/schedule.js" },
+        .{ .name = "on_js", .path = "src/js/globals/on.js" },
         .{ .name = "webhook_js", .path = "src/js/globals/webhook.js" },
         .{ .name = "email_js", .path = "src/js/globals/email.js" },
         .{ .name = "textcodec_js", .path = "src/js/globals/textcodec.js" },
@@ -455,6 +457,8 @@ pub fn build(b: *std.Build) void {
         // module (docs/durable-wake-plan.md P1). Add an entry here AND
         // in `src/js/builtin_modules.zig`'s `MODULES` table.
         .{ .name = "builtin_scheduler_tick_mjs", .path = "src/js/builtin_modules/scheduler_tick.mjs" },
+        // Handler-surface Phase 5 — the `cron(...)` recurrence engine.
+        .{ .name = "builtin_cron_tick_mjs", .path = "src/js/builtin_modules/cron_tick.mjs" },
 
         // Starter content baked into the freshly-created tenant's
         // first deployment — see `deployStarterContent` in

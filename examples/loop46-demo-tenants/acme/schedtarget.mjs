@@ -25,5 +25,12 @@ export default function () {
     const m = parseInt(kv.get(perId) || "0", 10) + 1;
     kv.set(perId, String(m));
 
+    // Per-tag counter so a smoke can tell schedule vs cron fires apart.
+    const tag = (a.msg && typeof a.msg.tag === "string") ? a.msg.tag : "";
+    if (tag) {
+        const tk = "sched-tag/" + tag;
+        kv.set(tk, String(parseInt(kv.get(tk) || "0", 10) + 1));
+    }
+
     return { status: 200 };
 }
