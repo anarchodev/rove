@@ -3,7 +3,7 @@
 > **Status**: synthesis, 2026-05-22. Built from the effect-system audit
 > in §5. This is the cross-cutting frame that `primitive-gaps.md` §5,
 > `streaming-model.md`, and `connection-actor-plan.md` are each a facet
-> of — see §8. It is the ground truth for the question "does this new
+> of — see §9. It is the ground truth for the question "does this new
 > effect fit the model?"
 >
 > The customer-facing handler surface (named exports per Msg kind,
@@ -393,7 +393,185 @@ Known catalog gaps, *not* incoherence: streaming inbound body
 pending), connection-actor inbound / WebSocket (see
 `docs/websocket-plan.md`), `http.cancelFetch` transport.
 
-## 8. Relation to existing docs
+## 8. Trigger scope — connection vs tenant
+
+> **Status**: synthesis, 2026-06-02. Deepens L2 (§2.2): it names *why*
+> a Continuation reconstructs-or-abandons, and the two orthogonal axes
+> that classify every trigger feeding a Continuation. The customer
+> surface this implies is specified in [`handler-shape.md`](handler-shape.md);
+> here it is the model justification for that surface's shape.
+
+### 8.1 A Continuation's durability is forced by its scope
+
+§2.2's L2 says a Continuation reconstructs iff its bound Cmd is durable.
+The 2026-06 design names *why*, and it is not a policy choice — it is
+physics. A Continuation resumes one of two things:
+
+- A **connection-scoped** Continuation resumes a write to a specific
+  socket fd on a specific node — a held HTTP/2 stream, a WebSocket
+  frame. That resource is non-replicable. If the leader moves or the
+  worker crashes, the socket is gone; there is nothing on the new node
+  to resume *to*. Durability is not merely unguaranteed — it is
+  **meaningless**: you could persist the registration through raft and
+  on recovery have nowhere to deliver it.
+- A **tenant-scoped** Continuation resumes pure logical work — "run
+  this module, produce these effects (kv writes, outbound sends)."
+  Those effects can be produced on any node. Durability is both
+  achievable and wanted.
+
+> **L2, sharpened.** A Continuation is durable iff it is tenant-scoped.
+> Connection-scoped Continuations are ephemeral *by construction* —
+> the resource they resume, a socket fd pinned to one node, is the one
+> piece of state consensus cannot move.
+
+This subsumes §2.2's reconstruct-vs-abandon: "bound to a durable Cmd"
+⟺ "tenant-scoped." `webhook.send`'s owed Continuation reconstructs
+because it is tenant-scoped (its work is logical: process the result,
+write kv). Every stream / fetch / held connection abandons because it
+is connection-scoped. Same rule, named at its root.
+
+### 8.2 Two axes — scope × delivery
+
+Scope is one of two orthogonal axes that classify every Msg origin
+(§2.3) feeding a Continuation. The second is **delivery**: whether the
+trigger is *edge* (idempotent "something changed, go look" —
+coalescable) or *value* (carries a unique payload that must arrive
+exactly once — not coalescable). The two are independent; every trigger
+is a cell in a 2×2:
+
+| | edge (coalescable) | value (exactly-once) |
+|---|---|---|
+| **connection-scoped** — ephemeral, node-local, connection-affine, cancelled on close | held-stream kv-prefix wake; disconnect; timer | held `http.fetch` chunk / result |
+| **tenant-scoped** — durable (env-0), tenant-routed, lifecycle independent of any connection | cron; kv-react subscription | `webhook.send` result; durable scheduled wake (gap 2.6) |
+
+Every property the audit (§5) tracks per-effect is derivable from the
+cell rather than chosen per-effect:
+
+- **Durability** (§4 q3) and **routing** come from the *row* —
+  connection-scoped resumes route to the worker holding the socket
+  (continuation-affinity, §6 prediction 1 + worklist #4); tenant-scoped
+  resumes route by tenant or are picked up from the durable Model +
+  boot-scan.
+- **Coalescing** and **failure** semantics (§4 q5/q6) come from the
+  *column* — edge triggers fold (the wake-ring, Gap 2.2); value
+  triggers must be delivered exactly once.
+- **Cancellation:** terminating a chain (`close` / response value)
+  cancels exactly the connection row — node-local, no distributed
+  cancel. The tenant row was never connection-owned, so it is
+  untouched. This is why a close-cancel race does not exist.
+
+Scope is a property of the **registration** (the waiter), not the
+event. The same kv write fans out to a connection-scoped held-stream
+wait *and* a tenant-scoped kv-react subscription; each waiter's own row
+decides its durability.
+
+### 8.3 `bind` was the conflated row-selector
+
+The retired `bind` flag (now auto-bind + `detach`, see
+`auto-bind-plan.md`) was the API-level operator that chose a
+Continuation's row — "does this result resume the held socket?" Because
+the row *is* the durability class (§8.1), `bind` was a durability
+selector wearing a routing-flag costume, which is why it was
+load-bearing and confusing.
+
+The clean decomposition keeps two registrations that `bind` fused:
+
+- **Durability** is intrinsic to the **primitive**, never a flag.
+  `webhook.send` is tenant-row, always (it writes `_send/owed/{id}`,
+  §3). `http.fetch` is connection-row, always (no marker, nothing
+  promised).
+- **Connection-resume** is *derived from held context* (auto-bind) and
+  is **additive** — it adds a connection-row resume on top of whatever
+  the primitive already is; `detach` removes it. It can never move a
+  primitive between rows: detach a `webhook.send` and it is still
+  durable; you merely forgo the socket-resume.
+
+The proof the old flag conflated the two is the auto-bind carve-out
+that **excludes `webhook.send`'s `bound_send_id`** from auto-binding
+([[project_auto_bind_reshape]]). Under clean separation there is
+nothing to exclude — webhook registers tenant-row because it is
+durable, and auto-binds its connection-row resume like anything else in
+held context. The exclusion exists *only* because one flag did two
+jobs.
+
+This is why `webhook.send`'s two-layer shape (§2.2, §3) is exactly the
+principle instantiated: a durable tenant-row owed-marker (always)
+**plus** an ephemeral connection-row held-sync resume
+(`__rove_resume_if_bound`, §6.4 of `connection-actor-plan.md`, taken
+only if the originating socket is still on this worker). One logical
+operation registering in both rows — the held-sync resume is an
+invisible optimization, never a customer concept.
+
+### 8.4 Registration ordering — watch before write
+
+The dominant tenant↔connection composition is "respond by streaming,
+but the data is produced by a tenant-row effect": a held handler kicks
+off durable work and waits on the kv key that work will write (the
+decomposed `bind` case). This carries a lost-wakeup hazard — the watch
+must be armed before the write it waits for.
+
+The grammar makes this the runtime's invariant, not the author's
+burden. Effects are commit-gated (L4): calling `webhook.send` during
+the body only *buffers* a Cmd; the activation produces
+`(Writeset, Cmd Msg)` atomically. At end-of-activation the runtime
+sequences: **arm the return-value's connection triggers → commit →
+then dispatch the buffered effects.** The author writes the effect
+before the `return` in source order and it is still safe, because
+neither happens until the activation ends.
+
+Make it robust to the *external*-writer race too by **anchoring the
+kv-watch to the activation's read view** (reuse `beginReadView` /
+`READSET_VERSION`): the watch fires on any write to its prefix *since
+the version the handler read at*. Then —
+
+- the effect's write lands at a version strictly after the read view,
+  so it always fires the watch regardless of arm-instant timing;
+- a write by another request between "handler read" and "watch armed"
+  still fires it — no TOCTOU gap, because the baseline is the read
+  view, not wall-clock;
+- a key already in terminal state when the handler runs is caught by
+  read-on-(re)invoke: the handler reads at the top, sees done, and
+  terminates without arming a watch at all.
+
+The user-facing semantic this yields — a kv wait means *"wake me on
+any change since the state I just read"* — is exactly how an author
+already reasons ("I looked, it wasn't ready; tell me when it changes"),
+which is why the ordering rule stays invisible.
+
+### 8.5 The surface that falls out — grammar position = scope
+
+The split reaches customers as **where in the handler you write a
+thing**, never a durability flag (full surface spec:
+`handler-shape.md`):
+
+- **"What happens to THIS request"** → the **return value**
+  (`response` / `stream` / `next`, handler-shape §2). Connection-row:
+  ephemeral, dies with the socket, never touches raft.
+- **"Work that becomes A NEW request"** → an **effect you call**
+  (`webhook.send`, durable `schedule`, cron — §3 compositions).
+  Tenant-row: durable, runs as a fresh activation whether or not
+  anyone is connected, and its result handler is itself a plain
+  `(req) → response` export (handler-shape §5.4 / §5.6).
+
+The author's litmus test is the physics of §8.1, stated for humans:
+
+> **If the caller closed their laptop right now, should this still
+> happen?** No → return value (this request). Yes → effect call (a new
+> request).
+
+Because durable work is "just a new request," it borrows zero concepts
+from streaming: simple to start (a call) and simple to handle (a normal
+export). Streaming — the genuinely harder model (re-invocation, kv/timer
+waits, read-on-reinvoke, `close`) — is reached only via the explicit
+return verbs, strictly opt-in and orthogonal to durability. The two
+complexities are additive with no cliff: adding a durable effect never
+changes your return; adding streaming never changes your effects.
+Preserving that gradient is a hard constraint — the moment `schedule` /
+`webhook.send` take wait-shaped options or share types with `stream`,
+the floor inherits streaming vocabulary and the gradient flattens.
+Substrate shared, surfaces separate.
+
+## 9. Relation to existing docs
 
 This doc does not replace any of these — it is the frame they are facets
 of.
@@ -417,4 +595,12 @@ of.
   wake / disconnect Msg origins, as one instantiation.
 - **`connection-actor-plan.md`** — the duplex connection effect:
   connection-write Cmd runtime + frame Msg origin on one Continuation.
+  §6.4's held-sync resume is the connection-row half of §8.3.
+- **`handler-shape.md`** — the customer surface §8.5 implies: the
+  three return verbs (`response` / `stream` / `next`) are the
+  connection-row "this request"; the effect calls are the tenant-row
+  "a new request."
+- **`auto-bind-plan.md`** — the `bind` → auto-bind + `detach`
+  reshape §8.3 analyzes; the connection-resume registration as a
+  context-derived additive, not a durability knob.
 - **`docs/PLAN.md` §13** — the live process / surface map.
