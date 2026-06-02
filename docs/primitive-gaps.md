@@ -1,14 +1,15 @@
 # Primitive gaps — proposals for systematic removal
 
-**Status:** All five gaps DONE or design-locked (2026-05-20 → 2026-05-27).
-Streaming gaps (2.3 / 2.4 / 2.5) consolidated under
-`docs/streaming-model.md`. Tape-minimization arc: §6 considered-and-
+**Status:** Original five gaps DONE or design-locked (2026-05-20 →
+2026-05-27). **One new gap open: §2.6 durable scheduled wake (proposed
+2026-06-01, unbuilt).** Streaming gaps (2.3 / 2.4 / 2.5) consolidated
+under `docs/streaming-model.md`. Tape-minimization arc: §6 considered-and-
 removed; §7 design-only (unbuilt — gated on customer LLM-stream demand);
 §7.4 cancelled with effect-reification Phase 7; §8 + §9 shipped
-2026-05-26; §10 summarizes. The load-bearing value is §4
-(do-not-re-propose), §5 (cross-cutting constraint), §7 (the design for
-streamed-byte capture when LLM-replay matters), and §10 (the four-kind
-minimal tape).
+2026-05-26; §10 summarizes. The load-bearing value is §2.6 (the open
+proposal), §4 (do-not-re-propose), §5 (cross-cutting constraint), §7 (the
+design for streamed-byte capture when LLM-replay matters), and §10 (the
+four-kind minimal tape).
 
 ---
 
@@ -19,7 +20,7 @@ shape — the runtime IS the Elm runtime).
 
 | Slot | Variants today | Where defined |
 |---|---|---|
-| **Msg** (wake source) | `inbound_request`, `send_callback`, `timer`, `kv_wake`, `disconnect` | `streaming-handlers-plan.md` §2 + §4 |
+| **Msg** (wake source) | `inbound_request`, `send_callback`, `timer` (in-memory cron — non-durable clock), `kv_wake`, `disconnect` | `streaming-handlers-plan.md` §2 + §4 |
 | **Cmd** (return shape) | `Response`, `__rove_next`, `__rove_stream` | `streaming-handlers-plan.md` §3 |
 | **Effects** (accumulated in batch) | kv writeset (env-0), `webhook.send` (env-0 `_send/owed/{id}` marker via JS shim) | `src/js/bindings/webhook.send.js`, `effect-reification-plan.md` Phase 5 |
 | **Inline-synchronous side primitive** | kv triggers (BEFORE/AFTER prefix hooks) | `src/js/trigger_dispatch.zig` |
@@ -105,9 +106,115 @@ below is a case of that model rather than a standalone design.
 
 ---
 
+### 2.6 Durable scheduled wake — **PROPOSED 2026-06-01, unbuilt**
+
+**The gap.** `webhook.send` is supposed to be a §3 *composition* of
+primitives — a JS shim over `kv.set` + `http.fetch`
+([[project_durability_as_js_shim]]). It isn't, quite. It has a
+**privileged tail** a customer cannot reproduce: the retry/boot sweep
+(`worker.zig` `sweepOwedRetries` / `sweepOwedRetriesOnPromotion`) is
+hardcoded to scan the reserved `_send/owed/` prefix and fire the baked
+`__system/webhook_onresult` module. A customer can write the marker and
+the `http.fetch`, but they **cannot express "re-arm me at time T,
+surviving leader change"** — so they cannot build `webhook.send`, or any
+durable-timer feature, out of the primitives they have. That asymmetry is
+the smell: a feature (§3) leaning on machinery no other §3 composition can
+reach.
+
+**This is not a missing law — it is a hardcoded instance of L2.**
+`effect-algebra.md` §2.2 (L2) already says the owed Continuation is the
+*one* Continuation that **reconstructs** rather than abandons, precisely
+because it is bound to a durable Cmd that promised delivery; the boot-scan
+is that reconstruction. The defect is only that reconstruction is wired to
+*webhook's* prefix and handler instead of being a primitive. And
+`effect-algebra.md` §2.3 already blesses the fix: **Msg origins are the
+open family "where the algebra is allowed to grow."** `cron` and `boot`
+live there today. A durable wake is the missing sibling.
+
+**The primitive.** A **one-shot, absolute-time, at-least-once durable
+wake**: `Cmd.scheduleWake(at_ns, msg)` — a Cmd runtime whose target is the
+Model (it writes an ordinary env-0 key `{at_ns, handler, msg}`) — plus a
+`durable_wake` Msg origin that fires when `at_ns` falls due. The generic
+sweep scans durable-wake keys and emits the Msg; **it is webhook-agnostic.**
+`_send/owed/` collapses to *the webhook library's private kv namespace*
+with no special sweep or apply-time semantics; `webhook_onresult` stops
+being baked and becomes ordinary library JS.
+
+**One-shot absolute, not interval-cron.** The temptation is "durable
+cron." Resist it — an interval is strictly *less* expressive:
+
+- Webhook retry needs **irregular** fire times (exp backoff 1s, 2s, 4s…),
+  which an interval cannot express. This is exactly why the owed marker
+  stores `next_at_ns` (an absolute timestamp), not a period.
+- **Recurrence = a one-shot that re-arms itself** (the self-rescheduling
+  pattern). Interval-cron is then *sugar* over the absolute primitive,
+  not the primitive.
+- It **unifies the two timers that exist today** — the §2.1 cron sweep
+  (interval, non-durable clock, resets on failover) and the owed sweep
+  (absolute, durable) — into one durable-absolute-wake, with interval-cron
+  as a library on top.
+
+**What it collapses.** `webhook.send`, `email.send`, `retry.*`, durable
+cron, delayed/scheduled jobs, debounce, lease/TTL expiry, saga timeouts —
+all become libraries over one Msg origin. The boot-scan becomes the
+primitive's implementation, not per-feature magic. This is the durable-
+execution timer (Temporal timers, Cloudflare Durable Object alarms, Step
+Functions wait-states all reduce to it).
+
+**Consistent with L1 — not a second store.** The wake records are
+ordinary env-0 Model keys, so this does **not** reintroduce the
+`schedules.db` / envelope-8-11 second store deleted 2026-05-19
+(`effect-algebra.md` §2.1). Durability stays in the one Model; only the
+*Msg origin* is new, and §2.3 sanctions new Msg origins.
+
+**The residue you cannot banish.** Reconstruction cannot move into pure
+user JS: user JS only runs in response to a Msg, and *something* with two
+powers user code structurally lacks must produce the first one — (1) fire
+when no request is in flight, (2) re-scan durable state on leadership
+promotion. That something is privileged by necessity. The win is it is
+**one primitive's runtime serving all user code, not a special-case bolted
+onto webhooks.** And the line stays honest: **at-least-once *firing* ≠
+exactly-once *effect*.** The wake guarantees the handler runs (possibly
+twice — boot re-fire + normal fire); idempotency of the external effect
+stays the handler/library's job (the `kv.get(marker) == null → no-op`
+guard in `webhook_onresult` is exactly that, content-addressing is its
+`blob.put` analog). The primitive gives durable *scheduling*, not durable
+*dedup*.
+
+**The fork to decide before building.** The granularity choice shapes the
+implementation:
+
+- **One durable alarm per tenant** (Cloudflare DO model). Dodges the index
+  problem entirely — next-fire lives on the tenant slot, O(tenants) max —
+  but forces the customer to multiplex (keep their own queue, set the
+  alarm to the earliest due). Smallest, safest surface; the DO precedent
+  is strong evidence one alarm suffices to build everything.
+- **Many timers per tenant.** Richer, but the sweep now needs a
+  time-ordered due-index (`_wake/due/{ts}/{id}`) so it pops **O(due)**, not
+  the O(all-pending) prefix paging the owed sweep does today — and the
+  steady-state tick must stay off the O(N_tenants) path (today's owed
+  sweep iterates every loaded tenant each second; fine at tens of timers,
+  not at scale — [[feedback_no_n_tenants_hot_path]],
+  [[project_owed_recovery_strategy]]).
+
+**Lean (per the simplicity-over-flexibility prior,
+[[feedback_model_simplicity_safety]]): start with one-alarm-per-tenant.**
+It makes `webhook.send` a clean composition immediately, sidesteps the
+index hazard, and many-timers + ordered-index can land later behind the
+same `scheduleWake` surface if a customer earns it.
+
+**Preserves all of §5.** Commit-gated (the wake Cmd writes a Model key,
+released post-commit per L4); replayable (the `durable_wake` Msg is a
+taped input per L3; `at_ns` is a recorded scalar); affine + strike posture
+untouched (no held handle, resource/deadline bound). It is an additive Msg
+origin, not a relaxation.
+
+---
+
 ## 3. Sequencing
 
-All five gaps are either DONE or design-locked. Status snapshot:
+The original five are DONE or design-locked; §2.6 is a new open
+proposal. Status snapshot:
 
 | # | Gap | Status |
 |---|---|---|
@@ -116,6 +223,7 @@ All five gaps are either DONE or design-locked. Status snapshot:
 | 3 | 2.3 streaming outbound (`http.fetch`) | **DONE 2026-05-21** |
 | 4 | 2.4 streaming inbound body | design locked in `streaming-model.md` §3; implementation pending |
 | 5 | 2.5 held outbound subscription | **DONE 2026-05-24** |
+| 6 | 2.6 durable scheduled wake | **PROPOSED 2026-06-01** — unbuilt; one-vs-many-timer fork open |
 
 ---
 

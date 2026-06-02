@@ -91,6 +91,14 @@ This is the engine-side half of determinism. arenajs handles
 within-activation; L3 handles between. The tape is bounded per chain
 (`primitive-gaps.md` §6) — recorded, not recorded *forever*.
 
+The next origin proposed for this family is a **durable scheduled wake**
+(`primitive-gaps.md` §2.6, unbuilt): a one-shot, absolute-time,
+at-least-once `durable_wake` Msg whose fire-time is itself a Model key.
+It generalizes the one place L2 reconstruction is currently hardcoded —
+the webhook boot-scan of `_send/owed/` (§2.2) — into a primitive, so
+`webhook.send`, durable cron, and delayed jobs become §3 compositions
+over it rather than features leaning on a webhook-specific sweep.
+
 ### 2.4 Cmd runtimes — open family
 
 Everything that carries out a Cmd: kv-write, http-out (send + fetch),
