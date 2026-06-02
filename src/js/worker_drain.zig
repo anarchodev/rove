@@ -95,52 +95,80 @@ fn drainEntityArm(
     source: anytype,
     comptime site_label: []const u8,
 ) !void {
-    const entities = source.entitySlice();
-    const waits = source.column(RaftWait);
-    const resp_bodies = source.column(h2.RespBody);
-    var i: usize = 0;
-    while (i < entities.len) : (i += 1) {
-        const ent = entities[i];
-        const wait = waits[i];
-        const resp_body = resp_bodies[i];
+    // Effect-reification Phase 3.2.a: the per-unit classify→dispatch
+    // loop is now `effect.reconcile`; this ctx supplies the H2
+    // reference path's txn handling + on-commit / on-fault actions.
+    // Behavior is byte-identical to the pre-3.2.a hand-rolled loop:
+    // the commit arm only commits the shared txn (the entity move is
+    // the `parked_units` arm's `Cmd.respond` job — Phase 4.1.3
+    // Option-2), and the fault arm rolls back + 503-downgrades +
+    // moves to `response_in`. The nested struct captures `site_label`
+    // (comptime) so the panic sites stay comptime-`site`d for
+    // `panic_mod.invariantViolated`.
+    const Ctx = struct {
+        worker: @TypeOf(worker),
+        server: @TypeOf(server),
+        allocator: std.mem.Allocator,
+        source: @TypeOf(source),
+        entities: []const rove.Entity,
+        waits: []RaftWait,
+        resp_bodies: []h2.RespBody,
 
-        switch (effect_mod.classify(wait.seq, wait.deadline_ns, wm)) {
-            .pending => continue,
-            .commit => {
-                switch (worker.pending_txns.commitAndTake(allocator, wait.seq)) {
-                    .took, .absent => {},
-                    .conflict => continue,
-                    .failed => |err| panic_mod.invariantViolated(
-                        site_label ++ ".commit",
-                        "seq={d} err={s}",
-                        .{ wait.seq, @errorName(err) },
-                    ),
-                }
-                // Commit-arm entity move lives on the parked_units
-                // arm via `interpretCmd .respond` (Phase 4.1.3
-                // Option-2). Nothing more to do here.
-            },
-            .fault => {
-                switch (worker.pending_txns.rollbackAndTake(allocator, wait.seq)) {
-                    .took, .absent => {},
-                    .failed => |err| panic_mod.invariantViolated(
-                        site_label ++ ".rollback",
-                        "seq={d} err={s}",
-                        .{ wait.seq, @errorName(err) },
-                    ),
-                }
-                // Per-sibling on-entity cleanup (ContDescriptor /
-                // stream components / etc.) deinits structurally when
-                // cleanupResponses destroys the entity — no manual
-                // side-table teardown.
-                const old_body_ptr: ?[*]u8 = resp_body.data;
-                const old_body_len: u32 = resp_body.len;
-                try respb.overwrite503InPending(worker, source, ent, allocator);
-                if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
-                try server.reg.move(ent, source, &server.response_in);
-            },
+        pub fn seqAt(self: *@This(), i: usize) u64 {
+            return self.waits[i].seq;
         }
-    }
+        pub fn deadlineAt(self: *@This(), i: usize) i64 {
+            return self.waits[i].deadline_ns;
+        }
+        pub fn commitAt(self: *@This(), i: usize) !void {
+            // First entity at this seq takes the shared txn through
+            // commit; later siblings see `.absent`. `.conflict`
+            // (kvexp NotChainHead) retries next tick. The entity move
+            // is the `parked_units` arm's job — nothing else here.
+            switch (self.worker.pending_txns.commitAndTake(self.allocator, self.waits[i].seq)) {
+                .took, .absent, .conflict => {},
+                .failed => |err| panic_mod.invariantViolated(
+                    site_label ++ ".commit",
+                    "seq={d} err={s}",
+                    .{ self.waits[i].seq, @errorName(err) },
+                ),
+            }
+        }
+        pub fn faultAt(self: *@This(), i: usize) !void {
+            const ent = self.entities[i];
+            switch (self.worker.pending_txns.rollbackAndTake(self.allocator, self.waits[i].seq)) {
+                .took, .absent => {},
+                .failed => |err| panic_mod.invariantViolated(
+                    site_label ++ ".rollback",
+                    "seq={d} err={s}",
+                    .{ self.waits[i].seq, @errorName(err) },
+                ),
+            }
+            // Per-sibling on-entity cleanup (ContDescriptor / stream
+            // components / etc.) deinits structurally when
+            // cleanupResponses destroys the entity — no manual
+            // side-table teardown.
+            const old_body_ptr: ?[*]u8 = self.resp_bodies[i].data;
+            const old_body_len: u32 = self.resp_bodies[i].len;
+            try respb.overwrite503InPending(self.worker, self.source, ent, self.allocator);
+            if (old_body_ptr) |p| self.allocator.free(p[0..old_body_len]);
+            try self.server.reg.move(ent, self.source, &self.server.response_in);
+        }
+    };
+
+    var ctx = Ctx{
+        .worker = worker,
+        .server = server,
+        .allocator = allocator,
+        .source = source,
+        // Snapshotted before the loop: `reg.move` (fault arm) is
+        // deferred to `reg.flush`, so these slices stay valid for the
+        // whole pass even as entities move out.
+        .entities = source.entitySlice(),
+        .waits = source.column(RaftWait),
+        .resp_bodies = source.column(h2.RespBody),
+    };
+    try effect_mod.reconcile(&ctx, ctx.entities.len, wm);
 }
 
 /// Iterate `raft_pending`, check each entity's `RaftWait.seq` against
@@ -204,109 +232,104 @@ pub fn drainRaftPending(worker: anytype) !void {
         var buf: [256]rove.Entity = undefined;
         const n = @min(slice.len, buf.len);
         std.mem.copyForwards(rove.Entity, buf[0..n], slice[0..n]);
-        for (buf[0..n]) |ent| {
-            const unit = server.reg.get(ent, &worker.parked_units, ParkedUnit) catch continue;
-            switch (effect_mod.classify(unit.seq, unit.deadline_ns, wm)) {
-                .pending => continue,
-                .commit => {
-                    // Phase 4c: forgetful-writes units carry their own
-                    // `TrackedTxn` (no entity in raft_pending waiting on
-                    // this seq — see `proposeForgetfulWrites`). Commit
-                    // it here; the firePending* helpers run alongside,
-                    // same post-commit firing order as the entity-backed
-                    // path. Null `txn` after commit so ParkedUnit.deinit
-                    // doesn't try to rollback on destroy.
-                    if (unit.txn) |t| {
-                        t.commit() catch |cerr| switch (cerr) {
-                            // kvexp NotChainHead: predecessor hasn't
-                            // committed its head yet. Retry next tick
-                            // — same posture as the entity-backed
-                            // branch below (and as
-                            // `worker_streaming.proposeForgetfulWrites`
-                            // documents). Leave unit.txn attached and
-                            // the unit parked; classify on the next
-                            // tick still says `.commit` once the
-                            // predecessor lands. Pre-fix this aborted
-                            // every concurrent same-tenant heldsync
-                            // under multi-worker load (kv_shard_bench /
-                            // heldsync_multiworker_smoke).
-                            error.Conflict => continue,
-                            else => panic_mod.invariantViolated(
-                                "drainRaftPending.parked_units.commit",
-                                "seq={d} tenant={s} err={s}",
-                                .{ unit.seq, unit.tenant_id, @errorName(cerr) },
-                            ),
-                        };
-                        allocator.destroy(t);
-                        unit.txn = null;
-                    } else if (worker.pending_txns.contains(unit.seq)) {
-                        // Entity-backed unit (no own txn): a sibling
-                        // `drainEntityArm` arm is responsible for
-                        // committing the txn at this seq. If the txn
-                        // is still parked, that arm conflicted
-                        // (kvexp NotChainHead — predecessor not
-                        // committed yet) and skipped its move. Our
-                        // `Cmd.respond` would otherwise move the
-                        // entity before its writes are durable — and
-                        // the orphaned txn would block every later
-                        // forgetful commit in the chain. Defer to
-                        // the next tick; the unit stays in
-                        // `parked_units` for retry.
-                        //
-                        // Effect-reification Phase 4.1.3 Option-2:
-                        // this check restores commit + move atomicity
-                        // that the pre-4.1.3 inline-move arm got for
-                        // free. The `Cmd.respond` Phase 4.1.3 decoupled
-                        // re-introduces a window where commit-and-move
-                        // are split across the entity arm and the unit
-                        // arm; this gate closes that window.
-                        continue;
-                    }
-                    // Effect-reification Phase 4.1: the unified
-                    // commit-arm release. fireKvReactSubscriptions
-                    // walks the kv_wake_broadcast Cmds (read-only,
-                    // enqueues kv-react fires onto worker.msg_queue),
-                    // then releaseAll interprets every Cmd in order
-                    // (kv broadcasts via interpretCmd, stream
-                    // chunks transfer to StreamChunks, stream_close
-                    // flips the draining flag). Both pre-4.1
-                    // helpers — firePendingKvWakes +
-                    // transferStagedChunks — collapsed into this
-                    // pair of calls. Same operations, one switch
-                    // site (`effect.interpretCmd`) instead of three
-                    // hand-rolled per-kind functions.
-                    worker_streaming.fireKvReactSubscriptions(worker, unit) catch |err|
-                        std.log.warn(
-                            "rove-js kv-react ({s}): {s}",
-                            .{ unit.tenant_id, @errorName(err) },
-                        );
-                    unit.buffered.releaseAll(worker, unit.tenant_id);
-                    server.reg.destroy(ent) catch |err| std.log.warn(
-                        "rove-js parked_units commit destroy: {s}",
-                        .{@errorName(err)},
-                    );
-                },
-                .fault => {
-                    // Phase 4c: rollback the attached txn before
-                    // discarding. `ParkedUnit.deinit` is the structural
-                    // safety net (shutdown path); doing it here keeps
-                    // the fault/timeout discard ordering symmetric with
-                    // commit's destroy-then-clear pattern.
-                    if (unit.txn) |t| {
-                        t.rollback() catch |rerr| std.log.warn(
-                            "rove-js drainRaftPending.parked_units.rollback seq={d} tenant={s}: {s}",
-                            .{ unit.seq, unit.tenant_id, @errorName(rerr) },
-                        );
-                        allocator.destroy(t);
-                        unit.txn = null;
-                    }
-                    server.reg.destroy(ent) catch |err| std.log.warn(
-                        "rove-js parked_units fault destroy: {s}",
-                        .{@errorName(err)},
-                    );
-                },
+
+        // Effect-reification Phase 3.2.a: the entity-less parked_units
+        // sweep is the fourth `reconcile` caller, so `classify` now
+        // lives behind exactly one loop shape across all four arms.
+        // The ctx resolves each unit FRESH by id (`reg.get … catch` →
+        // skip, matching the pre-3.2.a `catch continue`); a gone unit
+        // returns a sentinel seq so `classify` yields `.pending` and
+        // neither arm fires. The `.conflict` (kvexp NotChainHead) and
+        // `pending_txns.contains` "defer to next tick" branches map to
+        // an early `return` from `commitAt` — the unit stays parked,
+        // not destroyed.
+        const Ctx = struct {
+            worker: @TypeOf(worker),
+            server: @TypeOf(server),
+            allocator: std.mem.Allocator,
+            ids: []const rove.Entity,
+
+            fn unitAt(self: *@This(), i: usize) ?*ParkedUnit {
+                return self.server.reg.get(self.ids[i], &self.worker.parked_units, ParkedUnit) catch null;
             }
-        }
+            pub fn seqAt(self: *@This(), i: usize) u64 {
+                const u = self.unitAt(i) orelse return std.math.maxInt(u64);
+                return u.seq;
+            }
+            pub fn deadlineAt(self: *@This(), i: usize) i64 {
+                const u = self.unitAt(i) orelse return std.math.maxInt(i64);
+                return u.deadline_ns;
+            }
+            pub fn commitAt(self: *@This(), i: usize) !void {
+                const unit = self.unitAt(i) orelse return;
+                // Phase 4c: forgetful-writes units carry their own
+                // `TrackedTxn` (no entity in raft_pending waiting on
+                // this seq). Commit it here; null `txn` after so
+                // `ParkedUnit.deinit` doesn't re-rollback on destroy.
+                if (unit.txn) |t| {
+                    t.commit() catch |cerr| switch (cerr) {
+                        // kvexp NotChainHead: predecessor's head not
+                        // committed yet. Leave the unit parked; next
+                        // tick still classifies `.commit` once it
+                        // lands. Pre-fix this aborted every concurrent
+                        // same-tenant heldsync under multi-worker load.
+                        error.Conflict => return,
+                        else => panic_mod.invariantViolated(
+                            "drainRaftPending.parked_units.commit",
+                            "seq={d} tenant={s} err={s}",
+                            .{ unit.seq, unit.tenant_id, @errorName(cerr) },
+                        ),
+                    };
+                    self.allocator.destroy(t);
+                    unit.txn = null;
+                } else if (self.worker.pending_txns.contains(unit.seq)) {
+                    // Entity-backed unit (no own txn): the sibling
+                    // `drainEntityArm` hasn't committed the shared txn
+                    // at this seq yet (it conflicted on NotChainHead).
+                    // Releasing our `Cmd.respond` now would move the
+                    // entity before its writes are durable — defer to
+                    // the next tick (Phase 4.1.3 Option-2 atomicity
+                    // gate). The unit stays in `parked_units`.
+                    return;
+                }
+                // Effect-reification Phase 4.1: the unified commit-arm
+                // release. fireKvReactSubscriptions enqueues kv-react
+                // fires onto worker.msg_queue; releaseAll interprets
+                // every Cmd in order (the firePendingKvWakes +
+                // transferStagedChunks collapse).
+                worker_streaming.fireKvReactSubscriptions(self.worker, unit) catch |err|
+                    std.log.warn(
+                        "rove-js kv-react ({s}): {s}",
+                        .{ unit.tenant_id, @errorName(err) },
+                    );
+                unit.buffered.releaseAll(self.worker, unit.tenant_id);
+                self.server.reg.destroy(self.ids[i]) catch |err| std.log.warn(
+                    "rove-js parked_units commit destroy: {s}",
+                    .{@errorName(err)},
+                );
+            }
+            pub fn faultAt(self: *@This(), i: usize) !void {
+                const unit = self.unitAt(i) orelse return;
+                // Phase 4c: rollback the attached txn before
+                // discarding, keeping fault/timeout discard ordering
+                // symmetric with commit's destroy-then-clear pattern.
+                if (unit.txn) |t| {
+                    t.rollback() catch |rerr| std.log.warn(
+                        "rove-js drainRaftPending.parked_units.rollback seq={d} tenant={s}: {s}",
+                        .{ unit.seq, unit.tenant_id, @errorName(rerr) },
+                    );
+                    self.allocator.destroy(t);
+                    unit.txn = null;
+                }
+                self.server.reg.destroy(self.ids[i]) catch |err| std.log.warn(
+                    "rove-js parked_units fault destroy: {s}",
+                    .{@errorName(err)},
+                );
+            }
+        };
+
+        var ctx = Ctx{ .worker = worker, .server = server, .allocator = allocator, .ids = buf[0..n] };
+        try effect_mod.reconcile(&ctx, n, wm);
     }
 
     // Gap 2.1 Phase E (refactored), effect-reification Phase 2C:
