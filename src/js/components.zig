@@ -1,25 +1,19 @@
 //! rove-js per-entity components.
 //!
-//! These types are the principle-compliant replacement for
-//! `worker.parked_meta` / `worker.parked_streams_meta` /
-//! `worker.pending_stream_meta` — the three entity-keyed side
-//! stores `~/.claude/memory/rove-library.md` principle #2 forbids.
-//! Per the refactor plan (`docs/handler-cmds-refactor-plan.md`),
-//! they live as components on the entity's Row; rove's auto-deinit
-//! on entity-move / entity-destroy handles cleanup structurally
-//! instead of via the four manual cleanup sites
-//! (`cleanupResponses`, `drainRaftPending` fault branch,
-//! `drainOnLeadershipLoss`, `Worker.destroy`) the side-tables
-//! require today.
+//! These types are the principle-compliant replacement for the three
+//! entity-keyed side stores (`worker.parked_meta` /
+//! `worker.parked_streams_meta` / `worker.pending_stream_meta`) that
+//! `~/.claude/memory/rove-library.md` principle #2 forbids. Per the
+//! refactor plan (`docs/streaming-handlers-plan.md`), they live as
+//! components on the entity's Row; rove's auto-deinit on
+//! entity-move / entity-destroy handles cleanup structurally instead
+//! of via manual cleanup sites.
 //!
-//! Phase 1 of the refactor (the additive dual-write) drops these
-//! onto the worker's merged `request_row` so every h2 stream
-//! collection + worker `parked_continuations` + `raft_pending`
-//! carries them. Non-cont / non-stream entities have all-null /
-//! all-default values; nobody reads them on those entities.
-//! Phases 2–4 flip readers from the side stores to the components;
-//! Phases 5–7 split `raft_pending` into siblings + delete the side
-//! stores; Phase 8 collapses the resume engines.
+//! The migration shipped (Phase 7 fold, 2026-05-24): the side stores
+//! are deleted, `raft_pending` is split into siblings
+//! (`raft_pending_response` / `_cont` / `_stream`), and these
+//! components are the sole structural home for per-entity
+//! cont/stream state.
 
 const std = @import("std");
 const continuation_mod = @import("bindings/continuation.zig");

@@ -1,13 +1,15 @@
 //! JS globals installed on every request context.
 //!
-//! Four globals for M1:
+//! Two families of surface are installed:
 //!
-//!   `kv.get(key)`              → string | null
-//!   `kv.set(key, value)`       → undefined
-//!   `kv.delete(key)`           → undefined
-//!   `console.log(...args)`     → undefined (appended to stderr-buffer)
-//!   `request`                  → `{ method, path, body }` (read-only by convention)
-//!   `response`                 → `{ status: 200, body: "", headers: {} }`
+//!   - **Static namespaces** (`installStatic`, once into the base
+//!     snapshot, shared across all requests on the thread): `kv`,
+//!     `console`, `crypto`, `webhook`, `platform`, and the JS-shim
+//!     helpers evaluated from `globals/*.js`.
+//!   - **Per-request objects** (`installRequest`, one cursor write per
+//!     request): a read-only `request` (`method`, `path`, `host`,
+//!     `body`, `query`, `headers`, `cookies`, `session`, `activation`,
+//!     ...) and a writable `response` (`status`, `body`, `headers`).
 //!
 //! State shared between the C functions and the dispatcher lives in a
 //! `DispatchState` struct stashed on the context via
