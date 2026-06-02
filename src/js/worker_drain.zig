@@ -9,7 +9,8 @@
 //!     (`raft_pending_response` / `_cont` / `_stream`) share
 //!     `drainEntityArm`; the entity-less `parked_units` sweep is the
 //!     fourth arm and the commit-gated buffer release point (see
-//!     `worker_streaming.firePendingKvWakes` + `transferStagedChunks`).
+//!     `worker_streaming.fireKvReactSubscriptions` +
+//!     `unit.buffered.releaseAll`).
 //!   - **`resumeContinuation` / `resumeBoundContinuation` /
 //!     `sweepParkedContinuations` / `drainPendingBoundResumes`** —
 //!     the held-sync trampoline. Continuation activations re-enter
@@ -644,7 +645,7 @@ fn proposeAndParkContResume(
                 // drop the NodeState owner mirror for the OLD
                 // send_id; the new one was registered above when
                 // the repark scanned the writeset.
-                worker.node.unregisterBoundSendOwner(old_b);
+                worker.node.router.unregisterBoundSendOwner(old_b);
                 worker.unregisterBoundSendEntity(old_b);
                 allocator.free(old_b);
             }
@@ -679,7 +680,7 @@ fn proposeAndParkContResume(
             if (desc.bound_schedule_id) |old_b| {
                 // Phase 1 NodeState cleanup — chain is no longer
                 // a cont, drop the send owner.
-                worker.node.unregisterBoundSendOwner(old_b);
+                worker.node.router.unregisterBoundSendOwner(old_b);
                 worker.unregisterBoundSendEntity(old_b);
                 allocator.free(old_b);
             }
@@ -1003,7 +1004,7 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     if (stale_desc) |d| {
         if (d.cont) |*old_c| old_c.deinit(allocator);
         if (d.bound_schedule_id) |b| {
-            worker.node.unregisterBoundSendOwner(b);
+            worker.node.router.unregisterBoundSendOwner(b);
             worker.unregisterBoundSendEntity(b);
             allocator.free(b);
         }
@@ -1283,7 +1284,7 @@ fn resumeContinuation(
                 // stamp the owner. Same Phase 2 dependency as the
                 // open-hop site in worker_dispatch.zig.
                 if (new_bound_sched_id) |send_id| {
-                    _ = worker.node.registerBoundSendOwner(send_id, worker.msg_inbox_idx);
+                    _ = worker.node.router.registerBoundSendOwner(send_id, worker.msg_inbox_idx);
                     // Phase 3 mirror.
                     worker.registerBoundSendEntity(send_id, ent);
                 }
@@ -1634,7 +1635,7 @@ pub fn resumeBoundFetchChain(
             // bound send (same as the worker_dispatch open-hop and
             // resumeContinuation repark sites).
             if (new_bound_sched_id) |send_id| {
-                _ = worker.node.registerBoundSendOwner(send_id, worker.msg_inbox_idx);
+                _ = worker.node.router.registerBoundSendOwner(send_id, worker.msg_inbox_idx);
                 // Phase 3 mirror.
                 worker.registerBoundSendEntity(send_id, ent);
             }
@@ -1685,7 +1686,7 @@ pub fn resumeBoundFetchChain(
             if (mutable_desc.cont) |*old_c| old_c.deinit(allocator);
             mutable_desc.cont = c2m;
             if (mutable_desc.bound_schedule_id) |old_b| {
-                worker.node.unregisterBoundSendOwner(old_b);
+                worker.node.router.unregisterBoundSendOwner(old_b);
                 worker.unregisterBoundSendEntity(old_b);
                 allocator.free(old_b);
             }
@@ -1925,7 +1926,7 @@ fn pollDurableBodyRef(
 
 pub fn drainBodyPending(worker: anytype) !void {
     const server = worker.h2;
-    const coord = worker.node.blob_coordinator orelse return;
+    const coord = worker.node.blob_coord.coordinator orelse return;
 
     const ents = worker.body_pending.entitySlice();
     const waits = worker.body_pending.column(BodyDurabilityWait);
@@ -1981,7 +1982,7 @@ pub fn drainBodyPending(worker: anytype) !void {
 /// `fireFetchEventActivation` takes ownership of the released
 /// event (deinit fires via its top-level `defer` on completion).
 pub fn drainFetchPendingDurability(worker: anytype) !void {
-    const coord = worker.node.blob_coordinator orelse return;
+    const coord = worker.node.blob_coord.coordinator orelse return;
     var i: usize = 0;
     while (i < worker.fetch_pending_durability.items.len) {
         const pe = &worker.fetch_pending_durability.items[i];
