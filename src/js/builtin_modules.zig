@@ -58,6 +58,11 @@ const MODULES = [_]struct {
         .path = "__system/webhook_onresult.mjs",
         .src = @embedFile("builtin_webhook_onresult_mjs"),
     },
+    .{
+        // §2.6 durable scheduled wake (docs/durable-wake-plan.md P1).
+        .path = "__system/scheduler_tick.mjs",
+        .src = @embedFile("builtin_scheduler_tick_mjs"),
+    },
 };
 
 /// Compile every built-in module to QJS bytecode and return an

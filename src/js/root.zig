@@ -94,6 +94,8 @@ pub const sweepBootSubscriptions = worker.sweepBootSubscriptions;
 pub const sweepCronSubscriptions = worker.sweepCronSubscriptions;
 pub const sweepOwedRetries = worker.sweepOwedRetries;
 pub const sweepOwedRetriesOnPromotion = worker.sweepOwedRetriesOnPromotion;
+pub const sweepDurableWakes = worker.sweepDurableWakes;
+pub const sweepDurableWakesOnPromotion = worker.sweepDurableWakesOnPromotion;
 pub const serviceFetchEvents = worker.serviceFetchEvents;
 pub const drainSpools = worker.drainSpools;
 

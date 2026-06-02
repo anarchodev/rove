@@ -126,6 +126,11 @@ pub const CRON_SWEEP_INTERVAL_NS = subscription_sweep.CRON_SWEEP_INTERVAL_NS;
 pub const sweepBootSubscriptions = subscription_sweep.sweepBootSubscriptions;
 const starter = @import("starter.zig");
 pub const sweepCronSubscriptions = subscription_sweep.sweepCronSubscriptions;
+const durable_wake = @import("durable_wake.zig");
+// §2.6 durable scheduled-wake sweep lives in durable_wake.zig.
+pub const WAKE_SWEEP_INTERVAL_NS = durable_wake.WAKE_SWEEP_INTERVAL_NS;
+pub const sweepDurableWakes = durable_wake.sweepDurableWakes;
+pub const sweepDurableWakesOnPromotion = durable_wake.sweepDurableWakesOnPromotion;
 
 /// Phase 5 PR-3: deferred §6.4 held-sync resume entry. The baked
 /// `__system/webhook_onresult` shim calls
@@ -1219,6 +1224,13 @@ pub fn Worker(comptime opts: Options) type {
         /// 0) because the sweep is partitioned —
         /// `hash(tenant_id) % N_msg_inboxes == self.msg_inbox_idx`.
         last_send_sweep_ns: i64 = 0,
+        /// §2.6 durable-wake: monotonic-ns of the last
+        /// `sweepDurableWakes` invocation on THIS worker. Throttles the
+        /// per-tick durable-wake sweep to one pass per
+        /// `WAKE_SWEEP_INTERVAL_NS`. Per-worker (not just worker 0)
+        /// because the sweep is partitioned the same way the owed
+        /// sweep is — `hash(tenant_id) % N_msg_inboxes == self.msg_inbox_idx`.
+        last_wake_sweep_ns: i64 = 0,
         /// Phase 5 PR-3: deferred held-sync resumes. The baked
         /// `__system/webhook_onresult` shim calls
         /// `_system.continuation.resumeIfBound` on terminal; that
@@ -2133,6 +2145,27 @@ pub fn Worker(comptime opts: Options) type {
             if (self.node.fetch_engine) |engine| engine.cancel(id);
             worker_streaming.dropSpool(self, id);
             self.unregisterBoundFetch(id);
+        }
+
+        /// §2.6 durable-wake: trampoline wired into
+        /// `DispatchState.fire_wake`. The baked
+        /// `__system/scheduler_tick`'s `__rove_fire_wake(...)` lands
+        /// here once per due `_sched/by_time` entry; we hash-route a
+        /// `durable_wake` activation to the entry's owning worker via
+        /// the router. Returns false when no worker is registered (the
+        /// builtin surfaces that as a thrown error so a fire is never
+        /// silently dropped). All borrowed slices in `input` are dup'd
+        /// by `enqueueDurableWakeForTenant`.
+        pub fn fireWakeTrampoline(ctx: *anyopaque, input: globals.FireWakeInput) bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.node.router.enqueueDurableWakeForTenant(input) catch |err| {
+                std.log.warn(
+                    "rove-js durable-wake: enqueueDurableWakeForTenant ({s} → {s}): {s}",
+                    .{ input.tenant_id, input.target, @errorName(err) },
+                );
+                return false;
+            };
+            return true;
         }
 
         /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`

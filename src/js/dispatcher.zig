@@ -210,6 +210,15 @@ pub const Request = struct {
     /// paths; the JS `http.cancelFetch` becomes a no-op then.
     cancel_fetch: ?*const fn (ctx: *anyopaque, id: []const u8) void = null,
     cancel_fetch_ctx: ?*anyopaque = null,
+    /// §2.6 durable-wake trampolines (`docs/durable-wake-plan.md` P0),
+    /// wired by the worker only on the baked `__system/scheduler_tick`
+    /// fire path. `set_wake` stores this tenant's next-fire watermark;
+    /// `fire_wake` enqueues a `durable_wake` activation per due entry.
+    /// Null elsewhere — the capability-scoped builtins no-op / throw.
+    set_wake: ?*const fn (ctx: *anyopaque, tenant_id: []const u8, when_ns: i64) void = null,
+    set_wake_ctx: ?*anyopaque = null,
+    fire_wake: ?*const fn (ctx: *anyopaque, input: globals.FireWakeInput) bool = null,
+    fire_wake_ctx: ?*anyopaque = null,
     /// `docs/streaming-model.md` §7 item 1: the entity owning the
     /// chain that this activation runs against. The http.fetch
     /// binding reads this when `bind: true` to register the held
@@ -310,6 +319,18 @@ pub const Request = struct {
     /// runtime aborted the rest. Surfaces as
     /// `request.activation.body_truncated`.
     activation_fetch_body_truncated: bool = false,
+    /// §2.6 durable-wake activation payload. Set only when
+    /// `activation_source == .durable_wake`; surfaces as
+    /// `request.activation.{id, key, scheduled_at_ns, msg}` where
+    /// `msg` is the parsed `activation_wake_msg_json`. Borrowed slices
+    /// — caller (`fireDurableWakeActivation`) owns the bytes for the
+    /// duration of the dispatch.
+    activation_wake_id: ?[]const u8 = null,
+    activation_wake_key: ?[]const u8 = null,
+    activation_wake_scheduled_at_ns: i64 = 0,
+    /// JSON-encoded customer `msg` ("null" when omitted); decoded
+    /// back to a JS value as `request.activation.msg`.
+    activation_wake_msg_json: ?[]const u8 = null,
 };
 
 /// One `(name, value)` pair extracted from the handler's
@@ -504,6 +525,10 @@ pub const Dispatcher = struct {
             .resume_if_bound_ctx = request.resume_if_bound_ctx,
             .cancel_fetch = request.cancel_fetch,
             .cancel_fetch_ctx = request.cancel_fetch_ctx,
+            .set_wake = request.set_wake,
+            .set_wake_ctx = request.set_wake_ctx,
+            .fire_wake = request.fire_wake,
+            .fire_wake_ctx = request.fire_wake_ctx,
             .activation_entity = request.activation_entity,
             .activation_fetches_pending = request.activation_fetches_pending,
             .pending_fetches = request.pending_fetches,

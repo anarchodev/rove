@@ -112,6 +112,16 @@ pub const ActivationSource = enum(u8) {
     /// `fetch_pipe_done` (9) variants into this single tag along with
     /// dropping `pipe_to` / `on_done`.
     fetch_chunk = 7,
+    /// Durable scheduled wake (`docs/primitive-gaps.md` §2.6 +
+    /// `docs/durable-wake-plan.md`). A `scheduler.at(whenNs, target,
+    /// msg)` entry fell due: the baked `__system/scheduler_tick`
+    /// fanned out to `target` via `__rove_fire_wake`, and the target
+    /// handler runs with `request.activation = { kind: "durable_wake",
+    /// id, key, scheduled_at_ns, msg }`. At-least-once *firing* — the
+    /// target owns dedup (the §2.6 firing contract). No held socket;
+    /// the fired entry's two `_sched/` keys are deleted in this
+    /// activation's own writeset (exactly-once on the normal path).
+    durable_wake = 8,
 };
 
 /// Inline tape + body byte payloads for one request. Each `_bytes`

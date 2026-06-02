@@ -200,6 +200,7 @@ fn activationName(a: log_mod.ActivationSource) []const u8 {
         .wake_batch => "wake_batch",
         .subscription_fire => "subscription_fire",
         .fetch_chunk => "fetch_chunk",
+        .durable_wake => "durable_wake",
     };
 }
 

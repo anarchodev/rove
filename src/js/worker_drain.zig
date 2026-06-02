@@ -60,6 +60,7 @@ const respb = @import("response_builder.zig");
 
 const worker_mod = @import("worker.zig");
 const worker_streaming = @import("worker_streaming.zig");
+const durable_wake = @import("durable_wake.zig");
 const bodies_mod = @import("rove-bodies");
 const ParkedUnit = worker_mod.ParkedUnit;
 const RaftWait = worker_mod.RaftWait;
@@ -302,6 +303,13 @@ pub fn drainRaftPending(worker: anytype) !void {
                         "rove-js kv-react ({s}): {s}",
                         .{ unit.tenant_id, @errorName(err) },
                     );
+                // §2.6 P2: commit-gated durable-wake watermark bootstrap.
+                // Reads the same committed `kv_wake_broadcast` Cmds (still
+                // intact — releaseAll consumes them next) and lowers
+                // `next_wake_ns` for any `_sched/by_time/` put, so the
+                // steady sweep fires `scheduler_tick` at the new earliest
+                // time. Must precede releaseAll (which drains the Cmds).
+                durable_wake.noteCommittedSchedWrites(self.worker, unit);
                 unit.buffered.releaseAll(self.worker, unit.tenant_id);
                 self.server.reg.destroy(self.ids[i]) catch |err| std.log.warn(
                     "rove-js parked_units commit destroy: {s}",

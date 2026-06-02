@@ -13,6 +13,51 @@ email / retry re-platformed on top. Net effect: delete the per-feature Zig
 sweeps; durable cron becomes possible; one generic privileged JS lib
 replaces N feature-specific sweeps.
 
+## Status
+
+**P0–P4 SHIPPED (compiles, `zig build test` green; runtime smokes are
+P6, not yet run).** The primitive is usable end-to-end: a customer
+handler can `scheduler.at(...)` / `after` / `cancel` / `get`, and due
+wakes fire their `target` as a `durable_wake` activation. **P5
+(re-platform webhook/cron onto `scheduler`, delete the per-feature Zig
+sweeps) and P6/P7 (smokes + cleanup) are NOT done** — the owed +
+cron sweeps still run in parallel, untouched.
+
+Where the P0–P4 code lives:
+- `durable_wake` activation kind + `DurableWake` Msg: `src/log/root.zig`,
+  `src/js/effect/msg.zig`, `src/js/effect/queue.zig`,
+  `src/log_server/flush_writer.zig`, JS surface in `src/js/globals.zig`.
+- Engine watermark: `TenantSlot.next_wake_ns` (atomic) +
+  `lowerWake`/`setWakeTrampoline` in `src/js/deployment_cache.zig`.
+- Builtins `__rove_set_wake` / `__rove_fire_wake`:
+  `src/js/bindings/scheduler.zig` (+ `GLOBAL_BUILTINS` /
+  `builtin_exceptions` in `globals.zig`); trampolines on `Request`/
+  `DispatchState`; `fireWakeTrampoline` on the worker.
+- Sweep + promotion + P2 bootstrap: `src/js/durable_wake.zig`
+  (`sweepDurableWakes`, `sweepDurableWakesOnPromotion`,
+  `noteCommittedSchedWrites`), wired in `src/loop46/main.zig` and the
+  `worker_drain.zig` commit arm.
+- Fire paths: `fireSchedulerTick` + `fireDurableWakeActivation` +
+  the `.durable_wake` drain arm in `src/js/worker_streaming.zig`.
+- Baked `__system/scheduler_tick.mjs` + public `globals/scheduler.js`
+  (registered in `builtin_modules.zig` / `globals.zig` / `build.zig`).
+
+Two design points settled during the build (differ slightly from the
+sketch below):
+- **Fan-out via a second capability-scoped builtin** `__rove_fire_wake`
+  (not a `scheduler_tick` return value) — keeps the dispatch uniform
+  with `__rove_stream`'s emit posture. So the engine surface is two
+  builtins, not one.
+- **P2 bootstrap is a direct watermark-lower in the commit arm**, not a
+  kv-react→`scheduler_tick` fire. `noteCommittedSchedWrites` reads the
+  committed `kv_wake_broadcast` Cmds (same post-commit chokepoint
+  kv-react uses) and `lowerWake`s `next_wake_ns` from committed state.
+  Equivalent commit-gated guarantee, no implicit baked subscription.
+- **`scheduler_tick` watermark = `now` whenever it fired ≥1 entry** (the
+  owed-sweep "re-fire while work remains" model), so a target that
+  throws — rolling back its own cleanup-delete — is retried on the next
+  sweep instead of stranded until the next promotion.
+
 ## Phases
 
 Land-inert-first (mirrors `effect-reification-plan.md` Phase 5 PR-3 step 1:

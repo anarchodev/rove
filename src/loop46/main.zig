@@ -455,6 +455,14 @@ fn workerMain(args: *WorkerCtx) !void {
         if (!worker.was_leader and is_leader_now) {
             rjs.sweepOwedRetriesOnPromotion(worker);
         }
+        // §2.6 durable scheduled wake: on `false→true`, reconstruct
+        // each partitioned tenant's volatile `next_wake_ns` watermark
+        // by firing `scheduler_tick` for any tenant with `_sched/`
+        // entries (generalizes the owed promotion sweep). Same
+        // per-worker partitioning, so every worker covers its slice.
+        if (!worker.was_leader and is_leader_now) {
+            rjs.sweepDurableWakesOnPromotion(worker);
+        }
         worker.was_leader = is_leader_now;
 
         // Phase 4 park-on-durability: release any body-parked
@@ -504,6 +512,17 @@ fn workerMain(args: *WorkerCtx) !void {
         // scan per worker per `SEND_SWEEP_INTERVAL_NS`.
         if (is_leader_now) {
             rjs.sweepOwedRetries(worker);
+        }
+        // §2.6 durable scheduled wake: throttled per-worker partitioned
+        // sweep (every worker, leader-only). Fires `scheduler_tick` for
+        // each tenant in this worker's slice whose `next_wake_ns`
+        // watermark is due. Gated on the cheap atomic load — inert
+        // (skips every slot) until a `scheduler.at()` commits the first
+        // `_sched/` entry. `scheduler_tick`'s `__rove_fire_wake`
+        // enqueues `durable_wake` activations onto the inbox, drained
+        // by serviceSubscriptionFires below on this same tick.
+        if (is_leader_now) {
+            rjs.sweepDurableWakes(worker);
         }
 
         // Gap 2.1 Phase D: drain the cross-thread subscription-fire
