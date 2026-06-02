@@ -600,7 +600,7 @@ fn proposeAndParkContResume(
         .source = .raft_pending_cont,
         .dest = respond_dest,
     } }) catch {};
-    worker_mod.parkKvWakes(worker, seq, tenant_id, writeset, cont_cmds) catch |perr|
+    parkKvWakes(worker, seq, tenant_id, writeset, cont_cmds) catch |perr|
         std.log.warn("rove-js cont-resume parkKvWakes (tenant={s}) failed: {s}", .{ tenant_id, @errorName(perr) });
 
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() +
@@ -1553,7 +1553,7 @@ pub fn resumeBoundFetchChain(
             // dispatch wrapper's `if (final) unregisterBoundFetch`
             // would have done it anyway). Per-fetch counter (4)
             // will hook the same call path.
-            worker_mod.scanAndCancelBoundFetches(worker, ent);
+            scanAndCancelBoundFetches(worker, ent);
             if (r.exception.len > 0) {
                 txn.rollback() catch {};
                 txn_done = true;
@@ -2010,5 +2010,222 @@ pub fn drainFetchPendingDurability(worker: anytype) !void {
                 worker_mod.fireFetchEventActivation(worker, &released.event, wire_ref);
             },
         }
+    }
+}
+
+/// streaming-handlers-plan §4.6: register a batch's kv-writes as
+/// commit-gated wake intents. Extracts `(key, op)` from each put /
+/// delete in the writeset (key bytes dup'd so the caller can
+/// release the writeset bytes), parks them on a `ParkedUnit` keyed
+/// by the propose `seq`. `drainRaftPending` fires them at commit
+/// via `firePendingKvWakes`. No-op when the writeset has no ops.
+pub fn parkKvWakes(
+    worker: anytype,
+    seq: u64,
+    tenant_id: []const u8,
+    writeset: *const kv_mod.WriteSet,
+    extra_cmds: effect_mod.cmd.BufferedCmds,
+) !void {
+    // Effect-reification Phase 4.1.2: `extra_cmds` carries the
+    // batch's `http.fetch` Cmds (transferred from the worker
+    // dispatch's `batch_pending_fetches` accumulator). The Cmds
+    // ride alongside the kv_wake_broadcast Cmds on this unit;
+    // `interpretCmd` submits each PendingFetch to the engine on
+    // commit, closing the marker-commit race
+    // `webhook.send`'s sweep-only path papered over. `extra_cmds`
+    // is consumed unconditionally — caller MUST treat its copy as
+    // moved-from after the call (set to `.{}`).
+    if (writeset.ops.items.len == 0 and extra_cmds.items.items.len == 0) {
+        // Nothing to park. Ensure extra_cmds is freed (already
+        // empty if caller never populated it).
+        var ec = extra_cmds;
+        ec.deinit(worker.allocator);
+        return;
+    }
+    const allocator = worker.allocator;
+    // Take ownership of the extra_cmds as the unit's base; append
+    // kv_wake_broadcast Cmds for the writeset on top.
+    var cmds: effect_mod.cmd.BufferedCmds = extra_cmds;
+    errdefer cmds.deinit(allocator);
+    try cmds.items.ensureUnusedCapacity(allocator, writeset.ops.items.len);
+    for (writeset.ops.items) |op| switch (op) {
+        .put => |p| {
+            const k = try allocator.dupe(u8, p.key);
+            cmds.items.appendAssumeCapacity(.{
+                .kv_wake_broadcast = .{ .key = k, .op = 'p' },
+            });
+        },
+        .delete => |d| {
+            const k = try allocator.dupe(u8, d.key);
+            cmds.items.appendAssumeCapacity(.{
+                .kv_wake_broadcast = .{ .key = k, .op = 'd' },
+            });
+        },
+    };
+    // Transfer ownership of `cmds` into the unit; clear local
+    // immediately to invalidate the earlier errdefer.
+    var unit: ParkedUnit = .{
+        .seq = seq,
+        .deadline_ns = @intCast(std.time.nanoTimestamp() +
+            @as(i128, @intCast(worker.commit_wait_timeout_ns))),
+        .buffered = cmds,
+    };
+    cmds = .{};
+    errdefer ParkedUnit.deinit(allocator, (&unit)[0..1]);
+    unit.tenant_id = try allocator.dupe(u8, tenant_id);
+    const ent = try worker.h2.reg.create(&worker.parked_units);
+    errdefer worker.h2.reg.destroy(ent) catch {};
+    try worker.h2.reg.set(ent, &worker.parked_units, ParkedUnit, unit);
+    unit = .{};
+}
+
+/// Leadership-loss drain. Called from the dispatch loop on a
+/// leader→follower transition. Rolls back every pending TrackedTxn
+/// (kvexp recipe §2) and downgrades every `raft_pending` entry to
+/// 503. The follower can't honor those raft seqs — the new leader
+/// will re-propose anything that was actually durable.
+pub fn drainOnLeadershipLoss(worker: anytype) !void {
+    const server = worker.h2;
+    const allocator = worker.allocator;
+
+    // Rollback every pending TrackedTxn. Each lives at a unique seq;
+    // each is in its own per-tenant chain (kvexp dispatch lease
+    // guarantees one in-flight at a time). Rollback order doesn't
+    // matter — different tenants are independent chains and within a
+    // tenant we have exactly one entry. Phase 3.2.c: SharedTxnPool's
+    // drainAll wraps the rollback-loop + clear (best-effort on
+    // rollback errors, matching the leadership-loss-is-recoverable
+    // posture).
+    worker.pending_txns.drainAll(allocator);
+
+    // Discard parked units — their seqs won't commit on this now-
+    // follower; the buffered emits MUST NOT fire (the new leader
+    // re-fires anything that was actually durable). Destroy every
+    // entity in the parked_units collection; `reg.destroy` (deferred)
+    // fires `ParkedUnit.deinit` structurally on each — rollback any
+    // attached txn, free owned slices.
+    {
+        const slice = worker.parked_units.entitySlice();
+        // Copy to a stable buffer because destroy is deferred and
+        // entitySlice reflects the current pre-flush state.
+        var buf: [256]rove.Entity = undefined;
+        var idx: usize = 0;
+        while (idx < slice.len) {
+            const n = @min(slice.len - idx, buf.len);
+            std.mem.copyForwards(rove.Entity, buf[0..n], slice[idx .. idx + n]);
+            for (buf[0..n]) |ent| {
+                server.reg.destroy(ent) catch |err| std.log.warn(
+                    "drainOnLeadershipLoss: parked_units destroy: {s}",
+                    .{@errorName(err)},
+                );
+            }
+            idx += n;
+        }
+    }
+
+    // Phase 5: downgrade every entry across the three raft-pending
+    // siblings to 503 + move to response_in.
+    try drainLeadershipLossColl(worker, server, allocator, &worker.raft_pending_response);
+    try drainLeadershipLossColl(worker, server, allocator, &worker.raft_pending_cont);
+    try drainLeadershipLossColl(worker, server, allocator, &worker.raft_pending_stream);
+}
+
+/// Phase 5 helper: walk one raft-pending sibling, 503 every entry,
+/// move to response_in. No per-kind cleanup arg: all cont and stream
+/// state lives on the entity's components and deinits structurally
+/// when `cleanupResponses` destroys the entity (Phase 7 folded the
+/// old `parked_meta` / `pending_stream_meta` side-tables onto the
+/// entity, so there is no side store to free per kind).
+fn drainLeadershipLossColl(
+    worker: anytype,
+    server: anytype,
+    allocator: std.mem.Allocator,
+    coll: anytype,
+) !void {
+    const entities = coll.entitySlice();
+    const resp_bodies = coll.column(h2.RespBody);
+    var i: usize = entities.len;
+    while (i > 0) {
+        i -= 1;
+        const ent = entities[i];
+        const resp_body = resp_bodies[i];
+        const old_body_ptr: ?[*]u8 = resp_body.data;
+        const old_body_len: u32 = resp_body.len;
+        try respb.overwrite503InPending(worker, coll, ent, allocator);
+        if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
+        try server.reg.move(ent, coll, &server.response_in);
+    }
+}
+
+// (proposeWriteSet/proposeRootWriteSet re-exports removed
+// 2026-05-17 — unused; callers use raft_propose.* directly and
+// proposeRootWriteSet itself is gone post-Option-A.)
+
+/// Destroy entities sitting in `response_out` (h2 has finished
+/// flushing them to the wire). Same pattern as the echo example's
+/// `cleanupResponses`.
+///
+/// Phase 2b-ii: also reap streaming-chain state. An entity in
+/// `response_out` that still has a stream cell (in either the
+/// active or draining map, Phase 6) is a **client-disconnect** —
+/// h2's `serverStreamClose` routed it here without our normal
+/// drain-to-stream_close_in path firing (which would have freed
+/// the cell in `serviceParkedStreams`). Fire one last handler
+/// activation (§4.4 `activation: { kind: "disconnect" }`) so the
+/// customer's cleanup runs, then free the cell, then destroy the
+/// entity.
+pub fn cleanupResponses(worker: anytype) !void {
+    const server = worker.h2;
+    const entities = server.response_out.entitySlice();
+    const chains = server.response_out.column(components_mod.StreamChain);
+    for (entities, chains) |ent, chain| {
+        // Phase 7: an entity in response_out with a populated
+        // StreamChain.module_path is a client-disconnect on a held
+        // stream — fire the disconnect activation before destroy.
+        if (chain.module_path.len > 0) {
+            worker_streaming.fireDisconnectActivation(worker, ent);
+        }
+        // `docs/streaming-model.md` §7 item 1: cancel any bound
+        // fetches still associated with this entity. The held
+        // client is gone; upstream chunks would land on a destroyed
+        // entity. cancel_fetch is cooperative — the FetchEngine
+        // tears down the libcurl handle; the unregister drops the
+        // registry entry. Walk + collect first so we don't mutate
+        // the map mid-iteration.
+        scanAndCancelBoundFetches(worker, ent);
+        try server.reg.destroy(ent);
+    }
+}
+
+/// Walk the worker's `bound_fetch_entities` map, cancel + unregister
+/// every entry pointing at `ent`. Called from the disconnect cleanup
+/// path, from `resumeBoundFetchChain` / `resumeBoundFetchStream`'s
+/// `.terminal` arms (auto-cancel siblings when the chain itself
+/// terminates), and from any future "held entity destroyed" site.
+/// Idempotent — repeated calls with the same entity see an empty
+/// match set.
+pub fn scanAndCancelBoundFetches(worker: anytype, ent: rove.Entity) void {
+    var doomed: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer doomed.deinit(worker.allocator);
+    var it = worker.bound_fetch_entities.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.*.eql(ent)) {
+            doomed.append(worker.allocator, entry.key_ptr.*) catch break;
+        }
+    }
+    for (doomed.items) |fetch_id| {
+        if (worker.node.fetch_engine) |engine| engine.cancel(fetch_id);
+        // `docs/chunk-spool-plan.md` Phase 4: drop any spooled chunks
+        // for this fetch — the held client is gone (disconnect) or the
+        // chain is terminating, so they'll never be consumed. Done
+        // BEFORE `unregisterBoundFetch`: `fetch_id` aliases the
+        // bound_fetch_entities key that `unregisterBoundFetch` frees,
+        // while `dropSpool` frees the (separate) spool-map key — so
+        // `fetch_id` must still be valid here.
+        worker_streaming.dropSpool(worker, fetch_id);
+        // unregisterBoundFetch frees the key via fetchRemove. The
+        // slice in `doomed` borrows the same bytes — read fetch_id
+        // BEFORE the unregister call.
+        worker.unregisterBoundFetch(fetch_id);
     }
 }
