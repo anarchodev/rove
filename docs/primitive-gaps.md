@@ -314,6 +314,95 @@ taped input per L3; `at_ns` is a recorded scalar); affine + strike posture
 untouched (no held handle, resource/deadline bound). It is an additive Msg
 origin, not a relaxation.
 
+### 2.6.1 Interface and caps — concrete spec
+
+**The capability-scoped engine primitive.** One global builtin, callable
+only from baked scheduler code (gated on `is_system_module`, the same
+posture as the other `__rove_*` builtins that survive `_harden.js`'s
+`_system` deletion — [[project_durability_as_js_shim]] bug #1):
+
+```
+__rove_set_wake(when_ns: bigint)   // set THIS tenant's single next-fire;
+                                   // 0n ⇒ none. Idempotent overwrite.
+```
+
+The engine keeps one `next_wake_ns` per tenant on the tenant slot, in a
+per-worker-partitioned min-structure (`hash(tenant) % n_inboxes`, matching
+the owed sweep's routing) so the 1 Hz tick is **O(tenants-due)**, not
+O(tenants-with-any-timer). When `now ≥ next_wake_ns` it fires the baked
+`__system/scheduler_tick` module in that tenant's context. On leadership
+gain it fires `scheduler_tick` once per partitioned tenant to reconstruct
+(generalizes `sweepOwedRetriesOnPromotion`). `scheduler_tick` is the only
+caller of `__rove_set_wake`; customer handlers never reach it — that
+scoping is what closes the clobber footgun.
+
+**The public `scheduler` JS lib** (`globals/scheduler.js`, a documented
+shim per [[project_globals_system_split]]). cron / webhook / email / retry
+all compose on it:
+
+```js
+// Invoke `target` with `msg` at absolute `whenNs`. At-least-once FIRING;
+// target owns dedup + retry (the firing contract). Returns a stable id.
+scheduler.at(whenNs: bigint, target: string, msg?: any,
+             opts?: { key?: string }) => string
+
+// Convenience: `delayMs` from now (rounded up to the next tick).
+scheduler.after(delayMs: number, target: string, msg?: any,
+                opts?: { key?: string }) => string
+
+scheduler.cancel(id: string) => boolean             // true iff removed
+scheduler.get(id: string) => { id, whenNs, target, key } | null
+```
+
+- `target` — a module specifier, same shape as `__rove_next` / webhook
+  `on_result`.
+- `msg` — JSON-serializable; delivered as the activation Msg (below).
+- `opts.key` — idempotency. `id = base64url(sha256(key))` (43 chars,
+  mirrors webhook's `handle`); same key ⇒ same id ⇒ last-write-wins (moves
+  `when` / `target` / `msg`). No key ⇒ `crypto.randomUUID()`. **Re-arming =
+  `at()` again with the same key.**
+- **No recurrence here** — a one-shot that re-arms itself (the
+  absolute-one-shot decision); the `cron` lib is the recurring sugar over
+  `scheduler.after()`.
+
+**Storage** (ordinary tenant kv, owned by the lib — no reserved
+semantics):
+
+```
+_sched/by_id/{id}                     -> {when_ns, target, msg, key?}
+_sched/by_time/{when_ns_padded}/{id}  -> ""      // time-ordered index
+```
+
+`scheduler_tick` range-scans `by_time` from the front for due entries (up
+to the per-tick cap), dispatches each `target`, and **deletes the fired
+entry's two keys in the same writeset as the dispatched activation's
+effects** — so the normal path fires exactly once; at-least-once arises
+only from a crash between fire and commit (a boot re-fire), exactly the
+`_send/owed/` semantics. A target needing strict-once dedups on `id`
+(webhook's `kv.get(marker)==null` guard is this). After draining,
+`scheduler_tick` recomputes the min and calls `__rove_set_wake(new_min)`.
+
+**Dispatched activation:**
+
+```
+request.activation = { kind: "durable_wake", id, key, scheduled_at_ns, msg }
+```
+
+**Per-tenant caps** — concrete values for the firing-contract wake-dispatch
+budget (caps #1/#2 above); all fail-loud
+([[feedback_fail_loud_resource_exhaustion]]), operator-tunable:
+
+| Cap | Default | Rationale |
+|---|---|---|
+| `SCHED_MAX_OUTSTANDING` | 10,000 | depth ceiling; `at()` past it throws. Governs boot-recovery scan cost (~1–2 s / 10k, [[project_owed_recovery_strategy]]); raisable, cost scales linearly — paged/lazy recovery is the lever beyond that |
+| `SCHED_MAX_FIRES_PER_TICK` | 256 | thundering-herd bound when many wakes share a due-time; remainder carries to the next tick; ~matches per-chain commit-bound throughput (§6). Spread load with `key`-jitter, not a higher cap |
+| `SCHED_TICK_RESOLUTION` | 1 s | matches existing 1 Hz sweeps + cron's ≥1000 ms floor (`worker.zig` `interval_ms` min); `whenNs` rounds up to the next tick; sub-second unsupported |
+| `SCHED_MAX_MSG_BYTES` | 16 KiB | `msg` is durable + taped; mirrors the 16 KiB readset inline threshold (`FETCH_INLINE_THRESHOLD`). Bigger ⇒ store in your own kv, pass a `key` in `msg` |
+| per-tenant `http.fetch` cap | (existing) | retry attempts ride `http.fetch`; bounded there, not re-specified here |
+
+`SCHED_MAX_OUTSTANDING` + `SCHED_MAX_FIRES_PER_TICK` together are cap #1
+(depth + rate); the `http.fetch` bound is cap #2.
+
 ---
 
 ## 3. Sequencing
@@ -328,7 +417,7 @@ proposal. Status snapshot:
 | 3 | 2.3 streaming outbound (`http.fetch`) | **DONE 2026-05-21** |
 | 4 | 2.4 streaming inbound body | design locked in `streaming-model.md` §3; implementation pending |
 | 5 | 2.5 held outbound subscription | **DONE 2026-05-24** |
-| 6 | 2.6 durable scheduled wake | **PROPOSED 2026-06-01** — unbuilt; both forks resolved (firing contract; canonical JS `scheduler` lib over a capability-scoped minimal primitive) |
+| 6 | 2.6 durable scheduled wake | **PROPOSED 2026-06-01** — unbuilt; both forks resolved + interface/caps specced (§2.6.1); ready to build |
 
 ---
 
