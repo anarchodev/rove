@@ -23,6 +23,22 @@ const std = @import("std");
 
 /// Reserved key prefixes used by both checks below. Keep in sync with
 /// the platform writers that own each namespace:
+///   `_app/`             → reserved for the app manifest of a
+///                         distributable (marketplace) app: deploy-time
+///                         metadata + install-time config *schema*
+///                         (distinct from `_config/`, which holds config
+///                         *values*). An author-declared
+///                         `_app/manifest.json` in the customer tree
+///                         mirrors here on release (sibling of the
+///                         `_config/` mirror); the *derived* capability
+///                         set (the effect verbs a deployment uses, a
+///                         byproduct of §6 export-coverage validation)
+///                         lands beside it. Consumer (install flow /
+///                         grant gate) is post-launch — this only claims
+///                         the namespace now so apps deployed today are
+///                         born-distributable. See
+///                         `docs/handler-surface-impl-plan.md` §7 and
+///                         `project_self_host_marketplace`.
 ///   `_audit/`           → reserved for future audit log
 ///   `_config/`          → file-tree-mirrored library config (deploy
 ///                         pipeline writes; handlers read via
@@ -58,6 +74,7 @@ const std = @import("std");
 /// (sse-plan §7), so the prefix is no longer special — customer code
 /// is free to use it.
 pub const PLATFORM_KV_PREFIXES = [_][]const u8{
+    "_app/",
     "_audit/",
     "_config/",
     "_deploy/",
@@ -103,6 +120,7 @@ test "isReservedTriggerPrefix: customer prefixes are allowed" {
 }
 
 test "isReservedTriggerPrefix: exact platform prefix blocked" {
+    try std.testing.expect(isReservedTriggerPrefix("_app/"));
     try std.testing.expect(isReservedTriggerPrefix("_audit/"));
     try std.testing.expect(isReservedTriggerPrefix("_callback/"));
     try std.testing.expect(isReservedTriggerPrefix("_config/"));
@@ -138,6 +156,7 @@ test "isReservedTriggerPrefix: deeper-than-platform blocked (would catch system 
 }
 
 test "isCustomerWriteReserved: platform prefixes blocked" {
+    try std.testing.expect(isCustomerWriteReserved("_app/manifest"));
     try std.testing.expect(isCustomerWriteReserved("_callback/xyz"));
     try std.testing.expect(isCustomerWriteReserved("_audit/anything"));
     try std.testing.expect(isCustomerWriteReserved("_config/oauth/google"));
