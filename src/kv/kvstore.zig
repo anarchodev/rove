@@ -912,6 +912,18 @@ pub const KvStore = struct {
             return top.saw_speculation;
         }
 
+        /// The durable write-clock watermark this txn's reads are
+        /// baselined to (kvexp `Txn.readVersion`; effect-algebra §8.4
+        /// watch anchor). A kv-watch armed at this baseline fires for any
+        /// write to its prefix at a version strictly greater — i.e. one
+        /// that landed after the state the handler read. Capture it after
+        /// the handler's reads for the tightest (least-spurious) baseline.
+        /// 0 if the txn never opened (no reads → no speculative basis).
+        pub fn readVersion(self: *TrackedTxn) u64 {
+            const top = self.top orelse return 0;
+            return top.readVersion();
+        }
+
         /// Hand the txn to the chain to await raft (active → parked) and
         /// record its `{tenant, seq}` handle on `parked_handle`. After
         /// this, commit/rollback route by handle. Folds any still-open

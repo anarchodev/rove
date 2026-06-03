@@ -129,6 +129,16 @@ const SuccessRec = struct {
     /// `ChainContext` component by the cont helpers so the resume
     /// inherits the same chain id.
     correlation_id: ?[]const u8 = null,
+    /// Handler-surface Phase 1: `on.timer`/`on.kv` registrations drained
+    /// from this activation's `pending_wakes` accumulator when it
+    /// returned `next(...)`. Owned slice; `parkSuccessesOnSiblings` arms
+    /// the entity's `StreamWakes` from it and frees it. Empty when the
+    /// handler registered no wakes (a plain park / deadline-only resume).
+    cont_wakes: []globals.PendingWakeReg = &.{},
+    /// §8.4 watch baseline — `txn.readVersion()` captured after the
+    /// handler's reads. Stamped onto `StreamWakes.read_version` so kv
+    /// wakes fire only for writes after the state the handler observed.
+    cont_read_version: u64 = 0,
     /// Set when the handler returned `__rove_stream(...)` (streaming-
     /// handlers-plan §3.3). Carries the chain-level state forward to
     /// `finalizeBatch`, which redirects the entity into h2's stream
@@ -290,6 +300,7 @@ fn contParkIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocator,
         });
     }
 
+    try armContWakesIfAny(server, allocator, s);
     try server.reg.move(s.ent, &server.request_out, &worker.parked_continuations);
     return true;
 }
@@ -329,12 +340,72 @@ fn contRecordIfAny(worker: anytype, server: anytype, allocator: std.mem.Allocato
             .deployment_id = s.deployment_id,
         });
     }
+
+    try armContWakesIfAny(server, allocator, s);
+}
+
+/// Handler-surface Phase 1: arm the held continuation's `StreamWakes`
+/// from its drained `on.timer`/`on.kv` registrations + the §8.4 read-view
+/// baseline, set on the entity in `request_out` so the component rides
+/// the park into `parked_continuations`. The kv prefixes + `{to}` are
+/// duped into the component; `s.cont_wakes` is consumed (freed + nulled).
+/// No-op when the handler registered no wakes (a plain park). Errors
+/// propagate to the caller's errdefer (the entity is still in
+/// `request_out` and the success unwinds to a fault).
+fn armContWakesIfAny(server: anytype, allocator: std.mem.Allocator, s: *SuccessRec) !void {
+    defer freeContWakes(allocator, s);
+    if (s.cont_wakes.len == 0) return;
+    var interval_ms: i64 = 0;
+    var wake_to: ?[]u8 = null;
+    var prefixes: std.ArrayListUnmanaged([]u8) = .empty;
+    errdefer {
+        for (prefixes.items) |p| allocator.free(p);
+        prefixes.deinit(allocator);
+        if (wake_to) |t| allocator.free(t);
+    }
+    for (s.cont_wakes) |reg| {
+        switch (reg.kind) {
+            .timer => interval_ms = reg.interval_ms,
+            .kv => try prefixes.append(allocator, try allocator.dupe(u8, reg.prefix)),
+        }
+        // Last `{to}` wins — `on.*` wakes resume one "edge wake" export
+        // per held connection; a default `onWake` applies when null.
+        if (reg.to) |t| {
+            if (wake_to) |old| allocator.free(old);
+            wake_to = try allocator.dupe(u8, t);
+        }
+    }
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    const next_wake_ns: i64 = if (interval_ms > 0)
+        now_ns + interval_ms * std.time.ns_per_ms
+    else
+        std.math.maxInt(i64);
+    const kv_prefixes = try prefixes.toOwnedSlice(allocator);
+    errdefer {
+        for (kv_prefixes) |p| allocator.free(p);
+        if (kv_prefixes.len > 0) allocator.free(kv_prefixes);
+    }
+    try server.reg.set(s.ent, &server.request_out, components_mod.StreamWakes, .{
+        .interval_ms = interval_ms,
+        .next_wake_ns = next_wake_ns,
+        .kv_prefixes = kv_prefixes,
+        .read_version = s.cont_read_version,
+        .wake_to = wake_to,
+    });
+}
+
+/// Free + null a SuccessRec's drained `on.*` registrations. Idempotent.
+fn freeContWakes(allocator: std.mem.Allocator, s: *SuccessRec) void {
+    for (s.cont_wakes) |*reg| reg.deinit(allocator);
+    if (s.cont_wakes.len > 0) allocator.free(s.cont_wakes);
+    s.cont_wakes = &.{};
 }
 
 /// 503 path: the open hop didn't durably commit → can't hold.
 /// Discard the descriptor; the entity gets the same 503 a terminal
 /// success would (client retries — best-effort / moot-on-loss).
 fn contDiscardIfAny(allocator: std.mem.Allocator, s: *SuccessRec) void {
+    freeContWakes(allocator, s);
     if (s.cont) |*cptr| {
         cptr.deinit(allocator);
         s.cont = null;
@@ -3180,6 +3251,19 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         resp.console = &.{};
         resp.exception = &.{};
 
+        // Handler-surface Phase 1: a held `next(...)` carries its
+        // on.timer/on.kv registrations to the park site, which arms the
+        // entity's StreamWakes. Transfer ownership out of the per-request
+        // accumulator (its defer then no-ops). A terminal handler holds
+        // no connection, so its (model-inert) registrations are just
+        // freed by the accumulator's defer. Capture readVersion AFTER the
+        // handler's reads for the tightest §8.4 baseline.
+        const cont_wakes_owned: []globals.PendingWakeReg = if (cont_opt != null)
+            (pending_wakes.toOwnedSlice(allocator) catch &.{})
+        else
+            &.{};
+        const cont_rv: u64 = if (cont_opt != null) (if (txn) |t| t.readVersion() else 0) else 0;
+
         try successes.append(allocator, .{
             .ent = ent,
             .sid = sid,
@@ -3203,6 +3287,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 0,
             .cont_bound_sched_id = cont_bound_sched_id,
             .correlation_id = correlation_id,
+            .cont_wakes = cont_wakes_owned,
+            .cont_read_version = cont_rv,
             .stream = stream_meta_opt,
         });
         // Ownership transferred onto the SuccessRec; the outer
