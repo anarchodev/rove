@@ -687,6 +687,8 @@ fn finalizeBatch(
             // barrier path gets `source`/`dest` matching where it
             // parks — not the stale `raft_pending_response` →
             // `response_in` the pre-null read used to emit.
+            txn.park(seq) catch |perr|
+                std.log.warn("rove-js finalizeBatch (barrier): park seq={d} tenant={s}: {s} (pointer fallback)", .{ seq, anchor_id, @errorName(perr) });
             try worker.pending_txns.park(allocator, seq, txn);
 
             // Effect-reification Phase 4.1.2: the barrier path's
@@ -849,9 +851,16 @@ fn finalizeBatch(
         return processed;
     };
 
-    // Propose succeeded: park the txn on the worker's pending map
-    // keyed by raft seq. drainRaftPending commits it once raft
-    // confirms (forward iteration, so chain head commits first).
+    // Propose succeeded: hand the txn to the chain by handle, then park
+    // it on the worker's pending map keyed by raft seq. `park` flips it
+    // active → parked so drainRaftPending's commit/rollback resolve
+    // by-handle under the tenant lock (cross-worker safe — no raw `top`
+    // deref a sibling's cascade could have freed). On the rare
+    // invalidation race (a predecessor faulted in this window) we log
+    // and pool anyway; the pointer-fallback active path handles the
+    // detached txn, and the entry faults in raft regardless.
+    txn.park(seq) catch |perr|
+        std.log.warn("rove-js finalizeBatch: park seq={d} tenant={s}: {s} (pointer fallback)", .{ seq, anchor_id, @errorName(perr) });
     try worker.pending_txns.park(allocator, seq, txn);
 
     // Observe writeset-size for `/_system/metrics`. Pair with

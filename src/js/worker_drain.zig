@@ -596,6 +596,10 @@ fn proposeAndParkContResume(
     // Propose accepted. From here we own the parked-side
     // bookkeeping; if it fails the chain is in a half-state we can't
     // gracefully roll back (the raft entry is committed-pending).
+    // Hand the txn to the chain by handle (cross-worker-safe commit/
+    // rollback at drain); pointer fallback on the rare invalidation race.
+    txn.park(seq) catch |perr|
+        std.log.warn("rove-js cont-resume: park seq={d} tenant={s}: {s} (pointer fallback)", .{ seq, tenant_id, @errorName(perr) });
     try worker.pending_txns.park(allocator, seq, txn);
     // parkKvWakes rides this seq so the kv-react wakes fire AFTER
     // commit. Best-effort: log and continue if parking fails —
