@@ -1794,13 +1794,11 @@ const GLOBAL_BUILTINS = [_]FnBinding{
     // not an effect. Internal-only today; the public `next` JS shim
     // over this lands in Phase 3b-iii.
     .{ .name = "__rove_next", .cfunc = cont_b.jsNext, .argc = 2 },
-    // Iterative streaming primitive (streaming-handlers-plan §3.3).
-    // Same shape/posture as `__rove_next`: pure constructor of a
-    // branded descriptor; classified on the handler's return path.
-    // Phase 2a (this commit) wires the type-plumbing only — the
-    // worker temporarily 503s `.stream` returns until Phase 2b lands
-    // the chunked-write flow + timer-wake re-activation.
-    .{ .name = "__rove_stream", .cfunc = stream_b.jsStream, .argc = 1 },
+    // Handler-surface Phase 2: the `__rove_stream(...)` return verb is
+    // RETIRED — streamed output is the `stream.start()`/`stream.write()`
+    // effect surface (`_system.stream`, registered above) + `on.*` +
+    // `return next()`. The dispatcher's `finishResponse` bridge builds
+    // the internal Stream descriptor from those effects.
     // Phase 5 PR-3: deferred-resume hook for the baked
     // `__system/webhook_onresult` shim. Has to be a persistent
     // global (survives the `_harden.js` `delete globalThis._system`
@@ -2405,7 +2403,7 @@ test "lint(c): every native binding has a globals/ shim (Phase A)" {
     // Math.random are INTRINSIC_EXTENSIONS (out of scope — intrinsic
     // determinism overrides); __rove_check_email_rate is an internal
     // GLOBAL_BUILTIN (called only by globals/email.js).
-    const builtin_exceptions = [_][]const u8{ "__rove_check_email_rate", "__rove_next", "__rove_stream", "__rove_resume_if_bound", "__rove_set_wake", "__rove_fire_wake" };
+    const builtin_exceptions = [_][]const u8{ "__rove_check_email_rate", "__rove_next", "__rove_resume_if_bound", "__rove_set_wake", "__rove_fire_wake" };
 
     // Documented namespace exceptions: `_system.continuation` is an
     // internal binding called only by the baked

@@ -719,17 +719,8 @@ const PendingResponse = struct {
     /// h2 entity. Handler-path only — middleware may not return a
     /// continuation in v1 (plan §3b B6).
     continuation: ?continuation_mod.Continuation = null,
-    /// Set by the handler path when the return value is a branded
-    /// `__rove_stream(...)` descriptor (streaming-handlers-plan
-    /// §3.3, Phase 2). Transient (consumed by `finishResponse` into
-    /// the `RunOutcome.stream` arm). Mutually exclusive with
-    /// `continuation` — a handler return can be at most one of
-    /// `{ Response, Continuation, Stream }`.
-    stream: ?stream_mod.Stream = null,
-
     fn deinit(self: *PendingResponse, allocator: std.mem.Allocator) void {
         if (self.continuation) |*cont| cont.deinit(allocator);
-        if (self.stream) |*s| s.deinit(allocator);
         allocator.free(self.body);
         allocator.free(self.exception);
         for (self.cookies.items) |c2| allocator.free(c2);
@@ -1059,13 +1050,11 @@ fn runModule(
         }
         return;
     }
-    // Streaming-handlers-plan §3.3 Phase 2: `__rove_stream(...)` is
-    // the iterative-resume sibling of `next(...)`. Same accidental-
-    // collision-resistance posture; same handler-path-only restriction.
-    if (try stream_mod.tryExtract(d.allocator, ctx.raw, result.val)) |stream| {
-        pending.stream = stream;
-        return;
-    }
+    // Handler-surface Phase 2: the `__rove_stream(...)` return verb is
+    // gone — a streaming handler returns `next()` (handled above, with
+    // the ambient head captured when `stream_started`) and produces
+    // output via the `stream.*` effects, which `finishResponse` bridges
+    // to the internal Stream descriptor.
 
     // Body from return value. Status / cookies from the ambient
     // `response` global.
@@ -1721,15 +1710,6 @@ fn finishResponse(
         console_buf.deinit(d.allocator);
         return .{ .continuation = cont };
     }
-    // Streaming-handlers Phase 2: handler returned `__rove_stream(...)`.
-    // Same ownership-move-out shape as `.continuation`; consumed by
-    // the worker's `.stream` handling.
-    if (pending.stream) |s| {
-        pending.stream = null;
-        console_buf.deinit(d.allocator);
-        return .{ .stream = s };
-    }
-
     const console_bytes = console_buf.toOwnedSlice(d.allocator) catch
         return DispatchError.OutOfMemory;
 
