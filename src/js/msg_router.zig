@@ -512,16 +512,20 @@ pub const MsgRouter = struct {
     /// push failure is logged and swallowed — the §9.4 "spurious +
     /// overflow" thesis lets us drop a wake; the worker that lost it
     /// will refetch authoritative state on its next activation anyway.
+    /// `write_version` is the producer store's §8.4 write clock for
+    /// this write (or the `maxInt` fire-always sentinel); it rides each
+    /// event so `matchEventsToWakes` can gate on the watch baseline.
     pub fn broadcastKvWake(
         self: *MsgRouter,
         tenant_id: []const u8,
         key: []const u8,
         op: u8,
+        write_version: u64,
     ) void {
         self.wake_inboxes_mutex.lock();
         defer self.wake_inboxes_mutex.unlock();
         for (self.wake_inboxes.items) |inbox| {
-            inbox.push(tenant_id, key, op) catch |err| {
+            inbox.push(tenant_id, key, op, write_version) catch |err| {
                 std.log.warn(
                     "rove-js kv-wake broadcast: push tenant={s} key={s}: {s}",
                     .{ tenant_id, key, @errorName(err) },

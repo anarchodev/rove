@@ -482,14 +482,20 @@ pub fn applyWriteSet(
             return;
         };
         const ns: *worker_mod.NodeState = @ptrCast(@alignCast(opaque_node));
+        // §8.4 watch baseline: this writeset just landed via
+        // `applyEncodedWriteSet`, so the follower store's write clock now
+        // reflects it. Read it once and stamp every op's wake event;
+        // `maxInt` (contended lease) fires-always rather than dropping a
+        // wake.
+        const wv: u64 = store.writeVersion() orelse std.math.maxInt(u64);
         var fired: usize = 0;
         for (ops.items) |op| switch (op) {
             .put => |p| {
-                ns.router.broadcastKvWake(env.id, p.key, 'p');
+                ns.router.broadcastKvWake(env.id, p.key, 'p', wv);
                 fired += 1;
             },
             .delete => |d| {
-                ns.router.broadcastKvWake(env.id, d.key, 'd');
+                ns.router.broadcastKvWake(env.id, d.key, 'd', wv);
                 fired += 1;
             },
         };

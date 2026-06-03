@@ -310,7 +310,17 @@ pub fn drainRaftPending(worker: anytype) !void {
                 // steady sweep fires `scheduler_tick` at the new earliest
                 // time. Must precede releaseAll (which drains the Cmds).
                 durable_wake.noteCommittedSchedWrites(self.worker, unit);
-                unit.buffered.releaseAll(self.worker, unit.tenant_id);
+                // §8.4 watch baseline: the unit's txn just committed, so
+                // the tenant store's write clock now reflects this batch.
+                // Sample it once (per batch, not per op) and stamp every
+                // `kv_wake_broadcast`; `maxInt` (tenant absent / contended
+                // lease) fires-always rather than dropping an `on.kv` wake.
+                const wv: u64 = blk: {
+                    const slot = self.worker.node.deploy.tenant_files_map.get(unit.tenant_id) orelse
+                        break :blk std.math.maxInt(u64);
+                    break :blk slot.app_kv.writeVersion() orelse std.math.maxInt(u64);
+                };
+                unit.buffered.releaseAll(self.worker, unit.tenant_id, wv);
                 self.server.reg.destroy(self.ids[i]) catch |err| std.log.warn(
                     "rove-js parked_units commit destroy: {s}",
                     .{@errorName(err)},
@@ -1114,6 +1124,11 @@ fn resumeContinuation(
 ) !void {
     const allocator = worker.allocator;
     const server = worker.h2;
+    // Handler-surface Phase 1: a wake resume's tape rows are
+    // `.wake_batch` (an `on.*` connection wake), not `.send_callback`.
+    // Used for every captureLog / LogHeader below so replay groups the
+    // wake activation correctly under the chain's correlation_id.
+    const act_src: log_mod.ActivationSource = if (wake) .wake_batch else .send_callback;
     // Resolve-once guard: membership in `parked_continuations` IS
     // the cont-state discriminant. Cont state (path / fn_name /
     // ctx_json / tenant_id / correlation_id) reads from the
@@ -1149,6 +1164,18 @@ fn resumeContinuation(
     // fired entries are consumed (the timer-due / kv-match trigger).
     const resume_fn: ?[]const u8 = if (wake) blk: {
         const sw = server.reg.get(ent, &worker.parked_continuations, components_mod.StreamWakes) catch break :blk "onWake";
+        // Drain the §9.4 kv-match ring (if any) — this resume consumes
+        // every accumulated `on.kv` match, so they must not re-fire on
+        // the next sweep. The entries are freed; `onWake` is a "go look"
+        // edge wake, so the matched keys aren't surfaced to the handler
+        // (it re-reads authoritative kv state). A timer-only wake leaves
+        // the ring empty, so this is a no-op there.
+        if (sw.pending_wakes.len > 0) {
+            if (sw.pending_wakes.drainInto(allocator)) |drained| {
+                for (drained.wakes) |*we| we.deinit(allocator);
+                if (drained.wakes.len > 0) allocator.free(drained.wakes);
+            } else |_| {}
+        }
         break :blk if (sw.wake_to) |t| t else "onWake";
     } else cont_fn_name;
     const body = if (wake)
@@ -1232,7 +1259,7 @@ fn resumeContinuation(
                 // source = send_callback so the row shares the chain
                 // id with the inbound entry and the replay UX groups
                 // them.
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, .send_callback, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, act_src, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1260,7 +1287,7 @@ fn resumeContinuation(
                     .duration_ns = 0,
                     .status = st,
                     .outcome = .ok,
-                    .activation = .send_callback,
+                    .activation = act_src,
                     .method = "POST",
                     .path = cont_path,
                     .host = "",
@@ -1289,14 +1316,14 @@ fn resumeContinuation(
                     txn_owned = false; // helper destroyed it
                     txn_done = true;
                     resolveParked(worker, ent, sid, sess, 500, "continuation write replication failed\n") catch {};
-                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, corr_id, .send_callback, 0);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, corr_id, act_src, 0);
                     return;
                 };
                 // proposeAndParkContResume took ownership of txn (moved
                 // into pending_txns) and body_dup (stamped onto entity).
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, st, .ok, console_owned, exception_owned, .{}, corr_id, .send_callback, cont_seq);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, st, .ok, console_owned, exception_owned, .{}, corr_id, act_src, cont_seq);
                 return;
             }
             // Clean read-only commit cannot fault (mirrors
@@ -1309,7 +1336,7 @@ fn resumeContinuation(
             txn_done = true;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
             try resolveParked(worker, ent, sid, sess, st, r.body);
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, .send_callback, 0);
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, act_src, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -1365,7 +1392,7 @@ fn resumeContinuation(
                     // so replay surfaces the same value.
                     .status = 0,
                     .outcome = .ok,
-                    .activation = .send_callback,
+                    .activation = act_src,
                     .method = "POST",
                     .path = cont_path,
                     .host = "",
@@ -1393,7 +1420,7 @@ fn resumeContinuation(
                     txn_owned = false;
                     txn_done = true;
                     resolveParked(worker, ent, sid, sess, 500, "continuation write replication failed\n") catch {};
-                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_id, .send_callback, 0);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_id, act_src, 0);
                     return;
                 };
                 txn_owned = false;
@@ -1401,7 +1428,7 @@ fn resumeContinuation(
                 // Log the repark hop's tape row. status=0 (parked,
                 // same as the inbound trampoline open hop's
                 // captureSuccess shape).
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 0, .ok, &.{}, &.{}, .{}, corr_id, .send_callback, repark_seq);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 0, .ok, &.{}, &.{}, .{}, corr_id, act_src, repark_seq);
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -1439,7 +1466,7 @@ fn resumeContinuation(
                 .wrote = wrote,
                 .txn_owned = &txn_owned,
                 .txn_done = &txn_done,
-                .activation = .send_callback,
+                .activation = act_src,
             });
         },
     }
@@ -1913,8 +1940,8 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
     const Pending = struct { ent: rove.Entity, sid: h2.StreamId, sess: h2.Session };
     var expired: std.ArrayListUnmanaged(Pending) = .empty;
     defer expired.deinit(allocator);
-    var timer_due: std.ArrayListUnmanaged(Pending) = .empty;
-    defer timer_due.deinit(allocator);
+    var wake_due: std.ArrayListUnmanaged(Pending) = .empty;
+    defer wake_due.deinit(allocator);
     {
         const sids = worker.parked_continuations.column(h2.StreamId);
         const sesss = worker.parked_continuations.column(h2.Session);
@@ -1923,14 +1950,23 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
         for (ents, sids, sesss, descs, wakes) |ent, sid, sess, desc, *sw| {
             if (now_ns >= desc.deadline_ns) {
                 try expired.append(allocator, .{ .ent = ent, .sid = sid, .sess = sess });
-            } else if (sw.interval_ms > 0 and now_ns >= sw.next_wake_ns) {
-                // Recurring `on.timer`: advance `next_wake_ns` (drift-on-
-                // fire, matching `serviceParkedStreams`) so it re-fires
-                // next interval, then resume the held handler at
-                // `onWake`/`{to}`. The StreamWakes component rides the
-                // re-park, so no re-arming is needed for recurrence.
-                sw.next_wake_ns = now_ns + sw.interval_ms * std.time.ns_per_ms;
-                try timer_due.append(allocator, .{ .ent = ent, .sid = sid, .sess = sess });
+                continue;
+            }
+            // Two `on.*` wake sources fan into one `onWake` fire:
+            //   - `on.timer`: `next_wake_ns` elapsed. Advance it
+            //     (drift-on-fire, matching `serviceParkedStreams`) so it
+            //     re-fires next interval; the StreamWakes component rides
+            //     the `next()` re-park, so recurrence needs no re-arming.
+            //   - `on.kv`: `drainKvWakeInbox` pushed a §8.4-gated prefix
+            //     match onto the ring; `pending_wakes.len > 0` is the
+            //     "go look" signal (`resumeContinuation` drains it).
+            // One resume per tick even if both are due — the handler's
+            // `onWake` re-reads kv state regardless of the trigger.
+            const timer_due = sw.interval_ms > 0 and now_ns >= sw.next_wake_ns;
+            const kv_due = sw.pending_wakes.len > 0;
+            if (timer_due) sw.next_wake_ns = now_ns + sw.interval_ms * std.time.ns_per_ms;
+            if (timer_due or kv_due) {
+                try wake_due.append(allocator, .{ .ent = ent, .sid = sid, .sess = sess });
             }
         }
     }
@@ -1945,12 +1981,14 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
         };
     }
 
-    for (timer_due.items) |e| {
-        // `on.timer` wake (no callee outcome). Best-effort: on failure the
-        // entity stays parked and the next interval retries; a thrown/erroring
-        // onWake resolves via resumeContinuation's own error handling.
+    for (wake_due.items) |e| {
+        // `on.*` connection wake (no callee outcome). Best-effort: on
+        // failure the entity stays parked and the next tick / interval
+        // retries; a thrown/erroring onWake resolves via
+        // resumeContinuation's own error handling. resumeContinuation
+        // drains the kv ring so a consumed match doesn't re-fire.
         resumeContinuation(worker, e.ent, e.sid, e.sess, "", true, true) catch |err| {
-            std.log.warn("rove-js continuation: on.timer wake resume failed ({s})", .{@errorName(err)});
+            std.log.warn("rove-js continuation: on.* wake resume failed ({s})", .{@errorName(err)});
         };
     }
 }

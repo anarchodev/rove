@@ -350,12 +350,21 @@ fn drainKvWakeInbox(worker: anytype) !void {
     if (events.items.len == 0) return;
 
     const server = worker.h2;
+    // Handler-surface Phase 1 (`on.kv`): `parked_continuations` carries
+    // the same `StreamColl` Row (StreamWakes / ChainContext /
+    // StreamDraining) as the five h2 stream collections, so a held
+    // `next()` continuation armed with `on.kv` matches here too. Its
+    // ring is serviced by `sweepParkedContinuations` (not
+    // `serviceParkedStreams`), but the prefix-match accumulation is
+    // identical. Listed last so a stream and a continuation never share
+    // a column slice in one iteration.
     inline for (.{
         &server.stream_response_in,
         &server.stream_data_out,
         &server.stream_data_in,
         &server.stream_close_in,
         &server._stream_data_sending,
+        &worker.parked_continuations,
     }) |coll| {
         const wakes_col = coll.column(components_mod.StreamWakes);
         const chains_col = coll.column(components_mod.ChainContext);
@@ -384,6 +393,12 @@ fn matchEventsToWakes(
     // surface in the order they happened; the handler iterates).
     for (events.items) |ev| {
         if (!std.mem.eql(u8, ev.tenant_id, chain_ctx.tenant_id)) continue;
+        // §8.4 watch baseline (`on.kv`): a watch armed at `read_version`
+        // fires only for a write strictly newer than the state its
+        // arming handler read. `read_version == 0` is the unanchored
+        // pre-`on.kv` stream path — fire on any prefix match. `maxInt`
+        // event versions (producer couldn't read the clock) always pass.
+        if (wakes.read_version != 0 and ev.write_version <= wakes.read_version) continue;
         var matched: bool = false;
         for (wakes.kv_prefixes) |pfx| {
             if (std.mem.startsWith(u8, ev.key, pfx)) {

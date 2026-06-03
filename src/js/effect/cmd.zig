@@ -252,12 +252,17 @@ pub const BufferedCmds = struct {
     /// `node.fetch_engine`, so the host worker type plumbs through
     /// structurally. Same `anytype` pattern every worker-side
     /// system uses.
+    /// `write_version` is the tenant store's §8.4 write clock sampled
+    /// once post-commit by the caller (the leader commit arm) and
+    /// stamped onto every `kv_wake_broadcast` so `matchEventsToWakes`
+    /// can gate `on.kv` watches. `maxInt` = fire-always sentinel.
     pub fn releaseAll(
         self: *BufferedCmds,
         worker: anytype,
         tenant_id: []const u8,
+        write_version: u64,
     ) void {
-        for (self.items.items) |cmd| interpretCmd(cmd, worker, tenant_id);
+        for (self.items.items) |cmd| interpretCmd(cmd, worker, tenant_id, write_version);
         self.items.deinit(worker.allocator);
         self.* = .{};
     }
@@ -275,11 +280,12 @@ pub fn interpretCmd(
     cmd: Cmd,
     worker: anytype,
     tenant_id: []const u8,
+    write_version: u64,
 ) void {
     const allocator = worker.allocator;
     switch (cmd) {
         .kv_wake_broadcast => |w| {
-            worker.node.router.broadcastKvWake(tenant_id, w.key, w.op);
+            worker.node.router.broadcastKvWake(tenant_id, w.key, w.op, write_version);
             // Broadcast just reads the key; release it after.
             allocator.free(w.key);
         },
