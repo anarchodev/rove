@@ -112,11 +112,10 @@ pub const SpecificError = error{
     /// configured `max_overlay_bytes_per_store`. Caller should
     /// rollback + durabilize + retry, or drop the request.
     OverlayCapExceeded,
-    /// beginReadView() called while this Txn already has an open
-    /// read view.
-    ReadViewAlreadyOpen,
-    /// refreshReadView() called with no open read view.
-    NoReadView,
+    /// An op (read/write/commit/park) was attempted on a Txn whose chained
+    /// predecessor faulted: a rollback cascade invalidated it. The caller
+    /// must abort this Txn (`rollback`) — its speculative basis is gone.
+    TxnInvalidated,
 };
 
 const META_DBI_NAME: [:0]const u8 = "_meta";
@@ -212,10 +211,9 @@ pub const HistogramSnapshot = struct {
 /// given thread always hits the same shard. Snapshot sums across all
 /// shards.
 ///
-/// Sharded counters here are the per-op / per-Txn-lifecycle ones —
-/// anything hit at request frequency (put / delete / get / bytes_put,
-/// txn + savepoint commit/rollback, txn begin, chain-depth sum).
-/// Rare counters (lifecycle, durabilize) and gauges live unsharded on
+/// Sharded counters here are the ones called per-API-op
+/// (put / delete / get / bytes_put). Less-frequent counters (txn
+/// commit/rollback, lifecycle, durabilize, gauges) live unsharded on
 /// `Metrics` directly — sharding them would just waste memory.
 ///
 /// Note: `active_leases` and `active_snapshots` aren't stored as
@@ -236,6 +234,13 @@ pub const HotShard = extern struct {
     txn_rollback: std.atomic.Value(u64) = .init(0),
     savepoint_commit: std.atomic.Value(u64) = .init(0),
     savepoint_rollback: std.atomic.Value(u64) = .init(0),
+    // Speculative-chain instrumentation. `txn_begin` counts top-level Txn
+    // begins (the denominator for mean chain depth and the begin rate);
+    // `txn_commit_speculative` counts top-level commits whose reads resolved
+    // against an uncommitted chain predecessor; `chain_depth_sum`
+    // accumulates the per-tenant chain depth sampled at each begin (divide
+    // by `txn_begin` for a mean). The high-water gauge is unsharded — see
+    // Metrics.chain_depth_max.
     txn_begin: std.atomic.Value(u64) = .init(0),
     txn_commit_speculative: std.atomic.Value(u64) = .init(0),
     chain_depth_sum: std.atomic.Value(u64) = .init(0),
@@ -300,10 +305,10 @@ pub const Metrics = struct {
     snapshot_close_total: std.atomic.Value(u64) = .init(0),
     poison_total: std.atomic.Value(u64) = .init(0),
 
-    /// High-water mark: the deepest per-tenant speculative chain ever
-    /// observed at beginTxn (1 = a lone Txn with no speculation).
-    /// CAS-max updated, so the cache line stays read-mostly once the
-    /// peak stabilizes.
+    // Speculative-chain high-water mark: the deepest per-tenant chain ever
+    // observed at a begin. Unsharded (a single CAS-maintained gauge) —
+    // begins are far rarer than point ops, so contention is negligible and
+    // a true max across threads is simpler than reconciling per-shard maxes.
     chain_depth_max: std.atomic.Value(u64) = .init(0),
 
     // Duration distributions. durabilize is the main one (one fsync
@@ -368,26 +373,21 @@ pub const Metrics = struct {
         _ = self.currentShard().savepoint_rollback.fetchAdd(1, .monotonic);
     }
 
-    /// Record a beginTxn: count it, fold its chain depth into the sum
-    /// (for a mean), and bump the high-water max. `chain_depth` is the
-    /// chain length *including* the Txn just appended (≥ 1).
+    /// Sample the chain depth at a top-level begin: add it to the (sharded)
+    /// running sum and bump the (unsharded) high-water gauge. `chain_depth`
+    /// is the live per-tenant depth after this begin.
     pub inline fn recordTxnBegin(self: *Metrics, chain_depth: u32) void {
         const s = self.currentShard();
         _ = s.txn_begin.fetchAdd(1, .monotonic);
         _ = s.chain_depth_sum.fetchAdd(chain_depth, .monotonic);
-        var seen = self.chain_depth_max.load(.monotonic);
-        while (chain_depth > seen) {
-            seen = self.chain_depth_max.cmpxchgWeak(
-                seen,
-                chain_depth,
-                .monotonic,
-                .monotonic,
-            ) orelse break;
+        var cur = self.chain_depth_max.load(.monotonic);
+        while (chain_depth > cur) {
+            cur = self.chain_depth_max.cmpxchgWeak(cur, chain_depth, .monotonic, .monotonic) orelse break;
         }
     }
 
-    /// Record a top-level commit whose reads resolved against an
-    /// uncommitted chain predecessor — i.e. it consumed speculation.
+    /// A top-level commit whose reads resolved against an uncommitted chain
+    /// predecessor (consumed speculation).
     pub inline fn recordTxnCommitSpeculative(self: *Metrics) void {
         _ = self.currentShard().txn_commit_speculative.fetchAdd(1, .monotonic);
     }
@@ -607,7 +607,6 @@ pub const Manifest = struct {
             }
             ts.chain_head = null;
             ts.chain_tail = null;
-            ts.chain_depth = 0;
             ts.releaseRef(self.allocator);
         }
         self.tenants.deinit(self.allocator);
@@ -873,6 +872,10 @@ pub const Manifest = struct {
 
         // 2. Enumerate every tenant.
         const TenantPair = struct { id: u64, ts: *TenantState };
+        // Drained tenants also carry the write-clock value captured at the
+        // main_overlay → draining move, so we can publish it as the durable
+        // watermark after the LMDB commit lands (see durable_write_version).
+        const DrainedTenant = struct { id: u64, ts: *TenantState, version: u64 };
         var tenant_pairs: std.ArrayListUnmanaged(TenantPair) = .empty;
         defer tenant_pairs.deinit(self.allocator);
         {
@@ -895,7 +898,7 @@ pub const Manifest = struct {
         //    LMDB commit (step 6) — readers consult
         //    main_overlay → draining_overlay → LMDB, so an in-flight
         //    key is never momentarily absent from all three.
-        var drained: std.ArrayListUnmanaged(TenantPair) = .empty;
+        var drained: std.ArrayListUnmanaged(DrainedTenant) = .empty;
         defer drained.deinit(self.allocator);
         defer for (drained.items) |t| {
             // Runs after the commit attempt (success or error). On
@@ -914,10 +917,15 @@ pub const Manifest = struct {
                 continue;
             }
             std.debug.assert(!t.ts.draining_active);
+            // Capture the clock under the same lock as the move: every
+            // write now in draining has version <= this; writes that land
+            // in the fresh main_overlay during this durabilize get a
+            // higher version and are NOT covered by this watermark.
+            const captured = t.ts.write_version.load(.monotonic);
             t.ts.main_overlay.moveInto(&t.ts.draining_overlay);
             t.ts.draining_active = true;
             t.ts.lock.unlock();
-            drained.append(self.allocator, t) catch
+            drained.append(self.allocator, .{ .id = t.id, .ts = t.ts, .version = captured }) catch
                 @panic("OOM building drained list in durabilize");
         }
 
@@ -970,6 +978,21 @@ pub const Manifest = struct {
 
         try txn.commit();
 
+        // Publish the durable watermark: the commit has landed, so for
+        // each drained tenant every write with version <= captured is now
+        // in LMDB. Read views opened from here on capture this as their
+        // readVersion; any write still in (the fresh) main_overlay carries
+        // a higher version and so stays strictly above that baseline —
+        // closing the draining-eviction window. Done before the deferred
+        // draining clear, so the data remains visible (via draining) the
+        // whole time. Success path only: a failed commit poisoned above
+        // and must not advance the watermark.
+        for (drained.items) |t| {
+            t.ts.lock.lock();
+            t.ts.durable_write_version = t.version;
+            t.ts.lock.unlock();
+        }
+
         // 5. Bookkeeping.
         {
             self.dbis_lock.lock();
@@ -997,6 +1020,55 @@ pub const Manifest = struct {
     /// `Txn.commit`, which means something completely different.
     pub fn flush(self: *Manifest) !void {
         return self.durabilize(0);
+    }
+
+    // ── chain mutation by handle (cross-worker) ─────────────────────
+
+    /// Look up a tenant and retain a reference, or null if it doesn't
+    /// exist. Unlike `acquire`, never creates — a handle to a dropped
+    /// tenant resolves to nothing. The retain keeps the TenantState alive
+    /// across the gap between releasing `tenants_lock` and taking
+    /// `ts.lock`; caller must `releaseRef` when done.
+    fn getTenantRetained(self: *Manifest, tenant_id: u64) ?*TenantState {
+        self.tenants_lock.lock();
+        defer self.tenants_lock.unlock();
+        const ts = self.tenants.get(tenant_id) orelse return null;
+        ts.retain();
+        return ts;
+    }
+
+    /// Commit the parked top-level Txn named by `h`. Locks its tenant and
+    /// resolves the handle by chain walk — idempotent and callable from any
+    /// worker, never through a raw `*Txn`. Returns `.absent` if the Txn is
+    /// already gone, `.not_head` if a lower predecessor is still open
+    /// (retry later), `.committed` on success. See `TxnHandle`.
+    pub fn commit(self: *Manifest, h: TxnHandle) !CommitResult {
+        try self.checkAlive();
+        const ts = self.getTenantRetained(h.tenant) orelse return .absent;
+        defer ts.releaseRef(self.allocator);
+        ts.lock.lock();
+        defer ts.lock.unlock();
+        const txn = ts.resolveChainLocked(h.seq) orelse return .absent;
+        if (txn.open_child != null) return error.SavepointStillOpen;
+        return txn.commitTopLevelLocked();
+    }
+
+    /// Roll back the parked top-level Txn named by `h` AND its forward
+    /// chain-dependents (the cascade — raft tail-truncation). Locks its
+    /// tenant, resolves by chain walk. Idempotent and convergent under
+    /// uncoordinated multi-worker calls: whoever runs first unwinds the
+    /// most, the other resolves `.absent`. Never takes `dispatch_lock`, so
+    /// a raft-apply-thread rollback can't stall on a live handler.
+    pub fn rollbackFrom(self: *Manifest, h: TxnHandle) RollbackResult {
+        // No checkAlive: rollback frees memory and must work during
+        // teardown, mirroring the infallible pointer `Txn.rollback`.
+        const ts = self.getTenantRetained(h.tenant) orelse return .absent;
+        defer ts.releaseRef(self.allocator);
+        ts.lock.lock();
+        defer ts.lock.unlock();
+        const txn = ts.resolveChainLocked(h.seq) orelse return .absent;
+        txn.rollbackFromLocked(true);
+        return .rolled_back;
     }
 
     /// Read the durable raft watermark from LMDB. Returns 0 if no
@@ -1108,6 +1180,30 @@ const TenantState = struct {
     /// inside kvexp's internal lock paths.
     dispatch_lock: std.Thread.Mutex = .{},
     main_overlay: Overlay,
+    /// Node-local monotonic write clock for this store. Bumped once per
+    /// write-incorporating top-level commit (overlay → main_overlay) —
+    /// the single funnel through which leader commit, follower apply, and
+    /// snapshot install (`loadSnapshot`) all pass. NOT advanced by
+    /// durabilize (already-counted writes moving to LMDB), savepoint
+    /// commit (not yet confirmed), or the read-only fast-path commit.
+    /// In-memory only; resets to 0 on reopen (a restart re-arms any
+    /// external watches). See `StoreLease.writeVersion` / `Txn.readVersion`
+    /// and the one-directional contract in their doc comments.
+    write_version: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// The write-clock value as of the most recently *durabilized* (LMDB-
+    /// committed) batch for this store: every write with version <= this
+    /// is in LMDB and therefore present in any read-view snapshot pinned
+    /// after that durabilize returned. `Txn.readVersion` returns this —
+    /// not the live `write_version` — so that a write still living only
+    /// in `main_overlay` at read-view open (which a later durabilize can
+    /// evict from that view's now-stale LMDB snapshot) always carries a
+    /// version strictly greater than the captured baseline. That closes
+    /// the "draining-eviction window" in the §3 contract: an evicted,
+    /// no-longer-visible write can never have version <= readVersion.
+    /// Trade-off: a lower baseline means writes committed-but-not-yet-
+    /// checkpointed at view open all fire as (permitted) spurious wakes —
+    /// bounded by the checkpoint window. Guarded by `lock`.
+    durable_write_version: u64 = 0,
     /// durabilize handoff slot. `durabilize` moves `main_overlay` here
     /// (under `lock`) *before* the LMDB commit, and clears it (under
     /// `lock`) only *after* the commit. Reads consult
@@ -1121,9 +1217,9 @@ const TenantState = struct {
     draining_active: bool = false,
     chain_head: ?*Txn = null,
     chain_tail: ?*Txn = null,
-    /// Number of top-level Txns currently linked between chain_head and
-    /// chain_tail. Maintained under `lock` on every chain mutation;
-    /// feeds the chain-depth metrics. Savepoints are not chain members.
+    /// Live count of top-level Txns in this tenant's chain. Maintained
+    /// under `lock` (begin +1, top-level commit -1, rollback cascade -=
+    /// removed, teardown = 0) and sampled into the chain-depth metrics.
     chain_depth: u32 = 0,
 
     /// Refcount = (1 if still in Manifest.tenants) + (1 per outstanding
@@ -1135,10 +1231,11 @@ const TenantState = struct {
     refcount: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
 
     /// One LMDB read txn parked (mdb_txn_reset) between batches and
-    /// renewed (mdb_txn_renew) at the next beginReadView — skips the
-    /// me_maxdbs-sized mdb_txn_begin memset after the first batch.
-    /// Holds no reader slot / no snapshot while parked. Guarded by
-    /// `lock`; one TrackedTxn per tenant at a time so no concurrent use.
+    /// renewed (mdb_txn_renew) when the next batch lazily opens its read
+    /// view (`ensureReadViewLocked`) — skips the me_maxdbs-sized
+    /// mdb_txn_begin memset after the first batch. Holds no reader slot /
+    /// no snapshot while parked. Guarded by `lock`; one active read view
+    /// per tenant at a time so no concurrent use.
     parked_read_txn: ?lmdb.Txn = null,
 
     fn retain(self: *TenantState) void {
@@ -1171,7 +1268,68 @@ const TenantState = struct {
             allocator.destroy(self);
         }
     }
+
+    /// Park (or release) every open batch read view across this tenant's
+    /// chain. The first reusable handle is parked (mdb_txn_reset keeps the
+    /// handle but drops the reader slot) for a cheap renew next batch; any
+    /// extras are aborted. Caller holds `lock`. Called by
+    /// `StoreLease.release` so reader slots aren't pinned across the
+    /// post-dispatch (e.g. raft-commit) wait — a later read re-opens the
+    /// view lazily. Only top-level Txns carry a read view, and all live
+    /// top-level Txns are on the chain, so this reaches every one.
+    fn parkOpenReadViewsLocked(self: *TenantState) void {
+        var cur = self.chain_head;
+        while (cur) |t| {
+            if (t.read_view) |*rv| {
+                if (self.parked_read_txn == null) {
+                    rv.resetRead();
+                    self.parked_read_txn = rv.*;
+                } else {
+                    rv.abort();
+                }
+                t.read_view = null;
+            }
+            cur = t.chain_next;
+        }
+    }
+
+    /// Resolve a parked Txn handle to its live `*Txn` by walking the chain
+    /// for the matching `seq`, or null if it's gone (committed / rolled
+    /// back / cascaded — all unlink before free). Caller holds `lock`. The
+    /// chain is the liveness set, so this needs no side map and is
+    /// inherently idempotent. Un-parked (active) Txns carry `seq == null`
+    /// and never match a handle. O(chain depth), bounded by the in-flight
+    /// speculation window.
+    fn resolveChainLocked(self: *TenantState, seq: u64) ?*Txn {
+        var cur = self.chain_head;
+        while (cur) |t| {
+            if (t.seq != null and t.seq.? == seq) return t;
+            cur = t.chain_next;
+        }
+        return null;
+    }
 };
+
+// ─── Txn handles (cross-worker chain mutation) ──────────────────────
+
+/// Opaque, stable name for a parked top-level `Txn`, valid for the Txn's
+/// lifetime and inert afterward (it just resolves `.absent`). NOT a
+/// pointer — workers hold these instead of `*Txn`, so no code outside
+/// kvexp ever dereferences a chained Txn's memory. `tenant` routes to the
+/// per-tenant lock; `seq` (the caller's globally-monotonic raft propose
+/// seq) names the Txn within that tenant's chain.
+pub const TxnHandle = struct { tenant: u64, seq: u64 };
+
+/// Result of `Manifest.commit(handle)`.
+///   .committed — merged into main_overlay (or fast-path spliced), freed.
+///   .not_head  — a lower predecessor is still open; retry on a later tick.
+///   .absent    — already committed or rolled back; no-op.
+pub const CommitResult = enum { committed, not_head, absent };
+
+/// Result of `Manifest.rollbackFrom(handle)`.
+///   .rolled_back — the Txn (and its forward chain-dependents) freed.
+///   .absent      — already gone (directly or via a prior cascade); no-op.
+pub const RollbackResult = enum { rolled_back, absent };
 
 // ─── Txn ────────────────────────────────────────────────────────────
 
@@ -1185,6 +1343,25 @@ pub const Txn = struct {
     /// top-level Txns (parent == null).
     chain_prev: ?*Txn,
     chain_next: ?*Txn,
+    /// Stable handle id for this top-level Txn, assigned by `park(seq)`
+    /// when the caller hands the Txn to the chain (post-dispatch, awaiting
+    /// raft). `null` while the Txn is the active writer (addressed only by
+    /// the raw pointer its owning worker holds); set once parked. The
+    /// caller then refers to it across workers by `TxnHandle{tenant, seq}`
+    /// and `Manifest.commit`/`rollbackFrom` resolve it by walking the
+    /// chain for this `seq` — so a freed Txn (unlinked before free) simply
+    /// isn't found and resolves `.absent`, with no side map to maintain.
+    /// rove supplies its raft propose seq here (globally monotonic → no
+    /// reuse / no ABA). Savepoints never carry one.
+    seq: ?u64 = null,
+    /// Set when a rollback cascade reached this Txn while it was still the
+    /// active writer (un-parked, `seq == null`) on another worker — i.e. a
+    /// chained predecessor faulted mid-dispatch. The cascade detaches +
+    /// marks rather than frees (freeing underneath a live handler would be
+    /// a UAF); the owning worker self-aborts on its next op / commit / park
+    /// (each returns `error.TxnInvalidated`), which frees it. Only ever set
+    /// on a top-level Txn; savepoints read it via `topLevelLocked`.
+    invalidated: bool = false,
     /// This Txn's own writes.
     overlay: Overlay,
     /// The currently-open savepoint child, if any. LIFO: at most one.
@@ -1204,13 +1381,27 @@ pub const Txn = struct {
     /// without going through raft.
     saw_speculation: bool = false,
 
-    /// Optional batch-scoped LMDB read handle. Only ever set on the
-    /// top-level Txn (parent == null); savepoints resolve to it by
-    /// walking up. When present, point reads reuse this one parked
-    /// MDB_RDONLY txn instead of begin/abort per get — read-latest,
-    /// re-snapshotted by refreshReadView(). Always torn down on
-    /// commit/rollback even if endReadView() wasn't called.
+    /// Automatic batch-scoped LMDB read handle. Only ever set on the
+    /// top-level Txn (parent == null); savepoints resolve to it by walking
+    /// up. Point reads reuse this one parked MDB_RDONLY txn instead of
+    /// begin/abort per get. Opened lazily on first read and auto-refreshed
+    /// on durabilize by `ensureReadViewLocked` — read-latest with read-
+    /// your-committed-writes continuity. Parked on `StoreLease.release`
+    /// (the dispatch boundary) and torn down on commit/rollback, so it
+    /// can't leak a reader slot.
     read_view: ?lmdb.Txn = null,
+
+    /// The store's *durable* write-clock watermark the read view is pinned
+    /// to — the version of the LMDB snapshot it holds, not the live write
+    /// clock. Set when the view is opened/renewed (lazily on first read,
+    /// and on each durabilize-triggered auto-renew). Only meaningful on the
+    /// top-level Txn; savepoints resolve upward. Exposed via `readVersion()`
+    /// (which falls back to the store's current durable watermark when no
+    /// view is open). Captured under tenant_state.lock alongside the
+    /// snapshot pin so the two are consistent. See
+    /// `TenantState.durable_write_version` for why the durable watermark
+    /// (not the live clock) keeps the no-lost-wake contract airtight.
+    read_version: u64 = 0,
 
     /// Batch-scoped cache of this tenant's LMDB DBI. `tenant_id` is
     /// constant for a Txn's life and the dispatch lease blocks a
@@ -1242,10 +1433,12 @@ pub const Txn = struct {
         return d;
     }
 
-    /// Resolve the LMDB read handle for a point read. If a batch read
-    /// view is open, reuse it (not owned — never abort it here);
-    /// otherwise mint a one-shot read txn the caller must release.
-    /// Caller must hold tenant_state.lock.
+    /// Resolve the LMDB read handle for a point read. Lazily opens (and
+    /// auto-refreshes) the batch read view via `ensureReadViewLocked`, then
+    /// reuses it (not owned — never abort it here). If opening/renewing the
+    /// view hit an LMDB error, falls back to a one-shot read txn the caller
+    /// must release, so a read never fails just because the parked handle
+    /// couldn't renew. Caller must hold tenant_state.lock.
     const LmdbRead = struct {
         txn: lmdb.Txn,
         owned: bool,
@@ -1254,6 +1447,7 @@ pub const Txn = struct {
         }
     };
     fn lmdbReadLocked(self: *Txn) !LmdbRead {
+        self.ensureReadViewLocked();
         if (self.topLevelLocked().read_view) |rv|
             return .{ .txn = rv, .owned = false };
         return .{ .txn = try lmdb.Txn.beginRead(&self.manifest.env), .owned = true };
@@ -1266,6 +1460,7 @@ pub const Txn = struct {
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
         if (self.open_child != null) return error.SavepointStillOpen;
+        try self.checkNotInvalidatedLocked();
         // Per-store memory cap. Conservative — counts main_overlay +
         // this Txn's overlay + the new bytes, no dedup credit. The
         // check has to happen *before* putLocked mutates the overlay
@@ -1285,6 +1480,7 @@ pub const Txn = struct {
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
         if (self.open_child != null) return error.SavepointStillOpen;
+        try self.checkNotInvalidatedLocked();
         const existed = try self.keyExistsLocked(key);
         self.overlay.tombstoneLocked(key);
         self.manifest.metrics.recordDelete();
@@ -1302,9 +1498,18 @@ pub const Txn = struct {
         t.saw_speculation = true;
     }
 
+    /// Self-abort gate: errors if this Txn's top-level was invalidated by a
+    /// predecessor's rollback cascade (chained predecessor faulted while
+    /// this one was mid-dispatch). The owner must `rollback` on seeing
+    /// this. Caller holds `tenant_state.lock`.
+    fn checkNotInvalidatedLocked(self: *Txn) error{TxnInvalidated}!void {
+        if (self.topLevelLocked().invalidated) return error.TxnInvalidated;
+    }
+
     pub fn get(self: *Txn, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
+        try self.checkNotInvalidatedLocked();
         self.manifest.metrics.recordGet();
         return self.getLocked(allocator, key);
     }
@@ -1404,6 +1609,7 @@ pub const Txn = struct {
     pub fn scanPrefix(self: *Txn, prefix: []const u8) !TxnPrefixCursor {
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
+        try self.checkNotInvalidatedLocked();
 
         // Flatten the layered view into a sorted slice, with closer-
         // to-self layers winning collisions. Tombstones are preserved
@@ -1515,65 +1721,140 @@ pub const Txn = struct {
         return self.overlay.entries.count() == 0 and !self.saw_speculation;
     }
 
-    // ── batch read view ────────────────────────────────────────────
+    // ── write-version clock ─────────────────────────────────────────
 
-    /// Open a batch-scoped LMDB read handle. While open, every point
-    /// read in this Txn (and its savepoints) reuses one parked
-    /// MDB_RDONLY txn instead of opening + aborting one per `get` —
-    /// removing per-get reader-table slot churn across a request
-    /// batch. The overlay walk (own → savepoints → chain →
-    /// main_overlay → draining) is unchanged; only the durable-LMDB
-    /// tail is amortized.
+    /// The store's durable write-clock watermark this Txn's reads are
+    /// baselined to: the watermark the open read view is pinned to, or — if
+    /// no view is open yet — the store's current durable watermark (which
+    /// is exactly what the next read would pin). Always meaningful; reads
+    /// open/refresh the view automatically. Savepoints resolve to the
+    /// top-level Txn. Auto-renew advances this on each durabilize, so
+    /// reading it after your reads gives the tightest correct baseline.
     ///
-    /// This is *read-latest*, not a snapshot: a single read view does
-    /// pin one LMDB snapshot, so call `refreshReadView()` at request
-    /// boundaries to observe state durabilized since. Recorded on the
-    /// top-level Txn; calling on a savepoint resolves upward.
-    pub fn beginReadView(self: *Txn) !void {
-        try self.manifest.checkAlive();
+    /// Contract (one-directional): for any write batch `W` on this store
+    /// whose effects were NOT visible to reads under this view,
+    /// `StoreLease.writeVersion()` observed for `W` is strictly greater
+    /// than the value returned here. The converse is not guaranteed — a
+    /// visible write may also carry a greater version (a harmless
+    /// over-fire for a watch keyed on this baseline). Never the reverse:
+    /// a not-visible write with version <= this value is impossible.
+    ///
+    /// Two layers make that airtight. Reads auto-refresh on durabilize, so
+    /// a write visible via `main_overlay` stays visible (from LMDB) after
+    /// it is durabilized — no eviction gap. And even if a read did observe
+    /// a stale snapshot, the baseline is the durable watermark, so any
+    /// not-yet-durable write ranks strictly above it.
+    pub fn readVersion(self: *Txn) u64 {
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
         const root = self.topLevelLocked();
-        if (root.read_view != null) return error.ReadViewAlreadyOpen;
+        if (root.read_view != null) return root.read_version;
+        return self.tenant_state.durable_write_version;
+    }
+
+    // ── batch read view (automatic) ─────────────────────────────────
+
+    /// Ensure a batch read view is open and fresh for a point read.
+    ///
+    /// Read views are fully automatic: this is called from the read path
+    /// (`lmdbReadLocked`) so the application never has to open, refresh, or
+    /// close one. It (a) lazily opens the view on first use — renewing the
+    /// tenant's parked MDB_RDONLY handle if present, else paying the
+    /// one-time `begin` — and (b) auto-renews it whenever a durabilize has
+    /// advanced `durable_write_version` since the view was pinned.
+    ///
+    /// Why a durabilize is the *only* refresh trigger: durabilize is the
+    /// sole writer of the LMDB env (every `Txn.commit` lands in the live-
+    /// read `main_overlay`; only durabilize moves state into LMDB). So the
+    /// pinned snapshot can go stale for exactly one reason, and a single
+    /// `durable_write_version` compare detects it. Renewing on that event
+    /// makes a read view *read-latest with read-your-committed-writes
+    /// continuity*: a key visible via `main_overlay` before a durabilize
+    /// stays visible (now from LMDB) after it, with no eviction gap.
+    ///
+    /// `read_version` baselines to the durable watermark the pinned
+    /// snapshot reflects — conservative for the watch contract (see
+    /// `readVersion`). Caller holds tenant_state.lock. On any LMDB error
+    /// the view is left closed and the caller falls back to a one-shot txn;
+    /// reads never fail just because the parked handle couldn't renew.
+    fn ensureReadViewLocked(self: *Txn) void {
+        const root = self.topLevelLocked();
         const ts = self.tenant_state;
+        if (root.read_view) |*rv| {
+            // Auto-renew iff a durabilize landed since we pinned. Reuse the
+            // same handle (reset+renew) — keeps the reader slot, no churn.
+            if (ts.durable_write_version > root.read_version) {
+                rv.resetRead();
+                rv.renewRead() catch {
+                    rv.abort();
+                    root.read_view = null;
+                    return;
+                };
+                root.read_version = ts.durable_write_version;
+            }
+            return;
+        }
+        // Lazy open.
         if (ts.parked_read_txn) |*p| {
             p.renewRead() catch {
                 p.abort();
                 ts.parked_read_txn = null;
-                root.read_view = try lmdb.Txn.beginRead(&self.manifest.env);
+                root.read_view = lmdb.Txn.beginRead(&self.manifest.env) catch return;
+                root.read_version = ts.durable_write_version;
                 return;
             };
             root.read_view = ts.parked_read_txn; // move handle into the batch
             ts.parked_read_txn = null;
+            root.read_version = ts.durable_write_version;
         } else {
             // First batch for this tenant: pay the memset once.
-            root.read_view = try lmdb.Txn.beginRead(&self.manifest.env);
+            root.read_view = lmdb.Txn.beginRead(&self.manifest.env) catch return;
+            root.read_version = ts.durable_write_version;
         }
     }
 
-    /// Re-snapshot the read view: park the reader slot and re-acquire
-    /// a fresh LMDB snapshot reusing it (no slot-table churn), so
-    /// subsequent reads see the latest durabilized state. Call between
-    /// batch requests. On renew failure the view is torn down (reads
-    /// fall back to one-shot read txns) and the error is propagated.
+    /// Optional: pre-open (and freshen) the batch read view now, instead of
+    /// letting the first `get` open it lazily. You normally don't need this
+    /// — reads open and refresh the view automatically. Useful only to
+    /// capture `readVersion()` up-front or to pay the open cost outside the
+    /// read path. Idempotent: opening an already-open view auto-renews it.
+    pub fn beginReadView(self: *Txn) !void {
+        try self.manifest.checkAlive();
+        self.tenant_state.lock.lock();
+        defer self.tenant_state.lock.unlock();
+        self.ensureReadViewLocked();
+    }
+
+    /// Optional: force an immediate re-snapshot to the latest durable state
+    /// and re-baseline `readVersion()`. Reads already auto-refresh on
+    /// durabilize, so this is only needed to advance the watch baseline at
+    /// a precise point. Opens a view if none is open. On renew failure the
+    /// view is torn down (reads fall back to one-shot txns) and the error
+    /// is propagated.
     pub fn refreshReadView(self: *Txn) !void {
         try self.manifest.checkAlive();
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
         const root = self.topLevelLocked();
-        const rv = if (root.read_view) |*rv| rv else return error.NoReadView;
-        rv.resetRead();
-        rv.renewRead() catch |e| {
-            rv.abort();
-            root.read_view = null;
-            return e;
-        };
+        if (root.read_view) |*rv| {
+            rv.resetRead();
+            rv.renewRead() catch |e| {
+                rv.abort();
+                root.read_view = null;
+                return e;
+            };
+            root.read_version = self.tenant_state.durable_write_version;
+        } else {
+            self.ensureReadViewLocked();
+        }
     }
 
-    /// Close the read view, releasing its reader slot. Safe to call
-    /// when none is open. Invoked automatically on commit/rollback, so
-    /// an explicit call is optional (useful to release the slot early
-    /// while keeping the Txn open).
+    /// Optional: release the read view's reader slot now, while keeping the
+    /// Txn open. Reads re-open it lazily afterwards. Read views are also
+    /// parked automatically on `StoreLease.release` (the dispatch boundary)
+    /// and on commit/rollback, so an explicit call is rarely needed — it's
+    /// here for unusual flows that hold a Txn readable across a long wait
+    /// and want the slot freed sooner. Safe to call when none is open.
     pub fn endReadView(self: *Txn) void {
         self.tenant_state.lock.lock();
         defer self.tenant_state.lock.unlock();
@@ -1635,6 +1916,26 @@ pub const Txn = struct {
         return child;
     }
 
+    /// Assign this top-level Txn's stable handle and return it. Called by
+    /// the owner when it hands the Txn off to the chain (post-dispatch,
+    /// awaiting raft) — the `active → parked` transition. `seq` is the
+    /// caller's globally-monotonic id (rove's raft propose seq). After
+    /// this, refer to the Txn only by the returned handle across workers;
+    /// `Manifest.commit`/`rollbackFrom` resolve it under the tenant lock.
+    pub fn park(self: *Txn, seq: u64) error{TxnInvalidated}!TxnHandle {
+        const ts = self.tenant_state;
+        ts.lock.lock();
+        defer ts.lock.unlock();
+        std.debug.assert(self.parent == null); // savepoints aren't parked
+        std.debug.assert(self.seq == null); // no double-park
+        // Catch-all self-abort: if the predecessor faulted while this
+        // handler ran (and it issued no further ops), invalidation surfaces
+        // here at the park boundary instead of going unnoticed.
+        if (self.invalidated) return error.TxnInvalidated;
+        self.seq = seq;
+        return .{ .tenant = self.tenant_id, .seq = seq };
+    }
+
     pub fn commit(self: *Txn) !void {
         try self.manifest.checkAlive();
         // Capture tenant_state up front so the deferred unlock doesn't
@@ -1646,57 +1947,74 @@ pub const Txn = struct {
         ts.lock.lock();
         defer ts.lock.unlock();
         if (self.open_child != null) return error.SavepointStillOpen;
-        const is_savepoint = self.parent != null;
-        const was_speculative = !is_savepoint and self.saw_speculation;
+        try self.checkNotInvalidatedLocked();
         if (self.parent) |parent| {
-            // Savepoint commit.
+            // Savepoint commit: merge into parent, leave the top-level (and
+            // its read view) alive.
             Overlay.moveInto(&self.overlay, &parent.overlay);
             parent.open_child = null;
-        } else {
-            // Top-level commit. Two paths:
-            //
-            // Fast path — read-only AND speculation-free: nothing in
-            // our overlay, no read ever resolved to a chain predecessor.
-            // Predecessors don't depend on us (we wrote nothing) and
-            // successors don't depend on us (we observed no speculation,
-            // so nothing they may have read could have come from us).
-            // Splice ourselves out of the chain wherever we sit — no
-            // chain-head requirement. The application can short-circuit
-            // raft propose for this Txn entirely.
-            //
-            // Slow path — normal commit: must be chain head, drain
-            // overlay into main_overlay, advance head.
-            const fast_path = self.overlay.entries.count() == 0 and !self.saw_speculation;
-            if (fast_path) {
-                if (self.chain_prev) |prev| prev.chain_next = self.chain_next;
-                if (self.chain_next) |next| next.chain_prev = self.chain_prev;
-                if (ts.chain_head == self) ts.chain_head = self.chain_next;
-                if (ts.chain_tail == self) ts.chain_tail = self.chain_prev;
-            } else {
-                if (ts.chain_head != self) return error.NotChainHead;
-                Overlay.moveInto(&self.overlay, &ts.main_overlay);
-                if (self.chain_next) |next| {
-                    next.chain_prev = null;
-                    ts.chain_head = next;
-                } else {
-                    ts.chain_head = null;
-                    ts.chain_tail = null;
-                }
-            }
-            ts.chain_depth -= 1;
+            self.overlay.deinit();
+            manifest.allocator.destroy(self);
+            manifest.metrics.recordSavepointCommit();
+            return;
         }
-        // Top-level commit frees this Txn; park any batch read view it
-        // owns for reuse by the next batch on this tenant. (Savepoint
-        // commit leaves the top-level — and its read view — alive.)
-        if (!is_savepoint) self.parkReadViewLocked();
+        return switch (self.commitTopLevelLocked()) {
+            .committed => {},
+            .not_head => error.NotChainHead,
+            .absent => unreachable, // self is live; resolution is the caller's concern
+        };
+    }
+
+    /// Top-level commit body. Caller holds tenant_state.lock and has
+    /// checked `open_child == null` and `parent == null`. Frees `self` on
+    /// `.committed`; returns `.not_head` with no side effects when a
+    /// predecessor is still open. Shared by the pointer `commit()` and the
+    /// by-handle `Manifest.commit`.
+    fn commitTopLevelLocked(self: *Txn) CommitResult {
+        const ts = self.tenant_state;
+        const manifest = self.manifest;
+        // Fast path — read-only AND speculation-free: nothing in our
+        // overlay, no read ever resolved to a chain predecessor.
+        // Predecessors don't depend on us (we wrote nothing) and
+        // successors don't depend on us (we observed no speculation), so we
+        // can splice out wherever we sit — no chain-head requirement.
+        //
+        // Slow path — normal commit: must be chain head, drain overlay into
+        // main_overlay, advance head.
+        const fast_path = self.overlay.entries.count() == 0 and !self.saw_speculation;
+        if (fast_path) {
+            if (self.chain_prev) |prev| prev.chain_next = self.chain_next;
+            if (self.chain_next) |next| next.chain_prev = self.chain_prev;
+            if (ts.chain_head == self) ts.chain_head = self.chain_next;
+            if (ts.chain_tail == self) ts.chain_tail = self.chain_prev;
+        } else {
+            if (ts.chain_head != self) return .not_head;
+            Overlay.moveInto(&self.overlay, &ts.main_overlay);
+            // Advance the store's write clock: this is the one
+            // write-incorporation funnel (see TenantState.write_version).
+            // Bumped under ts.lock, which the read view also holds when
+            // capturing read_version — that serialization is what
+            // guarantees the no-lost-wake contract.
+            _ = ts.write_version.fetchAdd(1, .monotonic);
+            if (self.chain_next) |next| {
+                next.chain_prev = null;
+                ts.chain_head = next;
+            } else {
+                ts.chain_head = null;
+                ts.chain_tail = null;
+            }
+        }
+        // This top-level Txn leaves the chain (fast-path splice or slow-path
+        // head advance, both above). Account for it before freeing self.
+        std.debug.assert(ts.chain_depth > 0);
+        ts.chain_depth -= 1;
+        const consumed_speculation = self.saw_speculation;
+        self.parkReadViewLocked();
         self.overlay.deinit();
         manifest.allocator.destroy(self);
-        if (is_savepoint) {
-            manifest.metrics.recordSavepointCommit();
-        } else {
-            manifest.metrics.recordTxnCommit();
-            if (was_speculative) manifest.metrics.recordTxnCommitSpeculative();
-        }
+        manifest.metrics.recordTxnCommit();
+        if (consumed_speculation) manifest.metrics.recordTxnCommitSpeculative();
+        return .committed;
     }
 
     pub fn rollback(self: *Txn) void {
@@ -1705,43 +2023,89 @@ pub const Txn = struct {
         const manifest = self.manifest;
         ts.lock.lock();
         defer ts.lock.unlock();
-        const is_savepoint = self.parent != null;
-        if (self.parent == null) {
-            // Top-level: park this Txn's own batch read view for reuse
-            // (its result didn't depend on any speculative predecessor —
-            // a tail rollback can't invalidate the durable snapshot).
-            // Park *before* the cascade so freeSubtreeLocked sees a null
-            // read_view on self and its abort block stays a pure safety
-            // net for successors / tenant-death teardown.
-            self.parkReadViewLocked();
-            // Detach the tail of the chain at self, then free self + all
-            // successors.
-            if (self.chain_prev) |prev| {
-                prev.chain_next = null;
-                ts.chain_tail = prev;
-            } else {
-                ts.chain_head = null;
-                ts.chain_tail = null;
-            }
-            var freed: u32 = 0;
-            var cur: ?*Txn = self;
-            while (cur) |c| {
-                const next = c.chain_next;
-                c.freeSubtreeLocked();
-                freed += 1;
-                cur = next;
-            }
-            ts.chain_depth -= freed;
-        } else {
+        if (self.parent) |parent| {
             // Savepoint: detach from parent + free subtree.
-            self.parent.?.open_child = null;
+            parent.open_child = null;
             self.freeSubtreeLocked();
-        }
-        if (is_savepoint) {
             manifest.metrics.recordSavepointRollback();
-        } else {
-            manifest.metrics.recordTxnRollback();
+            return;
         }
+        if (self.invalidated) {
+            // Already detached from the chain by the cascade that
+            // invalidated it (it was the active tail — no successors and
+            // chain pointers nulled). Just free it; no chain surgery, which
+            // would clobber the unrelated surviving prefix.
+            self.parkReadViewLocked();
+            self.freeSubtreeLocked();
+            manifest.metrics.recordTxnRollback();
+            return;
+        }
+        self.rollbackFromLocked(false);
+    }
+
+    /// Top-level rollback body: detach the chain at `self` and free `self`
+    /// plus every forward chain-dependent (raft tail-truncation — a
+    /// successor that read this Txn's speculative overlay can never outlive
+    /// it). Caller holds tenant_state.lock and `parent == null`.
+    ///
+    /// `protect_active` gates the active-writer guard, and the gate is the
+    /// *entry point*, not Txn state: the by-handle `Manifest.rollbackFrom`
+    /// (rove's cross-worker cascade, where a successor may be live-dispatched
+    /// on another worker) passes true; the pointer `Txn.rollback`
+    /// (standalone / single-threaded / self-abort) passes false and frees
+    /// everything as before. When true, an un-parked (`seq == null`)
+    /// successor — necessarily the active tail in rove's pipeline — is
+    /// invalidated + detached rather than freed, so we never free underneath
+    /// a live handler; its owner self-aborts and frees it. When false a
+    /// `seq == null` node just means "pointer-only caller, never parked" and
+    /// is freed normally.
+    fn rollbackFromLocked(self: *Txn, protect_active: bool) void {
+        const manifest = self.manifest;
+        const ts = self.tenant_state;
+        // Park this Txn's own batch read view for reuse (a tail rollback
+        // can't invalidate the durable snapshot). Park *before* the cascade
+        // so freeSubtreeLocked sees a null read_view on self and its abort
+        // block stays a pure safety net for successors / tenant teardown.
+        self.parkReadViewLocked();
+        // Detach the chain at self, then free self + all successors.
+        if (self.chain_prev) |prev| {
+            prev.chain_next = null;
+            ts.chain_tail = prev;
+        } else {
+            ts.chain_head = null;
+            ts.chain_tail = null;
+        }
+        var cur: ?*Txn = self;
+        var removed: u32 = 0;
+        while (cur) |c| {
+            const next = c.chain_next;
+            if (protect_active and c != self and c.seq == null) {
+                // Active successor: still the live writer mid-dispatch on
+                // another worker (un-parked → seq == null). Freeing it
+                // underneath that handler would be a UAF. Mark it
+                // invalidated and detach it (it's the chain tail, so there
+                // is nothing after it); its owner self-aborts on the next
+                // op / commit / park, which frees it.
+                std.debug.assert(next == null);
+                c.invalidated = true;
+                c.chain_prev = null;
+                c.chain_next = null;
+                removed += 1; // detached from the chain, even though not freed
+                break;
+            }
+            c.freeSubtreeLocked();
+            removed += 1;
+            cur = next;
+        }
+        // Decrement by everything removed from the chain — freed successors
+        // AND the invalidated-detached active tail. The tail has left the
+        // chain even though its memory outlives this call (its owner frees
+        // it via the invalidated branch of rollback(), which does not touch
+        // chain_depth again). Counting only freed nodes would drift the
+        // gauge up by one on every active-tail invalidation.
+        std.debug.assert(ts.chain_depth >= removed);
+        ts.chain_depth -= removed;
+        manifest.metrics.recordTxnRollback();
     }
 
     /// Recursively free self + any open_child subtree. Caller holds
@@ -1993,6 +2357,19 @@ pub const StoreLease = struct {
         return txn;
     }
 
+    /// The store's current node-local write clock. Monotonic, advanced
+    /// once per write-incorporating commit (leader commit, follower
+    /// apply, and snapshot install all funnel through `Txn.commit`);
+    /// unaffected by durabilize, savepoint commit, and read-only
+    /// fast-path commits. Read it immediately after incorporating a
+    /// write batch and stamp it onto wake events for that batch — any
+    /// read view opened before the batch carries a strictly smaller
+    /// `Txn.readVersion()`. Lock-free atomic load (the lease pins the
+    /// TenantState, so no map lookup / dropStore race).
+    pub fn writeVersion(self: *StoreLease) u64 {
+        return self.tenant_state.write_version.load(.monotonic);
+    }
+
     /// Point-read against committed state (main_overlay + LMDB). Does
     /// NOT see this lease's in-flight Txns.
     pub fn get(self: *StoreLease, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
@@ -2114,6 +2491,16 @@ pub const StoreLease = struct {
     pub fn release(self: *StoreLease) void {
         const ts = self.tenant_state;
         const manifest = self.manifest;
+        // Park any open read views before yielding dispatch, so reader slots
+        // aren't held across the post-dispatch wait (e.g. while a Txn awaits
+        // raft commit). Done under ts.lock while dispatch_lock is still held
+        // — no concurrent lease holder exists, so an incoming holder's
+        // freshly-opened view can't be clobbered. Reads re-open lazily.
+        {
+            ts.lock.lock();
+            defer ts.lock.unlock();
+            ts.parkOpenReadViewsLocked();
+        }
         ts.dispatch_lock.unlock();
         manifest.metrics.recordRelease();
         // Drop the reference we took in acquire / tryAcquire. If this
@@ -2487,6 +2874,137 @@ pub fn loadSnapshot(manifest: *Manifest, reader: anytype) !u64 {
     while (it.next()) |entry| try entry.value_ptr.*.commit();
     txns.clearRetainingCapacity();
     return last_applied;
+}
+
+// ─── Per-tenant migration bundle ───────────────────────────────────
+//
+// `dumpSnapshot`/`loadSnapshot` move the WHOLE database (every store)
+// — that's the checkpoint path. No-downtime tenant migration needs the
+// opposite grain: one store's committed key-space, framed as a
+// self-contained blob that can be shipped to another node and loaded
+// under the same store id. (tenant_id == store_id is stable across a
+// move, so the bundle's embedded id IS the destination id — no
+// remapping.) This is the KV-state half of the V2 control plane's
+// detach/attach handshake; the raft-group lifecycle half lives in the
+// raft engine (`destroy_group` / `clear_tombstone` / epoch fence).
+//
+// Wire format (own magic so it can't be confused with a full snapshot):
+//
+//     [magic:u32 LE = BUNDLE_MAGIC]
+//     [version:u8 = BUNDLE_VERSION]
+//     [store_id:u64 LE]
+//     [n_pairs:u64 LE]
+//     repeat n_pairs:
+//       [key_len:u16 LE][val_len:u32 LE][key bytes][val bytes]
+//
+// Lengths-first framing mirrors `dumpSnapshot`'s per-pair layout; the
+// only widening is val_len u16→u32 so a bundle can carry values up to
+// `BUNDLE_VAL_MAX` (the snapshot format's u16 caps values at 64 KiB).
+// No CRC — same stance as `dumpSnapshot`: integrity is the transport's
+// / blob store's job. `loadTenantBundle` is hardened against hostile
+// bytes the same way `loadSnapshot` is (bounded buffers + length
+// checks, never trusts a length blindly) since bundles cross nodes.
+
+pub const BUNDLE_MAGIC: u32 = 0x4D494752; // "MIGR", little-endian
+pub const BUNDLE_VERSION: u8 = 1;
+const BUNDLE_KEY_MAX: usize = 256; // matches loadSnapshot's KMAX
+const BUNDLE_VAL_MAX: usize = 1 << 20; // 1 MiB, matches loadSnapshot's VMAX
+
+/// Header fields a bundle declares up front, returned by
+/// `peekTenantBundle` so a caller can route or validate (which tenant?
+/// how big?) before committing to a full load.
+pub const TenantBundleHeader = struct {
+    store_id: u64,
+    n_pairs: u64,
+};
+
+/// Serialize a single store's committed key-space out of `snap` into
+/// `writer`, framed as a migration bundle. `snap` is a consistent read
+/// view, so the two scans (count, then emit) agree. Snapshot ownership
+/// stays with the caller. A store with no keys produces a valid empty
+/// bundle (header with n_pairs=0) — useful for migrating an empty
+/// tenant.
+pub fn dumpTenantBundle(snap: *Snapshot, store_id: u64, writer: anytype) !void {
+    try writer.writeInt(u32, BUNDLE_MAGIC, .little);
+    try writer.writeByte(BUNDLE_VERSION);
+    try writer.writeInt(u64, store_id, .little);
+
+    // First pass: count, so n_pairs lands in the header ahead of the
+    // forward-only pair stream (lets `peekTenantBundle` size the load).
+    var n_pairs: u64 = 0;
+    {
+        var cur = try snap.scanPrefix(store_id, "");
+        defer cur.deinit();
+        while (try cur.next()) n_pairs += 1;
+    }
+    try writer.writeInt(u64, n_pairs, .little);
+
+    var cur = try snap.scanPrefix(store_id, "");
+    defer cur.deinit();
+    while (try cur.next()) {
+        const k = cur.key();
+        const v = cur.value();
+        if (k.len > BUNDLE_KEY_MAX) return error.BundleKeyTooLarge;
+        if (v.len > BUNDLE_VAL_MAX) return error.BundleValueTooLarge;
+        try writer.writeInt(u16, @intCast(k.len), .little);
+        try writer.writeInt(u32, @intCast(v.len), .little);
+        try writer.writeAll(k);
+        try writer.writeAll(v);
+    }
+}
+
+/// Read just a bundle's header. The caller typically peeks on one
+/// stream to learn the store id, then loads from a fresh stream over
+/// the same bytes (the header is not re-read by `loadTenantBundle`'s
+/// reader — they are independent passes).
+pub fn peekTenantBundle(reader: anytype) !TenantBundleHeader {
+    const magic = try reader.readInt(u32, .little);
+    if (magic != BUNDLE_MAGIC) return error.InvalidBundleFormat;
+    const version = try reader.readByte();
+    if (version != BUNDLE_VERSION) return error.UnsupportedBundleVersion;
+    return .{
+        .store_id = try reader.readInt(u64, .little),
+        .n_pairs = try reader.readInt(u64, .little),
+    };
+}
+
+/// Load a migration bundle into `manifest` under the store id the
+/// bundle names, creating the store if absent, and return that id. All
+/// pairs land in one committed Txn. Hardened against malformed input
+/// (bounded buffers + length checks) because bundles arrive over the
+/// network. On any error the Txn is rolled back, leaving the store
+/// untouched.
+pub fn loadTenantBundle(manifest: *Manifest, reader: anytype) !u64 {
+    const magic = try reader.readInt(u32, .little);
+    if (magic != BUNDLE_MAGIC) return error.InvalidBundleFormat;
+    const version = try reader.readByte();
+    if (version != BUNDLE_VERSION) return error.UnsupportedBundleVersion;
+    const store_id = try reader.readInt(u64, .little);
+    const n_pairs = try reader.readInt(u64, .little);
+
+    if (!(try manifest.hasStore(store_id))) try manifest.createStore(store_id);
+    // An empty tenant: the store now exists; nothing to write.
+    if (n_pairs == 0) return store_id;
+
+    var key_buf: [BUNDLE_KEY_MAX]u8 = undefined;
+    var val_buf: [BUNDLE_VAL_MAX]u8 = undefined;
+
+    var lease = try manifest.acquire(store_id);
+    defer lease.release();
+    var txn = try lease.beginTxn();
+    errdefer txn.rollback();
+
+    var i: u64 = 0;
+    while (i < n_pairs) : (i += 1) {
+        const klen = try reader.readInt(u16, .little);
+        const vlen = try reader.readInt(u32, .little);
+        if (klen > key_buf.len or vlen > val_buf.len) return error.InvalidBundleFormat;
+        try reader.readNoEof(key_buf[0..klen]);
+        try reader.readNoEof(val_buf[0..vlen]);
+        try txn.put(key_buf[0..klen], val_buf[0..vlen]);
+    }
+    try txn.commit();
+    return store_id;
 }
 
 // -----------------------------------------------------------------------------
@@ -3031,7 +3549,7 @@ test "ReadView: overlay, chain and LMDB all visible through the parked txn" {
     t.rollback();
 }
 
-test "ReadView: pinned within the view, read-latest after refreshReadView" {
+test "ReadView: auto-refreshes on durabilize (read-latest, no manual refresh)" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
@@ -3047,12 +3565,10 @@ test "ReadView: pinned within the view, read-latest after refreshReadView" {
 
     try w.put("k", "new");
     try w.commit(); // w is chain head → drains to main_overlay
-    try h.manifest.flush(); // → LMDB k=new
+    try h.manifest.flush(); // → LMDB k=new; bumps durable_write_version
 
-    // The view's snapshot predates the commit: still null.
-    try testing.expect((try t.get(testing.allocator, "k")) == null);
-
-    try t.refreshReadView();
+    // No manual refresh: the next read auto-renews the view (a durabilize
+    // landed since it was pinned) and sees the latest durable state.
     const got = (try t.get(testing.allocator, "k")).?;
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("new", got);
@@ -3060,15 +3576,47 @@ test "ReadView: pinned within the view, read-latest after refreshReadView" {
     t.rollback(); // also auto-ends the read view
 }
 
-test "ReadView: error cases and idempotent teardown" {
+test "ReadView: auto-parks on lease release (reader slot freed for the wait)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    try h.manifest.flush();
+
+    var lease = try h.manifest.acquire(1);
+    const t = try lease.beginTxn();
+    // A read lazily opens the view — no explicit beginReadView.
+    try testing.expect((try t.get(testing.allocator, "absent")) == null);
+    try testing.expect(t.read_view != null);
+
+    // Releasing the lease parks the view: the reader slot is handed back to
+    // the tenant's parked handle, and the Txn keeps living (speculative
+    // apply) without pinning a slot across the post-dispatch wait.
+    lease.release();
+    try testing.expect(t.read_view == null);
+    try testing.expect(t.tenant_state.parked_read_txn != null);
+
+    // The Txn is still usable: a later read re-opens the view lazily.
+    var lease2 = try h.manifest.acquire(1);
+    defer lease2.release();
+    try testing.expect((try t.get(testing.allocator, "absent")) == null);
+    try testing.expect(t.read_view != null);
+
+    t.rollback();
+}
+
+test "ReadView: begin/refresh/end are optional and idempotent" {
     var h = try Harness.init();
     defer h.deinit();
     try h.manifest.createStore(1);
 
     var t = try h.quickTxn(1);
-    try testing.expectError(error.NoReadView, t.refreshReadView());
+    // Reads work with no explicit begin — the view opens lazily.
+    try testing.expect((try t.get(testing.allocator, "nope")) == null);
+    // refresh with no view open is fine (it opens one); begin is
+    // idempotent (opening an already-open view just renews it).
+    try t.refreshReadView();
     try t.beginReadView();
-    try testing.expectError(error.ReadViewAlreadyOpen, t.beginReadView());
+    try t.beginReadView();
     t.endReadView();
     t.endReadView(); // idempotent
     try t.beginReadView(); // reopen ok
@@ -3087,14 +3635,17 @@ test "ReadView: a savepoint resolves to the top-level's view" {
     var t = try h.quickTxn(1);
     try t.beginReadView();
     var sp = try t.savepoint();
-    try testing.expectError(error.ReadViewAlreadyOpen, sp.beginReadView());
+    // The savepoint resolves to the top-level's view; begin on it just
+    // renews that same view (no separate per-savepoint view).
+    try sp.beginReadView();
 
     const got = (try sp.get(testing.allocator, "d")).?; // via top-level view
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("x", got);
 
     sp.endReadView(); // tears down the top-level's view
-    try testing.expectError(error.NoReadView, t.refreshReadView());
+    // A later read through the savepoint just re-opens it lazily — no error.
+    try testing.expect((try sp.get(testing.allocator, "absent")) == null);
 
     sp.rollback();
     t.rollback();
@@ -3271,6 +3822,613 @@ test "dumpSnapshot / loadSnapshot round-trip" {
     const ga = (try s.get(testing.allocator, "a")).?;
     defer testing.allocator.free(ga);
     try testing.expectEqualStrings("1", ga);
+}
+
+// ─── write-version clock (rove watch primitive) ──────────────────────
+// Contract (write-version-request.md §3): for any read view R and write
+// batch W on the same store, if W was NOT visible to reads under R then
+// writeVersion(W) > R.readVersion(). A visible write with a greater
+// version is permitted (a harmless spurious wake); a not-visible write
+// with version <= readVersion is the forbidden lost-wake direction.
+
+test "WriteVersion: a commit bumps writeVersion strictly above an earlier readVersion (no lost wake)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    // Writer opens first (chain head), reader second (chain tail) so the
+    // writer's commit takes the chain-head slow path.
+    var w = try h.quickTxn(1);
+    var r = try h.quickTxn(1);
+    try r.beginReadView();
+    const base = r.readVersion();
+
+    try w.put("k", "v"); // a key not yet incorporated when r opened
+    try w.commit(); // head → main_overlay; advances the clock
+
+    var lease = try h.manifest.acquire(1);
+    defer lease.release();
+    try testing.expect(lease.writeVersion() > base);
+
+    r.rollback();
+}
+
+test "WriteVersion: read continuity across durabilize + watch baseline below the write" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    // Seed + flush so the store's LMDB sub-DBI exists durably (it is
+    // created lazily at first durabilize) and the watermark is non-zero.
+    {
+        var seed = try h.quickTxn(1);
+        try seed.put("seed", "s");
+        try seed.commit();
+    }
+    try h.manifest.flush(); // durable_write_version → 1, DBI created
+
+    // W commits into main_overlay but is NOT yet durabilized.
+    var w = try h.quickTxn(1);
+    try w.put("k", "v");
+    try w.commit(); // write clock → 2; k lives only in main_overlay
+
+    // A read view opened now pins an LMDB snapshot that lacks k. Its
+    // readVersion is the durable watermark (1 — the seed flush), strictly
+    // below k's write version of 2.
+    var r = try h.quickTxn(1);
+    try r.beginReadView();
+    const rv = r.readVersion();
+    try testing.expectEqual(@as(u64, 1), rv);
+
+    // k is visible now via the live main_overlay walk.
+    {
+        const got = (try r.get(testing.allocator, "k")).?;
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("v", got);
+    }
+
+    // durabilize evicts k from main_overlay into LMDB. The view's pinned
+    // snapshot predates that commit — but the next read auto-renews (a
+    // durabilize landed since it was pinned), so k stays visible:
+    // read-your-committed-writes continuity, no eviction gap.
+    try h.manifest.flush();
+    {
+        const got = (try r.get(testing.allocator, "k")).?;
+        defer testing.allocator.free(got);
+        try testing.expectEqualStrings("v", got);
+    }
+
+    // Belt-and-suspenders for the watch contract: k's write version
+    // strictly exceeds the baseline r captured, so even had the read gone
+    // stale, a watch armed on r's view would still fire for k (never a
+    // lost wake). With a live-clock baseline rv would equal writeVersion.
+    var lease = try h.manifest.acquire(1);
+    defer lease.release();
+    try testing.expect(lease.writeVersion() > rv);
+
+    r.rollback();
+}
+
+test "WriteVersion: snapshot install (loadSnapshot) advances the clock" {
+    // In kvexp the leader-commit, follower-apply, and snapshot-install
+    // paths all funnel through Txn.commit; loadSnapshot is the distinct
+    // bulk path. A fresh store starts at 0, so any advance came from the
+    // load's per-tenant commits.
+    var src = try Harness.init();
+    defer src.deinit();
+    try src.manifest.createStore(10);
+    {
+        var t = try src.quickTxn(10);
+        try t.put("a", "1");
+        try t.commit();
+    }
+    try src.manifest.durabilize(7);
+
+    var snap = try src.manifest.openSnapshot();
+    defer snap.close();
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var writer_state = buf.writer(testing.allocator);
+    try dumpSnapshot(&snap, &writer_state);
+
+    var dst = try Harness.init();
+    defer dst.deinit();
+    var reader_state = std.io.fixedBufferStream(buf.items);
+    _ = try loadSnapshot(dst.manifest, reader_state.reader());
+
+    var lease = try dst.manifest.acquire(10);
+    defer lease.release();
+    try testing.expect(lease.writeVersion() > 0);
+}
+
+test "WriteVersion: durabilize does not advance the clock" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+    {
+        var t = try h.quickTxn(1);
+        try t.put("k", "v");
+        try t.commit(); // advances
+    }
+
+    var lease = try h.manifest.acquire(1);
+    defer lease.release();
+    const after_commit = lease.writeVersion();
+    try testing.expect(after_commit > 0);
+
+    // durabilize moves already-counted writes main_overlay → LMDB; not a
+    // new write, so the clock must hold steady.
+    try h.manifest.flush();
+    try testing.expectEqual(after_commit, lease.writeVersion());
+}
+
+test "WriteVersion: monotonic across commits; read-only fast-path commit does not advance" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    var lease = try h.manifest.acquire(1);
+    defer lease.release();
+
+    var prev = lease.writeVersion();
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        var t = try lease.beginTxn();
+        try t.put("k", "v");
+        try t.commit();
+        const now = lease.writeVersion();
+        try testing.expect(now > prev); // each write-incorporating commit strictly increases
+        prev = now;
+    }
+
+    // A read-only, speculation-free Txn takes the fast path (splice-out)
+    // and must NOT advance the clock.
+    var ro = try lease.beginTxn();
+    try testing.expect(ro.canSkipRaftPropose());
+    try ro.commit();
+    try testing.expectEqual(prev, lease.writeVersion());
+}
+
+test "WriteVersion: savepoint commit does not advance; spurious (>) is permitted for a visible write" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    var lease = try h.manifest.acquire(1);
+    defer lease.release();
+
+    var t = try lease.beginTxn();
+    try t.beginReadView();
+    const base = t.readVersion();
+
+    // Savepoint commit merges into the parent overlay — not yet
+    // confirmed — so the clock must not move.
+    var sp = try t.savepoint();
+    try sp.put("k", "v");
+    try sp.commit();
+    try testing.expectEqual(base, lease.writeVersion());
+
+    // Top-level commit confirms → the clock advances. The write is
+    // visible to t's own view yet now carries a version above base; §3
+    // permits this (spurious), and only the reverse would be a bug.
+    try t.commit();
+    try testing.expect(lease.writeVersion() > base);
+}
+
+// ─── chain mutation by handle ────────────────────────────────────────
+// Parked top-level Txns are committed / rolled back by opaque handle
+// (TxnHandle{tenant, seq}) from any worker — never through a raw *Txn — so
+// a cascade can't free memory another worker still points at. Resolution
+// is a chain walk by seq; gone handles resolve .absent (idempotent).
+// (The testing allocator panics on any double-free, so "no crash across
+// both call orders" is itself part of the assertion.)
+
+fn chainEmpty(h: *Harness, tenant: u64) bool {
+    return (h.manifest.tenants.get(tenant) orelse return true).chain_head == null;
+}
+
+test "ChainHandle: cross-worker convergent rollback (head-first)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    // Depth-2 chain: t1 head (seq 1), t2 successor (seq 2). quickTxn
+    // releases the lease; the txns live on, parked at their raft seqs and
+    // "owned" by two different workers' pools (here, two handles).
+    var t1 = try h.quickTxn(1);
+    try t1.put("a", "1");
+    var t2 = try h.quickTxn(1);
+    try t2.put("b", "2");
+    const h1 = try t1.park(1);
+    const h2 = try t2.park(2);
+
+    // Worker 1 rolls back the faulted head: cascade frees t1 AND t2.
+    try testing.expectEqual(RollbackResult.rolled_back, h.manifest.rollbackFrom(h1));
+    // Worker 2's later call on the (cascaded-away) successor: no-op.
+    try testing.expectEqual(RollbackResult.absent, h.manifest.rollbackFrom(h2));
+    try testing.expect(chainEmpty(&h, 1));
+}
+
+test "ChainHandle: cross-worker convergent rollback (successor-first)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    var t1 = try h.quickTxn(1);
+    try t1.put("a", "1");
+    var t2 = try h.quickTxn(1);
+    try t2.put("b", "2");
+    const h1 = try t1.park(1);
+    const h2 = try t2.park(2);
+
+    // Reverse order: rolling back the successor unwinds only it (deps point
+    // forward; the head never depended on its successor), leaving the head.
+    try testing.expectEqual(RollbackResult.rolled_back, h.manifest.rollbackFrom(h2));
+    try testing.expect(!chainEmpty(&h, 1)); // head still there
+    // The head is then unwound by its own call.
+    try testing.expectEqual(RollbackResult.rolled_back, h.manifest.rollbackFrom(h1));
+    try testing.expect(chainEmpty(&h, 1));
+}
+
+test "ChainHandle: commit not_head then resolve" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    var t1 = try h.quickTxn(1);
+    try t1.put("a", "1");
+    var t2 = try h.quickTxn(1);
+    try t2.put("b", "2");
+    const h1 = try t1.park(1);
+    const h2 = try t2.park(2);
+
+    // Successor first: defined .not_head return, no error, no side effect.
+    try testing.expectEqual(CommitResult.not_head, try h.manifest.commit(h2));
+    // Head commits, then the successor (now head) commits.
+    try testing.expectEqual(CommitResult.committed, try h.manifest.commit(h1));
+    try testing.expectEqual(CommitResult.committed, try h.manifest.commit(h2));
+    // Re-committing a gone handle is .absent, never an error.
+    try testing.expectEqual(CommitResult.absent, try h.manifest.commit(h1));
+    try testing.expect(chainEmpty(&h, 1));
+
+    // Both writes landed in committed state.
+    var lease = try h.manifest.acquire(1);
+    defer lease.release();
+    const a = (try lease.get(testing.allocator, "a")).?;
+    defer testing.allocator.free(a);
+    try testing.expectEqualStrings("1", a);
+    const b = (try lease.get(testing.allocator, "b")).?;
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings("2", b);
+}
+
+test "ChainHandle: idempotent rollback" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    var t = try h.quickTxn(1);
+    try t.put("a", "1");
+    const handle = try t.park(7);
+
+    try testing.expectEqual(RollbackResult.rolled_back, h.manifest.rollbackFrom(handle));
+    try testing.expectEqual(RollbackResult.absent, h.manifest.rollbackFrom(handle));
+    try testing.expect(chainEmpty(&h, 1));
+}
+
+test "ChainHandle: mixed — head commits, successor faults" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    var t1 = try h.quickTxn(1);
+    try t1.put("a", "1");
+    var t2 = try h.quickTxn(1);
+    try t2.put("b", "2");
+    const h1 = try t1.park(1);
+    const h2 = try t2.park(2);
+
+    // Head commits; successor independently faults and unwinds only itself.
+    try testing.expectEqual(CommitResult.committed, try h.manifest.commit(h1));
+    try testing.expectEqual(RollbackResult.rolled_back, h.manifest.rollbackFrom(h2));
+    try testing.expect(chainEmpty(&h, 1));
+
+    var lease = try h.manifest.acquire(1);
+    defer lease.release();
+    const a = (try lease.get(testing.allocator, "a")).?;
+    defer testing.allocator.free(a);
+    try testing.expectEqualStrings("1", a); // head's write survived
+    try testing.expect((try lease.get(testing.allocator, "b")) == null); // successor's didn't
+}
+
+test "ChainHandle: handle to an unknown tenant / seq resolves absent" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    // Unknown tenant.
+    try testing.expectEqual(RollbackResult.absent, h.manifest.rollbackFrom(.{ .tenant = 99, .seq = 1 }));
+    try testing.expectEqual(CommitResult.absent, try h.manifest.commit(.{ .tenant = 99, .seq = 1 }));
+    // Known tenant, unknown seq (nothing parked).
+    var t = try h.quickTxn(1);
+    _ = try t.park(5);
+    try testing.expectEqual(CommitResult.absent, try h.manifest.commit(.{ .tenant = 1, .seq = 404 }));
+    t.rollback(); // clean up via the pointer path
+}
+
+test "ChainHandle: active successor is invalidated, not freed, then self-aborts" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    // T1: a writer that finished its handler and parked (awaiting raft).
+    var t1 = try h.quickTxn(1);
+    try t1.put("a", "1");
+    const h1 = try t1.park(1);
+
+    // T2: the next activation, still mid-dispatch — un-parked (seq == null),
+    // chained after T1, speculatively reading T1's uncommitted write.
+    var lease = try h.manifest.acquire(1);
+    var t2 = try lease.beginTxn();
+    {
+        const seen = (try t2.get(testing.allocator, "a")).?; // T1's speculative value
+        defer testing.allocator.free(seen);
+        try testing.expectEqualStrings("1", seen);
+    }
+    try t2.put("b", "2");
+
+    // T1 faults: rove rolls it back by handle. The cascade reaches the
+    // active T2 — it must NOT be freed underneath its live handler. It is
+    // marked invalidated and detached. (rollbackFrom takes ts.lock only,
+    // never dispatch_lock, so holding the lease here does not deadlock.)
+    try testing.expectEqual(RollbackResult.rolled_back, h.manifest.rollbackFrom(h1));
+
+    // T2 is still alive (not freed); every op now self-aborts.
+    try testing.expectError(error.TxnInvalidated, t2.get(testing.allocator, "a"));
+    try testing.expectError(error.TxnInvalidated, t2.put("c", "3"));
+    try testing.expectError(error.TxnInvalidated, t2.commit());
+
+    // Owner self-aborts via the pointer it still holds. No double-free
+    // (the testing allocator would catch one).
+    t2.rollback();
+    lease.release();
+    try testing.expect(chainEmpty(&h, 1));
+}
+
+test "ChainHandle: invalidation surfaces at park (catch-all)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    var t1 = try h.quickTxn(1);
+    try t1.put("a", "1");
+    const h1 = try t1.park(1);
+
+    var lease = try h.manifest.acquire(1);
+    var t2 = try lease.beginTxn();
+    try t2.put("b", "2"); // handler did work but issues no further kv ops
+
+    try testing.expectEqual(RollbackResult.rolled_back, h.manifest.rollbackFrom(h1));
+
+    // Handler ran to completion and reaches park without touching kv again:
+    // the catch-all fires here so the doomed result never replicates.
+    try testing.expectError(error.TxnInvalidated, t2.park(2));
+
+    t2.rollback();
+    lease.release();
+    try testing.expect(chainEmpty(&h, 1));
+}
+
+test "ChainHandle: pointer rollback still frees un-parked successors (standalone)" {
+    // The active-writer guard is gated on the by-handle entry point, so the
+    // standalone pointer cascade is unchanged: rolling back a head frees its
+    // un-parked successors rather than marking them.
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    var t1 = try h.quickTxn(1);
+    try t1.put("a", "1");
+    var t2 = try h.quickTxn(1); // un-parked successor (seq == null)
+    try t2.put("b", "2");
+
+    t1.rollback(); // pointer path → frees t1 AND t2 (no marking)
+    try testing.expect(chainEmpty(&h, 1));
+    // No leak (testing allocator would flag t2 if it were only marked).
+}
+
+// ─── speculative-chain-depth metrics ─────────────────────────────────
+
+test "ChainMetrics: chain_depth tracks begin/commit; speculation + high-water counted" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    var lease = try h.manifest.acquire(1);
+    defer lease.release();
+    const ts = lease.tenant_state;
+    try testing.expectEqual(@as(u32, 0), ts.chain_depth);
+
+    var t1 = try lease.beginTxn();
+    try testing.expectEqual(@as(u32, 1), ts.chain_depth);
+    var t2 = try lease.beginTxn();
+    try testing.expectEqual(@as(u32, 2), ts.chain_depth);
+
+    // t2 speculatively reads t1's uncommitted write.
+    try t1.put("k", "v");
+    {
+        const seen = (try t2.get(testing.allocator, "k")).?;
+        defer testing.allocator.free(seen);
+        try testing.expectEqualStrings("v", seen);
+    }
+
+    try t1.commit(); // head, writer, read nothing speculative → not speculative
+    try testing.expectEqual(@as(u32, 1), ts.chain_depth);
+    try t2.commit(); // now head; consumed t1's speculation
+    try testing.expectEqual(@as(u32, 0), ts.chain_depth);
+
+    const m = h.manifest.metricsSnapshot();
+    try testing.expectEqual(@as(u64, 2), m.txn_begin_total); // t1 + t2
+    try testing.expectEqual(@as(u64, 1), m.txn_commit_speculative_total); // only t2
+    try testing.expectEqual(@as(u64, 2), m.chain_depth_max); // peaked at 2
+    try testing.expectEqual(@as(u64, 3), m.chain_depth_sum); // sampled at begin: 1 + 2
+    // mean chain depth = chain_depth_sum / txn_begin_total = 3/2.
+}
+
+test "ChainMetrics: pointer rollback cascade decrements chain_depth by all removed" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    var lease = try h.manifest.acquire(1);
+    defer lease.release();
+    const ts = lease.tenant_state;
+
+    var t1 = try lease.beginTxn();
+    _ = try lease.beginTxn(); // t2
+    _ = try lease.beginTxn(); // t3
+    try testing.expectEqual(@as(u32, 3), ts.chain_depth);
+
+    t1.rollback(); // cascade frees t1 + t2 + t3
+    try testing.expectEqual(@as(u32, 0), ts.chain_depth);
+}
+
+test "ChainMetrics: invalidated-detached active tail counts as removed (Branch-2 reconciliation)" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try h.manifest.createStore(1);
+
+    // T1 parked (awaiting raft).
+    var t1 = try h.quickTxn(1);
+    try t1.put("a", "1");
+    const h1 = try t1.park(1);
+
+    // T2 active (un-parked), chained after T1.
+    var lease = try h.manifest.acquire(1);
+    const ts = lease.tenant_state;
+    var t2 = try lease.beginTxn();
+    try t2.put("b", "2");
+    try testing.expectEqual(@as(u32, 2), ts.chain_depth);
+
+    // T1 faults: by-handle cascade frees T1 and invalidates+detaches T2.
+    // Depth must drop to 0 — counting BOTH the freed node and the
+    // detached-but-not-freed tail (the §3 reconciliation; counting only
+    // freed nodes would leave it at 1).
+    try testing.expectEqual(RollbackResult.rolled_back, h.manifest.rollbackFrom(h1));
+    try testing.expectEqual(@as(u32, 0), ts.chain_depth);
+
+    // T2 self-aborts: it was already removed from the chain, so depth
+    // stays 0 (not decremented twice).
+    t2.rollback();
+    try testing.expectEqual(@as(u32, 0), ts.chain_depth);
+
+    lease.release();
+}
+
+test "dumpTenantBundle / loadTenantBundle round-trip under the same store id" {
+    var src = try Harness.init();
+    defer src.deinit();
+    try src.manifest.createStore(42);
+    {
+        var t = try src.quickTxn(42);
+        try t.put("k1", "v1");
+        try t.put("k2", "v2");
+        try t.commit();
+    }
+
+    var snap = try src.manifest.openSnapshot();
+    defer snap.close();
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var writer_state = buf.writer(testing.allocator);
+    try dumpTenantBundle(&snap, 42, &writer_state);
+
+    // peek reports the header without disturbing a separate load pass.
+    var peek_state = std.io.fixedBufferStream(buf.items);
+    const hdr = try peekTenantBundle(peek_state.reader());
+    try testing.expectEqual(@as(u64, 42), hdr.store_id);
+    try testing.expectEqual(@as(u64, 2), hdr.n_pairs);
+
+    var dst = try Harness.init();
+    defer dst.deinit();
+    var reader_state = std.io.fixedBufferStream(buf.items);
+    const loaded_id = try loadTenantBundle(dst.manifest, reader_state.reader());
+    try testing.expectEqual(@as(u64, 42), loaded_id);
+
+    var s = try dst.manifest.acquire(42);
+    defer s.release();
+    const v1 = (try s.get(testing.allocator, "k1")).?;
+    defer testing.allocator.free(v1);
+    try testing.expectEqualStrings("v1", v1);
+    const v2 = (try s.get(testing.allocator, "k2")).?;
+    defer testing.allocator.free(v2);
+    try testing.expectEqualStrings("v2", v2);
+}
+
+test "dumpTenantBundle: carries only the named tenant, not its neighbours" {
+    var src = try Harness.init();
+    defer src.deinit();
+    try src.manifest.createStore(10);
+    try src.manifest.createStore(20);
+    {
+        var t = try src.quickTxn(10);
+        try t.put("mine", "yes");
+        try t.commit();
+    }
+    {
+        var t = try src.quickTxn(20);
+        try t.put("theirs", "no");
+        try t.commit();
+    }
+
+    var snap = try src.manifest.openSnapshot();
+    defer snap.close();
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var writer_state = buf.writer(testing.allocator);
+    try dumpTenantBundle(&snap, 10, &writer_state);
+
+    var dst = try Harness.init();
+    defer dst.deinit();
+    var reader_state = std.io.fixedBufferStream(buf.items);
+    _ = try loadTenantBundle(dst.manifest, reader_state.reader());
+
+    // Tenant 10's key arrived; tenant 20 was never in the bundle, so
+    // its store doesn't even exist at the destination.
+    var s = try dst.manifest.acquire(10);
+    defer s.release();
+    const mine = (try s.get(testing.allocator, "mine")).?;
+    defer testing.allocator.free(mine);
+    try testing.expectEqualStrings("yes", mine);
+    try testing.expect(!(try dst.manifest.hasStore(20)));
+}
+
+test "loadTenantBundle: an empty tenant round-trips (store created, no keys)" {
+    var src = try Harness.init();
+    defer src.deinit();
+    try src.manifest.createStore(7);
+
+    var snap = try src.manifest.openSnapshot();
+    defer snap.close();
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var writer_state = buf.writer(testing.allocator);
+    try dumpTenantBundle(&snap, 7, &writer_state);
+
+    var dst = try Harness.init();
+    defer dst.deinit();
+    var reader_state = std.io.fixedBufferStream(buf.items);
+    const id = try loadTenantBundle(dst.manifest, reader_state.reader());
+    try testing.expectEqual(@as(u64, 7), id);
+    try testing.expect(try dst.manifest.hasStore(7));
+}
+
+test "loadTenantBundle: rejects a bundle with the wrong magic" {
+    var dst = try Harness.init();
+    defer dst.deinit();
+    const garbage = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x01, 0, 0, 0, 0 };
+    var reader_state = std.io.fixedBufferStream(garbage[0..]);
+    try testing.expectError(error.InvalidBundleFormat, loadTenantBundle(dst.manifest, reader_state.reader()));
 }
 
 test "dropStore: while txns open, drops everything cleanly" {
@@ -3748,70 +4906,6 @@ test "Metrics: counters and gauges reflect hot-path activity" {
     // Poison increments its counter.
     h.manifest._testPoison();
     try testing.expectEqual(@as(u64, 1), h.manifest.metricsSnapshot().poison_total);
-}
-
-test "Metrics: chain depth + speculation counters" {
-    var h = try Harness.init();
-    defer h.deinit();
-    try h.manifest.createStore(1);
-    try h.manifest.flush();
-
-    // Baseline: nothing begun yet.
-    {
-        const m = h.manifest.metricsSnapshot();
-        try testing.expectEqual(@as(u64, 0), m.txn_begin_total);
-        try testing.expectEqual(@as(u64, 0), m.chain_depth_sum);
-        try testing.expectEqual(@as(u64, 0), m.chain_depth_max);
-        try testing.expectEqual(@as(u64, 0), m.txn_commit_speculative_total);
-    }
-
-    // Three stacked Txns — chain depth climbs 1 → 2 → 3, one sample
-    // per beginTxn.
-    var t1 = try h.quickTxn(1);
-    try t1.put("a", "1");
-    var t2 = try h.quickTxn(1);
-    var t3 = try h.quickTxn(1);
-    // t3 reads a key only the uncommitted t1 wrote → speculation.
-    {
-        const got = (try t3.get(testing.allocator, "a")).?;
-        defer testing.allocator.free(got);
-        try testing.expectEqualStrings("1", got);
-    }
-    {
-        const m = h.manifest.metricsSnapshot();
-        try testing.expectEqual(@as(u64, 3), m.txn_begin_total);
-        try testing.expectEqual(@as(u64, 1 + 2 + 3), m.chain_depth_sum);
-        try testing.expectEqual(@as(u64, 3), m.chain_depth_max);
-        try testing.expectEqual(@as(u32, 3), h.manifest.tenants.get(1).?.chain_depth);
-    }
-
-    // Commit in chain order. t1 (writer) and t2 (empty fast path) are
-    // speculation-free; only t3 consumed an uncommitted predecessor.
-    try t1.commit();
-    try t2.commit();
-    try t3.commit();
-    {
-        const m = h.manifest.metricsSnapshot();
-        try testing.expectEqual(@as(u64, 3), m.txn_commit_total);
-        try testing.expectEqual(@as(u64, 1), m.txn_commit_speculative_total);
-        // Every Txn left the chain — depth is back to zero.
-        try testing.expectEqual(@as(u32, 0), h.manifest.tenants.get(1).?.chain_depth);
-    }
-
-    // A rollback cascade decrements depth for every Txn it frees.
-    var r1 = try h.quickTxn(1);
-    _ = try h.quickTxn(1); // r2 — freed by the cascade
-    _ = try h.quickTxn(1); // r3 — freed by the cascade
-    try testing.expectEqual(@as(u32, 3), h.manifest.tenants.get(1).?.chain_depth);
-    r1.rollback(); // detaches r1, frees r1 + r2 + r3
-    {
-        const m = h.manifest.metricsSnapshot();
-        try testing.expectEqual(@as(u64, 6), m.txn_begin_total);
-        try testing.expectEqual(@as(u64, 1 + 2 + 3 + 1 + 2 + 3), m.chain_depth_sum);
-        try testing.expectEqual(@as(u32, 0), h.manifest.tenants.get(1).?.chain_depth);
-        // Peak stayed at 3 — the cascade round never went deeper.
-        try testing.expectEqual(@as(u64, 3), m.chain_depth_max);
-    }
 }
 
 test "Metrics: duration histograms record durabilize and snapshot timing" {
