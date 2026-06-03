@@ -1576,6 +1576,19 @@ pub fn resumeBoundFetchChain(
         break :blk cnt.pending;
     };
 
+    // Handler-surface Phase 2/3: a bound-fetch chunk handler
+    // (`onFetchChunk`) opens the streamed response via `stream.start()` /
+    // `stream.write()` + `next()`. Wire the chunk accumulator so
+    // `finishResponse`'s bridge produces the `RunOutcome.stream` that the
+    // `.stream` arm (`resumeIntoStream`) turns into the cont→stream
+    // transition. (The ambient head is captured by runModule when
+    // `stream_started`.)
+    var stream_chunks: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (stream_chunks.items) |ch| allocator.free(ch);
+        stream_chunks.deinit(allocator);
+    }
+
     var req: Request = .{
         .method = "POST",
         .path = spath,
@@ -1589,6 +1602,7 @@ pub fn resumeBoundFetchChain(
         .correlation_id = correlation_id,
         .activation_source = .fetch_chunk,
         .activation_fetch_id = ev.fetch_id,
+        .pending_stream_chunks = &stream_chunks,
         .is_system_module = builtin_modules_mod.isBuiltinPath(path),
         .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
         .resume_if_bound_ctx = @ptrCast(worker),

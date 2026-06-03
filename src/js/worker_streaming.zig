@@ -933,6 +933,15 @@ pub fn resumeBoundFetchStream(
         break :blk 0;
     };
 
+    // Handler-surface Phase 2/3: a bound-fetch chunk handler streaming a
+    // frame back via `stream.write()` + `next()` re-parks the stream —
+    // wire the chunk accumulator for `finishResponse`'s bridge.
+    var stream_chunks: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (stream_chunks.items) |ch| allocator.free(ch);
+        stream_chunks.deinit(allocator);
+    }
+
     var req: Request = .{
         .method = "POST",
         .path = spath,
@@ -946,6 +955,7 @@ pub fn resumeBoundFetchStream(
         .correlation_id = chain_ctx.correlation_id,
         .activation_source = .fetch_chunk,
         .activation_fetch_id = ev.fetch_id,
+        .pending_stream_chunks = &stream_chunks,
         .is_system_module = builtin_modules_mod.isBuiltinPath(path),
         .activation_write_pressure_dropped = dropped_chunks_snapshot,
         .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,

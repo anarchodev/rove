@@ -30,39 +30,27 @@ export default function () {
         response.status = 400;
         return "missing ?url=";
     }
-    http.fetch({
-        url: url,
-        method: "GET",
-        // Auto-binds: this handler returns next()/stream() (held), so
-        // chunks resume onFetchChunk — no `bind` keyword needed.
-        // stream:true splits the upstream body into multiple
-        // fetch_chunk events at max_response_chunk_bytes granularity
-        // — this is what exercises the multi-chunk Gap #1 path.
-        stream: true,
-        max_response_chunk_bytes: 64,
-        // on_chunk is still required by the binding (field is the
-        // module-path resolver for the unbound Pattern A path; for
-        // bound fetches the resume engine ignores it and dispatches
-        // the held chain's onFetchChunk instead).
-        on_chunk: "boundproxy",
-        ctx: { tag: "boundsmoke" },
-    });
+    // on.fetch is connection-scoped: this held handler returns next(),
+    // so the fetch binds and chunks resume onFetchChunk. stream:true
+    // splits the upstream body into multiple fetch_chunk events at
+    // max_response_chunk_bytes granularity — the multi-chunk Gap #1 path.
+    on.fetch(url, { stream: true, max_response_chunk_bytes: 64 });
     return __rove_next("boundproxy/index", { ctx: { tag: "boundsmoke" } });
 }
 
-// Per upstream chunk on a bound fetch. Streams "chunk:<text>" back
-// to the held client; closes on the terminal (done=true) chunk.
+// Per upstream chunk on a bound fetch. Streams "chunk:<text>" back to
+// the held client via stream.write; closes on the terminal (done=true)
+// chunk.
 export function onFetchChunk() {
     if (request.done) {
         // Terminal chunk — close the stream.
         return "";
     }
     const text = new TextDecoder().decode(request.body);
-    return __rove_stream({
-        // Headers ride only on the first activation (engine drops
-        // them on subsequent stream activations).
-        headers: { "content-type": "text/plain" },
-        write: ["chunk:" + text],
-        ctx: { tag: "boundsmoke" },
-    });
+    // Headers ride only on the first activation (ignored once the head
+    // is committed).
+    response.headers = { "content-type": "text/plain" };
+    stream.start();
+    stream.write("chunk:" + text);
+    return __rove_next("boundproxy/index", { ctx: { tag: "boundsmoke" } });
 }
