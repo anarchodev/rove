@@ -3244,6 +3244,15 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // registers (no register-then-cleanup churn either).
             const held = cont_opt != null or stream_meta_opt != null;
             for (pending_fetches.items) |*pf| {
+                // Handler-surface Phase 3: an `on.fetch` (connection-
+                // scoped) from a NON-held activation is INERT — drop it
+                // (no unbound fire). The model's rule: all `on.*` are for
+                // the current connection; connectionless outbound is
+                // `webhook.send` (docs/handler-shape.md §2.4).
+                if (pf.connection_scoped and !held) {
+                    pf.deinit(allocator);
+                    continue;
+                }
                 // A `webhook.send` fetch (bound_send_id set) uses the
                 // §6.4 bound_send_owners callback routing, NOT auto-bind
                 // — never bind it (it would steal chunks from the
@@ -3252,8 +3261,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 if (pf.bind) {
                     _ = @TypeOf(worker.*).registerBoundFetchTrampoline(@ptrCast(worker), pf.id, ent);
                 }
+                // Kept (bound or unbound-detached fire) → move to the
+                // batch; dropped connection-scoped fetches were freed
+                // above and are NOT appended.
+                batch_pending_fetches.appendAssumeCapacity(pf.*);
             }
-            for (pending_fetches.items) |pf| batch_pending_fetches.appendAssumeCapacity(pf);
             pending_fetches.clearRetainingCapacity();
         }
 

@@ -148,6 +148,7 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
         .detach = row.detach,
         .bound_send_id = row.bound_send_id,
         .name = row.name,
+        .connection_scoped = row.connection_scoped,
     });
     // Ownership transferred — clear the carrier's slices so its
     // deinit is a no-op.
@@ -160,6 +161,125 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
     row.ctx_json = &.{};
     row.bound_send_id = &.{};
     row.name = &.{};
+}
+
+/// `_system.on.fetch(url, opts?, { to? })` — connection-scoped outbound
+/// (handler-surface Phase 3, `docs/handler-shape.md` §2.3). Issues an
+/// HTTP request whose result wakes THIS connection: chunks resume the
+/// held chain's `{to}` export (default `onFetchChunk`). Connection-only
+/// — if the activation doesn't end up holding the socket the fetch is
+/// INERT (dropped at the success seam, no unbound fire); connectionless
+/// outbound is `webhook.send`. The transient twin of `webhook.send`;
+/// composes over the same fetch primitive as `http.fetch` but always
+/// binds-or-drops, so `on_chunk` (the unbound module path) is unused.
+pub fn jsOnFetch(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    const state = globals.getState(ctx);
+    if (argc < 1 or !c.JS_IsString(argv[0])) {
+        _ = c.JS_ThrowTypeError(ctx, "on.fetch(url, opts?, {to?}) requires a url string");
+        return js_exception;
+    }
+    // `opts` (arg1) is optional; the field readers need a real object
+    // (reading a prop off `undefined` throws), so substitute a fresh
+    // empty object when absent.
+    const made_opts = !(argc >= 2 and c.JS_IsObject(argv[1]));
+    const opts: c.JSValue = if (made_opts) c.JS_NewObject(ctx) else argv[1];
+    defer if (made_opts) c.JS_FreeValue(ctx, opts);
+    const to_obj: c.JSValue = if (argc >= 3) argv[2] else js_undefined;
+
+    var row = buildOnFetchRow(ctx, state, argv[0], opts, to_obj) catch |err| switch (err) {
+        error.JsException => return js_exception,
+        else => {
+            state.pending_kv_error = err;
+            return js_exception;
+        },
+    };
+    state.http_fetch_index += 1;
+    const res = c.JS_NewStringLen(ctx, row.id.ptr, row.id.len);
+    appendPendingFetch(state, &row) catch |err| {
+        c.JS_FreeValue(ctx, res);
+        row.deinit(state.allocator);
+        state.pending_kv_error = err;
+        return js_exception;
+    };
+    row.deinit(state.allocator);
+    return res;
+}
+
+/// Build a `BuiltFetch` for `on.fetch`: `url` is a positional string
+/// (arg0, not `opts.url`); the shared transport fields come from `opts`;
+/// `{to}` (an optional `{ to: "export" }` object) selects the bound
+/// export via `name`. `connection_scoped = true`, `detach = false`,
+/// `on_chunk` empty (a connection-scoped fetch never fires unbound).
+fn buildOnFetchRow(
+    ctx: ?*c.JSContext,
+    state: *globals.DispatchState,
+    url_val: c.JSValue,
+    opts: c.JSValue,
+    to_obj: c.JSValue,
+) !BuiltFetch {
+    const a = state.allocator;
+    var fetched: FetchExtracted = .{};
+    errdefer fetched.deinit(a);
+
+    fetched.id = try deriveFetchIdHex(a, state.request_id, state.http_fetch_index);
+    {
+        var len: usize = 0;
+        const cstr = c.JS_ToCStringLen(ctx, &len, url_val);
+        if (cstr == null) return error.JsException;
+        defer c.JS_FreeCString(ctx, cstr);
+        fetched.url = try a.dupe(u8, @as([*]const u8, @ptrCast(cstr))[0..len]);
+    }
+    fetched.method = try dupeJsString(ctx, a, opts, "method", "GET");
+    fetched.body = try dupeJsString(ctx, a, opts, "body", "");
+    fetched.headers_json = try dupeJsObjectAsJson(ctx, a, opts, "headers", "{}");
+    fetched.ctx_json = try dupeJsObjectAsJson(ctx, a, opts, "ctx", "null");
+    // Connection-scoped fetches always bind-or-drop, so the unbound
+    // `on_chunk` module path is never consulted — leave it empty.
+    fetched.on_chunk_module = try a.dupe(u8, "");
+    fetched.bound_send_id = try a.dupe(u8, "");
+    // `{to}` → the bound-export override (`name`). Empty = default
+    // `onFetchChunk`. Read from `to_obj.to` (the third arg).
+    fetched.name = if (c.JS_IsObject(to_obj))
+        try dupeJsString(ctx, a, to_obj, "to", "")
+    else
+        try a.dupe(u8, "");
+    if (fetched.name.?.len > 0 and !isValidExportName(fetched.name.?)) {
+        _ = c.JS_ThrowTypeError(
+            ctx,
+            "on.fetch: `to` must be a JS identifier (alphanumeric/underscore/$, first char non-digit)",
+        );
+        return error.JsException;
+    }
+
+    const stream = try getBoolField(ctx, opts, "stream", false);
+    const timeout_ms_i32 = try getIntField(ctx, opts, "timeout_ms", 30_000);
+    const max_chunk_i32 = try getIntField(ctx, opts, "max_response_chunk_bytes", 256 * 1024);
+    const max_total_i64 = try getInt64Field(ctx, opts, "max_total_response_bytes", 50 * 1024 * 1024);
+
+    const row: BuiltFetch = .{
+        .id = fetched.id.?,
+        .url = fetched.url.?,
+        .method = fetched.method.?,
+        .headers_json = fetched.headers_json.?,
+        .body = fetched.body.?,
+        .timeout_ms = @intCast(@max(timeout_ms_i32, 1)),
+        .on_chunk_module = fetched.on_chunk_module.?,
+        .ctx_json = fetched.ctx_json.?,
+        .stream = stream,
+        .max_response_chunk_bytes = @intCast(@max(max_chunk_i32, 1)),
+        .max_total_response_bytes = if (max_total_i64 < 1) 1 else @intCast(max_total_i64),
+        .detach = false,
+        .bound_send_id = fetched.bound_send_id.?,
+        .name = fetched.name.?,
+        .connection_scoped = true,
+    };
+    fetched = .{}; // ownership transferred
+    return row;
 }
 
 /// `http.cancelFetch({id})` — cancel a not-yet-completed fetch.
@@ -326,6 +446,16 @@ const BuiltFetch = struct {
     /// switch(request.fetchId) at the top of one shared handler.
     /// Allocator-owned dupe.
     name: []u8 = &.{},
+    /// Handler-surface Phase 3: true ⇒ this fetch was issued via
+    /// `on.fetch` — a CONNECTION trigger. Connection-scoped by
+    /// construction: it binds to the held chain (chunks → `{to}` /
+    /// `onFetchChunk`) when the activation holds the socket, and is
+    /// INERT (dropped, no unbound fire) when it doesn't — the model's
+    /// "all `on.*` are for the current connection; connectionless
+    /// outbound is `webhook.send`" rule (`docs/handler-shape.md` §2.4).
+    /// Plain `http.fetch` leaves this false (fires unbound when not
+    /// held).
+    connection_scoped: bool = false,
 
     fn deinit(self: *BuiltFetch, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
