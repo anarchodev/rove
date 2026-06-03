@@ -61,6 +61,15 @@
 // can dedupe by `(id, version)` consistently across first-fire-from-
 // handler and retry-from-sweep.
 
+// Handler-surface Phase 3: the customer `http.fetch` spelling is
+// retired — webhook.send composes durability over the internal fetch
+// PRIMITIVE (`_system.http.fetch`), not the public surface. Capture it
+// at eval time (before the `_harden.js` `delete globalThis._system`
+// step); the `send` closure below uses the captured reference, which
+// stays valid post-harden (only the globalThis property is removed, not
+// the object). Same closure-capture posture as globals/on.js.
+const sysHttp = _system.http;
+
 /**
  * Durable outbound HTTP — at-least-once delivery, replay-deterministic.
  * Customer code that hardcoded the previous `http.send` surface should
@@ -208,7 +217,7 @@ globalThis.webhook = {
     // path stays correct either way (the 25s mandatory deadline
     // covers both paths).
     if (!scheduled) {
-      http.fetch({
+      sysHttp.fetch({
         url: opts.url,
         method: opts.method || "POST",
         body: opts.body || "",

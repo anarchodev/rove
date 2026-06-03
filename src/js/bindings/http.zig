@@ -30,6 +30,14 @@
 //!   });
 //!   http.cancelFetch({ id });
 //!
+//! Handler-surface Phase 3: `_system.http.fetch` (`jsHttpFetch`) is now
+//! the INTERNAL outbound primitive — the customer `http.fetch` spelling
+//! is retired. The two public outbound surfaces compose over it:
+//! `on.fetch` (`jsOnFetch`, connection-scoped, binds to the held chain)
+//! and `webhook.send` (the JS shim, durable + connectionless). Plain
+//! `_system.http.fetch` is the always-unbound Pattern-A transport the
+//! webhook/email shims use.
+//!
 //! See the design docs for full semantics. This file is the
 //! C-level glue; argument validation + accumulator append + nothing
 //! else.
