@@ -1,30 +1,37 @@
-// Streaming-handlers — multi-frame timer-wake exerciser.
-// The handler returns `__rove_stream({...})` with a single SSE
-// `:heartbeat\n\n` chunk and a `waitFor.timer.intervalMs` of 200ms.
-// The runtime ships the chunk, parks the chain, then re-invokes the
-// handler every 200ms (`request.activation.kind === "wake_batch"`,
-// with a timer entry in `activation.wakes`) which emits another
-// `:heartbeat\n\n`. The smoke (scripts/streaming_heartbeat_smoke.py)
-// opens the stream, reads at least three heartbeats over ~700ms,
-// then closes — verifying the chunked-DATA + timer-wake lifecycle
-// end-to-end.
+// Streaming-handlers — multi-frame timer-wake exerciser (handler-
+// surface Phase 2 `stream.*` surface). The inbound hop opens the stream
+// with a single SSE `:heartbeat\n\n` frame and arms `on.timer(200)`;
+// the runtime re-invokes the handler every 200ms
+// (`request.activation.kind === "wake_batch"`, a timer entry in
+// `activation.wakes`) and it emits another `:heartbeat\n\n`. The smoke
+// (scripts/streaming_heartbeat_smoke.py) reads at least three
+// heartbeats over ~700ms, then closes — verifying the chunked-DATA +
+// timer-wake lifecycle end to end.
 //
-// The connection has NO held handle — the chain IS the connection
-// by construction (project-connection-actor-unified-trigger). The
-// platform decides when the stream ends; right now that's either:
-//   - client disconnect (h2 reports the entity through to
-//     `response_out`, `cleanupResponses` reaps the cell), or
-//   - the per-stream activation cap (MAX_STREAM_ACTIVATIONS).
+// The connection has NO held handle — the chain IS the connection by
+// construction (project-connection-actor-unified-trigger). The platform
+// decides when the stream ends: client disconnect, or the per-stream
+// activation cap (MAX_STREAM_ACTIVATIONS).
 export default function () {
-    return __rove_stream({
-        status: 200,
-        headers: {
+    const a = request.activation;
+    if (a.kind === "inbound") {
+        response.status = 200;
+        response.headers = {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
-        },
-        write: [
-            ":heartbeat\n\n",
-        ],
-        waitFor: { timer: { intervalMs: 200 } },
-    });
+        };
+        stream.start();
+        stream.write(":heartbeat\n\n");
+        on.timer(200);
+        return __rove_next("heartbeat/index", {});
+    }
+    if (a.kind === "wake_batch") {
+        stream.start(); // keep the stream alive even if zero frames this wake
+        for (const w of a.wakes) {
+            if (w.kind === "timer") stream.write(":heartbeat\n\n");
+        }
+        on.timer(200);
+        return __rove_next("heartbeat/index", {});
+    }
+    return ""; // close
 }

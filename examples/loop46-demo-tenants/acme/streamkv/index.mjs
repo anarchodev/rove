@@ -25,6 +25,7 @@ export default function () {
         return __rove_next("streamkv/index", {});     // hold the socket
     }
     if (a.kind === "wake_batch") {
+        stream.start(); // keep the stream alive even on a zero-frame wake
         // One frame per kv entry in the §9.4 batch (temporal order).
         for (const w of a.wakes) {
             if (w.kind !== "kv") continue;
