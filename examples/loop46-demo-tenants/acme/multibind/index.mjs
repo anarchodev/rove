@@ -35,14 +35,10 @@ export default function () {
         response.status = 400;
         return "missing ?u1=&u2=";
     }
-    const id1 = http.fetch({
-        url: u1, method: "GET", stream: true,
-        max_response_chunk_bytes: 64, on_chunk: "multibind", ctx: {},
-    });
-    const id2 = http.fetch({
-        url: u2, method: "GET", stream: true,
-        max_response_chunk_bytes: 64, on_chunk: "multibind", ctx: {},
-    });
+    // Two connection-scoped fetches on the one held chain; chunks for
+    // both resume onFetchChunk (keyed by request.fetchId).
+    const id1 = on.fetch(u1, { stream: true, max_response_chunk_bytes: 64 });
+    const id2 = on.fetch(u2, { stream: true, max_response_chunk_bytes: 64 });
     // Remember the two fetch ids (in issue order) + reset state.
     kv.set("mb/id1", id1);
     kv.set("mb/id2", id2);

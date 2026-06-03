@@ -35,15 +35,8 @@ export default function () {
     }
     // Fresh accumulator per run.
     kv.set("spoolsink/full", "");
-    http.fetch({
-        url: url,
-        method: "GET",
-        // Auto-binds (held handler) → chunks resume onFetchChunk.
-        stream: true,
-        max_response_chunk_bytes: 64,
-        on_chunk: "spoolsink",
-        ctx: { tag: "spoolsink" },
-    });
+    // Connection-scoped (held handler) → chunks resume onFetchChunk.
+    on.fetch(url, { stream: true, max_response_chunk_bytes: 64 });
     return __rove_next("spoolsink/index", { ctx: { tag: "spoolsink" } });
 }
 

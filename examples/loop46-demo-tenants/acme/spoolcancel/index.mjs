@@ -27,10 +27,7 @@ export default function () {
         return "missing ?url=";
     }
     kv.set("sc/count", "0");
-    http.fetch({
-        url: url, method: "GET", stream: true,
-        max_response_chunk_bytes: 64, on_chunk: "spoolcancel", ctx: {},
-    });
+    on.fetch(url, { stream: true, max_response_chunk_bytes: 64 });
     return __rove_next("spoolcancel/index", { ctx: {} });
 }
 

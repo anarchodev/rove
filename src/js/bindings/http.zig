@@ -71,15 +71,11 @@ pub fn jsHttpFetch(
             return js_exception;
         },
     };
-    // `docs/auto-bind-plan.md`: bound-fetch registration moved OUT of
-    // the binding call to the handler-success seam in
-    // `worker_dispatch.zig` — it can only be decided once the handler's
-    // outcome (held vs terminal) is known, which is exactly what makes
-    // auto-bind possible. The binding just records the customer's
-    // `detach` opt-out on the `PendingFetch`; the success seam computes
-    // `bind = held and !detach` and registers `fetch_id → entity`. No
-    // call-time `activation_entity` requirement, no register-then-
-    // cleanup churn for a handler that throws after the call.
+    // Handler-surface Phase 3: plain `http.fetch` is the always-unbound
+    // Pattern-A transient — its `on_chunk` module fires as a separate
+    // chain (never binds the calling chain; binding is `on.fetch`'s job).
+    // The success seam (`worker_dispatch.zig`) leaves `bind = false` for
+    // a non-`connection_scoped` fetch.
     state.http_fetch_index += 1;
     // Build the id JS string NOW — `appendPendingFetch` transfers
     // ownership of `row.id` into the PendingFetch and clears the
@@ -142,10 +138,9 @@ fn appendPendingFetch(state: *globals.DispatchState, row: *BuiltFetch) !void {
         .max_total_response_bytes = row.max_total_response_bytes,
         .held = row.held,
         // `bind` is COMPUTED at the handler-success seam
-        // (`worker_dispatch.zig`: `bind = held and !detach`); the
-        // binding only records the customer's `detach` opt-out here.
+        // (`worker_dispatch.zig`: only `connection_scoped` on.fetch
+        // binds; `detach` is retired).
         .bind = false,
-        .detach = row.detach,
         .bound_send_id = row.bound_send_id,
         .name = row.name,
         .connection_scoped = row.connection_scoped,
@@ -213,7 +208,7 @@ pub fn jsOnFetch(
 /// Build a `BuiltFetch` for `on.fetch`: `url` is a positional string
 /// (arg0, not `opts.url`); the shared transport fields come from `opts`;
 /// `{to}` (an optional `{ to: "export" }` object) selects the bound
-/// export via `name`. `connection_scoped = true`, `detach = false`,
+/// export via `name`. `connection_scoped = true`,
 /// `on_chunk` empty (a connection-scoped fetch never fires unbound).
 fn buildOnFetchRow(
     ctx: ?*c.JSContext,
@@ -273,7 +268,6 @@ fn buildOnFetchRow(
         .stream = stream,
         .max_response_chunk_bytes = @intCast(@max(max_chunk_i32, 1)),
         .max_total_response_bytes = if (max_total_i64 < 1) 1 else @intCast(max_total_i64),
-        .detach = false,
         .bound_send_id = fetched.bound_send_id.?,
         .name = fetched.name.?,
         .connection_scoped = true,
@@ -421,15 +415,6 @@ const BuiltFetch = struct {
     /// `jsHttpSubscribe`; false for `jsHttpFetch`. Threaded into
     /// the `PendingFetch` the engine reads.
     held: bool = false,
-    /// `docs/auto-bind-plan.md`: `detach: true` is the opt-OUT from
-    /// auto-bind. By default a fetch issued from a handler that ends up
-    /// *held* (`next()`/`stream()`) auto-binds — upstream chunks resume
-    /// the calling chain's `onFetchChunk`. `detach: true` instead fires
-    /// a separate `fireFetchEventActivation` chain (the `on_chunk`
-    /// module), i.e. fire-and-forget. The bind decision itself is made
-    /// at handler-success in `worker_dispatch.zig` (it needs the
-    /// outcome): `PendingFetch.bind = held and !detach`.
-    detach: bool = false,
     /// `docs/cross-worker-held-state-plan.md` Phase 2B: webhook.send
     /// shim passes the send_id (the `_send/owed/{id}` suffix) so the
     /// FetchEngine's chunk router can consult `bound_send_owners` to
@@ -513,7 +498,6 @@ fn buildFetchRow(
     }
 
     const stream = try getBoolField(ctx, opts, "stream", false);
-    const detach = try getBoolField(ctx, opts, "detach", false);
     const timeout_ms_i32 = try getIntField(ctx, opts, "timeout_ms", 30_000);
     const max_chunk_i32 = try getIntField(ctx, opts, "max_response_chunk_bytes", 256 * 1024);
     const max_total_i64 = try getInt64Field(ctx, opts, "max_total_response_bytes", 50 * 1024 * 1024);
@@ -530,7 +514,6 @@ fn buildFetchRow(
         .stream = stream,
         .max_response_chunk_bytes = @intCast(@max(max_chunk_i32, 1)),
         .max_total_response_bytes = if (max_total_i64 < 1) 1 else @intCast(max_total_i64),
-        .detach = detach,
         .bound_send_id = fetched.bound_send_id.?,
         .name = fetched.name.?,
     };

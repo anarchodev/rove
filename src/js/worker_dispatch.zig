@@ -3253,11 +3253,15 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     pf.deinit(allocator);
                     continue;
                 }
-                // A `webhook.send` fetch (bound_send_id set) uses the
-                // §6.4 bound_send_owners callback routing, NOT auto-bind
-                // — never bind it (it would steal chunks from the
-                // webhook_onresult shim). docs/auto-bind-plan.md.
-                pf.bind = held and !pf.detach and pf.bound_send_id.len == 0;
+                // Handler-surface Phase 3: ONLY `on.fetch` (connection-
+                // scoped) auto-binds — `detach` is retired and plain
+                // `http.fetch` is now the always-unbound Pattern-A
+                // transient (fires its `on_chunk` module as a separate
+                // chain). A `webhook.send` fetch (bound_send_id set) is
+                // never bound either — its §6.4 bound_send_owners routing
+                // would otherwise steal chunks from the webhook_onresult
+                // shim.
+                pf.bind = pf.connection_scoped and held and pf.bound_send_id.len == 0;
                 if (pf.bind) {
                     _ = @TypeOf(worker.*).registerBoundFetchTrampoline(@ptrCast(worker), pf.id, ent);
                 }
