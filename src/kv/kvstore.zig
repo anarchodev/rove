@@ -496,6 +496,29 @@ pub const KvStore = struct {
         return v orelse return Error.NotFound;
     }
 
+    /// The store's node-local write clock — the kvexp `StoreLease
+    /// .writeVersion` (effect-algebra §8.4 watch baseline). Monotonic,
+    /// advanced once per write-incorporating commit (leader commit /
+    /// follower apply / snapshot install). Read it immediately after
+    /// incorporating a write batch and stamp the version onto that
+    /// batch's kv-wake events: any read view opened before the batch
+    /// carries a strictly-smaller `TrackedTxn.readVersion`, so a watch
+    /// armed at that baseline fires (`matchEventsToWakes`).
+    ///
+    /// Non-blocking: uses `tryAcquire`, so it never stalls behind a
+    /// concurrent same-tenant dispatch lease (the leader commit arm
+    /// runs per write batch — it must not block). Returns `null` on
+    /// contention; callers stamp that as the "fire-always" sentinel so
+    /// a contended read over-fires (permitted §9.4) rather than dropping
+    /// a wake. The clock itself is a lock-free atomic load behind the
+    /// lease's tenant-state pin.
+    pub fn writeVersion(self: *KvStore) ?u64 {
+        const lease_opt = self.manifest.tryAcquire(self.store_id) catch return null;
+        var lease = lease_opt orelse return null;
+        defer lease.release();
+        return lease.writeVersion();
+    }
+
     /// Direct put. Acquires the per-tenant lock so the one-shot Txn
     /// is the only entry in the kvexp chain for the duration — same
     /// guarantee TrackedTxn relies on. The lock is reentrant-ish:

@@ -355,6 +355,15 @@ pub const KvWakeEvent = struct {
     tenant_id: []u8,
     key: []u8,
     op: u8,
+    /// Handler-surface Phase 1 (`on.kv`): the producer store's
+    /// `KvStore.writeVersion` at the moment this write was incorporated
+    /// (§8.4). `matchEventsToWakes` fires a watch only when this is
+    /// strictly greater than the watch's `read_version` baseline, so a
+    /// watch never wakes for state its arming handler already saw.
+    /// `std.math.maxInt(u64)` is the "fire-always" sentinel a producer
+    /// stamps when it couldn't read the clock (contended lease) — an
+    /// over-fire is permitted (§9.4), a missed wake is not.
+    write_version: u64 = 0,
 
     pub fn deinit(self: *KvWakeEvent, allocator: std.mem.Allocator) void {
         allocator.free(self.tenant_id);
@@ -391,14 +400,14 @@ pub const KvWakeInbox = struct {
     /// the caller (apply-thread path logs and continues — losing a
     /// wake is preferable to crashing the apply loop; the §9.4
     /// "spurious + overflow" thesis allows this).
-    pub fn push(self: *KvWakeInbox, tenant_id: []const u8, key: []const u8, op: u8) !void {
+    pub fn push(self: *KvWakeInbox, tenant_id: []const u8, key: []const u8, op: u8, write_version: u64) !void {
         const tid = try self.allocator.dupe(u8, tenant_id);
         errdefer self.allocator.free(tid);
         const k = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(k);
         self.mutex.lock();
         defer self.mutex.unlock();
-        try self.events.append(self.allocator, .{ .tenant_id = tid, .key = k, .op = op });
+        try self.events.append(self.allocator, .{ .tenant_id = tid, .key = k, .op = op, .write_version = write_version });
     }
 
     /// Move all queued events into the caller's local list (the
