@@ -2701,6 +2701,18 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             pending_fetches.deinit(allocator);
         }
 
+        // Handler-surface Phase 1: per-activation `on.timer`/`on.kv`
+        // accumulator (same shape/ownership as `pending_fetches`). This
+        // is a connection activation, so the accumulator is non-null and
+        // `on.*` records wakes; the worker arms them onto the held
+        // entity's `StreamWakes` at park (Phase 1 Task 2). The defer
+        // frees any leftovers on the error/no-park path.
+        var pending_wakes: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+        defer {
+            for (pending_wakes.items) |*pw| pw.deinit(allocator);
+            pending_wakes.deinit(allocator);
+        }
+
         const request: Request = .{
             .method = method,
             .path = path,
@@ -2714,6 +2726,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .activation_source = .inbound,
             .session_id = session_resolved.sid,
             .pending_fetches = &pending_fetches,
+            .pending_wakes = &pending_wakes,
             // Non-null only when the handler-tenant is the admin
             // singleton — gates installation of `platform.root.*`.
             .platform = handler_inst.platform,
