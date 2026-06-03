@@ -56,21 +56,16 @@
      * @param {Object<string,string>} [opts.headers] - Request headers.
      * @param {string} [opts.body] - Request body.
      * @param {number} [opts.timeout_ms=30000] - Per-request timeout.
-     * @param {string} opts.on_chunk - Module path for the detached
-     *   `on_chunk` callback (REQUIRED). The activation shape is
+     * @param {string} opts.on_chunk - Module path for the `on_chunk`
+     *   callback (REQUIRED). The activation shape is
      *   `{ kind: "fetch_chunk", fetch_id, seq, byteOffset, bytes,
      *   headers? (seq=0), final, status? (final), ok? (final),
-     *   body_truncated? (final), ctx }`. NOTE: this fires only for a
-     *   DETACHED fetch (see `detach`). When the calling handler holds
-     *   the chain (returns `next()`/`stream()`), the fetch auto-binds
-     *   and chunks resume the chain's `onFetchChunk` export instead —
-     *   `on_chunk` is ignored.
-     * @param {boolean} [opts.detach=false] - Opt OUT of auto-bind.
-     *   By default a fetch from a held handler binds to that chain
-     *   (chunks → its `onFetchChunk`). `detach: true` fires a separate
-     *   `on_chunk` chain (fire-and-forget) — use it when you don't want
-     *   the fetch to drive the held response. A fetch from a terminal
-     *   handler is always detached (no chain to bind to).
+     *   body_truncated? (final), ctx }`. `http.fetch` is always
+     *   DETACHED — its `on_chunk` module runs as a separate
+     *   fire-and-forget chain, never the calling chain. To bind an
+     *   outbound to the held connection (chunks resume THIS chain's
+     *   `onFetchChunk`), use {@link on.fetch} instead (`detach` is
+     *   retired — scope is a verb, not a flag).
      * @param {boolean} [opts.stream=false] - false → one event
      *   with `final: true` (default; first chunk only). true →
      *   one event per upstream writeback, last one carries
@@ -95,18 +90,14 @@
      * });
      *
      * @example
-     * // Streaming LLM tokens. The handler returns next()/stream(), so
-     * // the fetch AUTO-BINDS: each upstream chunk resumes this module's
-     * // `onFetchChunk` export (no `bind` keyword needed). `on_chunk` is
-     * // still required by the binding but ignored on the bound path.
-     * http.fetch({
-     *   url: "https://api.openai.com/v1/chat/completions",
-     *   method: "POST",
-     *   body: JSON.stringify({ model, messages, stream: true }),
-     *   on_chunk: "onFetchChunk",
-     *   stream: true,
-     * });
-     * // export function onFetchChunk() { return stream({ write: transform(request.body) }); }
+     * // Streaming LLM tokens BOUND to the held connection: use on.fetch,
+     * // not http.fetch. The held handler returns next(), so each upstream
+     * // chunk resumes this chain's onFetchChunk, which streams it out.
+     * on.fetch("https://api.openai.com/v1/chat/completions",
+     *          { method: "POST", body: JSON.stringify({ model, messages, stream: true }),
+     *            stream: true });
+     * return next();
+     * // export function onFetchChunk() { stream.write(transform(request.body)); return next(); }
      */
     fetch(opts) {
       return sys.fetch(opts);

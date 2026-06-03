@@ -181,12 +181,8 @@ pub const PendingFetch = struct {
     /// named export per chunk. `bind=false` → Pattern A
     /// (`fireFetchEventActivation`, separate chain, no held socket).
     /// `docs/auto-bind-plan.md`: COMPUTED at the handler-success seam
-    /// (`bind = held and !detach`), not carried from a JS keyword.
+    /// (only `connection_scoped` on.fetch binds), not a JS keyword.
     bind: bool = false,
-    /// `docs/auto-bind-plan.md`: customer opt-OUT from auto-bind
-    /// (`http.fetch({detach: true})`). The success seam uses it to
-    /// decide `bind`; the engine never reads `detach` directly.
-    detach: bool = false,
     /// `docs/cross-worker-held-state-plan.md` Phase 2B: when the
     /// `webhook.send` JS shim issues an `http.fetch` to drive a
     /// held-sync send, it stamps the send_id here so the chunk
