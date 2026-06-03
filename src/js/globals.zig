@@ -201,6 +201,12 @@ pub const PendingFetch = struct {
     /// uses the supplied identifier as the named-export target.
     /// Allocator-owned.
     name: []u8 = &.{},
+    /// Handler-surface Phase 3: true ⇒ issued via `on.fetch` (a
+    /// CONNECTION trigger). The success seam binds it when the
+    /// activation held the socket and DROPS it (inert, no unbound fire)
+    /// when it didn't — connectionless outbound is `webhook.send`
+    /// (`docs/handler-shape.md` §2.4). False for plain `http.fetch`.
+    connection_scoped: bool = false,
 
     pub fn deinit(self: *PendingFetch, allocator: std.mem.Allocator) void {
         allocator.free(self.tenant_id);
@@ -1671,8 +1677,13 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // arms them on the held entity at park. Inert when there's no held
     // connection (the accumulator is null).
     .{ .path = &.{ "_system", "on" }, .fns = &.{
-        .{ .name = "timer", .cfunc = on_b.jsOnTimer, .argc = 2 },
-        .{ .name = "kv",    .cfunc = on_b.jsOnKv,    .argc = 2 },
+        .{ .name = "timer", .cfunc = on_b.jsOnTimer,   .argc = 2 },
+        .{ .name = "kv",    .cfunc = on_b.jsOnKv,      .argc = 2 },
+        // Handler-surface Phase 3: connection-scoped outbound. Binds the
+        // fetch to the held chain (chunks → `{to}`/`onFetchChunk`) when
+        // held; inert when not. Lives in the http binding (composes the
+        // same fetch primitive as `http.fetch`).
+        .{ .name = "fetch", .cfunc = http_b.jsOnFetch, .argc = 3 },
     } },
     // Handler-surface Phase 2: connection output effects. `stream.start`
     // / `stream.write` accumulate onto `DispatchState`; the worker

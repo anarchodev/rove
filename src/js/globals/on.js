@@ -65,5 +65,34 @@
     kv(prefix, opts) {
       return sys.kv(prefix, opts);
     },
+
+    /**
+     * Perform an outbound HTTP request and wake the held connection on
+     * its result. Connection-scoped: the result resumes THIS chain's
+     * `{to}` export (default `onFetchChunk`) while it still holds the
+     * socket; if the activation doesn't hold the socket the fetch is
+     * inert (its durable twin is `webhook.send`). With `opts.stream`
+     * each upstream writeback wakes the handler as it arrives.
+     *
+     * @param {string} url - Upstream URL.
+     * @param {object} [opts]
+     * @param {string} [opts.method="GET"] - HTTP method.
+     * @param {Object<string,string>} [opts.headers] - Request headers.
+     * @param {string} [opts.body] - Request body.
+     * @param {boolean} [opts.stream=false] - false → one result event;
+     *   true → one event per upstream chunk as it arrives.
+     * @param {number} [opts.timeout_ms=30000] - Per-request timeout.
+     * @param {object} [to]
+     * @param {string} [to.to] - Export the result wakes; defaults to
+     *   `onFetchChunk`.
+     * @returns {string} The fetch id (for `http.cancelFetch`).
+     * @example
+     * on.fetch('https://api.example.com/stream', { stream: true },
+     *          { to: 'onUpstream' });
+     * return next();
+     */
+    fetch(url, opts, to) {
+      return sys.fetch(url, opts, to);
+    },
   };
 })();
