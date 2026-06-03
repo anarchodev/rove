@@ -2783,6 +2783,16 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             for (pending_wakes.items) |*pw| pw.deinit(allocator);
             pending_wakes.deinit(allocator);
         }
+        // Handler-surface Phase 2: `stream.write(chunk)` records chunks;
+        // `finishResponse` moves them into the internal Stream descriptor
+        // (next ⇒ keep streaming) or onto the terminal body (close). The
+        // defer frees any leftovers `finishResponse` didn't consume
+        // (error / non-stream paths leave the list empty).
+        var stream_chunks: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (stream_chunks.items) |ch| allocator.free(ch);
+            stream_chunks.deinit(allocator);
+        }
 
         const request: Request = .{
             .method = method,
@@ -2798,6 +2808,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .session_id = session_resolved.sid,
             .pending_fetches = &pending_fetches,
             .pending_wakes = &pending_wakes,
+            .pending_stream_chunks = &stream_chunks,
             // Non-null only when the handler-tenant is the admin
             // singleton — gates installation of `platform.root.*`.
             .platform = handler_inst.platform,

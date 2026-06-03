@@ -280,6 +280,13 @@ pub const Request = struct {
     /// the worker only on connection activations; null elsewhere
     /// (`on.*` inert). See `globals.PendingWakeReg`.
     pending_wakes: ?*std.ArrayListUnmanaged(globals.PendingWakeReg) = null,
+    /// Handler-surface Phase 2: caller-owned `stream.write(chunk)`
+    /// accumulator (threaded to `DispatchState.pending_stream_chunks`).
+    /// Set by the worker only on connection activations; null elsewhere
+    /// (`stream.*` inert). `finishResponse` drains it into the internal
+    /// `Stream` descriptor (next() ⇒ keep streaming) or prepends it to
+    /// the terminal body (close).
+    pending_stream_chunks: ?*std.ArrayListUnmanaged([]u8) = null,
     /// Gap 2.1 subscription_fire payload (catalog §2.1 +
     /// `docs/subscriptions-plan.md`). Set only when
     /// `activation_source == .subscription_fire`; surfaces as
@@ -538,6 +545,7 @@ pub const Dispatcher = struct {
             .activation_fetches_pending = request.activation_fetches_pending,
             .pending_fetches = request.pending_fetches,
             .pending_wakes = request.pending_wakes,
+            .pending_stream_chunks = request.pending_stream_chunks,
             .is_system_module = request.is_system_module,
         };
 
@@ -1039,6 +1047,16 @@ fn runModule(
     // persisted discriminant).
     if (try continuation_mod.tryExtract(d.allocator, ctx.raw, result.val)) |cont| {
         pending.continuation = cont;
+        // Handler-surface Phase 2: a `stream.*` + `next()` activation
+        // commits the ambient `response.*` head NOW (stream.start). A
+        // plain `next()` defers the head — nothing to capture. Pull
+        // status/headers/cookies so `finishResponse`'s stream bridge has
+        // them (a bare continuation skips this and the head stays open).
+        const st = globals.getState(ctx.raw);
+        if (st.stream_started) {
+            extractResponseMetadata(d.allocator, ctx.raw, &pending.status, &pending.cookies, &pending.headers) catch
+                return error.OutOfMemory;
+        }
         return;
     }
     // Streaming-handlers-plan §3.3 Phase 2: `__rove_stream(...)` is
@@ -1667,6 +1685,34 @@ fn finishResponse(
         return DispatchError.KvFailed;
     }
 
+    // Handler-surface Phase 2 (`stream.*` effects, §2.2): a handler that
+    // called `stream.start()`/`stream.write()` produces the streamed
+    // response from the ambient `response.*` head + the chunk effect
+    // buffer, with disposition `return next()` (keep streaming) or a
+    // terminal (close). Bridge to the internal `Stream` descriptor so
+    // the existing stream pipeline (worker `.stream` arm →
+    // serviceParkedStreams → resumeStream) drives BOTH the old
+    // `__rove_stream` surface and this one, unchanged. The disposition
+    // is preserved: `next()` ⇒ `.stream` (re-arm); a terminal ⇒ keep the
+    // terminal but prepend the buffered chunks so the final frames ship
+    // before END_STREAM.
+    if (state.stream_started) {
+        if (pending.continuation) |cont| {
+            var c2 = cont;
+            pending.continuation = null; // take ownership
+            const s = buildStreamFromEffects(d.allocator, state, pending, c2.ctx_json) catch |e| {
+                c2.deinit(d.allocator);
+                return e;
+            };
+            c2.deinit(d.allocator); // path/fn_name/ctx_json — ctx was dup'd into `s`
+            console_buf.deinit(d.allocator);
+            return .{ .stream = s };
+        }
+        // Terminal close: ship the buffered chunks before the final body.
+        try prependStreamChunks(d.allocator, state, pending);
+        // fall through to the terminal build below.
+    }
+
     // Trampoline: the handler returned `next(...)`. Hand the
     // descriptor up; the (unused) response accumulators stay empty.
     // Move ownership out of `pending` so its deinit can't double-free.
@@ -1714,6 +1760,115 @@ fn finishResponse(
         .set_cookies = set_cookies,
         .headers = headers_slice,
     } };
+}
+
+// ── Handler-surface Phase 2: stream.* effect → Stream descriptor ───
+
+/// Build the internal `Stream` descriptor for a `next()`-disposition
+/// activation that emitted `stream.*` output. Head comes from the
+/// ambient `response.*` (status + headers — ignored on resume hops, set
+/// on the first hop); chunks are MOVED out of the `stream.write` effect
+/// buffer; kv/timer wakes come from the `on.*` accumulator (dup'd — the
+/// worker's list deinit frees the originals); `ctx_json` is dup'd from
+/// the `next({ctx})` descriptor. Cookies on the stream head are not
+/// carried (parity with the retired `__rove_stream` surface).
+fn buildStreamFromEffects(
+    allocator: std.mem.Allocator,
+    state: *globals.DispatchState,
+    pending: *PendingResponse,
+    ctx_json_src: []const u8,
+) error{OutOfMemory}!stream_mod.Stream {
+    const headers_wire: ?[]u8 = if (pending.headers.items.len > 0)
+        try encodeHeadersWire(allocator, pending.headers.items)
+    else
+        null;
+    errdefer if (headers_wire) |h| allocator.free(h);
+
+    // Chunks: transfer ownership out of the effect buffer into a fresh
+    // spine; clear the source so the worker's deinit frees an empty list.
+    var chunks: [][]u8 = &.{};
+    if (state.pending_stream_chunks) |list| {
+        if (list.items.len > 0) {
+            chunks = try allocator.alloc([]u8, list.items.len);
+            @memcpy(chunks, list.items);
+            list.clearRetainingCapacity();
+        }
+    }
+    errdefer {
+        for (chunks) |ch| allocator.free(ch);
+        if (chunks.len > 0) allocator.free(chunks);
+    }
+
+    // Wakes: dup the on.* registrations into kv_prefixes + interval_ms.
+    var interval_ms: ?i64 = null;
+    var prefixes: std.ArrayListUnmanaged([]u8) = .empty;
+    errdefer {
+        for (prefixes.items) |p| allocator.free(p);
+        prefixes.deinit(allocator);
+    }
+    if (state.pending_wakes) |wl| {
+        for (wl.items) |reg| switch (reg.kind) {
+            .timer => interval_ms = reg.interval_ms,
+            .kv => try prefixes.append(allocator, try allocator.dupe(u8, reg.prefix)),
+        };
+    }
+    const kv_prefixes = try prefixes.toOwnedSlice(allocator);
+    errdefer {
+        for (kv_prefixes) |p| allocator.free(p);
+        if (kv_prefixes.len > 0) allocator.free(kv_prefixes);
+    }
+
+    const ctx_json = try allocator.dupe(u8, ctx_json_src);
+
+    return .{
+        .status = @intCast(@max(@min(pending.status, 599), 100)),
+        .headers = headers_wire,
+        .chunks = chunks,
+        .interval_ms = interval_ms,
+        .kv_prefixes = kv_prefixes,
+        .ctx_json = ctx_json,
+    };
+}
+
+/// Render `[]ResponseHeader` as wire-format `name: value\r\n` lines —
+/// the inverse of `parseStreamHeaders` (worker `.stream` arm). Empty
+/// input is handled by the caller (returns null instead).
+fn encodeHeadersWire(
+    allocator: std.mem.Allocator,
+    hdrs: []const ResponseHeader,
+) error{OutOfMemory}![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (hdrs) |h| {
+        try out.appendSlice(allocator, h.name);
+        try out.appendSlice(allocator, ": ");
+        try out.appendSlice(allocator, h.value);
+        try out.appendSlice(allocator, "\r\n");
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Terminal-close path: concatenate the buffered `stream.write` chunks
+/// ahead of the terminal body so the final frames ship before
+/// END_STREAM, then free + clear the effect buffer. No-op when the
+/// buffer is empty (a plain terminal that happened to call
+/// `stream.start()` with no writes).
+fn prependStreamChunks(
+    allocator: std.mem.Allocator,
+    state: *globals.DispatchState,
+    pending: *PendingResponse,
+) error{OutOfMemory}!void {
+    const list = state.pending_stream_chunks orelse return;
+    if (list.items.len == 0) return;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    for (list.items) |ch| try buf.appendSlice(allocator, ch);
+    try buf.appendSlice(allocator, pending.body);
+    const merged = try buf.toOwnedSlice(allocator);
+    if (pending.body.len > 0) allocator.free(pending.body);
+    pending.body = merged;
+    for (list.items) |ch| allocator.free(ch);
+    list.clearRetainingCapacity();
 }
 
 fn jsValueToOwned(

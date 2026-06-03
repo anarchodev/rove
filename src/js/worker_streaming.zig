@@ -38,6 +38,7 @@ const log_mod = @import("rove-log");
 const tape_mod = @import("rove-tape");
 
 const dispatcher_mod = @import("dispatcher.zig");
+const globals = @import("globals.zig");
 const Request = dispatcher_mod.Request;
 const components_mod = @import("components.zig");
 const chunk_spool_mod = @import("chunk_spool.zig");
@@ -540,6 +541,22 @@ fn resumeStream(
     // since the last activation (one-shot signal — handler decides
     // whether to refetch / resync / throttle / terminate).
     const dropped_chunks_snapshot = chunks_st.takeDropped();
+    // Handler-surface Phase 2: a resumed stream handler re-arms its
+    // wakes via `on.*` and emits more output via `stream.write()`, just
+    // like the first hop. Wire both accumulators so `finishResponse`
+    // rebuilds the internal Stream descriptor (chunks + kv/timer wakes)
+    // that the `.stream` arm below re-parks. Pre-Phase-2 the re-arm came
+    // from the returned `__rove_stream({waitFor})` descriptor instead.
+    var pending_wakes: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer {
+        for (pending_wakes.items) |*pw| pw.deinit(allocator);
+        pending_wakes.deinit(allocator);
+    }
+    var stream_chunks: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (stream_chunks.items) |ch| allocator.free(ch);
+        stream_chunks.deinit(allocator);
+    }
     const request: Request = .{
         .method = "POST",
         .path = spath,
@@ -555,6 +572,8 @@ fn resumeStream(
         .activation_wakes = batch_owned,
         .activation_lost_oldest = batch_lost_oldest,
         .activation_write_pressure_dropped = dropped_chunks_snapshot,
+        .pending_wakes = &pending_wakes,
+        .pending_stream_chunks = &stream_chunks,
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     const run_oc = worker.dispatcher.runOutcome(
