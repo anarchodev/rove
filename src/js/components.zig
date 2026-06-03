@@ -190,11 +190,24 @@ pub const StreamWakes = struct {
     next_wake_ns: i64 = std.math.maxInt(i64),
     kv_prefixes: [][]u8 = &.{},
     pending_wakes: PendingWakes = .{},
+    /// Handler-surface Phase 1 (`on.kv`): the §8.4 watch baseline — the
+    /// kvexp write-clock version the arming handler read at. A kv-write
+    /// event fires this watch only when its `writeVersion` is strictly
+    /// greater (i.e. the write landed after the read view), so a watch
+    /// never fires for state the handler already saw. 0 = unanchored
+    /// (the pre-`on.kv` stream path, which matches on any post-arm event).
+    read_version: u64 = 0,
+    /// Handler-surface Phase 1 (`on.*`): the export a wake routes to —
+    /// `"module.method"` or a bare `"method"`, or null → the default
+    /// `onWake` (the generic "edge wake — go look" export). Allocator-
+    /// owned; set from the last `on.*` registration's `{to}` selector.
+    wake_to: ?[]u8 = null,
 
     pub fn deinit(allocator: std.mem.Allocator, items: []StreamWakes) void {
         for (items) |*item| {
             for (item.kv_prefixes) |p| allocator.free(p);
             if (item.kv_prefixes.len > 0) allocator.free(item.kv_prefixes);
+            if (item.wake_to) |t| allocator.free(t);
             item.pending_wakes.deinit(allocator);
             item.* = .{};
         }
