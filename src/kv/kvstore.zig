@@ -48,6 +48,13 @@ pub const Error = error{
     /// cleanup pass.
     Sqlite,
     Io,
+    /// This txn's chain predecessor faulted while it was open, so a
+    /// rollback cascade invalidated it (kvexp `error.TxnInvalidated`,
+    /// active-writer cascade protection). The batch must self-abort:
+    /// roll back and return a retriable 5xx — its speculative basis is
+    /// gone. Distinct from `Conflict` (which means "retry the same txn
+    /// later"); an invalidated txn must NOT be retried.
+    TxnInvalidated,
 };
 
 pub const Entry = struct {
@@ -757,6 +764,16 @@ pub const KvStore = struct {
         /// Reset to false in `ensureOpen` so a re-opened TrackedTxn
         /// starts clean.
         read_view_opened: bool = false,
+        /// Set by `park` once the txn is handed to the chain to await
+        /// raft (active → parked). Non-null ⇒ commit/rollback route
+        /// through `Manifest.commit`/`rollbackFrom` **by handle** under
+        /// the tenant lock, never dereferencing `top` — a cross-worker
+        /// rollback cascade may have freed the kvexp Txn out from under
+        /// our pool entry, and by-handle resolution returns `.absent`
+        /// in that case instead of UAF-ing. The handle is `{tenant,
+        /// raft_seq}`; `raft_seq` is the same value rove pools the txn
+        /// under and classifies against the commit/fault watermarks.
+        parked_handle: ?kvexp.TxnHandle = null,
 
         pub fn open(self: *TrackedTxn) Error!void {
             return self.ensureOpen();
@@ -878,19 +895,72 @@ pub const KvStore = struct {
             return top.saw_speculation;
         }
 
+        /// Hand the txn to the chain to await raft (active → parked) and
+        /// record its `{tenant, seq}` handle on `parked_handle`. After
+        /// this, commit/rollback route by handle. Folds any still-open
+        /// savepoints first — the handler is done, its writes are final,
+        /// and a later by-handle commit must not see an open child. The
+        /// caller passes the raft propose `seq` it pools the txn under;
+        /// the same value keys the kvexp chain resolution.
+        ///
+        /// `error.TxnInvalidated` ⇒ a chain predecessor faulted while
+        /// this batch's handler ran (active-writer cascade), so the
+        /// batch's writes are built on a dead speculative basis — the
+        /// caller must self-abort (rollback + retriable 5xx), not pool it.
+        pub fn park(self: *TrackedTxn, seq: u64) Error!void {
+            std.debug.assert(self.opened);
+            std.debug.assert(self.parked_handle == null);
+            while (self.savepoints.pop()) |sp| {
+                sp.commit() catch |err| switch (err) {
+                    error.TxnInvalidated => return Error.TxnInvalidated,
+                    else => return Error.Sqlite,
+                };
+            }
+            const top = self.top orelse return Error.Sqlite;
+            self.parked_handle = top.park(seq) catch return Error.TxnInvalidated;
+        }
+
+        /// Tear down wrapper state after a by-handle commit/rollback —
+        /// kvexp already freed the kvexp Txn, so `top` is stale and must
+        /// not be dereferenced. The lease is normally gone (released at
+        /// park), but drop it defensively.
+        fn finishParked(self: *TrackedTxn) void {
+            self.top = null;
+            self.parked_handle = null;
+            self.opened = false;
+            self.savepoints.deinit(self.store.allocator);
+            self.savepoints = .empty;
+            if (self.lease != null) {
+                self.store.active_txn = null;
+                self.lease.?.release();
+                self.lease = null;
+            }
+        }
+
         pub fn commit(self: *TrackedTxn) Error!void {
             if (!self.opened) return;
-            // Any open savepoints close first (kvexp errors with
-            // SavepointStillOpen otherwise). Fold them into the
-            // top-level overlay before attempting the chain commit.
+            // Parked (post-`park`): resolve + commit by handle under the
+            // tenant lock. Never touch `top` — a cross-worker rollback
+            // cascade may have freed it. `.not_head` keeps the txn parked
+            // for a later-tick retry (predecessor not committed yet);
+            // `.absent` means it's already gone (treat as done).
+            if (self.parked_handle) |h| {
+                switch (self.store.manifest.commit(h) catch return Error.Sqlite) {
+                    .committed, .absent => {},
+                    .not_head => return Error.Conflict,
+                }
+                self.finishParked();
+                return;
+            }
+            // Active / immediate: the pointer path. Any open savepoints
+            // close first (kvexp errors with SavepointStillOpen
+            // otherwise). On `NotChainHead` the kvexp.Txn is unchanged
+            // (still in the chain) and the caller can retry on a later
+            // tick once the predecessor worker commits its own head.
             while (self.savepoints.pop()) |sp| {
                 sp.commit() catch return Error.Sqlite;
             }
             const top = self.top.?;
-            // Try the kvexp commit BEFORE tearing down our state.
-            // On `NotChainHead` the kvexp.Txn is unchanged (still in
-            // the chain) and the caller can retry on a later tick
-            // once the predecessor worker commits its own head.
             top.commit() catch |err| switch (err) {
                 error.NotChainHead => return Error.Conflict,
                 else => return Error.Sqlite,
@@ -910,6 +980,17 @@ pub const KvStore = struct {
 
         pub fn rollback(self: *TrackedTxn) Error!void {
             if (!self.opened) return;
+            // Parked: roll back by handle (cascades forward-dependents).
+            // Idempotent + convergent across workers — `.absent` if a
+            // sibling/predecessor cascade already freed it. No `top` deref.
+            if (self.parked_handle) |h| {
+                _ = self.store.manifest.rollbackFrom(h);
+                self.finishParked();
+                return;
+            }
+            // Active / immediate: the pointer cascade. An active txn is
+            // the chain tail (the lease serialises writers), so it has no
+            // successors to cascade.
             const top = self.top.?;
             self.top = null;
             self.opened = false;
