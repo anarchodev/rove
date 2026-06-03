@@ -2790,18 +2790,27 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 "tenant={s} err={s}",
                 .{ scope_inst.id, @errorName(re) },
             );
-            const outcome: log_mod.Outcome = if (err == dispatcher_mod.DispatchError.Interrupted)
-                .timeout
-            else
-                .handler_error;
-            const status: u16 = if (err == dispatcher_mod.DispatchError.Interrupted) 504 else 500;
-            if (err == dispatcher_mod.DispatchError.Interrupted) {
+            // A chain predecessor faulted mid-handler and the cascade
+            // invalidated this txn (kvexp self-abort gate, surfaced as
+            // Error.TxnInvalidated via pending_kv_error → KvFailed). The
+            // batch's speculative basis is gone, so it's a retriable 503,
+            // not a 500 handler-error. `last_kv_error` is reset per
+            // activation at runOutcome entry, so this read is this
+            // activation's error.
+            const interrupted = err == dispatcher_mod.DispatchError.Interrupted;
+            const invalidated = err == dispatcher_mod.DispatchError.KvFailed and
+                (if (worker.dispatcher.last_kv_error) |lke| lke == error.TxnInvalidated else false);
+            const outcome: log_mod.Outcome = if (interrupted) .timeout else if (invalidated) .fault else .handler_error;
+            const status: u16 = if (interrupted) 504 else if (invalidated) 503 else 500;
+            if (interrupted) {
                 try respb.setSimpleResponse(server, ent, sid, sess, 504, "handler exceeded cpu budget\n", allocator);
                 worker.penalty_box.recordKill(
                     handler_inst.id,
                     dep_id,
                     received_ns,
                 ) catch |pe| std.log.warn("rove-js penalty recordKill failed: {s}", .{@errorName(pe)});
+            } else if (invalidated) {
+                try respb.setSimpleResponse(server, ent, sid, sess, 503, "speculative dependency rolled back; retry\n", allocator);
             } else {
                 try respb.setErrorResponse(server, ent, sid, sess);
             }

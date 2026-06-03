@@ -1079,6 +1079,19 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", cont_path_for_log, "", ctx.deployment_id, ctx.now_ns, 0, .ok, &.{}, &.{}, .{}, ctx.correlation_id, ctx.activation, 0);
 }
 
+/// 503 (retriable) when this activation's failure was an invalidated txn
+/// — a chain predecessor faulted and the cascade self-aborted it
+/// (`Error.TxnInvalidated` via `pending_kv_error`); else 500. Lets a
+/// resume hop's held caller retry rather than treat a transient
+/// speculative-basis loss as a hard handler error. `last_kv_error` is
+/// reset per activation at `runOutcome` entry.
+fn resumeErrStatus(worker: anytype) u16 {
+    if (worker.dispatcher.last_kv_error) |lke| {
+        if (lke == error.TxnInvalidated) return 503;
+    }
+    return 500;
+}
+
 /// The deadline trigger passes `allow_repark = false`.
 /// `error.Resume*` → caller falls back to a hard 504.
 fn resumeContinuation(
@@ -1180,7 +1193,7 @@ fn resumeContinuation(
     ) catch {
         txn.rollback() catch {};
         txn_done = true;
-        try resolveParked(worker, ent, sid, sess, 500, "continuation handler error\n");
+        try resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "continuation handler error\n");
         return;
     };
 
@@ -1572,7 +1585,7 @@ pub fn resumeBoundFetchChain(
     ) catch {
         txn.rollback() catch {};
         txn_done = true;
-        resolveParked(worker, ent, sid, sess, 500, "bound-fetch handler error\n") catch {};
+        resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "bound-fetch handler error\n") catch {};
         return;
     };
 

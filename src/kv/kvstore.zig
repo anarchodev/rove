@@ -476,6 +476,10 @@ pub const KvStore = struct {
             const leaf = t.activeLeaf();
             const v = leaf.get(self.allocator, key) catch |err| switch (err) {
                 error.OutOfMemory => return Error.OutOfMemory,
+                // A chain predecessor faulted mid-handler and the cascade
+                // invalidated this active txn (kvexp self-abort gate). Surface
+                // it distinctly so the dispatcher emits a retriable 503.
+                error.TxnInvalidated => return Error.TxnInvalidated,
                 else => return Error.Sqlite,
             };
             return v orelse return Error.NotFound;
@@ -500,7 +504,10 @@ pub const KvStore = struct {
     pub fn put(self: *KvStore, key: []const u8, value: []const u8) Error!void {
         if (self.active_txn) |t| {
             const leaf = t.activeLeaf();
-            leaf.put(key, value) catch return Error.Sqlite;
+            leaf.put(key, value) catch |err| switch (err) {
+                error.TxnInvalidated => return Error.TxnInvalidated,
+                else => return Error.Sqlite,
+            };
             return;
         }
         // Blocking acquire — direct KvStore.put is used by test/admin
@@ -526,6 +533,7 @@ pub const KvStore = struct {
             const leaf = t.activeLeaf();
             _ = leaf.delete(key) catch |err| switch (err) {
                 error.OutOfMemory => return Error.OutOfMemory,
+                error.TxnInvalidated => return Error.TxnInvalidated,
                 else => return Error.Sqlite,
             };
             return;
@@ -584,7 +592,10 @@ pub const KvStore = struct {
             // Lazy batch-scoped read view (see KvStore.get).
             t.beginReadView();
             const leaf = t.activeLeaf();
-            var pc = leaf.scanPrefix(prefix_bytes) catch return Error.Sqlite;
+            var pc = leaf.scanPrefix(prefix_bytes) catch |err| switch (err) {
+                error.TxnInvalidated => return Error.TxnInvalidated,
+                else => return Error.Sqlite,
+            };
             defer pc.deinit();
             try collectPrefix(self.allocator, &pc, prefix_bytes, cursor, count, &list);
         } else {
@@ -824,12 +835,18 @@ pub const KvStore = struct {
 
         pub fn put(self: *TrackedTxn, key: []const u8, value: []const u8) Error!void {
             try self.ensureOpen();
-            self.activeLeaf().put(key, value) catch return Error.Sqlite;
+            self.activeLeaf().put(key, value) catch |err| switch (err) {
+                error.TxnInvalidated => return Error.TxnInvalidated,
+                else => return Error.Sqlite,
+            };
         }
 
         pub fn delete(self: *TrackedTxn, key: []const u8) Error!void {
             try self.ensureOpen();
-            _ = self.activeLeaf().delete(key) catch return Error.Sqlite;
+            _ = self.activeLeaf().delete(key) catch |err| switch (err) {
+                error.TxnInvalidated => return Error.TxnInvalidated,
+                else => return Error.Sqlite,
+            };
         }
 
         pub fn savepoint(self: *TrackedTxn) Error!void {
