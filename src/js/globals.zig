@@ -375,6 +375,20 @@ pub const DispatchState = struct {
     /// park time and frees the list. Null on connectionless / test
     /// paths — `on.*` is then inert (the model: connection-only wakes).
     pending_wakes: ?*std.ArrayListUnmanaged(PendingWakeReg) = null,
+    /// Handler-surface Phase 2 (`stream.*` effects, `docs/handler-shape.md`
+    /// §2.2): true once the handler called `stream.start()` or the first
+    /// `stream.write()` — the activation opens/continues a streamed
+    /// response. Read by the worker post-dispatch to drive the stream-
+    /// pipeline entry. Connection-only — `stream.*` is inert (and this
+    /// stays false) when `pending_stream_chunks` is null.
+    stream_started: bool = false,
+    /// Handler-surface Phase 2: caller-owned accumulator for chunks
+    /// emitted via `stream.write(chunk)` this activation (same ownership
+    /// model as `pending_fetches`/`pending_wakes`). Each is an owned byte
+    /// slice; the worker stages them as commit-gated `Cmd.stream_chunk`
+    /// at park, then frees the list. Null on connectionless / test paths
+    /// ⇒ `stream.*` is inert (the model: connection-only output).
+    pending_stream_chunks: ?*std.ArrayListUnmanaged([]u8) = null,
     /// Phase 5 PR-2b: true ⇒ the dispatched module is a `__system/`
     /// built-in (e.g. the webhook shim's `webhook_onresult.mjs`).
     /// `isCustomerWriteReserved` is skipped so the shim can write
@@ -1590,6 +1604,8 @@ pub fn installStatic(ctx: *c.JSContext) void {
     evalSnippet(ctx, "schedule.js", SCHEDULE_JS);
     // Handler-surface Phase 1: connection wake triggers.
     evalSnippet(ctx, "on.js", ON_JS);
+    // Handler-surface Phase 2: connection output effects (`stream.*`).
+    evalSnippet(ctx, "stream.js", STREAM_JS);
     evalSnippet(ctx, "webhook.js", WEBHOOK_JS);
     evalSnippet(ctx, "email.js", EMAIL_JS);
     // users is standalone (kv + crypto.{randomBytes,sha256}).
@@ -1657,6 +1673,14 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     .{ .path = &.{ "_system", "on" }, .fns = &.{
         .{ .name = "timer", .cfunc = on_b.jsOnTimer, .argc = 2 },
         .{ .name = "kv",    .cfunc = on_b.jsOnKv,    .argc = 2 },
+    } },
+    // Handler-surface Phase 2: connection output effects. `stream.start`
+    // / `stream.write` accumulate onto `DispatchState`; the worker
+    // drives the stream-pipeline entry + stages chunks as commit-gated
+    // `Cmd.stream_chunk` at park. Inert when there's no held connection.
+    .{ .path = &.{ "_system", "stream" }, .fns = &.{
+        .{ .name = "start", .cfunc = stream_b.jsStreamStart, .argc = 0 },
+        .{ .name = "write", .cfunc = stream_b.jsStreamWrite, .argc = 1 },
     } },
     // crypto. No crypto global in qjs-ng by default, so we fabricate
     // one. hmacSha256 is the vendor-neutral primitive for building
@@ -1806,6 +1830,7 @@ const RETRY_JS = @embedFile("retry_js");
 const SCHEDULER_JS = @embedFile("scheduler_js");
 const SCHEDULE_JS = @embedFile("schedule_js");
 const ON_JS = @embedFile("on_js");
+const STREAM_JS = @embedFile("stream_js");
 const WEBHOOK_JS = @embedFile("webhook_js");
 const EMAIL_JS = @embedFile("email_js");
 const TEXTCODEC_JS = @embedFile("textcodec_js");
@@ -1836,6 +1861,7 @@ const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "scheduler", .src = SCHEDULER_JS },
     .{ .name = "schedule", .src = SCHEDULE_JS },
     .{ .name = "on", .src = ON_JS },
+    .{ .name = "stream", .src = STREAM_JS },
     .{ .name = "webhook", .src = WEBHOOK_JS },
     .{ .name = "email", .src = EMAIL_JS },
     .{ .name = "textcodec", .src = TEXTCODEC_JS },

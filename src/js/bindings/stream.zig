@@ -128,6 +128,70 @@ pub fn jsStream(
     return obj;
 }
 
+// ── `_system.stream.start()` / `_system.stream.write(chunk)` ───────
+//
+// Handler-surface Phase 2 (`docs/handler-shape.md` §2.2): `stream` is
+// an **effect namespace** (ambient, like `kv`), NOT a return verb. The
+// streamed response is produced over time by `stream.start()` (commit
+// the ambient `response.*` head + open the stream) and
+// `stream.write(chunk)` (emit a chunk, commit-gated). Both accumulate
+// onto `DispatchState`; the worker drives the stream-pipeline entry +
+// stages the chunks as commit-gated `Cmd.stream_chunk` at park. The
+// handler's disposition is `return next()` (keep producing) / a
+// terminal (close) — `stream.*` never returns a value into *this*
+// activation.
+//
+// Connection-only, like `on.*`: on a connectionless activation
+// (cron / schedule / webhook.send callback / test path) the
+// `pending_stream_chunks` accumulator is null and these calls are inert
+// no-ops, per the model (§2.4 — disposition verbs + `stream.*`/`on.*`
+// are inert without a held socket).
+
+/// `_system.stream.start()` — open the streamed response (commit the
+/// ambient head). Idempotent flag set; the first `stream.write()` would
+/// imply it anyway. Inert when there's no held connection.
+pub fn jsStreamStart(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    _: c_int,
+    _: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    const state = globals.getState(ctx);
+    if (state.pending_stream_chunks == null) return js_undefined; // connectionless ⇒ inert
+    state.stream_started = true;
+    return js_undefined;
+}
+
+/// `_system.stream.write(chunk)` — emit one chunk to the held socket.
+/// Commit-gated: the chunk reaches the wire only after this activation's
+/// writes commit (`streaming-model.md` §2). `chunk` is coerced to bytes
+/// (string or typed value → UTF-8). Inert when there's no connection.
+pub fn jsStreamWrite(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    const state = globals.getState(ctx);
+    const list = state.pending_stream_chunks orelse return js_undefined; // connectionless ⇒ inert
+    if (argc < 1) {
+        _ = c.JS_ThrowTypeError(ctx, "stream.write(chunk) requires a chunk argument");
+        return js_exception;
+    }
+    const bytes = jsValueAsOwnedBytes(state.allocator, ctx, argv[0]) catch {
+        _ = c.JS_ThrowInternalError(ctx, "stream.write: out of memory");
+        return js_exception;
+    };
+    // Writing implies the stream is open — `start()` is optional.
+    state.stream_started = true;
+    list.append(state.allocator, bytes) catch {
+        state.allocator.free(bytes);
+        _ = c.JS_ThrowInternalError(ctx, "stream.write: out of memory");
+        return js_exception;
+    };
+    return js_undefined;
+}
+
 // ── Classify a handler return value ────────────────────────────────
 
 /// Return a `Stream` iff `val` is a branded `stream(...)` descriptor;
