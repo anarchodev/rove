@@ -1101,6 +1101,16 @@ fn resumeContinuation(
     sess: h2.Session,
     outcome_json: []const u8,
     allow_repark: bool,
+    /// Handler-surface Phase 1: true ⇒ this is an `on.*` connection-wake
+    /// resume (timer expiry / kv match), not a `send_callback`. Routes to
+    /// the `StreamWakes.wake_to` export (default `onWake`) with a body of
+    /// `{fn, args:[ctx]}` (no callee outcome) and a `.wake_batch`
+    /// activation. Everything downstream (terminal / continuation / write
+    /// handling, re-park) is identical — and on a `next()` re-park the
+    /// entity's `StreamWakes` rides along untouched, so a recurring
+    /// `on.timer` keeps firing without re-arming (sweep advances
+    /// `next_wake_ns` each fire), matching the stream wake path.
+    wake: bool,
 ) !void {
     const allocator = worker.allocator;
     const server = worker.h2;
@@ -1133,8 +1143,17 @@ fn resumeContinuation(
     // A continuation is an internal request: named export → RPC
     // envelope `{fn,args:[ctx,outcome]}`; default export → body
     // object `{ctx,outcome}`. ctx_json/outcome_json are JSON text
-    // embedded verbatim.
-    const body = if (cont_fn_name) |fnname|
+    // embedded verbatim. A wake resume routes to the StreamWakes
+    // `wake_to` export (default `onWake`) with no callee outcome —
+    // `{fn,args:[ctx]}` — and drains the entity's wake ring so the
+    // fired entries are consumed (the timer-due / kv-match trigger).
+    const resume_fn: ?[]const u8 = if (wake) blk: {
+        const sw = server.reg.get(ent, &worker.parked_continuations, components_mod.StreamWakes) catch break :blk "onWake";
+        break :blk if (sw.wake_to) |t| t else "onWake";
+    } else cont_fn_name;
+    const body = if (wake)
+        try std.fmt.allocPrint(allocator, "{{\"fn\":\"{s}\",\"args\":[{s}]}}", .{ resume_fn.?, cont_ctx_json })
+    else if (cont_fn_name) |fnname|
         try std.fmt.allocPrint(allocator, "{{\"fn\":\"{s}\",\"args\":[{s},{s}]}}", .{ fnname, cont_ctx_json, outcome_json })
     else
         try std.fmt.allocPrint(allocator, "{{\"ctx\":{s},\"outcome\":{s}}}", .{ cont_ctx_json, outcome_json });
@@ -1174,9 +1193,9 @@ fn resumeContinuation(
         // Inherit the chain id from the parking request so every
         // tape row of this chain shares one correlation_id; mark
         // this activation as a send-callback resume (streaming-
-        // handlers-plan §6).
+        // handlers-plan §6) — or .wake_batch for an on.* connection wake.
         .correlation_id = correlation_id,
-        .activation_source = .send_callback,
+        .activation_source = if (wake) .wake_batch else .send_callback,
     };
     std.log.info("rove-js corr: resume corr={s} request_id={d} tenant={s}", .{ correlation_id orelse "(none)", request_id, inst.id });
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
@@ -1802,7 +1821,7 @@ pub fn resumeBoundContinuation(
                 if (bsid != null and std.mem.eql(u8, bsid.?, sched_id)) {
                     const sid = server.reg.get(ent, &worker.parked_continuations, h2.StreamId) catch return false;
                     const sess = server.reg.get(ent, &worker.parked_continuations, h2.Session) catch return false;
-                    resumeContinuation(worker, ent, sid.*, sess.*, outcome_json, true) catch |err| {
+                    resumeContinuation(worker, ent, sid.*, sess.*, outcome_json, true, false) catch |err| {
                         std.log.warn(
                             "rove-js cont-resume: {s}/{s}: {s}; 502",
                             .{ tenant_id, sched_id, @errorName(err) },
@@ -1834,7 +1853,7 @@ pub fn resumeBoundContinuation(
             "rove-js cont-resume: registry miss; fallback scan matched send_id={s} tenant={s}",
             .{ sched_id, tenant_id },
         );
-        resumeContinuation(worker, ent, sid, sess, outcome_json, true) catch |err| {
+        resumeContinuation(worker, ent, sid, sess, outcome_json, true, false) catch |err| {
             std.log.warn(
                 "rove-js cont-resume: {s}/{s}: {s}; 502",
                 .{ tenant_id, sched_id, @errorName(err) },
@@ -1887,28 +1906,51 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
     const allocator = worker.allocator;
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
 
-    // Collect expired first — resume/resolve mutate the collection,
-    // so snapshot (ent,sid,sess) while the slice is stable.
-    const Expired = struct { ent: rove.Entity, sid: h2.StreamId, sess: h2.Session };
-    var expired: std.ArrayListUnmanaged(Expired) = .empty;
+    // Collect work first — resume/resolve mutate the collection, so
+    // snapshot (ent,sid,sess) while the slice is stable. Deadline takes
+    // priority over a due timer (a mandatory §6.4 timeout terminates,
+    // it doesn't fire onWake).
+    const Pending = struct { ent: rove.Entity, sid: h2.StreamId, sess: h2.Session };
+    var expired: std.ArrayListUnmanaged(Pending) = .empty;
     defer expired.deinit(allocator);
+    var timer_due: std.ArrayListUnmanaged(Pending) = .empty;
+    defer timer_due.deinit(allocator);
     {
         const sids = worker.parked_continuations.column(h2.StreamId);
         const sesss = worker.parked_continuations.column(h2.Session);
         const descs = worker.parked_continuations.column(components_mod.ContDescriptor);
-        for (ents, sids, sesss, descs) |ent, sid, sess, desc| {
-            if (now_ns >= desc.deadline_ns)
+        const wakes = worker.parked_continuations.column(components_mod.StreamWakes);
+        for (ents, sids, sesss, descs, wakes) |ent, sid, sess, desc, *sw| {
+            if (now_ns >= desc.deadline_ns) {
                 try expired.append(allocator, .{ .ent = ent, .sid = sid, .sess = sess });
+            } else if (sw.interval_ms > 0 and now_ns >= sw.next_wake_ns) {
+                // Recurring `on.timer`: advance `next_wake_ns` (drift-on-
+                // fire, matching `serviceParkedStreams`) so it re-fires
+                // next interval, then resume the held handler at
+                // `onWake`/`{to}`. The StreamWakes component rides the
+                // re-park, so no re-arming is needed for recurrence.
+                sw.next_wake_ns = now_ns + sw.interval_ms * std.time.ns_per_ms;
+                try timer_due.append(allocator, .{ .ent = ent, .sid = sid, .sess = sess });
+            }
         }
     }
 
     for (expired.items) |e| {
-        resumeContinuation(worker, e.ent, e.sid, e.sess, "{\"ok\":false,\"reason\":\"deadline\"}", false) catch |err| {
+        resumeContinuation(worker, e.ent, e.sid, e.sess, "{\"ok\":false,\"reason\":\"deadline\"}", false, false) catch |err| {
             std.log.warn(
                 "rove-js continuation: deadline resume failed ({s}); hard 504",
                 .{@errorName(err)},
             );
             resolveParked(worker, e.ent, e.sid, e.sess, 504, "hold deadline exceeded\n") catch {};
+        };
+    }
+
+    for (timer_due.items) |e| {
+        // `on.timer` wake (no callee outcome). Best-effort: on failure the
+        // entity stays parked and the next interval retries; a thrown/erroring
+        // onWake resolves via resumeContinuation's own error handling.
+        resumeContinuation(worker, e.ent, e.sid, e.sess, "", true, true) catch |err| {
+            std.log.warn("rove-js continuation: on.timer wake resume failed ({s})", .{@errorName(err)});
         };
     }
 }
