@@ -11,16 +11,15 @@
 //   2. ~80 fat chunks (~4 KB each = ~320 KB) — exceeds the 256 KB cap so
 //      ~16-20 chunks drop per activation. The status frame always
 //      survives because it goes FIRST.
+const FAT_CHUNK = "data: " + "X".repeat(3950) + "\n\n"; // ~3.96 KB
+
+function emit(prior_dropped) {
+    stream.write(`event: pressure\ndata: dropped=${prior_dropped}\n\n`);
+    for (let i = 0; i < 80; i++) stream.write(FAT_CHUNK);
+}
+
 export default function () {
-    const a = request.activation;
-    const chunk = "data: " + "X".repeat(3950) + "\n\n"; // ~3.96 KB
-
-    function emit(prior_dropped) {
-        stream.write(`event: pressure\ndata: dropped=${prior_dropped}\n\n`);
-        for (let i = 0; i < 80; i++) stream.write(chunk);
-    }
-
-    if (a.kind === "inbound") {
+    if (request.activation.kind === "inbound") {
         response.status = 200;
         response.headers = {
             "Content-Type": "text/event-stream",
@@ -31,11 +30,14 @@ export default function () {
         on.timer(100);
         return __rove_next("big_chunks/index", {});
     }
-    if (a.kind === "wake_batch") {
-        stream.start();
-        emit(a.write_pressure.dropped_chunks);
-        on.timer(100);
-        return __rove_next("big_chunks/index", {});
-    }
     return "";
+}
+
+// Timer wake — echo the prior activation's dropped-chunk count, then
+// flood again.
+export function onWake() {
+    stream.start();
+    emit(request.activation.write_pressure.dropped_chunks);
+    on.timer(100);
+    return __rove_next("big_chunks/index", {});
 }

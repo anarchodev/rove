@@ -20,22 +20,24 @@ export default function () {
         on.timer(100);
         return __rove_next("disc_writer/index", {});
     }
-    if (a.kind === "wake_batch") {
-        // Timer-fired heartbeat (no kv wakes registered → timer-only
-        // batch). One frame per timer entry.
-        stream.start();
-        for (const w of a.wakes) {
-            if (w.kind === "timer") stream.write(":hb\n\n");
-        }
-        on.timer(100);
-        return __rove_next("disc_writer/index", {});
-    }
     if (a.kind === "disconnect") {
         // The cleanup write — set a marker key. The smoke reads it back
-        // via /readkey after disconnect.
+        // via /readkey after disconnect. (`onDisconnect` is Phase 4's
+        // follow-up; disconnect still lands on the default export.)
         const id = (request.ctx && request.ctx.id) || "1";
         kv.set("disc_marker/" + id, "fired");
         return "";
     }
     return "";
+}
+
+// Timer-fired heartbeat (no kv wakes registered → timer-only batch).
+// One frame per timer entry.
+export function onWake() {
+    stream.start();
+    for (const w of request.activation.wakes) {
+        if (w.kind === "timer") stream.write(":hb\n\n");
+    }
+    on.timer(100);
+    return __rove_next("disc_writer/index", {});
 }

@@ -5,8 +5,7 @@
 // fires, so the wake_batch hop's propose can't quorum; the staged chunk
 // must NOT leak. (Handler-surface Phase 2 `stream.*` surface.)
 export default function () {
-    const a = request.activation;
-    if (a.kind === "inbound") {
+    if (request.activation.kind === "inbound") {
         response.status = 200;
         response.headers = {
             "Content-Type": "text/event-stream",
@@ -20,17 +19,17 @@ export default function () {
         on.timer(1500);
         return __rove_next("index", {});
     }
-    if (a.kind === "wake_batch") {
-        // wake_batch + writes: the arm Phase 4.0.b gates. A raft fault
-        // during the commit-wait window must discard the staged "tick"
-        // chunk; the customer must NOT see this frame on the wire until
-        // the kv.set durably commits.
-        const ctr = parseInt(kv.get("counter") ?? "0") + 1;
-        kv.set("counter", String(ctr));
-        stream.start();
-        stream.write(`event: tick\ndata: ${ctr}\n\n`);
-        on.timer(1500);
-        return __rove_next("index", {});
-    }
     return "";
+}
+
+// wake_batch + writes: the arm Phase 4.0.b gates. A raft fault during
+// the commit-wait window must discard the staged "tick" chunk; the
+// customer must NOT see this frame until the kv.set durably commits.
+export function onWake() {
+    const ctr = parseInt(kv.get("counter") ?? "0") + 1;
+    kv.set("counter", String(ctr));
+    stream.start();
+    stream.write(`event: tick\ndata: ${ctr}\n\n`);
+    on.timer(1500);
+    return __rove_next("index", {});
 }

@@ -1113,14 +1113,19 @@ fn parseDispatch(
     }
 
     // Query-string path: ?fn=name[&args=<urlencoded-json-array>].
-    // Both optional. Missing or empty fn → "default" (PLAN §2.4: the
-    // default export is the modern path, called with no arguments).
+    // Both optional. Missing or empty fn → the activation kind's
+    // conventional export (handler-surface Phase 4, docs/handler-shape.md
+    // §3): a `wake_batch` (`on.kv`/`on.timer`) resume lands in `onWake`,
+    // inbound + everything that names its own target (the `?fn=`/`{fn}`
+    // resume paths: send_callback, fetch_chunk, cron, subscription) stay
+    // `default`. Named exports replace the `request.activation.kind`
+    // switch as the dispatch surface.
     const query = request.query orelse "";
     const fn_owned: []u8 = blk: {
         if (queryParam(query, "fn")) |s| {
             if (s.len > 0) break :blk try decodePercent(allocator, s);
         }
-        break :blk try allocator.dupe(u8, "default");
+        break :blk try allocator.dupe(u8, defaultExportForKind(request.activation_source));
     };
     errdefer allocator.free(fn_owned);
 
@@ -1132,6 +1137,22 @@ fn parseDispatch(
     };
 
     return .{ .fn_name = fn_owned, .args_json_text = args_text };
+}
+
+/// Handler-surface Phase 4: map an activation source to its conventional
+/// named export, used when the resume path didn't name one explicitly
+/// (`?fn=`/`{fn}`). `wake_batch` (the `on.kv`/`on.timer` edge wake — and
+/// the legacy singular `kv_wake`/`timer`) lands in `onWake`. Inbound and
+/// the kinds whose resume path always names its own target — send_callback
+/// (the `next({fn})` / `on_result`), fetch_chunk (`{to}`/`onFetchChunk`),
+/// cron + subscription_fire (the registration's export), durable_wake (the
+/// baked `scheduler_tick` default) — fall through to `default`, so this
+/// only changes the previously-unrouted stream-wake + (future) paths.
+fn defaultExportForKind(src: ActivationSource) []const u8 {
+    return switch (src) {
+        .wake_batch, .kv_wake, .timer => "onWake",
+        else => "default",
+    };
 }
 
 fn looksLikeJson(body: []const u8) bool {

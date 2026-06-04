@@ -13,8 +13,7 @@
 // decides when the stream ends: client disconnect, or the per-stream
 // activation cap (MAX_STREAM_ACTIVATIONS).
 export default function () {
-    const a = request.activation;
-    if (a.kind === "inbound") {
+    if (request.activation.kind === "inbound") {
         response.status = 200;
         response.headers = {
             "Content-Type": "text/event-stream",
@@ -25,13 +24,15 @@ export default function () {
         on.timer(200);
         return __rove_next("heartbeat/index", {});
     }
-    if (a.kind === "wake_batch") {
-        stream.start(); // keep the stream alive even if zero frames this wake
-        for (const w of a.wakes) {
-            if (w.kind === "timer") stream.write(":heartbeat\n\n");
-        }
-        on.timer(200);
-        return __rove_next("heartbeat/index", {});
-    }
     return ""; // close
+}
+
+// Timer wake — emit a heartbeat per timer entry, re-arm.
+export function onWake() {
+    stream.start(); // keep the stream alive even if zero frames this wake
+    for (const w of request.activation.wakes) {
+        if (w.kind === "timer") stream.write(":heartbeat\n\n");
+    }
+    on.timer(200);
+    return __rove_next("heartbeat/index", {});
 }

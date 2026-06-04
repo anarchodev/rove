@@ -11,8 +11,7 @@
 // stream pipeline (stream_response_in → stream_data_out) →
 // serviceParkedStreams → resumeStream → (re-dispatch) → bridge again.
 export default function () {
-    const a = request.activation;
-    if (a.kind === "inbound") {
+    if (request.activation.kind === "inbound") {
         // The head is the ambient response.* (no descriptor head).
         response.status = 200;
         response.headers = {
@@ -24,17 +23,19 @@ export default function () {
         on.kv("streamkv/in/");                        // wait for writes
         return __rove_next("streamkv/index", {});     // hold the socket
     }
-    if (a.kind === "wake_batch") {
-        stream.start(); // keep the stream alive even on a zero-frame wake
-        // One frame per kv entry in the §9.4 batch (temporal order).
-        for (const w of a.wakes) {
-            if (w.kind !== "kv") continue;
-            const v = kv.get(w.key) ?? "(absent)";
-            stream.write("event: update\ndata: " + w.key + "=" + v + "\n\n");
-        }
-        on.kv("streamkv/in/");                        // re-arm
-        return __rove_next("streamkv/index", {});
-    }
     // Disconnect (or anything else): close.
     return "";
+}
+
+// A kv write under the watched prefix landed (§8.4-gated) — emit one
+// frame per kv entry in the §9.4 batch (temporal order), then re-arm.
+export function onWake() {
+    stream.start(); // keep the stream alive even on a zero-frame wake
+    for (const w of request.activation.wakes) {
+        if (w.kind !== "kv") continue;
+        const v = kv.get(w.key) ?? "(absent)";
+        stream.write("event: update\ndata: " + w.key + "=" + v + "\n\n");
+    }
+    on.kv("streamkv/in/");                        // re-arm
+    return __rove_next("streamkv/index", {});
 }

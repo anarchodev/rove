@@ -10,8 +10,7 @@
 // durably via `drainRaftPending` (chunks gated on commit per
 // streaming-model §2).
 export default function () {
-    const a = request.activation;
-    if (a.kind === "inbound") {
+    if (request.activation.kind === "inbound") {
         response.status = 200;
         response.headers = {
             "Content-Type": "text/event-stream",
@@ -22,18 +21,20 @@ export default function () {
         on.kv("watchwrite/in/");
         return __rove_next("watchwrite/index", {});
     }
-    if (a.kind === "wake_batch") {
-        // §9.4: relay every kv entry in the batch in temporal order.
-        stream.start(); // keep the stream alive even on a zero-frame wake
-        for (const w of a.wakes) {
-            if (w.kind !== "kv") continue;
-            const value = kv.get(w.key) ?? "(absent)";
-            const out_key = "watchwrite/out/" + w.key.slice("watchwrite/in/".length);
-            kv.set(out_key, "processed:" + value);
-            stream.write(`event: relayed\ndata: ${w.key}->${out_key}\n\n`);
-        }
-        on.kv("watchwrite/in/");
-        return __rove_next("watchwrite/index", {});
-    }
     return "";
+}
+
+// §9.4: relay every kv entry in the wake batch in temporal order,
+// writing a processed marker per key.
+export function onWake() {
+    stream.start(); // keep the stream alive even on a zero-frame wake
+    for (const w of request.activation.wakes) {
+        if (w.kind !== "kv") continue;
+        const value = kv.get(w.key) ?? "(absent)";
+        const out_key = "watchwrite/out/" + w.key.slice("watchwrite/in/".length);
+        kv.set(out_key, "processed:" + value);
+        stream.write(`event: relayed\ndata: ${w.key}->${out_key}\n\n`);
+    }
+    on.kv("watchwrite/in/");
+    return __rove_next("watchwrite/index", {});
 }
