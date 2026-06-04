@@ -13,9 +13,11 @@
 // drains them in temporal order; `wakes[i]` carries
 // `{kind:"kv",key,op,firedAt}` or `{kind:"timer",firedAt}`;
 // `overflow.lost_oldest` reports any ring-overflow), or `"disconnect"`.
+// Inbound (the default export): open the stream + arm the kv wake.
+// The kv-write wake lands in onWake (Phase 4 named-export dispatch);
+// disconnect / anything else closes.
 export default function () {
-    const a = request.activation;
-    if (a.kind === "inbound") {
+    if (request.activation.kind === "inbound") {
         response.status = 200;
         response.headers = {
             "Content-Type": "text/event-stream",
@@ -26,20 +28,22 @@ export default function () {
         on.kv("watch/");
         return __rove_next("watch/index", {});
     }
-    if (a.kind === "wake_batch") {
-        // One frame per kv entry in the batch (temporal order). Timer
-        // entries are ignored — this handler only registered kv wakes.
-        // `overflow.lost_oldest > 0` would mean we missed writes; the
-        // recommended response is to re-snapshot, but here we continue.
-        stream.start(); // keep the stream alive even on a zero-frame wake
-        for (const w of a.wakes) {
-            if (w.kind !== "kv") continue;
-            const value = kv.get(w.key) ?? "(deleted)";
-            stream.write(`event: update\ndata: ${w.key}=${value} (${w.op})\n\n`);
-        }
-        on.kv("watch/");
-        return __rove_next("watch/index", {});
-    }
     // Disconnect (or anything else): record + close.
     return "";
+}
+
+// One frame per kv entry in the batch (temporal order). Timer entries
+// are ignored — this handler only registered kv wakes.
+// `request.activation.overflow.lost_oldest > 0` would mean we missed
+// writes; the recommended response is to re-snapshot, but here we
+// continue.
+export function onWake() {
+    stream.start(); // keep the stream alive even on a zero-frame wake
+    for (const w of request.activation.wakes) {
+        if (w.kind !== "kv") continue;
+        const value = kv.get(w.key) ?? "(deleted)";
+        stream.write(`event: update\ndata: ${w.key}=${value} (${w.op})\n\n`);
+    }
+    on.kv("watch/");
+    return __rove_next("watch/index", {});
 }

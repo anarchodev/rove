@@ -8,8 +8,7 @@
 // genuinely streaming (CURLOPT_WRITEFUNCTION): chunks must arrive
 // incrementally, well before the fetch's timeout fires.
 export default function () {
-    const a = request.activation;
-    if (a.kind === "inbound") {
+    if (request.activation.kind === "inbound") {
         response.status = 200;
         response.headers = { "Content-Type": "text/plain" };
         stream.start();
@@ -17,14 +16,15 @@ export default function () {
         on.timer(120);
         return __rove_next("drip/index", {});
     }
-    if (a.kind === "wake_batch") {
-        // One frame per timer tick — never returns terminal, so the
-        // stream runs until the fetch times out + libcurl FINs.
-        stream.start();
-        stream.write("drip\n");
-        on.timer(120);
-        return __rove_next("drip/index", {});
-    }
     // disconnect (client gone): close.
     return "";
+}
+
+// One frame per timer tick — never returns terminal, so the stream
+// runs until the fetch times out + libcurl FINs.
+export function onWake() {
+    stream.start();
+    stream.write("drip\n");
+    on.timer(120);
+    return __rove_next("drip/index", {});
 }
