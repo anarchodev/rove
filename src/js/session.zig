@@ -1,7 +1,25 @@
 //! Platform-managed session cookie. Eagerly minted on every JS-handler
 //! request that doesn't already carry one. Exposed to handlers as
-//! `request.session.id`. Defines the SSE event-routing identity per
-//! `docs/sse-plan.md` §1.
+//! `request.session.id` — a guaranteed-present, host-isolated browser
+//! identity available on every activation.
+//!
+//! ## Primary consumer: the auth stack
+//!
+//! Originally added as the SSE event-routing identity; that subsystem
+//! was retired (streaming-handlers Phase 5, 2026-05-19 — cross-node
+//! SSE now rides raft-replicated kv-write wakes, no sticky-session
+//! routing). The cookie's load-bearing role today is the auth anchor
+//! for `globals/oidc.js` (both the IdP and the relying party, incl.
+//! the platform's own `__auth__` IdP + admin dashboard). The OIDC RP
+//! depends on a *platform-minted* cookie specifically: its token
+//! exchange completes in a synthesized callback that has no
+//! `request.session` and can't set cookies, so it needs a stable id
+//! that already exists on the real browser request before login
+//! finishes (see `oidc.js` `beginLogin` → `_rp/sess/{sid}`).
+//!
+//! The customer `globals/sessions.js` library mints its OWN cookie and
+//! does not use this one — self-mint is the pattern any library can
+//! follow; this cookie is the platform-provided default.
 //!
 //! ## Cookie shape
 //!
@@ -12,16 +30,15 @@
 //! is present, no `Domain=` attribute is given, and `Path=/`. So the
 //! prefix catches misconfiguration at the browser, not just on our
 //! end. It also forbids cross-host send: a tenant-A cookie is never
-//! sent to tenant-B, providing free defense-in-depth on top of the
-//! structural per-tenant-app.db isolation that the SSE pump already
-//! enforces.
+//! sent to tenant-B, a browser-enforced isolation guarantee on top of
+//! the structural per-tenant-app.db isolation.
 //!
 //! ## Mint policy
 //!
 //! Static-asset and `/_system/*` paths short-circuit before this
 //! function is called, so they don't pollute. Any handler-dispatch
-//! path or `/_events` connect that doesn't see `__Host-rove_sid` in
-//! the request gets a fresh sid minted and `Set-Cookie` appended.
+//! path that doesn't see `__Host-rove_sid` in the request gets a
+//! fresh sid minted and `Set-Cookie` appended.
 //!
 //! ## Why no validation table
 //!
@@ -198,7 +215,7 @@ test "resolve: re-mints when cookie has non-hex char" {
 
 test "cross-host isolation: tenant A cookie not seen on tenant B request" {
     // This is the host-binding half of the cross-tenant isolation
-    // argument from docs/sse-plan.md §2.3. The `__Host-` cookie
+    // argument (see the `## Cookie shape` note above). The `__Host-` cookie
     // prefix forbids `Domain=` and forces host-only scope, so a
     // browser holding tenant-A's cookie does NOT send it to
     // tenant-B's subdomain. We can't test the BROWSER side here
@@ -259,7 +276,7 @@ test "cross-host isolation: malformed cross-host cookie is rejected and remints"
     const r = resolve(hdrs, prng.random());
     try testing.expect(!r.mint_set_cookie);
     try testing.expectEqualSlices(u8, sid_a, &r.sid);
-    // The defense lives at the kv-scope layer: the pump on the
+    // The defense lives at the kv-scope layer: the handler on the
     // host receiving this cookie reads from THAT host's tenant's
     // app.db, where no other tenant can write.
 }
