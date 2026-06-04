@@ -250,18 +250,37 @@ The set of *kinds* is closed (runtime-defined). The `to:` option on
 `on.*` (and the target on the connectionless verbs) chooses **which
 export** a trigger's activation lands in; it does not invent a kind.
 
-> **Shipped (Phase 4):** the runtime maps `activation_source → export`
-> when the resume path didn't name one. `wake_batch` (`on.kv`/`on.timer`)
-> → `onWake`; `disconnect` → `onDisconnect` (a missing `onDisconnect` is
-> a no-op — cleanup is optional). The kinds whose resume path already
-> names its target — `on.fetch` (`onFetchChunk` / `{to}`), `webhook.send`
-> (`onResult`), `cron`/`schedule` (the named target) — route through that
-> name. `request.activation.kind` is no longer a dispatch discriminator
-> (the named export is); it remains on `request.activation` alongside the
-> wake payload (`wakes` / `overflow` / `write_pressure`). The finer
-> inbound-chunk (`onChunk`) and `onFetchResult`/`onFetchDone` splits in
-> the table above are the target convention, wired as those paths are
-> reshaped.
+> **Shipped (Phase 4 + finer conventions):** the runtime maps
+> `activation_source → export` when the resume path didn't name one.
+> `wake_batch` (`on.kv`/`on.timer`) → `onWake`; `disconnect` →
+> `onDisconnect` (a missing `onDisconnect` is a no-op — cleanup is
+> optional).
+>
+> **`on.fetch` (bound, connection-scoped) now splits by event shape**
+> when no `{to}` is given: a non-streaming fetch (one `final` event with
+> the whole body) → `onFetchResult`; a streaming fetch's intermediate
+> chunks (`final == false`) → `onFetchChunk`; its terminal event
+> (`final == true`) → `onFetchDone`. An explicit `{to}` overrides for
+> every event of the fetch (the handler then branches on
+> `request.done`).
+>
+> **`_subscriptions/` fires now dispatch by trigger source:** a boot
+> fire → `onBoot`, a cron fire → `onCron`, a kv-react fire →
+> `onSubscription` — so a subscription module no longer branches on
+> `request.activation.source.kind`. (The `cron(spec, target, …)` verb is
+> a separate surface that names its own target via the durable
+> scheduler.) `webhook.send` results route through the shim's named
+> `onResult`; an unnamed cross-module `next({module})` chain legitimately
+> targets that module's `default`, so there is no forced `onSendCallback`
+> default.
+>
+> A missing conventional export is the fail-loud 404 backstop
+> (`runModule`). `request.activation.kind` is no longer a dispatch
+> discriminator (the named export is); it remains on
+> `request.activation` alongside the wake / source payload (`wakes` /
+> `overflow` / `write_pressure` / `source`). The inbound-chunk
+> (`onChunk`) split in the table above remains the target convention,
+> wired as that path is reshaped.
 
 The scope column is load-bearing: a **connection** activation runs with
 the held socket (it can call `stream.*`/`on.*` and return `next`/a
@@ -477,7 +496,54 @@ rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
   `deploymentId`, `result`, …) but **no** HTTP `headers`/`body`, and the
   connection verbs are inert (§2.4).
 
-## 8. What's gone vs `streaming-model.md` §3 (and prior revisions)
+## 8. App manifest (reserved seam)
+
+A bundle MAY ship a root **`manifest.json`** declaring the app's
+identity and intent:
+
+```json
+{
+  "name": "link-shortener",
+  "version": "1.0.0",
+  "config":   { "schema": { "API_KEY": { "type": "string" } } },
+  "effects":  { "declared": ["kv", "on.fetch"] },
+  "metadata": { "description": "…", "homepage": "…" }
+}
+```
+
+Required: `name` + `version` (non-empty strings). Optional: `config`
+(install-time secrets/config schema), `effects` (declared — later
+auto-derivable from the replay tape), `metadata` (listing). Unknown
+top-level fields are accepted while the schema is still wet.
+
+**Why now, even though nothing consumes it.** This is the deliberate
+seam for the self-hosters marketplace (a community-installable app = a
+tenant). Apps written *today* should be born-distributable; retrofitting
+a manifest later means re-authoring every app. So the seam is reserved
+pre-launch even though the consumer (install-time capability grants, a
+registry, runtime config injection) is post-launch.
+
+**Status — reserved + INERT.**
+- **Validated at deploy.** `deployManifest` (files-server) structurally
+  validates a root `manifest.json` before mutating the working tree; a
+  malformed one rejects the deploy `400 InvalidAppManifest` (immediate
+  author feedback). Absent is fine — the file is optional.
+- **Born-distributable for free.** `manifest.json` is an ordinary static
+  bundle file, so it ships content-addressed in the deployment and
+  travels with the app — no separate storage.
+- **Nothing consumes it yet.** No capability enforcement, no registry,
+  and no runtime `_deploy/manifest` pointer. The `_deploy/manifest`
+  *kv* key is reserved for whichever consumer first needs the active
+  manifest without resolving the file blob; it deliberately is *not*
+  written today (it would have to be threaded through three distinct
+  release paths — the Zig bootstrap release, the `__admin__`
+  `publishRelease` RPC, and the seed — and a one-of-three wiring would
+  be a half-seam).
+
+The validator lives in `rove-files` (`app_manifest.zig`); see the
+self-hosters marketplace plan for the consuming side.
+
+## 9. What's gone vs `streaming-model.md` §3 (and prior revisions)
 
 - `request.activation.kind` switch → runtime dispatches by export name
 - `__rove_stream({…})` / the `stream` **return verb** → `stream.start()`
@@ -492,7 +558,7 @@ rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
 - `ctx.state` scratchpad → forbidden; durable state in `kv`, ephemeral
   connection state in `ctx`
 
-## 9. What's unchanged
+## 10. What's unchanged
 
 - The engine model: pure function per activation, arena reset between
   activations, no closure smuggling
@@ -506,7 +572,7 @@ rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
 - The substrate: blob coordinator, readset replication, content-
   addressed extents; the 64 KiB internal coalesce budget
 
-## 10. Open questions
+## 11. Open questions
 
 1. **`stream.*` / `on.*` as ambient namespaces vs imports.** Current:
    `stream`/`on`/`kv`/`response` are ambient (effects/state); only `next`
@@ -521,7 +587,7 @@ rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
 4. **`default` vs `onInbound`.** Keep `default` for the familiar simple
    case; alias to `onInbound` internally.
 
-## 11. Relation to other plans
+## 12. Relation to other plans
 
 - `effect-algebra.md` §8 — the scope model; §8.3 `bind`/`detach`
   retirement; §8.4 watch-before-write; §8.5 "grammar position = scope."

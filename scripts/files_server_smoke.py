@@ -246,6 +246,47 @@ def main() -> int:
                 }))
         expect("POST /deployments missing blob", 400, r.status)
 
+        # ── App-manifest seam (docs/handler-shape.md §8) ─────────────
+        # A bundle-root manifest.json is a static file; deploy validates
+        # it structurally (author feedback) but nothing consumes it yet.
+        good_manifest = json.dumps({
+            "name": "link-shortener",
+            "version": "1.0.0",
+            "effects": {"declared": ["kv"]},
+        })
+        good_hash = hashlib.sha256(good_manifest.encode()).hexdigest()
+        r = h2c(f"http://127.0.0.1:{port}/twophase/blobs/{good_hash}",
+                method="PUT", headers=auth, data=good_manifest)
+        expect("PUT valid manifest.json blob", 204, r.status)
+        r = h2c(f"http://127.0.0.1:{port}/twophase/deployments", method="POST",
+                headers={**auth, "Content-Type": "application/json"},
+                data=json.dumps({"files": {
+                    "index.mjs": {"hash": handler_hash, "kind": "handler"},
+                    "manifest.json": {"hash": good_hash, "kind": "static",
+                                      "content_type": "application/json"},
+                }}))
+        if '"id":"' not in r.body:
+            sys.exit(f"FAIL valid manifest deploy rejected: {r.status} {r.body}")
+        print("ok  deploy with valid manifest.json accepted")
+
+        # Invalid manifest.json (missing required `version`) → 400.
+        bad_manifest = json.dumps({"name": "oops"})
+        bad_hash = hashlib.sha256(bad_manifest.encode()).hexdigest()
+        r = h2c(f"http://127.0.0.1:{port}/twophase/blobs/{bad_hash}",
+                method="PUT", headers=auth, data=bad_manifest)
+        expect("PUT invalid manifest.json blob", 204, r.status)
+        r = h2c(f"http://127.0.0.1:{port}/twophase/deployments", method="POST",
+                headers={**auth, "Content-Type": "application/json"},
+                data=json.dumps({"files": {
+                    "index.mjs": {"hash": handler_hash, "kind": "handler"},
+                    "manifest.json": {"hash": bad_hash, "kind": "static",
+                                      "content_type": "application/json"},
+                }}))
+        expect("deploy with invalid manifest.json", 400, r.status)
+        if "InvalidAppManifest" not in r.body:
+            sys.exit(f"FAIL expected InvalidAppManifest in body: {r.body}")
+        print("ok  invalid manifest.json rejected as InvalidAppManifest")
+
         print("PASS files-server smoke")
         return 0
     finally:

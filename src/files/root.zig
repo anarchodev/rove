@@ -60,6 +60,7 @@ pub const KvStore = kv.KvStore;
 pub const BlobStore = blob_mod.BlobStore;
 
 pub const manifest_json = @import("manifest_json.zig");
+pub const app_manifest = @import("app_manifest.zig");
 
 pub const Error = error{
     NotFound,
@@ -974,4 +975,5 @@ test "assembleManifest produces mixed handler + static entries with content-type
 
 test {
     _ = manifest_json;
+    _ = app_manifest;
 }

@@ -8,11 +8,8 @@
 // `<tenant>|<name>`); leader change resets the cron clock, which
 // can pause cron for up to one interval. Customer-side
 // idempotency / missed-tick tolerance is the documented contract.
-export default function () {
+export function onCron() {
     const a = request.activation;
-    if (a.kind !== "subscription_fire" || a.source.kind !== "cron") {
-        return { status: 500, body: "unexpected activation" };
-    }
     const count_str = kv.get("cron-fire-count") ?? "0";
     const count = parseInt(count_str, 10) + 1;
     kv.set("cron-fire-count", String(count));

@@ -1545,14 +1545,15 @@ pub fn resumeBoundFetchChain(
     const bc = dep.bc;
 
     // Build the resume request. Target the customer's chosen
-    // named export — `ev.name` if the bind specified `name:`,
-    // else default `onFetchChunk`. Body is `{ctx: <ctx_json>}` —
+    // named export — `ev.name` if the bind specified `to:`, else the
+    // conventional fetch export (onFetchResult / onFetchChunk /
+    // onFetchDone, handler-shape.md §3). Body is `{ctx: <ctx_json>}` —
     // handler reads `request.body` for the chunk bytes from the
     // activation_fetch_bytes slot, not from request.body.
     const ctx_src: []const u8 = if (ev.ctx_json.len > 0) ev.ctx_json else "{}";
     const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{ctx_src}) catch return;
     defer allocator.free(body);
-    const fn_name: []const u8 = if (ev.name.len > 0) ev.name else "onFetchChunk";
+    const fn_name: []const u8 = ev.resolvedExport();
     const spath = std.fmt.allocPrint(allocator, "/{s}?fn={s}", .{ path, fn_name }) catch return;
     defer allocator.free(spath);
     const query = std.fmt.allocPrint(allocator, "fn={s}", .{fn_name}) catch return;

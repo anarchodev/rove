@@ -782,6 +782,7 @@ fn buildChunkEvent(
         .seq = seq,
         .byte_offset = byte_offset,
         .bind = pf.bind,
+        .stream = pf.stream,
     };
     errdefer UpstreamFetchEvent.deinit(a, (&ev)[0..1]);
     if (headers_json) |hj| ev.fetch_headers = hj;

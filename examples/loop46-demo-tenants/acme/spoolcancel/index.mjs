@@ -33,12 +33,6 @@ export default function () {
 
 export function onFetchChunk() {
     const seq = request.chunkSeq;
-    if (request.done) {
-        // Shouldn't reach here (we cancel earlier) — but if the body is
-        // tiny, close cleanly.
-        response.status = 200;
-        return "done-uncancelled@" + seq;
-    }
     if (seq >= 2) {
         // Cancel our own fetch mid-stream + terminate the held chain.
         // No kv write → wrote=false → ships immediately via resolveParked.
@@ -49,4 +43,11 @@ export function onFetchChunk() {
     const c = parseInt(kv.get("sc/count") || "0", 10) + 1;
     kv.set("sc/count", String(c));
     return next();
+}
+
+// Terminal event (handler-shape.md §3). Shouldn't normally reach here —
+// we cancel mid-stream — but a tiny body could complete before seq>=2.
+export function onFetchDone() {
+    response.status = 200;
+    return "done-uncancelled@" + request.chunkSeq;
 }

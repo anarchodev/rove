@@ -41,11 +41,9 @@ export default function () {
 // Per upstream chunk on a bound fetch. Streams "chunk:<text>" back to
 // the held client via stream.write; closes on the terminal (done=true)
 // chunk.
+// Per intermediate upstream chunk on a bound, streaming fetch. The
+// terminal event dispatches to onFetchDone (handler-shape.md §3).
 export function onFetchChunk() {
-    if (request.done) {
-        // Terminal chunk — close the stream.
-        return "";
-    }
     const text = new TextDecoder().decode(request.body);
     // Headers ride only on the first activation (ignored once the head
     // is committed).
@@ -53,4 +51,9 @@ export function onFetchChunk() {
     stream.start();
     stream.write("chunk:" + text);
     return next({ tag: "boundsmoke" });
+}
+
+// Terminal event of the streamed fetch — close the held stream.
+export function onFetchDone() {
+    return "";
 }

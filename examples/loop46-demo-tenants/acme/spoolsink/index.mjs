@@ -41,14 +41,15 @@ export default function () {
 }
 
 export function onFetchChunk() {
-    if (request.done) {
-        // Terminal: hand the reconstructed body back to the held client.
-        response.status = 200;
-        return kv.get("spoolsink/full") || "";
-    }
     const text = new TextDecoder().decode(request.body);
     const prev = kv.get("spoolsink/full") || "";
     kv.set("spoolsink/full", prev + text);
     // Stay parked as a cont — forces a raft round-trip per chunk.
     return next({ tag: "spoolsink" });
+}
+
+// Terminal event — hand the reconstructed body back to the held client.
+export function onFetchDone() {
+    response.status = 200;
+    return kv.get("spoolsink/full") || "";
 }
