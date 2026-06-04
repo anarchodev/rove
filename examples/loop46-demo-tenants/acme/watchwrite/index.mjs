@@ -10,18 +10,15 @@
 // durably via `drainRaftPending` (chunks gated on commit per
 // streaming-model §2).
 export default function () {
-    if (request.activation.kind === "inbound") {
-        response.status = 200;
-        response.headers = {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-        };
-        stream.start();
-        stream.write("event: ready\ndata: 1\n\n");
-        on.kv("watchwrite/in/");
-        return __rove_next("watchwrite/index", {});
-    }
-    return "";
+    response.status = 200;
+    response.headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+    };
+    stream.start();
+    stream.write("event: ready\ndata: 1\n\n");
+    on.kv("watchwrite/in/");
+    return __rove_next("watchwrite/index", {});
 }
 
 // §9.4: relay every kv entry in the wake batch in temporal order,

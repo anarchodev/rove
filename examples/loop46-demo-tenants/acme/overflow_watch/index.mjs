@@ -6,18 +6,15 @@
 // Pairs with `acme/overflow_burst` (writes N keys in one txn → all N
 // events broadcast → ring overflows when N > CAP=32).
 export default function () {
-    if (request.activation.kind === "inbound") {
-        response.status = 200;
-        response.headers = {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-        };
-        stream.start();
-        stream.write("event: open\ndata: ok\n\n");
-        on.kv("overflow/");
-        return __rove_next("overflow_watch/index", {});
-    }
-    return "";
+    response.status = 200;
+    response.headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+    };
+    stream.start();
+    stream.write("event: open\ndata: ok\n\n");
+    on.kv("overflow/");
+    return __rove_next("overflow_watch/index", {});
 }
 
 // One status frame per wake echoing wakes.length + overflow.lost_oldest.

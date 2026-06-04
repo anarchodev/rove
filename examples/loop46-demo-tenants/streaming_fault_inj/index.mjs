@@ -5,21 +5,18 @@
 // fires, so the wake_batch hop's propose can't quorum; the staged chunk
 // must NOT leak. (Handler-surface Phase 2 `stream.*` surface.)
 export default function () {
-    if (request.activation.kind === "inbound") {
-        response.status = 200;
-        response.headers = {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-        };
-        stream.start();
-        stream.write("event: ready\ndata: 1\n\n");
-        // 1.5s timer — wide enough that the smoke can SIGSTOP followers
-        // before the wake fires, narrow enough to exercise the gate
-        // within a smoke's deadline.
-        on.timer(1500);
-        return __rove_next("index", {});
-    }
-    return "";
+    response.status = 200;
+    response.headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+    };
+    stream.start();
+    stream.write("event: ready\ndata: 1\n\n");
+    // 1.5s timer — wide enough that the smoke can SIGSTOP followers
+    // before the wake fires, narrow enough to exercise the gate within a
+    // smoke's deadline.
+    on.timer(1500);
+    return __rove_next("index", {});
 }
 
 // wake_batch + writes: the arm Phase 4.0.b gates. A raft fault during
