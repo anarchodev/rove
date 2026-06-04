@@ -954,4 +954,28 @@ pub fn build(b: *std.Build) void {
     rewind_exe.linkLibrary(raft_dep.artifact("raft_rs_zig"));
     const rewind_step = b.step("rewind", "Build the V2 rewind worker binary (Phase 2d)");
     rewind_step.dependOn(&b.addInstallArtifact(rewind_exe, .{}).step);
+
+    // ── rewind-front: the V2 front door (docs/v2-build-order.md §Phase 3,
+    // docs/v2-phase3-directory-routing.md §3b). An HTTP/2 terminator that
+    // resolves Host→tenant → directory.clusterFor → reverse-proxies to the
+    // owning cluster's `rewind`. No raft/kvexp/JS — it reads only the
+    // control-plane directory + forwards via libcurl. (Imports the
+    // directory source relatively, so no cp module is needed.)
+    const front_mod = b.createModule(.{
+        .root_source_file = b.path("src-v2/front/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    front_mod.addImport("rove", rove_mod);
+    front_mod.addImport("rove-h2", h2_mod);
+    front_mod.addImport("rove-blob", blob_mod);
+    front_mod.addImport("cp-directory", v2_cp_dir_mod);
+    front_mod.link_libc = true;
+    front_mod.linkSystemLibrary("nghttp2", .{});
+    front_mod.linkSystemLibrary("ssl", .{});
+    front_mod.linkSystemLibrary("crypto", .{});
+    front_mod.linkSystemLibrary("curl", .{});
+    const front_exe = b.addExecutable(.{ .name = "rewind-front", .root_module = front_mod });
+    const front_step = b.step("rewind-front", "Build the V2 front-door binary (Phase 3b)");
+    front_step.dependOn(&b.addInstallArtifact(front_exe, .{}).step);
 }

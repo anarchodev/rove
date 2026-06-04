@@ -31,8 +31,12 @@ const Bridge = bridge_mod.Bridge;
 const Worker = rjs.Worker(.{});
 
 /// 2e smoke: the host the admin surface answers on + the root bearer.
-const ADMIN_API_DOMAIN = "admin.localhost";
-const ADMIN_ROOT_TOKEN = "rewindtestroottokenpadding0123456789abcd";
+/// Overridable via env (`REWIND_ADMIN_DOMAIN` / `REWIND_ROOT_TOKEN`) so a
+/// two-cluster Phase-3 deployment can give each cluster a DISTINCT admin
+/// domain — the front-door routing proof keys off "Host matches this
+/// cluster's admin domain → 204, else mismatch" (two_cluster_smoke.py).
+const DEFAULT_ADMIN_API_DOMAIN = "admin.localhost";
+const DEFAULT_ADMIN_ROOT_TOKEN = "rewindtestroottokenpadding0123456789abcd";
 
 // ── Signal-driven shutdown ────────────────────────────────────────────
 var stop_flag: std.atomic.Value(bool) = .init(false);
@@ -90,6 +94,7 @@ const WorkerCtx = struct {
     node: *rjs.NodeState,
     log_batch_store: log_server.batch_store.BatchStore,
     data_dir: []const u8,
+    admin_api_domain: []const u8,
     ready: *std.Thread.ResetEvent,
 };
 
@@ -129,7 +134,7 @@ fn workerMain(args: *WorkerCtx) !void {
             .tls_config = null,
         },
         .log_worker_id = args.worker_idx,
-        .admin_api_domain = ADMIN_API_DOMAIN,
+        .admin_api_domain = args.admin_api_domain,
         .rate_limit_caps = .{},
         .compile_fn = QjsCompiler.compile,
         .compile_ctx = &compiler,
@@ -181,6 +186,9 @@ pub fn main() !void {
 
     try std.fs.cwd().makePath(data_dir);
 
+    const admin_api_domain = std.posix.getenv("REWIND_ADMIN_DOMAIN") orelse DEFAULT_ADMIN_API_DOMAIN;
+    const admin_root_token = std.posix.getenv("REWIND_ROOT_TOKEN") orelse DEFAULT_ADMIN_ROOT_TOKEN;
+
     // Blob backend (fs or s3) — process-wide, env-selected.
     var blob_owned = try blob_mod.env.loadFromEnv(allocator);
     defer blob_owned.deinit(allocator);
@@ -196,7 +204,7 @@ pub fn main() !void {
     // 2e exit-smoke wiring: a root bearer so `/_system/admin-kv` (the
     // built-in envelope-0 write path) is reachable, exercising propose →
     // bridge commit → worker txn.commit end to end on a single node.
-    node_tenant.root_token_secret = ADMIN_ROOT_TOKEN;
+    node_tenant.root_token_secret = admin_root_token;
 
     // The V2 per-tenant raft bridge + its pump thread. Leader-skip: the
     // worker owns the speculative overlay.
@@ -230,11 +238,12 @@ pub fn main() !void {
         .node = &node_state,
         .log_batch_store = log_batch_store,
         .data_dir = data_dir,
+        .admin_api_domain = admin_api_domain,
         .ready = &ready,
     };
     var th = try std.Thread.spawn(.{}, workerThreadEntry, .{&ctx});
     ready.wait();
-    std.log.info("rewind: listening on 0.0.0.0:{d} (data_dir={s})", .{ port, data_dir });
+    std.log.info("rewind: listening on 0.0.0.0:{d} (data_dir={s}, admin_domain={s})", .{ port, data_dir, admin_api_domain });
 
     while (!stop_flag.load(.acquire)) std.Thread.sleep(100 * std.time.ns_per_ms);
     th.join();
