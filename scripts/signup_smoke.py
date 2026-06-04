@@ -136,12 +136,20 @@ def main() -> int:
             sys.exit(f"FAIL owned after provision: {who}")
         print("ok  /v1/session owned=[alice]")
 
-        # 7. Downstream: provisionInstance ran deployStarter, so the
-        #    new tenant serves starter content.
-        r = c.wait_for_handler("alice", "/", expected_status=200, timeout_s=15.0)
-        if "live" not in r.body.lower():
-            sys.exit(f"FAIL starter HTML: {r.body[:200]}")
-        print(f"ok  starter content: GET {alice_origin}/ → 200")
+        # 7. Downstream: provisionInstance ran deployStarter, so the new
+        #    tenant serves starter content. Per deployment-snapshots-plan
+        #    §4, a static `_static/index.html` is served as a 302 redirect
+        #    to presigned S3 (not an inline 200) — so wait for the deploy
+        #    (302, not 503), then FOLLOW the redirect to read the bytes.
+        r = c.wait_for_handler("alice", "/", expected_status=302, timeout_s=15.0)
+        expect_status("starter GET alice/ → 302", 302, r)
+        loc = r.headers.get("location", "")
+        if "X-Amz-Signature=" not in loc:
+            sys.exit(f"FAIL starter 302 Location not presigned S3: {loc!r}")
+        r = curl(cc, f"{alice_origin}/", follow_redirects=True)
+        if r.status != 200 or "live" not in r.body.lower():
+            sys.exit(f"FAIL starter HTML: status={r.status} body={r.body[:200]!r}")
+        print(f"ok  starter content: GET {alice_origin}/ → 302 → 200 (live)")
 
         print()
         print("all provisionInstance edge-case checks passed")
