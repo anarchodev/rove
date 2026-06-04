@@ -19,18 +19,15 @@ function emit(prior_dropped) {
 }
 
 export default function () {
-    if (request.activation.kind === "inbound") {
-        response.status = 200;
-        response.headers = {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-        };
-        stream.start();
-        emit(0);
-        on.timer(100);
-        return __rove_next("big_chunks/index", {});
-    }
-    return "";
+    response.status = 200;
+    response.headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+    };
+    stream.start();
+    emit(0);
+    on.timer(100);
+    return __rove_next("big_chunks/index", {});
 }
 
 // Timer wake — echo the prior activation's dropped-chunk count, then

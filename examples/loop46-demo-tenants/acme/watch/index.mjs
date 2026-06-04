@@ -8,28 +8,24 @@
 //   - kv update:         `event: update\ndata: <key>=<value> (<op>)\n\n`
 //   - disconnect:        no frame; just records a tape entry.
 //
-// `request.activation.kind` discriminates: `"inbound"` (first hop),
-// `"wake_batch"` (one or more kv/timer events fired — §9.4 accumulator
-// drains them in temporal order; `wakes[i]` carries
-// `{kind:"kv",key,op,firedAt}` or `{kind:"timer",firedAt}`;
-// `overflow.lost_oldest` reports any ring-overflow), or `"disconnect"`.
-// Inbound (the default export): open the stream + arm the kv wake.
-// The kv-write wake lands in onWake (Phase 4 named-export dispatch);
-// disconnect / anything else closes.
+// Named-export dispatch (handler-surface Phase 4): the inbound hop runs
+// the `default` export; each kv wake runs `onWake`, which reads
+// `request.activation.wakes` (§9.4 accumulator, temporal order — each
+// `wakes[i]` is `{kind:"kv",key,op,firedAt}` or `{kind:"timer",firedAt}`;
+// `request.activation.overflow.lost_oldest` reports any ring-overflow).
+// A disconnect needs no cleanup here, so there's no `onDisconnect`.
+// Inbound (the default export): open the stream + arm the kv wake. The
+// kv-write wake lands in onWake (Phase 4 named-export dispatch).
 export default function () {
-    if (request.activation.kind === "inbound") {
-        response.status = 200;
-        response.headers = {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-        };
-        stream.start();
-        stream.write("event: snapshot\ndata: initial\n\n");
-        on.kv("watch/");
-        return __rove_next("watch/index", {});
-    }
-    // Disconnect (or anything else): record + close.
-    return "";
+    response.status = 200;
+    response.headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+    };
+    stream.start();
+    stream.write("event: snapshot\ndata: initial\n\n");
+    on.kv("watch/");
+    return __rove_next("watch/index", {});
 }
 
 // One frame per kv entry in the batch (temporal order). Timer entries

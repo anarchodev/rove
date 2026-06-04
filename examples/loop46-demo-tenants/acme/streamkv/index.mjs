@@ -11,20 +11,16 @@
 // stream pipeline (stream_response_in → stream_data_out) →
 // serviceParkedStreams → resumeStream → (re-dispatch) → bridge again.
 export default function () {
-    if (request.activation.kind === "inbound") {
-        // The head is the ambient response.* (no descriptor head).
-        response.status = 200;
-        response.headers = {
-            "content-type": "text/event-stream",
-            "cache-control": "no-cache",
-        };
-        stream.start();                              // commit the head
-        stream.write("event: ready\ndata: 1\n\n");   // first frame
-        on.kv("streamkv/in/");                        // wait for writes
-        return __rove_next("streamkv/index", {});     // hold the socket
-    }
-    // Disconnect (or anything else): close.
-    return "";
+    // The head is the ambient response.* (no descriptor head).
+    response.status = 200;
+    response.headers = {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+    };
+    stream.start();                              // commit the head
+    stream.write("event: ready\ndata: 1\n\n");   // first frame
+    on.kv("streamkv/in/");                        // wait for writes
+    return __rove_next("streamkv/index", {});     // hold the socket
 }
 
 // A kv write under the watched prefix landed (§8.4-gated) — emit one
