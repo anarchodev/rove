@@ -965,6 +965,14 @@ fn runModule(
     const handler = c.JS_GetPropertyStr(ctx.raw, ns, fn_name_z.ptr);
     defer c.JS_FreeValue(ctx.raw, handler);
     if (c.JS_IsException(handler) or !c.JS_IsFunction(ctx.raw, handler)) {
+        // Handler-surface Phase 4: a missing `onDisconnect` is a no-op,
+        // not a 404 — disconnect cleanup is optional (the held stream
+        // closes regardless). Other kinds (onWake, etc.) DO require the
+        // export; the §6 deploy-time coverage lint flags those.
+        if (request.activation_source == .disconnect) {
+            _ = ctx.takeException();
+            return;
+        }
         pending.status = 404;
         pending.body = std.fmt.allocPrint(
             d.allocator,
@@ -1151,6 +1159,7 @@ fn parseDispatch(
 fn defaultExportForKind(src: ActivationSource) []const u8 {
     return switch (src) {
         .wake_batch, .kv_wake, .timer => "onWake",
+        .disconnect => "onDisconnect",
         else => "default",
     };
 }
