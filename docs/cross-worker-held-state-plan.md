@@ -1,9 +1,27 @@
 # Cross-worker held state — routing async wakes to the owning worker
 
-> **Status:** Plan (2026-05-27). Not yet built. Motivated by the
-> `http.fetch({bind: true})` refit landing in multi-worker production
-> with a latent correctness gap (Gap #2 from the bind:true follow-up
-> list); same gap covers `webhook.send` held-sync.
+> **Status:** SHIPPED (verified 2026-06-04). All four phases landed via
+> the §2.1 continuation-affinity approach. The NodeState owner registries
+> live in `MsgRouter` (`src/js/msg_router.zig`: `bound_fetch_owners` /
+> `bound_send_owners` + `registerBoundFetchTrampoline` /
+> `registerBoundSendOwner` / `lookup*Owner` / unregister); `enqueueMsg
+> ForTenant` routes a bound fetch/send wake to the owning worker (logging
+> when `owner_idx != hash_idx`) and falls back to `hash(tenant_id)`
+> otherwise. The resume scans (`worker.zig` `resumeIfBound* /
+> lookupBoundFetch`, `worker_drain.zig` `resumeBoundContinuation`) are
+> registry-first with the linear scan kept as a safety-net fallback
+> (registry-miss / registering-worker-died). `scripts/
+> bound_fetch_multiworker_smoke.py` + `heldsync_multiworker_smoke.py`
+> (`workers_per_node=4`) pass AND assert via the
+> `bound_fetch_cross_worker_routes_total` metric that the cross-worker
+> path actually fired (not a SO_REUSEPORT-clustered trivial pass).
+>
+> Motivated by the `http.fetch({bind: true})` refit landing in
+> multi-worker production with a latent correctness gap (Gap #2 from the
+> bind:true follow-up list); same gap covered `webhook.send` held-sync.
+> Out-of-scope items (§5) remain out of scope: multi-node held state,
+> tenant-affinity inbound routing, the §6.4 deadline net,
+> registering-worker-death recovery.
 
 ## 1. The mismatch
 

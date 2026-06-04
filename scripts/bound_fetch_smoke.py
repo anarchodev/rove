@@ -53,11 +53,11 @@ def main() -> int:
         raft_base=40450,
         public_suffix=PUBLIC_SUFFIX,
         root_token=TOKEN,
-        # Single worker — bound fetch chunks hash-route by tenant; with
-        # one worker per node the chunks land where the inbound's held
-        # entity lives. (Cross-worker bind is an explicit open follow-up
-        # per the plan; the dispatcher's lookup-miss path logs + falls
-        # through to unbound dispatch.)
+        # Single worker keeps this smoke focused on the bind mechanics
+        # itself. The cross-worker case (chunks routed to the worker that
+        # holds the entity via the `bound_fetch_owners` registry) is
+        # covered + asserted by `bound_fetch_multiworker_smoke.py`
+        # (workers_per_node=4); see docs/cross-worker-held-state-plan.md.
         workers_per_node=1,
         with_log_files_bases=False,
         seed_manifest=repo_root / "examples" / "loop46-demo-tenants.json",
