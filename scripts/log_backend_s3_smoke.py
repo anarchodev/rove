@@ -110,11 +110,17 @@ def main() -> int:
 
             # Wait for acme to be loaded.
             c.wait_for_handler("acme", "/api?fn=handler", expected_status=200, timeout_s=20.0)
+            # POST with a body so each activation captures a `request_body`
+            # tape — the readset records the inbound body for replay
+            # regardless of whether the handler reads it. (A bare GET to
+            # this trivial handler produces NO tape channels, so the inline-
+            # tape assertion below would be unsatisfiable.)
             for n in range(1, 4):
-                r = curl(cc, f"{acme_origin}/api?fn=handler")
+                r = curl(cc, f"{acme_origin}/api?fn=handler", method="POST",
+                         data=f"tape-probe-{n}")
                 if r.status != 200:
                     sys.exit(f"FAIL request {n}: {r.status}")
-            print("ok  drove 3 acme requests, all 200")
+            print("ok  drove 3 acme requests (POST + body), all 200")
 
             jwt = mint_jwt(
                 c.services_jwt_secret,
@@ -136,7 +142,10 @@ def main() -> int:
                 list_body = ls_call(f"http://127.0.0.1:{ls_port}/v1/acme/list?limit=100")
                 try:
                     d = json.loads(list_body)
-                    api_records = [r for r in d.get("records", []) if r.get("path", "").startswith("/api")]
+                    # status==200 excludes the wait_for_handler readiness
+                    # probe (a GET that 503s while the deploy is loading).
+                    api_records = [r for r in d.get("records", [])
+                                   if r.get("path", "").startswith("/api") and r.get("status") == 200]
                 except (json.JSONDecodeError, AttributeError):
                     api_records = []
                 if len(api_records) >= 3:
@@ -145,7 +154,7 @@ def main() -> int:
             if len(api_records) < 3:
                 sys.exit(f"FAIL want >=3 /api records, got {len(api_records)}: {list_body[:500]}")
             for r in api_records[:3]:
-                if r["method"] != "GET":
+                if r["method"] != "POST":
                     sys.exit(f"FAIL method: {r}")
                 if r["host"] != ACME_HOST:
                     sys.exit(f"FAIL host: {r}")
@@ -168,7 +177,7 @@ def main() -> int:
             first_id = api_records[0]["request_id"]
             show_body = ls_call(f"http://127.0.0.1:{ls_port}/v1/acme/show/{first_id}")
             show = json.loads(show_body)["record"]
-            for field, want in [("status", 200), ("method", "GET")]:
+            for field, want in [("status", 200), ("method", "POST")]:
                 if show.get(field) != want:
                     sys.exit(f"FAIL show {field}: {show}")
             if not show["path"].startswith("/api"):
