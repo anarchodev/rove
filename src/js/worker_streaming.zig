@@ -2493,11 +2493,11 @@ pub fn proposeForgetfulWrites(
     else
         &.{};
     defer if (rs_bytes.len > 0) allocator.free(rs_bytes);
-    const seq = raft_propose.proposeBatch(worker, writeset, tenant_id, rs_bytes) catch |err| {
+    const seq = (raft_propose.proposeBatch(worker, writeset, tenant_id, rs_bytes) catch |err| {
         txn.rollback() catch {};
         allocator.destroy(txn);
         return err;
-    };
+    }).seq;
 
     // Effect-reification Phase 4.1: build the parked unit's
     // BufferedCmds list directly. Variants:

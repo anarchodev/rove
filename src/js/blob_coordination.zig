@@ -18,81 +18,13 @@
 
 const std = @import("std");
 const blob_mod = @import("rove-blob");
-const kv_mod = @import("raft-kv");
-const apply_mod = @import("apply.zig");
 
-/// Heap-owned reservation provider context. Lives as long as the
-/// `BlobCoordinator` does so the coord's refill thread can resolve the
-/// cluster + raft handles after `start` returns. Reserves cluster-wide
-/// `batch_id` blocks by advancing a pointer in `__root__.db` via an
-/// envelope-2 root_writeset, committed through raft.
-pub const CoordReservationCtx = struct {
-    cluster: *kv_mod.Cluster,
-
-    /// Key in `__root__.db` that holds the cluster-wide "next
-    /// unreserved batch_id" pointer. Treated as 0 when absent; the
-    /// reserve path advances it by the requested block size.
-    const RESERVATION_KEY: []const u8 = "_system/coord_next_pool_batch";
-
-    /// Total time we'll wait for a single reservation propose to
-    /// commit. On timeout the coord's refill loop retries after a
-    /// 100ms backoff.
-    const RESERVATION_PROPOSE_TIMEOUT_NS: u64 = 5 * std.time.ns_per_s;
-
-    pub fn reserveFn(ctx: *anyopaque, prev_end: u64, count: u32) anyerror!u64 {
-        const self: *CoordReservationCtx = @ptrCast(@alignCast(ctx));
-        const cluster = self.cluster;
-        const root_store = cluster.openRoot() catch |err| return err;
-
-        // Read the latest committed pointer. Absent → 0.
-        const stored: u64 = blk: {
-            const buf = root_store.get(RESERVATION_KEY) catch |err| switch (err) {
-                error.NotFound => break :blk 0,
-                else => return err,
-            };
-            defer cluster.allocator.free(buf);
-            if (buf.len != 8) return error.MalformedReservationPointer;
-            break :blk std.mem.readInt(u64, buf[0..8], .big);
-        };
-
-        // Floor at prev_end so back-to-back local refills can't
-        // overlap even if the committed pointer is stale (rare —
-        // would only happen if a previous propose failed to land).
-        // Floor at 1 so batch_id 0 (NO_BATCH sentinel) is never
-        // minted.
-        const base = @max(stored, prev_end, @as(u64, 1));
-        const new_end = base + count;
-
-        // Build the writeset that bumps the pointer. The leader's
-        // local applyRootWriteSet is leader-skip — we must apply
-        // locally before proposing so the next refill on this node
-        // (and any concurrent reader) sees the new value.
-        var ws = kv_mod.WriteSet.init(cluster.allocator);
-        defer ws.deinit();
-        var new_end_be: [8]u8 = undefined;
-        std.mem.writeInt(u64, &new_end_be, new_end, .big);
-        try ws.addPut(RESERVATION_KEY, &new_end_be);
-
-        // Local apply on the leader. On a follower this races — but
-        // followers never reserve (no submissions arrive), so the
-        // race window is empty in practice.
-        try root_store.put(RESERVATION_KEY, &new_end_be);
-
-        // Replicate via envelope-2 root_writeset, wait for commit.
-        const ws_bytes = try ws.encode(cluster.allocator);
-        defer cluster.allocator.free(ws_bytes);
-        const env = try apply_mod.encodeRootWriteSetEnvelope(cluster.allocator, ws_bytes);
-        defer cluster.allocator.free(env);
-
-        _ = cluster.proposeAndWait(env, RESERVATION_PROPOSE_TIMEOUT_NS) catch |err| switch (err) {
-            error.NotLeader => return error.NotLeader,
-            error.ProposalTimedOut => return error.ProposalTimedOut,
-            else => return err,
-        };
-
-        return new_end;
-    }
-};
+// V2 Phase 2c: the raft-backed cross-tenant `batch_id` reservation
+// (`CoordReservationCtx`, which proposed an envelope-2 root_writeset
+// through `kv.Cluster.proposeAndWait`) is removed. Single-node V2 uses
+// the coordinator's local atomic counter, which is correct for one node.
+// Multi-node (Phase 5) reintroduces cluster-wide reservation through the
+// bridge's `__root__` group — see docs/streaming-model.md §7 Phase 5.
 
 pub const BlobCoordination = struct {
     allocator: std.mem.Allocator,
@@ -102,11 +34,6 @@ pub const BlobCoordination = struct {
     /// `_pool/` backend at the same store every other per-tenant
     /// backend on the node points at.
     blob_backend_cfg: blob_mod.BackendConfig,
-
-    /// `kv.Cluster` handle — borrowed; owned by `main.zig`. Threaded
-    /// in via `setCluster` after `init` so `start` can install the
-    /// raft-backed reservation provider.
-    cluster: ?*kv_mod.Cluster = null,
 
     /// `docs/streaming-model.md §7` Phase 3: process-global write
     /// coordinator for readset blob PUTs. Replaces the per-worker
@@ -122,25 +49,11 @@ pub const BlobCoordination = struct {
     /// itself shuts down + joins).
     pool_backend: ?blob_mod.BlobBackend = null,
 
-    /// `docs/streaming-model.md §7` Phase 5: heap-owned reservation
-    /// provider context. Lives as long as `coordinator` does so the
-    /// coord's refill thread can resolve cluster + raft handles after
-    /// `start` returns.
-    reservation_ctx: ?*CoordReservationCtx = null,
-
     pub fn init(
         allocator: std.mem.Allocator,
         blob_backend_cfg: blob_mod.BackendConfig,
     ) BlobCoordination {
         return .{ .allocator = allocator, .blob_backend_cfg = blob_backend_cfg };
-    }
-
-    /// Wire the cluster handle so `start` can install the raft-backed
-    /// reservation provider. MUST be called before `start`; once the
-    /// coord is running this is a no-op (the reservation is captured at
-    /// coord init).
-    pub fn setCluster(self: *BlobCoordination, cluster: *kv_mod.Cluster) void {
-        self.cluster = cluster;
     }
 
     /// `docs/streaming-model.md §7` Phase 3 + Phase 5: spawn the
@@ -182,36 +95,19 @@ pub const BlobCoordination = struct {
         errdefer pool_backend.deinit();
         self.pool_backend = pool_backend;
 
-        // Build the reservation provider only when a cluster handle is
-        // wired in (production path). Without it the coord falls back to
-        // a local atomic counter — fine for tests, not safe across
-        // leader switches in a multi-node deploy.
-        var reservation: ?blob_mod.coordinator.ReservationProvider = null;
-        var res_ctx: ?*CoordReservationCtx = null;
-        if (self.cluster) |cl| {
-            const ctx = try self.allocator.create(CoordReservationCtx);
-            errdefer self.allocator.destroy(ctx);
-            ctx.* = .{ .cluster = cl };
-            res_ctx = ctx;
-            reservation = .{
-                .ctx = ctx,
-                .reserveFn = CoordReservationCtx.reserveFn,
-            };
-        }
-
-        const coord = blob_mod.BlobCoordinator.init(
+        // V2 Phase 2c single-node: local atomic-counter reservation
+        // (`reservation = null`). The cross-tenant raft-backed reservation
+        // returns in Phase 5 (multi-node) via the bridge's `__root__`
+        // group — see the file header.
+        const coord = try blob_mod.BlobCoordinator.init(
             self.allocator,
             self.pool_backend.?.blobStore(),
             .{
                 .worker_count = worker_count,
-                .reservation = reservation,
+                .reservation = null,
             },
-        ) catch |err| {
-            if (res_ctx) |c| self.allocator.destroy(c);
-            return err;
-        };
+        );
         self.coordinator = coord;
-        self.reservation_ctx = res_ctx;
     }
 
     /// Tear down in reverse start order: stop + join the coordinator
@@ -227,10 +123,6 @@ pub const BlobCoordination = struct {
         if (self.pool_backend) |*be| {
             be.deinit();
             self.pool_backend = null;
-        }
-        if (self.reservation_ctx) |ctx| {
-            self.allocator.destroy(ctx);
-            self.reservation_ctx = null;
         }
     }
 };

@@ -235,106 +235,20 @@ fn buildLogRecord(
 /// `upload_walker_idx`) + the reader connection are touched ONLY by
 /// the flusher thread.
 pub fn walkAndUploadCatchup(worker: anytype) !void {
-    // Single designated walker per node — `log_worker_id == 0` is the
-    // first worker thread. Other workers skip (the indexer's
-    // idempotency would absorb duplicates, but the work is waste).
-    if (worker.log_worker_id != 0) return;
-
-    const is_leader = worker.raft.isLeader();
-    if (!is_leader) {
-        // Track leadership on the flusher side so we can detect the
-        // next false→true edge. Followers never walk (their flushLogs
-        // drops drained records anyway).
-        worker.walker_is_leader = false;
-        return;
-    }
-    // false→true promotion edge, observed on the flusher thread:
-    // snapshot the catchup target (the gap end) via the reader
-    // connection. Everything past it is this leader's own work.
-    if (!worker.walker_is_leader) {
-        worker.walker_is_leader = true;
-        worker.upload_catchup_target = worker.raft.raftLogLastIndexReader() catch |err| blk: {
-            std.log.warn(
-                "rove-js upload walker: raftLogLastIndexReader on promotion failed: {s}",
-                .{@errorName(err)},
-            );
-            break :blk worker.upload_walker_idx; // nothing to catch up
-        };
-    }
-    // Steady state: catchup complete (or nothing to catch up). The
-    // common case on a healthy leader — a cheap early return, no
-    // raft_log reads.
-    if (worker.upload_walker_idx >= worker.upload_catchup_target) return;
-
-    const allocator = worker.allocator;
-    var processed: u64 = 0;
-    var idx: u64 = worker.upload_walker_idx + 1;
-    const stop_at: u64 = @min(worker.upload_catchup_target, worker.upload_walker_idx + WALKER_BATCH_CAP);
-    while (idx <= stop_at) : (idx += 1) {
-        const entry_opt = worker.raft.getRaftEntryReader(idx) catch |err| {
-            std.log.warn(
-                "rove-js upload walker: getRaftEntry({d}) failed: {s}",
-                .{ idx, @errorName(err) },
-            );
-            // Advance walker idx so we don't retry forever on the
-            // same broken entry; the indexer's dedup absorbs the
-            // single skipped record if a later catchup refers
-            // back to this seq.
-            worker.upload_walker_idx = idx;
-            continue;
-        };
-        const entry = entry_opt orelse {
-            // Entry truncated by snapshot or missing — skip.
-            worker.upload_walker_idx = idx;
-            continue;
-        };
-        defer allocator.free(entry.data);
-
-        if (entry.data.len < 8) {
-            worker.upload_walker_idx = idx;
-            continue;
-        }
-        const seq = std.mem.readInt(u64, entry.data[0..8], .big);
-        if (seq <= worker.last_uploaded_seq) {
-            // Already covered by leader's local fast path
-            // (`flushLogs` advanced `last_uploaded_seq` past this
-            // entry's seq). No re-derivation needed.
-            worker.upload_walker_idx = idx;
-            continue;
-        }
-
-        const records = hydrateRecordsFromRaftEntry(allocator, entry.data) catch |err| {
-            std.log.warn(
-                "rove-js upload walker: hydrate idx={d} seq={d} failed: {s}",
-                .{ idx, seq, @errorName(err) },
-            );
-            worker.upload_walker_idx = idx;
-            continue;
-        };
-        defer allocator.free(records);
-
-        for (records) |r| {
-            worker.log_buffer.append(r) catch |err| {
-                std.log.warn(
-                    "rove-js upload walker: log_buffer.append idx={d} seq={d} tenant={s}: {s}",
-                    .{ idx, seq, r.tenant_id, @errorName(err) },
-                );
-                // Free the unappended record; the previously-
-                // appended ones in this batch are owned by the
-                // buffer now.
-                var rr = r;
-                rr.deinit(allocator);
-                continue;
-            };
-        }
-        worker.upload_walker_idx = idx;
-        processed += 1;
-    }
-    if (processed > 0) {
-        // Wake the flusher so the new records land in S3 promptly,
-        // matching the dispatch-path's priority-flush convention.
-        worker.flusher_wake.set();
-    }
+    // V2 Phase 2c: this is the REQUEST/REPLAY-log (rove-log) upload
+    // subsystem, NOT the raft WAL. Steady-state request logs already go
+    // worker→S3 directly (`flushLogs` + the batch-pushed notify,
+    // docs/logs-plan.md). This function was only the *leader-promotion
+    // catch-up*: a newly-promoted leader walked the cluster-wide raft log
+    // (`raftLogLastIndexReader` / `getRaftEntryReader`) to find request-log
+    // records — which ride raft entries as readset/LogHeader blobs
+    // (readset-replication) — that a prior leader hadn't pushed yet.
+    //
+    // V2 has no single cluster log to walk, and single-node has no leader
+    // change, so there is nothing to catch up — no-op. Multi-node (Phase 5)
+    // needs the equivalent, re-derived from the per-tenant bridge's apply
+    // path rather than a willemt cluster-log walk.
+    _ = worker;
 }
 
 // ── Orphan-blob GC (Phase 5d) ─────────────────────────────────────────

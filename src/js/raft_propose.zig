@@ -21,6 +21,16 @@ const std = @import("std");
 const kv_mod = @import("raft-kv");
 const apply_mod = @import("apply.zig");
 
+/// V2 Phase 2c: the result of a propose. `group_id` is the tenant's raft
+/// group (the worker parks `RaftWait{group_id, seq}` and the drain polls
+/// `bridge.committedSeq(group_id)`); `seq` is the per-tenant propose seq,
+/// or 0 when nothing was proposed (empty writeset, skip path). Replaces
+/// the bare `u64` seq the V1 global watermark used.
+pub const Proposed = struct {
+    group_id: u64 = 0,
+    seq: u64 = 0,
+};
+
 fn proposeEncoded(
     worker: anytype,
     writeset: *const kv_mod.WriteSet,
@@ -28,9 +38,15 @@ fn proposeEncoded(
     instance_id: []const u8,
     rs_bytes: []const u8,
     skip_empty: bool,
-) !u64 {
-    if (skip_empty and writeset.ops.items.len == 0) return 0;
+) !Proposed {
+    if (skip_empty and writeset.ops.items.len == 0) return .{};
     const allocator = worker.allocator;
+
+    // Resolve (or assign) this tenant's raft group id. Idempotent; the
+    // bridge maps the envelope `id` string → numeric gid (Phase-3
+    // directory stub). The root writeset (`instance_id == ""`) maps to a
+    // reserved root group.
+    const gid = try worker.raft.registerTenant(instance_id);
 
     const ws_bytes = try writeset.encode(allocator);
     defer allocator.free(ws_bytes);
@@ -42,9 +58,9 @@ fn proposeEncoded(
     };
     defer allocator.free(envelope);
 
-    const seq = worker.raft.highWatermark() + 1;
-    try worker.raft.propose(seq, envelope);
-    return seq;
+    // The bridge copies the envelope + assigns the per-tenant seq.
+    const seq = try worker.raft.propose(gid, envelope);
+    return .{ .group_id = gid, .seq = seq };
 }
 
 /// Per-tenant app.db writeset (envelope type=0). Always proposes,
@@ -63,7 +79,7 @@ pub fn proposeWriteSet(
     writeset: *const kv_mod.WriteSet,
     instance_id: []const u8,
     rs_bytes: []const u8,
-) !u64 {
+) !Proposed {
     return proposeEncoded(worker, writeset, .writeset, instance_id, rs_bytes, false);
 }
 
@@ -99,8 +115,8 @@ pub fn proposeWriteSet(
 /// Returns the LAST propose's seq (the batch watermark). The H2
 /// dispatch path parks its txn on this seq and never exceeds the
 /// cap, so it always sees a single-propose seq exactly as before.
-pub fn proposeMulti(worker: anytype, inner: []const []const u8) !u64 {
-    if (inner.len == 0) return 0;
+pub fn proposeMulti(worker: anytype, gid: u64, inner: []const []const u8) !Proposed {
+    if (inner.len == 0) return .{};
     const allocator = worker.allocator;
     const CHUNK: usize = 255;
     var seq: u64 = 0;
@@ -108,17 +124,21 @@ pub fn proposeMulti(worker: anytype, inner: []const []const u8) !u64 {
     while (i < inner.len) {
         const end = @min(i + CHUNK, inner.len);
         const slice = inner[i..end];
-        seq = worker.raft.highWatermark() + 1;
+        // V2 Phase 2c: the whole multi (anchor writeset + any same-batch
+        // side writes) replicates through the ANCHOR tenant's group. The
+        // V1 cross-tenant trampoline (target tenants + root in one multi)
+        // is an admin/control-plane path off the single-tenant slice;
+        // Phase 3 (directory) routes those per-target.
         if (slice.len == 1) {
-            try worker.raft.propose(seq, slice[0]);
+            seq = try worker.raft.propose(gid, slice[0]);
         } else {
             const multi = try apply_mod.encodeMultiEnvelope(allocator, slice);
             defer allocator.free(multi);
-            try worker.raft.propose(seq, multi);
+            seq = try worker.raft.propose(gid, multi);
         }
         i = end;
     }
-    return seq;
+    return .{ .group_id = gid, .seq = seq };
 }
 
 /// `rs_bytes` rides the anchor envelope (inner[0]) only. Targets
@@ -132,8 +152,9 @@ pub fn proposeBatch(
     writeset: *const kv_mod.WriteSet,
     anchor_id: []const u8,
     rs_bytes: []const u8,
-) !u64 {
+) !Proposed {
     const allocator = worker.allocator;
+    const gid = try worker.raft.registerTenant(anchor_id);
 
     // Build each present envelope into a dynamic inner-list, then
     // hand off to proposeMulti. encodeTyped @memcpy's the payload so
@@ -182,5 +203,5 @@ pub fn proposeBatch(
             try inner.append(allocator, try apply_mod.encodeRootWriteSetEnvelope(allocator, rb));
         }
     }
-    return proposeMulti(worker, inner.items);
+    return proposeMulti(worker, gid, inner.items);
 }

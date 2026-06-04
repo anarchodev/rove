@@ -274,6 +274,13 @@ pub fn classify(seq: u64, deadline_ns: i64, w: Watermarks) SweepClass {
 ///
 ///   - `seqAt(i) u64`      — the i-th unit's parked raft seq
 ///   - `deadlineAt(i) i64` — its absolute timeout deadline (ns)
+///   - `watermarkAt(i) Watermarks` — the i-th unit's PER-TENANT
+///     watermark (`bridge.committedSeq(group_id)` / `faultedSeq` +
+///     a once-captured `now_ns`). V2 Phase 2c: each parked unit belongs
+///     to a different tenant raft group, so the commit/fault watermark
+///     is looked up per-unit by its `group_id` rather than passed as one
+///     node-wide snapshot. This is what keeps tenant B's commit from
+///     waiting on tenant A's (no global serialization point).
 ///   - `commitAt(i) !void` — take the txn through commit + the unit's
 ///     on-commit action (release buffered Cmds / move / destroy)
 ///   - `faultAt(i) !void`  — roll the txn back + the unit's on-fault
@@ -287,10 +294,10 @@ pub fn classify(seq: u64, deadline_ns: i64, w: Watermarks) SweepClass {
 /// CREATE new units in the same collection (the kv-react re-entrancy
 /// in the `parked_units` arm) still pass a snapshot-backed ctx; that
 /// guard is the caller's, not reconcile's.
-pub fn reconcile(ctx: anytype, count: usize, wm: Watermarks) !void {
+pub fn reconcile(ctx: anytype, count: usize) !void {
     var i: usize = 0;
     while (i < count) : (i += 1) {
-        switch (classify(ctx.seqAt(i), ctx.deadlineAt(i), wm)) {
+        switch (classify(ctx.seqAt(i), ctx.deadlineAt(i), ctx.watermarkAt(i))) {
             .pending => {},
             .commit => try ctx.commitAt(i),
             .fault => try ctx.faultAt(i),
@@ -632,6 +639,11 @@ test "reconcile: dispatches commit / fault / pending per classify" {
         fn deadlineAt(self: *@This(), i: usize) i64 {
             return self.deadlines[i];
         }
+        fn watermarkAt(_: *@This(), _: usize) Watermarks {
+            // Per-tenant watermark (V2 Phase 2c): this test treats all
+            // three units as one tenant — committed through 6, faulted at 8.
+            return .{ .committed = 6, .faulted = 8, .now_ns = 0 };
+        }
         fn commitAt(self: *@This(), i: usize) !void {
             try self.committed.append(testing.allocator, i);
         }
@@ -644,7 +656,7 @@ test "reconcile: dispatches commit / fault / pending per classify" {
     defer ctx.committed.deinit(testing.allocator);
     defer ctx.faulted.deinit(testing.allocator);
 
-    try reconcile(&ctx, 3, .{ .committed = 6, .faulted = 8, .now_ns = 0 });
+    try reconcile(&ctx, 3);
 
     try testing.expectEqualSlices(usize, &.{0}, ctx.committed.items);
     try testing.expectEqualSlices(usize, &.{1}, ctx.faulted.items);
@@ -660,6 +672,9 @@ test "reconcile: propagates a commitAt error" {
         fn deadlineAt(_: *@This(), _: usize) i64 {
             return 1_000;
         }
+        fn watermarkAt(_: *@This(), _: usize) Watermarks {
+            return .{ .committed = 5, .faulted = 0, .now_ns = 0 };
+        }
         fn commitAt(_: *@This(), _: usize) !void {
             return error.Boom;
         }
@@ -668,7 +683,7 @@ test "reconcile: propagates a commitAt error" {
 
     var ctx = Ctx{};
     // committed >= seq → .commit → commitAt returns error, reconcile propagates.
-    try testing.expectError(error.Boom, reconcile(&ctx, 1, .{ .committed = 5, .faulted = 0, .now_ns = 0 }));
+    try testing.expectError(error.Boom, reconcile(&ctx, 1));
 }
 
 test "Disposition is a two-variant enum" {

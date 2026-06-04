@@ -12,6 +12,8 @@
 
 const std = @import("std");
 const kv_mod = @import("raft-kv");
+// V2 Phase 2c: per-tenant raft bridge replaces V1's node-wide RaftNode.
+const Bridge = @import("bridge").Bridge;
 const blob_mod = @import("rove-blob");
 const files_mod = @import("rove-files");
 const tenant_mod = @import("rove-tenant");
@@ -436,7 +438,7 @@ pub const TenantSlot = struct {
     /// per-deploy config to kv — fixes the `7eb70ed` regression).
     /// Optional/`null` only in unit-test slot literals — a slot with
     /// no raft handle just skips the config mirror.
-    raft: ?*kv_mod.RaftNode = null,
+    raft: ?*Bridge = null,
     /// Borrowed pointer to the node-wide content-addressed bytecode
     /// cache. Set by `openTenantSlotNode`; `reloadAllBytecodes` builds
     /// each snapshot's lease set through it. Optional only in unit-test
@@ -618,7 +620,7 @@ pub const DeploymentCache = struct {
     /// Process raft node (= `cluster.raft`). Borrowed; owned by
     /// `main.zig`. Copied into each `TenantSlot` so `reloadDeployment`
     /// can leader-gate + propose the `_config/**.json` mirror.
-    raft: *kv_mod.RaftNode,
+    raft: *Bridge,
 
     /// Process-wide blob backend config consumed by `openTenantSlotNode`
     /// when opening each tenant's file-blob + manifest backends.
@@ -673,7 +675,7 @@ pub const DeploymentCache = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         tenant: *tenant_mod.Tenant,
-        raft: *kv_mod.RaftNode,
+        raft: *Bridge,
         blob_backend_cfg: blob_mod.BackendConfig,
     ) DeploymentCache {
         return .{
@@ -988,7 +990,7 @@ fn reloadAllBytecodes(slot: *TenantSlot) !void {
 fn mirrorDeployConfig(
     allocator: std.mem.Allocator,
     slot: *TenantSlot,
-    raft: *kv_mod.RaftNode,
+    raft: *Bridge,
     manifest: files_mod.manifest_json.Manifest,
     file_blobs: blob_mod.BlobStore,
 ) !void {
