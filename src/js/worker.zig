@@ -55,6 +55,10 @@ const rio = @import("rove-io");
 const h2 = @import("rove-h2");
 const qjs = @import("rove-qjs");
 const kv_mod = @import("raft-kv");
+// V2 Phase 2c: the per-tenant raft bridge replaces V1's node-wide
+// `kv_mod.RaftNode` at the worker seam (docs/v2-build-order.md §Phase 2).
+const bridge_mod = @import("bridge");
+const Bridge = bridge_mod.Bridge;
 const blob_mod = @import("rove-blob");
 const files_mod = @import("rove-files");
 const log_mod = @import("rove-log");
@@ -94,7 +98,6 @@ const msg_router_mod = @import("msg_router.zig");
 pub const MsgRouter = msg_router_mod.MsgRouter;
 const blob_coordination_mod = @import("blob_coordination.zig");
 pub const BlobCoordination = blob_coordination_mod.BlobCoordination;
-pub const CoordReservationCtx = blob_coordination_mod.CoordReservationCtx;
 const deployment_cache = @import("deployment_cache.zig");
 // Phase C: the per-tenant deployment cache + TenantSlot type family live
 // in deployment_cache.zig now. Re-exported here so existing callers
@@ -180,6 +183,13 @@ const Request = dispatcher_mod.Request;
 ///   `worker.pending_txns` that owns the parked `TrackedTxn`.
 /// - `deadline_ns`: absolute `std.time.nanoTimestamp()` deadline.
 pub const RaftWait = struct {
+    /// V2 Phase 2c: the tenant's raft group id. The drain looks up this
+    /// tenant's per-tenant committed/faulted watermark
+    /// (`bridge.committedSeq(group_id)`) instead of V1's single global
+    /// watermark — so tenant B's commit never waits on tenant A's.
+    group_id: u64 = 0,
+    /// Per-tenant propose seq (the bridge assigns it; monotonic per
+    /// tenant). Durable when `bridge.committedSeq(group_id) >= seq`.
     seq: u64 = 0,
     deadline_ns: i64 = 0,
 };
@@ -725,7 +735,7 @@ pub const NodeState = struct {
     /// Process raft node (= `cluster.raft`). Borrowed; owned by
     /// `main.zig`. Also copied into `deploy` + each `TenantSlot` so
     /// `reloadDeployment` can leader-gate + propose the config mirror.
-    raft: *kv_mod.RaftNode,
+    raft: *Bridge,
 
     /// Per-tenant deployment cache subsystem — tenant-slot map +
     /// node-wide bytecode cache + deployment-loader thread + manifest
@@ -789,7 +799,7 @@ pub const NodeState = struct {
         allocator: std.mem.Allocator,
         tenant: *tenant_mod.Tenant,
         blob_backend_cfg: blob_mod.BackendConfig,
-        raft: *kv_mod.RaftNode,
+        raft: *Bridge,
     ) !NodeState {
         // Phase 5 PR-2b: compile every `__system/*` built-in module
         // at startup. Bake them once; share across tenants via
@@ -915,7 +925,7 @@ pub const WorkerConfig = struct {
     /// Owned by the caller — the worker does NOT drive `run()` on it,
     /// the caller spawns the raft thread. In M1 this is a single-node
     /// cluster (auto-leader). Multi-node arrives later.
-    raft: *kv_mod.RaftNode,
+    raft: *Bridge,
     /// Listen address passed through to rove-io.
     addr: std.net.Address,
     /// rove-io options (ring size, buffer pool). Defaults are sensible.
@@ -1377,7 +1387,7 @@ pub fn Worker(comptime opts: Options) type {
         /// backend, manifest_http / manifest_easy / manifest_prefetch).
         /// Owned by `main.zig`; outlives every worker.
         node: *NodeState,
-        raft: *kv_mod.RaftNode,
+        raft: *Bridge,
         /// Per-tenant log state. NOT in NodeState because
         /// `RequestIdMinter` bakes the worker_id into the upper 16
         /// bits of every minted id — sharing the minter would alias

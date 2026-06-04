@@ -92,7 +92,7 @@ fn drainEntityArm(
     worker: anytype,
     server: anytype,
     allocator: std.mem.Allocator,
-    wm: effect_mod.Watermarks,
+    now_ns: i64,
     source: anytype,
     comptime site_label: []const u8,
 ) !void {
@@ -111,6 +111,7 @@ fn drainEntityArm(
         server: @TypeOf(server),
         allocator: std.mem.Allocator,
         source: @TypeOf(source),
+        now_ns: i64,
         entities: []const rove.Entity,
         waits: []RaftWait,
         resp_bodies: []h2.RespBody,
@@ -120,6 +121,15 @@ fn drainEntityArm(
         }
         pub fn deadlineAt(self: *@This(), i: usize) i64 {
             return self.waits[i].deadline_ns;
+        }
+        /// V2 Phase 2c: per-tenant watermark by this entity's group_id.
+        pub fn watermarkAt(self: *@This(), i: usize) effect_mod.Watermarks {
+            const gid = self.waits[i].group_id;
+            return .{
+                .committed = self.worker.raft.committedSeq(gid),
+                .faulted = self.worker.raft.faultedSeq(gid),
+                .now_ns = self.now_ns,
+            };
         }
         pub fn commitAt(self: *@This(), i: usize) !void {
             // First entity at this seq takes the shared txn through
@@ -161,6 +171,7 @@ fn drainEntityArm(
         .worker = worker,
         .server = server,
         .allocator = allocator,
+        .now_ns = now_ns,
         .source = source,
         // Snapshotted before the loop: `reg.move` (fault arm) is
         // deferred to `reg.flush`, so these slices stay valid for the
@@ -169,7 +180,7 @@ fn drainEntityArm(
         .waits = source.column(RaftWait),
         .resp_bodies = source.column(h2.RespBody),
     };
-    try effect_mod.reconcile(&ctx, ctx.entities.len, wm);
+    try effect_mod.reconcile(&ctx, ctx.entities.len);
 }
 
 /// Iterate `raft_pending`, check each entity's `RaftWait.seq` against
@@ -193,17 +204,14 @@ pub fn drainRaftPending(worker: anytype) !void {
     const server = worker.h2;
     const allocator = worker.allocator;
 
-    // Effect-reification Phase 3.2.a: one snapshot per tick, shared
-    // across every parked-seq sweep below. The four arms
-    // (raft_pending_response / _cont / _stream + parked_units) all
-    // classify against this same Watermarks via `effect.classify`,
-    // so commit / fault / timeout decisions are byte-identical
-    // across arms by construction.
-    const wm: effect_mod.Watermarks = .{
-        .committed = worker.raft.committedSeq(),
-        .faulted = worker.raft.faultedSeq(),
-        .now_ns = @intCast(std.time.nanoTimestamp()),
-    };
+    // V2 Phase 2c: per-tenant watermarks. The committed/faulted
+    // watermark is now looked up PER ENTITY by its `group_id` (each arm's
+    // ctx `watermarkAt(i)` calls `bridge.committedSeq(gid)` /
+    // `faultedSeq(gid)`), not snapshotted once node-wide — tenant logs
+    // commit independently, so a single global snapshot would couple
+    // their latency. We still capture `now_ns` once per tick so the
+    // timeout half of `classify` is consistent across all four arms.
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
 
     // Handler-cmds Phase 5: raft_pending is THREE sibling collections.
     // Each entity is parked on the sibling matching its commit
@@ -214,9 +222,9 @@ pub fn drainRaftPending(worker: anytype) !void {
     // queue moves. Forward-iter preserves per-tenant chain order
     // (entities enter the siblings in propose-seq order from
     // finalizeBatch).
-    try drainEntityArm(worker, server, allocator, wm, &worker.raft_pending_response, "raft_pending_response");
-    try drainEntityArm(worker, server, allocator, wm, &worker.raft_pending_cont, "raft_pending_cont");
-    try drainEntityArm(worker, server, allocator, wm, &worker.raft_pending_stream, "raft_pending_stream");
+    try drainEntityArm(worker, server, allocator, now_ns, &worker.raft_pending_response, "raft_pending_response");
+    try drainEntityArm(worker, server, allocator, now_ns, &worker.raft_pending_cont, "raft_pending_cont");
+    try drainEntityArm(worker, server, allocator, now_ns, &worker.raft_pending_stream, "raft_pending_stream");
 
     // ── Additive: non-entity parked units (idiom-1 SSE-emit gating,
     //    docs/unified-effect-gating.md). The H2 entity path above is
@@ -248,6 +256,7 @@ pub fn drainRaftPending(worker: anytype) !void {
             worker: @TypeOf(worker),
             server: @TypeOf(server),
             allocator: std.mem.Allocator,
+            now_ns: i64,
             ids: []const rove.Entity,
 
             fn unitAt(self: *@This(), i: usize) ?*ParkedUnit {
@@ -260,6 +269,23 @@ pub fn drainRaftPending(worker: anytype) !void {
             pub fn deadlineAt(self: *@This(), i: usize) i64 {
                 const u = self.unitAt(i) orelse return std.math.maxInt(i64);
                 return u.deadline_ns;
+            }
+            /// V2 Phase 2c: per-tenant watermark. ParkedUnits carry a
+            /// `tenant_id` (not a `RaftWait`), so resolve the gid through
+            /// the bridge registry (already registered when the unit
+            /// proposed). A gone/unregistered unit yields committed=0 →
+            /// `classify` leaves it pending (matches the sentinel-seq
+            /// shape of `seqAt`/`deadlineAt`).
+            pub fn watermarkAt(self: *@This(), i: usize) effect_mod.Watermarks {
+                const u = self.unitAt(i) orelse
+                    return .{ .committed = 0, .faulted = 0, .now_ns = self.now_ns };
+                const gid = self.worker.raft.gidForTenant(u.tenant_id) orelse
+                    return .{ .committed = 0, .faulted = 0, .now_ns = self.now_ns };
+                return .{
+                    .committed = self.worker.raft.committedSeq(gid),
+                    .faulted = self.worker.raft.faultedSeq(gid),
+                    .now_ns = self.now_ns,
+                };
             }
             pub fn commitAt(self: *@This(), i: usize) !void {
                 const unit = self.unitAt(i) orelse return;
@@ -346,8 +372,8 @@ pub fn drainRaftPending(worker: anytype) !void {
             }
         };
 
-        var ctx = Ctx{ .worker = worker, .server = server, .allocator = allocator, .ids = buf[0..n] };
-        try effect_mod.reconcile(&ctx, n, wm);
+        var ctx = Ctx{ .worker = worker, .server = server, .allocator = allocator, .now_ns = now_ns, .ids = buf[0..n] };
+        try effect_mod.reconcile(&ctx, n);
     }
 
     // Gap 2.1 Phase E (refactored), effect-reification Phase 2C:
@@ -568,7 +594,7 @@ fn proposeAndParkContResume(
         break :blk &.{};
     };
     defer if (rs_bytes.len > 0) allocator.free(rs_bytes);
-    const seq = raft_propose.proposeBatch(worker, writeset, tenant_id, rs_bytes) catch |err| {
+    const seq = (raft_propose.proposeBatch(worker, writeset, tenant_id, rs_bytes) catch |err| {
         // On propose failure: rollback txn, destroy it (caller's
         // ownership is implicit — we promised to consume it on
         // success OR free it on failure), free any owned resources in
@@ -602,7 +628,10 @@ fn proposeAndParkContResume(
             },
         }
         return err;
-    };
+    }).seq;
+    // V2 Phase 2c: resolve the tenant's group id (registered by the
+    // propose above) for the per-tenant RaftWait the drain looks up.
+    const group_id = worker.raft.gidForTenant(tenant_id) orelse 0;
     // Propose accepted. From here we own the parked-side
     // bookkeeping; if it fails the chain is in a half-state we can't
     // gracefully roll back (the raft entry is committed-pending).
@@ -670,6 +699,7 @@ fn proposeAndParkContResume(
             try server.reg.set(ent, &worker.parked_continuations, h2.StreamId, sid);
             try server.reg.set(ent, &worker.parked_continuations, h2.Session, sess);
             try server.reg.set(ent, &worker.parked_continuations, RaftWait, .{
+                .group_id = group_id,
                 .seq = seq,
                 .deadline_ns = deadline_ns,
             });
@@ -701,6 +731,7 @@ fn proposeAndParkContResume(
             const refreshed_deadline_ns: i64 = @as(i64, @intCast(std.time.nanoTimestamp())) + CONT_HOLD_DEADLINE_NS;
             desc.deadline_ns = refreshed_deadline_ns;
             try server.reg.set(ent, &worker.parked_continuations, RaftWait, .{
+                .group_id = group_id,
                 .seq = seq,
                 .deadline_ns = deadline_ns,
             });
@@ -796,6 +827,7 @@ fn proposeAndParkContResume(
             });
 
             try server.reg.set(ent, &worker.parked_continuations, RaftWait, .{
+                .group_id = group_id,
                 .seq = seq,
                 .deadline_ns = deadline_ns,
             });

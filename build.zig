@@ -56,31 +56,21 @@ pub fn build(b: *std.Build) void {
     // State engine is kvexp (vendored). raft_log persistence is still
     // sqlite for now (raft log is its own concern, separate from the
     // KV state path); follow-up cutover will migrate it.
+    // V2 (docs/v2-build-order.md §Phase 2): the `raft-kv` module now roots
+    // at the spine-free FACADE (`kvlimbs.zig`) — the kvexp-backed limbs +
+    // metrics + envelope codec, NONE of the willemt-raft / io_uring spine.
+    // Every importer (`rove-js`, files-server, files, log, tenant) gets the
+    // facade at once; the consensus engine is the V2 bridge. The old V1
+    // spine (`root.zig`, `cluster.zig`, `raft_node.zig`, …) is now dead on
+    // this branch — V1 preservation dropped (it's deleted at cutover) — so
+    // the willemt C sources + sqlite3 it needed are gone from this module.
     const kv_mod = b.addModule("raft-kv", .{
-        .root_source_file = b.path("src/kv/root.zig"),
+        .root_source_file = b.path("src/kv/kvlimbs.zig"),
         .target = target,
         .optimize = optimize,
     });
     kv_mod.link_libc = true;
-    kv_mod.linkSystemLibrary("sqlite3", .{});
     kv_mod.addImport("kvexp", kvexp_mod);
-
-    // Vendored willemt/raft (BSD-licensed, see vendor/raft/LICENSE).
-    kv_mod.addIncludePath(b.path("vendor/raft/include"));
-    kv_mod.addCSourceFiles(.{
-        .root = b.path("vendor/raft/src"),
-        .files = &.{
-            "raft_server.c",
-            "raft_server_properties.c",
-            "raft_node.c",
-            "raft_log.c",
-        },
-        .flags = &.{
-            "-std=c99",
-            "-Wno-pointer-sign",
-            "-Wno-unused-parameter",
-        },
-    });
 
     // ── rove-blob: pluggable blob storage (fs + s3 backends) ──
     //
@@ -879,21 +869,76 @@ pub fn build(b: *std.Build) void {
     });
     v2_node_mod.link_libc = true;
     v2_node_mod.addImport("raft_rs_zig", raft_dep.module("raft_rs_zig"));
-    // kvlimbs: the V1 reuse seam (src/kv/kvlimbs.zig) re-exporting
-    // kvstore.zig + writeset.zig as one module so `KvStore` is a single
-    // type across both. It needs `kvexp` in its own import table (the
-    // files' `@import("kvexp")` resolves through it); kvexp links
-    // liblmdb + libc, which propagates to the node module.
-    const v2_kvlimbs_mod = b.createModule(.{
-        .root_source_file = b.path("src/kv/kvlimbs.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    v2_kvlimbs_mod.link_libc = true;
-    v2_kvlimbs_mod.addImport("kvexp", kvexp_mod);
-    v2_node_mod.addImport("kvlimbs", v2_kvlimbs_mod);
+    // kvlimbs == the `raft-kv` facade module (`kv_mod`, now rooted at
+    // kvlimbs.zig). Sharing the SAME instance here and as rove-js's
+    // `raft-kv` import is what makes `KvStore` / `WriteSet` a single type
+    // across the worker and the bridge — the Zig per-module type identity
+    // requirement for the Phase-2 seam.
+    v2_node_mod.addImport("kvlimbs", kv_mod);
     const v2_node_test = b.addTest(.{ .root_module = v2_node_mod });
     v2_node_test.linkLibrary(raft_dep.artifact("raft_rs_zig"));
     const run_v2_node_test = b.addRunArtifact(v2_node_test);
     v2_test_step.dependOn(&run_v2_node_test.step);
+
+    // ── V2 Phase 2 — the worker-facing bridge over the per-tenant pump
+    // (docs/v2-build-order.md §Phase 2). `src-v2/kv/bridge.zig` owns the
+    // Phase-1 `Node`, runs its pump on a dedicated thread, and presents
+    // the per-tenant propose + watermark surface the reused rove-js worker
+    // talks to in place of V1's global `kv.RaftNode`. Same import table as
+    // the node module (it imports node.zig + envelope.zig relatively).
+    const v2_bridge_mod = b.createModule(.{
+        .root_source_file = b.path("src-v2/kv/bridge.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    v2_bridge_mod.link_libc = true;
+    v2_bridge_mod.addImport("raft_rs_zig", raft_dep.module("raft_rs_zig"));
+    v2_bridge_mod.addImport("kvlimbs", kv_mod);
+    const v2_bridge_test = b.addTest(.{ .root_module = v2_bridge_mod });
+    v2_bridge_test.linkLibrary(raft_dep.artifact("raft_rs_zig"));
+    const run_v2_bridge_test = b.addRunArtifact(v2_bridge_test);
+    v2_test_step.dependOn(&run_v2_bridge_test.step);
+
+    // ── V2 Phase 2c — attach the rove-js worker to the bridge ──────────
+    // rove-js imports the bridge as `@import("bridge")`. js_mod already
+    // imports `kv_mod` as "raft-kv" (the facade), so the worker's
+    // KvStore/TrackedTxn and the bridge's are the SAME type. A dedicated
+    // `js-v2` step compiles rove-js against the facade + bridge (V1's
+    // loop46 is dead on this branch) to drive the seam cut.
+    js_mod.addImport("bridge", v2_bridge_mod);
+    const js_v2_test = b.addTest(.{ .root_module = js_mod });
+    js_v2_test.linkLibrary(raft_dep.artifact("raft_rs_zig"));
+    const js_v2_step = b.step("js-v2", "Compile rove-js against the V2 facade + bridge (Phase 2c)");
+    js_v2_step.dependOn(&b.addRunArtifact(js_v2_test).step);
+
+    // ── rewind: the V2 single-node worker binary (docs/v2-build-order.md
+    // §Phase 2d). The V2 counterpart of `loop46` — the reused rove-js
+    // worker stack on the per-tenant bridge instead of the willemt cluster.
+    // Building this is also the FORCING FUNCTION for the Phase-2c generic
+    // worker-body conversions (Zig only analyzes `worker: anytype` fns when
+    // a concrete `Worker` is instantiated, which `rewind`'s workerMain does).
+    // Not in the default `install` step (V1's loop46 is dead on this branch).
+    const rewind_mod = b.createModule(.{
+        .root_source_file = b.path("src-v2/rewind/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    rewind_mod.addImport("rove", rove_mod);
+    rewind_mod.addImport("rove-js", js_mod);
+    rewind_mod.addImport("bridge", v2_bridge_mod);
+    rewind_mod.addImport("raft-kv", kv_mod);
+    rewind_mod.addImport("rove-h2", h2_mod);
+    rewind_mod.addImport("rove-blob", blob_mod);
+    rewind_mod.addImport("rove-tenant", tenant_mod);
+    rewind_mod.addImport("rove-qjs", qjs_mod);
+    rewind_mod.addImport("rove-log-server", log_server_mod);
+    rewind_mod.addImport("rove-files", files_mod);
+    rewind_mod.link_libc = true;
+    rewind_mod.linkSystemLibrary("nghttp2", .{});
+    rewind_mod.linkSystemLibrary("ssl", .{});
+    rewind_mod.linkSystemLibrary("crypto", .{});
+    const rewind_exe = b.addExecutable(.{ .name = "rewind", .root_module = rewind_mod });
+    rewind_exe.linkLibrary(raft_dep.artifact("raft_rs_zig"));
+    const rewind_step = b.step("rewind", "Build the V2 rewind worker binary (Phase 2d)");
+    rewind_step.dependOn(&b.addInstallArtifact(rewind_exe, .{}).step);
 }

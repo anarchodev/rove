@@ -83,117 +83,23 @@ pub const Error = error{
     OutOfMemory,
 };
 
-pub const MAX_ID_LEN: usize = 256;
-
 // ── Envelope wire format ────────────────────────────────────────────
 //
-// Stable, library-defined: every envelope is
-//
-//   [1B type][2B id_len BE][id bytes][payload]
-//
-// Type 0 is reserved for "writeset against the store named by `id`"
-// (the most common case). Type 1 is reserved for the multi-envelope
-// wrapper. Types 2-255 are application-defined; applications register
-// handlers via `registerEnvelope`.
-//
-// Pre-#1.0 Loop46 used types 0/2/7/8/9/10/11 directly; under the
-// library they collapse to a smaller set:
-//   type 0  → writeset (id = store_id; library-builtin)
-//   type 1  → multi (library-builtin)
-//   type 2+ → app-specific (Loop46 uses 2 for root_writeset,
-//             8/9/10/11 for schedule envelopes)
-// Apps that ship pre-launch don't need migration; on-disk shape
-// is being clean-slated as part of this refactor.
-
-pub const ENVELOPE_TYPE_WRITESET: u8 = 0;
-pub const ENVELOPE_TYPE_MULTI: u8 = 1;
-
-pub const Envelope = struct {
-    type: u8,
-    /// Store id when `type == ENVELOPE_TYPE_WRITESET`. For other
-    /// types, application-defined (often empty for cluster-wide
-    /// stores like a singleton schedules.db).
-    id: []const u8,
-    payload: []const u8,
-};
-
-pub fn decodeEnvelope(bytes: []const u8) Error!Envelope {
-    if (bytes.len < 3) return Error.Truncated;
-    const t = bytes[0];
-    const id_len = std.mem.readInt(u16, bytes[1..3], .big);
-    if (bytes.len < 3 + @as(usize, id_len)) return Error.Truncated;
-    return .{
-        .type = t,
-        .id = bytes[3 .. 3 + id_len],
-        .payload = bytes[3 + id_len ..],
-    };
-}
-
-pub fn encodeEnvelope(
-    allocator: std.mem.Allocator,
-    t: u8,
-    id: []const u8,
-    payload: []const u8,
-) ![]u8 {
-    if (id.len > MAX_ID_LEN) return error.OutOfMemory;
-    const total = 1 + 2 + id.len + payload.len;
-    const out = try allocator.alloc(u8, total);
-    out[0] = t;
-    std.mem.writeInt(u16, out[1..3], @intCast(id.len), .big);
-    @memcpy(out[3 .. 3 + id.len], id);
-    @memcpy(out[3 + id.len ..], payload);
-    return out;
-}
-
-/// Multi-envelope wrapper payload format:
-///   `[u8 count][u32 inner_len LE][inner_envelope_bytes]{count}`
-/// Each inner envelope is a complete `[type][id_len][id][payload]`
-/// blob. Inner envelopes apply in order; nesting (a `multi` inside
-/// a `multi`) panics. The outer envelope's `id` is empty.
-pub fn encodeMulti(
-    allocator: std.mem.Allocator,
-    inner: []const []const u8,
-) ![]u8 {
-    if (inner.len > 0xff) return error.OutOfMemory;
-    var inner_total: usize = 0;
-    for (inner) |b| inner_total += 4 + b.len;
-    const payload_len = 1 + inner_total;
-    const payload = try allocator.alloc(u8, payload_len);
-    defer allocator.free(payload);
-    payload[0] = @intCast(inner.len);
-    var pos: usize = 1;
-    for (inner) |b| {
-        std.mem.writeInt(u32, payload[pos..][0..4], @intCast(b.len), .little);
-        pos += 4;
-        @memcpy(payload[pos..][0..b.len], b);
-        pos += b.len;
-    }
-    // encodeEnvelope copies `payload` into the returned buffer.
-    return encodeEnvelope(allocator, ENVELOPE_TYPE_MULTI, "", payload);
-}
-
-/// Decode the inner-envelope byte slices from a multi-envelope's
-/// payload. Slices alias the input buffer; do not free individually.
-pub fn decodeMultiInner(
-    allocator: std.mem.Allocator,
-    payload: []const u8,
-) Error![][]const u8 {
-    if (payload.len < 1) return Error.Truncated;
-    const count = payload[0];
-    const out = allocator.alloc([]const u8, count) catch return Error.OutOfMemory;
-    errdefer allocator.free(out);
-    var pos: usize = 1;
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        if (payload.len < pos + 4) return Error.Truncated;
-        const len = std.mem.readInt(u32, payload[pos..][0..4], .little);
-        pos += 4;
-        if (payload.len < pos + len) return Error.Truncated;
-        out[i] = payload[pos .. pos + len];
-        pos += len;
-    }
-    return out;
-}
+// Extracted to the spine-free `envelope_codec.zig` (docs/v2-build-order
+// §Phase 2) so the V2 facade (`kvlimbs.zig`) can re-export the same codec
+// to the rove-js worker + files-server without pulling in this willemt
+// spine. Re-exported here verbatim so the V1 cluster's public API is
+// unchanged. The format is the stable library header
+// `[1B type][2B id_len BE][id][payload]`; type 0 = writeset (id =
+// store_id), type 1 = multi wrapper, types 2+ app-defined.
+pub const MAX_ID_LEN = envelope_codec.MAX_ID_LEN;
+pub const ENVELOPE_TYPE_WRITESET = envelope_codec.ENVELOPE_TYPE_WRITESET;
+pub const ENVELOPE_TYPE_MULTI = envelope_codec.ENVELOPE_TYPE_MULTI;
+pub const Envelope = envelope_codec.Envelope;
+pub const decodeEnvelope = envelope_codec.decodeEnvelope;
+pub const encodeEnvelope = envelope_codec.encodeEnvelope;
+pub const encodeMulti = envelope_codec.encodeMulti;
+pub const decodeMultiInner = envelope_codec.decodeMultiInner;
 
 // ── Store layout ───────────────────────────────────────────────────
 //

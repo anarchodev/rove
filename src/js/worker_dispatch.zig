@@ -614,6 +614,11 @@ fn parkSuccessesOnSiblings(
     seq: u64,
 ) !usize {
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
+    // V2 Phase 2c: the tenant is already registered (it just proposed),
+    // so `gidForTenant` resolves its raft group id for the per-tenant
+    // RaftWait the drain looks up. 0 (absent) only on the empty-propose
+    // path, where seq==0 leaves the unit pending — harmless.
+    const group_id = worker.raft.gidForTenant(anchor_id) orelse 0;
     for (successes.items) |*s| {
         // Capture the route BEFORE the record helpers null `s.cont` /
         // `s.stream` (contRecordIfAny:307 / streamRecordIfAnyAt:421);
@@ -621,7 +626,7 @@ fn parkSuccessesOnSiblings(
         const route = ParkRoute.of(s);
         try contRecordIfAny(worker, server, allocator, anchor_id, s); // sets the entity's ContDescriptor component
         try streamRecordIfAnyAt(worker, server, allocator, anchor_id, s); // sets the entity's stream components
-        try server.reg.set(s.ent, &server.request_out, RaftWait, .{ .seq = seq, .deadline_ns = deadline_ns });
+        try server.reg.set(s.ent, &server.request_out, RaftWait, .{ .group_id = group_id, .seq = seq, .deadline_ns = deadline_ns });
         try route.moveToSibling(worker, server, s.ent);
         captureSuccess(worker, anchor_id, s, s.status_code, .ok, seq);
     }
@@ -721,7 +726,7 @@ fn finalizeBatch(
             // with kv-reads that crossed an uncommitted speculative
             // overlay. The first-request readset rides as
             // `batch_readset_bytes` (slice 3d).
-            const seq = raft_propose.proposeWriteSet(worker, writeset, anchor_id, batch_readset_bytes) catch |perr| {
+            const seq = (raft_propose.proposeWriteSet(worker, writeset, anchor_id, batch_readset_bytes) catch |perr| {
                 std.log.warn("rove-js idiom-0 barrier propose (tenant={s}) failed: {s}", .{ anchor_id, @errorName(perr) });
                 txn.rollback() catch |rb_err| panic_mod.invariantViolated(
                     "finalizeBatch.rollback(idiom0_barrier_fail)",
@@ -747,7 +752,7 @@ fn finalizeBatch(
                 }
                 successes.clearRetainingCapacity();
                 return processed;
-            };
+            }).seq;
             // Propose accepted: transfer txn ownership to the drain
             // (parked on the barrier seq). Mirror the write-path branch
             // below exactly — stage commands, park the kv-wake unit,
@@ -888,7 +893,7 @@ fn finalizeBatch(
     // before calling finalizeBatch; empty `batch_readset_bytes` here
     // means the batch had no successful handler-bound requests (only
     // admin/system side effects).
-    const seq = raft_propose.proposeBatch(
+    const seq = (raft_propose.proposeBatch(
         worker,
         writeset,
         anchor_id,
@@ -920,7 +925,7 @@ fn finalizeBatch(
         }
         successes.clearRetainingCapacity();
         return processed;
-    };
+    }).seq;
 
     // Propose succeeded: hand the txn to the chain by handle, then park
     // it on the worker's pending map keyed by raft seq. `park` flips it
@@ -1400,8 +1405,10 @@ fn handleMetrics(
     // requests per raft entry". If the third is bumping the
     // `--propose-linger-us` value, the linger budget could be raised.
     try writeCountHistogram(w, "dispatch_writeset_size_requests", worker.node.dispatch_writeset_size.snapshot());
-    try writeCountHistogram(w, "raft_proposal_batch_size_writesets", worker.raft.proposalBatchSizeSnapshot());
-    try writeMicrosHistogram(w, "raft_proposal_linger_wait_us", worker.raft.proposalLingerWaitSnapshot());
+    // V2 Phase 2c: the V1 leader-side propose-batch/linger histograms
+    // lived on the cluster-wide RaftNode; the per-tenant bridge has no
+    // global proposer to measure. The DP-layer pump metrics return in a
+    // later phase (per-pump-cycle histograms on the bridge).
 
     // `docs/cross-worker-held-state-plan.md` Phase 2A: routing
     // observability. cross_worker counts wake events routed to a
@@ -1896,7 +1903,7 @@ fn handleRelease(
     // parallel release POSTs become a single consensus round.
     // handleRelease is an internal admin endpoint with no
     // dispatched-handler readset to attach.
-    const seq = raft_propose.proposeWriteSet(worker, &ws, parsed.value.tenant_id, "") catch |err| {
+    const seq = (raft_propose.proposeWriteSet(worker, &ws, parsed.value.tenant_id, "") catch |err| {
         // Propose failed before raft accepted it (queue full,
         // shutting down, not leader). The local write was a kvexp
         // *speculative* commit (volatile — LMDB only at raft-apply);
@@ -1911,7 +1918,7 @@ fn handleRelease(
         );
         try respb.setSystemResponseOwned(server, ent, sid, sess, 503, msg, allocator, cors_origin, null);
         return;
-    };
+    }).seq;
 
     // Enqueue the deployment loader directly — the leader's apply
     // path is leader-skip for envelope-0, so the apply thread won't
@@ -1937,7 +1944,9 @@ fn handleRelease(
     // batch multiple in-flight release POSTs.
     try respb.stageSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
+    const group_id = worker.raft.gidForTenant(parsed.value.tenant_id) orelse 0;
     try server.reg.set(ent, &server.request_out, RaftWait, .{
+        .group_id = group_id,
         .seq = seq,
         .deadline_ns = deadline_ns,
     });
@@ -2058,7 +2067,7 @@ fn handleAdminKv(
     // accept-time 204.)
     // System endpoint with no dispatched-handler readset; empty
     // rs_bytes is the right value here.
-    const seq = raft_propose.proposeWriteSet(worker, &ws, tenant_mod.ADMIN_INSTANCE_ID, "") catch |err| {
+    const seq = (raft_propose.proposeWriteSet(worker, &ws, tenant_mod.ADMIN_INSTANCE_ID, "") catch |err| {
         // Synchronous propose failure (queue full / shutting down /
         // not leader). The local write was a kvexp *speculative*
         // commit (volatile — LMDB only at raft-apply); a propose
@@ -2072,11 +2081,13 @@ fn handleAdminKv(
         );
         try respb.setSystemResponseOwned(server, ent, sid, sess, 503, msg, allocator, cors_origin, null);
         return;
-    };
+    }).seq;
 
     try respb.stageSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
+    const group_id = worker.raft.gidForTenant(tenant_mod.ADMIN_INSTANCE_ID) orelse 0;
     try server.reg.set(ent, &server.request_out, RaftWait, .{
+        .group_id = group_id,
         .seq = seq,
         .deadline_ns = deadline_ns,
     });

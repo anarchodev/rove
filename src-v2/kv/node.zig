@@ -46,6 +46,33 @@ pub const KvStore = kvstore.KvStore;
 pub const WriteSet = writeset.WriteSet;
 pub const Envelope = envelope.Envelope;
 
+/// Fired once per committed *real* entry (writeset / multi / root —
+/// not the leader's empty election no-op), AFTER it has applied, with
+/// the entry's raft index. The bridge (`bridge.zig`) uses this to bind
+/// per-tenant raft commit order to the per-tenant propose seq it handed
+/// the worker (the seq → commit-order binding behind the per-tenant
+/// watermark; docs/v2-build-order.md §Phase 2). `null` in the Phase-1
+/// unit tests, which drive the pump directly and read inline.
+pub const CommitHook = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, group_id: u64, raft_index: u64) void,
+};
+
+/// How committed entries apply to the tenant store (docs/v2-build-order.md
+/// §Phase 2 leader-skip + the speculative overlay).
+pub const ApplyMode = enum {
+    /// Decode a committed writeset and write it to the tenant's kvexp
+    /// store. The Phase-1 default and the future FOLLOWER role (Phase 5):
+    /// followers have no speculative overlay, so apply IS the write.
+    apply_on_commit,
+    /// Single-node LEADER: the worker already wrote the entry into its own
+    /// `TrackedTxn` speculative overlay before proposing and commits that
+    /// overlay when the watermark advances — so the pump must NOT re-write
+    /// the store (it would double-apply on a second handle). The pump only
+    /// validates the envelope + advances the commit watermark.
+    leader_skip,
+};
+
 pub const Error = error{
     /// A committed entry named a group with no live tenant slot — an
     /// invariant violation (we only apply entries for groups we created).
@@ -98,6 +125,17 @@ pub const Node = struct {
     /// `processReady` round (the C-ABI callback can't return one).
     /// Checked + cleared by `pump` after the round.
     apply_err: ?Error = null,
+
+    /// Optional per-committed-entry notification (see `CommitHook`).
+    /// Set by the bridge; left null by the Phase-1 inline tests.
+    commit_hook: ?CommitHook = null,
+
+    /// Whether committed entries write the store (`apply_on_commit`,
+    /// default) or only advance the watermark (`leader_skip`). The bridge
+    /// flips this to `leader_skip` when it fronts a worker that owns the
+    /// speculative overlay; the Phase-1 tests + the 2a bridge tests keep
+    /// the default so a read after commit sees the pump's write.
+    apply_mode: ApplyMode = .apply_on_commit,
 
     /// Stand up a single-node node (voter id 1, voter set `{1}`).
     pub fn initSingleNode(allocator: std.mem.Allocator, data_dir: []const u8) Error!*Node {
@@ -329,11 +367,27 @@ pub const Node = struct {
         const bytes = data[0..len];
         self.applyEntry(group_id, index, bytes) catch |e| {
             self.apply_err = e;
+            return;
         };
+        // The entry committed + applied cleanly: notify the bridge so it
+        // can advance the tenant's committed_seq watermark. Fires only on
+        // the success path, so the leader's empty election no-op (len==0,
+        // returned above) and any undecodable entry (apply_err, returned
+        // above) never advance a tenant's watermark.
+        if (self.commit_hook) |h| h.func(h.ctx, group_id, index);
     }
 
     fn applyEntry(self: *Node, group_id: u64, index: u64, bytes: []const u8) Error!void {
         const env = try envelope.decode(bytes);
+        if (self.apply_mode == .leader_skip) {
+            // Leader: the worker's TrackedTxn.commit is the durable write.
+            // We still decode (above) so a stale/unknown envelope type
+            // surfaces loudly, and bump applied_idx — but we do NOT touch
+            // the store. Root writesets (no per-tenant group) are a no-op
+            // here too; their durable write also rode the worker's txn.
+            if (self.groups.get(group_id)) |slot| slot.applied_idx = index;
+            return;
+        }
         switch (env.type) {
             .writeset => {
                 const slot = self.groups.get(group_id) orelse return Error.UnknownGroup;

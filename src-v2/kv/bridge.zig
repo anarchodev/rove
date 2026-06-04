@@ -1,0 +1,525 @@
+//! V2 data-plane bridge — the worker-facing seam over the per-tenant pump.
+//!
+//! docs/v2-build-order.md §Phase 2: swap the V1 *cluster-wide* raft
+//! propose/apply at the worker-dispatch seam for "propose to *this
+//! tenant's* group → await commit → apply." The bridge is what the
+//! reused rove-js worker talks to in place of V1's single global
+//! `kv.RaftNode`. It owns the Phase-1 `Node` (one raft-rs `Manager` +
+//! one `SharedWal`, per-tenant groups) and drives its pump.
+//!
+//! ## Threading split (the load-bearing invariant)
+//!
+//! raft-rs's `Manager` is **not** thread-safe, and the shared WAL wants
+//! one fsync per pump cycle — so ALL `Node`/`Manager` access happens on a
+//! single **pump thread**. Worker threads only ever touch the bridge's
+//! own *signaling* state (the per-tenant seq counters + watermarks +
+//! inbox), which is either mutex-guarded or atomic. Concretely:
+//!
+//!   - **Worker thread** → `propose(gid, env)`: assign a per-tenant seq,
+//!     enqueue the envelope, return the seq. Never blocks on commit.
+//!   - **Pump thread** → `pumpOnce` / `startPump`: drain the inbox,
+//!     `ensureGroup` + `node.propose` each item, run `node.pump()`. The
+//!     `Node` commit hook fires per committed entry and advances the
+//!     tenant's `committed_seq`.
+//!   - **Worker thread** → `committedSeq(gid)` each drain tick: a
+//!     lock-free atomic load. When `>= my_seq`, the worker promotes its
+//!     speculative `TrackedTxn` overlay (`txn.commit()`).
+//!
+//! ## Per-tenant watermark (locked 2026-06-04)
+//!
+//! Commit signaling is a **per-tenant watermark**, not rewind2's
+//! per-propose `CompletionHandle`. Scalability lives in the pump layer
+//! (hibernation / mailbox poll_ready / coalescing / shared WAL /
+//! c_allocator — multiraft-scaling-learnings §2–§3), which the `Node`
+//! carries regardless; the completion primitive only has to avoid a
+//! *global* serialization point so tenant B's commit never waits on
+//! tenant A's. A per-tenant `committed_seq` atomic gives exactly that,
+//! lock-free and with zero per-request allocation — and since rove
+//! serializes a tenant's proposes (the worker's `TrackedTxn` lease),
+//! per-tenant commits are monotonic, so the watermark is as precise as a
+//! per-propose handle would be here.
+//!
+//! ## Seq ↔ commit binding
+//!
+//! `propose` assigns `seq = ++sig.next_seq` **in the same critical
+//! section** as the inbox append, so per-tenant seq order == inbox order
+//! == (FIFO pump drain) == raft index order == commit order. The pump
+//! commit hook therefore advances `committed_seq` by exactly one per
+//! committed entry — the Nth commit for a tenant is its seq N. This
+//! counting binding is correct under Phase-2's single-node single-voter
+//! (every propose commits, in order; the group is driven to leader at
+//! creation so `node.propose` never fails NotLeader). Phase 5 (multi-
+//! node, where a propose can fail or leadership can change mid-flight)
+//! replaces counting with an explicit per-entry seq (framed prefix or a
+//! pending-seq FIFO) — flagged where it bites.
+
+const std = @import("std");
+const node_mod = @import("node.zig");
+
+pub const Node = node_mod.Node;
+pub const WriteSet = node_mod.WriteSet;
+
+pub const Error = error{
+    /// `propose` / `committedSeq` named a gid with no registered tenant.
+    UnknownTenant,
+    /// The bridge is shutting down; no further proposes accepted.
+    ShuttingDown,
+    OutOfMemory,
+} || node_mod.Error;
+
+/// Per-tenant signaling state, owned by the bridge and reachable from
+/// any thread. Deliberately SEPARATE from `Node.TenantSlot` (which owns
+/// the kvexp store + raft group and is touched only on the pump thread):
+/// this struct holds only the seq counter + watermarks the worker seam
+/// reads/writes. Heap-allocated and pointer-stable for the bridge's
+/// lifetime, so a cached `*GroupSig` is a safe lock-free read handle.
+pub const GroupSig = struct {
+    gid: u64,
+    /// Owned dup of the tenant store id string the worker stamps on
+    /// writeset envelopes. Borrowed by inbox items (stable).
+    id_str: []u8,
+    /// Per-tenant monotonic propose ticket. Guarded by `Bridge.mutex`
+    /// (assigned in the same critical section as the inbox append).
+    next_seq: u64 = 0,
+    /// Highest seq whose entry has committed + applied. Advanced only by
+    /// the pump commit hook (single writer); read lock-free by workers.
+    committed_seq: std.atomic.Value(u64) = .init(0),
+    /// Highest seq known to have faulted (leadership loss / shutdown).
+    /// Reserved in Phase 2 — single-node never loses leadership, so this
+    /// only moves on bridge teardown to fail any in-flight proposes.
+    faulted_seq: std.atomic.Value(u64) = .init(0),
+};
+
+/// One queued propose, handed worker thread → pump thread.
+const ProposeItem = struct {
+    gid: u64,
+    /// Borrowed from the gid's `GroupSig.id_str` (pointer-stable).
+    id_str: []const u8,
+    /// Owned envelope bytes; the pump frees after `node.propose`
+    /// (raft-rs copies the payload into the log entry).
+    payload: []u8,
+};
+
+pub const Bridge = struct {
+    /// Mirrors the field shape of V1's `RaftNode.config` that the reused
+    /// worker reads (`worker.raft.config.node_id`) — single-node default 1.
+    pub const Config = struct { node_id: u32 = 1 };
+
+    allocator: std.mem.Allocator,
+    node: *Node,
+    /// Compatibility surface for the reused worker's `.raft.config.*` reads.
+    config: Config = .{},
+
+    /// Guards `groups` + `by_id` + `next_gid` + `inbox` + every
+    /// `GroupSig.next_seq`. NOT held across `node.*` calls.
+    mutex: std.Thread.Mutex = .{},
+    groups: std.AutoHashMapUnmanaged(u64, *GroupSig) = .empty,
+    /// id_str → gid. Phase-2 directory stub (local monotonic assignment);
+    /// the replicated tenant→cluster directory is Phase 3.
+    by_id: std.StringHashMapUnmanaged(u64) = .empty,
+    next_gid: u64 = 1,
+    inbox: std.ArrayListUnmanaged(ProposeItem) = .empty,
+
+    pump_thread: ?std.Thread = null,
+    stop: std.atomic.Value(bool) = .init(false),
+
+    /// Stand up a single-node bridge over a fresh single-voter `Node`.
+    /// Does NOT start the pump thread — call `startPump` (production) or
+    /// drive `pumpOnce` directly (tests).
+    pub fn initSingleNode(allocator: std.mem.Allocator, data_dir: []const u8) Error!*Bridge {
+        const node = try Node.initSingleNode(allocator, data_dir);
+        errdefer node.deinit();
+        return Bridge.init(allocator, node);
+    }
+
+    pub fn init(allocator: std.mem.Allocator, node: *Node) Error!*Bridge {
+        const self = allocator.create(Bridge) catch return Error.OutOfMemory;
+        self.* = .{ .allocator = allocator, .node = node };
+        node.commit_hook = .{ .ctx = self, .func = onCommitted };
+        return self;
+    }
+
+    /// Put the node in leader-skip apply mode: the pump advances commit
+    /// watermarks but does NOT write tenant stores, because the worker
+    /// fronting this bridge owns the speculative overlay and commits it on
+    /// watermark advance. Call before serving (loop46-v2). The 2a unit
+    /// tests, which read the pump's own store, keep the default.
+    pub fn setLeaderSkip(self: *Bridge) void {
+        self.node.apply_mode = .leader_skip;
+    }
+
+    /// Stop the pump (if running), then free the node + all bridge state.
+    pub fn deinit(self: *Bridge) void {
+        self.stopPump();
+
+        const a = self.allocator;
+        self.node.deinit();
+
+        var it = self.groups.valueIterator();
+        while (it.next()) |sig_ptr| {
+            const sig = sig_ptr.*;
+            a.free(sig.id_str);
+            a.destroy(sig);
+        }
+        self.groups.deinit(a);
+        self.by_id.deinit(a);
+        // Any items still queued at teardown own their payloads.
+        for (self.inbox.items) |item| a.free(item.payload);
+        self.inbox.deinit(a);
+        a.destroy(self);
+    }
+
+    // ── Tenant registry (any thread) ─────────────────────────────────
+
+    /// Map a tenant store id to its numeric group id, assigning one on
+    /// first sight. Idempotent. Safe from any thread. Does NOT touch the
+    /// `Node`/`Manager` — the raft group is created lazily on the pump
+    /// thread at the tenant's first propose (`ensureGroup`).
+    pub fn registerTenant(self: *Bridge, id_str: []const u8) Error!u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.by_id.get(id_str)) |gid| return gid;
+
+        const gid = self.next_gid;
+        const sig = self.allocator.create(GroupSig) catch return Error.OutOfMemory;
+        errdefer self.allocator.destroy(sig);
+        const id_dup = self.allocator.dupe(u8, id_str) catch return Error.OutOfMemory;
+        errdefer self.allocator.free(id_dup);
+        sig.* = .{ .gid = gid, .id_str = id_dup };
+
+        self.groups.put(self.allocator, gid, sig) catch return Error.OutOfMemory;
+        errdefer _ = self.groups.remove(gid);
+        // Key the by_id entry on the owned dup so it outlives the caller's
+        // slice.
+        self.by_id.put(self.allocator, id_dup, gid) catch return Error.OutOfMemory;
+
+        self.next_gid += 1;
+        return gid;
+    }
+
+    /// Look up a registered tenant's gid by id, or null if unregistered.
+    pub fn gidForTenant(self: *Bridge, id_str: []const u8) ?u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.by_id.get(id_str);
+    }
+
+    fn sigFor(self: *Bridge, gid: u64) ?*GroupSig {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.groups.get(gid);
+    }
+
+    // ── Propose (worker thread) ──────────────────────────────────────
+
+    /// Assign a per-tenant seq, enqueue a COPY of `payload` for the pump,
+    /// and return the seq for the worker to park on. Copies (rather than
+    /// takes ownership) to match V1 `RaftNode.propose` semantics, so the
+    /// reused worker's existing "free the envelope after propose" logic is
+    /// unchanged — the bridge owns the copy and frees it after
+    /// `node.propose`. Never blocks on commit; the worker polls
+    /// `committedSeq(gid)`.
+    ///
+    /// The seq assignment + inbox append happen under one lock so per-
+    /// tenant seq order == enqueue order == commit order (see file
+    /// header). Returns the assigned seq (≥ 1).
+    pub fn propose(self: *Bridge, gid: u64, payload: []const u8) Error!u64 {
+        if (self.stop.load(.acquire)) return Error.ShuttingDown;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const sig = self.groups.get(gid) orelse return Error.UnknownTenant;
+        const owned = self.allocator.dupe(u8, payload) catch return Error.OutOfMemory;
+        sig.next_seq += 1;
+        const seq = sig.next_seq;
+        self.inbox.append(self.allocator, .{
+            .gid = gid,
+            .id_str = sig.id_str,
+            .payload = owned,
+        }) catch {
+            // Roll the seq back so the counting binding stays exact.
+            sig.next_seq -= 1;
+            self.allocator.free(owned);
+            return Error.OutOfMemory;
+        };
+        return seq;
+    }
+
+    // ── Watermarks (worker thread, lock-free) ────────────────────────
+
+    /// Highest seq for this tenant whose write is committed + applied.
+    /// A worker considers its write durable once `committedSeq(gid) >=
+    /// my_seq`. Lock-free atomic load on the hot drain path.
+    pub fn committedSeq(self: *Bridge, gid: u64) u64 {
+        const sig = self.sigFor(gid) orelse return 0;
+        return sig.committed_seq.load(.acquire);
+    }
+
+    /// Highest seq for this tenant known to have faulted (leadership
+    /// loss / shutdown). Phase 2: only moves on teardown.
+    pub fn faultedSeq(self: *Bridge, gid: u64) u64 {
+        const sig = self.sigFor(gid) orelse return 0;
+        return sig.faulted_seq.load(.acquire);
+    }
+
+    /// Node-wide leader check the reused worker uses to gate proposes
+    /// (config mirror, deploy markers). Single-node V2 is the only node,
+    /// so it is the leader of EVERY tenant group — always true. Matches
+    /// V1's no-arg `RaftNode.isLeader()` shape so the worker call sites
+    /// need no edits. Phase 5 (multi-node) reintroduces per-group
+    /// leadership (`isLeader(gid)`).
+    pub fn isLeader(self: *Bridge) bool {
+        _ = self;
+        return true;
+    }
+
+    // ── Pump (pump thread only) ──────────────────────────────────────
+
+    /// Spawn the dedicated pump thread. Production entry point. Idempotent
+    /// guard: a second call is a no-op.
+    pub fn startPump(self: *Bridge) Error!void {
+        if (self.pump_thread != null) return;
+        self.stop.store(false, .release);
+        self.pump_thread = std.Thread.spawn(.{}, pumpLoop, .{self}) catch return Error.Io;
+    }
+
+    /// Signal the pump thread to stop and join it. Then fail any still-
+    /// in-flight proposes (faulted_seq = next_seq) so a parked worker
+    /// stops waiting. Safe to call when no pump thread is running.
+    pub fn stopPump(self: *Bridge) void {
+        self.stop.store(true, .release);
+        if (self.pump_thread) |t| {
+            t.join();
+            self.pump_thread = null;
+        }
+        // Fail anything proposed-but-not-committed.
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var it = self.groups.valueIterator();
+        while (it.next()) |sig_ptr| {
+            const sig = sig_ptr.*;
+            sig.faulted_seq.store(sig.next_seq, .release);
+        }
+    }
+
+    fn pumpLoop(self: *Bridge) void {
+        while (!self.stop.load(.acquire)) {
+            const did = self.pumpOnce() catch |e| blk: {
+                std.log.warn("v2 bridge pump: {s}", .{@errorName(e)});
+                break :blk false;
+            };
+            // Idle backoff: nothing to drain and nothing committed this
+            // cycle. Single-node has no election/heartbeat traffic to
+            // service, so a short sleep is fine; Phase 6 wires the
+            // hibernation deadline / mailbox-driven wake here.
+            if (!did) std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+
+    /// One drain + pump cycle. Returns true if it proposed or committed
+    /// anything this cycle. Pump-thread-only (touches the `Node`). Public
+    /// so tests can drive the bridge deterministically without the thread.
+    pub fn pumpOnce(self: *Bridge) Error!bool {
+        // 1. Drain the inbox under the lock, then release it before any
+        //    `node.*` call (ensureGroup/propose/pump must not run with
+        //    the bridge mutex held — the commit hook re-acquires it).
+        var batch: std.ArrayListUnmanaged(ProposeItem) = .empty;
+        defer batch.deinit(self.allocator);
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.inbox.items.len > 0) {
+                batch.appendSlice(self.allocator, self.inbox.items) catch return Error.OutOfMemory;
+                self.inbox.clearRetainingCapacity();
+            }
+        }
+
+        var did_work = batch.items.len > 0;
+
+        // 2. Submit each drained propose to its tenant's group, creating
+        //    the group on first sight (drives it to leader).
+        for (batch.items) |item| {
+            defer self.allocator.free(item.payload);
+            _ = self.node.ensureGroup(item.gid, item.id_str) catch |e| {
+                std.log.warn("v2 bridge ensureGroup gid={d}: {s}", .{ item.gid, @errorName(e) });
+                continue;
+            };
+            self.node.propose(item.gid, item.payload) catch |e| {
+                std.log.warn("v2 bridge propose gid={d}: {s}", .{ item.gid, @errorName(e) });
+            };
+        }
+
+        // 3. Drive one ready cycle: commits + applies + fires the commit
+        //    hook (which advances committed_seq).
+        const committed = self.node.pump() catch |e| {
+            return e;
+        };
+        if (committed) did_work = true;
+        return did_work;
+    }
+
+    // ── Commit hook (pump thread, via node.applyCb) ──────────────────
+
+    /// Bound to `Node.commit_hook`. Fires once per committed real entry,
+    /// in per-tenant commit order. Advances the tenant's committed_seq by
+    /// one (the counting binding — see file header). `raft_index` is
+    /// unused under counting but kept in the signature for the Phase-5
+    /// switch to explicit per-entry seqs.
+    fn onCommitted(ctx: *anyopaque, group_id: u64, raft_index: u64) void {
+        _ = raft_index;
+        const self: *Bridge = @ptrCast(@alignCast(ctx));
+        const sig = self.sigFor(group_id) orelse {
+            // A committed entry for a group with no GroupSig is an
+            // invariant violation: every propose registered one first.
+            std.log.warn("v2 bridge commit for unregistered gid={d}", .{group_id});
+            return;
+        };
+        // Single writer (the pump thread), so a load+1+store is race-free.
+        const cur = sig.committed_seq.load(.monotonic);
+        sig.committed_seq.store(cur + 1, .release);
+    }
+};
+
+// ── Tests ────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+const envelope = @import("envelope.zig");
+
+/// Build a type-0 writeset envelope for `id_str` carrying `ws`. Mirrors
+/// what the worker seam will hand `propose`. Caller transfers ownership
+/// of the returned bytes to `propose`.
+fn encodeWs(a: std.mem.Allocator, id_str: []const u8, ws: *const WriteSet) ![]u8 {
+    const ws_bytes = try ws.encode(a);
+    defer a.free(ws_bytes);
+    return envelope.encodeWriteSet(a, id_str, ws_bytes);
+}
+
+test "bridge: propose → pumpOnce commits → committedSeq advances, read sees write" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const bridge = try Bridge.initSingleNode(a, dir);
+    defer bridge.deinit();
+
+    const gid = try bridge.registerTenant("tenant-1");
+
+    var ws = WriteSet.init(a);
+    defer ws.deinit();
+    try ws.addPut("greeting", "hello-bridge");
+
+    const env = try encodeWs(a, "tenant-1", &ws);
+    defer a.free(env); // propose copies, so the test still owns env
+    const seq = try bridge.propose(gid, env);
+    try testing.expectEqual(@as(u64, 1), seq);
+    try testing.expectEqual(@as(u64, 0), bridge.committedSeq(gid));
+
+    // Drive the pump deterministically (no thread): first cycle proposes
+    // + creates the group; subsequent cycles commit + apply.
+    var spins: u32 = 0;
+    while (bridge.committedSeq(gid) < seq and spins < 200) : (spins += 1) {
+        _ = try bridge.pumpOnce();
+    }
+    try testing.expectEqual(seq, bridge.committedSeq(gid));
+
+    // Pump thread is not running, so reading the node's store on this
+    // thread is race-free (2a; the cross-thread two-handle model is 2b).
+    const got = try bridge.node.get(gid, "greeting");
+    defer a.free(got);
+    try testing.expectEqualStrings("hello-bridge", got);
+}
+
+test "bridge: two tenants' watermarks advance independently (no cross-tenant HOL)" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const bridge = try Bridge.initSingleNode(a, dir);
+    defer bridge.deinit();
+
+    const ga = try bridge.registerTenant("alice");
+    const gb = try bridge.registerTenant("bob");
+    try testing.expect(ga != gb);
+
+    // Interleave proposes across the two tenants: A, B, A.
+    var wa1 = WriteSet.init(a);
+    defer wa1.deinit();
+    try wa1.addPut("k", "a1");
+    const ea1 = try encodeWs(a, "alice", &wa1);
+    defer a.free(ea1);
+    const sa1 = try bridge.propose(ga, ea1);
+
+    var wb1 = WriteSet.init(a);
+    defer wb1.deinit();
+    try wb1.addPut("k", "b1");
+    const eb1 = try encodeWs(a, "bob", &wb1);
+    defer a.free(eb1);
+    const sb1 = try bridge.propose(gb, eb1);
+
+    var wa2 = WriteSet.init(a);
+    defer wa2.deinit();
+    try wa2.addPut("k", "a2");
+    const ea2 = try encodeWs(a, "alice", &wa2);
+    defer a.free(ea2);
+    const sa2 = try bridge.propose(ga, ea2);
+
+    // Per-tenant monotonic seqs: alice {1,2}, bob {1}.
+    try testing.expectEqual(@as(u64, 1), sa1);
+    try testing.expectEqual(@as(u64, 1), sb1);
+    try testing.expectEqual(@as(u64, 2), sa2);
+
+    var spins: u32 = 0;
+    while ((bridge.committedSeq(ga) < sa2 or bridge.committedSeq(gb) < sb1) and spins < 400) : (spins += 1) {
+        _ = try bridge.pumpOnce();
+    }
+
+    // Each tenant's watermark reflects ONLY its own proposes — bob at 1,
+    // alice at 2 — proving the two logs commit independently (no shared
+    // contiguous seq that would stall one behind the other).
+    try testing.expectEqual(@as(u64, 2), bridge.committedSeq(ga));
+    try testing.expectEqual(@as(u64, 1), bridge.committedSeq(gb));
+
+    const a_val = try bridge.node.get(ga, "k");
+    defer a.free(a_val);
+    try testing.expectEqualStrings("a2", a_val);
+    const b_val = try bridge.node.get(gb, "k");
+    defer a.free(b_val);
+    try testing.expectEqualStrings("b1", b_val);
+}
+
+test "bridge: pump thread drives commits end to end" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const bridge = try Bridge.initSingleNode(a, dir);
+    defer bridge.deinit();
+
+    const gid = try bridge.registerTenant("threaded");
+    try bridge.startPump();
+
+    var ws = WriteSet.init(a);
+    defer ws.deinit();
+    try ws.addPut("k", "v");
+    const env = try encodeWs(a, "threaded", &ws);
+    defer a.free(env);
+    const seq = try bridge.propose(gid, env);
+
+    // Poll the lock-free watermark while the pump thread commits.
+    var spins: u32 = 0;
+    while (bridge.committedSeq(gid) < seq and spins < 2000) : (spins += 1) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(seq, bridge.committedSeq(gid));
+
+    // Quiesce the pump before reading the node store on this thread.
+    bridge.stopPump();
+    const got = try bridge.node.get(gid, "k");
+    defer a.free(got);
+    try testing.expectEqualStrings("v", got);
+}
