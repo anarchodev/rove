@@ -899,6 +899,19 @@ pub fn build(b: *std.Build) void {
     const run_v2_bridge_test = b.addRunArtifact(v2_bridge_test);
     v2_test_step.dependOn(&run_v2_bridge_test.step);
 
+    // ── V2 Phase 3 — control plane: the tenant→cluster directory ───────
+    // (docs/v2-build-order.md §Phase 3, docs/v2-phase3-directory-routing.md).
+    // `src-v2/cp/directory.zig` is the routing source of truth the
+    // front-door reads and the Phase-4 move flips. Pure std — no raft/kvexp
+    // deps — so it is a plain test module (and links no raft artifact).
+    const v2_cp_dir_mod = b.createModule(.{
+        .root_source_file = b.path("src-v2/cp/directory.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_v2_cp_dir_test = b.addRunArtifact(b.addTest(.{ .root_module = v2_cp_dir_mod }));
+    v2_test_step.dependOn(&run_v2_cp_dir_test.step);
+
     // ── V2 Phase 2c — attach the rove-js worker to the bridge ──────────
     // rove-js imports the bridge as `@import("bridge")`. js_mod already
     // imports `kv_mod` as "raft-kv" (the facade), so the worker's
