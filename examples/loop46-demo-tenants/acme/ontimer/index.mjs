@@ -15,7 +15,7 @@
 export default function () {
     const req = request.body ? JSON.parse(request.body) : {};
     on.timer(req.ms || 150);
-    return __rove_next("ontimer/index", { fn: "onWake", ctx: { tag: req.tag || "t" } });
+    return next({ tag: req.tag || "t" });
 }
 
 // Resumed by the timer wake. A timer carries no callee outcome, so the

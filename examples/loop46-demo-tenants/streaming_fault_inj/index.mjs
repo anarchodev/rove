@@ -16,7 +16,7 @@ export default function () {
     // before the wake fires, narrow enough to exercise the gate within a
     // smoke's deadline.
     on.timer(1500);
-    return __rove_next("index", {});
+    return next();
 }
 
 // wake_batch + writes: the arm Phase 4.0.b gates. A raft fault during
@@ -28,5 +28,5 @@ export function onWake() {
     stream.start();
     stream.write(`event: tick\ndata: ${ctr}\n\n`);
     on.timer(1500);
-    return __rove_next("index", {});
+    return next();
 }

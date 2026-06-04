@@ -25,7 +25,7 @@ export default function () {
     stream.start();
     stream.write("event: snapshot\ndata: initial\n\n");
     on.kv("watch/");
-    return __rove_next("watch/index", {});
+    return next();
 }
 
 // One frame per kv entry in the batch (temporal order). Timer entries
@@ -41,5 +41,5 @@ export function onWake() {
         stream.write(`event: update\ndata: ${w.key}=${value} (${w.op})\n\n`);
     }
     on.kv("watch/");
-    return __rove_next("watch/index", {});
+    return next();
 }

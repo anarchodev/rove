@@ -1608,6 +1608,8 @@ pub fn installStatic(ctx: *c.JSContext) void {
     evalSnippet(ctx, "on.js", ON_JS);
     // Handler-surface Phase 2: connection output effects (`stream.*`).
     evalSnippet(ctx, "stream.js", STREAM_JS);
+    // Handler-surface Phase 6: the public `next` disposition verb.
+    evalSnippet(ctx, "next.js", NEXT_JS);
     evalSnippet(ctx, "webhook.js", WEBHOOK_JS);
     evalSnippet(ctx, "email.js", EMAIL_JS);
     // users is standalone (kv + crypto.{randomBytes,sha256}).
@@ -1836,6 +1838,7 @@ const SCHEDULER_JS = @embedFile("scheduler_js");
 const SCHEDULE_JS = @embedFile("schedule_js");
 const ON_JS = @embedFile("on_js");
 const STREAM_JS = @embedFile("stream_js");
+const NEXT_JS = @embedFile("next_js");
 const WEBHOOK_JS = @embedFile("webhook_js");
 const EMAIL_JS = @embedFile("email_js");
 const TEXTCODEC_JS = @embedFile("textcodec_js");
@@ -1867,6 +1870,7 @@ const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "schedule", .src = SCHEDULE_JS },
     .{ .name = "on", .src = ON_JS },
     .{ .name = "stream", .src = STREAM_JS },
+    .{ .name = "next", .src = NEXT_JS },
     .{ .name = "webhook", .src = WEBHOOK_JS },
     .{ .name = "email", .src = EMAIL_JS },
     .{ .name = "textcodec", .src = TEXTCODEC_JS },

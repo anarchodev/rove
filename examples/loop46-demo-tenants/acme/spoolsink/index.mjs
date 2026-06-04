@@ -3,7 +3,7 @@
 //   GET /spoolsink?url=<upstream>
 //
 // Issues a bound, streaming http.fetch and consumes each upstream
-// chunk with a kv read-modify-write THEN `__rove_next()` — i.e. the
+// chunk with a kv read-modify-write THEN `next()` — i.e. the
 // "writes-per-chunk" pattern. Unlike `boundproxy` (which streams
 // frames back via `__rove_stream` and so pipelines without moving the
 // held entity), every chunk here forces a full raft round-trip: the
@@ -37,7 +37,7 @@ export default function () {
     kv.set("spoolsink/full", "");
     // Connection-scoped (held handler) → chunks resume onFetchChunk.
     on.fetch(url, { stream: true, max_response_chunk_bytes: 64 });
-    return __rove_next("spoolsink/index", { ctx: { tag: "spoolsink" } });
+    return next({ tag: "spoolsink" });
 }
 
 export function onFetchChunk() {
@@ -50,5 +50,5 @@ export function onFetchChunk() {
     const prev = kv.get("spoolsink/full") || "";
     kv.set("spoolsink/full", prev + text);
     // Stay parked as a cont — forces a raft round-trip per chunk.
-    return __rove_next("spoolsink/index", { ctx: { tag: "spoolsink" } });
+    return next({ tag: "spoolsink" });
 }

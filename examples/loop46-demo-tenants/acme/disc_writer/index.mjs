@@ -18,7 +18,7 @@ export default function () {
     stream.start();
     stream.write(":hb\n\n");
     on.timer(100);
-    return __rove_next("disc_writer/index", {});
+    return next();
 }
 
 // The cleanup write — set a marker key. The smoke reads it back via
@@ -37,5 +37,5 @@ export function onWake() {
         if (w.kind === "timer") stream.write(":hb\n\n");
     }
     on.timer(100);
-    return __rove_next("disc_writer/index", {});
+    return next();
 }

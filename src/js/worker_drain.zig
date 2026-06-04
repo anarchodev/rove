@@ -1342,6 +1342,16 @@ fn resumeContinuation(
         },
         .continuation => |c2| {
             var c2m = c2;
+            // Handler-surface Phase 6: an ambient `next(ctx)` repark emits
+            // an empty path — resolve it to the resuming module (the chain
+            // re-invokes itself). Explicit cross-module `__rove_next` keeps
+            // its path. OOM: leave empty (resume resolves to a clean error).
+            if (c2m.path.len == 0) {
+                if (allocator.dupe(u8, cont_path)) |dup| {
+                    allocator.free(c2m.path);
+                    c2m.path = dup;
+                } else |_| {}
+            }
             if (!allow_repark) {
                 // Deadline path: §6.4 mandatory timeout must
                 // terminate, not extend. Reject any new cont with
@@ -1734,7 +1744,15 @@ pub fn resumeBoundFetchChain(
         .continuation => |c2| {
             // Re-park: refresh the cont descriptor + deadline. The
             // chain stays awaiting the next bound-fetch chunk.
-            const c2m = c2;
+            var c2m = c2;
+            // Phase 6: ambient `next(ctx)` repark → resolve the empty
+            // path to the chain's module (re-invoke itself).
+            if (c2m.path.len == 0) {
+                if (allocator.dupe(u8, cont_path)) |dup| {
+                    allocator.free(c2m.path);
+                    c2m.path = dup;
+                } else |_| {}
+            }
             const new_bound_sched_id: ?[]u8 = blk: {
                 const only = worker_mod.scanLoneOwedSendId(ws.ops.items) orelse break :blk null;
                 break :blk allocator.dupe(u8, only) catch null;
