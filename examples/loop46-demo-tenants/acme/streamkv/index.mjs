@@ -1,7 +1,7 @@
 // stream.* + on.kv + next() exerciser (handler-surface Phase 2 slice
 // 2b/2c) — the NEW streaming surface, sibling of the old-surface `watch`
 // handler. Output is the `stream.start()` / `stream.write()` effects;
-// the wait is `on.kv`; the disposition is `__rove_next(...)` (keep the
+// the wait is `on.kv`; the disposition is `next()` (keep the
 // socket). No `__rove_stream({write, waitFor})` — that return verb is
 // retired in slice 2d. The dispatcher's `finishResponse` bridges this
 // (next() + stream_started) to the same internal Stream descriptor the
@@ -20,7 +20,7 @@ export default function () {
     stream.start();                              // commit the head
     stream.write("event: ready\ndata: 1\n\n");   // first frame
     on.kv("streamkv/in/");                        // wait for writes
-    return __rove_next("streamkv/index", {});     // hold the socket
+    return next();     // hold the socket
 }
 
 // A kv write under the watched prefix landed (§8.4-gated) — emit one
@@ -33,5 +33,5 @@ export function onWake() {
         stream.write("event: update\ndata: " + w.key + "=" + v + "\n\n");
     }
     on.kv("streamkv/in/");                        // re-arm
-    return __rove_next("streamkv/index", {});
+    return next();
 }

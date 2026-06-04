@@ -14,7 +14,7 @@ export default function () {
     stream.start();
     stream.write("event: open\ndata: ok\n\n");
     on.kv("overflow/");
-    return __rove_next("overflow_watch/index", {});
+    return next();
 }
 
 // One status frame per wake echoing wakes.length + overflow.lost_oldest.
@@ -23,5 +23,5 @@ export function onWake() {
     stream.start();
     stream.write(`event: batch\ndata: wakes=${a.wakes.length} lost=${a.overflow.lost_oldest}\n\n`);
     on.kv("overflow/");
-    return __rove_next("overflow_watch/index", {});
+    return next();
 }

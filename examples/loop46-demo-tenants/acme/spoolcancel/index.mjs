@@ -28,7 +28,7 @@ export default function () {
     }
     kv.set("sc/count", "0");
     on.fetch(url, { stream: true, max_response_chunk_bytes: 64 });
-    return __rove_next("spoolcancel/index", { ctx: {} });
+    return next();
 }
 
 export function onFetchChunk() {
@@ -48,5 +48,5 @@ export function onFetchChunk() {
     }
     const c = parseInt(kv.get("sc/count") || "0", 10) + 1;
     kv.set("sc/count", String(c));
-    return __rove_next("spoolcancel/index", { ctx: {} });
+    return next();
 }

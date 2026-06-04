@@ -2946,6 +2946,18 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .terminal => |r| r,
             .continuation => |cval| ctblk: {
                 cont_opt = cval;
+                // Handler-surface Phase 6: the ambient `next(ctx)` verb
+                // emits an empty path; resolve it to THIS handler's
+                // module so the resume re-invokes the same module. An
+                // explicit cross-module `__rove_next("other", …)`
+                // (held-sync / the webhook shim) keeps its own path. OOM:
+                // leave empty — the resume then resolves to a clean error.
+                if (cont_opt.?.path.len == 0) {
+                    if (allocator.dupe(u8, route.module_base)) |dup| {
+                        allocator.free(cont_opt.?.path);
+                        cont_opt.?.path = dup;
+                    } else |_| {}
+                }
                 break :ctblk dispatcher_mod.Response{
                     .body = &.{},
                     .console = &.{},

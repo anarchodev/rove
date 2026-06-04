@@ -18,7 +18,7 @@ export default function () {
     stream.start();
     stream.write("event: ready\ndata: 1\n\n");
     on.kv("watchwrite/in/");
-    return __rove_next("watchwrite/index", {});
+    return next();
 }
 
 // §9.4: relay every kv entry in the wake batch in temporal order,
@@ -33,5 +33,5 @@ export function onWake() {
         stream.write(`event: relayed\ndata: ${w.key}->${out_key}\n\n`);
     }
     on.kv("watchwrite/in/");
-    return __rove_next("watchwrite/index", {});
+    return next();
 }

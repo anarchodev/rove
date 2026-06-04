@@ -27,7 +27,7 @@ export default function () {
     stream.start();
     emit(0);
     on.timer(100);
-    return __rove_next("big_chunks/index", {});
+    return next();
 }
 
 // Timer wake — echo the prior activation's dropped-chunk count, then
@@ -36,5 +36,5 @@ export function onWake() {
     stream.start();
     emit(request.activation.write_pressure.dropped_chunks);
     on.timer(100);
-    return __rove_next("big_chunks/index", {});
+    return next();
 }

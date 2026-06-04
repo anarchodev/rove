@@ -27,7 +27,7 @@ export default function () {
     stream.start();
     stream.write(`event: hello\ndata: ${session_id}\n\n`);
     on.timer(100);
-    return __rove_next("sessions_sse/index", { ctx: { session_id } });
+    return next({ session_id });
 }
 
 // Mirror the open: deregister the session when the client disconnects.
@@ -44,5 +44,5 @@ export function onWake() {
         if (w.kind === "timer") stream.write(`event: tick\ndata: ${ctx.session_id}\n\n`);
     }
     on.timer(100);
-    return __rove_next("sessions_sse/index", { ctx });
+    return next(ctx);
 }

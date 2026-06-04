@@ -10,8 +10,10 @@
 > surface in `streaming-model.md` §3 and the multi-shape return values in
 > §4–§5. The engine model (coalesce budget, blob coordinator, one-rule
 > semantics — see `streaming-model.md` §1–§2 and §7.X) is **unchanged**;
-> only the customer-facing handler API changed. Remaining Phase 6 polish:
-> the public `next` module surface + the CLI-side §6 export-coverage lint.
+> only the customer-facing handler API changed. Phase 6 (polish) landed
+> the ambient `next` verb; the §6 export-coverage validation is CLI-side
+> (static analysis over arenajs-WASM), backstopped at runtime by the
+> missing-`onWake` 404.
 >
 > **Revised 2026-06-02 (rev 2 — `stream.*` model).** Organized around one
 > axis — **scope: current-connection vs connectionless** — derived in
@@ -116,9 +118,9 @@ stream loop's cursor, a fan-in accumulator (§5.8). It is **not** heap
 state across activations (the arena resets); state that must survive a
 disconnect lives in `kv`.
 
-```js
-import { next } from 'rove';
-```
+`next` is an **ambient global** (like `stream`, `on`, `kv`, `response`) —
+no import. `next()` resumes THIS module's conventional export for the
+activation kind; you never name the module or export.
 
 ### 2.2 Connection output — `stream.start` / `stream.write`
 
@@ -309,8 +311,6 @@ export default function () {
 ### 5.3 Streaming inbound — per-chunk upload to storage
 
 ```js
-import { next } from 'rove';
-
 export function onChunk() {
   on.fetch(`${STORAGE_URL}/${request.headers['x-key']}?seq=${request.chunkSeq}`,
            { method: 'PUT', body: request.body }, { to: 'onPut' });
@@ -327,8 +327,6 @@ export function onPut() {                        // each PUT result resumes here
 ### 5.4 Gateway — hold the client, forward upstream, return its status
 
 ```js
-import { next } from 'rove';
-
 export default function () {
   on.fetch('https://upstream.example.com', { method: 'POST', body: request.body },
            { to: 'onUpstream' });
@@ -348,8 +346,6 @@ abandoning it is correct.
 ### 5.5 LLM proxy — streamed connection fetch + held client
 
 ```js
-import { next } from 'rove';
-
 export default function () {
   on.fetch(LLM_URL, { method: 'POST', body: request.body }, { to: 'onUpstream' });
   return next();                                 // hold the client; wait for the first chunk
@@ -365,8 +361,6 @@ export function onUpstream() {
 ### 5.6 Connectionless work — fire durable, respond now
 
 ```js
-import { next } from 'rove';
-
 export default function () {
   webhook.send('https://billing.example.com/charge', { body: request.body, onResult: 'onCharge' });
   schedule({ in: '24h' }, 'sendReminder', { user: request.user });
@@ -385,8 +379,6 @@ export function onBoot()  { kv.set('booted_at', now()); }
 ### 5.7 SSE notifications — connection + connectionless composed
 
 ```js
-import { next } from 'rove';
-
 // Connect (or reconnect via Last-Event-ID).
 export default function () {
   response.headers = { 'content-type': 'text/event-stream' };       // ambient head
@@ -421,8 +413,6 @@ bounds the reconnect-replay window.)
 ### 5.8 Fan-in / join — wait for all, then combine
 
 ```js
-import { next } from 'rove';
-
 export default function () {
   on.fetch(API_A, {}, { to: 'onResult' });       // fetchId: 'a'
   on.fetch(API_B, {}, { to: 'onResult' });       // fetchId: 'b'

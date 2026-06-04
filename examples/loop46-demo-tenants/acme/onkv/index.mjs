@@ -23,7 +23,7 @@ export default function () {
     // only a write newer than what we just saw should wake us.
     kv.get(prefix + "flag");
     on.kv(prefix, { to: "onWake" });
-    return __rove_next("onkv/index", { fn: "onWake", ctx: { prefix } });
+    return next({ prefix });
 }
 
 // Resumed by a kv match. An `on.*` wake carries no callee outcome, so

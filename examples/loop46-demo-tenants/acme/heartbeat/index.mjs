@@ -20,7 +20,7 @@ export default function () {
     stream.start();
     stream.write(":heartbeat\n\n");
     on.timer(200);
-    return __rove_next("heartbeat/index", {});
+    return next();
 }
 
 // Timer wake — emit a heartbeat per timer entry, re-arm.
@@ -30,5 +30,5 @@ export function onWake() {
         if (w.kind === "timer") stream.write(":heartbeat\n\n");
     }
     on.timer(200);
-    return __rove_next("heartbeat/index", {});
+    return next();
 }

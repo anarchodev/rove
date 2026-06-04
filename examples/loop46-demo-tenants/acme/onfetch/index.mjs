@@ -25,7 +25,7 @@ export default function () {
     kv.set("onfetch/acc", ""); // fresh accumulator per run
     // Connection-scoped: binds to THIS held chain; chunks wake onUpstream.
     on.fetch(url, { stream: true, max_response_chunk_bytes: 64 }, { to: "onUpstream" });
-    return __rove_next("onfetch/index", {});
+    return next();
 }
 
 // Per upstream chunk (bound via on.fetch's {to}). Accumulate in kv; on
@@ -37,5 +37,5 @@ export function onUpstream() {
     }
     const text = new TextDecoder().decode(request.body);
     kv.set("onfetch/acc", (kv.get("onfetch/acc") || "") + text);
-    return __rove_next("onfetch/index", {});
+    return next();
 }

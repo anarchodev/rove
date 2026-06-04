@@ -9,7 +9,7 @@
 // Each upstream chunk fires `onFetchChunk`; chunks for the two
 // fetches interleave on the one entity. The handler keys a kv
 // accumulator by `request.fetchId` and consumes every chunk with a
-// read-modify-write + `__rove_next()` (writes-per-chunk → a raft
+// read-modify-write + `next()` (writes-per-chunk → a raft
 // round-trip per chunk, real back-pressure → both per-fetch spools
 // back up). Per-fetch ordering must hold (each spool is FIFO);
 // cross-fetch interleave is arbitrary.
@@ -45,7 +45,7 @@ export default function () {
     kv.set("mb/acc/" + id1, "");
     kv.set("mb/acc/" + id2, "");
     kv.set("mb/ndone", "0");
-    return __rove_next("multibind/index", { ctx: {} });
+    return next();
 }
 
 export function onFetchChunk() {
@@ -55,7 +55,7 @@ export function onFetchChunk() {
         kv.set("mb/ndone", String(ndone));
         if (ndone < 2) {
             // First fetch finished — stay parked for the second.
-            return __rove_next("multibind/index", { ctx: {} });
+            return next();
         }
         // Both done — return the two reconstructed bodies in issue order.
         const id1 = kv.get("mb/id1") || "";
@@ -66,5 +66,5 @@ export function onFetchChunk() {
     const text = new TextDecoder().decode(request.body);
     const prev = kv.get("mb/acc/" + fid) || "";
     kv.set("mb/acc/" + fid, prev + text);
-    return __rove_next("multibind/index", { ctx: {} });
+    return next();
 }

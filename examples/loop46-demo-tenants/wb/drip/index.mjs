@@ -13,7 +13,7 @@ export default function () {
     stream.start();
     stream.write("drip\n");
     on.timer(120);
-    return __rove_next("drip/index", {});
+    return next();
 }
 
 // One frame per timer tick — never returns terminal, so the stream
@@ -22,5 +22,5 @@ export function onWake() {
     stream.start();
     stream.write("drip\n");
     on.timer(120);
-    return __rove_next("drip/index", {});
+    return next();
 }
