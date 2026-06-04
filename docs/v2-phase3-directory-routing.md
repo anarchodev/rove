@@ -1,10 +1,13 @@
 # V2 Phase 3 — directory + routing across two (single-node) clusters
 
-> **Status (2026-06-04).** Phase 3 design + the control-plane directory
-> primitive (3a) landed; the front door (3b) + two-cluster smoke (3c) are
-> the remaining pieces. Companion: [`v2-build-order.md`](v2-build-order.md)
-> §Phase 3 (the one-paragraph spec this elaborates), PLAN §13 (live
-> process map).
+> **Status (2026-06-04).** Phase 3 COMPLETE: the control-plane directory
+> (3a), the `rewind-front` front door (3b), and the two-cluster exit smoke
+> (3c, `two_cluster_smoke.py`) all landed and green. The Phase-3 exit —
+> "tenant A served on cluster 1, tenant B on cluster 2, requests routed
+> correctly" — is proven. Next: Phase 4 (the brief-pause tenant-move
+> milestone), which flips `Directory.move` as its commit point. Companion:
+> [`v2-build-order.md`](v2-build-order.md) §Phase 3 (the one-paragraph
+> spec this elaborates), PLAN §13 (live process map).
 
 ## Why Phase 3 exists
 
@@ -25,8 +28,8 @@ move). Phase 3 is the routing substrate the move flips.
 | Piece | Where | What |
 |---|---|---|
 | **3a Directory** | `src-v2/cp/directory.zig` | tenant→cluster map; the routing source of truth + the `move` seam Phase 4 flips. **Done.** |
-| **3b Front door** | `src-v2/front/` | HTTP/2 terminator: resolve Host→tenant → `directory.clusterFor` → reverse-proxy to that cluster. |
-| **3c Smoke** | `scripts/two_cluster_smoke.py` | two `rewind` clusters + front door; tenant A→cluster 1, tenant B→cluster 2, routed correctly. The Phase-3 exit. |
+| **3b Front door** | `src-v2/front/main.zig` | HTTP/2 terminator: resolve Host→tenant → `directory.clusterFor` → reverse-proxy (libcurl, h2c) to that cluster. `zig build rewind-front`. **Done.** |
+| **3c Smoke** | `scripts/two_cluster_smoke.py` | two `rewind` clusters + front door; tenant A→cluster 1, tenant B→cluster 2, routed correctly. The Phase-3 exit. **Done — green.** |
 
 ## 3a — the directory (control plane)
 
@@ -55,7 +58,7 @@ Decisions baked in:
   *group id* (data plane, within a cluster); the directory maps
   tenant→*cluster* (control plane, across clusters). Different axes.
 
-## 3b — the front door (plan)
+## 3b — the front door
 
 A small HTTP/2 server that, per request:
 
@@ -91,14 +94,22 @@ address once clusters are multi-node.
 ## 3c — the exit smoke
 
 `two_cluster_smoke.py`: boot two `rewind` instances on distinct data dirs
-+ ports (cluster 1, cluster 2) and one front door seeded with
-`cluster-1=…;cluster-2=…` placement `A=cluster-1;B=cluster-2`. Provision
-tenant A on cluster 1 and tenant B on cluster 2 (admin-kv write through
-each backend directly). Then drive both tenants *through the front door*
-and assert each write lands on the correct backend (read it back through
-the front door; cross-check it is absent on the other cluster). A correct
-route for both tenants is the Phase-3 exit: **"tenant A served on cluster
-1, tenant B on cluster 2, requests routed correctly."**
++ ports and one front door seeded with `cluster-1=…;cluster-2=…`, hosts
+`c1.localhost=c1tenant;c2.localhost=c2tenant`, placement
+`c1tenant=cluster-1;c2tenant=cluster-2`.
+
+The routing proof avoids the OIDC `provisionInstance` machinery by giving
+each backend a **distinct admin domain** (`REWIND_ADMIN_DOMAIN` env, new in
+`rewind`): the built-in `/_system/admin-kv` write 204s iff the request's
+Host matches that backend's admin domain. So a direct hit with the foreign
+cluster's host/token is non-204 (establishing each host is
+cluster-specific), and *through the front door* both `c1.localhost` and
+`c2.localhost` return 204 — each 204 can only have come from the cluster
+whose admin domain matches that host, so both together prove correct
+routing. A broken router (both hosts to one cluster) would 204 one and
+non-204 the other. Plus an unmapped host → front-door 404. Green — the
+Phase-3 exit: **"tenant A served on cluster 1, tenant B on cluster 2,
+requests routed correctly."**
 
 ## Open questions / deferred
 
