@@ -860,6 +860,40 @@ pub fn build(b: *std.Build) void {
     const v2_smoke_test = b.addTest(.{ .root_module = v2_smoke_mod });
     v2_smoke_test.linkLibrary(raft_dep.artifact("raft_rs_zig"));
     const run_v2_smoke_test = b.addRunArtifact(v2_smoke_test);
-    const v2_test_step = b.step("v2-test", "V2 Phase-0 raft substrate smoke (Manager + group elects a leader)");
+    const v2_test_step = b.step("v2-test", "V2 raft substrate tests (Phase-0 smoke + Phase-1 per-tenant pump)");
     v2_test_step.dependOn(&run_v2_smoke_test.step);
+
+    // ── V2 Phase 1 — data-plane core: the per-tenant pump (single node)
+    // (docs/v2-build-order.md §Phase 1). `src-v2/kv/node.zig` owns a
+    // Manager + SharedWal and pumps per-tenant raft groups, applying
+    // committed writeset envelopes to each tenant's kvexp store. It
+    // reuses the V1 limbs as plain files — `src/kv/kvstore.zig` +
+    // `src/kv/writeset.zig` (which only import `kvexp`, not the willemt
+    // raft / io_uring spine) — so the node module needs `kvexp` in its
+    // import table (those files' `@import("kvexp")` resolves through it)
+    // plus the raft artifact. kvexp already links liblmdb + libc.
+    const v2_node_mod = b.createModule(.{
+        .root_source_file = b.path("src-v2/kv/node.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    v2_node_mod.link_libc = true;
+    v2_node_mod.addImport("raft_rs_zig", raft_dep.module("raft_rs_zig"));
+    // kvlimbs: the V1 reuse seam (src/kv/kvlimbs.zig) re-exporting
+    // kvstore.zig + writeset.zig as one module so `KvStore` is a single
+    // type across both. It needs `kvexp` in its own import table (the
+    // files' `@import("kvexp")` resolves through it); kvexp links
+    // liblmdb + libc, which propagates to the node module.
+    const v2_kvlimbs_mod = b.createModule(.{
+        .root_source_file = b.path("src/kv/kvlimbs.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    v2_kvlimbs_mod.link_libc = true;
+    v2_kvlimbs_mod.addImport("kvexp", kvexp_mod);
+    v2_node_mod.addImport("kvlimbs", v2_kvlimbs_mod);
+    const v2_node_test = b.addTest(.{ .root_module = v2_node_mod });
+    v2_node_test.linkLibrary(raft_dep.artifact("raft_rs_zig"));
+    const run_v2_node_test = b.addRunArtifact(v2_node_test);
+    v2_test_step.dependOn(&run_v2_node_test.step);
 }
