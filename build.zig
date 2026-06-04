@@ -40,18 +40,13 @@ pub fn build(b: *std.Build) void {
     h2_mod.linkSystemLibrary("ssl", .{});
     h2_mod.linkSystemLibrary("crypto", .{});
 
-    // ── kvexp: vendored embedded multi-tenant KV (anarchodev/kvexp).
-    // LMDB-backed durable B-tree fronted by an in-memory per-store
-    // memtable (overlay). Links against system liblmdb. Replaces
-    // SQLite as the per-tenant state engine. See
-    // vendor/kvexp/README.md.
-    const kvexp_mod = b.addModule("kvexp", .{
-        .root_source_file = b.path("vendor/kvexp/src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    kvexp_mod.link_libc = true;
-    kvexp_mod.linkSystemLibrary("lmdb", .{});
+    // ── kvexp: embedded multi-tenant KV (anarchodev/kvexp), fetched as
+    // a Zig package (pinned in build.zig.zon). LMDB-backed durable
+    // B-tree fronted by an in-memory per-store memtable (overlay); the
+    // per-tenant state engine. The fetched `kvexp` module already links
+    // system liblmdb + libc (see kvexp's build.zig).
+    const kvexp_dep = b.dependency("kvexp", .{ .target = target, .optimize = optimize });
+    const kvexp_mod = kvexp_dep.module("kvexp");
 
     // ── rove-kv: KV store + raft. Standalone leaf module — does NOT
     // depend on rove or rove-io. raft_net is a direct liburing wrapper;
@@ -176,11 +171,12 @@ pub fn build(b: *std.Build) void {
 
     // ── rove-qjs: arenajs (quickjs-ng fork) wrapper ──
     //
-    // Vendors anarchodev/arenajs at vendor/arenajs/ — a quickjs-ng
-    // fork that replaces malloc + GC with a dual bump arena (base
-    // + per-request) and collapses per-request restore to a single
-    // cursor write. See vendor/arenajs/README.md for the snapshot
-    // commit and the constraints inherited from the fork.
+    // arenajs (anarchodev/arenajs) is a quickjs-ng fork that replaces
+    // malloc + GC with a dual bump arena (base + per-request) and
+    // collapses per-request restore to a single cursor write. It is
+    // fetched as a Zig package (pinned in build.zig.zon) and exposes a
+    // static library `arenajs`; the quickjs/arena C sources + flags live
+    // in arenajs's own build.zig. The Zig wrapper stays here in rove.
     const qjs_mod = b.addModule("rove-qjs", .{
         .root_source_file = b.path("src/qjs/root.zig"),
         .target = target,
@@ -189,30 +185,9 @@ pub fn build(b: *std.Build) void {
     qjs_mod.link_libc = true;
     qjs_mod.linkSystemLibrary("m", .{});
     qjs_mod.linkSystemLibrary("pthread", .{});
-    qjs_mod.addIncludePath(b.path("vendor/arenajs"));
-    qjs_mod.addCSourceFiles(.{
-        .root = b.path("vendor/arenajs"),
-        .files = &.{
-            "quickjs.c",
-            "qjs-arena.c",
-            "libregexp.c",
-            "libunicode.c",
-            "dtoa.c",
-        },
-        .flags = &.{
-            "-std=c11",
-            "-D_GNU_SOURCE",
-            "-DQUICKJS_NG_BUILD",
-            "-Wno-implicit-fallthrough",
-            "-Wno-sign-compare",
-            "-Wno-array-bounds",
-            "-Wno-unused-parameter",
-            "-Wno-unused-but-set-variable",
-            "-Wno-unused-variable",
-            "-Wno-unused-function",
-            "-fno-sanitize=undefined",
-        },
-    });
+    const arenajs_dep = b.dependency("arenajs", .{ .target = target, .optimize = optimize });
+    qjs_mod.addIncludePath(arenajs_dep.path(".")); // quickjs.h, qjs-arena.h
+    qjs_mod.linkLibrary(arenajs_dep.artifact("arenajs"));
 
     // ── rove-jwt: shared HS256 mint + verify for the standalone
     //    services' Authorization gate (log-server, files-server).
@@ -865,4 +840,26 @@ pub fn build(b: *std.Build) void {
     run_rust_ffi_smoke.step.dependOn(&cargo_smoke.step);
     const rust_ffi_smoke_step = b.step("rust-ffi-smoke", "Run the Rust-FFI hello-world smoke (V2 spike)");
     rust_ffi_smoke_step.dependOn(&run_rust_ffi_smoke.step);
+
+    // ── V2 raft substrate (docs/v2-build-order.md Phase 0) ──────────────
+    // raft-rs-zig (anarchodev/raft-rs-zig) is the V2 multi-raft engine:
+    // TiKV raft-rs, one group per tenant, behind a Zig wrapper. Fetched as
+    // a Zig package (pinned in build.zig.zon); its own build.zig runs
+    // `cargo build` → libraft_sys.a and exposes module("raft_rs_zig") +
+    // artifact("raft_rs_zig"). Linking the artifact triggers that cargo
+    // build. Kept behind the v2-only `v2-test` step so the default
+    // `zig build` / `zig build test` never invoke cargo and V1
+    // contributors need no Rust toolchain.
+    const raft_dep = b.dependency("raft_rs_zig", .{ .target = target, .optimize = optimize });
+    const v2_smoke_mod = b.createModule(.{
+        .root_source_file = b.path("src-v2/v2_raft_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    v2_smoke_mod.addImport("raft_rs_zig", raft_dep.module("raft_rs_zig"));
+    const v2_smoke_test = b.addTest(.{ .root_module = v2_smoke_mod });
+    v2_smoke_test.linkLibrary(raft_dep.artifact("raft_rs_zig"));
+    const run_v2_smoke_test = b.addRunArtifact(v2_smoke_test);
+    const v2_test_step = b.step("v2-test", "V2 Phase-0 raft substrate smoke (Manager + group elects a leader)");
+    v2_test_step.dependOn(&run_v2_smoke_test.step);
 }

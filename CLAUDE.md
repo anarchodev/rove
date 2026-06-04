@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is rove
 
-Rove is a Zig systems library for building distributed serverless worker infrastructure. It provides content-addressed code deployment, a QuickJS-based JS runtime, an HTTP/2 server, and a distributed KV store with Raft consensus. All C dependencies are vendored — no network access or package managers needed.
+Rove is a Zig systems library for building distributed serverless worker infrastructure. It provides content-addressed code deployment, a QuickJS-based JS runtime, an HTTP/2 server, and a distributed KV store with Raft consensus. Third-party dependencies are **pinned and fetched at build time** — Zig/C packages (`arenajs`, `kvexp`, and the V2 engine `raft-rs-zig`) via `build.zig.zon`; the V2 raft engine's Rust crates via Cargo. The first build needs network; willemt's V1 raft is the lone remaining vendored dep (in `vendor/`, deleted at V2 cutover). This replaced the former vendor-everything / offline-build mandate when the V2 raft-rs Rust closure proved too large to vendor (see `docs/v2-build-order.md`).
 
 ## Product direction
 
@@ -116,11 +116,13 @@ Backend pick is process-wide via `BLOB_BACKEND=fs|s3` (+ `S3_ENDPOINT` / `S3_REG
 
 Raft replicates the manifest (the `file/{path}` key → `{hash, kind, content_type}` pointer); the shared backend serves the bytes referenced by those hashes. Followers apply the manifest ops; readers fetch the blob bytes from whichever backend `rove-blob` is configured with.
 
-### Vendored C code
+### Dependencies (pinned-and-fetched)
 
-See `vendor/README.md` for upstream revisions, patches, and maintenance procedures:
-- **arenajs** — fork of quickjs-ng with a dual bump arena (base + per-request); per-request reset is one cursor write instead of memcpy. Replaces the previously-vendored quickjs-ng + deterministic-init patch. See `vendor/arenajs/README.md` for the pinned commit and inherited constraints.
-- **willemt/raft** — consensus library, unmodified
+Pins live in `build.zig.zon` (Zig/C packages) and each Rust crate's `Cargo.lock`. The first `zig build` fetches; subsequent builds use the Zig package cache. To bump a dep, re-run `zig fetch --save=<name> git+https://…#<commit>`.
+- **arenajs** (`anarchodev/arenajs`) — fork of quickjs-ng with a dual bump arena (base + per-request); per-request reset is one cursor write instead of memcpy. Replaces the previously-vendored quickjs-ng + deterministic-init patch. Its own `build.zig` compiles the quickjs/arena C sources into a static lib; rove links it.
+- **kvexp** (`anarchodev/kvexp`) — first-party pure-Zig multi-tenant embedded KV (LMDB-backed) used as the per-tenant state engine under `TrackedTxn`'s speculative overlay.
+- **raft-rs-zig** (`anarchodev/raft-rs-zig`) — V2 multi-raft engine (TiKV raft-rs, one group per tenant) behind a Zig wrapper; its `build.zig` runs `cargo build` for the Rust FFI. Behind v2-only build steps (`zig build v2-test`); the default `zig build` never invokes cargo.
+- **willemt/raft** — V1 consensus library, unmodified — the **only still-vendored** dep (`vendor/raft/`), deleted at V2 cutover. See `vendor/README.md`.
 
 ## Conventions
 
