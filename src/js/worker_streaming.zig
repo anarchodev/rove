@@ -897,8 +897,9 @@ pub fn resumeBoundFetchStream(
     const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json}) catch return;
     defer allocator.free(body);
     // Custom `name:` override (matches resumeBoundFetchChain's
-    // first-chunk handling) — falls back to `onFetchChunk`.
-    const fn_name: []const u8 = if (ev.name.len > 0) ev.name else "onFetchChunk";
+    // first-chunk handling) — else the conventional fetch export
+    // (onFetchResult / onFetchChunk / onFetchDone, handler-shape.md §3).
+    const fn_name: []const u8 = ev.resolvedExport();
     const spath = std.fmt.allocPrint(allocator, "/{s}?fn={s}", .{ path, fn_name }) catch return;
     defer allocator.free(spath);
     const query = std.fmt.allocPrint(allocator, "fn={s}", .{fn_name}) catch return;
@@ -1449,6 +1450,18 @@ pub const SubscriptionFireSource = dispatcher_mod.SubscriptionFireSource;
 ///
 /// Errors return `void` — the caller is best-effort (cron sweep,
 /// apply-time hook, boot fire). Failures log + skip the activation.
+/// handler-shape.md §3: the conventional named export a `_subscriptions/`
+/// fire dispatches to, by trigger source. Lets one module split its
+/// boot / cron / kv-react handling into distinct exports instead of one
+/// `default` that branches on `request.activation.source.kind`.
+fn subscriptionExport(source: SubscriptionFireSource) []const u8 {
+    return switch (source) {
+        .boot => "onBoot",
+        .cron => "onCron",
+        .kv => "onSubscription",
+    };
+}
+
 pub fn fireSubscriptionActivation(
     worker: anytype,
     tenant_id: []const u8,
@@ -1533,13 +1546,24 @@ pub fn fireSubscriptionActivation(
         .{ subscription_name[0..name_prefix_len], request_id },
     ) catch corr_buf[0..0];
 
+    // Named-export dispatch by trigger source (handler-shape.md §3,
+    // completing the Phase-4 activation-kind-switch retirement for
+    // connectionless fires): a boot fire lands in `onBoot`, a cron fire
+    // in `onCron`, a kv-react fire in `onSubscription`. The handler no
+    // longer has to branch on `request.activation.source.kind`. A
+    // missing conventional export is the fail-loud 404 backstop. The
+    // `cron(spec, target, …)` verb is a separate surface that names its
+    // own target via the durable scheduler — not this path.
+    var query_buf: [32]u8 = undefined;
+    const query = std.fmt.bufPrint(&query_buf, "fn={s}", .{subscriptionExport(source)}) catch null;
+
     // Synthesize the Request carrying the subscription source union
     // (the variant IS the activation payload).
     const req: Request = .{
         .method = "POST",
         .path = spath,
         .body = body,
-        .query = null,
+        .query = query,
         .readset = &readset,
         .request_id = request_id,
         .platform = inst.platform,

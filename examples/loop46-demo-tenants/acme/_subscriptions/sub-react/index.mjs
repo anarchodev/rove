@@ -4,16 +4,8 @@
 // writes a marker to `sub-react-out/<key-tail>` so the smoke can
 // verify the chain origin fired (and fired exactly once on the
 // leader, not duplicated across follower nodes).
-export default function () {
+export function onSubscription() {
     const a = request.activation;
-    if (a.kind !== "subscription_fire") {
-        // This handler is fire-only — an inbound HTTP request would
-        // reach the tenant's index.mjs, not this module.
-        return { status: 500, body: "unexpected activation" };
-    }
-    if (a.source.kind !== "kv") {
-        return { status: 500, body: "expected kv source" };
-    }
     const tail = a.source.key.slice("sub-react-in/".length);
     const value = kv.get(a.source.key) ?? "(absent)";
     kv.set("sub-react-out/" + tail, `${a.source.op}:${value}`);

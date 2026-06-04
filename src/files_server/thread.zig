@@ -752,6 +752,7 @@ fn handleDeployments(
         const code: u16 = switch (err) {
             files_server.Error.InvalidInstanceId,
             files_server.Error.InvalidManifest,
+            files_server.Error.InvalidAppManifest,
             files_server.Error.InvalidPath,
             files_server.Error.CompileFailed,
             => 400,

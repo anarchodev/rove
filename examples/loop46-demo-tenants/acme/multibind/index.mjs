@@ -50,21 +50,24 @@ export default function () {
 
 export function onFetchChunk() {
     const fid = request.fetchId;
-    if (request.done) {
-        const ndone = parseInt(kv.get("mb/ndone") || "0", 10) + 1;
-        kv.set("mb/ndone", String(ndone));
-        if (ndone < 2) {
-            // First fetch finished — stay parked for the second.
-            return next();
-        }
-        // Both done — return the two reconstructed bodies in issue order.
-        const id1 = kv.get("mb/id1") || "";
-        const id2 = kv.get("mb/id2") || "";
-        response.status = 200;
-        return (kv.get("mb/acc/" + id1) || "") + SPLIT + (kv.get("mb/acc/" + id2) || "");
-    }
     const text = new TextDecoder().decode(request.body);
     const prev = kv.get("mb/acc/" + fid) || "";
     kv.set("mb/acc/" + fid, prev + text);
     return next();
+}
+
+// One terminal event per bound fetch (handler-shape.md §3). Count the
+// two completions; once BOTH are done return the reconstructed bodies.
+export function onFetchDone() {
+    const ndone = parseInt(kv.get("mb/ndone") || "0", 10) + 1;
+    kv.set("mb/ndone", String(ndone));
+    if (ndone < 2) {
+        // First fetch finished — stay parked for the second.
+        return next();
+    }
+    // Both done — return the two reconstructed bodies in issue order.
+    const id1 = kv.get("mb/id1") || "";
+    const id2 = kv.get("mb/id2") || "";
+    response.status = 200;
+    return (kv.get("mb/acc/" + id1) || "") + SPLIT + (kv.get("mb/acc/" + id2) || "");
 }

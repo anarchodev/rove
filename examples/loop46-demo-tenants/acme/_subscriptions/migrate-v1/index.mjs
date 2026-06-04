@@ -12,14 +12,8 @@
 // handler must STILL be idempotent for the rare
 // fire-then-crash-before-marker-write window (per the documented
 // contract).
-export default function () {
+export function onBoot() {
     const a = request.activation;
-    if (a.kind !== "subscription_fire" || a.source.kind !== "boot") {
-        // Defensive — this handler should only be invoked as a
-        // subscription_fire. An inbound request would route to a
-        // sibling URL, not this module.
-        return { status: 500, body: "unexpected activation" };
-    }
     const dep_id = a.source.deployment_id;
     const count_str = kv.get("boot-fire-count") ?? "0";
     const count = parseInt(count_str, 10) + 1;

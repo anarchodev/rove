@@ -100,6 +100,21 @@ def main() -> int:
         print(f"ok  on.fetch bound + {{to:onUpstream}} resumed; "
               f"reconstructed {len(r.body)}-byte upstream body byte-exact")
 
+        # 4. Non-streaming on.fetch (no stream:true, no {to}) → the whole
+        #    upstream body arrives in ONE terminal event dispatched to
+        #    the conventional onFetchResult export (handler-shape.md §3).
+        r = curl(cc, f"{acme_origin}/onfetchbuf?url={bulk_url}", method="GET", timeout=30.0)
+        if r.status != 200:
+            sys.exit(f"FAIL /onfetchbuf status={r.status} body={r.body!r}")
+        if r.body != EXPECTED_BODY:
+            sys.exit(
+                f"FAIL onFetchResult body mismatch.\n"
+                f"  want ({len(EXPECTED_BODY)}b): {EXPECTED_BODY!r}\n"
+                f"  got  ({len(r.body)}b): {r.body!r}"
+            )
+        print(f"ok  non-streaming on.fetch → onFetchResult delivered "
+              f"{len(r.body)}-byte whole body byte-exact")
+
     print("\nPASS on.fetch smoke")
     return 0
 

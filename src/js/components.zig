@@ -298,6 +298,18 @@ pub const UpstreamFetchEvent = struct {
     /// `request.activation.body_truncated`.
     body_truncated: bool = false,
 
+    /// True iff the originating fetch was issued with `stream: true`
+    /// (`PendingFetch.stream`). Carried so the bound-fetch resume can
+    /// pick the conventional named export per `docs/handler-shape.md`
+    /// §3: a non-streaming fetch (`stream == false`, one `final` event
+    /// with the whole body) lands in `onFetchResult`; a streaming
+    /// fetch's intermediate chunks (`final == false`) land in
+    /// `onFetchChunk` and its terminal event (`final == true`) lands
+    /// in `onFetchDone`. The customer's `{to}` override (`name`)
+    /// supersedes this for every event of the fetch. Plain bool — no
+    /// allocation, so `deinitItem` needs no change.
+    stream: bool = false,
+
     /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
     /// §5.5: this event belongs to a bound fetch
     /// (`http.fetch({bind: true})`). The dispatcher routes bound
@@ -350,6 +362,24 @@ pub const UpstreamFetchEvent = struct {
 
     pub fn deinit(allocator: std.mem.Allocator, items: []UpstreamFetchEvent) void {
         for (items) |*item| deinitItem(item, allocator);
+    }
+
+    /// `docs/handler-shape.md` §3: resolve the named export this event
+    /// dispatches to on the bound (connection-scoped) `on.fetch`
+    /// resume. An explicit `{to}` (`name`) overrides for every event of
+    /// the fetch; otherwise the export is chosen by the event shape:
+    ///   - non-streaming (`stream == false`) — one `final` event with
+    ///     the whole body → `onFetchResult`.
+    ///   - streaming intermediate chunk (`final == false`) →
+    ///     `onFetchChunk`.
+    ///   - streaming terminal (`final == true`) → `onFetchDone`.
+    /// A missing conventional export is the fail-loud 404 backstop
+    /// (runModule), same as the other named-export kinds.
+    pub fn resolvedExport(item: *const UpstreamFetchEvent) []const u8 {
+        if (item.name.len > 0) return item.name;
+        if (!item.stream) return "onFetchResult";
+        if (item.final) return "onFetchDone";
+        return "onFetchChunk";
     }
 
     /// Single-item variant of `deinit` for callers that hold one

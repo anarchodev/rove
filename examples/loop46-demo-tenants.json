@@ -21,6 +21,7 @@
         {"path": "onkv/index.mjs", "source": "loop46-demo-tenants/acme/onkv/index.mjs"},
         {"path": "streamkv/index.mjs", "source": "loop46-demo-tenants/acme/streamkv/index.mjs"},
         {"path": "onfetch/index.mjs", "source": "loop46-demo-tenants/acme/onfetch/index.mjs"},
+        {"path": "onfetchbuf/index.mjs", "source": "loop46-demo-tenants/acme/onfetchbuf/index.mjs"},
         {"path": "writekey/index.mjs", "source": "loop46-demo-tenants/acme/writekey/index.mjs"},
         {"path": "readkey/index.mjs", "source": "loop46-demo-tenants/acme/readkey/index.mjs"},
         {"path": "schedfire/index.mjs", "source": "loop46-demo-tenants/acme/schedfire/index.mjs"},

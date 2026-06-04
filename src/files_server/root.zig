@@ -53,6 +53,9 @@ pub const Error = error{
     Blob,
     NotFound,
     InvalidManifest,
+    /// A bundle-root `manifest.json` (the app-manifest seam,
+    /// `docs/handler-shape.md` §8) was present but structurally invalid.
+    InvalidAppManifest,
     CasConflict,
 };
 
@@ -501,6 +504,30 @@ pub fn deployManifest(
         return mapCodeError(err);
     if (expected_parent_id) |want| {
         if (want != current_parsed) return Error.CasConflict;
+    }
+
+    // ── App-manifest seam (docs/handler-shape.md §8): if the bundle
+    // ships a root `manifest.json`, validate it BEFORE mutating the
+    // working tree so the author gets immediate feedback and a bad
+    // manifest can't half-land. The manifest itself ships
+    // content-addressed in the deployment like any static file
+    // (born-distributable); nothing consumes it yet — reserved for the
+    // self-hosters marketplace (config schema + capability grants).
+    for (entries) |entry| {
+        if (!std.mem.eql(u8, entry.path, files_mod.app_manifest.FILE_NAME)) continue;
+        const mbytes = h.store.blob.get(entry.hash, allocator) catch |err| switch (err) {
+            error.NotFound => return Error.NotFound,
+            else => return Error.Blob,
+        };
+        defer allocator.free(mbytes);
+        files_mod.app_manifest.validate(allocator, mbytes) catch |err| {
+            std.log.warn(
+                "files-server: app manifest.json for {s} is invalid ({s}); rejecting deploy",
+                .{ instance_id, @errorName(err) },
+            );
+            return Error.InvalidAppManifest;
+        };
+        break;
     }
 
     // ── Full-replace: drop any existing file/* entries so paths
