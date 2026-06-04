@@ -1253,7 +1253,7 @@ Multi-envelope-per-raft-entry support shipped in Phase 5.5 (d) step 2 (envelope 
 
 Number choice was deliberate: retired types (1, 3, 4/5/6, 8/9/10/11) are reserved-and-rejected so any old raft log entry from before each cutover panics on apply instead of silently mis-routing. The migration windows predate 1.0 and are acceptable to break loudly.
 
-Type-2 writes come from two producers: the signup HTTP handler (mirrors `tenant.createInstance`'s local write into a root writeset) and the admin JS handler's `platform.root.set/delete` calls (collected into a per-request root writeset, proposed after commit). **Divergence on propose failure is logged, not compensated** — at-least-once semantics consistent with the Cmd/callback layers. (kvexp volatility means a pre-quorum crash loses the speculative write with no on-disk divergence; the residual escaped effect — the caller's success response — is tracked as idiom-3 in `docs/proposer-audit.md`. The earlier "wrap root writes in a TrackedTxn with undo semantics" direction is obsolete: the pre-kvexp `kv_undo` machinery was deleted.)
+Type-2 writes come from two producers: the signup HTTP handler (mirrors `tenant.createInstance`'s local write into a root writeset) and the admin JS handler's `platform.root.set/delete` calls (collected into a per-request root writeset, proposed after commit). **Divergence on propose failure is logged, not compensated** — at-least-once semantics consistent with the Cmd/callback layers. (kvexp volatility means a pre-quorum crash loses the speculative write with no on-disk divergence; the residual escaped effect — the caller's success response — is tracked as idiom-3 in `docs/decisions.md` §9. The earlier "wrap root writes in a TrackedTxn with undo semantics" direction is obsolete: the pre-kvexp `kv_undo` machinery was deleted.)
 
 ### 10.3 Two-phase deploy protocol on FS backend
 
@@ -1651,7 +1651,7 @@ Not available:
 
 - `platform.*` JS globals exist only on the `__admin__` handler. Other tenants' handlers see `platform === undefined` and get a `TypeError` if they try to call `platform.root.*`.
 - **`X-Rove-Scope: <instance_id>` header** rebinds the admin handler's `kv` to the target tenant's `app.db`. Without it, `kv.*` on the admin handler operates on admin's own `app.db` (NOT root — that's the §10.1 change).
-- **Admin JS writes to `platform.root.*` are replicated via type-2 root writeset**, but they land locally on the leader first and propose-on-commit. A propose failure is logged, not compensated (kvexp volatility → no on-disk divergence on crash; the residual is the caller-response escaped effect, tracked as idiom-3 in `docs/proposer-audit.md`).
+- **Admin JS writes to `platform.root.*` are replicated via type-2 root writeset**, but they land locally on the leader first and propose-on-commit. A propose failure is logged, not compensated (kvexp volatility → no on-disk divergence on crash; the residual is the caller-response escaped effect, tracked as idiom-3 in `docs/decisions.md` §9).
 
 ### Multi-node setup
 
