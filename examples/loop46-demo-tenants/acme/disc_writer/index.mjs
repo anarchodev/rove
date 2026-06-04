@@ -7,27 +7,25 @@
 // The disconnect-activation writes propose via raft and
 // `drainRaftPending` commits them asynchronously (no held socket to gate
 // on — fire-and-forget).
+// Inbound: open the heartbeat stream. Timer wakes → onWake; client
+// disconnect → onDisconnect.
 export default function () {
-    const a = request.activation;
-    if (a.kind === "inbound") {
-        response.status = 200;
-        response.headers = {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-        };
-        stream.start();
-        stream.write(":hb\n\n");
-        on.timer(100);
-        return __rove_next("disc_writer/index", {});
-    }
-    if (a.kind === "disconnect") {
-        // The cleanup write — set a marker key. The smoke reads it back
-        // via /readkey after disconnect. (`onDisconnect` is Phase 4's
-        // follow-up; disconnect still lands on the default export.)
-        const id = (request.ctx && request.ctx.id) || "1";
-        kv.set("disc_marker/" + id, "fired");
-        return "";
-    }
+    response.status = 200;
+    response.headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+    };
+    stream.start();
+    stream.write(":hb\n\n");
+    on.timer(100);
+    return __rove_next("disc_writer/index", {});
+}
+
+// The cleanup write — set a marker key. The smoke reads it back via
+// /readkey after the client disconnects.
+export function onDisconnect() {
+    const id = (request.ctx && request.ctx.id) || "1";
+    kv.set("disc_marker/" + id, "fired");
     return "";
 }
 

@@ -11,31 +11,28 @@ function resumeCtx() {
     return JSON.parse(request.body || "{}").ctx || {};
 }
 
+// Inbound: register the session + open the SSE tick stream.
 export default function () {
-    const a = request.activation;
-    if (a.kind === "inbound") {
-        const id = (request.query || "").split("&")
-            .map(p => p.split("="))
-            .find(p => decodeURIComponent(p[0]) === "id");
-        const session_id = id ? decodeURIComponent(id[1]) : "anon";
-        // The first-hop side effect: register the session.
-        kv.set("sessions/" + session_id, "online");
-        response.status = 200;
-        response.headers = {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-        };
-        stream.start();
-        stream.write(`event: hello\ndata: ${session_id}\n\n`);
-        on.timer(100);
-        return __rove_next("sessions_sse/index", { ctx: { session_id } });
-    }
-    if (a.kind === "disconnect") {
-        // Mirror the open: deregister the session. (`onDisconnect` is
-        // Phase 4's follow-up; disconnect still lands on default.)
-        kv.set("sessions/" + resumeCtx().session_id, "offline");
-        return "";
-    }
+    const id = (request.query || "").split("&")
+        .map(p => p.split("="))
+        .find(p => decodeURIComponent(p[0]) === "id");
+    const session_id = id ? decodeURIComponent(id[1]) : "anon";
+    // The first-hop side effect: register the session.
+    kv.set("sessions/" + session_id, "online");
+    response.status = 200;
+    response.headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+    };
+    stream.start();
+    stream.write(`event: hello\ndata: ${session_id}\n\n`);
+    on.timer(100);
+    return __rove_next("sessions_sse/index", { ctx: { session_id } });
+}
+
+// Mirror the open: deregister the session when the client disconnects.
+export function onDisconnect() {
+    kv.set("sessions/" + resumeCtx().session_id, "offline");
     return "";
 }
 
