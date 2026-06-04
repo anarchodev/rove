@@ -1,12 +1,17 @@
 # Handler shape — pattern-matching at module level
 
-> **Status:** Proposal. Supersedes the `__rove_stream` / `__rove_next`
-> / `request.activation.kind`-switch surface in `streaming-model.md`
-> §3 and the multi-shape return values in §4–§5. The engine model
-> (coalesce budget, blob coordinator, one-rule semantics — see
-> `streaming-model.md` §1–§2 and §7.X) is **unchanged**. Only the
-> customer-facing handler API changes. Implementation plan:
-> [`handler-surface-impl-plan.md`](handler-surface-impl-plan.md).
+> **Status:** SHIPPED (2026-06-03). Phases 1–5 of
+> [`handler-surface-impl-plan.md`](handler-surface-impl-plan.md) landed:
+> `on.*` connection wakes (Phase 1), the `stream.*` effect surface with
+> `__rove_stream` retired (Phase 2), `on.fetch` + `detach` + the customer
+> `http.fetch` spelling retired (Phase 3), named-export dispatch by
+> activation kind (Phase 4), and `schedule`/`cron` (Phase 5). It
+> supersedes the `__rove_stream` / `request.activation.kind`-switch
+> surface in `streaming-model.md` §3 and the multi-shape return values in
+> §4–§5. The engine model (coalesce budget, blob coordinator, one-rule
+> semantics — see `streaming-model.md` §1–§2 and §7.X) is **unchanged**;
+> only the customer-facing handler API changed. Remaining Phase 6 polish:
+> the public `next` module surface + the CLI-side §6 export-coverage lint.
 >
 > **Revised 2026-06-02 (rev 2 — `stream.*` model).** Organized around one
 > axis — **scope: current-connection vs connectionless** — derived in
@@ -242,6 +247,19 @@ model retired (§8.3). So:
 The set of *kinds* is closed (runtime-defined). The `to:` option on
 `on.*` (and the target on the connectionless verbs) chooses **which
 export** a trigger's activation lands in; it does not invent a kind.
+
+> **Shipped (Phase 4):** the runtime maps `activation_source → export`
+> when the resume path didn't name one. `wake_batch` (`on.kv`/`on.timer`)
+> → `onWake`; `disconnect` → `onDisconnect` (a missing `onDisconnect` is
+> a no-op — cleanup is optional). The kinds whose resume path already
+> names its target — `on.fetch` (`onFetchChunk` / `{to}`), `webhook.send`
+> (`onResult`), `cron`/`schedule` (the named target) — route through that
+> name. `request.activation.kind` is no longer a dispatch discriminator
+> (the named export is); it remains on `request.activation` alongside the
+> wake payload (`wakes` / `overflow` / `write_pressure`). The finer
+> inbound-chunk (`onChunk`) and `onFetchResult`/`onFetchDone` splits in
+> the table above are the target convention, wired as those paths are
+> reshaped.
 
 The scope column is load-bearing: a **connection** activation runs with
 the held socket (it can call `stream.*`/`on.*` and return `next`/a
