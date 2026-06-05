@@ -402,7 +402,9 @@ const Router = struct {
         path: []const u8,
     ) !void {
         const method_s = headerValue(rh, ":method") orelse "GET";
-        if (!std.mem.eql(u8, path, "/_control/move") or !std.mem.eql(u8, method_s, "POST")) {
+        const is_move = std.mem.eql(u8, path, "/_control/move");
+        const is_move_live = std.mem.eql(u8, path, "/_control/move-live");
+        if (!(is_move or is_move_live) or !std.mem.eql(u8, method_s, "POST")) {
             try replyStatus(server, ent, sid, sess, 404);
             return;
         }
@@ -416,7 +418,10 @@ const Router = struct {
             return;
         }
         const body: []const u8 = if (rb.data) |d| d[0..rb.len] else &.{};
-        try self.handleMove(server, ent, sid, sess, body);
+        if (is_move_live)
+            try self.handleMoveLive(server, ent, sid, sess, body)
+        else
+            try self.handleMove(server, ent, sid, sess, body);
     }
 
     /// Orchestrate a brief-pause tenant move (docs/v2-build-order.md
@@ -614,6 +619,205 @@ const Router = struct {
                 std.log.warn("front: resume source {s} ({s}) failed: {s}", .{ tenant, base, @errorName(err) });
             }
         }
+    }
+
+    // ── Zero-downtime move (Phase 7 slice c) ─────────────────────────
+
+    /// Orchestrate a ZERO-DOWNTIME tenant move — the source keeps serving the
+    /// whole time; no quiesce, no `moving` hold. Built on slice (b)'s
+    /// SYNCHRONOUS forwarding (a source write is acked only after the dest
+    /// applies it), so the dest always has every acked write and the snapshot
+    /// loads insert-if-absent without clobbering a forwarded (newer) key:
+    ///
+    ///   1. empty-attach the dest (form group + instance, NO data) on all
+    ///      destination nodes — ready to receive forwards.
+    ///   2. await the dest group's leader (its URL is the forward target).
+    ///   3. forward-begin on the source leader → it dual-writes every commit
+    ///      to the dest leader (synchronous).
+    ///   4. snapshot the source leader (non-quiescing — it keeps serving).
+    ///   5. load-merge the snapshot into every dest node (insert-if-absent,
+    ///      out-of-band from raft).
+    ///   6. flip the directory — the atomic commit point.
+    ///   7. evict the source — drops its instance + group + forward marker,
+    ///      so it stops serving + forwarding; serve-or-forward routes any
+    ///      straggler to the dest.
+    ///
+    /// A pre-flip failure forward-ends the source (stops dual-writing) +
+    /// evicts the half-attached dest, leaving the tenant serving on the
+    /// source untouched. Brief-pause `handleMove` stays for callers that want
+    /// it. (First cut: single forward target = the dest leader URL; a
+    /// dest-leader change mid-move is a noted refinement.)
+    fn handleMoveLive(self: *Router, server: *FrontH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
+        const a = self.allocator;
+        var parsed = std.json.parseFromSlice(struct { tenant: []const u8, dest: []const u8 }, a, body, .{ .ignore_unknown_fields = true }) catch {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        };
+        defer parsed.deinit();
+        const tenant = parsed.value.tenant;
+        const dest = parsed.value.dest;
+        if (tenant.len == 0 or dest.len == 0) {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        }
+        const resolution = self.directory.resolve(tenant) orelse {
+            try replyStatus(server, ent, sid, sess, 404);
+            return;
+        };
+        if (resolution.moving) {
+            try replyStatus(server, ent, sid, sess, 409);
+            return;
+        }
+        const src = resolution.cluster;
+        if (std.mem.eql(u8, src.id, dest)) {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        }
+        const dest_ref = self.directory.clusterById(dest) orelse {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        };
+        const src_nodes = src.nodes;
+        const dest_nodes = dest_ref.nodes;
+        const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        defer a.free(tbody);
+
+        // 1. Empty-attach the dest (no bundle → just the group + instance).
+        if (!self.attachToAll(dest_nodes, "", tenant)) {
+            self.evictAll(tenant, dest_nodes, tbody);
+            try replyStatus(server, ent, sid, sess, 502);
+            return;
+        }
+        // 2. Await the dest leader; its URL is the source's forward target.
+        const dest_leader = self.findDestLeaderUrl(dest_nodes, tenant) orelse {
+            self.evictAll(tenant, dest_nodes, tbody);
+            try replyStatus(server, ent, sid, sess, 504);
+            return;
+        };
+        defer a.free(dest_leader);
+
+        // 3. forward-begin on the source leader (dual-write to the dest leader).
+        if (!self.forwardBeginOnLeader(src_nodes, tenant, dest_leader)) {
+            self.evictAll(tenant, dest_nodes, tbody);
+            try replyStatus(server, ent, sid, sess, 502);
+            return;
+        }
+
+        // 4. Snapshot the source leader (non-quiescing; it keeps serving).
+        var snap = self.snapshotFromLeader(src_nodes, tbody) orelse {
+            self.forwardEndOnLeader(src_nodes, tenant);
+            self.evictAll(tenant, dest_nodes, tbody);
+            try replyStatus(server, ent, sid, sess, 502);
+            return;
+        };
+        defer snap.deinit(a);
+
+        // 5. Load-merge the snapshot into every dest node (insert-if-absent).
+        if (!self.loadMergeToAll(dest_nodes, snap.body, tenant)) {
+            self.forwardEndOnLeader(src_nodes, tenant);
+            self.evictAll(tenant, dest_nodes, tbody);
+            try replyStatus(server, ent, sid, sess, 502);
+            return;
+        }
+
+        // 6. Flip the directory — the atomic commit point.
+        self.directory.move(tenant, dest) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+
+        // 7. Evict the source (drops instance + group + forward marker → it
+        //    stops serving + forwarding; serve-or-forward routes stragglers
+        //    to the dest). Evict subsumes forward-end on the happy path.
+        self.evictAll(tenant, src_nodes, tbody);
+
+        const msg = std.fmt.allocPrint(a, "moved-live {s}: {s} -> {s}\n", .{ tenant, src.id, dest }) catch {
+            try replyStatus(server, ent, sid, sess, 200);
+            return;
+        };
+        try replyText(server, ent, sid, sess, 200, msg);
+    }
+
+    /// Poll every destination node's `/_system/v2-leader?tenant=` until one
+    /// reports 200, and return that node's base URL (owned) — the source's
+    /// forward target. Null on timeout.
+    fn findDestLeaderUrl(self: *Router, dest_nodes: []const []const u8, tenant: []const u8) ?[]u8 {
+        const a = self.allocator;
+        const suffix = std.fmt.allocPrint(a, "/_system/v2-leader?tenant={s}", .{tenant}) catch return null;
+        defer a.free(suffix);
+        const deadline: i128 = std.time.nanoTimestamp() + 15 * std.time.ns_per_s;
+        while (std.time.nanoTimestamp() < deadline) {
+            for (dest_nodes) |base| {
+                const resp = self.backendCall(base, suffix, .GET, "", null) catch continue;
+                var r = resp;
+                r.deinit(a);
+                if (r.status == 200) return a.dupe(u8, base) catch null;
+            }
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+        }
+        return null;
+    }
+
+    /// forward-begin on the source leader: try each source node's leader-gated
+    /// `/_system/v2-forward-begin {tenant,dest}` until one 204s (the leader).
+    fn forwardBeginOnLeader(self: *Router, src_nodes: []const []const u8, tenant: []const u8, dest_url: []const u8) bool {
+        const a = self.allocator;
+        const fb = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\",\"dest\":\"{s}\"}}", .{ tenant, dest_url }) catch return false;
+        defer a.free(fb);
+        for (src_nodes) |base| {
+            const resp = self.backendCall(base, "/_system/v2-forward-begin", .POST, fb, null) catch continue;
+            const ok = resp.status == 204;
+            var r = resp;
+            r.deinit(a);
+            if (ok) return true;
+        }
+        return false;
+    }
+
+    /// forward-end on the source leader (abort cleanup): best-effort.
+    fn forwardEndOnLeader(self: *Router, src_nodes: []const []const u8, tenant: []const u8) void {
+        const a = self.allocator;
+        const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch return;
+        defer a.free(tbody);
+        for (src_nodes) |base| {
+            if (self.backendCall(base, "/_system/v2-forward-end", .POST, tbody, null)) |r| {
+                const ok = r.status == 204;
+                var rr = r;
+                rr.deinit(a);
+                if (ok) return;
+            } else |_| {}
+        }
+    }
+
+    /// Dump the source LEADER's NON-quiescing snapshot (try each source node's
+    /// leader-gated `/_system/v2-snapshot` until one 200s). Owned body.
+    fn snapshotFromLeader(self: *Router, src_nodes: []const []const u8, tbody: []const u8) ?BackendResp {
+        const a = self.allocator;
+        for (src_nodes) |base| {
+            const resp = self.backendCall(base, "/_system/v2-snapshot", .POST, tbody, null) catch continue;
+            if (resp.status == 200) return resp;
+            var r = resp;
+            r.deinit(a);
+        }
+        return null;
+    }
+
+    /// Load-merge a snapshot (insert-if-absent) into every destination node.
+    fn loadMergeToAll(self: *Router, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8) bool {
+        const a = self.allocator;
+        for (dest_nodes) |base| {
+            const resp = self.backendCall(base, "/_system/v2-load-merge", .POST, bundle, tenant) catch |err| {
+                std.log.warn("front: v2-load-merge on {s} failed: {s}", .{ base, @errorName(err) });
+                return false;
+            };
+            var r = resp;
+            defer r.deinit(a);
+            if (r.status != 204) return false;
+        }
+        return true;
     }
 
     /// Blocking libcurl call to a backend's move surface, presenting the

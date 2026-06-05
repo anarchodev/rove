@@ -783,8 +783,25 @@ pub const KvStore = struct {
     /// is hardened against malformed input (bundles cross the network) and
     /// rolls back the txn on any error, leaving the store untouched.
     pub fn loadTenantBundle(self: *KvStore, bundle: []const u8) Error!void {
+        return self.loadBundleImpl(bundle, .{});
+    }
+
+    /// Insert-if-absent load (Phase 7 zero-downtime move). A key already
+    /// present in the store — written by a live forward that arrived while
+    /// this snapshot was streaming in — is preserved, and the bundle's
+    /// (older) value for it is dropped. So the destination can take the live
+    /// forward stream AND load the snapshot out-of-band without the snapshot
+    /// clobbering a newer forwarded key. Loaded in one exclusive kvexp txn,
+    /// so it is race-free against concurrent forward-applies (kvexp's
+    /// single-writer lease serializes them). Out-of-band from raft — the
+    /// bytes never enter the raft log (only the forward delta does).
+    pub fn loadTenantBundleMerge(self: *KvStore, bundle: []const u8) Error!void {
+        return self.loadBundleImpl(bundle, .{ .skip_existing = true });
+    }
+
+    fn loadBundleImpl(self: *KvStore, bundle: []const u8, opts: kvexp.LoadBundleOptions) Error!void {
         var stream = std.io.fixedBufferStream(bundle);
-        _ = kvexp.loadTenantBundle(self.manifest, stream.reader()) catch return Error.Sqlite;
+        _ = kvexp.loadTenantBundle(self.manifest, stream.reader(), opts) catch return Error.Sqlite;
         // Persist the loaded pairs; raft_idx=0 → don't disturb the
         // watermark (the destination group starts a fresh index sequence).
         self.manifest.durabilize(0) catch return Error.Io;
