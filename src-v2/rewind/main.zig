@@ -96,6 +96,8 @@ const WorkerCtx = struct {
     data_dir: []const u8,
     admin_api_domain: []const u8,
     move_secret: ?[]const u8,
+    cluster_id: ?[]const u8,
+    cp_url: ?[]const u8,
     ready: *std.Thread.ResetEvent,
 };
 
@@ -142,6 +144,8 @@ fn workerMain(args: *WorkerCtx) !void {
         .log_batch_store = args.log_batch_store,
         .data_dir = args.data_dir,
         .move_secret = args.move_secret,
+        .cluster_id = args.cluster_id,
+        .cp_url = args.cp_url,
     });
     defer worker.destroy();
 
@@ -295,6 +299,12 @@ pub fn main() !void {
     // surface (`/_system/v2-*`). The front door presents it as
     // `X-Rewind-Move-Secret`. Unset → the move surface is disabled.
     const move_secret = std.posix.getenv("REWIND_MOVE_SECRET");
+    // V2 Phase 7 — serve-or-forward: this cluster's id + the control-plane
+    // base URL. Set together; either unset → a local tenant miss 404s (no
+    // forwarding). A DP that can't serve a tenant locally asks the CP who
+    // owns it and forwards there.
+    const cluster_id = std.posix.getenv("REWIND_CLUSTER_ID");
+    const cp_url = std.posix.getenv("REWIND_CP_URL");
 
     // Blob backend (fs or s3) — process-wide, env-selected.
     var blob_owned = try blob_mod.env.loadFromEnv(allocator);
@@ -363,6 +373,8 @@ pub fn main() !void {
         .data_dir = data_dir,
         .admin_api_domain = admin_api_domain,
         .move_secret = move_secret,
+        .cluster_id = cluster_id,
+        .cp_url = cp_url,
         .ready = &ready,
     };
     var th = try std.Thread.spawn(.{}, workerThreadEntry, .{&ctx});

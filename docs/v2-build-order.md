@@ -258,8 +258,14 @@ This is the heart of the rewrite.
 > forwarding — DONE:** `v2-apply` (dest) + `v2-forward-begin`/`-end` (source
 > `_move/forward` marker) + `handleKv` dual-write; `scripts/zero_downtime_forward_smoke.py`
 > proves the source keeps serving while every committed write reaches the
-> dest. Remaining: (a) serve-or-forward + the replicated CP directory, (c)
-> the relinquish/acquire epoch-fenced cutover. A suspected `v2-bundle`
+> dest. **Slice (a) — serve-or-forward — DONE:** the CP route lookup
+> (`GET /_cp/route?host=`, `rewind-front`) + a `rewind` worker that, on a
+> local tenant miss, asks the CP who owns the host and forwards there
+> (`REWIND_CLUSTER_ID`/`REWIND_CP_URL`); `scripts/serve_or_forward_smoke.py`
+> proves a request to the wrong cluster reaches the owner (a hop, not a 404)
+> and the owner doesn't re-forward (no loop). Remaining: the directory's
+> raft-replication (hardening behind `Directory`), (c) the relinquish/acquire
+> epoch-fenced cutover. A suspected `v2-bundle`
 > empty-snapshot race was **investigated + cleared** (NOT a kvexp bug —
 > 0/63k repro incl. concurrent durabilize; the bundle HTTP path is reliable
 > across 600 fetches incl. a 42 KB multi-frame body; a corrupt bundle aborts
