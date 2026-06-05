@@ -294,6 +294,12 @@ pub fn build(b: *std.Build) void {
     // rove-kv tests
     const kv_tests = b.addTest(.{ .root_module = kv_mod });
     test_step.dependOn(&b.addRunArtifact(kv_tests).step);
+    // Isolated kv-only test step. On the v2 branch the aggregate `test`
+    // step is broken (frozen V1 modules still reference sqlite3 they no
+    // longer link), so a sqlite-free `raft-kv` step lets the KV limbs —
+    // incl. the Phase-4 tenant-bundle dump/load — be exercised on their own.
+    const kv_test_step = b.step("kv-test", "Run rove-kv (raft-kv facade) unit tests in isolation");
+    kv_test_step.dependOn(&b.addRunArtifact(kv_tests).step);
 
     // rove-blob tests
     const blob_tests = b.addTest(.{ .root_module = blob_mod });

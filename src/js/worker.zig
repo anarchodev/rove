@@ -943,6 +943,15 @@ pub const WorkerConfig = struct {
     /// keeps the bytes alive for the worker's lifetime. When null,
     /// `/_system/services-token` returns 503.
     services_jwt_secret: ?[]const u8 = null,
+    /// V2 Phase 4 — shared secret for the cluster-internal tenant-move
+    /// surface (`/_system/v2-*`: kv seed/read, bundle dump, attach,
+    /// evict). The front door (`rewind-front`) holds the same secret and
+    /// presents it as `X-Rewind-Move-Secret` when orchestrating a move
+    /// across clusters. Distinct from the operator root bearer (which the
+    /// front door does not hold) and from the services JWT. When null the
+    /// move endpoints are disabled (404/501). Borrowed; alive for the
+    /// worker's lifetime. (docs/v2-build-order.md §Phase 4.)
+    move_secret: ?[]const u8 = null,
     /// Public origin the dashboard uses to reach the log-server.
     /// Returned in the `/_system/services-token` response. Borrowed.
     log_public_base: ?[]const u8 = null,
@@ -1485,6 +1494,9 @@ pub fn Worker(comptime opts: Options) type {
         /// public origins for the standalone services. Returned to the
         /// dashboard via `/_system/services-token`.
         services_jwt_secret: ?[]const u8,
+        /// V2 Phase 4 — shared secret gating the `/_system/v2-*` tenant-
+        /// move surface. See `WorkerConfig.move_secret`.
+        move_secret: ?[]const u8,
         log_public_base: ?[]const u8,
         files_public_base: ?[]const u8,
         /// Internal-service POST insecure-TLS toggle (now log-push
@@ -1593,6 +1605,7 @@ pub fn Worker(comptime opts: Options) type {
                 .compile_ctx = config.compile_ctx,
                 .log_batch_store = config.log_batch_store,
                 .services_jwt_secret = config.services_jwt_secret,
+                .move_secret = config.move_secret,
                 .log_public_base = config.log_public_base,
                 .files_public_base = config.files_public_base,
                 .internal_insecure_tls = config.internal_insecure_tls,

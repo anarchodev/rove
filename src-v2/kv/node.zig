@@ -77,6 +77,9 @@ pub const Error = error{
     /// A committed entry named a group with no live tenant slot — an
     /// invariant violation (we only apply entries for groups we created).
     UnknownGroup,
+    /// `createGroupAtEpoch` was asked to attach a group id that already
+    /// has a live slot — a double-attach orchestration bug.
+    GroupExists,
     /// A proposed write did not commit + apply within the pump budget.
     NotCommitted,
     OutOfMemory,
@@ -205,10 +208,37 @@ pub const Node = struct {
     /// Look up a tenant slot, or create its kvexp store + raft group on
     /// demand and drive the group to leader (single-node: campaign +
     /// pump). `id_str` is the envelope id the worker will stamp on this
-    /// tenant's writesets; `tenant_id` is the numeric raft group id.
+    /// tenant's writesets; `tenant_id` is the numeric raft group id. The
+    /// never-migrated birth case: epoch 0 (`createGroup`).
     pub fn ensureGroup(self: *Node, tenant_id: u64, id_str: []const u8) Error!*TenantSlot {
         if (self.groups.get(tenant_id)) |slot| return slot;
+        return self.createGroupCore(tenant_id, id_str, 0);
+    }
 
+    /// Attach a tenant group at an explicit migration fence `epoch` (the
+    /// Phase-4 move-destination path; docs/v2-build-order.md §Phase 4
+    /// "createGroupEpoch(tenant, epoch+1) on destination"). The tenant's
+    /// kvexp state must already have been loaded (the bundle landed in the
+    /// worker's `cluster.kv` store); this just stands up the consensus
+    /// half — a fresh group whose epoch fences out any straggler traffic
+    /// from the source incarnation (moot single-node, load-bearing under
+    /// Phase-7 live overlap). `clearTombstone` first so a tenant id reused
+    /// after a prior `destroyGroupAndReclaim` on THIS node can re-attach.
+    /// Errors if the group already exists (attach is not idempotent — a
+    /// double attach is an orchestration bug worth surfacing).
+    pub fn createGroupAtEpoch(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64) Error!*TenantSlot {
+        if (self.groups.get(tenant_id) != null) return Error.GroupExists;
+        self.mgr.clearTombstone(tenant_id) catch {};
+        return self.createGroupCore(tenant_id, id_str, epoch);
+    }
+
+    /// Shared group-birth core for `ensureGroup` (epoch 0) and
+    /// `createGroupAtEpoch` (migration epoch): open the tenant's kvexp
+    /// store, stand up a `GroupedFileStorage` over the shared WAL, create
+    /// the raft group at `epoch`, register the slot, and drive it to
+    /// leader (single-node campaign). Caller has already verified the
+    /// group does not exist.
+    fn createGroupCore(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64) Error!*TenantSlot {
         // {data_dir}/{tenant_id}/app.db
         const dir = std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ self.data_dir, tenant_id }) catch
             return Error.OutOfMemory;
@@ -234,14 +264,15 @@ pub const Node = struct {
             return Error.Io;
         errdefer gfs.deinit();
 
-        try self.mgr.createGroup(
+        try self.mgr.createGroupEpoch(
             tenant_id,
             self.node_id,
+            epoch,
             raft.manager.grouped_file_storage_vtable,
             gfs,
         );
-        // After createGroup succeeds the manager owns `gfs`; cancel the
-        // local errdefer so a later failure in this fn doesn't double-free.
+        // After createGroupEpoch succeeds the manager owns `gfs`; cancel
+        // the local errdefer so a later failure here doesn't double-free.
         errdefer self.mgr.destroyGroup(tenant_id) catch {};
 
         self.groups.put(self.allocator, tenant_id, slot) catch return Error.OutOfMemory;
@@ -261,6 +292,33 @@ pub const Node = struct {
         if (!self.mgr.isLeader(tenant_id)) return Error.NotCommitted;
 
         return slot;
+    }
+
+    /// Tear down a tenant's raft group and reclaim its WAL segments (the
+    /// Phase-4 move-source cleanup; docs/v2-build-order.md §Phase 4
+    /// "destroyGroup + noteGroupDestroyed on source"). `destroyGroup`
+    /// frees the group's `GroupedFileStorage` (and tombstones the id so a
+    /// stray later create is rejected); `noteGroupDestroyed` lets the
+    /// shared WAL drop this group's segments. Then close + free the slot's
+    /// (leader-skip, unwritten) kvexp store and drop it from the active
+    /// set. No-op if the group is unknown (idempotent under retried
+    /// orchestration). The tenant's durable state is NOT here — it lives
+    /// in the worker's `cluster.kv` and is dropped separately by the move
+    /// orchestration (`deleteInstance`).
+    pub fn destroyGroupAndReclaim(self: *Node, tenant_id: u64) Error!void {
+        const slot = self.groups.get(tenant_id) orelse return;
+        self.mgr.destroyGroup(tenant_id) catch return Error.DestroyGroupFailed;
+        self.wal.noteGroupDestroyed(tenant_id);
+        _ = self.groups.remove(tenant_id);
+        for (self.active.items, 0..) |g, i| {
+            if (g == tenant_id) {
+                _ = self.active.swapRemove(i);
+                break;
+            }
+        }
+        slot.store.close();
+        self.allocator.free(slot.id_str);
+        self.allocator.destroy(slot);
     }
 
     fn growReadyBuf(self: *Node) Error!void {

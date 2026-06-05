@@ -95,6 +95,7 @@ const WorkerCtx = struct {
     log_batch_store: log_server.batch_store.BatchStore,
     data_dir: []const u8,
     admin_api_domain: []const u8,
+    move_secret: ?[]const u8,
     ready: *std.Thread.ResetEvent,
 };
 
@@ -140,6 +141,7 @@ fn workerMain(args: *WorkerCtx) !void {
         .compile_ctx = &compiler,
         .log_batch_store = args.log_batch_store,
         .data_dir = args.data_dir,
+        .move_secret = args.move_secret,
     });
     defer worker.destroy();
 
@@ -188,6 +190,10 @@ pub fn main() !void {
 
     const admin_api_domain = std.posix.getenv("REWIND_ADMIN_DOMAIN") orelse DEFAULT_ADMIN_API_DOMAIN;
     const admin_root_token = std.posix.getenv("REWIND_ROOT_TOKEN") orelse DEFAULT_ADMIN_ROOT_TOKEN;
+    // V2 Phase 4 — shared secret for the cluster-internal tenant-move
+    // surface (`/_system/v2-*`). The front door presents it as
+    // `X-Rewind-Move-Secret`. Unset → the move surface is disabled.
+    const move_secret = std.posix.getenv("REWIND_MOVE_SECRET");
 
     // Blob backend (fs or s3) — process-wide, env-selected.
     var blob_owned = try blob_mod.env.loadFromEnv(allocator);
@@ -239,6 +245,7 @@ pub fn main() !void {
         .log_batch_store = log_batch_store,
         .data_dir = data_dir,
         .admin_api_domain = admin_api_domain,
+        .move_secret = move_secret,
         .ready = &ready,
     };
     var th = try std.Thread.spawn(.{}, workerThreadEntry, .{&ctx});

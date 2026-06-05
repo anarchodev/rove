@@ -120,10 +120,27 @@ fn methodFrom(s: []const u8) ?curl.Method {
     return null;
 }
 
+const MOVE_SECRET_HEADER = "X-Rewind-Move-Secret";
+const TENANT_HEADER = "X-Rewind-Tenant";
+
+/// One backend response the orchestrator cares about: status + an owned
+/// copy of the body (the source bundle, relayed into the attach call).
+const BackendResp = struct {
+    status: u16,
+    body: []u8,
+    fn deinit(self: BackendResp, a: std.mem.Allocator) void {
+        a.free(self.body);
+    }
+};
+
 const Router = struct {
     allocator: std.mem.Allocator,
     directory: *Directory,
     hosts: *HostMap,
+    /// Shared secret presented to backends' `/_system/v2-*` move surface,
+    /// and required (via `X-Rewind-Move-Secret`) on `/_control/move`.
+    /// Null disables the move control surface (503).
+    move_secret: ?[]const u8,
 
     /// Reply helper: set an immediate status (no body) on the request
     /// entity and move it to response_in.
@@ -131,6 +148,18 @@ const Router = struct {
         try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = code });
         try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = null, .count = 0 });
         try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = null, .len = 0 });
+        try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
+        try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+        try server.reg.set(ent, &server.request_out, h2.Session, sess);
+        try server.reg.move(ent, &server.request_out, &server.response_in);
+    }
+
+    /// Reply with a status + owned text body (`msg` is freed by the
+    /// registry via `RespBody.deinit`).
+    fn replyText(server: *FrontH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, code: u16, msg: []u8) !void {
+        try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = code });
+        try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = null, .count = 0 });
+        try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = msg.ptr, .len = @intCast(msg.len) });
         try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
         try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
         try server.reg.set(ent, &server.request_out, h2.Session, sess);
@@ -146,6 +175,18 @@ const Router = struct {
         const req_bodies = server.request_out.column(h2.ReqBody);
 
         for (entities, sids, sessions, req_hdrs, req_bodies) |ent, sid, sess, rh, rb| {
+            const req_path = headerValue(rh, ":path") orelse "/";
+
+            // 0. Control plane: `/_control/move` is handled by the front
+            //    door itself (the move orchestrator), not proxied to a
+            //    backend. It is the one component that sees all clusters +
+            //    owns the directory, so the move's directory flip is its
+            //    atomic commit point.
+            if (std.mem.startsWith(u8, req_path, "/_control/")) {
+                try self.handleControl(server, ent, sid, sess, rh, rb, req_path);
+                continue;
+            }
+
             // 1. Resolve the inbound tenant from :authority (fall back to
             //    Host). Strip any `:port` — the host map is keyed on the
             //    bare hostname, matching the worker's `hostOnly`.
@@ -159,15 +200,22 @@ const Router = struct {
                 try replyStatus(server, ent, sid, sess, 404);
                 continue;
             };
-            const cluster = self.directory.clusterFor(tenant) orelse {
+            const resolution = self.directory.resolve(tenant) orelse {
                 std.log.warn("front: tenant {s} unplaced → 421", .{tenant});
                 try replyStatus(server, ent, sid, sess, 421); // misdirected: no placement
                 continue;
             };
+            // Mid-move: hold the tenant's traffic with a retryable 503
+            // until the directory flip completes (the brief pause).
+            if (resolution.moving) {
+                try replyStatus(server, ent, sid, sess, 503);
+                continue;
+            }
+            const cluster = resolution.cluster;
 
             // 2. Build the backend forward.
             const method_s = headerValue(rh, ":method") orelse "GET";
-            const path = headerValue(rh, ":path") orelse "/";
+            const path = req_path;
             const method = methodFrom(method_s) orelse {
                 try replyStatus(server, ent, sid, sess, 405);
                 continue;
@@ -238,6 +286,190 @@ const Router = struct {
             try server.reg.move(ent, &server.request_out, &server.response_in);
         }
     }
+
+    // ── Control plane: tenant-move orchestration ─────────────────────
+
+    /// Route + auth a `/_control/*` request. Only `POST /_control/move`
+    /// exists; it requires the move secret (`X-Rewind-Move-Secret`).
+    fn handleControl(
+        self: *Router,
+        server: *FrontH2,
+        ent: rove.Entity,
+        sid: h2.StreamId,
+        sess: h2.Session,
+        rh: h2.ReqHeaders,
+        rb: h2.ReqBody,
+        path: []const u8,
+    ) !void {
+        const method_s = headerValue(rh, ":method") orelse "GET";
+        if (!std.mem.eql(u8, path, "/_control/move") or !std.mem.eql(u8, method_s, "POST")) {
+            try replyStatus(server, ent, sid, sess, 404);
+            return;
+        }
+        const secret = self.move_secret orelse {
+            try replyStatus(server, ent, sid, sess, 503); // move surface disabled
+            return;
+        };
+        const presented = headerValue(rh, MOVE_SECRET_HEADER) orelse "";
+        if (presented.len != secret.len or !std.mem.eql(u8, presented, secret)) {
+            try replyStatus(server, ent, sid, sess, 401);
+            return;
+        }
+        const body: []const u8 = if (rb.data) |d| d[0..rb.len] else &.{};
+        try self.handleMove(server, ent, sid, sess, body);
+    }
+
+    /// Orchestrate a brief-pause tenant move (docs/v2-build-order.md
+    /// §Phase 4): hold the tenant → dump+quiesce on source → ship the
+    /// bundle to the destination → attach there → **flip the directory**
+    /// (the commit point) → evict the source. On any pre-flip failure the
+    /// directory reverts and the source is resumed, so a failed move is a
+    /// no-op the tenant survives.
+    fn handleMove(self: *Router, server: *FrontH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
+        const a = self.allocator;
+        var parsed = std.json.parseFromSlice(struct {
+            tenant: []const u8,
+            dest: []const u8,
+        }, a, body, .{ .ignore_unknown_fields = true }) catch {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        };
+        defer parsed.deinit();
+        const tenant = parsed.value.tenant;
+        const dest = parsed.value.dest;
+        if (tenant.len == 0 or dest.len == 0) {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        }
+
+        const resolution = self.directory.resolve(tenant) orelse {
+            try replyStatus(server, ent, sid, sess, 404); // unknown tenant
+            return;
+        };
+        if (resolution.moving) {
+            try replyStatus(server, ent, sid, sess, 409); // already moving
+            return;
+        }
+        const src = resolution.cluster;
+        if (std.mem.eql(u8, src.id, dest)) {
+            try replyStatus(server, ent, sid, sess, 400); // already on dest
+            return;
+        }
+        const dest_ref = self.directory.clusterById(dest) orelse {
+            try replyStatus(server, ent, sid, sess, 400); // unknown dest cluster
+            return;
+        };
+
+        const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        defer a.free(tbody);
+
+        self.directory.beginMove(tenant) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+
+        // 1. Quiesce + dump the source (server-side quiesce inside v2-bundle).
+        var dump = self.backendCall(src.base_url, "/_system/v2-bundle", .POST, tbody, null) catch {
+            self.resumeSource(tenant, src.base_url, tbody);
+            try replyStatus(server, ent, sid, sess, 502);
+            return;
+        };
+        defer dump.deinit(a);
+        if (dump.status != 200) {
+            self.resumeSource(tenant, src.base_url, tbody);
+            try replyStatus(server, ent, sid, sess, 502);
+            return;
+        }
+
+        // 2. Attach on the destination (load bundle + group at the move epoch).
+        var att = self.backendCall(dest_ref.base_url, "/_system/v2-attach", .POST, dump.body, tenant) catch {
+            self.resumeSource(tenant, src.base_url, tbody);
+            try replyStatus(server, ent, sid, sess, 502);
+            return;
+        };
+        defer att.deinit(a);
+        if (att.status != 204) {
+            self.resumeSource(tenant, src.base_url, tbody);
+            try replyStatus(server, ent, sid, sess, 502);
+            return;
+        }
+
+        // 3. Flip the directory — the atomic commit point of the move.
+        self.directory.move(tenant, dest) catch {
+            // Both tenant + dest were validated above; a failure here is
+            // an invariant violation. Leave moving-held + surface 500.
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+
+        // 4. Evict the source (destroy its group + drop the instance).
+        //    Best-effort: the move already committed; a stale source group
+        //    is reclaimed lazily and never serves traffic again.
+        if (self.backendCall(src.base_url, "/_system/v2-evict", .POST, tbody, null)) |ev| {
+            var e2 = ev;
+            e2.deinit(a);
+        } else |err| {
+            std.log.warn("front: post-move evict of {s} on {s} failed: {s}", .{ tenant, src.id, @errorName(err) });
+        }
+
+        const msg = std.fmt.allocPrint(a, "moved {s}: {s} -> {s}\n", .{ tenant, src.id, dest }) catch {
+            try replyStatus(server, ent, sid, sess, 200);
+            return;
+        };
+        try replyText(server, ent, sid, sess, 200, msg);
+    }
+
+    /// Abort path: revert the directory hold + resume the source cluster
+    /// (lift its quiesce) so a failed move leaves the tenant serving where
+    /// it started. Best-effort — logs but does not surface resume errors.
+    fn resumeSource(self: *Router, tenant: []const u8, src_base: []const u8, tbody: []const u8) void {
+        self.directory.abortMove(tenant) catch {};
+        if (self.backendCall(src_base, "/_system/v2-resume", .POST, tbody, null)) |r| {
+            var rr = r;
+            rr.deinit(self.allocator);
+        } else |err| {
+            std.log.warn("front: resume source {s} ({s}) failed: {s}", .{ tenant, src_base, @errorName(err) });
+        }
+    }
+
+    /// Blocking libcurl call to a backend's move surface, presenting the
+    /// move secret (+ optional `X-Rewind-Tenant`). Returns status + an
+    /// owned copy of the response body.
+    fn backendCall(
+        self: *Router,
+        base_url: []const u8,
+        path_suffix: []const u8,
+        method: curl.Method,
+        body: []const u8,
+        tenant_hdr: ?[]const u8,
+    ) !BackendResp {
+        const a = self.allocator;
+        const url = try std.fmt.allocPrint(a, "{s}{s}", .{ base_url, path_suffix });
+        defer a.free(url);
+
+        var headers: std.ArrayListUnmanaged(curl.Header) = .empty;
+        defer headers.deinit(a);
+        try headers.append(a, .{ .name = MOVE_SECRET_HEADER, .value = self.move_secret.? });
+        if (tenant_hdr) |t| try headers.append(a, .{ .name = TENANT_HEADER, .value = t });
+
+        var easy = try curl.Easy.init(a);
+        defer easy.deinit();
+        var resp = try easy.request(a, .{
+            .method = method,
+            .url = url,
+            .headers = headers.items,
+            .body = body,
+            .http_version = .h2c_prior_knowledge,
+            .verify_tls = false,
+        });
+        defer resp.deinit(a);
+
+        const body_copy = if (resp.body) |b| try a.dupe(u8, b) else try a.dupe(u8, "");
+        return .{ .status = resp.status, .body = body_copy };
+    }
 };
 
 /// Strip a `:port` suffix from an `:authority` / Host value, matching the
@@ -287,6 +519,11 @@ pub fn main() !void {
     defer hosts.deinit();
     try hosts.seed(getEnvCfg("REWIND_HOSTS"));
 
+    // V2 Phase 4 — shared secret for the cluster-internal move surface.
+    // The front door presents it to backends' `/_system/v2-*` endpoints
+    // and requires it on `/_control/move`. Unset → move control disabled.
+    const move_secret: ?[]const u8 = std.posix.getenv("REWIND_MOVE_SECRET");
+
     var reg = try rove.Registry.init(allocator, .{
         .max_entities = 8192,
         .deferred_queue_capacity = 2048,
@@ -303,9 +540,9 @@ pub fn main() !void {
     }, .{ .tls_config = null });
     defer server.destroy();
 
-    var router = Router{ .allocator = allocator, .directory = &directory, .hosts = &hosts };
+    var router = Router{ .allocator = allocator, .directory = &directory, .hosts = &hosts, .move_secret = move_secret };
 
-    std.log.info("rewind-front: listening on 0.0.0.0:{d}", .{port});
+    std.log.info("rewind-front: listening on 0.0.0.0:{d} (move control {s})", .{ port, if (move_secret != null) "enabled" else "disabled" });
     while (!stop_flag.load(.acquire)) {
         server.pollWithTimeout(10 * std.time.ns_per_ms) catch |err| switch (err) {
             error.SignalInterrupt => continue,

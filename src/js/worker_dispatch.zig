@@ -35,6 +35,7 @@ const router_mod = @import("router.zig");
 const respb = @import("response_builder.zig");
 const auth = @import("auth.zig");
 const raft_propose = @import("raft_propose.zig");
+const v2_move = @import("v2_move.zig");
 const panic_mod = @import("panic.zig");
 const worker_mod = @import("worker.zig");
 const components_mod = @import("components.zig");
@@ -1045,6 +1046,14 @@ fn tryHandleSystem(
     const qmark = std.mem.indexOfScalar(u8, path, '?');
     const path_no_q = if (qmark) |q| path[0..q] else path;
     const sys_rest = path_no_q["/_system/".len..];
+
+    // V2 Phase 4 — the cluster-internal tenant-move surface (`v2-*`). It
+    // carries its own `move_secret` auth (the front door holds it, not the
+    // operator root bearer) and no CORS, so it short-circuits before the
+    // admin-auth gate below. Disabled (404) when no move secret is set.
+    if (try v2_move.tryHandleV2(server, allocator, worker, ent, sid, sess, method, sys_rest, path, rh, body)) {
+        return true;
+    }
 
     // Liveness probe for load balancers / systemd-style supervisors.
     // No auth, no leadership-aware semantics — just "this process is
