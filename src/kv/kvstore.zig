@@ -137,13 +137,17 @@ pub const SeqCounterRegistry = struct {
 
     pub fn deinit(self: *SeqCounterRegistry) void {
         self.mutex.lock();
-        defer self.mutex.unlock();
         var it = self.counters.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.counters.deinit(self.allocator);
+        // Unlock BEFORE poisoning `self`: a deferred unlock would run AFTER
+        // `self.* = undefined` and assert on the poisoned mutex's garbage
+        // locking_thread (the SIGTERM-teardown panic). deinit is single-
+        // threaded teardown, so an explicit unlock here is sufficient.
+        self.mutex.unlock();
         self.* = undefined;
     }
 
