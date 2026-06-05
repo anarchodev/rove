@@ -916,6 +916,19 @@ pub fn build(b: *std.Build) void {
     const v2_hib_bench_step = b.step("v2-hibernation-bench", "Build the V2 Phase-6 hibernation pump-cost microbench");
     v2_hib_bench_step.dependOn(&b.addInstallArtifact(v2_hib_bench, .{}).step);
 
+    // ── V2 Phase 7 — empty-bundle race reproduction (kvstore/kvexp level)
+    const v2_bundle_repro_mod = b.createModule(.{
+        .root_source_file = b.path("examples/v2_bundle_repro.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    v2_bundle_repro_mod.link_libc = true;
+    v2_bundle_repro_mod.addImport("raft-kv", kv_mod);
+    v2_bundle_repro_mod.addImport("kvexp", kvexp_mod);
+    const v2_bundle_repro = b.addExecutable(.{ .name = "v2-bundle-repro", .root_module = v2_bundle_repro_mod });
+    const v2_bundle_repro_step = b.step("v2-bundle-repro", "Reproduce the empty-bundle race at the kvstore/kvexp level");
+    v2_bundle_repro_step.dependOn(&b.addInstallArtifact(v2_bundle_repro, .{}).step);
+
     // ── V2 Phase 5 — the cross-node transport adapter (coalesced) ──────
     // `src-v2/kv/transport.zig` wraps `raft_net` with per-recipient
     // coalescing; the Node drives it from its pump. Tested on its own

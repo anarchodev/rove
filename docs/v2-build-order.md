@@ -259,9 +259,12 @@ This is the heart of the rewrite.
 > `_move/forward` marker) + `handleKv` dual-write; `scripts/zero_downtime_forward_smoke.py`
 > proves the source keeps serving while every committed write reaches the
 > dest. Remaining: (a) serve-or-forward + the replicated CP directory, (c)
-> the relinquish/acquire epoch-fenced cutover. **Blocker found:** a
-> pre-existing `v2-bundle` empty-snapshot race (a write dumped instantly
-> after commit can be missing) must be fixed before (c).
+> the relinquish/acquire epoch-fenced cutover. A suspected `v2-bundle`
+> empty-snapshot race was **investigated + cleared** (NOT a kvexp bug —
+> 0/63k repro incl. concurrent durabilize; the bundle HTTP path is reliable
+> across 600 fetches incl. a 42 KB multi-frame body; a corrupt bundle aborts
+> the move safely at the dest's `loadTenantBundle`, no data loss). Tool:
+> `examples/v2_bundle_repro.zig` (`zig build v2-bundle-repro`).
 
 - **New:** the `relinquish` / `acquire` handshake — keep serving on the
   source while the destination catches up, with an epoch-fenced overlap
