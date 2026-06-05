@@ -20,10 +20,20 @@
 //!     `takeMessages` drains to nowhere. Multi-node is Phase 5.
 //!   - **no HTTP / JS** — propose + read are called directly. The
 //!     worker-dispatch seam swap is Phase 2.
-//!   - **no hibernation** — the active set only grows (every created
-//!     group is ticked every cycle). Fine at Phase-1 tenant counts;
-//!     the active-set/hibernation machinery is Phase 6
-//!     (multiraft-scaling-learnings §3.1).
+//!   - hibernation (Phase 6, `multiraft-scaling-learnings §3.1`): the
+//!     `active` set is a true HIBERNATING set — a group idle (no propose,
+//!     no non-heartbeat inbound step) for `hibernate_ns` drops out and is
+//!     no longer ticked, so an idle tenant stops heartbeating (leader) /
+//!     running its election timer (follower) and costs the pump nothing.
+//!     The activity bump deliberately SKIPS heartbeats (a heartbeat means
+//!     "don't elect me," not "I have work"), so a quiet group's own
+//!     keep-alive traffic can't keep it awake. Correctness across nodes:
+//!     every node counts a group's idle deadline from the last REAL
+//!     message (all see it ~simultaneously), so they hibernate within
+//!     network-jitter of each other — well under the election timeout —
+//!     and a hibernated group's frozen election timer never fires a
+//!     spurious campaign. A propose or a non-heartbeat step wakes it
+//!     cluster-wide.
 //!   - **no migration / epoch fence** — `createGroup` (birth epoch 0);
 //!     detach/attach is Phase 4.
 //!   - **no speculative overlay** — entries apply on commit (both the
@@ -49,6 +59,16 @@ pub const PeerAddr = transport_mod.PeerAddr;
 pub const KvStore = kvstore.KvStore;
 pub const WriteSet = writeset.WriteSet;
 pub const Envelope = envelope.Envelope;
+
+/// Default hibernation idle window (Phase 6, `multiraft-scaling-learnings
+/// §3.1`): a group with no propose / non-heartbeat step for this long drops
+/// out of the active set and is no longer ticked. Comfortably longer than
+/// the raft election timeout in wall-clock terms — what must stay below the
+/// election timeout is the *skew* between nodes hibernating the same group
+/// (≈ network jitter), not this absolute value; a generous window just
+/// avoids re-waking a barely-idle group. Tests override `Node.hibernate_ns`
+/// with a short value so the hibernate/wake transitions are observable fast.
+pub const DEFAULT_HIBERNATE_NS: i64 = 2 * std.time.ns_per_s;
 
 /// Resolves the per-tenant store a FOLLOWER's replicated entries apply to
 /// in `worker_overlay` mode (Phase 5 "Full HA"). Without it, a follower
@@ -129,6 +149,14 @@ pub const TenantSlot = struct {
     /// Highest raft index whose committed entry has been applied to
     /// `store`. 0 until the first apply.
     applied_idx: u64 = 0,
+    /// Hibernation (Phase 6): wall-clock deadline past which this group is
+    /// considered idle and swept out of the active tick set. Refreshed by
+    /// `bumpActive` on every propose + non-heartbeat inbound step (NOT on
+    /// heartbeats). 0 = never bumped (a fresh slot not yet active).
+    active_until_ns: i64 = 0,
+    /// Whether this group is currently in `Node.active` (ticked each pump
+    /// cycle). Lets `bumpActive` add it at most once and the sweep drop it.
+    in_active: bool = false,
 };
 
 /// One V2 node: a `Manager` of per-tenant raft groups over one shared
@@ -156,8 +184,12 @@ pub const Node = struct {
     /// tenant_id → slot. Iterated on deinit; looked up in the apply
     /// callback by `group_id`.
     groups: std.AutoHashMapUnmanaged(u64, *TenantSlot) = .empty,
-    /// Group ids ticked every pump cycle. Phase 1: every created group
-    /// (no hibernation). Index-aligned with nothing; just the tick list.
+    /// Group ids ticked every pump cycle — the HIBERNATING active set
+    /// (Phase 6). A group enters via `bumpActive` (propose / formation /
+    /// non-heartbeat step) and leaves when its `active_until_ns` passes
+    /// (`sweepHibernated`). NOT pre-seeded with every created group: an idle
+    /// group is not ticked, so the pump cost is O(active), not O(all groups)
+    /// — the multiraft-scaling-learnings §3.1 win at K = thousands.
     active: std.ArrayListUnmanaged(u64) = .empty,
     /// `pollReady` scratch, grown to `groups.count()` as groups are added.
     ready_buf: []u64 = &.{},
@@ -178,6 +210,14 @@ pub const Node = struct {
     /// unit tests keep the default so a read after commit sees the pump's
     /// write.
     apply_mode: ApplyMode = .apply_on_commit,
+
+    /// Hibernation idle window (Phase 6). Overridable per node (tests use a
+    /// short value); production keeps `DEFAULT_HIBERNATE_NS`.
+    hibernate_ns: i64 = DEFAULT_HIBERNATE_NS,
+    /// Scratch for draining the transport's woke-group list each pump cycle
+    /// (the gids that received a non-heartbeat message → `bumpActive`).
+    /// Owned; reused to avoid per-cycle allocation.
+    woke_scratch: std.ArrayListUnmanaged(u64) = .empty,
 
     /// Optional follower-apply store resolver (see `StoreResolver`). Set by
     /// the bridge in `worker_overlay` mode so a follower's replicated writes
@@ -279,6 +319,7 @@ pub const Node = struct {
         }
         self.groups.deinit(a);
         self.active.deinit(a);
+        self.woke_scratch.deinit(a);
         a.free(self.ready_buf);
         a.free(self.voters);
         a.free(self.data_dir);
@@ -357,8 +398,10 @@ pub const Node = struct {
 
         self.groups.put(self.allocator, tenant_id, slot) catch return Error.OutOfMemory;
         errdefer _ = self.groups.remove(tenant_id);
-        try self.active.append(self.allocator, tenant_id);
-        errdefer _ = self.active.pop();
+        // Formation is activity: a fresh group must tick to elect (multi-node)
+        // or campaign-to-leader (single-node). It hibernates once idle.
+        try self.bumpActive(tenant_id);
+        errdefer self.dropActive(tenant_id);
         try self.growReadyBuf();
 
         // Single-node: force this group to leader so proposes commit
@@ -410,13 +453,8 @@ pub const Node = struct {
         const slot = self.groups.get(tenant_id) orelse return;
         self.mgr.destroyGroup(tenant_id) catch return Error.DestroyGroupFailed;
         self.wal.noteGroupDestroyed(tenant_id);
+        self.dropActive(tenant_id);
         _ = self.groups.remove(tenant_id);
-        for (self.active.items, 0..) |g, i| {
-            if (g == tenant_id) {
-                _ = self.active.swapRemove(i);
-                break;
-            }
-        }
         slot.store.close();
         self.allocator.free(slot.id_str);
         self.allocator.destroy(slot);
@@ -429,10 +467,65 @@ pub const Node = struct {
         self.ready_buf = grown;
     }
 
+    // ── Hibernation active set (Phase 6) ─────────────────────────────
+
+    fn nowNs() i64 {
+        return @intCast(std.time.nanoTimestamp());
+    }
+
+    /// Mark a group active: refresh its hibernate deadline and add it to the
+    /// tick set if absent. Called on every propose, on formation, and on a
+    /// non-heartbeat inbound step — the events that mean "this group has
+    /// work," so the pump keeps ticking it. A no-op for an unknown gid.
+    /// Pump-thread only (mutates `active` + the slot).
+    pub fn bumpActive(self: *Node, gid: u64) Error!void {
+        const slot = self.groups.get(gid) orelse return;
+        slot.active_until_ns = nowNs() + self.hibernate_ns;
+        if (!slot.in_active) {
+            self.active.append(self.allocator, gid) catch return Error.OutOfMemory;
+            slot.in_active = true;
+        }
+    }
+
+    /// Remove a group from the active set (destroy / errdefer). Clears its
+    /// `in_active` flag. O(active); the active set is small by design.
+    fn dropActive(self: *Node, gid: u64) void {
+        for (self.active.items, 0..) |g, i| {
+            if (g == gid) {
+                _ = self.active.swapRemove(i);
+                break;
+            }
+        }
+        if (self.groups.get(gid)) |slot| slot.in_active = false;
+    }
+
+    /// Drop every group whose hibernate deadline has passed from the active
+    /// set — the pump stops ticking it, so it stops heartbeating (leader) /
+    /// running its election timer (follower) until a propose or non-heartbeat
+    /// step wakes it. Run once per pump cycle. Pump-thread only.
+    fn sweepHibernated(self: *Node, now: i64) void {
+        var i: usize = 0;
+        while (i < self.active.items.len) {
+            const gid = self.active.items[i];
+            const slot = self.groups.get(gid) orelse {
+                _ = self.active.swapRemove(i);
+                continue;
+            };
+            if (now > slot.active_until_ns) {
+                slot.in_active = false;
+                _ = self.active.swapRemove(i);
+            } else i += 1;
+        }
+    }
+
     /// Propose a raw raft-log entry to `tenant_id`'s group. Returns once
     /// the entry is staged in raft-rs's pending list — NOT once applied.
-    /// Drive `pump` to commit + apply it.
+    /// Drive `pump` to commit + apply it. A propose is activity, so it
+    /// wakes the group (`bumpActive`) — a hibernated tenant ticks again and
+    /// replicates the entry. Bump first so even a propose that raft-rs
+    /// rejects (non-leader) still re-ticks the group toward an election.
     pub fn propose(self: *Node, tenant_id: u64, entry: []const u8) Error!void {
+        try self.bumpActive(tenant_id);
         try self.mgr.propose(tenant_id, entry);
     }
 
@@ -495,6 +588,8 @@ pub const Node = struct {
             }
         }
 
+        const now = nowNs();
+
         // Always drive the transport (multi-node): flush this cycle's
         // coalesced sends, then a non-blocking tick that submits them and
         // delivers any inbound envelopes (→ stepBatch). Done every cycle —
@@ -502,9 +597,17 @@ pub const Node = struct {
         // and inbound messages are stepped even on an otherwise idle node.
         if (self.transport) |t| {
             t.flush();
-            const now: i64 = @intCast(std.time.nanoTimestamp());
             t.tick(now, 0) catch {};
+            // Wake any group that received a NON-heartbeat message this cycle
+            // (real raft traffic = work). Heartbeats are skipped on purpose
+            // (§3.1) so a quiet group can't keep itself awake.
+            self.woke_scratch.clearRetainingCapacity();
+            t.drainWoke(&self.woke_scratch, self.allocator) catch {};
+            for (self.woke_scratch.items) |gid| self.bumpActive(gid) catch {};
         }
+
+        // Hibernate: stop ticking any group idle past its deadline.
+        self.sweepHibernated(now);
 
         if (self.apply_err) |e| {
             self.apply_err = null;
@@ -929,4 +1032,236 @@ test "two tenants get independent stores on the same node" {
     const b_who = try node.get(2, "who");
     defer a.free(b_who);
     try testing.expectEqualStrings("bob", b_who);
+}
+
+// ── Phase 6: hibernation / active-set ─────────────────────────────────
+
+test "Phase 6: an idle group hibernates out of the active set, a propose re-wakes it" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const node = try Node.initSingleNode(a, dir);
+    defer node.deinit();
+    node.hibernate_ns = 30 * std.time.ns_per_ms; // short so the test is fast
+
+    const tenant: u64 = 9;
+    var ws = WriteSet.init(a);
+    defer ws.deinit();
+    try ws.addPut("k", "v1");
+    _ = try node.proposeWriteSet(tenant, "t9", &ws);
+
+    // A just-proposed group is active (ticked).
+    const slot = node.groups.get(tenant).?;
+    try testing.expect(slot.in_active);
+
+    // Let it idle past the hibernate window, pumping all the while — the
+    // sweep drops it from the active set, so the pump stops ticking it.
+    var spins: u32 = 0;
+    while (slot.in_active and spins < 200) : (spins += 1) {
+        _ = try node.pump();
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(!slot.in_active);
+    try testing.expectEqual(@as(usize, 0), node.active.items.len);
+
+    // A new propose wakes it — it ticks again and commits (single-node it is
+    // still the leader; hibernation froze the term, did not drop it).
+    var ws2 = WriteSet.init(a);
+    defer ws2.deinit();
+    try ws2.addPut("k", "v2");
+    _ = try node.proposeWriteSet(tenant, "t9", &ws2);
+    try testing.expect(slot.in_active);
+
+    const got = try node.get(tenant, "k");
+    defer a.free(got);
+    try testing.expectEqualStrings("v2", got);
+}
+
+test "Phase 6: many idle groups all drain from the active set (O(active) tick cost)" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const node = try Node.initSingleNode(a, dir);
+    defer node.deinit();
+    node.hibernate_ns = 30 * std.time.ns_per_ms;
+
+    // K tenants each take one write. (They enter the active set as they are
+    // written; the earliest may already be aging out by the time the last is
+    // created — that IS the mechanism — so don't assert a peak count here.)
+    const K: u64 = 80;
+    var t: u64 = 1;
+    while (t <= K) : (t += 1) {
+        var ws = WriteSet.init(a);
+        defer ws.deinit();
+        try ws.addPut("k", "v");
+        var idbuf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&idbuf, "t{d}", .{t});
+        _ = try node.proposeWriteSet(t, id, &ws);
+    }
+    try testing.expect(node.groups.count() == K); // all K exist
+
+    // Idle past the window: every group hibernates, so a pump cycle ticks
+    // NOTHING — the cost is O(active), not O(K).
+    var spins: u32 = 0;
+    while (node.active.items.len > 0 and spins < 200) : (spins += 1) {
+        _ = try node.pump();
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(usize, 0), node.active.items.len);
+    // All K groups still exist (hibernated ≠ destroyed) — a read still works.
+    const got = try node.get(K, "k");
+    defer a.free(got);
+    try testing.expectEqualStrings("v", got);
+}
+
+test "Phase 6: an idle 3-node group hibernates with no spurious leader change, then a propose wakes + replicates" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(root);
+
+    const voters = [_]u64{ 1, 2, 3 };
+    const dirs = [_][]u8{
+        try std.fmt.allocPrint(a, "{s}/h1", .{root}),
+        try std.fmt.allocPrint(a, "{s}/h2", .{root}),
+        try std.fmt.allocPrint(a, "{s}/h3", .{root}),
+    };
+    defer for (dirs) |d| a.free(d);
+
+    // Same PID-strided, bind-retry port allocation as the other networked
+    // tests (these run in parallel with sibling test binaries).
+    var nodes: [3]*Node = undefined;
+    var alive = [_]bool{ false, false, false };
+    defer for (nodes, 0..) |n, i| if (alive[i]) n.deinit();
+
+    const pid: u32 = @intCast(std.os.linux.getpid());
+    var attempt: u32 = 0;
+    while (attempt < 24) : (attempt += 1) {
+        const base: u16 = @intCast(28000 + ((pid +% attempt *% 619) % 3000) * 8);
+        var ok = true;
+        for (0..3) |i| {
+            var peers: [3]PeerAddr = undefined;
+            for (&peers, 0..) |*p, k| p.* = .{ .host = "127.0.0.1", .port = base + @as(u16, @intCast(k)) };
+            const addr = std.net.Address.parseIp("127.0.0.1", base + @as(u16, @intCast(i))) catch {
+                ok = false;
+                break;
+            };
+            nodes[i] = Node.initMultiNode(a, dirs[i], @intCast(i + 1), &voters, addr, &peers) catch {
+                ok = false;
+                break;
+            };
+            // A window long enough to elect, short enough to observe sleep.
+            nodes[i].hibernate_ns = 200 * std.time.ns_per_ms;
+            alive[i] = true;
+        }
+        if (ok) break;
+        for (0..3) |i| if (alive[i]) {
+            nodes[i].deinit();
+            alive[i] = false;
+        };
+    }
+    if (!(alive[0] and alive[1] and alive[2])) return error.SkipZigTest;
+
+    const tenant: u64 = 100;
+    const id = "tenant-100";
+    for (nodes) |n| _ = try n.ensureGroup(tenant, id);
+
+    // Warm the mesh, then elect node 1.
+    var warm: u32 = 0;
+    while (warm < 80) : (warm += 1) {
+        for (nodes) |n| _ = try n.pump();
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try nodes[0].campaign(tenant);
+
+    var leader: ?usize = null;
+    var spins: u32 = 0;
+    while (spins < 2000 and leader == null) : (spins += 1) {
+        for (nodes) |n| _ = try n.pump();
+        for (nodes, 0..) |n, i| if (n.isLeader(tenant)) {
+            leader = i;
+        };
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(leader != null);
+    const ld = leader.?;
+
+    // Replicate a baseline write so every node has recent real activity.
+    {
+        var ws = WriteSet.init(a);
+        defer ws.deinit();
+        try ws.addPut("k", "v1");
+        const ws_bytes = try ws.encode(a);
+        defer a.free(ws_bytes);
+        const env = try envelope.encodeWriteSet(a, id, ws_bytes);
+        defer a.free(env);
+        try nodes[ld].propose(tenant, env);
+        var done = false;
+        var s: u32 = 0;
+        while (s < 2000 and !done) : (s += 1) {
+            for (nodes) |n| _ = try n.pump();
+            done = true;
+            for (nodes) |n| {
+                const v = n.get(tenant, "k") catch {
+                    done = false;
+                    break;
+                };
+                a.free(v);
+            }
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+        try testing.expect(done);
+    }
+
+    // Idle the cluster well past the hibernate window. The leader stops
+    // heartbeating + the followers stop their election timers — all within
+    // jitter of each other (deadlines counted from the same last Append
+    // Entries, NOT from heartbeats) — so the frozen election timers never
+    // fire a spurious campaign.
+    var idle: u32 = 0;
+    while (idle < 500) : (idle += 1) {
+        for (nodes) |n| _ = try n.pump();
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    // Every node hibernated this group (active set empty), and leadership is
+    // unchanged — the original leader still leads, no one else campaigned.
+    for (nodes) |n| try testing.expectEqual(@as(usize, 0), n.active.items.len);
+    try testing.expect(nodes[ld].isLeader(tenant));
+    for (nodes, 0..) |n, i| if (i != ld) try testing.expect(!n.isLeader(tenant));
+
+    // A propose wakes the group cluster-wide (no re-election needed — the
+    // leader's term was frozen, not lost) and replicates to every node.
+    var ws2 = WriteSet.init(a);
+    defer ws2.deinit();
+    try ws2.addPut("k", "v2");
+    const ws2_bytes = try ws2.encode(a);
+    defer a.free(ws2_bytes);
+    const env2 = try envelope.encodeWriteSet(a, id, ws2_bytes);
+    defer a.free(env2);
+    try nodes[ld].propose(tenant, env2);
+
+    var woke = false;
+    var s2: u32 = 0;
+    while (s2 < 3000 and !woke) : (s2 += 1) {
+        for (nodes) |n| _ = try n.pump();
+        woke = true;
+        for (nodes) |n| {
+            const v = n.get(tenant, "k") catch {
+                woke = false;
+                break;
+            };
+            defer a.free(v);
+            if (!std.mem.eql(u8, v, "v2")) woke = false;
+        }
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(woke);
+    try testing.expect(nodes[ld].isLeader(tenant));
 }
