@@ -6,7 +6,7 @@
 //! blob/tenant/deploy) onto the V2 per-tenant raft **bridge** instead of
 //! V1's cluster-wide `kv.Cluster` + willemt raft thread:
 //!
-//!   bridge.initSingleNode → setLeaderSkip → startPump   (the pump thread)
+//!   bridge.initSingleNode → setWorkerOverlay → startPump   (the pump thread)
 //!   NodeState.init(tenant, blob_cfg, bridge)             (shared node state)
 //!   Worker.create(.{ .raft = bridge, … })                (one worker thread)
 //!
@@ -216,7 +216,7 @@ pub fn main() !void {
     // worker owns the speculative overlay.
     const bridge = try Bridge.initSingleNode(allocator, data_dir);
     defer bridge.deinit();
-    bridge.setLeaderSkip();
+    bridge.setWorkerOverlay();
     try bridge.startPump();
 
     // Per-tenant request-log batches → fs (S3 in prod via BLOB_BACKEND).

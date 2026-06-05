@@ -39,19 +39,27 @@
 //! per-tenant commits are monotonic, so the watermark is as precise as a
 //! per-propose handle would be here.
 //!
-//! ## Seq ↔ commit binding
+//! ## Seq ↔ commit binding (explicit per-entry FIFO — Phase 5)
 //!
-//! `propose` assigns `seq = ++sig.next_seq` **in the same critical
-//! section** as the inbox append, so per-tenant seq order == inbox order
-//! == (FIFO pump drain) == raft index order == commit order. The pump
-//! commit hook therefore advances `committed_seq` by exactly one per
-//! committed entry — the Nth commit for a tenant is its seq N. This
-//! counting binding is correct under Phase-2's single-node single-voter
-//! (every propose commits, in order; the group is driven to leader at
-//! creation so `node.propose` never fails NotLeader). Phase 5 (multi-
-//! node, where a propose can fail or leadership can change mid-flight)
-//! replaces counting with an explicit per-entry seq (framed prefix or a
-//! pending-seq FIFO) — flagged where it bites.
+//! `propose` assigns `seq = ++sig.next_seq` and pushes it onto the
+//! tenant's `pending` FIFO **in the same critical section** as the inbox
+//! append, so per-tenant seq order == inbox order == (FIFO pump drain) ==
+//! raft index order == commit order. The commit hook pops the FIFO front
+//! and sets `committed_seq` to that seq — **but only when this node is the
+//! group's leader**.
+//!
+//! Phase-2 used a simpler *counting* binding (Nth commit = seq N). That is
+//! wrong under multi-node: (a) a propose can fail (this node isn't the
+//! leader) so its seq never commits, and (b) a FOLLOWER applies entries
+//! replicated from another leader — committed entries with no local
+//! proposer — which counting would mis-attribute to a local waiter. The
+//! leader-gated FIFO pop fixes both: followers never advance the watermark
+//! (no local waiter), and a propose that can't commit here is FAULTED
+//! (`faulted_seq`) by the pump — at submit (`node.propose` rejected) or by
+//! the per-cycle leadership-loss sweep — so the parked worker fails fast
+//! (503) and the client retries against the leader node. A write in flight
+//! at the *instant* of a leader change is faulted + retried, not silently
+//! lost; live re-fencing under continuous load is Phase 7.
 
 const std = @import("std");
 const node_mod = @import("node.zig");
@@ -92,9 +100,18 @@ pub const GroupSig = struct {
     /// the pump commit hook (single writer); read lock-free by workers.
     committed_seq: std.atomic.Value(u64) = .init(0),
     /// Highest seq known to have faulted (leadership loss / shutdown).
-    /// Reserved in Phase 2 — single-node never loses leadership, so this
-    /// only moves on bridge teardown to fail any in-flight proposes.
+    /// Multi-node: a propose submitted on a non-leader, or in flight when
+    /// this node loses the group's leadership, faults so the worker fails
+    /// fast (503) and the client retries against the new leader.
     faulted_seq: std.atomic.Value(u64) = .init(0),
+    /// FIFO of proposed-but-not-yet-committed seqs (front = oldest), the
+    /// explicit per-entry seq↔commit binding that replaces Phase-2's
+    /// counting (multi-node breaks counting: a follower applies entries
+    /// from another leader, which the commit hook must NOT attribute to a
+    /// local proposer). Pushed by `propose`, popped by the commit hook
+    /// **only when this node is the group's leader**, cleared on fault.
+    /// Guarded by `Bridge.mutex`.
+    pending: std.ArrayListUnmanaged(u64) = .empty,
     /// Set by `quiesce` while this tenant is being moved off the node:
     /// `propose` rejects (`Error.Quiesced`) so no new write is admitted
     /// once the bundle snapshot is being taken. Single writer at a time
@@ -123,6 +140,9 @@ const ControlCmd = struct {
 /// One queued propose, handed worker thread → pump thread.
 const ProposeItem = struct {
     gid: u64,
+    /// The per-tenant seq this propose was assigned (so the pump can fault
+    /// exactly it if `node.propose` rejects on a non-leader).
+    seq: u64,
     /// Borrowed from the gid's `GroupSig.id_str` (pointer-stable).
     id_str: []const u8,
     /// Owned envelope bytes; the pump frees after `node.propose`
@@ -144,11 +164,16 @@ pub const Bridge = struct {
     /// `GroupSig.next_seq`. NOT held across `node.*` calls.
     mutex: std.Thread.Mutex = .{},
     groups: std.AutoHashMapUnmanaged(u64, *GroupSig) = .empty,
-    /// id_str → gid. Phase-2 directory stub (local monotonic assignment);
-    /// the replicated tenant→cluster directory is Phase 3.
+    /// id_str → gid (a deterministic hash; see `registerTenant`). The
+    /// cross-cluster tenant→cluster directory is the separate control-plane
+    /// `Directory` (Phase 3); this is just the local id→raft-group map.
     by_id: std.StringHashMapUnmanaged(u64) = .empty,
-    next_gid: u64 = 1,
     inbox: std.ArrayListUnmanaged(ProposeItem) = .empty,
+    /// Gids with a non-empty `GroupSig.pending` (in-flight proposes). The
+    /// pump sweeps only these each cycle for leadership-loss faulting, so
+    /// the sweep is O(in-flight tenants), not O(all tenants). Guarded by
+    /// `mutex`; deduped (a gid appears at most once).
+    in_flight: std.ArrayListUnmanaged(u64) = .empty,
     /// Move-orchestration control ops awaiting the pump thread (group
     /// create-at-epoch / destroy). Pointers to caller-stack `ControlCmd`s;
     /// guarded by `mutex`. Drained + executed in `pumpOnce`.
@@ -166,6 +191,24 @@ pub const Bridge = struct {
         return Bridge.init(allocator, node);
     }
 
+    /// Stand up a multi-node bridge (Phase 5) over a fresh multi-node
+    /// `Node`: this node's `node_id` ∈ `voters`, the cross-node transport
+    /// bound to `listen_addr` with `peers` (indexed by raft node id − 1).
+    /// Like the single-node bridge it does NOT start the pump thread —
+    /// call `startPump`.
+    pub fn initMultiNode(
+        allocator: std.mem.Allocator,
+        data_dir: []const u8,
+        node_id: u64,
+        voters: []const u64,
+        listen_addr: std.net.Address,
+        peers: []const node_mod.PeerAddr,
+    ) Error!*Bridge {
+        const node = try Node.initMultiNode(allocator, data_dir, node_id, voters, listen_addr, peers);
+        errdefer node.deinit();
+        return Bridge.init(allocator, node);
+    }
+
     pub fn init(allocator: std.mem.Allocator, node: *Node) Error!*Bridge {
         const self = allocator.create(Bridge) catch return Error.OutOfMemory;
         self.* = .{ .allocator = allocator, .node = node };
@@ -173,13 +216,16 @@ pub const Bridge = struct {
         return self;
     }
 
-    /// Put the node in leader-skip apply mode: the pump advances commit
-    /// watermarks but does NOT write tenant stores, because the worker
-    /// fronting this bridge owns the speculative overlay and commits it on
-    /// watermark advance. Call before serving (loop46-v2). The 2a unit
-    /// tests, which read the pump's own store, keep the default.
-    pub fn setLeaderSkip(self: *Bridge) void {
-        self.node.apply_mode = .leader_skip;
+    /// Put the node in worker-overlay apply mode: a worker fronting this
+    /// bridge owns the speculative overlay and commits it on watermark
+    /// advance, so the pump skips the store write **on the leader** (the
+    /// worker wrote it) but still writes it **on a follower** (no worker
+    /// for that tenant here). Single-node is always the leader, so this is
+    /// the old leader-skip behavior there. Call before serving (`rewind`).
+    /// The 2a unit tests, which read the pump's own store, keep the
+    /// default `apply_on_commit`.
+    pub fn setWorkerOverlay(self: *Bridge) void {
+        self.node.apply_mode = .worker_overlay;
     }
 
     /// Stop the pump (if running), then free the node + all bridge state.
@@ -192,11 +238,13 @@ pub const Bridge = struct {
         var it = self.groups.valueIterator();
         while (it.next()) |sig_ptr| {
             const sig = sig_ptr.*;
+            sig.pending.deinit(a);
             a.free(sig.id_str);
             a.destroy(sig);
         }
         self.groups.deinit(a);
         self.by_id.deinit(a);
+        self.in_flight.deinit(a);
         // Any items still queued at teardown own their payloads.
         for (self.inbox.items) |item| a.free(item.payload);
         self.inbox.deinit(a);
@@ -210,16 +258,23 @@ pub const Bridge = struct {
 
     // ── Tenant registry (any thread) ─────────────────────────────────
 
-    /// Map a tenant store id to its numeric group id, assigning one on
-    /// first sight. Idempotent. Safe from any thread. Does NOT touch the
-    /// `Node`/`Manager` — the raft group is created lazily on the pump
-    /// thread at the tenant's first propose (`ensureGroup`).
+    /// Map a tenant store id to its numeric raft group id, registering its
+    /// `GroupSig` on first sight. Idempotent. Safe from any thread. Does
+    /// NOT touch the `Node`/`Manager` — the raft group is created on the
+    /// pump thread (lazily at first propose via `ensureGroup`, or eagerly
+    /// via `createGroupEpoch` for a move/multi-node formation).
+    ///
+    /// The gid is a **deterministic hash of `id_str`**, not a local
+    /// counter: a raft group spans all nodes, so every node must derive the
+    /// SAME group id for a tenant or replication can't bind the incarnations
+    /// together. (Phase-2/3 used a local monotonic counter — fine for one
+    /// node, wrong the moment a second node joins.)
     pub fn registerTenant(self: *Bridge, id_str: []const u8) Error!u64 {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.by_id.get(id_str)) |gid| return gid;
 
-        const gid = self.next_gid;
+        const gid = tenantGid(id_str);
         const sig = self.allocator.create(GroupSig) catch return Error.OutOfMemory;
         errdefer self.allocator.destroy(sig);
         const id_dup = self.allocator.dupe(u8, id_str) catch return Error.OutOfMemory;
@@ -232,8 +287,17 @@ pub const Bridge = struct {
         // slice.
         self.by_id.put(self.allocator, id_dup, gid) catch return Error.OutOfMemory;
 
-        self.next_gid += 1;
         return gid;
+    }
+
+    /// Deterministic tenant-id → raft group id (Wyhash, seed 0). Group id 0
+    /// is avoided (raft reserves 0 as None for node ids; keep groups ≥ 1
+    /// for symmetry + to never collide with a sentinel). Collisions across
+    /// distinct tenants are a 64-bit-hash non-event, same stance as kvexp's
+    /// `hashStoreId`.
+    fn tenantGid(id_str: []const u8) u64 {
+        const h = std.hash.Wyhash.hash(0, id_str);
+        return if (h == 0) 1 else h;
     }
 
     /// Look up a registered tenant's gid by id, or null if unregistered.
@@ -271,19 +335,55 @@ pub const Bridge = struct {
         // source bundle snapshot is a quiescent point (Phase 4).
         if (sig.quiescing.load(.acquire)) return Error.Quiesced;
         const owned = self.allocator.dupe(u8, payload) catch return Error.OutOfMemory;
-        sig.next_seq += 1;
-        const seq = sig.next_seq;
+        errdefer self.allocator.free(owned);
+        const seq = sig.next_seq + 1;
+        // Record the in-flight seq BEFORE enqueue so the commit hook (which
+        // pops the front in FIFO/commit order) and the leadership-loss
+        // fault path both see it.
+        const was_empty = sig.pending.items.len == 0;
+        sig.pending.append(self.allocator, seq) catch return Error.OutOfMemory;
+        errdefer _ = sig.pending.pop();
+        if (was_empty) self.in_flight.append(self.allocator, gid) catch {
+            _ = sig.pending.pop();
+            return Error.OutOfMemory;
+        };
         self.inbox.append(self.allocator, .{
             .gid = gid,
+            .seq = seq,
             .id_str = sig.id_str,
             .payload = owned,
         }) catch {
-            // Roll the seq back so the counting binding stays exact.
-            sig.next_seq -= 1;
-            self.allocator.free(owned);
+            _ = sig.pending.pop();
+            if (was_empty) self.removeInFlightLocked(gid);
             return Error.OutOfMemory;
         };
+        sig.next_seq = seq;
         return seq;
+    }
+
+    /// Drop `gid` from `in_flight` (its pending FIFO emptied). Caller holds
+    /// `mutex`. O(in-flight count) — small.
+    fn removeInFlightLocked(self: *Bridge, gid: u64) void {
+        for (self.in_flight.items, 0..) |g, i| {
+            if (g == gid) {
+                _ = self.in_flight.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// Fault every in-flight seq for `gid` (a propose rejected on a
+    /// non-leader, or this node lost the group's leadership mid-flight):
+    /// raise `faulted_seq` to `next_seq` so parked workers fail fast, clear
+    /// the pending FIFO, and drop it from `in_flight`. Takes `mutex`.
+    fn faultTenant(self: *Bridge, gid: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const sig = self.groups.get(gid) orelse return;
+        if (sig.pending.items.len == 0) return;
+        sig.faulted_seq.store(sig.next_seq, .release);
+        sig.pending.clearRetainingCapacity();
+        self.removeInFlightLocked(gid);
     }
 
     // ── Watermarks (worker thread, lock-free) ────────────────────────
@@ -470,25 +570,59 @@ pub const Bridge = struct {
         if (self.drainControl()) did_work = true;
 
         // 2. Submit each drained propose to its tenant's group, creating
-        //    the group on first sight (drives it to leader).
+        //    the group on first sight. Single-node: this drives it to
+        //    leader. Multi-node: an already-formed group is found; if this
+        //    node is NOT the group's leader, `node.propose` rejects and we
+        //    FAULT the tenant's in-flight so the worker fails fast (503) and
+        //    the client retries against the leader node.
         for (batch.items) |item| {
             defer self.allocator.free(item.payload);
             _ = self.node.ensureGroup(item.gid, item.id_str) catch |e| {
                 std.log.warn("v2 bridge ensureGroup gid={d}: {s}", .{ item.gid, @errorName(e) });
+                self.faultTenant(item.gid);
                 continue;
             };
             self.node.propose(item.gid, item.payload) catch |e| {
                 std.log.warn("v2 bridge propose gid={d}: {s}", .{ item.gid, @errorName(e) });
+                self.faultTenant(item.gid);
             };
         }
 
         // 3. Drive one ready cycle: commits + applies + fires the commit
-        //    hook (which advances committed_seq).
+        //    hook (which advances committed_seq via the pending FIFO).
         const committed = self.node.pump() catch |e| {
             return e;
         };
         if (committed) did_work = true;
+
+        // 4. Leadership-loss sweep: fault in-flight tenants this node no
+        //    longer leads (an entry proposed here that will never commit
+        //    locally because leadership moved). O(in-flight), bounded per
+        //    cycle; the rest are swept next cycle.
+        self.sweepLostLeadership();
+
         return did_work;
+    }
+
+    /// Fault the in-flight proposes of any tenant this node no longer leads.
+    /// Snapshots `in_flight` under the lock, then checks leadership +
+    /// faults outside it (the Manager call + `faultTenant` each take their
+    /// own short critical sections). Pump-thread only.
+    fn sweepLostLeadership(self: *Bridge) void {
+        var snapshot: [32]u64 = undefined;
+        var n: usize = 0;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            for (self.in_flight.items) |g| {
+                if (n >= snapshot.len) break;
+                snapshot[n] = g;
+                n += 1;
+            }
+        }
+        for (snapshot[0..n]) |g| {
+            if (!self.node.isLeader(g)) self.faultTenant(g);
+        }
     }
 
     // ── Commit hook (pump thread, via node.applyCb) ──────────────────
@@ -501,15 +635,25 @@ pub const Bridge = struct {
     fn onCommitted(ctx: *anyopaque, group_id: u64, raft_index: u64) void {
         _ = raft_index;
         const self: *Bridge = @ptrCast(@alignCast(ctx));
-        const sig = self.sigFor(group_id) orelse {
-            // A committed entry for a group with no GroupSig is an
-            // invariant violation: every propose registered one first.
-            std.log.warn("v2 bridge commit for unregistered gid={d}", .{group_id});
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const sig = self.groups.get(group_id) orelse {
+            // A follower may apply a committed entry for a tenant it never
+            // had a local request for (so no GroupSig). That is normal
+            // replication, not an error — nothing to advance here.
             return;
         };
-        // Single writer (the pump thread), so a load+1+store is race-free.
-        const cur = sig.committed_seq.load(.monotonic);
-        sig.committed_seq.store(cur + 1, .release);
+        // Only the LEADER has local proposers parked on this watermark. A
+        // follower applying an entry replicated from another leader must NOT
+        // advance the watermark (there is no local waiter) nor pop the FIFO
+        // (it never pushed). This is the binding that counting could not
+        // express. On the leader, entries commit in propose (FIFO) order, so
+        // the front of `pending` is exactly this entry's seq.
+        if (!self.node.isLeader(group_id)) return;
+        if (sig.pending.items.len == 0) return; // e.g. a non-proposer no-op
+        const seq = sig.pending.orderedRemove(0);
+        sig.committed_seq.store(seq, .release);
+        if (sig.pending.items.len == 0) self.removeInFlightLocked(group_id);
     }
 };
 
@@ -700,6 +844,134 @@ test "bridge: move control — attach at epoch, quiesce holds writes, destroy re
     try testing.expectError(node_mod.Error.UnknownGroup, bridge.node.get(gid, "k"));
 
     bridge.stopPump();
+}
+
+test "bridge: gid is a deterministic hash of the tenant id" {
+    // The cross-node agreement property multi-node replication needs: the
+    // same tenant id maps to the same raft group id everywhere, distinct
+    // ids (almost surely) differ, and the id is never the reserved 0.
+    try testing.expectEqual(Bridge.tenantGid("alice"), Bridge.tenantGid("alice"));
+    try testing.expect(Bridge.tenantGid("alice") != Bridge.tenantGid("bob"));
+    try testing.expect(Bridge.tenantGid("anything") != 0);
+}
+
+test "Phase 5c: 3-bridge cluster replicates via the leader; a follower propose faults" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(root);
+
+    const voters = [_]u64{ 1, 2, 3 };
+    const dirs = [_][]u8{
+        try std.fmt.allocPrint(a, "{s}/b1", .{root}),
+        try std.fmt.allocPrint(a, "{s}/b2", .{root}),
+        try std.fmt.allocPrint(a, "{s}/b3", .{root}),
+    };
+    defer for (dirs) |d| a.free(d);
+
+    // Same PID-strided, bind-retry port allocation as the node test (this
+    // test also runs in parallel with sibling test binaries).
+    var bridges: [3]*Bridge = undefined;
+    var alive = [_]bool{ false, false, false };
+    defer for (bridges, 0..) |b, i| if (alive[i]) b.deinit();
+
+    const pid: u32 = @intCast(std.os.linux.getpid());
+    var attempt: u32 = 0;
+    while (attempt < 24) : (attempt += 1) {
+        const bp: u16 = @intCast(24000 + ((pid +% attempt *% 619) % 4000) * 8);
+        var ok = true;
+        for (0..3) |i| {
+            var peers: [3]node_mod.PeerAddr = undefined;
+            for (&peers, 0..) |*p, k| p.* = .{ .host = "127.0.0.1", .port = bp + @as(u16, @intCast(k)) };
+            const addr = std.net.Address.parseIp("127.0.0.1", bp + @as(u16, @intCast(i))) catch {
+                ok = false;
+                break;
+            };
+            bridges[i] = Bridge.initMultiNode(a, dirs[i], @intCast(i + 1), &voters, addr, &peers) catch {
+                ok = false;
+                break;
+            };
+            alive[i] = true;
+        }
+        if (ok) break;
+        for (0..3) |i| if (alive[i]) {
+            bridges[i].deinit();
+            alive[i] = false;
+        };
+    }
+    if (!(alive[0] and alive[1] and alive[2])) return error.SkipZigTest;
+
+    // Every node derives the SAME gid for the tenant.
+    const gid = try bridges[0].registerTenant("t");
+    try testing.expectEqual(gid, try bridges[1].registerTenant("t"));
+    try testing.expectEqual(gid, try bridges[2].registerTenant("t"));
+
+    // Form the group on all three. This test drives `pumpOnce` itself (the
+    // test thread IS the pump thread), so it touches the Node directly
+    // rather than the pump-thread control queue.
+    for (bridges) |b| _ = try b.node.ensureGroup(gid, "t");
+
+    var warm: u32 = 0;
+    while (warm < 150) : (warm += 1) {
+        for (bridges) |b| _ = try b.pumpOnce();
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try bridges[0].node.campaign(gid);
+
+    var leader: ?usize = null;
+    var spins: u32 = 0;
+    while (spins < 2000 and leader == null) : (spins += 1) {
+        for (bridges) |b| _ = try b.pumpOnce();
+        for (bridges, 0..) |b, i| if (b.node.isLeader(gid)) {
+            leader = i;
+        };
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(leader != null);
+
+    // Propose via the leader bridge; drive until every node's store applies
+    // it (apply_on_commit default — no real worker, so the pump writes).
+    var ws = WriteSet.init(a);
+    defer ws.deinit();
+    try ws.addPut("k", "v");
+    const env = try encodeWs(a, "t", &ws);
+    defer a.free(env);
+    const seq = try bridges[leader.?].propose(gid, env);
+
+    var done = false;
+    var s2: u32 = 0;
+    while (s2 < 2000 and !done) : (s2 += 1) {
+        for (bridges) |b| _ = try b.pumpOnce();
+        done = true;
+        for (bridges) |b| {
+            const v = b.node.get(gid, "k") catch {
+                done = false;
+                break;
+            };
+            a.free(v);
+        }
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(done);
+    // The leader's watermark advanced to EXACTLY the proposed seq (the
+    // pending-FIFO binding, not a count).
+    try testing.expectEqual(seq, bridges[leader.?].committedSeq(gid));
+
+    // A propose on a FOLLOWER faults (not leader) so a parked worker would
+    // fail fast and the client retry against the leader.
+    const follower = (leader.? + 1) % 3;
+    const fseq = try bridges[follower].propose(gid, env);
+    var faulted = false;
+    var s3: u32 = 0;
+    while (s3 < 2000 and !faulted) : (s3 += 1) {
+        for (bridges) |b| _ = try b.pumpOnce();
+        if (bridges[follower].faultedSeq(gid) >= fseq) faulted = true;
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(faulted);
+    // The follower never advanced a local watermark for the faulted write.
+    try testing.expect(bridges[follower].committedSeq(gid) < fseq);
 }
 
 test "bridge: createGroupEpoch requires a running pump thread" {

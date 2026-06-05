@@ -66,15 +66,25 @@ pub const CommitHook = struct {
 /// §Phase 2 leader-skip + the speculative overlay).
 pub const ApplyMode = enum {
     /// Decode a committed writeset and write it to the tenant's kvexp
-    /// store. The Phase-1 default and the future FOLLOWER role (Phase 5):
-    /// followers have no speculative overlay, so apply IS the write.
+    /// store. The Phase-1 default and the bare-node multi-node test: there
+    /// is no speculative overlay, so apply IS the write.
     apply_on_commit,
-    /// Single-node LEADER: the worker already wrote the entry into its own
-    /// `TrackedTxn` speculative overlay before proposing and commits that
-    /// overlay when the watermark advances — so the pump must NOT re-write
-    /// the store (it would double-apply on a second handle). The pump only
-    /// validates the envelope + advances the commit watermark.
+    /// Single-node LEADER (legacy): the worker already wrote the entry into
+    /// its own `TrackedTxn` speculative overlay before proposing and
+    /// commits that overlay when the watermark advances — so the pump must
+    /// NOT re-write the store (it would double-apply on a second handle).
+    /// Superseded by `worker_overlay` for the bridge (which is role-aware);
+    /// kept for any caller that wants an unconditional skip.
     leader_skip,
+    /// Worker-fronted multi-node (Phase 5): the apply behavior depends on
+    /// this node's role in the group. On the **leader**, the worker owns
+    /// the speculative overlay and commits it on watermark advance, so the
+    /// pump skips the store write (as `leader_skip`). On a **follower**,
+    /// there is no worker/overlay for this tenant here, so the pump must
+    /// write the committed entry to the store itself (as `apply_on_commit`)
+    /// — that is how followers stay in sync and how a tenant's data is
+    /// present on the survivors after a leader failure.
+    worker_overlay,
 };
 
 pub const Error = error{
@@ -144,11 +154,12 @@ pub const Node = struct {
     /// Set by the bridge; left null by the Phase-1 inline tests.
     commit_hook: ?CommitHook = null,
 
-    /// Whether committed entries write the store (`apply_on_commit`,
-    /// default) or only advance the watermark (`leader_skip`). The bridge
-    /// flips this to `leader_skip` when it fronts a worker that owns the
-    /// speculative overlay; the Phase-1 tests + the 2a bridge tests keep
-    /// the default so a read after commit sees the pump's write.
+    /// How committed entries apply (see `ApplyMode`): write the store
+    /// (`apply_on_commit`, default) vs. role-aware skip-on-leader
+    /// (`worker_overlay`, which the bridge sets when it fronts a worker
+    /// owning the speculative overlay). The Phase-1 tests + the bridge
+    /// unit tests keep the default so a read after commit sees the pump's
+    /// write.
     apply_mode: ApplyMode = .apply_on_commit,
 
     /// Stand up a single-node node (voter id 1, voter set `{1}`).
@@ -515,8 +526,16 @@ pub const Node = struct {
 
     fn applyEntry(self: *Node, group_id: u64, index: u64, bytes: []const u8) Error!void {
         const env = try envelope.decode(bytes);
-        if (self.apply_mode == .leader_skip) {
-            // Leader: the worker's TrackedTxn.commit is the durable write.
+        // Decide whether the pump writes the store, or only advances the
+        // watermark (the worker's TrackedTxn.commit is the durable write).
+        // `worker_overlay` makes that role-aware: skip on the leader (the
+        // worker wrote it), write on a follower (no worker here).
+        const skip_store = switch (self.apply_mode) {
+            .apply_on_commit => false,
+            .leader_skip => true,
+            .worker_overlay => self.mgr.isLeader(group_id),
+        };
+        if (skip_store) {
             // We still decode (above) so a stale/unknown envelope type
             // surfaces loudly, and bump applied_idx — but we do NOT touch
             // the store. Root writesets (no per-tenant group) are a no-op
