@@ -164,7 +164,7 @@ This is the heart of the rewrite.
 > `src-v2/cp/directory.zig`). Exit smoke `scripts/tenant_move_smoke.py` is
 > green: write → move → read-back, data intact, new cluster serves,
 > source evicted, routing flipped. Details: [`v2-phase4-tenant-move.md`](v2-phase4-tenant-move.md).
-> **The milestone is proven.** Next: Phase 5 (multi-node HA).
+> **The milestone is proven.** Phase 5 (multi-node HA) is now DONE too.
 
 - **New:** the move orchestration. Quiesce the tenant (directory marks it
   "moving" → router holds its writes; drain in-flight to
@@ -196,14 +196,16 @@ This is the heart of the rewrite.
 
 #### Phase 5 — Multi-node clusters (HA + durability) — launch-required
 
-> **IN PROGRESS (2026-06-04).** 5a (coalesced transport) + 5b (multi-node
-> Node election/replication/failover) `945962a` + 5c (multi-node bridge:
+> **DONE (2026-06-04).** 5a (coalesced transport) + 5b (multi-node Node
+> election/replication/failover) `945962a` + 5c (multi-node bridge:
 > deterministic gid, role-aware apply, FIFO seq binding + fault) `fb79732`
-> DONE + committed, green under `v2-test` (37/37): a 3-node group elects,
-> replicates, survives a leader kill, agrees on group ids, and faults a
-> follower's propose for client-retry-on-leader — over real loopback TCP.
-> Remaining: 5d move fan-out to all dest nodes, 5e rewind multi-node config
-> + 3-node smoke (leader-aware front-door routing).
+> + 5d (move fan-out to all dest nodes) + 5e (rewind multi-node config,
+> leader-aware front-door routing, Full-HA follower-apply store
+> unification, readset-frame apply fix, the 3-node smoke) — green under
+> `v2-test` (40/40). `scripts/three_node_smoke.py` moves a tenant onto a
+> 3-node destination, serves it leader-aware, kills the LEADER, and a
+> promoted follower serves the replicated data; a post-failover write
+> commits on the surviving quorum. Single-node milestone smokes still pass.
 > Details: [`v2-phase5-multinode.md`](v2-phase5-multinode.md).
 
 - **New:** cross-node transport; form per-tenant groups across 3 nodes;
@@ -214,8 +216,10 @@ This is the heart of the rewrite.
   messages plus epoch stamps (learnings §3.3); shared blob backend.
 - **Done:** `step_fenced` / `stepBatch` (epoch enforced on the coalesced
   fast path), `takeMessages`.
-- **Exit:** 3-node cluster; a tenant survives a node failure; a move
-  targets a 3-node destination. Canonical 3-node smoke.
+- **Exit (met):** 3-node cluster; a tenant survives a node failure
+  (leader kill → promoted follower serves the replicated data via the
+  unified follower-apply store); a move targets a 3-node destination.
+  `scripts/three_node_smoke.py`.
 - **~2–3 weeks.**
 
 #### Phase 6 — Scale: hibernation / active-set (K = thousands of tenants)

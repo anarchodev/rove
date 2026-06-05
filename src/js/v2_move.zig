@@ -89,6 +89,8 @@ pub fn tryHandleV2(
         try handleEvict(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-resume")) {
         try handleResume(server, allocator, worker, ent, sid, sess, method, body);
+    } else if (std.mem.eql(u8, sys_rest, "v2-leader")) {
+        try handleLeader(server, allocator, worker, ent, sid, sess, method, path);
     } else {
         try respb.setSystemResponse(server, ent, sid, sess, 404, "unknown v2 move endpoint\n", allocator, null, null);
     }
@@ -142,6 +144,19 @@ fn handleKv(
     if (std.mem.indexOfScalar(u8, key, 0) != null or std.mem.indexOfScalar(u8, value, 0) != null)
         return reply(server, allocator, ent, sid, sess, 400, "key/value contains NUL\n");
 
+    // Leader gate (Phase 5 multi-node): only the tenant's group leader may
+    // take the write. A follower would otherwise commit to its own `inst.kv`
+    // speculatively and then fault the propose (not leader) WITHOUT rolling
+    // that local write back (this immediate-commit endpoint, unlike the
+    // parked customer path, has no undo) — diverging the follower. Reject
+    // fast instead so the front door retries the leader. Registering first
+    // is idempotent and makes `isLeaderOf` resolvable on a single node (the
+    // sole voter leads every group, so this is always true there).
+    const gid = worker.raft.registerTenant(tenant) catch
+        return reply(server, allocator, ent, sid, sess, 500, "register failed\n");
+    if (!worker.raft.isLeaderOf(gid))
+        return reply(server, allocator, ent, sid, sess, 503, "not leader; retry the cluster leader\n");
+
     // Provision the instance on first sight (the source cluster's tenant
     // store is born here), then write through the real propose path: an
     // immediate kvexp commit followed by a raft propose the move's bundle
@@ -193,6 +208,14 @@ fn handleBundle(
 
     const gid = worker.raft.gidForTenant(tenant) orelse
         return reply(server, allocator, ent, sid, sess, 409, "tenant not active on this cluster\n");
+
+    // Leader gate (Phase 5 multi-node): the bundle must be dumped from the
+    // node that leads the tenant's group — the only node taking live writes,
+    // so quiescing it is what makes the snapshot a consistent point. A
+    // follower 421s so the front door's bundle step retries the next node.
+    // Single node → always leader, so the milestone path is unchanged.
+    if (!worker.raft.isLeaderOf(gid))
+        return reply(server, allocator, ent, sid, sess, 421, "not the leader for this tenant; try another node\n");
 
     // Quiesce: stop admitting writes, then wait for in-flight to drain to
     // applied == committed so the dump is a consistent point.
@@ -298,6 +321,37 @@ fn handleResume(
     defer allocator.free(tenant);
     if (worker.raft.gidForTenant(tenant)) |gid| worker.raft.unquiesce(gid);
     try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
+}
+
+// ── v2-leader: per-tenant leadership probe ───────────────────────────
+
+/// `GET /_system/v2-leader?tenant=…` → 200 if this node leads the tenant's
+/// raft group, 503 if it is a follower, 404 if the tenant is not active on
+/// this node. The move orchestrator polls every destination node after the
+/// attach fan-out until one reports 200 — i.e. the freshly formed group has
+/// elected — before flipping the directory, so post-move traffic finds a
+/// leader immediately instead of cycling 503s through an un-elected group.
+fn handleLeader(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    path: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "GET"))
+        return reply(server, allocator, ent, sid, sess, 405, "GET only\n");
+    const tenant = queryParam(path, "tenant") orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing ?tenant\n");
+    const gid = worker.raft.gidForTenant(tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
+    if (worker.raft.isLeaderOf(gid)) {
+        try respb.setSystemResponse(server, ent, sid, sess, 200, "leader\n", allocator, null, null);
+    } else {
+        try respb.setSystemResponse(server, ent, sid, sess, 503, "follower\n", allocator, null, null);
+    }
 }
 
 // ── helpers ──────────────────────────────────────────────────────────

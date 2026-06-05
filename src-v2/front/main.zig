@@ -167,7 +167,6 @@ const Router = struct {
     }
 
     fn processRequests(self: *Router, server: *FrontH2) !void {
-        const a = self.allocator;
         const entities = server.request_out.entitySlice();
         const sids = server.request_out.column(h2.StreamId);
         const sessions = server.request_out.column(h2.Session);
@@ -211,41 +210,78 @@ const Router = struct {
                 try replyStatus(server, ent, sid, sess, 503);
                 continue;
             }
-            const cluster = resolution.cluster;
-
-            // 2. Build the backend forward.
             const method_s = headerValue(rh, ":method") orelse "GET";
-            const path = req_path;
             const method = methodFrom(method_s) orelse {
                 try replyStatus(server, ent, sid, sess, 405);
                 continue;
             };
-            const url = try std.fmt.allocPrint(a, "{s}{s}", .{ cluster.base_url, path });
+
+            // 2. Forward to the cluster, leader-aware (Phase 5). A
+            //    multi-node cluster has N node origins but only the tenant's
+            //    group leader takes writes; a follower 503s a write (the
+            //    bridge faults a non-leader propose), so try nodes in order
+            //    and stop at the first non-503. A single-node cluster has
+            //    one node — one attempt, unchanged from the milestone.
+            try self.proxyToCluster(server, ent, sid, sess, rh, rb, req_path, authority, method, resolution.cluster.nodes);
+        }
+    }
+
+    /// Reverse-proxy one request to whichever node of `nodes` currently
+    /// leads the tenant's group, discovered by retrying on 503 (a follower's
+    /// not-leader response). Relays the first non-503 backend response (or
+    /// the last 503 if every node is a follower / mid-election — the client
+    /// retries). A transport error against one node falls through to the
+    /// next; all-failed → 502. The forward headers + body are built once and
+    /// reused across node attempts (a retried write re-POSTs the same body —
+    /// safe, since only the leader commits it).
+    fn proxyToCluster(
+        self: *Router,
+        server: *FrontH2,
+        ent: rove.Entity,
+        sid: h2.StreamId,
+        sess: h2.Session,
+        rh: h2.ReqHeaders,
+        rb: h2.ReqBody,
+        path: []const u8,
+        authority: []const u8,
+        method: curl.Method,
+        nodes: []const []const u8,
+    ) !void {
+        const a = self.allocator;
+
+        // Forward non-pseudo request headers, overriding Host to the
+        // original authority so the backend resolves the same domain.
+        var fwd_headers: std.ArrayListUnmanaged(curl.Header) = .empty;
+        defer fwd_headers.deinit(a);
+        try fwd_headers.append(a, .{ .name = "Host", .value = authority });
+        if (rh.fields) |fields| {
+            var i: u32 = 0;
+            while (i < rh.count) : (i += 1) {
+                const f = fields[i];
+                const fname = f.name[0..f.name_len];
+                if (fname.len > 0 and fname[0] == ':') continue; // pseudo
+                if (std.ascii.eqlIgnoreCase(fname, "host")) continue; // set above
+                if (isHopByHop(fname)) continue;
+                try fwd_headers.append(a, .{ .name = fname, .value = f.value[0..f.value_len] });
+            }
+        }
+        const body: []const u8 = if (rb.data) |d| d[0..rb.len] else &.{};
+
+        // The relay state we keep from the chosen attempt (owned body copy
+        // freed by the registry via RespBody.deinit).
+        var have_resp = false;
+        var relay_status: u16 = 502;
+        var relay_data: ?[*]u8 = null;
+        var relay_len: u32 = 0;
+
+        for (nodes, 0..) |node_base, ni| {
+            const last = ni + 1 == nodes.len;
+            const url = try std.fmt.allocPrint(a, "{s}{s}", .{ node_base, path });
             defer a.free(url);
 
-            // Forward non-pseudo request headers, overriding Host to the
-            // original authority so the backend resolves the same domain.
-            var fwd_headers: std.ArrayListUnmanaged(curl.Header) = .empty;
-            defer fwd_headers.deinit(a);
-            try fwd_headers.append(a, .{ .name = "Host", .value = authority });
-            if (rh.fields) |fields| {
-                var i: u32 = 0;
-                while (i < rh.count) : (i += 1) {
-                    const f = fields[i];
-                    const fname = f.name[0..f.name_len];
-                    if (fname.len > 0 and fname[0] == ':') continue; // pseudo
-                    if (std.ascii.eqlIgnoreCase(fname, "host")) continue; // set above
-                    if (isHopByHop(fname)) continue;
-                    try fwd_headers.append(a, .{ .name = fname, .value = f.value[0..f.value_len] });
-                }
-            }
-
-            const body: []const u8 = if (rb.data) |d| d[0..rb.len] else &.{};
-
-            // 3. Blocking forward (Phase-3 simplification — see file header).
             var easy = curl.Easy.init(a) catch {
-                try replyStatus(server, ent, sid, sess, 502);
-                continue;
+                if (!last) continue;
+                break;
             };
             defer easy.deinit();
             var resp = easy.request(a, .{
@@ -257,34 +293,44 @@ const Router = struct {
                 .verify_tls = false,
             }) catch |e| {
                 std.log.warn("front: forward {s} → {s} failed: {s}", .{ authority, url, @errorName(e) });
-                try replyStatus(server, ent, sid, sess, 502);
-                continue;
+                if (!last) continue;
+                break;
             };
             defer resp.deinit(a);
 
-            // 4. Relay status + body back over h2. Body bytes are copied
-            //    into a fresh alloc the registry frees via RespBody.deinit.
-            var resp_data: ?[*]u8 = null;
-            var resp_len: u32 = 0;
-            if (resp.body) |b| {
-                if (b.len > 0) {
-                    const copy = a.alloc(u8, b.len) catch {
-                        try replyStatus(server, ent, sid, sess, 502);
-                        continue;
+            // A 503 from a non-last node means "not the leader" — try next.
+            if (resp.status == 503 and !last) continue;
+
+            // Relay this response: copy the body into a registry-owned alloc.
+            relay_status = resp.status;
+            relay_data = null;
+            relay_len = 0;
+            if (resp.body) |bdy| {
+                if (bdy.len > 0) {
+                    const copy = a.alloc(u8, bdy.len) catch {
+                        if (!last) continue;
+                        break;
                     };
-                    @memcpy(copy, b);
-                    resp_data = copy.ptr;
-                    resp_len = @intCast(b.len);
+                    @memcpy(copy, bdy);
+                    relay_data = copy.ptr;
+                    relay_len = @intCast(bdy.len);
                 }
             }
-            try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = resp.status });
-            try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = null, .count = 0 });
-            try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = resp_data, .len = resp_len });
-            try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-            try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-            try server.reg.set(ent, &server.request_out, h2.Session, sess);
-            try server.reg.move(ent, &server.request_out, &server.response_in);
+            have_resp = true;
+            break;
         }
+
+        if (!have_resp) {
+            try replyStatus(server, ent, sid, sess, 502);
+            return;
+        }
+        try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = relay_status });
+        try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = null, .count = 0 });
+        try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = relay_data, .len = relay_len });
+        try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
+        try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+        try server.reg.set(ent, &server.request_out, h2.Session, sess);
+        try server.reg.move(ent, &server.request_out, &server.response_in);
     }
 
     // ── Control plane: tenant-move orchestration ─────────────────────
@@ -359,6 +405,10 @@ const Router = struct {
             try replyStatus(server, ent, sid, sess, 400); // unknown dest cluster
             return;
         };
+        // The node lists are pointer-stable for the directory's lifetime, so
+        // these slices stay valid across the blocking backend calls below.
+        const src_nodes = src.nodes;
+        const dest_nodes = dest_ref.nodes;
 
         const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch {
             try replyStatus(server, ent, sid, sess, 500);
@@ -371,33 +421,37 @@ const Router = struct {
             return;
         };
 
-        // 1. Quiesce + dump the source (server-side quiesce inside v2-bundle).
-        var dump = self.backendCall(src.base_url, "/_system/v2-bundle", .POST, tbody, null) catch {
-            self.resumeSource(tenant, src.base_url, tbody);
+        // 1. Quiesce + dump the source LEADER (v2-bundle is leader-gated —
+        //    a follower 421s, so try each source node until one returns the
+        //    bundle). Single-node source → one node, the leader.
+        var dump = self.bundleFromLeader(src_nodes, tbody) orelse {
+            self.resumeAll(tenant, src_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;
         };
         defer dump.deinit(a);
-        if (dump.status != 200) {
-            self.resumeSource(tenant, src.base_url, tbody);
+
+        // 2. Attach on EVERY destination node (the group is formed across the
+        //    whole destination cluster: each node loads the bundle + creates
+        //    its incarnation at the migration epoch). All must 204; on any
+        //    failure, evict the nodes that did attach + resume the source.
+        if (!self.attachToAll(dest_nodes, dump.body, tenant)) {
+            self.evictAll(tenant, dest_nodes, tbody);
+            self.resumeAll(tenant, src_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;
         }
 
-        // 2. Attach on the destination (load bundle + group at the move epoch).
-        var att = self.backendCall(dest_ref.base_url, "/_system/v2-attach", .POST, dump.body, tenant) catch {
-            self.resumeSource(tenant, src.base_url, tbody);
-            try replyStatus(server, ent, sid, sess, 502);
-            return;
-        };
-        defer att.deinit(a);
-        if (att.status != 204) {
-            self.resumeSource(tenant, src.base_url, tbody);
-            try replyStatus(server, ent, sid, sess, 502);
+        // 3. Await the freshly formed destination group's election so
+        //    post-move traffic finds a leader immediately (v2-leader polls).
+        if (!self.awaitDestLeader(dest_nodes, tenant)) {
+            self.evictAll(tenant, dest_nodes, tbody);
+            self.resumeAll(tenant, src_nodes, tbody);
+            try replyStatus(server, ent, sid, sess, 504);
             return;
         }
 
-        // 3. Flip the directory — the atomic commit point of the move.
+        // 4. Flip the directory — the atomic commit point of the move.
         self.directory.move(tenant, dest) catch {
             // Both tenant + dest were validated above; a failure here is
             // an invariant violation. Leave moving-held + surface 500.
@@ -405,15 +459,11 @@ const Router = struct {
             return;
         };
 
-        // 4. Evict the source (destroy its group + drop the instance).
-        //    Best-effort: the move already committed; a stale source group
-        //    is reclaimed lazily and never serves traffic again.
-        if (self.backendCall(src.base_url, "/_system/v2-evict", .POST, tbody, null)) |ev| {
-            var e2 = ev;
-            e2.deinit(a);
-        } else |err| {
-            std.log.warn("front: post-move evict of {s} on {s} failed: {s}", .{ tenant, src.id, @errorName(err) });
-        }
+        // 5. Evict the source on EVERY source node (destroy each group
+        //    incarnation + drop the instance). Best-effort: the move already
+        //    committed; a stale source group is reclaimed lazily and never
+        //    serves traffic again.
+        self.evictAll(tenant, src_nodes, tbody);
 
         const msg = std.fmt.allocPrint(a, "moved {s}: {s} -> {s}\n", .{ tenant, src.id, dest }) catch {
             try replyStatus(server, ent, sid, sess, 200);
@@ -422,16 +472,93 @@ const Router = struct {
         try replyText(server, ent, sid, sess, 200, msg);
     }
 
-    /// Abort path: revert the directory hold + resume the source cluster
-    /// (lift its quiesce) so a failed move leaves the tenant serving where
-    /// it started. Best-effort — logs but does not surface resume errors.
-    fn resumeSource(self: *Router, tenant: []const u8, src_base: []const u8, tbody: []const u8) void {
+    /// Try each source node's leader-gated `/_system/v2-bundle` until one
+    /// returns 200 (the group leader) and hand back its bundle body. A
+    /// follower 421s (no quiesce taken there). Null if no node produced a
+    /// bundle (none is the leader / all unreachable). The caller owns the
+    /// returned `BackendResp`.
+    fn bundleFromLeader(self: *Router, src_nodes: []const []const u8, tbody: []const u8) ?BackendResp {
+        const a = self.allocator;
+        for (src_nodes) |base| {
+            const resp = self.backendCall(base, "/_system/v2-bundle", .POST, tbody, null) catch |err| {
+                std.log.warn("front: v2-bundle on {s} failed: {s}", .{ base, @errorName(err) });
+                continue;
+            };
+            if (resp.status == 200) return resp;
+            var r = resp;
+            r.deinit(a); // 421 follower / other — try the next node
+        }
+        return null;
+    }
+
+    /// Fan a `/_system/v2-attach` (bundle + `X-Rewind-Tenant`) out to every
+    /// destination node. True only if all returned 204 (idempotent
+    /// re-attach included). On the first failure returns false; the caller
+    /// evicts the partially-attached set.
+    fn attachToAll(self: *Router, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8) bool {
+        const a = self.allocator;
+        for (dest_nodes) |base| {
+            const resp = self.backendCall(base, "/_system/v2-attach", .POST, bundle, tenant) catch |err| {
+                std.log.warn("front: v2-attach on {s} failed: {s}", .{ base, @errorName(err) });
+                return false;
+            };
+            var r = resp;
+            defer r.deinit(a);
+            if (r.status != 204) {
+                std.log.warn("front: v2-attach on {s} → {d}", .{ base, r.status });
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Poll every destination node's `/_system/v2-leader?tenant=…` until one
+    /// reports 200 (the formed group elected a leader), bounded by a wall
+    /// deadline. True once a leader is seen; false on timeout.
+    fn awaitDestLeader(self: *Router, dest_nodes: []const []const u8, tenant: []const u8) bool {
+        const a = self.allocator;
+        const suffix = std.fmt.allocPrint(a, "/_system/v2-leader?tenant={s}", .{tenant}) catch return false;
+        defer a.free(suffix);
+        const deadline: i128 = std.time.nanoTimestamp() + 15 * std.time.ns_per_s;
+        while (std.time.nanoTimestamp() < deadline) {
+            for (dest_nodes) |base| {
+                const resp = self.backendCall(base, suffix, .GET, "", null) catch continue;
+                var r = resp;
+                r.deinit(a);
+                if (r.status == 200) return true;
+            }
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+        }
+        return false;
+    }
+
+    /// Best-effort `/_system/v2-evict` to every node of a cluster (the move
+    /// committed, or we are unwinding a partial attach). Logs failures.
+    fn evictAll(self: *Router, tenant: []const u8, nodes: []const []const u8, tbody: []const u8) void {
+        const a = self.allocator;
+        for (nodes) |base| {
+            if (self.backendCall(base, "/_system/v2-evict", .POST, tbody, null)) |ev| {
+                var e2 = ev;
+                e2.deinit(a);
+            } else |err| {
+                std.log.warn("front: evict {s} on {s} failed: {s}", .{ tenant, base, @errorName(err) });
+            }
+        }
+    }
+
+    /// Abort path: revert the directory hold + resume EVERY source node (lift
+    /// the leader's quiesce; a no-op on followers that never quiesced) so a
+    /// failed move leaves the tenant serving where it started. Best-effort.
+    fn resumeAll(self: *Router, tenant: []const u8, src_nodes: []const []const u8, tbody: []const u8) void {
+        const a = self.allocator;
         self.directory.abortMove(tenant) catch {};
-        if (self.backendCall(src_base, "/_system/v2-resume", .POST, tbody, null)) |r| {
-            var rr = r;
-            rr.deinit(self.allocator);
-        } else |err| {
-            std.log.warn("front: resume source {s} ({s}) failed: {s}", .{ tenant, src_base, @errorName(err) });
+        for (src_nodes) |base| {
+            if (self.backendCall(base, "/_system/v2-resume", .POST, tbody, null)) |r| {
+                var rr = r;
+                rr.deinit(a);
+            } else |err| {
+                std.log.warn("front: resume source {s} ({s}) failed: {s}", .{ tenant, base, @errorName(err) });
+            }
         }
     }
 

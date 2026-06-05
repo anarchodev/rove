@@ -50,6 +50,23 @@ pub const KvStore = kvstore.KvStore;
 pub const WriteSet = writeset.WriteSet;
 pub const Envelope = envelope.Envelope;
 
+/// Resolves the per-tenant store a FOLLOWER's replicated entries apply to
+/// in `worker_overlay` mode (Phase 5 "Full HA"). Without it, a follower
+/// writes the node's own `slot.store` — a file the worker never reads, so
+/// a follower promoted to leader would serve from an empty serving store.
+/// The bridge sets this (via `setStoreResolver`) to point at the worker's
+/// own per-tenant `inst.kv`, provisioned on demand, so a follower's
+/// replicated writes land in the SAME store the worker serves from. The
+/// resolver runs on the pump thread; the worker's `Tenant` is internally
+/// locked, so on-demand provisioning is safe there. `group_id` + `id_str`
+/// identify the tenant (the worker keys its instance store on `id_str`).
+/// Returns null only on a provisioning failure (treated as a missing
+/// group — an invariant violation surfaced by the apply round).
+pub const StoreResolver = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, group_id: u64, id_str: []const u8) ?*KvStore,
+};
+
 /// Fired once per committed *real* entry (writeset / multi / root —
 /// not the leader's empty election no-op), AFTER it has applied, with
 /// the entry's raft index. The bridge (`bridge.zig`) uses this to bind
@@ -162,6 +179,12 @@ pub const Node = struct {
     /// write.
     apply_mode: ApplyMode = .apply_on_commit,
 
+    /// Optional follower-apply store resolver (see `StoreResolver`). Set by
+    /// the bridge in `worker_overlay` mode so a follower's replicated writes
+    /// land in the worker's own serving store (Phase 5 "Full HA"). Null in
+    /// the bare-node tests, which read the node's own `slot.store`.
+    store_resolver: ?StoreResolver = null,
+
     /// Stand up a single-node node (voter id 1, voter set `{1}`).
     pub fn initSingleNode(allocator: std.mem.Allocator, data_dir: []const u8) Error!*Node {
         return Node.init(allocator, data_dir, 1, &.{1});
@@ -193,8 +216,10 @@ pub const Node = struct {
     }
 
     /// True when this node is the sole voter (no transport, campaign at
-    /// group birth). Multi-node nodes elect via ticks.
-    fn isSingleNode(self: *const Node) bool {
+    /// group birth). Multi-node nodes elect via ticks. Public so the bridge
+    /// can answer `isLeaderOf` true for every group on a single-node node
+    /// (the sole voter leads every group it ever creates).
+    pub fn isSingleNode(self: *const Node) bool {
         return self.voters.len == 1;
     }
 
@@ -361,8 +386,12 @@ pub const Node = struct {
         try self.mgr.campaign(tenant_id);
     }
 
-    /// Whether this node is the raft leader of `tenant_id`'s group.
+    /// Whether this node is the raft leader of `tenant_id`'s group. False
+    /// for a group this node has not created yet (a tenant the bridge has
+    /// `registerTenant`'d but whose `createGroupEpoch`/`ensureGroup` has not
+    /// run here) — guarding the Manager read against an unknown group id.
     pub fn isLeader(self: *const Node, tenant_id: u64) bool {
+        if (self.groups.get(tenant_id) == null) return false;
         return self.mgr.isLeader(tenant_id);
     }
 
@@ -546,7 +575,11 @@ pub const Node = struct {
         switch (env.type) {
             .writeset => {
                 const slot = self.groups.get(group_id) orelse return Error.UnknownGroup;
-                try writeset.applyEncoded(slot.store, index, env.payload);
+                const store = self.writeStore(slot) orelse return Error.UnknownGroup;
+                // Strip the readset frame; apply the writeset bytes (the
+                // readset rides for the tape, not the store).
+                const wp = try envelope.decodeWriteSetPayload(env.payload);
+                try writeset.applyEncoded(store, index, wp.ws_bytes);
                 slot.applied_idx = index;
             },
             .multi => {
@@ -560,7 +593,9 @@ pub const Node = struct {
                             // Phase 1 the only stores that exist are this
                             // node's, so route by the same group's slot.
                             const slot = self.groups.get(group_id) orelse return Error.UnknownGroup;
-                            try writeset.applyEncoded(slot.store, index, ie.payload);
+                            const store = self.writeStore(slot) orelse return Error.UnknownGroup;
+                            const wp = try envelope.decodeWriteSetPayload(ie.payload);
+                            try writeset.applyEncoded(store, index, wp.ws_bytes);
                             slot.applied_idx = index;
                         },
                         .multi => return envelope.Error.NestedMulti,
@@ -575,6 +610,22 @@ pub const Node = struct {
             // only, so a stray root_writeset is an invariant violation.
             .root_writeset => return Error.UnknownGroup,
         }
+    }
+
+    /// The store a follower's (or `apply_on_commit`'s) committed writeset
+    /// applies to. In `worker_overlay` mode with a `store_resolver` set
+    /// (the bridge fronting a worker), this is the worker's own per-tenant
+    /// serving store — so a follower's replicated writes land in the SAME
+    /// store the worker serves from, and a follower promoted to leader
+    /// serves the data it replicated (Phase 5 "Full HA"). Without a resolver
+    /// (the bare-node multi-node + Phase-1 tests) it is the node's own slot
+    /// store. Null only when the resolver fails to provision (→ surfaced as
+    /// `UnknownGroup` by the caller).
+    fn writeStore(self: *Node, slot: *TenantSlot) ?*KvStore {
+        if (self.apply_mode == .worker_overlay) {
+            if (self.store_resolver) |r| return r.func(r.ctx, slot.tenant_id, slot.id_str);
+        }
+        return slot.store;
     }
 
     /// Context for `sendMsgCb`: which group's outbox is being drained (so

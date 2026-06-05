@@ -66,6 +66,8 @@ const node_mod = @import("node.zig");
 
 pub const Node = node_mod.Node;
 pub const WriteSet = node_mod.WriteSet;
+pub const PeerAddr = node_mod.PeerAddr;
+pub const StoreResolver = node_mod.StoreResolver;
 
 pub const Error = error{
     /// `propose` / `committedSeq` named a gid with no registered tenant.
@@ -104,6 +106,13 @@ pub const GroupSig = struct {
     /// this node loses the group's leadership, faults so the worker fails
     /// fast (503) and the client retries against the new leader.
     faulted_seq: std.atomic.Value(u64) = .init(0),
+    /// This node's leadership of the group, refreshed once per pump cycle by
+    /// the pump thread (the only Manager toucher) and read lock-free by the
+    /// worker thread via `isLeaderOf`. The worker MUST NOT call the
+    /// non-thread-safe `Manager` directly, so leadership is published here as
+    /// an atomic; one pump cycle stale at worst (fine for the rare move /
+    /// leader-probe callers that read it).
+    is_leader: std.atomic.Value(bool) = .init(false),
     /// FIFO of proposed-but-not-yet-committed seqs (front = oldest), the
     /// explicit per-entry seq↔commit binding that replaces Phase-2's
     /// counting (multi-node breaks counting: a follower applies entries
@@ -226,6 +235,19 @@ pub const Bridge = struct {
     /// default `apply_on_commit`.
     pub fn setWorkerOverlay(self: *Bridge) void {
         self.node.apply_mode = .worker_overlay;
+    }
+
+    /// Point follower-apply at the worker's own per-tenant serving store
+    /// (Phase 5 "Full HA"). In `worker_overlay` mode a follower has no local
+    /// worker for the tenant, so its replicated writes must land in the
+    /// store a worker WOULD serve from — the worker's `inst.kv`, provisioned
+    /// on demand — so that a follower promoted to leader after a failover
+    /// serves the data it replicated. The worker (`rewind`) wires this to
+    /// its `Tenant`. Without it a follower writes the node's own (unserved)
+    /// slot store. Call before serving; safe to leave unset (the bare-node
+    /// tests do). See `node_mod.StoreResolver`.
+    pub fn setStoreResolver(self: *Bridge, resolver: node_mod.StoreResolver) void {
+        self.node.store_resolver = resolver;
     }
 
     /// Stop the pump (if running), then free the node + all bridge state.
@@ -412,6 +434,24 @@ pub const Bridge = struct {
     pub fn isLeader(self: *Bridge) bool {
         _ = self;
         return true;
+    }
+
+    /// Per-group leadership (Phase 5 multi-node). True when this node is the
+    /// raft leader of `gid`'s group — used to leader-gate the move surface
+    /// (`v2-bundle` / `v2-kv` PUT reject fast on a follower so the front
+    /// door retries the leader, avoiding a non-leader speculative write that
+    /// never replicates) and to let the move orchestrator await a freshly
+    /// formed destination group's election (`v2-leader`). On a SINGLE-node
+    /// node the sole voter leads every group it creates, so this is
+    /// unconditionally true (matching the no-arg `isLeader`); the per-group
+    /// `mgr.isLeader` would otherwise read false for a tenant whose group
+    /// has not yet been lazily created on the single node. Reads the
+    /// pump-published `is_leader` atomic (never the Manager directly), so it
+    /// is worker-thread-safe and one pump cycle stale at worst.
+    pub fn isLeaderOf(self: *Bridge, gid: u64) bool {
+        if (self.node.isSingleNode()) return true;
+        const sig = self.sigFor(gid) orelse return false;
+        return sig.is_leader.load(.acquire);
     }
 
     // ── Move control (any thread; executes on the pump thread) ───────
@@ -601,7 +641,25 @@ pub const Bridge = struct {
         //    cycle; the rest are swept next cycle.
         self.sweepLostLeadership();
 
+        // 5. Publish each group's leadership for the worker thread (which
+        //    must not touch the Manager). O(groups) per cycle — the same
+        //    order as the active-set tick; pre-hibernation that is fine.
+        self.refreshLeadership();
+
         return did_work;
+    }
+
+    /// Refresh every registered group's `is_leader` atomic from the Manager.
+    /// Pump-thread only (reads the Manager). Held under the bridge mutex —
+    /// brief; no commit hook re-enters here (we are past `node.pump`). The
+    /// worker reads these atomics lock-free via `isLeaderOf`.
+    fn refreshLeadership(self: *Bridge) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var it = self.groups.iterator();
+        while (it.next()) |e| {
+            e.value_ptr.*.is_leader.store(self.node.isLeader(e.key_ptr.*), .release);
+        }
     }
 
     /// Fault the in-flight proposes of any tenant this node no longer leads.
