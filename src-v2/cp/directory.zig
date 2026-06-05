@@ -71,7 +71,18 @@ pub const Placement = struct {
     /// Index into `clusters` (the cluster currently serving this tenant).
     cluster_idx: usize,
 
-    pub const State = enum { active };
+    /// `active` — the tenant is served normally by `cluster_idx`.
+    /// `moving` — a move is in flight: the bundle is shipping to the
+    /// destination, so the front door holds the tenant's requests (503)
+    /// until `move` flips placement (or `abortMove` reverts to active).
+    pub const State = enum { active, moving };
+};
+
+/// What `resolve` hands the router: the cluster currently responsible for
+/// a tenant plus whether the tenant is mid-move (hold its traffic).
+pub const Resolution = struct {
+    cluster: ClusterRef,
+    moving: bool,
 };
 
 pub const Directory = struct {
@@ -181,11 +192,54 @@ pub const Directory = struct {
     /// hot-path read. Returns the `ClusterRef` by value; its slices are
     /// pointer-stable, so the caller may hold them past the lock.
     pub fn clusterFor(self: *Directory, tenant_id: []const u8) ?ClusterRef {
+        return if (self.resolve(tenant_id)) |r| r.cluster else null;
+    }
+
+    /// Hot-path read with move state: the serving cluster plus whether the
+    /// tenant is mid-move. The router holds (503) a `moving` tenant's
+    /// requests. Slices are pointer-stable; safe to hold past the lock.
+    pub fn resolve(self: *Directory, tenant_id: []const u8) ?Resolution {
         self.mutex.lock();
         defer self.mutex.unlock();
         const p = self.placements.get(tenant_id) orelse return null;
         const c = self.clusters.items[p.cluster_idx];
+        return .{
+            .cluster = .{ .id = c.id, .base_url = c.base_url },
+            .moving = p.state == .moving,
+        };
+    }
+
+    /// Resolve a cluster id to its `ClusterRef` (the move orchestrator
+    /// needs the destination cluster's `base_url`). Null if unknown.
+    pub fn clusterById(self: *Directory, cluster_id: []const u8) ?ClusterRef {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const idx = self.cluster_idx.get(cluster_id) orelse return null;
+        const c = self.clusters.items[idx];
         return .{ .id = c.id, .base_url = c.base_url };
+    }
+
+    // ── Move state (control plane writes; front door orchestration) ──
+
+    /// Mark a tenant `moving` — the front door holds its requests while
+    /// its bundle ships to the destination. The placement still points at
+    /// the source cluster (so an abort just reverts to `active`). Rejects
+    /// an unknown tenant (a move presupposes an existing placement).
+    pub fn beginMove(self: *Directory, tenant_id: []const u8) Error!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const p = self.placements.getPtr(tenant_id) orelse return Error.UnknownTenant;
+        p.state = .moving;
+    }
+
+    /// Revert a `beginMove` without changing placement — the move failed
+    /// before the directory flip, so the tenant resumes on its source
+    /// cluster. Rejects an unknown tenant.
+    pub fn abortMove(self: *Directory, tenant_id: []const u8) Error!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const p = self.placements.getPtr(tenant_id) orelse return Error.UnknownTenant;
+        p.state = .active;
     }
 
     // ── Static config seeding ────────────────────────────────────────
@@ -260,6 +314,43 @@ test "directory: move flips placement (the Phase-4 seam)" {
     try testing.expectEqualStrings("c2", dir.clusterFor("t").?.id);
     // base_url follows the new cluster.
     try testing.expectEqualStrings("http://h:2", dir.clusterFor("t").?.base_url);
+}
+
+test "directory: beginMove holds, move flips, abort reverts" {
+    var dir = Directory.init(testing.allocator);
+    defer dir.deinit();
+    try dir.addCluster("c1", "http://h:1");
+    try dir.addCluster("c2", "http://h:2");
+    try dir.assign("t", "c1");
+
+    // Active on c1.
+    var r = dir.resolve("t").?;
+    try testing.expectEqualStrings("c1", r.cluster.id);
+    try testing.expect(!r.moving);
+
+    // beginMove holds traffic but keeps the source placement.
+    try dir.beginMove("t");
+    r = dir.resolve("t").?;
+    try testing.expectEqualStrings("c1", r.cluster.id);
+    try testing.expect(r.moving);
+
+    // The directory flip commits the move: now active on c2.
+    try dir.move("t", "c2");
+    r = dir.resolve("t").?;
+    try testing.expectEqualStrings("c2", r.cluster.id);
+    try testing.expect(!r.moving);
+
+    // A second move that aborts reverts to the (now) source c2.
+    try dir.beginMove("t");
+    try testing.expect(dir.resolve("t").?.moving);
+    try dir.abortMove("t");
+    r = dir.resolve("t").?;
+    try testing.expectEqualStrings("c2", r.cluster.id);
+    try testing.expect(!r.moving);
+
+    // clusterById resolves the destination's base_url for the orchestrator.
+    try testing.expectEqualStrings("http://h:1", dir.clusterById("c1").?.base_url);
+    try testing.expect(dir.clusterById("nope") == null);
 }
 
 test "directory: error surfaces — unknown cluster / unknown tenant" {

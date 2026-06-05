@@ -64,6 +64,13 @@ pub const Error = error{
     UnknownTenant,
     /// The bridge is shutting down; no further proposes accepted.
     ShuttingDown,
+    /// A `propose` arrived for a tenant the move orchestration has
+    /// quiesced (`quiesce`) — its writes are held while its bundle ships
+    /// to the destination cluster (docs/v2-build-order.md §Phase 4).
+    Quiesced,
+    /// A control command (`createGroupEpoch` / `destroyGroup`) could not
+    /// be serviced because the pump thread is not running.
+    PumpNotRunning,
     OutOfMemory,
 } || node_mod.Error;
 
@@ -88,6 +95,29 @@ pub const GroupSig = struct {
     /// Reserved in Phase 2 — single-node never loses leadership, so this
     /// only moves on bridge teardown to fail any in-flight proposes.
     faulted_seq: std.atomic.Value(u64) = .init(0),
+    /// Set by `quiesce` while this tenant is being moved off the node:
+    /// `propose` rejects (`Error.Quiesced`) so no new write is admitted
+    /// once the bundle snapshot is being taken. Single writer at a time
+    /// (the move orchestration); read lock-free on the propose path.
+    quiescing: std.atomic.Value(bool) = .init(false),
+};
+
+/// A pump-thread-only control operation, handed worker thread → pump
+/// thread (the `Manager` is not thread-safe; group lifecycle must run on
+/// the pump thread alongside `processReady`). The caller stack-allocates
+/// one, enqueues a pointer, and blocks on `done` until the pump has
+/// executed it and stamped `err` — so the struct outlives the wait.
+const ControlCmd = struct {
+    const Kind = enum { create_group_epoch, destroy_group };
+    kind: Kind,
+    gid: u64,
+    /// Borrowed from the gid's `GroupSig.id_str` (pointer-stable); used by
+    /// `create_group_epoch` to open the tenant's group store.
+    id_str: []const u8 = &.{},
+    epoch: u64 = 0,
+    /// Result, written by the pump before signaling `done`.
+    err: ?Error = null,
+    done: std.Thread.ResetEvent = .{},
 };
 
 /// One queued propose, handed worker thread → pump thread.
@@ -119,6 +149,10 @@ pub const Bridge = struct {
     by_id: std.StringHashMapUnmanaged(u64) = .empty,
     next_gid: u64 = 1,
     inbox: std.ArrayListUnmanaged(ProposeItem) = .empty,
+    /// Move-orchestration control ops awaiting the pump thread (group
+    /// create-at-epoch / destroy). Pointers to caller-stack `ControlCmd`s;
+    /// guarded by `mutex`. Drained + executed in `pumpOnce`.
+    control_inbox: std.ArrayListUnmanaged(*ControlCmd) = .empty,
 
     pump_thread: ?std.Thread = null,
     stop: std.atomic.Value(bool) = .init(false),
@@ -166,6 +200,11 @@ pub const Bridge = struct {
         // Any items still queued at teardown own their payloads.
         for (self.inbox.items) |item| a.free(item.payload);
         self.inbox.deinit(a);
+        // Control commands are caller-stack-owned; just drop the pointers.
+        // (stopPump joined the pump thread, so nothing is mid-execute, and
+        // any waiter was released by stopPump's fault path / will time out
+        // — the move path never tears the bridge down mid-control.)
+        self.control_inbox.deinit(a);
         a.destroy(self);
     }
 
@@ -228,6 +267,9 @@ pub const Bridge = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const sig = self.groups.get(gid) orelse return Error.UnknownTenant;
+        // Held while the tenant is mid-move: refuse new writes so the
+        // source bundle snapshot is a quiescent point (Phase 4).
+        if (sig.quiescing.load(.acquire)) return Error.Quiesced;
         const owned = self.allocator.dupe(u8, payload) catch return Error.OutOfMemory;
         sig.next_seq += 1;
         const seq = sig.next_seq;
@@ -270,6 +312,93 @@ pub const Bridge = struct {
     pub fn isLeader(self: *Bridge) bool {
         _ = self;
         return true;
+    }
+
+    // ── Move control (any thread; executes on the pump thread) ───────
+
+    /// Quiesce a tenant for a move: stop admitting new proposes
+    /// (`Error.Quiesced`) and return the highest seq already accepted, so
+    /// the caller can wait for `committedSeq(gid) >= that` to know the
+    /// in-flight writes have drained to `applied == committed`. The bundle
+    /// snapshot is then a consistent point. Idempotent. `Error.UnknownTenant`
+    /// if the gid is unregistered. (docs/v2-build-order.md §Phase 4 quiesce.)
+    pub fn quiesce(self: *Bridge, gid: u64) Error!u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const sig = self.groups.get(gid) orelse return Error.UnknownTenant;
+        sig.quiescing.store(true, .release);
+        return sig.next_seq;
+    }
+
+    /// Lift a `quiesce` (move aborted / never completed). Re-admits
+    /// proposes. On a *successful* move the source group is destroyed
+    /// instead, so this is the abort/rollback seam. Idempotent.
+    pub fn unquiesce(self: *Bridge, gid: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.groups.get(gid)) |sig| sig.quiescing.store(false, .release);
+    }
+
+    /// Attach a freshly-loaded tenant's raft group at `epoch` on the pump
+    /// thread (move destination). The tenant must already be
+    /// `registerTenant`'d (so `gid` resolves and `id_str` is stable) and
+    /// its kvexp state already loaded into the worker store. Blocks until
+    /// the pump has created + led the group. (Phase 4 destination attach.)
+    pub fn createGroupEpoch(self: *Bridge, gid: u64, epoch: u64) Error!void {
+        const sig = self.sigFor(gid) orelse return Error.UnknownTenant;
+        var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch };
+        return self.runControl(&cmd);
+    }
+
+    /// Destroy a tenant's raft group + reclaim its WAL on the pump thread
+    /// (move source cleanup). Blocks until done. (Phase 4 source evict.)
+    pub fn destroyGroup(self: *Bridge, gid: u64) Error!void {
+        var cmd: ControlCmd = .{ .kind = .destroy_group, .gid = gid };
+        return self.runControl(&cmd);
+    }
+
+    /// Enqueue a control command for the pump thread and block until it
+    /// runs. Requires the pump thread (the only `Manager` toucher) to be
+    /// live; the move path always runs under `startPump`.
+    fn runControl(self: *Bridge, cmd: *ControlCmd) Error!void {
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.pump_thread == null) return Error.PumpNotRunning;
+            self.control_inbox.append(self.allocator, cmd) catch return Error.OutOfMemory;
+        }
+        cmd.done.wait();
+        if (cmd.err) |e| return e;
+    }
+
+    /// Drain + execute queued control commands on the pump thread. Run
+    /// from `pumpOnce` with the bridge mutex NOT held (the node ops
+    /// re-enter via the commit hook). Returns true if any ran.
+    fn drainControl(self: *Bridge) bool {
+        var batch: [16]*ControlCmd = undefined;
+        var n: usize = 0;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            while (n < batch.len and self.control_inbox.items.len > 0) {
+                batch[n] = self.control_inbox.orderedRemove(0);
+                n += 1;
+            }
+        }
+        for (batch[0..n]) |cmd| {
+            cmd.err = switch (cmd.kind) {
+                .create_group_epoch => blk: {
+                    _ = self.node.createGroupAtEpoch(cmd.gid, cmd.id_str, cmd.epoch) catch |e| break :blk e;
+                    break :blk null;
+                },
+                .destroy_group => blk: {
+                    self.node.destroyGroupAndReclaim(cmd.gid) catch |e| break :blk e;
+                    break :blk null;
+                },
+            };
+            cmd.done.set();
+        }
+        return n > 0;
     }
 
     // ── Pump (pump thread only) ──────────────────────────────────────
@@ -334,6 +463,11 @@ pub const Bridge = struct {
         }
 
         var did_work = batch.items.len > 0;
+
+        // 1b. Service move-orchestration control ops (group create-at-
+        //     epoch / destroy) on the pump thread before proposes, so an
+        //     attach's group exists before any post-move write lands.
+        if (self.drainControl()) did_work = true;
 
         // 2. Submit each drained propose to its tenant's group, creating
         //    the group on first sight (drives it to leader).
@@ -522,4 +656,62 @@ test "bridge: pump thread drives commits end to end" {
     const got = try bridge.node.get(gid, "k");
     defer a.free(got);
     try testing.expectEqualStrings("v", got);
+}
+
+test "bridge: move control — attach at epoch, quiesce holds writes, destroy reclaims" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const bridge = try Bridge.initSingleNode(a, dir);
+    defer bridge.deinit();
+    try bridge.startPump();
+
+    // Destination-attach shape: register the tenant, then stand up its
+    // group at a migration epoch (epoch+1 over the source's birth epoch).
+    const gid = try bridge.registerTenant("mover");
+    try bridge.createGroupEpoch(gid, 1);
+
+    // A post-attach write commits through the freshly-attached group.
+    var ws = WriteSet.init(a);
+    defer ws.deinit();
+    try ws.addPut("k", "after-move");
+    const env = try encodeWs(a, "mover", &ws);
+    defer a.free(env);
+    const seq = try bridge.propose(gid, env);
+    var spins: u32 = 0;
+    while (bridge.committedSeq(gid) < seq and spins < 2000) : (spins += 1) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(seq, bridge.committedSeq(gid));
+
+    // Quiesce: the watermark is at next_seq (nothing in flight) and new
+    // proposes are now refused.
+    const drained_to = try bridge.quiesce(gid);
+    try testing.expectEqual(seq, drained_to);
+    try testing.expectEqual(seq, bridge.committedSeq(gid));
+    try testing.expectError(Error.Quiesced, bridge.propose(gid, env));
+
+    // Source cleanup: destroy the group + reclaim its WAL. The node slot
+    // is gone afterward (a read on the node store errors UnknownGroup).
+    try bridge.destroyGroup(gid);
+    try testing.expectError(node_mod.Error.UnknownGroup, bridge.node.get(gid, "k"));
+
+    bridge.stopPump();
+}
+
+test "bridge: createGroupEpoch requires a running pump thread" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const bridge = try Bridge.initSingleNode(a, dir);
+    defer bridge.deinit();
+    const gid = try bridge.registerTenant("x");
+    // No startPump → control ops have no executor.
+    try testing.expectError(Error.PumpNotRunning, bridge.createGroupEpoch(gid, 1));
 }
