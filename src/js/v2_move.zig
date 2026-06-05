@@ -45,9 +45,20 @@ const kv_mod = @import("raft-kv");
 const tenant_mod = @import("rove-tenant");
 const respb = @import("response_builder.zig");
 const raft_propose = @import("raft_propose.zig");
+const blob = @import("rove-blob");
+const curl = blob.curl;
 
 const MOVE_SECRET_HEADER = "x-rewind-move-secret";
 const TENANT_HEADER = "x-rewind-tenant";
+
+/// Source-side marker key (in the tenant's own `inst.kv`) holding the
+/// destination base URL while a zero-downtime move's overlap window is open
+/// (Phase 7 slice b). When present, the source forwards every committed
+/// write for this tenant to the destination so it stays caught up while the
+/// source keeps serving. Set by `v2-forward-begin`, cleared by
+/// `v2-forward-end`. The `_move/` prefix is itself never forwarded (control
+/// metadata, not tenant data).
+const FORWARD_MARKER = "_move/forward";
 
 /// Entry point from `tryHandleSystem`. Returns true iff `sys_rest` named
 /// a `v2-*` move endpoint (and the response was finalized). `path` still
@@ -91,6 +102,12 @@ pub fn tryHandleV2(
         try handleResume(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-leader")) {
         try handleLeader(server, allocator, worker, ent, sid, sess, method, path);
+    } else if (std.mem.eql(u8, sys_rest, "v2-apply")) {
+        try handleApply(server, allocator, worker, ent, sid, sess, method, body);
+    } else if (std.mem.eql(u8, sys_rest, "v2-forward-begin")) {
+        try handleForwardBegin(server, allocator, worker, ent, sid, sess, method, body);
+    } else if (std.mem.eql(u8, sys_rest, "v2-forward-end")) {
+        try handleForwardEnd(server, allocator, worker, ent, sid, sess, method, body);
     } else {
         try respb.setSystemResponse(server, ent, sid, sess, 404, "unknown v2 move endpoint\n", allocator, null, null);
     }
@@ -144,48 +161,64 @@ fn handleKv(
     if (std.mem.indexOfScalar(u8, key, 0) != null or std.mem.indexOfScalar(u8, value, 0) != null)
         return reply(server, allocator, ent, sid, sess, 400, "key/value contains NUL\n");
 
-    // Leader gate (Phase 5 multi-node): only the tenant's group leader may
-    // take the write. A follower would otherwise commit to its own `inst.kv`
-    // speculatively and then fault the propose (not leader) WITHOUT rolling
-    // that local write back (this immediate-commit endpoint, unlike the
-    // parked customer path, has no undo) — diverging the follower. Reject
-    // fast instead so the front door retries the leader. Registering first
-    // is idempotent and makes `isLeaderOf` resolvable on a single node (the
-    // sole voter leads every group, so this is always true there).
-    const gid = worker.raft.registerTenant(tenant) catch
-        return reply(server, allocator, ent, sid, sess, 500, "register failed\n");
-    if (!worker.raft.isLeaderOf(gid))
-        return reply(server, allocator, ent, sid, sess, 503, "not leader; retry the cluster leader\n");
+    // Commit through the real leader-gated propose path.
+    const rc = commitWrite(worker, allocator, tenant, key, value);
+    if (rc != 0) return reply(server, allocator, ent, sid, sess, rc, "write failed\n");
 
-    // Provision the instance on first sight (the source cluster's tenant
-    // store is born here), then write through the real propose path: an
-    // immediate kvexp commit followed by a raft propose the move's bundle
-    // dump will see.
-    const inst = ensureInstance(worker, tenant) catch
-        return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
+    // Zero-downtime overlap (Phase 7 slice b): if a move is forwarding this
+    // tenant, dual-write the committed write to the destination so it stays
+    // caught up while we keep serving. A forward failure surfaces as 502 —
+    // the (idempotent) write is durable locally, so the caller retries and
+    // re-forwards, preserving "acknowledged source write ⇒ on the dest."
+    if (forwardTargetFor(worker, tenant)) |dest| {
+        defer allocator.free(dest);
+        const secret = worker.move_secret orelse "";
+        forwardWrite(allocator, secret, dest, tenant, key, value) catch |err| {
+            std.log.warn("v2 forward {s} → {s} failed: {s}", .{ tenant, dest, @errorName(err) });
+            return reply(server, allocator, ent, sid, sess, 502, "forward to move destination failed\n");
+        };
+    }
 
-    var txn = inst.kv.beginTrackedImmediate() catch
-        return reply(server, allocator, ent, sid, sess, 500, "txn open failed\n");
+    try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
+}
+
+// ── shared write path (v2-kv PUT + v2-apply) ─────────────────────────
+
+/// Commit a single key/value through the leader-gated propose path: an
+/// immediate kvexp `TrackedTxn` commit on `inst.kv` followed by a raft
+/// propose awaited to quorum. Returns 0 on success, else the HTTP status to
+/// reply with. Shared by `v2-kv` (a new source write) and `v2-apply` (a
+/// write forwarded from a move source) — both land a write through the same
+/// durable path; only `v2-kv` then forwards (`v2-apply` is the receiving
+/// end, so it must NOT re-forward — no loops).
+fn commitWrite(worker: anytype, allocator: std.mem.Allocator, tenant: []const u8, key: []const u8, value: []const u8) u16 {
+    // Leader gate (Phase 5 multi-node): only the group leader may take the
+    // write. A follower would commit to its own `inst.kv` speculatively then
+    // fault the propose with no undo (this immediate-commit path, unlike the
+    // parked customer path) — diverging it. Reject fast so the caller retries
+    // the leader. Registering first is idempotent + makes `isLeaderOf`
+    // resolvable on a single node (the sole voter leads every group).
+    const gid = worker.raft.registerTenant(tenant) catch return 500;
+    if (!worker.raft.isLeaderOf(gid)) return 503;
+
+    const inst = ensureInstance(worker, tenant) catch return 500;
+
+    var txn = inst.kv.beginTrackedImmediate() catch return 500;
     var ws = kv_mod.WriteSet.init(allocator);
     defer ws.deinit();
     txn.put(key, value) catch {
         txn.rollback() catch {};
-        return reply(server, allocator, ent, sid, sess, 500, "put failed\n");
+        return 500;
     };
     ws.addPut(key, value) catch {
         txn.rollback() catch {};
-        return reply(server, allocator, ent, sid, sess, 500, "writeset failed\n");
+        return 500;
     };
-    txn.commit() catch {
-        return reply(server, allocator, ent, sid, sess, 500, "commit failed\n");
-    };
+    txn.commit() catch return 500;
 
-    const proposed = raft_propose.proposeWriteSet(worker, &ws, tenant, "") catch
-        return reply(server, allocator, ent, sid, sess, 503, "propose failed\n");
-    if (!awaitCommit(worker, proposed.group_id, proposed.seq))
-        return reply(server, allocator, ent, sid, sess, 504, "raft commit timed out\n");
-
-    try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
+    const proposed = raft_propose.proposeWriteSet(worker, &ws, tenant, "") catch return 503;
+    if (!awaitCommit(worker, proposed.group_id, proposed.seq)) return 504;
+    return 0;
 }
 
 // ── v2-bundle: quiesce + dump (source) ───────────────────────────────
@@ -352,6 +385,142 @@ fn handleLeader(
     } else {
         try respb.setSystemResponse(server, ent, sid, sess, 503, "follower\n", allocator, null, null);
     }
+}
+
+// ── v2-apply: receive a write forwarded from a move source (dest) ─────
+
+/// `POST /_system/v2-apply {tenant,key,value}` — the destination end of the
+/// zero-downtime overlap (Phase 7 slice b). Applies a write the move source
+/// forwarded, through the SAME durable leader-gated path as `v2-kv` but
+/// WITHOUT re-forwarding (this is the receiving side — re-forwarding would
+/// loop). So while a tenant is moving, the dest stays caught up with the
+/// source's live writes and the source never stops serving.
+fn handleApply(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    body: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+    var parsed = std.json.parseFromSlice(struct {
+        tenant: []const u8,
+        key: []const u8,
+        value: []const u8,
+    }, allocator, body, .{ .ignore_unknown_fields = true }) catch
+        return reply(server, allocator, ent, sid, sess, 400, "expected {\"tenant\",\"key\",\"value\"}\n");
+    defer parsed.deinit();
+    const t = parsed.value.tenant;
+    if (t.len == 0 or parsed.value.key.len == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "empty tenant/key\n");
+
+    const rc = commitWrite(worker, allocator, t, parsed.value.key, parsed.value.value);
+    if (rc != 0) return reply(server, allocator, ent, sid, sess, rc, "apply failed\n");
+    try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
+}
+
+// ── v2-forward-begin / -end: open / close the source overlay (source) ─
+
+/// `POST /_system/v2-forward-begin {tenant,dest}` — open the overlap: record
+/// the destination base URL in the tenant's `inst.kv` (`_move/forward`) so
+/// every subsequent committed write is dual-written to the destination. The
+/// marker rides the replicated write path (so a source leader change carries
+/// it). Leader-gated like any source write.
+fn handleForwardBegin(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    body: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+    var parsed = std.json.parseFromSlice(struct {
+        tenant: []const u8,
+        dest: []const u8,
+    }, allocator, body, .{ .ignore_unknown_fields = true }) catch
+        return reply(server, allocator, ent, sid, sess, 400, "expected {\"tenant\",\"dest\"}\n");
+    defer parsed.deinit();
+    if (parsed.value.tenant.len == 0 or parsed.value.dest.len == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "empty tenant/dest\n");
+    const rc = commitWrite(worker, allocator, parsed.value.tenant, FORWARD_MARKER, parsed.value.dest);
+    if (rc != 0) return reply(server, allocator, ent, sid, sess, rc, "forward-begin failed\n");
+    try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
+}
+
+/// `POST /_system/v2-forward-end {tenant}` — close the overlap: clear the
+/// `_move/forward` marker (write empty) so the source stops dual-writing.
+fn handleForwardEnd(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    body: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+    const tenant = parseTenant(allocator, body) orelse
+        return reply(server, allocator, ent, sid, sess, 400, "expected {\"tenant\"}\n");
+    defer allocator.free(tenant);
+    const rc = commitWrite(worker, allocator, tenant, FORWARD_MARKER, "");
+    if (rc != 0) return reply(server, allocator, ent, sid, sess, rc, "forward-end failed\n");
+    try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
+}
+
+// ── forwarding (source side) ─────────────────────────────────────────
+
+/// The destination base URL this tenant is forwarding to, or null if no
+/// overlap is open. Reads the `_move/forward` marker from `inst.kv`; an
+/// absent or empty marker means "not forwarding." Owned dup on success.
+fn forwardTargetFor(worker: anytype, tenant: []const u8) ?[]u8 {
+    const inst = (worker.node.tenant.getInstance(tenant) catch null) orelse return null;
+    const v = inst.kv.get(FORWARD_MARKER) catch return null; // NotFound → null
+    if (v.len == 0) {
+        worker.allocator.free(v);
+        return null;
+    }
+    return v; // owned by the caller (kvexp get returns an owned copy)
+}
+
+/// Dual-write one committed key/value to the move destination's `v2-apply`
+/// (blocking libcurl, like the move surface — this is an internal, low-rate
+/// overlay path, not the customer hot path). Errors on a non-204 / transport
+/// failure so the source can surface 502 and the caller retry.
+fn forwardWrite(allocator: std.mem.Allocator, secret: []const u8, dest: []const u8, tenant: []const u8, key: []const u8, value: []const u8) !void {
+    const url = try std.fmt.allocPrint(allocator, "{s}/_system/v2-apply", .{dest});
+    defer allocator.free(url);
+    const payload = try std.fmt.allocPrint(allocator, "{{\"tenant\":\"{s}\",\"key\":\"{s}\",\"value\":\"{s}\"}}", .{ tenant, key, value });
+    defer allocator.free(payload);
+
+    var headers: std.ArrayListUnmanaged(curl.Header) = .empty;
+    defer headers.deinit(allocator);
+    // The dest's v2-apply is move-secret gated; forwarding is between
+    // clusters that share the secret, so present it (the worker holds it).
+    try headers.append(allocator, .{ .name = "X-Rewind-Move-Secret", .value = secret });
+    try headers.append(allocator, .{ .name = "Content-Type", .value = "application/json" });
+
+    var easy = try curl.Easy.init(allocator);
+    defer easy.deinit();
+    var resp = try easy.request(allocator, .{
+        .method = .POST,
+        .url = url,
+        .headers = headers.items,
+        .body = payload,
+        .http_version = .h2c_prior_knowledge,
+        .verify_tls = false,
+    });
+    defer resp.deinit(allocator);
+    if (resp.status != 204) return error.ForwardRejected;
 }
 
 // ── helpers ──────────────────────────────────────────────────────────
