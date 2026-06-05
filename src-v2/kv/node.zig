@@ -41,6 +41,10 @@ const kvlimbs = @import("kvlimbs");
 const kvstore = kvlimbs.kvstore;
 const writeset = kvlimbs.writeset;
 const envelope = @import("envelope.zig");
+const transport_mod = @import("transport.zig");
+
+pub const Transport = transport_mod.Transport;
+pub const PeerAddr = transport_mod.PeerAddr;
 
 pub const KvStore = kvstore.KvStore;
 pub const WriteSet = writeset.WriteSet;
@@ -115,6 +119,13 @@ pub const Node = struct {
     mgr: raft.Manager,
     wal: *raft.SharedWal,
 
+    /// Cross-node transport (Phase 5). `null` for a single-node node
+    /// (`initSingleNode`): no peers, so groups campaign to leader at
+    /// creation and `takeMessages` drains to nowhere. Non-null for a
+    /// multi-node node: the pump drives it each cycle (flush coalesced
+    /// sends + tick to deliver inbound → step) and groups elect via ticks.
+    transport: ?*Transport = null,
+
     /// tenant_id → slot. Iterated on deinit; looked up in the apply
     /// callback by `group_id`.
     groups: std.AutoHashMapUnmanaged(u64, *TenantSlot) = .empty,
@@ -143,6 +154,37 @@ pub const Node = struct {
     /// Stand up a single-node node (voter id 1, voter set `{1}`).
     pub fn initSingleNode(allocator: std.mem.Allocator, data_dir: []const u8) Error!*Node {
         return Node.init(allocator, data_dir, 1, &.{1});
+    }
+
+    /// Stand up a multi-node node (Phase 5): `node_id` ∈ `voters`, the full
+    /// voter set across the cluster, plus the cross-node transport bound to
+    /// `listen_addr` with `peers` (indexed by raft_net peer id = raft node
+    /// id − 1, `len == cluster size`). Groups created here do NOT campaign
+    /// at birth — election fires via ticks (real failover) or an explicit
+    /// `campaign`. The pump drives the transport each cycle.
+    pub fn initMultiNode(
+        allocator: std.mem.Allocator,
+        data_dir: []const u8,
+        node_id: u64,
+        voters: []const u64,
+        listen_addr: std.net.Address,
+        peers: []const PeerAddr,
+    ) Error!*Node {
+        const self = try Node.init(allocator, data_dir, node_id, voters);
+        errdefer self.deinit();
+        self.transport = Transport.init(allocator, .{
+            .node_id = node_id,
+            .listen_addr = listen_addr,
+            .peers = peers,
+            .manager = &self.mgr,
+        }) catch return Error.Io;
+        return self;
+    }
+
+    /// True when this node is the sole voter (no transport, campaign at
+    /// group birth). Multi-node nodes elect via ticks.
+    fn isSingleNode(self: *const Node) bool {
+        return self.voters.len == 1;
     }
 
     pub fn init(
@@ -183,6 +225,8 @@ pub const Node = struct {
 
     pub fn deinit(self: *Node) void {
         const a = self.allocator;
+        // Stop the network first (it borrows the Manager via step).
+        if (self.transport) |t| t.deinit();
         // Destroy groups first — `Manager.deinit` frees each group's
         // `GroupedFileStorage` via its destroy-vtable. The WAL is
         // borrowed by those storages, so it must outlive them: tear the
@@ -283,15 +327,32 @@ pub const Node = struct {
 
         // Single-node: force this group to leader so proposes commit
         // immediately (no peers to elect from). Multi-node lets the
-        // election fire via ticks (Phase 5).
-        try self.mgr.campaign(tenant_id);
-        var spins: u32 = 0;
-        while (!self.mgr.isLeader(tenant_id) and spins < 100) : (spins += 1) {
-            _ = try self.pump();
+        // election fire via ticks (or an explicit `campaign` from the
+        // bootstrap) — campaigning here would race the peers that have not
+        // yet created the group.
+        if (self.isSingleNode()) {
+            try self.mgr.campaign(tenant_id);
+            var spins: u32 = 0;
+            while (!self.mgr.isLeader(tenant_id) and spins < 100) : (spins += 1) {
+                _ = try self.pump();
+            }
+            if (!self.mgr.isLeader(tenant_id)) return Error.NotCommitted;
         }
-        if (!self.mgr.isLeader(tenant_id)) return Error.NotCommitted;
 
         return slot;
+    }
+
+    /// Force this node to start an election for `tenant_id`'s group
+    /// (multi-node bootstrap / test convenience). Production failover does
+    /// not need this — a follower whose leader goes silent campaigns on its
+    /// own election timeout via `tickGroups`.
+    pub fn campaign(self: *Node, tenant_id: u64) Error!void {
+        try self.mgr.campaign(tenant_id);
+    }
+
+    /// Whether this node is the raft leader of `tenant_id`'s group.
+    pub fn isLeader(self: *const Node, tenant_id: u64) bool {
+        return self.mgr.isLeader(tenant_id);
     }
 
     /// Tear down a tenant's raft group and reclaim its WAL segments (the
@@ -369,30 +430,47 @@ pub const Node = struct {
     pub fn pump(self: *Node) Error!bool {
         _ = self.mgr.tickGroups(self.active.items);
         const ready = self.mgr.pollReady(self.ready_buf);
-        if (ready.len == 0) return false;
 
         self.apply_err = null;
-        for (ready) |g| {
-            self.mgr.processReady(g, applyCb, self) catch |e| {
-                self.apply_err = self.apply_err orelse mapRaftErr(e);
+        if (ready.len > 0) {
+            for (ready) |g| {
+                self.mgr.processReady(g, applyCb, self) catch |e| {
+                    self.apply_err = self.apply_err orelse mapRaftErr(e);
+                };
+            }
+
+            // ONE fsync per cycle regardless of how many groups committed.
+            self.wal.flush() catch {
+                self.apply_err = self.apply_err orelse Error.Io;
             };
+
+            // Drain each ready group's outbox. Single-node: queued to a
+            // transport-less sink (a no-op). Multi-node: buffered per
+            // destination node, stamped with the group's migration epoch,
+            // for the coalesced flush below.
+            for (ready) |g| {
+                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g) };
+                self.mgr.takeMessages(g, sendMsgCb, &sctx) catch {};
+                self.mgr.release(g);
+            }
         }
 
-        // ONE fsync per cycle regardless of how many groups committed.
-        self.wal.flush() catch {
-            self.apply_err = self.apply_err orelse Error.Io;
-        };
-
-        for (ready) |g| {
-            self.mgr.takeMessages(g, dropMsgCb, null) catch {};
-            self.mgr.release(g);
+        // Always drive the transport (multi-node): flush this cycle's
+        // coalesced sends, then a non-blocking tick that submits them and
+        // delivers any inbound envelopes (→ stepBatch). Done every cycle —
+        // not just when a group committed — so heartbeats/elections flow
+        // and inbound messages are stepped even on an otherwise idle node.
+        if (self.transport) |t| {
+            t.flush();
+            const now: i64 = @intCast(std.time.nanoTimestamp());
+            t.tick(now, 0) catch {};
         }
 
         if (self.apply_err) |e| {
             self.apply_err = null;
             return e;
         }
-        return true;
+        return ready.len > 0;
     }
 
     /// Read a committed key from a tenant's store. Caller owns the
@@ -480,12 +558,30 @@ pub const Node = struct {
         }
     }
 
-    fn dropMsgCb(
-        _: ?*anyopaque,
-        _: u64,
-        _: [*c]const u8,
-        _: usize,
-    ) callconv(.c) void {}
+    /// Context for `sendMsgCb`: which group's outbox is being drained (so
+    /// each message carries its group id + migration epoch into the
+    /// coalesced envelope). Lives on the pump's stack for the takeMessages
+    /// call.
+    const SendCtx = struct {
+        node: *Node,
+        group_id: u64,
+        epoch: u64,
+    };
+
+    /// `takeMessages` callback: buffer one outbound raft message into the
+    /// transport for its destination node. No-op when there is no transport
+    /// (single-node), so the single-node pump's drain stays a sink.
+    fn sendMsgCb(
+        ud: ?*anyopaque,
+        to: u64,
+        msg_bytes: [*c]const u8,
+        msg_len: usize,
+    ) callconv(.c) void {
+        const ctx: *SendCtx = @ptrCast(@alignCast(ud.?));
+        const t = ctx.node.transport orelse return;
+        const bytes = if (msg_len == 0) &[_]u8{} else msg_bytes[0..msg_len];
+        t.queueOut(to, ctx.group_id, ctx.epoch, bytes);
+    }
 };
 
 /// Narrow a raft-rs error to the node's `Error` set (they overlap, but
@@ -562,6 +658,177 @@ test "a delete in a later writeset removes the key" {
     try testing.expect(idx2 > 0);
 
     try testing.expectError(Error.NotFound, node.get(tenant, "k"));
+}
+
+test "Phase 5: 3-node cluster elects a leader + replicates a committed write" {
+    const a = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(root);
+
+    const voters = [_]u64{ 1, 2, 3 };
+    const dirs = [_][]u8{
+        try std.fmt.allocPrint(a, "{s}/n1", .{root}),
+        try std.fmt.allocPrint(a, "{s}/n2", .{root}),
+        try std.fmt.allocPrint(a, "{s}/n3", .{root}),
+    };
+    defer for (dirs) |d| a.free(d);
+
+    // Peers must agree on fixed addresses (no ephemeral binding). This test
+    // is compiled into BOTH the node and bridge test binaries (bridge
+    // imports node.zig relatively) which zig runs in parallel, and reruns
+    // leave listen ports in TIME_WAIT — so try several well-separated bases
+    // (seeded by PID) until all three bind, and skip if the host has no
+    // free window at all.
+    var nodes: [3]*Node = undefined;
+    // `alive` tracks which nodes are stood up, so the cleanup defer never
+    // double-frees one the failover leg kills mid-test.
+    var alive = [_]bool{ false, false, false };
+    defer for (nodes, 0..) |n, i| if (alive[i]) n.deinit();
+
+    const pid: u32 = @intCast(std.os.linux.getpid());
+    var attempt: u32 = 0;
+    while (attempt < 24) : (attempt += 1) {
+        const base: u16 = @intCast(20000 + ((pid +% attempt *% 619) % 4000) * 8);
+        var ok = true;
+        for (0..3) |i| {
+            var peers: [3]PeerAddr = undefined;
+            for (&peers, 0..) |*p, k| p.* = .{ .host = "127.0.0.1", .port = base + @as(u16, @intCast(k)) };
+            const addr = std.net.Address.parseIp("127.0.0.1", base + @as(u16, @intCast(i))) catch {
+                ok = false;
+                break;
+            };
+            nodes[i] = Node.initMultiNode(a, dirs[i], @intCast(i + 1), &voters, addr, &peers) catch {
+                ok = false;
+                break;
+            };
+            alive[i] = true;
+        }
+        if (ok) break;
+        for (0..3) |i| if (alive[i]) {
+            nodes[i].deinit();
+            alive[i] = false;
+        };
+    }
+    if (!(alive[0] and alive[1] and alive[2])) return error.SkipZigTest; // no free window
+
+    const tenant: u64 = 100;
+    const id = "tenant-100";
+    // Create the group on all three nodes (multi-node: no campaign at birth).
+    for (nodes) |n| _ = try n.ensureGroup(tenant, id);
+
+    // Warm the mesh: drive every pump so the io_uring/TCP handshakes
+    // complete before we campaign.
+    var warm: u32 = 0;
+    while (warm < 150) : (warm += 1) {
+        for (nodes) |n| _ = try n.pump();
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+
+    // Elect node 1 (deterministic + fast; a dropped pre-connect vote is
+    // retried by the election-timeout path as a backstop).
+    try nodes[0].campaign(tenant);
+
+    var leader_idx: ?usize = null;
+    var spins: u32 = 0;
+    while (spins < 2000 and leader_idx == null) : (spins += 1) {
+        for (nodes) |n| _ = try n.pump();
+        for (nodes, 0..) |n, i| if (n.isLeader(tenant)) {
+            leader_idx = i;
+        };
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(leader_idx != null);
+
+    // Propose a write on the leader; drive until all three stores apply it.
+    var ws = WriteSet.init(a);
+    defer ws.deinit();
+    try ws.addPut("k", "replicated");
+    const ws_bytes = try ws.encode(a);
+    defer a.free(ws_bytes);
+    const env = try envelope.encodeWriteSet(a, id, ws_bytes);
+    defer a.free(env);
+    try nodes[leader_idx.?].propose(tenant, env);
+
+    var replicated = false;
+    var spins2: u32 = 0;
+    while (spins2 < 2000 and !replicated) : (spins2 += 1) {
+        for (nodes) |n| _ = try n.pump();
+        replicated = true;
+        for (nodes) |n| {
+            const v = n.get(tenant, "k") catch {
+                replicated = false;
+                break;
+            };
+            a.free(v);
+        }
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(replicated);
+
+    // The value is identical on every node.
+    for (nodes) |n| {
+        const v = try n.get(tenant, "k");
+        defer a.free(v);
+        try testing.expectEqualStrings("replicated", v);
+    }
+
+    // ── Failover: kill the leader; the two survivors must re-elect and
+    //    keep committing (3-node quorum = 2). ─────────────────────────────
+    const dead = leader_idx.?;
+    nodes[dead].deinit();
+    alive[dead] = false;
+
+    var new_leader: ?usize = null;
+    var spins3: u32 = 0;
+    while (spins3 < 4000 and new_leader == null) : (spins3 += 1) {
+        for (nodes, 0..) |n, i| if (alive[i]) {
+            _ = try n.pump();
+        };
+        for (nodes, 0..) |n, i| if (alive[i] and n.isLeader(tenant)) {
+            new_leader = i;
+        };
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(new_leader != null);
+
+    // A fresh write commits on the surviving quorum.
+    var ws2 = WriteSet.init(a);
+    defer ws2.deinit();
+    try ws2.addPut("k2", "after-failover");
+    const ws2_bytes = try ws2.encode(a);
+    defer a.free(ws2_bytes);
+    const env2 = try envelope.encodeWriteSet(a, id, ws2_bytes);
+    defer a.free(env2);
+    try nodes[new_leader.?].propose(tenant, env2);
+
+    var failover_ok = false;
+    var spins4: u32 = 0;
+    while (spins4 < 4000 and !failover_ok) : (spins4 += 1) {
+        for (nodes, 0..) |n, i| if (alive[i]) {
+            _ = try n.pump();
+        };
+        failover_ok = true;
+        for (nodes, 0..) |n, i| if (alive[i]) {
+            const v = n.get(tenant, "k2") catch {
+                failover_ok = false;
+                break;
+            };
+            a.free(v);
+        };
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(failover_ok);
+
+    // The pre-failover write survived on both survivors (durability across
+    // the leader change).
+    for (nodes, 0..) |n, i| if (alive[i]) {
+        const v = try n.get(tenant, "k");
+        defer a.free(v);
+        try testing.expectEqualStrings("replicated", v);
+    };
 }
 
 test "two tenants get independent stores on the same node" {

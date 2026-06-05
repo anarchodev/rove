@@ -847,6 +847,21 @@ pub fn build(b: *std.Build) void {
     // `zig build` / `zig build test` never invoke cargo and V1
     // contributors need no Rust toolchain.
     const raft_dep = b.dependency("raft_rs_zig", .{ .target = target, .optimize = optimize });
+
+    // ── V2 Phase 5 — raft peer transport (cross-node wire layer) ───────
+    // Reuse the V1 liburing transport (`src/kv/raft_net.zig` + its frame
+    // codec `raft_rpc.zig`, both std-only) as the V2 cross-node wire layer.
+    // The V2 coalescing adapter (`src-v2/kv/transport.zig`) moves opaque
+    // per-recipient envelopes over it; the V1 raft message types in
+    // `raft_rpc` are unused by the transport core. Module-rooted at
+    // raft_net.zig so its relative `@import("raft_rpc.zig")` resolves.
+    const raftnet_mod = b.createModule(.{
+        .root_source_file = b.path("src/kv/raft_net.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    raftnet_mod.link_libc = true;
+
     const v2_smoke_mod = b.createModule(.{
         .root_source_file = b.path("src-v2/v2_raft_smoke.zig"),
         .target = target,
@@ -881,7 +896,24 @@ pub fn build(b: *std.Build) void {
     // across the worker and the bridge — the Zig per-module type identity
     // requirement for the Phase-2 seam.
     v2_node_mod.addImport("kvlimbs", kv_mod);
+    v2_node_mod.addImport("raft-net", raftnet_mod);
     const v2_node_test = b.addTest(.{ .root_module = v2_node_mod });
+
+    // ── V2 Phase 5 — the cross-node transport adapter (coalesced) ──────
+    // `src-v2/kv/transport.zig` wraps `raft_net` with per-recipient
+    // coalescing; the Node drives it from its pump. Tested on its own
+    // (wire-format) here + end-to-end by the 3-node node test.
+    const v2_transport_mod = b.createModule(.{
+        .root_source_file = b.path("src-v2/kv/transport.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    v2_transport_mod.link_libc = true;
+    v2_transport_mod.addImport("raft_rs_zig", raft_dep.module("raft_rs_zig"));
+    v2_transport_mod.addImport("raft-net", raftnet_mod);
+    const v2_transport_test = b.addTest(.{ .root_module = v2_transport_mod });
+    v2_transport_test.linkLibrary(raft_dep.artifact("raft_rs_zig"));
+    v2_test_step.dependOn(&b.addRunArtifact(v2_transport_test).step);
     v2_node_test.linkLibrary(raft_dep.artifact("raft_rs_zig"));
     const run_v2_node_test = b.addRunArtifact(v2_node_test);
     v2_test_step.dependOn(&run_v2_node_test.step);
@@ -900,6 +932,7 @@ pub fn build(b: *std.Build) void {
     v2_bridge_mod.link_libc = true;
     v2_bridge_mod.addImport("raft_rs_zig", raft_dep.module("raft_rs_zig"));
     v2_bridge_mod.addImport("kvlimbs", kv_mod);
+    v2_bridge_mod.addImport("raft-net", raftnet_mod);
     const v2_bridge_test = b.addTest(.{ .root_module = v2_bridge_mod });
     v2_bridge_test.linkLibrary(raft_dep.artifact("raft_rs_zig"));
     const run_v2_bridge_test = b.addRunArtifact(v2_bridge_test);
