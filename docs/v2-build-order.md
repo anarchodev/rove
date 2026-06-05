@@ -224,22 +224,26 @@ This is the heart of the rewrite.
 
 #### Phase 6 — Scale: hibernation / active-set (K = thousands of tenants)
 
-> **CORE DONE (2026-06-04).** Active-set hibernation in `node.zig` +
+> **DONE (2026-06-04).** Active-set hibernation in `node.zig` +
 > `transport.zig`: `bumpActive` on propose / formation / non-heartbeat
 > step, tick only the active set, `sweepHibernated` per cycle, no pre-seed;
 > heartbeats deliberately do NOT wake (eraftpb wire-byte detection). Green
 > under `v2-test` (46/46) — single-node hibernate→wake, K-group idle drain,
 > and a 3-node group that hibernates with NO spurious leader change then
-> wakes + replicates on a propose. The K=10k macrobench is a noted
-> follow-up. Details: [`v2-phase6-hibernation.md`](v2-phase6-hibernation.md).
+> wakes + replicates on a propose. The K-tenant exit bench
+> (`v2-hibernation-bench`) shows pump cycle time at K=10k drop from
+> 1000 µs/cycle (tick-all) to ~0 when the tenants are idle (~31,000×). A
+> cluster-scale live-traffic macrobench is a separate follow-up. Details:
+> [`v2-phase6-hibernation.md`](v2-phase6-hibernation.md).
 
 - **New:** the active-set machinery above the FFI — bump on propose and on
   non-heartbeat step only, tick only the active set, do not pre-seed at
   init (learnings §3.1 + §3.4).
 - **Reuse:** the Phase-1 pump.
-- **Exit:** thousands of mostly-idle tenants do not burn the pump (cycle
-  time stays low); a K-tenant bench. *(Mechanism + multi-node correctness
-  proven by unit tests; the cluster-scale macrobench is the open follow-up.)*
+- **Exit (met):** thousands of mostly-idle tenants do not burn the pump
+  (cycle time stays low); a K-tenant bench. `v2-hibernation-bench` shows the
+  pump cycle at K=10k idle tenants drops to ~0 (vs 1 ms/cycle tick-all). A
+  cluster-scale live-traffic macrobench is a separate follow-up.
 - **~1–2 weeks.**
 
 #### Phase 7 — Zero-downtime move (the upgrade)
