@@ -83,6 +83,13 @@ pub const Transport = struct {
     outbufs: []OutBuf,
     /// Reusable scratch for the receive path — rebuilt per `onRecv`.
     step_scratch: std.ArrayListUnmanaged(StepBatchEntry) = .empty,
+    /// Group ids that received a NON-heartbeat message since the last
+    /// `drainWoke`. The pump drains this each cycle and `bumpActive`s each,
+    /// so a hibernated group wakes on real raft traffic but NOT on its own
+    /// keep-alive heartbeats (Phase 6 / §3.1). Appended in `onRecv` (pump
+    /// thread); cleared by `drainWoke`. Dups are fine — `bumpActive` is
+    /// idempotent — so no per-message dedup.
+    woke: std.ArrayListUnmanaged(u64) = .empty,
 
     pub const Config = struct {
         /// This node's raft id (1-based, must be ≤ peers.len).
@@ -131,7 +138,29 @@ pub const Transport = struct {
         for (self.outbufs) |*ob| ob.body.deinit(a);
         a.free(self.outbufs);
         self.step_scratch.deinit(a);
+        self.woke.deinit(a);
         a.destroy(self);
+    }
+
+    /// Append the gids that received a non-heartbeat message since the last
+    /// call into `out`, then clear the internal buffer. Pump-thread only
+    /// (runs right after `tick`, on the same thread `onRecv` filled it).
+    pub fn drainWoke(self: *Transport, out: *std.ArrayListUnmanaged(u64), a: std.mem.Allocator) !void {
+        try out.appendSlice(a, self.woke.items);
+        self.woke.clearRetainingCapacity();
+    }
+
+    /// Whether a raw eraftpb message is a heartbeat / heartbeat-response —
+    /// the wire bytes for `MsgHeartbeat` (8) / `MsgHeartbeatResponse` (9).
+    /// `msg_type` is eraftpb field 1, a varint, so the encoding is
+    /// `[0x08][value]` (the value < 16, single byte). Codec-independent: the
+    /// same bytes under protobuf-codec or prost-codec. A heartbeat means
+    /// "don't elect me," not "I have work," so it must NOT wake a hibernated
+    /// group (multiraft-scaling-learnings §3.1).
+    inline fn isHeartbeatLike(bytes: []const u8) bool {
+        if (bytes.len < 2) return false;
+        if (bytes[0] != 0x08) return false; // field 1 (msg_type), varint tag
+        return bytes[1] == 8 or bytes[1] == 9;
     }
 
     /// Buffer one outbound message (from `Manager.takeMessages`) for its
@@ -208,6 +237,8 @@ pub const Transport = struct {
                 .msg_ptr = msg.ptr,
                 .msg_len = msg.len,
             }) catch return;
+            // Real raft traffic wakes a hibernated group; heartbeats do not.
+            if (!isHeartbeatLike(msg)) self.woke.append(self.allocator, group_id) catch {};
         }
         _ = self.manager.stepBatch(self.step_scratch.items);
     }
