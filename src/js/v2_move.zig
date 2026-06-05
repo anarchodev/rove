@@ -108,6 +108,8 @@ pub fn tryHandleV2(
         try handleForwardBegin(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-forward-end")) {
         try handleForwardEnd(server, allocator, worker, ent, sid, sess, method, body);
+    } else if (std.mem.eql(u8, sys_rest, "v2-snapshot")) {
+        try handleSnapshot(server, allocator, worker, ent, sid, sess, method, body);
     } else {
         try respb.setSystemResponse(server, ent, sid, sess, 404, "unknown v2 move endpoint\n", allocator, null, null);
     }
@@ -290,14 +292,22 @@ fn handleAttach(
     const tenant = respb.findHeader(rh, TENANT_HEADER) orelse
         return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Tenant\n");
 
-    // Create the instance store, load the bundle into it, then attach the
-    // raft group at the migration epoch (source birth 0 + 1) so a fresh
-    // index sequence starts and any straggler from the old incarnation is
-    // fenced out (moot single-node, load-bearing under Phase-7 overlap).
+    // Create the instance store, load the bundle into it (if any), then
+    // attach the raft group at the migration epoch (source birth 0 + 1) so a
+    // fresh index sequence starts and any straggler from the old incarnation
+    // is fenced out (moot single-node, load-bearing under Phase-7 overlap).
+    //
+    // An EMPTY body is an "empty attach" (Phase 7 zero-downtime entry): form
+    // the group + instance with NO data so the destination is ready to
+    // receive the source's live forwards BEFORE its snapshot is shipped — the
+    // snapshot then loads insert-if-absent so it never clobbers a forwarded
+    // (newer) key. The brief-pause Phase-4/5d move ships the bundle here.
     const inst = ensureInstance(worker, tenant) catch
         return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
-    inst.kv.loadTenantBundle(body) catch
-        return reply(server, allocator, ent, sid, sess, 400, "bundle load failed\n");
+    if (body.len > 0) {
+        inst.kv.loadTenantBundle(body) catch
+            return reply(server, allocator, ent, sid, sess, 400, "bundle load failed\n");
+    }
 
     const gid = worker.raft.registerTenant(tenant) catch
         return reply(server, allocator, ent, sid, sess, 500, "register failed\n");
@@ -354,6 +364,45 @@ fn handleResume(
     defer allocator.free(tenant);
     if (worker.raft.gidForTenant(tenant)) |gid| worker.raft.unquiesce(gid);
     try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
+}
+
+// ── v2-snapshot: non-quiescing consistent dump (source) ──────────────
+
+/// `POST /_system/v2-snapshot {tenant}` → the tenant's key-space as a
+/// migration bundle, dumped WITHOUT quiescing — the source keeps serving
+/// (Phase 7 zero-downtime). Unlike `v2-bundle` (which quiesces + drains for
+/// the brief-pause move), the snapshot is just `dumpTenantBundle`'s
+/// consistent read view; concurrent writes are NOT in this snapshot but are
+/// carried to the destination by the live forward stream (`v2-forward-begin`,
+/// started BEFORE this snapshot), and the destination loads this bundle
+/// insert-if-absent so a forwarded (newer) key is never clobbered by the
+/// (older) snapshot. Leader-gated like `v2-bundle`.
+fn handleSnapshot(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    body: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+    const tenant = parseTenant(allocator, body) orelse
+        return reply(server, allocator, ent, sid, sess, 400, "expected {\"tenant\"}\n");
+    defer allocator.free(tenant);
+
+    const gid = worker.raft.gidForTenant(tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 409, "tenant not active on this cluster\n");
+    if (!worker.raft.isLeaderOf(gid))
+        return reply(server, allocator, ent, sid, sess, 421, "not the leader for this tenant; try another node\n");
+
+    const inst = (worker.node.tenant.getInstance(tenant) catch null) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "unknown tenant\n");
+    const bundle = inst.kv.dumpTenantBundle(allocator) catch
+        return reply(server, allocator, ent, sid, sess, 500, "snapshot dump failed\n");
+    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, bundle, allocator, null, "application/octet-stream");
 }
 
 // ── v2-leader: per-tenant leadership probe ───────────────────────────
