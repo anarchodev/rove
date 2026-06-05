@@ -2151,6 +2151,124 @@ const ResolveResult = union(enum) {
 ///  3. Fall-through handler dispatch — the caller runs the same
 ///     per-handler code for both shapes, branched on `is_admin` for
 ///     CORS + static-first decisions.
+///
+/// Serve-or-forward (Phase 7 slice a): this cluster has no tenant for `host`.
+/// If `cluster_id` + `cp_url` are configured, ask the control plane who owns
+/// the host (`GET {cp_url}/_cp/route?host=`); if the owner is a DIFFERENT
+/// cluster, reverse-proxy the request to it (leader-aware — try its nodes,
+/// retry on 503) and relay the response, returning true. Returns false when
+/// forwarding is disabled, the CP doesn't know the host, or this cluster is
+/// the named owner (a genuine local miss → caller 404s). Blocking libcurl on
+/// the MISS path only (mis-routed traffic), never the serve path; async
+/// forwarding off the customer hot path is a production refinement. Headers
+/// are status+body passthrough (content-type dropped), matching the front
+/// door's Phase-3 proxy.
+fn tryForwardToOwner(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    path: []const u8,
+    host: []const u8,
+    rh: h2.ReqHeaders,
+    body: []const u8,
+) !bool {
+    const cluster_id = worker.cluster_id orelse return false;
+    const cp_url = worker.cp_url orelse return false;
+    const curl = blob_mod.curl;
+
+    // 1. Ask the CP who owns this host.
+    const route_url = try std.fmt.allocPrint(allocator, "{s}/_cp/route?host={s}", .{ cp_url, host });
+    defer allocator.free(route_url);
+    var cp_easy = curl.Easy.init(allocator) catch return false;
+    defer cp_easy.deinit();
+    var cp_resp = cp_easy.request(allocator, .{
+        .method = .GET,
+        .url = route_url,
+        .headers = &.{},
+        .body = "",
+        .http_version = .h2c_prior_knowledge,
+        .verify_tls = false,
+    }) catch return false;
+    defer cp_resp.deinit(allocator);
+    if (cp_resp.status != 200) return false;
+    const route_body = cp_resp.body orelse return false;
+
+    var parsed = std.json.parseFromSlice(struct {
+        cluster: []const u8,
+        nodes: [][]const u8,
+    }, allocator, route_body, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+    // This cluster IS the named owner but lacks the tenant → genuine miss.
+    if (std.mem.eql(u8, parsed.value.cluster, cluster_id)) return false;
+    if (parsed.value.nodes.len == 0) return false;
+
+    // 2. Build the forward headers once (Host preserved; pseudo + hop-by-hop
+    //    stripped).
+    const cmethod = curlMethod(method) orelse return false;
+    var fwd_headers: std.ArrayListUnmanaged(curl.Header) = .empty;
+    defer fwd_headers.deinit(allocator);
+    try fwd_headers.append(allocator, .{ .name = "Host", .value = host });
+    if (rh.fields) |fields| {
+        var i: u32 = 0;
+        while (i < rh.count) : (i += 1) {
+            const f = fields[i];
+            const fname = f.name[0..f.name_len];
+            if (fname.len > 0 and fname[0] == ':') continue;
+            if (std.ascii.eqlIgnoreCase(fname, "host")) continue;
+            if (isHopByHopHdr(fname)) continue;
+            try fwd_headers.append(allocator, .{ .name = fname, .value = f.value[0..f.value_len] });
+        }
+    }
+
+    // 3. Forward leader-aware: try each node, retry on 503 (a follower).
+    for (parsed.value.nodes, 0..) |node_base, ni| {
+        const last = ni + 1 == parsed.value.nodes.len;
+        const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ node_base, path });
+        defer allocator.free(url);
+        var easy = curl.Easy.init(allocator) catch {
+            if (!last) continue;
+            return false;
+        };
+        defer easy.deinit();
+        var resp = easy.request(allocator, .{
+            .method = cmethod,
+            .url = url,
+            .headers = fwd_headers.items,
+            .body = body,
+            .http_version = .h2c_prior_knowledge,
+            .verify_tls = false,
+        }) catch {
+            if (!last) continue;
+            return false;
+        };
+        defer resp.deinit(allocator);
+        if (resp.status == 503 and !last) continue;
+        const rbody: []const u8 = if (resp.body) |b| b else "";
+        try respb.setSimpleResponse(server, ent, sid, sess, resp.status, rbody, allocator);
+        return true;
+    }
+    return false;
+}
+
+fn curlMethod(s: []const u8) ?blob_mod.curl.Method {
+    if (std.mem.eql(u8, s, "GET")) return .GET;
+    if (std.mem.eql(u8, s, "PUT")) return .PUT;
+    if (std.mem.eql(u8, s, "POST")) return .POST;
+    if (std.mem.eql(u8, s, "HEAD")) return .HEAD;
+    if (std.mem.eql(u8, s, "DELETE")) return .DELETE;
+    return null;
+}
+
+fn isHopByHopHdr(name: []const u8) bool {
+    const hop = [_][]const u8{ "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade" };
+    for (hop) |h| if (std.ascii.eqlIgnoreCase(name, h)) return true;
+    return false;
+}
+
 fn resolveRequest(
     server: anytype,
     allocator: std.mem.Allocator,
@@ -2162,6 +2280,7 @@ fn resolveRequest(
     path: []const u8,
     host: []const u8,
     rh: h2.ReqHeaders,
+    req_body: []const u8,
 ) !ResolveResult {
     const is_admin_host = if (worker.admin_api_domain) |pat|
         pat.len > 0 and std.mem.eql(u8, host, pat)
@@ -2175,6 +2294,14 @@ fn resolveRequest(
             return .handled;
         };
         if (r == null) {
+            // Serve-or-forward (Phase 7 slice a): this cluster can't resolve
+            // the tenant locally. If a control plane is configured, ask who
+            // owns the host and forward there (a stale public route or a
+            // post-move source lands here) — a hop, not a 404. Only a genuine
+            // unknown / owned-here-but-missing tenant falls through to 404.
+            if (try tryForwardToOwner(server, allocator, worker, ent, sid, sess, method, path, host, rh, req_body))
+                return .handled;
+
             const ps = worker.node.tenant.publicSuffix() orelse "(none)";
             const ad = worker.admin_api_domain orelse "(none)";
             const body_owned = std.fmt.allocPrint(
@@ -2408,7 +2535,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
 
         const host = worker_mod.hostOnly(authority);
 
-        const resolved = switch (try resolveRequest(server, allocator, worker, ent, sid, sess, method, path, host, rh)) {
+        const resolved = switch (try resolveRequest(server, allocator, worker, ent, sid, sess, method, path, host, rh, body)) {
             .handled => {
                 processed += 1;
                 continue;
