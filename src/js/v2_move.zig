@@ -110,6 +110,8 @@ pub fn tryHandleV2(
         try handleForwardEnd(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-snapshot")) {
         try handleSnapshot(server, allocator, worker, ent, sid, sess, method, body);
+    } else if (std.mem.eql(u8, sys_rest, "v2-load-merge")) {
+        try handleLoadMerge(server, allocator, worker, ent, sid, sess, method, rh, body);
     } else {
         try respb.setSystemResponse(server, ent, sid, sess, 404, "unknown v2 move endpoint\n", allocator, null, null);
     }
@@ -403,6 +405,39 @@ fn handleSnapshot(
     const bundle = inst.kv.dumpTenantBundle(allocator) catch
         return reply(server, allocator, ent, sid, sess, 500, "snapshot dump failed\n");
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, bundle, allocator, null, "application/octet-stream");
+}
+
+// ── v2-load-merge: insert-if-absent snapshot load (destination) ──────
+
+/// `POST /_system/v2-load-merge` (bundle bytes + `X-Rewind-Tenant`) — load a
+/// non-quiescing snapshot into an already-attached (empty) destination group,
+/// INSERT-IF-ABSENT: a key a live forward already wrote (newer) is kept; the
+/// snapshot's older value is dropped. This is the zero-downtime move's
+/// out-of-band snapshot load — the bytes go straight into `inst.kv`, never
+/// the raft log (only the forward delta replicates through raft). One
+/// exclusive kvexp txn, so it is race-free against concurrent forward-applies
+/// on this node. Fanned to EVERY destination node by the orchestrator (like
+/// the attach fan-out). The instance + group already exist (empty-attach).
+fn handleLoadMerge(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    rh: h2.ReqHeaders,
+    body: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+    const tenant = respb.findHeader(rh, TENANT_HEADER) orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Tenant\n");
+    const inst = ensureInstance(worker, tenant) catch
+        return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
+    inst.kv.loadTenantBundleMerge(body) catch
+        return reply(server, allocator, ent, sid, sess, 400, "merge load failed\n");
+    try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
 }
 
 // ── v2-leader: per-tenant leadership probe ───────────────────────────
