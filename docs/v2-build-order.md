@@ -272,9 +272,14 @@ This is the heart of the rewrite.
 > (empty-attach → forward-begin → snapshot → load-merge → flip → evict).
 > `scripts/zero_downtime_move_smoke.py` proves a write made AFTER the
 > snapshot survives (not regressed) and the source serves throughout.
-> Remaining: the directory's raft-replication (hardening behind `Directory`),
-> and the continuous-load zero-failed-requests exit smoke (a CP-following
-> concurrent writer). A suspected `v2-bundle`
+> **EXIT MET ⭐:** `scripts/zero_downtime_load_smoke.py` moves a tenant under
+> CONTINUOUS LOAD (a CP-following concurrent writer) with ZERO failed requests
+> + ZERO lost writes. (The load smoke caught + fixed a forward-marker snapshot
+> pollution: `_move/forward` lived in the tenant store, so the dest inherited
+> it + self-forwarded — `handleLoadMerge` now drops it.) Remaining hardening:
+> directory raft-replication (behind `Directory`), multi-node-dest forward
+> re-targeting, a shutdown-ordering panic on SIGTERM teardown. A suspected
+> `v2-bundle`
 > empty-snapshot race was **investigated + cleared** (NOT a kvexp bug —
 > 0/63k repro incl. concurrent durabilize; the bundle HTTP path is reliable
 > across 600 fetches incl. a 42 KB multi-frame body; a corrupt bundle aborts

@@ -437,6 +437,16 @@ fn handleLoadMerge(
         return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
     inst.kv.loadTenantBundleMerge(body) catch
         return reply(server, allocator, ent, sid, sess, 400, "merge load failed\n");
+    // The snapshot was dumped from the SOURCE's store, which holds the
+    // source's `_move/forward` marker (it lives in the tenant store today).
+    // The destination must NEVER inherit it — after the flip it would read
+    // that stale target and forward to it (often itself), deadlocking its own
+    // worker. Drop it. (Cleaner long-term: keep the forward marker out of the
+    // tenant data store entirely so it never enters a snapshot.)
+    inst.kv.delete(FORWARD_MARKER) catch |err| switch (err) {
+        error.NotFound => {},
+        else => std.log.warn("v2-load-merge: clearing inherited {s} failed: {s}", .{ FORWARD_MARKER, @errorName(err) }),
+    };
     try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
 }
 
