@@ -899,6 +899,23 @@ pub fn build(b: *std.Build) void {
     v2_node_mod.addImport("raft-net", raftnet_mod);
     const v2_node_test = b.addTest(.{ .root_module = v2_node_mod });
 
+    // ── V2 Phase 6 — hibernation / active-set pump-cost microbench ─────
+    // (docs/v2-phase6-hibernation.md). Measures node pump cycle time vs.
+    // active-set size: K idle tenants drain out so a cycle ticks ~nothing.
+    // Build with -Doptimize=ReleaseFast; run `v2-hibernation-bench [K] [cycles]`.
+    const v2_hib_bench_mod = b.createModule(.{
+        .root_source_file = b.path("examples/v2_hibernation_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    v2_hib_bench_mod.link_libc = true;
+    v2_hib_bench_mod.addImport("raft_rs_zig", raft_dep.module("raft_rs_zig"));
+    v2_hib_bench_mod.addImport("node", v2_node_mod);
+    const v2_hib_bench = b.addExecutable(.{ .name = "v2-hibernation-bench", .root_module = v2_hib_bench_mod });
+    v2_hib_bench.linkLibrary(raft_dep.artifact("raft_rs_zig"));
+    const v2_hib_bench_step = b.step("v2-hibernation-bench", "Build the V2 Phase-6 hibernation pump-cost microbench");
+    v2_hib_bench_step.dependOn(&b.addInstallArtifact(v2_hib_bench, .{}).step);
+
     // ── V2 Phase 5 — the cross-node transport adapter (coalesced) ──────
     // `src-v2/kv/transport.zig` wraps `raft_net` with per-recipient
     // coalescing; the Node drives it from its pump. Tested on its own

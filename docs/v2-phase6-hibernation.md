@@ -1,14 +1,15 @@
 # V2 Phase 6 — scale: hibernation / active-set (K = thousands of tenants)
 
-> **Status (2026-06-04). Core DONE.** The active-set hibernation machinery
-> is in `src-v2/kv/node.zig` + `src-v2/kv/transport.zig`, green under
-> `v2-test` (46/46). An idle group drops out of the tick set and costs the
-> pump nothing; it wakes on the next propose / non-heartbeat step. Proven by
-> three tests: single-node hibernate→wake, a K-group idle drain, and the
+> **Status (2026-06-04). DONE.** The active-set hibernation machinery is in
+> `src-v2/kv/node.zig` + `src-v2/kv/transport.zig`, green under `v2-test`
+> (46/46). An idle group drops out of the tick set and costs the pump
+> nothing; it wakes on the next propose / non-heartbeat step. Proven by three
+> tests (single-node hibernate→wake, a K-group idle drain, and the
 > load-bearing one — a 3-node group hibernates with **no spurious leader
-> change** and a propose wakes it + replicates. The full K=10k macrobench is
-> a noted follow-up (needs a cluster bench harness; the unit tests prove the
-> mechanism + the multi-node correctness).
+> change** and a propose wakes it + replicates) plus the `v2-hibernation-bench`
+> pump-cost microbench (see Results below) — the build-order's K-tenant exit.
+> A cluster-scale live-traffic macrobench remains a (separate, larger)
+> follow-up.
 > Spec: [`v2-build-order.md`](v2-build-order.md) §Phase 6;
 > [`v2-multiraft-scaling-learnings.md`](v2-multiraft-scaling-learnings.md)
 > §3.1 (the finding this implements).
@@ -106,15 +107,34 @@ nothing to serve, so this costs nothing real.
   a propose then wakes the group + replicates to every node with no
   re-election.
 
-## Follow-ups (not Phase-6-core blockers)
+## Results — `v2-hibernation-bench` (the K-tenant exit)
 
-- **K=10k macrobench.** The build-order exit calls for "thousands of
-  mostly-idle tenants do not burn the pump (cycle time stays low); a
-  K-tenant bench." The unit tests prove the mechanism + multi-node
-  correctness; a cluster-scale `h2load`/`smoke_lib` macrobench over
-  thousands of tenants (per
-  [`reference_bench_harness_direction`]) quantifies the cycle-time win and
-  belongs with the other cluster macrobenches.
+A node-level pump-cost microbench (`examples/v2_hibernation_bench.zig`,
+`zig build v2-hibernation-bench -Doptimize=ReleaseFast`,
+`./zig-out/bin/v2-hibernation-bench [K] [cycles]`): form K tenant groups on
+one node, measure the mean pump cycle wall time with all K active, let them
+hibernate, then measure it with the active set drained to zero.
+
+| K (tenants) | tick-all (all active) | hibernated (idle) | win |
+|---|---|---|---|
+| 2,000  | 210 µs/cycle (≈4.8k cycles/s) | ~0.1 µs/cycle | ~2,560× |
+| 10,000 | 1000 µs/cycle (≈1.0k cycles/s) | ~0 µs/cycle   | ~31,000× |
+
+The tick-all column scales linearly with K (the O(K) cost Phase 6 removes —
+1 ms/cycle at 10k matches the §3.1 prototype's post-heartbeat-fix number);
+the hibernated column is flat at ~0 regardless of K, because idle groups
+leave the active set entirely and the pump ticks nothing. All groups still
+exist (hibernated ≠ destroyed) and wake on the next request. This is the
+build-order's "thousands of mostly-idle tenants do not burn the pump."
+
+## Follow-ups (not blockers)
+
+- **Cluster-scale live-traffic macrobench.** This microbench isolates the
+  pump tick cost on one node; a cluster-scale `h2load`/`smoke_lib`
+  macrobench over thousands of *live* tenants (per
+  [`reference_bench_harness_direction`]) would measure the end-to-end win
+  under real request load + the multi-node heartbeat-coalescing interaction.
+  Belongs with the other cluster macrobenches.
 - **Hibernation deadline as a config knob.** `hibernate_ns` is a per-`Node`
   field today (env-overridable wiring in `rewind` if operations ever needs
   it); left at the 2 s default.
