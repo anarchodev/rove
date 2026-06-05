@@ -248,6 +248,21 @@ This is the heart of the rewrite.
 
 #### Phase 7 — Zero-downtime move (the upgrade)
 
+> **IN PROGRESS (2026-06-05).** Architecture locked (see the
+> `project_v2_zero_downtime_move` memory): public routing = Cloudflare as a
+> best-effort hint (NOT the cutover authority); cutover authority = our
+> replicated CP directory; every DP cluster serve-or-forwards (stale proxy
+> = an extra hop, never a failure); data overlap = dual-write forwarding +
+> the epoch fence. CP = a dedicated cluster, a separate binary (`rewind-front`
+> evolved), storage on our own `bridge`/`Node` raft. **Slice (b) — dual-write
+> forwarding — DONE:** `v2-apply` (dest) + `v2-forward-begin`/`-end` (source
+> `_move/forward` marker) + `handleKv` dual-write; `scripts/zero_downtime_forward_smoke.py`
+> proves the source keeps serving while every committed write reaches the
+> dest. Remaining: (a) serve-or-forward + the replicated CP directory, (c)
+> the relinquish/acquire epoch-fenced cutover. **Blocker found:** a
+> pre-existing `v2-bundle` empty-snapshot race (a write dumped instantly
+> after commit can be missing) must be fixed before (c).
+
 - **New:** the `relinquish` / `acquire` handshake — keep serving on the
   source while the destination catches up, with an epoch-fenced overlap
   window so stale source traffic to the destination rejects; drain
