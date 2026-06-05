@@ -186,6 +186,17 @@ const Router = struct {
                 continue;
             }
 
+            // 0b. Control plane: `/_cp/route?host=H` — the authoritative
+            //     owner lookup DP clusters consult for serve-or-forward
+            //     (Phase 7 slice a). A DP that can't serve a tenant locally
+            //     asks who currently owns it, and forwards there; the CP
+            //     (this front door, evolving into a dedicated binary) is the
+            //     one component with the host→tenant→cluster mapping.
+            if (std.mem.startsWith(u8, req_path, "/_cp/")) {
+                try self.handleCp(server, ent, sid, sess, req_path);
+                continue;
+            }
+
             // 1. Resolve the inbound tenant from :authority (fall back to
             //    Host). Strip any `:port` — the host map is keyed on the
             //    bare hostname, matching the worker's `hostOnly`.
@@ -331,6 +342,49 @@ const Router = struct {
         try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
         try server.reg.set(ent, &server.request_out, h2.Session, sess);
         try server.reg.move(ent, &server.request_out, &server.response_in);
+    }
+
+    // ── Control plane: owner lookup (serve-or-forward) ───────────────
+
+    /// `GET /_cp/route?host=H` — return the cluster that currently owns the
+    /// tenant for `H`, as JSON `{cluster, tenant, moving, nodes:[…]}`, or 404
+    /// if the host maps to no tenant / the tenant is unplaced. A DP cluster
+    /// that can't serve a request locally consults this and forwards to the
+    /// owner (Phase 7 slice a serve-or-forward) — so a stale Cloudflare route
+    /// (or a request to a post-move source) costs an extra hop, never a
+    /// failure. No auth: it leaks only placement (host→cluster), which the
+    /// public proxy config already encodes; lock it down when the CP becomes
+    /// its own binary.
+    fn handleCp(self: *Router, server: *FrontH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, path: []const u8) !void {
+        if (!std.mem.startsWith(u8, path, "/_cp/route")) {
+            try replyStatus(server, ent, sid, sess, 404);
+            return;
+        }
+        const host = queryParam(path, "host") orelse {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        };
+        const tenant = self.hosts.tenantFor(host) orelse {
+            try replyStatus(server, ent, sid, sess, 404);
+            return;
+        };
+        const resolution = self.directory.resolve(tenant) orelse {
+            try replyStatus(server, ent, sid, sess, 404);
+            return;
+        };
+
+        const a = self.allocator;
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(a);
+        const w = buf.writer(a);
+        try w.print("{{\"cluster\":\"{s}\",\"tenant\":\"{s}\",\"moving\":{},\"nodes\":[", .{ resolution.cluster.id, tenant, resolution.moving });
+        for (resolution.cluster.nodes, 0..) |n, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.print("\"{s}\"", .{n});
+        }
+        try w.writeAll("]}");
+        const owned = try buf.toOwnedSlice(a);
+        try replyText(server, ent, sid, sess, 200, owned);
     }
 
     // ── Control plane: tenant-move orchestration ─────────────────────
@@ -604,6 +658,18 @@ const Router = struct {
 fn hostOnly(authority: []const u8) []const u8 {
     if (std.mem.lastIndexOfScalar(u8, authority, ':')) |i| return authority[0..i];
     return authority;
+}
+
+/// Read a single query-string value (`/p?a=b&c=d`) by key. Values taken
+/// verbatim (no percent-decoding — the CP route lookup uses bare hostnames).
+fn queryParam(path: []const u8, key: []const u8) ?[]const u8 {
+    const q = std.mem.indexOfScalar(u8, path, '?') orelse return null;
+    var it = std.mem.tokenizeScalar(u8, path[q + 1 ..], '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
+    }
+    return null;
 }
 
 /// hop-by-hop headers must not be forwarded across a proxy (RFC 7230 §6.1).
