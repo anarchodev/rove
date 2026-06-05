@@ -51,15 +51,19 @@ pub const Error = error{
     OutOfMemory,
 };
 
-/// Where a cluster lives, from the front door's point of view. `base_url`
-/// is the origin the front door forwards a tenant's request to (e.g.
-/// `http://127.0.0.1:18091`); `id` is the logical name used in placement
-/// config and move commands. Both slices point into the `Directory`'s
-/// owned storage and are stable for the directory's lifetime, so a
-/// `ClusterRef` returned by value is safe to hold past the lock.
+/// Where a cluster lives, from the front door's point of view. `nodes` is
+/// the cluster's member node origins (e.g. `http://127.0.0.1:18092`) — one
+/// for a single-node cluster, N for a multi-node (Phase 5) cluster. The
+/// front door forwards a tenant's request to whichever node currently
+/// leads its group (it discovers the leader by trying nodes; a follower
+/// 503s a write so the front door retries the next), and fans a move's
+/// attach/evict out to every node. `id` is the logical name used in
+/// placement config and move commands. All slices (and the `nodes` backing
+/// array) point into the `Directory`'s owned storage and are stable for
+/// its lifetime, so a `ClusterRef` returned by value is safe past the lock.
 pub const ClusterRef = struct {
     id: []const u8,
-    base_url: []const u8,
+    nodes: []const []const u8,
 };
 
 /// A tenant's placement. Phase 3 has only `active`; Phase 4 adds e.g.
@@ -100,7 +104,12 @@ pub const Directory = struct {
 
     const OwnedCluster = struct {
         id: []u8,
-        base_url: []u8,
+        /// Owned array of owned node-origin URLs. Allocated once per
+        /// `addCluster`; never appended to, so the backing array address is
+        /// stable and a `ClusterRef.nodes` slice held past the lock stays
+        /// valid even when `clusters` reallocs (the slice header is copied
+        /// by value; the array it points at does not move).
+        nodes: [][]u8,
     };
 
     pub fn init(allocator: std.mem.Allocator) Directory {
@@ -111,7 +120,8 @@ pub const Directory = struct {
         const a = self.allocator;
         for (self.clusters.items) |c| {
             a.free(c.id);
-            a.free(c.base_url);
+            for (c.nodes) |n| a.free(n);
+            a.free(c.nodes);
         }
         self.clusters.deinit(a);
         self.cluster_idx.deinit(a);
@@ -123,34 +133,57 @@ pub const Directory = struct {
 
     // ── Cluster registry (control plane) ─────────────────────────────
 
-    /// Register a cluster the directory can place tenants on. Idempotent
-    /// on `id` — a repeat call with the same id updates its `base_url`
-    /// (re-addressing a cluster) and keeps the index stable. Safe from any
-    /// thread.
-    pub fn addCluster(self: *Directory, id: []const u8, base_url: []const u8) Error!void {
+    /// Register a cluster the directory can place tenants on, with its
+    /// member node origins (one URL for a single-node cluster, N for a
+    /// multi-node one). Idempotent on `id` — a repeat call with the same id
+    /// re-addresses the cluster (replaces its node set) and keeps the index
+    /// stable. `nodes` must be non-empty. Safe from any thread.
+    pub fn addCluster(self: *Directory, id: []const u8, nodes: []const []const u8) Error!void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.addClusterLocked(id, base_url);
+        return self.addClusterLocked(id, nodes);
     }
 
-    fn addClusterLocked(self: *Directory, id: []const u8, base_url: []const u8) Error!void {
+    fn addClusterLocked(self: *Directory, id: []const u8, nodes: []const []const u8) Error!void {
         const a = self.allocator;
+        if (nodes.len == 0) return Error.BadConfig;
+        const nodes_dup = try dupeNodes(a, nodes);
+        errdefer freeNodes(a, nodes_dup);
+
         if (self.cluster_idx.get(id)) |idx| {
             // Re-address in place; the id slice (and its index) stay put.
-            const new_url = a.dupe(u8, base_url) catch return Error.OutOfMemory;
-            a.free(self.clusters.items[idx].base_url);
-            self.clusters.items[idx].base_url = new_url;
+            const old = self.clusters.items[idx].nodes;
+            self.clusters.items[idx].nodes = nodes_dup;
+            freeNodes(a, old);
             return;
         }
         const id_dup = a.dupe(u8, id) catch return Error.OutOfMemory;
         errdefer a.free(id_dup);
-        const url_dup = a.dupe(u8, base_url) catch return Error.OutOfMemory;
-        errdefer a.free(url_dup);
         const idx = self.clusters.items.len;
-        self.clusters.append(a, .{ .id = id_dup, .base_url = url_dup }) catch return Error.OutOfMemory;
+        self.clusters.append(a, .{ .id = id_dup, .nodes = nodes_dup }) catch return Error.OutOfMemory;
         errdefer _ = self.clusters.pop();
         // Key the index on the owned id dup so it outlives the caller's slice.
         self.cluster_idx.put(a, id_dup, idx) catch return Error.OutOfMemory;
+    }
+
+    /// Deep-copy a node-URL list into owned storage.
+    fn dupeNodes(a: std.mem.Allocator, nodes: []const []const u8) Error![][]u8 {
+        const out = a.alloc([]u8, nodes.len) catch return Error.OutOfMemory;
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |n| a.free(n);
+            a.free(out);
+        }
+        for (nodes, 0..) |n, i| {
+            out[i] = a.dupe(u8, n) catch return Error.OutOfMemory;
+            filled = i + 1;
+        }
+        return out;
+    }
+
+    fn freeNodes(a: std.mem.Allocator, nodes: [][]u8) void {
+        for (nodes) |n| a.free(n);
+        a.free(nodes);
     }
 
     // ── Placement (control plane writes, front door reads) ───────────
@@ -204,19 +237,19 @@ pub const Directory = struct {
         const p = self.placements.get(tenant_id) orelse return null;
         const c = self.clusters.items[p.cluster_idx];
         return .{
-            .cluster = .{ .id = c.id, .base_url = c.base_url },
+            .cluster = .{ .id = c.id, .nodes = c.nodes },
             .moving = p.state == .moving,
         };
     }
 
     /// Resolve a cluster id to its `ClusterRef` (the move orchestrator
-    /// needs the destination cluster's `base_url`). Null if unknown.
+    /// needs the destination cluster's node set). Null if unknown.
     pub fn clusterById(self: *Directory, cluster_id: []const u8) ?ClusterRef {
         self.mutex.lock();
         defer self.mutex.unlock();
         const idx = self.cluster_idx.get(cluster_id) orelse return null;
         const c = self.clusters.items[idx];
-        return .{ .id = c.id, .base_url = c.base_url };
+        return .{ .id = c.id, .nodes = c.nodes };
     }
 
     // ── Move state (control plane writes; front door orchestration) ──
@@ -245,20 +278,35 @@ pub const Directory = struct {
     // ── Static config seeding ────────────────────────────────────────
 
     /// Seed clusters from a config string of the form
-    /// `id=base_url;id=base_url;…` (whitespace around tokens trimmed,
-    /// trailing `;` allowed). The Phase-3 "dead simple static config" path
-    /// — the front door calls this once at startup from an env var. Each
-    /// entry is `addCluster`'d (so a repeat id re-addresses).
+    /// `id=url1,url2,…;id=url;…` — each cluster's value is a comma-separated
+    /// list of member node origins (one for a single-node cluster, N for a
+    /// multi-node one). Whitespace around tokens is trimmed, a trailing `;`
+    /// is allowed. The static-config path — the front door calls this once
+    /// at startup from an env var. Each entry is `addCluster`'d (so a repeat
+    /// id re-addresses). A back-compatible single-URL value is just a list
+    /// of one.
     pub fn seedClusters(self: *Directory, config: []const u8) Error!void {
+        var node_buf: [16][]const u8 = undefined;
         var it = std.mem.tokenizeScalar(u8, config, ';');
         while (it.next()) |raw| {
             const entry = std.mem.trim(u8, raw, " \t\r\n");
             if (entry.len == 0) continue;
             const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return Error.BadConfig;
             const id = std.mem.trim(u8, entry[0..eq], " \t");
-            const url = std.mem.trim(u8, entry[eq + 1 ..], " \t");
-            if (id.len == 0 or url.len == 0) return Error.BadConfig;
-            try self.addCluster(id, url);
+            const urls = std.mem.trim(u8, entry[eq + 1 ..], " \t");
+            if (id.len == 0 or urls.len == 0) return Error.BadConfig;
+
+            var n: usize = 0;
+            var nit = std.mem.tokenizeScalar(u8, urls, ',');
+            while (nit.next()) |rawn| {
+                const url = std.mem.trim(u8, rawn, " \t");
+                if (url.len == 0) continue;
+                if (n >= node_buf.len) return Error.BadConfig; // > 16 nodes/cluster
+                node_buf[n] = url;
+                n += 1;
+            }
+            if (n == 0) return Error.BadConfig;
+            try self.addCluster(id, node_buf[0..n]);
         }
     }
 
@@ -284,18 +332,24 @@ pub const Directory = struct {
 
 const testing = std.testing;
 
+/// Test helper: register a single-node cluster (one node origin).
+fn addNode1(dir: *Directory, id: []const u8, url: []const u8) !void {
+    try dir.addCluster(id, &.{url});
+}
+
 test "directory: addCluster + assign + clusterFor round-trips" {
     var dir = Directory.init(testing.allocator);
     defer dir.deinit();
 
-    try dir.addCluster("cluster-1", "http://127.0.0.1:18091");
-    try dir.addCluster("cluster-2", "http://127.0.0.1:18092");
+    try addNode1(&dir, "cluster-1", "http://127.0.0.1:18091");
+    try addNode1(&dir, "cluster-2", "http://127.0.0.1:18092");
     try dir.assign("alice", "cluster-1");
     try dir.assign("bob", "cluster-2");
 
     const a = dir.clusterFor("alice").?;
     try testing.expectEqualStrings("cluster-1", a.id);
-    try testing.expectEqualStrings("http://127.0.0.1:18091", a.base_url);
+    try testing.expectEqual(@as(usize, 1), a.nodes.len);
+    try testing.expectEqualStrings("http://127.0.0.1:18091", a.nodes[0]);
     const b = dir.clusterFor("bob").?;
     try testing.expectEqualStrings("cluster-2", b.id);
 
@@ -305,22 +359,37 @@ test "directory: addCluster + assign + clusterFor round-trips" {
 test "directory: move flips placement (the Phase-4 seam)" {
     var dir = Directory.init(testing.allocator);
     defer dir.deinit();
-    try dir.addCluster("c1", "http://h:1");
-    try dir.addCluster("c2", "http://h:2");
+    try addNode1(&dir, "c1", "http://h:1");
+    try addNode1(&dir, "c2", "http://h:2");
     try dir.assign("t", "c1");
 
     try testing.expectEqualStrings("c1", dir.clusterFor("t").?.id);
     try dir.move("t", "c2");
     try testing.expectEqualStrings("c2", dir.clusterFor("t").?.id);
-    // base_url follows the new cluster.
-    try testing.expectEqualStrings("http://h:2", dir.clusterFor("t").?.base_url);
+    // node origin follows the new cluster.
+    try testing.expectEqualStrings("http://h:2", dir.clusterFor("t").?.nodes[0]);
+}
+
+test "directory: multi-node cluster carries every node origin" {
+    var dir = Directory.init(testing.allocator);
+    defer dir.deinit();
+    try dir.addCluster("c3", &.{ "http://h:1", "http://h:2", "http://h:3" });
+    try dir.assign("t", "c3");
+    const c = dir.clusterFor("t").?;
+    try testing.expectEqual(@as(usize, 3), c.nodes.len);
+    try testing.expectEqualStrings("http://h:1", c.nodes[0]);
+    try testing.expectEqualStrings("http://h:3", c.nodes[2]);
+    // Re-address replaces the whole node set.
+    try dir.addCluster("c3", &.{"http://h:9"});
+    try testing.expectEqual(@as(usize, 1), dir.clusterFor("t").?.nodes.len);
+    try testing.expectEqualStrings("http://h:9", dir.clusterFor("t").?.nodes[0]);
 }
 
 test "directory: beginMove holds, move flips, abort reverts" {
     var dir = Directory.init(testing.allocator);
     defer dir.deinit();
-    try dir.addCluster("c1", "http://h:1");
-    try dir.addCluster("c2", "http://h:2");
+    try addNode1(&dir, "c1", "http://h:1");
+    try addNode1(&dir, "c2", "http://h:2");
     try dir.assign("t", "c1");
 
     // Active on c1.
@@ -348,15 +417,15 @@ test "directory: beginMove holds, move flips, abort reverts" {
     try testing.expectEqualStrings("c2", r.cluster.id);
     try testing.expect(!r.moving);
 
-    // clusterById resolves the destination's base_url for the orchestrator.
-    try testing.expectEqualStrings("http://h:1", dir.clusterById("c1").?.base_url);
+    // clusterById resolves the destination's node set for the orchestrator.
+    try testing.expectEqualStrings("http://h:1", dir.clusterById("c1").?.nodes[0]);
     try testing.expect(dir.clusterById("nope") == null);
 }
 
 test "directory: error surfaces — unknown cluster / unknown tenant" {
     var dir = Directory.init(testing.allocator);
     defer dir.deinit();
-    try dir.addCluster("c1", "http://h:1");
+    try addNode1(&dir, "c1", "http://h:1");
 
     try testing.expectError(error.UnknownCluster, dir.assign("t", "nope"));
     try testing.expectError(error.UnknownTenant, dir.move("ghost", "c1"));
@@ -367,8 +436,8 @@ test "directory: error surfaces — unknown cluster / unknown tenant" {
 test "directory: assign is idempotent / re-placeable; addCluster re-addresses" {
     var dir = Directory.init(testing.allocator);
     defer dir.deinit();
-    try dir.addCluster("c1", "http://h:1");
-    try dir.addCluster("c2", "http://h:2");
+    try addNode1(&dir, "c1", "http://h:1");
+    try addNode1(&dir, "c2", "http://h:2");
 
     try dir.assign("t", "c1");
     try dir.assign("t", "c1"); // idempotent
@@ -378,8 +447,8 @@ test "directory: assign is idempotent / re-placeable; addCluster re-addresses" {
 
     // Re-address c1 in place; existing placements pointing at it follow.
     try dir.assign("u", "c1");
-    try dir.addCluster("c1", "http://newhost:9");
-    try testing.expectEqualStrings("http://newhost:9", dir.clusterFor("u").?.base_url);
+    try addNode1(&dir, "c1", "http://newhost:9");
+    try testing.expectEqualStrings("http://newhost:9", dir.clusterFor("u").?.nodes[0]);
 }
 
 test "directory: seedClusters + seedPlacements parse static config" {
@@ -389,8 +458,15 @@ test "directory: seedClusters + seedPlacements parse static config" {
     try dir.seedClusters("cluster-1=http://127.0.0.1:18091; cluster-2=http://127.0.0.1:18092 ;");
     try dir.seedPlacements("alice=cluster-1; bob=cluster-2");
 
-    try testing.expectEqualStrings("http://127.0.0.1:18091", dir.clusterFor("alice").?.base_url);
+    try testing.expectEqualStrings("http://127.0.0.1:18091", dir.clusterFor("alice").?.nodes[0]);
     try testing.expectEqualStrings("cluster-2", dir.clusterFor("bob").?.id);
+
+    // A multi-node cluster: comma-separated node origins.
+    try dir.seedClusters("cluster-3=http://127.0.0.1:18093,http://127.0.0.1:18094,http://127.0.0.1:18095");
+    try dir.seedPlacements("carol=cluster-3");
+    const c3 = dir.clusterFor("carol").?;
+    try testing.expectEqual(@as(usize, 3), c3.nodes.len);
+    try testing.expectEqualStrings("http://127.0.0.1:18095", c3.nodes[2]);
 
     try testing.expectError(error.BadConfig, dir.seedClusters("missing-equals"));
     try testing.expectError(error.BadConfig, dir.seedClusters("=http://nohost"));

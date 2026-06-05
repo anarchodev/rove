@@ -9,13 +9,15 @@
 //! outright because V1's `cluster.zig` is deleted at cutover
 //! (docs/v2-build-order.md "clean-slate the spine, reuse the limbs").
 //!
-//! Phase-1 scope (docs/v2-build-order.md §Phase 1): only the type-0
-//! writeset and the type-1 multi wrapper are live. Unlike V1's type-0,
-//! the Phase-1 payload is the **raw writeset bytes** — no readset
-//! section. Readset replication is explicitly off the milestone path
-//! ("a V1 feature V2 will want eventually, but not for the first
-//! slices"); when it lands it extends the type-0 payload exactly as V1
-//! did, without touching this header codec.
+//! The type-0 payload is the **readset-framed** `WriteSetPayload`
+//! (`[u32 ws_len][ws][u32 rs_len][rs]`), byte-identical to the worker's
+//! `src/js/apply.zig` so a worker propose applies unchanged on a V2
+//! follower (`decodeWriteSetPayload` strips the frame; apply uses
+//! `ws_bytes`, the readset rides for the tape). The header codec
+//! (`[1B type][2B id_len BE][id][payload]`) is unchanged. (Earlier Phase-1
+//! slices carried a raw-writeset payload; that only ever flowed on a
+//! single-node leader, which skips apply, so the mismatch was latent until
+//! a real follower applied a worker entry in Phase 5 multi-node.)
 
 const std = @import("std");
 
@@ -92,14 +94,61 @@ fn encodeTyped(
     return out;
 }
 
+/// Type-0 payload layout (`docs/readset-replication-plan.md` Phase 3),
+/// byte-identical to the worker's `src/js/apply.zig` `WriteSetPayload`:
+///
+///   `[u32 LE ws_len][ws_bytes][u32 LE rs_len][rs_bytes]`
+///
+/// The type-0 envelope payload is NOT raw writeset bytes — it interleaves
+/// the writeset with the request's serialized readset so the tape can be
+/// reconstructed on any follower that applies the entry. `rs_len == 0` is
+/// valid + frequent (non-handler producers — ACME, the move surface's
+/// `v2-kv`, the secondary inners of a batch — carry an empty readset). The
+/// V2 spine owns this codec because V1's `apply.zig` is deleted at cutover;
+/// it is held identical so the bytes the worker proposes apply unchanged.
+/// Apply only needs `ws_bytes`; the readset rides for the tape (Phase 5+).
+pub const WriteSetPayload = struct {
+    ws_bytes: []const u8,
+    rs_bytes: []const u8,
+};
+
+pub fn decodeWriteSetPayload(payload: []const u8) Error!WriteSetPayload {
+    if (payload.len < 4) return Error.Truncated;
+    const ws_len = std.mem.readInt(u32, payload[0..4], .little);
+    if (payload.len < 4 + @as(usize, ws_len) + 4) return Error.Truncated;
+    const ws_bytes = payload[4 .. 4 + ws_len];
+    const rs_len = std.mem.readInt(u32, payload[4 + ws_len ..][0..4], .little);
+    const rs_start: usize = 4 + ws_len + 4;
+    if (payload.len != rs_start + rs_len) return Error.Truncated;
+    return .{ .ws_bytes = ws_bytes, .rs_bytes = payload[rs_start .. rs_start + rs_len] };
+}
+
+pub fn encodeWriteSetPayload(
+    allocator: std.mem.Allocator,
+    ws_bytes: []const u8,
+    rs_bytes: []const u8,
+) Error![]u8 {
+    const total = 4 + ws_bytes.len + 4 + rs_bytes.len;
+    const out = allocator.alloc(u8, total) catch return Error.OutOfMemory;
+    std.mem.writeInt(u32, out[0..4], @intCast(ws_bytes.len), .little);
+    @memcpy(out[4..][0..ws_bytes.len], ws_bytes);
+    std.mem.writeInt(u32, out[4 + ws_bytes.len ..][0..4], @intCast(rs_bytes.len), .little);
+    @memcpy(out[4 + ws_bytes.len + 4 ..][0..rs_bytes.len], rs_bytes);
+    return out;
+}
+
 /// Build a type-0 writeset envelope. `ws_bytes` is the output of
-/// `writeset.WriteSet.encode`. Caller owns the returned slice.
+/// `writeset.WriteSet.encode`; it is wrapped in the readset-framed payload
+/// (empty readset) so the bytes are wire-identical to a worker propose.
+/// Caller owns the returned slice.
 pub fn encodeWriteSet(
     allocator: std.mem.Allocator,
     id: []const u8,
     ws_bytes: []const u8,
 ) Error![]u8 {
-    return encodeTyped(allocator, .writeset, id, ws_bytes);
+    const payload = try encodeWriteSetPayload(allocator, ws_bytes, "");
+    defer allocator.free(payload);
+    return encodeTyped(allocator, .writeset, id, payload);
 }
 
 /// Build a type-2 root writeset envelope (no per-tenant id).
@@ -162,7 +211,7 @@ pub fn decodeMultiInner(
 
 const testing = std.testing;
 
-test "writeset envelope round-trips" {
+test "writeset envelope round-trips (readset-framed payload)" {
     const a = testing.allocator;
     const env = try encodeWriteSet(a, "tenant-42", "WSBYTES");
     defer a.free(env);
@@ -170,7 +219,20 @@ test "writeset envelope round-trips" {
     const dec = try decode(env);
     try testing.expectEqual(Type.writeset, dec.type);
     try testing.expectEqualStrings("tenant-42", dec.id);
-    try testing.expectEqualStrings("WSBYTES", dec.payload);
+    // The payload is the readset frame; the writeset bytes ride inside it
+    // (empty readset) — wire-identical to a worker propose.
+    const wp = try decodeWriteSetPayload(dec.payload);
+    try testing.expectEqualStrings("WSBYTES", wp.ws_bytes);
+    try testing.expectEqual(@as(usize, 0), wp.rs_bytes.len);
+}
+
+test "writeset payload carries a non-empty readset" {
+    const a = testing.allocator;
+    const payload = try encodeWriteSetPayload(a, "WS", "READSET");
+    defer a.free(payload);
+    const wp = try decodeWriteSetPayload(payload);
+    try testing.expectEqualStrings("WS", wp.ws_bytes);
+    try testing.expectEqualStrings("READSET", wp.rs_bytes);
 }
 
 test "root writeset envelope round-trips with empty id" {
@@ -203,10 +265,10 @@ test "multi wrapper round-trips and unwraps inner envelopes in order" {
 
     const d0 = try decode(inner[0]);
     try testing.expectEqualStrings("t0", d0.id);
-    try testing.expectEqualStrings("first", d0.payload);
+    try testing.expectEqualStrings("first", (try decodeWriteSetPayload(d0.payload)).ws_bytes);
     const d1 = try decode(inner[1]);
     try testing.expectEqualStrings("t1", d1.id);
-    try testing.expectEqualStrings("second", d1.payload);
+    try testing.expectEqualStrings("second", (try decodeWriteSetPayload(d1.payload)).ws_bytes);
 }
 
 test "decode rejects a retired/unknown type byte" {

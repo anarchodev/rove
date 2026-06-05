@@ -172,6 +172,107 @@ fn workerMain(args: *WorkerCtx) !void {
     }
 }
 
+// ── Full-HA follower-apply store resolver ─────────────────────────────
+
+/// `bridge.StoreResolver.func`: resolve the worker's per-tenant serving
+/// store (`inst.kv`) for a follower's replicated apply, provisioning the
+/// instance on first sight. Runs on the pump thread; `Tenant` is internally
+/// locked (`maps_mutex`), so on-demand provisioning is safe alongside the
+/// worker thread. `gid` is unused — the worker keys its instance store on
+/// the tenant id string the envelope carries. Returns null only on a
+/// provisioning failure (surfaced by the apply round as `UnknownGroup`).
+fn resolveTenantStore(ctx: *anyopaque, gid: u64, id_str: []const u8) ?*kv.KvStore {
+    _ = gid;
+    const tenant: *tenant_mod.Tenant = @ptrCast(@alignCast(ctx));
+    if (tenant.getInstance(id_str) catch null) |inst| return inst.kv;
+    tenant.createInstance(id_str) catch return null;
+    const inst = (tenant.getInstance(id_str) catch null) orelse return null;
+    return inst.kv;
+}
+
+// ── Multi-node (Phase 5) config ───────────────────────────────────────
+
+/// Parsed multi-node bridge config (Phase 5 HA), owned for the lifetime of
+/// the `initMultiNode` call. `null` when this is a single-node deployment.
+const MultiNode = struct {
+    node_id: u64,
+    voters: []u64,
+    peers: []bridge_mod.PeerAddr,
+    /// Backing storage for the peer host slices (`host:port` left of `:`).
+    peer_bufs: [][]u8,
+    listen_addr: std.net.Address,
+    listen_str: []u8,
+
+    fn deinit(self: *const MultiNode, a: std.mem.Allocator) void {
+        a.free(self.voters);
+        a.free(self.peers);
+        for (self.peer_bufs) |b| a.free(b);
+        a.free(self.peer_bufs);
+        a.free(self.listen_str);
+    }
+};
+
+/// Build multi-node config from env, or return null if `REWIND_NODE_ID` is
+/// unset (single-node). Required together:
+///   - `REWIND_NODE_ID`   this node's 1-based raft id (∈ the voter set).
+///   - `REWIND_VOTERS`    comma-separated voter ids, e.g. `1,2,3`.
+///   - `REWIND_PEERS`     comma-separated raft transport `host:port`s,
+///                        indexed by raft id − 1 (peer i ⇒ raft id i+1).
+///                        These are the cross-node consensus ports, DISTINCT
+///                        from the HTTP listen port (argv[2]).
+/// The listen address is `peers[node_id − 1]`. Errors on malformed /
+/// inconsistent config (a misconfigured cluster must fail loud at startup).
+fn parseMultiNode(a: std.mem.Allocator) !?MultiNode {
+    const node_id_s = std.posix.getenv("REWIND_NODE_ID") orelse return null;
+    const voters_s = std.posix.getenv("REWIND_VOTERS") orelse return error.MissingVoters;
+    const peers_s = std.posix.getenv("REWIND_PEERS") orelse return error.MissingPeers;
+
+    const node_id = try std.fmt.parseInt(u64, std.mem.trim(u8, node_id_s, " \t"), 10);
+
+    var voters: std.ArrayListUnmanaged(u64) = .empty;
+    errdefer voters.deinit(a);
+    var vit = std.mem.tokenizeScalar(u8, voters_s, ',');
+    while (vit.next()) |tok| {
+        const t = std.mem.trim(u8, tok, " \t");
+        if (t.len == 0) continue;
+        try voters.append(a, try std.fmt.parseInt(u64, t, 10));
+    }
+    if (voters.items.len == 0) return error.MissingVoters;
+
+    var peers: std.ArrayListUnmanaged(bridge_mod.PeerAddr) = .empty;
+    errdefer peers.deinit(a);
+    var peer_bufs: std.ArrayListUnmanaged([]u8) = .empty;
+    errdefer {
+        for (peer_bufs.items) |b| a.free(b);
+        peer_bufs.deinit(a);
+    }
+    var pit = std.mem.tokenizeScalar(u8, peers_s, ',');
+    while (pit.next()) |tok| {
+        const t = std.mem.trim(u8, tok, " \t");
+        if (t.len == 0) continue;
+        const colon = std.mem.lastIndexOfScalar(u8, t, ':') orelse return error.BadPeer;
+        const host = try a.dupe(u8, t[0..colon]);
+        errdefer a.free(host);
+        const port = try std.fmt.parseInt(u16, t[colon + 1 ..], 10);
+        try peer_bufs.append(a, host);
+        try peers.append(a, .{ .host = host, .port = port });
+    }
+    if (node_id == 0 or node_id > peers.items.len) return error.BadNodeId;
+
+    const listen = peers.items[node_id - 1];
+    const listen_addr = try std.net.Address.parseIp(listen.host, listen.port);
+    const listen_str = try std.fmt.allocPrint(a, "{s}:{d}", .{ listen.host, listen.port });
+
+    return MultiNode{
+        .node_id = node_id,
+        .voters = try voters.toOwnedSlice(a),
+        .peers = try peers.toOwnedSlice(a),
+        .peer_bufs = try peer_bufs.toOwnedSlice(a),
+        .listen_addr = listen_addr,
+        .listen_str = listen_str,
+    };
+}
+
 // ── main ──────────────────────────────────────────────────────────────
 pub fn main() !void {
     // rove uses libc malloc globally (multiraft-scaling-learnings §3.6 —
@@ -213,10 +314,26 @@ pub fn main() !void {
     node_tenant.root_token_secret = admin_root_token;
 
     // The V2 per-tenant raft bridge + its pump thread. Leader-skip: the
-    // worker owns the speculative overlay.
-    const bridge = try Bridge.initSingleNode(allocator, data_dir);
+    // worker owns the speculative overlay. Single node by default; a
+    // multi-node (Phase 5 HA) node is configured by env — this node's
+    // 1-based raft id, the voter set, and the per-node raft transport
+    // addresses (distinct from the HTTP port). See `parseMultiNode`.
+    const bridge = if (try parseMultiNode(allocator)) |mn| blk: {
+        defer mn.deinit(allocator);
+        std.log.info("rewind: multi-node id={d} voters={d} listen={s}", .{ mn.node_id, mn.voters.len, mn.listen_str });
+        break :blk try Bridge.initMultiNode(allocator, data_dir, mn.node_id, mn.voters, mn.listen_addr, mn.peers);
+    } else try Bridge.initSingleNode(allocator, data_dir);
     defer bridge.deinit();
     bridge.setWorkerOverlay();
+    // Full-HA store unification (Phase 5): a FOLLOWER has no worker serving
+    // this tenant, so its replicated writes must land in the SAME store a
+    // worker WOULD serve from — the tenant's `inst.kv`, provisioned on
+    // demand — so a follower promoted to leader after a failover serves the
+    // data it replicated. Wire the pump's follower-apply at the node tenant
+    // (set BEFORE startPump so the first replicated entry already routes
+    // here). On a single node this is never consulted (the sole voter leads
+    // every group → leader-skip), so it is a no-op there.
+    bridge.setStoreResolver(.{ .ctx = node_tenant, .func = resolveTenantStore });
     try bridge.startPump();
 
     // Per-tenant request-log batches → fs (S3 in prod via BLOB_BACKEND).

@@ -1,15 +1,18 @@
 # V2 Phase 5 — multi-node clusters (HA + durability)
 
-> **Status (2026-06-04). IN PROGRESS — the multi-node engine is proven.**
+> **Status (2026-06-04). DONE — the Phase-5 exit is proven.**
 > Slices 5a (cross-node transport, `945962a`) + 5b (multi-node Node:
 > election + replication + failover, `945962a`) + 5c (multi-node bridge:
-> FIFO seq binding + role-aware apply, `fb79732`) are DONE + committed,
-> green under `v2-test` (37/37). A 3-node cluster elects a per-tenant
-> leader, replicates committed writes to every node, survives a leader
-> kill, derives the same group id on every node, and faults a follower's
-> propose so the client retries the leader — all over real loopback TCP.
-> Remaining: 5d (move fan-out to all dest nodes), 5e (rewind multi-node
-> config + 3-node smoke; leader-aware front-door routing lands there).
+> FIFO seq binding + role-aware apply, `fb79732`) + 5d (move fan-out to all
+> destination nodes) + 5e (rewind multi-node config + leader-aware
+> front-door routing + Full-HA store unification + the 3-node smoke) are
+> DONE, green under `v2-test` (40/40). `scripts/three_node_smoke.py` moves a
+> live tenant onto a 3-node destination cluster (attach fans out to every
+> node, forming the group across the cluster), serves it through the front
+> door's leader-aware routing, **kills the destination LEADER**, and a
+> promoted follower serves the data it replicated — then a fresh write
+> commits on the surviving 2-node quorum. The single-node milestone smokes
+> (`tenant_move` / `two_cluster` / `rewind`) still pass.
 > Companion: [`v2-build-order.md`](v2-build-order.md)
 > §Phase 5 (the spec), [`v2-multiraft-scaling-learnings.md`](v2-multiraft-scaling-learnings.md)
 > §3.2–3.4 (the transport/fsync/mailbox constraints this implements).
@@ -95,18 +98,82 @@ run in parallel without colliding.)
 leader replication to every store, the exact FIFO watermark, and a
 follower-propose fault.
 
-## Remaining
+## 5d — move fans out to all destination nodes — DONE
 
-### 5d — move fans out to all destination nodes
+The Phase-4 move targeted single-node clusters. A cluster is now a **set of
+node origins** (`cp/directory.zig`: `ClusterRef.nodes`, config
+`id=url1,url2,url3`). The front-door move orchestrator (`front/main.zig`)
+fans out:
 
-`v2-attach` must `createGroupEpoch` on **all** destination nodes (the
-group is formed across the destination cluster), and evict destroys it on
-all source nodes. The front door fans the attach/evict out to each node
-(or the destination leader coordinates).
+- **bundle** from the source LEADER. `v2-bundle` is now leader-gated (a
+  follower 421s), so the orchestrator tries each source node until one
+  returns the bundle — the leader is the only node taking live writes, so
+  quiescing it is what makes the snapshot consistent.
+- **attach** on **every** destination node (`attachToAll`): each loads the
+  bundle into its own `inst.kv` and `createGroupEpoch`s its incarnation at
+  the migration epoch, so the group forms across the whole destination
+  cluster. All must 204; on any failure the partially-attached set is
+  evicted and the source resumed.
+- **await election**: poll each destination node's new `v2-leader` probe
+  until one reports leadership, so post-move traffic finds a leader
+  immediately instead of cycling 503s through an un-elected group.
+- **flip** the directory (the commit point), then **evict** on every source
+  node (`evictAll`).
 
-### 5e — rewind multi-node config + 3-node smoke
+### 5e — rewind multi-node config + leader-aware routing + Full HA — DONE
 
-`rewind` gains multi-node config (this node's id, the peer list, per-node
-data dirs). `scripts/three_node_smoke.py`: form a 3-node cluster, serve a
-request, kill a node and survive (failover), move a tenant onto a 3-node
-destination. The Phase-5 exit.
+**Config (`rewind/main.zig`).** `REWIND_NODE_ID` / `REWIND_VOTERS` /
+`REWIND_PEERS` (comma-separated raft transport `host:port`s, indexed by
+raft id − 1, DISTINCT from the HTTP port) select `Bridge.initMultiNode`;
+unset → single-node. `parseMultiNode` resolves the listen address from
+`peers[node_id − 1]`.
+
+**Leader-aware front-door routing.** A multi-node cluster has N node origins
+but only the tenant's group leader takes writes. `proxyToCluster` tries
+nodes in order and stops at the first non-503 — a follower 503s a write
+(the bridge faults a non-leader propose), so a write self-routes to the
+leader; a read is served by any node (the follower stores are synced). The
+worker leader-gates `v2-kv` PUT too (registers + `isLeaderOf`), so a
+follower rejects fast WITHOUT a speculative local write that would diverge
+(this immediate-commit endpoint, unlike the parked customer path, has no
+undo).
+
+**Full-HA store unification (the load-bearing fix).** The bridge node kept
+a per-tenant store at `{data_dir}/{gid}/app.db`, but the worker serves from
+`{data_dir}/{id_str}/app.db` (`inst.kv`). On a leader, `worker_overlay`
+skips the node-store write (the worker's `TrackedTxn.commit` is durable),
+so the node store sat unused; on a follower the pump wrote the *node* store
+— a file the worker never reads. A follower promoted to leader would serve
+an **empty** `inst.kv`. Fixed with a **`StoreResolver`** (`node.zig`): in
+`worker_overlay` mode a follower's apply resolves the worker's own
+`inst.kv` (provisioned on demand via the node tenant, wired in
+`rewind/main.zig` before `startPump`), so a follower replicates into the
+SAME store it will serve from after promotion. `isLeaderOf(gid)` is
+published as a per-group atomic refreshed each pump cycle (the worker must
+never touch the non-thread-safe Manager).
+
+**Envelope frame fix (latent since Phase 1).** The worker proposes a
+readset-framed type-0 payload (`[u32 ws_len][ws][u32 rs_len][rs]`, from
+`src/js/apply.zig`), but the V2 node applied `env.payload` as raw writeset
+bytes. A single-node leader skips apply, so the mismatch never surfaced —
+until a real follower applied a worker entry. `envelope.zig` now owns the
+byte-identical `WriteSetPayload` codec and `node.applyEntry` strips the
+frame (`decodeWriteSetPayload`) before `writeset.applyEncoded`; the readset
+rides for the tape.
+
+**Exit smoke.** `scripts/three_node_smoke.py` — see the status block above.
+
+## Known follow-ups (not Phase-5 blockers)
+
+- **Zero-downtime / live re-fencing (Phase 7).** A write in flight at the
+  instant of a leader change is faulted + retried (503), not lost; moving a
+  tenant under continuous load with zero failed requests is Phase 7.
+- **Initial multi-node placement without a move.** A tenant's group forms
+  on a multi-node cluster via the attach fan-out (a move-in). Placing a
+  brand-new tenant directly on a multi-node cluster (no move) would need an
+  explicit formation step; today the smoke forms the group by moving onto
+  it. `v2-kv` PUT leader-gating depends on the group already existing.
+- **Replicated control-plane directory.** The front door still holds the
+  one authoritative `Directory` from static env config; a replicated CP
+  directory (so multiple front doors agree on placement) is later
+  hardening behind the same interface.
