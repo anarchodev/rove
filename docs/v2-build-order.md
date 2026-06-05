@@ -196,13 +196,14 @@ This is the heart of the rewrite.
 
 #### Phase 5 — Multi-node clusters (HA + durability) — launch-required
 
-> **IN PROGRESS (2026-06-04).** 5a (cross-node coalesced transport,
-> `src-v2/kv/transport.zig`) + 5b (multi-node Node election/replication/
-> failover, `src-v2/kv/node.zig`) DONE + committed (`945962a`), green
-> under `v2-test`: a 3-node group elects, replicates, and survives a
-> leader kill over real loopback TCP. Remaining: 5c multi-node bridge
-> (seq binding under leadership change + per-group leadership), 5d move
-> fan-out to all dest nodes, 5e rewind multi-node config + 3-node smoke.
+> **IN PROGRESS (2026-06-04).** 5a (coalesced transport) + 5b (multi-node
+> Node election/replication/failover) `945962a` + 5c (multi-node bridge:
+> deterministic gid, role-aware apply, FIFO seq binding + fault) `fb79732`
+> DONE + committed, green under `v2-test` (37/37): a 3-node group elects,
+> replicates, survives a leader kill, agrees on group ids, and faults a
+> follower's propose for client-retry-on-leader — over real loopback TCP.
+> Remaining: 5d move fan-out to all dest nodes, 5e rewind multi-node config
+> + 3-node smoke (leader-aware front-door routing).
 > Details: [`v2-phase5-multinode.md`](v2-phase5-multinode.md).
 
 - **New:** cross-node transport; form per-tenant groups across 3 nodes;
