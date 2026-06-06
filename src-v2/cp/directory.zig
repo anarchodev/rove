@@ -187,6 +187,10 @@ pub const Directory = struct {
         // placement writesets are present to scan.
         _ = bridge.node.ensureGroup(self.dir_gid, DIR_STORE_ID) catch return Error.Replication;
         errdefer self.deinit();
+        // The directory group must NEVER hibernate — it has to keep ticking so
+        // a follower re-elects on leader death (reads never propose to wake
+        // it). One always-active group is O(1).
+        bridge.pinGroupActive(self.dir_gid) catch return Error.Replication;
         try self.replayFromStore();
         // `self` is now at its final (heap) address — safe to hand the
         // observer a pointer to it. Pre-pump, so setting the node field races
@@ -225,6 +229,29 @@ pub const Directory = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.clusters.items.len == 0;
+    }
+
+    /// Collect the tenant ids currently in `moving` state (owned dups; caller
+    /// frees each + the slice). The reconciler uses this to find moves the
+    /// directory durably recorded as in-flight — a CP crash between `beginMove`
+    /// and the terminal `move`/`abortMove` leaves a tenant stuck `moving`
+    /// forever, since the `moving` hold is now durable. (docs/v2-cp-directory-
+    /// replication.md move-crash recovery.)
+    pub fn collectMoving(self: *Directory, a: std.mem.Allocator) Error![][]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var out: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (out.items) |t| a.free(t);
+            out.deinit(a);
+        }
+        var it = self.placements.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.state == .moving) {
+                out.append(a, a.dupe(u8, e.key_ptr.*) catch return Error.OutOfMemory) catch return Error.OutOfMemory;
+            }
+        }
+        return out.toOwnedSlice(a) catch return Error.OutOfMemory;
     }
 
     /// Whether THIS CP node leads the directory raft group — i.e. directory
@@ -844,6 +871,58 @@ test "directory: replicated move state (moving) survives a restart" {
         const r = d.resolve("t") orelse return error.TestUnexpectedResult;
         try testing.expectEqualStrings("c1", r.cluster.id);
         try testing.expect(r.moving);
+    }
+}
+
+test "directory: stuck 'moving' is collectable + abortable (Slice 2 recovery)" {
+    // The move-crash recovery primitives: a durable `moving` state (a CP crash
+    // between beginMove and the terminal move/abort) is found by
+    // `collectMoving` and cleared by `abortMove` (revert to active on the
+    // source — the flip never committed, so the source stays authoritative).
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir_path);
+
+    const bridge = try Bridge.initSingleNode(a, dir_path);
+    const d = try Directory.initReplicated(a, bridge);
+    defer d.destroy();
+    defer bridge.deinit();
+    try bridge.startPump();
+
+    try d.addCluster("c1", &.{"http://h:1"});
+    try d.addCluster("c2", &.{"http://h:2"});
+    try d.assign("alice", "c1");
+    try d.assign("bob", "c1");
+    // bob is mid-move (stuck); alice is healthy/active.
+    try d.beginMove("bob");
+
+    // collectMoving finds ONLY the stuck tenant.
+    {
+        const moving = try d.collectMoving(a);
+        defer {
+            for (moving) |t| a.free(t);
+            a.free(moving);
+        }
+        try testing.expectEqual(@as(usize, 1), moving.len);
+        try testing.expectEqualStrings("bob", moving[0]);
+    }
+
+    // Reconcile = abortMove (revert to active on the source). bob resumes
+    // active on c1 (its placement never flipped); alice is untouched.
+    try d.abortMove("bob");
+    try testing.expect(!d.resolve("bob").?.moving);
+    try testing.expectEqualStrings("c1", d.resolve("bob").?.cluster.id);
+
+    // Nothing is moving anymore.
+    {
+        const moving = try d.collectMoving(a);
+        defer {
+            for (moving) |t| a.free(t);
+            a.free(moving);
+        }
+        try testing.expectEqual(@as(usize, 0), moving.len);
     }
 }
 
