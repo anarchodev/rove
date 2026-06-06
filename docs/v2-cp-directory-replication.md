@@ -1,21 +1,35 @@
 # V2 — control-plane directory raft-replication (design)
 
-> **Status: Slice 1 SHIPPED (2026-06-05), Slices 2–3 remain.** The plan for
-> turning the front door's in-process static `Directory` into a replicated,
-> strongly-consistent, HA control plane backed by our own `bridge`/`Node`
-> raft substrate. Companion:
+> **Status: Slices 1 + 2 SHIPPED (2026-06-05), Slice 3 (optional) remains.**
+> The plan for turning the front door's in-process static `Directory` into a
+> replicated, strongly-consistent, HA control plane backed by our own
+> `bridge`/`Node` raft substrate. Companion:
 > [`project_v2_zero_downtime_move`] memory (the locked Cloudflare+CP+dual-write
 > architecture), `docs/v2-build-order.md` §Phase 7, `src-v2/cp/directory.zig`
 > (the interface this sits behind), `src-v2/kv/bridge.zig` (the substrate).
 >
-> **Slice 1 (single-node durable directory) is done + green:** `directory.zig`
+> **Slice 1 (single-node durable directory) — done + green:** `directory.zig`
 > is store-backed over a single-node CP `bridge` (one `__directory__` raft
 > group, `apply_on_commit`); the front door requires `REWIND_CP_DATA_DIR` and
-> seeds static config only into an empty store. v2-test 48/48; the Slice-1
-> exit is proven by `scripts/cp_restart_smoke.py` (a committed move survives a
-> front-door restart — the directory replays instead of re-seeding) and two
-> unit restart tests in `directory.zig`. See "Implementation decisions" below
-> for two deviations from the original sketch.
+> seeds static config only into an empty store. The Slice-1 exit is proven by
+> `scripts/cp_restart_smoke.py` (a committed move survives a front-door restart
+> — the directory replays instead of re-seeding) + two unit restart tests.
+>
+> **Slice 2 (multi-node CP HA) — done + green:** the directory raft group
+> spans 3 CP nodes (`REWIND_CP_NODE_ID`/`VOTERS`/`PEERS`). (2A) an apply
+> observer (`Node.apply_observer`) materializes the in-memory projection from
+> REPLICATED applies on the leader AND every follower, so a follower (no local
+> proposer) resolves placement too. (2B) leader-gated seeding — only the
+> directory leader seeds static config; followers fill via replication. (2C)
+> leader-aware writes — `/_cp/leader` reports leadership and a follower
+> forwards `/_control/*` to the CP leader (via `REWIND_CP_PEER_URLS`), so an
+> operator can target any CP node. v2-test 49/49 (incl. a 3-node directory
+> unit test); the Slice-2 exit is proven by `scripts/cp_ha_smoke.py` (seed
+> replicates to all 3 nodes; a move issued at a follower commits via forward;
+> KILL the leader → a survivor still reads + a fresh move commits on quorum).
+>
+> See "Implementation decisions" below for two deviations from the original
+> sketch.
 >
 > ## Implementation decisions (Slice 1, as built)
 >
@@ -27,8 +41,17 @@
 >    is read only once, at boot (single-threaded, pre-pump), to rebuild the
 >    projection. So the hot read path stays zero-alloc + pointer-stable
 >    (front-door consumers unchanged) and never touches the pump thread's
->    store. (Slice 2 must update the projection from the *apply* path so a
->    follower — which has no local proposer — stays in sync.)
+>    store. **Slice 2A** made this projection update *apply-driven* (not
+>    post-commit): an `apply_observer` fires on the leader AND every follower,
+>    so a follower with no local proposer stays in sync. That also forced the
+>    write path to RELEASE the directory mutex before awaiting commit (the
+>    observer takes that mutex on the pump thread, so holding it while awaiting
+>    the watermark — which only advances after the observer runs — would
+>    deadlock); read-your-write still holds because the observer fires inside
+>    `applyCb`, before the commit hook advances the awaited watermark. The
+>    replicated `Directory` is therefore heap-allocated (`initReplicated` →
+>    `*Directory`, freed by `destroy`) so the observer can capture a stable
+>    `self`; teardown stops the pump before freeing it.
 > 2. **`REWIND_CP_DATA_DIR` is required (fail loud).** A CP without durable
 >    storage loses every committed move on restart, so the front door refuses
 >    to start without it rather than defaulting to an ephemeral path that
@@ -101,18 +124,28 @@ give the CP binary a single-node bridge + directory group.
   replays the placement writesets and the new owner is still recorded. A
   single-node CP restart smoke.
 
-### Slice 2 — multi-node CP (HA)
+### Slice 2 — multi-node CP (HA) ✅ DONE
 
 The directory group spans 3 CP nodes (`bridge.initMultiNode`, like `rewind`'s
-`REWIND_NODE_ID`/`VOTERS`/`PEERS`).
-- **Writes go to the CP leader** (the front-door orchestration that writes the
-  directory must reach the CP leader — leader-aware, or the CP nodes proxy a
-  write to the leader). A `move` proposed on a follower faults → retry leader
-  (the bridge already does this).
-- **Reads from any CP node** (local store).
-- **Exit:** a directory write replicates to all 3 CP nodes; the CP survives a
-  node failure (kill a CP node, the directory still reads + writes); a 3-node
-  CP smoke.
+`REWIND_NODE_ID`/`VOTERS`/`PEERS` → `REWIND_CP_NODE_ID`/`VOTERS`/`PEERS`).
+- **Reads from any CP node** — resolved here NOT by `node.get` per request but
+  by the apply-driven in-memory projection (2A): `Node.apply_observer` fires
+  per committed PUT on the leader AND every follower, so a follower (which
+  never proposed) still materializes placement. This is the load-bearing
+  change vs. Slice 1 (whose post-commit projection update only ran on the
+  proposing/leader node).
+- **Writes go to the CP leader.** `directory.isLeader()` + `/_cp/leader` report
+  leadership; a follower receiving `/_control/*` forwards the whole request to
+  the leader (discovered via `/_cp/leader` across `REWIND_CP_PEER_URLS`) and
+  relays the response — so an operator can target any CP node. (A `move`
+  proposed locally on a follower would fault; the forward avoids that.)
+- **Seeding is leader-gated** — every multi-node CP node boots empty, so only
+  the directory leader seeds static config; followers fill via the leader's
+  replicated seed (bounded wait for election/replication to settle).
+- **Exit (met):** a directory write replicates to all 3 CP nodes; a move
+  issued at a follower commits (forward → leader); the CP survives a leader
+  kill (a survivor is promoted, still reads, a fresh move commits on quorum).
+  `scripts/cp_ha_smoke.py`.
 
 ### Slice 3 — DP-side owner cache + invalidation (optimization)
 
