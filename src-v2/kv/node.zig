@@ -311,7 +311,14 @@ pub const Node = struct {
         const wal_path = std.fmt.allocPrint(allocator, "{s}/raft-wal", .{data_dir}) catch
             return Error.OutOfMemory;
         defer allocator.free(wal_path);
-        const wal = raft.SharedWal.init(allocator, wal_path) catch return Error.Io;
+        // CRASH RECOVERY: `open` (not `init`) replays the durable WAL — it
+        // CRC-scans the existing segments, truncates only a torn tail, and
+        // buckets the recovered records per group for `initRecover` to replay.
+        // On a fresh data dir there is nothing to recover, so it behaves like
+        // `init`. Using `init` here (truncate-fresh) was discarding every
+        // committed entry on restart — the fsync'd log was thrown away, so a
+        // hard crash lost all writes since the last graceful close.
+        const wal = raft.SharedWal.open(allocator, wal_path) catch return Error.Io;
         errdefer wal.deinit();
 
         var mgr = try raft.Manager.init();
@@ -362,7 +369,10 @@ pub const Node = struct {
     /// never-migrated birth case: epoch 0 (`createGroup`).
     pub fn ensureGroup(self: *Node, tenant_id: u64, id_str: []const u8) Error!*TenantSlot {
         if (self.groups.get(tenant_id)) |slot| return slot;
-        return self.createGroupCore(tenant_id, id_str, 0);
+        // Birth OR restart: recover any durable WAL records for this group
+        // (a no-op on a never-seen group). On a restart this replays the
+        // committed log back into the store.
+        return self.createGroupCore(tenant_id, id_str, 0, true);
     }
 
     /// Attach a tenant group at an explicit migration fence `epoch` (the
@@ -379,7 +389,10 @@ pub const Node = struct {
     pub fn createGroupAtEpoch(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64) Error!*TenantSlot {
         if (self.groups.get(tenant_id) != null) return Error.GroupExists;
         self.mgr.clearTombstone(tenant_id) catch {};
-        return self.createGroupCore(tenant_id, id_str, epoch);
+        // A migration attach is a FRESH group — its state arrives via the
+        // bundle, not the WAL — so do NOT replay any (stale) recovered records
+        // for this gid.
+        return self.createGroupCore(tenant_id, id_str, epoch, false);
     }
 
     /// Shared group-birth core for `ensureGroup` (epoch 0) and
@@ -388,7 +401,7 @@ pub const Node = struct {
     /// the raft group at `epoch`, register the slot, and drive it to
     /// leader (single-node campaign). Caller has already verified the
     /// group does not exist.
-    fn createGroupCore(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64) Error!*TenantSlot {
+    fn createGroupCore(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64, recover: bool) Error!*TenantSlot {
         // {data_dir}/{tenant_id}/app.db
         const dir = std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ self.data_dir, tenant_id }) catch
             return Error.OutOfMemory;
@@ -409,9 +422,14 @@ pub const Node = struct {
 
         // GroupedFileStorage over the shared WAL. raft-rs takes ownership
         // via the vtable userdata slot and frees it when the group is
-        // destroyed — do NOT free it here.
-        const gfs = raft.GroupedFileStorage.init(self.allocator, self.voters, self.wal, tenant_id) catch
-            return Error.Io;
+        // destroyed — do NOT free it here. `initRecover` replays this group's
+        // records that `SharedWal.open` recovered (a no-op when none were —
+        // identical to `init`); `init` ignores any recovered records (the
+        // migration-attach case wants a fresh group from the bundle).
+        const gfs = if (recover)
+            raft.GroupedFileStorage.initRecover(self.allocator, self.voters, self.wal, tenant_id) catch return Error.Io
+        else
+            raft.GroupedFileStorage.init(self.allocator, self.voters, self.wal, tenant_id) catch return Error.Io;
         errdefer gfs.deinit();
 
         try self.mgr.createGroupEpoch(
@@ -445,6 +463,32 @@ pub const Node = struct {
                 _ = try self.pump();
             }
             if (!self.mgr.isLeader(tenant_id)) return Error.NotCommitted;
+
+            // Recovery: drain the replayed committed entries into the store
+            // before returning, so a reader (e.g. the CP's pre-pump store
+            // scan) sees the recovered state. The fresh leader commits a
+            // no-op then re-delivers the recovered committed log. Drain until
+            // the group's applied index stops advancing for a few consecutive
+            // cycles — robust against `pump()` returning a non-empty Ready for
+            // soft-state with nothing left to apply (which `!pump()` would
+            // busy-loop on). Bounded so a pathological log can't spin forever.
+            // (Multi-node recovers via ticks + the apply path after the pump
+            // thread starts, so no inline drain there.)
+            if (recover) {
+                const slot_ptr = self.groups.get(tenant_id) orelse return Error.UnknownGroup;
+                var last_applied: u64 = slot_ptr.applied_idx;
+                var stable: u32 = 0;
+                var drain: u32 = 0;
+                while (drain < 100_000 and stable < 3) : (drain += 1) {
+                    _ = try self.pump();
+                    if (slot_ptr.applied_idx == last_applied) {
+                        stable += 1;
+                    } else {
+                        stable = 0;
+                        last_applied = slot_ptr.applied_idx;
+                    }
+                }
+            }
         }
 
         return slot;

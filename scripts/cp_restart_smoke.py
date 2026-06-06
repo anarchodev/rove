@@ -17,7 +17,8 @@ owner, rather than re-seeding back to the static REWIND_PLACEMENT.
   B. POST front /_control/move {tenant, dest:cluster-2} → 200 (directory
      flip is one committed raft write).
   C. front routes Host=mover → c2 (post-move).
-  D. KILL the front door; restart it over the SAME REWIND_CP_DATA_DIR
+  D. KILL -9 the front door (hard crash, no graceful close → recovery is via
+     WAL replay); restart it over the SAME REWIND_CP_DATA_DIR
      (the rewind clusters keep running). REWIND_PLACEMENT still says
      cluster-1 in the env.
   E. the recovered front routes Host=mover → c2 — the committed move
@@ -219,12 +220,15 @@ def main():
         check("GET via front (→c2) status", st, 200)
         check("GET via front (→c2) value", body, VALUE)
 
-        # ── D. restart the front door over the SAME CP data dir ───────
-        print("leg D: kill + restart the front door (rewind clusters stay up)")
-        stop_proc(front)
+        # ── D. HARD-CRASH (kill -9) the front door over the same CP dir ─
+        print("leg D: kill -9 the front door (HARD crash — no graceful close,"
+              " so recovery is via WAL replay, not durabilize-on-close)")
+        os.kill(front.pid, signal.SIGKILL)
+        front.wait()
         procs.remove(front)
-        # Second boot: populated CP store → replay, NOT re-seed (even though
-        # REWIND_PLACEMENT still says cluster-1).
+        # Second boot: the committed move replays from the durable WAL →
+        # replay, NOT re-seed (even though REWIND_PLACEMENT still says
+        # cluster-1, and the store was never gracefully durabilized).
         spawn_front("front", PF, cpd, want_needle="skipping static seed")
 
         # ── E. the recovered front still routes to cluster-2 ──────────
