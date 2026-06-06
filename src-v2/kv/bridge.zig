@@ -239,6 +239,13 @@ pub const Bridge = struct {
         self.node.apply_mode = .worker_overlay;
     }
 
+    /// Pin a group as always-active (never hibernated) on the node — see
+    /// `node_mod.Node.pinActive`. The CP directory group uses this so it keeps
+    /// ticking and re-elects on leader death. Pre-pump / pump-thread only.
+    pub fn pinGroupActive(self: *Bridge, gid: u64) Error!void {
+        return self.node.pinActive(gid);
+    }
+
     /// Register a per-applied-put observer on the node (see
     /// `node_mod.ApplyObserver`). The control-plane directory uses this so a
     /// CP node's in-memory placement projection tracks replicated applies —

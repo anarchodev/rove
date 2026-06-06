@@ -173,6 +173,12 @@ pub const TenantSlot = struct {
     /// Whether this group is currently in `Node.active` (ticked each pump
     /// cycle). Lets `bumpActive` add it at most once and the sweep drop it.
     in_active: bool = false,
+    /// Pinned ALWAYS-active (never hibernated). The control-plane directory
+    /// group sets this: it must keep ticking so a follower runs its election
+    /// timer and re-elects on leader death — a directory read never proposes,
+    /// so a hibernated directory group would never wake to re-elect. One
+    /// always-ticking group is O(1), unlike the K-tenant data groups.
+    pinned: bool = false,
 };
 
 /// One V2 node: a `Manager` of per-tenant raft groups over one shared
@@ -510,6 +516,23 @@ pub const Node = struct {
         }
     }
 
+    /// Pin a group as ALWAYS-active: never hibernated, so it keeps ticking
+    /// (heartbeating as leader / running its election timer as follower)
+    /// regardless of request activity. The control-plane directory group uses
+    /// this — it is ONE group (so always-ticking is O(1)) and MUST stay
+    /// available: a directory read never proposes, so a hibernated directory
+    /// group whose leader died would never wake to re-elect. Pump-thread only
+    /// (or pre-pump). A no-op for an unknown gid.
+    pub fn pinActive(self: *Node, gid: u64) Error!void {
+        const slot = self.groups.get(gid) orelse return;
+        slot.pinned = true;
+        slot.active_until_ns = nowNs() + self.hibernate_ns;
+        if (!slot.in_active) {
+            self.active.append(self.allocator, gid) catch return Error.OutOfMemory;
+            slot.in_active = true;
+        }
+    }
+
     /// Remove a group from the active set (destroy / errdefer). Clears its
     /// `in_active` flag. O(active); the active set is small by design.
     fn dropActive(self: *Node, gid: u64) void {
@@ -534,7 +557,7 @@ pub const Node = struct {
                 _ = self.active.swapRemove(i);
                 continue;
             };
-            if (now > slot.active_until_ns) {
+            if (!slot.pinned and now > slot.active_until_ns) {
                 slot.in_active = false;
                 _ = self.active.swapRemove(i);
             } else i += 1;

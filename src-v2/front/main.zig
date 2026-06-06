@@ -787,6 +787,43 @@ const Router = struct {
         }
     }
 
+    // ── Stuck-move reconciliation (Slice 2 — move crash recovery) ────
+
+    /// Reconcile moves the directory durably recorded as in-flight but that no
+    /// orchestration is completing. The `moving` hold is durable (Slice 1), so
+    /// a CP crash between `beginMove` and the terminal `move`/`abortMove`
+    /// leaves a tenant stuck `moving` forever (front door 503s its traffic,
+    /// source quiesced). The flip is the move's commit point, so a still-
+    /// `moving` placement means the flip never happened and the SOURCE remains
+    /// authoritative: abort the move (revert to active) + resume the source.
+    ///
+    /// Runs ONLY on the directory leader (abort is a directory write), from the
+    /// serve loop between request batches. The front door is single-threaded
+    /// and a move orchestration is fully synchronous within one `handleControl`
+    /// (one serve-loop iteration), so this never overlaps a live move — any
+    /// tenant `moving` when this runs is a genuine stuck move from a prior /
+    /// crashed orchestration, safe to abort.
+    fn reconcileStuckMoves(self: *Router) void {
+        if (!self.directory.isLeader()) return;
+        const a = self.allocator;
+        const moving = self.directory.collectMoving(a) catch return;
+        defer {
+            for (moving) |t| a.free(t);
+            a.free(moving);
+        }
+        for (moving) |tenant| {
+            const res = self.directory.resolve(tenant) orelse continue;
+            if (!res.moving) continue; // raced a completing move — skip
+            const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch continue;
+            defer a.free(tbody);
+            std.log.warn("rewind-front: reconciling stuck move for {s} (abort + resume source {s})", .{ tenant, res.cluster.id });
+            // resumeAll: abortMove (revert to active) + best-effort resume each
+            // source node (lift a brief-pause quiesce). The source node list is
+            // pointer-stable past the resolve.
+            self.resumeAll(tenant, res.cluster.nodes, tbody);
+        }
+    }
+
     // ── Zero-downtime move (Phase 7 slice c) ─────────────────────────
 
     /// Orchestrate a ZERO-DOWNTIME tenant move — the source keeps serving the
@@ -1145,9 +1182,40 @@ pub fn main() !void {
             std.Thread.sleep(50 * std.time.ns_per_ms);
         }
         if (directory.isLeader() and directory.isEmpty()) {
-            try directory.seedClusters(getEnvCfg("REWIND_CLUSTERS"));
-            try directory.seedPlacements(getEnvCfg("REWIND_PLACEMENT"));
-            std.log.info("rewind-front: directory leader seeded from static config", .{});
+            // Seed as the leader, RETRYING transient replication faults:
+            // leadership can still be settling right after election, so a
+            // propose may fault even though we just read isLeader()==true.
+            // Seeds are idempotent (addCluster/assign upsert), so re-running
+            // after a partial seed is safe. Stop if we lose leadership (a peer
+            // will seed) or the store fills (replicated from elsewhere).
+            var seeded = false;
+            var attempt: u32 = 0;
+            while (attempt < 100) : (attempt += 1) {
+                if (!directory.isLeader() or !directory.isEmpty()) break;
+                directory.seedClusters(getEnvCfg("REWIND_CLUSTERS")) catch |e| switch (e) {
+                    error.Replication => {
+                        std.Thread.sleep(100 * std.time.ns_per_ms);
+                        continue;
+                    },
+                    else => return e, // malformed config / OOM → fail loud
+                };
+                directory.seedPlacements(getEnvCfg("REWIND_PLACEMENT")) catch |e| switch (e) {
+                    error.Replication => {
+                        std.Thread.sleep(100 * std.time.ns_per_ms);
+                        continue;
+                    },
+                    else => return e,
+                };
+                seeded = true;
+                break;
+            }
+            if (seeded) {
+                std.log.info("rewind-front: directory leader seeded from static config", .{});
+            } else if (directory.isEmpty()) {
+                std.log.warn("rewind-front: leader could not seed (replication unstable); will rely on replication / a peer", .{});
+            } else {
+                std.log.info("rewind-front: directory replayed/replicated (skipping static seed)", .{});
+            }
         } else if (directory.isEmpty()) {
             std.log.info("rewind-front: CP follower — awaiting directory replication from the leader", .{});
         } else {
@@ -1189,7 +1257,23 @@ pub fn main() !void {
 
     var router = Router{ .allocator = allocator, .directory = directory, .hosts = &hosts, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls };
 
-    std.log.info("rewind-front: listening on 0.0.0.0:{d} (move control {s})", .{ port, if (move_secret != null) "enabled" else "disabled" });
+    // Periodic stuck-move reconciliation on the directory leader (between
+    // request batches; never overlaps a synchronous move — see
+    // `reconcileStuckMoves`). last=0 → the first iteration reconciles, so a CP
+    // restart / failover cleans up a crashed move within one tick. Period from
+    // `REWIND_CP_RECONCILE_SECS` (default 5); 0 disables reconciliation.
+    const reconcile_secs: i128 = blk: {
+        const s = std.posix.getenv("REWIND_CP_RECONCILE_SECS") orelse break :blk 5;
+        break :blk std.fmt.parseInt(i128, std.mem.trim(u8, s, " \t"), 10) catch 5;
+    };
+    const reconcile_period_ns: i128 = reconcile_secs * std.time.ns_per_s;
+    var last_reconcile_ns: i128 = 0;
+
+    std.log.info("rewind-front: listening on 0.0.0.0:{d} (move control {s}, reconcile {s})", .{
+        port,
+        if (move_secret != null) "enabled" else "disabled",
+        if (reconcile_secs > 0) "on" else "off",
+    });
     while (!stop_flag.load(.acquire)) {
         server.pollWithTimeout(10 * std.time.ns_per_ms) catch |err| switch (err) {
             error.SignalInterrupt => continue,
@@ -1199,6 +1283,14 @@ pub fn main() !void {
         try reg.flush();
         try cleanupResponses(server);
         try reg.flush();
+
+        if (reconcile_secs > 0) {
+            const now_ns = std.time.nanoTimestamp();
+            if (now_ns - last_reconcile_ns > reconcile_period_ns) {
+                last_reconcile_ns = now_ns;
+                router.reconcileStuckMoves();
+            }
+        }
     }
     std.log.info("rewind-front: shut down", .{});
 }
