@@ -953,15 +953,19 @@ pub const WorkerConfig = struct {
     /// worker's lifetime. (docs/v2-build-order.md §Phase 4.)
     move_secret: ?[]const u8 = null,
     /// This cluster's logical id in the control-plane directory (Phase 7
-    /// serve-or-forward). When set together with `cp_url`, a request for a
+    /// serve-or-forward). When set together with `cp_urls`, a request for a
     /// tenant this cluster can't resolve locally is forwarded to the cluster
     /// the CP says owns it, instead of 404 — so a stale public route (or a
     /// request to a post-move source) costs an extra hop, never a failure.
     /// Unset → no forwarding (a local miss 404s as before). Borrowed.
     cluster_id: ?[]const u8 = null,
-    /// Base URL of the control-plane route lookup (`{cp_url}/_cp/route?host=`).
-    /// Paired with `cluster_id`; unset disables serve-or-forward. Borrowed.
-    cp_url: ?[]const u8 = null,
+    /// Base URLs of the CP nodes for the route lookup
+    /// (`{cp}/_cp/route?host=`). A LIST (Slice 2 HA): the CP is a 3-node
+    /// cluster, and routing reads work on ANY CP node (apply-driven
+    /// projection), so the worker tries each until one answers — surviving a
+    /// CP node failure. Paired with `cluster_id`; empty disables serve-or-
+    /// forward. Borrowed.
+    cp_urls: []const []const u8 = &.{},
     /// Public origin the dashboard uses to reach the log-server.
     /// Returned in the `/_system/services-token` response. Borrowed.
     log_public_base: ?[]const u8 = null,
@@ -1508,9 +1512,9 @@ pub fn Worker(comptime opts: Options) type {
         /// move surface. See `WorkerConfig.move_secret`.
         move_secret: ?[]const u8,
         /// V2 Phase 7 — serve-or-forward. See `WorkerConfig.cluster_id` /
-        /// `cp_url`. Both null → forwarding disabled.
+        /// `cp_urls`. cluster_id null or cp_urls empty → forwarding disabled.
         cluster_id: ?[]const u8,
-        cp_url: ?[]const u8,
+        cp_urls: []const []const u8,
         log_public_base: ?[]const u8,
         files_public_base: ?[]const u8,
         /// Internal-service POST insecure-TLS toggle (now log-push
@@ -1621,7 +1625,7 @@ pub fn Worker(comptime opts: Options) type {
                 .services_jwt_secret = config.services_jwt_secret,
                 .move_secret = config.move_secret,
                 .cluster_id = config.cluster_id,
-                .cp_url = config.cp_url,
+                .cp_urls = config.cp_urls,
                 .log_public_base = config.log_public_base,
                 .files_public_base = config.files_public_base,
                 .internal_insecure_tls = config.internal_insecure_tls,

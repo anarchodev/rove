@@ -53,7 +53,11 @@ def spawn_rewind(name, port, data_dir, cluster_id, admin_domain):
     env = dict(os.environ)
     env["REWIND_ADMIN_DOMAIN"] = admin_domain
     env["REWIND_CLUSTER_ID"] = cluster_id
-    env["REWIND_CP_URL"] = f"http://127.0.0.1:{PCP}"
+    # A LIST with a DEAD CP URL first (port 1, nothing listening) → exercises
+    # the multi-CP fallthrough (Slice 2 HA): the worker skips the unreachable
+    # CP node and uses the live one. A single down CP node never breaks
+    # serve-or-forward.
+    env["REWIND_CP_URL"] = f"http://127.0.0.1:1;http://127.0.0.1:{PCP}"
     p = subprocess.Popen(
         [REWIND, data_dir, str(port)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
