@@ -59,6 +59,7 @@ pub const PeerAddr = transport_mod.PeerAddr;
 pub const KvStore = kvstore.KvStore;
 pub const WriteSet = writeset.WriteSet;
 pub const Envelope = envelope.Envelope;
+pub const RangeResult = kvstore.RangeResult;
 
 /// Default hibernation idle window (Phase 6, `multiraft-scaling-learnings
 /// §3.1`): a group with no propose / non-heartbeat step for this long drops
@@ -621,6 +622,24 @@ pub const Node = struct {
     pub fn get(self: *Node, tenant_id: u64, key: []const u8) Error![]u8 {
         const slot = self.groups.get(tenant_id) orelse return Error.UnknownGroup;
         return slot.store.get(key);
+    }
+
+    /// Prefix-scan a group's store (one page; `cursor` resumes a prior page,
+    /// `""` starts). The caller owns + frees the returned `RangeResult`. Like
+    /// `get`, this reads the slot store directly, so it is only safe off the
+    /// pump thread for a STABLE group whose slot is fixed (the CP directory
+    /// group, scanned at boot before the pump thread starts). The CP uses it
+    /// to materialize its in-memory placement projection from the replicated
+    /// store on startup (a directory write survives a restart).
+    pub fn prefix(
+        self: *Node,
+        tenant_id: u64,
+        prefix_bytes: []const u8,
+        cursor: []const u8,
+        count: u32,
+    ) Error!RangeResult {
+        const slot = self.groups.get(tenant_id) orelse return Error.UnknownGroup;
+        return slot.store.prefix(prefix_bytes, cursor, count);
     }
 
     // ── apply path ──────────────────────────────────────────────────
