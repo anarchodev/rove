@@ -228,11 +228,18 @@ const Router = struct {
     /// and required (via `X-Rewind-Move-Secret`) on `/_control/move`.
     /// Null disables the move control surface (503).
     move_secret: ?[]const u8,
-    /// HTTP origins of the OTHER CP nodes (Slice 2 HA), for forwarding a
-    /// directory WRITE (`/_control/*`) when this node is not the directory
-    /// group leader. Empty for a single-node CP (this node always leads).
-    /// `REWIND_CP_PEER_URLS`. Borrowed; owned by `main`.
+    /// HTTP origins of the CP nodes (Slice 2 HA), for forwarding a directory
+    /// WRITE (`/_control/*`) when this node is not the directory group leader.
+    /// Empty for a single-node CP (this node always leads). `REWIND_CP_PEER_URLS`,
+    /// indexed by CP node id − 1 (same convention as `REWIND_CP_PEERS`).
+    /// Borrowed; owned by `main`.
     cp_peer_urls: []const []const u8 = &.{},
+    /// This node's own index into `cp_peer_urls` (= CP node id − 1), so the
+    /// leader probe NEVER calls its own `/_cp/leader`: that is a synchronous
+    /// self-call from the poll loop (which is busy making the call), so it
+    /// can't be served and hangs until the request timeout. Null for a
+    /// single-node CP (no forwarding).
+    self_cp_idx: ?usize = null,
 
     /// Reply helper: set an immediate status (no body) on the request
     /// entity and move it to response_in.
@@ -550,11 +557,14 @@ const Router = struct {
         path: []const u8,
     ) !void {
         const a = self.allocator;
+        const t0 = std.time.milliTimestamp();
         const leader = self.findCpLeaderUrl() orelse {
             try replyStatus(server, ent, sid, sess, 503); // no CP leader right now
             return;
         };
         defer a.free(leader);
+        const t1 = std.time.milliTimestamp();
+        std.log.info("front: forward findCpLeader: {d}ms → {s}", .{ t1 - t0, leader });
         const method = methodFrom(headerValue(rh, ":method") orelse "POST") orelse .POST;
         const body: []const u8 = if (rb.data) |d| d[0..rb.len] else &.{};
         const resp = self.backendCall(leader, path, method, body, null) catch |err| {
@@ -562,6 +572,7 @@ const Router = struct {
             try replyStatus(server, ent, sid, sess, 502);
             return;
         };
+        std.log.info("front: forward backendCall: {d}ms status={d}", .{ std.time.milliTimestamp() - t1, resp.status });
         var r = resp;
         defer r.deinit(a);
         if (r.body.len == 0) {
@@ -580,7 +591,13 @@ const Router = struct {
     /// Null if none leads (mid-election / all unreachable).
     fn findCpLeaderUrl(self: *Router) ?[]u8 {
         const a = self.allocator;
-        for (self.cp_peer_urls) |base| {
+        for (self.cp_peer_urls, 0..) |base, i| {
+            // Never probe self — a blocking call to our own /_cp/leader from
+            // inside the poll loop self-deadlocks (we are the loop, busy here).
+            // We are forwarding precisely because we are NOT the leader.
+            if (self.self_cp_idx) |self_i| {
+                if (i == self_i) continue;
+            }
             const resp = self.backendCall(base, "/_cp/leader", .GET, "", null) catch continue;
             const ok = resp.status == 200;
             var r = resp;
@@ -641,10 +658,24 @@ const Router = struct {
         };
         defer a.free(tbody);
 
+        // Per-step timing — the move is a chain of blocking back-end calls +
+        // directory raft commits; this surfaces which step stalls when the
+        // whole move runs long. Kept in tree (diagnostic state is not
+        // temporary).
+        var t_ms: i64 = std.time.milliTimestamp();
+        const T = struct {
+            fn lap(prev: *i64, comptime label: []const u8) void {
+                const now = std.time.milliTimestamp();
+                std.log.info("front: move step {s}: {d}ms", .{ label, now - prev.* });
+                prev.* = now;
+            }
+        };
+
         self.directory.beginMove(tenant) catch {
             try replyStatus(server, ent, sid, sess, 500);
             return;
         };
+        T.lap(&t_ms, "beginMove");
 
         // 1. Quiesce + dump the source LEADER (v2-bundle is leader-gated —
         //    a follower 421s, so try each source node until one returns the
@@ -655,6 +686,7 @@ const Router = struct {
             return;
         };
         defer dump.deinit(a);
+        T.lap(&t_ms, "bundle");
 
         // 2. Attach on EVERY destination node (the group is formed across the
         //    whole destination cluster: each node loads the bundle + creates
@@ -666,6 +698,7 @@ const Router = struct {
             try replyStatus(server, ent, sid, sess, 502);
             return;
         }
+        T.lap(&t_ms, "attach");
 
         // 3. Await the freshly formed destination group's election so
         //    post-move traffic finds a leader immediately (v2-leader polls).
@@ -675,6 +708,7 @@ const Router = struct {
             try replyStatus(server, ent, sid, sess, 504);
             return;
         }
+        T.lap(&t_ms, "awaitDestLeader");
 
         // 4. Flip the directory — the atomic commit point of the move.
         self.directory.move(tenant, dest) catch {
@@ -683,12 +717,14 @@ const Router = struct {
             try replyStatus(server, ent, sid, sess, 500);
             return;
         };
+        T.lap(&t_ms, "flip");
 
         // 5. Evict the source on EVERY source node (destroy each group
         //    incarnation + drop the instance). Best-effort: the move already
         //    committed; a stale source group is reclaimed lazily and never
         //    serves traffic again.
         self.evictAll(tenant, src_nodes, tbody);
+        T.lap(&t_ms, "evict");
 
         const msg = std.fmt.allocPrint(a, "moved {s}: {s} -> {s}\n", .{ tenant, src.id, dest }) catch {
             try replyStatus(server, ent, sid, sess, 200);
@@ -1145,8 +1181,10 @@ pub fn main() !void {
     // Single-node CP by default; a multi-node (HA) CP is configured by env
     // (this CP node's raft id, the voter set, the consensus transport
     // addresses). The directory raft group spans the voter set.
+    var cp_self_idx: ?usize = null;
     const cp_bridge = if (try parseCpMultiNode(allocator)) |mn| blk: {
         defer mn.deinit(allocator);
+        cp_self_idx = mn.node_id - 1; // index into REWIND_CP_PEER_URLS
         std.log.info("rewind-front: multi-node CP id={d} voters={d} listen={s}", .{ mn.node_id, mn.voters.len, mn.listen_str });
         break :blk try Bridge.initMultiNode(allocator, cp_data_dir, mn.node_id, mn.voters, mn.listen_addr, mn.peers);
     } else try Bridge.initSingleNode(allocator, cp_data_dir);
@@ -1255,7 +1293,7 @@ pub fn main() !void {
     }, .{ .tls_config = null });
     defer server.destroy();
 
-    var router = Router{ .allocator = allocator, .directory = directory, .hosts = &hosts, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls };
+    var router = Router{ .allocator = allocator, .directory = directory, .hosts = &hosts, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx };
 
     // Periodic stuck-move reconciliation on the directory leader (between
     // request batches; never overlaps a synchronous move — see
