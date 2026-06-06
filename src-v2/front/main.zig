@@ -57,6 +57,91 @@ fn installSignalHandlers() void {
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 }
 
+// ── Multi-node CP (Slice 2 HA) config ─────────────────────────────────
+
+/// Parsed multi-node CP bridge config, owned for the lifetime of the
+/// `initMultiNode` call (the slices are duped by the node/transport, so this
+/// is freed right after). `null` = single-node CP.
+const CpMultiNode = struct {
+    node_id: u64,
+    voters: []u64,
+    peers: []bridge_mod.PeerAddr,
+    /// Backing storage for the peer host slices (`host:port` left of `:`).
+    peer_bufs: [][]u8,
+    listen_addr: std.net.Address,
+    listen_str: []u8,
+
+    fn deinit(self: *const CpMultiNode, a: std.mem.Allocator) void {
+        a.free(self.voters);
+        a.free(self.peers);
+        for (self.peer_bufs) |b| a.free(b);
+        a.free(self.peer_bufs);
+        a.free(self.listen_str);
+    }
+};
+
+/// Build multi-node CP config from env, or null if `REWIND_CP_NODE_ID` is
+/// unset (single-node CP). Required together — the CP's directory raft group
+/// spans these nodes (mirrors `rewind`'s `REWIND_NODE_ID`/`VOTERS`/`PEERS`,
+/// but for the CP cluster, with CP-specific consensus ports distinct from the
+/// HTTP listen port):
+///   - `REWIND_CP_NODE_ID`  this CP node's 1-based raft id (∈ the voter set).
+///   - `REWIND_CP_VOTERS`   comma-separated voter ids, e.g. `1,2,3`.
+///   - `REWIND_CP_PEERS`    comma-separated raft transport `host:port`s,
+///                          indexed by raft id − 1. Distinct from the HTTP
+///                          listen port (argv[1]).
+/// Errors loud on malformed / inconsistent config.
+fn parseCpMultiNode(a: std.mem.Allocator) !?CpMultiNode {
+    const node_id_s = std.posix.getenv("REWIND_CP_NODE_ID") orelse return null;
+    const voters_s = std.posix.getenv("REWIND_CP_VOTERS") orelse return error.MissingCpVoters;
+    const peers_s = std.posix.getenv("REWIND_CP_PEERS") orelse return error.MissingCpPeers;
+
+    const node_id = try std.fmt.parseInt(u64, std.mem.trim(u8, node_id_s, " \t"), 10);
+
+    var voters: std.ArrayListUnmanaged(u64) = .empty;
+    errdefer voters.deinit(a);
+    var vit = std.mem.tokenizeScalar(u8, voters_s, ',');
+    while (vit.next()) |tok| {
+        const t = std.mem.trim(u8, tok, " \t");
+        if (t.len == 0) continue;
+        try voters.append(a, try std.fmt.parseInt(u64, t, 10));
+    }
+    if (voters.items.len == 0) return error.MissingCpVoters;
+
+    var peers: std.ArrayListUnmanaged(bridge_mod.PeerAddr) = .empty;
+    errdefer peers.deinit(a);
+    var peer_bufs: std.ArrayListUnmanaged([]u8) = .empty;
+    errdefer {
+        for (peer_bufs.items) |b| a.free(b);
+        peer_bufs.deinit(a);
+    }
+    var pit = std.mem.tokenizeScalar(u8, peers_s, ',');
+    while (pit.next()) |tok| {
+        const t = std.mem.trim(u8, tok, " \t");
+        if (t.len == 0) continue;
+        const colon = std.mem.lastIndexOfScalar(u8, t, ':') orelse return error.BadCpPeer;
+        const host = try a.dupe(u8, t[0..colon]);
+        errdefer a.free(host);
+        const port = try std.fmt.parseInt(u16, t[colon + 1 ..], 10);
+        try peer_bufs.append(a, host);
+        try peers.append(a, .{ .host = host, .port = port });
+    }
+    if (node_id == 0 or node_id > peers.items.len) return error.BadCpNodeId;
+
+    const listen = peers.items[node_id - 1];
+    const listen_addr = try std.net.Address.parseIp(listen.host, listen.port);
+    const listen_str = try std.fmt.allocPrint(a, "{s}:{d}", .{ listen.host, listen.port });
+
+    return CpMultiNode{
+        .node_id = node_id,
+        .voters = try voters.toOwnedSlice(a),
+        .peers = try peers.toOwnedSlice(a),
+        .peer_bufs = try peer_bufs.toOwnedSlice(a),
+        .listen_addr = listen_addr,
+        .listen_str = listen_str,
+    };
+}
+
 // ── Host → tenant static map (Phase-3 stand-in for the CP domain index)─
 const HostMap = struct {
     allocator: std.mem.Allocator,
@@ -143,6 +228,11 @@ const Router = struct {
     /// and required (via `X-Rewind-Move-Secret`) on `/_control/move`.
     /// Null disables the move control surface (503).
     move_secret: ?[]const u8,
+    /// HTTP origins of the OTHER CP nodes (Slice 2 HA), for forwarding a
+    /// directory WRITE (`/_control/*`) when this node is not the directory
+    /// group leader. Empty for a single-node CP (this node always leads).
+    /// `REWIND_CP_PEER_URLS`. Borrowed; owned by `main`.
+    cp_peer_urls: []const []const u8 = &.{},
 
     /// Reply helper: set an immediate status (no body) on the request
     /// entity and move it to response_in.
@@ -358,6 +448,14 @@ const Router = struct {
     /// public proxy config already encodes; lock it down when the CP becomes
     /// its own binary.
     fn handleCp(self: *Router, server: *FrontH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, path: []const u8) !void {
+        // `/_cp/leader` — 200 iff THIS CP node leads the directory raft group
+        // (so directory WRITES can commit here), else 503. A follower CP node
+        // uses this to discover the leader to forward a `/_control/*` write to;
+        // a single-node CP always answers 200.
+        if (std.mem.startsWith(u8, path, "/_cp/leader")) {
+            try replyStatus(server, ent, sid, sess, if (self.directory.isLeader()) 200 else 503);
+            return;
+        }
         if (!std.mem.startsWith(u8, path, "/_cp/route")) {
             try replyStatus(server, ent, sid, sess, 404);
             return;
@@ -419,11 +517,77 @@ const Router = struct {
             try replyStatus(server, ent, sid, sess, 401);
             return;
         }
+
+        // Multi-node CP (Slice 2 HA): the move flips the directory, which only
+        // commits on the directory-group LEADER. If this CP node is a follower,
+        // forward the whole control request to the CP leader and relay its
+        // response — so an operator can target any CP node. (Single-node CP
+        // always leads; `cp_peer_urls` is empty → handle locally.)
+        if (self.cp_peer_urls.len > 0 and !self.directory.isLeader()) {
+            try self.forwardControlToLeader(server, ent, sid, sess, rh, rb, path);
+            return;
+        }
+
         const body: []const u8 = if (rb.data) |d| d[0..rb.len] else &.{};
         if (is_move_live)
             try self.handleMoveLive(server, ent, sid, sess, body)
         else
             try self.handleMove(server, ent, sid, sess, body);
+    }
+
+    /// Forward a `/_control/*` request to the CP node that currently leads the
+    /// directory group (discovered via `/_cp/leader`), relaying its response.
+    /// Used when this CP node is a follower (directory writes can't commit
+    /// here). 503 if no CP leader is reachable (the client retries).
+    fn forwardControlToLeader(
+        self: *Router,
+        server: *FrontH2,
+        ent: rove.Entity,
+        sid: h2.StreamId,
+        sess: h2.Session,
+        rh: h2.ReqHeaders,
+        rb: h2.ReqBody,
+        path: []const u8,
+    ) !void {
+        const a = self.allocator;
+        const leader = self.findCpLeaderUrl() orelse {
+            try replyStatus(server, ent, sid, sess, 503); // no CP leader right now
+            return;
+        };
+        defer a.free(leader);
+        const method = methodFrom(headerValue(rh, ":method") orelse "POST") orelse .POST;
+        const body: []const u8 = if (rb.data) |d| d[0..rb.len] else &.{};
+        const resp = self.backendCall(leader, path, method, body, null) catch |err| {
+            std.log.warn("front: forward control to CP leader {s} failed: {s}", .{ leader, @errorName(err) });
+            try replyStatus(server, ent, sid, sess, 502);
+            return;
+        };
+        var r = resp;
+        defer r.deinit(a);
+        if (r.body.len == 0) {
+            try replyStatus(server, ent, sid, sess, @intCast(r.status));
+            return;
+        }
+        const owned = a.dupe(u8, r.body) catch {
+            try replyStatus(server, ent, sid, sess, @intCast(r.status));
+            return;
+        };
+        try replyText(server, ent, sid, sess, @intCast(r.status), owned);
+    }
+
+    /// Find the CP node currently leading the directory group: try each CP
+    /// peer's `/_cp/leader` until one answers 200, returning its URL (owned).
+    /// Null if none leads (mid-election / all unreachable).
+    fn findCpLeaderUrl(self: *Router) ?[]u8 {
+        const a = self.allocator;
+        for (self.cp_peer_urls) |base| {
+            const resp = self.backendCall(base, "/_cp/leader", .GET, "", null) catch continue;
+            const ok = resp.status == 200;
+            var r = resp;
+            r.deinit(a);
+            if (ok) return a.dupe(u8, base) catch null;
+        }
+        return null;
     }
 
     /// Orchestrate a brief-pause tenant move (docs/v2-build-order.md
@@ -898,6 +1062,28 @@ fn getEnvCfg(name: []const u8) []const u8 {
     return std.posix.getenv(name) orelse "";
 }
 
+/// Parse a `;`/`,`-separated list of origins into an owned, owned-element
+/// slice. Empty input → empty slice. Whitespace trimmed; blanks skipped.
+fn parseUrlList(a: std.mem.Allocator, config: []const u8) ![]const []const u8 {
+    var list: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (list.items) |u| a.free(u);
+        list.deinit(a);
+    }
+    var it = std.mem.tokenizeAny(u8, config, ";,");
+    while (it.next()) |raw| {
+        const url = std.mem.trim(u8, raw, " \t\r\n");
+        if (url.len == 0) continue;
+        try list.append(a, try a.dupe(u8, url));
+    }
+    return list.toOwnedSlice(a);
+}
+
+fn freeUrlList(a: std.mem.Allocator, urls: []const []const u8) void {
+    for (urls) |u| a.free(u);
+    a.free(urls);
+}
+
 pub fn main() !void {
     curl.globalInit();
     const allocator = std.heap.c_allocator;
@@ -919,7 +1105,14 @@ pub fn main() !void {
         std.log.err("rewind-front: REWIND_CP_DATA_DIR is required (the durable directory store path)", .{});
         return error.MissingCpDataDir;
     };
-    const cp_bridge = try Bridge.initSingleNode(allocator, cp_data_dir);
+    // Single-node CP by default; a multi-node (HA) CP is configured by env
+    // (this CP node's raft id, the voter set, the consensus transport
+    // addresses). The directory raft group spans the voter set.
+    const cp_bridge = if (try parseCpMultiNode(allocator)) |mn| blk: {
+        defer mn.deinit(allocator);
+        std.log.info("rewind-front: multi-node CP id={d} voters={d} listen={s}", .{ mn.node_id, mn.voters.len, mn.listen_str });
+        break :blk try Bridge.initMultiNode(allocator, cp_data_dir, mn.node_id, mn.voters, mn.listen_addr, mn.peers);
+    } else try Bridge.initSingleNode(allocator, cp_data_dir);
     const directory = try Directory.initReplicated(allocator, cp_bridge);
     // Teardown order matters: the pump fires the directory's apply observer,
     // so the pump must STOP (`cp_bridge.deinit` → `stopPump`) before the
@@ -932,13 +1125,42 @@ pub fn main() !void {
     // Static config seeds ONLY a fresh (empty) directory — a restart over a
     // populated store keeps its committed placements (incl. completed moves)
     // rather than re-seeding back to the static config.
-    if (directory.isEmpty()) {
-        try directory.seedClusters(getEnvCfg("REWIND_CLUSTERS"));
-        try directory.seedPlacements(getEnvCfg("REWIND_PLACEMENT"));
-        std.log.info("rewind-front: seeded directory from static config", .{});
+    //
+    // Single-node CP: this node is always the leader, so seed immediately.
+    // Multi-node CP: a directory write only commits on the LEADER, so only the
+    // leader seeds (once); every follower boots empty and fills its projection
+    // from the leader's replicated seed (the apply observer). Wait briefly for
+    // election / replication to settle before deciding.
+    if (cp_bridge.node.isSingleNode()) {
+        if (directory.isEmpty()) {
+            try directory.seedClusters(getEnvCfg("REWIND_CLUSTERS"));
+            try directory.seedPlacements(getEnvCfg("REWIND_PLACEMENT"));
+            std.log.info("rewind-front: seeded directory from static config", .{});
+        } else {
+            std.log.info("rewind-front: directory replayed from {s} (skipping static seed)", .{cp_data_dir});
+        }
     } else {
-        std.log.info("rewind-front: directory replayed from {s} (skipping static seed)", .{cp_data_dir});
+        const deadline: i128 = std.time.nanoTimestamp() + 10 * std.time.ns_per_s;
+        while (std.time.nanoTimestamp() < deadline and !directory.isLeader() and directory.isEmpty()) {
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+        }
+        if (directory.isLeader() and directory.isEmpty()) {
+            try directory.seedClusters(getEnvCfg("REWIND_CLUSTERS"));
+            try directory.seedPlacements(getEnvCfg("REWIND_PLACEMENT"));
+            std.log.info("rewind-front: directory leader seeded from static config", .{});
+        } else if (directory.isEmpty()) {
+            std.log.info("rewind-front: CP follower — awaiting directory replication from the leader", .{});
+        } else {
+            std.log.info("rewind-front: directory replayed/replicated (skipping static seed)", .{});
+        }
     }
+
+    // CP peer HTTP origins (Slice 2 HA) — the OTHER CP nodes' front-door URLs,
+    // so a follower can forward a `/_control/*` write to the directory leader.
+    // `REWIND_CP_PEER_URLS=http://a:8080;http://b:8080;http://c:8080`. Empty
+    // for a single-node CP (this node always leads → no forward).
+    const cp_peer_urls = try parseUrlList(allocator, getEnvCfg("REWIND_CP_PEER_URLS"));
+    defer freeUrlList(allocator, cp_peer_urls);
 
     var hosts = HostMap.init(allocator);
     defer hosts.deinit();
@@ -965,7 +1187,7 @@ pub fn main() !void {
     }, .{ .tls_config = null });
     defer server.destroy();
 
-    var router = Router{ .allocator = allocator, .directory = directory, .hosts = &hosts, .move_secret = move_secret };
+    var router = Router{ .allocator = allocator, .directory = directory, .hosts = &hosts, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls };
 
     std.log.info("rewind-front: listening on 0.0.0.0:{d} (move control {s})", .{ port, if (move_secret != null) "enabled" else "disabled" });
     while (!stop_flag.load(.acquire)) {
