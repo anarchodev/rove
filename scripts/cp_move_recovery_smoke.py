@@ -84,15 +84,26 @@ def black_hole(port):
     threading.Thread(target=loop, daemon=True).start()
 
 
+# Per-process stdout → FILE, never a PIPE: an un-drained pipe fills (~64KB)
+# and BLOCKS the process on its next log write mid-move (the classic
+# multi-process-smoke flake). Readiness reads the file.
+LOGDIR = os.environ.get("CLAUDE_JOB_DIR", "/tmp")
+
+
+def _spawn(name, argv, env):
+    logf = open(os.path.join(LOGDIR, f"cprec-{name}-{os.getpid()}.log"), "w+")
+    p = subprocess.Popen(argv, stdout=logf, stderr=subprocess.STDOUT, env=env)
+    p._logf = logf
+    p._name = name
+    procs.append(p)
+    return p
+
+
 def spawn_rewind(name, port, data_dir):
     env = dict(os.environ)
     env["REWIND_ADMIN_DOMAIN"] = f"{name}.localhost"
     env["REWIND_MOVE_SECRET"] = MOVE_SECRET
-    p = subprocess.Popen(
-        [REWIND, data_dir, str(port)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
-    )
-    procs.append(p)
+    p = _spawn(name, [REWIND, data_dir, str(port)], env)
     _await_line(p, name, "listening on")
     return p
 
@@ -110,12 +121,8 @@ def launch_cp(node_id, data_dir):
     env["REWIND_CP_PEERS"] = PEERS
     env["REWIND_CP_PEER_URLS"] = PEER_URLS
     env["REWIND_CP_RECONCILE_SECS"] = "2"
-    p = subprocess.Popen(
-        [FRONT, str(http)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
-    )
+    p = _spawn(f"cp{node_id}", [FRONT, str(http)], env)
     p._http = http
-    procs.append(p)
     cp_procs[http] = p
     return p
 
@@ -123,14 +130,12 @@ def launch_cp(node_id, data_dir):
 def _await_line(p, name, needle, timeout=25):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        line = p.stdout.readline()
-        if not line:
-            if p.poll() is not None:
-                raise SystemExit(f"{name} exited early: rc={p.returncode}")
-            continue
-        sys.stdout.write(f"  [{name}] " + line)
-        if needle in line:
+        p._logf.seek(0)
+        if needle in p._logf.read():
             return
+        if p.poll() is not None:
+            raise SystemExit(f"{name} exited early: rc={p.returncode}")
+        time.sleep(0.1)
     raise SystemExit(f"{name} did not reach '{needle}' within {timeout}s")
 
 
