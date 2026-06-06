@@ -2177,25 +2177,36 @@ fn tryForwardToOwner(
     body: []const u8,
 ) !bool {
     const cluster_id = worker.cluster_id orelse return false;
-    const cp_url = worker.cp_url orelse return false;
+    if (worker.cp_urls.len == 0) return false;
     const curl = blob_mod.curl;
 
-    // 1. Ask the CP who owns this host.
-    const route_url = try std.fmt.allocPrint(allocator, "{s}/_cp/route?host={s}", .{ cp_url, host });
-    defer allocator.free(route_url);
-    var cp_easy = curl.Easy.init(allocator) catch return false;
-    defer cp_easy.deinit();
-    var cp_resp = cp_easy.request(allocator, .{
-        .method = .GET,
-        .url = route_url,
-        .headers = &.{},
-        .body = "",
-        .http_version = .h2c_prior_knowledge,
-        .verify_tls = false,
-    }) catch return false;
-    defer cp_resp.deinit(allocator);
-    if (cp_resp.status != 200) return false;
-    const route_body = cp_resp.body orelse return false;
+    // 1. Ask the CP who owns this host. The CP is a 3-node cluster and routing
+    //    reads work on ANY node (apply-driven projection), so try each CP node
+    //    until one answers 200 — a single CP node being down never breaks
+    //    serve-or-forward. A reachable node that returns non-200 (e.g. 404 =
+    //    unknown host) is authoritative: stop, don't keep trying.
+    var route_owned: ?[]u8 = null;
+    defer if (route_owned) |b| allocator.free(b);
+    for (worker.cp_urls) |cp_url| {
+        const route_url = std.fmt.allocPrint(allocator, "{s}/_cp/route?host={s}", .{ cp_url, host }) catch return false;
+        defer allocator.free(route_url);
+        var cp_easy = curl.Easy.init(allocator) catch continue;
+        defer cp_easy.deinit();
+        var cp_resp = cp_easy.request(allocator, .{
+            .method = .GET,
+            .url = route_url,
+            .headers = &.{},
+            .body = "",
+            .http_version = .h2c_prior_knowledge,
+            .verify_tls = false,
+        }) catch continue; // CP node unreachable → try the next
+        defer cp_resp.deinit(allocator);
+        if (cp_resp.status != 200) return false; // reachable + authoritative non-owner answer
+        const route_body = cp_resp.body orelse return false;
+        route_owned = allocator.dupe(u8, route_body) catch return false;
+        break;
+    }
+    const route_body = route_owned orelse return false; // every CP node unreachable
 
     var parsed = std.json.parseFromSlice(struct {
         cluster: []const u8,

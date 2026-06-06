@@ -97,7 +97,7 @@ const WorkerCtx = struct {
     admin_api_domain: []const u8,
     move_secret: ?[]const u8,
     cluster_id: ?[]const u8,
-    cp_url: ?[]const u8,
+    cp_urls: []const []const u8,
     ready: *std.Thread.ResetEvent,
 };
 
@@ -145,7 +145,7 @@ fn workerMain(args: *WorkerCtx) !void {
         .data_dir = args.data_dir,
         .move_secret = args.move_secret,
         .cluster_id = args.cluster_id,
-        .cp_url = args.cp_url,
+        .cp_urls = args.cp_urls,
     });
     defer worker.destroy();
 
@@ -277,6 +277,28 @@ fn parseMultiNode(a: std.mem.Allocator) !?MultiNode {
     };
 }
 
+/// Parse a `;`/`,`-separated list of origins into an owned, owned-element
+/// slice (a single URL → a one-element list; empty input → empty slice).
+fn parseUrlList(a: std.mem.Allocator, config: []const u8) ![]const []const u8 {
+    var list: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (list.items) |u| a.free(u);
+        list.deinit(a);
+    }
+    var it = std.mem.tokenizeAny(u8, config, ";,");
+    while (it.next()) |raw| {
+        const url = std.mem.trim(u8, raw, " \t\r\n");
+        if (url.len == 0) continue;
+        try list.append(a, try a.dupe(u8, url));
+    }
+    return list.toOwnedSlice(a);
+}
+
+fn freeUrlList(a: std.mem.Allocator, urls: []const []const u8) void {
+    for (urls) |u| a.free(u);
+    a.free(urls);
+}
+
 // ── main ──────────────────────────────────────────────────────────────
 pub fn main() !void {
     // rove uses libc malloc globally (multiraft-scaling-learnings §3.6 —
@@ -304,7 +326,11 @@ pub fn main() !void {
     // forwarding). A DP that can't serve a tenant locally asks the CP who
     // owns it and forwards there.
     const cluster_id = std.posix.getenv("REWIND_CLUSTER_ID");
-    const cp_url = std.posix.getenv("REWIND_CP_URL");
+    // A LIST of CP node URLs (HA): `REWIND_CP_URL` accepts `;`/`,`-separated
+    // origins (a single URL is just a one-element list). The worker tries each
+    // until one answers, so a CP node failure never breaks serve-or-forward.
+    const cp_urls = try parseUrlList(allocator, std.posix.getenv("REWIND_CP_URL") orelse "");
+    defer freeUrlList(allocator, cp_urls);
 
     // Blob backend (fs or s3) — process-wide, env-selected.
     var blob_owned = try blob_mod.env.loadFromEnv(allocator);
@@ -374,7 +400,7 @@ pub fn main() !void {
         .admin_api_domain = admin_api_domain,
         .move_secret = move_secret,
         .cluster_id = cluster_id,
-        .cp_url = cp_url,
+        .cp_urls = cp_urls,
         .ready = &ready,
     };
     var th = try std.Thread.spawn(.{}, workerThreadEntry, .{&ctx});
