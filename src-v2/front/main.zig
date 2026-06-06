@@ -920,10 +920,13 @@ pub fn main() !void {
         return error.MissingCpDataDir;
     };
     const cp_bridge = try Bridge.initSingleNode(allocator, cp_data_dir);
+    const directory = try Directory.initReplicated(allocator, cp_bridge);
+    // Teardown order matters: the pump fires the directory's apply observer,
+    // so the pump must STOP (`cp_bridge.deinit` → `stopPump`) before the
+    // directory is freed. Defers run LIFO, so declare `directory.destroy`
+    // first (runs last) and `cp_bridge.deinit` second (runs first).
+    defer directory.destroy();
     defer cp_bridge.deinit();
-
-    var directory = try Directory.initReplicated(allocator, cp_bridge);
-    defer directory.deinit();
     try cp_bridge.startPump();
 
     // Static config seeds ONLY a fresh (empty) directory — a restart over a
@@ -962,7 +965,7 @@ pub fn main() !void {
     }, .{ .tls_config = null });
     defer server.destroy();
 
-    var router = Router{ .allocator = allocator, .directory = &directory, .hosts = &hosts, .move_secret = move_secret };
+    var router = Router{ .allocator = allocator, .directory = directory, .hosts = &hosts, .move_secret = move_secret };
 
     std.log.info("rewind-front: listening on 0.0.0.0:{d} (move control {s})", .{ port, if (move_secret != null) "enabled" else "disabled" });
     while (!stop_flag.load(.acquire)) {
