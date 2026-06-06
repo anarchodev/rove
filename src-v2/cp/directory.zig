@@ -227,6 +227,16 @@ pub const Directory = struct {
         return self.clusters.items.len == 0;
     }
 
+    /// Whether THIS CP node leads the directory raft group — i.e. directory
+    /// WRITES (the move flip) can commit here. Reads work on any node (the
+    /// apply-driven projection), but a write proposed on a follower faults,
+    /// so a multi-node CP follower must forward a control write to the leader.
+    /// Always true for a single-node CP and for an ephemeral directory.
+    pub fn isLeader(self: *Directory) bool {
+        const bridge = self.bridge orelse return true;
+        return bridge.isLeaderOf(self.dir_gid);
+    }
+
     // ── Boot replay ──────────────────────────────────────────────────
 
     /// Rebuild the in-memory projection from the directory group's store:
