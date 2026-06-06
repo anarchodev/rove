@@ -68,6 +68,7 @@ def spawn_front():
     env["REWIND_HOSTS"] = f"{HOST}={TENANT}"
     env["REWIND_PLACEMENT"] = f"{TENANT}=cluster-A"
     env["REWIND_MOVE_SECRET"] = SECRET
+    env["REWIND_CP_DATA_DIR"] = f"/tmp/zdl-cp-{os.getpid()}"
     return _spawn("front", [FRONT, str(PF)], env)
 
 
@@ -171,7 +172,8 @@ def main():
 
     pid = os.getpid()
     da, db = f"/tmp/zdl-a-{pid}", f"/tmp/zdl-b-{pid}"
-    for d in (da, db):
+    dcp = f"/tmp/zdl-cp-{pid}"
+    for d in (da, db, dcp):
         subprocess.run(["rm", "-rf", d])
 
     fails = []
@@ -230,7 +232,7 @@ def main():
         check("source A evicted", kv_get(PA, "seed")[0] in (404, 409), True)
     finally:
         stop_all()
-        for d in (da, db):
+        for d in (da, db, dcp):
             subprocess.run(["rm", "-rf", d])
 
     if fails:

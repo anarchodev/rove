@@ -63,6 +63,7 @@ def spawn_front():
     env["REWIND_HOSTS"] = "live.localhost=livetenant"
     env["REWIND_PLACEMENT"] = "livetenant=cluster-A"
     env["REWIND_MOVE_SECRET"] = SECRET
+    env["REWIND_CP_DATA_DIR"] = f"/tmp/zdm-cp-{os.getpid()}"
     p = subprocess.Popen([FRONT, str(PF)], stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, env=env)
     procs.append(p)
@@ -174,8 +175,9 @@ def main():
 
     pid = os.getpid()
     da, db = f"/tmp/zdm-a-{pid}", f"/tmp/zdm-b-{pid}"
+    dcp = f"/tmp/zdm-cp-{pid}"
     bpath = os.path.join(os.environ.get("CLAUDE_JOB_DIR", "/tmp"), f"zdm-snap-{pid}.bin")
-    for d in (da, db):
+    for d in (da, db, dcp):
         subprocess.run(["rm", "-rf", d])
 
     fails = []
@@ -221,7 +223,7 @@ def main():
         check("A evicted livetenant", kv_get(PA, "livetenant", "g")[0] in (404, 409), True)
     finally:
         stop_all()
-        for d in (da, db):
+        for d in (da, db, dcp):
             subprocess.run(["rm", "-rf", d])
         try:
             os.remove(bpath)

@@ -1,12 +1,38 @@
 # V2 — control-plane directory raft-replication (design)
 
-> **Status: DESIGN (2026-06-05), not yet implemented.** The validated plan for
+> **Status: Slice 1 SHIPPED (2026-06-05), Slices 2–3 remain.** The plan for
 > turning the front door's in-process static `Directory` into a replicated,
 > strongly-consistent, HA control plane backed by our own `bridge`/`Node`
-> raft substrate. Captured to implement fresh. Companion:
+> raft substrate. Companion:
 > [`project_v2_zero_downtime_move`] memory (the locked Cloudflare+CP+dual-write
 > architecture), `docs/v2-build-order.md` §Phase 7, `src-v2/cp/directory.zig`
 > (the interface this sits behind), `src-v2/kv/bridge.zig` (the substrate).
+>
+> **Slice 1 (single-node durable directory) is done + green:** `directory.zig`
+> is store-backed over a single-node CP `bridge` (one `__directory__` raft
+> group, `apply_on_commit`); the front door requires `REWIND_CP_DATA_DIR` and
+> seeds static config only into an empty store. v2-test 48/48; the Slice-1
+> exit is proven by `scripts/cp_restart_smoke.py` (a committed move survives a
+> front-door restart — the directory replays instead of re-seeding) and two
+> unit restart tests in `directory.zig`. See "Implementation decisions" below
+> for two deviations from the original sketch.
+>
+> ## Implementation decisions (Slice 1, as built)
+>
+> 1. **Reads use an in-memory projection, not `node.get` per request.** Risks
+>    #1 (`ClusterRef` ownership) and #2 (cross-thread store reads) below are
+>    both resolved by materializing the committed log into the existing
+>    pointer-stable `clusters`/`placements` maps: each mutating op proposes a
+>    writeset, awaits commit, then updates the map under the mutex; the store
+>    is read only once, at boot (single-threaded, pre-pump), to rebuild the
+>    projection. So the hot read path stays zero-alloc + pointer-stable
+>    (front-door consumers unchanged) and never touches the pump thread's
+>    store. (Slice 2 must update the projection from the *apply* path so a
+>    follower — which has no local proposer — stays in sync.)
+> 2. **`REWIND_CP_DATA_DIR` is required (fail loud).** A CP without durable
+>    storage loses every committed move on restart, so the front door refuses
+>    to start without it rather than defaulting to an ephemeral path that
+>    silently re-seeds. Every front-door smoke now sets a fresh per-run path.
 
 ## Why
 
@@ -62,7 +88,7 @@ stale read safe).
 
 ## Decomposition (build in this order)
 
-### Slice 1 — single-node raft-backed `Directory` (durability + replay)
+### Slice 1 — single-node raft-backed `Directory` (durability + replay) ✅ DONE
 
 Rework `cp/directory.zig` to be **store-backed behind the same interface**, and
 give the CP binary a single-node bridge + directory group.
@@ -97,6 +123,12 @@ relinquish state + epoch fence are enforced cluster-side, not just by the
 directory. (Low priority — the per-miss query already works.)
 
 ## Key risks / decisions to resolve during implementation
+
+> Slice 1 resolved #1 + #2 together via the in-memory projection (see
+> "Implementation decisions" up top): reads never allocate or touch the store,
+> so neither `ClusterRef` ownership nor cross-thread `node.get` ever arises.
+> #3 was taken as written (seed only if empty). #1/#2 below are kept for the
+> Slice-2 follower-apply path, where the projection must update from applies.
 
 1. **`ClusterRef` ownership.** Today `ClusterRef.nodes` is a borrowed,
    pointer-stable slice into the in-memory `OwnedCluster`. A store-backed

@@ -968,17 +968,22 @@ pub fn build(b: *std.Build) void {
     const run_v2_bridge_test = b.addRunArtifact(v2_bridge_test);
     v2_test_step.dependOn(&run_v2_bridge_test.step);
 
-    // ── V2 Phase 3 — control plane: the tenant→cluster directory ───────
-    // (docs/v2-build-order.md §Phase 3, docs/v2-phase3-directory-routing.md).
-    // `src-v2/cp/directory.zig` is the routing source of truth the
-    // front-door reads and the Phase-4 move flips. Pure std — no raft/kvexp
-    // deps — so it is a plain test module (and links no raft artifact).
+    // ── V2 Phase 3/7 — control plane: the tenant→cluster directory ─────
+    // (docs/v2-build-order.md §Phase 3, docs/v2-phase3-directory-routing.md,
+    // docs/v2-cp-directory-replication.md Slice 1). `src-v2/cp/directory.zig`
+    // is the routing source of truth the front-door reads and a move flips.
+    // Slice 1 makes it durable: it backs writes with the V2 `bridge`'s
+    // directory raft group, so it now imports the bridge (and its test links
+    // the raft artifact). Reads stay on a pointer-stable in-memory projection.
     const v2_cp_dir_mod = b.createModule(.{
         .root_source_file = b.path("src-v2/cp/directory.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const run_v2_cp_dir_test = b.addRunArtifact(b.addTest(.{ .root_module = v2_cp_dir_mod }));
+    v2_cp_dir_mod.addImport("bridge", v2_bridge_mod);
+    const v2_cp_dir_test = b.addTest(.{ .root_module = v2_cp_dir_mod });
+    v2_cp_dir_test.linkLibrary(raft_dep.artifact("raft_rs_zig"));
+    const run_v2_cp_dir_test = b.addRunArtifact(v2_cp_dir_test);
     v2_test_step.dependOn(&run_v2_cp_dir_test.step);
 
     // ── V2 Phase 2c — attach the rove-js worker to the bridge ──────────
@@ -1027,9 +1032,10 @@ pub fn build(b: *std.Build) void {
     // ── rewind-front: the V2 front door (docs/v2-build-order.md §Phase 3,
     // docs/v2-phase3-directory-routing.md §3b). An HTTP/2 terminator that
     // resolves Host→tenant → directory.clusterFor → reverse-proxies to the
-    // owning cluster's `rewind`. No raft/kvexp/JS — it reads only the
-    // control-plane directory + forwards via libcurl. (Imports the
-    // directory source relatively, so no cp module is needed.)
+    // owning cluster's `rewind`. Reads route only through the control-plane
+    // directory + forward via libcurl; Slice 1 makes the directory durable,
+    // so the front door now stands up the CP `bridge` (a single directory
+    // raft group) and links the raft artifact.
     const front_mod = b.createModule(.{
         .root_source_file = b.path("src-v2/front/main.zig"),
         .target = target,
@@ -1039,12 +1045,14 @@ pub fn build(b: *std.Build) void {
     front_mod.addImport("rove-h2", h2_mod);
     front_mod.addImport("rove-blob", blob_mod);
     front_mod.addImport("cp-directory", v2_cp_dir_mod);
+    front_mod.addImport("bridge", v2_bridge_mod);
     front_mod.link_libc = true;
     front_mod.linkSystemLibrary("nghttp2", .{});
     front_mod.linkSystemLibrary("ssl", .{});
     front_mod.linkSystemLibrary("crypto", .{});
     front_mod.linkSystemLibrary("curl", .{});
     const front_exe = b.addExecutable(.{ .name = "rewind-front", .root_module = front_mod });
+    front_exe.linkLibrary(raft_dep.artifact("raft_rs_zig"));
     const front_step = b.step("rewind-front", "Build the V2 front-door binary (Phase 3b)");
     front_step.dependOn(&b.addInstallArtifact(front_exe, .{}).step);
 }

@@ -69,6 +69,7 @@ def spawn_front(name, port):
     env["REWIND_CLUSTERS"] = f"cluster-1=http://127.0.0.1:{P1};cluster-2=http://127.0.0.1:{P2}"
     env["REWIND_HOSTS"] = f"{C1_HOST}=c1tenant;{C2_HOST}=c2tenant"
     env["REWIND_PLACEMENT"] = "c1tenant=cluster-1;c2tenant=cluster-2"
+    env["REWIND_CP_DATA_DIR"] = f"/tmp/two-cluster-cp-{os.getpid()}"
     p = subprocess.Popen(
         [FRONT, str(port)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
@@ -130,7 +131,8 @@ def main():
 
     d1 = f"/tmp/two-cluster-c1-{os.getpid()}"
     d2 = f"/tmp/two-cluster-c2-{os.getpid()}"
-    for d in (d1, d2):
+    dcp = f"/tmp/two-cluster-cp-{os.getpid()}"
+    for d in (d1, d2, dcp):
         subprocess.run(["rm", "-rf", d])
 
     failures = []
@@ -164,7 +166,7 @@ def main():
         check("front Host unknown → 404", admin_kv(PF, "nope.localhost", C1_TOKEN, "k/n", "v"), "404")
     finally:
         stop_all()
-        for d in (d1, d2):
+        for d in (d1, d2, dcp):
             subprocess.run(["rm", "-rf", d])
 
     if failures:

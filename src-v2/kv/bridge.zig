@@ -63,6 +63,7 @@
 
 const std = @import("std");
 const node_mod = @import("node.zig");
+const envelope = @import("envelope.zig");
 
 pub const Node = node_mod.Node;
 pub const WriteSet = node_mod.WriteSet;
@@ -381,6 +382,27 @@ pub const Bridge = struct {
         };
         sig.next_seq = seq;
         return seq;
+    }
+
+    /// Convenience over `propose`: build a type-0 writeset envelope putting
+    /// a single `key=value` for the gid's registered tenant id and propose
+    /// it, returning the assigned seq. The control-plane directory (which has
+    /// no rove-js worker to assemble writesets) uses this to replicate a
+    /// `cluster/*` / `placement/*` directory write through its group. Awaits
+    /// nothing — the caller polls `committedSeq(gid)` / `faultedSeq(gid)`.
+    pub fn proposePut(self: *Bridge, gid: u64, key: []const u8, value: []const u8) Error!u64 {
+        const id_str = blk: {
+            const sig = self.sigFor(gid) orelse return Error.UnknownTenant;
+            break :blk sig.id_str; // pointer-stable for the bridge's lifetime
+        };
+        var ws = WriteSet.init(self.allocator);
+        defer ws.deinit();
+        ws.addPut(key, value) catch return Error.OutOfMemory;
+        const ws_bytes = ws.encode(self.allocator) catch return Error.OutOfMemory;
+        defer self.allocator.free(ws_bytes);
+        const env = envelope.encodeWriteSet(self.allocator, id_str, ws_bytes) catch return Error.OutOfMemory;
+        defer self.allocator.free(env);
+        return self.propose(gid, env);
     }
 
     /// Drop `gid` from `in_flight` (its pending FIFO emptied). Caller holds
@@ -718,7 +740,6 @@ pub const Bridge = struct {
 // ── Tests ────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const envelope = @import("envelope.zig");
 
 /// Build a type-0 writeset envelope for `id_str` carrying `ws`. Mirrors
 /// what the worker seam will hand `propose`. Caller transfers ownership

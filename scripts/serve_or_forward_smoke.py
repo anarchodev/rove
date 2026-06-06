@@ -68,6 +68,7 @@ def spawn_front():
     env["REWIND_CLUSTERS"] = f"cluster-A=http://127.0.0.1:{PA};cluster-B=http://127.0.0.1:{PB}"
     env["REWIND_HOSTS"] = f"{HOST}={TENANT}"
     env["REWIND_PLACEMENT"] = f"{TENANT}=cluster-A"
+    env["REWIND_CP_DATA_DIR"] = f"/tmp/sof-cp-{os.getpid()}"
     p = subprocess.Popen(
         [FRONT, str(PCP)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
@@ -124,7 +125,8 @@ def main():
     pid = os.getpid()
     da = f"/tmp/sof-a-{pid}"
     db = f"/tmp/sof-b-{pid}"
-    for d in (da, db):
+    dcp = f"/tmp/sof-cp-{pid}"
+    for d in (da, db, dcp):
         subprocess.run(["rm", "-rf", d])
 
     failures = []
@@ -162,7 +164,7 @@ def main():
               f"status={code}")
     finally:
         stop_all()
-        for d in (da, db):
+        for d in (da, db, dcp):
             subprocess.run(["rm", "-rf", d])
 
     if failures:

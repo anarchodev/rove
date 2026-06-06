@@ -89,6 +89,7 @@ def spawn_front(name, port):
     env["REWIND_HOSTS"] = f"{HOST}={TENANT}"
     env["REWIND_PLACEMENT"] = f"{TENANT}=cluster-1"
     env["REWIND_MOVE_SECRET"] = MOVE_SECRET
+    env["REWIND_CP_DATA_DIR"] = f"/tmp/three-node-cp-{os.getpid()}"
     p = subprocess.Popen(
         [FRONT, str(port)],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
@@ -235,7 +236,8 @@ def main():
     pid = os.getpid()
     d1 = f"/tmp/three-node-c1-{pid}"
     dnodes = [f"/tmp/three-node-c2n{i}-{pid}" for i in range(3)]
-    for d in (d1, *dnodes):
+    dcp = f"/tmp/three-node-cp-{pid}"
+    for d in (d1, *dnodes, dcp):
         subprocess.run(["rm", "-rf", d])
 
     failures = []
@@ -312,7 +314,7 @@ def main():
             check("GET via front (post-failover value)", (st, body), (200, VALUE3))
     finally:
         stop_all()
-        for d in (d1, *dnodes):
+        for d in (d1, *dnodes, dcp):
             subprocess.run(["rm", "-rf", d])
 
     if failures:

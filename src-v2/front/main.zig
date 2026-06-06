@@ -35,6 +35,8 @@ const blob = @import("rove-blob");
 const curl = blob.curl;
 const directory_mod = @import("cp-directory");
 const Directory = directory_mod.Directory;
+const bridge_mod = @import("bridge");
+const Bridge = bridge_mod.Bridge;
 
 const FrontH2 = h2.H2(.{});
 
@@ -906,11 +908,34 @@ pub fn main() !void {
     const port_str = arg_it.next() orelse "8080";
     const port = try std.fmt.parseInt(u16, port_str, 10);
 
-    // Static config (Phase-3 stand-in for the replicated control plane).
-    var directory = Directory.init(allocator);
+    // Control-plane directory — durable, backed by a single-node CP bridge
+    // (one "directory" raft group; docs/v2-cp-directory-replication.md
+    // Slice 1). The store at `REWIND_CP_DATA_DIR` persists placement across
+    // restarts; `initReplicated` replays it before the pump thread starts.
+    // Required: a CP without durable storage loses every committed move on
+    // restart, which is a misconfiguration — fail loud rather than default
+    // to an ephemeral path that silently re-seeds static config.
+    const cp_data_dir = std.posix.getenv("REWIND_CP_DATA_DIR") orelse {
+        std.log.err("rewind-front: REWIND_CP_DATA_DIR is required (the durable directory store path)", .{});
+        return error.MissingCpDataDir;
+    };
+    const cp_bridge = try Bridge.initSingleNode(allocator, cp_data_dir);
+    defer cp_bridge.deinit();
+
+    var directory = try Directory.initReplicated(allocator, cp_bridge);
     defer directory.deinit();
-    try directory.seedClusters(getEnvCfg("REWIND_CLUSTERS"));
-    try directory.seedPlacements(getEnvCfg("REWIND_PLACEMENT"));
+    try cp_bridge.startPump();
+
+    // Static config seeds ONLY a fresh (empty) directory — a restart over a
+    // populated store keeps its committed placements (incl. completed moves)
+    // rather than re-seeding back to the static config.
+    if (directory.isEmpty()) {
+        try directory.seedClusters(getEnvCfg("REWIND_CLUSTERS"));
+        try directory.seedPlacements(getEnvCfg("REWIND_PLACEMENT"));
+        std.log.info("rewind-front: seeded directory from static config", .{});
+    } else {
+        std.log.info("rewind-front: directory replayed from {s} (skipping static seed)", .{cp_data_dir});
+    }
 
     var hosts = HostMap.init(allocator);
     defer hosts.deinit();
