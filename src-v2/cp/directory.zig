@@ -163,14 +163,23 @@ pub const Directory = struct {
 
     /// Durable directory backed by `bridge`'s directory raft group. Registers
     /// the `__directory__` group, creates/reopens it (replaying the persisted
-    /// store on a restart), and rebuilds the in-memory projection from the
-    /// committed `cluster/*` / `placement/*` keys.
+    /// store on a restart), rebuilds the in-memory projection from the
+    /// committed `cluster/*` / `placement/*` keys, and registers an apply
+    /// observer so the projection tracks ONGOING replicated applies (the
+    /// leader's own writes AND a follower's replicated entries).
     ///
-    /// MUST be called BEFORE `bridge.startPump()` — `ensureGroup` and the
-    /// boot scan touch the `Node` directly, which is only race-free while no
-    /// pump thread is running.
-    pub fn initReplicated(allocator: std.mem.Allocator, bridge: *Bridge) Error!Directory {
-        var self = Directory.init(allocator);
+    /// **Heap-allocated** (returns `*Directory`, freed by `destroy`) because
+    /// the apply observer captures `self` — its address must be stable for the
+    /// bridge's lifetime, which a by-value return can't promise. (The pure
+    /// `init` stays by-value; it has no observer.)
+    ///
+    /// MUST be called BEFORE `bridge.startPump()` — `ensureGroup`, the boot
+    /// scan, and setting the observer all touch the `Node` directly, which is
+    /// only race-free while no pump thread is running.
+    pub fn initReplicated(allocator: std.mem.Allocator, bridge: *Bridge) Error!*Directory {
+        const self = allocator.create(Directory) catch return Error.OutOfMemory;
+        errdefer allocator.destroy(self);
+        self.* = Directory.init(allocator);
         self.bridge = bridge;
         self.dir_gid = bridge.registerTenant(DIR_STORE_ID) catch return Error.Replication;
         // Create/reopen the directory group's store on this (pre-pump)
@@ -179,7 +188,19 @@ pub const Directory = struct {
         _ = bridge.node.ensureGroup(self.dir_gid, DIR_STORE_ID) catch return Error.Replication;
         errdefer self.deinit();
         try self.replayFromStore();
+        // `self` is now at its final (heap) address — safe to hand the
+        // observer a pointer to it. Pre-pump, so setting the node field races
+        // nothing; subsequent applies (post-startPump) update the projection.
+        bridge.setApplyObserver(.{ .ctx = self, .func = onApply });
         return self;
+    }
+
+    /// Tear down + free a `initReplicated` (heap) directory. (The by-value
+    /// `init` directory uses `deinit` directly.)
+    pub fn destroy(self: *Directory) void {
+        const a = self.allocator;
+        self.deinit();
+        a.destroy(self);
     }
 
     pub fn deinit(self: *Directory) void {
@@ -282,22 +303,63 @@ pub const Directory = struct {
         try self.applyPlacementLocal(tenant, idx, state);
     }
 
-    // ── Replication helper ───────────────────────────────────────────
+    // ── Write path: replicate → apply observer materializes ──────────
 
-    /// Replicate a single directory key=value through the directory group
-    /// and block until it commits. No-op in ephemeral mode (no bridge).
-    /// Holds nothing but the bridge's own locks; the caller holds the
-    /// directory mutex across this (rare control-plane writes — a few ms of
-    /// reader blocking is acceptable, and there is no lock-order inversion:
-    /// the pump never takes the directory mutex).
-    fn commitDirWrite(self: *Directory, key: []const u8, value: []const u8) Error!void {
-        const bridge = self.bridge orelse return;
-        const seq = bridge.proposePut(self.dir_gid, key, value) catch return Error.Replication;
-        const deadline: i128 = std.time.nanoTimestamp() + COMMIT_TIMEOUT_NS;
-        while (bridge.committedSeq(self.dir_gid) < seq) {
-            if (bridge.faultedSeq(self.dir_gid) >= seq) return Error.Replication;
-            if (std.time.nanoTimestamp() > deadline) return Error.Replication;
-            std.Thread.sleep(200 * std.time.ns_per_us);
+    /// Apply a single directory `key=value`. Replicated mode: propose it
+    /// through the directory group and block until it commits; the **apply
+    /// observer** (`onApply`, fired on the pump thread) materializes it into
+    /// the projection — on the leader AND on every follower. Ephemeral mode
+    /// (no bridge, tests): update the projection inline.
+    ///
+    /// The caller must NOT hold `self.mutex` here. The observer takes the
+    /// mutex on the pump thread, so a writer that held it while awaiting
+    /// commit would deadlock: the watermark only advances after `applyCb`
+    /// (and its observer) runs, but the observer would be blocked on the
+    /// writer's lock. So mutating ops validate under a brief lock, release
+    /// it, then call this. Read-your-write still holds: the observer fires
+    /// inside `applyCb`, strictly before the commit hook advances the
+    /// watermark this awaits, so the projection reflects the write by the
+    /// time this returns.
+    fn applyDirWrite(self: *Directory, key: []const u8, value: []const u8) Error!void {
+        if (self.bridge) |bridge| {
+            const seq = bridge.proposePut(self.dir_gid, key, value) catch return Error.Replication;
+            const deadline: i128 = std.time.nanoTimestamp() + COMMIT_TIMEOUT_NS;
+            while (bridge.committedSeq(self.dir_gid) < seq) {
+                if (bridge.faultedSeq(self.dir_gid) >= seq) return Error.Replication;
+                if (std.time.nanoTimestamp() > deadline) return Error.Replication;
+                std.Thread.sleep(200 * std.time.ns_per_us);
+            }
+        } else {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            try self.applyDirKv(key, value);
+        }
+    }
+
+    /// The apply observer (`Bridge.setApplyObserver`): fired on the pump
+    /// thread once per committed directory PUT, on the leader and every
+    /// follower. Materializes the write into the in-memory projection under
+    /// the mutex — the seam by which a CP follower (no local proposer) stays
+    /// in sync, and the leader's own writes land. Best-effort: a parse error
+    /// is logged, not fatal (the durable store remains the source of truth).
+    fn onApply(ctx: *anyopaque, gid: u64, key: []const u8, value: []const u8) void {
+        const self: *Directory = @ptrCast(@alignCast(ctx));
+        if (gid != self.dir_gid) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.applyDirKv(key, value) catch |e| {
+            std.log.warn("cp directory apply {s}: {s}", .{ key, @errorName(e) });
+        };
+    }
+
+    /// Route a committed directory `key=value` to the projection by key
+    /// prefix. Caller holds `self.mutex`. Unknown keys are ignored
+    /// (forward-compatible with a later host-index axis).
+    fn applyDirKv(self: *Directory, key: []const u8, value: []const u8) Error!void {
+        if (std.mem.startsWith(u8, key, "cluster/")) {
+            try self.applyClusterFromJoined(key["cluster/".len..], value);
+        } else if (std.mem.startsWith(u8, key, "placement/")) {
+            try self.applyPlacementFromValue(key["placement/".len..], value);
         }
     }
 
@@ -318,25 +380,16 @@ pub const Directory = struct {
     /// member node origins (one URL for a single-node cluster, N for a
     /// multi-node one). Idempotent on `id` — a repeat call with the same id
     /// re-addresses the cluster (replaces its node set) and keeps the index
-    /// stable. `nodes` must be non-empty. Replicates before it takes effect.
+    /// stable. `nodes` must be non-empty. Replicates before it takes effect
+    /// (the projection updates via the apply observer / inline ephemerally).
     pub fn addCluster(self: *Directory, id: []const u8, nodes: []const []const u8) Error!void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.addClusterLocked(id, nodes);
-    }
-
-    fn addClusterLocked(self: *Directory, id: []const u8, nodes: []const []const u8) Error!void {
         if (nodes.len == 0) return Error.BadConfig;
         const a = self.allocator;
-
-        // Durable write first; only touch the projection once it commits.
         const joined = try joinNodes(a, nodes);
         defer a.free(joined);
         const key = std.fmt.allocPrint(a, "cluster/{s}", .{id}) catch return Error.OutOfMemory;
         defer a.free(key);
-        try self.commitDirWrite(key, joined);
-
-        return self.applyClusterLocal(id, nodes);
+        return self.applyDirWrite(key, joined);
     }
 
     /// Upsert a cluster into the in-memory projection (no replication). The
@@ -388,11 +441,12 @@ pub const Directory = struct {
     /// placement). Idempotent. `cluster_id` must already be `addCluster`'d.
     /// Replicates before it takes effect.
     pub fn assign(self: *Directory, tenant_id: []const u8, cluster_id: []const u8) Error!void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const idx = self.cluster_idx.get(cluster_id) orelse return Error.UnknownCluster;
-        try self.commitPlacement(tenant_id, cluster_id, .active);
-        return self.applyPlacementLocal(tenant_id, idx, .active);
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.cluster_idx.get(cluster_id) == null) return Error.UnknownCluster;
+        }
+        return self.writePlacement(tenant_id, cluster_id, .active);
     }
 
     /// Re-place an already-placed tenant onto `dest_cluster_id`. The
@@ -401,22 +455,26 @@ pub const Directory = struct {
     /// only in that it rejects an unknown tenant — a move presupposes an
     /// existing placement, so a missing one is a caller bug worth surfacing.
     pub fn move(self: *Directory, tenant_id: []const u8, dest_cluster_id: []const u8) Error!void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const idx = self.cluster_idx.get(dest_cluster_id) orelse return Error.UnknownCluster;
-        if (self.placements.getPtr(tenant_id) == null) return Error.UnknownTenant;
-        try self.commitPlacement(tenant_id, dest_cluster_id, .active);
-        return self.applyPlacementLocal(tenant_id, idx, .active);
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.cluster_idx.get(dest_cluster_id) == null) return Error.UnknownCluster;
+            if (self.placements.getPtr(tenant_id) == null) return Error.UnknownTenant;
+        }
+        return self.writePlacement(tenant_id, dest_cluster_id, .active);
     }
 
-    /// Replicate a `placement/{tenant}` = `{state}:{cluster}` write.
-    fn commitPlacement(self: *Directory, tenant: []const u8, cluster_id: []const u8, state: Placement.State) Error!void {
+    /// Build + apply a `placement/{tenant}` = `{state}:{cluster}` write
+    /// (replicated → apply observer materializes it; inline ephemerally).
+    /// The caller has already validated under a brief lock; this holds no
+    /// lock across the replicate/await (see `applyDirWrite`).
+    fn writePlacement(self: *Directory, tenant: []const u8, cluster_id: []const u8, state: Placement.State) Error!void {
         const a = self.allocator;
         const key = std.fmt.allocPrint(a, "placement/{s}", .{tenant}) catch return Error.OutOfMemory;
         defer a.free(key);
         const value = std.fmt.allocPrint(a, "{s}:{s}", .{ @tagName(state), cluster_id }) catch return Error.OutOfMemory;
         defer a.free(value);
-        try self.commitDirWrite(key, value);
+        return self.applyDirWrite(key, value);
     }
 
     /// Upsert a placement into the in-memory projection (no replication).
@@ -482,14 +540,18 @@ pub const Directory = struct {
     }
 
     fn setMoveState(self: *Directory, tenant_id: []const u8, state: Placement.State) Error!void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const p = self.placements.getPtr(tenant_id) orelse return Error.UnknownTenant;
         // The placement keeps pointing at its current cluster across a
-        // begin/abort; only the state changes. Replicate the full value.
-        const cluster_id = self.clusters.items[p.cluster_idx].id;
-        try self.commitPlacement(tenant_id, cluster_id, state);
-        p.state = state;
+        // begin/abort; only the state changes. Capture the current cluster id
+        // under a brief lock (its slice is pointer-stable, so it stays valid
+        // after release), then replicate the full `{state}:{cluster}` value
+        // without holding the lock (see `applyDirWrite`).
+        const cluster_id = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const p = self.placements.getPtr(tenant_id) orelse return Error.UnknownTenant;
+            break :blk self.clusters.items[p.cluster_idx].id;
+        };
+        return self.writePlacement(tenant_id, cluster_id, state);
     }
 
     // ── Static config seeding ────────────────────────────────────────
@@ -702,9 +764,12 @@ test "directory: replicated placement survives a CP restart (Slice 1 exit)" {
     // through the directory raft group.
     {
         const bridge = try Bridge.initSingleNode(a, dir_path);
+        const d = try Directory.initReplicated(a, bridge);
+        // Stop the pump (→ no more apply-observer fires) before freeing the
+        // directory the observer points at: declare `destroy` first so it
+        // runs LAST, `bridge.deinit` second so it runs first.
+        defer d.destroy();
         defer bridge.deinit();
-        var d = try Directory.initReplicated(a, bridge);
-        defer d.deinit();
         try bridge.startPump();
 
         try d.addCluster("c1", &.{"http://h:1"});
@@ -719,9 +784,12 @@ test "directory: replicated placement survives a CP restart (Slice 1 exit)" {
     // the move is still recorded — t is on c2, not its original c1.
     {
         const bridge = try Bridge.initSingleNode(a, dir_path);
+        const d = try Directory.initReplicated(a, bridge);
+        // Stop the pump (→ no more apply-observer fires) before freeing the
+        // directory the observer points at: declare `destroy` first so it
+        // runs LAST, `bridge.deinit` second so it runs first.
+        defer d.destroy();
         defer bridge.deinit();
-        var d = try Directory.initReplicated(a, bridge);
-        defer d.deinit();
 
         try testing.expect(!d.isEmpty());
         const r = d.clusterFor("t") orelse return error.TestUnexpectedResult;
@@ -741,9 +809,12 @@ test "directory: replicated move state (moving) survives a restart" {
 
     {
         const bridge = try Bridge.initSingleNode(a, dir_path);
+        const d = try Directory.initReplicated(a, bridge);
+        // Stop the pump (→ no more apply-observer fires) before freeing the
+        // directory the observer points at: declare `destroy` first so it
+        // runs LAST, `bridge.deinit` second so it runs first.
+        defer d.destroy();
         defer bridge.deinit();
-        var d = try Directory.initReplicated(a, bridge);
-        defer d.deinit();
         try bridge.startPump();
         try d.addCluster("c1", &.{"http://h:1"});
         try d.assign("t", "c1");
@@ -752,13 +823,136 @@ test "directory: replicated move state (moving) survives a restart" {
     }
     {
         const bridge = try Bridge.initSingleNode(a, dir_path);
+        const d = try Directory.initReplicated(a, bridge);
+        // Stop the pump (→ no more apply-observer fires) before freeing the
+        // directory the observer points at: declare `destroy` first so it
+        // runs LAST, `bridge.deinit` second so it runs first.
+        defer d.destroy();
         defer bridge.deinit();
-        var d = try Directory.initReplicated(a, bridge);
-        defer d.deinit();
         // The moving hold is durable — the recovered CP still holds traffic
         // until an operator completes or aborts the move.
         const r = d.resolve("t") orelse return error.TestUnexpectedResult;
         try testing.expectEqualStrings("c1", r.cluster.id);
         try testing.expect(r.moving);
+    }
+}
+
+// ── Multi-node CP — Slice 2: apply-driven projection / HA ───────────────
+
+test "directory: a leader's write replicates to FOLLOWER projections (Slice 2A)" {
+    // The heart of multi-node CP: a directory write on the leader replicates
+    // through the directory raft group, and each FOLLOWER's apply observer
+    // materializes it into that node's in-memory projection — so any CP node
+    // (not just the leader) resolves the placement. A follower has no local
+    // proposer, so this can ONLY come from the apply path.
+    //
+    // Manual-pump (the test thread is the sole Node toucher), so we drive
+    // election with an explicit campaign and write via `bridge.proposePut`
+    // directly rather than the blocking `Directory.move` (which would need a
+    // separate pump thread to make progress).
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(root);
+
+    const voters = [_]u64{ 1, 2, 3 };
+    const dirs = [_][]u8{
+        try std.fmt.allocPrint(a, "{s}/c1", .{root}),
+        try std.fmt.allocPrint(a, "{s}/c2", .{root}),
+        try std.fmt.allocPrint(a, "{s}/c3", .{root}),
+    };
+    defer for (dirs) |d| a.free(d);
+
+    // PID-strided, bind-retry port allocation (parallel test binaries).
+    var bridges: [3]*Bridge = undefined;
+    var alive = [_]bool{ false, false, false };
+    const pid: u32 = @intCast(std.os.linux.getpid());
+    var attempt: u32 = 0;
+    blk: while (attempt < 24) : (attempt += 1) {
+        const bp: u16 = @intCast(25000 + ((pid +% attempt *% 631) % 4000) * 8);
+        var ok = true;
+        for (0..3) |i| {
+            var peers: [3]bridge_mod.PeerAddr = undefined;
+            for (&peers, 0..) |*p, k| p.* = .{ .host = "127.0.0.1", .port = bp + @as(u16, @intCast(k)) };
+            const addr = std.net.Address.parseIp("127.0.0.1", bp + @as(u16, @intCast(i))) catch {
+                ok = false;
+                break;
+            };
+            bridges[i] = Bridge.initMultiNode(a, dirs[i], @intCast(i + 1), &voters, addr, &peers) catch {
+                ok = false;
+                break;
+            };
+            alive[i] = true;
+        }
+        if (ok) break :blk;
+        for (0..3) |i| if (alive[i]) {
+            bridges[i].deinit();
+            alive[i] = false;
+        };
+    }
+    if (!(alive[0] and alive[1] and alive[2])) return error.SkipZigTest;
+    defer for (bridges) |b| b.deinit();
+
+    // Each node stands up its directory (registers group + observer + scans
+    // the empty store). Multi-node `ensureGroup` does NOT campaign, so this
+    // is non-blocking.
+    var directories: [3]*Directory = undefined;
+    for (&directories, bridges) |*d, b| d.* = try Directory.initReplicated(a, b);
+    defer for (directories) |d| d.destroy();
+
+    const dir_gid = directories[0].dir_gid;
+    for (directories) |d| try testing.expectEqual(dir_gid, d.dir_gid);
+
+    // Warm the transport, elect node 1 leader of the directory group.
+    var warm: u32 = 0;
+    while (warm < 150) : (warm += 1) {
+        for (bridges) |b| _ = try b.pumpOnce();
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try bridges[0].node.campaign(dir_gid);
+    var leader: ?usize = null;
+    var spins: u32 = 0;
+    while (spins < 2000 and leader == null) : (spins += 1) {
+        for (bridges) |b| _ = try b.pumpOnce();
+        for (bridges, 0..) |b, i| if (b.node.isLeader(dir_gid)) {
+            leader = i;
+        };
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(leader != null);
+    const li = leader.?;
+
+    // Write cluster + placement THROUGH the leader bridge (proposePut), then
+    // pump until every node has committed seq 2 (the placement).
+    _ = try bridges[li].proposePut(dir_gid, "cluster/west", "http://w:1,http://w:2");
+    const pseq = try bridges[li].proposePut(dir_gid, "placement/acme", "active:west");
+    var done = false;
+    var s2: u32 = 0;
+    while (s2 < 3000 and !done) : (s2 += 1) {
+        for (bridges) |b| _ = try b.pumpOnce();
+        if (bridges[li].committedSeq(dir_gid) >= pseq) done = true;
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(done);
+
+    // Give followers a few cycles to apply the replicated entries (their
+    // observers run inside `pumpOnce`).
+    var settle: u32 = 0;
+    while (settle < 200) : (settle += 1) {
+        for (bridges) |b| _ = try b.pumpOnce();
+    }
+
+    // EVERY node — leader and both followers — resolves acme → west via its
+    // OWN projection, materialized from the replicated applies.
+    for (directories, 0..) |d, i| {
+        const r = d.resolve("acme") orelse {
+            std.debug.print("node {d} has no placement for acme\n", .{i});
+            return error.TestUnexpectedResult;
+        };
+        try testing.expectEqualStrings("west", r.cluster.id);
+        try testing.expectEqual(@as(usize, 2), r.cluster.nodes.len);
+        try testing.expectEqualStrings("http://w:2", r.cluster.nodes[1]);
+        try testing.expect(!r.moving);
     }
 }

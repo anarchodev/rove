@@ -100,6 +100,21 @@ pub const CommitHook = struct {
     func: *const fn (ctx: *anyopaque, group_id: u64, raft_index: u64) void,
 };
 
+/// Fired once per PUT in a committed writeset, AFTER it has applied to the
+/// store, on EVERY node (leader and follower). Unlike `CommitHook` (which
+/// binds commit order to a local proposer's seq, so it only advances on the
+/// leader), this fires wherever the entry applies — the seam a replicated
+/// in-memory projection updates from. The control-plane `Directory`
+/// (`cp/directory.zig`) uses it: a CP follower has no local proposer, so its
+/// placement projection materializes from these replicated applies, not from
+/// `propose`. `key`/`value` borrow the decoded writeset bytes (valid only
+/// for the call). `null` for every non-CP node (the bridge sets it only when
+/// fronting the directory group).
+pub const ApplyObserver = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, group_id: u64, key: []const u8, value: []const u8) void,
+};
+
 /// How committed entries apply to the tenant store (docs/v2-build-order.md
 /// §Phase 2 leader-skip + the speculative overlay).
 pub const ApplyMode = enum {
@@ -203,6 +218,13 @@ pub const Node = struct {
     /// Optional per-committed-entry notification (see `CommitHook`).
     /// Set by the bridge; left null by the Phase-1 inline tests.
     commit_hook: ?CommitHook = null,
+
+    /// Optional per-applied-put notification (see `ApplyObserver`). Set by
+    /// the bridge for the control-plane directory group so a CP node's
+    /// in-memory projection tracks replicated applies (leader + follower).
+    /// Null everywhere else — decoding the writeset twice is only worth it
+    /// for the tiny directory writes.
+    apply_observer: ?ApplyObserver = null,
 
     /// How committed entries apply (see `ApplyMode`): write the store
     /// (`apply_on_commit`, default) vs. role-aware skip-on-leader
@@ -703,6 +725,7 @@ pub const Node = struct {
                 const wp = try envelope.decodeWriteSetPayload(env.payload);
                 try writeset.applyEncoded(store, index, wp.ws_bytes);
                 slot.applied_idx = index;
+                self.notifyApply(group_id, wp.ws_bytes);
             },
             .multi => {
                 const inner = try envelope.decodeMultiInner(self.allocator, env.payload);
@@ -719,6 +742,7 @@ pub const Node = struct {
                             const wp = try envelope.decodeWriteSetPayload(ie.payload);
                             try writeset.applyEncoded(store, index, wp.ws_bytes);
                             slot.applied_idx = index;
+                            self.notifyApply(group_id, wp.ws_bytes);
                         },
                         .multi => return envelope.Error.NestedMulti,
                         // root_writeset inside a multi: Phase 2+ (control
@@ -748,6 +772,25 @@ pub const Node = struct {
             if (self.store_resolver) |r| return r.func(r.ctx, slot.tenant_id, slot.id_str);
         }
         return slot.store;
+    }
+
+    /// Fire the `apply_observer` (if set) once per PUT in a just-applied
+    /// writeset. Re-decodes the writeset bytes — cheap for the directory's
+    /// single-op writes, and only ever set on the CP. Best-effort: the bytes
+    /// already applied cleanly via `applyEncoded`, so a decode error here is
+    /// not propagated (it would only mean a stale projection, recovered on
+    /// the next apply / restart scan).
+    fn notifyApply(self: *Node, group_id: u64, ws_bytes: []const u8) void {
+        const obs = self.apply_observer orelse return;
+        var ops: std.ArrayListUnmanaged(writeset.Op) = .empty;
+        defer ops.deinit(self.allocator);
+        writeset.decodeOps(ws_bytes, self.allocator, &ops) catch return;
+        for (ops.items) |op| switch (op) {
+            .put => |p| obs.func(obs.ctx, group_id, p.key, p.value),
+            // The directory never deletes; ignore (a future deleting producer
+            // would extend the observer with a delete arm).
+            .delete => {},
+        };
     }
 
     /// Context for `sendMsgCb`: which group's outbox is being drained (so

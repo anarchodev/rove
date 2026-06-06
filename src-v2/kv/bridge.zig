@@ -69,6 +69,7 @@ pub const Node = node_mod.Node;
 pub const WriteSet = node_mod.WriteSet;
 pub const PeerAddr = node_mod.PeerAddr;
 pub const StoreResolver = node_mod.StoreResolver;
+pub const ApplyObserver = node_mod.ApplyObserver;
 
 pub const Error = error{
     /// `propose` / `committedSeq` named a gid with no registered tenant.
@@ -236,6 +237,17 @@ pub const Bridge = struct {
     /// default `apply_on_commit`.
     pub fn setWorkerOverlay(self: *Bridge) void {
         self.node.apply_mode = .worker_overlay;
+    }
+
+    /// Register a per-applied-put observer on the node (see
+    /// `node_mod.ApplyObserver`). The control-plane directory uses this so a
+    /// CP node's in-memory placement projection tracks replicated applies —
+    /// the leader's own writes AND a follower's replicated entries (a follower
+    /// has no local proposer, so the post-commit projection update can't fire
+    /// there). Call before serving. Safe to leave unset (every non-CP bridge
+    /// does).
+    pub fn setApplyObserver(self: *Bridge, observer: node_mod.ApplyObserver) void {
+        self.node.apply_observer = observer;
     }
 
     /// Point follower-apply at the worker's own per-tenant serving store
