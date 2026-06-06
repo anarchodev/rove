@@ -71,6 +71,14 @@ pub const RangeResult = kvstore.RangeResult;
 /// with a short value so the hibernate/wake transitions are observable fast.
 pub const DEFAULT_HIBERNATE_NS: i64 = 2 * std.time.ns_per_s;
 
+/// Default durabilize cadence (V2 port of V1's `Cluster.tickSnapshot`
+/// interval): how often the pump folds each dirty tenant store's in-memory
+/// overlay into LMDB + stamps its raft watermark + (single-node) compacts the
+/// WAL. A committed write is already durable in the fsync'd raft WAL the
+/// instant it commits; this checkpoint just bounds how much WAL a restart must
+/// replay and lets the WAL be truncated. Tests override with a short value.
+pub const DEFAULT_DURABILIZE_NS: i64 = 500 * std.time.ns_per_ms;
+
 /// Resolves the per-tenant store a FOLLOWER's replicated entries apply to
 /// in `worker_overlay` mode (Phase 5 "Full HA"). Without it, a follower
 /// writes the node's own `slot.store` — a file the worker never reads, so
@@ -179,6 +187,19 @@ pub const TenantSlot = struct {
     /// so a hibernated directory group would never wake to re-elect. One
     /// always-ticking group is O(1), unlike the K-tenant data groups.
     pinned: bool = false,
+    /// Highest raft index durabilized into the store's LMDB (folded out of the
+    /// in-memory overlay + stamped as `lastAppliedRaftIdx`) by `durabilizeTick`.
+    /// `applied_idx > durabilized_idx` ⇒ this group has committed-but-not-yet-
+    /// durable writes (it is "dirty"). Single-node compacts the WAL up to here.
+    durabilized_idx: u64 = 0,
+    /// Whether this slot is in `Node.dirty` (committed since last durabilize),
+    /// so `applyEntry` enqueues it at most once.
+    in_dirty: bool = false,
+    /// Borrowed `GroupedFileStorage` for this group — the Manager owns it (via
+    /// the storage vtable) and frees it on `destroyGroup`, but we keep the
+    /// pointer to drive WAL compaction (`gfs.compact`) without a Manager API.
+    /// Valid for the slot's lifetime (we control `destroyGroup`).
+    gfs: *raft.GroupedFileStorage,
 };
 
 /// One V2 node: a `Manager` of per-tenant raft groups over one shared
@@ -215,6 +236,33 @@ pub const Node = struct {
     active: std.ArrayListUnmanaged(u64) = .empty,
     /// `pollReady` scratch, grown to `groups.count()` as groups are added.
     ready_buf: []u64 = &.{},
+
+    /// Gids with committed-but-not-yet-durabilized writes (`applied_idx >
+    /// durabilized_idx`). Enqueued by `applyEntry`, drained by
+    /// `durabilizeTick` — so durabilize cost is O(dirty), not O(all groups).
+    /// All dirty groups are durabilized together each tick so the shared WAL
+    /// can be compacted to a floor (their commits interleave in the one WAL).
+    dirty: std.ArrayListUnmanaged(u64) = .empty,
+    /// Wall-clock of the last `durabilizeTick`; the tick is interval-gated
+    /// (`durabilize_interval_ns`) like V1's `Cluster.tickSnapshot` — folding
+    /// the overlay into LMDB is an fsync, amortized over many commits.
+    last_durabilize_ns: i64 = 0,
+    durabilize_interval_ns: i64 = DEFAULT_DURABILIZE_NS,
+    /// Whether `durabilizeTick` also COMPACTS the WAL (single-node only) after
+    /// durabilizing. OFF by default: the compact→recover round-trip is buggy in
+    /// raft-rs-zig today (a compacted+recovered group loads a stale `commit=0`
+    /// hardstate → raft panics `hs.commit 0 out of range`; that library has no
+    /// compact+recover test). Durabilize alone still bounds the in-memory
+    /// overlay (folds it into LMDB). Flip to true once raft-rs-zig preserves
+    /// the hardstate across compaction+recovery — the call site is ready.
+    /// Multi-node compaction additionally needs a follower-match-index floor.
+    compact_wal: bool = false,
+    /// Set true while a group's recovery drain (`createGroupCore`) re-applies
+    /// the replayed WAL tail: forces the store WRITE even in `worker_overlay`
+    /// mode (where the leader normally skips it because the worker's txn wrote
+    /// it) — at restart there is no worker, so the pump must write the store
+    /// itself, exactly as a follower does.
+    recovering: bool = false,
 
     /// First error raised by the apply callback during the current
     /// `processReady` round (the C-ABI callback can't return one).
@@ -355,6 +403,7 @@ pub const Node = struct {
         }
         self.groups.deinit(a);
         self.active.deinit(a);
+        self.dirty.deinit(a);
         self.woke_scratch.deinit(a);
         a.free(self.ready_buf);
         a.free(self.voters);
@@ -413,12 +462,10 @@ pub const Node = struct {
 
         const store = try KvStore.open(self.allocator, path);
         errdefer store.close();
-
-        const slot = self.allocator.create(TenantSlot) catch return Error.OutOfMemory;
-        errdefer self.allocator.destroy(slot);
-        const id_dup = self.allocator.dupe(u8, id_str) catch return Error.OutOfMemory;
-        errdefer self.allocator.free(id_dup);
-        slot.* = .{ .tenant_id = tenant_id, .id_str = id_dup, .store = store };
+        // Whatever was already durabilized into LMDB (a prior incarnation's
+        // checkpoint) is the starting watermark — don't re-durabilize or
+        // re-compact below it.
+        const durable_idx = store.lastAppliedRaftIdx() catch 0;
 
         // GroupedFileStorage over the shared WAL. raft-rs takes ownership
         // via the vtable userdata slot and frees it when the group is
@@ -431,6 +478,19 @@ pub const Node = struct {
         else
             raft.GroupedFileStorage.init(self.allocator, self.voters, self.wal, tenant_id) catch return Error.Io;
         errdefer gfs.deinit();
+
+        const slot = self.allocator.create(TenantSlot) catch return Error.OutOfMemory;
+        errdefer self.allocator.destroy(slot);
+        const id_dup = self.allocator.dupe(u8, id_str) catch return Error.OutOfMemory;
+        errdefer self.allocator.free(id_dup);
+        slot.* = .{
+            .tenant_id = tenant_id,
+            .id_str = id_dup,
+            .store = store,
+            .gfs = gfs,
+            .applied_idx = durable_idx,
+            .durabilized_idx = durable_idx,
+        };
 
         try self.mgr.createGroupEpoch(
             tenant_id,
@@ -475,6 +535,11 @@ pub const Node = struct {
             // (Multi-node recovers via ticks + the apply path after the pump
             // thread starts, so no inline drain there.)
             if (recover) {
+                // Force the store write during replay (`worker_overlay` leaders
+                // normally skip it because the worker's txn wrote it — but at
+                // restart there is no worker, so the pump must write).
+                self.recovering = true;
+                defer self.recovering = false;
                 const slot_ptr = self.groups.get(tenant_id) orelse return Error.UnknownGroup;
                 var last_applied: u64 = slot_ptr.applied_idx;
                 var stable: u32 = 0;
@@ -699,11 +764,59 @@ pub const Node = struct {
         // Hibernate: stop ticking any group idle past its deadline.
         self.sweepHibernated(now);
 
+        // Checkpoint: fold each dirty store's overlay into LMDB + stamp its
+        // watermark + (single-node) compact the WAL. Interval-gated, O(dirty).
+        self.durabilizeTick(now);
+
         if (self.apply_err) |e| {
             self.apply_err = null;
             return e;
         }
         return ready.len > 0;
+    }
+
+    /// Checkpoint dirty stores (V2 port of V1's `Cluster.tickSnapshot`).
+    /// Interval-gated. For each group with committed-but-not-durable writes,
+    /// fold its overlay into LMDB + stamp `lastAppliedRaftIdx` (one atomic
+    /// durabilize), then — SINGLE-NODE ONLY — compact the shared WAL up to the
+    /// durabilized index so the log is bounded. Multi-node compaction is unsafe
+    /// without a follower-match-index floor (a lagging follower would need a
+    /// data-carrying snapshot, which is not wired), so a multi-node node
+    /// durabilizes (bounding replay) but does not yet truncate. Pump-thread
+    /// only. All dirty groups are flushed in one tick so the shared WAL's
+    /// interleaved commits clear together.
+    fn durabilizeTick(self: *Node, now: i64) void {
+        if (self.dirty.items.len == 0) return;
+        if (now - self.last_durabilize_ns < self.durabilize_interval_ns) return;
+        self.last_durabilize_ns = now;
+        const single = self.isSingleNode();
+        for (self.dirty.items) |gid| {
+            const slot = self.groups.get(gid) orelse continue;
+            slot.in_dirty = false;
+            if (slot.applied_idx <= slot.durabilized_idx) continue;
+            const store = self.writeStore(slot) orelse continue;
+            store.setLastAppliedRaftIdx(slot.applied_idx) catch |e| {
+                std.log.warn("v2 durabilize gid={d}: {s}", .{ gid, @errorName(e) });
+                continue;
+            };
+            if (single and self.compact_wal) {
+                slot.gfs.compact(slot.applied_idx) catch |e| {
+                    std.log.warn("v2 wal compact gid={d}: {s}", .{ gid, @errorName(e) });
+                };
+            }
+            slot.durabilized_idx = slot.applied_idx;
+        }
+        self.dirty.clearRetainingCapacity();
+    }
+
+    /// Enqueue `slot` for the next `durabilizeTick` if not already (its
+    /// `applied_idx` just advanced past `durabilized_idx`). Pump-thread only.
+    fn markDirty(self: *Node, slot: *TenantSlot) void {
+        if (slot.in_dirty) return;
+        slot.in_dirty = true;
+        self.dirty.append(self.allocator, slot.tenant_id) catch {
+            slot.in_dirty = false; // best-effort; recovery still covers it
+        };
     }
 
     /// Read a committed key from a tenant's store. Caller owns the
@@ -770,7 +883,11 @@ pub const Node = struct {
         // watermark (the worker's TrackedTxn.commit is the durable write).
         // `worker_overlay` makes that role-aware: skip on the leader (the
         // worker wrote it), write on a follower (no worker here).
-        const skip_store = switch (self.apply_mode) {
+        const skip_store = if (self.recovering)
+            // Replaying the WAL at restart: there is no worker to have written
+            // the store, so the pump MUST write it (and durabilize the tail).
+            false
+        else switch (self.apply_mode) {
             .apply_on_commit => false,
             .leader_skip => true,
             .worker_overlay => self.mgr.isLeader(group_id),
@@ -779,8 +896,13 @@ pub const Node = struct {
             // We still decode (above) so a stale/unknown envelope type
             // surfaces loudly, and bump applied_idx — but we do NOT touch
             // the store. Root writesets (no per-tenant group) are a no-op
-            // here too; their durable write also rode the worker's txn.
-            if (self.groups.get(group_id)) |slot| slot.applied_idx = index;
+            // here too; their durable write also rode the worker's txn. The
+            // worker DID write its own overlay (inst.kv), so the group is still
+            // dirty: `durabilizeTick` folds that overlay + stamps the watermark.
+            if (self.groups.get(group_id)) |slot| {
+                slot.applied_idx = index;
+                self.markDirty(slot);
+            }
             return;
         }
         switch (env.type) {
@@ -792,6 +914,7 @@ pub const Node = struct {
                 const wp = try envelope.decodeWriteSetPayload(env.payload);
                 try writeset.applyEncoded(store, index, wp.ws_bytes);
                 slot.applied_idx = index;
+                self.markDirty(slot);
                 self.notifyApply(group_id, wp.ws_bytes);
             },
             .multi => {
@@ -809,6 +932,7 @@ pub const Node = struct {
                             const wp = try envelope.decodeWriteSetPayload(ie.payload);
                             try writeset.applyEncoded(store, index, wp.ws_bytes);
                             slot.applied_idx = index;
+                            self.markDirty(slot);
                             self.notifyApply(group_id, wp.ws_bytes);
                         },
                         .multi => return envelope.Error.NestedMulti,
@@ -929,6 +1053,41 @@ test "Phase 1 exit: propose a writeset, it commits + applies, a read sees it" {
     const got2 = try node.get(tenant, "count");
     defer a.free(got2);
     try testing.expectEqualStrings("1", got2);
+}
+
+test "durabilize: the pump checkpoints the store + stamps the raft watermark" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const node = try Node.initSingleNode(a, dir);
+    defer node.deinit();
+    node.durabilize_interval_ns = 0; // durabilize on every cycle (no gating)
+
+    const tenant: u64 = 7;
+    var ws = WriteSet.init(a);
+    defer ws.deinit();
+    try ws.addPut("k", "v");
+    const applied = try node.proposeWriteSet(tenant, "t7", &ws);
+    try testing.expect(applied > 0);
+
+    // A few cycles so the durabilize tick definitely ran post-apply.
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) _ = try node.pump();
+
+    const slot = node.groups.get(tenant).?;
+    // The overlay was folded into LMDB and the durable raft watermark was
+    // stamped up to the applied index (so a restart replays only past here).
+    try testing.expectEqual(applied, try slot.store.lastAppliedRaftIdx());
+    try testing.expectEqual(applied, slot.durabilized_idx);
+    try testing.expect(slot.in_dirty == false); // drained from the dirty set
+
+    // Data is still readable after durabilize.
+    const got = try node.get(tenant, "k");
+    defer a.free(got);
+    try testing.expectEqualStrings("v", got);
 }
 
 test "a delete in a later writeset removes the key" {
