@@ -147,6 +147,31 @@ The directory group spans 3 CP nodes (`bridge.initMultiNode`, like `rewind`'s
   kill (a survivor is promoted, still reads, a fresh move commits on quorum).
   `scripts/cp_ha_smoke.py`.
 
+### Post-Slice-2 hardening ✅ DONE (2026-06-05)
+
+Two finishers that make the HA real end-to-end:
+- **Multi-node DP→CP client.** Each DP worker's serve-or-forward queried one
+  `REWIND_CP_URL`; now it accepts a LIST and tries each CP node until one
+  answers (reads work on any node), so a down CP node never breaks routing.
+- **Move-crash recovery.** A CP-leader crash between `beginMove` and the
+  flip/abort strands a tenant `moving` (durable + replicated). The directory
+  leader runs `reconcileStuckMoves` from the serve loop (`REWIND_CP_RECONCILE_SECS`,
+  default 5): abort the stuck move → revert to active on the source + resume.
+  Forced two sub-fixes: the leader-gated seed retries transient post-election
+  faults, and the directory group is **pinned always-active** (`Node.pinActive`)
+  so a hibernated follower still runs its election timer and re-elects on
+  leader death (a directory read never proposes to wake it).
+  `scripts/cp_move_recovery_smoke.py`.
+
+> **Known gap (separate, pre-existing):** a single-node CP HARD crash (kill -9)
+> loses uncommitted-to-disk directory writes — only a graceful SIGTERM persists
+> the kvexp store today, so a hard crash + restart re-seeds from static config
+> (reverting committed moves). This is a kvexp / raft-WAL crash-durability
+> property of the V2 data plane generally, not CP-specific. Multi-node failover
+> does NOT depend on it (state survives via replication). Needs its own pass:
+> fsync the SharedWal per commit + replay it into the store on restart, rather
+> than relying on the LMDB store's graceful close.
+
 ### Slice 3 — DP-side owner cache + invalidation (optimization)
 
 serve-or-forward queries the CP per *miss* today (no hot-path cost). Optionally
