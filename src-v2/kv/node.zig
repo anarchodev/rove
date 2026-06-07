@@ -249,14 +249,32 @@ pub const Node = struct {
     last_durabilize_ns: i64 = 0,
     durabilize_interval_ns: i64 = DEFAULT_DURABILIZE_NS,
     /// Whether `durabilizeTick` also COMPACTS the WAL (single-node only) after
-    /// durabilizing. OFF by default: the compact→recover round-trip is buggy in
-    /// raft-rs-zig today (a compacted+recovered group loads a stale `commit=0`
-    /// hardstate → raft panics `hs.commit 0 out of range`; that library has no
-    /// compact+recover test). Durabilize alone still bounds the in-memory
-    /// overlay (folds it into LMDB). Flip to true once raft-rs-zig preserves
-    /// the hardstate across compaction+recovery — the call site is ready.
-    /// Multi-node compaction additionally needs a follower-match-index floor.
-    compact_wal: bool = false,
+    /// durabilizing — truncating the log up to the durabilized index so it stays
+    /// bounded. ON. Safe because durabilize folds the overlay into LMDB (and
+    /// stamps `lastAppliedRaftIdx`) BEFORE truncating, so data up to the
+    /// compaction point is durable independent of the WAL; recovery reloads it
+    /// from LMDB and replays only the post-compaction tail.
+    ///
+    /// Prereqs that are now met: the raft-rs-zig compact→recover hardstate bug
+    /// (a recovered group loaded a stale `commit=0` → `hs.commit out of range`)
+    /// is fixed upstream by persisting the `LightReady` commit index (pinned at
+    /// raft-rs-zig 5092bc6).
+    ///
+    /// A prior note here claimed enabling this "crashes the real THREADED
+    /// binaries" — that was a red herring. The crash was a rustc -O0
+    /// `movaps`/`.rodata.cst16` alignment GPF triggered by the dependency bump
+    /// (it reproduced with `compact_wal = false` too), fixed by building
+    /// raft-sys at `opt-level = 1` (raft-rs-zig 5092bc6). With that fixed,
+    /// compaction is verified: single-node compaction runs and survives
+    /// compact→recover across restart (no `hs.commit` panic, no cross-thread
+    /// abort), and the full V2 smoke suite (rewind / tenant_move / three_node /
+    /// cp_move_recovery / zero_downtime_move) passes.
+    ///
+    /// Still single-node-only by design (the `single and …` guard below):
+    /// multi-node compaction needs a follower-match-index floor — a lagging
+    /// follower would need a data-carrying snapshot, which is not wired — so a
+    /// multi-node node durabilizes (bounding replay) but does not truncate.
+    compact_wal: bool = true,
     /// Set true while a group's recovery drain (`createGroupCore`) re-applies
     /// the replayed WAL tail: forces the store WRITE even in `worker_overlay`
     /// mode (where the leader normally skips it because the worker's txn wrote
