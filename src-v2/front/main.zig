@@ -252,8 +252,13 @@ const Router = struct {
             .not_found => return .not_found,
             .moving => return .moving,
             .placed => |owned| {
+                // `putOwned` stores (and now owns) `owned`; return it directly
+                // rather than re-`get`-ting — a re-get with a 0ms TTL
+                // (always-fresh mode) would miss and panic the `.?`. The slice
+                // stays valid for this loop iteration (no eviction until a
+                // later put/invalidate).
                 try self.cache.putOwned(host, owned, now_ns);
-                return .{ .nodes = self.cache.get(host, now_ns).? };
+                return .{ .nodes = owned };
             },
         }
     }

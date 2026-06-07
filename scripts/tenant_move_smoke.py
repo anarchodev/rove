@@ -5,7 +5,8 @@ docs/v2-phase4-tenant-move.md).
 Moves a live tenant from one single-node cluster to another with a brief
 pause and proves the data survives + the new cluster serves it:
 
-    front door :18090   (move orchestrator + routing directory)
+    rewind-cp :18093    (move orchestrator + routing directory)
+    front door :18090   (stateless proxy; resolves placement from the CP)
       ├─ cluster-1 → rewind :18091   (movetenant starts here)
       └─ cluster-2 → rewind :18092   (movetenant ends here)
 
@@ -14,7 +15,7 @@ pause and proves the data survives + the new cluster serves it:
 The tenant store is seeded + read through the cluster-internal move
 surface (`/_system/v2-kv`, gated by REWIND_MOVE_SECRET): a PUT writes
 through the real propose→commit path; a GET reads the kvexp store. The
-move itself is one call to the front door's `POST /_control/move`, which
+move itself is one call to the CP's `POST /_control/move`, which
 quiesces + dumps the source, ships the bundle to the destination, attaches
 its raft group at the migration epoch, flips the routing directory (the
 commit point), and evicts the source.
@@ -41,11 +42,14 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from v2_topology import spawn_cp, spawn_front, await_line, CP_BIN, FRONT_BIN
+
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin")
 REWIND = os.path.join(BINDIR, "rewind")
-FRONT = os.path.join(BINDIR, "rewind-front")
 
 PF = int(os.environ.get("FRONT_PORT", "18090"))
+PCP = int(os.environ.get("CP_PORT", "18093"))
 P1 = int(os.environ.get("C1_PORT", "18091"))
 P2 = int(os.environ.get("C2_PORT", "18092"))
 
@@ -67,38 +71,8 @@ def spawn_rewind(name, port, data_dir):
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
     )
     procs.append(p)
-    _await_line(p, name, "listening on")
+    await_line(p, name, "listening on")
     return p
-
-
-def spawn_front(name, port):
-    env = dict(os.environ)
-    env["REWIND_CLUSTERS"] = f"cluster-1=http://127.0.0.1:{P1};cluster-2=http://127.0.0.1:{P2}"
-    env["REWIND_HOSTS"] = f"{HOST}={TENANT}"
-    env["REWIND_PLACEMENT"] = f"{TENANT}=cluster-1"
-    env["REWIND_MOVE_SECRET"] = MOVE_SECRET
-    env["REWIND_CP_DATA_DIR"] = f"/tmp/tenant-move-cp-{os.getpid()}"
-    p = subprocess.Popen(
-        [FRONT, str(port)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
-    )
-    procs.append(p)
-    _await_line(p, name, "listening on")
-    return p
-
-
-def _await_line(p, name, needle):
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        line = p.stdout.readline()
-        if not line:
-            if p.poll() is not None:
-                raise SystemExit(f"{name} exited early: rc={p.returncode}")
-            continue
-        sys.stdout.write(f"  [{name}] " + line)
-        if needle in line:
-            return
-    raise SystemExit(f"{name} did not reach '{needle}' within 15s")
 
 
 def _curl(args):
@@ -140,9 +114,9 @@ def kv_get(port, tenant, key, host=None):
     return _curl(args)
 
 
-def move(front_port, tenant, dest):
+def move(cp_port, tenant, dest):
     args = [
-        "-X", "POST", f"http://127.0.0.1:{front_port}/_control/move",
+        "-X", "POST", f"http://127.0.0.1:{cp_port}/_control/move",
         "-H", f"X-Rewind-Move-Secret: {MOVE_SECRET}",
         "-H", "Content-Type: application/json",
         "--data", f'{{"tenant":"{tenant}","dest":"{dest}"}}',
@@ -163,9 +137,9 @@ def stop_all():
 
 
 def main():
-    for b in (REWIND, FRONT):
+    for b in (REWIND, CP_BIN, FRONT_BIN):
         if not os.path.exists(b):
-            raise SystemExit(f"{b} not found — run `zig build rewind && zig build rewind-front`")
+            raise SystemExit(f"{b} not found — run `zig build rewind && zig build rewind-cp && zig build rewind-front`")
     if not os.environ.get("S3_ENDPOINT"):
         raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
 
@@ -185,10 +159,24 @@ def main():
             failures.append(f"{label}: got {got!r}")
 
     try:
-        print("boot: two rewind clusters + front door (move control enabled)")
+        print("boot: two rewind clusters + CP (move control) + front door")
         spawn_rewind("c1", P1, d1)
         spawn_rewind("c2", P2, d2)
-        spawn_front("front", PF)
+        spawn_cp(
+            procs, PCP,
+            clusters=f"cluster-1=http://127.0.0.1:{P1};cluster-2=http://127.0.0.1:{P2}",
+            hosts=f"{HOST}={TENANT}",
+            placement=f"{TENANT}=cluster-1",
+            cp_data_dir=dcp,
+            move_secret=MOVE_SECRET,
+        )
+        # route_cache_ms=0 → the front re-resolves placement every request, so
+        # the post-move read (leg E) sees the directory flip immediately. The
+        # move-surface `/_system/v2-kv` probe is not a serve-or-forward path, so
+        # a stale cached route would hit the evicted source; always-fresh avoids
+        # that. (Customer traffic tolerates a stale hop via serve-or-forward —
+        # see serve_or_forward_smoke.)
+        spawn_front(procs, PF, f"http://127.0.0.1:{PCP}", route_cache_ms=0)
 
         # ── A. seed on c1, read it back two ways ──────────────────────
         print("leg A: seed movetenant on cluster-1")
@@ -204,7 +192,7 @@ def main():
 
         # ── B. the move ──────────────────────────────────────────────
         print("leg B: move movetenant cluster-1 → cluster-2 (brief pause)")
-        st, body = move(PF, TENANT, "cluster-2")
+        st, body = move(PCP, TENANT, "cluster-2")
         check("POST /_control/move status", st, 200)
         print(f"       move says: {body.strip()!r}")
 
