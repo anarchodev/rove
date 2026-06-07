@@ -75,6 +75,13 @@ pub const Request = struct {
     timeout_ms: u32 = 15_000,
     connect_timeout_ms: u32 = 5_000,
     verify_tls: bool = true,
+    /// Force cleartext HTTP/2 (`CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE`) —
+    /// needed when the peer is an h2-only plaintext server (rove's own
+    /// nghttp2 nodes), which won't answer an HTTP/1.1 request. Default
+    /// false leaves libcurl's negotiation alone (the `http.fetch` path
+    /// talks to arbitrary upstreams). Mirrors `curl.zig`'s
+    /// `HttpVersion.h2c_prior_knowledge`.
+    http2_prior_knowledge: bool = false,
 };
 
 /// Result handed to the `on_done` callback when a transfer completes.
@@ -206,6 +213,9 @@ pub const Transfer = struct {
         const verify_long: c_long = if (req.verify_tls) 1 else 0;
         _ = c.curl_easy_setopt(handle, c.CURLOPT_SSL_VERIFYPEER, verify_long);
         _ = c.curl_easy_setopt(handle, c.CURLOPT_SSL_VERIFYHOST, @as(c_long, if (req.verify_tls) 2 else 0));
+        if (req.http2_prior_knowledge) {
+            _ = c.curl_easy_setopt(handle, c.CURLOPT_HTTP_VERSION, @as(c_long, c.CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE));
+        }
 
         switch (req.method) {
             .GET => _ = c.curl_easy_setopt(handle, c.CURLOPT_HTTPGET, @as(c_long, 1)),

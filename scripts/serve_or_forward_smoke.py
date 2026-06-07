@@ -25,6 +25,12 @@ Legs:
   C.  request to cluster-A (the OWNER) with Host=cust → A answers locally
       (it is the owner per the CP, so it does NOT re-forward — no loop) →
       404 body mentions A's domain.
+  D.  (the async-forwarding win) a forward to a BLACK-HOLE owner (a TCP
+      socket that accepts but never replies) parks off the worker loop;
+      cluster-B's single worker still serves a concurrent local request in
+      milliseconds. The prior BLOCKING forwarder would wedge that worker in
+      libcurl for the whole stage timeout (~5-15s) — so this leg fails
+      against the blocking implementation and passes against the async one.
 
 Requires S3 env — `set -a; . ./.env; set +a` first.
 Build:  `zig build rewind && zig build rewind-front`
@@ -32,8 +38,10 @@ Build:  `zig build rewind && zig build rewind-front`
 
 import os
 import signal
+import socket
 import subprocess
 import sys
+import threading
 import time
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin")
@@ -43,10 +51,36 @@ FRONT = os.path.join(BINDIR, "rewind-front")
 PCP = 19010
 PA = 19011
 PB = 19012
+PBH = 19013  # black-hole owner: accepts the TCP connection, never replies
 HOST = "cust.localhost"
 TENANT = "custtenant"
+SLOW_HOST = "slow.localhost"
+SLOW_TENANT = "slowtenant"
 
 procs = []
+
+
+def start_blackhole():
+    """A TCP server that accepts connections and holds them open without ever
+    sending a byte — a forward to it parks until the engine's stage timeout.
+    The blocking forwarder would wedge cluster-B's single worker here; the
+    async one parks it off the loop. Daemon thread; dies with the process."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", PBH))
+    srv.listen(16)
+    held = []
+
+    def loop():
+        while True:
+            try:
+                conn, _ = srv.accept()
+                held.append(conn)  # keep the fd open; never read/write
+            except OSError:
+                return
+
+    threading.Thread(target=loop, daemon=True).start()
+    return srv
 
 
 def spawn_rewind(name, port, data_dir, cluster_id, admin_domain):
@@ -69,9 +103,12 @@ def spawn_rewind(name, port, data_dir, cluster_id, admin_domain):
 
 def spawn_front():
     env = dict(os.environ)
-    env["REWIND_CLUSTERS"] = f"cluster-A=http://127.0.0.1:{PA};cluster-B=http://127.0.0.1:{PB}"
-    env["REWIND_HOSTS"] = f"{HOST}={TENANT}"
-    env["REWIND_PLACEMENT"] = f"{TENANT}=cluster-A"
+    env["REWIND_CLUSTERS"] = (
+        f"cluster-A=http://127.0.0.1:{PA};cluster-B=http://127.0.0.1:{PB}"
+        f";cluster-BH=http://127.0.0.1:{PBH}"
+    )
+    env["REWIND_HOSTS"] = f"{HOST}={TENANT};{SLOW_HOST}={SLOW_TENANT}"
+    env["REWIND_PLACEMENT"] = f"{TENANT}=cluster-A;{SLOW_TENANT}=cluster-BH"
     env["REWIND_CP_DATA_DIR"] = f"/tmp/sof-cp-{os.getpid()}"
     p = subprocess.Popen(
         [FRONT, str(PCP)],
@@ -140,8 +177,10 @@ def main():
         if not cond:
             failures.append(label)
 
+    bh = None
     try:
-        print("boot: CP + cluster-A (owner) + cluster-B (non-owner)")
+        print("boot: black-hole owner + CP + cluster-A (owner) + cluster-B (non-owner)")
+        bh = start_blackhole()
         spawn_front()
         spawn_rewind("A", PA, da, "cluster-A", "a.localhost")
         spawn_rewind("B", PB, db, "cluster-B", "b.localhost")
@@ -166,8 +205,26 @@ def main():
         check("A answered locally (404 body names a.localhost)",
               "a.localhost" in body,
               f"status={code}")
+
+        # ── D. the async win: a parked forward doesn't wedge the worker ─
+        print("leg D: forward to a black-hole owner parks; B still serves "
+              "a concurrent local request (async, not blocked)")
+        # Background: B forwards SLOW_HOST → cluster-BH (black hole) → the
+        # engine parks it until its stage timeout. The blocking forwarder
+        # would wedge B's single worker here for the whole timeout.
+        bg = threading.Thread(target=lambda: get(PB, SLOW_HOST), daemon=True)
+        bg.start()
+        time.sleep(0.5)  # let the forward submit + park
+        t0 = time.time()
+        code, body = get(PB, "nope2.localhost")  # local 404, no owner
+        elapsed = time.time() - t0
+        check("B served a local request while a forward was parked",
+              elapsed < 2.0 and "b.localhost" in body,
+              f"status={code} elapsed={elapsed:.2f}s")
     finally:
         stop_all()
+        if bh is not None:
+            bh.close()
         for d in (da, db, dcp):
             subprocess.run(["rm", "-rf", d])
 

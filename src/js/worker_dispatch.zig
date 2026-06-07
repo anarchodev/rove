@@ -82,6 +82,8 @@ fn checkProxyWarning(rh: h2.ReqHeaders) void {
 
 const Request = dispatcher_mod.Request;
 const RaftWait = worker_mod.RaftWait;
+const ForwardWait = worker_mod.ForwardWait;
+const proxy_engine_mod = @import("proxy_engine.zig");
 
 /// Per-handler record carried through the batch walk, from a
 /// successful `dispatcher.run` to the shared commit + propose at
@@ -2152,18 +2154,28 @@ const ResolveResult = union(enum) {
 ///     per-handler code for both shapes, branched on `is_admin` for
 ///     CORS + static-first decisions.
 ///
-/// Serve-or-forward (Phase 7 slice a): this cluster has no tenant for `host`.
-/// If `cluster_id` + `cp_url` are configured, ask the control plane who owns
-/// the host (`GET {cp_url}/_cp/route?host=`); if the owner is a DIFFERENT
-/// cluster, reverse-proxy the request to it (leader-aware — try its nodes,
-/// retry on 503) and relay the response, returning true. Returns false when
-/// forwarding is disabled, the CP doesn't know the host, or this cluster is
-/// the named owner (a genuine local miss → caller 404s). Blocking libcurl on
-/// the MISS path only (mis-routed traffic), never the serve path; async
-/// forwarding off the customer hot path is a production refinement. Headers
-/// are status+body passthrough (content-type dropped), matching the front
-/// door's Phase-3 proxy.
-fn tryForwardToOwner(
+/// Park deadline for an async serve-or-forward — a backstop only. The
+/// proxy engine's own per-stage curl timeouts drive the common case;
+/// this reaps a parked slot whose engine result was lost (e.g. an
+/// engine crash) to a 504 so the h2 stream never hangs forever.
+const FORWARD_PARK_DEADLINE_NS: i64 = 35 * std.time.ns_per_s;
+
+/// Async serve-or-forward (Phase 7 follow-up): this cluster has no tenant
+/// for `host`. If a control plane is configured, COPY the request,
+/// allocate a forward id, park the entity in `forward_pending`, and
+/// submit a `ProxyJobSpec` to the node's proxy engine — which runs the
+/// CP route-query + leader-aware forward OFF this worker loop.
+/// `drainForwardPending` builds the final response when the engine
+/// answers. Returns true when the entity was parked or responded (caller
+/// is done with it); false only when forwarding is unconfigured (caller
+/// falls through to the inline 404).
+///
+/// Replaces the prior blocking `tryForwardToOwner`, which ran two
+/// synchronous libcurl round-trips (CP query + forward) on the worker's
+/// poll loop — stalling every other request on the thread for the full
+/// cross-cluster latency on each mis-routed request (acute during a
+/// post-move routing burst).
+fn parkForward(
     server: anytype,
     allocator: std.mem.Allocator,
     worker: anytype,
@@ -2178,51 +2190,77 @@ fn tryForwardToOwner(
 ) !bool {
     const cluster_id = worker.cluster_id orelse return false;
     if (worker.cp_urls.len == 0) return false;
-    const curl = blob_mod.curl;
+    const engine = worker.node.proxy_engine orelse return false;
+    const cmethod = curlMultiMethod(method) orelse return false;
 
-    // 1. Ask the CP who owns this host. The CP is a 3-node cluster and routing
-    //    reads work on ANY node (apply-driven projection), so try each CP node
-    //    until one answers 200 — a single CP node being down never breaks
-    //    serve-or-forward. A reachable node that returns non-200 (e.g. 404 =
-    //    unknown host) is authoritative: stop, don't keep trying.
-    var route_owned: ?[]u8 = null;
-    defer if (route_owned) |b| allocator.free(b);
-    for (worker.cp_urls) |cp_url| {
-        const route_url = std.fmt.allocPrint(allocator, "{s}/_cp/route?host={s}", .{ cp_url, host }) catch return false;
-        defer allocator.free(route_url);
-        var cp_easy = curl.Easy.init(allocator) catch continue;
-        defer cp_easy.deinit();
-        var cp_resp = cp_easy.request(allocator, .{
-            .method = .GET,
-            .url = route_url,
-            .headers = &.{},
-            .body = "",
-            .http_version = .h2c_prior_knowledge,
-            .verify_tls = false,
-        }) catch continue; // CP node unreachable → try the next
-        defer cp_resp.deinit(allocator);
-        if (cp_resp.status != 200) return false; // reachable + authoritative non-owner answer
-        const route_body = cp_resp.body orelse return false;
-        route_owned = allocator.dupe(u8, route_body) catch return false;
-        break;
+    // Build the spec with allocator-owned copies of everything the engine
+    // needs (the request buffers are recycled after dispatch). On a build
+    // OOM the entity is still in `request_out`, untouched → respond 503.
+    var spec = buildForwardSpec(allocator, worker, cluster_id, cmethod, host, path, rh, body) catch {
+        try respb.setSimpleResponse(server, ent, sid, sess, 503, "forward unavailable\n", allocator);
+        return true;
+    };
+    const fid = spec.forward_id;
+
+    // Hand the job to the engine (it now owns `spec`), THEN park. A
+    // failed submit frees the spec and 503s without parking.
+    engine.submit(spec) catch {
+        spec.deinit(allocator);
+        try respb.setSimpleResponse(server, ent, sid, sess, 503, "forward unavailable\n", allocator);
+        return true;
+    };
+    const deadline_ns: i64 = @as(i64, @intCast(std.time.nanoTimestamp())) + FORWARD_PARK_DEADLINE_NS;
+    try server.reg.set(ent, &server.request_out, ForwardWait, .{ .forward_id = fid, .deadline_ns = deadline_ns });
+    try server.reg.move(ent, &server.request_out, &worker.forward_pending);
+    return true;
+}
+
+/// Assemble a `ProxyJobSpec` with allocator-owned copies of the request
+/// (cluster id, CP node list, host, path, filtered headers, body). Every
+/// intermediate allocation is `errdefer`-freed, so a failure leaks
+/// nothing and leaves the caller's request state untouched.
+fn buildForwardSpec(
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    cluster_id: []const u8,
+    cmethod: blob_mod.curl_multi.Method,
+    host: []const u8,
+    path: []const u8,
+    rh: h2.ReqHeaders,
+    body: []const u8,
+) !proxy_engine_mod.ProxyJobSpec {
+    const my_cluster_id = try allocator.dupe(u8, cluster_id);
+    errdefer allocator.free(my_cluster_id);
+
+    const cp_urls = try allocator.alloc([]u8, worker.cp_urls.len);
+    var cp_filled: usize = 0;
+    errdefer {
+        for (cp_urls[0..cp_filled]) |u| allocator.free(u);
+        allocator.free(cp_urls);
     }
-    const route_body = route_owned orelse return false; // every CP node unreachable
+    for (worker.cp_urls, 0..) |u, i| {
+        cp_urls[i] = try allocator.dupe(u8, u);
+        cp_filled += 1;
+    }
 
-    var parsed = std.json.parseFromSlice(struct {
-        cluster: []const u8,
-        nodes: [][]const u8,
-    }, allocator, route_body, .{ .ignore_unknown_fields = true }) catch return false;
-    defer parsed.deinit();
-    // This cluster IS the named owner but lacks the tenant → genuine miss.
-    if (std.mem.eql(u8, parsed.value.cluster, cluster_id)) return false;
-    if (parsed.value.nodes.len == 0) return false;
+    const host_c = try allocator.dupe(u8, host);
+    errdefer allocator.free(host_c);
+    const path_c = try allocator.dupe(u8, path);
+    errdefer allocator.free(path_c);
+    const body_c = try allocator.dupe(u8, body);
+    errdefer allocator.free(body_c);
 
-    // 2. Build the forward headers once (Host preserved; pseudo + hop-by-hop
-    //    stripped).
-    const cmethod = curlMethod(method) orelse return false;
-    var fwd_headers: std.ArrayListUnmanaged(curl.Header) = .empty;
-    defer fwd_headers.deinit(allocator);
-    try fwd_headers.append(allocator, .{ .name = "Host", .value = host });
+    // Forward headers: Host preserved; pseudo + hop-by-hop stripped. Each
+    // name/value is duped (the request fields point into recycled buffers).
+    var hdrs: std.ArrayListUnmanaged(blob_mod.curl_multi.Header) = .empty;
+    errdefer {
+        for (hdrs.items) |h| {
+            allocator.free(@constCast(h.name));
+            allocator.free(@constCast(h.value));
+        }
+        hdrs.deinit(allocator);
+    }
+    try appendOwnedHeader(allocator, &hdrs, "Host", host);
     if (rh.fields) |fields| {
         var i: u32 = 0;
         while (i < rh.count) : (i += 1) {
@@ -2231,41 +2269,39 @@ fn tryForwardToOwner(
             if (fname.len > 0 and fname[0] == ':') continue;
             if (std.ascii.eqlIgnoreCase(fname, "host")) continue;
             if (isHopByHopHdr(fname)) continue;
-            try fwd_headers.append(allocator, .{ .name = fname, .value = f.value[0..f.value_len] });
+            try appendOwnedHeader(allocator, &hdrs, fname, f.value[0..f.value_len]);
         }
     }
+    const headers = try hdrs.toOwnedSlice(allocator);
 
-    // 3. Forward leader-aware: try each node, retry on 503 (a follower).
-    for (parsed.value.nodes, 0..) |node_base, ni| {
-        const last = ni + 1 == parsed.value.nodes.len;
-        const url = try std.fmt.allocPrint(allocator, "{s}{s}", .{ node_base, path });
-        defer allocator.free(url);
-        var easy = curl.Easy.init(allocator) catch {
-            if (!last) continue;
-            return false;
-        };
-        defer easy.deinit();
-        var resp = easy.request(allocator, .{
-            .method = cmethod,
-            .url = url,
-            .headers = fwd_headers.items,
-            .body = body,
-            .http_version = .h2c_prior_knowledge,
-            .verify_tls = false,
-        }) catch {
-            if (!last) continue;
-            return false;
-        };
-        defer resp.deinit(allocator);
-        if (resp.status == 503 and !last) continue;
-        const rbody: []const u8 = if (resp.body) |b| b else "";
-        try respb.setSimpleResponse(server, ent, sid, sess, resp.status, rbody, allocator);
-        return true;
-    }
-    return false;
+    return .{
+        .forward_id = worker.node.next_forward_id.fetchAdd(1, .monotonic),
+        .worker_idx = worker.msg_inbox_idx,
+        .my_cluster_id = my_cluster_id,
+        .cp_urls = cp_urls,
+        .host = host_c,
+        .method = cmethod,
+        .path = path_c,
+        .headers = headers,
+        .headers_owned = true,
+        .body = body_c,
+    };
 }
 
-fn curlMethod(s: []const u8) ?blob_mod.curl.Method {
+fn appendOwnedHeader(
+    allocator: std.mem.Allocator,
+    hdrs: *std.ArrayListUnmanaged(blob_mod.curl_multi.Header),
+    name: []const u8,
+    value: []const u8,
+) !void {
+    const hn = try allocator.dupe(u8, name);
+    errdefer allocator.free(hn);
+    const hv = try allocator.dupe(u8, value);
+    errdefer allocator.free(hv);
+    try hdrs.append(allocator, .{ .name = hn, .value = hv });
+}
+
+fn curlMultiMethod(s: []const u8) ?blob_mod.curl_multi.Method {
     if (std.mem.eql(u8, s, "GET")) return .GET;
     if (std.mem.eql(u8, s, "PUT")) return .PUT;
     if (std.mem.eql(u8, s, "POST")) return .POST;
@@ -2310,7 +2346,7 @@ fn resolveRequest(
             // owns the host and forward there (a stale public route or a
             // post-move source lands here) — a hop, not a 404. Only a genuine
             // unknown / owned-here-but-missing tenant falls through to 404.
-            if (try tryForwardToOwner(server, allocator, worker, ent, sid, sess, method, path, host, rh, req_body))
+            if (try parkForward(server, allocator, worker, ent, sid, sess, method, path, host, rh, req_body))
                 return .handled;
 
             const ps = worker.node.tenant.publicSuffix() orelse "(none)";

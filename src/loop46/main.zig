@@ -481,6 +481,7 @@ fn workerMain(args: *WorkerCtx) !void {
             if (processed == 0) break;
         }
         try rjs.drainRaftPending(worker);
+        try rjs.drainForwardPending(worker);
         try reg.flush();
         // docs/chunk-spool-plan.md Phase 2: retry bound-fetch chunk
         // dispatch now that drainRaftPending has committed any prior
@@ -1528,6 +1529,9 @@ pub fn main() !void {
     // tolerates a cold-start window where no inboxes exist (warns
     // once + drops).
     try node_state.startFetchEngine();
+    // Async serve-or-forward engine + per-worker result inboxes (sized to
+    // the worker count, indexed by msg_inbox_idx). See proxy_engine.zig.
+    try node_state.startProxyEngine(num_workers);
 
     // docs/streaming-model.md §7 + Phase 5: process-global
     // write coordinator for readset blob PUTs. Spawned before workers
