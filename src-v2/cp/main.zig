@@ -312,6 +312,10 @@ const Router = struct {
             try replyStatus(server, ent, sid, sess, if (self.directory.isLeader()) 200 else 503);
             return;
         }
+        if (std.mem.startsWith(u8, path, "/_cp/plan")) {
+            try self.handleCpPlan(server, ent, sid, sess, path);
+            return;
+        }
         if (!std.mem.startsWith(u8, path, "/_cp/route")) {
             try replyStatus(server, ent, sid, sess, 404);
             return;
@@ -343,6 +347,28 @@ const Router = struct {
         try replyText(server, ent, sid, sess, 200, owned);
     }
 
+    /// `GET /_cp/plan?tenant=T` — the tenant's opaque plan/limits blob (200 +
+    /// the raw value), or 404 if unset (the DP treats absent as the free tier).
+    /// The DP reads this to resolve effective limits; placement-independent, so
+    /// it's keyed on the tenant, not the host. No auth (same trust as
+    /// `/_cp/route` — an internal CP read over the private network).
+    fn handleCpPlan(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, path: []const u8) !void {
+        const tenant = queryParam(path, "tenant") orelse {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        };
+        const a = self.allocator;
+        const plan = (self.directory.planForOwned(a, tenant) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        }) orelse {
+            try replyStatus(server, ent, sid, sess, 404); // unset → free tier
+            return;
+        };
+        // `plan` is owned; replyText hands it to the registry (RespBody.deinit).
+        try replyText(server, ent, sid, sess, 200, plan);
+    }
+
     // ── Control plane: tenant-move orchestration ─────────────────────
 
     /// Route + auth a `/_control/*` request. `POST /_control/move` (brief
@@ -361,7 +387,8 @@ const Router = struct {
         const method_s = headerValue(rh, ":method") orelse "GET";
         const is_move = std.mem.eql(u8, path, "/_control/move");
         const is_move_live = std.mem.eql(u8, path, "/_control/move-live");
-        if (!(is_move or is_move_live) or !std.mem.eql(u8, method_s, "POST")) {
+        const is_plan = std.mem.eql(u8, path, "/_control/plan");
+        if (!(is_move or is_move_live or is_plan) or !std.mem.eql(u8, method_s, "POST")) {
             try replyStatus(server, ent, sid, sess, 404);
             return;
         }
@@ -386,10 +413,43 @@ const Router = struct {
         }
 
         const body: []const u8 = if (rb.data) |d| d[0..rb.len] else &.{};
-        if (is_move_live)
+        if (is_plan)
+            try self.handlePlan(server, ent, sid, sess, body)
+        else if (is_move_live)
             try self.handleMoveLive(server, ent, sid, sess, body)
         else
             try self.handleMove(server, ent, sid, sess, body);
+    }
+
+    /// Set a tenant's plan/limits blob: `POST /_control/plan {tenant, plan}`.
+    /// `plan` is an opaque string the CP stores verbatim at `plan/{tenant}`
+    /// (the DP parses it into effective limits — `plan-tiers.md`). A directory
+    /// WRITE: leader-gated, so a follower has already forwarded to the leader
+    /// by the time we get here.
+    fn handlePlan(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
+        const a = self.allocator;
+        var parsed = std.json.parseFromSlice(struct {
+            tenant: []const u8,
+            plan: []const u8,
+        }, a, body, .{ .ignore_unknown_fields = true }) catch {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        };
+        defer parsed.deinit();
+        const tenant = parsed.value.tenant;
+        if (tenant.len == 0) {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        }
+        self.directory.setPlan(tenant, parsed.value.plan) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        const msg = std.fmt.allocPrint(a, "plan set for {s}\n", .{tenant}) catch {
+            try replyStatus(server, ent, sid, sess, 200);
+            return;
+        };
+        try replyText(server, ent, sid, sess, 200, msg);
     }
 
     /// Forward a `/_control/*` request to the CP node that currently leads the
