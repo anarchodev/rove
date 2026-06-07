@@ -62,8 +62,12 @@ const worker_mod = @import("worker.zig");
 const worker_streaming = @import("worker_streaming.zig");
 const durable_wake = @import("durable_wake.zig");
 const bodies_mod = @import("rove-bodies");
+const proxy_engine_mod = @import("proxy_engine.zig");
+const ProxyResult = proxy_engine_mod.ProxyResult;
+const ProxyOutcome = proxy_engine_mod.ProxyOutcome;
 const ParkedUnit = worker_mod.ParkedUnit;
 const RaftWait = worker_mod.RaftWait;
+const ForwardWait = worker_mod.ForwardWait;
 const BodyDurabilityWait = worker_mod.BodyDurabilityWait;
 const TenantFiles = worker_mod.TenantFiles;
 const captureLogWithId = worker_mod.captureLogWithId;
@@ -383,6 +387,125 @@ pub fn drainRaftPending(worker: anytype) !void {
     // tick's BATCH was already capped, so they process next tick
     // — no iterate-while-modify trap.
     worker_streaming.dispatchSubscriptionFires(worker);
+}
+
+// ── Async serve-or-forward drain ──────────────────────────────────────
+
+/// Drain this worker's proxy-result inbox and resolve parked
+/// serve-or-forward requests (`proxy_engine.zig`). For each entity in
+/// `forward_pending`: if its `ForwardWait.forward_id` has a matching
+/// `ProxyResult`, build the final response from the outcome and move it
+/// to `response_in`; if its deadline has passed with no result, 504.
+/// Otherwise the forward is still in flight — leave it parked.
+///
+/// Runs each worker tick next to `drainRaftPending`. The 1ms poll
+/// cadence bounds result latency without an explicit wake (same posture
+/// as the `MsgInbox` fetch-event path).
+pub fn drainForwardPending(worker: anytype) !void {
+    const allocator = worker.allocator;
+    const idx = worker.msg_inbox_idx;
+    const inboxes = worker.node.proxy_result_inboxes;
+    if (idx >= inboxes.len) return;
+
+    var results: std.ArrayListUnmanaged(ProxyResult) = .empty;
+    defer results.deinit(allocator);
+    try inboxes[idx].drainInto(allocator, &results);
+
+    const parked = worker.forward_pending.entitySlice();
+    if (results.items.len == 0 and parked.len == 0) return;
+
+    // Track which results we apply, to free the outcomes of any that
+    // find no parked entity (a reaped / raced slot).
+    var consumed = try allocator.alloc(bool, results.items.len);
+    defer allocator.free(consumed);
+    @memset(consumed, false);
+
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    // Snapshot before the loop: `reg.move` defers to flush, so the
+    // entity + wait slices stay valid for the whole pass.
+    const waits = worker.forward_pending.column(ForwardWait);
+
+    var i: usize = 0;
+    while (i < parked.len) : (i += 1) {
+        const ent = parked[i];
+        const fid = waits[i].forward_id;
+
+        var matched: ?usize = null;
+        for (results.items, 0..) |r, k| {
+            if (!consumed[k] and r.forward_id == fid) {
+                matched = k;
+                break;
+            }
+        }
+
+        if (matched) |k| {
+            consumed[k] = true;
+            try applyForwardOutcome(worker, ent, &results.items[k].outcome);
+        } else if (waits[i].deadline_ns != 0 and now_ns >= waits[i].deadline_ns) {
+            const body = try allocator.dupe(u8, "forward timeout\n");
+            try finalizeForward(worker, ent, 504, body);
+        }
+    }
+
+    // Outcomes whose forward_id had no parked entity: free their owned
+    // allocations so they don't leak (the parked stream was already
+    // reaped, or a duplicate result raced).
+    for (results.items, 0..) |*r, k| {
+        if (!consumed[k]) r.outcome.deinit(allocator);
+    }
+}
+
+/// Build the final response for a resolved forward from its outcome,
+/// then move the entity to `response_in`. The outcome's owned bytes are
+/// either transferred to the h2 response (`forwarded`) or freed here
+/// (`local_miss` host) — `consumed[]` in the caller prevents a second
+/// free.
+fn applyForwardOutcome(worker: anytype, ent: rove.Entity, outcome: *ProxyOutcome) !void {
+    const allocator = worker.allocator;
+    switch (outcome.*) {
+        .forwarded => |f| {
+            // `f.body` ownership transfers to the h2 response (no copy).
+            try finalizeForward(worker, ent, f.status, f.body);
+        },
+        .local_miss => |m| {
+            // Rebuild the diagnostic 404 the sync path produced
+            // (worker_dispatch resolveRequest miss branch).
+            const ad = worker.admin_api_domain orelse "(none)";
+            const ps = worker.node.tenant.publicSuffix() orelse "(none)";
+            const body = std.fmt.allocPrint(
+                allocator,
+                "no tenant for host '{s}'\n" ++
+                    "  admin_api_domain={s}\n" ++
+                    "  public_suffix={s}\n" ++
+                    "  no domain alias registered for this host\n",
+                .{ m.host, ad, ps },
+            ) catch try allocator.dupe(u8, "no tenant for host\n");
+            allocator.free(m.host);
+            try finalizeForward(worker, ent, 404, body);
+        },
+        .cp_unreachable => {
+            const body = try allocator.dupe(u8, "control plane unreachable\n");
+            try finalizeForward(worker, ent, 503, body);
+        },
+        .transport_error => {
+            const body = try allocator.dupe(u8, "forward failed\n");
+            try finalizeForward(worker, ent, 502, body);
+        },
+    }
+}
+
+/// Stamp a status + (allocator-owned) body onto the parked entity in
+/// `forward_pending` and move it to `response_in`. `body` ownership
+/// transfers to the h2 response (freed after the stream ships). The
+/// entity's h2 sid/session ride it from request ingress (preserved by
+/// `reg.move`), so only the response components are set here.
+fn finalizeForward(worker: anytype, ent: rove.Entity, status: u16, body: []u8) !void {
+    const server = worker.h2;
+    try server.reg.set(ent, &worker.forward_pending, h2.Status, .{ .code = status });
+    try server.reg.set(ent, &worker.forward_pending, h2.RespHeaders, .{ .fields = null, .count = 0 });
+    try server.reg.set(ent, &worker.forward_pending, h2.RespBody, .{ .data = body.ptr, .len = @intCast(body.len) });
+    try server.reg.set(ent, &worker.forward_pending, h2.H2IoResult, .{ .err = 0 });
+    try server.reg.move(ent, &worker.forward_pending, &server.response_in);
 }
 
 // ── Shared deployment-resolve ─────────────────────────────────────────

@@ -163,6 +163,7 @@ fn workerMain(args: *WorkerCtx) !void {
         try rjs.drainFetchPendingDurability(worker);
         _ = try rjs.dispatchOnce(worker, &blocked_tenants);
         try rjs.drainRaftPending(worker);
+        try rjs.drainForwardPending(worker);
         rjs.drainSpools(worker);
         try rjs.sweepParkedContinuations(worker);
         try rjs.serviceParkedStreams(worker);
@@ -384,6 +385,8 @@ pub fn main() !void {
     node_state.wireInternal();
     try node_state.deploy.startDeploymentLoader();
     try node_state.startFetchEngine();
+    // Async serve-or-forward engine. rewind runs a single worker (idx 0).
+    try node_state.startProxyEngine(1);
     try node_state.blob_coord.start(1);
 
     // One worker thread bound to the listen port (SO_REUSEPORT-ready).

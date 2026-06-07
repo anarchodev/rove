@@ -93,6 +93,8 @@ const limiter_mod = @import("limiter.zig");
 const router_mod = @import("router.zig");
 const reserved = @import("reserved.zig");
 const fetch_engine_mod = @import("fetch_engine.zig");
+const proxy_engine_mod = @import("proxy_engine.zig");
+pub const ProxyResultInbox = proxy_engine_mod.ProxyResultInbox;
 const builtin_modules_mod = @import("builtin_modules.zig");
 const msg_router_mod = @import("msg_router.zig");
 pub const MsgRouter = msg_router_mod.MsgRouter;
@@ -191,6 +193,20 @@ pub const RaftWait = struct {
     /// Per-tenant propose seq (the bridge assigns it; monotonic per
     /// tenant). Durable when `bridge.committedSeq(group_id) >= seq`.
     seq: u64 = 0,
+    deadline_ns: i64 = 0,
+};
+
+/// Per-entity park record for async serve-or-forward (`proxy_engine.zig`).
+/// When `resolveRequest` can't resolve a tenant locally and a control
+/// plane is configured, it stamps this component, submits a
+/// `ProxyJobSpec` to the node's proxy engine, and moves the entity from
+/// `request_out` to `forward_pending`. `drainForwardPending` matches the
+/// engine's `ProxyResult.forward_id` back to the parked entity and
+/// builds the final response (or reaps on `deadline_ns`).
+pub const ForwardWait = struct {
+    /// Matches `ProxyResult.forward_id` (node-monotonic; never 0).
+    forward_id: u64 = 0,
+    /// Hard deadline; on expiry the drain responds 504 and frees the slot.
     deadline_ns: i64 = 0,
 };
 
@@ -786,6 +802,23 @@ pub const NodeState = struct {
     /// the response + calls `enqueueFetchEventForTenant`.
     fetch_engine: ?*fetch_engine_mod.FetchEngine = null,
 
+    /// Async serve-or-forward engine (Phase 7 follow-up). One thread +
+    /// one `curl_multi` handle proxies mis-routed requests to the owning
+    /// cluster OFF the worker poll loop (the prior blocking
+    /// `tryForwardToOwner` stalled the loop for a full cross-cluster
+    /// round-trip). Lazy init via `startProxyEngine` after workers spawn.
+    /// See `proxy_engine.zig`.
+    proxy_engine: ?*proxy_engine_mod.ProxyEngine = null,
+    /// Per-worker result inboxes the proxy engine pushes into, indexed
+    /// by `worker.msg_inbox_idx`. Node-owned (allocated by
+    /// `startProxyEngine`, sized to the worker count, freed in `deinit`
+    /// AFTER the engine thread is joined) so a worker's own teardown can
+    /// never race a pending engine push.
+    proxy_result_inboxes: []ProxyResultInbox = &.{},
+    /// Monotonic id stamped on each parked forward so its async result
+    /// routes back to the right parked entity. Starts at 1 (0 = unset).
+    next_forward_id: std.atomic.Value(u64) = .init(1),
+
     /// Readset-blob write subsystem — the process-global
     /// `BlobCoordinator`, the shared `_pool/` S3 backend, the
     /// raft-backed reservation context, and the borrowed `kv.Cluster`
@@ -875,6 +908,19 @@ pub const NodeState = struct {
             fe.deinit();
             self.fetch_engine = null;
         }
+        // Proxy engine before its result inboxes: join the engine thread
+        // (no more pushes) THEN free the node-owned inboxes. Any results
+        // still queued at shutdown are freed via each inbox's deinit.
+        if (self.proxy_engine) |pe| {
+            pe.shutdown();
+            pe.deinit();
+            self.proxy_engine = null;
+        }
+        if (self.proxy_result_inboxes.len > 0) {
+            for (self.proxy_result_inboxes) |*ib| ib.deinit(self.allocator);
+            self.allocator.free(self.proxy_result_inboxes);
+            self.proxy_result_inboxes = &.{};
+        }
         // Tear down the blob-coord subsystem AFTER the fetch engine —
         // the engine's libcurl thread reaches `blob_coord.coordinator`,
         // so it must be joined first (above) before the coordinator +
@@ -911,6 +957,24 @@ pub const NodeState = struct {
         errdefer fe.deinit();
         try fe.start();
         self.fetch_engine = fe;
+    }
+
+    /// Spawn the async serve-or-forward engine (one thread + one
+    /// curl_multi handle) and allocate the per-worker result inboxes.
+    /// Idempotent. Call once from `main.zig` AFTER workers have spawned
+    /// + registered their msg inboxes — `num_workers` sizes the inbox
+    /// array, indexed by each worker's `msg_inbox_idx`.
+    pub fn startProxyEngine(self: *NodeState, num_workers: usize) !void {
+        if (self.proxy_engine != null) return;
+        const inboxes = try self.allocator.alloc(ProxyResultInbox, num_workers);
+        errdefer self.allocator.free(inboxes);
+        for (inboxes) |*ib| ib.* = .{};
+        self.proxy_result_inboxes = inboxes;
+
+        const pe = try proxy_engine_mod.ProxyEngine.init(self.allocator, self);
+        errdefer pe.deinit();
+        try pe.start();
+        self.proxy_engine = pe;
     }
 };
 
@@ -1054,6 +1118,7 @@ pub fn Worker(comptime opts: Options) type {
     // stores.
     const merged_request_row = rove.Row(&.{
         RaftWait,
+        ForwardWait,
         BodyDurabilityWait,
         components_mod.ChainContext,
         components_mod.ContDescriptor,
@@ -1151,6 +1216,15 @@ pub fn Worker(comptime opts: Options) type {
         /// request headers / body / sid / etc. ride the entity until
         /// the response is built).
         body_pending: StreamColl,
+        /// Async serve-or-forward park (`proxy_engine.zig`). A request
+        /// for a tenant this cluster doesn't own parks here with a
+        /// `ForwardWait` while the proxy engine runs the CP route-query
+        /// + forward off the worker loop; `drainForwardPending` walks
+        /// this collection each tick, matching the engine's result back
+        /// to the parked entity and moving it to `response_in`. Same
+        /// `StreamRow` as `raft_pending_*` so `reg.move` preserves the
+        /// h2 sid/session/headers the response needs.
+        forward_pending: StreamColl,
         /// Slice 4-fetch-park: parked outbound-fetch chunk events
         /// (large chunks waiting on durability). Plain
         /// `ArrayListUnmanaged` rather than a rove `Collection`
@@ -1591,6 +1665,7 @@ pub fn Worker(comptime opts: Options) type {
                 .raft_pending_cont = try StreamColl.init(allocator),
                 .raft_pending_stream = try StreamColl.init(allocator),
                 .body_pending = try StreamColl.init(allocator),
+                .forward_pending = try StreamColl.init(allocator),
                 .parked_continuations = try StreamColl.init(allocator),
                 .parked_units = try ParkedUnitColl.init(allocator),
                 .cron_state = try CronStateColl.init(allocator),
@@ -1642,6 +1717,7 @@ pub fn Worker(comptime opts: Options) type {
             errdefer self.raft_pending_cont.deinit();
             errdefer self.raft_pending_stream.deinit();
             errdefer self.body_pending.deinit();
+            errdefer self.forward_pending.deinit();
             errdefer self.parked_continuations.deinit();
             errdefer self.parked_units.deinit();
             errdefer self.cron_state.deinit();
@@ -1652,6 +1728,7 @@ pub fn Worker(comptime opts: Options) type {
             reg.registerCollection(&self.raft_pending_cont);
             reg.registerCollection(&self.raft_pending_stream);
             reg.registerCollection(&self.body_pending);
+            reg.registerCollection(&self.forward_pending);
             reg.registerCollection(&self.parked_continuations);
             reg.registerCollection(&self.parked_units);
             reg.registerCollection(&self.cron_state);
@@ -1867,6 +1944,7 @@ pub fn Worker(comptime opts: Options) type {
             self.raft_pending_cont.deinit();
             self.raft_pending_stream.deinit();
             self.body_pending.deinit();
+            self.forward_pending.deinit();
             // Slice 4-fetch-park: drop any still-parked fetch
             // chunks at shutdown (best-effort, same lossy posture
             // as the log flusher's final drain). Each entry owns
@@ -2425,6 +2503,7 @@ pub const flushLogs = worker_log.flushLogs;
 // narrating the side-table world — was rewritten in place during
 // the move. No behavior change.
 pub const drainRaftPending = worker_drain.drainRaftPending;
+pub const drainForwardPending = worker_drain.drainForwardPending;
 pub const drainBodyPending = worker_drain.drainBodyPending;
 pub const drainFetchPendingDurability = worker_drain.drainFetchPendingDurability;
 pub const resolveDeployment = worker_drain.resolveDeployment;
