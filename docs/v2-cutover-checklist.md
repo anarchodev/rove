@@ -80,17 +80,28 @@ No V2 brand-new-tenant create+place flow has been confirmed beyond the move path
 `v2-cp-operational-state.md` marks `instance/{id}` provisioning as "⚠️ maybe /
 needs thought." Confirm or build the create-a-new-tenant path end to end.
 
-## 🟢 Front-door tier split (architectural, blocks the edge gaps above)
+## ✅ Front-door tier split (architectural, was blocking the edge gaps) — SHIPPED
 
-Per [`v2-front-door-architecture.md`](v2-front-door-architecture.md): today
-`src-v2/front/main.zig` welds the CP raft directory to the request-path proxy, so
-every front-door replica is a CP voter (`REWIND_CP_NODE_ID/VOTERS/PEERS`) →
-front-door count == voter count (inverted scaling). Before/with the edge work:
-   - **Split the CP into its own binary + fixed raft cluster.**
-   - **Front door becomes a stateless CP read-replica**, not a voter; terminates
-     TLS; scales horizontally behind an L4 (TCP+ALPN passthrough) ingress.
-   - Reference deployment: OVH IP LB (TCP+ALPN) + transparent VAC DDoS; nothing
-     vendor-specific — the same contract runs on any host.
+Per [`v2-front-door-architecture.md`](v2-front-door-architecture.md), the
+prototype welded the CP raft directory to the request-path proxy, so every
+front-door replica was a CP voter (`REWIND_CP_NODE_ID/VOTERS/PEERS`) →
+front-door count == voter count (inverted scaling). **Done:**
+   - **CP is its own binary + raft cluster** — `src-v2/cp/main.zig` (`rewind-cp`):
+     directory raft + move orchestration (`/_control/move[-live]`) + `/_cp/route`
+     + `/_cp/leader` + reconciliation + CP-HA forwarding.
+   - **Front door is a stateless proxy** — `src-v2/front/main.zig`: resolves
+     placement via the CP's `/_cp/route` (short-TTL cache, `REWIND_CP_URL`),
+     leader-aware forward; no `bridge`/`cp-directory` (15M vs the CP's 113M). The
+     read-replica seam is cached-query (serve-or-forward is the staleness
+     backstop), not a raft learner at the edge.
+   - All nine v2 edge smokes run on the two-process topology via
+     `scripts/v2_topology.py` (`spawn_cp`/`spawn_front`) and pass (commits
+     `91ad279`→ the smoke-fan-out series).
+
+   **Still open on the edge** (the gaps above): TLS termination at the front door
+   (gap #3), the L4 (TCP+ALPN passthrough) reference deployment, and the cache's
+   `REWIND_ROUTE_CACHE_MS=0` (always-fresh) is what the move smokes use since
+   `/_system/v2-kv` is not a serve-or-forward path.
 
 ## 🟡 By-design / hardening — confirm, not hard blockers
 
@@ -105,8 +116,8 @@ front-door count == voter count (inverted scaling). Before/with the edge work:
 
 ## Suggested cutover order
 
-1. **Split the CP out** + front door becomes a stateless read-replica (the
-   🟢 item — unblocks the edge gaps).
+1. ~~**Split the CP out** + front door becomes a stateless read-replica.~~ ✅
+   **SHIPPED** — `rewind-cp` + slimmed `rewind-front`, all 9 edge smokes green.
 2. **Plan/limits in CP + DP enforcement** (gap #1) — `v2-cp-operational-state.md`
    steps 1–3.
 3. **Replicated domain index** (gap #2) — same directory group, sibling axis.
@@ -118,7 +129,7 @@ front-door count == voter count (inverted scaling). Before/with the edge work:
 7. Then the `src-v2 → src` code-move cutover; fix `zig build test`; run hardening
    benches.
 
-The headline: **the engine and the differentiator are done; the remaining work
-is operational-state (plan/domains/certs/provisioning) + the front-door/CP split
+The headline: **the engine, the differentiator, AND the front-door/CP split are
+done; the remaining work is operational-state (plan/domains/certs/provisioning)
 — and almost all of it lands in the CP directory whose replication machinery is
 already built.**
