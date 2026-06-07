@@ -446,6 +446,12 @@ pub const DispatchState = struct {
     /// Instance id for limiter lookup. Empty when the dispatcher
     /// runs without a worker (test paths).
     instance_id: []const u8 = "",
+    /// Plan-resolved rate caps + plan generation for `instance_id` (from its
+    /// `TenantSlot`). The `email.send` rate check sizes its bucket from these
+    /// (docs/plan-tiers.md Lever 1). Defaults = free/default caps on paths
+    /// with no resolved plan (tests, async activations).
+    plan_rate: limiter_mod.RateLimitCaps = .{},
+    plan_gen: u64 = 0,
     /// Gap 2.3 Phase E: correlation_id of the chain this handler
     /// run belongs to. `http.fetch({pipe_to})` stamps it onto the
     /// `PendingFetch` so the upstream bytes can later be routed to

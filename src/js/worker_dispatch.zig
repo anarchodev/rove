@@ -2648,7 +2648,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // size the bucket, not to bypass it. Runs BEFORE static
         // dispatch so static file requests count against the bucket
         // too. On exhaustion: 429 + Retry-After header.
-        const allowed = worker.limiter.check(scope_inst.id, .request, received_ns) catch |err| blk: {
+        // Per-tenant plan: rate caps + body cap + retention all resolve from
+        // the slot's cached plan (docs/plan-tiers.md). `plan_gen` lets the
+        // limiter re-snapshot caps when a tier change lands (Lever 1).
+        const plan = slot.effectivePlan();
+        const plan_gen = slot.plan_gen.load(.acquire);
+        const allowed = worker.limiter.check(scope_inst.id, .request, plan.rate, plan_gen, received_ns) catch |err| blk: {
             std.log.warn("rove-js: limiter.check({s}) failed: {s} — fail open", .{ scope_inst.id, @errorName(err) });
             break :blk true;
         };
@@ -3013,6 +3018,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // from acme's email bucket, not __admin__'s.
             .limiter = &worker.limiter,
             .instance_id = scope_inst.id,
+            // Same plan the request-rate check used — so `email.send`'s rate
+            // check sizes its bucket from this tenant's tier too (Lever 1's
+            // free second lever).
+            .plan_rate = plan.rate,
+            .plan_gen = plan_gen,
             // Admin-handler platform capabilities, all-or-nothing:
             // present iff this is an admin-handler request. Customer
             // requests get none, and the JS callables reject at the
