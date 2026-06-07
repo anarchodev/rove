@@ -15,11 +15,15 @@ const c = @cImport({
 
 /// One custom-domain cert: its own `SSL_CTX` (built by `buildSslCtx`,
 /// so it inherits the ALPN-h2 cb + TLS1.2-min like the default ctx)
-/// plus the on-disk mtimes that drive per-host reload.
+/// plus the on-disk mtimes that drive per-host reload (file path), or a
+/// content `version` token that drives the in-memory path
+/// (`putHostCertInMemory`, used by the V2 front door pulling certs from the
+/// CP). The two paths don't mix on a given host.
 const HostEntry = struct {
     ctx: *c.SSL_CTX,
-    cert_mtime: i128,
-    key_mtime: i128,
+    cert_mtime: i128 = 0,
+    key_mtime: i128 = 0,
+    version: u64 = 0,
 };
 
 pub const TlsConfig = struct {
@@ -254,6 +258,54 @@ pub const TlsConfig = struct {
         const dir = self.custom_cert_dir orelse return;
         self.reloadCustomCertsImpl(dir) catch |err|
             std.log.warn("tls: custom-cert rescan failed: {s}", .{@errorName(err)});
+    }
+
+    /// Install (or replace) a custom-host cert from IN-MEMORY PEM bytes — the
+    /// V2 front door's path, pulling certs from the CP cert-state axis instead
+    /// of a disk directory. `version` is a caller-supplied content token (e.g.
+    /// a hash of the packed cert): when it matches the stored entry's version
+    /// this is a no-op, so a periodic cert sync can call this every tick
+    /// cheaply and only rebuild the `SSL_CTX` on an actual renewal. Safe to
+    /// call from the main loop while worker threads run handshakes (the
+    /// servername cb takes `store_rw` shared; this takes it exclusive only for
+    /// the pointer swap — same discipline as `reloadCustomCertsImpl`).
+    pub fn putHostCertInMemory(self: *TlsConfig, host: []const u8, cert_pem: []const u8, key_pem: []const u8, version: u64) !void {
+        // Up-to-date already? (read lock — cheap, off the build path)
+        {
+            self.store_rw.lockShared();
+            const cur = self.host_store.get(host);
+            self.store_rw.unlockShared();
+            if (cur) |e| {
+                if (e.version == version and version != 0) return;
+            }
+        }
+
+        // Build the new ctx OUTSIDE the lock (slow: parse).
+        const new_ctx = try buildSslCtx(cert_pem, key_pem, self.client_ca_path);
+        errdefer c.SSL_CTX_free(new_ctx);
+
+        self.store_rw.lock();
+        const gop = self.host_store.getOrPut(self.allocator, host) catch {
+            self.store_rw.unlock();
+            c.SSL_CTX_free(new_ctx);
+            return error.OutOfMemory;
+        };
+        var old_ctx: ?*c.SSL_CTX = null;
+        if (gop.found_existing) {
+            old_ctx = gop.value_ptr.ctx;
+        } else {
+            gop.key_ptr.* = self.allocator.dupe(u8, host) catch {
+                _ = self.host_store.remove(host);
+                self.store_rw.unlock();
+                c.SSL_CTX_free(new_ctx);
+                return error.OutOfMemory;
+            };
+        }
+        gop.value_ptr.* = .{ .ctx = new_ctx, .version = version };
+        self.store_rw.unlock();
+        // Drop the store's old ref; in-flight handshakes hold their own (their
+        // SSL_set_SSL_CTX up-reffed) — same discipline as the file path.
+        if (old_ctx) |o| c.SSL_CTX_free(o);
     }
 
     fn reloadCustomCertsImpl(self: *TlsConfig, dir: []const u8) !void {

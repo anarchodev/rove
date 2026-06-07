@@ -283,6 +283,10 @@ const Router = struct {
             try self.handleCpPlan(server, ent, sid, sess, path);
             return;
         }
+        if (std.mem.startsWith(u8, path, "/_cp/certs")) {
+            try self.handleCpCerts(server, ent, sid, sess);
+            return;
+        }
         if (std.mem.startsWith(u8, path, "/_cp/cert")) {
             try self.handleCpCert(server, ent, sid, sess, path);
             return;
@@ -371,6 +375,36 @@ const Router = struct {
         // `replyText` serves arbitrary owned bytes (data/len) — the packed
         // frame is binary, but the front door reads it by length, not type.
         try replyText(server, ent, sid, sess, 200, packed_bytes);
+    }
+
+    /// `GET /_cp/certs` — newline-separated list of hosts that have a stored
+    /// cert. The front door polls this, then pulls each host's frame via
+    /// `/_cp/cert?host=` into its SNI store (the SNI handshake callback can't
+    /// block on a fetch, so certs are synced proactively, not lazily).
+    fn handleCpCerts(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session) !void {
+        const a = self.allocator;
+        const hosts = self.directory.certHostsOwned(a) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        defer {
+            for (hosts) |h| a.free(h);
+            a.free(hosts);
+        }
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(a);
+        for (hosts) |h| {
+            buf.appendSlice(a, h) catch {
+                try replyStatus(server, ent, sid, sess, 500);
+                return;
+            };
+            buf.append(a, '\n') catch {};
+        }
+        const owned = buf.toOwnedSlice(a) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        try replyText(server, ent, sid, sess, 200, owned);
     }
 
     // ── Control plane: tenant-move orchestration ─────────────────────

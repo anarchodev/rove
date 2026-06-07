@@ -849,6 +849,24 @@ pub const Directory = struct {
         return self.certs.contains(host);
     }
 
+    /// The hosts that currently have a stored cert (owned dups; caller frees
+    /// each + the slice). The front door polls this (`/_cp/certs`) to learn
+    /// which per-host certs to pull into its SNI store.
+    pub fn certHostsOwned(self: *Directory, a: std.mem.Allocator) Error![][]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var out: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (out.items) |h| a.free(h);
+            out.deinit(a);
+        }
+        var it = self.certs.keyIterator();
+        while (it.next()) |k| {
+            out.append(a, a.dupe(u8, k.*) catch return Error.OutOfMemory) catch return Error.OutOfMemory;
+        }
+        return out.toOwnedSlice(a) catch return Error.OutOfMemory;
+    }
+
     /// Upsert a packed cert into the in-memory projection (no replication). The
     /// committed-state applier, shared by replay + the post-commit observer.
     fn applyCertLocal(self: *Directory, host: []const u8, value: []const u8) Error!void {
