@@ -9,24 +9,25 @@ the recovered front door replays the store and keeps routing to the new
 owner, rather than re-seeding back to the static REWIND_PLACEMENT.
 
   topology:
-    front door :18090   (move orchestrator + DURABLE routing directory)
+    rewind-cp  :18093   (move orchestrator + DURABLE routing directory; restarted)
+    front door :18090   (stateless proxy; resolves placement from the CP)
       ├─ cluster-1 → rewind :18091   (movetenant starts here)
       └─ cluster-2 → rewind :18092   (movetenant ends here)
 
   A. seed movetenant on cluster-1; front routes Host=mover → c1.
-  B. POST front /_control/move {tenant, dest:cluster-2} → 200 (directory
+  B. POST CP /_control/move {tenant, dest:cluster-2} → 200 (directory
      flip is one committed raft write).
   C. front routes Host=mover → c2 (post-move).
-  D. KILL -9 the front door (hard crash, no graceful close → recovery is via
-     WAL replay); restart it over the SAME REWIND_CP_DATA_DIR
-     (the rewind clusters keep running). REWIND_PLACEMENT still says
+  D. KILL -9 the CP (hard crash, no graceful close → recovery is via WAL
+     replay); restart it over the SAME REWIND_CP_DATA_DIR (the rewind
+     clusters + the front door keep running). REWIND_PLACEMENT still says
      cluster-1 in the env.
-  E. the recovered front routes Host=mover → c2 — the committed move
+  E. the recovered CP still routes Host=mover → c2 — the committed move
      replayed from the durable directory store; static seeding was skipped.
      (A re-seed bug would route to c1, which evicted the tenant → 404.)
 
 Run S3-first:  `set -a; . ./.env; set +a; python3 scripts/cp_restart_smoke.py`
-Build first:   `zig build rewind && zig build rewind-front`
+Build first:   `zig build rewind && zig build rewind-cp && zig build rewind-front`
 """
 
 import os
@@ -35,13 +36,18 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from v2_topology import spawn_cp, spawn_front, await_line, CP_BIN, FRONT_BIN
+
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin")
 REWIND = os.path.join(BINDIR, "rewind")
-FRONT = os.path.join(BINDIR, "rewind-front")
 
 PF = int(os.environ.get("FRONT_PORT", "18090"))
+PCP = int(os.environ.get("CP_PORT", "18093"))
 P1 = int(os.environ.get("C1_PORT", "18091"))
 P2 = int(os.environ.get("C2_PORT", "18092"))
+
+CLUSTERS = f"cluster-1=http://127.0.0.1:{P1};cluster-2=http://127.0.0.1:{P2}"
 
 MOVE_SECRET = "rewindmovesecretpadding0123456789abcdef0"
 TENANT = "movetenant"
@@ -61,47 +67,23 @@ def spawn_rewind(name, port, data_dir):
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
     )
     procs.append(p)
-    _await_line(p, name, "listening on")
+    await_line(p, name, "listening on")
     return p
 
 
-def spawn_front(name, port, cp_data_dir, want_needle=None):
-    """Spawn the front door over `cp_data_dir`. If `want_needle` is given,
-    assert it appears in the boot log before 'listening on' (the seed-vs-
-    replay decision)."""
-    env = dict(os.environ)
-    env["REWIND_CLUSTERS"] = f"cluster-1=http://127.0.0.1:{P1};cluster-2=http://127.0.0.1:{P2}"
-    env["REWIND_HOSTS"] = f"{HOST}={TENANT}"
-    env["REWIND_PLACEMENT"] = f"{TENANT}=cluster-1"
-    env["REWIND_MOVE_SECRET"] = MOVE_SECRET
-    env["REWIND_CP_DATA_DIR"] = cp_data_dir
-    p = subprocess.Popen(
-        [FRONT, str(port)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+def spawn_cp_node(cpd, want_needle):
+    """Spawn (or restart) the durable CP over the `cpd` store, asserting the
+    seed-vs-replay boot decision via `want_needle`. The CP holds the directory
+    raft group; this is the process the smoke kills + restarts."""
+    return spawn_cp(
+        procs, PCP,
+        clusters=CLUSTERS,
+        hosts=f"{HOST}={TENANT}",
+        placement=f"{TENANT}=cluster-1",
+        cp_data_dir=cpd,
+        move_secret=MOVE_SECRET,
+        want_needle=want_needle,
     )
-    procs.append(p)
-    saw = _await_line(p, name, "listening on", also=want_needle)
-    if want_needle and not saw:
-        raise SystemExit(f"{name}: expected boot log {want_needle!r} not seen")
-    return p
-
-
-def _await_line(p, name, needle, also=None):
-    """Read p.stdout until `needle`. Returns True if `also` was also seen."""
-    saw_also = False
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        line = p.stdout.readline()
-        if not line:
-            if p.poll() is not None:
-                raise SystemExit(f"{name} exited early: rc={p.returncode}")
-            continue
-        sys.stdout.write(f"  [{name}] " + line)
-        if also and also in line:
-            saw_also = True
-        if needle in line:
-            return saw_also
-    raise SystemExit(f"{name} did not reach '{needle}' within 15s")
 
 
 def _curl(args):
@@ -140,9 +122,9 @@ def kv_get(port, tenant, key, host=None):
     return _curl(args)
 
 
-def move(front_port, tenant, dest):
+def move(cp_port, tenant, dest):
     args = [
-        "-X", "POST", f"http://127.0.0.1:{front_port}/_control/move",
+        "-X", "POST", f"http://127.0.0.1:{cp_port}/_control/move",
         "-H", f"X-Rewind-Move-Secret: {MOVE_SECRET}",
         "-H", "Content-Type: application/json",
         "--data", f'{{"tenant":"{tenant}","dest":"{dest}"}}',
@@ -173,9 +155,9 @@ def stop_all():
 
 
 def main():
-    for b in (REWIND, FRONT):
+    for b in (REWIND, CP_BIN, FRONT_BIN):
         if not os.path.exists(b):
-            raise SystemExit(f"{b} not found — run `zig build rewind && zig build rewind-front`")
+            raise SystemExit(f"{b} not found — run `zig build rewind && zig build rewind-cp && zig build rewind-front`")
     if not os.environ.get("S3_ENDPOINT"):
         raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
 
@@ -195,11 +177,15 @@ def main():
             failures.append(f"{label}: got {got!r}")
 
     try:
-        print("boot: two rewind clusters + front door (durable directory)")
+        print("boot: two rewind clusters + CP (durable directory) + front door")
         spawn_rewind("c1", P1, d1)
         spawn_rewind("c2", P2, d2)
-        # First boot: fresh CP store → the front seeds from static config.
-        front = spawn_front("front", PF, cpd, want_needle="seeded directory")
+        # First boot: fresh CP store → the CP seeds from static config.
+        cp = spawn_cp_node(cpd, want_needle="seeded directory")
+        # Stateless front door pointed at the CP; route_cache_ms=0 so the
+        # post-move + post-restart reads re-resolve placement every request
+        # (the /_system/v2-kv read path is not serve-or-forwarded).
+        spawn_front(procs, PF, f"http://127.0.0.1:{PCP}", route_cache_ms=0)
 
         # ── A. seed on c1; front routes there pre-move ────────────────
         print("leg A: seed movetenant on cluster-1; front routes → c1")
@@ -210,7 +196,7 @@ def main():
 
         # ── B. the move (directory flip = one committed raft write) ───
         print("leg B: move movetenant cluster-1 → cluster-2")
-        st, body = move(PF, TENANT, "cluster-2")
+        st, body = move(PCP, TENANT, "cluster-2")
         check("POST /_control/move status", st, 200)
         print(f"       move says: {body.strip()!r}")
 
@@ -221,15 +207,15 @@ def main():
         check("GET via front (→c2) value", body, VALUE)
 
         # ── D. HARD-CRASH (kill -9) the front door over the same CP dir ─
-        print("leg D: kill -9 the front door (HARD crash — no graceful close,"
+        print("leg D: kill -9 the CP (HARD crash — no graceful close,"
               " so recovery is via WAL replay, not durabilize-on-close)")
-        os.kill(front.pid, signal.SIGKILL)
-        front.wait()
-        procs.remove(front)
+        os.kill(cp.pid, signal.SIGKILL)
+        cp.wait()
+        procs.remove(cp)
         # Second boot: the committed move replays from the durable WAL →
         # replay, NOT re-seed (even though REWIND_PLACEMENT still says
         # cluster-1, and the store was never gracefully durabilized).
-        spawn_front("front", PF, cpd, want_needle="skipping static seed")
+        spawn_cp_node(cpd, want_needle="skipping static seed")
 
         # ── E. the recovered front still routes to cluster-2 ──────────
         print("leg E: recovered front STILL routes movetenant → cluster-2")
