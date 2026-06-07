@@ -1021,13 +1021,11 @@ pub fn build(b: *std.Build) void {
     const rewind_step = b.step("rewind", "Build the V2 rewind worker binary (Phase 2d)");
     rewind_step.dependOn(&b.addInstallArtifact(rewind_exe, .{}).step);
 
-    // ── rewind-front: the V2 front door (docs/v2-build-order.md §Phase 3,
-    // docs/v2-phase3-directory-routing.md §3b). An HTTP/2 terminator that
-    // resolves Host→tenant → directory.clusterFor → reverse-proxies to the
-    // owning cluster's `rewind`. Reads route only through the control-plane
-    // directory + forward via libcurl; Slice 1 makes the directory durable,
-    // so the front door now stands up the CP `bridge` (a single directory
-    // raft group) and links the raft artifact.
+    // ── rewind-front: the V2 front door (docs/v2-front-door-architecture.md).
+    // A STATELESS HTTP/2 reverse proxy: resolves Host→cluster via the CP's
+    // `/_cp/route` (cached) and reverse-proxies to the owning cluster's nodes
+    // (leader-aware). Holds NO directory/raft state — that lives in `rewind-cp`
+    // — so it links neither `bridge` nor `cp-directory`; just rove + h2 + curl.
     const front_mod = b.createModule(.{
         .root_source_file = b.path("src-v2/front/main.zig"),
         .target = target,
@@ -1036,8 +1034,6 @@ pub fn build(b: *std.Build) void {
     front_mod.addImport("rove", rove_mod);
     front_mod.addImport("rove-h2", h2_mod);
     front_mod.addImport("rove-blob", blob_mod);
-    front_mod.addImport("cp-directory", v2_cp_dir_mod);
-    front_mod.addImport("bridge", v2_bridge_mod);
     front_mod.link_libc = true;
     front_mod.linkSystemLibrary("nghttp2", .{});
     front_mod.linkSystemLibrary("ssl", .{});
@@ -1046,4 +1042,29 @@ pub fn build(b: *std.Build) void {
     const front_exe = b.addExecutable(.{ .name = "rewind-front", .root_module = front_mod });
     const front_step = b.step("rewind-front", "Build the V2 front-door binary (Phase 3b)");
     front_step.dependOn(&b.addInstallArtifact(front_exe, .{}).step);
+
+    // ── rewind-cp: the V2 control plane (docs/v2-front-door-architecture.md).
+    // The authoritative, replicated directory: owns placement + the host→tenant
+    // index, hosts the directory raft group (its OWN small cluster), and
+    // orchestrates moves (`/_control/move`) + serves `/_cp/route` + `/_cp/leader`.
+    // This is where `bridge` + `cp-directory` now live (lifted out of the front
+    // door), fixing the inverted scaling where every front-door was a CP voter.
+    const cp_mod = b.createModule(.{
+        .root_source_file = b.path("src-v2/cp/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cp_mod.addImport("rove", rove_mod);
+    cp_mod.addImport("rove-h2", h2_mod);
+    cp_mod.addImport("rove-blob", blob_mod);
+    cp_mod.addImport("cp-directory", v2_cp_dir_mod);
+    cp_mod.addImport("bridge", v2_bridge_mod);
+    cp_mod.link_libc = true;
+    cp_mod.linkSystemLibrary("nghttp2", .{});
+    cp_mod.linkSystemLibrary("ssl", .{});
+    cp_mod.linkSystemLibrary("crypto", .{});
+    cp_mod.linkSystemLibrary("curl", .{});
+    const cp_exe = b.addExecutable(.{ .name = "rewind-cp", .root_module = cp_mod });
+    const cp_step = b.step("rewind-cp", "Build the V2 control-plane binary");
+    cp_step.dependOn(&b.addInstallArtifact(cp_exe, .{}).step);
 }

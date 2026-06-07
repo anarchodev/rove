@@ -37,11 +37,14 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from v2_topology import spawn_cp, spawn_front, await_line, CP_BIN, FRONT_BIN
+
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin")
 REWIND = os.path.join(BINDIR, "rewind")
-FRONT = os.path.join(BINDIR, "rewind-front")
 
 PF = int(os.environ.get("FRONT_PORT", "18090"))
+PCP = int(os.environ.get("CP_PORT", "18093"))
 P1 = int(os.environ.get("C1_PORT", "18091"))
 P2 = int(os.environ.get("C2_PORT", "18092"))
 
@@ -60,37 +63,8 @@ def spawn_rewind(name, port, data_dir, admin_domain, token):
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
     )
     procs.append(p)
-    _await_line(p, name, "listening on")
+    await_line(p, name, "listening on")
     return p
-
-
-def spawn_front(name, port):
-    env = dict(os.environ)
-    env["REWIND_CLUSTERS"] = f"cluster-1=http://127.0.0.1:{P1};cluster-2=http://127.0.0.1:{P2}"
-    env["REWIND_HOSTS"] = f"{C1_HOST}=c1tenant;{C2_HOST}=c2tenant"
-    env["REWIND_PLACEMENT"] = "c1tenant=cluster-1;c2tenant=cluster-2"
-    env["REWIND_CP_DATA_DIR"] = f"/tmp/two-cluster-cp-{os.getpid()}"
-    p = subprocess.Popen(
-        [FRONT, str(port)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
-    )
-    procs.append(p)
-    _await_line(p, name, "listening on")
-    return p
-
-
-def _await_line(p, name, needle):
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        line = p.stdout.readline()
-        if not line:
-            if p.poll() is not None:
-                raise SystemExit(f"{name} exited early: rc={p.returncode}")
-            continue
-        sys.stdout.write(f"  [{name}] " + line)
-        if needle in line:
-            return
-    raise SystemExit(f"{name} did not reach '{needle}' within 15s")
 
 
 def admin_kv(port, host, token, key, value):
@@ -123,9 +97,9 @@ def stop_all():
 
 
 def main():
-    for b in (REWIND, FRONT):
+    for b in (REWIND, CP_BIN, FRONT_BIN):
         if not os.path.exists(b):
-            raise SystemExit(f"{b} not found — run `zig build rewind && zig build rewind-front`")
+            raise SystemExit(f"{b} not found — run `zig build rewind && zig build rewind-cp && zig build rewind-front`")
     if not os.environ.get("S3_ENDPOINT"):
         raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
 
@@ -137,10 +111,17 @@ def main():
 
     failures = []
     try:
-        print("boot: two rewind clusters + front door")
+        print("boot: two rewind clusters + CP + front door")
         spawn_rewind("c1", P1, d1, C1_HOST, C1_TOKEN)
         spawn_rewind("c2", P2, d2, C2_HOST, C2_TOKEN)
-        spawn_front("front", PF)
+        spawn_cp(
+            procs, PCP,
+            clusters=f"cluster-1=http://127.0.0.1:{P1};cluster-2=http://127.0.0.1:{P2}",
+            hosts=f"{C1_HOST}=c1tenant;{C2_HOST}=c2tenant",
+            placement="c1tenant=cluster-1;c2tenant=cluster-2",
+            cp_data_dir=dcp,
+        )
+        spawn_front(procs, PF, f"http://127.0.0.1:{PCP}")
 
         def check(label, got, want, predicate="eq"):
             ok = (got == want) if predicate == "eq" else (got != want)
