@@ -7,7 +7,7 @@ that receives a request for a tenant it does NOT own forwards it to the owner
 (discovered via the control plane's `/_cp/route`), instead of 404ing — so a
 stale public route (Cloudflare) costs an extra hop, never a failure.
 
-    CP (rewind-front) :19010   — owns host→tenant→cluster (the /_cp/route lookup)
+    CP (rewind-cp)    :19010   — owns host→tenant→cluster (the /_cp/route lookup)
     cluster-A rewind  :19011   — OWNS custtenant   (admin domain a.localhost)
     cluster-B rewind  :19012   — does NOT have it  (admin domain b.localhost)
 
@@ -33,7 +33,7 @@ Legs:
       against the blocking implementation and passes against the async one.
 
 Requires S3 env — `set -a; . ./.env; set +a` first.
-Build:  `zig build rewind && zig build rewind-front`
+Build:  `zig build rewind && zig build rewind-cp`
 """
 
 import os
@@ -44,9 +44,11 @@ import sys
 import threading
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from v2_topology import spawn_cp, await_line, CP_BIN
+
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin")
 REWIND = os.path.join(BINDIR, "rewind")
-FRONT = os.path.join(BINDIR, "rewind-front")
 
 PCP = 19010
 PA = 19011
@@ -97,40 +99,8 @@ def spawn_rewind(name, port, data_dir, cluster_id, admin_domain):
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
     )
     procs.append(p)
-    _await_line(p, name, "listening on")
+    await_line(p, name, "listening on")
     return p
-
-
-def spawn_front():
-    env = dict(os.environ)
-    env["REWIND_CLUSTERS"] = (
-        f"cluster-A=http://127.0.0.1:{PA};cluster-B=http://127.0.0.1:{PB}"
-        f";cluster-BH=http://127.0.0.1:{PBH}"
-    )
-    env["REWIND_HOSTS"] = f"{HOST}={TENANT};{SLOW_HOST}={SLOW_TENANT}"
-    env["REWIND_PLACEMENT"] = f"{TENANT}=cluster-A;{SLOW_TENANT}=cluster-BH"
-    env["REWIND_CP_DATA_DIR"] = f"/tmp/sof-cp-{os.getpid()}"
-    p = subprocess.Popen(
-        [FRONT, str(PCP)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
-    )
-    procs.append(p)
-    _await_line(p, "cp", "listening on")
-    return p
-
-
-def _await_line(p, name, needle):
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        line = p.stdout.readline()
-        if not line:
-            if p.poll() is not None:
-                raise SystemExit(f"{name} exited early: rc={p.returncode}")
-            continue
-        sys.stdout.write(f"  [{name}] " + line)
-        if needle in line:
-            return
-    raise SystemExit(f"{name} did not reach '{needle}' within 15s")
 
 
 def get(port, host):
@@ -157,9 +127,9 @@ def stop_all():
 
 
 def main():
-    for b in (REWIND, FRONT):
+    for b in (REWIND, CP_BIN):
         if not os.path.exists(b):
-            raise SystemExit(f"{b} not found — run `zig build rewind && zig build rewind-front`")
+            raise SystemExit(f"{b} not found — run `zig build rewind && zig build rewind-cp`")
     if not os.environ.get("S3_ENDPOINT"):
         raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
 
@@ -181,7 +151,16 @@ def main():
     try:
         print("boot: black-hole owner + CP + cluster-A (owner) + cluster-B (non-owner)")
         bh = start_blackhole()
-        spawn_front()
+        spawn_cp(
+            procs, PCP,
+            clusters=(
+                f"cluster-A=http://127.0.0.1:{PA};cluster-B=http://127.0.0.1:{PB}"
+                f";cluster-BH=http://127.0.0.1:{PBH}"
+            ),
+            hosts=f"{HOST}={TENANT};{SLOW_HOST}={SLOW_TENANT}",
+            placement=f"{TENANT}=cluster-A;{SLOW_TENANT}=cluster-BH",
+            cp_data_dir=dcp,
+        )
         spawn_rewind("A", PA, da, "cluster-A", "a.localhost")
         spawn_rewind("B", PB, db, "cluster-B", "b.localhost")
 
