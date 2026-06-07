@@ -2665,6 +2665,26 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             continue;
         }
 
+        // Lever 2 — body-size gate (docs/plan-tiers.md). Reject oversized
+        // inbound bodies with 413 off the tenant's plan-resolved
+        // `max_body_bytes`. A declared `content-length` over the cap fails
+        // up front; otherwise the actually-buffered length is checked. (The
+        // h2 reception path is tenant-agnostic — it resolves no plan — so a
+        // genuinely-incremental pre-buffer reject is the edge/front-door's job
+        // with a global ceiling; this enforces the per-tenant billing
+        // boundary server-side in the DP, read fresh from the cached plan.)
+        const body_cap = plan.max_body_bytes;
+        const declared_len: u64 = if (respb.findHeader(rh, "content-length")) |cl|
+            std.fmt.parseInt(u64, std.mem.trim(u8, cl, " \t"), 10) catch 0
+        else
+            0;
+        if (declared_len > body_cap or body.len > body_cap) {
+            try respb.setSimpleResponse(server, ent, sid, sess, 413, "payload too large\n", allocator);
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 413, .handler_error, &.{}, &.{}, .{}, null, .inbound, 0);
+            processed += 1;
+            continue;
+        }
+
         // Static-first dispatch for customer traffic only. Admin
         // requests already ran their own pre-auth static check above —
         // running it here again would shadow the admin JS handler with
