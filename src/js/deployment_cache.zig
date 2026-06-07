@@ -24,6 +24,7 @@ const reserved = @import("reserved.zig");
 const bytecode_cache_mod = @import("bytecode_cache.zig");
 const deployment_loader_mod = @import("deployment_loader.zig");
 const msg_router_mod = @import("msg_router.zig");
+const plan_mod = @import("plan.zig");
 
 const BlobBytes = bytecode_cache_mod.BlobBytes;
 const BytecodeCache = bytecode_cache_mod.BytecodeCache;
@@ -462,6 +463,29 @@ pub const TenantSlot = struct {
     prefetched_manifest: ?PrefetchedManifest,
     /// Atomic pointer to the current snapshot. Null until first load.
     current: std.atomic.Value(?*TenantFilesSnapshot),
+
+    /// Resolved per-tenant plan limits (docs/plan-tiers.md,
+    /// docs/v2-cp-operational-state.md). Null until the CP delivers a plan
+    /// (via the attach handshake on a move, or a live single-target push);
+    /// null ⇒ the free tier. An atomic pointer so a live plan change swaps it
+    /// without locking the dispatch read — readers do a lock-free load and
+    /// fall back to `plan_mod.table(.free)` on null (`effectivePlan`).
+    plan: std.atomic.Value(?*plan_mod.PlanLimits) = .init(null),
+    /// Bumped on every plan delivery/change. The rate limiter snapshots caps
+    /// when it first creates a tenant's buckets, so it re-inits them when this
+    /// generation moves (docs/plan-tiers.md Lever 1 generation-refresh). Body
+    /// size + retention read `effectivePlan()` fresh per request, so they pick
+    /// up a change with no generation check.
+    plan_gen: std.atomic.Value(u64) = .init(0),
+    /// Serializes `setPlan` (the rare, billing-driven write path) and owns the
+    /// retired-pointer list. Never taken on a read.
+    plan_lock: std.Thread.Mutex = .{},
+    /// Superseded `PlanLimits` pointers, freed at slot teardown. A swap can't
+    /// free the old pointer immediately (a concurrent dispatch read may still
+    /// hold it, and we have no epoch reclamation here); plan changes are rare
+    /// (billing events), so deferring the free to deinit is bounded and
+    /// simple. Guarded by `plan_lock`.
+    plan_retired: std.ArrayListUnmanaged(*plan_mod.PlanLimits) = .empty,
     /// Serializes `pinCurrent` (load + retain) against `reloadDeployment`
     /// (swap + release-old). Without this, a dispatcher could load
     /// the old pointer, the loader could swap-and-release it to
@@ -537,6 +561,27 @@ pub const TenantSlot = struct {
     pub fn currentDeploymentId(self: *TenantSlot) u64 {
         const snap = self.current.load(.acquire) orelse return 0;
         return snap.deployment_id;
+    }
+
+    /// The tenant's resolved plan limits — a lock-free read for the dispatch
+    /// path. Null cached plan ⇒ the free tier.
+    pub fn effectivePlan(self: *TenantSlot) plan_mod.PlanLimits {
+        if (self.plan.load(.acquire)) |p| return p.*;
+        return plan_mod.table(.free);
+    }
+
+    /// Install a resolved plan (from the CP attach handshake or a live push)
+    /// and bump the plan generation so the rate limiter re-snapshots caps. The
+    /// previous pointer is retired (freed at slot teardown), not freed here —
+    /// a concurrent reader may still hold it. Rare path (billing-driven).
+    pub fn setPlan(self: *TenantSlot, limits: plan_mod.PlanLimits) !void {
+        const p = try self.allocator.create(plan_mod.PlanLimits);
+        p.* = limits;
+        self.plan_lock.lock();
+        defer self.plan_lock.unlock();
+        const old = self.plan.swap(p, .acq_rel);
+        if (old) |o| try self.plan_retired.append(self.allocator, o);
+        _ = self.plan_gen.fetchAdd(1, .acq_rel);
     }
 };
 
@@ -957,6 +1002,11 @@ fn freeTenantSlot(allocator: std.mem.Allocator, slot: *TenantSlot) void {
         slot.current.store(null, .release);
         snap.release();
     }
+    // Free the current + all retired plan limits (no readers remain at
+    // teardown). See `TenantSlot.plan_retired`.
+    if (slot.plan.load(.acquire)) |p| allocator.destroy(p);
+    for (slot.plan_retired.items) |p| allocator.destroy(p);
+    slot.plan_retired.deinit(allocator);
     slot.manifest_backend.deinit();
     slot.blob_backend.deinit();
     if (slot.prefetched_manifest) |p| allocator.free(p.bytes);

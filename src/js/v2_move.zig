@@ -45,11 +45,18 @@ const kv_mod = @import("raft-kv");
 const tenant_mod = @import("rove-tenant");
 const respb = @import("response_builder.zig");
 const raft_propose = @import("raft_propose.zig");
+const plan_mod = @import("plan.zig");
 const blob = @import("rove-blob");
 const curl = blob.curl;
 
 const MOVE_SECRET_HEADER = "x-rewind-move-secret";
 const TENANT_HEADER = "x-rewind-tenant";
+
+/// Carries a tenant's opaque CP plan blob (`{tier, overrides}` JSON) on the
+/// `v2-attach` handshake (docs/v2-cp-operational-state.md "Delivery to the
+/// DP" — the plan rides attach on a move). Absent header ⇒ no plan delivered
+/// (the tenant stays free until a live push / the next attach).
+const PLAN_HEADER = "x-rewind-plan";
 
 /// Source-side marker key (in the tenant's own `inst.kv`) holding the
 /// destination base URL while a zero-downtime move's overlap window is open
@@ -112,6 +119,8 @@ pub fn tryHandleV2(
         try handleSnapshot(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-load-merge")) {
         try handleLoadMerge(server, allocator, worker, ent, sid, sess, method, rh, body);
+    } else if (std.mem.eql(u8, sys_rest, "v2-plan")) {
+        try handlePlan(server, allocator, worker, ent, sid, sess, method, path, body);
     } else {
         try respb.setSystemResponse(server, ent, sid, sess, 404, "unknown v2 move endpoint\n", allocator, null, null);
     }
@@ -311,6 +320,16 @@ fn handleAttach(
             return reply(server, allocator, ent, sid, sess, 400, "bundle load failed\n");
     }
 
+    // The tenant's plan rides the attach handshake (docs/v2-cp-operational-
+    // state.md): cache the resolved limits on its slot so enforcement is local
+    // from the first post-move request. Non-fatal — a bad/absent plan leaves
+    // the tenant on the free tier until a live push corrects it; it must not
+    // fail the move.
+    if (respb.findHeader(rh, PLAN_HEADER)) |plan_blob| {
+        applyPlanBlob(worker, allocator, tenant, plan_blob) catch |err|
+            std.log.warn("v2-attach: applyPlanBlob({s}) failed: {s}", .{ tenant, @errorName(err) });
+    }
+
     const gid = worker.raft.registerTenant(tenant) catch
         return reply(server, allocator, ent, sid, sess, 500, "register failed\n");
     worker.raft.createGroupEpoch(gid, 1) catch |err| switch (err) {
@@ -365,6 +384,70 @@ fn handleResume(
         return reply(server, allocator, ent, sid, sess, 400, "expected {\"tenant\"}\n");
     defer allocator.free(tenant);
     if (worker.raft.gidForTenant(tenant)) |gid| worker.raft.unquiesce(gid);
+    try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
+}
+
+// ── v2-plan: live plan delivery + diagnostic read (destination) ──────
+
+/// `POST /_system/v2-plan {tenant, plan}` — install a tenant's resolved plan
+/// limits on its hot-path slot (the CP's single-target push on a live tier
+/// change; docs/v2-cp-operational-state.md "Live tier change"). `plan` is the
+/// opaque `{tier, overrides}` blob the CP stores. 204 on success; 409 if the
+/// tenant is not active on this cluster (the CP pushes to the serving cluster,
+/// so that is a routing bug worth surfacing).
+///
+/// `GET /_system/v2-plan?tenant=T` — the tenant's RESOLVED effective limits as
+/// JSON (+ the plan generation). Diagnostic / smoke read-back: it proves
+/// delivery end-to-end (attach handshake or live push) without standing up the
+/// full enforcement levers. Kept in tree (diagnostic state is not temporary).
+fn handlePlan(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    path: []const u8,
+    body: []const u8,
+) !void {
+    if (std.mem.eql(u8, method, "GET")) {
+        const tenant = queryParam(path, "tenant") orelse
+            return reply(server, allocator, ent, sid, sess, 400, "missing tenant\n");
+        const inst = (worker.node.tenant.getInstance(tenant) catch null) orelse
+            return reply(server, allocator, ent, sid, sess, 404, "unknown tenant\n");
+        const slot = worker.node.deploy.getOrOpenTenantSlot(inst) catch
+            return reply(server, allocator, ent, sid, sess, 500, "slot open failed\n");
+        const p = slot.effectivePlan();
+        const gen = slot.plan_gen.load(.acquire);
+        const json = std.fmt.allocPrint(allocator, "{{\"request_capacity\":{d},\"request_refill_per_sec\":{d},\"email_capacity\":{d},\"email_refill_per_sec\":{d},\"max_body_bytes\":{d},\"retention_days\":{d},\"plan_gen\":{d}}}", .{
+            p.rate.request_capacity,
+            p.rate.request_refill_per_sec,
+            p.rate.email_capacity,
+            p.rate.email_refill_per_sec,
+            p.max_body_bytes,
+            p.retention_days,
+            gen,
+        }) catch return reply(server, allocator, ent, sid, sess, 500, "encode failed\n");
+        try respb.setSystemResponseOwned(server, ent, sid, sess, 200, json, allocator, null, "application/json");
+        return;
+    }
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "GET or POST only\n");
+
+    var parsed = std.json.parseFromSlice(struct {
+        tenant: []const u8,
+        plan: []const u8,
+    }, allocator, body, .{ .ignore_unknown_fields = true }) catch
+        return reply(server, allocator, ent, sid, sess, 400, "expected {\"tenant\",\"plan\"}\n");
+    defer parsed.deinit();
+    if (parsed.value.tenant.len == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "empty tenant\n");
+
+    applyPlanBlob(worker, allocator, parsed.value.tenant, parsed.value.plan) catch |err| switch (err) {
+        error.UnknownTenant => return reply(server, allocator, ent, sid, sess, 409, "tenant not active on this cluster\n"),
+        else => return reply(server, allocator, ent, sid, sess, 500, "plan install failed\n"),
+    };
     try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
 }
 
@@ -625,6 +708,17 @@ fn ensureInstance(worker: anytype, tenant: []const u8) !*const tenant_mod.Instan
     if (try worker.node.tenant.getInstance(tenant)) |inst| return inst;
     try worker.node.tenant.createInstance(tenant);
     return (try worker.node.tenant.getInstance(tenant)) orelse error.ProvisionFailed;
+}
+
+/// Resolve a CP plan blob into effective limits and cache them on the tenant's
+/// hot-path slot (`TenantSlot.setPlan`, which bumps the plan generation so the
+/// rate limiter re-snapshots caps). The blob is opaque `{tier, overrides}`
+/// JSON; an empty/malformed blob resolves to the free tier (`plan.parseBlob`).
+/// `error.UnknownTenant` if the tenant has no instance on this cluster.
+fn applyPlanBlob(worker: anytype, allocator: std.mem.Allocator, tenant: []const u8, plan_blob: []const u8) !void {
+    const inst = (try worker.node.tenant.getInstance(tenant)) orelse return error.UnknownTenant;
+    const slot = try worker.node.deploy.getOrOpenTenantSlot(inst);
+    try slot.setPlan(plan_mod.parseBlob(allocator, plan_blob));
 }
 
 /// Block (bounded by `commit_wait_timeout_ns`) until the tenant's raft
