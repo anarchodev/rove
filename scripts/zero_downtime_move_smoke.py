@@ -4,7 +4,7 @@ memory; docs/v2-build-order.md §Phase 7).
 
 Proves the cutover keeps the source serving (no quiesce) and loses no write:
 
-    front door :19020   (move-live orchestrator + directory)
+    rewind-cp  :19020   (move-live orchestrator + directory)
     cluster-A  :19021   (source)
     cluster-B  :19022   (destination)
 
@@ -23,7 +23,7 @@ Leg 2 — the move-live orchestration end to end:
   the whole time; afterward B serves the data and A is evicted.
 
 Requires S3 env — `set -a; . ./.env; set +a` first.
-Build:  `zig build rewind && zig build rewind-front`
+Build:  `zig build rewind && zig build rewind-cp`
 """
 
 import os
@@ -32,11 +32,13 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from v2_topology import spawn_cp, await_line, CP_BIN
+
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin")
 REWIND = os.path.join(BINDIR, "rewind")
-FRONT = os.path.join(BINDIR, "rewind-front")
 
-PF = 19020
+PCP = 19020
 PA = 19021
 PB = 19022
 SECRET = "rewindmovesecretpadding0123456789abcdef0"
@@ -53,36 +55,8 @@ def spawn_rewind(name, port, data_dir, admin_domain):
     p = subprocess.Popen([REWIND, data_dir, str(port)], stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, env=env)
     procs.append(p)
-    _await(p, name, "listening on")
+    await_line(p, name, "listening on")
     return p
-
-
-def spawn_front():
-    env = dict(os.environ)
-    env["REWIND_CLUSTERS"] = f"cluster-A={A_URL};cluster-B={B_URL}"
-    env["REWIND_HOSTS"] = "live.localhost=livetenant"
-    env["REWIND_PLACEMENT"] = "livetenant=cluster-A"
-    env["REWIND_MOVE_SECRET"] = SECRET
-    env["REWIND_CP_DATA_DIR"] = f"/tmp/zdm-cp-{os.getpid()}"
-    p = subprocess.Popen([FRONT, str(PF)], stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, text=True, env=env)
-    procs.append(p)
-    _await(p, "front", "listening on")
-    return p
-
-
-def _await(p, name, needle):
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        line = p.stdout.readline()
-        if not line:
-            if p.poll() is not None:
-                raise SystemExit(f"{name} exited early rc={p.returncode}")
-            continue
-        sys.stdout.write(f"  [{name}] " + line)
-        if needle in line:
-            return
-    raise SystemExit(f"{name} never reached '{needle}'")
 
 
 def hdr():
@@ -150,7 +124,7 @@ def await_leader(port, tenant, deadline_s=10):
 
 
 def move_live(dest):
-    return _curl(["-X", "POST", f"http://127.0.0.1:{PF}/_control/move-live", *hdr(),
+    return _curl(["-X", "POST", f"http://127.0.0.1:{PCP}/_control/move-live", *hdr(),
                   "-H", "Content-Type: application/json",
                   "--data", f'{{"tenant":"livetenant","dest":"{dest}"}}'])
 
@@ -167,9 +141,9 @@ def stop_all():
 
 
 def main():
-    for b in (REWIND, FRONT):
+    for b in (REWIND, CP_BIN):
         if not os.path.exists(b):
-            raise SystemExit(f"{b} missing — `zig build rewind && zig build rewind-front`")
+            raise SystemExit(f"{b} missing — `zig build rewind && zig build rewind-cp`")
     if not os.environ.get("S3_ENDPOINT"):
         raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
 
@@ -189,8 +163,15 @@ def main():
             fails.append(label)
 
     try:
-        print("boot: front + cluster-A (source) + cluster-B (dest)")
-        spawn_front()
+        print("boot: CP + cluster-A (source) + cluster-B (dest)")
+        spawn_cp(
+            procs, PCP,
+            clusters=f"cluster-A={A_URL};cluster-B={B_URL}",
+            hosts="live.localhost=livetenant",
+            placement="livetenant=cluster-A",
+            cp_data_dir=dcp,
+            move_secret=SECRET,
+        )
         spawn_rewind("A", PA, da, "a.localhost")
         spawn_rewind("B", PB, db, "b.localhost")
 
