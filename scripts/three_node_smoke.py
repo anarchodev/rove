@@ -4,7 +4,8 @@ docs/v2-phase5-multinode.md §5d/5e).
 
 Proves multi-node HA + the move fan-out end to end:
 
-    front door :18100   (move orchestrator + leader-aware routing)
+    rewind-cp  :18105   (move orchestrator + routing directory)
+    front door :18100   (stateless proxy; leader-aware forward to a cluster)
       ├─ cluster-1 → rewind :18101            (single-node source)
       └─ cluster-2 → rewind :18102/03/04      (3-node HA destination)
                        raft peers :18112/13/14
@@ -31,7 +32,7 @@ through the leader's propose→commit path, a GET reads the kvexp store.
 Requires S3 env (there is no fs BlobBackend) — source the repo `.env` first:
   `set -a; . ./.env; set +a; python3 scripts/three_node_smoke.py`
 
-Build first:  `zig build rewind && zig build rewind-front`
+Build first:  `zig build rewind && zig build rewind-cp && zig build rewind-front`
 """
 
 import os
@@ -40,11 +41,14 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from v2_topology import spawn_cp, spawn_front, await_line, CP_BIN, FRONT_BIN
+
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin")
 REWIND = os.path.join(BINDIR, "rewind")
-FRONT = os.path.join(BINDIR, "rewind-front")
 
 PF = int(os.environ.get("FRONT_PORT", "18100"))
+PCP = int(os.environ.get("CP_PORT", "18105"))          # single-node CP
 P1 = int(os.environ.get("C1_PORT", "18101"))           # cluster-1 (source)
 P2 = [18102, 18103, 18104]                             # cluster-2 HTTP ports
 RP2 = [18112, 18113, 18114]                            # cluster-2 raft peer ports
@@ -76,52 +80,8 @@ def spawn_rewind(name, port, data_dir, multinode=None):
     )
     p._name = name
     procs.append(p)
-    _await_line(p, name, "listening on")
+    await_line(p, name, "listening on")
     return p
-
-
-def spawn_front(name, port):
-    env = dict(os.environ)
-    c2_nodes = ",".join(f"http://127.0.0.1:{p}" for p in P2)
-    env["REWIND_CLUSTERS"] = (
-        f"cluster-1=http://127.0.0.1:{P1};cluster-2={c2_nodes}"
-    )
-    env["REWIND_HOSTS"] = f"{HOST}={TENANT}"
-    env["REWIND_PLACEMENT"] = f"{TENANT}=cluster-1"
-    env["REWIND_MOVE_SECRET"] = MOVE_SECRET
-    env["REWIND_CP_DATA_DIR"] = f"/tmp/three-node-cp-{os.getpid()}"
-    p = subprocess.Popen(
-        [FRONT, str(port)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
-    )
-    p._name = name
-    procs.append(p)
-    _await_line(p, name, "listening on")
-    return p
-
-
-def _await_line(p, name, needle):
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        line = p.stdout.readline()
-        if not line:
-            if p.poll() is not None:
-                raise SystemExit(f"{name} exited early: rc={p.returncode}")
-            continue
-        sys.stdout.write(f"  [{name}] " + line)
-        if needle in line:
-            return
-    raise SystemExit(f"{name} did not reach '{needle}' within 15s")
-
-
-def _drain(p):
-    """Best-effort: keep a process's stdout pipe from filling (it logs)."""
-    try:
-        os.set_blocking(p.stdout.fileno(), False)
-        while p.stdout.readline():
-            pass
-    except Exception:
-        pass
 
 
 def _curl(args):
@@ -170,9 +130,9 @@ def v2_leader(port):
     ])[0]
 
 
-def move(front_port, dest):
+def move(cp_port, dest):
     return _curl([
-        "-X", "POST", f"http://127.0.0.1:{front_port}/_control/move",
+        "-X", "POST", f"http://127.0.0.1:{cp_port}/_control/move",
         "-H", f"X-Rewind-Move-Secret: {MOVE_SECRET}",
         "-H", "Content-Type: application/json",
         "--data", f'{{"tenant":"{TENANT}","dest":"{dest}"}}',
@@ -227,9 +187,9 @@ def stop_all():
 
 
 def main():
-    for b in (REWIND, FRONT):
+    for b in (REWIND, CP_BIN, FRONT_BIN):
         if not os.path.exists(b):
-            raise SystemExit(f"{b} not found — run `zig build rewind && zig build rewind-front`")
+            raise SystemExit(f"{b} not found — run `zig build rewind && zig build rewind-cp && zig build rewind-front`")
     if not os.environ.get("S3_ENDPOINT"):
         raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
 
@@ -252,12 +212,24 @@ def main():
     peers_csv = ",".join(f"127.0.0.1:{rp}" for rp in RP2)
     leader_port = None
     try:
-        print("boot: single-node cluster-1 + 3-node cluster-2 + front door")
+        print("boot: single-node cluster-1 + 3-node cluster-2 + CP + front door")
         spawn_rewind("c1", P1, d1)  # single-node source
         for i in range(3):
             spawn_rewind(f"c2n{i+1}", P2[i], dnodes[i],
                          multinode=(i + 1, "1,2,3", peers_csv))
-        spawn_front("front", PF)
+        c2_nodes = ",".join(f"http://127.0.0.1:{p}" for p in P2)
+        spawn_cp(
+            procs, PCP,
+            clusters=f"cluster-1=http://127.0.0.1:{P1};cluster-2={c2_nodes}",
+            hosts=f"{HOST}={TENANT}",
+            placement=f"{TENANT}=cluster-1",
+            cp_data_dir=dcp,
+            move_secret=MOVE_SECRET,
+        )
+        # route_cache_ms=0: the /_system/v2-kv reads through the front are not a
+        # serve-or-forward path, so re-resolve every request (post-move flip +
+        # post-leader-kill node set are then seen immediately).
+        spawn_front(procs, PF, f"http://127.0.0.1:{PCP}", route_cache_ms=0)
 
         # ── A. seed on the single-node source ─────────────────────────
         print("leg A: seed movetenant on cluster-1 (single node)")
@@ -270,7 +242,7 @@ def main():
 
         # ── B. move onto the 3-node destination ───────────────────────
         print("leg B: move cluster-1 → cluster-2 (3-node dest, attach fan-out)")
-        st, body = move(PF, "cluster-2")
+        st, body = move(PCP, "cluster-2")
         check("POST /_control/move status", st, 200)
         print(f"       move says: {body.strip()!r}")
 
