@@ -144,6 +144,11 @@ pub const Directory = struct {
     cluster_idx: std.StringHashMapUnmanaged(usize) = .empty,
     /// tenant store id → placement.
     placements: std.StringHashMapUnmanaged(Placement) = .empty,
+    /// tenant store id → opaque plan/limits blob (`{tier, overrides}` JSON,
+    /// authored by the admin app). The CP is dumb here — it stores + replicates
+    /// + serves the bytes verbatim; the DP parses them into effective limits
+    /// (`plan-tiers.md`, `v2-cp-operational-state.md`). Owned key + value.
+    plans: std.StringHashMapUnmanaged([]u8) = .empty,
 
     const OwnedCluster = struct {
         id: []u8,
@@ -220,6 +225,13 @@ pub const Directory = struct {
         var it = self.placements.keyIterator();
         while (it.next()) |k| a.free(k.*);
         self.placements.deinit(a);
+        // `plans` keys AND values are owned dups (see `applyPlanLocal`).
+        var pit = self.plans.iterator();
+        while (pit.next()) |e| {
+            a.free(e.key_ptr.*);
+            a.free(e.value_ptr.*);
+        }
+        self.plans.deinit(a);
     }
 
     /// True when no cluster has been registered yet — the front door seeds
@@ -313,6 +325,26 @@ pub const Directory = struct {
             cursor = try a.dupe(u8, last);
             if (done) break;
         }
+
+        // Plans — opaque per-tenant limit blobs, independent of clusters.
+        a.free(cursor);
+        cursor = try a.dupe(u8, "");
+        while (true) {
+            var rr = node.prefix(self.dir_gid, "plan/", cursor, 256) catch return Error.Replication;
+            defer rr.deinit();
+            if (rr.entries.len == 0) break;
+            for (rr.entries) |e| {
+                const tenant = e.key["plan/".len..];
+                self.applyPlanLocal(tenant, e.value) catch |err| {
+                    std.log.warn("cp directory replay: bad plan {s}: {s}", .{ tenant, @errorName(err) });
+                };
+            }
+            const done = rr.entries.len < 256;
+            const last = rr.entries[rr.entries.len - 1].key;
+            a.free(cursor);
+            cursor = try a.dupe(u8, last);
+            if (done) break;
+        }
     }
 
     /// Parse a `cluster/*` value (`url1,url2,…`) and upsert the cluster into
@@ -397,6 +429,8 @@ pub const Directory = struct {
             try self.applyClusterFromJoined(key["cluster/".len..], value);
         } else if (std.mem.startsWith(u8, key, "placement/")) {
             try self.applyPlacementFromValue(key["placement/".len..], value);
+        } else if (std.mem.startsWith(u8, key, "plan/")) {
+            try self.applyPlanLocal(key["plan/".len..], value);
         }
     }
 
@@ -591,6 +625,50 @@ pub const Directory = struct {
         return self.writePlacement(tenant_id, cluster_id, state);
     }
 
+    // ── Plan / limits (admin-plane writes, DP reads) ─────────────────
+
+    /// Set a tenant's opaque plan/limits blob (`plan/{tenant} = value`). The
+    /// value is whatever the admin app authors (a `{tier, overrides}` JSON
+    /// string); the CP never parses it. Replicates before it takes effect
+    /// (the apply observer materializes it on the leader AND every follower).
+    /// Placement-independent — it does NOT move with the tenant's cluster.
+    pub fn setPlan(self: *Directory, tenant_id: []const u8, value: []const u8) Error!void {
+        if (tenant_id.len == 0) return Error.BadConfig;
+        const a = self.allocator;
+        const key = std.fmt.allocPrint(a, "plan/{s}", .{tenant_id}) catch return Error.OutOfMemory;
+        defer a.free(key);
+        return self.applyDirWrite(key, value);
+    }
+
+    /// A tenant's plan blob as an OWNED copy (caller frees), or null if unset.
+    /// Copies under the lock because, unlike cluster slices, a plan value can
+    /// be replaced (freed) by a concurrent apply — so a borrowed slice held
+    /// past the lock would be unsafe.
+    pub fn planForOwned(self: *Directory, a: std.mem.Allocator, tenant_id: []const u8) Error!?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const v = self.plans.get(tenant_id) orelse return null;
+        return a.dupe(u8, v) catch return Error.OutOfMemory;
+    }
+
+    /// Upsert a plan blob into the in-memory projection (no replication). The
+    /// committed-state applier, shared by replay + the post-commit observer.
+    fn applyPlanLocal(self: *Directory, tenant: []const u8, value: []const u8) Error!void {
+        const a = self.allocator;
+        const val_dup = a.dupe(u8, value) catch return Error.OutOfMemory;
+        errdefer a.free(val_dup);
+        const gop = self.plans.getOrPut(a, tenant) catch return Error.OutOfMemory;
+        if (!gop.found_existing) {
+            gop.key_ptr.* = a.dupe(u8, tenant) catch {
+                _ = self.plans.remove(tenant);
+                return Error.OutOfMemory;
+            };
+        } else {
+            a.free(gop.value_ptr.*);
+        }
+        gop.value_ptr.* = val_dup;
+    }
+
     // ── Static config seeding ────────────────────────────────────────
 
     /// Seed clusters from a config string of the form
@@ -683,6 +761,34 @@ test "directory: move flips placement (the Phase-4 seam)" {
     try testing.expectEqualStrings("c2", dir.clusterFor("t").?.id);
     // node origin follows the new cluster.
     try testing.expectEqualStrings("http://h:2", dir.clusterFor("t").?.nodes[0]);
+}
+
+test "directory: setPlan + planForOwned round-trip, update, unset→null" {
+    var dir = Directory.init(testing.allocator);
+    defer dir.deinit();
+    const a = testing.allocator;
+
+    // unset → null
+    try testing.expect((try dir.planForOwned(a, "acme")) == null);
+
+    // set → read back
+    try dir.setPlan("acme", "{\"tier\":\"pro\"}");
+    {
+        const p = (try dir.planForOwned(a, "acme")).?;
+        defer a.free(p);
+        try testing.expectEqualStrings("{\"tier\":\"pro\"}", p);
+    }
+
+    // update replaces (old value freed — no leak under the testing allocator)
+    try dir.setPlan("acme", "{\"tier\":\"enterprise\"}");
+    {
+        const p = (try dir.planForOwned(a, "acme")).?;
+        defer a.free(p);
+        try testing.expectEqualStrings("{\"tier\":\"enterprise\"}", p);
+    }
+
+    // unrelated tenant stays null; plan is placement-independent
+    try testing.expect((try dir.planForOwned(a, "other")) == null);
 }
 
 test "directory: multi-node cluster carries every node origin" {
