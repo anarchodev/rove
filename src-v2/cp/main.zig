@@ -136,47 +136,12 @@ fn parseCpMultiNode(a: std.mem.Allocator) !?CpMultiNode {
     };
 }
 
-// ── Host → tenant index (the CP domain index) ─────────────────────────
-const HostMap = struct {
-    allocator: std.mem.Allocator,
-    /// host → tenant store id. Both owned dups.
-    map: std.StringHashMapUnmanaged([]u8) = .empty,
-
-    fn init(allocator: std.mem.Allocator) HostMap {
-        return .{ .allocator = allocator };
-    }
-
-    fn deinit(self: *HostMap) void {
-        var it = self.map.iterator();
-        while (it.next()) |e| {
-            self.allocator.free(e.key_ptr.*);
-            self.allocator.free(e.value_ptr.*);
-        }
-        self.map.deinit(self.allocator);
-    }
-
-    /// Parse `host=tenant;host=tenant;…`.
-    fn seed(self: *HostMap, config: []const u8) !void {
-        var it = std.mem.tokenizeScalar(u8, config, ';');
-        while (it.next()) |raw| {
-            const entry = std.mem.trim(u8, raw, " \t\r\n");
-            if (entry.len == 0) continue;
-            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return error.BadConfig;
-            const host = std.mem.trim(u8, entry[0..eq], " \t");
-            const tenant = std.mem.trim(u8, entry[eq + 1 ..], " \t");
-            if (host.len == 0 or tenant.len == 0) return error.BadConfig;
-            const h_dup = try self.allocator.dupe(u8, host);
-            errdefer self.allocator.free(h_dup);
-            const t_dup = try self.allocator.dupe(u8, tenant);
-            errdefer self.allocator.free(t_dup);
-            try self.map.put(self.allocator, h_dup, t_dup);
-        }
-    }
-
-    fn tenantFor(self: *HostMap, host: []const u8) ?[]const u8 {
-        return self.map.get(host);
-    }
-};
+// The domain index (host → tenant) is no longer a static in-memory map: it
+// moved into the replicated `__directory__` group (`directory.zig` `hosts`
+// projection + `host/{host}` keys, gap #2), so it survives a CP restart, spans
+// the HA nodes, and accepts runtime custom-domain provisioning via the
+// `/_control/host` control write. The static `REWIND_HOSTS` env is now seeded
+// INTO the directory (see `main`).
 
 // ── Header lookup over h2 ReqHeaders ──────────────────────────────────
 fn headerValue(rh: h2.ReqHeaders, name: []const u8) ?[]const u8 {
@@ -220,7 +185,6 @@ const BackendResp = struct {
 const Router = struct {
     allocator: std.mem.Allocator,
     directory: *Directory,
-    hosts: *HostMap,
     /// Shared secret presented to backends' `/_system/v2-*` move surface,
     /// and required (via `X-Rewind-Move-Secret`) on `/_control/move`.
     /// Null disables the move control surface (503).
@@ -327,16 +291,23 @@ const Router = struct {
             try replyStatus(server, ent, sid, sess, 400);
             return;
         };
-        const tenant = self.hosts.tenantFor(host) orelse {
+        const a = self.allocator;
+        // Domain index (gap #2): host → tenant from the replicated directory.
+        // Owned copy (a host's tenant can be replaced by a concurrent apply,
+        // and `resolve` re-takes the directory mutex), freed after we resolve.
+        const tenant = (self.directory.hostTenantForOwned(a, host) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        }) orelse {
             try replyStatus(server, ent, sid, sess, 404);
             return;
         };
+        defer a.free(tenant);
         const resolution = self.directory.resolve(tenant) orelse {
             try replyStatus(server, ent, sid, sess, 404);
             return;
         };
 
-        const a = self.allocator;
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(a);
         const w = buf.writer(a);
@@ -391,7 +362,8 @@ const Router = struct {
         const is_move = std.mem.eql(u8, path, "/_control/move");
         const is_move_live = std.mem.eql(u8, path, "/_control/move-live");
         const is_plan = std.mem.eql(u8, path, "/_control/plan");
-        if (!(is_move or is_move_live or is_plan) or !std.mem.eql(u8, method_s, "POST")) {
+        const is_host = std.mem.eql(u8, path, "/_control/host");
+        if (!(is_move or is_move_live or is_plan or is_host) or !std.mem.eql(u8, method_s, "POST")) {
             try replyStatus(server, ent, sid, sess, 404);
             return;
         }
@@ -418,6 +390,8 @@ const Router = struct {
         const body: []const u8 = if (rb.data) |d| d[0..rb.len] else &.{};
         if (is_plan)
             try self.handlePlan(server, ent, sid, sess, body)
+        else if (is_host)
+            try self.handleHost(server, ent, sid, sess, body)
         else if (is_move_live)
             try self.handleMoveLive(server, ent, sid, sess, body)
         else
@@ -455,6 +429,37 @@ const Router = struct {
         // the tenant's next move/attach. Unplaced tenant → nothing to push.
         self.pushPlanToServingCluster(tenant, parsed.value.plan);
         const msg = std.fmt.allocPrint(a, "plan set for {s}\n", .{tenant}) catch {
+            try replyStatus(server, ent, sid, sess, 200);
+            return;
+        };
+        try replyText(server, ent, sid, sess, 200, msg);
+    }
+
+    /// Map a host to a tenant: `POST /_control/host {host, tenant}` (gap #2,
+    /// the replicated domain index). A directory WRITE: leader-gated, so a
+    /// follower has already forwarded to the leader by the time we get here.
+    /// Routing is a pure CP read (`/_cp/route`), so unlike a plan change there
+    /// is nothing to push to a DP — the front door picks up the new mapping on
+    /// its next CP route query (subject to its route-cache TTL).
+    fn handleHost(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
+        const a = self.allocator;
+        var parsed = std.json.parseFromSlice(struct {
+            host: []const u8,
+            tenant: []const u8,
+        }, a, body, .{ .ignore_unknown_fields = true }) catch {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        };
+        defer parsed.deinit();
+        if (parsed.value.host.len == 0 or parsed.value.tenant.len == 0) {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        }
+        self.directory.setHost(parsed.value.host, parsed.value.tenant) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        const msg = std.fmt.allocPrint(a, "host {s} -> {s}\n", .{ parsed.value.host, parsed.value.tenant }) catch {
             try replyStatus(server, ent, sid, sess, 200);
             return;
         };
@@ -1147,6 +1152,7 @@ pub fn main() !void {
         if (directory.isEmpty()) {
             try directory.seedClusters(getEnvCfg("REWIND_CLUSTERS"));
             try directory.seedPlacements(getEnvCfg("REWIND_PLACEMENT"));
+            try directory.seedHosts(getEnvCfg("REWIND_HOSTS"));
             std.log.info("rewind-cp: seeded directory from static config", .{});
         } else {
             std.log.info("rewind-cp: directory replayed from {s} (skipping static seed)", .{cp_data_dir});
@@ -1181,6 +1187,13 @@ pub fn main() !void {
                     },
                     else => return e,
                 };
+                directory.seedHosts(getEnvCfg("REWIND_HOSTS")) catch |e| switch (e) {
+                    error.Replication => {
+                        std.Thread.sleep(100 * std.time.ns_per_ms);
+                        continue;
+                    },
+                    else => return e,
+                };
                 seeded = true;
                 break;
             }
@@ -1205,10 +1218,6 @@ pub fn main() !void {
     const cp_peer_urls = try parseUrlList(allocator, getEnvCfg("REWIND_CP_PEER_URLS"));
     defer freeUrlList(allocator, cp_peer_urls);
 
-    var hosts = HostMap.init(allocator);
-    defer hosts.deinit();
-    try hosts.seed(getEnvCfg("REWIND_HOSTS"));
-
     // V2 Phase 4 — shared secret for the cluster-internal move surface. The CP
     // presents it to backends' `/_system/v2-*` endpoints and requires it on
     // `/_control/move`. Unset → move control disabled.
@@ -1230,7 +1239,7 @@ pub fn main() !void {
     }, .{ .tls_config = null });
     defer server.destroy();
 
-    var router = Router{ .allocator = allocator, .directory = directory, .hosts = &hosts, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx };
+    var router = Router{ .allocator = allocator, .directory = directory, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx };
 
     // Periodic stuck-move reconciliation on the directory leader (between
     // request batches; never overlaps a synchronous move — see
