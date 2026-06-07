@@ -127,8 +127,14 @@ front-door count == voter count (inverted scaling). **Done:**
 
 1. ~~**Split the CP out** + front door becomes a stateless read-replica.~~ ✅
    **SHIPPED** — `rewind-cp` + slimmed `rewind-front`, all 9 edge smokes green.
-2. **Plan/limits** (gap #1) — step 1 (CP axis) ✅ `2ddb662`; remaining: step 2
-   (DP delivery via attach + push) → step 3 (DP enforcement, `plan-tiers.md`).
+2. **Plan/limits** (gap #1) — step 1 (CP axis) ✅ `2ddb662`; step 2 (DP delivery
+   via attach handshake + live push) ✅ (`src/js/plan.zig` tier table +
+   `effective()`; `TenantSlot.plan`/`plan_gen` cache; `v2-attach` carries
+   `X-Rewind-Plan` + `POST /_system/v2-plan` live push; `cp_plan_delivery_smoke`
+   green). Remaining: step 3 (DP ENFORCEMENT — wire the cached `slot.plan` into
+   the three levers: rate limiter caps + generation-refresh, 413 body gate,
+   retention read-clamp; `plan-tiers.md`). The delivery + cache are done, so
+   step 3 is local wiring with no new state.
 3. **Replicated domain index** (gap #2) — same directory group, sibling axis.
 4. **Edge TLS termination + cert-state-in-CP + single ACME issuer** (gap #3) —
    per `v2-front-door-architecture.md`.

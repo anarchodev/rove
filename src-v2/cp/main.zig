@@ -203,6 +203,9 @@ fn methodFrom(s: []const u8) ?curl.Method {
 
 const MOVE_SECRET_HEADER = "X-Rewind-Move-Secret";
 const TENANT_HEADER = "X-Rewind-Tenant";
+/// Carries a tenant's opaque plan blob on `v2-attach` (delivery rides the move
+/// handshake) and `v2-plan` (live push). See docs/v2-cp-operational-state.md.
+const PLAN_HEADER = "X-Rewind-Plan";
 
 /// One backend response the orchestrator cares about: status + an owned
 /// copy of the body (the source bundle, relayed into the attach call).
@@ -445,11 +448,40 @@ const Router = struct {
             try replyStatus(server, ent, sid, sess, 500);
             return;
         };
+        // Live single-target push: the CP knows the tenant's current placement,
+        // so it delivers the new plan to the ONE serving cluster's nodes (which
+        // bump their slot's plan generation). Best-effort — the CP is now the
+        // durable source of truth; a failed push just means the change rides
+        // the tenant's next move/attach. Unplaced tenant → nothing to push.
+        self.pushPlanToServingCluster(tenant, parsed.value.plan);
         const msg = std.fmt.allocPrint(a, "plan set for {s}\n", .{tenant}) catch {
             try replyStatus(server, ent, sid, sess, 200);
             return;
         };
         try replyText(server, ent, sid, sess, 200, msg);
+    }
+
+    /// Deliver a tenant's plan blob to its CURRENT serving cluster — a live
+    /// `POST /_system/v2-plan {tenant, plan}` to every node of the cluster the
+    /// directory resolves the tenant to (the plan cache is per-node slot state,
+    /// so fan out like attach). Best-effort: logs per-node failures, never
+    /// blocks the control reply on delivery. No-op if the tenant is unplaced
+    /// (the plan rides its first attach instead).
+    fn pushPlanToServingCluster(self: *Router, tenant: []const u8, plan: []const u8) void {
+        const a = self.allocator;
+        const res = self.directory.resolve(tenant) orelse return; // unplaced
+        const payload = std.json.Stringify.valueAlloc(a, .{ .tenant = tenant, .plan = plan }, .{}) catch return;
+        defer a.free(payload);
+        for (res.cluster.nodes) |base| {
+            if (self.backendCall(base, "/_system/v2-plan", .POST, payload, &.{})) |resp| {
+                var r = resp;
+                defer r.deinit(a);
+                if (r.status != 204)
+                    std.log.warn("rewind-cp: v2-plan push for {s} on {s} → {d}", .{ tenant, base, r.status });
+            } else |err| {
+                std.log.warn("rewind-cp: v2-plan push for {s} on {s} failed: {s}", .{ tenant, base, @errorName(err) });
+            }
+        }
     }
 
     /// Forward a `/_control/*` request to the CP node that currently leads the
@@ -474,7 +506,7 @@ const Router = struct {
         defer a.free(leader);
         const method = methodFrom(headerValue(rh, ":method") orelse "POST") orelse .POST;
         const body: []const u8 = if (rb.data) |d| d[0..rb.len] else &.{};
-        const resp = self.backendCall(leader, path, method, body, null) catch |err| {
+        const resp = self.backendCall(leader, path, method, body, &.{}) catch |err| {
             std.log.warn("rewind-cp: forward control to CP leader {s} failed: {s}", .{ leader, @errorName(err) });
             try replyStatus(server, ent, sid, sess, 502);
             return;
@@ -504,7 +536,7 @@ const Router = struct {
             if (self.self_cp_idx) |self_i| {
                 if (i == self_i) continue;
             }
-            const resp = self.backendCall(base, "/_cp/leader", .GET, "", null) catch continue;
+            const resp = self.backendCall(base, "/_cp/leader", .GET, "", &.{}) catch continue;
             const ok = resp.status == 200;
             var r = resp;
             r.deinit(a);
@@ -597,8 +629,12 @@ const Router = struct {
         // 2. Attach on EVERY destination node (the group is formed across the
         //    whole destination cluster: each node loads the bundle + creates
         //    its incarnation at the migration epoch). All must 204; on any
-        //    failure, evict the nodes that did attach + resume the source.
-        if (!self.attachToAll(dest_nodes, dump.body, tenant)) {
+        //    failure, evict the nodes that did attach + resume the source. The
+        //    tenant's plan blob (if any) rides attach so the destination
+        //    enforces the right limits from its first request.
+        const plan_blob = self.directory.planForOwned(a, tenant) catch null;
+        defer if (plan_blob) |p| a.free(p);
+        if (!self.attachToAll(dest_nodes, dump.body, tenant, plan_blob)) {
             self.evictAll(tenant, dest_nodes, tbody);
             self.resumeAll(tenant, src_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
@@ -647,7 +683,7 @@ const Router = struct {
     fn bundleFromLeader(self: *Router, src_nodes: []const []const u8, tbody: []const u8) ?BackendResp {
         const a = self.allocator;
         for (src_nodes) |base| {
-            const resp = self.backendCall(base, "/_system/v2-bundle", .POST, tbody, null) catch |err| {
+            const resp = self.backendCall(base, "/_system/v2-bundle", .POST, tbody, &.{}) catch |err| {
                 std.log.warn("rewind-cp: v2-bundle on {s} failed: {s}", .{ base, @errorName(err) });
                 continue;
             };
@@ -658,14 +694,23 @@ const Router = struct {
         return null;
     }
 
-    /// Fan a `/_system/v2-attach` (bundle + `X-Rewind-Tenant`) out to every
-    /// destination node. True only if all returned 204 (idempotent
-    /// re-attach included). On the first failure returns false; the caller
-    /// evicts the partially-attached set.
-    fn attachToAll(self: *Router, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8) bool {
+    /// Fan a `/_system/v2-attach` (bundle + `X-Rewind-Tenant`, plus the
+    /// tenant's `X-Rewind-Plan` blob when set) out to every destination node.
+    /// The plan rides attach so the destination enforces the right limits from
+    /// the first post-move request (docs/v2-cp-operational-state.md). True only
+    /// if all returned 204 (idempotent re-attach included). On the first
+    /// failure returns false; the caller evicts the partially-attached set.
+    fn attachToAll(self: *Router, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8, plan: ?[]const u8) bool {
         const a = self.allocator;
+        var hdrs: [2]curl.Header = undefined;
+        hdrs[0] = .{ .name = TENANT_HEADER, .value = tenant };
+        var nh: usize = 1;
+        if (plan) |p| {
+            hdrs[nh] = .{ .name = PLAN_HEADER, .value = p };
+            nh += 1;
+        }
         for (dest_nodes) |base| {
-            const resp = self.backendCall(base, "/_system/v2-attach", .POST, bundle, tenant) catch |err| {
+            const resp = self.backendCall(base, "/_system/v2-attach", .POST, bundle, hdrs[0..nh]) catch |err| {
                 std.log.warn("rewind-cp: v2-attach on {s} failed: {s}", .{ base, @errorName(err) });
                 return false;
             };
@@ -689,7 +734,7 @@ const Router = struct {
         const deadline: i128 = std.time.nanoTimestamp() + 15 * std.time.ns_per_s;
         while (std.time.nanoTimestamp() < deadline) {
             for (dest_nodes) |base| {
-                const resp = self.backendCall(base, suffix, .GET, "", null) catch continue;
+                const resp = self.backendCall(base, suffix, .GET, "", &.{}) catch continue;
                 var r = resp;
                 r.deinit(a);
                 if (r.status == 200) return true;
@@ -704,7 +749,7 @@ const Router = struct {
     fn evictAll(self: *Router, tenant: []const u8, nodes: []const []const u8, tbody: []const u8) void {
         const a = self.allocator;
         for (nodes) |base| {
-            if (self.backendCall(base, "/_system/v2-evict", .POST, tbody, null)) |ev| {
+            if (self.backendCall(base, "/_system/v2-evict", .POST, tbody, &.{})) |ev| {
                 var e2 = ev;
                 e2.deinit(a);
             } else |err| {
@@ -720,7 +765,7 @@ const Router = struct {
         const a = self.allocator;
         self.directory.abortMove(tenant) catch {};
         for (src_nodes) |base| {
-            if (self.backendCall(base, "/_system/v2-resume", .POST, tbody, null)) |r| {
+            if (self.backendCall(base, "/_system/v2-resume", .POST, tbody, &.{})) |r| {
                 var rr = r;
                 rr.deinit(a);
             } else |err| {
@@ -831,7 +876,11 @@ const Router = struct {
         defer a.free(tbody);
 
         // 1. Empty-attach the dest (no bundle → just the group + instance).
-        if (!self.attachToAll(dest_nodes, "", tenant)) {
+        //    The plan blob (if any) rides attach so the dest enforces limits
+        //    from the first forwarded write onward.
+        const plan_blob = self.directory.planForOwned(a, tenant) catch null;
+        defer if (plan_blob) |p| a.free(p);
+        if (!self.attachToAll(dest_nodes, "", tenant, plan_blob)) {
             self.evictAll(tenant, dest_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;
@@ -896,7 +945,7 @@ const Router = struct {
         const deadline: i128 = std.time.nanoTimestamp() + 15 * std.time.ns_per_s;
         while (std.time.nanoTimestamp() < deadline) {
             for (dest_nodes) |base| {
-                const resp = self.backendCall(base, suffix, .GET, "", null) catch continue;
+                const resp = self.backendCall(base, suffix, .GET, "", &.{}) catch continue;
                 var r = resp;
                 r.deinit(a);
                 if (r.status == 200) return a.dupe(u8, base) catch null;
@@ -913,7 +962,7 @@ const Router = struct {
         const fb = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\",\"dest\":\"{s}\"}}", .{ tenant, dest_url }) catch return false;
         defer a.free(fb);
         for (src_nodes) |base| {
-            const resp = self.backendCall(base, "/_system/v2-forward-begin", .POST, fb, null) catch continue;
+            const resp = self.backendCall(base, "/_system/v2-forward-begin", .POST, fb, &.{}) catch continue;
             const ok = resp.status == 204;
             var r = resp;
             r.deinit(a);
@@ -928,7 +977,7 @@ const Router = struct {
         const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch return;
         defer a.free(tbody);
         for (src_nodes) |base| {
-            if (self.backendCall(base, "/_system/v2-forward-end", .POST, tbody, null)) |r| {
+            if (self.backendCall(base, "/_system/v2-forward-end", .POST, tbody, &.{})) |r| {
                 const ok = r.status == 204;
                 var rr = r;
                 rr.deinit(a);
@@ -942,7 +991,7 @@ const Router = struct {
     fn snapshotFromLeader(self: *Router, src_nodes: []const []const u8, tbody: []const u8) ?BackendResp {
         const a = self.allocator;
         for (src_nodes) |base| {
-            const resp = self.backendCall(base, "/_system/v2-snapshot", .POST, tbody, null) catch continue;
+            const resp = self.backendCall(base, "/_system/v2-snapshot", .POST, tbody, &.{}) catch continue;
             if (resp.status == 200) return resp;
             var r = resp;
             r.deinit(a);
@@ -954,7 +1003,7 @@ const Router = struct {
     fn loadMergeToAll(self: *Router, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8) bool {
         const a = self.allocator;
         for (dest_nodes) |base| {
-            const resp = self.backendCall(base, "/_system/v2-load-merge", .POST, bundle, tenant) catch |err| {
+            const resp = self.backendCall(base, "/_system/v2-load-merge", .POST, bundle, &.{.{ .name = TENANT_HEADER, .value = tenant }}) catch |err| {
                 std.log.warn("rewind-cp: v2-load-merge on {s} failed: {s}", .{ base, @errorName(err) });
                 return false;
             };
@@ -966,15 +1015,15 @@ const Router = struct {
     }
 
     /// Blocking libcurl call to a backend's move surface, presenting the
-    /// move secret (+ optional `X-Rewind-Tenant`). Returns status + an
-    /// owned copy of the response body.
+    /// move secret plus any `extra_headers` (e.g. `X-Rewind-Tenant`,
+    /// `X-Rewind-Plan`). Returns status + an owned copy of the response body.
     fn backendCall(
         self: *Router,
         base_url: []const u8,
         path_suffix: []const u8,
         method: curl.Method,
         body: []const u8,
-        tenant_hdr: ?[]const u8,
+        extra_headers: []const curl.Header,
     ) !BackendResp {
         const a = self.allocator;
         const url = try std.fmt.allocPrint(a, "{s}{s}", .{ base_url, path_suffix });
@@ -983,7 +1032,7 @@ const Router = struct {
         var headers: std.ArrayListUnmanaged(curl.Header) = .empty;
         defer headers.deinit(a);
         try headers.append(a, .{ .name = MOVE_SECRET_HEADER, .value = self.move_secret.? });
-        if (tenant_hdr) |t| try headers.append(a, .{ .name = TENANT_HEADER, .value = t });
+        for (extra_headers) |h| try headers.append(a, h);
 
         var easy = try curl.Easy.init(a);
         defer easy.deinit();
