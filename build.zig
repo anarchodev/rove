@@ -869,7 +869,6 @@ pub fn build(b: *std.Build) void {
     });
     v2_smoke_mod.addImport("raft_rs_zig", raft_dep.module("raft_rs_zig"));
     const v2_smoke_test = b.addTest(.{ .root_module = v2_smoke_mod });
-    v2_smoke_test.linkLibrary(raft_dep.artifact("raft_rs_zig"));
     const run_v2_smoke_test = b.addRunArtifact(v2_smoke_test);
     const v2_test_step = b.step("v2-test", "V2 raft substrate tests (Phase-0 smoke + Phase-1 per-tenant pump)");
     v2_test_step.dependOn(&run_v2_smoke_test.step);
@@ -912,7 +911,6 @@ pub fn build(b: *std.Build) void {
     v2_hib_bench_mod.addImport("raft_rs_zig", raft_dep.module("raft_rs_zig"));
     v2_hib_bench_mod.addImport("node", v2_node_mod);
     const v2_hib_bench = b.addExecutable(.{ .name = "v2-hibernation-bench", .root_module = v2_hib_bench_mod });
-    v2_hib_bench.linkLibrary(raft_dep.artifact("raft_rs_zig"));
     const v2_hib_bench_step = b.step("v2-hibernation-bench", "Build the V2 Phase-6 hibernation pump-cost microbench");
     v2_hib_bench_step.dependOn(&b.addInstallArtifact(v2_hib_bench, .{}).step);
 
@@ -942,9 +940,7 @@ pub fn build(b: *std.Build) void {
     v2_transport_mod.addImport("raft_rs_zig", raft_dep.module("raft_rs_zig"));
     v2_transport_mod.addImport("raft-net", raftnet_mod);
     const v2_transport_test = b.addTest(.{ .root_module = v2_transport_mod });
-    v2_transport_test.linkLibrary(raft_dep.artifact("raft_rs_zig"));
     v2_test_step.dependOn(&b.addRunArtifact(v2_transport_test).step);
-    v2_node_test.linkLibrary(raft_dep.artifact("raft_rs_zig"));
     const run_v2_node_test = b.addRunArtifact(v2_node_test);
     v2_test_step.dependOn(&run_v2_node_test.step);
 
@@ -964,7 +960,6 @@ pub fn build(b: *std.Build) void {
     v2_bridge_mod.addImport("kvlimbs", kv_mod);
     v2_bridge_mod.addImport("raft-net", raftnet_mod);
     const v2_bridge_test = b.addTest(.{ .root_module = v2_bridge_mod });
-    v2_bridge_test.linkLibrary(raft_dep.artifact("raft_rs_zig"));
     const run_v2_bridge_test = b.addRunArtifact(v2_bridge_test);
     v2_test_step.dependOn(&run_v2_bridge_test.step);
 
@@ -982,7 +977,6 @@ pub fn build(b: *std.Build) void {
     });
     v2_cp_dir_mod.addImport("bridge", v2_bridge_mod);
     const v2_cp_dir_test = b.addTest(.{ .root_module = v2_cp_dir_mod });
-    v2_cp_dir_test.linkLibrary(raft_dep.artifact("raft_rs_zig"));
     const run_v2_cp_dir_test = b.addRunArtifact(v2_cp_dir_test);
     v2_test_step.dependOn(&run_v2_cp_dir_test.step);
 
@@ -994,7 +988,6 @@ pub fn build(b: *std.Build) void {
     // loop46 is dead on this branch) to drive the seam cut.
     js_mod.addImport("bridge", v2_bridge_mod);
     const js_v2_test = b.addTest(.{ .root_module = js_mod });
-    js_v2_test.linkLibrary(raft_dep.artifact("raft_rs_zig"));
     const js_v2_step = b.step("js-v2", "Compile rove-js against the V2 facade + bridge (Phase 2c)");
     js_v2_step.dependOn(&b.addRunArtifact(js_v2_test).step);
 
@@ -1025,7 +1018,6 @@ pub fn build(b: *std.Build) void {
     rewind_mod.linkSystemLibrary("ssl", .{});
     rewind_mod.linkSystemLibrary("crypto", .{});
     const rewind_exe = b.addExecutable(.{ .name = "rewind", .root_module = rewind_mod });
-    rewind_exe.linkLibrary(raft_dep.artifact("raft_rs_zig"));
     const rewind_step = b.step("rewind", "Build the V2 rewind worker binary (Phase 2d)");
     rewind_step.dependOn(&b.addInstallArtifact(rewind_exe, .{}).step);
 
@@ -1052,7 +1044,6 @@ pub fn build(b: *std.Build) void {
     front_mod.linkSystemLibrary("crypto", .{});
     front_mod.linkSystemLibrary("curl", .{});
     const front_exe = b.addExecutable(.{ .name = "rewind-front", .root_module = front_mod });
-    front_exe.linkLibrary(raft_dep.artifact("raft_rs_zig"));
     const front_step = b.step("rewind-front", "Build the V2 front-door binary (Phase 3b)");
     front_step.dependOn(&b.addInstallArtifact(front_exe, .{}).step);
 }
