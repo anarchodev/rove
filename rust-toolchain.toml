@@ -1,0 +1,8 @@
+# Pin the Rust toolchain used to build the raft-sys staticlib (via the
+# raft-rs-zig dependency's `cargo build`, which Zig runs with cwd = this repo
+# root). Deterministic builds: avoids floating with whatever `stable` happens to
+# be on the machine. 1.96.0 is verified green with the raft-sys opt-level=1 fix
+# (see docs and raft-rs-zig 5092bc6). Bump deliberately, not implicitly.
+[toolchain]
+channel = "1.96.0"
+profile = "minimal"
