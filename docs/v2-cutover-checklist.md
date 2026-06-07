@@ -36,13 +36,22 @@ concentrated at the **edge** (front door) and in **operational state**
 
 ## 🔴 Real parity gaps — block cutover
 
-**1. Plan / limits enforcement — designed, not built.** V2 worker runs
-`rate_limit_caps = .{}` (empty defaults, `main.zig:141`) — no per-tenant plan
-resolution, no body-size `413`, no retention clamp. V1 wires `--rate-limit-*` +
-`limiter.zig` + plan lookups. This is the entire
-[`v2-cp-operational-state.md`](v2-cp-operational-state.md) build (steps 1–3,
-"Not built"): `plan/{tenant}` in the CP directory, delivery via attach handshake
-+ single-target push, DP enforcement on `TenantSlot`. **Biggest single gap.**
+**1. Plan / limits — CP foundation SHIPPED; DP delivery + enforcement remain.**
+The [`v2-cp-operational-state.md`](v2-cp-operational-state.md) build, in 3 steps:
+   - **Step 1 (CP-side) — ✅ SHIPPED** (`2ddb662`). `plan/{tenant}` is a sibling
+     axis in the CP `__directory__` group: `directory.zig` `plans` projection +
+     `setPlan`/`planForOwned`; `POST /_control/plan` (admin-gated write) + `GET
+     /_cp/plan?tenant=` (DP read); replicated via the apply observer + durable
+     across restart. Proven by `scripts/cp_plan_smoke.py` + an inline unit test.
+     The CP stores the `{tier, overrides}` blob verbatim (dumb CP).
+   - **Step 2 (delivery) — TODO.** The worker learns its plan: cold-start/move →
+     plan rides the attach handshake (`v2_move.zig`); live change → CP
+     single-target push to the serving cluster → DP plan-generation bump.
+   - **Step 3 (enforcement) — TODO** (`plan-tiers.md` verbatim). V2 worker still
+     runs `rate_limit_caps = .{}` (`rewind/main.zig:141`). New `src/js/plan.zig`
+     (`Tier` table + `effective`); cache `PlanLimits` on `TenantSlot`; wire
+     `limiter.zig` per-instance caps + generation-refresh; incremental `413` body
+     gate; server-side retention clamp on log/tape queries.
 
 **2. Domain → tenant routing is a static env map.** Front door resolves host via
 `HostMap` seeded from `REWIND_HOSTS` (`front/main.zig:165,1273`). V1 has a
@@ -118,8 +127,8 @@ front-door count == voter count (inverted scaling). **Done:**
 
 1. ~~**Split the CP out** + front door becomes a stateless read-replica.~~ ✅
    **SHIPPED** — `rewind-cp` + slimmed `rewind-front`, all 9 edge smokes green.
-2. **Plan/limits in CP + DP enforcement** (gap #1) — `v2-cp-operational-state.md`
-   steps 1–3.
+2. **Plan/limits** (gap #1) — step 1 (CP axis) ✅ `2ddb662`; remaining: step 2
+   (DP delivery via attach + push) → step 3 (DP enforcement, `plan-tiers.md`).
 3. **Replicated domain index** (gap #2) — same directory group, sibling axis.
 4. **Edge TLS termination + cert-state-in-CP + single ACME issuer** (gap #3) —
    per `v2-front-door-architecture.md`.
