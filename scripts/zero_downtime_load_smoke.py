@@ -14,12 +14,12 @@ flip→evict window). The exit criteria:
     eventual owner via one of: the snapshot (pre-forward-begin), a synchronous
     forward (during the overlap), or a direct write (post-flip).
 
-    front door :19030   (move-live orchestrator + CP directory)
+    rewind-cp  :19030   (move-live orchestrator + CP directory)
     cluster-A  :19031   (source)
     cluster-B  :19032   (destination)
 
 Requires S3 env — `set -a; . ./.env; set +a` first.
-Build:  `zig build rewind && zig build rewind-front`
+Build:  `zig build rewind && zig build rewind-cp`
 """
 
 import json
@@ -30,11 +30,13 @@ import sys
 import threading
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from v2_topology import spawn_cp, CP_BIN
+
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin")
 REWIND = os.path.join(BINDIR, "rewind")
-FRONT = os.path.join(BINDIR, "rewind-front")
 
-PF, PA, PB = 19030, 19031, 19032
+PCP, PA, PB = 19030, 19031, 19032
 SECRET = "rewindmovesecretpadding0123456789abcdef0"
 A_URL, B_URL = f"http://127.0.0.1:{PA}", f"http://127.0.0.1:{PB}"
 HOST = "load.localhost"
@@ -60,16 +62,6 @@ def spawn_rewind(name, port, data_dir, admin_domain):
     env["REWIND_ADMIN_DOMAIN"] = admin_domain
     env["REWIND_MOVE_SECRET"] = SECRET
     return _spawn(name, [REWIND, data_dir, str(port)], env)
-
-
-def spawn_front():
-    env = dict(os.environ)
-    env["REWIND_CLUSTERS"] = f"cluster-A={A_URL};cluster-B={B_URL}"
-    env["REWIND_HOSTS"] = f"{HOST}={TENANT}"
-    env["REWIND_PLACEMENT"] = f"{TENANT}=cluster-A"
-    env["REWIND_MOVE_SECRET"] = SECRET
-    env["REWIND_CP_DATA_DIR"] = f"/tmp/zdl-cp-{os.getpid()}"
-    return _spawn("front", [FRONT, str(PF)], env)
 
 
 def _await(name, logf, needle):
@@ -100,7 +92,7 @@ def hdr():
 
 def cp_owner_port():
     """Ask the CP who owns HOST; return the (single-node) owner's port, or None."""
-    code, body = _curl([f"http://127.0.0.1:{PF}/_cp/route?host={HOST}", *hdr()])
+    code, body = _curl([f"http://127.0.0.1:{PCP}/_cp/route?host={HOST}", *hdr()])
     if code != 200:
         return None
     try:
@@ -121,7 +113,7 @@ def kv_get(port, key):
 
 
 def move_live(dest):
-    return _curl(["-X", "POST", f"http://127.0.0.1:{PF}/_control/move-live", *hdr(),
+    return _curl(["-X", "POST", f"http://127.0.0.1:{PCP}/_control/move-live", *hdr(),
                   "-H", "Content-Type: application/json",
                   "--data", f'{{"tenant":"{TENANT}","dest":"{dest}"}}'])
 
@@ -164,9 +156,9 @@ def stop_all():
 
 
 def main():
-    for b in (REWIND, FRONT):
+    for b in (REWIND, CP_BIN):
         if not os.path.exists(b):
-            raise SystemExit(f"{b} missing — `zig build rewind && zig build rewind-front`")
+            raise SystemExit(f"{b} missing — `zig build rewind && zig build rewind-cp`")
     if not os.environ.get("S3_ENDPOINT"):
         raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
 
@@ -184,8 +176,16 @@ def main():
             fails.append(label)
 
     try:
-        print("boot: front + cluster-A (source) + cluster-B (dest)")
-        spawn_front()
+        print("boot: CP + cluster-A (source) + cluster-B (dest)")
+        spawn_cp(
+            procs, PCP,
+            clusters=f"cluster-A={A_URL};cluster-B={B_URL}",
+            hosts=f"{HOST}={TENANT}",
+            placement=f"{TENANT}=cluster-A",
+            cp_data_dir=dcp,
+            move_secret=SECRET,
+            log_dir=LOGDIR,
+        )
         spawn_rewind("A", PA, da, "a.localhost")
         spawn_rewind("B", PB, db, "b.localhost")
 
