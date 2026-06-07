@@ -158,6 +158,14 @@ pub const Directory = struct {
     /// `REWIND_HOSTS` env map). Placement-independent — a host points at a
     /// tenant, not a cluster, so it never changes on a move. Owned key + value.
     hosts: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// host (`acme.com`) → packed TLS cert+key (`[4B BE cert_len][cert_pem]
+    /// [key_pem]`, `packCert`) — the replicated cert-state axis (gap #3). The
+    /// single leader-elected ACME issuer (or a `/_control/cert` operator
+    /// upload) writes here; every stateless front-door pulls a host's cert via
+    /// `/_cp/cert` for SNI termination. Admin-authored + placement-independent
+    /// (survives moves), so it's a sibling axis here, not per-cluster
+    /// `__root__.db` like V1 (v2-front-door-architecture.md). Owned key + value.
+    certs: std.StringHashMapUnmanaged([]u8) = .empty,
 
     const OwnedCluster = struct {
         id: []u8,
@@ -248,6 +256,13 @@ pub const Directory = struct {
             a.free(e.value_ptr.*);
         }
         self.hosts.deinit(a);
+        // `certs` keys AND values are owned dups (see `applyCertLocal`).
+        var cit = self.certs.iterator();
+        while (cit.next()) |e| {
+            a.free(e.key_ptr.*);
+            a.free(e.value_ptr.*);
+        }
+        self.certs.deinit(a);
     }
 
     /// True when no cluster has been registered yet — the front door seeds
@@ -381,6 +396,27 @@ pub const Directory = struct {
             cursor = try a.dupe(u8, last);
             if (done) break;
         }
+
+        // Certs — the cert-state axis (host → packed cert+key), independent
+        // of clusters.
+        a.free(cursor);
+        cursor = try a.dupe(u8, "");
+        while (true) {
+            var rr = node.prefix(self.dir_gid, "cert/", cursor, 256) catch return Error.Replication;
+            defer rr.deinit();
+            if (rr.entries.len == 0) break;
+            for (rr.entries) |e| {
+                const host = e.key["cert/".len..];
+                self.applyCertLocal(host, e.value) catch |err| {
+                    std.log.warn("cp directory replay: bad cert {s}: {s}", .{ host, @errorName(err) });
+                };
+            }
+            const done = rr.entries.len < 256;
+            const last = rr.entries[rr.entries.len - 1].key;
+            a.free(cursor);
+            cursor = try a.dupe(u8, last);
+            if (done) break;
+        }
     }
 
     /// Parse a `cluster/*` value (`url1,url2,…`) and upsert the cluster into
@@ -469,6 +505,8 @@ pub const Directory = struct {
             try self.applyPlanLocal(key["plan/".len..], value);
         } else if (std.mem.startsWith(u8, key, "host/")) {
             try self.applyHostLocal(key["host/".len..], value);
+        } else if (std.mem.startsWith(u8, key, "cert/")) {
+            try self.applyCertLocal(key["cert/".len..], value);
         }
     }
 
@@ -755,6 +793,100 @@ pub const Directory = struct {
         gop.value_ptr.* = val_dup;
     }
 
+    // ── Cert state (ACME issuer / operator writes, front-door reads; gap #3) ─
+
+    /// A host's packed TLS cert+key (`[4B BE cert_len][cert_pem][key_pem]`),
+    /// split into PEM slices. Front doors feed these straight into OpenSSL.
+    pub const Cert = struct { cert_pem: []const u8, key_pem: []const u8 };
+
+    /// Pack a cert+key into the on-wire/at-rest frame (caller owns the result).
+    pub fn packCert(a: std.mem.Allocator, cert_pem: []const u8, key_pem: []const u8) Error![]u8 {
+        const out = a.alloc(u8, 4 + cert_pem.len + key_pem.len) catch return Error.OutOfMemory;
+        std.mem.writeInt(u32, out[0..4], @intCast(cert_pem.len), .big);
+        @memcpy(out[4 .. 4 + cert_pem.len], cert_pem);
+        @memcpy(out[4 + cert_pem.len ..], key_pem);
+        return out;
+    }
+
+    /// Split a packed frame into its PEM slices (borrowed from `packed_bytes`),
+    /// or null if the frame is malformed.
+    pub fn unpackCert(packed_bytes: []const u8) ?Cert {
+        if (packed_bytes.len < 4) return null;
+        const clen = std.mem.readInt(u32, packed_bytes[0..4], .big);
+        if (4 + clen > packed_bytes.len) return null;
+        return .{ .cert_pem = packed_bytes[4 .. 4 + clen], .key_pem = packed_bytes[4 + clen ..] };
+    }
+
+    /// Store a host's cert: `cert/{host} = packCert(cert, key)`. Written by the
+    /// leader-elected ACME issuer (in-process) or a `/_control/cert` operator
+    /// upload. Replicates before it takes effect (apply observer materializes
+    /// it on the leader AND every follower). Placement-independent.
+    pub fn setCert(self: *Directory, host: []const u8, cert_pem: []const u8, key_pem: []const u8) Error!void {
+        if (host.len == 0 or cert_pem.len == 0 or key_pem.len == 0) return Error.BadConfig;
+        const a = self.allocator;
+        const key = std.fmt.allocPrint(a, "cert/{s}", .{host}) catch return Error.OutOfMemory;
+        defer a.free(key);
+        const value = try packCert(a, cert_pem, key_pem);
+        defer a.free(value);
+        return self.applyDirWrite(key, value);
+    }
+
+    /// A host's packed cert frame as an OWNED copy (caller frees + `unpackCert`s),
+    /// or null if no cert is stored. Owned copy because — like a plan/host value
+    /// — a cert can be replaced (freed) by a concurrent apply (a renewal).
+    pub fn certForOwned(self: *Directory, a: std.mem.Allocator, host: []const u8) Error!?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const v = self.certs.get(host) orelse return null;
+        return a.dupe(u8, v) catch return Error.OutOfMemory;
+    }
+
+    /// Whether a (any) cert is stored for `host` — the issuer's "already issued?"
+    /// check, cheaper than copying the bytes out.
+    pub fn hasCert(self: *Directory, host: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.certs.contains(host);
+    }
+
+    /// Upsert a packed cert into the in-memory projection (no replication). The
+    /// committed-state applier, shared by replay + the post-commit observer.
+    fn applyCertLocal(self: *Directory, host: []const u8, value: []const u8) Error!void {
+        const a = self.allocator;
+        const val_dup = a.dupe(u8, value) catch return Error.OutOfMemory;
+        errdefer a.free(val_dup);
+        const gop = self.certs.getOrPut(a, host) catch return Error.OutOfMemory;
+        if (!gop.found_existing) {
+            gop.key_ptr.* = a.dupe(u8, host) catch {
+                _ = self.certs.remove(host);
+                return Error.OutOfMemory;
+            };
+        } else {
+            a.free(gop.value_ptr.*);
+        }
+        gop.value_ptr.* = val_dup;
+    }
+
+    /// Collect the hosts in the domain index that have NO cert yet (owned dups;
+    /// caller frees each + the slice). The ACME issuer's work-list: every
+    /// mapped host without a `cert/{host}` is a pending issuance.
+    pub fn collectUncertedHosts(self: *Directory, a: std.mem.Allocator) Error![][]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var out: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (out.items) |h| a.free(h);
+            out.deinit(a);
+        }
+        var it = self.hosts.keyIterator();
+        while (it.next()) |k| {
+            if (!self.certs.contains(k.*)) {
+                out.append(a, a.dupe(u8, k.*) catch return Error.OutOfMemory) catch return Error.OutOfMemory;
+            }
+        }
+        return out.toOwnedSlice(a) catch return Error.OutOfMemory;
+    }
+
     // ── Static config seeding ────────────────────────────────────────
 
     /// Seed clusters from a config string of the form
@@ -931,6 +1063,51 @@ test "directory: setHost + hostTenantForOwned round-trip, update, unset→null" 
         try testing.expectEqualStrings("bob", t);
     }
     try testing.expectError(error.BadConfig, dir.seedHosts("missing-equals"));
+}
+
+test "directory: setCert + certForOwned round-trip, pack/unpack, uncerted list" {
+    var dir = Directory.init(testing.allocator);
+    defer dir.deinit();
+    const a = testing.allocator;
+
+    try testing.expect(!dir.hasCert("acme.com"));
+    try testing.expect((try dir.certForOwned(a, "acme.com")) == null);
+
+    try dir.setCert("acme.com", "CERTPEM", "KEYPEM");
+    try testing.expect(dir.hasCert("acme.com"));
+    {
+        const packed_bytes = (try dir.certForOwned(a, "acme.com")).?;
+        defer a.free(packed_bytes);
+        const u = Directory.unpackCert(packed_bytes).?;
+        try testing.expectEqualStrings("CERTPEM", u.cert_pem);
+        try testing.expectEqualStrings("KEYPEM", u.key_pem);
+    }
+
+    // renewal replaces (old value freed — no leak under the testing allocator)
+    try dir.setCert("acme.com", "CERT2", "KEY2");
+    {
+        const packed_bytes = (try dir.certForOwned(a, "acme.com")).?;
+        defer a.free(packed_bytes);
+        const u = Directory.unpackCert(packed_bytes).?;
+        try testing.expectEqualStrings("CERT2", u.cert_pem);
+    }
+
+    try testing.expectError(error.BadConfig, dir.setCert("", "c", "k"));
+    try testing.expectError(error.BadConfig, dir.setCert("h", "", "k"));
+
+    // uncerted-hosts work-list: a mapped host with no cert shows up; once it
+    // has a cert it drops off.
+    try dir.setHost("acme.com", "acme");
+    try dir.setHost("beta.com", "beta");
+    {
+        const pending = try dir.collectUncertedHosts(a);
+        defer {
+            for (pending) |h| a.free(h);
+            a.free(pending);
+        }
+        try testing.expectEqual(@as(usize, 1), pending.len); // acme.com is certed
+        try testing.expectEqualStrings("beta.com", pending[0]);
+    }
 }
 
 test "directory: multi-node cluster carries every node origin" {

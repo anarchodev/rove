@@ -283,6 +283,10 @@ const Router = struct {
             try self.handleCpPlan(server, ent, sid, sess, path);
             return;
         }
+        if (std.mem.startsWith(u8, path, "/_cp/cert")) {
+            try self.handleCpCert(server, ent, sid, sess, path);
+            return;
+        }
         if (!std.mem.startsWith(u8, path, "/_cp/route")) {
             try replyStatus(server, ent, sid, sess, 404);
             return;
@@ -343,6 +347,32 @@ const Router = struct {
         try replyText(server, ent, sid, sess, 200, plan);
     }
 
+    /// `GET /_cp/cert?host=H` — the host's packed TLS cert+key frame
+    /// (`[4B cert_len][cert][key]`, application/octet-stream), or 404 if no
+    /// cert is stored (the front door then SNI-falls-back to the platform
+    /// wildcard / refuses). The stateless front-door pool pulls this for SNI
+    /// termination (gap #3). No auth: it serves only over the private CP
+    /// network, same trust as `/_cp/route`. (The PRIVATE key crosses this hop —
+    /// it must stay on the private network; production fronts the CP with the
+    /// same network boundary as `/_cp/route`.)
+    fn handleCpCert(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, path: []const u8) !void {
+        const host = queryParam(path, "host") orelse {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        };
+        const a = self.allocator;
+        const packed_bytes = (self.directory.certForOwned(a, host) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        }) orelse {
+            try replyStatus(server, ent, sid, sess, 404); // no cert for this host
+            return;
+        };
+        // `replyText` serves arbitrary owned bytes (data/len) — the packed
+        // frame is binary, but the front door reads it by length, not type.
+        try replyText(server, ent, sid, sess, 200, packed_bytes);
+    }
+
     // ── Control plane: tenant-move orchestration ─────────────────────
 
     /// Route + auth a `/_control/*` request. `POST /_control/move` (brief
@@ -363,7 +393,8 @@ const Router = struct {
         const is_move_live = std.mem.eql(u8, path, "/_control/move-live");
         const is_plan = std.mem.eql(u8, path, "/_control/plan");
         const is_host = std.mem.eql(u8, path, "/_control/host");
-        if (!(is_move or is_move_live or is_plan or is_host) or !std.mem.eql(u8, method_s, "POST")) {
+        const is_cert = std.mem.eql(u8, path, "/_control/cert");
+        if (!(is_move or is_move_live or is_plan or is_host or is_cert) or !std.mem.eql(u8, method_s, "POST")) {
             try replyStatus(server, ent, sid, sess, 404);
             return;
         }
@@ -392,6 +423,8 @@ const Router = struct {
             try self.handlePlan(server, ent, sid, sess, body)
         else if (is_host)
             try self.handleHost(server, ent, sid, sess, body)
+        else if (is_cert)
+            try self.handleCert(server, ent, sid, sess, body)
         else if (is_move_live)
             try self.handleMoveLive(server, ent, sid, sess, body)
         else
@@ -460,6 +493,38 @@ const Router = struct {
             return;
         };
         const msg = std.fmt.allocPrint(a, "host {s} -> {s}\n", .{ parsed.value.host, parsed.value.tenant }) catch {
+            try replyStatus(server, ent, sid, sess, 200);
+            return;
+        };
+        try replyText(server, ent, sid, sess, 200, msg);
+    }
+
+    /// Store a host's TLS cert: `POST /_control/cert {host, cert, key}` (PEM
+    /// strings) — the operator-brings-their-own-cert path (and, until DNS-01
+    /// lands, how the platform wildcard is supplied). The leader-elected ACME
+    /// issuer writes the same axis directly via `directory.setCert` (no HTTP
+    /// hop). A directory WRITE: leader-gated, so a follower has already
+    /// forwarded to the leader by the time we get here.
+    fn handleCert(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
+        const a = self.allocator;
+        var parsed = std.json.parseFromSlice(struct {
+            host: []const u8,
+            cert: []const u8,
+            key: []const u8,
+        }, a, body, .{ .ignore_unknown_fields = true }) catch {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        };
+        defer parsed.deinit();
+        if (parsed.value.host.len == 0 or parsed.value.cert.len == 0 or parsed.value.key.len == 0) {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        }
+        self.directory.setCert(parsed.value.host, parsed.value.cert, parsed.value.key) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        const msg = std.fmt.allocPrint(a, "cert stored for {s}\n", .{parsed.value.host}) catch {
             try replyStatus(server, ent, sid, sess, 200);
             return;
         };
