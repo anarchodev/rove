@@ -53,11 +53,17 @@ The [`v2-cp-operational-state.md`](v2-cp-operational-state.md) build, in 3 steps
      `limiter.zig` per-instance caps + generation-refresh; incremental `413` body
      gate; server-side retention clamp on log/tape queries.
 
-**2. Domain → tenant routing is a static env map.** Front door resolves host via
-`HostMap` seeded from `REWIND_HOSTS` (`front/main.zig:165,1273`). V1 has a
-dynamic replicated domain index (`__root__.db`). Cutover needs the replicated
-domain index in the CP directory (deferred at `directory.zig:56-57`). Without it
-there's no runtime custom-domain provisioning.
+**2. Domain → tenant routing is a static env map.** ✅ **RESOLVED (gap #2).**
+The host→tenant index is now a replicated axis in the CP `__directory__` group
+(`directory.zig` `hosts` projection + `host/{host}` keys, sibling to
+`cluster/*` / `placement/*` / `plan/*`): durable across a CP restart, spans the
+HA nodes, and accepts runtime custom-domain provisioning via `POST
+/_control/host` (move-secret gated, follower-forwards to the leader).
+`/_cp/route` resolves host→tenant from the index, then tenant→cluster from
+placement; `REWIND_HOSTS` is now seeded INTO the directory (replacing the static
+front-door map). Proof: `cp_host_smoke` (unmapped 404, static-seed resolve,
+runtime map, re-point across clusters, auth, restart-durability) + `v2-test`
+host axis test; `tenant_move_smoke` confirms the front-door routing path.
 
 **3. Edge TLS + ACME for custom domains — own it, no Cloudflare.**
 *Superseded by [`v2-front-door-architecture.md`](v2-front-door-architecture.md)
@@ -141,7 +147,8 @@ front-door count == voter count (inverted scaling). **Done:**
    Follow-ups (non-blocking): a deployed-handler 429/413 e2e smoke (move smokes
    exercise only raw `v2-kv`, not deployed handlers); standing the V2 log-query
    surface into the topology + wiring its `cp_url`.
-3. **Replicated domain index** (gap #2) — same directory group, sibling axis.
+3. ~~**Replicated domain index** (gap #2) — same directory group, sibling axis.~~
+   ✅ **SHIPPED** — `host/{host}` axis + `/_control/host` + `cp_host_smoke`.
 4. **Edge TLS termination + cert-state-in-CP + single ACME issuer** (gap #3) —
    per `v2-front-door-architecture.md`.
 5. **Tenant provisioning + multi-node formation** (gaps #4, #5) — the

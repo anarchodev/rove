@@ -53,8 +53,10 @@
 //!     group (single-node always does). Slice 2 adds multi-node HA: a write
 //!     on a follower faults → leader-aware retry; followers update their
 //!     projection from the apply path, not just from local proposes.
-//!   - **Host→tenant** stays a static `REWIND_HOSTS` map in the front door;
-//!     the replicated domain index is a separate axis (later).
+//!   - **Host→tenant** is now a replicated axis here too (gap #2): the
+//!     `hosts` projection + `host/{host}` keys, authored by the
+//!     `/_control/host` write and seeded from `REWIND_HOSTS`. (It was a
+//!     static front-door map in Slice 1.)
 
 const std = @import("std");
 const bridge_mod = @import("bridge");
@@ -149,6 +151,13 @@ pub const Directory = struct {
     /// + serves the bytes verbatim; the DP parses them into effective limits
     /// (`plan-tiers.md`, `v2-cp-operational-state.md`). Owned key + value.
     plans: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// host (`acme.com`) → tenant store id — the replicated domain index
+    /// (gap #2). The front door resolves `host → tenant → cluster` via
+    /// `/_cp/route`; this is the first hop, authored by a control write so
+    /// custom domains can be provisioned at runtime (replacing the static
+    /// `REWIND_HOSTS` env map). Placement-independent — a host points at a
+    /// tenant, not a cluster, so it never changes on a move. Owned key + value.
+    hosts: std.StringHashMapUnmanaged([]u8) = .empty,
 
     const OwnedCluster = struct {
         id: []u8,
@@ -232,6 +241,13 @@ pub const Directory = struct {
             a.free(e.value_ptr.*);
         }
         self.plans.deinit(a);
+        // `hosts` keys AND values are owned dups (see `applyHostLocal`).
+        var hit = self.hosts.iterator();
+        while (hit.next()) |e| {
+            a.free(e.key_ptr.*);
+            a.free(e.value_ptr.*);
+        }
+        self.hosts.deinit(a);
     }
 
     /// True when no cluster has been registered yet — the front door seeds
@@ -345,6 +361,26 @@ pub const Directory = struct {
             cursor = try a.dupe(u8, last);
             if (done) break;
         }
+
+        // Hosts — the domain index (host → tenant), independent of clusters.
+        a.free(cursor);
+        cursor = try a.dupe(u8, "");
+        while (true) {
+            var rr = node.prefix(self.dir_gid, "host/", cursor, 256) catch return Error.Replication;
+            defer rr.deinit();
+            if (rr.entries.len == 0) break;
+            for (rr.entries) |e| {
+                const host = e.key["host/".len..];
+                self.applyHostLocal(host, e.value) catch |err| {
+                    std.log.warn("cp directory replay: bad host {s}: {s}", .{ host, @errorName(err) });
+                };
+            }
+            const done = rr.entries.len < 256;
+            const last = rr.entries[rr.entries.len - 1].key;
+            a.free(cursor);
+            cursor = try a.dupe(u8, last);
+            if (done) break;
+        }
     }
 
     /// Parse a `cluster/*` value (`url1,url2,…`) and upsert the cluster into
@@ -431,6 +467,8 @@ pub const Directory = struct {
             try self.applyPlacementFromValue(key["placement/".len..], value);
         } else if (std.mem.startsWith(u8, key, "plan/")) {
             try self.applyPlanLocal(key["plan/".len..], value);
+        } else if (std.mem.startsWith(u8, key, "host/")) {
+            try self.applyHostLocal(key["host/".len..], value);
         }
     }
 
@@ -669,6 +707,54 @@ pub const Directory = struct {
         gop.value_ptr.* = val_dup;
     }
 
+    // ── Domain index (host → tenant; gap #2) ─────────────────────────
+
+    /// Map a host to a tenant store id (`host/{host} = tenant`). The first hop
+    /// of routing — the front door resolves `host → tenant` here, then
+    /// `tenant → cluster` via `resolve`. Authored by a control write so custom
+    /// domains can be provisioned at runtime. Replicates before it takes effect
+    /// (apply observer materializes it on the leader AND every follower).
+    /// Placement-independent — a host points at a tenant, never a cluster.
+    pub fn setHost(self: *Directory, host: []const u8, tenant_id: []const u8) Error!void {
+        if (host.len == 0 or tenant_id.len == 0) return Error.BadConfig;
+        const a = self.allocator;
+        const key = std.fmt.allocPrint(a, "host/{s}", .{host}) catch return Error.OutOfMemory;
+        defer a.free(key);
+        return self.applyDirWrite(key, tenant_id);
+    }
+
+    /// The tenant a host maps to, as an OWNED copy (caller frees), or null if
+    /// the host is unmapped. Copies under the lock because — like a plan value
+    /// and unlike a pointer-stable cluster slice — a host's tenant can be
+    /// replaced (freed) by a concurrent apply, so a borrowed slice held past
+    /// the lock would be unsafe. (Also: `resolve` takes the same mutex, so the
+    /// route handler must release before resolving the tenant → cluster.)
+    pub fn hostTenantForOwned(self: *Directory, a: std.mem.Allocator, host: []const u8) Error!?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const v = self.hosts.get(host) orelse return null;
+        return a.dupe(u8, v) catch return Error.OutOfMemory;
+    }
+
+    /// Upsert a host→tenant mapping into the in-memory projection (no
+    /// replication). The committed-state applier, shared by replay + the
+    /// post-commit observer.
+    fn applyHostLocal(self: *Directory, host: []const u8, tenant: []const u8) Error!void {
+        const a = self.allocator;
+        const val_dup = a.dupe(u8, tenant) catch return Error.OutOfMemory;
+        errdefer a.free(val_dup);
+        const gop = self.hosts.getOrPut(a, host) catch return Error.OutOfMemory;
+        if (!gop.found_existing) {
+            gop.key_ptr.* = a.dupe(u8, host) catch {
+                _ = self.hosts.remove(host);
+                return Error.OutOfMemory;
+            };
+        } else {
+            a.free(gop.value_ptr.*);
+        }
+        gop.value_ptr.* = val_dup;
+    }
+
     // ── Static config seeding ────────────────────────────────────────
 
     /// Seed clusters from a config string of the form
@@ -717,6 +803,24 @@ pub const Directory = struct {
             const cluster = std.mem.trim(u8, entry[eq + 1 ..], " \t");
             if (tenant.len == 0 or cluster.len == 0) return Error.BadConfig;
             try self.assign(tenant, cluster);
+        }
+    }
+
+    /// Seed the domain index from a config string of the form
+    /// `host=tenant;host=tenant;…` (the old static `REWIND_HOSTS` map, now
+    /// written INTO the replicated directory so it survives a restart + spans
+    /// the HA nodes). Each entry is `setHost`'d (replicated). Runtime custom
+    /// domains are added later via the `/_control/host` control write.
+    pub fn seedHosts(self: *Directory, config: []const u8) Error!void {
+        var it = std.mem.tokenizeScalar(u8, config, ';');
+        while (it.next()) |raw| {
+            const entry = std.mem.trim(u8, raw, " \t\r\n");
+            if (entry.len == 0) continue;
+            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return Error.BadConfig;
+            const host = std.mem.trim(u8, entry[0..eq], " \t");
+            const tenant = std.mem.trim(u8, entry[eq + 1 ..], " \t");
+            if (host.len == 0 or tenant.len == 0) return Error.BadConfig;
+            try self.setHost(host, tenant);
         }
     }
 };
@@ -789,6 +893,44 @@ test "directory: setPlan + planForOwned round-trip, update, unset→null" {
 
     // unrelated tenant stays null; plan is placement-independent
     try testing.expect((try dir.planForOwned(a, "other")) == null);
+}
+
+test "directory: setHost + hostTenantForOwned round-trip, update, unset→null" {
+    var dir = Directory.init(testing.allocator);
+    defer dir.deinit();
+    const a = testing.allocator;
+
+    // unmapped → null
+    try testing.expect((try dir.hostTenantForOwned(a, "acme.com")) == null);
+
+    // map → read back
+    try dir.setHost("acme.com", "acme");
+    {
+        const t = (try dir.hostTenantForOwned(a, "acme.com")).?;
+        defer a.free(t);
+        try testing.expectEqualStrings("acme", t);
+    }
+
+    // re-point the host to a different tenant (old value freed — no leak)
+    try dir.setHost("acme.com", "acme2");
+    {
+        const t = (try dir.hostTenantForOwned(a, "acme.com")).?;
+        defer a.free(t);
+        try testing.expectEqualStrings("acme2", t);
+    }
+
+    // empty host / tenant rejected
+    try testing.expectError(error.BadConfig, dir.setHost("", "x"));
+    try testing.expectError(error.BadConfig, dir.setHost("h", ""));
+
+    // seedHosts parses the static map form
+    try dir.seedHosts("a.com=alice; b.com=bob ;");
+    {
+        const t = (try dir.hostTenantForOwned(a, "b.com")).?;
+        defer a.free(t);
+        try testing.expectEqualStrings("bob", t);
+    }
+    try testing.expectError(error.BadConfig, dir.seedHosts("missing-equals"));
 }
 
 test "directory: multi-node cluster carries every node origin" {
