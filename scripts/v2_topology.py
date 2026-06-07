@@ -16,8 +16,13 @@ pointed at it via `REWIND_CP_URL`. Control/`/_cp` calls go to the CP port;
 customer traffic goes to the front port.
 
 `spawn_cp` / `spawn_front` append the spawned process to the caller's `procs`
-list (matching the existing per-smoke cleanup pattern) and block until the
-process logs "listening on".
+list (matching the existing per-smoke cleanup pattern). By default they pipe
+stdout (tee'd live to our stdout) and block until the process logs
+"listening on". For multi-node CP bootstrap — where all nodes must be up
+before any can elect — pass `wait=False` and await each later with
+`await_ready`; and pass `log_dir=...` so each process logs to a FILE rather
+than a PIPE (3+ steadily-logging processes would fill an un-drained pipe and
+wedge mid-move — the classic multi-process-smoke flake).
 """
 
 import os
@@ -30,12 +35,24 @@ CP_BIN = os.path.join(BINDIR, "rewind-cp")
 FRONT_BIN = os.path.join(BINDIR, "rewind-front")
 
 
-def await_line(proc, name, needle, timeout=15, also=None):
-    """Read `proc.stdout` (teeing to our stdout) until `needle` appears.
-    Returns True iff an optional second needle `also` was seen first.
-    Raises SystemExit if the process exits early or the deadline passes."""
-    saw_also = False
+def await_ready(proc, name, needle, timeout=25, also=None):
+    """Block until `proc` logs `needle`. Handles both transports:
+    file-logged procs (those carrying `_logf`, from `log_dir=`) are read from
+    the file; PIPE procs are read line-by-line and tee'd to our stdout.
+    Returns True iff an optional second needle `also` was also seen. Raises
+    SystemExit if the process exits early or the deadline passes."""
     deadline = time.time() + timeout
+    if hasattr(proc, "_logf"):
+        while time.time() < deadline:
+            proc._logf.seek(0)
+            data = proc._logf.read()
+            if needle in data:
+                return bool(also) and (also in data)
+            if proc.poll() is not None:
+                raise SystemExit(f"{name} exited early: rc={proc.returncode}")
+            time.sleep(0.1)
+        raise SystemExit(f"{name} did not reach '{needle}' within {timeout}s")
+    saw_also = False
     while time.time() < deadline:
         line = proc.stdout.readline()
         if not line:
@@ -48,6 +65,24 @@ def await_line(proc, name, needle, timeout=15, also=None):
         if needle in line:
             return saw_also
     raise SystemExit(f"{name} did not reach '{needle}' within {timeout}s")
+
+
+# Back-compat alias — smokes await PIPE-spawned workers via `await_line`.
+await_line = await_ready
+
+
+def _popen(name, argv, env, log_dir):
+    """Popen `argv`. With `log_dir`, stdout+stderr go to a per-process file and
+    the proc carries `_logf` (file transport); otherwise a tee-able PIPE."""
+    if log_dir is not None:
+        logf = open(os.path.join(log_dir, f"{name}-{os.getpid()}.log"), "w+")
+        p = subprocess.Popen(argv, stdout=logf, stderr=subprocess.STDOUT, env=env)
+        p._logf = logf
+        p._name = name
+        return p
+    return subprocess.Popen(
+        argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+    )
 
 
 def spawn_cp(
@@ -67,6 +102,8 @@ def spawn_cp(
     name="cp",
     want_needle=None,
     extra_env=None,
+    wait=True,
+    log_dir=None,
 ):
     """Spawn a `rewind-cp` on `port`.
 
@@ -74,9 +111,10 @@ def spawn_cp(
     (`host=tenant;...`), `placement` (`tenant=cluster;...`), `cp_data_dir`
     (durable directory store). `move_secret` enables the move surface.
     Multi-node (HA) CP: pass `node_id` / `voters` / `peers` / `peer_urls`
-    (the directory raft group spans the voter set). `want_needle` asserts a
-    boot-log line (e.g. the seed-vs-replay decision) appears before
-    "listening on". Returns the proc (appended to `procs`)."""
+    (the directory raft group spans the voter set), `wait=False` (await all
+    nodes after launching them all), and `log_dir` (file transport).
+    `want_needle` asserts a boot-log line (e.g. the seed-vs-replay decision)
+    appears before "listening on". Returns the proc (appended to `procs`)."""
     env = dict(os.environ)
     env["REWIND_CLUSTERS"] = clusters
     env["REWIND_HOSTS"] = hosts
@@ -96,14 +134,12 @@ def spawn_cp(
         env["REWIND_CP_RECONCILE_SECS"] = str(reconcile_secs)
     if extra_env:
         env.update(extra_env)
-    p = subprocess.Popen(
-        [CP_BIN, str(port)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
-    )
+    p = _popen(name, [CP_BIN, str(port)], env, log_dir)
     procs.append(p)
-    saw = await_line(p, name, "listening on", also=want_needle)
-    if want_needle and not saw:
-        raise SystemExit(f"{name}: expected boot log {want_needle!r} not seen")
+    if wait:
+        saw = await_ready(p, name, "listening on", also=want_needle)
+        if want_needle and not saw:
+            raise SystemExit(f"{name}: expected boot log {want_needle!r} not seen")
     return p
 
 
@@ -115,6 +151,8 @@ def spawn_front(
     route_cache_ms=None,
     name="front",
     extra_env=None,
+    wait=True,
+    log_dir=None,
 ):
     """Spawn a stateless `rewind-front` on `port`, resolving placement from
     `cp_url` (`REWIND_CP_URL`; `;`-join multiple CP origins for HA). Returns
@@ -125,10 +163,8 @@ def spawn_front(
         env["REWIND_ROUTE_CACHE_MS"] = str(route_cache_ms)
     if extra_env:
         env.update(extra_env)
-    p = subprocess.Popen(
-        [FRONT_BIN, str(port)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
-    )
+    p = _popen(name, [FRONT_BIN, str(port)], env, log_dir)
     procs.append(p)
-    await_line(p, name, "listening on")
+    if wait:
+        await_ready(p, name, "listening on")
     return p
