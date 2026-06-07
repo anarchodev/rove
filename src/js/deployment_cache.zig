@@ -24,7 +24,7 @@ const reserved = @import("reserved.zig");
 const bytecode_cache_mod = @import("bytecode_cache.zig");
 const deployment_loader_mod = @import("deployment_loader.zig");
 const msg_router_mod = @import("msg_router.zig");
-const plan_mod = @import("plan.zig");
+const plan_mod = @import("rove-plan");
 
 const BlobBytes = bytecode_cache_mod.BlobBytes;
 const BytecodeCache = bytecode_cache_mod.BytecodeCache;

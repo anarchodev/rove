@@ -1,12 +1,18 @@
-//! Per-tenant plan tiers + effective limits (docs/plan-tiers.md).
+//! rove-plan — per-tenant plan tiers + effective limits (docs/plan-tiers.md).
 //!
-//! A tenant's plan is `{tier, overrides}`: a named tier (a comptime table
+//! A LEAF module (std only) so every consumer can import it without a cycle:
+//! the worker (`rove-js`) resolves rate/body limits from it, and the
+//! log-query surface (`rove-log-server`) resolves the retention window from it
+//! (docs/plan-tiers.md Lever 3). It owns `RateLimitCaps` too — the limiter
+//! re-exports it — so the table that maps a tier to its numbers lives in ONE
+//! place reachable from both layers.
+//!
+//! A tenant's plan is `{tier, overrides}`: a named tier (the comptime table
 //! baked here) plus optional per-field overrides for enterprise custom deals.
 //! The CP stores the `{tier, overrides}` JSON blob verbatim and replicates it
-//! (docs/v2-cp-operational-state.md); the DP — this module — parses it into a
-//! resolved `PlanLimits` and caches it on the tenant's hot-path slot
-//! (`deployment_cache.TenantSlot`). Dispatch then reads `slot.plan.*` as a
-//! field load, paying zero extra store reads (the no-`O(N_tenants)` invariant).
+//! (docs/v2-cp-operational-state.md); each consumer parses it into the
+//! resolved limits it cares about — the worker caches `PlanLimits` on the
+//! tenant's hot-path slot; the log-server reads `retention_days` per query.
 //!
 //! `rove` only ENFORCES tiers — setting one (Stripe → admin app → CP write)
 //! is the product layer's job (docs/platform-accounts-model.md). This module
@@ -16,11 +22,23 @@
 //!
 //! `effective(tier, overrides)` folds `override ?? table(tier).field` per
 //! field. Resolving at read-time (not set-time) means changing what "pro"
-//! means is a one-line table edit, never a per-customer migration. Keep the
-//! TABLE in code; keep OVERRIDES in the CP blob.
+//! means is a one-line table edit, never a per-customer migration.
 
 const std = @import("std");
-const limiter = @import("limiter.zig");
+
+/// Per-(instance, action) token-bucket caps. Lives here (not in the limiter)
+/// so `rove-plan` stays a leaf the limiter can depend on; the limiter
+/// re-exports it as `limiter.RateLimitCaps` for its existing callers.
+pub const RateLimitCaps = struct {
+    /// Burst cap: max requests accepted in a single instant from one instance.
+    request_capacity: u32 = 1000,
+    /// Sustained rate: requests per second the bucket refills at.
+    request_refill_per_sec: u32 = 500,
+    /// Burst cap on `email.send` calls from a handler.
+    email_capacity: u32 = 100,
+    /// 10/sec → 600/min sustained — well under any sane Resend quota.
+    email_refill_per_sec: u32 = 10,
+};
 
 /// The named tiers. Free is the default for any tenant with no CP plan blob.
 /// `pro` / `enterprise` numbers below are launch placeholders — the concrete
@@ -42,11 +60,10 @@ pub const Tier = enum(u8) {
 };
 
 /// The resolved limits a tenant is enforced against. Small + copyable —
-/// cached by value behind an atomic pointer on the slot.
+/// cached by value behind an atomic pointer on the worker's slot.
 pub const PlanLimits = struct {
-    /// Per-(instance, action) token-bucket caps (Lever 1; reuses the
-    /// limiter's caps struct verbatim).
-    rate: limiter.RateLimitCaps,
+    /// Per-(instance, action) token-bucket caps (Lever 1).
+    rate: RateLimitCaps,
     /// Inbound request body ceiling — 413 above this (Lever 2).
     max_body_bytes: u32,
     /// Tape/log read-window in days — list/query clamp to the last N days
@@ -118,8 +135,8 @@ pub fn effective(tier: Tier, ov: Overrides) PlanLimits {
 
 /// Parse a CP plan blob (`{"tier":"pro","overrides":{…}}`) into resolved
 /// limits. An empty blob, malformed JSON, or an unknown tier all resolve to
-/// the FREE tier — the blob is operator/admin-authored, but the DP must never
-/// fail a customer request on a bad plan record (fail toward the free tier,
+/// the FREE tier — the blob is operator/admin-authored, but a consumer must
+/// never fail a request on a bad plan record (fail toward the free tier,
 /// never toward unbounded). `overrides` is optional and sparse.
 pub fn parseBlob(allocator: std.mem.Allocator, blob: []const u8) PlanLimits {
     const trimmed = std.mem.trim(u8, blob, " \t\r\n");
@@ -134,6 +151,12 @@ pub fn parseBlob(allocator: std.mem.Allocator, blob: []const u8) PlanLimits {
     };
     defer parsed.deinit();
     return effective(Tier.parse(parsed.value.tier), parsed.value.overrides);
+}
+
+/// Seconds of retention for a resolved plan — the read-clamp floor is
+/// `now_ns - retentionNs(plan)` (docs/plan-tiers.md Lever 3).
+pub fn retentionNs(p: PlanLimits) i64 {
+    return @as(i64, p.retention_days) * std.time.ns_per_day;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -171,12 +194,10 @@ test "plan: Tier.parse unknown → free" {
 
 test "plan: parseBlob round-trips tier + overrides" {
     const a = testing.allocator;
-    // bare tier
     {
         const p = parseBlob(a, "{\"tier\":\"pro\"}");
         try testing.expectEqual(table(.pro).max_body_bytes, p.max_body_bytes);
     }
-    // tier + override
     {
         const p = parseBlob(a, "{\"tier\":\"pro\",\"overrides\":{\"retention_days\":90}}");
         try testing.expectEqual(@as(u32, 90), p.retention_days);
@@ -190,4 +211,9 @@ test "plan: parseBlob fails toward the free tier" {
     try testing.expectEqual(table(.free).max_body_bytes, parseBlob(a, "   ").max_body_bytes);
     try testing.expectEqual(table(.free).max_body_bytes, parseBlob(a, "not json").max_body_bytes);
     try testing.expectEqual(table(.free).max_body_bytes, parseBlob(a, "{\"tier\":\"galaxy\"}").max_body_bytes);
+}
+
+test "plan: retentionNs scales days to ns" {
+    try testing.expectEqual(@as(i64, 7) * std.time.ns_per_day, retentionNs(table(.free)));
+    try testing.expectEqual(@as(i64, 365) * std.time.ns_per_day, retentionNs(table(.enterprise)));
 }

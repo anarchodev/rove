@@ -132,6 +132,18 @@ pub fn build(b: *std.Build) void {
     });
     bodies_mod.addImport("rove-blob", blob_mod);
 
+    // ── rove-plan: per-tenant plan tiers + effective limits ──────────
+    //
+    // A LEAF (std only) so both the worker (`rove-js`: rate + body caps)
+    // and the log-query surface (`rove-log-server`: retention window) can
+    // import the ONE tier table without a cycle (docs/plan-tiers.md). Owns
+    // `RateLimitCaps`, which the limiter re-exports.
+    const plan_mod = b.addModule("rove-plan", .{
+        .root_source_file = b.path("src/plan/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ── rove-tape: deterministic replay capture + replay bundle ──
     //
     // Phase 4. Per-channel append-only tapes (kv, date, math_random,
@@ -214,6 +226,7 @@ pub fn build(b: *std.Build) void {
     log_server_mod.addImport("rove-blob", blob_mod);
     log_server_mod.addImport("rove-log", log_mod);
     log_server_mod.addImport("rove-jwt", jwt_mod);
+    log_server_mod.addImport("rove-plan", plan_mod);
 
     // ── rove-ssrf: SSRF blocklist + dev-only test overrides ─────────
     //
@@ -329,9 +342,33 @@ pub fn build(b: *std.Build) void {
     const files_server_tests = b.addTest(.{ .root_module = files_server_mod });
     test_step.dependOn(&b.addRunArtifact(files_server_tests).step);
 
-    // rove-log-server tests
-    const log_server_tests = b.addTest(.{ .root_module = log_server_mod });
-    test_step.dependOn(&b.addRunArtifact(log_server_tests).step);
+    // rove-log-server tests — also a dedicated `log-server-test` step (the
+    // default `test` step is broken on v2 via the frozen SQLite modules).
+    // The shared module stays sqlite-free (linked at the binary level), so the
+    // test gets its OWN module that links sqlite3 (index_db.zig needs it).
+    const log_server_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/log_server/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    log_server_test_mod.link_libc = true;
+    log_server_test_mod.linkSystemLibrary("nghttp2", .{});
+    log_server_test_mod.linkSystemLibrary("ssl", .{});
+    log_server_test_mod.linkSystemLibrary("crypto", .{});
+    log_server_test_mod.linkSystemLibrary("z", .{});
+    log_server_test_mod.linkSystemLibrary("sqlite3", .{});
+    log_server_test_mod.addImport("rove", rove_mod);
+    log_server_test_mod.addImport("rove-io", io_mod);
+    log_server_test_mod.addImport("rove-h2", h2_mod);
+    log_server_test_mod.addImport("raft-kv", kv_mod);
+    log_server_test_mod.addImport("rove-blob", blob_mod);
+    log_server_test_mod.addImport("rove-log", log_mod);
+    log_server_test_mod.addImport("rove-jwt", jwt_mod);
+    log_server_test_mod.addImport("rove-plan", plan_mod);
+    const log_server_tests = b.addTest(.{ .root_module = log_server_test_mod });
+    const run_log_server_tests = b.addRunArtifact(log_server_tests);
+    const log_server_test_step = b.step("log-server-test", "Run rove-log-server unit tests");
+    log_server_test_step.dependOn(&run_log_server_tests.step);
 
     // rove-jwt tests
     const jwt_tests = b.addTest(.{ .root_module = jwt_mod });
@@ -340,6 +377,14 @@ pub fn build(b: *std.Build) void {
     // rove-ssrf tests
     const ssrf_tests = b.addTest(.{ .root_module = ssrf_mod });
     test_step.dependOn(&b.addRunArtifact(ssrf_tests).step);
+
+    // rove-plan tests — also a dedicated `plan-test` step (the default
+    // `test` step is broken on v2 via the frozen SQLite modules).
+    const plan_tests = b.addTest(.{ .root_module = plan_mod });
+    const run_plan_tests = b.addRunArtifact(plan_tests);
+    test_step.dependOn(&run_plan_tests.step);
+    const plan_test_step = b.step("plan-test", "Run rove-plan (tier table) unit tests");
+    plan_test_step.dependOn(&run_plan_tests.step);
 
     // ── rove-tenant: account/user/instance/domain metadata ──
     //
@@ -381,6 +426,7 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-bodies", bodies_mod);
     js_mod.addImport("rove-tenant", tenant_mod);
     js_mod.addImport("rove-ssrf", ssrf_mod);
+    js_mod.addImport("rove-plan", plan_mod);
     // Worker reads the per-deployment manifest at release time so the
     // _config/ → kv mirror (config_mirror.zig) can stage config rows
     // alongside the _deploy/current flip.

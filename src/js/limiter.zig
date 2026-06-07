@@ -31,6 +31,7 @@
 //! RateLimiter. Same model as `penalty.zig`.
 
 const std = @import("std");
+const plan_mod = @import("rove-plan");
 
 pub const Action = enum(u8) {
     request,
@@ -39,17 +40,11 @@ pub const Action = enum(u8) {
 
 const ACTION_COUNT: usize = std.meta.fields(Action).len;
 
-pub const RateLimitCaps = struct {
-    /// Burst cap: max requests we'll accept in a single instant
-    /// from one instance.
-    request_capacity: u32 = 1000,
-    /// Sustained rate: requests per second the bucket refills at.
-    request_refill_per_sec: u32 = 500,
-    /// Burst cap on `email.send` calls from a handler.
-    email_capacity: u32 = 100,
-    /// 10/sec → 600/min sustained — well under any sane Resend quota.
-    email_refill_per_sec: u32 = 10,
-};
+/// Re-exported from `rove-plan` (the leaf module that owns the tier table) so
+/// the limiter's existing callers keep using `limiter.RateLimitCaps`, while the
+/// definition lives in one place reachable from both the worker and the
+/// log-query surface (docs/plan-tiers.md).
+pub const RateLimitCaps = plan_mod.RateLimitCaps;
 
 pub fn defaultCaps() RateLimitCaps {
     return .{};

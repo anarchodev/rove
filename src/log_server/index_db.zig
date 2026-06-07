@@ -151,13 +151,17 @@ pub const IndexDb = struct {
     /// (tenant_id, received_ns DESC) primary index makes the count a
     /// covering scan. Used by `/v1/{tenant}/count` so dashboards can
     /// surface a record total without paginating the whole list.
-    pub fn queryCount(self: *IndexDb, tenant_id: []const u8) Error!u64 {
-        const sql = "SELECT COUNT(*) FROM log_index WHERE tenant_id = ?";
+    /// `floor_received_ns` is the retention read-clamp (docs/plan-tiers.md
+    /// Lever 3): only records at-or-after it are counted. Pass 0 to disable
+    /// the clamp (no plan / CP unreachable).
+    pub fn queryCount(self: *IndexDb, tenant_id: []const u8, floor_received_ns: i64) Error!u64 {
+        const sql = "SELECT COUNT(*) FROM log_index WHERE tenant_id = ? AND (?2 = 0 OR received_ns >= ?2)";
         var st: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &st, null) != c.SQLITE_OK)
             return Error.Sqlite;
         defer _ = c.sqlite3_finalize(st);
         bindText(st.?, 1, tenant_id);
+        _ = c.sqlite3_bind_int64(st, 2, floor_received_ns);
         const rc = c.sqlite3_step(st);
         if (rc != c.SQLITE_ROW) return Error.Sqlite;
         return @intCast(c.sqlite3_column_int64(st, 0));
@@ -198,11 +202,14 @@ pub const IndexDb = struct {
     /// Newest-first list of records for `tenant_id`. Pagination cursor:
     /// pass `(after_received_ns, after_request_id)` from the previous
     /// page's tail to advance. `(0, 0)` starts at the newest.
+    /// `floor_received_ns` is the retention read-clamp (docs/plan-tiers.md
+    /// Lever 3): rows before it are never returned. Pass 0 to disable.
     pub fn queryList(
         self: *IndexDb,
         tenant_id: []const u8,
         after_received_ns: i64,
         after_request_id: u64,
+        floor_received_ns: i64,
         limit: u32,
     ) Error!ListResult {
         const sql =
@@ -213,6 +220,7 @@ pub const IndexDb = struct {
             \\  AND (?2 = 0 OR
             \\       received_ns < ?2 OR
             \\       (received_ns = ?2 AND request_id < ?3))
+            \\  AND (?5 = 0 OR received_ns >= ?5)
             \\ORDER BY received_ns DESC, request_id DESC
             \\LIMIT ?4
         ;
@@ -224,6 +232,7 @@ pub const IndexDb = struct {
         _ = c.sqlite3_bind_int64(st, 2, after_received_ns);
         _ = c.sqlite3_bind_int64(st, 3, @intCast(after_request_id));
         _ = c.sqlite3_bind_int64(st, 4, @intCast(limit));
+        _ = c.sqlite3_bind_int64(st, 5, floor_received_ns);
 
         var rows: std.ArrayListUnmanaged(ListRow) = .empty;
         errdefer {
@@ -501,7 +510,7 @@ test "insertBatch + queryList round-trips, newest-first" {
     const ndjson_key = "_logs/00000001/00000000000000000100-1730764800000.ndjson";
     try idx.insertBatch(&batch, ndjson_key, 0);
 
-    var list = try idx.queryList("acme", 0, 0, 10);
+    var list = try idx.queryList("acme", 0, 0, 0, 10);
     defer list.deinit();
     try testing.expectEqual(@as(usize, 2), list.rows.len);
     // Newest first.
@@ -512,10 +521,19 @@ test "insertBatch + queryList round-trips, newest-first" {
 
     // Pagination: cursor at (received_ns=2000, id=101) returns the
     // older row only.
-    var p2 = try idx.queryList("acme", 2_000, 101, 10);
+    var p2 = try idx.queryList("acme", 2_000, 101, 0, 10);
     defer p2.deinit();
     try testing.expectEqual(@as(usize, 1), p2.rows.len);
     try testing.expectEqual(@as(u64, 100), p2.rows[0].request_id);
+
+    // Retention read-clamp (Lever 3): a floor of 1500 hides the
+    // received_ns=1000 record, leaving only the 2000 one — in list AND count.
+    var clamped = try idx.queryList("acme", 0, 0, 1_500, 10);
+    defer clamped.deinit();
+    try testing.expectEqual(@as(usize, 1), clamped.rows.len);
+    try testing.expectEqual(@as(u64, 101), clamped.rows[0].request_id);
+    try testing.expectEqual(@as(u64, 2), try idx.queryCount("acme", 0)); // no clamp
+    try testing.expectEqual(@as(u64, 1), try idx.queryCount("acme", 1_500)); // clamped
 }
 
 test "insertBatch is idempotent on the same sidecar key" {
@@ -559,7 +577,7 @@ test "insertBatch is idempotent on the same sidecar key" {
     try idx.insertBatch(&batch, ndjson_key, 0);
     try idx.insertBatch(&batch, ndjson_key, 0);
 
-    var list = try idx.queryList("globex", 0, 0, 10);
+    var list = try idx.queryList("globex", 0, 0, 0, 10);
     defer list.deinit();
     try testing.expectEqual(@as(usize, 1), list.rows.len);
 }
