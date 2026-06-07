@@ -45,7 +45,7 @@ const kv_mod = @import("raft-kv");
 const tenant_mod = @import("rove-tenant");
 const respb = @import("response_builder.zig");
 const raft_propose = @import("raft_propose.zig");
-const plan_mod = @import("plan.zig");
+const plan_mod = @import("rove-plan");
 const blob = @import("rove-blob");
 const curl = blob.curl;
 

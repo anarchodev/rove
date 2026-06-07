@@ -38,6 +38,9 @@ const batch_store_mod = @import("batch_store.zig");
 const index_db_mod = @import("index_db.zig");
 const indexer_mod = @import("indexer.zig");
 const jwt = @import("rove-jwt");
+const plan_mod = @import("rove-plan");
+const blob = @import("rove-blob");
+const curl = blob.curl;
 const zlib = @cImport({
     @cInclude("zlib.h");
 });
@@ -79,6 +82,16 @@ pub const Config = struct {
     /// the response without a matching CORS header. Null = no CORS
     /// (the standalone binary's loopback smoke path doesn't need it).
     cors_origin: ?[]const u8 = null,
+    /// CP base URL (e.g. `http://cp:9090`) for the retention read-clamp
+    /// (docs/plan-tiers.md Lever 3): each `/v1/{tenant}/list|show|count`
+    /// resolves the tenant's plan from `{cp_url}/_cp/plan?tenant=` (cached)
+    /// and hides records older than `retention_days`. Null disables the clamp
+    /// (the loopback smoke path / single-tenant deploys with no CP) — every
+    /// record is returned, as before. Borrowed; caller keeps it alive.
+    cp_url: ?[]const u8 = null,
+    /// TLS verification for the CP plan fetch. False in dev/smoke clusters
+    /// with self-signed internal certs; production leaves it true.
+    cp_insecure_tls: bool = false,
 };
 
 pub const Handle = struct {
@@ -174,10 +187,14 @@ fn runThread(h: *Handle) !void {
         std.log.info("log-server-standalone: h2c on 127.0.0.1:{d}", .{h.port});
     }
 
+    var retention = RetentionCache.init(allocator);
+    defer retention.deinit();
+
     const rctx: ReqCtx = .{
         .cfg = &h.config,
         .store = h.config.store,
         .db = h.config.db,
+        .retention = &retention,
     };
 
     while (!h.stop.load(.acquire)) {
@@ -208,7 +225,96 @@ const ReqCtx = struct {
     cfg: *const Config,
     store: batch_store_mod.BatchStore,
     db: *index_db_mod.IndexDb,
+    retention: *RetentionCache,
 };
+
+// ── Retention read-clamp (docs/plan-tiers.md Lever 3) ──────────────
+//
+// The log-query surface enforces the per-tenant retention window by hiding
+// records older than `now - retention_days`. `retention_days` comes from the
+// tenant's plan, which lives in the CP — so the log-server resolves it from
+// `{cp_url}/_cp/plan?tenant=` and caches the window per tenant with a short
+// TTL (a CP round-trip per query would be wasteful for an operator-facing,
+// low-rate surface). Single-threaded (the server event loop is the sole
+// accessor), so no lock.
+
+/// Per-tenant cached retention window (in ns) + when it was fetched.
+const RetentionEntry = struct {
+    retention_ns: i64,
+    fetched_ns: i64,
+};
+
+const RetentionCache = struct {
+    allocator: std.mem.Allocator,
+    map: std.StringHashMapUnmanaged(RetentionEntry) = .empty,
+
+    /// How long a resolved window stays fresh. A plan change (rare, billing-
+    /// driven) takes effect within this window on the query surface.
+    const TTL_NS: i64 = 30 * std.time.ns_per_s;
+
+    fn init(allocator: std.mem.Allocator) RetentionCache {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *RetentionCache) void {
+        var it = self.map.keyIterator();
+        while (it.next()) |k| self.allocator.free(k.*);
+        self.map.deinit(self.allocator);
+    }
+
+    /// The retention floor (`now_ns - retention_ns`) for `tenant`, or 0 to
+    /// disable the clamp. 0 is returned when no CP is configured OR the CP is
+    /// unreachable — fail OPEN (show more), the same direction the rate/body
+    /// levers fail: a transient CP outage must not hide a paying customer's
+    /// data (the data is never deleted, only window-hidden). A definitive 404
+    /// from the CP means "unset ⇒ free tier" and DOES clamp.
+    fn floorNs(self: *RetentionCache, cfg: *const Config, tenant: []const u8, now_ns: i64) i64 {
+        const cp_url = cfg.cp_url orelse return 0; // clamp disabled
+        const retention_ns = self.resolveRetentionNs(cfg, cp_url, tenant, now_ns) orelse return 0;
+        const floor = now_ns - retention_ns;
+        return if (floor > 0) floor else 0;
+    }
+
+    /// Cached-or-fetched retention window (ns) for `tenant`. Null ⇒ "couldn't
+    /// determine, don't clamp" (CP unreachable). A 404 resolves to the free
+    /// tier's window (a real clamp).
+    fn resolveRetentionNs(self: *RetentionCache, cfg: *const Config, cp_url: []const u8, tenant: []const u8, now_ns: i64) ?i64 {
+        if (self.map.get(tenant)) |e| {
+            if (now_ns - e.fetched_ns < TTL_NS) return e.retention_ns;
+        }
+        const rns = fetchRetentionNs(self.allocator, cp_url, tenant, cfg.cp_insecure_tls) orelse return null;
+        // Cache it (best-effort; a put failure just means we refetch next time).
+        const gop = self.map.getOrPut(self.allocator, tenant) catch return rns;
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, tenant) catch {
+                _ = self.map.remove(tenant);
+                return rns;
+            };
+        }
+        gop.value_ptr.* = .{ .retention_ns = rns, .fetched_ns = now_ns };
+        return rns;
+    }
+};
+
+/// Fetch + resolve a tenant's retention window (ns) from the CP. 404 ⇒ unset ⇒
+/// free tier. Any transport error / non-200-non-404 ⇒ null (don't clamp).
+fn fetchRetentionNs(allocator: std.mem.Allocator, cp_url: []const u8, tenant: []const u8, insecure_tls: bool) ?i64 {
+    const url = std.fmt.allocPrint(allocator, "{s}/_cp/plan?tenant={s}", .{ cp_url, tenant }) catch return null;
+    defer allocator.free(url);
+    var easy = curl.Easy.init(allocator) catch return null;
+    defer easy.deinit();
+    var resp = easy.request(allocator, .{
+        .method = .GET,
+        .url = url,
+        .http_version = .h2c_prior_knowledge,
+        .verify_tls = !insecure_tls,
+    }) catch return null;
+    defer resp.deinit(allocator);
+    if (resp.status == 404) return plan_mod.retentionNs(plan_mod.table(.free));
+    if (resp.status != 200) return null; // transient / error → don't clamp
+    const body = resp.body orelse return null;
+    return plan_mod.retentionNs(plan_mod.parseBlob(allocator, body));
+}
 
 fn processRequests(
     server: *LogH2,
@@ -321,10 +427,15 @@ fn handleOne(
         try setResponse(server, ent, sid, sess, 404, "not found\n", rctx.cfg);
         return;
     };
+    // Retention read-clamp (docs/plan-tiers.md Lever 3): resolve the tenant's
+    // window from the CP (cached) and hide records older than it. 0 ⇒ no clamp
+    // (CP not configured / unreachable).
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    const floor_ns = rctx.retention.floorNs(rctx.cfg, route.tenant_id, now_ns);
     switch (route.kind) {
-        .list => try handleList(server, allocator, rctx.db, ent, sid, sess, route.tenant_id, route.query, rctx.cfg),
-        .show => try handleShow(server, allocator, rctx.store, rctx.db, ent, sid, sess, route.tenant_id, route.tail, rctx.cfg),
-        .count => try handleCount(server, allocator, rctx.db, ent, sid, sess, route.tenant_id, rctx.cfg),
+        .list => try handleList(server, allocator, rctx.db, ent, sid, sess, route.tenant_id, route.query, floor_ns, rctx.cfg),
+        .show => try handleShow(server, allocator, rctx.store, rctx.db, ent, sid, sess, route.tenant_id, route.tail, floor_ns, rctx.cfg),
+        .count => try handleCount(server, allocator, rctx.db, ent, sid, sess, route.tenant_id, floor_ns, rctx.cfg),
     }
 }
 
@@ -426,13 +537,14 @@ fn handleList(
     sess: h2.Session,
     tenant_id: []const u8,
     query: []const u8,
+    floor_received_ns: i64,
     cfg: *const Config,
 ) !void {
     const limit = parseUint(u32, query, "limit", 100);
     const after_received_ns = parseInt(i64, query, "after_received_ns", 0);
     const after_request_id = parseUint(u64, query, "after_request_id", 0);
 
-    var list = db.queryList(tenant_id, after_received_ns, after_request_id, limit) catch |err| {
+    var list = db.queryList(tenant_id, after_received_ns, after_request_id, floor_received_ns, limit) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "list failed: {s}\n", .{@errorName(err)});
         try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
         return;
@@ -453,6 +565,7 @@ fn handleShow(
     sess: h2.Session,
     tenant_id: []const u8,
     request_id_str: []const u8,
+    floor_received_ns: i64,
     cfg: *const Config,
 ) !void {
     const request_id = std.fmt.parseInt(u64, request_id_str, 10) catch {
@@ -470,6 +583,14 @@ fn handleShow(
     }
     defer maybe.?.deinit(allocator);
     const row = maybe.?;
+
+    // Retention read-clamp (Lever 3): a record older than the tenant's window
+    // is 404 — same as if it never existed. The clamp is a billing boundary,
+    // so a direct /show must not bypass what /list hides.
+    if (floor_received_ns != 0 and row.received_ns < floor_received_ns) {
+        try setResponse(server, ent, sid, sess, 404, "record not found\n", cfg);
+        return;
+    }
 
     // Range-read the compressed frame out of the batch payload.
     // Each record is its own raw-deflate stream; the sidecar's
@@ -564,9 +685,10 @@ fn handleCount(
     sid: h2.StreamId,
     sess: h2.Session,
     tenant_id: []const u8,
+    floor_received_ns: i64,
     cfg: *const Config,
 ) !void {
-    const total = db.queryCount(tenant_id) catch |err| {
+    const total = db.queryCount(tenant_id, floor_received_ns) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "count failed: {s}\n", .{@errorName(err)});
         try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
         return;

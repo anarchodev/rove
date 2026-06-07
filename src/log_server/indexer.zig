@@ -371,7 +371,7 @@ test "pollOnce indexes a single sidecar end-to-end" {
     try testing.expectEqual(@as(u32, 0), stats.skipped_non_sidecars);
 
     // Index now has the row.
-    var list = try db.queryList("acme", 0, 0, 10);
+    var list = try db.queryList("acme", 0, 0, 0, 10);
     defer list.deinit();
     try testing.expectEqual(@as(usize, 1), list.rows.len);
     try testing.expectEqual(@as(u64, 7), list.rows[0].request_id);
@@ -418,7 +418,7 @@ test "pollOnce is idempotent across runs" {
     try testing.expectEqual(@as(u32, 1), stats2.batches_indexed);
 
     // Still exactly one row in the index after both passes.
-    var list = try db.queryList("acme", 0, 0, 10);
+    var list = try db.queryList("acme", 0, 0, 0, 10);
     defer list.deinit();
     try testing.expectEqual(@as(usize, 1), list.rows.len);
 }
@@ -480,7 +480,7 @@ test "pollOnce picks up newly-arrived sidecars across passes" {
     try testing.expectEqual(@as(u32, 2), s2.sidecars_seen);
     try testing.expectEqual(@as(u32, 2), s2.batches_indexed);
 
-    var list = try db.queryList("acme", 0, 0, 10);
+    var list = try db.queryList("acme", 0, 0, 0, 10);
     defer list.deinit();
     try testing.expectEqual(@as(usize, 2), list.rows.len);
     try testing.expectEqual(@as(u64, 2), list.rows[0].request_id);

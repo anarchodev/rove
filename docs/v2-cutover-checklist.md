@@ -127,14 +127,20 @@ front-door count == voter count (inverted scaling). **Done:**
 
 1. ~~**Split the CP out** + front door becomes a stateless read-replica.~~ ✅
    **SHIPPED** — `rewind-cp` + slimmed `rewind-front`, all 9 edge smokes green.
-2. **Plan/limits** (gap #1) — step 1 (CP axis) ✅ `2ddb662`; step 2 (DP delivery
-   via attach handshake + live push) ✅ (`src/js/plan.zig` tier table +
-   `effective()`; `TenantSlot.plan`/`plan_gen` cache; `v2-attach` carries
-   `X-Rewind-Plan` + `POST /_system/v2-plan` live push; `cp_plan_delivery_smoke`
-   green). Remaining: step 3 (DP ENFORCEMENT — wire the cached `slot.plan` into
-   the three levers: rate limiter caps + generation-refresh, 413 body gate,
-   retention read-clamp; `plan-tiers.md`). The delivery + cache are done, so
-   step 3 is local wiring with no new state.
+2. **Plan/limits** (gap #1) — ✅ **all three steps shipped.** Step 1 (CP axis)
+   `2ddb662`; step 2 (DP delivery via attach handshake + live push:
+   `rove-plan` tier table + `effective()`; `TenantSlot.plan`/`plan_gen` cache;
+   `v2-attach` carries `X-Rewind-Plan` + `POST /_system/v2-plan` live push;
+   `cp_plan_delivery_smoke` green); step 3 (DP enforcement — all three levers of
+   `plan-tiers.md`): Lever 1 rate caps + generation-refresh, Lever 2 413 body
+   gate (both in `worker_dispatch` off `slot.effectivePlan()`), Lever 3
+   retention read-clamp in the log-query surface (`rove-log-server` resolves the
+   window from the CP `/_cp/plan`, cached, and clamps list/show/count).
+   The tier table was hoisted into a shared **`rove-plan`** leaf so both the
+   worker and the log-server import the one table without a cycle.
+   Follow-ups (non-blocking): a deployed-handler 429/413 e2e smoke (move smokes
+   exercise only raw `v2-kv`, not deployed handlers); standing the V2 log-query
+   surface into the topology + wiring its `cp_url`.
 3. **Replicated domain index** (gap #2) — same directory group, sibling axis.
 4. **Edge TLS termination + cert-state-in-CP + single ACME issuer** (gap #3) —
    per `v2-front-door-architecture.md`.
