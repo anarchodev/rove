@@ -1,31 +1,31 @@
-//! rewind-front — the V2 front door (docs/v2-build-order.md §Phase 3,
-//! docs/v2-phase3-directory-routing.md §3b).
+//! rewind-front — the V2 front door (docs/v2-front-door-architecture.md).
 //!
-//! A small HTTP/2 terminator that routes each inbound request to the
-//! cluster currently serving its tenant. Per request:
+//! A STATELESS HTTP/2 reverse proxy. Per customer request:
 //!
-//!   read :authority / Host → Host→tenant (static map) →
-//!   directory.clusterFor(tenant) → reverse-proxy to cluster.base_url
+//!   read :authority / Host → resolve placement via the CP's
+//!   `/_cp/route?host=H` (cached) → reverse-proxy to the owning cluster's
+//!   nodes (leader-aware retry on 503).
 //!
-//! It is the one component that sees all clusters; a `rewind` worker only
-//! holds the tenants placed on it, so a request for a tenant on another
-//! cluster has to leave the process. The front door reads ONLY the
-//! directory (cluster-agnostic), so it ports forward to multi-node (Phase
-//! 5) unchanged — `base_url` just becomes a per-cluster leader address.
+//! It holds NO directory / raft state — placement lives in the CP
+//! (`rewind-cp`), which this binary reads as a cached read-replica. That is
+//! the split that fixes the prototype's inverted scaling (front door used to
+//! BE a CP raft voter): front doors now scale horizontally behind an L4
+//! ingress, independent of the CP voter set. A stale cache costs at most a
+//! serve-or-forward hop at the DP, never a wrong answer (the CP is the one
+//! authority, serve-or-forward the one backstop, this cache an
+//! intentionally-stale hint).
 //!
-//! ## Phase-3 simplifications (documented, deliberate)
+//! ## Deliberate first-cut simplifications
 //!
-//!   - **Static config.** Clusters / Host→tenant / placement all come from
-//!     env (`REWIND_CLUSTERS` / `REWIND_HOSTS` / `REWIND_PLACEMENT`). The
-//!     replicated control-plane directory + domain index is later
-//!     hardening behind `Directory`'s interface.
-//!   - **Blocking forward, sequential.** Each proxied request runs a
-//!     synchronous libcurl call inside the single-threaded h2 poll loop —
-//!     fine for the Phase-3 exit smoke (sequential requests); connection
-//!     pooling + concurrency is a noted deferral.
+//!   - **Blocking forward, sequential.** Each proxied request (and each CP
+//!     route lookup on a cache miss) runs a synchronous libcurl call inside
+//!     the single-threaded h2 poll loop; connection pooling + concurrency is
+//!     a noted deferral. Horizontal scaling is multiple front-door processes
+//!     (SO_REUSEPORT) behind the L4 ingress, not threads.
 //!   - **Status + body passthrough only.** Response headers (incl.
-//!     content-type) are dropped for now — the routing proof is on status
-//!     codes. Real header passthrough is a follow-up.
+//!     content-type) are dropped for now — a follow-up before cutover.
+//!   - **h2c.** Public TLS termination is a later slice; today the front door
+//!     speaks h2c and assumes TLS is terminated upstream.
 
 const std = @import("std");
 const rove = @import("rove");
@@ -33,10 +33,6 @@ const h2 = @import("rove-h2");
 const blob = @import("rove-blob");
 
 const curl = blob.curl;
-const directory_mod = @import("cp-directory");
-const Directory = directory_mod.Directory;
-const bridge_mod = @import("bridge");
-const Bridge = bridge_mod.Bridge;
 
 const FrontH2 = h2.H2(.{});
 
@@ -56,133 +52,6 @@ fn installSignalHandlers() void {
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
     std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 }
-
-// ── Multi-node CP (Slice 2 HA) config ─────────────────────────────────
-
-/// Parsed multi-node CP bridge config, owned for the lifetime of the
-/// `initMultiNode` call (the slices are duped by the node/transport, so this
-/// is freed right after). `null` = single-node CP.
-const CpMultiNode = struct {
-    node_id: u64,
-    voters: []u64,
-    peers: []bridge_mod.PeerAddr,
-    /// Backing storage for the peer host slices (`host:port` left of `:`).
-    peer_bufs: [][]u8,
-    listen_addr: std.net.Address,
-    listen_str: []u8,
-
-    fn deinit(self: *const CpMultiNode, a: std.mem.Allocator) void {
-        a.free(self.voters);
-        a.free(self.peers);
-        for (self.peer_bufs) |b| a.free(b);
-        a.free(self.peer_bufs);
-        a.free(self.listen_str);
-    }
-};
-
-/// Build multi-node CP config from env, or null if `REWIND_CP_NODE_ID` is
-/// unset (single-node CP). Required together — the CP's directory raft group
-/// spans these nodes (mirrors `rewind`'s `REWIND_NODE_ID`/`VOTERS`/`PEERS`,
-/// but for the CP cluster, with CP-specific consensus ports distinct from the
-/// HTTP listen port):
-///   - `REWIND_CP_NODE_ID`  this CP node's 1-based raft id (∈ the voter set).
-///   - `REWIND_CP_VOTERS`   comma-separated voter ids, e.g. `1,2,3`.
-///   - `REWIND_CP_PEERS`    comma-separated raft transport `host:port`s,
-///                          indexed by raft id − 1. Distinct from the HTTP
-///                          listen port (argv[1]).
-/// Errors loud on malformed / inconsistent config.
-fn parseCpMultiNode(a: std.mem.Allocator) !?CpMultiNode {
-    const node_id_s = std.posix.getenv("REWIND_CP_NODE_ID") orelse return null;
-    const voters_s = std.posix.getenv("REWIND_CP_VOTERS") orelse return error.MissingCpVoters;
-    const peers_s = std.posix.getenv("REWIND_CP_PEERS") orelse return error.MissingCpPeers;
-
-    const node_id = try std.fmt.parseInt(u64, std.mem.trim(u8, node_id_s, " \t"), 10);
-
-    var voters: std.ArrayListUnmanaged(u64) = .empty;
-    errdefer voters.deinit(a);
-    var vit = std.mem.tokenizeScalar(u8, voters_s, ',');
-    while (vit.next()) |tok| {
-        const t = std.mem.trim(u8, tok, " \t");
-        if (t.len == 0) continue;
-        try voters.append(a, try std.fmt.parseInt(u64, t, 10));
-    }
-    if (voters.items.len == 0) return error.MissingCpVoters;
-
-    var peers: std.ArrayListUnmanaged(bridge_mod.PeerAddr) = .empty;
-    errdefer peers.deinit(a);
-    var peer_bufs: std.ArrayListUnmanaged([]u8) = .empty;
-    errdefer {
-        for (peer_bufs.items) |b| a.free(b);
-        peer_bufs.deinit(a);
-    }
-    var pit = std.mem.tokenizeScalar(u8, peers_s, ',');
-    while (pit.next()) |tok| {
-        const t = std.mem.trim(u8, tok, " \t");
-        if (t.len == 0) continue;
-        const colon = std.mem.lastIndexOfScalar(u8, t, ':') orelse return error.BadCpPeer;
-        const host = try a.dupe(u8, t[0..colon]);
-        errdefer a.free(host);
-        const port = try std.fmt.parseInt(u16, t[colon + 1 ..], 10);
-        try peer_bufs.append(a, host);
-        try peers.append(a, .{ .host = host, .port = port });
-    }
-    if (node_id == 0 or node_id > peers.items.len) return error.BadCpNodeId;
-
-    const listen = peers.items[node_id - 1];
-    const listen_addr = try std.net.Address.parseIp(listen.host, listen.port);
-    const listen_str = try std.fmt.allocPrint(a, "{s}:{d}", .{ listen.host, listen.port });
-
-    return CpMultiNode{
-        .node_id = node_id,
-        .voters = try voters.toOwnedSlice(a),
-        .peers = try peers.toOwnedSlice(a),
-        .peer_bufs = try peer_bufs.toOwnedSlice(a),
-        .listen_addr = listen_addr,
-        .listen_str = listen_str,
-    };
-}
-
-// ── Host → tenant static map (Phase-3 stand-in for the CP domain index)─
-const HostMap = struct {
-    allocator: std.mem.Allocator,
-    /// host → tenant store id. Both owned dups.
-    map: std.StringHashMapUnmanaged([]u8) = .empty,
-
-    fn init(allocator: std.mem.Allocator) HostMap {
-        return .{ .allocator = allocator };
-    }
-
-    fn deinit(self: *HostMap) void {
-        var it = self.map.iterator();
-        while (it.next()) |e| {
-            self.allocator.free(e.key_ptr.*);
-            self.allocator.free(e.value_ptr.*);
-        }
-        self.map.deinit(self.allocator);
-    }
-
-    /// Parse `host=tenant;host=tenant;…`.
-    fn seed(self: *HostMap, config: []const u8) !void {
-        var it = std.mem.tokenizeScalar(u8, config, ';');
-        while (it.next()) |raw| {
-            const entry = std.mem.trim(u8, raw, " \t\r\n");
-            if (entry.len == 0) continue;
-            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return error.BadConfig;
-            const host = std.mem.trim(u8, entry[0..eq], " \t");
-            const tenant = std.mem.trim(u8, entry[eq + 1 ..], " \t");
-            if (host.len == 0 or tenant.len == 0) return error.BadConfig;
-            const h_dup = try self.allocator.dupe(u8, host);
-            errdefer self.allocator.free(h_dup);
-            const t_dup = try self.allocator.dupe(u8, tenant);
-            errdefer self.allocator.free(t_dup);
-            try self.map.put(self.allocator, h_dup, t_dup);
-        }
-    }
-
-    fn tenantFor(self: *HostMap, host: []const u8) ?[]const u8 {
-        return self.map.get(host);
-    }
-};
 
 // ── Header lookup over h2 ReqHeaders ──────────────────────────────────
 fn headerValue(rh: h2.ReqHeaders, name: []const u8) ?[]const u8 {
@@ -207,39 +76,111 @@ fn methodFrom(s: []const u8) ?curl.Method {
     return null;
 }
 
-const MOVE_SECRET_HEADER = "X-Rewind-Move-Secret";
-const TENANT_HEADER = "X-Rewind-Tenant";
-
-/// One backend response the orchestrator cares about: status + an owned
-/// copy of the body (the source bundle, relayed into the attach call).
-const BackendResp = struct {
-    status: u16,
-    body: []u8,
-    fn deinit(self: BackendResp, a: std.mem.Allocator) void {
-        a.free(self.body);
+// ── Owned-node helpers ────────────────────────────────────────────────
+fn dupNodes(a: std.mem.Allocator, src: []const []const u8) ![][]u8 {
+    const out = try a.alloc([]u8, src.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |n| a.free(n);
+        a.free(out);
     }
+    for (src, 0..) |n, i| {
+        out[i] = try a.dupe(u8, n);
+        filled = i + 1;
+    }
+    return out;
+}
+
+fn freeNodes(a: std.mem.Allocator, nodes: [][]u8) void {
+    for (nodes) |n| a.free(n);
+    a.free(nodes);
+}
+
+// ── Route cache (host → cluster nodes, short TTL) ─────────────────────
+//
+// The front door is single-threaded (one poll loop), so the cache needs no
+// locking; horizontal scaling is separate processes. A stale entry is safe —
+// serve-or-forward at the DP corrects a wrong cluster, so the only cost is a
+// hop. Entries simply expire (checked on read); no active eviction in the
+// first cut (size is bounded by distinct active hosts — a noted follow-up if
+// that grows unbounded).
+const RouteCache = struct {
+    allocator: std.mem.Allocator,
+    map: std.StringHashMapUnmanaged(Entry) = .empty,
+    ttl_ns: i128,
+
+    const Entry = struct {
+        nodes: [][]u8,
+        expires_ns: i128,
+    };
+
+    fn init(allocator: std.mem.Allocator, ttl_ns: i128) RouteCache {
+        return .{ .allocator = allocator, .ttl_ns = ttl_ns };
+    }
+
+    fn deinit(self: *RouteCache) void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            freeNodes(self.allocator, e.value_ptr.nodes);
+        }
+        self.map.deinit(self.allocator);
+    }
+
+    /// Fresh node list for `host`, or null (miss / expired).
+    fn get(self: *RouteCache, host: []const u8, now_ns: i128) ?[]const []const u8 {
+        const e = self.map.getPtr(host) orelse return null;
+        if (now_ns >= e.expires_ns) return null;
+        return e.nodes;
+    }
+
+    /// Cache `owned_nodes` (ownership transferred) for `host` with the
+    /// configured TTL. Replaces + frees any existing entry's nodes.
+    fn putOwned(self: *RouteCache, host: []const u8, owned_nodes: [][]u8, now_ns: i128) !void {
+        errdefer freeNodes(self.allocator, owned_nodes);
+        const gop = try self.map.getOrPut(self.allocator, host);
+        if (gop.found_existing) {
+            freeNodes(self.allocator, gop.value_ptr.nodes);
+        } else {
+            gop.key_ptr.* = self.allocator.dupe(u8, host) catch |e| {
+                self.map.removeByPtr(gop.key_ptr);
+                return e;
+            };
+        }
+        gop.value_ptr.nodes = owned_nodes;
+        gop.value_ptr.expires_ns = now_ns + self.ttl_ns;
+    }
+
+    /// Drop a host's entry (e.g. its cluster stopped answering — likely
+    /// moved/evicted; re-query the CP next time).
+    fn invalidate(self: *RouteCache, host: []const u8) void {
+        if (self.map.fetchRemove(host)) |kv| {
+            self.allocator.free(kv.key);
+            freeNodes(self.allocator, kv.value.nodes);
+        }
+    }
+};
+
+// ── CP route lookup result ────────────────────────────────────────────
+const CpRoute = union(enum) {
+    not_found,
+    moving,
+    placed: [][]u8, // owned node URLs
+};
+
+const RouteResult = union(enum) {
+    nodes: []const []const u8, // cache-owned; valid for this loop iteration
+    moving,
+    not_found,
 };
 
 const Router = struct {
     allocator: std.mem.Allocator,
-    directory: *Directory,
-    hosts: *HostMap,
-    /// Shared secret presented to backends' `/_system/v2-*` move surface,
-    /// and required (via `X-Rewind-Move-Secret`) on `/_control/move`.
-    /// Null disables the move control surface (503).
-    move_secret: ?[]const u8,
-    /// HTTP origins of the CP nodes (Slice 2 HA), for forwarding a directory
-    /// WRITE (`/_control/*`) when this node is not the directory group leader.
-    /// Empty for a single-node CP (this node always leads). `REWIND_CP_PEER_URLS`,
-    /// indexed by CP node id − 1 (same convention as `REWIND_CP_PEERS`).
-    /// Borrowed; owned by `main`.
-    cp_peer_urls: []const []const u8 = &.{},
-    /// This node's own index into `cp_peer_urls` (= CP node id − 1), so the
-    /// leader probe NEVER calls its own `/_cp/leader`: that is a synchronous
-    /// self-call from the poll loop (which is busy making the call), so it
-    /// can't be served and hangs until the request timeout. Null for a
-    /// single-node CP (no forwarding).
-    self_cp_idx: ?usize = null,
+    /// CP origins to resolve placement against (any node answers `/_cp/route`;
+    /// it's a read served from every CP node's projection). Tried in order;
+    /// the first reachable one wins. `REWIND_CP_URL`.
+    cp_urls: []const []const u8,
+    cache: *RouteCache,
 
     /// Reply helper: set an immediate status (no body) on the request
     /// entity and move it to response_in.
@@ -253,18 +194,6 @@ const Router = struct {
         try server.reg.move(ent, &server.request_out, &server.response_in);
     }
 
-    /// Reply with a status + owned text body (`msg` is freed by the
-    /// registry via `RespBody.deinit`).
-    fn replyText(server: *FrontH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, code: u16, msg: []u8) !void {
-        try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = code });
-        try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = null, .count = 0 });
-        try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = msg.ptr, .len = @intCast(msg.len) });
-        try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
-        try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
-        try server.reg.set(ent, &server.request_out, h2.Session, sess);
-        try server.reg.move(ent, &server.request_out, &server.response_in);
-    }
-
     fn processRequests(self: *Router, server: *FrontH2) !void {
         const entities = server.request_out.entitySlice();
         const sids = server.request_out.column(h2.StreamId);
@@ -272,78 +201,127 @@ const Router = struct {
         const req_hdrs = server.request_out.column(h2.ReqHeaders);
         const req_bodies = server.request_out.column(h2.ReqBody);
 
+        const now_ns = std.time.nanoTimestamp();
         for (entities, sids, sessions, req_hdrs, req_bodies) |ent, sid, sess, rh, rb| {
-            const req_path = headerValue(rh, ":path") orelse "/";
-
-            // 0. Control plane: `/_control/move` is handled by the front
-            //    door itself (the move orchestrator), not proxied to a
-            //    backend. It is the one component that sees all clusters +
-            //    owns the directory, so the move's directory flip is its
-            //    atomic commit point.
-            if (std.mem.startsWith(u8, req_path, "/_control/")) {
-                try self.handleControl(server, ent, sid, sess, rh, rb, req_path);
-                continue;
-            }
-
-            // 0b. Control plane: `/_cp/route?host=H` — the authoritative
-            //     owner lookup DP clusters consult for serve-or-forward
-            //     (Phase 7 slice a). A DP that can't serve a tenant locally
-            //     asks who currently owns it, and forwards there; the CP
-            //     (this front door, evolving into a dedicated binary) is the
-            //     one component with the host→tenant→cluster mapping.
-            if (std.mem.startsWith(u8, req_path, "/_cp/")) {
-                try self.handleCp(server, ent, sid, sess, req_path);
-                continue;
-            }
-
-            // 1. Resolve the inbound tenant from :authority (fall back to
-            //    Host). Strip any `:port` — the host map is keyed on the
-            //    bare hostname, matching the worker's `hostOnly`.
+            // Resolve the inbound tenant's cluster from :authority (fall back
+            // to Host). Strip any `:port` — placement is keyed on the bare
+            // hostname, matching the worker's `hostOnly`.
             const authority_raw = headerValue(rh, ":authority") orelse headerValue(rh, "host") orelse {
                 try replyStatus(server, ent, sid, sess, 400); // no host → bad request
                 continue;
             };
             const authority = hostOnly(authority_raw);
-            const tenant = self.hosts.tenantFor(authority) orelse {
-                std.log.warn("front: no tenant for host {s} → 404", .{authority});
-                try replyStatus(server, ent, sid, sess, 404);
-                continue;
-            };
-            const resolution = self.directory.resolve(tenant) orelse {
-                std.log.warn("front: tenant {s} unplaced → 421", .{tenant});
-                try replyStatus(server, ent, sid, sess, 421); // misdirected: no placement
-                continue;
-            };
-            // Mid-move: hold the tenant's traffic with a retryable 503
-            // until the directory flip completes (the brief pause).
-            if (resolution.moving) {
+
+            const route = self.resolveRoute(authority, now_ns) catch {
+                // CP unreachable — can't determine placement; client retries.
+                std.log.warn("front: CP route lookup for {s} failed → 503", .{authority});
                 try replyStatus(server, ent, sid, sess, 503);
                 continue;
-            }
-            const method_s = headerValue(rh, ":method") orelse "GET";
-            const method = methodFrom(method_s) orelse {
-                try replyStatus(server, ent, sid, sess, 405);
-                continue;
             };
-
-            // 2. Forward to the cluster, leader-aware (Phase 5). A
-            //    multi-node cluster has N node origins but only the tenant's
-            //    group leader takes writes; a follower 503s a write (the
-            //    bridge faults a non-leader propose), so try nodes in order
-            //    and stop at the first non-503. A single-node cluster has
-            //    one node — one attempt, unchanged from the milestone.
-            try self.proxyToCluster(server, ent, sid, sess, rh, rb, req_path, authority, method, resolution.cluster.nodes);
+            switch (route) {
+                .not_found => {
+                    std.log.warn("front: no placement for host {s} → 404", .{authority});
+                    try replyStatus(server, ent, sid, sess, 404);
+                },
+                // Mid-move: hold the tenant's traffic with a retryable 503
+                // until the directory flip completes (the brief pause).
+                .moving => try replyStatus(server, ent, sid, sess, 503),
+                .nodes => |nodes| {
+                    const req_path = headerValue(rh, ":path") orelse "/";
+                    const method_s = headerValue(rh, ":method") orelse "GET";
+                    const method = methodFrom(method_s) orelse {
+                        try replyStatus(server, ent, sid, sess, 405);
+                        continue;
+                    };
+                    const st = try self.proxyToCluster(server, ent, sid, sess, rh, rb, req_path, authority, method, nodes);
+                    // All nodes unreachable (502) → the cached cluster is
+                    // likely stale (moved/evicted). Drop it so the next
+                    // request re-resolves against the CP.
+                    if (st == 502) self.cache.invalidate(authority);
+                },
+            }
         }
     }
 
-    /// Reverse-proxy one request to whichever node of `nodes` currently
-    /// leads the tenant's group, discovered by retrying on 503 (a follower's
-    /// not-leader response). Relays the first non-503 backend response (or
-    /// the last 503 if every node is a follower / mid-election — the client
-    /// retries). A transport error against one node falls through to the
-    /// next; all-failed → 502. The forward headers + body are built once and
-    /// reused across node attempts (a retried write re-POSTs the same body —
-    /// safe, since only the leader commits it).
+    /// Resolve `host` → cluster nodes, cache-first. On miss, query the CP and
+    /// cache the result (unless `moving`, which is transient). Errors only if
+    /// no CP node is reachable.
+    fn resolveRoute(self: *Router, host: []const u8, now_ns: i128) !RouteResult {
+        if (self.cache.get(host, now_ns)) |nodes| return .{ .nodes = nodes };
+        switch (try self.cpRouteQuery(host)) {
+            .not_found => return .not_found,
+            .moving => return .moving,
+            .placed => |owned| {
+                try self.cache.putOwned(host, owned, now_ns);
+                return .{ .nodes = self.cache.get(host, now_ns).? };
+            },
+        }
+    }
+
+    /// Query the CP's `GET /_cp/route?host=H`, trying each CP origin until one
+    /// answers. 200 → parse `{cluster,tenant,moving,nodes}` (moving → `.moving`,
+    /// else `.placed` with owned nodes); 404 → `.not_found`. Errors if no CP
+    /// node returned a usable response.
+    fn cpRouteQuery(self: *Router, host: []const u8) !CpRoute {
+        const a = self.allocator;
+        const suffix = try std.fmt.allocPrint(a, "/_cp/route?host={s}", .{host});
+        defer a.free(suffix);
+
+        var last_err: anyerror = error.CpUnreachable;
+        for (self.cp_urls) |base| {
+            const url = std.fmt.allocPrint(a, "{s}{s}", .{ base, suffix }) catch |e| {
+                last_err = e;
+                continue;
+            };
+            defer a.free(url);
+            var easy = curl.Easy.init(a) catch |e| {
+                last_err = e;
+                continue;
+            };
+            defer easy.deinit();
+            var resp = easy.request(a, .{
+                .method = .GET,
+                .url = url,
+                .headers = &[_]curl.Header{},
+                .body = "",
+                .http_version = .h2c_prior_knowledge,
+                .verify_tls = false,
+            }) catch |e| {
+                std.log.warn("front: CP route {s} on {s} failed: {s}", .{ host, base, @errorName(e) });
+                last_err = e;
+                continue;
+            };
+            defer resp.deinit(a);
+
+            if (resp.status == 404) return .not_found;
+            if (resp.status != 200) {
+                last_err = error.CpBadStatus;
+                continue; // try the next CP node
+            }
+            const body = resp.body orelse "";
+            var parsed = std.json.parseFromSlice(struct {
+                cluster: []const u8 = "",
+                tenant: []const u8 = "",
+                moving: bool = false,
+                nodes: []const []const u8 = &.{},
+            }, a, body, .{ .ignore_unknown_fields = true }) catch {
+                last_err = error.CpBadBody;
+                continue;
+            };
+            defer parsed.deinit();
+            if (parsed.value.moving) return .moving;
+            return .{ .placed = try dupNodes(a, parsed.value.nodes) };
+        }
+        return last_err;
+    }
+
+    /// Reverse-proxy one request to whichever node of `nodes` currently leads
+    /// the tenant's group, discovered by retrying on 503 (a follower's
+    /// not-leader response). Relays the first non-503 backend response (or the
+    /// last 503 if every node is a follower / mid-election — the client
+    /// retries). A transport error against one node falls through to the next;
+    /// all-failed → 502. Returns the relayed status (502 sentinel on
+    /// all-failed) so the caller can invalidate a stale cache entry.
     fn proxyToCluster(
         self: *Router,
         server: *FrontH2,
@@ -356,7 +334,7 @@ const Router = struct {
         authority: []const u8,
         method: curl.Method,
         nodes: []const []const u8,
-    ) !void {
+    ) !u16 {
         const a = self.allocator;
 
         // Forward non-pseudo request headers, overriding Host to the
@@ -377,8 +355,6 @@ const Router = struct {
         }
         const body: []const u8 = if (rb.data) |d| d[0..rb.len] else &.{};
 
-        // The relay state we keep from the chosen attempt (owned body copy
-        // freed by the registry via RespBody.deinit).
         var have_resp = false;
         var relay_status: u16 = 502;
         var relay_data: ?[*]u8 = null;
@@ -411,7 +387,6 @@ const Router = struct {
             // A 503 from a non-last node means "not the leader" — try next.
             if (resp.status == 503 and !last) continue;
 
-            // Relay this response: copy the body into a registry-owned alloc.
             relay_status = resp.status;
             relay_data = null;
             relay_len = 0;
@@ -432,7 +407,7 @@ const Router = struct {
 
         if (!have_resp) {
             try replyStatus(server, ent, sid, sess, 502);
-            return;
+            return 502;
         }
         try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = relay_status });
         try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = null, .count = 0 });
@@ -441,658 +416,7 @@ const Router = struct {
         try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
         try server.reg.set(ent, &server.request_out, h2.Session, sess);
         try server.reg.move(ent, &server.request_out, &server.response_in);
-    }
-
-    // ── Control plane: owner lookup (serve-or-forward) ───────────────
-
-    /// `GET /_cp/route?host=H` — return the cluster that currently owns the
-    /// tenant for `H`, as JSON `{cluster, tenant, moving, nodes:[…]}`, or 404
-    /// if the host maps to no tenant / the tenant is unplaced. A DP cluster
-    /// that can't serve a request locally consults this and forwards to the
-    /// owner (Phase 7 slice a serve-or-forward) — so a stale Cloudflare route
-    /// (or a request to a post-move source) costs an extra hop, never a
-    /// failure. No auth: it leaks only placement (host→cluster), which the
-    /// public proxy config already encodes; lock it down when the CP becomes
-    /// its own binary.
-    fn handleCp(self: *Router, server: *FrontH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, path: []const u8) !void {
-        // `/_cp/leader` — 200 iff THIS CP node leads the directory raft group
-        // (so directory WRITES can commit here), else 503. A follower CP node
-        // uses this to discover the leader to forward a `/_control/*` write to;
-        // a single-node CP always answers 200.
-        if (std.mem.startsWith(u8, path, "/_cp/leader")) {
-            try replyStatus(server, ent, sid, sess, if (self.directory.isLeader()) 200 else 503);
-            return;
-        }
-        if (!std.mem.startsWith(u8, path, "/_cp/route")) {
-            try replyStatus(server, ent, sid, sess, 404);
-            return;
-        }
-        const host = queryParam(path, "host") orelse {
-            try replyStatus(server, ent, sid, sess, 400);
-            return;
-        };
-        const tenant = self.hosts.tenantFor(host) orelse {
-            try replyStatus(server, ent, sid, sess, 404);
-            return;
-        };
-        const resolution = self.directory.resolve(tenant) orelse {
-            try replyStatus(server, ent, sid, sess, 404);
-            return;
-        };
-
-        const a = self.allocator;
-        var buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer buf.deinit(a);
-        const w = buf.writer(a);
-        try w.print("{{\"cluster\":\"{s}\",\"tenant\":\"{s}\",\"moving\":{},\"nodes\":[", .{ resolution.cluster.id, tenant, resolution.moving });
-        for (resolution.cluster.nodes, 0..) |n, i| {
-            if (i > 0) try w.writeByte(',');
-            try w.print("\"{s}\"", .{n});
-        }
-        try w.writeAll("]}");
-        const owned = try buf.toOwnedSlice(a);
-        try replyText(server, ent, sid, sess, 200, owned);
-    }
-
-    // ── Control plane: tenant-move orchestration ─────────────────────
-
-    /// Route + auth a `/_control/*` request. Only `POST /_control/move`
-    /// exists; it requires the move secret (`X-Rewind-Move-Secret`).
-    fn handleControl(
-        self: *Router,
-        server: *FrontH2,
-        ent: rove.Entity,
-        sid: h2.StreamId,
-        sess: h2.Session,
-        rh: h2.ReqHeaders,
-        rb: h2.ReqBody,
-        path: []const u8,
-    ) !void {
-        const method_s = headerValue(rh, ":method") orelse "GET";
-        const is_move = std.mem.eql(u8, path, "/_control/move");
-        const is_move_live = std.mem.eql(u8, path, "/_control/move-live");
-        if (!(is_move or is_move_live) or !std.mem.eql(u8, method_s, "POST")) {
-            try replyStatus(server, ent, sid, sess, 404);
-            return;
-        }
-        const secret = self.move_secret orelse {
-            try replyStatus(server, ent, sid, sess, 503); // move surface disabled
-            return;
-        };
-        const presented = headerValue(rh, MOVE_SECRET_HEADER) orelse "";
-        if (presented.len != secret.len or !std.mem.eql(u8, presented, secret)) {
-            try replyStatus(server, ent, sid, sess, 401);
-            return;
-        }
-
-        // Multi-node CP (Slice 2 HA): the move flips the directory, which only
-        // commits on the directory-group LEADER. If this CP node is a follower,
-        // forward the whole control request to the CP leader and relay its
-        // response — so an operator can target any CP node. (Single-node CP
-        // always leads; `cp_peer_urls` is empty → handle locally.)
-        if (self.cp_peer_urls.len > 0 and !self.directory.isLeader()) {
-            try self.forwardControlToLeader(server, ent, sid, sess, rh, rb, path);
-            return;
-        }
-
-        const body: []const u8 = if (rb.data) |d| d[0..rb.len] else &.{};
-        if (is_move_live)
-            try self.handleMoveLive(server, ent, sid, sess, body)
-        else
-            try self.handleMove(server, ent, sid, sess, body);
-    }
-
-    /// Forward a `/_control/*` request to the CP node that currently leads the
-    /// directory group (discovered via `/_cp/leader`), relaying its response.
-    /// Used when this CP node is a follower (directory writes can't commit
-    /// here). 503 if no CP leader is reachable (the client retries).
-    fn forwardControlToLeader(
-        self: *Router,
-        server: *FrontH2,
-        ent: rove.Entity,
-        sid: h2.StreamId,
-        sess: h2.Session,
-        rh: h2.ReqHeaders,
-        rb: h2.ReqBody,
-        path: []const u8,
-    ) !void {
-        const a = self.allocator;
-        const t0 = std.time.milliTimestamp();
-        const leader = self.findCpLeaderUrl() orelse {
-            try replyStatus(server, ent, sid, sess, 503); // no CP leader right now
-            return;
-        };
-        defer a.free(leader);
-        const t1 = std.time.milliTimestamp();
-        std.log.info("front: forward findCpLeader: {d}ms → {s}", .{ t1 - t0, leader });
-        const method = methodFrom(headerValue(rh, ":method") orelse "POST") orelse .POST;
-        const body: []const u8 = if (rb.data) |d| d[0..rb.len] else &.{};
-        const resp = self.backendCall(leader, path, method, body, null) catch |err| {
-            std.log.warn("front: forward control to CP leader {s} failed: {s}", .{ leader, @errorName(err) });
-            try replyStatus(server, ent, sid, sess, 502);
-            return;
-        };
-        std.log.info("front: forward backendCall: {d}ms status={d}", .{ std.time.milliTimestamp() - t1, resp.status });
-        var r = resp;
-        defer r.deinit(a);
-        if (r.body.len == 0) {
-            try replyStatus(server, ent, sid, sess, @intCast(r.status));
-            return;
-        }
-        const owned = a.dupe(u8, r.body) catch {
-            try replyStatus(server, ent, sid, sess, @intCast(r.status));
-            return;
-        };
-        try replyText(server, ent, sid, sess, @intCast(r.status), owned);
-    }
-
-    /// Find the CP node currently leading the directory group: try each CP
-    /// peer's `/_cp/leader` until one answers 200, returning its URL (owned).
-    /// Null if none leads (mid-election / all unreachable).
-    fn findCpLeaderUrl(self: *Router) ?[]u8 {
-        const a = self.allocator;
-        for (self.cp_peer_urls, 0..) |base, i| {
-            // Never probe self — a blocking call to our own /_cp/leader from
-            // inside the poll loop self-deadlocks (we are the loop, busy here).
-            // We are forwarding precisely because we are NOT the leader.
-            if (self.self_cp_idx) |self_i| {
-                if (i == self_i) continue;
-            }
-            const resp = self.backendCall(base, "/_cp/leader", .GET, "", null) catch continue;
-            const ok = resp.status == 200;
-            var r = resp;
-            r.deinit(a);
-            if (ok) return a.dupe(u8, base) catch null;
-        }
-        return null;
-    }
-
-    /// Orchestrate a brief-pause tenant move (docs/v2-build-order.md
-    /// §Phase 4): hold the tenant → dump+quiesce on source → ship the
-    /// bundle to the destination → attach there → **flip the directory**
-    /// (the commit point) → evict the source. On any pre-flip failure the
-    /// directory reverts and the source is resumed, so a failed move is a
-    /// no-op the tenant survives.
-    fn handleMove(self: *Router, server: *FrontH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
-        const a = self.allocator;
-        var parsed = std.json.parseFromSlice(struct {
-            tenant: []const u8,
-            dest: []const u8,
-        }, a, body, .{ .ignore_unknown_fields = true }) catch {
-            try replyStatus(server, ent, sid, sess, 400);
-            return;
-        };
-        defer parsed.deinit();
-        const tenant = parsed.value.tenant;
-        const dest = parsed.value.dest;
-        if (tenant.len == 0 or dest.len == 0) {
-            try replyStatus(server, ent, sid, sess, 400);
-            return;
-        }
-
-        const resolution = self.directory.resolve(tenant) orelse {
-            try replyStatus(server, ent, sid, sess, 404); // unknown tenant
-            return;
-        };
-        if (resolution.moving) {
-            try replyStatus(server, ent, sid, sess, 409); // already moving
-            return;
-        }
-        const src = resolution.cluster;
-        if (std.mem.eql(u8, src.id, dest)) {
-            try replyStatus(server, ent, sid, sess, 400); // already on dest
-            return;
-        }
-        const dest_ref = self.directory.clusterById(dest) orelse {
-            try replyStatus(server, ent, sid, sess, 400); // unknown dest cluster
-            return;
-        };
-        // The node lists are pointer-stable for the directory's lifetime, so
-        // these slices stay valid across the blocking backend calls below.
-        const src_nodes = src.nodes;
-        const dest_nodes = dest_ref.nodes;
-
-        const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch {
-            try replyStatus(server, ent, sid, sess, 500);
-            return;
-        };
-        defer a.free(tbody);
-
-        // Per-step timing — the move is a chain of blocking back-end calls +
-        // directory raft commits; this surfaces which step stalls when the
-        // whole move runs long. Kept in tree (diagnostic state is not
-        // temporary).
-        var t_ms: i64 = std.time.milliTimestamp();
-        const T = struct {
-            fn lap(prev: *i64, comptime label: []const u8) void {
-                const now = std.time.milliTimestamp();
-                std.log.info("front: move step {s}: {d}ms", .{ label, now - prev.* });
-                prev.* = now;
-            }
-        };
-
-        self.directory.beginMove(tenant) catch {
-            try replyStatus(server, ent, sid, sess, 500);
-            return;
-        };
-        T.lap(&t_ms, "beginMove");
-
-        // 1. Quiesce + dump the source LEADER (v2-bundle is leader-gated —
-        //    a follower 421s, so try each source node until one returns the
-        //    bundle). Single-node source → one node, the leader.
-        var dump = self.bundleFromLeader(src_nodes, tbody) orelse {
-            self.resumeAll(tenant, src_nodes, tbody);
-            try replyStatus(server, ent, sid, sess, 502);
-            return;
-        };
-        defer dump.deinit(a);
-        T.lap(&t_ms, "bundle");
-
-        // 2. Attach on EVERY destination node (the group is formed across the
-        //    whole destination cluster: each node loads the bundle + creates
-        //    its incarnation at the migration epoch). All must 204; on any
-        //    failure, evict the nodes that did attach + resume the source.
-        if (!self.attachToAll(dest_nodes, dump.body, tenant)) {
-            self.evictAll(tenant, dest_nodes, tbody);
-            self.resumeAll(tenant, src_nodes, tbody);
-            try replyStatus(server, ent, sid, sess, 502);
-            return;
-        }
-        T.lap(&t_ms, "attach");
-
-        // 3. Await the freshly formed destination group's election so
-        //    post-move traffic finds a leader immediately (v2-leader polls).
-        if (!self.awaitDestLeader(dest_nodes, tenant)) {
-            self.evictAll(tenant, dest_nodes, tbody);
-            self.resumeAll(tenant, src_nodes, tbody);
-            try replyStatus(server, ent, sid, sess, 504);
-            return;
-        }
-        T.lap(&t_ms, "awaitDestLeader");
-
-        // 4. Flip the directory — the atomic commit point of the move.
-        self.directory.move(tenant, dest) catch {
-            // Both tenant + dest were validated above; a failure here is
-            // an invariant violation. Leave moving-held + surface 500.
-            try replyStatus(server, ent, sid, sess, 500);
-            return;
-        };
-        T.lap(&t_ms, "flip");
-
-        // 5. Evict the source on EVERY source node (destroy each group
-        //    incarnation + drop the instance). Best-effort: the move already
-        //    committed; a stale source group is reclaimed lazily and never
-        //    serves traffic again.
-        self.evictAll(tenant, src_nodes, tbody);
-        T.lap(&t_ms, "evict");
-
-        const msg = std.fmt.allocPrint(a, "moved {s}: {s} -> {s}\n", .{ tenant, src.id, dest }) catch {
-            try replyStatus(server, ent, sid, sess, 200);
-            return;
-        };
-        try replyText(server, ent, sid, sess, 200, msg);
-    }
-
-    /// Try each source node's leader-gated `/_system/v2-bundle` until one
-    /// returns 200 (the group leader) and hand back its bundle body. A
-    /// follower 421s (no quiesce taken there). Null if no node produced a
-    /// bundle (none is the leader / all unreachable). The caller owns the
-    /// returned `BackendResp`.
-    fn bundleFromLeader(self: *Router, src_nodes: []const []const u8, tbody: []const u8) ?BackendResp {
-        const a = self.allocator;
-        for (src_nodes) |base| {
-            const resp = self.backendCall(base, "/_system/v2-bundle", .POST, tbody, null) catch |err| {
-                std.log.warn("front: v2-bundle on {s} failed: {s}", .{ base, @errorName(err) });
-                continue;
-            };
-            if (resp.status == 200) return resp;
-            var r = resp;
-            r.deinit(a); // 421 follower / other — try the next node
-        }
-        return null;
-    }
-
-    /// Fan a `/_system/v2-attach` (bundle + `X-Rewind-Tenant`) out to every
-    /// destination node. True only if all returned 204 (idempotent
-    /// re-attach included). On the first failure returns false; the caller
-    /// evicts the partially-attached set.
-    fn attachToAll(self: *Router, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8) bool {
-        const a = self.allocator;
-        for (dest_nodes) |base| {
-            const resp = self.backendCall(base, "/_system/v2-attach", .POST, bundle, tenant) catch |err| {
-                std.log.warn("front: v2-attach on {s} failed: {s}", .{ base, @errorName(err) });
-                return false;
-            };
-            var r = resp;
-            defer r.deinit(a);
-            if (r.status != 204) {
-                std.log.warn("front: v2-attach on {s} → {d}", .{ base, r.status });
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /// Poll every destination node's `/_system/v2-leader?tenant=…` until one
-    /// reports 200 (the formed group elected a leader), bounded by a wall
-    /// deadline. True once a leader is seen; false on timeout.
-    fn awaitDestLeader(self: *Router, dest_nodes: []const []const u8, tenant: []const u8) bool {
-        const a = self.allocator;
-        const suffix = std.fmt.allocPrint(a, "/_system/v2-leader?tenant={s}", .{tenant}) catch return false;
-        defer a.free(suffix);
-        const deadline: i128 = std.time.nanoTimestamp() + 15 * std.time.ns_per_s;
-        while (std.time.nanoTimestamp() < deadline) {
-            for (dest_nodes) |base| {
-                const resp = self.backendCall(base, suffix, .GET, "", null) catch continue;
-                var r = resp;
-                r.deinit(a);
-                if (r.status == 200) return true;
-            }
-            std.Thread.sleep(50 * std.time.ns_per_ms);
-        }
-        return false;
-    }
-
-    /// Best-effort `/_system/v2-evict` to every node of a cluster (the move
-    /// committed, or we are unwinding a partial attach). Logs failures.
-    fn evictAll(self: *Router, tenant: []const u8, nodes: []const []const u8, tbody: []const u8) void {
-        const a = self.allocator;
-        for (nodes) |base| {
-            if (self.backendCall(base, "/_system/v2-evict", .POST, tbody, null)) |ev| {
-                var e2 = ev;
-                e2.deinit(a);
-            } else |err| {
-                std.log.warn("front: evict {s} on {s} failed: {s}", .{ tenant, base, @errorName(err) });
-            }
-        }
-    }
-
-    /// Abort path: revert the directory hold + resume EVERY source node (lift
-    /// the leader's quiesce; a no-op on followers that never quiesced) so a
-    /// failed move leaves the tenant serving where it started. Best-effort.
-    fn resumeAll(self: *Router, tenant: []const u8, src_nodes: []const []const u8, tbody: []const u8) void {
-        const a = self.allocator;
-        self.directory.abortMove(tenant) catch {};
-        for (src_nodes) |base| {
-            if (self.backendCall(base, "/_system/v2-resume", .POST, tbody, null)) |r| {
-                var rr = r;
-                rr.deinit(a);
-            } else |err| {
-                std.log.warn("front: resume source {s} ({s}) failed: {s}", .{ tenant, base, @errorName(err) });
-            }
-        }
-    }
-
-    // ── Stuck-move reconciliation (Slice 2 — move crash recovery) ────
-
-    /// Reconcile moves the directory durably recorded as in-flight but that no
-    /// orchestration is completing. The `moving` hold is durable (Slice 1), so
-    /// a CP crash between `beginMove` and the terminal `move`/`abortMove`
-    /// leaves a tenant stuck `moving` forever (front door 503s its traffic,
-    /// source quiesced). The flip is the move's commit point, so a still-
-    /// `moving` placement means the flip never happened and the SOURCE remains
-    /// authoritative: abort the move (revert to active) + resume the source.
-    ///
-    /// Runs ONLY on the directory leader (abort is a directory write), from the
-    /// serve loop between request batches. The front door is single-threaded
-    /// and a move orchestration is fully synchronous within one `handleControl`
-    /// (one serve-loop iteration), so this never overlaps a live move — any
-    /// tenant `moving` when this runs is a genuine stuck move from a prior /
-    /// crashed orchestration, safe to abort.
-    fn reconcileStuckMoves(self: *Router) void {
-        if (!self.directory.isLeader()) return;
-        const a = self.allocator;
-        const moving = self.directory.collectMoving(a) catch return;
-        defer {
-            for (moving) |t| a.free(t);
-            a.free(moving);
-        }
-        for (moving) |tenant| {
-            const res = self.directory.resolve(tenant) orelse continue;
-            if (!res.moving) continue; // raced a completing move — skip
-            const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch continue;
-            defer a.free(tbody);
-            std.log.warn("rewind-front: reconciling stuck move for {s} (abort + resume source {s})", .{ tenant, res.cluster.id });
-            // resumeAll: abortMove (revert to active) + best-effort resume each
-            // source node (lift a brief-pause quiesce). The source node list is
-            // pointer-stable past the resolve.
-            self.resumeAll(tenant, res.cluster.nodes, tbody);
-        }
-    }
-
-    // ── Zero-downtime move (Phase 7 slice c) ─────────────────────────
-
-    /// Orchestrate a ZERO-DOWNTIME tenant move — the source keeps serving the
-    /// whole time; no quiesce, no `moving` hold. Built on slice (b)'s
-    /// SYNCHRONOUS forwarding (a source write is acked only after the dest
-    /// applies it), so the dest always has every acked write and the snapshot
-    /// loads insert-if-absent without clobbering a forwarded (newer) key:
-    ///
-    ///   1. empty-attach the dest (form group + instance, NO data) on all
-    ///      destination nodes — ready to receive forwards.
-    ///   2. await the dest group's leader (its URL is the forward target).
-    ///   3. forward-begin on the source leader → it dual-writes every commit
-    ///      to the dest leader (synchronous).
-    ///   4. snapshot the source leader (non-quiescing — it keeps serving).
-    ///   5. load-merge the snapshot into every dest node (insert-if-absent,
-    ///      out-of-band from raft).
-    ///   6. flip the directory — the atomic commit point.
-    ///   7. evict the source — drops its instance + group + forward marker,
-    ///      so it stops serving + forwarding; serve-or-forward routes any
-    ///      straggler to the dest.
-    ///
-    /// A pre-flip failure forward-ends the source (stops dual-writing) +
-    /// evicts the half-attached dest, leaving the tenant serving on the
-    /// source untouched. Brief-pause `handleMove` stays for callers that want
-    /// it. (First cut: single forward target = the dest leader URL; a
-    /// dest-leader change mid-move is a noted refinement.)
-    fn handleMoveLive(self: *Router, server: *FrontH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
-        const a = self.allocator;
-        var parsed = std.json.parseFromSlice(struct { tenant: []const u8, dest: []const u8 }, a, body, .{ .ignore_unknown_fields = true }) catch {
-            try replyStatus(server, ent, sid, sess, 400);
-            return;
-        };
-        defer parsed.deinit();
-        const tenant = parsed.value.tenant;
-        const dest = parsed.value.dest;
-        if (tenant.len == 0 or dest.len == 0) {
-            try replyStatus(server, ent, sid, sess, 400);
-            return;
-        }
-        const resolution = self.directory.resolve(tenant) orelse {
-            try replyStatus(server, ent, sid, sess, 404);
-            return;
-        };
-        if (resolution.moving) {
-            try replyStatus(server, ent, sid, sess, 409);
-            return;
-        }
-        const src = resolution.cluster;
-        if (std.mem.eql(u8, src.id, dest)) {
-            try replyStatus(server, ent, sid, sess, 400);
-            return;
-        }
-        const dest_ref = self.directory.clusterById(dest) orelse {
-            try replyStatus(server, ent, sid, sess, 400);
-            return;
-        };
-        const src_nodes = src.nodes;
-        const dest_nodes = dest_ref.nodes;
-        const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch {
-            try replyStatus(server, ent, sid, sess, 500);
-            return;
-        };
-        defer a.free(tbody);
-
-        // 1. Empty-attach the dest (no bundle → just the group + instance).
-        if (!self.attachToAll(dest_nodes, "", tenant)) {
-            self.evictAll(tenant, dest_nodes, tbody);
-            try replyStatus(server, ent, sid, sess, 502);
-            return;
-        }
-        // 2. Await the dest leader; its URL is the source's forward target.
-        const dest_leader = self.findDestLeaderUrl(dest_nodes, tenant) orelse {
-            self.evictAll(tenant, dest_nodes, tbody);
-            try replyStatus(server, ent, sid, sess, 504);
-            return;
-        };
-        defer a.free(dest_leader);
-
-        // 3. forward-begin on the source leader (dual-write to the dest leader).
-        if (!self.forwardBeginOnLeader(src_nodes, tenant, dest_leader)) {
-            self.evictAll(tenant, dest_nodes, tbody);
-            try replyStatus(server, ent, sid, sess, 502);
-            return;
-        }
-
-        // 4. Snapshot the source leader (non-quiescing; it keeps serving).
-        var snap = self.snapshotFromLeader(src_nodes, tbody) orelse {
-            self.forwardEndOnLeader(src_nodes, tenant);
-            self.evictAll(tenant, dest_nodes, tbody);
-            try replyStatus(server, ent, sid, sess, 502);
-            return;
-        };
-        defer snap.deinit(a);
-
-        // 5. Load-merge the snapshot into every dest node (insert-if-absent).
-        if (!self.loadMergeToAll(dest_nodes, snap.body, tenant)) {
-            self.forwardEndOnLeader(src_nodes, tenant);
-            self.evictAll(tenant, dest_nodes, tbody);
-            try replyStatus(server, ent, sid, sess, 502);
-            return;
-        }
-
-        // 6. Flip the directory — the atomic commit point.
-        self.directory.move(tenant, dest) catch {
-            try replyStatus(server, ent, sid, sess, 500);
-            return;
-        };
-
-        // 7. Evict the source (drops instance + group + forward marker → it
-        //    stops serving + forwarding; serve-or-forward routes stragglers
-        //    to the dest). Evict subsumes forward-end on the happy path.
-        self.evictAll(tenant, src_nodes, tbody);
-
-        const msg = std.fmt.allocPrint(a, "moved-live {s}: {s} -> {s}\n", .{ tenant, src.id, dest }) catch {
-            try replyStatus(server, ent, sid, sess, 200);
-            return;
-        };
-        try replyText(server, ent, sid, sess, 200, msg);
-    }
-
-    /// Poll every destination node's `/_system/v2-leader?tenant=` until one
-    /// reports 200, and return that node's base URL (owned) — the source's
-    /// forward target. Null on timeout.
-    fn findDestLeaderUrl(self: *Router, dest_nodes: []const []const u8, tenant: []const u8) ?[]u8 {
-        const a = self.allocator;
-        const suffix = std.fmt.allocPrint(a, "/_system/v2-leader?tenant={s}", .{tenant}) catch return null;
-        defer a.free(suffix);
-        const deadline: i128 = std.time.nanoTimestamp() + 15 * std.time.ns_per_s;
-        while (std.time.nanoTimestamp() < deadline) {
-            for (dest_nodes) |base| {
-                const resp = self.backendCall(base, suffix, .GET, "", null) catch continue;
-                var r = resp;
-                r.deinit(a);
-                if (r.status == 200) return a.dupe(u8, base) catch null;
-            }
-            std.Thread.sleep(50 * std.time.ns_per_ms);
-        }
-        return null;
-    }
-
-    /// forward-begin on the source leader: try each source node's leader-gated
-    /// `/_system/v2-forward-begin {tenant,dest}` until one 204s (the leader).
-    fn forwardBeginOnLeader(self: *Router, src_nodes: []const []const u8, tenant: []const u8, dest_url: []const u8) bool {
-        const a = self.allocator;
-        const fb = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\",\"dest\":\"{s}\"}}", .{ tenant, dest_url }) catch return false;
-        defer a.free(fb);
-        for (src_nodes) |base| {
-            const resp = self.backendCall(base, "/_system/v2-forward-begin", .POST, fb, null) catch continue;
-            const ok = resp.status == 204;
-            var r = resp;
-            r.deinit(a);
-            if (ok) return true;
-        }
-        return false;
-    }
-
-    /// forward-end on the source leader (abort cleanup): best-effort.
-    fn forwardEndOnLeader(self: *Router, src_nodes: []const []const u8, tenant: []const u8) void {
-        const a = self.allocator;
-        const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch return;
-        defer a.free(tbody);
-        for (src_nodes) |base| {
-            if (self.backendCall(base, "/_system/v2-forward-end", .POST, tbody, null)) |r| {
-                const ok = r.status == 204;
-                var rr = r;
-                rr.deinit(a);
-                if (ok) return;
-            } else |_| {}
-        }
-    }
-
-    /// Dump the source LEADER's NON-quiescing snapshot (try each source node's
-    /// leader-gated `/_system/v2-snapshot` until one 200s). Owned body.
-    fn snapshotFromLeader(self: *Router, src_nodes: []const []const u8, tbody: []const u8) ?BackendResp {
-        const a = self.allocator;
-        for (src_nodes) |base| {
-            const resp = self.backendCall(base, "/_system/v2-snapshot", .POST, tbody, null) catch continue;
-            if (resp.status == 200) return resp;
-            var r = resp;
-            r.deinit(a);
-        }
-        return null;
-    }
-
-    /// Load-merge a snapshot (insert-if-absent) into every destination node.
-    fn loadMergeToAll(self: *Router, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8) bool {
-        const a = self.allocator;
-        for (dest_nodes) |base| {
-            const resp = self.backendCall(base, "/_system/v2-load-merge", .POST, bundle, tenant) catch |err| {
-                std.log.warn("front: v2-load-merge on {s} failed: {s}", .{ base, @errorName(err) });
-                return false;
-            };
-            var r = resp;
-            defer r.deinit(a);
-            if (r.status != 204) return false;
-        }
-        return true;
-    }
-
-    /// Blocking libcurl call to a backend's move surface, presenting the
-    /// move secret (+ optional `X-Rewind-Tenant`). Returns status + an
-    /// owned copy of the response body.
-    fn backendCall(
-        self: *Router,
-        base_url: []const u8,
-        path_suffix: []const u8,
-        method: curl.Method,
-        body: []const u8,
-        tenant_hdr: ?[]const u8,
-    ) !BackendResp {
-        const a = self.allocator;
-        const url = try std.fmt.allocPrint(a, "{s}{s}", .{ base_url, path_suffix });
-        defer a.free(url);
-
-        var headers: std.ArrayListUnmanaged(curl.Header) = .empty;
-        defer headers.deinit(a);
-        try headers.append(a, .{ .name = MOVE_SECRET_HEADER, .value = self.move_secret.? });
-        if (tenant_hdr) |t| try headers.append(a, .{ .name = TENANT_HEADER, .value = t });
-
-        var easy = try curl.Easy.init(a);
-        defer easy.deinit();
-        var resp = try easy.request(a, .{
-            .method = method,
-            .url = url,
-            .headers = headers.items,
-            .body = body,
-            .http_version = .h2c_prior_knowledge,
-            .verify_tls = false,
-        });
-        defer resp.deinit(a);
-
-        const body_copy = if (resp.body) |b| try a.dupe(u8, b) else try a.dupe(u8, "");
-        return .{ .status = resp.status, .body = body_copy };
+        return relay_status;
     }
 };
 
@@ -1101,18 +425,6 @@ const Router = struct {
 fn hostOnly(authority: []const u8) []const u8 {
     if (std.mem.lastIndexOfScalar(u8, authority, ':')) |i| return authority[0..i];
     return authority;
-}
-
-/// Read a single query-string value (`/p?a=b&c=d`) by key. Values taken
-/// verbatim (no percent-decoding — the CP route lookup uses bare hostnames).
-fn queryParam(path: []const u8, key: []const u8) ?[]const u8 {
-    const q = std.mem.indexOfScalar(u8, path, '?') orelse return null;
-    var it = std.mem.tokenizeScalar(u8, path[q + 1 ..], '&');
-    while (it.next()) |pair| {
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-        if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
-    }
-    return null;
 }
 
 /// hop-by-hop headers must not be forwarded across a proxy (RFC 7230 §6.1).
@@ -1167,115 +479,24 @@ pub fn main() !void {
     const port_str = arg_it.next() orelse "8080";
     const port = try std.fmt.parseInt(u16, port_str, 10);
 
-    // Control-plane directory — durable, backed by a single-node CP bridge
-    // (one "directory" raft group; docs/v2-cp-directory-replication.md
-    // Slice 1). The store at `REWIND_CP_DATA_DIR` persists placement across
-    // restarts; `initReplicated` replays it before the pump thread starts.
-    // Required: a CP without durable storage loses every committed move on
-    // restart, which is a misconfiguration — fail loud rather than default
-    // to an ephemeral path that silently re-seeds static config.
-    const cp_data_dir = std.posix.getenv("REWIND_CP_DATA_DIR") orelse {
-        std.log.err("rewind-front: REWIND_CP_DATA_DIR is required (the durable directory store path)", .{});
-        return error.MissingCpDataDir;
-    };
-    // Single-node CP by default; a multi-node (HA) CP is configured by env
-    // (this CP node's raft id, the voter set, the consensus transport
-    // addresses). The directory raft group spans the voter set.
-    var cp_self_idx: ?usize = null;
-    const cp_bridge = if (try parseCpMultiNode(allocator)) |mn| blk: {
-        defer mn.deinit(allocator);
-        cp_self_idx = mn.node_id - 1; // index into REWIND_CP_PEER_URLS
-        std.log.info("rewind-front: multi-node CP id={d} voters={d} listen={s}", .{ mn.node_id, mn.voters.len, mn.listen_str });
-        break :blk try Bridge.initMultiNode(allocator, cp_data_dir, mn.node_id, mn.voters, mn.listen_addr, mn.peers);
-    } else try Bridge.initSingleNode(allocator, cp_data_dir);
-    const directory = try Directory.initReplicated(allocator, cp_bridge);
-    // Teardown order matters: the pump fires the directory's apply observer,
-    // so the pump must STOP (`cp_bridge.deinit` → `stopPump`) before the
-    // directory is freed. Defers run LIFO, so declare `directory.destroy`
-    // first (runs last) and `cp_bridge.deinit` second (runs first).
-    defer directory.destroy();
-    defer cp_bridge.deinit();
-    try cp_bridge.startPump();
-
-    // Static config seeds ONLY a fresh (empty) directory — a restart over a
-    // populated store keeps its committed placements (incl. completed moves)
-    // rather than re-seeding back to the static config.
-    //
-    // Single-node CP: this node is always the leader, so seed immediately.
-    // Multi-node CP: a directory write only commits on the LEADER, so only the
-    // leader seeds (once); every follower boots empty and fills its projection
-    // from the leader's replicated seed (the apply observer). Wait briefly for
-    // election / replication to settle before deciding.
-    if (cp_bridge.node.isSingleNode()) {
-        if (directory.isEmpty()) {
-            try directory.seedClusters(getEnvCfg("REWIND_CLUSTERS"));
-            try directory.seedPlacements(getEnvCfg("REWIND_PLACEMENT"));
-            std.log.info("rewind-front: seeded directory from static config", .{});
-        } else {
-            std.log.info("rewind-front: directory replayed from {s} (skipping static seed)", .{cp_data_dir});
-        }
-    } else {
-        const deadline: i128 = std.time.nanoTimestamp() + 10 * std.time.ns_per_s;
-        while (std.time.nanoTimestamp() < deadline and !directory.isLeader() and directory.isEmpty()) {
-            std.Thread.sleep(50 * std.time.ns_per_ms);
-        }
-        if (directory.isLeader() and directory.isEmpty()) {
-            // Seed as the leader, RETRYING transient replication faults:
-            // leadership can still be settling right after election, so a
-            // propose may fault even though we just read isLeader()==true.
-            // Seeds are idempotent (addCluster/assign upsert), so re-running
-            // after a partial seed is safe. Stop if we lose leadership (a peer
-            // will seed) or the store fills (replicated from elsewhere).
-            var seeded = false;
-            var attempt: u32 = 0;
-            while (attempt < 100) : (attempt += 1) {
-                if (!directory.isLeader() or !directory.isEmpty()) break;
-                directory.seedClusters(getEnvCfg("REWIND_CLUSTERS")) catch |e| switch (e) {
-                    error.Replication => {
-                        std.Thread.sleep(100 * std.time.ns_per_ms);
-                        continue;
-                    },
-                    else => return e, // malformed config / OOM → fail loud
-                };
-                directory.seedPlacements(getEnvCfg("REWIND_PLACEMENT")) catch |e| switch (e) {
-                    error.Replication => {
-                        std.Thread.sleep(100 * std.time.ns_per_ms);
-                        continue;
-                    },
-                    else => return e,
-                };
-                seeded = true;
-                break;
-            }
-            if (seeded) {
-                std.log.info("rewind-front: directory leader seeded from static config", .{});
-            } else if (directory.isEmpty()) {
-                std.log.warn("rewind-front: leader could not seed (replication unstable); will rely on replication / a peer", .{});
-            } else {
-                std.log.info("rewind-front: directory replayed/replicated (skipping static seed)", .{});
-            }
-        } else if (directory.isEmpty()) {
-            std.log.info("rewind-front: CP follower — awaiting directory replication from the leader", .{});
-        } else {
-            std.log.info("rewind-front: directory replayed/replicated (skipping static seed)", .{});
-        }
+    // CP origins to resolve placement against. Required — a front door with no
+    // CP cannot route. `REWIND_CP_URL=http://cp1:9090;http://cp2:9090;…`
+    // (any CP node answers `/_cp/route`; multiple for HA).
+    const cp_urls = try parseUrlList(allocator, getEnvCfg("REWIND_CP_URL"));
+    defer freeUrlList(allocator, cp_urls);
+    if (cp_urls.len == 0) {
+        std.log.err("rewind-front: REWIND_CP_URL is required (the CP origin(s) to resolve placement)", .{});
+        return error.MissingCpUrl;
     }
 
-    // CP peer HTTP origins (Slice 2 HA) — the OTHER CP nodes' front-door URLs,
-    // so a follower can forward a `/_control/*` write to the directory leader.
-    // `REWIND_CP_PEER_URLS=http://a:8080;http://b:8080;http://c:8080`. Empty
-    // for a single-node CP (this node always leads → no forward).
-    const cp_peer_urls = try parseUrlList(allocator, getEnvCfg("REWIND_CP_PEER_URLS"));
-    defer freeUrlList(allocator, cp_peer_urls);
-
-    var hosts = HostMap.init(allocator);
-    defer hosts.deinit();
-    try hosts.seed(getEnvCfg("REWIND_HOSTS"));
-
-    // V2 Phase 4 — shared secret for the cluster-internal move surface.
-    // The front door presents it to backends' `/_system/v2-*` endpoints
-    // and requires it on `/_control/move`. Unset → move control disabled.
-    const move_secret: ?[]const u8 = std.posix.getenv("REWIND_MOVE_SECRET");
+    // Route-cache TTL (ms). A stale entry costs at most a serve-or-forward hop,
+    // so keep it short but non-zero to keep the CP off the per-request path.
+    const cache_ms: i128 = blk: {
+        const s = std.posix.getenv("REWIND_ROUTE_CACHE_MS") orelse break :blk 1000;
+        break :blk std.fmt.parseInt(i128, std.mem.trim(u8, s, " \t"), 10) catch 1000;
+    };
+    var cache = RouteCache.init(allocator, cache_ms * std.time.ns_per_ms);
+    defer cache.deinit();
 
     var reg = try rove.Registry.init(allocator, .{
         .max_entities = 8192,
@@ -1293,25 +514,9 @@ pub fn main() !void {
     }, .{ .tls_config = null });
     defer server.destroy();
 
-    var router = Router{ .allocator = allocator, .directory = directory, .hosts = &hosts, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx };
+    var router = Router{ .allocator = allocator, .cp_urls = cp_urls, .cache = &cache };
 
-    // Periodic stuck-move reconciliation on the directory leader (between
-    // request batches; never overlaps a synchronous move — see
-    // `reconcileStuckMoves`). last=0 → the first iteration reconciles, so a CP
-    // restart / failover cleans up a crashed move within one tick. Period from
-    // `REWIND_CP_RECONCILE_SECS` (default 5); 0 disables reconciliation.
-    const reconcile_secs: i128 = blk: {
-        const s = std.posix.getenv("REWIND_CP_RECONCILE_SECS") orelse break :blk 5;
-        break :blk std.fmt.parseInt(i128, std.mem.trim(u8, s, " \t"), 10) catch 5;
-    };
-    const reconcile_period_ns: i128 = reconcile_secs * std.time.ns_per_s;
-    var last_reconcile_ns: i128 = 0;
-
-    std.log.info("rewind-front: listening on 0.0.0.0:{d} (move control {s}, reconcile {s})", .{
-        port,
-        if (move_secret != null) "enabled" else "disabled",
-        if (reconcile_secs > 0) "on" else "off",
-    });
+    std.log.info("rewind-front: listening on 0.0.0.0:{d} (cp {d} node(s), route cache {d}ms)", .{ port, cp_urls.len, cache_ms });
     while (!stop_flag.load(.acquire)) {
         server.pollWithTimeout(10 * std.time.ns_per_ms) catch |err| switch (err) {
             error.SignalInterrupt => continue,
@@ -1321,14 +526,6 @@ pub fn main() !void {
         try reg.flush();
         try cleanupResponses(server);
         try reg.flush();
-
-        if (reconcile_secs > 0) {
-            const now_ns = std.time.nanoTimestamp();
-            if (now_ns - last_reconcile_ns > reconcile_period_ns) {
-                last_reconcile_ns = now_ns;
-                router.reconcileStuckMoves();
-            }
-        }
     }
     std.log.info("rewind-front: shut down", .{});
 }
