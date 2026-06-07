@@ -11,8 +11,12 @@
 //! bucket per worker); acceptable overshoot at launch scale. A future
 //! iteration can periodically sync buckets via root.db.
 //!
-//! Single plan tier in v1 — `defaultCaps()` returns the same numbers
-//! for every instance. Phase 10 will branch on the instance's plan.
+//! Per-tenant plan tiers: `check`/`checkN` take the tenant's plan-resolved
+//! `RateLimitCaps` + `plan_gen` (from its `TenantSlot`, docs/plan-tiers.md
+//! Lever 1). A bucket snapshots its caps at creation, so when the generation
+//! moves (a tier change) `getOrCreate` re-inits the caps. `defaultCaps()` is
+//! the fallback for callers without a resolved plan (test paths, async
+//! activations that never ran a request-rate check).
 //!
 //! Actions covered in v1: `request` (per-instance HTTP request budget,
 //! protects the worker from a single noisy tenant) and `email`
@@ -109,8 +113,14 @@ pub const TokenBucket = struct {
 
 const InstanceBuckets = struct {
     buckets: [ACTION_COUNT]TokenBucket,
+    /// Plan generation the caps were snapshotted at (the tenant's
+    /// `TenantSlot.plan_gen` at creation). A bucket snapshots its caps once,
+    /// so a tier change only takes effect when `getOrCreate` notices the
+    /// generation moved and re-inits (docs/plan-tiers.md Lever 1
+    /// generation-refresh). 0 = the default-caps generation.
+    gen: u64,
 
-    fn init(caps: RateLimitCaps, now_ns: i64) InstanceBuckets {
+    fn init(caps: RateLimitCaps, now_ns: i64, gen: u64) InstanceBuckets {
         var bs: [ACTION_COUNT]TokenBucket = undefined;
         bs[@intFromEnum(Action.request)] = TokenBucket.init(
             caps.request_capacity,
@@ -122,7 +132,7 @@ const InstanceBuckets = struct {
             caps.email_refill_per_sec,
             now_ns,
         );
-        return .{ .buckets = bs };
+        return .{ .buckets = bs, .gen = gen };
     }
 };
 
@@ -148,29 +158,35 @@ pub const RateLimiter = struct {
         self.instances.deinit(self.allocator);
     }
 
-    /// Take one token from `(instance_id, action)`. Returns true if
-    /// the action is allowed, false if the bucket is empty.
+    /// Take one token from `(instance_id, action)`, sourcing the bucket caps
+    /// from the tenant's resolved plan (`caps`/`gen` from its `TenantSlot`).
+    /// Returns true if allowed, false if the bucket is empty.
     /// `error.OutOfMemory` only on first-use lazy bucket creation.
     pub fn check(
         self: *RateLimiter,
         instance_id: []const u8,
         action: Action,
+        caps: RateLimitCaps,
+        gen: u64,
         now_ns: i64,
     ) !bool {
-        return self.checkN(instance_id, action, 1, now_ns);
+        return self.checkN(instance_id, action, 1, caps, gen, now_ns);
     }
 
-    /// Take `n` tokens from `(instance_id, action)`. Returns true
-    /// iff the bucket had `n` tokens (decremented); false if not
-    /// (bucket unchanged beyond the refill).
+    /// Take `n` tokens from `(instance_id, action)`. Returns true iff the
+    /// bucket had `n` tokens (decremented); false if not (bucket unchanged
+    /// beyond the refill). `caps`/`gen` are the tenant's plan-resolved rate
+    /// caps + plan generation; a moved generation re-snapshots the caps.
     pub fn checkN(
         self: *RateLimiter,
         instance_id: []const u8,
         action: Action,
         n: u32,
+        caps: RateLimitCaps,
+        gen: u64,
         now_ns: i64,
     ) !bool {
-        const inst = try self.getOrCreate(instance_id, now_ns);
+        const inst = try self.getOrCreate(instance_id, caps, gen, now_ns);
         return inst.buckets[@intFromEnum(action)].tryTake(@floatFromInt(n), now_ns);
     }
 
@@ -196,13 +212,21 @@ pub const RateLimiter = struct {
     fn getOrCreate(
         self: *RateLimiter,
         instance_id: []const u8,
+        caps: RateLimitCaps,
+        gen: u64,
         now_ns: i64,
     ) !*InstanceBuckets {
         const gop = try self.instances.getOrPut(self.allocator, instance_id);
         if (!gop.found_existing) {
             const owned = try self.allocator.dupe(u8, instance_id);
             gop.key_ptr.* = owned;
-            gop.value_ptr.* = InstanceBuckets.init(self.caps, now_ns);
+            gop.value_ptr.* = InstanceBuckets.init(caps, now_ns, gen);
+        } else if (gop.value_ptr.gen != gen) {
+            // The tenant's plan changed (generation moved): re-snapshot the
+            // caps. Reset tokens to full — simpler than rescaling, and harmless
+            // (a tenant whose tier just changed starts fresh at the new burst).
+            // docs/plan-tiers.md Lever 1 "generation-refresh."
+            gop.value_ptr.* = InstanceBuckets.init(caps, now_ns, gen);
         }
         return gop.value_ptr;
     }
@@ -267,14 +291,14 @@ test "limiter: per-instance isolation" {
     });
     defer rl.deinit();
 
-    try testing.expect(try rl.check("acme", .request, 0));
-    try testing.expect(try rl.check("acme", .request, 0));
-    try testing.expect(!(try rl.check("acme", .request, 0))); // exhausted
+    try testing.expect(try rl.check("acme", .request, rl.caps, 0, 0));
+    try testing.expect(try rl.check("acme", .request, rl.caps, 0, 0));
+    try testing.expect(!(try rl.check("acme", .request, rl.caps, 0, 0))); // exhausted
 
     // Different instance has its own bucket.
-    try testing.expect(try rl.check("beta", .request, 0));
-    try testing.expect(try rl.check("beta", .request, 0));
-    try testing.expect(!(try rl.check("beta", .request, 0)));
+    try testing.expect(try rl.check("beta", .request, rl.caps, 0, 0));
+    try testing.expect(try rl.check("beta", .request, rl.caps, 0, 0));
+    try testing.expect(!(try rl.check("beta", .request, rl.caps, 0, 0)));
 }
 
 test "limiter: actions are independent within an instance" {
@@ -286,11 +310,11 @@ test "limiter: actions are independent within an instance" {
     });
     defer rl.deinit();
 
-    try testing.expect(try rl.check("acme", .request, 0));
-    try testing.expect(!(try rl.check("acme", .request, 0)));
+    try testing.expect(try rl.check("acme", .request, rl.caps, 0, 0));
+    try testing.expect(!(try rl.check("acme", .request, rl.caps, 0, 0)));
     // request bucket exhausted but email bucket still has tokens.
-    try testing.expect(try rl.check("acme", .email, 0));
-    try testing.expect(!(try rl.check("acme", .email, 0)));
+    try testing.expect(try rl.check("acme", .email, rl.caps, 0, 0));
+    try testing.expect(!(try rl.check("acme", .email, rl.caps, 0, 0)));
 }
 
 test "limiter: retryAfterSeconds returns at least 1 + caps inf at 60" {
@@ -302,13 +326,13 @@ test "limiter: retryAfterSeconds returns at least 1 + caps inf at 60" {
     });
     defer rl.deinit();
 
-    _ = try rl.check("acme", .request, 0);
-    _ = try rl.check("acme", .request, 0);
+    _ = try rl.check("acme", .request, rl.caps, 0, 0);
+    _ = try rl.check("acme", .request, rl.caps, 0, 0);
     // 0.2s away in real terms, but we round up to 1s minimum.
     try testing.expectEqual(@as(u32, 1), rl.retryAfterSeconds("acme", .request));
 
-    _ = try rl.check("acme", .email, 0);
-    _ = try rl.check("acme", .email, 0);
+    _ = try rl.check("acme", .email, rl.caps, 0, 0);
+    _ = try rl.check("acme", .email, rl.caps, 0, 0);
     // Refill rate 0 → infinite wait → fallback 60s.
     try testing.expectEqual(@as(u32, 60), rl.retryAfterSeconds("acme", .email));
 }
@@ -318,4 +342,40 @@ test "limiter: retryAfterSeconds = 1 for unknown instance" {
     defer rl.deinit();
     // Never seen `ghost` — sensible default rather than crash.
     try testing.expectEqual(@as(u32, 1), rl.retryAfterSeconds("ghost", .request));
+}
+
+test "limiter: per-instance caps come from the passed plan, not the default" {
+    // The limiter's own `caps` is small, but a tenant on a bigger plan passes
+    // bigger caps per call — its bucket is sized from the plan, not `self.caps`.
+    var rl = RateLimiter.init(testing.allocator, .{ .request_capacity = 1, .request_refill_per_sec = 0 });
+    defer rl.deinit();
+    const pro: RateLimitCaps = .{ .request_capacity = 3, .request_refill_per_sec = 0 };
+    try testing.expect(try rl.check("acme", .request, pro, 1, 0));
+    try testing.expect(try rl.check("acme", .request, pro, 1, 0));
+    try testing.expect(try rl.check("acme", .request, pro, 1, 0));
+    try testing.expect(!(try rl.check("acme", .request, pro, 1, 0))); // 3-burst from the plan
+}
+
+test "limiter: a moved generation re-snapshots the caps (tier change)" {
+    var rl = RateLimiter.init(testing.allocator, .{});
+    defer rl.deinit();
+    const free: RateLimitCaps = .{ .request_capacity = 1, .request_refill_per_sec = 0 };
+    const pro: RateLimitCaps = .{ .request_capacity = 5, .request_refill_per_sec = 0 };
+
+    // Free tier (gen 1): a single-token burst, then exhausted.
+    try testing.expect(try rl.check("acme", .request, free, 1, 0));
+    try testing.expect(!(try rl.check("acme", .request, free, 1, 0)));
+
+    // Same generation → caps are NOT re-read; still exhausted even if we pass
+    // bigger caps (the bucket snapshotted free at gen 1).
+    try testing.expect(!(try rl.check("acme", .request, pro, 1, 0)));
+
+    // Upgrade bumps the generation → caps re-snapshot to pro, bucket resets
+    // full. The paying customer's higher limit is live immediately.
+    try testing.expect(try rl.check("acme", .request, pro, 2, 0));
+    try testing.expect(try rl.check("acme", .request, pro, 2, 0));
+    try testing.expect(try rl.check("acme", .request, pro, 2, 0));
+    try testing.expect(try rl.check("acme", .request, pro, 2, 0));
+    try testing.expect(try rl.check("acme", .request, pro, 2, 0));
+    try testing.expect(!(try rl.check("acme", .request, pro, 2, 0))); // pro 5-burst spent
 }

@@ -139,6 +139,14 @@ pub const Request = struct {
     /// per-instance bucket key. Empty when the dispatcher runs
     /// outside a worker context (test paths).
     instance_id: []const u8 = "",
+    /// Plan-resolved rate caps + plan generation for `instance_id` (from its
+    /// `TenantSlot`), threaded to DispatchState so both the request-rate check
+    /// and the `email.send` rate check size their buckets from the tenant's
+    /// plan and pick up a tier change via the generation (docs/plan-tiers.md
+    /// Lever 1). Defaults = the free/default caps for paths with no resolved
+    /// plan (tests, internal callback dispatch).
+    plan_rate: limiter_mod.RateLimitCaps = .{},
+    plan_gen: u64 = 0,
     /// Phase 5 PR-2b: true when the dispatched module belongs to the
     /// `__system/` namespace (resolved from `NodeState.builtin_modules`,
     /// not from a tenant's deployment files). Built-in modules are
@@ -531,6 +539,8 @@ pub const Dispatcher = struct {
             .bytecodes = bytecodes,
             .limiter = request.limiter,
             .instance_id = request.instance_id,
+            .plan_rate = request.plan_rate,
+            .plan_gen = request.plan_gen,
             .correlation_id = request.correlation_id orelse "",
             .platform_caps = request.platform_caps,
             .resume_if_bound = request.resume_if_bound,

@@ -34,7 +34,7 @@ pub fn jsCheckEmailRate(
     if (state.instance_id.len == 0) return js_undefined;
 
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    const allowed = lim.check(state.instance_id, .email, now_ns) catch |err| {
+    const allowed = lim.check(state.instance_id, .email, state.plan_rate, state.plan_gen, now_ns) catch |err| {
         // Lazy bucket creation OOM. Fail open + log — same posture
         // as the worker.zig request-side check.
         std.log.warn("rove-js: limiter.check email for {s} failed: {s} — fail open", .{ state.instance_id, @errorName(err) });
