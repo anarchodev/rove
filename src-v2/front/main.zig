@@ -161,6 +161,76 @@ const RouteCache = struct {
     }
 };
 
+// ── Cert sync (gap #3 slice 2): pull per-host certs from the CP ────────
+//
+// The front door terminates public TLS and SNI-selects a per-host cert. The
+// SNI servername callback runs *inside* the handshake and cannot block on a CP
+// fetch, so certs are synced PROACTIVELY into the `TlsConfig` host store on a
+// timer: poll `/_cp/certs` (the certed-host list), pull each host's frame via
+// `/_cp/cert`, and install it (`putHostCertInMemory`, a no-op when the content
+// version is unchanged). A freshly-issued domain's first connection in the poll
+// gap falls back to the wildcard; the next connection (post-sync) gets its
+// cert. Null `tls` (h2c front door, no TLS env) ⇒ this is inert.
+const CertSync = struct {
+    allocator: std.mem.Allocator,
+    cp_urls: []const []const u8,
+    tls: *h2.TlsConfig,
+
+    /// GET `suffix` from the first reachable CP node; owned 200 body or null.
+    fn cpGet(self: *CertSync, suffix: []const u8) ?[]u8 {
+        const a = self.allocator;
+        for (self.cp_urls) |base| {
+            const url = std.fmt.allocPrint(a, "{s}{s}", .{ base, suffix }) catch continue;
+            defer a.free(url);
+            var easy = curl.Easy.init(a) catch continue;
+            defer easy.deinit();
+            var resp = easy.request(a, .{
+                .method = .GET,
+                .url = url,
+                .headers = &[_]curl.Header{},
+                .body = "",
+                .http_version = .h2c_prior_knowledge,
+                .verify_tls = false,
+            }) catch continue;
+            defer resp.deinit(a);
+            if (resp.status != 200) continue;
+            const body = resp.body orelse "";
+            return a.dupe(u8, body) catch null;
+        }
+        return null;
+    }
+
+    /// One sync pass: install/renew every certed host's cert. Best-effort — a
+    /// CP that's unreachable leaves the current SNI store untouched.
+    fn sync(self: *CertSync) void {
+        const a = self.allocator;
+        const list = self.cpGet("/_cp/certs") orelse return;
+        defer a.free(list);
+        var it = std.mem.tokenizeScalar(u8, list, '\n');
+        while (it.next()) |raw| {
+            const host = std.mem.trim(u8, raw, " \t\r");
+            if (host.len == 0) continue;
+            const suffix = std.fmt.allocPrint(a, "/_cp/cert?host={s}", .{host}) catch continue;
+            defer a.free(suffix);
+            const frame = self.cpGet(suffix) orelse continue;
+            defer a.free(frame);
+            const u = unpackCert(frame) orelse continue;
+            const ver = std.hash.Wyhash.hash(0, frame);
+            self.tls.putHostCertInMemory(host, u.cert, u.key, ver) catch |e|
+                std.log.warn("front: install cert for {s} failed: {s}", .{ host, @errorName(e) });
+        }
+    }
+};
+
+/// Split the CP's packed cert frame (`[4B BE cert_len][cert_pem][key_pem]`).
+const UnpackedCert = struct { cert: []const u8, key: []const u8 };
+fn unpackCert(frame: []const u8) ?UnpackedCert {
+    if (frame.len < 4) return null;
+    const clen = std.mem.readInt(u32, frame[0..4], .big);
+    if (4 + clen > frame.len) return null;
+    return .{ .cert = frame[4 .. 4 + clen], .key = frame[4 + clen ..] };
+}
+
 // ── CP route lookup result ────────────────────────────────────────────
 const CpRoute = union(enum) {
     not_found,
@@ -509,6 +579,19 @@ pub fn main() !void {
     });
     defer reg.deinit();
 
+    // Public TLS termination (gap #3 slice 2). The default ctx is the platform
+    // wildcard from `REWIND_TLS_CERT`/`REWIND_TLS_KEY`; per-host custom-domain
+    // certs are synced from the CP (`CertSync`). Both env unset ⇒ the front
+    // door stays h2c (TLS terminated upstream) — the prior behavior, so
+    // existing h2c smokes are unaffected.
+    const tls_config: ?*h2.TlsConfig = blk: {
+        const cert = std.posix.getenv("REWIND_TLS_CERT");
+        const key = std.posix.getenv("REWIND_TLS_KEY");
+        if (cert == null or key == null) break :blk null;
+        break :blk try h2.TlsConfig.createFromFiles(allocator, cert.?, key.?, null);
+    };
+    defer if (tls_config) |t| t.destroy();
+
     const addr = try std.net.Address.parseIp("0.0.0.0", port);
     const server = try FrontH2.create(&reg, allocator, addr, .{
         .max_connections = 1024,
@@ -516,12 +599,27 @@ pub fn main() !void {
         .buf_size = 16384,
         .listen_backlog = 1024,
         .reuseport = true,
-    }, .{ .tls_config = null });
+    }, .{ .tls_config = tls_config });
     defer server.destroy();
 
     var router = Router{ .allocator = allocator, .cp_urls = cp_urls, .cache = &cache };
 
-    std.log.info("rewind-front: listening on 0.0.0.0:{d} (cp {d} node(s), route cache {d}ms)", .{ port, cp_urls.len, cache_ms });
+    // Proactive cert sync (only meaningful when we terminate TLS). Period from
+    // `REWIND_CERT_SYNC_MS` (default 2000); first pass runs before serving so a
+    // restart re-populates the SNI store immediately.
+    var cert_sync: ?CertSync = if (tls_config) |t|
+        .{ .allocator = allocator, .cp_urls = cp_urls, .tls = t }
+    else
+        null;
+    const cert_sync_ms: i128 = blk: {
+        const s = std.posix.getenv("REWIND_CERT_SYNC_MS") orelse break :blk 2000;
+        break :blk std.fmt.parseInt(i128, std.mem.trim(u8, s, " \t"), 10) catch 2000;
+    };
+    const cert_sync_period_ns: i128 = cert_sync_ms * std.time.ns_per_ms;
+    var last_cert_sync_ns: i128 = 0;
+    if (cert_sync) |*cs| cs.sync();
+
+    std.log.info("rewind-front: listening on 0.0.0.0:{d} (cp {d} node(s), route cache {d}ms, tls {s})", .{ port, cp_urls.len, cache_ms, if (tls_config != null) "on" else "off (h2c)" });
     while (!stop_flag.load(.acquire)) {
         server.pollWithTimeout(10 * std.time.ns_per_ms) catch |err| switch (err) {
             error.SignalInterrupt => continue,
@@ -531,6 +629,14 @@ pub fn main() !void {
         try reg.flush();
         try cleanupResponses(server);
         try reg.flush();
+
+        if (cert_sync) |*cs| {
+            const now_ns = std.time.nanoTimestamp();
+            if (now_ns - last_cert_sync_ns > cert_sync_period_ns) {
+                last_cert_sync_ns = now_ns;
+                cs.sync();
+            }
+        }
     }
     std.log.info("rewind-front: shut down", .{});
 }
