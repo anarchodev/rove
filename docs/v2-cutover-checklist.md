@@ -66,21 +66,24 @@ runtime map, re-point across clusters, auth, restart-durability) + `v2-test`
 host axis test; `tenant_move_smoke` confirms the front-door routing path.
 
 **3. Edge TLS + ACME for custom domains — own it, no Cloudflare.**
-*Superseded by [`v2-front-door-architecture.md`](v2-front-door-architecture.md)
-(Branch 2, committed 2026-06-07).* The front door is bare h2c
-(`front/main.zig`) and the worker is `tls_config = null` (`main.zig:137`); V1
-terminated TLS + ran a leader-pinned ACME issuer (`loop46/acme.zig`,
-`src/acme/`). The decision is **not** to outsource to Cloudflare (CF can't proxy
-h2c, and its only unique value was custom-hostname automation — not DDoS/WAF,
-which the host provides). Instead:
-   - Front door **terminates public h2-over-TLS** (reuse rove-h2 TLS path), SNI
-     cert selection; front-door → DP is private h2c.
-   - **Cert state moves into the CP** `__directory__` group (placement-
-     independent), replacing V1's per-cluster `__root__.db` `cert/{host}`.
-   - **One leader-elected ACME issuer**, evolved from `loop46/acme.zig` —
-     wildcard via DNS-01, custom hosts via HTTP-01 / TLS-ALPN-01.
-   - V1 ACME is **evolved + re-homed, not deleted.**
-   This is a contained CP-shaped build, not a vendor outsource.
+*Per [`v2-front-door-architecture.md`](v2-front-door-architecture.md).*
+   - ✅ **Slice 1 — cert state in the CP** `__directory__` group (`cert/{host}`,
+     placement-independent), `GET /_cp/cert(s)` + `POST /_control/cert`,
+     `cp_cert_smoke`. Replaces V1's per-cluster `__root__.db`.
+   - ✅ **Slice 2 — front door terminates public h2-over-TLS** with SNI cert
+     selection, certs synced from the CP (`h2/tls.zig` `putHostCertInMemory` +
+     front `CertSync`); front-door → DP stays private h2c. `cp_tls_edge_smoke`.
+   - ⏳ **Slice 3 — one leader-elected ACME issuer** (HTTP-01), evolved from
+     `loop46/acme.zig`, writing the CP cert axis. **Open wiring wrinkle:** the
+     HTTP-01 `:80` responder is HTTP/1.1, but the front door is nghttp2
+     (h2-only) — so "front forwards `/.well-known/acme-challenge/*` to the CP
+     issuer" needs an HTTP/1.1 `:80` listener somewhere. Cleanest is the CP's
+     responder binds `:80` (L4 routes `:80` → CP); the front-forward path needs
+     an h1 shim on the front. To resolve before building slice 3.
+   - ⏸ **Slice 4 — DNS-01 wildcard** deferred (provider-specific; wildcard via
+     manual `/_control/cert` for now).
+   - V1 ACME (`src/acme/` Client + Responder + crypto) is **evolved + re-homed,
+     not deleted.**
 
 **4. Direct multi-node placement without a move.** A tenant's raft group only
 forms via the attach fan-out of a move-in
@@ -150,7 +153,9 @@ front-door count == voter count (inverted scaling). **Done:**
 3. ~~**Replicated domain index** (gap #2) — same directory group, sibling axis.~~
    ✅ **SHIPPED** — `host/{host}` axis + `/_control/host` + `cp_host_smoke`.
 4. **Edge TLS termination + cert-state-in-CP + single ACME issuer** (gap #3) —
-   per `v2-front-door-architecture.md`.
+   per `v2-front-door-architecture.md`. Slices 1 (CP cert axis) + 2 (front-door
+   TLS termination + CP cert pull) ✅ SHIPPED; slice 3 (leader-elected HTTP-01
+   issuer) ⏳; DNS-01 wildcard (slice 4) deferred.
 5. **Tenant provisioning + multi-node formation** (gaps #4, #5) — the
    create-a-new-tenant path end to end.
 6. **Front-door content-type passthrough** (🟡 but mandatory).
