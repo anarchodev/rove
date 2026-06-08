@@ -128,9 +128,13 @@ The fork adds a per-connection **protocol mode**. `Conn` gains an
 3. ✅ **h1 over TLS (ALPN).** `tls.zig` `alpnSelectCb` now advertises `h2` +
    `http/1.1` in **server-preference order** (h2 wins when both offered); a new
    `TlsConn.alpnProtocol()` (`SSL_get0_alpn_selected`) reads the negotiated
-   protocol. `readsTlsHandshake`'s `handshake_done` branches on it: `http/1.1`
+   protocol. `readsTlsHandshake`'s `handshake_done` takes the h2 path **only
+   when ALPN explicitly negotiated `h2`** — `http/1.1` *or no ALPN at all*
    creates an `Http1Conn` (no nghttp2 session) and feeds the first decrypted
-   app-data flight; anything else keeps the h2 path. The h1 read branch decrypts
+   app-data flight. (h2-over-TLS *requires* ALPN `h2` per RFC 7540 §3.4, so an
+   h2 client always advertises it; a no-ALPN TLS client — HTTPS predates ALPN,
+   and minimal/older h1 clients omit it — can therefore only be HTTP/1.1, so h1
+   is the correct default, not a fallback.) The h1 read branch decrypts
    via `tc.feed` before `http1Feed`; a shared `http1Send` encrypts via
    `tc.encrypt` before `submitWrite` so the plaintext and TLS egress paths share
    one framing. `:scheme` is `https` for TLS conns. Two lifecycle fixes the TLS
@@ -140,12 +144,11 @@ The fork adds a per-connection **protocol mode**. `Conn` gains an
    h1 conns are reaped (closes the design's "idle reuse vs GC" open question).
    Proven against `zig build h2-tls-test` (added a named run step): `curl
    --http1.1` over TLS echoes h1, default curl negotiates h2, `openssl s_client
-   -alpn http/1.1|h2|h2,http/1.1` selects http/1.1|h2|h2 (preference), h1-over-
-   TLS keep-alive reuses one TLS conn, a **133 KB multi-record body** round-trips
-   identically, `Connection: close` + `411` over TLS, server survives errors;
-   plaintext phase-2 unaffected. *Limitation:* a no-ALPN h1-over-TLS client
-   defaults to h2 (no decrypted-byte sniff under TLS) — rare; webhooks/curl/
-   browsers all send ALPN.
+   -alpn http/1.1|h2|h2,http/1.1` selects http/1.1|h2|h2 (preference) and an
+   ALPN-less `s_client` routes to h1, h1-over-TLS keep-alive reuses one TLS
+   conn, a **133 KB multi-record body** round-trips identically, `Connection:
+   close` + `411` over TLS, server survives errors; plaintext phase-2
+   unaffected.
 4. **Chunked transfer-encoding** (request + response) + `Expect: 100-continue`.
    Most webhooks send `Content-Length`, so this is a fast-follow, not a blocker.
 5. **Front-door `:80` plaintext listener** (ACME HTTP-01 + HTTP→HTTPS redirect),
