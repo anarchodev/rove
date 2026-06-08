@@ -1,10 +1,12 @@
 # V2 — HTTP/1.1 edge ingress (design)
 
-> **Status: phases 1–4 shipped (2026-06-07).** Codec + plaintext h1 ingress +
+> **Status: phases 1–5 shipped (2026-06-07).** Codec + plaintext h1 ingress +
 > h1-over-TLS via ALPN + chunked-request decode & `100-continue` are live in
-> `rove-h2` and proven end-to-end (see Build order). Phases 5–6 (the `:80` ACME
-> listener, WebSocket) remain; chunked *response* is deferred to the
-> streaming-over-h1 integration. Adds HTTP/1.1 *ingress* to
+> `rove-h2`, and the `rewind-front` `:80` listener (ACME HTTP-01 + HTTP→HTTPS
+> redirect) is wired — all proven end-to-end (see Build order). Phase 6
+> (WebSocket) remains; chunked *response* is deferred to the streaming-over-h1
+> integration, and the ACME `200` challenge path lands with gap #3 slice 3 (the
+> CP issuer + `/_cp/acme-challenge` endpoint). Adds HTTP/1.1 *ingress* to
 > `rove-h2` (today nghttp2/HTTP-2-only) so the edge can accept inbound traffic
 > from h1-only clients without Cloudflare in front. Amends an assumption in
 > [`v2-front-door-architecture.md`](v2-front-door-architecture.md) (which
@@ -171,8 +173,21 @@ The fork adds a per-connection **protocol mode**. `Conn` gains an
    the only consumer of chunked output is a streaming handler over h1, which is
    coupled to the `stream_response_in` subsystem (today an io-error degrade) and
    belongs with that integration, not the codec.
-5. **Front-door `:80` plaintext listener** (ACME HTTP-01 + HTTP→HTTPS redirect),
-   retiring the gap #3 slice-3 wrinkle — the h1 front answers `:80` directly.
+5. ✅ **Front-door `:80` plaintext listener** (ACME HTTP-01 + HTTP→HTTPS
+   redirect), retiring the gap #3 slice-3 wrinkle — the h1 front answers `:80`
+   directly. `rewind-front` (`src-v2/front/main.zig`) gains a second `FrontH2`
+   server (its own registry, plaintext) polled non-blocking in the same loop:
+   `/.well-known/acme-challenge/<token>` fetches the key-authorization from the
+   CP issuer (`GET /_cp/acme-challenge?token=` — the CP side is slice 3, so it
+   404s until then, the correct "no challenge in flight" answer) and everything
+   else gets a `308` to `https://<host><path>` (method + path + query preserved;
+   missing `Host` → 400). Enabled via `REWIND_HTTP_PORT` (defaults to `80` when
+   the front terminates TLS, disabled in h2c mode where the upstream LB owns
+   `:80`). Proven: `curl --http1.1` on the `:80` port returns `308` with the
+   right `Location` (GET + POST), the ACME path 404s with no CP endpoint, a
+   no-`Host` request 400s, and the main TLS/h2c listener keeps serving under the
+   two-server loop. (A redirect/ACME smoke lands with slice 3, which supplies
+   the CP endpoint the `200` challenge path needs.)
 6. **(Later) WebSocket upgrade** — `101 Switching Protocols` + frame relay, the
    connection-actor / fediverse unlock. Its own design.
 

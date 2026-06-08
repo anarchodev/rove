@@ -522,6 +522,119 @@ fn getEnvCfg(name: []const u8) []const u8 {
     return std.posix.getenv(name) orelse "";
 }
 
+// ── Phase 5: the :80 plaintext listener (ACME HTTP-01 + HTTP→HTTPS redirect) ──
+//
+// rove-h2 now speaks HTTP/1.1 (gap #6 phases 1–4), so the front door answers
+// the ACME HTTP-01 `:80` challenge natively — retiring the gap #3 slice-3 `:80`
+// wrinkle. Two behaviors: serve `/.well-known/acme-challenge/<token>` (the
+// key-authorization fetched from the CP issuer, slice 3) and 308-redirect every
+// other request to its HTTPS origin.
+
+const ACME_PREFIX = "/.well-known/acme-challenge/";
+
+/// Pack a single response header into the `h2.RespHeaders` layout — one buffer
+/// holding the field array + name/value bytes, freed by `RespHeaders.deinit`
+/// when the response entity is destroyed.
+fn packRespHeader(a: std.mem.Allocator, name: []const u8, value: []const u8) !h2.RespHeaders {
+    const HF = h2.HeaderField;
+    const fields_size = @sizeOf(HF);
+    const total = fields_size + name.len + value.len;
+    const buf = try a.alloc(u8, total);
+    const fields: [*]HF = @ptrCast(@alignCast(buf.ptr));
+    const sb = buf.ptr + fields_size;
+    @memcpy(sb[0..name.len], name);
+    @memcpy(sb[name.len .. name.len + value.len], value);
+    fields[0] = .{ .name = sb, .name_len = @intCast(name.len), .value = sb + name.len, .value_len = @intCast(value.len) };
+    return .{ .fields = fields, .count = 1, ._buf = buf.ptr, ._buf_len = @intCast(total) };
+}
+
+/// Reply with status + headers + (optional, owned) body. Mirrors
+/// `Router.replyStatus` but carries a header set and body.
+fn replyFull(server: *FrontH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, code: u16, rh: h2.RespHeaders, body: ?[]u8) !void {
+    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = code });
+    try server.reg.set(ent, &server.request_out, h2.RespHeaders, rh);
+    try server.reg.set(ent, &server.request_out, h2.RespBody, .{
+        .data = if (body) |b| b.ptr else null,
+        .len = if (body) |b| @intCast(b.len) else 0,
+    });
+    try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
+    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+    try server.reg.set(ent, &server.request_out, h2.Session, sess);
+    try server.reg.move(ent, &server.request_out, &server.response_in);
+}
+
+/// Fetch the ACME HTTP-01 key-authorization for `token` from the CP issuer.
+/// Owned 200 body or null (no active challenge / CP unreachable). The CP
+/// endpoint itself is gap #3 slice 3 — until it exists this 404s, which is the
+/// correct answer for "no challenge in flight."
+fn acmeChallengeLookup(a: std.mem.Allocator, cp_urls: []const []const u8, token: []const u8) ?[]u8 {
+    for (cp_urls) |base| {
+        const url = std.fmt.allocPrint(a, "{s}/_cp/acme-challenge?token={s}", .{ base, token }) catch continue;
+        defer a.free(url);
+        var easy = curl.Easy.init(a) catch continue;
+        defer easy.deinit();
+        var resp = easy.request(a, .{
+            .method = .GET,
+            .url = url,
+            .headers = &[_]curl.Header{},
+            .body = "",
+            .http_version = .h2c_prior_knowledge,
+            .verify_tls = false,
+        }) catch continue;
+        defer resp.deinit(a);
+        if (resp.status != 200) continue;
+        return a.dupe(u8, resp.body orelse "") catch null;
+    }
+    return null;
+}
+
+/// Drive the `:80` server's request queue: ACME challenge or HTTPS redirect.
+fn processPort80(server: *FrontH2, a: std.mem.Allocator, cp_urls: []const []const u8) !void {
+    const entities = server.request_out.entitySlice();
+    const sids = server.request_out.column(h2.StreamId);
+    const sessions = server.request_out.column(h2.Session);
+    const req_hdrs = server.request_out.column(h2.ReqHeaders);
+
+    for (entities, sids, sessions, req_hdrs) |ent, sid, sess, rh| {
+        const path = headerValue(rh, ":path") orelse "/";
+
+        // ACME HTTP-01: serve the key-authorization fetched from the CP.
+        if (std.mem.startsWith(u8, path, ACME_PREFIX)) {
+            const token = path[ACME_PREFIX.len..];
+            if (token.len > 0) {
+                if (acmeChallengeLookup(a, cp_urls, token)) |ka| {
+                    const ct = packRespHeader(a, "content-type", "text/plain") catch {
+                        a.free(ka);
+                        try Router.replyStatus(server, ent, sid, sess, 500);
+                        continue;
+                    };
+                    try replyFull(server, ent, sid, sess, 200, ct, ka);
+                    continue;
+                }
+            }
+            try Router.replyStatus(server, ent, sid, sess, 404);
+            continue;
+        }
+
+        // Everything else → 308 to the HTTPS origin (preserves method + body).
+        const host_raw = headerValue(rh, ":authority") orelse headerValue(rh, "host") orelse {
+            try Router.replyStatus(server, ent, sid, sess, 400);
+            continue;
+        };
+        const host = hostOnly(host_raw);
+        const location = std.fmt.allocPrint(a, "https://{s}{s}", .{ host, path }) catch {
+            try Router.replyStatus(server, ent, sid, sess, 500);
+            continue;
+        };
+        defer a.free(location);
+        const loc = packRespHeader(a, "location", location) catch {
+            try Router.replyStatus(server, ent, sid, sess, 500);
+            continue;
+        };
+        try replyFull(server, ent, sid, sess, 308, loc, null);
+    }
+}
+
 /// Parse a `;`/`,`-separated list of origins into an owned, owned-element
 /// slice. Empty input → empty slice. Whitespace trimmed; blanks skipped.
 fn parseUrlList(a: std.mem.Allocator, config: []const u8) ![]const []const u8 {
@@ -604,6 +717,39 @@ pub fn main() !void {
 
     var router = Router{ .allocator = allocator, .cp_urls = cp_urls, .cache = &cache };
 
+    // Phase 5: optional plaintext `:80` listener (ACME HTTP-01 + HTTP→HTTPS
+    // redirect). Defaults to :80 when we terminate TLS (we own the public edge);
+    // disabled in h2c mode (TLS terminated upstream → the LB owns :80). Override
+    // with `REWIND_HTTP_PORT` (0 disables; a high port for tests).
+    const http_port: u16 = blk: {
+        if (std.posix.getenv("REWIND_HTTP_PORT")) |v|
+            break :blk std.fmt.parseInt(u16, std.mem.trim(u8, v, " \t"), 10) catch 0;
+        break :blk if (tls_config != null) 80 else 0;
+    };
+    var server80: ?*FrontH2 = null;
+    var reg80_ptr: ?*rove.Registry = null;
+    if (http_port != 0) {
+        const r80 = try allocator.create(rove.Registry);
+        r80.* = try rove.Registry.init(allocator, .{ .max_entities = 2048, .deferred_queue_capacity = 512 });
+        reg80_ptr = r80;
+        const addr80 = try std.net.Address.parseIp("0.0.0.0", http_port);
+        server80 = try FrontH2.create(r80, allocator, addr80, .{
+            .max_connections = 512,
+            .buf_count = 512,
+            .buf_size = 16384,
+            .listen_backlog = 512,
+            .reuseport = true,
+        }, .{});
+        std.log.info("rewind-front: :80 listener on 0.0.0.0:{d} (ACME HTTP-01 + HTTPS redirect)", .{http_port});
+    }
+    // server destroy must run before its registry deinit (it owns collections in
+    // it), so declare the registry-cleanup defer first (LIFO → runs last).
+    defer if (reg80_ptr) |r| {
+        r.deinit();
+        allocator.destroy(r);
+    };
+    defer if (server80) |s| s.destroy();
+
     // Proactive cert sync (only meaningful when we terminate TLS). Period from
     // `REWIND_CERT_SYNC_MS` (default 2000); first pass runs before serving so a
     // restart re-populates the SNI store immediately.
@@ -629,6 +775,19 @@ pub fn main() !void {
         try reg.flush();
         try cleanupResponses(server);
         try reg.flush();
+
+        // Phase 5: drain the low-traffic :80 listener non-blocking (its latency
+        // budget — ACME validation, redirects — tolerates the ~10ms main cycle).
+        if (server80) |s80| {
+            s80.poll(0) catch |err| switch (err) {
+                error.SignalInterrupt => {},
+                else => return err,
+            };
+            try processPort80(s80, allocator, cp_urls);
+            try reg80_ptr.?.flush();
+            try cleanupResponses(s80);
+            try reg80_ptr.?.flush();
+        }
 
         if (cert_sync) |*cs| {
             const now_ns = std.time.nanoTimestamp();

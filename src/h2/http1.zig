@@ -268,6 +268,8 @@ pub fn reasonPhrase(status: u16) []const u8 {
         301 => "Moved Permanently",
         302 => "Found",
         304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
