@@ -8,6 +8,7 @@ const Entity = rove.Entity;
 pub const tls = @import("tls.zig");
 pub const TlsConfig = tls.TlsConfig;
 pub const http1 = @import("http1.zig");
+pub const ws = @import("ws.zig");
 
 const c = @cImport({
     @cInclude("nghttp2/nghttp2.h");
@@ -100,6 +101,15 @@ pub const H2IoResult = struct {
     err: i32 = 0,
 };
 
+/// Per-WebSocket-message metadata on a WS seam entity (docs/websocket-plan.md
+/// §4.6). `opcode` is the RFC 6455 data opcode (`ws.Opcode` int): `1` text,
+/// `2` binary on an inbound `ws_message_out` entity (`8` close = client closed);
+/// the same field selects the frame type for an outbound `ws_send_in` entity.
+/// The payload itself rides the entity's `ReqBody` (allocator-owned bytes).
+pub const WsMeta = struct {
+    opcode: u8 = 0,
+};
+
 pub const Direction = enum(u8) { server = 0, client = 1 };
 
 pub const Conn = struct {
@@ -190,6 +200,33 @@ pub const Http1Conn = struct {
     /// wire. `nil` when no write is in flight.
     sending_entity: Entity = Entity.nil,
 
+    // ── WebSocket mode (docs/websocket-plan.md §4.5/§4.6) ────────────────────
+    /// Set once the `101` Upgrade has been queued: the connection has left the
+    /// HTTP request/response model and `buf` now accumulates RFC 6455 frames
+    /// (parsed by `wsDrive`, not `http1Drive`).
+    ws_mode: bool = false,
+    /// Reassembly buffer for a fragmented data message (a non-FIN opener +
+    /// `continuation` frames). Empty between messages. `ws_msg_opcode` records
+    /// the opener's opcode (text/binary); 0 means no message is in progress.
+    ws_msg: std.ArrayList(u8) = .empty,
+    ws_msg_opcode: u8 = 0,
+    /// Outbound framed-byte queue. Every server→client write (the `101`, WS data
+    /// frames, auto-pongs, the Close echo) is appended here and flushed by
+    /// `wsFlush` with exactly one socket write in flight (`ws_write_inflight`),
+    /// which both preserves frame order on the wire and coalesces a burst into
+    /// one write. Reused (capacity retained) across flushes.
+    ws_out: std.ArrayList(u8) = .empty,
+    ws_write_inflight: bool = false,
+    /// A Close frame has been queued (client-initiated or protocol error); the
+    /// connection is destroyed once `ws_out` drains.
+    ws_closing: bool = false,
+
+    /// Hard ceiling on a single reassembled WebSocket message at the edge — the
+    /// per-frame cap fed to `ws.parseFrame` and the running cap on a fragmented
+    /// message. Per-tenant plan limits are the DP worker's job (piece D); this
+    /// is the coarse front-door backstop, matching `MAX_BODY_BYTES`.
+    pub const MAX_WS_MESSAGE: usize = 16 * 1024 * 1024;
+
     /// Hard ceiling on a buffered request body at the edge. Per-tenant plan
     /// limits (gap #1, 413) are enforced in the DP worker; this is the coarse
     /// front-door backstop against an unbounded `Content-Length` OOM-ing the
@@ -205,6 +242,8 @@ pub const Http1Conn = struct {
     fn free(self: *Http1Conn) void {
         self.buf.deinit(self.allocator);
         self.chunk_body.deinit(self.allocator);
+        self.ws_msg.deinit(self.allocator);
+        self.ws_out.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 };
@@ -437,10 +476,19 @@ pub fn H2(comptime opts: Options) type {
         .connect = has_client,
     });
 
+    // WebSocket seam row (docs/websocket-plan.md §4.6): one entity per inbound
+    // completed message (`ws_message_out`) or outbound frame (`ws_send_in`).
+    // Carries the connection (`Session`), the payload (`ReqBody`), the opcode
+    // (`WsMeta`), and an error slot (`H2IoResult`), plus the worker's
+    // `request_row` so piece D can attach per-activation state — mirroring how
+    // `stream_row` merges it for normal requests.
+    const ws_row = Row(&.{ Session, ReqBody, WsMeta, H2IoResult }).merge(opts.request_row);
+
     // Collection types (for comptime)
     const StreamColl = Collection(stream_row, .{});
     const ReadColl = Collection(rio.ReadBaseRow, .{});
     const ConnColl = Collection(full_conn_row, .{});
+    const WsColl = Collection(ws_row, .{});
 
     const ClientConnectColl = if (has_client) Collection(connect_row_full, .{}) else void;
     const ClientStreamColl = if (has_client) Collection(stream_row, .{}) else void;
@@ -467,6 +515,16 @@ pub fn H2(comptime opts: Options) type {
         stream_data_in: StreamColl,
         stream_close_in: StreamColl,
         _stream_data_sending: StreamColl,
+
+        // WebSocket seam (docs/websocket-plan.md §4.6). `ws_message_out` holds a
+        // completed inbound message for the consumer (piece D → `onMessage`);
+        // `ws_send_in` holds an outbound frame the consumer queued (piece E ←
+        // `stream.write`). Outbound backpressure is on the per-conn `ws_out`
+        // byte queue + `ws_write_inflight` (one socket write at a time), not on
+        // these entities — so control frames (pong/close) interleave with data
+        // frames in wire order, which a per-entity `sending_entity` can't model.
+        ws_message_out: WsColl,
+        ws_send_in: WsColl,
 
         // Read triage
         _read_errors: ReadColl,
@@ -534,6 +592,7 @@ pub fn H2(comptime opts: Options) type {
             server_stream,
             server_read,
             server_conn,
+            server_ws,
             client_connect,
             client_stream,
         };
@@ -562,6 +621,8 @@ pub fn H2(comptime opts: Options) type {
             .{ .name = "stream_data_in",       .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
             .{ .name = "stream_close_in",      .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
             .{ .name = "_stream_data_sending", .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
+            .{ .name = "ws_message_out",       .Coll = WsColl,     .kind = .server_ws },
+            .{ .name = "ws_send_in",           .Coll = WsColl,     .kind = .server_ws },
             .{ .name = "_read_errors",         .Coll = ReadColl,   .kind = .server_read },
             .{ .name = "_read_init",           .Coll = ReadColl,   .kind = .server_read },
             .{ .name = "_read_active",         .Coll = ReadColl,   .kind = .server_read },
@@ -1237,6 +1298,7 @@ pub fn H2(comptime opts: Options) type {
             try self.consumeStreamResponses();
             try self.consumeStreamData();
             try self.consumeStreamClose();
+            try self.consumeWsSends();
             if (has_client) {
                 try self.consumeConnectRequests();
                 try self.consumeClientRequests();
@@ -1965,10 +2027,14 @@ pub fn H2(comptime opts: Options) type {
             const h1c = conn_ptr.h1.?;
             if (h1c.closing) return;
             h1c.buf.appendSlice(self.allocator, bytes) catch {
-                self.http1ErrorClose(conn_ptr, conn_entity, 500);
+                if (h1c.ws_mode)
+                    self.wsClose(conn_ptr, conn_entity, ws.CloseCode.internal_error)
+                else
+                    self.http1ErrorClose(conn_ptr, conn_entity, 500);
                 return;
             };
-            self.http1Drive(conn_ptr, conn_entity);
+            // Once upgraded, `buf` carries RFC 6455 frames, not HTTP requests.
+            if (h1c.ws_mode) self.wsDrive(conn_ptr, conn_entity) else self.http1Drive(conn_ptr, conn_entity);
         }
 
         /// Parse as much of the buffer as possible, emitting at most one request
@@ -1999,6 +2065,15 @@ pub fn H2(comptime opts: Options) type {
             // HTTP/1.1 requires Host; without it there's no `:authority`.
             if (head.host == null) {
                 self.http1ErrorClose(conn_ptr, conn_entity, 400);
+                return;
+            }
+
+            // WebSocket Upgrade (piece A): a GET carrying `Upgrade: websocket` +
+            // `Connection: upgrade` + `Sec-WebSocket-Key`. The `101` switches the
+            // connection out of the HTTP request/response model; `head.head_len`
+            // is consumed and any trailing bytes are early WS frames.
+            if (wsIsUpgrade(head)) {
+                self.wsHandshake(conn_ptr, conn_entity, head);
                 return;
             }
 
@@ -2348,6 +2423,274 @@ pub fn H2(comptime opts: Options) type {
             }
         }
 
+        // ── WebSocket transport (docs/websocket-plan.md §4.5/§4.6) ───────────
+        //
+        // Pieces A (101 handshake), C (connection mode + inbound frames), and the
+        // h2-side of E (outbound framing). The pure RFC 6455 codec lives in
+        // `ws.zig` (piece B); these functions wire it into the connection /
+        // entity plumbing. Inbound complete messages surface on `ws_message_out`;
+        // outbound frames are queued on `ws_send_in`. Single-tenant / single-node
+        // baseline, batch-of-1 durability (the worker seam is piece D).
+
+        /// True for a well-formed WebSocket Upgrade request: a `GET` carrying
+        /// `Upgrade: websocket`, an `Upgrade` token in `Connection:`, and a
+        /// non-empty `Sec-WebSocket-Key` (RFC 6455 §4.1). Header names are
+        /// case-insensitive and the tokens may sit in a comma list, so match
+        /// case-insensitively on substrings.
+        fn wsIsUpgrade(head: http1.Head) bool {
+            if (!std.mem.eql(u8, head.method, "GET")) return false;
+            var has_upgrade = false;
+            var has_conn_upgrade = false;
+            var has_key = false;
+            for (head.headers) |h| {
+                if (std.ascii.eqlIgnoreCase(h.name, "upgrade")) {
+                    if (std.ascii.indexOfIgnoreCase(h.value, "websocket") != null) has_upgrade = true;
+                } else if (std.ascii.eqlIgnoreCase(h.name, "connection")) {
+                    if (std.ascii.indexOfIgnoreCase(h.value, "upgrade") != null) has_conn_upgrade = true;
+                } else if (std.ascii.eqlIgnoreCase(h.name, "sec-websocket-key")) {
+                    if (h.value.len > 0) has_key = true;
+                }
+            }
+            return has_upgrade and has_conn_upgrade and has_key;
+        }
+
+        /// Piece A: complete the `101 Switching Protocols` handshake and switch
+        /// the connection into WebSocket mode. The `101` is queued through the WS
+        /// outbound path so it precedes — in wire order — any frame the worker
+        /// pushes next; trailing bytes already in `buf` (frames the client sent
+        /// coalesced with the handshake) are drained by the closing `wsDrive`.
+        fn wsHandshake(self: *Self, conn_ptr: *Conn, conn_entity: Entity, head: http1.Head) void {
+            const h1c = conn_ptr.h1.?;
+
+            var key: []const u8 = "";
+            for (head.headers) |h| {
+                if (std.ascii.eqlIgnoreCase(h.name, "sec-websocket-key")) key = h.value;
+            }
+            var accept_buf: [ws.ACCEPT_LEN]u8 = undefined;
+            const accept = ws.acceptKey(key, &accept_buf);
+
+            // Drop the consumed request head; what's left in `buf` is the start of
+            // the frame stream. Do this before flipping `ws_mode` so a parse never
+            // sees the HTTP head as frame bytes.
+            const head_len = head.head_len;
+            const leftover = h1c.buf.items.len - head_len;
+            if (leftover > 0) std.mem.copyForwards(u8, h1c.buf.items[0..leftover], h1c.buf.items[head_len..]);
+            h1c.buf.shrinkRetainingCapacity(leftover);
+
+            h1c.ws_mode = true;
+            h1c.in_flight = false;
+
+            var resp: std.ArrayList(u8) = .empty;
+            defer resp.deinit(self.allocator);
+            resp.appendSlice(self.allocator, "HTTP/1.1 101 Switching Protocols\r\n") catch {
+                self.reg.destroy(conn_entity) catch {};
+                return;
+            };
+            resp.appendSlice(self.allocator, "Upgrade: websocket\r\nConnection: Upgrade\r\n") catch {
+                self.reg.destroy(conn_entity) catch {};
+                return;
+            };
+            resp.appendSlice(self.allocator, "Sec-WebSocket-Accept: ") catch {
+                self.reg.destroy(conn_entity) catch {};
+                return;
+            };
+            resp.appendSlice(self.allocator, accept) catch {
+                self.reg.destroy(conn_entity) catch {};
+                return;
+            };
+            resp.appendSlice(self.allocator, "\r\n\r\n") catch {
+                self.reg.destroy(conn_entity) catch {};
+                return;
+            };
+
+            h1c.ws_out.appendSlice(self.allocator, resp.items) catch {
+                self.reg.destroy(conn_entity) catch {};
+                return;
+            };
+            self.wsFlush(conn_ptr, conn_entity);
+
+            // Process any frames that arrived in the same read as the handshake.
+            self.wsDrive(conn_ptr, conn_entity);
+        }
+
+        /// Piece C: parse as many complete RFC 6455 frames as `buf` holds,
+        /// dispatching each. Control frames are handled inline (auto-pong, Close
+        /// echo); data frames are reassembled and surfaced on `ws_message_out`. A
+        /// protocol/size error or OOM fails the connection with a Close frame.
+        fn wsDrive(self: *Self, conn_ptr: *Conn, conn_entity: Entity) void {
+            const h1c = conn_ptr.h1.?;
+            if (h1c.ws_closing) return;
+
+            var pos: usize = 0;
+            while (true) {
+                const r = ws.parseFrame(h1c.buf.items[pos..], Http1Conn.MAX_WS_MESSAGE) catch |err| {
+                    const code: u16 = switch (err) {
+                        error.ProtocolError => ws.CloseCode.protocol_error,
+                        error.TooLarge => ws.CloseCode.message_too_big,
+                    };
+                    self.wsClose(conn_ptr, conn_entity, code);
+                    break;
+                };
+                const frame = switch (r) {
+                    .need_more => break,
+                    .frame => |f| f,
+                };
+                self.wsHandleFrame(conn_ptr, conn_entity, frame) catch |err| {
+                    const code: u16 = if (err == error.WsProtocol)
+                        ws.CloseCode.protocol_error
+                    else
+                        ws.CloseCode.internal_error;
+                    self.wsClose(conn_ptr, conn_entity, code);
+                    break;
+                };
+                pos += frame.consumed;
+                if (h1c.ws_closing) break;
+            }
+
+            // Compact the consumed prefix out of `buf` (the unconsumed tail is the
+            // start of the next, still-incomplete frame).
+            if (pos > 0) {
+                const leftover = h1c.buf.items.len - pos;
+                if (leftover > 0) std.mem.copyForwards(u8, h1c.buf.items[0..leftover], h1c.buf.items[pos..]);
+                h1c.buf.shrinkRetainingCapacity(leftover);
+            }
+            self.wsFlush(conn_ptr, conn_entity);
+        }
+
+        /// Dispatch one parsed inbound frame. `frame.payload` borrows the
+        /// (unmasked-in-place) connection buffer, so anything retained past this
+        /// call is copied (into `ws_msg` or a `ws_message_out` entity).
+        fn wsHandleFrame(self: *Self, conn_ptr: *Conn, conn_entity: Entity, frame: ws.Frame) !void {
+            const h1c = conn_ptr.h1.?;
+            switch (frame.opcode) {
+                // Auto-pong: bounce the application data back; the handler never
+                // sees ping/pong (websocket-plan §5).
+                .ping => try ws.writeFrame(&h1c.ws_out, self.allocator, .pong, frame.payload),
+                .pong => {},
+                .close => {
+                    // Surface the disconnect (piece D → `onDisconnect`) then echo a
+                    // Close and tear down once it drains.
+                    try self.wsEmitMessage(conn_entity, @intFromEnum(ws.Opcode.close), "");
+                    if (!h1c.ws_closing) {
+                        ws.writeClose(&h1c.ws_out, self.allocator, ws.CloseCode.normal, "") catch {};
+                        h1c.ws_closing = true;
+                    }
+                },
+                .text, .binary => {
+                    // A new data opener while a fragmented message is open is a
+                    // protocol error (§5.4).
+                    if (h1c.ws_msg_opcode != 0) return error.WsProtocol;
+                    if (frame.fin) {
+                        try self.wsEmitMessage(conn_entity, @intFromEnum(frame.opcode), frame.payload);
+                    } else {
+                        h1c.ws_msg.clearRetainingCapacity();
+                        try h1c.ws_msg.appendSlice(self.allocator, frame.payload);
+                        h1c.ws_msg_opcode = @intFromEnum(frame.opcode);
+                    }
+                },
+                .continuation => {
+                    // A continuation with no opener is a protocol error (§5.4).
+                    if (h1c.ws_msg_opcode == 0) return error.WsProtocol;
+                    if (h1c.ws_msg.items.len + frame.payload.len > Http1Conn.MAX_WS_MESSAGE)
+                        return error.WsProtocol;
+                    try h1c.ws_msg.appendSlice(self.allocator, frame.payload);
+                    if (frame.fin) {
+                        try self.wsEmitMessage(conn_entity, h1c.ws_msg_opcode, h1c.ws_msg.items);
+                        h1c.ws_msg.clearRetainingCapacity();
+                        h1c.ws_msg_opcode = 0;
+                    }
+                },
+                _ => return error.WsProtocol,
+            }
+        }
+
+        /// Emit a completed inbound message (or a client-close signal, opcode 8)
+        /// onto `ws_message_out` for the consumer. `payload` is copied into an
+        /// allocator-owned `ReqBody` the entity's destroy frees.
+        fn wsEmitMessage(self: *Self, conn_entity: Entity, opcode: u8, payload: []const u8) !void {
+            const ent = try self.reg.create(&self.ws_message_out);
+            errdefer self.reg.destroy(ent) catch {};
+            try self.reg.set(ent, &self.ws_message_out, Session, .{ .entity = conn_entity });
+            try self.reg.set(ent, &self.ws_message_out, WsMeta, .{ .opcode = opcode });
+            var data: ?[*]u8 = null;
+            if (payload.len > 0) {
+                const copy = try self.allocator.dupe(u8, payload);
+                data = copy.ptr;
+            }
+            try self.reg.set(ent, &self.ws_message_out, ReqBody, .{ .data = data, .len = @intCast(payload.len) });
+        }
+
+        /// Queue a Close frame and begin teardown; the connection is destroyed by
+        /// `wsFlush` once the Close (and anything ahead of it) drains.
+        fn wsClose(self: *Self, conn_ptr: *Conn, conn_entity: Entity, code: u16) void {
+            const h1c = conn_ptr.h1.?;
+            if (!h1c.ws_closing) {
+                ws.writeClose(&h1c.ws_out, self.allocator, code, "") catch {};
+                h1c.ws_closing = true;
+            }
+            self.wsFlush(conn_ptr, conn_entity);
+        }
+
+        /// Flush the per-connection outbound byte queue with exactly one socket
+        /// write in flight (`ws_write_inflight`): preserves frame order on the
+        /// wire and coalesces a burst into one write. The completion lands in
+        /// `writesAccount`, which clears the flag and re-flushes. When a closing
+        /// connection has fully drained, reap it.
+        fn wsFlush(self: *Self, conn_ptr: *Conn, conn_entity: Entity) void {
+            const h1c = conn_ptr.h1.?;
+            if (h1c.ws_write_inflight) return;
+            if (h1c.ws_out.items.len == 0) {
+                if (h1c.ws_closing) self.reg.destroy(conn_entity) catch {};
+                return;
+            }
+            const data = h1c.ws_out.toOwnedSlice(self.allocator) catch return;
+            h1c.ws_write_inflight = true;
+            self.http1Send(conn_ptr, conn_entity, data);
+        }
+
+        /// Piece E (h2 side): drain `ws_send_in` — frames the consumer queued via
+        /// `stream.write` — RFC-6455-framing each by opcode onto the connection's
+        /// outbound queue. A `close` opcode requests a clean teardown. The entity
+        /// is one-shot (destroyed here); backpressure lives on `ws_out`.
+        fn consumeWsSends(self: *Self) !void {
+            const entities = self.ws_send_in.entitySlice();
+            const sessions = self.ws_send_in.column(Session);
+            const metas = self.ws_send_in.column(WsMeta);
+            const bodies = self.ws_send_in.column(ReqBody);
+
+            for (entities, sessions, metas, bodies) |ent, sess, meta, *body| {
+                if (self.reg.isStale(sess.entity)) {
+                    try self.reg.destroy(ent);
+                    continue;
+                }
+                const conn_ptr = getConn(self, sess.entity) orelse {
+                    try self.reg.destroy(ent);
+                    continue;
+                };
+                const h1c = conn_ptr.h1 orelse {
+                    try self.reg.destroy(ent);
+                    continue;
+                };
+                if (!h1c.ws_mode or h1c.ws_closing) {
+                    try self.reg.destroy(ent);
+                    continue;
+                }
+
+                const opcode: ws.Opcode = @enumFromInt(@as(u4, @truncate(meta.opcode)));
+                const payload = if (body.data) |d| d[0..body.len] else "";
+                if (opcode == .close) {
+                    self.wsClose(conn_ptr, sess.entity, ws.CloseCode.normal);
+                } else {
+                    ws.writeFrame(&h1c.ws_out, self.allocator, opcode, payload) catch {
+                        try self.reg.destroy(ent);
+                        continue;
+                    };
+                    self.wsFlush(conn_ptr, sess.entity);
+                }
+                try self.reg.destroy(ent);
+            }
+        }
+
         // =============================================================
         // Helper: submit a write entity
         // =============================================================
@@ -2503,7 +2846,14 @@ pub fn H2(comptime opts: Options) type {
                 if (!self.reg.isStale(conn_ent.entity)) {
                     if (getConn(self, conn_ent.entity)) |conn_ptr| {
                         if (conn_ptr.h1) |h1c| {
-                            if (!h1c.sending_entity.isNil()) {
+                            if (h1c.ws_mode) {
+                                // WS backpressure: the single in-flight `ws_out`
+                                // flush drained. Clear the flag and push whatever
+                                // queued behind it (and reap a drained closing
+                                // conn). On failure the conn is destroyed below.
+                                h1c.ws_write_inflight = false;
+                                if (!failed) self.wsFlush(conn_ptr, conn_ent.entity);
+                            } else if (!h1c.sending_entity.isNil()) {
                                 const sent = h1c.sending_entity;
                                 h1c.sending_entity = Entity.nil;
                                 if (self.reg.isInCollection(sent, &self._stream_data_sending)) {

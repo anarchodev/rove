@@ -104,10 +104,15 @@ to build until the variant is handled in the tape path, the interpret
 path, and the replay path. The contract stops being a doc you audit
 against.
 
-A `conn_write` variant for inbound-WebSocket frame writes is *not*
-parked in advance per the Option-1-scaffolding anti-pattern (Phase 4.1.4
-deferral). Add when the inbound-WS producer ships
-([`docs/websocket-plan.md`](websocket-plan.md)).
+A `conn_write` variant for inbound-WebSocket frame writes was reserved
+here (Phase 4.1.4) but is **no longer planned**: the Phase-2 handler
+reshape made `stream.write` the one connection-output surface, so
+outbound WS frames lower to the existing `Cmd.stream_chunk` (opcode-
+tagged, RFC-6455-framed at the h2 serialize fork) rather than a new Cmd
+([`docs/websocket-plan.md`](websocket-plan.md) §2.4 / §5). The "don't
+park typed slots without a producer" rule still held — the producer that
+finally shipped (`stream.write`) just turned out to reuse an existing
+slot.
 
 ### 3.3 The Continuation + reconciler
 
@@ -214,7 +219,7 @@ declaration on the typed Cmd/Msg unions instead of its own subsystem:
 | **4.1.1** | Typed Cmd union + `interpretCmd` exhaustive switch | 2026-05-24 |
 | **4.1.2** | `http_fetch` staging — closes the marker-commit race | 2026-05-24 |
 | **4.1.3** | `respond` Cmd routes H2 entity commit-move through `interpretCmd` | 2026-05-24 |
-| **4.1.4** | `conn_write` Cmd slot — **DEFERRED to inbound-WS** ([`websocket-plan.md`](websocket-plan.md)); don't park typed slots without producers | — |
+| **4.1.4** | `conn_write` Cmd slot — **WITHDRAWN:** outbound WS frames reuse `Cmd.stream_chunk` via `stream.write` ([`websocket-plan.md`](websocket-plan.md) §2.4); no new slot | n/a |
 | **5** | Retire `http.send` as a Zig primitive; durability becomes JS-shim composition. ~4.7 kLOC Zig deleted | 2026-05-24, `b908953` |
 | **6** | Cleanup tail — delete `src/connection_holder/`, move `cron_state` to a rove collection, resolve boot UNCLEAR (was already correct), rewrite effect-algebra §5/§6/§7, sweep CLAUDE.md dispatch wording | 2026-05-27 |
 | **7** | Collapse `files-server` into Cmds + in-process compile worker — **CANCELLED** 2026-05-27. Files-server stays as a separate binary; customer-facing blob primitives deferred until concrete demand. |
@@ -253,9 +258,11 @@ the Phase-0 baseline.
 - **Streaming inbound body (gap 2.4)** — NOT BUILT; design locked in
   `streaming-model.md` §3. Reification made it a cheap declaration
   when someone ships the h2 chunk delivery wire-up.
-- **Connection-actor WebSocket (gap 2.5 inbound)** — NOT BUILT; see
-  [`websocket-plan.md`](websocket-plan.md). `conn_write` Cmd slot adds
-  when the inbound-WS producer ships.
+- **Connection-actor WebSocket (gap 2.5 inbound)** — in progress
+  (single-tenant / single-node); see
+  [`websocket-plan.md`](websocket-plan.md). Outbound frames reuse
+  `Cmd.stream_chunk` via `stream.write` — the reserved `conn_write` slot
+  was withdrawn, not added.
 - **Phase 7 files-server collapse** — cancelled 2026-05-27. Files-server
   stays as a separate binary; customer-facing `blob.put` / `blob.get`
   primitives deferred until concrete demand.
