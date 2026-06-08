@@ -258,6 +258,57 @@ pub fn writeResponse(
     try out.appendSlice(a, body);
 }
 
+// ── Chunked streaming response (SSE, ReadableStream, proxied stream) ──────
+//
+// A streaming response whose length isn't known up front: emit the head with
+// `Transfer-Encoding: chunked` (no Content-Length), then each body piece as a
+// chunk, then the zero-terminator. Unlike `writeResponse`, the connection stays
+// open and keep-alive survives (chunked delimits the body).
+
+/// The terminating zero-chunk that ends a chunked response body.
+pub const CHUNK_TERMINATOR = "0\r\n\r\n";
+
+/// Serialize the head of a chunked streaming response (status line + headers +
+/// `Transfer-Encoding: chunked`, no body). Caller-set framing headers
+/// (`Content-Length` / `Connection` / `Transfer-Encoding`) are dropped — the
+/// serializer owns framing.
+pub fn writeStreamHead(
+    out: *std.ArrayList(u8),
+    a: std.mem.Allocator,
+    status: u16,
+    headers: []const RespHeader,
+) !void {
+    var lb: [4]u8 = undefined;
+    const code = std.fmt.bufPrint(&lb, "{d}", .{status}) catch unreachable;
+    try out.appendSlice(a, "HTTP/1.1 ");
+    try out.appendSlice(a, code);
+    try out.append(a, ' ');
+    try out.appendSlice(a, reasonPhrase(status));
+    try out.appendSlice(a, "\r\n");
+    for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "content-length") or
+            std.ascii.eqlIgnoreCase(h.name, "connection") or
+            std.ascii.eqlIgnoreCase(h.name, "transfer-encoding")) continue;
+        try out.appendSlice(a, h.name);
+        try out.appendSlice(a, ": ");
+        try out.appendSlice(a, h.value);
+        try out.appendSlice(a, "\r\n");
+    }
+    try out.appendSlice(a, "Transfer-Encoding: chunked\r\n\r\n");
+}
+
+/// Serialize one non-empty chunk: `<hex-size>\r\n<data>\r\n`. (A zero-length
+/// chunk would prematurely terminate the body — callers skip empty pieces and
+/// end the stream with `CHUNK_TERMINATOR`.)
+pub fn writeChunk(out: *std.ArrayList(u8), a: std.mem.Allocator, data: []const u8) !void {
+    var hb: [16]u8 = undefined;
+    const hex = std.fmt.bufPrint(&hb, "{x}", .{data.len}) catch unreachable;
+    try out.appendSlice(a, hex);
+    try out.appendSlice(a, "\r\n");
+    try out.appendSlice(a, data);
+    try out.appendSlice(a, "\r\n");
+}
+
 /// A minimal status→reason map. Clients ignore the phrase, so unknown codes get
 /// a generic class phrase rather than a table of every code.
 pub fn reasonPhrase(status: u16) []const u8 {
@@ -420,6 +471,37 @@ test "http1: decodeChunked rejects a bad size line (400)" {
     defer out.deinit(a);
     const r = decodeChunked("zz\r\nabc\r\n0\r\n\r\n", 0, &out, a, 1 << 20);
     try testing.expectEqual(ChunkStatus.malformed, r.status);
+}
+
+test "http1: writeStreamHead emits chunked TE, no content-length" {
+    const a = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try writeStreamHead(&out, a, 200, &.{
+        .{ .name = "Content-Type", .value = "text/event-stream" },
+        .{ .name = "Content-Length", .value = "5" }, // must be dropped
+    });
+    const s = out.items;
+    try testing.expect(std.mem.startsWith(u8, s, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.indexOf(u8, s, "Content-Type: text/event-stream\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "Transfer-Encoding: chunked\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "Content-Length") == null);
+    try testing.expect(std.mem.endsWith(u8, s, "\r\n\r\n"));
+}
+
+test "http1: writeChunk frames a piece, terminator ends the body" {
+    const a = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try writeChunk(&out, a, "data: hi\n\n"); // 10 bytes → 0xa
+    try out.appendSlice(a, CHUNK_TERMINATOR);
+    try testing.expectEqualStrings("a\r\ndata: hi\n\n\r\n0\r\n\r\n", out.items);
+    // Round-trips through the decoder.
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    const r = decodeChunked(out.items, 0, &body, a, 1 << 20);
+    try testing.expectEqual(ChunkStatus.complete, r.status);
+    try testing.expectEqualStrings("data: hi\n\n", body.items);
 }
 
 test "http1: h2 preface is NotHttp1" {
