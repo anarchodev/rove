@@ -1,8 +1,19 @@
 # WebSocket plan — transport, handler shape, and the use cases it unlocks
 
-> **Status**: planned, not started. **Inbound model decided 2026-06-07 — see
-> §4.5** (DO-shaped; gap #6 dropped the cost to ~1–2 weeks; §4's 6–10-week
-> estimate is superseded). Originally consolidated 2026-05-27 from the
+> **Status**: in progress (single-tenant / single-node). **Inbound model
+> decided 2026-06-07 — see §4.5** (DO-shaped; gap #6 dropped the cost to ~1–2
+> weeks; §4's 6–10-week estimate is superseded). **Handler-API revised 2026-06-08
+> to the shipped post-Phase-2 surface** — the held-connection handler is
+> `stream.*` effects + `on.*` waits + `return next()` / terminal + named-export
+> dispatch (`docs/handler-shape.md`), NOT the retired `__rove_stream({write,
+> waitFor})` return verb. Every handler-facing snippet below is in the current
+> vocabulary. **Transport shipped 2026-06-08**: the codec (piece B,
+> `src/h2/ws.zig`) plus the rove-h2 transport (pieces A/C + the h2 side of E) —
+> the `101` handshake, ws-mode connection, inbound parse/reassemble/auto-pong/
+> close, and outbound framing over the `ws_message_out` / `ws_send_in` collection
+> seam. Proven by `examples/ws_echo_test.zig` (`zig build ws-echo`) +
+> `scripts/ws_echo_smoke.py`. **Next: piece D** (the worker `onMessage` seam).
+> Originally consolidated 2026-05-27 from the
 > WebSocket-blocked items scattered across other docs (`connection-actor-plan.md`
 > §6.3 + §6.5, `effect-reification-plan.md` Phase 4.1.4 `conn_write`,
 > `primitive-gaps.md` §2.5 forward note, `streaming-handlers-plan.md`
@@ -22,9 +33,10 @@ firehose CONSUMER, Pub/Sub, custom WS APIs):
   `curl_ws_recv` / `curl_ws_send`). Adding a `held: bool` ws-mode
   variant of the existing `held` PendingFetch is the closest
   unstarted work.
-- Execution model is **fully shipped.** Each upstream WS frame is
-  an `inbound_chunk`-shaped Msg on the held chain — the same shape
-  `http.subscribe`'s on_chunk activations already use.
+- Execution model is **fully shipped.** Each upstream WS frame
+  resumes the held chain as a bound-`on.fetch` chunk activation —
+  the same `onFetchChunk` export `http.subscribe`'s streamed reads
+  already dispatch to.
 - Tape determinism is **already covered.** Per-chain tape budget
   (`streaming-model.md` §3) handles WS frame replay the same way it
   handles SSE chunks.
@@ -62,7 +74,7 @@ cursor-resumable. The forcing function for the fediverse vertical
 
 Status:
 - ✅ Long-lived held connection — `http.subscribe` shipped 2026-05-24
-- ✅ Per-frame activation model — `inbound_chunk` shape works
+- ✅ Per-frame activation model — the `onFetchChunk` activation shape works
 - ✅ Per-tenant cap, cooperative cancellation
 - ❌ **WS framing** — currently just HTTP body chunks via curl_multi;
   needs WebSocket frame parsing (binary opcodes, ping/pong)
@@ -80,13 +92,14 @@ chain activation machinery.
 
 Customer use case: a chat room handler receives WS messages from N
 connected clients, broadcasts to all of them. Today the customer can
-build the receive-half via long-poll over `__rove_stream` (works but
-chatty), but they can't expose a real WebSocket endpoint that browsers
-expect.
+build the receive-half via long-poll over the `stream.*` surface (works
+but chatty), but they can't expose a real WebSocket endpoint that
+browsers expect.
 
 Blocked on the h1 stack work above. The execution model is fully
-covered by streaming-handlers `__rove_stream` + per-frame
-`inbound_chunk` activations — no design work, just transport.
+covered by the held-handler surface (`stream.*` output + `on.*` waits +
+`next()`) + per-frame `onMessage` activations — no design work, just
+transport.
 
 ### 2.3 Federation inbound (ActivityPub C2S, atproto PDS server)
 
@@ -95,14 +108,19 @@ gated on the h1 stack. ActivityPub S2S (server-to-server) is
 HTTP-only and already works without WS per
 [[project_fediverse_libs]] ("AP needs ZERO transport work").
 
-### 2.4 effect-reification `conn_write` Cmd slot
+### 2.4 Outbound-frame effect — `stream.write`, not a separate `conn_write`
 
-`effect-reification-plan.md` Phase 4.1.4 deferred adding the
-`conn_write` Cmd variant for inbound-WS frame writes. The typed Cmd
-union has slots for every producer-bearing variant; `conn_write`
-gets added when the inbound-WS producer exists, not before
-(parking the typed slot in advance was caught as Option-1
-scaffolding in the 2026-05-24 audit).
+`effect-reification-plan.md` Phase 4.1.4 originally reserved a `conn_write`
+Cmd variant for inbound-WS frame writes. **The post-Phase-2 handler surface
+superseded that reservation:** connection output is the **one** `stream.write`
+effect surface (`docs/handler-shape.md` §2.2 — "ONE streaming surface"), which
+already lowers to `Cmd.stream_chunk`. So an outbound WS frame is just
+`stream.write(chunk)`; the WS opcode (text for a string value, binary for
+bytes) is carried on the chunk and applied as RFC 6455 framing at the h2
+serialize fork (where `http1StreamChunk` lives) for a WS-mode connection. No
+distinct `conn_write` Cmd — adding one would re-fork the unified output surface
+the Phase-2 reshape deliberately collapsed. Ping/pong are runtime-internal
+(auto-pong); close is the handler's terminal return.
 
 ## 3. Transport choices — outbound
 
@@ -219,9 +237,12 @@ one raft group → one serving worker" is the same shape, so a **tenant is the D
 analog** — held connections in the tenant's worker(s), durable state in the
 tenant's KV, and idle held connections riding the Phase-6 hibernation
 active-set (the DO "WebSocket Hibernation" analog; rove already has the
-primitive). A held WS connection is a held stream chain (§5, unchanged):
-inbound frames are `inbound_chunk` Msgs, `disconnect` is a `disconnect` Msg,
-outbound frames are the `conn_write` Cmd. No new execution vocabulary.
+primitive). A held WS connection is a held continuation chain (§5): each
+inbound frame dispatches to the `onMessage` export (one new connection
+activation kind, the WS analog of `onChunk`); client close → the existing
+`onDisconnect` export; outbound frames are `stream.write` (the existing
+connection-output effect). One new activation kind (`onMessage`); everything
+else reuses the shipped held-handler vocabulary.
 
 ### Two fan-out operations, forced apart by the model
 
@@ -255,20 +276,28 @@ non-empty writeset** — that is the whole rule. So:
 - **Durable frame** = non-empty writeset: a persisted chat message, a committed
   CRDT op, or a durable effect (whose owed-marker is itself a KV write).
 
-To avoid one raft round-trip per durable frame, coalesce via the connection
-actor's **coalesced trigger**: while batch K's commit is in flight, arriving
-frames queue on the actor (they do not each fire an activation); on commit they
-become batch K+1, delivered as one activation (`frames: [...]`) → one writeset
-→ one raft entry. **Load-adaptive, no tuning knob:** light load → batch-of-1
-(minimum latency); heavy load → the batch grows to cover one RTT's arrivals
-(the round-trip is hidden). Because V2 is one raft group per tenant, the
-coalescing is **across a tenant's connections**, not just within one socket —
-a busy room amortizes through its one group. Durability acks are necessarily
-batch-granular (you can only ack after the commit), so the WS protocol must not
-promise per-frame durability before that commit. The atomicity boundary is
-**explicit in the handler shape** (`frames: [...]`), mirroring outbound
-`__rove_stream({write: [...frames]})` — transparent group-commit is rejected
-(it fights the unanswerable "is activation K durable yet?").
+The atomicity unit is **one activation**: an `onMessage` run's `kv.*` writes +
+`stream.write`s commit together as one writeset → one raft entry, exactly like
+any other connection activation. The **first single-node cut ships batch-of-1**
+(each writing frame is its own activation → its own propose; ephemeral frames
+skip raft entirely).
+
+To avoid one raft round-trip per durable frame *later*, coalesce via the
+connection actor's **coalesced trigger**: while batch K's commit is in flight,
+arriving frames queue on the actor (they do not each fire an activation); on
+commit they become batch K+1, delivered as **one `onMessage` activation whose
+`request.activation.frames` carries the batch** → one writeset → one raft entry.
+**Load-adaptive, no tuning knob:** light load → batch-of-1 (minimum latency);
+heavy load → the batch grows to cover one RTT's arrivals (the round-trip is
+hidden). Because V2 is one raft group per tenant, the coalescing is **across a
+tenant's connections**, not just within one socket — a busy room amortizes
+through its one group. Durability acks are necessarily batch-granular (you can
+only ack after the commit), so the WS protocol must not promise per-frame
+durability before that commit. The atomicity boundary is **explicit in the
+activation shape** (the batched `frames` array delivered to one `onMessage`),
+the inbound analog of the `onChunk` batch — transparent group-commit is
+rejected (it fights the unanswerable "is activation K durable yet?"). This
+coalescing is a **later perf phase**, not part of the batch-of-1 baseline.
 
 ### Non-goals — DO-model-specific (extend §7)
 
@@ -284,32 +313,55 @@ promise per-frame durability before that commit. The atomicity boundary is
 
 | # | Piece | Size | Notes |
 |---|---|---|---|
-| A | `101` Upgrade handshake | **small** (~50 LOC) | `parseHead` gives the headers; `Sec-WebSocket-Accept` = SHA1(key+magic GUID)→base64 (std.crypto). Reply via the h1 serializer. |
-| B | RFC 6455 frame codec (`src/h2/ws.zig`) | **medium-small** (~400 LOC + tests) | pure parse/serialize: opcode, FIN, mask bit, 7/16/64-bit length, unmask, fragmentation/continuation, ping/pong/close. A self-contained table-tested file like `http1.zig`. The bulk of genuinely new code. |
-| C | connection mode switch on `Conn` | **small-medium** | a third branch alongside the `h1` fork in `readsFeedData` / the response path — accumulation buffer, TLS decrypt, the backpressure write machinery are all reused from gap #6. |
-| D | frame → activation | **medium** (softest estimate) | wire the frame producer into the shipped `inbound_chunk` / held-stream seam (the same one `http.subscribe`'s `on_chunk` uses). Re-read this seam before committing a number. |
-| E | `conn_write` Cmd executor | **medium** | the reserved Phase-4.1.4 slot → serialize frames + push to the backpressure-gated outbound path. |
+| A | `101` Upgrade handshake | ✅ **DONE** | `wsIsUpgrade` (GET + `Upgrade: websocket` + `Connection: upgrade` token + `Sec-WebSocket-Key`) detected in `http1Drive`; `wsHandshake` replies `101` with `ws.acceptKey` derivation and flips `Http1Conn.ws_mode`. The `101` is queued through the WS outbound path so it precedes any frame in wire order. |
+| B | RFC 6455 frame codec (`src/h2/ws.zig`) | ✅ **DONE** (~430 LOC + 16 tests, `zig build ws-test`) | pure parse/serialize: opcode, FIN, mask bit, 7/16/64-bit length, unmask, fragmentation surfaced (opcode+fin), ping/pong/close, `Sec-WebSocket-Accept` derivation. A self-contained table-tested file like `http1.zig`. |
+| C | connection mode switch on `Conn` | ✅ **DONE** | `Http1Conn.ws_mode` + reassembly state (`ws_msg`/`ws_msg_opcode`); `http1Feed` routes a ws-mode conn to `wsDrive` (parse loop, auto-pong, close echo, fragment reassembly → emit on `ws_message_out`). TLS decrypt + the read pump are reused from gap #6. |
+| E | outbound-frame framing | ✅ **DONE** (h2 side) | NOT a new Cmd. The WS seam is two collections: `ws_message_out` (inbound complete messages) + `ws_send_in` (outbound frames, opcode in `WsMeta`, bytes in `ReqBody`). `consumeWsSends` RFC-6455-frames each by opcode onto the per-conn `ws_out` byte queue; `wsFlush` keeps exactly one socket write in flight (`ws_write_inflight`, released in `writesAccount`) so control frames (pong/close) interleave with data in wire order. **Worker side (lower `stream.write` on a WS conn → `ws_send_in`) lands with piece D.** |
+| D | frame → activation | **medium** (NEXT) | dispatch each `ws_message_out` message to the `onMessage` export via the held-continuation resume seam (the `parked_continuations` / `resumeContinuation` path that `on.*` wakes already use). Client close (opcode 8 on `ws_message_out`) → the `onDisconnect` export. Lives in rove-js (the worker), consuming the stable `ws_message_out` / `ws_send_in` h2 collections. |
 | (shared) | cross-worker held-state locator | **medium, not WS-specific** | `cross-worker-held-state-plan.md`; needed by every held primitive. Amortized, not WS tax. |
 
-**Net platform commitment for DO-parity inbound WS: medium (~1–2 weeks)** on
-the gap-#6 substrate, dominated by the pure frame codec (B). Broadcast is docs
-(the kv-wake recipe).
+**Transport (A/B/C/E-h2) is shipped + proven** by `examples/ws_echo_test.zig`
+(`zig build ws-echo`) and `scripts/ws_echo_smoke.py` (raw-socket RFC 6455 client:
+101 handshake, text/binary echo, fragment reassembly, auto-pong, close
+handshake). **Remaining platform commitment: piece D** (the worker seam) on top
+of the `ws_message_out` / `ws_send_in` collections. Broadcast is docs (the
+kv-wake recipe).
 
-## 5. Handler execution model — already shipped, recap
+## 5. Handler execution model — the current (post-Phase-2) surface
 
-Per `streaming-model.md` and `connection-actor-plan.md` §6.3:
+Per `docs/handler-shape.md` (the shipped held-handler model) +
+`streaming-model.md`:
 
-- A WS connection IS a held stream chain. `correlation_id` per
-  connection.
-- Each inbound frame is an `inbound_chunk` Msg on the chain. Binary
-  frames > 16 KB go content-addressed via the blob coordinator
-  (streaming-model.md §7).
-- Handler returns `__rove_stream({write: [...frames], waitFor: {...}})`
-  to send + park for the next wake.
-- Disconnect is a `disconnect` Msg.
+- A WS connection IS a held continuation chain. `correlation_id` per
+  connection; the chain rides Phase-6 hibernation while idle.
+- Each inbound frame dispatches to the **`onMessage`** export — one new
+  connection activation kind (the WS analog of `onChunk`).
+  `request.activation` carries `{ opcode, data }` (and, under the §4.5
+  coalescing perf-phase, a `frames: [...]` batch). Binary frames > 16 KB
+  go content-addressed via the blob coordinator (streaming-model.md §7).
+- Outbound frames are the **`stream.write(chunk)`** effect (commit-gated,
+  like every connection write): a string value → a text frame, bytes → a
+  binary frame; the WS-mode connection applies RFC 6455 framing at the h2
+  serialize fork. Ping/pong are runtime-internal (auto-pong); the handler
+  never sees them.
+- **Park for the next frame** = `return next({ctx?})`; **close** = a
+  terminal return (the server sends a Close frame). A client-initiated
+  close routes to the **`onDisconnect`** export (cleanup is optional —
+  a missing `onDisconnect` is a no-op).
 
-No new Msg/Cmd vocabulary needed beyond `conn_write` (Phase 4.1.4
-deferral) for the outbound-frame Cmd.
+```js
+// echo: per inbound frame, send it back and stay open.
+export function onMessage(request) {
+  const { opcode, data } = request.activation;   // inbound frame
+  stream.write(opcode === 'binary' ? data : `echo:${data}`);
+  return next();                                  // park for the next frame
+}
+export function onDisconnect() { /* optional cleanup */ }
+```
+
+The **one** new runtime activation kind is `onMessage`; close reuses the
+shipped `onDisconnect`, and output reuses the one `stream.write` surface
+(`Cmd.stream_chunk`) — no separate `conn_write` Cmd (§2.4).
 
 ## 6. Use cases unlocked
 
@@ -338,8 +390,8 @@ collab).
   cross-connection ordering is the customer's problem.
 - **Server-pushed WS via h2 PUSH_PROMISE.** Deprecated by browsers;
   doesn't apply.
-- **Replacing SSE with WS for the live-UI-update use case.** SSE +
-  `__rove_stream` covers that case today (`streaming-model.md` §3-§4);
+- **Replacing SSE with WS for the live-UI-update use case.** SSE via the
+  `stream.*` surface covers that case today (`streaming-model.md` §3-§4);
   WS is for the cases SSE can't (bidirectional, binary, custom
   framing).
 
@@ -375,7 +427,10 @@ collab).
   collapse to "see websocket-plan.md"; §6.5 keeps the chain-merge
   semantics specific to atproto.
 - **`effect-reification-plan.md` Phase 4.1.4** (`conn_write` Cmd
-  slot) — adds when inbound-WS lands per this plan.
+  slot) — **superseded:** the Phase-2 `stream.*` reshape made
+  `stream.write` the one connection-output surface, so outbound WS
+  frames lower to `Cmd.stream_chunk` (opcode-tagged), not a new
+  `conn_write` Cmd (§2.4). That reservation can be struck.
 - **`primitive-gaps.md` §2.5** — outbound subscription shipped via
   `http.subscribe`; the "WS framing remains separate" note now
   resolves to this doc.

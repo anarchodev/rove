@@ -303,6 +303,11 @@ pub fn build(b: *std.Build) void {
     // rove-h2 tests
     const h2_tests = b.addTest(.{ .root_module = h2_mod });
     test_step.dependOn(&b.addRunArtifact(h2_tests).step);
+    // Isolated rove-h2 test step — the aggregate `test` step is broken on v2
+    // (frozen V1 sqlite modules), so this builds/runs just the h2 inline tests
+    // (and so compile-checks the WS transport in root.zig).
+    const h2_test_step = b.step("h2-test", "Run the rove-h2 unit tests (compile-checks root.zig)");
+    h2_test_step.dependOn(&b.addRunArtifact(h2_tests).step);
 
     // rove-kv tests
     const kv_tests = b.addTest(.{ .root_module = kv_mod });
@@ -395,6 +400,16 @@ pub fn build(b: *std.Build) void {
     const h1_tests = b.addTest(.{ .root_module = h1_test_mod });
     const h1_test_step = b.step("h1-test", "Run the HTTP/1.1 codec unit tests");
     h1_test_step.dependOn(&b.addRunArtifact(h1_tests).step);
+
+    // rove-h2 RFC 6455 WebSocket codec (websocket-plan §4.6 piece B) — pure std.
+    const ws_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/h2/ws.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const ws_tests = b.addTest(.{ .root_module = ws_test_mod });
+    const ws_test_step = b.step("ws-test", "Run the WebSocket frame codec unit tests");
+    ws_test_step.dependOn(&b.addRunArtifact(ws_tests).step);
 
     // ── rove-tenant: account/user/instance/domain metadata ──
     //
@@ -747,6 +762,29 @@ pub fn build(b: *std.Build) void {
     const h2_stream_run = b.addRunArtifact(h2_stream_test);
     const h2_stream_step = b.step("h2-stream-test", "Run the streaming echo server example (h2 + h1 chunked)");
     h2_stream_step.dependOn(&h2_stream_run.step);
+
+    // ws-echo: inbound WebSocket transport proof (websocket-plan §4.6 A/C/E-h2).
+    const ws_echo_mod = b.addModule("ws-echo", .{
+        .root_source_file = b.path("examples/ws_echo_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ws_echo_mod.addImport("rove", rove_mod);
+    ws_echo_mod.addImport("rove-io", io_mod);
+    ws_echo_mod.addImport("rove-h2", h2_mod);
+    ws_echo_mod.link_libc = true;
+    ws_echo_mod.linkSystemLibrary("nghttp2", .{});
+    ws_echo_mod.linkSystemLibrary("ssl", .{});
+    ws_echo_mod.linkSystemLibrary("crypto", .{});
+
+    const ws_echo_exe = b.addExecutable(.{
+        .name = "ws-echo",
+        .root_module = ws_echo_mod,
+    });
+    b.installArtifact(ws_echo_exe);
+    const ws_echo_run = b.addRunArtifact(ws_echo_exe);
+    const ws_echo_step = b.step("ws-echo", "Run the inbound WebSocket echo server example");
+    ws_echo_step.dependOn(&ws_echo_run.step);
 
     // s3-blob-smoke: exercise rove-blob's S3BlobStore against any
     // S3-compatible endpoint (default-tested against OVH). Pure
