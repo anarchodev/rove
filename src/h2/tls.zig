@@ -515,19 +515,25 @@ pub const TlsConfig = struct {
         inlen: c_uint,
         _: ?*anyopaque,
     ) callconv(.c) c_int {
-        // Walk client ALPN list looking for "h2"
-        var p = in;
-        const end = in + inlen;
-        while (@intFromPtr(p) < @intFromPtr(end)) {
-            const len = p[0];
-            p += 1;
-            if (@intFromPtr(p) + len > @intFromPtr(end)) break;
-            if (len == 2 and p[0] == 'h' and p[1] == '2') {
-                out[0] = p;
-                outlen[0] = 2;
-                return c.SSL_TLSEXT_ERR_OK;
+        // Server preference order: prefer h2, fall back to http/1.1 (the edge
+        // accepts h1-only clients — webhooks, ACME — without Cloudflare;
+        // docs/v2-edge-http1-ingress.md phase 3). Return the first server
+        // preference the client offered.
+        const prefs = [_][]const u8{ "h2", "http/1.1" };
+        for (prefs) |pref| {
+            var p = in;
+            const end = in + inlen;
+            while (@intFromPtr(p) < @intFromPtr(end)) {
+                const len = p[0];
+                p += 1;
+                if (@intFromPtr(p) + len > @intFromPtr(end)) break;
+                if (len == pref.len and std.mem.eql(u8, p[0..len], pref)) {
+                    out[0] = p;
+                    outlen[0] = @intCast(len);
+                    return c.SSL_TLSEXT_ERR_OK;
+                }
+                p += len;
             }
-            p += len;
         }
         return c.SSL_TLSEXT_ERR_NOACK;
     }
@@ -614,6 +620,17 @@ pub const TlsConn = struct {
 
         const result: FeedResult = if (just_completed) .handshake_done else .data;
         return .{ .result = result, .out_len = total };
+    }
+
+    /// The ALPN protocol the handshake negotiated ("h2", "http/1.1"), or an
+    /// empty slice if the client offered no ALPN. Valid after `handshake_done`.
+    /// Borrows OpenSSL-owned memory tied to the SSL object's lifetime.
+    pub fn alpnProtocol(self: *TlsConn) []const u8 {
+        var data: [*c]const u8 = null;
+        var len: c_uint = 0;
+        c.SSL_get0_alpn_selected(self.ssl, &data, &len);
+        if (data == null or len == 0) return &.{};
+        return data[0..@intCast(len)];
     }
 
     /// Encrypt plaintext for sending over TCP.
