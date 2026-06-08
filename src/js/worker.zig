@@ -1374,6 +1374,21 @@ pub fn Worker(comptime opts: Options) type {
         /// rove-library principle #8, so a chain transitioning
         /// cont→stream doesn't invalidate the map entry.
         bound_fetch_entities: std.StringHashMapUnmanaged(rove.Entity) = .empty,
+        /// `docs/websocket-plan.md` §4.5/§5 (piece D): per-connection
+        /// held WebSocket chain locator. Maps the h2 connection `Entity`
+        /// (the `Session.entity` carried on every `ws_message_out` /
+        /// `ws_send_in` entity) → the parked continuation entity holding
+        /// that connection's chain (in `parked_continuations`). The first
+        /// inbound frame establishes the chain (resolve tenant + module,
+        /// create the parked entity, insert here); subsequent frames look
+        /// it up; client close / conn death tears it down + removes the
+        /// entry. Keyed by `Entity` (index+generation), so a recycled
+        /// conn handle never resolves a dead chain — `reg.isStale`
+        /// distinguishes by generation. NOT a new collection: the chain
+        /// lives in the existing `parked_continuations` (its membership
+        /// IS the held lifecycle); this is only the conn→entity index,
+        /// the WS analog of `bound_fetch_entities`.
+        ws_chains_by_conn: std.AutoHashMapUnmanaged(rove.Entity, rove.Entity) = .empty,
         /// `docs/chunk-spool-plan.md` Phase 2: per-fetch chunk spool,
         /// keyed by `fetch_id`, sibling to `bound_fetch_entities`.
         /// Decouples bound-fetch chunk arrival from the held chain's
@@ -1915,6 +1930,11 @@ pub fn Worker(comptime opts: Options) type {
                 while (it.next()) |entry| allocator.free(entry.key_ptr.*);
                 self.bound_fetch_entities.deinit(allocator);
             }
+            // websocket-plan §5 (piece D): the conn→chain index holds no
+            // owned keys (Entity values) — the chain entities themselves
+            // are reaped via `parked_continuations`/registry teardown on
+            // shutdown. Just free the map's own storage.
+            self.ws_chains_by_conn.deinit(allocator);
             // `docs/chunk-spool-plan.md` Phase 2: free every spool +
             // its still-pending entries + the duped fetch_id key.
             // Best-effort drain at shutdown, same lossy posture as
@@ -2532,6 +2552,7 @@ pub const SubscriptionFireQueueInput = worker_streaming.SubscriptionFireQueueInp
 pub const StreamResumeStage = worker_streaming.StreamResumeStage;
 pub const setStreamComponents = worker_streaming.setStreamComponents;
 pub const serviceParkedStreams = worker_streaming.serviceParkedStreams;
+pub const serviceWsMessages = worker_streaming.serviceWsMessages;
 pub const fireSubscriptionActivation = worker_streaming.fireSubscriptionActivation;
 pub const proposeForgetfulWrites = worker_streaming.proposeForgetfulWrites;
 pub const serviceSubscriptionFires = worker_streaming.serviceSubscriptionFires;

@@ -39,6 +39,7 @@ const tape_mod = @import("rove-tape");
 
 const dispatcher_mod = @import("dispatcher.zig");
 const globals = @import("globals.zig");
+const router_mod = @import("router.zig");
 const Request = dispatcher_mod.Request;
 const components_mod = @import("components.zig");
 const chunk_spool_mod = @import("chunk_spool.zig");
@@ -1418,6 +1419,546 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
     }
 }
 
+// ── Inbound WebSocket worker seam (docs/websocket-plan.md §4.5/§5, piece D) ──
+//
+// A held WebSocket connection is a parked continuation chain (it lives in
+// `parked_continuations`, located by conn entity via `ws_chains_by_conn`).
+// The h2 transport surfaces each complete inbound data frame on the
+// `ws_message_out` collection (Session = conn, WsMeta.opcode, ReqBody =
+// payload); `serviceWsMessages` drains it once per tick and dispatches each
+// frame to the tenant's `onMessage` export (client-close opcode 8 →
+// `onDisconnect`). Outbound `stream.write`s lower to `ws_send_in` entities —
+// inline for read-only frames, commit-gated `ws_send` Cmds for writing frames
+// (batch-of-1 durability). This is additive on the STABLE transport
+// collections — no new collection, no transport change.
+
+/// Drain the conn→chain index of any entry whose connection has died without
+/// a Close frame (abrupt client RST/EOF — the transport reaps the conn but
+/// emits no opcode-8 message). Fire `onDisconnect` on each orphaned chain,
+/// then tear it down. Cheap when the map is empty (one length check). Run at
+/// the top of `serviceWsMessages` so a dead idle conn doesn't leak its chain.
+fn sweepStaleWsChains(worker: anytype) void {
+    if (worker.ws_chains_by_conn.count() == 0) return;
+    const server = worker.h2;
+    // Collect stale conns first — can't mutate the map mid-iteration.
+    var stale: [128]rove.Entity = undefined;
+    var n: usize = 0;
+    {
+        var it = worker.ws_chains_by_conn.iterator();
+        while (it.next()) |entry| {
+            if (n >= stale.len) break;
+            if (server.reg.isStale(entry.key_ptr.*)) {
+                stale[n] = entry.key_ptr.*;
+                n += 1;
+            }
+        }
+    }
+    for (stale[0..n]) |conn_ent| {
+        if (worker.ws_chains_by_conn.get(conn_ent)) |chain_ent| {
+            fireWsDisconnect(worker, chain_ent);
+        }
+        tearDownWsChain(worker, conn_ent);
+    }
+}
+
+/// Destroy a held WS chain entity + drop its conn→chain index entry.
+/// Idempotent — a no-op when the conn isn't mapped. The entity's
+/// `ChainContext` / `StreamChain` owned slices free via component deinit
+/// on destroy.
+fn tearDownWsChain(worker: anytype, conn_ent: rove.Entity) void {
+    const chain_ent = worker.ws_chains_by_conn.get(conn_ent) orelse return;
+    worker.h2.reg.destroy(chain_ent) catch {};
+    _ = worker.ws_chains_by_conn.remove(conn_ent);
+}
+
+/// Establish the held chain for a new WS connection on its first inbound
+/// frame: resolve the tenant (from the upgrade Host) + handler module (from
+/// the upgrade path), mint a per-connection correlation id, create the parked
+/// continuation entity carrying the chain identity, and index it by conn.
+/// Returns the chain entity, or an error if routing/tenant/module can't be
+/// resolved (the caller closes the socket).
+fn establishWsChain(worker: anytype, conn_ent: rove.Entity) !rove.Entity {
+    const allocator = worker.allocator;
+    const server = worker.h2;
+    const routing = server.wsConnRouting(conn_ent) orelse return error.WsConnGone;
+    const host = worker_mod.hostOnly(routing.authority);
+    const inst = (worker.node.tenant.resolveDomain(host) catch return error.WsResolveFailed) orelse
+        return error.WsNoTenant;
+
+    var route = router_mod.resolveRoute(allocator, routing.path) catch return error.WsRouteFailed;
+    defer route.deinit();
+
+    // Validate the module resolves to a deployment + bytecode now (and
+    // capture deployment_id for the chain). Each frame re-pins via
+    // `resolveDeployment` so this is a fail-fast + identity stamp.
+    var dep = try resolveDeployment(worker, allocator, inst.id, route.module_base);
+    defer dep.tc.release();
+
+    // Per-connection correlation id (16-hex of a fresh request_id), stable
+    // across the connection's frames — mirrors the inbound mint.
+    const request_id: u64 = blk: {
+        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
+        break :blk tl.id_minter.nextRequestId() catch 0;
+    };
+    var corr_buf: [16]u8 = undefined;
+    const corr = std.fmt.bufPrint(&corr_buf, "{x:0>16}", .{request_id}) catch unreachable;
+
+    const ent = try server.reg.create(&worker.parked_continuations);
+    errdefer server.reg.destroy(ent) catch {};
+    try server.reg.set(ent, &worker.parked_continuations, h2.Session, .{ .entity = conn_ent });
+    // Each dup's errdefer is block-scoped so it fires ONLY if the `set` that
+    // transfers ownership into the entity component fails. Once `set` succeeds
+    // and the block exits normally, the dup is owned by the component (freed by
+    // the entity-destroy errdefer above via the component's deinit) — no
+    // double-free on a later failure (`put`, etc.).
+    {
+        const tid_dup = try allocator.dupe(u8, inst.id);
+        errdefer allocator.free(tid_dup);
+        const corr_dup = try allocator.dupe(u8, corr);
+        errdefer allocator.free(corr_dup);
+        try server.reg.set(ent, &worker.parked_continuations, components_mod.ChainContext, .{
+            .tenant_id = tid_dup,
+            .correlation_id = corr_dup,
+            .deployment_id = dep.tc.snap.deployment_id,
+        });
+    }
+    {
+        const mod_dup = try allocator.dupe(u8, route.module_base);
+        errdefer allocator.free(mod_dup);
+        const ctx_dup = try allocator.dupe(u8, "{}");
+        errdefer allocator.free(ctx_dup);
+        try server.reg.set(ent, &worker.parked_continuations, components_mod.StreamChain, .{
+            .module_path = mod_dup,
+            .ctx_json = ctx_dup,
+            .activation_count = 0,
+        });
+    }
+    // A WS chain is a parked continuation that waits on the NEXT FRAME — not a
+    // §6.4 deadline and not an `on.*` wake. `sweepParkedContinuations` treats
+    // any entry with `now_ns >= deadline_ns` as deadline-expired, so set the
+    // deadline to "never" (the default 0 would tear the chain down on the very
+    // next tick). The default `StreamWakes` (interval_ms 0, empty ring) already
+    // makes it non-wake-due, so the sweep skips WS chains entirely; frame
+    // arrival (`serviceWsMessages`) is their only resume source.
+    try server.reg.set(ent, &worker.parked_continuations, components_mod.ContDescriptor, .{
+        .deadline_ns = std.math.maxInt(i64),
+    });
+    try worker.ws_chains_by_conn.put(allocator, conn_ent, ent);
+    return ent;
+}
+
+/// Drain `ws_message_out` once per tick: dispatch each inbound WS data frame
+/// to the held chain's `onMessage`, route a client close (opcode 8) to
+/// `onDisconnect`, and reap chains whose conn vanished. Gated by `count()==0`
+/// so the no-WS hot path pays nothing.
+pub fn serviceWsMessages(worker: anytype) !void {
+    sweepStaleWsChains(worker);
+
+    const server = worker.h2;
+    if (server.ws_message_out.entitySlice().len == 0) return;
+
+    // Snapshot (ment, conn, opcode, payload) up front — processing creates /
+    // destroys entities, so the columns aren't stable across the loop. The
+    // payload borrows `ReqBody.data`, valid until `ment` is destroyed; destroy
+    // is queued (flushed after this fn) so the borrow holds for the whole loop.
+    const Pending = struct { ment: rove.Entity, conn: rove.Entity, opcode: u8, payload: []const u8 };
+    var buf: [256]Pending = undefined;
+    var n: usize = 0;
+    {
+        const ents = server.ws_message_out.entitySlice();
+        const sessions = server.ws_message_out.column(h2.Session);
+        const metas = server.ws_message_out.column(h2.WsMeta);
+        const bodies = server.ws_message_out.column(h2.ReqBody);
+        for (ents, sessions, metas, bodies) |ent, sess, meta, body| {
+            if (n >= buf.len) break;
+            const payload: []const u8 = if (body.data) |d| d[0..body.len] else &.{};
+            buf[n] = .{ .ment = ent, .conn = sess.entity, .opcode = meta.opcode, .payload = payload };
+            n += 1;
+        }
+    }
+
+    for (buf[0..n]) |p| {
+        if (server.reg.isStale(p.conn)) {
+            // Conn already gone — reap any chain (no onDisconnect: the socket
+            // is dead, and an abrupt close is swept above). Drop the message.
+            tearDownWsChain(worker, p.conn);
+            server.reg.destroy(p.ment) catch {};
+            continue;
+        }
+        if (p.opcode == 8) {
+            // Client close → onDisconnect (best-effort), then tear down.
+            if (worker.ws_chains_by_conn.get(p.conn)) |chain_ent| {
+                fireWsDisconnect(worker, chain_ent);
+            }
+            tearDownWsChain(worker, p.conn);
+            server.reg.destroy(p.ment) catch {};
+            continue;
+        }
+        // Data frame (text/binary) → find-or-establish the chain, run onMessage.
+        const chain_ent = worker.ws_chains_by_conn.get(p.conn) orelse
+            establishWsChain(worker, p.conn) catch |err| {
+                std.log.warn("rove-js ws: establish chain failed: {s}; closing conn", .{@errorName(err)});
+                // Couldn't bind a tenant/module — send a Close so the client
+                // sees a clean shutdown rather than a hang.
+                effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = p.conn, .opcode = 8, .bytes = &.{} }) catch {};
+                server.reg.destroy(p.ment) catch {};
+                continue;
+            };
+        fireWsMessage(worker, chain_ent, p.conn, p.opcode, p.payload);
+        server.reg.destroy(p.ment) catch {};
+    }
+}
+
+/// Run one inbound WS frame's `onMessage` activation against the held chain.
+/// Structural sibling of `fireDisconnectActivation` — reads the chain identity
+/// off `parked_continuations`, re-pins the deployment, synthesizes a `{ctx}`
+/// request with the `.ws_message` activation (opcode + data surface as
+/// `request.activation`), runs the handler, then ships its `stream.write`
+/// frames to `ws_send_in` (inline if read-only, commit-gated if it wrote).
+/// `next()` keeps the chain parked (threading the new ctx); a terminal return
+/// closes the socket + tears the chain down.
+fn fireWsMessage(
+    worker: anytype,
+    chain_ent: rove.Entity,
+    conn_ent: rove.Entity,
+    opcode: u8,
+    payload: []const u8,
+) void {
+    const allocator = worker.allocator;
+    const server = worker.h2;
+    const chain_ctx = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.ChainContext) catch return;
+    const chain_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamChain) catch return;
+
+    const path = chain_st.module_path;
+    var dep = resolveDeployment(worker, allocator, chain_ctx.tenant_id, path) catch |err| {
+        std.log.warn("rove-js ws-message: tenant={s} resolveDeployment failed: {s}; closing", .{ chain_ctx.tenant_id, @errorName(err) });
+        effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+        tearDownWsChain(worker, conn_ent);
+        return;
+    };
+    defer dep.tc.release();
+    const inst = dep.inst;
+    const tc = dep.tc;
+    const bc = dep.bc;
+
+    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json}) catch return;
+    defer allocator.free(body);
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
+    defer allocator.free(spath);
+
+    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
+    var txn_owned = true;
+    defer if (txn_owned) allocator.destroy(txn);
+    txn.* = inst.kv.beginTrackedImmediate() catch return;
+    var txn_done = false;
+    defer if (!txn_done) txn.rollback() catch {};
+
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    defer readset.deinit();
+    const request_id: u64 = blk: {
+        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
+        break :blk tl.id_minter.nextRequestId() catch 0;
+    };
+    // `stream.write` accumulators (bytes + parallel opcode), wired so the
+    // handler's frames are captured for lowering to `ws_send_in`.
+    var stream_chunks: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (stream_chunks.items) |ch| allocator.free(ch);
+        stream_chunks.deinit(allocator);
+    }
+    var chunk_opcodes: std.ArrayListUnmanaged(u8) = .empty;
+    defer chunk_opcodes.deinit(allocator);
+
+    const request: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = body,
+        .query = null,
+        .readset = &readset,
+        .request_id = request_id,
+        .platform = inst.platform,
+        .limiter = &worker.limiter,
+        .instance_id = inst.id,
+        .correlation_id = chain_ctx.correlation_id,
+        .activation_source = .ws_message,
+        .activation_ws_opcode = opcode,
+        .activation_ws_data = payload,
+        .pending_stream_chunks = &stream_chunks,
+        .pending_stream_chunk_opcodes = &chunk_opcodes,
+    };
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    const run_oc = worker.dispatcher.runOutcome(
+        inst.kv,
+        txn,
+        &ws,
+        bc,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        tc.snap.triggers,
+        request,
+        &budget,
+    ) catch {
+        txn.rollback() catch {};
+        txn_done = true;
+        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .ws_message, 0);
+        effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+        tearDownWsChain(worker, conn_ent);
+        return;
+    };
+
+    var oc = run_oc;
+    switch (oc) {
+        .terminal => |*r| {
+            defer r.deinit(allocator);
+            if (r.exception.len > 0) {
+                txn.rollback() catch {};
+                txn_done = true;
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, .ws_message, 0);
+                r.console = &.{};
+                r.exception = &.{};
+                effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+                tearDownWsChain(worker, conn_ent);
+                return;
+            }
+            const lh: log_mod.LogHeader = wsLogHeader(request_id, tc.snap.deployment_id, @intCast(@max(@min(r.status, 599), 100)), path, chain_ctx.correlation_id);
+            const fw_seq = shipWsFrames(worker, conn_ent, &stream_chunks, &chunk_opcodes, &ws, txn, &txn_owned, chain_ctx.tenant_id, &readset, lh, true) catch |perr| {
+                std.log.warn("rove-js ws-message (terminal+writes): propose failed: {s}", .{@errorName(perr)});
+                txn_done = true;
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .ws_message, 0);
+                tearDownWsChain(worker, conn_ent);
+                return;
+            };
+            txn_done = true;
+            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .ws_message, fw_seq);
+            r.console = &.{};
+            r.exception = &.{};
+            tearDownWsChain(worker, conn_ent);
+        },
+        .continuation => |*cval| {
+            const lh: log_mod.LogHeader = wsLogHeader(request_id, tc.snap.deployment_id, 200, path, chain_ctx.correlation_id);
+            const fw_seq = shipWsFrames(worker, conn_ent, &stream_chunks, &chunk_opcodes, &ws, txn, &txn_owned, chain_ctx.tenant_id, &readset, lh, false) catch |perr| {
+                std.log.warn("rove-js ws-message (next+writes): propose failed: {s}", .{@errorName(perr)});
+                txn_done = true;
+                cval.deinit(allocator);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .ws_message, 0);
+                effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+                tearDownWsChain(worker, conn_ent);
+                return;
+            };
+            txn_done = true;
+            // next(): keep the chain parked; thread the new ctx forward.
+            if (chain_st.ctx_json.len > 0) allocator.free(chain_st.ctx_json);
+            chain_st.ctx_json = cval.ctx_json;
+            cval.ctx_json = &.{};
+            chain_st.activation_count += 1;
+            cval.deinit(allocator);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .ws_message, fw_seq);
+        },
+        .stream => |*s2| {
+            // A streamed-response descriptor from a WS frame is out of scope
+            // (the connection IS the stream): roll back, close, tear down.
+            s2.deinit(allocator);
+            txn.rollback() catch {};
+            txn_done = true;
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .ws_message, 0);
+            effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+            tearDownWsChain(worker, conn_ent);
+        },
+    }
+}
+
+/// Build the per-activation LogHeader for a ws_message hop (the WS analog of
+/// the inline `LogHeader` literals in `resumeStream` / `fireDisconnect`).
+fn wsLogHeader(request_id: u64, deployment_id: u64, status: u16, path: []const u8, corr: ?[]const u8) log_mod.LogHeader {
+    return .{
+        .request_id = request_id,
+        .deployment_id = deployment_id,
+        .duration_ns = 0,
+        .status = status,
+        .outcome = .ok,
+        .activation = .ws_message,
+        .method = "POST",
+        .path = path,
+        .host = "",
+        .correlation_id = corr orelse "",
+    };
+}
+
+/// Ship the frames an `onMessage` produced to `ws_send_in`. Read-only frames
+/// emit inline (committed now). A writing frame stages its frames (+ a
+/// trailing Close when `close`) as commit-gated `ws_send` Cmds via
+/// `proposeForgetfulWrites`, so they reach the wire only after the writeset
+/// commits (batch-of-1 durability). Consumes both lists; on the write path
+/// transfers the txn to the parked unit (clears `txn_owned`). Returns the
+/// propose seq (0 on the read-only path).
+fn shipWsFrames(
+    worker: anytype,
+    conn_ent: rove.Entity,
+    chunks: *std.ArrayListUnmanaged([]u8),
+    opcodes: *std.ArrayListUnmanaged(u8),
+    writeset: *const kv_mod.WriteSet,
+    txn: *kv_mod.KvStore.TrackedTxn,
+    txn_owned: *bool,
+    tenant_id: []const u8,
+    readset: *const tape_mod.Readset,
+    log_header: log_mod.LogHeader,
+    close: bool,
+) !u64 {
+    const allocator = worker.allocator;
+    if (writeset.ops.items.len > 0) {
+        var stage: StreamResumeStage = .{
+            .entity = rove.Entity.nil,
+            .ws_conn = conn_ent,
+            .mark_draining = close,
+        };
+        stage.chunks = chunks.*;
+        chunks.* = .empty;
+        stage.ws_opcodes = opcodes.*;
+        opcodes.* = .empty;
+        defer {
+            for (stage.chunks.items) |c| allocator.free(c);
+            stage.chunks.deinit(allocator);
+            stage.ws_opcodes.deinit(allocator);
+        }
+        const seq = proposeForgetfulWrites(worker, writeset, txn, tenant_id, &stage, readset, log_header) catch |err| {
+            txn_owned.* = false; // helper rolled back + destroyed the txn
+            return err;
+        };
+        txn_owned.* = false;
+        return seq;
+    }
+    // Read-only frame: commit now + emit each frame inline. No commit gate.
+    txn.commit() catch |e| panic_mod.invariantViolated(
+        "fireWsMessage.commit(read-only)",
+        "err={s}",
+        .{@errorName(e)},
+    );
+    for (chunks.items, 0..) |bytes, i| {
+        const op: u8 = if (i < opcodes.items.len) opcodes.items[i] else 1;
+        effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = op, .bytes = bytes }) catch {
+            if (bytes.len > 0) allocator.free(bytes);
+        };
+    }
+    chunks.clearRetainingCapacity(); // ownership transferred (or freed on error)
+    opcodes.clearRetainingCapacity();
+    if (close) {
+        effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+    }
+    return 0;
+}
+
+/// Run an `onDisconnect` activation for a held WS chain (client close or conn
+/// death). Mirrors `fireDisconnectActivation` but reads the chain off
+/// `parked_continuations` and never ships output (the socket is gone / the
+/// transport already echoed the Close). Writes commit asynchronously via
+/// `proposeForgetfulWrites` so cleanup side effects still land. The caller
+/// tears the chain down afterward.
+fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
+    const allocator = worker.allocator;
+    const server = worker.h2;
+    const chain_ctx = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.ChainContext) catch return;
+    const chain_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamChain) catch return;
+
+    const path = chain_st.module_path;
+    var dep = resolveDeployment(worker, allocator, chain_ctx.tenant_id, path) catch |err| {
+        std.log.warn("rove-js ws-disconnect: tenant={s} resolveDeployment failed: {s}; skipping", .{ chain_ctx.tenant_id, @errorName(err) });
+        return;
+    };
+    defer dep.tc.release();
+    const inst = dep.inst;
+    const tc = dep.tc;
+    const bc = dep.bc;
+
+    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json}) catch return;
+    defer allocator.free(body);
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
+    defer allocator.free(spath);
+
+    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
+    var txn_owned = true;
+    defer if (txn_owned) allocator.destroy(txn);
+    txn.* = inst.kv.beginTrackedImmediate() catch return;
+    var txn_done = false;
+    defer if (!txn_done) txn.rollback() catch {};
+
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    defer readset.deinit();
+    const request_id: u64 = blk: {
+        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
+        break :blk tl.id_minter.nextRequestId() catch 0;
+    };
+    const request: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = body,
+        .query = null,
+        .readset = &readset,
+        .request_id = request_id,
+        .platform = inst.platform,
+        .limiter = &worker.limiter,
+        .instance_id = inst.id,
+        .correlation_id = chain_ctx.correlation_id,
+        .activation_source = .disconnect,
+    };
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    const run_oc = worker.dispatcher.runOutcome(
+        inst.kv,
+        txn,
+        &ws,
+        bc,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        tc.snap.triggers,
+        request,
+        &budget,
+    ) catch {
+        txn.rollback() catch {};
+        txn_done = true;
+        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
+        return;
+    };
+
+    const wrote = ws.ops.items.len > 0;
+    var oc = run_oc;
+    // The handler's return shape is moot — the socket is gone. Deinit
+    // whatever it produced; commit any writes (async, nobody waits).
+    switch (oc) {
+        .terminal => |*r| r.deinit(allocator),
+        .continuation => |*cval| cval.deinit(allocator),
+        .stream => |*s2| s2.deinit(allocator),
+    }
+    if (wrote) {
+        const lh = wsLogHeader(request_id, tc.snap.deployment_id, 200, path, chain_ctx.correlation_id);
+        var lh_disc = lh;
+        lh_disc.activation = .disconnect;
+        _ = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null, &readset, lh_disc) catch |perr| {
+            std.log.warn("rove-js ws-disconnect: propose failed: {s}", .{@errorName(perr)});
+            txn_owned = false;
+            txn_done = true;
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
+            return;
+        };
+        txn_owned = false;
+        txn_done = true;
+        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
+        return;
+    }
+    txn.commit() catch |e| panic_mod.invariantViolated(
+        "fireWsDisconnect.commit",
+        "err={s}",
+        .{@errorName(e)},
+    );
+    txn_done = true;
+    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
+}
+
 /// Source payload for a Gap 2.1 subscription_fire activation.
 /// One variant per `SubscriptionEntry.Spec`. Borrowed slices —
 /// caller (the firing site in Phases D/E/F) owns the bytes for
@@ -2406,6 +2947,19 @@ pub const StreamResumeStage = struct {
     entity: rove.Entity,
     chunks: std.ArrayListUnmanaged([]u8) = .empty,
     mark_draining: bool = false,
+    /// websocket-plan §5 (piece D): when non-null, the staged `chunks`
+    /// are outbound WebSocket frames destined for this conn entity (NOT
+    /// `stream_data_out` HTTP DATA). The commit arm then builds one
+    /// `ws_send` Cmd per chunk (opcode taken from `ws_opcodes`, kept
+    /// parallel to `chunks` by the producer), and — if `mark_draining`
+    /// — appends a trailing close frame (opcode 8) instead of a
+    /// `stream_close`. Staging the frames on the unit (rather than
+    /// emitting `ws_send_in` inline) is what gates a WRITING frame's
+    /// output on its writeset commit (batch-of-1 durability). The
+    /// `ws_opcodes` list is owned by the producer (`fireWsMessage`);
+    /// its u8 values are copied into the Cmds, not transferred.
+    ws_conn: ?rove.Entity = null,
+    ws_opcodes: std.ArrayListUnmanaged(u8) = .empty,
 };
 
 /// Phase 4c: propose a write batch that nobody is waiting on. The
@@ -2536,23 +3090,43 @@ pub fn proposeForgetfulWrites(
         },
     };
     if (stage_opt) |s| {
-        // Transfer chunks one-for-one into stream_chunk Cmds.
-        // Each chunk's bytes ownership moves to the Cmd; clear
-        // the source slot to invalidate the earlier errdefer.
-        for (stage_chunks.items) |chunk_bytes| {
-            cmds.items.appendAssumeCapacity(.{
-                .stream_chunk = .{
-                    .stream_entity = s.entity,
-                    .bytes = chunk_bytes,
-                },
-            });
-        }
-        stage_chunks.deinit(allocator);
-        stage_chunks = .empty;
-        if (s.mark_draining) {
-            cmds.items.appendAssumeCapacity(.{
-                .stream_close = .{ .stream_entity = s.entity },
-            });
+        if (s.ws_conn) |conn| {
+            // websocket-plan §5: stage outbound WS frames as commit-
+            // gated `ws_send` Cmds (opcode per chunk, parallel to the
+            // bytes). `mark_draining` ⇒ append a trailing close frame
+            // (opcode 8) AFTER the data so wire order is data-then-close.
+            for (stage_chunks.items, 0..) |chunk_bytes, i| {
+                const op: u8 = if (i < s.ws_opcodes.items.len) s.ws_opcodes.items[i] else 1;
+                cmds.items.appendAssumeCapacity(.{
+                    .ws_send = .{ .conn_entity = conn, .opcode = op, .bytes = chunk_bytes },
+                });
+            }
+            stage_chunks.deinit(allocator);
+            stage_chunks = .empty;
+            if (s.mark_draining) {
+                cmds.items.appendAssumeCapacity(.{
+                    .ws_send = .{ .conn_entity = conn, .opcode = 8, .bytes = &.{} },
+                });
+            }
+        } else {
+            // Transfer chunks one-for-one into stream_chunk Cmds.
+            // Each chunk's bytes ownership moves to the Cmd; clear
+            // the source slot to invalidate the earlier errdefer.
+            for (stage_chunks.items) |chunk_bytes| {
+                cmds.items.appendAssumeCapacity(.{
+                    .stream_chunk = .{
+                        .stream_entity = s.entity,
+                        .bytes = chunk_bytes,
+                    },
+                });
+            }
+            stage_chunks.deinit(allocator);
+            stage_chunks = .empty;
+            if (s.mark_draining) {
+                cmds.items.appendAssumeCapacity(.{
+                    .stream_close = .{ .stream_entity = s.entity },
+                });
+            }
         }
     }
 

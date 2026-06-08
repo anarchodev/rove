@@ -201,6 +201,7 @@ fn activationName(a: log_mod.ActivationSource) []const u8 {
         .subscription_fire => "subscription_fire",
         .fetch_chunk => "fetch_chunk",
         .durable_wake => "durable_wake",
+        .ws_message => "ws_message",
     };
 }
 

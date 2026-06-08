@@ -220,6 +220,15 @@ pub const Http1Conn = struct {
     /// A Close frame has been queued (client-initiated or protocol error); the
     /// connection is destroyed once `ws_out` drains.
     ws_closing: bool = false,
+    /// Routing captured from the `101` Upgrade request (piece D, the worker
+    /// seam). The handshake completes at the transport layer without the worker,
+    /// then drops the request head — so without this the first inbound frame has
+    /// no tenant/module context. The worker reads these via `wsConnRouting` off
+    /// the `ws_message_out` entity's `Session`, resolves the tenant from
+    /// `ws_authority`, and the handler module from `ws_path`. Owned (duped at
+    /// handshake); `""` until then; freed in `free`.
+    ws_authority: []u8 = &.{},
+    ws_path: []u8 = &.{},
 
     /// Hard ceiling on a single reassembled WebSocket message at the edge — the
     /// per-frame cap fed to `ws.parseFrame` and the running cap on a fragmented
@@ -244,6 +253,8 @@ pub const Http1Conn = struct {
         self.chunk_body.deinit(self.allocator);
         self.ws_msg.deinit(self.allocator);
         self.ws_out.deinit(self.allocator);
+        if (self.ws_authority.len > 0) self.allocator.free(self.ws_authority);
+        if (self.ws_path.len > 0) self.allocator.free(self.ws_path);
         self.allocator.destroy(self);
     }
 };
@@ -740,6 +751,19 @@ pub fn H2(comptime opts: Options) type {
         /// Get the Conn component for a connection entity (searches the three conn collections).
         fn getConn(h2: *Self, entity: Entity) ?*Conn {
             return h2.reg.getAny(entity, h2.connColls(), Conn) catch null;
+        }
+
+        /// Piece D (worker seam): routing captured from a WebSocket conn's `101`
+        /// Upgrade request. The worker calls this with the `Session.entity` off a
+        /// `ws_message_out` entity to resolve the tenant (`authority`) and handler
+        /// module (`path`) for the held WS chain. Returns null when the entity is
+        /// no longer a live ws-mode conn (closed / not upgraded). Borrowed slices
+        /// — valid only while the conn lives; the worker dupes what it retains.
+        pub fn wsConnRouting(h2: *Self, conn_entity: Entity) ?struct { authority: []const u8, path: []const u8 } {
+            const cp = getConn(h2, conn_entity) orelse return null;
+            const h1c = cp.h1 orelse return null;
+            if (!h1c.ws_mode) return null;
+            return .{ .authority = h1c.ws_authority, .path = h1c.ws_path };
         }
 
         /// FD resolver callback for io — searches h2's connection collections in addition to io's.
@@ -2468,6 +2492,21 @@ pub fn H2(comptime opts: Options) type {
             }
             var accept_buf: [ws.ACCEPT_LEN]u8 = undefined;
             const accept = ws.acceptKey(key, &accept_buf);
+
+            // Piece D: capture the Upgrade request's routing (Host → authority,
+            // request-target → path) before the head is dropped below — the
+            // worker resolves the tenant + handler module from these on the
+            // first inbound frame (the handshake completes here without it).
+            // OOM duping either fails the connection, same as the response
+            // appends below.
+            h1c.ws_authority = self.allocator.dupe(u8, head.host orelse "") catch {
+                self.reg.destroy(conn_entity) catch {};
+                return;
+            };
+            h1c.ws_path = self.allocator.dupe(u8, head.target) catch {
+                self.reg.destroy(conn_entity) catch {};
+                return;
+            };
 
             // Drop the consumed request head; what's left in `buf` is the start of
             // the frame stream. Do this before flipping `ws_mode` so a parse never
