@@ -116,6 +116,14 @@ pub const Timer = struct {};
 /// activation. Same migration cluster as Timer / Inbound.
 pub const Disconnect = struct {};
 
+/// Inbound WebSocket frame (`docs/websocket-plan.md` §5). NOT routed
+/// through this Msg queue — `serviceWsMessages` drains the h2
+/// `ws_message_out` collection directly each tick and runs `onMessage`
+/// in-line. This empty payload exists solely to satisfy the
+/// `union(ActivationSource)` exhaustiveness contract (the §4 compiler
+/// check below); there is no producer enqueuing `.ws_message` Msgs.
+pub const WsMessage = struct {};
+
 /// Legacy single-key kv-wake (pre-§9.4). Today: apply.zig's writeset
 /// hook fired per matching put/delete. Retained on the enum so old
 /// tapes decode; `wake_batch` is the live shape and is what 2C
@@ -243,6 +251,7 @@ pub const Msg = union(ActivationSource) {
     subscription_fire: SubscriptionFire,
     fetch_chunk: FetchChunk,
     durable_wake: DurableWake,
+    ws_message: WsMessage,
 
     /// Project to the tape's wire-stable activation tag.
     pub fn kind(self: Msg) ActivationSource {
@@ -313,6 +322,7 @@ test "Msg covers every ActivationSource variant exhaustively" {
             .subscription_fire => .{ .subscription_fire = sf },
             .fetch_chunk => .{ .fetch_chunk = .{} },
             .durable_wake => .{ .durable_wake = dw },
+            .ws_message => .{ .ws_message = .{} },
         };
         try testing.expectEqual(tag, m.kind());
     }

@@ -87,6 +87,7 @@ pub const drainFetchPendingDurability = worker.drainFetchPendingDurability;
 pub const drainPendingBoundResumes = worker.drainPendingBoundResumes;
 pub const sweepParkedContinuations = worker.sweepParkedContinuations;
 pub const serviceParkedStreams = worker.serviceParkedStreams;
+pub const serviceWsMessages = worker.serviceWsMessages;
 pub const drainOnLeadershipLoss = worker.drainOnLeadershipLoss;
 pub const cleanupResponses = worker.cleanupResponses;
 pub const flushLogs = worker.flushLogs;

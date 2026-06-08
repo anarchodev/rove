@@ -102,6 +102,20 @@ pub const Cmd = union(enum) {
     /// pre-4.1.3 — arguably more correct).
     respond: RespondOut,
 
+    /// websocket-plan §5 (piece D): emit one outbound WebSocket frame
+    /// on commit. Created an entity in `h2.ws_send_in` (Session = the
+    /// conn, WsMeta.opcode, ReqBody = bytes) that `consumeWsSends`
+    /// RFC-6455-frames on the next h2 poll. Commit-gated so a frame
+    /// produced by a WRITING `onMessage` reaches the wire only after
+    /// its writeset commits (the batch-of-1 durability rule —
+    /// `streaming-model.md` §2 applied to WS). If the conn died before
+    /// commit (client vanished), the bytes free here — "writes
+    /// committed, no frame on the wire," the same disconnect-race
+    /// posture as `stream_chunk`. Producer: `fireWsMessage`'s write arm
+    /// (read-only frames emit `ws_send_in` inline — no commit to wait
+    /// on). Supersedes the withdrawn `conn_write` Cmd reservation.
+    ws_send: WsSendOut,
+
     /// Discard-arm: free every owned resource. Called per-Cmd from
     /// `BufferedCmds.deinit` on the fault path.
     pub fn deinit(self: *Cmd, allocator: std.mem.Allocator) void {
@@ -111,6 +125,7 @@ pub const Cmd = union(enum) {
             .stream_close => {},
             .http_fetch => |*pf| pf.deinit(allocator),
             .respond => |*ro| ro.deinit(allocator),
+            .ws_send => |wo| if (wo.bytes.len > 0) allocator.free(wo.bytes),
         }
         self.* = undefined;
     }
@@ -145,6 +160,19 @@ pub const StreamChunkOut = struct {
 /// `interpretCmd` can find the `StreamDraining` component.
 pub const StreamCloseSignal = struct {
     stream_entity: rove.Entity,
+};
+
+/// `ws_send` Cmd payload — one outbound WebSocket frame to emit on
+/// commit. `conn_entity` is the h2 connection (the `Session.entity`
+/// shared by every `ws_message_out` / `ws_send_in` entity for that
+/// socket); `opcode` is the RFC 6455 data/control opcode (1 = text,
+/// 2 = binary, 8 = close); `bytes` is the allocator-owned frame
+/// payload (empty for a close). Transferred into a fresh `ws_send_in`
+/// entity on commit; freed if the conn is gone (disconnect race).
+pub const WsSendOut = struct {
+    conn_entity: rove.Entity,
+    opcode: u8,
+    bytes: []u8,
 };
 
 /// `respond` Cmd payload — Phase 4.1.3's commit-arm entity move
@@ -358,7 +386,41 @@ pub fn interpretCmd(
                 ),
             }
         },
+        .ws_send => |wo| {
+            const server = worker.h2;
+            // The conn may have died during the commit-wait window
+            // (client RST/EOF); drop the frame + free its bytes — the
+            // socket is gone, "writes committed, no frame on the wire."
+            if (server.reg.isStale(wo.conn_entity)) {
+                if (wo.bytes.len > 0) allocator.free(wo.bytes);
+                return;
+            }
+            emitWsSend(worker, wo) catch |err| {
+                std.log.warn(
+                    "rove-js interpretCmd ws_send: emit failed: {s}; dropping frame (tenant={s})",
+                    .{ @errorName(err), tenant_id },
+                );
+                if (wo.bytes.len > 0) allocator.free(wo.bytes);
+            };
+        },
     }
+}
+
+/// Create one `ws_send_in` entity from a `ws_send` Cmd. The bytes
+/// transfer into the entity's `ReqBody` (freed by `consumeWsSends` →
+/// `reg.destroy` after the frame ships). On any `set` failure the
+/// partial entity is destroyed and the error propagates so the caller
+/// frees the bytes (the entity never reached a state where it owns
+/// them). Shared by the commit arm here and the read-only inline path
+/// in `fireWsMessage`.
+pub fn emitWsSend(worker: anytype, wo: WsSendOut) !void {
+    const server = worker.h2;
+    const ent = try server.reg.create(&server.ws_send_in);
+    errdefer server.reg.destroy(ent) catch {};
+    try server.reg.set(ent, &server.ws_send_in, h2.Session, .{ .entity = wo.conn_entity });
+    try server.reg.set(ent, &server.ws_send_in, h2.WsMeta, .{ .opcode = wo.opcode });
+    const data: ?[*]u8 = if (wo.bytes.len > 0) wo.bytes.ptr else null;
+    try server.reg.set(ent, &server.ws_send_in, h2.ReqBody, .{ .data = data, .len = @intCast(wo.bytes.len) });
 }
 
 /// `respond` interpreter shared body. Stamps the four payload

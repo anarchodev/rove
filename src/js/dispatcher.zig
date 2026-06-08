@@ -295,6 +295,12 @@ pub const Request = struct {
     /// `Stream` descriptor (next() ⇒ keep streaming) or prepends it to
     /// the terminal body (close).
     pending_stream_chunks: ?*std.ArrayListUnmanaged([]u8) = null,
+    /// websocket-plan §5: per-chunk WS data opcode accumulator, pushed
+    /// in lockstep with `pending_stream_chunks`. Non-null only on a WS
+    /// connection activation (the worker's `fireWsMessage` wires it);
+    /// null elsewhere (SSE / HTTP streams don't frame by opcode). See
+    /// `DispatchState.pending_stream_chunk_opcodes`.
+    pending_stream_chunk_opcodes: ?*std.ArrayListUnmanaged(u8) = null,
     /// Gap 2.1 subscription_fire payload (catalog §2.1 +
     /// `docs/subscriptions-plan.md`). Set only when
     /// `activation_source == .subscription_fire`; surfaces as
@@ -351,6 +357,15 @@ pub const Request = struct {
     /// JSON-encoded customer `msg` ("null" when omitted); decoded
     /// back to a JS value as `request.activation.msg`.
     activation_wake_msg_json: ?[]const u8 = null,
+    /// Inbound WebSocket frame payload (`docs/websocket-plan.md` §5).
+    /// Set only when `activation_source == .ws_message`; surfaces as
+    /// `request.activation.{opcode, data}` to the `onMessage` export.
+    /// `activation_ws_opcode` is the RFC 6455 data opcode (1 = text →
+    /// `data` is a string, 2 = binary → `data` is a Uint8Array).
+    /// `activation_ws_data` is the borrowed frame payload — caller
+    /// (`fireWsMessage`) owns the bytes for the dispatch's duration.
+    activation_ws_opcode: u8 = 0,
+    activation_ws_data: []const u8 = &.{},
 };
 
 /// One `(name, value)` pair extracted from the handler's
@@ -556,6 +571,7 @@ pub const Dispatcher = struct {
             .pending_fetches = request.pending_fetches,
             .pending_wakes = request.pending_wakes,
             .pending_stream_chunks = request.pending_stream_chunks,
+            .pending_stream_chunk_opcodes = request.pending_stream_chunk_opcodes,
             .is_system_module = request.is_system_module,
         };
 
@@ -1170,6 +1186,7 @@ fn defaultExportForKind(src: ActivationSource) []const u8 {
     return switch (src) {
         .wake_batch, .kv_wake, .timer => "onWake",
         .disconnect => "onDisconnect",
+        .ws_message => "onMessage",
         else => "default",
     };
 }

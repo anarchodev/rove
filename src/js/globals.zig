@@ -391,6 +391,14 @@ pub const DispatchState = struct {
     /// at park, then frees the list. Null on connectionless / test paths
     /// ⇒ `stream.*` is inert (the model: connection-only output).
     pending_stream_chunks: ?*std.ArrayListUnmanaged([]u8) = null,
+    /// websocket-plan §5: per-chunk RFC 6455 data opcode, pushed in
+    /// lockstep with `pending_stream_chunks` (1 = text, the arg was a
+    /// string; 2 = binary, an ArrayBuffer/TypedArray). Non-null only on
+    /// a WebSocket connection activation (the worker's `fireWsMessage`
+    /// wires it); null on SSE / HTTP stream chains, where the opcode is
+    /// irrelevant and chunks are plain bytes. Same caller-owned model
+    /// as `pending_stream_chunks` — the worker frees both lists.
+    pending_stream_chunk_opcodes: ?*std.ArrayListUnmanaged(u8) = null,
     /// Phase 5 PR-2b: true ⇒ the dispatched module is a `__system/`
     /// built-in (e.g. the webhook shim's `webhook_onresult.mjs`).
     /// `isCustomerWriteReserved` is skipped so the shim can write
@@ -2037,6 +2045,8 @@ pub fn installRequest(
         .fetch_chunk => "fetch_chunk",
         // §2.6 durable scheduled wake.
         .durable_wake => "durable_wake",
+        // websocket-plan §5: one inbound WS data frame.
+        .ws_message => "ws_message",
     };
     _ = c.JS_SetPropertyStr(ctx, activation_obj, "kind", c.JS_NewStringLen(ctx, kind.ptr, kind.len));
     if (request.activation_source == .wake_batch) {
@@ -2222,6 +2232,21 @@ pub fn installRequest(
                 _ = c.JS_SetPropertyStr(ctx, req_obj, "body_truncated", if (request.activation_fetch_body_truncated) js_true else js_false);
             }
         }
+    }
+
+    // websocket-plan §5: one inbound WS data frame →
+    // `request.activation = { kind:"ws_message", opcode, data }`.
+    // opcode 1 (text) surfaces `data` as a string; opcode 2 (binary)
+    // as a fresh Uint8Array copy the handler owns outright (no lifetime
+    // coupling to the borrowed frame payload). The handler replies with
+    // `stream.write(...)` and parks for the next frame via `next()`.
+    if (request.activation_source == .ws_message) {
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "opcode", c.JS_NewInt64(ctx, @intCast(request.activation_ws_opcode)));
+        const data_val = if (request.activation_ws_opcode == 2)
+            c.JS_NewUint8ArrayCopy(ctx, request.activation_ws_data.ptr, request.activation_ws_data.len)
+        else
+            c.JS_NewStringLen(ctx, request.activation_ws_data.ptr, request.activation_ws_data.len);
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "data", data_val);
     }
 
     // §2.6 durable-wake payload: `{ id, key, scheduled_at_ns, msg }`.

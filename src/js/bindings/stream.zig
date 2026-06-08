@@ -128,7 +128,8 @@ pub fn jsStreamWrite(
         _ = c.JS_ThrowTypeError(ctx, "stream.write(chunk) requires a chunk argument");
         return js_exception;
     }
-    const bytes = jsValueAsOwnedBytes(state.allocator, ctx, argv[0]) catch {
+    var opcode: u8 = 0;
+    const bytes = jsValueAsOwnedBytes(state.allocator, ctx, argv[0], &opcode) catch {
         _ = c.JS_ThrowInternalError(ctx, "stream.write: out of memory");
         return js_exception;
     };
@@ -139,19 +140,55 @@ pub fn jsStreamWrite(
         _ = c.JS_ThrowInternalError(ctx, "stream.write: out of memory");
         return js_exception;
     };
+    // websocket-plan §5: on a WS connection activation, record this
+    // chunk's frame opcode in lockstep (text iff the arg was a string,
+    // binary otherwise) so the worker frames it correctly. Null on
+    // SSE/HTTP chains (opcode irrelevant). Push AFTER the chunk append
+    // succeeds so the two lists stay the same length; on OOM here, undo
+    // the chunk append to preserve that invariant.
+    if (state.pending_stream_chunk_opcodes) |ops| {
+        ops.append(state.allocator, opcode) catch {
+            const dropped = list.pop().?;
+            state.allocator.free(dropped);
+            _ = c.JS_ThrowInternalError(ctx, "stream.write: out of memory");
+            return js_exception;
+        };
+    }
     return js_undefined;
 }
 
-
+/// Coerce a `stream.write` argument to owned bytes, reporting the RFC
+/// 6455 data opcode in `opcode_out` (1 = text, the value was a string;
+/// 2 = binary, an ArrayBuffer/TypedArray). A string is UTF-8-encoded via
+/// `JS_ToCStringLen`; a typed array's raw backing bytes are copied via
+/// `JS_GetUint8Array` — running binary through `JS_ToCStringLen` would
+/// truncate at embedded NULs and mangle non-UTF-8, so the type must be
+/// distinguished here (the same split `crypto.zig`'s `extractKeyOrDataBytes`
+/// makes). Any non-string that isn't a Uint8Array view falls back to the
+/// string coercion (e.g. numbers → their decimal text, a text frame).
 fn jsValueAsOwnedBytes(
     allocator: std.mem.Allocator,
     ctx: ?*c.JSContext,
     v: c.JSValue,
+    opcode_out: *u8,
 ) error{OutOfMemory}![]u8 {
+    if (!c.JS_IsString(v)) {
+        var byte_len: usize = 0;
+        const buf_ptr = c.JS_GetUint8Array(ctx, &byte_len, v);
+        if (buf_ptr != null) {
+            opcode_out.* = 2; // binary frame
+            return try allocator.dupe(u8, buf_ptr[0..byte_len]);
+        }
+        // Not a typed array — clear the pending exception JS_GetUint8Array
+        // set and fall through to the string coercion (text frame).
+        const pending = c.JS_GetException(ctx);
+        c.JS_FreeValue(ctx, pending);
+    }
     var len: usize = 0;
     const s = c.JS_ToCStringLen(ctx, &len, v);
     if (s == null) return error.OutOfMemory;
     defer c.JS_FreeCString(ctx, s);
+    opcode_out.* = 1; // text frame
     return try allocator.dupe(u8, s[0..len]);
 }
 

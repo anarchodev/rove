@@ -122,6 +122,16 @@ pub const ActivationSource = enum(u8) {
     /// the fired entry's two `_sched/` keys are deleted in this
     /// activation's own writeset (exactly-once on the normal path).
     durable_wake = 8,
+    /// Inbound WebSocket frame (`docs/websocket-plan.md` §4.5/§5). A
+    /// held WS connection is a parked continuation chain; each complete
+    /// inbound data frame (text/binary) resumes it via `fireWsMessage`
+    /// with `request.activation = { opcode, data }` dispatched to the
+    /// `onMessage` export. Client close (opcode 8) routes to
+    /// `onDisconnect` (the `disconnect` source above), not here. No
+    /// held HTTP response — outbound frames are `stream.write` lowered
+    /// to the h2 `ws_send_in` collection. Batch-of-1 durability: a
+    /// frame costs raft iff its activation commits a non-empty writeset.
+    ws_message = 9,
 };
 
 /// Inline tape + body byte payloads for one request. Each `_bytes`
