@@ -73,17 +73,21 @@ host axis test; `tenant_move_smoke` confirms the front-door routing path.
    - ✅ **Slice 2 — front door terminates public h2-over-TLS** with SNI cert
      selection, certs synced from the CP (`h2/tls.zig` `putHostCertInMemory` +
      front `CertSync`); front-door → DP stays private h2c. `cp_tls_edge_smoke`.
-   - ⏳ **Slice 3 — one leader-elected ACME issuer** (HTTP-01), evolved from
-     `loop46/acme.zig`, writing the CP cert axis. ~~**Open wiring wrinkle:** the
-     HTTP-01 `:80` responder is HTTP/1.1, but the front door is nghttp2
-     (h2-only)…~~ **Resolved by gap #6 (shipped):** `rove-h2` speaks HTTP/1.1
-     (`v2-edge-http1-ingress.md` phases 1–4) and `rewind-front` now runs a
-     plaintext `:80` listener (phase 5) that answers
-     `/.well-known/acme-challenge/<token>` natively by fetching from the CP and
-     308-redirects everything else to HTTPS — no separate h1 shim. **Remaining
-     for slice 3:** the CP issuer itself — leader-gated HTTP-01 client driving
-     the cert axis, plus the `GET /_cp/acme-challenge?token=` endpoint the front
-     already calls (returns the key-authorization for an in-flight challenge).
+   - ✅ **Slice 3 — leader-elected ACME issuer** (HTTP-01). `src-v2/cp/acme.zig`
+     — a leader-gated thread on `rewind-cp` (evolved from `loop46/acme.zig`,
+     reusing `rove-acme`'s RFC 8555 `Client`). Each tick the directory leader
+     computes the work-list (`collectUncertedHosts` — mapped hosts lacking
+     `cert/{host}`, filtered by `REWIND_PUBLIC_SUFFIX`/`REWIND_SYSTEM_SUFFIX`),
+     runs the client, and writes `directory.setCert` → replicates → front
+     `CertSync` → SNI. The HTTP-01 challenge is served by `rewind-front`'s `:80`
+     listener (gap #6 phase 5) forwarding to the CP's `GET
+     /_cp/acme-challenge?token=` endpoint, which reads the issuer's in-memory
+     challenge store. Inert unless `REWIND_ACME_DIRECTORY` set. The blocking
+     `issue()` runs off the request loop (else it self-deadlocks the validation
+     it depends on); `setCert` proposes through the mutex-guarded bridge whose
+     pump advances on its own thread. Proven end-to-end against Pebble:
+     `scripts/cp_acme_issue_smoke.py` (issue → cert axis → replicate → CertSync
+     → the front serves the Pebble-issued cert for `acmecorp.test` by SNI).
    - ⏸ **Slice 4 — DNS-01 wildcard** deferred (provider-specific; wildcard via
      manual `/_control/cert` for now).
    - V1 ACME (`src/acme/` Client + Responder + crypto) is **evolved + re-homed,
@@ -158,8 +162,9 @@ front-door count == voter count (inverted scaling). **Done:**
    ✅ **SHIPPED** — `host/{host}` axis + `/_control/host` + `cp_host_smoke`.
 4. **Edge TLS termination + cert-state-in-CP + single ACME issuer** (gap #3) —
    per `v2-front-door-architecture.md`. Slices 1 (CP cert axis) + 2 (front-door
-   TLS termination + CP cert pull) ✅ SHIPPED; slice 3 (leader-elected HTTP-01
-   issuer) ⏳; DNS-01 wildcard (slice 4) deferred.
+   TLS termination + CP cert pull) + 3 (leader-elected HTTP-01 issuer,
+   `src-v2/cp/acme.zig`, Pebble-proven) ✅ SHIPPED; DNS-01 wildcard (slice 4)
+   deferred.
 5. **Tenant provisioning + multi-node formation** (gaps #4, #5) — the
    create-a-new-tenant path end to end.
 6. **Front-door content-type passthrough** (🟡 but mandatory).

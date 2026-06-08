@@ -50,6 +50,18 @@ pub const Responder = struct {
         gop.value_ptr.* = v;
     }
 
+    /// Copy out the key-authorization for `token` (owned; caller frees), or
+    /// null if not published. For deployments where the `:80` challenge is
+    /// served by a *separate* front door that reads this in-memory map (the V2
+    /// CP issuer) instead of this struct's built-in accept loop — the map +
+    /// `put`/`remove` are reused without ever `start()`ing the socket.
+    pub fn getOwned(self: *Responder, a: std.mem.Allocator, token: []const u8) ?[]u8 {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const v = self.tokens.get(token) orelse return null;
+        return a.dupe(u8, v) catch null;
+    }
+
     pub fn remove(self: *Responder, token: []const u8) void {
         self.mu.lock();
         defer self.mu.unlock();

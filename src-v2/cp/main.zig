@@ -33,6 +33,7 @@ const directory_mod = @import("cp-directory");
 const Directory = directory_mod.Directory;
 const bridge_mod = @import("bridge");
 const Bridge = bridge_mod.Bridge;
+const acme_issuer = @import("acme.zig");
 
 const CpH2 = h2.H2(.{});
 
@@ -201,6 +202,10 @@ const Router = struct {
     /// can't be served and hangs until the request timeout. Null for a
     /// single-node CP (no forwarding).
     self_cp_idx: ?usize = null,
+    /// The leader-elected ACME issuer (gap #3 slice 3), or null when
+    /// `REWIND_ACME_DIRECTORY` is unset. Serves `/_cp/acme-challenge?token=`
+    /// from its in-memory challenge store.
+    acme: ?*acme_issuer.Handle = null,
 
     /// Reply helper: set an immediate status (no body) on the request
     /// entity and move it to response_in.
@@ -281,6 +286,10 @@ const Router = struct {
         }
         if (std.mem.startsWith(u8, path, "/_cp/plan")) {
             try self.handleCpPlan(server, ent, sid, sess, path);
+            return;
+        }
+        if (std.mem.startsWith(u8, path, "/_cp/acme-challenge")) {
+            try self.handleCpAcmeChallenge(server, ent, sid, sess, path);
             return;
         }
         if (std.mem.startsWith(u8, path, "/_cp/certs")) {
@@ -375,6 +384,28 @@ const Router = struct {
         // `replyText` serves arbitrary owned bytes (data/len) — the packed
         // frame is binary, but the front door reads it by length, not type.
         try replyText(server, ent, sid, sess, 200, packed_bytes);
+    }
+
+    /// `GET /_cp/acme-challenge?token=T` — the HTTP-01 key-authorization for an
+    /// in-flight challenge token, served from the issuer's in-memory store. The
+    /// front door's `:80` listener (gap #6 phase 5) forwards
+    /// `/.well-known/acme-challenge/<token>` here so the ACME CA's validation
+    /// reaches the leader that published the token. 404 when no issuer is
+    /// running or the token isn't published (the correct "no challenge" answer).
+    fn handleCpAcmeChallenge(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, path: []const u8) !void {
+        const token = queryParam(path, "token") orelse {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        };
+        const issuer = self.acme orelse {
+            try replyStatus(server, ent, sid, sess, 404);
+            return;
+        };
+        const keyauth = issuer.challengeFor(self.allocator, token) orelse {
+            try replyStatus(server, ent, sid, sess, 404);
+            return;
+        };
+        try replyText(server, ent, sid, sess, 200, keyauth);
     }
 
     /// `GET /_cp/certs` — newline-separated list of hosts that have a stored
@@ -1338,7 +1369,34 @@ pub fn main() !void {
     }, .{ .tls_config = null });
     defer server.destroy();
 
-    var router = Router{ .allocator = allocator, .directory = directory, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx };
+    // Leader-elected ACME HTTP-01 issuer (gap #3 slice 3). Inert unless
+    // `REWIND_ACME_DIRECTORY` is set — then it issues certs for mapped custom
+    // domains lacking a `cert/{host}` and serves the challenge via
+    // `/_cp/acme-challenge` (the front door's :80 listener forwards to it).
+    const acme_handle: ?*acme_issuer.Handle = blk: {
+        const dir_url = std.posix.getenv("REWIND_ACME_DIRECTORY") orelse break :blk null;
+        const h = acme_issuer.spawn(.{
+            .allocator = allocator,
+            .directory = directory,
+            .data_dir = cp_data_dir,
+            .directory_url = dir_url,
+            .contact_email = std.posix.getenv("REWIND_ACME_CONTACT"),
+            .insecure_tls = std.posix.getenv("REWIND_ACME_INSECURE_TLS") != null,
+            .public_suffix = getEnvCfg("REWIND_PUBLIC_SUFFIX"),
+            .system_suffix = getEnvCfg("REWIND_SYSTEM_SUFFIX"),
+        }) catch |err| {
+            std.log.warn("rewind-cp: ACME issuer spawn failed: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+        std.log.info("rewind-cp: ACME issuer enabled (dir={s})", .{dir_url});
+        break :blk h;
+    };
+    defer if (acme_handle) |h| {
+        h.signalStop();
+        h.join();
+    };
+
+    var router = Router{ .allocator = allocator, .directory = directory, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx, .acme = acme_handle };
 
     // Periodic stuck-move reconciliation on the directory leader (between
     // request batches; never overlaps a synchronous move — see
