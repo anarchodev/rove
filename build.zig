@@ -386,6 +386,16 @@ pub fn build(b: *std.Build) void {
     const plan_test_step = b.step("plan-test", "Run rove-plan (tier table) unit tests");
     plan_test_step.dependOn(&run_plan_tests.step);
 
+    // rove-h2 HTTP/1.1 codec (gap #6) — pure std, so a standalone test module.
+    const h1_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/h2/http1.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const h1_tests = b.addTest(.{ .root_module = h1_test_mod });
+    const h1_test_step = b.step("h1-test", "Run the HTTP/1.1 codec unit tests");
+    h1_test_step.dependOn(&b.addRunArtifact(h1_tests).step);
+
     // ── rove-tenant: account/user/instance/domain metadata ──
     //
     // M1 slice: just `Instance` + `Domain` with an in-memory cache and
