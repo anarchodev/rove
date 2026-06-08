@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is rove
 
-Rove is a Zig systems library for building distributed serverless worker infrastructure. It provides content-addressed code deployment, a QuickJS-based JS runtime, an HTTP/2 server, and a distributed KV store with Raft consensus. Third-party dependencies are **pinned and fetched at build time** — Zig/C packages (`arenajs`, `kvexp`, and the V2 engine `raft-rs-zig`) via `build.zig.zon`; the V2 raft engine's Rust crates via Cargo. The first build needs network; willemt's V1 raft is the lone remaining vendored dep (in `vendor/`, deleted at V2 cutover). This replaced the former vendor-everything / offline-build mandate when the V2 raft-rs Rust closure proved too large to vendor (see `docs/v2-build-order.md`).
+Rove is a Zig systems library for building distributed serverless worker infrastructure. It provides content-addressed code deployment, a QuickJS-based JS runtime, an HTTP/2 server, and a distributed KV store with Raft consensus. Third-party dependencies are **pinned and fetched at build time** — Zig/C packages (`arenajs`, `kvexp`, and the V2 engine `raft-rs-zig`) via `build.zig.zon`; the V2 raft engine's Rust crates via Cargo. The first build needs network. This replaced the former vendor-everything / offline-build mandate when the V2 raft-rs Rust closure proved too large to vendor (see `docs/v2-build-order.md`). **The V1→V2 cutover is done (branch `v2`):** the V1 product binary `loop46`, the willemt-raft engine (`vendor/raft/` + `src/kv/{cluster,raft_node,raft_log,…}.zig`), and the sqlite raft log are all retired. The V2 worker is `rewind` (`src-v2/rewind/main.zig`); per-tenant consensus is the `Bridge` (`src-v2/kv/bridge.zig`) + raft-rs. There are no vendored deps left.
 
 ## Product direction
 
@@ -15,9 +15,12 @@ Rove is a Zig systems library for building distributed serverless worker infrast
 ```bash
 zig build              # Build all modules and examples
 zig build test         # Run all unit tests (inline Zig tests across all modules)
-zig build loop46       # Build/run the loop46 product binary
-                       # (subcommands: `loop46 dev` for local quickstart,
-                       # `loop46 worker` for production)
+                       # — fixed at the V1 cutover (was broken by frozen V1 modules)
+zig build rewind       # Build the V2 worker binary (src-v2/rewind/main.zig)
+zig build rewind-cp    # Build the V2 control plane (directory + provisioning)
+zig build rewind-front # Build the V2 stateless front door (Host→cluster proxy)
+zig build files-server-v2  # Build the cluster-free V2 deploy publisher
+zig build v2-test      # V2 raft substrate tests
 zig build echo-server  # Run the TCP echo server example
 zig build h2-echo-server  # Run the HTTP/2 echo server example
 ```
@@ -122,7 +125,7 @@ Pins live in `build.zig.zon` (Zig/C packages) and each Rust crate's `Cargo.lock`
 - **arenajs** (`anarchodev/arenajs`) — fork of quickjs-ng with a dual bump arena (base + per-request); per-request reset is one cursor write instead of memcpy. Replaces the previously-vendored quickjs-ng + deterministic-init patch. Its own `build.zig` compiles the quickjs/arena C sources into a static lib; rove links it.
 - **kvexp** (`anarchodev/kvexp`) — first-party pure-Zig multi-tenant embedded KV (LMDB-backed) used as the per-tenant state engine under `TrackedTxn`'s speculative overlay.
 - **raft-rs-zig** (`anarchodev/raft-rs-zig`) — V2 multi-raft engine (TiKV raft-rs, one group per tenant) behind a Zig wrapper; its `build.zig` runs `cargo build` for the Rust FFI. Behind v2-only build steps (`zig build v2-test`); the default `zig build` never invokes cargo.
-- **willemt/raft** — V1 consensus library, unmodified — the **only still-vendored** dep (`vendor/raft/`), deleted at V2 cutover. See `vendor/README.md`.
+- ~~**willemt/raft**~~ — V1 consensus library, **deleted at the V2 cutover** (along with `vendor/` entirely). V2 consensus is `raft-rs-zig` (fetched).
 
 ## Conventions
 

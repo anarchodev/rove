@@ -167,6 +167,12 @@ fn workerMain(args: *WorkerCtx) !void {
         rjs.drainSpools(worker);
         try rjs.sweepParkedContinuations(worker);
         try rjs.serviceParkedStreams(worker);
+        // docs/websocket-plan.md §4.5/§5 (piece D): dispatch inbound WS
+        // frames (h2 `ws_message_out`) to the held chain's `onMessage` /
+        // `onDisconnect` and lower outbound `stream.write`s to `ws_send_in`.
+        // Writing frames stage commit-gated sends (drained on the next
+        // tick's `drainRaftPending`); read-only frames emit inline.
+        try rjs.serviceWsMessages(worker);
         try rjs.cleanupResponses(worker);
         rjs.sweepCronSubscriptions(worker);
         rjs.sweepOwedRetries(worker);
@@ -349,6 +355,14 @@ pub fn main() !void {
     // built-in envelope-0 write path) is reachable, exercising propose →
     // bridge commit → worker txn.commit end to end on a single node.
     node_tenant.root_token_secret = admin_root_token;
+    // Wildcard tenant routing: `REWIND_PUBLIC_SUFFIX=<suffix>` lets the worker
+    // resolve `{instance_id}.{suffix}` → that instance without an explicit
+    // `domain/` alias (the V1 `rewindjsapp.localhost` pattern). The front routes
+    // the host to this cluster via the CP directory; the worker then resolves
+    // the proxied host locally. Unset = wildcard disabled (explicit aliases only).
+    if (std.posix.getenv("REWIND_PUBLIC_SUFFIX")) |suffix| {
+        if (suffix.len > 0) try node_tenant.setPublicSuffix(suffix);
+    }
 
     // The V2 per-tenant raft bridge + its pump thread. Leader-skip: the
     // worker owns the speculative overlay. Single node by default; a
