@@ -110,9 +110,12 @@ class V2Cluster:
     cp_data_dir: Path
     files_data_dir: Path
     procs: list = field(default_factory=list)
+    node_procs: dict = field(default_factory=dict)  # node index → Popen (for stop/start)
     log_paths: dict = field(default_factory=dict)
     root_token: str = ROOT_TOKEN
     services_jwt: str = ""
+    _voters: str = ""
+    _peers: str = ""
 
     # ── lifecycle ──────────────────────────────────────────────────────
     @classmethod
@@ -149,6 +152,7 @@ class V2Cluster:
     def _boot(self, nodes: int) -> None:
         voters = ",".join(str(i + 1) for i in range(nodes))
         peers = ",".join(f"127.0.0.1:{rp}" for rp in self.raft_ports)
+        self._voters, self._peers = voters, peers
         for i in range(nodes):
             self._spawn_node(i, voters, peers)
         nodes_csv = ",".join(f"http://127.0.0.1:{p}" for p in self.node_ports)
@@ -181,6 +185,7 @@ class V2Cluster:
         p._name = f"n{i + 1}"
         p._logf = logf
         self.procs.append(p)
+        self.node_procs[i] = p
         await_ready(p, f"n{i + 1}", "listening on")
 
     def _spawn_files(self) -> None:
@@ -278,12 +283,115 @@ class V2Cluster:
             raise RuntimeError(f"release {tenant}/{dep_id}: {r.status} {r.body}")
         return dep_id
 
+    def deploy_manifest(self, tenant: str, files: dict[str, tuple[str, bytes | str]],
+                        *, node: int = 0) -> str:
+        """Content-addressed deploy with explicit per-file kind. `files` maps
+        each path → (kind, content) where kind is "handler" or "static".
+        Handlers compile server-side; statics are stored verbatim. This is the
+        only way to deploy a non-JS file (e.g. a subscription `spec.json`,
+        which the loader requires to be `kind=static`) — the `/upload` flow
+        compiles every file. PUTs each blob by sha256 hash, stamps the
+        manifest, then releases. Returns dep_id. (Tenant must be provisioned.)"""
+        import hashlib
+        import json as _json
+        manifest: dict[str, dict] = {}
+        for path, (kind, content) in files.items():
+            if isinstance(content, str):
+                content = content.encode()
+            h = hashlib.sha256(content).hexdigest()
+            r = _curl(f"{self.files_origin()}/{tenant}/blobs/{h}", method="PUT",
+                      headers={"Authorization": f"Bearer {self.services_jwt}"},
+                      data=content)
+            if r.status not in (200, 201, 204):
+                raise RuntimeError(f"put blob {tenant}/{path} ({h[:12]}): "
+                                   f"{r.status} {r.body}")
+            entry = {"hash": h, "kind": kind}
+            if kind == "static":
+                entry["content_type"] = "application/json" if path.endswith(".json") \
+                    else "application/octet-stream"
+            manifest[path] = entry
+        r = _curl(f"{self.files_origin()}/{tenant}/deployments", method="POST",
+                  headers={"Authorization": f"Bearer {self.services_jwt}",
+                           "Content-Type": "application/json"},
+                  data=_json.dumps({"files": manifest}))
+        if r.status != 201:
+            raise RuntimeError(f"deployments {tenant}: {r.status} {r.body}")
+        # `id` is a 16-hex-digit string; release() wants the decimal value.
+        dep_id = int(_json.loads(r.body)["id"], 16)
+        r = self.release(tenant, dep_id, node=node)
+        if r.status != 204:
+            raise RuntimeError(f"release {tenant}/{dep_id}: {r.status} {r.body}")
+        return str(dep_id)
+
     # ── serving ────────────────────────────────────────────────────────
+    def request(self, tenant: str, path: str = "/", *, method: str = "GET",
+                data: Optional[bytes | str] = None, host: Optional[str] = None,
+                headers: Optional[dict] = None,
+                timeout: float = 15.0) -> HttpResponse:
+        """Any method through the FRONT door (Host→cluster routing). Pass a
+        larger `timeout` for held requests (on.* wakes can ride up to the
+        §6.4 ~25s deadline before resolving)."""
+        return _curl(f"{self.front_url()}{path}", method=method, data=data,
+                     host=host or self.host_for(tenant), headers=headers,
+                     timeout=timeout)
+
     def get(self, tenant: str, path: str = "/", *, host: Optional[str] = None,
-            headers: Optional[dict] = None) -> HttpResponse:
+            headers: Optional[dict] = None, timeout: float = 15.0) -> HttpResponse:
         """GET through the FRONT door (Host→cluster routing)."""
-        return _curl(f"{self.front_url()}{path}", host=host or self.host_for(tenant),
-                     headers=headers)
+        return self.request(tenant, path, host=host, headers=headers,
+                            timeout=timeout)
+
+    def node_request(self, path: str, *, method: str = "GET", node: int = 0,
+                     host: Optional[str] = None, data: Optional[bytes | str] = None,
+                     headers: Optional[dict] = None) -> HttpResponse:
+        """Direct-to-node call (bypasses the front). For `/_system/*` admin
+        surfaces — pass `host=self.admin_host(node)`."""
+        return _curl(f"{self.node_url(node)}{path}", method=method, data=data,
+                     host=host, headers=headers)
+
+    def admin_kv_get(self, tenant: str, key: str, *, node: int = 0) -> HttpResponse:
+        """Read a tenant KV key via the worker's `/_system/v2-kv` (move-secret
+        gated) — handy for asserting a handler's durable writes landed."""
+        return _curl(
+            f"{self.node_url(node)}/_system/v2-kv?tenant={tenant}&key={key}",
+            headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+
+    def admin_kv_put(self, tenant: str, key: str, value: str, *,
+                     node: int = 0) -> HttpResponse:
+        """Write a tenant KV key via the worker's `/_system/v2-kv` (move-secret
+        gated, same surface `three_node_smoke` seeds through). The PUT goes
+        through the addressed node's leader propose→commit path, so target the
+        leader node (a follower 503s). Symmetric to `admin_kv_get` — together
+        they assert replication/durability across moves + failovers without
+        needing the deployment-load path."""
+        import json
+        return _curl(
+            f"{self.node_url(node)}/_system/v2-kv", method="PUT",
+            headers={"X-Rewind-Move-Secret": MOVE_SECRET,
+                     "Content-Type": "application/json"},
+            data=json.dumps({"tenant": tenant, "key": key, "value": value}))
+
+    def set_plan(self, tenant: str, plan_blob: str, *, node: int = 0) -> HttpResponse:
+        """Install a tenant's resolved plan limits on its hot-path slot via the
+        worker's `/_system/v2-plan` (move-secret gated) — the CP's live
+        single-target push (docs/v2-cp-operational-state.md "Live tier
+        change"). `plan_blob` is the opaque `{tier, overrides}` JSON the CP
+        stores; an empty/malformed blob resolves to the free tier. 204 on
+        success. Bumps `plan_gen` so the rate limiter re-snapshots caps — used
+        by the rate-limit smoke to dial a tiny `request_capacity`."""
+        import json
+        return _curl(
+            f"{self.node_url(node)}/_system/v2-plan", method="POST",
+            headers={"X-Rewind-Move-Secret": MOVE_SECRET,
+                     "Content-Type": "application/json"},
+            data=json.dumps({"tenant": tenant, "plan": plan_blob}))
+
+    def get_plan(self, tenant: str, *, node: int = 0) -> HttpResponse:
+        """Read the tenant's RESOLVED effective limits (JSON + `plan_gen`) via
+        `GET /_system/v2-plan` — diagnostic read-back that delivery landed."""
+        return _curl(
+            f"{self.node_url(node)}/_system/v2-plan?tenant={tenant}",
+            headers={"X-Rewind-Move-Secret": MOVE_SECRET})
 
     def wait_for_handler(self, tenant: str, path: str = "/", *,
                          want_status: int = 200, want_body: Optional[str] = None,
@@ -310,3 +418,53 @@ class V2Cluster:
         print(f"  --- node {node + 1} log (last 30) ---")
         for ln in lines[-30:]:
             print(f"    | {ln}")
+
+    # ── multi-node (failover smokes) ───────────────────────────────────
+    def leader_node(self, tenant: str, *, deadline_s: float = 20.0) -> Optional[int]:
+        """Index of the node currently leading `tenant`'s raft group (the node
+        whose `/_system/v2-leader` returns 200), or None. Polls until a leader
+        appears (a freshly-formed/re-elected group needs a moment)."""
+        deadline = time.time() + deadline_s
+        while time.time() < deadline:
+            for i, port in enumerate(self.node_ports):
+                if i not in self.node_procs or self.node_procs[i].poll() is not None:
+                    continue
+                r = _curl(f"{self.node_url(i)}/_system/v2-leader?tenant={tenant}",
+                          headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+                if r.status == 200:
+                    return i
+            time.sleep(0.4)
+        return None
+
+    def stop_node(self, i: int) -> None:
+        """SIGTERM node `i` (simulate a node death / leader kill)."""
+        p = self.node_procs.get(i)
+        if p is None or p.poll() is not None:
+            return
+        p.send_signal(signal.SIGTERM)
+        try:
+            p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+
+    def start_node(self, i: int) -> None:
+        """Re-spawn node `i` with its original voter/peer config (rejoins the
+        group, catches up via raft / snapshot)."""
+        self._spawn_node(i, self._voters, self._peers)
+
+    def request_retry(self, tenant: str, path: str = "/", *, want_status: int = 200,
+                      want_body: Optional[str] = None, method: str = "GET",
+                      data: Optional[bytes | str] = None, deadline_s: float = 20.0,
+                      headers: Optional[dict] = None) -> HttpResponse:
+        """Retry a front-door request while a cluster (re)elects a leader — a
+        write to a follower 503s; a killed node surfaces non-want. Used by
+        failover smokes after `stop_node`."""
+        deadline = time.time() + deadline_s
+        last = HttpResponse(status=0, body="", headers={})
+        while time.time() < deadline:
+            last = self.request(tenant, path, method=method, data=data, headers=headers)
+            if last.status == want_status and (want_body is None or want_body in last.body):
+                return last
+            time.sleep(0.4)
+        return last
