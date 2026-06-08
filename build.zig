@@ -526,66 +526,12 @@ pub fn build(b: *std.Build) void {
     const js_tests = b.addTest(.{ .root_module = js_mod });
     test_step.dependOn(&b.addRunArtifact(js_tests).step);
 
-    // Phase 5.5(c) snapshot capture orchestrator. Lives under
-    // src/loop46/ since it composes apply-side state with a
-    // BatchStore output, but it's testable in isolation against
-    // a FsBatchStore + a stub RaftNode + a real ApplyCtx.
-    const snapshot_mod = b.addModule("rove-snapshot", .{
-        .root_source_file = b.path("src/loop46/snapshot.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    snapshot_mod.addImport("raft-kv", kv_mod);
-    snapshot_mod.addImport("rove-js", js_mod);
-    snapshot_mod.addImport("rove-log-server", log_server_mod);
-    snapshot_mod.link_libc = true;
-    snapshot_mod.linkSystemLibrary("nghttp2", .{});
-    snapshot_mod.linkSystemLibrary("ssl", .{});
-    snapshot_mod.linkSystemLibrary("crypto", .{});
-    const snapshot_tests = b.addTest(.{ .root_module = snapshot_mod });
-    test_step.dependOn(&b.addRunArtifact(snapshot_tests).step);
-
-    // loop46: the Loop46 product binary. Subcommand-dispatched entry
-    // point (`loop46 dev`, `loop46 worker`, …) that composes the rove
-    // engine modules with the embedded admin UI bundle.
-    const loop46_mod = b.addModule("loop46", .{
-        .root_source_file = b.path("src/loop46/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    loop46_mod.addImport("rove", rove_mod);
-    loop46_mod.addImport("rove-js", js_mod);
-    loop46_mod.addImport("raft-kv", kv_mod);
-    loop46_mod.addImport("rove-blob", blob_mod);
-    loop46_mod.addImport("rove-jwt", jwt_mod);
-    loop46_mod.addImport("rove-files", files_mod);
-    loop46_mod.addImport("rove-files-server", files_server_mod);
-    loop46_mod.addImport("rove-log-server", log_server_mod);
-    loop46_mod.addImport("rove-qjs", qjs_mod);
-    loop46_mod.addImport("rove-tenant", tenant_mod);
-    loop46_mod.addImport("rove-h2", h2_mod);
-    loop46_mod.addImport("rove-ssrf", ssrf_mod);
-    loop46_mod.addImport("rove-acme", acme_mod);
-    // The admin + replay tenant bundles + UI files used to be
-    // embedded into the loop46 binary so the worker could
-    // bootstrap-deploy them at startup. Phase 5.5(e) step 3 moved
-    // that responsibility to files-server-standalone, so the embeds
-    // moved with it (see the platform_bundle_files block on
-    // files_server_mod above).
-    loop46_mod.link_libc = true;
-    loop46_mod.linkSystemLibrary("nghttp2", .{});
-    loop46_mod.linkSystemLibrary("ssl", .{});
-    loop46_mod.linkSystemLibrary("crypto", .{});
-
-    const loop46_exe = b.addExecutable(.{
-        .name = "loop46",
-        .root_module = loop46_mod,
-    });
-    b.installArtifact(loop46_exe);
-
-    const run_loop46 = b.addRunArtifact(loop46_exe);
-    const loop46_step = b.step("loop46", "Run the loop46 product binary");
-    loop46_step.dependOn(&run_loop46.step);
+    // V1→V2 cutover: `rove-snapshot` (src/loop46/snapshot.zig, willemt
+    // RaftNode) and the `loop46` product binary (src/loop46/, V1 cluster +
+    // sqlite raft) were RETIRED — the V2 worker is `rewind`
+    // (src-v2/rewind/main.zig). Both broke the aggregate `test` step and the
+    // default install on the v2 branch. Their per-tenant raft is the `Bridge`
+    // (src-v2/kv/bridge.zig) + raft-rs.
 
     // qjs-hello: minimal demo that runs a JS snippet via rove-qjs.
     // Will grow into a snapshot-restoring executable in the next Phase 0
@@ -623,22 +569,32 @@ pub fn build(b: *std.Build) void {
     // `sweepOwedRetriesOnPromotion` covers the same shape; see
     // `scripts/webhook_recovery_smoke.py` for end-to-end coverage.
 
-    // files-server-standalone: spawns the rove-files-server thread and
-    // idles. Exists so the smoke test can drive it from curl.
-    const cs_standalone_mod = b.addModule("files-server-standalone", .{
-        .root_source_file = b.path("examples/files_server_standalone.zig"),
+    // V1→V2 cutover: `files-server-standalone` (examples/files_server_standalone.zig,
+    // its own willemt-raft `Cluster`) was RETIRED — replaced by `files-server-v2`
+    // below (cluster-free; the flip is the worker's `/_system/release`).
+
+    // files-server-v2: the cluster-free V2 deploy artifact (branch `v2`).
+    // The V1 `files-server-standalone` brings up its own willemt-raft cluster
+    // (dead on V2); this one is a pure compile + manifest + blob-write service
+    // that shares the rewind worker's BlobBackend and delegates the
+    // `_deploy/current` flip to the worker's `/_system/release`. Behind its own
+    // named step (not the default install) so it builds on the V2 branch where
+    // the V1 binaries don't.
+    const fs_v2_mod = b.addModule("files-server-v2", .{
+        .root_source_file = b.path("examples/files_server_v2.zig"),
         .target = target,
         .optimize = optimize,
     });
-    cs_standalone_mod.addImport("rove-files-server", files_server_mod);
-    cs_standalone_mod.addImport("rove-blob", blob_mod);
-    cs_standalone_mod.addImport("rove-h2", h2_mod);
-    cs_standalone_mod.addImport("raft-kv", kv_mod);
-    const cs_standalone = b.addExecutable(.{
-        .name = "files-server-standalone",
-        .root_module = cs_standalone_mod,
+    fs_v2_mod.addImport("rove-files-server", files_server_mod);
+    fs_v2_mod.addImport("rove-blob", blob_mod);
+    fs_v2_mod.addImport("rove-h2", h2_mod);
+    fs_v2_mod.addImport("raft-kv", kv_mod);
+    const fs_v2_exe = b.addExecutable(.{
+        .name = "files-server-v2",
+        .root_module = fs_v2_mod,
     });
-    b.installArtifact(cs_standalone);
+    const fs_v2_step = b.step("files-server-v2", "Build the cluster-free V2 files-server (deploy publisher)");
+    fs_v2_step.dependOn(&b.addInstallArtifact(fs_v2_exe, .{}).step);
 
     // sse-server-standalone: RETIRED (task #10 Phase 3). The SSE
     // notification service now runs as a loop46-internal thread
@@ -660,6 +616,12 @@ pub fn build(b: *std.Build) void {
     ls_standalone_mod.addImport("rove-log-server", log_server_mod);
     ls_standalone_mod.addImport("rove-blob", blob_mod);
     ls_standalone_mod.addImport("rove-h2", h2_mod);
+    // `rove-log-server` is deliberately sqlite-free (the C lib is linked at the
+    // binary level, not the shared module — see `log_server_test_mod` below);
+    // its `index_db.zig` needs sqlite3, so this binary links it. (Pre-cutover
+    // this was masked by the default build failing on loop46 first.)
+    ls_standalone_mod.link_libc = true;
+    ls_standalone_mod.linkSystemLibrary("sqlite3", .{});
     const ls_standalone = b.addExecutable(.{
         .name = "log-server-standalone",
         .root_module = ls_standalone_mod,
@@ -667,21 +629,9 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(ls_standalone);
 
 
-    // kv-maelstrom: adapter binary that lets Maelstrom drive lin-kv
-    // linearizability workloads against rove-kv over stdin/stdout.
-    const kv_maelstrom_mod = b.addModule("kv-maelstrom", .{
-        .root_source_file = b.path("examples/kv_maelstrom.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    kv_maelstrom_mod.addImport("raft-kv", kv_mod);
-    kv_maelstrom_mod.link_libc = true;
-
-    const kv_maelstrom = b.addExecutable(.{
-        .name = "kv-maelstrom",
-        .root_module = kv_maelstrom_mod,
-    });
-    b.installArtifact(kv_maelstrom);
+    // V1→V2 cutover: `kv-maelstrom` (examples/kv_maelstrom.zig) drove
+    // Maelstrom linearizability against the V1 willemt `RaftNode` — RETIRED.
+    // V2 consensus (raft-rs) is exercised by the `v2-test` + cluster smokes.
 
     // ── Examples ──
     const echo_mod = b.addModule("echo-server", .{
