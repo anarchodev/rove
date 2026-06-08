@@ -178,10 +178,15 @@ DO-shaped model + revised plan is **§4.5**.
 **Decision: build inbound WebSockets as the Cloudflare-Durable-Object shape.**
 A tenant is the object; its connections are held in the tenant's worker(s);
 durable state is the tenant's raft-backed KV; idle held connections ride
-Phase-6 hibernation. Fan-out splits cleanly into **point-to-point** (platform,
-node-local) and **broadcast** (a customer recipe on kv wakes) — and that split
-is *forced by the model*, not chosen (below). Cross-node held-state routing is
-never built.
+Phase-6 hibernation. Fan-out splits cleanly into **point-to-point** (platform)
+and **broadcast** (a customer recipe on kv wakes) — and that split is *forced by
+the model*, not chosen (below).
+
+> **Scope: single-node only, for now.** The baseline targets a tenant served on
+> one node — the DO-parity shape. Multi-node held connections (a tenant whose
+> connections span machines) are deliberately **not addressed here**; held
+> state is single-node by construction today (`cross-worker-held-state-plan.md`)
+> and that is the assumption throughout this section.
 
 ### Gap #6 already paid the transport cost
 
@@ -220,23 +225,22 @@ outbound frames are the `conn_write` Cmd. No new execution vocabulary.
 
 ### Two fan-out operations, forced apart by the model
 
-| Operation | What | Mechanism | Scope | Owner |
-|---|---|---|---|---|
-| **point-to-point** | a chunk/disconnect/`send_callback` for *one* known continuation | holder locator (`worker_idx, slot, gen`) + cross-worker inbox | **same-node, cross-worker, same-tenant** | platform |
-| **broadcast** | push to *everyone* in a room | `on.kv` trigger + a durable write | any scale, **cross-node for free** | customer recipe |
+| Operation | What | Mechanism | Owner |
+|---|---|---|---|
+| **point-to-point** | a chunk/disconnect/`send_callback` for *one* known continuation | holder locator (`worker_idx, slot, gen`) + cross-worker inbox | platform |
+| **broadcast** | push to *everyone* in a room | `on.kv` trigger + a durable write | customer recipe |
 
 The runtime knows the target of a point-to-point wake (it owns the
-continuation), so it routes within the node — that is the only "held-state
-gap," and it is shared by every held primitive (fetch, subscribe, WS), not WS
-tax (`cross-worker-held-state-plan.md`; its locator is deliberately
-node-local). Broadcast is the opposite: the connection-actor model **never
-exposes a connection handle** (`connection-actor-unified-trigger.md`), so
-broadcast *cannot* be "enumerate the connections and push" — it must be pub-sub
-on a trigger. So broadcast is `on.kv`: subscribers park on a room key; a
-durable write fires the wake; because KV is raft-replicated, the write reaches
-every node and wakes parked continuations at apply-time — cross-node fan-out as
-a *consequence of replication*, not bespoke inter-node connection messaging.
-The hidden-handle rule guarantees there is no other way to broadcast anyway.
+continuation), so it routes to the worker that holds it — the existing
+held-state routing, shared by every held primitive (fetch, subscribe, WS), not
+WS tax (`cross-worker-held-state-plan.md`). Broadcast is the opposite: the
+connection-actor model **never exposes a connection handle**
+(`connection-actor-unified-trigger.md`), so broadcast *cannot* be "enumerate
+the connections and push" — it must be pub-sub on a trigger. So broadcast is
+`on.kv`: subscribers park on a room key; a durable write fires the wake; each
+parked continuation reads the new message and pushes it down its socket. The
+hidden-handle rule guarantees there is no other way to broadcast anyway, which
+is why fan-out is a customer recipe, not a platform API.
 
 ### Durability: per-frame raft cost is opt-in, and batches via group-commit
 
@@ -268,17 +272,13 @@ promise per-frame durability before that commit. The atomicity boundary is
 
 ### Non-goals — DO-model-specific (extend §7)
 
-- **Cross-node point-to-point held-state routing.** Never. A wake for a
-  *specific* held connection routes only within its node; cross-node fan-out is
-  always the broadcast (kv-wake) path, never a connection fabric.
 - **A platform broadcast/enumeration API.** Forced out by the hidden-handle
-  rule. Cross-tenant / cross-node / large-room fan-out is the customer's
-  kv-wake recipe. A `channel.js` / `room.js` shim (pure sugar over `on.kv` + a
-  durable write, à la `webhook.send`) may follow **once a common shape emerges
-  from real use** — defer per `compose_from_primitives`.
-- **Per-tenant scale beyond its worker via a fabric.** A tenant whose
-  connection load exceeds one worker shards via the kv-wake recipe (as you
-  shard a DO), not a platform fabric — the same ceiling DO has.
+  rule. Room/large fan-out is the customer's kv-wake recipe. A `channel.js` /
+  `room.js` shim (pure sugar over `on.kv` + a durable write, à la
+  `webhook.send`) may follow **once a common shape emerges from real use** —
+  defer per `compose_from_primitives`.
+- **Multi-node held connections.** Out of scope (see the scope note above);
+  the baseline is a tenant on one node.
 
 ## 4.6 Build decomposition + sizing (revised — on the gap-#6 substrate)
 
@@ -289,13 +289,11 @@ promise per-frame durability before that commit. The atomicity boundary is
 | C | connection mode switch on `Conn` | **small-medium** | a third branch alongside the `h1` fork in `readsFeedData` / the response path — accumulation buffer, TLS decrypt, the backpressure write machinery are all reused from gap #6. |
 | D | frame → activation | **medium** (softest estimate) | wire the frame producer into the shipped `inbound_chunk` / held-stream seam (the same one `http.subscribe`'s `on_chunk` uses). Re-read this seam before committing a number. |
 | E | `conn_write` Cmd executor | **medium** | the reserved Phase-4.1.4 slot → serialize frames + push to the backpressure-gated outbound path. |
-| (shared) | same-node cross-worker held-state locator | **medium, not WS-specific** | `cross-worker-held-state-plan.md`; needed by every held primitive. Amortized, not WS tax. |
+| (shared) | cross-worker held-state locator | **medium, not WS-specific** | `cross-worker-held-state-plan.md`; needed by every held primitive. Amortized, not WS tax. |
 
 **Net platform commitment for DO-parity inbound WS: medium (~1–2 weeks)** on
 the gap-#6 substrate, dominated by the pure frame codec (B). Broadcast is docs
-(the kv-wake recipe). The one dependency to verify first is whether kv-wakes
-fire at **apply-time on every node** (they must, for the broadcast recipe to
-cross nodes) vs propose-time on the leader only — a quick read, load-bearing.
+(the kv-wake recipe).
 
 ## 5. Handler execution model — already shipped, recap
 
@@ -359,10 +357,10 @@ collab).
   (atproto repo commits, chat messages).
 - **Reconnect / cursor policy.** Customer composes via kv per the
   framework principle. No platform-managed cursor store.
-- ~~**Cross-worker / cross-node fan-out.**~~ **RESOLVED in §4.5:**
-  point-to-point wakes route node-local (platform); broadcast is the customer's
-  `on.kv` recipe (cross-node for free); cross-node held-state routing is never
-  built. The hidden-handle rule forces broadcast onto pub-sub.
+- ~~**Cross-worker fan-out.**~~ **RESOLVED in §4.5:** point-to-point wakes route
+  to the holding worker (platform held-state routing); broadcast is the
+  customer's `on.kv` recipe — the hidden-handle rule forces it onto pub-sub.
+  Multi-node held connections are out of scope (single-node baseline).
 - ~~**Inbound durability per frame.**~~ **RESOLVED in §4.5:** a frame costs
   raft iff its activation writes; ephemeral frames are free + moot-on-loss;
   durable frames coalesce via the connection actor's trigger into one
