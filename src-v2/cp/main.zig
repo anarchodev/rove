@@ -456,10 +456,11 @@ const Router = struct {
         const method_s = headerValue(rh, ":method") orelse "GET";
         const is_move = std.mem.eql(u8, path, "/_control/move");
         const is_move_live = std.mem.eql(u8, path, "/_control/move-live");
+        const is_provision = std.mem.eql(u8, path, "/_control/provision");
         const is_plan = std.mem.eql(u8, path, "/_control/plan");
         const is_host = std.mem.eql(u8, path, "/_control/host");
         const is_cert = std.mem.eql(u8, path, "/_control/cert");
-        if (!(is_move or is_move_live or is_plan or is_host or is_cert) or !std.mem.eql(u8, method_s, "POST")) {
+        if (!(is_move or is_move_live or is_provision or is_plan or is_host or is_cert) or !std.mem.eql(u8, method_s, "POST")) {
             try replyStatus(server, ent, sid, sess, 404);
             return;
         }
@@ -490,10 +491,88 @@ const Router = struct {
             try self.handleHost(server, ent, sid, sess, body)
         else if (is_cert)
             try self.handleCert(server, ent, sid, sess, body)
+        else if (is_provision)
+            try self.handleProvision(server, ent, sid, sess, body)
         else if (is_move_live)
             try self.handleMoveLive(server, ent, sid, sess, body)
         else
             try self.handleMove(server, ent, sid, sess, body);
+    }
+
+    /// `POST /_control/provision {tenant, cluster, host?}` — stand up a
+    /// brand-new tenant (gaps #4 + #5): form its raft group on EVERY node of
+    /// `cluster` via an empty-attach (no bundle — the multi-node formation path
+    /// that needs no move), await the group's election, then write the
+    /// placement (the commit point that makes it routable), and optionally map
+    /// `host`→tenant. Create-only: 409 if the tenant is already placed (use
+    /// `/_control/move` to relocate); 400 for an unknown cluster. On a
+    /// formation failure the freshly-formed groups are evicted, so a failed
+    /// provision is a no-op.
+    fn handleProvision(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
+        const a = self.allocator;
+        var parsed = std.json.parseFromSlice(struct {
+            tenant: []const u8,
+            cluster: []const u8,
+            host: ?[]const u8 = null,
+        }, a, body, .{ .ignore_unknown_fields = true }) catch {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        };
+        defer parsed.deinit();
+        const tenant = parsed.value.tenant;
+        const cluster = parsed.value.cluster;
+        if (tenant.len == 0 or cluster.len == 0) {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        }
+
+        // Create-only — provisioning an already-placed tenant is a 409 (its
+        // group already exists; relocate via `/_control/move`).
+        if (self.directory.resolve(tenant) != null) {
+            try replyStatus(server, ent, sid, sess, 409);
+            return;
+        }
+        const cluster_ref = self.directory.clusterById(cluster) orelse {
+            try replyStatus(server, ent, sid, sess, 400); // unknown cluster
+            return;
+        };
+        const nodes = cluster_ref.nodes; // pointer-stable across the calls below
+
+        const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        defer a.free(tbody);
+
+        // 1. Empty-attach to every node → form the group across the cluster
+        //    (gap #4: multi-node formation with no move, no bundle). A new
+        //    tenant has no plan yet → free tier until `/_control/plan`.
+        if (!self.attachToAll(nodes, "", tenant, null)) {
+            self.evictAll(tenant, nodes, tbody);
+            try replyStatus(server, ent, sid, sess, 502);
+            return;
+        }
+        // 2. Await the formed group's election so the first request finds a leader.
+        if (!self.awaitDestLeader(nodes, tenant)) {
+            self.evictAll(tenant, nodes, tbody);
+            try replyStatus(server, ent, sid, sess, 504);
+            return;
+        }
+        // 3. Write the placement — the commit point that makes it routable.
+        self.directory.assign(tenant, cluster) catch {
+            self.evictAll(tenant, nodes, tbody);
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        // 4. Optional host→tenant mapping so the tenant is reachable now. It is
+        //    already provisioned (placed) — a host write failure is non-fatal;
+        //    retry via `/_control/host`.
+        if (parsed.value.host) |host| {
+            if (host.len > 0) self.directory.setHost(host, tenant) catch |err|
+                std.log.warn("rewind-cp: provision {s}: setHost({s}) failed: {s}", .{ tenant, host, @errorName(err) });
+        }
+        std.log.info("rewind-cp: provisioned {s} on {s} ({d} node(s))", .{ tenant, cluster, nodes.len });
+        try replyStatus(server, ent, sid, sess, 204);
     }
 
     /// Set a tenant's plan/limits blob: `POST /_control/plan {tenant, plan}`.

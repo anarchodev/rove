@@ -93,18 +93,22 @@ host axis test; `tenant_move_smoke` confirms the front-door routing path.
    - V1 ACME (`src/acme/` Client + Responder + crypto) is **evolved + re-homed,
      not deleted.**
 
-**4. Direct multi-node placement without a move.** A tenant's raft group only
-forms via the attach fan-out of a move-in
-([`v2-phase5-multinode.md`](v2-phase5-multinode.md) follow-ups). Normal
-provisioning of a brand-new tenant onto a multi-node cluster needs an explicit
-formation step; `v2-kv` PUT leader-gating depends on the group already existing.
-
-**5. Tenant provisioning / `createInstance` path.** V1 has `seed`,
-`provisionInstance`, admin `createInstance` (envelope-2 `root_writeset` →
-`__root__.db`). In V2 `__root__.db` is per-cluster and placement lives in the CP.
-No V2 brand-new-tenant create+place flow has been confirmed beyond the move path;
-`v2-cp-operational-state.md` marks `instance/{id}` provisioning as "⚠️ maybe /
-needs thought." Confirm or build the create-a-new-tenant path end to end.
+**4 + 5. Brand-new-tenant provisioning + multi-node formation without a move.**
+✅ **RESOLVED.** `POST /_control/provision {tenant, cluster, host?}`
+(`cp/main.zig` `handleProvision`, move-secret gated + CP-leader-forward) stands
+up a brand-new tenant in one call: empty-attach (`attachToAll(nodes, "", …)` —
+the move's attach step minus the bundle) to EVERY node of `cluster` forms the
+raft group across the whole cluster (gap #4 — no move needed; the empty-attach
+also `ensureInstance`s the blank per-tenant store, gap #5's create), await the
+group's election, then `directory.assign` writes the placement (the routable
+commit point) + optional `setHost`. Create-only (409 if already placed —
+relocate via `/_control/move`); a formation failure evicts the half-formed
+groups so a failed provision is a no-op. No `__root__`/`instance/{id}` write is
+needed — the CP directory (placement + host axis) + the empty instance suffice,
+exactly the state a move-in destination ends with. Proven end-to-end on a real
+3-node cluster: `scripts/cp_provision_smoke.py` (provision → group forms across
+all 3 nodes → a v2-kv write commits + replicates to every node → the front
+routes the host → re-provision 409 / unknown-cluster 400).
 
 ## ✅ Front-door tier split (architectural, was blocking the edge gaps) — SHIPPED
 
@@ -165,8 +169,9 @@ front-door count == voter count (inverted scaling). **Done:**
    TLS termination + CP cert pull) + 3 (leader-elected HTTP-01 issuer,
    `src-v2/cp/acme.zig`, Pebble-proven) ✅ SHIPPED; DNS-01 wildcard (slice 4)
    deferred.
-5. **Tenant provisioning + multi-node formation** (gaps #4, #5) — the
-   create-a-new-tenant path end to end.
+5. ~~**Tenant provisioning + multi-node formation** (gaps #4, #5) — the
+   create-a-new-tenant path end to end.~~ ✅ **SHIPPED** — `POST
+   /_control/provision` (`cp_provision_smoke.py`, 3-node).
 6. **Front-door content-type passthrough** (🟡 but mandatory).
 7. Then the `src-v2 → src` code-move cutover; fix `zig build test`; run hardening
    benches.
