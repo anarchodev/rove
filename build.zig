@@ -803,6 +803,9 @@ pub fn build(b: *std.Build) void {
         .root_module = h2_tls_mod,
     });
     b.installArtifact(h2_tls_test);
+    const h2_tls_run = b.addRunArtifact(h2_tls_test);
+    const h2_tls_step = b.step("h2-tls-test", "Run the TLS echo server example (h2 + http/1.1 via ALPN)");
+    h2_tls_step.dependOn(&h2_tls_run.step);
 
     // h2 client test
     const h2_client_mod = b.addModule("h2-client-test", .{

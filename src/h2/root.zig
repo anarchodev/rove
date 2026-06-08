@@ -1291,9 +1291,9 @@ pub fn H2(comptime opts: Options) type {
                 };
 
                 // HTTP/1.1 connection (Phase 2): serialize + write via the h1
-                // codec instead of nghttp2.
-                if (conn_ptr.h1) |h1c| {
-                    self.http1WriteResponse(ent, sess.entity, h1c, status, rh, rb, io_res) catch {
+                // codec instead of nghttp2 (encrypting if the conn is TLS).
+                if (conn_ptr.h1 != null) {
+                    self.http1WriteResponse(ent, conn_ptr, sess.entity, status, rh, rb, io_res) catch {
                         io_res.err = -1;
                         try self.reg.move(ent, &self.response_in, &self.response_out);
                     };
@@ -1830,6 +1830,23 @@ pub fn H2(comptime opts: Options) type {
                                 self.allocator.free(output);
                             };
                         }
+                        // ALPN decides the protocol (Phase 3): an `http/1.1`
+                        // negotiation drives the h1 codec; anything else (`h2`
+                        // or no ALPN) keeps the nghttp2 path. Both decrypt their
+                        // first app-data flight from `decrypt_buf`.
+                        if (std.mem.eql(u8, tc.alpnProtocol(), "http/1.1")) {
+                            const h1c = Http1Conn.create(self.allocator) orelse {
+                                try self.reg.destroy(conn_ent.entity);
+                                try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
+                                continue;
+                            };
+                            conn_ptr.h1 = h1c;
+                            if (feed_result.out_len > 0) {
+                                self.http1Feed(conn_ptr, conn_ent.entity, decrypt_buf[0..feed_result.out_len]);
+                            }
+                            try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
+                            continue;
+                        }
                         self.sessionCreate(conn_ptr, conn_ent.entity) catch {
                             try self.reg.destroy(conn_ent.entity);
                             try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
@@ -1856,7 +1873,10 @@ pub fn H2(comptime opts: Options) type {
             const entities = self._conn_tls_handshake.entitySlice();
             for (entities) |ent| {
                 const conn_ptr = self.reg.get(ent, &self._conn_tls_handshake, Conn) catch continue;
-                if (conn_ptr.ng_session != null) {
+                // An ALPN-h1 conn (Phase 3) has no ng_session but is ready once
+                // its Http1Conn is set — it must reach _conn_active so its reads
+                // are processed and the idle GC can see it.
+                if (conn_ptr.ng_session != null or conn_ptr.h1 != null) {
                     try self.reg.move(ent, &self._conn_tls_handshake, &self._conn_active);
                 }
             }
@@ -1887,19 +1907,21 @@ pub fn H2(comptime opts: Options) type {
         /// Append freshly-read plaintext bytes to the h1 buffer and drive the
         /// parser. Any failure surfaces as an error response + close rather
         /// than a silent drop.
-        fn http1Feed(self: *Self, h1c: *Http1Conn, conn_entity: Entity, bytes: []const u8) void {
+        fn http1Feed(self: *Self, conn_ptr: *Conn, conn_entity: Entity, bytes: []const u8) void {
+            const h1c = conn_ptr.h1.?;
             if (h1c.closing) return;
             h1c.buf.appendSlice(self.allocator, bytes) catch {
-                self.http1ErrorClose(h1c, conn_entity, 500);
+                self.http1ErrorClose(conn_ptr, conn_entity, 500);
                 return;
             };
-            self.http1Drive(h1c, conn_entity);
+            self.http1Drive(conn_ptr, conn_entity);
         }
 
         /// Parse as much of the buffer as possible, emitting at most one request
         /// (no pipelining). Called after a read and after a keep-alive response
         /// drains (to pick up a coalesced next request).
-        fn http1Drive(self: *Self, h1c: *Http1Conn, conn_entity: Entity) void {
+        fn http1Drive(self: *Self, conn_ptr: *Conn, conn_entity: Entity) void {
+            const h1c = conn_ptr.h1.?;
             if (h1c.in_flight or h1c.closing) return;
 
             var store: [http1.MAX_HEADERS]http1.Header = undefined;
@@ -1911,7 +1933,7 @@ pub fn H2(comptime opts: Options) type {
                     // before swapping in), but refuse it loudly rather than hang.
                     error.NotHttp1 => 400,
                 };
-                self.http1ErrorClose(h1c, conn_entity, status);
+                self.http1ErrorClose(conn_ptr, conn_entity, status);
                 return;
             };
 
@@ -1923,26 +1945,28 @@ pub fn H2(comptime opts: Options) type {
             // Chunked decoding is Phase 4; until then a chunked request is a
             // 411 (Length Required) rather than a misframe.
             if (head.chunked) {
-                self.http1ErrorClose(h1c, conn_entity, 411);
+                self.http1ErrorClose(conn_ptr, conn_entity, 411);
                 return;
             }
             // HTTP/1.1 requires Host; without it there's no `:authority`.
             if (head.host == null) {
-                self.http1ErrorClose(h1c, conn_entity, 400);
+                self.http1ErrorClose(conn_ptr, conn_entity, 400);
                 return;
             }
 
             const body_len = head.content_length orelse 0;
             if (body_len > Http1Conn.MAX_BODY_BYTES) {
-                self.http1ErrorClose(h1c, conn_entity, 413);
+                self.http1ErrorClose(conn_ptr, conn_entity, 413);
                 return;
             }
             const total = head.head_len + body_len;
             if (h1c.buf.items.len < total) return; // body still arriving
 
+            // `:scheme` reflects the transport: TLS-terminated h1 is https.
+            const scheme: []const u8 = if (conn_ptr.tls_conn != null) "https" else "http";
             const body = h1c.buf.items[head.head_len..total];
-            self.http1EmitRequest(conn_entity, head, body) catch {
-                self.http1ErrorClose(h1c, conn_entity, 503);
+            self.http1EmitRequest(conn_entity, head, body, scheme) catch {
+                self.http1ErrorClose(conn_ptr, conn_entity, 503);
                 return;
             };
             h1c.keep_alive = head.keep_alive;
@@ -1961,14 +1985,14 @@ pub fn H2(comptime opts: Options) type {
         /// Build a `request_out` entity from a parsed h1 head + body, synthesizing
         /// the h2-style pseudo-headers so all downstream routing/dispatch is
         /// protocol-agnostic. `StreamId` is the synthetic 1 (one request/conn).
-        fn http1EmitRequest(self: *Self, conn_entity: Entity, head: http1.Head, body: []const u8) !void {
+        fn http1EmitRequest(self: *Self, conn_entity: Entity, head: http1.Head, body: []const u8, scheme: []const u8) !void {
             const req_entity = try self.reg.create(&self.request_out);
             errdefer self.reg.destroy(req_entity) catch {};
 
             try self.reg.set(req_entity, &self.request_out, StreamId, .{ .id = 1 });
             try self.reg.set(req_entity, &self.request_out, Session, .{ .entity = conn_entity });
 
-            const rh = try self.http1BuildReqHeaders(head, "http");
+            const rh = try self.http1BuildReqHeaders(head, scheme);
             try self.reg.set(req_entity, &self.request_out, ReqHeaders, rh);
 
             var body_data: ?[*]u8 = null;
@@ -2050,9 +2074,25 @@ pub fn H2(comptime opts: Options) type {
             return .{ .fields = fields, .count = @intCast(n), ._buf = buf.ptr, ._buf_len = @intCast(total) };
         }
 
+        /// Encrypt (when the connection is TLS) and queue an owned plaintext
+        /// buffer for write. Takes ownership of `data`: frees it on any path.
+        /// The one place h1 egress bytes cross the TLS boundary, so both the
+        /// plaintext and ALPN-h1 paths share identical framing.
+        fn http1Send(self: *Self, conn_ptr: *Conn, conn_entity: Entity, data: []u8) void {
+            if (conn_ptr.tls_conn) |tc| {
+                defer self.allocator.free(data);
+                const cipher = tc.encrypt(data, self.allocator) catch return;
+                if (cipher.len == 0) return;
+                self.submitWrite(conn_entity, cipher) catch self.allocator.free(cipher);
+            } else {
+                self.submitWrite(conn_entity, data) catch self.allocator.free(data);
+            }
+        }
+
         /// Serialize a minimal error response (empty body) and close the
         /// connection — used for malformed/unsupported/over-cap requests.
-        fn http1ErrorClose(self: *Self, h1c: *Http1Conn, conn_entity: Entity, status: u16) void {
+        fn http1ErrorClose(self: *Self, conn_ptr: *Conn, conn_entity: Entity, status: u16) void {
+            const h1c = conn_ptr.h1.?;
             if (h1c.closing) return;
             h1c.closing = true;
             h1c.keep_alive = false;
@@ -2065,7 +2105,7 @@ pub fn H2(comptime opts: Options) type {
                 out.deinit(self.allocator);
                 return;
             };
-            self.submitWrite(conn_entity, data) catch self.allocator.free(data);
+            self.http1Send(conn_ptr, conn_entity, data);
         }
 
         /// Serialize a deployed-handler response over h1 and queue the write.
@@ -2073,13 +2113,14 @@ pub fn H2(comptime opts: Options) type {
         fn http1WriteResponse(
             self: *Self,
             ent: Entity,
+            conn_ptr: *Conn,
             conn_entity: Entity,
-            h1c: *Http1Conn,
             status: Status,
             rh: RespHeaders,
             rb: RespBody,
             io_res: *H2IoResult,
         ) !void {
+            const h1c = conn_ptr.h1.?;
             var out: std.ArrayList(u8) = .empty;
             defer out.deinit(self.allocator);
 
@@ -2100,17 +2141,14 @@ pub fn H2(comptime opts: Options) type {
             const body = if (rb.data) |d| d[0..rb.len] else "";
             try http1.writeResponse(&out, self.allocator, status.code, hdr_store[0..hn], body, h1c.keep_alive);
             const data = try out.toOwnedSlice(self.allocator);
-            self.submitWrite(conn_entity, data) catch |err| {
-                self.allocator.free(data);
-                return err;
-            };
+            self.http1Send(conn_ptr, conn_entity, data);
 
             io_res.err = 0;
             try self.reg.move(ent, &self.response_in, &self.response_out);
 
             if (h1c.keep_alive) {
                 h1c.in_flight = false;
-                self.http1Drive(h1c, conn_entity);
+                self.http1Drive(conn_ptr, conn_entity);
             } else {
                 // Connection: close — let the idle-timeout GC reap once the write
                 // drains (same proven path as the old 426 reply).
@@ -2166,14 +2204,28 @@ pub fn H2(comptime opts: Options) type {
                     continue;
                 };
 
-                // HTTP/1.1 connection (Phase 2, plaintext): feed bytes to the h1
-                // codec instead of nghttp2. Runs before the ng_session guard
-                // since an h1 conn has no session.
-                if (conn_ptr.h1) |h1c| {
+                // HTTP/1.1 connection: feed bytes to the h1 codec instead of
+                // nghttp2. Runs before the ng_session guard since an h1 conn has
+                // no session. TLS-terminated h1 (ALPN, Phase 3) decrypts first;
+                // plaintext (Phase 2) feeds raw.
+                if (conn_ptr.h1 != null) {
                     if (rr.data) |data_ptr| {
                         const data_len: usize = @intCast(rr.result);
-                        if (data_len > 0) self.http1Feed(h1c, conn_ent.entity, data_ptr[0..data_len]);
-                        conn_ptr.last_active_ns = monotonicNs();
+                        if (data_len > 0) {
+                            if (conn_ptr.tls_conn) |tc| {
+                                var decrypt_buf: [65536]u8 = undefined;
+                                const fr = tc.feed(data_ptr[0..data_len], &decrypt_buf);
+                                if (fr.result == .err) {
+                                    try self.reg.destroy(conn_ent.entity);
+                                    try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                                    continue;
+                                }
+                                if (fr.out_len > 0) self.http1Feed(conn_ptr, conn_ent.entity, decrypt_buf[0..fr.out_len]);
+                            } else {
+                                self.http1Feed(conn_ptr, conn_ent.entity, data_ptr[0..data_len]);
+                            }
+                            conn_ptr.last_active_ns = monotonicNs();
+                        }
                     }
                     try self.reg.move(ent, &self._read_active, &self.io.read_in);
                     continue;
@@ -2215,12 +2267,12 @@ pub fn H2(comptime opts: Options) type {
                             data_len > 0 and looksLikeHttp1Request(data_ptr[0..data_len]))
                         {
                             conn_ptr.first_read_seen = true;
-                            const h1c = self.http1SwapIn(conn_ptr) orelse {
+                            _ = self.http1SwapIn(conn_ptr) orelse {
                                 try self.reg.destroy(conn_ent.entity);
                                 try self.reg.move(ent, &self._read_active, &self.io.read_in);
                                 continue;
                             };
-                            self.http1Feed(h1c, conn_ent.entity, data_ptr[0..data_len]);
+                            self.http1Feed(conn_ptr, conn_ent.entity, data_ptr[0..data_len]);
                             conn_ptr.last_active_ns = monotonicNs();
                             try self.reg.move(ent, &self._read_active, &self.io.read_in);
                             continue;
@@ -2269,7 +2321,21 @@ pub fn H2(comptime opts: Options) type {
                 if (self.reg.isStale(ent)) continue;
 
                 const conn_ptr = self.reg.get(ent, &self._conn_active, Conn) catch continue;
-                if (conn_ptr.ng_session == null) continue;
+
+                // h1 connections have no nghttp2 session to drive — responses
+                // are written synchronously in `http1WriteResponse`. They still
+                // need idle reaping (a keep-alive conn the client leaves open, or
+                // a `Connection: close`/error conn awaiting its write to drain),
+                // which the nghttp2 path below does only for h2.
+                if (conn_ptr.ng_session == null) {
+                    if (conn_ptr.h1 != null and self.h2_opts.idle_timeout_ns > 0 and
+                        conn_ptr.last_active_ns > 0 and
+                        now -| conn_ptr.last_active_ns > self.h2_opts.idle_timeout_ns)
+                    {
+                        try self.reg.destroy(ent);
+                    }
+                    continue;
+                }
 
                 if (self.h2_opts.idle_timeout_ns > 0 and conn_ptr.last_active_ns > 0 and
                     now -| conn_ptr.last_active_ns > self.h2_opts.idle_timeout_ns)
