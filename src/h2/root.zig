@@ -170,6 +170,14 @@ pub const Http1Conn = struct {
     /// has been queued; the connection is reaped by the idle-timeout GC after
     /// the write drains (same path the old 426 used).
     closing: bool = false,
+    /// Chunked-request decode state (Phase 4). `chunk_body` accumulates the
+    /// assembled body across reads; `chunk_pos` is the resume offset into the
+    /// post-head region so consumed chunks are never re-scanned. Reset per
+    /// request at emit. `continue_sent` guards against re-emitting `100
+    /// Continue` for an `Expect: 100-continue` request on every read.
+    chunk_body: std.ArrayList(u8) = .empty,
+    chunk_pos: usize = 0,
+    continue_sent: bool = false,
 
     /// Hard ceiling on a buffered request body at the edge. Per-tenant plan
     /// limits (gap #1, 413) are enforced in the DP worker; this is the coarse
@@ -185,6 +193,7 @@ pub const Http1Conn = struct {
 
     fn free(self: *Http1Conn) void {
         self.buf.deinit(self.allocator);
+        self.chunk_body.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 };
@@ -1946,35 +1955,70 @@ pub fn H2(comptime opts: Options) type {
                 .head => |h| h,
             };
 
-            // Chunked decoding is Phase 4; until then a chunked request is a
-            // 411 (Length Required) rather than a misframe.
-            if (head.chunked) {
-                self.http1ErrorClose(conn_ptr, conn_entity, 411);
-                return;
-            }
             // HTTP/1.1 requires Host; without it there's no `:authority`.
             if (head.host == null) {
                 self.http1ErrorClose(conn_ptr, conn_entity, 400);
                 return;
             }
 
-            const body_len = head.content_length orelse 0;
-            if (body_len > Http1Conn.MAX_BODY_BYTES) {
-                self.http1ErrorClose(conn_ptr, conn_entity, 413);
-                return;
+            // Frame the body: chunked (Transfer-Encoding) decodes incrementally;
+            // otherwise Content-Length (absent ⇒ no body). Either way `body` is
+            // the assembled payload and `total` the bytes consumed from `buf`.
+            var body: []const u8 = "";
+            var total: usize = head.head_len;
+            if (head.chunked) {
+                const chunk_input = h1c.buf.items[head.head_len..];
+                const r = http1.decodeChunked(
+                    chunk_input,
+                    h1c.chunk_pos,
+                    &h1c.chunk_body,
+                    self.allocator,
+                    Http1Conn.MAX_BODY_BYTES,
+                );
+                h1c.chunk_pos = r.consumed; // resume offset for the next read
+                switch (r.status) {
+                    .need_more => {
+                        self.http1MaybeContinue(conn_ptr, conn_entity, head);
+                        return;
+                    },
+                    .malformed => {
+                        self.http1ErrorClose(conn_ptr, conn_entity, 400);
+                        return;
+                    },
+                    .too_large => {
+                        self.http1ErrorClose(conn_ptr, conn_entity, 413);
+                        return;
+                    },
+                    .complete => {},
+                }
+                body = h1c.chunk_body.items;
+                total = head.head_len + r.consumed;
+            } else {
+                const body_len = head.content_length orelse 0;
+                if (body_len > Http1Conn.MAX_BODY_BYTES) {
+                    self.http1ErrorClose(conn_ptr, conn_entity, 413);
+                    return;
+                }
+                total = head.head_len + body_len;
+                if (h1c.buf.items.len < total) {
+                    self.http1MaybeContinue(conn_ptr, conn_entity, head);
+                    return; // body still arriving
+                }
+                body = h1c.buf.items[head.head_len..total];
             }
-            const total = head.head_len + body_len;
-            if (h1c.buf.items.len < total) return; // body still arriving
 
             // `:scheme` reflects the transport: TLS-terminated h1 is https.
             const scheme: []const u8 = if (conn_ptr.tls_conn != null) "https" else "http";
-            const body = h1c.buf.items[head.head_len..total];
             self.http1EmitRequest(conn_entity, head, body, scheme) catch {
                 self.http1ErrorClose(conn_ptr, conn_entity, 503);
                 return;
             };
             h1c.keep_alive = head.keep_alive;
             h1c.in_flight = true;
+            // Reset per-request framing state for the next keep-alive request.
+            h1c.chunk_pos = 0;
+            h1c.chunk_body.clearRetainingCapacity();
+            h1c.continue_sent = false;
 
             // Drop the consumed request from the front of the buffer; the body
             // bytes are now owned by the request entity. Any trailing bytes
@@ -1984,6 +2028,17 @@ pub fn H2(comptime opts: Options) type {
                 std.mem.copyForwards(u8, h1c.buf.items[0..leftover], h1c.buf.items[total..]);
             }
             h1c.buf.shrinkRetainingCapacity(leftover);
+        }
+
+        /// Send a one-shot `100 Continue` for an `Expect: 100-continue` request
+        /// whose body hasn't fully arrived, so the client proceeds. Guarded by
+        /// `continue_sent` so repeated reads don't re-emit it.
+        fn http1MaybeContinue(self: *Self, conn_ptr: *Conn, conn_entity: Entity, head: http1.Head) void {
+            const h1c = conn_ptr.h1.?;
+            if (!head.expect_continue or h1c.continue_sent) return;
+            h1c.continue_sent = true;
+            const msg = self.allocator.dupe(u8, "HTTP/1.1 100 Continue\r\n\r\n") catch return;
+            self.http1Send(conn_ptr, conn_entity, msg);
         }
 
         /// Build a `request_out` entity from a parsed h1 head + body, synthesizing
@@ -2011,8 +2066,11 @@ pub fn H2(comptime opts: Options) type {
         /// cross into the h2-style representation, plus `Host` (→ `:authority`).
         fn http1IsHopByHop(name: []const u8) bool {
             const drop = [_][]const u8{
-                "host",          "connection", "keep-alive",
+                "host",          "connection",   "keep-alive",
                 "transfer-encoding", "upgrade",  "proxy-connection",
+                // `Expect: 100-continue` is satisfied at the edge (we answer the
+                // 100); the DP gets the fully-decoded body, so it must not leak.
+                "expect",
             };
             for (drop) |d| if (std.ascii.eqlIgnoreCase(name, d)) return true;
             return false;

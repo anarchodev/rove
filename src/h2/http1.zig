@@ -39,9 +39,12 @@ pub const Head = struct {
     host: ?[]const u8,
     /// `Content-Length`, or null if absent (⇒ no body, unless `chunked`).
     content_length: ?usize,
-    /// `Transfer-Encoding: chunked` present (Phase 4 decodes it; until then the
-    /// caller 411s).
+    /// `Transfer-Encoding: chunked` present; the body is chunk-framed (no
+    /// `Content-Length`) and decoded by `decodeChunked`.
     chunked: bool,
+    /// `Expect: 100-continue` present — the client is waiting for a `100
+    /// Continue` interim response before it sends the body.
+    expect_continue: bool,
     /// Effective connection persistence (HTTP/1.1 keep-alive default unless
     /// `Connection: close`; HTTP/1.0 close default unless `Connection: keep-alive`).
     keep_alive: bool,
@@ -102,6 +105,7 @@ pub fn parseHead(buf: []const u8, headers_out: []Header) ParseError!ParseResult 
     var host: ?[]const u8 = null;
     var content_length: ?usize = null;
     var chunked = false;
+    var expect_continue = false;
     var conn_close = false;
     var conn_keep_alive = false;
 
@@ -125,6 +129,8 @@ pub fn parseHead(buf: []const u8, headers_out: []Header) ParseError!ParseResult 
         } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
             if (std.ascii.indexOfIgnoreCase(value, "close") != null) conn_close = true;
             if (std.ascii.indexOfIgnoreCase(value, "keep-alive") != null) conn_keep_alive = true;
+        } else if (std.ascii.eqlIgnoreCase(name, "expect")) {
+            if (std.ascii.indexOfIgnoreCase(value, "100-continue") != null) expect_continue = true;
         }
     }
 
@@ -138,9 +144,76 @@ pub fn parseHead(buf: []const u8, headers_out: []Header) ParseError!ParseResult 
         .host = host,
         .content_length = content_length,
         .chunked = chunked,
+        .expect_continue = expect_continue,
         .keep_alive = keep_alive,
         .head_len = term + 4,
     } };
+}
+
+// ── Chunked transfer-encoding decode ─────────────────────────────────────
+
+pub const ChunkStatus = enum {
+    /// The chunked body isn't complete yet — read more, then resume from the
+    /// returned `consumed` offset (the start of the first not-yet-complete
+    /// chunk). Bytes appended to `out` so far are kept across calls.
+    need_more,
+    /// The terminating zero-chunk (+ optional trailers) was consumed; `out`
+    /// holds the assembled body and `consumed` is the total input bytes used.
+    complete,
+    /// Malformed chunk framing (bad size line, missing CRLF) — 400.
+    malformed,
+    /// The assembled body exceeded `max_body` — 413.
+    too_large,
+};
+
+pub const ChunkResult = struct { status: ChunkStatus, consumed: usize = 0 };
+
+/// Incrementally decode a chunked message body. `input` is the bytes after the
+/// request head (starting at the first chunk-size line); `pos` is where to
+/// resume (0 on the first call, the previous `.need_more` `consumed` after).
+/// Fully-decoded chunk payloads are appended to `out` (caller keeps it across
+/// calls, so consumed chunks are never re-scanned — O(n) total). Chunk
+/// extensions (`;ext`) and trailers are tolerated and discarded.
+pub fn decodeChunked(
+    input: []const u8,
+    pos: usize,
+    out: *std.ArrayList(u8),
+    a: std.mem.Allocator,
+    max_body: usize,
+) ChunkResult {
+    var i = pos;
+    while (true) {
+        const nl = std.mem.indexOfPos(u8, input, i, "\r\n") orelse
+            return .{ .status = .need_more, .consumed = i };
+        const size_line = input[i..nl];
+        // A chunk size may carry `;chunk-ext` — only the hex prefix matters.
+        const hex_end = std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len;
+        const hex = std.mem.trim(u8, size_line[0..hex_end], " \t");
+        if (hex.len == 0) return .{ .status = .malformed };
+        const size = std.fmt.parseInt(usize, hex, 16) catch return .{ .status = .malformed };
+        const data_start = nl + 2;
+
+        if (size == 0) {
+            // Last chunk: skip any trailer header lines up to the empty line
+            // that terminates the message.
+            var j = data_start;
+            while (true) {
+                const tnl = std.mem.indexOfPos(u8, input, j, "\r\n") orelse
+                    return .{ .status = .need_more, .consumed = i };
+                if (tnl == j) return .{ .status = .complete, .consumed = j + 2 };
+                j = tnl + 2;
+            }
+        }
+
+        // Need the chunk data plus its trailing CRLF before consuming it.
+        if (data_start + size + 2 > input.len) return .{ .status = .need_more, .consumed = i };
+        if (input[data_start + size] != '\r' or input[data_start + size + 1] != '\n')
+            return .{ .status = .malformed };
+        if (out.items.len + size > max_body) return .{ .status = .too_large };
+        out.appendSlice(a, input[data_start .. data_start + size]) catch
+            return .{ .status = .too_large };
+        i = data_start + size + 2;
+    }
 }
 
 /// A response header to emit. Hop-by-hop framing headers
@@ -281,6 +354,70 @@ test "http1: chunked detected" {
     var store: [MAX_HEADERS]Header = undefined;
     const r = try parse("POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n", &store);
     try testing.expect(r.head.chunked);
+}
+
+test "http1: Expect: 100-continue detected" {
+    var store: [MAX_HEADERS]Header = undefined;
+    const r = try parse("POST / HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\nabc", &store);
+    try testing.expect(r.head.expect_continue);
+    const r2 = try parse("POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc", &store);
+    try testing.expect(!r2.head.expect_continue);
+}
+
+test "http1: decodeChunked assembles a complete body" {
+    const a = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    // "Wikipedia in\r\n\r\nchunks." classic example, two data chunks + zero.
+    const body = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+    const r = decodeChunked(body, 0, &out, a, 1 << 20);
+    try testing.expectEqual(ChunkStatus.complete, r.status);
+    try testing.expectEqual(body.len, r.consumed);
+    try testing.expectEqualStrings("Wikipedia", out.items);
+}
+
+test "http1: decodeChunked resumes across partial reads (O(n), no re-scan)" {
+    const a = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const full = "3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n";
+    // First read: only the first chunk + part of the second size line.
+    const r1 = decodeChunked(full[0..8], 0, &out, a, 1 << 20); // "3\r\nabc\r\n"
+    try testing.expectEqual(ChunkStatus.need_more, r1.status);
+    try testing.expectEqualStrings("abc", out.items);
+    // Resume from where it stopped with the full buffer.
+    const r2 = decodeChunked(full, r1.consumed, &out, a, 1 << 20);
+    try testing.expectEqual(ChunkStatus.complete, r2.status);
+    try testing.expectEqualStrings("abcdef", out.items);
+    try testing.expectEqual(full.len, r2.consumed);
+}
+
+test "http1: decodeChunked tolerates chunk extensions + trailers" {
+    const a = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const body = "4;name=value\r\nbody\r\n0\r\nX-Trailer: y\r\n\r\n";
+    const r = decodeChunked(body, 0, &out, a, 1 << 20);
+    try testing.expectEqual(ChunkStatus.complete, r.status);
+    try testing.expectEqualStrings("body", out.items);
+    try testing.expectEqual(body.len, r.consumed);
+}
+
+test "http1: decodeChunked enforces max_body (413)" {
+    const a = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const body = "5\r\nhello\r\n0\r\n\r\n";
+    const r = decodeChunked(body, 0, &out, a, 4); // body is 5 bytes, cap 4
+    try testing.expectEqual(ChunkStatus.too_large, r.status);
+}
+
+test "http1: decodeChunked rejects a bad size line (400)" {
+    const a = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    const r = decodeChunked("zz\r\nabc\r\n0\r\n\r\n", 0, &out, a, 1 << 20);
+    try testing.expectEqual(ChunkStatus.malformed, r.status);
 }
 
 test "http1: h2 preface is NotHttp1" {

@@ -1,9 +1,10 @@
 # V2 — HTTP/1.1 edge ingress (design)
 
-> **Status: phases 1–3 shipped (2026-06-07).** Codec + plaintext h1 ingress +
-> h1-over-TLS via ALPN are live in `rove-h2` and proven end-to-end (see Build
-> order). Phases 4–6 (chunked + 100-continue, the `:80` ACME listener,
-> WebSocket) remain. Adds HTTP/1.1 *ingress* to
+> **Status: phases 1–4 shipped (2026-06-07).** Codec + plaintext h1 ingress +
+> h1-over-TLS via ALPN + chunked-request decode & `100-continue` are live in
+> `rove-h2` and proven end-to-end (see Build order). Phases 5–6 (the `:80` ACME
+> listener, WebSocket) remain; chunked *response* is deferred to the
+> streaming-over-h1 integration. Adds HTTP/1.1 *ingress* to
 > `rove-h2` (today nghttp2/HTTP-2-only) so the edge can accept inbound traffic
 > from h1-only clients without Cloudflare in front. Amends an assumption in
 > [`v2-front-door-architecture.md`](v2-front-door-architecture.md) (which
@@ -149,8 +150,27 @@ The fork adds a per-connection **protocol mode**. `Conn` gains an
    conn, a **133 KB multi-record body** round-trips identically, `Connection:
    close` + `411` over TLS, server survives errors; plaintext phase-2
    unaffected.
-4. **Chunked transfer-encoding** (request + response) + `Expect: 100-continue`.
-   Most webhooks send `Content-Length`, so this is a fast-follow, not a blocker.
+4. ✅ **Chunked transfer-encoding (request) + `Expect: 100-continue`.** The codec
+   gains a resumable `decodeChunked` (`pos` in / `consumed` out, body assembled
+   into a caller-kept buffer so consumed chunks are never re-scanned — O(n)
+   across partial reads; chunk extensions + trailers tolerated; `max_body` →
+   413, bad framing → 400) and an `expect_continue` flag on `Head`. `Http1Conn`
+   carries the decode state (`chunk_body`/`chunk_pos`) + `continue_sent`;
+   `http1Drive` frames the body via chunked-or-Content-Length, resetting the
+   per-request state at emit. `http1MaybeContinue` answers `100 Continue` once,
+   at the edge, when an `Expect` request's body hasn't fully arrived — so the DP
+   never sees `Expect` (it's added to the hop-by-hop drop list alongside
+   `Transfer-Encoding`; the DP gets a fully-decoded body). Codec unit-tested
+   (`h1-test`: assemble, partial-read resume, extensions/trailers, 413, 400) +
+   proven against the echo examples: `curl -T -` chunked echo, a 266 KB chunked
+   body round-tripping across many reads, `Expect: 100-continue` (curl and a
+   staged raw socket showing the `100` sent *before* the body), keep-alive
+   mixing a chunked then a plain request on one socket, malformed→400, and a
+   66 KB chunked body over TLS. **Chunked *response* (output) is deferred** — the
+   buffered response path always knows its length so it emits `Content-Length`;
+   the only consumer of chunked output is a streaming handler over h1, which is
+   coupled to the `stream_response_in` subsystem (today an io-error degrade) and
+   belongs with that integration, not the codec.
 5. **Front-door `:80` plaintext listener** (ACME HTTP-01 + HTTP→HTTPS redirect),
    retiring the gap #3 slice-3 wrinkle — the h1 front answers `:80` directly.
 6. **(Later) WebSocket upgrade** — `101 Switching Protocols` + frame relay, the
