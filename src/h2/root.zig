@@ -1830,11 +1830,15 @@ pub fn H2(comptime opts: Options) type {
                                 self.allocator.free(output);
                             };
                         }
-                        // ALPN decides the protocol (Phase 3): an `http/1.1`
-                        // negotiation drives the h1 codec; anything else (`h2`
-                        // or no ALPN) keeps the nghttp2 path. Both decrypt their
-                        // first app-data flight from `decrypt_buf`.
-                        if (std.mem.eql(u8, tc.alpnProtocol(), "http/1.1")) {
+                        // ALPN decides the protocol (Phase 3): h2 is taken ONLY
+                        // when explicitly negotiated. h2-over-TLS requires ALPN
+                        // `h2` (RFC 7540 §3.4), so an h2 client always advertises
+                        // it — which means `http/1.1` OR no ALPN at all can only
+                        // be HTTP/1.1, and both route to the h1 codec. (HTTPS
+                        // predates ALPN; minimal/older h1 clients omit it.) Both
+                        // paths decrypt their first app-data flight from
+                        // `decrypt_buf`.
+                        if (!std.mem.eql(u8, tc.alpnProtocol(), "h2")) {
                             const h1c = Http1Conn.create(self.allocator) orelse {
                                 try self.reg.destroy(conn_ent.entity);
                                 try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
