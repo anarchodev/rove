@@ -138,7 +138,7 @@ front-door count == voter count (inverted scaling). **Done:**
 | Item | Status |
 |---|---|
 | No TLS/auth/413/429 **at the L4 ingress** | By design — ingress is L4 passthrough; the front door terminates TLS, the DP enforces rate/413 (gap #1 must land). |
-| Front-door response headers dropped (incl. content-type) | Explicit Phase-3 deferral (`front/main.zig:26-28`) — **mandatory before cutover** (content-type passthrough is not optional). |
+| Front-door response headers dropped (incl. content-type) | ✅ **RESOLVED** — `proxyToCluster` relays the backend's response headers (`packRespHeaders`: lowercased for h2, minus hop-by-hop + framing). Proven by `scripts/front_content_type_smoke.py` (a GET through the front carries the backend's `content-type`). |
 | Front-door connection pooling (one curl/request, sequential) | Explicit deferral (`front/main.zig:24-25`) — perf hardening. |
 | Cluster-scale live-traffic hibernation macrobench | Phase 6 follow-up — proof, not function. |
 | Shared-WAL segment GC + per-group compaction | `compact_wal=true` landed (`e0326cf`); segment GC still open. |
@@ -172,7 +172,8 @@ front-door count == voter count (inverted scaling). **Done:**
 5. ~~**Tenant provisioning + multi-node formation** (gaps #4, #5) — the
    create-a-new-tenant path end to end.~~ ✅ **SHIPPED** — `POST
    /_control/provision` (`cp_provision_smoke.py`, 3-node).
-6. **Front-door content-type passthrough** (🟡 but mandatory).
+6. ~~**Front-door content-type passthrough** (🟡 but mandatory).~~ ✅ **SHIPPED**
+   — `proxyToCluster` relays response headers (`front_content_type_smoke.py`).
 7. Then the `src-v2 → src` code-move cutover; fix `zig build test`; run hardening
    benches.
 
