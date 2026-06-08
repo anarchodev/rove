@@ -1,6 +1,8 @@
 # WebSocket plan — transport, handler shape, and the use cases it unlocks
 
-> **Status**: planned, not started — 2026-05-27. Consolidates the
+> **Status**: planned, not started. **Inbound model decided 2026-06-07 — see
+> §4.5** (DO-shaped; gap #6 dropped the cost to ~1–2 weeks; §4's 6–10-week
+> estimate is superseded). Originally consolidated 2026-05-27 from the
 > WebSocket-blocked items scattered across other docs (`connection-actor-plan.md`
 > §6.3 + §6.5, `effect-reification-plan.md` Phase 4.1.4 `conn_write`,
 > `primitive-gaps.md` §2.5 forward note, `streaming-handlers-plan.md`
@@ -166,8 +168,134 @@ routing rules.
 edge-proxy reality. Defer 4.1 until a customer asks for native h1
 hosting; defer 4.2 until Cloudflare or whoever stops downgrading.
 
-Estimated cost for 4.3: **6-10 weeks** including framing, ping/pong,
-fragmentation, smoke coverage.
+Estimated cost for 4.3: ~~**6-10 weeks**~~ → **superseded by §4.5.** The
+gap-#6 HTTP/1.1 edge work (2026-06-07) already built the h1 listener this
+estimate assumed from scratch, dropping the inbound cost to ~1–2 weeks. The
+DO-shaped model + revised plan is **§4.5**.
+
+## 4.5 The DO-shaped inbound model + post-gap-#6 plan (decided 2026-06-07)
+
+**Decision: build inbound WebSockets as the Cloudflare-Durable-Object shape.**
+A tenant is the object; its connections are held in the tenant's worker(s);
+durable state is the tenant's raft-backed KV; idle held connections ride
+Phase-6 hibernation. Fan-out splits cleanly into **point-to-point** (platform,
+node-local) and **broadcast** (a customer recipe on kv wakes) — and that split
+is *forced by the model*, not chosen (below). Cross-node held-state routing is
+never built.
+
+### Gap #6 already paid the transport cost
+
+§4 priced inbound at **6–10 weeks** because option 4.3 assumed building the
+origin h1 listener from scratch. **That listener now exists.** The gap-#6
+HTTP/1.1 edge work (2026-06-07, `docs/v2-edge-http1-ingress.md`) shipped, in
+`rove-h2` + `rewind-front`:
+
+- the h1 codec (`src/h2/http1.zig`: request parse + response serialize, chunked
+  decode/encode, unit-tested) — the `101` Upgrade rides an h1 request, and
+  `parseHead` already yields its headers + `Sec-WebSocket-Key`;
+- plaintext **and** TLS-via-ALPN h1 ingress (`Conn.h1`, the sniff/handshake
+  forks, `:scheme`);
+- chunked streaming responses with **backpressure** (`_stream_data_sending`
+  one-write-in-flight gate) — the exact outbound-frame write discipline a WS
+  connection needs;
+- the connection lifecycle (`Http1Conn`, keep-alive, idle GC, the
+  decrypt/encrypt seam, `http1Send`).
+
+So §4.3 ("origin runs an h2 listener + a small h1 listener that only handles
+Upgrade") is effectively done — *better* than 4.3, since h1 is inline in
+rove-h2, not a second listener. **Revised inbound estimate: medium (~1–2
+weeks)** — see §4.6.
+
+### Tenant = the Durable Object
+
+Cloudflare DO is single-object-affinity: one addressable instance, all its WS
+connections terminate there, that's where state lives. rove's "one tenant →
+one raft group → one serving worker" is the same shape, so a **tenant is the DO
+analog** — held connections in the tenant's worker(s), durable state in the
+tenant's KV, and idle held connections riding the Phase-6 hibernation
+active-set (the DO "WebSocket Hibernation" analog; rove already has the
+primitive). A held WS connection is a held stream chain (§5, unchanged):
+inbound frames are `inbound_chunk` Msgs, `disconnect` is a `disconnect` Msg,
+outbound frames are the `conn_write` Cmd. No new execution vocabulary.
+
+### Two fan-out operations, forced apart by the model
+
+| Operation | What | Mechanism | Scope | Owner |
+|---|---|---|---|---|
+| **point-to-point** | a chunk/disconnect/`send_callback` for *one* known continuation | holder locator (`worker_idx, slot, gen`) + cross-worker inbox | **same-node, cross-worker, same-tenant** | platform |
+| **broadcast** | push to *everyone* in a room | `on.kv` trigger + a durable write | any scale, **cross-node for free** | customer recipe |
+
+The runtime knows the target of a point-to-point wake (it owns the
+continuation), so it routes within the node — that is the only "held-state
+gap," and it is shared by every held primitive (fetch, subscribe, WS), not WS
+tax (`cross-worker-held-state-plan.md`; its locator is deliberately
+node-local). Broadcast is the opposite: the connection-actor model **never
+exposes a connection handle** (`connection-actor-unified-trigger.md`), so
+broadcast *cannot* be "enumerate the connections and push" — it must be pub-sub
+on a trigger. So broadcast is `on.kv`: subscribers park on a room key; a
+durable write fires the wake; because KV is raft-replicated, the write reaches
+every node and wakes parked continuations at apply-time — cross-node fan-out as
+a *consequence of replication*, not bespoke inter-node connection messaging.
+The hidden-handle rule guarantees there is no other way to broadcast anyway.
+
+### Durability: per-frame raft cost is opt-in, and batches via group-commit
+
+A frame costs a raft round-trip **iff its handler activation commits a
+non-empty writeset** — that is the whole rule. So:
+
+- **Ephemeral frame** = empty writeset = zero raft + moot-on-loss: cursor /
+  presence / typing / live-pointer broadcasts, pure read-and-reply, fan-out to
+  other live sockets (a connection-actor write, not a KV write). If the holding
+  worker dies the frame is lost — but the socket died with it, so it is
+  consistent precisely *because* it promised nothing durable.
+- **Durable frame** = non-empty writeset: a persisted chat message, a committed
+  CRDT op, or a durable effect (whose owed-marker is itself a KV write).
+
+To avoid one raft round-trip per durable frame, coalesce via the connection
+actor's **coalesced trigger**: while batch K's commit is in flight, arriving
+frames queue on the actor (they do not each fire an activation); on commit they
+become batch K+1, delivered as one activation (`frames: [...]`) → one writeset
+→ one raft entry. **Load-adaptive, no tuning knob:** light load → batch-of-1
+(minimum latency); heavy load → the batch grows to cover one RTT's arrivals
+(the round-trip is hidden). Because V2 is one raft group per tenant, the
+coalescing is **across a tenant's connections**, not just within one socket —
+a busy room amortizes through its one group. Durability acks are necessarily
+batch-granular (you can only ack after the commit), so the WS protocol must not
+promise per-frame durability before that commit. The atomicity boundary is
+**explicit in the handler shape** (`frames: [...]`), mirroring outbound
+`__rove_stream({write: [...frames]})` — transparent group-commit is rejected
+(it fights the unanswerable "is activation K durable yet?").
+
+### Non-goals — DO-model-specific (extend §7)
+
+- **Cross-node point-to-point held-state routing.** Never. A wake for a
+  *specific* held connection routes only within its node; cross-node fan-out is
+  always the broadcast (kv-wake) path, never a connection fabric.
+- **A platform broadcast/enumeration API.** Forced out by the hidden-handle
+  rule. Cross-tenant / cross-node / large-room fan-out is the customer's
+  kv-wake recipe. A `channel.js` / `room.js` shim (pure sugar over `on.kv` + a
+  durable write, à la `webhook.send`) may follow **once a common shape emerges
+  from real use** — defer per `compose_from_primitives`.
+- **Per-tenant scale beyond its worker via a fabric.** A tenant whose
+  connection load exceeds one worker shards via the kv-wake recipe (as you
+  shard a DO), not a platform fabric — the same ceiling DO has.
+
+## 4.6 Build decomposition + sizing (revised — on the gap-#6 substrate)
+
+| # | Piece | Size | Notes |
+|---|---|---|---|
+| A | `101` Upgrade handshake | **small** (~50 LOC) | `parseHead` gives the headers; `Sec-WebSocket-Accept` = SHA1(key+magic GUID)→base64 (std.crypto). Reply via the h1 serializer. |
+| B | RFC 6455 frame codec (`src/h2/ws.zig`) | **medium-small** (~400 LOC + tests) | pure parse/serialize: opcode, FIN, mask bit, 7/16/64-bit length, unmask, fragmentation/continuation, ping/pong/close. A self-contained table-tested file like `http1.zig`. The bulk of genuinely new code. |
+| C | connection mode switch on `Conn` | **small-medium** | a third branch alongside the `h1` fork in `readsFeedData` / the response path — accumulation buffer, TLS decrypt, the backpressure write machinery are all reused from gap #6. |
+| D | frame → activation | **medium** (softest estimate) | wire the frame producer into the shipped `inbound_chunk` / held-stream seam (the same one `http.subscribe`'s `on_chunk` uses). Re-read this seam before committing a number. |
+| E | `conn_write` Cmd executor | **medium** | the reserved Phase-4.1.4 slot → serialize frames + push to the backpressure-gated outbound path. |
+| (shared) | same-node cross-worker held-state locator | **medium, not WS-specific** | `cross-worker-held-state-plan.md`; needed by every held primitive. Amortized, not WS tax. |
+
+**Net platform commitment for DO-parity inbound WS: medium (~1–2 weeks)** on
+the gap-#6 substrate, dominated by the pure frame codec (B). Broadcast is docs
+(the kv-wake recipe). The one dependency to verify first is whether kv-wakes
+fire at **apply-time on every node** (they must, for the broadcast recipe to
+cross nodes) vs propose-time on the leader only — a quick read, load-bearing.
 
 ## 5. Handler execution model — already shipped, recap
 
@@ -231,6 +359,14 @@ collab).
   (atproto repo commits, chat messages).
 - **Reconnect / cursor policy.** Customer composes via kv per the
   framework principle. No platform-managed cursor store.
+- ~~**Cross-worker / cross-node fan-out.**~~ **RESOLVED in §4.5:**
+  point-to-point wakes route node-local (platform); broadcast is the customer's
+  `on.kv` recipe (cross-node for free); cross-node held-state routing is never
+  built. The hidden-handle rule forces broadcast onto pub-sub.
+- ~~**Inbound durability per frame.**~~ **RESOLVED in §4.5:** a frame costs
+  raft iff its activation writes; ephemeral frames are free + moot-on-loss;
+  durable frames coalesce via the connection actor's trigger into one
+  group-committed raft entry, load-adaptively.
 
 ## 9. Relation to other docs
 
