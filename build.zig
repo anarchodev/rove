@@ -1121,6 +1121,7 @@ pub fn build(b: *std.Build) void {
     cp_mod.addImport("rove-blob", blob_mod);
     cp_mod.addImport("cp-directory", v2_cp_dir_mod);
     cp_mod.addImport("bridge", v2_bridge_mod);
+    cp_mod.addImport("rove-acme", acme_mod);
     cp_mod.link_libc = true;
     cp_mod.linkSystemLibrary("nghttp2", .{});
     cp_mod.linkSystemLibrary("ssl", .{});
