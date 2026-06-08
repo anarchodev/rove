@@ -22,8 +22,9 @@
 //!     the single-threaded h2 poll loop; connection pooling + concurrency is
 //!     a noted deferral. Horizontal scaling is multiple front-door processes
 //!     (SO_REUSEPORT) behind the L4 ingress, not threads.
-//!   - **Status + body passthrough only.** Response headers (incl.
-//!     content-type) are dropped for now — a follow-up before cutover.
+//!   - **Status + headers + body passthrough.** The backend's response
+//!     headers (content-type et al.) are relayed (`packRespHeaders`),
+//!     lowercased for h2, minus hop-by-hop + framing headers.
 //!   - **h2c.** Public TLS termination is a later slice; today the front door
 //!     speaks h2c and assumes TLS is terminated upstream.
 
@@ -434,6 +435,7 @@ const Router = struct {
         var relay_status: u16 = 502;
         var relay_data: ?[*]u8 = null;
         var relay_len: u32 = 0;
+        var relay_headers: h2.RespHeaders = .{ .fields = null, .count = 0 };
 
         for (nodes, 0..) |node_base, ni| {
             const last = ni + 1 == nodes.len;
@@ -476,6 +478,9 @@ const Router = struct {
                     relay_len = @intCast(bdy.len);
                 }
             }
+            // Relay the backend's response headers (content-type et al.). Packed
+            // into its own buffer, so it survives `resp.deinit` at loop end.
+            relay_headers = packRespHeaders(a, resp.headers) catch .{ .fields = null, .count = 0 };
             have_resp = true;
             break;
         }
@@ -485,7 +490,7 @@ const Router = struct {
             return 502;
         }
         try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = relay_status });
-        try server.reg.set(ent, &server.request_out, h2.RespHeaders, .{ .fields = null, .count = 0 });
+        try server.reg.set(ent, &server.request_out, h2.RespHeaders, relay_headers);
         try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = relay_data, .len = relay_len });
         try server.reg.set(ent, &server.request_out, h2.H2IoResult, .{ .err = 0 });
         try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
@@ -546,6 +551,56 @@ fn packRespHeader(a: std.mem.Allocator, name: []const u8, value: []const u8) !h2
     @memcpy(sb[name.len .. name.len + value.len], value);
     fields[0] = .{ .name = sb, .name_len = @intCast(name.len), .value = sb + name.len, .value_len = @intCast(value.len) };
     return .{ .fields = fields, .count = 1, ._buf = buf.ptr, ._buf_len = @intCast(total) };
+}
+
+/// A response header that must NOT be relayed through the proxy: connection-
+/// specific (hop-by-hop) headers, plus framing headers the h2/h1 response layer
+/// owns (`content-length` — nghttp2 frames DATA / the h1 serializer recomputes
+/// it from the buffered body; `transfer-encoding` — chunked is the h1 codec's,
+/// never crosses to h2). `:status` is the status line, not a header here.
+fn dropFromResponse(name: []const u8) bool {
+    return isHopByHop(name) or
+        std.ascii.eqlIgnoreCase(name, "content-length") or
+        (name.len > 0 and name[0] == ':');
+}
+
+/// Pack a backend's response headers into the `h2.RespHeaders` layout (one
+/// buffer: field array + name/value bytes, freed by `RespHeaders.deinit`).
+/// Names are lowercased — HTTP/2 requires lowercase field names, and the h1
+/// codec is case-insensitive — so `content-type` et al. survive the proxy hop.
+/// Hop-by-hop + framing headers are dropped. Empty result ⇒ null fields.
+fn packRespHeaders(a: std.mem.Allocator, headers: []const curl.Header) !h2.RespHeaders {
+    const HF = h2.HeaderField;
+    var n: usize = 0;
+    var strbytes: usize = 0;
+    for (headers) |h| {
+        if (dropFromResponse(h.name)) continue;
+        n += 1;
+        strbytes += h.name.len + h.value.len;
+    }
+    if (n == 0) return .{ .fields = null, .count = 0 };
+
+    const fields_size = n * @sizeOf(HF);
+    const total = fields_size + strbytes;
+    const buf = try a.alloc(u8, total);
+    const fields: [*]HF = @ptrCast(@alignCast(buf.ptr));
+    const sb = buf.ptr + fields_size;
+
+    var soff: usize = 0;
+    var fi: usize = 0;
+    for (headers) |h| {
+        if (dropFromResponse(h.name)) continue;
+        const noff = soff;
+        @memcpy(sb[noff .. noff + h.name.len], h.name);
+        for (sb[noff .. noff + h.name.len]) |*ch| ch.* = std.ascii.toLower(ch.*);
+        soff += h.name.len;
+        const voff = soff;
+        @memcpy(sb[voff .. voff + h.value.len], h.value);
+        soff += h.value.len;
+        fields[fi] = .{ .name = sb + noff, .name_len = @intCast(h.name.len), .value = sb + voff, .value_len = @intCast(h.value.len) };
+        fi += 1;
+    }
+    return .{ .fields = fields, .count = @intCast(n), ._buf = buf.ptr, ._buf_len = @intCast(total) };
 }
 
 /// Reply with status + headers + (optional, owned) body. Mirrors
