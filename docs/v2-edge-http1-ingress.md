@@ -1,6 +1,9 @@
 # V2 — HTTP/1.1 edge ingress (design)
 
-> **Status: design (2026-06-07). Not built.** Adds HTTP/1.1 *ingress* to
+> **Status: phases 1–2 shipped (2026-06-07).** Codec + plaintext h1 ingress are
+> live in `rove-h2` and proven end-to-end (see Build order). Phases 3–6
+> (h1-over-TLS via ALPN, chunked, the `:80` ACME listener, WebSocket) remain.
+> Adds HTTP/1.1 *ingress* to
 > `rove-h2` (today nghttp2/HTTP-2-only) so the edge can accept inbound traffic
 > from h1-only clients without Cloudflare in front. Amends an assumption in
 > [`v2-front-door-architecture.md`](v2-front-door-architecture.md) (which
@@ -99,16 +102,29 @@ The fork adds a per-connection **protocol mode**. `Conn` gains an
 
 ## Build order
 
-1. **`src/h2/http1.zig` — the codec (no I/O).** A request parser (request line
+1. ✅ **`src/h2/http1.zig` — the codec (no I/O).** A request parser (request line
    → `:method`/`:path`; headers → fields + synthesized `:authority` from `Host`,
    `:scheme`; body via `Content-Length`) and a response serializer (status line
    + headers + content-length + body; `Connection` keep-alive/close). Pure +
-   table-unit-tested. **This is the self-contained first step.**
-2. **Plaintext h1 ingress.** `Conn.h1`; in `readsFeedData`, a plaintext-sniffed
-   h1 first-read opens an `Http1Conn` (instead of the `426`) and drives the
-   parser; an h1 response path serializes + writes. Keep-alive across requests.
-   Smoke: `curl --http1.1` (no `--http2-prior-knowledge`) against an h2c
-   listener gets a real response.
+   table-unit-tested (`zig build h1-test`). **The self-contained first step.**
+   *(commit `6bff631`.)*
+2. ✅ **Plaintext h1 ingress.** `Conn.h1: ?*Http1Conn` (mutually exclusive with
+   `ng_session`); in `readsFeedData`, a plaintext-sniffed h1 first-read swaps the
+   eagerly-created (unused) nghttp2 session for an `Http1Conn` (`http1SwapIn`,
+   replacing the old `426`) and drives the parser (`http1Feed`/`http1Drive`); a
+   complete head+body emits the same `request_out` entity with synthesized
+   pseudo-headers (`http1BuildReqHeaders`, `StreamId = 1`). `consumeResponses`
+   forks on `conn_ptr.h1` to serialize + `submitWrite` (`http1WriteResponse`),
+   honoring keep-alive (compact buffer, re-drive for a coalesced next request)
+   vs `Connection: close`. Malformed/`411` chunked/missing-`Host`/`413`
+   over-cap (`Http1Conn.MAX_BODY_BYTES = 16 MiB`) all return a real status +
+   close (`http1ErrorClose`). Streaming responses over h1 (the
+   `stream_response_in` path) safely degrade to an io-error until Phase 4.
+   Proven against the h2c echo example (`zig build h2-echo-server`): `curl
+   --http1.1` POST/GET echo, keep-alive connection reuse (two distinct requests,
+   one socket), 21 KB multi-read body round-trip, `Connection: close`, HTTP/1.0
+   close-default, and the `400/411` error paths — all green, with
+   `--http2-prior-knowledge` h2 unaffected.
 3. **h1 over TLS (ALPN).** Advertise `http/1.1`; route ALPN-h1 connections to
    the codec (decrypt → parse; serialize → encrypt). Smoke: `curl --http1.1`
    over TLS; `openssl s_client -alpn http/1.1`.

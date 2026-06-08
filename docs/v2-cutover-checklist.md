@@ -74,12 +74,12 @@ host axis test; `tenant_move_smoke` confirms the front-door routing path.
      selection, certs synced from the CP (`h2/tls.zig` `putHostCertInMemory` +
      front `CertSync`); front-door → DP stays private h2c. `cp_tls_edge_smoke`.
    - ⏳ **Slice 3 — one leader-elected ACME issuer** (HTTP-01), evolved from
-     `loop46/acme.zig`, writing the CP cert axis. **Open wiring wrinkle:** the
+     `loop46/acme.zig`, writing the CP cert axis. ~~**Open wiring wrinkle:** the
      HTTP-01 `:80` responder is HTTP/1.1, but the front door is nghttp2
-     (h2-only) — so "front forwards `/.well-known/acme-challenge/*` to the CP
-     issuer" needs an HTTP/1.1 `:80` listener somewhere. Cleanest is the CP's
-     responder binds `:80` (L4 routes `:80` → CP); the front-forward path needs
-     an h1 shim on the front. To resolve before building slice 3.
+     (h2-only)…~~ **Resolved by gap #6:** `rove-h2` now accepts plaintext
+     HTTP/1.1 ingress (`v2-edge-http1-ingress.md` phases 1–2, shipped), so the
+     front door answers `:80` `/.well-known/acme-challenge/*` natively — no
+     separate h1 shim. Gap #6 phase 5 wires the `:80` listener + the redirect.
    - ⏸ **Slice 4 — DNS-01 wildcard** deferred (provider-specific; wildcard via
      manual `/_control/cert` for now).
    - V1 ACME (`src/acme/` Client + Responder + crypto) is **evolved + re-homed,

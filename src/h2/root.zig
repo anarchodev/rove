@@ -7,6 +7,7 @@ const Registry = rove.Registry;
 const Entity = rove.Entity;
 pub const tls = @import("tls.zig");
 pub const TlsConfig = tls.TlsConfig;
+pub const http1 = @import("http1.zig");
 
 const c = @cImport({
     @cInclude("nghttp2/nghttp2.h");
@@ -115,9 +116,19 @@ pub const Conn = struct {
     /// sniff: only the first read can possibly be a non-h2 protocol;
     /// later frames may have arbitrary leading bytes.
     first_read_seen: bool = false,
+    /// HTTP/1.1 connection state, mutually exclusive with `ng_session`.
+    /// Set when the first-read sniff (or, in a later phase, ALPN) routes
+    /// a server connection to the h1 codec instead of nghttp2. While this
+    /// is non-null the connection is driven entirely by `http1Feed` /
+    /// `http1WriteResponse` (docs/v2-edge-http1-ingress.md).
+    h1: ?*Http1Conn = null,
 
     pub fn deinit(_: std.mem.Allocator, items: []Conn) void {
         for (items) |*item| {
+            if (item.h1) |h1c| {
+                h1c.free();
+                item.h1 = null;
+            }
             if (item.ng_session) |session| {
                 _ = c.nghttp2_session_terminate_session(session, c.NGHTTP2_NO_ERROR);
                 while (c.nghttp2_session_want_write(session) != 0) {
@@ -137,6 +148,44 @@ pub const Conn = struct {
                 item.tls_conn = null;
             }
         }
+    }
+};
+
+/// Per-connection HTTP/1.1 state (docs/v2-edge-http1-ingress.md, Phase 2).
+/// Accumulates inbound bytes, drives the pure `http1` codec, and tracks the
+/// single in-flight request (no pipelining). Heap-owned; freed by `Conn.deinit`.
+pub const Http1Conn = struct {
+    allocator: std.mem.Allocator,
+    /// Inbound bytes not yet fully consumed by an emitted request. The head of
+    /// a complete request is dropped (compacted out) at emit time; any trailing
+    /// bytes (a coalesced next request) stay buffered until the response drains.
+    buf: std.ArrayList(u8),
+    /// True while a request entity is emitted and awaiting its response. No
+    /// second request is parsed until the first responds.
+    in_flight: bool = false,
+    /// Keep-alive decision captured from the in-flight request's head, applied
+    /// when its response is serialized.
+    keep_alive: bool = true,
+    /// Set once a response with `Connection: close` (or a fatal error response)
+    /// has been queued; the connection is reaped by the idle-timeout GC after
+    /// the write drains (same path the old 426 used).
+    closing: bool = false,
+
+    /// Hard ceiling on a buffered request body at the edge. Per-tenant plan
+    /// limits (gap #1, 413) are enforced in the DP worker; this is the coarse
+    /// front-door backstop against an unbounded `Content-Length` OOM-ing the
+    /// proxy before the request ever reaches a tenant.
+    pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+    fn create(allocator: std.mem.Allocator) ?*Http1Conn {
+        const h = allocator.create(Http1Conn) catch return null;
+        h.* = .{ .allocator = allocator, .buf = .empty };
+        return h;
+    }
+
+    fn free(self: *Http1Conn) void {
+        self.buf.deinit(self.allocator);
+        self.allocator.destroy(self);
     }
 };
 
@@ -1241,6 +1290,16 @@ pub fn H2(comptime opts: Options) type {
                     continue;
                 };
 
+                // HTTP/1.1 connection (Phase 2): serialize + write via the h1
+                // codec instead of nghttp2.
+                if (conn_ptr.h1) |h1c| {
+                    self.http1WriteResponse(ent, sess.entity, h1c, status, rh, rb, io_res) catch {
+                        io_res.err = -1;
+                        try self.reg.move(ent, &self.response_in, &self.response_out);
+                    };
+                    continue;
+                }
+
                 if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
                     try self.reg.move(ent, &self.response_in, &self.response_out);
@@ -1804,6 +1863,262 @@ pub fn H2(comptime opts: Options) type {
         }
 
         // =============================================================
+        // HTTP/1.1 ingress (docs/v2-edge-http1-ingress.md, Phase 2)
+        // =============================================================
+
+        /// A plaintext server connection's first read looked like HTTP/1.x.
+        /// Tear down the eagerly-created (unused — no bytes fed) nghttp2
+        /// session and swap in an `Http1Conn`. Returns null only on OOM.
+        fn http1SwapIn(self: *Self, conn_ptr: *Conn) ?*Http1Conn {
+            if (conn_ptr.ng_session) |session| {
+                c.nghttp2_session_del(session);
+                conn_ptr.ng_session = null;
+            }
+            if (conn_ptr.ng_ctx) |ctx| {
+                if (conn_ptr.ng_ctx_destroy) |destroy_fn| destroy_fn(ctx);
+                conn_ptr.ng_ctx = null;
+                conn_ptr.ng_ctx_destroy = null;
+            }
+            const h1c = Http1Conn.create(self.allocator) orelse return null;
+            conn_ptr.h1 = h1c;
+            return h1c;
+        }
+
+        /// Append freshly-read plaintext bytes to the h1 buffer and drive the
+        /// parser. Any failure surfaces as an error response + close rather
+        /// than a silent drop.
+        fn http1Feed(self: *Self, h1c: *Http1Conn, conn_entity: Entity, bytes: []const u8) void {
+            if (h1c.closing) return;
+            h1c.buf.appendSlice(self.allocator, bytes) catch {
+                self.http1ErrorClose(h1c, conn_entity, 500);
+                return;
+            };
+            self.http1Drive(h1c, conn_entity);
+        }
+
+        /// Parse as much of the buffer as possible, emitting at most one request
+        /// (no pipelining). Called after a read and after a keep-alive response
+        /// drains (to pick up a coalesced next request).
+        fn http1Drive(self: *Self, h1c: *Http1Conn, conn_entity: Entity) void {
+            if (h1c.in_flight or h1c.closing) return;
+
+            var store: [http1.MAX_HEADERS]http1.Header = undefined;
+            const res = http1.parseHead(h1c.buf.items, &store) catch |err| {
+                const status: u16 = switch (err) {
+                    error.HeadTooLarge => 431,
+                    error.Malformed => 400,
+                    // An h2 preface on an h1 conn should be impossible (we sniff
+                    // before swapping in), but refuse it loudly rather than hang.
+                    error.NotHttp1 => 400,
+                };
+                self.http1ErrorClose(h1c, conn_entity, status);
+                return;
+            };
+
+            const head = switch (res) {
+                .need_more => return,
+                .head => |h| h,
+            };
+
+            // Chunked decoding is Phase 4; until then a chunked request is a
+            // 411 (Length Required) rather than a misframe.
+            if (head.chunked) {
+                self.http1ErrorClose(h1c, conn_entity, 411);
+                return;
+            }
+            // HTTP/1.1 requires Host; without it there's no `:authority`.
+            if (head.host == null) {
+                self.http1ErrorClose(h1c, conn_entity, 400);
+                return;
+            }
+
+            const body_len = head.content_length orelse 0;
+            if (body_len > Http1Conn.MAX_BODY_BYTES) {
+                self.http1ErrorClose(h1c, conn_entity, 413);
+                return;
+            }
+            const total = head.head_len + body_len;
+            if (h1c.buf.items.len < total) return; // body still arriving
+
+            const body = h1c.buf.items[head.head_len..total];
+            self.http1EmitRequest(conn_entity, head, body) catch {
+                self.http1ErrorClose(h1c, conn_entity, 503);
+                return;
+            };
+            h1c.keep_alive = head.keep_alive;
+            h1c.in_flight = true;
+
+            // Drop the consumed request from the front of the buffer; the body
+            // bytes are now owned by the request entity. Any trailing bytes
+            // (a coalesced next request) stay buffered for after the response.
+            const leftover = h1c.buf.items.len - total;
+            if (leftover > 0) {
+                std.mem.copyForwards(u8, h1c.buf.items[0..leftover], h1c.buf.items[total..]);
+            }
+            h1c.buf.shrinkRetainingCapacity(leftover);
+        }
+
+        /// Build a `request_out` entity from a parsed h1 head + body, synthesizing
+        /// the h2-style pseudo-headers so all downstream routing/dispatch is
+        /// protocol-agnostic. `StreamId` is the synthetic 1 (one request/conn).
+        fn http1EmitRequest(self: *Self, conn_entity: Entity, head: http1.Head, body: []const u8) !void {
+            const req_entity = try self.reg.create(&self.request_out);
+            errdefer self.reg.destroy(req_entity) catch {};
+
+            try self.reg.set(req_entity, &self.request_out, StreamId, .{ .id = 1 });
+            try self.reg.set(req_entity, &self.request_out, Session, .{ .entity = conn_entity });
+
+            const rh = try self.http1BuildReqHeaders(head, "http");
+            try self.reg.set(req_entity, &self.request_out, ReqHeaders, rh);
+
+            var body_data: ?[*]u8 = null;
+            if (body.len > 0) {
+                const copy = try self.allocator.dupe(u8, body);
+                body_data = copy.ptr;
+            }
+            try self.reg.set(req_entity, &self.request_out, ReqBody, .{ .data = body_data, .len = @intCast(body.len) });
+        }
+
+        /// True for HTTP/1 connection-specific (hop-by-hop) headers that must not
+        /// cross into the h2-style representation, plus `Host` (→ `:authority`).
+        fn http1IsHopByHop(name: []const u8) bool {
+            const drop = [_][]const u8{
+                "host",          "connection", "keep-alive",
+                "transfer-encoding", "upgrade",  "proxy-connection",
+            };
+            for (drop) |d| if (std.ascii.eqlIgnoreCase(name, d)) return true;
+            return false;
+        }
+
+        /// Pack a parsed h1 head into an `h2.ReqHeaders` — four synthesized
+        /// pseudo-headers followed by the request's end-to-end headers
+        /// (names lowercased to match h2/handler lookups). One combined buffer
+        /// holds the field array + name/value bytes, freed by `ReqHeaders.deinit`.
+        fn http1BuildReqHeaders(self: *Self, head: http1.Head, scheme: []const u8) !ReqHeaders {
+            const Pair = struct { name: []const u8, value: []const u8 };
+            const pseudo = [_]Pair{
+                .{ .name = ":method", .value = head.method },
+                .{ .name = ":path", .value = head.target },
+                .{ .name = ":scheme", .value = scheme },
+                .{ .name = ":authority", .value = head.host orelse "" },
+            };
+
+            var n: usize = pseudo.len;
+            var strbytes: usize = 0;
+            for (pseudo) |p| strbytes += p.name.len + p.value.len;
+            for (head.headers) |hh| {
+                if (http1IsHopByHop(hh.name)) continue;
+                n += 1;
+                strbytes += hh.name.len + hh.value.len;
+            }
+
+            const fields_size = n * @sizeOf(HeaderField);
+            const total = fields_size + strbytes;
+            const buf = try self.allocator.alloc(u8, total);
+            const fields: [*]HeaderField = @ptrCast(@alignCast(buf.ptr));
+            const strbase = buf.ptr + fields_size;
+
+            var soff: usize = 0;
+            var fi: usize = 0;
+            const writeField = struct {
+                fn go(f: [*]HeaderField, sb: [*]u8, off: *usize, idx: *usize, name: []const u8, value: []const u8, lower: bool) void {
+                    const noff = off.*;
+                    @memcpy(sb[noff .. noff + name.len], name);
+                    if (lower) for (sb[noff .. noff + name.len]) |*ch| {
+                        ch.* = std.ascii.toLower(ch.*);
+                    };
+                    off.* += name.len;
+                    const voff = off.*;
+                    @memcpy(sb[voff .. voff + value.len], value);
+                    off.* += value.len;
+                    f[idx.*] = .{
+                        .name = sb + noff,
+                        .name_len = @intCast(name.len),
+                        .value = sb + voff,
+                        .value_len = @intCast(value.len),
+                    };
+                    idx.* += 1;
+                }
+            }.go;
+
+            for (pseudo) |p| writeField(fields, strbase, &soff, &fi, p.name, p.value, false);
+            for (head.headers) |hh| {
+                if (http1IsHopByHop(hh.name)) continue;
+                writeField(fields, strbase, &soff, &fi, hh.name, hh.value, true);
+            }
+
+            return .{ .fields = fields, .count = @intCast(n), ._buf = buf.ptr, ._buf_len = @intCast(total) };
+        }
+
+        /// Serialize a minimal error response (empty body) and close the
+        /// connection — used for malformed/unsupported/over-cap requests.
+        fn http1ErrorClose(self: *Self, h1c: *Http1Conn, conn_entity: Entity, status: u16) void {
+            if (h1c.closing) return;
+            h1c.closing = true;
+            h1c.keep_alive = false;
+            var out: std.ArrayList(u8) = .empty;
+            http1.writeResponse(&out, self.allocator, status, &.{}, "", false) catch {
+                out.deinit(self.allocator);
+                return;
+            };
+            const data = out.toOwnedSlice(self.allocator) catch {
+                out.deinit(self.allocator);
+                return;
+            };
+            self.submitWrite(conn_entity, data) catch self.allocator.free(data);
+        }
+
+        /// Serialize a deployed-handler response over h1 and queue the write.
+        /// Honors keep-alive (drive the next buffered request) vs close.
+        fn http1WriteResponse(
+            self: *Self,
+            ent: Entity,
+            conn_entity: Entity,
+            h1c: *Http1Conn,
+            status: Status,
+            rh: RespHeaders,
+            rb: RespBody,
+            io_res: *H2IoResult,
+        ) !void {
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(self.allocator);
+
+            // Translate h2 RespHeaders → h1 RespHeader slices. `:status` and the
+            // framing headers are owned by the serializer, so skip pseudo-headers.
+            var hdr_store: [http1.MAX_HEADERS]http1.RespHeader = undefined;
+            var hn: usize = 0;
+            if (rh.fields) |rfields| {
+                for (rfields[0..rh.count]) |f| {
+                    const name = f.name[0..f.name_len];
+                    if (name.len > 0 and name[0] == ':') continue; // pseudo
+                    if (hn >= hdr_store.len) break;
+                    hdr_store[hn] = .{ .name = name, .value = f.value[0..f.value_len] };
+                    hn += 1;
+                }
+            }
+
+            const body = if (rb.data) |d| d[0..rb.len] else "";
+            try http1.writeResponse(&out, self.allocator, status.code, hdr_store[0..hn], body, h1c.keep_alive);
+            const data = try out.toOwnedSlice(self.allocator);
+            self.submitWrite(conn_entity, data) catch |err| {
+                self.allocator.free(data);
+                return err;
+            };
+
+            io_res.err = 0;
+            try self.reg.move(ent, &self.response_in, &self.response_out);
+
+            if (h1c.keep_alive) {
+                h1c.in_flight = false;
+                self.http1Drive(h1c, conn_entity);
+            } else {
+                // Connection: close — let the idle-timeout GC reap once the write
+                // drains (same proven path as the old 426 reply).
+                h1c.closing = true;
+            }
+        }
+
+        // =============================================================
         // Helper: submit a write entity
         // =============================================================
 
@@ -1851,6 +2166,19 @@ pub fn H2(comptime opts: Options) type {
                     continue;
                 };
 
+                // HTTP/1.1 connection (Phase 2, plaintext): feed bytes to the h1
+                // codec instead of nghttp2. Runs before the ng_session guard
+                // since an h1 conn has no session.
+                if (conn_ptr.h1) |h1c| {
+                    if (rr.data) |data_ptr| {
+                        const data_len: usize = @intCast(rr.result);
+                        if (data_len > 0) self.http1Feed(h1c, conn_ent.entity, data_ptr[0..data_len]);
+                        conn_ptr.last_active_ns = monotonicNs();
+                    }
+                    try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                    continue;
+                }
+
                 if (conn_ptr.ng_session == null) {
                     try self.reg.move(ent, &self._read_active, &self.io.read_in);
                     continue;
@@ -1876,44 +2204,24 @@ pub fn H2(comptime opts: Options) type {
                             }
                         }
                     } else {
-                        // Plaintext server connections: sniff for an
-                        // HTTP/1.x request on the very first read. Without
-                        // this, nghttp2 rejects non-h2 bytes and we close
-                        // silently — the client sees "empty reply", the
-                        // operator sees nothing in the log. Sending a 426
-                        // back makes the protocol mismatch obvious to both.
+                        // Plaintext server connections: sniff for an HTTP/1.x
+                        // request on the very first read. nghttp2 would reject
+                        // non-h2 bytes and we'd close silently; instead route
+                        // the connection to the h1 codec (Phase 2,
+                        // docs/v2-edge-http1-ingress.md). Only the first read
+                        // can be a non-h2 preface, so the sniff is gated on
+                        // first_read_seen.
                         if (conn_ptr.direction == .server and !conn_ptr.first_read_seen and
                             data_len > 0 and looksLikeHttp1Request(data_ptr[0..data_len]))
                         {
-                            const resp =
-                                "HTTP/1.1 426 Upgrade Required\r\n" ++
-                                "Connection: Upgrade, close\r\n" ++
-                                "Upgrade: h2c\r\n" ++
-                                "Content-Type: text/plain\r\n" ++
-                                "Content-Length: 70\r\n" ++
-                                "\r\n" ++
-                                "this server speaks HTTP/2 only; retry with --http2-prior-knowledge\n";
-                            std.log.warn("rove-h2: HTTP/1.x request rejected on plaintext h2 listener (sent 426 Upgrade Required)", .{});
-                            const copy = self.allocator.dupe(u8, resp) catch {
-                                try self.reg.destroy(conn_ent.entity);
-                                try self.reg.move(ent, &self._read_active, &self.io.read_in);
-                                continue;
-                            };
-                            self.submitWrite(conn_ent.entity, copy) catch {
-                                self.allocator.free(copy);
-                                try self.reg.destroy(conn_ent.entity);
-                                try self.reg.move(ent, &self._read_active, &self.io.read_in);
-                                continue;
-                            };
-                            // Don't destroy the conn entity here — that
-                            // would cancel the queued write before
-                            // io_uring submits it. The client gets the
-                            // 426 (with Connection: close), closes from
-                            // their end, and the idle-timeout path GCs
-                            // the connection. Mark first_read_seen so
-                            // any further reads on this conn (there
-                            // shouldn't be) don't re-fire the sniff.
                             conn_ptr.first_read_seen = true;
+                            const h1c = self.http1SwapIn(conn_ptr) orelse {
+                                try self.reg.destroy(conn_ent.entity);
+                                try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                                continue;
+                            };
+                            self.http1Feed(h1c, conn_ent.entity, data_ptr[0..data_len]);
+                            conn_ptr.last_active_ns = monotonicNs();
                             try self.reg.move(ent, &self._read_active, &self.io.read_in);
                             continue;
                         }
