@@ -182,6 +182,13 @@ pub const Http1Conn = struct {
     /// head went out with `Transfer-Encoding: chunked` and body pieces are being
     /// written as chunks. Cleared at the terminating zero-chunk.
     streaming: bool = false,
+    /// Backpressure: the stream entity parked in `_stream_data_sending` whose
+    /// chunk (or head) write is in flight. Released back to `stream_data_out`
+    /// (the worker's "push the next piece" signal) only when that write drains
+    /// to the socket — so exactly one write is outstanding per stream, which
+    /// both paces the producer and keeps the chunks correctly ordered on the
+    /// wire. `nil` when no write is in flight.
+    sending_entity: Entity = Entity.nil,
 
     /// Hard ceiling on a buffered request body at the edge. Per-tenant plan
     /// limits (gap #1, 413) are enforced in the DP worker; this is the coarse
@@ -2285,7 +2292,11 @@ pub fn H2(comptime opts: Options) type {
             self.http1Send(conn_ptr, conn_entity, data);
             h1c.streaming = true;
             io_res.err = 0;
-            try self.reg.move(ent, &self.stream_response_in, &self.stream_data_out);
+            // Backpressure: hold the entity until the head write drains, so the
+            // worker can't push the first chunk until the head is on the wire
+            // (keeps the single-write-in-flight invariant from the very start).
+            h1c.sending_entity = ent;
+            try self.reg.move(ent, &self.stream_response_in, &self._stream_data_sending);
         }
 
         /// Write one body piece as a chunk, then return the entity to
@@ -2293,6 +2304,7 @@ pub fn H2(comptime opts: Options) type {
         /// `rb.data` is copied into the framed buffer, then freed + nulled (the
         /// same ownership transfer the h2 path does onto its `Stream`).
         fn http1StreamChunk(self: *Self, ent: Entity, conn_ptr: *Conn, conn_entity: Entity, rb: *RespBody) !void {
+            const h1c = conn_ptr.h1.?;
             if (rb.data) |d| {
                 if (rb.len > 0) {
                     var out: std.ArrayList(u8) = .empty;
@@ -2300,11 +2312,21 @@ pub fn H2(comptime opts: Options) type {
                     try http1.writeChunk(&out, self.allocator, d[0..rb.len]);
                     const data = try out.toOwnedSlice(self.allocator);
                     self.http1Send(conn_ptr, conn_entity, data);
+                    self.allocator.free(d[0..rb.len]);
+                    rb.data = null;
+                    rb.len = 0;
+                    // Backpressure: hold the entity until this chunk's write
+                    // drains; `writesAccount` releases it back to stream_data_out.
+                    h1c.sending_entity = ent;
+                    try self.reg.move(ent, &self.stream_data_in, &self._stream_data_sending);
+                    return;
                 }
                 self.allocator.free(d[0..rb.len]);
                 rb.data = null;
                 rb.len = 0;
             }
+            // Empty piece — nothing to write, so no backpressure: return the
+            // entity immediately for the next push.
             try self.reg.move(ent, &self.stream_data_in, &self.stream_data_out);
         }
 
@@ -2472,7 +2494,36 @@ pub fn H2(comptime opts: Options) type {
             const io_results = self.io.write_results.column(rio.IoResult);
 
             for (entities, conn_ents, io_results) |ent, conn_ent, io_res| {
-                if (!self.reg.isStale(conn_ent.entity) and io_res.err != 0) {
+                const failed = !self.reg.isStale(conn_ent.entity) and io_res.err != 0;
+
+                // h1 streaming backpressure: a completed head/chunk write
+                // releases the parked stream entity. There's at most one write
+                // in flight per stream (we only push the next piece after the
+                // previous drains), so `sending_entity` unambiguously names it.
+                if (!self.reg.isStale(conn_ent.entity)) {
+                    if (getConn(self, conn_ent.entity)) |conn_ptr| {
+                        if (conn_ptr.h1) |h1c| {
+                            if (!h1c.sending_entity.isNil()) {
+                                const sent = h1c.sending_entity;
+                                h1c.sending_entity = Entity.nil;
+                                if (self.reg.isInCollection(sent, &self._stream_data_sending)) {
+                                    if (failed) {
+                                        // The write failed (conn is about to be
+                                        // destroyed): surface it so the worker
+                                        // reaps the stream from response_out.
+                                        try self.reg.set(sent, &self._stream_data_sending, H2IoResult, .{ .err = -1 });
+                                        try self.reg.move(sent, &self._stream_data_sending, &self.response_out);
+                                    } else {
+                                        // Drained — let the worker push the next.
+                                        try self.reg.move(sent, &self._stream_data_sending, &self.stream_data_out);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (failed) {
                     try self.reg.destroy(conn_ent.entity);
                 }
                 try self.reg.destroy(ent);

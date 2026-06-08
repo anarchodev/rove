@@ -4,10 +4,10 @@
 > ingress + h1-over-TLS via ALPN + chunked-request decode & `100-continue` +
 > **chunked streaming/SSE responses** are live in `rove-h2`, and the
 > `rewind-front` `:80` listener (ACME HTTP-01 + HTTP→HTTPS redirect) is wired —
-> all proven end-to-end (see Build order). Phase 6 (WebSocket) remains; the ACME
-> `200` challenge path lands with gap #3 slice 3 (the CP issuer +
-> `/_cp/acme-challenge` endpoint); streaming backpressure is a noted follow-up.
-> Adds HTTP/1.1 *ingress* to
+> all proven end-to-end (see Build order). Streaming is flow-controlled
+> (backpressure mirrors h2). Phase 6 (WebSocket) remains; the ACME `200`
+> challenge path lands with gap #3 slice 3 (the CP issuer +
+> `/_cp/acme-challenge` endpoint). Adds HTTP/1.1 *ingress* to
 > `rove-h2` (today nghttp2/HTTP-2-only) so the edge can accept inbound traffic
 > from h1-only clients without Cloudflare in front. Amends an assumption in
 > [`v2-front-door-architecture.md`](v2-front-door-architecture.md) (which
@@ -187,14 +187,24 @@ The fork adds a per-connection **protocol mode**. `Conn` gains an
    through `decodeChunked`). Proven against `zig build h2-stream-test` (added a
    run step): `curl --http1.1` decodes the chunk stream, raw bytes show correct
    `7\r\nchunk1\n\r\n … 0\r\n\r\n` framing, keep-alive serves two streamed
-   responses on one socket, h2 streaming unaffected. **Follow-up — backpressure:**
-   chunks write immediately with no flow-control signal back to the worker
-   (h2 has window-based flow control). The producers are paced in practice (SSE
-   is event-driven; `pipe_to` draws from the bounded chunk-spool), but a
-   pathological fast-producer/slow-consumer could queue writes unbounded — the
-   fix mirrors h2's `_stream_data_sending`: hold the entity in a sending state
-   until the chunk's write completes (`writesAccount`) before returning it to
-   `stream_data_out`.
+   responses on one socket, h2 streaming unaffected.
+4c. ✅ **Streaming backpressure.** The producer is now flow-controlled exactly
+   like h2 (which paces via the data-provider + window). `http1StreamBegin` and
+   `http1StreamChunk` park the stream entity in `_stream_data_sending` (not
+   `stream_data_out`) and stamp `Http1Conn.sending_entity`; `writesAccount`
+   releases it back to `stream_data_out` — the worker's "push the next piece"
+   signal — only when that head/chunk write **drains to the socket** (rove-io
+   re-submits partial writes and reports completion only when the whole buffer
+   is sent). So exactly one write is outstanding per stream: a slow/stalled
+   consumer (full socket buffer ⇒ the send SQE stays pending) naturally stops
+   the producer instead of queueing writes unbounded; this also guarantees the
+   chunks stay correctly ordered on the wire (no two sends racing on one conn).
+   A consumer disconnect mid-stall fails the pending write → the `failed` branch
+   moves the parked entity to `response_out` with an error, so the worker reaps
+   it (no leak). Proven: all chunks still delivered + correctly ordered (head is
+   parked too), keep-alive recycles the entity through `_stream_data_sending`
+   across two streams on one conn, and the non-streaming buffered/chunked paths
+   (which share `writesAccount`) are unaffected.
 5. ✅ **Front-door `:80` plaintext listener** (ACME HTTP-01 + HTTP→HTTPS
    redirect), retiring the gap #3 slice-3 wrinkle — the h1 front answers `:80`
    directly. `rewind-front` (`src-v2/front/main.zig`) gains a second `FrontH2`
