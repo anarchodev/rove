@@ -1,12 +1,13 @@
 # V2 — HTTP/1.1 edge ingress (design)
 
-> **Status: phases 1–5 shipped (2026-06-07).** Codec + plaintext h1 ingress +
-> h1-over-TLS via ALPN + chunked-request decode & `100-continue` are live in
-> `rove-h2`, and the `rewind-front` `:80` listener (ACME HTTP-01 + HTTP→HTTPS
-> redirect) is wired — all proven end-to-end (see Build order). Phase 6
-> (WebSocket) remains; chunked *response* is deferred to the streaming-over-h1
-> integration, and the ACME `200` challenge path lands with gap #3 slice 3 (the
-> CP issuer + `/_cp/acme-challenge` endpoint). Adds HTTP/1.1 *ingress* to
+> **Status: phases 1–5 + streaming shipped (2026-06-07).** Codec + plaintext h1
+> ingress + h1-over-TLS via ALPN + chunked-request decode & `100-continue` +
+> **chunked streaming/SSE responses** are live in `rove-h2`, and the
+> `rewind-front` `:80` listener (ACME HTTP-01 + HTTP→HTTPS redirect) is wired —
+> all proven end-to-end (see Build order). Phase 6 (WebSocket) remains; the ACME
+> `200` challenge path lands with gap #3 slice 3 (the CP issuer +
+> `/_cp/acme-challenge` endpoint); streaming backpressure is a noted follow-up.
+> Adds HTTP/1.1 *ingress* to
 > `rove-h2` (today nghttp2/HTTP-2-only) so the edge can accept inbound traffic
 > from h1-only clients without Cloudflare in front. Amends an assumption in
 > [`v2-front-door-architecture.md`](v2-front-door-architecture.md) (which
@@ -168,11 +169,32 @@ The fork adds a per-connection **protocol mode**. `Conn` gains an
    body round-tripping across many reads, `Expect: 100-continue` (curl and a
    staged raw socket showing the `100` sent *before* the body), keep-alive
    mixing a chunked then a plain request on one socket, malformed→400, and a
-   66 KB chunked body over TLS. **Chunked *response* (output) is deferred** — the
-   buffered response path always knows its length so it emits `Content-Length`;
-   the only consumer of chunked output is a streaming handler over h1, which is
-   coupled to the `stream_response_in` subsystem (today an io-error degrade) and
-   belongs with that integration, not the codec.
+   66 KB chunked body over TLS. *(Buffered responses still emit `Content-Length`
+   — chunked **output** is the streaming case, below.)*
+4b. ✅ **Streaming / SSE responses over h1 (chunked output).** The worker's
+   streaming pipeline (`stream_response_in` → repeated `stream_data_in` →
+   `stream_close_in`) is protocol-agnostic, so three `conn.h1` forks in the h2
+   server's stream-consume functions make it emit HTTP/1.1 chunked framing
+   instead of nghttp2 DATA frames: `http1StreamBegin` writes the head with
+   `Transfer-Encoding: chunked` (no `Content-Length`) and parks the entity in
+   `stream_data_out`; `http1StreamChunk` frames + writes each piece
+   (`<hex>\r\n<data>\r\n`) as it arrives and returns the entity for the next;
+   `http1StreamEnd` writes the `0\r\n\r\n` terminator and honors keep-alive
+   (chunked delimits the body, so the conn serves the next request). No data
+   provider / `resume_data` / `_stream_data_sending` detour — each chunk is one
+   write (encrypted on TLS via the shared `http1Send`). Codec helpers
+   `writeStreamHead`/`writeChunk`/`CHUNK_TERMINATOR` (unit-tested, round-trip
+   through `decodeChunked`). Proven against `zig build h2-stream-test` (added a
+   run step): `curl --http1.1` decodes the chunk stream, raw bytes show correct
+   `7\r\nchunk1\n\r\n … 0\r\n\r\n` framing, keep-alive serves two streamed
+   responses on one socket, h2 streaming unaffected. **Follow-up — backpressure:**
+   chunks write immediately with no flow-control signal back to the worker
+   (h2 has window-based flow control). The producers are paced in practice (SSE
+   is event-driven; `pipe_to` draws from the bounded chunk-spool), but a
+   pathological fast-producer/slow-consumer could queue writes unbounded — the
+   fix mirrors h2's `_stream_data_sending`: hold the entity in a sending state
+   until the chunk's write completes (`writesAccount`) before returning it to
+   `stream_data_out`.
 5. ✅ **Front-door `:80` plaintext listener** (ACME HTTP-01 + HTTP→HTTPS
    redirect), retiring the gap #3 slice-3 wrinkle — the h1 front answers `:80`
    directly. `rewind-front` (`src-v2/front/main.zig`) gains a second `FrontH2`

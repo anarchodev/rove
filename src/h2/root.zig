@@ -178,6 +178,10 @@ pub const Http1Conn = struct {
     chunk_body: std.ArrayList(u8) = .empty,
     chunk_pos: usize = 0,
     continue_sent: bool = false,
+    /// A chunked streaming response (SSE / ReadableStream) is in progress: the
+    /// head went out with `Transfer-Encoding: chunked` and body pieces are being
+    /// written as chunks. Cleared at the terminating zero-chunk.
+    streaming: bool = false,
 
     /// Hard ceiling on a buffered request body at the edge. Per-tenant plan
     /// limits (gap #1, 413) are enforced in the DP worker; this is the coarse
@@ -1405,6 +1409,16 @@ pub fn H2(comptime opts: Options) type {
                     try self.reg.move(ent, &self.stream_response_in, &self.response_out);
                     continue;
                 };
+
+                // h1 streaming: chunked head + park for chunks (Phase 6).
+                if (conn_ptr.h1 != null) {
+                    self.http1StreamBegin(ent, conn_ptr, sess.entity, status, rh, io_res) catch {
+                        io_res.err = -1;
+                        try self.reg.move(ent, &self.stream_response_in, &self.response_out);
+                    };
+                    continue;
+                }
+
                 if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
                     try self.reg.move(ent, &self.stream_response_in, &self.response_out);
@@ -1490,6 +1504,16 @@ pub fn H2(comptime opts: Options) type {
                     try self.reg.move(ent, &self.stream_data_in, &self.response_out);
                     continue;
                 };
+
+                // h1 streaming: frame + write the chunk, return for the next.
+                if (conn_ptr.h1 != null) {
+                    self.http1StreamChunk(ent, conn_ptr, sess.entity, rb) catch {
+                        io_res.err = -1;
+                        try self.reg.move(ent, &self.stream_data_in, &self.response_out);
+                    };
+                    continue;
+                }
+
                 if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
                     try self.reg.move(ent, &self.stream_data_in, &self.response_out);
@@ -1541,6 +1565,16 @@ pub fn H2(comptime opts: Options) type {
                     try self.reg.move(ent, &self.stream_close_in, &self.response_out);
                     continue;
                 };
+
+                // h1 streaming: write the zero-terminator + finalize (Phase 6).
+                if (conn_ptr.h1 != null) {
+                    self.http1StreamEnd(ent, conn_ptr, sess.entity, io_res) catch {
+                        io_res.err = -1;
+                        try self.reg.move(ent, &self.stream_close_in, &self.response_out);
+                    };
+                    continue;
+                }
+
                 if (conn_ptr.ng_session == null) {
                     io_res.err = -1;
                     try self.reg.move(ent, &self.stream_close_in, &self.response_out);
@@ -2214,6 +2248,80 @@ pub fn H2(comptime opts: Options) type {
             } else {
                 // Connection: close — let the idle-timeout GC reap once the write
                 // drains (same proven path as the old 426 reply).
+                h1c.closing = true;
+            }
+        }
+
+        // ── HTTP/1.1 chunked streaming (SSE / ReadableStream) ────────────────
+        //
+        // The worker's streaming pipeline (`stream_response_in` → repeated
+        // `stream_data_in` → `stream_close_in`) is protocol-agnostic; these three
+        // forks make it emit HTTP/1.1 chunked framing instead of nghttp2 DATA
+        // frames. Each chunk is serialized and written as it arrives — no data
+        // provider, no `resume_data`, no `_stream_data_sending` detour.
+
+        /// Begin a streaming response: write the chunked head, mark the conn
+        /// streaming, and park the entity in `stream_data_out` for the worker to
+        /// push chunks onto.
+        fn http1StreamBegin(self: *Self, ent: Entity, conn_ptr: *Conn, conn_entity: Entity, status: Status, rh: RespHeaders, io_res: *H2IoResult) !void {
+            const h1c = conn_ptr.h1.?;
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(self.allocator);
+
+            var hdr_store: [http1.MAX_HEADERS]http1.RespHeader = undefined;
+            var hn: usize = 0;
+            if (rh.fields) |rfields| {
+                for (rfields[0..rh.count]) |f| {
+                    const name = f.name[0..f.name_len];
+                    if (name.len > 0 and name[0] == ':') continue; // pseudo
+                    if (hn >= hdr_store.len) break;
+                    hdr_store[hn] = .{ .name = name, .value = f.value[0..f.value_len] };
+                    hn += 1;
+                }
+            }
+
+            try http1.writeStreamHead(&out, self.allocator, status.code, hdr_store[0..hn]);
+            const data = try out.toOwnedSlice(self.allocator);
+            self.http1Send(conn_ptr, conn_entity, data);
+            h1c.streaming = true;
+            io_res.err = 0;
+            try self.reg.move(ent, &self.stream_response_in, &self.stream_data_out);
+        }
+
+        /// Write one body piece as a chunk, then return the entity to
+        /// `stream_data_out` so the worker can push the next. The worker-owned
+        /// `rb.data` is copied into the framed buffer, then freed + nulled (the
+        /// same ownership transfer the h2 path does onto its `Stream`).
+        fn http1StreamChunk(self: *Self, ent: Entity, conn_ptr: *Conn, conn_entity: Entity, rb: *RespBody) !void {
+            if (rb.data) |d| {
+                if (rb.len > 0) {
+                    var out: std.ArrayList(u8) = .empty;
+                    defer out.deinit(self.allocator);
+                    try http1.writeChunk(&out, self.allocator, d[0..rb.len]);
+                    const data = try out.toOwnedSlice(self.allocator);
+                    self.http1Send(conn_ptr, conn_entity, data);
+                }
+                self.allocator.free(d[0..rb.len]);
+                rb.data = null;
+                rb.len = 0;
+            }
+            try self.reg.move(ent, &self.stream_data_in, &self.stream_data_out);
+        }
+
+        /// End a streaming response: write the zero-terminator, then finalize the
+        /// entity and honor keep-alive (chunked delimits the body, so the conn
+        /// can serve the next request) vs close.
+        fn http1StreamEnd(self: *Self, ent: Entity, conn_ptr: *Conn, conn_entity: Entity, io_res: *H2IoResult) !void {
+            const h1c = conn_ptr.h1.?;
+            const term = try self.allocator.dupe(u8, http1.CHUNK_TERMINATOR);
+            self.http1Send(conn_ptr, conn_entity, term);
+            h1c.streaming = false;
+            io_res.err = 0;
+            try self.reg.move(ent, &self.stream_close_in, &self.response_out);
+            if (h1c.keep_alive) {
+                h1c.in_flight = false;
+                self.http1Drive(conn_ptr, conn_entity);
+            } else {
                 h1c.closing = true;
             }
         }

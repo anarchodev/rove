@@ -744,6 +744,9 @@ pub fn build(b: *std.Build) void {
         .root_module = h2_stream_mod,
     });
     b.installArtifact(h2_stream_test);
+    const h2_stream_run = b.addRunArtifact(h2_stream_test);
+    const h2_stream_step = b.step("h2-stream-test", "Run the streaming echo server example (h2 + h1 chunked)");
+    h2_stream_step.dependOn(&h2_stream_run.step);
 
     // s3-blob-smoke: exercise rove-blob's S3BlobStore against any
     // S3-compatible endpoint (default-tested against OVH). Pure
