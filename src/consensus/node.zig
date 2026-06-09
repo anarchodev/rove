@@ -108,15 +108,24 @@ pub const StoreResolver = struct {
 };
 
 /// Fired once per committed *real* entry (writeset / multi / root —
-/// not the leader's empty election no-op), AFTER it has applied, with
-/// the entry's raft index. The bridge (`bridge.zig`) uses this to bind
-/// per-tenant raft commit order to the per-tenant propose seq it handed
-/// the worker (the seq → commit-order binding behind the per-tenant
-/// watermark; docs/v2-build-order.md §Phase 2). `null` in the Phase-1
-/// unit tests, which drive the pump directly and read inline.
+/// not the leader's empty election no-op), AFTER it has applied AND the
+/// cycle's WAL fsync has completed, with the entry's raft index. The
+/// bridge (`bridge.zig`) uses this to bind per-tenant raft commit order
+/// to the per-tenant propose seq it handed the worker (the seq → commit-
+/// order binding behind the per-tenant watermark; docs/v2-build-order.md
+/// §Phase 2). Because the watermark is the worker's durable-ack signal,
+/// the hook is staged during `processReady` and fired only after
+/// `wal.flush()` succeeds — never ahead of the fsync. `null` in the
+/// Phase-1 unit tests, which drive the pump directly and read inline.
 pub const CommitHook = struct {
     ctx: *anyopaque,
     func: *const fn (ctx: *anyopaque, group_id: u64, raft_index: u64) void,
+};
+
+/// One staged commit notification (see `Node.commit_notify`).
+const CommitNotify = struct {
+    gid: u64,
+    idx: u64,
 };
 
 /// Fired once per PUT in a committed writeset, AFTER it has applied to the
@@ -323,6 +332,12 @@ pub const Node = struct {
     /// Checked + cleared by `pump` after the round.
     apply_err: ?Error = null,
 
+    /// Commit notifications staged during the current `processReady`
+    /// round, fired (in apply order) only AFTER the cycle's `wal.flush()`
+    /// succeeds — the commit hook is the worker's durable-ack signal, so
+    /// it must not run ahead of the fsync (see `pump`). Reused per cycle.
+    commit_notify: std.ArrayListUnmanaged(CommitNotify) = .empty,
+
     /// Optional per-committed-entry notification (see `CommitHook`).
     /// Set by the bridge; left null by the Phase-1 inline tests.
     commit_hook: ?CommitHook = null,
@@ -472,6 +487,7 @@ pub const Node = struct {
         self.active.deinit(a);
         self.dirty.deinit(a);
         self.woke_scratch.deinit(a);
+        self.commit_notify.deinit(a);
         a.free(self.ready_buf);
         a.free(self.voters);
         a.free(self.data_dir);
@@ -876,6 +892,7 @@ pub const Node = struct {
 
         self.apply_err = null;
         if (ready.len > 0) {
+            self.commit_notify.clearRetainingCapacity();
             for (ready) |g| {
                 self.mgr.processReady(g, applyCb, self) catch |e| {
                     self.apply_err = self.apply_err orelse mapRaftErr(e);
@@ -883,9 +900,28 @@ pub const Node = struct {
             }
 
             // ONE fsync per cycle regardless of how many groups committed.
-            self.wal.flush() catch {
-                self.apply_err = self.apply_err orelse Error.Io;
+            const flushed = blk: {
+                self.wal.flush() catch {
+                    self.apply_err = self.apply_err orelse Error.Io;
+                    break :blk false;
+                };
+                break :blk true;
             };
+
+            // Fire the commit hook ONLY after the cycle's fsync: the hook
+            // advances the per-tenant watermark the worker acks clients on,
+            // so firing it inside `processReady` (pre-fsync) let a worker
+            // promote + 200 a write whose log entry was not yet durable —
+            // a crash (or a flush failure, e.g. disk full) in that window
+            // lost an acked write. On flush failure the notifications are
+            // DROPPED: the parked workers time out → 503, which is the
+            // correct "unknown outcome" signal (never a false durable ack).
+            if (flushed) {
+                if (self.commit_hook) |h| {
+                    for (self.commit_notify.items) |n| h.func(h.ctx, n.gid, n.idx);
+                }
+            }
+            self.commit_notify.clearRetainingCapacity();
 
             // Drain each ready group's outbox. Single-node: queued to a
             // transport-less sink (a no-op). Multi-node: buffered per
@@ -1024,12 +1060,20 @@ pub const Node = struct {
             self.apply_err = e;
             return;
         };
-        // The entry committed + applied cleanly: notify the bridge so it
-        // can advance the tenant's committed_seq watermark. Fires only on
-        // the success path, so the leader's empty election no-op (len==0,
-        // returned above) and any undecodable entry (apply_err, returned
-        // above) never advance a tenant's watermark.
-        if (self.commit_hook) |h| h.func(h.ctx, group_id, index);
+        // The entry committed + applied cleanly: STAGE the bridge
+        // notification (advancing the tenant's committed_seq watermark).
+        // `pump` fires it after the cycle's `wal.flush()` succeeds — the
+        // watermark is the durable-ack signal, so it must not run ahead
+        // of the fsync. Staged only on the success path, so the leader's
+        // empty election no-op (len==0, returned above) and any
+        // undecodable entry (apply_err, returned above) never advance a
+        // tenant's watermark. A staging failure (OOM) is surfaced as an
+        // apply error rather than silently losing the waiter's wakeup.
+        if (self.commit_hook != null) {
+            self.commit_notify.append(self.allocator, .{ .gid = group_id, .idx = index }) catch {
+                self.apply_err = Error.OutOfMemory;
+            };
+        }
     }
 
     fn applyEntry(self: *Node, group_id: u64, index: u64, bytes: []const u8) Error!void {
