@@ -304,6 +304,29 @@ the inbound analog of the `onChunk` batch — transparent group-commit is
 rejected (it fights the unanswerable "is activation K durable yet?"). This
 coalescing is a **later perf phase**, not part of the batch-of-1 baseline.
 
+> **As-built note (2026-06-09, post pieces D+F) — the fsync/RTT amortization
+> above is already inherent in the batch-of-1 baseline; the `frames:[...]`
+> coalescing is demoted from a perf lever to a semantics lever.** Per-frame
+> activations don't block on commit (`proposeForgetfulWrites` enqueues and
+> returns; replies park commit-gated), every activation's writeset funnels
+> into the one per-tenant propose inbox, and the bridge's `pumpOnce` submits
+> the *entire* drained inbox to the group before driving one ready cycle — so
+> a K-frame burst is K raft entries in **one** Ready: one log append, one
+> fsync, one MsgAppend RTT, ~one commit round wall-clock. Handler runs are
+> cheap (the per-request arena reset is one cursor write), so "fewer
+> activations" is not a motivation either. **One message per `onMessage`
+> stays the shape.** Build the batched activation only if one of its
+> *remaining* motivations becomes real:
+> (a) **strict reply ordering** — today a read-only frame's inline reply can
+> overtake an in-flight writing frame's commit-gated reply (writing frames
+> stay ordered among themselves via the per-tenant commit FIFO);
+> (b) per-entry decode/apply overhead at extreme frame rates;
+> (c) batch atomicity as a customer-visible unit.
+> Caveat shared with every producer: same-Ready grouping is opportunistic
+> (the pump races the worker tick; no linger), so a tick's proposes can
+> split across two cycles — if a guarantee is ever needed, the lever is at
+> the pump, not the activation layer.
+
 ### Non-goals — DO-model-specific (extend §7)
 
 - **A platform broadcast/enumeration API.** Forced out by the hidden-handle
@@ -330,8 +353,10 @@ coalescing is a **later perf phase**, not part of the batch-of-1 baseline.
 (`zig build ws-echo`) and `scripts/ws_echo_smoke.py` (raw-socket RFC 6455 client:
 101 handshake, text/binary echo, fragment reassembly, auto-pong, close
 handshake). **Pieces D + F shipped 2026-06-09** — the single-node inbound
-baseline is done. Remaining: broadcast docs (the kv-wake recipe) and the §4.5
-coalescing perf phase (later, on demand).
+baseline is done. Remaining: broadcast docs (the kv-wake recipe). The §4.5
+`frames:[...]` coalescing is **demoted** (see the as-built note there): fsync/
+RTT amortization already holds in batch-of-1; it returns only if strict reply
+ordering / extreme-rate entry overhead / batch atomicity demand it.
 
 ## 5. Handler execution model — the current (post-Phase-2) surface
 
