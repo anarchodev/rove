@@ -101,6 +101,56 @@ const WorkerCtx = struct {
     ready: *std.Thread.ResetEvent,
 };
 
+/// V2 on-promotion recovery hook — closes the two failover-recovery gaps the
+/// smoke audit surfaced (`leader_failover_smoke_v2` / `durable_wake_smoke_v2`).
+/// When this node wins leadership of a tenant's raft group (a follower→leader
+/// edge the bridge pump publishes via `drainPromotions`), the freshly-promoted
+/// leader must:
+///   1. Load the tenant's current deployment — `_deploy/current` replicated
+///      while we were a follower, but the loader only enqueues inline at
+///      release time on the *original* leader, so without this the new leader
+///      serves 503 until a re-release.
+///   2. Reconstruct the volatile scheduler / owed-retry watermarks the old
+///      leader held in RAM (`next_wake_ns` and the owed-retry sweep baseline
+///      are never raft-replicated) — otherwise durable scheduled wakes that
+///      came due during the handover never fire on the new leader.
+///
+/// V1's `loop46` drove this off a single node-wide `was_leader` edge; V2
+/// leadership is per-group, so the edge is per-tenant. The deployment reload is
+/// per promoted tenant; the watermark sweeps are partition-wide + idempotent
+/// (the per-group propose gate inside each no-ops tenants this node does not
+/// lead), so they run once per tick whenever any promotion landed — matching
+/// V1's once-per-edge semantics.
+/// DP apply observer (`bridge.setApplyObserver`): fired on the pump thread once
+/// per committed PUT on a FOLLOWER (the leader's apply is skipped). Detects the
+/// replicated `_deploy/current` marker and enqueues a load so the follower
+/// tracks the tenant's current deployment continuously — see
+/// `DeploymentCache.enqueueDeployment` for why. `ctx` is `*NodeState`.
+fn onDeployApply(ctx: *anyopaque, gid: u64, key: []const u8, value: []const u8) void {
+    if (!std.mem.eql(u8, key, "_deploy/current")) return;
+    const node: *rjs.NodeState = @ptrCast(@alignCast(ctx));
+    const dep_id = std.fmt.parseInt(u64, value, 16) catch return;
+    const tenant_id = node.raft.idStrForGid(gid) orelse return;
+    node.deploy.enqueueDeployment(tenant_id, dep_id);
+}
+
+fn runPromotionHook(worker: anytype, worker_idx: usize) void {
+    var buf: [64][]const u8 = undefined;
+    const n = worker.raft.drainPromotions(&buf);
+    if (n == 0) return;
+    for (buf[0..n]) |tenant_id| {
+        worker.node.deploy.enqueueCurrentDeployment(tenant_id);
+    }
+    // Worker-0-only for the boot-subscription sweep (avoids duplicate enqueues
+    // across a node's workers); rewind runs a single worker, but keep the gate
+    // for forward-compat. The owed/wake sweeps are partitioned by
+    // `hash(tenant) % N_inboxes`, so every worker covers its own slice exactly
+    // once and they run unconditionally.
+    if (worker_idx == 0) rjs.sweepBootSubscriptions(worker);
+    rjs.sweepOwedRetriesOnPromotion(worker);
+    rjs.sweepDurableWakesOnPromotion(worker);
+}
+
 fn workerThreadEntry(args: *WorkerCtx) void {
     workerMain(args) catch |err| {
         std.log.err("rewind worker {d} exited: {s}", .{ args.worker_idx, @errorName(err) });
@@ -163,6 +213,7 @@ fn workerMain(args: *WorkerCtx) !void {
         try rjs.drainFetchPendingDurability(worker);
         _ = try rjs.dispatchOnce(worker, &blocked_tenants);
         try rjs.drainRaftPending(worker);
+        runPromotionHook(worker, args.worker_idx);
         try rjs.drainForwardPending(worker);
         rjs.drainSpools(worker);
         try rjs.sweepParkedContinuations(worker);
@@ -398,6 +449,18 @@ pub fn main() !void {
     defer node_state.deinit();
     node_state.wireInternal();
     try node_state.deploy.startDeploymentLoader();
+    // Continuous follower deployment loading: fire on every committed
+    // `_deploy/current` write so a FOLLOWER loads each deployment as it
+    // replicates (the loader is otherwise only enqueued inline at release time
+    // on the original leader). Then a promoted follower already serves the
+    // handler — and the on-promotion durable-wake sweep finds a loaded
+    // deployment. Set after the loader exists; safe to set post-`startPump`
+    // because no tenant group exists yet at this point in boot (the first
+    // provision/apply comes from the CP/clients much later), so `notifyApply`
+    // never reads `apply_observer` during this set. On the GROUP LEADER the
+    // apply is leader-skipped (no `notifyApply`), so this fires only on
+    // followers — exactly where the inline release enqueue never ran.
+    bridge.setApplyObserver(.{ .ctx = &node_state, .func = onDeployApply });
     try node_state.startFetchEngine();
     // Async serve-or-forward engine. rewind runs a single worker (idx 0).
     try node_state.startProxyEngine(1);

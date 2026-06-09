@@ -842,6 +842,59 @@ pub const DeploymentCache = struct {
         }
         return count;
     }
+
+    /// Enqueue a load of `tenant_id`'s current deployment from the replicated
+    /// `_deploy/current` marker, opening the tenant slot if it is not already
+    /// cached. The V2 on-promotion hook (`src-v2/rewind/main.zig`) calls this
+    /// when this node wins leadership of a tenant's raft group: a follower
+    /// replicates `_deploy/current` but never enqueues a load (the loader is
+    /// only enqueued inline at release time on the *original* leader), so a
+    /// freshly-promoted leader would serve 503 until a re-release. This reads
+    /// the already-committed marker and enqueues so the handler bytecode is
+    /// loaded from the shared blob store. No-op when the tenant is not on this
+    /// node, has no instance/slot, or has no deployment yet. Idempotent — the
+    /// loader's content-addressed skip drops a same-dep re-enqueue, so calling
+    /// it on every promotion (or for a tenant the node already serves) is
+    /// cheap.
+    /// Enqueue a deployment load by `tenant_id` + `dep_id` WITHOUT opening the
+    /// tenant slot — only a mutex-guarded queue append, so it is safe to call
+    /// from the raft pump thread. The loader thread does the slot-open + blob
+    /// fetch off-thread. The V2 DP apply observer
+    /// (`src-v2/rewind/main.zig::onDeployApply`) calls this on every applied
+    /// `_deploy/current` write so a FOLLOWER loads each deployment as it
+    /// replicates — then a follower promoted to leader already holds the
+    /// handler bytecode (no serve-503 window, and the on-promotion durable-wake
+    /// sweep's `scheduler_tick` finds a loaded deployment instead of racing an
+    /// enqueue). Idempotent via the loader's per-tenant dedup + content-address
+    /// skip. No-op when no loader is wired or `dep_id == 0`.
+    pub fn enqueueDeployment(self: *DeploymentCache, tenant_id: []const u8, dep_id: u64) void {
+        const loader = self.deployment_loader orelse return;
+        if (dep_id == 0) return;
+        loader.enqueue(tenant_id, dep_id) catch |err| std.log.warn(
+            "rove-js: apply-time deploy enqueue {s}/{d} failed: {s}",
+            .{ tenant_id, dep_id, @errorName(err) },
+        );
+    }
+
+    pub fn enqueueCurrentDeployment(self: *DeploymentCache, tenant_id: []const u8) void {
+        const loader = self.deployment_loader orelse return;
+        const inst = (self.tenant.getInstance(tenant_id) catch null) orelse return;
+        const slot = self.getOrOpenTenantSlot(inst) catch |err| {
+            std.log.warn(
+                "rove-js: promotion slot-open {s} failed: {s}",
+                .{ tenant_id, @errorName(err) },
+            );
+            return;
+        };
+        const cur_bytes = slot.app_kv.get("_deploy/current") catch return;
+        defer self.allocator.free(cur_bytes);
+        const dep_id = std.fmt.parseInt(u64, cur_bytes, 16) catch return;
+        if (dep_id == 0) return;
+        loader.enqueue(slot.instance_id, dep_id) catch |err| std.log.warn(
+            "rove-js: promotion enqueue {s}/{d} failed: {s}",
+            .{ slot.instance_id, dep_id, @errorName(err) },
+        );
+    }
 };
 
 /// Loader thunk for the single per-process loader. `ctx_opaque` is a
