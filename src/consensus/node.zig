@@ -109,22 +109,41 @@ pub const StoreResolver = struct {
 
 /// Fired once per committed *real* entry (writeset / multi / root —
 /// not the leader's empty election no-op), AFTER it has applied AND the
-/// cycle's WAL fsync has completed, with the entry's raft index. The
-/// bridge (`bridge.zig`) uses this to bind per-tenant raft commit order
-/// to the per-tenant propose seq it handed the worker (the seq → commit-
-/// order binding behind the per-tenant watermark; docs/v2-build-order.md
-/// §Phase 2). Because the watermark is the worker's durable-ack signal,
+/// cycle's WAL fsync has completed, with the entry's IDENTITY (the
+/// origin frame's `origin` + `seq`, see `envelope.EntryFrame`) and its
+/// raft index. The bridge (`bridge.zig`) advances a tenant's
+/// `committed_seq` watermark only for entries whose `origin` is its own
+/// — an identity binding, not a positional one, so an old-term entry
+/// resurrected by a re-election can never credit a different propose's
+/// waiter. Because the watermark is the worker's durable-ack signal,
 /// the hook is staged during `processReady` and fired only after
 /// `wal.flush()` succeeds — never ahead of the fsync. `null` in the
 /// Phase-1 unit tests, which drive the pump directly and read inline.
 pub const CommitHook = struct {
     ctx: *anyopaque,
-    func: *const fn (ctx: *anyopaque, group_id: u64, raft_index: u64) void,
+    func: *const fn (ctx: *anyopaque, group_id: u64, origin: u64, seq: u64, raft_index: u64) void,
+};
+
+/// Asks the bridge whether a committed entry's store write should be
+/// SKIPPED in `worker_overlay` mode: true iff the entry is THIS node's
+/// own live propose (`origin` matches the bridge and `seq` is still in
+/// the tenant's pending set — i.e. a local worker txn holds these writes
+/// and will commit them on watermark advance). Keying the skip on
+/// provenance instead of on `isLeader` closes two holes: a
+/// freshly-elected leader catching up on entries proposed elsewhere must
+/// WRITE them (no local worker ever did), and an entry whose local
+/// waiter gave up (fault / timeout → txn rolled back, seq abandoned)
+/// must be written by the pump when it later commits. Pump-thread only.
+pub const SkipQuery = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, group_id: u64, origin: u64, seq: u64) bool,
 };
 
 /// One staged commit notification (see `Node.commit_notify`).
 const CommitNotify = struct {
     gid: u64,
+    origin: u64,
+    seq: u64,
     idx: u64,
 };
 
@@ -341,6 +360,12 @@ pub const Node = struct {
     /// Optional per-committed-entry notification (see `CommitHook`).
     /// Set by the bridge; left null by the Phase-1 inline tests.
     commit_hook: ?CommitHook = null,
+
+    /// Optional worker-overlay skip oracle (see `SkipQuery`). Set by the
+    /// bridge alongside `commit_hook`. When null, `worker_overlay` falls
+    /// back to the role-keyed `isLeader` skip (bare-node tests only —
+    /// every worker-fronted deployment sets it).
+    skip_query: ?SkipQuery = null,
 
     /// Optional per-applied-put notification (see `ApplyObserver`). Set by
     /// the bridge for the control-plane directory group so a CP node's
@@ -844,15 +869,27 @@ pub const Node = struct {
         }
     }
 
-    /// Propose a raw raft-log entry to `tenant_id`'s group. Returns once
-    /// the entry is staged in raft-rs's pending list — NOT once applied.
-    /// Drive `pump` to commit + apply it. A propose is activity, so it
-    /// wakes the group (`bumpActive`) — a hibernated tenant ticks again and
-    /// replicates the entry. Bump first so even a propose that raft-rs
-    /// rejects (non-leader) still re-ticks the group toward an election.
-    pub fn propose(self: *Node, tenant_id: u64, entry: []const u8) Error!void {
+    /// Propose an encoded envelope to `tenant_id`'s group with no origin
+    /// identity (hookless: tests, bare nodes — `origin = seq = 0` matches
+    /// no bridge, so the entry is never skipped and advances no
+    /// watermark). See `proposeFramed`.
+    pub fn propose(self: *Node, tenant_id: u64, env_bytes: []const u8) Error!void {
+        return self.proposeFramed(tenant_id, 0, 0, env_bytes);
+    }
+
+    /// Propose an encoded envelope stamped with the proposer's identity
+    /// (`envelope.EntryFrame`: the bridge's per-boot `origin` + the
+    /// per-tenant `seq`). Returns once the entry is staged in raft-rs's
+    /// pending list — NOT once applied. Drive `pump` to commit + apply
+    /// it. A propose is activity, so it wakes the group (`bumpActive`) —
+    /// a hibernated tenant ticks again and replicates the entry. Bump
+    /// first so even a propose that raft-rs rejects (non-leader) still
+    /// re-ticks the group toward an election.
+    pub fn proposeFramed(self: *Node, tenant_id: u64, origin: u64, seq: u64, env_bytes: []const u8) Error!void {
         try self.bumpActive(tenant_id);
-        try self.mgr.propose(tenant_id, entry);
+        const framed = try envelope.encodeEntryFrame(self.allocator, origin, seq, env_bytes);
+        defer self.allocator.free(framed);
+        try self.mgr.propose(tenant_id, framed);
     }
 
     /// Build a type-0 writeset envelope from `ws` and propose it, then
@@ -918,7 +955,7 @@ pub const Node = struct {
             // correct "unknown outcome" signal (never a false durable ack).
             if (flushed) {
                 if (self.commit_hook) |h| {
-                    for (self.commit_notify.items) |n| h.func(h.ctx, n.gid, n.idx);
+                    for (self.commit_notify.items) |n| h.func(h.ctx, n.gid, n.origin, n.seq, n.idx);
                 }
             }
             self.commit_notify.clearRetainingCapacity();
@@ -1056,7 +1093,11 @@ pub const Node = struct {
         // election). Nothing to apply.
         if (len == 0) return;
         const bytes = data[0..len];
-        self.applyEntry(group_id, index, bytes) catch |e| {
+        const frame = envelope.decodeEntryFrame(bytes) catch |e| {
+            self.apply_err = e;
+            return;
+        };
+        self.applyEntry(group_id, index, frame) catch |e| {
             self.apply_err = e;
             return;
         };
@@ -1070,18 +1111,30 @@ pub const Node = struct {
         // tenant's watermark. A staging failure (OOM) is surfaced as an
         // apply error rather than silently losing the waiter's wakeup.
         if (self.commit_hook != null) {
-            self.commit_notify.append(self.allocator, .{ .gid = group_id, .idx = index }) catch {
+            self.commit_notify.append(self.allocator, .{
+                .gid = group_id,
+                .origin = frame.origin,
+                .seq = frame.seq,
+                .idx = index,
+            }) catch {
                 self.apply_err = Error.OutOfMemory;
             };
         }
     }
 
-    fn applyEntry(self: *Node, group_id: u64, index: u64, bytes: []const u8) Error!void {
-        const env = try envelope.decode(bytes);
+    fn applyEntry(self: *Node, group_id: u64, index: u64, frame: envelope.EntryFrame) Error!void {
+        const env = try envelope.decode(frame.env_bytes);
         // Decide whether the pump writes the store, or only advances the
         // watermark (the worker's TrackedTxn.commit is the durable write).
-        // `worker_overlay` makes that role-aware: skip on the leader (the
-        // worker wrote it), write on a follower (no worker here).
+        // `worker_overlay` keys this on PROVENANCE via the bridge's
+        // `skip_query`: skip iff the entry is this node's own live propose
+        // (origin matches and the seq's worker txn is still pending —
+        // that txn IS the store write). Everything else is written by the
+        // pump: a follower's replicated entries, a freshly-elected
+        // leader's catch-up entries proposed elsewhere, a replayed entry
+        // at recovery (no live txns at boot), and an entry whose local
+        // waiter already gave up (fault/timeout rolled the txn back and
+        // abandoned the seq).
         const skip_store = if (self.recovering)
             // Replaying the WAL at restart: there is no worker to have written
             // the store, so the pump MUST write it (and durabilize the tail).
@@ -1089,7 +1142,12 @@ pub const Node = struct {
         else switch (self.apply_mode) {
             .apply_on_commit => false,
             .leader_skip => true,
-            .worker_overlay => self.mgr.isLeader(group_id),
+            .worker_overlay => blk: {
+                if (self.skip_query) |q|
+                    break :blk q.func(q.ctx, group_id, frame.origin, frame.seq);
+                // No bridge (bare-node tests): the old role-keyed skip.
+                break :blk self.mgr.isLeader(group_id);
+            },
         };
         if (skip_store) {
             // We still decode (above) so a stale/unknown envelope type

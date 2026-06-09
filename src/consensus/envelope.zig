@@ -31,8 +31,82 @@ pub const Error = error{
     IdTooLong,
     UnknownEnvelopeType,
     NestedMulti,
+    /// A raft entry did not start with the `ENTRY_FRAME_MAGIC` byte —
+    /// every V2 entry is origin-framed at propose; a bare envelope in
+    /// the log is a producer bug (or a stale pre-frame entry, which a
+    /// pre-launch data-dir wipe removes).
+    BadEntryFrame,
     OutOfMemory,
 };
+
+// ── Entry frame (origin identity) ─────────────────────────────────────
+//
+// Every proposed raft entry is wrapped in a fixed 17-byte frame BEFORE
+// the envelope:
+//
+//     [1B ENTRY_FRAME_MAGIC][8B origin LE][8B seq LE][envelope bytes]
+//
+// `origin` is the proposing bridge's per-boot random id and `seq` its
+// per-tenant propose ticket — together the entry's IDENTITY. The apply
+// path uses them to (a) bind a committed entry to the exact local
+// propose awaiting it (the bridge advances `committed_seq` only for
+// `origin == its own id`, never by FIFO position — a resurrected
+// old-term entry committing after re-election can no longer mis-credit
+// a different propose's waiter), and (b) key the worker-overlay store
+// skip on true provenance ("THIS node's worker wrote this entry and its
+// txn is still live"), not on currently-being-leader — a freshly-elected
+// leader catching up on another proposer's entries must WRITE them.
+// A random per-boot origin (not the node id) also fences a restarted
+// node's WAL replay from colliding with the new incarnation's seqs.
+// `origin = 0, seq = 0` marks a hookless propose (tests, bare nodes):
+// it matches no bridge, so it is never skipped and never advances a
+// watermark.
+
+/// First byte of every framed entry. Deliberately outside the envelope
+/// `Type` range (0..=2) so a missing frame fails loud (`BadEntryFrame`)
+/// instead of mis-decoding.
+pub const ENTRY_FRAME_MAGIC: u8 = 0xF7;
+
+/// Bytes of the frame header preceding the envelope.
+pub const ENTRY_FRAME_LEN: usize = 1 + 8 + 8;
+
+pub const EntryFrame = struct {
+    /// Proposing bridge's per-boot random id (0 = hookless propose).
+    origin: u64,
+    /// Proposer's per-tenant seq ticket (0 = hookless propose).
+    seq: u64,
+    /// The framed envelope bytes; borrows the input.
+    env_bytes: []const u8,
+};
+
+/// Wrap an encoded envelope in the entry frame. Caller owns the result.
+pub fn encodeEntryFrame(
+    allocator: std.mem.Allocator,
+    origin: u64,
+    seq: u64,
+    env_bytes: []const u8,
+) Error![]u8 {
+    const out = allocator.alloc(u8, ENTRY_FRAME_LEN + env_bytes.len) catch return Error.OutOfMemory;
+    out[0] = ENTRY_FRAME_MAGIC;
+    std.mem.writeInt(u64, out[1..9], origin, .little);
+    std.mem.writeInt(u64, out[9..17], seq, .little);
+    @memcpy(out[ENTRY_FRAME_LEN..], env_bytes);
+    return out;
+}
+
+/// Decode the entry frame. `env_bytes` aliases `bytes`. The magic
+/// check precedes the length check so an unframed envelope of any
+/// length reports `BadEntryFrame`, not `Truncated`.
+pub fn decodeEntryFrame(bytes: []const u8) Error!EntryFrame {
+    if (bytes.len == 0) return Error.Truncated;
+    if (bytes[0] != ENTRY_FRAME_MAGIC) return Error.BadEntryFrame;
+    if (bytes.len < ENTRY_FRAME_LEN) return Error.Truncated;
+    return .{
+        .origin = std.mem.readInt(u64, bytes[1..9], .little),
+        .seq = std.mem.readInt(u64, bytes[9..17], .little),
+        .env_bytes = bytes[ENTRY_FRAME_LEN..],
+    };
+}
 
 /// Envelope type byte. Numbering matches V1's `apply.EnvelopeType` so
 /// the wire format is stable across the cutover. Retired V1 slots
@@ -210,6 +284,26 @@ pub fn decodeMultiInner(
 // ── Tests ────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "entry frame round-trips and rejects unframed/truncated bytes" {
+    const a = testing.allocator;
+    const env = try encodeWriteSet(a, "t", "WS");
+    defer a.free(env);
+
+    const framed = try encodeEntryFrame(a, 0xDEAD_BEEF, 42, env);
+    defer a.free(framed);
+    const f = try decodeEntryFrame(framed);
+    try testing.expectEqual(@as(u64, 0xDEAD_BEEF), f.origin);
+    try testing.expectEqual(@as(u64, 42), f.seq);
+    try testing.expectEqualSlices(u8, env, f.env_bytes);
+    // The framed envelope still decodes.
+    const dec = try decode(f.env_bytes);
+    try testing.expectEqual(Type.writeset, dec.type);
+
+    // A bare (unframed) envelope fails loud — type byte 0 is not the magic.
+    try testing.expectError(Error.BadEntryFrame, decodeEntryFrame(env));
+    try testing.expectError(Error.Truncated, decodeEntryFrame(framed[0..10]));
+}
 
 test "writeset envelope round-trips (readset-framed payload)" {
     const a = testing.allocator;

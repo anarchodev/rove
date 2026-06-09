@@ -149,6 +149,14 @@ fn drainEntityArm(
                 ),
             }
         }
+        /// Deadline passed, not bridge-faulted: request a pump-side
+        /// fault and stay parked (see `effect.SweepClass.timeout` — a
+        /// unilateral rollback here races the pump's worker-overlay
+        /// skip decision for this very entry). The next tick resolves
+        /// to `.commit` (it landed after all) or `.fault` (below).
+        pub fn timeoutAt(self: *@This(), i: usize) void {
+            self.worker.raft.requestFault(self.waits[i].group_id, self.waits[i].seq);
+        }
         pub fn faultAt(self: *@This(), i: usize) !void {
             const ent = self.entities[i];
             switch (self.worker.pending_txns.rollbackAndTake(self.allocator, self.waits[i].seq)) {
@@ -355,6 +363,15 @@ pub fn drainRaftPending(worker: anytype) !void {
                     "rove-js parked_units commit destroy: {s}",
                     .{@errorName(err)},
                 );
+            }
+            /// Deadline passed, not bridge-faulted: request a pump-side
+            /// fault and stay parked (see `effect.SweepClass.timeout`).
+            /// The gid resolves the same way `watermarkAt` does; a
+            /// gone/unregistered unit has nothing to fault.
+            pub fn timeoutAt(self: *@This(), i: usize) void {
+                const u = self.unitAt(i) orelse return;
+                const gid = self.worker.raft.gidForTenant(u.tenant_id) orelse return;
+                self.worker.raft.requestFault(gid, u.seq);
             }
             pub fn faultAt(self: *@This(), i: usize) !void {
                 const unit = self.unitAt(i) orelse return;
