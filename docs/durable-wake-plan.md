@@ -60,7 +60,7 @@ sketch below):
 
 ## Phases
 
-Land-inert-first (mirrors `effect-reification-plan.md` Phase 5 PR-3 step 1:
+Land-inert-first (mirrors `architecture/effects-and-handlers.md` Phase 5 PR-3 step 1:
 the owed sweep shipped inert as a safety net before the atomic flip).
 
 - **P0 — engine primitive (inert).** `__rove_set_wake(when_ns)` global
@@ -85,7 +85,7 @@ the owed sweep shipped inert as a safety net before the atomic flip).
   wake's `next_wake_ns` must be set from **committed** state, never from
   the handler that called `at()` (its `_sched` write is uncommitted at
   return — this is exactly the marker-commit race of
-  `effect-reification-plan.md` Phase 4.1 / durability-as-JS-shim bug #5).
+  `architecture/effects-and-handlers.md` Phase 4.1 / durability-as-JS-shim bug #5).
   Mechanism: a **kv-react** subscription (Gap 2.1) on the `_sched/by_time/`
   prefix fires `scheduler_tick` post-commit on the committing leader
   worker, which reads the now-committed entry and sets the wake. No
