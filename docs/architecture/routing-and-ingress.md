@@ -83,10 +83,11 @@ in-flight backpressure on the streaming path. h1→h2c translation is **edge-onl
 - **Outbound**: a worker `stream.write` lowers to a frame on `ws_send_in`
   (reusing `Cmd.stream_chunk`, opcode-tagged — there is **no** separate
   `conn_write`), serialized with one write in flight per connection.
-- **Status**: the transport (handshake + framing + inbound/outbound collections)
-  is shipped and proven (`zig build ws-echo`, `scripts/ws_echo_smoke.py`). The
-  remaining piece is the worker-side `onMessage` dispatch seam (piece D) — see
-  `effects-and-handlers.md`.
+- **Status**: shipped end to end. The transport (handshake + framing +
+  inbound/outbound collections) is proven by `zig build ws-echo` +
+  `scripts/ws_echo_smoke.py`; the worker-side `onMessage` dispatch seam
+  (piece D, 2026-06-09) by `scripts/ws_worker_smoke_v2.py` (deployed handler,
+  durable frames, both disconnect paths) — see `effects-and-handlers.md`.
 
 ## Streaming substrate
 
@@ -126,8 +127,6 @@ and the customer contract in [`handler-shape.md`](../handler-shape.md).
 
 ## Known limitations (as-built)
 
-- **Worker `onMessage` seam (WebSocket piece D)** is the one transport-adjacent
-  gap; everything below it is wired.
 - **Front→DP is per-request connect** today (no keep-alive pool to the data
   plane) — a known follow-up, not a correctness issue.
 - **Held connections are single-node** per cluster in the baseline; the

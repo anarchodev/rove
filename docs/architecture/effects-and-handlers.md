@@ -137,9 +137,10 @@ the wake to the owning worker, falling back to `hash(tenant)` on a registry miss
   durable cron / delayed jobs. See [`durable-wake-plan.md`](../durable-wake-plan.md).
 - **Streaming inbound body (gap 2.4)** is design-locked (the `onChunk` export, the
   ≤1 MB-fires-once rule) but the h2 chunk-delivery wire-up is pending.
-- **Inbound WebSocket dispatch (piece D)** — the transport is shipped (see
-  routing-and-ingress); the worker `onMessage` seam consuming `ws_message_out` is
-  the remaining piece.
+- ~~**Inbound WebSocket dispatch (piece D)**~~ — shipped 2026-06-09: the worker
+  `onMessage`/`onDisconnect` seam (`serviceWsMessages`, `src/js/worker_streaming.zig`)
+  consumes `ws_message_out` and lowers `stream.write` to `ws_send_in`
+  (commit-gated for writing frames). Proven by `scripts/ws_worker_smoke_v2.py`.
 - **Per-tenant kv-react backpressure has no cap** at the apply-time fan-out (the
   K=32 wake ring bounds the *holder* side only). A small cleanup, deferred until
   measured hot.

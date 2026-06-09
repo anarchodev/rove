@@ -12,7 +12,12 @@
 > the `101` handshake, ws-mode connection, inbound parse/reassemble/auto-pong/
 > close, and outbound framing over the `ws_message_out` / `ws_send_in` collection
 > seam. Proven by `examples/ws_echo_test.zig` (`zig build ws-echo`) +
-> `scripts/ws_echo_smoke.py`. **Next: piece D** (the worker `onMessage` seam).
+> `scripts/ws_echo_smoke.py`. **Piece D (worker seam) shipped + smoke-proven
+> 2026-06-09**: deployed-handler `onMessage` / `onDisconnect` over a real WS
+> connection — `scripts/ws_worker_smoke_v2.py` (piece F) asserts text/binary
+> echo, commit-gated durable frames, kv round-trip, terminal close, and both
+> disconnect paths (client Close + abrupt-drop stale sweep). The inbound
+> single-node baseline is **done**.
 > Originally consolidated 2026-05-27 from the
 > WebSocket-blocked items scattered across other docs (`architecture/effects-and-handlers.md`
 > §6.3 + §6.5, `architecture/effects-and-handlers.md` Phase 4.1.4 `conn_write`,
@@ -317,15 +322,16 @@ coalescing is a **later perf phase**, not part of the batch-of-1 baseline.
 | B | RFC 6455 frame codec (`src/h2/ws.zig`) | ✅ **DONE** (~430 LOC + 16 tests, `zig build ws-test`) | pure parse/serialize: opcode, FIN, mask bit, 7/16/64-bit length, unmask, fragmentation surfaced (opcode+fin), ping/pong/close, `Sec-WebSocket-Accept` derivation. A self-contained table-tested file like `http1.zig`. |
 | C | connection mode switch on `Conn` | ✅ **DONE** | `Http1Conn.ws_mode` + reassembly state (`ws_msg`/`ws_msg_opcode`); `http1Feed` routes a ws-mode conn to `wsDrive` (parse loop, auto-pong, close echo, fragment reassembly → emit on `ws_message_out`). TLS decrypt + the read pump are reused from gap #6. |
 | E | outbound-frame framing | ✅ **DONE** (h2 side) | NOT a new Cmd. The WS seam is two collections: `ws_message_out` (inbound complete messages) + `ws_send_in` (outbound frames, opcode in `WsMeta`, bytes in `ReqBody`). `consumeWsSends` RFC-6455-frames each by opcode onto the per-conn `ws_out` byte queue; `wsFlush` keeps exactly one socket write in flight (`ws_write_inflight`, released in `writesAccount`) so control frames (pong/close) interleave with data in wire order. **Worker side (lower `stream.write` on a WS conn → `ws_send_in`) lands with piece D.** |
-| D | frame → activation | **medium** (NEXT) | dispatch each `ws_message_out` message to the `onMessage` export via the held-continuation resume seam (the `parked_continuations` / `resumeContinuation` path that `on.*` wakes already use). Client close (opcode 8 on `ws_message_out`) → the `onDisconnect` export. Lives in rove-js (the worker), consuming the stable `ws_message_out` / `ws_send_in` h2 collections. |
+| D | frame → activation | ✅ **DONE** (2026-06-09) | `serviceWsMessages` (`src/js/worker_streaming.zig`) drains `ws_message_out` per tick: find-or-`establishWsChain` (a `parked_continuations` entry, indexed by conn via `ws_chains_by_conn`, deadline `maxInt` so the §6.4 sweep skips it), `fireWsMessage` runs `onMessage`, opcode 8 → `fireWsDisconnect` (`onDisconnect`); `sweepStaleWsChains` catches abrupt conn death. Outbound: read-only frames emit `ws_send_in` inline; a WRITING frame's frames stage as commit-gated `Cmd.ws_send` via `proposeForgetfulWrites` (batch-of-1). The dispatcher's `ws_frame_output` flag (set for `.ws_message` activations) bypasses the Phase-2 stream bridge so `stream.write`+`next()` stays a plain continuation with the chunks left for `shipWsFrames` — without it the activation classifies as an SSE `Stream` descriptor (501). |
+| F | functional smoke | ✅ **DONE** (2026-06-09) | `scripts/ws_worker_smoke_v2.py` on the `V2Cluster` harness: deploy an `onMessage`/`onDisconnect` handler, raw RFC 6455 client direct to the node (tenant Host) — text echo, binary echo with embedded NULs (Uint8Array fidelity), `kv.set` frame's reply gated behind the raft commit then visible via `/_system/v2-kv`, `kv.get` round-trip, terminal return → frames-then-Close, client Close → `onDisconnect`, abrupt TCP drop → stale-sweep `onDisconnect`. |
 | (shared) | cross-worker held-state locator | **medium, not WS-specific** | `architecture/effects-and-handlers.md`; needed by every held primitive. Amortized, not WS tax. |
 
 **Transport (A/B/C/E-h2) is shipped + proven** by `examples/ws_echo_test.zig`
 (`zig build ws-echo`) and `scripts/ws_echo_smoke.py` (raw-socket RFC 6455 client:
 101 handshake, text/binary echo, fragment reassembly, auto-pong, close
-handshake). **Remaining platform commitment: piece D** (the worker seam) on top
-of the `ws_message_out` / `ws_send_in` collections. Broadcast is docs (the
-kv-wake recipe).
+handshake). **Pieces D + F shipped 2026-06-09** — the single-node inbound
+baseline is done. Remaining: broadcast docs (the kv-wake recipe) and the §4.5
+coalescing perf phase (later, on demand).
 
 ## 5. Handler execution model — the current (post-Phase-2) surface
 
@@ -337,7 +343,9 @@ Per `docs/handler-shape.md` (the shipped held-handler model) +
 - Each inbound frame dispatches to the **`onMessage`** export — one new
   connection activation kind (the WS analog of `onChunk`).
   `request.activation` carries `{ opcode, data }` (and, under the §4.5
-  coalescing perf-phase, a `frames: [...]` batch). Binary frames > 16 KB
+  coalescing perf-phase, a `frames: [...]` batch). `opcode` is **numeric**
+  (1 = text → `data` is a string; 2 = binary → `data` is a Uint8Array the
+  handler owns). Binary frames > 16 KB
   go content-addressed via the blob coordinator (architecture/routing-and-ingress.md §7).
 - Outbound frames are the **`stream.write(chunk)`** effect (commit-gated,
   like every connection write): a string value → a text frame, bytes → a
@@ -351,9 +359,11 @@ Per `docs/handler-shape.md` (the shipped held-handler model) +
 
 ```js
 // echo: per inbound frame, send it back and stay open.
-export function onMessage(request) {
+// `request` is a GLOBAL (exports are invoked with no arguments — a
+// `request` parameter would shadow it with undefined).
+export function onMessage() {
   const { opcode, data } = request.activation;   // inbound frame
-  stream.write(opcode === 'binary' ? data : `echo:${data}`);
+  stream.write(opcode === 2 ? data : `echo:${data}`);  // 2 = binary
   return next();                                  // park for the next frame
 }
 export function onDisconnect() { /* optional cleanup */ }
