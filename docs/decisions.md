@@ -407,15 +407,45 @@ prototype before V2 wrote code.
 - **Intended tradeoff**: a fully-idle group whose leader dies does not auto-re-
   elect; the next request wakes + campaigns. An idle group has nothing to serve.
 
-### 10.5 Role-aware apply + store unification
-- **Decision**: the **leader** skips the replicated store write (the worker's
-  `TrackedTxn.commit` is durable); a **follower** writes it, into the worker's
-  *own* serving store (`StoreResolver`), so a promoted follower serves exactly
-  what it replicated.
-- A write in flight at a leader change is **faulted + retried** (503), **not
-  lost** — explicit per-entry FIFO seq binding (counting seqs is wrong multi-
-  node: proposes can fail; followers apply with no local proposer). Zero-failed-
-  request moves under continuous load are Phase 7.
+### 10.5 Provenance-keyed apply + store unification (revised 2026-06-09)
+- **Decision**: the pump skips the replicated store write **iff the entry is
+  this node's own still-pending propose** — every entry carries an identity
+  frame (per-boot random `origin_id` + per-tenant seq) and the bridge answers
+  a `skipQuery` against its pending set. Everything else (follower apply, a
+  promoted leader's catch-up, restart replay, abandoned waiters) is written by
+  the pump — into the worker's *own* serving store via **pump-owned sibling
+  handles** (`PumpStores`: same kvexp manifest + store id, private txn state;
+  sharing the worker's handle let applies land inside its open speculative
+  txn) using **chain-bypassing authoritative writes** (kvexp
+  `StoreLease.applyPut/applyDelete` — replicated truth never sequences behind
+  the local speculative txn chain).
+- The same identity drives the seq↔commit binding: the hook advances
+  `committed_seq` only for its own pending seq, never by FIFO position.
+  **Superseded** (2026-06-09): the leader-gated FIFO pop — an old-term entry
+  resurrected by re-election could credit the wrong waiter (false durable
+  ack); and skip-keyed-on-`isLeader` — it dropped catch-up/abandoned writes
+  from the serving store. (Counting seqs was rejected before both.)
+- A write in flight at a leader change is **faulted + retried** (503 =
+  *unknown outcome*: the entry may still commit later, so retries are
+  at-least-once). Zero-failed-request moves under continuous load are Phase 7.
+
+### 10.5b Commit quorum counts only fsynced entries (2026-06-09)
+- **Decision**: raft-rs-zig runs the async-append flow — `process_ready`
+  records appends; the pump acks `on_persist` **after** the cycle's one fsync;
+  persistence-asserting messages (append acks, vote responses) are held until
+  the ack. The rove pump is two-pass around the fsync (apply prior-durable →
+  flush → ack → apply unlocked commits), the commit hook fires post-fsync, and
+  WAL compaction flushes once before truncating (the durable commit index lags
+  one fsync). Single-node proposes still commit within one pump cycle.
+- **Why**: the sync flow (`advance` inside `process_ready`) counted the
+  leader's own *volatile* append toward quorum — a 3-node commit could be
+  reached with one durable copy fewer than quorum, and a single voter
+  committed (and could ack) entirely ahead of the fsync.
+- The durabilize/compaction checkpoint is additionally floored by the
+  **worker ack** (`noteWorkerCommitted`): a skipped entry's data lives in the
+  worker's open txn until promoted, and the kvexp fold cannot see open txns —
+  stamping/compacting past an un-acked entry claimed durability for volatile
+  data.
 
 ### 10.6 Tenant move = ship committed state to a fresh group
 - **Decision**: detach dumps committed KV state to a self-describing bundle;
