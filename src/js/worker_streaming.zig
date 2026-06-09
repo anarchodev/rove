@@ -563,18 +563,25 @@ fn resumeStream(
         .path = spath,
         .body = body,
         .query = null,
-        .readset = &readset,
-        .request_id = request_id,
-        .platform = inst.platform,
-        .limiter = &worker.limiter,
-        .instance_id = inst.id,
-        .correlation_id = chain_ctx.correlation_id,
-        .activation_source = activation,
-        .activation_wakes = batch_owned,
-        .activation_lost_oldest = batch_lost_oldest,
+        // `activation` is a runtime source (wake_batch / send_callback /
+        // other stream-wake kinds) — build the payload arm for wake_batch,
+        // fall back to the payload-less arm for the rest.
+        .activation = if (activation == .wake_batch)
+            .{ .wake_batch = .{ .wakes = batch_owned, .lost_oldest = batch_lost_oldest } }
+        else
+            dispatcher_mod.Activation.fromSource(activation),
         .activation_write_pressure_dropped = dropped_chunks_snapshot,
-        .pending_wakes = &pending_wakes,
-        .pending_stream_chunks = &stream_chunks,
+        .trace = .{
+            .readset = &readset,
+            .request_id = request_id,
+            .correlation_id = chain_ctx.correlation_id,
+        },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .admin = .{ .platform = inst.platform },
+        .effects = .{
+            .pending_wakes = &pending_wakes,
+            .pending_stream_chunks = &stream_chunks,
+        },
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     const run_oc = worker.dispatcher.runOutcome(
@@ -944,39 +951,41 @@ pub fn resumeBoundFetchStream(
         stream_chunks.deinit(allocator);
     }
 
-    var req: Request = .{
+    const req: Request = .{
         .method = "POST",
         .path = spath,
         .body = body,
         .query = query,
-        .readset = &readset,
-        .request_id = request_id,
-        .platform = inst.platform,
-        .limiter = &worker.limiter,
-        .instance_id = inst.id,
-        .correlation_id = chain_ctx.correlation_id,
-        .activation_source = .fetch_chunk,
-        .activation_fetch_id = ev.fetch_id,
-        .pending_stream_chunks = &stream_chunks,
         .is_system_module = builtin_modules_mod.isBuiltinPath(path),
-        .activation_write_pressure_dropped = dropped_chunks_snapshot,
-        .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
-        .resume_if_bound_ctx = @ptrCast(worker),
-        .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
-        .cancel_fetch_ctx = @ptrCast(worker),
+        .activation = .{ .fetch_chunk = .{
+            .id = ev.fetch_id,
+            .seq = ev.seq,
+            .byte_offset = ev.byte_offset,
+            .bytes = ev.bytes,
+            .headers = ev.fetch_headers,
+            .final = ev.final,
+            .terminal_status = if (ev.final) ev.terminal_status else 0,
+            .terminal_ok = if (ev.final) ev.terminal_ok else false,
+            .body_truncated = if (ev.final) ev.body_truncated else false,
+        } },
         .activation_entity = ent,
         .activation_fetches_pending = fetches_pending,
+        .activation_write_pressure_dropped = dropped_chunks_snapshot,
+        .trace = .{
+            .readset = &readset,
+            .request_id = request_id,
+            .correlation_id = chain_ctx.correlation_id,
+        },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .admin = .{ .platform = inst.platform },
+        .trampolines = .{
+            .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
+            .resume_if_bound_ctx = @ptrCast(worker),
+            .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
+            .cancel_fetch_ctx = @ptrCast(worker),
+        },
+        .effects = .{ .pending_stream_chunks = &stream_chunks },
     };
-    req.activation_fetch_seq = ev.seq;
-    req.activation_fetch_byte_offset = ev.byte_offset;
-    req.activation_fetch_bytes = ev.bytes;
-    req.activation_fetch_headers = ev.fetch_headers;
-    req.activation_fetch_final = ev.final;
-    if (ev.final) {
-        req.activation_fetch_terminal_status = ev.terminal_status;
-        req.activation_fetch_terminal_ok = ev.terminal_ok;
-        req.activation_fetch_body_truncated = ev.body_truncated;
-    }
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     var oc = worker.dispatcher.runOutcome(
@@ -1257,14 +1266,11 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
         .path = spath,
         .body = body,
         .query = null,
-        .readset = &readset,
-        .request_id = request_id,
-        .platform = inst.platform,
-        .limiter = &worker.limiter,
-        .instance_id = inst.id,
-        .correlation_id = chain_ctx.correlation_id,
-        .activation_source = .disconnect,
+        .activation = .disconnect,
         .activation_write_pressure_dropped = dropped_chunks_snapshot,
+        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = chain_ctx.correlation_id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .admin = .{ .platform = inst.platform },
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     const run_oc = worker.dispatcher.runOutcome(
@@ -1677,17 +1683,14 @@ fn fireWsMessage(
         .path = spath,
         .body = body,
         .query = null,
-        .readset = &readset,
-        .request_id = request_id,
-        .platform = inst.platform,
-        .limiter = &worker.limiter,
-        .instance_id = inst.id,
-        .correlation_id = chain_ctx.correlation_id,
-        .activation_source = .ws_message,
-        .activation_ws_opcode = opcode,
-        .activation_ws_data = payload,
-        .pending_stream_chunks = &stream_chunks,
-        .pending_stream_chunk_opcodes = &chunk_opcodes,
+        .activation = .{ .ws_message = .{ .opcode = opcode, .data = payload } },
+        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = chain_ctx.correlation_id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .admin = .{ .platform = inst.platform },
+        .effects = .{
+            .pending_stream_chunks = &stream_chunks,
+            .pending_stream_chunk_opcodes = &chunk_opcodes,
+        },
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     const run_oc = worker.dispatcher.runOutcome(
@@ -1899,13 +1902,10 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         .path = spath,
         .body = body,
         .query = null,
-        .readset = &readset,
-        .request_id = request_id,
-        .platform = inst.platform,
-        .limiter = &worker.limiter,
-        .instance_id = inst.id,
-        .correlation_id = chain_ctx.correlation_id,
-        .activation_source = .disconnect,
+        .activation = .disconnect,
+        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = chain_ctx.correlation_id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .admin = .{ .platform = inst.platform },
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     const run_oc = worker.dispatcher.runOutcome(
@@ -2105,15 +2105,10 @@ pub fn fireSubscriptionActivation(
         .path = spath,
         .body = body,
         .query = query,
-        .readset = &readset,
-        .request_id = request_id,
-        .platform = inst.platform,
-        .limiter = &worker.limiter,
-        .instance_id = inst.id,
-        .correlation_id = corr_full,
-        .activation_source = .subscription_fire,
-        .activation_subscription_name = subscription_name,
-        .activation_subscription_source = source,
+        .activation = .{ .subscription_fire = .{ .name = subscription_name, .source = source } },
+        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = corr_full },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .admin = .{ .platform = inst.platform },
     };
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
@@ -2340,20 +2335,17 @@ pub fn fireSchedulerTick(worker: anytype, tenant_id: []const u8) void {
         .path = spath,
         .body = body,
         .query = null,
-        .readset = &readset,
-        .request_id = request_id,
-        .platform = inst.platform,
-        .limiter = &worker.limiter,
-        .instance_id = inst.id,
-        .correlation_id = corr_full,
-        .activation_source = .subscription_fire,
-        .activation_subscription_name = "__scheduler_tick",
-        .activation_subscription_source = null,
         .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
-        .set_wake = &deployment_cache.TenantSlot.setWakeTrampoline,
-        .set_wake_ctx = @ptrCast(slot),
-        .fire_wake = &@TypeOf(worker.*).fireWakeTrampoline,
-        .fire_wake_ctx = @ptrCast(worker),
+        .activation = .{ .subscription_fire = .{ .name = "__scheduler_tick", .source = null } },
+        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = corr_full },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .admin = .{ .platform = inst.platform },
+        .trampolines = .{
+            .set_wake = &deployment_cache.TenantSlot.setWakeTrampoline,
+            .set_wake_ctx = @ptrCast(slot),
+            .fire_wake = &@TypeOf(worker.*).fireWakeTrampoline,
+            .fire_wake_ctx = @ptrCast(worker),
+        },
     };
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
@@ -2520,18 +2512,16 @@ fn fireDurableWakeActivation(worker: anytype, dw: *effect_mod.msg.DurableWake) v
         .path = spath,
         .body = body,
         .query = null,
-        .readset = &readset,
-        .request_id = request_id,
-        .platform = inst.platform,
-        .limiter = &worker.limiter,
-        .instance_id = inst.id,
-        .correlation_id = corr_full,
-        .activation_source = .durable_wake,
-        .activation_wake_id = dw.id,
-        .activation_wake_key = dw.key,
-        .activation_wake_scheduled_at_ns = dw.scheduled_at_ns,
-        .activation_wake_msg_json = dw.msg_json,
         .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
+        .activation = .{ .durable_wake = .{
+            .id = dw.id,
+            .key = dw.key,
+            .scheduled_at_ns = dw.scheduled_at_ns,
+            .msg_json = dw.msg_json,
+        } },
+        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = corr_full },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .admin = .{ .platform = inst.platform },
     };
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
@@ -2746,14 +2736,11 @@ fn fireChainedActivation(
         .path = spath,
         .body = body,
         .query = query_opt,
-        .readset = &readset,
-        .request_id = request_id,
-        .platform = inst.platform,
-        .limiter = &worker.limiter,
-        .instance_id = inst.id,
-        .correlation_id = corr_full,
-        .activation_source = .send_callback,
         .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
+        .activation = .send_callback,
+        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = corr_full },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .admin = .{ .platform = inst.platform },
     };
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
@@ -3894,42 +3881,40 @@ pub fn fireFetchEventActivation(
 
     const act_source: log_mod.ActivationSource = .fetch_chunk;
 
-    var req: Request = .{
+    const req: Request = .{
         .method = "POST",
         .path = spath,
         .body = body,
         .query = null,
-        .readset = &readset,
-        .request_id = request_id,
-        .platform = inst.platform,
-        .limiter = &worker.limiter,
-        .instance_id = inst.id,
-        .correlation_id = corr_full,
-        .activation_source = act_source,
-        .activation_fetch_id = event.fetch_id,
         .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
-        // Phase 5 PR-3: §6.4 held-sync resume hook. The baked
-        // `__system/webhook_onresult` shim calls `__rove_resume_if_bound`
-        // on terminal to wake any parked cont bound to this send-id.
-        // Set on every fetch-event activation (the H2 path sets it
-        // too, in `worker_dispatch.zig`); without this the JS builtin
-        // sees a null trampoline + returns false, leaving the cont
-        // parked until its 25s deadline.
-        .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
-        .resume_if_bound_ctx = @ptrCast(worker),
-        .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
-        .cancel_fetch_ctx = @ptrCast(worker),
+        .activation = .{ .fetch_chunk = .{
+            .id = event.fetch_id,
+            .seq = event.seq,
+            .byte_offset = event.byte_offset,
+            .bytes = event.bytes,
+            .headers = event.fetch_headers,
+            .final = event.final,
+            .terminal_status = if (event.final) event.terminal_status else 0,
+            .terminal_ok = if (event.final) event.terminal_ok else false,
+            .body_truncated = if (event.final) event.body_truncated else false,
+        } },
+        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = corr_full },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .admin = .{ .platform = inst.platform },
+        .trampolines = .{
+            // Phase 5 PR-3: §6.4 held-sync resume hook. The baked
+            // `__system/webhook_onresult` shim calls `__rove_resume_if_bound`
+            // on terminal to wake any parked cont bound to this send-id.
+            // Set on every fetch-event activation (the H2 path sets it
+            // too, in `worker_dispatch.zig`); without this the JS builtin
+            // sees a null trampoline + returns false, leaving the cont
+            // parked until its 25s deadline.
+            .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
+            .resume_if_bound_ctx = @ptrCast(worker),
+            .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
+            .cancel_fetch_ctx = @ptrCast(worker),
+        },
     };
-    req.activation_fetch_seq = event.seq;
-    req.activation_fetch_byte_offset = event.byte_offset;
-    req.activation_fetch_bytes = event.bytes;
-    req.activation_fetch_headers = event.fetch_headers;
-    req.activation_fetch_final = event.final;
-    if (event.final) {
-        req.activation_fetch_terminal_status = event.terminal_status;
-        req.activation_fetch_terminal_ok = event.terminal_ok;
-        req.activation_fetch_body_truncated = event.body_truncated;
-    }
 
     // Phase 4-fetch-inline: small fetch chunks ride inline in
     // the readset's `fetch_responses.inline_bytes` field — no

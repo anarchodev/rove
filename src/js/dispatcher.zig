@@ -22,6 +22,11 @@ const log_mod = @import("rove-log");
 const rove = @import("rove");
 
 const globals = @import("globals.zig");
+const request_mod = @import("request.zig");
+const rpc_dispatch = @import("rpc_dispatch.zig");
+const response_building = @import("response_building.zig");
+const module_execution = @import("module_execution.zig");
+const PendingResponse = module_execution.PendingResponse;
 const bytecode_cache_mod = @import("bytecode_cache.zig");
 const BlobBytes = bytecode_cache_mod.BlobBytes;
 const limiter_mod = @import("limiter.zig");
@@ -91,353 +96,17 @@ fn interruptHandler(_: ?*c.JSRuntime, opaque_ctx: ?*anyopaque) callconv(.c) c_in
     return if (now >= budget.deadline_ns) 1 else 0;
 }
 
-/// Re-export so handlers/dispatch code can refer to it as
-/// `dispatcher.ActivationSource` without taking a separate import.
-/// Canonical definition lives in `log_mod` (it's metadata for the
-/// log record).
-pub const ActivationSource = log_mod.ActivationSource;
+/// The request data model lives in `request.zig`; re-exported here so
+/// every existing `dispatcher.{Request,Response,RunOutcome,...}`
+/// reference keeps resolving.
+pub const ActivationSource = request_mod.ActivationSource;
+pub const SubscriptionFireSource = request_mod.SubscriptionFireSource;
+pub const Activation = request_mod.Activation;
 
-/// Gap 2.1 subscription-fire payload, discriminated by origin kind.
-/// Carried on `Request.activation_subscription_source` when
-/// `activation_source == .subscription_fire`; the variant IS the
-/// `source.kind` the JS surface reports (no "whichever slot is set"
-/// re-derivation). Borrowed slices — the caller
-/// (`fireSubscriptionActivation`) owns the bytes for the dispatch.
-/// `worker_streaming.SubscriptionFireSource` aliases this.
-pub const SubscriptionFireSource = union(enum) {
-    cron: struct { fired_at_ns: i64 },
-    kv: struct { key: []const u8, op: u8 },
-    boot: struct { deployment_id: u64 },
-};
-
-pub const Request = struct {
-    method: []const u8,
-    path: []const u8,
-    /// Wire host (HTTP/2 `:authority`, or HTTP/1 `Host:`). Includes
-    /// the `:port` segment when present — admin's JS handler uses
-    /// it verbatim to build absolute magic-link URLs that work in
-    /// both dev (`app.loop46.localhost:8198`) and prod
-    /// (`app.loop46.me`). Empty when the worker dispatches without
-    /// a wire request (test paths, internal callback dispatch).
-    host: []const u8 = "",
-    body: []const u8 = "",
-    /// Query string (everything after `?` in the URL, not including
-    /// the `?`). Null when the URL had none. Used by module handlers
-    /// to find `?fn=<name>` when dispatching function calls, and
-    /// available as `request.query` inside the handler.
-    query: ?[]const u8 = null,
-    /// Wire HTTP headers, lowercase per HTTP/2. Surfaced to JS as
-    /// `request.headers` (flat object, pseudo-headers filtered) and
-    /// `request.cookies` (parsed `cookie:` header). Null = none
-    /// supplied (test paths that don't care).
-    headers: ?h2.ReqHeaders = null,
-    /// Per-worker rate limiter, plumbed through to DispatchState so
-    /// the email-rate-check builtin can take from the email bucket.
-    /// Null in test paths that don't exercise rate limiting.
-    limiter: ?*limiter_mod.RateLimiter = null,
-    /// Instance id this request scopes to. Used as the limiter's
-    /// per-instance bucket key. Empty when the dispatcher runs
-    /// outside a worker context (test paths).
-    instance_id: []const u8 = "",
-    /// Plan-resolved rate caps + plan generation for `instance_id` (from its
-    /// `TenantSlot`), threaded to DispatchState so both the request-rate check
-    /// and the `email.send` rate check size their buckets from the tenant's
-    /// plan and pick up a tier change via the generation (docs/plan-tiers.md
-    /// Lever 1). Defaults = the free/default caps for paths with no resolved
-    /// plan (tests, internal callback dispatch).
-    plan_rate: limiter_mod.RateLimitCaps = .{},
-    plan_gen: u64 = 0,
-    /// Phase 5 PR-2b: true when the dispatched module belongs to the
-    /// `__system/` namespace (resolved from `NodeState.builtin_modules`,
-    /// not from a tenant's deployment files). Built-in modules are
-    /// platform-trusted code — they bypass the
-    /// `isCustomerWriteReserved` check so the webhook shim can write
-    /// `_send/owed/{id}` markers atomically with the customer's
-    /// writeset. Customer modules see `is_system_module = false`
-    /// and the reserved-prefix check fires as before.
-    is_system_module: bool = false,
-    /// Optional captured readset. When set, every source of handler
-    /// non-determinism (`kv.*`, `Date.now`, `Math.random`,
-    /// `crypto.getRandomValues` / `crypto.randomUUID`, and the QJS
-    /// module loader's `(specifier, source_hash)` resolutions) is
-    /// captured onto the matching channel so the worker can persist
-    /// it via `TapeRefs.*_hex` and replay can re-drive the handler
-    /// later. Owned by the caller, which tears it down after
-    /// flushing the log record. See `docs/readset-replication-plan.md`
-    /// and `src/tape/root.zig:Readset`.
-    readset: ?*tape_mod.Readset = null,
-    /// Pre-minted per-request identifier. The dispatcher copies it
-    /// onto `DispatchState` so `webhook.send` can derive a stable
-    /// outbox id (`sha256(request_id || call_index)`) that matches on
-    /// replay. Also used downstream so the log record and the outbox
-    /// rows spawned by the request share the same id.
-    request_id: u64 = 0,
-    /// Resolved session id (`__Host-rove_sid` cookie value or freshly
-    /// minted by the worker via `session.resolve`). 64 lowercase hex
-    /// chars when set; null on dispatch paths with no browser context
-    /// (callbacks, signup, sim/dry-run, internal admin tooling). The
-    /// dispatcher copies the bytes into `DispatchState` and exposes
-    /// them as `request.session.id` to JS handlers; null surfaces as
-    /// `request.session === null` so handlers can branch on it.
-    session_id: ?[64]u8 = null,
-    /// Non-null on admin-tenant requests — points back at the
-    /// `Tenant` so the JS globals can install `platform.root.*` for
-    /// the admin handler. Every other tenant's request passes null
-    /// and the callbacks reject.
-    platform: ?*tenant_mod.Tenant = null,
-    /// Collects `platform.root.*` writes made during this request.
-    /// When non-null the admin handler's root writes go into both
-    /// (a) root.db directly (for immediate read-your-writes) AND
-    /// (b) this writeset (for the worker to propose through raft).
-    /// Null means writes land locally only — fine for tests and
-    /// single-node setups, not for multi-node correctness.
-    root_writeset: ?*kv_mod.WriteSet = null,
-    /// Admin-tenant platform-capability trampolines (deployStarter /
-    /// releases.publish / scope().kv writes), bundled all-or-nothing.
-    /// Non-null on admin-handler requests; the worker passes opaque
-    /// `*Worker(opts)` ctx + concrete trampolines so its generic type
-    /// never leaks into globals.zig. Copied verbatim into
-    /// `DispatchState`. See `globals.PlatformCaps`.
-    platform_caps: ?globals.PlatformCaps = null,
-    /// Phase 5 PR-3: trampoline backing
-    /// `_system.continuation.resumeIfBound(send_id, event_json)` —
-    /// the §6.4 held-sync resume hook called by the JS-shim
-    /// `__system/webhook_onresult` module on terminal. The worker
-    /// wires this to `worker.resumeBoundContinuation`. Null on
-    /// test paths / non-worker dispatches; the JS callable returns
-    /// `false` in that case (no held-sync to resume).
-    resume_if_bound: ?*const fn (
-        ctx: *anyopaque,
-        tenant_id: []const u8,
-        send_id: []const u8,
-        event_json: []const u8,
-    ) bool = null,
-    resume_if_bound_ctx: ?*anyopaque = null,
-    /// `docs/curl-multi-plan.md` Phase 2: cancel-fetch trampoline.
-    /// Wired by the worker to `FetchEngine.cancel`. Null on test
-    /// paths; the JS `http.cancelFetch` becomes a no-op then.
-    cancel_fetch: ?*const fn (ctx: *anyopaque, id: []const u8) void = null,
-    cancel_fetch_ctx: ?*anyopaque = null,
-    /// §2.6 durable-wake trampolines (`docs/durable-wake-plan.md` P0),
-    /// wired by the worker only on the baked `__system/scheduler_tick`
-    /// fire path. `set_wake` stores this tenant's next-fire watermark;
-    /// `fire_wake` enqueues a `durable_wake` activation per due entry.
-    /// Null elsewhere — the capability-scoped builtins no-op / throw.
-    set_wake: ?*const fn (ctx: *anyopaque, tenant_id: []const u8, when_ns: i64) void = null,
-    set_wake_ctx: ?*anyopaque = null,
-    fire_wake: ?*const fn (ctx: *anyopaque, input: globals.FireWakeInput) bool = null,
-    fire_wake_ctx: ?*anyopaque = null,
-    /// `docs/streaming-model.md` §7 item 1: the entity owning the
-    /// chain that this activation runs against. The http.fetch
-    /// binding reads this when `bind: true` to register the held
-    /// entity into `Worker.bound_fetch_entities`. Set on every
-    /// activation path that can host a bound fetch (inbound,
-    /// send_callback, fetch_chunk-bound, wake_batch, etc.); null
-    /// on test paths and on subscription/cron/boot fires (those
-    /// have no held socket to bind a fetch's lifecycle to).
-    activation_entity: ?rove.Entity = null,
-    /// Bound-fetch count snapshot at activation-build time —
-    /// surfaces to JS as `request.fetchesPending` on every
-    /// onFetchChunk activation. Includes the current fetch (i.e.
-    /// `1` on the last chunk of a single bind; `N` on the first
-    /// chunk of N concurrent binds). Customer branches on
-    /// `request.done && request.fetchesPending === 1` to detect
-    /// "this is the last chunk of the last fetch."
-    activation_fetches_pending: u32 = 0,
-    /// Per-chain identifier; the same string on every activation of
-    /// one logical interaction (streaming-handlers-plan §5/§6). Set
-    /// by the runtime — inbound mints it (accepts an inbound
-    /// `X-Rove-Correlation-Id` header when present) and resumes
-    /// inherit. Null on test paths that don't care. Customer-visible
-    /// surface (`request.correlation_id`) lands when JS exposure does
-    /// (later phase); for now it is platform metadata for the tape.
-    correlation_id: ?[]const u8 = null,
-    /// What caused this activation. Inbound is the wire-request case;
-    /// `send_callback` covers both `__rove_next` resumes (§6.4) and
-    /// the plain on_result callback. Recorded on the tape.
-    activation_source: ActivationSource = .inbound,
-    /// Wake-batch payload (Gap 2.2 Phase D / streaming-handlers-plan
-    /// §9.4). Set only when `activation_source == .wake_batch`; a
-    /// temporal-order slice drained from the held stream's
-    /// `PendingWakes` ring. Surfaces as `request.activation.wakes`
-    /// on the JS side. Borrowed slice — caller (resumeStream) owns
-    /// the entries + their `kv_key` bytes for the duration of the
-    /// dispatch.
-    activation_wakes: []const components_mod.WakeEntry = &.{},
-    /// Ring-overflow count snapshotted at drain time. Surfaces as
-    /// `request.activation.overflow.lost_oldest`. Always present
-    /// on a `.wake_batch` activation; 0 in the common case.
-    activation_lost_oldest: u32 = 0,
-    /// §9.4 write-pressure: count of chunks dropped from the held
-    /// stream's `StreamChunks` queue since the last surfacing
-    /// (cap-overflow drops). Snapshotted + reset on each activation
-    /// of a streaming chain. Surfaces as
-    /// `request.activation.write_pressure.dropped_chunks`. Always
-    /// 0 for non-stream activations.
-    activation_write_pressure_dropped: u32 = 0,
-    /// Gap 2.3 Phase C1: caller-owned accumulator for `http.fetch`
-    /// calls during this activation. Bindings append; the
-    /// dispatcher passes the pointer through to `DispatchState`;
-    /// the worker (caller of `runOutcome`) flushes to
-    /// `NodeState.fetch_pending` at handler-success time + frees
-    /// any leftovers at handler-error time. Null on test paths
-    /// that don't care.
-    pending_fetches: ?*std.ArrayListUnmanaged(globals.PendingFetch) = null,
-    /// Handler-surface Phase 1: caller-owned `on.timer`/`on.kv`
-    /// accumulator (threaded to `DispatchState.pending_wakes`). Set by
-    /// the worker only on connection activations; null elsewhere
-    /// (`on.*` inert). See `globals.PendingWakeReg`.
-    pending_wakes: ?*std.ArrayListUnmanaged(globals.PendingWakeReg) = null,
-    /// Handler-surface Phase 2: caller-owned `stream.write(chunk)`
-    /// accumulator (threaded to `DispatchState.pending_stream_chunks`).
-    /// Set by the worker only on connection activations; null elsewhere
-    /// (`stream.*` inert). `finishResponse` drains it into the internal
-    /// `Stream` descriptor (next() ⇒ keep streaming) or prepends it to
-    /// the terminal body (close).
-    pending_stream_chunks: ?*std.ArrayListUnmanaged([]u8) = null,
-    /// websocket-plan §5: per-chunk WS data opcode accumulator, pushed
-    /// in lockstep with `pending_stream_chunks`. Non-null only on a WS
-    /// connection activation (the worker's `fireWsMessage` wires it);
-    /// null elsewhere (SSE / HTTP streams don't frame by opcode). See
-    /// `DispatchState.pending_stream_chunk_opcodes`.
-    pending_stream_chunk_opcodes: ?*std.ArrayListUnmanaged(u8) = null,
-    /// Gap 2.1 subscription_fire payload (catalog §2.1 +
-    /// `docs/subscriptions-plan.md`). Set only when
-    /// `activation_source == .subscription_fire`; surfaces as
-    /// `request.activation.{name, source}`. `name` is the
-    /// subscription's directory name (common to all kinds);
-    /// `source` is the kind-discriminated payload — the tagged
-    /// union makes "exactly one kind per fire" structural. Borrowed
-    /// slices — caller (`fireSubscriptionActivation`) owns the bytes
-    /// for the duration of the dispatch.
-    activation_subscription_name: ?[]const u8 = null,
-    activation_subscription_source: ?SubscriptionFireSource = null,
-    /// Gap 2.3 / Phase 5 PR-1 `http.fetch` activation payload. Set
-    /// when `activation_source == .fetch_chunk`. `fetch_id`
-    /// correlates every activation of one fetch; surfaces as
-    /// `request.activation.fetch_id`. Borrowed slices — caller
-    /// (`fireFetchEventActivation`) owns the bytes for the duration
-    /// of the dispatch.
-    activation_fetch_id: ?[]const u8 = null,
-    /// 0-based chunk index + cumulative bytes before this chunk +
-    /// the chunk payload (surfaces as `request.activation.bytes`,
-    /// a Uint8Array). `fetch_headers` is the parsed upstream
-    /// response headers (JSON-encoded `{"name":"value", ...}`),
-    /// present on `seq == 0` only.
-    activation_fetch_seq: u32 = 0,
-    activation_fetch_byte_offset: u64 = 0,
-    activation_fetch_bytes: []const u8 = &.{},
-    activation_fetch_headers: ?[]const u8 = null,
-    /// True on the last activation for this fetch. Surfaces as
-    /// `request.activation.final`. When true the terminal fields
-    /// below are valid.
-    activation_fetch_final: bool = false,
-    /// `final` only: upstream HTTP status (0 on transport error).
-    activation_fetch_terminal_status: u16 = 0,
-    /// `final` only: transport-only success flag. `ok: true,
-    /// status: 503` is "transport worked, server said no"; `ok:
-    /// false` is libcurl-level failure (timeout / DNS / TLS /
-    /// cancel). The JS layer interprets — not the runtime.
-    activation_fetch_terminal_ok: bool = false,
-    /// `final` only: true if upstream sent more body than the cap
-    /// (`max_response_chunk_bytes` for `stream: false`,
-    /// `max_total_response_bytes` for `stream: true`) and the
-    /// runtime aborted the rest. Surfaces as
-    /// `request.activation.body_truncated`.
-    activation_fetch_body_truncated: bool = false,
-    /// §2.6 durable-wake activation payload. Set only when
-    /// `activation_source == .durable_wake`; surfaces as
-    /// `request.activation.{id, key, scheduled_at_ns, msg}` where
-    /// `msg` is the parsed `activation_wake_msg_json`. Borrowed slices
-    /// — caller (`fireDurableWakeActivation`) owns the bytes for the
-    /// duration of the dispatch.
-    activation_wake_id: ?[]const u8 = null,
-    activation_wake_key: ?[]const u8 = null,
-    activation_wake_scheduled_at_ns: i64 = 0,
-    /// JSON-encoded customer `msg` ("null" when omitted); decoded
-    /// back to a JS value as `request.activation.msg`.
-    activation_wake_msg_json: ?[]const u8 = null,
-    /// Inbound WebSocket frame payload (`docs/websocket-plan.md` §5).
-    /// Set only when `activation_source == .ws_message`; surfaces as
-    /// `request.activation.{opcode, data}` to the `onMessage` export.
-    /// `activation_ws_opcode` is the RFC 6455 data opcode (1 = text →
-    /// `data` is a string, 2 = binary → `data` is a Uint8Array).
-    /// `activation_ws_data` is the borrowed frame payload — caller
-    /// (`fireWsMessage`) owns the bytes for the dispatch's duration.
-    activation_ws_opcode: u8 = 0,
-    activation_ws_data: []const u8 = &.{},
-};
-
-/// One `(name, value)` pair extracted from the handler's
-/// `response.headers` object. Both fields are owned allocator
-/// slices; the outer `Response` frees them on `deinit`.
-pub const ResponseHeader = struct {
-    name: []u8,
-    value: []u8,
-};
-
-pub const Response = struct {
-    status: i32 = 200,
-    body: []u8,
-    /// Captured `console.log` output (one line per call, newline-terminated).
-    console: []u8,
-    /// Exception message if the script threw. Empty on success.
-    exception: []u8,
-    /// Already-sanitized Set-Cookie header values, one per entry the
-    /// handler pushed onto `response.cookies`. Each string is an
-    /// owned, filter-passed cookie with any `Domain=...` attribute
-    /// stripped (see `sanitizeSetCookie`). Empty slice = no cookies.
-    set_cookies: [][]u8 = &.{},
-    /// Custom response headers the handler set via
-    /// `response.headers = {name: value, ...}`. Names are already
-    /// lowercased (HTTP/2 wire format) and vetted — pseudo-headers
-    /// and hop-by-hop names are rejected in `extractResponseMetadata`.
-    /// `set-cookie` specifically is NOT accepted here — cookies go
-    /// through `response.cookies` so sanitization fires.
-    headers: []ResponseHeader = &.{},
-    /// True when the body came from `JSON.stringify(ret)` (i.e. the
-    /// handler returned an object/array/number). The worker stamps
-    /// `content-type: application/json` on the response when true, so
-    /// browser clients can `res.json()` without guessing. Suppressed
-    /// when the handler set a content-type via `response.headers`.
-    body_is_json: bool = false,
-
-    pub fn deinit(self: *Response, allocator: std.mem.Allocator) void {
-        allocator.free(self.body);
-        allocator.free(self.console);
-        allocator.free(self.exception);
-        for (self.set_cookies) |cookie| allocator.free(cookie);
-        if (self.set_cookies.len > 0) allocator.free(self.set_cookies);
-        for (self.headers) |h| {
-            allocator.free(h.name);
-            allocator.free(h.value);
-        }
-        if (self.headers.len > 0) allocator.free(self.headers);
-        self.* = undefined;
-    }
-};
-
-/// Outcome of a dispatch run. A *transient* function result the
-/// caller consumes immediately to choose the next collection move —
-/// NOT a discriminant persisted on a per-entity record (that would be
-/// the `feedback_state_is_collection` antipattern). `.terminal` is
-/// today's behavior verbatim; `.continuation` means the handler
-/// returned `next(...)` and the request is mid-trampoline (the h2
-/// entity moves to `parked_continuations` — Phase 3b-ii — not a
-/// `kind` field read later).
-pub const RunOutcome = union(enum) {
-    terminal: Response,
-    continuation: continuation_mod.Continuation,
-    /// Iterative streaming descriptor (streaming-handlers-plan §3.3,
-    /// Phase 2). The handler returned `__rove_stream(...)`. The
-    /// worker's success path drives the held h2 entity through the
-    /// chunked-write lifecycle (`stream_response_in` → repeated
-    /// `stream_data_out`/`stream_data_in` → `stream_close_in` on
-    /// terminal close). Phase 2a (foundation) classifies the return
-    /// value; Phase 2b lands the worker wiring + timer wakes;
-    /// Phase 2c lands disconnect detection + caps.
-    stream: stream_mod.Stream,
-};
+pub const Request = request_mod.Request;
+pub const ResponseHeader = request_mod.ResponseHeader;
+pub const Response = request_mod.Response;
+pub const RunOutcome = request_mod.RunOutcome;
 
 pub const Dispatcher = struct {
     allocator: std.mem.Allocator,
@@ -541,37 +210,37 @@ pub const Dispatcher = struct {
             .txn = txn,
             .writeset = writeset,
             .console = &console_buf,
-            .readset = request.readset,
+            .readset = request.trace.readset,
             // `docs/primitive-gaps.md` §9 — Zig-side PRNG retired.
             // arenajs's per-request xorshift64star state is the
             // single PRNG; seeded by `installRequest` from
             // `state.readset.?.seed`.
-            .request_id = request.request_id,
+            .request_id = request.trace.request_id,
             .session_id = request.session_id,
-            .platform = request.platform,
-            .root_writeset = request.root_writeset,
+            .platform = request.admin.platform,
+            .root_writeset = request.admin.root_writeset,
             .triggers = triggers,
             .bytecodes = bytecodes,
-            .limiter = request.limiter,
-            .instance_id = request.instance_id,
-            .plan_rate = request.plan_rate,
-            .plan_gen = request.plan_gen,
-            .correlation_id = request.correlation_id orelse "",
-            .platform_caps = request.platform_caps,
-            .resume_if_bound = request.resume_if_bound,
-            .resume_if_bound_ctx = request.resume_if_bound_ctx,
-            .cancel_fetch = request.cancel_fetch,
-            .cancel_fetch_ctx = request.cancel_fetch_ctx,
-            .set_wake = request.set_wake,
-            .set_wake_ctx = request.set_wake_ctx,
-            .fire_wake = request.fire_wake,
-            .fire_wake_ctx = request.fire_wake_ctx,
+            .limiter = request.plan.limiter,
+            .instance_id = request.plan.instance_id,
+            .plan_rate = request.plan.plan_rate,
+            .plan_gen = request.plan.plan_gen,
+            .correlation_id = request.trace.correlation_id orelse "",
+            .platform_caps = request.admin.platform_caps,
+            .resume_if_bound = request.trampolines.resume_if_bound,
+            .resume_if_bound_ctx = request.trampolines.resume_if_bound_ctx,
+            .cancel_fetch = request.trampolines.cancel_fetch,
+            .cancel_fetch_ctx = request.trampolines.cancel_fetch_ctx,
+            .set_wake = request.trampolines.set_wake,
+            .set_wake_ctx = request.trampolines.set_wake_ctx,
+            .fire_wake = request.trampolines.fire_wake,
+            .fire_wake_ctx = request.trampolines.fire_wake_ctx,
             .activation_entity = request.activation_entity,
             .activation_fetches_pending = request.activation_fetches_pending,
-            .pending_fetches = request.pending_fetches,
-            .pending_wakes = request.pending_wakes,
-            .pending_stream_chunks = request.pending_stream_chunks,
-            .pending_stream_chunk_opcodes = request.pending_stream_chunk_opcodes,
+            .pending_fetches = request.effects.pending_fetches,
+            .pending_wakes = request.effects.pending_wakes,
+            .pending_stream_chunks = request.effects.pending_stream_chunks,
+            .pending_stream_chunk_opcodes = request.effects.pending_stream_chunk_opcodes,
             .is_system_module = request.is_system_module,
         };
 
@@ -594,16 +263,16 @@ pub const Dispatcher = struct {
         // for any `import` the handler performs from the deployment's
         // per-path map. Reinstalled per request so each request sees
         // its own tenant's bytecodes.
-        var loader_ctx = module_loader.Ctx{
+        var loader_ctx = module_execution.module_loader.Ctx{
             .allocator = self.allocator,
             .bytecodes = bytecodes,
             .source_hashes = source_hashes,
-            .module_tape = if (request.readset) |rs| &rs.module else null,
+            .module_tape = if (request.trace.readset) |rs| &rs.module else null,
         };
         c.JS_SetModuleLoaderFunc(
             rt.raw,
-            module_loader.normalize,
-            module_loader.load,
+            module_execution.module_loader.normalize,
+            module_execution.module_loader.load,
             &loader_ctx,
         );
 
@@ -638,10 +307,10 @@ pub const Dispatcher = struct {
             break :blk null;
         };
         if (mw_bytecode_opt) |mw_bc| {
-            const mw_fun_val = (try loadModuleBytecode(&ctx, self.allocator, mw_bc, &pending,
+            const mw_fun_val = (try module_execution.loadModuleBytecode(&ctx, self.allocator, mw_bc, &pending,
                 "_middlewares/index.mjs is not an ES module")) orelse
                 return finishResponse(self, &state, &pending, &console_buf);
-            runMiddleware(self, &rt, &ctx, mw_fun_val, budget, &pending) catch |err| switch (err) {
+            module_execution.runMiddleware(self, &rt, &ctx, mw_fun_val, budget, &pending) catch |err| switch (err) {
                 error.Interrupted => return DispatchError.Interrupted,
                 error.OutOfMemory => return DispatchError.OutOfMemory,
                 error.JsException => pending.short_circuit = true,
@@ -652,11 +321,11 @@ pub const Dispatcher = struct {
             return finishResponse(self, &state, &pending, &console_buf);
         }
 
-        const fun_val = (try loadModuleBytecode(&ctx, self.allocator, bytecode, &pending,
+        const fun_val = (try module_execution.loadModuleBytecode(&ctx, self.allocator, bytecode, &pending,
             "handler bytecode is not an ES module (.mjs)")) orelse
             return finishResponse(self, &state, &pending, &console_buf);
 
-        runModule(self, &rt, &ctx, fun_val, request, budget, &pending) catch |err| switch (err) {
+        module_execution.runModule(self, &rt, &ctx, fun_val, request, budget, &pending) catch |err| switch (err) {
             error.Interrupted => return DispatchError.Interrupted,
             error.OutOfMemory => return DispatchError.OutOfMemory,
             error.JsException => {}, // pending.exception already populated
@@ -719,998 +388,6 @@ pub const Dispatcher = struct {
         }
     }
 };
-
-const RunError = error{ Interrupted, OutOfMemory, JsException };
-
-/// Mutable response state accumulated across the dispatcher's run.
-/// Bundled so the helpers and the run* functions take one pointer
-/// instead of six out-params each. `finishResponse` consumes it
-/// (cookies/headers via `toOwnedSlice`, body/exception via direct
-/// transfer); on the error paths the caller's errdefer fires
-/// `deinit` to free anything still owned here.
-const PendingResponse = struct {
-    status: i32 = 200,
-    body: []u8 = &.{},
-    body_is_json: bool = false,
-    exception: []u8 = &.{},
-    cookies: std.ArrayList([]u8) = .empty,
-    headers: std.ArrayList(ResponseHeader) = .empty,
-    /// Set by `runMiddleware` when the middleware returns a non-
-    /// undefined/null value (or a malformed module) — the caller
-    /// skips the handler and goes straight to `finishResponse`.
-    short_circuit: bool = false,
-    /// Set by the handler path when the return value is a branded
-    /// `next(...)` descriptor. Transient (consumed by `finishResponse`
-    /// into the `RunOutcome.continuation` arm); never travels with an
-    /// h2 entity. Handler-path only — middleware may not return a
-    /// continuation in v1 (plan §3b B6).
-    continuation: ?continuation_mod.Continuation = null,
-    fn deinit(self: *PendingResponse, allocator: std.mem.Allocator) void {
-        if (self.continuation) |*cont| cont.deinit(allocator);
-        allocator.free(self.body);
-        allocator.free(self.exception);
-        for (self.cookies.items) |c2| allocator.free(c2);
-        self.cookies.deinit(allocator);
-        for (self.headers.items) |h| {
-            allocator.free(h.name);
-            allocator.free(h.value);
-        }
-        self.headers.deinit(allocator);
-    }
-};
-
-/// Result of `JS_ReadObject` + module-tag validation. Returns `null`
-/// when bytecode failed to load or wasn't an ES module — `pending`
-/// has been populated with the appropriate exception/body and the
-/// caller should fall through to `finishResponse`.
-fn loadModuleBytecode(
-    ctx: *qjs.Context,
-    allocator: std.mem.Allocator,
-    bytecode: []const u8,
-    pending: *PendingResponse,
-    not_a_module_msg: []const u8,
-) DispatchError!?qjs.Value {
-    const obj = c.JS_ReadObject(ctx.raw, bytecode.ptr, bytecode.len, c.JS_READ_OBJ_BYTECODE);
-    var val: qjs.Value = .{ .raw = obj, .ctx = ctx.raw };
-    if (val.isException()) {
-        pending.exception = ctx.takeExceptionMessage(allocator) catch
-            return DispatchError.OutOfMemory;
-        val.deinit();
-        return null;
-    }
-    if (val.raw.tag != c.JS_TAG_MODULE) {
-        val.deinit();
-        pending.status = 500;
-        pending.body = allocator.dupe(u8, not_a_module_msg) catch
-            return DispatchError.OutOfMemory;
-        return null;
-    }
-    return val;
-}
-
-/// Steps shared by middleware and handler module execution: evaluate
-/// the module top level, drain microtasks, check for a rejected
-/// top-level await, then materialize the namespace. Returns the
-/// namespace JSValue; caller owns and must `JS_FreeValue` it.
-/// `fun_val_in` is consumed by `JS_EvalFunction` — caller must not
-/// reuse it after this call.
-fn evalModule(
-    d: *Dispatcher,
-    rt: *qjs.Runtime,
-    ctx: *qjs.Context,
-    fun_val_in: qjs.Value,
-    budget: *Budget,
-    pending: *PendingResponse,
-) RunError!c.JSValue {
-    const mod_def_ptr: ?*c.JSModuleDef = @ptrCast(@alignCast(fun_val_in.raw.u.ptr));
-
-    var fun_val = fun_val_in;
-    const eval_result = c.JS_EvalFunction(ctx.raw, fun_val.raw);
-    fun_val = undefined;
-    var eval_val: qjs.Value = .{ .raw = eval_result, .ctx = ctx.raw };
-    defer eval_val.deinit();
-
-    if (eval_val.isException()) {
-        pending.exception = ctx.takeExceptionMessage(d.allocator) catch
-            return error.OutOfMemory;
-        if (budgetExpired(budget)) return error.Interrupted;
-        return error.JsException;
-    }
-
-    rt.pumpJobs();
-    if (budgetExpired(budget)) return error.Interrupted;
-
-    if (c.JS_PromiseState(ctx.raw, eval_val.raw) == c.JS_PROMISE_REJECTED) {
-        const reason = c.JS_PromiseResult(ctx.raw, eval_val.raw);
-        defer c.JS_FreeValue(ctx.raw, reason);
-        pending.exception = jsValueToOwned(d.allocator, ctx.raw, reason) catch
-            return error.OutOfMemory;
-        return error.JsException;
-    }
-
-    const ns = c.JS_GetModuleNamespace(ctx.raw, mod_def_ptr);
-    if (c.JS_IsException(ns)) {
-        pending.exception = ctx.takeExceptionMessage(d.allocator) catch
-            return error.OutOfMemory;
-        return error.JsException;
-    }
-    return ns;
-}
-
-const UnwrappedCall = struct {
-    val: c.JSValue,
-    /// Caller must `JS_FreeValue` iff true (promise-fulfilled path
-    /// returns a fresh ref; the not-a-promise path returns a borrow).
-    owns: bool,
-};
-
-/// Steps shared by middleware-call and handler-call: check the call's
-/// return value for a synchronous exception, drain jobs, then unwrap
-/// the (possibly-promise) value. Throws `JsException` with `pending.
-/// exception` populated on either failure mode.
-fn awaitAndUnwrap(
-    d: *Dispatcher,
-    rt: *qjs.Runtime,
-    ctx: *qjs.Context,
-    ret_val: qjs.Value,
-    budget: *Budget,
-    pending: *PendingResponse,
-) RunError!UnwrappedCall {
-    if (ret_val.isException()) {
-        pending.exception = ctx.takeExceptionMessage(d.allocator) catch
-            return error.OutOfMemory;
-        if (budgetExpired(budget)) return error.Interrupted;
-        return error.JsException;
-    }
-
-    rt.pumpJobs();
-    if (budgetExpired(budget)) return error.Interrupted;
-
-    const final = unwrapPromise(ctx.raw, ret_val.raw);
-    if (final.rejected) {
-        pending.exception = jsValueToOwned(d.allocator, ctx.raw, final.val) catch
-            return error.OutOfMemory;
-        c.JS_FreeValue(ctx.raw, final.val);
-        return error.JsException;
-    }
-    return .{ .val = final.val, .owns = final.owns };
-}
-
-/// Populate `pending.body`/`body_is_json` from the handler's return
-/// value, then read `pending.status`/`cookies`/`headers` from the
-/// ambient `response` global.
-fn extractBodyAndMeta(
-    d: *Dispatcher,
-    ctx: *qjs.Context,
-    val: c.JSValue,
-    pending: *PendingResponse,
-) error{OutOfMemory}!void {
-    try bodyFromReturn(d.allocator, ctx.raw, val, &pending.body, &pending.body_is_json);
-    try extractResponseMetadata(d.allocator, ctx.raw, &pending.status, &pending.cookies, &pending.headers);
-}
-
-/// Run `_middlewares/index.mjs`'s `before` export. The middleware sees
-/// the same `globalThis.request` / `globalThis.response` the handler
-/// will see — its mutations (most usefully `request.auth = {...}`)
-/// persist into the handler's call.
-///
-/// Return-value semantics differ from `runModule`:
-/// - `undefined` / `null` → continue (no `short_circuit_out` set)
-/// - any other value → short-circuit. Return value becomes the body
-///   (same `bodyFromReturn` rules as a handler); status / cookies /
-///   custom headers come from the response global, also like a
-///   handler.
-///
-/// A throw or rejected promise sets `exception_out` and surfaces as
-/// `error.JsException`; the caller treats that as a short-circuit
-/// with whatever the response global says (typically 500).
-///
-/// Missing `before` export is treated as an operator-visible 500 —
-/// admin's bundle declares it on purpose, and customer middlewares
-/// that forget to export it deserve a loud failure.
-fn runMiddleware(
-    d: *Dispatcher,
-    rt: *qjs.Runtime,
-    ctx: *qjs.Context,
-    fun_val_in: qjs.Value,
-    budget: *Budget,
-    pending: *PendingResponse,
-) RunError!void {
-    const ns = try evalModule(d, rt, ctx, fun_val_in, budget, pending);
-    defer c.JS_FreeValue(ctx.raw, ns);
-
-    const before_fn = c.JS_GetPropertyStr(ctx.raw, ns, "before");
-    defer c.JS_FreeValue(ctx.raw, before_fn);
-    if (c.JS_IsException(before_fn) or !c.JS_IsFunction(ctx.raw, before_fn)) {
-        // No `before` export — surface as a 500 rather than silently
-        // skipping. A malformed middleware should be loud.
-        _ = ctx.takeException();
-        pending.status = 500;
-        pending.body = std.fmt.allocPrint(
-            d.allocator,
-            "_middlewares/index.mjs must export a `before` function\n",
-            .{},
-        ) catch return error.OutOfMemory;
-        pending.short_circuit = true;
-        return;
-    }
-
-    const ret = c.JS_Call(ctx.raw, before_fn, globals.js_undefined, 0, null);
-    var ret_val: qjs.Value = .{ .raw = ret, .ctx = ctx.raw };
-    defer ret_val.deinit();
-
-    const result = try awaitAndUnwrap(d, rt, ctx, ret_val, budget, pending);
-    defer if (result.owns) c.JS_FreeValue(ctx.raw, result.val);
-
-    // Undefined / null → middleware passed; handler runs next. Any
-    // mutations to globalThis.request and globalThis.response made
-    // along the way persist via the shared QJS context.
-    if (c.JS_IsUndefined(result.val) or c.JS_IsNull(result.val)) return;
-
-    // Otherwise short-circuit: middleware's return value becomes the
-    // body, response-global metadata applies as if it were a handler.
-    extractBodyAndMeta(d, ctx, result.val, pending) catch
-        return error.OutOfMemory;
-    pending.short_circuit = true;
-}
-
-/// Evaluate the module top-level, drain jobs, look up `exports[fn]`
-/// (fn picked via `?fn=X` on GET or `{fn,args}` JSON body on POST),
-/// and call it with positional `args` spread in. The return value
-/// becomes the response body; status/headers/cookies come from the
-/// ambient `response` global. See `Dispatcher.run` for the full
-/// contract.
-fn runModule(
-    d: *Dispatcher,
-    rt: *qjs.Runtime,
-    ctx: *qjs.Context,
-    fun_val_in: qjs.Value,
-    request: Request,
-    budget: *Budget,
-    pending: *PendingResponse,
-) RunError!void {
-    const ns = try evalModule(d, rt, ctx, fun_val_in, budget, pending);
-    defer c.JS_FreeValue(ctx.raw, ns);
-
-    // ── Resolve fn name + args JSON from the request. ─────────────
-    var dispatch = parseDispatch(d.allocator, request) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.BadRequest => {
-            pending.status = 400;
-            pending.body = std.fmt.allocPrint(d.allocator,
-                "RPC envelope: `fn` must be a string and `args` must be an array\n", .{}) catch return error.OutOfMemory;
-            return;
-        },
-    };
-    defer dispatch.deinit(d.allocator);
-
-    const fn_name_z = std.fmt.allocPrintSentinel(d.allocator, "{s}", .{dispatch.fn_name}, 0) catch
-        return error.OutOfMemory;
-    defer d.allocator.free(fn_name_z);
-
-    const handler = c.JS_GetPropertyStr(ctx.raw, ns, fn_name_z.ptr);
-    defer c.JS_FreeValue(ctx.raw, handler);
-    if (c.JS_IsException(handler) or !c.JS_IsFunction(ctx.raw, handler)) {
-        // Handler-surface Phase 4: a missing `onDisconnect` is a no-op,
-        // not a 404 — disconnect cleanup is optional (the held stream
-        // closes regardless). Other kinds (onWake, etc.) DO require the
-        // export; the §6 deploy-time coverage lint flags those.
-        if (request.activation_source == .disconnect) {
-            _ = ctx.takeException();
-            return;
-        }
-        pending.status = 404;
-        pending.body = std.fmt.allocPrint(
-            d.allocator,
-            "module export \"{s}\" not found or not a function\n",
-            .{dispatch.fn_name},
-        ) catch return error.OutOfMemory;
-        return;
-    }
-
-    // Parse the args array as a single JSON value, then pull each
-    // element by index. Cheaper than re-parsing per element, and
-    // lets qjs handle all the nested-value construction in one pass.
-    //
-    // `JS_ParseJSON` (like `JS_Eval`) reads one byte past the
-    // declared length for UTF-8 validation, so the source MUST be
-    // NUL-terminated. Copy into an allocSentinel buffer.
-    const args_text = dispatch.args_json_text;
-    const args_text_z = d.allocator.allocSentinel(u8, args_text.len, 0) catch
-        return error.OutOfMemory;
-    defer d.allocator.free(args_text_z);
-    @memcpy(args_text_z, args_text);
-    const args_arr = c.JS_ParseJSON(
-        ctx.raw,
-        args_text_z.ptr,
-        args_text.len,
-        "<args>",
-    );
-    defer c.JS_FreeValue(ctx.raw, args_arr);
-    if (c.JS_IsException(args_arr)) {
-        pending.status = 400;
-        pending.body = std.fmt.allocPrint(d.allocator, "args JSON parse failed\n", .{}) catch
-            return error.OutOfMemory;
-        _ = ctx.takeException();
-        return;
-    }
-    const args_len_val = c.JS_GetPropertyStr(ctx.raw, args_arr, "length");
-    defer c.JS_FreeValue(ctx.raw, args_len_val);
-    var args_len: u32 = 0;
-    _ = c.JS_ToUint32(ctx.raw, &args_len, args_len_val);
-
-    const args_js = d.allocator.alloc(c.JSValue, args_len) catch
-        return error.OutOfMemory;
-    defer {
-        for (args_js) |v| c.JS_FreeValue(ctx.raw, v);
-        d.allocator.free(args_js);
-    }
-    var idx: u32 = 0;
-    while (idx < args_len) : (idx += 1) {
-        args_js[idx] = c.JS_GetPropertyUint32(ctx.raw, args_arr, idx);
-    }
-
-    const ret = c.JS_Call(
-        ctx.raw,
-        handler,
-        globals.js_undefined,
-        @intCast(args_js.len),
-        if (args_js.len == 0) null else args_js.ptr,
-    );
-    var ret_val: qjs.Value = .{ .raw = ret, .ctx = ctx.raw };
-    defer ret_val.deinit();
-
-    const result = try awaitAndUnwrap(d, rt, ctx, ret_val, budget, pending);
-    defer if (result.owns) c.JS_FreeValue(ctx.raw, result.val);
-
-    // Trampoline classification — handler path ONLY (middleware may
-    // not return a continuation in v1, plan §3b B6, so this is not in
-    // the shared `extractBodyAndMeta`). A branded `next(...)` return
-    // short-circuits the body path; `finishResponse` hands it up as
-    // `RunOutcome.continuation` and the entity moves to
-    // `parked_continuations` upstream (collection membership, not a
-    // persisted discriminant).
-    if (try continuation_mod.tryExtract(d.allocator, ctx.raw, result.val)) |cont| {
-        pending.continuation = cont;
-        // Handler-surface Phase 2: a `stream.*` + `next()` activation
-        // commits the ambient `response.*` head NOW (stream.start). A
-        // plain `next()` defers the head — nothing to capture. Pull
-        // status/headers/cookies so `finishResponse`'s stream bridge has
-        // them (a bare continuation skips this and the head stays open).
-        const st = globals.getState(ctx.raw);
-        if (st.stream_started) {
-            extractResponseMetadata(d.allocator, ctx.raw, &pending.status, &pending.cookies, &pending.headers) catch
-                return error.OutOfMemory;
-        }
-        return;
-    }
-    // Handler-surface Phase 2: the `__rove_stream(...)` return verb is
-    // gone — a streaming handler returns `next()` (handled above, with
-    // the ambient head captured when `stream_started`) and produces
-    // output via the `stream.*` effects, which `finishResponse` bridges
-    // to the internal Stream descriptor.
-
-    // Body from return value. Status / cookies from the ambient
-    // `response` global.
-    extractBodyAndMeta(d, ctx, result.val, pending) catch
-        return error.OutOfMemory;
-}
-
-/// Parsed `(fn, args)` from a request. `args_json_text` is a raw
-/// JSON array literal (e.g. `[]`, `["foo", 42]`); the caller does
-/// one `JS_ParseJSON` on it and spreads the elements into the
-/// handler call.
-const DispatchCall = struct {
-    fn_name: []u8,
-    args_json_text: []u8,
-
-    fn deinit(self: *DispatchCall, allocator: std.mem.Allocator) void {
-        allocator.free(self.fn_name);
-        allocator.free(self.args_json_text);
-        self.* = undefined;
-    }
-};
-
-fn parseDispatch(
-    allocator: std.mem.Allocator,
-    request: Request,
-) (error{ OutOfMemory, BadRequest })!DispatchCall {
-    // RPC envelope path: a JSON-looking POST body whose top-level
-    // object has `fn: string` (and optionally `args: array`). Anything
-    // else — a non-JSON body, an array body, an object without `fn`,
-    // or a parse failure — is treated as opaque payload and falls
-    // through to the query-string path. The handler reads the raw
-    // body via `request.body` in that case.
-    if (request.body.len > 0 and looksLikeJson(request.body)) {
-        if (std.json.parseFromSlice(
-            std.json.Value,
-            allocator,
-            request.body,
-            .{},
-        )) |parsed| {
-            defer parsed.deinit();
-            if (parsed.value == .object) {
-                if (parsed.value.object.get("fn")) |fn_val| {
-                    if (fn_val != .string) return error.BadRequest;
-                    const fn_owned = try allocator.dupe(u8, fn_val.string);
-                    errdefer allocator.free(fn_owned);
-
-                    const args_text = if (parsed.value.object.get("args")) |v| blk: {
-                        if (v != .array) return error.BadRequest;
-                        break :blk try jsonArrayToOwnedText(allocator, v.array.items);
-                    } else try allocator.dupe(u8, "[]");
-
-                    return .{ .fn_name = fn_owned, .args_json_text = args_text };
-                }
-            }
-        } else |_| {}
-    }
-
-    // Query-string path: ?fn=name[&args=<urlencoded-json-array>].
-    // Both optional. Missing or empty fn → the activation kind's
-    // conventional export (handler-surface Phase 4, docs/handler-shape.md
-    // §3): a `wake_batch` (`on.kv`/`on.timer`) resume lands in `onWake`,
-    // inbound + everything that names its own target (the `?fn=`/`{fn}`
-    // resume paths: send_callback, fetch_chunk, cron, subscription) stay
-    // `default`. Named exports replace the `request.activation.kind`
-    // switch as the dispatch surface.
-    const query = request.query orelse "";
-    const fn_owned: []u8 = blk: {
-        if (queryParam(query, "fn")) |s| {
-            if (s.len > 0) break :blk try decodePercent(allocator, s);
-        }
-        break :blk try allocator.dupe(u8, defaultExportForKind(request.activation_source));
-    };
-    errdefer allocator.free(fn_owned);
-
-    const args_text: []u8 = blk: {
-        if (queryParam(query, "args")) |s| {
-            if (s.len > 0) break :blk try decodePercent(allocator, s);
-        }
-        break :blk try allocator.dupe(u8, "[]");
-    };
-
-    return .{ .fn_name = fn_owned, .args_json_text = args_text };
-}
-
-/// Handler-surface Phase 4: map an activation source to its conventional
-/// named export, used when the resume path didn't name one explicitly
-/// (`?fn=`/`{fn}`). `wake_batch` (the `on.kv`/`on.timer` edge wake — and
-/// the legacy singular `kv_wake`/`timer`) lands in `onWake`. Inbound and
-/// the kinds whose resume path always names its own target — send_callback
-/// (the `next({fn})` / `on_result`), fetch_chunk (`{to}`/`onFetchChunk`),
-/// cron + subscription_fire (the registration's export), durable_wake (the
-/// baked `scheduler_tick` default) — fall through to `default`, so this
-/// only changes the previously-unrouted stream-wake + (future) paths.
-fn defaultExportForKind(src: ActivationSource) []const u8 {
-    return switch (src) {
-        .wake_batch, .kv_wake, .timer => "onWake",
-        .disconnect => "onDisconnect",
-        .ws_message => "onMessage",
-        else => "default",
-    };
-}
-
-fn looksLikeJson(body: []const u8) bool {
-    var i: usize = 0;
-    while (i < body.len and (body[i] == ' ' or body[i] == '\t' or body[i] == '\n' or body[i] == '\r')) i += 1;
-    return i < body.len and (body[i] == '{' or body[i] == '[');
-}
-
-/// Re-serialize a parsed `std.json.Value` array (POST body's `args`
-/// field) back into compact JSON text. The returned buffer is a full
-/// JSON array literal like `[1,"two",{"k":"v"}]` ready for one
-/// `JS_ParseJSON` on the qjs side.
-fn jsonArrayToOwnedText(
-    allocator: std.mem.Allocator,
-    items: []const std.json.Value,
-) error{OutOfMemory}![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    try buf.append(allocator, '[');
-    for (items, 0..) |item, i| {
-        if (i > 0) try buf.append(allocator, ',');
-        try stringifyJson(allocator, &buf, item);
-    }
-    try buf.append(allocator, ']');
-    return buf.toOwnedSlice(allocator);
-}
-
-fn stringifyJson(
-    allocator: std.mem.Allocator,
-    buf: *std.ArrayList(u8),
-    v: std.json.Value,
-) error{OutOfMemory}!void {
-    switch (v) {
-        .null => try buf.appendSlice(allocator, "null"),
-        .bool => |b| try buf.appendSlice(allocator, if (b) "true" else "false"),
-        .integer => |i| {
-            var tmp: [24]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "{d}", .{i}) catch unreachable;
-            try buf.appendSlice(allocator, s);
-        },
-        .float => |f| {
-            var tmp: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "{d}", .{f}) catch unreachable;
-            try buf.appendSlice(allocator, s);
-        },
-        .number_string => |s| try buf.appendSlice(allocator, s),
-        .string => |s| try writeJsonEscaped(allocator, buf, s),
-        .array => |arr| {
-            try buf.append(allocator, '[');
-            for (arr.items, 0..) |item, i| {
-                if (i > 0) try buf.append(allocator, ',');
-                try stringifyJson(allocator, buf, item);
-            }
-            try buf.append(allocator, ']');
-        },
-        .object => |obj| {
-            try buf.append(allocator, '{');
-            var it = obj.iterator();
-            var first = true;
-            while (it.next()) |kv| {
-                if (!first) try buf.append(allocator, ',');
-                first = false;
-                try writeJsonEscaped(allocator, buf, kv.key_ptr.*);
-                try buf.append(allocator, ':');
-                try stringifyJson(allocator, buf, kv.value_ptr.*);
-            }
-            try buf.append(allocator, '}');
-        },
-    }
-}
-
-fn writeJsonEscaped(
-    allocator: std.mem.Allocator,
-    buf: *std.ArrayList(u8),
-    s: []const u8,
-) error{OutOfMemory}!void {
-    try buf.append(allocator, '"');
-    for (s) |b| switch (b) {
-        '"' => try buf.appendSlice(allocator, "\\\""),
-        '\\' => try buf.appendSlice(allocator, "\\\\"),
-        '\n' => try buf.appendSlice(allocator, "\\n"),
-        '\r' => try buf.appendSlice(allocator, "\\r"),
-        '\t' => try buf.appendSlice(allocator, "\\t"),
-        0x08 => try buf.appendSlice(allocator, "\\b"),
-        0x0C => try buf.appendSlice(allocator, "\\f"),
-        0x00...0x07, 0x0B, 0x0E...0x1F => {
-            var tmp: [6]u8 = undefined;
-            const hex = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{b}) catch unreachable;
-            try buf.appendSlice(allocator, hex);
-        },
-        else => try buf.append(allocator, b),
-    };
-    try buf.append(allocator, '"');
-}
-
-fn queryParam(query: []const u8, name: []const u8) ?[]const u8 {
-    var it = std.mem.splitScalar(u8, query, '&');
-    while (it.next()) |pair| {
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse {
-            if (std.mem.eql(u8, pair, name)) return "";
-            continue;
-        };
-        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
-    }
-    return null;
-}
-
-fn decodePercent(allocator: std.mem.Allocator, encoded: []const u8) error{OutOfMemory}![]u8 {
-    var buf = try allocator.alloc(u8, encoded.len);
-    errdefer allocator.free(buf);
-    var w: usize = 0;
-    var i: usize = 0;
-    while (i < encoded.len) {
-        const b = encoded[i];
-        if (b == '+') {
-            buf[w] = ' ';
-            w += 1;
-            i += 1;
-        } else if (b == '%' and i + 2 < encoded.len) {
-            const hi = std.fmt.charToDigit(encoded[i + 1], 16) catch {
-                buf[w] = b;
-                w += 1;
-                i += 1;
-                continue;
-            };
-            const lo = std.fmt.charToDigit(encoded[i + 2], 16) catch {
-                buf[w] = b;
-                w += 1;
-                i += 1;
-                continue;
-            };
-            buf[w] = (hi << 4) | lo;
-            w += 1;
-            i += 3;
-        } else {
-            buf[w] = b;
-            w += 1;
-            i += 1;
-        }
-    }
-    return allocator.realloc(buf, w) catch buf[0..w];
-}
-
-fn budgetExpired(budget: *Budget) bool {
-    const now: i64 = @intCast(std.time.nanoTimestamp());
-    return now >= budget.deadline_ns;
-}
-
-const Unwrapped = struct {
-    val: c.JSValue,
-    rejected: bool,
-    /// Caller is responsible for freeing `val` iff this is true (the
-    /// promise-fulfilled path gives us a new reference).
-    owns: bool,
-};
-
-fn unwrapPromise(ctx: *c.JSContext, v: c.JSValue) Unwrapped {
-    const st = c.JS_PromiseState(ctx, v);
-    if (st == c.JS_PROMISE_FULFILLED) {
-        const r = c.JS_PromiseResult(ctx, v);
-        return .{ .val = r, .rejected = false, .owns = true };
-    }
-    if (st == c.JS_PROMISE_REJECTED) {
-        const r = c.JS_PromiseResult(ctx, v);
-        return .{ .val = r, .rejected = true, .owns = true };
-    }
-    // Not a promise, or still pending (shouldn't happen after pumpJobs).
-    return .{ .val = v, .rejected = false, .owns = false };
-}
-
-/// Convert the handler's return value to bytes:
-///   - string       → raw string (no JSON quoting); `is_json_out` = false
-///   - undefined/null → empty body; `is_json_out` = false
-///   - anything else → `JSON.stringify(ret)`; `is_json_out` = true
-fn bodyFromReturn(
-    allocator: std.mem.Allocator,
-    ctx: *c.JSContext,
-    ret: c.JSValue,
-    body_out: *[]u8,
-    is_json_out: *bool,
-) error{OutOfMemory}!void {
-    is_json_out.* = false;
-    if (c.JS_IsUndefined(ret) or c.JS_IsNull(ret)) return;
-    if (c.JS_IsString(ret)) {
-        body_out.* = jsValueToOwned(allocator, ctx, ret) catch return error.OutOfMemory;
-        return;
-    }
-    // JSON.stringify via the C API.
-    const json = c.JS_JSONStringify(ctx, ret, globals.js_undefined, globals.js_undefined);
-    defer c.JS_FreeValue(ctx, json);
-    if (c.JS_IsException(json) or c.JS_IsUndefined(json)) return;
-    body_out.* = jsValueToOwned(allocator, ctx, json) catch return error.OutOfMemory;
-    is_json_out.* = true;
-}
-
-/// Pull status + cookies + custom headers off the ambient `response`
-/// global. Body is NOT read from here — it always comes from the
-/// return value.
-///
-/// - `response.status` → `status_out`
-/// - `response.cookies` (array of strings) → `cookies_out`, each
-///   sanitized via `sanitizeSetCookie`
-/// - `response.headers` (object, string→string) → `headers_out`,
-///   filtered to reject pseudo-headers (`:xxx`), hop-by-hop names,
-///   and `set-cookie` (cookies go through the dedicated array so
-///   sanitization fires). Names are lowercased to match HTTP/2.
-fn extractResponseMetadata(
-    allocator: std.mem.Allocator,
-    ctx: *c.JSContext,
-    status_out: *i32,
-    cookies_out: *std.ArrayList([]u8),
-    headers_out: *std.ArrayList(ResponseHeader),
-) error{OutOfMemory}!void {
-    const global_obj = c.JS_GetGlobalObject(ctx);
-    defer c.JS_FreeValue(ctx, global_obj);
-    const resp_val = c.JS_GetPropertyStr(ctx, global_obj, "response");
-    defer c.JS_FreeValue(ctx, resp_val);
-    if (c.JS_IsUndefined(resp_val) or c.JS_IsNull(resp_val)) return;
-
-    const status_val = c.JS_GetPropertyStr(ctx, resp_val, "status");
-    defer c.JS_FreeValue(ctx, status_val);
-    if (!c.JS_IsUndefined(status_val) and !c.JS_IsNull(status_val)) {
-        _ = c.JS_ToInt32(ctx, status_out, status_val);
-    }
-
-    // ── response.cookies ────────────────────────────────────────
-    const cookies_val = c.JS_GetPropertyStr(ctx, resp_val, "cookies");
-    defer c.JS_FreeValue(ctx, cookies_val);
-    if (!c.JS_IsUndefined(cookies_val) and !c.JS_IsNull(cookies_val) and c.JS_IsArray(cookies_val)) {
-        const len_val = c.JS_GetPropertyStr(ctx, cookies_val, "length");
-        defer c.JS_FreeValue(ctx, len_val);
-        var n: u32 = 0;
-        _ = c.JS_ToUint32(ctx, &n, len_val);
-        // Hard cap — a pathological handler pushing thousands of
-        // cookies would blow up the HPACK table on every proxy hop.
-        const cap: u32 = @min(n, 32);
-
-        var i: u32 = 0;
-        while (i < cap) : (i += 1) {
-            const elem = c.JS_GetPropertyUint32(ctx, cookies_val, i);
-            defer c.JS_FreeValue(ctx, elem);
-            if (!c.JS_IsString(elem)) continue;
-            var raw_len: usize = 0;
-            const cstr = c.JS_ToCStringLen(ctx, &raw_len, elem);
-            if (cstr == null) continue;
-            defer c.JS_FreeCString(ctx, cstr);
-            if (raw_len == 0) continue;
-            const raw = @as([*]const u8, @ptrCast(cstr))[0..raw_len];
-            const sanitized = try sanitizeSetCookie(allocator, raw);
-            if (sanitized.len == 0) {
-                allocator.free(sanitized);
-                continue;
-            }
-            cookies_out.append(allocator, sanitized) catch |err| {
-                allocator.free(sanitized);
-                return err;
-            };
-        }
-    }
-
-    // ── response.headers ────────────────────────────────────────
-    //
-    // Object keys become header names (lowercased); string values
-    // become header values. Disallowed names are silently dropped —
-    // handler bugs shouldn't 500 the request. Hard cap 32 for the
-    // same HPACK reason as cookies.
-    const headers_val = c.JS_GetPropertyStr(ctx, resp_val, "headers");
-    defer c.JS_FreeValue(ctx, headers_val);
-    if (c.JS_IsUndefined(headers_val) or c.JS_IsNull(headers_val) or !c.JS_IsObject(headers_val)) return;
-
-    var prop_enum: [*c]c.JSPropertyEnum = null;
-    var prop_count: u32 = 0;
-    const flags: c_int = c.JS_GPN_STRING_MASK | c.JS_GPN_ENUM_ONLY;
-    if (c.JS_GetOwnPropertyNames(ctx, &prop_enum, &prop_count, headers_val, flags) < 0) return;
-    defer c.js_free(ctx, prop_enum);
-
-    const hdr_cap: u32 = @min(prop_count, 32);
-    var hi: u32 = 0;
-    while (hi < hdr_cap) : (hi += 1) {
-        const atom = prop_enum[hi].atom;
-        defer c.JS_FreeAtom(ctx, atom);
-        const name_cstr = c.JS_AtomToCString(ctx, atom);
-        if (name_cstr == null) continue;
-        defer c.JS_FreeCString(ctx, name_cstr);
-        const raw_name = std.mem.span(name_cstr);
-        if (!isEmittableHeaderName(raw_name)) continue;
-
-        const val = c.JS_GetProperty(ctx, headers_val, atom);
-        defer c.JS_FreeValue(ctx, val);
-        if (!c.JS_IsString(val)) continue;
-        var val_len: usize = 0;
-        const val_cstr = c.JS_ToCStringLen(ctx, &val_len, val);
-        if (val_cstr == null) continue;
-        defer c.JS_FreeCString(ctx, val_cstr);
-        const raw_val = @as([*]const u8, @ptrCast(val_cstr))[0..val_len];
-        if (!isCleanHeaderValue(raw_val)) continue;
-
-        const name_owned = try allocator.alloc(u8, raw_name.len);
-        errdefer allocator.free(name_owned);
-        for (raw_name, 0..) |b, i| name_owned[i] = std.ascii.toLower(b);
-
-        const val_owned = try allocator.alloc(u8, raw_val.len);
-        errdefer allocator.free(val_owned);
-        @memcpy(val_owned, raw_val);
-
-        headers_out.append(allocator, .{ .name = name_owned, .value = val_owned }) catch |err| {
-            allocator.free(name_owned);
-            allocator.free(val_owned);
-            return err;
-        };
-    }
-}
-
-/// Reject HTTP/2 pseudo-headers, hop-by-hop names, and the names
-/// we manage ourselves (cookies go through a sanitized pipeline,
-/// content-length is computed from the body). Case-insensitive.
-fn isEmittableHeaderName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    if (name[0] == ':') return false; // HTTP/2 pseudo-header
-    for (name) |b| {
-        // RFC 7230 token chars — be liberal, reject obvious garbage.
-        if (b <= 0x20 or b == 0x7f) return false;
-    }
-    const reserved = [_][]const u8{
-        "connection",      "transfer-encoding", "upgrade",
-        "keep-alive",      "te",                "trailer",
-        "proxy-authenticate", "proxy-authorization",
-        "set-cookie",      "content-length",
-    };
-    for (reserved) |n| {
-        if (std.ascii.eqlIgnoreCase(name, n)) return false;
-    }
-    return true;
-}
-
-/// Header values must not contain CR / LF (header-injection) or NUL.
-/// Everything else is opaque to us.
-fn isCleanHeaderValue(value: []const u8) bool {
-    for (value) |b| {
-        if (b == '\r' or b == '\n' or b == 0) return false;
-    }
-    return true;
-}
-
-/// Return an owned copy of `raw` with any `Domain=...` attribute
-/// stripped. Attribute matching is case-insensitive on the name and
-/// tolerant of surrounding whitespace. Everything else (name=value,
-/// Path, HttpOnly, Secure, SameSite, Max-Age, Expires, ...) is
-/// preserved in order.
-///
-/// **Why**: a customer handler writing
-/// `Set-Cookie: foo=bar; Domain=loop46.me` would push the cookie
-/// onto the parent domain, where a different tenant's handler would
-/// read it. The PSL entry at the browser level blocks this too, but
-/// server-side stripping is the authoritative defense and the one
-/// thing we control (PSL propagation can lag by browser version).
-///
-/// If `raw` is already Domain-free, the output is byte-identical.
-pub fn sanitizeSetCookie(
-    allocator: std.mem.Allocator,
-    raw: []const u8,
-) error{OutOfMemory}![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-
-    // A Set-Cookie value is `name=value` followed by zero or more
-    // `; attr[=val]` segments. Split on `;`, keep the first segment
-    // verbatim, filter `Domain` from the rest.
-    var it = std.mem.splitScalar(u8, raw, ';');
-    var first = true;
-    while (it.next()) |raw_seg| {
-        const seg = std.mem.trim(u8, raw_seg, " \t");
-        if (first) {
-            // Preserve the cookie's name=value as-is (caller already
-            // built it); trim only leading/trailing whitespace.
-            try buf.appendSlice(allocator, seg);
-            first = false;
-            continue;
-        }
-        if (seg.len == 0) continue; // `foo=bar;;baz` → drop empty
-        const eq = std.mem.indexOfScalar(u8, seg, '=');
-        const attr_name = if (eq) |e| seg[0..e] else seg;
-        const attr_trim = std.mem.trim(u8, attr_name, " \t");
-        if (std.ascii.eqlIgnoreCase(attr_trim, "domain")) continue;
-        try buf.appendSlice(allocator, "; ");
-        try buf.appendSlice(allocator, seg);
-    }
-    return buf.toOwnedSlice(allocator);
-}
-
-// ── Module loader ──────────────────────────────────────────────────────
-
-/// Shared module loader infrastructure. Mounted onto the per-request
-/// runtime via `JS_SetModuleLoaderFunc` so `import { x } from "./y.mjs"`
-/// in handlers resolves against the deployment's bytecode map.
-pub const module_loader = struct {
-    pub const Ctx = struct {
-        allocator: std.mem.Allocator,
-        /// Path → bytecode lease into the node-wide cache. Null
-        /// means the caller opted out of imports (tests, trivial
-        /// single-file handlers).
-        bytecodes: ?*const std.StringHashMapUnmanaged(*BlobBytes),
-        /// Path → source-blob hash hex (64 chars). Parallel to
-        /// `bytecodes` and populated by the same TenantFiles refresh
-        /// path. Read by `load` to populate the module-resolution
-        /// tape so replay can fetch the same source bytes by hash.
-        /// Null when no tape capture is requested.
-        source_hashes: ?*const std.StringHashMapUnmanaged([64]u8) = null,
-        /// Per-request module-resolution tape. Each successful `load`
-        /// appends one entry. Null when capture is disabled.
-        module_tape: ?*tape_mod.Tape = null,
-    };
-
-    /// Normalize `specifier` (relative or bare) against the importing
-    /// module's `base_name` into a canonical path key. Returns a
-    /// js_malloc'd buffer — quickjs owns it after this call.
-    pub fn normalize(
-        ctx: ?*c.JSContext,
-        base: [*c]const u8,
-        name: [*c]const u8,
-        _: ?*anyopaque,
-    ) callconv(.c) [*c]u8 {
-        const base_s = if (base != null) std.mem.span(base) else "";
-        const name_s = if (name != null) std.mem.span(name) else "";
-        const resolved = resolveSpecifier(base_s, name_s, static_buf[0..]);
-
-        // Copy into a qjs-allocated buffer so quickjs can free it.
-        const out = c.js_malloc(ctx, resolved.len + 1) orelse return null;
-        @memcpy(@as([*]u8, @ptrCast(out))[0..resolved.len], resolved);
-        @as([*]u8, @ptrCast(out))[resolved.len] = 0;
-        return @ptrCast(out);
-    }
-
-    pub fn load(
-        ctx: ?*c.JSContext,
-        name: [*c]const u8,
-        opaque_ptr: ?*anyopaque,
-    ) callconv(.c) ?*c.JSModuleDef {
-        const self: *const Ctx = @ptrCast(@alignCast(opaque_ptr.?));
-        const map = self.bytecodes orelse return null;
-        const name_s = std.mem.span(name);
-        const bb = map.get(name_s) orelse return null;
-        const obj = c.JS_ReadObject(ctx, bb.bytes.ptr, bb.bytes.len, c.JS_READ_OBJ_BYTECODE);
-        if (c.JS_IsException(obj)) return null;
-        if (obj.tag != c.JS_TAG_MODULE) {
-            c.JS_FreeValue(ctx, obj);
-            return null;
-        }
-        const mod_def: ?*c.JSModuleDef = @ptrCast(@alignCast(obj.u.ptr));
-        // `JS_ReadObject` returned a borrowed+held module value; qjs
-        // expects the loader to return the module def (which keeps
-        // its own reference). Drop the JSValue handle.
-        c.JS_FreeValue(ctx, obj);
-
-        // Capture the resolved import for replay. The replay shell
-        // reads each `(specifier, source_hash)` to fetch the same
-        // source bytes and build an importmap so the iframe's module
-        // graph matches production.
-        if (self.module_tape) |t| {
-            if (self.source_hashes) |hashes| {
-                if (hashes.get(name_s)) |hash| {
-                    t.appendModule(name_s, &hash) catch {};
-                }
-            }
-        }
-
-        return mod_def;
-    }
-
-    /// Stack buffer for a normalized path. 512 bytes is generous — path
-    /// lengths are bounded by `MAX_PATH_LEN` in rove-files.
-    threadlocal var static_buf: [512]u8 = undefined;
-};
-
-/// Resolve `specifier` ("./helper.mjs", "../lib/util", or a bare path)
-/// against `base` ("_api/kv/index.mjs") into a canonical deployment
-/// path key. Writes into `scratch` and returns a subslice pointing
-/// into it.
-fn resolveSpecifier(base: []const u8, specifier: []const u8, scratch: []u8) []const u8 {
-    // Bare / absolute specifiers pass through unchanged.
-    if (!std.mem.startsWith(u8, specifier, "./") and !std.mem.startsWith(u8, specifier, "../")) {
-        const n = @min(specifier.len, scratch.len);
-        @memcpy(scratch[0..n], specifier[0..n]);
-        return scratch[0..n];
-    }
-
-    // Determine the importing module's directory (everything before
-    // the final '/'). Empty if the importer is at the root.
-    var dir_len: usize = 0;
-    if (std.mem.lastIndexOfScalar(u8, base, '/')) |slash| dir_len = slash;
-
-    // Walk `specifier` applying "./" (skip) and "../" (pop one dir).
-    var dir_end = dir_len;
-    var rest = specifier;
-    while (true) {
-        if (std.mem.startsWith(u8, rest, "./")) {
-            rest = rest[2..];
-        } else if (std.mem.startsWith(u8, rest, "../")) {
-            if (std.mem.lastIndexOfScalar(u8, base[0..dir_end], '/')) |prev_slash| {
-                dir_end = prev_slash;
-            } else {
-                dir_end = 0;
-            }
-            rest = rest[3..];
-        } else break;
-    }
-
-    var w: usize = 0;
-    if (dir_end > 0) {
-        const n = @min(dir_end, scratch.len);
-        @memcpy(scratch[0..n], base[0..n]);
-        w = n;
-        if (w < scratch.len) {
-            scratch[w] = '/';
-            w += 1;
-        }
-    }
-    const tail = @min(rest.len, scratch.len - w);
-    @memcpy(scratch[w .. w + tail], rest[0..tail]);
-    w += tail;
-    return scratch[0..w];
-}
 
 fn finishResponse(
     d: *Dispatcher,
@@ -1908,20 +585,6 @@ fn prependStreamChunks(
     list.clearRetainingCapacity();
 }
 
-fn jsValueToOwned(
-    allocator: std.mem.Allocator,
-    ctx: *c.JSContext,
-    val: c.JSValue,
-) error{ OutOfMemory, JsException }![]u8 {
-    var len: usize = 0;
-    const cstr = c.JS_ToCStringLen(ctx, &len, val);
-    if (cstr == null) return error.JsException;
-    defer c.JS_FreeCString(ctx, cstr);
-    const out = try allocator.alloc(u8, len);
-    if (len > 0) @memcpy(out, @as([*]const u8, @ptrCast(cstr))[0..len]);
-    return out;
-}
-
 // ── Tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -1951,64 +614,6 @@ fn deinitTestBytecodes(map: *std.StringHashMapUnmanaged(*BlobBytes)) void {
     var it = map.iterator();
     while (it.next()) |e| testing.allocator.destroy(e.value_ptr.*);
     map.deinit(testing.allocator);
-}
-
-test "sanitizeSetCookie strips Domain attribute" {
-    const a = testing.allocator;
-
-    // Basic: Domain stripped, other attrs preserved.
-    {
-        const out = try sanitizeSetCookie(a, "foo=bar; Path=/; Domain=loop46.me; HttpOnly");
-        defer a.free(out);
-        try testing.expectEqualStrings("foo=bar; Path=/; HttpOnly", out);
-    }
-    // Case-insensitive attribute name.
-    {
-        const out = try sanitizeSetCookie(a, "sid=abc; domain=foo.com; SameSite=Lax");
-        defer a.free(out);
-        try testing.expectEqualStrings("sid=abc; SameSite=Lax", out);
-    }
-    {
-        const out = try sanitizeSetCookie(a, "sid=abc; DOMAIN=x.y.z; Secure");
-        defer a.free(out);
-        try testing.expectEqualStrings("sid=abc; Secure", out);
-    }
-    // No Domain = pass-through (only whitespace normalization).
-    {
-        const out = try sanitizeSetCookie(a, "a=b; Path=/; HttpOnly");
-        defer a.free(out);
-        try testing.expectEqualStrings("a=b; Path=/; HttpOnly", out);
-    }
-    // Leading/trailing spaces around attrs are trimmed on rewrite.
-    {
-        const out = try sanitizeSetCookie(a, "k=v;   Domain=foo  ;Path=/");
-        defer a.free(out);
-        try testing.expectEqualStrings("k=v; Path=/", out);
-    }
-    // Domain as the only attribute leaves only name=value.
-    {
-        const out = try sanitizeSetCookie(a, "k=v; Domain=loop46.me");
-        defer a.free(out);
-        try testing.expectEqualStrings("k=v", out);
-    }
-    // Flag-only attribute (no `=`) named "domain" still stripped.
-    {
-        const out = try sanitizeSetCookie(a, "k=v; Domain; HttpOnly");
-        defer a.free(out);
-        try testing.expectEqualStrings("k=v; HttpOnly", out);
-    }
-    // Value containing `=` (cookie value has embedded equals) preserved.
-    {
-        const out = try sanitizeSetCookie(a, "token=a=b=c; Domain=x; Secure");
-        defer a.free(out);
-        try testing.expectEqualStrings("token=a=b=c; Secure", out);
-    }
-    // Empty segment dropped without crashing.
-    {
-        const out = try sanitizeSetCookie(a, "k=v;;;Domain=x;;Path=/;;");
-        defer a.free(out);
-        try testing.expectEqualStrings("k=v; Path=/", out);
-    }
 }
 
 fn openTempKv(allocator: std.mem.Allocator, buf: *[64]u8) !*kv_mod.KvStore {
@@ -2255,7 +860,7 @@ test "dispatch: webhook.send writes _send/owed/{id} marker (immediate fire path)
     var resp = try runOne(&d, kv,
         \\const id = webhook.send({ url: "https://api.stripe.com/v1/charges", body: "x" });
         \\return id;
-    , .{ .method = "POST", .path = "/", .request_id = 7 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 7 } });
     defer resp.deinit(testing.allocator);
 
     const marker_raw = try readOwedMarker(kv, resp.body);
@@ -2292,7 +897,7 @@ test "dispatch: webhook.send with handle derives a stable id; same handle overwr
         \\const id1 = webhook.send({ handle: "reminder-foo", url: "https://x/" });
         \\const id2 = webhook.send({ handle: "reminder-foo", url: "https://y/", fire_at_ns: BigInt(Date.now() + 86400000) * 1000000n });
         \\return id1 + "|" + id2;
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
 
     // Same id twice — sha256(handle) is deterministic on input.
@@ -2326,7 +931,7 @@ test "dispatch: retry.send wraps webhook.send + carries _retry meta" {
         \\  max_attempts: 3,
         \\  context: { charge_id: 42 },
         \\});
-    , .{ .method = "POST", .path = "/", .request_id = 7 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 7 } });
     defer resp.deinit(testing.allocator);
 
     const marker_raw = try readOwedMarker(kv, resp.body);
@@ -2366,7 +971,7 @@ test "dispatch: retry.shouldRetry / retry.stripContext logic" {
         \\const no_retry_meta = retry.shouldRetry({ ok: false, context: { charge_id: 42 } });
         \\const stripped = JSON.stringify(retry.stripContext({ context: { charge_id: 42, _retry: { attempt: 2 } } }));
         \\return [ok, failed_with_attempts, failed_exhausted, no_retry_meta].join(",") + "|" + stripped;
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
 
     const pipe = std.mem.indexOfScalar(u8, resp.body, '|').?;
@@ -2873,7 +1478,7 @@ test "dispatch: kv tape captures foreign gets only (§8 minimal read set)" {
         .method = "POST",
         .path = "/",
         .query = "fn=go",
-        .readset = &readset,
+        .trace = .{ .readset = &readset },
     }, &budget);
     defer resp.deinit(testing.allocator);
 
@@ -2947,7 +1552,7 @@ test "dispatch: kv tape skips own-reads (§8 minimal read set)" {
         .method = "POST",
         .path = "/",
         .query = "fn=go",
-        .readset = &readset,
+        .trace = .{ .readset = &readset },
     }, &budget);
     defer resp.deinit(testing.allocator);
 
@@ -3015,7 +1620,7 @@ test "dispatch: Date.now + Math.random + crypto.* are seed/timestamp-only" {
             .method = "GET",
             .path = "/",
             .query = "fn=go",
-            .readset = &readset,
+            .trace = .{ .readset = &readset },
         }, &budget);
         defer resp.deinit(testing.allocator);
         body_1 = try testing.allocator.dupe(u8, resp.body);
@@ -3058,7 +1663,7 @@ test "dispatch: Date.now + Math.random + crypto.* are seed/timestamp-only" {
             .method = "GET",
             .path = "/",
             .query = "fn=go",
-            .readset = &readset2,
+            .trace = .{ .readset = &readset2 },
         }, &budget2);
         defer resp2.deinit(testing.allocator);
         body_2 = try testing.allocator.dupe(u8, resp2.body);
@@ -3958,7 +2563,7 @@ test "dispatch: webhook.send (JS shim) writes _send/owed/{id} markers" {
         \\});
         \\return id1 + "|" + id2;
     ,
-        .{ .method = "GET", .path = "/hook", .request_id = 0xdeadbeef },
+        .{ .method = "GET", .path = "/hook", .trace = .{ .request_id = 0xdeadbeef } },
     );
     defer resp.deinit(testing.allocator);
 
@@ -4007,7 +2612,7 @@ test "dispatch: webhook.send rejects missing url" {
         \\  return "threw:" + e.message;
         \\}
     ,
-        .{ .method = "GET", .path = "/", .request_id = 1 },
+        .{ .method = "GET", .path = "/", .trace = .{ .request_id = 1 } },
     );
     defer resp.deinit(testing.allocator);
     try testing.expect(std.mem.startsWith(u8, resp.body, "threw:"));
@@ -4038,7 +2643,7 @@ test "dispatch: email.send wraps webhook.send (JS shim) with Resend shape" {
         \\  context: { user_id: 42 },
         \\});
     ,
-        .{ .method = "POST", .path = "/", .request_id = 7 },
+        .{ .method = "POST", .path = "/", .trace = .{ .request_id = 7 } },
     );
     defer resp.deinit(testing.allocator);
 
@@ -4104,7 +2709,7 @@ test "dispatch: email.send rejects missing key/from/to/subject" {
     };
 
     for (cases) |src| {
-        var resp = try runOne(&d, kv, src, .{ .method = "POST", .path = "/", .request_id = 1 });
+        var resp = try runOne(&d, kv, src, .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
         defer resp.deinit(testing.allocator);
         try testing.expect(std.mem.startsWith(u8, resp.body, "threw:"));
     }
@@ -4124,7 +2729,7 @@ test "dispatch: btoa + atob round-trip" {
         \\const enc = btoa("hello world");
         \\const dec = atob(enc);
         \\return enc + "|" + dec;
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("aGVsbG8gd29ybGQ=|hello world", resp.body);
 }
@@ -4150,7 +2755,7 @@ test "dispatch: base64url round-trip + RFC test vector" {
         \\const cases = ["f","fo","foo","foob","fooba","foobar"];
         \\const out = cases.map(s => base64url.encode(new TextEncoder().encode(s)));
         \\return out.join("|");
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("Zg|Zm8|Zm9v|Zm9vYg|Zm9vYmE|Zm9vYmFy", resp.body);
 }
@@ -4171,7 +2776,7 @@ test "dispatch: base64url decode handles padded + URL-safe input" {
         \\const bytes = base64url.decode("Zm9v");
         \\const text = new TextDecoder().decode(bytes);
         \\return text;
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("foo", resp.body);
 }
@@ -4191,7 +2796,7 @@ test "dispatch: hex round-trip" {
         \\const enc = hex.encode(bytes);
         \\const dec = hex.decode(enc);
         \\return enc + "|" + (dec[0] === 0xde && dec[3] === 0xef);
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("deadbeef|true", resp.body);
 }
@@ -4209,7 +2814,7 @@ test "dispatch: URLSearchParams parse + read" {
     var resp = try runOne(&d, kv,
         \\const p = new URLSearchParams("?code=abc&state=xyz&scope=read+write");
         \\return p.get("code") + "|" + p.get("scope") + "|" + p.has("missing");
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("abc|read write|false", resp.body);
 }
@@ -4230,7 +2835,7 @@ test "dispatch: URLSearchParams build + toString round-trip" {
         \\p.set("scope", "read");
         \\p.append("scope", "write");
         \\return p.toString();
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     // 'set' replaces all existing entries with the same name (so
     // first scope=read becomes the lone scope), then append adds
@@ -4251,7 +2856,7 @@ test "dispatch: URLSearchParams getAll for repeated keys" {
     var resp = try runOne(&d, kv,
         \\const p = new URLSearchParams("scope=a&scope=b&scope=c");
         \\return p.getAll("scope").join(",");
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("a,b,c", resp.body);
 }
@@ -4280,7 +2885,7 @@ test "dispatch: crypto.verifyRsa accepts RFC 7515 §A.2 RS256 test vector" {
         \\const data = new TextEncoder().encode(signing_input);
         \\const sig = base64url.decode(sig_b64);
         \\return String(crypto.verifyRsa(jwk, "sha256", data, sig));
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("true", resp.body);
 }
@@ -4307,7 +2912,7 @@ test "dispatch: crypto.verifyRsa rejects tampered signature" {
         \\const data = new TextEncoder().encode(signing_input);
         \\const sig = base64url.decode(sig_b64);
         \\return String(crypto.verifyRsa(jwk, "sha256", data, sig));
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("false", resp.body);
 }
@@ -4332,7 +2937,7 @@ test "dispatch: crypto.verifyRsa rejects missing jwk.n / wrong kty" {
         \\];
         \\const out = tries.map(fn => { try { fn(); return "ok"; } catch (e) { return "threw"; } });
         \\return out.join(",");
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("threw,threw,threw", resp.body);
 }
@@ -4362,7 +2967,7 @@ test "dispatch: crypto.verifyEcdsa accepts RFC 7515 §A.3 ES256 test vector" {
         \\const data = new TextEncoder().encode(signing_input);
         \\const sig = base64url.decode(sig_b64);
         \\return String(crypto.verifyEcdsa(jwk, "sha256", data, sig));
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("true", resp.body);
 }
@@ -4389,7 +2994,7 @@ test "dispatch: crypto.verifyEcdsa rejects tampered signature" {
         \\sig[sig.length - 1] ^= 0x01;
         \\const data = new TextEncoder().encode(signing_input);
         \\return String(crypto.verifyEcdsa(jwk, "sha256", data, sig));
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("false", resp.body);
 }
@@ -4425,7 +3030,7 @@ test "dispatch: crypto.verifyEcdsa rejects wrong sig length / unsupported curve"
         \\];
         \\const out = tries.map(fn => { try { fn(); return "ok"; } catch (e) { return "threw"; } });
         \\return out.join(",");
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("threw,threw,threw", resp.body);
 }
@@ -4451,7 +3056,7 @@ test "dispatch: crypto.ecdsa keygen→sign→verify roundtrip (secp256k1)" {
         \\const bad = crypto.ecdsaVerify("secp256k1", publicKey,
         \\  new TextEncoder().encode("tampered"), sig);
         \\return `${privateKey.length},${publicKey.length},${sig.length},${ok},${bad}`;
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("32,33,64,true,false", resp.body);
 }
@@ -4470,7 +3075,7 @@ test "dispatch: jwt.decode parses valid token" {
         \\const token = "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJqb2UiLCJleHAiOjEzMDA4MTkzODB9.fakesig";
         \\const decoded = jwt.decode(token);
         \\return decoded.header.alg + "|" + decoded.payload.iss + "|" + decoded.payload.exp;
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("RS256|joe|1300819380", resp.body);
 }
@@ -4494,7 +3099,7 @@ test "dispatch: jwt.verify against RFC 7515 §A.2 RS256 vector" {
         \\const token = "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ.cC4hiUPoj9Eetdgtv3hF80EGrhuB__dzERat0XF9g2VtQgr9PJbu3XOiZj5RZmh7AAuHIm4Bh-0Qc_lF5YKt_O8W2Fp5jujGbds9uJdbF9CUAr7t1dnZcAcQjbKBYNX4BAynRFdiuB--f_nZLgrnbyTyWzO75vRK5h6xBArLIARNPvkSjtQBMHlb1L07Qe7K0GarZRmB_eSN9383LcOLn6_dO--xi12jzDwusC-eOkHWEsqtFZESc6BfI7noOPqvhJ1phCnvWh6IeYI2w9QOYEUipUTI8np6LbgGY9Fs98rqVt5AXLIhWkWywlVmtVrBp0igcN_IoypGlUPQGe77Rw";
         \\const result = jwt.verify(token, jwk);
         \\return result.valid + "|" + result.payload.iss;
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("true|joe", resp.body);
 }
@@ -4532,7 +3137,7 @@ test "dispatch: jwt.verify picks key by kid from JWKS" {
         \\} catch (e) {
         \\  return "threw:" + e.message;
         \\}
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("selected|false", resp.body);
 }
@@ -4558,7 +3163,7 @@ test "dispatch: jwt.validateClaims iss/aud/exp" {
         \\  jwt.validateClaims({ aud: ["a", "b"] }, { now: now_ms, aud: "b" }),
         \\];
         \\return cases.map(c => c === null ? "ok" : c).join(",");
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("ok,expired,issuer-mismatch,ok", resp.body);
 }
@@ -4592,7 +3197,7 @@ test "dispatch: oauth.fromConfig(inline).startLogin builds authorize URL + store
         \\const has_pkce = loc.includes("code_challenge=") && loc.includes("code_challenge_method=S256");
         \\const has_scope = loc.includes("scope=openid+email");
         \\return [response.status, has_state, has_pkce, has_scope].join("|");
-    , .{ .method = "GET", .path = "/", .request_id = 1 });
+    , .{ .method = "GET", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("302|true|true|true", resp.body);
 }
@@ -4638,7 +3243,7 @@ test "dispatch: oauth.fromConfig(name) reads from _config/oauth/{name}" {
         \\const stored = state_uuid ? kv.get("state/oauth/google/" + state_uuid) : null;
         \\const ok_loc = loc.startsWith("https://accounts.google.com/");
         \\return [stored !== null, ok_loc, response.status].join("|");
-    , .{ .method = "GET", .path = "/", .request_id = 1 });
+    , .{ .method = "GET", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("true|true|302", resp.body);
 }
@@ -4660,7 +3265,7 @@ test "dispatch: handlers cannot write _config/* (reserved prefix)" {
         \\} catch (e) {
         \\  return "threw:" + (e.message.includes("reserved") ? "ok" : e.message);
         \\}
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("threw:ok", resp.body);
 }
@@ -4682,7 +3287,7 @@ test "dispatch: oauth.fromConfig(name) throws when config row missing" {
         \\} catch (e) {
         \\  return e.message.includes("_config/oauth/nonexistent") ? "threw-correctly" : "wrong-msg:" + e.message;
         \\}
-    , .{ .method = "GET", .path = "/", .request_id = 1 });
+    , .{ .method = "GET", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("threw-correctly", resp.body);
 }
@@ -4705,7 +3310,7 @@ test "dispatch: sessions.fromConfig(inline).create writes kv row + queues cookie
         \\const has_attrs = cookie.includes("HttpOnly") && cookie.includes("Secure")
         \\  && cookie.includes("SameSite=Lax") && cookie.includes("Path=/");
         \\return [stored.user_sub, stored.email, has_attrs, cookie.startsWith("session=" + id)].join("|");
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("user123|a@b.c|true|true", resp.body);
 }
@@ -4825,7 +3430,7 @@ test "dispatch: sessions.parseCookies handles spaces + missing values" {
     var resp = try runOne(&d, kv,
         \\const c = sessions.parseCookies("a=1; b=2; c = 3 ; nokey;");
         \\return [c.a, c.b, c.c, c.nokey === undefined].join("|");
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("1|2|3|true", resp.body);
 }
@@ -4846,7 +3451,7 @@ test "dispatch: cron.dailyAt produces a future timestamp" {
         \\const future = ms > Date.now();
         \\const within_24h = (ms - Date.now()) < 25 * 60 * 60 * 1000;
         \\return [future, within_24h].join("|");
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("true|true", resp.body);
 }
@@ -4870,7 +3475,7 @@ test "dispatch: cron.fromNow + parseDuration" {
         \\  cron.parseDuration("1w"),
         \\  cron.parseDuration("nope"),
         \\].join(",");
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("30000,300000,7200000,86400000,604800000,", resp.body);
 }
@@ -4893,7 +3498,7 @@ test "dispatch: cron.next parses crontab expression" {
         \\const ms = Number(ns / 1_000_000n);
         \\const expected = Date.UTC(2026, 4, 9, 3, 0, 0);
         \\return ms === expected ? "match" : `mismatch: got ${new Date(ms).toISOString()}, want ${new Date(expected).toISOString()}`;
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("match", resp.body);
 }
@@ -4915,7 +3520,7 @@ test "dispatch: cron.next handles step expressions like */15" {
         \\const ms = Number(ns / 1_000_000n);
         \\const dt = new Date(ms);
         \\return dt.getUTCHours() + ":" + dt.getUTCMinutes();
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("12:15", resp.body);
 }
@@ -4940,7 +3545,7 @@ test "dispatch: PKCE-style flow uses sha256 + hex.decode + base64url.encode" {
         \\const sha_bytes = hex.decode(sha_hex);
         \\const challenge = base64url.encode(sha_bytes);
         \\return challenge;
-    , .{ .method = "POST", .path = "/", .request_id = 1 });
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", resp.body);
 }
@@ -5274,8 +3879,7 @@ test "dispatch: platform.instances.create creates instance and mirrors to root_w
         .{
             .method = "POST",
             .path = "/",
-            .platform = pf.tenant,
-            .root_writeset = &root_ws,
+            .admin = .{ .platform = pf.tenant, .root_writeset = &root_ws },
         },
     );
     defer resp.deinit(testing.allocator);
@@ -5322,8 +3926,7 @@ test "dispatch: platform.instances.create is idempotent on existing instance" {
         .{
             .method = "POST",
             .path = "/",
-            .platform = pf.tenant,
-            .root_writeset = &root_ws,
+            .admin = .{ .platform = pf.tenant, .root_writeset = &root_ws },
         },
     );
     defer resp.deinit(testing.allocator);
@@ -5354,8 +3957,7 @@ test "dispatch: platform.instances.create throws coded InvalidName on bad name" 
         .{
             .method = "POST",
             .path = "/",
-            .platform = pf.tenant,
-            .root_writeset = &root_ws,
+            .admin = .{ .platform = pf.tenant, .root_writeset = &root_ws },
         },
     );
     defer resp.deinit(testing.allocator);
@@ -5441,8 +4043,7 @@ test "dispatch: platform.instances.deployStarter throws when trampoline not conf
         .{
             .method = "POST",
             .path = "/",
-            .platform = pf.tenant,
-            .root_writeset = &root_ws,
+            .admin = .{ .platform = pf.tenant, .root_writeset = &root_ws },
         },
     );
     defer resp.deinit(testing.allocator);
@@ -5476,11 +4077,13 @@ test "dispatch: platform.instances.deployStarter invokes trampoline with name" {
         .{
             .method = "POST",
             .path = "/",
-            .platform = pf.tenant,
-            .root_writeset = &root_ws,
-            .platform_caps = .{
-                .ctx = &rec,
-                .deploy_starter = &DeployStarterRecorder.trampoline,
+            .admin = .{
+                .platform = pf.tenant,
+                .root_writeset = &root_ws,
+                .platform_caps = .{
+                    .ctx = &rec,
+                    .deploy_starter = &DeployStarterRecorder.trampoline,
+                },
             },
         },
     );
@@ -5520,11 +4123,13 @@ test "dispatch: platform.instances.deployStarter throws coded InstanceNotFound" 
         .{
             .method = "POST",
             .path = "/",
-            .platform = pf.tenant,
-            .root_writeset = &root_ws,
-            .platform_caps = .{
-                .ctx = &rec,
-                .deploy_starter = &DeployStarterRecorder.trampoline,
+            .admin = .{
+                .platform = pf.tenant,
+                .root_writeset = &root_ws,
+                .platform_caps = .{
+                    .ctx = &rec,
+                    .deploy_starter = &DeployStarterRecorder.trampoline,
+                },
             },
         },
     );
@@ -5555,7 +4160,7 @@ test "dispatch: email.send accepts array `to`, `cc`, `bcc`" {
         \\  text: "t",
         \\});
     ,
-        .{ .method = "POST", .path = "/", .request_id = 2 },
+        .{ .method = "POST", .path = "/", .trace = .{ .request_id = 2 } },
     );
     defer resp.deinit(testing.allocator);
 

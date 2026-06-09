@@ -1367,17 +1367,14 @@ fn resumeContinuation(
         .path = spath,
         .body = body,
         .query = null,
-        .readset = &readset,
-        .request_id = request_id,
-        .platform = inst.platform,
-        .limiter = &worker.limiter,
-        .instance_id = inst.id,
-        // Inherit the chain id from the parking request so every
-        // tape row of this chain shares one correlation_id; mark
-        // this activation as a send-callback resume (streaming-
-        // handlers-plan §6) — or .wake_batch for an on.* connection wake.
-        .correlation_id = correlation_id,
-        .activation_source = if (wake) .wake_batch else .send_callback,
+        // Inherit the chain id from the parking request so every tape row
+        // of this chain shares one correlation_id; mark this activation as
+        // a send-callback resume (streaming-handlers-plan §6) — or
+        // .wake_batch for an on.* connection wake.
+        .activation = if (wake) .{ .wake_batch = .{} } else .send_callback,
+        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .admin = .{ .platform = inst.platform },
     };
     std.log.info("rove-js corr: resume corr={s} request_id={d} tenant={s}", .{ correlation_id orelse "(none)", request_id, inst.id });
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
@@ -1755,38 +1752,36 @@ pub fn resumeBoundFetchChain(
         stream_chunks.deinit(allocator);
     }
 
-    var req: Request = .{
+    const req: Request = .{
         .method = "POST",
         .path = spath,
         .body = body,
         .query = query,
-        .readset = &readset,
-        .request_id = request_id,
-        .platform = inst.platform,
-        .limiter = &worker.limiter,
-        .instance_id = inst.id,
-        .correlation_id = correlation_id,
-        .activation_source = .fetch_chunk,
-        .activation_fetch_id = ev.fetch_id,
-        .pending_stream_chunks = &stream_chunks,
         .is_system_module = builtin_modules_mod.isBuiltinPath(path),
-        .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
-        .resume_if_bound_ctx = @ptrCast(worker),
-        .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
-        .cancel_fetch_ctx = @ptrCast(worker),
+        .activation = .{ .fetch_chunk = .{
+            .id = ev.fetch_id,
+            .seq = ev.seq,
+            .byte_offset = ev.byte_offset,
+            .bytes = ev.bytes,
+            .headers = ev.fetch_headers,
+            .final = ev.final,
+            .terminal_status = if (ev.final) ev.terminal_status else 0,
+            .terminal_ok = if (ev.final) ev.terminal_ok else false,
+            .body_truncated = if (ev.final) ev.body_truncated else false,
+        } },
         .activation_entity = ent,
         .activation_fetches_pending = fetches_pending,
+        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .admin = .{ .platform = inst.platform },
+        .trampolines = .{
+            .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
+            .resume_if_bound_ctx = @ptrCast(worker),
+            .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
+            .cancel_fetch_ctx = @ptrCast(worker),
+        },
+        .effects = .{ .pending_stream_chunks = &stream_chunks },
     };
-    req.activation_fetch_seq = ev.seq;
-    req.activation_fetch_byte_offset = ev.byte_offset;
-    req.activation_fetch_bytes = ev.bytes;
-    req.activation_fetch_headers = ev.fetch_headers;
-    req.activation_fetch_final = ev.final;
-    if (ev.final) {
-        req.activation_fetch_terminal_status = ev.terminal_status;
-        req.activation_fetch_terminal_ok = ev.terminal_ok;
-        req.activation_fetch_body_truncated = ev.body_truncated;
-    }
 
     // Read sid/sess from the entity's components BEFORE dispatch
     // so the error path can resolve the held socket cleanly.

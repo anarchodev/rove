@@ -51,7 +51,7 @@ pub const Outcome = enum(u8) {
 };
 
 /// What caused this handler activation (streaming-handlers-plan §2,
-/// shared by `dispatcher.Request.activation_source` and
+/// the wire enum behind `request.Activation` (via its `source()`) and
 /// `LogRecord.activation`). v1 has the two implemented variants; the
 /// enum grows (`kv_wake`, `timer`, `disconnect`) when `__rove_stream`
 /// lands.
