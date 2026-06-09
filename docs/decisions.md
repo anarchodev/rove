@@ -13,12 +13,13 @@ Scope and boundaries:
 - This complements, and does not replace:
   - **PLAN.md §7** — the canonical considered-and-rejected list for the core
     architecture. Entries here cross-reference it rather than duplicate it.
-  - **The living sub-plans** (`effect-algebra.md`, `effect-reification-plan.md`,
-    `handler-shape.md`, `snapshot-plan.md`, `readset-replication-plan.md`,
-    `streaming-handlers-plan.md`, `deployment-snapshots-plan.md`,
-    `auth-domain-plan.md`, `durable-wake-plan.md`, …) which remain the as-built
-    architectural references for *how* each shipped system works. This file
-    records *what was decided and why*, not the mechanics.
+  - **The as-built architecture references** in `architecture/` (`overview`,
+    `consensus-and-storage`, `effects-and-handlers`, `routing-and-ingress`,
+    `control-plane`, `deployment-and-logs`, `auth-and-domains`, `observability`),
+    plus the customer-facing contracts `effect-algebra.md` + `handler-shape.md`,
+    which remain the as-built references for *how* each shipped system works.
+    This file records *what was decided and why*, not the mechanics. See
+    `README.md` for the full documentation map.
   - **Coding-process feedback** (regression-baseline discipline, "verify 2xx in
     benches", etc.), which lives in the auto-memory `feedback_*` files.
 - Performance war-stories with reusable detail (bench tooling, falsified
@@ -127,7 +128,7 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
 
 ### 3.2 The four effect primitives are reified in code
 - **Decision** (effect-reification Phases 0–6 shipped; see
-  `effect-reification-plan.md` + `effect-algebra.md`): every external effect must
+  `architecture/effects-and-handlers.md` + `effect-algebra.md`): every external effect must
   be a *declaration* over four reified primitives (Model, Continuation, Msg
   origins, Cmd runtimes) under `src/js/effect/`, not a hand-rolled subsystem.
   `Cmd` and `Msg` are compiler-enforced tagged unions. Cancelled as part of this
@@ -249,7 +250,7 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
 
 ### 5.1 Replicate readsets (not intents); gate the callback, not the propose
 - **Decision** (Phases 1–6 shipped 2026-05-25/27; see
-  `readset-replication-plan.md`): the three-substrate model is **Raft = inputs +
+  `architecture/effects-and-handlers.md` §Readset replication): the three-substrate model is **Raft = inputs +
   cached writesets; BlobStore = input-bytes home (unrecoverable if lost) AND
   output-bytes cache (transient OK); Wire = ephemeral**. "Inputs durable, outputs
   derivable." The recorded readset **gates callback dispatch, not the propose**
@@ -274,7 +275,7 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
 
 ## 6. Auth & custom domains (OIDC)
 
-- **Decision** (Phases 1–4 shipped/verified 2026-05-16; see `auth-domain-plan.md`):
+- **Decision** (Phases 1–4 shipped/verified 2026-05-16; see `architecture/auth-and-domains.md`):
   full OIDC, dogfooded as a customer library. The IdP is the `__auth__` system
   tenant (magic-link + OIDC provider); RS256 signing is in Zig
   (`acme/crypto.zig`, OpenSSL) with JS calling `crypto.oidcSign` (hybrid fork).
@@ -353,3 +354,126 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   `TrackedTxn` with undo semantics" direction is obsolete; the pre-kvexp
   `kv_undo` machinery was deleted. (Cross-referenced from PLAN.md §10 type-2
   notes.)
+
+---
+
+## 10. V2 multi-raft architecture
+
+Mechanics live in the as-built references
+(`architecture/consensus-and-storage.md`, `architecture/control-plane.md`,
+`architecture/routing-and-ingress.md`). This section records the locked V2
+decisions and rejected paths only. V2 is on branch `v2`; Phases 0–7 shipped
+through 2026-06; the substrate was de-risked by the `rewind2` / `raft-rs-zig`
+prototype before V2 wrote code.
+
+### 10.1 One raft group per tenant (`tenant == group`, 1:1)
+- **Decision** (locked 2026-05-16): per-tenant raft groups on TiKV **raft-rs**
+  (Zig/C wrapper), with a CP/DP split where DPs are N independent clusters.
+- **Why**: per-tenant isolation (blast radius) and **no-downtime migration** — a
+  tenant is a movable unit *because* it is a whole group.
+- **Rejected**: N:1 group batching (erodes the movable-unit invariant). Framing
+  V2 as a throughput win — at realistic handler costs the binding constraint is
+  the apply pipeline, independent of raft topology (§10.3). The honest claim is
+  "throughput parity, architecturally cleaner; the win is migration + isolation."
+
+### 10.2 Shared-fsync WAL — one fsync per pump cycle
+- **Decision**: all of a node's groups interleave into one append-only WAL,
+  flushed **once per pump cycle** regardless of how many groups committed.
+- **Why**: per-group fsync collapses throughput past ~K=4; this is the
+  constraint that makes multi-tenant raft viable at all.
+- **Known limitation** (not correctness): single-node nodes compact the WAL
+  after a durabilize checkpoint; multi-node nodes durabilize (bounding replay)
+  but do **not** truncate — safe multi-node truncation needs a follower-match-
+  index floor + a data-carrying snapshot for lagging followers, deliberately
+  deferred.
+
+### 10.3 Apply-bound, not consensus-bound; the allocator is load-bearing
+- **Finding** (prototype, transferred to V2): throughput scales with **apply-
+  worker count** (`W` = physical cores; SMT oversubscribe *collapses* it), not
+  with raft. Spend throughput effort on the apply path, multi-raft effort on
+  migration/isolation.
+- **Allocator**: keep `c_allocator` globally — Zig's GPA has a global mutex that
+  becomes *the* wall under multi-threaded multi-raft; the Rust raft-rs shim sets
+  a jemalloc/mimalloc `#[global_allocator]`. **Standing rule**: swap the
+  allocator *before* any contention deep-dive (one-line probe).
+
+### 10.4 Hibernation — heartbeats must not wake idle groups
+- **Decision**: tick only an active set; `bumpActive` on propose / formation /
+  non-heartbeat step; **never** on heartbeats (detected at the eraftpb wire-byte
+  level, codec-independent). No pre-seed.
+- **Why**: at K=thousands of mostly-idle tenants, ticking all groups plus
+  heartbeat-driven self-wake buries the pump; O(active) restores it (≈31,000× at
+  K=10k idle).
+- **Intended tradeoff**: a fully-idle group whose leader dies does not auto-re-
+  elect; the next request wakes + campaigns. An idle group has nothing to serve.
+
+### 10.5 Role-aware apply + store unification
+- **Decision**: the **leader** skips the replicated store write (the worker's
+  `TrackedTxn.commit` is durable); a **follower** writes it, into the worker's
+  *own* serving store (`StoreResolver`), so a promoted follower serves exactly
+  what it replicated.
+- A write in flight at a leader change is **faulted + retried** (503), **not
+  lost** — explicit per-entry FIFO seq binding (counting seqs is wrong multi-
+  node: proposes can fail; followers apply with no local proposer). Zero-failed-
+  request moves under continuous load are Phase 7.
+
+### 10.6 Tenant move = ship committed state to a fresh group
+- **Decision**: detach dumps committed KV state to a self-describing bundle;
+  attach forms a **fresh** group at the migration epoch on every destination
+  node (`clearTombstone` lifts raft-rs's intentional id-reuse guard); the epoch
+  fences stale messages. **Blobs never move** (shared content-addressed
+  backend).
+- Quiesce (pause/drain proposes) and the directory flip that make the move
+  correct and no-downtime are the **CP's job** (see `control-plane.md`).
+- **Rejected**: carrying the raft-log tail across a move — "quiesce → commit →
+  ship state → fresh group" is sufficient and is what the prototype validated.
+
+### 10.7 Codec: prost (pre-generated), vendored raft-rs
+- **Decision**: vendor raft-rs with **prost-codec**, pre-generated `.rs` (no
+  `protoc` at build time), `panic = abort` / `lto`.
+- **Why**: per-message protobuf **decode** is the real per-message cost (batching
+  the `step` FFI bought 0× — the Zig↔C↔Rust boundary is sub-µs), so a
+  faster/smaller codec is the lever, not the FFI shape.
+
+---
+
+## 11. Deployment & log storage
+
+Mechanics: `architecture/deployment-and-logs.md`. This section records the
+storage decisions that section assumes. (The customer-logs-vs-operator-signals
+*sink* split is §7; these are about how each is stored.)
+
+### 11.1 Deploy and release are separate steps
+- **Decision**: `files-server-v2` publishes blobs + a content-addressed manifest
+  to S3 (cluster-free); a *separate* `/_system/release` writes the one
+  `_deploy/current` pointer through raft (envelope 0).
+- **Why**: the release flip is the approval gate — deploys stay approval-gated by
+  keeping the marker write distinct from the byte upload. Workers are pure
+  consumers; the manifest pointer is the only deploy state that replicates.
+
+### 11.2 Deployment snapshots are immutable, refcounted, content-addressed
+- **Decision**: a `TenantFilesSnapshot` is immutable and refcounted; a reload
+  swaps the slot pointer atomically and the old snapshot frees when the last
+  in-flight request releases it. Bytecode is shared process-wide by content hash
+  (`BytecodeCache`), so a reload is `O(changed files)`.
+- **Rejected**: mutating deployment state in place — unsafe against in-flight
+  requests, and it forced per-tenant byte duplication that the content-addressed
+  cache eliminates.
+
+### 11.3 Static assets 302-redirect to presigned S3 (not worker-RAM cache)
+- **Decision**: the worker serves a static asset as a 302 to a presigned S3 URL
+  (strong `ETag`, 304 support), never buffering the bytes.
+- **Why / Rejected**: "just cache it in the worker" is the wrong default for
+  MB-sized payloads the worker doesn't execute — the storage origin (+ the CDN
+  edge by URL) is the right server. See the storage-origin-vs-worker-RAM rule.
+
+### 11.4 Log batches are per-node interleaved, per-record raw-deflate
+- **Decision**: each node writes **one** S3 object per flush, interleaving all
+  tenants' records (`_logs/{node}/{batch}.ndjson`), each record raw-deflate-
+  framed; a standalone `log-server` indexes them into SQLite (polling + a worker
+  push that closes the S3-LIST consistency window).
+- **Why**: a per-tenant key layout would be `O(active tenants on node)` PUTs per
+  flush; one interleaved object collapses that to one. Per-record (not per-batch)
+  deflate lets a single click-through decompress one record with one range-GET.
+- **Gotcha**: compression is **libz** (`windowBits=-15`), not the Zig stdlib —
+  `std.compress.flate.Compress` is incomplete (panics on real payloads).

@@ -5,11 +5,11 @@
 > (`docs/v2-build-order.md` §Cutover): *delete `src/`, rename `src-v2/ → src/`,
 > once V2 is at parity and the control plane is robust. No data to migrate, so
 > cutover is a code operation.* Companions: `docs/v2-build-order.md`,
-> [`v2-front-door-architecture.md`](v2-front-door-architecture.md) (the
+> [`architecture/routing-and-ingress.md`](architecture/routing-and-ingress.md) (the
 > committed CF-free edge — supersedes gap #3 below),
 > [`v2-cp-operational-state.md`](v2-cp-operational-state.md) (gap #1),
-> [`v2-phase5-multinode.md`](v2-phase5-multinode.md),
-> [`v2-phase6-hibernation.md`](v2-phase6-hibernation.md).
+> [`architecture/consensus-and-storage.md`](architecture/consensus-and-storage.md),
+> [`architecture/consensus-and-storage.md`](architecture/consensus-and-storage.md).
 
 ## Orientation
 
@@ -66,7 +66,7 @@ runtime map, re-point across clusters, auth, restart-durability) + `v2-test`
 host axis test; `tenant_move_smoke` confirms the front-door routing path.
 
 **3. Edge TLS + ACME for custom domains — own it, no Cloudflare.**
-*Per [`v2-front-door-architecture.md`](v2-front-door-architecture.md).*
+*Per [`architecture/routing-and-ingress.md`](architecture/routing-and-ingress.md).*
    - ✅ **Slice 1 — cert state in the CP** `__directory__` group (`cert/{host}`,
      placement-independent), `GET /_cp/cert(s)` + `POST /_control/cert`,
      `cp_cert_smoke`. Replaces V1's per-cluster `__root__.db`.
@@ -112,7 +112,7 @@ routes the host → re-provision 409 / unknown-cluster 400).
 
 ## ✅ Front-door tier split (architectural, was blocking the edge gaps) — SHIPPED
 
-Per [`v2-front-door-architecture.md`](v2-front-door-architecture.md), the
+Per [`architecture/routing-and-ingress.md`](architecture/routing-and-ingress.md), the
 prototype welded the CP raft directory to the request-path proxy, so every
 front-door replica was a CP voter (`REWIND_CP_NODE_ID/VOTERS/PEERS`) →
 front-door count == voter count (inverted scaling). **Done:**
@@ -165,7 +165,7 @@ front-door count == voter count (inverted scaling). **Done:**
 3. ~~**Replicated domain index** (gap #2) — same directory group, sibling axis.~~
    ✅ **SHIPPED** — `host/{host}` axis + `/_control/host` + `cp_host_smoke`.
 4. **Edge TLS termination + cert-state-in-CP + single ACME issuer** (gap #3) —
-   per `v2-front-door-architecture.md`. Slices 1 (CP cert axis) + 2 (front-door
+   per `architecture/routing-and-ingress.md`. Slices 1 (CP cert axis) + 2 (front-door
    TLS termination + CP cert pull) + 3 (leader-elected HTTP-01 issuer,
    `src/cp/acme.zig`, Pebble-proven) ✅ SHIPPED; DNS-01 wildcard (slice 4)
    deferred.

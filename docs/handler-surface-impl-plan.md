@@ -36,7 +36,7 @@ commit-gated effect, leaving the return as pure disposition. The earlier
 "emit-as-effect is unsafe" objection is resolved by commit-gating —
 `stream.write()` buffers and the chunk reaches the wire only after the
 activation's writes commit (the `Cmd.stream_chunk` gate already exists,
-`collection-lifecycle-map.md` §6).
+`architecture/effects-and-handlers.md` §6).
 
 ## 1. Current → target gap
 
@@ -166,7 +166,7 @@ return verb); sweep examples to compile against the shipped surface.
 
 ## 3. Collection-model impact
 
-The change touches the state machine in `collection-lifecycle-map.md` —
+The change touches the state machine in `architecture/effects-and-handlers.md` —
 in the **simplifying** direction (your worry was right that it touches
 it; it removes structure rather than adding it):
 
@@ -197,7 +197,7 @@ it; it removes structure rather than adding it):
   Different edges — but the continuation loop is the shared blast radius,
   so sequence carefully if 3b is in flight on another branch.
 
-`collection-lifecycle-map.md` itself needs updating (§1 four-waits → the
+`architecture/effects-and-handlers.md` itself needs updating (§1 four-waits → the
 convergence; §3/§4 `stream()` edges → `stream.start()` effect; drop
 `raft_pending_stream`) — not done here (not this plan's file).
 
@@ -298,9 +298,9 @@ machinery.
   Phase 6).
 - `effect-algebra.md` §8 — scope model; §8.4 watch-before-write (Phase 1);
   §6 #1 the unified Continuation runtime Phases 1–2 build on.
-- `collection-lifecycle-map.md` — the state machine §3 maps onto; needs
+- `architecture/effects-and-handlers.md` — the state machine §3 maps onto; needs
   the deltas above.
-- `auto-bind-plan.md` — the `detach` mechanism Phase 3 retires.
+- `architecture/effects-and-handlers.md` — the `detach` mechanism Phase 3 retires.
 - `durable-wake-plan.md` — gap 2.6, the `schedule`/`cron` dependency
   (Phase 5).
 - `primitive-gaps.md` §2.1 — the subscription machinery `cron` reuses.

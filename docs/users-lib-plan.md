@@ -1,6 +1,6 @@
 # users-lib plan — "Make your own Clerk" (B2C, passwordless)
 
-**Status:** planned 2026-05-16. Elaborates `auth-domain-plan.md` §4.2
+**Status:** planned 2026-05-16. Elaborates `architecture/auth-and-domains.md` §4.2
 (dogfooded customer libraries) + §4.8 (`oauth.verifyIdToken`). No code
 yet; 12 tracked tasks (P1a–P5).
 

@@ -3,7 +3,7 @@
 **Status:** Original five gaps DONE or design-locked (2026-05-20 →
 2026-05-27). **One new gap open: §2.6 durable scheduled wake (proposed
 2026-06-01, unbuilt).** Streaming gaps (2.3 / 2.4 / 2.5) consolidated
-under `docs/streaming-model.md`. Tape-minimization arc: §6 considered-and-
+under `docs/architecture/routing-and-ingress.md`. Tape-minimization arc: §6 considered-and-
 removed; §7 design-only (unbuilt — gated on customer LLM-stream demand);
 §7.4 cancelled with effect-reification Phase 7; §8 + §9 shipped
 2026-05-26; §10 summarizes. The load-bearing value is §2.6 (the open
@@ -20,11 +20,11 @@ shape — the runtime IS the Elm runtime).
 
 | Slot | Variants today | Where defined |
 |---|---|---|
-| **Msg** (wake source) | `inbound_request`, `send_callback`, `timer` (in-memory cron — non-durable clock), `kv_wake`, `disconnect` | `streaming-handlers-plan.md` §2 + §4 |
-| **Cmd** (return shape) | `Response`, `__rove_next`, `__rove_stream` | `streaming-handlers-plan.md` §3 |
-| **Effects** (accumulated in batch) | kv writeset (env-0), `webhook.send` (env-0 `_send/owed/{id}` marker via JS shim) | `src/js/bindings/webhook.send.js`, `effect-reification-plan.md` Phase 5 |
+| **Msg** (wake source) | `inbound_request`, `send_callback`, `timer` (in-memory cron — non-durable clock), `kv_wake`, `disconnect` | `architecture/effects-and-handlers.md` §2 + §4 |
+| **Cmd** (return shape) | `Response`, `__rove_next`, `__rove_stream` | `architecture/effects-and-handlers.md` §3 |
+| **Effects** (accumulated in batch) | kv writeset (env-0), `webhook.send` (env-0 `_send/owed/{id}` marker via JS shim) | `src/js/bindings/webhook.send.js`, `architecture/effects-and-handlers.md` Phase 5 |
 | **Inline-synchronous side primitive** | kv triggers (BEFORE/AFTER prefix hooks) | `src/js/trigger_dispatch.zig` |
-| **Chain identity** | `correlation_id`, `ctx` | `streaming-handlers-plan.md` §5–§6 |
+| **Chain identity** | `correlation_id`, `ctx` | `architecture/effects-and-handlers.md` §5–§6 |
 
 Every gap below either adds a row to this table or reshapes a row so
 the gap is a parametric case.
@@ -73,7 +73,7 @@ See `project_gap_2_2_backpressure` memory for the commit map.
 
 ### 2.3 / 2.4 / 2.5 — streaming surface, both directions
 
-**See [`docs/streaming-model.md`](streaming-model.md) — it is the
+**See [`docs/architecture/routing-and-ingress.md`](architecture/routing-and-ingress.md) — it is the
 unifying model for all three.** The held chain processes a stream of
 Msgs and emits a stream of Cmds; bytes ride as chunks; "buffered" is
 the runtime coalescing that stream by default. Each individual gap
@@ -83,7 +83,7 @@ below is a case of that model rather than a standalone design.
   2026-05-21**. Reframed to `http.fetch` (transient + best-effort
   sibling of the durable `webhook.send`); Pattern A (`on_chunk`) +
   Pattern B (`pipe_to`) + `CURLOPT_WRITEFUNCTION` streaming transport
-  all shipped. See streaming-model.md §4 + §4.A (model + as-built
+  all shipped. See architecture/routing-and-ingress.md §4 + §4.A (model + as-built
   `http.fetch` reference).
 - **2.4 Streaming request body in** — **DESIGN LOCKED, IMPLEMENTATION
   PENDING.** Customer surface in `handler-shape.md`: a module exports
@@ -94,7 +94,7 @@ below is a case of that model rather than a standalone design.
   superseded "park-until-body-complete" middle tier is gone — there's
   no buffered-but-bigger path; you either fit in 1 MB or stream.
   Implementation is h2-wire + activation-Msg + per-chunk coord submit;
-  the blob coordinator is the substrate. See `streaming-model.md` §3
+  the blob coordinator is the substrate. See `architecture/routing-and-ingress.md` §3
   for substrate detail and `handler-shape.md` for the surface.
 - **2.5 Held outbound subscription (external-push wake)** — **DONE
   2026-05-24**. `http.subscribe` binding + `FetchEngine` curl_multi
@@ -415,7 +415,7 @@ proposal. Status snapshot:
 | 1 | 2.2 backpressure | **DONE 2026-05-20** |
 | 2 | 2.1 chain origins | **DONE 2026-05-20** (kv-react + boot + cron) |
 | 3 | 2.3 streaming outbound (`http.fetch`) | **DONE 2026-05-21** |
-| 4 | 2.4 streaming inbound body | design locked in `streaming-model.md` §3; implementation pending |
+| 4 | 2.4 streaming inbound body | design locked in `architecture/routing-and-ingress.md` §3; implementation pending |
 | 5 | 2.5 held outbound subscription | **DONE 2026-05-24** |
 | 6 | 2.6 durable scheduled wake | **PROPOSED 2026-06-01** — unbuilt; both forks resolved + interface/caps specced (§2.6.1); ready to build |
 
@@ -426,15 +426,15 @@ proposal. Status snapshot:
 For completeness, these are NOT gaps; they're rejected primitives.
 Don't fold them into proposals above.
 
-- **Durable SSE replay log.** `PLAN.md` §7 / `connection-actor-plan.md`
-  §10.1 / `streaming-handlers-plan.md` §10.3. Customer composes
+- **Durable SSE replay log.** `PLAN.md` §7 / `architecture/effects-and-handlers.md`
+  §10.1 / `architecture/effects-and-handlers.md` §10.3. Customer composes
   via own kv prefix.
 - **Cross-tenant kv subscriptions.** Tenant boundary; route
   cross-tenant via `platform.scope(id).kv` or http.send.
 - **Predicate-function kv-wakes.** Would run customer JS on the
-  raft apply thread (`streaming-handlers-plan.md` §4.6).
+  raft apply thread (`architecture/effects-and-handlers.md` §4.6).
 - **Blocking inline external call.** PLAN line 79 Cmd bet
-  preserved verbatim internally (`connection-actor-plan.md`
+  preserved verbatim internally (`architecture/effects-and-handlers.md`
   §10.3); §6.4 held-sync is a *projection*, not a relaxation.
 - **Multi-tenant atomic writeset.** Each tenant's app.db is its
   own raft target.
@@ -454,10 +454,10 @@ Every additive proposal preserves:
   per-batch, fire post-commit; no inline external call).
 - The **replayability** invariant (every Msg is a taped input;
   every Cmd is a taped output; large bytes go content-addressed
-  per `connection-actor-plan.md` §8).
+  per `architecture/effects-and-handlers.md` §8).
 - The **strike posture** (resource-bound, deadline-bound,
   fail-fast on abuse — `connection_holder_security` /
-  `streaming-handlers-plan.md` §9.2).
+  `architecture/effects-and-handlers.md` §9.2).
 
 Any future proposal that violates one of these is by definition not
 in this list; it's a §7/§10.1-style locked decision that has to be
@@ -498,7 +498,7 @@ shipped yet** and is the right place to add cost control when
 storage bills earn the optionality.
 
 **What remains.** Content-addressed-large-bytes is still the
-right pattern (`connection-actor-plan.md` §8): chunk bytes go to
+right pattern (`architecture/effects-and-handlers.md` §8): chunk bytes go to
 blob, tape carries the hash. This was independent of the cap;
 §7 below builds on it directly.
 
@@ -706,7 +706,7 @@ Two consistencies close the loop:
   used all along.
 - **Read set and CAS extent meet at the size threshold.** A small
   kv read is recorded inline; a large one is recorded as an
-  extent (`connection-actor-plan.md` §8). Same input — the
+  extent (`architecture/effects-and-handlers.md` §8). Same input — the
   threshold picks the form. The four kinds are not disjoint;
   "extent" is what any oversized value-record becomes.
 

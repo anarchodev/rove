@@ -1,7 +1,7 @@
 # Built-in JS libraries — reference docs plan
 
 Elaborates PLAN §13 (surface map) and complements
-`auth-domain-plan.md` (the customer-facing JS surface). Goal: reference
+`architecture/auth-and-domains.md` (the customer-facing JS surface). Goal: reference
 documentation for every built-in JS library, generated from a single
 source of truth, hosted on rewindjs itself.
 

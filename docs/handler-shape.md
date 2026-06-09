@@ -7,9 +7,9 @@
 > `http.fetch` spelling retired (Phase 3), named-export dispatch by
 > activation kind (Phase 4), and `schedule`/`cron` (Phase 5). It
 > supersedes the `__rove_stream` / `request.activation.kind`-switch
-> surface in `streaming-model.md` §3 and the multi-shape return values in
-> §4–§5. The engine model (coalesce budget, blob coordinator, one-rule
-> semantics — see `streaming-model.md` §1–§2 and §7.X) is **unchanged**;
+> surface and the old multi-shape return values. The engine model (coalesce
+> budget, blob coordinator, one-rule semantics — see
+> `architecture/routing-and-ingress.md`) is **unchanged**;
 > only the customer-facing handler API changed. Phase 6 (polish) landed
 > the ambient `next` verb; the §6 export-coverage validation is CLI-side
 > (static analysis over arenajs-WASM), backstopped at runtime by the
@@ -133,7 +133,7 @@ verb. It produces the streaming response over time:
   starts implicitly.
 - `stream.write(chunk)` — emit a chunk. **Commit-gated**: the chunk
   reaches the wire only after this activation's writes commit
-  (`streaming-model.md` §2). Call it as many times per activation as you
+  (the one rule — `architecture/routing-and-ingress.md`). Call it as many times per activation as you
   like; raw bytes (SSE `data:` framing is yours to write).
 
 Pair `stream.*` with `next()` to keep producing across activations;
@@ -543,7 +543,7 @@ registry, runtime config injection) is post-launch.
 The validator lives in `rove-files` (`app_manifest.zig`); see the
 self-hosters marketplace plan for the consuming side.
 
-## 9. What's gone vs `streaming-model.md` §3 (and prior revisions)
+## 9. What's gone (vs prior streaming revisions)
 
 - `request.activation.kind` switch → runtime dispatches by export name
 - `__rove_stream({…})` / the `stream` **return verb** → `stream.start()`
@@ -565,7 +565,7 @@ self-hosters marketplace plan for the consuming side.
 - Effects-accumulate / return-disposition: effects (`kv`, `stream.*`,
   `on.*`, connectionless) accumulate during the activation and fire
   post-commit; the return declares the disposition
-- The one rule (`streaming-model.md` §2): a chunk reaches the wire only
+- The one rule (`architecture/routing-and-ingress.md`): a chunk reaches the wire only
   after the activation that produced it has committed — `stream.write()`
   is commit-gated
 - Replay: `foldl(handlers, kv0, activations)` over the recorded inputs
@@ -593,12 +593,12 @@ self-hosters marketplace plan for the consuming side.
   retirement; §8.4 watch-before-write; §8.5 "grammar position = scope."
   The verbs here are the customer names for §2's primitives.
 - `handler-surface-impl-plan.md` — the phased implementation.
-- `collection-lifecycle-map.md` — the state machine the surface lowers
-  onto (the impl plan §3 notes the deltas).
-- `streaming-model.md` — engine substrate; §1 frame, §2 one rule, §7.X
-  blob coordinator unchanged. This supersedes §3's surface.
-- `auto-bind-plan.md` — the `detach` mechanism, retired here (§2.6).
+- `architecture/effects-and-handlers.md` — the collection-lifecycle state
+  machine the surface lowers onto.
+- `architecture/routing-and-ingress.md` — the engine substrate (the one rule,
+  coalescing, blob coordinator), unchanged.
+- `architecture/effects-and-handlers.md` — the `detach` mechanism, retired here (§2.6).
 - `durable-wake-plan.md` — gap 2.6, the `schedule`/`cron` substrate.
 - `primitive-gaps.md` §2.4 — inbound streaming body (`onChunk`).
-- `readset-replication-plan.md` — chunk capture making `onChunk` + the
+- `architecture/effects-and-handlers.md` — chunk capture making `onChunk` + the
   stream loop replayable.

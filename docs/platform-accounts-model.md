@@ -5,7 +5,7 @@
 > logs in, and which tenants they can touch — and, crucially, **where that
 > state lives**. Companions: [`v2-cp-operational-state.md`](v2-cp-operational-state.md)
 > (per-tenant plan/limits in the CP, authored by the admin app),
-> [`plan-tiers.md`](plan-tiers.md) (DP enforcement), `auth-domain-plan.md`
+> [`plan-tiers.md`](plan-tiers.md) (DP enforcement), `architecture/auth-and-domains.md`
 > (the `__auth__` OIDC IdP + OIDC-RP dashboards + `platform.scope`),
 > [`users-lib-plan.md`](users-lib-plan.md) (the *customer's* end-user auth —
 > a different plane; see §2), `pricing-model.md` (per-tenant caps),
@@ -69,7 +69,7 @@ the **platform** plane only:
 
 | Plane | Who authenticates | Where it lives | Org concept |
 |---|---|---|---|
-| **Platform / dashboard** | a *developer/operator* logging in to manage their tenants + billing | `__auth__` OIDC IdP + OIDC-RP dashboard app (`auth-domain-plan.md` Ph3, PLAN §13.1/§13.2); membership/account data in the dashboard app's `app.db` | **this doc** |
+| **Platform / dashboard** | a *developer/operator* logging in to manage their tenants + billing | `__auth__` OIDC IdP + OIDC-RP dashboard app (`architecture/auth-and-domains.md` Ph3, PLAN §13.1/§13.2); membership/account data in the dashboard app's `app.db` | **this doc** |
 | **End-user (customer app)** | the *customer's own users* of *their* deployed app | `users-lib` inside the customer's tenant (`users-lib-plan.md`) | **deliberately deferred** — B2C-only, "Orgs/B2B: Out" |
 
 The user's "a user can access multiple tenants" is the **platform plane**. It
