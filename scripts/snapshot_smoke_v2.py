@@ -34,9 +34,9 @@ Every one of those assertions is V1-raft-internal with no V2 equivalent:
 
 The OBSERVABLE essence the V1 snapshot mechanism ultimately served — "a
 lagging/rejoined node catches up to the replicated state" — is the subject of
-a SEPARATE V2 port, `scripts/snap_catchup_smoke_v2.py`, which proves the
-catchup precondition and SKIPs the rejoin-catchup step on the known
-boot-time-group-recovery engine gap. There is nothing left for THIS smoke to
+a SEPARATE V2 port, `scripts/snap_catchup_smoke_v2.py`, which proves the full
+rejoin-catchup arc via boot-time group recovery (the node-local group manifest
++ `Bridge.recoverGroups`). There is nothing left for THIS smoke to
 assert on V2: the raft-internal snapshot-FILE / log-compaction layer it tested
 simply does not exist here.
 
@@ -66,8 +66,8 @@ def main() -> int:
     print("V2 tenant state moves via the kvexp bundle dump/load (the tenant-MOVE")
     print("path: fresh raft group at a migration fence), NOT a willemt snapshot file.")
     print("The observable 'lagging node catches up' story is ported separately in")
-    print("scripts/snap_catchup_smoke_v2.py (which SKIPs its final step on the known")
-    print("boot-time group-recovery engine gap). This smoke has no remaining V2")
+    print("scripts/snap_catchup_smoke_v2.py (which now proves the full rejoin-catchup")
+    print("arc via boot-time group recovery). This smoke has no remaining V2")
     print("precondition to assert.")
     return 0
 
