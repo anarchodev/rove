@@ -1428,7 +1428,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
 // ── Inbound WebSocket worker seam (docs/websocket-plan.md §4.5/§5, piece D) ──
 //
 // A held WebSocket connection is a parked continuation chain (it lives in
-// `parked_continuations`, located by conn entity via `ws_chains_by_conn`).
+// `parked_continuations`, located by conn entity via `ws_conns`).
 // The h2 transport surfaces each complete inbound data frame on the
 // `ws_message_out` collection (Session = conn, WsMeta.opcode, ReqBody =
 // payload); `serviceWsMessages` drains it once per tick and dispatches each
@@ -1437,20 +1437,30 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
 // inline for read-only frames, commit-gated `ws_send` Cmds for writing frames
 // (batch-of-1 durability). This is additive on the STABLE transport
 // collections — no new collection, no transport change.
+//
+// §4.5 strict reply ordering — the per-connection INPUT GATE: while a
+// writing frame's forgetful unit awaits raft (`WsConnState.gate_seq`),
+// newly-arriving frames for that connection queue instead of activating.
+// `flushWsGates` re-opens the gate once the seq committed AND the unit
+// was released (its reply frames are in `ws_send_in`), then dispatches
+// the queue in arrival order. Two guarantees fall out: replies on one
+// socket are in message order across the durability boundary, and frame
+// K+1 reads frame K's writes (it only activates post-commit — the
+// read-your-writes the DO input gate provides).
 
-/// Drain the conn→chain index of any entry whose connection has died without
+/// Drain the conn-state index of any entry whose connection has died without
 /// a Close frame (abrupt client RST/EOF — the transport reaps the conn but
 /// emits no opcode-8 message). Fire `onDisconnect` on each orphaned chain,
 /// then tear it down. Cheap when the map is empty (one length check). Run at
 /// the top of `serviceWsMessages` so a dead idle conn doesn't leak its chain.
 fn sweepStaleWsChains(worker: anytype) void {
-    if (worker.ws_chains_by_conn.count() == 0) return;
+    if (worker.ws_conns.count() == 0) return;
     const server = worker.h2;
     // Collect stale conns first — can't mutate the map mid-iteration.
     var stale: [128]rove.Entity = undefined;
     var n: usize = 0;
     {
-        var it = worker.ws_chains_by_conn.iterator();
+        var it = worker.ws_conns.iterator();
         while (it.next()) |entry| {
             if (n >= stale.len) break;
             if (server.reg.isStale(entry.key_ptr.*)) {
@@ -1460,21 +1470,26 @@ fn sweepStaleWsChains(worker: anytype) void {
         }
     }
     for (stale[0..n]) |conn_ent| {
-        if (worker.ws_chains_by_conn.get(conn_ent)) |chain_ent| {
-            fireWsDisconnect(worker, chain_ent);
+        if (worker.ws_conns.get(conn_ent)) |st| {
+            fireWsDisconnect(worker, st.chain);
         }
         tearDownWsChain(worker, conn_ent);
     }
 }
 
-/// Destroy a held WS chain entity + drop its conn→chain index entry.
-/// Idempotent — a no-op when the conn isn't mapped. The entity's
-/// `ChainContext` / `StreamChain` owned slices free via component deinit
-/// on destroy.
+/// Destroy a held WS chain entity + drop its conn-state entry (freeing any
+/// gated frames still queued — the socket is closing; they can never be
+/// replied to). Idempotent — a no-op when the conn isn't mapped. The
+/// entity's `ChainContext` / `StreamChain` owned slices free via component
+/// deinit on destroy.
 fn tearDownWsChain(worker: anytype, conn_ent: rove.Entity) void {
-    const chain_ent = worker.ws_chains_by_conn.get(conn_ent) orelse return;
-    worker.h2.reg.destroy(chain_ent) catch {};
-    _ = worker.ws_chains_by_conn.remove(conn_ent);
+    const st = worker.ws_conns.getPtr(conn_ent) orelse return;
+    for (st.queue.items) |f| {
+        if (f.payload.len > 0) worker.allocator.free(f.payload);
+    }
+    st.queue.deinit(worker.allocator);
+    worker.h2.reg.destroy(st.chain) catch {};
+    _ = worker.ws_conns.remove(conn_ent);
 }
 
 /// Establish the held chain for a new WS connection on its first inbound
@@ -1549,8 +1564,100 @@ fn establishWsChain(worker: anytype, conn_ent: rove.Entity) !rove.Entity {
     try server.reg.set(ent, &worker.parked_continuations, components_mod.ContDescriptor, .{
         .deadline_ns = std.math.maxInt(i64),
     });
-    try worker.ws_chains_by_conn.put(allocator, conn_ent, ent);
+    try worker.ws_conns.put(allocator, conn_ent, .{ .chain = ent });
     return ent;
+}
+
+/// Arm the §4.5 input gate: `seq` is the writing frame's forgetful-unit
+/// propose; frames arriving for this connection queue until it resolves.
+/// The deadline mirrors the unit's own `commit_wait_timeout_ns` so a unit
+/// reaped without advancing either watermark (leadership-loss sweep)
+/// can't wedge the connection.
+fn armWsGate(worker: anytype, conn_ent: rove.Entity, tenant_id: []const u8, seq: u64) void {
+    const st = worker.ws_conns.getPtr(conn_ent) orelse return;
+    st.gate_seq = seq;
+    st.gate_gid = worker.raft.gidForTenant(tenant_id) orelse 0;
+    st.gate_deadline_ns = @as(i64, @intCast(std.time.nanoTimestamp())) +
+        @as(i64, @intCast(worker.commit_wait_timeout_ns));
+}
+
+/// True while any forgetful `ParkedUnit` still holds `seq` — i.e. the
+/// drain hasn't released (or has Conflict-deferred) that propose's
+/// buffered Cmds yet. The gate must wait for the UNIT, not just the
+/// commit watermark: `committedSeq` advances on the pump thread, so it
+/// can lead the drain within a tick — opening the gate on the watermark
+/// alone would let a queued frame's inline reply ship before the gated
+/// frame's commit-released reply frames reach `ws_send_in`. A destroyed-
+/// but-unflushed unit still shows in the column (deferred destroy) —
+/// that errs one tick conservative, never early.
+fn parkedUnitHoldsSeq(worker: anytype, seq: u64) bool {
+    for (worker.parked_units.column(worker_mod.ParkedUnit)) |*u| {
+        if (u.seq == seq) return true;
+    }
+    return false;
+}
+
+/// §4.5 input-gate pump, run once per tick (after `drainRaftPending` in
+/// the worker tick, so a commit observed here has already released its
+/// unit's reply frames). For each gated connection: fault/timeout →
+/// Close + teardown (the gated write's replies were discarded — the
+/// connection can't be resumed honestly); committed + unit released →
+/// open the gate and dispatch the queued frames in arrival order until
+/// either the queue drains or a writing frame re-arms the gate.
+fn flushWsGates(worker: anytype) void {
+    if (worker.ws_conns.count() == 0) return;
+    var pending: [128]rove.Entity = undefined;
+    var n: usize = 0;
+    {
+        var it = worker.ws_conns.iterator();
+        while (it.next()) |entry| {
+            if (n >= pending.len) break;
+            if (entry.value_ptr.gate_seq == 0 and entry.value_ptr.queue.items.len == 0) continue;
+            pending[n] = entry.key_ptr.*;
+            n += 1;
+        }
+    }
+    if (n == 0) return;
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    outer: for (pending[0..n]) |conn_ent| {
+        var st = worker.ws_conns.getPtr(conn_ent) orelse continue;
+        if (st.gate_seq != 0) {
+            const committed = worker.raft.committedSeq(st.gate_gid);
+            const faulted = worker.raft.faultedSeq(st.gate_gid);
+            if (faulted >= st.gate_seq or now_ns >= st.gate_deadline_ns) {
+                std.log.warn("rove-js ws: gated seq={d} faulted/timed out; closing conn", .{st.gate_seq});
+                effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+                tearDownWsChain(worker, conn_ent);
+                continue;
+            }
+            if (committed < st.gate_seq or parkedUnitHoldsSeq(worker, st.gate_seq)) continue;
+            st.gate_seq = 0;
+            st.gate_gid = 0;
+            st.gate_deadline_ns = 0;
+        }
+        while (st.queue.items.len != 0) {
+            const f = st.queue.orderedRemove(0);
+            defer if (f.payload.len > 0) worker.allocator.free(f.payload);
+            if (worker.h2.reg.isStale(conn_ent)) {
+                // Conn died while frames were queued — replies are
+                // undeliverable; the next sweep would fire onDisconnect,
+                // but the chain is right here: do it now.
+                fireWsDisconnect(worker, st.chain);
+                tearDownWsChain(worker, conn_ent);
+                continue :outer;
+            }
+            if (f.opcode == 8) {
+                fireWsDisconnect(worker, st.chain);
+                tearDownWsChain(worker, conn_ent);
+                continue :outer;
+            }
+            fireWsMessage(worker, st.chain, conn_ent, f.opcode, f.payload);
+            // fireWsMessage may have torn the chain down (terminal /
+            // error) or re-armed the gate (writing frame) — re-resolve.
+            st = worker.ws_conns.getPtr(conn_ent) orelse continue :outer;
+            if (st.gate_seq != 0) continue :outer;
+        }
+    }
 }
 
 /// Drain `ws_message_out` once per tick: dispatch each inbound WS data frame
@@ -1559,6 +1666,7 @@ fn establishWsChain(worker: anytype, conn_ent: rove.Entity) !rove.Entity {
 /// so the no-WS hot path pays nothing.
 pub fn serviceWsMessages(worker: anytype) !void {
     sweepStaleWsChains(worker);
+    flushWsGates(worker);
 
     const server = worker.h2;
     if (server.ws_message_out.entitySlice().len == 0) return;
@@ -1591,17 +1699,45 @@ pub fn serviceWsMessages(worker: anytype) !void {
             server.reg.destroy(p.ment) catch {};
             continue;
         }
+        // §4.5 input gate: while a writing frame's commit is in flight (or
+        // earlier frames are still queued — order is sacred), this frame
+        // queues instead of activating. Opcode 8 queues too, so a close
+        // behind queued data frames fires onDisconnect only after they run.
+        if (worker.ws_conns.getPtr(p.conn)) |st| {
+            if (st.gate_seq != 0 or st.queue.items.len != 0) {
+                const copy: []u8 = if (p.payload.len > 0)
+                    worker.allocator.dupe(u8, p.payload) catch {
+                        // OOM on the queue copy — can't preserve order, so
+                        // fail the connection loudly rather than drop a frame.
+                        effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = p.conn, .opcode = 8, .bytes = &.{} }) catch {};
+                        tearDownWsChain(worker, p.conn);
+                        server.reg.destroy(p.ment) catch {};
+                        continue;
+                    }
+                else
+                    &.{};
+                st.queue.append(worker.allocator, .{ .opcode = p.opcode, .payload = copy }) catch {
+                    if (copy.len > 0) worker.allocator.free(copy);
+                    effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = p.conn, .opcode = 8, .bytes = &.{} }) catch {};
+                    tearDownWsChain(worker, p.conn);
+                };
+                server.reg.destroy(p.ment) catch {};
+                continue;
+            }
+        }
         if (p.opcode == 8) {
             // Client close → onDisconnect (best-effort), then tear down.
-            if (worker.ws_chains_by_conn.get(p.conn)) |chain_ent| {
-                fireWsDisconnect(worker, chain_ent);
+            if (worker.ws_conns.get(p.conn)) |st| {
+                fireWsDisconnect(worker, st.chain);
             }
             tearDownWsChain(worker, p.conn);
             server.reg.destroy(p.ment) catch {};
             continue;
         }
         // Data frame (text/binary) → find-or-establish the chain, run onMessage.
-        const chain_ent = worker.ws_chains_by_conn.get(p.conn) orelse
+        const chain_ent = if (worker.ws_conns.get(p.conn)) |st|
+            st.chain
+        else
             establishWsChain(worker, p.conn) catch |err| {
                 std.log.warn("rove-js ws: establish chain failed: {s}; closing conn", .{@errorName(err)});
                 // Couldn't bind a tenant/module — send a Close so the client
@@ -1759,6 +1895,10 @@ fn fireWsMessage(
             cval.ctx_json = &.{};
             chain_st.activation_count += 1;
             cval.deinit(allocator);
+            // §4.5 input gate: this frame's output is commit-gated (real
+            // writes, or the read-only speculation barrier) — close the
+            // gate so later frames queue behind it in arrival order.
+            if (fw_seq != 0) armWsGate(worker, conn_ent, chain_ctx.tenant_id, fw_seq);
             captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .ws_message, fw_seq);
         },
         .stream => |*s2| {
@@ -1812,46 +1952,60 @@ fn shipWsFrames(
     close: bool,
 ) !u64 {
     const allocator = worker.allocator;
-    if (writeset.ops.items.len > 0) {
-        var stage: StreamResumeStage = .{
-            .entity = rove.Entity.nil,
-            .ws_conn = conn_ent,
-            .mark_draining = close,
-        };
-        stage.chunks = chunks.*;
-        chunks.* = .empty;
-        stage.ws_opcodes = opcodes.*;
-        opcodes.* = .empty;
-        defer {
-            for (stage.chunks.items) |c| allocator.free(c);
-            stage.chunks.deinit(allocator);
-            stage.ws_opcodes.deinit(allocator);
+    if (writeset.ops.items.len == 0) {
+        // Read-only frame: try the inline fast path — commit now, emit now.
+        // `Conflict` here is kvexp `NotChainHead`: the txn READ a chain
+        // predecessor's still-uncommitted overlay (`saw_speculation`), so
+        // the frames were computed on un-durable state. That is the
+        // idiom-0 read-side hazard (worker_dispatch.zig:707) in WS form —
+        // fall through to the commit-gated path below, which proposes an
+        // empty-writeset BARRIER and ships the frames only once the chain
+        // commits. Reachable only when the txn was opened on a read that
+        // crossed an in-flight write from another producer (the §4.5
+        // input gate already serializes this connection's own writes).
+        if (txn.commit()) |_| {
+            for (chunks.items, 0..) |bytes, i| {
+                const op: u8 = if (i < opcodes.items.len) opcodes.items[i] else 1;
+                effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = op, .bytes = bytes }) catch {
+                    if (bytes.len > 0) allocator.free(bytes);
+                };
+            }
+            chunks.clearRetainingCapacity(); // ownership transferred (or freed on error)
+            opcodes.clearRetainingCapacity();
+            if (close) {
+                effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+            }
+            return 0;
+        } else |e| switch (e) {
+            error.Conflict => {}, // speculation barrier below
+            else => panic_mod.invariantViolated(
+                "fireWsMessage.commit(read-only)",
+                "err={s}",
+                .{@errorName(e)},
+            ),
         }
-        const seq = proposeForgetfulWrites(worker, writeset, txn, tenant_id, &stage, readset, log_header) catch |err| {
-            txn_owned.* = false; // helper rolled back + destroyed the txn
-            return err;
-        };
-        txn_owned.* = false;
-        return seq;
     }
-    // Read-only frame: commit now + emit each frame inline. No commit gate.
-    txn.commit() catch |e| panic_mod.invariantViolated(
-        "fireWsMessage.commit(read-only)",
-        "err={s}",
-        .{@errorName(e)},
-    );
-    for (chunks.items, 0..) |bytes, i| {
-        const op: u8 = if (i < opcodes.items.len) opcodes.items[i] else 1;
-        effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = op, .bytes = bytes }) catch {
-            if (bytes.len > 0) allocator.free(bytes);
-        };
+    // Commit-gated path: real writes, or the read-only speculation barrier.
+    var stage: StreamResumeStage = .{
+        .entity = rove.Entity.nil,
+        .ws_conn = conn_ent,
+        .mark_draining = close,
+    };
+    stage.chunks = chunks.*;
+    chunks.* = .empty;
+    stage.ws_opcodes = opcodes.*;
+    opcodes.* = .empty;
+    defer {
+        for (stage.chunks.items) |c| allocator.free(c);
+        stage.chunks.deinit(allocator);
+        stage.ws_opcodes.deinit(allocator);
     }
-    chunks.clearRetainingCapacity(); // ownership transferred (or freed on error)
-    opcodes.clearRetainingCapacity();
-    if (close) {
-        effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
-    }
-    return 0;
+    const seq = proposeForgetfulWrites(worker, writeset, txn, tenant_id, &stage, readset, log_header) catch |err| {
+        txn_owned.* = false; // helper rolled back + destroyed the txn
+        return err;
+    };
+    txn_owned.* = false;
+    return seq;
 }
 
 /// Run an `onDisconnect` activation for a held WS chain (client close or conn
@@ -1950,11 +2104,18 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
         return;
     }
-    txn.commit() catch |e| panic_mod.invariantViolated(
-        "fireWsDisconnect.commit",
-        "err={s}",
-        .{@errorName(e)},
-    );
+    txn.commit() catch |e| switch (e) {
+        // kvexp NotChainHead: a read crossed an in-flight predecessor's
+        // overlay. onDisconnect ships nothing (the socket is gone), so a
+        // speculative read-only txn has nothing to gate — just roll it
+        // back; nothing durable is lost.
+        error.Conflict => txn.rollback() catch {},
+        else => panic_mod.invariantViolated(
+            "fireWsDisconnect.commit",
+            "err={s}",
+            .{@errorName(e)},
+        ),
+    };
     txn_done = true;
     captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
 }
@@ -3034,7 +3195,16 @@ pub fn proposeForgetfulWrites(
     else
         &.{};
     defer if (rs_bytes.len > 0) allocator.free(rs_bytes);
-    const seq = (raft_propose.proposeBatch(worker, writeset, tenant_id, rs_bytes) catch |err| {
+    // An EMPTY writeset here is the read-side speculation BARRIER (the
+    // idiom-0 dual, shipWsFrames' Conflict fallback): the activation read
+    // un-durable chain state, so its staged output must gate on the chain
+    // committing. `proposeBatch` would skip an empty writeset (seq 0 — no
+    // propose, nothing to park on); `proposeWriteSet` always proposes.
+    const prop_res = if (writeset.ops.items.len == 0)
+        raft_propose.proposeWriteSet(worker, writeset, tenant_id, rs_bytes)
+    else
+        raft_propose.proposeBatch(worker, writeset, tenant_id, rs_bytes);
+    const seq = (prop_res catch |err| {
         txn.rollback() catch {};
         allocator.destroy(txn);
         return err;
