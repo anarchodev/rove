@@ -729,7 +729,7 @@ fn finalizeBatch(
             // with kv-reads that crossed an uncommitted speculative
             // overlay. The first-request readset rides as
             // `batch_readset_bytes` (slice 3d).
-            const seq = (raft_propose.proposeWriteSet(worker, writeset, anchor_id, batch_readset_bytes) catch |perr| {
+            const barrier_proposed = (raft_propose.proposeWriteSet(worker, writeset, anchor_id, batch_readset_bytes) catch |perr| {
                 std.log.warn("rove-js idiom-0 barrier propose (tenant={s}) failed: {s}", .{ anchor_id, @errorName(perr) });
                 txn.rollback() catch |rb_err| panic_mod.invariantViolated(
                     "finalizeBatch.rollback(idiom0_barrier_fail)",
@@ -755,7 +755,8 @@ fn finalizeBatch(
                 }
                 successes.clearRetainingCapacity();
                 return processed;
-            }).seq;
+            });
+            const seq = barrier_proposed.seq;
             // Propose accepted: transfer txn ownership to the drain
             // (parked on the barrier seq). Mirror the write-path branch
             // below exactly — stage commands, park the kv-wake unit,
@@ -768,7 +769,7 @@ fn finalizeBatch(
             // `response_in` the pre-null read used to emit.
             txn.park(seq) catch |perr|
                 std.log.warn("rove-js finalizeBatch (barrier): park seq={d} tenant={s}: {s} (pointer fallback)", .{ seq, anchor_id, @errorName(perr) });
-            try worker.pending_txns.park(allocator, seq, txn);
+            try worker.pending_txns.park(allocator, barrier_proposed.group_id, seq, txn);
 
             // Effect-reification Phase 4.1.2: the barrier path's
             // batch had no writes BUT did read speculative state;
@@ -896,7 +897,7 @@ fn finalizeBatch(
     // before calling finalizeBatch; empty `batch_readset_bytes` here
     // means the batch had no successful handler-bound requests (only
     // admin/system side effects).
-    const seq = (raft_propose.proposeBatch(
+    const batch_proposed = (raft_propose.proposeBatch(
         worker,
         writeset,
         anchor_id,
@@ -928,19 +929,20 @@ fn finalizeBatch(
         }
         successes.clearRetainingCapacity();
         return processed;
-    }).seq;
+    });
+    const seq = batch_proposed.seq;
 
     // Propose succeeded: hand the txn to the chain by handle, then park
-    // it on the worker's pending map keyed by raft seq. `park` flips it
-    // active → parked so drainRaftPending's commit/rollback resolve
-    // by-handle under the tenant lock (cross-worker safe — no raw `top`
-    // deref a sibling's cascade could have freed). On the rare
+    // it on the worker's pending map keyed by (group, raft seq). `park`
+    // flips it active → parked so drainRaftPending's commit/rollback
+    // resolve by-handle under the tenant lock (cross-worker safe — no raw
+    // `top` deref a sibling's cascade could have freed). On the rare
     // invalidation race (a predecessor faulted in this window) we log
     // and pool anyway; the pointer-fallback active path handles the
     // detached txn, and the entry faults in raft regardless.
     txn.park(seq) catch |perr|
         std.log.warn("rove-js finalizeBatch: park seq={d} tenant={s}: {s} (pointer fallback)", .{ seq, anchor_id, @errorName(perr) });
-    try worker.pending_txns.park(allocator, seq, txn);
+    try worker.pending_txns.park(allocator, batch_proposed.group_id, seq, txn);
 
     // Observe writeset-size for `/_system/metrics`. Pair with
     // `raft_proposal_batch_size_writesets` (leader-side) to see how

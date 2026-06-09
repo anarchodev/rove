@@ -200,6 +200,38 @@ pub fn applyEncoded(
     try kv.commit();
 }
 
+/// `applyEncoded` for the CONSENSUS APPLY path: routes every op through
+/// the chain-bypassing authoritative writes (`KvStore.applyPut` /
+/// `applyDelete`) instead of the speculative txn machinery. A follower
+/// applying a committed entry must not sequence behind — or fail on —
+/// the tenant's open local txn chain (`NotChainHead`); the entry is
+/// already the cluster's truth. `seq` is accepted for signature
+/// symmetry; kvexp does not persist a per-op seq.
+pub fn applyEncodedDirect(
+    kv: *kvstore.KvStore,
+    seq: u64,
+    payload: []const u8,
+) !void {
+    _ = seq;
+    var r: Reader = .{ .data = payload, .pos = 0 };
+    const op_count = try r.u32be();
+
+    var i: u32 = 0;
+    while (i < op_count) : (i += 1) {
+        const type_byte = try r.byte();
+        const key_len = try r.u32be();
+        const key = try r.bytes(key_len);
+        const val_len = try r.u32be();
+        const value = try r.bytes(val_len);
+
+        const op_type = std.meta.intToEnum(OpType, type_byte) catch return DecodeError.UnknownOpType;
+        switch (op_type) {
+            .put => try kv.applyPut(key, value),
+            .delete => try kv.applyDelete(key),
+        }
+    }
+}
+
 /// Scan an encoded writeset for a PUT op against `key` and return
 /// its value, or null if no such op (or the op is a delete). Read-
 /// only — does not commit, does not allocate. Returned slice points

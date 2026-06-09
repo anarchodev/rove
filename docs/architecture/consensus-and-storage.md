@@ -29,13 +29,13 @@ frame V2 as a throughput win.
 
 | File | Role |
 |---|---|
-| `src/consensus/node.zig` | One `Node` per cluster node. Owns the raft-rs `Manager`, the pump loop, the active-set/hibernation machinery, `ApplyMode`, and `StoreResolver`. |
-| `src/consensus/bridge.zig` | Per-tenant `Bridge` — the seam between a worker and consensus. `registerTenant` (deterministic gid), propose, the per-tenant FIFO seq binding, role-aware apply wiring. |
-| `src/consensus/transport.zig` | Cross-node wire layer: per-recipient coalescing, the heartbeat-detect byte test, the woke-list that feeds hibernation. |
-| `src/consensus/envelope.zig` | The replicated entry codec: type byte + payload framing; the writeset readset-frame strip on apply. |
+| `src/consensus/node.zig` | One `Node` per cluster node. Owns the raft-rs `Manager`, the two-pass async-append pump, the active-set/hibernation machinery, `ApplyMode`, `StoreResolver`, and the durabilize floor hook. |
+| `src/consensus/bridge.zig` | Per-tenant `Bridge` — the seam between a worker and consensus. `registerTenant` (deterministic gid), propose, the entry-identity seq binding (`origin_id` + pending set), the provenance skip query, the worker-ack durabilize floor, fault plumbing. |
+| `src/consensus/transport.zig` | Cross-node wire layer: per-recipient coalescing, the heartbeat-detect byte test, the woke-list that feeds hibernation, the `stepBatch` skip counter. |
+| `src/consensus/envelope.zig` | The replicated entry codec: the **entry origin frame** (`[0xF7][origin u64][seq u64]` — every entry's proposer identity), type byte + payload framing, the writeset readset-frame strip on apply. |
 | `src/kv/raft_net.zig`, `raft_rpc.zig` | liburing wire transport + frame codec, reused from V1 (std-only; the V1 raft *message types* are unused). |
-| `src/kv/writeset.zig`, `envelope_codec.zig` | Writeset encode/decode and the `ENVELOPE_TYPE_*` constants the apply path agrees on. |
-| `raft-rs-zig` (fetched dep) | The Rust raft-rs wrapper: a `Manager` of many `RawNode`s behind a C ABI, with a mailbox `poll_ready`/`release`, batched `tick_groups`/`step_batch`, and `create_group`/`destroy_group`/`clear_tombstone` for migration. |
+| `src/kv/writeset.zig`, `envelope_codec.zig` | Writeset encode/decode (`applyEncodedDirect` is the consensus-apply entry point) and the `ENVELOPE_TYPE_*` constants the apply path agrees on. |
+| `raft-rs-zig` (fetched dep) | The Rust raft-rs wrapper: a `Manager` of many `RawNode`s behind a C ABI, with a mailbox `poll_ready`/`release`, batched `tick_groups`/`step_batch`, the **async-append persist handshake** (`process_ready` records appends; `on_persist` acks them after the host fsync), and `create_group`/`destroy_group`/`clear_tombstone` for migration. |
 
 ## What replicates through raft (envelopes)
 
@@ -51,45 +51,112 @@ A raft entry is a typed byte blob (`src/consensus/envelope.zig`,
 Retired type bytes are rejected loudly by the decoder so a stale log entry
 surfaces rather than mis-applying. The full evolution table is in PLAN §10.2.
 
+**Entry origin frame (load-bearing).** Every proposed entry is wrapped in a
+17-byte identity frame *before* the envelope: `[0xF7][origin u64][seq u64]`
+(`envelope.EntryFrame`). `origin` is the proposing bridge's **per-boot random
+id**, `seq` its per-tenant propose ticket. The apply path uses the pair to (a)
+bind a committed entry to the *exact* local propose awaiting it and (b) key
+the worker-overlay store skip on true provenance — see Multi-node below. The
+random per-boot origin also fences a restarted node's replayed WAL entries
+from colliding with the new incarnation's seq space. `origin = seq = 0` marks
+a hookless propose (tests, bare nodes): it matches no bridge, so it is never
+skipped and never advances a watermark. An unframed entry fails loudly
+(`BadEntryFrame`).
+
 **Writeset frame (load-bearing).** A type-0 payload is *readset-framed*:
 `[u32 ws_len][ws][u32 rs_len][rs]` (from `src/js/apply.zig`). The readset rides
 for the replay tape. `node.applyEntry` strips the frame
-(`decodeWriteSetPayload`) before `writeset.applyEncoded`. A single-node leader
-**skips apply** (its `TrackedTxn.commit` already wrote durably), so this frame
-mismatch was invisible until a real follower applied a worker entry — apply
-correctness is a follower-path concern.
+(`decodeWriteSetPayload`) before applying. Apply correctness is largely a
+follower-path concern — the leader skips the store write for its own live
+proposes — so follower-only smoke coverage is what historically caught frame
+bugs here.
+
+**Multi routing (per-inner id).** A `multi`'s inner writesets route by **their
+own** envelope id, never by the carrying group's slot — an admin batch
+(`proposeBatch`) puts cross-tenant trampoline targets and `platform.root.*`
+root-writesets in one multi anchored on the admin tenant's group, and the
+apply must land each inner in *its* tenant's store (`""` = the node root
+store, per the `StoreResolver` contract). A target the node cannot resolve is
+a loud `UnroutedApply`, not a silent mis-write.
 
 ## Write path & durability
 
 A customer write lands in a speculative **volatile overlay** (kvexp), then a
 parallel raft propose replicates it. On quorum the overlay commits
-(`TrackedTxn.commit()`); on fault/timeout it rolls back. A pre-quorum crash
-needs no undo log — the overlay is volatile, so the speculative write never
-reached disk. The writer is **never held across the raft round-trip**
-(decisions.md §2.2: holding the WAL writer for the RTT serializes a tenant to
+(`TrackedTxn.commit()`); on fault it rolls back. A pre-quorum crash needs no
+undo log — the overlay is volatile, so the speculative write never reached
+disk. The writer is **never held across the raft round-trip** (decisions.md
+§2.2: holding the WAL writer for the RTT serializes a tenant to
 `batch_size / raft_latency`).
+
+Three ordering rules make "committed" mean **durable**:
+
+- **Quorum counts only fsynced entries.** raft-rs runs the async-append flow:
+  `processReady` only *records* an append (buffered into the shared WAL);
+  the pump acks `onPersist` after the cycle's fsync, and only then does this
+  node's entry count toward the commit quorum (and only then do its
+  persistence-asserting messages — append acks, vote responses — leave the
+  node). The leader's own volatile tail can never be the deciding quorum vote.
+- **The commit hook fires post-fsync.** Per-entry commit notifications are
+  staged during apply and fired only after `wal.flush()` succeeds — the
+  watermark a worker acks clients on never runs ahead of the fsync. On a flush
+  failure they are dropped: parked workers time out → 503, never a false
+  durable ack.
+- **503 means *unknown outcome*.** A faulted/timed-out propose may still
+  commit later (it then applies via the pump path, its waiter gone), so client
+  retries are at-least-once — consistent with the platform's idempotent-replay
+  posture. A worker commit-wait **timeout** never rolls its txn back
+  unilaterally: it *requests* a pump-side fault (`requestFault`), which the
+  pump serializes against its own skip/commit decisions, and the next sweep
+  resolves to commit (committed-beats-faulted) or a normal-fault rollback.
 
 ## Multi-node: replication, roles, and failover
 
 A tenant's group spans the cluster's nodes (a cluster is a *set* of node
 origins). Three mechanisms make a follower able to take over:
 
-- **Role-aware apply (`ApplyMode.worker_overlay`).** On the **leader** the pump
-  *skips* the store write — the worker's `TrackedTxn.commit` is the durable
-  write. On a **follower** (no worker) the pump *writes* the store, so followers
-  stay in sync.
-- **`StoreResolver` (Full-HA store unification).** A follower must replicate
-  into the *same* store it will serve from after promotion. The resolver
-  (`node.zig`, set by the bridge via `setStoreResolver`) points follower apply
-  at the worker's own `inst.kv` (`{data_dir}/{id}/app.db`), not an unused
-  node-local store. Without this a promoted follower would serve an empty DB.
-- **Explicit per-entry FIFO seq binding.** `propose` pushes its seq onto a
-  per-tenant `pending` FIFO; the commit hook pops the front **only when this
-  node leads**. A propose that can't commit here (not leader, or a per-cycle
-  leadership-loss sweep) is **faulted** — the parked worker fails fast (503) and
-  the client retries the leader. A write in flight at a leader change is
-  faulted + retried, **not lost**. (Counting seqs is wrong multi-node: proposes
-  can fail, and followers apply entries with no local proposer.)
+- **Provenance-keyed apply (`ApplyMode.worker_overlay` + `skipQuery`).** The
+  pump skips the store write **iff the entry is this node's own still-pending
+  propose** (origin frame matches the bridge's per-boot id *and* the seq is in
+  the tenant's pending set — that worker txn IS the store write, committed on
+  watermark advance). Everything else is written by the pump: a follower's
+  replicated entries, a freshly-promoted leader's catch-up entries proposed
+  elsewhere, restart-recovery replay (no live txns at boot), and an entry
+  whose local waiter already gave up (fault/timeout → txn rolled back).
+  Keying the skip on *currently-being-leader* — the earlier shape — silently
+  dropped catch-up and abandoned-waiter writes from the serving store.
+- **`StoreResolver` + the two-handle model (Full-HA store unification).** A
+  follower must replicate into the *same* store it will serve from after
+  promotion — but **never through the worker's own `KvStore` handle**: a
+  handle carries per-batch txn state (`active_txn`), and a pump-thread apply
+  during a worker dispatch would land inside the worker's open speculative
+  txn. The resolver (`PumpStores`, `rewind/main.zig`) hands the pump its own
+  sibling handles, `attachSibling`'d into the same manifest at the same store
+  id — shared `TenantState` (overlay/LMDB/lease: the worker serves exactly
+  what the pump applies) with pump-private txn state. The apply itself uses
+  kvexp's **chain-bypassing authoritative writes**
+  (`StoreLease.applyPut/applyDelete` via `writeset.applyEncodedDirect`):
+  replicated state is the cluster's truth and must never sequence behind — or
+  `NotChainHead`-fail on — the tenant's open speculative txn chain (sound
+  because a follower's write proposes always fault, so local speculative
+  writes can never commit over an applied value).
+- **Entry-identity seq binding.** `propose` records its seq in a per-tenant
+  `pending` set, and the pump stamps the entry with the bridge's
+  `origin_id` + seq. The commit hook advances `committed_seq` **iff the
+  committed entry's origin is this bridge's own and that exact seq is still
+  pending** — never by FIFO position (an old-term entry resurrected by a
+  re-election while a new propose sat at the FIFO front used to credit the
+  wrong waiter: a false durable ack). A propose that can't commit here (not
+  leader, or the per-cycle leadership-loss sweep) is **faulted** — the parked
+  worker fails fast (503, *unknown outcome*) and the client retries the
+  leader.
+
+**Apply failure is fatal.** A committed entry that fails to decode/apply has
+already been consumed by raft (`advance_apply`; never redelivered), so
+warn-and-continue would serve a silently-diverged replica that could later win
+an election. The production pump **panics** instead; a restart replays the WAL
+from the last checkpoint and converges. (This posture is what surfaced the
+follower-apply races the two-handle model fixed.)
 
 **Leader gating.** Writes only commit on the group leader. The front door's
 `proxyToCluster` tries nodes in order and stops at the first non-503, so a write
@@ -132,67 +199,106 @@ hibernates. What matters is the *skew*, not the absolute `hibernate_ns`.
 auto-re-elect; the next request wakes it (propose → bump → tick → campaign).
 An idle group has nothing to serve, so this costs nothing real.
 
-## Shared WAL & fsync
+## Shared WAL & fsync (the two-pass pump)
 
-All of a node's groups interleave into one append-only WAL; the pump calls
-`flush()` **once per pump cycle** regardless of how many groups committed. Per-
-group fsync collapses throughput past ~K=4. The record carries a group id
+All of a node's groups interleave into one append-only WAL; the pump fsyncs
+**once per cycle** regardless of how many groups committed. Per-group fsync
+collapses throughput past ~K=4. The record carries a group id
 (`[tag:u8][group_id:u64][len:u32][payload][crc32]`) so the interleaved stream is
 a sequence of `(group_id, record)` tuples. Because a shared file cannot be
 physically rewound when raft rewrites one group's uncommitted suffix, replay
 **dispatches by `group_id` and keeps the last authoritative entry per group** —
 it is not a linear truncate.
 
+The pump is **two passes around that one fsync** (the async-append handshake):
+
+```
+tick → pass 1: processReady each ready group
+                 (appends BUFFERED; committed entries handed out here were
+                  already durable — raft gates them on its persist watermark)
+     → wal.flush()                       (the cycle's one fsync)
+     → mgr.onPersist per buffered group  (entries become quorum-countable;
+                                          stashed append-acks/vote-responses
+                                          released to the outboxes)
+     → pass 2: poll + apply the commits the acks just unlocked
+                 (a single-node propose still commits within one cycle)
+     → fire staged commit hooks          (everything applied is fsync-covered)
+     → takeMessages + release, both passes
+```
+
+On a failed flush the persist acks are *retained, not sent*: no ack on the
+wire, commits stay locked, nothing claims durability for volatile bytes.
+
 ## Durability, compaction & crash recovery
 
 Three mechanisms keep the WAL bounded and a restart correct:
 
-- **Durabilize tick** (`durabilizeTick`, the V2 port of V1's
-  `Cluster.tickSnapshot`). Interval-gated (`durabilize_interval_ns`), it folds
-  every **dirty** group's kvexp overlay into LMDB and stamps each group's
-  `lastAppliedRaftIdx` — `O(dirty)`, not `O(all groups)`. The fold is one fsync
-  amortized over many commits. A committed write is already durable in the
-  fsync'd raft WAL the instant it commits; this checkpoint just bounds how much
-  WAL a restart must replay.
+- **Durabilize tick + the worker-ack floor** (`durabilizeTick`, the V2 port of
+  V1's `Cluster.tickSnapshot`). Interval-gated (`durabilize_interval_ns`), it
+  folds every **dirty** group's kvexp overlay into LMDB and stamps each group's
+  `lastAppliedRaftIdx` — `O(dirty)`, not `O(all groups)`. The fold target is
+  `min(applied_idx, floor)`, where the **durabilize floor** (bridge hook) is
+  one less than the first committed-but-not-worker-acked entry's index: a
+  *skipped* entry's writes live in the worker's open `TrackedTxn` until the
+  worker observes the watermark and commits, and kvexp's fold only covers the
+  committed overlay — stamping/compacting past an un-acked entry would claim
+  durability for data the fold cannot see. Committers ack via
+  `noteWorkerCommitted` (drain arms, parked-unit txns; immediate-commit
+  producers pre-ack — the bridge keeps an acked high-water so a
+  fire-and-forget propose can't pin the floor). A slot whose fold could not
+  reach `applied_idx` **stays dirty** and is finished by a later tick.
 - **Compaction (single-node).** After durabilizing, a single-node node truncates
   the shared WAL up to the durabilized index (`compact_wal = true`, on). Safe
   because the data up to that point was folded into LMDB and the watermark
-  stamped *before* the truncate, so it survives independent of the WAL —
-  recovery reloads from LMDB and replays only the post-compaction tail.
-  Multi-node nodes durabilize (bounding replay) but do **not** truncate:
-  truncating safely needs a follower-match-index floor, and a lagging follower
-  would then need a data-carrying snapshot, which is not wired. **This is the one
-  known limitation in the storage layer** — it bounds nothing worse than WAL
-  growth on a long-lived multi-node group; correctness holds.
+  stamped *before* the truncate. The tick flushes the WAL once before its
+  first truncate: under the async-append flow the durable `HardState.commit`
+  lags the live commit by one fsync, and truncating past a non-durable commit
+  would panic `RawNode::new` at recovery. Multi-node nodes durabilize
+  (bounding replay) but do **not** truncate: truncating safely needs a
+  follower-match-index floor, and a lagging follower would then need a
+  data-carrying snapshot, which is not wired. **This is the one known
+  limitation in the storage layer** — it bounds nothing worse than WAL growth
+  on a long-lived multi-node group; correctness holds.
 - **Crash recovery.** At boot the Node opens the WAL with `SharedWal.open` (not
   `init`): it CRC-scans the segments, physically truncates only a *torn tail*,
   and buckets recovered records by `group_id`. `Bridge.recoverGroups` reads the
   per-node group list (a group's `id_str` is not recoverable from the WAL
-  alone) and calls `recoverGroup` for each, replaying its tail with
-  `recovering = true` so the pump writes the store itself — at restart there is
-  no worker to own the speculative write, exactly as a follower does. Per-group
-  compaction watermarks are re-baselined into each new segment header alongside
-  hard state, so recovery finds a group's compaction point even after the
-  segment that first wrote it is GC'd.
+  alone) and calls `recoverGroup` for each, replaying its tail so the pump
+  writes the store itself — the new bridge has no pending proposes at boot, so
+  the provenance skip naturally answers "write it" (the prior incarnation's
+  origin id can never match either). Per-group compaction watermarks are
+  re-baselined into each new segment header alongside hard state, so recovery
+  finds a group's compaction point even after the segment that first wrote it
+  is GC'd.
 
 raft-rs supplies the in-protocol snapshot transport; the per-tenant *state*
 durability above is rove's, not raft-rs's. (The former V1 snapshot doc — a
 willemt-raft stamp-and-compact model — did not carry over; it is in git
-history.) The earlier raft-rs-zig `compact → recover` hard-state bug (a recovered
-group loaded a stale `commit = 0` → `hs.commit out of range`) is fixed upstream
-by persisting the `LightReady` commit index (pinned at raft-rs-zig `5092bc6`);
-compaction is verified to survive compact→recover across restart under the full
-V2 smoke suite (`rewind` / `tenant_move` / `three_node` / `cp_move_recovery` /
-`zero_downtime_move`).
+history.) On commit-index durability: under the async-append flow a commit
+advance surfaces as a changed `hs()` in a *subsequent* ready and rides the
+normal hard-state persist, one fsync behind the live commit — safe because the
+durable commit only needs to stay ≥ the compaction point, which the
+pre-compact flush above guarantees. (The earlier sync-flow `compact → recover`
+hard-state bug — a recovered group loading a stale `commit = 0` →
+`hs.commit out of range` — was fixed by persisting the `LightReady` commit
+index; the async flow retires that mechanism but keeps the regression tests.)
+Compaction is verified to survive compact→recover across restart under the
+full V2 smoke suite (`rewind` / `tenant_move` / `three_node` /
+`cp_move_recovery` / `zero_downtime_move`).
 
 ## Tenant move (mechanism)
 
 A tenant is movable because it is a whole group. The DP-level mechanism:
 
-- **detach** → `bundle`: dump the tenant's committed KV state to a
-  self-describing byte blob (magic + version + tenant + KV pairs + CRC32),
-  `destroyGroup` on every node (which raft-rs **tombstones**), free pending
-  handles.
+- **detach** → `bundle`: quiesce, await `committedSeq` *and* the worker-overlay
+  drain (`workerAckedThrough` — raft commit alone only proves the apply was
+  *skipped*; the skipped writes live in parked worker txns until the drain
+  promotes them, and the drain runs between dispatches on the very thread the
+  bundle handler blocks; the source replies **423** until the overlay covers
+  the quiesce point and the CP retries the same node), then dump the tenant's
+  committed KV state to a self-describing byte blob (magic + version + tenant
+  + KV pairs + CRC32), `destroyGroup` on every node (which raft-rs
+  **tombstones**), free pending handles.
 - **attach**(`bundle`): load it, `clearTombstone` (migration is *intentional*
   id reuse — raft-rs tombstones a destroyed id to block zombie messages, so an
   explicit lift is required), `createGroupEpoch` a fresh incarnation at the
