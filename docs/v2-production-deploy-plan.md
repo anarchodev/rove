@@ -3,12 +3,12 @@
 > **Status: plan / not yet built (2026-06-08).** The first production deploy
 > of the V2 `rewind` stack, plus the repeatable *feature-done → deploy → docs*
 > workflow. Supersedes the V1 deploy story in
-> [`production.md`](production.md) + [`deployment.md`](deployment.md) +
+> [`v2-cutover-checklist.md`](v2-cutover-checklist.md) + [`architecture/deployment-and-logs.md`](architecture/deployment-and-logs.md) +
 > `scripts/systemd/*.service`, **all of which target the retired four-binary
 > V1 topology** (`loop46`, `files-server-standalone`, `log-server-standalone`,
 > `sse-server-standalone`) and must not be used. Companions:
 > [`v2-cutover-checklist.md`](v2-cutover-checklist.md),
-> [`v2-front-door-architecture.md`](v2-front-door-architecture.md),
+> [`architecture/routing-and-ingress.md`](architecture/routing-and-ingress.md),
 > [`v2-cp-operational-state.md`](v2-cp-operational-state.md).
 
 ## 0. The gap this plan closes
@@ -207,9 +207,14 @@ A pre-deploy checklist.
   push → quorum-safe rolling restart (cp→worker→front, health-gated on
   `/_cp/leader` + `/_system/health`, settle between hosts). Binaries only — no
   secrets pushed.
+- [x] **`/deploy` skill** (`.claude/skills/deploy/SKILL.md`) — the approval-gated
+  release procedure (§6): show the diff, human go/no-go, run `deploy.sh`,
+  validate, tag `prod-deployed`.
+- [ ] **`scripts/rove-cert-deploy.sh`** — the certbot `--deploy-hook` for the
+  Tier-1 wildcard (§4.1): rsync the renewed cert to all 3 fronts + reload each.
 - [ ] **`docs/v2-deployment.md`** — the full V2 runbook (the `README.md` is a
   condensed install; the runbook adds membership changes, cert rotation,
-  lost-quorum recovery, validation curls). Replaces V1 `deployment.md`.
+  lost-quorum recovery, validation curls). Replaces V1 `architecture/deployment-and-logs.md`.
 - [ ] **Prove the V2 handler-publish path** (gates the §11 tenants) + the
   **first-party tenant bundles** — marketing (static) first as the pipeline
   proof, then admin/auth/docs/cluster-manager (§11).
@@ -225,20 +230,50 @@ Two registrable domains (the auth/domain isolation boundary):
   IPs, short TTL (e.g. 60s). Serve-or-forward means DNS only needs to land you
   on *a* live front; it proxies to the right cluster regardless. (An OVH Load
   Balancer / L4 front is a later hardening step, not a launch blocker.)
-- **TLS:** the front terminates public h2-over-TLS with SNI cert selection.
-  `REWIND_TLS_CERT`/`REWIND_TLS_KEY` is the default platform-wildcard cert;
-  per-host custom-domain certs sync from the CP (`CertSync`).
-- **ACME:** set `REWIND_ACME_DIRECTORY` on the CP to enable the leader-elected
-  HTTP-01 issuer (`src/cp/acme.zig`). The front `:80` listener serves the
-  `/.well-known/acme-challenge/*` HTTP-01 token (forwarded to the CP's
-  `/_cp/acme-challenge`). Wildcard (DNS-01) is deferred — provision the
-  platform wildcard manually via `POST /_control/cert` for launch.
-- **Bootstrap order wrinkle:** the platform wildcard cert must exist *before*
-  the front can serve TLS. Either (a) issue it out-of-band (certbot/Let's
-  Encrypt manual) and seed `REWIND_TLS_CERT`, or (b) bring the front up on `:80`
-  only first, let the CP issuer mint it, then enable `:443`. Pick one in the
-  runbook (lean: (a) for launch — one manual wildcard, then automation owns
-  renewals).
+### 4.1 Two-tier TLS certs (decided 2026-06-08)
+
+The front terminates public h2-over-TLS with **SNI cert selection**: per incoming
+Host, an exact-match per-host cert wins, else the default wildcard. Two sources
+feed it.
+
+**Tier 1 — your own domains → one certbot DNS-01 wildcard.** `*.rewindjs.com` +
+`*.rewindjs.app` (+ the bare apexes — wildcards don't match the apex), issued by
+**certbot + the Cloudflare DNS plugin** (DNS-01 is the only way to get a wildcard;
+HTTP-01 can't) and auto-renewed via `certbot.timer`. This is the front's default
+cert (`REWIND_TLS_CERT`/`KEY`) and covers **all** first-party tenants + any
+customer subdomains of our domains. It also resolves the old "bootstrap wrinkle":
+it's the *automated* form of "seed a cert," so the front has a real wildcard from
+first boot — no boot-ordering dance, no `:80`-first dance.
+- **Distribution (option B):** run certbot on ONE host (or the ops box — DNS-01
+  needs only outbound to LE + Cloudflare), and a `--deploy-hook`
+  (`scripts/rove-cert-deploy.sh`) rsyncs the renewed cert to all 3 fronts'
+  `REWIND_TLS_CERT`/`KEY` paths and reloads each (restart `rewind-front` — safe,
+  it's stateless). Scoped Cloudflare token (`Zone.DNS:Edit` on the 2 zones),
+  creds ini `chmod 600`.
+
+**Tier 2 — customer custom domains → the CP's HTTP-01 issuer.** `customer.com` /
+`api.customer.com` are not under our wildcard, so each gets its own per-host cert
+from the platform's leader-elected ACME issuer (`src/cp/acme.zig`, HTTP-01, built
++ Pebble-proven). Flow: customer points DNS at our fronts → `POST /_control/host`
+maps host→tenant → the issuer serves the HTTP-01 challenge via the front `:80`
+(forwarded to `/_cp/acme-challenge`) → cert lands in the CP cert axis →
+**CertSync** fans it to all 3 fronts → served by SNI exact-match.
+- **Toggle:** `REWIND_ACME_DIRECTORY` is **unset at launch** (Tier-1 covers every
+  first-party host) and **flipped on when onboarding the first custom domain**.
+  Built + ready, just not exercised until then.
+- **Scope:** specific hosts only. A wildcard on the *customer's* domain
+  (`*.customer.com`) needs DNS-01 on *their* zone (CNAME-delegation / acme-dns) —
+  deferred.
+- **Onboarding gotcha:** a brief window between "DNS points at us" and "cert
+  minted" where that one host's TLS fails; first-party / wildcard hosts unaffected.
+
+**Custom domains are a metered, plan-gated, PAID feature (product decision
+2026-06-08).** Enforce via the shipped `rove-plan` tier table (gap #1): a
+per-tenant **cap** on custom domains checked at `POST /_control/host`, plus an
+**issuance rate limit** (protects against ACME abuse + Let's Encrypt's own
+account-level limits). Free tier = subdomains of our domains only; custom domains
+= paid tier / add-on (the Vercel/Netlify model). Post-launch feature, tied to
+`docs/plan-tiers.md` + `docs/pricing-model.md`; not built yet.
 
 ## 5. First-deploy runbook (outline — full version → `docs/v2-deployment.md`)
 
@@ -271,10 +306,12 @@ Two registrable domains (the auth/domain isolation boundary):
 
 ## 6. The repeatable workflow — *feature done → deploy → docs*
 
-A feature is **not done** until all four of these are true. Encoded as
-`scripts/deploy.sh` + a release checklist (and optionally a `/deploy` skill so
-it's one approval-gated command — matches the locked "deploys stay
-approval-gated" stance, `project_ai_integration_shape`).
+A feature is **not done** until all four of these are true. Encoded as the
+**`/deploy` skill** (`.claude/skills/deploy/SKILL.md`) — the approval-gated
+release procedure that wraps `scripts/deploy.sh` behind a mandatory human
+go/no-go, validates, and records the deployed commit (`prod-deployed` git tag).
+Matches the locked "deploys stay approval-gated" stance
+(`project_ai_integration_shape`).
 
 **Definition of done:**
 1. **Code + targeted tests green** — `zig build v2-test` + the feature's
@@ -397,6 +434,9 @@ deploy step.
      **Path B (directory export/import) is NOT a separate deliverable** — its
      export substrate falls out of ⑤'s join-snapshot; a thin CP-backup tool can
      wrap it later.
+   - **Custom-domain billing** (§4.1): per-tenant cap (enforced at
+     `POST /_control/host`) + issuance rate limit via the `rove-plan` tier table;
+     paid-tier gate. Lands when onboarding the first custom-domain customer.
    - **Static-asset CDN** over object storage (the earlier ingress discussion;
      fold into §4 when built).
 8. **Migrate to bare metal** (§1.1 Phase 2), dogfooding the move machinery:
@@ -405,15 +445,17 @@ deploy step.
    This is the dogfood proof of both move paths before any customer depends on
    them.
 
-## 9. Open decisions (need your call)
+## 9. Open decisions (need your call) — all resolved 2026-06-09
 
 - ~~**Docs-site host**~~ — **RESOLVED: full dogfood** (docs = a rewind.js app),
   deploy platform *before* docs (§7.1).
-- **TLS bootstrap:** manual wildcard seed (lean) vs front-up-on-:80-first
-  CP-issuance (§4).
-- **Deploy trigger:** approval-gated `/deploy` skill I run on request
-  (recommended, matches the gated-deploy stance) vs GitHub Actions CI/CD on
-  merge (needs CI secrets in a public repo).
+- ~~**TLS bootstrap**~~ — **RESOLVED: two-tier certs** (§4.1). Tier-1 certbot
+  DNS-01 wildcard for our domains (auto-renewed, distributed via deploy-hook B);
+  Tier-2 CP HTTP-01 issuer for customer custom domains (toggled on when needed).
+- ~~**Deploy trigger**~~ — **RESOLVED: approval-gated `/deploy` skill**
+  (`.claude/skills/deploy/SKILL.md`, built 2026-06-09), run on request. Chosen over
+  GitHub Actions CI/CD-on-merge (which needs CI secrets in a public repo + removes
+  the human gate that the gated-deploy stance wants, `project_ai_integration_shape`).
 
 ## 10. Verify-before-build — RESOLVED (2026-06-08, against the live source)
 
@@ -463,6 +505,11 @@ deploy step.
   → **no COOP/COEP needed**, period. §7.1's "artifact handoff" is therefore: the
   docs build copies the prebuilt `web/replay/_static/qjs_arena_wasm.*` (regen via
   emsdk when arenajs changes), not a `zig build` step.
+- [ ] **(open) Front default-cert hot-reload?** Does `rewind-front` watch
+  `REWIND_TLS_CERT`/`KEY` and reload on change (V1 had a stat-and-reload poll), or
+  must it restart to pick up a renewed Tier-1 wildcard (§4.1)? If it hot-reloads,
+  `rove-cert-deploy.sh` can drop the front restart; if not, the restart stays
+  (safe — front is stateless).
 
 ## 11. First-party tenant roadmap (the dogfood surface)
 
