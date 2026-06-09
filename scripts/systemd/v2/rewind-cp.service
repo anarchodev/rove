@@ -1,0 +1,66 @@
+# User-scoped service unit for the V2 control plane (rewind-cp).
+#
+# The V2 stack is THREE co-located processes per host (start order:
+# cp → worker → front):
+#   rewind-cp.service      — directory raft + /_control + /_cp (this file)
+#   rewind-worker.service  — DP multi-raft + per-tenant JS dispatch
+#   rewind-front.service   — stateless public TLS edge
+#
+# Full deployment plan: docs/v2-production-deploy-plan.md.
+# This REPLACES the retired V1 units (loop46/files/log/sse).
+#
+# ── Install (per host, as the deploy user) ───────────────────────────
+# 1. Binaries on PATH (or use scripts/deploy.sh):
+#      install -D -m0755 zig-out/bin/rewind-cp ~/.local/bin/rewind-cp
+# 2. Shared + per-node env (NOT pushed by deploy.sh — secrets):
+#      install -D -m0600 scripts/systemd/v2/common.env.example ~/.config/rove/common.env
+#      install -D -m0600 scripts/systemd/v2/node.env.example   ~/.config/rove/node.env
+#      # then edit both — see their comments.
+# 3. Unit:
+#      install -D -m0644 scripts/systemd/v2/rewind-cp.service \
+#          ~/.config/systemd/user/rewind-cp.service
+# 4. Enable:
+#      systemctl --user daemon-reload
+#      systemctl --user enable --now rewind-cp.service
+#      journalctl --user -u rewind-cp.service -f
+
+[Unit]
+Description=rewind-cp (V2 control plane: directory raft + provisioning)
+Documentation=https://github.com/anarchodev/rove/blob/main/docs/v2-production-deploy-plan.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/rove/common.env
+EnvironmentFile=%h/.config/rove/node.env
+# %h is NOT expanded inside EnvironmentFile, so the data dir is set here
+# (Environment= DOES expand specifiers). CP arg is just the HTTP port.
+Environment=REWIND_CP_DATA_DIR=%h/.rove/data/cp
+ExecStartPre=/usr/bin/install -d -m0700 %h/.rove/data/cp
+ExecStart=%h/.local/bin/rewind-cp 9090
+
+# Restart=always: a restarted CP node re-joins the directory raft and
+# catches up from quorum (boot-time recovery). RestartSec gives the OS
+# a beat to release the listen socket.
+Restart=always
+RestartSec=2
+# Directory writes commit through raft; don't SIGKILL mid-propose.
+TimeoutStopSec=20
+
+# Resource slice — protect the (near-idle) CP from a worker CPU/mem
+# spike on the same box (docs §1.2). Effective only with cgroup-v2
+# controller delegation to the user manager; harmless if ignored.
+CPUWeight=1000
+MemoryMin=256M
+MemoryHigh=2G
+
+# Hardening (mirrors the V1 units).
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.rove
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

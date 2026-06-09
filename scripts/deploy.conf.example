@@ -1,0 +1,28 @@
+# deploy.conf — config for scripts/deploy.sh. Copy to scripts/deploy.conf
+# (gitignored) and edit. deploy.sh ships ONLY binaries + restarts; it never
+# pushes env files / secrets (those are provisioned out-of-band).
+
+# SSH targets for the 3 nodes, space-separated. One at a time, in order.
+# Order is not safety-critical (one host fully restarts + rejoins quorum
+# before the next; CP re-elects sub-second and clients retry the CP list),
+# but listing a known follower first is a nice-to-have.
+ROVE_HOSTS="rove@host-1 rove@host-2 rove@host-3"
+
+# Remote bin dir, relative to the SSH user's home.
+ROVE_BIN_DIR=".local/bin"
+
+# Seconds to let a just-restarted node settle (raft rejoin/catch-up)
+# before touching the next host. Conservative; keeps quorum safe.
+ROVE_SETTLE_SECS=10
+
+# Set to 1 if you bind :443/:80 via setcap (must be re-applied after each
+# binary replace). Leave 0 if you used the sysctl approach (recommended).
+# ROVE_SETCAP=1 requires passwordless sudo for setcap on each host.
+ROVE_SETCAP=0
+
+# Set to 1 to skip the local build's test gate (NOT recommended).
+ROVE_SKIP_TESTS=0
+
+# ssh / rsync commands (override for jump hosts, keys, etc.)
+ROVE_SSH="ssh"
+ROVE_RSYNC="rsync"
