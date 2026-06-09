@@ -43,10 +43,10 @@ distinctly:
 
 | Piece | Where | What |
 |---|---|---|
-| **Bridge/Node move primitives** | `src-v2/kv/node.zig`, `src-v2/kv/bridge.zig` | `createGroupAtEpoch` / `destroyGroupAndReclaim` on the node; a pump-thread control queue (`createGroupEpoch` / `destroyGroup`) + `quiesce` / `unquiesce` on the bridge. The `Manager` is not thread-safe, so group lifecycle runs on the pump thread, enqueued + waited from the worker thread. |
+| **Bridge/Node move primitives** | `src/consensus/node.zig`, `src/consensus/bridge.zig` | `createGroupAtEpoch` / `destroyGroupAndReclaim` on the node; a pump-thread control queue (`createGroupEpoch` / `destroyGroup`) + `quiesce` / `unquiesce` on the bridge. The `Manager` is not thread-safe, so group lifecycle runs on the pump thread, enqueued + waited from the worker thread. |
 | **KvStore bundle dump/load** | `src/kv/kvstore.zig` | `dumpTenantBundle(allocator) []u8` / `loadTenantBundle(bytes)` — the minimal shippable form of one tenant store, over `kvexp.dumpTenantBundle` / `loadTenantBundle`. |
 | **Worker move surface** | `src/js/v2_move.zig` (wired into `tryHandleSystem`) | `/_system/v2-kv` (seed/read through the real propose path), `v2-bundle` (quiesce + dump), `v2-attach` (load + group-at-epoch), `v2-evict` (destroy group + drop instance), `v2-resume` (abort). Gated by a shared `move_secret` (`X-Rewind-Move-Secret`), no CORS, no root bearer. |
-| **Front-door orchestration** | `src-v2/front/main.zig`, `src-v2/cp/directory.zig` | `POST /_control/move {tenant,dest}` drives the whole move; `Directory` gains a `moving` placement state (router 503s a moving tenant) + `beginMove` / `abortMove` / `clusterById`. |
+| **Front-door orchestration** | `src/front/main.zig`, `src/cp/directory.zig` | `POST /_control/move {tenant,dest}` drives the whole move; `Directory` gains a `moving` placement state (router 503s a moving tenant) + `beginMove` / `abortMove` / `clusterById`. |
 | **Exit smoke** | `scripts/tenant_move_smoke.py` | two `rewind` clusters + front door; write → move → read-back; data intact + new cluster serves + source evicted + routing flipped. **Green.** |
 
 ## The move sequence (the orchestration)

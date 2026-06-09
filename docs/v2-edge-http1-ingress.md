@@ -207,7 +207,7 @@ The fork adds a per-connection **protocol mode**. `Conn` gains an
    (which share `writesAccount`) are unaffected.
 5. ✅ **Front-door `:80` plaintext listener** (ACME HTTP-01 + HTTP→HTTPS
    redirect), retiring the gap #3 slice-3 wrinkle — the h1 front answers `:80`
-   directly. `rewind-front` (`src-v2/front/main.zig`) gains a second `FrontH2`
+   directly. `rewind-front` (`src/front/main.zig`) gains a second `FrontH2`
    server (its own registry, plaintext) polled non-blocking in the same loop:
    `/.well-known/acme-challenge/<token>` fetches the key-authorization from the
    CP issuer (`GET /_cp/acme-challenge?token=` — the CP side is slice 3, so it

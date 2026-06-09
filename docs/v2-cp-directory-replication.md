@@ -5,8 +5,8 @@
 > replicated, strongly-consistent, HA control plane backed by our own
 > `bridge`/`Node` raft substrate. Companion:
 > [`project_v2_zero_downtime_move`] memory (the locked Cloudflare+CP+dual-write
-> architecture), `docs/v2-build-order.md` §Phase 7, `src-v2/cp/directory.zig`
-> (the interface this sits behind), `src-v2/kv/bridge.zig` (the substrate).
+> architecture), `docs/v2-build-order.md` §Phase 7, `src/cp/directory.zig`
+> (the interface this sits behind), `src/consensus/bridge.zig` (the substrate).
 >
 > **Slice 1 (single-node durable directory) — done + green:** `directory.zig`
 > is store-backed over a single-node CP `bridge` (one `__directory__` raft
@@ -59,7 +59,7 @@
 
 ## Why
 
-Today `src-v2/cp/directory.zig` is an in-process map seeded from static env
+Today `src/cp/directory.zig` is an in-process map seeded from static env
 config (`REWIND_CLUSTERS` / `REWIND_PLACEMENT` / `REWIND_HOSTS`), with one
 authoritative copy in a single front-door process. Phase 7 made it
 **request-critical**: every DP cluster's serve-or-forward reads it
@@ -193,7 +193,7 @@ directory. (Low priority — the per-miss query already works.)
    `resolve` would allocate the node list per call → the consumers
    (`handleCp`, `handleMove`, `handleMoveLive`, `proxyToCluster`) must free it
    (or `resolve` returns an owned `Resolution` with a `deinit`). Touches every
-   `resolution.cluster.nodes` site in `src-v2/front/main.zig`. Decide:
+   `resolution.cluster.nodes` site in `src/front/main.zig`. Decide:
    owned-Resolution-with-deinit vs. a short-lived arena per request.
 2. **Cross-thread store reads.** The HTTP poll loop calls `resolve` (→
    `node.get`) while the pump thread applies committed writes to the same
@@ -218,5 +218,5 @@ directory. (Low priority — the per-miss query already works.)
 - The `Directory` *interface* (`resolve`/`move`/`assign`/`beginMove`/
   `abortMove`/`clusterById`) — consumers in `front/main.zig` stay the same
   modulo the `ClusterRef` ownership decision (#1).
-- The writeset/envelope codec (`src-v2/kv/envelope.zig`) for the directory
+- The writeset/envelope codec (`src/consensus/envelope.zig`) for the directory
   writesets.

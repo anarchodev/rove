@@ -14,11 +14,11 @@
 //! get the codec without dragging in willemt-raft + io_uring. Its only
 //! dependency is `std`.
 //!
-//! Byte-identical to `src-v2/kv/envelope.zig` (the V2 spine's own copy):
+//! Byte-identical to `src/consensus/envelope.zig` (the V2 spine's own copy):
 //! the two stay in sync until the V1 cutover merges `src-v2/ → src/` and
 //! collapses them. Keeping the format here means the worker can encode an
 //! envelope through this codec and the V2 bridge can decode it through
-//! `src-v2/kv/envelope.zig` with no interpretation drift.
+//! `src/consensus/envelope.zig` with no interpretation drift.
 
 const std = @import("std");
 

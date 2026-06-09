@@ -12,7 +12,7 @@ hook. The fault is a *runtime quorum denial* — exactly as in V1, but on
 the V2 multi-raft stack:
 
   - Provision `streamfi` on a 3-NODE cluster. `/_control/provision` empty-
-    attaches the tenant's raft group to ALL THREE nodes (src-v2/cp/main.zig
+    attaches the tenant's raft group to ALL THREE nodes (src/cp/main.zig
     handleProvision → attachToAll), so the group spans the cluster and a
     write needs a 2-of-3 quorum.
   - Open the held SSE stream DIRECT to the leader node. The inbound

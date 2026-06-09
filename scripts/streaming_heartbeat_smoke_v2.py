@@ -16,7 +16,7 @@ handler JS is reused VERBATIM from the V1 demo tenant
 
 The held SSE request goes DIRECT to the node, NOT the front door: the V2
 front door buffers the full backend response (single `RespBody` relay,
-src-v2/front/main.zig) — it does not relay chunked DATA frames — so a
+src/front/main.zig) — it does not relay chunked DATA frames — so a
 never-terminating SSE stream through it never flushes a chunk before the
 client gives up. The node's h2 server streams `stream_data_in` DATA frames
 straight to the held client, which is the lifecycle under test. The

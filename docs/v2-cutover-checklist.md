@@ -13,19 +13,19 @@
 
 ## Orientation
 
-The V2 worker (`src-v2/rewind/main.zig`) **reuses the V1 modules wholesale**
+The V2 worker (`src/rewind/main.zig`) **reuses the V1 modules wholesale**
 (`rove-js`, `rove-files`, `rove-blob`, `rove-log-server`, `rove-tenant`,
 `rove-qjs`), so the entire request/dispatch/effect/KV-durability core carries
 over. The engine work (Phases 0–7) has landed. The remaining gaps are
 concentrated at the **edge** (front door) and in **operational state**
 (plan/limits/domains/certs) — both CP-shaped.
 
-## ✅ At parity (reused V1 modules, wired in `src-v2/rewind/main.zig`)
+## ✅ At parity (reused V1 modules, wired in `src/rewind/main.zig`)
 
 | Subsystem | Evidence |
 |---|---|
 | JS dispatch + effect reification (parked continuations, durable wakes, cron, owed retries) | `src/js/dispatcher.zig`, `worker_dispatch.zig` (reused) |
-| Per-tenant KV durability (TrackedTxn overlay → raft → commit) | `src-v2/kv/bridge.zig` + `node.zig` (multi-raft) |
+| Per-tenant KV durability (TrackedTxn overlay → raft → commit) | `src/consensus/bridge.zig` + `node.zig` (multi-raft) |
 | `http.fetch` engine, proxy/serve-or-forward, blob coordination | `main.zig:387,389,390` |
 | Deployment loader + bytecode cache | `main.zig:386` |
 | Blob backend (fs/S3) + log batch store | `main.zig:337-338,377-379` |
@@ -73,7 +73,7 @@ host axis test; `tenant_move_smoke` confirms the front-door routing path.
    - ✅ **Slice 2 — front door terminates public h2-over-TLS** with SNI cert
      selection, certs synced from the CP (`h2/tls.zig` `putHostCertInMemory` +
      front `CertSync`); front-door → DP stays private h2c. `cp_tls_edge_smoke`.
-   - ✅ **Slice 3 — leader-elected ACME issuer** (HTTP-01). `src-v2/cp/acme.zig`
+   - ✅ **Slice 3 — leader-elected ACME issuer** (HTTP-01). `src/cp/acme.zig`
      — a leader-gated thread on `rewind-cp` (evolved from `loop46/acme.zig`,
      reusing `rove-acme`'s RFC 8555 `Client`). Each tick the directory leader
      computes the work-list (`collectUncertedHosts` — mapped hosts lacking
@@ -116,10 +116,10 @@ Per [`v2-front-door-architecture.md`](v2-front-door-architecture.md), the
 prototype welded the CP raft directory to the request-path proxy, so every
 front-door replica was a CP voter (`REWIND_CP_NODE_ID/VOTERS/PEERS`) →
 front-door count == voter count (inverted scaling). **Done:**
-   - **CP is its own binary + raft cluster** — `src-v2/cp/main.zig` (`rewind-cp`):
+   - **CP is its own binary + raft cluster** — `src/cp/main.zig` (`rewind-cp`):
      directory raft + move orchestration (`/_control/move[-live]`) + `/_cp/route`
      + `/_cp/leader` + reconciliation + CP-HA forwarding.
-   - **Front door is a stateless proxy** — `src-v2/front/main.zig`: resolves
+   - **Front door is a stateless proxy** — `src/front/main.zig`: resolves
      placement via the CP's `/_cp/route` (short-TTL cache, `REWIND_CP_URL`),
      leader-aware forward; no `bridge`/`cp-directory` (15M vs the CP's 113M). The
      read-replica seam is cached-query (serve-or-forward is the staleness
@@ -167,7 +167,7 @@ front-door count == voter count (inverted scaling). **Done:**
 4. **Edge TLS termination + cert-state-in-CP + single ACME issuer** (gap #3) —
    per `v2-front-door-architecture.md`. Slices 1 (CP cert axis) + 2 (front-door
    TLS termination + CP cert pull) + 3 (leader-elected HTTP-01 issuer,
-   `src-v2/cp/acme.zig`, Pebble-proven) ✅ SHIPPED; DNS-01 wildcard (slice 4)
+   `src/cp/acme.zig`, Pebble-proven) ✅ SHIPPED; DNS-01 wildcard (slice 4)
    deferred.
 5. ~~**Tenant provisioning + multi-node formation** (gaps #4, #5) — the
    create-a-new-tenant path end to end.~~ ✅ **SHIPPED** — `POST

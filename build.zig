@@ -529,9 +529,9 @@ pub fn build(b: *std.Build) void {
     // V1→V2 cutover: `rove-snapshot` (src/loop46/snapshot.zig, willemt
     // RaftNode) and the `loop46` product binary (src/loop46/, V1 cluster +
     // sqlite raft) were RETIRED — the V2 worker is `rewind`
-    // (src-v2/rewind/main.zig). Both broke the aggregate `test` step and the
+    // (src/rewind/main.zig). Both broke the aggregate `test` step and the
     // default install on the v2 branch. Their per-tenant raft is the `Bridge`
-    // (src-v2/kv/bridge.zig) + raft-rs.
+    // (src/consensus/bridge.zig) + raft-rs.
 
     // qjs-hello: minimal demo that runs a JS snippet via rove-qjs.
     // Will grow into a snapshot-restoring executable in the next Phase 0
@@ -901,7 +901,7 @@ pub fn build(b: *std.Build) void {
     // ── V2 Phase 5 — raft peer transport (cross-node wire layer) ───────
     // Reuse the V1 liburing transport (`src/kv/raft_net.zig` + its frame
     // codec `raft_rpc.zig`, both std-only) as the V2 cross-node wire layer.
-    // The V2 coalescing adapter (`src-v2/kv/transport.zig`) moves opaque
+    // The V2 coalescing adapter (`src/consensus/transport.zig`) moves opaque
     // per-recipient envelopes over it; the V1 raft message types in
     // `raft_rpc` are unused by the transport core. Module-rooted at
     // raft_net.zig so its relative `@import("raft_rpc.zig")` resolves.
@@ -913,7 +913,7 @@ pub fn build(b: *std.Build) void {
     raftnet_mod.link_libc = true;
 
     const v2_smoke_mod = b.createModule(.{
-        .root_source_file = b.path("src-v2/v2_raft_smoke.zig"),
+        .root_source_file = b.path("src/consensus/v2_raft_smoke.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -924,7 +924,7 @@ pub fn build(b: *std.Build) void {
     v2_test_step.dependOn(&run_v2_smoke_test.step);
 
     // ── V2 Phase 1 — data-plane core: the per-tenant pump (single node)
-    // (docs/v2-build-order.md §Phase 1). `src-v2/kv/node.zig` owns a
+    // (docs/v2-build-order.md §Phase 1). `src/consensus/node.zig` owns a
     // Manager + SharedWal and pumps per-tenant raft groups, applying
     // committed writeset envelopes to each tenant's kvexp store. It
     // reuses the V1 limbs as plain files — `src/kv/kvstore.zig` +
@@ -933,7 +933,7 @@ pub fn build(b: *std.Build) void {
     // import table (those files' `@import("kvexp")` resolves through it)
     // plus the raft artifact. kvexp already links liblmdb + libc.
     const v2_node_mod = b.createModule(.{
-        .root_source_file = b.path("src-v2/kv/node.zig"),
+        .root_source_file = b.path("src/consensus/node.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -978,11 +978,11 @@ pub fn build(b: *std.Build) void {
     v2_bundle_repro_step.dependOn(&b.addInstallArtifact(v2_bundle_repro, .{}).step);
 
     // ── V2 Phase 5 — the cross-node transport adapter (coalesced) ──────
-    // `src-v2/kv/transport.zig` wraps `raft_net` with per-recipient
+    // `src/consensus/transport.zig` wraps `raft_net` with per-recipient
     // coalescing; the Node drives it from its pump. Tested on its own
     // (wire-format) here + end-to-end by the 3-node node test.
     const v2_transport_mod = b.createModule(.{
-        .root_source_file = b.path("src-v2/kv/transport.zig"),
+        .root_source_file = b.path("src/consensus/transport.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -995,13 +995,13 @@ pub fn build(b: *std.Build) void {
     v2_test_step.dependOn(&run_v2_node_test.step);
 
     // ── V2 Phase 2 — the worker-facing bridge over the per-tenant pump
-    // (docs/v2-build-order.md §Phase 2). `src-v2/kv/bridge.zig` owns the
+    // (docs/v2-build-order.md §Phase 2). `src/consensus/bridge.zig` owns the
     // Phase-1 `Node`, runs its pump on a dedicated thread, and presents
     // the per-tenant propose + watermark surface the reused rove-js worker
     // talks to in place of V1's global `kv.RaftNode`. Same import table as
     // the node module (it imports node.zig + envelope.zig relatively).
     const v2_bridge_mod = b.createModule(.{
-        .root_source_file = b.path("src-v2/kv/bridge.zig"),
+        .root_source_file = b.path("src/consensus/bridge.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1015,13 +1015,13 @@ pub fn build(b: *std.Build) void {
 
     // ── V2 Phase 3/7 — control plane: the tenant→cluster directory ─────
     // (docs/v2-build-order.md §Phase 3, docs/v2-phase3-directory-routing.md,
-    // docs/v2-cp-directory-replication.md Slice 1). `src-v2/cp/directory.zig`
+    // docs/v2-cp-directory-replication.md Slice 1). `src/cp/directory.zig`
     // is the routing source of truth the front-door reads and a move flips.
     // Slice 1 makes it durable: it backs writes with the V2 `bridge`'s
     // directory raft group, so it now imports the bridge (and its test links
     // the raft artifact). Reads stay on a pointer-stable in-memory projection.
     const v2_cp_dir_mod = b.createModule(.{
-        .root_source_file = b.path("src-v2/cp/directory.zig"),
+        .root_source_file = b.path("src/cp/directory.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1049,7 +1049,7 @@ pub fn build(b: *std.Build) void {
     // a concrete `Worker` is instantiated, which `rewind`'s workerMain does).
     // Not in the default `install` step (V1's loop46 is dead on this branch).
     const rewind_mod = b.createModule(.{
-        .root_source_file = b.path("src-v2/rewind/main.zig"),
+        .root_source_file = b.path("src/rewind/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1077,7 +1077,7 @@ pub fn build(b: *std.Build) void {
     // (leader-aware). Holds NO directory/raft state — that lives in `rewind-cp`
     // — so it links neither `bridge` nor `cp-directory`; just rove + h2 + curl.
     const front_mod = b.createModule(.{
-        .root_source_file = b.path("src-v2/front/main.zig"),
+        .root_source_file = b.path("src/front/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1100,7 +1100,7 @@ pub fn build(b: *std.Build) void {
     // This is where `bridge` + `cp-directory` now live (lifted out of the front
     // door), fixing the inverted scaling where every front-door was a CP voter.
     const cp_mod = b.createModule(.{
-        .root_source_file = b.path("src-v2/cp/main.zig"),
+        .root_source_file = b.path("src/cp/main.zig"),
         .target = target,
         .optimize = optimize,
     });

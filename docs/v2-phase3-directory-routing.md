@@ -27,8 +27,8 @@ move). Phase 3 is the routing substrate the move flips.
 
 | Piece | Where | What |
 |---|---|---|
-| **3a Directory** | `src-v2/cp/directory.zig` | tenant→cluster map; the routing source of truth + the `move` seam Phase 4 flips. **Done.** |
-| **3b Front door** | `src-v2/front/main.zig` | HTTP/2 terminator: resolve Host→tenant → `directory.clusterFor` → reverse-proxy (libcurl, h2c) to that cluster. `zig build rewind-front`. **Done.** |
+| **3a Directory** | `src/cp/directory.zig` | tenant→cluster map; the routing source of truth + the `move` seam Phase 4 flips. **Done.** |
+| **3b Front door** | `src/front/main.zig` | HTTP/2 terminator: resolve Host→tenant → `directory.clusterFor` → reverse-proxy (libcurl, h2c) to that cluster. `zig build rewind-front`. **Done.** |
 | **3c Smoke** | `scripts/two_cluster_smoke.py` | two `rewind` clusters + front door; tenant A→cluster 1, tenant B→cluster 2, routed correctly. The Phase-3 exit. **Done — green.** |
 
 ## 3a — the directory (control plane)

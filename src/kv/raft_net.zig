@@ -14,7 +14,7 @@ const posix = std.posix;
 const raft_rpc = @import("raft_rpc.zig");
 
 /// Re-export the frame codec so out-of-module callers (the V2 transport
-/// adapter, `src-v2/kv/transport.zig`) can build/parse the `[len:u32 BE]
+/// adapter, `src/consensus/transport.zig`) can build/parse the `[len:u32 BE]
 /// [crc:u32 BE][payload]` frames `send`/`on_recv` move, without a second
 /// path to `raft_rpc.zig` (which lives in this dir and isn't its own
 /// module). The V2 transport uses only the generic frame helpers

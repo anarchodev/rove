@@ -24,7 +24,7 @@ does not need quorum, but HA + durability do. Phase 5 makes each tenant's
 raft group span 3 nodes so a node failure loses neither availability nor
 data. It is launch-required hardening, not a new capability.
 
-## 5a — cross-node transport (`src-v2/kv/transport.zig`) — DONE
+## 5a — cross-node transport (`src/consensus/transport.zig`) — DONE
 
 Reuses the V1 liburing wire layer (`src/kv/raft_net.zig` + its frame codec
 `raft_rpc.zig`, both std-only; the V1 raft message types are unused) and
@@ -44,7 +44,7 @@ Node-id mapping: raft-rs ids are 1-based (etcd/raft reserves 0); raft_net
 peer ids are 0-based array indices. The transport owns the single
 `peer_id = node_id - 1` conversion at the send boundary.
 
-## 5b — multi-node Node (`src-v2/kv/node.zig`) — DONE
+## 5b — multi-node Node (`src/consensus/node.zig`) — DONE
 
 - `initMultiNode(node_id, voters, listen_addr, peers)` stands up the Node
   with the transport bound to `&self.mgr`. `initSingleNode` unchanged.
@@ -71,7 +71,7 @@ pre-failover value. (Fixed peer ports with a PID-strided, bind-retry
 allocator so the node + bridge test binaries — bridge imports node.zig —
 run in parallel without colliding.)
 
-## 5c — multi-node bridge (`src-v2/kv/bridge.zig`) — DONE
+## 5c — multi-node bridge (`src/consensus/bridge.zig`) — DONE
 
 - **Deterministic gid.** `registerTenant` hashes the tenant id (Wyhash) to
   the raft group id instead of a local counter — a group spans all nodes,

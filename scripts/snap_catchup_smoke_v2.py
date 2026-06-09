@@ -20,7 +20,7 @@ BOOT-TIME GROUP RECOVERY (the engine path this asserts):
   fresh group at the recorded epoch. The rejoined node is already a voter in
   the group's persisted confstate, so once the pump starts the leader
   replicates the missing tail (no conf-change needed) and it catches up. See
-  `src-v2/kv/{node,bridge}.zig` + `src-v2/rewind/main.zig`.
+  `src/consensus/{node,bridge}.zig` + `src/rewind/main.zig`.
 
   This smoke proves the full arc: provision+deploy across 3 nodes, seed
   replicates to all 3, a follower stops, the log advances 30 writes on the
@@ -179,7 +179,7 @@ def main() -> int:
                 break
             time.sleep(0.5)
         # Boot-time group recovery (the node-local manifest + `recoverGroups`,
-        # `src-v2/kv/{node,bridge}.zig`): the rejoined node re-stands-up its
+        # `src/consensus/{node,bridge}.zig`): the rejoined node re-stands-up its
         # `acme` raft group from the persisted WAL, rejoins as the voter it
         # already is, and the leader replicates the missing tail → it catches
         # up to the post-kill value. A hard assertion now, not a SKIP.

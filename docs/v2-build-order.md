@@ -112,7 +112,7 @@ Legend: **Reuse** = imports unchanged · **New** = write on the v2 branch ·
 
 This is the heart of the rewrite.
 
-- **New:** `src-v2/kv/`: a `Node` owning a `SharedWal` + a `Manager`, and
+- **New:** `src/consensus/`: a `Node` owning a `SharedWal` + a `Manager`, and
   a pump that ticks the active set → drains `poll_ready` → runs
   `processReady` (decode a committed entry → apply it to the tenant's
   kvexp store) → drains `takeMessages` → `release`. Per-tenant
@@ -157,11 +157,11 @@ This is the heart of the rewrite.
 
 > **DONE + green (2026-06-04).** Move orchestration shipped: bridge/node
 > group attach-at-epoch + destroy-and-reclaim + quiesce
-> (`src-v2/kv/{node,bridge}.zig`), `KvStore` tenant-bundle dump/load
+> (`src/consensus/{node,bridge}.zig`), `KvStore` tenant-bundle dump/load
 > (`src/kv/kvstore.zig`), the worker `/_system/v2-*` move surface
 > (`src/js/v2_move.zig`), the front-door `POST /_control/move`
-> orchestration + `moving` directory state (`src-v2/front/main.zig`,
-> `src-v2/cp/directory.zig`). Exit smoke `scripts/tenant_move_smoke.py` is
+> orchestration + `moving` directory state (`src/front/main.zig`,
+> `src/cp/directory.zig`). Exit smoke `scripts/tenant_move_smoke.py` is
 > green: write → move → read-back, data intact, new cluster serves,
 > source evicted, routing flipped. Details: [`v2-phase4-tenant-move.md`](v2-phase4-tenant-move.md).
 > **The milestone is proven.** Phase 5 (multi-node HA) is now DONE too.

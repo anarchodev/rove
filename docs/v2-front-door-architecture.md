@@ -9,9 +9,9 @@
 > makes the product self-hostable and host-agnostic — the AGPL "runs anywhere"
 > story falls out of the architecture, it isn't bolted on. Companions:
 > [`v2-cp-directory-replication.md`](v2-cp-directory-replication.md) (the
-> replicated directory this builds on), `src-v2/front/main.zig` (today's
-> conflated binary), `src-v2/cp/directory.zig` (the directory interface),
-> `src-v2/rewind/main.zig` (the DP worker), `loop46/acme.zig` +
+> replicated directory this builds on), `src/front/main.zig` (today's
+> conflated binary), `src/cp/directory.zig` (the directory interface),
+> `src/rewind/main.zig` (the DP worker), `loop46/acme.zig` +
 > `src/acme/` (V1's ACME issuer — *evolve, do not delete*),
 > `docs/v2-build-order.md` §Phase 7,
 > [`v2-cp-operational-state.md`](v2-cp-operational-state.md) (the CP axes:
@@ -34,7 +34,7 @@
 
 ## The problem this fixes
 
-Today `src-v2/front/main.zig` is **one binary doing two jobs with opposite
+Today `src/front/main.zig` is **one binary doing two jobs with opposite
 scaling and consistency profiles**:
 
 1. **Edge proxy** — per-request hot path; wants *many stateless replicas* behind

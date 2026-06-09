@@ -31,7 +31,7 @@ PORT = int(os.environ.get("REWIND_SMOKE_PORT", "18097"))
 DATA_DIR = f"/tmp/rewind-smoke-{os.getpid()}"
 BIN = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin", "rewind")
 ADMIN_HOST = "admin.localhost"
-ROOT_TOKEN = "rewindtestroottokenpadding0123456789abcd"  # matches src-v2/rewind/main.zig
+ROOT_TOKEN = "rewindtestroottokenpadding0123456789abcd"  # matches src/rewind/main.zig
 
 
 def spawn():
