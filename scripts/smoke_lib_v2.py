@@ -24,6 +24,7 @@ Generalizes the proven flow in `v2_handler_smoke.py`. Reuses `smoke_lib`'s
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -334,6 +335,57 @@ class V2Cluster:
         if r.status != 204:
             raise RuntimeError(f"release {tenant}/{dep_id}: {r.status} {r.body}")
         return dep_id
+
+    def deploy_with_static(self, tenant: str, handler_files: dict[str, str],
+                           static_files: dict[str, tuple], *, node: int = 0) -> str:
+        """Deploy handlers PLUS one or more STATIC manifest entries (e.g. a
+        `_config/*.json` row) via the files-server presign manifest flow — the
+        only way to stamp a `.static` entry (the `/upload`+`/deploy` contract
+        always compiles sources as `.handler`). This is what drives the
+        deploy-time `_config/` → kv mirror (`src/js/config_mirror.zig` via the
+        loader's `reloadDeployment`).
+
+        `static_files` maps path → `(bytes_or_str, content_type)`. Flow: upload
+        + compile the handlers via /upload+/deploy (server-authoritative source
+        hashes, read back from the manifest), PUT each static blob by its
+        sha256, then POST a MERGED manifest (handlers + statics) and release it.
+        Returns the new dep_id (decimal str)."""
+        import hashlib
+        for path, content in handler_files.items():
+            r = self.upload_source(tenant, path, content)
+            if r.status != 204:
+                raise RuntimeError(f"upload {tenant}/{path}: {r.status} {r.body}")
+        # Compile + stamp the handlers; read back the server-authoritative
+        # manifest so we reference the exact source hashes it stored.
+        base_id = self.deploy(tenant)
+        mf = _curl(f"{self.files_origin()}/{tenant}/deployments/{int(base_id):016x}",
+                   headers={"Authorization": f"Bearer {self.services_jwt}"})
+        if mf.status != 200:
+            raise RuntimeError(f"read manifest {tenant}/{base_id}: {mf.status} {mf.body}")
+        files = {e["path"]: {"hash": e["hash"], "kind": e["kind"],
+                             "content_type": e.get("content_type", "")}
+                 for e in json.loads(mf.body).get("entries", [])}
+        # Presign-upload each static blob (the server verifies sha256), then add
+        # it to the manifest as a `.static` entry.
+        for path, (content, content_type) in static_files.items():
+            b = content.encode() if isinstance(content, str) else content
+            h = hashlib.sha256(b).hexdigest()
+            pr = _curl(f"{self.files_origin()}/{tenant}/blobs/{h}", method="PUT",
+                       headers={"Authorization": f"Bearer {self.services_jwt}"}, data=b)
+            if pr.status != 204:
+                raise RuntimeError(f"put blob {tenant}/{path}: {pr.status} {pr.body}")
+            files[path] = {"hash": h, "kind": "static", "content_type": content_type}
+        dr = _curl(f"{self.files_origin()}/{tenant}/deployments", method="POST",
+                   headers={"Authorization": f"Bearer {self.services_jwt}",
+                            "Content-Type": "application/json"},
+                   data=json.dumps({"files": files}))
+        if dr.status != 201:
+            raise RuntimeError(f"deployments POST {tenant}: {dr.status} {dr.body}")
+        new_id = int(json.loads(dr.body)["id"], 16)
+        r = self.release(tenant, new_id, node=node)
+        if r.status != 204:
+            raise RuntimeError(f"release {tenant}/{new_id}: {r.status} {r.body}")
+        return str(new_id)
 
     def deploy_manifest(self, tenant: str, files: dict[str, tuple[str, bytes | str]],
                         *, node: int = 0) -> str:
