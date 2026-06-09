@@ -126,12 +126,21 @@ const WorkerCtx = struct {
 /// replicated `_deploy/current` marker and enqueues a load so the follower
 /// tracks the tenant's current deployment continuously — see
 /// `DeploymentCache.enqueueDeployment` for why. `ctx` is `*NodeState`.
-fn onDeployApply(ctx: *anyopaque, gid: u64, key: []const u8, value: []const u8) void {
+///
+/// `id_str` is the tenant the writeset TARGETED — for a release published
+/// through the admin batch (a `multi` cross-tenant inner) that is the
+/// release's target tenant, NOT the admin anchor whose group carried the
+/// entry, so it must come from the observer (the old `idStrForGid(gid)`
+/// lookup resolved the anchor and enqueued the wrong tenant's deployment).
+/// Borrowed for the call; the loader dups it. Empty for root writesets
+/// (no `_deploy/current` key there — the key check filters them).
+fn onDeployApply(ctx: *anyopaque, gid: u64, id_str: []const u8, key: []const u8, value: []const u8) void {
+    _ = gid;
     if (!std.mem.eql(u8, key, "_deploy/current")) return;
+    if (id_str.len == 0) return;
     const node: *rjs.NodeState = @ptrCast(@alignCast(ctx));
     const dep_id = std.fmt.parseInt(u64, value, 16) catch return;
-    const tenant_id = node.raft.idStrForGid(gid) orelse return;
-    node.deploy.enqueueDeployment(tenant_id, dep_id);
+    node.deploy.enqueueDeployment(id_str, dep_id);
 }
 
 fn runPromotionHook(worker: anytype, worker_idx: usize) void {
@@ -236,16 +245,19 @@ fn workerMain(args: *WorkerCtx) !void {
 
 // ── Full-HA follower-apply store resolver ─────────────────────────────
 
-/// `bridge.StoreResolver.func`: resolve the worker's per-tenant serving
-/// store (`inst.kv`) for a follower's replicated apply, provisioning the
-/// instance on first sight. Runs on the pump thread; `Tenant` is internally
-/// locked (`maps_mutex`), so on-demand provisioning is safe alongside the
-/// worker thread. `gid` is unused — the worker keys its instance store on
-/// the tenant id string the envelope carries. Returns null only on a
-/// provisioning failure (surfaced by the apply round as `UnknownGroup`).
+/// `bridge.StoreResolver.func`: resolve the worker's serving store for a
+/// replicated apply, provisioning the instance on first sight. Runs on the
+/// pump thread; `Tenant` is internally locked (`maps_mutex`), so on-demand
+/// provisioning is safe alongside the worker thread. `gid` is unused — the
+/// worker keys its instance store on the tenant id string the envelope
+/// carries. Per the `StoreResolver` contract the EMPTY id resolves the
+/// node-wide root store (`__root__`) — the target of `platform.root.*`
+/// root-writeset inners riding an admin batch. Returns null only on a
+/// provisioning failure (surfaced by the apply round as `UnroutedApply`).
 fn resolveTenantStore(ctx: *anyopaque, gid: u64, id_str: []const u8) ?*kv.KvStore {
     _ = gid;
     const tenant: *tenant_mod.Tenant = @ptrCast(@alignCast(ctx));
+    if (id_str.len == 0) return tenant.root;
     if (tenant.getInstance(id_str) catch null) |inst| return inst.kv;
     tenant.createInstance(id_str) catch return null;
     const inst = (tenant.getInstance(id_str) catch null) orelse return null;
