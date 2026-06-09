@@ -9,7 +9,7 @@
 > `sse-server-standalone`) and must not be used. Companions:
 > [`v2-cutover-checklist.md`](v2-cutover-checklist.md),
 > [`architecture/routing-and-ingress.md`](architecture/routing-and-ingress.md),
-> [`v2-cp-operational-state.md`](v2-cp-operational-state.md).
+> [`architecture/control-plane.md`](architecture/control-plane.md).
 
 ## 0. The gap this plan closes
 

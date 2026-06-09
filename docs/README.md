@@ -57,8 +57,6 @@ Active work on the current (V2) line. Each folds into `architecture/` on ship.
 
 - [v2-build-order.md](v2-build-order.md) — Phase sequencing (Phase 7 in progress)
 - [v2-cutover-checklist.md](v2-cutover-checklist.md) — living V1-deletion parity audit
-- [v2-cp-directory-replication.md](v2-cp-directory-replication.md) — CP replication (Slice 3 optional)
-- [v2-cp-operational-state.md](v2-cp-operational-state.md) — plan/limits delivery (Steps 2–3 TODO)
 - [v2-production-deploy-plan.md](v2-production-deploy-plan.md) — first production topology (not yet built)
 - [handler-surface-impl-plan.md](handler-surface-impl-plan.md) — handler-surface Phase 2
 - [durable-wake-plan.md](durable-wake-plan.md) — scheduler primitive (gap #6; P5+ pending)

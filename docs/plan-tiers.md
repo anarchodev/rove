@@ -2,10 +2,11 @@
 
 > **V2 storage note.** The **storage** decisions below are V1-framed
 > (`__root__.db`, `root_writeset` envelope type `2`). For V2 the tier/limits
-> source of truth moves to the **CP directory**, authored by an admin app —
-> see [`v2-cp-operational-state.md`](v2-cp-operational-state.md). The
-> **enforcement** half of this doc (levers 1–3, the `TenantSlot` cache, plan
-> generation) is unchanged by that move.
+> source of truth moves to the **CP directory**, authored by an admin app — see
+> [decisions.md §10.9](decisions.md) (the decision) +
+> `architecture/control-plane.md` ("Operational state", the mechanics; shipped
+> 2026-06). The **enforcement** half of this doc (levers 1–3, the `TenantSlot`
+> cache, plan generation) is unchanged by that move.
 
 **Design home:** this doc. Surface anchors: rate limiter
 `src/js/limiter.zig` (already tier-shaped — see its header comment),
