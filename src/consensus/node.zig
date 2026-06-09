@@ -262,6 +262,10 @@ pub const TenantSlot = struct {
     /// Whether this slot is in `Node.dirty` (committed since last durabilize),
     /// so `applyEntry` enqueues it at most once.
     in_dirty: bool = false,
+    /// Whether this slot is in `Node.persist_ack` (a `processReady` ran
+    /// whose buffered writes await the next fsync's `onPersist` ack), so
+    /// the pump enqueues it at most once per ack round.
+    in_persist_ack: bool = false,
     /// Borrowed `GroupedFileStorage` for this group — the Manager owns it (via
     /// the storage vtable) and frees it on `destroyGroup`, but we keep the
     /// pointer to drive WAL compaction (`gfs.compact`) without a Manager API.
@@ -315,6 +319,18 @@ pub const Node = struct {
     active: std.ArrayListUnmanaged(u64) = .empty,
     /// `pollReady` scratch, grown to `groups.count()` as groups are added.
     ready_buf: []u64 = &.{},
+    /// Second `pollReady` scratch for the post-fsync apply pass (pass 2
+    /// of `pump` — `ready_buf` still holds pass 1's ids at that point).
+    ready_buf2: []u64 = &.{},
+
+    /// Groups whose `processReady` buffered writes this (or a previous)
+    /// cycle and now await the post-fsync `mgr.onPersist` ack — the
+    /// async-append handshake (raft only counts this node's entries
+    /// toward the commit quorum once acked, and the persistence-
+    /// asserting messages stay stashed until then). Deduped via
+    /// `TenantSlot.in_persist_ack`; retained across a failed flush so
+    /// the ack retries after the next successful one. Pump-thread only.
+    persist_ack: std.ArrayListUnmanaged(u64) = .empty,
 
     /// Gids with committed-but-not-yet-durabilized writes (`applied_idx >
     /// durabilized_idx`). Enqueued by `applyEntry`, drained by
@@ -538,7 +554,9 @@ pub const Node = struct {
         self.dirty.deinit(a);
         self.woke_scratch.deinit(a);
         self.commit_notify.deinit(a);
+        self.persist_ack.deinit(a);
         a.free(self.ready_buf);
+        a.free(self.ready_buf2);
         a.free(self.voters);
         a.free(self.data_dir);
         a.destroy(self);
@@ -824,6 +842,22 @@ pub const Node = struct {
         if (self.ready_buf.len >= need) return;
         const grown = self.allocator.realloc(self.ready_buf, need) catch return Error.OutOfMemory;
         self.ready_buf = grown;
+        const grown2 = self.allocator.realloc(self.ready_buf2, need) catch return Error.OutOfMemory;
+        self.ready_buf2 = grown2;
+    }
+
+    /// Queue `gid` for the post-fsync `onPersist` ack (at most once per
+    /// round — see `persist_ack`). Pump-thread only.
+    fn notePersistAck(self: *Node, gid: u64) void {
+        const slot = self.groups.get(gid) orelse return;
+        if (slot.in_persist_ack) return;
+        slot.in_persist_ack = true;
+        self.persist_ack.append(self.allocator, gid) catch {
+            // Dropping the ack would stall the group's commits forever
+            // (raft never counts its entries); surface loudly instead.
+            slot.in_persist_ack = false;
+            self.apply_err = self.apply_err orelse Error.OutOfMemory;
+        };
     }
 
     // ── Hibernation active set (Phase 6) ─────────────────────────────
@@ -942,23 +976,46 @@ pub const Node = struct {
     /// Drive one ready cycle across the active set. Returns true if any
     /// group had committed entries to apply this cycle.
     ///
-    /// Mirrors rewind2's `pumpNode`: tick the active set, process every
-    /// ready group's committed entries, ONE `wal.flush()` for the whole
-    /// cycle (the load-bearing single-fsync constraint), then drain each
-    /// ready group's outbox and release it. Single-node has no peers, so
-    /// `takeMessages` drains to a no-op sink — but the drain+release is
-    /// still required to honour the pollReady/release pairing invariant.
+    /// The async-append pump (persist-before-quorum ordering): tick the
+    /// active set, then
+    ///
+    ///   pass 1: processReady every ready group — appends are BUFFERED
+    ///           into the shared WAL; committed entries handed out here
+    ///           were already durable (raft gates them on its persist
+    ///           watermark) and apply now
+    ///   fsync:  ONE `wal.flush()` for the whole cycle (the load-bearing
+    ///           single-fsync constraint)
+    ///   ack:    `mgr.onPersist` per buffered group — only now do this
+    ///           node's entries count toward the commit quorum, and only
+    ///           now do the stashed persistence-asserting messages
+    ///           (append acks / vote responses) reach the outboxes
+    ///   pass 2: the acks unlock commit advances — poll + apply the
+    ///           newly-committed entries in the same cycle
+    ///   hooks:  fire the staged commit notifications (everything applied
+    ///           this cycle is fsync-covered)
+    ///   drain:  takeMessages + release for both passes' groups.
+    ///
+    /// Single-node has no peers, so `takeMessages` drains to a no-op
+    /// sink — but the drain+release is still required to honour the
+    /// pollReady/release pairing invariant.
     pub fn pump(self: *Node) Error!bool {
         _ = self.mgr.tickGroups(self.active.items);
         const ready = self.mgr.pollReady(self.ready_buf);
 
         self.apply_err = null;
-        if (ready.len > 0) {
+        var ready2: []u64 = self.ready_buf2[0..0];
+        if (ready.len > 0 or self.persist_ack.items.len > 0) {
             self.commit_notify.clearRetainingCapacity();
+            // Pass 1: append this round's writes (BUFFERED — the fsync is
+            // below) and apply committed entries that were already durable
+            // from earlier cycles (raft gates handed-out committed entries
+            // on its persist watermark). Every processed ready is queued
+            // for the post-fsync ack.
             for (ready) |g| {
                 self.mgr.processReady(g, applyCb, self) catch |e| {
                     self.apply_err = self.apply_err orelse mapRaftErr(e);
                 };
+                self.notePersistAck(g);
             }
 
             // ONE fsync per cycle regardless of how many groups committed.
@@ -970,26 +1027,63 @@ pub const Node = struct {
                 break :blk true;
             };
 
-            // Fire the commit hook ONLY after the cycle's fsync: the hook
-            // advances the per-tenant watermark the worker acks clients on,
-            // so firing it inside `processReady` (pre-fsync) let a worker
-            // promote + 200 a write whose log entry was not yet durable —
-            // a crash (or a flush failure, e.g. disk full) in that window
-            // lost an acked write. On flush failure the notifications are
-            // DROPPED: the parked workers time out → 503, which is the
-            // correct "unknown outcome" signal (never a false durable ack).
             if (flushed) {
+                // Persist ack (the async-append handshake): the fsync now
+                // covers every buffered append, so tell raft — this is the
+                // point this node's entries start counting toward the
+                // commit quorum, and it releases the stashed persistence-
+                // asserting messages (append acks / vote responses) into
+                // the outboxes. On a failed flush the list is RETAINED:
+                // no ack, no acks on the wire, commits stay locked until
+                // a later successful fsync — never durability claimed for
+                // volatile bytes.
+                for (self.persist_ack.items) |g| {
+                    self.mgr.onPersist(g);
+                    if (self.groups.get(g)) |slot| slot.in_persist_ack = false;
+                }
+                self.persist_ack.clearRetainingCapacity();
+
+                // Pass 2: the acks commonly unlock a commit advance — the
+                // newly-committed entries surface as fresh readies. Apply
+                // them NOW so a single-node propose still commits within
+                // one pump cycle. Anything pass 2 buffers (typically the
+                // advanced commit index riding the next hard state) is
+                // covered by the NEXT cycle's fsync+ack — pass-2 groups
+                // re-enter `persist_ack`, and the `persist_ack.items.len`
+                // arm of the enclosing `if` guarantees that next round
+                // runs even if nothing else is ready.
+                ready2 = self.mgr.pollReady(self.ready_buf2);
+                for (ready2) |g| {
+                    self.mgr.processReady(g, applyCb, self) catch |e| {
+                        self.apply_err = self.apply_err orelse mapRaftErr(e);
+                    };
+                    self.notePersistAck(g);
+                }
+
+                // Fire the commit hook ONLY now: the hook advances the
+                // per-tenant watermark the worker acks clients on. Pass-1
+                // applies were durable before this cycle; pass-2 applies
+                // are covered by this cycle's fsync. On flush failure the
+                // notifications are DROPPED: parked workers time out →
+                // 503, the correct "unknown outcome" signal (never a
+                // false durable ack).
                 if (self.commit_hook) |h| {
                     for (self.commit_notify.items) |n| h.func(h.ctx, n.gid, n.origin, n.seq, n.idx);
                 }
             }
             self.commit_notify.clearRetainingCapacity();
 
-            // Drain each ready group's outbox. Single-node: queued to a
-            // transport-less sink (a no-op). Multi-node: buffered per
-            // destination node, stamped with the group's migration epoch,
-            // for the coalesced flush below.
+            // Drain each ready group's outbox (both passes; `release` is
+            // dup-tolerant and re-notifies if work landed mid-round).
+            // Single-node: queued to a transport-less sink (a no-op).
+            // Multi-node: buffered per destination node, stamped with the
+            // group's migration epoch, for the coalesced flush below.
             for (ready) |g| {
+                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g) };
+                self.mgr.takeMessages(g, sendMsgCb, &sctx) catch {};
+                self.mgr.release(g);
+            }
+            for (ready2) |g| {
                 var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g) };
                 self.mgr.takeMessages(g, sendMsgCb, &sctx) catch {};
                 self.mgr.release(g);
@@ -1037,7 +1131,7 @@ pub const Node = struct {
             self.apply_err = null;
             return e;
         }
-        return ready.len > 0;
+        return ready.len > 0 or ready2.len > 0;
     }
 
     /// Checkpoint dirty stores (V2 port of V1's `Cluster.tickSnapshot`).
@@ -1055,6 +1149,14 @@ pub const Node = struct {
         if (now - self.last_durabilize_ns < self.durabilize_interval_ns) return;
         self.last_durabilize_ns = now;
         const single = self.isSingleNode();
+        // Under the async-append flow the durable HardState.commit lags
+        // the live commit by one fsync (it rides the NEXT ready's hard
+        // state). Compaction must never truncate past a commit index that
+        // is not yet durable — a crash right after the truncate would
+        // recover hs.commit < first_index-1 and panic `RawNode::new`. One
+        // flush before the first compact of the tick closes the lag; lazy
+        // so a tick that compacts nothing pays nothing.
+        var compaction_flushed = false;
         // Iterate with a retain cursor: a slot whose fold could not reach
         // `applied_idx` this tick (durabilize floor below it, or a fold
         // error) STAYS dirty so a later tick finishes the job — without
@@ -1093,6 +1195,21 @@ pub const Node = struct {
                 continue;
             };
             if (single and self.compact_wal) {
+                if (!compaction_flushed) {
+                    self.wal.flush() catch |e| {
+                        // Can't make the commit index durable — skip ALL
+                        // compaction this tick (the stamp above already
+                        // happened, which is fine: durabilize ≠ truncate).
+                        std.log.warn("v2 wal pre-compact flush: {s}", .{@errorName(e)});
+                        slot.durabilized_idx = target;
+                        if (slot.applied_idx > target) {
+                            self.dirty.items[keep] = gid;
+                            keep += 1;
+                        } else slot.in_dirty = false;
+                        continue;
+                    };
+                    compaction_flushed = true;
+                }
                 slot.gfs.compact(target) catch |e| {
                     std.log.warn("v2 wal compact gid={d}: {s}", .{ gid, @errorName(e) });
                 };
@@ -1241,7 +1358,7 @@ pub const Node = struct {
                 // Strip the readset frame; apply the writeset bytes (the
                 // readset rides for the tape, not the store).
                 const wp = try envelope.decodeWriteSetPayload(env.payload);
-                try writeset.applyEncoded(store, index, wp.ws_bytes);
+                try writeset.applyEncodedDirect(store, index, wp.ws_bytes);
                 self.notifyApply(group_id, env.id, wp.ws_bytes);
             },
             .multi => {
@@ -1260,7 +1377,7 @@ pub const Node = struct {
                             // replay.
                             const store = self.storeFor(slot, ie.id) orelse return Error.UnroutedApply;
                             const wp = try envelope.decodeWriteSetPayload(ie.payload);
-                            try writeset.applyEncoded(store, index, wp.ws_bytes);
+                            try writeset.applyEncodedDirect(store, index, wp.ws_bytes);
                             self.notifyApply(group_id, ie.id, wp.ws_bytes);
                         },
                         .multi => return envelope.Error.NestedMulti,
@@ -1269,7 +1386,7 @@ pub const Node = struct {
                         // are not readset-framed.
                         .root_writeset => {
                             const store = self.storeFor(slot, "") orelse return Error.UnroutedApply;
-                            try writeset.applyEncoded(store, index, ie.payload);
+                            try writeset.applyEncodedDirect(store, index, ie.payload);
                             self.notifyApply(group_id, "", ie.payload);
                         },
                     }
@@ -1281,7 +1398,7 @@ pub const Node = struct {
             // readset frame).
             .root_writeset => {
                 const store = self.storeFor(slot, "") orelse return Error.UnroutedApply;
-                try writeset.applyEncoded(store, index, env.payload);
+                try writeset.applyEncodedDirect(store, index, env.payload);
                 self.notifyApply(group_id, "", env.payload);
             },
         }

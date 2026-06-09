@@ -7,12 +7,12 @@
             .hash = "arenajs-0.1.0-QYKxaXfpKQBAGWB9a0vlIjcksniFgJ2ZlsskOBvaPlvH",
         },
         .kvexp = .{
-            .url = "git+https://github.com/anarchodev/kvexp#f9770b921bbe1ff6d94c40baecb2a40898d1391c",
-            .hash = "kvexp-0.1.0-1hj5RJCOBACW5Vo8F4TOVVAGZdY7b4WFtO46Ogyk7U5e",
+            .url = "/home/user/src/kvexp-apply-direct",
+            .hash = "kvexp-0.1.0-1hj5RIObBAB6Dz9vdwG9d40yjEARdFqOM2obg64vbzIb",
         },
         .raft_rs_zig = .{
-            .url = "git+https://github.com/anarchodev/raft-rs-zig#5092bc69e2f267266a45326cea5c00d1bb35afe6",
-            .hash = "raft_rs_zig-0.0.1-SBgYX79wAwDwODvZdAO6oL8Mno7q8KT-5g9gP3cZovCS",
+            .url = "/home/user/src/raft-rs-zig-persist",
+            .hash = "raft_rs_zig-0.0.1-SBgYX5_HAwBq7TDpSJcI7rtxR_v8pd0GGFRDUdbg_4vf",
         },
     },
     .fingerprint = 0xe74470b1aa30c66d,
