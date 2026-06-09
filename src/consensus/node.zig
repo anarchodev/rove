@@ -387,6 +387,11 @@ pub const Node = struct {
     /// (`maxInt`) outside `worker_overlay` mode.
     durabilize_floor: ?DurabilizeFloor = null,
 
+    /// Count of transport tick failures (rate-limited logging in `pump`
+    /// — a persistently broken transport must be operator-visible, not a
+    /// silently-swallowed partition).
+    transport_err_count: u64 = 0,
+
     /// Optional per-applied-put notification (see `ApplyObserver`). Set by
     /// the bridge for the control-plane directory group so a CP node's
     /// in-memory projection tracks replicated applies (leader + follower).
@@ -1000,7 +1005,19 @@ pub const Node = struct {
         // and inbound messages are stepped even on an otherwise idle node.
         if (self.transport) |t| {
             t.flush();
-            t.tick(now, 0) catch {};
+            t.tick(now, 0) catch |e| {
+                // A transport tick failure is a silent partition in the
+                // making (nothing sent or received this cycle) — log it
+                // rate-limited so a persistently broken transport is
+                // operator-visible instead of an unexplained quorum loss.
+                self.transport_err_count +%= 1;
+                if (self.transport_err_count == 1 or self.transport_err_count % 1000 == 0) {
+                    std.log.warn(
+                        "v2 node {d}: transport tick failed ({s}) — {d} failures so far",
+                        .{ self.node_id, @errorName(e), self.transport_err_count },
+                    );
+                }
+            };
             // Wake any group that received a NON-heartbeat message this cycle
             // (real raft traffic = work). Heartbeats are skipped on purpose
             // (§3.1) so a quiet group can't keep itself awake.
