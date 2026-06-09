@@ -8,7 +8,7 @@
         },
         .kvexp = .{
             .url = "/home/user/src/kvexp-apply-direct",
-            .hash = "kvexp-0.1.0-1hj5RIObBAB6Dz9vdwG9d40yjEARdFqOM2obg64vbzIb",
+            .hash = "kvexp-0.1.0-1hj5RAadBAAeVQom02FO0Dv1GWfz_uiDO-RZeXMTnYMS",
         },
         .raft_rs_zig = .{
             .url = "/home/user/src/raft-rs-zig-persist",
