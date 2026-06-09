@@ -287,45 +287,30 @@ any other connection activation. The **first single-node cut ships batch-of-1**
 (each writing frame is its own activation → its own propose; ephemeral frames
 skip raft entirely).
 
-To avoid one raft round-trip per durable frame *later*, coalesce via the
-connection actor's **coalesced trigger**: while batch K's commit is in flight,
-arriving frames queue on the actor (they do not each fire an activation); on
-commit they become batch K+1, delivered as **one `onMessage` activation whose
-`request.activation.frames` carries the batch** → one writeset → one raft entry.
-**Load-adaptive, no tuning knob:** light load → batch-of-1 (minimum latency);
-heavy load → the batch grows to cover one RTT's arrivals (the round-trip is
-hidden). Because V2 is one raft group per tenant, the coalescing is **across a
-tenant's connections**, not just within one socket — a busy room amortizes
-through its one group. Durability acks are necessarily batch-granular (you can
-only ack after the commit), so the WS protocol must not promise per-frame
-durability before that commit. The atomicity boundary is **explicit in the
-activation shape** (the batched `frames` array delivered to one `onMessage`),
-the inbound analog of the `onChunk` batch — transparent group-commit is
-rejected (it fights the unanswerable "is activation K durable yet?"). This
-coalescing is a **later perf phase**, not part of the batch-of-1 baseline.
-
-> **As-built note (2026-06-09, post pieces D+F) — the fsync/RTT amortization
-> above is already inherent in the batch-of-1 baseline; the `frames:[...]`
-> coalescing is demoted from a perf lever to a semantics lever.** Per-frame
-> activations don't block on commit (`proposeForgetfulWrites` enqueues and
-> returns; replies park commit-gated), every activation's writeset funnels
-> into the one per-tenant propose inbox, and the bridge's `pumpOnce` submits
-> the *entire* drained inbox to the group before driving one ready cycle — so
-> a K-frame burst is K raft entries in **one** Ready: one log append, one
-> fsync, one MsgAppend RTT, ~one commit round wall-clock. Handler runs are
-> cheap (the per-request arena reset is one cursor write), so "fewer
-> activations" is not a motivation either. **One message per `onMessage`
-> stays the shape.** Build the batched activation only if one of its
-> *remaining* motivations becomes real:
-> (a) **strict reply ordering** — today a read-only frame's inline reply can
-> overtake an in-flight writing frame's commit-gated reply (writing frames
-> stay ordered among themselves via the per-tenant commit FIFO);
-> (b) per-entry decode/apply overhead at extreme frame rates;
-> (c) batch atomicity as a customer-visible unit.
-> Caveat shared with every producer: same-Ready grouping is opportunistic
-> (the pump races the worker tick; no linger), so a tick's proposes can
-> split across two cycles — if a guarantee is ever needed, the lever is at
-> the pump, not the activation layer.
+~~To avoid one raft round-trip per durable frame *later*, coalesce via the
+connection actor's coalesced trigger into one `onMessage` activation whose
+`request.activation.frames` carries the batch.~~ **REJECTED 2026-06-09 (§7) —
+there is no `frames:[...]` future goal; one message per `onMessage` is the
+permanent shape.** The amortization that design chased is already inherent in
+batch-of-1: per-frame activations are fire-and-forget (`proposeForgetfulWrites`
+enqueues and returns; replies park commit-gated), every activation's writeset
+funnels into the one per-tenant propose inbox, and the bridge's `pumpOnce`
+submits the *entire* drained inbox to the group before driving one ready
+cycle — so a K-frame burst is K raft entries in **one** Ready: one log append,
+one fsync, one MsgAppend RTT, ~one commit round wall-clock. Handler runs are
+cheap (the per-request arena reset is one cursor write), so fewer activations
+buys nothing. Durability acks stay **per-activation** (a writing frame's
+replies gate on its own commit) — strictly better than the batch-granular acks
+the coalesced design would have forced. Known, accepted wrinkle: a read-only
+frame's inline reply can overtake an in-flight writing frame's commit-gated
+reply (writing frames stay FIFO among themselves via the per-tenant commit
+order); if strict cross-frame reply ordering is ever demanded, gate inline
+emits behind the connection's in-flight commit — a runtime tweak, not an
+activation-shape change. Same-Ready grouping is opportunistic (no linger; the
+pump races the worker tick) — a guarantee, if ever needed, is a pump-level
+lever. Transparent multi-envelope merging of separate activations stays
+rejected too (per-inner apply isn't transactional; fault attribution is
+batch-granular).
 
 ### Non-goals — DO-model-specific (extend §7)
 
@@ -353,10 +338,10 @@ coalescing is a **later perf phase**, not part of the batch-of-1 baseline.
 (`zig build ws-echo`) and `scripts/ws_echo_smoke.py` (raw-socket RFC 6455 client:
 101 handshake, text/binary echo, fragment reassembly, auto-pong, close
 handshake). **Pieces D + F shipped 2026-06-09** — the single-node inbound
-baseline is done. Remaining: broadcast docs (the kv-wake recipe). The §4.5
-`frames:[...]` coalescing is **demoted** (see the as-built note there): fsync/
-RTT amortization already holds in batch-of-1; it returns only if strict reply
-ordering / extreme-rate entry overhead / batch atomicity demand it.
+baseline is done. Remaining: broadcast docs (the kv-wake recipe). The
+`frames:[...]` coalescing is **rejected outright** (§7) — fsync/RTT
+amortization already holds in batch-of-1; one message per `onMessage` is the
+permanent shape.
 
 ## 5. Handler execution model — the current (post-Phase-2) surface
 
@@ -367,8 +352,9 @@ Per `docs/handler-shape.md` (the shipped held-handler model) +
   connection; the chain rides Phase-6 hibernation while idle.
 - Each inbound frame dispatches to the **`onMessage`** export — one new
   connection activation kind (the WS analog of `onChunk`).
-  `request.activation` carries `{ opcode, data }` (and, under the §4.5
-  coalescing perf-phase, a `frames: [...]` batch). `opcode` is **numeric**
+  `request.activation` carries `{ opcode, data }` — **one message per
+  activation, permanently** (the batched `frames:[...]` shape is rejected,
+  §7). `opcode` is **numeric**
   (1 = text → `data` is a string; 2 = binary → `data` is a Uint8Array the
   handler owns). Binary frames > 16 KB
   go content-addressed via the blob coordinator (architecture/routing-and-ingress.md §7).
@@ -418,6 +404,15 @@ collab).
 
 ## 7. Out of scope (locked rejections — do not re-propose)
 
+- **A batched `frames:[...]` `onMessage` activation** (the former §4.5
+  coalesced-trigger perf phase). Rejected 2026-06-09: fsync/RTT amortization
+  is inherent in the batch-of-1 propose pipeline (§4.5 as-built — K frames =
+  K entries in one Ready/fsync), handler runs are cheap, and the batch shape
+  would re-introduce batch-granular durability acks plus a second activation
+  contract for no win. If strict cross-frame reply ordering or extreme-rate
+  per-entry overhead ever materializes, the levers are runtime-level (gate
+  inline emits behind the in-flight commit; pump-side linger) — not a handler-
+  surface change.
 - **WebSocket compression extensions (permessage-deflate).** RFC 7692.
   Adds memory + CPU overhead; the small-frame use case doesn't need
   it. Revisit if WS becomes a large-frame transport workhorse.
@@ -450,8 +445,9 @@ collab).
   Multi-node held connections are out of scope (single-node baseline).
 - ~~**Inbound durability per frame.**~~ **RESOLVED in §4.5:** a frame costs
   raft iff its activation writes; ephemeral frames are free + moot-on-loss;
-  durable frames coalesce via the connection actor's trigger into one
-  group-committed raft entry, load-adaptively.
+  a burst of writing frames stays one-entry-per-frame but the entries share
+  one Ready/fsync/RTT through the per-tenant propose pipeline (the batched-
+  activation coalescing was rejected — §7).
 
 ## 9. Relation to other docs
 
