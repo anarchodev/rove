@@ -277,6 +277,19 @@ fn handleBundle(
         worker.raft.unquiesce(gid);
         return reply(server, allocator, ent, sid, sess, 504, "drain timed out\n");
     }
+    // `committedSeq >= drained_to` proves raft commit + apply-skip, but a
+    // parked customer write's TrackedTxn only promotes into the store in
+    // drainRaftPending — which runs between dispatches on THIS worker
+    // thread, so it cannot make progress while we block here, and a dump
+    // taken now would silently MISS raft-committed writes (the move then
+    // destroys the source group → acked data lost). Reply 423: the CP
+    // retries shortly; between attempts the worker loop drains and the
+    // overlay catches up. The quiesce stays held across retries (no new
+    // writes; same keep-quiesced contract as the 200 path — an abandoned
+    // move releases it via v2-resume).
+    if (!worker.raft.workerAckedThrough(gid, drained_to)) {
+        return reply(server, allocator, ent, sid, sess, 423, "overlay drain in progress; retry\n");
+    }
 
     const inst = (worker.node.tenant.getInstance(tenant) catch null) orelse {
         worker.raft.unquiesce(gid);
