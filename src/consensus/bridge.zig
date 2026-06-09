@@ -140,14 +140,27 @@ pub const GroupSig = struct {
     /// leadership is per-group, so the edge lives here. Touched only in
     /// `refreshLeadership` under `Bridge.mutex`.
     was_leader: bool = false,
-    /// FIFO of proposed-but-not-yet-committed seqs (front = oldest), the
-    /// explicit per-entry seq↔commit binding that replaces Phase-2's
-    /// counting (multi-node breaks counting: a follower applies entries
-    /// from another leader, which the commit hook must NOT attribute to a
-    /// local proposer). Pushed by `propose`, popped by the commit hook
-    /// **only when this node is the group's leader**, cleared on fault.
-    /// Guarded by `Bridge.mutex`.
+    /// FIFO of proposed-but-not-yet-committed seqs (front = oldest).
+    /// Pushed by `propose`; the commit hook removes EXACTLY the
+    /// committed entry's own seq (identity binding — see file header);
+    /// cleared on fault. Guarded by `Bridge.mutex`.
     pending: std.ArrayListUnmanaged(u64) = .empty,
+    /// FIFO of committed-but-not-yet-worker-acked entries (front =
+    /// oldest), in `worker_overlay` mode only: a popped seq's store
+    /// write was SKIPPED on the premise that the local worker txn will
+    /// commit it — until the worker confirms (`noteWorkerCommitted`),
+    /// the entry's raft index caps the durabilize floor
+    /// (`durabilizeFloor`) so the pump can neither stamp the store's
+    /// watermark past it nor compact its WAL records away. Guarded by
+    /// `Bridge.mutex`.
+    awaiting_worker: std.ArrayListUnmanaged(AwaitAck) = .empty,
+    /// Highest seq whose store writes the worker has confirmed fold-
+    /// visible (`noteWorkerCommitted` high-water). Immediate-commit
+    /// producers (v2-kv, the config mirror) commit their txn BEFORE
+    /// proposing and may ack before the entry commits — the hook checks
+    /// this so an already-acked entry never enters `awaiting_worker`.
+    /// Guarded by `Bridge.mutex`.
+    worker_acked_seq: u64 = 0,
     /// Set by `quiesce` while this tenant is being moved off the node:
     /// `propose` rejects (`Error.Quiesced`) so no new write is admitted
     /// once the bundle snapshot is being taken. Single writer at a time
@@ -178,6 +191,14 @@ const ControlCmd = struct {
 const FaultReq = struct {
     gid: u64,
     seq: u64,
+};
+
+/// One committed-but-not-worker-acked entry (see
+/// `GroupSig.awaiting_worker`): the seq the worker will commit and the
+/// raft index its commit unblocks for durabilize/compaction.
+const AwaitAck = struct {
+    seq: u64,
+    idx: u64,
 };
 
 /// One queued propose, handed worker thread → pump thread.
@@ -280,6 +301,7 @@ pub const Bridge = struct {
         self.* = .{ .allocator = allocator, .node = node, .origin_id = origin };
         node.commit_hook = .{ .ctx = self, .func = onCommitted };
         node.skip_query = .{ .ctx = self, .func = skipQuery };
+        node.durabilize_floor = .{ .ctx = self, .func = durabilizeFloor };
         return self;
     }
 
@@ -337,6 +359,7 @@ pub const Bridge = struct {
         while (it.next()) |sig_ptr| {
             const sig = sig_ptr.*;
             sig.pending.deinit(a);
+            sig.awaiting_worker.deinit(a);
             a.free(sig.id_str);
             a.destroy(sig);
         }
@@ -871,7 +894,6 @@ pub const Bridge = struct {
     /// propose — see the file-header binding rationale. `raft_index` is
     /// recorded for the durabilize floor (worker-overlay ack tracking).
     fn onCommitted(ctx: *anyopaque, group_id: u64, origin: u64, seq: u64, raft_index: u64) void {
-        _ = raft_index;
         const self: *Bridge = @ptrCast(@alignCast(ctx));
         // Not ours: a follower apply, another node's propose (a promoted
         // leader's catch-up), a replayed entry from a previous incarnation
@@ -891,6 +913,20 @@ pub const Bridge = struct {
         } else null;
         if (found) |i| {
             _ = sig.pending.orderedRemove(i);
+            // worker_overlay: this entry's store write was SKIPPED on the
+            // premise that the local worker txn commits it. Until the
+            // worker acks (`noteWorkerCommitted`), `raft_index` caps the
+            // durabilize floor — the fold cannot see an open txn, so
+            // stamping/compacting past it would claim durability for
+            // data that is not yet foldable. Best-effort append: on OOM
+            // the floor is simply NOT raised conservatively… it must be
+            // the opposite — failing to record would let durabilize run
+            // PAST the entry. Surface it as a pump apply error instead.
+            if (self.node.apply_mode == .worker_overlay and seq > sig.worker_acked_seq) {
+                sig.awaiting_worker.append(self.allocator, .{ .seq = seq, .idx = raft_index }) catch {
+                    self.node.apply_err = node_mod.Error.OutOfMemory;
+                };
+            }
             // Proposes are per-tenant FIFO so commits arrive in seq order;
             // the monotonic max guard is belt-and-braces (a stale store
             // would strand later waiters, never wake one early).
@@ -898,6 +934,36 @@ pub const Bridge = struct {
                 sig.committed_seq.store(seq, .release);
             if (sig.pending.items.len == 0) self.removeInFlightLocked(group_id);
         }
+    }
+
+    /// Worker-thread ack that the speculative txn carrying every write
+    /// up to and including `seq` has COMMITTED into the store's main
+    /// overlay (kvexp fold-visible). Releases the durabilize floor for
+    /// those entries — the pump may now stamp the store watermark and
+    /// compact the WAL past them. `≤ seq` (not `== seq`) because a
+    /// chunked multi-propose parks one txn on its LAST seq while the
+    /// intermediate seqs share it. Lock-held scan is O(in-flight).
+    pub fn noteWorkerCommitted(self: *Bridge, gid: u64, seq: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const sig = self.groups.get(gid) orelse return;
+        if (seq > sig.worker_acked_seq) sig.worker_acked_seq = seq;
+        while (sig.awaiting_worker.items.len > 0 and sig.awaiting_worker.items[0].seq <= seq) {
+            _ = sig.awaiting_worker.orderedRemove(0);
+        }
+    }
+
+    /// Bound to `Node.durabilize_floor` (pump thread): the highest raft
+    /// index fully covered by the store's foldable overlay for `gid` —
+    /// one less than the first committed-but-not-worker-acked entry's
+    /// index, or unconstrained when nothing is awaited.
+    fn durabilizeFloor(ctx: *anyopaque, gid: u64) u64 {
+        const self: *Bridge = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const sig = self.groups.get(gid) orelse return std.math.maxInt(u64);
+        if (sig.awaiting_worker.items.len == 0) return std.math.maxInt(u64);
+        return sig.awaiting_worker.items[0].idx - 1;
     }
 
     /// Bound to `Node.skip_query` (worker-overlay apply). True iff this
@@ -1384,6 +1450,69 @@ test "bridge: identity binding — foreign + faulted entries write the store and
     defer a.free(lv);
     try testing.expectEqualStrings("vl", lv);
     try testing.expectEqual(s1, bridge.committedSeq(gid)); // still s1
+}
+
+test "bridge: durabilize floor holds until the worker acks the skipped entry's txn" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const bridge = try Bridge.initSingleNode(a, dir);
+    defer bridge.deinit();
+    bridge.setWorkerOverlay();
+    bridge.node.durabilize_interval_ns = 0; // fold every cycle
+
+    const store_path = try std.fmt.allocPrintSentinel(a, "{s}/worker.db", .{dir}, 0);
+    defer a.free(store_path);
+    const worker_store = try node_mod.KvStore.open(a, store_path);
+    defer worker_store.close();
+    const Res = struct {
+        store: *node_mod.KvStore,
+        fn resolve(ctx: *anyopaque, gid: u64, id_str: []const u8) ?*node_mod.KvStore {
+            _ = gid;
+            _ = id_str;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.store;
+        }
+    };
+    var res: Res = .{ .store = worker_store };
+    bridge.setStoreResolver(.{ .ctx = &res, .func = Res.resolve });
+
+    const gid = try bridge.registerTenant("flo");
+    var ws = WriteSet.init(a);
+    defer ws.deinit();
+    try ws.addPut("k", "v");
+    const env = try encodeWs(a, "flo", &ws);
+    defer a.free(env);
+    const seq = try bridge.propose(gid, env);
+    var spins: u32 = 0;
+    while (bridge.committedSeq(gid) < seq and spins < 400) : (spins += 1) {
+        _ = try bridge.pumpOnce();
+    }
+    try testing.expectEqual(seq, bridge.committedSeq(gid));
+
+    // The entry was SKIPPED (live own propose) and the "worker" has not
+    // committed its txn: many durabilize ticks may pass, but the fold
+    // watermark must stay BELOW the entry's applied index — stamping it
+    // (and compacting the WAL) would claim durability for data still in
+    // the open txn.
+    spins = 0;
+    while (spins < 10) : (spins += 1) _ = try bridge.pumpOnce();
+    const slot = bridge.node.groups.get(gid).?;
+    try testing.expect(slot.durabilized_idx < slot.applied_idx);
+    try testing.expect(slot.in_dirty); // retained for a later tick
+
+    // Worker ack: the txn promoted. The next durabilize folds + stamps
+    // through the entry and the slot drains from the dirty set.
+    bridge.noteWorkerCommitted(gid, seq);
+    spins = 0;
+    while (slot.durabilized_idx < slot.applied_idx and spins < 10) : (spins += 1) {
+        _ = try bridge.pumpOnce();
+    }
+    try testing.expectEqual(slot.applied_idx, slot.durabilized_idx);
+    try testing.expect(!slot.in_dirty);
 }
 
 test "bridge: createGroupEpoch requires a running pump thread" {

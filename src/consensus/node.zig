@@ -147,6 +147,21 @@ const CommitNotify = struct {
     idx: u64,
 };
 
+/// Asks the bridge for the highest raft index whose data is fully in
+/// the store's foldable overlay for `gid` — the DURABILIZE FLOOR.
+/// In `worker_overlay` mode a skipped entry's writes live in the
+/// worker's open `TrackedTxn` until the worker observes the watermark
+/// and commits; kvexp's fold (`setLastAppliedRaftIdx`) only covers the
+/// committed main overlay, so durabilizing/compacting past an un-acked
+/// entry would stamp a watermark (and truncate WAL) for data that is
+/// not yet foldable — a crash then loses an acked write. The bridge
+/// answers `first un-acked entry's index − 1` (or `maxInt` when nothing
+/// is awaited). Pump-thread only.
+pub const DurabilizeFloor = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, gid: u64) u64,
+};
+
 /// Fired once per PUT in a committed writeset, AFTER it has applied to the
 /// store, on EVERY node (leader and follower). Unlike `CommitHook` (which
 /// binds commit order to a local proposer's seq, so it only advances on the
@@ -366,6 +381,11 @@ pub const Node = struct {
     /// back to the role-keyed `isLeader` skip (bare-node tests only —
     /// every worker-fronted deployment sets it).
     skip_query: ?SkipQuery = null,
+
+    /// Optional durabilize floor (see `DurabilizeFloor`). Set by the
+    /// bridge alongside `commit_hook`; trivially unconstrained
+    /// (`maxInt`) outside `worker_overlay` mode.
+    durabilize_floor: ?DurabilizeFloor = null,
 
     /// Optional per-applied-put notification (see `ApplyObserver`). Set by
     /// the bridge for the control-plane directory group so a CP node's
@@ -1018,23 +1038,58 @@ pub const Node = struct {
         if (now - self.last_durabilize_ns < self.durabilize_interval_ns) return;
         self.last_durabilize_ns = now;
         const single = self.isSingleNode();
+        // Iterate with a retain cursor: a slot whose fold could not reach
+        // `applied_idx` this tick (durabilize floor below it, or a fold
+        // error) STAYS dirty so a later tick finishes the job — without
+        // this, a one-shot stamp left the un-foldable tail volatile
+        // forever (an idle tenant's last write never re-folded).
+        var keep: usize = 0;
         for (self.dirty.items) |gid| {
             const slot = self.groups.get(gid) orelse continue;
-            slot.in_dirty = false;
-            if (slot.applied_idx <= slot.durabilized_idx) continue;
-            const store = self.storeFor(slot, slot.id_str) orelse continue;
-            store.setLastAppliedRaftIdx(slot.applied_idx) catch |e| {
+            // The fold target: how far the store's overlay actually covers.
+            // In worker_overlay mode a skipped entry's writes sit in the
+            // worker's OPEN txn until the worker acks (`noteWorkerCommitted`)
+            // — folding/stamping/compacting past it would claim durability
+            // for data the fold cannot see (crash ⇒ acked write lost, WAL
+            // already truncated). The bridge's floor is `maxInt` when
+            // nothing is awaited.
+            var target = slot.applied_idx;
+            if (self.durabilize_floor) |f| target = @min(target, f.func(f.ctx, gid));
+            if (target <= slot.durabilized_idx) {
+                // Nothing foldable yet — keep the slot dirty and retry
+                // next tick (the worker ack raises the floor).
+                self.dirty.items[keep] = gid;
+                keep += 1;
+                continue;
+            }
+            const store = self.storeFor(slot, slot.id_str) orelse {
+                // Resolver failure — retry next tick rather than
+                // stranding an in_dirty=true slot outside the list.
+                self.dirty.items[keep] = gid;
+                keep += 1;
+                continue;
+            };
+            store.setLastAppliedRaftIdx(target) catch |e| {
                 std.log.warn("v2 durabilize gid={d}: {s}", .{ gid, @errorName(e) });
+                self.dirty.items[keep] = gid;
+                keep += 1;
                 continue;
             };
             if (single and self.compact_wal) {
-                slot.gfs.compact(slot.applied_idx) catch |e| {
+                slot.gfs.compact(target) catch |e| {
                     std.log.warn("v2 wal compact gid={d}: {s}", .{ gid, @errorName(e) });
                 };
             }
-            slot.durabilized_idx = slot.applied_idx;
+            slot.durabilized_idx = target;
+            if (slot.applied_idx > target) {
+                // Partially folded (floor held back the tail): stay dirty.
+                self.dirty.items[keep] = gid;
+                keep += 1;
+            } else {
+                slot.in_dirty = false;
+            }
         }
-        self.dirty.clearRetainingCapacity();
+        self.dirty.shrinkRetainingCapacity(keep);
     }
 
     /// Enqueue `slot` for the next `durabilizeTick` if not already (its
