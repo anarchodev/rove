@@ -336,6 +336,46 @@ pub const BufferedSendKvOps = effect_mod.cmd.BufferedCmds;
 /// 3.2+ uses `wake_key` when the H2 entity path migrates.
 pub const ParkedUnit = effect_mod.Continuation(BufferedSendKvOps, *kv_mod.KvStore.TrackedTxn);
 
+/// One inbound WS frame held behind its connection's input gate
+/// (websocket-plan §4.5 strict reply ordering). `payload` is an owned
+/// copy — the transport's `ws_message_out` entity is destroyed in the
+/// same tick the frame queues.
+pub const WsQueuedFrame = struct {
+    opcode: u8,
+    payload: []u8,
+};
+
+/// Per-WS-connection worker state (the `ws_conns` map value).
+///
+/// `gate_seq != 0` is the **input gate** (websocket-plan §4.5, the DO
+/// input-gate analog): a writing frame's forgetful unit is awaiting
+/// raft at that per-tenant seq, so newly-arriving frames queue on
+/// `queue` instead of activating. `flushWsGates` re-opens the gate
+/// once the seq is committed AND its parked unit has been released
+/// (the unit check is what makes "this conn's prior reply frames
+/// already reached `ws_send_in`" true — committedSeq alone races the
+/// drain), then dispatches the queue in arrival order. This yields
+/// both strict reply ordering and read-your-writes across a
+/// connection's frames: frame K+1 never activates while frame K's
+/// writes are un-durable. Fault/timeout of the gated seq closes the
+/// connection (the discarded reply can't be re-created — honest
+/// failure, mirroring the propose-fail path).
+pub const WsConnState = struct {
+    /// The held chain entity in `parked_continuations`.
+    chain: rove.Entity,
+    /// Raft seq the gate is closed on (0 = open).
+    gate_seq: u64 = 0,
+    /// The tenant group the seq belongs to (resolved at arm time).
+    gate_gid: u64 = 0,
+    /// Gate abandon deadline — mirrors the parked unit's own
+    /// `commit_wait_timeout_ns` so a unit reaped by leadership loss
+    /// (which never advances the fault watermark) can't wedge the
+    /// connection forever.
+    gate_deadline_ns: i64 = 0,
+    /// Frames awaiting the gate, in arrival order.
+    queue: std.ArrayListUnmanaged(WsQueuedFrame) = .empty,
+};
+
 /// Owned (key, op) pair captured from a write batch's writeset at
 /// propose time. Aliased to `effect.cmd.KvWakeOp` (the
 /// `kv_wake_broadcast` Cmd's payload type) so the propose-side
@@ -1373,8 +1413,9 @@ pub fn Worker(comptime opts: Options) type {
         /// `docs/websocket-plan.md` §4.5/§5 (piece D): per-connection
         /// held WebSocket chain locator. Maps the h2 connection `Entity`
         /// (the `Session.entity` carried on every `ws_message_out` /
-        /// `ws_send_in` entity) → the parked continuation entity holding
-        /// that connection's chain (in `parked_continuations`). The first
+        /// `ws_send_in` entity) → that connection's worker-side state:
+        /// the parked continuation entity holding its chain (in
+        /// `parked_continuations`) plus the §4.5 input gate. The first
         /// inbound frame establishes the chain (resolve tenant + module,
         /// create the parked entity, insert here); subsequent frames look
         /// it up; client close / conn death tears it down + removes the
@@ -1382,9 +1423,9 @@ pub fn Worker(comptime opts: Options) type {
         /// conn handle never resolves a dead chain — `reg.isStale`
         /// distinguishes by generation. NOT a new collection: the chain
         /// lives in the existing `parked_continuations` (its membership
-        /// IS the held lifecycle); this is only the conn→entity index,
+        /// IS the held lifecycle); this is only the conn→state index,
         /// the WS analog of `bound_fetch_entities`.
-        ws_chains_by_conn: std.AutoHashMapUnmanaged(rove.Entity, rove.Entity) = .empty,
+        ws_conns: std.AutoHashMapUnmanaged(rove.Entity, WsConnState) = .empty,
         /// `docs/chunk-spool-plan.md` Phase 2: per-fetch chunk spool,
         /// keyed by `fetch_id`, sibling to `bound_fetch_entities`.
         /// Decouples bound-fetch chunk arrival from the held chain's
@@ -1881,11 +1922,20 @@ pub fn Worker(comptime opts: Options) type {
                 while (it.next()) |entry| allocator.free(entry.key_ptr.*);
                 self.bound_fetch_entities.deinit(allocator);
             }
-            // websocket-plan §5 (piece D): the conn→chain index holds no
-            // owned keys (Entity values) — the chain entities themselves
+            // websocket-plan §5 (piece D): the chain entities themselves
             // are reaped via `parked_continuations`/registry teardown on
-            // shutdown. Just free the map's own storage.
-            self.ws_chains_by_conn.deinit(allocator);
+            // shutdown; free each connection's gated-frame queue, then
+            // the map's own storage.
+            {
+                var it = self.ws_conns.valueIterator();
+                while (it.next()) |st| {
+                    for (st.queue.items) |f| {
+                        if (f.payload.len > 0) allocator.free(f.payload);
+                    }
+                    st.queue.deinit(allocator);
+                }
+                self.ws_conns.deinit(allocator);
+            }
             // `docs/chunk-spool-plan.md` Phase 2: free every spool +
             // its still-pending entries + the duped fetch_id key.
             // Best-effort drain at shutdown, same lossy posture as

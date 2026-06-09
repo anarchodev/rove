@@ -221,8 +221,11 @@ fn workerMain(args: *WorkerCtx) !void {
         // docs/websocket-plan.md §4.5/§5 (piece D): dispatch inbound WS
         // frames (h2 `ws_message_out`) to the held chain's `onMessage` /
         // `onDisconnect` and lower outbound `stream.write`s to `ws_send_in`.
-        // Writing frames stage commit-gated sends (drained on the next
-        // tick's `drainRaftPending`); read-only frames emit inline.
+        // Writing frames stage commit-gated sends; the per-connection
+        // input gate queues frames arriving behind an in-flight commit
+        // (strict reply ordering + read-your-writes) and flushes them
+        // here once `drainRaftPending` (above, same tick) released the
+        // committed unit's reply frames. Read-only frames emit inline.
         try rjs.serviceWsMessages(worker);
         try rjs.cleanupResponses(worker);
         rjs.sweepCronSubscriptions(worker);

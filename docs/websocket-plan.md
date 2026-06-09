@@ -301,16 +301,37 @@ one fsync, one MsgAppend RTT, ~one commit round wall-clock. Handler runs are
 cheap (the per-request arena reset is one cursor write), so fewer activations
 buys nothing. Durability acks stay **per-activation** (a writing frame's
 replies gate on its own commit) — strictly better than the batch-granular acks
-the coalesced design would have forced. Known, accepted wrinkle: a read-only
-frame's inline reply can overtake an in-flight writing frame's commit-gated
-reply (writing frames stay FIFO among themselves via the per-tenant commit
-order); if strict cross-frame reply ordering is ever demanded, gate inline
-emits behind the connection's in-flight commit — a runtime tweak, not an
-activation-shape change. Same-Ready grouping is opportunistic (no linger; the
-pump races the worker tick) — a guarantee, if ever needed, is a pump-level
-lever. Transparent multi-envelope merging of separate activations stays
-rejected too (per-inner apply isn't transactional; fault attribution is
+the coalesced design would have forced. Same-Ready grouping is opportunistic
+(no linger; the pump races the worker tick) — a guarantee, if ever needed, is
+a pump-level lever. Transparent multi-envelope merging of separate activations
+stays rejected too (per-inner apply isn't transactional; fault attribution is
 batch-granular).
+
+**Strict reply ordering + read-your-writes are GUARANTEED (built 2026-06-09)
+via the per-connection INPUT GATE** — the DO-input-gate analog, in the worker,
+no handler-surface change. While a writing frame's forgetful unit awaits raft
+(`WsConnState.gate_seq`), frames arriving on that connection queue
+(`WsConnState.queue`) instead of activating; `flushWsGates` re-opens the gate
+once the seq is committed **and** the drain has released the unit's reply
+frames (the unit check — not just the commit watermark — is what makes "prior
+replies already reached `ws_send_in`" true; the watermark advances on the
+pump thread and can lead the drain), then dispatches the queue in arrival
+order. Consequences: replies on one socket arrive in message order across the
+durability boundary; frame K+1 activates post-commit so it reads frame K's
+writes (without the gate it read the *committed-only* view — the smoke caught
+`read:` returning `<none>` for a value the previous frame wrote); a queued
+client-Close runs `onDisconnect` only after the data frames ahead of it.
+Fault/timeout of the gated commit closes the connection (the discarded reply
+can't be honestly re-created). The independent-read fast path is preserved: a
+read-only frame with no in-flight write still emits inline. Companion fix,
+the idiom-0 read-side dual (`worker_dispatch.zig:707`) for WS: a read-only
+frame whose commit returns kvexp `NotChainHead` (its read crossed *another
+producer's* in-flight overlay — the gate already serializes this connection's
+own writes) re-ships through an empty-writeset **barrier propose**, so frames
+computed on un-durable state reach the wire only after the chain commits.
+Smoke: `scripts/ws_ordering_smoke_v2.py` (coalesced 5-frame burst → exact
+reply order + read-after-write; abrupt-drop disconnect racing an in-flight
+commit).
 
 ### Non-goals — DO-model-specific (extend §7)
 
@@ -409,9 +430,10 @@ collab).
   is inherent in the batch-of-1 propose pipeline (§4.5 as-built — K frames =
   K entries in one Ready/fsync), handler runs are cheap, and the batch shape
   would re-introduce batch-granular durability acks plus a second activation
-  contract for no win. If strict cross-frame reply ordering or extreme-rate
-  per-entry overhead ever materializes, the levers are runtime-level (gate
-  inline emits behind the in-flight commit; pump-side linger) — not a handler-
+  contract for no win. Strict cross-frame reply ordering was indeed demanded —
+  and built runtime-level as the per-connection input gate (§4.5, 2026-06-09),
+  proving the point: no handler-surface change. If extreme-rate per-entry
+  overhead ever materializes, that lever is pump-side (linger), also not a
   surface change.
 - **WebSocket compression extensions (permessage-deflate).** RFC 7692.
   Adds memory + CPU overhead; the small-frame use case doesn't need

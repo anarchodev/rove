@@ -110,7 +110,9 @@ def expected_accept(key: str) -> str:
     return base64.b64encode(hashlib.sha1((key + ACCEPT_MAGIC).encode()).digest()).decode()
 
 
-def send_frame(sock, opcode, payload: bytes, fin=True):
+def encode_frame(opcode, payload: bytes, fin=True) -> bytes:
+    """One masked client→server frame as bytes (callers may coalesce
+    several into one sendall to land them in a single read/tick)."""
     b0 = (0x80 if fin else 0) | opcode
     out = bytearray([b0])
     n = len(payload)
@@ -125,7 +127,11 @@ def send_frame(sock, opcode, payload: bytes, fin=True):
     mkey = os.urandom(4)
     out += mkey
     out += bytes(b ^ mkey[i & 3] for i, b in enumerate(payload))
-    sock.sendall(out)
+    return bytes(out)
+
+
+def send_frame(sock, opcode, payload: bytes, fin=True):
+    sock.sendall(encode_frame(opcode, payload, fin))
 
 
 def recv_exact(sock, n: int) -> bytes:
