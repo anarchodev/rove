@@ -148,6 +148,12 @@ def main():
         env["REWIND_CP_URL"] = f"http://127.0.0.1:{PCP}"
         env["REWIND_TLS_CERT"] = def_cert
         env["REWIND_TLS_KEY"] = def_key
+        # Disable the :80 ACME-HTTP-01 / HTTP→HTTPS listener: with TLS on the
+        # front otherwise defaults to binding privileged :80, which needs root.
+        # This smoke only exercises TLS termination + SNI cert selection on the
+        # TLS port, never the :80 redirect, so 0 (off) keeps it runnable
+        # unprivileged (CI / sandbox) without changing what it tests.
+        env["REWIND_HTTP_PORT"] = "0"
         env["REWIND_CERT_SYNC_MS"] = "400"
         env["REWIND_ROUTE_CACHE_MS"] = "0"
         fp = subprocess.Popen([FRONT_BIN, str(PF)], stdout=subprocess.PIPE,
