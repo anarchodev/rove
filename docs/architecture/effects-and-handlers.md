@@ -33,7 +33,7 @@ every variant is handled in the release path.
 | Primitive | File | What it is |
 |---|---|---|
 | **Model** | (the per-tenant KV) | The only durable store. kvexp speculative overlay + `app.db`; reads pinned per-activation for determinism. |
-| **Continuation** | `effect/continuation.zig` | A parked unit: `{seq, txn, buffered Cmds, wake, deadline}`. `reconcile` is the *one* system that resumes all parks — commit ≥ seq → `txn.commit()` + interpret buffered Cmds + resume; fault/timeout → `txn.rollback()` + discard. Affine: no handle is exposed to JS; the chain *is* the connection by construction. |
+| **Continuation** | `effect/continuation.zig` | A parked unit: `{seq, txn, buffered Cmds, wake, deadline}`. `reconcile` is the *one* system that resumes all parks — commit ≥ seq → `txn.commit()` + interpret buffered Cmds + resume; **fault** (bridge-declared) → `txn.rollback()` + discard; **timeout** (deadline, not faulted) → *request* a pump-side fault (`bridge.requestFault`) and stay parked — a unilateral worker-thread rollback would race the pump's provenance skip for this very entry; the next sweep resolves to commit (committed-beats-faulted) or a normal fault. Affine: no handle is exposed to JS; the chain *is* the connection by construction. |
 | **Msg** | `effect/msg.zig` | The activation origin (tagged union over `ActivationSource`): `inbound`, `send_callback`, `timer`, `disconnect`, `kv_wake`, `wake_batch`, `subscription_fire`, `fetch_chunk`, `durable_wake`, `ws_message`. `enqueueMsg` (`effect/queue.zig`) is the single tape-emitting ingress. |
 | **Cmd** | `effect/cmd.zig` | The commit-gated runtime effect: `kv_wake_broadcast`, `stream_chunk`, `stream_close`, `http_fetch`, `respond`. Released only when `committedSeq() >= seq`. |
 
@@ -107,7 +107,7 @@ kinds, each its own marker, each released by its own signal:
 
 | Wait | Collection | Released by |
 |---|---|---|
-| Raft-commit | `raft_pending_response` / `_cont` / `_stream` (+ `SharedTxnPool`) | `committedSeq() >= seq`, or fault/deadline |
+| Raft-commit | `raft_pending_response` / `_cont` / `_stream` (+ `SharedTxnPool`, keyed **(group, seq)** — V2 seqs are per-tenant, so a bare-seq key collides across tenants) | `committedSeq() >= seq`, or fault/deadline |
 | Body-durability | `body_pending` | blob coordinator HWM passes the body's seq |
 | Held-continuation | `parked_continuations` | callback arrives, or deadline → 504 |
 | Stream-wake | stream-data-out | kv-write match, timer fire, or disconnect |

@@ -79,33 +79,87 @@ pub const DEFAULT_HIBERNATE_NS: i64 = 2 * std.time.ns_per_s;
 /// replay and lets the WAL be truncated. Tests override with a short value.
 pub const DEFAULT_DURABILIZE_NS: i64 = 500 * std.time.ns_per_ms;
 
-/// Resolves the per-tenant store a FOLLOWER's replicated entries apply to
-/// in `worker_overlay` mode (Phase 5 "Full HA"). Without it, a follower
-/// writes the node's own `slot.store` — a file the worker never reads, so
-/// a follower promoted to leader would serve from an empty serving store.
-/// The bridge sets this (via `setStoreResolver`) to point at the worker's
-/// own per-tenant `inst.kv`, provisioned on demand, so a follower's
-/// replicated writes land in the SAME store the worker serves from. The
-/// resolver runs on the pump thread; the worker's `Tenant` is internally
-/// locked, so on-demand provisioning is safe there. `group_id` + `id_str`
-/// identify the tenant (the worker keys its instance store on `id_str`).
-/// Returns null only on a provisioning failure (treated as a missing
-/// group — an invariant violation surfaced by the apply round).
+/// Resolves the store a replicated entry applies to, keyed by the
+/// envelope's tenant id string. Two callers need it:
+///
+///   - a FOLLOWER's apply in `worker_overlay` mode (Phase 5 "Full HA"):
+///     without it, a follower writes the node's own `slot.store` — a file
+///     the worker never reads, so a follower promoted to leader would
+///     serve from an empty serving store. The bridge sets this (via
+///     `setStoreResolver`) to point at the worker's own per-tenant
+///     `inst.kv`, provisioned on demand.
+///   - a `multi` envelope's CROSS-TENANT inners (the admin batch's
+///     `platform.scope(id).kv.*` / `releases.publish` trampoline targets,
+///     `raft_propose.zig proposeBatch`): each inner's `id` may name a
+///     tenant OTHER than the anchor group's, so apply must route by that
+///     id, not by the group's slot.
+///
+/// Contract: `id_str` is the envelope id the writeset targets; the EMPTY
+/// id (`""`) resolves the node-wide ROOT store (`__root__`) — the target
+/// of `root_writeset` envelopes/inners (`platform.root.*`). `group_id` is
+/// the group the entry committed through (the anchor group for inners).
+/// The resolver runs on the pump thread; the worker's `Tenant` is
+/// internally locked, so on-demand provisioning is safe there. Returns
+/// null only on a provisioning failure (an invariant violation surfaced
+/// by the apply round as `UnroutedApply`).
 pub const StoreResolver = struct {
     ctx: *anyopaque,
     func: *const fn (ctx: *anyopaque, group_id: u64, id_str: []const u8) ?*KvStore,
 };
 
 /// Fired once per committed *real* entry (writeset / multi / root —
-/// not the leader's empty election no-op), AFTER it has applied, with
-/// the entry's raft index. The bridge (`bridge.zig`) uses this to bind
-/// per-tenant raft commit order to the per-tenant propose seq it handed
-/// the worker (the seq → commit-order binding behind the per-tenant
-/// watermark; docs/v2-build-order.md §Phase 2). `null` in the Phase-1
-/// unit tests, which drive the pump directly and read inline.
+/// not the leader's empty election no-op), AFTER it has applied AND the
+/// cycle's WAL fsync has completed, with the entry's IDENTITY (the
+/// origin frame's `origin` + `seq`, see `envelope.EntryFrame`) and its
+/// raft index. The bridge (`bridge.zig`) advances a tenant's
+/// `committed_seq` watermark only for entries whose `origin` is its own
+/// — an identity binding, not a positional one, so an old-term entry
+/// resurrected by a re-election can never credit a different propose's
+/// waiter. Because the watermark is the worker's durable-ack signal,
+/// the hook is staged during `processReady` and fired only after
+/// `wal.flush()` succeeds — never ahead of the fsync. `null` in the
+/// Phase-1 unit tests, which drive the pump directly and read inline.
 pub const CommitHook = struct {
     ctx: *anyopaque,
-    func: *const fn (ctx: *anyopaque, group_id: u64, raft_index: u64) void,
+    func: *const fn (ctx: *anyopaque, group_id: u64, origin: u64, seq: u64, raft_index: u64) void,
+};
+
+/// Asks the bridge whether a committed entry's store write should be
+/// SKIPPED in `worker_overlay` mode: true iff the entry is THIS node's
+/// own live propose (`origin` matches the bridge and `seq` is still in
+/// the tenant's pending set — i.e. a local worker txn holds these writes
+/// and will commit them on watermark advance). Keying the skip on
+/// provenance instead of on `isLeader` closes two holes: a
+/// freshly-elected leader catching up on entries proposed elsewhere must
+/// WRITE them (no local worker ever did), and an entry whose local
+/// waiter gave up (fault / timeout → txn rolled back, seq abandoned)
+/// must be written by the pump when it later commits. Pump-thread only.
+pub const SkipQuery = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, group_id: u64, origin: u64, seq: u64) bool,
+};
+
+/// One staged commit notification (see `Node.commit_notify`).
+const CommitNotify = struct {
+    gid: u64,
+    origin: u64,
+    seq: u64,
+    idx: u64,
+};
+
+/// Asks the bridge for the highest raft index whose data is fully in
+/// the store's foldable overlay for `gid` — the DURABILIZE FLOOR.
+/// In `worker_overlay` mode a skipped entry's writes live in the
+/// worker's open `TrackedTxn` until the worker observes the watermark
+/// and commits; kvexp's fold (`setLastAppliedRaftIdx`) only covers the
+/// committed main overlay, so durabilizing/compacting past an un-acked
+/// entry would stamp a watermark (and truncate WAL) for data that is
+/// not yet foldable — a crash then loses an acked write. The bridge
+/// answers `first un-acked entry's index − 1` (or `maxInt` when nothing
+/// is awaited). Pump-thread only.
+pub const DurabilizeFloor = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, gid: u64) u64,
 };
 
 /// Fired once per PUT in a committed writeset, AFTER it has applied to the
@@ -115,12 +169,18 @@ pub const CommitHook = struct {
 /// in-memory projection updates from. The control-plane `Directory`
 /// (`cp/directory.zig`) uses it: a CP follower has no local proposer, so its
 /// placement projection materializes from these replicated applies, not from
-/// `propose`. `key`/`value` borrow the decoded writeset bytes (valid only
-/// for the call). `null` for every non-CP node (the bridge sets it only when
-/// fronting the directory group).
+/// `propose`. The rewind worker uses it too (`onDeployApply`) to track
+/// replicated `_deploy/current` flips on followers. `id_str` is the tenant
+/// id the writeset TARGETED — for a `multi`'s cross-tenant inner that is
+/// the inner's id, NOT the anchor group's tenant (`""` for a root inner)
+/// — so observers must key tenant identity on it, never on `group_id`
+/// (which is only the group the entry committed through; the CP keeps
+/// using it to filter for the directory group). `key`/`value`/`id_str`
+/// borrow the decoded entry bytes (valid only for the call). `null` for
+/// every non-CP, non-worker node.
 pub const ApplyObserver = struct {
     ctx: *anyopaque,
-    func: *const fn (ctx: *anyopaque, group_id: u64, key: []const u8, value: []const u8) void,
+    func: *const fn (ctx: *anyopaque, group_id: u64, id_str: []const u8, key: []const u8, value: []const u8) void,
 };
 
 /// How committed entries apply to the tenant store (docs/v2-build-order.md
@@ -152,6 +212,13 @@ pub const Error = error{
     /// A committed entry named a group with no live tenant slot — an
     /// invariant violation (we only apply entries for groups we created).
     UnknownGroup,
+    /// A committed entry (or a `multi` inner) targeted a store this node
+    /// cannot resolve — a cross-tenant or root inner with no
+    /// `StoreResolver` set, or a resolver provisioning failure. An
+    /// invariant violation: the entry is committed in the log but its
+    /// writes have nowhere to land, so applying the rest of it would
+    /// silently diverge this replica.
+    UnroutedApply,
     /// `createGroupAtEpoch` was asked to attach a group id that already
     /// has a live slot — a double-attach orchestration bug.
     GroupExists,
@@ -195,6 +262,10 @@ pub const TenantSlot = struct {
     /// Whether this slot is in `Node.dirty` (committed since last durabilize),
     /// so `applyEntry` enqueues it at most once.
     in_dirty: bool = false,
+    /// Whether this slot is in `Node.persist_ack` (a `processReady` ran
+    /// whose buffered writes await the next fsync's `onPersist` ack), so
+    /// the pump enqueues it at most once per ack round.
+    in_persist_ack: bool = false,
     /// Borrowed `GroupedFileStorage` for this group — the Manager owns it (via
     /// the storage vtable) and frees it on `destroyGroup`, but we keep the
     /// pointer to drive WAL compaction (`gfs.compact`) without a Manager API.
@@ -248,6 +319,18 @@ pub const Node = struct {
     active: std.ArrayListUnmanaged(u64) = .empty,
     /// `pollReady` scratch, grown to `groups.count()` as groups are added.
     ready_buf: []u64 = &.{},
+    /// Second `pollReady` scratch for the post-fsync apply pass (pass 2
+    /// of `pump` — `ready_buf` still holds pass 1's ids at that point).
+    ready_buf2: []u64 = &.{},
+
+    /// Groups whose `processReady` buffered writes this (or a previous)
+    /// cycle and now await the post-fsync `mgr.onPersist` ack — the
+    /// async-append handshake (raft only counts this node's entries
+    /// toward the commit quorum once acked, and the persistence-
+    /// asserting messages stay stashed until then). Deduped via
+    /// `TenantSlot.in_persist_ack`; retained across a failed flush so
+    /// the ack retries after the next successful one. Pump-thread only.
+    persist_ack: std.ArrayListUnmanaged(u64) = .empty,
 
     /// Gids with committed-but-not-yet-durabilized writes (`applied_idx >
     /// durabilized_idx`). Enqueued by `applyEntry`, drained by
@@ -299,9 +382,31 @@ pub const Node = struct {
     /// Checked + cleared by `pump` after the round.
     apply_err: ?Error = null,
 
+    /// Commit notifications staged during the current `processReady`
+    /// round, fired (in apply order) only AFTER the cycle's `wal.flush()`
+    /// succeeds — the commit hook is the worker's durable-ack signal, so
+    /// it must not run ahead of the fsync (see `pump`). Reused per cycle.
+    commit_notify: std.ArrayListUnmanaged(CommitNotify) = .empty,
+
     /// Optional per-committed-entry notification (see `CommitHook`).
     /// Set by the bridge; left null by the Phase-1 inline tests.
     commit_hook: ?CommitHook = null,
+
+    /// Optional worker-overlay skip oracle (see `SkipQuery`). Set by the
+    /// bridge alongside `commit_hook`. When null, `worker_overlay` falls
+    /// back to the role-keyed `isLeader` skip (bare-node tests only —
+    /// every worker-fronted deployment sets it).
+    skip_query: ?SkipQuery = null,
+
+    /// Optional durabilize floor (see `DurabilizeFloor`). Set by the
+    /// bridge alongside `commit_hook`; trivially unconstrained
+    /// (`maxInt`) outside `worker_overlay` mode.
+    durabilize_floor: ?DurabilizeFloor = null,
+
+    /// Count of transport tick failures (rate-limited logging in `pump`
+    /// — a persistently broken transport must be operator-visible, not a
+    /// silently-swallowed partition).
+    transport_err_count: u64 = 0,
 
     /// Optional per-applied-put notification (see `ApplyObserver`). Set by
     /// the bridge for the control-plane directory group so a CP node's
@@ -448,7 +553,10 @@ pub const Node = struct {
         self.active.deinit(a);
         self.dirty.deinit(a);
         self.woke_scratch.deinit(a);
+        self.commit_notify.deinit(a);
+        self.persist_ack.deinit(a);
         a.free(self.ready_buf);
+        a.free(self.ready_buf2);
         a.free(self.voters);
         a.free(self.data_dir);
         a.destroy(self);
@@ -734,6 +842,22 @@ pub const Node = struct {
         if (self.ready_buf.len >= need) return;
         const grown = self.allocator.realloc(self.ready_buf, need) catch return Error.OutOfMemory;
         self.ready_buf = grown;
+        const grown2 = self.allocator.realloc(self.ready_buf2, need) catch return Error.OutOfMemory;
+        self.ready_buf2 = grown2;
+    }
+
+    /// Queue `gid` for the post-fsync `onPersist` ack (at most once per
+    /// round — see `persist_ack`). Pump-thread only.
+    fn notePersistAck(self: *Node, gid: u64) void {
+        const slot = self.groups.get(gid) orelse return;
+        if (slot.in_persist_ack) return;
+        slot.in_persist_ack = true;
+        self.persist_ack.append(self.allocator, gid) catch {
+            // Dropping the ack would stall the group's commits forever
+            // (raft never counts its entries); surface loudly instead.
+            slot.in_persist_ack = false;
+            self.apply_err = self.apply_err orelse Error.OutOfMemory;
+        };
     }
 
     // ── Hibernation active set (Phase 6) ─────────────────────────────
@@ -804,15 +928,27 @@ pub const Node = struct {
         }
     }
 
-    /// Propose a raw raft-log entry to `tenant_id`'s group. Returns once
-    /// the entry is staged in raft-rs's pending list — NOT once applied.
-    /// Drive `pump` to commit + apply it. A propose is activity, so it
-    /// wakes the group (`bumpActive`) — a hibernated tenant ticks again and
-    /// replicates the entry. Bump first so even a propose that raft-rs
-    /// rejects (non-leader) still re-ticks the group toward an election.
-    pub fn propose(self: *Node, tenant_id: u64, entry: []const u8) Error!void {
+    /// Propose an encoded envelope to `tenant_id`'s group with no origin
+    /// identity (hookless: tests, bare nodes — `origin = seq = 0` matches
+    /// no bridge, so the entry is never skipped and advances no
+    /// watermark). See `proposeFramed`.
+    pub fn propose(self: *Node, tenant_id: u64, env_bytes: []const u8) Error!void {
+        return self.proposeFramed(tenant_id, 0, 0, env_bytes);
+    }
+
+    /// Propose an encoded envelope stamped with the proposer's identity
+    /// (`envelope.EntryFrame`: the bridge's per-boot `origin` + the
+    /// per-tenant `seq`). Returns once the entry is staged in raft-rs's
+    /// pending list — NOT once applied. Drive `pump` to commit + apply
+    /// it. A propose is activity, so it wakes the group (`bumpActive`) —
+    /// a hibernated tenant ticks again and replicates the entry. Bump
+    /// first so even a propose that raft-rs rejects (non-leader) still
+    /// re-ticks the group toward an election.
+    pub fn proposeFramed(self: *Node, tenant_id: u64, origin: u64, seq: u64, env_bytes: []const u8) Error!void {
         try self.bumpActive(tenant_id);
-        try self.mgr.propose(tenant_id, entry);
+        const framed = try envelope.encodeEntryFrame(self.allocator, origin, seq, env_bytes);
+        defer self.allocator.free(framed);
+        try self.mgr.propose(tenant_id, framed);
     }
 
     /// Build a type-0 writeset envelope from `ws` and propose it, then
@@ -840,34 +976,114 @@ pub const Node = struct {
     /// Drive one ready cycle across the active set. Returns true if any
     /// group had committed entries to apply this cycle.
     ///
-    /// Mirrors rewind2's `pumpNode`: tick the active set, process every
-    /// ready group's committed entries, ONE `wal.flush()` for the whole
-    /// cycle (the load-bearing single-fsync constraint), then drain each
-    /// ready group's outbox and release it. Single-node has no peers, so
-    /// `takeMessages` drains to a no-op sink — but the drain+release is
-    /// still required to honour the pollReady/release pairing invariant.
+    /// The async-append pump (persist-before-quorum ordering): tick the
+    /// active set, then
+    ///
+    ///   pass 1: processReady every ready group — appends are BUFFERED
+    ///           into the shared WAL; committed entries handed out here
+    ///           were already durable (raft gates them on its persist
+    ///           watermark) and apply now
+    ///   fsync:  ONE `wal.flush()` for the whole cycle (the load-bearing
+    ///           single-fsync constraint)
+    ///   ack:    `mgr.onPersist` per buffered group — only now do this
+    ///           node's entries count toward the commit quorum, and only
+    ///           now do the stashed persistence-asserting messages
+    ///           (append acks / vote responses) reach the outboxes
+    ///   pass 2: the acks unlock commit advances — poll + apply the
+    ///           newly-committed entries in the same cycle
+    ///   hooks:  fire the staged commit notifications (everything applied
+    ///           this cycle is fsync-covered)
+    ///   drain:  takeMessages + release for both passes' groups.
+    ///
+    /// Single-node has no peers, so `takeMessages` drains to a no-op
+    /// sink — but the drain+release is still required to honour the
+    /// pollReady/release pairing invariant.
     pub fn pump(self: *Node) Error!bool {
         _ = self.mgr.tickGroups(self.active.items);
         const ready = self.mgr.pollReady(self.ready_buf);
 
         self.apply_err = null;
-        if (ready.len > 0) {
+        var ready2: []u64 = self.ready_buf2[0..0];
+        if (ready.len > 0 or self.persist_ack.items.len > 0) {
+            self.commit_notify.clearRetainingCapacity();
+            // Pass 1: append this round's writes (BUFFERED — the fsync is
+            // below) and apply committed entries that were already durable
+            // from earlier cycles (raft gates handed-out committed entries
+            // on its persist watermark). Every processed ready is queued
+            // for the post-fsync ack.
             for (ready) |g| {
                 self.mgr.processReady(g, applyCb, self) catch |e| {
                     self.apply_err = self.apply_err orelse mapRaftErr(e);
                 };
+                self.notePersistAck(g);
             }
 
             // ONE fsync per cycle regardless of how many groups committed.
-            self.wal.flush() catch {
-                self.apply_err = self.apply_err orelse Error.Io;
+            const flushed = blk: {
+                self.wal.flush() catch {
+                    self.apply_err = self.apply_err orelse Error.Io;
+                    break :blk false;
+                };
+                break :blk true;
             };
 
-            // Drain each ready group's outbox. Single-node: queued to a
-            // transport-less sink (a no-op). Multi-node: buffered per
-            // destination node, stamped with the group's migration epoch,
-            // for the coalesced flush below.
+            if (flushed) {
+                // Persist ack (the async-append handshake): the fsync now
+                // covers every buffered append, so tell raft — this is the
+                // point this node's entries start counting toward the
+                // commit quorum, and it releases the stashed persistence-
+                // asserting messages (append acks / vote responses) into
+                // the outboxes. On a failed flush the list is RETAINED:
+                // no ack, no acks on the wire, commits stay locked until
+                // a later successful fsync — never durability claimed for
+                // volatile bytes.
+                for (self.persist_ack.items) |g| {
+                    self.mgr.onPersist(g);
+                    if (self.groups.get(g)) |slot| slot.in_persist_ack = false;
+                }
+                self.persist_ack.clearRetainingCapacity();
+
+                // Pass 2: the acks commonly unlock a commit advance — the
+                // newly-committed entries surface as fresh readies. Apply
+                // them NOW so a single-node propose still commits within
+                // one pump cycle. Anything pass 2 buffers (typically the
+                // advanced commit index riding the next hard state) is
+                // covered by the NEXT cycle's fsync+ack — pass-2 groups
+                // re-enter `persist_ack`, and the `persist_ack.items.len`
+                // arm of the enclosing `if` guarantees that next round
+                // runs even if nothing else is ready.
+                ready2 = self.mgr.pollReady(self.ready_buf2);
+                for (ready2) |g| {
+                    self.mgr.processReady(g, applyCb, self) catch |e| {
+                        self.apply_err = self.apply_err orelse mapRaftErr(e);
+                    };
+                    self.notePersistAck(g);
+                }
+
+                // Fire the commit hook ONLY now: the hook advances the
+                // per-tenant watermark the worker acks clients on. Pass-1
+                // applies were durable before this cycle; pass-2 applies
+                // are covered by this cycle's fsync. On flush failure the
+                // notifications are DROPPED: parked workers time out →
+                // 503, the correct "unknown outcome" signal (never a
+                // false durable ack).
+                if (self.commit_hook) |h| {
+                    for (self.commit_notify.items) |n| h.func(h.ctx, n.gid, n.origin, n.seq, n.idx);
+                }
+            }
+            self.commit_notify.clearRetainingCapacity();
+
+            // Drain each ready group's outbox (both passes; `release` is
+            // dup-tolerant and re-notifies if work landed mid-round).
+            // Single-node: queued to a transport-less sink (a no-op).
+            // Multi-node: buffered per destination node, stamped with the
+            // group's migration epoch, for the coalesced flush below.
             for (ready) |g| {
+                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g) };
+                self.mgr.takeMessages(g, sendMsgCb, &sctx) catch {};
+                self.mgr.release(g);
+            }
+            for (ready2) |g| {
                 var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g) };
                 self.mgr.takeMessages(g, sendMsgCb, &sctx) catch {};
                 self.mgr.release(g);
@@ -883,7 +1099,19 @@ pub const Node = struct {
         // and inbound messages are stepped even on an otherwise idle node.
         if (self.transport) |t| {
             t.flush();
-            t.tick(now, 0) catch {};
+            t.tick(now, 0) catch |e| {
+                // A transport tick failure is a silent partition in the
+                // making (nothing sent or received this cycle) — log it
+                // rate-limited so a persistently broken transport is
+                // operator-visible instead of an unexplained quorum loss.
+                self.transport_err_count +%= 1;
+                if (self.transport_err_count == 1 or self.transport_err_count % 1000 == 0) {
+                    std.log.warn(
+                        "v2 node {d}: transport tick failed ({s}) — {d} failures so far",
+                        .{ self.node_id, @errorName(e), self.transport_err_count },
+                    );
+                }
+            };
             // Wake any group that received a NON-heartbeat message this cycle
             // (real raft traffic = work). Heartbeats are skipped on purpose
             // (§3.1) so a quiet group can't keep itself awake.
@@ -903,7 +1131,7 @@ pub const Node = struct {
             self.apply_err = null;
             return e;
         }
-        return ready.len > 0;
+        return ready.len > 0 or ready2.len > 0;
     }
 
     /// Checkpoint dirty stores (V2 port of V1's `Cluster.tickSnapshot`).
@@ -921,23 +1149,81 @@ pub const Node = struct {
         if (now - self.last_durabilize_ns < self.durabilize_interval_ns) return;
         self.last_durabilize_ns = now;
         const single = self.isSingleNode();
+        // Under the async-append flow the durable HardState.commit lags
+        // the live commit by one fsync (it rides the NEXT ready's hard
+        // state). Compaction must never truncate past a commit index that
+        // is not yet durable — a crash right after the truncate would
+        // recover hs.commit < first_index-1 and panic `RawNode::new`. One
+        // flush before the first compact of the tick closes the lag; lazy
+        // so a tick that compacts nothing pays nothing.
+        var compaction_flushed = false;
+        // Iterate with a retain cursor: a slot whose fold could not reach
+        // `applied_idx` this tick (durabilize floor below it, or a fold
+        // error) STAYS dirty so a later tick finishes the job — without
+        // this, a one-shot stamp left the un-foldable tail volatile
+        // forever (an idle tenant's last write never re-folded).
+        var keep: usize = 0;
         for (self.dirty.items) |gid| {
             const slot = self.groups.get(gid) orelse continue;
-            slot.in_dirty = false;
-            if (slot.applied_idx <= slot.durabilized_idx) continue;
-            const store = self.writeStore(slot) orelse continue;
-            store.setLastAppliedRaftIdx(slot.applied_idx) catch |e| {
+            // The fold target: how far the store's overlay actually covers.
+            // In worker_overlay mode a skipped entry's writes sit in the
+            // worker's OPEN txn until the worker acks (`noteWorkerCommitted`)
+            // — folding/stamping/compacting past it would claim durability
+            // for data the fold cannot see (crash ⇒ acked write lost, WAL
+            // already truncated). The bridge's floor is `maxInt` when
+            // nothing is awaited.
+            var target = slot.applied_idx;
+            if (self.durabilize_floor) |f| target = @min(target, f.func(f.ctx, gid));
+            if (target <= slot.durabilized_idx) {
+                // Nothing foldable yet — keep the slot dirty and retry
+                // next tick (the worker ack raises the floor).
+                self.dirty.items[keep] = gid;
+                keep += 1;
+                continue;
+            }
+            const store = self.storeFor(slot, slot.id_str) orelse {
+                // Resolver failure — retry next tick rather than
+                // stranding an in_dirty=true slot outside the list.
+                self.dirty.items[keep] = gid;
+                keep += 1;
+                continue;
+            };
+            store.setLastAppliedRaftIdx(target) catch |e| {
                 std.log.warn("v2 durabilize gid={d}: {s}", .{ gid, @errorName(e) });
+                self.dirty.items[keep] = gid;
+                keep += 1;
                 continue;
             };
             if (single and self.compact_wal) {
-                slot.gfs.compact(slot.applied_idx) catch |e| {
+                if (!compaction_flushed) {
+                    self.wal.flush() catch |e| {
+                        // Can't make the commit index durable — skip ALL
+                        // compaction this tick (the stamp above already
+                        // happened, which is fine: durabilize ≠ truncate).
+                        std.log.warn("v2 wal pre-compact flush: {s}", .{@errorName(e)});
+                        slot.durabilized_idx = target;
+                        if (slot.applied_idx > target) {
+                            self.dirty.items[keep] = gid;
+                            keep += 1;
+                        } else slot.in_dirty = false;
+                        continue;
+                    };
+                    compaction_flushed = true;
+                }
+                slot.gfs.compact(target) catch |e| {
                     std.log.warn("v2 wal compact gid={d}: {s}", .{ gid, @errorName(e) });
                 };
             }
-            slot.durabilized_idx = slot.applied_idx;
+            slot.durabilized_idx = target;
+            if (slot.applied_idx > target) {
+                // Partially folded (floor held back the tail): stay dirty.
+                self.dirty.items[keep] = gid;
+                keep += 1;
+            } else {
+                slot.in_dirty = false;
+            }
         }
-        self.dirty.clearRetainingCapacity();
+        self.dirty.shrinkRetainingCapacity(keep);
     }
 
     /// Enqueue `slot` for the next `durabilizeTick` if not already (its
@@ -996,24 +1282,48 @@ pub const Node = struct {
         // election). Nothing to apply.
         if (len == 0) return;
         const bytes = data[0..len];
-        self.applyEntry(group_id, index, bytes) catch |e| {
+        const frame = envelope.decodeEntryFrame(bytes) catch |e| {
             self.apply_err = e;
             return;
         };
-        // The entry committed + applied cleanly: notify the bridge so it
-        // can advance the tenant's committed_seq watermark. Fires only on
-        // the success path, so the leader's empty election no-op (len==0,
-        // returned above) and any undecodable entry (apply_err, returned
-        // above) never advance a tenant's watermark.
-        if (self.commit_hook) |h| h.func(h.ctx, group_id, index);
+        self.applyEntry(group_id, index, frame) catch |e| {
+            self.apply_err = e;
+            return;
+        };
+        // The entry committed + applied cleanly: STAGE the bridge
+        // notification (advancing the tenant's committed_seq watermark).
+        // `pump` fires it after the cycle's `wal.flush()` succeeds — the
+        // watermark is the durable-ack signal, so it must not run ahead
+        // of the fsync. Staged only on the success path, so the leader's
+        // empty election no-op (len==0, returned above) and any
+        // undecodable entry (apply_err, returned above) never advance a
+        // tenant's watermark. A staging failure (OOM) is surfaced as an
+        // apply error rather than silently losing the waiter's wakeup.
+        if (self.commit_hook != null) {
+            self.commit_notify.append(self.allocator, .{
+                .gid = group_id,
+                .origin = frame.origin,
+                .seq = frame.seq,
+                .idx = index,
+            }) catch {
+                self.apply_err = Error.OutOfMemory;
+            };
+        }
     }
 
-    fn applyEntry(self: *Node, group_id: u64, index: u64, bytes: []const u8) Error!void {
-        const env = try envelope.decode(bytes);
+    fn applyEntry(self: *Node, group_id: u64, index: u64, frame: envelope.EntryFrame) Error!void {
+        const env = try envelope.decode(frame.env_bytes);
         // Decide whether the pump writes the store, or only advances the
         // watermark (the worker's TrackedTxn.commit is the durable write).
-        // `worker_overlay` makes that role-aware: skip on the leader (the
-        // worker wrote it), write on a follower (no worker here).
+        // `worker_overlay` keys this on PROVENANCE via the bridge's
+        // `skip_query`: skip iff the entry is this node's own live propose
+        // (origin matches and the seq's worker txn is still pending —
+        // that txn IS the store write). Everything else is written by the
+        // pump: a follower's replicated entries, a freshly-elected
+        // leader's catch-up entries proposed elsewhere, a replayed entry
+        // at recovery (no live txns at boot), and an entry whose local
+        // waiter already gave up (fault/timeout rolled the txn back and
+        // abandoned the seq).
         const skip_store = if (self.recovering)
             // Replaying the WAL at restart: there is no worker to have written
             // the store, so the pump MUST write it (and durabilize the tail).
@@ -1021,7 +1331,12 @@ pub const Node = struct {
         else switch (self.apply_mode) {
             .apply_on_commit => false,
             .leader_skip => true,
-            .worker_overlay => self.mgr.isLeader(group_id),
+            .worker_overlay => blk: {
+                if (self.skip_query) |q|
+                    break :blk q.func(q.ctx, group_id, frame.origin, frame.seq);
+                // No bridge (bare-node tests): the old role-keyed skip.
+                break :blk self.mgr.isLeader(group_id);
+            },
         };
         if (skip_store) {
             // We still decode (above) so a stale/unknown envelope type
@@ -1036,17 +1351,15 @@ pub const Node = struct {
             }
             return;
         }
+        const slot = self.groups.get(group_id) orelse return Error.UnknownGroup;
         switch (env.type) {
             .writeset => {
-                const slot = self.groups.get(group_id) orelse return Error.UnknownGroup;
-                const store = self.writeStore(slot) orelse return Error.UnknownGroup;
+                const store = self.storeFor(slot, env.id) orelse return Error.UnroutedApply;
                 // Strip the readset frame; apply the writeset bytes (the
                 // readset rides for the tape, not the store).
                 const wp = try envelope.decodeWriteSetPayload(env.payload);
-                try writeset.applyEncoded(store, index, wp.ws_bytes);
-                slot.applied_idx = index;
-                self.markDirty(slot);
-                self.notifyApply(group_id, wp.ws_bytes);
+                try writeset.applyEncodedDirect(store, index, wp.ws_bytes);
+                self.notifyApply(group_id, env.id, wp.ws_bytes);
             },
             .multi => {
                 const inner = try envelope.decodeMultiInner(self.allocator, env.payload);
@@ -1055,60 +1368,78 @@ pub const Node = struct {
                     const ie = try envelope.decode(inner_bytes);
                     switch (ie.type) {
                         .writeset => {
-                            // Inner writesets may target any tenant; in
-                            // Phase 1 the only stores that exist are this
-                            // node's, so route by the same group's slot.
-                            const slot = self.groups.get(group_id) orelse return Error.UnknownGroup;
-                            const store = self.writeStore(slot) orelse return Error.UnknownGroup;
+                            // Inner writesets route by THEIR OWN id — an
+                            // admin batch's cross-tenant trampoline inner
+                            // (`proposeBatch` targets) names a tenant
+                            // other than the anchor group's, and writing
+                            // it into the anchor's store would corrupt
+                            // both tenants on a follower / at recovery
+                            // replay.
+                            const store = self.storeFor(slot, ie.id) orelse return Error.UnroutedApply;
                             const wp = try envelope.decodeWriteSetPayload(ie.payload);
-                            try writeset.applyEncoded(store, index, wp.ws_bytes);
-                            slot.applied_idx = index;
-                            self.markDirty(slot);
-                            self.notifyApply(group_id, wp.ws_bytes);
+                            try writeset.applyEncodedDirect(store, index, wp.ws_bytes);
+                            self.notifyApply(group_id, ie.id, wp.ws_bytes);
                         },
                         .multi => return envelope.Error.NestedMulti,
-                        // root_writeset inside a multi: Phase 2+ (control
-                        // plane). No root store in the Phase-1 pump.
-                        .root_writeset => return Error.UnknownGroup,
+                        // A root inner (`platform.root.*` riding the admin
+                        // batch). Raw writeset payload — root envelopes
+                        // are not readset-framed.
+                        .root_writeset => {
+                            const store = self.storeFor(slot, "") orelse return Error.UnroutedApply;
+                            try writeset.applyEncodedDirect(store, index, ie.payload);
+                            self.notifyApply(group_id, "", ie.payload);
+                        },
                     }
                 }
             },
-            // The root store + its producer (provisionInstance / admin)
-            // arrive in Phase 2+. The Phase-1 pump has per-tenant stores
-            // only, so a stray root_writeset is an invariant violation.
-            .root_writeset => return Error.UnknownGroup,
+            // A bare root writeset (rides the reserved root group, whose
+            // slot id is `""` — so the no-resolver fallback in `storeFor`
+            // routes it to that group's own slot store). Raw payload (no
+            // readset frame).
+            .root_writeset => {
+                const store = self.storeFor(slot, "") orelse return Error.UnroutedApply;
+                try writeset.applyEncodedDirect(store, index, env.payload);
+                self.notifyApply(group_id, "", env.payload);
+            },
         }
+        // One entry applied (all inners included): advance the group's
+        // applied index and queue it for the durabilize checkpoint.
+        slot.applied_idx = index;
+        self.markDirty(slot);
     }
 
-    /// The store a follower's (or `apply_on_commit`'s) committed writeset
-    /// applies to. In `worker_overlay` mode with a `store_resolver` set
-    /// (the bridge fronting a worker), this is the worker's own per-tenant
-    /// serving store — so a follower's replicated writes land in the SAME
-    /// store the worker serves from, and a follower promoted to leader
-    /// serves the data it replicated (Phase 5 "Full HA"). Without a resolver
-    /// (the bare-node multi-node + Phase-1 tests) it is the node's own slot
-    /// store. Null only when the resolver fails to provision (→ surfaced as
-    /// `UnknownGroup` by the caller).
-    fn writeStore(self: *Node, slot: *TenantSlot) ?*KvStore {
-        if (self.apply_mode == .worker_overlay) {
-            if (self.store_resolver) |r| return r.func(r.ctx, slot.tenant_id, slot.id_str);
-        }
-        return slot.store;
+    /// The store a committed writeset (or `multi` inner) targeting `id_str`
+    /// applies to. With a `store_resolver` set (the bridge fronting a
+    /// worker), the resolver routes by id — the worker's own per-tenant
+    /// serving store for a tenant id, the node-wide root store for `""` —
+    /// so a follower's replicated writes (including an admin batch's
+    /// cross-tenant inners) land in the SAME stores the worker serves from
+    /// (Phase 5 "Full HA"). Without a resolver (the bare-node multi-node +
+    /// Phase-1 tests, the CP) only the group's OWN id routes — to the slot
+    /// store; a cross-tenant or root target has nowhere to land and
+    /// surfaces as null (→ `UnroutedApply`, an invariant violation: those
+    /// producers only exist on worker-fronted nodes, which set a resolver).
+    fn storeFor(self: *Node, slot: *TenantSlot, id_str: []const u8) ?*KvStore {
+        if (self.store_resolver) |r| return r.func(r.ctx, slot.tenant_id, id_str);
+        if (std.mem.eql(u8, id_str, slot.id_str)) return slot.store;
+        return null;
     }
 
     /// Fire the `apply_observer` (if set) once per PUT in a just-applied
-    /// writeset. Re-decodes the writeset bytes — cheap for the directory's
-    /// single-op writes, and only ever set on the CP. Best-effort: the bytes
-    /// already applied cleanly via `applyEncoded`, so a decode error here is
-    /// not propagated (it would only mean a stale projection, recovered on
-    /// the next apply / restart scan).
-    fn notifyApply(self: *Node, group_id: u64, ws_bytes: []const u8) void {
+    /// writeset. `id_str` is the tenant id the writeset targeted (the
+    /// inner's id for a multi inner, `""` for a root writeset). Re-decodes
+    /// the writeset bytes — cheap for the single-op writes the observers
+    /// care about. Best-effort: the bytes already applied cleanly via
+    /// `applyEncoded`, so a decode error here is not propagated (it would
+    /// only mean a stale projection, recovered on the next apply / restart
+    /// scan).
+    fn notifyApply(self: *Node, group_id: u64, id_str: []const u8, ws_bytes: []const u8) void {
         const obs = self.apply_observer orelse return;
         var ops: std.ArrayListUnmanaged(writeset.Op) = .empty;
         defer ops.deinit(self.allocator);
         writeset.decodeOps(ws_bytes, self.allocator, &ops) catch return;
         for (ops.items) |op| switch (op) {
-            .put => |p| obs.func(obs.ctx, group_id, p.key, p.value),
+            .put => |p| obs.func(obs.ctx, group_id, id_str, p.key, p.value),
             // The directory never deletes; ignore (a future deleting producer
             // would extend the observer with a delete arm).
             .delete => {},
@@ -1451,6 +1782,148 @@ test "two tenants get independent stores on the same node" {
     const b_who = try node.get(2, "who");
     defer a.free(b_who);
     try testing.expectEqualStrings("bob", b_who);
+}
+
+test "multi: inner writesets route by INNER id (cross-tenant + root) through the resolver" {
+    // The admin-batch shape (`raft_propose.zig proposeBatch`): one multi
+    // through the ANCHOR tenant's group carrying [anchor ws, cross-tenant
+    // target ws, root ws]. Apply must route each inner by ITS id — the
+    // old slot-routed apply wrote the target's keys into the anchor's
+    // store on a follower (cross-tenant corruption) and errored on the
+    // root inner.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const node = try Node.initSingleNode(a, dir);
+    defer node.deinit();
+
+    // Simulated worker stores: anchor ("admin"), target ("acme"), root ("").
+    const open = struct {
+        fn open(alloc: std.mem.Allocator, base: []const u8, name: []const u8) !*KvStore {
+            const p = try std.fmt.allocPrintSentinel(alloc, "{s}/{s}.db", .{ base, name }, 0);
+            defer alloc.free(p);
+            return KvStore.open(alloc, p);
+        }
+    }.open;
+    const anchor_store = try open(a, dir, "w-admin");
+    defer anchor_store.close();
+    const target_store = try open(a, dir, "w-acme");
+    defer target_store.close();
+    const root_store = try open(a, dir, "w-root");
+    defer root_store.close();
+
+    const Resolver = struct {
+        anchor: *KvStore,
+        target: *KvStore,
+        root: *KvStore,
+        fn resolve(ctx: *anyopaque, group_id: u64, id_str: []const u8) ?*KvStore {
+            _ = group_id;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (id_str.len == 0) return self.root;
+            if (std.mem.eql(u8, id_str, "admin")) return self.anchor;
+            if (std.mem.eql(u8, id_str, "acme")) return self.target;
+            return null;
+        }
+    };
+    var res: Resolver = .{ .anchor = anchor_store, .target = target_store, .root = root_store };
+    node.store_resolver = .{ .ctx = &res, .func = Resolver.resolve };
+
+    const gid: u64 = 77;
+    const slot = try node.ensureGroup(gid, "admin");
+
+    // Build the three inners.
+    var ws_a = WriteSet.init(a);
+    defer ws_a.deinit();
+    try ws_a.addPut("anchor-key", "anchor-val");
+    const ws_a_bytes = try ws_a.encode(a);
+    defer a.free(ws_a_bytes);
+    const e_anchor = try envelope.encodeWriteSet(a, "admin", ws_a_bytes);
+    defer a.free(e_anchor);
+
+    var ws_t = WriteSet.init(a);
+    defer ws_t.deinit();
+    try ws_t.addPut("target-key", "target-val");
+    const ws_t_bytes = try ws_t.encode(a);
+    defer a.free(ws_t_bytes);
+    const e_target = try envelope.encodeWriteSet(a, "acme", ws_t_bytes);
+    defer a.free(e_target);
+
+    var ws_r = WriteSet.init(a);
+    defer ws_r.deinit();
+    try ws_r.addPut("instance/acme", "1");
+    const ws_r_bytes = try ws_r.encode(a);
+    defer a.free(ws_r_bytes);
+    const e_root = try envelope.encodeRootWriteSet(a, ws_r_bytes);
+    defer a.free(e_root);
+
+    const multi = try envelope.encodeMulti(a, &.{ e_anchor, e_target, e_root });
+    defer a.free(multi);
+
+    const before = slot.applied_idx;
+    try node.propose(gid, multi);
+    var spins: u32 = 0;
+    while (slot.applied_idx == before and spins < 200) : (spins += 1) {
+        _ = try node.pump();
+    }
+    try testing.expect(slot.applied_idx > before);
+
+    // Each inner landed in ITS tenant's store…
+    const av = try anchor_store.get("anchor-key");
+    defer a.free(av);
+    try testing.expectEqualStrings("anchor-val", av);
+    const tv = try target_store.get("target-key");
+    defer a.free(tv);
+    try testing.expectEqualStrings("target-val", tv);
+    const rv = try root_store.get("instance/acme");
+    defer a.free(rv);
+    try testing.expectEqualStrings("1", rv);
+
+    // …and did NOT leak into the anchor's store (the old corruption).
+    try testing.expectError(Error.NotFound, anchor_store.get("target-key"));
+    try testing.expectError(Error.NotFound, anchor_store.get("instance/acme"));
+}
+
+test "multi: a cross-tenant inner with no resolver fails loud (UnroutedApply)" {
+    // A bare node (no worker, no resolver) has nowhere to land a
+    // cross-tenant inner — applying it to the anchor's store would be the
+    // exact corruption the routing fix removes, so it must surface as an
+    // invariant violation instead of applying silently.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const node = try Node.initSingleNode(a, dir);
+    defer node.deinit();
+
+    const gid: u64 = 5;
+    _ = try node.ensureGroup(gid, "t1");
+
+    var ws = WriteSet.init(a);
+    defer ws.deinit();
+    try ws.addPut("k", "v");
+    const ws_bytes = try ws.encode(a);
+    defer a.free(ws_bytes);
+    const e_other = try envelope.encodeWriteSet(a, "other-tenant", ws_bytes);
+    defer a.free(e_other);
+    const multi = try envelope.encodeMulti(a, &.{e_other});
+    defer a.free(multi);
+
+    try node.propose(gid, multi);
+    var got: ?Error = null;
+    var spins: u32 = 0;
+    while (got == null and spins < 200) : (spins += 1) {
+        _ = node.pump() catch |e| {
+            got = e;
+        };
+    }
+    try testing.expectEqual(@as(?Error, Error.UnroutedApply), got);
+    // The mis-addressed write never reached the anchor's store.
+    try testing.expectError(Error.NotFound, node.get(gid, "k"));
 }
 
 // ── Phase 6: hibernation / active-set ─────────────────────────────────

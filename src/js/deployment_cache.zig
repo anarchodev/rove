@@ -1122,7 +1122,14 @@ fn mirrorDeployConfig(
         &ws,
         slot.instance_id,
         "",
-    )) |_| {} else |err| {
+    )) |proposed| {
+        // The txn committed above (immediate-commit producer): its
+        // writes are already fold-visible, so pre-ack the durabilize
+        // floor for this seq (the bridge keeps an acked high-water, so
+        // acking before the entry commits is safe and prevents the
+        // fire-and-forget propose from pinning the floor forever).
+        raft.noteWorkerCommitted(proposed.group_id, proposed.seq);
+    } else |err| {
         // Local commit is already durable on the leader; followers
         // re-derive on their next reload. Log, don't fail the deploy.
         std.log.warn(
@@ -1190,7 +1197,13 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
     // the deployment load (missing config is visible + self-heals on
     // the next reload).
     if (slot.raft) |raft| {
-        if (raft.isLeader()) {
+        // Per-TENANT leadership gate (the no-arg `isLeader()` is the V1
+        // node-wide shim and is unconditionally true on the bridge — a
+        // follower would propose, get rejected by raft, and needlessly
+        // fault the tenant's in-flight writes). registerTenant is
+        // idempotent and makes the gid resolvable.
+        const mirror_gid = raft.registerTenant(slot.instance_id) catch 0;
+        if (mirror_gid != 0 and raft.isLeaderOf(mirror_gid)) {
             mirrorDeployConfig(allocator, slot, raft, manifest, bs) catch |err|
                 std.log.warn(
                     "reloadDeployment: config mirror {s}/{d} failed: {s}",
@@ -1377,7 +1390,10 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
     // marker via the leader's raft propose and skip on their own
     // reload.
     if (slot.raft) |raft| {
-        if (raft.isLeader()) {
+        // Per-TENANT leadership gate (see the config-mirror gate above —
+        // the no-arg `isLeader()` shim is unconditionally true).
+        const boot_gid = raft.registerTenant(slot.instance_id) catch 0;
+        if (boot_gid != 0 and raft.isLeaderOf(boot_gid)) {
             enqueueBootSubscriptions(slot, new_snap) catch |err|
                 std.log.warn(
                     "rove-js: tenant {s} boot enqueue: {s}",

@@ -483,7 +483,11 @@ pub const Directory = struct {
     /// the mutex — the seam by which a CP follower (no local proposer) stays
     /// in sync, and the leader's own writes land. Best-effort: a parse error
     /// is logged, not fatal (the durable store remains the source of truth).
-    fn onApply(ctx: *anyopaque, gid: u64, key: []const u8, value: []const u8) void {
+    fn onApply(ctx: *anyopaque, gid: u64, id_str: []const u8, key: []const u8, value: []const u8) void {
+        // `id_str` (the writeset's target tenant id) is unused: the
+        // directory filters on its own group id — every entry in that
+        // group is a directory write.
+        _ = id_str;
         const self: *Directory = @ptrCast(@alignCast(ctx));
         if (gid != self.dir_gid) return;
         self.mutex.lock();

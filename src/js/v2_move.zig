@@ -230,6 +230,12 @@ fn commitWrite(worker: anytype, allocator: std.mem.Allocator, tenant: []const u8
     txn.commit() catch return 500;
 
     const proposed = raft_propose.proposeWriteSet(worker, &ws, tenant, "") catch return 503;
+    // The txn committed BEFORE the propose (immediate-commit path): its
+    // writes are already fold-visible, so release the durabilize floor
+    // the bridge would otherwise hold for this skipped own-propose. Safe
+    // to ack pre-commit — the bridge keeps an acked high-water and never
+    // tracks an already-acked seq.
+    worker.raft.noteWorkerCommitted(proposed.group_id, proposed.seq);
     if (!awaitCommit(worker, proposed.group_id, proposed.seq)) return 504;
     return 0;
 }
@@ -270,6 +276,19 @@ fn handleBundle(
     if (!awaitCommit(worker, gid, drained_to)) {
         worker.raft.unquiesce(gid);
         return reply(server, allocator, ent, sid, sess, 504, "drain timed out\n");
+    }
+    // `committedSeq >= drained_to` proves raft commit + apply-skip, but a
+    // parked customer write's TrackedTxn only promotes into the store in
+    // drainRaftPending — which runs between dispatches on THIS worker
+    // thread, so it cannot make progress while we block here, and a dump
+    // taken now would silently MISS raft-committed writes (the move then
+    // destroys the source group → acked data lost). Reply 423: the CP
+    // retries shortly; between attempts the worker loop drains and the
+    // overlay catches up. The quiesce stays held across retries (no new
+    // writes; same keep-quiesced contract as the 200 path — an abandoned
+    // move releases it via v2-resume).
+    if (!worker.raft.workerAckedThrough(gid, drained_to)) {
+        return reply(server, allocator, ent, sid, sess, 423, "overlay drain in progress; retry\n");
     }
 
     const inst = (worker.node.tenant.getInstance(tenant) catch null) orelse {

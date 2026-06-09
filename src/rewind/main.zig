@@ -126,12 +126,21 @@ const WorkerCtx = struct {
 /// replicated `_deploy/current` marker and enqueues a load so the follower
 /// tracks the tenant's current deployment continuously — see
 /// `DeploymentCache.enqueueDeployment` for why. `ctx` is `*NodeState`.
-fn onDeployApply(ctx: *anyopaque, gid: u64, key: []const u8, value: []const u8) void {
+///
+/// `id_str` is the tenant the writeset TARGETED — for a release published
+/// through the admin batch (a `multi` cross-tenant inner) that is the
+/// release's target tenant, NOT the admin anchor whose group carried the
+/// entry, so it must come from the observer (the old `idStrForGid(gid)`
+/// lookup resolved the anchor and enqueued the wrong tenant's deployment).
+/// Borrowed for the call; the loader dups it. Empty for root writesets
+/// (no `_deploy/current` key there — the key check filters them).
+fn onDeployApply(ctx: *anyopaque, gid: u64, id_str: []const u8, key: []const u8, value: []const u8) void {
+    _ = gid;
     if (!std.mem.eql(u8, key, "_deploy/current")) return;
+    if (id_str.len == 0) return;
     const node: *rjs.NodeState = @ptrCast(@alignCast(ctx));
     const dep_id = std.fmt.parseInt(u64, value, 16) catch return;
-    const tenant_id = node.raft.idStrForGid(gid) orelse return;
-    node.deploy.enqueueDeployment(tenant_id, dep_id);
+    node.deploy.enqueueDeployment(id_str, dep_id);
 }
 
 fn runPromotionHook(worker: anytype, worker_idx: usize) void {
@@ -237,23 +246,95 @@ fn workerMain(args: *WorkerCtx) !void {
     }
 }
 
-// ── Full-HA follower-apply store resolver ─────────────────────────────
+// ── Full-HA follower-apply store resolver (two-handle model) ──────────
 
-/// `bridge.StoreResolver.func`: resolve the worker's per-tenant serving
-/// store (`inst.kv`) for a follower's replicated apply, provisioning the
-/// instance on first sight. Runs on the pump thread; `Tenant` is internally
-/// locked (`maps_mutex`), so on-demand provisioning is safe alongside the
-/// worker thread. `gid` is unused — the worker keys its instance store on
-/// the tenant id string the envelope carries. Returns null only on a
-/// provisioning failure (surfaced by the apply round as `UnknownGroup`).
-fn resolveTenantStore(ctx: *anyopaque, gid: u64, id_str: []const u8) ?*kv.KvStore {
-    _ = gid;
-    const tenant: *tenant_mod.Tenant = @ptrCast(@alignCast(ctx));
-    if (tenant.getInstance(id_str) catch null) |inst| return inst.kv;
-    tenant.createInstance(id_str) catch return null;
-    const inst = (tenant.getInstance(id_str) catch null) orelse return null;
-    return inst.kv;
-}
+/// Pump-side store handles — the TWO-HANDLE model. The pump must NEVER
+/// use the worker's per-tenant `KvStore` handles: a handle carries
+/// per-batch txn state (`active_txn`), so sharing one across the pump
+/// and worker threads let a follower-apply land its writes INSIDE the
+/// worker's concurrently-open speculative txn (silent corruption: the
+/// replicated entry's data then rode the worker txn's commit/rollback)
+/// or trip on its lease/txn state mid-mutation — the intermittent
+/// `Sqlite` pump panic the failover smoke caught once apply failures
+/// became fatal. Each resolved id instead gets a PUMP-OWNED sibling
+/// handle attached into the SAME manifest at the SAME store id: the
+/// underlying store state (kvexp `TenantState` — overlay, LMDB, lease)
+/// is per store-id and internally locked, so the data stays unified
+/// (the worker serves exactly what the pump applies — the Phase-5
+/// store-unification requirement) while the per-handle txn state stays
+/// private to the pump. Cross-handle writes serialize on kvexp's
+/// blocking per-store lease.
+///
+/// All fields are pump-thread-only after init (the resolver runs
+/// exclusively on the pump thread; boot recovery runs before the pump
+/// thread starts, on the boot thread, which is the same exclusivity).
+const PumpStores = struct {
+    allocator: std.mem.Allocator,
+    tenant: *tenant_mod.Tenant,
+    /// id_str (owned dup) → pump-owned sibling handle.
+    map: std.StringHashMapUnmanaged(*kv.KvStore) = .empty,
+    /// Pump-owned sibling of the node-wide `__root__` store.
+    root_handle: ?*kv.KvStore = null,
+
+    fn deinit(self: *PumpStores) void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            e.value_ptr.*.close();
+            self.allocator.free(e.key_ptr.*);
+        }
+        self.map.deinit(self.allocator);
+        if (self.root_handle) |h| h.close();
+    }
+
+    /// `bridge.StoreResolver.func`: resolve the pump's handle for a
+    /// replicated apply, provisioning the worker-side instance on first
+    /// sight (so blob dirs + the serving handle exist the moment a
+    /// request lands). `gid` is unused — stores key on the tenant id
+    /// string the envelope carries. Per the `StoreResolver` contract
+    /// the EMPTY id resolves the node-wide root store (`__root__`) —
+    /// the target of `platform.root.*` root-writeset inners riding an
+    /// admin batch. Returns null only on a provisioning failure
+    /// (surfaced by the apply round as `UnroutedApply`).
+    fn resolve(ctx: *anyopaque, gid: u64, id_str: []const u8) ?*kv.KvStore {
+        _ = gid;
+        const self: *PumpStores = @ptrCast(@alignCast(ctx));
+        if (id_str.len == 0) {
+            if (self.root_handle) |h| return h;
+            const h = kv.KvStore.attachSibling(
+                self.allocator,
+                self.tenant.root,
+                kv.hashStoreId("__root__"),
+                null,
+            ) catch return null;
+            self.root_handle = h;
+            return h;
+        }
+        if (self.map.get(id_str)) |h| return h;
+        // Provision the worker-side instance first (idempotent;
+        // `Tenant` is internally locked, so this is safe alongside the
+        // worker thread), then attach the pump's own sibling handle —
+        // sharing the instance's seq counter so write-version minting
+        // stays globally monotonic across both handles.
+        self.tenant.createInstance(id_str) catch return null;
+        const inst = (self.tenant.getInstance(id_str) catch null) orelse return null;
+        const h = kv.KvStore.attachSibling(
+            self.allocator,
+            self.tenant.root,
+            kv.hashStoreId(id_str),
+            inst.kv.counter,
+        ) catch return null;
+        const key = self.allocator.dupe(u8, id_str) catch {
+            h.close();
+            return null;
+        };
+        self.map.put(self.allocator, key, h) catch {
+            self.allocator.free(key);
+            h.close();
+            return null;
+        };
+        return h;
+    }
+};
 
 // ── Multi-node (Phase 5) config ───────────────────────────────────────
 
@@ -418,6 +499,13 @@ pub fn main() !void {
         if (suffix.len > 0) try node_tenant.setPublicSuffix(suffix);
     }
 
+    // Pump-side store handles (two-handle model — see `PumpStores`).
+    // Declared BEFORE the bridge so its deinit (LIFO) runs AFTER
+    // `bridge.deinit` joins the pump thread — the resolver's handles
+    // must outlive every pump-thread apply.
+    var pump_stores = PumpStores{ .allocator = allocator, .tenant = node_tenant };
+    defer pump_stores.deinit();
+
     // The V2 per-tenant raft bridge + its pump thread. Leader-skip: the
     // worker owns the speculative overlay. Single node by default; a
     // multi-node (Phase 5 HA) node is configured by env — this node's
@@ -432,13 +520,13 @@ pub fn main() !void {
     bridge.setWorkerOverlay();
     // Full-HA store unification (Phase 5): a FOLLOWER has no worker serving
     // this tenant, so its replicated writes must land in the SAME store a
-    // worker WOULD serve from — the tenant's `inst.kv`, provisioned on
-    // demand — so a follower promoted to leader after a failover serves the
-    // data it replicated. Wire the pump's follower-apply at the node tenant
-    // (set BEFORE startPump so the first replicated entry already routes
-    // here). On a single node this is never consulted (the sole voter leads
-    // every group → leader-skip), so it is a no-op there.
-    bridge.setStoreResolver(.{ .ctx = node_tenant, .func = resolveTenantStore });
+    // worker WOULD serve from — the same manifest + store id the tenant's
+    // `inst.kv` serves, via the pump's OWN sibling handle (two-handle
+    // model, see `PumpStores`) — so a follower promoted to leader after a
+    // failover serves the data it replicated, without the pump ever
+    // touching the worker handle's txn state. Set BEFORE startPump so the
+    // first replicated entry already routes here.
+    bridge.setStoreResolver(.{ .ctx = &pump_stores, .func = PumpStores.resolve });
     // Boot-time group recovery: re-stand-up the tenant raft groups this node
     // persisted (its node-local manifest) so a restarted node rejoins its
     // groups and catches up to the live state — the leader replicates the

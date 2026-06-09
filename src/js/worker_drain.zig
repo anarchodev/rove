@@ -140,8 +140,13 @@ fn drainEntityArm(
             // commit; later siblings see `.absent`. `.conflict`
             // (kvexp NotChainHead) retries next tick. The entity move
             // is the `parked_units` arm's job — nothing else here.
-            switch (self.worker.pending_txns.commitAndTake(self.allocator, self.waits[i].seq)) {
-                .took, .absent, .conflict => {},
+            switch (self.worker.pending_txns.commitAndTake(self.allocator, self.waits[i].group_id, self.waits[i].seq)) {
+                // The txn promoted into the store's main overlay: release
+                // the durabilize floor for this seq (the pump skipped the
+                // entry's store write on this txn's behalf and has been
+                // holding the watermark/compaction below it).
+                .took => self.worker.raft.noteWorkerCommitted(self.waits[i].group_id, self.waits[i].seq),
+                .absent, .conflict => {},
                 .failed => |err| panic_mod.invariantViolated(
                     site_label ++ ".commit",
                     "seq={d} err={s}",
@@ -149,9 +154,17 @@ fn drainEntityArm(
                 ),
             }
         }
+        /// Deadline passed, not bridge-faulted: request a pump-side
+        /// fault and stay parked (see `effect.SweepClass.timeout` — a
+        /// unilateral rollback here races the pump's worker-overlay
+        /// skip decision for this very entry). The next tick resolves
+        /// to `.commit` (it landed after all) or `.fault` (below).
+        pub fn timeoutAt(self: *@This(), i: usize) void {
+            self.worker.raft.requestFault(self.waits[i].group_id, self.waits[i].seq);
+        }
         pub fn faultAt(self: *@This(), i: usize) !void {
             const ent = self.entities[i];
-            switch (self.worker.pending_txns.rollbackAndTake(self.allocator, self.waits[i].seq)) {
+            switch (self.worker.pending_txns.rollbackAndTake(self.allocator, self.waits[i].group_id, self.waits[i].seq)) {
                 .took, .absent => {},
                 .failed => |err| panic_mod.invariantViolated(
                     site_label ++ ".rollback",
@@ -313,7 +326,15 @@ pub fn drainRaftPending(worker: anytype) !void {
                     };
                     self.allocator.destroy(t);
                     unit.txn = null;
-                } else if (self.worker.pending_txns.contains(unit.seq)) {
+                    // Txn promoted: release the durabilize floor for this
+                    // seq (the pump skipped the entry's store write on
+                    // this txn's behalf).
+                    if (self.worker.raft.gidForTenant(unit.tenant_id)) |gid|
+                        self.worker.raft.noteWorkerCommitted(gid, unit.seq);
+                } else if (self.worker.pending_txns.contains(
+                    self.worker.raft.gidForTenant(unit.tenant_id) orelse 0,
+                    unit.seq,
+                )) {
                     // Entity-backed unit (no own txn): the sibling
                     // `drainEntityArm` hasn't committed the shared txn
                     // at this seq yet (it conflicted on NotChainHead).
@@ -355,6 +376,15 @@ pub fn drainRaftPending(worker: anytype) !void {
                     "rove-js parked_units commit destroy: {s}",
                     .{@errorName(err)},
                 );
+            }
+            /// Deadline passed, not bridge-faulted: request a pump-side
+            /// fault and stay parked (see `effect.SweepClass.timeout`).
+            /// The gid resolves the same way `watermarkAt` does; a
+            /// gone/unregistered unit has nothing to fault.
+            pub fn timeoutAt(self: *@This(), i: usize) void {
+                const u = self.unitAt(i) orelse return;
+                const gid = self.worker.raft.gidForTenant(u.tenant_id) orelse return;
+                self.worker.raft.requestFault(gid, u.seq);
             }
             pub fn faultAt(self: *@This(), i: usize) !void {
                 const unit = self.unitAt(i) orelse return;
@@ -762,7 +792,7 @@ fn proposeAndParkContResume(
     // rollback at drain); pointer fallback on the rare invalidation race.
     txn.park(seq) catch |perr|
         std.log.warn("rove-js cont-resume: park seq={d} tenant={s}: {s} (pointer fallback)", .{ seq, tenant_id, @errorName(perr) });
-    try worker.pending_txns.park(allocator, seq, txn);
+    try worker.pending_txns.park(allocator, group_id, seq, txn);
     // parkKvWakes rides this seq so the kv-react wakes fire AFTER
     // commit. Best-effort: log and continue if parking fails —
     // same posture as the inbound write path. Cont-resume hops

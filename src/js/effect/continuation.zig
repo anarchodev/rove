@@ -70,11 +70,23 @@ pub const Watermarks = struct {
     now_ns: i64,
 };
 
-/// Three-way per-unit classification for a parked-seq sweep.
+/// Four-way per-unit classification for a parked-seq sweep.
 /// Distinct from `Disposition` (the two-way resume discriminant)
 /// because `.pending` is a real outcome at sweep time — the unit
 /// hasn't committed yet and isn't faulted; leave it in place.
-pub const SweepClass = enum { commit, fault, pending };
+///
+/// `.timeout` (deadline passed, NOT bridge-faulted) is deliberately
+/// separate from `.fault`: the unit's speculative txn may NOT be rolled
+/// back unilaterally on the worker thread, because the pump may
+/// concurrently be deciding to SKIP this entry's store write on the
+/// premise that this very txn will commit it (the worker-overlay skip,
+/// `bridge.skipQuery`). The timeout arm instead REQUESTS a pump-side
+/// fault (`bridge.requestFault`) and leaves the unit parked; the pump
+/// serializes the request against its skip/commit decisions — either
+/// the entry already committed (the next sweep classifies `.commit`;
+/// committed-beats-faulted) or the tenant faults (`faulted_seq` rises;
+/// the next sweep classifies `.fault` and rolls back normally).
+pub const SweepClass = enum { commit, fault, timeout, pending };
 
 /// Outcome of `SharedTxnPool.commitAndTake`. Distinguishes four
 /// real cases the drain arms must handle:
@@ -140,7 +152,18 @@ pub fn SharedTxnPool(comptime Txn: type) type {
     return struct {
         const Self = @This();
 
-        txns: std.AutoHashMapUnmanaged(u64, Txn) = .empty,
+        /// Keyed by (group_id, seq) — V2 seqs are PER-TENANT (every
+        /// tenant's first write is seq 1), so a bare-seq key collides
+        /// the moment two tenants have writes in flight at the same
+        /// seq: `put` silently overwrote (leaking the first txn
+        /// uncommitted) and `commitAndTake` committed the WRONG
+        /// tenant's txn. V1's node-global seq made bare keys unique;
+        /// the V2 cutover required the composite.
+        txns: std.AutoHashMapUnmanaged(u128, Txn) = .empty,
+
+        inline fn key(gid: u64, seq: u64) u128 {
+            return (@as(u128, gid) << 64) | seq;
+        }
 
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             // Best-effort rollback for any leftover txns at shutdown.
@@ -150,41 +173,41 @@ pub fn SharedTxnPool(comptime Txn: type) type {
             var it = self.txns.iterator();
             while (it.next()) |entry| {
                 entry.value_ptr.*.rollback() catch |err| std.log.warn(
-                    "SharedTxnPool.deinit: leftover rollback seq={d}: {s}",
-                    .{ entry.key_ptr.*, @errorName(err) },
+                    "SharedTxnPool.deinit: leftover rollback gid={d} seq={d}: {s}",
+                    .{ @as(u64, @truncate(entry.key_ptr.* >> 64)), @as(u64, @truncate(entry.key_ptr.*)), @errorName(err) },
                 );
                 allocator.destroy(entry.value_ptr.*);
             }
             self.txns.deinit(allocator);
         }
 
-        /// Park a txn at `seq`. Producer side — called by the
+        /// Park a txn at (gid, seq). Producer side — called by the
         /// proposing path right after `proposeBatch` returns the seq.
-        pub fn park(self: *Self, allocator: std.mem.Allocator, seq: u64, txn: Txn) !void {
-            try self.txns.put(allocator, seq, txn);
+        pub fn park(self: *Self, allocator: std.mem.Allocator, gid: u64, seq: u64, txn: Txn) !void {
+            try self.txns.put(allocator, key(gid, seq), txn);
         }
 
-        /// Commit + take the txn at `seq`. See `CommitOutcome`.
+        /// Commit + take the txn at (gid, seq). See `CommitOutcome`.
         /// `.took` destroys the txn; `.conflict` and `.failed` keep
         /// it in the pool; `.absent` is a no-op.
-        pub fn commitAndTake(self: *Self, allocator: std.mem.Allocator, seq: u64) CommitOutcome {
-            const tracked = self.txns.get(seq) orelse return .absent;
+        pub fn commitAndTake(self: *Self, allocator: std.mem.Allocator, gid: u64, seq: u64) CommitOutcome {
+            const tracked = self.txns.get(key(gid, seq)) orelse return .absent;
             tracked.commit() catch |err| switch (err) {
                 error.Conflict => return .conflict,
                 else => return .{ .failed = err },
             };
-            _ = self.txns.remove(seq);
+            _ = self.txns.remove(key(gid, seq));
             allocator.destroy(tracked);
             return .took;
         }
 
-        /// Rollback + take the txn at `seq`. `.took` destroys;
+        /// Rollback + take the txn at (gid, seq). `.took` destroys;
         /// `.failed` also destroys (the rollback error means the
         /// txn is in an unknown state; we don't want to leave it
         /// in the pool to be re-attempted) but signals the caller
         /// to panic. `.absent` is a no-op.
-        pub fn rollbackAndTake(self: *Self, allocator: std.mem.Allocator, seq: u64) RollbackOutcome {
-            const kv = self.txns.fetchRemove(seq) orelse return .absent;
+        pub fn rollbackAndTake(self: *Self, allocator: std.mem.Allocator, gid: u64, seq: u64) RollbackOutcome {
+            const kv = self.txns.fetchRemove(key(gid, seq)) orelse return .absent;
             kv.value.rollback() catch |err| {
                 allocator.destroy(kv.value);
                 return .{ .failed = err };
@@ -206,8 +229,8 @@ pub fn SharedTxnPool(comptime Txn: type) type {
             var it = self.txns.iterator();
             while (it.next()) |entry| {
                 entry.value_ptr.*.rollback() catch |err| std.log.warn(
-                    "SharedTxnPool.drainAll: rollback seq={d} err={s}",
-                    .{ entry.key_ptr.*, @errorName(err) },
+                    "SharedTxnPool.drainAll: rollback gid={d} seq={d} err={s}",
+                    .{ @as(u64, @truncate(entry.key_ptr.* >> 64)), @as(u64, @truncate(entry.key_ptr.*)), @errorName(err) },
                 );
                 allocator.destroy(entry.value_ptr.*);
             }
@@ -228,8 +251,8 @@ pub fn SharedTxnPool(comptime Txn: type) type {
         /// the unit's `Cmd.respond` must NOT move the entity. The
         /// unit defers to the next tick so commit + move stay
         /// atomic (matching the pre-4.1.3 inline-move behavior).
-        pub fn contains(self: *const Self, seq: u64) bool {
-            return self.txns.contains(seq);
+        pub fn contains(self: *const Self, gid: u64, seq: u64) bool {
+            return self.txns.contains(key(gid, seq));
         }
 
         pub fn isEmpty(self: *const Self) bool {
@@ -256,9 +279,8 @@ pub fn SharedTxnPool(comptime Txn: type) type {
 /// divergence is a compile error rather than a drift bug.
 pub fn classify(seq: u64, deadline_ns: i64, w: Watermarks) SweepClass {
     if (w.committed >= seq) return .commit;
-    const is_faulted = w.faulted > 0 and w.faulted >= seq;
-    const is_timed_out = w.now_ns >= deadline_ns;
-    if (is_faulted or is_timed_out) return .fault;
+    if (w.faulted > 0 and w.faulted >= seq) return .fault;
+    if (w.now_ns >= deadline_ns) return .timeout;
     return .pending;
 }
 
@@ -285,6 +307,9 @@ pub fn classify(seq: u64, deadline_ns: i64, w: Watermarks) SweepClass {
 ///     on-commit action (release buffered Cmds / move / destroy)
 ///   - `faultAt(i) !void`  — roll the txn back + the unit's on-fault
 ///     action (discard buffered / 503-downgrade / destroy)
+///   - `timeoutAt(i) void` — deadline passed without commit or fault:
+///     request a pump-side fault (`bridge.requestFault`) and leave the
+///     unit parked (no txn action — see `SweepClass.timeout`)
 ///
 /// `count` is snapshotted by the caller BEFORE the loop. Entity
 /// `reg.move`/`reg.destroy` are deferred to `reg.flush` (rove's
@@ -301,6 +326,12 @@ pub fn reconcile(ctx: anytype, count: usize) !void {
             .pending => {},
             .commit => try ctx.commitAt(i),
             .fault => try ctx.faultAt(i),
+            // Deadline passed but not bridge-faulted: ask the pump to
+            // fault the tenant and LEAVE THE UNIT PARKED (see the
+            // `SweepClass.timeout` doc — a unilateral worker-thread
+            // rollback races the pump's worker-overlay skip decision).
+            // The next sweep resolves it as `.commit` or `.fault`.
+            .timeout => ctx.timeoutAt(i),
         }
     }
 }
@@ -524,29 +555,29 @@ test "SharedTxnPool: park + commitAndTake + absent + rollback" {
 
     const t1 = try testing.allocator.create(FakeTxn);
     t1.* = .{};
-    try pool.park(testing.allocator, 100, t1);
+    try pool.park(testing.allocator, 7, 100, t1);
     try testing.expectEqual(@as(usize, 1), pool.count());
 
     // commitAndTake on existing seq → .took, destroys t1.
-    const o1 = pool.commitAndTake(testing.allocator, 100);
+    const o1 = pool.commitAndTake(testing.allocator, 7, 100);
     try testing.expect(o1 == .took);
     try testing.expect(pool.isEmpty());
 
     // commitAndTake on absent seq → .absent.
-    const o2 = pool.commitAndTake(testing.allocator, 100);
+    const o2 = pool.commitAndTake(testing.allocator, 7, 100);
     try testing.expect(o2 == .absent);
 
     // .conflict path: park a txn whose commit returns Conflict.
     const t2 = try testing.allocator.create(FakeTxn);
     t2.* = .{ .fail_commit_with = error.Conflict };
-    try pool.park(testing.allocator, 200, t2);
-    const o3 = pool.commitAndTake(testing.allocator, 200);
+    try pool.park(testing.allocator, 7, 200, t2);
+    const o3 = pool.commitAndTake(testing.allocator, 7, 200);
     try testing.expect(o3 == .conflict);
     try testing.expectEqual(@as(usize, 1), pool.count()); // still parked
 
     // .failed path: commit returns a non-Conflict error.
     t2.fail_commit_with = error.OutOfMemory;
-    const o4 = pool.commitAndTake(testing.allocator, 200);
+    const o4 = pool.commitAndTake(testing.allocator, 7, 200);
     switch (o4) {
         .failed => |err| try testing.expectEqual(@as(anyerror, error.OutOfMemory), err),
         else => return error.TestUnexpectedResult,
@@ -555,12 +586,12 @@ test "SharedTxnPool: park + commitAndTake + absent + rollback" {
 
     // rollbackAndTake → .took, destroys + removes.
     t2.fail_commit_with = null;
-    const o5 = pool.rollbackAndTake(testing.allocator, 200);
+    const o5 = pool.rollbackAndTake(testing.allocator, 7, 200);
     try testing.expect(o5 == .took);
     try testing.expect(pool.isEmpty());
 
     // rollbackAndTake on absent seq → .absent.
-    const o6 = pool.rollbackAndTake(testing.allocator, 300);
+    const o6 = pool.rollbackAndTake(testing.allocator, 7, 300);
     try testing.expect(o6 == .absent);
 }
 
@@ -586,9 +617,15 @@ test "classify: commit / fault / timeout / pending outcomes" {
         .committed = 5, .faulted = 7, .now_ns = 0,
     }));
 
-    // timed-out → fault.
-    try testing.expectEqual(SweepClass.fault, classify(7, 100, .{
+    // timed-out (deadline passed, NOT bridge-faulted) → timeout: the
+    // arm requests a pump-side fault and leaves the unit parked.
+    try testing.expectEqual(SweepClass.timeout, classify(7, 100, .{
         .committed = 5, .faulted = 0, .now_ns = 150,
+    }));
+    // bridge-faulted wins over timed-out (rollback is safe — the pump
+    // already cleared the seq from pending before raising faulted_seq).
+    try testing.expectEqual(SweepClass.fault, classify(7, 100, .{
+        .committed = 5, .faulted = 7, .now_ns = 150,
     }));
 
     // Pre-commit, pre-fault, pre-deadline → pending.
@@ -650,6 +687,7 @@ test "reconcile: dispatches commit / fault / pending per classify" {
         fn faultAt(self: *@This(), i: usize) !void {
             try self.faulted.append(testing.allocator, i);
         }
+        fn timeoutAt(_: *@This(), _: usize) void {}
     };
 
     var ctx = Ctx{};
@@ -679,6 +717,7 @@ test "reconcile: propagates a commitAt error" {
             return error.Boom;
         }
         fn faultAt(_: *@This(), _: usize) !void {}
+        fn timeoutAt(_: *@This(), _: usize) void {}
     };
 
     var ctx = Ctx{};
