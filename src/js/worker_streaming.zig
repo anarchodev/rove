@@ -576,7 +576,7 @@ fn resumeStream(
             .request_id = request_id,
             .correlation_id = chain_ctx.correlation_id,
         },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
         .effects = .{
             .pending_wakes = &pending_wakes,
@@ -976,7 +976,7 @@ pub fn resumeBoundFetchStream(
             .request_id = request_id,
             .correlation_id = chain_ctx.correlation_id,
         },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
         .trampolines = .{
             .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
@@ -1269,7 +1269,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
         .activation = .disconnect,
         .activation_write_pressure_dropped = dropped_chunks_snapshot,
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = chain_ctx.correlation_id },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
@@ -1821,7 +1821,7 @@ fn fireWsMessage(
         .query = null,
         .activation = .{ .ws_message = .{ .opcode = opcode, .data = payload } },
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = chain_ctx.correlation_id },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
         .effects = .{
             .pending_stream_chunks = &stream_chunks,
@@ -2058,7 +2058,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         .query = null,
         .activation = .disconnect,
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = chain_ctx.correlation_id },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
@@ -2268,7 +2268,7 @@ pub fn fireSubscriptionActivation(
         .query = query,
         .activation = .{ .subscription_fire = .{ .name = subscription_name, .source = source } },
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = corr_full },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
     };
 
@@ -2499,7 +2499,7 @@ pub fn fireSchedulerTick(worker: anytype, tenant_id: []const u8) void {
         .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
         .activation = .{ .subscription_fire = .{ .name = "__scheduler_tick", .source = null } },
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = corr_full },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
         .trampolines = .{
             .set_wake = &deployment_cache.TenantSlot.setWakeTrampoline,
@@ -2681,7 +2681,7 @@ fn fireDurableWakeActivation(worker: anytype, dw: *effect_mod.msg.DurableWake) v
             .msg_json = dw.msg_json,
         } },
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = corr_full },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
     };
 
@@ -2900,7 +2900,7 @@ fn fireChainedActivation(
         .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
         .activation = .send_callback,
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = corr_full },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
     };
 
@@ -4069,7 +4069,7 @@ pub fn fireFetchEventActivation(
             .body_truncated = if (event.final) event.body_truncated else false,
         } },
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = corr_full },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
         .trampolines = .{
             // Phase 5 PR-3: §6.4 held-sync resume hook. The baked

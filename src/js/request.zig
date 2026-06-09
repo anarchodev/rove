@@ -23,6 +23,7 @@ const rove = @import("rove");
 
 const globals = @import("globals.zig");
 const limiter_mod = @import("limiter.zig");
+const blob_mod = @import("rove-blob");
 const continuation_mod = @import("bindings/continuation.zig");
 const stream_mod = @import("bindings/stream.zig");
 const components_mod = @import("components.zig");
@@ -202,6 +203,11 @@ pub const PlanLimits = struct {
     instance_id: []const u8 = "",
     plan_rate: limiter_mod.RateLimitCaps = .{},
     plan_gen: u64 = 0,
+    /// `docs/blob-storage-plan.md` P1: the node's S3 backend config
+    /// for `_system.blob.presign` (borrowed from
+    /// `NodeState.blob_backend_cfg`). Null outside a worker context —
+    /// presign throws "not configured".
+    blob_cfg: ?*const blob_mod.BackendConfig = null,
 };
 
 /// Per-request tracing + tape-replay metadata.

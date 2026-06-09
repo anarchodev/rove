@@ -53,6 +53,7 @@
 
 const std = @import("std");
 const blob_curl_multi = @import("rove-blob").curl_multi;
+const blob_sigv4 = @import("rove-blob").sigv4;
 const components_mod = @import("components.zig");
 const worker_mod = @import("worker.zig");
 const globals = @import("globals.zig");
@@ -83,6 +84,14 @@ const ENGINE_MAX_INFLIGHT: usize = 10_000;
 /// defined `final: true, ok: false` rejection event so the
 /// customer's `on_chunk` handler fires once and can take action.
 const HELD_MAX_PER_TENANT: u32 = 16;
+
+/// `docs/blob-storage-plan.md` P1: the special origin the `blob.*`
+/// JS shims target. Never resolved — `startTransfer` rewrites it to
+/// the real S3 endpoint + tenant `app-blobs/` prefix and signs the
+/// request before libcurl sees it. The `.internal` TLD is reserved
+/// (RFC 8375-adjacent ICANN reservation), so the placeholder can
+/// never collide with a real customer destination.
+pub const BLOB_ORIGIN_PREFIX = "http://rove-blob.internal/";
 
 pub const FetchEngine = struct {
     allocator: std.mem.Allocator,
@@ -351,6 +360,21 @@ pub const FetchEngine = struct {
         try parseHeadersJson(self.allocator, pf.headers_json, &headers_list);
 
         const method = parseMethod(pf.method) orelse return error.UnsupportedMethod;
+
+        // `docs/blob-storage-plan.md` P1: the blob.* trusted door.
+        // The JS shims fetch `http://rove-blob.internal/{hash}`; the
+        // engine rewrites that to the calling tenant's `app-blobs/`
+        // key on the real S3 endpoint and SigV4-signs it natively.
+        // Tenant identity comes from `pf.tenant_id` (stamped by the
+        // binding from the activation, never JS-supplied), so a
+        // handler can only ever reach its own prefix; the signing
+        // keys never enter JS space. Setup errors here surface as
+        // the standard single `final: true, ok: false` event via
+        // `drainInbound`'s catch.
+        if (std.mem.startsWith(u8, pf.url, BLOB_ORIGIN_PREFIX)) {
+            try self.rewriteAndSignBlobFetch(pf, method, &headers_list);
+        }
+
         const req: blob_curl_multi.Request = .{
             .method = method,
             .url = pf.url,
@@ -417,6 +441,103 @@ pub const FetchEngine = struct {
         try self.multi.?.add(transfer);
 
         if (ctx.held) self.bumpHeldCount(ctx.pf.tenant_id, 1);
+    }
+
+    /// `docs/blob-storage-plan.md` P1: rewrite a `rove-blob.internal`
+    /// placeholder URL to the calling tenant's content-addressed key
+    /// on the real S3 endpoint and attach SigV4 auth headers.
+    ///
+    /// - Key shape is locked to `{key_prefix_base}{tenant}/app-blobs/
+    ///   {sha256-hex}` — the tenant comes from `pf.tenant_id`, the
+    ///   hash from the URL tail (validated 64 lowercase hex), so JS
+    ///   cannot escape its own prefix by construction.
+    /// - Method allowlist GET / PUT / HEAD. No DELETE through this
+    ///   door (plan §7.1 — no customer delete at launch).
+    /// - JS-supplied headers are dropped except `content-type`
+    ///   (useful on PUT, not signed — only host / x-amz-date /
+    ///   x-amz-content-sha256 enter the signature). Anything else a
+    ///   shim set (or tried to spoof — `authorization`, `x-amz-*`)
+    ///   never reaches the wire.
+    fn rewriteAndSignBlobFetch(
+        self: *FetchEngine,
+        pf: *PendingFetch,
+        method: blob_curl_multi.Method,
+        headers_list: *std.ArrayListUnmanaged(blob_curl_multi.Header),
+    ) !void {
+        const cfg = &self.node.blob_backend_cfg;
+        if (cfg.endpoint.len == 0) return error.BlobBackendUnconfigured;
+        if (pf.tenant_id.len == 0) return error.BlobNoTenant;
+
+        const hash = pf.url[BLOB_ORIGIN_PREFIX.len..];
+        if (!isSha256HexLower(hash)) return error.BlobBadKey;
+
+        const method_name = switch (method) {
+            .GET => "GET",
+            .PUT => "PUT",
+            .HEAD => "HEAD",
+            else => return error.BlobMethodDenied,
+        };
+
+        // Path used both for signing and the wire URL (path-style S3).
+        const path = try std.fmt.allocPrint(
+            self.allocator,
+            "/{s}/{s}{s}/app-blobs/{s}",
+            .{ cfg.bucket, cfg.key_prefix_base, pf.tenant_id, hash },
+        );
+        defer self.allocator.free(path);
+
+        const scheme = if (cfg.use_tls) "https" else "http";
+        const new_url = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}://{s}{s}",
+            .{ scheme, cfg.endpoint, path },
+        );
+        self.allocator.free(pf.url);
+        pf.url = new_url;
+
+        var ts_buf: [16]u8 = undefined;
+        blob_sigv4.formatAmzDate(&ts_buf, std.time.timestamp());
+        const signed = try blob_sigv4.sign(self.allocator, .{
+            .method = method_name,
+            .path = path,
+            .host = cfg.endpoint,
+            .body = pf.body,
+            .access_key = cfg.access_key,
+            .secret_key = cfg.secret_key,
+            .region = cfg.region,
+            .service = "s3",
+            .timestamp = &ts_buf,
+        });
+        const values = [3][]u8{ signed.authorization, signed.x_amz_date, signed.x_amz_content_sha256 };
+        // Until a value is appended to `headers_list` (whose caller-
+        // side defer frees name+value of every entry), it is ours to
+        // free on the error path. `attached` tracks the handoff.
+        var attached: usize = 0;
+        errdefer for (values[attached..]) |v| self.allocator.free(v);
+
+        // Drop every JS-supplied header except content-type.
+        var i: usize = 0;
+        while (i < headers_list.items.len) {
+            const h = headers_list.items[i];
+            if (std.ascii.eqlIgnoreCase(h.name, "content-type")) {
+                i += 1;
+                continue;
+            }
+            self.allocator.free(h.name);
+            self.allocator.free(h.value);
+            _ = headers_list.swapRemove(i);
+        }
+
+        // Attach the three SigV4 headers. Names are dup'd so every
+        // entry uniformly owns name + value (the caller's defer
+        // frees both); the signed values transfer ownership in.
+        try headers_list.ensureUnusedCapacity(self.allocator, 3);
+        const names = [3][]const u8{ "authorization", "x-amz-date", "x-amz-content-sha256" };
+        for (names, values) |n, v| {
+            const owned_name = try self.allocator.dupe(u8, n);
+            headers_list.appendAssumeCapacity(.{ .name = owned_name, .value = v });
+            attached += 1;
+        }
     }
 
     /// Adjust the per-tenant held count by `delta` (+1 or -1).
@@ -747,6 +868,27 @@ fn parseMethod(s: []const u8) ?blob_curl_multi.Method {
     if (std.ascii.eqlIgnoreCase(s, "DELETE")) return .DELETE;
     if (std.ascii.eqlIgnoreCase(s, "HEAD")) return .HEAD;
     return null;
+}
+
+/// `blob.*` key validator: exactly 64 lowercase hex chars (a sha256
+/// digest as `crypto.sha256` renders it). Anything else — uppercase,
+/// path separators, traversal attempts — is rejected before the key
+/// is interpolated into an S3 path.
+fn isSha256HexLower(s: []const u8) bool {
+    if (s.len != 64) return false;
+    for (s) |b| {
+        const ok = (b >= '0' and b <= '9') or (b >= 'a' and b <= 'f');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+test "isSha256HexLower accepts a digest and rejects malformed keys" {
+    try std.testing.expect(isSha256HexLower("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+    try std.testing.expect(!isSha256HexLower("E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"));
+    try std.testing.expect(!isSha256HexLower("e3b0c44298fc1c149afbf4c8996fb924"));
+    try std.testing.expect(!isSha256HexLower("../../../../../../../etc/passwd0000000000000000000000000000000000"));
+    try std.testing.expect(!isSha256HexLower(""));
 }
 
 fn parseHeadersJson(

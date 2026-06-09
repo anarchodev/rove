@@ -238,7 +238,7 @@ fn buildOnFetchRow(
         fetched.url = try a.dupe(u8, @as([*]const u8, @ptrCast(cstr))[0..len]);
     }
     fetched.method = try dupeJsString(ctx, a, opts, "method", "GET");
-    fetched.body = try dupeJsString(ctx, a, opts, "body", "");
+    fetched.body = try dupeJsStringOrBytes(ctx, a, opts, "body", "");
     fetched.headers_json = try dupeJsObjectAsJson(ctx, a, opts, "headers", "{}");
     fetched.ctx_json = try dupeJsObjectAsJson(ctx, a, opts, "ctx", "null");
     // Connection-scoped fetches always bind-or-drop, so the unbound
@@ -479,7 +479,7 @@ fn buildFetchRow(
     fetched.id = try deriveFetchIdHex(a, state.request_id, state.http_fetch_index);
     fetched.url = try dupeJsString(ctx, a, opts, "url", null);
     fetched.method = try dupeJsString(ctx, a, opts, "method", "GET");
-    fetched.body = try dupeJsString(ctx, a, opts, "body", "");
+    fetched.body = try dupeJsStringOrBytes(ctx, a, opts, "body", "");
     fetched.headers_json = try dupeJsObjectAsJson(ctx, a, opts, "headers", "{}");
     fetched.ctx_json = try dupeJsObjectAsJson(ctx, a, opts, "ctx", "null");
     fetched.on_chunk_module = try dupeJsString(ctx, a, opts, "on_chunk", "");
@@ -610,6 +610,44 @@ fn dupeJsString(
     if (cstr == null) return error.JsException;
     defer c.JS_FreeCString(ctx, cstr);
     return try a.dupe(u8, @as([*]const u8, @ptrCast(cstr))[0..len]);
+}
+
+/// Like `dupeJsString`, but also accepts a Uint8Array. Fetch bodies
+/// must carry binary payloads losslessly (`blob.put` media bytes);
+/// routing raw bytes through a JS string would UTF-8-mangle them.
+/// String values keep `dupeJsString`'s UTF-8-bytes semantics, so
+/// every pre-existing caller behavior is unchanged.
+fn dupeJsStringOrBytes(
+    ctx: ?*c.JSContext,
+    a: std.mem.Allocator,
+    obj: c.JSValue,
+    name: [:0]const u8,
+    default_str: ?[]const u8,
+) ![]u8 {
+    const v = c.JS_GetPropertyStr(ctx, obj, name.ptr);
+    defer c.JS_FreeValue(ctx, v);
+    if (c.JS_IsUndefined(v)) {
+        if (default_str) |d| return try a.dupe(u8, d);
+        return error.JsException;
+    }
+    if (c.JS_IsString(v)) {
+        var len: usize = 0;
+        const cstr = c.JS_ToCStringLen(ctx, &len, v);
+        if (cstr == null) return error.JsException;
+        defer c.JS_FreeCString(ctx, cstr);
+        return try a.dupe(u8, @as([*]const u8, @ptrCast(cstr))[0..len]);
+    }
+    var byte_len: usize = 0;
+    const buf_ptr = c.JS_GetUint8Array(ctx, &byte_len, v);
+    if (buf_ptr == null) {
+        // JS_GetUint8Array may have set a pending exception — clear
+        // it so our own TypeError below is the one that surfaces.
+        const pending = c.JS_GetException(ctx);
+        c.JS_FreeValue(ctx, pending);
+        _ = c.JS_ThrowTypeError(ctx, "fetch: `body` must be a string or Uint8Array");
+        return error.JsException;
+    }
+    return try a.dupe(u8, buf_ptr[0..byte_len]);
 }
 
 fn dupeJsObjectAsJson(
