@@ -539,12 +539,27 @@ pub const KvStore = struct {
         }
         // Blocking acquire — direct KvStore.put is used by test/admin
         // paths where contention is rare; we don't surface Conflict.
-        var lease = self.manifest.acquire(self.store_id) catch return Error.Sqlite;
+        // Each collapse-to-Sqlite site logs the underlying kvexp error
+        // first — the V2 follower-apply panic surfaced as a bare
+        // `Sqlite` with the real cause swallowed here.
+        var lease = self.manifest.acquire(self.store_id) catch |err| {
+            std.log.warn("kvstore.put acquire store={x}: {s}", .{ self.store_id, @errorName(err) });
+            return Error.Sqlite;
+        };
         defer lease.release();
-        var txn = lease.beginTxn() catch return Error.Sqlite;
+        var txn = lease.beginTxn() catch |err| {
+            std.log.warn("kvstore.put beginTxn store={x}: {s}", .{ self.store_id, @errorName(err) });
+            return Error.Sqlite;
+        };
         errdefer txn.rollback();
-        txn.put(key, value) catch return Error.Sqlite;
-        txn.commit() catch return Error.Sqlite;
+        txn.put(key, value) catch |err| {
+            std.log.warn("kvstore.put put store={x}: {s}", .{ self.store_id, @errorName(err) });
+            return Error.Sqlite;
+        };
+        txn.commit() catch |err| {
+            std.log.warn("kvstore.put commit store={x}: {s}", .{ self.store_id, @errorName(err) });
+            return Error.Sqlite;
+        };
     }
 
     /// Legacy: SQLite-era version that stamped a seq column with
@@ -565,15 +580,27 @@ pub const KvStore = struct {
             };
             return;
         }
-        var lease = self.manifest.acquire(self.store_id) catch return Error.Sqlite;
+        var lease = self.manifest.acquire(self.store_id) catch |err| {
+            std.log.warn("kvstore.delete acquire store={x}: {s}", .{ self.store_id, @errorName(err) });
+            return Error.Sqlite;
+        };
         defer lease.release();
-        var txn = lease.beginTxn() catch return Error.Sqlite;
+        var txn = lease.beginTxn() catch |err| {
+            std.log.warn("kvstore.delete beginTxn store={x}: {s}", .{ self.store_id, @errorName(err) });
+            return Error.Sqlite;
+        };
         errdefer txn.rollback();
         _ = txn.delete(key) catch |err| switch (err) {
             error.OutOfMemory => return Error.OutOfMemory,
-            else => return Error.Sqlite,
+            else => {
+                std.log.warn("kvstore.delete delete store={x}: {s}", .{ self.store_id, @errorName(err) });
+                return Error.Sqlite;
+            },
         };
-        txn.commit() catch return Error.Sqlite;
+        txn.commit() catch |err| {
+            std.log.warn("kvstore.delete commit store={x}: {s}", .{ self.store_id, @errorName(err) });
+            return Error.Sqlite;
+        };
     }
 
     /// Read this *manifest*'s last *durable* raft idx — the value
@@ -591,6 +618,41 @@ pub const KvStore = struct {
     /// the new API requires those to be the same call.
     pub fn setLastAppliedRaftIdx(self: *KvStore, idx: u64) Error!void {
         self.manifest.durabilize(idx) catch return Error.Sqlite;
+    }
+
+    /// Chain-BYPASSING authoritative put — the replicated-apply seam
+    /// (kvexp `StoreLease.applyPut`). A follower applying a committed
+    /// raft entry must never sequence behind the tenant's open
+    /// speculative txn chain: the one-shot `put` path returned
+    /// `NotChainHead` whenever a local read batch had a txn open/parked
+    /// for the tenant (and retrying deadlocks — a parked predecessor
+    /// resolves only through the apply loop stuck behind it). Writes
+    /// straight into the committed overlay under the dispatch lease.
+    /// ONLY for the consensus apply path; client writes go through
+    /// `TrackedTxn`/`put`.
+    pub fn applyPut(self: *KvStore, key: []const u8, value: []const u8) Error!void {
+        var lease = self.manifest.acquire(self.store_id) catch |err| {
+            std.log.warn("kvstore.applyPut acquire store={x}: {s}", .{ self.store_id, @errorName(err) });
+            return Error.Sqlite;
+        };
+        defer lease.release();
+        lease.applyPut(key, value) catch |err| {
+            std.log.warn("kvstore.applyPut store={x}: {s}", .{ self.store_id, @errorName(err) });
+            return Error.Sqlite;
+        };
+    }
+
+    /// Chain-bypassing authoritative delete — see `applyPut`.
+    pub fn applyDelete(self: *KvStore, key: []const u8) Error!void {
+        var lease = self.manifest.acquire(self.store_id) catch |err| {
+            std.log.warn("kvstore.applyDelete acquire store={x}: {s}", .{ self.store_id, @errorName(err) });
+            return Error.Sqlite;
+        };
+        defer lease.release();
+        lease.applyDelete(key) catch |err| {
+            std.log.warn("kvstore.applyDelete store={x}: {s}", .{ self.store_id, @errorName(err) });
+            return Error.Sqlite;
+        };
     }
 
     /// Prefix scan. Keys whose bytes start with `prefix_bytes`,
