@@ -1122,7 +1122,14 @@ fn mirrorDeployConfig(
         &ws,
         slot.instance_id,
         "",
-    )) |_| {} else |err| {
+    )) |proposed| {
+        // The txn committed above (immediate-commit producer): its
+        // writes are already fold-visible, so pre-ack the durabilize
+        // floor for this seq (the bridge keeps an acked high-water, so
+        // acking before the entry commits is safe and prevents the
+        // fire-and-forget propose from pinning the floor forever).
+        raft.noteWorkerCommitted(proposed.group_id, proposed.seq);
+    } else |err| {
         // Local commit is already durable on the leader; followers
         // re-derive on their next reload. Log, don't fail the deploy.
         std.log.warn(

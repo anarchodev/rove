@@ -141,7 +141,12 @@ fn drainEntityArm(
             // (kvexp NotChainHead) retries next tick. The entity move
             // is the `parked_units` arm's job — nothing else here.
             switch (self.worker.pending_txns.commitAndTake(self.allocator, self.waits[i].seq)) {
-                .took, .absent, .conflict => {},
+                // The txn promoted into the store's main overlay: release
+                // the durabilize floor for this seq (the pump skipped the
+                // entry's store write on this txn's behalf and has been
+                // holding the watermark/compaction below it).
+                .took => self.worker.raft.noteWorkerCommitted(self.waits[i].group_id, self.waits[i].seq),
+                .absent, .conflict => {},
                 .failed => |err| panic_mod.invariantViolated(
                     site_label ++ ".commit",
                     "seq={d} err={s}",
@@ -321,6 +326,11 @@ pub fn drainRaftPending(worker: anytype) !void {
                     };
                     self.allocator.destroy(t);
                     unit.txn = null;
+                    // Txn promoted: release the durabilize floor for this
+                    // seq (the pump skipped the entry's store write on
+                    // this txn's behalf).
+                    if (self.worker.raft.gidForTenant(unit.tenant_id)) |gid|
+                        self.worker.raft.noteWorkerCommitted(gid, unit.seq);
                 } else if (self.worker.pending_txns.contains(unit.seq)) {
                     // Entity-backed unit (no own txn): the sibling
                     // `drainEntityArm` hasn't committed the shared txn

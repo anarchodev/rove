@@ -230,6 +230,12 @@ fn commitWrite(worker: anytype, allocator: std.mem.Allocator, tenant: []const u8
     txn.commit() catch return 500;
 
     const proposed = raft_propose.proposeWriteSet(worker, &ws, tenant, "") catch return 503;
+    // The txn committed BEFORE the propose (immediate-commit path): its
+    // writes are already fold-visible, so release the durabilize floor
+    // the bridge would otherwise hold for this skipped own-propose. Safe
+    // to ack pre-commit — the bridge keeps an acked high-water and never
+    // tracks an already-acked seq.
+    worker.raft.noteWorkerCommitted(proposed.group_id, proposed.seq);
     if (!awaitCommit(worker, proposed.group_id, proposed.seq)) return 504;
     return 0;
 }
