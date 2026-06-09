@@ -891,19 +891,29 @@ const Router = struct {
 
     /// Try each source node's leader-gated `/_system/v2-bundle` until one
     /// returns 200 (the group leader) and hand back its bundle body. A
-    /// follower 421s (no quiesce taken there). Null if no node produced a
-    /// bundle (none is the leader / all unreachable). The caller owns the
+    /// follower 421s (no quiesce taken there); the LEADER 423s while its
+    /// worker overlay is still catching up to the quiesce point (parked
+    /// txns promote between that worker's dispatches, so the dump must
+    /// wait a tick or two) — retry the SAME node briefly, it holds the
+    /// quiesce. Null if no node produced a bundle (none is the leader /
+    /// all unreachable / drain never settled). The caller owns the
     /// returned `BackendResp`.
     fn bundleFromLeader(self: *Router, src_nodes: []const []const u8, tbody: []const u8) ?BackendResp {
         const a = self.allocator;
         for (src_nodes) |base| {
-            const resp = self.backendCall(base, "/_system/v2-bundle", .POST, tbody, &.{}) catch |err| {
-                std.log.warn("rewind-cp: v2-bundle on {s} failed: {s}", .{ base, @errorName(err) });
-                continue;
-            };
-            if (resp.status == 200) return resp;
-            var r = resp;
-            r.deinit(a); // 421 follower / other — try the next node
+            var attempts: u32 = 0;
+            while (attempts < 80) : (attempts += 1) { // ≈2s at 25ms — the worker's commit-wait window
+                const resp = self.backendCall(base, "/_system/v2-bundle", .POST, tbody, &.{}) catch |err| {
+                    std.log.warn("rewind-cp: v2-bundle on {s} failed: {s}", .{ base, @errorName(err) });
+                    break; // node unreachable — try the next one
+                };
+                if (resp.status == 200) return resp;
+                var r = resp;
+                const status = r.status;
+                r.deinit(a);
+                if (status != 423) break; // 421 follower / other — try the next node
+                std.Thread.sleep(25 * std.time.ns_per_ms);
+            }
         }
         return null;
     }

@@ -1010,6 +1010,22 @@ pub const Bridge = struct {
         }
     }
 
+    /// True iff every committed entry up to `seq` has had its worker txn
+    /// promoted into the store (`noteWorkerCommitted` received) — i.e.
+    /// the store's foldable state fully covers the watermark through
+    /// `seq`. The move source's bundle dump gates on this: `committedSeq
+    /// >= seq` alone only proves raft commit + skip; the skipped writes
+    /// live in parked worker txns until the drain promotes them, and a
+    /// dump taken before that silently misses raft-committed data. Safe
+    /// from any thread (mutex).
+    pub fn workerAckedThrough(self: *Bridge, gid: u64, seq: u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const sig = self.groups.get(gid) orelse return true;
+        // FIFO front = oldest un-acked entry.
+        return sig.awaiting_worker.items.len == 0 or sig.awaiting_worker.items[0].seq > seq;
+    }
+
     /// Bound to `Node.durabilize_floor` (pump thread): the highest raft
     /// index fully covered by the store's foldable overlay for `gid` —
     /// one less than the first committed-but-not-worker-acked entry's
