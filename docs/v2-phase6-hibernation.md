@@ -1,7 +1,7 @@
 # V2 Phase 6 — scale: hibernation / active-set (K = thousands of tenants)
 
 > **Status (2026-06-04). DONE.** The active-set hibernation machinery is in
-> `src-v2/kv/node.zig` + `src-v2/kv/transport.zig`, green under `v2-test`
+> `src/consensus/node.zig` + `src/consensus/transport.zig`, green under `v2-test`
 > (46/46). An idle group drops out of the tick set and costs the pump
 > nothing; it wakes on the next propose / non-heartbeat step. Proven by three
 > tests (single-node hibernate→wake, a K-group idle drain, and the

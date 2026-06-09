@@ -845,7 +845,7 @@ pub const DeploymentCache = struct {
 
     /// Enqueue a load of `tenant_id`'s current deployment from the replicated
     /// `_deploy/current` marker, opening the tenant slot if it is not already
-    /// cached. The V2 on-promotion hook (`src-v2/rewind/main.zig`) calls this
+    /// cached. The V2 on-promotion hook (`src/rewind/main.zig`) calls this
     /// when this node wins leadership of a tenant's raft group: a follower
     /// replicates `_deploy/current` but never enqueues a load (the loader is
     /// only enqueued inline at release time on the *original* leader), so a
@@ -860,7 +860,7 @@ pub const DeploymentCache = struct {
     /// tenant slot — only a mutex-guarded queue append, so it is safe to call
     /// from the raft pump thread. The loader thread does the slot-open + blob
     /// fetch off-thread. The V2 DP apply observer
-    /// (`src-v2/rewind/main.zig::onDeployApply`) calls this on every applied
+    /// (`src/rewind/main.zig::onDeployApply`) calls this on every applied
     /// `_deploy/current` write so a FOLLOWER loads each deployment as it
     /// replicates — then a follower promoted to leader already holds the
     /// handler bytecode (no serve-503 window, and the on-promotion durable-wake

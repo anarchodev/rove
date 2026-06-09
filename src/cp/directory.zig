@@ -3,7 +3,7 @@
 //! docs/v2-cp-directory-replication.md Slice 1).
 //!
 //! This is the routing source of truth: given a tenant's store id, which
-//! cluster currently serves it. The **front-door** (`src-v2/front/`)
+//! cluster currently serves it. The **front-door** (`src/front/`)
 //! reads it on every inbound request to pick a backend; the **move
 //! orchestration** (Phase 4 / Phase 7) writes it — flipping a tenant's
 //! placement is the atomic commit point of a tenant move.

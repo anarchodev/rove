@@ -25,7 +25,7 @@ handler JS is reused VERBATIM from the V1 demo tenant
 
 The held SSE request + the concurrent `readkey` probes go DIRECT to the
 node: the V2 front door buffers the whole backend response (single
-`RespBody` relay, src-v2/front/main.zig), so a never-terminating SSE
+`RespBody` relay, src/front/main.zig), so a never-terminating SSE
 stream through it never flushes a chunk, AND a side request multiplexed on
 the same upstream conn would queue head-of-line behind the held stream.
 Direct-to-node uses one h2 connection per curl, so the probes don't HOL.

@@ -15,7 +15,7 @@ The engine gap this closed (commit history): the V2 `rewind` worker captured
 tapes but wrote request-log batches to a LOCAL `FsBatchStore`, while the only
 tape-query binary, `log-server-standalone`, reads S3-only — writer (fs) and
 reader (S3) never met, so no bundle could be assembled. Fixed by building the
-batch store in `src-v2/rewind/main.zig` from the blob S3 config (the flusher
+batch store in `src/rewind/main.zig` from the blob S3 config (the flusher
 thread, spawned by `Worker.create`, was already running) + a per-cluster
 `LOG_S3_KEY_PREFIX` so the co-spawned indexer reads exactly this run's batches.
 

@@ -188,7 +188,7 @@ def main() -> int:
 
                 # ⭐ Gap A (deploy auto-load on promotion): on V2 a promoted
                 # follower's on-promotion hook (`runPromotionHook` in
-                # `src-v2/rewind/main.zig`) reads the replicated
+                # `src/rewind/main.zig`) reads the replicated
                 # `_deploy/current` and enqueues the loader, so the handler is
                 # served on the new leader with NO re-release. The `__warm`
                 # probe schedules a far-future (delay=999999) wake purely to

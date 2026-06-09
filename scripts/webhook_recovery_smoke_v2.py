@@ -22,7 +22,7 @@ on, driven entirely by the sweep (delivery is sweep-only, never inline):
 
 WHY SINGLE-NODE (the V1 smoke was a 3-node leader-kill): on V2 the
 promotion-sweep recovery the V1 smoke exercised is NOT fully wired —
-(a) `src-v2/rewind/main.zig` calls the STEADY `sweepOwedRetries` every tick
+(a) `src/rewind/main.zig` calls the STEADY `sweepOwedRetries` every tick
 but never `sweepOwedRetriesOnPromotion`; (b) a promoted follower does not
 auto-load its deployment from the replicated `_deploy/current` (the gap
 `leader_failover_smoke_v2.py` surfaces); and (c) the `webhook_onresult`

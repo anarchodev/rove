@@ -6,7 +6,7 @@
 > [`plan-tiers.md`](plan-tiers.md) (which is V1-framed — `__root__.db`,
 > envelope type `2`); the **enforcement** half of that doc is unchanged.
 > Companions: [`v2-cp-directory-replication.md`](v2-cp-directory-replication.md)
-> (the replicated directory this extends), `src-v2/cp/directory.zig` (the
+> (the replicated directory this extends), `src/cp/directory.zig` (the
 > interface), [`effect-algebra.md`](effect-algebra.md) (a CP write is a `Cmd`),
 > [`project_v2_zero_downtime_move`] memory (CP = dedicated cluster/binary).
 

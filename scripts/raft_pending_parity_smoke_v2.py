@@ -6,7 +6,7 @@ The V1 smoke was a *pre-migration parity gate* for collapsing the H2
 reference path off the willemt `raft_pending_response` arm onto
 `effect.Continuation` + `reconcile()`. That willemt-specific commit-arm
 pipeline has NO V2 analog: on V2 the per-tenant raft is the `Bridge`
-(`src-v2/kv/bridge.zig`) + raft-rs, and a single voter leader-skips apply
+(`src/consensus/bridge.zig`) + raft-rs, and a single voter leader-skips apply
 entirely (worker owns the speculative overlay). So the *mechanism* the V1
 gate poked (`raft_pending` collections, willemt commit ordering) is gone.
 

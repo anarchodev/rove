@@ -23,7 +23,7 @@ after the kill the replicated value is read back on each SURVIVING node via
 `admin_kv_get`, and a fresh write commits on the surviving 2-node quorum
 (`admin_kv_put` → leader propose) and reads back. (The handler-dispatch serve
 path after a kill needs the follower deployment-load path — now wired via the
-DP apply observer + on-promotion hook (`src-v2/rewind/main.zig`) and exercised
+DP apply observer + on-promotion hook (`src/rewind/main.zig`) and exercised
 by `durable_wake_smoke_v2`. This smoke asserts data survival through `v2-kv`
 to mirror `three_node_smoke`, orthogonal to handler serving.)
 
