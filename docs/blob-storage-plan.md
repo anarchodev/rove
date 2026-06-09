@@ -345,7 +345,7 @@ direction, that is the promotion signal
 
 | Phase | Ships | Notes |
 |---|---|---|
-| P1 | node-local signing proxy + `put`/`get`/`pipe`/`url` shims | smallest end-to-end slice; covers events, snapshots, small media; `url` unlocks 307-to-presigned downloads |
+| P1 ✅ | signing door + `put`/`get`/`url` shims (2026-06-09, `scripts/blob_smoke_v2.py` 14/14) | smallest end-to-end slice; covers events, snapshots, small media; `url` unlocks 307-to-presigned downloads |
 | P2 | `write`/`seal` sessions (RAM-sourced assembly via `readBody`/`release`) | Case A streaming uploads; bounded 5 MiB part buffer |
 | P3 | `onHeaders` dispatch + `blob.receive` | Case B one-PUT uploads; h2 window held until disposition |
 | P4 | `segments.js` stdlib recipe + docs | the kv-cap ↔ byte-ring lever, documented |
@@ -353,6 +353,21 @@ direction, that is the promotion signal
 
 Each phase is independently useful; P1 alone un-blocks the Matrix
 exercise's event store and media reads.
+
+**P1 as-built deltas.** The "node-local signing proxy" shipped as a
+fetch-engine special-origin interceptor (`fetch_engine.zig`
+`rewriteAndSignBlobFetch`): the shims fetch
+`http://rove-blob.internal/{hash}`, the engine rewrites + SigV4-signs
+in-process — same trust boundary (tenant from `pf.tenant_id`, keys
+never in JS), no extra hop, no listener. `blob.pipe` deferred out of
+P1: the engine's `pipe_to` disposition was retired in reification
+Phase 5 PR-1, and `blob.url` 307-redirect covers the
+serve-bytes-to-client case better; revisit with P3 if a real
+in-handler pipe case appears. `blob.put` is single-attempt in P1
+(marker persists `failed:true` as evidence; no re-fire — the marker
+deliberately carries no bytes, §2.5 re-execution recovery is the
+follow-up). `_blob/` is deliberately NOT platform-reserved (the
+`_send/` rule: the shim writes the marker as customer JS).
 
 ## 9. Relation to other docs
 

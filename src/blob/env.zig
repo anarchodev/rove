@@ -74,7 +74,25 @@ pub fn envOpt(allocator: std.mem.Allocator, name: []const u8) error{OutOfMemory}
 /// `LoadError` values for missing required S3 settings so each binary
 /// can print its own diagnostic.
 pub fn loadFromEnv(allocator: std.mem.Allocator) LoadError!BlobBackendOwned {
-    const endpoint = (try envOpt(allocator, ENV_S3_ENDPOINT)) orelse return LoadError.MissingS3Endpoint;
+    const endpoint_raw = (try envOpt(allocator, ENV_S3_ENDPOINT)) orelse return LoadError.MissingS3Endpoint;
+    // Normalize to a bare host at the single load point: operators
+    // habitually set `S3_ENDPOINT=https://…` and `S3BlobStore.init`
+    // tolerates it by stripping, but every OTHER consumer of
+    // `BackendConfig.endpoint` (the fetch-engine blob door, the
+    // `blob.url` presign binding) builds URLs/Host headers from it
+    // raw — a scheme-carrying endpoint yields `https://https://…`.
+    // The scheme on the wire is `use_tls`'s job, never the
+    // endpoint's.
+    const endpoint = blk: {
+        var e: []const u8 = endpoint_raw;
+        if (std.mem.startsWith(u8, e, "https://")) e = e["https://".len..];
+        if (std.mem.startsWith(u8, e, "http://")) e = e["http://".len..];
+        while (e.len > 0 and e[e.len - 1] == '/') e = e[0 .. e.len - 1];
+        if (e.len == endpoint_raw.len) break :blk endpoint_raw;
+        const trimmed = allocator.dupe(u8, e) catch return LoadError.OutOfMemory;
+        allocator.free(endpoint_raw);
+        break :blk trimmed;
+    };
     errdefer allocator.free(endpoint);
     const region = (try envOpt(allocator, ENV_S3_REGION)) orelse return LoadError.MissingS3Region;
     errdefer allocator.free(region);
