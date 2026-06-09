@@ -1,17 +1,66 @@
-# Durable scheduled wake — build plan
+# Durable scheduled wake
 
-**Design home:** `primitive-gaps.md` §2.6 (the gap + both resolved forks)
-and §2.6.1 (interface + caps). Effect-model anchor: `effect-algebra.md`
-§2.2 (L2 reconstruct-vs-abandon — this generalizes the one place
-reconstruction is hardcoded) and §2.3 (Msg origins — the open family this
-adds to). Read those first; this doc is only the build order.
+**Effect-model anchor:** `effect-algebra.md` §2.2 (L2 reconstruct-vs-abandon —
+this generalizes the one place reconstruction is hardcoded) and §2.3 (Msg
+origins — the open family this adds to).
 
-**Goal.** Turn webhook's privileged `_send/owed/` boot-scan into a
-primitive: a one-shot, absolute-time, at-least-once **firing** durable
-wake, fronted by one canonical JS `scheduler` lib, with cron / webhook /
-email / retry re-platformed on top. Net effect: delete the per-feature Zig
-sweeps; durable cron becomes possible; one generic privileged JS lib
-replaces N feature-specific sweeps.
+**Goal.** Turn webhook's privileged `_send/owed/` boot-scan into a primitive: a
+one-shot, absolute-time, at-least-once **firing** durable wake, fronted by one
+canonical JS `scheduler` lib, with cron / webhook / email / retry re-platformed
+on top. Net effect: delete the per-feature Zig sweeps; durable cron becomes
+possible; one generic privileged JS lib replaces N feature-specific sweeps.
+
+## Design
+
+**The gap.** `webhook.send` should be a JS-shim composition over `kv.set` +
+`http.fetch`, but it has a privileged tail a customer cannot reproduce: the
+retry/boot sweep (`sweepOwedRetries` / `…OnPromotion`) hardcoded to scan
+`_send/owed/` and fire the baked `__system/webhook_onresult`. A customer can
+write the marker + the fetch, but cannot express "re-arm me at time T, surviving
+leader change." A feature leaning on machinery no other composition can reach is
+the smell.
+
+**Not a missing law — a hardcoded instance of L2.** `effect-algebra.md` §2.2
+already names the owed Continuation as the one that *reconstructs* (the
+boot-scan); the defect is only that reconstruction is wired to webhook's prefix
+instead of being a primitive. §2.3 blesses the fix: Msg origins are the open
+family, and a durable wake is the missing sibling of `cron` / `boot`.
+
+**The primitive: one-shot, absolute-time, at-least-once firing.**
+`Cmd.scheduleWake(at_ns, msg)` writes an ordinary env-0 Model key; a
+`durable_wake` Msg origin fires when due. One-shot **absolute**, not
+interval-cron — webhook backoff needs irregular fire times an interval can't
+express; recurrence is a one-shot that re-arms itself; interval-cron becomes
+sugar over it. It collapses `webhook.send` / `email.send` / `retry.*` / durable
+cron / delayed jobs / debounce / lease-TTL / saga timeouts into libraries over
+one Msg origin. Consistent with L1 — wake records are ordinary Model keys, **not**
+the deleted `schedules.db` second store.
+
+**Resolution 1 — locus: a canonical JS `scheduler` lib over a capability-scoped
+primitive.** The engine keeps **one** durable next-fire per tenant (a single
+timestamp) reachable only by the baked `scheduler` lib (the `__system/`
+privilege), never by customer code — so independent timers can't clobber a shared
+raw slot. The per-tenant queue / ordering / fan-out lives in the `scheduler` JS
+lib (ordinary taped kv); cron / webhook / email compose on `scheduler.at()`. This
+gets the composability of an engine-owned queue with the minimal-engine posture
+of the JS-shim direction. An opt-in bring-your-own override is deferred until a
+customer asks.
+
+**Resolution 2 — contract: firing, not completion.** At-least-once *firing* (the
+wake guarantees the handler *runs*; the library owns retry + dedup) over
+at-least-once *completion* (the engine re-arms until terminal success, absorbing
+the retry kernel). Retry **policy** (attempts, backoff) is a composition → JS;
+retry **budget** (rate, outstanding) is a resource bound → engine, regardless of
+who owns policy. Firing keeps all three properties — platform controls the rate
+(caps), customers decide policy (JS), no retry kernel re-enters Zig — continuous
+with the durability-as-JS-shim decision (`b908953`). Consequence: `_send/owed/`
+does **not** disappear; it is *de-privileged* to ordinary library kv.
+
+**Preserves the invariants.** Commit-gated (the wake Cmd writes a Model key,
+released post-commit per L4); replayable (the `durable_wake` Msg is a taped input
+per L3, `at_ns` a recorded scalar — see `tape-minimization.md`); affine + strike
+posture intact. An additive Msg origin, not a relaxation. The concrete interface
+and caps are the phases below (P3 = the `scheduler` lib; P4 = the caps).
 
 ## Status
 
@@ -60,7 +109,7 @@ sketch below):
 
 ## Phases
 
-Land-inert-first (mirrors `effect-reification-plan.md` Phase 5 PR-3 step 1:
+Land-inert-first (mirrors `architecture/effects-and-handlers.md` Phase 5 PR-3 step 1:
 the owed sweep shipped inert as a safety net before the atomic flip).
 
 - **P0 — engine primitive (inert).** `__rove_set_wake(when_ns)` global
@@ -85,7 +134,7 @@ the owed sweep shipped inert as a safety net before the atomic flip).
   wake's `next_wake_ns` must be set from **committed** state, never from
   the handler that called `at()` (its `_sched` write is uncommitted at
   return — this is exactly the marker-commit race of
-  `effect-reification-plan.md` Phase 4.1 / durability-as-JS-shim bug #5).
+  `architecture/effects-and-handlers.md` Phase 4.1 / durability-as-JS-shim bug #5).
   Mechanism: a **kv-react** subscription (Gap 2.1) on the `_sched/by_time/`
   prefix fires `scheduler_tick` post-commit on the committing leader
   worker, which reads the now-committed entry and sets the wake. No
@@ -93,7 +142,8 @@ the owed sweep shipped inert as a safety net before the atomic flip).
   required for correctness.
 
 - **P3 — public `globals/scheduler.js`.** `at` / `after` / `cancel` /
-  `get` per §2.6.1. `id = base64url(sha256(key))` when `opts.key` given,
+  `get`: `scheduler.at(whenNs, target, msg?, {key?})` (+ `after`/`cancel`/`get`);
+  `id = base64url(sha256(key))` when `opts.key` given,
   else `crypto.randomUUID()`. Writes `_sched/by_id/{id}` +
   `_sched/by_time/{when_ns_padded}/{id}`. Round `whenNs` up to the next
   tick. Documented shim (JSDoc-extracted per the globals/_system split).
@@ -139,13 +189,13 @@ the owed sweep shipped inert as a safety net before the atomic flip).
 - **Replay / determinism** → the `durable_wake` Msg is a taped input (L3);
   `scheduled_at_ns` recorded; the WASM replay host needs a `durable_wake`
   activation kind. `id` is deterministic (sha256(key)) or rides the
-  seeded PRNG (`randomUUID`, already taped per primitive-gaps §9/§10).
+  seeded PRNG (`randomUUID`, already taped — see `tape-minimization.md`).
 - **Recovery scan cost** → bounded by `SCHED_MAX_OUTSTANDING`; paged/lazy
   recovery is the lever beyond 10k (`project_owed_recovery_strategy`).
 
 ## Not in this plan
 
 - The opt-in **scheduler override** seam (bring-your-own under
-  `scheduler`) — deferred until a customer asks (§2.6).
+  `scheduler`) — deferred until a customer asks (see Design above).
 - **Many-timer engine index** — explicitly rejected; the queue lives in
   the `scheduler` JS lib, the engine keeps one next-fire per tenant.

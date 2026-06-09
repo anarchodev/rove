@@ -1,8 +1,9 @@
-# Observability plan — Grafana Cloud cutover
+# Observability
 
-> Expands PLAN §2.9 on the **operator-telemetry** side. The
-> customer-facing logs/replay story is in `docs/logs-plan.md`; this
-> doc covers metrics + traces aimed at oncall, not at customers.
+> 🟢 **As-built reference.** Operator telemetry (metrics + traces to Grafana
+> Cloud), aimed at oncall — not at customers. The customer-facing request-log /
+> replay store is [`deployment-and-logs.md`](deployment-and-logs.md). Why (the
+> two-sink split + the no-`tenant_id`-label rule): [decisions.md §7](../decisions.md).
 >
 > Status as of 2026-05-13: pre-implementation. Today's surface is a
 > single `/_system/metrics` endpoint on the worker (the io/h2/raft
@@ -20,8 +21,9 @@ Tempo).
 **The load-bearing constraint** (decided 2026-05-13, persisted in
 auto-memory as `project_observability_split`): **customer request logs
 do not go to Grafana.** They live in the per-tenant replay store
-(`docs/logs-plan.md` — S3-direct, page-encrypted at rest, addressable
-by request_id). Grafana Cloud holds operator-shaped signals only.
+([`deployment-and-logs.md`](deployment-and-logs.md) — S3-direct,
+page-encrypted at rest, addressable by request_id). Grafana Cloud holds
+operator-shaped signals only.
 `tenant_id` and `request_id` ride as **trace exemplars or low-cardinality
 structured-log fields**, never as Prometheus labels. The reasons:
 

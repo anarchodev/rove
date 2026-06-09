@@ -2,17 +2,18 @@
 
 > **V2 storage note.** The **storage** decisions below are V1-framed
 > (`__root__.db`, `root_writeset` envelope type `2`). For V2 the tier/limits
-> source of truth moves to the **CP directory**, authored by an admin app —
-> see [`v2-cp-operational-state.md`](v2-cp-operational-state.md). The
-> **enforcement** half of this doc (levers 1–3, the `TenantSlot` cache, plan
-> generation) is unchanged by that move.
+> source of truth moves to the **CP directory**, authored by an admin app — see
+> [decisions.md §10.9](decisions.md) (the decision) +
+> `architecture/control-plane.md` ("Operational state", the mechanics; shipped
+> 2026-06). The **enforcement** half of this doc (levers 1–3, the `TenantSlot`
+> cache, plan generation) is unchanged by that move.
 
 **Design home:** this doc. Surface anchors: rate limiter
 `src/js/limiter.zig` (already tier-shaped — see its header comment),
 tenant metadata `src/tenant/root.zig` (`Instance`, `resolveDomain`),
 deployment hot-path cache `src/js/deployment_cache.zig` (`TenantSlot`),
 inbound body path `src/h2/root.zig` (`ReqBody` / `bodyAppend`), retention
-`docs/logs-plan.md` §6.8, rate-limiter primitive `docs/PLAN.md` §2.10.
+`docs/architecture/deployment-and-logs.md` §6.8, rate-limiter primitive `docs/PLAN.md` §2.10.
 
 **Goal.** Let paying customers buy bigger numbers on three axes —
 **request rate**, **max body size**, **tape retention window** — without
@@ -146,7 +147,7 @@ DoS vector worth closing regardless of tiers.
 
 ## Lever 3 — tape retention (read-path window clamp; no GC at launch)
 
-Full compacting GC is specced in `logs-plan.md` §6.8 but **unbuilt**.
+Full compacting GC is specced in `architecture/deployment-and-logs.md` §6.8 but **unbuilt**.
 We do **not** build it for launch. Instead we *fake* retention as a
 read-path clamp: tapes/logs physically persist on S3 unbounded, but the
 list/query surface only returns the last `EFFECTIVE(retention_days)`.
@@ -179,7 +180,7 @@ list/query surface only returns the last `EFFECTIVE(retention_days)`.
 
 **Later:**
 
-- Real retention GC (`logs-plan.md` §6.8) to reclaim S3 storage once the
+- Real retention GC (`architecture/deployment-and-logs.md` §6.8) to reclaim S3 storage once the
   faked window's storage cost matters.
 - Define the concrete `pro` / `enterprise` rows + the billing-webhook →
   admin → `root_writeset` flow (product layer).

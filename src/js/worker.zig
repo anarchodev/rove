@@ -84,7 +84,6 @@ const auth = @import("auth.zig");
 const dispatch = @import("worker_dispatch.zig");
 const worker_log = @import("worker_log.zig");
 const worker_upload_checkpoint = @import("worker_upload_checkpoint.zig");
-const worker_upload_walker = @import("worker_upload_walker.zig");
 const worker_streaming = @import("worker_streaming.zig");
 const worker_drain = @import("worker_drain.zig");
 const panic_mod = @import("panic.zig");
@@ -119,7 +118,6 @@ const owed_retry = @import("owed_retry.zig");
 // (-> main.zig via rjs.X) keep working unchanged.
 pub const OWED_PREFIX = owed_retry.OWED_PREFIX;
 pub const scanLoneOwedSendId = owed_retry.scanLoneOwedSendId;
-pub const SEND_SWEEP_INTERVAL_NS = owed_retry.SEND_SWEEP_INTERVAL_NS;
 pub const sweepOwedRetries = owed_retry.sweepOwedRetries;
 pub const sweepOwedRetriesOnPromotion = owed_retry.sweepOwedRetriesOnPromotion;
 const subscription_sweep = @import("subscription_sweep.zig");
@@ -127,13 +125,11 @@ const subscription_sweep = @import("subscription_sweep.zig");
 // CronState is re-exported for the Worker `cron_state` collection row;
 // the sweep entry points for root.zig -> main.zig.
 pub const CronState = subscription_sweep.CronState;
-pub const CRON_SWEEP_INTERVAL_NS = subscription_sweep.CRON_SWEEP_INTERVAL_NS;
 pub const sweepBootSubscriptions = subscription_sweep.sweepBootSubscriptions;
 const starter = @import("starter.zig");
 pub const sweepCronSubscriptions = subscription_sweep.sweepCronSubscriptions;
 const durable_wake = @import("durable_wake.zig");
 // §2.6 durable scheduled-wake sweep lives in durable_wake.zig.
-pub const WAKE_SWEEP_INTERVAL_NS = durable_wake.WAKE_SWEEP_INTERVAL_NS;
 pub const sweepDurableWakes = durable_wake.sweepDurableWakes;
 pub const sweepDurableWakesOnPromotion = durable_wake.sweepDurableWakesOnPromotion;
 
@@ -1517,9 +1513,9 @@ pub fn Worker(comptime opts: Options) type {
         /// `open_duration_ns` — protecting the shared h2 thread from a
         /// runaway stored procedure. Auto-releases on redeploy.
         penalty_box: penalty_mod.PenaltyBox,
-        /// Per-instance × per-action token-bucket limits. Single tier
-        /// in v1 (`limiter_mod.defaultCaps()`); Phase 10 will branch
-        /// on plan. Customer-tenant traffic checks the `request`
+        /// Per-instance × per-action token-bucket limits, resolved from
+        /// the tenant's plan-tier caps (`rove-plan`; docs/plan-tiers.md).
+        /// Customer-tenant traffic checks the `request`
         /// bucket before dispatch and gets 429 + Retry-After when
         /// exhausted; admin requests bypass the check entirely.
         /// `email.send` from a handler checks the `email` bucket and
@@ -1551,36 +1547,7 @@ pub fn Worker(comptime opts: Options) type {
         /// raft seq this worker has covered with a successful
         /// `flushLogs`. Read at startup from the checkpoint file
         /// (0 if missing); advanced after each successful flush.
-        /// Phase 5c's promotion-time walker reads this (or the
-        /// MINIMUM across all per-worker checkpoints on the node)
-        /// to know where to resume re-uploading log records derived
-        /// from raft entries.
         last_uploaded_seq: u64 = 0,
-        /// `docs/readset-replication-plan.md` Phase 5c — last raft
-        /// log index the upload walker has visited. Persists only
-        /// for the worker's lifetime (resets to 0 on restart;
-        /// re-scanning is cheap because entries with
-        /// `seq <= last_uploaded_seq` are skipped without
-        /// hydrating). Only the designated walker worker
-        /// (`log_worker_id == 0`) on the current leader advances it.
-        upload_walker_idx: u64 = 0,
-        /// `docs/chunk-spool-plan.md` Phase 5 walker-race fix: the
-        /// upload walker now runs ONLY during post-promotion catchup,
-        /// not every flusher tick — a healthy leader's logs already
-        /// come from dispatch capture, so the steady-state per-tick
-        /// `raft_log` reads (which raced the raft thread + were pure
-        /// waste) are gone. These two fields, touched ONLY by the
-        /// flusher thread, drive that gating:
-        ///   - `walker_is_leader`: the flusher's own view of leadership,
-        ///     so it can detect the false→true edge and arm a catchup.
-        ///   - `upload_catchup_target`: raft index to catch up to,
-        ///     snapshotted (via the reader connection) when the flusher
-        ///     observes promotion. The walker walks up to it, then
-        ///     idles until the next promotion. Entries committed after
-        ///     promotion are this leader's own (dispatch-captured), so
-        ///     they don't need the walker.
-        walker_is_leader: bool = false,
-        upload_catchup_target: u64 = 0,
         /// Compile callback used by signup to deploy starter content.
         /// Borrowed from `WorkerConfig.compile_fn` / `compile_ctx`.
         compile_fn: ?files_mod.CompileFn,
@@ -1778,8 +1745,7 @@ pub fn Worker(comptime opts: Options) type {
 
             // docs/streaming-model.md §7: body flush is the process-
             // global BlobCoordinator's job (NodeState.blob_coordinator);
-            // this per-worker flusher_thread runs only log flush + the
-            // upload-walker.
+            // this per-worker flusher_thread runs only the log flush.
             self.flusher_thread = try std.Thread.spawn(.{}, flusherLoop, .{self});
 
             // Spawn the push thread only if a libcurl handle was
@@ -1814,28 +1780,13 @@ pub fn Worker(comptime opts: Options) type {
         fn flusherLoop(self: *Self) void {
             const FLUSHER_TICK_NS: u64 = 50 * std.time.ns_per_ms;
             while (!self.flusher_should_stop.load(.acquire)) {
-                // docs/streaming-model.md §7: body flush
-                // is now driven by the process-global coordinator's
-                // own drainer + executor threads — no per-tick call
-                // from the worker. Log flush + upload-walker still
-                // ride this tick.
-                // Phase 5c order: flushLogs FIRST (drains the local
-                // fast path's records + advances `last_uploaded_seq`),
-                // walker SECOND. On a healthy leader the walker then
-                // sees `seq <= last_uploaded_seq` for every entry it
-                // visits and short-circuits without hydrating —
-                // avoiding the per-entry-per-tick double-PUT that
-                // walker-first ordering would create. On promotion
-                // catchup (new leader with `last_uploaded_seq = 0`),
-                // flushLogs has nothing to drain on the first tick
-                // and the walker appends records that the NEXT tick's
-                // flushLogs picks up. Eventual consistency at the
-                // indexer absorbs any narrow-window duplicates.
+                // docs/streaming-model.md §7: body flush is now driven by
+                // the process-global coordinator's own drainer + executor
+                // threads — no per-tick call from the worker. The per-tick
+                // log flush drains the local fast path's records and advances
+                // `last_uploaded_seq`.
                 _ = worker_log.flushLogs(self) catch |err| {
                     std.log.warn("rove-js flusher: flushLogs failed: {s}", .{@errorName(err)});
-                };
-                worker_upload_walker.walkAndUploadCatchup(self) catch |err| {
-                    std.log.warn("rove-js flusher: walkAndUploadCatchup failed: {s}", .{@errorName(err)});
                 };
                 self.flusher_wake.timedWait(FLUSHER_TICK_NS) catch {};
                 self.flusher_wake.reset();

@@ -30,13 +30,12 @@ import. It owns no kv namespace and ships full JSDoc — see
   your actor + key), so use a domain you will keep — your custom
   domain or your `*.rewindjs.app` host. WebFinger **must** be served
   from the same host that appears in `@username@host`.
-- The edge proxy every production deployment already requires
-  (`docs/deployment.md` §Prerequisites). Remote fediverse servers are
-  long-tail HTTP/1.1 clients; the proxy terminates them and speaks h2
-  to your worker. No special transport setup — this is the same
-  proxy you already run.
+- The front door every production deployment already runs terminates
+  long-tail HTTP/1.1 clients (remote fediverse servers) and speaks h2 to
+  your worker (`docs/architecture/routing-and-ingress.md`). No special
+  transport setup.
 - Deploy with the same `_deploy/current` flow you already use
-  (`docs/deployment.md`). Nothing here is deploy-special.
+  (`docs/architecture/deployment-and-logs.md`). Nothing here is deploy-special.
 
 ---
 
@@ -282,10 +281,11 @@ Honest scope, so you know the edges:
   accounts) means one config per actor via
   `activitypub.fromConfig("name")` reading `_config/activitypub/name`.
 - **No AT Protocol / firehose.** That needs WebSockets and the
-  connection-actor primitive (`docs/connection-actor-plan.md`) and is
-  deliberately v2. ActivityPub needs none of it.
+  connection-actor primitive (`docs/architecture/effects-and-handlers.md`,
+  `docs/architecture/routing-and-ingress.md`) and is deliberately v2.
+  ActivityPub needs none of it.
 
 Reference: `src/js/globals/activitypub.js` (full JSDoc + `@example` on
 every method), `src/js/bindings/webhook.send.js` (the durable outbound
-Cmd this rides), `docs/connection-actor-plan.md` (where the
+Cmd this rides), `docs/architecture/routing-and-ingress.md` (where the
 held-connection work goes when it's time).

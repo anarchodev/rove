@@ -5,9 +5,9 @@
 > the rewrite: **moving a tenant from one cluster to another.** It assumes
 > the strategic frame settled in conversation on 2026-05-29 (see
 > "Decision" below) and builds on the substrate already prototyped and
-> partially landed. Companion docs: [`v2-vendoring-spike.md`](v2-vendoring-spike.md)
+> partially landed. Companion docs: [`architecture/consensus-and-storage.md`](architecture/consensus-and-storage.md)
 > (how raft-rs lives under `vendor/` + the FFI shape) and
-> [`v2-multiraft-scaling-learnings.md`](v2-multiraft-scaling-learnings.md)
+> [`architecture/consensus-and-storage.md`](architecture/consensus-and-storage.md)
 > (measured findings from the rewind2 / raft-rs-zig prototype). PLAN §13
 > is the live process/surface map.
 
@@ -163,7 +163,7 @@ This is the heart of the rewrite.
 > orchestration + `moving` directory state (`src/front/main.zig`,
 > `src/cp/directory.zig`). Exit smoke `scripts/tenant_move_smoke.py` is
 > green: write → move → read-back, data intact, new cluster serves,
-> source evicted, routing flipped. Details: [`v2-phase4-tenant-move.md`](v2-phase4-tenant-move.md).
+> source evicted, routing flipped. Details: [`architecture/control-plane.md`](architecture/control-plane.md).
 > **The milestone is proven.** Phase 5 (multi-node HA) is now DONE too.
 
 - **New:** the move orchestration. Quiesce the tenant (directory marks it
@@ -206,7 +206,7 @@ This is the heart of the rewrite.
 > 3-node destination, serves it leader-aware, kills the LEADER, and a
 > promoted follower serves the replicated data; a post-failover write
 > commits on the surviving quorum. Single-node milestone smokes still pass.
-> Details: [`v2-phase5-multinode.md`](v2-phase5-multinode.md).
+> Details: [`architecture/consensus-and-storage.md`](architecture/consensus-and-storage.md).
 
 - **New:** cross-node transport; form per-tenant groups across 3 nodes;
   per-group election/failover; moves create the destination group on all
@@ -234,7 +234,7 @@ This is the heart of the rewrite.
 > (`v2-hibernation-bench`) shows pump cycle time at K=10k drop from
 > 1000 µs/cycle (tick-all) to ~0 when the tenants are idle (~31,000×). A
 > cluster-scale live-traffic macrobench is a separate follow-up. Details:
-> [`v2-phase6-hibernation.md`](v2-phase6-hibernation.md).
+> [`architecture/consensus-and-storage.md`](architecture/consensus-and-storage.md).
 
 - **New:** the active-set machinery above the FFI — bump on propose and on
   non-heartbeat step only, tick only the active set, do not pre-seed at

@@ -8,7 +8,7 @@ Rove is a Zig systems library for building distributed serverless worker infrast
 
 ## Product direction
 
-`rove` is the engine for **rewind.js**, a purely-functional serverless product. Locked architecture and phased build plan live in [`docs/PLAN.md`](docs/PLAN.md). Read it before making decisions that could contradict existing direction (domain layout, pure-function execution model, Cmd-pattern external effects via **one outbound HTTP primitive** with `webhook.send` / `email.send` / `retry.*` as **JS-shim libraries that compose durability on top of it** — see `effect-algebra.md` §6 rule 4 + `effect-reification-plan.md` Phase 5; page-level encryption at rest; etc.). Section 7 of that doc lists decisions that were explicitly considered and rejected — do not re-propose those without new information. Sub-plans in `docs/` (`files-server-plan.md`, `logs-plan.md`, `snapshot-plan.md`, `sim-test-framework.md`, `fixture-lifecycle.md`, `agent-surface.md`, `observability-plan.md`, `replay-wasm-plan.md`, `dashboard-design-brief.md`, `auth-domain-plan.md`, `builtin-libs-docs-plan.md`, `users-lib-plan.md`, `connection-actor-plan.md`, `effect-algebra.md`, `effect-reification-plan.md`, `websocket-plan.md`, `durable-wake-plan.md`, `plan-tiers.md`, `v2-front-door-architecture.md`, `v2-cp-operational-state.md`, `platform-accounts-model.md`) elaborate specific PLAN sections. `docs/effect-algebra.md` is the cross-cutting model — the four-primitive frame every external effect fits, plus the live effect audit. PLAN §13 is the live process / surface map.
+`rove` is the engine for **rewind.js**, a purely-functional serverless product. Locked architecture and phased build plan live in [`docs/PLAN.md`](docs/PLAN.md). Read it before making decisions that could contradict existing direction (domain layout, pure-function execution model, Cmd-pattern external effects via **one outbound HTTP primitive** with `webhook.send` / `email.send` / `retry.*` as **JS-shim libraries that compose durability on top of it** — see `effect-algebra.md` §6 rule 4 + `decisions.md` §3.3; page-level encryption at rest; etc.). Section 7 of that doc lists decisions that were explicitly considered and rejected — do not re-propose those without new information. **`docs/README.md` is the documentation map.** As-built architecture references live in `docs/architecture/` (`overview`, `consensus-and-storage`, `effects-and-handlers`, `routing-and-ingress`, `control-plane`, `deployment-and-logs`, `auth-and-domains`, `observability`); locked decisions + rejected alternatives in `docs/decisions.md`; in-flight plans + product/strategy docs in `docs/` (per the README map). `docs/effect-algebra.md` (the cross-cutting four-primitive model + live effect audit) and `docs/handler-shape.md` (the customer handler surface) are the customer-facing contracts. PLAN §13 is the live process / surface map.
 
 ## Build commands
 
@@ -88,7 +88,7 @@ Systems are pure functions called between `poll()` and `reg.flush()`, not method
 h2.request_out → dispatchOnce → [drainRaftPending if writes] → h2.response_in → h2.response_out
 ```
 
-`dispatchOnce` invokes the handler via `Dispatcher.runOutcome` (`src/js/dispatcher.zig`) — the single re-entry point for every activation (inbound, send_callback, fetch_chunk, kv_wake, disconnect, subscription_fire). See `docs/effect-reification-plan.md` §3.3 for the Continuation primitive that backs the parked Msg queue.
+`dispatchOnce` invokes the handler via `Dispatcher.runOutcome` (`src/js/dispatcher.zig`) — the single re-entry point for every activation (inbound, send_callback, fetch_chunk, kv_wake, disconnect, subscription_fire). See `docs/architecture/effects-and-handlers.md` for the Continuation primitive that backs the parked Msg queue.
 
 Each JS request gets a fresh JS context via arenajs's dual-arena reset (one cursor write per request — see `vendor/arenajs/README.md`). The base arena is built once at worker startup and shared across all requests on the thread; the per-request arena is reset between handler invocations.
 
@@ -102,11 +102,11 @@ Envelopes are typed byte blobs (`src/js/apply.zig`). Only three types are live (
 
 | Type | Target store | Producer |
 |---|---|---|
-| `0` writeset | `{data_dir}/{id}/app.db` | Customer handler `kv.*` via `TrackedTxn` + writeset; `_deploy/current` release marker; the `webhook.send` / `email.send` JS-shim's `_send/owed/{id}` markers ride here too (ordinary kv writes — no apply-time special-case post `effect-reification-plan.md` Phase 5) |
+| `0` writeset | `{data_dir}/{id}/app.db` | Customer handler `kv.*` via `TrackedTxn` + writeset; `_deploy/current` release marker; the `webhook.send` / `email.send` JS-shim's `_send/owed/{id}` markers ride here too (ordinary kv writes — no apply-time special-case post the durability-as-JS-shim change, `decisions.md` §3.3) |
 | `1` multi | per-inner-envelope target | Worker dispatcher — atomically bundles multiple writeset envelopes into one raft entry |
-| `2` root_writeset | `{data_dir}/__root__.db` | `provisionInstance` / admin `createInstance`'s `tenant.createInstance`; admin JS `platform.root.*`; ACME `cert/{host}` (auth-domain-plan §3.2) |
+| `2` root_writeset | `{data_dir}/__root__.db` | `provisionInstance` / admin `createInstance`'s `tenant.createInstance`; admin JS `platform.root.*`; ACME `cert/{host}` (see `docs/architecture/auth-and-domains.md`) |
 
-Retired type bytes — the decoder rejects each loudly, so any stale raft-log entry surfaces instead of silently mis-applying: `log_batch` (originally type 1) and `files_writeset` (3) in Phase 5.5 (a) / (e) — log batches go S3-direct per `docs/logs-plan.md`, per-tenant deployment manifests live in a `deployments/` BlobBackend per `docs/files-server-plan.md`; the dedicated webhook envelopes (4/5/6) on 2026-05-09; and `schedule_upsert/complete/cancel/demote` (8/9/10/11) on 2026-05-19 in the `http.send` Option-(b) re-platform — there is no `schedules.db` and no schedule-server thread. The per-node leader-local `SendDispatch` that Option-(b) introduced was itself retired on 2026-05-24 per the durability-as-JS-shim decision (`effect-reification-plan.md` Phase 5 PR-3, commit `b908953`); the `_send/owed/{id}` markers are now written by `webhook.send.js` / `email.send.js` as ordinary envelope-0 kv keys and the apply-time special-cases are gone. `multi` was renumbered from type 7 to type 1 to match `kv.cluster.ENVELOPE_TYPE_MULTI`. See `docs/effect-algebra.md` for how envelopes fit the effect model, PLAN.md §10.2 for the full evolution table, and §13 for the live process map.
+Retired type bytes — the decoder rejects each loudly, so any stale raft-log entry surfaces instead of silently mis-applying: `log_batch` (originally type 1) and `files_writeset` (3) in Phase 5.5 (a) / (e) — log batches go S3-direct and per-tenant deployment manifests live in a `deployments/` BlobBackend per `docs/architecture/deployment-and-logs.md`; the dedicated webhook envelopes (4/5/6) on 2026-05-09; and `schedule_upsert/complete/cancel/demote` (8/9/10/11) on 2026-05-19 in the `http.send` Option-(b) re-platform — there is no `schedules.db` and no schedule-server thread. The per-node leader-local `SendDispatch` that Option-(b) introduced was itself retired on 2026-05-24 per the durability-as-JS-shim decision (`decisions.md` §3.3, commit `b908953`); the `_send/owed/{id}` markers are now written by `webhook.send.js` / `email.send.js` as ordinary envelope-0 kv keys and the apply-time special-cases are gone. `multi` was renumbered from type 7 to type 1 to match `kv.cluster.ENVELOPE_TYPE_MULTI`. See `docs/effect-algebra.md` for how envelopes fit the effect model, PLAN.md §10.2 for the full evolution table, and §13 for the live process map.
 
 ### Blob replication (multi-node)
 
@@ -133,3 +133,19 @@ Pins live in `build.zig.zon` (Zig/C packages) and each Rust crate's `Cargo.lock`
 - Module public API is exported through each module's `root.zig`.
 - No async/await — concurrency uses collection-based polling + phase-based dispatch.
 - Comments reference a "Phase" numbering system tracking the incremental delivery plan; phases run 0 through 14 (with 5.5 as the storage-scalability bucket). See `docs/PLAN.md` §3 for current phase content and §10.16 for the beta / 1.0 / post-1.0 launch sequencing.
+
+## Working with multiple agents (git worktrees)
+
+This repo is frequently worked on by several Claude sessions at once. To keep sessions from colliding in one working tree — where one window's uncommitted edits get swept into another's commit — **each session runs in its own git worktree on its own branch**, all sharing the one `.git` object store (no bare repo needed; worktrees attach to the regular checkout):
+
+```bash
+git worktree add ../rove-<topic> -b <branch> <base>   # e.g. ../rove-docs -b docs/restructure v2
+git worktree list
+git worktree remove ../rove-<topic>                   # when merged/abandoned; `git worktree prune` clears dead entries
+```
+
+Rules for the shared repo:
+- The main checkout (`/home/user/src/rove`) is load-bearing — it holds the real `.git`; don't delete or move it.
+- A branch can be checked out in only one worktree (git enforces this) — one branch per session by construction.
+- Never switch the branch of, or run `git add -u` / `git commit` in, a checkout another session is using. Unexplained working-tree WIP is probably a sibling session's — examine it, stage only your own files, and never commit another window's work without confirmation.
+- Smoke tests bind fixed ports (see the per-smoke port table in the scripts); don't run two smoke suites across worktrees simultaneously or they collide (`EADDRINUSE`).
