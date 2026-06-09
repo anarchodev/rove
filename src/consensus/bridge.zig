@@ -39,27 +39,43 @@
 //! per-tenant commits are monotonic, so the watermark is as precise as a
 //! per-propose handle would be here.
 //!
-//! ## Seq ↔ commit binding (explicit per-entry FIFO — Phase 5)
+//! ## Seq ↔ commit binding (entry IDENTITY — origin frame)
 //!
-//! `propose` assigns `seq = ++sig.next_seq` and pushes it onto the
-//! tenant's `pending` FIFO **in the same critical section** as the inbox
-//! append, so per-tenant seq order == inbox order == (FIFO pump drain) ==
-//! raft index order == commit order. The commit hook pops the FIFO front
-//! and sets `committed_seq` to that seq — **but only when this node is the
-//! group's leader**.
+//! `propose` assigns `seq = ++sig.next_seq`, pushes it onto the tenant's
+//! `pending` set **in the same critical section** as the inbox append,
+//! and the pump stamps every entry with the bridge's per-boot random
+//! `origin_id` + that seq (`envelope.EntryFrame`). The commit hook
+//! advances `committed_seq` to an entry's seq **iff the entry's origin is
+//! this bridge's own id and its seq is still pending** — an identity
+//! binding, never a positional one.
 //!
-//! Phase-2 used a simpler *counting* binding (Nth commit = seq N). That is
-//! wrong under multi-node: (a) a propose can fail (this node isn't the
-//! leader) so its seq never commits, and (b) a FOLLOWER applies entries
-//! replicated from another leader — committed entries with no local
-//! proposer — which counting would mis-attribute to a local waiter. The
-//! leader-gated FIFO pop fixes both: followers never advance the watermark
-//! (no local waiter), and a propose that can't commit here is FAULTED
-//! (`faulted_seq`) by the pump — at submit (`node.propose` rejected) or by
-//! the per-cycle leadership-loss sweep — so the parked worker fails fast
-//! (503) and the client retries against the leader node. A write in flight
-//! at the *instant* of a leader change is faulted + retried, not silently
-//! lost; live re-fencing under continuous load is Phase 7.
+//! Two earlier bindings were wrong in turn. Phase-2 *counting* (Nth
+//! commit = seq N) broke under multi-node: a follower applies entries
+//! with no local proposer, and a rejected propose never commits. The
+//! Phase-5 *leader-gated FIFO pop* fixed those but still bound by
+//! POSITION: an old-term entry resurrected by a re-election (committing
+//! while a NEW propose sat at the FIFO front) popped the wrong seq — a
+//! false durable ack for a write that had not committed. Identity makes
+//! that impossible: a committed entry can only ever credit the exact
+//! propose that produced it, and the per-boot random origin also fences
+//! a restarted node's replayed entries from colliding with the new
+//! incarnation's seqs.
+//!
+//! The same identity keys the worker-overlay store skip (`skipQuery`):
+//! the pump skips the store write iff the entry is this bridge's own
+//! STILL-PENDING propose (the local worker txn holds those writes and
+//! commits them on watermark advance). Entries proposed elsewhere (a
+//! promoted leader's catch-up), replayed at recovery (no live txns at
+//! boot), or whose waiter gave up (fault/timeout → txn rolled back →
+//! `abandon`) are written by the pump like any follower apply.
+//!
+//! A propose that can't commit here is FAULTED (`faulted_seq`) — at
+//! submit (`node.propose` rejected on a non-leader) or by the per-cycle
+//! leadership-loss sweep — so the parked worker fails fast (503) and the
+//! client retries against the leader. 503 means **unknown outcome**: the
+//! entry may still commit later (it then applies via the pump path, the
+//! waiter being gone), so retries are at-least-once — consistent with
+//! the platform's idempotent-replay posture.
 
 const std = @import("std");
 const node_mod = @import("node.zig");
@@ -157,6 +173,13 @@ const ControlCmd = struct {
     done: std.Thread.ResetEvent = .{},
 };
 
+/// One queued commit-wait-timeout fault request (see
+/// `Bridge.requestFault`), handed worker thread → pump thread.
+const FaultReq = struct {
+    gid: u64,
+    seq: u64,
+};
+
 /// One queued propose, handed worker thread → pump thread.
 const ProposeItem = struct {
     gid: u64,
@@ -179,6 +202,13 @@ pub const Bridge = struct {
     node: *Node,
     /// Compatibility surface for the reused worker's `.raft.config.*` reads.
     config: Config = .{},
+
+    /// This bridge incarnation's random identity, stamped (with the seq)
+    /// into every proposed entry's origin frame. The commit hook and the
+    /// skip query match on it — see the file header. Random per boot
+    /// (not the node id) so a restarted node's replayed WAL entries can
+    /// never collide with the new incarnation's seq space.
+    origin_id: u64,
 
     /// Guards `groups` + `by_id` + `next_gid` + `inbox` + every
     /// `GroupSig.next_seq`. NOT held across `node.*` calls.
@@ -205,6 +235,11 @@ pub const Bridge = struct {
     /// create-at-epoch / destroy). Pointers to caller-stack `ControlCmd`s;
     /// guarded by `mutex`. Drained + executed in `pumpOnce`.
     control_inbox: std.ArrayListUnmanaged(*ControlCmd) = .empty,
+    /// Worker-thread commit-wait timeouts awaiting pump-side execution
+    /// (`requestFault` → `drainFaultRequests`) — the fault must be
+    /// serialized with the pump's skip/commit decisions. Guarded by
+    /// `mutex`.
+    fault_requests: std.ArrayListUnmanaged(FaultReq) = .empty,
 
     pump_thread: ?std.Thread = null,
     stop: std.atomic.Value(bool) = .init(false),
@@ -238,8 +273,13 @@ pub const Bridge = struct {
 
     pub fn init(allocator: std.mem.Allocator, node: *Node) Error!*Bridge {
         const self = allocator.create(Bridge) catch return Error.OutOfMemory;
-        self.* = .{ .allocator = allocator, .node = node };
+        // origin 0 is the reserved "hookless" identity (bare proposes);
+        // re-draw on the (2^-64) collision.
+        var origin: u64 = 0;
+        while (origin == 0) origin = std.crypto.random.int(u64);
+        self.* = .{ .allocator = allocator, .node = node, .origin_id = origin };
         node.commit_hook = .{ .ctx = self, .func = onCommitted };
+        node.skip_query = .{ .ctx = self, .func = skipQuery };
         return self;
     }
 
@@ -304,6 +344,7 @@ pub const Bridge = struct {
         self.by_id.deinit(a);
         self.in_flight.deinit(a);
         self.promoted.deinit(a);
+        self.fault_requests.deinit(a);
         // Any items still queued at teardown own their payloads.
         for (self.inbox.items) |item| a.free(item.payload);
         self.inbox.deinit(a);
@@ -680,7 +721,7 @@ pub const Bridge = struct {
                 self.faultTenant(item.gid);
                 continue;
             };
-            self.node.propose(item.gid, item.payload) catch |e| {
+            self.node.proposeFramed(item.gid, self.origin_id, item.seq, item.payload) catch |e| {
                 std.log.warn("v2 bridge propose gid={d}: {s}", .{ item.gid, @errorName(e) });
                 self.faultTenant(item.gid);
             };
@@ -698,6 +739,11 @@ pub const Bridge = struct {
         //    locally because leadership moved). O(in-flight), bounded per
         //    cycle; the rest are swept next cycle.
         self.sweepLostLeadership();
+
+        // 4b. Worker commit-wait timeouts, executed HERE so the fault is
+        //     serialized against this thread's skip/commit decisions
+        //     (see `requestFault`).
+        self.drainFaultRequests();
 
         // 5. Publish each group's leadership for the worker thread (which
         //    must not touch the Manager). O(groups) per cycle — the same
@@ -817,35 +863,113 @@ pub const Bridge = struct {
         }
     }
 
-    // ── Commit hook (pump thread, via node.applyCb) ──────────────────
+    // ── Commit hook + skip query (pump thread, via node.applyCb) ─────
 
-    /// Bound to `Node.commit_hook`. Fires once per committed real entry,
-    /// in per-tenant commit order. Advances the tenant's committed_seq by
-    /// one (the counting binding — see file header). `raft_index` is
-    /// unused under counting but kept in the signature for the Phase-5
-    /// switch to explicit per-entry seqs.
-    fn onCommitted(ctx: *anyopaque, group_id: u64, raft_index: u64) void {
+    /// Bound to `Node.commit_hook`, fired post-fsync per committed real
+    /// entry with the entry's IDENTITY (origin frame). Advances the
+    /// tenant's committed_seq iff the entry is THIS bridge's own pending
+    /// propose — see the file-header binding rationale. `raft_index` is
+    /// recorded for the durabilize floor (worker-overlay ack tracking).
+    fn onCommitted(ctx: *anyopaque, group_id: u64, origin: u64, seq: u64, raft_index: u64) void {
         _ = raft_index;
         const self: *Bridge = @ptrCast(@alignCast(ctx));
+        // Not ours: a follower apply, another node's propose (a promoted
+        // leader's catch-up), a replayed entry from a previous incarnation
+        // (different boot origin), or a hookless propose (origin 0).
+        // Nothing to advance — there is no local waiter bound to it.
+        if (origin != self.origin_id) return;
         self.mutex.lock();
         defer self.mutex.unlock();
-        const sig = self.groups.get(group_id) orelse {
-            // A follower may apply a committed entry for a tenant it never
-            // had a local request for (so no GroupSig). That is normal
-            // replication, not an error — nothing to advance here.
-            return;
-        };
-        // Only the LEADER has local proposers parked on this watermark. A
-        // follower applying an entry replicated from another leader must NOT
-        // advance the watermark (there is no local waiter) nor pop the FIFO
-        // (it never pushed). This is the binding that counting could not
-        // express. On the leader, entries commit in propose (FIFO) order, so
-        // the front of `pending` is exactly this entry's seq.
-        if (!self.node.isLeader(group_id)) return;
-        if (sig.pending.items.len == 0) return; // e.g. a non-proposer no-op
-        const seq = sig.pending.orderedRemove(0);
-        sig.committed_seq.store(seq, .release);
-        if (sig.pending.items.len == 0) self.removeInFlightLocked(group_id);
+        const sig = self.groups.get(group_id) orelse return;
+        // Identity pop: remove exactly THIS seq if it is still pending.
+        // Gone already ⇒ the waiter gave up (fault / timeout → abandoned)
+        // — the pump wrote the store (skipQuery said no skip), so the
+        // data is intact; the watermark must not move for a waiter that
+        // already saw 503 ("unknown outcome", may materialize later).
+        const found = for (sig.pending.items, 0..) |s, i| {
+            if (s == seq) break i;
+        } else null;
+        if (found) |i| {
+            _ = sig.pending.orderedRemove(i);
+            // Proposes are per-tenant FIFO so commits arrive in seq order;
+            // the monotonic max guard is belt-and-braces (a stale store
+            // would strand later waiters, never wake one early).
+            if (seq > sig.committed_seq.load(.acquire))
+                sig.committed_seq.store(seq, .release);
+            if (sig.pending.items.len == 0) self.removeInFlightLocked(group_id);
+        }
+    }
+
+    /// Bound to `Node.skip_query` (worker-overlay apply). True iff this
+    /// committed entry is the bridge's OWN still-pending propose — the
+    /// local worker txn holds its writes and commits them on watermark
+    /// advance, so the pump must not double-apply. Anything else (foreign
+    /// origin, abandoned seq) must be written by the pump. Pump-thread;
+    /// takes the mutex briefly. Pending can only shrink on the pump
+    /// thread itself (commit hook / fault sweep / drainControl), so a
+    /// true answer here cannot be invalidated before this entry's own
+    /// post-flush commit notification fires later in the same cycle.
+    fn skipQuery(ctx: *anyopaque, group_id: u64, origin: u64, seq: u64) bool {
+        const self: *Bridge = @ptrCast(@alignCast(ctx));
+        if (origin != self.origin_id) return false;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const sig = self.groups.get(group_id) orelse return false;
+        for (sig.pending.items) |s| {
+            if (s == seq) return true;
+        }
+        return false;
+    }
+
+    /// Worker-thread notice that a parked propose hit its commit-wait
+    /// DEADLINE. The worker must NOT roll its speculative txn back
+    /// unilaterally — the pump may concurrently be skipping this very
+    /// entry's store write on the premise that the txn will commit it
+    /// (`skipQuery`). Instead the request queues here and the pump
+    /// executes it (`drainFaultRequests`), serialized against its own
+    /// skip/commit decisions: if the seq is STILL pending there, the
+    /// whole tenant faults (`faultTenant` raises `faulted_seq`; the
+    /// worker's next sweep rolls back on the `.fault` arm); if the seq
+    /// already committed in the meantime, the request is a no-op and the
+    /// worker's next sweep classifies `.commit` (committed beats
+    /// faulted). A queue-append failure (OOM) just means the worker
+    /// re-requests next tick — the deadline already passed.
+    pub fn requestFault(self: *Bridge, gid: u64, seq: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.fault_requests.append(self.allocator, .{ .gid = gid, .seq = seq }) catch {};
+    }
+
+    /// Execute queued timeout-fault requests (pump thread, from
+    /// `pumpOnce` after `node.pump`). Bounded batch; the rest run next
+    /// cycle. See `requestFault` for the still-pending guard rationale.
+    fn drainFaultRequests(self: *Bridge) void {
+        var batch: [32]FaultReq = undefined;
+        var n: usize = 0;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            while (n < batch.len and self.fault_requests.items.len > 0) {
+                batch[n] = self.fault_requests.orderedRemove(0);
+                n += 1;
+            }
+        }
+        for (batch[0..n]) |req| {
+            // Fault only if the seq is still pending: it may have
+            // committed between the worker's timeout and this drain —
+            // commit wins, and faulting the tenant then would 503 its
+            // healthy LATER proposes for nothing.
+            const still_pending = blk: {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                const sig = self.groups.get(req.gid) orelse break :blk false;
+                for (sig.pending.items) |s| {
+                    if (s == req.seq) break :blk true;
+                }
+                break :blk false;
+            };
+            if (still_pending) self.faultTenant(req.gid);
+        }
     }
 };
 
@@ -1163,6 +1287,103 @@ test "Phase 5c: 3-bridge cluster replicates via the leader; a follower propose f
     try testing.expect(faulted);
     // The follower never advanced a local watermark for the faulted write.
     try testing.expect(bridges[follower].committedSeq(gid) < fseq);
+}
+
+test "bridge: identity binding — foreign + faulted entries write the store and never credit a waiter" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const bridge = try Bridge.initSingleNode(a, dir);
+    defer bridge.deinit();
+    // Worker-overlay mode with a resolver: the pump's skip decision is
+    // provenance-keyed (skipQuery), and non-skipped writes land in the
+    // "worker's" store — here a test store standing in for inst.kv.
+    bridge.setWorkerOverlay();
+    const store_path = try std.fmt.allocPrintSentinel(a, "{s}/worker.db", .{dir}, 0);
+    defer a.free(store_path);
+    const worker_store = try node_mod.KvStore.open(a, store_path);
+    defer worker_store.close();
+    const Res = struct {
+        store: *node_mod.KvStore,
+        fn resolve(ctx: *anyopaque, gid: u64, id_str: []const u8) ?*node_mod.KvStore {
+            _ = gid;
+            _ = id_str;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.store;
+        }
+    };
+    var res: Res = .{ .store = worker_store };
+    bridge.setStoreResolver(.{ .ctx = &res, .func = Res.resolve });
+
+    const gid = try bridge.registerTenant("ten");
+
+    // Baseline: a live bridge propose is SKIPPED by the pump (the
+    // "worker txn" owns it) and advances the watermark to exactly its seq.
+    var ws1 = WriteSet.init(a);
+    defer ws1.deinit();
+    try ws1.addPut("mine", "v1");
+    const e1 = try encodeWs(a, "ten", &ws1);
+    defer a.free(e1);
+    const s1 = try bridge.propose(gid, e1);
+    var spins: u32 = 0;
+    while (bridge.committedSeq(gid) < s1 and spins < 400) : (spins += 1) {
+        _ = try bridge.pumpOnce();
+    }
+    try testing.expectEqual(s1, bridge.committedSeq(gid));
+    // Skipped: the pump did NOT write the worker store (no worker here
+    // to commit the txn, so the key is simply absent).
+    try testing.expectError(node_mod.Error.NotFound, worker_store.get("mine"));
+
+    // FOREIGN entry (origin 0 ≠ bridge origin — stands in for another
+    // node's propose arriving at a promoted leader): the pump must
+    // WRITE it (no local txn exists) and must NOT advance the watermark.
+    var ws2 = WriteSet.init(a);
+    defer ws2.deinit();
+    try ws2.addPut("foreign", "vf");
+    const e2 = try encodeWs(a, "ten", &ws2);
+    defer a.free(e2);
+    try bridge.node.propose(gid, e2); // hookless: origin = seq = 0
+    spins = 0;
+    while (spins < 400) : (spins += 1) {
+        _ = try bridge.pumpOnce();
+        if (worker_store.get("foreign")) |v| {
+            a.free(v);
+            break;
+        } else |_| {}
+    }
+    const fv = try worker_store.get("foreign");
+    defer a.free(fv);
+    try testing.expectEqualStrings("vf", fv);
+    try testing.expectEqual(s1, bridge.committedSeq(gid)); // unchanged
+
+    // FAULTED-then-committed: propose via the bridge, fault the tenant
+    // BEFORE the pump submits it (the waiter gives up, txn rolled back),
+    // then let it commit anyway. The pump must WRITE the store (skip
+    // would assume a txn that no longer exists) and must NOT advance
+    // the watermark for the gone waiter.
+    var ws3 = WriteSet.init(a);
+    defer ws3.deinit();
+    try ws3.addPut("late", "vl");
+    const e3 = try encodeWs(a, "ten", &ws3);
+    defer a.free(e3);
+    const s3 = try bridge.propose(gid, e3);
+    bridge.faultTenant(gid);
+    try testing.expect(bridge.faultedSeq(gid) >= s3);
+    spins = 0;
+    while (spins < 400) : (spins += 1) {
+        _ = try bridge.pumpOnce();
+        if (worker_store.get("late")) |v| {
+            a.free(v);
+            break;
+        } else |_| {}
+    }
+    const lv = try worker_store.get("late");
+    defer a.free(lv);
+    try testing.expectEqualStrings("vl", lv);
+    try testing.expectEqual(s1, bridge.committedSeq(gid)); // still s1
 }
 
 test "bridge: createGroupEpoch requires a running pump thread" {

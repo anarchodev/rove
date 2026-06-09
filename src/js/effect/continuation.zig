@@ -70,11 +70,23 @@ pub const Watermarks = struct {
     now_ns: i64,
 };
 
-/// Three-way per-unit classification for a parked-seq sweep.
+/// Four-way per-unit classification for a parked-seq sweep.
 /// Distinct from `Disposition` (the two-way resume discriminant)
 /// because `.pending` is a real outcome at sweep time — the unit
 /// hasn't committed yet and isn't faulted; leave it in place.
-pub const SweepClass = enum { commit, fault, pending };
+///
+/// `.timeout` (deadline passed, NOT bridge-faulted) is deliberately
+/// separate from `.fault`: the unit's speculative txn may NOT be rolled
+/// back unilaterally on the worker thread, because the pump may
+/// concurrently be deciding to SKIP this entry's store write on the
+/// premise that this very txn will commit it (the worker-overlay skip,
+/// `bridge.skipQuery`). The timeout arm instead REQUESTS a pump-side
+/// fault (`bridge.requestFault`) and leaves the unit parked; the pump
+/// serializes the request against its skip/commit decisions — either
+/// the entry already committed (the next sweep classifies `.commit`;
+/// committed-beats-faulted) or the tenant faults (`faulted_seq` rises;
+/// the next sweep classifies `.fault` and rolls back normally).
+pub const SweepClass = enum { commit, fault, timeout, pending };
 
 /// Outcome of `SharedTxnPool.commitAndTake`. Distinguishes four
 /// real cases the drain arms must handle:
@@ -256,9 +268,8 @@ pub fn SharedTxnPool(comptime Txn: type) type {
 /// divergence is a compile error rather than a drift bug.
 pub fn classify(seq: u64, deadline_ns: i64, w: Watermarks) SweepClass {
     if (w.committed >= seq) return .commit;
-    const is_faulted = w.faulted > 0 and w.faulted >= seq;
-    const is_timed_out = w.now_ns >= deadline_ns;
-    if (is_faulted or is_timed_out) return .fault;
+    if (w.faulted > 0 and w.faulted >= seq) return .fault;
+    if (w.now_ns >= deadline_ns) return .timeout;
     return .pending;
 }
 
@@ -285,6 +296,9 @@ pub fn classify(seq: u64, deadline_ns: i64, w: Watermarks) SweepClass {
 ///     on-commit action (release buffered Cmds / move / destroy)
 ///   - `faultAt(i) !void`  — roll the txn back + the unit's on-fault
 ///     action (discard buffered / 503-downgrade / destroy)
+///   - `timeoutAt(i) void` — deadline passed without commit or fault:
+///     request a pump-side fault (`bridge.requestFault`) and leave the
+///     unit parked (no txn action — see `SweepClass.timeout`)
 ///
 /// `count` is snapshotted by the caller BEFORE the loop. Entity
 /// `reg.move`/`reg.destroy` are deferred to `reg.flush` (rove's
@@ -301,6 +315,12 @@ pub fn reconcile(ctx: anytype, count: usize) !void {
             .pending => {},
             .commit => try ctx.commitAt(i),
             .fault => try ctx.faultAt(i),
+            // Deadline passed but not bridge-faulted: ask the pump to
+            // fault the tenant and LEAVE THE UNIT PARKED (see the
+            // `SweepClass.timeout` doc — a unilateral worker-thread
+            // rollback races the pump's worker-overlay skip decision).
+            // The next sweep resolves it as `.commit` or `.fault`.
+            .timeout => ctx.timeoutAt(i),
         }
     }
 }
@@ -586,9 +606,15 @@ test "classify: commit / fault / timeout / pending outcomes" {
         .committed = 5, .faulted = 7, .now_ns = 0,
     }));
 
-    // timed-out → fault.
-    try testing.expectEqual(SweepClass.fault, classify(7, 100, .{
+    // timed-out (deadline passed, NOT bridge-faulted) → timeout: the
+    // arm requests a pump-side fault and leaves the unit parked.
+    try testing.expectEqual(SweepClass.timeout, classify(7, 100, .{
         .committed = 5, .faulted = 0, .now_ns = 150,
+    }));
+    // bridge-faulted wins over timed-out (rollback is safe — the pump
+    // already cleared the seq from pending before raising faulted_seq).
+    try testing.expectEqual(SweepClass.fault, classify(7, 100, .{
+        .committed = 5, .faulted = 7, .now_ns = 150,
     }));
 
     // Pre-commit, pre-fault, pre-deadline → pending.
