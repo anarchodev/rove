@@ -303,19 +303,16 @@ pub fn build(b: *std.Build) void {
     // rove-h2 tests
     const h2_tests = b.addTest(.{ .root_module = h2_mod });
     test_step.dependOn(&b.addRunArtifact(h2_tests).step);
-    // Isolated rove-h2 test step — the aggregate `test` step is broken on v2
-    // (frozen V1 sqlite modules), so this builds/runs just the h2 inline tests
-    // (and so compile-checks the WS transport in root.zig).
+    // Isolated rove-h2 test step — runs just the h2 inline tests (and so
+    // compile-checks the WS transport in root.zig) without the rest of the suite.
     const h2_test_step = b.step("h2-test", "Run the rove-h2 unit tests (compile-checks root.zig)");
     h2_test_step.dependOn(&b.addRunArtifact(h2_tests).step);
 
     // rove-kv tests
     const kv_tests = b.addTest(.{ .root_module = kv_mod });
     test_step.dependOn(&b.addRunArtifact(kv_tests).step);
-    // Isolated kv-only test step. On the v2 branch the aggregate `test`
-    // step is broken (frozen V1 modules still reference sqlite3 they no
-    // longer link), so a sqlite-free `raft-kv` step lets the KV limbs —
-    // incl. the Phase-4 tenant-bundle dump/load — be exercised on their own.
+    // Isolated kv-only test step — a fast, sqlite-free `raft-kv` runner that
+    // exercises the KV limbs (incl. the Phase-4 tenant-bundle dump/load) alone.
     const kv_test_step = b.step("kv-test", "Run rove-kv (raft-kv facade) unit tests in isolation");
     kv_test_step.dependOn(&b.addRunArtifact(kv_tests).step);
 
@@ -347,10 +344,10 @@ pub fn build(b: *std.Build) void {
     const files_server_tests = b.addTest(.{ .root_module = files_server_mod });
     test_step.dependOn(&b.addRunArtifact(files_server_tests).step);
 
-    // rove-log-server tests — also a dedicated `log-server-test` step (the
-    // default `test` step is broken on v2 via the frozen SQLite modules).
-    // The shared module stays sqlite-free (linked at the binary level), so the
-    // test gets its OWN module that links sqlite3 (index_db.zig needs it).
+    // rove-log-server tests — a dedicated `log-server-test` step, kept OUT of
+    // the aggregate `test`: the shared module stays sqlite-free (sqlite is
+    // linked at the binary level), so the test gets its OWN module that links
+    // sqlite3 (index_db.zig needs it).
     const log_server_test_mod = b.createModule(.{
         .root_source_file = b.path("src/log_server/root.zig"),
         .target = target,
@@ -383,8 +380,8 @@ pub fn build(b: *std.Build) void {
     const ssrf_tests = b.addTest(.{ .root_module = ssrf_mod });
     test_step.dependOn(&b.addRunArtifact(ssrf_tests).step);
 
-    // rove-plan tests — also a dedicated `plan-test` step (the default
-    // `test` step is broken on v2 via the frozen SQLite modules).
+    // rove-plan tests — also exposed as a dedicated `plan-test` step for
+    // running the tier table in isolation.
     const plan_tests = b.addTest(.{ .root_module = plan_mod });
     const run_plan_tests = b.addRunArtifact(plan_tests);
     test_step.dependOn(&run_plan_tests.step);

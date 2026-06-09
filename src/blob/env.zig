@@ -1,8 +1,7 @@
 //! Operator-facing env-driven `BackendConfig` loader. Lives in
-//! rove-blob (not in loop46) so every binary that owns blob storage
-//! — `loop46`, `files-server-standalone`, `log-server-standalone` —
-//! reads the same env vars and produces the same shape. Standardizes
-//! the deploy contract:
+//! rove-blob so every binary that owns blob storage — the `rewind`
+//! worker, `rewind-cp`, and the log-query surface — reads the same env
+//! vars and produces the same shape. Standardizes the deploy contract:
 //!
 //! ```
 //! S3_ENDPOINT=https://...

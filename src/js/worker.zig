@@ -119,7 +119,6 @@ const owed_retry = @import("owed_retry.zig");
 // (-> main.zig via rjs.X) keep working unchanged.
 pub const OWED_PREFIX = owed_retry.OWED_PREFIX;
 pub const scanLoneOwedSendId = owed_retry.scanLoneOwedSendId;
-pub const SEND_SWEEP_INTERVAL_NS = owed_retry.SEND_SWEEP_INTERVAL_NS;
 pub const sweepOwedRetries = owed_retry.sweepOwedRetries;
 pub const sweepOwedRetriesOnPromotion = owed_retry.sweepOwedRetriesOnPromotion;
 const subscription_sweep = @import("subscription_sweep.zig");
@@ -127,13 +126,11 @@ const subscription_sweep = @import("subscription_sweep.zig");
 // CronState is re-exported for the Worker `cron_state` collection row;
 // the sweep entry points for root.zig -> main.zig.
 pub const CronState = subscription_sweep.CronState;
-pub const CRON_SWEEP_INTERVAL_NS = subscription_sweep.CRON_SWEEP_INTERVAL_NS;
 pub const sweepBootSubscriptions = subscription_sweep.sweepBootSubscriptions;
 const starter = @import("starter.zig");
 pub const sweepCronSubscriptions = subscription_sweep.sweepCronSubscriptions;
 const durable_wake = @import("durable_wake.zig");
 // §2.6 durable scheduled-wake sweep lives in durable_wake.zig.
-pub const WAKE_SWEEP_INTERVAL_NS = durable_wake.WAKE_SWEEP_INTERVAL_NS;
 pub const sweepDurableWakes = durable_wake.sweepDurableWakes;
 pub const sweepDurableWakesOnPromotion = durable_wake.sweepDurableWakesOnPromotion;
 
@@ -1517,9 +1514,9 @@ pub fn Worker(comptime opts: Options) type {
         /// `open_duration_ns` — protecting the shared h2 thread from a
         /// runaway stored procedure. Auto-releases on redeploy.
         penalty_box: penalty_mod.PenaltyBox,
-        /// Per-instance × per-action token-bucket limits. Single tier
-        /// in v1 (`limiter_mod.defaultCaps()`); Phase 10 will branch
-        /// on plan. Customer-tenant traffic checks the `request`
+        /// Per-instance × per-action token-bucket limits, resolved from
+        /// the tenant's plan-tier caps (`rove-plan`; docs/plan-tiers.md).
+        /// Customer-tenant traffic checks the `request`
         /// bucket before dispatch and gets 429 + Retry-After when
         /// exhausted; admin requests bypass the check entirely.
         /// `email.send` from a handler checks the `email` bucket and
