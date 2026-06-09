@@ -477,3 +477,25 @@ storage decisions that section assumes. (The customer-logs-vs-operator-signals
   deflate lets a single click-through decompress one record with one range-GET.
 - **Gotcha**: compression is **libz** (`windowBits=-15`), not the Zig stdlib —
   `std.compress.flate.Compress` is incomplete (panics on real payloads).
+
+---
+
+## 12. Rejected effect-surface primitives
+
+Effect/handler-surface primitives considered and **rejected** — do not re-propose
+without new information (harvested from the retired `primitive-gaps.md` §4). These
+are closed, not gaps.
+
+- **Durable SSE replay log** — rejected. A customer composes replayable
+  server-push via their own kv prefix; the platform does not own an SSE event log
+  (see §3 / §8).
+- **Cross-tenant kv subscriptions** — rejected. The tenant boundary is hard;
+  cross-tenant access goes through `platform.scope(id).kv` or an outbound
+  `http.fetch`, never a kv-wake spanning tenants.
+- **Predicate-function kv-wakes** — rejected. A customer predicate would run
+  customer JS on the raft apply thread; kv-wakes match on key *prefix* only.
+- **Blocking inline external call** — rejected (PLAN line 79's Cmd bet, preserved
+  verbatim). An external result reaches a handler only as a later Msg; the
+  held-sync projection is cosmetic, not a relaxation (see §3.3).
+- **Multi-tenant atomic writeset** — rejected. Each tenant's `app.db` is its own
+  raft target; there is no cross-tenant atomic commit.

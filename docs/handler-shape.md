@@ -599,6 +599,6 @@ self-hosters marketplace plan for the consuming side.
   coalescing, blob coordinator), unchanged.
 - `architecture/effects-and-handlers.md` — the `detach` mechanism, retired here (§2.6).
 - `durable-wake-plan.md` — gap 2.6, the `schedule`/`cron` substrate.
-- `primitive-gaps.md` §2.4 — inbound streaming body (`onChunk`).
+- `architecture/routing-and-ingress.md` — inbound streaming body (`onChunk`).
 - `architecture/effects-and-handlers.md` — chunk capture making `onChunk` + the
   stream loop replayable.
