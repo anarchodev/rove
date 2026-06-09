@@ -303,4 +303,4 @@ machinery.
 - `architecture/effects-and-handlers.md` — the `detach` mechanism Phase 3 retires.
 - `durable-wake-plan.md` — gap 2.6, the `schedule`/`cron` dependency
   (Phase 5).
-- `primitive-gaps.md` §2.1 — the subscription machinery `cron` reuses.
+- `architecture/effects-and-handlers.md` — the subscription machinery `cron` reuses.

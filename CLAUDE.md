@@ -133,3 +133,19 @@ Pins live in `build.zig.zon` (Zig/C packages) and each Rust crate's `Cargo.lock`
 - Module public API is exported through each module's `root.zig`.
 - No async/await — concurrency uses collection-based polling + phase-based dispatch.
 - Comments reference a "Phase" numbering system tracking the incremental delivery plan; phases run 0 through 14 (with 5.5 as the storage-scalability bucket). See `docs/PLAN.md` §3 for current phase content and §10.16 for the beta / 1.0 / post-1.0 launch sequencing.
+
+## Working with multiple agents (git worktrees)
+
+This repo is frequently worked on by several Claude sessions at once. To keep sessions from colliding in one working tree — where one window's uncommitted edits get swept into another's commit — **each session runs in its own git worktree on its own branch**, all sharing the one `.git` object store (no bare repo needed; worktrees attach to the regular checkout):
+
+```bash
+git worktree add ../rove-<topic> -b <branch> <base>   # e.g. ../rove-docs -b docs/restructure v2
+git worktree list
+git worktree remove ../rove-<topic>                   # when merged/abandoned; `git worktree prune` clears dead entries
+```
+
+Rules for the shared repo:
+- The main checkout (`/home/user/src/rove`) is load-bearing — it holds the real `.git`; don't delete or move it.
+- A branch can be checked out in only one worktree (git enforces this) — one branch per session by construction.
+- Never switch the branch of, or run `git add -u` / `git commit` in, a checkout another session is using. Unexplained working-tree WIP is probably a sibling session's — examine it, stage only your own files, and never commit another window's work without confirmation.
+- Smoke tests bind fixed ports (see the per-smoke port table in the scripts); don't run two smoke suites across worktrees simultaneously or they collide (`EADDRINUSE`).

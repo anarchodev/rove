@@ -63,7 +63,7 @@ Active work on the current (V2) line. Each folds into `architecture/` on ship.
 - [handler-surface-impl-plan.md](handler-surface-impl-plan.md) — handler-surface Phase 2
 - [durable-wake-plan.md](durable-wake-plan.md) — scheduler primitive (gap #6; P5+ pending)
 - [websocket-plan.md](websocket-plan.md) — inbound WS (transport shipped, worker seam pending)
-- [primitive-gaps.md](primitive-gaps.md) — effect-gap catalog + tape-minimization design arc
+- [tape-minimization.md](tape-minimization.md) — the minimal replay tape (4 record kinds) + tape-by-reference design
 - [plan-tiers.md](plan-tiers.md) — per-tenant tier enforcement
 - [builtin-libs-docs-plan.md](builtin-libs-docs-plan.md) — `_system.*` + JS shim docs
 - [replay-wasm-plan.md](replay-wasm-plan.md) — WASM replay UI (§8.6+ deferred)
@@ -80,7 +80,3 @@ Active work on the current (V2) line. Each folds into `architecture/` on ship.
 
 - [activitypub-tutorial.md](activitypub-tutorial.md) — ActivityPub bot in ~30 lines
 - [flows/signup.md](flows/signup.md) — end-to-end signup walkthrough
-
-## Exploratory
-
-- [rove-generalization.md](rove-generalization.md) — speculative language-on-rove design (out of engine scope)

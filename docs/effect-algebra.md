@@ -1,8 +1,8 @@
 # The effect algebra
 
 > **Status**: synthesis, 2026-05-22. Built from the effect-system audit
-> in §5. This is the cross-cutting frame that `primitive-gaps.md` §5 and the
-> as-built `architecture/effects-and-handlers.md` + `architecture/routing-and-ingress.md`
+> in §5. This is the cross-cutting frame that the as-built
+> `architecture/effects-and-handlers.md` + `architecture/routing-and-ingress.md`
 > are each a facet of — see §9. It is the ground truth for the question "does this new
 > effect fit the model?"
 >
@@ -88,11 +88,12 @@ is *allowed* to grow.
 > enter a handler except through a recorded Msg or a Model snapshot read.
 
 This is the engine-side half of determinism. arenajs handles
-within-activation; L3 handles between. The tape is bounded per chain
-(`primitive-gaps.md` §6) — recorded, not recorded *forever*.
+within-activation; L3 handles between. Tape volume is bounded by per-tenant
+retention, not a per-chain cap (`tape-minimization.md` §1) — recorded, not
+recorded *forever*.
 
 The next origin proposed for this family is a **durable scheduled wake**
-(`primitive-gaps.md` §2.6, unbuilt): a one-shot, absolute-time,
+(`durable-wake-plan.md`, P0–P4 shipped): a one-shot, absolute-time,
 at-least-once `durable_wake` Msg whose fire-time is itself a Model key.
 It generalizes the one place L2 reconstruction is currently hardcoded —
 the webhook boot-scan of `_send/owed/` (§2.2) — into a primitive, so
@@ -215,7 +216,7 @@ findings rather than excusing them:
   separate; the JS-shim composition pattern doesn't get exercised on
   this surface). No customer demand established; defer until concrete
   use case forces it. The input/output asymmetry the design rested on
-  still holds — see `primitive-gaps.md` §7.4.
+  still holds — see `tape-minimization.md` §2.2.
 
 ## 4. The contract — six questions every effect answers
 
@@ -259,7 +260,7 @@ Ten effect-shapes scored against §4. `✓` conforms, `✗` diverges.
 | `blob.get` (JS shim) | `PendingFetch` GET against BlobBackend URL | `http_done` (or `http_chunk` if streamed) | ephemeral; no marker (failed read = client retries) |
 | subscriptions | deploy-time spec file — no runtime Cmd | `subscription_fire` activation | ephemeral (boot: marker rides writeset) |
 | streaming out | `__rove_stream({write, waitFor})` | `wake_batch` / `disconnect` | ephemeral entity; per-activation writes replicated |
-| streaming in (body) | — | `inbound_chunk` Msg with `BodyRef` payload (per effects-and-handlers §4.4) | input bytes durable in BlobStore via `{tenant}/readset-blobs/{batch_id}`; callback gated on `durable_offset` advance; **NOT BUILT** (gap 2.4 — design in effects-and-handlers §4 + primitive-gaps §7) |
+| streaming in (body) | — | `inbound_chunk` Msg with `BodyRef` payload (per effects-and-handlers §4.4) | input bytes durable in BlobStore via `{tenant}/readset-blobs/{batch_id}`; callback gated on `durable_offset` advance; **NOT BUILT** (gap 2.4 — design in `architecture/routing-and-ingress.md` + `tape-minimization.md` §2) |
 | conn-actor out (held-sync §6.4) | `__rove_next` / stream chunks | `send_callback` resume | ephemeral entity |
 | conn-actor in (WS frames) | — | — | **NOT BUILT** (gap 2.5 / §6.3) |
 
@@ -580,11 +581,10 @@ of.
   runtime" (the Option-A one-request-lifecycle convergence) and the L4
   commit-gate as a generalized `ParkedUnit` reconciler. Option-B
   mechanism shipped; the Option-A collapse is the active phasing.
-- **`primitive-gaps.md` §5** — four of the laws stated as per-gap
-  disciplines (affine, commit-gated, replayability, bounded tape). §6
-  is the bound on L3's tape; §7 is the customer-facing surface
-  (`blob.put` / `blob.get` shims, inbound-body persist-before-observe)
-  for the §2.5 substrate distinction this doc names.
+- **`tape-minimization.md`** — L3's tape reduced to four record kinds (minimal
+  read set, timestamp, seed, CAS extent); §2 is the tape-by-reference design for
+  streamed bytes (the `pipe_to` gap). The retired `primitive-gaps.md` §4
+  rejections now live in `decisions.md` §12.
 - **`architecture/effects-and-handlers.md`** — the durable-input substrate
   this doc's §2.5 corollary depends on: every "body" routes through
   a per-tenant BlobStore buffer with callback-gating on
