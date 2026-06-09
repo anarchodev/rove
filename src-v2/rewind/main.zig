@@ -446,10 +446,31 @@ pub fn main() !void {
     if (recovered > 0) std.log.info("rewind: recovered {d} tenant group(s) at boot", .{recovered});
     try bridge.startPump();
 
-    // Per-tenant request-log batches → fs (S3 in prod via BLOB_BACKEND).
-    const log_fs = try log_server.batch_store_fs.FsBatchStore.init(allocator, data_dir);
-    defer log_fs.deinit();
-    const log_batch_store = log_fs.batchStore();
+    // Per-tenant request-log / tape batches → S3. The only tape-query surface,
+    // `log-server-standalone`, reads S3-only (its indexer LISTs + serves
+    // `/v1/{tenant}/list` + `/show`), so a local `FsBatchStore` would be
+    // unreadable by it — writer (fs) and reader (S3) never met, which is why
+    // captured tapes could never be queried back out for replay. Build the
+    // batch store from the SAME S3 connection params as the blob backend (rove
+    // blob is S3-only), plus an optional `LOG_S3_KEY_PREFIX` so log batches can
+    // sit under a named prefix; both sides default to "" and so agree. The
+    // worker's single background flusher thread serializes all PUTs through
+    // this store's one libcurl handle (rewind runs a single worker — see
+    // below; a multi-worker node would need a per-flusher handle).
+    const log_key_prefix = (try blob_mod.env.envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
+        try allocator.dupe(u8, "");
+    defer allocator.free(log_key_prefix);
+    const log_s3 = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
+        .endpoint = blob_owned.cfg.endpoint,
+        .region = blob_owned.cfg.region,
+        .bucket = blob_owned.cfg.bucket,
+        .key_prefix = log_key_prefix,
+        .access_key = blob_owned.cfg.access_key,
+        .secret_key = blob_owned.cfg.secret_key,
+        .use_tls = blob_owned.cfg.use_tls,
+    });
+    defer log_s3.deinit();
+    const log_batch_store = log_s3.batchStore();
 
     // Process-shared node state (tenant resolver, deployment cache, blob
     // coordinator, msg router, builtin modules).
