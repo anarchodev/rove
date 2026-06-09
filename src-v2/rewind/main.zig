@@ -436,6 +436,14 @@ pub fn main() !void {
     // here). On a single node this is never consulted (the sole voter leads
     // every group → leader-skip), so it is a no-op there.
     bridge.setStoreResolver(.{ .ctx = node_tenant, .func = resolveTenantStore });
+    // Boot-time group recovery: re-stand-up the tenant raft groups this node
+    // persisted (its node-local manifest) so a restarted node rejoins its
+    // groups and catches up to the live state — the leader replicates the
+    // missing tail once the pump starts. BEFORE startPump (group lifecycle is
+    // single-threaded until the pump owns the Manager), mirroring the CP
+    // directory's boot `ensureGroup` scan. No-op on a fresh data dir.
+    const recovered = bridge.recoverGroups();
+    if (recovered > 0) std.log.info("rewind: recovered {d} tenant group(s) at boot", .{recovered});
     try bridge.startPump();
 
     // Per-tenant request-log batches → fs (S3 in prod via BLOB_BACKEND).

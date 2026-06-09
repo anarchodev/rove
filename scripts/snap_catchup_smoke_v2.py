@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """V2 snapshot/log catchup smoke (port of `scripts/snap_catchup_smoke.py`).
 
-STATUS: SKIP — the rejoin-catchup engine path is not implemented in V2 yet
-(see "engine gap" below). The smoke asserts everything that DOES work (the
-catchup PRECONDITION) and then SKIPs the rejoin-catchup assertion with a
-precise reason rather than failing on an unbuilt path.
-
 The V1 smoke drove the out-of-band snapshot-catchup machinery for a far-behind
 follower and asserted the internal cycle stage → exit → install →
 raft_load_snapshot → cleanup. On V2 the OBSERVABLE essence is: a follower that
@@ -14,34 +9,23 @@ was DOWN while the log advanced REJOINS and CATCHES UP to the replicated state
 raft-internal + snapshot-file + TLS + leader-direct infra and asserts catchup
 purely through served reads (`admin_kv_get`).
 
-ENGINE GAP (why this SKIPs the final step):
-  A V2 node's per-tenant raft groups are created ONLY by a runtime
-  provision / `v2-attach` (`Manager.createGroup`/`createGroupEpoch`), never
-  recovered at boot — `src-v2/rewind/main.zig` calls no `createGroup` /
-  `registerTenant` on startup, and `raft-rs-zig`'s `Manager.init` does not
-  scan persisted storage to re-stand-up groups. So when a stopped node
-  restarts, its `acme` group is GONE: it serves its own stale persisted
-  `inst.kv` (the value at kill time) via `resolveTenantStore`, but it is not a
-  member of the live group and receives no further applies — it never catches
-  up. Re-attaching via the move surface doesn't help either: `v2-attach`
-  forms the group at epoch 1 (migration fence), whereas the original group is
-  epoch 0, so the two are fenced apart rather than the same group.
+BOOT-TIME GROUP RECOVERY (the engine path this asserts):
+  A V2 node's per-tenant raft groups are created by a runtime provision /
+  `v2-attach`, but a restarted node must ALSO re-stand-up the groups it already
+  had. The node persists each group in a node-local manifest
+  (`{data_dir}/__groups__`, id_str → epoch — gid is a non-invertible hash of
+  id_str, so the id_str must be stored); at boot `Bridge.recoverGroups`
+  (before `startPump`, like the CP directory's boot `ensureGroup`) reads it and
+  calls `node.recoverGroup` per tenant, which replays the durable WAL into a
+  fresh group at the recorded epoch. The rejoined node is already a voter in
+  the group's persisted confstate, so once the pump starts the leader
+  replicates the missing tail (no conf-change needed) and it catches up. See
+  `src-v2/kv/{node,bridge}.zig` + `src-v2/rewind/main.zig`.
 
-  This is the Phase-5 follow-up explicitly listed as open in the V2 memory
-  ("multi-node placement-without-move formation", "replicated CP directory");
-  no V2 smoke restarts a node (the reference `three_node_smoke` only KILLS,
-  never restarts). Closing it needs an engine change (boot-time group
-  recovery + leader re-adds the rejoined voter and ships a snapshot), which
-  is out of scope for this smoke migration.
-
-  Observed: rejoined node serves `seed-0` (its value at kill time), never the
-  post-kill `advance-29` / `after-rejoin` written on the surviving quorum.
-
-  What this smoke DOES prove (all green): provision+deploy across 3 nodes,
-  seed replicates to all 3, a follower stops, the log advances 30 writes on
-  the surviving quorum, both survivors hold the latest value, the rejoined
-  node comes back up and serves its persisted store. The single missing piece
-  is the engine-level rejoin-catchup.
+  This smoke proves the full arc: provision+deploy across 3 nodes, seed
+  replicates to all 3, a follower stops, the log advances 30 writes on the
+  surviving quorum, both survivors hold the latest value, the stopped node
+  RESTARTS, rejoins its `acme` group, and catches up to the post-kill value.
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
 Build: `zig build rewind rewind-cp rewind-front files-server-v2`
@@ -78,7 +62,6 @@ ADVANCE_WRITES = 30  # advance the log while the follower is down
 
 def main() -> int:
     failures = []
-    skipped = []
 
     def check(label, ok, detail=""):
         print(f"  {'ok  ' if ok else 'FAIL'} {label}{(' — ' + detail) if detail else ''}")
@@ -195,33 +178,17 @@ def main() -> int:
                 ok_catchup = True
                 break
             time.sleep(0.5)
-        if ok_catchup:
-            check(f"⭐ rejoined node {follower + 1} caught up to {latest2!r}", True)
-        else:
-            # Engine gap (documented in the module docstring): the rejoined
-            # node's per-tenant raft group is not recovered at boot, so it
-            # never re-joins the live group / receives further applies. It
-            # serves its stale persisted value instead of catching up.
-            print(f"  SKIP ⭐ rejoin-catchup — rejoined node {follower + 1} serves "
-                  f"its persisted {rg.body!r}, not the post-kill {latest2!r}")
-            print("       engine gap: V2 does not recover per-tenant raft groups "
-                  "at boot, so a restarted node cannot rejoin + catch up. This is "
-                  "the open Phase-5 'placement-without-move formation' follow-up; "
-                  "closing it needs an engine change (out of scope here).")
-            skipped.append("rejoin-catchup (engine gap: no boot-time group recovery)")
+        # Boot-time group recovery (the node-local manifest + `recoverGroups`,
+        # `src-v2/kv/{node,bridge}.zig`): the rejoined node re-stands-up its
+        # `acme` raft group from the persisted WAL, rejoins as the voter it
+        # already is, and the leader replicates the missing tail → it catches
+        # up to the post-kill value. A hard assertion now, not a SKIP.
+        check(f"⭐ rejoined node {follower + 1} caught up to {latest2!r}", ok_catchup,
+              f"got {rg.status} {rg.body!r}, expected {latest2!r} within 40s")
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
         return 1
-    if skipped:
-        print("\nSKIP snap-catchup smoke (v2) — the catchup PRECONDITION is proven "
-              "(seed replicates to all 3; the log advances on the surviving quorum "
-              "while a follower is down; both survivors hold the latest value; the "
-              "rejoined node comes back up serving its persisted store), but the "
-              "rejoin-CATCHUP step is blocked on an unimplemented engine path:")
-        for s in skipped:
-            print("  - " + s)
-        return 0
     print("\nPASS snap-catchup smoke (v2) — a follower that was down while the "
           "log advanced rejoined and caught up to the replicated latest value.")
     return 0

@@ -764,6 +764,38 @@ pub const Bridge = struct {
         return n;
     }
 
+    /// Boot-time recovery: re-stand-up every tenant group this node persisted
+    /// (its node-local manifest) so a restarted node rejoins its raft groups
+    /// and catches up to the live state. For each recorded (id_str, epoch):
+    /// `registerTenant` (rebuild the `GroupSig` so the worker can serve /
+    /// propose / leader-probe the tenant) + `node.recoverGroup` (re-create the
+    /// raft group from its durable WAL state). MUST be called BEFORE
+    /// `startPump` — like the CP directory's boot `ensureGroup`, group
+    /// lifecycle is single-threaded until the pump owns the (non-thread-safe)
+    /// Manager. A per-group failure is logged + skipped (one bad group must not
+    /// block the rest). Returns the count recovered. No-op on a fresh data dir.
+    pub fn recoverGroups(self: *Bridge) usize {
+        const groups = self.node.persistedGroups(self.allocator) catch |err| {
+            std.log.warn("v2 bridge: recoverGroups manifest read failed: {s}", .{@errorName(err)});
+            return 0;
+        };
+        defer Node.freePersistedGroups(self.allocator, groups);
+        var n: usize = 0;
+        for (groups) |g| {
+            const gid = self.registerTenant(g.id_str) catch |err| {
+                std.log.warn("v2 bridge: recoverGroups register {s} failed: {s}", .{ g.id_str, @errorName(err) });
+                continue;
+            };
+            _ = self.node.recoverGroup(gid, g.id_str, g.epoch) catch |err| {
+                std.log.warn("v2 bridge: recoverGroups group {s} failed: {s}", .{ g.id_str, @errorName(err) });
+                continue;
+            };
+            n += 1;
+            std.log.info("v2 bridge: recovered tenant group {s} (epoch {d})", .{ g.id_str, g.epoch });
+        }
+        return n;
+    }
+
     /// Fault the in-flight proposes of any tenant this node no longer leads.
     /// Snapshots `in_flight` under the lock, then checks leadership +
     /// faults outside it (the Manager call + `faultTenant` each take their

@@ -217,6 +217,18 @@ pub const Node = struct {
     mgr: raft.Manager,
     wal: *raft.SharedWal,
 
+    /// Node-local group manifest: the set of tenant groups this node has
+    /// (id_str → birth/migration epoch, decimal). NOT replicated — each node
+    /// records only its own groups. The raft WAL persists every group's
+    /// consensus state (hardstate/confstate/log), but `Manager.init` does not
+    /// scan it to re-stand-up groups, and a group's `id_str` is not recoverable
+    /// from its gid (a non-invertible hash). So this manifest is the durable
+    /// list `Bridge.recoverGroups` reads at boot to call `recoverGroup` for
+    /// each — the missing seam that lets a restarted node rejoin its groups and
+    /// catch up (`snap_catchup_smoke_v2`). Written in `createGroupCore`, removed
+    /// in `destroyGroupAndReclaim`. Lives at `{data_dir}/__groups__/app.db`.
+    groups_manifest: *KvStore,
+
     /// Cross-node transport (Phase 5). `null` for a single-node node
     /// (`initSingleNode`): no peers, so groups campaign to leader at
     /// creation and `takeMessages` drains to nowhere. Non-null for a
@@ -387,6 +399,17 @@ pub const Node = struct {
         const wal = raft.SharedWal.open(allocator, wal_path) catch return Error.Io;
         errdefer wal.deinit();
 
+        // Node-local group manifest store (see the `groups_manifest` field).
+        const man_dir = std.fmt.allocPrint(allocator, "{s}/__groups__", .{data_dir}) catch
+            return Error.OutOfMemory;
+        defer allocator.free(man_dir);
+        std.fs.cwd().makePath(man_dir) catch return Error.Io;
+        const man_path = std.fmt.allocPrintSentinel(allocator, "{s}/app.db", .{man_dir}, 0) catch
+            return Error.OutOfMemory;
+        defer allocator.free(man_path);
+        const groups_manifest = try KvStore.open(allocator, man_path);
+        errdefer groups_manifest.close();
+
         var mgr = try raft.Manager.init();
         errdefer mgr.deinit();
 
@@ -397,6 +420,7 @@ pub const Node = struct {
             .voters = voters_dup,
             .mgr = mgr,
             .wal = wal,
+            .groups_manifest = groups_manifest,
         };
         return self;
     }
@@ -411,6 +435,7 @@ pub const Node = struct {
         // manager down before the WAL.
         self.mgr.deinit();
         self.wal.deinit();
+        self.groups_manifest.close();
 
         var it = self.groups.valueIterator();
         while (it.next()) |slot_ptr| {
@@ -460,6 +485,84 @@ pub const Node = struct {
         // bundle, not the WAL — so do NOT replay any (stale) recovered records
         // for this gid.
         return self.createGroupCore(tenant_id, id_str, epoch, false);
+    }
+
+    /// A group recorded in the node-local manifest (see `groups_manifest`):
+    /// the tenant id string + its birth/migration epoch.
+    pub const PersistedGroup = struct {
+        id_str: []u8,
+        epoch: u64,
+    };
+
+    /// Re-stand-up a persisted group at boot from its durable WAL state
+    /// (`createGroupCore(recover=true)`) at the recorded `epoch`. The rejoined
+    /// node is already a voter in the group's persisted confstate, so once the
+    /// pump starts the leader replicates the missing log tail (or ships a
+    /// snapshot) and the node catches up — no conf-change needed. Pre-pump,
+    /// single-threaded, like `ensureGroup`. Idempotent.
+    pub fn recoverGroup(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64) Error!*TenantSlot {
+        if (self.groups.get(tenant_id)) |slot| return slot;
+        return self.createGroupCore(tenant_id, id_str, epoch, true);
+    }
+
+    /// Record (or update) a group in the node-local recovery manifest.
+    /// Best-effort: a manifest failure is logged, never propagated — the live
+    /// group already exists; recovery is a resilience feature, not a gate.
+    /// Pump-thread (group lifecycle); `KvStore.put` self-commits.
+    fn recordGroup(self: *Node, id_str: []const u8, epoch: u64) void {
+        var buf: [24]u8 = undefined;
+        const ep = std.fmt.bufPrint(&buf, "{d}", .{epoch}) catch return;
+        self.groups_manifest.put(id_str, ep) catch |err| std.log.warn(
+            "v2 node: group manifest record {s} failed: {s}",
+            .{ id_str, @errorName(err) },
+        );
+    }
+
+    /// Remove a group from the recovery manifest (move-out). Best-effort.
+    fn forgetGroup(self: *Node, id_str: []const u8) void {
+        self.groups_manifest.delete(id_str) catch |err| std.log.warn(
+            "v2 node: group manifest forget {s} failed: {s}",
+            .{ id_str, @errorName(err) },
+        );
+    }
+
+    /// Read the recovery manifest into a freshly-allocated slice (caller owns:
+    /// free each `id_str`, then the slice via `freePersistedGroups`). Read once
+    /// at boot by `Bridge.recoverGroups`. Empty on a fresh data dir.
+    pub fn persistedGroups(self: *Node, allocator: std.mem.Allocator) Error![]PersistedGroup {
+        var out: std.ArrayListUnmanaged(PersistedGroup) = .empty;
+        errdefer {
+            for (out.items) |g| allocator.free(g.id_str);
+            out.deinit(allocator);
+        }
+        var cursor_buf: ?[]u8 = null;
+        defer if (cursor_buf) |c| allocator.free(c);
+        while (true) {
+            const cursor: []const u8 = cursor_buf orelse "";
+            var page = self.groups_manifest.prefix("", cursor, 256) catch return Error.Io;
+            defer page.deinit();
+            if (page.entries.len == 0) break;
+            for (page.entries) |e| {
+                const epoch = std.fmt.parseInt(u64, e.value, 10) catch 0;
+                const id_dup = allocator.dupe(u8, e.key) catch return Error.OutOfMemory;
+                out.append(allocator, .{ .id_str = id_dup, .epoch = epoch }) catch {
+                    allocator.free(id_dup);
+                    return Error.OutOfMemory;
+                };
+            }
+            const last = page.entries[page.entries.len - 1].key;
+            const new_cursor = allocator.dupe(u8, last) catch return Error.OutOfMemory;
+            if (cursor_buf) |c| allocator.free(c);
+            cursor_buf = new_cursor;
+            if (page.entries.len < 256) break;
+        }
+        return out.toOwnedSlice(allocator) catch return Error.OutOfMemory;
+    }
+
+    /// Free a `persistedGroups` result.
+    pub fn freePersistedGroups(allocator: std.mem.Allocator, groups: []PersistedGroup) void {
+        for (groups) |g| allocator.free(g.id_str);
+        allocator.free(groups);
     }
 
     /// Shared group-birth core for `ensureGroup` (epoch 0) and
@@ -523,6 +626,12 @@ pub const Node = struct {
 
         self.groups.put(self.allocator, tenant_id, slot) catch return Error.OutOfMemory;
         errdefer _ = self.groups.remove(tenant_id);
+        // Record in the node-local manifest so a restart can recover this
+        // group (see `groups_manifest`). Best-effort + idempotent: re-recording
+        // the same (id_str → epoch) on a recovery-path create is a no-op write;
+        // a manifest failure must not abort a working group (recovery is a
+        // resilience feature, not a correctness gate for the live group).
+        self.recordGroup(id_str, epoch);
         // Formation is activity: a fresh group must tick to elect (multi-node)
         // or campaign-to-leader (single-node). It hibernates once idle.
         try self.bumpActive(tenant_id);
@@ -610,6 +719,10 @@ pub const Node = struct {
         self.mgr.destroyGroup(tenant_id) catch return Error.DestroyGroupFailed;
         self.wal.noteGroupDestroyed(tenant_id);
         self.dropActive(tenant_id);
+        // Drop from the recovery manifest BEFORE freeing the slot (we need its
+        // `id_str`): a tenant moved off this node must not be re-stood-up on the
+        // next restart.
+        self.forgetGroup(slot.id_str);
         _ = self.groups.remove(tenant_id);
         slot.store.close();
         self.allocator.free(slot.id_str);
