@@ -261,6 +261,12 @@ pub const Bridge = struct {
     /// serialized with the pump's skip/commit decisions. Guarded by
     /// `mutex`.
     fault_requests: std.ArrayListUnmanaged(FaultReq) = .empty,
+    /// Pump-thread-only scratch for `sweepLostLeadership` (snapshot of
+    /// `in_flight`, reused per cycle).
+    sweep_scratch: std.ArrayListUnmanaged(u64) = .empty,
+    /// Pump-thread-only: wall-clock of the last FULL leadership scan
+    /// (see `refreshLeadership` / `LEADER_SCAN_INTERVAL_NS`).
+    last_leader_scan_ns: i64 = 0,
 
     pump_thread: ?std.Thread = null,
     stop: std.atomic.Value(bool) = .init(false),
@@ -368,13 +374,13 @@ pub const Bridge = struct {
         self.in_flight.deinit(a);
         self.promoted.deinit(a);
         self.fault_requests.deinit(a);
+        self.sweep_scratch.deinit(a);
         // Any items still queued at teardown own their payloads.
         for (self.inbox.items) |item| a.free(item.payload);
         self.inbox.deinit(a);
-        // Control commands are caller-stack-owned; just drop the pointers.
-        // (stopPump joined the pump thread, so nothing is mid-execute, and
-        // any waiter was released by stopPump's fault path / will time out
-        // — the move path never tears the bridge down mid-control.)
+        // Control commands are caller-stack-owned; stopPump already
+        // released every queued waiter (err = ShuttingDown + done.set),
+        // so the list is empty — this just frees its capacity.
         self.control_inbox.deinit(a);
         a.destroy(self);
     }
@@ -547,12 +553,14 @@ pub const Bridge = struct {
         return sig.faulted_seq.load(.acquire);
     }
 
-    /// Node-wide leader check the reused worker uses to gate proposes
-    /// (config mirror, deploy markers). Single-node V2 is the only node,
-    /// so it is the leader of EVERY tenant group — always true. Matches
-    /// V1's no-arg `RaftNode.isLeader()` shape so the worker call sites
-    /// need no edits. Phase 5 (multi-node) reintroduces per-group
-    /// leadership (`isLeader(gid)`).
+    /// V1-compat NODE-WIDE leader shim — **unconditionally true**, even
+    /// on a multi-node node. V2 leadership is per-GROUP; there is no
+    /// meaningful node-wide answer, so any call site gating a per-tenant
+    /// decision on this is wrong and must use `isLeaderOf(gid)` (the
+    /// config-mirror and boot-subscription gates were migrated; the
+    /// remaining caller is the log flusher, whose batches only exist on
+    /// nodes serving the tenant — i.e. its leader — so the vestigial
+    /// always-true answer is behavior-preserving there).
     pub fn isLeader(self: *Bridge) bool {
         _ = self;
         return true;
@@ -682,9 +690,18 @@ pub const Bridge = struct {
             t.join();
             self.pump_thread = null;
         }
-        // Fail anything proposed-but-not-committed.
         self.mutex.lock();
         defer self.mutex.unlock();
+        // Release any control-command waiter whose cmd was enqueued after
+        // the pump's last drain (the `runControl` pump-alive check races
+        // `stopPump`): the pump is gone, so the cmd will never execute —
+        // without this the caller blocks on `cmd.done` forever.
+        while (self.control_inbox.items.len > 0) {
+            const cmd = self.control_inbox.orderedRemove(0);
+            cmd.err = Error.ShuttingDown;
+            cmd.done.set();
+        }
+        // Fail anything proposed-but-not-committed.
         var it = self.groups.valueIterator();
         while (it.next()) |sig_ptr| {
             const sig = sig_ptr.*;
@@ -694,9 +711,20 @@ pub const Bridge = struct {
 
     fn pumpLoop(self: *Bridge) void {
         while (!self.stop.load(.acquire)) {
-            const did = self.pumpOnce() catch |e| blk: {
-                std.log.warn("v2 bridge pump: {s}", .{@errorName(e)});
-                break :blk false;
+            // A pump error is an INFALLIBILITY VIOLATION, not an operational
+            // hiccup: a committed entry failed to decode/apply (raft has
+            // already consumed it via advance_apply — it will never be
+            // redelivered, so this replica is silently diverged from the
+            // log), or the WAL fsync failed (nothing acked from here on
+            // would be durable), or allocation failed on the commit path.
+            // Warn-and-continue (the old behavior) served a diverged
+            // replica that could later win an election; die loudly instead
+            // — a restart replays the WAL from the last checkpoint and
+            // converges. (Tests drive `pumpOnce` directly and still see
+            // error returns; boot-time recovery has its own retry-from-
+            // scratch semantics in `recoverGroups`.)
+            const did = self.pumpOnce() catch |e| {
+                std.debug.panic("v2 bridge pump: unrecoverable apply/flush failure: {s}", .{@errorName(e)});
             };
             // Idle backoff: nothing to drain and nothing committed this
             // cycle. Single-node has no election/heartbeat traffic to
@@ -776,29 +804,58 @@ pub const Bridge = struct {
         return did_work;
     }
 
-    /// Refresh every registered group's `is_leader` atomic from the Manager.
-    /// Pump-thread only (reads the Manager). Held under the bridge mutex —
-    /// brief; no commit hook re-enters here (we are past `node.pump`). The
-    /// worker reads these atomics lock-free via `isLeaderOf`.
+    /// How often `refreshLeadership` falls back to a FULL all-groups scan.
+    /// Leadership edges on a ticking group are caught same-cycle via the
+    /// active set; the full scan only bounds staleness for the rare edge
+    /// with no wake (e.g. a partition-heal where a hibernated old leader's
+    /// first post-heal message is a plain heartbeat that steps it down).
+    const LEADER_SCAN_INTERVAL_NS: i64 = 50 * std.time.ns_per_ms;
+
+    /// Refresh groups' `is_leader` atomics from the Manager. Per cycle this
+    /// covers only the node's ACTIVE set — leadership can only change when
+    /// a group processes ticks or messages, which (almost always — see
+    /// `LEADER_SCAN_INTERVAL_NS`) implies it was woken into the active set
+    /// earlier in the same pump cycle. A full all-groups scan runs
+    /// interval-gated as the staleness backstop. The old shape scanned
+    /// every registered group every cycle under the bridge mutex — an
+    /// O(N_tenants) per-cycle hot-path cost that nullified hibernation's
+    /// O(active) win at K=thousands. Pump-thread only (reads the Manager
+    /// + `node.active`). The worker reads the atomics lock-free via
+    /// `isLeaderOf`.
     fn refreshLeadership(self: *Bridge) void {
+        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+        const full = now_ns - self.last_leader_scan_ns >= LEADER_SCAN_INTERVAL_NS;
+        if (full) self.last_leader_scan_ns = now_ns;
         self.mutex.lock();
         defer self.mutex.unlock();
         const single = self.node.isSingleNode();
-        var it = self.groups.iterator();
-        while (it.next()) |e| {
-            const sig = e.value_ptr.*;
-            const now = self.node.isLeader(e.key_ptr.*);
-            // false→true promotion edge: queue for the worker's on-promotion
-            // recovery hook. Skipped on a single node — the sole voter leads
-            // every group from creation and never fails over, so there is no
-            // old-leader RAM state to reconstruct (and the leader already
-            // loaded the deployment + armed watermarks inline at release).
-            if (!single and now and !sig.was_leader) {
-                self.promoted.append(self.allocator, sig.gid) catch {};
+        if (full) {
+            var it = self.groups.iterator();
+            while (it.next()) |e| {
+                self.refreshOneLocked(e.value_ptr.*, e.key_ptr.*, single);
             }
-            sig.was_leader = now;
-            sig.is_leader.store(now, .release);
+        } else {
+            for (self.node.active.items) |gid| {
+                const sig = self.groups.get(gid) orelse continue;
+                self.refreshOneLocked(sig, gid, single);
+            }
         }
+    }
+
+    /// Refresh one group's published leadership + detect the
+    /// follower→leader promotion edge. Caller holds `mutex`; pump thread.
+    fn refreshOneLocked(self: *Bridge, sig: *GroupSig, gid: u64, single: bool) void {
+        const now = self.node.isLeader(gid);
+        // false→true promotion edge: queue for the worker's on-promotion
+        // recovery hook. Skipped on a single node — the sole voter leads
+        // every group from creation and never fails over, so there is no
+        // old-leader RAM state to reconstruct (and the leader already
+        // loaded the deployment + armed watermarks inline at release).
+        if (!single and now and !sig.was_leader) {
+            self.promoted.append(self.allocator, sig.gid) catch {};
+        }
+        sig.was_leader = now;
+        sig.is_leader.store(now, .release);
     }
 
     /// Drain the gids promoted (follower→leader) since the last call into
@@ -866,22 +923,22 @@ pub const Bridge = struct {
     }
 
     /// Fault the in-flight proposes of any tenant this node no longer leads.
-    /// Snapshots `in_flight` under the lock, then checks leadership +
-    /// faults outside it (the Manager call + `faultTenant` each take their
-    /// own short critical sections). Pump-thread only.
+    /// Snapshots ALL of `in_flight` under the lock (it is O(in-flight
+    /// tenants) by design — a fixed 32-slot snapshot with no cursor
+    /// silently never checked the tail, so a tenant beyond the first 32
+    /// ate the full commit-wait timeout instead of a fast 503), then
+    /// checks leadership + faults outside it (the Manager call +
+    /// `faultTenant` each take their own short critical sections).
+    /// `sweep_scratch` is reused across cycles to avoid per-cycle
+    /// allocation. Pump-thread only.
     fn sweepLostLeadership(self: *Bridge) void {
-        var snapshot: [32]u64 = undefined;
-        var n: usize = 0;
+        self.sweep_scratch.clearRetainingCapacity();
         {
             self.mutex.lock();
             defer self.mutex.unlock();
-            for (self.in_flight.items) |g| {
-                if (n >= snapshot.len) break;
-                snapshot[n] = g;
-                n += 1;
-            }
+            self.sweep_scratch.appendSlice(self.allocator, self.in_flight.items) catch return;
         }
-        for (snapshot[0..n]) |g| {
+        for (self.sweep_scratch.items) |g| {
             if (!self.node.isLeader(g)) self.faultTenant(g);
         }
     }

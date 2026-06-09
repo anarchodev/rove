@@ -90,6 +90,10 @@ pub const Transport = struct {
     /// thread); cleared by `drainWoke`. Dups are fine — `bumpActive` is
     /// idempotent — so no per-message dedup.
     woke: std.ArrayListUnmanaged(u64) = .empty,
+    /// Total inbound messages `stepBatch` skipped (unknown group / epoch
+    /// fence / decode failure) — rate-limited-logged in `onRecv` so a
+    /// node silently dropping a group's traffic is operator-visible.
+    step_skip_count: u64 = 0,
 
     pub const Config = struct {
         /// This node's raft id (1-based, must be ≤ peers.len).
@@ -170,12 +174,22 @@ pub const Transport = struct {
         if (to == self.node_id or to == 0 or to > self.cluster_size) return;
         const ob = &self.outbufs[to - 1];
         const a = self.allocator;
+        // Roll back to this mark on a partial append: a header without
+        // its message bytes would shift every later record's framing in
+        // the coalesced envelope (the CRC covers the corrupt payload, so
+        // the receiver would mis-parse the rest of the cycle's messages,
+        // not reject them). Dropping the whole record is safe — raft
+        // re-emits on the next tick.
+        const mark = ob.body.items.len;
         var hdr: [20]u8 = undefined;
         std.mem.writeInt(u64, hdr[0..8], group_id, .little);
         std.mem.writeInt(u64, hdr[8..16], epoch, .little);
         std.mem.writeInt(u32, hdr[16..20], @intCast(msg.len), .little);
         ob.body.appendSlice(a, &hdr) catch return;
-        ob.body.appendSlice(a, msg) catch return;
+        ob.body.appendSlice(a, msg) catch {
+            ob.body.shrinkRetainingCapacity(mark);
+            return;
+        };
         ob.count += 1;
     }
 
@@ -240,7 +254,23 @@ pub const Transport = struct {
             // Real raft traffic wakes a hibernated group; heartbeats do not.
             if (!isHeartbeatLike(msg)) self.woke.append(self.allocator, group_id) catch {};
         }
-        _ = self.manager.stepBatch(self.step_scratch.items);
+        const stepped = self.manager.stepBatch(self.step_scratch.items);
+        // stepBatch skips bad entries silently (unknown group, stale
+        // epoch fence, decode failure). An unknown group is the loud
+        // case to watch: a node that missed a group's attach fan-out
+        // drops that tenant's raft traffic forever — quorum silently
+        // degrades to N-1 with zero signal. Count + rate-limit-log so
+        // the degradation is operator-visible.
+        if (stepped < self.step_scratch.items.len) {
+            const skipped = self.step_scratch.items.len - stepped;
+            self.step_skip_count +%= skipped;
+            if (self.step_skip_count == skipped or self.step_skip_count / 1000 != (self.step_skip_count - skipped) / 1000) {
+                std.log.warn(
+                    "v2 transport node {d}: stepBatch skipped {d}/{d} inbound messages (unknown group / fenced / undecodable) — {d} total",
+                    .{ self.node_id, skipped, self.step_scratch.items.len, self.step_skip_count },
+                );
+            }
+        }
     }
 };
 
