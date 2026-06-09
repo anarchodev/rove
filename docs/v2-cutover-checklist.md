@@ -7,7 +7,7 @@
 > cutover is a code operation.* Companions: `docs/v2-build-order.md`,
 > [`architecture/routing-and-ingress.md`](architecture/routing-and-ingress.md) (the
 > committed CF-free edge — supersedes gap #3 below),
-> [`v2-cp-operational-state.md`](v2-cp-operational-state.md) (gap #1),
+> [`architecture/control-plane.md`](architecture/control-plane.md) (gap #1 — plan/limits, decisions.md §10.9),
 > [`architecture/consensus-and-storage.md`](architecture/consensus-and-storage.md),
 > [`architecture/consensus-and-storage.md`](architecture/consensus-and-storage.md).
 
@@ -37,7 +37,7 @@ concentrated at the **edge** (front door) and in **operational state**
 ## 🔴 Real parity gaps — block cutover
 
 **1. Plan / limits — CP foundation SHIPPED; DP delivery + enforcement remain.**
-The [`v2-cp-operational-state.md`](v2-cp-operational-state.md) build, in 3 steps:
+The build (decisions.md §10.9 + `architecture/control-plane.md`), in 3 steps:
    - **Step 1 (CP-side) — ✅ SHIPPED** (`2ddb662`). `plan/{tenant}` is a sibling
      axis in the CP `__directory__` group: `directory.zig` `plans` projection +
      `setPlan`/`planForOwned`; `POST /_control/plan` (admin-gated write) + `GET

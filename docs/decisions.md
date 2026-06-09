@@ -435,6 +435,50 @@ prototype before V2 wrote code.
   the `step` FFI bought 0× — the Zig↔C↔Rust boundary is sub-µs), so a
   faster/smaller codec is the lever, not the FFI shape.
 
+### 10.8 The CP directory is itself raft-replicated (HA, strongly consistent)
+- **Decision** (shipped 2026-06): the control plane is a small dedicated raft
+  cluster (`rewind-cp`, 3–5 voters) holding one `__directory__` group on rove's
+  **own** `bridge`/`Node` substrate — dogfooding the DP engine. Reads serve from
+  an in-memory projection materialized by an `apply_observer` on the leader **and
+  every follower** (a follower has no local proposer); writes propose through the
+  leader, and a follower forwards `/_control/*` to it. The directory group is
+  pinned always-active so a follower re-elects on leader death (a routing read
+  never proposes to wake it).
+- **Why**: Phase 7 made placement request-critical — every DP serve-or-forward
+  reads it and the move's atomic flip writes it — so a single static front-door
+  copy can't be the launch CP; it must be HA + strongly consistent.
+- **Rejected**: the front door as a CP raft voter (the prototype welded the
+  directory to the request-path proxy → front-door count == voter count, inverted
+  scaling). Split the CP into its own binary; the front door is a **stateless
+  cached read-replica** (serve-or-forward is the staleness backstop, not a raft
+  learner at the edge). Mechanics: `architecture/control-plane.md`.
+
+### 10.9 Operational state lives in the CP, authored by an admin app
+- **Decision** (shipped 2026-06): per-tenant **operational state** — plan/limits,
+  and the other admin-set placement-independent axes (domain → tenant index, ACME
+  `cert/{host}`) — lives in the CP `__directory__` group as sibling axes to
+  `placement/*`. The source of truth is the **dumb** CP (it holds *what* the
+  limits are, not *why*); the authority that **mutates** it is a normal rewind.js
+  admin app (a DP tenant) emitting **capability-gated** control writes
+  (`/_control/*`). A CP write is an outbound `Cmd` in the effect algebra; the
+  app's own `app.db` holds the idempotency/audit record.
+- **Why (the CP-home filter)**: the criterion is "**admin-authored AND
+  placement-independent**," the same pair that already puts placement in the CP —
+  *not* "it determines limits" (limits are *enforced* DP-local). A tenant moves
+  between clusters, so the per-cluster `__root__.db` is the wrong home (V1's
+  `root_writeset` conflated source-of-truth with authority). Delivery reuses
+  placement's channels: the plan rides the `v2-attach` handshake at cold-start/
+  move; a live change is a single-target push to the serving cluster (a plan-
+  generation bump). The front door can enforce body-size `413` at the edge from
+  its cached read; rate (`429`) + retention clamp stay DP-local.
+- **Rejected**: plan in `__root__.db` (per-cluster → must migrate on every move; N
+  copies of one-per-tenant state). A dedicated control binary with business logic
+  (keep the CP small/auditable; policy — "Pro costs $X," provisioning — lives in
+  an iterable tenant app). The confused-deputy guard is a **capability grant**,
+  not a hardcoded tenant id (future-proofs delegated/self-host admin). Mechanics:
+  `architecture/control-plane.md`; enforcement levers: `plan-tiers.md`; accounts/
+  billing product layer: `platform-accounts-model.md`.
+
 ---
 
 ## 11. Deployment & log storage
