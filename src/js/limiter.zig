@@ -14,9 +14,9 @@
 //! Per-tenant plan tiers: `check`/`checkN` take the tenant's plan-resolved
 //! `RateLimitCaps` + `plan_gen` (from its `TenantSlot`, docs/plan-tiers.md
 //! Lever 1). A bucket snapshots its caps at creation, so when the generation
-//! moves (a tier change) `getOrCreate` re-inits the caps. `defaultCaps()` is
-//! the fallback for callers without a resolved plan (test paths, async
-//! activations that never ran a request-rate check).
+//! moves (a tier change) `getOrCreate` re-inits the caps. Callers without a
+//! resolved plan (test paths, async activations that never ran a request-rate
+//! check) fall back to a default `RateLimitCaps{}`.
 //!
 //! Actions covered in v1: `request` (per-instance HTTP request budget,
 //! protects the worker from a single noisy tenant) and `email`
@@ -45,10 +45,6 @@ const ACTION_COUNT: usize = std.meta.fields(Action).len;
 /// definition lives in one place reachable from both the worker and the
 /// log-query surface (docs/plan-tiers.md).
 pub const RateLimitCaps = plan_mod.RateLimitCaps;
-
-pub fn defaultCaps() RateLimitCaps {
-    return .{};
-}
 
 pub const TokenBucket = struct {
     /// Maximum tokens the bucket can hold.
