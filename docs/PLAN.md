@@ -1015,10 +1015,6 @@ Resolved items moved to §10. Open items:
   trace_id/tenant_id/request_id. Load-bearing constraint: customer
   request logs stay in the replay store (`docs/architecture/deployment-and-logs.md`); only
   operator signals go to Grafana.
-- `docs/rove-generalization.md` — speculative, not committed:
-  exploration of a programming language built around the
-  rove-kernel (row-typed collections + identity). Reference only;
-  not a direction rewind.js itself takes.
 
 ## 6b. Architectural principle: separability follows raft participation
 

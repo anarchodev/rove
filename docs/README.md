@@ -80,7 +80,3 @@ Active work on the current (V2) line. Each folds into `architecture/` on ship.
 
 - [activitypub-tutorial.md](activitypub-tutorial.md) — ActivityPub bot in ~30 lines
 - [flows/signup.md](flows/signup.md) — end-to-end signup walkthrough
-
-## Exploratory
-
-- [rove-generalization.md](rove-generalization.md) — speculative language-on-rove design (out of engine scope)
