@@ -3020,49 +3020,59 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .body = body,
             .query = route.query,
             .headers = rh,
-            .readset = &readset,
-            .request_id = request_id,
-            .correlation_id = correlation_id,
-            .activation_source = .inbound,
             .session_id = session_resolved.sid,
-            .pending_fetches = &pending_fetches,
-            .pending_wakes = &pending_wakes,
-            .pending_stream_chunks = &stream_chunks,
-            // Non-null only when the handler-tenant is the admin
-            // singleton — gates installation of `platform.root.*`.
-            .platform = handler_inst.platform,
-            .root_writeset = root_ws_ptr,
-            // Limiter scope: the SCOPE tenant (the kv this handler
-            // operates on), not the handler tenant. Admin handlers
-            // running as `__admin__` scoped to `acme` should pull
-            // from acme's email bucket, not __admin__'s.
-            .limiter = &worker.limiter,
-            .instance_id = scope_inst.id,
-            // Same plan the request-rate check used — so `email.send`'s rate
-            // check sizes its bucket from this tenant's tier too (Lever 1's
-            // free second lever).
-            .plan_rate = plan.rate,
-            .plan_gen = plan_gen,
-            // Admin-handler platform capabilities, all-or-nothing:
-            // present iff this is an admin-handler request. Customer
-            // requests get none, and the JS callables reject at the
-            // gate before reaching any trampoline. Scope reads go
-            // direct in globals.zig (no trampoline).
-            .platform_caps = if (handler_inst.platform != null) .{
-                .ctx = @ptrCast(worker),
-                .deploy_starter = &@TypeOf(worker.*).deployStarterTrampoline,
-                .release_publish = &@TypeOf(worker.*).releasePublishTrampoline,
-                .scope_kv_write = &@TypeOf(worker.*).scopeKvWriteTrampoline,
-            } else null,
-            // Phase 5 PR-3: §6.4 held-sync resume hook trampoline.
-            // Available to every dispatch (the JS-shim
-            // `__system/webhook_onresult` calls it on terminal);
-            // returns false when nothing's bound.
-            .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
-            .resume_if_bound_ctx = @ptrCast(worker),
-            .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
-            .cancel_fetch_ctx = @ptrCast(worker),
+            .activation = .inbound,
             .activation_entity = ent,
+            .trace = .{
+                .readset = &readset,
+                .request_id = request_id,
+                .correlation_id = correlation_id,
+            },
+            .plan = .{
+                // Limiter scope: the SCOPE tenant (the kv this handler
+                // operates on), not the handler tenant. Admin handlers
+                // running as `__admin__` scoped to `acme` should pull
+                // from acme's email bucket, not __admin__'s.
+                .limiter = &worker.limiter,
+                .instance_id = scope_inst.id,
+                // Same plan the request-rate check used — so `email.send`'s rate
+                // check sizes its bucket from this tenant's tier too (Lever 1's
+                // free second lever).
+                .plan_rate = plan.rate,
+                .plan_gen = plan_gen,
+            },
+            .admin = .{
+                // Non-null only when the handler-tenant is the admin
+                // singleton — gates installation of `platform.root.*`.
+                .platform = handler_inst.platform,
+                .root_writeset = root_ws_ptr,
+                // Admin-handler platform capabilities, all-or-nothing:
+                // present iff this is an admin-handler request. Customer
+                // requests get none, and the JS callables reject at the
+                // gate before reaching any trampoline. Scope reads go
+                // direct in globals.zig (no trampoline).
+                .platform_caps = if (handler_inst.platform != null) .{
+                    .ctx = @ptrCast(worker),
+                    .deploy_starter = &@TypeOf(worker.*).deployStarterTrampoline,
+                    .release_publish = &@TypeOf(worker.*).releasePublishTrampoline,
+                    .scope_kv_write = &@TypeOf(worker.*).scopeKvWriteTrampoline,
+                } else null,
+            },
+            .trampolines = .{
+                // Phase 5 PR-3: §6.4 held-sync resume hook trampoline.
+                // Available to every dispatch (the JS-shim
+                // `__system/webhook_onresult` calls it on terminal);
+                // returns false when nothing's bound.
+                .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
+                .resume_if_bound_ctx = @ptrCast(worker),
+                .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
+                .cancel_fetch_ctx = @ptrCast(worker),
+            },
+            .effects = .{
+                .pending_fetches = &pending_fetches,
+                .pending_wakes = &pending_wakes,
+                .pending_stream_chunks = &stream_chunks,
+            },
         };
 
         txn.?.savepoint() catch |err| panic_mod.invariantViolated(

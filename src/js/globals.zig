@@ -25,6 +25,8 @@ const h2 = @import("rove-h2");
 const rove = @import("rove");
 const limiter_mod = @import("limiter.zig");
 const crypto_b = @import("bindings/crypto.zig");
+const crypto_jose_b = @import("bindings/crypto_jose.zig");
+const crypto_ecdsa_b = @import("bindings/crypto_ecdsa.zig");
 const email_rate_b = @import("bindings/email_rate.zig");
 const http_b = @import("bindings/http.zig");
 const cont_b = @import("bindings/continuation.zig");
@@ -1719,24 +1721,24 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         // RSA-PKCS#1 v1.5 verify (RS256 / RS384 / RS512). Customer
         // composes JWT/OIDC verification on top — see retry.js +
         // base64url.* helpers.
-        .{ .name = "verifyRsa",       .cfunc = crypto_b.jsCryptoVerifyRsa,       .argc = 4 },
+        .{ .name = "verifyRsa",       .cfunc = crypto_jose_b.jsCryptoVerifyRsa,  .argc = 4 },
         // ECDSA verify (ES256 / ES384 / ES512). Required for Sign in
         // with Apple, AWS Cognito on EC keys, etc. Sig is JWS raw
         // R||S concatenation (the binding converts to DER internally).
-        .{ .name = "verifyEcdsa",     .cfunc = crypto_b.jsCryptoVerifyEcdsa,     .argc = 4 },
+        .{ .name = "verifyEcdsa",     .cfunc = crypto_jose_b.jsCryptoVerifyEcdsa, .argc = 4 },
         // OIDC RS256 key custody (auth-domain-plan §4.7, fork A
         // HYBRID): keygen + sign are Zig/OpenSSL; the IdP JS holds
         // the private key only as an opaque PEM string it never
         // parses.
-        .{ .name = "oidcGenerateKey", .cfunc = crypto_b.jsCryptoOidcGenerateKey, .argc = 0 },
-        .{ .name = "oidcSign",        .cfunc = crypto_b.jsCryptoOidcSign,        .argc = 2 },
+        .{ .name = "oidcGenerateKey", .cfunc = crypto_jose_b.jsCryptoOidcGenerateKey, .argc = 0 },
+        .{ .name = "oidcSign",        .cfunc = crypto_jose_b.jsCryptoOidcSign,   .argc = 2 },
         // Raw-key ECDSA over secp256k1 / P-256: keygen + sign + verify
         // with SHA-256, 64-byte compact R||S, low-S enforced. The
         // primitive atproto.js builds did:key/did:plc + signed repo
         // commits on (separate from the JOSE verifyEcdsa path above).
-        .{ .name = "ecdsaGenerateKey", .cfunc = crypto_b.jsCryptoEcdsaGenerateKey, .argc = 1 },
-        .{ .name = "ecdsaSign",        .cfunc = crypto_b.jsCryptoEcdsaSign,        .argc = 3 },
-        .{ .name = "ecdsaVerify",      .cfunc = crypto_b.jsCryptoEcdsaVerify,      .argc = 4 },
+        .{ .name = "ecdsaGenerateKey", .cfunc = crypto_ecdsa_b.jsCryptoEcdsaGenerateKey, .argc = 1 },
+        .{ .name = "ecdsaSign",        .cfunc = crypto_ecdsa_b.jsCryptoEcdsaSign,        .argc = 3 },
+        .{ .name = "ecdsaVerify",      .cfunc = crypto_ecdsa_b.jsCryptoEcdsaVerify,      .argc = 4 },
     } },
     // http.fetch / http.cancelFetch — the platform's outbound HTTP
     // primitive. Transient + best-effort; durability is composed in
@@ -2032,7 +2034,7 @@ pub fn installRequest(
     // key/op payload (the pre-Gap-2.2 single-slot fields had no
     // producer and were dropped); live kv fan-out rides `.wake_batch`.
     const activation_obj = c.JS_NewObject(ctx);
-    const kind: []const u8 = switch (request.activation_source) {
+    const kind: []const u8 = switch (request.activation.source()) {
         .inbound => "inbound",
         .send_callback => "send_callback",
         .timer => "timer",
@@ -2049,10 +2051,11 @@ pub fn installRequest(
         .ws_message => "ws_message",
     };
     _ = c.JS_SetPropertyStr(ctx, activation_obj, "kind", c.JS_NewStringLen(ctx, kind.ptr, kind.len));
-    if (request.activation_source == .wake_batch) {
+    if (request.activation == .wake_batch) {
+        const wb = request.activation.wake_batch;
         // wakes: [{kind:"kv",key,op,firedAt}|{kind:"timer",firedAt}, ...]
         const wakes_arr = c.JS_NewArray(ctx);
-        for (request.activation_wakes, 0..) |w, i| {
+        for (wb.wakes, 0..) |w, i| {
             const entry = c.JS_NewObject(ctx);
             switch (w.tag) {
                 .kv => {
@@ -2076,7 +2079,7 @@ pub fn installRequest(
         }
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "wakes", wakes_arr);
         const overflow = c.JS_NewObject(ctx);
-        _ = c.JS_SetPropertyStr(ctx, overflow, "lost_oldest", c.JS_NewInt64(ctx, @intCast(request.activation_lost_oldest)));
+        _ = c.JS_SetPropertyStr(ctx, overflow, "lost_oldest", c.JS_NewInt64(ctx, @intCast(wb.lost_oldest)));
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "overflow", overflow);
     }
 
@@ -2095,12 +2098,13 @@ pub fn installRequest(
     // is the subscription's directory name; `source` carries the
     // kind-specific payload (cron firedAt / kv key+op / boot
     // deployment_id).
-    if (request.activation_source == .subscription_fire) {
-        if (request.activation_subscription_name) |n| {
+    if (request.activation == .subscription_fire) {
+        const sf = request.activation.subscription_fire;
+        if (sf.name) |n| {
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "name", c.JS_NewStringLen(ctx, n.ptr, n.len));
         }
         const source_obj = c.JS_NewObject(ctx);
-        if (request.activation_subscription_source) |src| switch (src) {
+        if (sf.source) |src| switch (src) {
             .kv => |kv| {
                 _ = c.JS_SetPropertyStr(ctx, source_obj, "kind", c.JS_NewStringLen(ctx, "kv", 2));
                 _ = c.JS_SetPropertyStr(ctx, source_obj, "key", c.JS_NewStringLen(ctx, kv.key.ptr, kv.key.len));
@@ -2137,12 +2141,13 @@ pub fn installRequest(
     // `final: true` and carries the terminal fields (`status`,
     // `ok`, `body_truncated`); intermediates have `final: false`
     // and only the per-chunk fields.
-    if (request.activation_source == .fetch_chunk) {
-        if (request.activation_fetch_id) |fid| {
+    if (request.activation == .fetch_chunk) {
+        const fc = request.activation.fetch_chunk;
+        if (fc.id) |fid| {
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "fetch_id", c.JS_NewStringLen(ctx, fid.ptr, fid.len));
         }
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "seq", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_seq)));
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "byteOffset", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_byte_offset)));
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "seq", c.JS_NewInt64(ctx, @intCast(fc.seq)));
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "byteOffset", c.JS_NewInt64(ctx, @intCast(fc.byte_offset)));
         // `bytes`: a fresh Uint8Array copy — the handler owns it
         // outright, no lifetime coupling to the event. May be empty
         // on a transport-error / empty-body final event.
@@ -2150,14 +2155,14 @@ pub fn installRequest(
             ctx,
             activation_obj,
             "bytes",
-            c.JS_NewUint8ArrayCopy(ctx, request.activation_fetch_bytes.ptr, request.activation_fetch_bytes.len),
+            c.JS_NewUint8ArrayCopy(ctx, fc.bytes.ptr, fc.bytes.len),
         );
         // `headers` (seq 0 only): the activation carries the
         // PARSED headers as a JSON-encoded `{"name":"value", ...}`
         // string — decode back into a JS object here so the
         // handler sees a plain map. The FetchPool side handles
         // the wire-format parse + last-wins for repeated headers.
-        if (request.activation_fetch_headers) |hjson| {
+        if (fc.headers) |hjson| {
             // `JS_ParseJSON` requires a NUL-terminated buffer
             // (`buf[buf_len] = '\0'` per vendor/arenajs/quickjs.h:1060).
             // Our slice doesn't carry the trailing NUL — copy into a
@@ -2184,11 +2189,11 @@ pub fn installRequest(
         // body is itself non-compilable (translate-c bug — `int != 0`
         // lands in an i32 field); use the module's prebuilt bool
         // JSValue constants instead.
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "final", if (request.activation_fetch_final) js_true else js_false);
-        if (request.activation_fetch_final) {
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "status", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_terminal_status)));
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "ok", if (request.activation_fetch_terminal_ok) js_true else js_false);
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "body_truncated", if (request.activation_fetch_body_truncated) js_true else js_false);
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "final", if (fc.final) js_true else js_false);
+        if (fc.final) {
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "status", c.JS_NewInt64(ctx, @intCast(fc.terminal_status)));
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "ok", if (fc.terminal_ok) js_true else js_false);
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "body_truncated", if (fc.body_truncated) js_true else js_false);
         }
         // `docs/handler-shape.md` §3 + §7: the customer's
         // onFetchChunk handler (BOUND fetch path — bind:true) reads
@@ -2207,13 +2212,13 @@ pub fn installRequest(
                 ctx,
                 req_obj,
                 "body",
-                c.JS_NewUint8ArrayCopy(ctx, request.activation_fetch_bytes.ptr, request.activation_fetch_bytes.len),
+                c.JS_NewUint8ArrayCopy(ctx, fc.bytes.ptr, fc.bytes.len),
             );
-            _ = c.JS_SetPropertyStr(ctx, req_obj, "done", if (request.activation_fetch_final) js_true else js_false);
-            if (request.activation_fetch_id) |fid| {
+            _ = c.JS_SetPropertyStr(ctx, req_obj, "done", if (fc.final) js_true else js_false);
+            if (fc.id) |fid| {
                 _ = c.JS_SetPropertyStr(ctx, req_obj, "fetchId", c.JS_NewStringLen(ctx, fid.ptr, fid.len));
             }
-            _ = c.JS_SetPropertyStr(ctx, req_obj, "chunkSeq", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_seq)));
+            _ = c.JS_SetPropertyStr(ctx, req_obj, "chunkSeq", c.JS_NewInt64(ctx, @intCast(fc.seq)));
             // Pending bound-fetch count including this one.
             // Customer branches on
             // `request.done && request.fetchesPending === 1` to
@@ -2226,10 +2231,10 @@ pub fn installRequest(
             // the same fields that ride on the unbound
             // `request.activation.{ok,status,body_truncated}` but
             // hoisted to the top level for the bound surface.
-            if (request.activation_fetch_final) {
-                _ = c.JS_SetPropertyStr(ctx, req_obj, "ok", if (request.activation_fetch_terminal_ok) js_true else js_false);
-                _ = c.JS_SetPropertyStr(ctx, req_obj, "status", c.JS_NewInt64(ctx, @intCast(request.activation_fetch_terminal_status)));
-                _ = c.JS_SetPropertyStr(ctx, req_obj, "body_truncated", if (request.activation_fetch_body_truncated) js_true else js_false);
+            if (fc.final) {
+                _ = c.JS_SetPropertyStr(ctx, req_obj, "ok", if (fc.terminal_ok) js_true else js_false);
+                _ = c.JS_SetPropertyStr(ctx, req_obj, "status", c.JS_NewInt64(ctx, @intCast(fc.terminal_status)));
+                _ = c.JS_SetPropertyStr(ctx, req_obj, "body_truncated", if (fc.body_truncated) js_true else js_false);
             }
         }
     }
@@ -2240,12 +2245,13 @@ pub fn installRequest(
     // as a fresh Uint8Array copy the handler owns outright (no lifetime
     // coupling to the borrowed frame payload). The handler replies with
     // `stream.write(...)` and parks for the next frame via `next()`.
-    if (request.activation_source == .ws_message) {
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "opcode", c.JS_NewInt64(ctx, @intCast(request.activation_ws_opcode)));
-        const data_val = if (request.activation_ws_opcode == 2)
-            c.JS_NewUint8ArrayCopy(ctx, request.activation_ws_data.ptr, request.activation_ws_data.len)
+    if (request.activation == .ws_message) {
+        const wm = request.activation.ws_message;
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "opcode", c.JS_NewInt64(ctx, @intCast(wm.opcode)));
+        const data_val = if (wm.opcode == 2)
+            c.JS_NewUint8ArrayCopy(ctx, wm.data.ptr, wm.data.len)
         else
-            c.JS_NewStringLen(ctx, request.activation_ws_data.ptr, request.activation_ws_data.len);
+            c.JS_NewStringLen(ctx, wm.data.ptr, wm.data.len);
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "data", data_val);
     }
 
@@ -2254,18 +2260,19 @@ pub fn installRequest(
     // (mirrors the fetch-headers decode above). `key` is omitted (not
     // null) when `at()` was called without one — matches the JS lib's
     // `get()` shape.
-    if (request.activation_source == .durable_wake) {
-        if (request.activation_wake_id) |id| {
+    if (request.activation == .durable_wake) {
+        const dw = request.activation.durable_wake;
+        if (dw.id) |id| {
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "id", c.JS_NewStringLen(ctx, id.ptr, id.len));
         }
-        if (request.activation_wake_key) |k| {
+        if (dw.key) |k| {
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "key", c.JS_NewStringLen(ctx, k.ptr, k.len));
         }
         // Scheduled fire time fits comfortably in a JS Number until
         // the year 2262 (Date.now()*1e6); surface as a plain number
         // for ergonomic `scheduled_at_ns` math.
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "scheduled_at_ns", c.JS_NewInt64(ctx, request.activation_wake_scheduled_at_ns));
-        const mjson = request.activation_wake_msg_json orelse "null";
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "scheduled_at_ns", c.JS_NewInt64(ctx, dw.scheduled_at_ns));
+        const mjson = dw.msg_json orelse "null";
         if (state.allocator.allocSentinel(u8, mjson.len, 0)) |buf| {
             defer state.allocator.free(buf);
             @memcpy(buf, mjson);
