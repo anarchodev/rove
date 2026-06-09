@@ -252,9 +252,8 @@ pub const LogRecord = struct {
     /// the envelope carrying this request's writeset was proposed at.
     /// Zero is a sentinel for "no associated raft seq" (early-error
     /// paths, read-only batches that never proposed, paths not yet
-    /// plumbed). `flushLogs` advances the per-worker
-    /// `last_uploaded_seq` checkpoint by `max(record.raft_seq)` so
-    /// Phase 5c's promotion-time walker knows where to resume.
+    /// plumbed). `flushLogs` advances the per-worker `last_uploaded_seq`
+    /// checkpoint by `max(record.raft_seq)`.
     raft_seq: u64 = 0,
 
     pub fn deinit(self: *LogRecord, allocator: std.mem.Allocator) void {
