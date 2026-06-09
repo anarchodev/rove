@@ -186,41 +186,29 @@ def main() -> int:
                 check("Gate B: leader changed", new_leader is not None and new_leader != orig_leader,
                       f"leader unchanged ({new_leader})")
 
-                # Load the deployment on the new leader. On V2 a promoted
-                # follower does NOT auto-load the deployment from the
-                # replicated `_deploy/current` (the same gap surfaced by
-                # `leader_failover_smoke_v2.py`); a re-release on the new
-                # leader re-triggers the loader (bytecode/manifest are in the
-                # shared S3 store, `_deploy/current` already replicated).
-                if new_leader is not None and dep_id:
-                    rr = c.request_retry("acme", "/schedfire?delay=999999&tag=__probe",
-                                         want_status=200, deadline_s=4.0)
-                    if rr.status != 200:
-                        c.release("acme", dep_id, node=new_leader)
+                # ⭐ Gap A (deploy auto-load on promotion): on V2 a promoted
+                # follower's on-promotion hook (`runPromotionHook` in
+                # `src-v2/rewind/main.zig`) reads the replicated
+                # `_deploy/current` and enqueues the loader, so the handler is
+                # served on the new leader with NO re-release. The `__warm`
+                # probe schedules a far-future (delay=999999) wake purely to
+                # confirm the handler serves — it does NOT arm a near-term
+                # `next_wake_ns` (monotone-min keeps any earlier ff-wake
+                # arming), so it cannot fire the overdue `ff-wake` within the
+                # 40 s window below; only the promotion sweep can.
                 w = c.request_retry("acme", "/schedfire?delay=999999&tag=__warm",
                                     want_status=200, deadline_s=25.0)
-                check("Gate B: deployment loaded on new leader", w.status == 200,
-                      f"warm got {w.status} {w.body!r}")
+                check("Gate B: deployment auto-loaded on new leader (no re-release)",
+                      w.status == 200, f"warm got {w.status} {w.body!r}")
 
-                # PARTIAL (V2 gap): the V1 smoke relied on
-                # `sweepDurableWakesOnPromotion` automatically reconstructing
-                # `next_wake_ns` from the replicated `_sched` state when a
-                # follower is promoted. That promotion sweep is NOT wired in
-                # the V2 worker loop (`src-v2/rewind/main.zig` calls the steady
-                # `sweepDurableWakes` but never the OnPromotion variant), and
-                # `next_wake_ns` is volatile (never replicated) → a fresh
-                # leader's watermark is 0, so the overdue `ff-wake` entry would
-                # never be swept on its own. We nudge it: scheduling a fresh
-                # SHORT wake on the new leader commits a `_sched/by_time` put
-                # whose `lowerWake` arms `next_wake_ns`, so the steady sweep
-                # fires `__system/scheduler_tick` — which RANGE-SCANS
-                # `_sched/by_time` and fires EVERY due entry, including the
-                # overdue `ff-wake` that survived the leader change. So this
-                # still proves the durable `_sched` state survived + fires on
-                # the new leader; only the *automatic* promotion reconstruction
-                # is unverified (see report note).
-                c.request_retry("acme", "/schedfire?delay=2000&tag=nudge",
-                                want_status=200, deadline_s=10.0)
+                # ⭐ Gap B (promotion wake reconstruction): the same hook runs
+                # `sweepDurableWakesOnPromotion`, which fires
+                # `__system/scheduler_tick` for any tenant with `_sched/by_time`
+                # entries — reconstructing the volatile `next_wake_ns` watermark
+                # (never raft-replicated) from the replicated `_sched` state, so
+                # the overdue `ff-wake` that survived the leader change fires on
+                # its own. NO nudge: the assertion below is now a real test of
+                # the automatic promotion reconstruction.
 
                 # Per-id fire counter is raft-replicated → visible on the
                 # surviving nodes.

@@ -115,6 +115,15 @@ pub const GroupSig = struct {
     /// an atomic; one pump cycle stale at worst (fine for the rare move /
     /// leader-probe callers that read it).
     is_leader: std.atomic.Value(bool) = .init(false),
+    /// Pump-thread-only mirror of `is_leader` from the PREVIOUS refresh,
+    /// used by `refreshLeadership` to detect the follower→leader (false→true)
+    /// promotion edge. A freshly-promoted leader must run the on-promotion
+    /// recovery hook (reload the tenant's deployment + reconstruct the
+    /// volatile scheduler/owed-retry watermarks the old leader held in RAM) —
+    /// V1's `loop46` drove this off a single node-wide `was_leader`, but V2
+    /// leadership is per-group, so the edge lives here. Touched only in
+    /// `refreshLeadership` under `Bridge.mutex`.
+    was_leader: bool = false,
     /// FIFO of proposed-but-not-yet-committed seqs (front = oldest), the
     /// explicit per-entry seq↔commit binding that replaces Phase-2's
     /// counting (multi-node breaks counting: a follower applies entries
@@ -185,6 +194,13 @@ pub const Bridge = struct {
     /// the sweep is O(in-flight tenants), not O(all tenants). Guarded by
     /// `mutex`; deduped (a gid appears at most once).
     in_flight: std.ArrayListUnmanaged(u64) = .empty,
+    /// Gids that transitioned follower→leader since the worker last called
+    /// `drainPromotions`. Appended by `refreshLeadership` (pump thread) on
+    /// the false→true edge; drained by the worker thread's on-promotion hook.
+    /// Multi-node only — on a single node the sole voter leads every group it
+    /// creates and never fails over, so nothing is ever queued here. Guarded
+    /// by `mutex`.
+    promoted: std.ArrayListUnmanaged(u64) = .empty,
     /// Move-orchestration control ops awaiting the pump thread (group
     /// create-at-epoch / destroy). Pointers to caller-stack `ControlCmd`s;
     /// guarded by `mutex`. Drained + executed in `pumpOnce`.
@@ -287,6 +303,7 @@ pub const Bridge = struct {
         self.groups.deinit(a);
         self.by_id.deinit(a);
         self.in_flight.deinit(a);
+        self.promoted.deinit(a);
         // Any items still queued at teardown own their payloads.
         for (self.inbox.items) |item| a.free(item.payload);
         self.inbox.deinit(a);
@@ -697,10 +714,54 @@ pub const Bridge = struct {
     fn refreshLeadership(self: *Bridge) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        const single = self.node.isSingleNode();
         var it = self.groups.iterator();
         while (it.next()) |e| {
-            e.value_ptr.*.is_leader.store(self.node.isLeader(e.key_ptr.*), .release);
+            const sig = e.value_ptr.*;
+            const now = self.node.isLeader(e.key_ptr.*);
+            // false→true promotion edge: queue for the worker's on-promotion
+            // recovery hook. Skipped on a single node — the sole voter leads
+            // every group from creation and never fails over, so there is no
+            // old-leader RAM state to reconstruct (and the leader already
+            // loaded the deployment + armed watermarks inline at release).
+            if (!single and now and !sig.was_leader) {
+                self.promoted.append(self.allocator, sig.gid) catch {};
+            }
+            sig.was_leader = now;
+            sig.is_leader.store(now, .release);
         }
+    }
+
+    /// Drain the gids promoted (follower→leader) since the last call into
+    /// `out` (up to `out.len`), returning each tenant's stable `id_str`
+    /// (borrowed from its `GroupSig`, valid for the bridge lifetime). Returns
+    /// the count written. Worker-thread entry point for the on-promotion hook;
+    /// mutex-guarded against the pump's `refreshLeadership` append. Order is
+    /// irrelevant (each promotion is processed idempotently), so this pops
+    /// from the back. A queued gid whose group was destroyed (move) between
+    /// the edge and the drain is skipped.
+    /// Resolve a gid to its tenant `id_str` (borrowed, stable for the bridge
+    /// lifetime), or null if the group is unregistered. Mutex-guarded; safe
+    /// from any thread. Used by the DP apply observer (pump thread) to map an
+    /// applied group's id to the tenant id the deployment loader keys on.
+    pub fn idStrForGid(self: *Bridge, gid: u64) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const sig = self.groups.get(gid) orelse return null;
+        return sig.id_str;
+    }
+
+    pub fn drainPromotions(self: *Bridge, out: [][]const u8) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var n: usize = 0;
+        while (n < out.len) {
+            const gid = self.promoted.pop() orelse break;
+            const sig = self.groups.get(gid) orelse continue;
+            out[n] = sig.id_str;
+            n += 1;
+        }
+        return n;
     }
 
     /// Fault the in-flight proposes of any tenant this node no longer leads.
