@@ -1,0 +1,375 @@
+# Customer blob storage — the `blob.*` surface
+
+> **Status:** design, 2026-06-09. Revives the `blob.put` / `blob.get`
+> JS shims that were specced and then canceled 2026-05-27
+> (`effect-algebra.md` §3 — "defer until concrete use case forces
+> it"). The concrete use case arrived: a paper exercise implementing a
+> Matrix homeserver as a rewindjs customer reduced every gap to this
+> surface (plus ed25519, which is a sibling primitive outside this
+> plan's scope). The adopt-model question in §5 is **code-verified**
+> against `src/blob/coordinator.zig` + `src/js/worker_dispatch.zig`
+> as of `d4a2266`; everything else is design.
+
+## 1. Motivation — the storage doctrine, surfaced
+
+The engine already lives by one storage discipline: **raft replicates
+the pointer, object storage holds the bytes.** Deployment manifests in
+kv → content-addressed blobs in S3; log batches sealed S3-direct;
+readset bodies in blob storage with BodyRefs in the raft entry. This
+plan surfaces that same discipline as customer API:
+
+> **kv is for state you mutate; the object store is for facts you
+> accumulate.**
+
+Every event-sourced app — the natural shape for a purely-functional
+platform — has this anatomy: immutable accumulating facts (events,
+uploads, history) plus a small mutable projection (cursors, indices,
+current-state pointers). Without a blob surface, the facts pile into
+kv and hit the size cap; with it, kv usage plateaus at the working set
+while history grows in cheap object storage. The two pricing axes
+(`pricing-model.md`: kv hard-cap + object-storage byte-ring) already
+assume exactly this split — the pricing and the storage doctrine are
+the same statement.
+
+The validating workload is a Matrix homeserver implemented entirely as
+a customer app: event DAG as CAS (Matrix event IDs *are* content
+hashes in room v3+), media repo, resolved-state snapshots as
+derivable-class blobs, history sealed out of kv. Everything in that
+exercise that didn't already compose from shipped primitives reduced
+to the verbs below.
+
+## 2. Addressing doctrine — CAS only; names are kv's job
+
+Every object is content-addressed at
+`{key_prefix_base}{instance_id}/app-blobs/{hash}`. The store has **no
+names** — the customer's naming layer (`media/{id} → hash`,
+`segments/{room}/{seq} → hash`) lives in kv, where it is
+transactional, replicated, and indexed.
+
+This kills four problems at birth: overwrite semantics, key
+collisions, LIST, and read-after-write naming races — and dedup falls
+out free. It also makes replay cheap by construction: a read by hash
+is deterministic, so the tape records the hash, not the bytes
+(`tape-minimization.md` CAS-extent record kind). An app that pushes
+its bulk into the CAS gets *cheaper* replay — the incentive gradient
+points at the architecture we want customers to use.
+
+The tenant prefix is the third sibling of the existing per-tenant S3
+layout (`file-blobs/`, `log-blobs/`), so isolation, ops, and metering
+ride infrastructure that already exists.
+
+## 3. The verb surface
+
+Two design laws govern everything here (from `handler-shape.md` /
+`effect-algebra.md` §8): **the verb is the scope** (no durability
+flags), and **bytes the handler doesn't execute on never transit the
+worker** ([[feedback_storage_origin_vs_worker_ram]]).
+
+### 3.1 `blob.put(bytes) → hash` — small objects, durable-intent
+
+```js
+const hash = blob.put(bytes);                       // arena-bounded (≤ ~1 MB)
+kv.set(`media/${id}`, { hash, ct: 'image/png' });   // same writeset — atomic
+```
+
+The hash is a pure function of the bytes, so `put` returns it
+**synchronously** without violating the Msg invariant (like
+`webhook.send` returning an id) — the handler indexes it in kv in the
+same activation, atomic with the durability marker. Mechanically this
+is the canceled 2026-05-27 spec unchanged: the standard rule-4
+composition — `_blob/owed/{hash}` kv marker (rides envelope-0 atomic
+with the handler's writes) + idempotent content-addressed PUT + retry
+cron + boot subscription. Recovery re-derives bytes by re-executing
+the source activation against its readset (`effect-algebra.md` §2.5).
+
+### 3.2 `blob.get(hash)` / `blob.pipe(hash)` — reads
+
+`blob.get` is `on.fetch` against the blob backend wearing a hash
+instead of a URL; the fetch engine's three response dispositions are
+already the right shapes:
+
+```js
+blob.get(hash, { to: 'onBlob' });    // whole → one activation with the bytes
+blob.get(hash, { to: 'onSeg' });     // streamed → chunk-shaped activations
+blob.pipe(hash);                     // Pattern B: backend → held connection
+```
+
+`pipe` serves bytes storage→socket with zero activation hops, untaped
+by derivation (no Msg origin — and harmless: the content is
+CAS-stable). Ephemeral, no marker; a backend miss is a 503 and the
+client retries.
+
+### 3.3 `blob.url(hash, {ttl}) → url` — presign, the one platform-only verb
+
+A pure computation — SigV4 over platform-held keys, no I/O, no Msg.
+The handler answers a media download with a `307` to a presigned URL
+and the bytes never touch the worker at all. One determinism rule:
+the signature's timestamp derives from the activation's **taped
+clock**, never a wall-clock read — replay then reproduces the URL
+bit-for-bit.
+
+This is the only verb in the plan a customer categorically cannot
+compose (they don't hold signing keys), which makes it the clearest
+platform obligation. The presign code substantially exists in
+`rove-blob` (path-style SigV4); the work is exposure + tenant-prefix
+enforcement.
+
+### 3.4 Streaming in, Case A — `blob.write` / `blob.seal` (handler observes the chunks)
+
+For handlers whose logic depends on chunk content (parse, validate,
+transform — and also archive the raw bytes):
+
+```js
+export function onChunk() {
+  blob.write(request.body);            // accumulate into this connection's session
+  if (!request.done) return next();
+  blob.seal({ to: 'onSealed' });       // complete multipart → hash
+  return next();
+}
+export function onSealed() {
+  kv.set(`media/${id}`, { hash: request.result.hash });
+  return json({ ... });
+}
+```
+
+Scope-as-verb does the safety work: the upload session is
+**connection-scoped** — an ephemeral ECS entity, one implicit session
+per connection ([[feedback_model_simplicity_safety]]: ship one;
+explicit handles wait for a customer with concurrent uploads),
+abandoned on disconnect (S3 `AbortMultipartUpload`). Nothing durable
+exists until `seal`, whose commit point is the ordinary `_blob/owed`
+marker.
+
+**Implementation: RAM-sourced assembly, not re-buffering.** The
+chunks were already coordinator-submitted as tape inputs before the
+handler observed them (§5). The session does not copy bytes out of
+the activation: `blob.write` records the chunk's `(worker_id, seq)`;
+`seal` assembles the tenant-prefix multipart by reading parts back
+from the coordinator's retained RAM (`readBody`,
+`coordinator.zig:557`) — zero S3 GETs — buffering to the 5 MiB
+part-minimum in a bounded per-session buffer, then `release`-ing each
+consumed submission (the chunk-spool P6 refcount). Cost: the bytes
+hit S3 twice (pool as tape input + tenant prefix as the object). That
+is the correct price for Case A — the handler *observed* the bytes,
+so replay needs them.
+
+### 3.5 Streaming in, Case B — `blob.receive` + `onHeaders` (handler doesn't need the bytes)
+
+The Matrix media endpoint decides everything from headers: bearer
+token, content-type, quota. No body byte influences the disposition.
+The right shape is not inverted homing of chunk Msgs — it is **no
+chunk Msgs at all**: the inbound mirror of `pipe_to` (Cmd ⊕ Cmd, no
+Msg origin), bytes flowing socket → tenant-prefix multipart without
+entering an activation.
+
+```js
+export function onHeaders() {           // fires before any body byte is accepted
+  if (!authed(request.headers)) { response.status = 401; return 'unauthorized'; }
+  blob.receive({ to: 'onStored' });     // pipe the entire body; zero chunk Msgs
+  return next();
+}
+export function onStored() {            // one completion Msg: { hash, len }
+  kv.set(`media/${mxc()}`, { hash: request.result.hash });
+  return json({ content_uri: ... });
+}
+```
+
+Three properties make this clean:
+
+- **`onHeaders` extends an existing mechanism.** The engine already
+  picks dispatch shape by export introspection at load (`default` vs
+  `onChunk`); "exports `onHeaders` → headers-first dispatch" is one
+  more row, not a new system. HTTP/2 flow control makes it
+  zero-buffer: hold the stream window closed until the disposition is
+  decided, then open it for the pipe — the client is held at the
+  door, not buffered in the hallway.
+- **S3 multipart natively has commit-gate semantics.** Parts stream
+  up eagerly as bytes arrive, but *nothing is externally observable
+  until `CompleteMultipartUpload`* — so the complete call is
+  commit-gated like any Cmd (L4), and a dropped connection or
+  rolled-back activation maps to `AbortMultipartUpload` (L2 abandon
+  semantics, for free).
+- **Untaped bytes are correct here by the same derivation as
+  `pipe_to`**: there is no Msg to record. The input-bytes home is the
+  customer object itself; the completion Msg tapes `{hash, len}`,
+  which is all replay strictly needs.
+
+**Why `onHeaders` is load-bearing and not a nicety:** without it, the
+pipe must be declared from an activation that already carries body
+bytes, and the durability gate has pool-homed those bytes first. The
+tax is up to 1 MB per streamed upload — and *the whole object* for
+bodies under 1 MB, since the buffered `default` path delivers (and
+therefore pool-homes) the entire body. Small media — the
+high-frequency case — pays 2× without it. With it, the accounting is
+exact: bytes the handler's logic depends on are taped; bytes it
+doesn't are piped, one PUT, at every object size.
+
+The customer litmus mirrors the existing scope litmus, pointed at
+bytes: *does your logic depend on the content of the chunks?* Yes →
+`onChunk` + `blob.write` (Case A — you pay the tape, correctly). No →
+`onHeaders` + `blob.receive` (Case B — one PUT).
+
+## 4. The verbs against the effect-algebra contract
+
+No new singleton: every verb decomposes into Model writes + the
+outbound-HTTP Cmd runtime + existing Msg origins + (for sessions) an
+ephemeral connection-scoped entity. Durability never leaves its one
+home — `seal`/`put`'s commit point is a kv marker (L1, rule 4).
+
+| Verb | Cmd | Msg | Durability | Failure |
+|---|---|---|---|---|
+| `put` | `_blob/owed/{hash}` marker + PUT | shim `onResult` | durable-intent composition | at-least-once, idempotent via CAS |
+| `get` | fetch | result / chunks | ephemeral | at-most-once; miss = 503, client retries |
+| `pipe` | fetch ⊕ connection-write | none (no Msg origin) | ephemeral | at-most-once; untaped by derivation |
+| `url` | — (pure fn over taped clock) | — | — | n/a |
+| `write`/`seal` | part-PUTs + marker at seal | seal result | ephemeral until seal; durable-intent at seal | abandon on disconnect; seal idempotent |
+| `receive` | inbound-pipe ⊕ part-PUTs; commit-gated complete | one completion Msg | object durable at complete | abort on disconnect; nothing promised pre-complete |
+
+**Trust boundary.** Unlike `webhook.send.js`, these shims cannot sign
+with raw `on.fetch` — SigV4 keys and prefix enforcement cannot live in
+forkable customer JS. The shape that preserves rule 4 anyway: the
+verbs stay readable JS shims, but they target a **node-local blob
+proxy** that signs and enforces `{instance_id}/app-blobs/`. Policy
+stays in JavaScript; the credential stays behind a thin trusted door.
+
+## 5. The adopt investigation — why Case A pays twice (code-verified)
+
+The tempting design was *adoption*: inbound bytes are already durable
+in tenant object storage before any handler observes them (the
+callback-gating invariant), so a streaming put could just retain
+pointers into the readset blobs instead of re-uploading. Verified
+against the coordinator, **per-request addressability holds but
+adoption-by-reference is dead**:
+
+- **Addressable: yes.** Every >16 KB submission gets an exact
+  `BodyRef {batch_id, offset, len}` (`coordinator.zig:49`), recorded
+  durably in the readset that rides the raft entry
+  (`worker_dispatch.zig:2853`). Submission boundary = activation
+  boundary (`coordinator.zig:432`).
+- **Cross-tenant pool.** Since Phase 5, all workers' and all tenants'
+  submissions mix freely in one S3 object under
+  `_pool/{batch_id:0>20}` (`coordinator.zig:704`). Adopted ranges
+  would point into objects containing other tenants' bytes — presign
+  is impossible (a presigned GET authorizes the *object*; Range is
+  client-supplied), so every read would proxy forever.
+- **Lifecycle coupling.** Pool batches are tape-input storage, scoped
+  to tape retention. Media must outlive retention → adoption means
+  pinning shared 16 MiB batches (`max_batch_bytes`,
+  `coordinator.zig:87`) full of other tenants' expired bytes —
+  un-GC-able, un-attributable. And bodies ≤ 16 KB never reach S3 at
+  all — they ride inline in the raft entry
+  (`INBOUND_INLINE_THRESHOLD`, `worker_dispatch.zig:2844`): nothing
+  to adopt.
+- **Fragmentation vs S3 copy semantics.** Chunks are ~64 KB–1 MB,
+  scattered across drain passes and interleaved within batches; S3
+  `UploadPartCopy` requires ≥ 5 MiB per part. Server-side assembly is
+  not expressible; GET+re-PUT pays download *plus* upload — worse
+  than transport.
+
+What survives is the §3.4 design: the chunk-spool P6 retained-RAM +
+`readBody`/`release` hooks feed the multipart with no S3 GET and no
+handler re-buffering.
+
+**Post-evidence option (recorded, not planned): inverted homing.**
+For Case A streamed uploads, home the bytes at the tenant prefix
+*first* and point the readset BodyRef into
+`{tenant}/app-blobs/{hash}` — one PUT shared by tape and customer.
+Bill: a new BodyRef interpretation (the `NO_BATCH = 0` sentinel
+already proves the field is a discriminated union in disguise —
+[[feedback_wire_width_vs_interpretation]]), a READSET_VERSION bump,
+chunk-dispatch gating degrading to 5 MiB part boundaries, and
+`blob.delete` fenced to tape retention. Only worth it if a real
+workload is both transform-heavy *and* archive-heavy; Case B already
+gives the byte-heavy path one-PUT semantics without any of this.
+
+## 6. Standard-library recipe: sealed segments (`segments.js`)
+
+The first thing every append-heavy app does with this surface is the
+universal log-structured move: hot mutable tier + sealed immutable
+runs (memtable→SSTable, Kafka segments, raft log+snapshot). It is
+**not a primitive** — decomposed it is Model writes + `blob.put` +
+cron + the commit gate — so per rule 4 it ships as a readable,
+forkable stdlib shim:
+
+- **Hot tail:** recent records as kv rows
+  (`timeline/{stream}/{seq} → record`) — addressable, atomic with the
+  handler, counted against the kv cap.
+- **Seal (cron):** range-read the oldest N rows, serialize with an
+  offset table, `blob.put`; in the PUT's `onResult`, write the
+  segment index row (`segments/{stream}/{firstSeq} → {hash, count,
+  offsets}`) and delete the N hot rows **in one writeset**.
+- **Read:** stitch — hot window via kv, older via segment-index
+  lookup + `blob.get` + offset slice.
+
+The crash-safety nuance is the design content: a sealed segment is
+**durable-class, not cache-class** (unlike derivable snapshots/
+indices) — once the hot rows are deleted it is the sole copy past
+tape retention. So the delete is gated on the confirmed PUT
+(callback-gating, the discipline the platform already has), and the
+swap is atomic.
+
+Why it matters beyond convenience: the seal cadence is the knob that
+trades kv-cap consumption against byte-ring consumption — the hot
+window size *is* the kv bill. An append-heavy app without sealing
+eventually hits the kv cap; with it, kv plateaus at the working set
+forever. If customers keep forking `segments.js` in the same
+direction, that is the promotion signal
+([[feedback_compose_from_primitives]]).
+
+## 7. Open questions
+
+1. **Delete / GC.** CAS + customer-owned naming means the platform
+   cannot know liveness. Candidate: `blob.delete(hash)`, customer
+   owns refcounting, metering reconciles from the prefix. Defensible
+   day one: no delete at all (media retention forces it eventually;
+   eventually ≠ launch). Any delete must be fenced against tape
+   retention where the object is an input home (Case B).
+2. **Quota enforcement point.** Reject at `put`/`seal`/`receive`
+   (before bytes land) — the only placement that strands nothing;
+   byte-ring metering reconciles platform-side from prefix listing.
+3. **`seal` sync vs Msg.** A synchronous hash requires the runtime to
+   gate the response on the final part landing behind the scenes;
+   the Msg form (`{to}`) is honest about the wait. Current lean: Msg
+   form (shown in §3.4) — consistent with "results arrive as future
+   Msgs."
+4. **`onHeaders` semantics beyond uploads.** Headers-first dispatch
+   is useful for any early-rejection (auth, rate-limit) before
+   accepting a body. Decide whether it composes with `default`
+   /`onChunk` in one module or is exclusive.
+5. **Local-backend fast path.** Single-node / fs-backend deployments
+   could short-circuit the proxy; the original spec called this a
+   JS-shim choice, not a primitive distinction. Confirm under the
+   no-dev-only-paths rule ([[feedback_avoid_dev_only_features]]).
+
+## 8. Phasing
+
+| Phase | Ships | Notes |
+|---|---|---|
+| P1 | node-local signing proxy + `put`/`get`/`pipe`/`url` shims | smallest end-to-end slice; covers events, snapshots, small media; `url` unlocks 307-to-presigned downloads |
+| P2 | `write`/`seal` sessions (RAM-sourced assembly via `readBody`/`release`) | Case A streaming uploads; bounded 5 MiB part buffer |
+| P3 | `onHeaders` dispatch + `blob.receive` | Case B one-PUT uploads; h2 window held until disposition |
+| P4 | `segments.js` stdlib recipe + docs | the kv-cap ↔ byte-ring lever, documented |
+| — | byte-ring metering + quota | alongside P1–P3; enforcement points per §7.2 |
+
+Each phase is independently useful; P1 alone un-blocks the Matrix
+exercise's event store and media reads.
+
+## 9. Relation to other docs
+
+- **`effect-algebra.md`** — §3 marks `blob.put`/`blob.get` deferred;
+  this plan is the deferral's exit condition arriving. §2.5
+  (input/output byte asymmetry) is the recovery model `put` leans on;
+  §8 scope axes classify every verb here.
+- **`handler-shape.md`** — the verb-is-scope surface these verbs
+  extend; `onHeaders` adds a row to §3's activation table.
+- **`architecture/effects-and-handlers.md`** — callback-gating /
+  durable-input substrate; the Continuation the sessions park on.
+- **`architecture/routing-and-ingress.md`** — `pipe_to` (Pattern B),
+  whose inbound mirror is `blob.receive`; the 1 MB ceiling and
+  `onChunk` dispatch.
+- **`pricing-model.md`** — the kv-cap + byte-ring axes this surface
+  makes legible.
+- **`tape-minimization.md`** — CAS-extent tape records; why CAS reads
+  are nearly free on the tape.
+- **`docs/chunk-spool-plan.md`** (folded) — the P6 retained-RAM
+  `readBody`/`release` hooks §3.4 builds on.
