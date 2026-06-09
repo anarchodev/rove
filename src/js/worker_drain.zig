@@ -1403,7 +1403,7 @@ fn resumeContinuation(
         // .wake_batch for an on.* connection wake.
         .activation = if (wake) .{ .wake_batch = .{} } else .send_callback,
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
     };
     std.log.info("rove-js corr: resume corr={s} request_id={d} tenant={s}", .{ correlation_id orelse "(none)", request_id, inst.id });
@@ -1802,7 +1802,7 @@ pub fn resumeBoundFetchChain(
         .activation_entity = ent,
         .activation_fetches_pending = fetches_pending,
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
         .trampolines = .{
             .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,

@@ -225,6 +225,7 @@ pub const Dispatcher = struct {
             .instance_id = request.plan.instance_id,
             .plan_rate = request.plan.plan_rate,
             .plan_gen = request.plan.plan_gen,
+            .blob_cfg = request.plan.blob_cfg,
             .correlation_id = request.trace.correlation_id orelse "",
             .platform_caps = request.admin.platform_caps,
             .resume_if_bound = request.trampolines.resume_if_bound,

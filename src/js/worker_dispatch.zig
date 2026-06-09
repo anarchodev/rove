@@ -3042,6 +3042,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 // free second lever).
                 .plan_rate = plan.rate,
                 .plan_gen = plan_gen,
+                .blob_cfg = &worker.node.blob_backend_cfg,
             },
             .admin = .{
                 // Non-null only when the handler-tenant is the admin

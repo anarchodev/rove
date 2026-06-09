@@ -68,6 +68,12 @@ const MODULES = [_]struct {
         .path = "__system/cron_tick.mjs",
         .src = @embedFile("builtin_cron_tick_mjs"),
     },
+    .{
+        // `docs/blob-storage-plan.md` P1: blob.put's marker-settling
+        // result handler.
+        .path = "__system/blob_onresult.mjs",
+        .src = @embedFile("builtin_blob_onresult_mjs"),
+    },
 };
 
 /// Compile every built-in module to QJS bytecode and return an

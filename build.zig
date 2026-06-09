@@ -486,6 +486,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "textcodec_js", .path = "src/js/globals/textcodec.js" },
         .{ .name = "users_js", .path = "src/js/globals/users.js" },
         .{ .name = "activitypub_js", .path = "src/js/globals/activitypub.js" },
+        .{ .name = "blob_js", .path = "src/js/globals/blob.js" },
 
         // Built-in handler modules — compiled to bytecode at NodeState
         // init, resolved via the `__system/` module-path prefix
@@ -500,6 +501,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "builtin_scheduler_tick_mjs", .path = "src/js/builtin_modules/scheduler_tick.mjs" },
         // Handler-surface Phase 5 — the `cron(...)` recurrence engine.
         .{ .name = "builtin_cron_tick_mjs", .path = "src/js/builtin_modules/cron_tick.mjs" },
+        // `docs/blob-storage-plan.md` P1 — blob.put's marker-settling
+        // result handler.
+        .{ .name = "builtin_blob_onresult_mjs", .path = "src/js/builtin_modules/blob_onresult.mjs" },
 
         // Starter content baked into the freshly-created tenant's
         // first deployment — see `deployStarterContent` in

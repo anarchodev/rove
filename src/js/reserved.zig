@@ -69,6 +69,12 @@ const std = @import("std");
 /// queuing the JS-shim retry sweep to attempt their request — which
 /// is exactly what calling webhook.send does. No spoofing surface.
 ///
+/// `_blob/` follows the `_send/` rule: the `blob.put` JS shim
+/// (`globals/blob.js`) writes its `_blob/owed/{hash}` marker via
+/// ordinary `kv.set`, so the prefix CANNOT be platform-reserved (the
+/// write guard would reject the shim itself). A customer faking the
+/// key creates a stale marker nobody consumes — no spoofing surface.
+///
 /// `_events/` was reserved for SSE event rows under the legacy worker
 /// pump; the centralized sse-server retired that storage layer
 /// (sse-plan §7), so the prefix is no longer special — customer code

@@ -33,6 +33,8 @@ const cont_b = @import("bindings/continuation.zig");
 const stream_b = @import("bindings/stream.zig");
 const scheduler_b = @import("bindings/scheduler.zig");
 const on_b = @import("bindings/on.zig");
+const blob_b = @import("bindings/blob.zig");
+const blob_mod = @import("rove-blob");
 const td = @import("trigger_dispatch.zig");
 const reserved = @import("reserved.zig");
 const bytecode_cache_mod = @import("bytecode_cache.zig");
@@ -465,6 +467,12 @@ pub const DispatchState = struct {
     /// Instance id for limiter lookup. Empty when the dispatcher
     /// runs without a worker (test paths).
     instance_id: []const u8 = "",
+    /// `docs/blob-storage-plan.md` P1: the node's S3 backend config,
+    /// borrowed from `NodeState.blob_backend_cfg` for the
+    /// `_system.blob.presign` binding (the one blob verb that needs
+    /// the signing keys natively). Null on test paths without a
+    /// node — presign then throws "not configured".
+    blob_cfg: ?*const blob_mod.BackendConfig = null,
     /// Plan-resolved rate caps + plan generation for `instance_id` (from its
     /// `TenantSlot`). The `email.send` rate check sizes its bucket from these
     /// (docs/plan-tiers.md Lever 1). Defaults = free/default caps on paths
@@ -1637,6 +1645,9 @@ pub fn installStatic(ctx: *c.JSContext) void {
     evalSnippet(ctx, "next.js", NEXT_JS);
     evalSnippet(ctx, "webhook.js", WEBHOOK_JS);
     evalSnippet(ctx, "email.js", EMAIL_JS);
+    // blob depends on crypto.sha256 + http (both above) +
+    // _system.blob.presign (`docs/blob-storage-plan.md` P1).
+    evalSnippet(ctx, "blob.js", BLOB_JS);
     // users is standalone (kv + crypto.{randomBytes,sha256}).
     evalSnippet(ctx, "users.js", USERS_JS);
     // activitypub depends on base64url/hex/btoa + crypto + http +
@@ -1764,6 +1775,13 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         .{ .name = "subscribe",          .cfunc = http_b.jsHttpSubscribe,          .argc = 1 },
         .{ .name = "cancelSubscription", .cfunc = http_b.jsHttpCancelSubscription, .argc = 1 },
     } },
+    // `docs/blob-storage-plan.md` P1: tenant blob storage. Only
+    // `presign` is native (needs the platform-held signing keys);
+    // `blob.put` / `blob.get` are JS compositions in globals/blob.js
+    // over the fetch engine's `rove-blob.internal` trusted door.
+    .{ .path = &.{ "_system", "blob" }, .fns = &.{
+        .{ .name = "presign", .cfunc = blob_b.jsBlobPresign, .argc = 3 },
+    } },
     // Phase 5 PR-3: the `_system.continuation.resumeIfBound` shim was
     // a stillborn — the `_harden.js` step (`delete globalThis._system;`
     // at the end of `evalShimSources`) runs BEFORE customer + baked
@@ -1869,6 +1887,7 @@ const EMAIL_JS = @embedFile("email_js");
 const TEXTCODEC_JS = @embedFile("textcodec_js");
 const USERS_JS = @embedFile("users_js");
 const ACTIVITYPUB_JS = @embedFile("activitypub_js");
+const BLOB_JS = @embedFile("blob_js");
 
 /// (public name, embedded source) for every `globals/*.js` file. The
 /// single list the Phase-A lints below pivot on: each `.src` is an
@@ -1901,6 +1920,7 @@ const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "textcodec", .src = TEXTCODEC_JS },
     .{ .name = "users", .src = USERS_JS },
     .{ .name = "activitypub", .src = ACTIVITYPUB_JS },
+    .{ .name = "blob", .src = BLOB_JS },
 };
 
 fn installNamespace(ctx: *c.JSContext, global: c.JSValue, ns: NamespaceBindings) void {
