@@ -16,8 +16,8 @@
 > Originally consolidated 2026-05-27 from the
 > WebSocket-blocked items scattered across other docs (`architecture/effects-and-handlers.md`
 > §6.3 + §6.5, `architecture/effects-and-handlers.md` Phase 4.1.4 `conn_write`,
-> `primitive-gaps.md` §2.5 forward note, `architecture/effects-and-handlers.md`
-> §13 out-of-scope, the deleted `curl-multi-plan.md` Phase 4) into one
+> the held-outbound-subscription note (now in `architecture/effects-and-handlers.md`),
+> the deleted `curl-multi-plan.md` Phase 4) into one
 > place. The execution model is already specified (`architecture/routing-and-ingress.md`
 > §1–§5 + connection-actor §6); this doc is about transport choices,
 > what shipping WS unlocks, and the cost/sequencing.
@@ -431,7 +431,7 @@ collab).
   `stream.write` the one connection-output surface, so outbound WS
   frames lower to `Cmd.stream_chunk` (opcode-tagged), not a new
   `conn_write` Cmd (§2.4). That reservation can be struck.
-- **`primitive-gaps.md` §2.5** — outbound subscription shipped via
+- **Held outbound subscription** (`architecture/effects-and-handlers.md`) — shipped via
   `http.subscribe`; the "WS framing remains separate" note now
   resolves to this doc.
 - **`architecture/effects-and-handlers.md` §13** (out of scope: WS transport)
