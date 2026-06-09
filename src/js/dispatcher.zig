@@ -241,6 +241,7 @@ pub const Dispatcher = struct {
             .pending_wakes = request.effects.pending_wakes,
             .pending_stream_chunks = request.effects.pending_stream_chunks,
             .pending_stream_chunk_opcodes = request.effects.pending_stream_chunk_opcodes,
+            .ws_frame_output = request.activation == .ws_message,
             .is_system_module = request.is_system_module,
         };
 
@@ -419,7 +420,12 @@ fn finishResponse(
     // is preserved: `next()` ⇒ `.stream` (re-arm); a terminal ⇒ keep the
     // terminal but prepend the buffered chunks so the final frames ship
     // before END_STREAM.
-    if (state.stream_started) {
+    // WS frame output (websocket-plan §5, piece D) skips this bridge
+    // entirely: the chunks stay in `pending_stream_chunks` for the worker's
+    // `shipWsFrames` (→ `ws_send_in`), `next()` falls through to the plain
+    // continuation below, and a terminal keeps its own body (the frames
+    // ship before the Close; nothing is prepended).
+    if (state.stream_started and !state.ws_frame_output) {
         if (pending.continuation) |cont| {
             var c2 = cont;
             pending.continuation = null; // take ownership

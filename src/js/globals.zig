@@ -386,6 +386,15 @@ pub const DispatchState = struct {
     /// pipeline entry. Connection-only — `stream.*` is inert (and this
     /// stays false) when `pending_stream_chunks` is null.
     stream_started: bool = false,
+    /// websocket-plan §5 (piece D): true when this activation's
+    /// `stream.write` output is WS frames, not a streamed HTTP response.
+    /// Set by the dispatcher for `.ws_message` activations. Bypasses the
+    /// Phase-2 stream bridge (`stream_started` → `Stream` descriptor /
+    /// terminal chunk-prepend) so the chunks stay in
+    /// `pending_stream_chunks` for `shipWsFrames` to lower to
+    /// `ws_send_in`, and `next()` stays a plain continuation (the WS
+    /// chain parks on frame arrival, not the stream pipeline).
+    ws_frame_output: bool = false,
     /// Handler-surface Phase 2: caller-owned accumulator for chunks
     /// emitted via `stream.write(chunk)` this activation (same ownership
     /// model as `pending_fetches`/`pending_wakes`). Each is an owned byte
