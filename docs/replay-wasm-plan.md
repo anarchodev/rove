@@ -214,7 +214,7 @@ module   (channel 4):
   [u32 len][specifier utf-8]
   [u32 len][source_hash_hex utf-8]   // always 64 chars
 
-fetch_responses (channel 5):   // readset-replication-plan §2c-2
+fetch_responses (channel 5):   // effects-and-handlers §2c-2
   [u32 len][fetch_id utf-8]
   [u32 seq]
   [u64 byte_offset]
@@ -227,7 +227,7 @@ fetch_responses (channel 5):   // readset-replication-plan §2c-2
   [u8  body_truncated]               // 0 if !final
   [u32 len][headers utf-8]           // non-empty on seq=0 only
 
-trigger_payload (channel 6):   // readset-replication-plan §2d/§4-inline
+trigger_payload (channel 6):   // effects-and-handlers §2d/§4-inline
   [u64 body_ref.batch_id]            // NO_BATCH(0) ⇒ inline bytes
   [u64 body_ref.offset]
   [u32 body_ref.len]                 // when inline, == inline_bytes.len

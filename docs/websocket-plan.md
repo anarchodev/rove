@@ -14,11 +14,11 @@
 > seam. Proven by `examples/ws_echo_test.zig` (`zig build ws-echo`) +
 > `scripts/ws_echo_smoke.py`. **Next: piece D** (the worker `onMessage` seam).
 > Originally consolidated 2026-05-27 from the
-> WebSocket-blocked items scattered across other docs (`connection-actor-plan.md`
-> §6.3 + §6.5, `effect-reification-plan.md` Phase 4.1.4 `conn_write`,
-> `primitive-gaps.md` §2.5 forward note, `streaming-handlers-plan.md`
-> §13 out-of-scope, the deleted `curl-multi-plan.md` Phase 4) into one
-> place. The execution model is already specified (`streaming-model.md`
+> WebSocket-blocked items scattered across other docs (`architecture/effects-and-handlers.md`
+> §6.3 + §6.5, `architecture/effects-and-handlers.md` Phase 4.1.4 `conn_write`,
+> the held-outbound-subscription note (now in `architecture/effects-and-handlers.md`),
+> the deleted `curl-multi-plan.md` Phase 4) into one
+> place. The execution model is already specified (`architecture/routing-and-ingress.md`
 > §1–§5 + connection-actor §6); this doc is about transport choices,
 > what shipping WS unlocks, and the cost/sequencing.
 
@@ -38,7 +38,7 @@ firehose CONSUMER, Pub/Sub, custom WS APIs):
   the same `onFetchChunk` export `http.subscribe`'s streamed reads
   already dispatch to.
 - Tape determinism is **already covered.** Per-chain tape budget
-  (`streaming-model.md` §3) handles WS frame replay the same way it
+  (`architecture/routing-and-ingress.md` §3) handles WS frame replay the same way it
   handles SSE chunks.
 
 **Inbound WebSocket** (server endpoint for chat, presence, collab
@@ -57,7 +57,7 @@ editing, federation inbound):
   covers inbound-chunk dispatch + held-stream lifecycle); when
   transport lands, WS-shaped handlers ride it.
 - One typed Cmd slot is reserved-but-deferred:
-  `effect-reification-plan.md` Phase 4.1.4 `conn_write` — added
+  `architecture/effects-and-handlers.md` Phase 4.1.4 `conn_write` — added
   when the inbound-WS producer exists.
 
 The two halves are independently shippable. **Outbound WS is the
@@ -110,7 +110,7 @@ HTTP-only and already works without WS per
 
 ### 2.4 Outbound-frame effect — `stream.write`, not a separate `conn_write`
 
-`effect-reification-plan.md` Phase 4.1.4 originally reserved a `conn_write`
+`architecture/effects-and-handlers.md` Phase 4.1.4 originally reserved a `conn_write`
 Cmd variant for inbound-WS frame writes. **The post-Phase-2 handler surface
 superseded that reservation:** connection output is the **one** `stream.write`
 effect surface (`docs/handler-shape.md` §2.2 — "ONE streaming surface"), which
@@ -163,7 +163,7 @@ Pros: one stack; nghttp2 supports it; per-stream multiplexing means
 many WS connections per TCP connection.
 Cons: **Cloudflare downgrades WS to HTTP/1.1 to origin** per
 operator reports. If the platform sits behind Cloudflare (the
-documented edge proxy requirement, `deployment.md`), this option
+documented edge proxy requirement, `architecture/deployment-and-logs.md`), this option
 silently fails — the client opens WS to Cloudflare, Cloudflare
 opens h1+Upgrade to origin, and the origin's extended-CONNECT
 handler never fires.
@@ -203,14 +203,14 @@ the model*, not chosen (below).
 > **Scope: single-node only, for now.** The baseline targets a tenant served on
 > one node — the DO-parity shape. Multi-node held connections (a tenant whose
 > connections span machines) are deliberately **not addressed here**; held
-> state is single-node by construction today (`cross-worker-held-state-plan.md`)
+> state is single-node by construction today (`architecture/effects-and-handlers.md`)
 > and that is the assumption throughout this section.
 
 ### Gap #6 already paid the transport cost
 
 §4 priced inbound at **6–10 weeks** because option 4.3 assumed building the
 origin h1 listener from scratch. **That listener now exists.** The gap-#6
-HTTP/1.1 edge work (2026-06-07, `docs/v2-edge-http1-ingress.md`) shipped, in
+HTTP/1.1 edge work (2026-06-07, `docs/architecture/routing-and-ingress.md`) shipped, in
 `rove-h2` + `rewind-front`:
 
 - the h1 codec (`src/h2/http1.zig`: request parse + response serialize, chunked
@@ -254,7 +254,7 @@ else reuses the shipped held-handler vocabulary.
 The runtime knows the target of a point-to-point wake (it owns the
 continuation), so it routes to the worker that holds it — the existing
 held-state routing, shared by every held primitive (fetch, subscribe, WS), not
-WS tax (`cross-worker-held-state-plan.md`). Broadcast is the opposite: the
+WS tax (`architecture/effects-and-handlers.md`). Broadcast is the opposite: the
 connection-actor model **never exposes a connection handle**
 (`connection-actor-unified-trigger.md`), so broadcast *cannot* be "enumerate
 the connections and push" — it must be pub-sub on a trigger. So broadcast is
@@ -318,7 +318,7 @@ coalescing is a **later perf phase**, not part of the batch-of-1 baseline.
 | C | connection mode switch on `Conn` | ✅ **DONE** | `Http1Conn.ws_mode` + reassembly state (`ws_msg`/`ws_msg_opcode`); `http1Feed` routes a ws-mode conn to `wsDrive` (parse loop, auto-pong, close echo, fragment reassembly → emit on `ws_message_out`). TLS decrypt + the read pump are reused from gap #6. |
 | E | outbound-frame framing | ✅ **DONE** (h2 side) | NOT a new Cmd. The WS seam is two collections: `ws_message_out` (inbound complete messages) + `ws_send_in` (outbound frames, opcode in `WsMeta`, bytes in `ReqBody`). `consumeWsSends` RFC-6455-frames each by opcode onto the per-conn `ws_out` byte queue; `wsFlush` keeps exactly one socket write in flight (`ws_write_inflight`, released in `writesAccount`) so control frames (pong/close) interleave with data in wire order. **Worker side (lower `stream.write` on a WS conn → `ws_send_in`) lands with piece D.** |
 | D | frame → activation | **medium** (NEXT) | dispatch each `ws_message_out` message to the `onMessage` export via the held-continuation resume seam (the `parked_continuations` / `resumeContinuation` path that `on.*` wakes already use). Client close (opcode 8 on `ws_message_out`) → the `onDisconnect` export. Lives in rove-js (the worker), consuming the stable `ws_message_out` / `ws_send_in` h2 collections. |
-| (shared) | cross-worker held-state locator | **medium, not WS-specific** | `cross-worker-held-state-plan.md`; needed by every held primitive. Amortized, not WS tax. |
+| (shared) | cross-worker held-state locator | **medium, not WS-specific** | `architecture/effects-and-handlers.md`; needed by every held primitive. Amortized, not WS tax. |
 
 **Transport (A/B/C/E-h2) is shipped + proven** by `examples/ws_echo_test.zig`
 (`zig build ws-echo`) and `scripts/ws_echo_smoke.py` (raw-socket RFC 6455 client:
@@ -330,7 +330,7 @@ kv-wake recipe).
 ## 5. Handler execution model — the current (post-Phase-2) surface
 
 Per `docs/handler-shape.md` (the shipped held-handler model) +
-`streaming-model.md`:
+`architecture/routing-and-ingress.md`:
 
 - A WS connection IS a held continuation chain. `correlation_id` per
   connection; the chain rides Phase-6 hibernation while idle.
@@ -338,7 +338,7 @@ Per `docs/handler-shape.md` (the shipped held-handler model) +
   connection activation kind (the WS analog of `onChunk`).
   `request.activation` carries `{ opcode, data }` (and, under the §4.5
   coalescing perf-phase, a `frames: [...]` batch). Binary frames > 16 KB
-  go content-addressed via the blob coordinator (streaming-model.md §7).
+  go content-addressed via the blob coordinator (architecture/routing-and-ingress.md §7).
 - Outbound frames are the **`stream.write(chunk)`** effect (commit-gated,
   like every connection write): a string value → a text frame, bytes → a
   binary frame; the WS-mode connection applies RFC 6455 framing at the h2
@@ -391,7 +391,7 @@ collab).
 - **Server-pushed WS via h2 PUSH_PROMISE.** Deprecated by browsers;
   doesn't apply.
 - **Replacing SSE with WS for the live-UI-update use case.** SSE via the
-  `stream.*` surface covers that case today (`streaming-model.md` §3-§4);
+  `stream.*` surface covers that case today (`architecture/routing-and-ingress.md` §3-§4);
   WS is for the cases SSE can't (bidirectional, binary, custom
   framing).
 
@@ -420,21 +420,21 @@ collab).
 
 ## 9. Relation to other docs
 
-- **`streaming-model.md` §3 (inbound chunks) + §4 (outbound chunks)**
+- **`architecture/routing-and-ingress.md` §3 (inbound chunks) + §4 (outbound chunks)**
   — the execution model WS rides. No changes needed.
-- **`connection-actor-plan.md` §6.3** (WebSocket projection) + §6.5
+- **`architecture/effects-and-handlers.md` §6.3** (WebSocket projection) + §6.5
   (atproto firehose) — superseded by this doc. §6.3 should
   collapse to "see websocket-plan.md"; §6.5 keeps the chain-merge
   semantics specific to atproto.
-- **`effect-reification-plan.md` Phase 4.1.4** (`conn_write` Cmd
+- **`architecture/effects-and-handlers.md` Phase 4.1.4** (`conn_write` Cmd
   slot) — **superseded:** the Phase-2 `stream.*` reshape made
   `stream.write` the one connection-output surface, so outbound WS
   frames lower to `Cmd.stream_chunk` (opcode-tagged), not a new
   `conn_write` Cmd (§2.4). That reservation can be struck.
-- **`primitive-gaps.md` §2.5** — outbound subscription shipped via
+- **Held outbound subscription** (`architecture/effects-and-handlers.md`) — shipped via
   `http.subscribe`; the "WS framing remains separate" note now
   resolves to this doc.
-- **`streaming-handlers-plan.md` §13** (out of scope: WS transport)
+- **`architecture/effects-and-handlers.md` §13** (out of scope: WS transport)
   — resolves to this doc.
 - **`PLAN.md` §2.12 "Why SSE not WebSockets"** — the deferral
   rationale; this doc is where the v2 work lives.

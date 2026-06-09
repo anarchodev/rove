@@ -258,8 +258,8 @@ pub const Envelope = struct {
 ///
 /// Thin wrapper over the shared `kv.decodeEnvelope` header codec: the
 /// raw `u8` type is mapped to `EnvelopeType`, so any stale retired-type
-/// byte trips `UnknownEnvelopeType` here (the propose / upload-walker /
-/// test side). NB: the *live* apply path decodes through
+/// byte trips `UnknownEnvelopeType` here (the propose / test side).
+/// NB: the *live* apply path decodes through
 /// `kv.decodeEnvelope` directly inside the cluster — the retired-type
 /// guard for that path lives there (see the cluster's handler table).
 pub fn decodeEnvelope(payload: []const u8) Error!Envelope {

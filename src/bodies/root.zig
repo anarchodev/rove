@@ -5,8 +5,8 @@
 //! `docs/streaming-model.md §7` Phase 3 (2026-05-27), body flush
 //! moved to the process-global `blob.BlobCoordinator`; the only
 //! survivors here are the on-wire shape (`BodyRef`, `NO_BATCH`) and
-//! the leaf-key formatter (`batchKey`) that replay + upload-walker
-//! still need to reconstruct S3 keys from raft entry readsets.
+//! the leaf-key formatter (`batchKey`) that replay still needs to
+//! reconstruct S3 keys from raft entry readsets.
 //!
 //! Phase 5 (2026-05-27): the coordinator collapsed per-(tenant,
 //! worker) lanes into a single cross-tenant `_pool/` prefix, and

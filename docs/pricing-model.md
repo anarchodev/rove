@@ -55,14 +55,14 @@ axis.
   one.
 
 - **Already cheap to measure off the hot path.** The snapshot manifest
-  already computes per-tenant `db_size` (`docs/snapshot-plan.md`), so
+  already computes per-tenant `db_size` (`docs/architecture/consensus-and-storage.md`), so
   billing rides an existing seam without violating the
   no-`O(N_tenants)`-on-dispatch rule.
 
 ## 3. Axis 2 — Object storage as a capacity ring (not a time window)
 
 Every transaction deposits ~1 KB of replay log into object storage
-(`_logs/...`, `docs/logs-plan.md`). So for any tenant that retains
+(`_logs/...`, `docs/architecture/deployment-and-logs.md`). So for any tenant that retains
 logs, object-storage growth *tracks transaction volume* — something
 Lambda/Cloudflare can't price because they can't see invocations as
 storage. Here the product literally stores every transaction, so
@@ -94,7 +94,7 @@ burns the window fastest exactly when its logs matter most.** During an
 incident or viral spike, log production jumps, so the window *contracts*
 right when you most want to rewind into it — the same shape as
 "the request that crashed is the one you can't replay"
-(`readset-replication-plan.md` §1).
+(`architecture/effects-and-handlers.md` §1).
 
 The tempting fix is "evict at 90 days OR N GB, whichever first." That is
 **strictly worse for the customer** and we reject it. A time number can
@@ -136,7 +136,7 @@ time-based, because log batch objects are **cross-tenant fan-in**
 `_logs/.../{batch}.ndjson` PUT). You can't reclaim a tenant's oldest
 bytes by deleting a batch object — it holds other tenants' records too.
 So precise per-tenant eviction *requires* the compacting GC rewrite that
-`logs-plan.md` §6.8 currently lists as deferred — and makes it
+`architecture/deployment-and-logs.md` §6.8 currently lists as deferred — and makes it
 **mandatory and continuous**, not a someday-nicety. Time-based, by
 contrast, can drop whole objects past their newest record's TTL, or even
 be a plain S3 lifecycle rule. That compactor is the real price of this
@@ -313,7 +313,7 @@ flush seams, so neither adds hot-path work.
   customer promise depends on the ratio; worst-case (incompressible:
   encrypted, already-compressed, or random payloads, ratio ≈ 1.0) is
   assumed for all guarantees and pricing. The level-1 raw-deflate ratio
-  over real records (unmeasured; `logs-plan.md` defers the benchmark) now
+  over real records (unmeasured; `architecture/deployment-and-logs.md` defers the benchmark) now
   only tells us our *margin* — how much under the raw quota actual S3
   spend runs. Still worth measuring for capacity planning, but it no
   longer gates correctness. **Caveat:** encryption at rest is deferred;

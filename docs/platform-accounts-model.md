@@ -3,9 +3,10 @@
 > **Status: design (2026-06-07). Not built.** Establishes the
 > identity/billing model for the **hosted** rewind.js service — who pays, who
 > logs in, and which tenants they can touch — and, crucially, **where that
-> state lives**. Companions: [`v2-cp-operational-state.md`](v2-cp-operational-state.md)
-> (per-tenant plan/limits in the CP, authored by the admin app),
-> [`plan-tiers.md`](plan-tiers.md) (DP enforcement), `auth-domain-plan.md`
+> state lives**. Companions: [decisions.md §10.9](decisions.md)
+> (per-tenant plan/limits in the CP, authored by the admin app — mechanics in
+> `architecture/control-plane.md`),
+> [`plan-tiers.md`](plan-tiers.md) (DP enforcement), `architecture/auth-and-domains.md`
 > (the `__auth__` OIDC IdP + OIDC-RP dashboards + `platform.scope`),
 > [`users-lib-plan.md`](users-lib-plan.md) (the *customer's* end-user auth —
 > a different plane; see §2), `pricing-model.md` (per-tenant caps),
@@ -37,7 +38,7 @@ dashboard app (a tenant)                         CP                    DP
 
 ## §1 — Why this stays out of the engine
 
-The criterion `v2-cp-operational-state.md` already established for "what goes
+The criterion decisions.md §10.9 established for "what goes
 in the CP" is **admin-authored AND placement-independent** — that is what put
 `plan/{tenant}` there. Accounts/orgs/users fail a *different* test that keeps
 them out of even the CP: they are **business policy**, and the locked
@@ -57,7 +58,7 @@ Concretely:
   graph. The account→tenants mapping is the dashboard app's job.
 - **The control-write seam is already account-shaped.** The CP control API
   authorizes the caller via a **capability grant, not a hardcoded tenant id**
-  (`v2-cp-operational-state.md` §"The sharp edge"). "An org manages its
+  (decisions.md §10.9, the confused-deputy capability-grant guard). "An org manages its
   tenants" is the *same shape* as the already-anticipated "a self-hoster
   manages sub-tenants' limits." No CP change is needed to support accounts —
   the dashboard app simply holds the grant.
@@ -69,7 +70,7 @@ the **platform** plane only:
 
 | Plane | Who authenticates | Where it lives | Org concept |
 |---|---|---|---|
-| **Platform / dashboard** | a *developer/operator* logging in to manage their tenants + billing | `__auth__` OIDC IdP + OIDC-RP dashboard app (`auth-domain-plan.md` Ph3, PLAN §13.1/§13.2); membership/account data in the dashboard app's `app.db` | **this doc** |
+| **Platform / dashboard** | a *developer/operator* logging in to manage their tenants + billing | `__auth__` OIDC IdP + OIDC-RP dashboard app (`architecture/auth-and-domains.md` Ph3, PLAN §13.1/§13.2); membership/account data in the dashboard app's `app.db` | **this doc** |
 | **End-user (customer app)** | the *customer's own users* of *their* deployed app | `users-lib` inside the customer's tenant (`users-lib-plan.md`) | **deliberately deferred** — B2C-only, "Orgs/B2B: Out" |
 
 The user's "a user can access multiple tenants" is the **platform plane**. It
@@ -175,6 +176,6 @@ This is **product-layer (tenant app) work**, not `rove` code:
 3. Stripe webhook → set `Account.tier` → materialize: write
    `/_control/plan` for each of the account's tenants (idempotency/audit in
    the app's own `app.db`, the effect being the CP write — same durability
-   story as any `Cmd`, `v2-cp-operational-state.md` §"The control-write seam").
+   story as any `Cmd` — decisions.md §10.9, the DP→CP control-write seam).
 4. (Later, on demand) cross-account `Grant` sharing; billing/org split;
    pooled-quota metering service.

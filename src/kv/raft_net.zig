@@ -808,6 +808,16 @@ fn captureRecv(from_id: u32, payload: []const u8, ctx: ?*anyopaque) void {
     };
 }
 
+/// Build an opaque application frame (`[len][crc][payload]`) the way the V2
+/// transport does — there's no typed message codec to encode against.
+fn testFrame(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
+    const buf = try allocator.alloc(u8, raft_rpc.HEADER_SIZE + payload.len);
+    std.mem.writeInt(u32, buf[0..4], @intCast(payload.len), .big);
+    @memcpy(buf[raft_rpc.HEADER_SIZE..], payload);
+    std.mem.writeInt(u32, buf[4..8], raft_rpc.checksum(payload), .big);
+    return buf;
+}
+
 test "two RaftNets exchange a frame over loopback" {
     const allocator = testing.allocator;
 
@@ -852,19 +862,14 @@ test "two RaftNets exchange a frame over loopback" {
         try b.tick(now, 0);
 
         if (!sent and a.peers[1].state == .connected and b.peers[0].state == .connected) {
-            const frame_a_to_b = try raft_rpc.encodeVoteReq(allocator, .{
-                .term = 1,
-                .candidate_id = 0,
-                .last_log_idx = 0,
-                .last_log_term = 0,
-            });
+            // Opaque application frames each way — the V2 transport moves
+            // opaque payloads (no typed message codec), so the loopback test
+            // just verifies bidirectional delivery of arbitrary bytes.
+            const frame_a_to_b = try testFrame(allocator, "ping-a-to-b");
             defer allocator.free(frame_a_to_b);
             try a.send(1, frame_a_to_b);
 
-            const frame_b_to_a = try raft_rpc.encodeVoteResp(allocator, .{
-                .term = 1,
-                .vote_granted = 1,
-            });
+            const frame_b_to_a = try testFrame(allocator, "pong-b-to-a");
             defer allocator.free(frame_b_to_a);
             try b.send(0, frame_b_to_a);
 
@@ -886,11 +891,8 @@ test "two RaftNets exchange a frame over loopback" {
     try testing.expect(cap_a.items.items.len >= 1);
     try testing.expect(cap_b.items.items.len >= 1);
 
-    var msg_a = try raft_rpc.decode(allocator, cap_a.items.items[0].payload);
-    defer msg_a.deinit(allocator);
-    try testing.expect(msg_a == .vote_resp);
-
-    var msg_b = try raft_rpc.decode(allocator, cap_b.items.items[0].payload);
-    defer msg_b.deinit(allocator);
-    try testing.expect(msg_b == .vote_req);
+    // on_recv delivers the payload only (frame header stripped); the ident
+    // handshake is consumed internally, so item[0] is the application frame.
+    try testing.expectEqualStrings("pong-b-to-a", cap_a.items.items[0].payload);
+    try testing.expectEqualStrings("ping-a-to-b", cap_b.items.items[0].payload);
 }
