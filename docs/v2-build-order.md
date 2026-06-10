@@ -278,7 +278,16 @@ This is the heart of the rewrite.
 > pollution: `_move/forward` lived in the tenant store, so the dest inherited
 > it + self-forwarded — `handleLoadMerge` now drops it.) Remaining hardening:
 > directory raft-replication (behind `Directory`), multi-node-dest forward
-> re-targeting, a shutdown-ordering panic on SIGTERM teardown. A suspected
+> re-targeting. The shutdown-ordering panic on SIGTERM teardown is **fixed
+> 2026-06-10**: the rewind worker's LIFO defers deinit'd `node_state` BEFORE
+> `bridge.deinit` joined the pump, so a follower applying `_deploy/current`
+> in that window fired the deploy apply observer into a freed NodeState —
+> `main` now calls `bridge.stopPump()` right after the worker joins
+> (mirroring the CP's documented pump-before-observer-target ordering); the
+> teardown smokes (`three_node` / `zero_downtime_{move,load,forward}` /
+> `smoke_lib_v2.shutdown`) now ASSERT a clean handled-SIGTERM exit 0 per
+> process, so any regression (panic = SIGABRT, hang = SIGKILL escalation)
+> fails loudly instead of vanishing into an unchecked `p.wait()`. A suspected
 > `v2-bundle`
 > empty-snapshot race was **investigated + cleared** (NOT a kvexp bug —
 > 0/63k repro incl. concurrent durabilize; the bundle HTTP path is reliable

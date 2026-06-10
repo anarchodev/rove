@@ -138,6 +138,13 @@ def stop_all():
             p.wait(timeout=10)
         except subprocess.TimeoutExpired:
             p.kill(); p.wait()
+    # A handled SIGTERM exits 0; anything else (SIGABRT = a Zig panic,
+    # SIGSEGV, nonzero) is a teardown bug — drain and surface it.
+    for p in procs:
+        if p.returncode != 0:
+            tail = p.stdout.read() if p.stdout else ""
+            print(f"TEARDOWN: pid {p.pid} exited rc={p.returncode}")
+            print("\n".join("  | " + l for l in tail.splitlines()[-40:]))
 
 
 def main():
