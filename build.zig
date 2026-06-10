@@ -496,6 +496,8 @@ pub fn build(b: *std.Build) void {
         // tenant's context. Add an entry here AND in
         // `src/js/builtin_modules.zig`'s `MODULES` table.
         .{ .name = "builtin_webhook_onresult_mjs", .path = "src/js/builtin_modules/webhook_onresult.mjs" },
+        // durable-wake-plan P5(a) — webhook.send's wake-fired half.
+        .{ .name = "builtin_webhook_fire_mjs", .path = "src/js/builtin_modules/webhook_fire.mjs" },
         // §2.6 durable scheduled wake — the `scheduler_tick` baked
         // module (docs/durable-wake-plan.md P1). Add an entry here AND
         // in `src/js/builtin_modules.zig`'s `MODULES` table.

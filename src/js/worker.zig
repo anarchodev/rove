@@ -116,13 +116,12 @@ pub const PrefetchedManifest = deployment_cache.PrefetchedManifest;
 pub const ManifestHttpConfig = deployment_cache.ManifestHttpConfig;
 pub const ManifestPrefetchMap = deployment_cache.ManifestPrefetchMap;
 const owed_retry = @import("owed_retry.zig");
-// Leader-side _send/owed/ retry sweep lives in owed_retry.zig.
-// Re-exported so worker_drain/worker_dispatch (worker_mod.X) + root.zig
-// (-> main.zig via rjs.X) keep working unchanged.
+// The `_send/owed/` marker's §6.4 held-sync binding scan (the retry
+// SWEEP retired with durable-wake-plan P5(a) — deferred fires ride the
+// durable scheduler as `__system/webhook_fire` wakes). Re-exported so
+// worker_drain/worker_dispatch (worker_mod.X) keep working unchanged.
 pub const OWED_PREFIX = owed_retry.OWED_PREFIX;
 pub const scanLoneOwedSendId = owed_retry.scanLoneOwedSendId;
-pub const sweepOwedRetries = owed_retry.sweepOwedRetries;
-pub const sweepOwedRetriesOnPromotion = owed_retry.sweepOwedRetriesOnPromotion;
 const subscription_sweep = @import("subscription_sweep.zig");
 // Boot + cron subscription sweeps live in subscription_sweep.zig.
 // CronState is re-exported for the Worker `cron_state` collection row;
@@ -1442,13 +1441,6 @@ pub fn Worker(comptime opts: Options) type {
         /// `CRON_SWEEP_INTERVAL_NS`. Worker-local because the
         /// sweep runs on worker 0 only.
         last_cron_sweep_ns: i64 = 0,
-        /// Phase 5 PR-3: monotonic-ns of the last
-        /// `sweepOwedRetries` invocation on THIS worker. Throttles
-        /// the per-tick retry sweep to one pass per
-        /// `SEND_SWEEP_INTERVAL_NS`. Per-worker (not just worker
-        /// 0) because the sweep is partitioned —
-        /// `hash(tenant_id) % N_msg_inboxes == self.msg_inbox_idx`.
-        last_send_sweep_ns: i64 = 0,
         /// §2.6 durable-wake: monotonic-ns of the last
         /// `sweepDurableWakes` invocation on THIS worker. Throttles the
         /// per-tick durable-wake sweep to one pass per

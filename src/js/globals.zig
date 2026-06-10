@@ -1904,6 +1904,12 @@ const GLOBAL_BUILTINS = [_]FnBinding{
     // `fire_wake` enqueues one `durable_wake` activation per due entry.
     .{ .name = "__rove_set_wake", .cfunc = scheduler_b.jsSetWake, .argc = 1 },
     .{ .name = "__rove_fire_wake", .cfunc = scheduler_b.jsFireWake, .argc = 6 },
+    // durable-wake-plan P5(a): outbound-fetch reach for baked modules
+    // (`__system/webhook_fire` — the wake-fired half of webhook.send).
+    // Same gate (throws unless is_system_module); delegates to the
+    // `_system.http.fetch` binding, so staging/commit-gating/limits
+    // are identical to a handler-issued fetch.
+    .{ .name = "__rove_fetch", .cfunc = http_b.jsSystemFetch, .argc = 1 },
 };
 
 // Public shims (docs/builtin-libs-docs-plan.md Phase A). JSDoc-carrying
@@ -2543,7 +2549,7 @@ test "lint(c): every native binding has a globals/ shim (Phase A)" {
     // Math.random are INTRINSIC_EXTENSIONS (out of scope — intrinsic
     // determinism overrides); __rove_check_email_rate is an internal
     // GLOBAL_BUILTIN (called only by globals/email.js).
-    const builtin_exceptions = [_][]const u8{ "__rove_check_email_rate", "__rove_next", "__rove_resume_if_bound", "__rove_set_wake", "__rove_fire_wake" };
+    const builtin_exceptions = [_][]const u8{ "__rove_check_email_rate", "__rove_next", "__rove_resume_if_bound", "__rove_set_wake", "__rove_fire_wake", "__rove_fetch" };
 
     // Documented namespace exceptions: `_system.continuation` is an
     // internal binding called only by the baked
