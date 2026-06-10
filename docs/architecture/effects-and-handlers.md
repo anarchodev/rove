@@ -125,20 +125,22 @@ the wake to the owning worker, falling back to `hash(tenant)` on a registry miss
 
 ## Known limitations (as-built)
 
-- **Marker-commit race — mitigated, not fully closed.** An inline fetch can
-  complete before the handler's writeset commits. `Cmd.http_fetch` is now staged
-  on the parked unit and released only post-commit, which closes the dangling-
-  marker case; the residual first-fire latency is swept (~1 s). The proper fix is
-  the commit-gated Cmd buffer (effect-reification Phase 4.1, the one remaining
-  active phase). See decisions.md §3.3 gotcha 5.
-- **`durable_wake` (gap 2.6) is design-in-code, not wired.** The `Msg.durable_wake`
-  variant and the `scheduler.*` lib shape exist; the firing path is not built. It
-  is the planned unification point for `webhook.send` / `email.send` / `retry.*` /
+- ~~**Marker-commit race**~~ — closed by the commit-gated Cmd buffer
+  (effect-reification Phase 4.1.2, shipped 2026-05-24): `Cmd.http_fetch` is
+  staged on the parked unit and submitted to the FetchEngine only after the
+  batch commits, so an inline fetch can no longer complete before its
+  handler's writeset is durable. The owed sweep (~1 s first-fire latency)
+  remains as the crash-recovery path only. See decisions.md §3.3 gotcha 5.
+- ~~**`durable_wake` (gap 2.6) is design-in-code, not wired**~~ — shipped: the
+  firing path is built (`durable_wake.sweepDurableWakes` → `fireSchedulerTick`;
+  `Msg.durable_wake` → `fireDurableWakeActivation` with atomically-committed
+  `_sched/` cleanup deletes), proven by `scripts/durable_wake_smoke_v2.py`. It
+  is the unification point for `webhook.send` / `email.send` / `retry.*` /
   durable cron / delayed jobs. See [`durable-wake-plan.md`](../durable-wake-plan.md).
 - **Streaming inbound body (gap 2.4)** is design-locked (the `onChunk` export, the
   ≤1 MB-fires-once rule) but the h2 chunk-delivery wire-up is pending.
 - ~~**Inbound WebSocket dispatch (piece D)**~~ — shipped 2026-06-09: the worker
-  `onMessage`/`onDisconnect` seam (`serviceWsMessages`, `src/js/worker_streaming.zig`)
+  `onMessage`/`onDisconnect` seam (`serviceWsMessages`, `src/js/worker_ws.zig`)
   consumes `ws_message_out` and lowers `stream.write` to `ws_send_in`
   (commit-gated for writing frames). Proven by `scripts/ws_worker_smoke_v2.py`.
 - **Per-tenant kv-react backpressure has no cap** at the apply-time fan-out (the
