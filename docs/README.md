@@ -48,7 +48,7 @@ The maintained set. Subsystem-owned, kept current with the code.
 
 ### Customer-facing contracts (kept alongside)
 
-- **[effect-algebra.md](effect-algebra.md)** — the four-primitive effect model + live effect audit
+- **[effect-algebra.md](effect-algebra.md)** — the four-primitive effect model + the trigger-scope axes
 - **[handler-shape.md](handler-shape.md)** — the customer handler API surface
 
 ## In-flight plans

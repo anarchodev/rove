@@ -61,7 +61,7 @@ ride infrastructure that already exists.
 ## 3. The verb surface
 
 Two design laws govern everything here (from `handler-shape.md` /
-`effect-algebra.md` §8): **the verb is the scope** (no durability
+`effect-algebra.md` §6): **the verb is the scope** (no durability
 flags), and **bytes the handler doesn't execute on never transit the
 worker** ([[feedback_storage_origin_vs_worker_ram]]).
 
@@ -477,10 +477,11 @@ follow-up). `_blob/` is deliberately NOT platform-reserved (the
 
 ## 9. Relation to other docs
 
-- **`effect-algebra.md`** — §3 marks `blob.put`/`blob.get` deferred;
-  this plan is the deferral's exit condition arriving. §2.5
-  (input/output byte asymmetry) is the recovery model `put` leans on;
-  §8 scope axes classify every verb here.
+- **`effect-algebra.md`** — §3 once marked `blob.put`/`blob.get`
+  deferred; this plan was the deferral's exit condition arriving (§3 now
+  records the shipped composition). §2.5 (input/output byte asymmetry)
+  is the recovery model `put` leans on; §6 scope axes classify every
+  verb here.
 - **`handler-shape.md`** — the verb-is-scope surface these verbs
   extend; `onHeaders` adds a row to §3's activation table.
 - **`architecture/effects-and-handlers.md`** — callback-gating /
