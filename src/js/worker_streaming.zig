@@ -1324,6 +1324,29 @@ fn fireTapes(
     return captureTapesWithActivation(worker, readset, body, activation_bytes);
 }
 
+/// Commit a read-only fire txn. kvexp `NotChainHead` (surfaced as
+/// `error.Conflict`) is an EXPECTED race here, not an invariant: the
+/// txn opened while another activation's propose was still in flight
+/// on the same tenant and read through its uncommitted overlay
+/// (`saw_speculation`), so kvexp refuses to commit it ahead of its
+/// chain predecessor. Commit-or-panic WAS sound when every activation
+/// sat in the same H2 request collection (the per-tenant dispatch
+/// lease serialized them); connectionless fires run outside that
+/// collection, so a fire can land inside a propose's quorum window —
+/// a chained hop one tick after its parent is the easy repro.
+/// Nothing escapes a connectionless fire pre-commit, so there is
+/// nothing to commit-gate: roll back and let the producer's re-fire
+/// path (cron sweep, owed sweep, scheduler tick) cover any skipped
+/// work — the `fireWsDisconnect` posture. Any other commit error is
+/// a real infallibility violation.
+fn commitReadOnlyFire(p: *FirePrep, comptime site: []const u8) void {
+    p.txn.commit() catch |e| switch (e) {
+        error.Conflict => p.txn.rollback() catch {},
+        else => panic_mod.invariantViolated(site, "err={s}", .{@errorName(e)}),
+    };
+    p.txn_done = true;
+}
+
 /// Run the handler + apply its outcome — the shared tail of every
 /// connectionless fire. `log_path` is the module path on log records
 /// (no leading slash); `corr` must match `req.trace.correlation_id`;
@@ -1393,12 +1416,7 @@ pub fn runFire(
                 r.exception = &.{};
                 return;
             }
-            p.txn.commit() catch |e| panic_mod.invariantViolated(
-                spec.site ++ ".commit(terminal)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            p.txn_done = true;
+            commitReadOnlyFire(p, spec.site ++ ".commit(terminal)");
             captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
             r.console = &.{};
             r.exception = &.{};
@@ -1445,15 +1463,11 @@ pub fn runFire(
                 return;
             }
             if (comptime spec.readonly_cont_commits) {
-                p.txn.commit() catch |e| panic_mod.invariantViolated(
-                    spec.site ++ ".commit(cont)",
-                    "err={s}",
-                    .{@errorName(e)},
-                );
+                commitReadOnlyFire(p, spec.site ++ ".commit(cont)");
             } else {
                 p.txn.rollback() catch {};
+                p.txn_done = true;
             }
-            p.txn_done = true;
             captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
         },
         .stream => |*s2| {
@@ -1485,12 +1499,7 @@ pub fn runFire(
                 captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, fw_seq);
                 return;
             }
-            p.txn.commit() catch |e| panic_mod.invariantViolated(
-                spec.site ++ ".commit(stream)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            p.txn_done = true;
+            commitReadOnlyFire(p, spec.site ++ ".commit(stream)");
             captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
         },
     }
