@@ -1,38 +1,28 @@
 #!/usr/bin/env python3
-"""V2 port of `webhook_recovery_smoke.py` — the `webhook.send` JS-shim
-durable-delivery contract, on the `V2Cluster` harness.
+"""V2 `webhook.send` deferred-delivery contract — the durable-wake path
+(durable-wake-plan P5(a)), on the `V2Cluster` harness.
 
 `webhook.send({ fire_at_ns: now+Δ })` writes a durable `_send/owed/{id}` kv
-marker and, because the fire time is in the FUTURE, does NOT call `http.fetch`
-immediately — the per-worker `sweepOwedRetries` is the sole fire mechanism for
-the scheduled case. This is the exact same sweep the V1 recovery smoke relied
-on: after a leader change, the (new) leader's owed-retry sweep walks
-`_send/owed/` and re-drives any due-but-unfired marker.
+marker AND a durable scheduler entry under key `_send/{id}` aimed at the baked
+`__system/webhook_fire`; because the fire time is in the FUTURE, no inline
+`http.fetch` happens — the durable wake is the sole fire mechanism for the
+scheduled case (the per-feature Zig owed sweep is deleted). The same wake
+entry doubles as the crash-recovery watchdog: it is replicated kv, so a
+freshly-promoted leader reconstructs its watermark (`sweepDurableWakesOnPromotion`)
+and the send survives leader change — proven cross-feature by
+`durable_wake_smoke_v2.py` Gate B (a wake scheduled before a 3-node leader
+kill fires on the new leader).
 
-This V2 port asserts the durable owed-marker LIFECYCLE that recovery is built
-on, driven entirely by the sweep (delivery is sweep-only, never inline):
+This smoke asserts the deferred-delivery LIFECYCLE on a single node, where it
+is deterministic:
 
   1. Fire a DELAYED `webhook.send` (fire_at_ns ≈ now+Δ) at the `wb` echo
      tenant. The marker lands in kv; nothing fires yet (verified: the marker
      is present BEFORE the fire time and wb has NOT received anything).
-  2. Once the fire time falls due, the steady `sweepOwedRetries` fires the
-     request — wb receives the POST, the `cbresult` on_result writes
-     `cb/result/{id}` to acme kv, and the `_send/owed/{id}` marker is CLEARED
-     on terminal success.
-
-WHY SINGLE-NODE (the V1 smoke was a 3-node leader-kill): on V2 the
-promotion-sweep recovery the V1 smoke exercised is NOT fully wired —
-(a) `src/rewind/main.zig` calls the STEADY `sweepOwedRetries` every tick
-but never `sweepOwedRetriesOnPromotion`; (b) a promoted follower does not
-auto-load its deployment from the replicated `_deploy/current` (the gap
-`leader_failover_smoke_v2.py` surfaces); and (c) the `webhook_onresult`
-fetch-event resolution races the async deployment load on a freshly-promoted
-node (`ResumeNoDeployment`). A genuine 3-node kill therefore needs cross-tenant
-deployment priming on the survivors for BOTH acme and wb, which is too
-intricate to assert deterministically without engine changes (out of scope).
-So this asserts the same durable-marker + sweep-driven-delivery mechanism that
-recovery depends on, on a single node, where it is deterministic; the
-*promotion-sweep recovery across a leader kill* is left as PARTIAL (see report).
+  2. Once the fire time falls due, the wake fires `__system/webhook_fire` —
+     wb receives the POST, the `cbresult` on_result writes `cb/result/{id}`
+     to acme kv, and the `_send/owed/{id}` marker + the scheduler entry are
+     CLEARED on terminal success.
 
 V2 specifics: plaintext h2c (no TLS / leader-direct / `--dev-webhook-unsafe`);
 the delivery target is the `wb` echo TENANT at its hostname:port (V2 binds
@@ -201,7 +191,7 @@ def main() -> int:
         check("wb has NOT received the delayed send yet (sweep-only)", not_yet,
               "wb already saw the send id before the fire time")
 
-        print("step 6: AFTER the fire time — the owed sweep delivers to wb")
+        print("step 6: AFTER the fire time — the durable wake delivers to wb")
         deadline = time.monotonic() + 40.0
         recv = None
         while time.monotonic() < deadline:
@@ -215,7 +205,7 @@ def main() -> int:
                 except json.JSONDecodeError:
                     pass
             time.sleep(0.5)
-        check("owed sweep delivered the webhook to wb", recv is not None,
+        check("durable wake delivered the webhook to wb", recv is not None,
               "no recv/last row with the send id within 40s")
         if recv:
             check("wb saw POST /hook with body 'ping'",
@@ -258,7 +248,7 @@ def main() -> int:
                 owed_gone = True
                 break
             time.sleep(0.5)
-        check("_send/owed/{id} marker cleared after sweep delivery", owed_gone,
+        check("_send/owed/{id} marker cleared after wake delivery", owed_gone,
               f"still present: {last_owed.status if last_owed else '-'} "
               f"{last_owed.body if last_owed else '-'!r}")
 
@@ -270,9 +260,9 @@ def main() -> int:
         print(f"\nFAILURES ({len(failures)}): {failures}")
         return 1
     print("\nPASS webhook-recovery smoke (v2): delayed webhook.send wrote a "
-          "durable owed marker, the owed-retry sweep re-drove delivery, and the "
-          "marker cleared on terminal success (promotion-sweep-across-kill is "
-          "PARTIAL — see header)")
+          "durable owed marker + scheduler entry, the durable wake drove "
+          "delivery, and the marker cleared on terminal success (leader-kill "
+          "survival is durable_wake_smoke_v2 Gate B)")
     return 0
 
 

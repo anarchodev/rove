@@ -276,11 +276,13 @@ export** a trigger's activation lands in; it does not invent a kind.
 > `request.done`).
 >
 > **`_subscriptions/` fires now dispatch by trigger source:** a boot
-> fire → `onBoot`, a cron fire → `onCron`, a kv-react fire →
-> `onSubscription` — so a subscription module no longer branches on
-> `request.activation.source.kind`. (The `cron(spec, target, …)` verb is
-> a separate surface that names its own target via the durable
-> scheduler.) `webhook.send` results route through the shim's named
+> fire → `onBoot`, a kv-react fire → `onSubscription` — so a
+> subscription module no longer branches on
+> `request.activation.source.kind`. (The manifest `kind=cron`
+> subscription and its `onCron` export RETIRED with durable-wake P5(b):
+> recurrence is the `cron(spec, target, …)` verb — durable, surviving
+> leader change — or a self-re-arming `scheduler.after` for sub-minute
+> intervals, seeded from `onBoot`.) `webhook.send` results route through the shim's named
 > `onResult`; an unnamed cross-module `next({module})` chain legitimately
 > targets that module's `default`, so there is no forced `onSendCallback`
 > default.
@@ -402,7 +404,6 @@ export function onCharge() {                      // connectionless — no socke
   kv.set(`charges/${request.result.body.id}`, request.result.body);
 }
 
-export function onCron()  { kv.set('last_cron', now()); }
 export function onBoot()  { kv.set('booted_at', now()); }
 ```
 
@@ -502,10 +503,10 @@ rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
   `request.result` (`on.fetch` whole / `webhook.send`), `request.body` +
   `request.fetchId` (streamed `on.fetch` chunk), or `request.key` /
   `request.value` (`on.kv`).
-- **Connectionless fires** (`onCron`, `onBoot`, `onSubscription`, an
-  `onResult` callback): origin-specific fields (`cronName`,
-  `deploymentId`, `result`, …) but **no** HTTP `headers`/`body`, and the
-  connection verbs are inert (§2.4).
+- **Connectionless fires** (`onBoot`, `onSubscription`, a `cron`/
+  `schedule` target, an `onResult` callback): origin-specific fields
+  (`deploymentId`, `result`, `request.activation.msg`, …) but **no**
+  HTTP `headers`/`body`, and the connection verbs are inert (§2.4).
 
 ## 8. App manifest (reserved seam)
 

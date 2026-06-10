@@ -55,7 +55,7 @@ pub const MsgRouter = struct {
     /// `fetch_chunk_inboxes`) — one registry, one push path,
     /// `hash(tenant_id) % N_inboxes` for hash-by-tenant stickiness.
     /// Producers from non-worker threads (`deployment_loader` for
-    /// boot, the cron sweeper, the `FetchEngine` libcurl thread) call
+    /// boot, the `FetchEngine` libcurl thread) call
     /// `enqueueMsgForTenant`; the typed wrappers
     /// `enqueueSubscriptionFireForTenant` /
     /// `enqueueFetchEventForTenant` build the matching `effect.Msg`
@@ -154,7 +154,7 @@ pub const MsgRouter = struct {
     /// inbox. The producer-side enqueueXxxForTenant functions
     /// hash-route to one of these by `hash(tenant_id) % N`. Returns
     /// the inbox's slot index in `msg_inboxes` — workers store it so
-    /// the per-worker partitioned sweeps (`sweepOwedRetries`) can
+    /// the per-worker partitioned sweeps (`sweepDurableWakes`) can
     /// match the same `hash(tenant_id) % N` that `enqueueMsgForTenant`
     /// would route to.
     pub fn registerMsgInbox(self: *MsgRouter, inbox: *effect_mod.MsgInbox) !usize {
@@ -302,7 +302,7 @@ pub const MsgRouter = struct {
     /// is true AND `bound_fetch_owners[ev.fetch_id]` resolves, route
     /// directly to the owning worker's inbox. Otherwise fall back to
     /// `hash(tenant_id)` — the existing behavior for unbound (Pattern
-    /// A) fetches, subscription fires, cron, kv-react, etc.
+    /// A) fetches, subscription fires, kv-react, etc.
     ///
     /// The owner-routing path closes the cross-worker bind gap: the
     /// inbound that registered the bound fetch may live on a
