@@ -1,27 +1,20 @@
-// Phase 5 PR-2b: webhook.send shim's on_chunk handler. Baked into
-// the binary as the first `__system/` built-in module — proves the
-// resolution mechanism + bypass-reserved-prefix-check path are
-// wired correctly. NOT YET CALLED at runtime: the customer-facing
-// `webhook.send` (globals/webhook.js) still points at the Zig
-// http.send path until PR-3 atomically flips the shim AND deletes
-// the SendDispatch kernel (the apply.zig `_send/owed/*` classifier
-// would double-fire today if both paths were live simultaneously).
-//
-// The shim (Phase 5 PR-3, planned):
+// `webhook.send`'s result classifier — the baked on_chunk handler
+// every webhook fetch (inline first fire from the shim, or a deferred
+// fire from `__system/webhook_fire`) reports into.
 //
 //   1. Ignores intermediate chunks (waits for final).
 //   2. On final: classifies the result (success / retryable failure
-//      / give-up) and updates the durable `_send/owed/{id}` marker:
+//      / give-up) against the durable `_send/owed/{id}` marker:
 //        - success (status < 400): kv.delete the marker + cancel the
 //          send's scheduler entry (the webhook_fire watchdog).
 //        - retryable (status >= 500 OR transport !ok): bump attempts,
 //          keep the marker, re-arm the scheduler entry to the backoff
-//          time (durable-wake-plan P5(a) — the deleted Zig owed sweep
-//          used to poll a `next_at_ns` marker field instead).
-//        - give-up (status 4xx, or attempts >= MAX): delete the
+//          time (durable-wake-plan P5(a)).
+//        - give-up (status 4xx, or attempts >= max): delete the
 //          marker + cancel the entry, record the give-up.
 //   3. Hands off to the customer's on_result module via __rove_next
-//      (Phase 5 PR-2a lifted the cont arm from fetch handlers).
+//      (unless a §6.4 held-sync continuation is bound to this send —
+//      then the deferred resume gets the event instead).
 //
 // Resolved by the runtime via `__system/` module path resolution
 // (not in any tenant's deployment files); compiled to bytecode

@@ -209,7 +209,8 @@ rather than merely obeying them:
 - **`webhook.send` / `email.send` are JS shims, not Zig primitives.**
   They compose `kv.set("_send/owed/{id}", ...)` (rides envelope-0
   atomic with the handler's writes) + the outbound HTTP primitive + a
-  retry sweep + a boot re-arm. The original "durable-intent" framing (a
+  durable scheduled wake (the `scheduler` lib; re-arm = `scheduler.at`
+  with the same key). The original "durable-intent" framing (a
   baked-in Zig primitive) was a premature optimization: every piece
   composes from primitives that exist. The composition is **visible
   JavaScript in the standard library** — the platform dogfoods its own
@@ -269,9 +270,10 @@ substrate itself must change — rare, and worth stopping for.
 And the standing **durability rule** (decisions.md §3.3): a
 durable-intent effect is *always* the JS composition
 `kv.set("_<verb>/owed/{key}", ...)` (rides envelope-0 atomic with the
-handler's writes) + outbound HTTP + a retry sweep + a boot re-arm on
-leader-promotion. No new store, no new envelope type, no new Zig
-primitive.
+handler's writes) + outbound HTTP + a durable scheduled wake under an
+idempotency key (fire / retry re-arm / crash-recovery watchdog — the
+generic L2 reconstruction, durable-wake P5). No new store, no new
+envelope type, no new Zig primitive, no per-feature sweep.
 
 ## 6. Trigger scope — connection vs tenant
 

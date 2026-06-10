@@ -47,7 +47,9 @@ arm).
   `runOutcome` is the single re-entry point). `default` (inbound HTTP),
   `onWake` (timer/kv), `onFetchResult` / `onFetchChunk` / `onFetchDone` (bound
   fetch, by event shape), `onDisconnect` (client close), plus the connectionless
-  origins (`onBoot` / `onCron` / `onSubscription`); `{to}` / `?fn=` overrides.
+  origins (`onBoot` / `onSubscription`; the manifest cron subscription and its
+  `onCron` export retired with durable-wake P5(b) — recurrence is the `cron()`
+  verb); `{to}` / `?fn=` overrides.
   `activationKindForExport` maps kind → export name.
 - **Return is a disposition**: a terminal body closes the interaction;
   `next({ctx?})` parks it for the next wake. The response head is the ambient
@@ -64,10 +66,14 @@ There is **one** outbound HTTP primitive, `http.fetch`. `webhook.send` /
 `email.send` / `retry.*` are JS standard-library shims that compose durability on
 top of it (decisions.md §3.3): a `kv.set("_send/owed/{id}", …)` owed-marker
 (an ordinary envelope-0 write that rides the handler's batch atomically) + the
-`http.fetch` + a boot/cron-scoped sweep that re-fires stale markers. The
-dedicated `http.send` Zig primitive, the schedule envelopes, and the leader-local
-`SendDispatch` were all **deleted** (~4.7 kLOC net, `b908953`). Owed-recovery is
-a single-pass boot-scan of `_send/owed/` across tenant DBIs (decisions.md §3.4).
+`http.fetch` + a **durable scheduled wake** under the idempotency key
+`_send/{id}` aimed at the baked `__system/webhook_fire` (durable-wake P5(a)):
+scheduled fires, retry re-arms (`webhook_onresult` moves the wake to the
+backoff time), and the crash-recovery watchdog are one `scheduler` entry. The
+dedicated `http.send` Zig primitive, the schedule envelopes, the leader-local
+`SendDispatch`, and later the per-feature owed sweep (`sweepOwedRetries*`)
+were all **deleted** (`b908953`; P5(a)). Owed-recovery is the generic
+durable-wake promotion pass — no `_send/owed/`-specific scan remains.
 The rule: small bounded payload (a webhook body) → bytes-in-marker; arbitrary
 size (blob bytes) → pointer-in-marker + re-execution.
 
@@ -146,14 +152,19 @@ the wake to the owning worker, falling back to `hash(tenant)` on a registry miss
   (effect-reification Phase 4.1.2, shipped 2026-05-24): `Cmd.http_fetch` is
   staged on the parked unit and submitted to the FetchEngine only after the
   batch commits, so an inline fetch can no longer complete before its
-  handler's writeset is durable. The owed sweep (~1 s first-fire latency)
-  remains as the crash-recovery path only. See decisions.md §3.3 gotcha 5.
+  handler's writeset is durable. Crash recovery is the send's durable-wake
+  watchdog (`__system/webhook_fire`, +40 s) — the owed sweep is deleted.
+  See decisions.md §3.3 gotcha 5.
 - ~~**`durable_wake` (gap 2.6) is design-in-code, not wired**~~ — shipped: the
   firing path is built (`durable_wake.sweepDurableWakes` → `fireSchedulerTick`;
   `Msg.durable_wake` → `fireDurableWakeActivation` with atomically-committed
-  `_sched/` cleanup deletes), proven by `scripts/durable_wake_smoke_v2.py`. It
-  is the unification point for `webhook.send` / `email.send` / `retry.*` /
-  durable cron / delayed jobs. See [`durable-wake-plan.md`](../durable-wake-plan.md).
+  `_sched/` cleanup deletes), proven by `scripts/durable_wake_smoke_v2.py`
+  (incl. 3-node failover survival). The unification SHIPPED (P5, 2026-06-10):
+  `webhook.send` / `email.send` / `retry.*` deferred fires ride a wake aimed at
+  `__system/webhook_fire`; durable cron is the `cron()` verb over
+  `__system/cron_tick`; the per-feature Zig sweeps (`sweepOwedRetries*`,
+  `CronState` + `sweepCronSubscriptions`) are deleted. See
+  [`durable-wake-plan.md`](../durable-wake-plan.md).
 - **Streaming inbound body (gap 2.4)** is design-locked (the `onChunk` export, the
   ≤1 MB-fires-once rule) but the h2 chunk-delivery wire-up is pending.
 - ~~**Inbound WebSocket dispatch (piece D)**~~ — shipped 2026-06-09: the worker

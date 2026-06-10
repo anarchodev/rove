@@ -930,7 +930,7 @@ rewind.js ships as **five binaries**, all `zig build` steps from this repo:
 
 | Binary | Source | Build step | Owns |
 |---|---|---|---|
-| `rewind` | `src/rewind/main.zig` | `zig build rewind` | The **worker / data-plane node**: per-worker QuickJS (arenajs) dispatcher; the per-tenant `Bridge` over the multi-raft `Node`; HTTP/2 serving; held-connection + streaming state; the `webhook.send` / `email.send` `_send/owed/` sweep; `/_system/release`, `/_system/v2-*` (move), `/_system/services-token` machine-to-machine endpoints. Hosts the DP system tenants `__admin__` / `__replay__` / `__auth__`. |
+| `rewind` | `src/rewind/main.zig` | `zig build rewind` | The **worker / data-plane node**: per-worker QuickJS (arenajs) dispatcher; the per-tenant `Bridge` over the multi-raft `Node`; HTTP/2 serving; held-connection + streaming state; the durable-wake scheduler sweep (`_sched/`, gap 2.6 — webhook/email deferred fires, durable cron, and crash-recovery watchdogs all ride it; the per-feature owed/cron sweeps are deleted); `/_system/release`, `/_system/v2-*` (move), `/_system/services-token` machine-to-machine endpoints. Hosts the DP system tenants `__admin__` / `__replay__` / `__auth__`. |
 | `rewind-front` | `src/front/main.zig` | `zig build rewind-front` | The **front door** (stateless edge): terminates TLS (own ACME), routes `Host → cluster` from the CP directory (cached, off the hot path), leader-aware proxy (`proxyToCluster`, retry-on-503), orchestrates tenant moves (`POST /_control/move`). |
 | `rewind-cp` | `src/cp/main.zig` | `zig build rewind-cp` | The **control plane** (a small dedicated raft cluster, 3–5 voters): the replicated `__directory__` group — authoritative `Host → cluster` placement, per-tenant `plan/*`, ACME `cert/*`. Sequences tenant moves; the directory flip is the move commit point. |
 | `files-server-v2` | `examples/files_server_v2.zig` | `zig build files-server-v2` | The **deploy publisher** (cluster-free): compiles + uploads bytecode/static blobs + a content-addressed manifest to S3; bootstraps the `__admin__` / `__replay__` bundles; flips `_deploy/current` via the worker's `/_system/release`. Runs no raft of its own. |
@@ -993,7 +993,7 @@ The customer-visible handler API is specified in
   only); standard intrinsics (`JSON`, `Date`, `RegExp`, `Map`/`Set`, `Promise`,
   `BigInt`, typed arrays).
 - **JS standard-library shims** (embedded into every context): `webhook.send` /
-  `email.send` / `retry.*` (durability composed over `http.fetch` + `_send/owed/`
+  `email.send` / `retry.*` (durability composed over `http.fetch` + `_send/owed/` markers + durable-wake
   markers; vendor-neutral), `base64` / `base64url` / `hex`, `URLSearchParams`,
   `TextEncoder` / `TextDecoder` (UTF-8).
 - **Curated libraries** (opt-in by call site): `jwt`, `oauth.fromConfig(name)`,

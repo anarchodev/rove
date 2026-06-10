@@ -178,9 +178,10 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   or a second raft snapshot.
 
 ### 3.5 Subscriptions & streaming gaps (shipped semantics)
-- **Subscriptions (gap 2.1, shipped)**: three chain origins without an inbound
-  request — cron / kv-react / boot. Cron is throttled to 1 Hz and is **not**
-  raft-replicated (leader change resets the clock, by design). The boot marker
+- **Subscriptions (gap 2.1, shipped; cron half retired)**: chain origins
+  without an inbound request — kv-react / boot. The third origin (manifest
+  `kind=cron`, a 1 Hz non-raft-replicated interval clock) retired with
+  durable-wake P5(b) — recurrence is the durable `cron()` verb. The boot marker
   **must** be injected into the handler's writeset *before* the handler runs
   (post-handler injection hits a conflict). Defer in-loop kv-react fires to a
   post-loop drain (avoid iterate-while-modify). Use `JS_NewBigUint64` for `u64 >
@@ -216,7 +217,8 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   body or `next({ctx?})`. The response head is the **ambient `response` global**,
   not a return argument. Dispatch is by named export keyed on activation kind
   (`onWake` / `onDisconnect` / `onFetchResult` / `onFetchChunk` / `onFetchDone` /
-  `onBoot` / `onCron` / `onSubscription` / default; `{to}` overrides). The
+  `onBoot` / `onSubscription` / default; `onCron` retired with durable-wake
+  P5(b); `{to}` overrides). The
   `stream` pipeline is unchanged — only the entry trigger, head, and disposition
   changed. The old `bind:true` / `stream`-return-verb / `detach` framings are
   retired.

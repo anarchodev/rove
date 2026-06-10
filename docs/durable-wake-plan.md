@@ -64,13 +64,60 @@ and caps are the phases below (P3 = the `scheduler` lib; P4 = the caps).
 
 ## Status
 
-**P0–P4 SHIPPED (compiles, `zig build test` green; runtime smokes are
-P6, not yet run).** The primitive is usable end-to-end: a customer
-handler can `scheduler.at(...)` / `after` / `cancel` / `get`, and due
-wakes fire their `target` as a `durable_wake` activation. **P5
-(re-platform webhook/cron onto `scheduler`, delete the per-feature Zig
-sweeps) and P6/P7 (smokes + cleanup) are NOT done** — the owed +
-cron sweeps still run in parallel, untouched.
+**SHIPPED IN FULL — P0–P7 (P0–P4 earlier; P5–P7 on 2026-06-10, branch
+`durable-wake`).** The primitive is the only deferred-fire mechanism
+left: the per-feature Zig sweeps are deleted and webhook / email /
+retry / cron all ride it.
+
+As-built deltas from the phase sketch below:
+
+- **P5(a) webhook**: the wake target is a new baked
+  `__system/webhook_fire.mjs` (not `webhook_onresult` as sketched —
+  onresult is a result classifier, not a fire). One `scheduler` entry
+  per send under idempotency key `_send/{id}` serves as scheduled
+  fire, retry re-arm (onresult moves it to the backoff time), and
+  crash-recovery **watchdog** (+40 s past the 30 s attempt timeout —
+  the immediate path arms it too, replacing the promotion sweep; no
+  double-send window, unlike the old 1 Hz sweep). Terminal results
+  cancel it. `next_at_ns` left the marker — the wake entry is the
+  single fire-time authority. Baked modules can't reach `_system.http`
+  (post-harden), so a capability-scoped **`__rove_fetch`** builtin
+  (gated on `is_system_module`) carries the fetch. `owed_retry.zig` is
+  now only the §6.4 held-sync binding scan.
+- **P5(b) cron**: the manifest `kind=cron` subscription was retired
+  OUTRIGHT (not re-platformed under the hood) — the `cron(spec,
+  target)` verb (shipped with handler-surface Phase 5, self-re-arming
+  via `__system/cron_tick`) is the surface, and sub-minute intervals
+  are a self-re-arming `scheduler.after` seeded from `onBoot`
+  (`scripts/scheduler_heartbeat_smoke_v2.py` is the recipe). A
+  `kind=cron` spec.json now fails the deploy loudly with that recipe.
+  `CronState` / `sweepCronSubscriptions` / the `.cron` fire source /
+  `onCron` are deleted.
+- **Fire-path fetch wiring (forced by P5)**: `req.effects.
+  pending_fetches` was null on every `runFire` / cont-resume /
+  stream-resume path, so a fetch issued from a wake, subscription, or
+  chained activation was silently dropped — masked by the old owed
+  sweep re-driving the marker. Every fire/resume origin now owns an
+  accumulator; writing paths stage `Cmd.http_fetch` on the parked unit
+  (`proposeForgetfulWrites` / `proposeAndParkContResume` grew a
+  `fetches_opt`), read-only commits flush post-commit. The one
+  remaining narrow gap: a connection-scoped `on.fetch` bind from a
+  *writing* resume — warns loudly.
+- **P6 smokes**: `durable_wake_smoke_v2.py` (fire + 3-node
+  leader-kill failover survival + msg-byte cap),
+  `scheduler_heartbeat_smoke_v2.py` (interval recurrence + kind=cron
+  rejection); webhook / webhook-recovery / schedule-cron / heldsync /
+  streaming / on.* / subscription regressions green.
+
+Where the code lives (P0–P4 locations below still accurate, plus):
+`src/js/builtin_modules/webhook_fire.mjs`; `__rove_fetch` in
+`src/js/bindings/http.zig` + `globals.zig`; the fire/resume fetch
+accumulators in `worker_streaming.zig` (`runFire`,
+`flushFireFetches`, `proposeForgetfulWrites`) and `worker_drain.zig`
+(`proposeAndParkContResume`, `resumeContinuation`,
+`resumeBoundFetchChain`).
+
+Earlier P0–P4 notes (still accurate):
 
 Where the P0–P4 code lives:
 - `durable_wake` activation kind + `DurableWake` Msg: `src/log/root.zig`,

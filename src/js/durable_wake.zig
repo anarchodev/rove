@@ -8,13 +8,14 @@
 //! ordering, and fan-out all live in the `scheduler` JS lib's `_sched/`
 //! kv — this file never parses a `_sched/` entry.
 //!
-//! Generalizes the webhook owed sweep (`owed_retry.zig`): same
-//! per-worker `hash(tenant_id) % N_msg_inboxes` partitioning, same 1 Hz
-//! throttle, same false→true-promotion reconstruction pass. The
-//! difference is the steady-state path is O(tenants-with-a-due-wake)
-//! — gated on the cheap atomic `next_wake_ns` load — rather than a kv
-//! prefix scan per tenant per tick. The expensive scan happens only
-//! inside `scheduler_tick`, and only when a tenant is actually due.
+//! Generalized FROM the webhook owed sweep (the deleted
+//! `sweepOwedRetries*`, durable-wake-plan P5(a)) and now the ONLY
+//! deferred-fire sweep: per-worker `hash(tenant_id) % N_msg_inboxes`
+//! partitioning, 1 Hz throttle, false→true-promotion reconstruction
+//! pass. The steady-state path is O(tenants-with-a-due-wake) — gated
+//! on the cheap atomic `next_wake_ns` load — rather than a kv prefix
+//! scan per tenant per tick. The expensive scan happens only inside
+//! `scheduler_tick`, and only when a tenant is actually due.
 //!
 //! Free functions taking `worker: anytype` (the established
 //! worker-system pattern); `worker.zig` re-exports the public entry
@@ -30,8 +31,7 @@ const deployment_cache = @import("deployment_cache.zig");
 /// the steady sweep gates on the in-memory watermark instead.
 pub const SCHED_BY_TIME_PREFIX: []const u8 = "_sched/by_time/";
 
-/// Per-worker durable-wake sweep cadence. Matches `CRON_SWEEP_INTERVAL_NS`
-/// + `SEND_SWEEP_INTERVAL_NS` (1 Hz) and `SCHED_TICK_RESOLUTION` — the
+/// Per-worker durable-wake sweep cadence. Matches `SCHED_TICK_RESOLUTION` — the
 /// `scheduler` lib rounds `whenNs` up to the next tick, so a 1 Hz sweep
 /// fires every due wake within one resolution window of its target.
 pub const WAKE_SWEEP_INTERVAL_NS: i64 = 1 * std.time.ns_per_s;
