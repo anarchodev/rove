@@ -246,6 +246,13 @@ grow — a real architectural event, not a feature.
 
 Ten effect-shapes scored against §4. `✓` conforms, `✗` diverges.
 
+> **Historical snapshot.** These tables record the *as-found* 2026-05-22
+> state and keep the pre-redesign spellings (`__rove_stream`, `__rove_next`,
+> Pattern A/B fetch, `waitFor`) — all retired by the handler-surface redesign
+> (shipped 2026-06-03; the live surface is `handler-shape.md`). §6 tracks
+> which predictions shipped. The WS gap noted below also closed (inbound WS
+> baseline 2026-06-09).
+
 ### Handler-facing shape
 
 | Effect | Cmd | Msg | Durability |

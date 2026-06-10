@@ -1,7 +1,7 @@
 # Handler shape — pattern-matching at module level
 
-> **Status:** SHIPPED (2026-06-03). Phases 1–5 of
-> [`handler-surface-impl-plan.md`](handler-surface-impl-plan.md) landed:
+> **Status:** SHIPPED (2026-06-03). All phases of the implementation plan
+> landed (the plan doc is folded-and-deleted; this doc is the contract):
 > `on.*` connection wakes (Phase 1), the `stream.*` effect surface with
 > `__rove_stream` retired (Phase 2), `on.fetch` + `detach` + the customer
 > `http.fetch` spelling retired (Phase 3), named-export dispatch by
@@ -135,6 +135,15 @@ verb. It produces the streaming response over time:
   reaches the wire only after this activation's writes commit
   (the one rule — `architecture/routing-and-ingress.md`). Call it as many times per activation as you
   like; raw bytes (SSE `data:` framing is yours to write).
+
+**In a continuing activation (`onWake` etc.), call `stream.start()`
+unconditionally, before any conditional writes.** The runtime classifies
+an activation as streaming by whether it touched `stream.*`
+(`finishResponse`, the one classification point): a wake that happens to
+write zero frames and returns `next()` without `stream.start()` is parked
+as a plain continuation — not a stream re-park — and the stream closes.
+`stream.start()` is idempotent on an already-started stream, so the
+unconditional call is free.
 
 Pair `stream.*` with `next()` to keep producing across activations;
 close with a terminal return:
@@ -594,7 +603,6 @@ self-hosters marketplace plan for the consuming side.
 - `effect-algebra.md` §8 — the scope model; §8.3 `bind`/`detach`
   retirement; §8.4 watch-before-write; §8.5 "grammar position = scope."
   The verbs here are the customer names for §2's primitives.
-- `handler-surface-impl-plan.md` — the phased implementation.
 - `architecture/effects-and-handlers.md` — the collection-lifecycle state
   machine the surface lowers onto.
 - `architecture/routing-and-ingress.md` — the engine substrate (the one rule,

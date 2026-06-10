@@ -37,7 +37,7 @@ const std = @import("std");
 ///                         grant gate) is post-launch — this only claims
 ///                         the namespace now so apps deployed today are
 ///                         born-distributable. See
-///                         `docs/handler-surface-impl-plan.md` §7 and
+///                         `docs/handler-shape.md` §8 and
 ///                         `project_self_host_marketplace`.
 ///   `_audit/`           → reserved for future audit log
 ///   `_config/`          → file-tree-mirrored library config (deploy
