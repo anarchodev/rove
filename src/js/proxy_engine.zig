@@ -31,8 +31,9 @@
 //!     (the request is genuinely for us but the tenant isn't here →
 //!     404). Otherwise advance to stage 2 with the owner's nodes.
 //!  2. **Forward** — proxy the original request to `{nodes[i]}{path}`,
-//!     leader-aware (retry the next node on a `503` follower). The
-//!     owner's response (any status) becomes `.forwarded`.
+//!     leader-aware (retry the next node on a `421` not-leader; an
+//!     ambiguous post-propose `503` is relayed, never re-executed).
+//!     The owner's response becomes `.forwarded`.
 //!
 //! ## Why a dedicated engine (not `FetchEngine`)
 //!
@@ -512,12 +513,20 @@ fn onForwardDone(engine: *ProxyEngine, job: *ProxyJob, result: Result) void {
         onAttemptFailed(job); // transport error → try next owner node
         return;
     }
-    // Leader-aware: a follower answers 503; retry the next node.
-    if (result.status == 503 and job.node_idx + 1 < job.owner_nodes.len) {
+    // Leader-aware: a follower answers 421 (propose-fail, rolled back —
+    // retry-SAFE; see respb.overwriteWith421). A 503 is the ambiguous
+    // post-propose failure (entry may still commit under a new leader)
+    // and must NOT be re-executed here — relay it; the client's retry
+    // policy owns that decision. Same disambiguation as the front
+    // door's proxyToCluster.
+    if (result.status == 421 and job.node_idx + 1 < job.owner_nodes.len) {
         job.node_idx += 1;
         job.needs_next = true;
         return;
     }
+    // All owner nodes said 421 (mid-election): surface a retryable 503
+    // rather than leaking the internal re-aim status.
+    const relay_status: u16 = if (result.status == 421) 503 else result.status;
     // Terminal: deliver the owner's response (the borrowed body must be
     // duped before the Transfer is freed by drainCompleted).
     const body = engine.allocator.dupe(u8, result.body) catch {
@@ -526,7 +535,7 @@ fn onForwardDone(engine: *ProxyEngine, job: *ProxyJob, result: Result) void {
         return;
     };
     job.done = true;
-    job.outcome = .{ .forwarded = .{ .status = result.status, .body = body } };
+    job.outcome = .{ .forwarded = .{ .status = relay_status, .body = body } };
 }
 
 fn finishLocalMiss(engine: *ProxyEngine, job: *ProxyJob) void {

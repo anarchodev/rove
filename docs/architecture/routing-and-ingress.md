@@ -14,7 +14,7 @@
 
 `rewind-front` is a **stateless** TLS-terminating reverse proxy: it resolves
 `Host → cluster` from the control-plane directory (cached), then proxies
-**leader-aware** (retry-on-503 self-routes a write to the group leader). The
+**leader-aware** (retry-on-421 self-routes a write to the group leader). The
 front accepts HTTP/2, HTTP/1.1, and WebSocket at the edge and speaks h2c to the
 data-plane on the private network. Streaming obeys one rule — a byte reaches the
 wire only after the activation that produced it commits — and a blob coordinator
@@ -38,9 +38,16 @@ wire only after the activation that produced it commits — and a blob coordinat
   cluster via `Router.resolveRoute(host)`, backed by `RouteCache` (host → node
   URLs, TTL-bound) with a CP query (`GET /_cp/route?host=`) on miss.
 - **Leader-aware proxy** (`proxyToCluster`): tries the cluster's nodes in order
-  and stops at the first non-503. A follower 503s a write (the bridge faults a
-  non-leader propose), so a write self-routes to the leader; a read is served by
-  any synced node. See [decisions.md §10.5](../decisions.md).
+  and stops at the first non-421. A follower 421s a write (`Bridge.propose`
+  rejects synchronously on a formed group it doesn't lead — nothing enters the
+  log, so re-executing elsewhere is safe), and a write self-routes to the
+  leader; a read is served by any synced node. A **503 is never retried by the
+  platform**: the worker's post-propose failures (commit-wait fault/timeout,
+  leadership-loss sweep) are ambiguous — the entry may still commit under a new
+  leader — and a blind retry double-executes the handler. Ambiguous 503s relay
+  to the client, whose retry policy owns that decision; all-nodes-421
+  (mid-election) maps to a plain retryable 503. Same discipline in the DP's
+  serve-or-forward (`proxy_engine.zig`). See [decisions.md §10.5](../decisions.md).
 - **Serve-or-forward**: a request that reaches the wrong cluster is forwarded by
   the data plane, not failed (the directory is the cutover authority; a stale
   front-door hint is one extra hop, never an error). See `control-plane.md`.
