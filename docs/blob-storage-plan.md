@@ -377,9 +377,10 @@ bound-fetch resume were silently discarded (handler-shape §5.3's
 chained-fetch pattern; `flushResumeFetches` now binds + submits on
 the read-only resume arms, post-commit per L4 — WRITING resumes
 that fetch still drop loudly until the commit-gated Cmd path covers
-resumes). Known bound: materializing ~100 KB+ object bytes as a JS
-string blows the per-request arena — large reads want
-`stream: true` or the `blob.url` redirect; documented on `blob.get`.
+resumes). (An arena bound surfaced here — pure-JS TextDecoder's per-char
+garbage OOMing ~139 KB decodes in the then-4 MiB request arena — was
+fixed in the same branch: native `_system.textcodec` transcode +
+arena raised to 100 MiB.)
 
 **P1 as-built deltas.** The "node-local signing proxy" shipped as a
 fetch-engine special-origin interceptor (`fetch_engine.zig`
