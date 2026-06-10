@@ -307,6 +307,14 @@ const Stream = struct {
     /// when the consumer picks a mode, at END_STREAM, or (connection
     /// window only) at stream close.
     unconsumed: u32 = 0,
+    /// headers_first: END_STREAM has been received — the inbound
+    /// body is complete. When the request entity already left the
+    /// receiving/buffering collections at that point (the worker
+    /// pulled it for a headers-first dispatch decision), the bytes
+    /// stay in this Stream's buffer with this flag set;
+    /// `requestBodyBuffer` attaches them in place and a `blob.receive`
+    /// sink drains them directly.
+    inbound_eof: bool = false,
     send_data: ?*BodyData = null,
     response_status: u16 = 0,
     stream_chunk_data: ?[*]u8 = null,
@@ -815,31 +823,56 @@ pub fn H2(comptime opts: Options) type {
         /// module (`path`) for the held WS chain. Returns null when the entity is
         /// no longer a live ws-mode conn (closed / not upgraded). Borrowed slices
         /// — valid only while the conn lives; the worker dupes what it retains.
-        /// headers_first consumers: classic-buffering decision for an
-        /// early-emitted request sitting in `request_receiving`.
-        /// Re-opens the stream's flow-control window (repaying the
-        /// held debt) and resumes accumulate-in-h2; the entity moves
-        /// to `request_buffering` and arrives in `request_out` with
-        /// the body attached when END_STREAM lands. No-op when the
-        /// entity already left `request_receiving` (the client reset
-        /// mid-decision) — the close path owns it then.
-        pub fn requestBodyBuffer(h2: *Self, ent: Entity) void {
-            if (!h2.reg.isInCollection(ent, &h2.request_receiving)) return;
-            const sess = h2.reg.get(ent, &h2.request_receiving, Session) catch return;
-            const sid = h2.reg.get(ent, &h2.request_receiving, StreamId) catch return;
-            h2.reg.move(ent, &h2.request_receiving, &h2.request_buffering) catch return;
+        /// `requestBodyBuffer` outcome — what the consumer should
+        /// expect next for the entity it asked to classic-buffer.
+        pub const BufferDecision = enum {
+            /// Stream re-opened, h2 is accumulating; the entity moved
+            /// to `request_buffering` and arrives in `request_out`
+            /// body-complete at END_STREAM.
+            buffering,
+            /// The body had already fully arrived (END_STREAM raced
+            /// the decision) — it was attached to the entity in
+            /// place, in whatever collection holds it. Dispatch it.
+            body_complete,
+            /// The stream is gone (client reset / connection died).
+            /// Nobody will ever complete this request — answer it.
+            gone,
+        };
 
-            const conn_ptr = getConn(h2, sess.entity) orelse return;
-            const ng_session = conn_ptr.ng_session orelse return;
-            const stream: ?*Stream = @ptrCast(@alignCast(
-                c.nghttp2_session_get_stream_user_data(ng_session, @intCast(sid.id)),
-            ));
-            const s = stream orelse return;
-            s.body_mode = .buffer;
-            if (s.unconsumed > 0) {
-                _ = c.nghttp2_session_consume(ng_session, @intCast(sid.id), s.unconsumed);
-                s.unconsumed = 0;
+        /// headers_first consumers: classic-buffering decision for an
+        /// early-emitted request (in `request_receiving`, or already
+        /// pulled into `request_out` for a headers-first dispatch
+        /// probe). Re-opens the stream's flow-control window
+        /// (repaying the held debt) and resumes accumulate-in-h2 —
+        /// or, when END_STREAM already landed, attaches the
+        /// accumulated body in place.
+        pub fn requestBodyBuffer(h2: *Self, ent: Entity) BufferDecision {
+            for ([_]*StreamColl{ &h2.request_receiving, &h2.request_out }) |coll| {
+                if (h2.reg.isInCollection(ent, coll)) {
+                    const sess = h2.reg.get(ent, coll, Session) catch return .gone;
+                    const sid = h2.reg.get(ent, coll, StreamId) catch return .gone;
+
+                    const conn_ptr = getConn(h2, sess.entity) orelse return .gone;
+                    const ng_session = conn_ptr.ng_session orelse return .gone;
+                    const stream: ?*Stream = @ptrCast(@alignCast(
+                        c.nghttp2_session_get_stream_user_data(ng_session, @intCast(sid.id)),
+                    ));
+                    const s = stream orelse return .gone;
+
+                    if (s.inbound_eof) {
+                        h2.reg.set(ent, coll, ReqBody, takeBody(s)) catch return .gone;
+                        return .body_complete;
+                    }
+                    s.body_mode = .buffer;
+                    if (s.unconsumed > 0) {
+                        _ = c.nghttp2_session_consume(ng_session, @intCast(sid.id), s.unconsumed);
+                        s.unconsumed = 0;
+                    }
+                    h2.reg.move(ent, coll, &h2.request_buffering) catch return .gone;
+                    return .buffering;
+                }
             }
+            return .gone;
         }
 
         pub fn wsConnRouting(h2: *Self, conn_entity: Entity) ?struct { authority: []const u8, path: []const u8 } {
@@ -1068,13 +1101,11 @@ pub fn H2(comptime opts: Options) type {
                 // in — only the connection window still matters), then
                 // attach the accumulated body and move the entity into
                 // `request_out`, restoring its body-complete contract.
-                // An entity that already left the receiving/buffering
-                // collections (early response in flight → stream is
-                // .discard) is not touched.
                 if (s.unconsumed > 0) {
                     _ = c.nghttp2_session_consume(session, frame.*.hd.stream_id, s.unconsumed);
                     s.unconsumed = 0;
                 }
+                s.inbound_eof = true;
                 if (s.body_mode == .discard) return 0;
                 for ([_]*StreamColl{ &h2.request_receiving, &h2.request_buffering }) |coll| {
                     if (h2.reg.isInCollection(s.entity, coll)) {
@@ -1083,6 +1114,14 @@ pub fn H2(comptime opts: Options) type {
                         return 0;
                     }
                 }
+                // The entity already left receiving/buffering — the
+                // worker pulled it for a headers-first dispatch
+                // decision (it's in request_out or parked on a held
+                // chain), or an early response is in flight. The bytes
+                // stay in this Stream's buffer under `inbound_eof`:
+                // `requestBodyBuffer` attaches them in place on a
+                // buffer decision, and a `blob.receive` sink drains
+                // them directly.
                 return 0;
             }
 

@@ -132,6 +132,15 @@ pub const ActivationSource = enum(u8) {
     /// to the h2 `ws_send_in` collection. Batch-of-1 durability: a
     /// frame costs raft iff its activation commits a non-empty writeset.
     ws_message = 9,
+    /// Headers-first inbound dispatch (`docs/blob-storage-plan.md`
+    /// §3.5, the `blob.receive` transport). The request's HEADERS
+    /// frame arrived but body DATA is still inbound; the handler
+    /// module exports `onHeaders`, so the activation runs with an
+    /// EMPTY body and decides the disposition (early 4xx,
+    /// `blob.receive` + `next()`) before the platform accepts a
+    /// single body byte. The body bytes are untaped by derivation —
+    /// no Msg carries them (§3.5's pipe_to symmetry).
+    inbound_headers = 10,
 };
 
 /// Inline tape + body byte payloads for one request. Each `_bytes`
