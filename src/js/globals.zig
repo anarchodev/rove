@@ -36,6 +36,7 @@ const on_b = @import("bindings/on.zig");
 const blob_b = @import("bindings/blob.zig");
 const blob_mod = @import("rove-blob");
 const blob_sessions_mod = @import("blob_sessions.zig");
+const textcodec_b = @import("bindings/textcodec.zig");
 const td = @import("trigger_dispatch.zig");
 const reserved = @import("reserved.zig");
 const bytecode_cache_mod = @import("bytecode_cache.zig");
@@ -1743,6 +1744,14 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     .{ .path = &.{ "_system", "stream" }, .fns = &.{
         .{ .name = "start", .cfunc = stream_b.jsStreamStart, .argc = 0 },
         .{ .name = "write", .cfunc = stream_b.jsStreamWrite, .argc = 1 },
+    } },
+    // Native UTF-8 transcode for TextEncoder/TextDecoder. The shim
+    // classes (globals/textcodec.js) keep the WHATWG shape; byte
+    // work is native so multi-MB payloads don't drown the bump
+    // arena in per-char string garbage.
+    .{ .path = &.{ "_system", "textcodec" }, .fns = &.{
+        .{ .name = "encode", .cfunc = textcodec_b.jsTextEncode, .argc = 1 },
+        .{ .name = "decode", .cfunc = textcodec_b.jsTextDecode, .argc = 2 },
     } },
     // crypto. No crypto global in qjs-ng by default, so we fabricate
     // one. hmacSha256 is the vendor-neutral primitive for building
