@@ -215,18 +215,30 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   `webhook.send` / `schedule` / `cron` are connectionless. Return is a terminal
   body or `next({ctx?})`. The response head is the **ambient `response` global**,
   not a return argument. Dispatch is by named export keyed on activation kind
-  (`onWake` / `onDisconnect` / `onFetchChunk` / default). The `stream` pipeline is
-  unchanged — only the entry trigger, head, and disposition changed. The old
-  `bind:true` / `stream`-return-verb / `detach` framings are retired.
+  (`onWake` / `onDisconnect` / `onFetchResult` / `onFetchChunk` / `onFetchDone` /
+  `onBoot` / `onCron` / `onSubscription` / default; `{to}` overrides). The
+  `stream` pipeline is unchanged — only the entry trigger, head, and disposition
+  changed. The old `bind:true` / `stream`-return-verb / `detach` framings are
+  retired.
 
-### 4.2 `http.fetch` auto-binds to the held chain; `detach:true` opts out
-- **Decision** (shipped 2026-05-29): a held handler's `http.fetch` binds to the
-  held chain by default; `detach:true` is the opt-out; `bind:true` was removed.
-  Registration happens at the **handler-success seam** (only there is held-vs-
-  terminal known). Gotchas: `applyWriteSet` is leader-skipped so only inbound H2
-  dispatch sets the `pending_fetches` accumulator; `webhook.send` must be
-  excluded from auto-bind via `bound_send_id.len==0` to avoid stealing chunks
-  from `__system/webhook_onresult`.
+### 4.2 `on.fetch` is connection-scoped by construction; inert if not held
+- **Decision** (auto-bind shipped 2026-05-29 as `http.fetch`+`detach`; reshaped
+  to `on.fetch` 2026-06-03): a held handler's `on.fetch` binds to the held chain
+  by construction — there is no opt-out flag (`detach` deleted, `bind:true`
+  deleted before it), and a **non-held `on.fetch` is dropped inert** (no unbound
+  fire; connectionless outbound is `webhook.send` only — user-confirmed). The
+  customer `http.fetch` spelling is retired; `_system.http.fetch` remains the
+  internal primitive `webhook.send` / `http.subscribe` compose over, and it
+  never auto-binds. Registration happens at the **handler-success seam** (only
+  there is held-vs-terminal known). Gotchas: `applyWriteSet` is leader-skipped
+  so only inbound H2 dispatch sets the `pending_fetches` accumulator; the
+  system fetch is excluded from auto-bind via `bound_send_id.len==0` to avoid
+  stealing chunks from `__system/webhook_onresult`.
+- **Rejected**: firing a non-held `on.fetch` as an unbound chain (the pre-3c
+  auto-bind seam's behavior) — "inert if not held" keeps the verb's meaning
+  scope-pure; and keeping a connectionless *transient* fetch primitive — the
+  only genuine niche (loss-tolerant high-volume beacons) had no demonstrated
+  demand, and `webhook.send` is durable-by-default.
 
 ### 4.3 Public APIs are JS shims; native hooks hide under `_system.*`
 - **Decision** (shipped 2026-05-16): all Zig-provided native hooks move under the
