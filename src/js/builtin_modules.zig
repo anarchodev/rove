@@ -74,6 +74,13 @@ const MODULES = [_]struct {
         .path = "__system/blob_onresult.mjs",
         .src = @embedFile("builtin_blob_onresult_mjs"),
     },
+    .{
+        // `docs/blob-storage-plan.md` §6: segments.seal's swap half
+        // (index write + hot-row delete after the segment PUT
+        // confirmed).
+        .path = "__system/segments_onsealed.mjs",
+        .src = @embedFile("builtin_segments_onsealed_mjs"),
+    },
 };
 
 /// Compile every built-in module to QJS bytecode and return an

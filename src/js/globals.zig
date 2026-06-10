@@ -1666,6 +1666,9 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // blob depends on crypto.sha256 + http (both above) +
     // _system.blob.presign (`docs/blob-storage-plan.md` P1).
     evalSnippet(ctx, "blob.js", BLOB_JS);
+    // segments composes kv + blob + TextDecoder (all above) — pure
+    // JS, no natives of its own (`docs/blob-storage-plan.md` §6).
+    evalSnippet(ctx, "segments.js", SEGMENTS_JS);
     // users is standalone (kv + crypto.{randomBytes,sha256}).
     evalSnippet(ctx, "users.js", USERS_JS);
     // activitypub depends on base64url/hex/btoa + crypto + http +
@@ -1917,6 +1920,7 @@ const TEXTCODEC_JS = @embedFile("textcodec_js");
 const USERS_JS = @embedFile("users_js");
 const ACTIVITYPUB_JS = @embedFile("activitypub_js");
 const BLOB_JS = @embedFile("blob_js");
+const SEGMENTS_JS = @embedFile("segments_js");
 
 /// (public name, embedded source) for every `globals/*.js` file. The
 /// single list the Phase-A lints below pivot on: each `.src` is an
@@ -1950,6 +1954,7 @@ const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "users", .src = USERS_JS },
     .{ .name = "activitypub", .src = ACTIVITYPUB_JS },
     .{ .name = "blob", .src = BLOB_JS },
+    .{ .name = "segments", .src = SEGMENTS_JS },
 };
 
 fn installNamespace(ctx: *c.JSContext, global: c.JSValue, ns: NamespaceBindings) void {
