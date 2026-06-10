@@ -217,7 +217,7 @@ test "MsgInbox: deinit on non-empty walks variant-aware free" {
         .tenant_id = try testing.allocator.dupe(u8, "t"),
         .subscription_name = try testing.allocator.dupe(u8, "s"),
         .module_path = try testing.allocator.dupe(u8, "m"),
-        .source = .{ .cron = .{ .fired_at_ns = 1 } },
+        .source = .{ .boot = .{ .deployment_id = 1 } },
     };
     try inbox.push(.{ .subscription_fire = sf });
     // No drain: deinit walks the items and calls freeOwnedMsg —
@@ -252,7 +252,7 @@ test "MsgQueue: SubscriptionFire payload freed on shutdown deinit" {
         .tenant_id = try testing.allocator.dupe(u8, "acme"),
         .subscription_name = try testing.allocator.dupe(u8, "cron-sub"),
         .module_path = try testing.allocator.dupe(u8, "_subscriptions/cron-sub/index.mjs"),
-        .source = .{ .cron = .{ .fired_at_ns = 42 } },
+        .source = .{ .boot = .{ .deployment_id = 42 } },
     };
     try enqueueMsg(&q, .{ .subscription_fire = sf });
     try testing.expectEqual(@as(usize, 1), q.len());

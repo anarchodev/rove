@@ -123,13 +123,11 @@ const owed_retry = @import("owed_retry.zig");
 pub const OWED_PREFIX = owed_retry.OWED_PREFIX;
 pub const scanLoneOwedSendId = owed_retry.scanLoneOwedSendId;
 const subscription_sweep = @import("subscription_sweep.zig");
-// Boot + cron subscription sweeps live in subscription_sweep.zig.
-// CronState is re-exported for the Worker `cron_state` collection row;
-// the sweep entry points for root.zig -> main.zig.
-pub const CronState = subscription_sweep.CronState;
+// Boot subscription sweep lives in subscription_sweep.zig (the cron
+// half retired with durable-wake-plan P5(b) — recurrence rides the
+// durable scheduler).
 pub const sweepBootSubscriptions = subscription_sweep.sweepBootSubscriptions;
 const starter = @import("starter.zig");
-pub const sweepCronSubscriptions = subscription_sweep.sweepCronSubscriptions;
 pub const sweepBlobSessions = @import("blob_sessions.zig").sweepBlobSessions;
 const durable_wake = @import("durable_wake.zig");
 // §2.6 durable scheduled-wake sweep lives in durable_wake.zig.
@@ -1247,15 +1245,6 @@ pub fn Worker(comptime opts: Options) type {
     const ParkedUnitRow = rove.Row(&.{ParkedUnit});
     const ParkedUnitColl = rove.Collection(ParkedUnitRow, .{});
 
-    // Worker-0-only collection for cron subscription next-fire state.
-    // Replaces the pre-2026-05-27 `node.cron_state` StringHashMap +
-    // mutex. Single ownership is intrinsic (the cron sweep already
-    // runs only on worker 0 + leader — see `loop46/main.zig`); the
-    // mutex was defensive but effectively unused. Per-entity strings
-    // own their allocation; auto-deinit on entity destroy.
-    const CronStateRow = rove.Row(&.{CronState});
-    const CronStateColl = rove.Collection(CronStateRow, .{});
-
     // `docs/blob-storage-plan.md` P2: open blob upload sessions —
     // one entity per (tenant, chain) accumulating `blob.write`
     // bytes until `blob.seal`. Per-worker (a chain's activations
@@ -1401,12 +1390,6 @@ pub fn Worker(comptime opts: Options) type {
         /// State-as-membership: presence in the collection IS the
         /// "awaiting raft commit" state.
         parked_units: ParkedUnitColl,
-        /// Cron subscription next-fire-at-ns state. Lives on every
-        /// worker for uniformity but only worker 0 ever populates /
-        /// reads it (sweep is gated to `args.worker_idx == 0 and
-        /// is_leader_now` in `loop46/main.zig`). Replaces the pre-
-        /// 2026-05-27 node-level StringHashMap + mutex.
-        cron_state: CronStateColl,
         /// `docs/blob-storage-plan.md` P2: open blob upload sessions
         /// (`blob.write` / `blob.seal`). TTL-swept via
         /// `blob_sessions.sweepBlobSessions` in the worker tick.
@@ -1435,12 +1418,6 @@ pub fn Worker(comptime opts: Options) type {
         /// `drainMsgInbox` (once per tick from `serviceSubscriptionFires`
         /// / `serviceFetchEvents`) moves Msgs onto `msg_queue`.
         msg_inbox: effect_mod.MsgInbox = undefined,
-        /// Gap 2.1 Phase F: monotonic-ns of the last
-        /// `sweepCronSubscriptions` invocation. Used to throttle
-        /// the per-tick cron sweep to at most one pass per
-        /// `CRON_SWEEP_INTERVAL_NS`. Worker-local because the
-        /// sweep runs on worker 0 only.
-        last_cron_sweep_ns: i64 = 0,
         /// §2.6 durable-wake: monotonic-ns of the last
         /// `sweepDurableWakes` invocation on THIS worker. Throttles the
         /// per-tick durable-wake sweep to one pass per
@@ -1756,7 +1733,6 @@ pub fn Worker(comptime opts: Options) type {
                 .forward_pending = try StreamColl.init(allocator),
                 .parked_continuations = try StreamColl.init(allocator),
                 .parked_units = try ParkedUnitColl.init(allocator),
-                .cron_state = try CronStateColl.init(allocator),
                 .blob_sessions = try BlobSessionColl.init(allocator),
                 .msg_inbox = effect_mod.MsgInbox.init(allocator),
                 // Effect-reification Phase 2 ingress. Cap chosen
@@ -1809,7 +1785,6 @@ pub fn Worker(comptime opts: Options) type {
             errdefer self.forward_pending.deinit();
             errdefer self.parked_continuations.deinit();
             errdefer self.parked_units.deinit();
-            errdefer self.cron_state.deinit();
             errdefer self.blob_sessions.deinit();
             errdefer self.tenant_logs.clearAllEntries(allocator);
             errdefer self.wake_inbox.deinit();
@@ -1821,7 +1796,6 @@ pub fn Worker(comptime opts: Options) type {
             reg.registerCollection(&self.forward_pending);
             reg.registerCollection(&self.parked_continuations);
             reg.registerCollection(&self.parked_units);
-            reg.registerCollection(&self.cron_state);
             reg.registerCollection(&self.blob_sessions);
 
             // Register the inbox with the node so apply.zig +
@@ -2033,7 +2007,6 @@ pub fn Worker(comptime opts: Options) type {
             }
             self.parked_continuations.deinit();
             self.parked_units.deinit();
-            self.cron_state.deinit();
             self.blob_sessions.deinit();
             self.raft_pending_response.deinit();
             self.raft_pending_cont.deinit();

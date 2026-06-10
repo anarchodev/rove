@@ -377,7 +377,7 @@ pub const MsgRouter = struct {
     }
 
     /// Gap 2.1 Phase D + effect-reification Phase 2E: hash-route a
-    /// subscription fire (cron / kv-react / boot) to the destination
+    /// subscription fire (kv-react / boot) to the destination
     /// worker's unified `MsgInbox` as a `SubscriptionFire` variant.
     /// Producer (loader / sweeper) owns the input slices borrowed;
     /// this fn dupes onto the payload before pushing. Returns
@@ -396,7 +396,6 @@ pub const MsgRouter = struct {
         errdefer allocator.free(path);
 
         const source: effect_mod.msg.SubscriptionFire.Source = switch (in.source) {
-            .cron => |c| .{ .cron = .{ .fired_at_ns = c.fired_at_ns } },
             .kv => |k| blk: {
                 const key_dup = try allocator.dupe(u8, k.key);
                 break :blk .{ .kv = .{ .key = key_dup, .op = k.op } };

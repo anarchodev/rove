@@ -1643,16 +1643,15 @@ pub const SubscriptionFireSource = dispatcher_mod.SubscriptionFireSource;
 ///         routes as a `send_callback` activation, not as a held
 ///         continuation).
 ///
-/// Errors return `void` — the caller is best-effort (cron sweep,
-/// apply-time hook, boot fire). Failures log + skip the activation.
+/// Errors return `void` — the caller is best-effort (apply-time
+/// hook, boot fire). Failures log + skip the activation.
 /// handler-shape.md §3: the conventional named export a `_subscriptions/`
 /// fire dispatches to, by trigger source. Lets one module split its
-/// boot / cron / kv-react handling into distinct exports instead of one
+/// boot / kv-react handling into distinct exports instead of one
 /// `default` that branches on `request.activation.source.kind`.
 fn subscriptionExport(source: SubscriptionFireSource) []const u8 {
     return switch (source) {
         .boot => "onBoot",
-        .cron => "onCron",
         .kv => "onSubscription",
     };
 }
@@ -1717,12 +1716,11 @@ pub fn fireSubscriptionActivation(
 
     // Named-export dispatch by trigger source (handler-shape.md §3,
     // completing the Phase-4 activation-kind-switch retirement for
-    // connectionless fires): a boot fire lands in `onBoot`, a cron fire
-    // in `onCron`, a kv-react fire in `onSubscription`. The handler no
-    // longer has to branch on `request.activation.source.kind`. A
-    // missing conventional export is the fail-loud 404 backstop. The
-    // `cron(spec, target, …)` verb is a separate surface that names its
-    // own target via the durable scheduler — not this path.
+    // connectionless fires): a boot fire lands in `onBoot`, a kv-react
+    // fire in `onSubscription`. The handler no longer has to branch on
+    // `request.activation.source.kind`. A missing conventional export
+    // is the fail-loud 404 backstop. Recurrence (`cron(spec, target)`)
+    // names its own target via the durable scheduler — not this path.
     var query_buf: [32]u8 = undefined;
     const query = std.fmt.bufPrint(&query_buf, "fn={s}", .{subscriptionExport(source)}) catch null;
 
@@ -2711,7 +2709,6 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
                     sf.subscription_name,
                     sf.module_path,
                     switch (sf.source) {
-                        .cron => |c| SubscriptionFireSource{ .cron = .{ .fired_at_ns = c.fired_at_ns } },
                         .kv => |kv| SubscriptionFireSource{ .kv = .{ .key = kv.key, .op = kv.op } },
                         .boot => |b| SubscriptionFireSource{ .boot = .{ .deployment_id = b.deployment_id } },
                     },
