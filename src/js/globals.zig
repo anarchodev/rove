@@ -74,9 +74,10 @@ pub const TriggerEntry = struct {
 /// /index.mjs` pairs. Implements `docs/primitive-gaps.md` §2.1 +
 /// `streaming-handlers-plan.md` §5.
 ///
-/// Three kinds (see `Spec` below): cron (recurring), kv (apply-time
-/// fan-out from a watched tenant prefix), boot (once per deployment
-/// activation). The handler is a normal TEA `update`; the
+/// Two kinds (see `Spec` below): kv (apply-time fan-out from a
+/// watched tenant prefix), boot (once per deployment activation).
+/// The cron kind retired with durable-wake-plan P5(b) — recurrence
+/// is the `cron(spec, target)` verb over the durable scheduler. The handler is a normal TEA `update`; the
 /// difference is the activation source (`subscription_fire`) and
 /// the absence of a held socket — `Response`/`__rove_next`/
 /// `__rove_stream` returns are recorded on the tape but bytes
@@ -95,13 +96,6 @@ pub const SubscriptionEntry = struct {
     spec: Spec,
 
     pub const Spec = union(enum) {
-        /// Recurring fire at fixed intervals. v1 is interval-based
-        /// (in milliseconds); crontab-expression schedules ("0 3 * *
-        /// *") are deferred — customers compose those via
-        /// `http.send({fire_at_ns: cron.next(...)})` self-reschedule.
-        /// Sub-second intervals rejected at deploy
-        /// (`discoverSubscriptions`).
-        cron: struct { interval_ms: i64 },
         /// Fire on any put/delete under `prefix` by ANY chain on
         /// this tenant. Mirrors the §4.6 parked-stream wake but as
         /// a chain origin (no parked stream required).
@@ -116,7 +110,6 @@ pub const SubscriptionEntry = struct {
         allocator.free(self.name);
         allocator.free(self.module_path);
         switch (self.spec) {
-            .cron => {}, // interval_ms is i64; no slice to free
             .kv => |kv_spec| allocator.free(kv_spec.prefix),
             .boot => {},
         }
@@ -2211,10 +2204,6 @@ pub fn installRequest(
                 // Zig-side `{d}` formatting of the same u64.
                 _ = c.JS_SetPropertyStr(ctx, source_obj, "deployment_id", c.JS_NewBigUint64(ctx, boot.deployment_id));
             },
-            .cron => |cron| {
-                _ = c.JS_SetPropertyStr(ctx, source_obj, "kind", c.JS_NewStringLen(ctx, "cron", 4));
-                _ = c.JS_SetPropertyStr(ctx, source_obj, "firedAt", c.JS_NewInt64(ctx, cron.fired_at_ns));
-            },
         };
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "source", source_obj);
     }
@@ -2710,18 +2699,6 @@ test "harden: _system unreachable post-installStatic, shims still bound (Phase A
 }
 
 // ── SubscriptionEntry tests (Gap 2.1 Phase A) ───────────────────────
-
-test "SubscriptionEntry.deinit frees cron spec" {
-    const a = std.testing.allocator;
-    var entry: SubscriptionEntry = .{
-        .name = try a.dupe(u8, "cleanup-daily"),
-        .module_path = try a.dupe(u8, "_subscriptions/cleanup-daily/index.mjs"),
-        .spec = .{ .cron = .{ .interval_ms = 60_000 } },
-    };
-    entry.deinit(a);
-    // No assertions — the test exists so the testing allocator's
-    // leak detector fires on a missed branch.
-}
 
 test "SubscriptionEntry.deinit frees kv spec" {
     const a = std.testing.allocator;

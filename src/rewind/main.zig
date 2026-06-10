@@ -244,7 +244,6 @@ fn workerMain(args: *WorkerCtx) !void {
         // committed unit's reply frames. Read-only frames emit inline.
         try rjs.serviceWsMessages(worker);
         try rjs.cleanupResponses(worker);
-        rjs.sweepCronSubscriptions(worker);
         rjs.sweepBlobSessions(worker);
         rjs.sweepDurableWakes(worker);
         rjs.serviceSubscriptionFires(worker);
