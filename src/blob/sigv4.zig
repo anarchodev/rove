@@ -74,6 +74,18 @@ pub const SignInput = struct {
     /// UTC timestamp as `YYYYMMDDTHHMMSSZ` (16 chars). Caller passes
     /// in so testing is deterministic; production uses `formatAmzDate`.
     timestamp: []const u8,
+    /// Extra headers to SIGN beyond the fixed three (host,
+    /// x-amz-content-sha256, x-amz-date). SigV4 requires every
+    /// `x-amz-*` header on the wire to be signed — `x-amz-copy-source`
+    /// for server-side CopyObject is the motivating case. Names MUST
+    /// be lowercase and values already trimmed; the caller attaches
+    /// the same headers to the wire request itself.
+    extra_signed_headers: []const ExtraHeader = &.{},
+};
+
+pub const ExtraHeader = struct {
+    name: []const u8,
+    value: []const u8,
 };
 
 /// Output headers the caller must attach to the wire request before
@@ -122,7 +134,30 @@ pub fn sign(allocator: std.mem.Allocator, in: SignInput) !SignedHeaders {
     }
 
     // 4. Canonical headers (lowercase name, trim value, sorted).
-    //    We sign exactly: host, x-amz-content-sha256, x-amz-date.
+    //    The fixed three (host, x-amz-content-sha256, x-amz-date)
+    //    merged with any `extra_signed_headers`, sorted by name.
+    var hdrs: std.ArrayListUnmanaged(ExtraHeader) = .empty;
+    defer hdrs.deinit(allocator);
+    try hdrs.ensureTotalCapacity(allocator, 3 + in.extra_signed_headers.len);
+    hdrs.appendAssumeCapacity(.{ .name = "host", .value = in.host });
+    hdrs.appendAssumeCapacity(.{ .name = "x-amz-content-sha256", .value = &body_hash_hex });
+    hdrs.appendAssumeCapacity(.{ .name = "x-amz-date", .value = in.timestamp });
+    for (in.extra_signed_headers) |h| hdrs.appendAssumeCapacity(h);
+    std.mem.sort(ExtraHeader, hdrs.items, {}, struct {
+        fn lt(_: void, a: ExtraHeader, b: ExtraHeader) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lt);
+
+    // The `;`-joined signed-header list appears in both the canonical
+    // request and the Authorization header.
+    var signed_list = std.ArrayList(u8){};
+    defer signed_list.deinit(allocator);
+    for (hdrs.items, 0..) |h, i| {
+        if (i > 0) try signed_list.append(allocator, ';');
+        try signed_list.appendSlice(allocator, h.name);
+    }
+
     var canon_req = std.ArrayList(u8){};
     defer canon_req.deinit(allocator);
     try canon_req.appendSlice(allocator, in.method);
@@ -131,21 +166,15 @@ pub fn sign(allocator: std.mem.Allocator, in: SignInput) !SignedHeaders {
     try canon_req.append(allocator, '\n');
     try canon_req.appendSlice(allocator, canon_query.items);
     try canon_req.append(allocator, '\n');
-    // host:value\n
-    try canon_req.appendSlice(allocator, "host:");
-    try canon_req.appendSlice(allocator, in.host);
-    try canon_req.append(allocator, '\n');
-    // x-amz-content-sha256:value\n
-    try canon_req.appendSlice(allocator, "x-amz-content-sha256:");
-    try canon_req.appendSlice(allocator, &body_hash_hex);
-    try canon_req.append(allocator, '\n');
-    // x-amz-date:value\n
-    try canon_req.appendSlice(allocator, "x-amz-date:");
-    try canon_req.appendSlice(allocator, in.timestamp);
-    try canon_req.append(allocator, '\n');
+    for (hdrs.items) |h| {
+        try canon_req.appendSlice(allocator, h.name);
+        try canon_req.append(allocator, ':');
+        try canon_req.appendSlice(allocator, h.value);
+        try canon_req.append(allocator, '\n');
+    }
     // blank line, then signed-headers list, then payload hash
     try canon_req.append(allocator, '\n');
-    try canon_req.appendSlice(allocator, "host;x-amz-content-sha256;x-amz-date");
+    try canon_req.appendSlice(allocator, signed_list.items);
     try canon_req.append(allocator, '\n');
     try canon_req.appendSlice(allocator, &body_hash_hex);
 
@@ -193,12 +222,12 @@ pub fn sign(allocator: std.mem.Allocator, in: SignInput) !SignedHeaders {
     const sig_hex = std.fmt.bytesToHex(sig, .lower);
 
     // 8. Build the Authorization header value.
-    //    "AWS4-HMAC-SHA256 Credential=<ak>/<date>/<region>/<service>/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=<hex>"
+    //    "AWS4-HMAC-SHA256 Credential=<ak>/<date>/<region>/<service>/aws4_request, SignedHeaders=<list>, Signature=<hex>"
     const auth = try std.fmt.allocPrint(allocator,
         "AWS4-HMAC-SHA256 Credential={s}/{s}/{s}/{s}/aws4_request, " ++
-        "SignedHeaders=host;x-amz-content-sha256;x-amz-date, " ++
+        "SignedHeaders={s}, " ++
         "Signature={s}",
-        .{ in.access_key, date, in.region, in.service, &sig_hex });
+        .{ in.access_key, date, in.region, in.service, signed_list.items, &sig_hex });
     errdefer allocator.free(auth);
 
     const date_owned = try allocator.dupe(u8, in.timestamp);
@@ -416,7 +445,7 @@ fn uriEncodePath(
 
 /// URI-encode a single component (NO slashes preserved). Used by
 /// the query-string canonicalizer for keys and values.
-fn uriEncodeComponent(
+pub fn uriEncodeComponent(
     allocator: std.mem.Allocator,
     out: *std.ArrayList(u8),
     s: []const u8,
