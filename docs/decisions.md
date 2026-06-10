@@ -156,10 +156,12 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   3. A `stream:false` fetch must emit exactly **one** event (body + `final:true`
      + terminal).
   4. Customer middleware **must** be skipped for `__system/` modules.
-  5. Marker-commit race: an inline fetch can complete before the handler's
-     writeset commits via raft. Shipped mitigation is sweep-only (~1s first-fire
-     latency); the proper fix is the commit-gated Cmd buffer (effect-reification
-     Phase 4.1, the one remaining active phase).
+  5. Marker-commit race: an inline fetch could complete before the handler's
+     writeset committed via raft. Closed by the commit-gated Cmd buffer
+     (effect-reification Phase 4.1.2 `Cmd.http_fetch` staging, shipped
+     2026-05-24) — the fetch submits to the FetchEngine only after the batch
+     commits. The owed sweep (~1s first-fire latency) remains as the
+     crash-recovery path only.
 
 ### 3.4 Owed-recovery is a boot-scan of `_send/owed/`
 - **Decision** (Option (b), shipped 2026-05-19): at process start, reconstruct
