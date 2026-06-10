@@ -42,7 +42,6 @@ pub const ActivationSource = log_mod.ActivationSource;
 /// (`fireSubscriptionActivation`) owns the bytes for the dispatch.
 /// `worker_streaming.SubscriptionFireSource` aliases this.
 pub const SubscriptionFireSource = union(enum) {
-    cron: struct { fired_at_ns: i64 },
     kv: struct { key: []const u8, op: u8 },
     boot: struct { deployment_id: u64 },
 };

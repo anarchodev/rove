@@ -570,7 +570,7 @@ fn shipWsFrames(
         stage.chunks.deinit(allocator);
         stage.ws_opcodes.deinit(allocator);
     }
-    const seq = proposeForgetfulWrites(worker, writeset, txn, tenant_id, &stage, readset, log_header) catch |err| {
+    const seq = proposeForgetfulWrites(worker, writeset, txn, tenant_id, &stage, null, readset, log_header) catch |err| {
         txn_owned.* = false; // helper rolled back + destroyed the txn
         return err;
     };
@@ -640,7 +640,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
     }
     if (wrote) {
         const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, .disconnect, path, chain_ctx.correlation_id);
-        _ = proposeForgetfulWrites(worker, &p.ws, p.txn, chain_ctx.tenant_id, null, &p.readset, lh) catch |perr| {
+        _ = proposeForgetfulWrites(worker, &p.ws, p.txn, chain_ctx.tenant_id, null, null, &p.readset, lh) catch |perr| {
             std.log.warn("rove-js ws-disconnect: propose failed: {s}", .{@errorName(perr)});
             p.txn_owned = false;
             p.txn_done = true;

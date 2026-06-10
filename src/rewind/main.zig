@@ -152,11 +152,11 @@ fn runPromotionHook(worker: anytype, worker_idx: usize) void {
     }
     // Worker-0-only for the boot-subscription sweep (avoids duplicate enqueues
     // across a node's workers); rewind runs a single worker, but keep the gate
-    // for forward-compat. The owed/wake sweeps are partitioned by
+    // for forward-compat. The wake sweep is partitioned by
     // `hash(tenant) % N_inboxes`, so every worker covers its own slice exactly
-    // once and they run unconditionally.
+    // once and it runs unconditionally. (The owed retry sweep retired with
+    // durable-wake-plan P5(a) — webhook recovery is a durable wake now.)
     if (worker_idx == 0) rjs.sweepBootSubscriptions(worker);
-    rjs.sweepOwedRetriesOnPromotion(worker);
     rjs.sweepDurableWakesOnPromotion(worker);
 }
 
@@ -244,9 +244,7 @@ fn workerMain(args: *WorkerCtx) !void {
         // committed unit's reply frames. Read-only frames emit inline.
         try rjs.serviceWsMessages(worker);
         try rjs.cleanupResponses(worker);
-        rjs.sweepCronSubscriptions(worker);
         rjs.sweepBlobSessions(worker);
-        rjs.sweepOwedRetries(worker);
         rjs.sweepDurableWakes(worker);
         rjs.serviceSubscriptionFires(worker);
         rjs.drainPendingBoundResumes(worker);

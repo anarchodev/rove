@@ -562,6 +562,15 @@ fn resumeStream(
         for (pending_wakes.items) |*pw| pw.deinit(allocator);
         pending_wakes.deinit(allocator);
     }
+    // durable-wake-plan P5(a): the resumed hop's `http.fetch`es
+    // (webhook.send inline fire, blob.put). Write arms commit-gate
+    // them via proposeForgetfulWrites; read-only commits flush
+    // directly; error arms free via the defer.
+    var pending_fetches: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
+    defer {
+        for (pending_fetches.items) |*pf| pf.deinit(allocator);
+        pending_fetches.deinit(allocator);
+    }
     var stream_chunks: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
         for (stream_chunks.items) |ch| allocator.free(ch);
@@ -590,6 +599,7 @@ fn resumeStream(
         .effects = .{
             .pending_wakes = &pending_wakes,
             .pending_stream_chunks = &stream_chunks,
+            .pending_fetches = &pending_fetches,
         },
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
@@ -662,7 +672,7 @@ fn resumeStream(
                     .host = "",
                     .correlation_id = chain_ctx.correlation_id orelse "",
                 };
-                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &readset, lh_term) catch |perr| {
+                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &pending_fetches, &readset, lh_term) catch |perr| {
                     std.log.warn("rove-js stream-resume (terminal + writes): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
                     txn_done = true;
@@ -700,6 +710,7 @@ fn resumeStream(
                 .{@errorName(e)},
             );
             txn_done = true;
+            flushFireFetches(worker, &pending_fetches);
             if (r.body.len > 0) {
                 const owned = try allocator.dupe(u8, r.body);
                 try chunks_st.tryAppend(allocator, owned);
@@ -766,7 +777,7 @@ fn resumeStream(
                     .host = "",
                     .correlation_id = chain_ctx.correlation_id orelse "",
                 };
-                fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &readset, lh_stream) catch |perr| {
+                fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &pending_fetches, &readset, lh_stream) catch |perr| {
                     std.log.warn("rove-js stream-resume (stream + writes): propose failed: {s}", .{@errorName(perr)});
                     // Helper already freed `stage.chunks` (the
                     // outer defer is now a no-op). Free what's
@@ -789,6 +800,7 @@ fn resumeStream(
                     .{@errorName(e)},
                 );
                 txn_done = true;
+                flushFireFetches(worker, &pending_fetches);
             }
             // Headers on subsequent hops are ignored (the stream's
             // initial response headers already shipped); free them.
@@ -967,6 +979,13 @@ pub fn resumeBoundFetchStream(
         for (stream_chunks.items) |ch| allocator.free(ch);
         stream_chunks.deinit(allocator);
     }
+    // durable-wake-plan P5(a): see resumeStream — same accumulator,
+    // same release discipline.
+    var pending_fetches: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
+    defer {
+        for (pending_fetches.items) |*pf| pf.deinit(allocator);
+        pending_fetches.deinit(allocator);
+    }
 
     const req: Request = .{
         .method = "POST",
@@ -1004,7 +1023,10 @@ pub fn resumeBoundFetchStream(
             .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
             .cancel_fetch_ctx = @ptrCast(worker),
         },
-        .effects = .{ .pending_stream_chunks = &stream_chunks },
+        .effects = .{
+            .pending_stream_chunks = &stream_chunks,
+            .pending_fetches = &pending_fetches,
+        },
     };
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
@@ -1065,7 +1087,7 @@ pub fn resumeBoundFetchStream(
                     .host = "",
                     .correlation_id = chain_ctx.correlation_id orelse "",
                 };
-                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &readset, lh_term) catch |perr| {
+                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &pending_fetches, &readset, lh_term) catch |perr| {
                     std.log.warn("rove-js bound-fetch stream (terminal + writes): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
                     txn_done = true;
@@ -1091,6 +1113,7 @@ pub fn resumeBoundFetchStream(
                 .{@errorName(e)},
             );
             txn_done = true;
+            flushFireFetches(worker, &pending_fetches);
             if (r.body.len > 0) {
                 const owned = allocator.dupe(u8, r.body) catch return;
                 chunks_st.tryAppend(allocator, owned) catch {};
@@ -1141,7 +1164,7 @@ pub fn resumeBoundFetchStream(
                     .host = "",
                     .correlation_id = chain_ctx.correlation_id orelse "",
                 };
-                fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &readset, lh_stream) catch |perr| {
+                fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &pending_fetches, &readset, lh_stream) catch |perr| {
                     std.log.warn("rove-js bound-fetch stream (stream + writes): propose failed: {s}", .{@errorName(perr)});
                     s2.deinit(allocator);
                     txn_owned = false;
@@ -1159,6 +1182,7 @@ pub fn resumeBoundFetchStream(
                     .{@errorName(e)},
                 );
                 txn_done = true;
+                flushFireFetches(worker, &pending_fetches);
             }
             // Headers on subsequent hops ignored; free.
             if (s2.headers) |h| allocator.free(h);
@@ -1385,6 +1409,26 @@ pub fn runFire(
     const allocator = worker.allocator;
     const tenant_id = p.dep.inst.id;
     const dep_id = p.dep.tc.snap.deployment_id;
+
+    // durable-wake-plan P5(a): every fire origin gets an `http.fetch`
+    // accumulator. Pre-P5(a), `req.effects.pending_fetches` was null
+    // on every runFire path, so a fetch issued from a wake /
+    // subscription / chained activation (`__system/webhook_fire`'s
+    // deferred fire, a customer `webhook.send` from an on_result
+    // handler) was SILENTLY dropped — masked by the old Zig owed
+    // sweep, which re-drove the marker from kv. Write-path fires hand
+    // the list to `proposeForgetfulWrites` (commit-gated
+    // `Cmd.http_fetch`); read-only commits flush directly post-commit.
+    // Error / rollback paths free via the defer (the chain never
+    // fires — at-least-once recovery is the producer's own wake).
+    var pending_fetches: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
+    defer {
+        for (pending_fetches.items) |*pf| pf.deinit(allocator);
+        pending_fetches.deinit(allocator);
+    }
+    var req_w = req;
+    if (req_w.effects.pending_fetches == null) req_w.effects.pending_fetches = &pending_fetches;
+
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     const run_oc = worker.dispatcher.runOutcome(
         p.dep.inst.kv,
@@ -1394,7 +1438,7 @@ pub fn runFire(
         &p.dep.tc.snap.bytecodes,
         &p.dep.tc.snap.source_hashes,
         p.dep.tc.snap.triggers,
-        req,
+        req_w,
         &budget,
     ) catch {
         p.txn.rollback() catch {};
@@ -1419,7 +1463,7 @@ pub fn runFire(
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
             if (wrote) {
                 const lh = fireLogHeader(p.request_id, dep_id, st, spec.act, log_path, corr);
-                const fw_seq = proposeForgetfulWrites(worker, &p.ws, p.txn, tenant_id, null, &p.readset, lh) catch |perr| {
+                const fw_seq = proposeForgetfulWrites(worker, &p.ws, p.txn, tenant_id, null, &pending_fetches, &p.readset, lh) catch |perr| {
                     std.log.warn("rove-js " ++ spec.site ++ " ({s}): propose failed: {s}", .{ label, @errorName(perr) });
                     p.txn_owned = false; // helper rolled back + destroyed the txn
                     p.txn_done = true;
@@ -1436,6 +1480,7 @@ pub fn runFire(
                 return;
             }
             commitReadOnlyFire(p, spec.site ++ ".commit(terminal)");
+            flushFireFetches(worker, &pending_fetches);
             captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
             r.console = &.{};
             r.exception = &.{};
@@ -1469,7 +1514,7 @@ pub fn runFire(
             }
             if (wrote) {
                 const lh = fireLogHeader(p.request_id, dep_id, 200, spec.act, log_path, corr);
-                const fw_seq = proposeForgetfulWrites(worker, &p.ws, p.txn, tenant_id, null, &p.readset, lh) catch |perr| {
+                const fw_seq = proposeForgetfulWrites(worker, &p.ws, p.txn, tenant_id, null, &pending_fetches, &p.readset, lh) catch |perr| {
                     std.log.warn("rove-js " ++ spec.site ++ " ({s}): cont-return propose failed: {s}", .{ label, @errorName(perr) });
                     p.txn_owned = false;
                     p.txn_done = true;
@@ -1483,6 +1528,7 @@ pub fn runFire(
             }
             if (comptime spec.readonly_cont_commits) {
                 commitReadOnlyFire(p, spec.site ++ ".commit(cont)");
+                flushFireFetches(worker, &pending_fetches);
             } else {
                 p.txn.rollback() catch {};
                 p.txn_done = true;
@@ -1506,7 +1552,7 @@ pub fn runFire(
             }
             if (wrote) {
                 const lh = fireLogHeader(p.request_id, dep_id, 200, spec.act, log_path, corr);
-                const fw_seq = proposeForgetfulWrites(worker, &p.ws, p.txn, tenant_id, null, &p.readset, lh) catch |perr| {
+                const fw_seq = proposeForgetfulWrites(worker, &p.ws, p.txn, tenant_id, null, &pending_fetches, &p.readset, lh) catch |perr| {
                     std.log.warn("rove-js " ++ spec.site ++ " ({s}): stream-return propose failed: {s}", .{ label, @errorName(perr) });
                     p.txn_owned = false;
                     p.txn_done = true;
@@ -1519,6 +1565,7 @@ pub fn runFire(
                 return;
             }
             commitReadOnlyFire(p, spec.site ++ ".commit(stream)");
+            flushFireFetches(worker, &pending_fetches);
             captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
         },
         // Only `.inbound_headers` activations produce this;
@@ -1529,6 +1576,42 @@ pub fn runFire(
             captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
         },
     }
+}
+
+/// durable-wake-plan P5(a): submit a read-only fire's accumulated
+/// fetches once its txn committed. Connection-scoped (`on.fetch`)
+/// entries drop — a fire never holds a connection, so they're inert
+/// by the handler-shape scope rule (mirrors `finalizeBatch`'s
+/// non-held drop and `proposeForgetfulWrites`' filter on the write
+/// path). On enqueue failure the entries stay on the list for the
+/// caller's defer to free.
+fn flushFireFetches(
+    worker: anytype,
+    fetches: *std.ArrayListUnmanaged(globals.PendingFetch),
+) void {
+    const allocator = worker.allocator;
+    if (fetches.items.len == 0) return;
+    var keep: usize = 0;
+    for (fetches.items) |pf_const| {
+        var pf = pf_const;
+        if (pf.connection_scoped) {
+            pf.deinit(allocator);
+            continue;
+        }
+        fetches.items[keep] = pf;
+        keep += 1;
+    }
+    fetches.items.len = keep;
+    if (keep == 0) return;
+    worker.node.enqueuePendingFetches(fetches.items) catch |err| {
+        std.log.warn(
+            "rove-js fire fetch flush: enqueuePendingFetches failed: {s} ({d} fetch(es) dropped)",
+            .{ @errorName(err), fetches.items.len },
+        );
+        return; // caller's defer frees
+    };
+    // Ownership transferred to the engine queue.
+    fetches.clearRetainingCapacity();
 }
 
 /// Streaming-handlers-plan §4.4: client disconnect on a held stream.
@@ -1643,16 +1726,15 @@ pub const SubscriptionFireSource = dispatcher_mod.SubscriptionFireSource;
 ///         routes as a `send_callback` activation, not as a held
 ///         continuation).
 ///
-/// Errors return `void` — the caller is best-effort (cron sweep,
-/// apply-time hook, boot fire). Failures log + skip the activation.
+/// Errors return `void` — the caller is best-effort (apply-time
+/// hook, boot fire). Failures log + skip the activation.
 /// handler-shape.md §3: the conventional named export a `_subscriptions/`
 /// fire dispatches to, by trigger source. Lets one module split its
-/// boot / cron / kv-react handling into distinct exports instead of one
+/// boot / kv-react handling into distinct exports instead of one
 /// `default` that branches on `request.activation.source.kind`.
 fn subscriptionExport(source: SubscriptionFireSource) []const u8 {
     return switch (source) {
         .boot => "onBoot",
-        .cron => "onCron",
         .kv => "onSubscription",
     };
 }
@@ -1717,12 +1799,11 @@ pub fn fireSubscriptionActivation(
 
     // Named-export dispatch by trigger source (handler-shape.md §3,
     // completing the Phase-4 activation-kind-switch retirement for
-    // connectionless fires): a boot fire lands in `onBoot`, a cron fire
-    // in `onCron`, a kv-react fire in `onSubscription`. The handler no
-    // longer has to branch on `request.activation.source.kind`. A
-    // missing conventional export is the fail-loud 404 backstop. The
-    // `cron(spec, target, …)` verb is a separate surface that names its
-    // own target via the durable scheduler — not this path.
+    // connectionless fires): a boot fire lands in `onBoot`, a kv-react
+    // fire in `onSubscription`. The handler no longer has to branch on
+    // `request.activation.source.kind`. A missing conventional export
+    // is the fail-loud 404 backstop. Recurrence (`cron(spec, target)`)
+    // names its own target via the durable scheduler — not this path.
     var query_buf: [32]u8 = undefined;
     const query = std.fmt.bufPrint(&query_buf, "fn={s}", .{subscriptionExport(source)}) catch null;
 
@@ -2025,6 +2106,17 @@ pub const StreamResumeStage = struct {
 /// subscription, and fetch-event callers pass `null`; they're
 /// either entity-less or already disconnect-tolerant.
 ///
+/// durable-wake-plan P5(a): the optional `fetches_opt` parameter is
+/// the commit-gated `http.fetch` payload for forgetful fires. When
+/// non-null, each accumulated PendingFetch becomes a `Cmd.http_fetch`
+/// on the parked unit, released by `interpretCmd` strictly after raft
+/// commits — the same gate the inbound path's `finalizeBatch` applies.
+/// Connection-scoped (`on.fetch`) entries are dropped (a fire never
+/// holds a connection, so they're inert by the handler-shape scope
+/// rule). On success ownership moves to the unit and the list is
+/// cleared; on propose failure the entries stay on the list for the
+/// caller's defer to free (the chain never fires).
+///
 /// On success the helper consumes the txn pointer AND the `stage`
 /// chunks (moved into the ParkedUnit). On failure it rolls back +
 /// destroys the txn AND frees any staged chunks; the caller's
@@ -2037,6 +2129,7 @@ pub fn proposeForgetfulWrites(
     txn: *kv_mod.KvStore.TrackedTxn,
     tenant_id: []const u8,
     stage_opt: ?*StreamResumeStage,
+    fetches_opt: ?*std.ArrayListUnmanaged(globals.PendingFetch),
     /// Pass `&readset` (slice 1b's per-activation Readset) so this
     /// activation's readset rides the raft entry as the type-0
     /// envelope's `rs_bytes` section (slice 3d-fetch). `null` for
@@ -2118,9 +2211,29 @@ pub fn proposeForgetfulWrites(
     // Total Cmd capacity: writes + chunks + (1 close if any).
     var cmds: effect_mod.cmd.BufferedCmds = .{};
     errdefer cmds.deinit(allocator);
+
+    // P5(a): filter the fire's accumulated fetches BEFORE sizing the
+    // Cmd list — connection-scoped (`on.fetch`) registrations are
+    // inert from a fire origin (no held connection to bind to).
+    var fetches_count: usize = 0;
+    if (fetches_opt) |fetches| {
+        var keep: usize = 0;
+        for (fetches.items) |pf_const| {
+            var pf = pf_const;
+            if (pf.connection_scoped) {
+                pf.deinit(allocator);
+                continue;
+            }
+            fetches.items[keep] = pf;
+            keep += 1;
+        }
+        fetches.items.len = keep;
+        fetches_count = keep;
+    }
+
     const chunks_count = stage_chunks.items.len;
     const close_count: usize = if (stage_opt) |s| (if (s.mark_draining) 1 else 0) else 0;
-    const cap = writeset.ops.items.len + chunks_count + close_count;
+    const cap = writeset.ops.items.len + chunks_count + close_count + fetches_count;
     if (cap > 0) cmds.items.ensureUnusedCapacity(allocator, cap) catch |perr|
         std.log.warn("rove-js forgetful-writes cmds ensureCapacity (tenant={s}) failed: {s}", .{ tenant_id, @errorName(perr) });
 
@@ -2176,6 +2289,21 @@ pub fn proposeForgetfulWrites(
                     .stream_close = .{ .stream_entity = s.entity },
                 });
             }
+        }
+    }
+
+    // P5(a): transfer the surviving fetches one-for-one into
+    // commit-gated `Cmd.http_fetch` entries. `interpretCmd` submits
+    // each to the fetch engine strictly after the unit's writeset
+    // commits — the fetch + its marker share one commit gate, the
+    // same contract `webhook.send`'s inline fire gets on the inbound
+    // path. Clear the source list so the caller's defer no-ops.
+    if (fetches_opt) |fetches| {
+        if (fetches.items.len > 0) {
+            for (fetches.items) |pf| {
+                cmds.items.appendAssumeCapacity(.{ .http_fetch = pf });
+            }
+            fetches.clearRetainingCapacity();
         }
     }
 
@@ -2711,7 +2839,6 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
                     sf.subscription_name,
                     sf.module_path,
                     switch (sf.source) {
-                        .cron => |c| SubscriptionFireSource{ .cron = .{ .fired_at_ns = c.fired_at_ns } },
                         .kv => |kv| SubscriptionFireSource{ .kv = .{ .key = kv.key, .op = kv.op } },
                         .boot => |b| SubscriptionFireSource{ .boot = .{ .deployment_id = b.deployment_id } },
                     },

@@ -1,24 +1,20 @@
-// Phase 5 PR-2b: webhook.send shim's on_chunk handler. Baked into
-// the binary as the first `__system/` built-in module — proves the
-// resolution mechanism + bypass-reserved-prefix-check path are
-// wired correctly. NOT YET CALLED at runtime: the customer-facing
-// `webhook.send` (globals/webhook.js) still points at the Zig
-// http.send path until PR-3 atomically flips the shim AND deletes
-// the SendDispatch kernel (the apply.zig `_send/owed/*` classifier
-// would double-fire today if both paths were live simultaneously).
-//
-// The shim (Phase 5 PR-3, planned):
+// `webhook.send`'s result classifier — the baked on_chunk handler
+// every webhook fetch (inline first fire from the shim, or a deferred
+// fire from `__system/webhook_fire`) reports into.
 //
 //   1. Ignores intermediate chunks (waits for final).
 //   2. On final: classifies the result (success / retryable failure
-//      / give-up) and updates the durable `_send/owed/{id}` marker:
-//        - success (status < 400): kv.delete the marker.
-//        - retryable (status >= 500 OR transport !ok): bump
-//          attempts + next_at_ns, keep the marker.
-//        - give-up (status 4xx, or attempts >= MAX): delete the
-//          marker, record the give-up.
+//      / give-up) against the durable `_send/owed/{id}` marker:
+//        - success (status < 400): kv.delete the marker + cancel the
+//          send's scheduler entry (the webhook_fire watchdog).
+//        - retryable (status >= 500 OR transport !ok): bump attempts,
+//          keep the marker, re-arm the scheduler entry to the backoff
+//          time (durable-wake-plan P5(a)).
+//        - give-up (status 4xx, or attempts >= max): delete the
+//          marker + cancel the entry, record the give-up.
 //   3. Hands off to the customer's on_result module via __rove_next
-//      (Phase 5 PR-2a lifted the cont arm from fetch handlers).
+//      (unless a §6.4 held-sync continuation is bound to this send —
+//      then the deferred resume gets the event instead).
 //
 // Resolved by the runtime via `__system/` module path resolution
 // (not in any tenant's deployment files); compiled to bytecode
@@ -101,14 +97,23 @@ export default function () {
 
     if (should_retry) {
         // Update marker; do NOT fire on_result yet (still in flight).
+        // The durable scheduler entry under key `_send/{id}` moves to
+        // the backoff time (same key ⇒ last-write-wins re-arm); the
+        // wake fires `__system/webhook_fire`, which re-fetches.
         owed.attempts += 1;
-        owed.next_at_ns = String(computeNextAtNs(owed.attempts));
+        delete owed.next_at_ns; // legacy timing field — scheduler owns timing now
         kv.set("_send/owed/" + id, JSON.stringify(owed));
+        scheduler.at(computeNextAtNs(owed.attempts), "__system/webhook_fire",
+                     { id: id }, { key: "_send/" + id });
         return { status: 200 };
     }
 
-    // Terminal: clear marker. Fire on_result if customer registered one.
+    // Terminal: clear marker + cancel the send's scheduler entry (the
+    // crash-recovery watchdog / pending retry). The schedule id is
+    // deterministic from the key — same recipe as scheduler.at's
+    // opts.key handling (base64url-no-pad(sha256(key))).
     kv.delete("_send/owed/" + id);
+    scheduler.cancel(base64url.encode(hex.decode(crypto.sha256("_send/" + id))));
 
     // Mark as a give-up vs success in the result the customer sees.
     if (transport_failed || upstream_5xx) {

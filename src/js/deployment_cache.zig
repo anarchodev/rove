@@ -131,10 +131,9 @@ const SubscriptionFileKind = enum { handler, spec };
 /// fields fail the deploy.
 const SubscriptionSpecJson = struct {
     kind: []const u8,
-    /// Required for kind=cron. Milliseconds between fires. Must be
-    /// >= 1000 (one second). For complex schedules (e.g. "daily at
-    /// 3am"), customers compose via
-    /// `http.send({fire_at_ns: cron.next(...)})`.
+    /// Legacy kind=cron field — tolerated by the parser so the
+    /// kind=cron rejection below produces its pointed migration
+    /// error instead of a generic unknown-field parse failure.
     interval_ms: ?i64 = null,
     /// Required for kind=kv.
     prefix: ?[]const u8 = null,
@@ -258,18 +257,17 @@ fn translateSpec(
     raw: SubscriptionSpecJson,
 ) !globals.SubscriptionEntry.Spec {
     if (std.mem.eql(u8, raw.kind, "cron")) {
-        const interval_ms = raw.interval_ms orelse {
-            std.log.err("rove-js: subscription `{s}` kind=cron missing `interval_ms` field", .{name});
-            return error.SubscriptionSpecMissingField;
-        };
-        if (interval_ms < 1000) {
-            std.log.err(
-                "rove-js: subscription `{s}` kind=cron has sub-second interval_ms={d} (minimum 1000)",
-                .{ name, interval_ms },
-            );
-            return error.SubscriptionSpecMissingField;
-        }
-        return .{ .cron = .{ .interval_ms = interval_ms } };
+        // durable-wake-plan P5(b): the manifest cron subscription (a
+        // non-durable in-memory interval clock) retired in favor of
+        // the durable scheduler. Fail the deploy loudly with the
+        // migration recipe instead of silently ignoring the spec.
+        std.log.err(
+            "rove-js: subscription `{s}` kind=cron is retired — register recurrence from a boot " ++
+                "subscription instead: `cron(\"*/1 * * * *\", \"module/path\")` (crontab, durable) or a " ++
+                "self-re-arming `scheduler.after(intervalMs, ...)` for sub-minute intervals",
+            .{name},
+        );
+        return error.SubscriptionSpecUnknownKind;
     }
     if (std.mem.eql(u8, raw.kind, "kv")) {
         const prefix = raw.prefix orelse {
