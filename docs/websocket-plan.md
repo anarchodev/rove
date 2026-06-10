@@ -24,7 +24,8 @@
 > the held-outbound-subscription note (now in `architecture/effects-and-handlers.md`),
 > the deleted `curl-multi-plan.md` Phase 4) into one
 > place. The execution model is already specified (`architecture/routing-and-ingress.md`
-> §1–§5 + connection-actor §6); this doc is about transport choices,
+> "Held connections" + `architecture/effects-and-handlers.md`, with the locked
+> model recorded in `decisions.md` §13); this doc is about transport choices,
 > what shipping WS unlocks, and the cost/sequencing.
 
 ## 1. The asymmetry — outbound is close, inbound is far
@@ -261,7 +262,7 @@ continuation), so it routes to the worker that holds it — the existing
 held-state routing, shared by every held primitive (fetch, subscribe, WS), not
 WS tax (`architecture/effects-and-handlers.md`). Broadcast is the opposite: the
 connection-actor model **never exposes a connection handle**
-(`connection-actor-unified-trigger.md`), so broadcast *cannot* be "enumerate
+(`decisions.md` §13.2), so broadcast *cannot* be "enumerate
 the connections and push" — it must be pub-sub on a trigger. So broadcast is
 `on.kv`: subscribers park on a room key; a durable write fires the wake; each
 parked continuation reads the new message and pushes it down its socket. The

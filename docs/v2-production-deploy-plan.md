@@ -540,7 +540,7 @@ non-operator admin principals never see or invoke them. The fleet authority
 (move-secret / CP control calls) stays **server-side in the admin handler**,
 never shipped to the browser and never exposed to a non-operator session. This
 avoids putting fleet keys inside a customer-style sandbox (the confused-deputy
-concentration the capability model warns about, `project_connection_holder_security`).
+concentration the capability model warns about, `decisions.md` §13.2).
 
 **Build order (ASAP-optimized, each a pass through the §6 loop):**
 
