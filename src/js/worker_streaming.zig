@@ -9,11 +9,14 @@
 //!     `serviceParkedStreams`, `drainKvWakeInbox`, `matchEventsToWakes`,
 //!     `resumeStream` — the wake → resume → ship-chunks loop.
 //!   - Activation firers: `fireDisconnectActivation`,
-//!     `fireSubscriptionActivation`, `fireChainedActivation` —
-//!     synchronous handler invocations from a Msg (no held socket).
-//!     `fireFetchEventActivation` stays in `worker.zig` under its
-//!     "Gap 2.3 http.fetch" section; the four are near-duplicate
-//!     today and collapse together in Phase 4.1.
+//!     `fireSubscriptionActivation`, `fireSchedulerTick`,
+//!     `fireDurableWakeActivation`, `fireChainedActivation`,
+//!     `fireFetchEventActivation` — synchronous handler invocations
+//!     from a Msg (no held socket). All are thin wrappers over the
+//!     shared `firePrep` + `runFire` scaffold; per-firer behavior is
+//!     a comptime `FinishSpec` (continuation/stream action,
+//!     always-propose, tape capture) plus the Request each one
+//!     synthesizes.
 //!   - Commit-gated buffer: `StreamResumeStage`, `proposeForgetfulWrites`,
 //!     `fireKvReactSubscriptions` + `unit.buffered.releaseAll` — the
 //!     parked-unit commit-arm runtime `drainRaftPending` invokes for
@@ -24,6 +27,12 @@
 //!     `serviceSubscriptionFires`, `dispatchPendingMsgs` (+ two
 //!     back-compat aliases) — cross-thread inbox drain → in-thread queue
 //!     drain → per-variant fire.
+//!
+//! The inbound WebSocket seam (chain establish/teardown, the §4.5
+//! input gate, `serviceWsMessages` → `fireWsMessage` /
+//! `fireWsDisconnect`) lives in `worker_ws.zig`; its commit-gated
+//! write path calls back into `StreamResumeStage` +
+//! `proposeForgetfulWrites` here.
 //!
 //! Every function takes `worker: anytype` so the structural-typed
 //! access to Worker's fields keeps working without forcing this file
@@ -1169,7 +1178,335 @@ pub fn resumeBoundFetchStream(
     }
 }
 
-// ── Activation firers ─────────────────────────────────────────────────
+// ── Activation firers ───────────────────────────────────────────────────
+//
+// Every fire*Activation below (and the WS pair in `worker_ws.zig`)
+// shares one prep + run + apply choreography; the per-firer behavior
+// is the `FinishSpec` axes plus the Request each one synthesizes.
+// `firePrep` owns the prep block (deployment pin, txn, writeset,
+// readset, request-id mint); `runFire` owns the run + outcome switch.
+
+/// Prep state shared by every connectionless fire. Build with
+/// `firePrep`; `deinit` releases everything not explicitly handed
+/// off (`runFire` flips `txn_owned`/`txn_done` when txn ownership
+/// transfers to the parked unit on a successful propose).
+pub const FirePrep = struct {
+    dep: worker_drain.ChainDeployment,
+    txn: *kv_mod.KvStore.TrackedTxn,
+    txn_owned: bool = true,
+    txn_done: bool = false,
+    ws: kv_mod.WriteSet,
+    readset: tape_mod.Readset,
+    now_ns: i64,
+    request_id: u64,
+
+    pub fn deinit(p: *FirePrep, allocator: std.mem.Allocator) void {
+        if (!p.txn_done) p.txn.rollback() catch {};
+        if (p.txn_owned) allocator.destroy(p.txn);
+        p.ws.deinit();
+        p.readset.deinit();
+        p.dep.tc.release();
+    }
+};
+
+/// Build the shared prep. Returns null (after a warn) when the
+/// tenant/deployment can't be resolved or the txn can't open — the
+/// caller skips the activation (the best-effort posture all fires
+/// share; the producer's own retry/sweep re-fires where one exists).
+pub fn firePrep(
+    worker: anytype,
+    tenant_id: []const u8,
+    module_path: []const u8,
+    comptime site: []const u8,
+) ?FirePrep {
+    const allocator = worker.allocator;
+    var dep = resolveDeployment(worker, allocator, tenant_id, module_path) catch |err| {
+        std.log.warn(
+            "rove-js " ++ site ++ ": tenant={s} module={s} resolveDeployment failed: {s}; skipping",
+            .{ tenant_id, module_path, @errorName(err) },
+        );
+        return null;
+    };
+    // Heap-allocate the txn so the pointer stays stable when
+    // ownership transfers to the parked unit (propose path).
+    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch {
+        dep.tc.release();
+        return null;
+    };
+    txn.* = dep.inst.kv.beginTrackedImmediate() catch {
+        allocator.destroy(txn);
+        dep.tc.release();
+        return null;
+    };
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    return .{
+        .dep = dep,
+        .txn = txn,
+        .ws = kv_mod.WriteSet.init(allocator),
+        .readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns)),
+        .now_ns = now_ns,
+        .request_id = blk: {
+            const tl = worker.tenant_logs.get(dep.inst.id) orelse break :blk 0;
+            break :blk tl.id_minter.nextRequestId() catch 0;
+        },
+    };
+}
+
+/// What a `.continuation` return does, per firer.
+const ContAction = enum {
+    /// Deinit silently (a disconnect hop has nowhere to resume).
+    drop,
+    /// Warn — held continuations aren't expressible from this origin
+    /// (v1); customers compose multi-step via webhook.send on_result.
+    warn,
+    /// Treat as a bug in our own module: warn, roll back (writes
+    /// included), skip the log record entirely.
+    rollback_silent,
+    /// Enqueue the named module as a chained SendCallback hop on the
+    /// next tick (bounded recursion via the dispatch BATCH cap),
+    /// inheriting this chain's correlation_id.
+    enqueue,
+};
+const StreamAction = enum { drop, warn, rollback_silent };
+
+/// The per-firer behavior axes of `runFire`'s outcome switch.
+/// Comptime so each firer compiles its own lean switch.
+const FinishSpec = struct {
+    /// Activation tag on log records + propose LogHeaders.
+    act: log_mod.ActivationSource,
+    /// Warn/panic-site label, e.g. "subscription-fire".
+    site: []const u8,
+    on_cont: ContAction,
+    on_stream: StreamAction,
+    /// durable-wake: cleanup deletes are pre-injected, so every
+    /// outcome proposes — even a handler that wrote nothing.
+    always_propose: bool = false,
+    /// What a read-only `.continuation` return does with the txn:
+    /// commit (chained/fetch posture) vs rollback (disconnect/
+    /// subscription posture). Preserved per-firer from the
+    /// pre-collapse code; both end a read-only txn.
+    readonly_cont_commits: bool = false,
+    /// fetch_chunk: capture tape payloads on every log record.
+    with_tape: bool = false,
+};
+
+/// The LogHeader every propose path ships. Also used by the WS seam
+/// (`worker_ws.zig`) with its own activation tags.
+pub fn fireLogHeader(
+    request_id: u64,
+    deployment_id: u64,
+    status: u16,
+    act: log_mod.ActivationSource,
+    path: []const u8,
+    corr: ?[]const u8,
+) log_mod.LogHeader {
+    return .{
+        .request_id = request_id,
+        .deployment_id = deployment_id,
+        .duration_ns = 0,
+        .status = status,
+        .outcome = .ok,
+        .activation = act,
+        .method = "POST",
+        .path = path,
+        .host = "",
+        .correlation_id = corr orelse "",
+    };
+}
+
+/// Tape payloads for one log record. Fresh per call —
+/// `captureLogWithId` takes ownership of the byte allocations.
+fn fireTapes(
+    worker: anytype,
+    comptime with_tape: bool,
+    readset: *tape_mod.Readset,
+    body: []const u8,
+    activation_bytes: []const u8,
+) log_mod.TapePayloads {
+    if (!with_tape) return .{};
+    return captureTapesWithActivation(worker, readset, body, activation_bytes);
+}
+
+/// Commit a read-only fire txn. kvexp `NotChainHead` (surfaced as
+/// `error.Conflict`) is an EXPECTED race here, not an invariant: the
+/// txn opened while another activation's propose was still in flight
+/// on the same tenant and read through its uncommitted overlay
+/// (`saw_speculation`), so kvexp refuses to commit it ahead of its
+/// chain predecessor. Commit-or-panic WAS sound when every activation
+/// sat in the same H2 request collection (the per-tenant dispatch
+/// lease serialized them); connectionless fires run outside that
+/// collection, so a fire can land inside a propose's quorum window —
+/// a chained hop one tick after its parent is the easy repro.
+/// Nothing escapes a connectionless fire pre-commit, so there is
+/// nothing to commit-gate: roll back and let the producer's re-fire
+/// path (cron sweep, owed sweep, scheduler tick) cover any skipped
+/// work — the `fireWsDisconnect` posture. Any other commit error is
+/// a real infallibility violation.
+fn commitReadOnlyFire(p: *FirePrep, comptime site: []const u8) void {
+    p.txn.commit() catch |e| switch (e) {
+        error.Conflict => p.txn.rollback() catch {},
+        else => panic_mod.invariantViolated(site, "err={s}", .{@errorName(e)}),
+    };
+    p.txn_done = true;
+}
+
+/// Run the handler + apply its outcome — the shared tail of every
+/// connectionless fire. `log_path` is the module path on log records
+/// (no leading slash); `corr` must match `req.trace.correlation_id`;
+/// `label` identifies the firer in warn messages (name / module /
+/// tenant); `activation_bytes` feeds tape capture when
+/// `spec.with_tape` (fetch chunk payloads) — pass "" otherwise.
+pub fn runFire(
+    worker: anytype,
+    p: *FirePrep,
+    req: Request,
+    comptime spec: FinishSpec,
+    log_path: []const u8,
+    corr: ?[]const u8,
+    label: []const u8,
+    activation_bytes: []const u8,
+) void {
+    const allocator = worker.allocator;
+    const tenant_id = p.dep.inst.id;
+    const dep_id = p.dep.tc.snap.deployment_id;
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    const run_oc = worker.dispatcher.runOutcome(
+        p.dep.inst.kv,
+        p.txn,
+        &p.ws,
+        p.dep.bc,
+        &p.dep.tc.snap.bytecodes,
+        &p.dep.tc.snap.source_hashes,
+        p.dep.tc.snap.triggers,
+        req,
+        &budget,
+    ) catch {
+        p.txn.rollback() catch {};
+        p.txn_done = true;
+        captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
+        return;
+    };
+
+    const wrote = spec.always_propose or p.ws.ops.items.len > 0;
+    var oc = run_oc;
+    switch (oc) {
+        .terminal => |*r| {
+            defer r.deinit(allocator);
+            if (r.exception.len > 0) {
+                p.txn.rollback() catch {};
+                p.txn_done = true;
+                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, r.console, r.exception, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+            if (wrote) {
+                const lh = fireLogHeader(p.request_id, dep_id, st, spec.act, log_path, corr);
+                const fw_seq = proposeForgetfulWrites(worker, &p.ws, p.txn, tenant_id, null, &p.readset, lh) catch |perr| {
+                    std.log.warn("rove-js " ++ spec.site ++ " ({s}): propose failed: {s}", .{ label, @errorName(perr) });
+                    p.txn_owned = false; // helper rolled back + destroyed the txn
+                    p.txn_done = true;
+                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, r.console, r.exception, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
+                    r.console = &.{};
+                    r.exception = &.{};
+                    return;
+                };
+                p.txn_owned = false;
+                p.txn_done = true;
+                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, fw_seq);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            commitReadOnlyFire(p, spec.site ++ ".commit(terminal)");
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
+            r.console = &.{};
+            r.exception = &.{};
+        },
+        .continuation => |*cval| {
+            defer cval.deinit(allocator);
+            switch (comptime spec.on_cont) {
+                .drop => {},
+                .warn => std.log.warn(
+                    "rove-js " ++ spec.site ++ " ({s}): __rove_next from this origin is a no-op (v1)",
+                    .{label},
+                ),
+                .rollback_silent => {
+                    std.log.warn("rove-js " ++ spec.site ++ " ({s}): unexpected __rove_next return (no-op)", .{label});
+                    p.txn.rollback() catch {};
+                    p.txn_done = true;
+                    return;
+                },
+                .enqueue => {
+                    worker.node.router.enqueueChainedDispatchForTenant(
+                        tenant_id,
+                        cval.path,
+                        cval.ctx_json,
+                        cval.fn_name,
+                        corr,
+                    ) catch |err| std.log.warn(
+                        "rove-js " ++ spec.site ++ " ({s}): chained dispatch enqueue failed: {s}",
+                        .{ label, @errorName(err) },
+                    );
+                },
+            }
+            if (wrote) {
+                const lh = fireLogHeader(p.request_id, dep_id, 200, spec.act, log_path, corr);
+                const fw_seq = proposeForgetfulWrites(worker, &p.ws, p.txn, tenant_id, null, &p.readset, lh) catch |perr| {
+                    std.log.warn("rove-js " ++ spec.site ++ " ({s}): cont-return propose failed: {s}", .{ label, @errorName(perr) });
+                    p.txn_owned = false;
+                    p.txn_done = true;
+                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
+                    return;
+                };
+                p.txn_owned = false;
+                p.txn_done = true;
+                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, fw_seq);
+                return;
+            }
+            if (comptime spec.readonly_cont_commits) {
+                commitReadOnlyFire(p, spec.site ++ ".commit(cont)");
+            } else {
+                p.txn.rollback() catch {};
+                p.txn_done = true;
+            }
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
+        },
+        .stream => |*s2| {
+            s2.deinit(allocator);
+            switch (comptime spec.on_stream) {
+                .drop => {},
+                .warn => std.log.warn(
+                    "rove-js " ++ spec.site ++ " ({s}): __rove_stream from this origin is a no-op (v1)",
+                    .{label},
+                ),
+                .rollback_silent => {
+                    std.log.warn("rove-js " ++ spec.site ++ " ({s}): unexpected __rove_stream return (no-op)", .{label});
+                    p.txn.rollback() catch {};
+                    p.txn_done = true;
+                    return;
+                },
+            }
+            if (wrote) {
+                const lh = fireLogHeader(p.request_id, dep_id, 200, spec.act, log_path, corr);
+                const fw_seq = proposeForgetfulWrites(worker, &p.ws, p.txn, tenant_id, null, &p.readset, lh) catch |perr| {
+                    std.log.warn("rove-js " ++ spec.site ++ " ({s}): stream-return propose failed: {s}", .{ label, @errorName(perr) });
+                    p.txn_owned = false;
+                    p.txn_done = true;
+                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
+                    return;
+                };
+                p.txn_owned = false;
+                p.txn_done = true;
+                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, fw_seq);
+                return;
+            }
+            commitReadOnlyFire(p, spec.site ++ ".commit(stream)");
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
+        },
+    }
+}
 
 /// Streaming-handlers-plan §4.4: client disconnect on a held stream.
 /// h2's `serverStreamClose` routed the entity to `response_out`
@@ -1201,11 +1538,6 @@ pub fn resumeBoundFetchStream(
 /// (no manual cleanup site needed since Phase 7).
 pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
     const allocator = worker.allocator;
-    // Handler-cmds Phase 3: reads come from the entity's components
-    // (the entity is in `response_out` at this point — same
-    // `merged_request_row` covers it). The side-table cell only
-    // confirms the entity HAS a stream (the `.contains` check in
-    // `cleanupResponses` is the gate that drove us here).
     const server = worker.h2;
     // Phase 7: entity has a stream chain iff StreamChain.module_path
     // is non-empty. Component presence replaces the parked_streams_*
@@ -1219,47 +1551,18 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
     );
 
     const path = chain_st.module_path;
-    var dep = resolveDeployment(worker, allocator, chain_ctx.tenant_id, path) catch |err| {
-        std.log.warn("rove-js stream-disconnect: tenant={s} resolveDeployment failed: {s}; skipping activation", .{ chain_ctx.tenant_id, @errorName(err) });
-        return;
-    };
-    defer dep.tc.release();
-    const inst = dep.inst;
-    const tc = dep.tc;
-    const bc = dep.bc;
+    var p = firePrep(worker, chain_ctx.tenant_id, path, "stream-disconnect") orelse return;
+    defer p.deinit(allocator);
 
     const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json}) catch return;
     defer allocator.free(body);
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
     defer allocator.free(spath);
 
-    // Heap-allocate the txn so the pointer is stable across an
-    // optional `pending_txns[seq]` parking (Phase 4c — writes on
-    // a disconnect hop). `txn_owned` flips to false once ownership
-    // transfers to the pending map.
-    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
-    var txn_owned = true;
-    defer if (txn_owned) allocator.destroy(txn);
-    txn.* = inst.kv.beginTrackedImmediate() catch return;
-    var txn_done = false;
-    defer if (!txn_done) txn.rollback() catch {};
-
-    var ws = kv_mod.WriteSet.init(allocator);
-    defer ws.deinit();
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
-    defer readset.deinit();
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
     // §9.4 write-pressure: snapshot + reset the chunk-queue drop
     // counter so the disconnect activation sees what was lost.
     // (No socket to flush to anymore, but the handler can still
     // log / persist an "ended with N dropped frames" marker.)
-    // StreamChunks lives on the entity in `response_out` post-
-    // FIN-routing; `get` here is best-effort (a malformed entity
-    // would simply skip the snapshot).
     const dropped_chunks_snapshot: u32 = blk: {
         const sc = server.reg.get(ent, &server.response_out, components_mod.StreamChunks) catch break :blk 0;
         break :blk sc.takeDropped();
@@ -1271,856 +1574,20 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
         .query = null,
         .activation = .disconnect,
         .activation_write_pressure_dropped = dropped_chunks_snapshot,
-        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = chain_ctx.correlation_id },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
-        .admin = .{ .platform = inst.platform },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .admin = .{ .platform = p.dep.inst.platform },
     };
-    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        tc.snap.triggers,
-        request,
-        &budget,
-    ) catch {
-        txn.rollback() catch {};
-        txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
-        return;
-    };
-
-    const wrote = ws.ops.items.len > 0;
-    var oc = run_oc;
-    // The handler's return shape is moot — the socket is closed.
-    // We deinit whatever it produced, then record the outcome on
-    // the tape with the appropriate status. If the hop WROTE,
-    // Phase 4c parks the txn on `pending_txns[seq]` so
-    // `drainRaftPending` commits it asynchronously (no entity is
-    // waiting; the kv writes + any `_send/owed/*` / §4.6 wakes
-    // become durable on their own).
-    switch (oc) {
-        .terminal => |*r| {
-            defer r.deinit(allocator);
-            if (r.exception.len > 0) {
-                txn.rollback() catch {};
-                txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect, 0);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            if (wrote) {
-                const lh_disc_term: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = @intCast(@max(@min(r.status, 599), 100)),
-                    .outcome = .ok,
-                    .activation = .disconnect,
-                    .method = "POST",
-                    .path = chain_st.module_path,
-                    .host = "",
-                    .correlation_id = chain_ctx.correlation_id orelse "",
-                };
-                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null, &readset, lh_disc_term) catch |perr| {
-                    std.log.warn("rove-js stream-disconnect: propose failed: {s}", .{@errorName(perr)});
-                    txn_owned = false; // helper destroyed it
-                    txn_done = true;
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect, 0);
-                    r.console = &.{};
-                    r.exception = &.{};
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect, fw_seq);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "fireDisconnectActivation.commit(terminal)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .disconnect, 0);
-            r.console = &.{};
-            r.exception = &.{};
-        },
-        .continuation => |*cval| {
-            // `__rove_next` from a disconnect hop is futile (no
-            // socket to hold) — drop the descriptor. The hop's
-            // writes (if any) still commit asynchronously so any
-            // observable side effects (kv state, http.send fire,
-            // §4.6 wakes) materialize for other observers.
-            cval.deinit(allocator);
-            if (wrote) {
-                const lh_disc_cont: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = 200,
-                    .outcome = .ok,
-                    .activation = .disconnect,
-                    .method = "POST",
-                    .path = chain_st.module_path,
-                    .host = "",
-                    .correlation_id = chain_ctx.correlation_id orelse "",
-                };
-                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null, &readset, lh_disc_cont) catch |perr| {
-                    std.log.warn("rove-js stream-disconnect (cont return): propose failed: {s}", .{@errorName(perr)});
-                    txn_owned = false;
-                    txn_done = true;
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, fw_seq);
-                return;
-            }
-            txn.rollback() catch {};
-            txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
-        },
-        .stream => |*s2| {
-            s2.deinit(allocator);
-            if (wrote) {
-                const lh_disc_stream: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = 200,
-                    .outcome = .ok,
-                    .activation = .disconnect,
-                    .method = "POST",
-                    .path = chain_st.module_path,
-                    .host = "",
-                    .correlation_id = chain_ctx.correlation_id orelse "",
-                };
-                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null, &readset, lh_disc_stream) catch |perr| {
-                    std.log.warn("rove-js stream-disconnect (stream return): propose failed: {s}", .{@errorName(perr)});
-                    txn_owned = false;
-                    txn_done = true;
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, fw_seq);
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "fireDisconnectActivation.commit(stream)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
-        },
-    }
-}
-
-// ── Inbound WebSocket worker seam (docs/websocket-plan.md §4.5/§5, piece D) ──
-//
-// A held WebSocket connection is a parked continuation chain (it lives in
-// `parked_continuations`, located by conn entity via `ws_conns`).
-// The h2 transport surfaces each complete inbound data frame on the
-// `ws_message_out` collection (Session = conn, WsMeta.opcode, ReqBody =
-// payload); `serviceWsMessages` drains it once per tick and dispatches each
-// frame to the tenant's `onMessage` export (client-close opcode 8 →
-// `onDisconnect`). Outbound `stream.write`s lower to `ws_send_in` entities —
-// inline for read-only frames, commit-gated `ws_send` Cmds for writing frames
-// (batch-of-1 durability). This is additive on the STABLE transport
-// collections — no new collection, no transport change.
-//
-// §4.5 strict reply ordering — the per-connection INPUT GATE: while a
-// writing frame's forgetful unit awaits raft (`WsConnState.gate_seq`),
-// newly-arriving frames for that connection queue instead of activating.
-// `flushWsGates` re-opens the gate once the seq committed AND the unit
-// was released (its reply frames are in `ws_send_in`), then dispatches
-// the queue in arrival order. Two guarantees fall out: replies on one
-// socket are in message order across the durability boundary, and frame
-// K+1 reads frame K's writes (it only activates post-commit — the
-// read-your-writes the DO input gate provides).
-
-/// Drain the conn-state index of any entry whose connection has died without
-/// a Close frame (abrupt client RST/EOF — the transport reaps the conn but
-/// emits no opcode-8 message). Fire `onDisconnect` on each orphaned chain,
-/// then tear it down. Cheap when the map is empty (one length check). Run at
-/// the top of `serviceWsMessages` so a dead idle conn doesn't leak its chain.
-fn sweepStaleWsChains(worker: anytype) void {
-    if (worker.ws_conns.count() == 0) return;
-    const server = worker.h2;
-    // Collect stale conns first — can't mutate the map mid-iteration.
-    var stale: [128]rove.Entity = undefined;
-    var n: usize = 0;
-    {
-        var it = worker.ws_conns.iterator();
-        while (it.next()) |entry| {
-            if (n >= stale.len) break;
-            if (server.reg.isStale(entry.key_ptr.*)) {
-                stale[n] = entry.key_ptr.*;
-                n += 1;
-            }
-        }
-    }
-    for (stale[0..n]) |conn_ent| {
-        if (worker.ws_conns.get(conn_ent)) |st| {
-            fireWsDisconnect(worker, st.chain);
-        }
-        tearDownWsChain(worker, conn_ent);
-    }
-}
-
-/// Destroy a held WS chain entity + drop its conn-state entry (freeing any
-/// gated frames still queued — the socket is closing; they can never be
-/// replied to). Idempotent — a no-op when the conn isn't mapped. The
-/// entity's `ChainContext` / `StreamChain` owned slices free via component
-/// deinit on destroy.
-fn tearDownWsChain(worker: anytype, conn_ent: rove.Entity) void {
-    const st = worker.ws_conns.getPtr(conn_ent) orelse return;
-    for (st.queue.items) |f| {
-        if (f.payload.len > 0) worker.allocator.free(f.payload);
-    }
-    st.queue.deinit(worker.allocator);
-    worker.h2.reg.destroy(st.chain) catch {};
-    _ = worker.ws_conns.remove(conn_ent);
-}
-
-/// Establish the held chain for a new WS connection on its first inbound
-/// frame: resolve the tenant (from the upgrade Host) + handler module (from
-/// the upgrade path), mint a per-connection correlation id, create the parked
-/// continuation entity carrying the chain identity, and index it by conn.
-/// Returns the chain entity, or an error if routing/tenant/module can't be
-/// resolved (the caller closes the socket).
-fn establishWsChain(worker: anytype, conn_ent: rove.Entity) !rove.Entity {
-    const allocator = worker.allocator;
-    const server = worker.h2;
-    const routing = server.wsConnRouting(conn_ent) orelse return error.WsConnGone;
-    const host = worker_mod.hostOnly(routing.authority);
-    const inst = (worker.node.tenant.resolveDomain(host) catch return error.WsResolveFailed) orelse
-        return error.WsNoTenant;
-
-    var route = router_mod.resolveRoute(allocator, routing.path) catch return error.WsRouteFailed;
-    defer route.deinit();
-
-    // Validate the module resolves to a deployment + bytecode now (and
-    // capture deployment_id for the chain). Each frame re-pins via
-    // `resolveDeployment` so this is a fail-fast + identity stamp.
-    var dep = try resolveDeployment(worker, allocator, inst.id, route.module_base);
-    defer dep.tc.release();
-
-    // Per-connection correlation id (16-hex of a fresh request_id), stable
-    // across the connection's frames — mirrors the inbound mint.
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
-    var corr_buf: [16]u8 = undefined;
-    const corr = std.fmt.bufPrint(&corr_buf, "{x:0>16}", .{request_id}) catch unreachable;
-
-    const ent = try server.reg.create(&worker.parked_continuations);
-    errdefer server.reg.destroy(ent) catch {};
-    try server.reg.set(ent, &worker.parked_continuations, h2.Session, .{ .entity = conn_ent });
-    // Each dup's errdefer is block-scoped so it fires ONLY if the `set` that
-    // transfers ownership into the entity component fails. Once `set` succeeds
-    // and the block exits normally, the dup is owned by the component (freed by
-    // the entity-destroy errdefer above via the component's deinit) — no
-    // double-free on a later failure (`put`, etc.).
-    {
-        const tid_dup = try allocator.dupe(u8, inst.id);
-        errdefer allocator.free(tid_dup);
-        const corr_dup = try allocator.dupe(u8, corr);
-        errdefer allocator.free(corr_dup);
-        try server.reg.set(ent, &worker.parked_continuations, components_mod.ChainContext, .{
-            .tenant_id = tid_dup,
-            .correlation_id = corr_dup,
-            .deployment_id = dep.tc.snap.deployment_id,
-        });
-    }
-    {
-        const mod_dup = try allocator.dupe(u8, route.module_base);
-        errdefer allocator.free(mod_dup);
-        const ctx_dup = try allocator.dupe(u8, "{}");
-        errdefer allocator.free(ctx_dup);
-        try server.reg.set(ent, &worker.parked_continuations, components_mod.StreamChain, .{
-            .module_path = mod_dup,
-            .ctx_json = ctx_dup,
-            .activation_count = 0,
-        });
-    }
-    // A WS chain is a parked continuation that waits on the NEXT FRAME — not a
-    // §6.4 deadline and not an `on.*` wake. `sweepParkedContinuations` treats
-    // any entry with `now_ns >= deadline_ns` as deadline-expired, so set the
-    // deadline to "never" (the default 0 would tear the chain down on the very
-    // next tick). The default `StreamWakes` (interval_ms 0, empty ring) already
-    // makes it non-wake-due, so the sweep skips WS chains entirely; frame
-    // arrival (`serviceWsMessages`) is their only resume source.
-    try server.reg.set(ent, &worker.parked_continuations, components_mod.ContDescriptor, .{
-        .deadline_ns = std.math.maxInt(i64),
-    });
-    try worker.ws_conns.put(allocator, conn_ent, .{ .chain = ent });
-    return ent;
-}
-
-/// Arm the §4.5 input gate: `seq` is the writing frame's forgetful-unit
-/// propose; frames arriving for this connection queue until it resolves.
-/// The deadline mirrors the unit's own `commit_wait_timeout_ns` so a unit
-/// reaped without advancing either watermark (leadership-loss sweep)
-/// can't wedge the connection.
-fn armWsGate(worker: anytype, conn_ent: rove.Entity, tenant_id: []const u8, seq: u64) void {
-    const st = worker.ws_conns.getPtr(conn_ent) orelse return;
-    st.gate_seq = seq;
-    st.gate_gid = worker.raft.gidForTenant(tenant_id) orelse 0;
-    st.gate_deadline_ns = @as(i64, @intCast(std.time.nanoTimestamp())) +
-        @as(i64, @intCast(worker.commit_wait_timeout_ns));
-}
-
-/// True while any forgetful `ParkedUnit` still holds `seq` — i.e. the
-/// drain hasn't released (or has Conflict-deferred) that propose's
-/// buffered Cmds yet. The gate must wait for the UNIT, not just the
-/// commit watermark: `committedSeq` advances on the pump thread, so it
-/// can lead the drain within a tick — opening the gate on the watermark
-/// alone would let a queued frame's inline reply ship before the gated
-/// frame's commit-released reply frames reach `ws_send_in`. A destroyed-
-/// but-unflushed unit still shows in the column (deferred destroy) —
-/// that errs one tick conservative, never early.
-fn parkedUnitHoldsSeq(worker: anytype, seq: u64) bool {
-    for (worker.parked_units.column(worker_mod.ParkedUnit)) |*u| {
-        if (u.seq == seq) return true;
-    }
-    return false;
-}
-
-/// §4.5 input-gate pump, run once per tick (after `drainRaftPending` in
-/// the worker tick, so a commit observed here has already released its
-/// unit's reply frames). For each gated connection: fault/timeout →
-/// Close + teardown (the gated write's replies were discarded — the
-/// connection can't be resumed honestly); committed + unit released →
-/// open the gate and dispatch the queued frames in arrival order until
-/// either the queue drains or a writing frame re-arms the gate.
-fn flushWsGates(worker: anytype) void {
-    if (worker.ws_conns.count() == 0) return;
-    var pending: [128]rove.Entity = undefined;
-    var n: usize = 0;
-    {
-        var it = worker.ws_conns.iterator();
-        while (it.next()) |entry| {
-            if (n >= pending.len) break;
-            if (entry.value_ptr.gate_seq == 0 and entry.value_ptr.queue.items.len == 0) continue;
-            pending[n] = entry.key_ptr.*;
-            n += 1;
-        }
-    }
-    if (n == 0) return;
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    outer: for (pending[0..n]) |conn_ent| {
-        var st = worker.ws_conns.getPtr(conn_ent) orelse continue;
-        if (st.gate_seq != 0) {
-            const committed = worker.raft.committedSeq(st.gate_gid);
-            const faulted = worker.raft.faultedSeq(st.gate_gid);
-            if (faulted >= st.gate_seq or now_ns >= st.gate_deadline_ns) {
-                std.log.warn("rove-js ws: gated seq={d} faulted/timed out; closing conn", .{st.gate_seq});
-                effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
-                tearDownWsChain(worker, conn_ent);
-                continue;
-            }
-            if (committed < st.gate_seq or parkedUnitHoldsSeq(worker, st.gate_seq)) continue;
-            st.gate_seq = 0;
-            st.gate_gid = 0;
-            st.gate_deadline_ns = 0;
-        }
-        while (st.queue.items.len != 0) {
-            const f = st.queue.orderedRemove(0);
-            defer if (f.payload.len > 0) worker.allocator.free(f.payload);
-            if (worker.h2.reg.isStale(conn_ent)) {
-                // Conn died while frames were queued — replies are
-                // undeliverable; the next sweep would fire onDisconnect,
-                // but the chain is right here: do it now.
-                fireWsDisconnect(worker, st.chain);
-                tearDownWsChain(worker, conn_ent);
-                continue :outer;
-            }
-            if (f.opcode == 8) {
-                fireWsDisconnect(worker, st.chain);
-                tearDownWsChain(worker, conn_ent);
-                continue :outer;
-            }
-            fireWsMessage(worker, st.chain, conn_ent, f.opcode, f.payload);
-            // fireWsMessage may have torn the chain down (terminal /
-            // error) or re-armed the gate (writing frame) — re-resolve.
-            st = worker.ws_conns.getPtr(conn_ent) orelse continue :outer;
-            if (st.gate_seq != 0) continue :outer;
-        }
-    }
-}
-
-/// Drain `ws_message_out` once per tick: dispatch each inbound WS data frame
-/// to the held chain's `onMessage`, route a client close (opcode 8) to
-/// `onDisconnect`, and reap chains whose conn vanished. Gated by `count()==0`
-/// so the no-WS hot path pays nothing.
-pub fn serviceWsMessages(worker: anytype) !void {
-    sweepStaleWsChains(worker);
-    flushWsGates(worker);
-
-    const server = worker.h2;
-    if (server.ws_message_out.entitySlice().len == 0) return;
-
-    // Snapshot (ment, conn, opcode, payload) up front — processing creates /
-    // destroys entities, so the columns aren't stable across the loop. The
-    // payload borrows `ReqBody.data`, valid until `ment` is destroyed; destroy
-    // is queued (flushed after this fn) so the borrow holds for the whole loop.
-    const Pending = struct { ment: rove.Entity, conn: rove.Entity, opcode: u8, payload: []const u8 };
-    var buf: [256]Pending = undefined;
-    var n: usize = 0;
-    {
-        const ents = server.ws_message_out.entitySlice();
-        const sessions = server.ws_message_out.column(h2.Session);
-        const metas = server.ws_message_out.column(h2.WsMeta);
-        const bodies = server.ws_message_out.column(h2.ReqBody);
-        for (ents, sessions, metas, bodies) |ent, sess, meta, body| {
-            if (n >= buf.len) break;
-            const payload: []const u8 = if (body.data) |d| d[0..body.len] else &.{};
-            buf[n] = .{ .ment = ent, .conn = sess.entity, .opcode = meta.opcode, .payload = payload };
-            n += 1;
-        }
-    }
-
-    for (buf[0..n]) |p| {
-        if (server.reg.isStale(p.conn)) {
-            // Conn already gone — reap any chain (no onDisconnect: the socket
-            // is dead, and an abrupt close is swept above). Drop the message.
-            tearDownWsChain(worker, p.conn);
-            server.reg.destroy(p.ment) catch {};
-            continue;
-        }
-        // §4.5 input gate: while a writing frame's commit is in flight (or
-        // earlier frames are still queued — order is sacred), this frame
-        // queues instead of activating. Opcode 8 queues too, so a close
-        // behind queued data frames fires onDisconnect only after they run.
-        if (worker.ws_conns.getPtr(p.conn)) |st| {
-            if (st.gate_seq != 0 or st.queue.items.len != 0) {
-                const copy: []u8 = if (p.payload.len > 0)
-                    worker.allocator.dupe(u8, p.payload) catch {
-                        // OOM on the queue copy — can't preserve order, so
-                        // fail the connection loudly rather than drop a frame.
-                        effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = p.conn, .opcode = 8, .bytes = &.{} }) catch {};
-                        tearDownWsChain(worker, p.conn);
-                        server.reg.destroy(p.ment) catch {};
-                        continue;
-                    }
-                else
-                    &.{};
-                st.queue.append(worker.allocator, .{ .opcode = p.opcode, .payload = copy }) catch {
-                    if (copy.len > 0) worker.allocator.free(copy);
-                    effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = p.conn, .opcode = 8, .bytes = &.{} }) catch {};
-                    tearDownWsChain(worker, p.conn);
-                };
-                server.reg.destroy(p.ment) catch {};
-                continue;
-            }
-        }
-        if (p.opcode == 8) {
-            // Client close → onDisconnect (best-effort), then tear down.
-            if (worker.ws_conns.get(p.conn)) |st| {
-                fireWsDisconnect(worker, st.chain);
-            }
-            tearDownWsChain(worker, p.conn);
-            server.reg.destroy(p.ment) catch {};
-            continue;
-        }
-        // Data frame (text/binary) → find-or-establish the chain, run onMessage.
-        const chain_ent = if (worker.ws_conns.get(p.conn)) |st|
-            st.chain
-        else
-            establishWsChain(worker, p.conn) catch |err| {
-                std.log.warn("rove-js ws: establish chain failed: {s}; closing conn", .{@errorName(err)});
-                // Couldn't bind a tenant/module — send a Close so the client
-                // sees a clean shutdown rather than a hang.
-                effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = p.conn, .opcode = 8, .bytes = &.{} }) catch {};
-                server.reg.destroy(p.ment) catch {};
-                continue;
-            };
-        fireWsMessage(worker, chain_ent, p.conn, p.opcode, p.payload);
-        server.reg.destroy(p.ment) catch {};
-    }
-}
-
-/// Run one inbound WS frame's `onMessage` activation against the held chain.
-/// Structural sibling of `fireDisconnectActivation` — reads the chain identity
-/// off `parked_continuations`, re-pins the deployment, synthesizes a `{ctx}`
-/// request with the `.ws_message` activation (opcode + data surface as
-/// `request.activation`), runs the handler, then ships its `stream.write`
-/// frames to `ws_send_in` (inline if read-only, commit-gated if it wrote).
-/// `next()` keeps the chain parked (threading the new ctx); a terminal return
-/// closes the socket + tears the chain down.
-fn fireWsMessage(
-    worker: anytype,
-    chain_ent: rove.Entity,
-    conn_ent: rove.Entity,
-    opcode: u8,
-    payload: []const u8,
-) void {
-    const allocator = worker.allocator;
-    const server = worker.h2;
-    const chain_ctx = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.ChainContext) catch return;
-    const chain_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamChain) catch return;
-
-    const path = chain_st.module_path;
-    var dep = resolveDeployment(worker, allocator, chain_ctx.tenant_id, path) catch |err| {
-        std.log.warn("rove-js ws-message: tenant={s} resolveDeployment failed: {s}; closing", .{ chain_ctx.tenant_id, @errorName(err) });
-        effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
-        tearDownWsChain(worker, conn_ent);
-        return;
-    };
-    defer dep.tc.release();
-    const inst = dep.inst;
-    const tc = dep.tc;
-    const bc = dep.bc;
-
-    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json}) catch return;
-    defer allocator.free(body);
-    const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
-    defer allocator.free(spath);
-
-    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
-    var txn_owned = true;
-    defer if (txn_owned) allocator.destroy(txn);
-    txn.* = inst.kv.beginTrackedImmediate() catch return;
-    var txn_done = false;
-    defer if (!txn_done) txn.rollback() catch {};
-
-    var ws = kv_mod.WriteSet.init(allocator);
-    defer ws.deinit();
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
-    defer readset.deinit();
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
-    // `stream.write` accumulators (bytes + parallel opcode), wired so the
-    // handler's frames are captured for lowering to `ws_send_in`.
-    var stream_chunks: std.ArrayListUnmanaged([]u8) = .empty;
-    defer {
-        for (stream_chunks.items) |ch| allocator.free(ch);
-        stream_chunks.deinit(allocator);
-    }
-    var chunk_opcodes: std.ArrayListUnmanaged(u8) = .empty;
-    defer chunk_opcodes.deinit(allocator);
-
-    const request: Request = .{
-        .method = "POST",
-        .path = spath,
-        .body = body,
-        .query = null,
-        .activation = .{ .ws_message = .{ .opcode = opcode, .data = payload } },
-        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = chain_ctx.correlation_id },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
-        .admin = .{ .platform = inst.platform },
-        .effects = .{
-            .pending_stream_chunks = &stream_chunks,
-            .pending_stream_chunk_opcodes = &chunk_opcodes,
-        },
-    };
-    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        tc.snap.triggers,
-        request,
-        &budget,
-    ) catch {
-        txn.rollback() catch {};
-        txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .ws_message, 0);
-        effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
-        tearDownWsChain(worker, conn_ent);
-        return;
-    };
-
-    var oc = run_oc;
-    switch (oc) {
-        .terminal => |*r| {
-            defer r.deinit(allocator);
-            if (r.exception.len > 0) {
-                txn.rollback() catch {};
-                txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, .ws_message, 0);
-                r.console = &.{};
-                r.exception = &.{};
-                effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
-                tearDownWsChain(worker, conn_ent);
-                return;
-            }
-            const lh: log_mod.LogHeader = wsLogHeader(request_id, tc.snap.deployment_id, @intCast(@max(@min(r.status, 599), 100)), path, chain_ctx.correlation_id);
-            const fw_seq = shipWsFrames(worker, conn_ent, &stream_chunks, &chunk_opcodes, &ws, txn, &txn_owned, chain_ctx.tenant_id, &readset, lh, true) catch |perr| {
-                std.log.warn("rove-js ws-message (terminal+writes): propose failed: {s}", .{@errorName(perr)});
-                txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .ws_message, 0);
-                tearDownWsChain(worker, conn_ent);
-                return;
-            };
-            txn_done = true;
-            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .ws_message, fw_seq);
-            r.console = &.{};
-            r.exception = &.{};
-            tearDownWsChain(worker, conn_ent);
-        },
-        .continuation => |*cval| {
-            const lh: log_mod.LogHeader = wsLogHeader(request_id, tc.snap.deployment_id, 200, path, chain_ctx.correlation_id);
-            const fw_seq = shipWsFrames(worker, conn_ent, &stream_chunks, &chunk_opcodes, &ws, txn, &txn_owned, chain_ctx.tenant_id, &readset, lh, false) catch |perr| {
-                std.log.warn("rove-js ws-message (next+writes): propose failed: {s}", .{@errorName(perr)});
-                txn_done = true;
-                cval.deinit(allocator);
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .ws_message, 0);
-                effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
-                tearDownWsChain(worker, conn_ent);
-                return;
-            };
-            txn_done = true;
-            // next(): keep the chain parked; thread the new ctx forward.
-            if (chain_st.ctx_json.len > 0) allocator.free(chain_st.ctx_json);
-            chain_st.ctx_json = cval.ctx_json;
-            cval.ctx_json = &.{};
-            chain_st.activation_count += 1;
-            cval.deinit(allocator);
-            // §4.5 input gate: this frame's output is commit-gated (real
-            // writes, or the read-only speculation barrier) — close the
-            // gate so later frames queue behind it in arrival order.
-            if (fw_seq != 0) armWsGate(worker, conn_ent, chain_ctx.tenant_id, fw_seq);
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .ws_message, fw_seq);
-        },
-        .stream => |*s2| {
-            // A streamed-response descriptor from a WS frame is out of scope
-            // (the connection IS the stream): roll back, close, tear down.
-            s2.deinit(allocator);
-            txn.rollback() catch {};
-            txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .ws_message, 0);
-            effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
-            tearDownWsChain(worker, conn_ent);
-        },
-    }
-}
-
-/// Build the per-activation LogHeader for a ws_message hop (the WS analog of
-/// the inline `LogHeader` literals in `resumeStream` / `fireDisconnect`).
-fn wsLogHeader(request_id: u64, deployment_id: u64, status: u16, path: []const u8, corr: ?[]const u8) log_mod.LogHeader {
-    return .{
-        .request_id = request_id,
-        .deployment_id = deployment_id,
-        .duration_ns = 0,
-        .status = status,
-        .outcome = .ok,
-        .activation = .ws_message,
-        .method = "POST",
-        .path = path,
-        .host = "",
-        .correlation_id = corr orelse "",
-    };
-}
-
-/// Ship the frames an `onMessage` produced to `ws_send_in`. Read-only frames
-/// emit inline (committed now). A writing frame stages its frames (+ a
-/// trailing Close when `close`) as commit-gated `ws_send` Cmds via
-/// `proposeForgetfulWrites`, so they reach the wire only after the writeset
-/// commits (batch-of-1 durability). Consumes both lists; on the write path
-/// transfers the txn to the parked unit (clears `txn_owned`). Returns the
-/// propose seq (0 on the read-only path).
-fn shipWsFrames(
-    worker: anytype,
-    conn_ent: rove.Entity,
-    chunks: *std.ArrayListUnmanaged([]u8),
-    opcodes: *std.ArrayListUnmanaged(u8),
-    writeset: *const kv_mod.WriteSet,
-    txn: *kv_mod.KvStore.TrackedTxn,
-    txn_owned: *bool,
-    tenant_id: []const u8,
-    readset: *const tape_mod.Readset,
-    log_header: log_mod.LogHeader,
-    close: bool,
-) !u64 {
-    const allocator = worker.allocator;
-    if (writeset.ops.items.len == 0) {
-        // Read-only frame: try the inline fast path — commit now, emit now.
-        // `Conflict` here is kvexp `NotChainHead`: the txn READ a chain
-        // predecessor's still-uncommitted overlay (`saw_speculation`), so
-        // the frames were computed on un-durable state. That is the
-        // idiom-0 read-side hazard (worker_dispatch.zig:707) in WS form —
-        // fall through to the commit-gated path below, which proposes an
-        // empty-writeset BARRIER and ships the frames only once the chain
-        // commits. Reachable only when the txn was opened on a read that
-        // crossed an in-flight write from another producer (the §4.5
-        // input gate already serializes this connection's own writes).
-        if (txn.commit()) |_| {
-            for (chunks.items, 0..) |bytes, i| {
-                const op: u8 = if (i < opcodes.items.len) opcodes.items[i] else 1;
-                effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = op, .bytes = bytes }) catch {
-                    if (bytes.len > 0) allocator.free(bytes);
-                };
-            }
-            chunks.clearRetainingCapacity(); // ownership transferred (or freed on error)
-            opcodes.clearRetainingCapacity();
-            if (close) {
-                effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
-            }
-            return 0;
-        } else |e| switch (e) {
-            error.Conflict => {}, // speculation barrier below
-            else => panic_mod.invariantViolated(
-                "fireWsMessage.commit(read-only)",
-                "err={s}",
-                .{@errorName(e)},
-            ),
-        }
-    }
-    // Commit-gated path: real writes, or the read-only speculation barrier.
-    var stage: StreamResumeStage = .{
-        .entity = rove.Entity.nil,
-        .ws_conn = conn_ent,
-        .mark_draining = close,
-    };
-    stage.chunks = chunks.*;
-    chunks.* = .empty;
-    stage.ws_opcodes = opcodes.*;
-    opcodes.* = .empty;
-    defer {
-        for (stage.chunks.items) |c| allocator.free(c);
-        stage.chunks.deinit(allocator);
-        stage.ws_opcodes.deinit(allocator);
-    }
-    const seq = proposeForgetfulWrites(worker, writeset, txn, tenant_id, &stage, readset, log_header) catch |err| {
-        txn_owned.* = false; // helper rolled back + destroyed the txn
-        return err;
-    };
-    txn_owned.* = false;
-    return seq;
-}
-
-/// Run an `onDisconnect` activation for a held WS chain (client close or conn
-/// death). Mirrors `fireDisconnectActivation` but reads the chain off
-/// `parked_continuations` and never ships output (the socket is gone / the
-/// transport already echoed the Close). Writes commit asynchronously via
-/// `proposeForgetfulWrites` so cleanup side effects still land. The caller
-/// tears the chain down afterward.
-fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
-    const allocator = worker.allocator;
-    const server = worker.h2;
-    const chain_ctx = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.ChainContext) catch return;
-    const chain_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamChain) catch return;
-
-    const path = chain_st.module_path;
-    var dep = resolveDeployment(worker, allocator, chain_ctx.tenant_id, path) catch |err| {
-        std.log.warn("rove-js ws-disconnect: tenant={s} resolveDeployment failed: {s}; skipping", .{ chain_ctx.tenant_id, @errorName(err) });
-        return;
-    };
-    defer dep.tc.release();
-    const inst = dep.inst;
-    const tc = dep.tc;
-    const bc = dep.bc;
-
-    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json}) catch return;
-    defer allocator.free(body);
-    const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
-    defer allocator.free(spath);
-
-    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
-    var txn_owned = true;
-    defer if (txn_owned) allocator.destroy(txn);
-    txn.* = inst.kv.beginTrackedImmediate() catch return;
-    var txn_done = false;
-    defer if (!txn_done) txn.rollback() catch {};
-
-    var ws = kv_mod.WriteSet.init(allocator);
-    defer ws.deinit();
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
-    defer readset.deinit();
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
-    const request: Request = .{
-        .method = "POST",
-        .path = spath,
-        .body = body,
-        .query = null,
-        .activation = .disconnect,
-        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = chain_ctx.correlation_id },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
-        .admin = .{ .platform = inst.platform },
-    };
-    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        tc.snap.triggers,
-        request,
-        &budget,
-    ) catch {
-        txn.rollback() catch {};
-        txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
-        return;
-    };
-
-    const wrote = ws.ops.items.len > 0;
-    var oc = run_oc;
-    // The handler's return shape is moot — the socket is gone. Deinit
-    // whatever it produced; commit any writes (async, nobody waits).
-    switch (oc) {
-        .terminal => |*r| r.deinit(allocator),
-        .continuation => |*cval| cval.deinit(allocator),
-        .stream => |*s2| s2.deinit(allocator),
-    }
-    if (wrote) {
-        const lh = wsLogHeader(request_id, tc.snap.deployment_id, 200, path, chain_ctx.correlation_id);
-        var lh_disc = lh;
-        lh_disc.activation = .disconnect;
-        _ = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, null, &readset, lh_disc) catch |perr| {
-            std.log.warn("rove-js ws-disconnect: propose failed: {s}", .{@errorName(perr)});
-            txn_owned = false;
-            txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
-            return;
-        };
-        txn_owned = false;
-        txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
-        return;
-    }
-    txn.commit() catch |e| switch (e) {
-        // kvexp NotChainHead: a read crossed an in-flight predecessor's
-        // overlay. onDisconnect ships nothing (the socket is gone), so a
-        // speculative read-only txn has nothing to gate — just roll it
-        // back; nothing durable is lost.
-        error.Conflict => txn.rollback() catch {},
-        else => panic_mod.invariantViolated(
-            "fireWsDisconnect.commit",
-            "err={s}",
-            .{@errorName(e)},
-        ),
-    };
-    txn_done = true;
-    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
+    // The handler's return shape is moot — the socket is closed
+    // (`.drop` on both non-terminal arms). Writes still commit
+    // asynchronously (Phase 4c) so observable side effects (kv
+    // state, `_send/owed/*`, §4.6 wakes) materialize.
+    runFire(worker, &p, request, .{
+        .act = .disconnect,
+        .site = "stream-disconnect",
+        .on_cont = .drop,
+        .on_stream = .drop,
+    }, path, chain_ctx.correlation_id, chain_ctx.tenant_id, "");
 }
 
 /// Source payload for a Gap 2.1 subscription_fire activation.
@@ -2175,17 +1642,8 @@ pub fn fireSubscriptionActivation(
     source: SubscriptionFireSource,
 ) void {
     const allocator = worker.allocator;
-    var dep = resolveDeployment(worker, allocator, tenant_id, module_path) catch |err| {
-        std.log.warn(
-            "rove-js subscription-fire: tenant={s} name={s} resolveDeployment failed: {s}; skipping",
-            .{ tenant_id, subscription_name, @errorName(err) },
-        );
-        return;
-    };
-    defer dep.tc.release();
-    const inst = dep.inst;
-    const tc = dep.tc;
-    const bc = dep.bc;
+    var p = firePrep(worker, tenant_id, module_path, "subscription-fire") orelse return;
+    defer p.deinit(allocator);
 
     // Subscription chains start fresh — empty ctx, fresh
     // correlation_id. (The handler can pass ctx forward via its
@@ -2195,23 +1653,6 @@ pub fn fireSubscriptionActivation(
     defer allocator.free(body);
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
     defer allocator.free(spath);
-
-    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
-    var txn_owned = true;
-    defer if (txn_owned) allocator.destroy(txn);
-    txn.* = inst.kv.beginTrackedImmediate() catch return;
-    var txn_done = false;
-    defer if (!txn_done) txn.rollback() catch {};
-
-    var ws = kv_mod.WriteSet.init(allocator);
-    defer ws.deinit();
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
-    defer readset.deinit();
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
 
     // Gap 2.1 Phase D: inject the `_boot_fired/<dep_id>` marker
     // into the handler's writeset BEFORE the handler runs. The
@@ -2223,14 +1664,14 @@ pub fn fireSubscriptionActivation(
     if (source == .boot) {
         var key_buf: [64]u8 = undefined;
         const marker_key = std.fmt.bufPrint(&key_buf, "_boot_fired/{d}", .{source.boot.deployment_id}) catch unreachable;
-        txn.put(marker_key, "fired") catch |err| {
+        p.txn.put(marker_key, "fired") catch |err| {
             std.log.warn(
                 "rove-js boot marker txn.put ({s}/{d}): {s}",
                 .{ tenant_id, source.boot.deployment_id, @errorName(err) },
             );
             return;
         };
-        ws.addPut(marker_key, "fired") catch |err| {
+        p.ws.addPut(marker_key, "fired") catch |err| {
             std.log.warn(
                 "rove-js boot marker ws.addPut ({s}/{d}): {s}",
                 .{ tenant_id, source.boot.deployment_id, @errorName(err) },
@@ -2248,7 +1689,7 @@ pub fn fireSubscriptionActivation(
     const corr_full = std.fmt.bufPrint(
         &corr_buf,
         "sub-{s}-{x:0>16}",
-        .{ subscription_name[0..name_prefix_len], request_id },
+        .{ subscription_name[0..name_prefix_len], p.request_id },
     ) catch corr_buf[0..0];
 
     // Named-export dispatch by trigger source (handler-shape.md §3,
@@ -2270,169 +1711,16 @@ pub fn fireSubscriptionActivation(
         .body = body,
         .query = query,
         .activation = .{ .subscription_fire = .{ .name = subscription_name, .source = source } },
-        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = corr_full },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
-        .admin = .{ .platform = inst.platform },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .admin = .{ .platform = p.dep.inst.platform },
     };
-
-    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        tc.snap.triggers,
-        req,
-        &budget,
-    ) catch {
-        txn.rollback() catch {};
-        txn_done = true;
-        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, corr_full, .subscription_fire, 0);
-        return;
-    };
-
-    const wrote = ws.ops.items.len > 0;
-    var oc = run_oc;
-    // Subscription chains have no held socket; non-terminal returns
-    // are deinit'd + recorded on the tape with a warning. Customers
-    // compose multi-hop via http.send({on_result:...}) instead.
-    switch (oc) {
-        .terminal => |*r| {
-            defer r.deinit(allocator);
-            if (r.exception.len > 0) {
-                txn.rollback() catch {};
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, corr_full, .subscription_fire, 0);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            if (wrote) {
-                const lh_sub_term: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = @intCast(@max(@min(r.status, 599), 100)),
-                    .outcome = .ok,
-                    .activation = .subscription_fire,
-                    .method = "POST",
-                    .path = module_path,
-                    .host = "",
-                    .correlation_id = corr_full,
-                };
-                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_sub_term) catch |perr| {
-                    std.log.warn("rove-js subscription-fire ({s}): propose failed: {s}", .{ subscription_name, @errorName(perr) });
-                    txn_owned = false;
-                    txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, corr_full, .subscription_fire, 0);
-                    r.console = &.{};
-                    r.exception = &.{};
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .subscription_fire, fw_seq);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "fireSubscriptionActivation.commit(terminal)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .subscription_fire, 0);
-            r.console = &.{};
-            r.exception = &.{};
-        },
-        .continuation => |*cval| {
-            // `__rove_next` from a subscription chain has no held
-            // socket to resume into. Recorded but ignored; writes
-            // (if any) still commit. Customers compose multi-step
-            // via http.send({on_result:...}) which routes its
-            // callback as a `send_callback` activation.
-            cval.deinit(allocator);
-            std.log.warn(
-                "rove-js subscription-fire ({s}): __rove_next from subscription origin is a no-op (v1)",
-                .{subscription_name},
-            );
-            if (wrote) {
-                const lh_sub_cont: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = 200,
-                    .outcome = .ok,
-                    .activation = .subscription_fire,
-                    .method = "POST",
-                    .path = module_path,
-                    .host = "",
-                    .correlation_id = corr_full,
-                };
-                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_sub_cont) catch |perr| {
-                    std.log.warn("rove-js subscription-fire ({s}) cont-return propose failed: {s}", .{ subscription_name, @errorName(perr) });
-                    txn_owned = false;
-                    txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .subscription_fire, 0);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire, fw_seq);
-                return;
-            }
-            txn.rollback() catch {};
-            txn_done = true;
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire, 0);
-        },
-        .stream => |*s2| {
-            // `__rove_stream` from a subscription chain — same as
-            // `__rove_next` above: no held socket, recorded but
-            // ignored; writes commit.
-            s2.deinit(allocator);
-            std.log.warn(
-                "rove-js subscription-fire ({s}): __rove_stream from subscription origin is a no-op (v1)",
-                .{subscription_name},
-            );
-            if (wrote) {
-                const lh_sub_stream: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = 200,
-                    .outcome = .ok,
-                    .activation = .subscription_fire,
-                    .method = "POST",
-                    .path = module_path,
-                    .host = "",
-                    .correlation_id = corr_full,
-                };
-                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_sub_stream) catch |perr| {
-                    std.log.warn("rove-js subscription-fire ({s}) stream-return propose failed: {s}", .{ subscription_name, @errorName(perr) });
-                    txn_owned = false;
-                    txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .subscription_fire, 0);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire, fw_seq);
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "fireSubscriptionActivation.commit(stream)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .subscription_fire, 0);
-        },
-    }
+    runFire(worker, &p, req, .{
+        .act = .subscription_fire,
+        .site = "subscription-fire",
+        .on_cont = .warn,
+        .on_stream = .warn,
+    }, module_path, corr_full, subscription_name, "");
 }
 
 /// §2.6 durable-wake (P1): fire the baked `__system/scheduler_tick`
@@ -2455,44 +1743,16 @@ pub fn fireSubscriptionActivation(
 pub fn fireSchedulerTick(worker: anytype, tenant_id: []const u8) void {
     const allocator = worker.allocator;
     const module_path = "__system/scheduler_tick";
-
-    var dep = resolveDeployment(worker, allocator, tenant_id, module_path) catch |err| {
-        std.log.warn(
-            "rove-js scheduler_tick: tenant={s} resolveDeployment failed: {s}; skipping",
-            .{ tenant_id, @errorName(err) },
-        );
-        return;
-    };
-    defer dep.tc.release();
-    const inst = dep.inst;
-    const tc = dep.tc;
-    const bc = dep.bc;
-    const slot = dep.tc.slot;
+    var p = firePrep(worker, tenant_id, module_path, "scheduler_tick") orelse return;
+    defer p.deinit(allocator);
 
     const body = allocator.dupe(u8, "{\"ctx\":{}}") catch return;
     defer allocator.free(body);
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
     defer allocator.free(spath);
 
-    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
-    var txn_owned = true;
-    defer if (txn_owned) allocator.destroy(txn);
-    txn.* = inst.kv.beginTrackedImmediate() catch return;
-    var txn_done = false;
-    defer if (!txn_done) txn.rollback() catch {};
-
-    var ws = kv_mod.WriteSet.init(allocator);
-    defer ws.deinit();
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
-    defer readset.deinit();
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
-
     var corr_buf: [48]u8 = undefined;
-    const corr_full = std.fmt.bufPrint(&corr_buf, "sched-{x:0>16}", .{request_id}) catch corr_buf[0..0];
+    const corr_full = std.fmt.bufPrint(&corr_buf, "sched-{x:0>16}", .{p.request_id}) catch corr_buf[0..0];
 
     const req: Request = .{
         .method = "POST",
@@ -2501,100 +1761,24 @@ pub fn fireSchedulerTick(worker: anytype, tenant_id: []const u8) void {
         .query = null,
         .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
         .activation = .{ .subscription_fire = .{ .name = "__scheduler_tick", .source = null } },
-        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = corr_full },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
-        .admin = .{ .platform = inst.platform },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .admin = .{ .platform = p.dep.inst.platform },
         .trampolines = .{
             .set_wake = &deployment_cache.TenantSlot.setWakeTrampoline,
-            .set_wake_ctx = @ptrCast(slot),
+            .set_wake_ctx = @ptrCast(p.dep.tc.slot),
             .fire_wake = &@TypeOf(worker.*).fireWakeTrampoline,
             .fire_wake_ctx = @ptrCast(worker),
         },
     };
-
-    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        tc.snap.triggers,
-        req,
-        &budget,
-    ) catch {
-        txn.rollback() catch {};
-        txn_done = true;
-        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, corr_full, .subscription_fire, 0);
-        return;
-    };
-
-    const wrote = ws.ops.items.len > 0;
-    var oc = run_oc;
-    switch (oc) {
-        .terminal => |*r| {
-            defer r.deinit(allocator);
-            if (r.exception.len > 0) {
-                txn.rollback() catch {};
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, corr_full, .subscription_fire, 0);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            if (wrote) {
-                const lh: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = @intCast(@max(@min(r.status, 599), 100)),
-                    .outcome = .ok,
-                    .activation = .subscription_fire,
-                    .method = "POST",
-                    .path = module_path,
-                    .host = "",
-                    .correlation_id = corr_full,
-                };
-                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh) catch |perr| {
-                    std.log.warn("rove-js scheduler_tick ({s}): propose failed: {s}", .{ tenant_id, @errorName(perr) });
-                    txn_owned = false;
-                    txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, corr_full, .subscription_fire, 0);
-                    r.console = &.{};
-                    r.exception = &.{};
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, r.console, r.exception, .{}, corr_full, .subscription_fire, fw_seq);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "fireSchedulerTick.commit(terminal)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, r.console, r.exception, .{}, corr_full, .subscription_fire, 0);
-            r.console = &.{};
-            r.exception = &.{};
-        },
-        .continuation => |*cval| {
-            cval.deinit(allocator);
-            std.log.warn("rove-js scheduler_tick ({s}): unexpected __rove_next return (no-op)", .{tenant_id});
-            txn.rollback() catch {};
-            txn_done = true;
-        },
-        .stream => |*s2| {
-            s2.deinit(allocator);
-            std.log.warn("rove-js scheduler_tick ({s}): unexpected __rove_stream return (no-op)", .{tenant_id});
-            txn.rollback() catch {};
-            txn_done = true;
-        },
-    }
+    // `scheduler_tick` is our own module and always returns terminal;
+    // a continuation/stream return is a bug (`.rollback_silent`).
+    runFire(worker, &p, req, .{
+        .act = .subscription_fire,
+        .site = "scheduler_tick",
+        .on_cont = .rollback_silent,
+        .on_stream = .rollback_silent,
+    }, module_path, corr_full, tenant_id, "");
 }
 
 /// §2.6 durable-wake (P1): dispatch one due `_sched/by_time` entry's
@@ -2616,18 +1800,8 @@ fn fireDurableWakeActivation(worker: anytype, dw: *effect_mod.msg.DurableWake) v
     const allocator = worker.allocator;
     const tenant_id = dw.tenant_id;
     const module_path = dw.module_path;
-
-    var dep = resolveDeployment(worker, allocator, tenant_id, module_path) catch |err| {
-        std.log.warn(
-            "rove-js durable-wake: tenant={s} target={s} resolveDeployment failed: {s}; skipping",
-            .{ tenant_id, module_path, @errorName(err) },
-        );
-        return;
-    };
-    defer dep.tc.release();
-    const inst = dep.inst;
-    const tc = dep.tc;
-    const bc = dep.bc;
+    var p = firePrep(worker, tenant_id, module_path, "durable-wake") orelse return;
+    defer p.deinit(allocator);
 
     // The customer target reads `request.activation.msg`; also surface
     // the msg as `request.body = {"ctx": <msg>}` for uniformity with
@@ -2637,31 +1811,17 @@ fn fireDurableWakeActivation(worker: anytype, dw: *effect_mod.msg.DurableWake) v
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
     defer allocator.free(spath);
 
-    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
-    var txn_owned = true;
-    defer if (txn_owned) allocator.destroy(txn);
-    txn.* = inst.kv.beginTrackedImmediate() catch return;
-    var txn_done = false;
-    defer if (!txn_done) txn.rollback() catch {};
-
-    var ws = kv_mod.WriteSet.init(allocator);
-    defer ws.deinit();
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
-    defer readset.deinit();
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
-
     // Inject the fired entry's `_sched/` deletes BEFORE the handler
     // runs — they commit atomically with the handler's effects.
+    // This is why the spec sets `always_propose`: the writeset is
+    // never empty, and even a continuation/stream return still
+    // proposes (the cleanup must land).
     for (dw.cleanup_keys) |k| {
-        txn.delete(k) catch |err| {
+        p.txn.delete(k) catch |err| {
             std.log.warn("rove-js durable-wake ({s}/{s}): cleanup txn.delete failed: {s}", .{ tenant_id, dw.id, @errorName(err) });
             return;
         };
-        ws.addDelete(k) catch |err| {
+        p.ws.addDelete(k) catch |err| {
             std.log.warn("rove-js durable-wake ({s}/{s}): cleanup ws.addDelete failed: {s}", .{ tenant_id, dw.id, @errorName(err) });
             return;
         };
@@ -2669,7 +1829,7 @@ fn fireDurableWakeActivation(worker: anytype, dw: *effect_mod.msg.DurableWake) v
 
     var corr_buf: [80]u8 = undefined;
     const id_prefix_len: usize = @min(dw.id.len, 32);
-    const corr_full = std.fmt.bufPrint(&corr_buf, "wake-{s}-{x:0>16}", .{ dw.id[0..id_prefix_len], request_id }) catch corr_buf[0..0];
+    const corr_full = std.fmt.bufPrint(&corr_buf, "wake-{s}-{x:0>16}", .{ dw.id[0..id_prefix_len], p.request_id }) catch corr_buf[0..0];
 
     const req: Request = .{
         .method = "POST",
@@ -2683,129 +1843,20 @@ fn fireDurableWakeActivation(worker: anytype, dw: *effect_mod.msg.DurableWake) v
             .scheduled_at_ns = dw.scheduled_at_ns,
             .msg_json = dw.msg_json,
         } },
-        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = corr_full },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
-        .admin = .{ .platform = inst.platform },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .admin = .{ .platform = p.dep.inst.platform },
     };
 
-    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        tc.snap.triggers,
-        req,
-        &budget,
-    ) catch {
-        txn.rollback() catch {};
-        txn_done = true;
-        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, corr_full, .durable_wake, 0);
-        return;
-    };
-
-    // `wrote` is always true (cleanup deletes were injected), so we
-    // always propose. A handler exception still rolls back — including
-    // the cleanup deletes — so the entry survives for a re-fire.
-    var oc = run_oc;
-    switch (oc) {
-        .terminal => |*r| {
-            defer r.deinit(allocator);
-            if (r.exception.len > 0) {
-                txn.rollback() catch {};
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, corr_full, .durable_wake, 0);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            const lh: log_mod.LogHeader = .{
-                .request_id = request_id,
-                .deployment_id = tc.snap.deployment_id,
-                .duration_ns = 0,
-                .status = @intCast(@max(@min(r.status, 599), 100)),
-                .outcome = .ok,
-                .activation = .durable_wake,
-                .method = "POST",
-                .path = module_path,
-                .host = "",
-                .correlation_id = corr_full,
-            };
-            const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh) catch |perr| {
-                std.log.warn("rove-js durable-wake ({s}/{s}): propose failed: {s}", .{ tenant_id, dw.id, @errorName(perr) });
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, corr_full, .durable_wake, 0);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            };
-            txn_owned = false;
-            txn_done = true;
-            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .durable_wake, fw_seq);
-            r.console = &.{};
-            r.exception = &.{};
-        },
-        .continuation => |*cval| {
-            // No held socket on a durable-wake origin; the cont is
-            // recorded but ignored (v1) — but the cleanup deletes
-            // still commit. Customers compose multi-step via
-            // webhook.send / a follow-up scheduler.at.
-            cval.deinit(allocator);
-            std.log.warn("rove-js durable-wake ({s}/{s}): __rove_next from wake origin is a no-op (v1)", .{ tenant_id, dw.id });
-            const lh: log_mod.LogHeader = .{
-                .request_id = request_id,
-                .deployment_id = tc.snap.deployment_id,
-                .duration_ns = 0,
-                .status = 200,
-                .outcome = .ok,
-                .activation = .durable_wake,
-                .method = "POST",
-                .path = module_path,
-                .host = "",
-                .correlation_id = corr_full,
-            };
-            const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh) catch |perr| {
-                std.log.warn("rove-js durable-wake ({s}/{s}) cont-return propose failed: {s}", .{ tenant_id, dw.id, @errorName(perr) });
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .durable_wake, 0);
-                return;
-            };
-            txn_owned = false;
-            txn_done = true;
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .durable_wake, fw_seq);
-        },
-        .stream => |*s2| {
-            s2.deinit(allocator);
-            std.log.warn("rove-js durable-wake ({s}/{s}): __rove_stream from wake origin is a no-op (v1)", .{ tenant_id, dw.id });
-            const lh: log_mod.LogHeader = .{
-                .request_id = request_id,
-                .deployment_id = tc.snap.deployment_id,
-                .duration_ns = 0,
-                .status = 200,
-                .outcome = .ok,
-                .activation = .durable_wake,
-                .method = "POST",
-                .path = module_path,
-                .host = "",
-                .correlation_id = corr_full,
-            };
-            const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh) catch |perr| {
-                std.log.warn("rove-js durable-wake ({s}/{s}) stream-return propose failed: {s}", .{ tenant_id, dw.id, @errorName(perr) });
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .durable_wake, 0);
-                return;
-            };
-            txn_owned = false;
-            txn_done = true;
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .durable_wake, fw_seq);
-        },
-    }
+    var label_buf: [160]u8 = undefined;
+    const label = std.fmt.bufPrint(&label_buf, "{s}/{s}", .{ tenant_id, dw.id }) catch tenant_id;
+    runFire(worker, &p, req, .{
+        .act = .durable_wake,
+        .site = "durable-wake",
+        .on_cont = .warn,
+        .on_stream = .warn,
+        .always_propose = true,
+    }, module_path, corr_full, label, "");
 }
 
 /// Phase 5 PR-2: dispatch a chained handler activation produced by
@@ -2839,41 +1890,14 @@ fn fireChainedActivation(
     const allocator = worker.allocator;
     const tenant_id = sc.tenant_id;
     const module_path = sc.module_path;
-
-    var dep = resolveDeployment(worker, allocator, tenant_id, module_path) catch |err| {
-        std.log.warn(
-            "rove-js chained-dispatch: tenant={s} module={s} resolveDeployment failed: {s}; skipping",
-            .{ tenant_id, module_path, @errorName(err) },
-        );
-        return;
-    };
-    defer dep.tc.release();
-    const inst = dep.inst;
-    const tc = dep.tc;
-    const bc = dep.bc;
+    var p = firePrep(worker, tenant_id, module_path, "chained-dispatch") orelse return;
+    defer p.deinit(allocator);
 
     const ctx_src: []const u8 = if (sc.ctx_json.len > 0) sc.ctx_json else "null";
     const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{ctx_src}) catch return;
     defer allocator.free(body);
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
     defer allocator.free(spath);
-
-    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
-    var txn_owned = true;
-    defer if (txn_owned) allocator.destroy(txn);
-    txn.* = inst.kv.beginTrackedImmediate() catch return;
-    var txn_done = false;
-    defer if (!txn_done) txn.rollback() catch {};
-
-    var ws = kv_mod.WriteSet.init(allocator);
-    defer ws.deinit();
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
-    defer readset.deinit();
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
 
     // Inherit correlation_id when the cont carried one (chained from
     // a fetch handler — preserves the parent fetch's chain identity).
@@ -2883,7 +1907,7 @@ fn fireChainedActivation(
     const corr_full: []const u8 = if (sc.correlation_id) |c|
         c
     else
-        std.fmt.bufPrint(&corr_buf, "chain-{x:0>16}", .{request_id}) catch corr_buf[0..0];
+        std.fmt.bufPrint(&corr_buf, "chain-{x:0>16}", .{p.request_id}) catch corr_buf[0..0];
 
     // Build the synthetic query for the named-export case (the
     // `?fn=<name>` shape inherited from the original Phase-5-retired
@@ -2902,178 +1926,20 @@ fn fireChainedActivation(
         .query = query_opt,
         .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
         .activation = .send_callback,
-        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = corr_full },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
-        .admin = .{ .platform = inst.platform },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .admin = .{ .platform = p.dep.inst.platform },
     };
-
-    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        tc.snap.triggers,
-        req,
-        &budget,
-    ) catch {
-        txn.rollback() catch {};
-        txn_done = true;
-        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, corr_full, .send_callback, 0);
-        return;
-    };
-
-    const wrote = ws.ops.items.len > 0;
-    var oc = run_oc;
-    // Chained-dispatch handler has no held socket. Same posture as
-    // subscription_fire: terminal propose-forgetful or commit;
-    // cont/stream returns are warned + writes still propose.
-    switch (oc) {
-        .terminal => |*r| {
-            defer r.deinit(allocator);
-            if (r.exception.len > 0) {
-                txn.rollback() catch {};
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, corr_full, .send_callback, 0);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            if (wrote) {
-                const lh_chain_term: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = @intCast(@max(@min(r.status, 599), 100)),
-                    .outcome = .ok,
-                    .activation = .send_callback,
-                    .method = "POST",
-                    .path = module_path,
-                    .host = "",
-                    .correlation_id = corr_full,
-                };
-                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_chain_term) catch |perr| {
-                    std.log.warn("rove-js chained-dispatch ({s}): propose failed: {s}", .{ module_path, @errorName(perr) });
-                    txn_owned = false;
-                    txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, corr_full, .send_callback, 0);
-                    r.console = &.{};
-                    r.exception = &.{};
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .send_callback, fw_seq);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "fireChainedActivation.commit(terminal)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, corr_full, .send_callback, 0);
-            r.console = &.{};
-            r.exception = &.{};
-        },
-        .continuation => |*cval| {
-            // Chained-from-chained: enqueue another SendCallback Msg
-            // so the next hop runs on the following tick (bounded
-            // recursion via the dispatch BATCH cap). Inherits the
-            // same correlation_id.
-            defer cval.deinit(allocator);
-            const enqueue_err = worker.node.router.enqueueChainedDispatchForTenant(
-                tenant_id,
-                cval.path,
-                cval.ctx_json,
-                cval.fn_name,
-                corr_full,
-            );
-            if (enqueue_err) |_| {} else |err| std.log.warn(
-                "rove-js chained-dispatch ({s}): nested enqueue failed: {s}",
-                .{ module_path, @errorName(err) },
-            );
-            if (wrote) {
-                const lh_chain_cont: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = 200,
-                    .outcome = .ok,
-                    .activation = .send_callback,
-                    .method = "POST",
-                    .path = module_path,
-                    .host = "",
-                    .correlation_id = corr_full,
-                };
-                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_chain_cont) catch |perr| {
-                    std.log.warn("rove-js chained-dispatch ({s}) cont-return propose failed: {s}", .{ module_path, @errorName(perr) });
-                    txn_owned = false;
-                    txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .send_callback, 0);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback, fw_seq);
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "fireChainedActivation.commit(cont)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback, 0);
-        },
-        .stream => |*s2| {
-            // `__rove_stream` from a chained-dispatch handler — no
-            // held socket; same posture as subscription_fire stream.
-            s2.deinit(allocator);
-            std.log.warn(
-                "rove-js chained-dispatch ({s}): __rove_stream is a no-op (no held socket)",
-                .{module_path},
-            );
-            if (wrote) {
-                const lh_chain_stream: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = 200,
-                    .outcome = .ok,
-                    .activation = .send_callback,
-                    .method = "POST",
-                    .path = module_path,
-                    .host = "",
-                    .correlation_id = corr_full,
-                };
-                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_chain_stream) catch |perr| {
-                    std.log.warn("rove-js chained-dispatch ({s}) stream-return propose failed: {s}", .{ module_path, @errorName(perr) });
-                    txn_owned = false;
-                    txn_done = true;
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_full, .send_callback, 0);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback, fw_seq);
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "fireChainedActivation.commit(stream)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, corr_full, .send_callback, 0);
-        },
-    }
+    // `.enqueue`: chained-from-chained re-enqueues another
+    // SendCallback hop on the next tick (bounded recursion via the
+    // dispatch BATCH cap), inheriting the same correlation_id.
+    runFire(worker, &p, req, .{
+        .act = .send_callback,
+        .site = "chained-dispatch",
+        .on_cont = .enqueue,
+        .on_stream = .warn,
+        .readonly_cont_commits = true,
+    }, module_path, corr_full, module_path, "");
 }
 
 // ── Commit-gated post-propose ─────────────────────────────────────────
@@ -4005,17 +2871,8 @@ pub fn fireFetchEventActivation(
     const tenant_id = event.tenant_id;
     const allocator = worker.allocator;
 
-    var dep = resolveDeployment(worker, allocator, tenant_id, module_path) catch |err| {
-        std.log.warn(
-            "rove-js fetch-event: tenant={s} module={s} resolveDeployment failed: {s}; skipping",
-            .{ tenant_id, module_path, @errorName(err) },
-        );
-        return;
-    };
-    defer dep.tc.release();
-    const inst = dep.inst;
-    const tc = dep.tc;
-    const bc = dep.bc;
+    var p = firePrep(worker, tenant_id, module_path, "fetch-event") orelse return;
+    defer p.deinit(allocator);
 
     // Body `{ctx: <ctx_json>}`. `ctx_json` is the chain ctx the
     // originating `http.fetch` call passed; empty → `{}`.
@@ -4024,23 +2881,6 @@ pub fn fireFetchEventActivation(
     defer allocator.free(body);
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
     defer allocator.free(spath);
-
-    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
-    var txn_owned = true;
-    defer if (txn_owned) allocator.destroy(txn);
-    txn.* = inst.kv.beginTrackedImmediate() catch return;
-    var txn_done = false;
-    defer if (!txn_done) txn.rollback() catch {};
-
-    var ws = kv_mod.WriteSet.init(allocator);
-    defer ws.deinit();
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
-    defer readset.deinit();
-    const request_id: u64 = blk: {
-        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
-        break :blk tl.id_minter.nextRequestId() catch 0;
-    };
 
     // Correlation: all activations of one fetch share `fetch-<id>`
     // so the replay UX groups the chunk chain with its terminal.
@@ -4051,8 +2891,6 @@ pub fn fireFetchEventActivation(
         "fetch-{s}",
         .{event.fetch_id[0..id_len]},
     ) catch corr_buf[0..0];
-
-    const act_source: log_mod.ActivationSource = .fetch_chunk;
 
     const req: Request = .{
         .method = "POST",
@@ -4071,9 +2909,9 @@ pub fn fireFetchEventActivation(
             .terminal_ok = if (event.final) event.terminal_ok else false,
             .body_truncated = if (event.final) event.body_truncated else false,
         } },
-        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = corr_full },
-        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
-        .admin = .{ .platform = inst.platform },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .admin = .{ .platform = p.dep.inst.platform },
         .trampolines = .{
             // Phase 5 PR-3: §6.4 held-sync resume hook. The baked
             // `__system/webhook_onresult` shim calls `__rove_resume_if_bound`
@@ -4124,7 +2962,7 @@ pub fn fireFetchEventActivation(
         // body's batch was confirmed durable by
         // drainFetchPendingDurability before this re-fire; use
         // the saved ref directly + skip append. Re-appending
-        // would mint a new batch and re-trigger park.
+        // would mint a new batch and re-park.
         body_ref = saved;
     } else if (event.bytes.len > 0 and event.bytes.len <= FETCH_INLINE_THRESHOLD) {
         // Inline fast path — no buffer append, the chunk bytes
@@ -4157,19 +2995,15 @@ pub fn fireFetchEventActivation(
                     .event = event.*,
                     .worker_seq = s,
                     .worker_id = wid,
-                    .tenant_id_view = inst.id,
+                    .tenant_id_view = p.dep.inst.id,
                 }) catch |err| {
                     std.log.warn(
                         "rove-js fetch-event: fetch_pending_durability.append tenant={s}: {s}",
                         .{ tenant_id, @errorName(err) },
                     );
-                    txn.rollback() catch {};
-                    txn_done = true;
                     return;
                 };
                 parked_to_durability = true;
-                txn.rollback() catch {};
-                txn_done = true;
                 return;
             }
             // submit failed — fall through with empty body_ref.
@@ -4178,7 +3012,7 @@ pub fn fireFetchEventActivation(
             // branch.
         }
     }
-    readset.fetch_responses.appendFetchResponse(
+    p.readset.fetch_responses.appendFetchResponse(
         event.fetch_id,
         event.seq,
         event.byte_offset,
@@ -4200,189 +3034,16 @@ pub fn fireFetchEventActivation(
     };
 
     // Phase 2D: the activation's input bytes (the upstream chunk
-    // payload) get taped on `TapePayloads.activation_bytes`.
+    // payload) get taped on `TapePayloads.activation_bytes` —
+    // `runFire` captures them on every log record (with_tape).
     // Closes algebra §7 worklist #1 — replay reconstitutes the same
     // handler invocation from the same captured bytes.
-    const activation_bytes_for_tape: []const u8 = event.bytes;
-
-    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        tc.snap.triggers,
-        req,
-        &budget,
-    ) catch {
-        txn.rollback() catch {};
-        txn_done = true;
-        const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
-        captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
-        return;
-    };
-
-    const wrote = ws.ops.items.len > 0;
-    var oc = run_oc;
-    // Fetch chains have no held socket — terminal commits/proposes;
-    // continuation/stream returns are deinit'd + recorded with a
-    // warning. Identical posture to `fireSubscriptionActivation`.
-    switch (oc) {
-        .terminal => |*r| {
-            defer r.deinit(allocator);
-            if (r.exception.len > 0) {
-                txn.rollback() catch {};
-                txn_done = true;
-                const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, tape_payloads, corr_full, act_source, 0);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            if (wrote) {
-                const lh_fetch_term: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = @intCast(@max(@min(r.status, 599), 100)),
-                    .outcome = .ok,
-                    .activation = act_source,
-                    .method = "POST",
-                    .path = module_path,
-                    .host = "",
-                    .correlation_id = corr_full,
-                };
-                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_fetch_term) catch |perr| {
-                    std.log.warn("rove-js fetch-event ({s}): propose failed: {s}", .{ module_path, @errorName(perr) });
-                    txn_owned = false;
-                    txn_done = true;
-                    const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, tape_payloads, corr_full, act_source, 0);
-                    r.console = &.{};
-                    r.exception = &.{};
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, tape_payloads, corr_full, act_source, fw_seq);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "fireFetchEventActivation.commit(terminal)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, tape_payloads, corr_full, act_source, 0);
-            r.console = &.{};
-            r.exception = &.{};
-        },
-        .continuation => |*cval| {
-            // Phase 5 PR-2: lift the cont arm to actually dispatch
-            // the named module. The fetch handler returned
-            // `__rove_next(path, {fn, ctx})` — enqueue a SendCallback
-            // Msg so the named handler runs as a fire-and-forget
-            // chain hop on the next worker tick. Inherits the
-            // current chain's correlation_id so replay UX groups
-            // the whole flow (inbound → fetch → chained hop) under
-            // one umbrella.
-            defer cval.deinit(allocator);
-            const enqueue_err = worker.node.router.enqueueChainedDispatchForTenant(
-                tenant_id,
-                cval.path,
-                cval.ctx_json,
-                cval.fn_name,
-                corr_full,
-            );
-            if (enqueue_err) |_| {} else |err| std.log.warn(
-                "rove-js fetch-event ({s}): chained dispatch enqueue failed: {s}",
-                .{ module_path, @errorName(err) },
-            );
-            if (wrote) {
-                const lh_fetch_cont: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = 200,
-                    .outcome = .ok,
-                    .activation = act_source,
-                    .method = "POST",
-                    .path = module_path,
-                    .host = "",
-                    .correlation_id = corr_full,
-                };
-                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_fetch_cont) catch |perr| {
-                    std.log.warn("rove-js fetch-event ({s}) cont-return propose failed: {s}", .{ module_path, @errorName(perr) });
-                    txn_owned = false;
-                    txn_done = true;
-                    const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, fw_seq);
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "fireFetchEventActivation.commit(cont)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
-        },
-        .stream => |*s2| {
-            s2.deinit(allocator);
-            std.log.warn(
-                "rove-js fetch-event ({s}): __rove_stream from a fetch activation is a no-op (v1)",
-                .{module_path},
-            );
-            if (wrote) {
-                const lh_fetch_stream: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = 200,
-                    .outcome = .ok,
-                    .activation = act_source,
-                    .method = "POST",
-                    .path = module_path,
-                    .host = "",
-                    .correlation_id = corr_full,
-                };
-                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, tenant_id, null, &readset, lh_fetch_stream) catch |perr| {
-                    std.log.warn("rove-js fetch-event ({s}) stream-return propose failed: {s}", .{ module_path, @errorName(perr) });
-                    txn_owned = false;
-                    txn_done = true;
-                    const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
-                    captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
-                captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, fw_seq);
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "fireFetchEventActivation.commit(stream)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            const tape_payloads = captureTapesWithActivation(worker, &readset, body, activation_bytes_for_tape);
-            captureLogWithId(worker, tenant_id, request_id, "POST", module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, tape_payloads, corr_full, act_source, 0);
-        },
-    }
+    runFire(worker, &p, req, .{
+        .act = .fetch_chunk,
+        .site = "fetch-event",
+        .on_cont = .enqueue,
+        .on_stream = .warn,
+        .readonly_cont_commits = true,
+        .with_tape = true,
+    }, module_path, corr_full, module_path, event.bytes);
 }
