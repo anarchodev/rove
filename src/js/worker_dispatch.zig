@@ -1928,14 +1928,17 @@ fn handleRelease(
         // *speculative* commit (volatile — LMDB only at raft-apply);
         // a propose that never reached raft leaves nothing durable,
         // so there is no local undo to perform (kvexp has no
-        // kv_undo table). Return 503 without parking;
+        // kv_undo table). NotLeader → 421 (the retry-safe re-aim
+        // status, decisions.md §10.5c) so callers hunt the leader;
+        // anything else → 503 without parking;
         // docs/proposer-audit.md (kvexp volatility).
+        const status: u16 = if (err == error.NotLeader) 421 else 503;
         const msg = try std.fmt.allocPrint(
             allocator,
             "release propose failed: {s}\n",
             .{@errorName(err)},
         );
-        try respb.setSystemResponseOwned(server, ent, sid, sess, 503, msg, allocator, cors_origin, null);
+        try respb.setSystemResponseOwned(server, ent, sid, sess, status, msg, allocator, cors_origin, null);
         return;
     }).seq;
 
@@ -2091,14 +2094,16 @@ fn handleAdminKv(
         // not leader). The local write was a kvexp *speculative*
         // commit (volatile — LMDB only at raft-apply); a propose
         // that never reached raft leaves nothing durable to undo
-        // (kvexp has no kv_undo table). Return 503 without parking;
+        // (kvexp has no kv_undo table). NotLeader → 421 (re-aim,
+        // decisions.md §10.5c); anything else → 503 without parking;
         // docs/proposer-audit.md (kvexp volatility).
+        const status: u16 = if (err == error.NotLeader) 421 else 503;
         const msg = try std.fmt.allocPrint(
             allocator,
             "admin-kv propose failed: {s}\n",
             .{@errorName(err)},
         );
-        try respb.setSystemResponseOwned(server, ent, sid, sess, 503, msg, allocator, cors_origin, null);
+        try respb.setSystemResponseOwned(server, ent, sid, sess, status, msg, allocator, cors_origin, null);
         return;
     }).seq;
 

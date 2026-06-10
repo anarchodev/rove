@@ -1340,7 +1340,7 @@ test "bridge: gid is a deterministic hash of the tenant id" {
     try testing.expect(Bridge.tenantGid("anything") != 0);
 }
 
-test "Phase 5c: 3-bridge cluster replicates via the leader; a follower propose faults" {
+test "Phase 5c: 3-bridge cluster replicates via the leader; a follower propose is refused" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1443,20 +1443,26 @@ test "Phase 5c: 3-bridge cluster replicates via the leader; a follower propose f
     // pending-FIFO binding, not a count).
     try testing.expectEqual(seq, bridges[leader.?].committedSeq(gid));
 
-    // A propose on a FOLLOWER faults (not leader) so a parked worker would
-    // fail fast and the client retry against the leader.
+    // A propose on a FOLLOWER is refused synchronously (NotLeader,
+    // decisions.md §10.5c): nothing enters the inbox or the raft log, so
+    // the worker maps it to a retry-safe 421 and the proxy re-aims at the
+    // leader. (Pre-§10.5c this faulted asynchronously — and raft-rs 0.7's
+    // proposal forwarding meant the entry could still commit cluster-wide
+    // while the local seq faulted: "write failed" with the write durable.)
     const follower = (leader.? + 1) % 3;
-    const fseq = try bridges[follower].propose(gid, env);
-    var faulted = false;
+    try testing.expectError(Error.NotLeader, bridges[follower].propose(gid, env));
+    // ...and the refused propose never commits: pump everyone a while and
+    // assert the follower's watermarks are unmoved and the leader's store
+    // saw no second write.
+    const f_committed = bridges[follower].committedSeq(gid);
+    const f_faulted = bridges[follower].faultedSeq(gid);
     var s3: u32 = 0;
-    while (s3 < 2000 and !faulted) : (s3 += 1) {
+    while (s3 < 100) : (s3 += 1) {
         for (bridges) |b| _ = try b.pumpOnce();
-        if (bridges[follower].faultedSeq(gid) >= fseq) faulted = true;
         std.Thread.sleep(1 * std.time.ns_per_ms);
     }
-    try testing.expect(faulted);
-    // The follower never advanced a local watermark for the faulted write.
-    try testing.expect(bridges[follower].committedSeq(gid) < fseq);
+    try testing.expectEqual(f_committed, bridges[follower].committedSeq(gid));
+    try testing.expectEqual(f_faulted, bridges[follower].faultedSeq(gid));
 }
 
 test "bridge: identity binding — foreign + faulted entries write the store and never credit a waiter" {
