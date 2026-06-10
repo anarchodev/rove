@@ -33,7 +33,8 @@
 //! - Phase 3.1+: migrate parked sites onto Continuation; H2 reference
 //!   path is the dragon (3.2) — byte-identical, gated by perf.
 //! - Phase 4: `interpretCmd` + the commit-gated buffer on Continuation;
-//!   forces the streaming-pre-commit decision (algebra worklist #2).
+//!   forces the streaming-pre-commit decision (the effect-audit's
+//!   pre-commit-ship finding).
 //! - Phase 5: delete `SendDispatch` + ship `webhook.send.js` /
 //!   `email.send.js` durability-as-JS-shim per
 //!   `project_durability_as_js_shim`.

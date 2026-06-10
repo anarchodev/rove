@@ -17,7 +17,7 @@
 >
 > **Revised 2026-06-02 (rev 2 — `stream.*` model).** Organized around one
 > axis — **scope: current-connection vs connectionless** — derived in
-> [`effect-algebra.md`](effect-algebra.md) §8. **The verb is the scope;
+> [`effect-algebra.md`](effect-algebra.md) §6. **The verb is the scope;
 > output is a commit-gated effect; the return is pure disposition.**
 > Streamed output is `stream.start()` / `stream.write()` (effects), not a
 > `stream` return verb. The only return shapes are `next(...)` (park) and
@@ -80,7 +80,7 @@ The body **accumulates** the Cmd as you compute — `kv.*` builds the
 Model; `stream.*`, `on.*`, and the connectionless verbs are effects that
 fire post-commit — and the **return value** picks the connection's
 disposition. Together that's the TEA pair `(Model', Cmd)`
-(`effect-algebra.md` §8 is the derivation; §1 the determinism invariant).
+(`effect-algebra.md` §6 is the derivation; §1 the determinism invariant).
 
 ### 2.1 Disposition — the return value
 
@@ -168,7 +168,7 @@ calls that re-invoke a handler still holding the socket. Ephemeral
   **since the version this activation read** (anchored to the read view,
   so a write between "you read" and "you parked" still fires it, and the
   common "wait on a key, write it from a connectionless callback"
-  pattern is lossless — `effect-algebra.md` §8.4).
+  pattern is lossless — `effect-algebra.md` §6.4).
 - `on.fetch(url, opts?, { to? })` — perform an outbound request and wake
   on its result (whole or chunked). Connection-scoped outbound; its
   durable twin is `webhook.send` (§2.4).
@@ -185,7 +185,7 @@ return next({ rooms: request.ctx.rooms });
 The runtime arms `on.*` wakes **before** firing any connectionless
 effects of the same activation, so a wake can't be missed even when a
 connectionless callback writes the key it watches (`effect-algebra.md`
-§8.4).
+§6.4).
 
 ### 2.4 Connectionless triggers — `webhook.send` / `schedule` / `cron`
 
@@ -204,7 +204,7 @@ connectionless triggers, and do work — but it has **no connection**, so
 the disposition verbs and `stream.*` / `on.*` are **inert** there. To
 surface a connectionless result *to* a still-connected client, compose:
 the callback writes `kv`, the connection watches that key with `on.kv`
-(the SSE example, §5.7; the model, `effect-algebra.md` §8.5).
+(the SSE example, §5.7; the model, `effect-algebra.md` §6.5).
 
 > `subscribe.kv` (a runtime durable kv-react) is **deferred** — `on.kv`
 > covers the connection case; no runtime durable kv-react for now.
@@ -229,9 +229,9 @@ why they're Cmd-builders, not Model mutations.
 Scope must be a *verb*, not a flag, because a connectionless trigger is
 **durable**, and durability isn't a boolean — it's a Model-row +
 commit-gate + reload-on-leader-change overlay (`effect-algebra.md` §2.2,
-§8.1). A `{ durable: true }` / `{ detach: true }` flag can't conjure
+§6.1). A `{ durable: true }` / `{ detach: true }` flag can't conjure
 that lifecycle; flipping scope with a flag is the `bind` mistake the
-model retired (§8.3). So:
+model retired (§6.3). So:
 
 - **`detach` is retired.** "A fetch that outlives my connection" is the
   connectionless verb (`webhook.send`), not `on.fetch({ detach:true })`.
@@ -437,7 +437,7 @@ cursor*; each wake **range-drains** from the cursor (so coalesced wakes
 never lose notifications) and advances it in `ctx`. The notifications
 live in `kv` (durable) and the client's resume point is its
 `Last-Event-ID`, so a dropped connection just reconnects — no durable
-server-side connection state. (`effect-algebra.md` §8.5; retention
+server-side connection state. (`effect-algebra.md` §6.5; retention
 bounds the reconnect-replay window.)
 
 ### 5.8 Fan-in / join — wait for all, then combine
@@ -461,7 +461,7 @@ export function onTimeout() { response.status = 504; return 'upstream timeout'; 
 
 `next({ctx})` makes `ctx` the continuation's accumulator. Each fetch
 result fires its own `onResult` (value-triggers are delivered
-individually — `effect-algebra.md` §8.2), resumes are serialized, and
+individually — `effect-algebra.md` §6.2), resumes are serialized, and
 each `next(ctx)` updates the threaded `ctx` the next resume reads — so
 the join is race-free with no lock. `next` (not committing) the whole
 time, because the response could be `200` or, via `onTimeout`, `504`.
@@ -600,8 +600,8 @@ self-hosters marketplace plan for the consuming side.
 
 ## 12. Relation to other plans
 
-- `effect-algebra.md` §8 — the scope model; §8.3 `bind`/`detach`
-  retirement; §8.4 watch-before-write; §8.5 "grammar position = scope."
+- `effect-algebra.md` §6 — the scope model; §6.3 `bind`/`detach`
+  retirement; §6.4 watch-before-write; §6.5 "grammar position = scope."
   The verbs here are the customer names for §2's primitives.
 - `architecture/effects-and-handlers.md` — the collection-lifecycle state
   machine the surface lowers onto.

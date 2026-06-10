@@ -33,8 +33,8 @@
 //! channels plus activation_bytes for chunk variants). The
 //! pre-handler hook contemplated in early drafts wasn't needed:
 //! post-handler taping records the same bytes the handler observed
-//! and meets the audit's "taped per fire" check
-//! (`docs/effect-algebra.md` §5).
+//! and meets the effect-audit's "taped per fire" check (the L3 law,
+//! `docs/effect-algebra.md` §2.3).
 //!
 //! ## Ownership model
 //!

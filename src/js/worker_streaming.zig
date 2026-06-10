@@ -2723,8 +2723,8 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
                 // Phase 5 PR-1: single fetch activation kind. Every
                 // event fires `on_chunk` against the handler; `event.final`
                 // distinguishes the terminal event from intermediates.
-                // Tape captures the chunk bytes (closes algebra §7
-                // worklist #1).
+                // Tape captures the chunk bytes (closes the 2026-05-22
+                // effect-audit's untaped-chunk finding).
                 //
                 // Slice 4-fetch-park: fireFetchEventActivation owns
                 // the event — internal defer deinits it OR transfers
@@ -3059,8 +3059,9 @@ pub fn fireFetchEventActivation(
     // Phase 2D: the activation's input bytes (the upstream chunk
     // payload) get taped on `TapePayloads.activation_bytes` —
     // `runFire` captures them on every log record (with_tape).
-    // Closes algebra §7 worklist #1 — replay reconstitutes the same
-    // handler invocation from the same captured bytes.
+    // Closes the effect-audit's untaped-chunk finding — replay
+    // reconstitutes the same handler invocation from the same captured
+    // bytes.
     runFire(worker, &p, req, .{
         .act = .fetch_chunk,
         .site = "fetch-event",

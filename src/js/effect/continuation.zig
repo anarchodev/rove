@@ -338,7 +338,7 @@ pub fn reconcile(ctx: anytype, count: usize) !void {
 
 /// The Msg / route key a Continuation parks on (Phase 3.5 — the
 /// O(1) wake-correlation index). Today's resume is a cross-worker
-/// scan (`docs/effect-algebra.md` §7 worklist #4). The indexed
+/// scan (the effect-audit's cross-worker-resume finding). The indexed
 /// form replaces it.
 ///
 /// Declared but unindexed in Phase 3.0; the migration sub-phases

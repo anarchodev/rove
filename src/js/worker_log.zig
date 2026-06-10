@@ -183,8 +183,9 @@ pub fn captureTapes(
 /// `REQUEST_BODY_CAP` (16 KB) ride inline in
 /// `TapePayloads.activation_bytes`; larger chunks live in BlobBackend
 /// via the readset's `fetch_responses` BodyRef and are fetched on
-/// demand. L3 (algebra): closes worklist #1 — every Msg is recorded
-/// (the BodyRef IS the record for the >16 KB case).
+/// demand. L3 (algebra): closes the effect-audit's untaped-chunk
+/// finding — every Msg is recorded (the BodyRef IS the record for the
+/// >16 KB case).
 pub fn captureTapesWithActivation(
     worker: anytype,
     readset: *tape_mod.Readset,
