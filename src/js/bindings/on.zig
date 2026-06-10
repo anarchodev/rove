@@ -1,5 +1,5 @@
 //! `_system.on` — connection wake triggers (`docs/handler-shape.md`
-//! §2.3, `handler-surface-impl-plan.md` Phase 1). `on.timer(ms)` /
+//! §2.3). `on.timer(ms)` /
 //! `on.kv(prefix, {to?})` register a wake **for the current
 //! connection**: a body-builder effect (not a return verb) that
 //! accumulates onto `DispatchState.pending_wakes` during the

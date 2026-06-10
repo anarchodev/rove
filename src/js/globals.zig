@@ -294,7 +294,7 @@ pub const FireWakeInput = struct {
 /// registration accumulated during the body. Mirrors the
 /// `pending_fetches` accumulator shape — the binding appends, the
 /// worker drains at end-of-activation and arms the held entity's
-/// `StreamWakes` (`docs/handler-surface-impl-plan.md` Phase 1). A
+/// `StreamWakes` (`docs/handler-shape.md` §2.3). A
 /// connection wake; inert (the accumulator is null) on connectionless
 /// activations.
 pub const PendingWakeReg = struct {
