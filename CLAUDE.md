@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is rove
 
-Rove is a Zig systems library for building distributed serverless worker infrastructure. It provides content-addressed code deployment, a QuickJS-based JS runtime, an HTTP/2 server, and a distributed KV store with Raft consensus. Third-party dependencies are **pinned and fetched at build time** — Zig/C packages (`arenajs`, `kvexp`, and the V2 engine `raft-rs-zig`) via `build.zig.zon`; the V2 raft engine's Rust crates via Cargo. The first build needs network. This replaced the former vendor-everything / offline-build mandate when the V2 raft-rs Rust closure proved too large to vendor (see `docs/v2-build-order.md`). **The V1→V2 cutover is done (branch `v2`):** the V1 product binary `loop46`, the willemt-raft engine (`vendor/raft/` + `src/kv/{cluster,raft_node,raft_log,…}.zig`), and the sqlite raft log are all retired. The V2 worker is `rewind` (`src-v2/rewind/main.zig`); per-tenant consensus is the `Bridge` (`src-v2/kv/bridge.zig`) + raft-rs. There are no vendored deps left.
+Rove is a Zig systems library for building distributed serverless worker infrastructure. It provides content-addressed code deployment, a QuickJS-based JS runtime, an HTTP/2 server, and a distributed KV store with Raft consensus. Third-party dependencies are **pinned and fetched at build time** — Zig/C packages (`arenajs`, `kvexp`, and the V2 engine `raft-rs-zig`) via `build.zig.zon`; the V2 raft engine's Rust crates via Cargo. The first build needs network. This replaced the former vendor-everything / offline-build mandate when the V2 raft-rs Rust closure proved too large to vendor (see `docs/v2-build-order.md`). **The V1→V2 cutover is done (branch `v2`):** the V1 product binary `loop46`, the willemt-raft engine (`vendor/raft/` + `src/kv/{cluster,raft_node,raft_log,…}.zig`), and the sqlite raft log are all retired. The V2 worker is `rewind` (`src/rewind/main.zig`); per-tenant consensus is the `Bridge` (`src/consensus/bridge.zig`) + raft-rs. There are no vendored deps left.
 
 ## Product direction
 
@@ -16,7 +16,7 @@ Rove is a Zig systems library for building distributed serverless worker infrast
 zig build              # Build all modules and examples
 zig build test         # Run all unit tests (inline Zig tests across all modules)
                        # — fixed at the V1 cutover (was broken by frozen V1 modules)
-zig build rewind       # Build the V2 worker binary (src-v2/rewind/main.zig)
+zig build rewind       # Build the V2 worker binary (src/rewind/main.zig)
 zig build rewind-cp    # Build the V2 control plane (directory + provisioning)
 zig build rewind-front # Build the V2 stateless front door (Host→cluster proxy)
 zig build files-server-v2  # Build the cluster-free V2 deploy publisher
@@ -25,52 +25,77 @@ zig build echo-server  # Run the TCP echo server example
 zig build h2-echo-server  # Run the HTTP/2 echo server example
 ```
 
-Requires Zig 0.15.0+. System libraries needed: nghttp2, OpenSSL (ssl + crypto), SQLite3.
+Requires Zig 0.15.0+ and a Rust toolchain (pinned by `rust-toolchain.toml`) for
+the consensus-linked steps — anything that pulls in the bridge (`rewind`,
+`rewind-cp`, `v2-test`, `js-v2`, the aggregate `test` via rove-js) builds
+raft-rs-zig's Rust FFI via cargo; the bare `zig build` install step does not.
+System libraries: nghttp2, OpenSSL (ssl + crypto), libcurl, liblmdb (via
+kvexp), zlib; SQLite3 only for the log-server standalone binary and its
+`log-server-test` step.
 
 ## Smoke tests
 
 Python scripts in `scripts/` drive end-to-end tests against running binaries.
-Each one spawns its own cluster + standalones and tears them down via
-`atexit` / signal handlers (no `pkill -f` fragility).
+Each one spawns its own topology and tears it down via `atexit` / signal
+handlers (no `pkill -f` fragility). V2 smokes need S3 credentials in the
+environment first (`set -a; . ./.env; set +a`) — V2 has no fs blob backend.
 
 ```bash
-python3 scripts/ctl_smoke.py            # /_system/* control surface
-python3 scripts/files_server_smoke.py   # files-server compile/upload/deploy/fetch
-python3 scripts/penalty_smoke.py        # penalty box system
-python3 scripts/leader_failover_smoke.py  # raft leader change preserves http.send
+python3 scripts/rewind_smoke.py        # single-node rewind write path (propose → commit → 204)
+python3 scripts/ctl_smoke_v2.py        # provision → deploy → serve through the front door
+python3 scripts/three_node_smoke.py    # ⭐ multi-node HA: move onto a 3-node cluster, kill the leader
+python3 scripts/tenant_move_smoke.py   # live tenant move cluster-1 → cluster-2
 ```
 
-`scripts/smoke_lib.py` is the shared harness — `Cluster.spawn` /
-`discover_leader` / `spawn_files_server` / `mint_services_token` /
-process-tracking + cleanup primitives. New smokes should follow the
-existing tier-1 ones (e.g. `cookie_auth_smoke.py`) for the canonical
-shape. The Python harness replaced the bash `_smoke_helpers.sh` flow
-in commits 431722b → 95e53f3.
+`scripts/smoke_lib_v2.py` is the V2 harness — `V2Cluster.spawn` brings up
+rewind-cp + front door + rewind node(s) + files-server-v2 and exposes
+`provision` / `deploy_handlers` / `wait_for_handler`; `scripts/v2_topology.py`
+holds the per-binary spawn primitives. The functional smokes were ported as
+`*_smoke_v2.py` (~40 of them); the original un-suffixed versions spawn the
+retired `loop46` binary via `smoke_lib.py` and are dead — `smoke_lib.py`
+survives only for helper imports (`mint_jwt`, `HttpResponse`). New smokes
+should follow `ctl_smoke_v2.py` for the canonical shape.
 
 ## Architecture
 
 ### Module dependency graph
 
 ```
-rove (core ECS)  ←── rove-io (io_uring) ←── rove-h2 (HTTP/2 + nghttp2)
-                                                  ↑
-rove-kv (KV + Raft + SQLite) ──────────┐          │
-rove-blob (fs/s3 blob storage) ────────┤          │
-rove-files (content-addressed files) ──┤          │
-rove-log (per-tenant request logs) ────┤          │
-rove-tape (deterministic replay) ──────┤          │
-rove-tenant (account/domain metadata) ─┤          │
-rove-qjs (arenajs JS engine wrapper) ──┤          │
-                                       ↓          │
-                              rove-js (worker dispatcher) ──┘
-                              rove-files-server (compile/deploy HTTP surface)
-                              rove-log-server (log query HTTP surface)
-                              rove-sse-server (SSE notifications — runs as a
-                                               loop46 thread, single-node;
-                                               imported by loop46 + rove-js)
+rove (core ECS) ←── rove-io (io_uring) ←── rove-h2 (HTTP/2 + h1 + WS, nghttp2)
+
+raft-kv (kvexp KV facade — no consensus) ─┐
+rove-blob (S3 blob storage, libcurl) ─────┤   leaves: rove-plan (tier table),
+rove-files (content-addressed files) ─────┤           rove-jwt (HS256),
+rove-log (per-tenant request logs) ───────┤           rove-ssrf (blocklist)
+rove-bodies (body-batch S3 buffer) ───────┤
+rove-tape (deterministic replay) ─────────┤
+rove-tenant (account/domain metadata) ────┤
+rove-qjs (arenajs JS engine wrapper) ─────┤
+rove-acme (ACME HTTP-01 client) ──────────┤
+                                          ↓
+                  rove-js (worker dispatcher; imports bridge + the above)
+                  rove-files-server (compile/deploy HTTP surface)
+                  rove-log-server (log query HTTP surface)
+
+consensus (src/consensus/, V2): node.zig (per-tenant raft-rs groups, pump,
+           hibernating active-set) + bridge.zig (worker-facing propose +
+           commit-watermark surface) + transport.zig (coalesced cross-node
+           wire over raft-net, a direct liburing wrapper)
+cp-directory (src/cp/directory.zig): tenant→cluster routing, backed by a
+           directory raft group via the bridge
+
+binaries:  rewind        (src/rewind/)  the worker — rove-js on the bridge
+           rewind-cp     (src/cp/)      replicated directory + provisioning + moves
+           rewind-front  (src/front/)   stateless Host→cluster proxy — no raft state
+           files-server-v2, log-server-standalone  (examples/ wrappers)
 ```
 
-**rove-kv is a standalone leaf module** — it does NOT depend on rove or rove-io. Its raft networking (`raft_net`) uses io_uring directly via liburing, bypassing the rove-io abstraction.
+**`raft-kv` is the spine-free KV facade** (`src/kv/kvlimbs.zig`) — the
+kvexp-backed limbs (`KvStore` / `TrackedTxn` / writesets), metrics, and the
+envelope codec, with NO consensus engine inside. Consensus lives in
+`src/consensus/` behind the `Bridge`; the cross-node wire layer (`raft-net`,
+`src/kv/raft_net.zig`) uses io_uring directly via liburing, bypassing the
+rove-io abstraction.
 
 ### Core ECS pattern (rove module)
 
@@ -90,7 +115,7 @@ h2.request_out → dispatchOnce → [drainRaftPending if writes] → h2.response
 
 `dispatchOnce` invokes the handler via `Dispatcher.runOutcome` (`src/js/dispatcher.zig`) — the single re-entry point for every activation (inbound, send_callback, fetch_chunk, kv_wake, disconnect, subscription_fire). See `docs/architecture/effects-and-handlers.md` for the Continuation primitive that backs the parked Msg queue.
 
-Each JS request gets a fresh JS context via arenajs's dual-arena reset (one cursor write per request — see `vendor/arenajs/README.md`). The base arena is built once at worker startup and shared across all requests on the thread; the per-request arena is reset between handler invocations.
+Each JS request gets a fresh JS context via arenajs's dual-arena reset (one cursor write per request — see the README in the fetched `arenajs` package, `anarchodev/arenajs`). The base arena is built once at worker startup and shared across all requests on the thread; the per-request arena is reset between handler invocations.
 
 ### Data durability model
 
@@ -106,25 +131,22 @@ Envelopes are typed byte blobs (`src/js/apply.zig`). Only three types are live (
 | `1` multi | per-inner-envelope target | Worker dispatcher — atomically bundles multiple writeset envelopes into one raft entry |
 | `2` root_writeset | `{data_dir}/__root__.db` | `provisionInstance` / admin `createInstance`'s `tenant.createInstance`; admin JS `platform.root.*`; ACME `cert/{host}` (see `docs/architecture/auth-and-domains.md`) |
 
-Retired type bytes — the decoder rejects each loudly, so any stale raft-log entry surfaces instead of silently mis-applying: `log_batch` (originally type 1) and `files_writeset` (3) in Phase 5.5 (a) / (e) — log batches go S3-direct and per-tenant deployment manifests live in a `deployments/` BlobBackend per `docs/architecture/deployment-and-logs.md`; the dedicated webhook envelopes (4/5/6) on 2026-05-09; and `schedule_upsert/complete/cancel/demote` (8/9/10/11) on 2026-05-19 in the `http.send` Option-(b) re-platform — there is no `schedules.db` and no schedule-server thread. The per-node leader-local `SendDispatch` that Option-(b) introduced was itself retired on 2026-05-24 per the durability-as-JS-shim decision (`decisions.md` §3.3, commit `b908953`); the `_send/owed/{id}` markers are now written by `webhook.send.js` / `email.send.js` as ordinary envelope-0 kv keys and the apply-time special-cases are gone. `multi` was renumbered from type 7 to type 1 to match `kv.cluster.ENVELOPE_TYPE_MULTI`. See `docs/effect-algebra.md` for how envelopes fit the effect model, PLAN.md §10.2 for the full evolution table, and §13 for the live process map.
+Retired type bytes — the decoder rejects each loudly, so any stale raft-log entry surfaces instead of silently mis-applying: `log_batch` (originally type 1) and `files_writeset` (3) in Phase 5.5 (a) / (e) — log batches go S3-direct and per-tenant deployment manifests live in a `deployments/` BlobBackend per `docs/architecture/deployment-and-logs.md`; the dedicated webhook envelopes (4/5/6) on 2026-05-09; and `schedule_upsert/complete/cancel/demote` (8/9/10/11) on 2026-05-19 in the `http.send` Option-(b) re-platform — there is no `schedules.db` and no schedule-server thread. The per-node leader-local `SendDispatch` that Option-(b) introduced was itself retired on 2026-05-24 per the durability-as-JS-shim decision (`decisions.md` §3.3, commit `b908953`); the `_send/owed/{id}` markers are now written by `webhook.send.js` / `email.send.js` as ordinary envelope-0 kv keys and the apply-time special-cases are gone. `multi` was renumbered from type 7 to type 1 to match `ENVELOPE_TYPE_MULTI` (`src/kv/envelope_codec.zig`). See `docs/effect-algebra.md` for how envelopes fit the effect model, PLAN.md §10.2 for the full evolution table, and §13 for the live process map.
 
-### Blob replication (multi-node)
+### Blob storage (S3-only)
 
-Blob bytes (source, bytecode, static assets) live in `{data_dir}/{id}/file-blobs/` and are **not** carried through raft envelopes — a 1MB static blob per envelope would blow the raft log size/latency budget. Single-node: `FilesystemBlobStore` works as-is. **Multi-node requires a shared `BlobStore` backend** — all nodes read the same content-addressed store. Two options:
+Blob bytes (source, bytecode, static assets, log/tape batches) are **not** carried through raft envelopes — a 1MB static blob per envelope would blow the raft log size/latency budget. They live in S3-shaped object storage: `S3BlobStore` in `rove-blob` (path-style, SigV4-signed; tested against OVH, works against AWS / MinIO / R2 / B2). There is no filesystem backend — production is multi-node and every node must read the same content-addressed store, so S3 is mandatory even single-node (smokes source `.env` first).
 
-1. **Shared filesystem mount** (NFS, EFS, Ceph) at `{data_dir}` on every node. Zero new code — `FilesystemBlobStore` treats the mount point like any other directory.
-2. **S3 / object store** — `S3BlobStore` in `rove-blob` (path-style, SigV4-signed; tested against OVH but works against AWS / MinIO / R2 / B2). Cleaner ops story, more setup.
+Config is env-driven via `rove-blob`'s `env.zig` (`S3_ENDPOINT` / `S3_REGION` / `S3_BUCKET` / `S3_KEY_PREFIX_BASE` / `S3_USE_TLS` / `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), read identically by `rewind`, `rewind-cp`, and the log-server so every per-tenant backend opens against the same store. Per-tenant scoping is the key prefix `{key_prefix_base}{instance_id}/{file-blobs|log-blobs}/`, so leader and followers hit identical keys.
 
-Backend pick is process-wide via `BLOB_BACKEND=fs|s3` (+ `S3_ENDPOINT` / `S3_REGION` / `S3_BUCKET` / `S3_KEY_PREFIX_BASE` / `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `S3_USE_TLS`) read by the `loop46` binary at startup. The chosen `blob_mod.BackendConfig` threads through `WorkerConfig.blob_backend`, `ApplyCtx.blob_backend_cfg`, and the files-server / log-server `spawn` so every per-tenant backend on the node opens against the same store. Per-tenant scoping in S3 is the key prefix `{key_prefix_base}{instance_id}/{file-blobs|log-blobs}/`, mirroring the on-disk layout exactly so leader and followers hit identical keys.
-
-Raft replicates the manifest (the `file/{path}` key → `{hash, kind, content_type}` pointer); the shared backend serves the bytes referenced by those hashes. Followers apply the manifest ops; readers fetch the blob bytes from whichever backend `rove-blob` is configured with.
+Raft replicates the manifest (the `file/{path}` key → `{hash, kind, content_type}` pointer); the shared backend serves the bytes referenced by those hashes. Followers apply the manifest ops; readers fetch the blob bytes from S3.
 
 ### Dependencies (pinned-and-fetched)
 
 Pins live in `build.zig.zon` (Zig/C packages) and each Rust crate's `Cargo.lock`. The first `zig build` fetches; subsequent builds use the Zig package cache. To bump a dep, re-run `zig fetch --save=<name> git+https://…#<commit>`.
 - **arenajs** (`anarchodev/arenajs`) — fork of quickjs-ng with a dual bump arena (base + per-request); per-request reset is one cursor write instead of memcpy. Replaces the previously-vendored quickjs-ng + deterministic-init patch. Its own `build.zig` compiles the quickjs/arena C sources into a static lib; rove links it.
 - **kvexp** (`anarchodev/kvexp`) — first-party pure-Zig multi-tenant embedded KV (LMDB-backed) used as the per-tenant state engine under `TrackedTxn`'s speculative overlay.
-- **raft-rs-zig** (`anarchodev/raft-rs-zig`) — V2 multi-raft engine (TiKV raft-rs, one group per tenant) behind a Zig wrapper; its `build.zig` runs `cargo build` for the Rust FFI. Behind v2-only build steps (`zig build v2-test`); the default `zig build` never invokes cargo.
+- **raft-rs-zig** (`anarchodev/raft-rs-zig`) — V2 multi-raft engine (TiKV raft-rs, one group per tenant) behind a Zig wrapper; its `build.zig` runs `cargo build` for the Rust FFI. Linked by every consensus-shaped step (`rewind`, `rewind-cp`, `v2-test`, `js-v2`, the aggregate `test` via rove-js's bridge import); the bare `zig build` install step never invokes cargo.
 - ~~**willemt/raft**~~ — V1 consensus library, **deleted at the V2 cutover** (along with `vendor/` entirely). V2 consensus is `raft-rs-zig` (fetched).
 
 ## Conventions
