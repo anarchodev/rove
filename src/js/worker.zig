@@ -1137,6 +1137,7 @@ pub const WorkerConfig = struct {
 };
 
 pub const dispatchOnce = dispatch.dispatchOnce;
+pub const drainRequestReceiving = dispatch.drainRequestReceiving;
 
 pub fn Worker(comptime opts: Options) type {
     // rove-js contributes `RaftWait` to every request entity so we can
