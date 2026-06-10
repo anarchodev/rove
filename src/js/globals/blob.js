@@ -114,11 +114,10 @@ globalThis.blob = {
    * @param {boolean} [opts.stream] - Per-chunk delivery (default
    *   false: one whole-body result, up to `max_bytes`).
    * @param {number} [opts.max_bytes] - Whole-body transport cap
-   *   (default 8 MB). NOTE: the per-request arena bounds what your
-   *   handler can MATERIALIZE from the bytes (decode/concat of
-   *   ~100 KB+ bodies can OOM the activation) — for large objects
-   *   use `stream: true` and process per chunk, or serve clients
-   *   via `blob.url` redirect and never touch the bytes at all.
+   *   (default 8 MB). The per-request arena (100 MiB allocation
+   *   volume) comfortably covers decoding bodies this size; for
+   *   serving bytes your handler doesn't execute on, prefer the
+   *   `blob.url` redirect — the bytes then never touch the worker.
    * @returns {string} The fetch id.
    *
    * @example

@@ -282,10 +282,15 @@ def main() -> int:
         gen_hash = (r.body.decode() if isinstance(r.body, bytes) else str(r.body)).strip()
         check("gen hash == python sha256 of same content",
               gen_hash == gen_expect, f"got {gen_hash!r} want {gen_expect!r}")
-        # Round-trip via the presigned URL, not blob.get: a 139 KB
-        # body materialized as a JS string blows the per-request
-        # arena (TextDecoder OOM) — large objects are exactly what
-        # the redirect path is for.
+        # Round-trip the sealed object BOTH ways: through the door
+        # (blob.get + native TextDecoder over a 139 KB body — this
+        # exact read OOM'd the pre-native pure-JS decoder) and via
+        # the presigned URL (independent of the worker entirely).
+        r = c.request(TENANT, f"/get?hash={gen_expect}", timeout=30.0)
+        got = r.body.decode() if isinstance(r.body, bytes) else str(r.body)
+        check("sealed gen object round-trips via blob.get (139 KB decode)",
+              r.status == 200 and got == GEN_CHUNK * 8,
+              f"status {r.status} len {len(got)}")
         r = c.request(TENANT, f"/url?hash={gen_expect}")
         gen_url = (r.body.decode() if isinstance(r.body, bytes) else str(r.body)).strip()
         try:
