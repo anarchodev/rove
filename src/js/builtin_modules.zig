@@ -59,6 +59,12 @@ const MODULES = [_]struct {
         .src = @embedFile("builtin_webhook_onresult_mjs"),
     },
     .{
+        // durable-wake-plan P5(a): the wake-fired half of webhook.send
+        // (scheduled fires, retry re-arms, crash-recovery watchdog).
+        .path = "__system/webhook_fire.mjs",
+        .src = @embedFile("builtin_webhook_fire_mjs"),
+    },
+    .{
         // §2.6 durable scheduled wake (docs/durable-wake-plan.md P1).
         .path = "__system/scheduler_tick.mjs",
         .src = @embedFile("builtin_scheduler_tick_mjs"),

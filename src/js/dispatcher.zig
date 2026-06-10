@@ -908,8 +908,35 @@ test "dispatch: webhook.send writes _send/owed/{id} marker (immediate fire path)
     try testing.expectEqualStrings("POST", obj.get("method").?.string);
     try testing.expectEqualStrings("x", obj.get("body").?.string);
     try testing.expectEqual(@as(i64, 0), obj.get("attempts").?.integer);
-    // next_at_ns is "0" for immediate-fire (no fire_at_ns supplied).
-    try testing.expectEqualStrings("0", obj.get("next_at_ns").?.string);
+    // durable-wake-plan P5(a): timing left the marker — the scheduler
+    // entry under key `_send/{id}` is the durable next-fire authority.
+    try testing.expectEqual(@as(?std.json.Value, null), obj.get("next_at_ns"));
+
+    // The immediate path arms a crash-recovery watchdog wake aimed at
+    // the baked `__system/webhook_fire`. Schedule id =
+    // base64url-no-pad(sha256("_send/" + id)) (scheduler.at's
+    // opts.key recipe).
+    const sched_raw = try readSchedByKey(kv, resp.body);
+    defer testing.allocator.free(sched_raw);
+    var sched = try std.json.parseFromSlice(std.json.Value, testing.allocator, sched_raw, .{});
+    defer sched.deinit();
+    try testing.expectEqualStrings("__system/webhook_fire", sched.value.object.get("target").?.string);
+}
+
+/// Read the `_sched/by_id/` record for webhook.send's scheduler entry
+/// (idempotency key `_send/{id}`): schedule id = base64url-no-pad of
+/// sha256 of the key — the same recipe `scheduler.at` applies to
+/// `opts.key`.
+fn readSchedByKey(kv: *kv_mod.KvStore, send_id: []const u8) ![]u8 {
+    var key_buf: [256]u8 = undefined;
+    const sched_key = std.fmt.bufPrint(&key_buf, "_send/{s}", .{send_id}) catch unreachable;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(sched_key, &digest, .{});
+    var id_buf: [43]u8 = undefined;
+    const sched_id = std.base64.url_safe_no_pad.Encoder.encode(&id_buf, &digest);
+    var kv_key_buf: [300]u8 = undefined;
+    const kv_key = std.fmt.bufPrint(&kv_key_buf, "_sched/by_id/{s}", .{sched_id}) catch unreachable;
+    return kv.get(kv_key);
 }
 
 // Phase 5 PR-3: the original Zig http.send-binding tests deleted
@@ -2583,7 +2610,8 @@ test "dispatch: webhook.send (JS shim) writes _send/owed/{id} markers" {
 
     // Phase 5 PR-3: webhook.send is the JS-shim composition
     // (`globals/webhook.js`). Each writes a JSON `_send/owed/{id}`
-    // marker the per-worker retry sweep (sweepOwedRetries) reads.
+    // marker the baked `__system/webhook_fire` / `webhook_onresult`
+    // modules read (deferred fires ride the durable scheduler).
     var resp = try runOne(
         &d,
         kv,

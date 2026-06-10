@@ -1,22 +1,16 @@
 // `webhook.send` — durable outbound HTTP, composed in JS on top of
-// the four reified primitives: `kv.set` (durable marker), `http.fetch`
+// the reified primitives: `kv.set` (durable marker), `http.fetch`
 // (transient transport), `__system/webhook_onresult` (the baked
 // on_chunk shim that classifies + retries + chains to the customer's
-// on_result), and the per-worker partitioned retry sweep (cron-like;
-// effect-reification-plan.md Phase 5 PR-3 step 1, commit `769bf53`).
+// on_result), and the durable `scheduler` (durable-wake-plan P5(a)):
+// scheduled fires, retry re-arms, and the crash-recovery watchdog are
+// all ONE `scheduler` entry under the idempotency key `_send/{id}`,
+// fired as the baked `__system/webhook_fire`. The privileged Zig owed
+// sweep (`owed_retry.zig`'s `sweepOwedRetries*`) is deleted — every
+// piece of webhook durability is now a composition a customer could
+// write themselves.
 //
-// Phase 5 PR-3 (this commit) atomically:
-//   - Flips this file from `http.send` (Zig binding) to the JS-shim
-//     composition below.
-//   - Deletes the Zig kernel (`send_dispatch.zig` / `send_inflight.zig`
-//     / `send_outbox.zig` / `callback_dispatch.zig`).
-//   - Drops the `apply.zig` `_send/owed/*` classifier hook — the
-//     marker is now an ordinary envelope-0 kv put.
-// The flip + delete MUST be one commit: with both alive the classifier
-// double-fires every webhook (legacy SendDispatch armed AND the JS
-// shim's `http.fetch` issued in the same tick).
-//
-// ## Marker JSON shape (the contract the retry sweep + onresult read)
+// ## Marker JSON shape (the contract webhook_fire + onresult read)
 //
 //   {
 //     "url":        string,                // upstream URL
@@ -24,15 +18,14 @@
 //     "body":       string,                // request body
 //     "headers":    object | undefined,    // customer headers (X-Rove-* stamped on fire)
 //     "attempts":   integer,               // 0 on first write; bumped by onresult
-//     "next_at_ns": string,                // BigInt-as-string; "0" or omitted ≡ due now
+//     "max_attempts": integer,             // retry budget (default 5)
 //     "on_result":  string | null,         // customer module path (null = fire-and-forget)
 //     "context":    any | null             // opaque customer payload, echoed back
 //   }
 //
-// `next_at_ns` is a string so it survives `JSON.stringify` without
-// precision loss (Date.now() * 1e6 fits an i64 but not a JS number's
-// safe-integer range past 2255). The Zig sweep parses it with
-// `std.fmt.parseInt(i64, …)`; missing/0 ≡ due now.
+// Fire TIMING no longer lives in the marker (`next_at_ns` is gone) —
+// the `scheduler` entry under key `_send/{id}` is the single durable
+// next-fire authority. The marker is pure send state.
 //
 // ## Id derivation
 //
@@ -51,15 +44,28 @@
 //          __system/webhook_onresult`, ctx = {id, on_result, context}.
 //          Customer-visible request carries `X-Rove-Schedule-Id` +
 //          `X-Rove-Schedule-Version` headers (version=1).
+//       3. scheduler watchdog at now + WATCHDOG_MS aimed at
+//          `__system/webhook_fire` — if the leader dies (or the
+//          onresult commit is lost) between the fetch and its
+//          terminal event, the wake re-fires the marker on whatever
+//          node then leads. Survives leader change by construction
+//          (the wake entry is replicated kv; the new leader's
+//          promotion pass rebuilds its watermark from it).
 //   - Scheduled (`fire_at_ns > now`):
-//       1. kv.set the marker with `next_at_ns = String(fire_at_ns)`.
-//       The retry sweep picks it up when due. No http.fetch from this
-//       call site.
+//       1. kv.set the marker.
+//       2. scheduler.at(fire_at_ns, "__system/webhook_fire", {id},
+//          {key: "_send/" + id}). No http.fetch from this call site —
+//          webhook_fire issues it when the wake fires.
 //
-// The sweep stamps the same `X-Rove-Schedule-Id` + `X-Rove-Schedule-
-// Version: {attempts+1}` headers on each retry, so upstream services
-// can dedupe by `(id, version)` consistently across first-fire-from-
-// handler and retry-from-sweep.
+// All three writes (marker + the scheduler entry's two `_sched/` keys)
+// ride the handler's one writeset; the inline fetch is a buffered Cmd
+// released post-commit. If the handler throws or raft faults, none of
+// it happened.
+//
+// webhook_fire stamps the same `X-Rove-Schedule-Id` + `X-Rove-
+// Schedule-Version: {attempts+1}` headers on each deferred fire, so
+// upstream services can dedupe by `(id, version)` consistently across
+// first-fire-from-handler and wake-fired retries.
 
 // Handler-surface Phase 3: the customer `http.fetch` spelling is
 // retired — webhook.send composes durability over the internal fetch
@@ -69,6 +75,11 @@
 // stays valid post-harden (only the globalThis property is removed, not
 // the object). Same closure-capture posture as globals/on.js.
 const sysHttp = _system.http;
+
+// Crash-recovery watchdog distance for the immediate-fire path: one
+// attempt timeout (the fetch binding's 30 s cap) + grace. Mirrored in
+// `__system/webhook_fire.mjs` (its per-attempt re-arm) — keep in sync.
+const WEBHOOK_WATCHDOG_MS = 40_000;
 
 /**
  * Durable outbound HTTP — at-least-once delivery, replay-deterministic.
@@ -85,7 +96,9 @@ globalThis.webhook = {
    * raft, then fires the request via {@link http.fetch}. On failure
    * the platform retries with exponential backoff (1s, 2s, 4s, …,
    * capped at 60s, max 5 attempts) — controlled by the baked
-   * `__system/webhook_onresult` shim, not customer code.
+   * `__system/webhook_onresult` shim, not customer code. Deferred
+   * fires (scheduled sends, retries, crash recovery) ride the durable
+   * {@link scheduler} and survive leader changes.
    *
    * The handler's commit gates the marker: if the handler throws or
    * raft faults, no marker is written and no request fires. After
@@ -104,9 +117,9 @@ globalThis.webhook = {
    *   handle. Same handle → same id → same `_send/owed/{id}` row
    *   (last write wins). Omit for a fresh random id.
    * @param {bigint|number} [opts.fire_at_ns] - Epoch nanoseconds.
-   *   `> now` defers the fire to the retry sweep (the marker is
-   *   written but no `http.fetch` happens until the sweep). Omit or
-   *   `<= now` for fire-as-soon-as-handler-commits.
+   *   `> now` defers the fire to a durable scheduled wake (the marker
+   *   is written but no `http.fetch` happens until the wake fires).
+   *   Omit or `<= now` for fire-as-soon-as-handler-commits.
    * @param {string} [opts.on_result] - Module path of a customer
    *   result handler. Receives the terminal event as
    *   `request.body.ctx.result = {ok, status, body, headers,
@@ -158,8 +171,8 @@ globalThis.webhook = {
       id = crypto.randomUUID();
     }
 
-    // Resolve fire_at_ns to a BigInt for the marker. now_ns is a
-    // BigInt (Date.now() is a Number; multiply by 1e6n converts).
+    // Resolve fire_at_ns to a BigInt. now_ns is a BigInt (Date.now()
+    // is a Number; multiply by 1e6n converts).
     const now_ns = BigInt(Date.now()) * 1_000_000n;
     let fire_at_ns_big = 0n;
     if (opts.fire_at_ns != null) {
@@ -186,14 +199,22 @@ globalThis.webhook = {
       headers: opts.headers || {},
       attempts: 0,
       max_attempts: max_attempts,
-      // Scheduled → next_at_ns is the customer-chosen fire time.
-      // Immediate → "0" (the sweep treats 0 as due-now, but the
-      // immediate http.fetch below pre-empts it).
-      next_at_ns: scheduled ? String(fire_at_ns_big) : "0",
       on_result: on_result,
       context: opts.context !== undefined ? opts.context : null,
     };
     kv.set("_send/owed/" + id, JSON.stringify(marker));
+
+    // The durable next-fire entry (one per send, idempotency key
+    // `_send/{id}` — re-sends with the same handle MOVE it, mirroring
+    // the marker's last-write-wins). Scheduled: the customer's fire
+    // time. Immediate: the crash-recovery watchdog (onresult cancels
+    // it on the terminal event; a retry re-arm moves it to the
+    // backoff time).
+    if (scheduled) {
+      scheduler.at(fire_at_ns_big, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
+    } else {
+      scheduler.after(WEBHOOK_WATCHDOG_MS, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
+    }
 
     // Phase 4.1.2 (re-enabled inline fire). The earlier sweep-only
     // path was a workaround for the marker-commit race: the marker
@@ -211,11 +232,10 @@ globalThis.webhook = {
     // AFTER raft commits the writeset. The fetch + the marker
     // share one commit gate. No more race.
     //
-    // Scheduled fires (`fire_at_ns > now`) still go sweep-only —
-    // the sweep is the natural home for "fire later" because the
-    // engine has no deferred-submit mechanism. The held-sync §6.4
-    // path stays correct either way (the 25s mandatory deadline
-    // covers both paths).
+    // Scheduled fires (`fire_at_ns > now`) go wake-only — the baked
+    // `__system/webhook_fire` issues the fetch when the durable wake
+    // fires. The held-sync §6.4 path stays correct either way (the
+    // 25s mandatory deadline covers both paths).
     if (!scheduled) {
       sysHttp.fetch({
         url: opts.url,
