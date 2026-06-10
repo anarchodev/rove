@@ -221,6 +221,14 @@ class V2Cluster:
             except subprocess.TimeoutExpired:
                 p.kill()
                 p.wait()
+        # A handled SIGTERM exits 0; anything else (SIGABRT = a Zig panic,
+        # SIGSEGV, nonzero) is a teardown bug — drain and surface it.
+        for p in self.procs:
+            if p.returncode not in (0, -signal.SIGKILL):
+                tail = p.stdout.read() if p.stdout else ""
+                name = getattr(p, "_name", "?")
+                print(f"TEARDOWN: {name} (pid {p.pid}) exited rc={p.returncode}")
+                print("\n".join("  | " + l for l in tail.splitlines()[-40:]))
         for d in (*self.data_dirs, self.cp_data_dir, self.files_data_dir,
                   self.log_data_dir):
             subprocess.run(["rm", "-rf", str(d)])

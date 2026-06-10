@@ -182,8 +182,18 @@ def stop_all():
         try:
             p.wait(timeout=10)
         except subprocess.TimeoutExpired:
+            p._hung_on_sigterm = True
             p.kill()
             p.wait()
+    # A handled SIGTERM exits 0; anything else (SIGABRT = a Zig panic,
+    # SIGSEGV, a hang escalated to SIGKILL) is a teardown bug — surface it.
+    for p in procs:
+        if getattr(p, "_hung_on_sigterm", False):
+            print(f"TEARDOWN: pid {p.pid} HUNG on SIGTERM (10s) — killed")
+        if p.returncode != 0 and not getattr(p, "_expected_kill", False):
+            tail = p.stdout.read() if p.stdout else ""
+            print(f"TEARDOWN: pid {p.pid} exited rc={p.returncode}")
+            print("\n".join("  | " + l for l in tail.splitlines()[-40:]))
 
 
 def main():
@@ -275,6 +285,7 @@ def main():
             print(f"       leader is :{leader_port} — killing it")
             for p in procs:
                 if getattr(p, "_name", "").startswith("c2") and p.args[2] == str(leader_port):
+                    p._expected_kill = True
                     p.send_signal(signal.SIGKILL)
                     p.wait()
             # data survived: a promoted survivor serves the latest value
