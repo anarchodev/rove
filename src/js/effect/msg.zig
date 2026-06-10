@@ -328,6 +328,7 @@ test "Msg covers every ActivationSource variant exhaustively" {
             .fetch_chunk => .{ .fetch_chunk = .{} },
             .durable_wake => .{ .durable_wake = dw },
             .ws_message => .{ .ws_message = .{} },
+            .inbound_headers => .{ .inbound_headers = .{} },
         };
         try testing.expectEqual(tag, m.kind());
     }

@@ -224,7 +224,7 @@ fn workerMain(args: *WorkerCtx) !void {
             else => return err,
         };
 
-        rjs.drainRequestReceiving(worker);
+        try rjs.drainRequestReceiving(worker);
         try rjs.drainBodyPending(worker);
         try rjs.drainFetchPendingDurability(worker);
         _ = try rjs.dispatchOnce(worker, &blocked_tenants);

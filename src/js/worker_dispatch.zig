@@ -27,6 +27,7 @@ const files_server_mod = @import("rove-files-server");
 const config_mirror = @import("config_mirror.zig");
 const effect_mod = @import("effect/root.zig");
 
+const blob_receive_mod = @import("blob_receive.zig");
 const dispatcher_mod = @import("dispatcher.zig");
 const continuation_mod = @import("bindings/continuation.zig");
 const stream_mod = @import("bindings/stream.zig");
@@ -845,11 +846,26 @@ fn finalizeBatch(
         // (the engine.submit fan-out) + clear so the outer defer
         // is a no-op.
         if (batch_pending_fetches.items.len > 0) {
-            worker.node.enqueuePendingFetches(batch_pending_fetches.items) catch |perr|
-                std.log.warn(
-                    "rove-js batch http.fetch flush (read-only, tenant={s}): {s}",
-                    .{ anchor_id, @errorName(perr) },
-                );
+            // blob.receive (§3.5.1 slice B): receive-door fetches arm
+            // on this worker (thread-affine h2 sink attach), never the
+            // engine. Partition them out in place.
+            var keep: usize = 0;
+            for (batch_pending_fetches.items) |pf| {
+                if (blob_receive_mod.isReceiveUrl(pf.url)) {
+                    worker.armBlobReceive(pf);
+                } else {
+                    batch_pending_fetches.items[keep] = pf;
+                    keep += 1;
+                }
+            }
+            batch_pending_fetches.items.len = keep;
+            if (keep > 0) {
+                worker.node.enqueuePendingFetches(batch_pending_fetches.items) catch |perr|
+                    std.log.warn(
+                        "rove-js batch http.fetch flush (read-only, tenant={s}): {s}",
+                        .{ anchor_id, @errorName(perr) },
+                    );
+            }
             batch_pending_fetches.clearRetainingCapacity();
         }
         for (successes.items) |*s| {
@@ -2460,20 +2476,24 @@ fn resolveRequest(
 }
 
 /// headers_first front half (`docs/blob-storage-plan.md` §3.5.1):
-/// h2 emits a request whose body is still inbound into
-/// `request_receiving` at the HEADERS frame, holding the stream's
-/// flow-control window shut until the worker picks a disposition.
-/// Pull every receiving entity into `request_out` under
-/// `BodyInbound{ .receiving = true }`; `dispatchOnce` runs it as an
-/// `.inbound_headers` activation — the module's `onHeaders` export
-/// decides from headers alone, and a module without one falls back
-/// to classic buffering via the `.no_onheaders` outcome.
-pub fn drainRequestReceiving(worker: anytype) void {
+/// EVERY h2 body-carrying request is emitted into
+/// `request_receiving` at the HEADERS frame (h2 never auto-completes
+/// it — uniform dispatch regardless of body timing). Pull each one
+/// into `request_out` under `BodyInbound{ .receiving = true }`;
+/// `dispatchOnce` picks the shape per module: `onHeaders` exported →
+/// `.inbound_headers` (empty body); not exported (the cached common
+/// case) → attach-or-buffer and run classic. The flush makes the
+/// moves visible to this same tick's `dispatchOnce`, so the classic
+/// path keeps its arrival-tick dispatch latency.
+pub fn drainRequestReceiving(worker: anytype) !void {
     const server = worker.h2;
-    for (server.request_receiving.entitySlice()) |ent| {
+    const entities = server.request_receiving.entitySlice();
+    if (entities.len == 0) return;
+    for (entities) |ent| {
         server.reg.set(ent, &server.request_receiving, worker_mod.BodyInbound, .{ .receiving = true }) catch continue;
         server.reg.move(ent, &server.request_receiving, &server.request_out) catch continue;
     }
+    try server.reg.flush();
 }
 
 pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
@@ -2594,7 +2614,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         const method = respb.findHeader(rh, ":method") orelse "GET";
         const path = respb.findHeader(rh, ":path") orelse "/";
         const authority = respb.findHeader(rh, ":authority") orelse "";
-        const body: []const u8 = if (req_body.data) |p| p[0..req_body.len] else "";
+        // `var`: the headers-first disposition below may attach an
+        // already-complete body in place (`.body_complete`) and
+        // continue this very iteration as a classic dispatch.
+        var body: []const u8 = if (req_body.data) |p| p[0..req_body.len] else "";
 
         checkProxyWarning(rh);
 
@@ -2779,6 +2802,52 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 503, .timeout, &.{}, &.{}, .{}, null, .inbound, 0);
             processed += 1;
             continue;
+        }
+
+        // headers_first disposition (§3.5.1). Every h2 body-carrying
+        // request arrives marked `.receiving` (drainRequestReceiving)
+        // with an EMPTY body — uniform regardless of body timing.
+        // Dispatch shape comes from the module's exports, cached per
+        // (deployment, module):
+        //   - exports onHeaders (or unknown — probe; the outcome
+        //     fills the cache) → `.inbound_headers` activation, body
+        //     stays at the door.
+        //   - known-no → classic: attach the body in place when it
+        //     already fully arrived and continue THIS iteration, or
+        //     re-open the window and re-dispatch body-complete later.
+        var headers_first_dispatch = false;
+        if (body_inbound.receiving) {
+            const cached = worker_mod.onHeadersLookup(worker, dep_id, route.module_base);
+            if (cached orelse true) {
+                headers_first_dispatch = true;
+            } else {
+                try server.reg.set(ent, &server.request_out, worker_mod.BodyInbound, .{ .receiving = false });
+                switch (server.requestBodyBuffer(ent)) {
+                    .body_complete => {
+                        if (server.reg.get(ent, &server.request_out, h2.ReqBody)) |rb| {
+                            body = if (rb.data) |p| p[0..rb.len] else "";
+                        } else |_| {}
+                        // Re-check the body cap against the real
+                        // length (a chunked body has no
+                        // content-length for the declared check).
+                        if (body.len > body_cap) {
+                            try respb.setSimpleResponse(server, ent, sid, sess, 413, "payload too large\n", allocator);
+                            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 413, .handler_error, &.{}, &.{}, .{}, null, .inbound, 0);
+                            processed += 1;
+                            continue;
+                        }
+                    },
+                    .buffering => {
+                        processed += 1;
+                        continue;
+                    },
+                    .gone => {
+                        try respb.setSimpleResponse(server, ent, sid, sess, 503, "client disconnected before body completed\n", allocator);
+                        processed += 1;
+                        continue;
+                    },
+                }
+            }
         }
 
         // This is a handler-bound request. Either establish the
@@ -3062,7 +3131,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .query = route.query,
             .headers = rh,
             .session_id = session_resolved.sid,
-            .activation = if (body_inbound.receiving) .inbound_headers else .inbound,
+            .activation = if (headers_first_dispatch) .inbound_headers else .inbound,
             .activation_entity = ent,
             .trace = .{
                 .readset = &readset,
@@ -3221,13 +3290,24 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // after the transfer (below) so the defer becomes a no-op
         // on the success path.
         defer if (stream_meta_opt) |*m| m.deinit(allocator);
+        // headers_first probe outcome → export cache. A successful
+        // `.inbound_headers` run proves `onHeaders` exists; the
+        // `.no_onheaders` arm below records the miss. Deployments
+        // are immutable, so first-probe fills are permanent.
+        if (headers_first_dispatch and run_oc != .no_onheaders)
+            worker_mod.onHeadersRemember(worker, dep_id, route.module_base, true);
+
         var resp: dispatcher_mod.Response = switch (run_oc) {
             // headers_first probe miss: the module has no `onHeaders`
             // — fall back to classic buffering. Roll back the probe's
             // savepoint (module top-level may have run), clear the
             // marker, and hand the body question back to h2. Not a
-            // completed activation: no response, no log record.
+            // completed activation: no response, no log record. Only
+            // the FIRST body-carrying request per (deployment,
+            // module) lands here — the cache routes the rest
+            // straight to the classic path.
             .no_onheaders => {
+                worker_mod.onHeadersRemember(worker, dep_id, route.module_base, false);
                 txn.?.rollbackTo() catch |re| panic_mod.invariantViolated(
                     "dispatchOnce.rollbackTo(no_onheaders)",
                     "tenant={s} err={s}",
@@ -3533,6 +3613,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // `pending_fetches` if THIS handler failed before
         // reaching here; on success ownership transfers via
         // `clearRetainingCapacity` after the move.
+        var has_receive = false;
         transfer: {
             if (pending_fetches.items.len == 0) break :transfer;
             batch_pending_fetches.ensureUnusedCapacity(allocator, pending_fetches.items.len) catch |perr| {
@@ -3558,6 +3639,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // registers (no register-then-cleanup churn either).
             const held = cont_opt != null or stream_meta_opt != null;
             for (pending_fetches.items) |*pf| {
+                // blob.receive: the chain holds for the duration of
+                // the client's upload — give it the receive deadline,
+                // not the 25 s default (no intermediate activations
+                // ever bump it; zero chunk Msgs by design).
+                if (held and blob_receive_mod.isReceiveUrl(pf.url)) has_receive = true;
                 // Handler-surface Phase 3: an `on.fetch` (connection-
                 // scoped) from a NON-held activation is INERT — drop it
                 // (no unbound fire). The model's rule: all `on.*` are for
@@ -3623,7 +3709,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .request_id = request_id,
             .cont = cont_opt,
             .cont_deadline_ns = if (cont_opt != null)
-                @as(i64, @intCast(std.time.nanoTimestamp())) + worker_mod.CONT_HOLD_DEADLINE_NS
+                @as(i64, @intCast(std.time.nanoTimestamp())) +
+                    (if (has_receive) worker_mod.RECEIVE_HOLD_DEADLINE_NS else worker_mod.CONT_HOLD_DEADLINE_NS)
             else
                 0,
             .cont_bound_sched_id = cont_bound_sched_id,

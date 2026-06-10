@@ -20,6 +20,7 @@ const qjs = @import("rove-qjs");
 const c = qjs.c;
 const blob_mod = @import("rove-blob");
 const blob_sessions = @import("../blob_sessions.zig");
+const blob_receive = @import("../blob_receive.zig");
 const http_b = @import("http.zig");
 
 const globals = @import("../globals.zig");
@@ -333,6 +334,136 @@ pub fn jsBlobSeal(
     // it so the handler can use it immediately; the `to` resume also
     // receives it as `request.ctx.hash` (the seal PUT's ctx_json).
     return c.JS_NewStringLen(ctx, &sealed.hash_hex, 64);
+}
+
+/// `_system.blob.receive(to)` — `docs/blob-storage-plan.md` §3.5
+/// (P3): pipe the inbound body socket → tenant-prefix S3 multipart
+/// with ZERO chunk Msgs. Only callable from an `onHeaders`
+/// activation (the body is still at the door); at most once per
+/// activation (a receive consumes THE body). Appends a
+/// `connection_scoped` PendingFetch through the
+/// `rove-receive.internal` door — the EXISTING handler-success seam
+/// bind-or-drops it exactly like `blob.seal`'s PUT: held (`next()`)
+/// ⇒ the worker arms the upload driver at the commit point and the
+/// completion event resumes this chain at `to` with
+/// `request.ctx = {hash, len}`; not held ⇒ inert (nothing promised,
+/// the stream stays held and the response flips it to discard).
+pub fn jsBlobReceive(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    const state = globals.getState(ctx);
+    if (!state.allow_blob_receive) {
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive: only callable from an onHeaders activation");
+        return js_exception;
+    }
+    if (state.blob_receive_used) {
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive: already called for this request (one inbound body)");
+        return js_exception;
+    }
+    const fetches = state.pending_fetches orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive: no connection context");
+        return js_exception;
+    };
+    const ent = state.activation_entity orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive: no held socket on this activation");
+        return js_exception;
+    };
+    if (argc < 1 or !c.JS_IsString(argv[0])) {
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive requires a `to` export name");
+        return js_exception;
+    }
+
+    var to_len: usize = 0;
+    const to_c = c.JS_ToCStringLen(ctx, &to_len, argv[0]);
+    if (to_c == null) return js_exception;
+    defer c.JS_FreeCString(ctx, to_c);
+    const to = @as([*]const u8, @ptrCast(to_c))[0..to_len];
+    if (!http_b.isValidExportName(to)) {
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive: `to` must be a JS identifier");
+        return js_exception;
+    }
+
+    const a = state.allocator;
+    const fetch_id = http_b.deriveFetchIdHex(a, state.request_id, state.http_fetch_index) catch {
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive: out of memory");
+        return js_exception;
+    };
+    state.http_fetch_index += 1;
+    var id_owned: ?[]u8 = fetch_id;
+    defer if (id_owned) |s| a.free(s);
+
+    var built: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (built.items) |s| a.free(s);
+        built.deinit(a);
+    }
+    const url = dupePrint(a, &built, "{s}{d}.{d}", .{
+        blob_receive.RECEIVE_ORIGIN_PREFIX, ent.index, ent.generation,
+    }) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive: out of memory");
+        return js_exception;
+    };
+    const method = dupePrint(a, &built, "PUT", .{}) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive: out of memory");
+        return js_exception;
+    };
+    const headers_json = dupePrint(a, &built, "{{}}", .{}) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive: out of memory");
+        return js_exception;
+    };
+    const ctx_json = dupePrint(a, &built, "{{}}", .{}) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive: out of memory");
+        return js_exception;
+    };
+    const empty1 = dupePrint(a, &built, "", .{}) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive: out of memory");
+        return js_exception;
+    };
+    const empty2 = dupePrint(a, &built, "", .{}) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive: out of memory");
+        return js_exception;
+    };
+    const empty3 = dupePrint(a, &built, "", .{}) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive: out of memory");
+        return js_exception;
+    };
+    const tenant_dup = dupePrint(a, &built, "{s}", .{state.instance_id}) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive: out of memory");
+        return js_exception;
+    };
+    const name_dup = dupePrint(a, &built, "{s}", .{to}) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive: out of memory");
+        return js_exception;
+    };
+
+    fetches.append(a, .{
+        .tenant_id = tenant_dup,
+        .id = id_owned.?,
+        .url = url,
+        .method = method,
+        .headers_json = headers_json,
+        .body = empty1,
+        .timeout_ms = 0,
+        .on_chunk_module = empty2,
+        .ctx_json = ctx_json,
+        .stream = false,
+        .max_response_chunk_bytes = 64 * 1024,
+        .max_total_response_bytes = 1024 * 1024,
+        .name = name_dup,
+        .bound_send_id = empty3,
+        .connection_scoped = true,
+    }) catch {
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive: out of memory");
+        return js_exception;
+    };
+    built.clearRetainingCapacity();
+    id_owned = null;
+    state.blob_receive_used = true;
+
+    return js_undefined;
 }
 
 /// Append-or-null print helper: dupes the formatted string and
