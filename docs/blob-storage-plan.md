@@ -209,53 +209,66 @@ bytes: *does your logic depend on the content of the chunks?* Yes →
 `onChunk` + `blob.write` (Case A — you pay the tape, correctly). No →
 `onHeaders` + `blob.receive` (Case B — one PUT).
 
-### 3.5.1 P3 build state + transport design (slice A shipped 2026-06-09)
+### 3.5.1 P3 as-built (slice A 2026-06-09, slice B 2026-06-10)
 
-**Slice A — the storage half — is BUILT and live-proven**
-(`s3-blob-smoke` step 8 against real S3): `S3BlobStore.
-createMultipartUpload / uploadPart / completeMultipartUpload /
-abortMultipartUpload / copyObject` (`src/blob/s3.zig`), on a new
-generalized `requestExt` (wire-encoded query signed verbatim via
-`query_canonical` so uploadId encoding can't drift; ETag captured
-from response headers; `<Error>`-in-200-body detected on create/
-complete/copy), plus `sigv4.sign` extended with
-`extra_signed_headers` (SigV4 mandates signing `x-amz-copy-source`).
-The temp→CAS move is `complete` at `app-blobs/.uploads/{session}`
-then server-side `copyObject` to `app-blobs/{hash}` + delete — zero
-bytes transit the worker.
+**Slice A — the storage half** (`s3-blob-smoke` step 8 against real
+S3): `S3BlobStore.createMultipartUpload / uploadPart /
+completeMultipartUpload / abortMultipartUpload / copyObject`
+(`src/blob/s3.zig`), on a generalized `requestExt` (wire-encoded
+query signed verbatim via `query_canonical` so uploadId encoding
+can't drift; ETag captured from response headers;
+`<Error>`-in-200-body detected on create/complete/copy), plus
+`sigv4.sign` extended with `extra_signed_headers` (SigV4 mandates
+signing `x-amz-copy-source`). The temp→CAS move is `complete` at
+`app-blobs/.uploads/{id}` then server-side `copyObject` to
+`app-blobs/{hash}` + delete — zero bytes transit the worker.
 
-**The transport half is NOT built.** Code-verified seams
-(2026-06-09 recon) for whoever builds it:
+**Slice B — the transport half** (`blob_receive_smoke_v2.py` +
+`inbound_body_smoke_v2.py`), as built:
 
-- Bodies today buffer in the h2 `Stream` until END_STREAM
-  (`src/h2/root.zig` `bodyAppend` ~:377, `onDataChunkRecvCb` ~:826);
-  the `request_out` entity exists only at END_STREAM
-  (`onFrameRecvCb` ~:875). There is NO h2-layer size cap (only the
-  front door's 16 MB backstop) — the streaming path is also the fix
-  for that exposure.
-- nghttp2 runs AUTO window update — zero
-  `nghttp2_session_consume` calls in tree. Holding bytes back until
-  disposition requires `NGHTTP2_OPT_NO_AUTO_WINDOW_UPDATE` +
-  explicit `consume()` after the handler decides; without it,
-  "receive" still buffers whole bodies in worker RAM and the verb is
-  pointless. This is the load-bearing h2 change.
-- Headers are fully parsed at `on_header` time (Stream.hdr_fields)
-  but no entity exists — `onHeaders` dispatch = emit `request_out`
-  at HEADERS with a body-still-inbound marker component, dispatch by
-  export introspection (the `default`/`onChunk` mechanism), and
-  route subsequent DATA chunks to a sink registered on the entity
-  (the `ws_message_out` per-frame delivery is the in-tree precedent
-  for incremental h2→worker payloads).
-- The sink: per-upload driver (NOT the blob coordinator's executor
-  pool — its one-synchronous-PUT shape doesn't fit stateful
-  multipart) accumulating to ≥5 MiB parts, incremental sha256,
-  complete+copy on END_STREAM, abort on disconnect/teardown. The
-  completion enqueues one Msg ({hash, len}) resuming the held chain
-  at `{to}` — same bind machinery as `blob.seal`'s PUT.
-- h1 ingress shares `request_out` downstream
-  (`src/h2/http1.zig` `http1EmitRequest` ~:2184) and has the
-  `expect: 100-continue` hook (~:2173) — h1 streaming can follow,
-  not gate, the h2 path.
+- **headers_first h2** (`h2_opts.headers_first`, rewind worker only —
+  front door/examples keep the classic contract): server sessions
+  run `NGHTTP2_OPT_NO_AUTO_WINDOW_UPDATE`; every body-carrying
+  request is emitted into the new `request_receiving` collection at
+  the HEADERS frame with the stream's window held shut (`.hold`).
+  State is collection membership: `request_receiving` (undecided) →
+  `request_buffering` (classic decision) → `request_out` (body
+  attached — its body-complete contract is preserved). h2 never
+  auto-completes from `request_receiving`, so dispatch shape is
+  uniform regardless of body timing (a 1 KiB and a 12 MiB upload to
+  the same module take the same path).
+- **`onHeaders` dispatch row**: wire activation source
+  `inbound_headers = 10`; the worker's disposition point
+  (`drainRequestReceiving` → `dispatchOnce`) consults a worker-local
+  per-(deployment, module) `onHeaders` export cache — exported →
+  `.inbound_headers` activation with an EMPTY body (early 4xx and
+  the plan-tier 413 fire before any body byte is accepted; body is
+  untaped by construction); not exported (the cached common case) →
+  attach-in-place + same-tick classic dispatch, zero hot-path cost.
+  First request per module probes (the `RunOutcome.no_onheaders`
+  fallback) and fills the cache; deployments are immutable.
+- **`blob.receive({to})`** is a connection-scoped PendingFetch
+  through the `rove-receive.internal` door — `blob.seal`'s exact
+  pattern, so bind-or-drop at handler success, commit-gating via
+  `Cmd.http_fetch`, and the held-chain resume machinery are all
+  reused verbatim. The worker intercepts the door URL at its two
+  commit points (`interpretCmd` + the read-only flush) and arms a
+  per-upload driver thread (`src/js/blob_receive.zig`): h2 `.sink`
+  mode routes DATA into its queue; it accumulates ≥5 MiB parts,
+  hashes incrementally, completes + copies + deletes on END_STREAM,
+  aborts on disconnect, and emits ONE terminal `UpstreamFetchEvent`
+  (`request.ctx = {hash, len}`) through the FetchEngine's router.
+  Flow control is end-to-end: `sweepBodySinks` repays window only as
+  the driver drains, so the client's send rate follows the S3 upload
+  rate (≤ one window + one 5 MiB part buffer RAM per job; node cap
+  64 jobs). Receive-holding chains park with a 15 min deadline
+  (zero Msgs ever bump a receive park).
+- h1 ingress is unchanged (bodies complete at emission — h1
+  streaming can follow, not gate, the h2 path). The h2-layer size
+  cap exposure is narrowed but not closed: the per-tenant 413 now
+  fires from the declared content-length before buffering;
+  a length-less h2 stream still buffers up to the cap before the
+  recheck (follow-up: h2-level running-length cap).
 
 ## 4. The verbs against the effect-algebra contract
 
@@ -412,7 +425,7 @@ string (hot) / `null` (gone) / `undefined` (sealed — finish in
 |---|---|---|
 | P1 ✅ | signing door + `put`/`get`/`url` shims (2026-06-09, `scripts/blob_smoke_v2.py`) | smallest end-to-end slice; covers events, snapshots, small media; `url` unlocks 307-to-presigned downloads |
 | P2 ✅ | `write`/`seal` upload sessions (2026-06-09, same smoke, 19/19) | bounded single-PUT sessions (64 MiB cap), NOT multipart — see as-built deltas |
-| P3 ◐ | slice A (S3 multipart substrate) ✅ 2026-06-09; transport half designed, not built | §3.5.1: storage half live-proven; remaining = h2 window-hold + onHeaders dispatch + DATA sink |
+| P3 ✅ | slice A (S3 multipart substrate) 2026-06-09 + slice B (transport + `blob.receive`) 2026-06-10 (`scripts/blob_receive_smoke_v2.py`) | §3.5.1: full Case-B pipe live-proven — 12 MiB streamed byte-exact, zero chunk activations |
 | P4 ✅ | `segments.js` stdlib recipe (2026-06-09, smoke step 8, 28/28) | the kv-cap ↔ byte-ring lever; as-built notes in §6 |
 | — | byte-ring metering + quota | alongside P1–P3; enforcement points per §7.2 |
 

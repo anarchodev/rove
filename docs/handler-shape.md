@@ -235,6 +235,7 @@ model retired (§8.3). So:
 | Activation | Export | Scope | When it fires |
 |---|---|---|---|
 | inbound HTTP (buffered) | `default` | connection | body ≤ 1 MB; > 1 MB → 413 if no `onChunk` |
+| inbound HTTP, headers-first | `onHeaders` | connection | SHIPPED (blob-storage-plan §3.5): module exports `onHeaders` → every body-carrying request dispatches it with an EMPTY body before any body byte is accepted (the client is flow-control-held at the door). Decide from headers alone: early 4xx terminal, or `blob.receive({to}) + next()` to pipe the body socket→storage with zero chunk activations — `{to}` resumes with `request.ctx = {hash, len}` when the object is durable. Uniform regardless of body timing or size |
 | inbound HTTP chunk | `onChunk` | connection | per chunk (≤ 1 MB → fires once with the whole body) |
 | `on.fetch` result | `onFetchResult` (or `to`) | connection | a connection `on.fetch` returned its whole body |
 | `on.fetch` chunk | `onFetchChunk` (or `to`) | connection | per chunk of a streamed `on.fetch` |
