@@ -140,6 +140,11 @@ pub const InboundChunk = struct {
     /// under the cap fires exactly once with `seq == 0` and
     /// `done == true`.
     done: bool = false,
+    /// The held chain's `next({ctx})` payload (JSON text, borrowed
+    /// from the parked ContDescriptor for the dispatch) — surfaces as
+    /// `request.ctx` on chunk 1+. Null on the first fire (no
+    /// continuation yet).
+    ctx_json: ?[]const u8 = null,
 };
 
 /// What caused this activation, carrying the per-source payload. Only the

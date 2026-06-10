@@ -2753,12 +2753,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             std.fmt.parseInt(u64, std.mem.trim(u8, cl, " \t"), 10) catch 0
         else
             0;
-        if (declared_len > body_cap or body.len > body_cap) {
-            try respb.setSimpleResponse(server, ent, sid, sess, 413, "payload too large\n", allocator);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 413, .handler_error, &.{}, &.{}, .{}, null, .inbound, 0);
-            processed += 1;
-            continue;
-        }
+        // Gap 2.4: the 413 itself moved BELOW route resolution — a
+        // module that exports `onChunk` streams any-size bodies, and
+        // whether it does is a per-(deployment, module) question. The
+        // classic paths keep both halves of the old check: the
+        // pre-buffer declared-length reject (classic receiving arm)
+        // and the buffered-length check (after the chunk-routing
+        // decision).
 
         // Static-first dispatch for customer traffic only. Admin
         // requests already ran their own pre-auth static check above —
@@ -2832,22 +2833,56 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             const cached = worker_mod.onHeadersLookup(worker, dep_id, route.module_base);
             if (cached orelse true) {
                 headers_first_dispatch = true;
+            } else if (worker.inbound_chunk_jobs.get(ent) != null or
+                (worker_mod.onChunkLookup(worker, dep_id, route.module_base) orelse true))
+            {
+                // Gap 2.4 S2 (inbound-chunk-plan): the module routes to
+                // `onChunk` (cached-yes or unknown — the first fire
+                // probes). Attach the worker-side body sink once; the
+                // job accumulates (≤ cap, single-fire) or streams
+                // (> cap, per-chunk with repay-on-resolve
+                // backpressure). The FIRST fire is staged here through
+                // the normal dispatch block; `pumpInboundChunks` fires
+                // the rest off `parked_continuations` membership.
+                const job = worker.inbound_chunk_jobs.get(ent) orelse
+                    worker.armInboundChunkSink(ent, sess.entity, sid.id, body_cap) orelse
+                    {
+                        try respb.setSimpleResponse(server, ent, sid, sess, 503, "client disconnected before body completed\n", allocator);
+                        processed += 1;
+                        continue;
+                    };
+                if (job.classic_fallback) {
+                    // `no_onchunk` probe miss on a complete ≤cap body:
+                    // dispatch classic with the staged payload (the
+                    // sink consumed the bytes, so h2 can't re-buffer).
+                    body = job.staged orelse "";
+                } else if (job.fireReady()) {
+                    if (!job.stageFire()) {
+                        processed += 1;
+                        continue; // OOM — retry next walk
+                    }
+                    body = job.staged.?;
+                    chunk_dispatch = true;
+                } else {
+                    // Bytes still arriving; nothing to do this walk.
+                    continue;
+                }
             } else {
+                // Classic buffered path. Pre-buffer reject on the
+                // declared length (the relocated half of the old
+                // up-front 413) so a declared-huge body never buffers.
+                if (declared_len > body_cap) {
+                    try respb.setSimpleResponse(server, ent, sid, sess, 413, "payload too large\n", allocator);
+                    worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 413, .handler_error, &.{}, &.{}, .{}, null, .inbound, 0);
+                    processed += 1;
+                    continue;
+                }
                 try server.reg.set(ent, &server.request_out, worker_mod.BodyInbound, .{ .receiving = false });
                 switch (server.requestBodyBuffer(ent)) {
                     .body_complete => {
                         if (server.reg.get(ent, &server.request_out, h2.ReqBody)) |rb| {
                             body = if (rb.data) |p| p[0..rb.len] else "";
                         } else |_| {}
-                        // Re-check the body cap against the real
-                        // length (a chunked body has no
-                        // content-length for the declared check).
-                        if (body.len > body_cap) {
-                            try respb.setSimpleResponse(server, ent, sid, sess, 413, "payload too large\n", allocator);
-                            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 413, .handler_error, &.{}, &.{}, .{}, null, .inbound, 0);
-                            processed += 1;
-                            continue;
-                        }
                     },
                     .buffering => {
                         processed += 1;
@@ -2866,13 +2901,19 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // dispatch routes to `onChunk` when the module exports it —
         // cached-yes or unknown (the first dispatch probes; a
         // `.no_onchunk` outcome below caches the miss and re-walks
-        // classic). Single fire with the whole body, `done = true`;
-        // the > cap streaming path is the plan's S2. Decided OUTSIDE
-        // the receiving branch so it covers all three body arrivals:
-        // same-iteration `.body_complete`, the `.buffering`
-        // re-dispatch, and bodies complete at first emission.
-        if (!headers_first_dispatch and body.len > 0) {
+        // classic). Single fire with the whole body, `done = true`.
+        // Decided OUTSIDE the receiving branch so it also covers
+        // bodies that arrived complete (h1, END_STREAM-with-HEADERS).
+        if (!headers_first_dispatch and !chunk_dispatch and body.len > 0) {
             chunk_dispatch = worker_mod.onChunkLookup(worker, dep_id, route.module_base) orelse true;
+        }
+        // The buffered-length half of the relocated 413: applies to
+        // every non-chunk dispatch (chunk handlers take any size).
+        if (!headers_first_dispatch and !chunk_dispatch and (declared_len > body_cap or body.len > body_cap)) {
+            try respb.setSimpleResponse(server, ent, sid, sess, 413, "payload too large\n", allocator);
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 413, .handler_error, &.{}, &.{}, .{}, null, .inbound, 0);
+            processed += 1;
+            continue;
         }
 
         // This is a handler-bound request. Either establish the
@@ -3158,12 +3199,19 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .session_id = session_resolved.sid,
             .activation = if (headers_first_dispatch)
                 .inbound_headers
-            else if (chunk_dispatch)
-                // S1 single fire: the whole buffered body is chunk 0
-                // and the last chunk at once.
-                .{ .inbound_chunk = .{ .seq = 0, .byte_offset = 0, .done = true } }
-            else
-                .inbound,
+            else if (chunk_dispatch) blk: {
+                // Staged sink fire (S2): per-chunk fields from the
+                // job. No job (h1 / body-complete-at-emission): the
+                // whole buffered body is chunk 0 and the last at once.
+                if (worker.inbound_chunk_jobs.get(ent)) |job| {
+                    break :blk dispatcher_mod.Activation{ .inbound_chunk = .{
+                        .seq = job.next_seq,
+                        .byte_offset = job.fired_offset,
+                        .done = job.staged_done,
+                    } };
+                }
+                break :blk dispatcher_mod.Activation{ .inbound_chunk = .{ .seq = 0, .byte_offset = 0, .done = true } };
+            } else .inbound,
             .activation_entity = ent,
             .trace = .{
                 .readset = &readset,
@@ -3328,9 +3376,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // are immutable, so first-probe fills are permanent.
         if (headers_first_dispatch and run_oc != .no_onheaders)
             worker_mod.onHeadersRemember(worker, dep_id, route.module_base, true);
-        // Same discipline for the gap-2.4 onChunk probe.
-        if (chunk_dispatch and run_oc != .no_onchunk)
+        // Same discipline for the gap-2.4 onChunk probe; a staged sink
+        // fire also advances the job's dispatch bookkeeping (seq /
+        // offset / repay-on-resolve; `pumpInboundChunks` fires the
+        // rest off the parked collection).
+        if (chunk_dispatch and run_oc != .no_onchunk) {
             worker_mod.onChunkRemember(worker, dep_id, route.module_base, true);
+            if (worker.inbound_chunk_jobs.get(ent)) |job| job.fireDispatched();
+        }
 
         var resp: dispatcher_mod.Response = switch (run_oc) {
             // headers_first probe miss: the module has no `onHeaders`
@@ -3361,11 +3414,16 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 continue;
             },
             // Gap-2.4 probe miss: the module has no `onChunk` — cache
-            // the miss, roll back the probe's savepoint, and leave the
-            // entity in request_out (body already attached,
-            // `receiving` already false): the next walk dispatches it
-            // as a classic `.inbound`. Only the FIRST body-carrying
-            // request per (deployment, module) lands here.
+            // the miss and roll back the probe's savepoint. Three
+            // sub-cases:
+            //   - sink job, complete ≤cap body → classic fallback: the
+            //     sink consumed the bytes, so the staged payload
+            //     re-dispatches as a classic `.inbound` next walk.
+            //   - sink job, > cap (firing) → the contract's 413.
+            //   - no job (h1 / body-complete-at-emission): body is
+            //     attached; the next walk dispatches it classic.
+            // Only the FIRST body-carrying request per (deployment,
+            // module) lands here.
             .no_onchunk => {
                 worker_mod.onChunkRemember(worker, dep_id, route.module_base, false);
                 txn.?.rollbackTo() catch |re| panic_mod.invariantViolated(
@@ -3373,6 +3431,15 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     "tenant={s} err={s}",
                     .{ scope_inst.id, @errorName(re) },
                 );
+                if (worker.inbound_chunk_jobs.get(ent)) |job| {
+                    if (job.eof and !job.firing) {
+                        job.classic_fallback = true;
+                    } else {
+                        job.kill();
+                        try respb.setSimpleResponse(server, ent, sid, sess, 413, "payload too large\n", allocator);
+                        worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 413, .handler_error, &.{}, &.{}, .{}, null, .inbound, 0);
+                    }
+                }
                 processed += 1;
                 continue;
             },
