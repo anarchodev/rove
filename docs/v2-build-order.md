@@ -279,7 +279,7 @@ This is the heart of the rewrite.
 > it + self-forwarded — `handleLoadMerge` now drops it.) **All three
 > remaining-hardening items are closed (2026-06-10):** directory
 > raft-replication shipped earlier with the replicated CP
-> (`docs/v2-cp-directory-replication.md`, `cp_ha_smoke.py` — this list was
+> (`docs/architecture/control-plane.md`, `cp_ha_smoke.py` — this list was
 > stale); multi-node-dest forward re-targeting is **done** — the
 > `_move/forward` marker now holds the FULL dest node list (comma-separated,
 > leader first; a single URL is a one-element list) and the source's

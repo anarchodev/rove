@@ -616,3 +616,153 @@ are closed, not gaps.
   held-sync projection is cosmetic, not a relaxation (see §3.3).
 - **Multi-tenant atomic writeset** — rejected. Each tenant's `app.db` is its own
   raft target; there is no cross-tenant atomic commit.
+
+---
+
+## 13. Connection-actor: the unified trigger model & callback execution
+
+Recorded 2026-06-10 from the 2026-05-18 architecture session. This model
+superseded the framing of the retired `connection-actor-plan.md` (§4
+copyable-handle branch, §6 projections) and the retired `http-send-plan.md`;
+both were deleted in the docs restructure with their mechanics folded into
+`architecture/effects-and-handlers.md` and `architecture/routing-and-ingress.md`
+("Held connections"), but the *decisions* had until now lived only in session
+memory.
+
+### 13.1 Affine trampoline + coalesced trigger — fan-in on the trigger, never the writer
+- **Decision** (2026-05-18; the shipped shape is the Continuation primitive +
+  parked-Msg queue): every connection has exactly one owner — an affine,
+  single-threaded continuation chain. A handler activation either returns a
+  terminal value (becomes the response; the connection closes) or a
+  continue-disposition (the connection stays parked; the runtime invokes the
+  next module). Many sources may *signal* the owner, but only via a coalesced
+  trigger that carries **no data and no write capability** — "wake the owners
+  subscribed to this", nothing more. Trigger activators: timer/delay, inbound
+  message, named publish, fetch/send callback, durable-log advance. The woken
+  owner's single-threaded callback decides what to read (request body / kv
+  state / durable-log prefix) and what to write.
+- **Why**: every projection (SSE, WebSocket, held-sync third-party call,
+  subscription stream) collapses to this one primitive — only the activator
+  and what the owner reads vary. Write races are impossible by construction
+  (one writer per connection); fan-in complexity relocates onto the trigger,
+  which is stateless and data-free. This also makes PLAN §7/§10.1's
+  "notification ≠ state store; refetch beats replay" thesis the *universal*
+  mechanism rather than an SSE special case.
+- **Rejected**: a **copyable addressable connection handle** plus a sequencer
+  for fan-in (the original plan-§4 branch). The affine chain needs no handle
+  at all; the "fan-in needs sequencer + handle + 5-layer security" analysis
+  was wrong. Corollary, intentional: broadcast *cannot* be "enumerate the
+  connections and push" — fan-out is pub-sub on a trigger (the `on.kv` room
+  recipe in `websocket-plan.md`), a customer recipe rather than a platform
+  API.
+
+### 13.2 No connection handle in any JS projection (capability-by-construction)
+- **Decision**: customer JS never receives a connection reference, in any
+  projection. Resolve-once and leak-once bugs, and handle-based confused
+  deputies, are structurally impossible rather than defended against.
+- **Effect on the 5-layer holder isolation model** (locked 2026-05-18, when a
+  handle still existed): layers 1 (unguessable 128-bit external handle) and 5
+  (no JS surface to name a foreign id) are **mooted** — there is nothing to
+  guess or name. Layers 2–4 remain load-bearing for the internal
+  worker↔held-state transport: an owning-tenant chokepoint on every
+  operation (fail loud on mismatch), privileged endpoints gated on an
+  internal bearer never surfaced to QJS, and wake routing fixed to the
+  owning tenant from the platform's own table — never a caller-supplied
+  tenant. The live threat is the **confused deputy via customer
+  `http.fetch`**: a handler can POST any URL, so an internal endpoint that
+  mutates connection state must authenticate the platform, not trust its
+  caller. The same reasoning keeps fleet keys out of customer-style sandboxes
+  (`v2-production-deploy-plan.md`, cluster-manager section).
+- **Scope of trigger naming**: `trigger(name)` namespacing is DoS/quota
+  hardening, **not a confidentiality boundary** — a cross-tenant trigger can
+  at most cause a spurious refetch of the woken owner's *own* tenant state;
+  no data crosses tenants on a trigger.
+
+### 13.3 No peer-to-peer cross-node operations — raft is the only cross-node coordination
+- **Decision** (user-asserted 2026-05-18; architectural invariant): there is
+  no node-to-node operation in the system, and there must not be one. The
+  only cross-node coordination is raft (the existing envelope/commit log
+  every kv write already uses). The shipped connection-actor is worker-local
+  park + worker-local resume; if push projections are ever built, their
+  fan-out reuses a *centralized* side-process that workers POST to —
+  architecturally identical to worker→files-server / worker→log-server —
+  never a node-to-node primitive.
+- **Why**: a second cross-node protocol would re-open the membership,
+  ordering, and partial-failure questions raft already answers, for a
+  notification path whose contents are explicitly losable.
+
+### 13.4 Callback execution: continuation-affinity, nothing replicated, moot-on-loss
+- **Decision** (modeled 2026-05-18; shipped 2026-06-03, `dcb7c6b`, as the
+  cross-worker held-state routing): a continuation callback routes to the
+  worker *holding* the continuation — a live, node-local, in-memory object —
+  addressed by owner registry (`MsgRouter.bound_fetch_owners` /
+  `bound_send_owners`; registry-first resume with the `hash(tenant)` route as
+  fallback), not by hashing the tenant. Callback *result delivery* bypasses
+  raft entirely; only the hop's own kv writeset rides envelope-0, like any
+  request. Node death ⇒ the continuation is gone ⇒ the callback drops
+  (moot-on-loss: the held connection died with the node, and the synchronous
+  caller retries the whole request).
+- **Why**: the chain is born on one worker and every hop routes back to it,
+  so per-tenant lock-locality falls out without a pinning rule; replicating
+  continuation state would buy durability for an object that is worthless
+  once its connection is dead.
+- **Two callback classes — do not conflate**: *continuation* callbacks
+  (above) versus *stateless* fire-and-forget callbacks with no parked
+  continuation. The latter's durability is the §3.3 owed/proof markers on
+  the per-tenant kv path, recovered per §3.4. Likewise, an external call and
+  an internal continuation are **distinct call shapes that compose** — there
+  is no fused `http.send(on_result)` primitive; "held-sync" is a best-effort
+  external call plus an explicitly returned continuation.
+
+### 13.5 "At-least-once" split: no-silent-loss is platform; retry-to-2xx is a JS lib
+- **Decision** (2026-05-18; implementation shipped via §3.3 + §3.4):
+  "at-least-once" conflated two guarantees. **Meaning-1 — no-silent-loss**
+  (a send is *owed* until there is durable proof it was attempted and
+  recorded; absent proof after a crash, it re-fires) is the platform
+  guarantee, and it rides the per-tenant kv/raft path: the owed marker is
+  part of the issuing hop's own committing writeset (free and atomic), the
+  proof is a per-tenant write on callback — N-way by construction, no
+  central store, no pinned thread. **Meaning-2 — auto-retry-to-2xx** is an
+  application policy and was never platform; it is the customer-composable
+  `retry.*` JS lib. The old cluster-wide schedule store + leader-pinned
+  firer was an *implementation* of Meaning-1, not its essence; deleting it
+  removed the funnel while keeping the guarantee. Duplicate fires remain
+  possible by design (re-fire on missing proof), so resolve-once /
+  idempotency at the consumer stays a requirement — that is the irreducible
+  cost of keeping no-silent-loss without a funnel.
+- **Steady-state no-scan invariant** (engine-independent): dispatch work is
+  found by per-worker collection membership fed at apply time; never a
+  per-tick scan, and never an O(N_tenants) walk on the hot path. The durable
+  `_send/owed/` rows are the crash-recovery backstop, not the dispatch
+  trigger; they live in snapshotted per-tenant state precisely because raft
+  log compaction would GC an owed-but-unproven entry older than the last
+  snapshot.
+- **Rejected** (recorded here because `http-send-plan.md` §15.8, where the
+  full analysis lived, was deleted):
+  - **Pure best-effort as the default** — loses no-silent-loss: on node
+    death the handler receives *nothing* (not even a failure), and
+    fire-and-forget sends vanish. Kept only as the semantics of the bare
+    primitive; durability composes on top (§3.3).
+  - **(c) Central send-index with N-way locator-routed execution** — wins
+    recovery decisively (one central scan) but every `http.fetch`-with-
+    durability writes one shared structure: a cross-tenant write hot spot,
+    exactly the contention per-tenant `app.db` isolation measurably removes.
+    The legacy funnel was the pinned firer, not the store — but a central
+    store trades the execution funnel for a write funnel. Irreducible: you
+    cannot have one place to scan *and* N independent places to write.
+  - **(d) Per-worker schedule stores** — durable state keyed by `--workers`
+    (an unstable runtime fan-out parameter; shrinking it orphans stores)
+    reverses the interchangeable-workers architecture, and the owed marker
+    in (b) is already free and atomic inside the hop's own writeset, which a
+    separate per-worker keyspace cannot match without multi-envelope
+    coupling. Stabilizing the shards (fixed shard ids + a rebalancer)
+    reinvents a consumer group — the cross-node coordination §13.3 forbids.
+  - The **tradeoff triangle** that frames all of these — pick two of
+    {no-silent-loss · no resolve-once complexity · N-way (no funnel)}. The
+    shipped choice keeps no-silent-loss and N-way, and pays resolve-once.
+
+**Still open (tracked in `websocket-plan.md`, not decisions):** push
+projections (the centralized fan-out side-process) are unbuilt; outbound
+WebSocket is unstarted; the fairness policy for the callback execution phase
+(a held-sync continuation is a user waiting synchronously — plain FIFO against
+fresh requests is not obviously right) is undecided.
