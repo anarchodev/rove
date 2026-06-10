@@ -562,6 +562,15 @@ fn resumeStream(
         for (pending_wakes.items) |*pw| pw.deinit(allocator);
         pending_wakes.deinit(allocator);
     }
+    // durable-wake-plan P5(a): the resumed hop's `http.fetch`es
+    // (webhook.send inline fire, blob.put). Write arms commit-gate
+    // them via proposeForgetfulWrites; read-only commits flush
+    // directly; error arms free via the defer.
+    var pending_fetches: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
+    defer {
+        for (pending_fetches.items) |*pf| pf.deinit(allocator);
+        pending_fetches.deinit(allocator);
+    }
     var stream_chunks: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
         for (stream_chunks.items) |ch| allocator.free(ch);
@@ -590,6 +599,7 @@ fn resumeStream(
         .effects = .{
             .pending_wakes = &pending_wakes,
             .pending_stream_chunks = &stream_chunks,
+            .pending_fetches = &pending_fetches,
         },
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
@@ -662,7 +672,7 @@ fn resumeStream(
                     .host = "",
                     .correlation_id = chain_ctx.correlation_id orelse "",
                 };
-                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, null, &readset, lh_term) catch |perr| {
+                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &pending_fetches, &readset, lh_term) catch |perr| {
                     std.log.warn("rove-js stream-resume (terminal + writes): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
                     txn_done = true;
@@ -700,6 +710,7 @@ fn resumeStream(
                 .{@errorName(e)},
             );
             txn_done = true;
+            flushFireFetches(worker, &pending_fetches);
             if (r.body.len > 0) {
                 const owned = try allocator.dupe(u8, r.body);
                 try chunks_st.tryAppend(allocator, owned);
@@ -766,7 +777,7 @@ fn resumeStream(
                     .host = "",
                     .correlation_id = chain_ctx.correlation_id orelse "",
                 };
-                fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, null, &readset, lh_stream) catch |perr| {
+                fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &pending_fetches, &readset, lh_stream) catch |perr| {
                     std.log.warn("rove-js stream-resume (stream + writes): propose failed: {s}", .{@errorName(perr)});
                     // Helper already freed `stage.chunks` (the
                     // outer defer is now a no-op). Free what's
@@ -789,6 +800,7 @@ fn resumeStream(
                     .{@errorName(e)},
                 );
                 txn_done = true;
+                flushFireFetches(worker, &pending_fetches);
             }
             // Headers on subsequent hops are ignored (the stream's
             // initial response headers already shipped); free them.
@@ -967,6 +979,13 @@ pub fn resumeBoundFetchStream(
         for (stream_chunks.items) |ch| allocator.free(ch);
         stream_chunks.deinit(allocator);
     }
+    // durable-wake-plan P5(a): see resumeStream — same accumulator,
+    // same release discipline.
+    var pending_fetches: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
+    defer {
+        for (pending_fetches.items) |*pf| pf.deinit(allocator);
+        pending_fetches.deinit(allocator);
+    }
 
     const req: Request = .{
         .method = "POST",
@@ -1004,7 +1023,10 @@ pub fn resumeBoundFetchStream(
             .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
             .cancel_fetch_ctx = @ptrCast(worker),
         },
-        .effects = .{ .pending_stream_chunks = &stream_chunks },
+        .effects = .{
+            .pending_stream_chunks = &stream_chunks,
+            .pending_fetches = &pending_fetches,
+        },
     };
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
@@ -1065,7 +1087,7 @@ pub fn resumeBoundFetchStream(
                     .host = "",
                     .correlation_id = chain_ctx.correlation_id orelse "",
                 };
-                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, null, &readset, lh_term) catch |perr| {
+                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &pending_fetches, &readset, lh_term) catch |perr| {
                     std.log.warn("rove-js bound-fetch stream (terminal + writes): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
                     txn_done = true;
@@ -1091,6 +1113,7 @@ pub fn resumeBoundFetchStream(
                 .{@errorName(e)},
             );
             txn_done = true;
+            flushFireFetches(worker, &pending_fetches);
             if (r.body.len > 0) {
                 const owned = allocator.dupe(u8, r.body) catch return;
                 chunks_st.tryAppend(allocator, owned) catch {};
@@ -1141,7 +1164,7 @@ pub fn resumeBoundFetchStream(
                     .host = "",
                     .correlation_id = chain_ctx.correlation_id orelse "",
                 };
-                fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, null, &readset, lh_stream) catch |perr| {
+                fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &pending_fetches, &readset, lh_stream) catch |perr| {
                     std.log.warn("rove-js bound-fetch stream (stream + writes): propose failed: {s}", .{@errorName(perr)});
                     s2.deinit(allocator);
                     txn_owned = false;
@@ -1159,6 +1182,7 @@ pub fn resumeBoundFetchStream(
                     .{@errorName(e)},
                 );
                 txn_done = true;
+                flushFireFetches(worker, &pending_fetches);
             }
             // Headers on subsequent hops ignored; free.
             if (s2.headers) |h| allocator.free(h);
