@@ -315,12 +315,22 @@ class V2Cluster:
         return r.body.strip()
 
     def release(self, tenant: str, dep_id: str | int, *, node: int = 0) -> HttpResponse:
+        """POST the release flip. Leader-aware: the release proposes through
+        the tenant's raft group, so a follower 421s (NotLeader, rolled back —
+        decisions.md §10.5c); try each node starting from `node` until one
+        accepts. Single-node clusters never 421."""
         import json
-        return _curl(f"{self.node_url(node)}/_system/release", method="POST",
-                     host=self.admin_host(node),
-                     headers={"Authorization": f"Bearer {self.root_token}",
-                              "Content-Type": "application/json"},
-                     data=json.dumps({"tenant_id": tenant, "dep_id": int(dep_id)}))
+        r = None
+        for k in range(max(1, len(self.node_ports))):
+            i = (node + k) % max(1, len(self.node_ports))
+            r = _curl(f"{self.node_url(i)}/_system/release", method="POST",
+                      host=self.admin_host(i),
+                      headers={"Authorization": f"Bearer {self.root_token}",
+                               "Content-Type": "application/json"},
+                      data=json.dumps({"tenant_id": tenant, "dep_id": int(dep_id)}))
+            if r.status != 421:
+                return r
+        return r
 
     def deploy_handlers(self, tenant: str, files: dict[str, str], *,
                         node: int = 0) -> str:
