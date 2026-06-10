@@ -1,17 +1,19 @@
 # The effect algebra
 
-> **Status**: synthesis, 2026-05-22. Built from the effect-system audit
-> in §5. This is the cross-cutting frame that the as-built
-> `architecture/effects-and-handlers.md` + `architecture/routing-and-ingress.md`
-> are each a facet of — see §9. It is the ground truth for the question "does this new
-> effect fit the model?"
+> **Status**: principles — the effect model every shipped or proposed
+> effect must fit. Distilled 2026-05-22 from a full effect-system audit;
+> the audit tables and worklist that used to live here (old §5–§7) are
+> retired — every finding shipped (`decisions.md` §3.2/§3.3 record the
+> outcomes; the tables live in git history). This is the cross-cutting
+> frame that the as-built `architecture/effects-and-handlers.md` +
+> `architecture/routing-and-ingress.md` are each a facet of — see §7. It
+> is the ground truth for the question "does this new effect fit the
+> model?"
 >
-> The customer-facing handler surface (named exports per Msg kind,
-> `stream()` / `next()` Cmd verbs) is specified in
-> [`handler-shape.md`](handler-shape.md). The Cmd / Msg tables
-> below use the engine's internal names (`__rove_stream` /
-> `__rove_next` / `request.activation.kind`); the customer-typed
-> surface renames these without changing the engine semantics.
+> The customer-facing handler surface (named exports per Msg kind, the
+> `stream.*` / `on.*` effects, the `next()` disposition) is specified in
+> [`handler-shape.md`](handler-shape.md); this doc uses the customer
+> spellings except where it names an engine internal explicitly.
 
 ## 1. The model in one paragraph
 
@@ -52,8 +54,8 @@ cannot conflict on something you only append to.
 
 Proven, not aspirational: `schedules.db` and envelope types 8/9/10/11
 were retired (2026-05-19, `http.send` Option-(b)) precisely because a
-second durable store was always redundant. `http.send`'s durable intent
-is now `_send/owed/{id}` keys in the tenant's own `app.db`, riding the
+second durable store was always redundant. A send's durable intent is
+now `_send/owed/{id}` keys in the tenant's own `app.db`, riding the
 ordinary envelope-0 writeset. Two replicated stores remain — `app.db`
 (per-tenant) and `__root__.db` (root) — and they are the same primitive
 at two scopes, not two primitives.
@@ -62,20 +64,21 @@ at two scopes, not two primitives.
 
 A parked handler activation that correlates an emitted Cmd to the future
 Msg that answers it. Mechanically: park an entity → subscribe it to a
-wake source → resume it when the Msg arrives. `http.send`'s callback,
-`http.fetch`'s chunks, a held stream's wakes, a held connection's
-frames — all the same structure.
+wake source → resume it when the Msg arrives. `webhook.send`'s result
+callback, `on.fetch`'s chunks, a held stream's wakes, a held
+connection's frames — all the same structure.
 
 > **L2 — A Continuation is always ephemeral.** It must be reconstructible
 > from the Model, or safe to abandon — and it is safe to abandon iff no
 > externally-observable effect has escaped.
 
-`http.send` is the only Continuation that *reconstructs* (boot-scan of
-`_send/owed/` re-arms it) — because it is bound to a durable Cmd that
+`webhook.send` is the only Continuation that *reconstructs* (the sweep
+of `_send/owed/` re-arms it) — because it is bound to a durable Cmd that
 promised delivery. Every other Continuation *abandons* on loss: a
 dropped stream/fetch/connection becomes a failed request, and that is
 correct because nothing was promised. The reconstruct-vs-abandon choice
-is determined entirely by whether the bound Cmd is durable.
+is determined entirely by whether the bound Cmd is durable. §6.1 names
+the root of that distinction.
 
 ### 2.3 Msg origins — open family
 
@@ -92,24 +95,26 @@ within-activation; L3 handles between. Tape volume is bounded by per-tenant
 retention, not a per-chain cap (`tape-minimization.md` §1) — recorded, not
 recorded *forever*.
 
-The next origin proposed for this family is a **durable scheduled wake**
+The newest member of this family is the **durable scheduled wake**
 (`durable-wake-plan.md`, P0–P4 shipped): a one-shot, absolute-time,
 at-least-once `durable_wake` Msg whose fire-time is itself a Model key.
-It generalizes the one place L2 reconstruction is currently hardcoded —
-the webhook boot-scan of `_send/owed/` (§2.2) — into a primitive, so
+It generalizes the one place L2 reconstruction was hardcoded —
+the webhook sweep of `_send/owed/` (§2.2) — into a primitive, so
 `webhook.send`, durable cron, and delayed jobs become §3 compositions
 over it rather than features leaning on a webhook-specific sweep.
 
 ### 2.4 Cmd runtimes — open family
 
-Everything that carries out a Cmd: kv-write, http-out (send + fetch),
-connection-write, response-write, `events.emit`. Also an open family.
+Everything that carries out a Cmd: kv-write, http-out, stream-write
+(`Cmd.stream_chunk` — also the WS frame path), response-write. Also an
+open family.
 
 > **L4 — Every Cmd is a recorded output, and is commit-gated** — released
 > only after the Model write of the same activation has committed
 > (`committedSeq() >= seq`).
 
-L4 is the commit-gate invariant: no externally-observable effect may be released until `committedSeq() >= seq`. A Cmd is durable only by
+L4 is the commit-gate invariant: no externally-observable effect may be
+released until `committedSeq() >= seq`. A Cmd is durable only by
 *being, or writing, a Model key* — there is no other route to durability
 (corollary of L1). kv-write is the degenerate Cmd runtime whose target
 *is* the Model.
@@ -157,13 +162,13 @@ an *optimization* — followers apply it directly rather than re-execute
 QuickJS. If lost, it's reconstructible by replay. Same shape: cached
 output, source-of-truth elsewhere.
 
-This is what makes §6 rule 4 ("durability stays in one home — and that
-home is JS") actually work for arbitrary-sized handler payloads: a JS
-shim's durability marker need not contain the bytes being made durable,
-only a pointer to the activation that can re-derive them. For input
-bytes the marker pattern doesn't apply at all — they're routed through
-effects-and-handlers's body-buffer-then-blob mechanism, durable by
-construction at the point a handler can observe them.
+This is what makes §5's durability rule ("durability stays in one home —
+and that home is JS") actually work for arbitrary-sized handler
+payloads: a JS shim's durability marker need not contain the bytes being
+made durable, only a pointer to the activation that can re-derive them.
+For input bytes the marker pattern doesn't apply at all — they're routed
+through the body-buffer-then-blob mechanism, durable by construction at
+the point a handler can observe them.
 
 ## 3. Every effect is a composition
 
@@ -174,49 +179,51 @@ Continuation? ⊕ Model?`:
 |---|---|---|---|---|
 | KV read | — | — (Model query) | no | synchronous snapshot read, not a Cmd |
 | KV write | — | kv-write | no | the Cmd runtime whose target is the Model |
-| outbound HTTP — whole response | http-done | http-out | yes | the single outbound primitive |
-| outbound HTTP — `on_chunk` (Pattern A) | http-chunk / http-done | http-out | yes | streaming response — chunks fire activations |
-| outbound HTTP — `pipe_to` (Pattern B) | **none** | http-out ⊕ connection-write | no | Cmd ⊕ Cmd, no Msg → structurally untaped *by derivation* |
-| `webhook.send` / `email.send` (JS shims) | (the shim's `on_result`) | kv-write ⊕ http-out | yes | durable-intent is a *composition* — kv marker + outbound HTTP + retry-cron + boot-subscription, none of them new primitives |
-| `blob.put` (JS shim) | http_done from PUT | kv-write ⊕ http-out | yes | content-addressed marker `_blob/owed/{hash}` (pointer to source activation, NOT the bytes) + idempotent PUT; recovery re-executes the source activation to re-derive bytes — bytes too large to fit in marker, but inputs are durable so they're derivable; §2.5 |
-| `blob.get` (JS shim) | http_done (or http_chunk if streamed) | http-out | yes | direct `http.fetch(blob_url(hash))` with all three dispositions; local-BlobBackend fast-path is a JS-shim choice, not a primitive distinction; no marker, no durability — failed read = client retries |
+| `on.fetch` — whole result | fetch result (`onFetchResult`) | http-out | yes | the single outbound primitive, connection-scoped spelling |
+| `on.fetch` — streamed | fetch chunk (`onFetchChunk` / `onFetchDone`) | http-out | yes | streaming response — chunks fire activations |
+| `webhook.send` / `email.send` (JS shims) | the shim's result activation | kv-write ⊕ http-out | yes | durable-intent is a *composition* — kv marker + outbound HTTP + retry-cron + boot-subscription, none of them new primitives |
+| `blob.put` (JS shim) | result activation (from the PUT) | kv-write ⊕ http-out | yes | content-addressed marker `_blob/owed/{hash}` (pointer to source activation, NOT the bytes) + idempotent PUT against the signed internal origin; recovery re-executes the source activation to re-derive bytes — §2.5 |
+| `blob.get` (JS shim) | result (or chunks if streamed) | http-out | yes | a fetch against the signed internal origin; no marker, no durability — failed read = client retries |
 | subscriptions (cron/boot/kv-react) | cron / boot / kv-react | — | no | Msg origin alone; boot composes a kv-write marker for idempotency |
-| streaming response (`__rove_stream`) | wake / disconnect | response-write | yes | the Continuation *is* the held stream |
-| connection-actor | inbound frame | connection-write | yes | duplex: a Msg origin and a Cmd runtime on one Continuation |
+| streaming response (`stream.*` + `on.*`) | wake (`onWake`) / disconnect | stream-write | yes | the Continuation *is* the held stream |
+| connection-actor (WebSocket) | inbound frame (`onMessage`) | stream-write (→ WS frame) | yes | duplex: a Msg origin and a Cmd runtime on one Continuation |
 
-Three compositions are worth calling out because they *explain* audit
-findings rather than excusing them:
+Compositions worth calling out because they *carry* the principles
+rather than merely obeying them:
 
-- **`pipe_to` is the one composition with no Msg origin.** The tape
-  records Msg origins (L3); with no origin there is nothing to record.
-  "Structurally untaped" is a theorem, not a carve-out.
+- **A composition with no Msg origin is structurally untaped — a
+  theorem, not a carve-out.** The tape records Msg origins (L3); a pure
+  Cmd ⊕ Cmd pipe gives it nothing to record. The retired `pipe_to`
+  disposition was the canonical instance; any future bytes-never-enter-
+  a-handler pipe inherits the property by derivation, and must be
+  justified the same way (the bytes are derivable or deliberately
+  unobserved).
 - **Outbound HTTP is one runtime, not two named effects.** Earlier
   drafts split it as `http.send` (durable) vs `http.fetch` (transient).
-  `architecture/effects-and-handlers.md` Phase 5 (revised 2026-05-22) deletes
-  the split: there is one outbound HTTP Cmd parameterized by
-  response-disposition (whole / chunk / pipe); durability is *not* a
-  parameter and not a verb-level choice.
-- **`webhook.send` / `email.send` retire as Zig primitives.** They
-  become standard-library JS shims that compose `kv.set("_send/owed/
-  {id}", ...)` (rides envelope-0 atomic with the handler's writes) +
-  the outbound HTTP primitive + a `_subscriptions/send-retry/` cron
-  subscription that re-fires stale markers + a boot subscription on
-  leader-promotion. The original "durable-intent" framing (a baked-in
-  Zig primitive) was a premature optimization: every piece composes
-  from primitives that now exist (kv writes, cron, boot, and the
-  outbound HTTP runtime). The composition is **visible JavaScript in
-  the standard library** — the platform dogfoods its own primitives,
-  and customers can read / fork the retry policy. A paid-tier fast
-  path (pattern-match the shim, dispatch native) is a post-launch
-  optimization that does not change the customer-facing API.
-  See `architecture/effects-and-handlers.md` Phase 5 for the migration steps.
-- **`blob.put` / `blob.get` deferred.** Customer-facing blob primitives
-  were specced and then canceled 2026-05-27 alongside
-  `architecture/effects-and-handlers.md` Phase 7 (files-server-standalone stays
-  separate; the JS-shim composition pattern doesn't get exercised on
-  this surface). No customer demand established; defer until concrete
-  use case forces it. The input/output asymmetry the design rested on
-  still holds — see `tape-minimization.md` §2.2.
+  The reification deleted the split (2026-05-24, decisions.md §3.3):
+  there is one outbound HTTP Cmd (`_system.http.fetch`, the curl_multi
+  engine) parameterized by response-disposition; durability is *not* a
+  parameter and not a verb-level choice. The customer spellings are
+  `on.fetch` (connection) and `webhook.send` (durable connectionless) —
+  decisions.md §4.2.
+- **`webhook.send` / `email.send` are JS shims, not Zig primitives.**
+  They compose `kv.set("_send/owed/{id}", ...)` (rides envelope-0
+  atomic with the handler's writes) + the outbound HTTP primitive + a
+  retry sweep + a boot re-arm. The original "durable-intent" framing (a
+  baked-in Zig primitive) was a premature optimization: every piece
+  composes from primitives that exist. The composition is **visible
+  JavaScript in the standard library** — the platform dogfoods its own
+  primitives, and customers can read / fork the retry policy. A
+  paid-tier fast path (pattern-match the shim, dispatch native) is a
+  post-launch optimization that does not change the customer-facing
+  API. (decisions.md §3.3.)
+- **`blob.*` proved the pattern holds under demand.** The blob surface
+  was first specced, then deferred for lack of a concrete use case, and
+  shipped 2026-06-10 (`blob-storage-plan.md` P1–P4) as exactly this
+  composition class: JS shims over the one fetch primitive against a
+  signed internal origin, with the §2.5 input/output asymmetry as the
+  recovery model. The deferral and its exit condition are the
+  compose-from-primitives discipline working as intended.
 
 ## 4. The contract — six questions every effect answers
 
@@ -225,7 +232,7 @@ Where two effects answer differently, the algebra is incoherent there.
 
 1. **Cmd shape** — what the handler emits to invoke it.
 2. **Msg shape** — what re-enters a handler, as what Msg; or "outside
-   the handler" (the `pipe_to` case — and *only* that case).
+   the handler" (the no-Msg-origin case, §3 — and *only* that case).
 3. **Durability class** — ephemeral / replicated-mutation /
    durable-intent (= a Cmd composed with a Model marker write).
 4. **Replay** — how the result becomes a recorded Msg (L3). Or why it
@@ -242,110 +249,14 @@ side tables, no plain hashmaps standing in for state, no ephemeral
 globals. An effect that needs a third option is the substrate needing to
 grow — a real architectural event, not a feature.
 
-## 5. The audit — 2026-05-22
+## 5. The minimal set
 
-Ten effect-shapes scored against §4. `✓` conforms, `✗` diverges.
-
-> **Historical snapshot.** These tables record the *as-found* 2026-05-22
-> state and keep the pre-redesign spellings (`__rove_stream`, `__rove_next`,
-> Pattern A/B fetch, `waitFor`) — all retired by the handler-surface redesign
-> (shipped 2026-06-03; the live surface is `handler-shape.md`). §6 tracks
-> which predictions shipped. The WS gap noted below also closed (inbound WS
-> baseline 2026-06-09).
-
-### Handler-facing shape
-
-| Effect | Cmd | Msg | Durability |
-|---|---|---|---|
-| KV read | sync call — no Cmd | sync return — no Msg | ephemeral (snapshot-pinned) |
-| KV write | writeset op | none | replicated-mutation (env-0) |
-| outbound HTTP — whole | `PendingFetch` in per-request list | `http_done` (a chain activation) | ephemeral |
-| outbound HTTP — A (`on_chunk`) | same | `http_chunk` / `http_done` | ephemeral |
-| outbound HTTP — B (`pipe_to`) | same + `pipe_to` | outside the handler (one `http_pipe_done`) | ephemeral |
-| `webhook.send` / `email.send` (JS shims) | `_send/owed/{id}` kv write + a `PendingFetch` | the shim's `on_result` (a chain activation triggered by `http_done`) | durable-intent = composition (kv write rides env-0 atomic with handler) |
-| `blob.put` (JS shim) | `_blob/owed/{hash}` kv write (pointer to source activation, no bytes) + `PendingFetch` PUT to BlobBackend URL | the shim's `on_result` (a chain activation triggered by `http_done`) | durable-intent = composition; recovery via re-execution per §2.5; requires effects-and-handlers for full semantics |
-| `blob.get` (JS shim) | `PendingFetch` GET against BlobBackend URL | `http_done` (or `http_chunk` if streamed) | ephemeral; no marker (failed read = client retries) |
-| subscriptions | deploy-time spec file — no runtime Cmd | `subscription_fire` activation | ephemeral (boot: marker rides writeset) |
-| streaming out | `__rove_stream({write, waitFor})` | `wake_batch` / `disconnect` | ephemeral entity; per-activation writes replicated |
-| streaming in (body) | — | `inbound_chunk` Msg with `BodyRef` payload (per effects-and-handlers §4.4) | input bytes durable in BlobStore via `{tenant}/readset-blobs/{batch_id}`; callback gated on `durable_offset` advance; **NOT BUILT** (gap 2.4 — design in `architecture/routing-and-ingress.md` + `tape-minimization.md` §2) |
-| conn-actor out (held-sync §6.4) | `__rove_next` / stream chunks | `send_callback` resume | ephemeral entity |
-| conn-actor in (WS frames) | — | — | **NOT BUILT** (gap 2.5 / §6.3) |
-
-### Runtime contract
-
-| Effect | Replay | Backpressure | Failure | State home |
-|---|---|---|---|---|
-| KV read | taped ✓ | none (in-mem) | at-most-once; no durable effect | read-view on `Txn` (worker-local map) |
-| KV write | taped ✓ | overlay cap ✓; `WriteSet` itself unbounded ✗ | at-most-once client / at-least-once raft | overlay + `WriteSet` + `pending_txns` map + `raft_pending_*` collection |
-| outbound HTTP — whole / A / B | taped at the http-done / http-chunk Msg ingress (Phase 2D wires the hook; closes worklist #1) | `fetch_pending` unbounded ✗; per-fetch caps ✓ | at-most-once; B untaped *by design* (no Msg origin); whole + A at-most-once with no kernel-level recovery | `fetch_pending` list + `fetch_event_pending` collection (both retire in Phase 2D) + `StreamChunks` / `PipeState` on entity for B |
-| `webhook.send` / `email.send` (JS shims) | marker taped via the ordinary env-0 writeset; the shim's `on_result` activation is taped like every other chain hop ✓ | retry-cron rate ✓ ; first-attempt rides handler dispatch; subsequent attempts ride the cron sweep ✓ | at-least-once at the *attempt* level (M1) via marker-write/clear; **NOT** retry-to-success — that is the shim's policy choice | `_send/owed/{id}` kv (durable, replicated) + the shim's per-attempt scratch state |
-| `blob.put` (JS shim) | marker taped via env-0 writeset ✓; PUT request itself rides http-out's taping; `on_result` is taped like any chain hop ✓ | retry-cron rate ✓; bytes ride the activation's QJS arena until first PUT completes (not held across retries — recovery re-derives) | transient-loss-tolerant; **eventually recoverable** from inputs via re-execution per §2.5 — content-addressing makes retry idempotent; effects-and-handlers is the recovery prerequisite | `_blob/owed/{hash}` kv (durable, replicated) carries only `{correlation_id, seq, call_index, dest_key}`; bytes themselves live in BlobStore at `{tenant}/blobs/{hash}` (cache; transiently absent OK) |
-| `blob.get` (JS shim) | http-out taping applies ✓ | http-out's `fetch_pending` cap ✓ | at-most-once read; transient backend miss surfaces as 503 — caller retries; no recovery, no marker | none |
-| subscriptions | taped per fire ✓ | cron 1 Hz ✓; kv-react no limit ✗; per-tenant cap maybe NOT BUILT | boot: single-fire via writeset-bundled `_boot_fired/<dep_id>` marker (`worker_streaming.zig:1105`) ✓; cron + kv-react: at-most-once | `subscription_fire_pending` collection ✓; `cron_state` collection ✓ (worker-0 owned) |
-| streaming out | taped per activation ✓ (cap 10 MB / 50k) | wake ring K=32 + `StreamChunks` 256 KB — lossy, surfaced ✓ | at-most-once stream; chunks may ship pre-commit ✗ | stream collections ✓ |
-| conn-actor out | taped per activation ✓ | `StreamChunks` 256 KB ✓ | at-most-once flush; cross-worker resume = linear scan + requeue ✗ | `parked_continuations` collection ✓ |
-
-The model holds: every effect that remains a Zig primitive fills the
-template consistently. The audit caught exactly one breach of the §1
-invariant — Pattern-A outbound HTTP returns chunk bytes to the handler
-without taping them. That the framework finds exactly one violation,
-and that the violation is a *missing instance of a general rule* (L3),
-is the framework earning its keep. (Phase 2D of
-`architecture/effects-and-handlers.md` closes it.)
-
-Note: this revision (2026-05-22) collapses `http.send` + `http.fetch`
-into one row — they are one outbound HTTP runtime. `webhook.send` /
-`email.send` are JS-shim *compositions* on top, not primitives. The
-old "durable-intent primitive" row retired because every piece of its
-composition (kv markers, retry cron, boot subscription, outbound HTTP)
-is already a primitive.
-
-## 6. Toward the minimal set
-
-Every divergent cell in §5 had one root cause: **the four primitives
-were not factored out.** Each effect hand-rolled its own slice of
-Continuation, of taping, of backpressure — and the hand-rolled copies
-drifted. The reification work in `docs/architecture/effects-and-handlers.md`
-landed the consolidation (Phases 0–5 SHIPPED 2026-05-24, `b908953`).
-
-The four predictions the algebra made, against current state:
-
-1. **One Continuation runtime — SHIPPED.** The seven hand-rolled park
-   collections (`raft_pending_response` / `_cont` / `_stream`,
-   `parked_continuations`, `stream_data_out` / `stream_response_in`,
-   `fetch_event_pending`) now share one parametric Continuation
-   primitive (`effect.Continuation`), with per-resume-behavior
-   collections retaining distinct state but sharing the park/wake/
-   resume code. Cross-worker resume is O(1) via the wake-correlation
-   index. The wake ring is universal.
-
-2. **One outbound-HTTP runtime — SHIPPED.** `http.send` retired as a
-   primitive (Phase 5, 2026-05-24). The only outbound HTTP runtime
-   is `fetch_pool` (now `fetch_engine`, the curl_multi engine)
-   parameterized by response-disposition (whole / `on_chunk` /
-   `pipe_to`). `SendDispatch` + `InflightSet` + `send_outbox` + the
-   apply-time special-cases for `_send/owed` / `_send/proof` all
-   deleted. Durability reconstitutes as JS-shim composition (rule 4).
-
-3. **One Msg-origin runtime, taping built in — SHIPPED.** Phase 2D
-   wired the tape hook into the Msg-origin primitive; the Pattern A
-   chunk-tape bug is *unconstructible* — you can't instantiate a Msg
-   origin without the tape hook.
-
-4. **Durability stays in one home — and that home is JS — SHIPPED.**
-   Proven by the `schedules.db` retirement (2026-05-19) + the
-   `http.send` → JS-shim cutover (2026-05-24). The standing rule: a
-   durable-intent effect is *always* the JS composition `kv.set(
-   "_<verb>/owed/{key}", ...)` (rides envelope-0 atomic with the
-   handler's writes) + outbound HTTP + a retry cron subscription + a
-   boot subscription on leader-promotion. No new store, no new
-   envelope type, no new Zig primitive. The composition is part of
-   the standard library (`webhook.send.js`, `email.send.js`) — the
-   platform dogfoods its own primitives, and customers can read or
-   fork the policy.
-
-   A paid-tier fast path that pattern-matches a shim and dispatches
-   native is a post-launch optimization, not part of the model.
+The 2026-05-22 audit scored every effect against §4 and found seven
+incoherences with one root cause: **the four primitives were not
+factored out.** Each effect hand-rolled its own slice of Continuation,
+of taping, of backpressure — and the hand-rolled copies drifted. The
+reification (`decisions.md` §3.2) factored them; the audit's findings
+all closed.
 
 The shape of the minimal set: **two singletons that must never be
 duplicated (the Model, the Continuation), and two open families whose
@@ -355,64 +266,25 @@ families may grow forever; the singletons may not fork. A proposed
 effect that cannot be expressed this way is the signal that the
 substrate itself must change — rare, and worth stopping for.
 
-## 7. Worklist
+And the standing **durability rule** (decisions.md §3.3): a
+durable-intent effect is *always* the JS composition
+`kv.set("_<verb>/owed/{key}", ...)` (rides envelope-0 atomic with the
+handler's writes) + outbound HTTP + a retry sweep + a boot re-arm on
+leader-promotion. No new store, no new envelope type, no new Zig
+primitive.
 
-Substantially cleared by `docs/architecture/effects-and-handlers.md` Phases 0–5
-(SHIPPED 2026-05-24, `b908953`).
+## 6. Trigger scope — connection vs tenant
 
-1. ~~**Tape outbound-HTTP Pattern A chunk bytes**~~ — **DONE** via
-   reification Phase 2D (`fireFetchEventActivation` now passes
-   populated `TapePayloads`; chunks content-addressed past a threshold).
-2. ~~**Resolve the streaming pre-commit invariant**~~ — **DONE** via
-   Phase 4.0.b. The pre-commit-ship path in `proposeForgetfulWrites`
-   is removed; resume-hop chunks stage on the entity until commit, then
-   move into `StreamChunks`. Per [[feedback_model_simplicity_safety]]
-   ship-one-safe-semantic; `__rove_stream({eager_ship: true})` reserved
-   for customer demand.
-3. **Backpressure template across remaining unbounded queues** —
-   `StreamChunks` cap shipped (Gap 2.2); `fetch_pending` + `WriteSet`
-   + kv-react remain unbounded. Smaller cleanup item; ship when a
-   real overflow shows up.
-4. ~~**Cross-worker Continuation resume scan**~~ — **DONE** via the
-   continuation-affinity routing per `project_callback_execution_model`
-   (callbacks route to the worker holding the continuation via a
-   pointer, not via hash(tenant)); no scan.
-5. ~~**`cron_state` lives in a plain `StringHashMap`**~~ — **DONE
-   2026-05-27** via `architecture/effects-and-handlers.md` Phase 6 step 2.
-   Moved to a `CronState` component on a `cron_state` collection on
-   every worker (only worker 0 populates it; the sweep was already
-   worker-0 + leader gated at the caller). `node.cron_state` +
-   mutex deleted.
-6. ~~**Boot subscription double-fire is UNCLEAR**~~ — **RESOLVED.**
-   The `_boot_fired/<dep_id>` marker rides the handler's writeset
-   (`worker_streaming.zig:1105`) — marker + handler effects commit
-   atomically. No "fired-but-not-marked" window; single-fire
-   semantics. The earlier "marker written AFTER" concern reflected a
-   pre-2026-05 implementation; current code is safe.
-7. ~~**Retire `http.send` as a Zig primitive**~~ — **DONE 2026-05-24**
-   via Phase 5 + the durability-as-JS-shim flip. ~4.7 kLOC of Zig
-   deleted; `webhook.send.js` / `email.send.js` compose durability
-   over kv markers + outbound HTTP + retry cron + boot subscription.
-8. ~~**Delete `src/connection_holder/` dead scaffold**~~ — **DONE
-   2026-05-27** via `architecture/effects-and-handlers.md` Phase 6 step 1.
+Deepens L2 (§2.2): it names *why* a Continuation
+reconstructs-or-abandons, and the two orthogonal axes that classify
+every trigger feeding a Continuation. The customer surface this implies
+is specified in [`handler-shape.md`](handler-shape.md); here it is the
+model justification for that surface's shape.
 
-Known catalog gaps, *not* incoherence: streaming inbound body
-(gap 2.4 — design locked; implementation pending, see
-`architecture/routing-and-ingress.md`), connection-actor inbound / WebSocket (see
-`docs/websocket-plan.md`), `http.cancelFetch` transport.
-
-## 8. Trigger scope — connection vs tenant
-
-> **Status**: synthesis, 2026-06-02. Deepens L2 (§2.2): it names *why*
-> a Continuation reconstructs-or-abandons, and the two orthogonal axes
-> that classify every trigger feeding a Continuation. The customer
-> surface this implies is specified in [`handler-shape.md`](handler-shape.md);
-> here it is the model justification for that surface's shape.
-
-### 8.1 A Continuation's durability is forced by its scope
+### 6.1 A Continuation's durability is forced by its scope
 
 §2.2's L2 says a Continuation reconstructs iff its bound Cmd is durable.
-The 2026-06 design names *why*, and it is not a policy choice — it is
+This section names *why*, and it is not a policy choice — it is
 physics. A Continuation resumes one of two things:
 
 - A **connection-scoped** Continuation resumes a write to a specific
@@ -438,7 +310,7 @@ because it is tenant-scoped (its work is logical: process the result,
 write kv). Every stream / fetch / held connection abandons because it
 is connection-scoped. Same rule, named at its root.
 
-### 8.2 Two axes — scope × delivery
+### 6.2 Two axes — scope × delivery
 
 Scope is one of two orthogonal axes that classify every Msg origin
 (§2.3) feeding a Continuation. The second is **delivery**: whether the
@@ -449,68 +321,67 @@ is a cell in a 2×2:
 
 | | edge (coalescable) | value (exactly-once) |
 |---|---|---|
-| **connection-scoped** — ephemeral, node-local, connection-affine, cancelled on close | held-stream kv-prefix wake; disconnect; timer | held `http.fetch` chunk / result |
-| **tenant-scoped** — durable (env-0), tenant-routed, lifecycle independent of any connection | cron; kv-react subscription | `webhook.send` result; durable scheduled wake (gap 2.6) |
+| **connection-scoped** — ephemeral, node-local, connection-affine, cancelled on close | `on.kv` wake; disconnect; `on.timer` | held `on.fetch` chunk / result |
+| **tenant-scoped** — durable (env-0), tenant-routed, lifecycle independent of any connection | cron; kv-react subscription | `webhook.send` result; durable scheduled wake (`durable_wake`) |
 
-Every property the audit (§5) tracks per-effect is derivable from the
+Every property the §4 contract tracks per-effect is derivable from the
 cell rather than chosen per-effect:
 
 - **Durability** (§4 q3) and **routing** come from the *row* —
   connection-scoped resumes route to the worker holding the socket
-  (continuation-affinity, §6 prediction 1 + worklist #4); tenant-scoped
-  resumes route by tenant or are picked up from the durable Model +
-  boot-scan.
+  (continuation-affinity); tenant-scoped resumes route by tenant or are
+  picked up from the durable Model + boot-scan.
 - **Coalescing** and **failure** semantics (§4 q5/q6) come from the
-  *column* — edge triggers fold (the wake-ring, Gap 2.2); value
-  triggers must be delivered exactly once.
-- **Cancellation:** terminating a chain (`close` / response value)
-  cancels exactly the connection row — node-local, no distributed
-  cancel. The tenant row was never connection-owned, so it is
-  untouched. This is why a close-cancel race does not exist.
+  *column* — edge triggers fold (the K=32 wake ring); value triggers
+  must be delivered exactly once.
+- **Cancellation:** terminating a chain (a terminal return) cancels
+  exactly the connection row — node-local, no distributed cancel. The
+  tenant row was never connection-owned, so it is untouched. This is
+  why a close-cancel race does not exist.
 
 Scope is a property of the **registration** (the waiter), not the
-event. The same kv write fans out to a connection-scoped held-stream
-wait *and* a tenant-scoped kv-react subscription; each waiter's own row
+event. The same kv write fans out to a connection-scoped `on.kv` wait
+*and* a tenant-scoped kv-react subscription; each waiter's own row
 decides its durability.
 
-### 8.3 `bind` was the conflated row-selector
+### 6.3 `bind` was the conflated row-selector
 
-The retired `bind` flag (now auto-bind + `detach`, see
-`architecture/effects-and-handlers.md`) was the API-level operator that chose a
-Continuation's row — "does this result resume the held socket?" Because
-the row *is* the durability class (§8.1), `bind` was a durability
+The retired `bind` flag — superseded first by auto-bind + `detach`,
+then by `on.fetch`'s connection-scoped-by-construction shape
+(decisions.md §4.2) — was the API-level operator that chose a
+Continuation's row: "does this result resume the held socket?" Because
+the row *is* the durability class (§6.1), `bind` was a durability
 selector wearing a routing-flag costume, which is why it was
 load-bearing and confusing.
 
-The clean decomposition keeps two registrations that `bind` fused:
+The clean decomposition keeps two registrations the flag fused:
 
 - **Durability** is intrinsic to the **primitive**, never a flag.
   `webhook.send` is tenant-row, always (it writes `_send/owed/{id}`,
-  §3). `http.fetch` is connection-row, always (no marker, nothing
-  promised).
-- **Connection-resume** is *derived from held context* (auto-bind) and
-  is **additive** — it adds a connection-row resume on top of whatever
-  the primitive already is; `detach` removes it. It can never move a
-  primitive between rows: detach a `webhook.send` and it is still
-  durable; you merely forgo the socket-resume.
+  §3). `on.fetch` is connection-row, always (no marker, nothing
+  promised — and inert if no connection is held).
+- **Connection-resume** is *derived from held context* and is
+  **additive** — it adds a connection-row resume on top of whatever
+  the primitive already is. It can never move a primitive between
+  rows: a `webhook.send` whose socket is gone is still durable; you
+  merely forgo the socket-resume.
 
-The proof the old flag conflated the two is the auto-bind carve-out
-that **excludes `webhook.send`'s `bound_send_id`** from auto-binding
-([[project_auto_bind_reshape]]). Under clean separation there is
-nothing to exclude — webhook registers tenant-row because it is
-durable, and auto-binds its connection-row resume like anything else in
-held context. The exclusion exists *only* because one flag did two
-jobs.
+The proof the old flag conflated the two is the carve-out it needed:
+`webhook.send`'s internal fetch had to be **excluded** from auto-binding
+(decisions.md §4.2 gotchas). Under clean separation there is nothing to
+exclude — webhook registers tenant-row because it is durable, and takes
+its connection-row resume like anything else in held context. The
+exclusion existed *only* because one flag did two jobs.
 
 This is why `webhook.send`'s two-layer shape (§2.2, §3) is exactly the
 principle instantiated: a durable tenant-row owed-marker (always)
 **plus** an ephemeral connection-row held-sync resume
-(`__rove_resume_if_bound`, the held-sync resume in `architecture/effects-and-handlers.md`, taken
-only if the originating socket is still on this worker). One logical
-operation registering in both rows — the held-sync resume is an
-invisible optimization, never a customer concept.
+(`__rove_resume_if_bound`, taken only if the originating socket is
+still on this worker). One logical operation registering in both rows —
+the held-sync resume is an invisible optimization, never a customer
+concept.
 
-### 8.4 Registration ordering — watch before write
+### 6.4 Registration ordering — watch before write
 
 The dominant tenant↔connection composition is "respond by streaming,
 but the data is produced by a tenant-row effect": a held handler kicks
@@ -522,15 +393,16 @@ The grammar makes this the runtime's invariant, not the author's
 burden. Effects are commit-gated (L4): calling `webhook.send` during
 the body only *buffers* a Cmd; the activation produces
 `(Writeset, Cmd Msg)` atomically. At end-of-activation the runtime
-sequences: **arm the return-value's connection triggers → commit →
+sequences: **arm the activation's connection triggers → commit →
 then dispatch the buffered effects.** The author writes the effect
 before the `return` in source order and it is still safe, because
 neither happens until the activation ends.
 
-Make it robust to the *external*-writer race too by **anchoring the
-kv-watch to the activation's read view** (reuse `beginReadView` /
-`READSET_VERSION`): the watch fires on any write to its prefix *since
-the version the handler read at*. Then —
+It is robust to the *external*-writer race too because **the kv-watch
+is anchored to the activation's read view** (`on.kv`'s shipped
+semantics, via `beginReadView` / the write-version clock): the watch
+fires on any write to its prefix *since the version the handler read
+at*. Then —
 
 - the effect's write lands at a version strictly after the read view,
   so it always fires the watch regardless of arm-instant timing;
@@ -546,68 +418,64 @@ any change since the state I just read"* — is exactly how an author
 already reasons ("I looked, it wasn't ready; tell me when it changes"),
 which is why the ordering rule stays invisible.
 
-### 8.5 The surface that falls out — grammar position = scope
+### 6.5 The surface that falls out — grammar position = scope
 
 The split reaches customers as **where in the handler you write a
 thing**, never a durability flag (full surface spec:
 `handler-shape.md`):
 
-- **"What happens to THIS request"** → the **return value**
-  (`response` / `stream` / `next`, handler-shape §2). Connection-row:
-  ephemeral, dies with the socket, never touches raft.
+- **"What happens to THIS request"** → the **connection-scoped
+  surface**: ambient `response.*`, the `stream.*` output effects, the
+  `on.*` triggers, and the return (`next()` / a terminal body —
+  handler-shape §2). Connection-row: ephemeral, dies with the socket,
+  never touches raft.
 - **"Work that becomes A NEW request"** → an **effect you call**
-  (`webhook.send`, durable `schedule`, cron — §3 compositions).
+  (`webhook.send`, durable `schedule`, `cron` — §3 compositions).
   Tenant-row: durable, runs as a fresh activation whether or not
   anyone is connected, and its result handler is itself a plain
-  `(req) → response` export (handler-shape §5.4 / §5.6).
+  named-export handler (handler-shape §5).
 
-The author's litmus test is the physics of §8.1, stated for humans:
+The author's litmus test is the physics of §6.1, stated for humans:
 
 > **If the caller closed their laptop right now, should this still
-> happen?** No → return value (this request). Yes → effect call (a new
-> request).
+> happen?** No → connection surface (this request). Yes → effect call
+> (a new request).
 
 Because durable work is "just a new request," it borrows zero concepts
 from streaming: simple to start (a call) and simple to handle (a normal
 export). Streaming — the genuinely harder model (re-invocation, kv/timer
-waits, read-on-reinvoke, `close`) — is reached only via the explicit
-return verbs, strictly opt-in and orthogonal to durability. The two
-complexities are additive with no cliff: adding a durable effect never
-changes your return; adding streaming never changes your effects.
-Preserving that gradient is a hard constraint — the moment `schedule` /
-`webhook.send` take wait-shaped options or share types with `stream`,
-the floor inherits streaming vocabulary and the gradient flattens.
-Substrate shared, surfaces separate.
+waits, read-on-reinvoke, the terminal close) — is reached only via the
+explicit `stream.*` / `on.*` calls, strictly opt-in and orthogonal to
+durability. The two complexities are additive with no cliff: adding a
+durable effect never changes your return; adding streaming never
+changes your effects. Preserving that gradient is a hard constraint —
+the moment `schedule` / `webhook.send` take wait-shaped options or
+share types with `stream.*`, the floor inherits streaming vocabulary
+and the gradient flattens. Substrate shared, surfaces separate.
 
-## 9. Relation to existing docs
+## 7. Relation to existing docs
 
 This doc does not replace any of these — it is the frame they are facets
 of.
 
-- **`architecture/effects-and-handlers.md`** — the realization of "one Continuation
-  runtime" (the Option-A one-request-lifecycle convergence) and the L4
-  commit-gate as a generalized `ParkedUnit` reconciler. Option-B
-  mechanism shipped; the Option-A collapse is the active phasing.
-- **`tape-minimization.md`** — L3's tape reduced to four record kinds (minimal
-  read set, timestamp, seed, CAS extent); §2 is the tape-by-reference design for
-  streamed bytes (the `pipe_to` gap). The retired `primitive-gaps.md` §4
-  rejections now live in `decisions.md` §12.
-- **`architecture/effects-and-handlers.md`** — the durable-input substrate
-  this doc's §2.5 corollary depends on: every "body" routes through
-  a per-tenant BlobStore buffer with callback-gating on
-  `durable_offset`; the readset in the raft entry makes
-  re-execution (and therefore `blob.put` recovery, §6 rule 4) work
-  without navigating Model history.
-- **`architecture/routing-and-ingress.md`** — the response-write Cmd runtime +
-  the wake / disconnect Msg origins, as one instantiation.
-- **`architecture/effects-and-handlers.md`** — the duplex connection effect:
-  connection-write Cmd runtime + frame Msg origin on one Continuation; the
-  held-sync resume is the connection-row half of §8.3.
-- **`handler-shape.md`** — the customer surface §8.5 implies: the
-  three return verbs (`response` / `stream` / `next`) are the
-  connection-row "this request"; the effect calls are the tenant-row
-  "a new request."
-- **`architecture/effects-and-handlers.md`** — the `bind` → auto-bind + `detach`
-  reshape §8.3 analyzes; the connection-resume registration as a
-  context-derived additive, not a durability knob.
+- **`architecture/effects-and-handlers.md`** — the as-built realization:
+  the one Continuation runtime (`effect.reconcile`), the L4 commit-gate,
+  the four reified primitives under `src/js/effect/`, the durable-input
+  substrate §2.5 depends on (body-buffer-then-blob, callback-gating on
+  `durable_offset`, the readset in the raft entry), and the auto-bind
+  seam §6.3 analyzes.
+- **`architecture/routing-and-ingress.md`** — the stream-write Cmd
+  runtime + the wake / disconnect Msg origins, as one instantiation
+  (commit-then-flush, coalescing, the blob coordinator).
+- **`tape-minimization.md`** — L3's tape reduced to four record kinds
+  (minimal read set, timestamp, seed, CAS extent); §2 is the
+  tape-by-reference design for streamed bytes. The retired
+  `primitive-gaps.md` §4 rejections now live in `decisions.md` §12.
+- **`handler-shape.md`** — the customer surface §6.5 implies: the
+  connection-scoped `stream.*` / `on.*` / `next()` surface is the
+  "this request" row; the effect calls are the tenant-row "a new
+  request."
+- **`decisions.md`** §3 (effects/durability — incl. §3.2 reification,
+  §3.3 durability-as-JS-shim) + §4 (handler surface) — the locked
+  decisions and rejected alternatives behind §3, §5, and §6.
 - **`docs/PLAN.md` §13** — the live process / surface map.

@@ -8,8 +8,8 @@
 > model), §4 (handler surface), §5 (readset replication). Two companion
 > references stay separate because they are the customer-facing contract:
 > [`handler-shape.md`](../handler-shape.md) (the API surface) and
-> [`effect-algebra.md`](../effect-algebra.md) (the four-primitive model + live
-> effect audit).
+> [`effect-algebra.md`](../effect-algebra.md) (the four-primitive model + the
+> trigger-scope axes).
 
 ## The shape in one paragraph
 

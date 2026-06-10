@@ -501,7 +501,7 @@ pub const KvStore = struct {
     }
 
     /// The store's node-local write clock — the kvexp `StoreLease
-    /// .writeVersion` (effect-algebra §8.4 watch baseline). Monotonic,
+    /// .writeVersion` (effect-algebra §6.4 watch baseline). Monotonic,
     /// advanced once per write-incorporating commit (leader commit /
     /// follower apply / snapshot install). Read it immediately after
     /// incorporating a write batch and stamp the version onto that
@@ -1057,7 +1057,7 @@ pub const KvStore = struct {
         }
 
         /// The durable write-clock watermark this txn's reads are
-        /// baselined to (kvexp `Txn.readVersion`; effect-algebra §8.4
+        /// baselined to (kvexp `Txn.readVersion`; effect-algebra §6.4
         /// watch anchor). A kv-watch armed at this baseline fires for any
         /// write to its prefix at a version strictly greater — i.e. one
         /// that landed after the state the handler read. Capture it after
