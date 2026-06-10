@@ -60,8 +60,8 @@ Active work on the current (V2) line. Each folds into `architecture/` on ship.
 - [v2-production-deploy-plan.md](v2-production-deploy-plan.md) — first production topology (not yet built)
 - [handler-surface-impl-plan.md](handler-surface-impl-plan.md) — handler-surface Phase 2
 - [durable-wake-plan.md](durable-wake-plan.md) — scheduler primitive (gap #6; P5+ pending)
-- [websocket-plan.md](websocket-plan.md) — inbound WS (transport shipped, worker seam pending)
-- [blob-storage-plan.md](blob-storage-plan.md) — customer `blob.*` surface (CAS + streaming both ways; design)
+- [websocket-plan.md](websocket-plan.md) — inbound WS (single-node baseline shipped 2026-06-09: transport + worker seam + smoke; remaining: broadcast recipe docs, outbound WS)
+- [blob-storage-plan.md](blob-storage-plan.md) — customer `blob.*` surface (P1–P4 shipped 2026-06-10: `blob.write`/`seal`/`receive` + `segments.js`)
 - [tape-minimization.md](tape-minimization.md) — the minimal replay tape (4 record kinds) + tape-by-reference design
 - [plan-tiers.md](plan-tiers.md) — per-tenant tier enforcement
 - [builtin-libs-docs-plan.md](builtin-libs-docs-plan.md) — `_system.*` + JS shim docs
