@@ -1059,8 +1059,9 @@ const Router = struct {
     /// A pre-flip failure forward-ends the source (stops dual-writing) +
     /// evicts the half-attached dest, leaving the tenant serving on the
     /// source untouched. Brief-pause `handleMove` stays for callers that want
-    /// it. (First cut: single forward target = the dest leader URL; a
-    /// dest-leader change mid-move is a noted refinement.)
+    /// it. The forward target is the full dest node list (leader first) —
+    /// the source re-aims past 421s, so a dest-leader change mid-overlap
+    /// degrades to a retry hop, not a failed acked write.
     fn handleMoveLive(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
         const a = self.allocator;
         var parsed = std.json.parseFromSlice(struct { tenant: []const u8, dest: []const u8 }, a, body, .{ .ignore_unknown_fields = true }) catch {
@@ -1109,16 +1110,25 @@ const Router = struct {
             try replyStatus(server, ent, sid, sess, 502);
             return;
         }
-        // 2. Await the dest leader; its URL is the source's forward target.
+        // 2. Await the dest leader; the source's forward target is the FULL
+        //    dest node list, leader first — the source tries it in order and
+        //    re-aims past 421s, so a dest leader change mid-overlap costs a
+        //    retry hop instead of failing acked source writes.
         const dest_leader = self.findDestLeaderUrl(dest_nodes, tenant) orelse {
             self.evictAll(tenant, dest_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 504);
             return;
         };
         defer a.free(dest_leader);
+        const fwd_targets = csvLeaderFirst(a, dest_leader, dest_nodes) orelse {
+            self.evictAll(tenant, dest_nodes, tbody);
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        defer a.free(fwd_targets);
 
-        // 3. forward-begin on the source leader (dual-write to the dest leader).
-        if (!self.forwardBeginOnLeader(src_nodes, tenant, dest_leader)) {
+        // 3. forward-begin on the source leader (dual-write to the dest).
+        if (!self.forwardBeginOnLeader(src_nodes, tenant, fwd_targets)) {
             self.evictAll(tenant, dest_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;
@@ -1177,6 +1187,21 @@ const Router = struct {
             std.Thread.sleep(50 * std.time.ns_per_ms);
         }
         return null;
+    }
+
+    /// The forward-target list for `v2-forward-begin`: every dest node's base
+    /// URL, comma-separated, with the current leader first (the common case
+    /// is then one forward attempt). Null on OOM.
+    fn csvLeaderFirst(a: std.mem.Allocator, leader: []const u8, nodes: []const []const u8) ?[]u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(a);
+        out.appendSlice(a, leader) catch return null;
+        for (nodes) |base| {
+            if (std.mem.eql(u8, base, leader)) continue;
+            out.append(a, ',') catch return null;
+            out.appendSlice(a, base) catch return null;
+        }
+        return out.toOwnedSlice(a) catch null;
     }
 
     /// forward-begin on the source leader: try each source node's leader-gated
