@@ -240,6 +240,115 @@ pub fn main() !void {
     try out.print("[+{d:>6}ms] ok  delete(missing) idempotent ({d}ms)\n", .{ elapsedMs(start_ns), elapsedMsSince(t) });
     try out.flush();
 
+    // ── 8. multipart upload round-trip (blob-storage-plan §3.5 A) ────
+    // create → 2 parts (5 MiB + tail) → complete → get byte-identical
+    // → server-side copy to a content-addressed key → delete both →
+    // abort path. Also proves the 200-with-<Error>-body detection and
+    // the signed x-amz-copy-source against a real endpoint.
+    {
+        t = std.time.nanoTimestamp();
+        try out.print("[+{d:>6}ms] →  multipart create ...\n", .{elapsedMs(start_ns)});
+        try out.flush();
+        const mp_key = "smoke-multipart-tmp";
+        const upload_id = store.createMultipartUpload(mp_key, "application/octet-stream", allocator) catch |err| {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "multipart create failed: {s}", .{@errorName(err)}) catch "create failed";
+            fail(msg);
+        };
+        defer allocator.free(upload_id);
+        try out.print("[+{d:>6}ms] ok  create → UploadId {d} chars ({d}ms)\n", .{ elapsedMs(start_ns), upload_id.len, elapsedMsSince(t) });
+        try out.flush();
+
+        // Part 1: exactly the 5 MiB minimum, patterned so corruption
+        // or reordering shows in the byte-compare. Part 2: small tail
+        // (the last part may be any size).
+        const part1 = try allocator.alloc(u8, blob.S3BlobStore.MULTIPART_MIN_PART_BYTES);
+        defer allocator.free(part1);
+        for (part1, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+        const part2 = "tail-part-after-five-mib";
+
+        t = std.time.nanoTimestamp();
+        try out.print("[+{d:>6}ms] →  upload part 1 (5 MiB) + part 2 ...\n", .{elapsedMs(start_ns)});
+        try out.flush();
+        const etag1 = store.uploadPart(mp_key, upload_id, 1, part1, allocator) catch |err| {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "uploadPart 1 failed: {s}", .{@errorName(err)}) catch "part failed";
+            fail(msg);
+        };
+        defer allocator.free(etag1);
+        const etag2 = store.uploadPart(mp_key, upload_id, 2, part2, allocator) catch |err| {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "uploadPart 2 failed: {s}", .{@errorName(err)}) catch "part failed";
+            fail(msg);
+        };
+        defer allocator.free(etag2);
+        try out.print("[+{d:>6}ms] ok  parts uploaded ({d}ms)\n", .{ elapsedMs(start_ns), elapsedMsSince(t) });
+        try out.flush();
+
+        t = std.time.nanoTimestamp();
+        try out.print("[+{d:>6}ms] →  complete + verify ...\n", .{elapsedMs(start_ns)});
+        try out.flush();
+        store.completeMultipartUpload(mp_key, upload_id, &.{ etag1, etag2 }) catch |err| {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "complete failed: {s}", .{@errorName(err)}) catch "complete failed";
+            fail(msg);
+        };
+        const assembled = bs.get(mp_key, allocator) catch |err| {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "get(multipart) failed: {s}", .{@errorName(err)}) catch "get failed";
+            fail(msg);
+        };
+        defer allocator.free(assembled);
+        if (assembled.len != part1.len + part2.len) fail("multipart object length mismatch");
+        if (!std.mem.eql(u8, assembled[0..part1.len], part1)) fail("multipart part 1 bytes mismatch");
+        if (!std.mem.eql(u8, assembled[part1.len..], part2)) fail("multipart part 2 bytes mismatch");
+        try out.print("[+{d:>6}ms] ok  complete + get → {d} bytes byte-identical ({d}ms)\n", .{ elapsedMs(start_ns), assembled.len, elapsedMsSince(t) });
+        try out.flush();
+
+        t = std.time.nanoTimestamp();
+        try out.print("[+{d:>6}ms] →  server-side copy → content-addressed key ...\n", .{elapsedMs(start_ns)});
+        try out.flush();
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(assembled, &digest, .{});
+        const hash_hex = std.fmt.bytesToHex(digest, .lower);
+        const final_key = try std.fmt.allocPrint(allocator, "smoke-multipart-{s}", .{&hash_hex});
+        defer allocator.free(final_key);
+        store.copyObject(mp_key, final_key) catch |err| {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "copyObject failed: {s}", .{@errorName(err)}) catch "copy failed";
+            fail(msg);
+        };
+        const copied = bs.get(final_key, allocator) catch |err| {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "get(copied) failed: {s}", .{@errorName(err)}) catch "get failed";
+            fail(msg);
+        };
+        defer allocator.free(copied);
+        if (!std.mem.eql(u8, copied, assembled)) fail("copied object bytes mismatch");
+        bs.delete(mp_key) catch {};
+        bs.delete(final_key) catch {};
+        try out.print("[+{d:>6}ms] ok  copy + verify + cleanup ({d}ms)\n", .{ elapsedMs(start_ns), elapsedMsSince(t) });
+        try out.flush();
+
+        // Abort path: create a fresh upload and abandon it.
+        t = std.time.nanoTimestamp();
+        try out.print("[+{d:>6}ms] →  abort ...\n", .{elapsedMs(start_ns)});
+        try out.flush();
+        const abort_id = store.createMultipartUpload(mp_key, null, allocator) catch |err| {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "create(for abort) failed: {s}", .{@errorName(err)}) catch "create failed";
+            fail(msg);
+        };
+        defer allocator.free(abort_id);
+        store.abortMultipartUpload(mp_key, abort_id) catch |err| {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "abort failed: {s}", .{@errorName(err)}) catch "abort failed";
+            fail(msg);
+        };
+        try out.print("[+{d:>6}ms] ok  abort ({d}ms)\n", .{ elapsedMs(start_ns), elapsedMsSince(t) });
+        try out.flush();
+    }
+
     try out.writeAll("\nPASS s3-blob smoke\n");
     try out.flush();
 }
