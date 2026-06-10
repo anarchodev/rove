@@ -135,21 +135,17 @@ pub const KvWake = struct {};
 /// resume. Migrates alongside the streaming origins.
 pub const WakeBatch = struct {};
 
-/// Subscription chain origin — cron / kv-react / boot (primitive-gaps
-/// §2.1). Today: `enqueueSubscriptionFireForTenant` (cross-thread) →
-/// `SubscriptionFireInbox` → drained into `subscription_fire_pending`.
-/// Phase 2B migrates the cron + boot drain to push these payloads onto
-/// `MsgQueue`; Phase 2C migrates the kv-react direct-enqueue site to
-/// the same path. Owns its strings; `deinit` is called by
-/// `MsgQueue.deinit` (drop-on-shutdown) and by the dispatch path after
-/// the fire completes.
+/// Subscription chain origin — kv-react / boot (primitive-gaps §2.1;
+/// the cron origin retired with durable-wake-plan P5(b) — recurrence
+/// is a `durable_wake`, not a subscription fire). Owns its strings;
+/// `deinit` is called by `MsgQueue.deinit` (drop-on-shutdown) and by
+/// the dispatch path after the fire completes.
 pub const SubscriptionFire = struct {
     /// Source-of-fire discriminant + per-source payload. Mirrors
     /// `worker.SubscriptionFireSource` but lives in the effect module
     /// so the algebra surface doesn't reach back into the dispatch
     /// internals.
     pub const Source = union(enum) {
-        cron: struct { fired_at_ns: i64 },
         kv: struct {
             /// Owned by the parent `SubscriptionFire`; freed in `deinit`.
             key: []u8,
@@ -293,7 +289,7 @@ test "Msg covers every ActivationSource variant exhaustively" {
         .tenant_id = try testing.allocator.dupe(u8, "t"),
         .subscription_name = try testing.allocator.dupe(u8, "s"),
         .module_path = try testing.allocator.dupe(u8, "m"),
-        .source = .{ .cron = .{ .fired_at_ns = 0 } },
+        .source = .{ .boot = .{ .deployment_id = 0 } },
     };
     defer sf.deinit(testing.allocator);
 

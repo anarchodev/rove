@@ -127,7 +127,7 @@ Envelopes are typed byte blobs (`src/js/apply.zig`). Only three types are live (
 
 | Type | Target store | Producer |
 |---|---|---|
-| `0` writeset | `{data_dir}/{id}/app.db` | Customer handler `kv.*` via `TrackedTxn` + writeset; `_deploy/current` release marker; the `webhook.send` / `email.send` JS-shim's `_send/owed/{id}` markers ride here too (ordinary kv writes — no apply-time special-case post the durability-as-JS-shim change, `decisions.md` §3.3) |
+| `0` writeset | `{data_dir}/{id}/app.db` | Customer handler `kv.*` via `TrackedTxn` + writeset; `_deploy/current` release marker; the `webhook.send` / `email.send` JS-shim's `_send/owed/{id}` markers and the durable `scheduler` lib's `_sched/*` wake entries ride here too (ordinary kv writes — no apply-time special-case; `decisions.md` §3.3 + `docs/durable-wake-plan.md`) |
 | `1` multi | per-inner-envelope target | Worker dispatcher — atomically bundles multiple writeset envelopes into one raft entry |
 | `2` root_writeset | `{data_dir}/__root__.db` | `provisionInstance` / admin `createInstance`'s `tenant.createInstance`; admin JS `platform.root.*`; ACME `cert/{host}` (see `docs/architecture/auth-and-domains.md`) |
 

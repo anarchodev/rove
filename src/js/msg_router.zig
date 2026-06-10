@@ -55,7 +55,7 @@ pub const MsgRouter = struct {
     /// `fetch_chunk_inboxes`) — one registry, one push path,
     /// `hash(tenant_id) % N_inboxes` for hash-by-tenant stickiness.
     /// Producers from non-worker threads (`deployment_loader` for
-    /// boot, the cron sweeper, the `FetchEngine` libcurl thread) call
+    /// boot, the `FetchEngine` libcurl thread) call
     /// `enqueueMsgForTenant`; the typed wrappers
     /// `enqueueSubscriptionFireForTenant` /
     /// `enqueueFetchEventForTenant` build the matching `effect.Msg`
@@ -154,7 +154,7 @@ pub const MsgRouter = struct {
     /// inbox. The producer-side enqueueXxxForTenant functions
     /// hash-route to one of these by `hash(tenant_id) % N`. Returns
     /// the inbox's slot index in `msg_inboxes` — workers store it so
-    /// the per-worker partitioned sweeps (`sweepOwedRetries`) can
+    /// the per-worker partitioned sweeps (`sweepDurableWakes`) can
     /// match the same `hash(tenant_id) % N` that `enqueueMsgForTenant`
     /// would route to.
     pub fn registerMsgInbox(self: *MsgRouter, inbox: *effect_mod.MsgInbox) !usize {
@@ -302,7 +302,7 @@ pub const MsgRouter = struct {
     /// is true AND `bound_fetch_owners[ev.fetch_id]` resolves, route
     /// directly to the owning worker's inbox. Otherwise fall back to
     /// `hash(tenant_id)` — the existing behavior for unbound (Pattern
-    /// A) fetches, subscription fires, cron, kv-react, etc.
+    /// A) fetches, subscription fires, kv-react, etc.
     ///
     /// The owner-routing path closes the cross-worker bind gap: the
     /// inbound that registered the bound fetch may live on a
@@ -377,7 +377,7 @@ pub const MsgRouter = struct {
     }
 
     /// Gap 2.1 Phase D + effect-reification Phase 2E: hash-route a
-    /// subscription fire (cron / kv-react / boot) to the destination
+    /// subscription fire (kv-react / boot) to the destination
     /// worker's unified `MsgInbox` as a `SubscriptionFire` variant.
     /// Producer (loader / sweeper) owns the input slices borrowed;
     /// this fn dupes onto the payload before pushing. Returns
@@ -396,7 +396,6 @@ pub const MsgRouter = struct {
         errdefer allocator.free(path);
 
         const source: effect_mod.msg.SubscriptionFire.Source = switch (in.source) {
-            .cron => |c| .{ .cron = .{ .fired_at_ns = c.fired_at_ns } },
             .kv => |k| blk: {
                 const key_dup = try allocator.dupe(u8, k.key);
                 break :blk .{ .kv = .{ .key = key_dup, .op = k.op } };

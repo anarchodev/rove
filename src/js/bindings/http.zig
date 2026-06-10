@@ -113,6 +113,27 @@ pub fn jsHttpFetch(
     return res;
 }
 
+/// `__rove_fetch(opts)` — capability-scoped twin of `_system.http.fetch`
+/// for baked `__system/` modules (durable-wake-plan P5(a)). Baked
+/// modules eval AFTER the `_harden.js` `delete globalThis._system`
+/// step, so they can't reach `_system.http`; this persistent global
+/// (gated on `is_system_module`, same posture as `__rove_set_wake`)
+/// is how `__system/webhook_fire` issues the retry/scheduled-fire
+/// fetch the deleted Zig owed sweep used to build natively.
+pub fn jsSystemFetch(
+    ctx: ?*c.JSContext,
+    this: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    const state = globals.getState(ctx);
+    if (!state.is_system_module) {
+        _ = c.JS_ThrowTypeError(ctx, "__rove_fetch is not available to customer code");
+        return js_exception;
+    }
+    return jsHttpFetch(ctx, this, argc, argv);
+}
+
 /// Transfer `BuiltFetch`'s owned slices into a `PendingFetch`
 /// appended to `state.pending_fetches.*`. Dups `tenant_id` (which
 /// `BuiltFetch` doesn't carry — it's implicit on the binding
