@@ -141,6 +141,15 @@ pub const ActivationSource = enum(u8) {
     /// single body byte. The body bytes are untaped by derivation —
     /// no Msg carries them (§3.5's pipe_to symmetry).
     inbound_headers = 10,
+    /// Streaming inbound body chunk (gap 2.4,
+    /// `docs/inbound-chunk-plan.md` + `docs/handler-shape.md` §4). The
+    /// handler module exports `onChunk`; the inbound body dispatches
+    /// per-chunk — `request.body` = THIS chunk, `request.done` flags
+    /// the last, `request.chunkSeq` counts from 0. A body that
+    /// completed under the cap fires once with the whole body and
+    /// `done = true`. Chunk bytes are recorded inputs (L3) — they ride
+    /// the activation's tape like fetch chunks.
+    inbound_chunk = 11,
 };
 
 /// Inline tape + body byte payloads for one request. Each `_bytes`

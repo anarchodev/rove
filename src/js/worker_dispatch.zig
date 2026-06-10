@@ -2827,6 +2827,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         //     already fully arrived and continue THIS iteration, or
         //     re-open the window and re-dispatch body-complete later.
         var headers_first_dispatch = false;
+        var chunk_dispatch = false;
         if (body_inbound.receiving) {
             const cached = worker_mod.onHeadersLookup(worker, dep_id, route.module_base);
             if (cached orelse true) {
@@ -2859,6 +2860,19 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     },
                 }
             }
+        }
+
+        // Gap 2.4 (inbound-chunk-plan): any body-carrying classic
+        // dispatch routes to `onChunk` when the module exports it —
+        // cached-yes or unknown (the first dispatch probes; a
+        // `.no_onchunk` outcome below caches the miss and re-walks
+        // classic). Single fire with the whole body, `done = true`;
+        // the > cap streaming path is the plan's S2. Decided OUTSIDE
+        // the receiving branch so it covers all three body arrivals:
+        // same-iteration `.body_complete`, the `.buffering`
+        // re-dispatch, and bodies complete at first emission.
+        if (!headers_first_dispatch and body.len > 0) {
+            chunk_dispatch = worker_mod.onChunkLookup(worker, dep_id, route.module_base) orelse true;
         }
 
         // This is a handler-bound request. Either establish the
@@ -3142,7 +3156,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .query = route.query,
             .headers = rh,
             .session_id = session_resolved.sid,
-            .activation = if (headers_first_dispatch) .inbound_headers else .inbound,
+            .activation = if (headers_first_dispatch)
+                .inbound_headers
+            else if (chunk_dispatch)
+                // S1 single fire: the whole buffered body is chunk 0
+                // and the last chunk at once.
+                .{ .inbound_chunk = .{ .seq = 0, .byte_offset = 0, .done = true } }
+            else
+                .inbound,
             .activation_entity = ent,
             .trace = .{
                 .readset = &readset,
@@ -3307,6 +3328,9 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // are immutable, so first-probe fills are permanent.
         if (headers_first_dispatch and run_oc != .no_onheaders)
             worker_mod.onHeadersRemember(worker, dep_id, route.module_base, true);
+        // Same discipline for the gap-2.4 onChunk probe.
+        if (chunk_dispatch and run_oc != .no_onchunk)
+            worker_mod.onChunkRemember(worker, dep_id, route.module_base, true);
 
         var resp: dispatcher_mod.Response = switch (run_oc) {
             // headers_first probe miss: the module has no `onHeaders`
@@ -3333,6 +3357,22 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     .buffering, .body_complete => {},
                     .gone => try respb.setSimpleResponse(server, ent, sid, sess, 503, "client disconnected before body completed\n", allocator),
                 }
+                processed += 1;
+                continue;
+            },
+            // Gap-2.4 probe miss: the module has no `onChunk` — cache
+            // the miss, roll back the probe's savepoint, and leave the
+            // entity in request_out (body already attached,
+            // `receiving` already false): the next walk dispatches it
+            // as a classic `.inbound`. Only the FIRST body-carrying
+            // request per (deployment, module) lands here.
+            .no_onchunk => {
+                worker_mod.onChunkRemember(worker, dep_id, route.module_base, false);
+                txn.?.rollbackTo() catch |re| panic_mod.invariantViolated(
+                    "dispatchOnce.rollbackTo(no_onchunk)",
+                    "tenant={s} err={s}",
+                    .{ scope_inst.id, @errorName(re) },
+                );
                 processed += 1;
                 continue;
             },

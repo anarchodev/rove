@@ -276,6 +276,31 @@ pub fn onHeadersRemember(worker: anytype, dep_id: u64, module_base: []const u8, 
     gop.value_ptr.* = has_onheaders;
 }
 
+/// Gap 2.4: the `onChunk` twin of `onHeadersLookup` — same key shape,
+/// same probe-and-fill discipline.
+pub fn onChunkLookup(worker: anytype, dep_id: u64, module_base: []const u8) ?bool {
+    var key_buf: [512]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{d}:{s}", .{ dep_id, module_base }) catch return null;
+    return worker.onchunk_cache.get(key);
+}
+
+/// Gap 2.4: the `onChunk` twin of `onHeadersRemember`.
+pub fn onChunkRemember(worker: anytype, dep_id: u64, module_base: []const u8, has_onchunk: bool) void {
+    const allocator = worker.allocator;
+    if (worker.onchunk_cache.count() >= 8192) {
+        var it = worker.onchunk_cache.keyIterator();
+        while (it.next()) |kp| allocator.free(kp.*);
+        worker.onchunk_cache.clearRetainingCapacity();
+    }
+    const key = std.fmt.allocPrint(allocator, "{d}:{s}", .{ dep_id, module_base }) catch return;
+    const gop = worker.onchunk_cache.getOrPut(allocator, key) catch {
+        allocator.free(key);
+        return;
+    };
+    if (gop.found_existing) allocator.free(key);
+    gop.value_ptr.* = has_onchunk;
+}
+
 /// headers_first dispatch state (`docs/blob-storage-plan.md` §3.5.1).
 /// `drainRequestReceiving` moves an early-emitted request (body still
 /// inbound) from h2's `request_receiving` into `request_out` with
@@ -1400,6 +1425,11 @@ pub fn Worker(comptime opts: Options) type {
         /// consulted by the headers-first disposition so steady-state
         /// classic POSTs pay no probe. Worker-local — no locking.
         onheaders_cache: std.StringHashMapUnmanaged(bool) = .empty,
+        /// Gap 2.4: per-(deployment, module) "exports onChunk" cache —
+        /// same shape, fill discipline, and bound as `onheaders_cache`.
+        /// Consulted after a known-no onHeaders outcome to pick the
+        /// chunk-dispatch path without re-probing.
+        onchunk_cache: std.StringHashMapUnmanaged(bool) = .empty,
         /// Effect-reification Phase 2 ingress
         /// (`docs/effect-algebra.md` §2.3; `effect-reification-plan.md`
         /// Phase 2). One bounded queue per worker; every migrated
@@ -1915,6 +1945,11 @@ pub fn Worker(comptime opts: Options) type {
                 var it = self.onheaders_cache.keyIterator();
                 while (it.next()) |kp| allocator.free(kp.*);
                 self.onheaders_cache.deinit(allocator);
+            }
+            {
+                var it = self.onchunk_cache.keyIterator();
+                while (it.next()) |kp| allocator.free(kp.*);
+                self.onchunk_cache.deinit(allocator);
             }
             self.limiter.deinit();
             self.penalty_box.deinit();
