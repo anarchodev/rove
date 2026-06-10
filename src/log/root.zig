@@ -200,7 +200,7 @@ pub const TapePayloads = struct {
     /// payload, surfaced as `request.activation.bytes`). Empty for
     /// every other activation source. L3 (`docs/effect-algebra.md`):
     /// every Msg is recorded, including its bytes — closes the
-    /// algebra §7 worklist #1 fetch-A untaped-chunk bug.
+    /// effect-audit's fetch-A untaped-chunk bug.
     activation_bytes: []const u8 = &.{},
     /// True iff `activation_bytes` is a truncated prefix.
     activation_bytes_truncated: bool = false,
