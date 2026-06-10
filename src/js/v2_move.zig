@@ -59,9 +59,10 @@ const TENANT_HEADER = "x-rewind-tenant";
 const PLAN_HEADER = "x-rewind-plan";
 
 /// Source-side marker key (in the tenant's own `inst.kv`) holding the
-/// destination base URL while a zero-downtime move's overlap window is open
-/// (Phase 7 slice b). When present, the source forwards every committed
-/// write for this tenant to the destination so it stays caught up while the
+/// destination node list — comma-separated base URLs, leader first — while a
+/// zero-downtime move's overlap window is open (Phase 7 slice b; a single
+/// URL is just a one-element list). When present, the source forwards every
+/// committed write for this tenant to the destination so it stays caught up while the
 /// source keeps serving. Set by `v2-forward-begin`, cleared by
 /// `v2-forward-end`. The `_move/` prefix is itself never forwarded (control
 /// metadata, not tenant data).
@@ -625,10 +626,11 @@ fn handleApply(
 // ── v2-forward-begin / -end: open / close the source overlay (source) ─
 
 /// `POST /_system/v2-forward-begin {tenant,dest}` — open the overlap: record
-/// the destination base URL in the tenant's `inst.kv` (`_move/forward`) so
-/// every subsequent committed write is dual-written to the destination. The
-/// marker rides the replicated write path (so a source leader change carries
-/// it). Leader-gated like any source write.
+/// the destination node list (comma-separated base URLs, leader first) in
+/// the tenant's `inst.kv` (`_move/forward`) so every subsequent committed
+/// write is dual-written to the destination, re-aiming past non-leader
+/// nodes (421). The marker rides the replicated write path (so a source
+/// leader change carries it). Leader-gated like any source write.
 fn handleForwardBegin(
     server: anytype,
     allocator: std.mem.Allocator,
@@ -678,9 +680,10 @@ fn handleForwardEnd(
 
 // ── forwarding (source side) ─────────────────────────────────────────
 
-/// The destination base URL this tenant is forwarding to, or null if no
-/// overlap is open. Reads the `_move/forward` marker from `inst.kv`; an
-/// absent or empty marker means "not forwarding." Owned dup on success.
+/// The destination node list (comma-separated, leader-first) this tenant is
+/// forwarding to, or null if no overlap is open. Reads the `_move/forward`
+/// marker from `inst.kv`; an absent or empty marker means "not forwarding."
+/// Owned dup on success.
 fn forwardTargetFor(worker: anytype, tenant: []const u8) ?[]u8 {
     const inst = (worker.node.tenant.getInstance(tenant) catch null) orelse return null;
     const v = inst.kv.get(FORWARD_MARKER) catch return null; // NotFound → null
@@ -691,11 +694,30 @@ fn forwardTargetFor(worker: anytype, tenant: []const u8) ?[]u8 {
     return v; // owned by the caller (kvexp get returns an owned copy)
 }
 
-/// Dual-write one committed key/value to the move destination's `v2-apply`
-/// (blocking libcurl, like the move surface — this is an internal, low-rate
-/// overlay path, not the customer hot path). Errors on a non-204 / transport
-/// failure so the source can surface 502 and the caller retry.
-fn forwardWrite(allocator: std.mem.Allocator, secret: []const u8, dest: []const u8, tenant: []const u8, key: []const u8, value: []const u8) !void {
+/// Dual-write one committed key/value to the move destination's `v2-apply`.
+/// `dests` is the comma-separated, leader-first destination node list the
+/// orchestrator wrote at forward-begin. Try each node in order: 204 =
+/// forwarded; 421 (that node does not lead the dest group — a dest leader
+/// change mid-overlap) or a transport failure = re-aim at the next node;
+/// any other status = hard fail (a real rejection, e.g. a secret mismatch —
+/// don't mask it by retrying it around the cluster). Errors when no listed
+/// node takes the write so the source can surface 502 and the caller retry.
+fn forwardWrite(allocator: std.mem.Allocator, secret: []const u8, dests: []const u8, tenant: []const u8, key: []const u8, value: []const u8) !void {
+    var it = std.mem.splitScalar(u8, dests, ',');
+    while (it.next()) |dest_raw| {
+        const dest = std.mem.trim(u8, dest_raw, " ");
+        if (dest.len == 0) continue;
+        const status = forwardWriteOne(allocator, secret, dest, tenant, key, value) catch continue;
+        if (status == 204) return;
+        if (status != 421) return error.ForwardRejected;
+    }
+    return error.NoDestLeader;
+}
+
+/// One forward attempt against one dest node (blocking libcurl, like the
+/// move surface — this is an internal, low-rate overlay path, not the
+/// customer hot path). Returns the HTTP status; errors on transport failure.
+fn forwardWriteOne(allocator: std.mem.Allocator, secret: []const u8, dest: []const u8, tenant: []const u8, key: []const u8, value: []const u8) !u16 {
     const url = try std.fmt.allocPrint(allocator, "{s}/_system/v2-apply", .{dest});
     defer allocator.free(url);
     const payload = try std.fmt.allocPrint(allocator, "{{\"tenant\":\"{s}\",\"key\":\"{s}\",\"value\":\"{s}\"}}", .{ tenant, key, value });
@@ -719,7 +741,7 @@ fn forwardWrite(allocator: std.mem.Allocator, secret: []const u8, dest: []const 
         .verify_tls = false,
     });
     defer resp.deinit(allocator);
-    if (resp.status != 204) return error.ForwardRejected;
+    return resp.status;
 }
 
 // ── helpers ──────────────────────────────────────────────────────────
