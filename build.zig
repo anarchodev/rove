@@ -487,6 +487,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "users_js", .path = "src/js/globals/users.js" },
         .{ .name = "activitypub_js", .path = "src/js/globals/activitypub.js" },
         .{ .name = "blob_js", .path = "src/js/globals/blob.js" },
+        .{ .name = "segments_js", .path = "src/js/globals/segments.js" },
 
         // Built-in handler modules — compiled to bytecode at NodeState
         // init, resolved via the `__system/` module-path prefix
@@ -504,6 +505,8 @@ pub fn build(b: *std.Build) void {
         // `docs/blob-storage-plan.md` P1 — blob.put's marker-settling
         // result handler.
         .{ .name = "builtin_blob_onresult_mjs", .path = "src/js/builtin_modules/blob_onresult.mjs" },
+        // `docs/blob-storage-plan.md` §6 — segments.seal's swap half.
+        .{ .name = "builtin_segments_onsealed_mjs", .path = "src/js/builtin_modules/segments_onsealed.mjs" },
 
         // Starter content baked into the freshly-created tenant's
         // first deployment — see `deployStarterContent` in
