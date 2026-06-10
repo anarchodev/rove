@@ -126,6 +126,22 @@ pub const WsMessage = struct {
     data: []const u8 = &.{},
 };
 
+/// Gap 2.4 streaming-inbound-body chunk payload
+/// (`docs/inbound-chunk-plan.md`). The chunk bytes themselves ride
+/// `Request.body` (the documented customer surface is `request.body` =
+/// THIS chunk); this carries the per-chunk bookkeeping that surfaces as
+/// `request.chunkSeq` / `request.done`.
+pub const InboundChunk = struct {
+    /// 0-based chunk index (`request.chunkSeq`).
+    seq: u32 = 0,
+    /// Cumulative bytes delivered before this chunk.
+    byte_offset: u64 = 0,
+    /// True on the last chunk (`request.done`). A body that completed
+    /// under the cap fires exactly once with `seq == 0` and
+    /// `done == true`.
+    done: bool = false,
+};
+
 /// What caused this activation, carrying the per-source payload. Only the
 /// active variant is meaningful; `installRequest` switches on it to build
 /// the JS-side `request.activation` shape. Recorded on the tape via
@@ -150,6 +166,7 @@ pub const Activation = union(enum) {
     fetch_chunk: FetchChunk,
     durable_wake: DurableWake,
     ws_message: WsMessage,
+    inbound_chunk: InboundChunk,
 
     /// The log/tape wire enum for this activation. Keeps
     /// `log_mod.ActivationSource` authoritative for the record while the
@@ -167,6 +184,7 @@ pub const Activation = union(enum) {
             .fetch_chunk => .fetch_chunk,
             .durable_wake => .durable_wake,
             .ws_message => .ws_message,
+            .inbound_chunk => .inbound_chunk,
         };
     }
 
@@ -182,7 +200,7 @@ pub const Activation = union(enum) {
             .timer => .timer,
             .disconnect => .disconnect,
             .kv_wake => .kv_wake,
-            .wake_batch, .subscription_fire, .fetch_chunk, .durable_wake, .ws_message => std.debug.panic(
+            .wake_batch, .subscription_fire, .fetch_chunk, .durable_wake, .ws_message, .inbound_chunk => std.debug.panic(
                 "Activation.fromSource: {s} carries a payload; build the arm explicitly",
                 .{@tagName(src)},
             ),
@@ -449,4 +467,11 @@ pub const RunOutcome = union(enum) {
     /// request body-complete later. Never produced by any other
     /// activation kind.
     no_onheaders,
+    /// An `.inbound_chunk` probe found no `onChunk` export — the module
+    /// wants the classic buffered path (gap 2.4,
+    /// `docs/inbound-chunk-plan.md`). Same posture as `no_onheaders`:
+    /// the dispatch site rolls back the probe's savepoint, caches the
+    /// miss, and re-dispatches as a classic `.inbound`. Never produced
+    /// by any other activation kind.
+    no_onchunk,
 };

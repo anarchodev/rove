@@ -1727,12 +1727,13 @@ fn resumeContinuation(
                 .activation = act_src,
             });
         },
-        // Only `.inbound_headers` activations produce this; resume
-        // hops never dispatch as one. Defined failure, not a panic.
-        .no_onheaders => {
+        // Only `.inbound_headers` / `.inbound_chunk` activations
+        // produce these; resume hops never dispatch as one. Defined
+        // failure, not a panic.
+        .no_onheaders, .no_onchunk => {
             txn.rollback() catch {};
             txn_done = true;
-            try resolveParked(worker, ent, sid, sess, 500, "headers-first probe on a resume path\n");
+            try resolveParked(worker, ent, sid, sess, 500, "export probe on a resume path\n");
         },
     }
 }
@@ -2131,12 +2132,13 @@ pub fn resumeBoundFetchChain(
                 .activation = .fetch_chunk,
             });
         },
-        // Only `.inbound_headers` activations produce this; bound-
-        // fetch resumes never dispatch as one. Defined failure.
-        .no_onheaders => {
+        // Only `.inbound_headers` / `.inbound_chunk` activations
+        // produce these; bound-fetch resumes never dispatch as one.
+        // Defined failure.
+        .no_onheaders, .no_onchunk => {
             txn.rollback() catch {};
             txn_done = true;
-            resolveParked(worker, ent, sid, sess, 500, "headers-first probe on a resume path\n") catch {};
+            resolveParked(worker, ent, sid, sess, 500, "export probe on a resume path\n") catch {};
         },
     }
 }
