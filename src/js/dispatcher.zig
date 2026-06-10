@@ -3654,6 +3654,73 @@ test "dispatch: TextEncoder/TextDecoder round-trip multi-byte UTF-8" {
     try testing.expectEqualStrings("hi ★ € 世", out.value.object.get("echo").?.string);
 }
 
+test "dispatch: TextDecoder handles MB-scale payloads (native transcode, no per-char garbage)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // 2 MiB of multi-byte content. The retired pure-JS decoder's
+    // per-char `s += fromCharCode(b)` loop generated string-realloc
+    // garbage far beyond any plausible arena at this size; the
+    // native path is one conversion each way.
+    var resp = try runOne(
+        &d,
+        kv,
+        \\let unit = "abcdefé★0123456789";
+        \\let s = unit;
+        \\while (s.length < 2 * 1024 * 1024) s += s;
+        \\const bytes = new TextEncoder().encode(s);
+        \\const back = new TextDecoder().decode(bytes);
+        \\return { len: s.length, byte_len: bytes.length, round_trip_ok: back === s };
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+
+    var out = try std.json.parseFromSlice(std.json.Value, testing.allocator, resp.body, .{});
+    defer out.deinit();
+    try testing.expect(out.value.object.get("round_trip_ok").?.bool);
+    try testing.expect(out.value.object.get("byte_len").?.integer > 2 * 1024 * 1024);
+}
+
+test "dispatch: TextDecoder malformed input — U+FFFD lenient, TypeError fatal" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(
+        &d,
+        kv,
+        \\const bad = new Uint8Array([0x6f, 0x6b, 0x80, 0x21]); // "ok" <cont-byte> "!"
+        \\const lenient = new TextDecoder().decode(bad);
+        \\let fatal_threw = false;
+        \\try { new TextDecoder("utf-8", { fatal: true }).decode(bad); }
+        \\catch (e) { fatal_threw = e instanceof TypeError; }
+        \\return {
+        \\  lenient_ok: lenient === "ok�!",
+        \\  fatal_threw: fatal_threw,
+        \\};
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+
+    var out = try std.json.parseFromSlice(std.json.Value, testing.allocator, resp.body, .{});
+    defer out.deinit();
+    try testing.expect(out.value.object.get("lenient_ok").?.bool);
+    try testing.expect(out.value.object.get("fatal_threw").?.bool);
+}
+
 test "dispatch: crypto.hmacSha256 throws on missing args" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
