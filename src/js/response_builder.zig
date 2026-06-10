@@ -205,11 +205,19 @@ pub fn finalizeResponse(
     try server.reg.move(ent, &server.request_out, &server.response_in);
 }
 
-/// Overwrite an entity in `request_out` with a 503 body. Used when a
-/// raft propose fails before the entity gets parked. Frees any body
-/// the handler wrote before stamping the new one. Does NOT move into
-/// response_in — caller orchestrates that.
-pub fn overwriteWith503(
+/// Overwrite an entity in `request_out` with a `421 Misdirected
+/// Request` body. Used when a raft propose fails before the entity
+/// gets parked — the txn ROLLED BACK, nothing entered the log, so
+/// re-executing the request elsewhere is safe. 421 is the
+/// retry-SAFE signal the front door's leader discovery keys on
+/// (`front: proxyToCluster`); the ambiguous post-propose failures
+/// (`overwrite503InPending` — commit-wait fault/timeout, leadership
+/// loss) stay 503 and are deliberately NOT retried by the front
+/// door, because their entry may still commit under a new leader
+/// and a blind retry double-executes the handler.
+/// Frees any body the handler wrote before stamping the new one.
+/// Does NOT move into response_in — caller orchestrates that.
+pub fn overwriteWith421(
     server: anytype,
     ent: rove.Entity,
     allocator: std.mem.Allocator,
@@ -217,15 +225,19 @@ pub fn overwriteWith503(
     old_body_len: u32,
 ) !void {
     if (old_body_ptr) |p| allocator.free(p[0..old_body_len]);
-    const body = try allocator.dupe(u8, "write replication failed\n");
-    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 503 });
+    const body = try allocator.dupe(u8, "write not accepted here (rolled back); retry against the cluster leader\n");
+    try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = 421 });
     try server.reg.set(ent, &server.request_out, h2.RespBody, .{
         .data = body.ptr,
         .len = @intCast(body.len),
     });
 }
 
-/// Overwrite a parked entity's response with a 503. Caller is
+/// Overwrite a parked entity's response with a 503. This is the
+/// AMBIGUOUS failure (commit-wait fault/timeout, leadership-loss
+/// sweep): the entry was proposed and may still commit under a new
+/// leader, so this 503 must never be auto-retried by the platform —
+/// see `overwriteWith421` for the retry-safe sibling. Caller is
 /// responsible for freeing the old body (done in `drainRaftPending`
 /// where the column access lives). Handler-cmds Phase 5: takes the
 /// owning collection explicitly — the worker has three sibling
