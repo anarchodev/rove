@@ -714,6 +714,15 @@ fn proposeAndParkContResume(
     txn: *kv_mod.KvStore.TrackedTxn,
     tenant_id: []const u8,
     next: ContResumeNext,
+    /// durable-wake-plan P5(a): the resume activation's accumulated
+    /// `http.fetch`es. Non-connection-scoped entries (webhook.send's
+    /// inline fire, blob.put's PUT) are staged as commit-gated
+    /// `Cmd.http_fetch` on the parked unit — released by interpretCmd
+    /// strictly after the writeset commits, the same gate the inbound
+    /// path applies. Connection-scoped (`on.fetch`) entries are LEFT
+    /// on the list (binding to a held entity from a writing resume is
+    /// still unwired — callers warn loudly about leftovers).
+    fetches_opt: ?*std.ArrayListUnmanaged(globals.PendingFetch),
     /// Slice 3d-fetch: the cont-resume dispatch's readset, serialized
     /// onto the raft envelope's `rs_bytes` section so the resumed
     /// activation is replayable on any follower. Pointer (not value)
@@ -828,6 +837,28 @@ fn proposeAndParkContResume(
         .source = .raft_pending_cont,
         .dest = respond_dest,
     } }) catch {};
+    // P5(a): commit-gate the resume's unbound fetches. Compact the
+    // connection-scoped ones (which we can't stage) to the front of
+    // the caller's list; everything else transfers into the unit.
+    if (fetches_opt) |fetches| {
+        var keep: usize = 0;
+        for (fetches.items) |pf| {
+            if (pf.connection_scoped) {
+                fetches.items[keep] = pf;
+                keep += 1;
+                continue;
+            }
+            cont_cmds.items.append(allocator, .{ .http_fetch = pf }) catch {
+                // OOM: leave it on the caller's list (freed there,
+                // chain never fires — at-least-once recovery is the
+                // producer's own wake).
+                fetches.items[keep] = pf;
+                keep += 1;
+                continue;
+            };
+        }
+        fetches.items.len = keep;
+    }
     parkKvWakes(worker, seq, tenant_id, writeset, cont_cmds) catch |perr|
         std.log.warn("rove-js cont-resume parkKvWakes (tenant={s}) failed: {s}", .{ tenant_id, @errorName(perr) });
 
@@ -1103,6 +1134,9 @@ const StreamResumeCtx = struct {
     /// (resumeBoundFetchChain) — the ONLY semantic difference between
     /// the two callers' `.stream` arms.
     activation: log_mod.ActivationSource,
+    /// P5(a): the resume hop's `http.fetch` accumulator (see
+    /// `proposeAndParkContResume.fetches_opt`).
+    pending_fetches: ?*std.ArrayListUnmanaged(globals.PendingFetch) = null,
 };
 
 /// `docs/streaming-model.md` §7 item 1 (Phase 2b lift): the cont→stream
@@ -1193,6 +1227,7 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
                 .kv_prefixes = stream_kv_prefixes,
                 .interval_ms = stream_interval,
             } },
+            ctx.pending_fetches,
             ctx.readset,
             lh,
         ) catch |perr| {
@@ -1272,6 +1307,12 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     if (parsed_headers.len > 0) allocator.free(parsed_headers);
 
     installStreamComponentsInline(worker, ctx.ent, ctx.sid, ctx.sess, stream_status, handler_resp_hdrs, module_path_dup, stream_ctx_json, stream_chunks, stream_kv_prefixes, stream_interval);
+    // P5(a): read-only cont→stream transition committed above — flush
+    // the hop's unbound fetches now. Connection-scoped binds from this
+    // transition stay unwired (the entity just moved to the stream
+    // collections; flushResumeFetches' parked_continuations count bump
+    // soft-fails there) — they drop with a register failure.
+    if (ctx.pending_fetches) |pf| flushResumeFetches(worker, ctx.ent, pf, false);
     captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", cont_path_for_log, "", ctx.deployment_id, ctx.now_ns, 0, .ok, &.{}, &.{}, .{}, ctx.correlation_id, ctx.activation, 0);
 }
 
@@ -1393,6 +1434,16 @@ fn resumeContinuation(
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
         break :blk tl.id_minter.nextRequestId() catch 0;
     };
+    // durable-wake-plan P5(a): accumulate this resume hop's
+    // `http.fetch`es (a `webhook.send` from an onResult handler —
+    // heldsync recipe-1's retry hop — issues one inline). Write arms
+    // stage them as commit-gated Cmds via `proposeAndParkContResume`;
+    // read-only arms flush post-commit; error arms free via the defer.
+    var pending_fetches: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
+    defer {
+        for (pending_fetches.items) |*pf| pf.deinit(allocator);
+        pending_fetches.deinit(allocator);
+    }
     const request: Request = .{
         .method = "POST",
         .path = spath,
@@ -1406,6 +1457,7 @@ fn resumeContinuation(
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
         .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = inst.platform },
+        .effects = .{ .pending_fetches = &pending_fetches },
     };
     std.log.info("rove-js corr: resume corr={s} request_id={d} tenant={s}", .{ correlation_id orelse "(none)", request_id, inst.id });
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
@@ -1488,6 +1540,7 @@ fn resumeContinuation(
                         .status = st,
                         .body = body_dup,
                     } },
+                    &pending_fetches,
                     &readset,
                     lh_terminal,
                 ) catch |perr| {
@@ -1507,6 +1560,10 @@ fn resumeContinuation(
                 txn_owned = false;
                 txn_done = true;
                 captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, st, .ok, console_owned, exception_owned, .{}, corr_id, act_src, cont_seq);
+                if (pending_fetches.items.len > 0) std.log.warn(
+                    "rove-js cont-resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
+                    .{ pending_fetches.items.len, tenant_id },
+                );
                 return;
             }
             // Clean read-only commit cannot fault (mirrors
@@ -1517,6 +1574,7 @@ fn resumeContinuation(
                 .{@errorName(e)},
             );
             txn_done = true;
+            flushResumeFetches(worker, ent, &pending_fetches, false);
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
             try resolveParked(worker, ent, sid, sess, st, r.body);
             captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, act_src, 0);
@@ -1603,6 +1661,7 @@ fn resumeContinuation(
                         .new_cont = c2m,
                         .new_bound_sched_id = new_bound_sched_id,
                     } },
+                    &pending_fetches,
                     &readset,
                     lh_repark,
                 ) catch |perr| {
@@ -1622,6 +1681,10 @@ fn resumeContinuation(
                 // same as the inbound trampoline open hop's
                 // captureSuccess shape).
                 captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 0, .ok, &.{}, &.{}, .{}, corr_id, act_src, repark_seq);
+                if (pending_fetches.items.len > 0) std.log.warn(
+                    "rove-js cont-resume: {d} connection-scoped fetch(es) from a WRITING repark dropped (bind-from-writing-resume not wired) tenant={s}",
+                    .{ pending_fetches.items.len, tenant_id },
+                );
                 return;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -1630,6 +1693,7 @@ fn resumeContinuation(
                 .{@errorName(e)},
             );
             txn_done = true;
+            flushResumeFetches(worker, ent, &pending_fetches, true);
             // Re-park: swap the descriptor in place on the entity's
             // ContDescriptor component, refresh the deadline; the
             // entity stays in `parked_continuations`. Ownership of
@@ -1659,6 +1723,7 @@ fn resumeContinuation(
                 .wrote = wrote,
                 .txn_owned = &txn_owned,
                 .txn_done = &txn_done,
+                .pending_fetches = &pending_fetches,
                 .activation = act_src,
             });
         },
@@ -1923,6 +1988,7 @@ pub fn resumeBoundFetchChain(
                     txn,
                     tenant_id,
                     .{ .terminal = .{ .status = st, .body = body_dup } },
+                    &pending_fetches,
                     &readset,
                     lh,
                 ) catch |perr| {
@@ -1938,7 +2004,7 @@ pub fn resumeBoundFetchChain(
                 txn_done = true;
                 captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, .{}, correlation_id, .fetch_chunk, seq);
                 if (pending_fetches.items.len > 0) std.log.warn(
-                    "rove-js bound-fetch resume: {d} fetch(es) from a WRITING resume dropped (commit-gated resume fetches not yet wired) tenant={s}",
+                    "rove-js bound-fetch resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ pending_fetches.items.len, tenant_id },
                 );
                 return;
@@ -2003,6 +2069,7 @@ pub fn resumeBoundFetchChain(
                     txn,
                     tenant_id,
                     .{ .repark = .{ .new_cont = c2m, .new_bound_sched_id = new_bound_sched_id } },
+                    &pending_fetches,
                     &readset,
                     lh,
                 ) catch |perr| {
@@ -2016,7 +2083,7 @@ pub fn resumeBoundFetchChain(
                 txn_done = true;
                 captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, .fetch_chunk, seq);
                 if (pending_fetches.items.len > 0) std.log.warn(
-                    "rove-js bound-fetch resume: {d} fetch(es) from a WRITING resume dropped (commit-gated resume fetches not yet wired) tenant={s}",
+                    "rove-js bound-fetch resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ pending_fetches.items.len, tenant_id },
                 );
                 return;
@@ -2060,6 +2127,7 @@ pub fn resumeBoundFetchChain(
                 .wrote = wrote,
                 .txn_owned = &txn_owned,
                 .txn_done = &txn_done,
+                .pending_fetches = &pending_fetches,
                 .activation = .fetch_chunk,
             });
         },
