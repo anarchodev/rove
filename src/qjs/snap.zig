@@ -48,7 +48,17 @@ pub const DEFAULT_BASE_SIZE: usize = 10 * 1024 * 1024;
 /// Default request-arena size: holds per-request allocations (loaded
 /// handler bytecode, intermediate JS values, response building).
 /// Handler authors who exceed this see JS OOM on the offending alloc.
-pub const DEFAULT_REQUEST_SIZE: usize = 4 * 1024 * 1024;
+///
+/// Sizing notes (raised 4 MiB → 100 MiB, 2026-06-09):
+/// - This bounds ALLOCATION VOLUME per activation, not live-set —
+///   a bump arena never reclaims within a request, so transient
+///   garbage counts in full. 4 MiB proved tight for handlers
+///   touching ~100 KB+ payloads once any allocation-amplifying
+///   code ran over them.
+/// - The arena is lazily-committed anonymous mmap (qjs-arena.c), so
+///   the per-worker cost is virtual until touched; RSS grows to
+///   each worker's high-water mark, not worker_count × 100 MiB.
+pub const DEFAULT_REQUEST_SIZE: usize = 100 * 1024 * 1024;
 
 pub const Sizes = struct {
     base_size: usize = DEFAULT_BASE_SIZE,
