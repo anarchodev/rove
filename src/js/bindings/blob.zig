@@ -19,10 +19,13 @@ const std = @import("std");
 const qjs = @import("rove-qjs");
 const c = qjs.c;
 const blob_mod = @import("rove-blob");
+const blob_sessions = @import("../blob_sessions.zig");
+const http_b = @import("http.zig");
 
 const globals = @import("../globals.zig");
 
 const js_exception = globals.js_exception;
+const js_undefined = globals.js_undefined;
 
 /// Default + max TTL for presigned URLs. SigV4 caps expiry at 7
 /// days; we default to 5 minutes (the deployment-statics redirect
@@ -125,6 +128,263 @@ pub fn jsBlobPresign(
     defer a.free(url);
 
     return c.JS_NewStringLen(ctx, url.ptr, url.len);
+}
+
+// ── P2: upload sessions (`docs/blob-storage-plan.md` §3.4) ─────────
+
+/// `_system.blob.write(bytes)` → total session bytes. Appends to
+/// this chain's upload session (created on first write) via the
+/// worker trampoline. Direct mutation is safe without a commit
+/// gate: a faulted activation kills its chain, so an orphaned
+/// session is unreachable and TTL-swept (`blob_sessions.zig` header).
+pub fn jsBlobWrite(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    const state = globals.getState(ctx);
+    const write_fn = state.blob_write orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.write: not supported in this context");
+        return js_exception;
+    };
+    if (argc < 1) {
+        _ = c.JS_ThrowTypeError(ctx, "blob.write requires (bytes)");
+        return js_exception;
+    }
+
+    var cstr: [*c]const u8 = null;
+    defer if (cstr != null) c.JS_FreeCString(ctx, cstr);
+    const bytes = extractBytes(ctx, argv[0], &cstr) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.write: bytes must be a string or Uint8Array");
+        return js_exception;
+    };
+
+    const total = write_fn(
+        state.blob_session_ctx.?,
+        state.instance_id,
+        state.correlation_id,
+        bytes,
+    ) catch |err| {
+        _ = switch (err) {
+            error.SessionTooLarge => c.JS_ThrowTypeError(ctx, "blob.write: session exceeds the 64 MiB cap"),
+            error.TooManySessions => c.JS_ThrowTypeError(ctx, "blob.write: too many open sessions for this tenant"),
+            error.NoChain => c.JS_ThrowTypeError(ctx, "blob.write: no request chain to key the session on"),
+            else => c.JS_ThrowTypeError(ctx, "blob.write: out of memory"),
+        };
+        return js_exception;
+    };
+    return c.JS_NewInt64(ctx, @intCast(total));
+}
+
+/// `_system.blob.seal(to, content_type?)` → hash hex. Finalizes the chain's
+/// session: takes the buffer + sha256 from the trampoline and
+/// appends a natively-built `connection_scoped` PendingFetch — a PUT
+/// through the `rove-blob.internal` door — to the activation's
+/// pending-fetches accumulator. The EXISTING handler-success seam
+/// then bind-or-drops it exactly like an `on.fetch`: held ⇒ the PUT
+/// result resumes this chain at the `to` export (with
+/// `request.ctx.hash`); not held ⇒ inert (bytes freed, nothing
+/// promised) — the same scope semantics as every `on.*` verb.
+pub fn jsBlobSeal(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    const state = globals.getState(ctx);
+    const seal_fn = state.blob_seal orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.seal: not supported in this context");
+        return js_exception;
+    };
+    const fetches = state.pending_fetches orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.seal: no connection context for the seal result");
+        return js_exception;
+    };
+    if (argc < 1 or !c.JS_IsString(argv[0])) {
+        _ = c.JS_ThrowTypeError(ctx, "blob.seal requires a `to` export name");
+        return js_exception;
+    }
+
+    var to_len: usize = 0;
+    const to_c = c.JS_ToCStringLen(ctx, &to_len, argv[0]);
+    if (to_c == null) return js_exception;
+    defer c.JS_FreeCString(ctx, to_c);
+    const to = @as([*]const u8, @ptrCast(to_c))[0..to_len];
+    if (!http_b.isValidExportName(to)) {
+        _ = c.JS_ThrowTypeError(ctx, "blob.seal: `to` must be a JS identifier");
+        return js_exception;
+    }
+
+    var ct_c: [*c]const u8 = null;
+    defer if (ct_c != null) c.JS_FreeCString(ctx, ct_c);
+    var content_type: ?[]const u8 = null;
+    if (argc >= 2 and c.JS_IsString(argv[1])) {
+        var ct_len: usize = 0;
+        ct_c = c.JS_ToCStringLen(ctx, &ct_len, argv[1]);
+        if (ct_c == null) return js_exception;
+        const ct = @as([*]const u8, @ptrCast(ct_c))[0..ct_len];
+        if (!isSafeHeaderValue(ct)) {
+            _ = c.JS_ThrowTypeError(ctx, "blob.seal: content_type contains invalid characters");
+            return js_exception;
+        }
+        content_type = ct;
+    }
+
+    const sealed = seal_fn(
+        state.blob_session_ctx.?,
+        state.instance_id,
+        state.correlation_id,
+    ) catch |err| {
+        _ = switch (err) {
+            error.NoSession => c.JS_ThrowTypeError(ctx, "blob.seal: no open session (nothing written, or already sealed)"),
+            error.NoChain => c.JS_ThrowTypeError(ctx, "blob.seal: no request chain"),
+            else => c.JS_ThrowTypeError(ctx, "blob.seal: out of memory"),
+        };
+        return js_exception;
+    };
+    // From here the sealed body is ours until appended; free on any
+    // error path.
+    var body_owned: ?[]u8 = sealed.body;
+    defer if (body_owned) |b| state.allocator.free(b);
+
+    const a = state.allocator;
+    const fetch_id = http_b.deriveFetchIdHex(a, state.request_id, state.http_fetch_index) catch {
+        _ = c.JS_ThrowTypeError(ctx, "blob.seal: out of memory");
+        return js_exception;
+    };
+    state.http_fetch_index += 1;
+    var id_owned: ?[]u8 = fetch_id;
+    defer if (id_owned) |s| a.free(s);
+
+    var built: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (built.items) |s| a.free(s);
+        built.deinit(a);
+    }
+    const url = dupePrint(a, &built, "{s}{s}", .{ blob_sessions.BLOB_ORIGIN_PREFIX, &sealed.hash_hex }) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.seal: out of memory");
+        return js_exception;
+    };
+    const method = dupePrint(a, &built, "PUT", .{}) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.seal: out of memory");
+        return js_exception;
+    };
+    const headers_json = if (content_type) |ct|
+        dupePrint(a, &built, "{{\"content-type\":\"{s}\"}}", .{ct}) orelse {
+            _ = c.JS_ThrowTypeError(ctx, "blob.seal: out of memory");
+            return js_exception;
+        }
+    else
+        dupePrint(a, &built, "{{}}", .{}) orelse {
+            _ = c.JS_ThrowTypeError(ctx, "blob.seal: out of memory");
+            return js_exception;
+        };
+    const ctx_json = dupePrint(a, &built, "{{\"hash\":\"{s}\"}}", .{&sealed.hash_hex}) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.seal: out of memory");
+        return js_exception;
+    };
+    const on_chunk = dupePrint(a, &built, "", .{}) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.seal: out of memory");
+        return js_exception;
+    };
+    const bound_send_id = dupePrint(a, &built, "", .{}) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.seal: out of memory");
+        return js_exception;
+    };
+    const tenant_dup = dupePrint(a, &built, "{s}", .{state.instance_id}) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.seal: out of memory");
+        return js_exception;
+    };
+    const name_dup = dupePrint(a, &built, "{s}", .{to}) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "blob.seal: out of memory");
+        return js_exception;
+    };
+
+    fetches.append(a, .{
+        .tenant_id = tenant_dup,
+        .id = id_owned.?,
+        .url = url,
+        .method = method,
+        .headers_json = headers_json,
+        .body = body_owned.?,
+        // Generous: a 64 MiB body on a slow uplink. The engine's
+        // terminal event fires either way.
+        .timeout_ms = 300_000,
+        .on_chunk_module = on_chunk,
+        .ctx_json = ctx_json,
+        .stream = false,
+        .max_response_chunk_bytes = 64 * 1024,
+        .max_total_response_bytes = 1024 * 1024,
+        .name = name_dup,
+        .bound_send_id = bound_send_id,
+        .connection_scoped = true,
+    }) catch {
+        _ = c.JS_ThrowTypeError(ctx, "blob.seal: out of memory");
+        return js_exception;
+    };
+    // Everything transferred into the PendingFetch — disarm the
+    // cleanup defers.
+    built.clearRetainingCapacity();
+    body_owned = null;
+    id_owned = null;
+
+    // The hash is known synchronously (incremental hasher) — return
+    // it so the handler can use it immediately; the `to` resume also
+    // receives it as `request.ctx.hash` (the seal PUT's ctx_json).
+    return c.JS_NewStringLen(ctx, &sealed.hash_hex, 64);
+}
+
+/// Append-or-null print helper: dupes the formatted string and
+/// tracks it in `built` so one defer frees every not-yet-transferred
+/// piece on the error paths.
+fn dupePrint(
+    a: std.mem.Allocator,
+    built: *std.ArrayListUnmanaged([]u8),
+    comptime fmt: []const u8,
+    args: anytype,
+) ?[]u8 {
+    const s = std.fmt.allocPrint(a, fmt, args) catch return null;
+    built.append(a, s) catch {
+        a.free(s);
+        return null;
+    };
+    return s;
+}
+
+/// Read a JS value as bytes: string (UTF-8) or Uint8Array. Mirrors
+/// crypto.zig's extractKeyOrDataBytes.
+fn extractBytes(
+    ctx: ?*c.JSContext,
+    val: c.JSValue,
+    cstr_out: *[*c]const u8,
+) ?[]const u8 {
+    if (c.JS_IsString(val)) {
+        var len: usize = 0;
+        const cstr = c.JS_ToCStringLen(ctx, &len, val);
+        if (cstr == null) return null;
+        cstr_out.* = cstr;
+        return @as([*]const u8, @ptrCast(cstr))[0..len];
+    }
+    var byte_len: usize = 0;
+    const buf_ptr = c.JS_GetUint8Array(ctx, &byte_len, val);
+    if (buf_ptr == null) {
+        const pending = c.JS_GetException(ctx);
+        c.JS_FreeValue(ctx, pending);
+        return null;
+    }
+    return buf_ptr[0..byte_len];
+}
+
+/// Conservative header-value check for the signed-through
+/// content-type: printable ASCII, no quotes/backslashes (it is
+/// interpolated into a JSON string literal).
+fn isSafeHeaderValue(s: []const u8) bool {
+    if (s.len == 0 or s.len > 256) return false;
+    for (s) |b| {
+        if (b < 0x20 or b > 0x7e or b == '"' or b == '\\') return false;
+    }
+    return true;
 }
 
 /// Same validator as the fetch engine's trusted door — exactly 64

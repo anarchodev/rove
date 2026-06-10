@@ -113,7 +113,12 @@ globalThis.blob = {
    * @param {string} [opts.to] - Export name to resume in.
    * @param {boolean} [opts.stream] - Per-chunk delivery (default
    *   false: one whole-body result, up to `max_bytes`).
-   * @param {number} [opts.max_bytes] - Whole-body cap (default 8 MB).
+   * @param {number} [opts.max_bytes] - Whole-body transport cap
+   *   (default 8 MB). NOTE: the per-request arena bounds what your
+   *   handler can MATERIALIZE from the bytes (decode/concat of
+   *   ~100 KB+ bodies can OOM the activation) — for large objects
+   *   use `stream: true` and process per chunk, or serve clients
+   *   via `blob.url` redirect and never touch the bytes at all.
    * @returns {string} The fetch id.
    *
    * @example
@@ -162,6 +167,75 @@ globalThis.blob = {
     assertHash(hash, "blob.url");
     return sysBlob.presign(hash, opts.ttl != null ? opts.ttl : null,
                            opts.content_type != null ? opts.content_type : null);
+  },
+
+  /**
+   * Append bytes to this connection's upload session (created on
+   * the first write). The session accumulates across the chain's
+   * activations — write each streamed `on.fetch` chunk from its
+   * resume, or call repeatedly within one activation — then
+   * {@link blob.seal} turns the whole accumulation into one
+   * content-addressed object.
+   *
+   * Caps (P2): 64 MiB per session, 2 open sessions per tenant —
+   * exceeding either throws. A session whose chain dies without
+   * sealing is swept after ~2 minutes idle; nothing reaches storage
+   * before `seal`, so abandonment costs nothing.
+   *
+   * @param {string|Uint8Array} bytes - Chunk to append. Strings
+   *   append their UTF-8 bytes; use Uint8Array for binary.
+   * @returns {number} Total session bytes after the append.
+   *
+   * @example
+   * export function onMirrorChunk() {
+   *   if (!request.done) { blob.write(request.body); return next(); }
+   *   blob.seal({ to: "onStored", content_type: "image/png" });
+   *   return next();
+   * }
+   */
+  write(bytes) {
+    if (typeof bytes !== "string" && !(bytes instanceof Uint8Array))
+      throw new TypeError("blob.write: bytes must be a string or Uint8Array");
+    return sysBlob.write(bytes);
+  },
+
+  /**
+   * Seal this connection's upload session: hash the accumulated
+   * bytes (sha256 = the object's key), return the hash
+   * synchronously, and PUT the bytes content-addressed. The PUT's
+   * result resumes THIS connection at the `to` export with
+   * `request.status`; thread the hash there via `next({ hash })`
+   * (the chain-ctx idiom). Connection-scoped like `on.fetch`:
+   * without a held connection the seal is inert.
+   *
+   * Durability contract: there is no owed marker — your `to` export
+   * observing a 2xx status IS the signal the object is durable;
+   * write your kv index there. On failure, re-uploading the same
+   * bytes is always safe (same hash, idempotent PUT).
+   *
+   * @param {object} opts
+   * @param {string} opts.to - Export resumed with the PUT result
+   *   (required).
+   * @param {string} [opts.content_type] - Stored Content-Type.
+   * @returns {string} The object's sha256 hash (64 hex chars).
+   *
+   * @example
+   * const hash = blob.seal({ to: "onStored", content_type: "image/png" });
+   * return next({ hash });
+   *
+   * // ...
+   * export function onStored() {
+   *   if (request.status !== 200) { response.status = 502; return "store failed"; }
+   *   kv.set(`media/${mxc()}`, JSON.stringify({ hash: request.ctx.hash }));
+   *   return JSON.stringify({ content_uri: request.ctx.hash });
+   * }
+   */
+  seal(opts) {
+    opts = opts || {};
+    if (typeof opts.to !== "string" || !opts.to.length)
+      throw new TypeError("blob.seal: `to` export name is required");
+    return sysBlob.seal(opts.to,
+                        opts.content_type != null ? opts.content_type : undefined);
   },
 };
 

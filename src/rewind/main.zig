@@ -238,6 +238,7 @@ fn workerMain(args: *WorkerCtx) !void {
         try rjs.serviceWsMessages(worker);
         try rjs.cleanupResponses(worker);
         rjs.sweepCronSubscriptions(worker);
+        rjs.sweepBlobSessions(worker);
         rjs.sweepOwedRetries(worker);
         rjs.sweepDurableWakes(worker);
         rjs.serviceSubscriptionFires(worker);

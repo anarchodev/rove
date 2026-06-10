@@ -3070,6 +3070,9 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 .resume_if_bound_ctx = @ptrCast(worker),
                 .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
                 .cancel_fetch_ctx = @ptrCast(worker),
+                .blob_write = &@TypeOf(worker.*).blobWriteTrampoline,
+                .blob_seal = &@TypeOf(worker.*).blobSealTrampoline,
+                .blob_session_ctx = @ptrCast(worker),
             },
             .effects = .{
                 .pending_fetches = &pending_fetches,

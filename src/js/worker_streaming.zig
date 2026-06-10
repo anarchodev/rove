@@ -981,6 +981,9 @@ pub fn resumeBoundFetchStream(
         .trampolines = .{
             .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
             .resume_if_bound_ctx = @ptrCast(worker),
+            .blob_write = &@TypeOf(worker.*).blobWriteTrampoline,
+            .blob_seal = &@TypeOf(worker.*).blobSealTrampoline,
+            .blob_session_ctx = @ptrCast(worker),
             .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
             .cancel_fetch_ctx = @ptrCast(worker),
         },
@@ -4081,6 +4084,9 @@ pub fn fireFetchEventActivation(
             // parked until its 25s deadline.
             .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
             .resume_if_bound_ctx = @ptrCast(worker),
+            .blob_write = &@TypeOf(worker.*).blobWriteTrampoline,
+            .blob_seal = &@TypeOf(worker.*).blobSealTrampoline,
+            .blob_session_ctx = @ptrCast(worker),
             .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
             .cancel_fetch_ctx = @ptrCast(worker),
         },

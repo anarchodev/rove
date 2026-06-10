@@ -35,6 +35,7 @@ const scheduler_b = @import("bindings/scheduler.zig");
 const on_b = @import("bindings/on.zig");
 const blob_b = @import("bindings/blob.zig");
 const blob_mod = @import("rove-blob");
+const blob_sessions_mod = @import("blob_sessions.zig");
 const td = @import("trigger_dispatch.zig");
 const reserved = @import("reserved.zig");
 const bytecode_cache_mod = @import("bytecode_cache.zig");
@@ -473,6 +474,22 @@ pub const DispatchState = struct {
     /// the signing keys natively). Null on test paths without a
     /// node — presign then throws "not configured".
     blob_cfg: ?*const blob_mod.BackendConfig = null,
+    /// `docs/blob-storage-plan.md` P2: blob upload-session
+    /// trampolines (worker `blobWriteTrampoline` /
+    /// `blobSealTrampoline`). Null where there is no worker —
+    /// `blob.write` / `blob.seal` then throw.
+    blob_write: ?*const fn (
+        ctx: *anyopaque,
+        tenant_id: []const u8,
+        corr: []const u8,
+        bytes: []const u8,
+    ) blob_sessions_mod.Error!u64 = null,
+    blob_seal: ?*const fn (
+        ctx: *anyopaque,
+        tenant_id: []const u8,
+        corr: []const u8,
+    ) blob_sessions_mod.Error!blob_sessions_mod.Sealed = null,
+    blob_session_ctx: ?*anyopaque = null,
     /// Plan-resolved rate caps + plan generation for `instance_id` (from its
     /// `TenantSlot`). The `email.send` rate check sizes its bucket from these
     /// (docs/plan-tiers.md Lever 1). Defaults = free/default caps on paths
@@ -1781,6 +1798,9 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     // over the fetch engine's `rove-blob.internal` trusted door.
     .{ .path = &.{ "_system", "blob" }, .fns = &.{
         .{ .name = "presign", .cfunc = blob_b.jsBlobPresign, .argc = 3 },
+        // P2 upload sessions (`docs/blob-storage-plan.md` §3.4).
+        .{ .name = "write",   .cfunc = blob_b.jsBlobWrite,   .argc = 1 },
+        .{ .name = "seal",    .cfunc = blob_b.jsBlobSeal,    .argc = 2 },
     } },
     // Phase 5 PR-3: the `_system.continuation.resumeIfBound` shim was
     // a stillborn — the `_harden.js` step (`delete globalThis._system;`
@@ -2237,6 +2257,30 @@ pub fn installRequest(
         // only by `resumeBoundFetchChain`, null in
         // `fireFetchEventActivation`'s unbound path.
         if (request.activation_entity != null) {
+            // handler-shape §7: fetch resumes carry `request.ctx`
+            // (the fetch's `ctx:` option). The resume path
+            // synthesized `Request.body` as `{"ctx":...}` but the
+            // bound surface replaces `request.body` with the chunk
+            // bytes below — lift the ctx to its documented home
+            // first. (Pre-P2 this was silently dropped: any bound
+            // fetch's `ctx:` was unreachable from the handler.)
+            // Same NUL-terminated-buffer rule as the fetch-headers
+            // parse above.
+            if (request.body.len > 0) {
+                if (state.allocator.allocSentinel(u8, request.body.len, 0)) |buf| {
+                    defer state.allocator.free(buf);
+                    @memcpy(buf, request.body);
+                    const parsed = c.JS_ParseJSON(ctx, buf.ptr, request.body.len, "<fetch ctx>");
+                    if (c.JS_IsException(parsed)) {
+                        _ = c.JS_GetException(ctx); // clear; no ctx
+                    } else {
+                        const ctx_val = c.JS_GetPropertyStr(ctx, parsed, "ctx");
+                        // Setter consumes the ctx_val reference.
+                        _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", ctx_val);
+                        c.JS_FreeValue(ctx, parsed);
+                    }
+                } else |_| {}
+            }
             _ = c.JS_SetPropertyStr(
                 ctx,
                 req_obj,

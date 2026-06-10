@@ -60,6 +60,7 @@ const kv_mod = @import("raft-kv");
 const bridge_mod = @import("bridge");
 const Bridge = bridge_mod.Bridge;
 const blob_mod = @import("rove-blob");
+const blob_sessions_mod = @import("blob_sessions.zig");
 const files_mod = @import("rove-files");
 const log_mod = @import("rove-log");
 const log_server_mod = @import("rove-log-server");
@@ -128,6 +129,7 @@ pub const CronState = subscription_sweep.CronState;
 pub const sweepBootSubscriptions = subscription_sweep.sweepBootSubscriptions;
 const starter = @import("starter.zig");
 pub const sweepCronSubscriptions = subscription_sweep.sweepCronSubscriptions;
+pub const sweepBlobSessions = @import("blob_sessions.zig").sweepBlobSessions;
 const durable_wake = @import("durable_wake.zig");
 // §2.6 durable scheduled-wake sweep lives in durable_wake.zig.
 pub const sweepDurableWakes = durable_wake.sweepDurableWakes;
@@ -1202,6 +1204,14 @@ pub fn Worker(comptime opts: Options) type {
     const CronStateRow = rove.Row(&.{CronState});
     const CronStateColl = rove.Collection(CronStateRow, .{});
 
+    // `docs/blob-storage-plan.md` P2: open blob upload sessions —
+    // one entity per (tenant, chain) accumulating `blob.write`
+    // bytes until `blob.seal`. Per-worker (a chain's activations
+    // all run on its owning worker). Session strings + buffer
+    // auto-deinit on entity destroy.
+    const BlobSessionRow = rove.Row(&.{blob_sessions_mod.Session});
+    const BlobSessionColl = rove.Collection(BlobSessionRow, .{});
+
     // Effect-reification Phase 2D: the `fetch_event_pending`
     // collection that lived here is gone. Inbox messages drain
     // directly onto `Worker.msg_queue` (the unified ingress);
@@ -1345,6 +1355,10 @@ pub fn Worker(comptime opts: Options) type {
         /// is_leader_now` in `loop46/main.zig`). Replaces the pre-
         /// 2026-05-27 node-level StringHashMap + mutex.
         cron_state: CronStateColl,
+        /// `docs/blob-storage-plan.md` P2: open blob upload sessions
+        /// (`blob.write` / `blob.seal`). TTL-swept via
+        /// `blob_sessions.sweepBlobSessions` in the worker tick.
+        blob_sessions: BlobSessionColl,
         /// Effect-reification Phase 2 ingress
         /// (`docs/effect-algebra.md` §2.3; `effect-reification-plan.md`
         /// Phase 2). One bounded queue per worker; every migrated
@@ -1692,6 +1706,7 @@ pub fn Worker(comptime opts: Options) type {
                 .parked_continuations = try StreamColl.init(allocator),
                 .parked_units = try ParkedUnitColl.init(allocator),
                 .cron_state = try CronStateColl.init(allocator),
+                .blob_sessions = try BlobSessionColl.init(allocator),
                 .msg_inbox = effect_mod.MsgInbox.init(allocator),
                 // Effect-reification Phase 2 ingress. Cap chosen
                 // well above the typical per-tick fire rate (cron
@@ -1744,6 +1759,7 @@ pub fn Worker(comptime opts: Options) type {
             errdefer self.parked_continuations.deinit();
             errdefer self.parked_units.deinit();
             errdefer self.cron_state.deinit();
+            errdefer self.blob_sessions.deinit();
             errdefer self.tenant_logs.clearAllEntries(allocator);
             errdefer self.wake_inbox.deinit();
 
@@ -1755,6 +1771,7 @@ pub fn Worker(comptime opts: Options) type {
             reg.registerCollection(&self.parked_continuations);
             reg.registerCollection(&self.parked_units);
             reg.registerCollection(&self.cron_state);
+            reg.registerCollection(&self.blob_sessions);
 
             // Register the inbox with the node so apply.zig +
             // worker_dispatch.zig can broadcast kv-write events to
@@ -1961,6 +1978,7 @@ pub fn Worker(comptime opts: Options) type {
             self.parked_continuations.deinit();
             self.parked_units.deinit();
             self.cron_state.deinit();
+            self.blob_sessions.deinit();
             self.raft_pending_response.deinit();
             self.raft_pending_cont.deinit();
             self.raft_pending_stream.deinit();
@@ -2317,6 +2335,44 @@ pub fn Worker(comptime opts: Options) type {
                 return false;
             };
             return true;
+        }
+
+        /// `docs/blob-storage-plan.md` P2: blob upload-session
+        /// trampolines, wired into `Request.trampolines` so the
+        /// `_system.blob.write` / `.seal` bindings reach this
+        /// worker's `blob_sessions` collection through the same
+        /// type-erased seam as the other worker re-entries.
+        pub fn blobWriteTrampoline(
+            ctx: *anyopaque,
+            tenant_id: []const u8,
+            corr: []const u8,
+            bytes: []const u8,
+        ) blob_sessions_mod.Error!u64 {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            return blob_sessions_mod.write(
+                self.allocator,
+                self.h2.reg,
+                &self.blob_sessions,
+                tenant_id,
+                corr,
+                bytes,
+                @intCast(std.time.nanoTimestamp()),
+            );
+        }
+
+        pub fn blobSealTrampoline(
+            ctx: *anyopaque,
+            tenant_id: []const u8,
+            corr: []const u8,
+        ) blob_sessions_mod.Error!blob_sessions_mod.Sealed {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            return blob_sessions_mod.seal(
+                self.allocator,
+                self.h2.reg,
+                &self.blob_sessions,
+                tenant_id,
+                corr,
+            );
         }
 
         /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`

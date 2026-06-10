@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""blob.* P1 smoke — `docs/blob-storage-plan.md` P1 exit check.
+"""blob.* P1+P2 smoke — `docs/blob-storage-plan.md` exit checks.
 
 Proves the customer blob surface end to end on the real V2 stack
 against real S3 (the V2 blob backend is S3-only):
@@ -19,6 +19,13 @@ against real S3 (the V2 blob backend is S3-only):
      query-mode SigV4 path + per-tenant prefix isolation end to end.
   4. Hash validation: `blob.url` on a malformed hash → handler throws
      → 500 (the trusted door never sees a non-digest key).
+  5. P2 `blob.write`/`blob.seal` sessions: (a) mirror — a streamed
+     `on.fetch` of our own presigned URL, one `blob.write` per chunk
+     resume, `seal` on final; content addressing self-validates (the
+     mirrored object's hash must equal the source's); (b) gen —
+     eight writes in one activation, seal, hash compared to a
+     python-side sha256 of the same content; round-tripped via
+     presigned URL (large bodies don't materialize in JS — arena).
 
 Needs S3 env (`set -a; . ./.env; set +a`) and binaries:
 `zig build rewind rewind-cp rewind-front files-server-v2`.
@@ -73,6 +80,60 @@ export default function () {
   const ctx = JSON.parse(request.body).ctx;
   kv.set("put_result", JSON.stringify({ result: ctx.result, context: ctx.context }));
 }
+"""
+
+# P2 mirror flow: stream an upstream object (here: a presigned URL of
+# our own put object, hex-encoded to survive the query string) chunk
+# by chunk through blob.write, seal, and return the resulting hash.
+# Content addressing makes the test self-validating: mirrored bytes
+# must produce the ORIGINAL object's hash.
+MIRROR_SRC = """
+export default function () {
+  const src = new TextDecoder().decode(
+    hex.decode(request.path.slice(request.path.indexOf("src=") + 4)));
+  on.fetch(src, { stream: true, max_response_chunk_bytes: 16384 },
+           { to: "onChunk" });
+  return next();
+}
+
+export function onChunk() {
+  if (!request.done) {
+    if (request.body && request.body.length) blob.write(request.body);
+    return next();
+  }
+  const hash = blob.seal({ to: "onStored", content_type: "text/plain" });
+  return next({ hash });
+}
+
+export function onStored() {
+  if (request.status !== 200) {
+    response.status = 502;
+    return "seal PUT failed: " + request.status;
+  }
+  return request.ctx.hash;
+}
+"""
+
+# P2 multi-write-in-one-activation flow: JS-generated content, eight
+# blob.write calls, seal — the smoke compares against a python-side
+# sha256 of the same deterministic content.
+GEN_CHUNK = "rewindjs-blob-p2!" * 1024  # 17 KiB
+GEN_SRC = f"""
+export default function () {{
+  let chunk = "";
+  for (let i = 0; i < 1024; i++) chunk += "rewindjs-blob-p2!";
+  for (let i = 0; i < 8; i++) blob.write(chunk);
+  const hash = blob.seal({{ to: "onStored" }});
+  return next({{ hash }});
+}}
+
+export function onStored() {{
+  if (request.status !== 200) {{
+    response.status = 502;
+    return "seal PUT failed: " + request.status;
+  }}
+  return request.ctx.hash;
+}}
 """
 
 HANDLER_SRC = """
@@ -135,6 +196,8 @@ def main() -> int:
                 "index.mjs": HANDLER_SRC,
                 "get/index.mjs": GET_SRC,
                 "putresult.mjs": PUTRESULT_SRC,
+                "mirror/index.mjs": MIRROR_SRC,
+                "gen/index.mjs": GEN_SRC,
             })
         except Exception as e:  # noqa: BLE001
             check("deploy_handlers", False, str(e))
@@ -203,6 +266,35 @@ def main() -> int:
         print("step 5: malformed hash rejected before the door")
         r = c.request(TENANT, "/url?hash=nothex")
         check("bad hash → 500", r.status == 500, f"got {r.status} {r.body!r}")
+
+        print("step 6: P2 mirror — streamed fetch → blob.write per chunk → seal")
+        src_hex = url.encode().hex()
+        r = c.request(TENANT, f"/mirror?src={src_hex}", timeout=60.0)
+        check("mirror route → 200", r.status == 200, f"got {r.status} {r.body!r}")
+        mirrored = (r.body.decode() if isinstance(r.body, bytes) else str(r.body)).strip()
+        check("mirrored hash == original hash (CAS self-validation)",
+              mirrored == expect_hash, f"got {mirrored!r} want {expect_hash!r}")
+
+        print("step 7: P2 multi-write — 8 writes in one activation → seal")
+        gen_expect = hashlib.sha256((GEN_CHUNK * 8).encode()).hexdigest()
+        r = c.request(TENANT, "/gen", timeout=60.0)
+        check("gen route → 200", r.status == 200, f"got {r.status} {r.body!r}")
+        gen_hash = (r.body.decode() if isinstance(r.body, bytes) else str(r.body)).strip()
+        check("gen hash == python sha256 of same content",
+              gen_hash == gen_expect, f"got {gen_hash!r} want {gen_expect!r}")
+        # Round-trip via the presigned URL, not blob.get: a 139 KB
+        # body materialized as a JS string blows the per-request
+        # arena (TextDecoder OOM) — large objects are exactly what
+        # the redirect path is for.
+        r = c.request(TENANT, f"/url?hash={gen_expect}")
+        gen_url = (r.body.decode() if isinstance(r.body, bytes) else str(r.body)).strip()
+        try:
+            with urllib.request.urlopen(gen_url, timeout=15) as resp:
+                direct = resp.read().decode()
+            check("sealed gen object round-trips via presigned URL",
+                  direct == GEN_CHUNK * 8, f"len {len(direct)}")
+        except Exception as e:  # noqa: BLE001
+            check("sealed gen object round-trips via presigned URL", False, str(e))
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 0 if FAIL == 0 else 1
