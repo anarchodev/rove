@@ -316,6 +316,23 @@ forever. If customers keep forking `segments.js` in the same
 direction, that is the promotion signal
 ([[feedback_compose_from_primitives]]).
 
+**As-built (P4, 2026-06-09).** `globals/segments.js` ships
+`append` / `get` / `slice` / `seal` over `_seg/{stream}/…` keys
+(NOT platform-reserved — the `_send/` rule), with
+`__system/segments_onsealed.mjs` as the swap half (index write +
+hot-row deletes, one atomic writeset, strictly after the PUT
+confirmed). Deltas from the sketch above: the v1 segment format is a
+JSON envelope `{v, stream, first_seq, values: […]}` rather than a
+binary offset table — `segments.slice` indexes by `seq − first_seq`,
+the 100 MiB arena makes parsing whole segments cheap, and the offset
+optimization waits for evidence; sealed reads thread their slicing
+info via `blob.get`'s `ctx:` passthrough (added for this) instead of
+kv round-trips; overlapping seals converge by construction (same
+`first_seq` ⇒ last index write wins and its CAS blob carries a
+superset). Hot reads are synchronous; `segments.get` returns
+string (hot) / `null` (gone) / `undefined` (sealed — finish in
+`{to}` with `segments.slice`).
+
 ## 7. Open questions
 
 1. **Delete / GC.** CAS + customer-owned naming means the platform
@@ -348,7 +365,7 @@ direction, that is the promotion signal
 | P1 ✅ | signing door + `put`/`get`/`url` shims (2026-06-09, `scripts/blob_smoke_v2.py`) | smallest end-to-end slice; covers events, snapshots, small media; `url` unlocks 307-to-presigned downloads |
 | P2 ✅ | `write`/`seal` upload sessions (2026-06-09, same smoke, 19/19) | bounded single-PUT sessions (64 MiB cap), NOT multipart — see as-built deltas |
 | P3 | `onHeaders` dispatch + `blob.receive` | Case B one-PUT uploads; h2 window held until disposition |
-| P4 | `segments.js` stdlib recipe + docs | the kv-cap ↔ byte-ring lever, documented |
+| P4 ✅ | `segments.js` stdlib recipe (2026-06-09, smoke step 8, 28/28) | the kv-cap ↔ byte-ring lever; as-built notes in §6 |
 | — | byte-ring metering + quota | alongside P1–P3; enforcement points per §7.2 |
 
 Each phase is independently useful; P1 alone un-blocks the Matrix

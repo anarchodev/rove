@@ -136,6 +136,30 @@ export function onStored() {{
 }}
 """
 
+# Held route (next()) ⇒ module-per-route. Reads one record: hot →
+# sync return; sealed → blob.get of the segment resumes onSeg, which
+# slices via the recipe helper.
+SEGGET_SRC = """
+export default function () {
+  const qpos = request.path.indexOf("?");
+  const q = {};
+  for (const pair of request.path.slice(qpos + 1).split("&")) {
+    const eq = pair.indexOf("=");
+    if (eq > 0) q[pair.slice(0, eq)] = pair.slice(eq + 1);
+  }
+  const v = segments.get(q.stream, Number(q.seq), { to: "onSeg" });
+  if (typeof v === "string") return "hot:" + v;
+  if (v === null) { response.status = 404; return "missing"; }
+  return next();
+}
+
+export function onSeg() {
+  if (!request.done) return next();
+  if (request.status !== 200) { response.status = 502; return "segment fetch failed"; }
+  return "sealed:" + segments.slice(request);
+}
+"""
+
 HANDLER_SRC = """
 export default function () {
   const qpos = request.path.indexOf("?");
@@ -165,6 +189,26 @@ export default function () {
     const pr = kv.get("put_result");
     return JSON.stringify({ owed: owed ? JSON.parse(owed) : null,
                             put_result: pr ? JSON.parse(pr) : null });
+  }
+  if (path === "/seg-append") {
+    const n = Number(q.n || "1");
+    let first = -1, last = -1;
+    for (let i = 0; i < n; i++) {
+      // Each record embeds its own seq so reads are self-checking.
+      const nx = Number(kv.get("_seg/" + q.stream + "/n") ?? "0");
+      const seq = segments.append(q.stream, "v-" + nx);
+      if (first < 0) first = seq;
+      last = seq;
+    }
+    return JSON.stringify({ first, last });
+  }
+  if (path === "/seg-seal") {
+    return String(segments.seal(q.stream, { min: 1 }));
+  }
+  if (path === "/seg-check") {
+    const hot = kv.prefix("_seg/" + q.stream + "/h/", null, 4096);
+    const segs = kv.prefix("_seg/" + q.stream + "/s/", null, 4096);
+    return JSON.stringify({ hot: hot.length, segs: segs.map((r) => JSON.parse(r.value)) });
   }
   if (path === "/") return "ready";
   response.status = 404;
@@ -198,6 +242,7 @@ def main() -> int:
                 "putresult.mjs": PUTRESULT_SRC,
                 "mirror/index.mjs": MIRROR_SRC,
                 "gen/index.mjs": GEN_SRC,
+                "segget/index.mjs": SEGGET_SRC,
             })
         except Exception as e:  # noqa: BLE001
             check("deploy_handlers", False, str(e))
@@ -300,6 +345,46 @@ def main() -> int:
                   direct == GEN_CHUNK * 8, f"len {len(direct)}")
         except Exception as e:  # noqa: BLE001
             check("sealed gen object round-trips via presigned URL", False, str(e))
+
+        print("step 8: P4 segments — append, hot read, seal, sealed read")
+        r = c.request(TENANT, "/seg-append?stream=sm&n=6")
+        check("append 6 → seqs 0..5", r.status == 200 and json.loads(r.body) == {"first": 0, "last": 5},
+              f"got {r.status} {r.body!r}")
+        r = c.request(TENANT, "/segget?stream=sm&seq=2", timeout=30.0)
+        body = r.body.decode() if isinstance(r.body, bytes) else str(r.body)
+        check("hot read seq 2", r.status == 200 and body == "hot:v-2", f"got {r.status} {body!r}")
+        r = c.request(TENANT, "/seg-seal?stream=sm")
+        body = r.body.decode() if isinstance(r.body, bytes) else str(r.body)
+        check("seal → 6 rows", r.status == 200 and body.strip() == "6", f"got {r.status} {body!r}")
+        swapped = None
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            rc = c.request(TENANT, "/seg-check?stream=sm")
+            if rc.status == 200:
+                st = json.loads(rc.body)
+                if st["hot"] == 0 and len(st["segs"]) == 1:
+                    swapped = st
+                    break
+            time.sleep(0.5)
+        check("swap: hot rows gone, 1 index row", swapped is not None,
+              "swap never landed in 30s")
+        if swapped:
+            seg = swapped["segs"][0]
+            check("index row covers 0..5",
+                  seg["first_seq"] == 0 and seg["last_seq"] == 5 and seg["count"] == 6,
+                  f"got {seg!r}")
+        r = c.request(TENANT, "/segget?stream=sm&seq=2", timeout=30.0)
+        body = r.body.decode() if isinstance(r.body, bytes) else str(r.body)
+        check("sealed read seq 2 (blob.get + slice)",
+              r.status == 200 and body == "sealed:v-2", f"got {r.status} {body!r}")
+        r = c.request(TENANT, "/seg-append?stream=sm&n=2")
+        check("counter survives seal (next seqs 6..7)",
+              r.status == 200 and json.loads(r.body) == {"first": 6, "last": 7},
+              f"got {r.status} {r.body!r}")
+        r = c.request(TENANT, "/segget?stream=sm&seq=6", timeout=30.0)
+        body = r.body.decode() if isinstance(r.body, bytes) else str(r.body)
+        check("post-seal hot read seq 6", r.status == 200 and body == "hot:v-6",
+              f"got {r.status} {body!r}")
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 0 if FAIL == 0 else 1

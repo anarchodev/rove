@@ -3620,6 +3620,47 @@ test "dispatch: crypto.hmacSha256 accepts Uint8Array inputs" {
     );
 }
 
+test "dispatch: segments append + hot get + per-stream counter" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Hot-tail half of the recipe (the seal half needs the fetch
+    // engine — covered by blob_smoke_v2.py step 8).
+    var resp = try runOne(
+        &d,
+        kv,
+        \\const a = segments.append("t1", "v0");
+        \\const b = segments.append("t1", "v1");
+        \\const other = segments.append("t2", "x0");
+        \\return {
+        \\  a: a, b: b, other: other,
+        \\  hot: segments.get("t1", 1),
+        \\  missing_is_null: segments.get("t1", 99) === null,
+        \\  next: kv.get("_seg/t1/n"),
+        \\  row_key_padded: kv.get("_seg/t1/h/00000000000000000001") === "v1",
+        \\};
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+
+    var out = try std.json.parseFromSlice(std.json.Value, testing.allocator, resp.body, .{});
+    defer out.deinit();
+    try testing.expectEqual(@as(i64, 0), out.value.object.get("a").?.integer);
+    try testing.expectEqual(@as(i64, 1), out.value.object.get("b").?.integer);
+    try testing.expectEqual(@as(i64, 0), out.value.object.get("other").?.integer);
+    try testing.expectEqualStrings("v1", out.value.object.get("hot").?.string);
+    try testing.expect(out.value.object.get("missing_is_null").?.bool);
+    try testing.expectEqualStrings("2", out.value.object.get("next").?.string);
+    try testing.expect(out.value.object.get("row_key_padded").?.bool);
+}
+
 test "dispatch: TextEncoder/TextDecoder round-trip multi-byte UTF-8" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

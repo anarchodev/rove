@@ -111,6 +111,8 @@ globalThis.blob = {
    * @param {string} hash - The object's sha256 hash.
    * @param {object} [opts]
    * @param {string} [opts.to] - Export name to resume in.
+   * @param {*} [opts.ctx] - Delivered as `request.ctx` on the
+   *   resume (JSON round-trip).
    * @param {boolean} [opts.stream] - Per-chunk delivery (default
    *   false: one whole-body result, up to `max_bytes`).
    * @param {number} [opts.max_bytes] - Whole-body transport cap
@@ -137,6 +139,10 @@ globalThis.blob = {
         ? (opts.max_chunk_bytes || 256 * 1024)
         : (opts.max_bytes || 8 * 1024 * 1024),
     };
+    // `ctx` rides the fetch and resumes as `request.ctx` — how
+    // composers (segments.get) thread slicing info to the `to`
+    // export without kv round-trips.
+    if (opts.ctx !== undefined) fetch_opts.ctx = opts.ctx;
     return on.fetch(BLOB_ORIGIN + hash, fetch_opts,
                     opts.to ? { to: opts.to } : undefined);
   },
