@@ -617,5 +617,13 @@ pub fn main() !void {
 
     while (!stop_flag.load(.acquire)) std.Thread.sleep(100 * std.time.ns_per_ms);
     th.join();
+    // Teardown order: the pump fires the deploy apply observer into
+    // `node_state` (`setApplyObserver` above), but `node_state`'s defer —
+    // declared after the bridge — deinits BEFORE `bridge.deinit` joins the
+    // pump in the LIFO unwind. A follower applying `_deploy/current` in
+    // that window dereferences a freed NodeState. Stop the pump first
+    // (idempotent — `bridge.deinit`'s own `stopPump` becomes a no-op),
+    // mirroring the CP's documented pump-before-observer-target ordering.
+    bridge.stopPump();
     std.log.info("rewind: shut down", .{});
 }
