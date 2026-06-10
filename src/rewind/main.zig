@@ -233,6 +233,12 @@ fn workerMain(args: *WorkerCtx) !void {
         try rjs.drainForwardPending(worker);
         rjs.drainSpools(worker);
         try rjs.sweepParkedContinuations(worker);
+        // Gap 2.4 (docs/inbound-chunk-plan.md S2): fire the next staged
+        // inbound body chunk into each held `onChunk` chain. Runs after
+        // drainRaftPending so a writing chunk's committed entity is back
+        // in parked_continuations (the pump's readiness signal) within
+        // the same tick.
+        rjs.pumpInboundChunks(worker);
         try rjs.serviceParkedStreams(worker);
         // docs/websocket-plan.md §4.5/§5 (piece D): dispatch inbound WS
         // frames (h2 `ws_message_out`) to the held chain's `onMessage` /

@@ -2752,3 +2752,365 @@ pub fn scanAndCancelBoundFetches(worker: anytype, ent: rove.Entity) void {
         worker.unregisterBoundFetch(fetch_id);
     }
 }
+
+// ── Gap 2.4: inbound-chunk resume engine (`docs/inbound-chunk-plan.md` S2) ──
+
+/// Per-tick pump for streaming inbound bodies. For each live job:
+/// janitor stale entities (response shipped / connection died — the
+/// existing chain-teardown paths run first; this only reclaims the job),
+/// repay the prior fire's flow-control window once the entity is parked
+/// again, and fire the next staged chunk into the held chain. The first
+/// fire (the `onChunk` probe) is `dispatchOnce`'s — the pump only ever
+/// resumes `parked_continuations` entities, so ordering and
+/// read-your-writes are collection membership: chunk K+1 cannot fire
+/// until chunk K's activation (and, if it wrote, its raft commit)
+/// returned the entity to the parked collection.
+pub fn pumpInboundChunks(worker: anytype) void {
+    const server = worker.h2;
+    var done: std.ArrayListUnmanaged(rove.Entity) = .empty;
+    defer done.deinit(worker.allocator);
+    var it = worker.inbound_chunk_jobs.iterator();
+    while (it.next()) |entry| {
+        const ent = entry.key_ptr.*;
+        const job = entry.value_ptr.*;
+        if (server.reg.isStale(ent)) {
+            // The request finished (terminal shipped + cleaned) or the
+            // connection died (disconnect teardown ran). Either way the
+            // chain's own machinery resolved the entity; reclaim the job.
+            job.kill();
+            done.append(worker.allocator, ent) catch {};
+            continue;
+        }
+        if (!job.first_fired) continue; // dispatchOnce owns the probe fire
+        if (!server.reg.isInCollection(ent, &worker.parked_continuations)) continue; // fire in flight
+        // The prior fire fully resolved (commit included) — repay its
+        // window so the client can send the next stretch.
+        job.repayResolved();
+        if (job.final_fired) {
+            // Upload complete; the chain lives on under the ordinary
+            // continuation machinery (wakes, deadline). Detach early —
+            // h2's sink reference releases at stream close.
+            done.append(worker.allocator, ent) catch {};
+            continue;
+        }
+        if (job.aborted) {
+            // Client died mid-upload while the chain is parked. The h2
+            // disconnect path fires `onDisconnect` for held chains; the
+            // job just stops feeding. Reclaim on the stale sweep above.
+            continue;
+        }
+        if (!job.fireReady()) continue;
+        if (!job.stageFire()) continue; // OOM — retry next tick
+        resumeInboundChunk(worker, ent, job);
+        job.fireDispatched();
+    }
+    for (done.items) |ent| {
+        if (worker.inbound_chunk_jobs.fetchRemove(ent)) |kv| kv.value.unref();
+    }
+}
+
+/// Resume a held chain with the next inbound body chunk — the
+/// `.inbound_chunk` sibling of `resumeBoundFetchChain` (same shape:
+/// parked entity + raw chunk bytes + named-export dispatch + the
+/// `finishResponse` stream bridge). `job.staged` carries the payload;
+/// the per-fire fields come from the job's dispatch-side bookkeeping.
+fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) void {
+    const allocator = worker.allocator;
+    const server = worker.h2;
+    if (!server.reg.isInCollection(ent, &worker.parked_continuations)) return; // resolve-once
+    const desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return;
+    const chain = server.reg.get(ent, &worker.parked_continuations, components_mod.ChainContext) catch return;
+    const c = desc.cont orelse return;
+    const tenant_id = chain.tenant_id;
+    const correlation_id = chain.correlation_id;
+    const cont_path = c.path;
+    const cont_ctx_json = c.ctx_json;
+    const path = cont_path;
+    var dep = resolveDeployment(worker, allocator, tenant_id, path) catch |err| {
+        std.log.warn(
+            "rove-js inbound-chunk resume: resolveDeployment tenant={s} module={s}: {s}",
+            .{ tenant_id, path, @errorName(err) },
+        );
+        return;
+    };
+    defer dep.tc.release();
+    const inst = dep.inst;
+    const tc = dep.tc;
+    const bc = dep.bc;
+
+    const chunk_bytes: []const u8 = job.staged orelse return;
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
+    defer allocator.free(spath);
+
+    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
+    var txn_owned = true;
+    defer if (txn_owned) allocator.destroy(txn);
+    txn.* = inst.kv.beginTrackedImmediate() catch return;
+    var txn_done = false;
+    defer if (!txn_done) txn.rollback() catch {};
+
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    defer readset.deinit();
+    const request_id: u64 = blk: {
+        const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
+        break :blk tl.id_minter.nextRequestId() catch 0;
+    };
+
+    const fetches_pending: u32 = blk: {
+        const cnt = server.reg.get(ent, &worker.parked_continuations, components_mod.BoundFetchCount) catch break :blk 0;
+        break :blk cnt.pending;
+    };
+
+    // A chunk handler may stream (`stream.start`/`stream.write` +
+    // `next()` — the finishResponse bridge) and may fetch
+    // (`on.fetch` per chunk, handler-shape §5.3).
+    var stream_chunks: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (stream_chunks.items) |ch| allocator.free(ch);
+        stream_chunks.deinit(allocator);
+    }
+    var pending_fetches: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
+    defer {
+        for (pending_fetches.items) |*pf| pf.deinit(allocator);
+        pending_fetches.deinit(allocator);
+    }
+
+    const req: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = chunk_bytes,
+        .query = null,
+        .activation = .{ .inbound_chunk = .{
+            .seq = job.next_seq,
+            .byte_offset = job.fired_offset,
+            .done = job.staged_done,
+            .ctx_json = if (cont_ctx_json.len > 0) cont_ctx_json else null,
+        } },
+        .activation_entity = ent,
+        .activation_fetches_pending = fetches_pending,
+        .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .admin = .{ .platform = inst.platform },
+        .trampolines = .{
+            .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
+            .resume_if_bound_ctx = @ptrCast(worker),
+            .blob_write = &@TypeOf(worker.*).blobWriteTrampoline,
+            .blob_seal = &@TypeOf(worker.*).blobSealTrampoline,
+            .blob_session_ctx = @ptrCast(worker),
+            .cancel_fetch = &@TypeOf(worker.*).cancelFetchTrampoline,
+            .cancel_fetch_ctx = @ptrCast(worker),
+        },
+        .effects = .{
+            .pending_stream_chunks = &stream_chunks,
+            .pending_fetches = &pending_fetches,
+        },
+    };
+
+    const sid_ptr = server.reg.get(ent, &worker.parked_continuations, h2.StreamId) catch return;
+    const sess_ptr = server.reg.get(ent, &worker.parked_continuations, h2.Session) catch return;
+    const sid = sid_ptr.*;
+    const sess = sess_ptr.*;
+
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    var oc = worker.dispatcher.runOutcome(
+        inst.kv,
+        txn,
+        &ws,
+        bc,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        tc.snap.triggers,
+        req,
+        &budget,
+    ) catch {
+        txn.rollback() catch {};
+        txn_done = true;
+        resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "inbound-chunk handler error\n") catch {};
+        return;
+    };
+
+    const wrote = ws.ops.items.len > 0;
+
+    switch (oc) {
+        .terminal => |*r| {
+            defer r.deinit(allocator);
+            scanAndCancelBoundFetches(worker, ent);
+            if (r.exception.len > 0) {
+                txn.rollback() catch {};
+                txn_done = true;
+                resolveParked(worker, ent, sid, sess, 500, "inbound-chunk handler exception\n") catch {};
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, .inbound_chunk, 0);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+            if (wrote) {
+                const body_dup = allocator.dupe(u8, r.body) catch {
+                    txn.rollback() catch {};
+                    txn_done = true;
+                    resolveParked(worker, ent, sid, sess, 500, "inbound-chunk alloc failed\n") catch {};
+                    return;
+                };
+                const lh: log_mod.LogHeader = .{
+                    .request_id = request_id,
+                    .deployment_id = tc.snap.deployment_id,
+                    .duration_ns = 0,
+                    .status = st,
+                    .outcome = .ok,
+                    .activation = .inbound_chunk,
+                    .method = "POST",
+                    .path = cont_path,
+                    .host = "",
+                    .correlation_id = correlation_id orelse "",
+                };
+                const console_owned = r.console;
+                const exception_owned = r.exception;
+                r.console = &.{};
+                r.exception = &.{};
+                const seq = proposeAndParkContResume(
+                    worker,
+                    ent,
+                    sid,
+                    sess,
+                    &ws,
+                    txn,
+                    tenant_id,
+                    .{ .terminal = .{ .status = st, .body = body_dup } },
+                    &pending_fetches,
+                    &readset,
+                    lh,
+                ) catch |perr| {
+                    std.log.warn("rove-js inbound-chunk propose failed: {s}", .{@errorName(perr)});
+                    allocator.free(body_dup);
+                    txn_owned = false;
+                    txn_done = true;
+                    resolveParked(worker, ent, sid, sess, 500, "inbound-chunk replication failed\n") catch {};
+                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, correlation_id, .inbound_chunk, 0);
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, .{}, correlation_id, .inbound_chunk, seq);
+                return;
+            }
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "resumeInboundChunk.commit(terminal_ro)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            flushResumeFetches(worker, ent, &pending_fetches, false);
+            resolveParked(worker, ent, sid, sess, st, r.body) catch {};
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, .inbound_chunk, 0);
+            r.console = &.{};
+            r.exception = &.{};
+        },
+        .continuation => |c2| {
+            var c2m = c2;
+            if (c2m.path.len == 0) {
+                if (allocator.dupe(u8, cont_path)) |dup| {
+                    allocator.free(c2m.path);
+                    c2m.path = dup;
+                } else |_| {}
+            }
+            const new_bound_sched_id: ?[]u8 = blk: {
+                const only = worker_mod.scanLoneOwedSendId(ws.ops.items) orelse break :blk null;
+                break :blk allocator.dupe(u8, only) catch null;
+            };
+            if (new_bound_sched_id) |send_id| {
+                _ = worker.node.router.registerBoundSendOwner(send_id, worker.msg_inbox_idx);
+                worker.registerBoundSendEntity(send_id, ent);
+            }
+            if (wrote) {
+                const lh: log_mod.LogHeader = .{
+                    .request_id = request_id,
+                    .deployment_id = tc.snap.deployment_id,
+                    .duration_ns = 0,
+                    .status = 0,
+                    .outcome = .ok,
+                    .activation = .inbound_chunk,
+                    .method = "POST",
+                    .path = cont_path,
+                    .host = "",
+                    .correlation_id = correlation_id orelse "",
+                };
+                const seq = proposeAndParkContResume(
+                    worker,
+                    ent,
+                    sid,
+                    sess,
+                    &ws,
+                    txn,
+                    tenant_id,
+                    .{ .repark = .{ .new_cont = c2m, .new_bound_sched_id = new_bound_sched_id } },
+                    &pending_fetches,
+                    &readset,
+                    lh,
+                ) catch |perr| {
+                    std.log.warn("rove-js inbound-chunk repark: propose failed: {s}", .{@errorName(perr)});
+                    txn_owned = false;
+                    txn_done = true;
+                    resolveParked(worker, ent, sid, sess, 500, "inbound-chunk replication failed\n") catch {};
+                    return;
+                };
+                txn_owned = false;
+                txn_done = true;
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, .inbound_chunk, seq);
+                if (pending_fetches.items.len > 0) std.log.warn(
+                    "rove-js inbound-chunk resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
+                    .{ pending_fetches.items.len, tenant_id },
+                );
+                return;
+            }
+            txn.commit() catch |e| panic_mod.invariantViolated(
+                "resumeInboundChunk.commit(repark_ro)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            txn_done = true;
+            const mutable_desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return;
+            if (mutable_desc.cont) |*old_c| old_c.deinit(allocator);
+            mutable_desc.cont = c2m;
+            if (mutable_desc.bound_schedule_id) |old_b| {
+                worker.node.router.unregisterBoundSendOwner(old_b);
+                worker.unregisterBoundSendEntity(old_b);
+                allocator.free(old_b);
+            }
+            mutable_desc.bound_schedule_id = new_bound_sched_id;
+            mutable_desc.deadline_ns = now_ns + CONT_HOLD_DEADLINE_NS;
+            flushResumeFetches(worker, ent, &pending_fetches, true);
+        },
+        .stream => |*s| {
+            resumeIntoStream(worker, s, .{
+                .ent = ent,
+                .sid = sid,
+                .sess = sess,
+                .ws = &ws,
+                .txn = txn,
+                .tenant_id = tenant_id,
+                .readset = &readset,
+                .cont_path = cont_path,
+                .correlation_id = correlation_id,
+                .request_id = request_id,
+                .now_ns = now_ns,
+                .deployment_id = tc.snap.deployment_id,
+                .wrote = wrote,
+                .txn_owned = &txn_owned,
+                .txn_done = &txn_done,
+                .pending_fetches = &pending_fetches,
+                .activation = .inbound_chunk,
+            });
+        },
+        // The probe ran on the FIRST fire (dispatchOnce); a parked
+        // chain's module proved its `onChunk` there. Defensive arm.
+        .no_onheaders, .no_onchunk => {
+            txn.rollback() catch {};
+            txn_done = true;
+            resolveParked(worker, ent, sid, sess, 500, "export probe on a resume path\n") catch {};
+        },
+    }
+}

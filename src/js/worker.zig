@@ -62,6 +62,7 @@ const Bridge = bridge_mod.Bridge;
 const blob_mod = @import("rove-blob");
 const blob_sessions_mod = @import("blob_sessions.zig");
 const blob_receive_mod = @import("blob_receive.zig");
+const inbound_chunk_mod = @import("worker_inbound_chunk.zig");
 const files_mod = @import("rove-files");
 const log_mod = @import("rove-log");
 const log_server_mod = @import("rove-log-server");
@@ -1498,6 +1499,13 @@ pub fn Worker(comptime opts: Options) type {
         /// IS the held lifecycle); this is only the conn→state index,
         /// the WS analog of `bound_fetch_entities`.
         ws_conns: std.AutoHashMapUnmanaged(rove.Entity, WsConnState) = .empty,
+        /// Gap 2.4 (`docs/inbound-chunk-plan.md` S2): live inbound-chunk
+        /// jobs, keyed by the request entity. One per body-carrying
+        /// request whose module routes to `onChunk`. `dispatchOnce`
+        /// stages the FIRST fire (the probe); `pumpInboundChunks` fires
+        /// the rest off `parked_continuations` membership and janitors
+        /// stale entries.
+        inbound_chunk_jobs: std.AutoHashMapUnmanaged(rove.Entity, *inbound_chunk_mod.Job) = .empty,
         /// `docs/chunk-spool-plan.md` Phase 2: per-fetch chunk spool,
         /// keyed by `fetch_id`, sibling to `bound_fetch_entities`.
         /// Decouples bound-fetch chunk arrival from the held chain's
@@ -2018,6 +2026,18 @@ pub fn Worker(comptime opts: Options) type {
                 }
                 self.ws_conns.deinit(allocator);
             }
+            // Gap 2.4: drop the worker's reference on every live
+            // inbound-chunk job (h2's sink reference, if still held,
+            // releases through h2's own teardown; the refcount frees
+            // the job on the last drop).
+            {
+                var it = self.inbound_chunk_jobs.valueIterator();
+                while (it.next()) |jp| {
+                    jp.*.kill();
+                    jp.*.unref();
+                }
+                self.inbound_chunk_jobs.deinit(allocator);
+            }
             // `docs/chunk-spool-plan.md` Phase 2: free every spool +
             // its still-pending entries + the duped fetch_id key.
             // Best-effort drain at shutdown, same lossy posture as
@@ -2495,6 +2515,47 @@ pub fn Worker(comptime opts: Options) type {
             };
         }
 
+        /// Gap 2.4 (`docs/inbound-chunk-plan.md` S2): create the
+        /// inbound-chunk job for a receiving request and attach it to
+        /// the stream as the h2 body sink. Returns null (and leaves no
+        /// references behind) if the stream is already gone. On
+        /// success the job is registered in `inbound_chunk_jobs`
+        /// (worker ref) and h2 holds the sink ref.
+        pub fn armInboundChunkSink(
+            self: *Self,
+            ent: rove.Entity,
+            conn_entity: rove.Entity,
+            stream_id: u32,
+            cap: u64,
+        ) ?*inbound_chunk_mod.Job {
+            const job = inbound_chunk_mod.Job.create(self.allocator, cap) catch return null;
+            const s: h2.BodySink = .{
+                .ctx = job,
+                .push = &inbound_chunk_mod.Sink.push,
+                .finish = &inbound_chunk_mod.Sink.finish,
+                .abort = &inbound_chunk_mod.Sink.abort,
+                .drained = &inbound_chunk_mod.Sink.drained,
+                .release = &inbound_chunk_mod.Sink.release,
+            };
+            switch (self.h2.requestBodySink(conn_entity, stream_id, s)) {
+                .streaming, .eof => {},
+                .gone => {
+                    // h2 took no reference; drop both.
+                    job.unref();
+                    job.unref();
+                    return null;
+                },
+            }
+            self.inbound_chunk_jobs.put(self.allocator, ent, job) catch {
+                // Worker side failed; h2 still holds its ref. Dead
+                // jobs drain so the closing stream can't wedge.
+                job.kill();
+                job.unref();
+                return null;
+            };
+            return job;
+        }
+
         /// Resolve a request entity's stream identity (its h2 Session
         /// conn entity + StreamId) wherever the entity currently is —
         /// `request_out` (read-only commit path), `raft_pending_cont`
@@ -2720,6 +2781,7 @@ pub const resolveDeployment = worker_drain.resolveDeployment;
 pub const resumeBoundContinuation = worker_drain.resumeBoundContinuation;
 pub const drainPendingBoundResumes = worker_drain.drainPendingBoundResumes;
 pub const sweepParkedContinuations = worker_drain.sweepParkedContinuations;
+pub const pumpInboundChunks = worker_drain.pumpInboundChunks;
 pub const parkKvWakes = worker_drain.parkKvWakes;
 pub const drainOnLeadershipLoss = worker_drain.drainOnLeadershipLoss;
 pub const cleanupResponses = worker_drain.cleanupResponses;
