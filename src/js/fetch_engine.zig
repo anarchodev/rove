@@ -90,8 +90,10 @@ const HELD_MAX_PER_TENANT: u32 = 16;
 /// the real S3 endpoint + tenant `app-blobs/` prefix and signs the
 /// request before libcurl sees it. The `.internal` TLD is reserved
 /// (RFC 8375-adjacent ICANN reservation), so the placeholder can
-/// never collide with a real customer destination.
-pub const BLOB_ORIGIN_PREFIX = "http://rove-blob.internal/";
+/// never collide with a real customer destination. Canonical
+/// definition lives in `blob_sessions.zig` (leaf) so the P2 seal
+/// binding can name it without an import cycle.
+pub const BLOB_ORIGIN_PREFIX = @import("blob_sessions.zig").BLOB_ORIGIN_PREFIX;
 
 pub const FetchEngine = struct {
     allocator: std.mem.Allocator,

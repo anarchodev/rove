@@ -24,6 +24,7 @@ const rove = @import("rove");
 const globals = @import("globals.zig");
 const limiter_mod = @import("limiter.zig");
 const blob_mod = @import("rove-blob");
+const blob_sessions_mod = @import("blob_sessions.zig");
 const continuation_mod = @import("bindings/continuation.zig");
 const stream_mod = @import("bindings/stream.zig");
 const components_mod = @import("components.zig");
@@ -272,6 +273,24 @@ pub const Trampolines = struct {
     set_wake_ctx: ?*anyopaque = null,
     fire_wake: ?*const fn (ctx: *anyopaque, input: globals.FireWakeInput) bool = null,
     fire_wake_ctx: ?*anyopaque = null,
+    /// `docs/blob-storage-plan.md` P2: blob upload sessions.
+    /// `blob_write` appends to (creating on first write) the chain's
+    /// session; `blob_seal` finalizes it and hands back hash + bytes
+    /// for the binding's seal-PUT PendingFetch. Wired to the worker's
+    /// `blobWriteTrampoline` / `blobSealTrampoline`; null on paths
+    /// with no worker (the bindings then throw "not supported").
+    blob_write: ?*const fn (
+        ctx: *anyopaque,
+        tenant_id: []const u8,
+        corr: []const u8,
+        bytes: []const u8,
+    ) blob_sessions_mod.Error!u64 = null,
+    blob_seal: ?*const fn (
+        ctx: *anyopaque,
+        tenant_id: []const u8,
+        corr: []const u8,
+    ) blob_sessions_mod.Error!blob_sessions_mod.Sealed = null,
+    blob_session_ctx: ?*anyopaque = null,
 };
 
 /// Caller-owned accumulators the bindings append to during the dispatch;

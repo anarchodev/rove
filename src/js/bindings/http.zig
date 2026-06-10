@@ -531,8 +531,9 @@ fn buildFetchRow(
 
 /// JS-identifier validator. Used to gate the customer-supplied
 /// `name:` on http.fetch so a stray space or colon doesn't end up
-/// in a `?fn=` query and silently mis-dispatch.
-fn isValidExportName(s: []const u8) bool {
+/// in a `?fn=` query and silently mis-dispatch. Pub: `blob.seal`'s
+/// binding validates its `to` the same way.
+pub fn isValidExportName(s: []const u8) bool {
     if (s.len == 0) return false;
     const first = s[0];
     if (!std.ascii.isAlphabetic(first) and first != '_' and first != '$') return false;

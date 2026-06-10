@@ -94,6 +94,7 @@ pub const flushLogs = worker.flushLogs;
 pub const serviceSubscriptionFires = worker.serviceSubscriptionFires;
 pub const sweepBootSubscriptions = worker.sweepBootSubscriptions;
 pub const sweepCronSubscriptions = worker.sweepCronSubscriptions;
+pub const sweepBlobSessions = worker.sweepBlobSessions;
 pub const sweepOwedRetries = worker.sweepOwedRetries;
 pub const sweepOwedRetriesOnPromotion = worker.sweepOwedRetriesOnPromotion;
 pub const sweepDurableWakes = worker.sweepDurableWakes;
