@@ -4,7 +4,7 @@
 //!
 //!   read :authority / Host → resolve placement via the CP's
 //!   `/_cp/route?host=H` (cached) → reverse-proxy to the owning cluster's
-//!   nodes (leader-aware retry on 503).
+//!   nodes (leader-aware retry on 421 not-leader; ambiguous 503s relay).
 //!
 //! It holds NO directory / raft state — placement lives in the CP
 //! (`rewind-cp`), which this binary reads as a cached read-replica. That is
@@ -392,12 +392,16 @@ const Router = struct {
     }
 
     /// Reverse-proxy one request to whichever node of `nodes` currently leads
-    /// the tenant's group, discovered by retrying on 503 (a follower's
-    /// not-leader response). Relays the first non-503 backend response (or the
-    /// last 503 if every node is a follower / mid-election — the client
-    /// retries). A transport error against one node falls through to the next;
-    /// all-failed → 502. Returns the relayed status (502 sentinel on
-    /// all-failed) so the caller can invalidate a stale cache entry.
+    /// the tenant's group, discovered by retrying on 421 (a follower's
+    /// not-leader / rolled-back response — retry-SAFE by contract with
+    /// `respb.overwriteWith421`). Relays the first non-421 backend response;
+    /// all-421 (mid-election) maps to a plain retryable 503 for the client.
+    /// An ambiguous 503 (post-propose fault/timeout — the entry may still
+    /// commit) is relayed WITHOUT retry so the platform never
+    /// double-executes a write. A transport error against one node falls
+    /// through to the next; all-failed → 502. Returns the relayed status
+    /// (502 sentinel on all-failed) so the caller can invalidate a stale
+    /// cache entry.
     fn proxyToCluster(
         self: *Router,
         server: *FrontH2,
@@ -461,8 +465,17 @@ const Router = struct {
             };
             defer resp.deinit(a);
 
-            // A 503 from a non-last node means "not the leader" — try next.
-            if (resp.status == 503 and !last) continue;
+            // A 421 means "not the leader / rolled back, re-aim" — the
+            // worker's propose-fail path guarantees nothing entered the
+            // raft log, so re-executing on the next node is safe. A 503
+            // is deliberately NOT retried: the worker's post-propose
+            // failures (commit-wait fault/timeout, leadership-loss sweep)
+            // are ambiguous — the entry may still commit under a new
+            // leader, and a blind retry double-executes the handler
+            // (observed as a double-minted scheduler wake in
+            // durable_wake_smoke_v2 Gate A). The ambiguous 503 relays to
+            // the client, whose own retry policy owns that decision.
+            if (resp.status == 421 and !last) continue;
 
             relay_status = resp.status;
             relay_data = null;
@@ -489,6 +502,10 @@ const Router = struct {
             try replyStatus(server, ent, sid, sess, 502);
             return 502;
         }
+        // Every node said 421 (mid-election, no leader yet): surface a
+        // plain retryable 503 — nothing executed anywhere, the client
+        // retries — rather than leaking the internal re-aim status.
+        if (relay_status == 421) relay_status = 503;
         try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = relay_status });
         try server.reg.set(ent, &server.request_out, h2.RespHeaders, relay_headers);
         try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = relay_data, .len = relay_len });

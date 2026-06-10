@@ -208,11 +208,14 @@ fn commitWrite(worker: anytype, allocator: std.mem.Allocator, tenant: []const u8
     // Leader gate (Phase 5 multi-node): only the group leader may take the
     // write. A follower would commit to its own `inst.kv` speculatively then
     // fault the propose with no undo (this immediate-commit path, unlike the
-    // parked customer path) — diverging it. Reject fast so the caller retries
-    // the leader. Registering first is idempotent + makes `isLeaderOf`
-    // resolvable on a single node (the sole voter leads every group).
+    // parked customer path) — diverging it. Reject fast with 421 (the
+    // not-leader / nothing-executed status the front door + serve-or-forward
+    // retry on; same convention as the v2-bundle gates below) so the caller
+    // re-aims at the leader. Registering first is idempotent + makes
+    // `isLeaderOf` resolvable on a single node (the sole voter leads every
+    // group).
     const gid = worker.raft.registerTenant(tenant) catch return 500;
-    if (!worker.raft.isLeaderOf(gid)) return 503;
+    if (!worker.raft.isLeaderOf(gid)) return 421;
 
     const inst = ensureInstance(worker, tenant) catch return 500;
 

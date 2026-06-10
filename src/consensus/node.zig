@@ -811,6 +811,13 @@ pub const Node = struct {
         return self.mgr.isLeader(tenant_id);
     }
 
+    /// True when `tenant_id`'s raft group exists on this node. Pump-thread
+    /// only (same ownership as every `groups` reader); the bridge publishes
+    /// it to workers as `GroupSig.formed` once per leadership refresh.
+    pub fn hasGroup(self: *const Node, tenant_id: u64) bool {
+        return self.groups.get(tenant_id) != null;
+    }
+
     /// Tear down a tenant's raft group and reclaim its WAL segments (the
     /// Phase-4 move-source cleanup; docs/v2-build-order.md §Phase 4
     /// "destroyGroup + noteGroupDestroyed on source"). `destroyGroup`

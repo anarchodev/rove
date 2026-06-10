@@ -738,10 +738,12 @@ fn finalizeBatch(
                 );
                 allocator.destroy(txn);
                 for (successes.items) |*s| {
-                    contDiscardIfAny(allocator, s); // open hop didn't commit → 503, not held
+                    contDiscardIfAny(allocator, s); // open hop didn't commit → 421, not held
                     streamDiscardIfAny(allocator, s); // stream-first-hop never reached the wire → drop chain meta
-                    respb.overwriteWith503(server, s.ent, allocator, s.body_ptr, s.body_len) catch |e2| panic_mod.invariantViolated(
-                        "finalizeBatch.respb.overwriteWith503(idiom0_barrier_fail)",
+                    // 421 not 503: the barrier never entered the log and the
+                    // txn rolled back — retry-safe (the front door re-aims).
+                    respb.overwriteWith421(server, s.ent, allocator, s.body_ptr, s.body_len) catch |e2| panic_mod.invariantViolated(
+                        "finalizeBatch.respb.overwriteWith421(idiom0_barrier_fail)",
                         "tenant={s} err={s}",
                         .{ anchor_id, @errorName(e2) },
                     );
@@ -750,7 +752,7 @@ fn finalizeBatch(
                         "tenant={s} err={s}",
                         .{ anchor_id, @errorName(e2) },
                     );
-                    captureSuccess(worker, anchor_id, s, 503, .fault, 0);
+                    captureSuccess(worker, anchor_id, s, 421, .fault, 0);
                     processed += 1;
                 }
                 successes.clearRetainingCapacity();
@@ -911,9 +913,13 @@ fn finalizeBatch(
         );
         allocator.destroy(txn);
         for (successes.items) |*s| {
-            contDiscardIfAny(allocator, s); // open hop didn't commit → 503, not held
-            respb.overwriteWith503(server, s.ent, allocator, s.body_ptr, s.body_len) catch |err2| panic_mod.invariantViolated(
-                "finalizeBatch.respb.overwriteWith503(propose_fail)",
+            contDiscardIfAny(allocator, s); // open hop didn't commit → 421, not held
+            // 421 not 503: the propose never entered the log and the txn
+            // rolled back — retry-safe. This is the follower "not the
+            // leader" response the front door's leader discovery keys on;
+            // the ambiguous post-propose 503s are never auto-retried.
+            respb.overwriteWith421(server, s.ent, allocator, s.body_ptr, s.body_len) catch |err2| panic_mod.invariantViolated(
+                "finalizeBatch.respb.overwriteWith421(propose_fail)",
                 "tenant={s} err={s}",
                 .{ anchor_id, @errorName(err2) },
             );
@@ -924,7 +930,7 @@ fn finalizeBatch(
             );
             // Propose failed — no raft seq to stamp; the entry never
             // made it to the log.
-            captureSuccess(worker, anchor_id, s, 503, .fault, 0);
+            captureSuccess(worker, anchor_id, s, 421, .fault, 0);
             processed += 1;
         }
         successes.clearRetainingCapacity();
