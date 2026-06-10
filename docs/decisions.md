@@ -449,6 +449,33 @@ prototype before V2 wrote code.
   stamping/compacting past an un-acked entry claimed durability for volatile
   data.
 
+### 10.5c Follower proposes fail fast; 421 re-aims, 503 is never platform-retried (2026-06-09)
+- **Decision**: `Bridge.propose` rejects synchronously (`Error.NotLeader` →
+  HTTP **421**) when the tenant's group is formed on this node and it is not
+  the leader. The 421 contract is "nothing entered the log; re-execute
+  elsewhere is safe" — the front door's `proxyToCluster`, the DP
+  serve-or-forward (`proxy_engine`), and the move surface's v2-kv/v2-bundle
+  gates all key their node-failover on 421 and **never on 503**. A 503 from
+  the write path is the ambiguous post-propose failure (commit-wait
+  fault/timeout, leadership-loss sweep — the entry may still commit under a
+  new leader) and is relayed to the client, whose retry policy owns the
+  at-least-once decision.
+- **Why**: raft-rs 0.7 unconditionally FORWARDS a follower's proposal to the
+  leader (`step_follower` MsgPropose; no `disable_proposal_forwarding` in
+  this version). Pre-fix, a follower-addressed write committed cluster-wide
+  while the local leadership sweep faulted the seq — the client was told
+  "write failed" with the write durable, and the front door's then-blind
+  503-retry re-executed the handler (observed as `durable_wake_smoke_v2`
+  Gate A's double-minted wake; decisively reproduced by a direct-to-follower
+  write probe: 503 + value committed on all nodes). A `formed` flag on
+  `GroupSig` (pump-published) gates the check so lazy first-propose group
+  formation still passes. Backstop: raft-rs-zig's `raft_manager_propose`
+  leader-gates before stepping raft (refused proposes provably never
+  commit), covering the one-refresh-stale race.
+- **Rejected**: marking retry-safety with a response header (status-only is
+  visible in every log/proxy hop and 421 is semantically exact); disabling
+  forwarding via raft-rs config (knob doesn't exist in 0.7).
+
 ### 10.6 Tenant move = ship committed state to a fresh group
 - **Decision**: detach dumps committed KV state to a self-describing bundle;
   attach forms a **fresh** group at the migration epoch on every destination

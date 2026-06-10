@@ -99,6 +99,11 @@ pub const Error = error{
     /// A control command (`createGroupEpoch` / `destroyGroup`) could not
     /// be serviced because the pump thread is not running.
     PumpNotRunning,
+    /// This node has the tenant's group but is not its raft leader —
+    /// the propose was refused BEFORE anything entered the log, so the
+    /// caller can safely re-aim at the leader (the worker maps this to
+    /// a 421; the front door / serve-or-forward retry on it).
+    NotLeader,
     OutOfMemory,
 } || node_mod.Error;
 
@@ -131,6 +136,14 @@ pub const GroupSig = struct {
     /// an atomic; one pump cycle stale at worst (fine for the rare move /
     /// leader-probe callers that read it).
     is_leader: std.atomic.Value(bool) = .init(false),
+    /// Whether the group EXISTS on this node, published by the pump's
+    /// leadership refresh (`refreshOneLocked` → `node.hasGroup`). Gates the
+    /// fail-fast follower check in `propose`: a registered tenant whose
+    /// group hasn't formed yet must still pass through (lazy first-propose
+    /// formation), while a formed group on a non-leader rejects
+    /// synchronously instead of letting raft-rs FORWARD the proposal (see
+    /// `propose`). One refresh stale at worst, same as `is_leader`.
+    formed: std.atomic.Value(bool) = .init(false),
     /// Pump-thread-only mirror of `is_leader` from the PREVIOUS refresh,
     /// used by `refreshLeadership` to detect the follower→leader (false→true)
     /// promotion edge. A freshly-promoted leader must run the on-promotion
@@ -463,6 +476,23 @@ pub const Bridge = struct {
         // Held while the tenant is mid-move: refuse new writes so the
         // source bundle snapshot is a quiescent point (Phase 4).
         if (sig.quiescing.load(.acquire)) return Error.Quiesced;
+        // Fail fast on a non-leader: raft-rs 0.7 unconditionally FORWARDS
+        // a follower's proposal to the leader (`step_follower` MsgPropose),
+        // so without this gate the entry would commit cluster-wide while
+        // this node's leadership sweep faults the seq — the client is told
+        // "write failed" with the write durable, and any proxy that blind-
+        // retries the failure double-executes the handler (the
+        // durable_wake Gate-A double-mint). Rejecting HERE — before the
+        // payload enters the inbox — keeps the file-header invariant ("a
+        // rejected propose never commits") actually true. `formed` gates
+        // the check so lazy first-propose group formation still passes;
+        // a formed-but-still-electing group rejects on every node until a
+        // leader exists (proxies surface that as a retryable 503). The
+        // raft-rs-zig propose leader-gate backstops the one-refresh-stale
+        // race window.
+        if (!self.node.isSingleNode() and
+            sig.formed.load(.acquire) and !sig.is_leader.load(.acquire))
+            return Error.NotLeader;
         const owned = self.allocator.dupe(u8, payload) catch return Error.OutOfMemory;
         errdefer self.allocator.free(owned);
         const seq = sig.next_seq + 1;
@@ -856,6 +886,7 @@ pub const Bridge = struct {
         }
         sig.was_leader = now;
         sig.is_leader.store(now, .release);
+        sig.formed.store(self.node.hasGroup(gid), .release);
     }
 
     /// Drain the gids promoted (follower→leader) since the last call into
