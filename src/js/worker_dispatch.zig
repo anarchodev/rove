@@ -2459,6 +2459,22 @@ fn resolveRequest(
     } };
 }
 
+/// headers_first front half (`docs/blob-storage-plan.md` §3.5.1):
+/// h2 emits a request whose body is still inbound into
+/// `request_receiving` at the HEADERS frame, holding the stream's
+/// flow-control window shut until the worker picks a disposition.
+/// Until the `onHeaders` dispatch row lands, the only disposition is
+/// classic buffering: `requestBodyBuffer` re-opens the window, h2
+/// accumulates, and the entity arrives in `request_out`
+/// body-complete at END_STREAM — so `dispatchOnce` and everything
+/// after it keeps its body-complete contract.
+pub fn drainRequestReceiving(worker: anytype) void {
+    const server = worker.h2;
+    for (server.request_receiving.entitySlice()) |ent| {
+        server.requestBodyBuffer(ent);
+    }
+}
+
 pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     const server = worker.h2;
     const allocator = worker.allocator;

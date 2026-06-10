@@ -194,6 +194,12 @@ fn workerMain(args: *WorkerCtx) !void {
             .initial_window_size = 1024 * 1024,
             .max_frame_size = 16384,
             .tls_config = null,
+            // blob-storage-plan §3.5.1: emit body-carrying requests at
+            // the HEADERS frame so the worker can dispatch from headers
+            // alone (`onHeaders` / `blob.receive`) instead of buffering
+            // first. drainRequestReceiving in the tick loop is the
+            // disposition point.
+            .headers_first = true,
         },
         .log_worker_id = args.worker_idx,
         .admin_api_domain = args.admin_api_domain,
@@ -218,6 +224,7 @@ fn workerMain(args: *WorkerCtx) !void {
             else => return err,
         };
 
+        rjs.drainRequestReceiving(worker);
         try rjs.drainBodyPending(worker);
         try rjs.drainFetchPendingDurability(worker);
         _ = try rjs.dispatchOnce(worker, &blocked_tenants);
