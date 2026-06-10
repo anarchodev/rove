@@ -554,7 +554,7 @@ fn finalizeForward(worker: anytype, ent: rove.Entity, status: u16, body: []u8) !
 /// unified outcome-switch obscures rather than clarifies, so each
 /// engine keeps its tail. See the doc comment on each engine for
 /// the prep / run / apply phase structure.
-const ChainDeployment = struct {
+pub const ChainDeployment = struct {
     inst: *const tenant_mod.Instance,
     tc: TenantFiles,
     bc: []u8,

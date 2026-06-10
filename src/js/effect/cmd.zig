@@ -4,8 +4,9 @@
 //! commit-gated, recorded action the engine carries out after the Model
 //! write of the same activation commits (L4 — every Cmd is commit-gated).
 //!
-//! Phase 4.1 (this file's current scope, `docs/effect-reification-plan.md`
-//! §6 Phase 4.1): the typed union backed by an exhaustive `interpretCmd`
+//! Phase 4.1, shipped 2026-05-24 (the plan doc is folded into
+//! `docs/decisions.md` §3.2 + `docs/architecture/effects-and-handlers.md`):
+//! the typed union backed by an exhaustive `interpretCmd`
 //! switch + `BufferedCmds` wrapping the per-unit list. Every buffered
 //! release point used to be a hand-rolled per-kind helper:
 //!
