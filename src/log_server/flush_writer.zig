@@ -202,6 +202,7 @@ fn activationName(a: log_mod.ActivationSource) []const u8 {
         .fetch_chunk => "fetch_chunk",
         .durable_wake => "durable_wake",
         .ws_message => "ws_message",
+        .inbound_headers => "inbound_headers",
     };
 }
 

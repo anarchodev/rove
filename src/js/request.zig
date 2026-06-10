@@ -134,6 +134,10 @@ pub const WsMessage = struct {
 /// both `__rove_next` resumes (§6.4) and the plain on_result callback.
 pub const Activation = union(enum) {
     inbound,
+    /// Headers-first inbound (`docs/blob-storage-plan.md` §3.5): the
+    /// body is still inbound; the handler's `onHeaders` export runs
+    /// with an empty body to decide the disposition.
+    inbound_headers,
     send_callback,
     /// Timer wake on a held stream (streaming-handlers-plan §4.5).
     timer,
@@ -154,6 +158,7 @@ pub const Activation = union(enum) {
     pub fn source(self: Activation) ActivationSource {
         return switch (self) {
             .inbound => .inbound,
+            .inbound_headers => .inbound_headers,
             .send_callback => .send_callback,
             .timer => .timer,
             .disconnect => .disconnect,
@@ -173,6 +178,7 @@ pub const Activation = union(enum) {
     pub fn fromSource(src: ActivationSource) Activation {
         return switch (src) {
             .inbound => .inbound,
+            .inbound_headers => .inbound_headers,
             .send_callback => .send_callback,
             .timer => .timer,
             .disconnect => .disconnect,
@@ -437,4 +443,11 @@ pub const RunOutcome = union(enum) {
     /// 2). The handler returned `__rove_stream(...)`. The worker's success
     /// path drives the held h2 entity through the chunked-write lifecycle.
     stream: stream_mod.Stream,
+    /// An `.inbound_headers` probe found no `onHeaders` export — the
+    /// module wants the classic buffered path. Not a response: the
+    /// dispatch site rolls back the probe's savepoint and asks h2 to
+    /// buffer the body (`requestBodyBuffer`), re-dispatching the
+    /// request body-complete later. Never produced by any other
+    /// activation kind.
+    no_onheaders,
 };
