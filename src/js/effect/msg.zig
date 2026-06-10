@@ -252,6 +252,11 @@ pub const Msg = union(ActivationSource) {
     fetch_chunk: FetchChunk,
     durable_wake: DurableWake,
     ws_message: WsMessage,
+    /// Headers-first inbound (§3.5). Dispatched inline from
+    /// `dispatchOnce` (the entity IS the queue position) — nothing
+    /// enqueues this variant; it exists because the union is tagged
+    /// by the wire enum.
+    inbound_headers: Inbound,
 
     /// Project to the tape's wire-stable activation tag.
     pub fn kind(self: Msg) ActivationSource {
@@ -323,6 +328,7 @@ test "Msg covers every ActivationSource variant exhaustively" {
             .fetch_chunk => .{ .fetch_chunk = .{} },
             .durable_wake => .{ .durable_wake = dw },
             .ws_message => .{ .ws_message = .{} },
+            .inbound_headers => .{ .inbound_headers = .{} },
         };
         try testing.expectEqual(tag, m.kind());
     }

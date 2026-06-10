@@ -80,6 +80,7 @@ pub const TenantLog = worker.TenantLog;
 pub const DEFAULT_HANDLER_PATH = worker.DEFAULT_HANDLER_PATH;
 pub const BlockedTenants = worker.BlockedTenants;
 pub const dispatchOnce = worker.dispatchOnce;
+pub const drainRequestReceiving = worker.drainRequestReceiving;
 pub const drainRaftPending = worker.drainRaftPending;
 pub const drainForwardPending = worker.drainForwardPending;
 pub const drainBodyPending = worker.drainBodyPending;

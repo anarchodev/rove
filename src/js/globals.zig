@@ -581,6 +581,14 @@ pub const DispatchState = struct {
     /// activations.
     activation_fetches_pending: u32 = 0,
 
+    /// `docs/blob-storage-plan.md` §3.5: `blob.receive` is only
+    /// meaningful when the body is still at the door — set iff this
+    /// dispatch is an `.inbound_headers` activation.
+    allow_blob_receive: bool = false,
+    /// A receive consumes THE inbound body; at most one per
+    /// activation.
+    blob_receive_used: bool = false,
+
     pub fn deinit(self: *DispatchState, ctx: ?*c.JSContext) void {
         var it = self.trigger_module_ns.iterator();
         while (it.next()) |e| {
@@ -1813,6 +1821,10 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         // P2 upload sessions (`docs/blob-storage-plan.md` §3.4).
         .{ .name = "write",   .cfunc = blob_b.jsBlobWrite,   .argc = 1 },
         .{ .name = "seal",    .cfunc = blob_b.jsBlobSeal,    .argc = 2 },
+        // P3 `blob.receive` (`docs/blob-storage-plan.md` §3.5):
+        // headers-first inbound pipe — only callable from an
+        // `onHeaders` activation.
+        .{ .name = "receive", .cfunc = blob_b.jsBlobReceive, .argc = 1 },
     } },
     // Phase 5 PR-3: the `_system.continuation.resumeIfBound` shim was
     // a stillborn — the `_harden.js` step (`delete globalThis._system;`
@@ -2112,6 +2124,9 @@ pub fn installRequest(
         .durable_wake => "durable_wake",
         // websocket-plan §5: one inbound WS data frame.
         .ws_message => "ws_message",
+        // blob-storage-plan §3.5: headers-first inbound — body still
+        // inbound, handler decides from headers alone.
+        .inbound_headers => "inbound_headers",
     };
     _ = c.JS_SetPropertyStr(ctx, activation_obj, "kind", c.JS_NewStringLen(ctx, kind.ptr, kind.len));
     if (request.activation == .wake_batch) {

@@ -61,6 +61,7 @@ const bridge_mod = @import("bridge");
 const Bridge = bridge_mod.Bridge;
 const blob_mod = @import("rove-blob");
 const blob_sessions_mod = @import("blob_sessions.zig");
+const blob_receive_mod = @import("blob_receive.zig");
 const files_mod = @import("rove-files");
 const log_mod = @import("rove-log");
 const log_server_mod = @import("rove-log-server");
@@ -249,6 +250,48 @@ pub const BodyDurabilityStatus = enum {
     failed,
 };
 
+/// §3.5.1: consult the worker's per-(deployment, module) `onHeaders`
+/// export cache. `null` = unknown (first body-carrying request to
+/// this module on this worker — probe and fill).
+pub fn onHeadersLookup(worker: anytype, dep_id: u64, module_base: []const u8) ?bool {
+    var key_buf: [512]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{d}:{s}", .{ dep_id, module_base }) catch return null;
+    return worker.onheaders_cache.get(key);
+}
+
+/// Record a probe outcome. Deployments are immutable, so an entry
+/// never changes; the map is bounded by a hard clear at 8192 entries
+/// (only reachable through thousands of distinct deployments on one
+/// worker — re-probing after a clear is just one extra dispatch).
+pub fn onHeadersRemember(worker: anytype, dep_id: u64, module_base: []const u8, has_onheaders: bool) void {
+    const allocator = worker.allocator;
+    if (worker.onheaders_cache.count() >= 8192) {
+        var it = worker.onheaders_cache.keyIterator();
+        while (it.next()) |kp| allocator.free(kp.*);
+        worker.onheaders_cache.clearRetainingCapacity();
+    }
+    const key = std.fmt.allocPrint(allocator, "{d}:{s}", .{ dep_id, module_base }) catch return;
+    const gop = worker.onheaders_cache.getOrPut(allocator, key) catch {
+        allocator.free(key);
+        return;
+    };
+    if (gop.found_existing) allocator.free(key);
+    gop.value_ptr.* = has_onheaders;
+}
+
+/// headers_first dispatch state (`docs/blob-storage-plan.md` §3.5.1).
+/// `drainRequestReceiving` moves an early-emitted request (body still
+/// inbound) from h2's `request_receiving` into `request_out` with
+/// `receiving = true`; `dispatchOnce` runs it as an
+/// `.inbound_headers` activation (empty body, `onHeaders` export).
+/// Cleared when the probe misses (classic buffering takes over — the
+/// entity returns body-complete with the default-false component) or
+/// when h2 attaches an already-complete body in place. The default
+/// (false) is what every classic entity carries.
+pub const BodyInbound = struct {
+    receiving: bool = false,
+};
+
 pub const BodyDurabilityWait = struct {
     /// Coord durability key — opaque to the dispatch path.
     worker_seq: u64 = 0,
@@ -399,6 +442,13 @@ pub const KvWakeOp = effect_mod.cmd.KvWakeOp;
 /// Fixed for 3b-ii (config knob is a later refinement); mirrors the
 /// connection-holder's `default_hold_deadline_ms` (25 s).
 pub const CONT_HOLD_DEADLINE_NS: i64 = 25 * std.time.ns_per_s;
+
+/// Hold deadline for a chain whose `blob.receive` is mid-upload —
+/// the client streams for the duration and NOTHING bumps the parked
+/// deadline (zero chunk activations by design, §3.5). Sized for the
+/// largest plan-tier body (256 MiB) on a slow uplink; the h2 idle
+/// timeout reaps genuinely dead clients long before this.
+pub const RECEIVE_HOLD_DEADLINE_NS: i64 = 15 * 60 * std.time.ns_per_s;
 
 // Phase 7: `ParkedCont` struct removed — cont state lives on the
 // entity's `ContDescriptor` + `ChainContext` components, which
@@ -1137,6 +1187,7 @@ pub const WorkerConfig = struct {
 };
 
 pub const dispatchOnce = dispatch.dispatchOnce;
+pub const drainRequestReceiving = dispatch.drainRequestReceiving;
 
 pub fn Worker(comptime opts: Options) type {
     // rove-js contributes `RaftWait` to every request entity so we can
@@ -1159,6 +1210,7 @@ pub fn Worker(comptime opts: Options) type {
         RaftWait,
         ForwardWait,
         BodyDurabilityWait,
+        BodyInbound,
         components_mod.ChainContext,
         components_mod.ContDescriptor,
         components_mod.StreamChain,
@@ -1360,6 +1412,12 @@ pub fn Worker(comptime opts: Options) type {
         /// (`blob.write` / `blob.seal`). TTL-swept via
         /// `blob_sessions.sweepBlobSessions` in the worker tick.
         blob_sessions: BlobSessionColl,
+        /// §3.5.1: per-(deployment, module) "exports onHeaders" cache,
+        /// keyed `"{dep_id}:{module_base}"` (owned keys). Filled by
+        /// dispatch outcomes (a deployment's exports are immutable),
+        /// consulted by the headers-first disposition so steady-state
+        /// classic POSTs pay no probe. Worker-local — no locking.
+        onheaders_cache: std.StringHashMapUnmanaged(bool) = .empty,
         /// Effect-reification Phase 2 ingress
         /// (`docs/effect-algebra.md` §2.3; `effect-reification-plan.md`
         /// Phase 2). One bounded queue per worker; every migrated
@@ -1887,6 +1945,11 @@ pub fn Worker(comptime opts: Options) type {
             for (self.push_queue.items) |k| allocator.free(k);
             self.push_queue.deinit(allocator);
             self.push_queue_mutex.unlock();
+            {
+                var it = self.onheaders_cache.keyIterator();
+                while (it.next()) |kp| allocator.free(kp.*);
+                self.onheaders_cache.deinit(allocator);
+            }
             self.limiter.deinit();
             self.penalty_box.deinit();
             self.tenant_logs.deinit(allocator);
@@ -2374,6 +2437,75 @@ pub fn Worker(comptime opts: Options) type {
                 tenant_id,
                 corr,
             );
+        }
+
+        /// `docs/blob-storage-plan.md` §3.5.1 slice B: arm a
+        /// `blob.receive` at its commit point. The receive-door
+        /// PendingFetch (intercepted before the FetchEngine by
+        /// `interpretCmd`'s http_fetch arm and `finalizeBatch`'s
+        /// read-only flush) names the activation entity in its URL;
+        /// resolve the request's stream identity, attach the h2 body
+        /// sink, and start the upload driver. Consumes `pf_in`.
+        /// Every failure path still emits the `ok:false` terminal
+        /// event (via the job thread) so the held chain resumes with
+        /// a defined failure instead of hanging to its deadline.
+        pub fn armBlobReceive(self: *Self, pf_in: globals.PendingFetch) void {
+            var pf = pf_in;
+            defer pf.deinit(self.allocator);
+
+            const job = blob_receive_mod.Job.create(
+                self.allocator,
+                &self.node.router,
+                &self.node.blob_backend_cfg,
+                pf.tenant_id,
+                pf.id,
+                pf.name,
+                null,
+            ) catch {
+                std.log.warn("rove-js blob.receive: job alloc failed tenant={s}", .{pf.tenant_id});
+                return;
+            };
+
+            var attached = false;
+            arm: {
+                if (blob_receive_mod.active_jobs.load(.acquire) > blob_receive_mod.MAX_ACTIVE_JOBS) {
+                    std.log.warn(
+                        "rove-js blob.receive: active-job cap ({d}) reached; rejecting tenant={s}",
+                        .{ blob_receive_mod.MAX_ACTIVE_JOBS, pf.tenant_id },
+                    );
+                    break :arm;
+                }
+                const ent = blob_receive_mod.entityFromReceiveUrl(pf.url) orelse break :arm;
+                const ident = self.streamIdentity(ent) orelse break :arm;
+                switch (self.h2.requestBodySink(ident.conn, ident.sid, job.sink())) {
+                    .streaming, .eof => attached = true,
+                    .gone => {},
+                }
+            }
+            if (!attached) {
+                // Stream gone / cap / bad identity: no h2 reference
+                // was taken — drop it ourselves; the job thread sees
+                // `aborted` and emits the failure terminal.
+                job.markGone();
+                job.releaseSinkRef();
+            }
+            job.start() catch {
+                job.markGone();
+                job.failNow();
+            };
+        }
+
+        /// Resolve a request entity's stream identity (its h2 Session
+        /// conn entity + StreamId) wherever the entity currently is —
+        /// `request_out` (read-only commit path), `raft_pending_cont`
+        /// (write-path commit arm) or `parked_continuations` (safety).
+        fn streamIdentity(self: *Self, ent: rove.Entity) ?struct { conn: rove.Entity, sid: u32 } {
+            const server = self.h2;
+            if (server.reg.isStale(ent)) return null;
+            const colls = .{ &server.request_out, &self.raft_pending_cont, &self.parked_continuations };
+            const sess = server.reg.getAny(ent, colls, h2.Session) catch return null;
+            const sid = server.reg.getAny(ent, colls, h2.StreamId) catch return null;
+            return .{ .conn = sess.entity, .sid = sid.id };
         }
 
         /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`

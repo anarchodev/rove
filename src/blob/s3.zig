@@ -20,9 +20,9 @@
 //! same model the per-tenant SQLite handles use elsewhere in rove.
 //!
 //! What's deliberately NOT here:
-//! - Multipart upload (single PUT only — capped at S3's 5 GiB
-//!   per-object hard limit, which is well above any blob size we
-//!   produce today).
+//! - (Multipart upload WAS here-listed as omitted; it shipped with
+//!   blob-storage-plan §3.5 slice A — create/uploadPart/complete/
+//!   abort/copyObject below — as the storage half of `blob.receive`.)
 //! - Server-side encryption headers (S3 SSE / SSE-KMS). Loop46's
 //!   own page-encryption (PLAN Phase 9) handles this client-side;
 //!   no need for S3-side enc on top.
@@ -403,6 +403,360 @@ pub const S3BlobStore = struct {
             .POST => "POST",
             .HEAD => "HEAD",
             .DELETE => "DELETE",
+        };
+    }
+
+    // ── Multipart upload (`docs/blob-storage-plan.md` §3.5 slice A) ──
+    //
+    // The storage half of `blob.receive`: an unbounded inbound body
+    // streams up as ≥5 MiB parts under a TEMP key (the content hash
+    // is unknown until the last byte), then `completeMultipartUpload`
+    // + `copyObject` move the finished object to its content-addressed
+    // home and `deleteObject` drops the temp. Synchronous (EasyPool)
+    // like every other method here — the transport driver runs these
+    // off the worker thread.
+    //
+    // S3 quirks encoded below, so callers don't relearn them:
+    //  - Create/Complete/Copy can return HTTP 200 with an `<Error>`
+    //    BODY (the infamous 200-error) — status alone is not success.
+    //  - Every part except the last must be ≥ 5 MiB or Complete
+    //    rejects with EntityTooSmall.
+    //  - `x-amz-copy-source` is an x-amz-* header and therefore MUST
+    //    be SigV4-signed (`extra_signed_headers`).
+
+    pub const MULTIPART_MIN_PART_BYTES: usize = 5 * 1024 * 1024;
+
+    /// Start a multipart upload at `key`. Returns the allocator-owned
+    /// UploadId.
+    pub fn createMultipartUpload(
+        self: *S3BlobStore,
+        key: []const u8,
+        content_type: ?[]const u8,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        var resp = try self.requestExt(.{
+            .method = .POST,
+            .key = key,
+            .query_wire = "uploads=",
+            .content_type = content_type,
+        }, allocator);
+        defer resp.deinit(allocator);
+        if (resp.status != 200 or bodyHasS3Error(resp.body_owned)) {
+            std.log.warn(
+                "rove-blob s3 multipart: create {s} status={d}: {s}",
+                .{ key, resp.status, resp.bodySnippet() },
+            );
+            return Error.Io;
+        }
+        const body = resp.body_owned orelse return Error.Io;
+        const upload_id = extractXmlText(body, "UploadId") orelse {
+            std.log.warn("rove-blob s3 multipart: create {s}: no UploadId in response", .{key});
+            return Error.Io;
+        };
+        return allocator.dupe(u8, upload_id);
+    }
+
+    /// Upload one part (1-based `part_number`). Returns the
+    /// allocator-owned ETag (quoted, verbatim — Complete accepts it
+    /// as-is).
+    pub fn uploadPart(
+        self: *S3BlobStore,
+        key: []const u8,
+        upload_id: []const u8,
+        part_number: u32,
+        bytes: []const u8,
+        allocator: std.mem.Allocator,
+    ) ![]u8 {
+        const query = try multipartQuery(self.allocator, upload_id, part_number);
+        defer self.allocator.free(query);
+        var resp = try self.requestExt(.{
+            .method = .PUT,
+            .key = key,
+            .query_wire = query,
+            .body = bytes,
+            .capture_header = "etag",
+        }, allocator);
+        defer resp.deinit(allocator);
+        if (resp.status != 200) {
+            std.log.warn(
+                "rove-blob s3 multipart: part {d} of {s} status={d}: {s}",
+                .{ part_number, key, resp.status, resp.bodySnippet() },
+            );
+            return Error.Io;
+        }
+        const etag = resp.captured_header orelse {
+            std.log.warn("rove-blob s3 multipart: part {d} of {s}: no ETag header", .{ part_number, key });
+            return Error.Io;
+        };
+        return allocator.dupe(u8, etag);
+    }
+
+    /// Finish the upload. `etags[i]` is part `i+1`'s ETag from
+    /// `uploadPart`.
+    pub fn completeMultipartUpload(
+        self: *S3BlobStore,
+        key: []const u8,
+        upload_id: []const u8,
+        etags: []const []const u8,
+    ) !void {
+        var xml = std.ArrayList(u8){};
+        defer xml.deinit(self.allocator);
+        try xml.appendSlice(self.allocator, "<CompleteMultipartUpload>");
+        for (etags, 1..) |etag, n| {
+            const part = try std.fmt.allocPrint(
+                self.allocator,
+                "<Part><PartNumber>{d}</PartNumber><ETag>{s}</ETag></Part>",
+                .{ n, etag },
+            );
+            defer self.allocator.free(part);
+            try xml.appendSlice(self.allocator, part);
+        }
+        try xml.appendSlice(self.allocator, "</CompleteMultipartUpload>");
+
+        const query = try multipartQuery(self.allocator, upload_id, null);
+        defer self.allocator.free(query);
+        var resp = try self.requestExt(.{
+            .method = .POST,
+            .key = key,
+            .query_wire = query,
+            .body = xml.items,
+        }, self.allocator);
+        defer resp.deinit(self.allocator);
+        // Complete is the canonical 200-with-<Error>-body op.
+        if (resp.status != 200 or bodyHasS3Error(resp.body_owned)) {
+            std.log.warn(
+                "rove-blob s3 multipart: complete {s} status={d}: {s}",
+                .{ key, resp.status, resp.bodySnippet() },
+            );
+            return Error.Io;
+        }
+    }
+
+    /// Abandon an in-flight upload (frees S3-side part storage).
+    /// Idempotent enough for cleanup paths: 204 or 404 both succeed.
+    pub fn abortMultipartUpload(
+        self: *S3BlobStore,
+        key: []const u8,
+        upload_id: []const u8,
+    ) !void {
+        const query = try multipartQuery(self.allocator, upload_id, null);
+        defer self.allocator.free(query);
+        var resp = try self.requestExt(.{
+            .method = .DELETE,
+            .key = key,
+            .query_wire = query,
+        }, self.allocator);
+        defer resp.deinit(self.allocator);
+        if (resp.status != 204 and resp.status != 404) {
+            std.log.warn(
+                "rove-blob s3 multipart: abort {s} status={d}: {s}",
+                .{ key, resp.status, resp.bodySnippet() },
+            );
+            return Error.Io;
+        }
+    }
+
+    /// Server-side copy `src_key` → `dst_key` (both under this
+    /// store's prefix). Zero bytes transit the caller — this is how
+    /// a completed multipart upload at a temp key moves to its
+    /// content-addressed home.
+    pub fn copyObject(
+        self: *S3BlobStore,
+        src_key: []const u8,
+        dst_key: []const u8,
+    ) !void {
+        const copy_source = try std.fmt.allocPrint(
+            self.allocator,
+            "/{s}/{s}{s}",
+            .{ self.config.bucket, self.config.key_prefix, src_key },
+        );
+        defer self.allocator.free(copy_source);
+        var resp = try self.requestExt(.{
+            .method = .PUT,
+            .key = dst_key,
+            .copy_source = copy_source,
+        }, self.allocator);
+        defer resp.deinit(self.allocator);
+        // Copy is a 200-with-<Error>-body op too; success carries
+        // <CopyObjectResult>.
+        if (resp.status != 200 or bodyHasS3Error(resp.body_owned)) {
+            std.log.warn(
+                "rove-blob s3 multipart: copy {s} → {s} status={d}: {s}",
+                .{ src_key, dst_key, resp.status, resp.bodySnippet() },
+            );
+            return Error.Io;
+        }
+    }
+
+    /// `partNumber={n}&uploadId={id}` (or just `uploadId={id}`),
+    /// percent-encoded once and used BOTH on the wire and (re-parsed)
+    /// in the signature — upload ids can carry `+`/`/`/`=` which must
+    /// encode identically in both places. Keys already sort
+    /// (`partNumber` < `uploadId`).
+    fn multipartQuery(
+        allocator: std.mem.Allocator,
+        upload_id: []const u8,
+        part_number: ?u32,
+    ) ![]u8 {
+        var out = std.ArrayList(u8){};
+        errdefer out.deinit(allocator);
+        if (part_number) |n| {
+            var nbuf: [24]u8 = undefined;
+            const ns = std.fmt.bufPrint(&nbuf, "partNumber={d}&", .{n}) catch unreachable;
+            try out.appendSlice(allocator, ns);
+        }
+        try out.appendSlice(allocator, "uploadId=");
+        try sigv4.uriEncodeComponent(allocator, &out, upload_id);
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// `<Tag>text</Tag>` extraction — the only XML S3 makes us read.
+    fn extractXmlText(body: []const u8, comptime tag: []const u8) ?[]const u8 {
+        const open = "<" ++ tag ++ ">";
+        const close = "</" ++ tag ++ ">";
+        const start = (std.mem.indexOf(u8, body, open) orelse return null) + open.len;
+        const end = std.mem.indexOfPos(u8, body, start, close) orelse return null;
+        if (end <= start) return null;
+        return body[start..end];
+    }
+
+    fn bodyHasS3Error(body: ?[]const u8) bool {
+        const b = body orelse return false;
+        return std.mem.indexOf(u8, b, "<Error>") != null;
+    }
+
+    const ExtOpts = struct {
+        method: curl_mod.Method,
+        key: []const u8,
+        /// Query string EXACTLY as it goes on the wire (already
+        /// percent-encoded). Signed via `query_canonical` after a
+        /// sort-preserving pass — callers keep keys pre-sorted.
+        query_wire: []const u8 = "",
+        body: []const u8 = "",
+        content_type: ?[]const u8 = null,
+        /// Signed + sent `x-amz-copy-source` (CopyObject).
+        copy_source: ?[]const u8 = null,
+        /// Response header to capture (case-insensitive), returned
+        /// on `ExtResp.captured_header`.
+        capture_header: ?[]const u8 = null,
+    };
+
+    const ExtResp = struct {
+        status: u16,
+        body_owned: ?[]u8,
+        captured_header: ?[]u8,
+
+        fn bodySnippet(self: ExtResp) []const u8 {
+            const body = self.body_owned orelse return "";
+            return body[0..@min(body.len, 256)];
+        }
+
+        fn deinit(self: *ExtResp, allocator: std.mem.Allocator) void {
+            if (self.body_owned) |b| allocator.free(b);
+            if (self.captured_header) |h| allocator.free(h);
+            self.* = undefined;
+        }
+    };
+
+    /// `requestAlloc`'s general sibling: query strings, extra signed
+    /// headers, response-header capture. Kept separate so the hot
+    /// blob paths don't pay for the option soup.
+    fn requestExt(
+        self: *S3BlobStore,
+        opts: ExtOpts,
+        body_allocator: std.mem.Allocator,
+    ) !ExtResp {
+        const scheme = if (self.config.use_tls) "https" else "http";
+        const qsep: []const u8 = if (opts.query_wire.len > 0) "?" else "";
+        const url = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}://{s}/{s}/{s}{s}{s}{s}",
+            .{ scheme, self.config.endpoint, self.config.bucket, self.config.key_prefix, opts.key, qsep, opts.query_wire },
+        );
+        defer self.allocator.free(url);
+
+        const path = try std.fmt.allocPrint(
+            self.allocator,
+            "/{s}/{s}{s}",
+            .{ self.config.bucket, self.config.key_prefix, opts.key },
+        );
+        defer self.allocator.free(path);
+
+        var ts_buf: [16]u8 = undefined;
+        sigv4.formatAmzDate(&ts_buf, std.time.timestamp());
+
+        var extra: [1]sigv4.ExtraHeader = undefined;
+        var extra_n: usize = 0;
+        if (opts.copy_source) |cs| {
+            extra[extra_n] = .{ .name = "x-amz-copy-source", .value = cs };
+            extra_n += 1;
+        }
+
+        var signed = try sigv4.sign(self.allocator, .{
+            .method = methodName(opts.method),
+            .path = path,
+            // The wire query is already percent-encoded with sorted
+            // keys — sign it verbatim so wire and signature can't
+            // drift on the encoding of uploadId.
+            .query_canonical = opts.query_wire,
+            .host = self.config.endpoint,
+            .body = opts.body,
+            .access_key = self.config.access_key,
+            .secret_key = self.config.secret_key,
+            .region = self.config.region,
+            .service = "s3",
+            .timestamp = &ts_buf,
+            .extra_signed_headers = extra[0..extra_n],
+        });
+        defer signed.deinit(self.allocator);
+
+        var headers_buf: [5]curl_mod.Header = undefined;
+        var hn: usize = 0;
+        headers_buf[hn] = .{ .name = "x-amz-date", .value = signed.x_amz_date };
+        hn += 1;
+        headers_buf[hn] = .{ .name = "x-amz-content-sha256", .value = signed.x_amz_content_sha256 };
+        hn += 1;
+        headers_buf[hn] = .{ .name = "Authorization", .value = signed.authorization };
+        hn += 1;
+        if (opts.copy_source) |cs| {
+            headers_buf[hn] = .{ .name = "x-amz-copy-source", .value = cs };
+            hn += 1;
+        }
+        if (opts.content_type) |ct| {
+            headers_buf[hn] = .{ .name = "content-type", .value = ct };
+            hn += 1;
+        }
+
+        std.log.debug("rove-blob s3: → {s} {s}", .{ methodName(opts.method), url });
+
+        const easy = self.pool.acquire();
+        defer self.pool.release(easy);
+        var resp = easy.request(body_allocator, .{
+            .method = opts.method,
+            .url = url,
+            .headers = headers_buf[0..hn],
+            .body = opts.body,
+        }) catch |err| {
+            std.log.warn(
+                "rove-blob s3: {s} {s} failed: {s}",
+                .{ methodName(opts.method), url, @errorName(err) },
+            );
+            return Error.Io;
+        };
+
+        var captured: ?[]u8 = null;
+        if (opts.capture_header) |want| {
+            if (resp.header(want)) |v| captured = try body_allocator.dupe(u8, v);
+        }
+        resp.deinitHeaders(body_allocator);
+
+        return .{
+            .status = resp.status,
+            .body_owned = if (resp.body) |b| (if (b.len > 0) b else blk: {
+                body_allocator.free(b);
+                break :blk null;
+            }) else null,
+            .captured_header = captured,
         };
     }
 };

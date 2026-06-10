@@ -242,6 +242,51 @@ globalThis.blob = {
     return sysBlob.seal(opts.to,
                         opts.content_type != null ? opts.content_type : undefined);
   },
+
+  /**
+   * Pipe the entire inbound request body socket → content-addressed
+   * storage with ZERO chunk activations (Case B,
+   * `docs/blob-storage-plan.md` §3.5). Only callable from an
+   * `onHeaders` export — the body hasn't been accepted yet; calling
+   * `blob.receive` then `return next()` opens the valve. Bytes
+   * stream to a tenant-prefix S3 multipart at the client's rate
+   * (flow-controlled to the upload rate) and NEVER enter a handler
+   * activation or the tape — the completion event is all replay
+   * needs.
+   *
+   * The chain resumes at `to` when the object is durable:
+   * `request.ctx = { hash, len }` with
+   * `request.activation.ok === true`. On failure (client
+   * disconnect, storage error) `to` runs with
+   * `request.activation.ok === false` and nothing was stored —
+   * S3 multipart is commit-gated, so a torn upload is invisible.
+   *
+   * The litmus (vs `onChunk` + blob.write): does your logic depend
+   * on the CONTENT of the bytes? No → this, one PUT. Yes → the
+   * chunk path, which tapes what you read.
+   *
+   * @param {object} opts
+   * @param {string} opts.to - Export resumed with `{hash, len}`
+   *   when the object is durable (required).
+   *
+   * @example
+   * export function onHeaders() {
+   *   if (!authed(request.headers)) { response.status = 401; return "no"; }
+   *   blob.receive({ to: "onStored" });
+   *   return next();
+   * }
+   * export function onStored() {
+   *   if (!request.activation.ok) { response.status = 502; return "store failed"; }
+   *   kv.set(`media/${request.ctx.hash}`, JSON.stringify({ len: request.ctx.len }));
+   *   return JSON.stringify({ hash: request.ctx.hash });
+   * }
+   */
+  receive(opts) {
+    opts = opts || {};
+    if (typeof opts.to !== "string" || !opts.to.length)
+      throw new TypeError("blob.receive: `to` export name is required");
+    return sysBlob.receive(opts.to);
+  },
 };
 
 })();

@@ -30,6 +30,14 @@ pub fn parseDispatch(
     allocator: std.mem.Allocator,
     request: Request,
 ) (error{ OutOfMemory, BadRequest })!DispatchCall {
+    // Headers-first dispatch targets `onHeaders` unconditionally — a
+    // `?fn=` on the request URL must not shadow it (the body the RPC
+    // envelope would ride in hasn't even been accepted yet).
+    if (request.activation == .inbound_headers) {
+        const fn_owned = try allocator.dupe(u8, "onHeaders");
+        errdefer allocator.free(fn_owned);
+        return .{ .fn_name = fn_owned, .args_json_text = try allocator.dupe(u8, "[]") };
+    }
     // RPC envelope path: a JSON-looking POST body whose top-level
     // object has `fn: string` (and optionally `args: array`). Anything
     // else — a non-JSON body, an array body, an object without `fn`,
@@ -102,6 +110,7 @@ fn defaultExportForKind(src: ActivationSource) []const u8 {
         .wake_batch, .kv_wake, .timer => "onWake",
         .disconnect => "onDisconnect",
         .ws_message => "onMessage",
+        .inbound_headers => "onHeaders",
         else => "default",
     };
 }

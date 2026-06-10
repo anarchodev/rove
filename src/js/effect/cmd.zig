@@ -38,6 +38,7 @@ const rove = @import("rove");
 const h2 = @import("rove-h2");
 const globals_mod = @import("../globals.zig");
 const components_mod = @import("../components.zig");
+const blob_receive_mod = @import("../blob_receive.zig");
 
 /// Output the handler emits to its return. Released by the
 /// reconciler's commit arm (`Continuation.releaseOnCommit` →
@@ -350,6 +351,13 @@ pub fn interpretCmd(
             drain_ptr.is_draining = true;
         },
         .http_fetch => |pf| {
+            // blob.receive (§3.5.1 slice B): the receive-door URL
+            // never reaches libcurl — arm the inbound upload on this
+            // worker (thread-affine with its h2 instance) instead.
+            if (blob_receive_mod.isReceiveUrl(pf.url)) {
+                worker.armBlobReceive(pf);
+                return;
+            }
             const engine = worker.node.fetch_engine orelse {
                 var pfm = pf;
                 pfm.deinit(allocator);

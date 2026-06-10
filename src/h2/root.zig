@@ -110,6 +110,51 @@ pub const WsMeta = struct {
     opcode: u8 = 0,
 };
 
+/// What an `headers_first` server does with inbound DATA on a stream
+/// whose request entity was early-emitted at the HEADERS frame
+/// (`docs/blob-storage-plan.md` §3.5.1, the `blob.receive`
+/// transport). The entity's lifecycle state is collection
+/// membership, not this flag: `request_receiving` (early-emitted,
+/// consumer hasn't decided) → `request_buffering`
+/// (`requestBodyBuffer` called) → `request_out` (END_STREAM landed,
+/// body attached). `BodyMode` is the stream-side window policy that
+/// shadows those moves: `.hold` buffers but does NOT consume — the
+/// flow-control window closes after one window's worth and the
+/// client stalls at the door until the consumer decides. `.buffer`
+/// mirrors the classic auto-window path (accumulate + consume
+/// immediately). `.discard` drops body bytes (the consumer answered
+/// from headers alone). `.sink` routes body bytes to a registered
+/// `BodySink` (a `blob.receive` upload driver) — the window opens
+/// only as the sink reports drained bytes, so the client's send rate
+/// is throttled to the sink's upload rate. `.auto` is the
+/// non-headers_first default (nghttp2 auto window update, no manual
+/// consume).
+const BodyMode = enum(u8) { auto = 0, hold, buffer, discard, sink };
+
+/// Consumer-supplied destination for inbound body bytes on a `.sink`
+/// stream (`requestBodySink`). All callbacks are invoked on the h2
+/// poll thread while the Stream is alive; `release` is the LAST call
+/// — h2 drops its reference at stream close and never touches the
+/// sink again. `push` borrows the bytes (the sink copies what it
+/// keeps). `drained` returns bytes the sink has consumed since the
+/// last call — h2 repays exactly that much flow-control window, so
+/// backpressure follows the sink's real drain rate.
+pub const BodySink = struct {
+    ctx: *anyopaque,
+    /// One DATA frame's bytes. Return false on a fatal sink error —
+    /// h2 resets the stream.
+    push: *const fn (ctx: *anyopaque, bytes: []const u8) bool,
+    /// END_STREAM: the body is complete; no more `push` calls.
+    finish: *const fn (ctx: *anyopaque) void,
+    /// The stream died before END_STREAM (client reset / connection
+    /// gone). No more calls except `release`.
+    abort: *const fn (ctx: *anyopaque) void,
+    /// Bytes consumed by the sink since the last `drained` call.
+    drained: *const fn (ctx: *anyopaque) u32,
+    /// h2 is done with this sink (stream closed). Drop h2's ref.
+    release: *const fn (ctx: *anyopaque) void,
+};
+
 pub const Direction = enum(u8) { server = 0, client = 1 };
 
 pub const Conn = struct {
@@ -282,6 +327,29 @@ const Stream = struct {
     client_stream: bool = false,
     stream_eof: bool = false,
     ng_stream_id: i32 = 0,
+    /// headers_first window policy for inbound body DATA — see the
+    /// `BodyMode` doc. `.auto` on non-headers_first instances.
+    body_mode: BodyMode = .auto,
+    /// Bytes received but not yet `nghttp2_session_consume`d while
+    /// `body_mode == .hold` — the held flow-control debt. Repaid
+    /// when the consumer picks a mode, at END_STREAM, or (connection
+    /// window only) at stream close.
+    unconsumed: u32 = 0,
+    /// headers_first: END_STREAM has been received — the inbound
+    /// body is complete. When the request entity already left the
+    /// receiving/buffering collections at that point (the worker
+    /// pulled it for a headers-first dispatch decision), the bytes
+    /// stay in this Stream's buffer with this flag set;
+    /// `requestBodyBuffer` attaches them in place and a `blob.receive`
+    /// sink drains them directly.
+    inbound_eof: bool = false,
+    /// `.sink` mode destination (`requestBodySink`). h2 holds one
+    /// reference: released (and nulled) at stream close, after
+    /// `finish` or `abort`.
+    sink: ?BodySink = null,
+    /// True once `sink.finish` was called (END_STREAM delivered) —
+    /// stream close then releases without aborting.
+    sink_finished: bool = false,
     send_data: ?*BodyData = null,
     response_status: u16 = 0,
     stream_chunk_data: ?[*]u8 = null,
@@ -468,6 +536,19 @@ pub const H2Options = struct {
     /// to 0 to disable (legacy behavior).
     idle_timeout_ns: u64 = 10 * std.time.ns_per_s,
     tls_config: ?*TlsConfig = null,
+    /// Headers-first request emission (`docs/blob-storage-plan.md`
+    /// §3.5.1). Off (default): request entities appear in
+    /// `request_out` at END_STREAM with the full body — the classic
+    /// contract every existing consumer (front door, examples) is
+    /// built on. On: a server request whose HEADERS frame lacks
+    /// END_STREAM is emitted into `request_receiving` immediately,
+    /// with nghttp2's auto window update disabled — body DATA
+    /// buffers unconsumed (the client stalls after one window)
+    /// until the consumer either calls `requestBodyBuffer` (classic
+    /// buffering resumes; h2 moves the entity to `request_out` with
+    /// the body attached at END_STREAM) or responds early (h2 flips
+    /// the stream to discard). Only the rewind worker enables this.
+    headers_first: bool = false,
 };
 
 // =============================================================================
@@ -516,6 +597,16 @@ pub fn H2(comptime opts: Options) type {
 
         // H2-specific collections: server request/response
         request_out: StreamColl,
+        // headers_first early-emission pipeline (h2_opts.headers_first
+        // doc). A request entity whose body is still inbound lives in
+        // `request_receiving` (fresh — consumer hasn't decided) or
+        // `request_buffering` (consumer called `requestBodyBuffer`);
+        // h2 attaches the accumulated body and moves it to
+        // `request_out` when END_STREAM lands, so `request_out` keeps
+        // its body-complete contract. Always-empty when headers_first
+        // is off.
+        request_receiving: StreamColl,
+        request_buffering: StreamColl,
         response_in: StreamColl,
         response_out: StreamColl,
         _response_sending: StreamColl,
@@ -587,9 +678,29 @@ pub fn H2(comptime opts: Options) type {
         /// trip the abort).
         recv_enobufs_low_outstanding_streak: u32 = 0,
 
+        /// Active `.sink` streams (`requestBodySink`). The sweep
+        /// repays flow-control window as each sink drains, and is the
+        /// single release point for h2's sink reference — it detects
+        /// dead streams (closed normally OR torn down with the
+        /// connection, where no close callback fires) and releases
+        /// exactly once.
+        body_sinks: std.ArrayListUnmanaged(SinkRef) = .empty,
+
+        const SinkRef = struct {
+            conn_entity: Entity,
+            stream_id: i32,
+            sink: BodySink,
+        };
+
         // Shared nghttp2 callbacks — one per H2 instantiation
         var ng_callbacks: ?*c.nghttp2_session_callbacks = null;
         var ng_client_callbacks: ?*c.nghttp2_session_callbacks = null;
+        // Server session option for headers_first instances:
+        // NO_AUTO_WINDOW_UPDATE, so inbound body flow control is the
+        // explicit `nghttp2_session_consume` calls in
+        // `onDataChunkRecvCb` / `requestBodyBuffer`. Created once,
+        // only when the first headers_first session comes up.
+        var ng_server_option: ?*c.nghttp2_option = null;
 
         // =============================================================
         // COLLECTIONS — single source of truth for the 27 collection
@@ -624,6 +735,8 @@ pub fn H2(comptime opts: Options) type {
 
         const COLLECTIONS = [_]CollSpec{
             .{ .name = "request_out",          .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
+            .{ .name = "request_receiving",    .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
+            .{ .name = "request_buffering",    .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
             .{ .name = "response_in",          .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
             .{ .name = "response_out",         .Coll = StreamColl, .kind = .server_stream },
             .{ .name = "_response_sending",    .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
@@ -759,6 +872,155 @@ pub fn H2(comptime opts: Options) type {
         /// module (`path`) for the held WS chain. Returns null when the entity is
         /// no longer a live ws-mode conn (closed / not upgraded). Borrowed slices
         /// — valid only while the conn lives; the worker dupes what it retains.
+        /// `requestBodyBuffer` outcome — what the consumer should
+        /// expect next for the entity it asked to classic-buffer.
+        pub const BufferDecision = enum {
+            /// Stream re-opened, h2 is accumulating; the entity moved
+            /// to `request_buffering` and arrives in `request_out`
+            /// body-complete at END_STREAM.
+            buffering,
+            /// The body had already fully arrived (END_STREAM raced
+            /// the decision) — it was attached to the entity in
+            /// place, in whatever collection holds it. Dispatch it.
+            body_complete,
+            /// The stream is gone (client reset / connection died).
+            /// Nobody will ever complete this request — answer it.
+            gone,
+        };
+
+        /// headers_first consumers: classic-buffering decision for an
+        /// early-emitted request (in `request_receiving`, or already
+        /// pulled into `request_out` for a headers-first dispatch
+        /// probe). Re-opens the stream's flow-control window
+        /// (repaying the held debt) and resumes accumulate-in-h2 —
+        /// or, when END_STREAM already landed, attaches the
+        /// accumulated body in place.
+        pub fn requestBodyBuffer(h2: *Self, ent: Entity) BufferDecision {
+            for ([_]*StreamColl{ &h2.request_receiving, &h2.request_out }) |coll| {
+                if (h2.reg.isInCollection(ent, coll)) {
+                    const sess = h2.reg.get(ent, coll, Session) catch return .gone;
+                    const sid = h2.reg.get(ent, coll, StreamId) catch return .gone;
+
+                    const conn_ptr = getConn(h2, sess.entity) orelse return .gone;
+                    const ng_session = conn_ptr.ng_session orelse return .gone;
+                    const stream: ?*Stream = @ptrCast(@alignCast(
+                        c.nghttp2_session_get_stream_user_data(ng_session, @intCast(sid.id)),
+                    ));
+                    const s = stream orelse return .gone;
+
+                    if (s.inbound_eof) {
+                        h2.reg.set(ent, coll, ReqBody, takeBody(s)) catch return .gone;
+                        return .body_complete;
+                    }
+                    s.body_mode = .buffer;
+                    if (s.unconsumed > 0) {
+                        _ = c.nghttp2_session_consume(ng_session, @intCast(sid.id), s.unconsumed);
+                        s.unconsumed = 0;
+                    }
+                    h2.reg.move(ent, coll, &h2.request_buffering) catch return .gone;
+                    return .buffering;
+                }
+            }
+            return .gone;
+        }
+
+        /// `requestBodySink` outcome.
+        pub const SinkAttach = enum {
+            /// DATA is flowing to the sink; END_STREAM will `finish`.
+            streaming,
+            /// The body had already fully arrived — the sink received
+            /// everything (buffered bytes + `finish`) during this call.
+            eof,
+            /// The stream is gone; the sink got nothing and the caller
+            /// should abort the job. h2 holds NO reference.
+            gone,
+        };
+
+        /// Attach a body sink (the `blob.receive` upload driver) to an
+        /// early-emitted request's stream, identified by its Session
+        /// conn entity + StreamId (the request entity may be parked
+        /// anywhere by now — a held continuation — so identity, not
+        /// collection membership, addresses the stream). Bytes already
+        /// buffered under `.hold` are pushed first; their window debt
+        /// is repaid by `sweepBodySinks` as the sink drains, so the
+        /// client's send rate follows the upload rate end to end. On
+        /// any non-`.gone` return h2 holds one sink reference,
+        /// released by the sweep when the stream dies.
+        pub fn requestBodySink(h2: *Self, conn_entity: Entity, stream_id: u32, sink: BodySink) SinkAttach {
+            if (!h2.h2_opts.headers_first) return .gone;
+            const conn_ptr = getConn(h2, conn_entity) orelse return .gone;
+            const ng_session = conn_ptr.ng_session orelse return .gone;
+            const stream: ?*Stream = @ptrCast(@alignCast(
+                c.nghttp2_session_get_stream_user_data(ng_session, @intCast(stream_id)),
+            ));
+            const s = stream orelse return .gone;
+
+            // Hand over whatever buffered under `.hold`. The sink
+            // copies; any held window debt stays on `unconsumed` and
+            // is repaid by the sweep as the sink reports drainage.
+            if (s.body_data) |p| {
+                if (s.body_len > 0) {
+                    if (!sink.push(sink.ctx, p[0..s.body_len])) return .gone;
+                }
+                s.allocator.free(p[0..s.body_cap]);
+                s.body_data = null;
+                s.body_len = 0;
+                s.body_cap = 0;
+            }
+
+            h2.body_sinks.append(h2.allocator, .{
+                .conn_entity = conn_entity,
+                .stream_id = @intCast(stream_id),
+                .sink = sink,
+            }) catch return .gone;
+            s.sink = sink;
+            s.body_mode = .sink;
+
+            if (s.inbound_eof) {
+                sink.finish(sink.ctx);
+                s.sink_finished = true;
+                return .eof;
+            }
+            return .streaming;
+        }
+
+        /// Repay flow-control window on `.sink` streams as their
+        /// drivers drain, and release h2's sink reference when the
+        /// stream dies (the SOLE release point — covers both normal
+        /// close and connection teardown, where nghttp2 fires no
+        /// per-stream close callback). The job-side `abort` is
+        /// idempotent, so the belt-and-braces abort here is safe
+        /// after a close-path abort already ran.
+        fn sweepBodySinks(self: *Self) void {
+            var i: usize = 0;
+            while (i < self.body_sinks.items.len) {
+                const ref = &self.body_sinks.items[i];
+                const live: ?struct { ng: *c.nghttp2_session, s: *Stream } = blk: {
+                    const conn_ptr = getConn(self, ref.conn_entity) orelse break :blk null;
+                    const ng = conn_ptr.ng_session orelse break :blk null;
+                    const st: ?*Stream = @ptrCast(@alignCast(
+                        c.nghttp2_session_get_stream_user_data(ng, ref.stream_id),
+                    ));
+                    const s = st orelse break :blk null;
+                    if (s.sink == null) break :blk null;
+                    break :blk .{ .ng = ng, .s = s };
+                };
+                if (live) |l| {
+                    const delta = ref.sink.drained(ref.sink.ctx);
+                    if (delta > 0 and l.s.unconsumed > 0) {
+                        const repay = @min(delta, l.s.unconsumed);
+                        _ = c.nghttp2_session_consume(l.ng, ref.stream_id, repay);
+                        l.s.unconsumed -= repay;
+                    }
+                    i += 1;
+                    continue;
+                }
+                ref.sink.abort(ref.sink.ctx);
+                ref.sink.release(ref.sink.ctx);
+                _ = self.body_sinks.swapRemove(i);
+            }
+        }
+
         pub fn wsConnRouting(h2: *Self, conn_entity: Entity) ?struct { authority: []const u8, path: []const u8 } {
             const cp = getConn(h2, conn_entity) orelse return null;
             const h1c = cp.h1 orelse return null;
@@ -832,47 +1094,85 @@ pub fn H2(comptime opts: Options) type {
             user_data: ?*anyopaque,
         ) callconv(.c) c_int {
             _ = flags;
-            _ = user_data;
             const stream: ?*Stream = @ptrCast(@alignCast(
                 c.nghttp2_session_get_stream_user_data(session, stream_id),
             ));
-            if (stream == null) return 0;
+            const nctx: *NgCtx = @ptrCast(@alignCast(user_data));
 
-            if (!stream.?.bodyAppend(data, len))
-                return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            if (!nctx.h2.h2_opts.headers_first) {
+                if (stream == null) return 0;
+                if (!stream.?.bodyAppend(data, len))
+                    return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                return 0;
+            }
+
+            // headers_first: auto window update is off, so every byte
+            // of inbound DATA is flow-control debt until a consume
+            // call repays it. What happens to the bytes follows the
+            // stream's BodyMode.
+            if (stream == null) {
+                // DATA for a stream we no longer track (e.g. reset
+                // after an early response). Nothing to deliver, but
+                // the bytes still occupied the connection window —
+                // release it or the whole connection wedges.
+                _ = c.nghttp2_session_consume_connection(session, len);
+                return 0;
+            }
+            const s = stream.?;
+            switch (s.body_mode) {
+                .auto, .buffer => {
+                    // Classic accumulate path; consume immediately so
+                    // the client keeps streaming (the WINDOW_UPDATE
+                    // goes out on the next send drive).
+                    if (!s.bodyAppend(data, len))
+                        return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                    _ = c.nghttp2_session_consume(session, stream_id, len);
+                },
+                .hold => {
+                    // Window-hold: buffer but do NOT consume. The
+                    // client is held at the door after at most one
+                    // window's worth while the consumer decides.
+                    if (!s.bodyAppend(data, len))
+                        return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                    s.unconsumed += @intCast(len);
+                },
+                .discard => {
+                    _ = c.nghttp2_session_consume(session, stream_id, len);
+                },
+                .sink => {
+                    // Route to the upload driver. Window credit is
+                    // repaid by `sweepBodySinks` as the sink reports
+                    // drained bytes — the client's send rate follows
+                    // the upload rate. A push failure is fatal for
+                    // this stream only (RST), not the connection.
+                    const sk = s.sink orelse {
+                        _ = c.nghttp2_session_consume(session, stream_id, len);
+                        return 0;
+                    };
+                    if (!sk.push(sk.ctx, data[0..len]))
+                        return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+                    s.unconsumed += @intCast(len);
+                },
+            }
             return 0;
         }
 
-        fn onFrameRecvCb(
-            session: ?*c.nghttp2_session,
-            frame: [*c]const c.nghttp2_frame,
-            user_data: ?*anyopaque,
-        ) callconv(.c) c_int {
-            if (frame.*.hd.type != c.NGHTTP2_HEADERS and frame.*.hd.type != c.NGHTTP2_DATA)
-                return 0;
-            if (frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM == 0)
-                return 0;
-
-            const stream: ?*Stream = @ptrCast(@alignCast(
-                c.nghttp2_session_get_stream_user_data(session, frame.*.hd.stream_id),
-            ));
-            if (stream == null or stream.?.emitted) return 0;
-
-            const nctx: *NgCtx = @ptrCast(@alignCast(user_data));
-            const s = stream.?;
-            s.emitted = true;
-            s.ng_stream_id = frame.*.hd.stream_id;
-
-            const h2 = nctx.h2;
-
-            // Create request entity in request_out. Capacity is set
-            // at boot via the registry's `max_entities`; the per-tenant
-            // rate limiter is the gate that's supposed to keep entity
-            // counts inside that bound. If we still hit the cap here,
-            // that's a misconfiguration (rate limit too high or cap
-            // too low) — abort with a clear banner so the operator
-            // sees it instead of having streams silently rejected.
-            const req_entity = h2.reg.create(&h2.request_out) catch |err| switch (err) {
+        /// Create a request entity in `coll` with the stream's
+        /// finalized headers. Capacity is set at boot via the
+        /// registry's `max_entities`; the per-tenant rate limiter is
+        /// the gate that's supposed to keep entity counts inside that
+        /// bound. If we still hit the cap here, that's a
+        /// misconfiguration (rate limit too high or cap too low) —
+        /// abort with a clear banner so the operator sees it instead
+        /// of having streams silently rejected.
+        fn emitRequestEntity(
+            h2: *Self,
+            coll: *StreamColl,
+            s: *Stream,
+            stream_id: i32,
+            conn_entity: Entity,
+        ) ?Entity {
+            const req_entity = h2.reg.create(coll) catch |err| switch (err) {
                 error.Full => {
                     var buf: [512]u8 = undefined;
                     const msg = std.fmt.bufPrint(
@@ -887,7 +1187,7 @@ pub fn H2(comptime opts: Options) type {
                     _ = std.posix.write(2, msg) catch {};
                     std.process.abort();
                 },
-                else => return c.NGHTTP2_ERR_CALLBACK_FAILURE,
+                else => return null,
             };
 
             var fields: ?[*]HeaderField = null;
@@ -895,10 +1195,15 @@ pub fn H2(comptime opts: Options) type {
             var buf_len: u32 = 0;
             const hdr_buf = s.hdrFinalize(&fields, &count, &buf_len);
 
-            h2.reg.set(req_entity, &h2.request_out, StreamId, .{ .id = @intCast(frame.*.hd.stream_id) }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-            h2.reg.set(req_entity, &h2.request_out, Session, .{ .entity = nctx.conn_entity }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-            h2.reg.set(req_entity, &h2.request_out, ReqHeaders, .{ .fields = fields, .count = count, ._buf = hdr_buf, ._buf_len = buf_len }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            h2.reg.set(req_entity, coll, StreamId, .{ .id = @intCast(stream_id) }) catch return null;
+            h2.reg.set(req_entity, coll, Session, .{ .entity = conn_entity }) catch return null;
+            h2.reg.set(req_entity, coll, ReqHeaders, .{ .fields = fields, .count = count, ._buf = hdr_buf, ._buf_len = buf_len }) catch return null;
+            return req_entity;
+        }
 
+        /// Take the stream's accumulated body buffer (shrunk to fit)
+        /// out of the Stream, leaving it empty.
+        fn takeBody(s: *Stream) ReqBody {
             const body_data = if (s.body_data) |p| blk: {
                 if (s.body_len < s.body_cap) {
                     const shrunk = s.allocator.realloc(p[0..s.body_cap], s.body_len) catch p[0..s.body_cap];
@@ -906,11 +1211,93 @@ pub fn H2(comptime opts: Options) type {
                 }
                 break :blk @as(?[*]u8, p);
             } else null;
-            h2.reg.set(req_entity, &h2.request_out, ReqBody, .{ .data = body_data, .len = s.body_len }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-
+            const body: ReqBody = .{ .data = body_data, .len = s.body_len };
             s.body_data = null;
             s.body_len = 0;
             s.body_cap = 0;
+            return body;
+        }
+
+        fn onFrameRecvCb(
+            session: ?*c.nghttp2_session,
+            frame: [*c]const c.nghttp2_frame,
+            user_data: ?*anyopaque,
+        ) callconv(.c) c_int {
+            if (frame.*.hd.type != c.NGHTTP2_HEADERS and frame.*.hd.type != c.NGHTTP2_DATA)
+                return 0;
+
+            const stream: ?*Stream = @ptrCast(@alignCast(
+                c.nghttp2_session_get_stream_user_data(session, frame.*.hd.stream_id),
+            ));
+            if (stream == null) return 0;
+            const s = stream.?;
+            const nctx: *NgCtx = @ptrCast(@alignCast(user_data));
+            const h2 = nctx.h2;
+            const end_stream = frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0;
+
+            // headers_first early emission: a request whose HEADERS
+            // frame lacks END_STREAM has body DATA still inbound.
+            // Emit the entity NOW into `request_receiving` (empty
+            // ReqBody) so the consumer can decide the disposition
+            // from headers alone; the stream holds the flow-control
+            // window shut (`.hold`) until it does.
+            if (h2.h2_opts.headers_first and frame.*.hd.type == c.NGHTTP2_HEADERS and !end_stream and !s.emitted) {
+                const req_entity = emitRequestEntity(h2, &h2.request_receiving, s, frame.*.hd.stream_id, nctx.conn_entity) orelse
+                    return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                h2.reg.set(req_entity, &h2.request_receiving, ReqBody, .{ .data = null, .len = 0 }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                s.emitted = true;
+                s.ng_stream_id = frame.*.hd.stream_id;
+                s.body_mode = .hold;
+                s.entity = req_entity;
+                return 0;
+            }
+
+            if (!end_stream) return 0;
+
+            if (s.emitted) {
+                // END_STREAM on an early-emitted stream: the body is
+                // complete. Repay any held flow-control debt (the
+                // backpressure question is moot once the last byte is
+                // in — only the connection window still matters), then
+                // attach the accumulated body and move the entity into
+                // `request_out`, restoring its body-complete contract.
+                if (s.unconsumed > 0) {
+                    _ = c.nghttp2_session_consume(session, frame.*.hd.stream_id, s.unconsumed);
+                    s.unconsumed = 0;
+                }
+                s.inbound_eof = true;
+                if (s.body_mode == .sink) {
+                    if (s.sink) |sk| {
+                        sk.finish(sk.ctx);
+                        s.sink_finished = true;
+                    }
+                    return 0;
+                }
+                if (s.body_mode == .discard) return 0;
+                // Only a `.buffer` decision auto-completes: attach the
+                // body and restore request_out's body-complete
+                // contract. An entity still in `request_receiving`
+                // stays there — EVERY body-carrying request flows
+                // through the worker's disposition point (uniform
+                // headers-first dispatch regardless of body timing);
+                // the bytes wait in this Stream's buffer under
+                // `inbound_eof`, attached in place by
+                // `requestBodyBuffer` or drained by a `blob.receive`
+                // sink.
+                if (h2.reg.isInCollection(s.entity, &h2.request_buffering)) {
+                    h2.reg.set(s.entity, &h2.request_buffering, ReqBody, takeBody(s)) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                    h2.reg.move(s.entity, &h2.request_buffering, &h2.request_out) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                }
+                return 0;
+            }
+
+            // Classic path: entity is created at END_STREAM with the
+            // full body attached.
+            s.emitted = true;
+            s.ng_stream_id = frame.*.hd.stream_id;
+            const req_entity = emitRequestEntity(h2, &h2.request_out, s, frame.*.hd.stream_id, nctx.conn_entity) orelse
+                return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            h2.reg.set(req_entity, &h2.request_out, ReqBody, takeBody(s)) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
             s.entity = req_entity;
             return 0;
         }
@@ -928,6 +1315,25 @@ pub fn H2(comptime opts: Options) type {
 
             const s = stream.?;
             const nctx: *NgCtx = @ptrCast(@alignCast(user_data));
+
+            // headers_first: bytes held un-consumed on a stream that
+            // dies still occupy the CONNECTION window (the stream
+            // window dies with the stream). Repay it or every later
+            // stream on this connection inherits a shrunken window.
+            if (s.unconsumed > 0) {
+                _ = c.nghttp2_session_consume_connection(session, s.unconsumed);
+                s.unconsumed = 0;
+            }
+
+            // Sink stream closing before END_STREAM delivered: the
+            // upload can't complete — tell the driver. (Release of
+            // h2's sink ref is `sweepBodySinks`' job — it detects the
+            // dead stream and releases exactly once; the job's abort
+            // is idempotent.)
+            if (s.sink) |sk| {
+                if (!s.sink_finished) sk.abort(sk.ctx);
+                s.sink = null;
+            }
 
             if (s.emitted and !s.entity.isNil() and !nctx.h2.reg.isStale(s.entity)) {
                 const err: i32 = if (s.send_complete and error_code == 0) 0 else -1;
@@ -1044,7 +1450,21 @@ pub fn H2(comptime opts: Options) type {
             nctx.* = .{ .h2 = self, .allocator = self.allocator, .conn_entity = conn_entity };
 
             var session: ?*c.nghttp2_session = null;
-            if (c.nghttp2_session_server_new(&session, ng_callbacks, @ptrCast(nctx)) != 0) {
+            if (self.h2_opts.headers_first) {
+                if (ng_server_option == null) {
+                    var opt: ?*c.nghttp2_option = null;
+                    if (c.nghttp2_option_new(&opt) != 0) {
+                        self.allocator.destroy(nctx);
+                        return error.OutOfMemory;
+                    }
+                    c.nghttp2_option_set_no_auto_window_update(opt, 1);
+                    ng_server_option = opt;
+                }
+                if (c.nghttp2_session_server_new2(&session, ng_callbacks, @ptrCast(nctx), ng_server_option) != 0) {
+                    self.allocator.destroy(nctx);
+                    return error.Nghttp2SessionCreateFailed;
+                }
+            } else if (c.nghttp2_session_server_new(&session, ng_callbacks, @ptrCast(nctx)) != 0) {
                 self.allocator.destroy(nctx);
                 return error.Nghttp2SessionCreateFailed;
             }
@@ -1259,6 +1679,7 @@ pub fn H2(comptime opts: Options) type {
             self.recv_enobufs_logged = false;
             self.recv_enobufs_last_logged_decade = 0;
             self.recv_enobufs_low_outstanding_streak = 0;
+            self.body_sinks = .empty;
 
             // Init every collection field. Disabled (client_only with
             // has_client = false) collections have field type `void` —
@@ -1289,6 +1710,11 @@ pub fn H2(comptime opts: Options) type {
 
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
+            for (self.body_sinks.items) |ref| {
+                ref.sink.abort(ref.sink.ctx);
+                ref.sink.release(ref.sink.ctx);
+            }
+            self.body_sinks.deinit(allocator);
             inline for (COLLECTIONS) |s| {
                 if (s.client_only and !has_client) continue;
                 @field(self, s.name).deinit();
@@ -1318,6 +1744,7 @@ pub fn H2(comptime opts: Options) type {
             // Phase 1: Consume user inputs queued between polls (responses, chunks).
             // Must run before io.poll so the writes they generate can be submitted
             // in the same iteration.
+            self.sweepBodySinks();
             try self.consumeResponses();
             try self.consumeStreamResponses();
             try self.consumeStreamData();
@@ -1372,8 +1799,33 @@ pub fn H2(comptime opts: Options) type {
             try self.readsFeedData();
             try self.reg.flush();
 
+            self.sweepOrphanedInbound();
+            try self.reg.flush();
+
             try self.writesAccount();
             try self.reg.flush();
+        }
+
+        /// headers_first: a connection that died mid-upload takes its
+        /// streams down without firing `onStreamCloseCb`
+        /// (`nghttp2_session_del` frees streams silently), so an
+        /// early-emitted request still waiting for its body would sit
+        /// in `request_receiving` / `request_buffering` forever — the
+        /// worker only answers entities it has been shown. Sweep
+        /// entities whose connection is gone into `response_out` as
+        /// closed streams.
+        fn sweepOrphanedInbound(self: *Self) void {
+            if (!self.h2_opts.headers_first) return;
+            for ([_]*StreamColl{ &self.request_receiving, &self.request_buffering }) |coll| {
+                const entities = coll.entitySlice();
+                const sessions = coll.column(Session);
+                for (entities, sessions) |ent, sess| {
+                    if (getConn(self, sess.entity) == null) {
+                        self.reg.set(ent, coll, H2IoResult, .{ .err = -1 }) catch {};
+                        self.reg.move(ent, coll, &self.response_out) catch {};
+                    }
+                }
+            }
         }
 
         // =============================================================
@@ -1413,6 +1865,7 @@ pub fn H2(comptime opts: Options) type {
                 }
 
                 const ng_session = conn_ptr.ng_session.?;
+                self.flipInboundBodyToDiscard(ng_session, sid.id);
 
                 var status_buf: [3]u8 = undefined;
                 const status_str = std.fmt.bufPrint(&status_buf, "{d}", .{status.code}) catch "500";
@@ -1484,6 +1937,32 @@ pub fn H2(comptime opts: Options) type {
             }
         }
 
+        /// headers_first: a response is going out while the request
+        /// body may still be inbound (early 4xx from headers alone,
+        /// worker error paths). Stop accumulating, drop what was
+        /// buffered, and repay the held window so the client can
+        /// drain or reset cleanly — remaining DATA frames are
+        /// consumed-and-dropped by the `.discard` arm.
+        fn flipInboundBodyToDiscard(self: *Self, ng_session: *c.nghttp2_session, stream_id: u32) void {
+            if (!self.h2_opts.headers_first) return;
+            const stream: ?*Stream = @ptrCast(@alignCast(
+                c.nghttp2_session_get_stream_user_data(ng_session, @intCast(stream_id)),
+            ));
+            const s = stream orelse return;
+            if (s.body_mode != .hold and s.body_mode != .buffer) return;
+            s.body_mode = .discard;
+            if (s.body_data) |p| {
+                s.allocator.free(p[0..s.body_cap]);
+                s.body_data = null;
+                s.body_len = 0;
+                s.body_cap = 0;
+            }
+            if (s.unconsumed > 0) {
+                _ = c.nghttp2_session_consume(ng_session, @intCast(stream_id), s.unconsumed);
+                s.unconsumed = 0;
+            }
+        }
+
         // =============================================================
         // Streaming: consume stream_response_in
         // =============================================================
@@ -1519,6 +1998,7 @@ pub fn H2(comptime opts: Options) type {
                 }
 
                 const ng_session = conn_ptr.ng_session.?;
+                self.flipInboundBodyToDiscard(ng_session, sid.id);
 
                 var status_buf: [3]u8 = undefined;
                 const status_str = std.fmt.bufPrint(&status_buf, "{d}", .{status.code}) catch "500";

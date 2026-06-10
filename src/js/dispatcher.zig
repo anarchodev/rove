@@ -241,6 +241,7 @@ pub const Dispatcher = struct {
             .blob_session_ctx = request.trampolines.blob_session_ctx,
             .activation_entity = request.activation_entity,
             .activation_fetches_pending = request.activation_fetches_pending,
+            .allow_blob_receive = request.activation == .inbound_headers,
             .pending_fetches = request.effects.pending_fetches,
             .pending_wakes = request.effects.pending_wakes,
             .pending_stream_chunks = request.effects.pending_stream_chunks,
@@ -390,6 +391,21 @@ pub const Dispatcher = struct {
                     .headers = &.{},
                 };
             },
+            .no_onheaders => {
+                // Only `.inbound_headers` activations produce this,
+                // and none ride the back-compat path. Defined error,
+                // not a panic — same graceful posture as the arms
+                // above.
+                return .{
+                    .status = 500,
+                    .body = try self.allocator.dupe(u8, "headers-first probe on a non-headers-first path\n"),
+                    .body_is_json = false,
+                    .console = try self.allocator.dupe(u8, ""),
+                    .exception = try self.allocator.dupe(u8, ""),
+                    .set_cookies = &.{},
+                    .headers = &.{},
+                };
+            },
         }
     }
 };
@@ -400,6 +416,13 @@ fn finishResponse(
     pending: *PendingResponse,
     console_buf: *std.ArrayList(u8),
 ) DispatchError!RunOutcome {
+    // Headers-first probe miss — before everything else: nothing ran,
+    // so there is no kv error / stream / continuation to reconcile.
+    if (pending.no_onheaders) {
+        console_buf.deinit(d.allocator);
+        return .no_onheaders;
+    }
+
     if (state.pending_kv_error) |err| {
         d.last_kv_error = err;
         // Return an error → caller's `errdefer console_buf.deinit`
@@ -739,6 +762,7 @@ fn runOne(
             s.deinit(testing.allocator);
             @panic("runOne: handler returned a stream; use runOneOutcome");
         },
+        .no_onheaders => @panic("runOne: no_onheaders outside an inbound_headers dispatch"),
     }
 }
 
@@ -783,6 +807,7 @@ test "dispatch: next(...) return is classified as a continuation" {
             try testing.expect(std.mem.indexOf(u8, cont.ctx_json, "\"u\":\"alice\"") != null);
             try testing.expect(std.mem.indexOf(u8, cont.ctx_json, "\"tries\":0") != null);
         },
+        .no_onheaders => return error.TestExpectedContinuation,
     }
 }
 
@@ -818,6 +843,7 @@ test "dispatch: ordinary return stays terminal (trampoline does not engage)" {
             return error.TestExpectedContinuation;
         },
         .continuation => |*cont| cont.deinit(testing.allocator),
+        .no_onheaders => return error.TestExpectedContinuation,
     }
 }
 
