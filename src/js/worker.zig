@@ -249,6 +249,19 @@ pub const BodyDurabilityStatus = enum {
     failed,
 };
 
+/// headers_first dispatch state (`docs/blob-storage-plan.md` §3.5.1).
+/// `drainRequestReceiving` moves an early-emitted request (body still
+/// inbound) from h2's `request_receiving` into `request_out` with
+/// `receiving = true`; `dispatchOnce` runs it as an
+/// `.inbound_headers` activation (empty body, `onHeaders` export).
+/// Cleared when the probe misses (classic buffering takes over — the
+/// entity returns body-complete with the default-false component) or
+/// when h2 attaches an already-complete body in place. The default
+/// (false) is what every classic entity carries.
+pub const BodyInbound = struct {
+    receiving: bool = false,
+};
+
 pub const BodyDurabilityWait = struct {
     /// Coord durability key — opaque to the dispatch path.
     worker_seq: u64 = 0,
@@ -1160,6 +1173,7 @@ pub fn Worker(comptime opts: Options) type {
         RaftWait,
         ForwardWait,
         BodyDurabilityWait,
+        BodyInbound,
         components_mod.ChainContext,
         components_mod.ContDescriptor,
         components_mod.StreamChain,

@@ -833,6 +833,14 @@ fn resumeStream(
             chain_st.activation_count += 1;
             captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation, fw_seq);
         },
+        // Only `.inbound_headers` activations produce this; stream
+        // resumes never dispatch as one. Defined failure.
+        .no_onheaders => {
+            txn.rollback() catch {};
+            txn_done = true;
+            markStreamDraining(server, ent);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation, 0);
+        },
     }
 }
 
@@ -1175,6 +1183,14 @@ pub fn resumeBoundFetchStream(
             chain_st.activation_count += 1;
             captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .fetch_chunk, fw_seq);
         },
+        // Only `.inbound_headers` activations produce this; stream
+        // resumes never dispatch as one. Defined failure.
+        .no_onheaders => {
+            txn.rollback() catch {};
+            txn_done = true;
+            markStreamDrainingAnywhere(server, ent);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+        },
     }
 }
 
@@ -1504,6 +1520,13 @@ pub fn runFire(
             }
             commitReadOnlyFire(p, spec.site ++ ".commit(stream)");
             captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
+        },
+        // Only `.inbound_headers` activations produce this;
+        // connectionless fires never dispatch as one. Defined failure.
+        .no_onheaders => {
+            p.txn.rollback() catch {};
+            p.txn_done = true;
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
         },
     }
 }

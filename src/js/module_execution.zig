@@ -53,6 +53,11 @@ pub const PendingResponse = struct {
     /// h2 entity. Handler-path only — middleware may not return a
     /// continuation in v1 (plan §3b B6).
     continuation: ?continuation_mod.Continuation = null,
+    /// Set by `runModule` when an `.inbound_headers` probe found no
+    /// `onHeaders` export. `finishResponse` maps it to
+    /// `RunOutcome.no_onheaders` — the dispatch site falls back to
+    /// classic body buffering instead of a 404.
+    no_onheaders: bool = false,
     pub fn deinit(self: *PendingResponse, allocator: std.mem.Allocator) void {
         if (self.continuation) |*cont| cont.deinit(allocator);
         allocator.free(self.body);
@@ -305,6 +310,16 @@ pub fn runModule(
         // export; the §6 deploy-time coverage lint flags those.
         if (request.activation == .disconnect) {
             _ = ctx.takeException();
+            return;
+        }
+        // Headers-first probe: a module without `onHeaders` wants the
+        // classic buffered path — signal the dispatch site to buffer
+        // + re-dispatch instead of 404ing (`docs/blob-storage-plan.md`
+        // §3.5: "exports onHeaders → headers-first" is one dispatch
+        // row, and its absence is the normal case, not an error).
+        if (request.activation == .inbound_headers) {
+            _ = ctx.takeException();
+            pending.no_onheaders = true;
             return;
         }
         pending.status = 404;

@@ -390,6 +390,21 @@ pub const Dispatcher = struct {
                     .headers = &.{},
                 };
             },
+            .no_onheaders => {
+                // Only `.inbound_headers` activations produce this,
+                // and none ride the back-compat path. Defined error,
+                // not a panic — same graceful posture as the arms
+                // above.
+                return .{
+                    .status = 500,
+                    .body = try self.allocator.dupe(u8, "headers-first probe on a non-headers-first path\n"),
+                    .body_is_json = false,
+                    .console = try self.allocator.dupe(u8, ""),
+                    .exception = try self.allocator.dupe(u8, ""),
+                    .set_cookies = &.{},
+                    .headers = &.{},
+                };
+            },
         }
     }
 };
@@ -400,6 +415,13 @@ fn finishResponse(
     pending: *PendingResponse,
     console_buf: *std.ArrayList(u8),
 ) DispatchError!RunOutcome {
+    // Headers-first probe miss — before everything else: nothing ran,
+    // so there is no kv error / stream / continuation to reconcile.
+    if (pending.no_onheaders) {
+        console_buf.deinit(d.allocator);
+        return .no_onheaders;
+    }
+
     if (state.pending_kv_error) |err| {
         d.last_kv_error = err;
         // Return an error → caller's `errdefer console_buf.deinit`

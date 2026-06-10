@@ -2463,15 +2463,16 @@ fn resolveRequest(
 /// h2 emits a request whose body is still inbound into
 /// `request_receiving` at the HEADERS frame, holding the stream's
 /// flow-control window shut until the worker picks a disposition.
-/// Until the `onHeaders` dispatch row lands, the only disposition is
-/// classic buffering: `requestBodyBuffer` re-opens the window, h2
-/// accumulates, and the entity arrives in `request_out`
-/// body-complete at END_STREAM — so `dispatchOnce` and everything
-/// after it keeps its body-complete contract.
+/// Pull every receiving entity into `request_out` under
+/// `BodyInbound{ .receiving = true }`; `dispatchOnce` runs it as an
+/// `.inbound_headers` activation — the module's `onHeaders` export
+/// decides from headers alone, and a module without one falls back
+/// to classic buffering via the `.no_onheaders` outcome.
 pub fn drainRequestReceiving(worker: anytype) void {
     const server = worker.h2;
     for (server.request_receiving.entitySlice()) |ent| {
-        server.requestBodyBuffer(ent);
+        server.reg.set(ent, &server.request_receiving, worker_mod.BodyInbound, .{ .receiving = true }) catch continue;
+        server.reg.move(ent, &server.request_receiving, &server.request_out) catch continue;
     }
 }
 
@@ -2496,6 +2497,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     // underlying collection but the local slices stay valid for
     // this dispatch tick.
     const body_waits = server.request_out.column(worker_mod.BodyDurabilityWait);
+    // headers_first (§3.5.1): entities pulled from `request_receiving`
+    // by `drainRequestReceiving` carry `receiving = true` — their body
+    // is still inbound (ReqBody is empty by invariant) and they
+    // dispatch as `.inbound_headers`.
+    const body_inbounds = server.request_out.column(worker_mod.BodyInbound);
 
     // Leader-only request handling. Followers serve no client traffic
     // — they just replicate the leader's raft entries. Any request
@@ -2576,7 +2582,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
 
     var processed: usize = 0;
 
-    for (entities, sids, sessions, req_hdrs, req_bodies, body_waits) |ent, sid, sess, rh, req_body, body_wait| {
+    for (entities, sids, sessions, req_hdrs, req_bodies, body_waits, body_inbounds) |ent, sid, sess, rh, req_body, body_wait, body_inbound| {
         if (!is_leader) {
             try respb.setSimpleResponse(server, ent, sid, sess, 503, "not leader; retry against the cluster leader\n", allocator);
             processed += 1;
@@ -2591,6 +2597,23 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         const body: []const u8 = if (req_body.data) |p| p[0..req_body.len] else "";
 
         checkProxyWarning(rh);
+
+        // headers_first: `/_system/*` routes are platform surface, not
+        // customer handlers — never headers-first (a tenant-move
+        // `v2-kv` bundle POST must arrive whole). Flip to classic
+        // buffering and come back body-complete.
+        if (body_inbound.receiving and std.mem.startsWith(u8, path, "/_system")) {
+            try server.reg.set(ent, &server.request_out, worker_mod.BodyInbound, .{ .receiving = false });
+            switch (server.requestBodyBuffer(ent)) {
+                // .buffering: comes back via request_buffering at
+                // END_STREAM. .body_complete: attached in place —
+                // next walk dispatches it whole.
+                .buffering, .body_complete => {},
+                .gone => try respb.setSimpleResponse(server, ent, sid, sess, 503, "client disconnected before body completed\n", allocator),
+            }
+            processed += 1;
+            continue;
+        }
 
         // `/_system/*` — CORS gate, then auth + system route dispatch.
         if (try tryHandleSystem(server, allocator, worker, ent, sid, sess, method, path, rh, body)) {
@@ -3039,7 +3062,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .query = route.query,
             .headers = rh,
             .session_id = session_resolved.sid,
-            .activation = .inbound,
+            .activation = if (body_inbound.receiving) .inbound_headers else .inbound,
             .activation_entity = ent,
             .trace = .{
                 .readset = &readset,
@@ -3199,6 +3222,29 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // on the success path.
         defer if (stream_meta_opt) |*m| m.deinit(allocator);
         var resp: dispatcher_mod.Response = switch (run_oc) {
+            // headers_first probe miss: the module has no `onHeaders`
+            // — fall back to classic buffering. Roll back the probe's
+            // savepoint (module top-level may have run), clear the
+            // marker, and hand the body question back to h2. Not a
+            // completed activation: no response, no log record.
+            .no_onheaders => {
+                txn.?.rollbackTo() catch |re| panic_mod.invariantViolated(
+                    "dispatchOnce.rollbackTo(no_onheaders)",
+                    "tenant={s} err={s}",
+                    .{ scope_inst.id, @errorName(re) },
+                );
+                try server.reg.set(ent, &server.request_out, worker_mod.BodyInbound, .{ .receiving = false });
+                switch (server.requestBodyBuffer(ent)) {
+                    // .buffering: re-dispatches body-complete via
+                    // request_buffering → request_out at END_STREAM.
+                    // .body_complete: body attached in place — the
+                    // next walk runs it as a classic `.inbound`.
+                    .buffering, .body_complete => {},
+                    .gone => try respb.setSimpleResponse(server, ent, sid, sess, 503, "client disconnected before body completed\n", allocator),
+                }
+                processed += 1;
+                continue;
+            },
             .terminal => |r| r,
             .continuation => |cval| ctblk: {
                 cont_opt = cval;

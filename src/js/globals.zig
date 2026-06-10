@@ -2112,6 +2112,9 @@ pub fn installRequest(
         .durable_wake => "durable_wake",
         // websocket-plan §5: one inbound WS data frame.
         .ws_message => "ws_message",
+        // blob-storage-plan §3.5: headers-first inbound — body still
+        // inbound, handler decides from headers alone.
+        .inbound_headers => "inbound_headers",
     };
     _ = c.JS_SetPropertyStr(ctx, activation_obj, "kind", c.JS_NewStringLen(ctx, kind.ptr, kind.len));
     if (request.activation == .wake_batch) {
