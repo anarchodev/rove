@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """V2 Phase-7 slice (a) smoke — serve-or-forward (project_v2_zero_downtime_move
-memory; docs/v2-build-order.md §Phase 7).
+memory; v2-build-order §Phase 7).
 
 Proves the ROUTING-correctness half of the zero-downtime design: a DP cluster
 that receives a request for a tenant it does NOT own forwards it to the owner

@@ -7,7 +7,7 @@
 //! type numbering matching V1's `EnvelopeType`) so the apply payload is
 //! unchanged across the rewrite — but the V2 spine owns its codec
 //! outright because V1's `cluster.zig` is deleted at cutover
-//! (docs/v2-build-order.md "clean-slate the spine, reuse the limbs").
+//! (v2-build-order "clean-slate the spine, reuse the limbs").
 //!
 //! The type-0 payload is the **readset-framed** `WriteSetPayload`
 //! (`[u32 ws_len][ws][u32 rs_len][rs]`), byte-identical to the worker's

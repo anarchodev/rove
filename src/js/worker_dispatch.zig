@@ -2486,7 +2486,7 @@ fn resolveRequest(
     } };
 }
 
-/// headers_first front half (`docs/blob-storage-plan.md` §3.5.1):
+/// headers_first front half (blob-storage-plan §3.5.1; `docs/architecture/routing-and-ingress.md`):
 /// EVERY h2 body-carrying request is emitted into
 /// `request_receiving` at the HEADERS frame (h2 never auto-completes
 /// it — uniform dispatch regardless of body timing). Pull each one
@@ -2724,7 +2724,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // dispatch so static file requests count against the bucket
         // too. On exhaustion: 429 + Retry-After header.
         // Per-tenant plan: rate caps + body cap + retention all resolve from
-        // the slot's cached plan (docs/plan-tiers.md). `plan_gen` lets the
+        // the slot's cached plan (docs/architecture/control-plane.md). `plan_gen` lets the
         // limiter re-snapshot caps when a tier change lands (Lever 1).
         const plan = slot.effectivePlan();
         const plan_gen = slot.plan_gen.load(.acquire);
@@ -2740,7 +2740,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             continue;
         }
 
-        // Lever 2 — body-size gate (docs/plan-tiers.md). Reject oversized
+        // Lever 2 — body-size gate (docs/architecture/control-plane.md). Reject oversized
         // inbound bodies with 413 off the tenant's plan-resolved
         // `max_body_bytes`. A declared `content-length` over the cap fails
         // up front; otherwise the actually-buffered length is checked. (The

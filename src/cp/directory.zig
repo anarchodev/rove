@@ -1,4 +1,4 @@
-//! V2 control plane — the tenant→cluster directory (docs/v2-build-order.md
+//! V2 control plane — the tenant→cluster directory (v2-build-order
 //! §Phase 3 "a minimal control plane — the tenant→cluster directory";
 //! docs/v2-cp-directory-replication.md Slice 1).
 //!
@@ -149,7 +149,7 @@ pub const Directory = struct {
     /// tenant store id → opaque plan/limits blob (`{tier, overrides}` JSON,
     /// authored by the admin app). The CP is dumb here — it stores + replicates
     /// + serves the bytes verbatim; the DP parses them into effective limits
-    /// (`plan-tiers.md`, `v2-cp-operational-state.md`). Owned key + value.
+    /// (decisions.md §10.9 + docs/architecture/control-plane.md). Owned key + value.
     plans: std.StringHashMapUnmanaged([]u8) = .empty,
     /// host (`acme.com`) → tenant store id — the replicated domain index
     /// (gap #2). The front door resolves `host → tenant → cluster` via

@@ -6,7 +6,7 @@
 > state lives**. Companions: [decisions.md §10.9](decisions.md)
 > (per-tenant plan/limits in the CP, authored by the admin app — mechanics in
 > `architecture/control-plane.md`),
-> [`plan-tiers.md`](plan-tiers.md) (DP enforcement), `architecture/auth-and-domains.md`
+> [`architecture/control-plane.md`](architecture/control-plane.md) "Operational state" (DP enforcement), `architecture/auth-and-domains.md`
 > (the `__auth__` OIDC IdP + OIDC-RP dashboards + `platform.scope`),
 > [`users-lib-plan.md`](users-lib-plan.md) (the *customer's* end-user auth —
 > a different plane; see §2), `pricing-model.md` (per-tenant caps),
@@ -44,7 +44,7 @@ in the CP" is **admin-authored AND placement-independent** — that is what put
 them out of even the CP: they are **business policy**, and the locked
 architecture says business policy lives in a **normal admin app**, never in
 the CP binary (a small, auditable trust boundary) and never in `rove` core
-("rove never knows what a dollar is", `plan-tiers.md`).
+("rove never knows what a dollar is", decisions.md §10.9).
 
 Concretely:
 

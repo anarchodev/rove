@@ -139,9 +139,9 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
 - **Decision** (shipped 2026-05-24, `b908953`, net −4.7 kLOC Zig): there is **one
   outbound HTTP primitive** (`http.fetch`). `webhook.send` / `email.send` /
   `retry.*` are JS standard-library shims that compose durability on top of it
-  (`kv.set` owed-marker + `http.fetch` + a per-worker sweep). The dedicated
-  `http.send` Zig primitive, the schedule envelopes, and the leader-local
-  `SendDispatch` were all retired.
+  (`kv.set` owed-marker + `http.fetch` + a durable scheduled wake, §3.7). The
+  dedicated `http.send` Zig primitive, the schedule envelopes, the leader-local
+  `SendDispatch`, and later the per-feature owed sweep were all retired.
 - **Inputs durable / outputs derivable**: `blob.put` / `blob.get` are likewise
   **JS shims, not Zig Cmd primitives** — the marker key holds a pointer
   (`{correlation_id, seq, call_index, dest_key}`), never the bytes; recovery is
@@ -160,10 +160,10 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
      writeset committed via raft. Closed by the commit-gated Cmd buffer
      (effect-reification Phase 4.1.2 `Cmd.http_fetch` staging, shipped
      2026-05-24) — the fetch submits to the FetchEngine only after the batch
-     commits. The owed sweep (~1s first-fire latency) remains as the
-     crash-recovery path only.
+     commits. Crash recovery is the send's durable-wake watchdog entry
+     (§3.7) — the owed sweep is deleted.
 
-### 3.4 Owed-recovery is a boot-scan of `_send/owed/`
+### 3.4 Owed-recovery is a boot-scan (superseded: now the generic `_sched/` promotion pass)
 - **Decision** (Option (b), shipped 2026-05-19): at process start, reconstruct
   the in-flight/timer set with a single-pass boot-scan of `_send/owed/` across all
   tenant DBIs (the per-tenant kv write is the authoritative source). Measured
@@ -171,6 +171,11 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   ~1–2s/10k RTO budget is accepted. Mitigation levers (fold the probe into
   `Manifest.init`; shard across workers) are known but deliberately not built —
   escalate only past ~10k tenants/node and re-run `owed_recovery_scan_bench.zig`.
+- **Superseded** (durable-wake P5(a), 2026-06-10): the `_send/owed/`-specific
+  sweep is deleted; reconstruction is the generic durable-wake promotion pass
+  over `_sched/` (§3.7) plus a per-send watchdog wake entry. The measured scan
+  costs and the rejected alternatives below carry over unchanged — the
+  promotion pass is the same single-pass walk, generalized.
 - **Rejected**: (a) lazy recover-on-tenant-open — silently drops a quiet
   tenant's cron/delayed sends; (c) "snapshot-in-one-shot" — illusory in kvexp,
   where walking the snapshot ≡ walking the DBIs ≡ the boot-scan. The only way to
@@ -204,6 +209,101 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   The cap traded a small bound for node-wide mutex traffic on the dispatch hot
   path. Per-tenant retention/sampling (a deferred `tape_mode` knob) is the
   correct lever.
+
+### 3.7 Durable scheduled wake: one-shot, absolute-time, at-least-once *firing*
+- **Decision** (gap 2.6, P0–P7 shipped in full 2026-06-10): the platform's only
+  deferred-fire mechanism is a durable scheduled wake — `durable_wake` is a Msg
+  origin like any other, and wake records are ordinary envelope-0 Model keys
+  (`_sched/by_id/` + `_sched/by_time/`), not a second store. One-shot
+  **absolute-time**, not interval-cron: webhook backoff needs irregular fire
+  times an interval can't express; recurrence is a one-shot that re-arms itself
+  (the `cron()` verb is sugar over it). Webhook / email / retry / durable cron /
+  delayed jobs / debounce all became libraries over this one origin; the
+  per-feature Zig sweeps (`sweepOwedRetries*`, `CronState` +
+  `sweepCronSubscriptions`) are deleted.
+- **Contract is at-least-once *firing*, not completion**: the wake guarantees
+  the handler *runs*; retry **policy** (attempts, backoff) is a composition →
+  JS; retry **budget** (rate, outstanding) is a resource bound → engine caps
+  (`SCHED_MAX_OUTSTANDING` / `SCHED_MAX_FIRES_PER_TICK` / `SCHED_MAX_MSG_BYTES`,
+  all fail-loud). Keeps the no-retry-kernel-in-Zig posture of §3.3.
+- **Locus**: the engine keeps exactly **one** durable next-fire watermark per
+  tenant (`TenantSlot.next_wake_ns`), reachable only via capability-scoped
+  builtins (`__rove_set_wake` / `__rove_fire_wake`, `is_system_module`-gated);
+  the queue / ordering / fan-out lives in the baked `scheduler` JS lib
+  (ordinary taped kv). Customer surface is `scheduler.at/after/cancel/get` +
+  `cron()`.
+- **The marker-commit-race lesson, again**: a freshly-scheduled wake's
+  watermark must be lowered from **committed** state, never from the handler
+  that called `at()` — the bootstrap is a direct watermark-lower in the commit
+  arm (`noteCommittedSchedWrites`), not a volatile set-on-call.
+- **Manifest `kind=cron` retired outright** (not re-platformed under the hood):
+  a `kind=cron` spec.json fails the deploy loudly; sub-minute intervals are a
+  self-re-arming `scheduler.after` seeded from `onBoot`
+  (`scripts/scheduler_heartbeat_smoke_v2.py` is the recipe).
+- **Rejected**: a many-timer engine index (queue lives in the JS lib);
+  at-least-once *completion* (engine absorbs the retry kernel); interval-cron
+  as the primitive; bring-your-own scheduler override (deferred until a
+  customer asks).
+- **Gotcha that cost real debugging**: `pending_fetches` was null on every
+  `runFire` / cont-resume / stream-resume path, so a fetch issued from a wake,
+  subscription, or chained activation was *silently dropped* — masked for
+  months by the old owed sweep re-driving the marker. Every fire/resume origin
+  now owns a commit-gated fetch accumulator; deleting a safety net is what
+  surfaced the class.
+
+### 3.8 Customer blob storage: CAS-only, the Case A/B split, adoption rejected
+- **Decision** (P1–P4 shipped 2026-06-09/10; mechanics in
+  `architecture/routing-and-ingress.md`, surface in `handler-shape.md`): the
+  customer object store is **content-addressed only** —
+  `…{instance_id}/app-blobs/{hash}`, no names in the store; the naming layer
+  (`media/{id} → hash`) is the customer's kv, where it is transactional and
+  replicated. Kills overwrite semantics, key collisions, LIST, and
+  read-after-write naming races at birth; dedup falls out free; replay records
+  the hash, not the bytes. The doctrine: **kv is for state you mutate; the
+  object store is for facts you accumulate** — the same statement as the two
+  pricing axes (kv hard-cap + byte-ring).
+- **The streaming-upload litmus is the scope litmus pointed at bytes**: does
+  your logic depend on the chunk content? Yes → `onChunk` + `blob.write`/`seal`
+  (Case A — bytes are taped, correctly: the handler observed them). No →
+  `onHeaders` + `blob.receive` (Case B — the inbound mirror of `pipe_to`:
+  no chunk Msgs at all, bytes flow socket→multipart untaped *by derivation*,
+  one PUT at every object size; the completion Msg tapes `{hash, len}`).
+  `onHeaders` is load-bearing, not a nicety: without it the durability gate
+  pool-homes up to the whole body first, and small media pays 2×.
+- **Rejected — adoption-by-reference** (code-verified against the
+  coordinator): retaining readset pool bytes as the customer object is dead on
+  four counts — the cross-tenant `_pool/` batches make presign impossible (a
+  presigned GET authorizes the object; Range is client-supplied); media must
+  outlive tape retention → pinning shared batches of other tenants' expired
+  bytes; bodies ≤ 16 KB ride inline in the raft entry, nothing to adopt; and
+  ~64 KB–1 MB scattered chunks can't meet `UploadPartCopy`'s 5 MiB floor.
+  Recorded post-evidence option (not planned): inverted homing — tenant-prefix
+  first, BodyRef points in — only if a real workload is both transform-heavy
+  *and* archive-heavy.
+- **Trust boundary**: SigV4 keys and prefix enforcement cannot live in
+  forkable customer JS — the verbs stay readable shims targeting an in-process
+  signing interceptor (`rove-blob.internal` / `rove-receive.internal`), not a
+  proxy hop. `_blob/` is deliberately **not** platform-reserved (the `_send/`
+  rule: the shim writes its marker as customer JS).
+- **Deliberately bounded**: sessions are a 64 MiB single-PUT buffer (2/tenant,
+  120 s idle TTL) — S3 multipart for `seal` is deferred until a real > 64 MiB
+  case (Synapse's default media cap is 50 MB). `blob.pipe` deferred out
+  (`pipe_to` disposition retired; `blob.url`'s 307-to-presigned covers
+  serve-bytes-to-client). `blob.put` is single-attempt (marker persists
+  `failed:true`; §2.5 re-execution recovery is the follow-up).
+- **`segments.js` is a stdlib recipe, not a primitive** (rule 4): hot kv tail +
+  sealed immutable CAS segments; the seal cadence is the knob trading kv-cap
+  against byte-ring consumption. The design content is crash-safety: a sealed
+  segment is **durable-class, not cache-class** — once the hot rows are
+  deleted it is the sole copy past tape retention, so the hot-row delete is
+  gated on the confirmed PUT and the index-write+delete swap is one atomic
+  writeset. Customers forking it in the same direction is the promotion
+  signal.
+- **Open (deliberately undecided)**: delete/GC (candidate `blob.delete(hash)`,
+  customer-owned refcounting; defensible day one: no delete — any delete must
+  be fenced against tape retention where the object is an input home); quota
+  enforcement at `put`/`seal`/`receive` before bytes land; whether `onHeaders`
+  composes with `default`/`onChunk` in one module or is exclusive.
 
 ---
 
@@ -501,12 +601,16 @@ prototype before V2 wrote code.
 - **Rejected**: carrying the raft-log tail across a move — "quiesce → commit →
   ship state → fresh group" is sufficient and is what the prototype validated.
 
-### 10.7 Codec: prost (pre-generated), vendored raft-rs
-- **Decision**: vendor raft-rs with **prost-codec**, pre-generated `.rs` (no
-  `protoc` at build time), `panic = abort` / `lto`.
+### 10.7 Codec: prost (pre-generated)
+- **Decision**: raft-rs with **prost-codec**, pre-generated `.rs` (no `protoc`
+  at build time), `panic = abort` / `lto`.
 - **Why**: per-message protobuf **decode** is the real per-message cost (batching
   the `step` FFI bought 0× — the Zig↔C↔Rust boundary is sub-µs), so a
   faster/smaller codec is the lever, not the FFI shape.
+- **Not a size lever**: protobuf-build vs prost makes no difference to the
+  dependency-closure size (protobuf-build pulls ~33 MB of protoc binaries
+  under both) — do not re-litigate prost-vs-protobuf on size grounds (§10.11).
+
 
 ### 10.8 The CP directory is itself raft-replicated (HA, strongly consistent)
 - **Decision** (shipped 2026-06): the control plane is a small dedicated raft
@@ -549,8 +653,58 @@ prototype before V2 wrote code.
   (keep the CP small/auditable; policy — "Pro costs $X," provisioning — lives in
   an iterable tenant app). The confused-deputy guard is a **capability grant**,
   not a hardcoded tenant id (future-proofs delegated/self-host admin). Mechanics:
-  `architecture/control-plane.md`; enforcement levers: `plan-tiers.md`; accounts/
-  billing product layer: `platform-accounts-model.md`.
+  `architecture/control-plane.md`; accounts/billing product layer:
+  `platform-accounts-model.md`.
+- **Enforcement decisions** (the three levers shipped 2026-06; mechanics in
+  `architecture/control-plane.md` "Operational state"): `rove` only *enforces*
+  tiers — setting one (Stripe webhook → admin write) is product-layer; **rove
+  never knows what a dollar is**. Effective limits resolve at **read-time**
+  (`override ?? TIER_TABLE[tier].field`) and cache on the `TenantSlot` with a
+  plan generation (no `O(N_tenants)` on dispatch). Rate buckets
+  **generation-refresh** on a stale generation — stale-until-restart was
+  rejected because the painful direction is a *paying* customer not getting
+  their raise until restart. Retention is a **server-side read-path clamp**,
+  not GC: upgrade reveals, downgrade hides-never-deletes (sidesteps the
+  "downgrade retroactively deletes data" hazard); unbounded S3 until real GC
+  is an accepted operator cost. Open product call: the concrete
+  free/pro/enterprise numbers.
+
+### 10.10 Cutover strategy: freeze V1, branch, no dual-mode
+- **Decision** (2026-05-29; executed, cutover complete 2026-06-10): freeze V1
+  on main, build V2 as its replacement on branch `v2`, merge and delete V1
+  when V2 can serve + move tenants. **Pre-release with no production data**
+  collapses the migration problem: dual-mode (two raft engines coexisting in
+  one binary — the single hardest piece of the earlier parallel-`src-v2/`
+  plan) was answering a *live-migration* question that no longer existed.
+  "Clean slate" meant clean-slate the **spine** (consensus/storage,
+  `src/kv/` willemt) and reuse the **limbs** (`h2/`, `blob/`, the JS
+  dispatcher, `tape/`, `tenant/`, files-server) as imports.
+- **De-risking order**: the first cross-cluster move ran between two
+  *single-node* "clusters" — mobility needs the whole bundle→ship→attach→
+  reroute path but **not quorum**; multi-node HA became hardening *after*
+  the capability was proven. Value-first: prove the differentiator (the
+  move) before investing in HA and scale.
+- **Why mobility forced the rewrite**: V1's raft was cluster-wide — one log,
+  every tenant interleaved, the consensus index *cluster*-scoped — so a
+  tenant's state (`durableRaftIdx`) and its consensus position did not
+  travel together; moving off a shared log needs a bespoke dual-write/fence
+  protocol that is error-prone at the fence and doesn't generalize. Per-
+  tenant groups make state + consensus position one movable unit (§10.1,
+  §10.6).
+
+### 10.11 Dependency model: pin-and-fetch, not vendor
+- **Decision** (2026-06-04, branch `v2`): third-party deps are **pinned and
+  fetched at build time** — Zig/C packages (`arenajs`, `kvexp`,
+  `raft-rs-zig`) via `build.zig.zon` full-SHA pins, the raft engine's Rust
+  crates via `Cargo.lock`. The first build needs network; subsequent builds
+  hit the Zig package cache. This **replaced the vendor-everything /
+  offline-build mandate**.
+- **Why**: the raft-rs Rust closure measured 60–143 MB — too large to vendor
+  sanely, and no codec choice shrinks it (§10.7). The willemt/raft vendor
+  (and `vendor/` entirely) was deleted at the V2 cutover.
+- **Do not** re-vendor or re-propose the offline-build mandate without new
+  information. `zig fetch --save=<name> git+https://…#<commit>` needs the
+  **full SHA**.
 
 ---
 

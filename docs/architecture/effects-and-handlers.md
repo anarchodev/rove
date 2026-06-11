@@ -77,6 +77,60 @@ durable-wake promotion pass — no `_send/owed/`-specific scan remains.
 The rule: small bounded payload (a webhook body) → bytes-in-marker; arbitrary
 size (blob bytes) → pointer-in-marker + re-execution.
 
+## Durable scheduled wake (the deferred-fire primitive)
+
+One-shot, absolute-time, at-least-once **firing** (decisions.md §3.7). Wake
+records are ordinary envelope-0 Model keys; the engine holds exactly one
+durable next-fire watermark per tenant; everything else is the baked
+`scheduler` JS lib.
+
+- **Engine half**: `TenantSlot.next_wake_ns` (atomic) +
+  `lowerWake`/`setWakeTrampoline` (`src/js/deployment_cache.zig`); a 1 Hz
+  partitioned sweep `sweepDurableWakes` — O(tenants-due) per tick — plus
+  `sweepDurableWakesOnPromotion` — O(tenants) once on leadership gain
+  (`src/js/durable_wake.zig`, wired in `src/rewind/main.zig`). The watermark is
+  bootstrapped **from committed state only**: `noteCommittedSchedWrites` in the
+  `worker_drain.zig` commit arm lowers it when a committed batch touches
+  `_sched/` — never set-on-call from the still-uncommitted handler (the
+  marker-commit-race lesson).
+- **Two capability-scoped builtins** (`is_system_module`-gated, survive
+  `_harden.js`): `__rove_set_wake(when_ns)` / `__rove_fire_wake`
+  (`src/js/bindings/scheduler.zig`). Baked modules can't reach `_system.http`,
+  so a third gated builtin `__rove_fetch` (`src/js/bindings/http.zig`) carries
+  system fetches.
+- **The queue lives in JS**: baked `__system/scheduler_tick.mjs` range-scans
+  `_sched/by_time/` for due entries (≤ `SCHED_MAX_FIRES_PER_TICK`), dispatches
+  each target, deletes the fired entry's keys **in the same writeset as the
+  dispatched activation's effects**, recomputes the min, re-arms. If it fired
+  ≥1 entry the watermark is set to *now* — a target that throws (rolling back
+  its own cleanup-delete) is retried next sweep, not stranded. Public surface:
+  `globals/scheduler.js` (`at`/`after`/`cancel`/`get`; `_sched/by_id/{id}` +
+  `_sched/by_time/{when_ns_padded}/{id}`; `id = sha256(key)` or
+  `randomUUID()` — both replay-deterministic). Caps fail loud:
+  `SCHED_MAX_OUTSTANDING` / `SCHED_MAX_FIRES_PER_TICK` / `SCHED_MAX_MSG_BYTES`.
+- **Fire path**: `fireSchedulerTick` / `fireDurableWakeActivation` + the
+  `.durable_wake` drain arm (`src/js/worker_streaming.zig`); the
+  `Msg.durable_wake` origin is a taped input like any other.
+- **What rides it**: `webhook.send`/`email.send` keep one `scheduler` entry per
+  send under idempotency key `_send/{id}` — scheduled fire, retry re-arm
+  (`__system/webhook_onresult` moves it to the backoff time), and
+  crash-recovery **watchdog** (+40 s past the 30 s attempt timeout) in a single
+  entry, aimed at baked `__system/webhook_fire.mjs`; terminal results cancel
+  it. Durable cron is the `cron(spec, target)` verb over `__system/cron_tick`,
+  self-re-arming; a manifest `kind=cron` spec.json fails the deploy loudly
+  (sub-minute recurrence = `scheduler.after` seeded from `onBoot`, recipe in
+  `scripts/scheduler_heartbeat_smoke_v2.py`).
+- **Fetch-from-fire wiring**: every `runFire` / cont-resume / stream-resume
+  origin owns a commit-gated `Cmd.http_fetch` accumulator
+  (`flushFireFetches`, `proposeForgetfulWrites` / `proposeAndParkContResume`
+  grew a `fetches_opt`) — before this, a fetch issued from a wake or chained
+  activation was silently dropped, masked by the old owed sweep. One known
+  narrow gap: a connection-scoped `on.fetch` bind from a *writing* resume —
+  warns loudly.
+- **Smokes**: `scripts/durable_wake_smoke_v2.py` (fire + 3-node leader-kill
+  failover survival + msg-byte cap), `scripts/scheduler_heartbeat_smoke_v2.py`
+  (interval recurrence + `kind=cron` rejection).
+
 ## Readset replication
 
 A raft entry carries the **writeset and the readset**
@@ -155,16 +209,10 @@ the wake to the owning worker, falling back to `hash(tenant)` on a registry miss
   handler's writeset is durable. Crash recovery is the send's durable-wake
   watchdog (`__system/webhook_fire`, +40 s) — the owed sweep is deleted.
   See decisions.md §3.3 gotcha 5.
-- ~~**`durable_wake` (gap 2.6) is design-in-code, not wired**~~ — shipped: the
-  firing path is built (`durable_wake.sweepDurableWakes` → `fireSchedulerTick`;
-  `Msg.durable_wake` → `fireDurableWakeActivation` with atomically-committed
-  `_sched/` cleanup deletes), proven by `scripts/durable_wake_smoke_v2.py`
-  (incl. 3-node failover survival). The unification SHIPPED (P5, 2026-06-10):
-  `webhook.send` / `email.send` / `retry.*` deferred fires ride a wake aimed at
-  `__system/webhook_fire`; durable cron is the `cron()` verb over
-  `__system/cron_tick`; the per-feature Zig sweeps (`sweepOwedRetries*`,
-  `CronState` + `sweepCronSubscriptions`) are deleted. See
-  [`durable-wake-plan.md`](../durable-wake-plan.md).
+- ~~**`durable_wake` (gap 2.6) is design-in-code, not wired**~~ — shipped in
+  full 2026-06-10; see "Durable scheduled wake" above. The per-feature Zig
+  sweeps (`sweepOwedRetries*`, `CronState` + `sweepCronSubscriptions`) are
+  deleted.
 - **Streaming inbound body (gap 2.4)** is design-locked (the `onChunk` export, the
   ≤1 MB-fires-once rule) but the h2 chunk-delivery wire-up is pending.
 - ~~**Inbound WebSocket dispatch (piece D)**~~ — shipped 2026-06-09: the worker

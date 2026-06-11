@@ -85,7 +85,7 @@ const ENGINE_MAX_INFLIGHT: usize = 10_000;
 /// customer's `on_chunk` handler fires once and can take action.
 const HELD_MAX_PER_TENANT: u32 = 16;
 
-/// `docs/blob-storage-plan.md` P1: the special origin the `blob.*`
+/// blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`: the special origin the `blob.*`
 /// JS shims target. Never resolved — `startTransfer` rewrites it to
 /// the real S3 endpoint + tenant `app-blobs/` prefix and signs the
 /// request before libcurl sees it. The `.internal` TLD is reserved
@@ -363,7 +363,7 @@ pub const FetchEngine = struct {
 
         const method = parseMethod(pf.method) orelse return error.UnsupportedMethod;
 
-        // `docs/blob-storage-plan.md` P1: the blob.* trusted door.
+        // blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`: the blob.* trusted door.
         // The JS shims fetch `http://rove-blob.internal/{hash}`; the
         // engine rewrites that to the calling tenant's `app-blobs/`
         // key on the real S3 endpoint and SigV4-signs it natively.
@@ -445,7 +445,7 @@ pub const FetchEngine = struct {
         if (ctx.held) self.bumpHeldCount(ctx.pf.tenant_id, 1);
     }
 
-    /// `docs/blob-storage-plan.md` P1: rewrite a `rove-blob.internal`
+    /// blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`: rewrite a `rove-blob.internal`
     /// placeholder URL to the calling tenant's content-addressed key
     /// on the real S3 endpoint and attach SigV4 auth headers.
     ///

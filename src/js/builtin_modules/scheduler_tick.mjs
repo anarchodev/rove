@@ -1,5 +1,5 @@
 // §2.6 durable scheduled wake — the baked `__system/scheduler_tick`
-// module (docs/durable-wake-plan.md P1). Fired by the engine
+// module (durable-wake P1; docs/architecture/effects-and-handlers.md). Fired by the engine
 // (`durable_wake.sweepDurableWakes`) in a tenant's context whenever
 // that tenant's `next_wake_ns` watermark falls due, and once per
 // tenant on leadership gain to reconstruct the watermark.

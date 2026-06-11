@@ -244,7 +244,7 @@ model retired (§6.3). So:
 | Activation | Export | Scope | When it fires |
 |---|---|---|---|
 | inbound HTTP (buffered) | `default` | connection | body ≤ 1 MB; > 1 MB → 413 if no `onChunk` |
-| inbound HTTP, headers-first | `onHeaders` | connection | SHIPPED (blob-storage-plan §3.5): module exports `onHeaders` → every body-carrying request dispatches it with an EMPTY body before any body byte is accepted (the client is flow-control-held at the door). Decide from headers alone: early 4xx terminal, or `blob.receive({to}) + next()` to pipe the body socket→storage with zero chunk activations — `{to}` resumes with `request.ctx = {hash, len}` when the object is durable. Uniform regardless of body timing or size |
+| inbound HTTP, headers-first | `onHeaders` | connection | SHIPPED 2026-06-10 (`architecture/routing-and-ingress.md`): module exports `onHeaders` → every body-carrying request dispatches it with an EMPTY body before any body byte is accepted (the client is flow-control-held at the door). Decide from headers alone: early 4xx terminal, or `blob.receive({to}) + next()` to pipe the body socket→storage with zero chunk activations — `{to}` resumes with `request.ctx = {hash, len}` when the object is durable. Uniform regardless of body timing or size |
 | inbound HTTP chunk | `onChunk` | connection | per chunk (≤ 1 MB → fires once with the whole body) |
 | `on.fetch` result | `onFetchResult` (or `to`) | connection | a connection `on.fetch` returned its whole body |
 | `on.fetch` chunk | `onFetchChunk` (or `to`) | connection | per chunk of a streamed `on.fetch` |
@@ -609,7 +609,8 @@ self-hosters marketplace plan for the consuming side.
 - `architecture/routing-and-ingress.md` — the engine substrate (the one rule,
   coalescing, blob coordinator), unchanged.
 - `architecture/effects-and-handlers.md` — the `detach` mechanism, retired here (§2.6).
-- `durable-wake-plan.md` — gap 2.6, the `schedule`/`cron` substrate.
+- `architecture/effects-and-handlers.md` "Durable scheduled wake" — the
+  `schedule`/`cron` substrate (gap 2.6; decisions in `decisions.md` §3.7).
 - `architecture/routing-and-ingress.md` — inbound streaming body (`onChunk`).
 - `architecture/effects-and-handlers.md` — chunk capture making `onChunk` + the
   stream loop replayable.

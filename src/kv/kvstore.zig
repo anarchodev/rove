@@ -823,7 +823,7 @@ pub const KvStore = struct {
     /// caller frees. Unlike `vacuumInto`/`dumpManifestToFile` (whole-file
     /// kvexp snapshots), a bundle is the minimal shippable form of one
     /// store's committed pairs — what a tenant MOVE ships from the source
-    /// cluster's `cluster.kv` to the destination's (docs/v2-build-order.md
+    /// cluster's `cluster.kv` to the destination's (v2-build-order
     /// §Phase 4). The bundle stamps `self.store_id`, so the destination
     /// reconstructs the same store id (both clusters hash the tenant id to
     /// the same `store_id`). Durabilize first so the snapshot reflects

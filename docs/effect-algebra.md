@@ -96,7 +96,8 @@ retention, not a per-chain cap (`tape-minimization.md` §1) — recorded, not
 recorded *forever*.
 
 The newest member of this family is the **durable scheduled wake**
-(`durable-wake-plan.md`, P0–P4 shipped): a one-shot, absolute-time,
+(shipped in full; `decisions.md` §3.7 + `architecture/effects-and-handlers.md`
+"Durable scheduled wake"): a one-shot, absolute-time,
 at-least-once `durable_wake` Msg whose fire-time is itself a Model key.
 It generalizes the one place L2 reconstruction was hardcoded —
 the webhook sweep of `_send/owed/` (§2.2) — into a primitive, so
@@ -220,7 +221,8 @@ rather than merely obeying them:
   API. (decisions.md §3.3.)
 - **`blob.*` proved the pattern holds under demand.** The blob surface
   was first specced, then deferred for lack of a concrete use case, and
-  shipped 2026-06-10 (`blob-storage-plan.md` P1–P4) as exactly this
+  shipped 2026-06-10 (P1–P4; `decisions.md` §3.8 +
+  `architecture/routing-and-ingress.md`) as exactly this
   composition class: JS shims over the one fetch primitive against a
   signed internal origin, with the §2.5 input/output asymmetry as the
   recovery model. The deferral and its exit condition are the

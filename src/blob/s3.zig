@@ -406,7 +406,7 @@ pub const S3BlobStore = struct {
         };
     }
 
-    // ── Multipart upload (`docs/blob-storage-plan.md` §3.5 slice A) ──
+    // ── Multipart upload (blob-storage-plan §3.5 slice A; `docs/architecture/routing-and-ingress.md`) ──
     //
     // The storage half of `blob.receive`: an unbounded inbound body
     // streams up as ≥5 MiB parts under a TEMP key (the content hash

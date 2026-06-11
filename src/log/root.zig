@@ -113,7 +113,7 @@ pub const ActivationSource = enum(u8) {
     /// dropping `pipe_to` / `on_done`.
     fetch_chunk = 7,
     /// Durable scheduled wake (`docs/primitive-gaps.md` §2.6 +
-    /// `docs/durable-wake-plan.md`). A `scheduler.at(whenNs, target,
+    /// `docs/architecture/effects-and-handlers.md`). A `scheduler.at(whenNs, target,
     /// msg)` entry fell due: the baked `__system/scheduler_tick`
     /// fanned out to `target` via `__rove_fire_wake`, and the target
     /// handler runs with `request.activation = { kind: "durable_wake",
@@ -132,7 +132,7 @@ pub const ActivationSource = enum(u8) {
     /// to the h2 `ws_send_in` collection. Batch-of-1 durability: a
     /// frame costs raft iff its activation commits a non-empty writeset.
     ws_message = 9,
-    /// Headers-first inbound dispatch (`docs/blob-storage-plan.md`
+    /// Headers-first inbound dispatch (`docs/architecture/routing-and-ingress.md`
     /// §3.5, the `blob.receive` transport). The request's HEADERS
     /// frame arrived but body DATA is still inbound; the handler
     /// module exports `onHeaders`, so the activation runs with an

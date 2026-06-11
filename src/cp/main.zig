@@ -577,7 +577,7 @@ const Router = struct {
 
     /// Set a tenant's plan/limits blob: `POST /_control/plan {tenant, plan}`.
     /// `plan` is an opaque string the CP stores verbatim at `plan/{tenant}`
-    /// (the DP parses it into effective limits — `plan-tiers.md`). A directory
+    /// (the DP parses it into effective limits — `docs/architecture/control-plane.md`). A directory
     /// WRITE: leader-gated, so a follower has already forwarded to the leader
     /// by the time we get here.
     fn handlePlan(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
@@ -759,7 +759,7 @@ const Router = struct {
         return null;
     }
 
-    /// Orchestrate a brief-pause tenant move (docs/v2-build-order.md
+    /// Orchestrate a brief-pause tenant move (v2-build-order
     /// §Phase 4): hold the tenant → dump+quiesce on source → ship the
     /// bundle to the destination → attach there → **flip the directory**
     /// (the commit point) → evict the source. On any pre-flip failure the

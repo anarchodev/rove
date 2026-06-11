@@ -148,8 +148,8 @@ signals go to Grafana Cloud (the two-sink split). Mechanics:
 Token bucket per `(instance, action)`, per-plan-configured — the same knob that
 differentiates plan tiers. Shipped v1 narrow scope is `request` + `email`
 (per-worker, in-memory). Plan-tier wiring lands with custom domains (Phase 10);
-the limits live on the CP plan axis (`architecture/control-plane.md`). Plan-tier
-strategy: [plan-tiers.md](plan-tiers.md).
+the limits live on the CP plan axis; enforcement levers + tier model:
+`architecture/control-plane.md` "Operational state" (decisions.md §10.9).
 
 ### 2.11 CLI (v1 scope)
 
@@ -659,10 +659,10 @@ Nobody is offering this combination. The marketing headline is the functional co
 Live status is **not** tracked in this document anymore. The authoritative
 current picture is:
 
-- `docs/v2-cutover-checklist.md` — the V2 dashboard (what's shipped / in-flight /
-  open on branch `v2`).
 - The `architecture/` reference set — each doc's **"Known limitations
-  (as-built)"** section is the per-subsystem status of record.
+  (as-built)"** section is the per-subsystem status of record. (The V2 cutover
+  checklist was retired at the cutover, 2026-06-10; its open items were folded
+  into those sections.)
 
 The original 2026-04-30 phase-by-phase snapshot was removed in the 2026-06 docs
 restructure: it described the retired V1 stack and had been superseded several
@@ -1031,5 +1031,5 @@ Implementation in `src/js/config_mirror.zig`.
 substantially restructured by Phase 5.5 and the V1→V2 cutover (Webhooks/email →
 the `http.fetch` + JS-shim model; the platform SSE pipe → customer `stream(...)`
 handlers; the single `loop46` binary → the five-binary CP/DP split above). When
-reading §3 for *what* a phase delivers, cross-check this section and
-`docs/v2-cutover-checklist.md` for what actually exists today.
+reading §3 for *what* a phase delivers, cross-check this section and the
+`architecture/` reference set for what actually exists today.

@@ -462,13 +462,13 @@ pub const DispatchState = struct {
     /// Instance id for limiter lookup. Empty when the dispatcher
     /// runs without a worker (test paths).
     instance_id: []const u8 = "",
-    /// `docs/blob-storage-plan.md` P1: the node's S3 backend config,
+    /// blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`: the node's S3 backend config,
     /// borrowed from `NodeState.blob_backend_cfg` for the
     /// `_system.blob.presign` binding (the one blob verb that needs
     /// the signing keys natively). Null on test paths without a
     /// node — presign then throws "not configured".
     blob_cfg: ?*const blob_mod.BackendConfig = null,
-    /// `docs/blob-storage-plan.md` P2: blob upload-session
+    /// blob-storage-plan P2; `docs/architecture/routing-and-ingress.md`: blob upload-session
     /// trampolines (worker `blobWriteTrampoline` /
     /// `blobSealTrampoline`). Null where there is no worker —
     /// `blob.write` / `blob.seal` then throw.
@@ -486,7 +486,7 @@ pub const DispatchState = struct {
     blob_session_ctx: ?*anyopaque = null,
     /// Plan-resolved rate caps + plan generation for `instance_id` (from its
     /// `TenantSlot`). The `email.send` rate check sizes its bucket from these
-    /// (docs/plan-tiers.md Lever 1). Defaults = free/default caps on paths
+    /// (docs/architecture/control-plane.md Lever 1). Defaults = free/default caps on paths
     /// with no resolved plan (tests, async activations).
     plan_rate: limiter_mod.RateLimitCaps = .{},
     plan_gen: u64 = 0,
@@ -574,7 +574,7 @@ pub const DispatchState = struct {
     /// activations.
     activation_fetches_pending: u32 = 0,
 
-    /// `docs/blob-storage-plan.md` §3.5: `blob.receive` is only
+    /// blob-storage-plan §3.5; `docs/architecture/routing-and-ingress.md`: `blob.receive` is only
     /// meaningful when the body is still at the door — set iff this
     /// dispatch is an `.inbound_headers` activation.
     allow_blob_receive: bool = false,
@@ -1665,10 +1665,10 @@ pub fn installStatic(ctx: *c.JSContext) void {
     evalSnippet(ctx, "webhook.js", WEBHOOK_JS);
     evalSnippet(ctx, "email.js", EMAIL_JS);
     // blob depends on crypto.sha256 + http (both above) +
-    // _system.blob.presign (`docs/blob-storage-plan.md` P1).
+    // _system.blob.presign (blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`).
     evalSnippet(ctx, "blob.js", BLOB_JS);
     // segments composes kv + blob + TextDecoder (all above) — pure
-    // JS, no natives of its own (`docs/blob-storage-plan.md` §6).
+    // JS, no natives of its own (blob-storage-plan §6; `docs/architecture/routing-and-ingress.md`).
     evalSnippet(ctx, "segments.js", SEGMENTS_JS);
     // users is standalone (kv + crypto.{randomBytes,sha256}).
     evalSnippet(ctx, "users.js", USERS_JS);
@@ -1805,16 +1805,16 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         .{ .name = "subscribe",          .cfunc = http_b.jsHttpSubscribe,          .argc = 1 },
         .{ .name = "cancelSubscription", .cfunc = http_b.jsHttpCancelSubscription, .argc = 1 },
     } },
-    // `docs/blob-storage-plan.md` P1: tenant blob storage. Only
+    // blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`: tenant blob storage. Only
     // `presign` is native (needs the platform-held signing keys);
     // `blob.put` / `blob.get` are JS compositions in globals/blob.js
     // over the fetch engine's `rove-blob.internal` trusted door.
     .{ .path = &.{ "_system", "blob" }, .fns = &.{
         .{ .name = "presign", .cfunc = blob_b.jsBlobPresign, .argc = 3 },
-        // P2 upload sessions (`docs/blob-storage-plan.md` §3.4).
+        // P2 upload sessions (blob-storage-plan §3.4; `docs/architecture/routing-and-ingress.md`).
         .{ .name = "write",   .cfunc = blob_b.jsBlobWrite,   .argc = 1 },
         .{ .name = "seal",    .cfunc = blob_b.jsBlobSeal,    .argc = 2 },
-        // P3 `blob.receive` (`docs/blob-storage-plan.md` §3.5):
+        // P3 `blob.receive` (blob-storage-plan §3.5; `docs/architecture/routing-and-ingress.md`):
         // headers-first inbound pipe — only callable from an
         // `onHeaders` activation.
         .{ .name = "receive", .cfunc = blob_b.jsBlobReceive, .argc = 1 },
@@ -1888,7 +1888,7 @@ const GLOBAL_BUILTINS = [_]FnBinding{
     // bypass the `_harden.js` deletion via the `builtin_exceptions`
     // list in the globals-lint allowlist.
     .{ .name = "__rove_resume_if_bound", .cfunc = cont_b.jsContinuationResumeIfBound, .argc = 2 },
-    // §2.6 durable scheduled wake (docs/durable-wake-plan.md P0).
+    // §2.6 durable scheduled wake (durable-wake P0; docs/architecture/effects-and-handlers.md).
     // Capability-scoped (throw unless is_system_module) so only the
     // baked `__system/scheduler_tick` reaches them — that scoping
     // closes the clobber footgun. Persistent globals like the others

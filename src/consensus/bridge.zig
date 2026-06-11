@@ -1,6 +1,6 @@
 //! V2 data-plane bridge — the worker-facing seam over the per-tenant pump.
 //!
-//! docs/v2-build-order.md §Phase 2: swap the V1 *cluster-wide* raft
+//! v2-build-order §Phase 2: swap the V1 *cluster-wide* raft
 //! propose/apply at the worker-dispatch seam for "propose to *this
 //! tenant's* group → await commit → apply." The bridge is what the
 //! reused rove-js worker talks to in place of V1's single global
@@ -94,7 +94,7 @@ pub const Error = error{
     ShuttingDown,
     /// A `propose` arrived for a tenant the move orchestration has
     /// quiesced (`quiesce`) — its writes are held while its bundle ships
-    /// to the destination cluster (docs/v2-build-order.md §Phase 4).
+    /// to the destination cluster (v2-build-order §Phase 4).
     Quiesced,
     /// A control command (`createGroupEpoch` / `destroyGroup`) could not
     /// be serviced because the pump thread is not running.
@@ -621,7 +621,7 @@ pub const Bridge = struct {
     /// the caller can wait for `committedSeq(gid) >= that` to know the
     /// in-flight writes have drained to `applied == committed`. The bundle
     /// snapshot is then a consistent point. Idempotent. `Error.UnknownTenant`
-    /// if the gid is unregistered. (docs/v2-build-order.md §Phase 4 quiesce.)
+    /// if the gid is unregistered. (v2-build-order §Phase 4 quiesce.)
     pub fn quiesce(self: *Bridge, gid: u64) Error!u64 {
         self.mutex.lock();
         defer self.mutex.unlock();

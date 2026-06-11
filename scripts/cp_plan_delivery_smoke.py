@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """CP→DP plan delivery smoke (gap #1, step 2; docs/v2-cp-operational-state.md
-"Delivery to the DP", docs/plan-tiers.md).
+"Delivery to the DP", docs/architecture/control-plane.md).
 
 Step 1 proved the CP stores + serves the opaque plan blob. This proves the DP
 LEARNS its plan over the two channels the design names — and resolves the blob

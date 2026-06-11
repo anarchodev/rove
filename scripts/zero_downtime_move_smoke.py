@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """V2 Phase-7 slice (c) smoke — zero-downtime move (project_v2_zero_downtime_move
-memory; docs/v2-build-order.md §Phase 7).
+memory; v2-build-order §Phase 7).
 
 Proves the cutover keeps the source serving (no quiesce) and loses no write:
 

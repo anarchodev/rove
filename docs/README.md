@@ -54,22 +54,20 @@ The maintained set. Subsystem-owned, kept current with the code.
 ## In-flight plans
 
 Active work on the current (V2) line. Each folds into `architecture/` on ship.
+(Folded + deleted 2026-06-10, all shipped: `v2-build-order`,
+`v2-cutover-checklist`, `durable-wake-plan`, `blob-storage-plan`,
+`plan-tiers` — they survive in git history.)
 
-- [v2-build-order.md](v2-build-order.md) — Phase sequencing (Phase 7 in progress)
-- [v2-cutover-checklist.md](v2-cutover-checklist.md) — living V1-deletion parity audit
 - [v2-production-deploy-plan.md](v2-production-deploy-plan.md) — first production topology (not yet built)
-- [durable-wake-plan.md](durable-wake-plan.md) — scheduler primitive (gap #6; SHIPPED in full — P0–P7)
 - [websocket-plan.md](websocket-plan.md) — inbound WS (single-node baseline shipped 2026-06-09: transport + worker seam + smoke; remaining: broadcast recipe docs, outbound WS)
-- [blob-storage-plan.md](blob-storage-plan.md) — customer `blob.*` surface (P1–P4 shipped 2026-06-10: `blob.write`/`seal`/`receive` + `segments.js`)
 - [tape-minimization.md](tape-minimization.md) — the minimal replay tape (4 record kinds) + tape-by-reference design
-- [plan-tiers.md](plan-tiers.md) — per-tenant tier enforcement
 - [builtin-libs-docs-plan.md](builtin-libs-docs-plan.md) — `_system.*` + JS shim docs
 - [replay-wasm-plan.md](replay-wasm-plan.md) — WASM replay UI (§8.6+ deferred)
 - [sim-test-framework.md](sim-test-framework.md) · [fixture-lifecycle.md](fixture-lifecycle.md) · [agent-surface.md](agent-surface.md) — replay/sim/agent surface (Phase 12–14)
 
 ## Product & strategy
 
-- [pricing-model.md](pricing-model.md) · [plan-tiers.md](plan-tiers.md) — pricing + tiers
+- [pricing-model.md](pricing-model.md) — pricing model (tier *enforcement* shipped — `architecture/control-plane.md` "Operational state")
 - [platform-accounts-model.md](platform-accounts-model.md) — accounts/orgs/users (product layer, not the engine)
 - [dashboard-design-brief.md](dashboard-design-brief.md) — dashboard/replay UI brief
 - [users-lib-plan.md](users-lib-plan.md) — B2C passwordless auth library

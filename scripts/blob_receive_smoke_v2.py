@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""`blob.receive` end-to-end (docs/blob-storage-plan.md §3.5, P3 slice B).
+"""`blob.receive` end-to-end (blob-storage-plan §3.5; docs/architecture/routing-and-ingress.md, P3 slice B).
 
 The Case-B inbound pipe: a module exporting `onHeaders` dispatches
 from headers alone (body still at the door, h2 window held);

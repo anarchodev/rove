@@ -7,7 +7,7 @@
 //! multi-envelope wrapper; types 2+ are application-defined.
 //!
 //! Extracted out of `cluster.zig` (the V1 willemt-raft spine) into this
-//! standalone, dependency-free file (docs/v2-build-order.md §Phase 2) so
+//! standalone, dependency-free file (v2-build-order §Phase 2) so
 //! the codec has a **spine-free home** that both V1 and the V2 facade can
 //! share: `cluster.zig` re-exports it (V1 unchanged), and `kvlimbs.zig`
 //! re-exports it so the rove-js worker (`apply.zig`) and `files-server`

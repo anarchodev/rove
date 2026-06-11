@@ -12,7 +12,7 @@
 //! iteration can periodically sync buckets via root.db.
 //!
 //! Per-tenant plan tiers: `check`/`checkN` take the tenant's plan-resolved
-//! `RateLimitCaps` + `plan_gen` (from its `TenantSlot`, docs/plan-tiers.md
+//! `RateLimitCaps` + `plan_gen` (from its `TenantSlot`, docs/architecture/control-plane.md
 //! Lever 1). A bucket snapshots its caps at creation, so when the generation
 //! moves (a tier change) `getOrCreate` re-inits the caps. Callers without a
 //! resolved plan (test paths, async activations that never ran a request-rate
@@ -43,7 +43,7 @@ const ACTION_COUNT: usize = std.meta.fields(Action).len;
 /// Re-exported from `rove-plan` (the leaf module that owns the tier table) so
 /// the limiter's existing callers keep using `limiter.RateLimitCaps`, while the
 /// definition lives in one place reachable from both the worker and the
-/// log-query surface (docs/plan-tiers.md).
+/// log-query surface (docs/architecture/control-plane.md).
 pub const RateLimitCaps = plan_mod.RateLimitCaps;
 
 pub const TokenBucket = struct {
@@ -107,7 +107,7 @@ const InstanceBuckets = struct {
     /// Plan generation the caps were snapshotted at (the tenant's
     /// `TenantSlot.plan_gen` at creation). A bucket snapshots its caps once,
     /// so a tier change only takes effect when `getOrCreate` notices the
-    /// generation moved and re-inits (docs/plan-tiers.md Lever 1
+    /// generation moved and re-inits (docs/architecture/control-plane.md Lever 1
     /// generation-refresh). 0 = the default-caps generation.
     gen: u64,
 
@@ -216,7 +216,7 @@ pub const RateLimiter = struct {
             // The tenant's plan changed (generation moved): re-snapshot the
             // caps. Reset tokens to full — simpler than rescaling, and harmless
             // (a tenant whose tier just changed starts fresh at the new burst).
-            // docs/plan-tiers.md Lever 1 "generation-refresh."
+            // docs/architecture/control-plane.md Lever 1 "generation-refresh."
             gop.value_ptr.* = InstanceBuckets.init(caps, now_ns, gen);
         }
         return gop.value_ptr;

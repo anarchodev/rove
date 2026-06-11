@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""headers_first classic fallback (docs/blob-storage-plan.md §3.5.1).
+"""headers_first classic fallback (blob-storage-plan §3.5.1; docs/architecture/routing-and-ingress.md).
 
 Every h2 body-carrying request now flows HEADERS-frame-early through
 `request_receiving` → the worker's disposition point. For modules

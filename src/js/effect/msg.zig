@@ -185,7 +185,7 @@ pub const SubscriptionFire = struct {
 pub const FetchChunk = components_mod.UpstreamFetchEvent;
 
 /// Durable scheduled-wake activation (`docs/primitive-gaps.md` §2.6 +
-/// `docs/durable-wake-plan.md`). Produced by the baked
+/// `docs/architecture/effects-and-handlers.md`). Produced by the baked
 /// `__system/scheduler_tick`'s `__rove_fire_wake` fan-out: one of
 /// these per due `_sched/by_time` entry, enqueued for the entry's
 /// owning tenant. The dispatch path (`fireDurableWakeActivation`)

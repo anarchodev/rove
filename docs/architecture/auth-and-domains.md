@@ -16,8 +16,9 @@ every issuer/redirect/route is derived from `request.host`. The OpenID Connect
 identity provider is the `__auth__` system tenant running the *same* `oidc.js`
 library customers use; RS256 signing is a hybrid (keys generated and signed in
 Zig/OpenSSL, opaque bytes in JS). Custom-domain certs are issued in-tree by a
-leader-pinned ACME HTTP-01 responder and replicated to every node through an
-envelope-2 raft write, so any node can terminate TLS for any host.
+leader-elected ACME HTTP-01 issuer on the control plane and replicated through
+the CP directory's `cert/{host}` axis, so any front door can terminate TLS for
+any host.
 
 ## Code map
 
@@ -27,7 +28,7 @@ envelope-2 raft write, so any node can terminate TLS for any host.
 | `src/acme/crypto.zig` | ACME EC P-256 keygen, JWK + RFC 7638 thumbprint, PEM I/O (OpenSSL). |
 | `src/acme/client.zig` | RFC 8555 state machine (newAccount/newOrder/authz/finalize) over libcurl, with nonce retry. |
 | `src/acme/responder.zig` | The `:80` HTTP/1.1 challenge responder (token → key-auth), isolated from the h2 stack. |
-| `src/cp/acme.zig` | Leader-gated issuance; `cert/{host}` envelope-2 write; per-node cert materializer. |
+| `src/cp/acme.zig` | Leader-gated issuer thread on `rewind-cp`; `directory.setCert` writes the `cert/{host}` CP-directory axis. |
 | `src/h2/tls.zig` | SNI `host_store` + per-host `SSL_CTX`, `reloadCustomCerts` mtime poll, optional mTLS. |
 | `src/js/bindings/crypto.zig` | RSA keygen + `crypto.oidcSign(priv_pem, signing_input)` + JWK export (the hybrid seam). |
 | `src/js/globals/oidc.js` | `oidc.provider(config)` (IdP) + `oidc.rp(config)` (relying-party helper). |
@@ -67,14 +68,28 @@ last-write-wins + sign-only-`current`, not a `_processed` marker.
   **custom** FQDNs (HTTP-01, in-tree). `--public-suffix` and `--system-suffix`
   are required CLI flags (must differ) — the only place a domain enters config,
   and it seeds explicit `domain/{host}` entries for the system tenants at boot.
-- **HTTP-01 issuance**: the `:80` responder (leader-pinned, in-memory token →
-  key-auth) answers `/.well-known/acme-challenge/*`; `client.zig` drives the RFC
-  8555 order with one long-lived EC account key under `{data_dir}/acme/`.
-- **Cert replication**: an issued `{cert, key}` is written to `cert/{host}` via
-  **envelope 2 (`root_writeset`)** on `__root__.db`; every node's materializer
-  applies it and writes the PEM into the cert dir within ~1 s, so `reloadCustomCerts`
-  (routing-and-ingress) picks it up. **Leader issues; every node serves.** Proven
-  against Pebble.
+- **HTTP-01 issuance**: a **leader-elected issuer thread** on `rewind-cp`
+  (`src/cp/acme.zig`; `client.zig` drives the RFC 8555 order with one
+  long-lived EC account key under `{data_dir}/acme/`). Each tick the directory
+  leader computes the work-list (`collectUncertedHosts` — mapped hosts lacking
+  `cert/{host}`, filtered by the public/system suffixes), runs the client, and
+  writes `directory.setCert`. The challenge is served by `rewind-front`'s `:80`
+  listener forwarding to the CP's `GET /_cp/acme-challenge?token=` (the
+  issuer's in-memory challenge store). Inert unless `REWIND_ACME_DIRECTORY` is
+  set. Two deadlock guards: the blocking `issue()` runs off the request loop
+  (else it self-deadlocks the validation it depends on), and `setCert` proposes
+  through the mutex-guarded bridge whose pump advances on its own thread.
+- **Cert state & replication**: `cert/{host}` is an axis in the CP
+  `__directory__` group (placement-independent), written via
+  `directory.setCert` / `POST /_control/cert`, read via `GET /_cp/cert(s)` —
+  this **replaced V1's per-cluster envelope-2 `__root__.db` path**. The front
+  door's `CertSync` pulls issued certs into SNI (`putHostCertInMemory`).
+  **The CP leader issues; every front serves.** Proven end-to-end against
+  Pebble: `scripts/cp_acme_issue_smoke.py` (issue → cert axis → replicate →
+  CertSync → the front serves the issued cert by SNI); the cert axis and edge
+  TLS also by `cp_cert_smoke` / `cp_tls_edge_smoke`.
+- **DNS-01 for customer custom-domain wildcards is deferred**
+  (provider-specific); wildcards via manual `POST /_control/cert` for now.
 - **mTLS** (`--require-client-cert-ca`) plumbs verification into every per-host
   `SSL_CTX` (operator-level in v1).
 
@@ -103,9 +118,9 @@ hard-coded domain in this path as a bug.
 
 ## Known limitations (as-built)
 
-- **ACME renewal / expiry-driven reissue is the sole tracked follow-up** — v1
-  issues a cert only when `cert/{host}` is absent; timer-driven renewal and
-  leader-elected issuer coordination are not built.
+- **ACME renewal / expiry-driven reissue is the sole tracked follow-up** — the
+  issuer only fires when `cert/{host}` is absent; timer-driven renewal is not
+  built.
 - **Third-party-RP `id_token` signature verification** (`oauth.verifyIdToken`) —
   the chain exists in `oidc.rp` but isn't exposed.
 - **Per-host / per-tenant mTLS CA** is deferred (operator-level only in v1).

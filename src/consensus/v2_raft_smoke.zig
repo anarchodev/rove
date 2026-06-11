@@ -1,4 +1,4 @@
-//! V2 Phase-0 exit test (docs/v2-build-order.md): prove the fetched
+//! V2 Phase-0 exit test (v2-build-order): prove the fetched
 //! raft-rs-zig substrate is callable from inside rove — create a Manager,
 //! stand up a single-voter group, and drive it to leader. This is the
 //! build-integration milestone (cargo → link → FFI works end to end); the

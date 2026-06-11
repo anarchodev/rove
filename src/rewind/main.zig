@@ -1,4 +1,4 @@
-//! rewind — the V2 single-node worker binary (docs/v2-build-order.md
+//! rewind — the V2 single-node worker binary (v2-build-order
 //! §Phase 2 "a v2 worker binary"). Named for the product (rewind.js) that
 //! V2 is the engine for; it is the V2 counterpart of V1's `loop46`.
 //!

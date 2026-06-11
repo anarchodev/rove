@@ -1,4 +1,4 @@
-// `docs/blob-storage-plan.md` §6: segments.seal's on_result — the
+// blob-storage-plan §6; `docs/architecture/routing-and-ingress.md`: segments.seal's on_result — the
 // SWAP half of the seal. The shim serialized the hot rows and fired
 // a durable blob.put; this module runs when that PUT settled and,
 // only on success, performs the pointer swap in ONE atomic writeset:

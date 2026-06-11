@@ -1,10 +1,10 @@
 # Pricing model — what to sell and why
 
 > **Status**: Design proposal, 2026-06-02. Captures the economic model
-> behind the tiers; the *enforcement* mechanism is `docs/plan-tiers.md`
+> behind the tiers; the *enforcement* mechanism is the plan-tiers enforcement (`architecture/control-plane.md` "Operational state")
 > (tier plumbing + per-lever wire-up). This doc is the "what to charge
 > for and why" that sits upstream of that one. It **revises** the
-> retention lever of `plan-tiers.md` (§Lever 3) from a time-window clamp
+> retention lever of the plan-tiers enforcement (`architecture/control-plane.md`) (§Lever 3) from a time-window clamp
 > to a capacity ring with a derived time floor — see §6 for the
 > reconciliation. Nothing here is built; the load-bearing unmeasured
 > assumption is the per-record deflate ratio (§7).
@@ -23,7 +23,7 @@ usually goes wrong:
   open.
 
 We sell **two billing axes** and back them with **one new guardrail**
-(plus the rate/body levers already specced in `plan-tiers.md`):
+(plus the rate/body levers already specced in the plan-tiers enforcement (`architecture/control-plane.md`)):
 
 | | What | Role | Scarcity |
 |---|---|---|---|
@@ -281,9 +281,9 @@ Surface the *derived* floor in the live-horizon UI: "500 GB at 64 KB/s
 real commitment, light sites still win, costs nothing beyond the
 capacity already sold.
 
-### Reconciliation with `plan-tiers.md`
+### Reconciliation with the plan-tiers enforcement
 
-`plan-tiers.md` is the enforcement/build-plan doc; this is the model it
+The plan-tiers enforcement (folded into `architecture/control-plane.md`; decisions.md §10.9) is the shipped mechanism; this is the model it
 enforces. Mapping:
 
 - **Lever 1 (request rate)** → augmented. Keep the limiter, but the
@@ -293,7 +293,7 @@ enforces. Mapping:
 - **Lever 2 (max body size)** → unchanged and complementary. Per-request
   413 gate bounds single-shot overshoot; the §5 bucket bounds sustained
   rate.
-- **Lever 3 (tape retention)** → **revised.** plan-tiers.md fakes
+- **Lever 3 (tape retention)** → **revised.** the shipped Lever 3 fakes
   retention as a read-path *time clamp* (return only the last N days,
   no GC). This doc replaces that with a **capacity ring + derived time
   floor**. The read-path clamp is fine as a launch stopgap (instant,
@@ -301,7 +301,7 @@ enforces. Mapping:
   *days*, and the real eviction is the per-tenant compactor of §3.2.
   When that compactor ships, the time-clamp retires.
 
-New control-plane state (beyond plan-tiers.md's `plan/{id}`): the ring
+New control-plane state (beyond the plan axis `plan/{tenant}`): the ring
 needs per-tenant resident-log-bytes accounting and the eviction
 watermark. KV-size and log-bytes are both readable at the snapshot /
 flush seams, so neither adds hot-path work.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V2 Phase-4 exit smoke ⭐ THE MILESTONE (docs/v2-build-order.md §Phase 4,
+"""V2 Phase-4 exit smoke ⭐ THE MILESTONE (v2-build-order §Phase 4,
 docs/v2-phase4-tenant-move.md).
 
 Moves a live tenant from one single-node cluster to another with a brief

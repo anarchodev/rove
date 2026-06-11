@@ -1,6 +1,6 @@
 //! V2 data-plane core — the per-tenant pump (single node).
 //!
-//! docs/v2-build-order.md §Phase 1: "the heart of the rewrite." A
+//! v2-build-order §Phase 1: "the heart of the rewrite." A
 //! `Node` owns one `SharedWal` + one raft-rs `Manager`, and a pump that
 //! drives the active set of per-tenant raft groups:
 //!
@@ -183,7 +183,7 @@ pub const ApplyObserver = struct {
     func: *const fn (ctx: *anyopaque, group_id: u64, id_str: []const u8, key: []const u8, value: []const u8) void,
 };
 
-/// How committed entries apply to the tenant store (docs/v2-build-order.md
+/// How committed entries apply to the tenant store (v2-build-order
 /// §Phase 2 leader-skip + the speculative overlay).
 pub const ApplyMode = enum {
     /// Decode a committed writeset and write it to the tenant's kvexp
@@ -576,7 +576,7 @@ pub const Node = struct {
     }
 
     /// Attach a tenant group at an explicit migration fence `epoch` (the
-    /// Phase-4 move-destination path; docs/v2-build-order.md §Phase 4
+    /// Phase-4 move-destination path; v2-build-order §Phase 4
     /// "createGroupEpoch(tenant, epoch+1) on destination"). The tenant's
     /// kvexp state must already have been loaded (the bundle landed in the
     /// worker's `cluster.kv` store); this just stands up the consensus
@@ -819,7 +819,7 @@ pub const Node = struct {
     }
 
     /// Tear down a tenant's raft group and reclaim its WAL segments (the
-    /// Phase-4 move-source cleanup; docs/v2-build-order.md §Phase 4
+    /// Phase-4 move-source cleanup; v2-build-order §Phase 4
     /// "destroyGroup + noteGroupDestroyed on source"). `destroyGroup`
     /// frees the group's `GroupedFileStorage` (and tombstones the id so a
     /// stray later create is rejected); `noteGroupDestroyed` lets the

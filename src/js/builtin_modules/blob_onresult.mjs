@@ -1,4 +1,4 @@
-// `docs/blob-storage-plan.md` P1: blob.put's on_chunk handler. The
+// blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`: blob.put's on_chunk handler. The
 // shim wrote a durable `_blob/owed/{hash}` marker (riding the
 // handler's writeset, envelope-0 atomic) and fired the signed PUT
 // through the fetch engine's rove-blob.internal door; this module

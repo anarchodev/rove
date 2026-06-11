@@ -85,6 +85,23 @@ A failure **before** step 4 → `abortMove` + `v2-resume` (a no-op move). **Afte
 step 4 it is durable. The destination is born at the migration epoch, which
 fences stale messages to the old location. Blobs never move (shared backend).
 
+## Tenant provisioning (new tenant, no move)
+
+`POST /_control/provision {tenant, cluster, host?}` (`handleProvision`,
+move-secret gated + CP-leader-forwarded) stands up a brand-new tenant in one
+call: an **empty-attach** (`attachToAll(nodes, "", …)` — the move's attach step
+minus the bundle) to every node of `cluster` forms the raft group across the
+whole cluster and `ensureInstance`s the blank per-tenant store; await the
+group's election; then `directory.assign` writes the placement (the routable
+commit point) + optional `setHost`. Create-only (409 if already placed —
+relocate via `/_control/move`); a formation failure evicts the half-formed
+groups, so a failed provision is a no-op. No root/instance marker write is
+needed — the CP directory (placement + host axis) plus the empty instance is
+exactly the state a move-in destination ends with. Proven on a real 3-node
+cluster: `scripts/cp_provision_smoke.py` (provision → group forms on all 3
+nodes → a write commits + replicates everywhere → the front routes the host →
+re-provision 409 / unknown-cluster 400).
+
 ## Operational state (plan / limits)
 
 - **Lives in the CP directory** (`plan/{tenant}`), a sibling axis to placement —
@@ -94,10 +111,36 @@ fences stale messages to the old location. Blobs never move (shared backend).
   writes plans via the CP's capability-gated `/_control/plan`; accounts/orgs/
   billing are product-layer, above the CP (see
   [`platform-accounts-model.md`](../platform-accounts-model.md)).
-- **Delivery**: a plan rides the `v2-attach` handshake at cold-start/move; a live
-  tier change is a single-target push to the tenant's current cluster (a plan-
-  generation bump). Enforcement is DP-local; the front door enforces body-size at
-  the edge from its cached read.
+- **Delivery**: a plan rides the `v2-attach` handshake at cold-start/move
+  (`X-Rewind-Plan`); a live tier change is a single-target push to the tenant's
+  current cluster (`POST /_system/v2-plan`, a plan-generation bump). Proven by
+  `scripts/cp_plan_smoke.py` + `cp_plan_delivery_smoke.py`.
+- **The tier model**: a tenant's plan is `{tier, overrides}` stored verbatim
+  (dumb CP); the effective value of any limit is
+  `override ?? TIER_TABLE[tier].field`, resolved at **read-time** — changing
+  what "Pro" means never touches customer records, and per-field overrides
+  cover enterprise custom deals without schema churn. The tier table is a
+  comptime table in the shared **`rove-plan`** leaf (`src/plan/root.zig`,
+  hoisted so the worker and the log-server import one table without a cycle).
+  The resolved `PlanLimits` is cached on the tenant's `TenantSlot` with a
+  **plan generation** counter, so dispatch reads a field, never a store (the
+  no-`O(N_tenants)`-on-dispatch invariant).
+- **Enforcement (DP-local, three levers, all off `slot.effectivePlan()`)**:
+  - **Lever 1 — rate** (`src/js/limiter.zig`): per-`(instance, action)` token buckets
+    sourced per-instance from the cached tier; **generation-refresh** re-inits
+    a stale bucket's caps at `getOrCreate`, so a paying customer's raise lands
+    instantly, no restart. Per-worker `N×` overshoot explicitly accepted at
+    launch scale. The `email` action gives email-rate differentiation free.
+  - **Lever 2 — body size**: an incremental `413` gate in the body path — fails when the
+    accumulated length crosses `max_body_bytes`, and up front from a declared
+    `content-length`; read fresh per request, so tier changes are immediate.
+  - **Lever 3 — retention**: a **server-side read-path clamp** — the log/tape list +
+    query surface returns only the last `retention_days` (`rove-log-server`
+    resolves the plan from `{cp_url}/_cp/plan`, cached, and clamps
+    list/show/count). Tapes persist on S3 unbounded; upgrade *reveals*,
+    downgrade *hides, never deletes*. The clamp is a **billing boundary, not a
+    UI nicety** — it must hold server-side, or a direct query bypasses it.
+    Real compacting GC is deferred until the storage cost matters.
 
 ## Zero-downtime move (Phase 7)
 
@@ -113,10 +156,13 @@ The Phase-4 brief-pause move (above) is shipped and proven
   clobbering a forwarded write); because forwarding is synchronous it has every
   acked write, so the flip loses nothing. `handleMoveLive` orchestrates this.
 
-The mechanism is in place; **live re-fencing under continuous load with zero
-failed requests, and per-tenant move concurrency, are the remaining work** (a
-write in flight at the instant of a leader change is still faulted + retried, not
-lost — decisions.md §10.5).
+Proven under load: `scripts/zero_downtime_load_smoke.py` moves a tenant under
+**continuous load** (a CP-following concurrent writer) with zero failed
+requests and zero lost writes; `multi_dest_forward_smoke.py` proves the
+`_move/forward` marker's full dest-node list (leader-first CSV) re-aims the
+dual-write past a 421 when the destination leader changes mid-overlap. A write
+in flight at the instant of a leader change is still faulted + retried, not
+lost (decisions.md §10.5).
 
 ## Known limitations (as-built)
 
@@ -124,5 +170,10 @@ lost — decisions.md §10.5).
   per-tenant moves are deferred.
 - **DP-side directory cache** (Slice 3) is optional and not built — the per-miss
   CP query is sufficient today.
-- **ACME issuer coordination** (leader-elected issuance + renewal) is the tracked
-  follow-up in `auth-and-domains.md`.
+- **ACME renewal** (timer-driven, expiry-aware reissue) is the tracked follow-up
+  in `auth-and-domains.md` (leader-elected issuance itself is shipped).
+- **Plan-enforcement test follow-ups** (non-blocking; the deployed-handler e2e
+  and 429 halves are closed by `scripts/v2_handler_smoke.py` +
+  `rate_limit_smoke_v2.py`): a `413` body-gate e2e smoke, and wiring the smoke
+  topology's log-server `cp_url` so the retention clamp is exercised
+  end-to-end.

@@ -133,7 +133,7 @@ pub const WsMessage = struct {
 /// both `__rove_next` resumes (§6.4) and the plain on_result callback.
 pub const Activation = union(enum) {
     inbound,
-    /// Headers-first inbound (`docs/blob-storage-plan.md` §3.5): the
+    /// Headers-first inbound (blob-storage-plan §3.5; `docs/architecture/routing-and-ingress.md`): the
     /// body is still inbound; the handler's `onHeaders` export runs
     /// with an empty body to decide the disposition.
     inbound_headers,
@@ -198,7 +198,7 @@ pub const Activation = union(enum) {
 
 /// Rate-limit / plan inputs, threaded to `DispatchState` so both the
 /// request-rate check and the `email.send` rate check size their buckets
-/// from the tenant's plan (docs/plan-tiers.md Lever 1). Defaults = the
+/// from the tenant's plan (docs/architecture/control-plane.md Lever 1). Defaults = the
 /// free/default caps for paths with no resolved plan (tests, internal
 /// callback dispatch).
 pub const PlanLimits = struct {
@@ -209,7 +209,7 @@ pub const PlanLimits = struct {
     instance_id: []const u8 = "",
     plan_rate: limiter_mod.RateLimitCaps = .{},
     plan_gen: u64 = 0,
-    /// `docs/blob-storage-plan.md` P1: the node's S3 backend config
+    /// blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`: the node's S3 backend config
     /// for `_system.blob.presign` (borrowed from
     /// `NodeState.blob_backend_cfg`). Null outside a worker context —
     /// presign throws "not configured".
@@ -278,7 +278,7 @@ pub const Trampolines = struct {
     set_wake_ctx: ?*anyopaque = null,
     fire_wake: ?*const fn (ctx: *anyopaque, input: globals.FireWakeInput) bool = null,
     fire_wake_ctx: ?*anyopaque = null,
-    /// `docs/blob-storage-plan.md` P2: blob upload sessions.
+    /// blob-storage-plan P2; `docs/architecture/routing-and-ingress.md`: blob upload sessions.
     /// `blob_write` appends to (creating on first write) the chain's
     /// session; `blob_seal` finalizes it and hands back hash + bytes
     /// for the binding's seal-PUT PendingFetch. Wired to the worker's
