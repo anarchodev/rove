@@ -98,8 +98,10 @@ Legend: **Reuse** = imports unchanged · **New** = write on the v2 branch ·
   under `vendor/` and `cargo vendor` its Rust dependency tree (rove's
   offline-build mandate — raft-rs-zig currently fetches from crates.io).
   `build.zig`: a cargo step + a `raft_rs_zig` module/artifact, gated
-  behind v2-only build steps (`zig build loop46-v2`, `v2-test`) so the
-  default `zig build` and V1 contributors are untouched.
+  behind v2-only build steps (`zig build loop46-v2` — shipped as `js-v2` —
+  and `v2-test`) so the default `zig build` and V1 contributors were
+  untouched. (The vendoring plan here was itself superseded by pin-and-fetch;
+  see the doc's later sections.)
 - **Reuse:** the existing `rust-ffi-smoke` example is the literal wiring
   template (it already proves `cargo build` → `linkSystemLibrary` end to
   end on main, with the exact system-lib list). `vendor/kvexp` already in

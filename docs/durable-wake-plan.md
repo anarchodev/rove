@@ -131,7 +131,7 @@ Where the P0–P4 code lives:
   `DispatchState`; `fireWakeTrampoline` on the worker.
 - Sweep + promotion + P2 bootstrap: `src/js/durable_wake.zig`
   (`sweepDurableWakes`, `sweepDurableWakesOnPromotion`,
-  `noteCommittedSchedWrites`), wired in `src/loop46/main.zig` and the
+  `noteCommittedSchedWrites`), wired in `src/rewind/main.zig` and the
   `worker_drain.zig` commit arm.
 - Fire paths: `fireSchedulerTick` + `fireDurableWakeActivation` +
   the `.durable_wake` drain arm in `src/js/worker_streaming.zig`.

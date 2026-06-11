@@ -2,6 +2,14 @@
 
 Implements [`docs/PLAN.md`](PLAN.md) §10.10.
 
+> **CLI naming/host updated 2026-06-10.** Per `decisions.md` §8.3 the CLI +
+> MCP server ship as one npm package (**`rewind`** / `rewind-mcp`, Node over
+> arenajs-WASM), and the V1 `loop46` binary is retired. Verbs here are
+> spelled `rewind <verb>`; the `src/loop46/*` / `src/files_cli/*`
+> implementation pointers (and the `LOOP46_*` env-var spellings, which are
+> still the live names in code) are V1-era detail — the surface (doctor,
+> scoped tokens, `--json` audit, skill file) stands.
+
 **Scope**: make rewind.js a first-class target for AI agents (Claude Code, Codex, Cursor, future runtimes) without building an MCP protocol server in v1. The local-agent path is fully served by:
 
 1. A skill file teaching the workflow.
@@ -14,11 +22,11 @@ Implements [`docs/PLAN.md`](PLAN.md) §10.10.
 
 ## What already exists (after Phase 12 + 13)
 
-- **CLI subcommands** from earlier phases: `loop46 worker`, `loop46 dev`, `loop46 deploy`, `loop46 logs` (existing); `loop46 simulate`, `loop46 test`, `loop46 export-fixture` (Phase 12); `loop46 kv`, `loop46 fixture` (Phase 13).
+- **CLI subcommands** from earlier phases: the operator-side `worker` / `dev` verbs (V1 `loop46`; the V2 operator binaries are `rewind`/`rewind-cp`/`rewind-front`), `rewind deploy`, `rewind logs`; `rewind simulate`, `rewind test`, `rewind export-fixture` (Phase 12); `rewind kv`, `rewind fixture` (Phase 13).
 - **Bearer-token auth** via `Authorization: Bearer <hex>` and session cookies (`src/tenant/root.zig:584-794`).
 - **No skill file** — greenfield.
 - **No scoped tokens** — only root tokens and sessions exist.
-- **No `loop46 doctor`** — agents currently have no quick env-readiness check.
+- **No `rewind doctor`** — agents currently have no quick env-readiness check.
 - **No `--json` flag audit** — some subcommands have it, others don't.
 
 ## T1–T5 ordered
@@ -36,16 +44,16 @@ Define a standard envelope:
 }
 ```
 
-Subcommands that natively emit lists (e.g., `loop46 logs`, `loop46 fixture diff`) include them in `data.entries` or similar. Non-zero exit code on `ok: false`.
+Subcommands that natively emit lists (e.g., `rewind logs`, `rewind fixture diff`) include them in `data.entries` or similar. Non-zero exit code on `ok: false`.
 
 This is mostly small per-command edits in `src/loop46/*` and `src/files_cli/`.
 
-### T2. `loop46 doctor` — environment readiness check
+### T2. `rewind doctor` — environment readiness check
 
 New subcommand. Probes the environment and reports a structured readiness report:
 
 ```
-loop46 doctor [--json]
+rewind doctor [--json]
 
 Checks:
 - Working tree detected (handler.mjs, _tests/, etc.)
@@ -53,7 +61,7 @@ Checks:
 - LOOP46_SCOPE env var set
 - LOOP46_HOST reachable (HTTP HEAD to admin endpoint)
 - Token scope verifiable (calls /_system/whoami or equivalent)
-- `loop46 worker` binary version matches deployed version (optional)
+- worker binary version matches the deployed platform version (optional)
 ```
 
 Output:
@@ -87,7 +95,7 @@ New token type alongside existing root tokens (`root_token/{hash}`) and sessions
 - `kv` — read kv (overlap with `fixture`; either grants read; reserved for future read+write split if needed).
 - `logs` — read log records.
 
-**Wire format**: `Authorization: Bearer loop46_scoped_<hex>` (or just keep `Bearer <hex>` if simpler, with the hex string distinguishable by length / prefix in the lookup).
+**Wire format**: `Authorization: Bearer rewind_scoped_<hex>` (or just keep `Bearer <hex>` if simpler, with the hex string distinguishable by length / prefix in the lookup).
 
 **Auth flow**: each request validates token capabilities against the operation. E.g., `POST /v1/instances/<id>/deployments` requires `deploy` capability + `<id>` in `instances`.
 
@@ -106,34 +114,34 @@ PATCH  /_system/scoped_tokens/{hash}              → modify capabilities/instan
 
 Plus CLI:
 ```
-loop46 mint-token --label <l> --capabilities <c1,c2,...> --instances <i1,i2,...> [--expires <duration>]
+rewind mint-token --label <l> --capabilities <c1,c2,...> --instances <i1,i2,...> [--expires <duration>]
                                                   → emits token_hex once on stdout
-loop46 list-tokens [--json]
-loop46 revoke-token <hash>
+rewind list-tokens [--json]
+rewind revoke-token <hash>
 ```
 
 ### T5. Skill file
 
-New file at `docs/skills/loop46.md` (final path TBD when Anthropic skill conventions stabilize; for now committed to the repo, published on the rewind.js docs site for agent discovery).
+New file at `docs/skills/rewind.md` (final path TBD when Anthropic skill conventions stabilize; for now committed to the repo, published on the rewind.js docs site for agent discovery).
 
 Sections:
 - **Overview**: what rewind.js is in one paragraph from an agent's POV.
-- **Workflow**: edit handler → `loop46 test` → fix fixtures via `loop46 fixture *` → `loop46 deploy`. Concrete examples.
+- **Workflow**: edit handler → `rewind test` → fix fixtures via `rewind fixture *` → `rewind deploy`. Concrete examples.
 - **Tool catalog**: every CLI subcommand with a one-line purpose, expected args, and a JSON-output example.
 - **Auth setup**: `LOOP46_TOKEN`, `LOOP46_SCOPE`, `LOOP46_HOST`. How to mint a scoped token.
 - **Common patterns**:
-  - "Fix unresolved-read failure in a sim test" — invoke `loop46 fixture add ... --from <instance>`.
-  - "Pull a real production scenario as a test" — `loop46 export-fixture --request <id>`.
-  - "Build a fixture from scratch" — `loop46 fixture from-keys customer/42 ... --from <instance>`.
-  - "Deploy a candidate" — push, run `loop46 test`, deploy.
-  - "Investigate a failure" — `loop46 logs ...`, identify failing request, export fixture, fix, redeploy.
+  - "Fix unresolved-read failure in a sim test" — invoke `rewind fixture add ... --from <instance>`.
+  - "Pull a real production scenario as a test" — `rewind export-fixture --request <id>`.
+  - "Build a fixture from scratch" — `rewind fixture from-keys customer/42 ... --from <instance>`.
+  - "Deploy a candidate" — push, run `rewind test`, deploy.
+  - "Investigate a failure" — `rewind logs ...`, identify failing request, export fixture, fix, redeploy.
 - **Gotchas**:
   - Sim tests run locally — the agent needs the working tree.
   - Tests are stripped from production manifests at deploy time (see PLAN.md §10.8).
   - `simulate(...)` defaults to `mode: isolated` for sim tests; use `mode: strict` for replay-against-recording.
   - Snapshots commit alongside test code; `--update-snapshots` regenerates.
   - Outbox effects don't actually fire in simulation — assert on the bundle's would-have-enqueued list.
-  - **`loop46 dry-run` is cheap** (skips raft propose + commit fsync; cost class is read-only-equivalent). Use it freely for fixture authoring; no need to ration calls.
+  - **`rewind dry-run` is cheap** (skips raft propose + commit fsync; cost class is read-only-equivalent). Use it freely for fixture authoring; no need to ration calls.
   - Dry-run results are non-deterministic across calls (live state varies between runs). If you want reproducibility, capture once into a fixture and run sim tests against the fixture instead.
 
 The skill file should be small enough for Claude to load fully (~500-1500 lines), structured enough to be navigable, and updated as the CLI evolves.
@@ -141,9 +149,9 @@ The skill file should be small enough for Claude to load fully (~500-1500 lines)
 ## Critical files
 
 **New code**:
-- `src/loop46/doctor_cmd.zig` — `loop46 doctor`. T2.
+- `src/loop46/doctor_cmd.zig` — `rewind doctor`. T2.
 - `src/loop46/token_cmd.zig` — `mint-token`, `list-tokens`, `revoke-token`. T3 + T4.
-- `docs/skills/loop46.md` — the skill file. T5.
+- `docs/skills/rewind.md` — the skill file. T5.
 
 **Extend**:
 - `src/loop46/main.zig` — register new subcommands.
@@ -156,17 +164,17 @@ The skill file should be small enough for Claude to load fully (~500-1500 lines)
 
 - `scripts/agent_surface_smoke.sh`:
   - **JSON output**: invoke each CLI subcommand with `--json`, assert each returns the standard envelope shape.
-  - **Doctor**: with no env vars set, `loop46 doctor --json` reports failures correctly. With a valid setup, all checks pass.
-  - **Mint scoped token**: `loop46 mint-token --capabilities deploy,test --instances acme` → emits a token. List shows it. Use it for a deploy → succeeds. Use it for a `simulate` call → 403 (capability not granted).
+  - **Doctor**: with no env vars set, `rewind doctor --json` reports failures correctly. With a valid setup, all checks pass.
+  - **Mint scoped token**: `rewind mint-token --capabilities deploy,test --instances acme` → emits a token. List shows it. Use it for a deploy → succeeds. Use it for a `simulate` call → 403 (capability not granted).
   - **Revoke**: revoke the token, retry the deploy → 401.
   - **Capability gate**: scoped token with only `read` cannot deploy or fixture.
-- Manual: configure Claude Code with the skill file in a rewind.js source tree → ask "find the most recent failing request and propose a fix" → confirm the agent reads the skill, runs `loop46 logs`, finds the failure, runs `loop46 export-fixture`, edits the handler, runs `loop46 test`, iterates.
+- Manual: configure Claude Code with the skill file in a rewind.js source tree → ask "find the most recent failing request and propose a fix" → confirm the agent reads the skill, runs `rewind logs`, finds the failure, runs `rewind export-fixture`, edits the handler, runs `rewind test`, iterates.
 - Inline Zig tests for scoped token install/authenticate roundtrip + capability validation.
 
 ## Open questions
 
-1. **Skill file location**: `docs/skills/loop46.md` in the repo plus published at `rewindjs.com/skills/`? Bundled with the CLI binary as a `loop46 skill` subcommand? Anthropic's skill convention is still settling; for v1, just commit it to the repo and document it on the website.
-2. **Token format prefix**: `loop46_scoped_<hex>` distinguishes scoped tokens from root tokens visually; or just hex with the kind stored at the lookup site. Prefix is more grep-friendly but couples format to logic. Probably prefix, since git scanners (GitHub secret scanning) match on prefix patterns.
+1. **Skill file location**: `docs/skills/rewind.md` in the repo plus published at `rewindjs.com/skills/`? Bundled with the CLI binary as a `rewind skill` subcommand? Anthropic's skill convention is still settling; for v1, just commit it to the repo and document it on the website.
+2. **Token format prefix**: `rewind_scoped_<hex>` distinguishes scoped tokens from root tokens visually; or just hex with the kind stored at the lookup site. Prefix is more grep-friendly but couples format to logic. Probably prefix, since git scanners (GitHub secret scanning) match on prefix patterns.
 3. **Capability hierarchy**: `read` should imply log read, kv read, manifest read. Should it also imply `fixture`? Or are they independent? Likely `read` is a base, others are additive. Document explicit relationships.
 4. **Audit log for token use**: should every scoped-token-authenticated request log to a security-audit channel? Useful for "what did this CI bot's token do this week?" Defer until usage shows demand.
 5. **Token expiration**: support `expires_at` from day one (yes, planned). What's the default? No expiration (caller must explicitly request one)? Or default 30 days? Probably no default — explicit is safer.
