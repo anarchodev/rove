@@ -1,11 +1,14 @@
 # Streaming inbound body — the `onChunk` export (gap 2.4)
 
-> **Status:** in-flight, 2026-06-10. Implements the locked contract in
+> **Status:** S1–S3 SHIPPED 2026-06-10 (`scripts/inbound_chunk_smoke_v2.py`
+> green, cache-cold and cache-warm; regression smokes + `zig build test`
+> green). Implements the locked contract in
 > [`handler-shape.md`](handler-shape.md) §3 (activation table row), §4
 > (the 1 MB ceiling), §5.3 (worked example), §7 (`request` fields).
-> Design constraint: ride the shipped `blob.receive` transport
+> Design constraint held: rides the shipped `blob.receive` transport
 > (`BodyMode.sink` + drained-repay flow control, `src/h2/root.zig`) —
-> **no new h2 surface.**
+> **zero new h2 surface.** See "Remaining work" below for what keeps
+> this plan in-flight.
 
 ## The contract being wired (from handler-shape.md)
 
@@ -78,19 +81,44 @@ held entity (the existing receiving-stream death path); the parked
 continuation faults like any disconnected stream. Early terminal while
 body inbound → respond + `flipInboundBodyToDiscard` (exists).
 
-## Slices
+## Slices (as-built)
 
-- **S1 — vocabulary + probe + single-fire.** `inbound_chunk` variant +
-  exhaustive sites; `onChunk` probe cache + `no_onchunk` fallback;
-  END_STREAM-≤cap bodies single-fire `onChunk(done=true)`; `request.done`
-  / `request.chunkSeq` JS fields. Classic + onHeaders paths untouched.
-- **S2 — the chunked path.** Worker `BodySink` + `InboundChunkState`;
-  accumulate→chunked switch at the cap; parked-continuation chunk pump;
-  drained-on-release backpressure; eof/abort/early-terminal edges.
-- **S3 — smoke.** Direct-to-worker (front-door streaming proxy is a
-  separate gap): single-fire small body; multi-chunk 5 MB upload with
-  per-chunk kv writes proving order + read-your-writes; early-terminal
-  reject; mid-upload client abort.
-- **S4 — docs.** handler-shape.md drop the "wired as that path is
-  reshaped" pend note; effects-and-handlers.md close the gap-2.4 known
-  limitation; this plan folds-and-deletes.
+- **S1 — vocabulary + probe + single-fire — DONE** (`d6b9cda`).
+  `inbound_chunk` variant + exhaustive sites; `onChunk` probe cache +
+  `no_onchunk` fallback; ≤cap bodies single-fire `onChunk(done=true)`;
+  `request.done` / `request.chunkSeq` JS fields.
+- **S2 — the chunked path — DONE** (`7f5f68c`).
+  `src/js/worker_inbound_chunk.zig` Job (the worker-side sink) +
+  `worker_drain.zig` `resumeInboundChunk`/`pumpInboundChunks` +
+  the dispatch-decision sink arm. As designed, plus: per-fire payloads
+  slice at 256 KB (the `.hold` handover arrives as ONE giant push).
+- **S3 — smoke — DONE** (`8cbd886`), and it caught three real bugs:
+  (1) silent chunk drop when a staged fire was skipped or its resume
+  transiently failed — fixed with `staged_consumed` (never stage past
+  an undispatched fire; advance bookkeeping only when the activation
+  ran); (2) cache-cold whole-body buffering — the `no_onheaders`
+  fallback now leaves `receiving` set so the next walk runs the full
+  decision; (3) `request.headers` missing on chunk 1+ — `ReqHeaders`
+  rides the held entity and the resume threads it.
+- **S4 — docs — DONE.** handler-shape pend note dropped;
+  effects-and-handlers gap-2.4 limitation closed.
+
+## Remaining work (keeps this plan in-flight)
+
+- **Tape the chunk payloads.** Resume fires record `.{}` tape payloads
+  (same as the other resume engines today), so a multi-chunk upload is
+  not yet replay-reconstructible — an L3 gap. The fix is the bound-fetch
+  pattern: chunk bytes as `activation_bytes` (≤ the inline cap) or
+  content-addressed BodyRefs through the blob coordinator.
+- **Front door.** Chunked uploads work direct-to-worker; the front
+  door's streaming proxy (a separate known gap) buffers, so the edge
+  path inherits its limits until that lands.
+- **h1 bodies** arrive complete (no early emission), so an onChunk
+  module gets them as one ≤16 MB single fire — fine semantically, but
+  the h1 path never streams.
+- **Client-abort smoke.** Mid-upload disconnect exercises the
+  sink-abort + held-chain disconnect teardown; covered by code paths
+  shared with WS/streaming but not yet asserted end-to-end.
+- When these close, fold-and-delete per the docs lifecycle
+  (mechanics → `architecture/effects-and-handlers.md`, why →
+  `decisions.md`).
