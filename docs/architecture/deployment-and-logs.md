@@ -24,7 +24,7 @@ SQLite for query.
 
 | File | Role |
 |---|---|
-| `examples/files_server_v2.zig` | The `files-server-v2` binary — cluster-free publisher (no raft of its own). |
+| `src/files_server/main.zig` | The `files-server-v2` binary — cluster-free publisher (no raft of its own). |
 | `src/files_server/root.zig`, `bootstrap.zig` | Deploy/upload/list routes; the `__admin__` bootstrap (S3 PUTs + release). |
 | `src/files/manifest_json.zig` | Manifest codec + `computeDeploymentId(entries)` (content-addressed u64 = sha256 prefix). |
 | `src/files/app_manifest.zig` | Bundle-root `manifest.json` validator (name+version required; inert capability grants validated at deploy). |
