@@ -3058,13 +3058,19 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         if (chunk_job_opt) |chunk_job| gate: {
             const h = chunk_job.head() orelse break :gate;
             if (h.bytes.len == 0) break :gate;
+            // The chunk payload IS this activation's Msg (L3) — its
+            // trigger_payload entry is the chunk-tape record (gap
+            // 2.4), never read-elided. The flag also keeps the
+            // Uint8Array `request.body` (eager, not a recording
+            // getter) consistent with the captured record.
+            readset.body_read = true;
             if (h.coord == .inline_ok) {
                 const inline_ref: bodies_mod.BodyRef = .{
                     .batch_id = bodies_mod.NO_BATCH,
                     .offset = 0,
                     .len = @intCast(h.bytes.len),
                 };
-                readset.trigger_payload.appendTriggerPayload(inline_ref, "", h.bytes) catch |err| {
+                readset.trigger_payload.appendTriggerPayload(inline_ref, h.bytes) catch |err| {
                     std.log.warn("rove-js inbound-chunk: trigger_payload append (inline, first fire): {s}", .{@errorName(err)});
                 };
             } else {
@@ -3072,7 +3078,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     .batch_id = h.batch_id,
                     .offset = h.ref_offset,
                     .len = h.ref_len,
-                }, "", "") catch |err| {
+                }, "") catch |err| {
                     std.log.warn("rove-js inbound-chunk: trigger_payload append (ref, first fire): {s}", .{@errorName(err)});
                 };
             }
@@ -3082,7 +3088,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 // durability before moving the entity back; the saved
                 // body_ref points into S3. Skip append + flush;
                 // record the BodyRef on the readset.
-                readset.trigger_payload.appendTriggerPayload(body_wait.body_ref, "", "") catch |err| {
+                readset.trigger_payload.appendTriggerPayload(body_wait.body_ref, "") catch |err| {
                     std.log.warn(
                         "rove-js inbound: readset.trigger_payload append (resume) tenant={s}: {s}",
                         .{ scope_inst.id, @errorName(err) },
@@ -3106,7 +3112,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                         .offset = 0,
                         .len = @intCast(body.len),
                     };
-                    readset.trigger_payload.appendTriggerPayload(inline_ref, "", body) catch |err| {
+                    readset.trigger_payload.appendTriggerPayload(inline_ref, body) catch |err| {
                         std.log.warn(
                             "rove-js inbound: readset.trigger_payload append (inline) tenant={s} bytes={d}: {s}",
                             .{ scope_inst.id, body.len, @errorName(err) },

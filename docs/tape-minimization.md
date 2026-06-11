@@ -195,9 +195,15 @@ host callouts.
 `new Date()` (no args) are pinned per-request via arenajs's `JS_SetDateNow` API —
 every call within one request returns `@divTrunc(readset.timestamp_ns,
 ns_per_ms)`. Same posture as Cloudflare Workers / Lambda SnapStart. Replay pins
-via the WASM reactor's `arena_set_date_now` export. The remaining wire channels
-are `kv` + `module` + `fetch_responses` + `trigger_payload` (4 channels,
-READSET_VERSION 4).
+via the WASM reactor's `arena_set_date_now` export.
+
+2026-06-11 (read-taped request surface, `decisions.md` §4.6): the
+`request_reads` channel joined the wire — the lazily-recorded inbound request
+inputs (header names list, header values read, body-read marker, masked/raw ip
+reads). It is a **read set** in the §5 taxonomy, same kind as `kv`: the request
+surface records what the handler read, not what arrived. The wire channels are
+now `kv` + `module` + `fetch_responses` + `trigger_payload` + `request_reads`
+(5 channels, READSET_VERSION 6).
 
 By the §2.2 mechanism axis: the read set and the timestamp are **direct values** —
 recorded inline, irreducibly; a clock read is neither generative nor referential,

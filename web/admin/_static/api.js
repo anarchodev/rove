@@ -518,6 +518,11 @@ export const api = {
     }
     const tapeBlobs = {
       kv: decodeB64(tapesField.kv_tape_b64),
+      // Read-taping: the lazily-recorded request-surface reads
+      // (header names + values, body-read marker, ip reads). The
+      // replay shell rebuilds `request` from these — see
+      // web/replay/_static/request-replay.mjs.
+      request_reads: decodeB64(tapesField.request_reads_tape_b64),
     };
     // `docs/primitive-gaps.md` §9 + fold-in: two captured-request
     // scalars in the bundle. Replay shell hands `seed` to
@@ -563,6 +568,10 @@ export const api = {
       seed,
       timestamp_ns,
       tape_blobs: tapeBlobs,
+      // The activation kind drives which export the replay epilogue
+      // invokes (request-replay.mjs exportForActivation — mirrors
+      // rpc_dispatch.defaultExportForKind).
+      activation: record.activation,
       // True iff the historical manifest was unreachable and the
       // shell got the CURRENT manifest as a fallback. Replay shell
       // surfaces this in the side-effects panel so the user knows

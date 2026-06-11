@@ -25,13 +25,24 @@ export const RTAP_MAGIC   = 0x52544150;
 // set), 2 → 3 by §9 (seed-not-draws — dropped math_random +
 // crypto_random), 3 → 4 by the §9 fold-in (dropped `.date`
 // channel — `Date.now()` / `new Date()` (no args) are pinned
-// per-request via `arena_set_date_now`). The readset header's
-// `seed` + `timestamp_ns` scalars are the entire input for the
-// random + clock sources.
-export const RTAP_VERSION = 4;
+// per-request via `arena_set_date_now`), 4 → 5 by the read-taped
+// request surface (new `request_reads` channel — the lazily
+// recorded header/body/ip reads that rebuild `request` on replay).
+// The readset header's `seed` + `timestamp_ns` scalars are the
+// entire input for the random + clock sources.
+export const RTAP_VERSION = 5;
 
-export const CHANNEL_KV     = 0;
-export const CHANNEL_MODULE = 1;
+export const CHANNEL_KV            = 0;
+export const CHANNEL_MODULE        = 1;
+export const CHANNEL_REQUEST_READS = 4;
+
+// `request_reads` entry kinds — mirrors `RequestReadKind` in
+// src/tape/root.zig.
+export const READ_KIND_HEADER_NAMES = 0;
+export const READ_KIND_HEADER_VALUE = 1;
+export const READ_KIND_BODY_READ    = 2;
+export const READ_KIND_IP_MASKED    = 3;
+export const READ_KIND_IP_RAW       = 4;
 
 export const KV_OP_GET     = 0;
 export const KV_OP_SET     = 1;
@@ -100,6 +111,12 @@ function decodeEntry(channel, bytes) {
             const source_hash_hex = readUtf8();
             return { specifier, source_hash_hex };
         }
+        case CHANNEL_REQUEST_READS: {
+            const kind = bytes[off++];
+            const name = readUtf8();
+            const value = readUtf8();
+            return { kind, name, value };
+        }
         default:
             throw new Error("unknown RTAP channel " + channel);
     }
@@ -151,6 +168,11 @@ function encodeEntry(channel, entry) {
             w.str(entry.specifier);
             w.str(entry.source_hash_hex);
             break;
+        case CHANNEL_REQUEST_READS:
+            w.u8(entry.kind);
+            w.str(entry.name || "");
+            w.str(entry.value || "");
+            break;
         default:
             throw new Error("unknown channel " + channel);
     }
@@ -186,6 +208,7 @@ export function buildTapesFromBlobs(blobs) {
     const map = {
         kv: CHANNEL_KV,
         module: CHANNEL_MODULE,
+        request_reads: CHANNEL_REQUEST_READS,
     };
     for (const name of Object.keys(map)) {
         const blob = blobs[name];
