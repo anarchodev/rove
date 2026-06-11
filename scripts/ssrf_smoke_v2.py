@@ -35,7 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX  # noqa: E402
+from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, rpc_wrap  # noqa: E402
 
 HELDSYNC_SRC = r"""export default function () {
     const req = JSON.parse(request.body);
@@ -75,7 +75,7 @@ WB_SRC = r"""export default function () {
 READY_SRC = 'export function handler() { return "ready"; }\n'
 
 FIXTURE = {
-    "index.mjs": READY_SRC,
+    "index.mjs": rpc_wrap(READY_SRC),
     "probe/index.mjs": HELDSYNC_SRC,
     "probe/onresult.mjs": ONRESULT_SRC,
 }

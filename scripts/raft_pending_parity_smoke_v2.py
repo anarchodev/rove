@@ -53,7 +53,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 TENANT = "rpparity"
 CONCURRENCY = int(os.environ.get("CONCURRENCY", "64"))
@@ -75,7 +75,6 @@ export function put(i) {
 export function get(i) {
   return kv.get("k/" + i) || "";
 }
-export default function () { return "ok"; }
 '''
 
 
@@ -98,7 +97,7 @@ def main() -> int:
 
         print("step 2: deploy index.mjs")
         try:
-            dep_id = c.deploy_handlers(TENANT, {"index.mjs": HANDLER_SRC})
+            dep_id = c.deploy_handlers(TENANT, {"index.mjs": rpc_wrap(HANDLER_SRC)})
             check("deploy_handlers → dep_id", bool(dep_id), f"dep_id={dep_id}")
         except RuntimeError as e:
             check("deploy_handlers", False, str(e))

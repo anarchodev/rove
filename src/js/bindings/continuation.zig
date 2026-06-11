@@ -58,10 +58,10 @@ pub const Continuation = struct {
     /// Module path the next hop dispatches to (e.g. "handlers/login").
     path: []u8,
     /// Named export to invoke, or null → the module's default export.
-    /// Mirrors the existing request contract (`?fn=` / RPC envelope vs
-    /// default export); a continuation is resolved through the SAME
-    /// dispatch path a request is — it is not a new calling
-    /// convention.
+    /// Carried into the resume Request as the first-class
+    /// `fn_override` (decisions.md §4.5); a continuation is resolved
+    /// through the SAME dispatch path a request is — it is not a new
+    /// calling convention.
     fn_name: ?[]u8,
     /// The author's `ctx`, JSON-serialized. The runtime later forms
     /// the next hop's request body as ctx + the injected effect

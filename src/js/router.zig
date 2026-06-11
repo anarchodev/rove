@@ -24,9 +24,10 @@
 //! The router is intentionally function-name-agnostic. Unlike shift-js's
 //! `sjs_route_t`, it does not resolve which export to call — it only
 //! splits the path from the query string and stores the raw query on the
-//! `Route`. The dispatcher (`dispatcher.zig`'s `parseDispatch`) extracts
-//! `?fn=<name>` (and `&args=`) from that query downstream when invoking a
-//! module export.
+//! `Route`. The query is opaque to the platform (surfaced to JS as
+//! `request.query`); the invoked export is resolved from the
+//! activation kind / resume target (`rpc_dispatch.parseDispatch`,
+//! decisions.md §4.5).
 
 const std = @import("std");
 
@@ -35,9 +36,8 @@ pub const Route = struct {
     /// Owned by `allocator`. Caller frees via `deinit`.
     module_base: []const u8,
     /// Query string (everything after `?`), or null if the URL had
-    /// none. Owned by `allocator`. Consumed downstream by the dispatcher
-    /// (`parseDispatch`) to extract `?fn=`/`&args=` for module-export
-    /// dispatch.
+    /// none. Owned by `allocator`. Opaque to the platform — surfaced
+    /// to the handler as `request.query`.
     query: ?[]const u8,
 
     allocator: std.mem.Allocator,

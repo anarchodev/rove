@@ -41,7 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEMO = REPO_ROOT / "examples" / "loop46-demo-tenants"
@@ -52,7 +52,7 @@ def _src(rel: str) -> str:
 
 
 PENALTY_HANDLERS = {
-    "index.mjs": _src("penalty/index.mjs"),
+    "index.mjs": rpc_wrap(_src("penalty/index.mjs")),
 }
 
 

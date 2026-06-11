@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_lib import mint_jwt  # noqa: E402
-from smoke_lib_v2 import V2Cluster  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 ROOT_SRC = 'export function handler() { return "ctl-root\\n"; }\n'
 API_SRC = 'export function handler() { return "ctl-api\\n"; }\n'
@@ -46,8 +46,8 @@ def main() -> int:
         print("step 2: deploy two routes (root + /api)")
         try:
             dep_id = c.deploy_handlers("acme", {
-                "index.mjs": ROOT_SRC,
-                "api/index.mjs": API_SRC,
+                "index.mjs": rpc_wrap(ROOT_SRC),
+                "api/index.mjs": rpc_wrap(API_SRC),
             })
             check("deploy_handlers → dep_id", bool(dep_id), f"dep_id={dep_id}")
         except RuntimeError as e:

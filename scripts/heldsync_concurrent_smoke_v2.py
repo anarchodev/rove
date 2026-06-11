@@ -37,7 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX  # noqa: E402
+from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, rpc_wrap  # noqa: E402
 
 N_CONCURRENT = 20
 
@@ -122,7 +122,7 @@ def main() -> int:
         try:
             c.deploy_handlers("wb", {"index.mjs": WB_SRC, "echo/index.mjs": WB_SRC})
             dep_id = c.deploy_handlers("acme", {
-                "index.mjs": READY_SRC,
+                "index.mjs": rpc_wrap(READY_SRC),
                 "heldsync/index.mjs": HELDSYNC_SRC,
                 "heldsync/onresult.mjs": ONRESULT_SRC,
             })
