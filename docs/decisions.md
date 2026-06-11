@@ -103,15 +103,17 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   replay projection. Treat as a PLAN §7-style closed item.
 
 ### 2.6 Cluster / raft-KV library shape
-- **Decision** (as-built, from the retired `raft-kv-design.md`): the `rove-kv`
-  `Cluster` is one raft group fronting N pluggable stores, with
+- **Decision** (V1 as-built, from the retired `raft-kv-design.md`; the V1
+  `Cluster` itself was retired at the V2 cutover — V2 is the spine-free
+  `kvlimbs` facade + the consensus `Bridge`, see §10): the `rove-kv`
+  `Cluster` was one raft group fronting N pluggable stores, with
   **multiple-envelopes-per-entry atomicity** (`LeaderTxn` for multi-store atomic
-  commits). Backend is pluggable (SQLite today). Snapshot tick is
+  commits). Backend was pluggable (SQLite). Snapshot tick was
   stamp-and-compact across all stores. Learner peer mode + peer-to-peer
-  `send_snapshot`. Application-level request routing is registered separately
-  from the library. Two live consumers: loop46 and the files-server standalone.
-  The optional `rove-kv`→`raft-kv` rename is deferred (build.zig still exports
-  `rove-kv`).
+  `send_snapshot`. Application-level request routing was registered separately
+  from the library. Its two consumers were loop46 and the files-server
+  standalone, both retired/V2-ified at the cutover. (The `rove-kv`→`raft-kv`
+  module rename did land in V2.)
 
 ---
 

@@ -68,7 +68,7 @@ cursor API — is the next set of milestones.
 
 ### Smoke coverage landed — see `scripts/replay_wasm_smoke.py` and
 ### `scripts/replay_shell_smoke.mjs` (Playwright). Dev bringup is
-### `scripts/replay_wasm_dev.py` (there is no `loop46 dev`
+### `scripts/replay_wasm_dev.py` (there is no dev-mode CLI
 ### subcommand).
 
 ---
@@ -487,7 +487,7 @@ build-time toggling. It doesn't.
 ### 8.1 Real-world bundle test — DONE (commit c23257d)
 
 Dev cluster bringup via `scripts/replay_wasm_dev.py` (there is no
-`loop46 dev` subcommand). Smoke coverage in
+dev-mode CLI subcommand). Smoke coverage in
 `scripts/replay_wasm_smoke.py` and `scripts/replay_shell_smoke.mjs`
 (Playwright).
 
