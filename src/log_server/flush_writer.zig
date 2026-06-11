@@ -357,6 +357,7 @@ fn writeTapePayloads(
     try writeBytesField(allocator, w, "module_tree_b64", t.module_tree_bytes, false);
     try writeBytesField(allocator, w, "fetch_responses_tape_b64", t.fetch_responses_tape_bytes, false);
     try writeBytesField(allocator, w, "trigger_payload_tape_b64", t.trigger_payload_tape_bytes, false);
+    try writeBytesField(allocator, w, "request_reads_tape_b64", t.request_reads_tape_bytes, false);
     try writeBytesField(allocator, w, "request_body_b64", t.request_body_bytes, false);
     try w.writeAll(",\"request_body_truncated\":");
     try w.writeAll(if (t.request_body_truncated) "true" else "false");

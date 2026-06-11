@@ -60,22 +60,31 @@ def _run_wasm_driver(bundle_path: Path, *, stop_at: int | None = None,
         raise RuntimeError(f"WASM driver stdout not JSON (rc={proc.returncode})")
 
 # A handler that exercises the live tape channels: kv.get + kv.set (the kv
-# tape) plus Math.random / Date.now (drawn from the per-request seed +
-# timestamp_ns scalars in the readset header — the §9 fold-in inputs). This
-# mirrors the channels the V1 replay-demo handler produced, so the captured
-# batch carries a real tape, proving capture runs on V2.
+# tape), Math.random / Date.now (drawn from the per-request seed +
+# timestamp_ns scalars in the readset header — the §9 fold-in inputs), plus
+# the read-taped request surface (`request_reads` channel): a header value
+# read, a body read, and the masked `request.ip` — so the captured record
+# carries the new channel and the WASM replay rebuilds `request` from it.
 HANDLER_SRC = """\
 function bumpCount(prior) { return prior + 1; }
 function rollDie() { return 1 + Math.floor(Math.random() * 6); }
 export function handler() {
   const at = Date.now();
   const die = rollDie();
+  const probe = request.headers["x-replay-probe"] ?? "none";
+  const blen = request.body.length;
+  const ip = request.ip;
   const prior = parseInt(kv.get("count") ?? "0", 10);
   const next = bumpCount(prior);
   kv.set("count", String(next));
-  return `replay-demo count=${next} die=${die} at=${at}\\n`;
+  return `replay-demo count=${next} die=${die} at=${at} probe=${probe} blen=${blen} ip=${ip}\\n`;
 }
 """
+
+# Stamped on every driven request; the handler reads x-replay-probe (a
+# recorded header_value) and request.ip (derived from x-forwarded-for,
+# masked to /24 → 203.0.113.0).
+PROBE_HEADERS = {"x-replay-probe": "p1", "x-forwarded-for": "203.0.113.7"}
 
 
 def main() -> int:
@@ -108,13 +117,22 @@ def main() -> int:
             if r.status != 200:
                 c.dump_node_log(grep=["deploy", "loader", "manifest", "error", "warn"])
             else:
+                last_body = ""
                 for _ in range(3):
-                    rr = c.get(TENANT, "/?fn=handler")
+                    rr = c.get(TENANT, "/?fn=handler", headers=PROBE_HEADERS)
                     if rr.status != 200:
                         check("repeat GET → 200", False, f"got {rr.status} {rr.body!r}")
                         break
+                    last_body = rr.body
                 else:
                     check("drove 3 more requests → 200", True)
+                # Read-taped IP surface: request.ip is the MASKED client
+                # IP (IPv4 last octet zeroed) derived from the edge's
+                # x-forwarded-for; the probe header round-trips.
+                check("request.ip returned the masked XFF (203.0.113.0)",
+                      "ip=203.0.113.0" in last_body, f"body={last_body!r}")
+                check("request.headers probe value visible to the handler",
+                      "probe=p1" in last_body, f"body={last_body!r}")
 
             # Durable kv write landed (proves the handler's kv tape channel
             # actually ran + committed through the bridge).
@@ -166,6 +184,9 @@ def main() -> int:
                         pass
                 check("show returned the captured kv tape (kv_tape_b64 present)",
                       bool(tapes.get("kv_tape_b64")),
+                      f"tapes keys={list(tapes.keys())}")
+                check("show returned the request_reads tape (read-taped surface)",
+                      bool(tapes.get("request_reads_tape_b64")),
                       f"tapes keys={list(tapes.keys())}")
 
                 # ── step 5: compose the replay bundle + run the WASM driver. ─
@@ -224,7 +245,8 @@ def main() -> int:
                             "seed": tapes.get("seed", 0),
                             "timestamp_ns": tapes.get("timestamp_ns", 0),
                             "tape_blobs": {"kv": tapes.get("kv_tape_b64") or None,
-                                           "module": tapes.get("module_tree_b64") or None},
+                                           "module": tapes.get("module_tree_b64") or None,
+                                           "request_reads": tapes.get("request_reads_tape_b64") or None},
                         }
                         bundle_path = Path(f"/tmp/replay-wasm-v2-{TENANT}.json")
                         bundle_path.write_text(json.dumps(bundle))

@@ -414,6 +414,56 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   deploy helper (hidden magic — smokes opt in explicitly via
   `smoke_lib_v2.rpc_wrap`).
 
+### 4.6 GDPR-safe request capture = read-recording; masked `request.ip` + `unmaskedIp()`
+- **Decision** (2026-06-11): replay determinism requires capturing every
+  request input the handler can branch on — and **redaction is structurally
+  impossible** (a redacted input replays differently). GDPR safety therefore
+  comes from **data minimization by read-recording**: the request surface is
+  lazy accessors that record into the `request_reads` tape channel on first
+  access. Header **names** record unconditionally per activation (so
+  `Object.keys` replays); header **values** / the cookie header / the body /
+  the ip surfaces record only when read. The tape stores exactly what the code
+  observed, nothing else.
+- **Body is reference-lazy, never storage-lazy**: the pre-dispatch durability
+  gate (pool submit / raft-inline) is unconditional; if the handler never read
+  `request.body`, `Readset.elideUnreadBody` drops the trigger_payload entry +
+  `request_body_bytes`, so the replay record holds no pointer to the bytes.
+  Unreferenced pool bytes age out with the pool lifecycle. **Chunk activations
+  are exempt**: the chunk payload IS the activation's Msg (the gap-2.4
+  chunk-tape record), `request.body` there is an eagerly-defined binary
+  Uint8Array (not the recording getter — and the define must be
+  `JS_DefinePropertyValueStr`, a [[Set]] silently no-ops against the
+  setter-less accessor), so the worker sets `body_read` structurally at the
+  chunk-append sites and the entry always survives.
+- **Client IP**: the transport headers (`x-forwarded-for`, `x-real-ip`,
+  `cf-connecting-ip`, `forwarded`) are stripped from `request.headers` (same
+  mechanism as pseudo-headers). `request.ip` returns the **masked** IP (IPv4
+  last octet zeroed; IPv6 /48) derived from `cf-connecting-ip` else the
+  rightmost (edge-appended, spoof-resistant) XFF entry. The raw IP is
+  `request.unmaskedIp()` — a *method*: the call is the customer's explicit
+  controller-responsibility moment, and it puts the raw IP on their tape.
+  Stripping is what makes the friction real — with XFF visible, everyone
+  would just read the header.
+- **Replay divergence is loud**: replay reading anything unrecorded throws
+  `REPLAY DIVERGENCE`, never silently `undefined` (the replay epilogue is
+  `web/replay/_static/request-replay.mjs`; the entry export is invoked via
+  arenajs's `__arena_entry_ns()` — appended code cannot otherwise reach an
+  anonymous `export default`, and self-imports diverge from the module tape).
+- **Retention + encryption duties remain** for whatever WAS recorded (cookies,
+  auth headers, raw IPs the handler read): per-tenant S3 prefix isolation
+  exists; page-level encryption at rest is the locked direction (§7); a
+  bounded retention window on log-blobs is the outstanding piece of the
+  GDPR-processor story.
+- **Deferred**: read-flagging `fetch_chunk`'s `request.activation.bytes`
+  (needs keep-entry-drop-bytes partial elision — the fetch_responses entry
+  doubles as the activation event record; `TODO(read-taping)` at
+  `worker_log.captureTapesWithActivation`).
+- **Rejected**: capture-all-visible headers (stores cookies/auth even when
+  unread — weakest minimization); header-value redaction/allowlists (breaks
+  replay determinism); a separate per-tenant "don't capture IPs" config knob
+  (the read-recording model makes it the handler-code author's explicit,
+  auditable choice instead).
+
 ---
 
 ## 5. Readset replication
@@ -476,6 +526,10 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   The Grafana Cloud bill is cardinality-driven; per-tenant cardinality would
   explode active series and duplicate replay-store cost while leaking plaintext
   to a third party.
+- What the replay store may CONTAIN per request is governed by the
+  read-recording decision (§4.6): exactly the request inputs the handler read,
+  with client IPs masked unless the handler explicitly called
+  `request.unmaskedIp()`.
 
 ---
 

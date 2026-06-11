@@ -726,8 +726,9 @@ fn proposeAndParkContResume(
     /// Slice 3d-fetch: the cont-resume dispatch's readset, serialized
     /// onto the raft envelope's `rs_bytes` section so the resumed
     /// activation is replayable on any follower. Pointer (not value)
-    /// because the readset lives in the caller's stack frame.
-    readset: *const tape_mod.Readset,
+    /// because the readset lives in the caller's stack frame. Mutable
+    /// so the unread-body elision below applies before serialization.
+    readset: *tape_mod.Readset,
     /// Slice 5a-1: per-activation LogHeader stamped into the readset
     /// blob so any follower (Phase 5c) can rebuild the customer
     /// LogRecord. `null` only for paths that genuinely have no
@@ -742,6 +743,12 @@ fn proposeAndParkContResume(
     // the next per-tenant batch's open lease isn't blocked on raft
     // here.
     txn.releaseLease();
+
+    // Read-taping: drop the body reference when the handler never
+    // read it (idempotent — captureTapes may have elided already,
+    // but on this path the raft copy serializes here and must agree
+    // with the LogRecord copy regardless of call order).
+    readset.elideUnreadBody();
 
     // Slice 3d-fetch: serialize the cont-resume's readset (with the
     // caller-supplied LogHeader stamped into it, slice 5a-1) wrapped
@@ -3016,13 +3023,18 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
     // wire BodyRef (head_fire.batch_id/...); record the pointer. The
     // readset rides the raft entry (follower replay) AND serializes
     // into the LogRecord tapes below (dashboard replay).
+    // The chunk payload IS this activation's Msg (L3) — its
+    // trigger_payload entry is the chunk-tape record (gap 2.4), never
+    // read-elided; `request.body` here is the eager Uint8Array, not
+    // the recording getter, so the flag is set structurally.
+    if (chunk_bytes.len > 0) readset.body_read = true;
     if (chunk_bytes.len > 0 and chunk_bytes.len <= worker_mod.REQUEST_BODY_CAP) {
         const inline_ref: bodies_mod.BodyRef = .{
             .batch_id = bodies_mod.NO_BATCH,
             .offset = 0,
             .len = @intCast(chunk_bytes.len),
         };
-        readset.trigger_payload.appendTriggerPayload(inline_ref, "", chunk_bytes) catch |err| {
+        readset.trigger_payload.appendTriggerPayload(inline_ref, chunk_bytes) catch |err| {
             std.log.warn("rove-js inbound-chunk: trigger_payload append (inline): {s}", .{@errorName(err)});
         };
     } else if (chunk_bytes.len > 0) {
@@ -3030,7 +3042,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
             .batch_id = head_fire.batch_id,
             .offset = head_fire.ref_offset,
             .len = head_fire.ref_len,
-        }, "", "") catch |err| {
+        }, "") catch |err| {
             std.log.warn("rove-js inbound-chunk: trigger_payload append (ref): {s}", .{@errorName(err)});
         };
     }

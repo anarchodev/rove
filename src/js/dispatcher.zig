@@ -2439,6 +2439,582 @@ test "dispatch: request.headers missing → empty object, missing key → undefi
     );
 }
 
+// ── read-taped request surface (`request_reads` channel) ─────────────
+
+/// Count `request_reads` entries matching (kind, name).
+fn countReads(rs: *const tape_mod.Readset, kind: tape_mod.RequestReadKind, name: []const u8) usize {
+    var n: usize = 0;
+    for (rs.request_reads.entries.items) |e| {
+        const r = e.request_reads;
+        if (r.kind == kind and std.mem.eql(u8, r.name, name)) n += 1;
+    }
+    return n;
+}
+
+/// The recorded value for the FIRST `request_reads` entry matching
+/// (kind, name), or null.
+fn readValue(rs: *const tape_mod.Readset, kind: tape_mod.RequestReadKind, name: []const u8) ?[]const u8 {
+    for (rs.request_reads.entries.items) |e| {
+        const r = e.request_reads;
+        if (r.kind == kind and std.mem.eql(u8, r.name, name)) return r.value;
+    }
+    return null;
+}
+
+test "dispatch: request_reads — values recorded only on read, repeat reads dedupe" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    const bytecode = try ctx.compileToBytecode(
+        \\export default function () {
+        \\    // Read ONE header, three times. x-slack-signature stays unread.
+        \\    const a = request.headers["user-agent"];
+        \\    const b = request.headers["user-agent"];
+        \\    const c = request.headers["user-agent"];
+        \\    return a + b + c;
+        \\}
+    ,
+        "h.mjs",
+        testing.allocator,
+        .{ .kind = .module },
+    );
+    defer testing.allocator.free(bytecode);
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var hdr_buf: [8]h2.HeaderField = undefined;
+    const hdrs = makeReqHeaders(&hdr_buf, &.{
+        .{ ":method", "GET" },
+        .{ "user-agent", "smoke/1" },
+        .{ "x-slack-signature", "v0=abc" },
+    });
+
+    var readset = tape_mod.Readset.init(testing.allocator, 0, 0);
+    defer readset.deinit();
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
+        .method = "GET",
+        .path = "/",
+        .headers = hdrs,
+        .trace = .{ .readset = &readset },
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 200), resp.status);
+
+    // The names list is recorded once, eagerly, with all non-pseudo
+    // names in wire order; values only for what was read — and only
+    // once despite three reads.
+    try testing.expectEqual(@as(usize, 1), countReads(&readset, .header_names, ""));
+    try testing.expectEqualStrings(
+        "[\"user-agent\",\"x-slack-signature\"]",
+        readValue(&readset, .header_names, "").?,
+    );
+    try testing.expectEqual(@as(usize, 1), countReads(&readset, .header_value, "user-agent"));
+    try testing.expectEqualStrings("smoke/1", readValue(&readset, .header_value, "user-agent").?);
+    try testing.expectEqual(@as(usize, 0), countReads(&readset, .header_value, "x-slack-signature"));
+}
+
+test "dispatch: request_reads — Object.keys records no values, JSON.stringify records all" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var hdr_buf: [8]h2.HeaderField = undefined;
+    const hdrs = makeReqHeaders(&hdr_buf, &.{
+        .{ "user-agent", "smoke/1" },
+        .{ "accept", "*/*" },
+    });
+
+    // Object.keys: observes the name SET, fires no getters.
+    {
+        const bytecode = try ctx.compileToBytecode(
+            \\export default function () {
+            \\    return Object.keys(request.headers).join(",");
+            \\}
+        ,
+            "h.mjs",
+            testing.allocator,
+            .{ .kind = .module },
+        );
+        defer testing.allocator.free(bytecode);
+
+        var readset = tape_mod.Readset.init(testing.allocator, 0, 0);
+        defer readset.deinit();
+        var txn = try kv.beginTrackedImmediate();
+        defer txn.rollback() catch {};
+        var ws = kv_mod.WriteSet.init(testing.allocator);
+        defer ws.deinit();
+        var budget = Budget.fromNow(Budget.default_duration_ns);
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
+            .method = "GET",
+            .path = "/",
+            .headers = hdrs,
+            .trace = .{ .readset = &readset },
+        }, &budget);
+        defer resp.deinit(testing.allocator);
+
+        try testing.expectEqualStrings("user-agent,accept", resp.body);
+        try testing.expectEqual(@as(usize, 1), countReads(&readset, .header_names, ""));
+        try testing.expectEqual(@as(usize, 0), countReads(&readset, .header_value, "user-agent"));
+        try testing.expectEqual(@as(usize, 0), countReads(&readset, .header_value, "accept"));
+    }
+
+    // JSON.stringify: fires every getter — every value records,
+    // which is exactly right (the handler really did read them all).
+    {
+        const bytecode = try ctx.compileToBytecode(
+            \\export default function () {
+            \\    return JSON.stringify(request.headers);
+            \\}
+        ,
+            "h.mjs",
+            testing.allocator,
+            .{ .kind = .module },
+        );
+        defer testing.allocator.free(bytecode);
+
+        var readset = tape_mod.Readset.init(testing.allocator, 0, 0);
+        defer readset.deinit();
+        var txn = try kv.beginTrackedImmediate();
+        defer txn.rollback() catch {};
+        var ws = kv_mod.WriteSet.init(testing.allocator);
+        defer ws.deinit();
+        var budget = Budget.fromNow(Budget.default_duration_ns);
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
+            .method = "GET",
+            .path = "/",
+            .headers = hdrs,
+            .trace = .{ .readset = &readset },
+        }, &budget);
+        defer resp.deinit(testing.allocator);
+
+        try testing.expectEqual(@as(usize, 1), countReads(&readset, .header_value, "user-agent"));
+        try testing.expectEqual(@as(usize, 1), countReads(&readset, .header_value, "accept"));
+    }
+}
+
+test "dispatch: request_reads — cookies access records the whole cookie header once" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    const bytecode = try ctx.compileToBytecode(
+        \\export default function () {
+        \\    const c1 = request.cookies;
+        \\    const c2 = request.cookies;
+        \\    return JSON.stringify({
+        \\        sid: c1.sid,
+        \\        theme: c1.theme,
+        \\        same: c1 === c2,
+        \\    });
+        \\}
+    ,
+        "h.mjs",
+        testing.allocator,
+        .{ .kind = .module },
+    );
+    defer testing.allocator.free(bytecode);
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var hdr_buf: [4]h2.HeaderField = undefined;
+    const hdrs = makeReqHeaders(&hdr_buf, &.{
+        .{ "cookie", "sid=abc; theme=dark" },
+    });
+
+    var readset = tape_mod.Readset.init(testing.allocator, 0, 0);
+    defer readset.deinit();
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
+        .method = "GET",
+        .path = "/",
+        .headers = hdrs,
+        .trace = .{ .readset = &readset },
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqualStrings(
+        "{\"sid\":\"abc\",\"theme\":\"dark\",\"same\":true}",
+        resp.body,
+    );
+    // One header_value{cookie} entry: the cookies access IS a cookie-
+    // header read; the self-replaced object makes the second access
+    // free (and identity-stable).
+    try testing.expectEqual(@as(usize, 1), countReads(&readset, .header_value, "cookie"));
+    try testing.expectEqualStrings(
+        "sid=abc; theme=dark",
+        readValue(&readset, .header_value, "cookie").?,
+    );
+}
+
+test "dispatch: request_reads — body flag set on read (incl. empty body), absent when unread" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Reads the body (non-empty).
+    {
+        const bytecode = try ctx.compileToBytecode(
+            \\export default function () { return "len=" + request.body.length; }
+        ,
+            "h.mjs",
+            testing.allocator,
+            .{ .kind = .module },
+        );
+        defer testing.allocator.free(bytecode);
+
+        var readset = tape_mod.Readset.init(testing.allocator, 0, 0);
+        defer readset.deinit();
+        var txn = try kv.beginTrackedImmediate();
+        defer txn.rollback() catch {};
+        var ws = kv_mod.WriteSet.init(testing.allocator);
+        defer ws.deinit();
+        var budget = Budget.fromNow(Budget.default_duration_ns);
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
+            .method = "POST",
+            .path = "/",
+            .body = "hello",
+            .trace = .{ .readset = &readset },
+        }, &budget);
+        defer resp.deinit(testing.allocator);
+
+        try testing.expectEqualStrings("len=5", resp.body);
+        try testing.expect(readset.body_read);
+        try testing.expectEqual(@as(usize, 1), countReads(&readset, .body_read, ""));
+    }
+
+    // Reads an EMPTY body — still a recorded fact ("read an empty
+    // body" vs "never looked" are different replay inputs).
+    {
+        const bytecode = try ctx.compileToBytecode(
+            \\export default function () { return "len=" + request.body.length; }
+        ,
+            "h.mjs",
+            testing.allocator,
+            .{ .kind = .module },
+        );
+        defer testing.allocator.free(bytecode);
+
+        var readset = tape_mod.Readset.init(testing.allocator, 0, 0);
+        defer readset.deinit();
+        var txn = try kv.beginTrackedImmediate();
+        defer txn.rollback() catch {};
+        var ws = kv_mod.WriteSet.init(testing.allocator);
+        defer ws.deinit();
+        var budget = Budget.fromNow(Budget.default_duration_ns);
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
+            .method = "GET",
+            .path = "/",
+            .trace = .{ .readset = &readset },
+        }, &budget);
+        defer resp.deinit(testing.allocator);
+
+        try testing.expectEqualStrings("len=0", resp.body);
+        try testing.expect(readset.body_read);
+    }
+
+    // Never touches the body — flag stays false, nothing recorded,
+    // and elideUnreadBody drops any trigger_payload reference.
+    {
+        const bytecode = try ctx.compileToBytecode(
+            \\export default function () { return "no-body-read"; }
+        ,
+            "h.mjs",
+            testing.allocator,
+            .{ .kind = .module },
+        );
+        defer testing.allocator.free(bytecode);
+
+        var readset = tape_mod.Readset.init(testing.allocator, 0, 0);
+        defer readset.deinit();
+        try readset.trigger_payload.appendTriggerPayload(
+            .{ .batch_id = 0, .offset = 0, .len = 5 },
+            "hello",
+        );
+        var txn = try kv.beginTrackedImmediate();
+        defer txn.rollback() catch {};
+        var ws = kv_mod.WriteSet.init(testing.allocator);
+        defer ws.deinit();
+        var budget = Budget.fromNow(Budget.default_duration_ns);
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
+            .method = "POST",
+            .path = "/",
+            .body = "hello",
+            .trace = .{ .readset = &readset },
+        }, &budget);
+        defer resp.deinit(testing.allocator);
+
+        try testing.expect(!readset.body_read);
+        try testing.expectEqual(@as(usize, 0), countReads(&readset, .body_read, ""));
+        readset.elideUnreadBody();
+        try testing.expectEqual(@as(usize, 0), readset.trigger_payload.entries.items.len);
+    }
+}
+
+test "dispatch: request.ip masked, unmaskedIp() raw, IP transport headers stripped" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    const bytecode = try ctx.compileToBytecode(
+        \\export default function () {
+        \\    return JSON.stringify({
+        \\        ip: request.ip,
+        \\        raw: request.unmaskedIp(),
+        \\        xff: request.headers["x-forwarded-for"] === undefined,
+        \\        keys: Object.keys(request.headers).join(","),
+        \\    });
+        \\}
+    ,
+        "h.mjs",
+        testing.allocator,
+        .{ .kind = .module },
+    );
+    defer testing.allocator.free(bytecode);
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Spoof-shaped XFF: client-sent junk on the left, the edge-
+    // appended (trusted) entry rightmost.
+    var hdr_buf: [8]h2.HeaderField = undefined;
+    const hdrs = makeReqHeaders(&hdr_buf, &.{
+        .{ "user-agent", "smoke/1" },
+        .{ "x-forwarded-for", "198.51.100.7, 203.0.113.9" },
+        .{ "x-real-ip", "203.0.113.9" },
+        .{ "forwarded", "for=203.0.113.9" },
+    });
+
+    var readset = tape_mod.Readset.init(testing.allocator, 0, 0);
+    defer readset.deinit();
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
+        .method = "GET",
+        .path = "/",
+        .headers = hdrs,
+        .trace = .{ .readset = &readset },
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    // Masked = rightmost XFF entry with the last octet zeroed; raw =
+    // the rightmost entry verbatim; the transport headers themselves
+    // are invisible (stripped from both the object and the name set).
+    try testing.expectEqualStrings(
+        "{\"ip\":\"203.0.113.0\",\"raw\":\"203.0.113.9\",\"xff\":true,\"keys\":\"user-agent\"}",
+        resp.body,
+    );
+    try testing.expectEqualStrings("203.0.113.0", readValue(&readset, .ip_masked, "").?);
+    try testing.expectEqualStrings("203.0.113.9", readValue(&readset, .ip_raw, "").?);
+    try testing.expectEqualStrings("[\"user-agent\"]", readValue(&readset, .header_names, "").?);
+}
+
+test "dispatch: request.ip prefers cf-connecting-ip; IPv6 masks to /48; absent → null" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // cf-connecting-ip (IPv6) wins over XFF; /48 mask.
+    {
+        const bytecode = try ctx.compileToBytecode(
+            \\export default function () {
+            \\    return request.ip + "|" + request.unmaskedIp();
+            \\}
+        ,
+            "h.mjs",
+            testing.allocator,
+            .{ .kind = .module },
+        );
+        defer testing.allocator.free(bytecode);
+
+        var hdr_buf: [4]h2.HeaderField = undefined;
+        const hdrs = makeReqHeaders(&hdr_buf, &.{
+            .{ "cf-connecting-ip", "2001:db8:85a3:8d3:1319:8a2e:370:7348" },
+            .{ "x-forwarded-for", "203.0.113.9" },
+        });
+
+        var txn = try kv.beginTrackedImmediate();
+        defer txn.rollback() catch {};
+        var ws = kv_mod.WriteSet.init(testing.allocator);
+        defer ws.deinit();
+        var budget = Budget.fromNow(Budget.default_duration_ns);
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
+            .method = "GET",
+            .path = "/",
+            .headers = hdrs,
+        }, &budget);
+        defer resp.deinit(testing.allocator);
+
+        try testing.expectEqualStrings(
+            "2001:db8:85a3::|2001:db8:85a3:8d3:1319:8a2e:370:7348",
+            resp.body,
+        );
+    }
+
+    // No IP transport headers at all → both surfaces null, and the
+    // null read is itself recorded (replay must reproduce it).
+    {
+        const bytecode = try ctx.compileToBytecode(
+            \\export default function () {
+            \\    return JSON.stringify({ ip: request.ip, raw: request.unmaskedIp() });
+            \\}
+        ,
+            "h.mjs",
+            testing.allocator,
+            .{ .kind = .module },
+        );
+        defer testing.allocator.free(bytecode);
+
+        var hdr_buf: [2]h2.HeaderField = undefined;
+        const hdrs = makeReqHeaders(&hdr_buf, &.{
+            .{ "user-agent", "smoke/1" },
+        });
+
+        var readset = tape_mod.Readset.init(testing.allocator, 0, 0);
+        defer readset.deinit();
+        var txn = try kv.beginTrackedImmediate();
+        defer txn.rollback() catch {};
+        var ws = kv_mod.WriteSet.init(testing.allocator);
+        defer ws.deinit();
+        var budget = Budget.fromNow(Budget.default_duration_ns);
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
+            .method = "GET",
+            .path = "/",
+            .headers = hdrs,
+            .trace = .{ .readset = &readset },
+        }, &budget);
+        defer resp.deinit(testing.allocator);
+
+        try testing.expectEqualStrings("{\"ip\":null,\"raw\":null}", resp.body);
+        try testing.expectEqualStrings("", readValue(&readset, .ip_masked, "").?);
+        try testing.expectEqualStrings("", readValue(&readset, .ip_raw, "").?);
+    }
+}
+
+test "dispatch: duplicate header names — last value wins through the getters" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    const bytecode = try ctx.compileToBytecode(
+        \\export default function () {
+        \\    return request.headers["x-dup"] + "|" + Object.keys(request.headers).join(",");
+        \\}
+    ,
+        "h.mjs",
+        testing.allocator,
+        .{ .kind = .module },
+    );
+    defer testing.allocator.free(bytecode);
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var hdr_buf: [4]h2.HeaderField = undefined;
+    const hdrs = makeReqHeaders(&hdr_buf, &.{
+        .{ "x-dup", "first" },
+        .{ "accept", "*/*" },
+        .{ "x-dup", "second" },
+    });
+
+    var readset = tape_mod.Readset.init(testing.allocator, 0, 0);
+    defer readset.deinit();
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
+        .method = "GET",
+        .path = "/",
+        .headers = hdrs,
+        .trace = .{ .readset = &readset },
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    // Last value wins; enumeration keeps the FIRST occurrence's slot;
+    // the names list is deduped the same way.
+    try testing.expectEqualStrings("second|x-dup,accept", resp.body);
+    try testing.expectEqualStrings("second", readValue(&readset, .header_value, "x-dup").?);
+    try testing.expectEqualStrings("[\"x-dup\",\"accept\"]", readValue(&readset, .header_names, "").?);
+}
+
 test "dispatch: request.cookies parses RFC 6265 cookie header" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

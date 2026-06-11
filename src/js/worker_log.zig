@@ -82,10 +82,10 @@ pub fn getOrOpenTenantLog(
 // ── Tape capture ──────────────────────────────────────────────────────
 //
 // `tape_mod.Readset` is the per-request structural holder for the
-// four channels (kv / module / fetch_responses / trigger_payload);
-// the worker allocates one per dispatch, hands its pointer to the
-// dispatcher via `Request.readset`, then serializes + flushes the
-// non-empty channels via `captureTapes*` below.
+// five channels (kv / module / fetch_responses / trigger_payload /
+// request_reads); the worker allocates one per dispatch, hands its
+// pointer to the dispatcher via `Request.readset`, then serializes +
+// flushes the non-empty channels via `captureTapes*` below.
 // `Math.random` / `crypto.*` / `Date.now` no longer have dedicated
 // channels (§9 + fold-in); the readset's `seed` + `timestamp_ns`
 // scalars are stamped onto arenajs's per-context state by the
@@ -129,6 +129,12 @@ pub fn captureTapes(
 ) log_mod.TapePayloads {
     const allocator = worker.allocator;
 
+    // Read-taping: a body the handler never read leaves no reference
+    // in the log — drop the trigger_payload entry (idempotent; the
+    // raft-entry serialization on the success path runs after this,
+    // so both copies agree). The body's STORAGE is untouched.
+    readset.elideUnreadBody();
+
     var payloads: log_mod.TapePayloads = .{
         .seed = readset.seed,
         .timestamp_ns = readset.timestamp_ns,
@@ -142,6 +148,7 @@ pub fn captureTapes(
         .{ .tape = &readset.module, .out = &payloads.module_tree_bytes },
         .{ .tape = &readset.fetch_responses, .out = &payloads.fetch_responses_tape_bytes },
         .{ .tape = &readset.trigger_payload, .out = &payloads.trigger_payload_tape_bytes },
+        .{ .tape = &readset.request_reads, .out = &payloads.request_reads_tape_bytes },
     };
 
     for (channels) |ch| {
@@ -165,7 +172,11 @@ pub fn captureTapes(
     // replay re-produces the response by re-running the handler with
     // the same request body + tapes, so storing the original would
     // be pure duplication on every S3 batch PUT.
-    if (request_body.len > 0 and request_body.len <= REQUEST_BODY_CAP) {
+    // Read-taping gate: only a body the handler actually read is
+    // captured (the `request.body` getter flips `body_read`). An
+    // unread body is absent from the record entirely — that's the
+    // data-minimization contract, not an oversight.
+    if (readset.body_read and request_body.len > 0 and request_body.len <= REQUEST_BODY_CAP) {
         if (allocator.dupe(u8, request_body)) |captured| {
             payloads.request_body_bytes = captured;
         } else |err| {
@@ -186,6 +197,14 @@ pub fn captureTapes(
 /// demand. L3 (algebra): closes the effect-audit's untaped-chunk
 /// finding — every Msg is recorded (the BodyRef IS the record for the
 /// >16 KB case).
+///
+/// TODO(read-taping): `activation_bytes` is still captured
+/// unconditionally. Read-flagging it (like `request.body`) needs a
+/// keep-entry-drop-bytes partial elision — the `fetch_responses`
+/// entry doubles as the activation EVENT record (seq/final/status
+/// must survive even when bytes go unread) — plus a Uint8Array
+/// getter into the activation object. Deferred; see decisions.md
+/// (read-taped request surface).
 pub fn captureTapesWithActivation(
     worker: anytype,
     readset: *tape_mod.Readset,

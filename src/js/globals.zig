@@ -346,6 +346,20 @@ pub const DispatchState = struct {
     /// persistence story; tape channels are defined in
     /// `src/tape/root.zig:Readset`.
     readset: ?*tape_mod.Readset = null,
+    /// The activation's wire headers, borrowed for the lifetime of
+    /// the JS run (the h2 entity row outlives dispatch, including
+    /// park/resume and chunk re-fires). The lazy `request.headers`
+    /// getters and the `request.ip` / `request.unmaskedIp()` IP
+    /// derivation read from here on access — recording each read
+    /// into `readset.request_reads` (read-taping; see
+    /// `tape.Channel.request_reads`).
+    req_headers: ?h2.ReqHeaders = null,
+    /// The activation's body bytes, borrowed like `req_headers`.
+    /// Materialized into JS only when the handler reads
+    /// `request.body`; the read flips `readset.body_read`, which is
+    /// what keeps the body's tape/log reference alive
+    /// (`Readset.elideUnreadBody`).
+    req_body: []const u8 = "",
     // `docs/primitive-gaps.md` §9 — the per-request Zig PRNG was
     // retired. arenajs's per-request `xorshift64star` state (in
     // `js_random_state_active(ctx)`) is now the single PRNG. The
@@ -2054,7 +2068,15 @@ pub fn installRequest(
     const global = c.JS_GetGlobalObject(ctx);
     defer c.JS_FreeValue(ctx, global);
 
-    // request = { method, path, body, query, headers, cookies }
+    // request = { method, path, host, body, query, headers, cookies,
+    //             ip, unmaskedIp() }
+    //
+    // The request surface is READ-TAPED (`docs/handler-shape.md`):
+    // method/path/host/query are eager data properties (they already
+    // live on the LogRecord's dedicated fields), but everything else
+    // is a lazy accessor that records the read into
+    // `readset.request_reads` on first access — the tape stores
+    // exactly the inputs the handler observed, nothing else.
     //
     // `query` is the raw URL query string (everything after `?`) or
     // null when the URL had none. Parsing is the handler's job —
@@ -2063,25 +2085,44 @@ pub fn installRequest(
     // handler. If customer demand for `URLSearchParams` shows up,
     // it can land as another polyfill alongside TextEncoder.
     //
-    // `headers` is a flat object, lowercase keys per HTTP/2.
-    // Pseudo-headers (`:method`, `:path`, `:scheme`, `:authority`)
-    // are filtered out — they're already exposed as `request.method`
-    // / `request.path` etc. Multiple headers with the same name
-    // comma-join (HTTP-standard fold).
+    // `headers` is a flat object, lowercase keys per HTTP/2, one
+    // recording GETTER per header. Pseudo-headers (`:method`,
+    // `:path`, `:scheme`, `:authority`) are filtered out — they're
+    // already exposed as `request.method` / `request.path` etc. —
+    // and so are the IP transport headers (`x-forwarded-for`,
+    // `x-real-ip`, `cf-connecting-ip`, `forwarded`): the client IP
+    // is reachable ONLY via `request.ip` (masked) /
+    // `request.unmaskedIp()` (raw, the deliberate taped
+    // escalation). Duplicate header names: last value wins,
+    // first-occurrence enumeration position. Assigning to
+    // `request.headers.x` throws in module (strict) code — the
+    // properties are accessors without setters.
     //
-    // `cookies` is a parsed `{name: value}` from the `cookie` header,
-    // RFC 6265 semicolon-separated. Empty / no-cookie → `{}`.
+    // `cookies` is a parsed `{name: value}` from the `cookie` header
+    // (RFC 6265, semicolon-separated), materialized on first access;
+    // the access records the whole `cookie` header as read. Empty /
+    // no-cookie → `{}`.
+    //
+    // `body` is a lazy accessor too: first access records the
+    // body-read marker that keeps the body's tape/log reference
+    // alive (unread bodies are elided from the replay record —
+    // `Readset.elideUnreadBody`).
     const req_obj = c.JS_NewObject(ctx);
+    state.req_headers = request.headers;
+    state.req_body = request.body;
     _ = c.JS_SetPropertyStr(ctx, req_obj, "method", c.JS_NewStringLen(ctx, request.method.ptr, request.method.len));
     _ = c.JS_SetPropertyStr(ctx, req_obj, "path", c.JS_NewStringLen(ctx, request.path.ptr, request.path.len));
     _ = c.JS_SetPropertyStr(ctx, req_obj, "host", c.JS_NewStringLen(ctx, request.host.ptr, request.host.len));
-    _ = c.JS_SetPropertyStr(ctx, req_obj, "body", c.JS_NewStringLen(ctx, request.body.ptr, request.body.len));
+    definePropertyGetter(ctx, req_obj, "body", c.JS_NewCFunction2(ctx, @ptrCast(&jsBodyGetter), "body", 0, c.JS_CFUNC_getter_magic, 0));
     if (request.query) |q| {
         _ = c.JS_SetPropertyStr(ctx, req_obj, "query", c.JS_NewStringLen(ctx, q.ptr, q.len));
     } else {
         _ = c.JS_SetPropertyStr(ctx, req_obj, "query", js_null);
     }
     installHeaders(ctx, state, req_obj, request.headers);
+    definePropertyGetter(ctx, req_obj, "cookies", c.JS_NewCFunction2(ctx, @ptrCast(&jsCookiesGetter), "cookies", 0, c.JS_CFUNC_getter_magic, 0));
+    definePropertyGetter(ctx, req_obj, "ip", c.JS_NewCFunction2(ctx, @ptrCast(&jsIpGetter), "ip", 0, c.JS_CFUNC_getter_magic, 0));
+    _ = c.JS_SetPropertyStr(ctx, req_obj, "unmaskedIp", c.JS_NewCFunction2(ctx, jsUnmaskedIp, "unmaskedIp", 0, c.JS_CFUNC_generic, 0));
 
     // request.session = {id: "<64hex>"} when the worker resolved a
     // session cookie (or freshly minted one) for this request, else
@@ -2307,11 +2348,18 @@ pub fn installRequest(
                     }
                 } else |_| {}
             }
-            _ = c.JS_SetPropertyStr(
+            // DEFINE (not set): `body` is a setter-less accessor by
+            // default (the read-taping getter) — a plain [[Set]]
+            // silently fails against it; defining replaces it. Chunk
+            // bytes are arbitrary binary → Uint8Array, and the chunk
+            // payload is the activation's Msg itself, recorded on
+            // the fetch_responses tape — never read-elided.
+            _ = c.JS_DefinePropertyValueStr(
                 ctx,
                 req_obj,
                 "body",
                 c.JS_NewUint8ArrayCopy(ctx, fc.bytes.ptr, fc.bytes.len),
+                c.JS_PROP_C_W_E,
             );
             _ = c.JS_SetPropertyStr(ctx, req_obj, "done", if (fc.final) js_true else js_false);
             if (fc.id) |fid| {
@@ -2366,11 +2414,15 @@ pub fn installRequest(
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "seq", c.JS_NewInt64(ctx, @intCast(ic.seq)));
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "byteOffset", c.JS_NewInt64(ctx, @intCast(ic.byte_offset)));
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "done", if (ic.done) js_true else js_false);
-        _ = c.JS_SetPropertyStr(
+        // DEFINE (not set) — see the fetch_chunk body comment: the
+        // default `body` accessor has no setter, so a plain [[Set]]
+        // silently no-ops; defining replaces it with the binary view.
+        _ = c.JS_DefinePropertyValueStr(
             ctx,
             req_obj,
             "body",
             c.JS_NewUint8ArrayCopy(ctx, request.body.ptr, request.body.len),
+            c.JS_PROP_C_W_E,
         );
         _ = c.JS_SetPropertyStr(ctx, req_obj, "done", if (ic.done) js_true else js_false);
         _ = c.JS_SetPropertyStr(ctx, req_obj, "chunkSeq", c.JS_NewInt64(ctx, @intCast(ic.seq)));
@@ -2439,11 +2491,79 @@ pub fn installRequest(
     _ = c.JS_SetPropertyStr(ctx, global, "response", resp_obj);
 }
 
-/// Build `request.headers` (flat lowercase object, pseudo-headers
-/// filtered) and `request.cookies` (parsed from the `cookie:` header)
-/// onto `req_obj`. Last-write-wins on duplicate header names — HTTP/2
-/// clients SHOULD coalesce duplicates and most do; if a real customer
-/// hits a producer that doesn't, we revisit.
+/// The IP transport headers hidden from `request.headers`. The
+/// client IP is personal data under GDPR; it is reachable ONLY via
+/// `request.ip` (masked) / `request.unmaskedIp()` (raw — the
+/// deliberate, taped escalation). Hiding the raw headers is what
+/// makes that friction real: read-taping can't redact (a redacted
+/// input breaks replay determinism), so the surface is minimized
+/// instead. The worker's own native XFF uses (proxy warning, the IP
+/// derivation below) read the wire directly and are unaffected.
+const STRIPPED_IP_HEADERS = [_][]const u8{
+    "x-forwarded-for",
+    "x-real-ip",
+    "cf-connecting-ip",
+    "forwarded",
+};
+
+fn isStrippedIpHeader(name: []const u8) bool {
+    for (STRIPPED_IP_HEADERS) |s| {
+        if (std.mem.eql(u8, s, name)) return true;
+    }
+    return false;
+}
+
+/// Record one request-surface read into the readset, if one is
+/// attached (unit-test paths run without). Failure to record is a
+/// warn, not a throw — it can only happen on OOM, and the divergence
+/// error on a later replay points straight back here.
+fn recordRequestRead(
+    state: *DispatchState,
+    kind: tape_mod.RequestReadKind,
+    name: []const u8,
+    value: []const u8,
+) void {
+    const rs = state.readset orelse return;
+    rs.request_reads.appendRequestReadOnce(kind, name, value) catch |err| {
+        std.log.warn("rove-js request_reads: record {s} '{s}': {s}", .{
+            @tagName(kind), name, @errorName(err),
+        });
+    };
+}
+
+/// Define `name` on `obj` as an accessor with the given getter
+/// JSValue and no setter (assignment throws in strict module code).
+/// ENUMERABLE + CONFIGURABLE — configurable is what lets the
+/// self-replacing getters swap themselves for a data property on
+/// first access, and lets duplicate header names re-define (last
+/// value wins, first occurrence keeps the enumeration slot).
+/// Consumes the getter ref (JS_DefinePropertyGetSet frees it).
+fn definePropertyGetter(
+    ctx: *c.JSContext,
+    obj: c.JSValue,
+    name: []const u8,
+    getter: c.JSValue,
+) void {
+    const atom = c.JS_NewAtomLen(ctx, name.ptr, name.len);
+    defer c.JS_FreeAtom(ctx, atom);
+    _ = c.JS_DefinePropertyGetSet(
+        ctx,
+        obj,
+        atom,
+        getter,
+        js_undefined,
+        c.JS_PROP_ENUMERABLE | c.JS_PROP_CONFIGURABLE,
+    );
+}
+
+/// Build `request.headers`: one recording getter per non-pseudo,
+/// non-IP-transport header (flat lowercase names per HTTP/2), plus
+/// the once-per-activation `header_names` tape entry that makes
+/// `Object.keys(request.headers)` replay faithfully without forcing
+/// every value onto the tape. Values are recorded only when a getter
+/// actually fires. Last-write-wins on duplicate header names —
+/// re-defining the accessor keeps the first occurrence's enumeration
+/// position, matching the old eager `JS_SetPropertyStr` semantics.
 fn installHeaders(
     ctx: *c.JSContext,
     state: *DispatchState,
@@ -2451,47 +2571,265 @@ fn installHeaders(
     hdrs_opt: ?h2.ReqHeaders,
 ) void {
     const headers_obj = c.JS_NewObject(ctx);
-    const cookies_obj = c.JS_NewObject(ctx);
-
-    var cookie_value: []const u8 = "";
 
     if (hdrs_opt) |hdrs| if (hdrs.fields) |fields_ptr| {
         const fields = fields_ptr[0..hdrs.count];
-        for (fields) |f| {
+
+        // First-occurrence name list for the `header_names` entry.
+        // Deduped the same way the property table dedupes (duplicate
+        // names re-define in place).
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(state.allocator);
+
+        for (fields, 0..) |f, i| {
             const name = f.name[0..f.name_len];
-            const value = f.value[0..f.value_len];
 
             // Skip pseudo-headers (`:method`, `:path`, `:scheme`,
-            // `:authority`). They're already exposed as
-            // `request.method` / `request.path` etc.
+            // `:authority`) — already exposed as `request.method` /
+            // `request.path` etc. — and the IP transport headers
+            // (see STRIPPED_IP_HEADERS).
             if (name.len > 0 and name[0] == ':') continue;
+            if (isStrippedIpHeader(name)) continue;
 
-            // NUL-terminate name for JS_SetPropertyStr.
-            const name_z = state.allocator.allocSentinel(u8, name.len, 0) catch continue;
-            defer state.allocator.free(name_z);
-            @memcpy(name_z, name);
-
-            _ = c.JS_SetPropertyStr(
+            // The getter's magic is the FIELD INDEX — no per-getter
+            // heap state; the getter reads name+value back out of
+            // `state.req_headers` on call. Duplicate names: the later
+            // define replaces the accessor → its (later) index wins.
+            definePropertyGetter(
                 ctx,
                 headers_obj,
-                name_z.ptr,
-                c.JS_NewStringLen(ctx, value.ptr, value.len),
+                name,
+                c.JS_NewCFunction2(ctx, @ptrCast(&jsHeaderGetter), "header", 0, c.JS_CFUNC_getter_magic, @intCast(i)),
             );
 
-            // Stash the cookie header for parseCookies below. If the
-            // wire has multiple Cookie headers (RFC 7230 says clients
-            // SHOULD send one) we take the last; this is consistent
-            // with the last-write-wins rule above.
-            if (std.mem.eql(u8, name, "cookie")) {
-                cookie_value = value;
+            if (state.readset != null) {
+                var seen = false;
+                for (names.items) |n| {
+                    if (std.mem.eql(u8, n, name)) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) names.append(state.allocator, name) catch {};
+            }
+        }
+
+        // Record the enumerable name set once per activation —
+        // `Object.keys` / `for..in` observe it without firing any
+        // getter, so replay needs it independently of the values.
+        if (state.readset != null) {
+            const json = stringSliceToJson(state.allocator, names.items) catch |err| blk: {
+                std.log.warn("rove-js request_reads: header_names json: {s}", .{@errorName(err)});
+                break :blk null;
+            };
+            if (json) |j| {
+                defer state.allocator.free(j);
+                recordRequestRead(state, .header_names, "", j);
             }
         }
     };
 
-    parseCookies(ctx, state, cookies_obj, cookie_value);
-
     _ = c.JS_SetPropertyStr(ctx, req_obj, "headers", headers_obj);
-    _ = c.JS_SetPropertyStr(ctx, req_obj, "cookies", cookies_obj);
+}
+
+/// JSON-encode a list of strings as a JSON array. Caller frees.
+fn stringSliceToJson(
+    allocator: std.mem.Allocator,
+    items: []const []const u8,
+) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    {
+        var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
+        defer buf = aw.toArrayList();
+        try std.json.Stringify.value(items, .{}, &aw.writer);
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// `request.headers.<name>` accessor (JS_CFUNC_getter_magic). The
+/// magic int is the index into `state.req_headers.fields`. Live mode
+/// only — replay builds its own getter surface in JS from the tape
+/// (web/replay/_static/request-replay.mjs).
+fn jsHeaderGetter(
+    ctx: ?*c.JSContext,
+    this_val: c.JSValue,
+    magic: c_int,
+) callconv(.c) c.JSValue {
+    _ = this_val;
+    const state = getState(ctx);
+    const hdrs = state.req_headers orelse return js_undefined;
+    const fields_ptr = hdrs.fields orelse return js_undefined;
+    const idx: usize = @intCast(magic);
+    std.debug.assert(idx < hdrs.count);
+    const f = fields_ptr[idx];
+    const name = f.name[0..f.name_len];
+    const value = f.value[0..f.value_len];
+    recordRequestRead(state, .header_value, name, value);
+    return c.JS_NewStringLen(ctx, value.ptr, value.len);
+}
+
+/// Self-replace an accessor with a data property holding `value` and
+/// return it. The define consumes one ref; the returned value is a
+/// fresh dup for the caller. Keeps object identity stable across
+/// repeat reads (`request.cookies === request.cookies`) and avoids
+/// re-materializing large bodies per access.
+fn selfReplaceWithValue(
+    ctx: ?*c.JSContext,
+    this_val: c.JSValue,
+    name: [*:0]const u8,
+    value: c.JSValue,
+) c.JSValue {
+    _ = c.JS_DefinePropertyValueStr(ctx, this_val, name, c.JS_DupValue(ctx, value), c.JS_PROP_C_W_E);
+    return value;
+}
+
+/// `request.body` accessor: records the body-read marker (which is
+/// what keeps the body's tape/log reference alive — unread bodies
+/// are elided by `Readset.elideUnreadBody`), then self-replaces with
+/// the materialized string. Reading an EMPTY body still records:
+/// "read an empty body" and "never looked" are different replay
+/// facts.
+fn jsBodyGetter(
+    ctx: ?*c.JSContext,
+    this_val: c.JSValue,
+    magic: c_int,
+) callconv(.c) c.JSValue {
+    _ = magic;
+    const state = getState(ctx);
+    if (state.readset) |rs| rs.body_read = true;
+    recordRequestRead(state, .body_read, "", "");
+    const body_val = c.JS_NewStringLen(ctx, state.req_body.ptr, state.req_body.len);
+    return selfReplaceWithValue(ctx, this_val, "body", body_val);
+}
+
+/// `request.cookies` accessor: counts as a read of the whole
+/// `cookie` header (recorded via the same `header_value` kind a
+/// direct `request.headers.cookie` read uses, so the two dedupe
+/// against each other), parses it (RFC 6265), and self-replaces with
+/// the parsed object.
+fn jsCookiesGetter(
+    ctx: ?*c.JSContext,
+    this_val: c.JSValue,
+    magic: c_int,
+) callconv(.c) c.JSValue {
+    _ = magic;
+    const state = getState(ctx);
+    const cookies_obj = c.JS_NewObject(ctx);
+
+    // Last `cookie` field wins — same rule as duplicate header
+    // values generally (RFC 7230 says clients SHOULD send one).
+    var cookie_value: []const u8 = "";
+    var have_cookie = false;
+    if (state.req_headers) |hdrs| if (hdrs.fields) |fields_ptr| {
+        for (fields_ptr[0..hdrs.count]) |f| {
+            if (std.mem.eql(u8, f.name[0..f.name_len], "cookie")) {
+                cookie_value = f.value[0..f.value_len];
+                have_cookie = true;
+            }
+        }
+    };
+    if (have_cookie) {
+        recordRequestRead(state, .header_value, "cookie", cookie_value);
+        parseCookies(ctx.?, state, cookies_obj, cookie_value);
+    }
+    return selfReplaceWithValue(ctx, this_val, "cookies", cookies_obj);
+}
+
+/// `request.ip` accessor — the MASKED client IP (IPv4: last octet
+/// zeroed; IPv6: /48 kept, rest zeroed), or null when no edge proxy
+/// reported one (or it didn't parse). Masked is the default surface:
+/// coarse geo / abuse heuristics work, and the tape stays clear of
+/// precise personal data. The raw IP is `request.unmaskedIp()`.
+fn jsIpGetter(
+    ctx: ?*c.JSContext,
+    this_val: c.JSValue,
+    magic: c_int,
+) callconv(.c) c.JSValue {
+    _ = magic;
+    const state = getState(ctx);
+    var buf: [64]u8 = undefined;
+    const masked: ?[]const u8 = if (deriveClientIp(state.req_headers)) |raw|
+        maskIp(&buf, raw)
+    else
+        null;
+    recordRequestRead(state, .ip_masked, "", masked orelse "");
+    const val = if (masked) |m| c.JS_NewStringLen(ctx, m.ptr, m.len) else js_null;
+    return selfReplaceWithValue(ctx, this_val, "ip", val);
+}
+
+/// `request.unmaskedIp()` — the deliberate raw-IP escalation. A
+/// method, not a property: the call shape is the "do you need this?"
+/// friction, and the call is the taped, controller-responsibility
+/// moment (the raw IP lands on the replay tape). Returns null when
+/// no edge proxy reported a client IP.
+fn jsUnmaskedIp(
+    ctx: ?*c.JSContext,
+    this: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    _ = this;
+    _ = argc;
+    _ = argv;
+    const state = getState(ctx);
+    const raw = deriveClientIp(state.req_headers);
+    recordRequestRead(state, .ip_raw, "", raw orelse "");
+    if (raw) |r| return c.JS_NewStringLen(ctx, r.ptr, r.len);
+    return js_null;
+}
+
+/// Derive the client IP from the wire headers: the last
+/// `cf-connecting-ip` value if present (the edge's authoritative
+/// single-value header), else the RIGHTMOST entry of the last
+/// `x-forwarded-for` header — the entry the trusted edge appended;
+/// anything a spoofing client sent rides further left. Returns a
+/// trimmed slice borrowing the header storage, or null when neither
+/// header is present / the result is empty.
+fn deriveClientIp(hdrs_opt: ?h2.ReqHeaders) ?[]const u8 {
+    const hdrs = hdrs_opt orelse return null;
+    const fields_ptr = hdrs.fields orelse return null;
+    var cf: ?[]const u8 = null;
+    var xff: ?[]const u8 = null;
+    for (fields_ptr[0..hdrs.count]) |f| {
+        const name = f.name[0..f.name_len];
+        if (std.mem.eql(u8, name, "cf-connecting-ip")) {
+            cf = f.value[0..f.value_len];
+        } else if (std.mem.eql(u8, name, "x-forwarded-for")) {
+            xff = f.value[0..f.value_len];
+        }
+    }
+    const candidate: []const u8 = if (cf) |v|
+        v
+    else if (xff) |v| blk: {
+        const comma = std.mem.lastIndexOfScalar(u8, v, ',');
+        break :blk if (comma) |i| v[i + 1 ..] else v;
+    } else return null;
+    const trimmed = std.mem.trim(u8, candidate, " \t");
+    return if (trimmed.len == 0) null else trimmed;
+}
+
+/// Mask an IP string into `buf`: IPv4 → last octet zeroed
+/// (`a.b.c.0`); IPv6 → first three groups kept (/48), remainder
+/// compressed to `::` (`2001:db8:85a3::`). Returns null when the
+/// input parses as neither — a malformed transport header yields no
+/// masked IP rather than leaking unparsed text.
+fn maskIp(buf: *[64]u8, raw: []const u8) ?[]const u8 {
+    if (std.mem.indexOfScalar(u8, raw, ':') == null) {
+        // IPv4: validate via the std parser, then rewrite the last
+        // octet textually.
+        _ = std.net.Ip4Address.parse(raw, 0) catch return null;
+        const last_dot = std.mem.lastIndexOfScalar(u8, raw, '.') orelse return null;
+        return std.fmt.bufPrint(buf, "{s}.0", .{raw[0..last_dot]}) catch null;
+    }
+    // IPv6 (possibly with a zone or v4-mapped tail — the std parser
+    // handles the grammar; we only need the first 48 bits).
+    const addr = std.net.Ip6Address.parse(raw, 0) catch return null;
+    const b: [16]u8 = addr.sa.addr;
+    const g0 = (@as(u16, b[0]) << 8) | b[1];
+    const g1 = (@as(u16, b[2]) << 8) | b[3];
+    const g2 = (@as(u16, b[4]) << 8) | b[5];
+    return std.fmt.bufPrint(buf, "{x}:{x}:{x}::", .{ g0, g1, g2 }) catch null;
 }
 
 /// RFC 6265 cookie-string parser: semicolon-separated `name=value`

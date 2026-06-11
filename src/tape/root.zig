@@ -75,9 +75,11 @@ pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
 /// 2 → 3 by §9 (seed-not-draws — dropped math_random + crypto_random);
 /// 3 → 4 by the §9 fold-in (dropped `.date` channel — Date.now is
 /// pinned per-request via `JS_SetDateNow`, the timestamp scalar in
-/// the readset header is the entire input). Pre-launch — no v3
-/// tapes need to be readable post-bump.
-pub const VERSION: u16 = 4;
+/// the readset header is the entire input); 4 → 5 by the read-taped
+/// request surface (new `.request_reads` channel; the dead
+/// `TriggerPayloadEntry.headers` reserved field removed). Pre-launch
+/// — no v4 tapes need to be readable post-bump.
+pub const VERSION: u16 = 5;
 
 /// Magic + version for the whole-Readset wire format used by
 /// `Readset.serialize` (`docs/readset-replication-plan.md` Phase 3).
@@ -96,6 +98,9 @@ pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
 /// (Date.now is pinned per-request via JS_SetDateNow); count
 /// drops 5 → 4. The header's `seed` + `timestamp_ns` scalars are
 /// now the entire input for the random + clock sources.
+/// 5 → 6 by the read-taped request surface: the `.request_reads`
+/// channel was added (count 4 → 5) — the lazily-recorded inbound
+/// request inputs (header names/values, body-read flag, ip reads).
 /// Pre-launch — hard cutover, no old raft logs to migrate. The parser
 /// accepts exactly this version and rejects anything else loudly; the
 /// version byte is a format guard, not a compatibility band. BodyRefs
@@ -103,8 +108,8 @@ pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
 /// (`_pool/{batch_id:0>20}`). When the format changes, bump this and
 /// delete the old shape in the same change — do not add a
 /// min-supported fallback.
-pub const READSET_VERSION: u16 = 5;
-pub const READSET_CHANNEL_COUNT: usize = 4;
+pub const READSET_VERSION: u16 = 6;
+pub const READSET_CHANNEL_COUNT: usize = 5;
 
 /// Renumbered contiguously by `docs/primitive-gaps.md` §9 +
 /// fold-in: `math_random` + `crypto_random` + `date` channels are
@@ -130,6 +135,20 @@ pub const Channel = enum(u16) {
     /// instead of the inline `request_body_bytes` capture.
     /// Zero entries when the request had no body.
     trigger_payload = 3,
+    /// The lazily-recorded inbound request surface
+    /// (`docs/handler-shape.md` request semantics): exactly the
+    /// request inputs the handler READ, nothing else — the GDPR
+    /// data-minimization channel. One `header_names` entry per
+    /// activation (so `Object.keys(request.headers)` replays
+    /// faithfully), one `header_value` entry per header the handler
+    /// actually read (incl. the whole `cookie` header on first
+    /// `request.cookies` access), a `body_read` marker when
+    /// `request.body` was touched (its absence is what licenses
+    /// eliding the trigger_payload body reference), and
+    /// `ip_masked` / `ip_raw` for `request.ip` /
+    /// `request.unmaskedIp()`. Replay reading anything NOT recorded
+    /// here is a divergence error, never a silent undefined.
+    request_reads = 4,
 };
 
 /// Outcome of a kv operation as captured on the tape. `NotFound` is
@@ -165,6 +184,32 @@ pub const KvPair = struct {
     value: []const u8,
 };
 
+/// What a `request_reads` entry records. The kind byte is the wire
+/// discriminator; `name`/`value` meaning depends on it (see
+/// `RequestReadEntry`).
+pub const RequestReadKind = enum(u8) {
+    /// Once per activation, recorded eagerly at request install iff
+    /// the request had wire headers. `name = ""`; `value` = JSON
+    /// array of lowercase non-pseudo, non-IP-transport header names
+    /// in first-occurrence order (== `Object.keys` order).
+    header_names = 0,
+    /// First read of one header's value (or of the whole `cookie`
+    /// header via `request.cookies`). `name` = lowercase header
+    /// name; `value` = what the handler saw (last-write-wins fold).
+    header_value = 1,
+    /// First `request.body` access. `name`/`value` empty. Presence
+    /// distinguishes "body read (possibly empty)" from "body never
+    /// observed → trigger_payload reference elided".
+    body_read = 2,
+    /// First `request.ip` access. `name = ""`; `value` = the masked
+    /// client IP returned (empty value ⇒ null was returned).
+    ip_masked = 3,
+    /// First `request.unmaskedIp()` call — the deliberate, taped
+    /// raw-IP escalation. `name = ""`; `value` = the unmasked IP
+    /// returned (empty value ⇒ null was returned).
+    ip_raw = 4,
+};
+
 /// Single captured event. Owned storage: the `Tape` that holds this
 /// entry also owns any byte slices it references.
 pub const Entry = union(Channel) {
@@ -172,6 +217,7 @@ pub const Entry = union(Channel) {
     module: ModuleEntry,
     fetch_responses: FetchResponseEntry,
     trigger_payload: TriggerPayloadEntry,
+    request_reads: RequestReadEntry,
 
     pub const KvEntry = struct {
         op: KvOp,
@@ -286,15 +332,23 @@ pub const Entry = union(Channel) {
     ///   substrate (every replica sees the bytes when the
     ///   entry replicates).
     ///
-    /// `headers` is reserved for future inbound-header capture
-    /// (replay currently re-reads method/path/host/wire headers
-    /// from the log record's dedicated fields); kept on the
-    /// entry so the wire layout matches the §4.1 readset shape
-    /// and a later slice can populate it without a version bump.
+    /// Inbound headers are NOT here — the handler-read subset rides
+    /// the `request_reads` channel (read-taping); method/path/host
+    /// stay on the log record's dedicated fields. The whole entry is
+    /// elided by `Readset.elideUnreadBody` when the handler never
+    /// read `request.body` (storage stays — only the log-side
+    /// reference is lazy).
     pub const TriggerPayloadEntry = struct {
         body_ref: bodies_mod.BodyRef,
-        headers: []const u8,
         inline_bytes: []const u8,
+    };
+
+    /// One lazily-recorded request-surface read. See
+    /// `RequestReadKind` for the per-kind `name`/`value` semantics.
+    pub const RequestReadEntry = struct {
+        kind: RequestReadKind,
+        name: []const u8,
+        value: []const u8,
     };
 };
 
@@ -468,32 +522,56 @@ pub const Tape = struct {
 
     /// Append one inbound trigger payload entry. The channel
     /// carries at most one entry per request; callers append
-    /// nothing when the request had no body. `headers` is
-    /// reserved for future capture — pass `""` for now.
+    /// nothing when the request had no body.
     ///
     /// `inline_bytes` carries the request body inline when the
     /// caller chose the small-body inline path (`body_ref.batch_id
     /// == bodies_mod.NO_BATCH`); empty for the by-reference path
     /// (`body_ref.batch_id != NO_BATCH`, bytes live in
-    /// `_pool/{batch_id}`). Both slices are
-    /// dup'd into tape storage.
+    /// `_pool/{batch_id}`). The slice is dup'd into tape storage.
     pub fn appendTriggerPayload(
         self: *Tape,
         body_ref: bodies_mod.BodyRef,
-        headers: []const u8,
         inline_bytes: []const u8,
     ) !void {
         std.debug.assert(self.channel == .trigger_payload);
-        const headers_copy = try self.allocator.dupe(u8, headers);
-        errdefer self.allocator.free(headers_copy);
         const inline_copy = try self.allocator.dupe(u8, inline_bytes);
         errdefer self.allocator.free(inline_copy);
         try self.entries.append(self.allocator, .{ .trigger_payload = .{
             .body_ref = body_ref,
-            .headers = headers_copy,
             .inline_bytes = inline_copy,
         } });
-        self.owned_bytes += headers_copy.len + inline_copy.len;
+        self.owned_bytes += inline_copy.len;
+    }
+
+    /// Record one request-surface read, once: if an entry with the
+    /// same `(kind, name)` already exists the call is a no-op (a
+    /// header's value can't change mid-request, so repeat reads add
+    /// no information). Linear scan — header counts are O(tens) and
+    /// this only runs on the FIRST read of each distinct input
+    /// anyway (the JS getters self-replace), so the scan is a
+    /// belt-and-braces guard, not the hot-path dedupe.
+    pub fn appendRequestReadOnce(
+        self: *Tape,
+        kind: RequestReadKind,
+        name: []const u8,
+        value: []const u8,
+    ) !void {
+        std.debug.assert(self.channel == .request_reads);
+        for (self.entries.items) |e| {
+            const r = e.request_reads;
+            if (r.kind == kind and std.mem.eql(u8, r.name, name)) return;
+        }
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+        const value_copy = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(value_copy);
+        try self.entries.append(self.allocator, .{ .request_reads = .{
+            .kind = kind,
+            .name = name_copy,
+            .value = value_copy,
+        } });
+        self.owned_bytes += name_copy.len + value_copy.len;
     }
 
     /// Serialize to a fresh heap buffer the caller owns. Empty tapes
@@ -581,6 +659,16 @@ pub const Readset = struct {
     /// resolves `request.body` via `BlobStore.getRange` instead of
     /// the inline `request_body_bytes` capture.
     trigger_payload: Tape,
+    /// The lazily-recorded request-surface reads (see
+    /// `Channel.request_reads`). The JS getters in
+    /// `globals.installRequest` append here on first access.
+    request_reads: Tape,
+    /// Set by the `request.body` getter on first access. Consulted
+    /// AFTER the handler ran (DispatchState is gone by then):
+    /// `elideUnreadBody` + the worker's `request_body_bytes` capture
+    /// gate on it. False ⇒ the body never influenced execution and
+    /// the log carries no reference to it.
+    body_read: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -594,6 +682,7 @@ pub const Readset = struct {
             .module = Tape.init(allocator, .module),
             .fetch_responses = Tape.init(allocator, .fetch_responses),
             .trigger_payload = Tape.init(allocator, .trigger_payload),
+            .request_reads = Tape.init(allocator, .request_reads),
         };
     }
 
@@ -602,26 +691,45 @@ pub const Readset = struct {
         self.module.deinit();
         self.fetch_responses.deinit();
         self.trigger_payload.deinit();
+        self.request_reads.deinit();
+    }
+
+    /// Drop the body reference from the readset when the handler
+    /// never read `request.body`. The body's STORAGE is untouched —
+    /// large bodies were already submitted to the pool pre-dispatch
+    /// (the durability gate is unconditional) — only the log-side
+    /// reference is lazy: no trigger_payload entry ⇒ the LogRecord /
+    /// raft entry carries nothing that points at the body bytes.
+    /// Idempotent; called at the top of `captureTapes` and before
+    /// every raft-entry readset serialization.
+    pub fn elideUnreadBody(self: *Readset) void {
+        if (self.body_read) return;
+        if (self.trigger_payload.entries.items.len == 0) return;
+        for (self.trigger_payload.entries.items) |*e| {
+            freeEntry(self.trigger_payload.allocator, e);
+        }
+        self.trigger_payload.entries.clearRetainingCapacity();
+        self.trigger_payload.owned_bytes = 0;
     }
 
     /// Serialize the whole readset to a single blob suitable for the
     /// raft entry's readset section
     /// (`docs/readset-replication-plan.md` Phase 3 + 5a). Wire format
-    /// (READSET_VERSION = 5):
+    /// (READSET_VERSION = 6):
     ///
     /// ```
     /// [u32  magic = READSET_MAGIC ('RREA')]
     /// [u16  version = READSET_VERSION]
     /// [i64  timestamp_ns  big-endian]
     /// [u64  seed          big-endian]
-    /// for each of the 4 channels in fixed order:
+    /// for each of the 5 channels in fixed order:
     ///   [u32 blob_len BE][blob_bytes]   // blob is a full Tape.serialize()
     /// [u32 log_header_len BE][log_header_bytes]   // Phase 5a
     /// ```
     ///
     /// Channels are emitted in fixed order: kv, module,
-    /// fetch_responses, trigger_payload — the same order
-    /// `parseReadset` consumes them. An empty channel still emits a
+    /// fetch_responses, trigger_payload, request_reads — the same
+    /// order `parseReadset` consumes them. An empty channel still emits a
     /// 12-byte header-only blob so the fixed layout stays alignable
     /// on the wire.
     ///
@@ -650,6 +758,7 @@ pub const Readset = struct {
             &self.module,
             &self.fetch_responses,
             &self.trigger_payload,
+            &self.request_reads,
         };
         for (channels) |t| {
             const blob = try t.serialize(allocator);
@@ -692,7 +801,8 @@ pub const ParsedReadset = struct {
     timestamp_ns: i64,
     seed: u64,
     /// Borrowed slices into the input bytes, one per channel in
-    /// fixed order (kv, module, fetch_responses, trigger_payload).
+    /// fixed order (kv, module, fetch_responses, trigger_payload,
+    /// request_reads).
     blobs: [READSET_CHANNEL_COUNT][]const u8,
     /// `docs/readset-replication-plan.md` Phase 5a — per-request
     /// LogRecord metadata. `null` when the producer didn't stamp a
@@ -968,8 +1078,11 @@ fn freeEntry(allocator: std.mem.Allocator, e: *Entry) void {
             allocator.free(f.inline_bytes);
         },
         .trigger_payload => |*t| {
-            allocator.free(t.headers);
             allocator.free(t.inline_bytes);
+        },
+        .request_reads => |*r| {
+            allocator.free(r.name);
+            allocator.free(r.value);
         },
     }
 }
@@ -1066,8 +1179,12 @@ fn encodeEntry(
             var br_len: [4]u8 = undefined;
             std.mem.writeInt(u32, &br_len, t.body_ref.len, .big);
             try buf.appendSlice(allocator, &br_len);
-            try appendLenPrefixed(allocator, buf, t.headers);
             try appendLenPrefixed(allocator, buf, t.inline_bytes);
+        },
+        .request_reads => |r| {
+            try buf.append(allocator, @intFromEnum(r.kind));
+            try appendLenPrefixed(allocator, buf, r.name);
+            try appendLenPrefixed(allocator, buf, r.value);
         },
     }
 }
@@ -1174,7 +1291,6 @@ fn decodeEntry(
             cur += 8;
             const br_len = std.mem.readInt(u32, bytes[cur..][0..4], .big);
             cur += 4;
-            const headers = try readLenPrefixed(bytes, &cur);
             const inline_bytes = try readLenPrefixed(bytes, &cur);
             if (cur != bytes.len) return ParseError.Truncated;
             return .{ .trigger_payload = .{
@@ -1183,8 +1299,21 @@ fn decodeEntry(
                     .offset = br_offset,
                     .len = br_len,
                 },
-                .headers = headers,
                 .inline_bytes = inline_bytes,
+            } };
+        },
+        .request_reads => {
+            if (bytes.len < 1) return ParseError.Truncated;
+            const kind = std.meta.intToEnum(RequestReadKind, bytes[0]) catch
+                return ParseError.UnknownChannel;
+            cur = 1;
+            const name = try readLenPrefixed(bytes, &cur);
+            const value = try readLenPrefixed(bytes, &cur);
+            if (cur != bytes.len) return ParseError.Truncated;
+            return .{ .request_reads = .{
+                .kind = kind,
+                .name = name,
+                .value = value,
             } };
         },
     }
@@ -1324,8 +1453,8 @@ test "readset: serialize + parseReadset roundtrip" {
     try rs.trigger_payload.appendTriggerPayload(
         .{ .batch_id = 3, .offset = 0, .len = 128 },
         "",
-        "",
     );
+    try rs.request_reads.appendRequestReadOnce(.header_value, "user-agent", "smoke/1");
 
     const bytes = try rs.serialize(testing.allocator, null);
     defer testing.allocator.free(bytes);
@@ -1342,6 +1471,7 @@ test "readset: serialize + parseReadset roundtrip" {
         .module,
         .fetch_responses,
         .trigger_payload,
+        .request_reads,
     };
     for (parsed.blobs, 0..) |blob, idx| {
         var p = try parse(testing.allocator, blob);
@@ -1539,7 +1669,6 @@ test "trigger_payload tape: BodyRef-only roundtrip (large body)" {
     try tape.appendTriggerPayload(
         .{ .batch_id = 3, .offset = 4096, .len = 1024 },
         "",
-        "",
     );
     const bytes = try tape.serialize(testing.allocator);
     defer testing.allocator.free(bytes);
@@ -1552,7 +1681,6 @@ test "trigger_payload tape: BodyRef-only roundtrip (large body)" {
     try testing.expectEqual(@as(u64, 3), t.body_ref.batch_id);
     try testing.expectEqual(@as(u64, 4096), t.body_ref.offset);
     try testing.expectEqual(@as(u32, 1024), t.body_ref.len);
-    try testing.expectEqualStrings("", t.headers);
     try testing.expectEqualStrings("", t.inline_bytes);
 }
 
@@ -1563,7 +1691,6 @@ test "trigger_payload tape: inline small-body roundtrip" {
     // Inline path: sentinel batch_id, body rides as inline_bytes.
     try tape.appendTriggerPayload(
         .{ .batch_id = 0, .offset = 0, .len = @intCast(body.len) },
-        "",
         body,
     );
     const bytes = try tape.serialize(testing.allocator);
@@ -1575,6 +1702,97 @@ test "trigger_payload tape: inline small-body roundtrip" {
     try testing.expectEqual(@as(u64, 0), t.body_ref.batch_id);
     try testing.expectEqualStrings(body, t.inline_bytes);
     try testing.expectEqual(@as(u32, body.len), t.body_ref.len);
+}
+
+test "request_reads tape: all kinds roundtrip" {
+    var tape = Tape.init(testing.allocator, .request_reads);
+    defer tape.deinit();
+    try tape.appendRequestReadOnce(.header_names, "", "[\"user-agent\",\"cookie\"]");
+    try tape.appendRequestReadOnce(.header_value, "user-agent", "smoke/1");
+    try tape.appendRequestReadOnce(.header_value, "cookie", "sid=abc; theme=dark");
+    try tape.appendRequestReadOnce(.body_read, "", "");
+    try tape.appendRequestReadOnce(.ip_masked, "", "203.0.113.0");
+    try tape.appendRequestReadOnce(.ip_raw, "", "203.0.113.7");
+
+    const bytes = try tape.serialize(testing.allocator);
+    defer testing.allocator.free(bytes);
+    var parsed = try parse(testing.allocator, bytes);
+    defer parsed.deinit();
+
+    try testing.expectEqual(Channel.request_reads, parsed.channel);
+    try testing.expectEqual(@as(usize, 6), parsed.entries.len);
+    const names = parsed.entries[0].request_reads;
+    try testing.expectEqual(RequestReadKind.header_names, names.kind);
+    try testing.expectEqualStrings("[\"user-agent\",\"cookie\"]", names.value);
+    const ua = parsed.entries[1].request_reads;
+    try testing.expectEqual(RequestReadKind.header_value, ua.kind);
+    try testing.expectEqualStrings("user-agent", ua.name);
+    try testing.expectEqualStrings("smoke/1", ua.value);
+    const br = parsed.entries[3].request_reads;
+    try testing.expectEqual(RequestReadKind.body_read, br.kind);
+    try testing.expectEqualStrings("", br.name);
+    const masked = parsed.entries[4].request_reads;
+    try testing.expectEqual(RequestReadKind.ip_masked, masked.kind);
+    try testing.expectEqualStrings("203.0.113.0", masked.value);
+    const raw = parsed.entries[5].request_reads;
+    try testing.expectEqual(RequestReadKind.ip_raw, raw.kind);
+    try testing.expectEqualStrings("203.0.113.7", raw.value);
+}
+
+test "request_reads tape: appendRequestReadOnce dedupes on (kind, name)" {
+    var tape = Tape.init(testing.allocator, .request_reads);
+    defer tape.deinit();
+    try tape.appendRequestReadOnce(.header_value, "user-agent", "smoke/1");
+    try tape.appendRequestReadOnce(.header_value, "user-agent", "smoke/1");
+    try tape.appendRequestReadOnce(.header_value, "user-agent", "ignored-second-value");
+    // Same name under a DIFFERENT kind is a distinct record.
+    try tape.appendRequestReadOnce(.header_value, "accept", "*/*");
+    try tape.appendRequestReadOnce(.body_read, "", "");
+    try tape.appendRequestReadOnce(.body_read, "", "");
+
+    try testing.expectEqual(@as(usize, 3), tape.entries.items.len);
+    try testing.expectEqualStrings("smoke/1", tape.entries.items[0].request_reads.value);
+    try testing.expectEqualStrings("accept", tape.entries.items[1].request_reads.name);
+    try testing.expectEqual(RequestReadKind.body_read, tape.entries.items[2].request_reads.kind);
+}
+
+test "elideUnreadBody: drops trigger_payload entries unless body was read" {
+    var rs = Readset.init(testing.allocator, 1, 1);
+    defer rs.deinit();
+    try rs.trigger_payload.appendTriggerPayload(
+        .{ .batch_id = 0, .offset = 0, .len = 5 },
+        "hello",
+    );
+    try testing.expectEqual(@as(usize, 1), rs.trigger_payload.entries.items.len);
+
+    // Unread → elided; idempotent on repeat.
+    rs.elideUnreadBody();
+    try testing.expectEqual(@as(usize, 0), rs.trigger_payload.entries.items.len);
+    try testing.expectEqual(@as(usize, 0), rs.trigger_payload.owned_bytes);
+    rs.elideUnreadBody();
+    try testing.expectEqual(@as(usize, 0), rs.trigger_payload.entries.items.len);
+
+    // Read → entry survives.
+    var rs2 = Readset.init(testing.allocator, 1, 1);
+    defer rs2.deinit();
+    try rs2.trigger_payload.appendTriggerPayload(
+        .{ .batch_id = 0, .offset = 0, .len = 5 },
+        "hello",
+    );
+    rs2.body_read = true;
+    rs2.elideUnreadBody();
+    try testing.expectEqual(@as(usize, 1), rs2.trigger_payload.entries.items.len);
+    try testing.expectEqualStrings("hello", rs2.trigger_payload.entries.items[0].trigger_payload.inline_bytes);
+}
+
+test "readset: old-version blob is rejected loudly" {
+    var rs = Readset.init(testing.allocator, 42, 7);
+    defer rs.deinit();
+    const blob = try rs.serialize(testing.allocator, null);
+    defer testing.allocator.free(blob);
+    // Patch the version field back to the previous wire version.
+    std.mem.writeInt(u16, blob[4..6], READSET_VERSION - 1, .big);
+    try testing.expectError(ParseError.UnsupportedVersion, parseReadset(blob));
 }
 
 test "fetch_responses tape: chunk + terminal roundtrip" {
