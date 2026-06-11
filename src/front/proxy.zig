@@ -652,10 +652,19 @@ pub fn Proxy(comptime FrontH2: type) type {
             flow.attempt += 1;
             self.reg.set(pump, coll, h2.Session, .{ .entity = sess }) catch {};
             self.reg.set(pump, coll, h2.ReqHeaders, packed_hdrs) catch {};
-            self.reg.set(pump, coll, h2.ReqBody, .{}) catch {};
+            // A bodyless request (GET/HEAD/DELETE — body complete with zero
+            // bytes) must carry END_STREAM on its upstream HEADERS: a proxy
+            // preserves END_STREAM position. Left open, the worker's
+            // headers-first disposition sees a phantom inbound body and a
+            // GET to an `onHeaders` module mis-dispatches to `onHeaders`
+            // instead of the default export. Non-empty bodies keep the
+            // streamed pump (chunks + close) — they ARE body-carrying.
+            const bodyless = flow.body_complete and flow.body_total == 0;
+            self.reg.set(pump, coll, h2.ReqBody, .{ .complete = bodyless }) catch {};
             self.reg.set(pump, coll, h2.H2IoResult, .{ .err = 0 }) catch {};
             self.reg.set(pump, coll, h2.StreamId, .{ .id = 0 }) catch {};
             self.reg.set(pump, coll, FlowRef, .{ .ptr = @ptrCast(flow), .attempt = flow.attempt }) catch {};
+            if (bodyless) flow.up_closed = true;
 
             flow.up_sess = sess;
             flow.attempt_live = true;

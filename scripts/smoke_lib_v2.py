@@ -76,7 +76,13 @@ def _curl(url: str, *, method: str = "GET", headers: Optional[dict] = None,
     args.append(url)
     proc = subprocess.run(args, input=data if data is not None else b"",
                           capture_output=True, timeout=timeout)
-    if proc.returncode != 0:
+    # Exit 55 = "failed sending data": the server replied before reading the
+    # whole upload and reset the rest (RST_STREAM NO_ERROR — legal h2; an
+    # onHeaders handler answering from headers alone does this on purpose).
+    # curl forgives early replies only for >=400 statuses; for an early 2xx
+    # it still exits 55 with the complete response in hand — report the
+    # response, not a phantom transport failure.
+    if proc.returncode != 0 and not (proc.returncode == 55 and b"\r\n\r\n" in proc.stdout):
         return HttpResponse(status=0, body=proc.stderr.decode(errors="replace"), headers={})
     raw = proc.stdout
     split = raw.rfind(b"\r\n\r\n")

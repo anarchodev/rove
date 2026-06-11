@@ -359,10 +359,16 @@ pub fn main() !void {
         // slice; an Upgrade proxies as a plain GET.
         .websocket_upgrades = false,
     });
-    defer server.destroy();
-
     var proxy = Proxy.init(allocator, &reg, server, cp_urls, &cache);
-    defer proxy.deinit();
+    // Teardown order matters: `server.destroy()` releases any still-live
+    // body sinks, and those callbacks walk proxy-owned Flow state — so the
+    // server must go down while the proxy is still alive. One defer block
+    // (LIFO with separate defers would run proxy.deinit first and the sink
+    // release would touch freed flows).
+    defer {
+        server.destroy();
+        proxy.deinit();
+    }
 
     // Phase 5: optional plaintext `:80` listener (ACME HTTP-01 + HTTP→HTTPS
     // redirect). Defaults to :80 when we terminate TLS (we own the public edge);
