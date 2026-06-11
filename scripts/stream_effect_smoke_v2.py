@@ -52,7 +52,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX  # noqa: E402
+from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, rpc_wrap  # noqa: E402
 
 # Handlers verbatim from the V1 demo tenant
 # (examples/loop46-demo-tenants/acme/{streamkv,writekv}/index.mjs).
@@ -111,7 +111,7 @@ def main() -> int:
         print("step 2: deploy streamkv + writekv (+ a root readiness probe)")
         try:
             dep_id = c.deploy_handlers("acme", {
-                "index.mjs": READY_SRC,
+                "index.mjs": rpc_wrap(READY_SRC),
                 "streamkv/index.mjs": STREAMKV_SRC,
                 "writekv/index.mjs": WRITEKV_SRC,
             })

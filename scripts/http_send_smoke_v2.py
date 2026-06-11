@@ -42,7 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX  # noqa: E402
+from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, rpc_wrap  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEMO = REPO_ROOT / "examples" / "loop46-demo-tenants"
@@ -80,8 +80,8 @@ def main() -> int:
         try:
             c.deploy_handlers("wb", {"index.mjs": WB_SRC})
             dep_id = c.deploy_handlers("acme", {
-                "index.mjs": ACME_INDEX_SRC,
-                "httpfire/index.mjs": HTTPFIRE_SRC,
+                "index.mjs": rpc_wrap(ACME_INDEX_SRC),
+                "httpfire/index.mjs": rpc_wrap(HTTPFIRE_SRC),
                 "httpresult.mjs": HTTPRESULT_SRC,
             })
             check("deploy_handlers → dep_id", bool(dep_id), f"dep_id={dep_id}")

@@ -28,7 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 HASH_SRC = """\
 export default function () {
@@ -69,7 +69,7 @@ def main() -> int:
         r = c.provision("acme")
         check("provision → 204", r.status == 204, f"got {r.status}")
         dep_id = c.deploy_handlers("acme", {
-            "index.mjs": READY_SRC,
+            "index.mjs": rpc_wrap(READY_SRC),
             "hash/index.mjs": HASH_SRC,
             "upload/index.mjs": ONHEADERS_SRC,
         })
