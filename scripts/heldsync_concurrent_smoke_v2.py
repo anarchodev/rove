@@ -139,7 +139,7 @@ def main() -> int:
         ready = c.wait_for_handler("acme", "/?fn=handler", want_body="ready")
         check("acme loaded", ready.status == 200 and "ready" in ready.body,
               f"got {ready.status} {ready.body!r}")
-        wb_url = f"http://wb.{PUBLIC_SUFFIX}:{c.node_ports[0]}/echo"
+        wb_url = f"http://wb.{PUBLIC_SUFFIX}:{c.front_port}/echo"
         deadline = time.monotonic() + 25.0
         wb_ok = False
         w = None

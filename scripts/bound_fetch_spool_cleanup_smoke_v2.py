@@ -115,7 +115,7 @@ def main() -> int:
             print("\nFAILURES:", failures)
             return 1
 
-        port = c.node_ports[0]
+        port = c.front_port
         cancel_url = f"http://wb.{PUBLIC_SUFFIX}:{port}/bigbody?n={CANCEL_N}"
         drip_url = f"http://wb.{PUBLIC_SUFFIX}:{port}/drip"
 

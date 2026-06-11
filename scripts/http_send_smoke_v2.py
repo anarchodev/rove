@@ -119,7 +119,7 @@ def main() -> int:
             return 1
 
         print("step 4: fire http.send through acme's httpfire handler")
-        target = f"http://wb.{PUBLIC_SUFFIX}:{c.node_ports[0]}/echo"
+        target = f"http://wb.{PUBLIC_SUFFIX}:{c.front_port}/echo"
         args = urllib.parse.quote(json.dumps([target, TAG]))
         send_id = ""
         deadline = time.monotonic() + 20.0

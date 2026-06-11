@@ -119,7 +119,7 @@ def main() -> int:
             return 1
 
         # 1. plaintext http → blocked at the scheme gate (TLS-always).
-        plain = f"http://wb.{PUBLIC_SUFFIX}:{c.node_ports[0]}/echo"
+        plain = f"http://wb.{PUBLIC_SUFFIX}:{c.front_port}/echo"
         r = probe(c, "plain", plain)
         check("http:// upstream → blocked 502",
               r.status == 502 and r.body.startswith("blocked:plain:"),
@@ -173,7 +173,7 @@ def main() -> int:
         check("wb echo reachable", wb_ok, f"got {w.status} {w.body!r}")
 
         # 6. the loopback h2c flow every other smoke relies on still works.
-        wb_url = f"http://wb.{PUBLIC_SUFFIX}:{c.node_ports[0]}/echo"
+        wb_url = f"http://wb.{PUBLIC_SUFFIX}:{c.front_port}/echo"
         r = probe(c, "hatch", wb_url)
         check("hatch: loopback h2c echo → 200 passed",
               r.status == 200 and r.body == "passed:hatch:echoed:hatch",
