@@ -7,9 +7,10 @@ end to end on the real V2 stack: a DEPLOYED JS handler's `onMessage` /
 `onDisconnect` exports served over a raw RFC 6455 connection.
 
 Topology: `V2Cluster` (single rewind node + CP + front + files-server-v2).
-The WS upgrade goes DIRECT to the node (the front door buffers full responses —
-no upgrade passthrough) with `Host: {tenant}.localhost`, the same direct-to-node
-pattern the held-stream smokes use.
+The WS upgrade goes THROUGH THE FRONT DOOR (websocket-plan §8.5): the front
+terminates the handshake and tunnels the connection to the worker as an RFC
+8441 Extended CONNECT stream on the pooled h2c conn — the production path.
+`Host: {tenant}.localhost` routes the tunnel like any request.
 
 Asserts:
   1. text frame → `onMessage` → `stream.write` text echo (read-only path,
@@ -200,7 +201,7 @@ def main() -> int:
             failures.append(label)
 
     with V2Cluster.spawn("wsworker", nodes=1) as c:
-        node_port = c.node_ports[0]
+        ws_port = c.front_port
         host = c.host_for(TENANT)
 
         print("step 1: provision + deploy the onMessage handler")
@@ -221,9 +222,9 @@ def main() -> int:
             print(f"\nFAILURES: {failures}")
             return 1
 
-        print("step 2: WS upgrade direct to the node (tenant Host)")
+        print("step 2: WS upgrade through the front (tenant Host)")
         try:
-            sock = ws_connect(node_port, host)
+            sock = ws_connect(ws_port, host)
             check("101 handshake + accept key", True)
         except Exception as e:
             check("101 handshake + accept key", False, repr(e))
@@ -289,7 +290,7 @@ def main() -> int:
 
         print("step 8: client Close frame → onDisconnect")
         try:
-            s2 = ws_connect(node_port, host)
+            s2 = ws_connect(ws_port, host)
             send_frame(s2, OP_TEXT, b"tag:clean")
             op, _, pl = recv_frame(s2)
             check("tagged:clean", pl == b"tagged:clean", f"pl={pl!r}")
@@ -313,7 +314,7 @@ def main() -> int:
 
         print("step 9: abrupt TCP drop → stale-chain sweep → onDisconnect")
         try:
-            s3 = ws_connect(node_port, host)
+            s3 = ws_connect(ws_port, host)
             send_frame(s3, OP_TEXT, b"tag:abrupt")
             op, _, pl = recv_frame(s3)
             check("tagged:abrupt", pl == b"tagged:abrupt", f"pl={pl!r}")
