@@ -61,7 +61,7 @@ Active work on the current (V2) line. Each folds into `architecture/` on ship.
 - [durable-wake-plan.md](durable-wake-plan.md) — scheduler primitive (gap #6; SHIPPED in full — P0–P7)
 - [websocket-plan.md](websocket-plan.md) — inbound WS (single-node baseline shipped 2026-06-09: transport + worker seam + smoke; remaining: broadcast recipe docs, outbound WS)
 - [blob-storage-plan.md](blob-storage-plan.md) — customer `blob.*` surface (P1–P4 shipped 2026-06-10: `blob.write`/`seal`/`receive` + `segments.js`)
-- [inbound-chunk-plan.md](inbound-chunk-plan.md) — streaming inbound body / `onChunk` (gap 2.4; S1–S3 shipped 2026-06-10; remaining: chunk tape, front-door streaming)
+- [inbound-chunk-plan.md](inbound-chunk-plan.md) — streaming inbound body / `onChunk` (gap 2.4; S1–S5 shipped 2026-06-10 incl. per-chunk tape; remaining: front-door streaming)
 - [tape-minimization.md](tape-minimization.md) — the minimal replay tape (4 record kinds) + tape-by-reference design
 - [plan-tiers.md](plan-tiers.md) — per-tenant tier enforcement
 - [builtin-libs-docs-plan.md](builtin-libs-docs-plan.md) — `_system.*` + JS shim docs
