@@ -26,7 +26,8 @@ wire only after the activation that produced it commits — and a blob coordinat
 
 | File | Role |
 |---|---|
-| `src/front/main.zig` | `rewind-front`: `Router` + `RouteCache` (Host→nodes, TTL), `proxyToCluster` (libcurl h2c, 503 leader-retry), `/_cp/route` + cert polling, the `:80` ACME HTTP-01 responder + HTTPS redirect, the move-orchestration entry. |
+| `src/front/main.zig` | `rewind-front` boot + edge config: TLS termination + cert polling, the `:80` ACME HTTP-01 responder + HTTPS redirect, the poll loop driving the proxy. |
+| `src/front/proxy.zig` | The streaming reverse-proxy core: `Proxy` (per-request `Flow` state machine, pooled h2c client conn per backend node, bidirectional body pumps with window-repayment backpressure, 421 re-aim with a replay buffer), `RouteCache` + the `/_cp/route` lookup (libcurl, control-plane only). |
 | `src/h2/root.zig` | rove-h2 server (nghttp2): per-stream request entities; `Conn` dual-stack (h2 + `Http1Conn`); the WebSocket collections `ws_message_out` / `ws_send_in`. |
 | `src/h2/http1.zig` | Pure HTTP/1.1 codec: `parseHead` → `:method/:path/:authority/:scheme`, resumable `decodeChunked`, `Expect: 100-continue`, keep-alive, chunked response serialize. |
 | `src/h2/ws.zig` | Pure RFC 6455 codec: `acceptKey`, `Opcode`, `parseFrame` (unmask in place, FIN/fragmentation surfaced), server-frame serialize. |
@@ -42,17 +43,39 @@ wire only after the activation that produced it commits — and a blob coordinat
 - **Stateless**: holds no raft state. Per request it resolves `:authority` →
   cluster via `Router.resolveRoute(host)`, backed by `RouteCache` (host → node
   URLs, TTL-bound) with a CP query (`GET /_cp/route?host=`) on miss.
-- **Leader-aware proxy** (`proxyToCluster`): tries the cluster's nodes in order
-  and stops at the first non-421. A follower 421s a write (`Bridge.propose`
-  rejects synchronously on a formed group it doesn't lead — nothing enters the
-  log, so re-executing elsewhere is safe), and a write self-routes to the
-  leader; a read is served by any synced node. A **503 is never retried by the
-  platform**: the worker's post-propose failures (commit-wait fault/timeout,
-  leadership-loss sweep) are ambiguous — the entry may still commit under a new
-  leader — and a blind retry double-executes the handler. Ambiguous 503s relay
-  to the client, whose retry policy owns that decision; all-nodes-421
-  (mid-election) maps to a plain retryable 503. Same discipline in the DP's
-  serve-or-forward (`proxy_engine.zig`). See [decisions.md §10.5](../decisions.md).
+- **Streaming proxy** (`src/front/proxy.zig`, 2026-06-11 — replaced the
+  blocking-curl first cut that buffered whole bodies): the data path is a
+  same-poll-loop rove-h2 CLIENT leg — one pooled h2c connection per backend
+  node, every proxied request a multiplexed stream. Request bodies stream
+  upstream as they arrive (`headers_first` + `BodySink` on the front's server
+  side → the client streaming leg), so headers-first propagates END TO END —
+  the worker makes its `onChunk`/`blob.receive` disposition while the body is
+  still arriving at the edge. Response bodies stream downstream
+  (`client_headers_first` + `BodySink` on the client side → the server's
+  `stream_response`/`stream_data` pipeline, h2 AND h1 downstream) — held SSE
+  streams relay frames mid-stream. Backpressure is end-to-end: each side's
+  flow-control window is repaid only as the opposite side drains. Deferred:
+  WebSocket tunneling (an Upgrade proxies as a plain GET; needs an h1-upgrade
+  client leg) and h1 inbound body streaming (h1 uploads buffer at the edge —
+  the h1 codec emits body-complete requests). Proven by
+  `scripts/front_streaming_smoke_v2.py`.
+- **Leader-aware proxy**: tries the cluster's nodes in order and stops at the
+  first non-421. A follower 421s a write (`Bridge.propose` rejects
+  synchronously on a formed group it doesn't lead — nothing enters the log, so
+  re-executing elsewhere is safe), and a write self-routes to the leader; a
+  read is served by any synced node. Streaming changes the mechanics, not the
+  contract: a 421 (or transport error before any response) re-aims at the next
+  node by REPLAYING the request body from a replay buffer — kept whole for
+  body-complete (classic/h1) requests at any size, and up to 256 KiB for
+  streamed bodies. A streamed body past the cap maps a 421 to a plain
+  retryable 503 (nothing executed — the follower refused at the door). A
+  **503 is never retried by the platform**: the worker's post-propose failures
+  (commit-wait fault/timeout, leadership-loss sweep) are ambiguous — the entry
+  may still commit under a new leader — and a blind retry double-executes the
+  handler. Ambiguous 503s relay to the client, whose retry policy owns that
+  decision; all-nodes-421 (mid-election) maps to a plain retryable 503. Same
+  discipline in the DP's serve-or-forward (`proxy_engine.zig`). See
+  [decisions.md §10.5](../decisions.md).
 - **Serve-or-forward**: a request that reaches the wrong cluster is forwarded by
   the data plane, not failed (the directory is the cutover authority; a stale
   front-door hint is one extra hop, never an error). See `control-plane.md`.

@@ -347,6 +347,11 @@ const Stream = struct {
     /// reference: released (and nulled) at stream close, after
     /// `finish` or `abort`.
     sink: ?BodySink = null,
+    /// client_headers_first: the response HEADERS were early-emitted
+    /// into `client_response_receiving` — the END_STREAM /
+    /// stream-close paths must not re-attach headers/body to the
+    /// request entity.
+    resp_emitted: bool = false,
     /// True once `sink.finish` was called (END_STREAM delivered) —
     /// stream close then releases without aborting.
     sink_finished: bool = false,
@@ -549,6 +554,30 @@ pub const H2Options = struct {
     /// the body attached at END_STREAM) or responds early (h2 flips
     /// the stream to discard). Only the rewind worker enables this.
     headers_first: bool = false,
+    /// Client-side mirror of `headers_first` (the front door's
+    /// streaming reverse proxy). Off (default): a client response is
+    /// delivered complete — RespHeaders/RespBody/Status attach to the
+    /// request entity at END_STREAM and it lands in
+    /// `client_response_out`. On: a final (non-1xx) response whose
+    /// HEADERS frame lacks END_STREAM emits a FRESH entity into
+    /// `client_response_receiving` immediately (Status + RespHeaders;
+    /// the consumer destroys it after reading), with nghttp2's auto
+    /// window update disabled — body DATA buffers unconsumed (the
+    /// upstream stalls after one stream window) until the consumer
+    /// attaches a `BodySink` via `requestBodySink` (same call as the
+    /// server side; the sink's drain rate then paces the upstream).
+    /// The request entity still reaches `client_response_out` at
+    /// stream close as the terminal signal, without headers/body
+    /// re-attached.
+    client_headers_first: bool = false,
+    /// Answer HTTP/1.1 `Upgrade: websocket` handshakes (RFC 6455 piece
+    /// A) on server connections. On (default) for the worker — the
+    /// edge or a direct client speaks WS to it. The front door turns
+    /// this OFF: terminating WS at the proxy would strand the frames
+    /// there (WS tunneling through the front is a separate, unbuilt
+    /// leg), so an Upgrade request degrades to a classic proxied GET
+    /// and the backend answers it as plain HTTP.
+    websocket_upgrades: bool = true,
 };
 
 // =============================================================================
@@ -648,6 +677,13 @@ pub fn H2(comptime opts: Options) type {
         client_request_in: ClientStreamColl,
         client_response_out: ClientStreamColl,
         _client_request_sending: ClientStreamColl,
+        // client_headers_first early-emission output (see the
+        // `H2Options.client_headers_first` doc): one FRESH entity per
+        // streaming response's HEADERS (Status + RespHeaders + Session
+        // + StreamId). Consumer-owned — read it, attach a body sink
+        // via `requestBodySink`, destroy it. Always-empty when
+        // client_headers_first is off.
+        client_response_receiving: ClientStreamColl,
 
         // Client streaming (conditional)
         client_stream_request_in: ClientStreamColl,
@@ -701,6 +737,23 @@ pub fn H2(comptime opts: Options) type {
         // `onDataChunkRecvCb` / `requestBodyBuffer`. Created once,
         // only when the first headers_first session comes up.
         var ng_server_option: ?*c.nghttp2_option = null;
+        // Client mirror for client_headers_first sessions.
+        var ng_client_option: ?*c.nghttp2_option = null;
+
+        /// Connection-level recv window for headers_first /
+        /// client_headers_first sessions. With manual window
+        /// management, every `.hold`/`.sink` stream's unconsumed bytes
+        /// are debt against BOTH its stream window and the shared
+        /// connection window. The stream window (65535 default) bounds
+        /// per-stream buffering — that's the backpressure we want. But
+        /// at the default 64 KiB CONNECTION window, a single held
+        /// stream wedges every other stream on the connection — fatal
+        /// for a proxy multiplexing many clients over one upstream
+        /// conn, and for the worker receiving that conn. Raise the
+        /// connection window so per-stream holds stay independent
+        /// (~256 concurrently-held streams before connection-level
+        /// pushback).
+        const HELD_CONN_RECV_WINDOW: i32 = 16 * 1024 * 1024;
 
         // =============================================================
         // COLLECTIONS — single source of truth for the 27 collection
@@ -759,6 +812,9 @@ pub fn H2(comptime opts: Options) type {
             .{ .name = "_client_connect_pending",  .Coll = ClientConnectColl, .kind = .client_connect, .client_only = true },
             .{ .name = "client_request_in",           .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true, .in_chain = true },
             .{ .name = "client_response_out",         .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true },
+            // Output-only, never a request entity's home — out of the
+            // chain so clientStreamClose/streamSet never match it.
+            .{ .name = "client_response_receiving",   .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true },
             .{ .name = "_client_request_sending",     .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true, .in_chain = true },
             .{ .name = "client_stream_request_in",    .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true, .in_chain = true },
             .{ .name = "client_stream_data_out",      .Coll = ClientStreamColl, .kind = .client_stream, .client_only = true, .in_chain = true },
@@ -947,7 +1003,10 @@ pub fn H2(comptime opts: Options) type {
         /// any non-`.gone` return h2 holds one sink reference,
         /// released by the sweep when the stream dies.
         pub fn requestBodySink(h2: *Self, conn_entity: Entity, stream_id: u32, sink: BodySink) SinkAttach {
-            if (!h2.h2_opts.headers_first) return .gone;
+            // Also serves client_headers_first consumers — the sink
+            // machinery (mode switch, sweep, window repayment) is
+            // direction-agnostic; the stream is addressed the same way.
+            if (!h2.h2_opts.headers_first and !h2.h2_opts.client_headers_first) return .gone;
             const conn_ptr = getConn(h2, conn_entity) orelse return .gone;
             const ng_session = conn_ptr.ng_session orelse return .gone;
             const stream: ?*Stream = @ptrCast(@alignCast(
@@ -1019,6 +1078,36 @@ pub fn H2(comptime opts: Options) type {
                 ref.sink.release(ref.sink.ctx);
                 _ = self.body_sinks.swapRemove(i);
             }
+        }
+
+        /// Abort an upstream (client-direction) stream: RST_STREAM with
+        /// CANCEL. The proxy uses this to abandon an attempt (a 421
+        /// re-aim, a downstream that died mid-upload) without
+        /// half-closing — a clean END_STREAM would make the peer treat
+        /// a truncated body as complete. The reset surfaces through
+        /// `onStreamCloseClientCb` → the request entity lands in
+        /// `client_response_out` with `err != 0`.
+        pub fn clientStreamReset(h2: *Self, conn_entity: Entity, stream_id: u32) void {
+            if (!has_client) return;
+            const conn_ptr = getConn(h2, conn_entity) orelse return;
+            const ng = conn_ptr.ng_session orelse return;
+            _ = c.nghttp2_submit_rst_stream(ng, c.NGHTTP2_FLAG_NONE, @intCast(stream_id), c.NGHTTP2_CANCEL);
+        }
+
+        /// Abort a server-direction stream whose response can no longer
+        /// complete (the proxy's upstream died mid-relay). h2: RST so
+        /// the client sees a hard stream error, never a clean
+        /// END_STREAM on a truncated body. h1: there is no mid-response
+        /// abort signal — destroy the connection (a chunked body with
+        /// no terminator IS the truncation signal).
+        pub fn serverStreamAbort(h2: *Self, conn_entity: Entity, stream_id: u32) void {
+            const conn_ptr = getConn(h2, conn_entity) orelse return;
+            if (conn_ptr.h1 != null) {
+                h2.reg.destroy(conn_entity) catch {};
+                return;
+            }
+            const ng = conn_ptr.ng_session orelse return;
+            _ = c.nghttp2_submit_rst_stream(ng, c.NGHTTP2_FLAG_NONE, @intCast(stream_id), c.NGHTTP2_INTERNAL_ERROR);
         }
 
         pub fn wsConnRouting(h2: *Self, conn_entity: Entity) ?struct { authority: []const u8, path: []const u8 } {
@@ -1099,13 +1188,19 @@ pub fn H2(comptime opts: Options) type {
             ));
             const nctx: *NgCtx = @ptrCast(@alignCast(user_data));
 
-            if (!nctx.h2.h2_opts.headers_first) {
+            if (!nctx.h2.h2_opts.headers_first and !nctx.h2.h2_opts.client_headers_first) {
                 if (stream == null) return 0;
                 if (!stream.?.bodyAppend(data, len))
                     return c.NGHTTP2_ERR_CALLBACK_FAILURE;
                 return 0;
             }
 
+            // headers_first / client_headers_first: auto window update
+            // is off on this stream's direction (server resp. client
+            // sessions); on the other direction the streams stay in
+            // `.auto` mode, whose `consume` call is a harmless no-op
+            // under nghttp2's auto window update.
+            //
             // headers_first: auto window update is off, so every byte
             // of inbound DATA is flow-control debt until a consume
             // call repays it. What happens to the bytes follows the
@@ -1499,6 +1594,15 @@ pub fn H2(comptime opts: Options) type {
                 conn.ng_ctx = null;
                 return error.Nghttp2SettingsFailed;
             }
+
+            // Manual window management: keep per-stream holds from
+            // starving the shared connection window — essential once a
+            // streaming front door multiplexes many clients' requests
+            // over ONE connection to this server (see the
+            // HELD_CONN_RECV_WINDOW doc).
+            if (self.h2_opts.headers_first) {
+                _ = c.nghttp2_session_set_local_window_size(session, c.NGHTTP2_FLAG_NONE, 0, HELD_CONN_RECV_WINDOW);
+            }
         }
 
         // =============================================================
@@ -1546,8 +1650,6 @@ pub fn H2(comptime opts: Options) type {
         ) callconv(.c) c_int {
             if (frame.*.hd.type != c.NGHTTP2_HEADERS and frame.*.hd.type != c.NGHTTP2_DATA)
                 return 0;
-            if (frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM == 0)
-                return 0;
 
             const stream: ?*Stream = @ptrCast(@alignCast(
                 c.nghttp2_session_get_stream_user_data(session, frame.*.hd.stream_id),
@@ -1557,6 +1659,65 @@ pub fn H2(comptime opts: Options) type {
             const s = stream.?;
             const nctx: *NgCtx = @ptrCast(@alignCast(user_data));
             const h2 = nctx.h2;
+            const end_stream = frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0;
+
+            // client_headers_first early emission: a final (non-1xx)
+            // response whose HEADERS frame lacks END_STREAM has body
+            // DATA still inbound. Emit a FRESH entity into
+            // `client_response_receiving` now (Status + RespHeaders)
+            // so the consumer can start relaying; the stream holds the
+            // flow-control window shut (`.hold`) until a sink is
+            // attached. A post-1xx final response misses the
+            // HCAT_RESPONSE gate and falls back to the classic
+            // buffered delivery — correct, just not streamed.
+            if (h2.h2_opts.client_headers_first and
+                frame.*.hd.type == c.NGHTTP2_HEADERS and
+                frame.*.headers.cat == c.NGHTTP2_HCAT_RESPONSE and
+                !end_stream and !s.resp_emitted and s.response_status >= 200)
+            {
+                const coll = &h2.client_response_receiving;
+                const resp_entity = h2.reg.create(coll) catch
+                    return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                var fields: ?[*]HeaderField = null;
+                var count: u32 = 0;
+                var buf_len: u32 = 0;
+                const hdr_buf = s.hdrFinalize(&fields, &count, &buf_len);
+                h2.reg.set(resp_entity, coll, StreamId, .{ .id = @intCast(frame.*.hd.stream_id) }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                h2.reg.set(resp_entity, coll, Session, .{ .entity = nctx.conn_entity }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                h2.reg.set(resp_entity, coll, Status, .{ .code = s.response_status }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                h2.reg.set(resp_entity, coll, RespHeaders, .{ .fields = fields, .count = count, ._buf = hdr_buf, ._buf_len = buf_len }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                h2.reg.set(resp_entity, coll, ReqHeaders, .{ .fields = null, .count = 0 }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                h2.reg.set(resp_entity, coll, ReqBody, .{ .data = null, .len = 0 }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                h2.reg.set(resp_entity, coll, RespBody, .{ .data = null, .len = 0 }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                h2.reg.set(resp_entity, coll, H2IoResult, .{ .err = 0 }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                s.resp_emitted = true;
+                s.body_mode = .hold;
+                return 0;
+            }
+
+            if (!end_stream) return 0;
+
+            if (s.resp_emitted) {
+                // END_STREAM on an early-emitted response: the body is
+                // complete. Repay held debt (backpressure is moot once
+                // the last byte is in); tell a sink. Headers/body are
+                // NOT re-attached to the request entity — they were
+                // delivered on the receiving entity; the request
+                // entity reaches `client_response_out` at stream close
+                // as the terminal signal.
+                if (s.unconsumed > 0) {
+                    _ = c.nghttp2_session_consume(session, frame.*.hd.stream_id, s.unconsumed);
+                    s.unconsumed = 0;
+                }
+                s.inbound_eof = true;
+                if (s.body_mode == .sink) {
+                    if (s.sink) |sk| {
+                        sk.finish(sk.ctx);
+                        s.sink_finished = true;
+                    }
+                }
+                return 0;
+            }
 
             if (!s.entity.isNil() and !h2.reg.isStale(s.entity)) {
                 var fields: ?[*]HeaderField = null;
@@ -1603,6 +1764,36 @@ pub fn H2(comptime opts: Options) type {
             const s = stream.?;
             const nctx: *NgCtx = @ptrCast(@alignCast(user_data));
 
+            // client_headers_first: bytes held un-consumed on a dying
+            // stream still occupy the CONNECTION window — repay it or
+            // every later stream on this connection inherits a
+            // shrunken window. (Mirror of the server-side close.)
+            if (s.unconsumed > 0) {
+                _ = c.nghttp2_session_consume_connection(session, s.unconsumed);
+                s.unconsumed = 0;
+            }
+
+            // Sink stream closing before END_STREAM delivered: the
+            // response can't complete — tell the driver. Release of
+            // h2's sink ref stays `sweepBodySinks`' job.
+            if (s.sink) |sk| {
+                if (!s.sink_finished) sk.abort(sk.ctx);
+                s.sink = null;
+            } else if (s.resp_emitted and s.body_len > 0 and
+                !s.entity.isNil() and !nctx.h2.reg.isStale(s.entity))
+            {
+                // Early-emitted response whose stream closed before the
+                // consumer attached a sink (a fast response can arrive
+                // and close within ONE poll — the receiving entity and
+                // this close land in the same turn). The `.hold` bytes
+                // would die with the Stream; hand them to the request
+                // entity instead — the terminal `client_response_out`
+                // event carries the body tail (the consumer relays it,
+                // gated on `err`).
+                const tail = takeBody(s);
+                streamSet(nctx.h2, s.entity, RespBody, .{ .data = tail.data, .len = tail.len });
+            }
+
             if (!s.entity.isNil() and !nctx.h2.reg.isStale(s.entity)) {
                 const err: i32 = if (error_code == 0) 0 else -1;
                 clientStreamClose(nctx.h2, s.entity, err);
@@ -1637,7 +1828,21 @@ pub fn H2(comptime opts: Options) type {
             nctx.* = .{ .h2 = self, .allocator = self.allocator, .conn_entity = conn_entity };
 
             var session: ?*c.nghttp2_session = null;
-            if (c.nghttp2_session_client_new(&session, ng_client_callbacks, @ptrCast(nctx)) != 0) {
+            if (self.h2_opts.client_headers_first) {
+                if (ng_client_option == null) {
+                    var opt: ?*c.nghttp2_option = null;
+                    if (c.nghttp2_option_new(&opt) != 0) {
+                        self.allocator.destroy(nctx);
+                        return error.OutOfMemory;
+                    }
+                    c.nghttp2_option_set_no_auto_window_update(opt, 1);
+                    ng_client_option = opt;
+                }
+                if (c.nghttp2_session_client_new2(&session, ng_client_callbacks, @ptrCast(nctx), ng_client_option) != 0) {
+                    self.allocator.destroy(nctx);
+                    return error.Nghttp2SessionCreateFailed;
+                }
+            } else if (c.nghttp2_session_client_new(&session, ng_client_callbacks, @ptrCast(nctx)) != 0) {
                 self.allocator.destroy(nctx);
                 return error.Nghttp2SessionCreateFailed;
             }
@@ -1657,6 +1862,13 @@ pub fn H2(comptime opts: Options) type {
                 conn.ng_session = null;
                 conn.ng_ctx = null;
                 return error.Nghttp2SettingsFailed;
+            }
+
+            // Manual window management: keep per-stream holds from
+            // starving the shared connection window (see the
+            // HELD_CONN_RECV_WINDOW doc).
+            if (self.h2_opts.client_headers_first) {
+                _ = c.nghttp2_session_set_local_window_size(session, c.NGHTTP2_FLAG_NONE, 0, HELD_CONN_RECV_WINDOW);
             }
         }
 
@@ -1800,6 +2012,7 @@ pub fn H2(comptime opts: Options) type {
             try self.reg.flush();
 
             self.sweepOrphanedInbound();
+            if (has_client) self.sweepOrphanedClient();
             try self.reg.flush();
 
             try self.writesAccount();
@@ -1823,6 +2036,30 @@ pub fn H2(comptime opts: Options) type {
                     if (getConn(self, sess.entity) == null) {
                         self.reg.set(ent, coll, H2IoResult, .{ .err = -1 }) catch {};
                         self.reg.move(ent, coll, &self.response_out) catch {};
+                    }
+                }
+            }
+        }
+
+        /// Client-side counterpart of `sweepOrphanedInbound`: an
+        /// upstream connection that dies takes its nghttp2 streams
+        /// down without firing per-stream close callbacks, so request
+        /// entities parked in the pump collections would wait forever
+        /// — the consumer only reacts to entities it is shown. Sweep
+        /// entities whose connection is gone into
+        /// `client_response_out` as failed streams. (Response-body
+        /// sinks on those streams are aborted + released by
+        /// `sweepBodySinks`, which detects the dead conn the same
+        /// way.)
+        fn sweepOrphanedClient(self: *Self) void {
+            if (!has_client) return;
+            for ([_]*ClientStreamColl{ &self.client_stream_data_out, &self._client_stream_data_sending, &self._client_request_sending }) |coll| {
+                const entities = coll.entitySlice();
+                const sessions = coll.column(Session);
+                for (entities, sessions) |ent, sess| {
+                    if (getConn(self, sess.entity) == null) {
+                        self.reg.set(ent, coll, H2IoResult, .{ .err = -1 }) catch {};
+                        self.reg.move(ent, coll, &self.client_response_out) catch {};
                     }
                 }
             }
@@ -2576,7 +2813,7 @@ pub fn H2(comptime opts: Options) type {
             // `Connection: upgrade` + `Sec-WebSocket-Key`. The `101` switches the
             // connection out of the HTTP request/response model; `head.head_len`
             // is consumed and any trailing bytes are early WS frames.
-            if (wsIsUpgrade(head)) {
+            if (self.h2_opts.websocket_upgrades and wsIsUpgrade(head)) {
                 self.wsHandshake(conn_ptr, conn_entity, head);
                 return;
             }

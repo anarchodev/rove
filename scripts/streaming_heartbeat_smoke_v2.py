@@ -14,14 +14,13 @@ discover_leader, seed_manifest (V2 provisions + deploys explicitly). The
 handler JS is reused VERBATIM from the V1 demo tenant
 (`examples/loop46-demo-tenants/acme/heartbeat/index.mjs`).
 
-The held SSE request goes DIRECT to the node, NOT the front door: the V2
-front door buffers the full backend response (single `RespBody` relay,
-src/front/main.zig) — it does not relay chunked DATA frames — so a
-never-terminating SSE stream through it never flushes a chunk before the
-client gives up. The node's h2 server streams `stream_data_in` DATA frames
-straight to the held client, which is the lifecycle under test. The
-disconnect (curl exits on --max-time) drives the worker's cell-cleanup
-path; we then assert the §4.4 disconnect activation logged on the node.
+The held SSE request goes DIRECT to the node — this smoke pins the
+WORKER-side lifecycle (stream_data_in DATA frames to a held client +
+the §4.4 disconnect activation when curl exits on --max-time). The
+edge path is covered separately: since the streaming proxy landed
+(2026-06-11, src/front/proxy.zig), `front_streaming_smoke_v2.py`
+asserts the same held-SSE frames relay incrementally THROUGH the
+front door.
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
 """

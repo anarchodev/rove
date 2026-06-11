@@ -225,8 +225,9 @@ the wake to the owning worker, falling back to `hash(tenant)` on a registry miss
   BodyRef, with submissions pipelined so the gate's S3 round-trip is
   off the serial path) — multi-chunk uploads replay like any request.
   Proven by `scripts/inbound_chunk_smoke_v2.py` (incl. the
-  log-server tape-query step). One follow-up remains: chunked uploads
-  are direct-to-worker until the front-door streaming proxy lands.
+  log-server tape-query step). The front-door streaming proxy landed
+  2026-06-11, so chunked uploads also work through the edge
+  (`scripts/front_streaming_smoke_v2.py`).
 - ~~**Inbound WebSocket dispatch (piece D)**~~ — shipped 2026-06-09: the worker
   `onMessage`/`onDisconnect` seam (`serviceWsMessages`, `src/js/worker_ws.zig`)
   consumes `ws_message_out` and lowers `stream.write` to `ws_send_in`
