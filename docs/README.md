@@ -60,7 +60,7 @@ Active work on the current (V2) line. Each folds into `architecture/` on ship.
 
 - [v2-production-deploy-plan.md](v2-production-deploy-plan.md) — first production topology (not yet built)
 - [websocket-plan.md](websocket-plan.md) — inbound WS (single-node baseline shipped 2026-06-09: transport + worker seam + smoke; remaining: broadcast recipe docs, outbound WS)
-- [inbound-chunk-plan.md](inbound-chunk-plan.md) — streaming inbound body / `onChunk` (gap 2.4; S1–S5 shipped 2026-06-10 incl. per-chunk tape; remaining: front-door streaming)
+- [inbound-chunk-plan.md](inbound-chunk-plan.md) — streaming inbound body / `onChunk` (gap 2.4; S1–S5 shipped 2026-06-10 incl. per-chunk tape; front-door streaming proxy shipped 2026-06-11 — remaining: h1 inbound streaming)
 - [tape-minimization.md](tape-minimization.md) — the minimal replay tape (4 record kinds) + tape-by-reference design
 - [builtin-libs-docs-plan.md](builtin-libs-docs-plan.md) — `_system.*` + JS shim docs
 - [replay-wasm-plan.md](replay-wasm-plan.md) — WASM replay UI (§8.6+ deferred)

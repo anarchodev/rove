@@ -2,8 +2,9 @@
 """Gap 2.4 smoke — streaming inbound body via the `onChunk` export
 (`docs/inbound-chunk-plan.md` S3).
 
-Proves, against a single rewind node (direct — the front door's
-streaming proxy is a separate gap):
+Proves, against a single rewind node (direct — pins the worker-side
+machinery; the edge path is `front_streaming_smoke_v2.py`, since the
+front-door streaming proxy landed 2026-06-11):
 
   1. single-fire: a small body to an onChunk module fires ONCE with the
      whole body, `done = true`, `chunkSeq = 0`
