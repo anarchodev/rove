@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 import { buildTapesFromBlobs } from "../web/replay/_static/rtap.mjs";
+import { buildRequestEpilogue } from "../web/replay/_static/request-replay.mjs";
 import getArenaJs from "../web/replay/_static/qjs_arena_wasm.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -43,7 +44,7 @@ const raw = JSON.parse(fs.readFileSync(bundlePath, "utf-8"));
 // on the wire. `Math.random` + `crypto.*` + `Date.now()` reseed
 // from `raw.seed` + `raw.timestamp_ns`, no per-call tape entries.
 const tape_blobs = {};
-for (const k of ["kv", "module"]) {
+for (const k of ["kv", "module", "request_reads"]) {
     const b64 = raw.tape_blobs?.[k];
     tape_blobs[k] = b64 ? new Uint8Array(Buffer.from(b64, "base64")) : null;
 }
@@ -196,21 +197,20 @@ if (!entry_path) {
 if (!entry_path || !entry_source) fail("no entry module in bundle");
 
 // arena_run_module only EVALUATES the module body — it doesn't
-// invoke any export. To exercise the captured handler (and consume
-// the tapes the way production did), append a stamp-and-call epilogue
-// to the entry source: set globalThis.request the way the worker does
-// per request, then call the named export. The injected lines show up
-// in the trace too, but they're at module-top scope, so they don't
-// confuse the call-tree timeline.
-const entry_fn = raw.entry_fn || "handler";
-const req_json = JSON.stringify(raw.request || { method: "GET", path: "/", host: "", body: "" });
+// invoke any export. The shared epilogue builder (request-replay.mjs,
+// same one the browser shell uses) rebuilds `request` from the
+// recorded `request_reads` tape — getters that throw REPLAY
+// DIVERGENCE on unrecorded reads — and invokes the export through
+// `__arena_entry_ns()`. The injected lines sit at module-top scope,
+// so they don't confuse the call-tree timeline.
 const wrapped_source =
     entry_source +
-    "\n;(() => {" +
-    "  globalThis.request = " + req_json + ";" +
-    "  globalThis.response = { status: 200, headers: {}, cookies: [] };" +
-    "  globalThis.__replay_result = " + entry_fn + "();" +
-    "})();\n";
+    buildRequestEpilogue({
+        record: raw.request || {},
+        requestReads: Module.tapes.request_reads,
+        bodyBytes: raw.request?.body ?? null,
+        exportName: raw.entry_fn || "default",
+    });
 
 arena_set_trace_mode(trace_mode_arg);
 const rc = arena_run_module(entry_path, wrapped_source);

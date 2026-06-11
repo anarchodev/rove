@@ -30,6 +30,7 @@
 //   ✗ variables drawer (needs engine.inspectAt — wired in phase C)
 
 import { buildTapesFromBlobs } from "./rtap.mjs";
+import { buildRequestEpilogue, exportForActivation } from "./request-replay.mjs";
 import { CursorEngine } from "./cursor.mjs";
 import getArenaJs from "./qjs_arena_wasm.js";
 
@@ -1200,6 +1201,20 @@ async function main() {
         return;
     }
 
+    // Read-taping: rebuild `request` from the recorded reads and
+    // invoke the activation's export — appended, so the original
+    // source's line numbers stay intact for the trace timeline.
+    // Before this the shell only evaluated the module body and never
+    // called the handler at all.
+    const epilogue = buildRequestEpilogue({
+        record: bundle.request || {},
+        requestReads: tapes.request_reads,
+        bodyBytes: bundle.request?.body_bytes ?? null,
+        exportName: exportForActivation(bundle.activation),
+        binaryBody: bundle.activation === "inbound_chunk" || bundle.activation === "fetch_chunk",
+    });
+    const entrySrcWithEpilogue = entrySrc + epilogue;
+
     // Surface engine output in case the handler prints / errors.
     const captured = [];
     const origPrint = Module.print, origErr = Module.printErr;
@@ -1230,7 +1245,7 @@ async function main() {
     let mat;
     try {
         mat = await state.engine.materialise(
-            { entry: { name: entryPath, src: entrySrc }, tapes, module_sources: moduleSources, seed, timestamp_ns },
+            { entry: { name: entryPath, src: entrySrcWithEpilogue }, tapes, module_sources: moduleSources, seed, timestamp_ns },
             { targetSnapshots },
         );
     } catch (err) {

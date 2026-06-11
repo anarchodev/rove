@@ -178,13 +178,16 @@ the recorder's encoding rules:
 ```
 Per-tape:
   [u32 magic = 0x52544150 'RTAP']
-  [u16 version = 1]
-  [u16 channel (0=kv, 1=date, 2=math_random, 3=crypto_random,
-                4=module, 5=fetch_responses, 6=trigger_payload)]
+  [u16 version = 5]
+  [u16 channel (0=kv, 1=module, 2=fetch_responses, 3=trigger_payload,
+                4=request_reads)]
   [u32 entry_count]
   for each entry: [u32 len][entry bytes]
 
-All multi-byte ints are big-endian.
+All multi-byte ints are big-endian. (The former date / math_random /
+crypto_random channels were retired by tape-minimization §4: the
+readset-header `timestamp_ns` + `seed` scalars replace them, and the
+channel ids were renumbered with the version bump.)
 ```
 
 Per-channel entry layouts:
@@ -201,20 +204,11 @@ kv       (channel 0):
     [u32 result_count]
     repeat: [u32 len][key][u32 len][value]
 
-date     (channel 1):
-  [i64 ms_epoch]
-
-math_random   (channel 2):
-  [f64 value]
-
-crypto_random (channel 3):
-  [u32 len][raw bytes]
-
-module   (channel 4):
+module   (channel 1):
   [u32 len][specifier utf-8]
   [u32 len][source_hash_hex utf-8]   // always 64 chars
 
-fetch_responses (channel 5):   // effects-and-handlers §2c-2
+fetch_responses (channel 2):   // effects-and-handlers §2c-2
   [u32 len][fetch_id utf-8]
   [u32 seq]
   [u64 byte_offset]
@@ -226,13 +220,22 @@ fetch_responses (channel 5):   // effects-and-handlers §2c-2
   [u8  terminal_ok]                  // 0 if !final
   [u8  body_truncated]               // 0 if !final
   [u32 len][headers utf-8]           // non-empty on seq=0 only
+  [u32 len][inline_bytes]            // inline fast path
 
-trigger_payload (channel 6):   // effects-and-handlers §2d/§4-inline
+trigger_payload (channel 3):   // effects-and-handlers §2d/§4-inline
   [u64 body_ref.batch_id]            // NO_BATCH(0) ⇒ inline bytes
   [u64 body_ref.offset]
   [u32 body_ref.len]                 // when inline, == inline_bytes.len
-  [u32 len][headers utf-8]           // reserved; empty for now
   [u32 len][inline_bytes]            // present when batch_id == NO_BATCH
+                                     // whole entry ELIDED when the handler
+                                     // never read request.body (§4.6
+                                     // read-taping, decisions.md)
+
+request_reads (channel 4):     // decisions.md §4.6 read-taped request surface
+  [u8 kind (0=header_names, 1=header_value, 2=body_read,
+            3=ip_masked, 4=ip_raw)]
+  [u32 len][name utf-8]              // header name for header_value; else ""
+  [u32 len][value utf-8]             // names-JSON / header value / ip string
                                      // (small-body inline path); empty
                                      // for the BodyRef-to-S3 path
 ```
