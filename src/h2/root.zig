@@ -53,6 +53,14 @@ pub const ReqHeaders = struct {
 pub const ReqBody = struct {
     data: ?[*]u8 = null,
     len: u32 = 0,
+    /// `client_stream_request_in` only: the request body — possibly empty —
+    /// is already complete at submit time. The submit carries END_STREAM
+    /// with the HEADERS (empty body) or after the attached body's DATA, so
+    /// a proxied bodyless request never looks body-carrying upstream (the
+    /// worker's headers-first disposition would mis-route it to
+    /// `onHeaders`). No `client_stream_data_in` / `client_stream_close_in`
+    /// pump follows. Ignored on every other collection.
+    complete: bool = false,
 
     pub fn deinit(allocator: std.mem.Allocator, items: []ReqBody) void {
         for (items) |*item| {
@@ -245,6 +253,36 @@ pub const Http1Conn = struct {
     /// wire. `nil` when no write is in flight.
     sending_entity: Entity = Entity.nil,
 
+    // ── Inbound body streaming (headers_first instances only) ────────────────
+    /// The in-flight request's stream state while its body is still inbound —
+    /// the same `Stream` accumulator the h2 path keeps as nghttp2 stream user
+    /// data (`body_mode` routing, accumulated bytes, sink ref + drain debt,
+    /// `inbound_eof`), so `requestBodyBuffer` / `requestBodySink` /
+    /// `sweepBodySinks` drive both protocols through one shape. Created at
+    /// early-emit, freed at request-cycle end (`http1FinishCycle`) or conn
+    /// teardown. Null when no streaming body is in flight.
+    stream: ?*Stream = null,
+    /// True from early-emit until the last body byte is consumed off the wire.
+    /// While set, inbound bytes route to `http1DriveBody` and no next request
+    /// is parsed (`buf` holds body framing, not a request head).
+    body_active: bool = false,
+    /// Content-Length bytes still owed. Null while the in-flight body is
+    /// chunked (`chunk_pos` / `chunk_body` carry the framing state instead).
+    body_remaining: ?usize = null,
+    body_chunked: bool = false,
+    /// Total body bytes routed so far (the `Expect: 100-continue` early-reply
+    /// close-out below needs "has the client started sending?").
+    body_seen: usize = 0,
+    /// `Expect: 100-continue` captured from the head — the head bytes are
+    /// compacted away at early-emit, and the decision-gated `100 Continue`
+    /// (sent when the consumer commits to the body) fires later.
+    expect_continue: bool = false,
+    /// The read entity parked in `_read_h1_paused` while inbound bytes have
+    /// outrun the consumer. nil = reads armed. TCP receive-window pushback is
+    /// h1's flow-control window; not re-arming the socket read is how we stop
+    /// repaying it.
+    paused_read: Entity = Entity.nil,
+
     // ── WebSocket mode (docs/websocket-plan.md §4.5/§4.6) ────────────────────
     /// Set once the `101` Upgrade has been queued: the connection has left the
     /// HTTP request/response model and `buf` now accumulates RFC 6455 frames
@@ -287,6 +325,14 @@ pub const Http1Conn = struct {
     /// proxy before the request ever reaches a tenant.
     pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
+    /// Backpressure cap for a streaming h1 inbound body: stop arming socket
+    /// reads when held-undecided bytes (`.hold`) or pushed-but-undrained sink
+    /// bytes (`.sink`) cross this; resume as the consumer decides / the sink
+    /// drains. Matches the 1 MiB h2 stream windows the worker and front
+    /// configure, so h1 and h2 uploads see the same per-stream buffering
+    /// bound at the edge.
+    pub const STREAM_PAUSE_BYTES: usize = 1024 * 1024;
+
     fn create(allocator: std.mem.Allocator) ?*Http1Conn {
         const h = allocator.create(Http1Conn) catch return null;
         h.* = .{ .allocator = allocator, .buf = .empty };
@@ -294,6 +340,7 @@ pub const Http1Conn = struct {
     }
 
     fn free(self: *Http1Conn) void {
+        if (self.stream) |s| s.free();
         self.buf.deinit(self.allocator);
         self.chunk_body.deinit(self.allocator);
         self.ws_msg.deinit(self.allocator);
@@ -662,6 +709,11 @@ pub fn H2(comptime opts: Options) type {
         _read_init: ReadColl,
         _read_active: ReadColl,
         _read_handshake: ReadColl,
+        // h1 inbound-body backpressure: the conn's read entity parks here
+        // (instead of re-arming via io.read_in) while streamed body bytes
+        // have outrun the consumer; `http1UnparkRead` re-arms it. At most
+        // one entry per h1 conn (`Http1Conn.paused_read`).
+        _read_h1_paused: ReadColl,
 
         // Connection pipeline
         _conn_tls_handshake: ConnColl,
@@ -804,6 +856,7 @@ pub fn H2(comptime opts: Options) type {
             .{ .name = "_read_init",           .Coll = ReadColl,   .kind = .server_read },
             .{ .name = "_read_active",         .Coll = ReadColl,   .kind = .server_read },
             .{ .name = "_read_handshake",      .Coll = ReadColl,   .kind = .server_read },
+            .{ .name = "_read_h1_paused",      .Coll = ReadColl,   .kind = .server_read },
             .{ .name = "_conn_tls_handshake",  .Coll = ConnColl,   .kind = .server_conn },
             .{ .name = "_conn_active",         .Coll = ConnColl,   .kind = .server_conn },
             .{ .name = "client_connect_in",        .Coll = ClientConnectColl, .kind = .client_connect, .client_only = true },
@@ -958,6 +1011,26 @@ pub fn H2(comptime opts: Options) type {
                     const sid = h2.reg.get(ent, coll, StreamId) catch return .gone;
 
                     const conn_ptr = getConn(h2, sess.entity) orelse return .gone;
+
+                    // h1 streaming body: the conn's in-flight Stream plays
+                    // the nghttp2 user-data role. "Re-opening the window" =
+                    // committing to the body: send the gated 100 Continue
+                    // and re-arm a parked read.
+                    if (conn_ptr.h1) |h1c| {
+                        const s = h1c.stream orelse return .gone;
+                        if (!s.entity.eql(ent)) return .gone;
+                        if (s.inbound_eof) {
+                            h2.reg.set(ent, coll, ReqBody, takeBody(s)) catch return .gone;
+                            return .body_complete;
+                        }
+                        s.body_mode = .buffer;
+                        s.unconsumed = 0;
+                        h2.http1MaybeContinueStored(conn_ptr, sess.entity);
+                        h2.http1UnparkRead(h1c);
+                        h2.reg.move(ent, coll, &h2.request_buffering) catch return .gone;
+                        return .buffering;
+                    }
+
                     const ng_session = conn_ptr.ng_session orelse return .gone;
                     const stream: ?*Stream = @ptrCast(@alignCast(
                         c.nghttp2_session_get_stream_user_data(ng_session, @intCast(sid.id)),
@@ -1008,6 +1081,39 @@ pub fn H2(comptime opts: Options) type {
             // direction-agnostic; the stream is addressed the same way.
             if (!h2.h2_opts.headers_first and !h2.h2_opts.client_headers_first) return .gone;
             const conn_ptr = getConn(h2, conn_entity) orelse return .gone;
+
+            // h1 streaming body: same attach contract, with read re-arm in
+            // place of window repayment (the sweep paces reads off
+            // `drained` exactly as it repays h2 window).
+            if (conn_ptr.h1) |h1c| {
+                const s = h1c.stream orelse return .gone;
+                if (s.ng_stream_id != @as(i32, @intCast(stream_id))) return .gone;
+                if (s.body_data) |p| {
+                    if (s.body_len > 0) {
+                        if (!sink.push(sink.ctx, p[0..s.body_len])) return .gone;
+                    }
+                    s.allocator.free(p[0..s.body_cap]);
+                    s.body_data = null;
+                    s.body_len = 0;
+                    s.body_cap = 0;
+                }
+                h2.body_sinks.append(h2.allocator, .{
+                    .conn_entity = conn_entity,
+                    .stream_id = @intCast(stream_id),
+                    .sink = sink,
+                }) catch return .gone;
+                s.sink = sink;
+                s.body_mode = .sink;
+                if (s.inbound_eof) {
+                    sink.finish(sink.ctx);
+                    s.sink_finished = true;
+                    return .eof;
+                }
+                h2.http1MaybeContinueStored(conn_ptr, conn_entity);
+                h2.http1UnparkRead(h1c);
+                return .streaming;
+            }
+
             const ng_session = conn_ptr.ng_session orelse return .gone;
             const stream: ?*Stream = @ptrCast(@alignCast(
                 c.nghttp2_session_get_stream_user_data(ng_session, @intCast(stream_id)),
@@ -1054,22 +1160,40 @@ pub fn H2(comptime opts: Options) type {
             var i: usize = 0;
             while (i < self.body_sinks.items.len) {
                 const ref = &self.body_sinks.items[i];
-                const live: ?struct { ng: *c.nghttp2_session, s: *Stream } = blk: {
+                // Resolve the live stream this ref still drives: h2 via
+                // nghttp2 stream user data; h1 via the conn's in-flight
+                // Stream — where a ctx mismatch means a NEW request's sink
+                // already replaced this one on the synthetic stream id (the
+                // old request's cycle is over → release this ref).
+                var ng: ?*c.nghttp2_session = null;
+                var h1c: ?*Http1Conn = null;
+                const live: ?*Stream = blk: {
                     const conn_ptr = getConn(self, ref.conn_entity) orelse break :blk null;
-                    const ng = conn_ptr.ng_session orelse break :blk null;
+                    if (conn_ptr.h1) |h| {
+                        h1c = h;
+                        const s = h.stream orelse break :blk null;
+                        const sk = s.sink orelse break :blk null;
+                        if (sk.ctx != ref.sink.ctx) break :blk null;
+                        break :blk s;
+                    }
+                    ng = conn_ptr.ng_session orelse break :blk null;
                     const st: ?*Stream = @ptrCast(@alignCast(
-                        c.nghttp2_session_get_stream_user_data(ng, ref.stream_id),
+                        c.nghttp2_session_get_stream_user_data(ng.?, ref.stream_id),
                     ));
                     const s = st orelse break :blk null;
                     if (s.sink == null) break :blk null;
-                    break :blk .{ .ng = ng, .s = s };
+                    break :blk s;
                 };
-                if (live) |l| {
+                if (live) |s| {
                     const delta = ref.sink.drained(ref.sink.ctx);
-                    if (delta > 0 and l.s.unconsumed > 0) {
-                        const repay = @min(delta, l.s.unconsumed);
-                        _ = c.nghttp2_session_consume(l.ng, ref.stream_id, repay);
-                        l.s.unconsumed -= repay;
+                    if (delta > 0 and s.unconsumed > 0) {
+                        const repay = @min(delta, s.unconsumed);
+                        if (ng) |sess| _ = c.nghttp2_session_consume(sess, ref.stream_id, repay);
+                        s.unconsumed -= repay;
+                    }
+                    // h1 window repayment = re-arming the socket read.
+                    if (h1c) |h| {
+                        if (s.unconsumed < Http1Conn.STREAM_PAUSE_BYTES) self.http1UnparkRead(h);
                     }
                     i += 1;
                     continue;
@@ -1957,6 +2081,7 @@ pub fn H2(comptime opts: Options) type {
             // Must run before io.poll so the writes they generate can be submitted
             // in the same iteration.
             self.sweepBodySinks();
+            self.sweepPausedH1Reads();
             try self.consumeResponses();
             try self.consumeStreamResponses();
             try self.consumeStreamData();
@@ -2775,7 +2900,16 @@ pub fn H2(comptime opts: Options) type {
                 return;
             };
             // Once upgraded, `buf` carries RFC 6455 frames, not HTTP requests.
-            if (h1c.ws_mode) self.wsDrive(conn_ptr, conn_entity) else self.http1Drive(conn_ptr, conn_entity);
+            // A streaming inbound body consumes its framing first; if that
+            // completes the body AND the response already went out,
+            // `http1BodyComplete` re-enters `http1Drive` for a pipelined next
+            // request, so the plain call below stays a no-op double-check.
+            if (h1c.ws_mode) {
+                self.wsDrive(conn_ptr, conn_entity);
+            } else {
+                if (h1c.body_active) self.http1DriveBody(conn_ptr, conn_entity);
+                self.http1Drive(conn_ptr, conn_entity);
+            }
         }
 
         /// Parse as much of the buffer as possible, emitting at most one request
@@ -2783,7 +2917,7 @@ pub fn H2(comptime opts: Options) type {
         /// drains (to pick up a coalesced next request).
         fn http1Drive(self: *Self, conn_ptr: *Conn, conn_entity: Entity) void {
             const h1c = conn_ptr.h1.?;
-            if (h1c.in_flight or h1c.closing) return;
+            if (h1c.in_flight or h1c.body_active or h1c.closing) return;
 
             var store: [http1.MAX_HEADERS]http1.Header = undefined;
             const res = http1.parseHead(h1c.buf.items, &store) catch |err| {
@@ -2818,9 +2952,16 @@ pub fn H2(comptime opts: Options) type {
                 return;
             }
 
+            // `:scheme` reflects the transport: TLS-terminated h1 is https.
+            const scheme: []const u8 = if (conn_ptr.tls_conn != null) "https" else "http";
+
             // Frame the body: chunked (Transfer-Encoding) decodes incrementally;
-            // otherwise Content-Length (absent ⇒ no body). Either way `body` is
-            // the assembled payload and `total` the bytes consumed from `buf`.
+            // otherwise Content-Length (absent ⇒ no body). A body that has fully
+            // arrived takes the classic body-complete emit below — the h1 mirror
+            // of h2's END_STREAM-at-HEADERS path. An incomplete body on a
+            // headers_first instance early-emits into `request_receiving` and
+            // streams (`http1BeginStreamingBody`); on classic instances it waits
+            // in `buf` exactly as before.
             var body: []const u8 = "";
             var total: usize = head.head_len;
             if (head.chunked) {
@@ -2835,7 +2976,11 @@ pub fn H2(comptime opts: Options) type {
                 h1c.chunk_pos = r.consumed; // resume offset for the next read
                 switch (r.status) {
                     .need_more => {
-                        self.http1MaybeContinue(conn_ptr, conn_entity, head);
+                        if (self.h2_opts.headers_first) {
+                            self.http1BeginStreamingBody(conn_ptr, conn_entity, head, scheme);
+                        } else {
+                            self.http1MaybeContinue(conn_ptr, conn_entity, head);
+                        }
                         return;
                     },
                     .malformed => {
@@ -2852,20 +2997,27 @@ pub fn H2(comptime opts: Options) type {
                 total = head.head_len + r.consumed;
             } else {
                 const body_len = head.content_length orelse 0;
-                if (body_len > Http1Conn.MAX_BODY_BYTES) {
+                // The 16 MiB edge backstop guards BUFFERING, not transit: a
+                // headers_first consumer may sink an arbitrarily large body
+                // (`blob.receive`), so the up-front declared-length reject
+                // applies only to classic instances; streaming enforces the
+                // cap where bytes actually accumulate (`http1RouteBody`,
+                // plus the worker's plan-tier 413 on the declared length).
+                if (body_len > Http1Conn.MAX_BODY_BYTES and !self.h2_opts.headers_first) {
                     self.http1ErrorClose(conn_ptr, conn_entity, 413);
                     return;
                 }
                 total = head.head_len + body_len;
                 if (h1c.buf.items.len < total) {
-                    self.http1MaybeContinue(conn_ptr, conn_entity, head);
+                    if (self.h2_opts.headers_first) {
+                        self.http1BeginStreamingBody(conn_ptr, conn_entity, head, scheme);
+                    } else {
+                        self.http1MaybeContinue(conn_ptr, conn_entity, head);
+                    }
                     return; // body still arriving
                 }
                 body = h1c.buf.items[head.head_len..total];
             }
-
-            // `:scheme` reflects the transport: TLS-terminated h1 is https.
-            const scheme: []const u8 = if (conn_ptr.tls_conn != null) "https" else "http";
             self.http1EmitRequest(conn_entity, head, body, scheme) catch {
                 self.http1ErrorClose(conn_ptr, conn_entity, 503);
                 return;
@@ -2898,18 +3050,324 @@ pub fn H2(comptime opts: Options) type {
             self.http1Send(conn_ptr, conn_entity, msg);
         }
 
-        /// Build a `request_out` entity from a parsed h1 head + body, synthesizing
+        // ── h1 inbound body streaming (headers_first) ─────────────────────────
+        //
+        // The h1 mirror of the h2 early-emission pipeline: an incomplete body
+        // early-emits the request into `request_receiving` at head-parse time
+        // (synthetic StreamId 1), and inbound bytes route per the consumer's
+        // disposition through the SAME `Stream` accumulator + `BodyMode` switch
+        // the h2 DATA callback uses — so `requestBodyBuffer` / `requestBodySink`
+        // / `sweepBodySinks` serve both protocols. Where h2 backpressure is
+        // flow-control window debt, h1's is the socket read: the read entity
+        // parks in `_read_h1_paused` when bytes outrun the consumer and is
+        // re-armed as the sink drains / the disposition lands.
+
+        /// headers_first: the head is parsed but the body hasn't fully arrived.
+        /// Early-emit the request and switch the connection into body-streaming
+        /// mode. The `Expect: 100-continue` reply is decision-gated (sent when
+        /// the consumer commits to the body via buffer/sink), not sent here.
+        fn http1BeginStreamingBody(self: *Self, conn_ptr: *Conn, conn_entity: Entity, head: http1.Head, scheme: []const u8) void {
+            const h1c = conn_ptr.h1.?;
+            const s = Stream.create(conn_entity, self.allocator) orelse {
+                self.http1ErrorClose(conn_ptr, conn_entity, 503);
+                return;
+            };
+            s.emitted = true;
+            s.ng_stream_id = 1;
+            s.body_mode = .hold;
+
+            const req_entity = self.http1CreateEntity(&self.request_receiving, conn_entity, head, scheme) catch {
+                s.free();
+                self.http1ErrorClose(conn_ptr, conn_entity, 503);
+                return;
+            };
+            s.entity = req_entity;
+            h1c.stream = s;
+
+            h1c.keep_alive = head.keep_alive;
+            h1c.expect_continue = head.expect_continue;
+            h1c.in_flight = true;
+            h1c.body_active = true;
+            h1c.body_chunked = head.chunked;
+            h1c.body_remaining = if (head.chunked) null else (head.content_length orelse 0);
+            h1c.body_seen = 0;
+
+            // Drop the head; `buf` now starts at the body region (the chunked
+            // resume offset `chunk_pos` is relative to it). The head's slices
+            // (`head`, the entity's ReqHeaders source) were consumed above.
+            const leftover = h1c.buf.items.len - head.head_len;
+            if (leftover > 0) std.mem.copyForwards(u8, h1c.buf.items[0..leftover], h1c.buf.items[head.head_len..]);
+            h1c.buf.shrinkRetainingCapacity(leftover);
+
+            // Chunked: the parse attempt already decoded a prefix into
+            // `chunk_body` — route it (under `.hold`) before continuing.
+            if (head.chunked and h1c.chunk_body.items.len > 0) {
+                const ok = self.http1RouteBody(conn_ptr, conn_entity, h1c.chunk_body.items);
+                h1c.chunk_body.clearRetainingCapacity();
+                if (!ok) return;
+            }
+            // Consume whatever body bytes already arrived.
+            self.http1DriveBody(conn_ptr, conn_entity);
+        }
+
+        /// Consume available inbound body bytes for the in-flight streaming
+        /// request (the h1 mirror of `onDataChunkRecvCb` + the END_STREAM
+        /// block). Leaves `buf` holding only not-yet-consumable bytes (a
+        /// chunk-framing tail / a pipelined next request).
+        fn http1DriveBody(self: *Self, conn_ptr: *Conn, conn_entity: Entity) void {
+            const h1c = conn_ptr.h1.?;
+            if (!h1c.body_active or h1c.closing) return;
+            const s = h1c.stream orelse return;
+
+            if (h1c.body_chunked) {
+                // The decode cap guards ACCUMULATION: `.hold`/`.buffer` grow
+                // the stream's buffer, so bound their remaining allowance at
+                // the edge backstop; `.sink`/`.discard` route bytes straight
+                // out and per-pass input is already bounded by read pacing.
+                const cap: usize = switch (s.body_mode) {
+                    .hold, .buffer, .auto => Http1Conn.MAX_BODY_BYTES -| s.body_len,
+                    .sink, .discard => std.math.maxInt(usize),
+                };
+                const r = http1.decodeChunked(h1c.buf.items, h1c.chunk_pos, &h1c.chunk_body, self.allocator, cap);
+                if (h1c.chunk_body.items.len > 0) {
+                    const ok = self.http1RouteBody(conn_ptr, conn_entity, h1c.chunk_body.items);
+                    h1c.chunk_body.clearRetainingCapacity();
+                    if (!ok) return;
+                }
+                switch (r.status) {
+                    .need_more, .complete => {
+                        // Drop fully-decoded framing from the buffer; the
+                        // resume offset is relative to what remains.
+                        if (r.consumed > 0) {
+                            const leftover = h1c.buf.items.len - r.consumed;
+                            if (leftover > 0) std.mem.copyForwards(u8, h1c.buf.items[0..leftover], h1c.buf.items[r.consumed..]);
+                            h1c.buf.shrinkRetainingCapacity(leftover);
+                        }
+                        h1c.chunk_pos = 0;
+                        if (r.status == .complete) self.http1BodyComplete(conn_ptr, conn_entity);
+                    },
+                    .malformed => self.http1ErrorClose(conn_ptr, conn_entity, 400),
+                    .too_large => self.http1ErrorClose(conn_ptr, conn_entity, 413),
+                }
+                return;
+            }
+
+            const remaining = h1c.body_remaining orelse 0;
+            const take = @min(h1c.buf.items.len, remaining);
+            if (take > 0) {
+                if (!self.http1RouteBody(conn_ptr, conn_entity, h1c.buf.items[0..take])) return;
+                const leftover = h1c.buf.items.len - take;
+                if (leftover > 0) std.mem.copyForwards(u8, h1c.buf.items[0..leftover], h1c.buf.items[take..]);
+                h1c.buf.shrinkRetainingCapacity(leftover);
+                h1c.body_remaining = remaining - take;
+            }
+            if ((h1c.body_remaining orelse 0) == 0) self.http1BodyComplete(conn_ptr, conn_entity);
+        }
+
+        /// Route streamed body bytes per the in-flight stream's mode. Returns
+        /// false when the request can take no more bytes (error response
+        /// queued / connection torn down) — callers stop driving.
+        fn http1RouteBody(self: *Self, conn_ptr: *Conn, conn_entity: Entity, bytes: []const u8) bool {
+            const h1c = conn_ptr.h1.?;
+            const s = h1c.stream.?;
+            h1c.body_seen += bytes.len;
+            switch (s.body_mode) {
+                .hold => {
+                    if (!s.bodyAppend(bytes.ptr, bytes.len)) {
+                        self.http1ErrorClose(conn_ptr, conn_entity, 500);
+                        return false;
+                    }
+                    s.unconsumed +|= @intCast(bytes.len);
+                },
+                .buffer, .auto => {
+                    // The Content-Length analog of the chunked decode cap —
+                    // accumulated bytes never exceed the edge backstop.
+                    if (s.body_len + bytes.len > Http1Conn.MAX_BODY_BYTES) {
+                        self.http1ErrorClose(conn_ptr, conn_entity, 413);
+                        return false;
+                    }
+                    if (!s.bodyAppend(bytes.ptr, bytes.len)) {
+                        self.http1ErrorClose(conn_ptr, conn_entity, 500);
+                        return false;
+                    }
+                },
+                .discard => {},
+                .sink => {
+                    const sk = s.sink orelse return true;
+                    if (!sk.push(sk.ctx, bytes)) {
+                        // Fatal sink failure. h2 RSTs the stream; for h1 the
+                        // stream IS the connection (`serverStreamAbort`'s
+                        // rule) — tear it down. `closing` makes the rest of
+                        // this drive inert while the destroy is in flight.
+                        h1c.closing = true;
+                        self.reg.destroy(conn_entity) catch {};
+                        return false;
+                    }
+                    s.unconsumed +|= @intCast(bytes.len);
+                },
+            }
+            return true;
+        }
+
+        /// The last body byte was consumed off the wire — the h1 mirror of the
+        /// h2 END_STREAM block in `onFrameRecvCb`.
+        fn http1BodyComplete(self: *Self, conn_ptr: *Conn, conn_entity: Entity) void {
+            const h1c = conn_ptr.h1.?;
+            const s = h1c.stream orelse return;
+            h1c.body_active = false;
+            s.inbound_eof = true;
+            self.http1UnparkRead(h1c);
+            switch (s.body_mode) {
+                .sink => {
+                    if (s.sink) |sk| {
+                        sk.finish(sk.ctx);
+                        s.sink_finished = true;
+                    }
+                },
+                .discard => {},
+                // Only a `.buffer` decision auto-completes (same contract as
+                // h2): attach the body and restore request_out's
+                // body-complete shape. `.hold` bytes wait under `inbound_eof`
+                // for the consumer's disposition (`requestBodyBuffer`
+                // attaches in place / a sink drains them at attach).
+                .buffer => {
+                    if (self.reg.isInCollection(s.entity, &self.request_buffering)) {
+                        self.reg.set(s.entity, &self.request_buffering, ReqBody, takeBody(s)) catch {};
+                        self.reg.move(s.entity, &self.request_buffering, &self.request_out) catch {};
+                    }
+                },
+                .hold, .auto => {},
+            }
+            // The response already went out (early reply mid-body): the cycle
+            // is over — reset and pick up a pipelined next request.
+            if (!h1c.in_flight and !h1c.closing) {
+                if (h1c.keep_alive) {
+                    self.http1FinishCycle(conn_ptr);
+                    self.http1Drive(conn_ptr, conn_entity);
+                } else {
+                    h1c.closing = true;
+                }
+            }
+        }
+
+        /// A request cycle fully ended (response written AND inbound body fully
+        /// consumed): drop the per-request stream state so the next keep-alive
+        /// request starts clean. A sink reference, if any, is released by
+        /// `sweepBodySinks` (it sees the stream gone — or, when a new request's
+        /// sink has replaced it, the ctx mismatch).
+        fn http1FinishCycle(self: *Self, conn_ptr: *Conn) void {
+            _ = self;
+            const h1c = conn_ptr.h1.?;
+            if (h1c.stream) |s| {
+                s.free();
+                h1c.stream = null;
+            }
+            h1c.body_active = false;
+            h1c.body_remaining = null;
+            h1c.body_chunked = false;
+            h1c.body_seen = 0;
+            h1c.expect_continue = false;
+            h1c.continue_sent = false;
+            h1c.chunk_pos = 0;
+            h1c.chunk_body.clearRetainingCapacity();
+        }
+
+        /// h1 mirror of `flipInboundBodyToDiscard`: a response is going out
+        /// while the request body is still inbound. Stop accumulating and keep
+        /// draining the remaining wire bytes so keep-alive framing survives.
+        /// An `Expect: 100-continue` client that was never told to proceed
+        /// will never send the body — close instead of waiting forever.
+        /// Runs BEFORE the response serializes (it may clear `keep_alive`).
+        fn http1FlipInboundToDiscard(self: *Self, conn_ptr: *Conn) void {
+            const h1c = conn_ptr.h1.?;
+            if (!h1c.body_active) return;
+            const s = h1c.stream orelse return;
+            if (h1c.expect_continue and !h1c.continue_sent and h1c.body_seen == 0) {
+                h1c.keep_alive = false;
+            }
+            // A `.sink` keeps draining (the driver owns the bytes); only the
+            // undecided / accumulate modes flip.
+            if (s.body_mode != .hold and s.body_mode != .buffer) return;
+            s.body_mode = .discard;
+            if (s.body_data) |p| {
+                s.allocator.free(p[0..s.body_cap]);
+                s.body_data = null;
+                s.body_len = 0;
+                s.body_cap = 0;
+            }
+            s.unconsumed = 0;
+            self.http1UnparkRead(h1c);
+        }
+
+        /// Decision-gated `100 Continue` for a streaming body: sent when the
+        /// consumer commits to reading it (buffer / sink attach).
+        fn http1MaybeContinueStored(self: *Self, conn_ptr: *Conn, conn_entity: Entity) void {
+            const h1c = conn_ptr.h1.?;
+            if (!h1c.expect_continue or h1c.continue_sent or !h1c.body_active) return;
+            h1c.continue_sent = true;
+            const msg = self.allocator.dupe(u8, "HTTP/1.1 100 Continue\r\n\r\n") catch return;
+            self.http1Send(conn_ptr, conn_entity, msg);
+        }
+
+        /// Re-arm a read parked for inbound-body backpressure.
+        fn http1UnparkRead(self: *Self, h1c: *Http1Conn) void {
+            if (h1c.paused_read.isNil()) return;
+            const ent = h1c.paused_read;
+            h1c.paused_read = Entity.nil;
+            self.reg.move(ent, &self._read_h1_paused, &self.io.read_in) catch {};
+        }
+
+        /// True when the in-flight streaming body has outrun its consumer:
+        /// `.hold` accumulated past the cap with no disposition yet, or
+        /// `.sink` pushed-but-undrained debt past the cap. The caller parks
+        /// the read entity instead of re-arming.
+        fn http1ReadShouldPause(self: *Self, conn_ptr: *Conn) bool {
+            _ = self;
+            const h1c = conn_ptr.h1 orelse return false;
+            if (h1c.closing or h1c.ws_mode or !h1c.body_active) return false;
+            const s = h1c.stream orelse return false;
+            return switch (s.body_mode) {
+                .hold => s.body_len >= Http1Conn.STREAM_PAUSE_BYTES,
+                .sink => s.unconsumed >= Http1Conn.STREAM_PAUSE_BYTES,
+                else => false,
+            };
+        }
+
+        /// Return parked h1 reads whose connection died to the io pool, the
+        /// same recycling `readsFeedData` does for live-path stale reads (conn
+        /// teardown can't — it doesn't know the read entity).
+        fn sweepPausedH1Reads(self: *Self) void {
+            const entities = self._read_h1_paused.entitySlice();
+            const conn_ents = self._read_h1_paused.column(rio.ConnEntity);
+            for (entities, conn_ents) |ent, ce| {
+                if (self.reg.isStale(ce.entity)) {
+                    self.reg.move(ent, &self._read_h1_paused, &self.io.read_in) catch {};
+                }
+            }
+        }
+
+        /// Create a request entity in `coll` from a parsed h1 head, synthesizing
         /// the h2-style pseudo-headers so all downstream routing/dispatch is
-        /// protocol-agnostic. `StreamId` is the synthetic 1 (one request/conn).
-        fn http1EmitRequest(self: *Self, conn_entity: Entity, head: http1.Head, body: []const u8, scheme: []const u8) !void {
-            const req_entity = try self.reg.create(&self.request_out);
+        /// protocol-agnostic. `StreamId` is the synthetic 1 (one request/conn);
+        /// `ReqBody` starts empty (the caller attaches a complete body or
+        /// streams into it).
+        fn http1CreateEntity(self: *Self, coll: *StreamColl, conn_entity: Entity, head: http1.Head, scheme: []const u8) !Entity {
+            const req_entity = try self.reg.create(coll);
             errdefer self.reg.destroy(req_entity) catch {};
 
-            try self.reg.set(req_entity, &self.request_out, StreamId, .{ .id = 1 });
-            try self.reg.set(req_entity, &self.request_out, Session, .{ .entity = conn_entity });
+            try self.reg.set(req_entity, coll, StreamId, .{ .id = 1 });
+            try self.reg.set(req_entity, coll, Session, .{ .entity = conn_entity });
 
             const rh = try self.http1BuildReqHeaders(head, scheme);
-            try self.reg.set(req_entity, &self.request_out, ReqHeaders, rh);
+            try self.reg.set(req_entity, coll, ReqHeaders, rh);
+            try self.reg.set(req_entity, coll, ReqBody, .{ .data = null, .len = 0 });
+            return req_entity;
+        }
+
+        /// Build a `request_out` entity from a parsed h1 head + complete body.
+        fn http1EmitRequest(self: *Self, conn_entity: Entity, head: http1.Head, body: []const u8, scheme: []const u8) !void {
+            const req_entity = try self.http1CreateEntity(&self.request_out, conn_entity, head, scheme);
+            errdefer self.reg.destroy(req_entity) catch {};
 
             var body_data: ?[*]u8 = null;
             if (body.len > 0) {
@@ -3040,6 +3498,19 @@ pub fn H2(comptime opts: Options) type {
             io_res: *H2IoResult,
         ) !void {
             const h1c = conn_ptr.h1.?;
+            // A streaming body that error-closed mid-flight (malformed chunk,
+            // cap) already queued its 4xx and doomed the conn — a worker
+            // response for that request has nowhere to go. (Unreachable on
+            // the classic path: parse errors precede emission there.)
+            if (h1c.closing) {
+                io_res.err = -1;
+                try self.reg.move(ent, &self.response_in, &self.response_out);
+                return;
+            }
+            // Responding while the request body is still inbound (early 4xx,
+            // worker error paths): flip the inbound side to discard FIRST —
+            // it may clear `keep_alive`, which the serializer consults below.
+            self.http1FlipInboundToDiscard(conn_ptr);
             var out: std.ArrayList(u8) = .empty;
             defer out.deinit(self.allocator);
 
@@ -3067,7 +3538,14 @@ pub fn H2(comptime opts: Options) type {
 
             if (h1c.keep_alive) {
                 h1c.in_flight = false;
-                self.http1Drive(conn_ptr, conn_entity);
+                if (!h1c.body_active) {
+                    // Cycle over (body already complete / never had one);
+                    // pick up a coalesced next request. When the body is
+                    // still draining post-flip, `http1BodyComplete` finishes
+                    // the cycle instead.
+                    self.http1FinishCycle(conn_ptr);
+                    self.http1Drive(conn_ptr, conn_entity);
+                }
             } else {
                 // Connection: close — let the idle-timeout GC reap once the write
                 // drains (same proven path as the old 426 reply).
@@ -3088,6 +3566,17 @@ pub fn H2(comptime opts: Options) type {
         /// push chunks onto.
         fn http1StreamBegin(self: *Self, ent: Entity, conn_ptr: *Conn, conn_entity: Entity, status: Status, rh: RespHeaders, io_res: *H2IoResult) !void {
             const h1c = conn_ptr.h1.?;
+            // Same mid-flight error-close guard as `http1WriteResponse`.
+            if (h1c.closing) {
+                io_res.err = -1;
+                try self.reg.move(ent, &self.stream_response_in, &self.response_out);
+                return;
+            }
+            // Same early-reply rule as `http1WriteResponse`: a streaming
+            // response starting while the request body is still inbound flips
+            // the inbound side to discard (may clear `keep_alive`, consulted
+            // at `http1StreamEnd`).
+            self.http1FlipInboundToDiscard(conn_ptr);
             var out: std.ArrayList(u8) = .empty;
             defer out.deinit(self.allocator);
 
@@ -3158,7 +3647,10 @@ pub fn H2(comptime opts: Options) type {
             try self.reg.move(ent, &self.stream_close_in, &self.response_out);
             if (h1c.keep_alive) {
                 h1c.in_flight = false;
-                self.http1Drive(conn_ptr, conn_entity);
+                if (!h1c.body_active) {
+                    self.http1FinishCycle(conn_ptr);
+                    self.http1Drive(conn_ptr, conn_entity);
+                }
             } else {
                 h1c.closing = true;
             }
@@ -3516,6 +4008,19 @@ pub fn H2(comptime opts: Options) type {
                                 self.http1Feed(conn_ptr, conn_ent.entity, data_ptr[0..data_len]);
                             }
                             conn_ptr.last_active_ns = monotonicNs();
+                        }
+                    }
+                    // Inbound-body backpressure: park instead of re-arming
+                    // when the streamed body has outrun its consumer. The
+                    // feed may have torn the conn down (deferred destroy) —
+                    // re-resolve before dereferencing.
+                    if (!self.reg.isStale(conn_ent.entity)) {
+                        if (getConn(self, conn_ent.entity)) |cp| {
+                            if (self.http1ReadShouldPause(cp)) {
+                                cp.h1.?.paused_read = ent;
+                                try self.reg.move(ent, &self._read_active, &self._read_h1_paused);
+                                continue;
+                            }
                         }
                     }
                     try self.reg.move(ent, &self._read_active, &self.io.read_in);
@@ -3988,9 +4493,10 @@ pub fn H2(comptime opts: Options) type {
             const entities = self.client_stream_request_in.entitySlice();
             const sessions = self.client_stream_request_in.column(Session);
             const req_hdrs = self.client_stream_request_in.column(ReqHeaders);
+            const req_bodies = self.client_stream_request_in.column(ReqBody);
             const io_results = self.client_stream_request_in.column(H2IoResult);
 
-            for (entities, sessions, req_hdrs, io_results) |ent, sess, rh, *io_res| {
+            for (entities, sessions, req_hdrs, req_bodies, io_results) |ent, sess, rh, rb, *io_res| {
                 const conn_ptr = getConn(self, sess.entity) orelse {
                     io_res.err = -1;
                     try self.reg.move(ent, &self.client_stream_request_in, &self.client_response_out);
@@ -4030,37 +4536,59 @@ pub fn H2(comptime opts: Options) type {
                     }
                 }
 
+                // `ReqBody.complete`: the body is fully known at submit (the
+                // proxy's bodyless / body-complete case) — submit it with the
+                // request so END_STREAM rides the HEADERS (empty) or the
+                // attached body's final DATA. No pump follows; the entity
+                // still parks in `client_stream_data_out` so the consumer
+                // learns the stream id for response mapping.
                 var data_prd = c.nghttp2_data_provider{
                     .source = .{ .ptr = null },
                     .read_callback = &onDataSourceReadCb,
                 };
+                var prd: ?*c.nghttp2_data_provider = &data_prd;
+                var body_data_ptr: ?*BodyData = null;
+                if (rb.complete) {
+                    if (rb.data != null and rb.len > 0) {
+                        body_data_ptr = BodyData.create(self.allocator, rb.data.?, rb.len) orelse {
+                            io_res.err = -1;
+                            try self.reg.move(ent, &self.client_stream_request_in, &self.client_response_out);
+                            continue;
+                        };
+                        data_prd.source = .{ .ptr = @ptrCast(body_data_ptr) };
+                    } else {
+                        prd = null;
+                    }
+                }
 
                 const stream_id = c.nghttp2_submit_request(
                     ng_session,
                     null,
                     nva_slice.ptr,
                     nv_count,
-                    &data_prd,
+                    prd,
                     null,
                 );
 
                 if (stream_id < 0) {
+                    if (body_data_ptr) |bd| bd.destroy();
                     io_res.err = -1;
                     try self.reg.move(ent, &self.client_stream_request_in, &self.client_response_out);
                     continue;
                 }
 
                 const stream = Stream.create(sess.entity, self.allocator) orelse {
+                    if (body_data_ptr) |bd| bd.destroy();
                     io_res.err = -1;
                     try self.reg.move(ent, &self.client_stream_request_in, &self.client_response_out);
                     continue;
                 };
                 stream.entity = ent;
                 stream.emitted = true;
-                stream.streaming = true;
+                stream.streaming = !rb.complete;
                 stream.client_stream = true;
-                stream.send_complete = false;
-                stream.send_data = null;
+                stream.send_complete = rb.complete and body_data_ptr == null;
+                stream.send_data = body_data_ptr;
                 stream.ng_stream_id = stream_id;
                 _ = c.nghttp2_session_set_stream_user_data(ng_session, stream_id, @ptrCast(stream));
 
