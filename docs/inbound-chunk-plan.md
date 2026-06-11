@@ -118,9 +118,11 @@ body inbound → respond + `flipInboundBodyToDiscard` (exists).
 
 ## Remaining work (keeps this plan in-flight)
 
-- **Front door.** Chunked uploads work direct-to-worker; the front
-  door's streaming proxy (a separate known gap) buffers, so the edge
-  path inherits its limits until that lands.
+- ~~**Front door.**~~ Shipped 2026-06-11: the front-door streaming
+  proxy (`src/front/proxy.zig`) forwards h2 request bodies as they
+  arrive (headers-first end to end), so chunked uploads work THROUGH
+  the edge — `scripts/front_streaming_smoke_v2.py` multi-fires a 12 MB
+  upload via the front. h1 ingress still buffers (next bullet).
 - **h1 bodies** arrive complete (no early emission), so an onChunk
   module gets them as one ≤16 MB single fire — fine semantically, but
   the h1 path never streams.

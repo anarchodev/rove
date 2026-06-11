@@ -742,8 +742,9 @@ libraries). The surprises worth flagging for first-run docs:
   single-node, so every node reads the same content-addressed store and
   replay survives tenant moves.
 - **A write in flight at a leader change is *faulted + retried*, not lost** — the
-  parked worker fails fast (503) and the front door's leader-aware proxy retries
-  the new leader (decisions.md §10.5). On failover the new leader has the full
+  parked worker fails fast (421 not-leader) and the front door's leader-aware
+  proxy re-aims at the new leader (decisions.md §10.5; ambiguous post-propose
+  503s relay un-retried). On failover the new leader has the full
   manifest but may 503 on a blob not yet visible in the shared backend (served
   on first read).
 - Outbound HTTP delivery (`webhook.send` shim): per-tenant `_send/owed/{id}`
@@ -781,7 +782,7 @@ rewind.js ships as **five binaries**, all `zig build` steps from this repo:
 | Binary | Source | Build step | Owns |
 |---|---|---|---|
 | `rewind` | `src/rewind/main.zig` | `zig build rewind` | The **worker / data-plane node**: per-worker QuickJS (arenajs) dispatcher; the per-tenant `Bridge` over the multi-raft `Node`; HTTP/2 serving; held-connection + streaming state; the durable-wake scheduler sweep (`_sched/`, gap 2.6 — webhook/email deferred fires, durable cron, and crash-recovery watchdogs all ride it; the per-feature owed/cron sweeps are deleted); `/_system/release`, `/_system/v2-*` (move), `/_system/services-token` machine-to-machine endpoints. Hosts the DP system tenants `__admin__` / `__replay__` / `__auth__`. |
-| `rewind-front` | `src/front/main.zig` | `zig build rewind-front` | The **front door** (stateless edge): terminates TLS (own ACME), routes `Host → cluster` from the CP directory (cached, off the hot path), leader-aware proxy (`proxyToCluster`, retry-on-503), orchestrates tenant moves (`POST /_control/move`). |
+| `rewind-front` | `src/front/main.zig` + `src/front/proxy.zig` | `zig build rewind-front` | The **front door** (stateless edge): terminates TLS (own ACME), routes `Host → cluster` from the CP directory (cached, off the hot path), STREAMING leader-aware proxy (pooled h2c client legs, bodies relay both directions as they arrive, 421 re-aim with replay buffer). (Tenant moves are the CP's `POST /_control/move`.) |
 | `rewind-cp` | `src/cp/main.zig` | `zig build rewind-cp` | The **control plane** (a small dedicated raft cluster, 3–5 voters): the replicated `__directory__` group — authoritative `Host → cluster` placement, per-tenant `plan/*`, ACME `cert/*`. Sequences tenant moves; the directory flip is the move commit point. |
 | `files-server-v2` | `examples/files_server_v2.zig` | `zig build files-server-v2` | The **deploy publisher** (cluster-free): compiles + uploads bytecode/static blobs + a content-addressed manifest to S3; bootstraps the `__admin__` / `__replay__` bundles; flips `_deploy/current` via the worker's `/_system/release`. Runs no raft of its own. |
 | `log-server` | `src/log_server/*` | (standalone) | The **request-log query surface**: polls S3 for per-node `.ndjson` log batches + sidecars, maintains a local SQLite `log_index.db`, serves `/v1/{tenant}/{list,show,count}` to the dashboard. No raft. |
