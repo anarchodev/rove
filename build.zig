@@ -202,9 +202,8 @@ pub fn build(b: *std.Build) void {
 
     // ── rove-log-server: standalone log-server (Phase 5.5 a) ─────────
     //
-    // Indexer + h2 query API, S3-backed. Runs in the loop46 process
-    // for the in-process spawn path; the standalone binary at
-    // examples/log_server_standalone.zig wraps the same modules.
+    // Indexer + h2 query API, S3-backed. The production binary at
+    // src/log_server/main.zig wraps these modules.
     const log_server_mod = b.addModule("rove-log-server", .{
         .root_source_file = b.path("src/log_server/root.zig"),
         .target = target,
@@ -587,7 +586,7 @@ pub fn build(b: *std.Build) void {
     // named step (not the default install) so it builds on the V2 branch where
     // the V1 binaries don't.
     const fs_v2_mod = b.addModule("files-server-v2", .{
-        .root_source_file = b.path("examples/files_server_v2.zig"),
+        .root_source_file = b.path("src/files_server/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -615,7 +614,7 @@ pub fn build(b: *std.Build) void {
     // Smoke driver populates the batch-store dir directly on disk
     // (no worker yet); step 3 wires the worker's flush path into S3.
     const ls_standalone_mod = b.addModule("log-server-standalone", .{
-        .root_source_file = b.path("examples/log_server_standalone.zig"),
+        .root_source_file = b.path("src/log_server/main.zig"),
         .target = target,
         .optimize = optimize,
     });
