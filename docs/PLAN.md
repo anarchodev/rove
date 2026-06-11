@@ -109,7 +109,8 @@ top: an `_send/owed/{id}` owed-marker (an ordinary envelope-0 kv write, atomic
 with the handler's writeset) + `http.fetch` + a boot/cron sweep that re-fires
 stale markers. At-least-once (receivers dedup on the id header); vendor-neutral
 (no platform signing header — customers stamp HMAC/SigV4 via `crypto.*`);
-mandatory SSRF block + TLS-always. Why durability-as-JS-shim (and the three
+mandatory SSRF block + TLS-always (⚠️ the blocklist is contract-not-yet-wired
+in V2 — see §12). Why durability-as-JS-shim (and the three
 retired native generations — `webhooks.db`, `http.send`+`schedules.db`,
 `SendDispatch`): decisions.md §3.3 + §3.4 + §7; mechanics:
 `architecture/effects-and-handlers.md` (the primitive itself:
@@ -186,6 +187,12 @@ model: decisions.md §2 + §10; mechanics: `architecture/consensus-and-storage.m
 > (Launch sequencing) owns the beta / 1.0 / post-1.0 split and remaps
 > phases across those windows. Read this section for what each phase
 > *contains*; read §10.16 for what ships *when*.
+>
+> **Shipped phases are collapsed** (2026-06-11) to a status line + pointers —
+> the phase numbers stay because code comments and other docs cite them; the
+> original work-item detail is in git history and, where it survived contact
+> with reality, in `architecture/` / decisions.md. Unbuilt phases (9, 10, 12,
+> 13, 14) keep their content; 12–14 defer to their sub-plan docs.
 
 **Cross-cutting for every phase**:
 - `deployment_id` on all request logs.
@@ -194,193 +201,105 @@ model: decisions.md §2 + §10; mechanics: `architecture/consensus-and-storage.m
 - Logger nesting for triggers/webhooks/callbacks under parent `request_id`.
 - All admin API paths versioned `/v1/` from day one.
 
-### Phase 1 — Domain infrastructure
+### Phase 1 — Domain infrastructure — SHIPPED (re-platformed in V2)
 
-- Register `rewindjs.app`.
-- DNS: apex + wildcard `*.rewindjs.app` pointed at server IP, proxied through Cloudflare.
-- Wildcard LE cert via `scripts/rove-lego-renew.sh` (ACME DNS-01). rove-js reads `cert.pem`/`key.pem` directly and terminates TLS in-process; Cloudflare fronts with Full/Strict.
-- Host routing lives in the worker (`*.rewindjs.app` + `app.rewindjs.com` both hit js-worker; dispatcher splits by host). No reverse proxy.
-- Response layer: sanitize `Set-Cookie` `Domain=` attribute (strip).  **Done**: `sanitizeSetCookie` in `src/js/dispatcher.zig:819`, applied in `extractResponseMetadata` on every JS handler response. Covered by 9 inline tests.
-- `rove-tenant` wildcard domain resolution — accept any `*.rewindjs.app` matching a registered instance id.
-- PSL submission (`rewindjs.app` → `publicsuffix/list`) **deferred to Phase 10**. Server-side Domain stripping above is the authoritative defense; PSL is defense-in-depth at the browser level and its propagation lag makes it unsuitable for the launch path.
+Domains, wildcard TLS, host routing. In V2 the stateless front door
+(`rewind-front`) terminates TLS with its own ACME issuer and routes
+Host→cluster from the CP directory; `Set-Cookie Domain=` stripping (the
+authoritative cookie-isolation defense) shipped with inline tests. PSL
+submission stays deferred to Phase 10. Mechanics:
+`architecture/routing-and-ingress.md` + `architecture/auth-and-domains.md`.
 
-### Phase 2 — File API + static serving
+### Phase 2 — File API + static serving — SHIPPED
 
-- Extend `rove-files` for `_static/` prefix (raw bytes, no compile, content-type in manifest).
-- Routing rule in dispatcher: static-first with full fallback order (see 2.4).
-- Shared path-validation module.
-- ETag + `If-None-Match` → 304 on static.
-- Deploy API: single-file (`PUT/DELETE /files/<path>`), bulk (`POST /blobs/check` + `PUT /blobs/<hash>` + `POST /deployments`).
-- Draft track with CAS. `POST /deployments/{id}/activate`. Deploy history + diff.
-- Compile-on-save: `POST /lint`.
-- File + deploy-size caps, plan-tier configurable.
-- Retention: last 50 + last 7 days; blob GC.
+Content-addressed two-phase deploy (blobs + immutable manifest), static-first
+routing with the §2.4 fallback order, ETag/304, drafts + history, size caps.
+Customer surface: [handler-shape.md](handler-shape.md); mechanics:
+`architecture/deployment-and-logs.md`.
 
-### Phase 3 — Webhooks + email
+### Phase 3 — Webhooks + email — SHIPPED, then re-platformed twice
 
-> Note: as initially shipped, Phase 3 used a per-tenant
-> `_outbox/*` + `_outbox_inflight/*` + `_dlq/*` schema with a
-> drainer thread doing the deliveries. Phase 5.5 item 4 replaces
-> that with a cluster-wide raft-replicated `webhooks.db` and a
-> leader-pinned webhook-server thread; the customer-facing API is
-> unchanged. The bullets below describe the eventual end state (not
-> the historical Phase-3 implementation).
+Outbound HTTP, `webhook.send` / `email.send`, callbacks, `crypto.hmacSha256`
+for vendor-specific signing (no platform signing header — §10.4). The final
+shape is durability-as-JS-shim over the single `http.fetch` primitive
+(decisions.md §3.3); the intermediate generations (per-tenant `_outbox/*`
+drainer → `webhooks.db` envelopes 4/5/6 → `http.send` + `schedules.db` →
+leader-local `SendDispatch`) are recorded in §7 +
+`architecture/effects-and-handlers.md`. Resend is the email provider
+(decisions.md §1.2). ⚠️ The SSRF-blocklist half of the outbound contract is
+**not yet wired in V2** — see the gap note under §12 "Webhook / email
+semantics".
 
-- `webhooks.db` cluster-wide schema (raft-replicated via envelope types 4/5/6).
-- HTTP client: SSRF blocklist, TLS always, redirect cap, timeouts.
-- `crypto.hmacSha256(key, data)` JS primitive so customers can build vendor-specific signatures (Stripe, Slack, etc.) in their handlers — no platform-owned signing header (see §10.4).
-- Webhook-server (leader-pinned thread inside loop46 binary): reads `webhooks.db`, POSTs customer URLs, proposes envelopes 5/6 on completion. Exponential backoff + full jitter.
-- Callback invocation: envelope 5 apply writes `_callback/{id}` to tenant app.db; existing `dispatchCallbacks` worker phase fires the customer's `onResult` handler in a fresh transaction.
-- `email.send` wraps `webhook.send` with platform SMTP creds.
-- Observability: log each attempt, dashboard queries `webhooks.db` for pending / inflight / failed views.
-- **SMTP provider decision** (SES / Postmark / Resend) must be made before this phase kicks off.
+### Phase 4 — Signup + auth — SHIPPED (admin auth re-platformed to OIDC in V2)
 
-### Phase 4 — Signup + auth
+Magic-link signup (`_magic/{hash}`, 30-min single-use), revocable session
+cookies, starter content. Two policy decisions made here stay load-bearing:
 
-- Magic-link primitive: `_magic/{hash}` in root.db, 30-min TTL, single-use.
-- Session cookie: opaque token, revocable, stored in root.db.
-- `POST /v1/signup`: validate, **reserve the name** via `pending/{name}` in admin app.db, mint magic, enqueue magic-link email — does **not** allocate the customer tenant yet (abuse-prevention amendment, see below).
-- `GET /v1/auth?mt=...`: validate, **create instance + deploy starter content as part of redemption**, mint session, 302 to dashboard.
-- `POST /v1/logout`: clear cookie, revoke session.
-- Starter content: one `index.mjs` (uses `kv`, returns JSON), one `_static/index.html` that fetches it and shows "your API is live at `{name}.rewindjs.app`".
-- **Lazy-creation-on-redeem (abuse prevention).** The customer tenant is *not* created at signup — only a `pending/{name}` reservation in admin app.db. Tenant creation, root_writeset propose, and starter-content deploy all happen inside `redeemMagic`, atomically with the session mint. A periodic sweep deletes expired `pending/*` entries to free the name. Without this, an unredeemed signup squats the name and leaks `{id}/app.db`, `{id}/files.db`, and the file-blob directory indefinitely. Detailed flow in [`docs/flows/signup.md`](flows/signup.md).
-- **Per-account instance limit.** Email is the account identity. New `account/{sha256(email)}/...` namespace in admin app.db owns the plan tier (`account/{hash}/plan`) and the instance ownership index (`account/{hash}/instances/{instance_id}`). Signup-time check counts owned instances *plus* non-expired `pending/*` reservations against the account's `max_instances` — both count, otherwise the free tier is trivially evadable by squatting names via incomplete signups. Same check repeats at redeem-time as the authoritative gate (two simultaneous signups by one email could both pass at signup time; only the second to redeem hits the limit). v1 hardcodes `max_instances = 1` for free; Phase 10 wires the value from a per-tier config keyed on `account/{hash}/plan`. Seed-manifest tenants stay outside the account model entirely — operator-provisioned, no associated email, no `account/*` record. The same `account/{hash}/plan` lookup will eventually drive *all* per-account caps (request/email rate limits, DLQ retention, blob storage caps, custom-domain counts, plus Stripe customer linkage in Phase 10).
+- **Lazy-creation-on-redeem**: signup only writes a `pending/{name}`
+  reservation; tenant creation + starter deploy happen atomically at
+  redemption, and a periodic sweep expires stale reservations (otherwise
+  unredeemed signups squat names and leak per-tenant state). Full flow:
+  [`flows/signup.md`](flows/signup.md).
+- **The account namespace** `account/{sha256(email)}/...` (plan tier +
+  instance-ownership index): signup *and* redeem count owned instances plus
+  live reservations against `max_instances` (v1 hardcodes 1); Phase 10 wires
+  all per-account caps + Stripe linkage through the same
+  `account/{hash}/plan` lookup. Seed-manifest tenants live outside the
+  account model (operator-provisioned, no email).
 
-### Phase 5 — Minimal admin UI
+Admin/dashboard auth is now OIDC end-to-end (`architecture/auth-and-domains.md`).
 
-- Deploy admin UI to `app.rewindjs.com` **using Phase 2's file API**. Dogfood.
-- Pages: signup/login, dashboard home, instance detail with tabs (Code, KV, Logs, Deploys).
-- CodeMirror 6 in Code tab. Save-draft + Deploy buttons.
-- Deploy history with diff view.
-- Logs tab uses existing `rove-log` surface; add `deployment_id` display.
-- **First customer can now sign up, deploy, see it live, debug.**
+### Phase 5 — Minimal admin UI — SHIPPED
 
-### Phase 5.5 — Storage scalability for production load (MVP boundary)
+Dashboard at `app.rewindjs.com`, dogfooded on the platform's own file API:
+Code (CodeMirror) / KV / Logs / Deploys tabs. The remaining dashboard work is
+beta polish — §10.16's launch path item 1.
 
-Production-blocking. Without this, every observability record rides the raft
-log, request/response bodies (once captured) would too, and `raft.log.db`
-grows without bound. Back-of-envelope at ~500 bytes per log record × 1000
-req/s × one tenant: ~43 GB/day into `raft.log.db` alone, doubled by the
-per-tenant `log.db` apply. Captured bodies make this ~100× worse if they
-land in raft. The cluster lasts days or weeks before disk pressure forces
-ops intervention.
+### Phase 5.5 — Storage scalability (MVP boundary) — SHIPPED in evolved forms
 
-> **The work items below are now elaborated in dedicated sub-plans.**
-> `docs/architecture/deployment-and-logs.md` covers item 1 (logs leave raft entirely, go S3-direct
-> with a sidecar-indexed log-server on `logs.{public_suffix}`).
-> `docs/architecture/consensus-and-storage.md` covers item 3 (per-tenant snapshot indices with
-> S3 transport — replaces the original "raft snapshot + log compaction" with
-> a no-pause file-shipping model).
-> Item 4 (originally a webhook-shaped subsystem) shipped through three
-> generations and finally landed as durability-as-JS-shim — see
-> `architecture/effects-and-handlers.md` Phase 5 + memory
-> `project_durability_as_js_shim`.
-> `docs/architecture/deployment-and-logs.md` covers item 5 (files-server moves to its own
-> subdomain with manifest-in-S3, marker-driven release).
-> Item 2 (tape body capture) is straightforward and remains an
-> implementation detail rather than a separate plan.
+The "nothing heavy rides raft" bucket — without it, log records and captured
+bodies ride the raft log and disk pressure kills the cluster in weeks. All
+five work items landed, each in a shape that evolved past the original sketch:
 
-Five coupled work items, all following the existing file-blob pattern
-(bytes on `BlobStore`, raft replicates only the manifest where applicable;
-state moves out of raft where stronger guarantees aren't needed):
+1. **Logs leave raft entirely** — per-node S3-direct batches + a standalone
+   log-server index (`architecture/deployment-and-logs.md`).
+2. **Tape body capture** — subsumed by readset replication + the blob
+   coordinator (`BodyRef` inline-vs-blob routing; decisions.md §5).
+3. **Snapshot + compaction** — per-tenant snapshot indices with S3 transport,
+   no global write pause (`architecture/consensus-and-storage.md`); the V2
+   multi-raft engine compacts per group.
+4. **Webhook subsystem** — converged on durability-as-JS-shim (decisions.md
+   §3.3); every rejected dedicated-subsystem generation is recorded in §7.
+5. **Files-server move** — manifest in S3, `_deploy/current` marker release,
+   cluster-free publisher (`files-server-v2`); envelope 3 retired
+   (`architecture/deployment-and-logs.md`).
 
-1. **Log batch payload offload to blob store.** Today the raft entry payload
-   IS the batch bytes (see the now-stale "Phase 6" comment in
-   `src/log/root.zig` header). Change so the leader writes the drained
-   batch to its `BlobStore` (already used for files), and the raft entry
-   carries `{tenant_id, batch_hash, manifest}`. Apply on followers fetches
-   the blob via the shared backend (`FilesystemBlobStore` for single-host,
-   `S3BlobStore` for multi-node). Propose gated on blob-write completion
-   so applies are referentially valid — same constraint file blobs already
-   honor today.
+Blob storage is **S3-only in V2** — there is no filesystem backend; production
+is multi-node and every node must read the same content-addressed store. The
+original "post-1.0 files/log detach" note is moot: V2 ships them as separate
+binaries (§13.1).
 
-2. **Tape body capture (request + response).** Infrastructure pre-staged:
-   `tape_refs` slot on `LogRecord`, `BlobStore` field on `LogStore`, 256 KB
-   default truncation cap from §2.4. Wire it. Bodies go straight to the
-   per-tenant blob backend (`{inst.dir}/log-blobs/`); only the hash + meta
-   lands in the log record. Truncation marker preserved across replay so
-   the simulator (Phase 12) sees the same bytes.
+### Phase 6 — Triggers — SHIPPED
 
-3. **Raft snapshot + log compaction.** `willemt/raft` has the snapshot hooks
-   but no integration in `src/kv/raft_*`. Snapshot trigger on size threshold
-   of `raft.log.db`; prune committed entries behind it. Single-node-only is
-   fine for v1 (snapshot lives next to the raft log); multi-node snapshot
-   transfer deferred to the multi-node milestone alongside `S3BlobStore`.
+`_triggers/` prefix-trie registration, before/after dispatch inside the write
+transaction, depth-8 cascades, platform-prefix guard, replay-for-free (kv op
+capture re-fires them). Contract: [handler-shape.md](handler-shape.md);
+mechanics: `architecture/effects-and-handlers.md`.
 
-4. **Centralized webhook subsystem (raft-replicated `webhooks.db`).** Today
-   `drainOnce` (`src/outbox/drainer.zig:137`) snapshots the entire instance
-   set every tick and opens a fresh SQLite connection per tenant for an
-   `_outbox/*` prefix scan — ~40k SQLite open+scan ops/sec at 4 ticks ×
-   10k tenants, almost all empty. Replace with a single cluster-wide
-   `webhooks.db` raft-replicated via new envelope types 4 (enqueue
-   batch), 5 (complete), and 6 (retry-schedule). The dispatcher
-   accumulates `webhook.send` calls per-handler and proposes envelope 4
-   in **the same raft entry as envelope 0 (the writeset)**, so by the
-   time the customer response returns (gated on raft commit), the
-   webhook is durable cluster-wide. There is no per-tenant
-   `_outbox/{id}` row, no apply-hook forwarding, no drainer. Delivery
-   runs from a leader-pinned webhook-server thread inside the loop46
-   binary; on leader change, the new leader inherits all in-flight
-   state via `webhooks.db` with zero scan cost. The current generation
-   (durability-as-JS-shim, shipped 2026-05-24) replaces all of this
-   with composition over `kv.set` + `http.fetch` — see
-   `architecture/effects-and-handlers.md` Phase 5.
-
-   The earlier "leader-local in v1, raft-replicate later" and
-   "transactional `_outbox/*` handoff with apply-hook forwarding"
-   positions were both rejected (see §7) — neither paid for the
-   complexity once envelope 4 could ride with envelope 0 directly.
-
-5. **Files-server architectural move.** Today the worker holds per-tenant
-   `files.db` SQLite + an in-memory manifest cache mirroring files-server's
-   local SQLite, kept in sync via raft envelope type 3 + a 2s polling
-   refresh. Two replicas of the same state, expensive to keep coherent.
-   Replace with: files-server moves to its own subdomain
-   (`files.{public_suffix}`) with its own TLS, manifest moves to S3
-   (`tenants/{id}/deployments/{dep_id}.json` + `tenants/{id}/blobs/{hash}`),
-   runtime release signal becomes a `_deploy/current` kv marker written by
-   a `POST /_system/release` worker route and picked up via apply.zig's
-   writeset-value scan into a process-wide ReleaseTable (no polling), worker reads
-   bytecodes/statics on demand from S3 with content-hash ETags +
-   Cloudflare in front. Worker drops the entire `/_system/files/*` proxy
-   and the `files.db` per-tenant store (envelope type 3 retires); the §2.4
-   routing/cache/path-validation/size-cap rules carry forward unchanged.
-   Detail in `docs/architecture/deployment-and-logs.md`. Lower urgency than (a)/(c)
-   (files.db doesn't blow up under sustained traffic the way log.db does)
-   but unblocks multi-node deployment (S3-backed manifest IS the cross-node
-   share path) and removes ~2 replicas-worth of in-process state from the
-   worker.
-
-Single-host launch defaults to `FilesystemBlobStore` against the local `{data_dir}`; multi-node launch picks `S3BlobStore` (shipped — see §10.5 + `architecture/consensus-and-storage.md` "Blob replication") or a shared FS mount via `BLOB_BACKEND`. The work above is backend-agnostic because `BlobStore` is already the abstraction seam. **First customer can now take real production traffic without disk-fill within weeks.** MVP complete.
-
-The further detach of files-server / log-server into separately-deployed
-processes that admin's JS handler calls via `webhook.send` (rather than
-the worker proxying) is **post-1.0** — see §10.13 + `architecture/deployment-and-logs.md`
-§11.
-
-### Phase 6 — Triggers
-
-- Load `_triggers/*.mjs` into a per-instance prefix trie at deployment-load time.
-- `rove-kv` transaction wrapping: before/after trigger dispatch on `put` and `delete`.
-- Cascade with depth limit (8). Platform-prefix guard.
-- Tape replay auto-re-fires triggers (free from kv op capture).
-- Dashboard: Triggers tab. Fire counts, error rates, recent invocations nested under parent request.
-
-### Phase 7 — CLI
+### Phase 7 — CLI — UNBUILT, ships at 1.0
 
 - `rewind deploy`: walk dir, hash, check, upload missing, commit manifest.
 - `rewind.json` parsing.
 - Deploy-token issuance UI in dashboard (one-time plaintext print).
 - Later commands deferred.
 
-### Phase 8 — Rate limiter primitive
+### Phase 8 — Rate limiter primitive — SHIPPED (narrow v1 scope)
 
-- Token-bucket data structure per `(instance, action)`.
-- Configured on instance record; per-plan defaults.
-- Applied at request dispatch, deploy, email send, each webhook attempt, kv writes (optional).
-- Dashboard: per-instance bucket state.
+Token bucket per `(instance, action)`; the shipped scope is `request` +
+`email` (per-worker, in-memory). Plan-tier wiring lands with Phase 10 on the
+CP plan axis (`architecture/control-plane.md` "Operational state").
 
-### Phase 9 — Encryption at rest
+### Phase 9 — Encryption at rest — UNBUILT
 
 - Master-key loader (file + env var).
 - Per-instance HKDF derivations (distinct labels per subsystem).
@@ -389,7 +308,7 @@ the worker proxying) is **post-1.0** — see §10.13 + `architecture/deployment-
 - Tape encryption.
 - Key-rotation format stamped with version byte; rotation tooling deferred.
 
-### Phase 10 — Custom domains + polish
+### Phase 10 — Custom domains + polish — UNBUILT (DNS-01 wildcard + per-host HTTP-01 issuers exist; the customer-facing tier does not)
 
 - Customer CNAME `api.myapp.com` → `foo.rewindjs.app`.
 - Per-custom-domain Let's Encrypt cert provisioning. Watch ACME rate limits at signup surges.
@@ -403,66 +322,34 @@ the worker proxying) is **post-1.0** — see §10.13 + `architecture/deployment-
 Phase 11 originally specified a platform-managed SSE primitive
 (`events.emit`, sse-server, JWT handoff). That subsystem shipped
 2026-04 and was **deleted 2026-05-19** in streaming-handlers Phase 5;
-customer-arbitrary SSE handlers on `__rove_stream` + kv-write wakes
-replace it. See §2.12 + `docs/architecture/effects-and-handlers.md`.
+customer-arbitrary streaming handlers replace it (initially the
+`__rove_stream` surface, since renamed by the handler-surface redesign to
+`stream(...)` + `on.kv` watched-prefix wakes). See §2.12 +
+`docs/architecture/effects-and-handlers.md`.
 
-### Phase 12 — Sim test framework + simulator library (§10.7, §10.8)
+### Phase 12 — Sim test framework + simulator library (§10.7, §10.8) — UNBUILT, post-1.0
 
-Client-side simulator library + deterministic handler test framework. Worker has no simulator role. Independently shippable: customers get sim tests on day one with no live-state dependency.
+Client-side simulator library + deterministic handler test framework: `rewind
+simulate` (synthetic request + kv overlay + mode → bundle), `rewind test`
+(`_tests/`, snapshots), `rewind export-fixture`. Purely client-side — the
+worker is a recording device, never a simulator; no live-KV pass-through.
+**[sim-test-framework.md](sim-test-framework.md) is the authoritative plan**
+(CLI host since re-decided as the `rewind` npm package — decisions.md §8.3).
 
-- New module `src/simulator/` (CLI library only): `root.zig` + `replay_source.zig` + `bytecode_cache.zig` + small `compile.zig`. **No `thread.zig`, no `main.zig` stub** — there's no worker hosting and no separate binary in v1.
-- `ReplaySource` with composable layers: write buffer / overlay / tape / miss policy. Modes (`strict`, `what_if`, `isolated`) are layer combinations.
-- Dependency surface excludes `rove-kv` (no SQLite in the simulator).
-- New CLI subcommand `rewind simulate` exposes the simulator library directly: synthetic request + kv overlay + mode flag → bundle on stdout.
-- Bundle JSON module extracted from `examples/log_cli.zig` into `src/tape/bundle.zig`.
-- Bundle JSON additions: cross-channel `seq` ordering, structured stack frames, value previews, structured console, `replay_available`. New `tape_entries` field for inline tapes (used by §10.11 dry-run bundles).
-- Module tape wiring at `JS_ResolveModule` — `appendModule` infrastructure exists in `src/tape/root.zig` but has no caller. Needed for multi-file determinism.
-- Test framework (§10.8): `_tests/` directory + `rewind test` CLI subcommand embedding QuickJS for test code execution outside the handler sandbox. Sim tests run **fully locally** from the working tree.
-- Snapshot machinery (`_tests/__snapshots__/{name}.json`, `--update-snapshots`).
-- `rewind export-fixture` writes sibling-file pairs (`_tests/from-prod-{id}.mjs` + `_tests/__fixtures__/from-prod-{id}.json`) so fixtures stay offline-runnable.
-- Production-strip of `_tests/` — test files live in dev repo only.
-- Request body capture into the tape (new request-input channel) — needed for fixtures and replays to faithfully reproduce POST bodies.
-- Stale-comment cleanup at `src/log/root.zig:71`.
+### Phase 13 — Fixture lifecycle + worker dry-run (§10.9, §10.11) — UNBUILT, post-1.0
 
-**No server endpoints in this phase.** No `simulate` rate-limit action, no `/_system/simulate/{id}` route, no thread pool in worker. The worker is unchanged.
+Fixture authoring/editing tooling (`rewind kv` / `rewind fixture` families,
+the `--auto-fix-from` recovery flow) plus the worker-side
+`POST /_system/dry-run/{id}` always-rollback dispatch mode (the one worker
+piece). **[fixture-lifecycle.md](fixture-lifecycle.md) is the authoritative
+plan.**
 
-Detailed plan: `docs/sim-test-framework.md`.
+### Phase 14 — AI agent surface (§10.10) — UNBUILT (skill file pulled forward to beta)
 
-### Phase 13 — Fixture lifecycle + worker dry-run (§10.9, §10.11)
-
-Tooling for authoring, editing, and refreshing the fixture data sim tests run against — plus the worker-side dry-run dispatch mode that lets customers capture realistic tapes from synthetic requests without persistence.
-
-**Fixture lifecycle** (§10.9):
-- `/_system/kv/{id}/*` admin endpoint (read-only, paginated): `get/{key}`, `?prefix=...&limit=N&after=<key>`, `count?prefix=...`.
-- New CLI subcommand `rewind kv` (`get`, `list-prefix`, `count`).
-- New CLI subcommand `rewind fixture` family: `from-keys`, `add`, `remove`, `edit`, `diff`, `refresh`, `merge`.
-- Runner integration: structured "unresolved read on K" error referencing fixture path + missing key. Optional `rewind test --auto-fix-from <instance>` flag pulls missing keys on-the-fly and writes them back.
-
-**Worker dry-run** (§10.11):
-- `POST /_system/dry-run/{id}` endpoint — runs synthetic request through dispatch with always-rollback + propose-disabled. Returns bundle (response, kv writes, would-have-enqueued webhook rows, tape entries) inline; nothing persists.
-- Implementation: `dry_run: bool` flag on `dispatchOnce`. Roughly 50 lines.
-- Optional `dry_run` rate-limit action (default: share `request` budget).
-- New CLI subcommand `rewind dry-run --request '{...}' --instance <id>`.
-- Composite tool: `rewind fixture from-dry-run --request '{...}' --instance <id> -o <fixture.json>` runs dry-run, extracts the kv tape, writes a fixture file. Single command, end-to-end fixture authoring from a synthetic request.
-
-**Web UI follow-on** (deferred; lands alongside Phase 5 admin UI maturity): "Fixtures" tab in dashboard with same affordances over the same backend endpoints.
-
-Detailed plan: `docs/fixture-lifecycle.md`.
-
-### Phase 14 — AI agent surface (§10.10)
-
-Skill file + CLI polish + scoped tokens. **No MCP server in v1.** Hosted MCP deferred until concrete remote-agent demand surfaces. The local agent path (Claude Code in customer's working tree) is fully served by CLI + skill file.
-
-- `docs/skills/rewind.md` — canonical skill file for Claude Code (and similar agents). Teaches the workflow, tool catalog, common patterns, gotchas.
-- `--json` output mode audit on every CLI subcommand.
-- New CLI subcommand `rewind doctor` — environment + connectivity readiness check; first-thing-an-agent-runs.
-- Scoped tokens — new token type at `scoped_token/{sha256_hex}` in root.db. Carries a capability subset (`read`, `simulate`, `deploy`, `fixture`, `kv`, etc.) and instance scope. Independent of MCP; security primitive worth having for any agent integration. Mint via dashboard or `rewind mint-token --capabilities ...`.
-- `/_system/scoped_tokens` admin routes (mint/list/revoke).
-- Dashboard "Tokens" tab.
-
-What's deferred (not in v1): hosted HTTP MCP at `mcp.rewindjs.com`, `rewind-mcp` binary, MCP wire-format code. Build when a real remote-agent use case shows up.
-
-Detailed plan: `docs/agent-surface.md`.
+Skill file (`docs/skills/rewind.md` — a §10.16 beta item) + `--json` CLI
+audit + `rewind doctor` + scoped capability tokens. No MCP server in v1;
+hosted MCP deferred until remote-agent demand. **[agent-surface.md](agent-surface.md)
+is the authoritative plan.**
 
 ## 4. Deferred to v2
 
@@ -492,58 +379,30 @@ These are explicitly not in v1 so future sessions don't accidentally design arou
 
 Resolved items moved to §10. Open items:
 
-- **Phase 9 (encryption)**: commit to SQLCipher vs vendored VFS. Audit implications differ.
+- **Phase 9 (encryption)**: commit to SQLCipher vs a first-party AES-GCM VFS.
+  Audit implications differ. (The old "vendored VFS" wording predates the
+  pin-and-fetch dependency model.)
 - **Phase 10 (custom domains)**: ACME rate-limit strategy for a signup surge.
-- **Phase 5 (admin UI hosting)**: Cloudflare Pages vs rove-hosted dogfood for the admin UI static bundle in production. Dogfood is more honest; Cloudflare is lower risk for launch.
-- **Blob backend for multi-node**: shared filesystem mount (`BLOB_BACKEND=fs`) vs `S3BlobStore` (`BLOB_BACKEND=s3`). Both shipped; ops decision per deployment. Single-node launch defaults to `fs` against local `{data_dir}`. See §10.5.
+
+Resolved since this list was written (recorded so they aren't re-asked):
+admin-UI hosting = platform-hosted dogfood (docs and dashboard are tenants —
+`v2-production-deploy-plan.md`); blob backend = **S3-only, mandatory, no
+filesystem variant** (production is multi-node; every node reads the same
+content-addressed store).
 
 ## 6. Relevant existing code
 
-- `src/files/root.zig:14` — content-addressed manifest + blob scheme; Phase 2 extends this.
-- `src/files/root.zig:73` — `MAX_PATH_LEN = 192`; reused in path validation.
-- `src/tenant/root.zig:459` — `__admin__` KV aliases to root.db. Pivot may keep, repurpose, or deprecate; re-evaluate in Phase 5.
-- `src/tenant/root.zig:518` — root-token hash scheme; pattern reused for magic-link tokens (`_magic/{hash}`, 30-min TTL).
-- `src/js/worker.zig` — QuickJS snapshot-restore per-request; trigger and callback invocations reuse this.
-- `vendor/README.md` — dependency posture (no network installs, everything vendored). Informs Phase 9 SQLCipher-vs-VFS decision.
-- `web/admin/` — existing admin UI skeleton. Will be largely rewritten in Phase 5 against the new auth + file API.
+The 2026-04 pointer list rotted (line numbers drifted; `vendor/` no longer
+exists) and was removed. Each `architecture/` reference opens with a **Code
+map** table for its subsystem — start there.
 
 ## 6a. Sub-plans expanding sections of this document
 
-- `docs/architecture/deployment-and-logs.md` — §2.4 + Phase 5.5 (e) expansion:
-  own subdomain, manifest in S3, marker-driven release, async
-  load + atomic pointer swap, Cloudflare-fronted static serving.
-  Also contains the post-1.0 detach detail (§11) — editor
-  bearer-auth flow, deploy-notification path, work-order list,
-  latency mitigations.
-- `docs/architecture/deployment-and-logs.md` — §2.9 + Phase 5.5 (a) expansion: S3-direct
-  batches with `.idx.json` sidecars, log-server on
-  `logs.{public_suffix}`. Envelope type 1 retires.
-- `docs/architecture/effects-and-handlers.md` — covers §2.6 outbound HTTP after
-  the 2026-05-24 durability-as-JS-shim retirement. Customer-facing
-  `webhook.send` / `email.send` API preserved as JS shims composing
-  on `http.fetch` + `kv.set("_send/owed/{id}", ...)`. Earlier
-  generations (`webhooks.db` envelopes 4/5/6 shipped 2026-05-06,
-  `schedules.db` envelopes 8/9/10/11 shipped 2026-05-09, per-tenant
-  `_send/owed/` + leader-local `SendDispatch` shipped 2026-05-19) are
-  all retired; the sub-plan docs were removed.
-- `docs/architecture/consensus-and-storage.md` — §2.13 + Phase 5.5 (c) expansion:
-  per-tenant snapshot indices, S3 transport, no global
-  write-pause. Replaces the row-level delta protocol in
-  `src/kv/raft_snapshot.zig`.
-- `docs/sim-test-framework.md` — §10.7 + §10.8 expansion: simulator
-  module, `_tests/` directory, `rewind test` / `rewind simulate`.
-- `docs/fixture-lifecycle.md` — §10.9 + §10.11 expansion: fixture
-  authoring tooling + worker dry-run dispatch mode.
-- `docs/agent-surface.md` — §10.10 expansion: skill file, `--json`
-  audit, `rewind doctor`, scoped tokens.
-- `docs/architecture/observability.md` — §2.9 expansion on the operator side:
-  Grafana Cloud cutover plan. Inventories today's `/_system/metrics`
-  (15 series, postmortem-shaped) and phases the gap to a fleet
-  scrape — auth via a `scrape` services-JWT cap, node/worker labels,
-  histogram primitive, OpenMetrics exemplars carrying
-  trace_id/tenant_id/request_id. Load-bearing constraint: customer
-  request logs stay in the replay store (`docs/architecture/deployment-and-logs.md`); only
-  operator signals go to Grafana.
+[README.md](README.md) is the documentation map and owns this index: the
+`architecture/` as-built set (mechanics per subsystem), the customer contracts
+([handler-shape.md](handler-shape.md) + [effect-algebra.md](effect-algebra.md)),
+and the in-flight plan docs. The former inline list here duplicated it and
+drifted.
 
 ## 6b. Architectural principle: separability follows raft participation
 
@@ -558,49 +417,25 @@ whether it has a public TLS surface (the original heuristic).
 Participation = reads raft-replicated state, OR proposes
 envelopes, OR is leader-pinned by definition.
 
-> **V2 note.** The principle holds and is *why* `files-server-v2` and
-> `log-server` are separate binaries (no raft participation, state in S3) while
-> the per-tenant consensus stays in `rewind`. The V1 examples in the table below
-> (the single `loop46` binary, the leader-pinned `webhook-server` thread) are
-> retired; durability is now a JS shim, not a raft-participating subsystem. See
-> §13 for the live V2 process map.
+The principle holds in V2 and is *why* `files-server-v2` and `log-server` are
+separate binaries (no raft participation, state in S3) while the per-tenant
+consensus stays in `rewind`. The V1 examples that used to live in a table here
+(the single `loop46` binary, the leader-pinned `webhook-server` thread) are
+retired — durability is now a JS shim, not a raft-participating subsystem. The
+live process map is §13; the principle lets us answer "split or not" without
+re-litigating case by case.
 
-| Subsystem | Participates in raft? | Where it lives |
-|---|---|---|
-| worker (customer kv path) | yes (proposes envelope 0; leader-only) | loop46 binary |
-| files-server | no (state in S3) | own binary, own subdomain, separable to its own machine |
-| log-server | no (state in S3 + local index cache) | own binary, own subdomain, separable to its own machine |
-| webhook-server | yes (reads webhooks.db; proposes 4/5/6; leader-pinned) | thread in loop46 binary |
-| (future) anything else needing raft state | yes by definition | thread in loop46 binary |
-| (future) anything else stateless wrt raft | no | candidate for separate binary |
+## 6c. Leadership and the public surface
 
-The principle lets us cleanly answer the "split or not" question
-without re-litigating the tradeoffs case by case.
-
-## 6c. Leader-only public surface
-
-> **V2 note.** This subsection described V1's *single* raft group (one cluster
-> leader). V2 is **multi-raft — one group per tenant** — so leadership is
-> per-tenant, not per-node: any node may lead some tenants and follow others.
-> The model below is reframed in V2 as: the stateless front door
-> (`rewind-front`) proxies each request leader-aware *per tenant*
-> (`proxyToCluster`, retry-on-503), reads are served by any synced node, and a
-> write self-routes to that tenant's group leader. See
-> `architecture/consensus-and-storage.md` + `architecture/routing-and-ingress.md`.
-
-Related architectural property (V1): **only the raft leader accepts
-customer requests.** Workers run only on the leader; followers are
-pure raft replicas with no public listeners. Customer-facing LBs
-route the worker subdomain (and the files-server / log-server
-subdomains) to the current leader; on raft election, the LB switches.
-
-Implication for the separable subsystems: while files-server /
-log-server CAN run on different machines from any raft node (their
-state is in S3), they're typically deployed on every node with a
-leader-pinned active state — same pattern as webhook-server but at
-process granularity instead of thread granularity. Operators who want
-to scale them independently can, because nothing in their architecture
-requires co-location.
+V1's version of this section said "only the raft leader accepts customer
+requests" — a whole-cluster property, because V1 was a single raft group. V2
+is **multi-raft (one group per tenant)**, so leadership is per-tenant, not
+per-node: any node may lead some tenants and follow others, and every node
+accepts traffic. The surviving property: the stateless front door
+(`rewind-front`) proxies each request leader-aware *per tenant*
+(`proxyToCluster`, retry-on-503); reads are served by any synced node; a write
+self-routes to that tenant's group leader. See
+`architecture/consensus-and-storage.md` + `architecture/routing-and-ingress.md`.
 
 ## 7. Superseded decisions (do not re-propose)
 
@@ -645,7 +480,7 @@ The `{name}.api.rewindjs.com` **PSL** bullet still stands and is *not* contradic
 The uniqueness isn't any single feature — it's the coherence of the set:
 
 - **Purely functional handlers** (no async IO, no fetch, all effects are Cmds).
-- **Cmd-pattern outbound path: `webhook.send` is the only door to the outside world**, accumulated alongside the writeset and proposed atomically with kv writes.
+- **Cmd-pattern outbound path: one native door to the outside world (`http.fetch`)**, commit-gated and atomic with the writeset; durability (`webhook.send` / `email.send` / `retry.*`) composes in JS on top.
 - **Deterministic triggers in the same KV transaction as the write.**
 - **Tape capture on every request, encrypted at rest.**
 - **Browser-based replay with DevTools breakpoints on production bugs.**
@@ -697,6 +532,11 @@ labels** other docs cite and points to the current home. Launch sequencing
 
 ### 10.16 Launch sequencing: lead with replay, two-audience framing locked in (decided 2026-04-30)
 
+> The week-estimates below are 2026-04-30 figures and predate the V2
+> re-platform that intervened (multi-raft, CP/DP split, cutover — all done).
+> The *relative sequencing* and the audience framing are the locked part;
+> treat durations as historical.
+
 **Two audiences served by one product**, both motivating the build from day one:
 
 - **"Story 1 — the new programmer"**: brand-new dev, helped by a friend, currently stuck composing Firebase = Google account + billing account + Firebase console + Firestore + Cloud Functions IAM + three different log views just to add a persistent leaderboard. rewind.js collapses all of that to magic-link signup + one dashboard + kv-comes-free + zero permissions to configure. When her app breaks (it will), she has zero mental model for `gcloud logs read` — she just clicks the failed request in her dashboard. Tape replay is what turns "I give up" into "oh, I see what happened."
@@ -722,7 +562,7 @@ The framings differ but the product is identical: **Story 1 hears "ship in minut
 **1.0 launch path** (Story 2 audience adds, builds on top of operating beta):
 
 1. **Tape-replay DAP CLI** (§10.12 Story 2 path) — `rewind replay <request_id>` CLI fetching bundle + tape, writing a Node entry script with stubs preloaded, spawning under `--inspect-brk`, printing attach instructions for VS Code / JetBrains / nvim-dap / dap-mode. Reuses the stubs library shipped in beta. ~1-2 weeks.
-2. **rewind.js-the-project Stripe integration for supporter payments** — *the real production integration that doubles as the customer-facing docs example.* rewind.js's admin handler exposes a "support rewind.js" page that creates a Stripe Checkout session via `webhook.send`, returns a tiny shell page that opens a `__rove_stream` connection, the callback writes a kv key that wakes the stream which emits the session URL to the connected client, browser navigates. Receives `checkout.session.completed` webhook with timing-safe HMAC signature verification, writes a `supporter/{email}` row in admin's app.db, the same stream wakes a second time and emits "Thanks!" so the originating tab updates without a refresh. **Docs example is extracted from this**: the patterns we actually use become the patterns we teach. ~1.5-2 weeks, plus the small primitives audit (`crypto.timingSafeEqual` confirmed; `base64Encode/Decode` and `hmacSha1` if needed).
+2. **rewind.js-the-project Stripe integration for supporter payments** — *the real production integration that doubles as the customer-facing docs example.* rewind.js's admin handler exposes a "support rewind.js" page that creates a Stripe Checkout session via `webhook.send`, returns a tiny shell page that opens a streaming connection (a `stream(...)` handler with an `on.kv` watched prefix), the callback writes a kv key that wakes the stream which emits the session URL to the connected client, browser navigates. Receives `checkout.session.completed` webhook with timing-safe HMAC signature verification, writes a `supporter/{email}` row in admin's app.db, the same stream wakes a second time and emits "Thanks!" so the originating tab updates without a refresh. **Docs example is extracted from this**: the patterns we actually use become the patterns we teach. ~1.5-2 weeks. (The primitives audit is closed — `crypto.timingSafeEqual`, `hmacSha1`, and `base64` are all shipped, §13.3.)
 3. **Phase 7 `rewind deploy` CLI** subset — content-addressed two-phase upload, `rewind.json` parsing, deploy-token issuance UI in dashboard. ~1-2 weeks for v1 scope; later CLI subcommands (`kv`, `logs`, `init`) deferred.
 4. **Plan tiers + paid pricing** — first paid tier, plan-tier branching in rate limiter caps, billing wiring via Stripe (uses item 2's primitives). ~1-2 weeks.
 5. **Custom domains** (Phase 10) — customer CNAME + per-domain Let's Encrypt. ~2 weeks.
@@ -866,7 +706,15 @@ libraries). The surprises worth flagging for first-run docs:
 - **`webhook.send` is vendor-neutral.** No default signing header; use `crypto.hmacSha256` to build vendor-specific signatures in the handler before `webhook.send`.
 - **`email.send` takes `key` as an explicit argument.** Customer's abuse-control concern; keep the Resend key in KV and pass it at call site.
 - **Response body captured at 256KB max.** Anything larger is truncated with `truncated: true` on the callback event.
-- **A dev-only flag relaxes SSRF + HTTPS-only on the outbound `http.fetch` path** for local smokes. NEVER set in production — a malicious customer handler could probe localhost and leak bodies over plaintext.
+- ⚠️ **SSRF blocklist: contract, not yet wired (verified 2026-06-11).** The
+  §2.6 mandatory-block contract stands, but `rove-ssrf`'s
+  `resolveSafe`/`isBlocked` currently has **no caller on the V2 `http.fetch`
+  path** — outbound requests are not SSRF-filtered today, and a malicious
+  handler could probe localhost / internal endpoints. Wiring the blocklist
+  into the fetch engine is a **pre-production blocker**. (Only the test-only
+  `test_allow_plaintext` TLS toggle is wired; there is deliberately no
+  dev-mode relax flag. Smokes hit tenant-local upstream URLs, so the wiring
+  needs a loopback-allowlist story for the test topology.)
 
 ### Auth / signup
 
@@ -887,15 +735,15 @@ libraries). The surprises worth flagging for first-run docs:
   the per-tenant `_deploy/current` release pointer replicate via raft (envelopes
   0/1/2). **Blob bytes do not** — bytecode/statics, deploy manifests, and log
   batches all live in the shared content-addressed store / S3.
-- Running more than one node requires a shared `BlobStore` backend: a shared
-  filesystem mount at `{data_dir}` (NFS/EFS/Ceph) or `BLOB_BACKEND=s3` (+ the
-  `S3_*` / `AWS_*` env vars). With single-host `fs`, tape/asset bytes are
-  node-local and replay 404s after a move for old request IDs.
+- The blob backend is **S3-shaped object storage only** (`S3_*` / `AWS_*` env
+  vars — `rove-blob`'s `env.zig`); there is no filesystem variant, even
+  single-node, so every node reads the same content-addressed store and
+  replay survives tenant moves.
 - **A write in flight at a leader change is *faulted + retried*, not lost** — the
   parked worker fails fast (503) and the front door's leader-aware proxy retries
   the new leader (decisions.md §10.5). On failover the new leader has the full
-  manifest but may 503 on a blob not yet served by the shared backend (served on
-  first read for S3; transparently for an FS mount).
+  manifest but may 503 on a blob not yet visible in the shared backend (served
+  on first read).
 - Outbound HTTP delivery (`webhook.send` shim): per-tenant `_send/owed/{id}`
   markers ride envelope-0 atomic with handler writes; on leader change a boot/cron
   sweep replays unresolved markers — at-least-once with id dedup. See
