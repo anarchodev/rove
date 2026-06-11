@@ -35,7 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 # The `ontimer` handler — verbatim from the V1 demo tenant
 # (examples/loop46-demo-tenants/acme/ontimer/index.mjs).
@@ -73,7 +73,7 @@ def main() -> int:
         print("step 2: deploy the ontimer handler (+ a root readiness probe)")
         try:
             dep_id = c.deploy_handlers("acme", {
-                "index.mjs": READY_SRC,
+                "index.mjs": rpc_wrap(READY_SRC),
                 "ontimer/index.mjs": ONTIMER_SRC,
             })
             check("deploy_handlers → dep_id", bool(dep_id), f"dep_id={dep_id}")

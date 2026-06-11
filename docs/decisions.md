@@ -384,6 +384,36 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   (Kept as an active gotcha memory; recorded here because it is non-obvious and
   must be enforced on every new shim.)
 
+### 4.5 The `{fn,args}`/`?fn=` RPC envelope is retired — dispatch is one semantic
+- **Decision** (2026-06-11): the platform invokes exactly ONE export per
+  activation — the activation kind's conventional export (handler-shape §3) or
+  the resume path's first-class target. The former platform-level dispatch
+  envelope (`?fn=name&args=` query / `{"fn":…,"args":[…]}` POST body) is
+  DELETED: `request.query` and `request.body` are opaque payload the engine
+  never interprets. Named-function routing is handler JS — the `rpc({...})`
+  recipe (handler-shape §3.1); the `__admin__` dashboard handler
+  (`web/admin/index.mjs`) is the dogfood implementation, and the dashboard's
+  HTTP wire shapes are unchanged.
+- **Why**: (a) one invocation semantic, not two; (b) the envelope let body
+  bytes influence execution NATIVELY (rpc_dispatch parsed `{fn,args}` out of
+  the body), which is the one hole in the read-taping determinism model — a
+  handler call shaped by a body the tape can't see as a read. With dispatch in
+  JS, the shim's `request.query`/`request.body` reads are taped like any other
+  input. This is the precursor the read-taped-request-surface slice is gated
+  on; (c) the old internal resume targeting synthesized `{"fn":"<name>"…}`
+  JSON bodies by string-format — an escaping hazard.
+- **Internal resume targeting is first-class**: `Request.fn_override` +
+  `Request.fn_args_json` (positional ctx/outcome args), set by the resume
+  engines (send-callback / wake / bound-fetch chunk / subscription / chained
+  dispatch). No synthetic `?fn=` queries or envelope bodies anywhere; the
+  no-target callback form still carries the plain `{ctx,outcome}` body the
+  default export reads.
+- **Rejected**: keeping the envelope alongside read-taping by recording a
+  `dispatch_call` tape kind (papers over the hole and parks a wire
+  discriminator we planned to delete); auto-wrapping smoke handlers in the
+  deploy helper (hidden magic — smokes opt in explicitly via
+  `smoke_lib_v2.rpc_wrap`).
+
 ---
 
 ## 5. Readset replication

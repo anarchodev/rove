@@ -294,15 +294,60 @@ function handleSession() {
     return { is_root: !!a.is_root, sub: a.sub || null, owned: owned };
 }
 
+// ── fn-RPC dispatch (JS recipe) ─────────────────────────────────────
+//
+// The platform no longer interprets `?fn=` / `{fn,args}` (decisions.md
+// §4.5 — only the activation's conventional export is invoked);
+// named-function routing is the handler's own job. This is the
+// documented recipe from handler-shape.md: parse the same wire shapes
+// the dashboard has always sent (api.js is unchanged) and dispatch to
+// a local table. Reading `request.query` / `request.body` here is what
+// puts the dispatch inputs on the replay tape.
+const FNS = {
+    listInstance, getInstance, createInstance, deleteInstance,
+    listDomain, assignDomain,
+    listKv, getKv, setKv, deleteKv,
+    publishRelease, provisionInstance,
+};
+
+function rpcDispatch() {
+    let fn = null, args = [];
+    for (const part of (request.query || "").split("&")) {
+        const eq = part.indexOf("=");
+        const k = eq === -1 ? part : part.slice(0, eq);
+        if (k !== "fn" && k !== "args") continue;
+        const v = eq === -1 ? "" : decodeURIComponent(part.slice(eq + 1).replace(/\+/g, "%20"));
+        if (k === "fn" && v) fn = v;
+        else if (k === "args" && v) { try { args = JSON.parse(v); } catch (_) {} }
+    }
+    if (!fn && request.body) {
+        try {
+            const b = JSON.parse(request.body);
+            if (b && typeof b.fn === "string") {
+                fn = b.fn;
+                args = Array.isArray(b.args) ? b.args : [];
+            }
+        } catch (_) {}
+    }
+    if (!fn) return null;
+    const f = FNS[fn];
+    if (!f) { response.status = 404; return { error: "no such fn: " + fn }; }
+    return { result: f(...args) };
+}
+
 // ── Path-routed surface (default export) ────────────────────────────
 //
-// `/_rp/*` is the browser-facing OIDC relying-party handshake
-// (oidc.rp); `/v1/*` is the dashboard's whoami/logout. The async
-// completion modules `_rp/complete.mjs` / `_rp/jwks.mjs` are invoked
-// directly by callback dispatch, NOT routed here. Everything below is
-// either pre-auth (see _middlewares PRE_AUTH_PATHS) or trusts
-// request.auth.
+// fn-RPC first (the dashboard's `?fn=`/`{fn,args}` calls all target
+// `/`), then `/_rp/*` — the browser-facing OIDC relying-party
+// handshake (oidc.rp) — and `/v1/*`, the dashboard's whoami/logout.
+// The async completion modules `_rp/complete.mjs` / `_rp/jwks.mjs`
+// are invoked directly by callback dispatch, NOT routed here.
+// Everything below is either pre-auth (see _middlewares
+// PRE_AUTH_PATHS) or trusts request.auth.
 export default function() {
+    const rpc = rpcDispatch();
+    if (rpc !== null) return rpc.result;
+
     const fullPath = request.path;
     const q = fullPath.indexOf("?");
     const path = q === -1 ? fullPath : fullPath.slice(0, q);

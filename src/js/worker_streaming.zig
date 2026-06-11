@@ -862,8 +862,8 @@ fn resumeStream(
 /// cont→stream. Sibling of `resumeStream` — same stream-chain
 /// machinery, but the activation kind is `.fetch_chunk` (carrying
 /// the chunk bytes/seq/done payload on the Request) and the dispatch
-/// targets the module's `onFetchChunk` named export via
-/// `?fn=onFetchChunk`.
+/// targets the module's `onFetchChunk` named export via the
+/// first-class `fn_override`.
 ///
 /// Per rove-library principle 1, the caller has already established
 /// the entity's state (it's in `stream_data_out`); this function
@@ -937,11 +937,11 @@ pub fn resumeBoundFetchStream(
     // Custom `name:` override (matches resumeBoundFetchChain's
     // first-chunk handling) — else the conventional fetch export
     // (onFetchResult / onFetchChunk / onFetchDone, handler-shape.md §3).
+    // First-class resume target (decisions.md §4.5) — no synthetic
+    // `?fn=` query, and the path stays the real module path.
     const fn_name: []const u8 = ev.resolvedExport();
-    const spath = std.fmt.allocPrint(allocator, "/{s}?fn={s}", .{ path, fn_name }) catch return;
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
     defer allocator.free(spath);
-    const query = std.fmt.allocPrint(allocator, "fn={s}", .{fn_name}) catch return;
-    defer allocator.free(query);
 
     const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
     var txn_owned = true;
@@ -992,7 +992,7 @@ pub fn resumeBoundFetchStream(
         .method = "POST",
         .path = spath,
         .body = body,
-        .query = query,
+        .fn_override = fn_name,
         .is_system_module = builtin_modules_mod.isBuiltinPath(path),
         .activation = .{ .fetch_chunk = .{
             .id = ev.fetch_id,
@@ -1690,7 +1690,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
     // The handler's return shape is moot — the socket is closed
     // (`.drop` on both non-terminal arms). Writes still commit
     // asynchronously (Phase 4c) so observable side effects (kv
-    // state, `_send/owed/*`, §4.6 wakes) materialize.
+    // state, `_send/owed/*`, §4.5 wakes) materialize.
     runFire(worker, &p, request, .{
         .act = .disconnect,
         .site = "stream-disconnect",
@@ -1807,8 +1807,7 @@ pub fn fireSubscriptionActivation(
     // `request.activation.source.kind`. A missing conventional export
     // is the fail-loud 404 backstop. Recurrence (`cron(spec, target)`)
     // names its own target via the durable scheduler — not this path.
-    var query_buf: [32]u8 = undefined;
-    const query = std.fmt.bufPrint(&query_buf, "fn={s}", .{subscriptionExport(source)}) catch null;
+    // First-class target (decisions.md §4.5) — no synthetic query.
 
     // Synthesize the Request carrying the subscription source union
     // (the variant IS the activation payload).
@@ -1816,7 +1815,7 @@ pub fn fireSubscriptionActivation(
         .method = "POST",
         .path = spath,
         .body = body,
-        .query = query,
+        .fn_override = subscriptionExport(source),
         .activation = .{ .subscription_fire = .{ .name = subscription_name, .source = source } },
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
         .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
@@ -2016,21 +2015,14 @@ fn fireChainedActivation(
     else
         std.fmt.bufPrint(&corr_buf, "chain-{x:0>16}", .{p.request_id}) catch corr_buf[0..0];
 
-    // Build the synthetic query for the named-export case (the
-    // `?fn=<name>` shape inherited from the original Phase-5-retired
-    // callback dispatcher; the chain-activation path now consumes
-    // it). Default-export when fn_name is null/empty.
-    var query_buf: [256]u8 = undefined;
-    const query_opt: ?[]const u8 = if (sc.fn_name) |fnn|
-        if (fnn.len > 0) std.fmt.bufPrint(&query_buf, "fn={s}", .{fnn}) catch null else null
-    else
-        null;
-
+    // First-class target for the named-export case (decisions.md
+    // §4.5); default-export when fn_name is null/empty (parseDispatch
+    // treats an empty override as unset).
     const req: Request = .{
         .method = "POST",
         .path = spath,
         .body = body,
-        .query = query_opt,
+        .fn_override = sc.fn_name,
         .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
         .activation = .send_callback,
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
@@ -2091,7 +2083,7 @@ pub const StreamResumeStage = struct {
 /// in `drainRaftPending` commits at the seq — same gate as the
 /// entity-backed path's `pending_txns[seq]`, just routed through
 /// the unit drain so we don't need an entity in `raft_pending`.
-/// On commit, the unit's §4.6 kv-wakes fire (the existing
+/// On commit, the unit's §4.5 kv-wakes fire (the existing
 /// `firePendingKvWakes` iterates at the same point).
 ///
 /// Used by `fireDisconnectActivation` — the socket is gone, so
@@ -2201,7 +2193,7 @@ pub fn proposeForgetfulWrites(
     // Effect-reification Phase 4.1: build the parked unit's
     // BufferedCmds list directly. Variants:
     //
-    //   - kv_wake_broadcast — one per writeset op (the §4.6 fan-out
+    //   - kv_wake_broadcast — one per writeset op (the §4.5 fan-out
     //     + kv-react fire); interpretCmd broadcasts to subscribed
     //     stream watchers + the unit's kv-react walk reads them
     //     before releaseAll consumes.

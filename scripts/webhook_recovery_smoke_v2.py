@@ -42,7 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX  # noqa: E402
+from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, rpc_wrap  # noqa: E402
 
 # acme's delayed-webhook handler + on_result callback. Shaped after the V1
 # demo tenant's httpfire.fireDelayed / httpresult, adapted to the V2
@@ -114,8 +114,8 @@ def main() -> int:
         try:
             c.deploy_handlers("wb", {"index.mjs": WB_SRC, "hook/index.mjs": WB_SRC})
             dep_id = c.deploy_handlers("acme", {
-                "index.mjs": ACME_INDEX_SRC,
-                "cbfire/index.mjs": CBFIRE_SRC,
+                "index.mjs": rpc_wrap(ACME_INDEX_SRC),
+                "cbfire/index.mjs": rpc_wrap(CBFIRE_SRC),
                 "cbresult.mjs": CBRESULT_SRC,
             })
             check("deploy_handlers → dep_id", bool(dep_id), f"dep_id={dep_id}")

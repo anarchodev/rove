@@ -654,7 +654,7 @@ fn resolveParked(
 ///     bound_schedule_id (or the §6.4 deadline).
 ///
 /// Also parks the kv-wake commit gates (`parkKvWakes`) on the same
-/// seq so any §4.6 wake fan-outs fire AFTER commit, alongside the
+/// seq so any §4.5 wake fan-outs fire AFTER commit, alongside the
 /// entity's state transition. (The send-arm commit gate retired
 /// with the SendDispatch kernel in Phase 5 PR-3; `_send/owed/*` is
 /// now an ordinary kv put.)
@@ -1390,13 +1390,19 @@ fn resumeContinuation(
     const tc = dep.tc;
     const bc = dep.bc;
 
-    // A continuation is an internal request: named export → RPC
-    // envelope `{fn,args:[ctx,outcome]}`; default export → body
-    // object `{ctx,outcome}`. ctx_json/outcome_json are JSON text
-    // embedded verbatim. A wake resume routes to the StreamWakes
-    // `wake_to` export (default `onWake`) with no callee outcome —
-    // `{fn,args:[ctx]}` — and drains the entity's wake ring so the
-    // fired entries are consumed (the timer-due / kv-match trigger).
+    // A continuation is an internal request. Named export → the
+    // target rides `Request.fn_override` with positional args
+    // `[ctx]` (wake — no callee outcome) / `[ctx,outcome]`
+    // (callback); default export → a plain body object
+    // `{ctx,outcome}` the handler reads via `request.body`.
+    // ctx_json/outcome_json are JSON text embedded verbatim. The
+    // retired `{fn,args}` body envelope is never synthesized
+    // (decisions.md §4.5 — dispatch targeting is first-class, and
+    // the old fmt-into-JSON envelope was an escaping hazard for fn
+    // names). A wake resume routes to the StreamWakes `wake_to`
+    // export (default `onWake`) and drains the entity's wake ring so
+    // the fired entries are consumed (the timer-due / kv-match
+    // trigger).
     const resume_fn: ?[]const u8 = if (wake) blk: {
         const sw = server.reg.get(ent, &worker.parked_continuations, components_mod.StreamWakes) catch break :blk "onWake";
         // Drain the §9.4 kv-match ring (if any) — this resume consumes
@@ -1413,13 +1419,19 @@ fn resumeContinuation(
         }
         break :blk if (sw.wake_to) |t| t else "onWake";
     } else cont_fn_name;
-    const body = if (wake)
-        try std.fmt.allocPrint(allocator, "{{\"fn\":\"{s}\",\"args\":[{s}]}}", .{ resume_fn.?, cont_ctx_json })
-    else if (cont_fn_name) |fnname|
-        try std.fmt.allocPrint(allocator, "{{\"fn\":\"{s}\",\"args\":[{s},{s}]}}", .{ fnname, cont_ctx_json, outcome_json })
+    const named: bool = wake or cont_fn_name != null;
+    const args_json: []const u8 = if (wake)
+        try std.fmt.allocPrint(allocator, "[{s}]", .{cont_ctx_json})
+    else if (cont_fn_name != null)
+        try std.fmt.allocPrint(allocator, "[{s},{s}]", .{ cont_ctx_json, outcome_json })
+    else
+        try allocator.dupe(u8, "[]");
+    defer allocator.free(args_json);
+    const body = if (named)
+        ""
     else
         try std.fmt.allocPrint(allocator, "{{\"ctx\":{s},\"outcome\":{s}}}", .{ cont_ctx_json, outcome_json });
-    defer allocator.free(body);
+    defer if (!named) allocator.free(body);
     const spath = try std.fmt.allocPrint(allocator, "/{s}", .{path});
     defer allocator.free(spath);
 
@@ -1457,6 +1469,11 @@ fn resumeContinuation(
         .path = spath,
         .body = body,
         .query = null,
+        // First-class resume target: the named export (wake_to /
+        // cont_fn_name) + its positional args. Null for the
+        // default-export form, whose payload rides `body` instead.
+        .fn_override = if (named) resume_fn else null,
+        .fn_args_json = args_json,
         // Inherit the chain id from the parking request so every tape row
         // of this chain shares one correlation_id; mark this activation as
         // a send-callback resume (streaming-handlers-plan §6) — or
@@ -1825,11 +1842,11 @@ pub fn resumeBoundFetchChain(
     const ctx_src: []const u8 = if (ev.ctx_json.len > 0) ev.ctx_json else "{}";
     const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{ctx_src}) catch return;
     defer allocator.free(body);
+    // First-class resume target (decisions.md §4.5) — no synthetic
+    // `?fn=` query; the path stays the real module path.
     const fn_name: []const u8 = ev.resolvedExport();
-    const spath = std.fmt.allocPrint(allocator, "/{s}?fn={s}", .{ path, fn_name }) catch return;
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
     defer allocator.free(spath);
-    const query = std.fmt.allocPrint(allocator, "fn={s}", .{fn_name}) catch return;
-    defer allocator.free(query);
 
     const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
     var txn_owned = true;
@@ -1890,7 +1907,7 @@ pub fn resumeBoundFetchChain(
         .method = "POST",
         .path = spath,
         .body = body,
-        .query = query,
+        .fn_override = fn_name,
         .is_system_module = builtin_modules_mod.isBuiltinPath(path),
         .activation = .{ .fetch_chunk = .{
             .id = ev.fetch_id,
@@ -2552,7 +2569,7 @@ pub fn drainFetchPendingDurability(worker: anytype) !void {
     }
 }
 
-/// streaming-handlers-plan §4.6: register a batch's kv-writes as
+/// streaming-handlers-plan §4.5: register a batch's kv-writes as
 /// commit-gated wake intents. Extracts `(key, op)` from each put /
 /// delete in the writeset (key bytes dup'd so the caller can
 /// release the writeset bytes), parks them on a `ParkedUnit` keyed

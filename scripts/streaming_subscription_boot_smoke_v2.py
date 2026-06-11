@@ -36,7 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEMO = REPO_ROOT / "examples" / "loop46-demo-tenants" / "acme"
@@ -49,7 +49,7 @@ def _src(rel: str) -> str:
 # Subscription module + handlers reused verbatim from the V1 demo tenant.
 # spec.json MUST deploy as `static` (the loader skips non-static specs).
 HANDLERS = {
-    "index.mjs": ("handler", _src("index.mjs")),
+    "index.mjs": ("handler", rpc_wrap(_src("index.mjs"))),
     "readkey/index.mjs": ("handler", _src("readkey/index.mjs")),
     "_subscriptions/migrate-v1/index.mjs":
         ("handler", _src("_subscriptions/migrate-v1/index.mjs")),

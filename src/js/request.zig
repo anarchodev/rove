@@ -354,9 +354,24 @@ pub const Request = struct {
     host: []const u8 = "",
     body: []const u8 = "",
     /// Query string (everything after `?`, not including it). Null when the
-    /// URL had none. Used to find `?fn=<name>` and surfaced as
-    /// `request.query`.
+    /// URL had none. Surfaced as `request.query` — opaque to the platform
+    /// (the former `?fn=`/`&args=` platform dispatch is retired; handlers
+    /// that want query-based routing parse it in JS, decisions.md §4.5).
     query: ?[]const u8 = null,
+    /// Internal resume-path dispatch target. The platform's own resume
+    /// engines (send-callback / wake / bound-fetch / subscription /
+    /// chained dispatch) name the export to invoke here — first-class,
+    /// never via the customer-visible body or query string (the
+    /// `{fn,args}` envelope is retired, decisions.md §4.5). Null →
+    /// the activation kind's conventional export
+    /// (`rpc_dispatch.defaultExportForKind`). Borrowed slice owned by
+    /// the dispatching worker frame.
+    fn_override: ?[]const u8 = null,
+    /// Positional-args JSON array literal for `fn_override` calls
+    /// (e.g. `[{...ctx}]`, `[{...ctx},{...outcome}]`). One
+    /// `JS_ParseJSON` + spread on the qjs side. Ignored when
+    /// `fn_override` is null.
+    fn_args_json: []const u8 = "[]",
     /// Wire HTTP headers, lowercase per HTTP/2. Surfaced to JS as
     /// `request.headers` (pseudo-headers filtered) and `request.cookies`.
     /// Null = none supplied (test paths that don't care).

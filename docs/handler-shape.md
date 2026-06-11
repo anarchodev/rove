@@ -307,6 +307,55 @@ default for `on.kv`/`on.timer` is one generic `onWake` because they're
 which fired (the SSE cursor pattern, §5.7). `on.fetch` keeps per-result
 exports because it carries a payload.
 
+### 3.1 Named-function RPC is handler JS (the `rpc` recipe)
+
+The platform invokes **only** the activation's export (the table
+above). The former platform-level `?fn=name&args=…` query and
+`{"fn":…,"args":[…]}` POST-body dispatch are RETIRED (decisions.md
+§4.5): `request.query` and `request.body` are opaque payload the
+engine never interprets. Internal resume targeting (`{to}`,
+`next({fn})`, `onResult`) is first-class on the runtime's Request and
+unaffected.
+
+A handler that wants named-function routing composes it from
+primitives — and because the shim reads `request.query` /
+`request.body` in JS, the dispatch inputs land on the replay tape like
+every other read:
+
+```js
+function rpc(fns) {
+  return function () {
+    let fn = null, args = [];
+    for (const part of (request.query || "").split("&")) {
+      const eq = part.indexOf("=");
+      const k = eq === -1 ? part : part.slice(0, eq);
+      if (k !== "fn" && k !== "args") continue;
+      const v = eq === -1 ? "" : decodeURIComponent(part.slice(eq + 1).replace(/\+/g, "%20"));
+      if (k === "fn" && v) fn = v;
+      else if (k === "args" && v) { try { args = JSON.parse(v); } catch (_) {} }
+    }
+    if (!fn && request.body) {
+      try {
+        const b = JSON.parse(request.body);
+        if (b && typeof b.fn === "string") { fn = b.fn; args = Array.isArray(b.args) ? b.args : []; }
+      } catch (_) {}
+    }
+    const f = fn ? fns[fn] : null;
+    if (!f) { response.status = 404; return "no such fn: " + fn; }
+    return f(...args);
+  };
+}
+
+function whoami() { return "it me"; }
+function add(a, b) { return a + b; }
+export default rpc({ whoami, add });
+```
+
+The wire shapes are unchanged — `GET /?fn=whoami` and
+`POST {"fn":"add","args":[1,2]}` work exactly as before; the dispatch
+just belongs to the app now (the `__admin__` dashboard handler,
+`web/admin/index.mjs`, is the dogfood example).
+
 ## 4. Buffered vs streaming inbound — the 1 MB ceiling
 
 **Any inbound HTTP request body ≤ 1 MB is delivered in a single

@@ -36,7 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEMO = REPO_ROOT / "examples" / "loop46-demo-tenants"
@@ -93,7 +93,7 @@ def main() -> int:
         r = c.provision("acme")
         check("provision → 204", r.status == 204, f"got {r.status}")
         dep_id = c.deploy_handlers("acme", {
-            "index.mjs": READY_SRC,
+            "index.mjs": rpc_wrap(READY_SRC),
             "up/index.mjs": ONCHUNK_SRC,
             "big/index.mjs": BIG_SRC,
             "heartbeat/index.mjs": (DEMO / "acme/heartbeat/index.mjs").read_text(),

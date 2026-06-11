@@ -47,7 +47,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 # A single handler: POST {value} writes kv["failover/value"]; GET reads it
 # back. Verbatim-shape kv.get/kv.set bindings (matches on_kv_smoke_v2).
@@ -89,7 +89,7 @@ def main() -> int:
         lead0 = c.leader_node("acme")
         check("leader present pre-deploy", lead0 is not None, f"lead={lead0}")
         try:
-            dep_id = c.deploy_handlers("acme", {"index.mjs": HANDLER_SRC},
+            dep_id = c.deploy_handlers("acme", {"index.mjs": rpc_wrap(HANDLER_SRC)},
                                        node=lead0 if lead0 is not None else 0)
             check("deploy_handlers → dep_id", bool(dep_id), f"dep_id={dep_id}")
         except RuntimeError as e:

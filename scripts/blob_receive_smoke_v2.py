@@ -38,7 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 RECEIVE_SRC = """\
 export function onHeaders() {
@@ -109,7 +109,7 @@ def main() -> int:
         rp = c.set_plan("acme", '{"tier":"pro"}')
         check("set_plan pro → 2xx", rp.status in (200, 204), f"got {rp.status} {rp.body!r}")
         dep_id = c.deploy_handlers("acme", {
-            "index.mjs": READY_SRC,
+            "index.mjs": rpc_wrap(READY_SRC),
             "upload/index.mjs": RECEIVE_SRC,
             "misuse/index.mjs": MISUSE_SRC,
             "read/index.mjs": READER_SRC,
