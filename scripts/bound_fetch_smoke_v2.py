@@ -105,7 +105,7 @@ def main() -> int:
         # ── 3. THE bound fetch. ───────────────────────────────────────
         # acme fetches wb/bulk over loopback h2c; the wb.<suffix> Host
         # carries the tenant routing (bare 127.0.0.1 → 404).
-        bulk_url = f"http://wb.{PUBLIC_SUFFIX}:{c.node_ports[0]}/bulk"
+        bulk_url = f"http://wb.{PUBLIC_SUFFIX}:{c.front_port}/bulk"
         r = c.get("acme", f"/boundproxy?url={up.quote(bulk_url)}", timeout=30.0)
         if r.status != 200:
             check("/boundproxy → 200", False, f"status={r.status} body={r.body!r}")

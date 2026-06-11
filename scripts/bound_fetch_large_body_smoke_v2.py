@@ -109,7 +109,7 @@ def main() -> int:
             print("\nFAILURES:", failures)
             return 1
 
-        big_url = f"http://wb.{PUBLIC_SUFFIX}:{c.node_ports[0]}/bigbody?n={N_LINES}"
+        big_url = f"http://wb.{PUBLIC_SUFFIX}:{c.front_port}/bigbody?n={N_LINES}"
 
         # ── 1. Upstream reachable + deterministic. ────────────────────
         r = c.wait_for_handler("wb", f"/bigbody?n={N_LINES}", want_status=200,

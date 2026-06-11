@@ -134,7 +134,7 @@ def main() -> int:
               f"got {ready.status} {ready.body!r}")
         # wb echoes (POST) — poll it directly so the first heldsync hop isn't
         # racing the wb cold-start deploy.
-        wb_url = f"http://wb.{PUBLIC_SUFFIX}:{c.node_ports[0]}/echo"
+        wb_url = f"http://wb.{PUBLIC_SUFFIX}:{c.front_port}/echo"
         deadline = time.time() + 25.0
         wb_ok = False
         while time.time() < deadline:
