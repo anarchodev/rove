@@ -472,6 +472,75 @@ collab).
   one Ready/fsync/RTT through the per-tenant propose pipeline (the batched-
   activation coalescing was rejected — §7).
 
+## 8.5 WS through the front — Extended CONNECT (RFC 8441), and the h2c-only worker
+
+**Decided 2026-06-12 (in build).** The front terminates the WebSocket
+handshake at the edge and tunnels each connection upstream as an RFC 8441
+Extended CONNECT stream (`:method: CONNECT`, `:protocol: websocket`) on the
+EXISTING pooled h2c connection — no per-WS upstream socket, per-stream flow
+control for free. Once the worker accepts WS as h2 streams, nothing pins h1
+to the worker and the worker goes h2c-only (h1 termination, like TLS, becomes
+the front's job alone). Rejected alternative: a dedicated h1-upgrade client
+leg per WS connection — smaller slice but a throwaway (parked half-measure)
+and it keeps h1 + the socket-hijack mode in the worker forever.
+
+**Identity model (the key move).** A logical WS connection is an opaque
+`Entity` everywhere in the worker seam (`ws_conns` map keys, `ws_message_out`
+Session, `emitWsSend`). Today that's the h1 conn entity; under 8441 it is a
+per-CONNECT-stream identity entity in a new `ws_streams` collection
+(Session=conn, StreamId=sid, ReqHeaders=CONNECT headers). The seam's
+staleness sweep (`reg.isStale(key)`) works unchanged; routing comes from the
+CONNECT `:authority`/`:path` instead of the `ws_authority`/`ws_path` capture
+hack on `Http1Conn` (which dies with the worker's h1 mode).
+
+**Worker server side** (rove-h2, `H2Options.extended_connect`):
+1. `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1` on server sessions.
+2. HEADERS with `:method CONNECT` + `:protocol websocket` → identity entity
+   into `ws_connect_out` — the WORKER dispositions the tunnel (resolve tenant
+   from `:authority`, leadership check, later auth/plan gates) and calls
+   `wsConnectAccept(ent)` (h2 replies `:status 200`, no END_STREAM; entity →
+   `ws_streams`) or `wsConnectReject(ent, status)` (421 → the front re-aims at
+   the next node — fixes the h1-direct flaw where the 101 succeeded on
+   followers and the first frame failed).
+3. Inbound stream DATA carries RFC 6455 frames (browser masking intact — the
+   front relays bytes verbatim): per-stream `WsReassembler` (the
+   `wsDrive`/`wsHandleFrame` logic factored off `Http1Conn`), auto-pong,
+   close → `ws_message_out` opcode 8 + echo + stream END; complete messages →
+   `ws_message_out` with Session = identity entity. Window consumed
+   immediately (the worker's §4.5 input gate is the real backpressure).
+4. Outbound: `consumeWsSends` grows an h2 arm — frames serialize onto a
+   per-stream byte queue shipped through the existing streaming-response
+   data-provider machinery (one submit in flight, deferred reads). `close`
+   opcode → Close frame, then END_STREAM. Stream close → destroy the
+   identity entity (the seam sweep fires `onDisconnect` via isStale).
+
+**Front side**:
+- The h1 listener surfaces Upgrade requests to the consumer instead of
+  auto-completing them (new mode beside `websocket_upgrades`): a
+  `ws_upgrade_out` entity (Session=conn, the head's routing + key). The
+  proxy resolves the route and opens the upstream CONNECT (client side:
+  `client_ws_connect_in`, gated on the peer's ENABLE_CONNECT_PROTOCOL
+  setting); ONLY on upstream `:status 200` does it complete the downstream
+  `101` (`wsUpgradeAccept`) and enter raw-relay tunnel mode — downstream
+  socket bytes → upstream DATA chunks (existing client stream-data pump),
+  upstream DATA → downstream socket (existing one-write-in-flight ws queue),
+  no frame parsing at the front. Upstream 421 → next node; exhausted →
+  plain HTTP 502 downstream (no 101 ever sent — clean failure).
+- Examples (`ws-echo`) keep the auto-handshake mode; the worker stops
+  terminating WS over h1 entirely.
+
+**Then the worker goes h2c-only**: the h1 swap-in is disabled on the worker
+instance (`H2Options`), worker-direct h1 smokes repoint through the front,
+and the worker's wire surface is exactly one protocol. The h1 codec (incl.
+the 2026-06-12 h1 inbound streaming) remains in rove-h2 for the front and
+examples — the front IS the h1 edge.
+
+Verify-items: nghttp2 1.66 Extended CONNECT callback shape (client submit
+requires the peer SETTINGS observed first); shared-conn fairness for a
+firehose WS vs request traffic on the pooled conn (16 MiB conn window +
+per-stream windows — needs a smoke); WS close-handshake mapping to stream
+half-close in both directions.
+
 ## 9. Relation to other docs
 
 - **`architecture/routing-and-ingress.md` §3 (inbound chunks) + §4 (outbound chunks)**

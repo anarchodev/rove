@@ -89,6 +89,56 @@ fn tearDownWsChain(worker: anytype, conn_ent: rove.Entity) void {
     _ = worker.ws_conns.remove(conn_ent);
 }
 
+/// Routing for a WS identity entity, transport-agnostic: an Extended-CONNECT
+/// stream's identity entity (h2, `wsStreamRouting` — websocket-plan §8.5) or
+/// an h1 ws-mode conn entity (`wsConnRouting`).
+fn wsRouting(server: anytype, ent: rove.Entity) ?struct { authority: []const u8, path: []const u8 } {
+    if (server.wsStreamRouting(ent)) |r| return .{ .authority = r.authority, .path = r.path };
+    if (server.wsConnRouting(ent)) |r| return .{ .authority = r.authority, .path = r.path };
+    return null;
+}
+
+/// websocket-plan §8.5: disposition pending Extended-CONNECT tunnels BEFORE
+/// any 200 reaches the front — unknown tenant/host → 404; not the tenant's
+/// leader → 421 (the front re-aims at the next node, the same contract as
+/// request routing; this fixes the h1-direct flaw where the 101 always
+/// succeeded and the first frame failed). Accepting wires the stream into
+/// `ws_message_out` / `ws_send_in`; the chain itself establishes lazily on
+/// the first frame (`establishWsChain`), same as h1.
+fn serviceWsConnects(worker: anytype) void {
+    const server = worker.h2;
+    const ents = server.ws_connect_out.entitySlice();
+    if (ents.len == 0) return;
+    // Snapshot — accept/reject mutate the collection.
+    var buf: [64]rove.Entity = undefined;
+    var n: usize = 0;
+    for (ents) |ent| {
+        if (n >= buf.len) break;
+        buf[n] = ent;
+        n += 1;
+    }
+    for (buf[0..n]) |ent| {
+        const routing = wsRouting(server, ent) orelse {
+            server.wsConnectReject(ent, 400);
+            continue;
+        };
+        const host = worker_mod.hostOnly(routing.authority);
+        const inst = (worker.node.tenant.resolveDomain(host) catch null) orelse {
+            server.wsConnectReject(ent, 404);
+            continue;
+        };
+        _ = inst;
+        if (!worker.raft.isLeader()) {
+            server.wsConnectReject(ent, 421);
+            continue;
+        }
+        if (server.wsConnectAccept(ent) != .ok) {
+            // Stream died between emit and now; nothing to clean.
+            continue;
+        }
+    }
+}
+
 /// Establish the held chain for a new WS connection on its first inbound
 /// frame: resolve the tenant (from the upgrade Host) + handler module (from
 /// the upgrade path), mint a per-connection correlation id, create the parked
@@ -98,7 +148,7 @@ fn tearDownWsChain(worker: anytype, conn_ent: rove.Entity) void {
 fn establishWsChain(worker: anytype, conn_ent: rove.Entity) !rove.Entity {
     const allocator = worker.allocator;
     const server = worker.h2;
-    const routing = server.wsConnRouting(conn_ent) orelse return error.WsConnGone;
+    const routing = wsRouting(server, conn_ent) orelse return error.WsConnGone;
     const host = worker_mod.hostOnly(routing.authority);
     const inst = (worker.node.tenant.resolveDomain(host) catch return error.WsResolveFailed) orelse
         return error.WsNoTenant;
@@ -262,6 +312,7 @@ fn flushWsGates(worker: anytype) void {
 /// `onDisconnect`, and reap chains whose conn vanished. Gated by `count()==0`
 /// so the no-WS hot path pays nothing.
 pub fn serviceWsMessages(worker: anytype) !void {
+    serviceWsConnects(worker);
     sweepStaleWsChains(worker);
     flushWsGates(worker);
 

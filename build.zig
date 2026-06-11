@@ -849,6 +849,29 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(h2_limit_test);
 
+    // Extended-CONNECT WS tunnel test (websocket-plan §8.5): in-process
+    // client+server pair over RFC 8441. `zig build h2-ws-connect-test` runs it.
+    const h2_ws_connect_mod = b.addModule("h2-ws-connect-test", .{
+        .root_source_file = b.path("examples/h2_ws_connect_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    h2_ws_connect_mod.addImport("rove", rove_mod);
+    h2_ws_connect_mod.addImport("rove-io", io_mod);
+    h2_ws_connect_mod.addImport("rove-h2", h2_mod);
+    h2_ws_connect_mod.link_libc = true;
+    h2_ws_connect_mod.linkSystemLibrary("nghttp2", .{});
+    h2_ws_connect_mod.linkSystemLibrary("ssl", .{});
+    h2_ws_connect_mod.linkSystemLibrary("crypto", .{});
+
+    const h2_ws_connect_test = b.addExecutable(.{
+        .name = "h2-ws-connect-test",
+        .root_module = h2_ws_connect_mod,
+    });
+    b.installArtifact(h2_ws_connect_test);
+    const run_h2_ws_connect = b.addRunArtifact(h2_ws_connect_test);
+    b.step("h2-ws-connect-test", "Run the Extended-CONNECT WS tunnel test").dependOn(&run_h2_ws_connect.step);
+
     // ── rust-ffi-smoke: V2 vendoring spike (docs/v2-vendoring-spike.md).
     // Step 1 — prove `cargo build → linkSystemLibrary` works end-to-end
     // before vendoring raft-rs's full dep tree. The Rust staticlib at
