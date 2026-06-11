@@ -245,7 +245,7 @@ the exact bytes, the real HTTP Signature, the real key fetch, the
 invocation for the `inbox` 202, one for the `inbox_verified` result;
 they stitch together through the carried context).
 
-Open that recorded request in the replay/sim surface (`loop46 replay
+Open that recorded request in the replay/sim surface (`rewind replay
 <id>` / the sim-test framework — PLAN §10.12,
 `docs/sim-test-framework.md`) and you can re-run the verification path
 deterministically and synthesize a regression test from it: a test
