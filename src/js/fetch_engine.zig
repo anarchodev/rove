@@ -373,8 +373,41 @@ pub const FetchEngine = struct {
         // keys never enter JS space. Setup errors here surface as
         // the standard single `final: true, ok: false` event via
         // `drainInbound`'s catch.
-        if (std.mem.startsWith(u8, pf.url, BLOB_ORIGIN_PREFIX)) {
+        //
+        // SSRF gate (PLAN §2.6): every CUSTOMER-supplied URL is
+        // policy-checked per attempt (scheme ∈ http(s), TLS-always
+        // unless the test hatch, no blocklisted resolution — see
+        // rove-ssrf), and the vetted address is pinned via
+        // CURLOPT_RESOLVE so a second DNS answer (rebinding) can't
+        // move the connect. The blob door is exempt: its URL is
+        // rewritten to the platform-configured S3 endpoint (which
+        // may legitimately be private), never customer-controlled.
+        // Customer transfers also run with redirects OFF (the
+        // Request doc explains why); a blocked URL surfaces as the
+        // standard failed-setup event (`terminal_ok=false`).
+        var pin_buf: [768]u8 = undefined;
+        var resolve_pin: ?[:0]const u8 = null;
+        const is_blob_door = std.mem.startsWith(u8, pf.url, BLOB_ORIGIN_PREFIX);
+        if (is_blob_door) {
             try self.rewriteAndSignBlobFetch(pf, method, &headers_list);
+        } else {
+            const checked = ssrf_mod.checkUrl(self.allocator, pf.url) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    std.log.warn(
+                        "rove-js fetch_engine: outbound blocked tenant={s} id={s}: {s} url={s}",
+                        .{ pf.tenant_id, pf.id, @errorName(err), pf.url },
+                    );
+                    return error.OutboundBlocked;
+                },
+            };
+            if (!checked.host_is_literal)
+                resolve_pin = try buildResolvePin(
+                    &pin_buf,
+                    checked.host,
+                    checked.port,
+                    checked.addresses[0..checked.address_count],
+                );
         }
 
         const req: blob_curl_multi.Request = .{
@@ -390,6 +423,8 @@ pub const FetchEngine = struct {
             // some other entry point.
             .timeout_ms = if (pf.held) 0 else pf.timeout_ms,
             .verify_tls = !ssrf_mod.test_allow_plaintext,
+            .follow_redirects = is_blob_door,
+            .resolve_pin = resolve_pin,
         };
 
         const ctx = try self.allocator.create(FetchCtx);
@@ -777,12 +812,21 @@ fn onHeaderLineCb(line: []const u8, ctx: ?*anyopaque) void {
 /// the terminal event, remove from inflight_by_id, free the ctx.
 fn onDoneCb(transfer: *blob_curl_multi.Transfer, result: blob_curl_multi.Result, ctx: ?*anyopaque) void {
     const s: *FetchCtx = @ptrCast(@alignCast(ctx.?));
-    _ = transfer;
 
     // Transport-only: libcurl finished cleanly AND we hit no
     // alloc/route failure. Cap-only truncation is NOT a failure
     // (the customer explicitly bounded the response).
     const transport_ok = result.ok and !s.failed;
+    if (!result.ok) {
+        // Operator-readable transport failure — the customer-visible
+        // outcome is just `ok=false`, so this line is the only place
+        // the curl reason (timeout vs DNS vs connect vs policy)
+        // surfaces.
+        std.log.warn(
+            "rove-js fetch_engine: transport failed tenant={s} id={s} curl_code={d} err={s}",
+            .{ s.pf.tenant_id, s.pf.id, result.curl_code, std.mem.sliceTo(&transfer.err_buf, 0) },
+        );
+    }
 
     if (!s.stream_mode) {
         // Phase 5 PR-1: ONE event with `final: true` + the body +
@@ -808,6 +852,66 @@ fn onDoneCb(transfer: *blob_curl_multi.Transfer, result: blob_curl_multi.Result,
     if (s.held) s.engine.bumpHeldCount(s.pf.tenant_id, -1);
     _ = s.engine.inflight_by_id.remove(s.pf.id);
     s.deinit();
+}
+
+/// `"{host}:{port}:{ip1,ip2,…}"` for `CURLOPT_RESOLVE` — pins the
+/// transfer's connect to the SSRF-vetted address set. The WHOLE
+/// vetted set is pinned (every address was blocklist-checked), not
+/// just the first, so curl keeps its normal multi-address connect
+/// fallback — e.g. `*.localhost` resolves to both `::1` and
+/// `127.0.0.1` while the test echo node binds v4 only. IPv6 goes in
+/// brackets (curl's requirement for numeric v6); the host is
+/// lowercased in place so curl's case-insensitive host match hits
+/// the entry. Only called for DNS-name hosts (a literal-IP URL has
+/// nothing to rebind).
+fn buildResolvePin(buf: []u8, host: []const u8, port: u16, addrs: []const std.net.Address) ![:0]const u8 {
+    var n: usize = 0;
+    n += (try std.fmt.bufPrint(buf[n..], "{s}:{d}:", .{ host, port })).len;
+    for (addrs, 0..) |addr, i| {
+        if (i != 0) {
+            if (n + 1 >= buf.len) return error.NoSpaceLeft;
+            buf[n] = ',';
+            n += 1;
+        }
+        n += (try printPinIp(buf[n..], addr)).len;
+    }
+    if (n >= buf.len) return error.NoSpaceLeft;
+    buf[n] = 0;
+    const pin = buf[0..n :0];
+    for (pin[0..host.len]) |*ch| ch.* = std.ascii.toLower(ch.*);
+    return pin;
+}
+
+fn printPinIp(buf: []u8, addr: std.net.Address) ![]const u8 {
+    return switch (addr.any.family) {
+        std.posix.AF.INET => blk: {
+            const o: [4]u8 = @bitCast(addr.in.sa.addr);
+            break :blk try std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ o[0], o[1], o[2], o[3] });
+        },
+        std.posix.AF.INET6 => blk: {
+            const b = addr.in6.sa.addr;
+            break :blk try std.fmt.bufPrint(buf, "[{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}]", .{
+                std.mem.readInt(u16, b[0..2], .big),   std.mem.readInt(u16, b[2..4], .big),
+                std.mem.readInt(u16, b[4..6], .big),   std.mem.readInt(u16, b[6..8], .big),
+                std.mem.readInt(u16, b[8..10], .big),  std.mem.readInt(u16, b[10..12], .big),
+                std.mem.readInt(u16, b[12..14], .big), std.mem.readInt(u16, b[14..16], .big),
+            });
+        },
+        else => error.OutboundBlocked,
+    };
+}
+
+test "buildResolvePin: v4 + v6 set + lowercasing" {
+    var buf: [768]u8 = undefined;
+    const v4 = try std.net.Address.parseIp("93.184.216.34", 443);
+    const pin4 = try buildResolvePin(&buf, "Example.COM", 443, &.{v4});
+    try std.testing.expectEqualStrings("example.com:443:93.184.216.34", pin4);
+
+    var buf2: [768]u8 = undefined;
+    const v6 = try std.net.Address.parseIp("::1", 8443);
+    const v4b = try std.net.Address.parseIp("127.0.0.1", 8443);
+    const pin = try buildResolvePin(&buf2, "wb.localhost", 8443, &.{ v6, v4b });
+    try std.testing.expectEqualStrings("wb.localhost:8443:[0:0:0:0:0:0:0:1],127.0.0.1", pin);
 }
 
 /// Setup-failure path: fire a single empty `final: true` event with

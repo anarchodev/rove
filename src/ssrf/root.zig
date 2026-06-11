@@ -1,10 +1,11 @@
-//! rove-ssrf — SSRF blocklist + dev-only safety overrides for
+//! rove-ssrf — SSRF blocklist + test-only safety overrides for
 //! outbound HTTP from customer handlers.
 //!
 //! Imported by `js/fetch_engine.zig` (the curl_multi engine that
 //! handles `http.fetch` / `http.subscribe` / the `webhook.send` JS
-//! shim's transport) and by `loop46/main.zig` (to flip the
-//! `--dev-webhook-unsafe` test overrides).
+//! shim's transport — `checkUrl` is its per-attempt gate) and by
+//! `rewind/main.zig` (the `REWIND_UNSAFE_OUTBOUND=1` env flips the
+//! test overrides for smoke topologies).
 //!
 //! The rule: if ANY address a hostname resolves to lives inside one
 //! of the blocked CIDRs, refuse to connect. Prevents a malicious (or
@@ -45,6 +46,9 @@ pub const Error = error{
     BlockedAddress,
     UnresolvableHost,
     EmptyHost,
+    BadUrl,
+    UnsupportedScheme,
+    PlaintextBlocked,
 };
 
 /// **TEST-ONLY** escape hatch that skips the loopback (127/8) and
@@ -53,17 +57,111 @@ pub const Error = error{
 /// this would let a malicious customer handler probe the host's own
 /// services. The EC2-metadata link-local range (169.254.0.0/16) is
 /// still blocked unconditionally. Set via the worker's
-/// `--dev-webhook-unsafe` CLI flag; no config-file path.
+/// `REWIND_UNSAFE_OUTBOUND=1` env (smoke topologies); no config-file
+/// path.
 pub var test_allow_loopback: bool = false;
 
 /// **TEST-ONLY** escape hatch that lets the curl engine talk to
 /// `http://` URLs (in addition to `https://`). Paired with
-/// `test_allow_loopback` under loop46's `--dev-webhook-unsafe` flag
-/// so smokes can point at on-box echo servers. **Never set in
+/// `test_allow_loopback` under the worker's `REWIND_UNSAFE_OUTBOUND=1`
+/// env so smokes can point at on-box echo servers. **Never set in
 /// production** — plaintext outbound leaks request bodies on any
 /// intermediate hop. Read by `fetch_engine.zig` to flip
 /// `verify_tls` on libcurl.
 pub var test_allow_plaintext: bool = false;
+
+/// A customer-supplied outbound URL that passed the policy gate.
+/// `host` is a slice into the caller's URL (brackets stripped for an
+/// IPv6 literal); `addresses[0..address_count]` is the FULL vetted
+/// resolution set the caller MUST pin the connection to
+/// (CURLOPT_RESOLVE) so a second DNS answer can't land somewhere the
+/// gate never approved (rebinding defense). The whole set is pinned —
+/// not just the first address — so curl keeps its normal
+/// multi-address connect fallback (e.g. a v6-resolving name whose
+/// server only binds v4). `host_is_literal` means the host was a
+/// literal IP — no DNS, so no pin needed.
+pub const MAX_PIN_ADDRS = 8;
+
+pub const CheckedUrl = struct {
+    addresses: [MAX_PIN_ADDRS]std.net.Address,
+    address_count: u8,
+    host: []const u8,
+    port: u16,
+    host_is_literal: bool,
+};
+
+/// The full outbound policy gate for one customer-supplied URL
+/// (`http.fetch` and everything shimmed over it). Enforces, in order:
+///   1. scheme is `https` (or `http` only under the test-only
+///      `test_allow_plaintext` escape hatch) — anything else
+///      (`file:`, `gopher:`, …) is `UnsupportedScheme`;
+///   2. a non-empty host;
+///   3. every address the host resolves to clears the blocklist
+///      (`resolveSafe` — re-resolved on every attempt per PLAN §2.6).
+/// Fail-closed: a host we can't parse or resolve is an error, never
+/// a pass-through. Percent-encoded hosts are deliberately NOT decoded
+/// — they fail resolution and are rejected (curl would decode them,
+/// so passing them through unchecked would be a smuggling vector).
+pub fn checkUrl(allocator: std.mem.Allocator, url: []const u8) !CheckedUrl {
+    const uri = std.Uri.parse(url) catch return Error.BadUrl;
+
+    var default_port: u16 = undefined;
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
+        default_port = 443;
+    } else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) {
+        if (!test_allow_plaintext) return Error.PlaintextBlocked;
+        default_port = 80;
+    } else {
+        return Error.UnsupportedScheme;
+    }
+
+    const host_component = uri.host orelse return Error.EmptyHost;
+    var host = switch (host_component) {
+        .raw, .percent_encoded => |s| s,
+    };
+    // std.Uri keeps an IPv6 literal's brackets; strip for parse/resolve.
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']')
+        host = host[1 .. host.len - 1];
+    if (host.len == 0) return Error.EmptyHost;
+
+    const port = uri.port orelse default_port;
+
+    var out: CheckedUrl = .{
+        .addresses = undefined,
+        .address_count = 0,
+        .host = host,
+        .port = port,
+        .host_is_literal = false,
+    };
+
+    // Literal-IP fast path: no DNS, one address, no pin needed.
+    if (std.net.Address.parseIp(host, port)) |addr| {
+        if (isBlocked(addr)) return Error.BlockedAddress;
+        out.addresses[0] = addr;
+        out.address_count = 1;
+        out.host_is_literal = true;
+        return out;
+    } else |_| {}
+
+    var list = std.net.getAddressList(allocator, host, port) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return Error.UnresolvableHost,
+    };
+    defer list.deinit();
+    if (list.addrs.len == 0) return Error.UnresolvableHost;
+
+    // Reject if ANY address is blocked (a host must not smuggle a
+    // private address into the record set alongside a public one);
+    // keep up to MAX_PIN_ADDRS vetted addresses for the pin.
+    for (list.addrs) |a| {
+        if (isBlocked(a)) return Error.BlockedAddress;
+        if (out.address_count < MAX_PIN_ADDRS) {
+            out.addresses[out.address_count] = a;
+            out.address_count += 1;
+        }
+    }
+    return out;
+}
 
 /// Look up every address `host` resolves to on `port`, bail out if
 /// any hits the blocklist. Returns the first safe address (caller
@@ -175,11 +273,10 @@ const testing = std.testing;
 
 test "isBlocked v4: RFC 1918 + loopback + metadata" {
     const blocked = [_][]const u8{
-        "10.0.0.1", "10.255.255.255", "127.0.0.1", "127.1.2.3",
-        "169.254.169.254", "172.16.0.1", "172.31.255.254",
-        "192.168.1.1", "192.168.254.1", "100.64.0.1", "0.0.0.0",
-        "224.0.0.1", "239.255.255.255", "255.255.255.255",
-        "198.18.0.1", "198.51.100.1",
+        "10.0.0.1",        "10.255.255.255",  "127.0.0.1",      "127.1.2.3",
+        "169.254.169.254", "172.16.0.1",      "172.31.255.254", "192.168.1.1",
+        "192.168.254.1",   "100.64.0.1",      "0.0.0.0",        "224.0.0.1",
+        "239.255.255.255", "255.255.255.255", "198.18.0.1",     "198.51.100.1",
     };
     for (blocked) |s| {
         const addr = try std.net.Address.parseIp4(s, 0);
@@ -189,7 +286,7 @@ test "isBlocked v4: RFC 1918 + loopback + metadata" {
 
 test "isBlocked v4: public addresses pass" {
     const allowed = [_][]const u8{
-        "8.8.8.8", "1.1.1.1", "172.15.0.1", "192.169.0.1",
+        "8.8.8.8",        "1.1.1.1",     "172.15.0.1", "192.169.0.1",
         "100.63.255.255", "100.128.0.1", "54.210.1.1",
     };
     for (allowed) |s| {
@@ -200,7 +297,7 @@ test "isBlocked v4: public addresses pass" {
 
 test "isBlocked v6: loopback + link-local + ULA" {
     const blocked = [_][]const u8{
-        "::1", "::", "fe80::1", "fc00::1", "fd12:3456::1", "ff02::1",
+        "::1",              "::",              "fe80::1", "fc00::1", "fd12:3456::1", "ff02::1",
         "::ffff:127.0.0.1", "::ffff:10.0.0.1",
     };
     for (blocked) |s| {
@@ -226,4 +323,51 @@ test "resolveSafe: literal-IP fast path" {
     try testing.expectError(Error.BlockedAddress, resolveSafe(testing.allocator, "127.0.0.1", 443));
     try testing.expectError(Error.BlockedAddress, resolveSafe(testing.allocator, "169.254.169.254", 443));
     try testing.expectError(Error.EmptyHost, resolveSafe(testing.allocator, "", 443));
+}
+
+test "checkUrl: scheme policy" {
+    // Non-http(s) schemes are rejected outright — curl must never see
+    // a file:/gopher:/ftp: URL from a handler.
+    try testing.expectError(Error.UnsupportedScheme, checkUrl(testing.allocator, "file:///etc/passwd"));
+    try testing.expectError(Error.UnsupportedScheme, checkUrl(testing.allocator, "gopher://8.8.8.8/x"));
+    try testing.expectError(Error.UnsupportedScheme, checkUrl(testing.allocator, "ftp://8.8.8.8/x"));
+    // Plaintext http is blocked unless the test escape hatch is set.
+    try testing.expectError(Error.PlaintextBlocked, checkUrl(testing.allocator, "http://8.8.8.8/x"));
+    try testing.expectError(Error.BadUrl, checkUrl(testing.allocator, "not a url"));
+}
+
+test "checkUrl: literal-IP policy + ports" {
+    const ok = try checkUrl(testing.allocator, "https://8.8.8.8/path?q=1");
+    try testing.expect(ok.host_is_literal);
+    try testing.expectEqual(@as(u16, 443), ok.port);
+    try testing.expectEqualStrings("8.8.8.8", ok.host);
+
+    const with_port = try checkUrl(testing.allocator, "https://1.1.1.1:8443/");
+    try testing.expectEqual(@as(u16, 8443), with_port.port);
+
+    try testing.expectError(Error.BlockedAddress, checkUrl(testing.allocator, "https://127.0.0.1/"));
+    try testing.expectError(Error.BlockedAddress, checkUrl(testing.allocator, "https://169.254.169.254/latest/meta-data/"));
+    try testing.expectError(Error.BlockedAddress, checkUrl(testing.allocator, "https://10.1.2.3:8080/"));
+    // Userinfo must not confuse host extraction.
+    try testing.expectError(Error.BlockedAddress, checkUrl(testing.allocator, "https://public.example@127.0.0.1/"));
+    // IPv6 literals, bracketed per RFC 3986.
+    try testing.expectError(Error.BlockedAddress, checkUrl(testing.allocator, "https://[::1]/"));
+    try testing.expectError(Error.BlockedAddress, checkUrl(testing.allocator, "https://[fd00::1]:8443/"));
+    const v6ok = try checkUrl(testing.allocator, "https://[2001:4860:4860::8888]/");
+    try testing.expect(v6ok.host_is_literal);
+    try testing.expectEqualStrings("2001:4860:4860::8888", v6ok.host);
+}
+
+test "checkUrl: test_allow hatches" {
+    test_allow_plaintext = true;
+    test_allow_loopback = true;
+    defer {
+        test_allow_plaintext = false;
+        test_allow_loopback = false;
+    }
+    const loop = try checkUrl(testing.allocator, "http://127.0.0.1:18443/echo");
+    try testing.expect(loop.host_is_literal);
+    try testing.expectEqual(@as(u16, 18443), loop.port);
+    // Metadata range stays blocked even under the hatches.
+    try testing.expectError(Error.BlockedAddress, checkUrl(testing.allocator, "http://169.254.169.254/"));
 }

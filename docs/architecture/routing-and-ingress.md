@@ -135,6 +135,34 @@ in-flight backpressure on the streaming path. h1→h2c translation is **edge-onl
   an `onChunk` export takes it per-chunk. Outbound `http.fetch` coalescing is the
   auto-bind behavior described in `effects-and-handlers.md`.
 
+## Outbound policy gate (SSRF / TLS-always)
+
+- Every **customer-supplied** outbound URL (`http.fetch` and everything shimmed
+  over it — `webhook.send`, `email.send`, scheduler fires) passes
+  `rove-ssrf.checkUrl` in the fetch engine's `startTransfer`, **per attempt**:
+  scheme must be `https` (TLS-always), the host must resolve, and **every**
+  resolved address must clear the blocklist (RFC 1918, loopback, link-local /
+  cloud metadata, CGNAT, multicast/reserved — `src/ssrf/root.zig` has the full
+  table). A blocked URL surfaces as the standard failed outcome
+  (`ok=false, status=0`) plus an operator-readable `outbound blocked` log line.
+- **Rebinding defense**: the full vetted address set is pinned on the transfer
+  via `CURLOPT_RESOLVE` (whole set, not first-only, so curl keeps its
+  multi-address connect fallback), so the connect can only land on an address
+  the gate approved. **Redirects are OFF for customer transfers** (decisions.md
+  §3.8) — the handler sees the 3xx and composes its own follow, which re-enters
+  the gate as a fresh fetch. Transfers are also protocol-restricted to
+  `http,https` at the curl layer (`file:`/`gopher:`/… can't slip through even
+  if the gate regresses).
+- **Exempt**: the `rove-blob.internal` trusted door — its URL is rewritten to
+  the platform-configured S3 endpoint (legitimately private in some
+  deployments), never customer-controlled; it keeps redirect-following for S3
+  307s.
+- **Test hatch**: `REWIND_UNSAFE_OUTBOUND=1` on `rewind` relaxes ONLY the
+  loopback block + TLS-always (smoke topologies echo over on-box plaintext
+  h2c; the harness sets it on spawned workers). The metadata range stays
+  blocked unconditionally. Never set in production. Gate smoke:
+  `scripts/ssrf_smoke_v2.py`.
+
 ## Blob coordinator & chunk spool
 
 - **Coordinator** (`src/blob/coordinator.zig`): a worker `submit`s bytes to an
