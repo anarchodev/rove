@@ -44,9 +44,6 @@
 //!     request proxies as a plain GET and the backend answers it as
 //!     HTTP. A real tunnel needs an h1-upgrade client leg / raw
 //!     splice — its own slice.
-//!   - h1 inbound body streaming. The h1 codec emits body-complete
-//!     requests; an h1 chunked upload buffers at the edge (16 MiB
-//!     backstop) before forwarding. h2 ingress streams.
 
 const std = @import("std");
 const rove = @import("rove");

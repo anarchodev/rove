@@ -31,9 +31,7 @@
 //! invalidation) live in proxy.zig.
 //!
 //! Known deferrals: WebSocket tunneling at the edge (an Upgrade
-//! proxies as a plain GET; `websocket_upgrades = false`) and h1
-//! inbound body streaming (h1 uploads buffer at the edge before
-//! forwarding; h2 ingress streams).
+//! proxies as a plain GET; `websocket_upgrades = false`).
 
 const std = @import("std");
 const rove = @import("rove");
