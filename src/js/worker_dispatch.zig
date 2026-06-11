@@ -2856,6 +2856,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     // dispatch classic with the staged payload (the
                     // sink consumed the bytes, so h2 can't re-buffer).
                     body = job.staged orelse "";
+                } else if (job.staged != null and !job.staged_consumed) {
+                    // A staged fire was skipped after staging (anchor
+                    // mismatch / busy tenant below `continue`d this
+                    // entity): re-dispatch the SAME payload — staging
+                    // past it would drop its bytes.
+                    body = job.staged.?;
+                    chunk_dispatch = true;
                 } else if (job.fireReady()) {
                     if (!job.stageFire()) {
                         processed += 1;
@@ -3401,15 +3408,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     "tenant={s} err={s}",
                     .{ scope_inst.id, @errorName(re) },
                 );
-                try server.reg.set(ent, &server.request_out, worker_mod.BodyInbound, .{ .receiving = false });
-                switch (server.requestBodyBuffer(ent)) {
-                    // .buffering: re-dispatches body-complete via
-                    // request_buffering → request_out at END_STREAM.
-                    // .body_complete: body attached in place — the
-                    // next walk runs it as a classic `.inbound`.
-                    .buffering, .body_complete => {},
-                    .gone => try respb.setSimpleResponse(server, ent, sid, sess, 503, "client disconnected before body completed\n", allocator),
-                }
+                // Gap 2.4: leave `receiving` SET — the next walk
+                // re-runs the dispatch decision with the onHeaders
+                // cache now filled, which routes to the onChunk sink
+                // path or to classic buffering (with its declared-cap
+                // check) THERE. Flipping straight to classic here
+                // buffered any-size bodies whole before the onChunk
+                // question was ever asked (the first cache-cold >cap
+                // upload single-fired 12 MB).
                 processed += 1;
                 continue;
             },
