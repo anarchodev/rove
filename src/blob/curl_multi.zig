@@ -82,6 +82,19 @@ pub const Request = struct {
     /// talks to arbitrary upstreams). Mirrors `curl.zig`'s
     /// `HttpVersion.h2c_prior_knowledge`.
     http2_prior_knowledge: bool = false,
+    /// Follow 3xx redirects (libcurl-internal). Platform-trusted
+    /// transfers (S3, the blob door) keep the default; **customer
+    /// `http.fetch` transfers MUST pass `false`** — an internal
+    /// redirect hop would bypass the SSRF gate (a public URL can 302
+    /// to the metadata IP). The handler sees the 3xx and composes its
+    /// own follow, which re-enters the gate as a fresh fetch.
+    follow_redirects: bool = true,
+    /// Optional `CURLOPT_RESOLVE` entry (`HOST:PORT:IP`, IPv6 ip in
+    /// brackets) pinning the connection to the address the SSRF gate
+    /// vetted — otherwise a second DNS answer (rebinding) could land
+    /// the connect somewhere the gate never approved. curl copies the
+    /// string; the caller may pass stack memory.
+    resolve_pin: ?[:0]const u8 = null,
 };
 
 /// Result handed to the `on_done` callback when a transfer completes.
@@ -138,6 +151,9 @@ pub const Transfer = struct {
     resp_headers: std.ArrayListUnmanaged(Header),
     /// Header-list passed to CURLOPT_HTTPHEADER; freed in deinit.
     req_headers_slist: ?*c.curl_slist,
+    /// One-entry list passed to CURLOPT_RESOLVE (the SSRF pin);
+    /// freed in deinit.
+    resolve_slist: ?*c.curl_slist,
     /// Nul-terminated URL copy libcurl keeps a reference to.
     url_z: [:0]u8,
     /// Caller-supplied terminal callback + ctx.
@@ -180,10 +196,20 @@ pub const Transfer = struct {
         errdefer if (slist != null) c.curl_slist_free_all(slist);
         for (req.headers) |h| {
             const line = try std.fmt.allocPrintSentinel(
-                allocator, "{s}: {s}", .{ h.name, h.value }, 0,
+                allocator,
+                "{s}: {s}",
+                .{ h.name, h.value },
+                0,
             );
             defer allocator.free(line);
             slist = c.curl_slist_append(slist, line.ptr);
+        }
+
+        var resolve_slist: ?*c.curl_slist = null;
+        errdefer if (resolve_slist != null) c.curl_slist_free_all(resolve_slist);
+        if (req.resolve_pin) |pin| {
+            resolve_slist = c.curl_slist_append(null, pin.ptr);
+            if (resolve_slist == null) return Error.CurlInitFailed;
         }
 
         self.* = .{
@@ -194,6 +220,7 @@ pub const Transfer = struct {
             .resp_body = .empty,
             .resp_headers = .empty,
             .req_headers_slist = slist,
+            .resolve_slist = resolve_slist,
             .url_z = url_z,
             .on_done = on_done,
             .user_ctx = user_ctx,
@@ -207,7 +234,15 @@ pub const Transfer = struct {
         _ = c.curl_easy_setopt(handle, c.CURLOPT_URL, url_z.ptr);
         _ = c.curl_easy_setopt(handle, c.CURLOPT_ERRORBUFFER, &self.err_buf);
         _ = c.curl_easy_setopt(handle, c.CURLOPT_NOSIGNAL, @as(c_long, 1));
-        _ = c.curl_easy_setopt(handle, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 1));
+        _ = c.curl_easy_setopt(handle, c.CURLOPT_FOLLOWLOCATION, @as(c_long, if (req.follow_redirects) 1 else 0));
+        _ = c.curl_easy_setopt(handle, c.CURLOPT_MAXREDIRS, @as(c_long, 5));
+        // http/https only — a handler-supplied URL must never reach
+        // file:, gopher:, ftp:, … even if the gate upstream regresses.
+        _ = c.curl_easy_setopt(handle, c.CURLOPT_PROTOCOLS_STR, "http,https");
+        _ = c.curl_easy_setopt(handle, c.CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+        if (req.resolve_pin != null) {
+            _ = c.curl_easy_setopt(handle, c.CURLOPT_RESOLVE, self.resolve_slist);
+        }
         _ = c.curl_easy_setopt(handle, c.CURLOPT_TIMEOUT_MS, @as(c_long, req.timeout_ms));
         _ = c.curl_easy_setopt(handle, c.CURLOPT_CONNECTTIMEOUT_MS, @as(c_long, req.connect_timeout_ms));
         const verify_long: c_long = if (req.verify_tls) 1 else 0;
@@ -278,6 +313,7 @@ pub const Transfer = struct {
     pub fn deinit(self: *Transfer) void {
         c.curl_easy_cleanup(self.handle);
         if (self.req_headers_slist != null) c.curl_slist_free_all(self.req_headers_slist);
+        if (self.resolve_slist != null) c.curl_slist_free_all(self.resolve_slist);
         self.allocator.free(self.url_z);
         self.resp_body.deinit(self.allocator);
         for (self.resp_headers.items) |h| {
@@ -822,7 +858,8 @@ test "runDriver: cooperative shutdown via stop_flag" {
     const drv = try std.Thread.spawn(.{}, struct {
         fn run(m: *Multi, s: *std.atomic.Value(bool)) void {
             runDriver(m, s) catch |err| std.log.warn(
-                "curl_multi runDriver test: {s}", .{@errorName(err)},
+                "curl_multi runDriver test: {s}",
+                .{@errorName(err)},
             );
         }
     }.run, .{ multi, &stop });

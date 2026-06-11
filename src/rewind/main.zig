@@ -471,6 +471,22 @@ pub fn main() !void {
 
     const admin_api_domain = std.posix.getenv("REWIND_ADMIN_DOMAIN") orelse DEFAULT_ADMIN_API_DOMAIN;
     const admin_root_token = std.posix.getenv("REWIND_ROOT_TOKEN") orelse DEFAULT_ADMIN_ROOT_TOKEN;
+    // Test-only outbound escape hatch for smoke topologies whose
+    // upstream echo tenants live on loopback over plaintext h2c.
+    // Relaxes ONLY the loopback block + the TLS-always rule on
+    // customer `http.fetch`; the metadata range (169.254/16) and the
+    // rest of the blocklist stay enforced. NEVER set in production —
+    // a malicious handler could probe the host's own services.
+    if (std.posix.getenv("REWIND_UNSAFE_OUTBOUND")) |v| {
+        if (std.mem.eql(u8, v, "1")) {
+            rjs.ssrf.test_allow_loopback = true;
+            rjs.ssrf.test_allow_plaintext = true;
+            std.log.warn(
+                "rewind: REWIND_UNSAFE_OUTBOUND=1 — outbound loopback block + TLS-always DISABLED (test topologies only; never production)",
+                .{},
+            );
+        }
+    }
     // V2 Phase 4 — shared secret for the cluster-internal tenant-move
     // surface (`/_system/v2-*`). The front door presents it as
     // `X-Rewind-Move-Secret`. Unset → the move surface is disabled.
