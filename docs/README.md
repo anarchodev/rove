@@ -72,6 +72,7 @@ Active work on the current (V2) line. Each folds into `architecture/` on ship.
 
 - [pricing-model.md](pricing-model.md) · [plan-tiers.md](plan-tiers.md) — pricing + tiers
 - [platform-accounts-model.md](platform-accounts-model.md) — accounts/orgs/users (product layer, not the engine)
+- [saas-in-a-box.md](saas-in-a-box.md) — the author-platform shape: per-end-customer tenants + the first-party library suite (users/billing/jobs/webhooks/flags/…)
 - [dashboard-design-brief.md](dashboard-design-brief.md) — dashboard/replay UI brief
 - [users-lib-plan.md](users-lib-plan.md) — B2C passwordless auth library
 
