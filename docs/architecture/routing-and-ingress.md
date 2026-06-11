@@ -58,9 +58,11 @@ wire only after the activation that produced it commits — and a blob coordinat
   streams too (2026-06-11 — see the HTTP/1.1 section). A bodyless proxied
   request carries END_STREAM on its upstream HEADERS (`ReqBody.complete` on
   the pump submit) so the worker's headers-first disposition never sees a
-  phantom inbound body. Deferred: WebSocket tunneling (an Upgrade proxies as
-  a plain GET; needs an h1-upgrade client leg). Proven by
-  `scripts/front_streaming_smoke_v2.py` + `scripts/h1_streaming_smoke_v2.py`.
+  phantom inbound body. WebSocket terminates at the edge and tunnels
+  upstream as an RFC 8441 Extended CONNECT stream on the same pooled conn
+  (2026-06-12 — see the WebSocket section). Proven by
+  `scripts/front_streaming_smoke_v2.py` + `scripts/h1_streaming_smoke_v2.py`
+  + `scripts/ws_worker_smoke_v2.py`.
 - **Leader-aware proxy**: tries the cluster's nodes in order and stops at the
   first non-421. A follower 421s a write (`Bridge.propose` rejects
   synchronously on a formed group it doesn't lead — nothing enters the log, so
@@ -128,11 +130,31 @@ streaming path. h1→h2c translation is **edge-only**.
   response mid-body flips hold/buffer to discard and drains the remaining
   wire bytes so keep-alive framing survives. Non-`headers_first` instances
   (examples, log-server) keep the classic body-complete contract. Proven by
-  `scripts/h1_streaming_smoke_v2.py` (worker-direct + through the front).
+  `scripts/h1_streaming_smoke_v2.py` (through the front).
+- **The worker is h2c-only** (2026-06-12, websocket-plan §8.5): with WS
+  riding Extended CONNECT, nothing pins h1 to the worker —
+  `accept_http1 = false` on the rewind instance closes an h1-looking first
+  read (and ALPN-h1). h1 termination, like TLS, is the front's job alone;
+  the codec stays in rove-h2 for the front and examples.
 
 ## WebSocket (RFC 6455)
 
-- **Handshake**: an h1 `GET` with `Upgrade: websocket` is detected in
+- **Through the front (the production path, 2026-06-12 — websocket-plan
+  §8.5)**: the front terminates the handshake (`websocket_surface` — the
+  Upgrade head surfaces to the proxy; the downstream 101 is DEFERRED until
+  the upstream accepts, so a refused tunnel is a plain HTTP error) and
+  relays bytes verbatim over an RFC 8441 Extended CONNECT stream
+  (`:method CONNECT`, `:protocol websocket`) multiplexed on the pooled h2c
+  conn. The worker (`extended_connect`) dispositions each tunnel BEFORE the
+  200 (`serviceWsConnects`: unknown tenant → 404, non-leader → 421 → the
+  front re-aims at the next node), then parses RFC 6455 frames from stream
+  DATA per-stream (`WsReassembler`) onto the same `ws_message_out` /
+  `ws_send_in` seam — the logical WS connection's identity is a per-stream
+  entity (`ws_streams`), so the worker seam is transport-agnostic. Proven by
+  `scripts/ws_worker_smoke_v2.py` (all steps through the front) +
+  `zig build h2-ws-connect-test`.
+- **Handshake** (h1, at the edge / examples): an h1 `GET` with
+  `Upgrade: websocket` is detected in
   `parseHead`; the server replies `101` with the derived `Sec-WebSocket-Accept`,
   flips `Http1Conn.ws_mode`, and continues into `wsDrive`.
 - **Inbound**: `wsDrive` parses frames (unmask in place), auto-replies to pings,

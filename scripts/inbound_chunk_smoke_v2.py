@@ -162,7 +162,7 @@ def main() -> int:
         rows = []
         deadline = time.time() + 30.0
         while time.time() < deadline:
-            lr = c.log_get("acme/list?limit=400")
+            lr = c.log_get("acme/list?limit=1200")
             if lr.status == 200:
                 try:
                     rows = [r2 for r2 in json.loads(lr.body).get("records", [])
@@ -180,7 +180,13 @@ def main() -> int:
         with_tape = 0
         inline_seen = False
         ref_seen = False
-        for row in rows[:40]:
+        # Scan until BOTH tape forms are seen (≥40 records minimum):
+        # list order can front-load the 12 MB upload's 256K BodyRef
+        # fires, and the few inline records (the 1 KB single-fire,
+        # small finals) may sit anywhere in the set.
+        for row in rows:
+            if sampled >= 40 and inline_seen and ref_seen:
+                break
             sr = c.log_get(f"acme/show/{row['request_id']}")
             if sr.status != 200:
                 continue

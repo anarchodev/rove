@@ -474,7 +474,12 @@ collab).
 
 ## 8.5 WS through the front — Extended CONNECT (RFC 8441), and the h2c-only worker
 
-**Decided 2026-06-12 (in build).** The front terminates the WebSocket
+**SHIPPED 2026-06-12** (`feat/ws-extended-connect`; proven by
+`ws_worker_smoke_v2.py` — all worker-seam steps through the front — and the
+in-process `zig build h2-ws-connect-test`; the worker is h2c-only:
+`accept_http1 = false`). Design as built below.
+
+The front terminates the WebSocket
 handshake at the edge and tunnels each connection upstream as an RFC 8441
 Extended CONNECT stream (`:method: CONNECT`, `:protocol: websocket`) on the
 EXISTING pooled h2c connection — no per-WS upstream socket, per-stream flow

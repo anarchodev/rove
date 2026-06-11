@@ -205,6 +205,11 @@ fn workerMain(args: *WorkerCtx) !void {
             // `serviceWsMessages` dispositions `ws_connect_out`
             // (tenant + leadership at tunnel-open, BEFORE the 200).
             .extended_connect = true,
+            // The worker is h2c-ONLY: h1 (and h1-WS) termination is the
+            // front's job alone; an h1-looking first read closes. The
+            // h1 codec lives on in rove-h2 for the front + examples.
+            .accept_http1 = false,
+            .websocket_upgrades = false,
         },
         .log_worker_id = args.worker_idx,
         .admin_api_domain = args.admin_api_domain,
