@@ -1,17 +1,16 @@
-//! `log-server-standalone` — Phase 5.5 (a) standalone log query API.
+//! `log-server-standalone` — the request-log query API.
 //!
-//! After Task #61 the loop46 worker no longer spawns log-server
-//! in-process; the operator runs this binary alongside `loop46
-//! worker` and points the worker at it via `--log-public-base`. Both
-//! processes share the JWT secret (`LOOP46_SERVICES_JWT_SECRET`) so
-//! tokens minted at the worker's `/_system/services-token` verify
-//! here on every `/v1/*` request, AND share the same batch-store +
+//! The operator runs this binary alongside the `rewind` worker and
+//! points the worker at it via `--log-public-base`. Both processes
+//! share the JWT secret (`LOOP46_SERVICES_JWT_SECRET`) so tokens
+//! minted at the worker's `/_system/services-token` verify here on
+//! every `/v1/*` request, AND share the same batch-store +
 //! blob-backend config so the standalone can index/serve what the
 //! worker writes.
 //!
 //! Required env:
 //!   LOOP46_SERVICES_JWT_SECRET   hex HMAC-SHA256 shared with the
-//!                                loop46 worker.
+//!                                rewind worker.
 //!
 //! Optional env (S3 batch store + tape blob backend):
 //!   BLOB_BACKEND=s3              + S3_ENDPOINT / S3_REGION /
