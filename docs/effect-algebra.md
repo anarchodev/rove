@@ -95,6 +95,15 @@ within-activation; L3 handles between. Tape volume is bounded by per-tenant
 retention, not a per-chain cap (`tape-minimization.md` §1) — recorded, not
 recorded *forever*.
 
+The inbound request surface satisfies L3 by **read-recording** (the
+`request_reads` tape channel; `decisions.md` §4): header names are
+recorded unconditionally per activation, while header values, the
+cookie header, the body, and the ip surfaces are recorded on first
+access — the tape holds exactly the subset of the Msg the handler
+observed. A body the handler never read carries no log-side reference
+at all (`Readset.elideUnreadBody`); its durability gating is
+unchanged. On replay, an unrecorded read is a loud divergence error.
+
 The newest member of this family is the **durable scheduled wake**
 (shipped in full; `decisions.md` §3.7 + `architecture/effects-and-handlers.md`
 "Durable scheduled wake"): a one-shot, absolute-time,

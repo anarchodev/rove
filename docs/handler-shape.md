@@ -548,7 +548,7 @@ fires; the arena reset wipes it). Cross-activation connection state
 rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
 
 - **`default`:** `request.body`, `.headers`, `.method`, `.path`,
-  `.query`, `.cookies`, `.ip`.
+  `.query`, `.cookies`, `.ip`, `.unmaskedIp()`.
 - **`onChunk`:** `request.body` = THIS chunk; `request.done`;
   `request.chunkSeq` (from 0).
 - **Connection wakes / fetch resumes:** `request.ctx`, plus
@@ -559,6 +559,46 @@ rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
   `schedule` target, an `onResult` callback): origin-specific fields
   (`deploymentId`, `result`, `request.activation.msg`, …) but **no**
   HTTP `headers`/`body`, and the connection verbs are inert (§2.4).
+
+### 7.1 The request surface is read-recorded
+
+Everything on `request` your handler can branch on is a replay input,
+so it is **recorded on access** (the `request_reads` tape channel —
+the tape stores exactly what your code read, nothing else; that IS the
+data-minimization story, see `decisions.md` §4.6):
+
+- `request.headers` is a flat lowercase object of **accessors**, one
+  per wire header. Header *names* are always recorded (so
+  `Object.keys` replays faithfully); a header's *value* is recorded
+  only when you read it. Pseudo-headers (`:method` etc.) and the IP
+  transport headers (`x-forwarded-for`, `x-real-ip`,
+  `cf-connecting-ip`, `forwarded`) are not present — the client IP is
+  reachable only via the two surfaces below. Duplicate names: last
+  value wins. Assigning to `request.headers.x` throws in module code
+  (accessor without setter); decorate `request` itself instead
+  (`request.auth = …` still works).
+- `request.cookies` materializes on first access; the access counts
+  as reading the whole `cookie` header.
+- `request.body` is an accessor too. A body your handler never reads
+  is **absent from the replay record entirely** (storage/durability
+  is unaffected — only the log-side reference is elided). Chunk
+  activations are the exception: the chunk payload IS the activation's
+  Msg (a binary Uint8Array, §3), so it is always recorded — read or
+  not.
+- `request.ip` is the **masked** client IP — IPv4 with the last octet
+  zeroed (`203.0.113.0`), IPv6 truncated to /48 (`2001:db8:85a3::`) —
+  derived from `cf-connecting-ip`, else the rightmost (edge-appended,
+  spoof-resistant) `x-forwarded-for` entry; `null` when no edge proxy
+  reported one. Masked covers coarse geo and abuse heuristics without
+  putting a precise IP on the tape.
+- `request.unmaskedIp()` returns the raw client IP. It is a *method*
+  deliberately: calling it is your explicit decision, as the data
+  controller, to process precise IPs — and the call puts the raw IP
+  on your replay tape, where your retention window applies.
+
+On replay, reading anything the original run didn't read raises a
+loud `REPLAY DIVERGENCE` error rather than silently returning
+`undefined`.
 
 ## 8. App manifest (reserved seam)
 
