@@ -213,8 +213,17 @@ the wake to the owning worker, falling back to `hash(tenant)` on a registry miss
   full 2026-06-10; see "Durable scheduled wake" above. The per-feature Zig
   sweeps (`sweepOwedRetries*`, `CronState` + `sweepCronSubscriptions`) are
   deleted.
-- **Streaming inbound body (gap 2.4)** is design-locked (the `onChunk` export, the
-  ≤1 MB-fires-once rule) but the h2 chunk-delivery wire-up is pending.
+- ~~**Streaming inbound body (gap 2.4)**~~ — shipped 2026-06-10
+  (`docs/inbound-chunk-plan.md`): a module exporting `onChunk` receives
+  any-size bodies per-chunk over the `blob.receive` transport seam (a
+  worker-side `BodySink`; window repay rides each fire's resolution, so
+  the client throttles to the handler's commit rate). Chunk K+1 fires
+  only when K's activation committed and re-parked — ordering and
+  read-your-writes are collection membership. Proven by
+  `scripts/inbound_chunk_smoke_v2.py`. Two follow-ups remain (the
+  plan's remaining-work list): chunk payloads aren't yet taped on
+  resume fires (multi-chunk replay gap), and chunked uploads are
+  direct-to-worker until the front-door streaming proxy lands.
 - ~~**Inbound WebSocket dispatch (piece D)**~~ — shipped 2026-06-09: the worker
   `onMessage`/`onDisconnect` seam (`serviceWsMessages`, `src/js/worker_ws.zig`)
   consumes `ws_message_out` and lowers `stream.write` to `ws_send_in`

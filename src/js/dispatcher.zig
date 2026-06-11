@@ -391,14 +391,14 @@ pub const Dispatcher = struct {
                     .headers = &.{},
                 };
             },
-            .no_onheaders => {
-                // Only `.inbound_headers` activations produce this,
-                // and none ride the back-compat path. Defined error,
-                // not a panic — same graceful posture as the arms
-                // above.
+            .no_onheaders, .no_onchunk => {
+                // Only `.inbound_headers` / `.inbound_chunk`
+                // activations produce these, and none ride the
+                // back-compat path. Defined error, not a panic — same
+                // graceful posture as the arms above.
                 return .{
                     .status = 500,
-                    .body = try self.allocator.dupe(u8, "headers-first probe on a non-headers-first path\n"),
+                    .body = try self.allocator.dupe(u8, "export probe outcome on a non-probing path\n"),
                     .body_is_json = false,
                     .console = try self.allocator.dupe(u8, ""),
                     .exception = try self.allocator.dupe(u8, ""),
@@ -416,11 +416,16 @@ fn finishResponse(
     pending: *PendingResponse,
     console_buf: *std.ArrayList(u8),
 ) DispatchError!RunOutcome {
-    // Headers-first probe miss — before everything else: nothing ran,
-    // so there is no kv error / stream / continuation to reconcile.
+    // Headers-first / chunk probe miss — before everything else:
+    // nothing ran, so there is no kv error / stream / continuation to
+    // reconcile.
     if (pending.no_onheaders) {
         console_buf.deinit(d.allocator);
         return .no_onheaders;
+    }
+    if (pending.no_onchunk) {
+        console_buf.deinit(d.allocator);
+        return .no_onchunk;
     }
 
     if (state.pending_kv_error) |err| {
@@ -763,6 +768,7 @@ fn runOne(
             @panic("runOne: handler returned a stream; use runOneOutcome");
         },
         .no_onheaders => @panic("runOne: no_onheaders outside an inbound_headers dispatch"),
+        .no_onchunk => @panic("runOne: no_onchunk outside an inbound_chunk dispatch"),
     }
 }
 
@@ -807,7 +813,7 @@ test "dispatch: next(...) return is classified as a continuation" {
             try testing.expect(std.mem.indexOf(u8, cont.ctx_json, "\"u\":\"alice\"") != null);
             try testing.expect(std.mem.indexOf(u8, cont.ctx_json, "\"tries\":0") != null);
         },
-        .no_onheaders => return error.TestExpectedContinuation,
+        .no_onheaders, .no_onchunk => return error.TestExpectedContinuation,
     }
 }
 
@@ -843,7 +849,7 @@ test "dispatch: ordinary return stays terminal (trampoline does not engage)" {
             return error.TestExpectedContinuation;
         },
         .continuation => |*cont| cont.deinit(testing.allocator),
-        .no_onheaders => return error.TestExpectedContinuation,
+        .no_onheaders, .no_onchunk => return error.TestExpectedContinuation,
     }
 }
 
