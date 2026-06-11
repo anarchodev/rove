@@ -54,11 +54,13 @@ wire only after the activation that produced it commits — and a blob coordinat
   (`client_headers_first` + `BodySink` on the client side → the server's
   `stream_response`/`stream_data` pipeline, h2 AND h1 downstream) — held SSE
   streams relay frames mid-stream. Backpressure is end-to-end: each side's
-  flow-control window is repaid only as the opposite side drains. Deferred:
-  WebSocket tunneling (an Upgrade proxies as a plain GET; needs an h1-upgrade
-  client leg) and h1 inbound body streaming (h1 uploads buffer at the edge —
-  the h1 codec emits body-complete requests). Proven by
-  `scripts/front_streaming_smoke_v2.py`.
+  flow-control window is repaid only as the opposite side drains. h1 ingress
+  streams too (2026-06-11 — see the HTTP/1.1 section). A bodyless proxied
+  request carries END_STREAM on its upstream HEADERS (`ReqBody.complete` on
+  the pump submit) so the worker's headers-first disposition never sees a
+  phantom inbound body. Deferred: WebSocket tunneling (an Upgrade proxies as
+  a plain GET; needs an h1-upgrade client leg). Proven by
+  `scripts/front_streaming_smoke_v2.py` + `scripts/h1_streaming_smoke_v2.py`.
 - **Leader-aware proxy**: tries the cluster's nodes in order and stops at the
   first non-421. A follower 421s a write (`Bridge.propose` rejects
   synchronously on a formed group it doesn't lead — nothing enters the log, so
@@ -103,9 +105,30 @@ exclusive). A plaintext first read that `looksLikeHttp1Request` (or an ALPN-h1
 negotiation) swaps in the h1 path. `parseHead` synthesizes the h2 pseudo-headers
 (`:authority` from `Host`, `:scheme` from TLS-or-plaintext) on a synthetic
 `StreamId=1`, so the rest of the pipeline is protocol-agnostic. `decodeChunked`
-is resumable; `Expect: 100-continue` is answered once at the edge; responses
-serialize with `Content-Length` or `Transfer-Encoding: chunked`, with one-write-
-in-flight backpressure on the streaming path. h1→h2c translation is **edge-only**.
+is resumable; responses serialize with `Content-Length` or
+`Transfer-Encoding: chunked`, with one-write-in-flight backpressure on the
+streaming path. h1→h2c translation is **edge-only**.
+
+- **Inbound body streaming** (2026-06-11): on `headers_first` instances
+  (worker, front) an h1 body that hasn't fully arrived at head-parse
+  early-emits the request into `request_receiving` and streams through the
+  SAME `Stream`/`BodyMode` machinery as h2 DATA — `requestBodyBuffer`,
+  `requestBodySink`, discard — so `onChunk`, `blob.receive`, and the front's
+  flow relay work over h1 with zero consumer changes. A body already complete
+  in the buffer keeps the classic body-complete emit (the h1 mirror of h2's
+  END_STREAM-at-HEADERS path). Backpressure is the socket read: the conn's
+  read entity parks in `_read_h1_paused` once held (`.hold`) or
+  pushed-but-undrained (`.sink`) bytes cross 1 MiB (matching the h2 stream
+  windows) and re-arms as the sink drains — TCP receive-window pushback is
+  h1's flow-control window. The 16 MiB edge backstop guards BUFFERING only; a
+  sunk body is unbounded at the edge and paced end to end.
+  `Expect: 100-continue` is decision-gated — sent when the consumer commits
+  to the body (buffer / sink attach); an early reply to a client never told
+  to proceed closes the connection out (it will never send the body). A
+  response mid-body flips hold/buffer to discard and drains the remaining
+  wire bytes so keep-alive framing survives. Non-`headers_first` instances
+  (examples, log-server) keep the classic body-complete contract. Proven by
+  `scripts/h1_streaming_smoke_v2.py` (worker-direct + through the front).
 
 ## WebSocket (RFC 6455)
 
@@ -230,8 +253,9 @@ naming layer is the customer's kv (decisions.md §3.8). Engine pieces:
   repays window only as the driver drains, so the client's send rate follows
   the S3 upload rate (≤ one window + one 5 MiB part buffer per job; node cap
   64 jobs). Receive-holding chains park with a 15 min deadline.
-- h1 ingress is unchanged (bodies complete at emission — h1 streaming can
-  follow, not gate, the h2 path).
+- h1 ingress streams the same way (2026-06-11): an incomplete-at-parse h1
+  body rides the identical disposition machinery — see the HTTP/1.1 ingress
+  section.
 
 Smokes: `scripts/blob_smoke_v2.py` (put/get/url + sessions + `segments.js`),
 `scripts/blob_receive_smoke_v2.py` (12 MiB streamed byte-exact, zero chunk
