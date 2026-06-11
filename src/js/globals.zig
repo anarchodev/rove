@@ -2126,6 +2126,8 @@ pub fn installRequest(
         // blob-storage-plan §3.5: headers-first inbound — body still
         // inbound, handler decides from headers alone.
         .inbound_headers => "inbound_headers",
+        // gap 2.4 / inbound-chunk-plan: streaming inbound body chunk.
+        .inbound_chunk => "inbound_chunk",
     };
     _ = c.JS_SetPropertyStr(ctx, activation_obj, "kind", c.JS_NewStringLen(ctx, kind.ptr, kind.len));
     if (request.activation == .wake_batch) {
@@ -2350,6 +2352,40 @@ pub fn installRequest(
         else
             c.JS_NewStringLen(ctx, wm.data.ptr, wm.data.len);
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "data", data_val);
+    }
+
+    // gap 2.4 / inbound-chunk-plan: streaming inbound body chunk.
+    // `Request.body` carries the raw chunk; re-surface it as a
+    // Uint8Array (chunks are arbitrary bytes — same posture as the
+    // bound-fetch chunk surface above), add the documented top-level
+    // `request.done` + `request.chunkSeq` (handler-shape §7), mirror
+    // the per-chunk fields on the activation object, and lift the
+    // held chain's `next({ctx})` payload to `request.ctx`.
+    if (request.activation == .inbound_chunk) {
+        const ic = request.activation.inbound_chunk;
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "seq", c.JS_NewInt64(ctx, @intCast(ic.seq)));
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "byteOffset", c.JS_NewInt64(ctx, @intCast(ic.byte_offset)));
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "done", if (ic.done) js_true else js_false);
+        _ = c.JS_SetPropertyStr(
+            ctx,
+            req_obj,
+            "body",
+            c.JS_NewUint8ArrayCopy(ctx, request.body.ptr, request.body.len),
+        );
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "done", if (ic.done) js_true else js_false);
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "chunkSeq", c.JS_NewInt64(ctx, @intCast(ic.seq)));
+        if (ic.ctx_json) |cj| {
+            if (state.allocator.allocSentinel(u8, cj.len, 0)) |buf| {
+                defer state.allocator.free(buf);
+                @memcpy(buf, cj);
+                const parsed = c.JS_ParseJSON(ctx, buf.ptr, cj.len, "<chunk ctx>");
+                if (c.JS_IsException(parsed)) {
+                    _ = c.JS_GetException(ctx); // clear; no ctx
+                } else {
+                    _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", parsed);
+                }
+            } else |_| {}
+        }
     }
 
     // §2.6 durable-wake payload: `{ id, key, scheduled_at_ns, msg }`.

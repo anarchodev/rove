@@ -153,7 +153,7 @@ the limits live on the CP plan axis; enforcement levers + tier model:
 
 ### 2.11 CLI (v1 scope)
 
-`loop46 deploy ./dir` (content-addressed two-phase upload) + a `loop46.json`
+`rewind deploy ./dir` (content-addressed two-phase upload) + a `rewind.json`
 project file; token copy-paste auth. Ships at 1.0, not beta (§10.16). Later
 `kv` / `logs` / `init` commands deferred (§4).
 
@@ -368,8 +368,8 @@ the worker proxying) is **post-1.0** — see §10.13 + `architecture/deployment-
 
 ### Phase 7 — CLI
 
-- `loop46 deploy`: walk dir, hash, check, upload missing, commit manifest.
-- `loop46.json` parsing.
+- `rewind deploy`: walk dir, hash, check, upload missing, commit manifest.
+- `rewind.json` parsing.
 - Deploy-token issuance UI in dashboard (one-time plaintext print).
 - Later commands deferred.
 
@@ -413,13 +413,13 @@ Client-side simulator library + deterministic handler test framework. Worker has
 - New module `src/simulator/` (CLI library only): `root.zig` + `replay_source.zig` + `bytecode_cache.zig` + small `compile.zig`. **No `thread.zig`, no `main.zig` stub** — there's no worker hosting and no separate binary in v1.
 - `ReplaySource` with composable layers: write buffer / overlay / tape / miss policy. Modes (`strict`, `what_if`, `isolated`) are layer combinations.
 - Dependency surface excludes `rove-kv` (no SQLite in the simulator).
-- New CLI subcommand `loop46 simulate` exposes the simulator library directly: synthetic request + kv overlay + mode flag → bundle on stdout.
+- New CLI subcommand `rewind simulate` exposes the simulator library directly: synthetic request + kv overlay + mode flag → bundle on stdout.
 - Bundle JSON module extracted from `examples/log_cli.zig` into `src/tape/bundle.zig`.
 - Bundle JSON additions: cross-channel `seq` ordering, structured stack frames, value previews, structured console, `replay_available`. New `tape_entries` field for inline tapes (used by §10.11 dry-run bundles).
 - Module tape wiring at `JS_ResolveModule` — `appendModule` infrastructure exists in `src/tape/root.zig` but has no caller. Needed for multi-file determinism.
-- Test framework (§10.8): `_tests/` directory + `loop46 test` CLI subcommand embedding QuickJS for test code execution outside the handler sandbox. Sim tests run **fully locally** from the working tree.
+- Test framework (§10.8): `_tests/` directory + `rewind test` CLI subcommand embedding QuickJS for test code execution outside the handler sandbox. Sim tests run **fully locally** from the working tree.
 - Snapshot machinery (`_tests/__snapshots__/{name}.json`, `--update-snapshots`).
-- `loop46 export-fixture` writes sibling-file pairs (`_tests/from-prod-{id}.mjs` + `_tests/__fixtures__/from-prod-{id}.json`) so fixtures stay offline-runnable.
+- `rewind export-fixture` writes sibling-file pairs (`_tests/from-prod-{id}.mjs` + `_tests/__fixtures__/from-prod-{id}.json`) so fixtures stay offline-runnable.
 - Production-strip of `_tests/` — test files live in dev repo only.
 - Request body capture into the tape (new request-input channel) — needed for fixtures and replays to faithfully reproduce POST bodies.
 - Stale-comment cleanup at `src/log/root.zig:71`.
@@ -434,16 +434,16 @@ Tooling for authoring, editing, and refreshing the fixture data sim tests run ag
 
 **Fixture lifecycle** (§10.9):
 - `/_system/kv/{id}/*` admin endpoint (read-only, paginated): `get/{key}`, `?prefix=...&limit=N&after=<key>`, `count?prefix=...`.
-- New CLI subcommand `loop46 kv` (`get`, `list-prefix`, `count`).
-- New CLI subcommand `loop46 fixture` family: `from-keys`, `add`, `remove`, `edit`, `diff`, `refresh`, `merge`.
-- Runner integration: structured "unresolved read on K" error referencing fixture path + missing key. Optional `loop46 test --auto-fix-from <instance>` flag pulls missing keys on-the-fly and writes them back.
+- New CLI subcommand `rewind kv` (`get`, `list-prefix`, `count`).
+- New CLI subcommand `rewind fixture` family: `from-keys`, `add`, `remove`, `edit`, `diff`, `refresh`, `merge`.
+- Runner integration: structured "unresolved read on K" error referencing fixture path + missing key. Optional `rewind test --auto-fix-from <instance>` flag pulls missing keys on-the-fly and writes them back.
 
 **Worker dry-run** (§10.11):
 - `POST /_system/dry-run/{id}` endpoint — runs synthetic request through dispatch with always-rollback + propose-disabled. Returns bundle (response, kv writes, would-have-enqueued webhook rows, tape entries) inline; nothing persists.
 - Implementation: `dry_run: bool` flag on `dispatchOnce`. Roughly 50 lines.
 - Optional `dry_run` rate-limit action (default: share `request` budget).
-- New CLI subcommand `loop46 dry-run --request '{...}' --instance <id>`.
-- Composite tool: `loop46 fixture from-dry-run --request '{...}' --instance <id> -o <fixture.json>` runs dry-run, extracts the kv tape, writes a fixture file. Single command, end-to-end fixture authoring from a synthetic request.
+- New CLI subcommand `rewind dry-run --request '{...}' --instance <id>`.
+- Composite tool: `rewind fixture from-dry-run --request '{...}' --instance <id> -o <fixture.json>` runs dry-run, extracts the kv tape, writes a fixture file. Single command, end-to-end fixture authoring from a synthetic request.
 
 **Web UI follow-on** (deferred; lands alongside Phase 5 admin UI maturity): "Fixtures" tab in dashboard with same affordances over the same backend endpoints.
 
@@ -453,14 +453,14 @@ Detailed plan: `docs/fixture-lifecycle.md`.
 
 Skill file + CLI polish + scoped tokens. **No MCP server in v1.** Hosted MCP deferred until concrete remote-agent demand surfaces. The local agent path (Claude Code in customer's working tree) is fully served by CLI + skill file.
 
-- `docs/skills/loop46.md` — canonical skill file for Claude Code (and similar agents). Teaches the workflow, tool catalog, common patterns, gotchas.
+- `docs/skills/rewind.md` — canonical skill file for Claude Code (and similar agents). Teaches the workflow, tool catalog, common patterns, gotchas.
 - `--json` output mode audit on every CLI subcommand.
-- New CLI subcommand `loop46 doctor` — environment + connectivity readiness check; first-thing-an-agent-runs.
-- Scoped tokens — new token type at `scoped_token/{sha256_hex}` in root.db. Carries a capability subset (`read`, `simulate`, `deploy`, `fixture`, `kv`, etc.) and instance scope. Independent of MCP; security primitive worth having for any agent integration. Mint via dashboard or `loop46 mint-token --capabilities ...`.
+- New CLI subcommand `rewind doctor` — environment + connectivity readiness check; first-thing-an-agent-runs.
+- Scoped tokens — new token type at `scoped_token/{sha256_hex}` in root.db. Carries a capability subset (`read`, `simulate`, `deploy`, `fixture`, `kv`, etc.) and instance scope. Independent of MCP; security primitive worth having for any agent integration. Mint via dashboard or `rewind mint-token --capabilities ...`.
 - `/_system/scoped_tokens` admin routes (mint/list/revoke).
 - Dashboard "Tokens" tab.
 
-What's deferred (not in v1): hosted HTTP MCP at `mcp.rewindjs.com`, `loop46-mcp` binary, MCP wire-format code. Build when a real remote-agent use case shows up.
+What's deferred (not in v1): hosted HTTP MCP at `mcp.rewindjs.com`, `rewind-mcp` binary, MCP wire-format code. Build when a real remote-agent use case shows up.
 
 Detailed plan: `docs/agent-surface.md`.
 
@@ -482,7 +482,7 @@ These are explicitly not in v1 so future sessions don't accidentally design arou
 - Cancellation API (`webhook.cancel(id)`).
 - BYOSMTP for paid tiers.
 - Redacted-tape export for external sharing.
-- Local dev CLI (`loop46 dev` mini-rove for offline testing).
+- Local dev CLI (`rewind dev` mini-rove for offline testing).
 - Symlinks / aliases / redirects (rules.json).
 - Private blobs that handlers read but URL doesn't serve — if needed, use `_static/_private/*` convention.
 - Runtime external imports (esm.sh at handler runtime).
@@ -531,11 +531,11 @@ Resolved items moved to §10. Open items:
   write-pause. Replaces the row-level delta protocol in
   `src/kv/raft_snapshot.zig`.
 - `docs/sim-test-framework.md` — §10.7 + §10.8 expansion: simulator
-  module, `_tests/` directory, `loop46 test` / `loop46 simulate`.
+  module, `_tests/` directory, `rewind test` / `rewind simulate`.
 - `docs/fixture-lifecycle.md` — §10.9 + §10.11 expansion: fixture
   authoring tooling + worker dry-run dispatch mode.
 - `docs/agent-surface.md` — §10.10 expansion: skill file, `--json`
-  audit, `loop46 doctor`, scoped tokens.
+  audit, `rewind doctor`, scoped tokens.
 - `docs/architecture/observability.md` — §2.9 expansion on the operator side:
   Grafana Cloud cutover plan. Inventories today's `/_system/metrics`
   (15 series, postmortem-shaped) and phases the gap to a fleet
@@ -713,7 +713,7 @@ The framings differ but the product is identical: **Story 1 hears "ship in minut
 1. **Phase 5 dashboard polish** — instance health indicators, logs view discoverability for Story 1, "Replay" button on Logs rows, "copy request ID" affordance. ~2 weeks.
 2. **Tape-replay browser page** (§10.12 Story 1 path) — bundle JSON shape on the worker (compose from existing endpoints, or new `/_system/replay/bundle/{request_id}` aggregator), sandboxed iframe replay page on `replay.rewindjs.com`, stubs library (rewind.js globals reading from tape), `<script type="module">` source loading, `debugger;` injection at handler entry. ~1-2 weeks.
 3. **CodeMirror 6 syntax-highlighting upgrade for the Code tab** — replaces the existing `<textarea>` with a CM6 `EditorView`. Language modes by file extension: `.mjs` / `.js` → `@codemirror/lang-javascript`, `.html` → `@codemirror/lang-html`, `.css` → `@codemirror/lang-css`; default plain text. Line numbers + basic editing extensions. **Out of scope for beta**: autocomplete, lint, fold gutter, breakpoint gutter, draft workflow integration. Vendored bundle (no third-party CDN at runtime). ~½ week.
-4. **Phase 14 LLM skill file** (`docs/skills/loop46.md`) — AI-assisted rewind.js coding. Without it, LLMs default to imperative `await fetch()` patterns that don't compile. ~1 week.
+4. **Phase 14 LLM skill file** (`docs/skills/rewind.md`) — AI-assisted rewind.js coding. Without it, LLMs default to imperative `await fetch()` patterns that don't compile. ~1 week.
 5. **Story 1 leaderboard example tenant** — the literal Firebase-pain demo, 5 lines of handler + one HTML page. ~½ day. Pairs with the beta launch post.
 6. **Beta operational** — free-tier caps wired to existing rate limiter defaults, beta banner in dashboard, data-continuity promise visible at signup, feedback channel link, per-account storage cap enforcement. ~3-5 days. Detail in §10.17.
 
@@ -721,9 +721,9 @@ The framings differ but the product is identical: **Story 1 hears "ship in minut
 
 **1.0 launch path** (Story 2 audience adds, builds on top of operating beta):
 
-1. **Tape-replay DAP CLI** (§10.12 Story 2 path) — `loop46 replay <request_id>` CLI fetching bundle + tape, writing a Node entry script with stubs preloaded, spawning under `--inspect-brk`, printing attach instructions for VS Code / JetBrains / nvim-dap / dap-mode. Reuses the stubs library shipped in beta. ~1-2 weeks.
+1. **Tape-replay DAP CLI** (§10.12 Story 2 path) — `rewind replay <request_id>` CLI fetching bundle + tape, writing a Node entry script with stubs preloaded, spawning under `--inspect-brk`, printing attach instructions for VS Code / JetBrains / nvim-dap / dap-mode. Reuses the stubs library shipped in beta. ~1-2 weeks.
 2. **rewind.js-the-project Stripe integration for supporter payments** — *the real production integration that doubles as the customer-facing docs example.* rewind.js's admin handler exposes a "support rewind.js" page that creates a Stripe Checkout session via `webhook.send`, returns a tiny shell page that opens a `__rove_stream` connection, the callback writes a kv key that wakes the stream which emits the session URL to the connected client, browser navigates. Receives `checkout.session.completed` webhook with timing-safe HMAC signature verification, writes a `supporter/{email}` row in admin's app.db, the same stream wakes a second time and emits "Thanks!" so the originating tab updates without a refresh. **Docs example is extracted from this**: the patterns we actually use become the patterns we teach. ~1.5-2 weeks, plus the small primitives audit (`crypto.timingSafeEqual` confirmed; `base64Encode/Decode` and `hmacSha1` if needed).
-3. **Phase 7 `loop46 deploy` CLI** subset — content-addressed two-phase upload, `loop46.json` parsing, deploy-token issuance UI in dashboard. ~1-2 weeks for v1 scope; later CLI subcommands (`kv`, `logs`, `init`) deferred.
+3. **Phase 7 `rewind deploy` CLI** subset — content-addressed two-phase upload, `rewind.json` parsing, deploy-token issuance UI in dashboard. ~1-2 weeks for v1 scope; later CLI subcommands (`kv`, `logs`, `init`) deferred.
 4. **Plan tiers + paid pricing** — first paid tier, plan-tier branching in rate limiter caps, billing wiring via Stripe (uses item 2's primitives). ~1-2 weeks.
 5. **Custom domains** (Phase 10) — customer CNAME + per-domain Let's Encrypt. ~2 weeks.
 
@@ -742,16 +742,16 @@ Phase 9 encryption at rest joins the 1.0 path only if B2B compliance demand surf
 - **Failure-mode audit**: real money is real stakes. The webhook signature timing-safe-equal becomes load-bearing when it's *our* customers' card charges flowing through it. We'll discover the actual gaps in the toolkit far faster than a contrived example would surface them.
 
 **What's NOT in beta but lands at 1.0**:
-- DAP CLI replay (`loop46 replay`)
+- DAP CLI replay (`rewind replay`)
 - Stripe-on-rewind.js supporter payments
-- `loop46 deploy` CLI
+- `rewind deploy` CLI
 - Plan tiers + paid pricing
 - Custom domains
 - Phase 9 encryption (only if B2B compliance demand surfaces during beta)
 
 **What's NOT in either beta or 1.0** (recorded so future-us doesn't second-guess):
 - §10.13 / §10.14 file-server + log-server detach + bearer-auth dogfooding. Multi-week refactor that makes the architecture purer but doesn't make the product more useful to a first user. **Post-1.0** when the dashboard-to-file-server path's in-process proxy starts hurting (it doesn't yet). The detach is gated only on engineering bandwidth, not blocking primitives.
-- §10.15 `analytics.track` + `metrics.*` primitives. Their absence is workable (customers `webhook.send` to their OLAP / TSDB of choice). **Post-1.0** alongside the loop46-olap / loop46-tsdb pseudo-third-party companion services that motivate them.
+- §10.15 `analytics.track` + `metrics.*` primitives. Their absence is workable (customers `webhook.send` to their OLAP / TSDB of choice). **Post-1.0** alongside the rewind-olap / rewind-tsdb pseudo-third-party companion services that motivate them.
 - Phase 5.5 storage scalability (log batch offload, tape body capture, raft snapshot, centralized webhook subsystem, files-server architectural move). Matters when sustained production traffic forces it; not at beta or first-1.0 volumes.
 - **Phase 12 / 13 sim test framework + fixture lifecycle + worker dry-run**. Beta absorbs the bundle JSON shape, stubs library, and request body capture (§10.12); the Zig + QuickJS strict-determinism `ReplaySource` + sim test framework + fixtures wait. Post-1.0.
 
@@ -797,7 +797,7 @@ Operational items required to open rewind.js beta to external Story 1 users. All
 
 **No-CLI positioning**:
 - Beta docs explicitly say *"All workflows are dashboard-driven. CLI ships at 1.0."* Pre-empts "where's the CLI?" feedback from Story 2 visitors and lets them self-select to wait.
-- The `loop46` binary during beta only ships operator commands (`loop46 dev`, `loop46 worker`) — no customer-facing subcommands.
+- The platform binaries during beta ship only operator surfaces (`rewind` / `rewind-cp` / `rewind-front`) — no customer-facing CLI subcommands.
 - Beta docs omit live use cases (Stripe Checkout, OAuth code exchange, AI agent results, slow API calls) entirely rather than teaching polling for them. SSE arrives at 1.0 as the *first* answer for those flows.
 
 **Beta-open checklist** (items to complete before public URL):

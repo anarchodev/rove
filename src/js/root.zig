@@ -87,6 +87,7 @@ pub const drainBodyPending = worker.drainBodyPending;
 pub const drainFetchPendingDurability = worker.drainFetchPendingDurability;
 pub const drainPendingBoundResumes = worker.drainPendingBoundResumes;
 pub const sweepParkedContinuations = worker.sweepParkedContinuations;
+pub const pumpInboundChunks = worker.pumpInboundChunks;
 pub const serviceParkedStreams = worker.serviceParkedStreams;
 pub const serviceWsMessages = worker.serviceWsMessages;
 pub const drainOnLeadershipLoss = worker.drainOnLeadershipLoss;
@@ -115,4 +116,5 @@ test {
     _ = reserved;
     _ = session;
     _ = deployment_loader;
+    _ = @import("worker_inbound_chunk.zig");
 }

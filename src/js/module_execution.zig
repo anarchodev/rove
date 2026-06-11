@@ -58,6 +58,11 @@ pub const PendingResponse = struct {
     /// `RunOutcome.no_onheaders` — the dispatch site falls back to
     /// classic body buffering instead of a 404.
     no_onheaders: bool = false,
+    /// Set by `runModule` when an `.inbound_chunk` probe found no
+    /// `onChunk` export (gap 2.4). `finishResponse` maps it to
+    /// `RunOutcome.no_onchunk` — the dispatch site falls back to the
+    /// classic `.inbound` dispatch instead of a 404.
+    no_onchunk: bool = false,
     pub fn deinit(self: *PendingResponse, allocator: std.mem.Allocator) void {
         if (self.continuation) |*cont| cont.deinit(allocator);
         allocator.free(self.body);
@@ -320,6 +325,14 @@ pub fn runModule(
         if (request.activation == .inbound_headers) {
             _ = ctx.takeException();
             pending.no_onheaders = true;
+            return;
+        }
+        // Chunk-dispatch probe (gap 2.4): a module without `onChunk`
+        // wants the classic buffered path — same fall-back posture as
+        // the `onHeaders` probe above, not a 404.
+        if (request.activation == .inbound_chunk) {
+            _ = ctx.takeException();
+            pending.no_onchunk = true;
             return;
         }
         pending.status = 404;
