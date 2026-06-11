@@ -2528,7 +2528,7 @@ pub fn Worker(comptime opts: Options) type {
             stream_id: u32,
             cap: u64,
         ) ?*inbound_chunk_mod.Job {
-            const job = inbound_chunk_mod.Job.create(self.allocator, cap) catch return null;
+            const job = inbound_chunk_mod.Job.create(self.allocator, cap, REQUEST_BODY_CAP) catch return null;
             const s: h2.BodySink = .{
                 .ctx = job,
                 .push = &inbound_chunk_mod.Sink.push,
@@ -2782,6 +2782,7 @@ pub const resumeBoundContinuation = worker_drain.resumeBoundContinuation;
 pub const drainPendingBoundResumes = worker_drain.drainPendingBoundResumes;
 pub const sweepParkedContinuations = worker_drain.sweepParkedContinuations;
 pub const pumpInboundChunks = worker_drain.pumpInboundChunks;
+pub const releaseInboundChunkParks = worker_drain.releaseInboundChunkParks;
 pub const parkKvWakes = worker_drain.parkKvWakes;
 pub const drainOnLeadershipLoss = worker_drain.drainOnLeadershipLoss;
 pub const cleanupResponses = worker_drain.cleanupResponses;

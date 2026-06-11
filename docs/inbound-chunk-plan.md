@@ -102,14 +102,22 @@ body inbound → respond + `flipInboundBodyToDiscard` (exists).
   rides the held entity and the resume threads it.
 - **S4 — docs — DONE.** handler-shape pend note dropped;
   effects-and-handlers gap-2.4 limitation closed.
+- **S5 — chunk tape — DONE (2026-06-10).** Every chunk fire is a
+  recorded, durable-gated activation: the readset's `trigger_payload`
+  carries the payload (≤16 KB inline; >16 KB as a blob-coordinator
+  BodyRef), real TapePayloads ride every log record, and read-only
+  reparks emit the parked-hop record they were missing. The Job became
+  a prepared-fires queue so coordinator submissions PIPELINE (the
+  serialized first cut cost an S3 RTT per fire). Found + fixed along
+  the way: waiting sink entities were re-charging the rate limiter
+  every walk (429 mid-upload), and a pre-existing cont_path UAF in the
+  post-repark log sites of ALL THREE resume engines (cont-resume,
+  bound-fetch, inbound-chunk) — log records carried freed bytes as
+  their path. Smoke step 7 asserts 50+ chunk records queryable via
+  log-server with both tape forms present.
 
 ## Remaining work (keeps this plan in-flight)
 
-- **Tape the chunk payloads.** Resume fires record `.{}` tape payloads
-  (same as the other resume engines today), so a multi-chunk upload is
-  not yet replay-reconstructible — an L3 gap. The fix is the bound-fetch
-  pattern: chunk bytes as `activation_bytes` (≤ the inline cap) or
-  content-addressed BodyRefs through the blob coordinator.
 - **Front door.** Chunked uploads work direct-to-worker; the front
   door's streaming proxy (a separate known gap) buffers, so the edge
   path inherits its limits until that lands.

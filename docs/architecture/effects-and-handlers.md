@@ -219,11 +219,14 @@ the wake to the owning worker, falling back to `hash(tenant)` on a registry miss
   worker-side `BodySink`; window repay rides each fire's resolution, so
   the client throttles to the handler's commit rate). Chunk K+1 fires
   only when K's activation committed and re-parked — ordering and
-  read-your-writes are collection membership. Proven by
-  `scripts/inbound_chunk_smoke_v2.py`. Two follow-ups remain (the
-  plan's remaining-work list): chunk payloads aren't yet taped on
-  resume fires (multi-chunk replay gap), and chunked uploads are
-  direct-to-worker until the front-door streaming proxy lands.
+  read-your-writes are collection membership. Every chunk fire is a
+  recorded, durable-gated activation: the readset's `trigger_payload`
+  carries the payload (≤16 KB inline; larger as a blob-coordinator
+  BodyRef, with submissions pipelined so the gate's S3 round-trip is
+  off the serial path) — multi-chunk uploads replay like any request.
+  Proven by `scripts/inbound_chunk_smoke_v2.py` (incl. the
+  log-server tape-query step). One follow-up remains: chunked uploads
+  are direct-to-worker until the front-door streaming proxy lands.
 - ~~**Inbound WebSocket dispatch (piece D)**~~ — shipped 2026-06-09: the worker
   `onMessage`/`onDisconnect` seam (`serviceWsMessages`, `src/js/worker_ws.zig`)
   consumes `ws_message_out` and lowers `stream.write` to `ws_send_in`
