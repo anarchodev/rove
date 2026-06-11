@@ -10,7 +10,8 @@ BodyMode machinery as h2 — `requestBodyBuffer` (classic), the
 inbound-chunk sink (`onChunk`), socket-read parking as backpressure in
 place of window debt, and the decision-gated `100 Continue`.
 
-Proves, direct-to-worker AND through the front door:
+Proves, through the front door (the worker is h2c-only — h1 terminates at
+the edge; a worker-direct h1 read closes, asserted in the final step):
   1. 12 MB h1 Content-Length upload → multi-fire `onChunk`, byte-exact,
      read-your-writes ordered (streamed, not buffered: 12 MB ≫ the 1 MiB
      read-pause cap, so the backpressure parking is on the hot path).
@@ -143,10 +144,9 @@ def main() -> int:
             print(f"\nFAILURES ({len(failures)}): {failures}")
             return 1
         host = c.host_for("acme")
-        worker = c.node_url(0)
         front = c.front_url()
 
-        for label, base in (("worker-direct", worker), ("via front", front)):
+        for label, base in (("via front", front),):
             print(f"step 2 ({label}): 12 MB h1 Content-Length upload → onChunk multi-fire")
             big = os.urandom(12 * 1024 * 1024)
             exit_, status, body_s = h1_curl(f"{base}/up", host, data=big,
@@ -206,12 +206,25 @@ def main() -> int:
                   status == 401 and "unauthorized" in body_s,
                   f"exit={exit_} status={status} body={body_s[:90]!r}")
 
+        print("step 6: worker is h2c-only — a direct h1 request is refused")
+        import socket
+        try:
+            sk = socket.create_connection(("127.0.0.1", c.node_ports[0]), timeout=5)
+            sk.settimeout(5)
+            sk.sendall(f"GET / HTTP/1.1\r\nHost: {host}\r\n\r\n".encode())
+            data = sk.recv(1024)
+            check("worker closes h1 (no bytes back)", data == b"", f"got {data[:60]!r}")
+            sk.close()
+        except (ConnectionResetError, TimeoutError, OSError) as e:
+            check("worker closes h1 (no bytes back)", True, repr(e))
+
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
         return 1
     print("\nPASS h1 streaming smoke (v2): h1 uploads stream from the edge — "
           "onChunk multi-fire, chunked decode, classic mid-stream buffering, "
-          "and the Expect early-reply close-out, direct AND through the front")
+          "and the Expect early-reply close-out THROUGH THE FRONT; the worker "
+          "itself is h2c-only and refuses h1")
     return 0
 
 
