@@ -292,8 +292,11 @@ export** a trigger's activation lands in; it does not invent a kind.
 > discriminator (the named export is); it remains on
 > `request.activation` alongside the wake / source payload (`wakes` /
 > `overflow` / `write_pressure` / `source`). The inbound-chunk
-> (`onChunk`) split in the table above remains the target convention,
-> wired as that path is reshaped.
+> (`onChunk`) split in the table above is SHIPPED (gap 2.4,
+> 2026-06-10): `request.body` for a chunk activation is a
+> **Uint8Array** (chunks are arbitrary bytes — same posture as bound
+> fetch chunks), and `next({ctx})` between chunks surfaces as
+> `request.ctx` on the following chunk.
 
 The scope column is load-bearing: a **connection** activation runs with
 the held socket (it can call `stream.*`/`on.*` and return `next`/a

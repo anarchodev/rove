@@ -38,6 +38,14 @@ pub fn parseDispatch(
         errdefer allocator.free(fn_owned);
         return .{ .fn_name = fn_owned, .args_json_text = try allocator.dupe(u8, "[]") };
     }
+    // Chunk dispatch targets `onChunk` unconditionally (gap 2.4) — the
+    // body IS the chunk payload, so a JSON-looking chunk must never be
+    // misread as an RPC envelope, and `?fn=` must not shadow the export.
+    if (request.activation == .inbound_chunk) {
+        const fn_owned = try allocator.dupe(u8, "onChunk");
+        errdefer allocator.free(fn_owned);
+        return .{ .fn_name = fn_owned, .args_json_text = try allocator.dupe(u8, "[]") };
+    }
     // RPC envelope path: a JSON-looking POST body whose top-level
     // object has `fn: string` (and optionally `args: array`). Anything
     // else — a non-JSON body, an array body, an object without `fn`,
@@ -111,6 +119,7 @@ fn defaultExportForKind(src: ActivationSource) []const u8 {
         .disconnect => "onDisconnect",
         .ws_message => "onMessage",
         .inbound_headers => "onHeaders",
+        .inbound_chunk => "onChunk",
         else => "default",
     };
 }

@@ -76,9 +76,11 @@ pub fn freeOwnedMsg(allocator: std.mem.Allocator, msg: *Msg) void {
         // ws_message is never enqueued (serviceWsMessages drains the h2
         // collection in-line); the empty payload owns nothing.
         .ws_message,
-        // inbound_headers is dispatched inline from dispatchOnce
-        // (entity-driven, like inbound); the empty payload owns nothing.
+        // inbound_headers / inbound_chunk are dispatched inline from
+        // dispatchOnce (entity-driven, like inbound); the empty
+        // payloads own nothing.
         .inbound_headers,
+        .inbound_chunk,
         => {},
     }
 }

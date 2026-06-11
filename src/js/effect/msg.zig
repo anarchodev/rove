@@ -253,6 +253,11 @@ pub const Msg = union(ActivationSource) {
     /// enqueues this variant; it exists because the union is tagged
     /// by the wire enum.
     inbound_headers: Inbound,
+    /// Streaming inbound body chunk (gap 2.4). Entity-driven like
+    /// `inbound`/`inbound_headers` — the chunk bytes ride the held
+    /// entity's component, never this queue; the variant exists
+    /// because the union is tagged by the wire enum.
+    inbound_chunk: Inbound,
 
     /// Project to the tape's wire-stable activation tag.
     pub fn kind(self: Msg) ActivationSource {
@@ -325,6 +330,7 @@ test "Msg covers every ActivationSource variant exhaustively" {
             .durable_wake => .{ .durable_wake = dw },
             .ws_message => .{ .ws_message = .{} },
             .inbound_headers => .{ .inbound_headers = .{} },
+            .inbound_chunk => .{ .inbound_chunk = .{} },
         };
         try testing.expectEqual(tag, m.kind());
     }
