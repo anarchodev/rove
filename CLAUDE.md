@@ -87,7 +87,8 @@ cp-directory (src/cp/directory.zig): tenant→cluster routing, backed by a
 binaries:  rewind        (src/rewind/)  the worker — rove-js on the bridge
            rewind-cp     (src/cp/)      replicated directory + provisioning + moves
            rewind-front  (src/front/)   stateless Host→cluster proxy — no raft state
-           files-server-v2, log-server-standalone  (examples/ wrappers)
+           files-server-v2     (src/files_server/main.zig)  deploy publisher
+           log-server-standalone (src/log_server/main.zig)  log query surface
 ```
 
 **`raft-kv` is the spine-free KV facade** (`src/kv/kvlimbs.zig`) — the
