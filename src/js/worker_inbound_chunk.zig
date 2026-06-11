@@ -221,15 +221,23 @@ pub const Job = struct {
         if (self.dead or self.aborted) return true;
         if (!self.firing and !self.eof) return true; // still accumulating
         while (self.chunks.items.len > 0) {
-            // Plan one fire: whole chunks while under the bound, plus
-            // a partial slice of an oversized one.
+            // Plan one fire. A job that never crossed the cap flushes
+            // its WHOLE accumulated body as one fire — the ≤cap
+            // single-fire contract; both the single-fire `onChunk`
+            // shape and the `no_onchunk` classic fallback (which
+            // dispatches `head().bytes` as THE body) depend on the
+            // head being the complete payload, so slicing it at
+            // MAX_FIRE_BYTES would truncate the classic re-walk.
+            // Streaming (> cap) fires bound at MAX_FIRE_BYTES: whole
+            // chunks while under it, plus a partial slice of an
+            // oversized one.
             var take_n: usize = 0;
             var take_bytes: usize = 0;
             var take_repay: u32 = 0;
             var partial: usize = 0;
             for (self.chunks.items) |ch| {
                 const remaining = ch.bytes.len - ch.consumed;
-                if (take_bytes + remaining > MAX_FIRE_BYTES) {
+                if (self.firing and take_bytes + remaining > MAX_FIRE_BYTES) {
                     partial = MAX_FIRE_BYTES - take_bytes;
                     take_bytes += partial;
                     break;
