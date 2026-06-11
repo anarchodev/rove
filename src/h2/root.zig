@@ -313,6 +313,24 @@ pub const Http1Conn = struct {
     ws_authority: []u8 = &.{},
     ws_path: []u8 = &.{},
 
+    // ── WS upgrade surface / raw tunnel (front door; websocket-plan §8.5) ────
+    /// `websocket_surface`: the Upgrade head was emitted to the consumer
+    /// (`ws_upgrade_out`) and the connection is parked — no request parse, no
+    /// 101 — until `wsUpgradeAccept` / `wsUpgradeReject` decides. Early frame
+    /// bytes the client coalesced after the handshake accumulate in `buf`.
+    ws_pending: bool = false,
+    /// `Sec-WebSocket-Key` captured for the deferred 101 (owned; freed in
+    /// `free`).
+    ws_key: []u8 = &.{},
+    /// Raw-relay tunnel (set by `wsUpgradeAccept`): socket bytes push to this
+    /// consumer sink VERBATIM — no RFC 6455 parsing at this hop; masking
+    /// survives to the far end. Outbound tunnel bytes ride `ws_out` /
+    /// `wsTunnelWrite`. Backpressure: `tunnel_unconsumed` (pushed-but-
+    /// undrained) parks the socket read at the same 1 MiB cap streamed
+    /// bodies use; `sweepBodySinks` repays from the sink's `drained`.
+    tunnel_sink: ?BodySink = null,
+    tunnel_unconsumed: u32 = 0,
+
     /// Hard ceiling on a single reassembled WebSocket message at the edge — the
     /// per-frame cap fed to `ws.parseFrame` and the running cap on a fragmented
     /// message. Per-tenant plan limits are the DP worker's job (piece D); this
@@ -347,6 +365,40 @@ pub const Http1Conn = struct {
         self.ws_out.deinit(self.allocator);
         if (self.ws_authority.len > 0) self.allocator.free(self.ws_authority);
         if (self.ws_path.len > 0) self.allocator.free(self.ws_path);
+        if (self.ws_key.len > 0) self.allocator.free(self.ws_key);
+        self.allocator.destroy(self);
+    }
+};
+
+/// Per-stream WS state for an Extended CONNECT tunnel (websocket-plan §8.5).
+/// Lives from `wsConnectAccept` to stream close. Inbound stream DATA bytes
+/// accumulate in `buf` and feed the RFC 6455 parser (`wsStreamDrive`);
+/// fragmented messages reassemble in `msg`; outbound framed bytes queue on
+/// `send_buf` and ship through the stream's deferred data provider (one
+/// nghttp2 submit, resumed as frames are queued).
+const WsReassembler = struct {
+    allocator: std.mem.Allocator,
+    buf: std.ArrayList(u8) = .empty,
+    msg: std.ArrayList(u8) = .empty,
+    msg_opcode: u8 = 0,
+    send_buf: std.ArrayList(u8) = .empty,
+    /// Our side is done after `send_buf` drains (Close sent / END_STREAM
+    /// requested): the provider returns EOF instead of deferring.
+    closing: bool = false,
+    /// The peer's close was already surfaced (opcode-8 message emitted) —
+    /// an END_STREAM after a clean Close frame must not emit a second one.
+    client_closed: bool = false,
+
+    fn create(allocator: std.mem.Allocator) ?*WsReassembler {
+        const wr = allocator.create(WsReassembler) catch return null;
+        wr.* = .{ .allocator = allocator };
+        return wr;
+    }
+
+    fn free(self: *WsReassembler) void {
+        self.buf.deinit(self.allocator);
+        self.msg.deinit(self.allocator);
+        self.send_buf.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 };
@@ -407,6 +459,15 @@ const Stream = struct {
     stream_chunk_data: ?[*]u8 = null,
     stream_chunk_len: u32 = 0,
     stream_chunk_offset: u32 = 0,
+    /// Extended-CONNECT WS stream (websocket-plan §8.5). Set at CONNECT
+    /// detection; `entity` is the identity entity in `ws_connect_out` /
+    /// `ws_streams` and stream close destroys it (instead of the
+    /// request-entity `serverStreamClose` routing).
+    is_ws: bool = false,
+    /// Non-null once the consumer accepted the tunnel (`wsConnectAccept`).
+    /// Pre-accept, inbound DATA rides the `.hold` arm like any undecided
+    /// body.
+    ws_reasm: ?*WsReassembler = null,
 
     fn create(conn_entity: Entity, allocator: std.mem.Allocator) ?*Stream {
         const s = allocator.create(Stream) catch return null;
@@ -421,7 +482,23 @@ const Stream = struct {
         if (self.body_data) |p| allocator.free(p[0..self.body_cap]);
         if (self.send_data) |d| d.destroy();
         if (self.stream_chunk_data) |cd| allocator.free(cd[0..self.stream_chunk_len]);
+        if (self.ws_reasm) |wr| wr.free();
         allocator.destroy(self);
+    }
+
+    /// Look up a header value in the PRE-finalize accumulator (names and
+    /// values are offset-encoded into `hdr_strbuf` until `hdrFinalize`).
+    /// Used at HEADERS-frame time, before any entity exists.
+    fn hdrValue(self: *const Stream, name: []const u8) ?[]const u8 {
+        const fields = self.hdr_fields orelse return null;
+        const sb = self.hdr_strbuf orelse return null;
+        for (fields[0..self.hdr_count]) |f| {
+            const n = sb[(@intFromPtr(f.name) - 1)..][0..f.name_len];
+            if (std.mem.eql(u8, n, name)) {
+                return sb[(@intFromPtr(f.value) - 1)..][0..f.value_len];
+            }
+        }
+        return null;
     }
 
     fn hdrAppend(self: *Stream, name: [*]const u8, name_len: usize, value: [*]const u8, value_len: usize) bool {
@@ -625,6 +702,32 @@ pub const H2Options = struct {
     /// leg), so an Upgrade request degrades to a classic proxied GET
     /// and the backend answers it as plain HTTP.
     websocket_upgrades: bool = true,
+    /// RFC 8441 Extended CONNECT on SERVER sessions (websocket-plan
+    /// §8.5): advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL` and surface
+    /// each `:method CONNECT` + `:protocol websocket` stream as an
+    /// identity entity in `ws_connect_out` for the consumer's
+    /// disposition (`wsConnectAccept` → the stream becomes a live WS
+    /// carried as RFC 6455 frames in stream DATA, messages on
+    /// `ws_message_out`; `wsConnectReject(status)` → the tunnel is
+    /// refused before any 200). The rewind worker enables this — it is
+    /// how WS reaches the worker once the front terminates the
+    /// handshake at the edge.
+    extended_connect: bool = false,
+    /// Surface h1 `Upgrade: websocket` heads to the consumer instead of
+    /// auto-completing the handshake (websocket-plan §8.5, the front
+    /// door): each valid Upgrade emits a `ws_upgrade_out` entity
+    /// (Session = conn, ReqHeaders = the head) and the connection
+    /// parks until `wsUpgradeAccept(ent, sink)` — deferred 101 +
+    /// raw-relay tunnel mode — or `wsUpgradeReject(ent, status)`.
+    /// Mutually exclusive with `websocket_upgrades` (surface wins).
+    websocket_surface: bool = false,
+    /// Accept HTTP/1.1 on server connections (the plaintext first-read
+    /// sniff / ALPN-h1). The rewind worker turns this OFF
+    /// (websocket-plan §8.5): h1 termination is the front's job alone —
+    /// every byte that reaches a worker is h2c. An h1-looking first
+    /// read just closes (the firewall-bounded private network has no
+    /// legitimate h1 speakers).
+    accept_http1: bool = true,
 };
 
 // =============================================================================
@@ -703,6 +806,21 @@ pub fn H2(comptime opts: Options) type {
         // frames in wire order, which a per-entity `sending_entity` can't model.
         ws_message_out: WsColl,
         ws_send_in: WsColl,
+
+        // Extended-CONNECT WS identity entities (websocket-plan §8.5,
+        // `extended_connect` instances only). One entity per WS-over-h2
+        // stream (Session = conn, StreamId, ReqHeaders = the CONNECT
+        // headers). `ws_connect_out`: awaiting the consumer's
+        // disposition (`wsConnectAccept` / `wsConnectReject`).
+        // `ws_streams`: live tunnels — the entity IS the logical WS
+        // connection identity the consumer keys its state by (the h2
+        // mirror of the h1 conn entity); destroyed at stream close.
+        ws_connect_out: StreamColl,
+        ws_streams: StreamColl,
+        // websocket_surface instances (the front): h1 Upgrade heads
+        // awaiting the consumer's disposition (`wsUpgradeAccept` /
+        // `wsUpgradeReject`). Session = conn, ReqHeaders = the head.
+        ws_upgrade_out: StreamColl,
 
         // Read triage
         _read_errors: ReadColl,
@@ -852,6 +970,11 @@ pub fn H2(comptime opts: Options) type {
             .{ .name = "_stream_data_sending", .Coll = StreamColl, .kind = .server_stream, .in_chain = true },
             .{ .name = "ws_message_out",       .Coll = WsColl,     .kind = .server_ws },
             .{ .name = "ws_send_in",           .Coll = WsColl,     .kind = .server_ws },
+            // Not in_chain: WS identity entities die with their stream
+            // (destroyed in onStreamCloseCb), never via serverStreamClose.
+            .{ .name = "ws_connect_out",       .Coll = StreamColl, .kind = .server_stream },
+            .{ .name = "ws_streams",           .Coll = StreamColl, .kind = .server_stream },
+            .{ .name = "ws_upgrade_out",       .Coll = StreamColl, .kind = .server_stream },
             .{ .name = "_read_errors",         .Coll = ReadColl,   .kind = .server_read },
             .{ .name = "_read_init",           .Coll = ReadColl,   .kind = .server_read },
             .{ .name = "_read_active",         .Coll = ReadColl,   .kind = .server_read },
@@ -1171,6 +1294,18 @@ pub fn H2(comptime opts: Options) type {
                     const conn_ptr = getConn(self, ref.conn_entity) orelse break :blk null;
                     if (conn_ptr.h1) |h| {
                         h1c = h;
+                        // stream_id 0 = h1 tunnel sink (wsUpgradeAccept):
+                        // repay = read unpark off `tunnel_unconsumed`;
+                        // no Stream involved.
+                        if (ref.stream_id == 0) {
+                            const sk = h.tunnel_sink orelse break :blk null;
+                            if (sk.ctx != ref.sink.ctx) break :blk null;
+                            const delta = ref.sink.drained(ref.sink.ctx);
+                            if (delta > 0) h.tunnel_unconsumed -|= @min(delta, h.tunnel_unconsumed);
+                            if (h.tunnel_unconsumed < Http1Conn.STREAM_PAUSE_BYTES) self.http1UnparkRead(h);
+                            i += 1;
+                            continue;
+                        }
                         const s = h.stream orelse break :blk null;
                         const sk = s.sink orelse break :blk null;
                         if (sk.ctx != ref.sink.ctx) break :blk null;
@@ -1239,6 +1374,245 @@ pub fn H2(comptime opts: Options) type {
             const h1c = cp.h1 orelse return null;
             if (!h1c.ws_mode) return null;
             return .{ .authority = h1c.ws_authority, .path = h1c.ws_path };
+        }
+
+        // ── Extended-CONNECT WS (websocket-plan §8.5) ─────────────────
+
+        /// Routing for a WS identity entity (h2 tunnel): `:authority` /
+        /// `:path` straight off the CONNECT headers. Valid while the
+        /// entity lives (`ws_connect_out` pre-accept, `ws_streams`
+        /// after); borrowed slices — the consumer dupes what it keeps.
+        pub fn wsStreamRouting(h2: *Self, ws_ent: Entity) ?struct { authority: []const u8, path: []const u8 } {
+            for ([_]*StreamColl{ &h2.ws_streams, &h2.ws_connect_out }) |coll| {
+                if (!h2.reg.isInCollection(ws_ent, coll)) continue;
+                const rh = h2.reg.get(ws_ent, coll, ReqHeaders) catch return null;
+                const fields = rh.fields orelse return null;
+                var authority: ?[]const u8 = null;
+                var path: ?[]const u8 = null;
+                for (fields[0..rh.count]) |f| {
+                    const name = f.name[0..f.name_len];
+                    if (std.mem.eql(u8, name, ":authority")) authority = f.value[0..f.value_len];
+                    if (std.mem.eql(u8, name, ":path")) path = f.value[0..f.value_len];
+                }
+                return .{ .authority = authority orelse return null, .path = path orelse return null };
+            }
+            return null;
+        }
+
+        /// Resolve a WS identity entity to its live nghttp2 stream.
+        fn wsStreamOf(h2: *Self, coll: *StreamColl, ws_ent: Entity) ?struct { ng: *c.nghttp2_session, sid: i32, s: *Stream } {
+            const sess = h2.reg.get(ws_ent, coll, Session) catch return null;
+            const sid = h2.reg.get(ws_ent, coll, StreamId) catch return null;
+            const conn_ptr = getConn(h2, sess.entity) orelse return null;
+            const ng = conn_ptr.ng_session orelse return null;
+            const st: ?*Stream = @ptrCast(@alignCast(
+                c.nghttp2_session_get_stream_user_data(ng, @intCast(sid.id)),
+            ));
+            const s = st orelse return null;
+            return .{ .ng = ng, .sid = @intCast(sid.id), .s = s };
+        }
+
+        /// True when the peer of a CLIENT connection advertised RFC 8441
+        /// Extended CONNECT (`SETTINGS_ENABLE_CONNECT_PROTOCOL`). A
+        /// client MUST observe the setting before submitting a
+        /// `:protocol` CONNECT — the front gates tunnel opens on this.
+        pub fn connExtendedConnect(h2: *Self, conn_entity: Entity) bool {
+            const conn_ptr = getConn(h2, conn_entity) orelse return false;
+            const ng = conn_ptr.ng_session orelse return false;
+            return c.nghttp2_session_get_remote_settings(ng, c.NGHTTP2_SETTINGS_ENABLE_CONNECT_PROTOCOL) == 1;
+        }
+
+        pub const WsConnectDecision = enum { ok, gone };
+
+        /// Accept a pending Extended-CONNECT tunnel: reply `:status
+        /// 200` (no END_STREAM — the open-ended WS body), attach the
+        /// frame reassembler, hand over any pre-accept held bytes +
+        /// repay their window debt, and move the identity entity to
+        /// `ws_streams`. From here inbound messages surface on
+        /// `ws_message_out` and `ws_send_in` frames ship back.
+        pub fn wsConnectAccept(h2: *Self, ws_ent: Entity) WsConnectDecision {
+            if (!h2.reg.isInCollection(ws_ent, &h2.ws_connect_out)) return .gone;
+            const live = h2.wsStreamOf(&h2.ws_connect_out, ws_ent) orelse return .gone;
+            const s = live.s;
+            const wr = WsReassembler.create(h2.allocator) orelse return .gone;
+
+            var status_buf: [3]u8 = .{ '2', '0', '0' };
+            var nva = [_]c.nghttp2_nv{.{
+                .name = @constCast(":status"),
+                .namelen = 7,
+                .value = &status_buf,
+                .valuelen = 3,
+                .flags = c.NGHTTP2_NV_FLAG_NONE,
+            }};
+            var data_prd = c.nghttp2_data_provider{
+                .source = .{ .ptr = null },
+                .read_callback = &onDataSourceReadCb,
+            };
+            if (c.nghttp2_submit_response(live.ng, live.sid, &nva, nva.len, &data_prd) != 0) {
+                wr.free();
+                return .gone;
+            }
+            s.ws_reasm = wr;
+            // Pre-accept bytes buffered under `.hold`: feed them to the
+            // parser and repay the held window.
+            if (s.body_data) |p| {
+                if (s.body_len > 0) {
+                    wr.buf.appendSlice(h2.allocator, p[0..s.body_len]) catch {
+                        s.ws_reasm = null;
+                        wr.free();
+                        return .gone;
+                    };
+                }
+                s.allocator.free(p[0..s.body_cap]);
+                s.body_data = null;
+                s.body_len = 0;
+                s.body_cap = 0;
+            }
+            if (s.unconsumed > 0) {
+                _ = c.nghttp2_session_consume(live.ng, live.sid, s.unconsumed);
+                s.unconsumed = 0;
+            }
+            s.body_mode = .auto;
+            h2.reg.move(ws_ent, &h2.ws_connect_out, &h2.ws_streams) catch return .gone;
+            h2.wsStreamDrive(live.ng, s);
+            return .ok;
+        }
+
+        /// Refuse a pending tunnel with an HTTP status (421 = wrong
+        /// node, re-aim; 404/403 = no such tenant/handler). The
+        /// response carries END_STREAM; the identity entity dies here
+        /// (stream close skips it via staleness).
+        pub fn wsConnectReject(h2: *Self, ws_ent: Entity, status: u16) void {
+            if (!h2.reg.isInCollection(ws_ent, &h2.ws_connect_out)) return;
+            if (h2.wsStreamOf(&h2.ws_connect_out, ws_ent)) |live| {
+                var status_buf: [3]u8 = undefined;
+                const code = std.fmt.bufPrint(&status_buf, "{d}", .{status}) catch "500";
+                var nva = [_]c.nghttp2_nv{.{
+                    .name = @constCast(":status"),
+                    .namelen = 7,
+                    .value = @constCast(code.ptr),
+                    .valuelen = code.len,
+                    .flags = c.NGHTTP2_NV_FLAG_NONE,
+                }};
+                _ = c.nghttp2_submit_response(live.ng, live.sid, &nva, nva.len, null);
+                // Repay any held pre-accept bytes so the connection
+                // window survives the refusal.
+                if (live.s.unconsumed > 0) {
+                    _ = c.nghttp2_session_consume(live.ng, live.sid, live.s.unconsumed);
+                    live.s.unconsumed = 0;
+                }
+            }
+            h2.reg.destroy(ws_ent) catch {};
+        }
+
+        /// Parse buffered inbound tunnel bytes into messages (the h2
+        /// mirror of `wsDrive`/`wsHandleFrame`): auto-pong, Close →
+        /// opcode-8 message + echo + our-side END, data frames
+        /// (+continuations) reassemble onto `ws_message_out` keyed by
+        /// the identity entity.
+        fn wsStreamDrive(h2: *Self, session: ?*c.nghttp2_session, s: *Stream) void {
+            const wr = s.ws_reasm orelse return;
+            var resume_send = false;
+            var pos: usize = 0;
+            drive: while (true) {
+                const r = ws.parseFrame(wr.buf.items[pos..], Http1Conn.MAX_WS_MESSAGE) catch {
+                    // Protocol error / oversize: close our side; the
+                    // peer sees Close + END_STREAM.
+                    if (!wr.closing) {
+                        ws.writeClose(&wr.send_buf, h2.allocator, ws.CloseCode.protocol_error, "") catch {};
+                        wr.closing = true;
+                        resume_send = true;
+                    }
+                    break :drive;
+                };
+                const frame = switch (r) {
+                    .need_more => break :drive,
+                    .frame => |f| f,
+                };
+                switch (frame.opcode) {
+                    .ping => {
+                        ws.writeFrame(&wr.send_buf, h2.allocator, .pong, frame.payload) catch {};
+                        resume_send = true;
+                    },
+                    .pong => {},
+                    .close => {
+                        if (!wr.client_closed) {
+                            wr.client_closed = true;
+                            h2.wsEmitMessage(s.entity, @intFromEnum(ws.Opcode.close), "") catch {};
+                        }
+                        if (!wr.closing) {
+                            ws.writeClose(&wr.send_buf, h2.allocator, ws.CloseCode.normal, "") catch {};
+                            wr.closing = true;
+                        }
+                        resume_send = true;
+                    },
+                    .text, .binary => blk: {
+                        if (wr.msg_opcode != 0) {
+                            // Data opener while fragmented msg open.
+                            ws.writeClose(&wr.send_buf, h2.allocator, ws.CloseCode.protocol_error, "") catch {};
+                            wr.closing = true;
+                            resume_send = true;
+                            break :blk;
+                        }
+                        if (frame.fin) {
+                            h2.wsEmitMessage(s.entity, @intFromEnum(frame.opcode), frame.payload) catch {};
+                        } else {
+                            wr.msg.clearRetainingCapacity();
+                            wr.msg.appendSlice(h2.allocator, frame.payload) catch break :blk;
+                            wr.msg_opcode = @intFromEnum(frame.opcode);
+                        }
+                    },
+                    .continuation => blk: {
+                        if (wr.msg_opcode == 0 or
+                            wr.msg.items.len + frame.payload.len > Http1Conn.MAX_WS_MESSAGE)
+                        {
+                            ws.writeClose(&wr.send_buf, h2.allocator, ws.CloseCode.protocol_error, "") catch {};
+                            wr.closing = true;
+                            resume_send = true;
+                            break :blk;
+                        }
+                        wr.msg.appendSlice(h2.allocator, frame.payload) catch break :blk;
+                        if (frame.fin) {
+                            h2.wsEmitMessage(s.entity, wr.msg_opcode, wr.msg.items) catch {};
+                            wr.msg.clearRetainingCapacity();
+                            wr.msg_opcode = 0;
+                        }
+                    },
+                    _ => {
+                        ws.writeClose(&wr.send_buf, h2.allocator, ws.CloseCode.protocol_error, "") catch {};
+                        wr.closing = true;
+                        resume_send = true;
+                        break :drive;
+                    },
+                }
+                pos += frame.consumed;
+                if (wr.closing) break :drive;
+            }
+            if (pos > 0) {
+                const leftover = wr.buf.items.len - pos;
+                if (leftover > 0) std.mem.copyForwards(u8, wr.buf.items[0..leftover], wr.buf.items[pos..]);
+                wr.buf.shrinkRetainingCapacity(leftover);
+            }
+            if (resume_send) {
+                _ = c.nghttp2_session_resume_data(session, s.ng_stream_id);
+            }
+        }
+
+        /// Queue one outbound frame on a live tunnel (the h2 arm of
+        /// `consumeWsSends`). Close → Close frame then END_STREAM once
+        /// the queue drains.
+        fn wsStreamSend(h2: *Self, ws_ent: Entity, opcode: u8, payload: []const u8) void {
+            const live = h2.wsStreamOf(&h2.ws_streams, ws_ent) orelse return;
+            const wr = live.s.ws_reasm orelse return;
+            if (wr.closing) return;
+            const op: ws.Opcode = @enumFromInt(@as(u4, @truncate(opcode)));
+            if (op == .close) {
+                ws.writeClose(&wr.send_buf, h2.allocator, ws.CloseCode.normal, "") catch {};
+                wr.closing = true;
+            } else {
+                ws.writeFrame(&wr.send_buf, h2.allocator, op, payload) catch return;
+            }
+            _ = c.nghttp2_session_resume_data(live.ng, live.sid);
         }
 
         /// FD resolver callback for io — searches h2's connection collections in addition to io's.
@@ -1338,6 +1712,18 @@ pub fn H2(comptime opts: Options) type {
                 return 0;
             }
             const s = stream.?;
+            // Live Extended-CONNECT WS stream: DATA carries RFC 6455
+            // frames. Consume immediately (the worker's input gate is
+            // the real backpressure) and drive the parser. Pre-accept
+            // (`is_ws` but no reassembler yet) falls through to the
+            // `.hold` arm like any undecided body.
+            if (s.ws_reasm) |wr| {
+                _ = c.nghttp2_session_consume(session, stream_id, len);
+                wr.buf.appendSlice(nctx.h2.allocator, data[0..len]) catch
+                    return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                nctx.h2.wsStreamDrive(session, s);
+                return 0;
+            }
             switch (s.body_mode) {
                 .auto, .buffer => {
                     // Classic accumulate path; consume immediately so
@@ -1454,6 +1840,56 @@ pub fn H2(comptime opts: Options) type {
             const h2 = nctx.h2;
             const end_stream = frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0;
 
+            // Extended CONNECT (websocket-plan §8.5): `:method CONNECT`
+            // + `:protocol websocket` opens a WS tunnel, not a request.
+            // Emit the identity entity into `ws_connect_out` for the
+            // consumer's disposition; inbound DATA holds (window-held)
+            // until `wsConnectAccept` attaches the reassembler. Checked
+            // before the headers_first early-emit so a CONNECT never
+            // masquerades as a body-carrying request.
+            if (h2.h2_opts.extended_connect and frame.*.hd.type == c.NGHTTP2_HEADERS and !s.emitted) {
+                if (s.hdrValue(":method")) |m| {
+                    if (std.mem.eql(u8, m, "CONNECT")) {
+                        const proto = s.hdrValue(":protocol") orelse "";
+                        // Only websocket tunnels; a CONNECT that already
+                        // half-closed can never carry one.
+                        if (!std.mem.eql(u8, proto, "websocket") or end_stream) {
+                            _ = c.nghttp2_submit_rst_stream(session, c.NGHTTP2_FLAG_NONE, frame.*.hd.stream_id, c.NGHTTP2_REFUSED_STREAM);
+                            return 0;
+                        }
+                        const ws_ent = emitRequestEntity(h2, &h2.ws_connect_out, s, frame.*.hd.stream_id, nctx.conn_entity) orelse
+                            return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                        h2.reg.set(ws_ent, &h2.ws_connect_out, ReqBody, .{ .data = null, .len = 0 }) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+                        s.emitted = true;
+                        s.is_ws = true;
+                        s.ng_stream_id = frame.*.hd.stream_id;
+                        s.body_mode = .hold;
+                        s.entity = ws_ent;
+                        return 0;
+                    }
+                }
+            }
+
+            // Extended-CONNECT WS stream: the only HEADERS/DATA event
+            // that matters past this point is the peer's END_STREAM —
+            // surface it as a disconnect (unless a Close frame already
+            // did) and finish our side once the send queue drains.
+            if (s.is_ws) {
+                if (end_stream) {
+                    if (s.ws_reasm) |wr| {
+                        if (!wr.client_closed) {
+                            wr.client_closed = true;
+                            h2.wsEmitMessage(s.entity, @intFromEnum(ws.Opcode.close), "") catch {};
+                        }
+                        wr.closing = true;
+                        _ = c.nghttp2_session_resume_data(session, frame.*.hd.stream_id);
+                    }
+                    // Pre-accept END (no reassembler): the close
+                    // callback reaps the identity entity.
+                }
+                return 0;
+            }
+
             // headers_first early emission: a request whose HEADERS
             // frame lacks END_STREAM has body DATA still inbound.
             // Emit the entity NOW into `request_receiving` (empty
@@ -1554,7 +1990,13 @@ pub fn H2(comptime opts: Options) type {
                 s.sink = null;
             }
 
-            if (s.emitted and !s.entity.isNil() and !nctx.h2.reg.isStale(s.entity)) {
+            if (s.is_ws) {
+                // WS identity entities die with their stream — the
+                // consumer's staleness sweep is the disconnect signal.
+                if (!s.entity.isNil() and !nctx.h2.reg.isStale(s.entity)) {
+                    nctx.h2.reg.destroy(s.entity) catch {};
+                }
+            } else if (s.emitted and !s.entity.isNil() and !nctx.h2.reg.isStale(s.entity)) {
                 const err: i32 = if (s.send_complete and error_code == 0) 0 else -1;
                 serverStreamClose(nctx.h2, s.entity, err);
             }
@@ -1579,6 +2021,24 @@ pub fn H2(comptime opts: Options) type {
                 c.nghttp2_session_get_stream_user_data(session, stream_id),
             ));
             if (stream) |s| {
+                // Extended-CONNECT WS: hand the queued framed bytes to
+                // nghttp2; defer when idle, EOF once closing and drained.
+                if (s.ws_reasm) |wr| {
+                    if (wr.send_buf.items.len == 0) {
+                        if (wr.closing) {
+                            data_flags[0] |= @intCast(c.NGHTTP2_DATA_FLAG_EOF);
+                            s.send_complete = true;
+                            return 0;
+                        }
+                        return c.NGHTTP2_ERR_DEFERRED;
+                    }
+                    const n = @min(length, wr.send_buf.items.len);
+                    @memcpy(buf[0..n], wr.send_buf.items[0..n]);
+                    const leftover = wr.send_buf.items.len - n;
+                    if (leftover > 0) std.mem.copyForwards(u8, wr.send_buf.items[0..leftover], wr.send_buf.items[n..]);
+                    wr.send_buf.shrinkRetainingCapacity(leftover);
+                    return @intCast(n);
+                }
                 if (s.streaming) {
                     if (s.stream_eof and s.stream_chunk_data == null) {
                         data_flags[0] |= @intCast(c.NGHTTP2_DATA_FLAG_EOF);
@@ -1692,7 +2152,7 @@ pub fn H2(comptime opts: Options) type {
             conn.ng_ctx = @ptrCast(nctx);
             conn.ng_ctx_destroy = &destroyNgCtx;
 
-            var settings_buf: [4]c.nghttp2_settings_entry = undefined;
+            var settings_buf: [5]c.nghttp2_settings_entry = undefined;
             var settings_count: usize = 0;
 
             settings_buf[settings_count] = .{ .settings_id = c.NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, .value = self.h2_opts.max_concurrent_streams };
@@ -1708,6 +2168,10 @@ pub fn H2(comptime opts: Options) type {
             }
             if (self.h2_opts.max_header_list_size != 0) {
                 settings_buf[settings_count] = .{ .settings_id = c.NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, .value = self.h2_opts.max_header_list_size };
+                settings_count += 1;
+            }
+            if (self.h2_opts.extended_connect) {
+                settings_buf[settings_count] = .{ .settings_id = c.NGHTTP2_SETTINGS_ENABLE_CONNECT_PROTOCOL, .value = 1 };
                 settings_count += 1;
             }
 
@@ -2817,6 +3281,11 @@ pub fn H2(comptime opts: Options) type {
                         // paths decrypt their first app-data flight from
                         // `decrypt_buf`.
                         if (!std.mem.eql(u8, tc.alpnProtocol(), "h2")) {
+                            if (!self.h2_opts.accept_http1) {
+                                try self.reg.destroy(conn_ent.entity);
+                                try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
+                                continue;
+                            }
                             const h1c = Http1Conn.create(self.allocator) orelse {
                                 try self.reg.destroy(conn_ent.entity);
                                 try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
@@ -2892,6 +3361,20 @@ pub fn H2(comptime opts: Options) type {
         fn http1Feed(self: *Self, conn_ptr: *Conn, conn_entity: Entity, bytes: []const u8) void {
             const h1c = conn_ptr.h1.?;
             if (h1c.closing) return;
+            // Raw-relay tunnel: bytes go straight to the consumer sink —
+            // no buffering, no parsing. A push failure means the far end
+            // is gone; tear the conn down.
+            if (h1c.ws_mode) {
+                if (h1c.tunnel_sink) |sink| {
+                    if (!sink.push(sink.ctx, bytes)) {
+                        h1c.closing = true;
+                        self.reg.destroy(conn_entity) catch {};
+                        return;
+                    }
+                    h1c.tunnel_unconsumed +|= @intCast(bytes.len);
+                    return;
+                }
+            }
             h1c.buf.appendSlice(self.allocator, bytes) catch {
                 if (h1c.ws_mode)
                     self.wsClose(conn_ptr, conn_entity, ws.CloseCode.internal_error)
@@ -2947,6 +3430,10 @@ pub fn H2(comptime opts: Options) type {
             // `Connection: upgrade` + `Sec-WebSocket-Key`. The `101` switches the
             // connection out of the HTTP request/response model; `head.head_len`
             // is consumed and any trailing bytes are early WS frames.
+            if (self.h2_opts.websocket_surface and wsIsUpgrade(head)) {
+                self.http1SurfaceUpgrade(conn_ptr, conn_entity, head);
+                return;
+            }
             if (self.h2_opts.websocket_upgrades and wsIsUpgrade(head)) {
                 self.wsHandshake(conn_ptr, conn_entity, head);
                 return;
@@ -3324,7 +3811,14 @@ pub fn H2(comptime opts: Options) type {
         fn http1ReadShouldPause(self: *Self, conn_ptr: *Conn) bool {
             _ = self;
             const h1c = conn_ptr.h1 orelse return false;
-            if (h1c.closing or h1c.ws_mode or !h1c.body_active) return false;
+            if (h1c.closing) return false;
+            // Tunnel backpressure: pushed-but-undrained relay bytes.
+            if (h1c.ws_mode) {
+                if (h1c.tunnel_sink != null)
+                    return h1c.tunnel_unconsumed >= Http1Conn.STREAM_PAUSE_BYTES;
+                return false;
+            }
+            if (!h1c.body_active) return false;
             const s = h1c.stream orelse return false;
             return switch (s.body_mode) {
                 .hold => s.body_len >= Http1Conn.STREAM_PAUSE_BYTES,
@@ -3687,6 +4181,129 @@ pub fn H2(comptime opts: Options) type {
             return has_upgrade and has_conn_upgrade and has_key;
         }
 
+        /// websocket_surface (websocket-plan §8.5): park the connection and
+        /// emit the Upgrade head to the consumer for disposition. The 101 is
+        /// DEFERRED — `wsUpgradeAccept` sends it only once the upstream
+        /// tunnel exists, so a refused tunnel degrades to a plain HTTP error
+        /// (no half-upgraded socket). Early frame bytes the client coalesced
+        /// after the handshake stay in `buf` until accept.
+        fn http1SurfaceUpgrade(self: *Self, conn_ptr: *Conn, conn_entity: Entity, head: http1.Head) void {
+            const h1c = conn_ptr.h1.?;
+            var key: []const u8 = "";
+            for (head.headers) |h| {
+                if (std.ascii.eqlIgnoreCase(h.name, "sec-websocket-key")) key = h.value;
+            }
+            h1c.ws_key = self.allocator.dupe(u8, key) catch {
+                self.http1ErrorClose(conn_ptr, conn_entity, 500);
+                return;
+            };
+            const scheme: []const u8 = if (conn_ptr.tls_conn != null) "https" else "http";
+            _ = self.http1CreateEntity(&self.ws_upgrade_out, conn_entity, head, scheme) catch {
+                self.http1ErrorClose(conn_ptr, conn_entity, 503);
+                return;
+            };
+            h1c.ws_pending = true;
+            h1c.in_flight = true; // no further request parse on this conn
+            h1c.keep_alive = head.keep_alive;
+            // Drop the head; anything left in `buf` is early frame bytes.
+            const leftover = h1c.buf.items.len - head.head_len;
+            if (leftover > 0) std.mem.copyForwards(u8, h1c.buf.items[0..leftover], h1c.buf.items[head.head_len..]);
+            h1c.buf.shrinkRetainingCapacity(leftover);
+        }
+
+        pub const WsUpgradeDecision = enum { ok, gone };
+
+        /// Accept a surfaced Upgrade: send the deferred `101`, switch the
+        /// connection into raw-relay tunnel mode (socket bytes → `sink`,
+        /// verbatim — no frame parsing at this hop), and hand any early
+        /// frame bytes over. h2 holds one sink reference, released by
+        /// `sweepBodySinks` when the connection dies; window repayment is
+        /// the socket-read park/unpark at the streamed-body cap.
+        pub fn wsUpgradeAccept(h2: *Self, ent: Entity, sink: BodySink) WsUpgradeDecision {
+            if (!h2.reg.isInCollection(ent, &h2.ws_upgrade_out)) return .gone;
+            const sess = h2.reg.get(ent, &h2.ws_upgrade_out, Session) catch return .gone;
+            defer h2.reg.destroy(ent) catch {};
+            const conn_ptr = getConn(h2, sess.entity) orelse return .gone;
+            const h1c = conn_ptr.h1 orelse return .gone;
+            if (!h1c.ws_pending or h1c.closing) return .gone;
+
+            var accept_buf: [ws.ACCEPT_LEN]u8 = undefined;
+            const accept = ws.acceptKey(h1c.ws_key, &accept_buf);
+            var resp: std.ArrayList(u8) = .empty;
+            defer resp.deinit(h2.allocator);
+            resp.appendSlice(h2.allocator, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ") catch return .gone;
+            resp.appendSlice(h2.allocator, accept) catch return .gone;
+            resp.appendSlice(h2.allocator, "\r\n\r\n") catch return .gone;
+
+            h2.body_sinks.append(h2.allocator, .{
+                .conn_entity = sess.entity,
+                .stream_id = 0, // sentinel: h1 tunnel sink (no h2 stream)
+                .sink = sink,
+            }) catch return .gone;
+
+            h1c.ws_pending = false;
+            h1c.ws_mode = true;
+            h1c.tunnel_sink = sink;
+
+            const out = resp.toOwnedSlice(h2.allocator) catch {
+                h1c.tunnel_sink = null;
+                _ = h2.body_sinks.pop();
+                return .gone;
+            };
+            h2.http1Send(conn_ptr, sess.entity, out);
+
+            // Early frame bytes that rode in with the handshake.
+            if (h1c.buf.items.len > 0) {
+                if (!sink.push(sink.ctx, h1c.buf.items)) {
+                    h2.reg.destroy(sess.entity) catch {};
+                    return .ok; // sink owns the failure; conn is going down
+                }
+                h1c.tunnel_unconsumed +|= @intCast(h1c.buf.items.len);
+                h1c.buf.clearRetainingCapacity();
+            }
+            return .ok;
+        }
+
+        /// Refuse a surfaced Upgrade with a plain HTTP status — the client
+        /// never sees a 101.
+        pub fn wsUpgradeReject(h2: *Self, ent: Entity, status: u16) void {
+            if (!h2.reg.isInCollection(ent, &h2.ws_upgrade_out)) return;
+            const sess = h2.reg.get(ent, &h2.ws_upgrade_out, Session) catch return;
+            defer h2.reg.destroy(ent) catch {};
+            const conn_ptr = getConn(h2, sess.entity) orelse return;
+            self_reject: {
+                const h1c = conn_ptr.h1 orelse break :self_reject;
+                if (!h1c.ws_pending) break :self_reject;
+                h1c.ws_pending = false;
+            }
+            h2.http1ErrorClose(conn_ptr, sess.entity, status);
+        }
+
+        /// Write raw bytes down a tunnel connection (the upstream leg's
+        /// relay). Order-preserving, one socket write in flight (the
+        /// `ws_out` queue).
+        pub fn wsTunnelWrite(h2: *Self, conn_entity: Entity, bytes: []const u8) void {
+            const conn_ptr = getConn(h2, conn_entity) orelse return;
+            const h1c = conn_ptr.h1 orelse return;
+            if (!h1c.ws_mode or h1c.tunnel_sink == null or h1c.ws_closing) return;
+            h1c.ws_out.appendSlice(h2.allocator, bytes) catch return;
+            h2.wsFlush(conn_ptr, conn_entity);
+        }
+
+        /// Close a tunnel connection once its outbound queue drains (the
+        /// upstream side ended). The sink reference releases via
+        /// `sweepBodySinks` when the conn dies.
+        pub fn wsTunnelClose(h2: *Self, conn_entity: Entity) void {
+            const conn_ptr = getConn(h2, conn_entity) orelse return;
+            const h1c = conn_ptr.h1 orelse return;
+            if (!h1c.ws_mode) {
+                h2.reg.destroy(conn_entity) catch {};
+                return;
+            }
+            h1c.ws_closing = true;
+            h2.wsFlush(conn_ptr, conn_entity);
+        }
+
         /// Piece A: complete the `101 Switching Protocols` handshake and switch
         /// the connection into WebSocket mode. The `101` is queued through the WS
         /// outbound path so it precedes — in wire order — any frame the worker
@@ -3911,6 +4528,15 @@ pub fn H2(comptime opts: Options) type {
                     try self.reg.destroy(ent);
                     continue;
                 }
+                // Extended-CONNECT tunnel: the Session is a WS identity
+                // entity (not a conn) — frames ride the stream's send
+                // queue.
+                if (self.reg.isInCollection(sess.entity, &self.ws_streams)) {
+                    const payload = if (body.data) |d| d[0..body.len] else "";
+                    self.wsStreamSend(sess.entity, meta.opcode, payload);
+                    try self.reg.destroy(ent);
+                    continue;
+                }
                 const conn_ptr = getConn(self, sess.entity) orelse {
                     try self.reg.destroy(ent);
                     continue;
@@ -4062,6 +4688,14 @@ pub fn H2(comptime opts: Options) type {
                         if (conn_ptr.direction == .server and !conn_ptr.first_read_seen and
                             data_len > 0 and looksLikeHttp1Request(data_ptr[0..data_len]))
                         {
+                            // h2c-only instances (the worker —
+                            // websocket-plan §8.5): h1 terminates at the
+                            // front; refuse rather than swap in.
+                            if (!self.h2_opts.accept_http1) {
+                                try self.reg.destroy(conn_ent.entity);
+                                try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                                continue;
+                            }
                             conn_ptr.first_read_seen = true;
                             _ = self.http1SwapIn(conn_ptr) orelse {
                                 try self.reg.destroy(conn_ent.entity);

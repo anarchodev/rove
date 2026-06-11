@@ -37,13 +37,12 @@
 //! like the ambiguous post-propose 503, which is never platform-
 //! retried (docs/architecture/routing-and-ingress.md §2).
 //!
-//! ## What this still does not do (explicit follow-ups)
-//!
-//!   - WebSocket tunneling. The front's h1 listener no longer
-//!     terminates WS (`websocket_upgrades = false`); an Upgrade
-//!     request proxies as a plain GET and the backend answers it as
-//!     HTTP. A real tunnel needs an h1-upgrade client leg / raw
-//!     splice — its own slice.
+//! WebSocket: the h1 listener surfaces Upgrade heads
+//! (`websocket_surface`), and each accepted connection tunnels
+//! upstream as an RFC 8441 Extended CONNECT stream on the pooled h2c
+//! conn (websocket-plan §8.5) — `WsTunnel` pairs the raw-relay
+//! downstream socket with the CONNECT stream; 421 re-aims like any
+//! request; the downstream 101 waits for the upstream 200.
 
 const std = @import("std");
 const rove = @import("rove");
@@ -62,6 +61,9 @@ const Entity = rove.Entity;
 pub const FlowRef = struct {
     ptr: ?*anyopaque = null,
     attempt: u32 = 0,
+    /// `ptr` is a *WsTunnel, not a *Flow (Extended-CONNECT WS tunnel
+    /// pump/terminal entities — websocket-plan §8.5).
+    tunnel: bool = false,
 };
 
 /// Request-body bytes kept for 421 / transport-error replay. Streamed
@@ -235,8 +237,13 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// h2-created `client_response_receiving` entities (which carry
         /// no FlowRef).
         flows_by_up: std.AutoHashMapUnmanaged(StreamKey, *Flow) = .empty,
+        /// WS tunnels by upstream (sess, sid) — the CONNECT-response
+        /// mapping (checked BEFORE flows_by_up: an unmapped receiving
+        /// stream is reset, which must never hit a tunnel).
+        tunnels_by_up: std.AutoHashMapUnmanaged(StreamKey, *WsTunnel) = .empty,
         /// Live-flow count (operator visibility / leak canary).
         live_flows: usize = 0,
+        live_tunnels: usize = 0,
 
         const StreamKey = struct {
             idx: u32,
@@ -250,14 +257,56 @@ pub fn Proxy(comptime FrontH2: type) type {
 
         // ── Upstream pool ─────────────────────────────────────────────
 
+        const Waiter = union(enum) {
+            flow: *Flow,
+            tunnel: *WsTunnel,
+        };
+
         const Upstream = struct {
             origin: []u8, // owned, also the pool key
             state: enum { down, connecting, up } = .down,
             sess: Entity = Entity.nil,
             addr: ?std.net.Address = null,
             last_fail_ns: i128 = 0,
-            /// Flows waiting on the in-flight connect.
-            waiters: std.ArrayListUnmanaged(*Flow) = .empty,
+            /// Flows/tunnels waiting on the in-flight connect.
+            waiters: std.ArrayListUnmanaged(Waiter) = .empty,
+        };
+
+        /// One WS tunnel: a downstream h1 Upgrade paired with an upstream
+        /// Extended-CONNECT stream on the pooled h2c conn (websocket-plan
+        /// §8.5). The front never parses frames — bytes relay verbatim in
+        /// both directions; the worker unmasks. Freed when `done` with no
+        /// outstanding terminals or sink refs.
+        const WsTunnel = struct {
+            proxy: *Self,
+            down_conn: Entity,
+            /// The `ws_upgrade_out` handle; valid until `decided`
+            /// (wsUpgradeAccept / wsUpgradeReject consume it).
+            upgrade_ent: Entity,
+            authority: []u8, // owned
+            host: []u8, // owned
+            nodes: [][]u8 = &.{},
+            node_idx: usize = 0,
+            attempt: u32 = 0,
+            up_sess: Entity = Entity.nil,
+            up_sid: u32 = 0,
+            waiting_conn: bool = false,
+            attempt_live: bool = false,
+            pending_terminals: u8 = 0,
+            /// Downstream socket bytes awaiting upstream chunks.
+            up_buf: std.ArrayListUnmanaged(u8) = .empty,
+            /// Bytes moved into upstream chunks, not yet reported to the
+            /// downstream tunnel sink's `drained` (read unpark).
+            down_drained: u32 = 0,
+            /// Upstream response bytes written downstream, not yet
+            /// reported to the upstream sink's `drained` (window repay).
+            up_drained: u32 = 0,
+            chunk_inflight: u32 = 0,
+            accepted: bool = false,
+            decided: bool = false,
+            down_gone: bool = false,
+            done: bool = false,
+            sink_refs: u8 = 0,
         };
 
         // ── Flow — one proxied request ────────────────────────────────
@@ -373,6 +422,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             }
             self.pool.deinit(self.allocator);
             self.flows_by_up.deinit(self.allocator);
+            self.tunnels_by_up.deinit(self.allocator);
         }
 
         /// One proxy turn — run after `server.poll…()` each loop
@@ -382,6 +432,7 @@ pub fn Proxy(comptime FrontH2: type) type {
         pub fn run(self: *Self, now_ns: i128) !void {
             try self.intakeStreaming(now_ns);
             try self.intakeClassic(now_ns);
+            try self.intakeWsUpgrades(now_ns);
             try self.reg.flush();
             try self.consumeConnects(now_ns);
             try self.reg.flush();
@@ -473,6 +524,325 @@ pub fn Proxy(comptime FrontH2: type) type {
 
         /// Shared intake front half: authority → route → Flow. Returns
         /// null after answering the request directly (4xx/5xx).
+        // ── WS tunnels (websocket-plan §8.5) ──────────────────────────
+
+        /// Surfaced h1 Upgrade heads: resolve the route and open the
+        /// upstream Extended-CONNECT attempt. The downstream 101 waits
+        /// for the upstream 200 (`consumeResponseHeaders`), so a refused
+        /// tunnel is a plain HTTP error downstream.
+        fn intakeWsUpgrades(self: *Self, now_ns: i128) !void {
+            const coll = &self.server.ws_upgrade_out;
+            const entities = coll.entitySlice();
+            const sids = coll.column(h2.StreamId);
+            const sessions = coll.column(h2.Session);
+            const req_hdrs = coll.column(h2.ReqHeaders);
+            const flow_refs = coll.column(FlowRef);
+
+            for (entities, sids, sessions, req_hdrs, flow_refs) |ent, sid, sess, rh, *fr| {
+                _ = sid;
+                if (fr.ptr != null) continue; // already tunnel-bound
+                if (self.reg.isStale(sess.entity)) {
+                    // Downstream died before disposition.
+                    try self.reg.destroy(ent);
+                    continue;
+                }
+                const authority_raw = headerValue(rh, ":authority") orelse {
+                    self.server.wsUpgradeReject(ent, 400);
+                    continue;
+                };
+                const host = hostOnly(authority_raw);
+                const route = self.resolveRoute(host, now_ns) catch {
+                    self.server.wsUpgradeReject(ent, 503);
+                    continue;
+                };
+                const nodes: []const []const u8 = switch (route) {
+                    .not_found => {
+                        self.server.wsUpgradeReject(ent, 404);
+                        continue;
+                    },
+                    .moving => {
+                        self.server.wsUpgradeReject(ent, 503);
+                        continue;
+                    },
+                    .nodes => |n| n,
+                };
+                if (nodes.len == 0) {
+                    self.server.wsUpgradeReject(ent, 502);
+                    continue;
+                }
+
+                const t = self.allocator.create(WsTunnel) catch {
+                    self.server.wsUpgradeReject(ent, 503);
+                    continue;
+                };
+                t.* = .{
+                    .proxy = self,
+                    .down_conn = sess.entity,
+                    .upgrade_ent = ent,
+                    .authority = undefined,
+                    .host = undefined,
+                };
+                t.authority = self.allocator.dupe(u8, authority_raw) catch {
+                    self.allocator.destroy(t);
+                    self.server.wsUpgradeReject(ent, 503);
+                    continue;
+                };
+                t.host = self.allocator.dupe(u8, host) catch {
+                    self.allocator.free(t.authority);
+                    self.allocator.destroy(t);
+                    self.server.wsUpgradeReject(ent, 503);
+                    continue;
+                };
+                t.nodes = dupNodes(self.allocator, nodes) catch {
+                    self.allocator.free(t.authority);
+                    self.allocator.free(t.host);
+                    self.allocator.destroy(t);
+                    self.server.wsUpgradeReject(ent, 503);
+                    continue;
+                };
+                self.live_tunnels += 1;
+                fr.ptr = @ptrCast(t);
+                fr.tunnel = true;
+                self.startTunnelAttempt(t);
+            }
+        }
+
+        fn startTunnelAttempt(self: *Self, t: *WsTunnel) void {
+            t.up_sid = 0;
+            t.up_sess = Entity.nil;
+            t.chunk_inflight = 0;
+            const origin = t.nodes[t.node_idx];
+            const up = self.poolEntry(origin) catch {
+                self.tunnelAttemptFailed(t);
+                return;
+            };
+            switch (up.state) {
+                .up => {
+                    if (self.reg.isStale(up.sess)) {
+                        up.state = .down;
+                        up.sess = Entity.nil;
+                        self.connectUpstream(up, .{ .tunnel = t });
+                    } else {
+                        self.submitTunnel(t, up.sess);
+                    }
+                },
+                .connecting => {
+                    up.waiters.append(self.allocator, .{ .tunnel = t }) catch {
+                        self.tunnelAttemptFailed(t);
+                        return;
+                    };
+                    t.waiting_conn = true;
+                },
+                .down => self.connectUpstream(up, .{ .tunnel = t }),
+            }
+        }
+
+        /// Open the Extended-CONNECT stream on a live pool conn. RFC 8441
+        /// requires the peer's ENABLE_CONNECT_PROTOCOL before submitting.
+        fn submitTunnel(self: *Self, t: *WsTunnel, sess: Entity) void {
+            if (!self.server.connExtendedConnect(sess)) {
+                std.log.warn("front: {s} has no extended-connect — cannot tunnel WS", .{t.nodes[t.node_idx]});
+                self.tunnelAttemptFailed(t);
+                return;
+            }
+            const packed_hdrs = self.packTunnelHeaders(t) catch {
+                self.tunnelAttemptFailed(t);
+                return;
+            };
+            const pump = self.reg.create(&self.server.client_stream_request_in) catch {
+                if (packed_hdrs._buf) |b| self.allocator.free(b[0..packed_hdrs._buf_len]);
+                self.tunnelAttemptFailed(t);
+                return;
+            };
+            const coll = &self.server.client_stream_request_in;
+            t.attempt += 1;
+            self.reg.set(pump, coll, h2.Session, .{ .entity = sess }) catch {};
+            self.reg.set(pump, coll, h2.ReqHeaders, packed_hdrs) catch {};
+            self.reg.set(pump, coll, h2.ReqBody, .{}) catch {};
+            self.reg.set(pump, coll, h2.H2IoResult, .{ .err = 0 }) catch {};
+            self.reg.set(pump, coll, h2.StreamId, .{ .id = 0 }) catch {};
+            self.reg.set(pump, coll, FlowRef, .{ .ptr = @ptrCast(t), .attempt = t.attempt, .tunnel = true }) catch {};
+            t.up_sess = sess;
+            t.attempt_live = true;
+            t.pending_terminals += 1;
+        }
+
+        /// The five RFC 8441 CONNECT headers, one owned buffer.
+        fn packTunnelHeaders(self: *Self, t: *WsTunnel) !h2.ReqHeaders {
+            const Pair = struct { name: []const u8, value: []const u8 };
+            const pairs = [_]Pair{
+                .{ .name = ":method", .value = "CONNECT" },
+                .{ .name = ":protocol", .value = "websocket" },
+                .{ .name = ":scheme", .value = "http" },
+                .{ .name = ":authority", .value = t.authority },
+                .{ .name = ":path", .value = "/" }, // overwritten below
+            };
+            // :path comes from the Upgrade head (still on the entity).
+            const rh_src = self.reg.get(t.upgrade_ent, &self.server.ws_upgrade_out, h2.ReqHeaders) catch null;
+            const path: []const u8 = if (rh_src) |rh| (headerValue(rh.*, ":path") orelse "/") else "/";
+
+            var strbytes: usize = 0;
+            for (pairs[0..4]) |p| strbytes += p.name.len + p.value.len;
+            strbytes += ":path".len + path.len;
+
+            const n = pairs.len;
+            const fields_size = n * @sizeOf(h2.HeaderField);
+            const buf = try self.allocator.alloc(u8, fields_size + strbytes);
+            errdefer self.allocator.free(buf);
+            const fields: [*]h2.HeaderField = @ptrCast(@alignCast(buf.ptr));
+            const strbase = buf.ptr + fields_size;
+            var soff: usize = 0;
+            var fi: usize = 0;
+            const put = struct {
+                fn go(f: [*]h2.HeaderField, sb: [*]u8, off: *usize, idx: *usize, name: []const u8, value: []const u8) void {
+                    @memcpy(sb[off.* .. off.* + name.len], name);
+                    const noff = off.*;
+                    off.* += name.len;
+                    @memcpy(sb[off.* .. off.* + value.len], value);
+                    const voff = off.*;
+                    off.* += value.len;
+                    f[idx.*] = .{
+                        .name = sb + noff,
+                        .name_len = @intCast(name.len),
+                        .value = sb + voff,
+                        .value_len = @intCast(value.len),
+                    };
+                    idx.* += 1;
+                }
+            }.go;
+            for (pairs[0..4]) |p| put(fields, strbase, &soff, &fi, p.name, p.value);
+            put(fields, strbase, &soff, &fi, ":path", path);
+            return .{ .fields = fields, .count = @intCast(n), ._buf = buf.ptr, ._buf_len = @intCast(buf.len) };
+        }
+
+        /// Current tunnel attempt failed before the 200: next node or
+        /// refuse the downstream Upgrade.
+        fn tunnelAttemptFailed(self: *Self, t: *WsTunnel) void {
+            self.unmapTunnel(t);
+            t.attempt_live = false;
+            if (t.down_gone or self.reg.isStale(t.down_conn)) {
+                self.finishTunnel(t);
+                return;
+            }
+            if (t.node_idx + 1 < t.nodes.len) {
+                t.node_idx += 1;
+                self.startTunnelAttempt(t);
+                return;
+            }
+            self.cache.invalidate(t.host);
+            self.finishTunnel(t);
+        }
+
+        fn unmapTunnel(self: *Self, t: *WsTunnel) void {
+            if (!t.up_sess.isNil() and t.up_sid != 0) {
+                _ = self.tunnels_by_up.remove(keyOf(t.up_sess, t.up_sid));
+            }
+        }
+
+        /// Terminal state: nothing more will happen for this tunnel. An
+        /// undecided downstream Upgrade is refused here (also destroys
+        /// the handle entity when the conn is already dead). Frees once
+        /// outstanding terminals + sink refs drain.
+        fn finishTunnel(self: *Self, t: *WsTunnel) void {
+            if (!t.decided) {
+                t.decided = true;
+                self.server.wsUpgradeReject(t.upgrade_ent, 502);
+            }
+            t.done = true;
+            self.maybeDestroyTunnel(t);
+        }
+
+        fn maybeDestroyTunnel(self: *Self, t: *WsTunnel) void {
+            if (!t.done or t.pending_terminals != 0 or t.sink_refs != 0) return;
+            self.unmapTunnel(t);
+            self.allocator.free(t.authority);
+            self.allocator.free(t.host);
+            freeNodes(self.allocator, t.nodes);
+            t.up_buf.deinit(self.allocator);
+            self.live_tunnels -= 1;
+            self.allocator.destroy(t);
+        }
+
+        // Tunnel sinks. Downstream socket bytes → `up_buf` (pumped as
+        // upstream chunks); upstream response bytes → the downstream
+        // write queue. Both run on the poll thread.
+        fn tunnelOf(ctx: *anyopaque) *WsTunnel {
+            return @ptrCast(@alignCast(ctx));
+        }
+        fn downTunnelPush(ctx: *anyopaque, bytes: []const u8) bool {
+            const t = tunnelOf(ctx);
+            if (t.done) return false;
+            t.up_buf.appendSlice(t.proxy.allocator, bytes) catch return false;
+            return true;
+        }
+        fn downTunnelFinish(_: *anyopaque) void {}
+        fn downTunnelAbort(ctx: *anyopaque) void {
+            const t = tunnelOf(ctx);
+            t.down_gone = true;
+        }
+        fn downTunnelDrained(ctx: *anyopaque) u32 {
+            const t = tunnelOf(ctx);
+            const d = t.down_drained;
+            t.down_drained = 0;
+            return d;
+        }
+        fn downTunnelRelease(ctx: *anyopaque) void {
+            const t = tunnelOf(ctx);
+            t.down_gone = true;
+            t.sink_refs -|= 1;
+            t.proxy.maybeDestroyTunnel(t);
+        }
+        fn downTunnelSinkOf(t: *WsTunnel) h2.BodySink {
+            return .{
+                .ctx = @ptrCast(t),
+                .push = &downTunnelPush,
+                .finish = &downTunnelFinish,
+                .abort = &downTunnelAbort,
+                .drained = &downTunnelDrained,
+                .release = &downTunnelRelease,
+            };
+        }
+        fn upTunnelPush(ctx: *anyopaque, bytes: []const u8) bool {
+            const t = tunnelOf(ctx);
+            if (t.down_gone or t.proxy.reg.isStale(t.down_conn)) return false;
+            t.proxy.server.wsTunnelWrite(t.down_conn, bytes);
+            t.up_drained +%= @intCast(bytes.len);
+            return true;
+        }
+        fn upTunnelFinish(ctx: *anyopaque) void {
+            // Upstream ended cleanly (worker sent Close + END): close
+            // the downstream socket once its queue drains.
+            const t = tunnelOf(ctx);
+            t.proxy.server.wsTunnelClose(t.down_conn);
+        }
+        fn upTunnelAbort(ctx: *anyopaque) void {
+            const t = tunnelOf(ctx);
+            if (!t.down_gone and !t.proxy.reg.isStale(t.down_conn)) {
+                t.proxy.reg.destroy(t.down_conn) catch {};
+            }
+        }
+        fn upTunnelDrained(ctx: *anyopaque) u32 {
+            const t = tunnelOf(ctx);
+            const d = t.up_drained;
+            t.up_drained = 0;
+            return d;
+        }
+        fn upTunnelRelease(ctx: *anyopaque) void {
+            const t = tunnelOf(ctx);
+            t.sink_refs -|= 1;
+            t.proxy.maybeDestroyTunnel(t);
+        }
+        fn upTunnelSinkOf(t: *WsTunnel) h2.BodySink {
+            return .{
+                .ctx = @ptrCast(t),
+                .push = &upTunnelPush,
+                .finish = &upTunnelFinish,
+                .abort = &upTunnelAbort,
+                .drained = &upTunnelDrained,
+                .release = &upTunnelRelease,
+            };
+        }
+
         fn beginFlow(
             self: *Self,
             coll: anytype,
@@ -564,19 +934,19 @@ pub fn Proxy(comptime FrontH2: type) type {
                         // Idle-reaped (or died quietly). Reconnect.
                         up.state = .down;
                         up.sess = Entity.nil;
-                        self.connectUpstream(up, flow);
+                        self.connectUpstream(up, .{ .flow = flow });
                     } else {
                         self.submitAttempt(flow, up.sess);
                     }
                 },
                 .connecting => {
-                    up.waiters.append(self.allocator, flow) catch {
+                    up.waiters.append(self.allocator, .{ .flow = flow }) catch {
                         self.attemptFailed(flow, false);
                         return;
                     };
                     flow.waiting_conn = true;
                 },
-                .down => self.connectUpstream(up, flow),
+                .down => self.connectUpstream(up, .{ .flow = flow }),
             }
         }
 
@@ -592,16 +962,16 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// Kick off (or join) a connect to a down upstream. Inside the
         /// backoff window the attempt fails over immediately instead
         /// of hammering a dead node.
-        fn connectUpstream(self: *Self, up: *Upstream, flow: *Flow) void {
+        fn connectUpstream(self: *Self, up: *Upstream, waiter: Waiter) void {
             const now = std.time.nanoTimestamp();
             if (up.state == .down and now - up.last_fail_ns < CONNECT_BACKOFF_NS) {
-                self.attemptFailed(flow, false);
+                self.waiterFailed(waiter);
                 return;
             }
             const addr = up.addr orelse blk: {
                 const a = resolveOrigin(self.allocator, up.origin) catch {
                     up.last_fail_ns = now;
-                    self.attemptFailed(flow, false);
+                    self.waiterFailed(waiter);
                     return;
                 };
                 up.addr = a;
@@ -609,7 +979,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             };
 
             const ce = self.reg.create(&self.server.client_connect_in) catch {
-                self.attemptFailed(flow, false);
+                self.waiterFailed(waiter);
                 return;
             };
             self.reg.set(ce, &self.server.client_connect_in, h2.ConnectTarget, .{ .addr = addr }) catch {};
@@ -618,13 +988,23 @@ pub fn Proxy(comptime FrontH2: type) type {
             self.reg.set(ce, &self.server.client_connect_in, FlowRef, .{ .ptr = @ptrCast(up) }) catch {};
 
             up.state = .connecting;
-            up.waiters.append(self.allocator, flow) catch {
-                // The connect proceeds (other flows may join); this
-                // flow fails over.
-                self.attemptFailed(flow, false);
+            up.waiters.append(self.allocator, waiter) catch {
+                // The connect proceeds (other waiters may join); this
+                // one fails over.
+                self.waiterFailed(waiter);
                 return;
             };
-            flow.waiting_conn = true;
+            switch (waiter) {
+                .flow => |f| f.waiting_conn = true,
+                .tunnel => |t| t.waiting_conn = true,
+            }
+        }
+
+        fn waiterFailed(self: *Self, waiter: Waiter) void {
+            switch (waiter) {
+                .flow => |f| self.attemptFailed(f, false),
+                .tunnel => |t| self.tunnelAttemptFailed(t),
+            }
         }
 
         /// Submit the current attempt's request head on `sess` via the
@@ -766,16 +1146,28 @@ pub fn Proxy(comptime FrontH2: type) type {
             var waiters = up.waiters;
             up.waiters = .empty;
             defer waiters.deinit(self.allocator);
-            for (waiters.items) |flow| {
-                flow.waiting_conn = false;
-                if (flow.down_gone or !flow.down_alive) {
-                    self.teardownFlow(flow);
-                } else if (ok) {
-                    self.submitAttempt(flow, up.sess);
-                } else {
-                    self.attemptFailed(flow, false);
-                }
-            }
+            for (waiters.items) |w| switch (w) {
+                .flow => |flow| {
+                    flow.waiting_conn = false;
+                    if (flow.down_gone or !flow.down_alive) {
+                        self.teardownFlow(flow);
+                    } else if (ok) {
+                        self.submitAttempt(flow, up.sess);
+                    } else {
+                        self.attemptFailed(flow, false);
+                    }
+                },
+                .tunnel => |t| {
+                    t.waiting_conn = false;
+                    if (t.down_gone or self.reg.isStale(t.down_conn)) {
+                        self.finishTunnel(t);
+                    } else if (ok) {
+                        self.submitTunnel(t, up.sess);
+                    } else {
+                        self.tunnelAttemptFailed(t);
+                    }
+                },
+            };
         }
 
         // ── Response relay ────────────────────────────────────────────
@@ -791,6 +1183,12 @@ pub fn Proxy(comptime FrontH2: type) type {
 
             for (entities, sids, sessions, statuses, resp_hdrs) |ent, sid, sess, status, rh| {
                 defer self.reg.destroy(ent) catch {};
+                // WS tunnel CONNECT responses first — an unmapped stream
+                // is reset below, which must never hit a live tunnel.
+                if (self.tunnels_by_up.get(keyOf(sess.entity, sid.id))) |t| {
+                    self.tunnelResponse(t, sess.entity, sid.id, status.code);
+                    continue;
+                }
                 const flow = self.flows_by_up.get(keyOf(sess.entity, sid.id)) orelse {
                     // Response on a stream we no longer track (abandoned
                     // attempt that raced our RST). Make sure it dies.
@@ -832,6 +1230,37 @@ pub fn Proxy(comptime FrontH2: type) type {
             }
         }
 
+        /// An early-emitted response on a tunnel's CONNECT stream. 200 =
+        /// tunnel accepted: send the deferred downstream 101 and wire
+        /// both relay sinks. Anything else = refused mid-handshake.
+        fn tunnelResponse(self: *Self, t: *WsTunnel, up_sess: Entity, up_sid: u32, code: u16) void {
+            if (code != 200 or t.down_gone or self.reg.isStale(t.down_conn)) {
+                self.server.clientStreamReset(up_sess, up_sid);
+                self.tunnelAttemptFailed(t);
+                return;
+            }
+            t.decided = true;
+            switch (self.server.wsUpgradeAccept(t.upgrade_ent, downTunnelSinkOf(t))) {
+                .ok => {
+                    t.accepted = true;
+                    t.sink_refs += 1;
+                },
+                .gone => {
+                    // Downstream died between intake and the 200.
+                    self.server.clientStreamReset(up_sess, up_sid);
+                    self.finishTunnel(t);
+                    return;
+                },
+            }
+            switch (self.server.requestBodySink(up_sess, up_sid, upTunnelSinkOf(t))) {
+                .streaming, .eof => t.sink_refs += 1,
+                .gone => {
+                    // Upstream stream already dead; terminal will land.
+                    self.server.wsTunnelClose(t.down_conn);
+                },
+            }
+        }
+
         /// Move the downstream entity into the streaming-response
         /// pipeline with the relayed status + headers.
         fn relayHead(self: *Self, flow: *Flow, code: u16, packed_hdrs: h2.RespHeaders) void {
@@ -855,6 +1284,40 @@ pub fn Proxy(comptime FrontH2: type) type {
 
             for (entities, sids, sessions, flow_refs) |ent, sid, sess, fr| {
                 const p = fr.ptr orelse continue;
+                // WS tunnel pump: register the stream id, repay the
+                // downstream read window for drained chunks, relay the
+                // next slice of downstream bytes upstream.
+                if (fr.tunnel) {
+                    const t: *WsTunnel = @ptrCast(@alignCast(p));
+                    if (fr.attempt != t.attempt) continue;
+                    if (t.up_sid == 0) {
+                        t.up_sid = sid.id;
+                        t.up_sess = sess.entity;
+                        self.tunnels_by_up.put(self.allocator, keyOf(sess.entity, sid.id), t) catch {};
+                    }
+                    if (t.chunk_inflight > 0) {
+                        t.down_drained +|= t.chunk_inflight;
+                        t.chunk_inflight = 0;
+                    }
+                    if (t.down_gone or self.reg.isStale(t.down_conn)) {
+                        // Downstream socket died — no clean WS Close
+                        // exists; reset so the worker sees disconnect.
+                        self.server.clientStreamReset(sess.entity, sid.id);
+                        continue;
+                    }
+                    if (t.up_buf.items.len > 0) {
+                        const n: u32 = @intCast(@min(t.up_buf.items.len, CHUNK_MAX));
+                        const chunk = self.allocator.alloc(u8, n) catch continue;
+                        @memcpy(chunk, t.up_buf.items[0..n]);
+                        const leftover = t.up_buf.items.len - n;
+                        if (leftover > 0) std.mem.copyForwards(u8, t.up_buf.items[0..leftover], t.up_buf.items[n..]);
+                        t.up_buf.shrinkRetainingCapacity(leftover);
+                        self.reg.set(ent, coll, h2.ReqBody, .{ .data = chunk.ptr, .len = n }) catch {};
+                        self.reg.move(ent, coll, &self.server.client_stream_data_in) catch {};
+                        t.chunk_inflight = n;
+                    }
+                    continue;
+                }
                 const flow: *Flow = @ptrCast(@alignCast(p));
                 if (fr.attempt != flow.attempt) continue; // abandoned; close cb will reap it
 
@@ -949,6 +1412,49 @@ pub fn Proxy(comptime FrontH2: type) type {
                 defer self.reg.destroy(ent) catch {};
                 _ = sid;
                 const p = fr.ptr orelse continue;
+                // WS tunnel terminal: the CONNECT stream ended.
+                if (fr.tunnel) {
+                    const t: *WsTunnel = @ptrCast(@alignCast(p));
+                    t.pending_terminals -|= 1;
+                    if (fr.attempt != t.attempt) {
+                        self.maybeDestroyTunnel(t);
+                        continue;
+                    }
+                    self.unmapTunnel(t);
+                    t.attempt_live = false;
+                    if (t.accepted) {
+                        // Live tunnel over (worker side ended / died):
+                        // close the downstream socket once it drains.
+                        // The sinks already saw finish/abort.
+                        self.server.wsTunnelClose(t.down_conn);
+                        self.finishTunnel(t);
+                        continue;
+                    }
+                    // Refused before any 200 (worker 421/transport
+                    // error): the rejected-CONNECT response rides this
+                    // terminal. 421 / conn death → re-aim at the next
+                    // node; anything else refuses the Upgrade.
+                    const conn_died = io_res.err != 0 and self.reg.isStale(t.up_sess);
+                    if (status.code == 421 or io_res.err != 0) {
+                        if (conn_died) {
+                            if (self.pool.get(t.nodes[t.node_idx])) |up| {
+                                if (up.state == .up and self.reg.isStale(up.sess)) {
+                                    up.state = .down;
+                                    up.sess = Entity.nil;
+                                    up.last_fail_ns = 0;
+                                }
+                            }
+                        }
+                        self.tunnelAttemptFailed(t);
+                        continue;
+                    }
+                    if (!t.decided) {
+                        t.decided = true;
+                        self.server.wsUpgradeReject(t.upgrade_ent, if (status.code != 0) status.code else 502);
+                    }
+                    self.finishTunnel(t);
+                    continue;
+                }
                 const flow: *Flow = @ptrCast(@alignCast(p));
                 flow.pending_terminals -|= 1;
                 if (fr.attempt != flow.attempt) {
