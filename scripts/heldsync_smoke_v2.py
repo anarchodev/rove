@@ -20,8 +20,9 @@ second client request), so there is no front-door head-of-line concern.
 V2 outbound: the worker binds 0.0.0.0, so on-box libcurl reaches the same
 node over loopback at `http://wb.localhost:<node_port>/echo`; the
 `wb.<suffix>` Host carries the tenant routing (a bare 127.0.0.1 URL would
-404). V2 does not enforce the loopback/plaintext SSRF block on outbound, so
-no `--dev-webhook-unsafe` is needed (it isn't wired on `rewind` anyway).
+404). The SSRF gate (wired 2026-06-11) blocks loopback/plaintext outbound in
+production; the harness sets `REWIND_UNSAFE_OUTBOUND=1` on spawned workers so
+this topology keeps working (see `ssrf_smoke_v2.py` for the gate's own smoke).
 
 Dropped from V1 (V2-irrelevant): TLS/https, leader-direct addressing /
 discover_leader, seed_manifest, workers_per_node, --dev-webhook-unsafe.

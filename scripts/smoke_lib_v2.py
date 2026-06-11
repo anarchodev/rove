@@ -118,6 +118,11 @@ class V2Cluster:
     log_paths: dict = field(default_factory=dict)
     root_token: str = ROOT_TOKEN
     services_jwt: str = ""
+    # Workers get REWIND_UNSAFE_OUTBOUND=1 by default: smoke upstream echo
+    # tenants live on loopback over plaintext h2c, which the SSRF gate
+    # (rove-ssrf, wired 2026-06-11) blocks in production. ssrf_smoke_v2
+    # passes unsafe_outbound=False to test the production posture.
+    unsafe_outbound: bool = True
     _voters: str = ""
     _peers: str = ""
 
@@ -125,7 +130,8 @@ class V2Cluster:
     @classmethod
     def spawn(cls, tag: str, *, nodes: int = 1, http_base: int = 18300,
               raft_base: int = 18400, cp_port: int = 0, front_port: int = 0,
-              files_port: int = 0, cluster_id: str = "cluster-1") -> "V2Cluster":
+              files_port: int = 0, cluster_id: str = "cluster-1",
+              unsafe_outbound: bool = True) -> "V2Cluster":
         if not os.environ.get("S3_ENDPOINT"):
             raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
         for b in (REWIND, CP_BIN, FRONT_BIN, FILES_V2):
@@ -149,6 +155,7 @@ class V2Cluster:
             cp_data_dir=Path(f"/tmp/v2smoke-{tag}-cp-{pid}"),
             files_data_dir=Path(f"/tmp/v2smoke-{tag}-files-{pid}"),
             log_data_dir=Path(f"/tmp/v2smoke-{tag}-log-{pid}"),
+            unsafe_outbound=unsafe_outbound,
         )
         for d in (*c.data_dirs, c.cp_data_dir, c.files_data_dir):
             subprocess.run(["rm", "-rf", str(d)])
@@ -188,6 +195,8 @@ class V2Cluster:
         # a co-spawned `log-server-standalone` reads exactly this cluster's
         # batches. rewind defaults the log key prefix to LOG_S3_KEY_PREFIX.
         env["LOG_S3_KEY_PREFIX"] = self.s3_prefix
+        if self.unsafe_outbound:
+            env["REWIND_UNSAFE_OUTBOUND"] = "1"
         log = f"/tmp/v2smoke-{self.tag}-n{i + 1}-{os.getpid()}.log"
         self.log_paths[f"n{i + 1}"] = log
         logf = open(log, "w+")

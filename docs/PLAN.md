@@ -109,8 +109,9 @@ top: an `_send/owed/{id}` owed-marker (an ordinary envelope-0 kv write, atomic
 with the handler's writeset) + `http.fetch` + a boot/cron sweep that re-fires
 stale markers. At-least-once (receivers dedup on the id header); vendor-neutral
 (no platform signing header — customers stamp HMAC/SigV4 via `crypto.*`);
-mandatory SSRF block + TLS-always (⚠️ the blocklist is contract-not-yet-wired
-in V2 — see §12). Why durability-as-JS-shim (and the three
+mandatory SSRF block + TLS-always (wired 2026-06-11: per-attempt gate +
+full-set `CURLOPT_RESOLVE` pin + redirects-off for customer fetches —
+decisions.md §3.8). Why durability-as-JS-shim (and the three
 retired native generations — `webhooks.db`, `http.send`+`schedules.db`,
 `SendDispatch`): decisions.md §3.3 + §3.4 + §7; mechanics:
 `architecture/effects-and-handlers.md` (the primitive itself:
@@ -226,9 +227,8 @@ shape is durability-as-JS-shim over the single `http.fetch` primitive
 drainer → `webhooks.db` envelopes 4/5/6 → `http.send` + `schedules.db` →
 leader-local `SendDispatch`) are recorded in §7 +
 `architecture/effects-and-handlers.md`. Resend is the email provider
-(decisions.md §1.2). ⚠️ The SSRF-blocklist half of the outbound contract is
-**not yet wired in V2** — see the gap note under §12 "Webhook / email
-semantics".
+(decisions.md §1.2). The SSRF-blocklist half of the outbound contract was
+wired 2026-06-11 (decisions.md §3.8; `scripts/ssrf_smoke_v2.py`).
 
 ### Phase 4 — Signup + auth — SHIPPED (admin auth re-platformed to OIDC in V2)
 
@@ -706,15 +706,17 @@ libraries). The surprises worth flagging for first-run docs:
 - **`webhook.send` is vendor-neutral.** No default signing header; use `crypto.hmacSha256` to build vendor-specific signatures in the handler before `webhook.send`.
 - **`email.send` takes `key` as an explicit argument.** Customer's abuse-control concern; keep the Resend key in KV and pass it at call site.
 - **Response body captured at 256KB max.** Anything larger is truncated with `truncated: true` on the callback event.
-- ⚠️ **SSRF blocklist: contract, not yet wired (verified 2026-06-11).** The
-  §2.6 mandatory-block contract stands, but `rove-ssrf`'s
-  `resolveSafe`/`isBlocked` currently has **no caller on the V2 `http.fetch`
-  path** — outbound requests are not SSRF-filtered today, and a malicious
-  handler could probe localhost / internal endpoints. Wiring the blocklist
-  into the fetch engine is a **pre-production blocker**. (Only the test-only
-  `test_allow_plaintext` TLS toggle is wired; there is deliberately no
-  dev-mode relax flag. Smokes hit tenant-local upstream URLs, so the wiring
-  needs a loopback-allowlist story for the test topology.)
+- **Outbound is gated (SSRF + TLS-always; wired 2026-06-11).** Every
+  customer-supplied URL is policy-checked per attempt — `https` only, every
+  resolved address blocklist-checked (RFC 1918 / loopback / link-local
+  metadata / CGNAT / …), the vetted address set pinned on the connection —
+  and **`http.fetch` does not follow redirects** (the handler sees the 3xx
+  and composes the follow; each hop re-enters the gate). A blocked fetch
+  surfaces as a failed outcome (`ok=false, status=0`). decisions.md §3.8;
+  as-built: `architecture/routing-and-ingress.md` "Outbound policy gate";
+  smoke: `scripts/ssrf_smoke_v2.py`. The smoke-only
+  `REWIND_UNSAFE_OUTBOUND=1` hatch relaxes loopback + TLS-always for test
+  topologies — never production.
 
 ### Auth / signup
 

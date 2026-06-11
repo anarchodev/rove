@@ -52,6 +52,7 @@ pub const limiter = @import("limiter.zig");
 pub const router = @import("router.zig");
 pub const config_mirror = @import("config_mirror.zig");
 pub const reserved = @import("reserved.zig");
+pub const ssrf = @import("rove-ssrf");
 pub const session = @import("session.zig");
 pub const deployment_loader = @import("deployment_loader.zig");
 pub const DeploymentLoader = deployment_loader.DeploymentLoader;

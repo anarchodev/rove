@@ -307,6 +307,28 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   enforcement at `put`/`seal`/`receive` before bytes land; whether `onHeaders`
   composes with `default`/`onChunk` in one module or is exclusive.
 
+### 3.8 Outbound gate wired; customer fetches do not follow redirects
+- **Decision** (shipped 2026-06-11; closes the PLAN §2.6 wiring gap): every
+  customer-supplied outbound URL passes `rove-ssrf.checkUrl` per attempt
+  (scheme = `https` / TLS-always, every resolved address blocklist-checked),
+  the full vetted address set is pinned via `CURLOPT_RESOLVE` (rebinding
+  defense without losing curl's multi-address connect fallback), transfers are
+  protocol-restricted to `http,https`, and **`http.fetch` does not follow
+  redirects** — the handler receives the 3xx and composes its own follow,
+  which re-enters the gate as a fresh fetch. As-built:
+  `architecture/routing-and-ingress.md` "Outbound policy gate".
+- **Why redirects-off**: libcurl-internal redirect hops bypass the gate (a
+  public URL can 302 to the metadata IP). Surfacing the 3xx is the one safe
+  semantic (per the simplicity/safety default); auto-follow-with-per-hop-gate
+  is a later opt-in if real demand appears. The trusted `rove-blob.internal`
+  door keeps following (platform-controlled URL; S3 307s).
+- **Test hatch**: `REWIND_UNSAFE_OUTBOUND=1` env relaxes only loopback +
+  TLS-always for smoke topologies (metadata range unconditionally blocked);
+  there is no production relax knob.
+- **Rejected**: first-address-only pinning — kills the v6→v4 connect fallback
+  (`*.localhost` resolves to `::1` first; a v4-only listener then refuses) —
+  the gate vets ALL addresses, so pinning all is strictly safer AND compatible.
+
 ---
 
 ## 4. Handler surface
