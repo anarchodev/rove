@@ -1375,6 +1375,14 @@ fn resumeContinuation(
     const cont_path = c.path;
     const cont_fn_name = c.fn_name;
     const cont_ctx_json = c.ctx_json;
+    // Snapshot for log records: `cont_path` borrows into desc.cont's
+    // backing memory, which a write-repark (`proposeAndParkContResume`
+    // `.repark` arm) or an in-place cont refresh FREES before the
+    // post-propose captureLogWithId sites run — the same UAF class
+    // `resumeIntoStream`'s `cont_path_for_log` snapshot guards (a
+    // surfaced log record carried freed bytes as its path).
+    const cont_path_log = allocator.dupe(u8, cont_path) catch &.{};
+    defer if (cont_path_log.len > 0) allocator.free(cont_path_log);
     const path = cont_path;
     var dep = try resolveDeployment(worker, allocator, tenant_id, path);
     defer dep.tc.release();
@@ -1494,7 +1502,7 @@ fn resumeContinuation(
                 // source = send_callback so the row shares the chain
                 // id with the inbound entry and the replay UX groups
                 // them.
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, act_src, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, act_src, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1552,14 +1560,14 @@ fn resumeContinuation(
                     txn_owned = false; // helper destroyed it
                     txn_done = true;
                     resolveParked(worker, ent, sid, sess, 500, "continuation write replication failed\n") catch {};
-                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, corr_id, act_src, 0);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", dep_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, corr_id, act_src, 0);
                     return;
                 };
                 // proposeAndParkContResume took ownership of txn (moved
                 // into pending_txns) and body_dup (stamped onto entity).
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, st, .ok, console_owned, exception_owned, .{}, corr_id, act_src, cont_seq);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", dep_id, now_ns, st, .ok, console_owned, exception_owned, .{}, corr_id, act_src, cont_seq);
                 if (pending_fetches.items.len > 0) std.log.warn(
                     "rove-js cont-resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ pending_fetches.items.len, tenant_id },
@@ -1577,7 +1585,7 @@ fn resumeContinuation(
             flushResumeFetches(worker, ent, &pending_fetches, false);
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
             try resolveParked(worker, ent, sid, sess, st, r.body);
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, act_src, 0);
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, act_src, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -1672,7 +1680,7 @@ fn resumeContinuation(
                     txn_owned = false;
                     txn_done = true;
                     resolveParked(worker, ent, sid, sess, 500, "continuation write replication failed\n") catch {};
-                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_id, act_src, 0);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", dep_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_id, act_src, 0);
                     return;
                 };
                 txn_owned = false;
@@ -1680,7 +1688,7 @@ fn resumeContinuation(
                 // Log the repark hop's tape row. status=0 (parked,
                 // same as the inbound trampoline open hop's
                 // captureSuccess shape).
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", dep_id, now_ns, 0, .ok, &.{}, &.{}, .{}, corr_id, act_src, repark_seq);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", dep_id, now_ns, 0, .ok, &.{}, &.{}, .{}, corr_id, act_src, repark_seq);
                 if (pending_fetches.items.len > 0) std.log.warn(
                     "rove-js cont-resume: {d} connection-scoped fetch(es) from a WRITING repark dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ pending_fetches.items.len, tenant_id },
@@ -1787,6 +1795,14 @@ pub fn resumeBoundFetchChain(
     const tenant_id = chain.tenant_id;
     const correlation_id = chain.correlation_id;
     const cont_path = c.path;
+    // Snapshot for log records: `cont_path` borrows into desc.cont's
+    // backing memory, which a write-repark (`proposeAndParkContResume`
+    // `.repark` arm) or an in-place cont refresh FREES before the
+    // post-propose captureLogWithId sites run — the same UAF class
+    // `resumeIntoStream`'s `cont_path_for_log` snapshot guards (a
+    // surfaced log record carried freed bytes as its path).
+    const cont_path_log = allocator.dupe(u8, cont_path) catch &.{};
+    defer if (cont_path_log.len > 0) allocator.free(cont_path_log);
     const path = cont_path;
     var dep = resolveDeployment(worker, allocator, tenant_id, path) catch |err| {
         std.log.warn(
@@ -1951,7 +1967,7 @@ pub fn resumeBoundFetchChain(
                 txn.rollback() catch {};
                 txn_done = true;
                 resolveParked(worker, ent, sid, sess, 500, "bound-fetch handler exception\n") catch {};
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, .fetch_chunk, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, .fetch_chunk, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1998,12 +2014,12 @@ pub fn resumeBoundFetchChain(
                     txn_owned = false;
                     txn_done = true;
                     resolveParked(worker, ent, sid, sess, 500, "bound-fetch replication failed\n") catch {};
-                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, correlation_id, .fetch_chunk, 0);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, correlation_id, .fetch_chunk, 0);
                     return;
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, .{}, correlation_id, .fetch_chunk, seq);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, .{}, correlation_id, .fetch_chunk, seq);
                 if (pending_fetches.items.len > 0) std.log.warn(
                     "rove-js bound-fetch resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ pending_fetches.items.len, tenant_id },
@@ -2020,7 +2036,7 @@ pub fn resumeBoundFetchChain(
             // fetches drop (scope rule), unbound ones still fire.
             flushResumeFetches(worker, ent, &pending_fetches, false);
             resolveParked(worker, ent, sid, sess, st, r.body) catch {};
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, .fetch_chunk, 0);
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, .fetch_chunk, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -2082,7 +2098,7 @@ pub fn resumeBoundFetchChain(
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, .fetch_chunk, seq);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, .fetch_chunk, seq);
                 if (pending_fetches.items.len > 0) std.log.warn(
                     "rove-js bound-fetch resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ pending_fetches.items.len, tenant_id },
@@ -2765,6 +2781,80 @@ pub fn scanAndCancelBoundFetches(worker: anytype, ent: rove.Entity) void {
 /// read-your-writes are collection membership: chunk K+1 cannot fire
 /// until chunk K's activation (and, if it wrote, its raft commit)
 /// returned the entity to the parked collection.
+/// Release every in-flight coordinator park a job holds (kill /
+/// teardown paths — nobody will poll them to completion, and the
+/// coordinator retains a RAM copy per submission until released).
+pub fn releaseInboundChunkParks(worker: anytype, job: anytype) void {
+    const coord = worker.node.blob_coord.coordinator orelse return;
+    for (job.prepared.items) |*pf| {
+        if (pf.coord == .pending) {
+            _ = coord.release(pf.wid, pf.seq);
+            pf.coord = .failed;
+        }
+    }
+}
+
+/// Resolve a held chunk chain with a defined 5xx and stop feeding it —
+/// the pump's failure exit (durability gate down / submit failed). The
+/// entity goes through `resolveParked` (the standard parked-chain
+/// resolution); the killed job is reclaimed by the janitor once the
+/// entity is stale.
+fn failInboundChunkChain(worker: anytype, ent: rove.Entity, job: anytype, msg: []const u8) void {
+    const server = worker.h2;
+    releaseInboundChunkParks(worker, job);
+    job.kill();
+    const sid_ptr = server.reg.get(ent, &worker.parked_continuations, h2.StreamId) catch return;
+    const sess_ptr = server.reg.get(ent, &worker.parked_continuations, h2.Session) catch return;
+    resolveParked(worker, ent, sid_ptr.*, sess_ptr.*, 503, msg) catch {};
+}
+
+/// Advance every prepared fire's durability park (the chunk-tape gate,
+/// the resume-fire twin of the dispatch body-gate): submit every
+/// `.unsubmitted` payload to the blob coordinator IMMEDIATELY — the
+/// whole queue pipelines, so S3 round-trips amortize across fires
+/// instead of serializing (the fetch-chunk spool posture) — and poll
+/// `.pending` ones to `.resolved` (materialized wire BodyRef) or
+/// `.failed`. ≤ inline-threshold payloads skip the park (`.inline_ok`:
+/// the raft entry's fsync is the durability substrate). Returns false
+/// if the head is terminally failed (caller fails the chain).
+fn advanceInboundChunkGate(worker: anytype, job: anytype) bool {
+    if (job.prepared.items.len == 0) return true;
+    const coord = worker.node.blob_coord.coordinator orelse {
+        // No coordinator: only inline-sized fires can proceed; a
+        // > threshold head is a hard gate failure.
+        const h = job.head() orelse return true;
+        return h.coord == .inline_ok;
+    };
+    for (job.prepared.items) |*pf| {
+        switch (pf.coord) {
+            .unsubmitted => {
+                const wid: u8 = @intCast(worker.log_worker_id);
+                if (coord.submit(wid, pf.bytes)) |seq| {
+                    pf.wid = wid;
+                    pf.seq = seq;
+                    pf.coord = .pending;
+                } else |err| {
+                    std.log.warn("rove-js inbound-chunk: coord.submit bytes={d}: {s}", .{ pf.bytes.len, @errorName(err) });
+                    pf.coord = .failed;
+                }
+            },
+            .pending => switch (pollDurableBodyRef(coord, pf.wid, pf.seq, "chunk-gate", "")) {
+                .not_yet => {},
+                .failed => pf.coord = .failed,
+                .ready => |ref| {
+                    pf.batch_id = ref.batch_id;
+                    pf.ref_offset = ref.offset;
+                    pf.ref_len = ref.len;
+                    pf.coord = .resolved;
+                },
+            },
+            .inline_ok, .resolved, .failed => {},
+        }
+    }
+    const h = job.head() orelse return true;
+    return h.coord != .failed;
+}
+
 pub fn pumpInboundChunks(worker: anytype) void {
     const server = worker.h2;
     var done: std.ArrayListUnmanaged(rove.Entity) = .empty;
@@ -2776,9 +2866,28 @@ pub fn pumpInboundChunks(worker: anytype) void {
         if (server.reg.isStale(ent)) {
             // The request finished (terminal shipped + cleaned) or the
             // connection died (disconnect teardown ran). Either way the
-            // chain's own machinery resolved the entity; reclaim the job.
+            // chain's own machinery resolved the entity; reclaim the
+            // job (releasing any in-flight durability parks).
+            releaseInboundChunkParks(worker, job);
             job.kill();
             done.append(worker.allocator, ent) catch {};
+            continue;
+        }
+        if (job.dead or job.classic_fallback) continue; // 413'd / classic re-walk owns it
+        // Prepare + advance durability EVERY tick regardless of the
+        // entity's state — submissions pipeline while earlier fires
+        // execute (including before/during the dispatchOnce first
+        // fire), so the gate's S3 round-trip is off the serial path.
+        _ = job.prepareFires();
+        if (!advanceInboundChunkGate(worker, job)) {
+            if (server.reg.isInCollection(ent, &worker.parked_continuations)) {
+                failInboundChunkChain(worker, ent, job, "chunk durability gate failed\n");
+            } else {
+                // First fire not parked yet — let the dispatch walk
+                // surface the failure; mark dead so nothing fires.
+                releaseInboundChunkParks(worker, job);
+                job.kill();
+            }
             continue;
         }
         if (!job.first_fired) continue; // dispatchOnce owns the probe fire
@@ -2799,14 +2908,8 @@ pub fn pumpInboundChunks(worker: anytype) void {
             // job just stops feeding. Reclaim on the stale sweep above.
             continue;
         }
-        // Re-dispatch a staged-but-skipped fire (a transient failure
-        // below left it unconsumed) before staging anything new —
-        // staging past it would silently drop its bytes while keeping
-        // seqs contiguous (the bug the first smoke run caught).
-        if (job.staged == null or job.staged_consumed) {
-            if (!job.fireReady()) continue;
-            if (!job.stageFire()) continue; // OOM — retry next tick
-        }
+        const h = job.head() orelse continue; // nothing prepared yet
+        if (h.coord != .inline_ok and h.coord != .resolved) continue; // durability pending
         if (resumeInboundChunk(worker, ent, job)) job.fireDispatched();
     }
     for (done.items) |ent| {
@@ -2817,8 +2920,9 @@ pub fn pumpInboundChunks(worker: anytype) void {
 /// Resume a held chain with the next inbound body chunk — the
 /// `.inbound_chunk` sibling of `resumeBoundFetchChain` (same shape:
 /// parked entity + raw chunk bytes + named-export dispatch + the
-/// `finishResponse` stream bridge). `job.staged` carries the payload;
-/// the per-fire fields come from the job's dispatch-side bookkeeping.
+/// `finishResponse` stream bridge). The job's head fire carries the
+/// payload + its durability park; the per-fire fields come from the
+/// job's dispatch-side bookkeeping.
 /// Returns true iff the activation ran (the caller advances the job's
 /// fire bookkeeping only then); a pre-dispatch failure — transient txn
 /// conflict, deployment resolve — leaves the staged fire unconsumed
@@ -2834,6 +2938,14 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
     const correlation_id = chain.correlation_id;
     const cont_path = c.path;
     const cont_ctx_json = c.ctx_json;
+    // Snapshot for log records: `cont_path` borrows into desc.cont's
+    // backing memory, which a write-repark (`proposeAndParkContResume`
+    // `.repark` arm) or an in-place cont refresh FREES before the
+    // post-propose captureLogWithId sites run — the same UAF class
+    // `resumeIntoStream`'s `cont_path_for_log` snapshot guards (a
+    // surfaced log record carried freed bytes as its path).
+    const cont_path_log = allocator.dupe(u8, cont_path) catch &.{};
+    defer if (cont_path_log.len > 0) allocator.free(cont_path_log);
     const path = cont_path;
     var dep = resolveDeployment(worker, allocator, tenant_id, path) catch |err| {
         std.log.warn(
@@ -2847,7 +2959,8 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
     const tc = dep.tc;
     const bc = dep.bc;
 
-    const chunk_bytes: []const u8 = job.staged orelse return false;
+    const head_fire = job.head() orelse return false;
+    const chunk_bytes: []const u8 = head_fire.bytes;
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return false;
     defer allocator.free(spath);
 
@@ -2877,6 +2990,33 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
         const cnt = server.reg.get(ent, &worker.parked_continuations, components_mod.BoundFetchCount) catch break :blk 0;
         break :blk cnt.pending;
     };
+
+    // Chunk-tape: record this fire's input bytes on the readset's
+    // trigger_payload channel — the same two-path rule as the classic
+    // inbound body-gate. ≤ inline threshold: bytes ride inline (the
+    // raft entry's fsync is durability). Larger: the pump already
+    // parked the payload on the blob coordinator and materialized the
+    // wire BodyRef (head_fire.batch_id/...); record the pointer. The
+    // readset rides the raft entry (follower replay) AND serializes
+    // into the LogRecord tapes below (dashboard replay).
+    if (chunk_bytes.len > 0 and chunk_bytes.len <= worker_mod.REQUEST_BODY_CAP) {
+        const inline_ref: bodies_mod.BodyRef = .{
+            .batch_id = bodies_mod.NO_BATCH,
+            .offset = 0,
+            .len = @intCast(chunk_bytes.len),
+        };
+        readset.trigger_payload.appendTriggerPayload(inline_ref, "", chunk_bytes) catch |err| {
+            std.log.warn("rove-js inbound-chunk: trigger_payload append (inline): {s}", .{@errorName(err)});
+        };
+    } else if (chunk_bytes.len > 0) {
+        readset.trigger_payload.appendTriggerPayload(.{
+            .batch_id = head_fire.batch_id,
+            .offset = head_fire.ref_offset,
+            .len = head_fire.ref_len,
+        }, "", "") catch |err| {
+            std.log.warn("rove-js inbound-chunk: trigger_payload append (ref): {s}", .{@errorName(err)});
+        };
+    }
 
     // A chunk handler may stream (`stream.start`/`stream.write` +
     // `next()` — the finishResponse bridge) and may fetch
@@ -2910,7 +3050,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
         .activation = .{ .inbound_chunk = .{
             .seq = job.next_seq,
             .byte_offset = job.fired_offset,
-            .done = job.staged_done,
+            .done = head_fire.done,
             .ctx_json = if (cont_ctx_json.len > 0) cont_ctx_json else null,
         } },
         .activation_entity = ent,
@@ -2966,7 +3106,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
                 txn.rollback() catch {};
                 txn_done = true;
                 resolveParked(worker, ent, sid, sess, 500, "inbound-chunk handler exception\n") catch {};
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, .inbound_chunk, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, .inbound_chunk, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return true;
@@ -3013,12 +3153,12 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
                     txn_owned = false;
                     txn_done = true;
                     resolveParked(worker, ent, sid, sess, 500, "inbound-chunk replication failed\n") catch {};
-                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, correlation_id, .inbound_chunk, 0);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .fault, console_owned, exception_owned, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, .inbound_chunk, 0);
                     return true;
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, .{}, correlation_id, .inbound_chunk, seq);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, .inbound_chunk, seq);
                 return true;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -3029,7 +3169,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
             txn_done = true;
             flushResumeFetches(worker, ent, &pending_fetches, false);
             resolveParked(worker, ent, sid, sess, st, r.body) catch {};
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, .inbound_chunk, 0);
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, .inbound_chunk, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -3083,7 +3223,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, .inbound_chunk, seq);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, .inbound_chunk, seq);
                 if (pending_fetches.items.len > 0) std.log.warn(
                     "rove-js inbound-chunk resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ pending_fetches.items.len, tenant_id },
@@ -3107,6 +3247,12 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
             mutable_desc.bound_schedule_id = new_bound_sched_id;
             mutable_desc.deadline_ns = now_ns + CONT_HOLD_DEADLINE_NS;
             flushResumeFetches(worker, ent, &pending_fetches, true);
+            // Chunk-tape: a read-only repark is still a recorded
+            // activation (a ctx-only accumulating handler hops
+            // read-only on EVERY chunk — without this record the
+            // upload would be unreplayable). Status 0 = the
+            // parked-hop convention.
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, .inbound_chunk, 0);
         },
         .stream => |*s| {
             resumeIntoStream(worker, s, .{
