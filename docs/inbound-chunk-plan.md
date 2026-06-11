@@ -122,10 +122,13 @@ body inbound → respond + `flipInboundBodyToDiscard` (exists).
   proxy (`src/front/proxy.zig`) forwards h2 request bodies as they
   arrive (headers-first end to end), so chunked uploads work THROUGH
   the edge — `scripts/front_streaming_smoke_v2.py` multi-fires a 12 MB
-  upload via the front. h1 ingress still buffers (next bullet).
-- **h1 bodies** arrive complete (no early emission), so an onChunk
-  module gets them as one ≤16 MB single fire — fine semantically, but
-  the h1 path never streams.
+  upload via the front.
+- ~~**h1 bodies.**~~ Shipped 2026-06-11: an incomplete-at-parse h1 body
+  early-emits and streams through the same `BodyMode` machinery as h2
+  (read-parking as backpressure, decision-gated 100-continue) — an h1
+  upload multi-fires `onChunk` worker-direct AND through the front;
+  `scripts/h1_streaming_smoke_v2.py`. See
+  `architecture/routing-and-ingress.md` (HTTP/1.1 ingress).
 - **Client-abort smoke.** Mid-upload disconnect exercises the
   sink-abort + held-chain disconnect teardown; covered by code paths
   shared with WS/streaming but not yet asserted end-to-end.
