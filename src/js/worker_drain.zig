@@ -2799,10 +2799,15 @@ pub fn pumpInboundChunks(worker: anytype) void {
             // job just stops feeding. Reclaim on the stale sweep above.
             continue;
         }
-        if (!job.fireReady()) continue;
-        if (!job.stageFire()) continue; // OOM — retry next tick
-        resumeInboundChunk(worker, ent, job);
-        job.fireDispatched();
+        // Re-dispatch a staged-but-skipped fire (a transient failure
+        // below left it unconsumed) before staging anything new —
+        // staging past it would silently drop its bytes while keeping
+        // seqs contiguous (the bug the first smoke run caught).
+        if (job.staged == null or job.staged_consumed) {
+            if (!job.fireReady()) continue;
+            if (!job.stageFire()) continue; // OOM — retry next tick
+        }
+        if (resumeInboundChunk(worker, ent, job)) job.fireDispatched();
     }
     for (done.items) |ent| {
         if (worker.inbound_chunk_jobs.fetchRemove(ent)) |kv| kv.value.unref();
@@ -2814,13 +2819,17 @@ pub fn pumpInboundChunks(worker: anytype) void {
 /// parked entity + raw chunk bytes + named-export dispatch + the
 /// `finishResponse` stream bridge). `job.staged` carries the payload;
 /// the per-fire fields come from the job's dispatch-side bookkeeping.
-fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) void {
+/// Returns true iff the activation ran (the caller advances the job's
+/// fire bookkeeping only then); a pre-dispatch failure — transient txn
+/// conflict, deployment resolve — leaves the staged fire unconsumed
+/// for the next tick's retry.
+fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
     const allocator = worker.allocator;
     const server = worker.h2;
-    if (!server.reg.isInCollection(ent, &worker.parked_continuations)) return; // resolve-once
-    const desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return;
-    const chain = server.reg.get(ent, &worker.parked_continuations, components_mod.ChainContext) catch return;
-    const c = desc.cont orelse return;
+    if (!server.reg.isInCollection(ent, &worker.parked_continuations)) return false; // resolve-once
+    const desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return false;
+    const chain = server.reg.get(ent, &worker.parked_continuations, components_mod.ChainContext) catch return false;
+    const c = desc.cont orelse return false;
     const tenant_id = chain.tenant_id;
     const correlation_id = chain.correlation_id;
     const cont_path = c.path;
@@ -2831,21 +2840,26 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) void {
             "rove-js inbound-chunk resume: resolveDeployment tenant={s} module={s}: {s}",
             .{ tenant_id, path, @errorName(err) },
         );
-        return;
+        return false;
     };
     defer dep.tc.release();
     const inst = dep.inst;
     const tc = dep.tc;
     const bc = dep.bc;
 
-    const chunk_bytes: []const u8 = job.staged orelse return;
-    const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
+    const chunk_bytes: []const u8 = job.staged orelse return false;
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return false;
     defer allocator.free(spath);
 
-    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return;
+    const txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch return false;
     var txn_owned = true;
     defer if (txn_owned) allocator.destroy(txn);
-    txn.* = inst.kv.beginTrackedImmediate() catch return;
+    txn.* = inst.kv.beginTrackedImmediate() catch |berr| {
+        // Transient (e.g. chain-head conflict with a just-committed
+        // hop): the staged fire stays unconsumed; next tick retries.
+        std.log.debug("rove-js inbound-chunk: beginTracked deferred: {s}", .{@errorName(berr)});
+        return false;
+    };
     var txn_done = false;
     defer if (!txn_done) txn.rollback() catch {};
 
@@ -2878,11 +2892,21 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) void {
         pending_fetches.deinit(allocator);
     }
 
+    // The inbound request's headers ride the held entity (ReqHeaders is
+    // in the base Row) — every chunk activation sees the same
+    // `request.headers` the first one did (handler-shape §5.3 reads
+    // them per chunk).
+    const req_headers: ?h2.ReqHeaders = blk: {
+        const p = server.reg.get(ent, &worker.parked_continuations, h2.ReqHeaders) catch break :blk null;
+        break :blk p.*;
+    };
+
     const req: Request = .{
         .method = "POST",
         .path = spath,
         .body = chunk_bytes,
         .query = null,
+        .headers = req_headers,
         .activation = .{ .inbound_chunk = .{
             .seq = job.next_seq,
             .byte_offset = job.fired_offset,
@@ -2909,8 +2933,8 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) void {
         },
     };
 
-    const sid_ptr = server.reg.get(ent, &worker.parked_continuations, h2.StreamId) catch return;
-    const sess_ptr = server.reg.get(ent, &worker.parked_continuations, h2.Session) catch return;
+    const sid_ptr = server.reg.get(ent, &worker.parked_continuations, h2.StreamId) catch return false;
+    const sess_ptr = server.reg.get(ent, &worker.parked_continuations, h2.Session) catch return false;
     const sid = sid_ptr.*;
     const sess = sess_ptr.*;
 
@@ -2929,7 +2953,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) void {
         txn.rollback() catch {};
         txn_done = true;
         resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "inbound-chunk handler error\n") catch {};
-        return;
+        return true;
     };
 
     const wrote = ws.ops.items.len > 0;
@@ -2945,7 +2969,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) void {
                 captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, .inbound_chunk, 0);
                 r.console = &.{};
                 r.exception = &.{};
-                return;
+                return true;
             }
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
             if (wrote) {
@@ -2953,7 +2977,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) void {
                     txn.rollback() catch {};
                     txn_done = true;
                     resolveParked(worker, ent, sid, sess, 500, "inbound-chunk alloc failed\n") catch {};
-                    return;
+                    return true;
                 };
                 const lh: log_mod.LogHeader = .{
                     .request_id = request_id,
@@ -2990,12 +3014,12 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) void {
                     txn_done = true;
                     resolveParked(worker, ent, sid, sess, 500, "inbound-chunk replication failed\n") catch {};
                     captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, correlation_id, .inbound_chunk, 0);
-                    return;
+                    return true;
                 };
                 txn_owned = false;
                 txn_done = true;
                 captureLogWithId(worker, tenant_id, request_id, "POST", cont_path, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, .{}, correlation_id, .inbound_chunk, seq);
-                return;
+                return true;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
                 "resumeInboundChunk.commit(terminal_ro)",
@@ -3055,7 +3079,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) void {
                     txn_owned = false;
                     txn_done = true;
                     resolveParked(worker, ent, sid, sess, 500, "inbound-chunk replication failed\n") catch {};
-                    return;
+                    return true;
                 };
                 txn_owned = false;
                 txn_done = true;
@@ -3064,7 +3088,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) void {
                     "rove-js inbound-chunk resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ pending_fetches.items.len, tenant_id },
                 );
-                return;
+                return true;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
                 "resumeInboundChunk.commit(repark_ro)",
@@ -3072,7 +3096,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) void {
                 .{@errorName(e)},
             );
             txn_done = true;
-            const mutable_desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return;
+            const mutable_desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return true;
             if (mutable_desc.cont) |*old_c| old_c.deinit(allocator);
             mutable_desc.cont = c2m;
             if (mutable_desc.bound_schedule_id) |old_b| {
@@ -3113,4 +3137,5 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) void {
             resolveParked(worker, ent, sid, sess, 500, "export probe on a resume path\n") catch {};
         },
     }
+    return true;
 }

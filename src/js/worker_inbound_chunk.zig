@@ -31,8 +31,14 @@ pub const MAX_FIRE_BYTES: usize = 256 * 1024;
 
 const Chunk = struct {
     bytes: []u8,
-    /// Flow-control window to repay when this chunk's fire resolves.
-    /// 0 for bytes accepted during the accumulating phase (pre-repaid).
+    /// Bytes already consumed into earlier fires (a single push can be
+    /// far larger than MAX_FIRE_BYTES — the h2 `.hold` handover at
+    /// sink-attach delivers everything buffered so far as ONE push —
+    /// so staging slices big chunks instead of firing them whole).
+    consumed: usize = 0,
+    /// Flow-control window to repay when this chunk's LAST slice
+    /// fires. 0 for bytes accepted during the accumulating phase
+    /// (pre-repaid).
     repay: u32,
 };
 
@@ -73,6 +79,13 @@ pub const Job = struct {
     staged: ?[]u8 = null,
     staged_repay: u32 = 0,
     staged_done: bool = false,
+    /// False while `staged` awaits its dispatch. A staged fire can be
+    /// skipped between staging and dispatch (anchor mismatch, busy
+    /// tenant, a transient txn conflict on the resume path) — the next
+    /// attempt MUST re-dispatch the same staged payload, never stage
+    /// past it (that silently drops bytes while keeping seqs
+    /// contiguous — the exact bug the first smoke run caught).
+    staged_consumed: bool = true,
 
     /// Window bytes whose fire resolved but aren't reported to h2 yet.
     unrepaid: u32 = 0,
@@ -179,30 +192,49 @@ pub const Job = struct {
     /// borrowed as `Request.body` through the whole activation) is
     /// freed here, not in `fireDispatched`.
     pub fn stageFire(self: *Job) bool {
+        // Never stage past an undispatched fire.
+        std.debug.assert(self.staged == null or self.staged_consumed);
         if (self.staged) |s| {
             self.allocator.free(s);
             self.staged = null;
         }
-        var take_n: usize = 0;
+        // Plan the take: whole chunks while under the bound, plus a
+        // partial slice of the next one if it alone exceeds the
+        // remaining budget (the `.hold` handover at sink-attach can be
+        // one giant push). A chunk's window repay rides its LAST slice.
+        var take_n: usize = 0; // fully-consumed chunks
         var take_bytes: usize = 0;
         var take_repay: u32 = 0;
+        var partial: usize = 0; // bytes taken from chunks[take_n]
         for (self.chunks.items) |ch| {
-            if (take_n > 0 and take_bytes + ch.bytes.len > MAX_FIRE_BYTES) break;
+            const remaining = ch.bytes.len - ch.consumed;
+            if (take_bytes + remaining > MAX_FIRE_BYTES) {
+                partial = MAX_FIRE_BYTES - take_bytes;
+                take_bytes += partial;
+                break;
+            }
             take_n += 1;
-            take_bytes += ch.bytes.len;
+            take_bytes += remaining;
             take_repay +%= ch.repay;
         }
         const buf = self.allocator.alloc(u8, take_bytes) catch return false;
         var off: usize = 0;
         for (self.chunks.items[0..take_n]) |ch| {
-            @memcpy(buf[off .. off + ch.bytes.len], ch.bytes);
-            off += ch.bytes.len;
+            const rest = ch.bytes[ch.consumed..];
+            @memcpy(buf[off .. off + rest.len], rest);
+            off += rest.len;
             self.allocator.free(ch.bytes);
+        }
+        if (partial > 0) {
+            const ch = &self.chunks.items[take_n];
+            @memcpy(buf[off .. off + partial], ch.bytes[ch.consumed .. ch.consumed + partial]);
+            ch.consumed += partial;
         }
         self.chunks.replaceRangeAssumeCapacity(0, take_n, &.{});
         self.staged = buf;
         self.staged_repay = take_repay;
         self.staged_done = self.eof and self.chunks.items.len == 0;
+        self.staged_consumed = false;
         return true;
     }
 
@@ -214,6 +246,8 @@ pub const Job = struct {
     /// job's deinit reclaims it.
     pub fn fireDispatched(self: *Job) void {
         const s = self.staged orelse return;
+        if (self.staged_consumed) return; // idempotent
+        self.staged_consumed = true;
         self.fired_offset += s.len;
         self.next_seq += 1;
         self.first_fired = true;
