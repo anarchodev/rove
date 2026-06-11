@@ -2723,6 +2723,22 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // size the bucket, not to bypass it. Runs BEFORE static
         // dispatch so static file requests count against the bucket
         // too. On exhaustion: 429 + Retry-After header.
+        // Gap-2.4 chunk wait: an armed sink entity whose head fire
+        // isn't ready (bytes still arriving / durability park in
+        // flight) idles in request_out across many walks — skip it
+        // BEFORE the rate check or every waiting tick charges a
+        // request token (the first walk charged on arm; the firing
+        // walk charges below).
+        if (worker.inbound_chunk_jobs.get(ent)) |jb| {
+            if (!jb.classic_fallback and !jb.dead) {
+                const fireable = if (jb.head()) |h|
+                    (h.coord == .inline_ok or h.coord == .resolved)
+                else
+                    false;
+                if (!fireable) continue;
+            }
+        }
+
         // Per-tenant plan: rate caps + body cap + retention all resolve from
         // the slot's cached plan (docs/plan-tiers.md). `plan_gen` lets the
         // limiter re-snapshot caps when a tier change lands (Lever 1).
@@ -2853,26 +2869,29 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     };
                 if (job.classic_fallback) {
                     // `no_onchunk` probe miss on a complete ≤cap body:
-                    // dispatch classic with the staged payload (the
+                    // dispatch classic with the prepared payload (the
                     // sink consumed the bytes, so h2 can't re-buffer).
-                    body = job.staged orelse "";
-                } else if (job.staged != null and !job.staged_consumed) {
-                    // A staged fire was skipped after staging (anchor
-                    // mismatch / busy tenant below `continue`d this
-                    // entity): re-dispatch the SAME payload — staging
-                    // past it would drop its bytes.
-                    body = job.staged.?;
-                    chunk_dispatch = true;
-                } else if (job.fireReady()) {
-                    if (!job.stageFire()) {
-                        processed += 1;
-                        continue; // OOM — retry next walk
-                    }
-                    body = job.staged.?;
-                    chunk_dispatch = true;
+                    body = if (job.head()) |h| h.bytes else "";
                 } else {
-                    // Bytes still arriving; nothing to do this walk.
-                    continue;
+                    // Prepare arrival-time fires; the head re-dispatches
+                    // idempotently if a prior walk skipped it (anchor
+                    // mismatch / busy tenant) — firing past it would
+                    // drop its bytes. > inline-threshold heads wait for
+                    // the pump's durability gate (`.resolved`).
+                    _ = job.prepareFires();
+                    if (job.head()) |h| {
+                        if (h.coord == .inline_ok or h.coord == .resolved) {
+                            body = h.bytes;
+                            chunk_dispatch = true;
+                        } else {
+                            // Durability park in flight (the pump
+                            // submits + polls); nothing to do this walk.
+                            continue;
+                        }
+                    } else {
+                        // Bytes still arriving; nothing to do this walk.
+                        continue;
+                    }
                 }
             } else {
                 // Classic buffered path. Pre-buffer reject on the
@@ -3026,8 +3045,38 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // without unduly inflating the per-entry size.
         const INBOUND_INLINE_THRESHOLD: usize = 16 * 1024;
 
+        // Gap-2.4 chunk-tape: a sink-fed chunk fire owns its OWN
+        // durability story — the JOB parked the payload on the blob
+        // coordinator (the pump's gate) and the head is fire-able only
+        // when inline-sized or resolved. Record the trigger_payload
+        // here (the classic gate below is for h2-buffered bodies and
+        // would double-submit + wrongly park the entity), then skip it.
+        // The h1 / body-complete-at-emission single-fire has no job and
+        // takes the classic gate like any buffered body.
+        const chunk_job_opt = if (chunk_dispatch) worker.inbound_chunk_jobs.get(ent) else null;
         var body_gate_failed = false;
-        switch (body_wait.status) {
+        if (chunk_job_opt) |chunk_job| gate: {
+            const h = chunk_job.head() orelse break :gate;
+            if (h.bytes.len == 0) break :gate;
+            if (h.coord == .inline_ok) {
+                const inline_ref: bodies_mod.BodyRef = .{
+                    .batch_id = bodies_mod.NO_BATCH,
+                    .offset = 0,
+                    .len = @intCast(h.bytes.len),
+                };
+                readset.trigger_payload.appendTriggerPayload(inline_ref, "", h.bytes) catch |err| {
+                    std.log.warn("rove-js inbound-chunk: trigger_payload append (inline, first fire): {s}", .{@errorName(err)});
+                };
+            } else {
+                readset.trigger_payload.appendTriggerPayload(.{
+                    .batch_id = h.batch_id,
+                    .offset = h.ref_offset,
+                    .len = h.ref_len,
+                }, "", "") catch |err| {
+                    std.log.warn("rove-js inbound-chunk: trigger_payload append (ref, first fire): {s}", .{@errorName(err)});
+                };
+            }
+        } else switch (body_wait.status) {
             .resolved => {
                 // Resume from park — drainBodyPending verified
                 // durability before moving the entity back; the saved
@@ -3207,15 +3256,18 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .activation = if (headers_first_dispatch)
                 .inbound_headers
             else if (chunk_dispatch) blk: {
-                // Staged sink fire (S2): per-chunk fields from the
-                // job. No job (h1 / body-complete-at-emission): the
-                // whole buffered body is chunk 0 and the last at once.
+                // Prepared sink fire (S2): per-chunk fields from the
+                // job's head. No job (h1 / body-complete-at-emission):
+                // the whole buffered body is chunk 0 and the last at
+                // once.
                 if (worker.inbound_chunk_jobs.get(ent)) |job| {
-                    break :blk dispatcher_mod.Activation{ .inbound_chunk = .{
-                        .seq = job.next_seq,
-                        .byte_offset = job.fired_offset,
-                        .done = job.staged_done,
-                    } };
+                    if (job.head()) |h| {
+                        break :blk dispatcher_mod.Activation{ .inbound_chunk = .{
+                            .seq = job.next_seq,
+                            .byte_offset = job.fired_offset,
+                            .done = h.done,
+                        } };
+                    }
                 }
                 break :blk dispatcher_mod.Activation{ .inbound_chunk = .{ .seq = 0, .byte_offset = 0, .done = true } };
             } else .inbound,
@@ -3441,6 +3493,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     if (job.eof and !job.firing) {
                         job.classic_fallback = true;
                     } else {
+                        worker_mod.releaseInboundChunkParks(worker, job);
                         job.kill();
                         try respb.setSimpleResponse(server, ent, sid, sess, 413, "payload too large\n", allocator);
                         worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 413, .handler_error, &.{}, &.{}, .{}, null, .inbound, 0);

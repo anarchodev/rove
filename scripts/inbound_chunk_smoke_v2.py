@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -147,6 +148,64 @@ def main() -> int:
         check("early terminal → 403",
               r.status == 403 or "403" in r.body,
               f"got {r.status} {r.body[:120]!r}")
+
+        # ── step 7 (chunk-tape follow-up): every chunk activation is a
+        # recorded, replayable log record. The worker's flusher PUTs the
+        # log batches to S3; a co-spawned log-server queries them back.
+        # Each `.inbound_chunk` record must carry a non-empty
+        # trigger_payload tape — inline bytes for ≤16 KB fires (the 1 KB
+        # single-fire), a coordinator BodyRef for larger ones (most of
+        # the 12 MB upload's 256 KB fires).
+        print("step 7: ⭐ per-chunk tape records queryable via log-server")
+        c.spawn_log_server()
+        rows = []
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            lr = c.log_get("acme/list?limit=400")
+            if lr.status == 200:
+                try:
+                    rows = [r2 for r2 in json.loads(lr.body).get("records", [])
+                            if "up/index" in r2.get("path", "")]
+                except json.JSONDecodeError:
+                    rows = []
+                # the 12 MB upload alone is ~50+ fires
+                if len(rows) >= 50:
+                    break
+            time.sleep(0.5)
+        check("≥50 chunk-hop records indexed", len(rows) >= 50, f"{len(rows)} rows")
+
+        sampled = 0
+        chunk_recs = 0
+        with_tape = 0
+        inline_seen = False
+        ref_seen = False
+        for row in rows[:40]:
+            sr = c.log_get(f"acme/show/{row['request_id']}")
+            if sr.status != 200:
+                continue
+            try:
+                rec = json.loads(sr.body)["record"]
+            except (json.JSONDecodeError, KeyError):
+                continue
+            sampled += 1
+            if rec.get("activation") != "inbound_chunk":
+                continue
+            chunk_recs += 1
+            tp = (rec.get("tapes") or {}).get("trigger_payload_tape_b64") or ""
+            if tp:
+                with_tape += 1
+                # A BodyRef-only entry serializes tiny; an inline entry
+                # carries the chunk bytes. Both forms must appear.
+                if len(tp) < 500:
+                    ref_seen = True
+                elif len(tp) > 1000:
+                    inline_seen = True
+        check("sampled chunk records all carry a trigger-payload tape",
+              chunk_recs > 0 and with_tape == chunk_recs,
+              f"sampled={sampled} chunk_recs={chunk_recs} with_tape={with_tape}")
+        check("both tape forms present (inline ≤16K + BodyRef >16K)",
+              inline_seen and ref_seen,
+              f"inline={inline_seen} ref={ref_seen}")
 
     print()
     if failures:
