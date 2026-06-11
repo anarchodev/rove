@@ -273,8 +273,9 @@ pub fn runMiddleware(
 }
 
 /// Evaluate the module top-level, drain jobs, look up `exports[fn]`
-/// (fn picked via `?fn=X` on GET or `{fn,args}` JSON body on POST),
-/// and call it with positional `args` spread in. The return value
+/// (fn = the resume path's `Request.fn_override`, else the activation
+/// kind's conventional export — `rpc_dispatch.parseDispatch`), and
+/// call it with positional `args` spread in. The return value
 /// becomes the response body; status/headers/cookies come from the
 /// ambient `response` global. See `Dispatcher.run` for the full
 /// contract.
@@ -290,16 +291,8 @@ pub fn runModule(
     const ns = try evalModule(d, rt, ctx, fun_val_in, budget, pending);
     defer c.JS_FreeValue(ctx.raw, ns);
 
-    // ── Resolve fn name + args JSON from the request. ─────────────
-    var dispatch = rpc_dispatch.parseDispatch(d.allocator, request) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.BadRequest => {
-            pending.status = 400;
-            pending.body = std.fmt.allocPrint(d.allocator,
-                "RPC envelope: `fn` must be a string and `args` must be an array\n", .{}) catch return error.OutOfMemory;
-            return;
-        },
-    };
+    // ── Resolve the target export + args for this activation. ─────
+    var dispatch = try rpc_dispatch.parseDispatch(d.allocator, request);
     defer dispatch.deinit(d.allocator);
 
     const fn_name_z = std.fmt.allocPrintSentinel(d.allocator, "{s}", .{dispatch.fn_name}, 0) catch

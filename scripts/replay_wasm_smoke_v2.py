@@ -35,7 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, _curl  # noqa: E402
+from smoke_lib_v2 import V2Cluster, _curl, rpc_wrap  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TENANT = "replay-demo"
@@ -93,7 +93,7 @@ def main() -> int:
 
         print("step 2: deploy the replay-demo handler (kv + random + date tape channels)")
         try:
-            dep_id = c.deploy_handlers(TENANT, {"index.mjs": HANDLER_SRC})
+            dep_id = c.deploy_handlers(TENANT, {"index.mjs": rpc_wrap(HANDLER_SRC)})
             check("deploy_handlers → dep_id", bool(dep_id), f"dep_id={dep_id}")
         except RuntimeError as e:
             check("deploy_handlers", False, str(e))

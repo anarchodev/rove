@@ -39,7 +39,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 # POST {value} writes kv["catchup/value"]; GET reads it back.
 HANDLER_SRC = """\
@@ -77,7 +77,7 @@ def main() -> int:
         lead = c.leader_node("acme")
         check("leader present pre-deploy", lead is not None, f"lead={lead}")
         try:
-            dep_id = c.deploy_handlers("acme", {"index.mjs": HANDLER_SRC},
+            dep_id = c.deploy_handlers("acme", {"index.mjs": rpc_wrap(HANDLER_SRC)},
                                        node=lead if lead is not None else 0)
             check("deploy_handlers → dep_id", bool(dep_id), f"dep_id={dep_id}")
         except RuntimeError as e:

@@ -164,13 +164,16 @@ pub const Dispatcher = struct {
     /// through `txn` (local durability + undo) AND `writeset` (raft
     /// replication).
     ///
-    /// The handler contract is shift-js-flavored RPC:
-    ///   - `bytecode` MUST be an ES module with named function exports.
-    ///     Non-module bytecode is a hard error (500).
-    ///   - The caller picks an export by name (`?fn=X` on GET, or
-    ///     `{fn:"X",args:[...]}` in the POST body).
-    ///   - `args` is a JSON array spread into positional arguments.
-    ///     Missing → `[]`. Malformed JSON → 400.
+    /// The handler contract:
+    ///   - `bytecode` MUST be an ES module. Non-module bytecode is a
+    ///     hard error (500).
+    ///   - The invoked export is the resume path's first-class target
+    ///     (`Request.fn_override`) or the activation kind's
+    ///     conventional export (`rpc_dispatch.parseDispatch`); the
+    ///     retired customer `?fn=`/`{fn,args}` shapes are opaque
+    ///     payload (decisions.md §4.5).
+    ///   - `Request.fn_args_json` is a JSON array spread into
+    ///     positional arguments (resume payloads: ctx / outcome).
     ///   - The handler's **return value** becomes the response body
     ///     (strings emit as-is; everything else is `JSON.stringify`'d).
     ///   - Status / headers / cookies flow through the ambient
@@ -712,8 +715,9 @@ test "dispatch: kv.get on missing key returns null" {
 }
 
 /// Test harness: wrap a statement-level snippet in a named export
-/// named `go`, compile as .mjs, dispatch with `?fn=go`. Matches the
-/// production contract — named-export modules only, positional args.
+/// named `go`, compile as .mjs, dispatch via the internal
+/// `fn_override` target (the resume-engine mechanism — the customer
+/// `?fn=` query dispatch is retired, decisions.md §4.5).
 fn runOneOutcome(
     d: *Dispatcher,
     kv: *kv_mod.KvStore,
@@ -736,10 +740,9 @@ fn runOneOutcome(
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
 
-    // If the caller didn't set a query, force `fn=go` so the
-    // dispatcher finds our wrapper export.
+    // If the caller didn't name a target, route to our wrapper export.
     var request = request_in;
-    if (request.query == null) request.query = "fn=go";
+    if (request.fn_override == null) request.fn_override = "go";
 
     var budget = Budget.fromNow(Budget.default_duration_ns);
     const outcome = try d.runOutcome(kv, &txn, &ws, bytecode, null, null, null, request, &budget);
@@ -1546,7 +1549,7 @@ test "dispatch: kv tape captures foreign gets only (§8 minimal read set)" {
     var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
         .method = "POST",
         .path = "/",
-        .query = "fn=go",
+        .fn_override = "go",
         .trace = .{ .readset = &readset },
     }, &budget);
     defer resp.deinit(testing.allocator);
@@ -1620,7 +1623,7 @@ test "dispatch: kv tape skips own-reads (§8 minimal read set)" {
     var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
         .method = "POST",
         .path = "/",
-        .query = "fn=go",
+        .fn_override = "go",
         .trace = .{ .readset = &readset },
     }, &budget);
     defer resp.deinit(testing.allocator);
@@ -1688,7 +1691,7 @@ test "dispatch: Date.now + Math.random + crypto.* are seed/timestamp-only" {
         var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
             .method = "GET",
             .path = "/",
-            .query = "fn=go",
+            .fn_override = "go",
             .trace = .{ .readset = &readset },
         }, &budget);
         defer resp.deinit(testing.allocator);
@@ -1731,7 +1734,7 @@ test "dispatch: Date.now + Math.random + crypto.* are seed/timestamp-only" {
         var resp2 = try d.run(kv, &txn2, &ws2, bytecode, null, null, null, .{
             .method = "GET",
             .path = "/",
-            .query = "fn=go",
+            .fn_override = "go",
             .trace = .{ .readset = &readset2 },
         }, &budget2);
         defer resp2.deinit(testing.allocator);
@@ -1780,7 +1783,7 @@ test "dispatch: tight loop hits budget and returns Interrupted" {
         null,
         null,
         null,
-        .{ .method = "GET", .path = "/", .query = "fn=go" },
+        .{ .method = "GET", .path = "/", .fn_override = "go" },
         &budget,
     );
     const elapsed_ns: i64 = @as(i64, @intCast(std.time.nanoTimestamp())) - started;
@@ -1812,7 +1815,7 @@ test "dispatch: short handler does not trip budget" {
     try testing.expectEqualStrings("fast", resp.body);
 }
 
-test "dispatch: .mjs module + function dispatch with ?fn=" {
+test "dispatch: .mjs module + internal fn_override dispatch with positional args" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1820,7 +1823,9 @@ test "dispatch: .mjs module + function dispatch with ?fn=" {
         cleanupTempKv(&buf);
     }
 
-    // Compile a tiny module with two exports.
+    // Compile a tiny module with two exports plus a default that
+    // proves customer envelope shapes no longer route (the platform
+    // invokes only the conventional export when nothing overrides).
     var rt = try qjs.Runtime.init();
     defer rt.deinit();
     var ctx = try rt.newContext();
@@ -1833,6 +1838,9 @@ test "dispatch: .mjs module + function dispatch with ?fn=" {
         \\    response.status = 201;
         \\    return ("HI " + path).toUpperCase();
         \\}
+        \\export default function () {
+        \\    return "default-ran";
+        \\}
     ,
         "h.mjs",
         testing.allocator,
@@ -1842,7 +1850,7 @@ test "dispatch: .mjs module + function dispatch with ?fn=" {
 
     var d = try Dispatcher.init(testing.allocator); defer d.deinit();
 
-    // ?fn=greet with args=["/hello"] → "hi /hello", status 200.
+    // fn_override=greet with args ["/hello"] → "hi /hello", status 200.
     {
         var txn = try kv.beginTrackedImmediate();
         defer txn.rollback() catch {};
@@ -1852,14 +1860,15 @@ test "dispatch: .mjs module + function dispatch with ?fn=" {
         var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
             .method = "GET",
             .path = "/hello",
-            .query = "fn=greet&args=%5B%22%2Fhello%22%5D",
+            .fn_override = "greet",
+            .fn_args_json = "[\"/hello\"]",
         }, &budget);
         defer resp.deinit(testing.allocator);
         try testing.expectEqual(@as(i32, 200), resp.status);
         try testing.expectEqualStrings("hi /hello", resp.body);
     }
 
-    // ?fn=shout → "HI /HELLO", status 201 via response global.
+    // fn_override=shout → "HI /HELLO", status 201 via response global.
     {
         var txn = try kv.beginTrackedImmediate();
         defer txn.rollback() catch {};
@@ -1869,14 +1878,15 @@ test "dispatch: .mjs module + function dispatch with ?fn=" {
         var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
             .method = "GET",
             .path = "/hello",
-            .query = "fn=shout&args=%5B%22%2Fhello%22%5D",
+            .fn_override = "shout",
+            .fn_args_json = "[\"/hello\"]",
         }, &budget);
         defer resp.deinit(testing.allocator);
         try testing.expectEqual(@as(i32, 201), resp.status);
         try testing.expectEqualStrings("HI /HELLO", resp.body);
     }
 
-    // Unknown fn → 404 with a descriptive body.
+    // Unknown override → 404 with a descriptive body.
     {
         var txn = try kv.beginTrackedImmediate();
         defer txn.rollback() catch {};
@@ -1886,11 +1896,30 @@ test "dispatch: .mjs module + function dispatch with ?fn=" {
         var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
             .method = "GET",
             .path = "/hello",
-            .query = "fn=nope",
+            .fn_override = "nope",
         }, &budget);
         defer resp.deinit(testing.allocator);
         try testing.expectEqual(@as(i32, 404), resp.status);
         try testing.expect(std.mem.indexOf(u8, resp.body, "nope") != null);
+    }
+
+    // The retired customer envelope shapes are inert: a `?fn=` query
+    // and a `{fn,args}` body both land in the DEFAULT export.
+    {
+        var txn = try kv.beginTrackedImmediate();
+        defer txn.rollback() catch {};
+        var ws = kv_mod.WriteSet.init(testing.allocator);
+        defer ws.deinit();
+        var budget = Budget.fromNow(Budget.default_duration_ns);
+        var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
+            .method = "POST",
+            .path = "/hello",
+            .query = "fn=shout&args=%5B%22x%22%5D",
+            .body = "{\"fn\":\"greet\",\"args\":[\"x\"]}",
+        }, &budget);
+        defer resp.deinit(testing.allocator);
+        try testing.expectEqual(@as(i32, 200), resp.status);
+        try testing.expectEqualStrings("default-ran", resp.body);
     }
 }
 
@@ -1928,7 +1957,7 @@ fn runWithMiddleware(
     defer ws.deinit();
 
     var request = request_in;
-    if (request.query == null) request.query = "fn=go";
+    if (request.fn_override == null) request.fn_override = "go";
 
     var budget = Budget.fromNow(Budget.default_duration_ns);
     const resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, null, request, &budget);
@@ -2088,7 +2117,7 @@ test "dispatch: middleware applies to ?fn=<named> RPC dispatch too" {
         \\    return { error: "blocked" };
         \\}
     ,
-        .{ .method = "GET", .path = "/", .query = "fn=go" },
+        .{ .method = "GET", .path = "/", .fn_override = "go" },
     );
     defer resp.deinit(testing.allocator);
     try testing.expectEqual(@as(i32, 401), resp.status);
@@ -2238,7 +2267,7 @@ test "dispatch: POST with non-envelope JSON body invokes default, body in reques
     try testing.expectEqualStrings("got name=alice", resp.body);
 }
 
-test "dispatch: POST RPC envelope still routes to named export" {
+test "dispatch: a {fn,args} POST body is opaque payload — default export runs" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -2254,7 +2283,11 @@ test "dispatch: POST RPC envelope still routes to named export" {
         \\export function greet(who) {
         \\    return "hi " + who;
         \\}
-        \\export default function () { return "default-not-called"; }
+        \\export default function () {
+        \\    // The retired envelope is just a body now — visible,
+        \\    // never interpreted (decisions.md §4.5).
+        \\    return "default saw " + JSON.parse(request.body).fn;
+        \\}
     ,
         "h.mjs",
         testing.allocator,
@@ -2277,7 +2310,7 @@ test "dispatch: POST RPC envelope still routes to named export" {
     }, &budget);
     defer resp.deinit(testing.allocator);
     try testing.expectEqual(@as(i32, 200), resp.status);
-    try testing.expectEqualStrings("hi world", resp.body);
+    try testing.expectEqualStrings("default saw greet", resp.body);
 }
 
 // ── request.headers + request.cookies ─────────────────────────────────
@@ -2550,7 +2583,8 @@ test "dispatch: async module handler gets unwrapped" {
     var resp = try d.run(kv, &txn, &ws, bytecode, null, null, null, .{
         .method = "GET",
         .path = "/x",
-        .query = "fn=fetchLike&args=%5B%22%2Fx%22%5D",
+        .fn_override = "fetchLike",
+        .fn_args_json = "[\"/x\"]",
     }, &budget);
     defer resp.deinit(testing.allocator);
     try testing.expectEqual(@as(i32, 202), resp.status);

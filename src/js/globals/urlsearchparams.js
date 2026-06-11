@@ -10,16 +10,15 @@
 // Methods: append, delete, entries, forEach, get, getAll, has, keys,
 // set, sort, toString, values, [Symbol.iterator], `size`.
 //
-// Encoding follows application/x-www-form-urlencoded — same as the
-// dispatcher's query-string parser (`?fn=&args=`), so a value
-// produced by `toString()` round-trips through the platform.
+// Encoding follows application/x-www-form-urlencoded, so a value
+// produced by `toString()` round-trips through `request.query` and
+// the JS `rpc({...})` dispatch recipe (handler-shape.md).
 
 /**
  * WHATWG `URLSearchParams` (spec-compliant subset) for parsing and
  * building `application/x-www-form-urlencoded` query strings without
- * the full `URL` class. Encoding matches the dispatcher's
- * `?fn=&args=` parser, so `toString()` output round-trips through the
- * platform.
+ * the full `URL` class. `toString()` output round-trips through
+ * `request.query`.
  *
  * @class URLSearchParams
  * @example

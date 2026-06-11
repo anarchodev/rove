@@ -45,7 +45,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster  # noqa: E402
+from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 PREFIX = "onkv/"
 WRITE_DELAY_S = 0.5
@@ -102,7 +102,7 @@ def main() -> int:
         print("step 2: deploy onkv + writekv (+ a root readiness probe)")
         try:
             dep_id = c.deploy_handlers("acme", {
-                "index.mjs": READY_SRC,
+                "index.mjs": rpc_wrap(READY_SRC),
                 "onkv/index.mjs": ONKV_SRC,
                 "writekv/index.mjs": WRITEKV_SRC,
             })

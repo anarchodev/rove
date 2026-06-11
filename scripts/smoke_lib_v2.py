@@ -24,6 +24,7 @@ Generalizes the proven flow in `v2_handler_smoke.py`. Reuses `smoke_lib`'s
 
 from __future__ import annotations
 
+import re
 import json
 import os
 import signal
@@ -51,6 +52,54 @@ ROOT_TOKEN = "rewindtestroottokenpadding0123456789abcd"  # DEFAULT_ADMIN_ROOT_TO
 MOVE_SECRET = "rewindmovesecretpadding0123456789abcdef0"
 JWT_SECRET_HEX = "a" * 64  # LOOP46_SERVICES_JWT_SECRET
 PUBLIC_SUFFIX = "localhost"
+
+# ── fn-RPC dispatch recipe ──────────────────────────────────────────────
+# The platform invokes only the activation's conventional export
+# (decisions.md §4.5) — `?fn=`/`{fn,args}` routing is handler JS. This is
+# the handler-shape.md recipe; `rpc_wrap` applies it to a smoke handler
+# whose named exports the smoke drives via `?fn=` URLs, preserving the
+# wire format every existing smoke uses.
+RPC_SHIM = """\
+// fn-RPC dispatch recipe (handler-shape.md; decisions.md §4.5) — the
+// platform invokes only the conventional export, so named-function
+// routing is handler JS.
+function __rpc(fns) {
+  return function () {
+    let fn = null, args = [];
+    for (const part of (request.query || "").split("&")) {
+      const eq = part.indexOf("=");
+      const k = eq === -1 ? part : part.slice(0, eq);
+      if (k !== "fn" && k !== "args") continue;
+      const v = eq === -1 ? "" : decodeURIComponent(part.slice(eq + 1).replace(/\\+/g, "%20"));
+      if (k === "fn" && v) fn = v;
+      else if (k === "args" && v) { try { args = JSON.parse(v); } catch (_) {} }
+    }
+    if (!fn && request.body) {
+      try {
+        const b = JSON.parse(request.body);
+        if (b && typeof b.fn === "string") { fn = b.fn; args = Array.isArray(b.args) ? b.args : []; }
+      } catch (_) {}
+    }
+    const f = fn ? fns[fn] : null;
+    if (!f) { response.status = 404; return "no such fn: " + fn; }
+    return f(...args);
+  };
+}
+"""
+
+_EXPORT_FN_RE = re.compile(r"^export\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)", re.M)
+
+
+def rpc_wrap(src: str) -> str:
+    """Prepend the fn-RPC shim and add `export default __rpc({...})` over
+    the module's exported named functions. The smoke's `?fn=`/`{fn,args}`
+    wire calls are unchanged — dispatch just happens in handler JS now.
+    Modules that already have a default export must compose the recipe by
+    hand instead (assert so a silent double-default never deploys)."""
+    assert "export default" not in src, "rpc_wrap: module already has a default export"
+    names = list(dict.fromkeys(_EXPORT_FN_RE.findall(src)))
+    assert names, "rpc_wrap: no exported named functions found"
+    return RPC_SHIM + src + "\nexport default __rpc({ " + ", ".join(names) + " });\n"
 
 
 def _free_base(default: int) -> int:

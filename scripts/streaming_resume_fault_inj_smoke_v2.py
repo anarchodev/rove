@@ -57,7 +57,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, MOVE_SECRET  # noqa: E402
+from smoke_lib_v2 import V2Cluster, MOVE_SECRET, rpc_wrap  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEMO = REPO_ROOT / "examples" / "loop46-demo-tenants"
@@ -119,7 +119,7 @@ def main() -> int:
               "(+ a root readiness probe)")
         try:
             dep_id = c.deploy_handlers("streamfi", {
-                "index.mjs": READY_SRC,
+                "index.mjs": rpc_wrap(READY_SRC),
                 "stream/index.mjs": STREAMFI_SRC,
             }, node=Ldeploy)
             check("deploy_handlers → dep_id", bool(dep_id), f"dep_id={dep_id}")
