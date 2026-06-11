@@ -41,7 +41,7 @@ wire only after the activation that produced it commits — and a blob coordinat
 ## Front door & routing
 
 - **Stateless**: holds no raft state. Per request it resolves `:authority` →
-  cluster via `Router.resolveRoute(host)`, backed by `RouteCache` (host → node
+  cluster via `Proxy.resolveRoute(host)`, backed by `RouteCache` (host → node
   URLs, TTL-bound) with a CP query (`GET /_cp/route?host=`) on miss.
 - **Streaming proxy** (`src/front/proxy.zig`, 2026-06-11 — replaced the
   blocking-curl first cut that buffered whole bodies): the data path is a
