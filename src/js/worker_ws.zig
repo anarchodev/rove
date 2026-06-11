@@ -489,9 +489,10 @@ fn fireWsMessage(
             effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
             tearDownWsChain(worker, conn_ent);
         },
-        // Only `.inbound_headers` activations produce this; WS frames
-        // never dispatch as one. Defined failure: close + tear down.
-        .no_onheaders => {
+        // Only `.inbound_headers` / `.inbound_chunk` activations
+        // produce these; WS frames never dispatch as one. Defined
+        // failure: close + tear down.
+        .no_onheaders, .no_onchunk => {
             p.txn.rollback() catch {};
             p.txn_done = true;
             captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .ws_message, 0);
@@ -636,7 +637,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         .terminal => |*r| r.deinit(allocator),
         .continuation => |*cval| cval.deinit(allocator),
         .stream => |*s2| s2.deinit(allocator),
-        .no_onheaders => {},
+        .no_onheaders, .no_onchunk => {},
     }
     if (wrote) {
         const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, .disconnect, path, chain_ctx.correlation_id);
