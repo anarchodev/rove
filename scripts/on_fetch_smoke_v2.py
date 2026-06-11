@@ -103,7 +103,7 @@ def main() -> int:
         check("acme reachable", r.status in (200, 404),
               f"got {r.status} {r.body!r}")
 
-        bulk_url = f"http://wb.{PUBLIC_SUFFIX}:{c.node_ports[0]}/bulk"
+        bulk_url = f"http://wb.{PUBLIC_SUFFIX}:{c.front_port}/bulk"
 
         # ── 3. THE on.fetch (streaming + {to:onUpstream}). ────────────
         r = c.get("acme", f"/onfetch?url={up.quote(bulk_url)}", timeout=30.0)

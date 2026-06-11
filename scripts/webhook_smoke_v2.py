@@ -146,7 +146,7 @@ def main() -> int:
             return 1
 
         print("step 4: fire the webhook through acme's cbfire handler")
-        wb_url = f"http://wb.{PUBLIC_SUFFIX}:{c.node_ports[0]}/hook"
+        wb_url = f"http://wb.{PUBLIC_SUFFIX}:{c.front_port}/hook"
         import urllib.parse
         args = urllib.parse.quote(json.dumps([wb_url, "smoke1"]))
         send_id = ""

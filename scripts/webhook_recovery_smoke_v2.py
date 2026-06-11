@@ -150,7 +150,7 @@ def main() -> int:
             print(f"\nFAILURES ({len(failures)}): {failures}")
             return 1
 
-        wb_url = f"http://wb.{PUBLIC_SUFFIX}:{c.node_ports[0]}/hook"
+        wb_url = f"http://wb.{PUBLIC_SUFFIX}:{c.front_port}/hook"
         print(f"step 4: fire a DELAYED webhook.send (delay={DELAY_MS}ms) through acme")
         args = urllib.parse.quote(json.dumps([wb_url, "recov1", DELAY_MS]))
         send_id = ""

@@ -91,8 +91,8 @@ def main() -> int:
             print("\nFAILURES:", failures)
             return 1
 
-        u1 = f"http://wb.{PUBLIC_SUFFIX}:{c.node_ports[0]}/bigbody?n={N1}"
-        u2 = f"http://wb.{PUBLIC_SUFFIX}:{c.node_ports[0]}/bigbody?n={N2}"
+        u1 = f"http://wb.{PUBLIC_SUFFIX}:{c.front_port}/bigbody?n={N1}"
+        u2 = f"http://wb.{PUBLIC_SUFFIX}:{c.front_port}/bigbody?n={N2}"
 
         # ── 1. Upstreams reachable + deterministic. ───────────────────
         r1 = c.wait_for_handler("wb", f"/bigbody?n={N1}", want_status=200,
