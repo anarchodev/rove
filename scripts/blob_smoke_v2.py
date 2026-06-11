@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""blob.* P1+P2 smoke — `docs/blob-storage-plan.md` exit checks.
+"""blob.* P1+P2 smoke — `docs/architecture/routing-and-ingress.md` exit checks.
 
 Proves the customer blob surface end to end on the real V2 stack
 against real S3 (the V2 blob backend is S3-only):

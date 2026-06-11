@@ -1,9 +1,9 @@
-//! rove-plan — per-tenant plan tiers + effective limits (docs/plan-tiers.md).
+//! rove-plan — per-tenant plan tiers + effective limits (docs/architecture/control-plane.md).
 //!
 //! A LEAF module (std only) so every consumer can import it without a cycle:
 //! the worker (`rove-js`) resolves rate/body limits from it, and the
 //! log-query surface (`rove-log-server`) resolves the retention window from it
-//! (docs/plan-tiers.md Lever 3). It owns `RateLimitCaps` too — the limiter
+//! (docs/architecture/control-plane.md Lever 3). It owns `RateLimitCaps` too — the limiter
 //! re-exports it — so the table that maps a tier to its numbers lives in ONE
 //! place reachable from both layers.
 //!
@@ -42,7 +42,7 @@ pub const RateLimitCaps = struct {
 
 /// The named tiers. Free is the default for any tenant with no CP plan blob.
 /// `pro` / `enterprise` numbers below are launch placeholders — the concrete
-/// figures are a product call (docs/plan-tiers.md "Open decisions"), not an
+/// figures are a product call (decisions.md §10.9 — a product call), not an
 /// engineering one, and live here so changing them is a one-line edit.
 pub const Tier = enum(u8) {
     free,
@@ -82,7 +82,7 @@ pub fn table(t: Tier) PlanLimits {
                 .email_refill_per_sec = 10,
             },
             // A few MB — generous-but-finite, coherent with the 256 KB
-            // streaming QUEUE_BYTES_CAP (docs/plan-tiers.md Lever 2).
+            // streaming QUEUE_BYTES_CAP (docs/architecture/control-plane.md Lever 2).
             .max_body_bytes = 4 * 1024 * 1024,
             .retention_days = 7,
         },
@@ -111,7 +111,7 @@ pub fn table(t: Tier) PlanLimits {
 
 /// Sparse per-field overrides — every field optional. A null field falls
 /// through to the tier table. Enterprise custom deals set the ones they need
-/// without schema churn (docs/plan-tiers.md "Overrides granularity").
+/// without schema churn (decisions.md §10.9).
 pub const Overrides = struct {
     request_capacity: ?u32 = null,
     request_refill_per_sec: ?u32 = null,
@@ -154,7 +154,7 @@ pub fn parseBlob(allocator: std.mem.Allocator, blob: []const u8) PlanLimits {
 }
 
 /// Seconds of retention for a resolved plan — the read-clamp floor is
-/// `now_ns - retentionNs(plan)` (docs/plan-tiers.md Lever 3).
+/// `now_ns - retentionNs(plan)` (docs/architecture/control-plane.md Lever 3).
 pub fn retentionNs(p: PlanLimits) i64 {
     return @as(i64, p.retention_days) * std.time.ns_per_day;
 }

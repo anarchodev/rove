@@ -1,6 +1,6 @@
 //! V2 Phase 4 — the cluster-internal tenant-MOVE surface.
 //!
-//! docs/v2-build-order.md §Phase 4 ("Quiesce + brief-pause move"). These
+//! v2-build-order §Phase 4 ("Quiesce + brief-pause move"). These
 //! `/_system/v2-*` endpoints are the data-plane half of moving a tenant
 //! from one single-node cluster to another; the front door
 //! (`rewind-front`) is the orchestrator that calls them in sequence and

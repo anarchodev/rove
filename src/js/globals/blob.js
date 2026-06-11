@@ -1,4 +1,4 @@
-// blob.* — tenant object storage (`docs/blob-storage-plan.md` P1).
+// blob.* — tenant object storage (blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`).
 //
 // The storage doctrine in one line: kv is for state you mutate; the
 // object store is for facts you accumulate. Every object is
@@ -246,7 +246,7 @@ globalThis.blob = {
   /**
    * Pipe the entire inbound request body socket → content-addressed
    * storage with ZERO chunk activations (Case B,
-   * `docs/blob-storage-plan.md` §3.5). Only callable from an
+   * blob-storage-plan §3.5; `docs/architecture/routing-and-ingress.md`). Only callable from an
    * `onHeaders` export — the body hasn't been accepted yet; calling
    * `blob.receive` then `return next()` opens the valve. Bytes
    * stream to a tenant-prefix S3 multipart at the client's rate

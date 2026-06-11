@@ -1,6 +1,6 @@
 //! `__rove_set_wake` / `__rove_fire_wake` — the §2.6 durable-wake
 //! engine primitive, capability-scoped to baked `__system/` modules
-//! (`docs/durable-wake-plan.md` P0). These are the ONLY two builtins
+//! (durable-wake P0; `docs/architecture/effects-and-handlers.md`). These are the ONLY two builtins
 //! the durable-wake primitive adds; everything else (the queue,
 //! ordering, fan-out, backoff) lives in JS (`scheduler.js` +
 //! `scheduler_tick.mjs`), per the durability-as-JS-shim direction.

@@ -1,6 +1,6 @@
-//! `_system.blob.*` native bindings — `docs/blob-storage-plan.md` P1.
+//! `_system.blob.*` native bindings — blob-storage-plan P1.
 //!
-//! Only one verb lives natively: `presign`. It is the single blob
+//! Only one verb lives natively; `docs/architecture/routing-and-ingress.md`: `presign`. It is the single blob
 //! verb a customer categorically cannot compose in JS — it requires
 //! the platform-held S3 signing keys. Everything else (`put` / `get`
 //! / the owed-marker durability composition) is readable JavaScript
@@ -131,7 +131,7 @@ pub fn jsBlobPresign(
     return c.JS_NewStringLen(ctx, url.ptr, url.len);
 }
 
-// ── P2: upload sessions (`docs/blob-storage-plan.md` §3.4) ─────────
+// ── P2: upload sessions (blob-storage-plan §3.4; `docs/architecture/routing-and-ingress.md`) ─────────
 
 /// `_system.blob.write(bytes)` → total session bytes. Appends to
 /// this chain's upload session (created on first write) via the
@@ -336,8 +336,8 @@ pub fn jsBlobSeal(
     return c.JS_NewStringLen(ctx, &sealed.hash_hex, 64);
 }
 
-/// `_system.blob.receive(to)` — `docs/blob-storage-plan.md` §3.5
-/// (P3): pipe the inbound body socket → tenant-prefix S3 multipart
+/// `_system.blob.receive(to)` — blob-storage-plan §3.5
+/// (P3; `docs/architecture/routing-and-ingress.md`): pipe the inbound body socket → tenant-prefix S3 multipart
 /// with ZERO chunk Msgs. Only callable from an `onHeaders`
 /// activation (the body is still at the door); at most once per
 /// activation (a receive consumes THE body). Appends a

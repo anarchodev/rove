@@ -1855,7 +1855,7 @@ pub fn resumeBoundFetchChain(
         stream_chunks.deinit(allocator);
     }
 
-    // `docs/blob-storage-plan.md` P2 (+ handler-shape §5.3): fetches
+    // blob-storage-plan P2 (+ handler-shape §5.3; `docs/architecture/routing-and-ingress.md`): fetches
     // issued FROM a bound-fetch resume (`on.fetch` chained from a
     // chunk handler, `blob.seal`'s PUT). Pre-P2 the accumulator was
     // simply absent here and every such fetch silently dropped.
@@ -2141,7 +2141,7 @@ pub fn resumeBoundFetchChain(
     }
 }
 
-/// `docs/blob-storage-plan.md` P2 (+ handler-shape §5.3): submit the
+/// blob-storage-plan P2 (+ handler-shape §5.3; `docs/architecture/routing-and-ingress.md`): submit the
 /// fetches a bound-fetch RESUME activation issued. Mirrors the
 /// worker_dispatch success-seam bind/drop logic for the resume case:
 ///

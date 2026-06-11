@@ -314,7 +314,7 @@ pub fn runModule(
         }
         // Headers-first probe: a module without `onHeaders` wants the
         // classic buffered path — signal the dispatch site to buffer
-        // + re-dispatch instead of 404ing (`docs/blob-storage-plan.md`
+        // + re-dispatch instead of 404ing (`docs/architecture/routing-and-ingress.md`
         // §3.5: "exports onHeaders → headers-first" is one dispatch
         // row, and its absence is the normal case, not an error).
         if (request.activation == .inbound_headers) {

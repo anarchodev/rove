@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """CP replicated domain index smoke (gap #2; docs/v2-cp-directory-replication.md,
-docs/v2-cutover-checklist.md gap #2).
+V2 cutover gap #2 — the host axis, docs/architecture/control-plane.md).
 
 The host→tenant index used to be a static `REWIND_HOSTS` env map. Gap #2 makes
 it a replicated axis in the CP `__directory__` group (`host/{host}` → tenant,

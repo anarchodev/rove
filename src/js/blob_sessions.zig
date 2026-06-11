@@ -1,7 +1,7 @@
-//! Blob upload sessions — `docs/blob-storage-plan.md` P2.
+//! Blob upload sessions — blob-storage-plan P2.
 //!
 //! A session accumulates bytes across the activations of ONE held
-//! chain (`blob.write(bytes)` per activation — typically a streamed
+//! chain (`blob.write(bytes; `docs/architecture/routing-and-ingress.md`)` per activation — typically a streamed
 //! `on.fetch`'s chunk resumes) and `blob.seal` turns the accumulated
 //! buffer into a single content-addressed PUT through the P1 signing
 //! door. Connection-scoped by construction: keyed on

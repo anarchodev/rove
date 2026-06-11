@@ -1,6 +1,6 @@
 //! V2 Phase 5 — cross-node raft transport (coalesced, per-recipient).
 //!
-//! docs/v2-build-order.md §Phase 5: "reuse rove's `raft_net.zig` io_uring
+//! v2-build-order §Phase 5: "reuse rove's `raft_net.zig` io_uring
 //! transport as the wire layer, adapted to per-recipient **coalesced**
 //! envelopes carrying many groups' messages plus epoch stamps"
 //! (multiraft-scaling-learnings §3.3). This is the wire half of multi-node

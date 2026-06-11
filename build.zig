@@ -56,7 +56,7 @@ pub fn build(b: *std.Build) void {
     // State engine is kvexp (vendored). raft_log persistence is still
     // sqlite for now (raft log is its own concern, separate from the
     // KV state path); follow-up cutover will migrate it.
-    // V2 (docs/v2-build-order.md §Phase 2): the `raft-kv` module now roots
+    // V2 (V2 cutover; docs/architecture/consensus-and-storage.md): the `raft-kv` module now roots
     // at the spine-free FACADE (`kvlimbs.zig`) — the kvexp-backed limbs +
     // metrics + envelope codec, NONE of the willemt-raft / io_uring spine.
     // Every importer (`rove-js`, files-server, files, log, tenant) gets the
@@ -136,7 +136,7 @@ pub fn build(b: *std.Build) void {
     //
     // A LEAF (std only) so both the worker (`rove-js`: rate + body caps)
     // and the log-query surface (`rove-log-server`: retention window) can
-    // import the ONE tier table without a cycle (docs/plan-tiers.md). Owns
+    // import the ONE tier table without a cycle (docs/architecture/control-plane.md). Owns
     // `RateLimitCaps`, which the limiter re-exports.
     const plan_mod = b.addModule("rove-plan", .{
         .root_source_file = b.path("src/plan/root.zig"),
@@ -499,15 +499,15 @@ pub fn build(b: *std.Build) void {
         // durable-wake-plan P5(a) — webhook.send's wake-fired half.
         .{ .name = "builtin_webhook_fire_mjs", .path = "src/js/builtin_modules/webhook_fire.mjs" },
         // §2.6 durable scheduled wake — the `scheduler_tick` baked
-        // module (docs/durable-wake-plan.md P1). Add an entry here AND
+        // module (durable-wake P1; docs/architecture/effects-and-handlers.md). Add an entry here AND
         // in `src/js/builtin_modules.zig`'s `MODULES` table.
         .{ .name = "builtin_scheduler_tick_mjs", .path = "src/js/builtin_modules/scheduler_tick.mjs" },
         // Handler-surface Phase 5 — the `cron(...)` recurrence engine.
         .{ .name = "builtin_cron_tick_mjs", .path = "src/js/builtin_modules/cron_tick.mjs" },
-        // `docs/blob-storage-plan.md` P1 — blob.put's marker-settling
+        // blob-storage P1 (docs/architecture/routing-and-ingress.md) — blob.put's marker-settling
         // result handler.
         .{ .name = "builtin_blob_onresult_mjs", .path = "src/js/builtin_modules/blob_onresult.mjs" },
-        // `docs/blob-storage-plan.md` §6 — segments.seal's swap half.
+        // blob-storage §6 (docs/architecture/routing-and-ingress.md) — segments.seal's swap half.
         .{ .name = "builtin_segments_onsealed_mjs", .path = "src/js/builtin_modules/segments_onsealed.mjs" },
 
         // Starter content baked into the freshly-created tenant's
@@ -893,7 +893,7 @@ pub fn build(b: *std.Build) void {
     const rust_ffi_smoke_step = b.step("rust-ffi-smoke", "Run the Rust-FFI hello-world smoke (V2 spike)");
     rust_ffi_smoke_step.dependOn(&run_rust_ffi_smoke.step);
 
-    // ── V2 raft substrate (docs/v2-build-order.md Phase 0) ──────────────
+    // ── V2 raft substrate (v2-build-order Phase 0) ──────────────────────
     // raft-rs-zig (anarchodev/raft-rs-zig) is the V2 multi-raft engine:
     // TiKV raft-rs, one group per tenant, behind a Zig wrapper. Fetched as
     // a Zig package (pinned in build.zig.zon); its own build.zig runs
@@ -930,7 +930,7 @@ pub fn build(b: *std.Build) void {
     v2_test_step.dependOn(&run_v2_smoke_test.step);
 
     // ── V2 Phase 1 — data-plane core: the per-tenant pump (single node)
-    // (docs/v2-build-order.md §Phase 1). `src/consensus/node.zig` owns a
+    // (v2-build-order Phase 1). `src/consensus/node.zig` owns a
     // Manager + SharedWal and pumps per-tenant raft groups, applying
     // committed writeset envelopes to each tenant's kvexp store. It
     // reuses the V1 limbs as plain files — `src/kv/kvstore.zig` +
@@ -1001,7 +1001,7 @@ pub fn build(b: *std.Build) void {
     v2_test_step.dependOn(&run_v2_node_test.step);
 
     // ── V2 Phase 2 — the worker-facing bridge over the per-tenant pump
-    // (docs/v2-build-order.md §Phase 2). `src/consensus/bridge.zig` owns the
+    // (v2-build-order Phase 2). `src/consensus/bridge.zig` owns the
     // Phase-1 `Node`, runs its pump on a dedicated thread, and presents
     // the per-tenant propose + watermark surface the reused rove-js worker
     // talks to in place of V1's global `kv.RaftNode`. Same import table as
@@ -1020,7 +1020,7 @@ pub fn build(b: *std.Build) void {
     v2_test_step.dependOn(&run_v2_bridge_test.step);
 
     // ── V2 Phase 3/7 — control plane: the tenant→cluster directory ─────
-    // (docs/v2-build-order.md §Phase 3, docs/v2-phase3-directory-routing.md,
+    // (v2-build-order Phase 3; docs/architecture/control-plane.md,
     // docs/v2-cp-directory-replication.md Slice 1). `src/cp/directory.zig`
     // is the routing source of truth the front-door reads and a move flips.
     // Slice 1 makes it durable: it backs writes with the V2 `bridge`'s
@@ -1047,7 +1047,7 @@ pub fn build(b: *std.Build) void {
     const js_v2_step = b.step("js-v2", "Compile rove-js against the V2 facade + bridge (Phase 2c)");
     js_v2_step.dependOn(&b.addRunArtifact(js_v2_test).step);
 
-    // ── rewind: the V2 single-node worker binary (docs/v2-build-order.md
+    // ── rewind: the V2 single-node worker binary (v2-build-order
     // §Phase 2d). The V2 counterpart of `loop46` — the reused rove-js
     // worker stack on the per-tenant bridge instead of the willemt cluster.
     // Building this is also the FORCING FUNCTION for the Phase-2c generic

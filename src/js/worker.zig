@@ -56,7 +56,7 @@ const h2 = @import("rove-h2");
 const qjs = @import("rove-qjs");
 const kv_mod = @import("raft-kv");
 // V2 Phase 2c: the per-tenant raft bridge replaces V1's node-wide
-// `kv_mod.RaftNode` at the worker seam (docs/v2-build-order.md §Phase 2).
+// `kv_mod.RaftNode` at the worker seam (v2-build-order §Phase 2).
 const bridge_mod = @import("bridge");
 const Bridge = bridge_mod.Bridge;
 const blob_mod = @import("rove-blob");
@@ -276,7 +276,7 @@ pub fn onHeadersRemember(worker: anytype, dep_id: u64, module_base: []const u8, 
     gop.value_ptr.* = has_onheaders;
 }
 
-/// headers_first dispatch state (`docs/blob-storage-plan.md` §3.5.1).
+/// headers_first dispatch state (blob-storage-plan §3.5.1; `docs/architecture/routing-and-ingress.md`).
 /// `drainRequestReceiving` moves an early-emitted request (body still
 /// inbound) from h2's `request_receiving` into `request_out` with
 /// `receiving = true`; `dispatchOnce` runs it as an
@@ -1100,7 +1100,7 @@ pub const WorkerConfig = struct {
     /// across clusters. Distinct from the operator root bearer (which the
     /// front door does not hold) and from the services JWT. When null the
     /// move endpoints are disabled (404/501). Borrowed; alive for the
-    /// worker's lifetime. (docs/v2-build-order.md §Phase 4.)
+    /// worker's lifetime. (v2-build-order §Phase 4.)
     move_secret: ?[]const u8 = null,
     /// This cluster's logical id in the control-plane directory (Phase 7
     /// serve-or-forward). When set together with `cp_urls`, a request for a
@@ -1245,7 +1245,7 @@ pub fn Worker(comptime opts: Options) type {
     const ParkedUnitRow = rove.Row(&.{ParkedUnit});
     const ParkedUnitColl = rove.Collection(ParkedUnitRow, .{});
 
-    // `docs/blob-storage-plan.md` P2: open blob upload sessions —
+    // blob-storage-plan P2; `docs/architecture/routing-and-ingress.md`: open blob upload sessions —
     // one entity per (tenant, chain) accumulating `blob.write`
     // bytes until `blob.seal`. Per-worker (a chain's activations
     // all run on its owning worker). Session strings + buffer
@@ -1390,7 +1390,7 @@ pub fn Worker(comptime opts: Options) type {
         /// State-as-membership: presence in the collection IS the
         /// "awaiting raft commit" state.
         parked_units: ParkedUnitColl,
-        /// `docs/blob-storage-plan.md` P2: open blob upload sessions
+        /// blob-storage-plan P2; `docs/architecture/routing-and-ingress.md`: open blob upload sessions
         /// (`blob.write` / `blob.seal`). TTL-swept via
         /// `blob_sessions.sweepBlobSessions` in the worker tick.
         blob_sessions: BlobSessionColl,
@@ -1597,7 +1597,7 @@ pub fn Worker(comptime opts: Options) type {
         /// runaway stored procedure. Auto-releases on redeploy.
         penalty_box: penalty_mod.PenaltyBox,
         /// Per-instance × per-action token-bucket limits, resolved from
-        /// the tenant's plan-tier caps (`rove-plan`; docs/plan-tiers.md).
+        /// the tenant's plan-tier caps (`rove-plan`; docs/architecture/control-plane.md).
         /// Customer-tenant traffic checks the `request`
         /// bucket before dispatch and gets 429 + Retry-After when
         /// exhausted; admin requests bypass the check entirely.
@@ -2366,7 +2366,7 @@ pub fn Worker(comptime opts: Options) type {
             return true;
         }
 
-        /// `docs/blob-storage-plan.md` P2: blob upload-session
+        /// blob-storage-plan P2; `docs/architecture/routing-and-ingress.md`: blob upload-session
         /// trampolines, wired into `Request.trampolines` so the
         /// `_system.blob.write` / `.seal` bindings reach this
         /// worker's `blob_sessions` collection through the same
@@ -2404,7 +2404,7 @@ pub fn Worker(comptime opts: Options) type {
             );
         }
 
-        /// `docs/blob-storage-plan.md` §3.5.1 slice B: arm a
+        /// blob-storage-plan §3.5.1 slice B; `docs/architecture/routing-and-ingress.md`: arm a
         /// `blob.receive` at its commit point. The receive-door
         /// PendingFetch (intercepted before the FetchEngine by
         /// `interpretCmd`'s http_fetch arm and `finalizeBatch`'s

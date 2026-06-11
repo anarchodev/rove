@@ -112,7 +112,7 @@ pub const WsMeta = struct {
 
 /// What an `headers_first` server does with inbound DATA on a stream
 /// whose request entity was early-emitted at the HEADERS frame
-/// (`docs/blob-storage-plan.md` §3.5.1, the `blob.receive`
+/// (blob-storage-plan §3.5.1; `docs/architecture/routing-and-ingress.md`, the `blob.receive`
 /// transport). The entity's lifecycle state is collection
 /// membership, not this flag: `request_receiving` (early-emitted,
 /// consumer hasn't decided) → `request_buffering`
@@ -536,7 +536,7 @@ pub const H2Options = struct {
     /// to 0 to disable (legacy behavior).
     idle_timeout_ns: u64 = 10 * std.time.ns_per_s,
     tls_config: ?*TlsConfig = null,
-    /// Headers-first request emission (`docs/blob-storage-plan.md`
+    /// Headers-first request emission (`docs/architecture/routing-and-ingress.md`
     /// §3.5.1). Off (default): request entities appear in
     /// `request_out` at END_STREAM with the full body — the classic
     /// contract every existing consumer (front door, examples) is

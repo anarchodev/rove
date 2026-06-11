@@ -199,6 +199,11 @@ hibernates. What matters is the *skew*, not the absolute `hibernate_ns`.
 auto-re-elect; the next request wakes it (propose → bump → tick → campaign).
 An idle group has nothing to serve, so this costs nothing real.
 
+Proven by the `v2-test` hibernation suite + `v2-hibernation-bench` (pump cycle
+at K=10k idle tenants drops from ~1 ms tick-all to ~0). A cluster-scale
+**live-traffic** hibernation macrobench is a tracked follow-up — proof at
+scale, not function.
+
 ## Shared WAL & fsync (the two-pass pump)
 
 All of a node's groups interleave into one append-only WAL; the pump fsyncs
@@ -258,7 +263,8 @@ Three mechanisms keep the WAL bounded and a restart correct:
   follower-match-index floor, and a lagging follower would then need a
   data-carrying snapshot, which is not wired. **This is the one known
   limitation in the storage layer** — it bounds nothing worse than WAL growth
-  on a long-lived multi-node group; correctness holds.
+  on a long-lived multi-node group; correctness holds. (Physical segment-file
+  GC — reclaiming fully-compacted segments — is likewise still open.)
 - **Crash recovery.** At boot the Node opens the WAL with `SharedWal.open` (not
   `init`): it CRC-scans the segments, physically truncates only a *torn tail*,
   and buckets recovered records by `group_id`. `Bridge.recoverGroups` reads the
@@ -285,6 +291,19 @@ index; the async flow retires that mechanism but keeps the regression tests.)
 Compaction is verified to survive compact→recover across restart under the
 full V2 smoke suite (`rewind` / `tenant_move` / `three_node` /
 `cp_move_recovery` / `zero_downtime_move`).
+
+## Shutdown ordering (pump before observer targets)
+
+Anything the pump's apply path can call into must outlive the pump. The rewind
+worker's LIFO defers once deinit'd `NodeState` *before* `bridge.deinit` joined
+the pump thread, so a follower applying `_deploy/current` in that window fired
+the deploy apply-observer into freed memory — `main` now calls
+`bridge.stopPump()` right after the worker joins, mirroring the CP's
+pump-before-observer-target ordering. The teardown smokes (`three_node` /
+`zero_downtime_{move,load,forward}` / `smoke_lib_v2.shutdown`) **assert a clean
+handled-SIGTERM exit 0 per process**, so a regression (panic = SIGABRT, hang =
+SIGKILL escalation) fails loudly instead of vanishing into an unchecked
+`p.wait()`.
 
 ## Tenant move (mechanism)
 

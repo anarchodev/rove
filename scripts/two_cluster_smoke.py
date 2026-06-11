@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""V2 Phase-3 exit smoke (docs/v2-build-order.md §Phase 3,
-docs/v2-phase3-directory-routing.md §3c).
+"""V2 Phase-3 exit smoke (v2-build-order §Phase 3,
+v2 Phase-3 directory routing; docs/architecture/control-plane.md).
 
 Stands up TWO single-node `rewind` clusters + one `rewind-front` front
 door and proves the front door routes each tenant's request to the cluster

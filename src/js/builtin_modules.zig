@@ -65,7 +65,7 @@ const MODULES = [_]struct {
         .src = @embedFile("builtin_webhook_fire_mjs"),
     },
     .{
-        // §2.6 durable scheduled wake (docs/durable-wake-plan.md P1).
+        // §2.6 durable scheduled wake (durable-wake P1; docs/architecture/effects-and-handlers.md).
         .path = "__system/scheduler_tick.mjs",
         .src = @embedFile("builtin_scheduler_tick_mjs"),
     },
@@ -75,13 +75,13 @@ const MODULES = [_]struct {
         .src = @embedFile("builtin_cron_tick_mjs"),
     },
     .{
-        // `docs/blob-storage-plan.md` P1: blob.put's marker-settling
+        // blob-storage-plan P1; `docs/architecture/routing-and-ingress.md`: blob.put's marker-settling
         // result handler.
         .path = "__system/blob_onresult.mjs",
         .src = @embedFile("builtin_blob_onresult_mjs"),
     },
     .{
-        // `docs/blob-storage-plan.md` §6: segments.seal's swap half
+        // blob-storage-plan §6; `docs/architecture/routing-and-ingress.md`: segments.seal's swap half
         // (index write + hot-row delete after the segment PUT
         // confirmed).
         .path = "__system/segments_onsealed.mjs",

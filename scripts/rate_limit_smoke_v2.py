@@ -4,7 +4,7 @@ harness (branch `v2`).
 
 The per-tenant request bucket + email bucket (`src/js/limiter.zig`,
 PLAN §2.10) are enforced in the V2 worker's dispatch path off each
-tenant's resolved plan limits (docs/plan-tiers.md Lever 1) — there is no
+tenant's resolved plan limits (docs/architecture/control-plane.md Lever 1) — there is no
 `--rate-limit-*` worker flag anymore. So this port dials a tiny cap by
 installing a plan blob through the worker's move-secret-gated
 `/_system/v2-plan` surface (`c.set_plan`), the same single-target push

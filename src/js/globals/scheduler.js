@@ -1,5 +1,5 @@
 // @rove/scheduler — durable, one-shot, absolute-time scheduled wakes
-// (docs/primitive-gaps.md §2.6 + docs/durable-wake-plan.md). The
+// (docs/primitive-gaps.md §2.6 + docs/architecture/effects-and-handlers.md). The
 // canonical timer primitive every durable-timer feature (cron,
 // webhook retry, delayed jobs, lease/TTL expiry, saga timeouts)
 // composes on.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """V2 Phase-7 EXIT smoke ⭐ — move under continuous load, zero failed requests
-(docs/v2-build-order.md §Phase 7; project_v2_zero_downtime_move memory).
+(v2-build-order §Phase 7; project_v2_zero_downtime_move memory).
 
 A concurrent writer hammers a tenant with distinct keys while the tenant is
 moved A→B with a single `/_control/move-live`. The writer FOLLOWS the tenant:

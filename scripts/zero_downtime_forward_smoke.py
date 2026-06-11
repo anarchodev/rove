@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V2 Phase-7 slice (b) smoke — dual-write forwarding (docs/v2-build-order.md
+"""V2 Phase-7 slice (b) smoke — dual-write forwarding (v2-build-order
 §Phase 7, project_v2_zero_downtime_move memory).
 
 Proves the DATA-OVERLAP half of a zero-downtime move: while a tenant is

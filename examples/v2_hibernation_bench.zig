@@ -1,4 +1,4 @@
-//! V2 Phase-6 exit bench (docs/v2-build-order.md §Phase 6,
+//! V2 Phase-6 exit bench (v2-build-order §Phase 6,
 //! docs/v2-phase6-hibernation.md, multiraft-scaling-learnings §3.1).
 //!
 //! Measures the one thing Phase 6 exists to fix: the per-pump-cycle cost as

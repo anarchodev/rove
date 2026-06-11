@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V2 `rewind` exit smoke (docs/v2-build-order.md §Phase 2e).
+"""V2 `rewind` exit smoke (v2-build-order §Phase 2e).
 
 Boots the single-node `rewind` worker binary and drives the built-in
 `/_system/admin-kv` write path, which exercises the whole Phase-2

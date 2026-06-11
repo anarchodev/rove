@@ -83,7 +83,7 @@ pub const Config = struct {
     /// (the standalone binary's loopback smoke path doesn't need it).
     cors_origin: ?[]const u8 = null,
     /// CP base URL (e.g. `http://cp:9090`) for the retention read-clamp
-    /// (docs/plan-tiers.md Lever 3): each `/v1/{tenant}/list|show|count`
+    /// (docs/architecture/control-plane.md Lever 3): each `/v1/{tenant}/list|show|count`
     /// resolves the tenant's plan from `{cp_url}/_cp/plan?tenant=` (cached)
     /// and hides records older than `retention_days`. Null disables the clamp
     /// (the loopback smoke path / single-tenant deploys with no CP) — every
@@ -228,7 +228,7 @@ const ReqCtx = struct {
     retention: *RetentionCache,
 };
 
-// ── Retention read-clamp (docs/plan-tiers.md Lever 3) ──────────────
+// ── Retention read-clamp (docs/architecture/control-plane.md Lever 3) ──────────────
 //
 // The log-query surface enforces the per-tenant retention window by hiding
 // records older than `now - retention_days`. `retention_days` comes from the
@@ -427,7 +427,7 @@ fn handleOne(
         try setResponse(server, ent, sid, sess, 404, "not found\n", rctx.cfg);
         return;
     };
-    // Retention read-clamp (docs/plan-tiers.md Lever 3): resolve the tenant's
+    // Retention read-clamp (docs/architecture/control-plane.md Lever 3): resolve the tenant's
     // window from the CP (cached) and hide records older than it. 0 ⇒ no clamp
     // (CP not configured / unreachable).
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());

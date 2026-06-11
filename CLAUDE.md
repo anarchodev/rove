@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is rove
 
-Rove is a Zig systems library for building distributed serverless worker infrastructure. It provides content-addressed code deployment, a QuickJS-based JS runtime, an HTTP/2 server, and a distributed KV store with Raft consensus. Third-party dependencies are **pinned and fetched at build time** — Zig/C packages (`arenajs`, `kvexp`, and the V2 engine `raft-rs-zig`) via `build.zig.zon`; the V2 raft engine's Rust crates via Cargo. The first build needs network. This replaced the former vendor-everything / offline-build mandate when the V2 raft-rs Rust closure proved too large to vendor (see `docs/v2-build-order.md`). **The V1→V2 cutover is done (branch `v2`):** the V1 product binary `loop46`, the willemt-raft engine (`vendor/raft/` + `src/kv/{cluster,raft_node,raft_log,…}.zig`), and the sqlite raft log are all retired. The V2 worker is `rewind` (`src/rewind/main.zig`); per-tenant consensus is the `Bridge` (`src/consensus/bridge.zig`) + raft-rs. There are no vendored deps left.
+Rove is a Zig systems library for building distributed serverless worker infrastructure. It provides content-addressed code deployment, a QuickJS-based JS runtime, an HTTP/2 server, and a distributed KV store with Raft consensus. Third-party dependencies are **pinned and fetched at build time** — Zig/C packages (`arenajs`, `kvexp`, and the V2 engine `raft-rs-zig`) via `build.zig.zon`; the V2 raft engine's Rust crates via Cargo. The first build needs network. This replaced the former vendor-everything / offline-build mandate when the V2 raft-rs Rust closure proved too large to vendor (see `docs/decisions.md` §10.11). **The V1→V2 cutover is done (branch `v2`):** the V1 product binary `loop46`, the willemt-raft engine (`vendor/raft/` + `src/kv/{cluster,raft_node,raft_log,…}.zig`), and the sqlite raft log are all retired. The V2 worker is `rewind` (`src/rewind/main.zig`); per-tenant consensus is the `Bridge` (`src/consensus/bridge.zig`) + raft-rs. There are no vendored deps left.
 
 ## Product direction
 
@@ -127,7 +127,7 @@ Envelopes are typed byte blobs (`src/js/apply.zig`). Only three types are live (
 
 | Type | Target store | Producer |
 |---|---|---|
-| `0` writeset | `{data_dir}/{id}/app.db` | Customer handler `kv.*` via `TrackedTxn` + writeset; `_deploy/current` release marker; the `webhook.send` / `email.send` JS-shim's `_send/owed/{id}` markers and the durable `scheduler` lib's `_sched/*` wake entries ride here too (ordinary kv writes — no apply-time special-case; `decisions.md` §3.3 + `docs/durable-wake-plan.md`) |
+| `0` writeset | `{data_dir}/{id}/app.db` | Customer handler `kv.*` via `TrackedTxn` + writeset; `_deploy/current` release marker; the `webhook.send` / `email.send` JS-shim's `_send/owed/{id}` markers and the durable `scheduler` lib's `_sched/*` wake entries ride here too (ordinary kv writes — no apply-time special-case; `decisions.md` §3.3 + §3.7) |
 | `1` multi | per-inner-envelope target | Worker dispatcher — atomically bundles multiple writeset envelopes into one raft entry |
 | `2` root_writeset | `{data_dir}/__root__.db` | `provisionInstance` / admin `createInstance`'s `tenant.createInstance`; admin JS `platform.root.*`; ACME `cert/{host}` (see `docs/architecture/auth-and-domains.md`) |
 

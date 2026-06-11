@@ -1,4 +1,4 @@
-// segments.* — sealed-segment append log (`docs/blob-storage-plan.md` §6).
+// segments.* — sealed-segment append log (blob-storage-plan §6; `docs/architecture/routing-and-ingress.md`).
 //
 // The universal log-structured storage move, shipped as a readable,
 // forkable stdlib recipe (rule 4: durability compositions are visible

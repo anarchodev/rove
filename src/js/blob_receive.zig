@@ -1,5 +1,5 @@
 //! `blob.receive` upload driver — the transport half of
-//! `docs/blob-storage-plan.md` §3.5 (P3 slice B).
+//! blob-storage-plan §3.5 (P3 slice B; `docs/architecture/routing-and-ingress.md`).
 //!
 //! One `Job` per accepted inbound upload. The h2 layer routes body
 //! DATA into the job's queue via the `BodySink` interface (worker

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V2 Phase-5 exit smoke ⭐ (docs/v2-build-order.md §Phase 5,
+"""V2 Phase-5 exit smoke ⭐ (v2-build-order §Phase 5,
 docs/v2-phase5-multinode.md §5d/5e).
 
 Proves multi-node HA + the move fan-out end to end:

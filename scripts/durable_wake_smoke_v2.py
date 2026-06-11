@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """V2 port of `durable_wake_smoke.py` — the §2.6 durable scheduled wake
-primitive (docs/durable-wake-plan.md P0–P4) on the `V2Cluster` harness.
+primitive (durable-wake P0–P4; docs/architecture/effects-and-handlers.md) on the `V2Cluster` harness.
 
 A handler calls `scheduler.after(...)`, the engine's leader-gated sweep fires
 the baked `__system/scheduler_tick` when the watermark falls due, the tick

@@ -151,7 +151,7 @@ pub const IndexDb = struct {
     /// (tenant_id, received_ns DESC) primary index makes the count a
     /// covering scan. Used by `/v1/{tenant}/count` so dashboards can
     /// surface a record total without paginating the whole list.
-    /// `floor_received_ns` is the retention read-clamp (docs/plan-tiers.md
+    /// `floor_received_ns` is the retention read-clamp (docs/architecture/control-plane.md
     /// Lever 3): only records at-or-after it are counted. Pass 0 to disable
     /// the clamp (no plan / CP unreachable).
     pub fn queryCount(self: *IndexDb, tenant_id: []const u8, floor_received_ns: i64) Error!u64 {
@@ -202,7 +202,7 @@ pub const IndexDb = struct {
     /// Newest-first list of records for `tenant_id`. Pagination cursor:
     /// pass `(after_received_ns, after_request_id)` from the previous
     /// page's tail to advance. `(0, 0)` starts at the newest.
-    /// `floor_received_ns` is the retention read-clamp (docs/plan-tiers.md
+    /// `floor_received_ns` is the retention read-clamp (docs/architecture/control-plane.md
     /// Lever 3): rows before it are never returned. Pass 0 to disable.
     pub fn queryList(
         self: *IndexDb,

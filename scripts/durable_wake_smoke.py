@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """End-to-end smoke for the §2.6 durable scheduled wake primitive
-(docs/durable-wake-plan.md P0–P4).
+(durable-wake P0–P4; docs/architecture/effects-and-handlers.md).
 
 Exercises the full path a customer sees: a handler calls
 `scheduler.after(...)`, the engine's 1 Hz sweep fires the baked

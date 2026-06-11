@@ -1,5 +1,5 @@
 //! `durable_wake.zig` — §2.6 leader-side durable-scheduled-wake sweep
-//! (`docs/durable-wake-plan.md` P0). The engine half of the durable
+//! (durable-wake P0; `docs/architecture/effects-and-handlers.md`). The engine half of the durable
 //! scheduler: it owns ONE next-fire watermark per tenant
 //! (`TenantSlot.next_wake_ns`, set by the baked
 //! `__system/scheduler_tick` via `__rove_set_wake`) and, once per
@@ -132,7 +132,7 @@ pub fn sweepDurableWakesOnPromotion(worker: anytype) void {
 /// `scheduler_tick` at the new earliest time.
 ///
 /// This is the durable analogue of a kv-react bootstrap
-/// (`docs/durable-wake-plan.md` P2): the watermark is set from
+/// (durable-wake P2; `docs/architecture/effects-and-handlers.md`): the watermark is set from
 /// *committed* state, post-commit, never volatile-set by the `at()`
 /// caller (whose `_sched` write is still uncommitted at return — the
 /// Phase-4.1 trap). Runs on the committing worker, which may differ

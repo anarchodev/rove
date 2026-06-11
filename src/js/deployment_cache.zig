@@ -462,7 +462,7 @@ pub const TenantSlot = struct {
     /// Atomic pointer to the current snapshot. Null until first load.
     current: std.atomic.Value(?*TenantFilesSnapshot),
 
-    /// Resolved per-tenant plan limits (docs/plan-tiers.md,
+    /// Resolved per-tenant plan limits (docs/architecture/control-plane.md,
     /// docs/v2-cp-operational-state.md). Null until the CP delivers a plan
     /// (via the attach handshake on a move, or a live single-target push);
     /// null ⇒ the free tier. An atomic pointer so a live plan change swaps it
@@ -471,7 +471,7 @@ pub const TenantSlot = struct {
     plan: std.atomic.Value(?*plan_mod.PlanLimits) = .init(null),
     /// Bumped on every plan delivery/change. The rate limiter snapshots caps
     /// when it first creates a tenant's buckets, so it re-inits them when this
-    /// generation moves (docs/plan-tiers.md Lever 1 generation-refresh). Body
+    /// generation moves (docs/architecture/control-plane.md Lever 1 generation-refresh). Body
     /// size + retention read `effectivePlan()` fresh per request, so they pick
     /// up a change with no generation check.
     plan_gen: std.atomic.Value(u64) = .init(0),
@@ -496,7 +496,7 @@ pub const TenantSlot = struct {
     /// §2.6 durable scheduled wake: this tenant's single next-fire
     /// timestamp (absolute wall-clock ns), or 0 for "no wake pending."
     /// The engine's only durable-wake state — the queue/ordering lives
-    /// in the `scheduler` JS lib's `_sched/` kv (`docs/durable-wake-plan.md`).
+    /// in the `scheduler` JS lib's `_sched/` kv (`docs/architecture/effects-and-handlers.md`).
     /// Written only by the baked `__system/scheduler_tick` via
     /// `__rove_set_wake` (steady state, on the partition-owner worker)
     /// and by the post-commit bootstrap hook (P2, on the committing

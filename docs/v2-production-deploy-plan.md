@@ -3,11 +3,10 @@
 > **Status: plan / not yet built (2026-06-08).** The first production deploy
 > of the V2 `rewind` stack, plus the repeatable *feature-done → deploy → docs*
 > workflow. Supersedes the V1 deploy story in
-> [`v2-cutover-checklist.md`](v2-cutover-checklist.md) + [`architecture/deployment-and-logs.md`](architecture/deployment-and-logs.md) +
+> [`architecture/deployment-and-logs.md`](architecture/deployment-and-logs.md) +
 > `scripts/systemd/*.service`, **all of which target the retired four-binary
 > V1 topology** (`loop46`, `files-server-standalone`, `log-server-standalone`,
 > `sse-server-standalone`) and must not be used. Companions:
-> [`v2-cutover-checklist.md`](v2-cutover-checklist.md),
 > [`architecture/routing-and-ingress.md`](architecture/routing-and-ingress.md),
 > [`architecture/control-plane.md`](architecture/control-plane.md).
 
@@ -273,7 +272,8 @@ per-tenant **cap** on custom domains checked at `POST /_control/host`, plus an
 **issuance rate limit** (protects against ACME abuse + Let's Encrypt's own
 account-level limits). Free tier = subdomains of our domains only; custom domains
 = paid tier / add-on (the Vercel/Netlify model). Post-launch feature, tied to
-`docs/plan-tiers.md` + `docs/pricing-model.md`; not built yet.
+the plan-tier levers (`architecture/control-plane.md`, shipped) +
+`docs/pricing-model.md` (not built).
 
 ## 5. First-deploy runbook (outline — full version → `docs/v2-deployment.md`)
 
