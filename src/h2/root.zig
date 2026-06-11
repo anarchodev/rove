@@ -721,6 +721,13 @@ pub const H2Options = struct {
     /// raw-relay tunnel mode — or `wsUpgradeReject(ent, status)`.
     /// Mutually exclusive with `websocket_upgrades` (surface wins).
     websocket_surface: bool = false,
+    /// Accept HTTP/1.1 on server connections (the plaintext first-read
+    /// sniff / ALPN-h1). The rewind worker turns this OFF
+    /// (websocket-plan §8.5): h1 termination is the front's job alone —
+    /// every byte that reaches a worker is h2c. An h1-looking first
+    /// read just closes (the firewall-bounded private network has no
+    /// legitimate h1 speakers).
+    accept_http1: bool = true,
 };
 
 // =============================================================================
@@ -3274,6 +3281,11 @@ pub fn H2(comptime opts: Options) type {
                         // paths decrypt their first app-data flight from
                         // `decrypt_buf`.
                         if (!std.mem.eql(u8, tc.alpnProtocol(), "h2")) {
+                            if (!self.h2_opts.accept_http1) {
+                                try self.reg.destroy(conn_ent.entity);
+                                try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
+                                continue;
+                            }
                             const h1c = Http1Conn.create(self.allocator) orelse {
                                 try self.reg.destroy(conn_ent.entity);
                                 try self.reg.move(ent, &self._read_handshake, &self.io.read_in);
@@ -4676,6 +4688,14 @@ pub fn H2(comptime opts: Options) type {
                         if (conn_ptr.direction == .server and !conn_ptr.first_read_seen and
                             data_len > 0 and looksLikeHttp1Request(data_ptr[0..data_len]))
                         {
+                            // h2c-only instances (the worker —
+                            // websocket-plan §8.5): h1 terminates at the
+                            // front; refuse rather than swap in.
+                            if (!self.h2_opts.accept_http1) {
+                                try self.reg.destroy(conn_ent.entity);
+                                try self.reg.move(ent, &self._read_active, &self.io.read_in);
+                                continue;
+                            }
                             conn_ptr.first_read_seen = true;
                             _ = self.http1SwapIn(conn_ptr) orelse {
                                 try self.reg.destroy(conn_ent.entity);

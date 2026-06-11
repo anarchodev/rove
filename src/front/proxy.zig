@@ -37,13 +37,12 @@
 //! like the ambiguous post-propose 503, which is never platform-
 //! retried (docs/architecture/routing-and-ingress.md §2).
 //!
-//! ## What this still does not do (explicit follow-ups)
-//!
-//!   - WebSocket tunneling. The front's h1 listener no longer
-//!     terminates WS (`websocket_upgrades = false`); an Upgrade
-//!     request proxies as a plain GET and the backend answers it as
-//!     HTTP. A real tunnel needs an h1-upgrade client leg / raw
-//!     splice — its own slice.
+//! WebSocket: the h1 listener surfaces Upgrade heads
+//! (`websocket_surface`), and each accepted connection tunnels
+//! upstream as an RFC 8441 Extended CONNECT stream on the pooled h2c
+//! conn (websocket-plan §8.5) — `WsTunnel` pairs the raw-relay
+//! downstream socket with the CONNECT stream; 421 re-aims like any
+//! request; the downstream 101 waits for the upstream 200.
 
 const std = @import("std");
 const rove = @import("rove");
