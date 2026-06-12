@@ -77,6 +77,33 @@ durable-wake promotion pass — no `_send/owed/`-specific scan remains.
 The rule: small bounded payload (a webhook body) → bytes-in-marker; arbitrary
 size (blob bytes) → pointer-in-marker + re-execution.
 
+### The tenant door (inter-tenant fast path)
+
+When the worker is started with `REWIND_INTERNAL_FRONT=<ip>[,<ip>…]` (the
+fronts' private-plane addresses — vRack/WireGuard IPs), an outbound fetch
+whose host is one of OUR platform tenant hostnames (label-boundary suffix
+match against `REWIND_PUBLIC_SUFFIX` / `REWIND_SYSTEM_SUFFIX`) pins its
+connect to those addresses via `CURLOPT_RESOLVE` instead of resolving public
+DNS, so tenant→tenant calls never hairpin through the public edge
+(`tenantDoorPin`, `src/js/fetch_engine.zig`). Everything else is identical to
+the public path — the URL, Host, and SNI are untouched (the front routes by
+Host and serves the same wildcard cert on the private interface), TLS
+verification stays on, the transfer is taped like any fetch (replay can't
+tell the difference), and the target tenant sees an ordinary inbound request
+arriving through a front. The entries are bare IPs: `CURLOPT_RESOLVE` remaps
+the address of `host:port`, never the port, so the URL's own port carries
+over (fronts answer `:443` on the private interface because they bind
+`0.0.0.0`).
+
+SSRF posture: a door-matched host skips DNS and the blocklist — the pinned
+address is platform-configured, never customer-controlled, the same trust
+argument as the blob door — but still passes the scheme gate
+(`ssrf.parseUrl`). The customer controls only *which* tenant host is dialed,
+which the public path allows anyway. Custom domains don't suffix-match and
+take the public path. Unset ⇒ the door is inert (single-node/dev default);
+set with neither suffix configured ⇒ the worker fails loud at boot.
+Smoke: `scripts/tenant_door_smoke_v2.py`.
+
 ## Durable scheduled wake (the deferred-fire primitive)
 
 One-shot, absolute-time, at-least-once **firing** (decisions.md §3.7). Wake
