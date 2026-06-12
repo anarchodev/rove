@@ -23,7 +23,7 @@ machinery first, then cut over** — that is the bulk of this plan.
 ### 1.1 Topology — 3 bare-metal nodes, single DC, fully co-located
 
 ```
-host-1 / host-2 / host-3          (identical OVH Advance bare-metal, one DC)
+bhs-1 / bhs-2 / bhs-3             (identical OVH Advance bare-metal, one DC: BHS)
  ├─ rewind-cp      :9090 + raft :9101   directory raft — 3-voter quorum
  ├─ rewind worker  :8443 + raft :8501   DP multi-raft — tenant groups span all 3
  └─ rewind-front   :443 (TLS) + :80      stateless edge: TLS term + ACME + redirect
@@ -49,26 +49,27 @@ Rationale (full reasoning in the chat that produced this doc):
   non-event). The CP quorum never grows past 3. This is why we don't start at
   5/6.
 
-#### Phased rollout — bootstrap on VPS, migrate to bare metal (decided 2026-06-08)
+#### Phased rollout — ~~bootstrap on VPS, migrate to bare metal~~ start directly on bare metal (revised 2026-06-12)
 
-The bare-metal spec is the *destination*, not necessarily where we start.
-Co-location risk is a **customer-facing** availability concern, and the
-bootstrap phase has **no customers** — so we start cheap and migrate once solid:
+The 2026-06-08 decision was a two-phase rollout: bootstrap on 3 region-spread
+VPS (GRA/SBG/BHS — region-spread as the anti-affinity substitute), then
+migrate to bare metal later, dogfooding the move machinery on the way.
+**Superseded 2026-06-12: deploy straight onto the destination — 3 separate
+bare-metal boxes, all in BHS** (`bhs-1` / `bhs-2` / `bhs-3`). Consequences:
 
-- **Phase 1 — bootstrap:** the same co-located 3-process topology on **3 VPS,
-  spread across 3 OVH regions/AZs** (GRA/SBG/BHS). Region-spread *eliminates*
-  co-location risk even on VPS (no shared hypervisor possible), giving real
-  1-failure tolerance cheaply; the cost is ~10ms cross-DC raft latency, which is
-  irrelevant pre-customer. **Note:** VPS perf (no PLP NVMe, shared vCPU) will
-  *not* reflect bare-metal prod — don't benchmark-and-assume in either direction.
-- **Phase 2 — migrate to bare metal**, dogfooding the move machinery on our own
-  first-party tenants before any customer relies on it:
-  - **DP:** stand up the bare-metal cluster as a second DP cluster and
-    `/_control/move` each tenant over (proven by `three_node_smoke`; blobs never
-    move — shared S3 bucket).
-  - **CP:** **online voter add/retire (Path A, §8)** — add the bare-metal nodes
-    as directory voters, retire the VPS ones. This is net-new (see §8); the
-    migration is its dogfood proof.
+- **No migration phase.** The first production deploy lands on the final
+  hardware; perf characteristics (PLP-NVMe fsync, dedicated cores) are real
+  from day one — no VPS-vs-prod benchmark ambiguity.
+- **Co-location risk is covered the bare-metal way** (the §1.1 rationale):
+  three physically distinct machines, no shared hypervisor possible. Single-DC
+  exposure (a BHS-level event takes the cluster) matches the locked single-DC
+  destination; the answer to DC loss remains the async DR learner (§1.3), not
+  region-spread voters.
+- **The old Phase-2 dogfood loses its forcing function.** CP voter add/retire
+  (Path A) is still built — the DR learner shares its conf-change foundation
+  (§8 item 7) — and `/_control/move` gets dogfooded against a scratch second
+  DP cluster before any customer relies on it, instead of via a hardware
+  migration.
 
 ### 1.2 Per-node spec — sized for an fsync/RTT-bound workload, not CPU
 
@@ -412,8 +413,8 @@ deploy step.
 1. **Resolve §10 verify-items** (cheap, unblocks accurate env files).
 2. **Build the V2 deploy machinery** (§3): systemd units, `deploy.sh`,
    `docs/v2-deployment.md`; delete V1 units.
-3. **First production deploy** (§5) — the milestone, onto the **Phase-1 VPS
-   cluster** (3 region-spread VPS, §1.1). Stands up the platform + the
+3. **First production deploy** (§5) — the milestone, onto the **production
+   cluster** (3 bare-metal boxes in BHS, §1.1). Stands up the platform + the
    auto-created admin instance. **Docs not required (user's call.)**
 4. **Prove the V2 handler-publish path** — compile → publish (`files-server-v2`)
    → `/_system/release` flip → served. This single proof gates every first-party
@@ -444,11 +445,11 @@ deploy step.
      paid-tier gate. Lands when onboarding the first custom-domain customer.
    - **Static-asset CDN** over object storage (the earlier ingress discussion;
      fold into §4 when built).
-8. **Migrate to bare metal** (§1.1 Phase 2), dogfooding the move machinery:
-   **DP** = `/_control/move` each first-party tenant onto the bare-metal cluster;
-   **CP** = voter add/retire (Path A above) — add bare-metal voters, retire VPS.
-   This is the dogfood proof of both move paths before any customer depends on
-   them.
+8. ~~**Migrate to bare metal** (§1.1 Phase 2), dogfooding the move machinery~~
+   — **superseded 2026-06-12** (§1.1): we deploy straight onto bare metal, so
+   there is no migration. The dogfood proofs move elsewhere: `/_control/move`
+   against a scratch second DP cluster before the first customer-visible move;
+   CP voter add/retire (Path A) proven by the DR-learner work (item 7).
 
 ## 9. Open decisions (need your call) — all resolved 2026-06-09
 
