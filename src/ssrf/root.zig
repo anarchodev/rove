@@ -90,19 +90,19 @@ pub const CheckedUrl = struct {
     host_is_literal: bool,
 };
 
-/// The full outbound policy gate for one customer-supplied URL
-/// (`http.fetch` and everything shimmed over it). Enforces, in order:
-///   1. scheme is `https` (or `http` only under the test-only
-///      `test_allow_plaintext` escape hatch) — anything else
-///      (`file:`, `gopher:`, …) is `UnsupportedScheme`;
-///   2. a non-empty host;
-///   3. every address the host resolves to clears the blocklist
-///      (`resolveSafe` — re-resolved on every attempt per PLAN §2.6).
-/// Fail-closed: a host we can't parse or resolve is an error, never
-/// a pass-through. Percent-encoded hosts are deliberately NOT decoded
-/// — they fail resolution and are rejected (curl would decode them,
-/// so passing them through unchecked would be a smuggling vector).
-pub fn checkUrl(allocator: std.mem.Allocator, url: []const u8) !CheckedUrl {
+/// The scheme + host/port half of `checkUrl`: validates the scheme
+/// policy (https-only outside the `test_allow_plaintext` hatch) and
+/// extracts the host WITHOUT resolving it. `host` is a slice into the
+/// caller's URL (IPv6 brackets stripped). Used directly by callers
+/// that pin the connect address themselves and so never consult DNS
+/// (the fetch engine's tenant door); `checkUrl` layers resolution +
+/// the blocklist on top.
+pub const ParsedUrl = struct {
+    host: []const u8,
+    port: u16,
+};
+
+pub fn parseUrl(url: []const u8) !ParsedUrl {
     const uri = std.Uri.parse(url) catch return Error.BadUrl;
 
     var default_port: u16 = undefined;
@@ -124,7 +124,25 @@ pub fn checkUrl(allocator: std.mem.Allocator, url: []const u8) !CheckedUrl {
         host = host[1 .. host.len - 1];
     if (host.len == 0) return Error.EmptyHost;
 
-    const port = uri.port orelse default_port;
+    return .{ .host = host, .port = uri.port orelse default_port };
+}
+
+/// The full outbound policy gate for one customer-supplied URL
+/// (`http.fetch` and everything shimmed over it). Enforces, in order:
+///   1. scheme is `https` (or `http` only under the test-only
+///      `test_allow_plaintext` escape hatch) — anything else
+///      (`file:`, `gopher:`, …) is `UnsupportedScheme`;
+///   2. a non-empty host;
+///   3. every address the host resolves to clears the blocklist
+///      (`resolveSafe` — re-resolved on every attempt per PLAN §2.6).
+/// Fail-closed: a host we can't parse or resolve is an error, never
+/// a pass-through. Percent-encoded hosts are deliberately NOT decoded
+/// — they fail resolution and are rejected (curl would decode them,
+/// so passing them through unchecked would be a smuggling vector).
+pub fn checkUrl(allocator: std.mem.Allocator, url: []const u8) !CheckedUrl {
+    const parsed = try parseUrl(url);
+    const host = parsed.host;
+    const port = parsed.port;
 
     var out: CheckedUrl = .{
         .addresses = undefined,
@@ -334,6 +352,29 @@ test "checkUrl: scheme policy" {
     // Plaintext http is blocked unless the test escape hatch is set.
     try testing.expectError(Error.PlaintextBlocked, checkUrl(testing.allocator, "http://8.8.8.8/x"));
     try testing.expectError(Error.BadUrl, checkUrl(testing.allocator, "not a url"));
+}
+
+test "parseUrl: scheme policy + host/port extraction, no resolution" {
+    // Same scheme taxonomy as checkUrl (it IS checkUrl's first half).
+    try testing.expectError(Error.UnsupportedScheme, parseUrl("file:///etc/passwd"));
+    try testing.expectError(Error.PlaintextBlocked, parseUrl("http://example.com/"));
+    try testing.expectError(Error.BadUrl, parseUrl("not a url"));
+
+    // Host/port extraction — note the host is NOT resolved or
+    // blocklist-checked here (a name that would never resolve parses
+    // fine; the tenant door pins its own address, checkUrl resolves).
+    const p = try parseUrl("https://b.rewindjs.test/path?q=1");
+    try testing.expectEqualStrings("b.rewindjs.test", p.host);
+    try testing.expectEqual(@as(u16, 443), p.port);
+
+    const with_port = try parseUrl("https://B.Example.COM:8443/");
+    try testing.expectEqualStrings("B.Example.COM", with_port.host);
+    try testing.expectEqual(@as(u16, 8443), with_port.port);
+
+    // IPv6 brackets stripped, as in checkUrl.
+    const v6 = try parseUrl("https://[2001:db8::1]:9443/");
+    try testing.expectEqualStrings("2001:db8::1", v6.host);
+    try testing.expectEqual(@as(u16, 9443), v6.port);
 }
 
 test "checkUrl: literal-IP policy + ports" {

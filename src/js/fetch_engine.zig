@@ -95,9 +95,39 @@ const HELD_MAX_PER_TENANT: u32 = 16;
 /// binding can name it without an import cycle.
 pub const BLOB_ORIGIN_PREFIX = @import("blob_sessions.zig").BLOB_ORIGIN_PREFIX;
 
+/// Upper bound on `REWIND_INTERNAL_FRONT` entries — one per front in
+/// the deployment, and a deployment has at most a handful of fronts.
+const MAX_DOOR_ADDRS = 4;
+
 pub const FetchEngine = struct {
     allocator: std.mem.Allocator,
     node: *NodeState,
+
+    /// Tenant door (the inter-tenant fast path): when
+    /// `REWIND_INTERNAL_FRONT` is set, an outbound fetch whose host is
+    /// one of OUR platform tenant hostnames (`*.{REWIND_PUBLIC_SUFFIX}`
+    /// / `*.{REWIND_SYSTEM_SUFFIX}`, label-boundary suffix match) pins
+    /// its connect to these front addresses (the private plane —
+    /// vRack/WireGuard IPs) instead of resolving public DNS, so
+    /// tenant→tenant calls never hairpin through the public edge.
+    /// Everything else about the transfer is identical to the public
+    /// path: the URL/Host/SNI are untouched (the front routes by Host
+    /// and serves the same wildcard cert on the private interface),
+    /// TLS verification stays on, and the target tenant sees an
+    /// ordinary inbound request. The entries are bare IPs — the URL's
+    /// own port carries over, because CURLOPT_RESOLVE remaps the
+    /// address of `host:port`, never the port.
+    ///
+    /// SSRF posture: a door-matched host skips DNS + the blocklist
+    /// (the pinned address is platform-configured, never
+    /// customer-controlled — same trust argument as the blob door
+    /// above), but still passes the scheme gate via `ssrf.parseUrl`.
+    /// The customer controls only WHICH tenant host is dialed, which
+    /// the public path allows anyway.
+    door_addrs: [MAX_DOOR_ADDRS]std.net.Address = undefined,
+    door_addr_count: u8 = 0,
+    door_suffixes: [2][]const u8 = .{ "", "" },
+    door_suffix_count: u8 = 0,
 
     thread: ?std.Thread = null,
     multi: ?*blob_curl_multi.Multi = null,
@@ -140,7 +170,108 @@ pub const FetchEngine = struct {
         const self = try allocator.create(FetchEngine);
         errdefer allocator.destroy(self);
         self.* = .{ .allocator = allocator, .node = node };
+        if (std.posix.getenv("REWIND_INTERNAL_FRONT")) |csv| {
+            if (csv.len > 0) try self.parseDoorConfig(
+                csv,
+                std.posix.getenv("REWIND_PUBLIC_SUFFIX"),
+                std.posix.getenv("REWIND_SYSTEM_SUFFIX"),
+            );
+        }
         return self;
+    }
+
+    /// Parse + validate the tenant-door config (split from `init` so
+    /// tests can drive it without env). Boot-time misconfig fails
+    /// LOUD — a worker with a half-working door would silently route
+    /// inter-tenant calls over the public edge, which is exactly the
+    /// drift the door exists to prevent.
+    fn parseDoorConfig(
+        self: *FetchEngine,
+        addrs_csv: []const u8,
+        public_suffix: ?[]const u8,
+        system_suffix: ?[]const u8,
+    ) !void {
+        if (public_suffix) |s| if (s.len > 0) {
+            self.door_suffixes[self.door_suffix_count] = s;
+            self.door_suffix_count += 1;
+        };
+        if (system_suffix) |s| if (s.len > 0) {
+            self.door_suffixes[self.door_suffix_count] = s;
+            self.door_suffix_count += 1;
+        };
+        if (self.door_suffix_count == 0) {
+            std.log.err(
+                "rove-js fetch_engine: REWIND_INTERNAL_FRONT is set but neither " ++
+                    "REWIND_PUBLIC_SUFFIX nor REWIND_SYSTEM_SUFFIX is — the tenant " ++
+                    "door has no hostnames to match",
+                .{},
+            );
+            return error.TenantDoorMisconfig;
+        }
+        var it = std.mem.splitScalar(u8, addrs_csv, ',');
+        while (it.next()) |raw| {
+            const entry = std.mem.trim(u8, raw, " ");
+            if (entry.len == 0) continue;
+            if (self.door_addr_count == MAX_DOOR_ADDRS) {
+                std.log.err(
+                    "rove-js fetch_engine: REWIND_INTERNAL_FRONT has more than {d} entries",
+                    .{MAX_DOOR_ADDRS},
+                );
+                return error.TenantDoorMisconfig;
+            }
+            // Bare IPs only: CURLOPT_RESOLVE keeps the URL's port, so a
+            // `:port` here would be dead config masquerading as live.
+            self.door_addrs[self.door_addr_count] = std.net.Address.parseIp(entry, 0) catch {
+                std.log.err(
+                    "rove-js fetch_engine: bad REWIND_INTERNAL_FRONT entry '{s}' — " ++
+                        "entries are bare IPs (the URL's port is preserved)",
+                    .{entry},
+                );
+                return error.TenantDoorMisconfig;
+            };
+            self.door_addr_count += 1;
+        }
+        if (self.door_addr_count == 0) {
+            std.log.err("rove-js fetch_engine: REWIND_INTERNAL_FRONT is set but empty", .{});
+            return error.TenantDoorMisconfig;
+        }
+        std.log.info(
+            "rove-js fetch_engine: tenant door enabled — {d} internal front addr(s), {d} suffix(es)",
+            .{ self.door_addr_count, self.door_suffix_count },
+        );
+    }
+
+    /// Is `host` one of our platform tenant hostnames? Label-boundary
+    /// suffix match, ASCII case-insensitive: for suffix `rewindjs.app`,
+    /// both `b.rewindjs.app` and the apex `rewindjs.app` match;
+    /// `evil-rewindjs.app` does not.
+    fn doorHostMatch(self: *const FetchEngine, host: []const u8) bool {
+        for (self.door_suffixes[0..self.door_suffix_count]) |suffix| {
+            if (host.len == suffix.len) {
+                if (std.ascii.eqlIgnoreCase(host, suffix)) return true;
+            } else if (host.len > suffix.len) {
+                if (host[host.len - suffix.len - 1] == '.' and
+                    std.ascii.eqlIgnoreCase(host[host.len - suffix.len ..], suffix))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    /// Tenant-door gate for one outbound URL: returns the
+    /// CURLOPT_RESOLVE pin redirecting the host to the internal front
+    /// addresses when the door is configured AND the URL's host is one
+    /// of ours. Returns null whenever the door doesn't apply —
+    /// INCLUDING on a URL that fails to parse — so the regular gate
+    /// (`checkUrl`) owns the error taxonomy; this fast path never
+    /// invents its own rejections.
+    fn tenantDoorPin(self: *const FetchEngine, url: []const u8, buf: []u8) ?[:0]const u8 {
+        if (self.door_addr_count == 0) return null;
+        const parsed = ssrf_mod.parseUrl(url) catch return null;
+        if (!self.doorHostMatch(parsed.host)) return null;
+        // NoSpaceLeft can only mean a host far beyond DNS's 255-byte
+        // cap — decline the door; checkUrl rejects it as unresolvable.
+        return buildResolvePin(buf, parsed.host, parsed.port, self.door_addrs[0..self.door_addr_count]) catch null;
     }
 
     /// Spawn the engine thread + create the curl_multi handle.
@@ -390,6 +521,16 @@ pub const FetchEngine = struct {
         const is_blob_door = std.mem.startsWith(u8, pf.url, BLOB_ORIGIN_PREFIX);
         if (is_blob_door) {
             try self.rewriteAndSignBlobFetch(pf, method, &headers_list);
+        } else if (self.tenantDoorPin(pf.url, &pin_buf)) |pin| {
+            // Tenant door: the host is one of OUR tenant hostnames —
+            // pin the connect to the internal front addresses (private
+            // plane) instead of public DNS. See the field doc on
+            // `door_addrs` for the full semantics + SSRF argument.
+            resolve_pin = pin;
+            std.log.info(
+                "rove-js fetch_engine: tenant door — outbound to {s} pinned to internal front (tenant={s} id={s})",
+                .{ pf.url, pf.tenant_id, pf.id },
+            );
         } else {
             const checked = ssrf_mod.checkUrl(self.allocator, pf.url) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -912,6 +1053,54 @@ test "buildResolvePin: v4 + v6 set + lowercasing" {
     const v4b = try std.net.Address.parseIp("127.0.0.1", 8443);
     const pin = try buildResolvePin(&buf2, "wb.localhost", 8443, &.{ v6, v4b });
     try std.testing.expectEqualStrings("wb.localhost:8443:[0:0:0:0:0:0:0:1],127.0.0.1", pin);
+}
+
+test "tenant door: parseDoorConfig + label-boundary host match" {
+    var fe: FetchEngine = .{ .allocator = std.testing.allocator, .node = undefined };
+    try fe.parseDoorConfig("10.99.0.1, 10.99.0.2", "rewindjs.app", "rewindjs.com");
+    try std.testing.expectEqual(@as(u8, 2), fe.door_addr_count);
+    try std.testing.expectEqual(@as(u8, 2), fe.door_suffix_count);
+
+    try std.testing.expect(fe.doorHostMatch("b.rewindjs.app"));
+    try std.testing.expect(fe.doorHostMatch("B.REWINDJS.APP"));
+    try std.testing.expect(fe.doorHostMatch("rewindjs.app")); // apex
+    try std.testing.expect(fe.doorHostMatch("docs.rewindjs.com"));
+    try std.testing.expect(!fe.doorHostMatch("evil-rewindjs.app")); // label boundary
+    try std.testing.expect(!fe.doorHostMatch("rewindjs.app.evil.com"));
+    try std.testing.expect(!fe.doorHostMatch("example.com"));
+
+    // Misconfig fails loud at boot: door with no suffixes; `ip:port`
+    // entry (dead config — CURLOPT_RESOLVE keeps the URL's port).
+    var fe2: FetchEngine = .{ .allocator = std.testing.allocator, .node = undefined };
+    try std.testing.expectError(error.TenantDoorMisconfig, fe2.parseDoorConfig("10.99.0.1", null, null));
+    var fe3: FetchEngine = .{ .allocator = std.testing.allocator, .node = undefined };
+    try std.testing.expectError(error.TenantDoorMisconfig, fe3.parseDoorConfig("10.99.0.1:443", "rewindjs.app", null));
+}
+
+test "tenant door: pin redirects host to internal fronts, URL port preserved" {
+    var fe: FetchEngine = .{ .allocator = std.testing.allocator, .node = undefined };
+    try fe.parseDoorConfig("10.99.0.1,10.99.0.2", "rewindjs.app", null);
+
+    var buf: [768]u8 = undefined;
+    const pin = fe.tenantDoorPin("https://B.rewindjs.app/x", &buf).?;
+    try std.testing.expectEqualStrings("b.rewindjs.app:443:10.99.0.1,10.99.0.2", pin);
+
+    var buf2: [768]u8 = undefined;
+    const pin2 = fe.tenantDoorPin("https://b.rewindjs.app:8443/x", &buf2).?;
+    try std.testing.expectEqualStrings("b.rewindjs.app:8443:10.99.0.1,10.99.0.2", pin2);
+
+    // Non-matching host / unparseable URL → the door declines and the
+    // regular checkUrl gate owns the verdict.
+    var buf3: [768]u8 = undefined;
+    try std.testing.expect(fe.tenantDoorPin("https://example.com/", &buf3) == null);
+    try std.testing.expect(fe.tenantDoorPin("not a url", &buf3) == null);
+    // The scheme gate still applies on the door path (https-only
+    // outside the test hatch).
+    try std.testing.expect(fe.tenantDoorPin("http://b.rewindjs.app/", &buf3) == null);
+
+    // Unconfigured door is inert.
+    const fe2: FetchEngine = .{ .allocator = std.testing.allocator, .node = undefined };
+    try std.testing.expect(fe2.tenantDoorPin("https://b.rewindjs.app/", &buf3) == null);
 }
 
 /// Setup-failure path: fire a single empty `final: true` event with
