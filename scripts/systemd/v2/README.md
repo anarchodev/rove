@@ -16,6 +16,13 @@ Start order is encoded via `After=`/`Wants=`: **cp → worker → front**.
 
 ## First-time install (per host)
 
+Host bootstrap (deploy user, runtime libs, the root-level one-time steps
+below, firewall) is automated by
+[`scripts/ovh-post-install.sh`](../../ovh-post-install.sh) — feed it to the
+OVH installer as the post-installation script. The steps here pick up from
+there (binaries, env/secrets, units, TLS); on a bootstrapped host, steps 5–6's
+root parts are already done.
+
 ```bash
 # 1. binaries (or just run scripts/deploy.sh from your workstation)
 zig build rewind rewind-cp rewind-front -Doptimize=ReleaseFast
