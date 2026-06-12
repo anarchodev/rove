@@ -55,6 +55,30 @@ systemctl --user daemon-reload
 systemctl --user enable --now rewind-cp.service rewind-worker.service rewind-front.service
 ```
 
+## Private plane (vRack) — one-time, before the env files are real
+
+The `10.0.0.x` addresses in `common.env.example` live on the OVH vRack
+between the 3 hosts. The post-install firewall ships with those ports
+closed; this step opens them peer-to-peer.
+
+1. Activate a vRack (free with the servers) and attach each server's
+   **private** network interface to it — OVH Manager → Bare Metal Cloud →
+   vRack → add the 3 servers — or via the API
+   ([`scripts/ovh-api.py`](../../ovh-api.py)).
+2. On each host, as root, with that host's IP and the other two as peers:
+
+   ```bash
+   sudo scripts/vrack-setup.sh 10.0.0.1/24 10.0.0.2,10.0.0.3   # bhs-1
+   ```
+
+   This configures the private NIC (static, no gateway — vRack is plain
+   L2) and opens the §2.5 private-plane ports (8443/8501/9090/9101 + 443
+   tenant door) to the two peers on that NIC only.
+3. Verify from each host: `ping 10.0.0.N` for both peers, and from
+   *outside* confirm the public IP still answers only 22/80/443. The
+   nftables peer rule is the **sole** security boundary for these ports
+   (no app-layer auth — deploy plan §2.5).
+
 ## Ongoing deploys
 
 Use [`scripts/deploy.sh`](../../deploy.sh) from your workstation — it builds,

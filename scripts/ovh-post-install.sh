@@ -48,9 +48,10 @@ systemctl daemon-reload
 
 # ── firewall: public = 22/80/443 ONLY ───────────────────────────────────
 # The private plane (:8443 h2c, :8501/:9101 raft, :9090 CP, :443 tenant
-# door) stays CLOSED until the vRack/private-plane peers are known — open
-# it peer-to-peer by uncommenting the rule below with the real interface
-# and addresses, then `systemctl reload nftables`.
+# door) stays CLOSED until the vRack peers are known. After attaching the
+# servers' private interfaces to the vRack, run scripts/vrack-setup.sh once
+# per host — it configures the private NIC and inserts the peer rule below
+# with the real interface and addresses (the commented line is the shape).
 cat > /etc/nftables.conf <<'EOF'
 #!/usr/sbin/nft -f
 flush ruleset
