@@ -8,10 +8,12 @@ keep them in the git-ignored `.env.ovh` at the repo root and source it:
     set -a; . ./.env.ovh; set +a
 
   OVH_ENDPOINT      eu | ca | us, or a full base URL (default eu).
-                    Use the region your OVH manager account lives in.
+                    Use the entity your OVH ACCOUNT lives in — the
+                    server's physical DC is irrelevant (a US account
+                    with BHS servers is all-us).
   OVH_APP_KEY       application key      } minted together at
-  OVH_APP_SECRET    application secret   } https://<region>.api.ovh.com/createToken/
-  OVH_CONSUMER_KEY  consumer key         }
+  OVH_APP_SECRET    application secret   } eu/ca: https://<region>.api.ovh.com/createToken/
+  OVH_CONSUMER_KEY  consumer key         } us:    https://us.ovhcloud.com/auth/api/createToken
 
 Usage:
     scripts/ovh-api.py GET  /me
