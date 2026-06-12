@@ -48,7 +48,10 @@ LOG_SERVER = BIN_DIR / "log-server-standalone"
 
 # Fixed shared secrets (smokes don't need rotation; these match the rewind
 # defaults / v2_handler_smoke so behavior is reproducible).
-ROOT_TOKEN = "rewindtestroottokenpadding0123456789abcd"  # DEFAULT_ADMIN_ROOT_TOKEN
+# A non-default token: rewind refuses to boot on an unset/empty/default
+# REWIND_ROOT_TOKEN (src/rewind/main.zig). The harness exports this to
+# each worker (`REWIND_ROOT_TOKEN`) and uses it for admin-surface auth.
+ROOT_TOKEN = "smoke-nonprod-root-token-0123456789abcdef"
 MOVE_SECRET = "rewindmovesecretpadding0123456789abcdef0"
 JWT_SECRET_HEX = "a" * 64  # LOOP46_SERVICES_JWT_SECRET
 PUBLIC_SUFFIX = "localhost"
@@ -252,6 +255,12 @@ class V2Cluster:
         env["LOG_S3_KEY_PREFIX"] = self.s3_prefix
         if self.unsafe_outbound:
             env["REWIND_UNSAFE_OUTBOUND"] = "1"
+        # When the tenant door is enabled (REWIND_INTERNAL_FRONT, set by the
+        # door smoke), the door only fires for the front's TLS port. Our test
+        # front binds a high port, not 443, so tell the worker which port to
+        # accept — otherwise the door declines every test fetch.
+        if env.get("REWIND_INTERNAL_FRONT"):
+            env["REWIND_INTERNAL_FRONT_PORT"] = str(self.front_port)
         log = f"/tmp/v2smoke-{self.tag}-n{i + 1}-{os.getpid()}.log"
         self.log_paths[f"n{i + 1}"] = log
         logf = open(log, "w+")

@@ -54,7 +54,7 @@ PF = int(os.environ.get("FRONT_PORT", "18250"))
 PFILES = int(os.environ.get("FILES_PORT", "18256"))
 
 MOVE_SECRET = "rewindmovesecretpadding0123456789abcdef0"
-ROOT_TOKEN = "rewindtestroottokenpadding0123456789abcd"  # DEFAULT_ADMIN_ROOT_TOKEN
+ROOT_TOKEN = "smoke-nonprod-root-token-0123456789abcdef"  # non-default: rewind rejects the default
 JWT_SECRET_HEX = "a" * 64  # LOOP46_SERVICES_JWT_SECRET (shared with the mint below)
 ADMIN_HOST = "n1.localhost"  # REWIND_ADMIN_DOMAIN for the node
 

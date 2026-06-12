@@ -88,6 +88,7 @@ def start_blackhole():
 def spawn_rewind(name, port, data_dir, cluster_id, admin_domain):
     env = dict(os.environ)
     env["REWIND_ADMIN_DOMAIN"] = admin_domain
+    env["REWIND_ROOT_TOKEN"] = "smoke-nonprod-root-token-0123456789abcdef"  # non-default: rewind rejects unset/default
     env["REWIND_CLUSTER_ID"] = cluster_id
     # A LIST with a DEAD CP URL first (port 1, nothing listening) → exercises
     # the multi-CP fallthrough (Slice 2 HA): the worker skips the unreachable
