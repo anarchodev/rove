@@ -61,6 +61,7 @@ def spawn_rewind(name, port, data_dir, admin_domain):
     env = dict(os.environ)
     env["REWIND_ADMIN_DOMAIN"] = admin_domain
     env["REWIND_MOVE_SECRET"] = SECRET
+    env["REWIND_ROOT_TOKEN"] = "smoke-nonprod-root-token-0123456789abcdef"  # non-default: rewind rejects unset/default
     return _spawn(name, [REWIND, data_dir, str(port)], env)
 
 

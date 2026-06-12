@@ -37,6 +37,18 @@ const acme_issuer = @import("acme.zig");
 
 const CpH2 = h2.H2(.{});
 
+/// Constant-time byte-slice equality for secret comparison: the
+/// compare time depends only on the (non-secret) length, never on how
+/// many leading bytes matched — so a timing signal can't be used to
+/// brute-force the secret one byte at a time. Mirrors the root-token
+/// check in `rove-tenant`'s `authenticate`.
+fn constantTimeEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| diff |= x ^ y;
+    return diff == 0;
+}
+
 // ── Signal-driven shutdown ────────────────────────────────────────────
 var stop_flag: std.atomic.Value(bool) = .init(false);
 
@@ -469,7 +481,7 @@ const Router = struct {
             return;
         };
         const presented = headerValue(rh, MOVE_SECRET_HEADER) orelse "";
-        if (presented.len != secret.len or !std.mem.eql(u8, presented, secret)) {
+        if (!constantTimeEql(presented, secret)) {
             try replyStatus(server, ent, sid, sess, 401);
             return;
         }

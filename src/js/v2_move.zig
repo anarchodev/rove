@@ -52,6 +52,18 @@ const curl = blob.curl;
 const MOVE_SECRET_HEADER = "x-rewind-move-secret";
 const TENANT_HEADER = "x-rewind-tenant";
 
+/// Constant-time byte-slice equality for secret comparison: the
+/// compare time depends only on the (non-secret) length, never on how
+/// many leading bytes matched — so a timing signal can't be used to
+/// brute-force the secret one byte at a time. Mirrors the root-token
+/// check in `rove-tenant`'s `authenticate`.
+fn constantTimeEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| diff |= x ^ y;
+    return diff == 0;
+}
+
 /// Carries a tenant's opaque CP plan blob (`{tier, overrides}` JSON) on the
 /// `v2-attach` handshake (docs/v2-cp-operational-state.md "Delivery to the
 /// DP" — the plan rides attach on a move). Absent header ⇒ no plan delivered
@@ -93,7 +105,7 @@ pub fn tryHandleV2(
         return true;
     };
     const presented = respb.findHeader(rh, MOVE_SECRET_HEADER) orelse "";
-    if (presented.len != secret.len or !std.mem.eql(u8, presented, secret)) {
+    if (!constantTimeEql(presented, secret)) {
         try respb.setSystemResponse(server, ent, sid, sess, 401, "bad move secret\n", allocator, null, null);
         return true;
     }
