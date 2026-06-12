@@ -132,6 +132,7 @@ All three binaries are positional-arg + env-var configured. **Verified against
 | `REWIND_ADMIN_DOMAIN` | admin/`__root__` tenant host |
 | `REWIND_ROOT_TOKEN` | admin bootstrap token |
 | `REWIND_PUBLIC_SUFFIX` | customer tenant wildcard eTLD+1 (`rewindjs.app`) |
+| `REWIND_INTERNAL_FRONT` | tenant door: comma-sep **bare IPs** of the fronts on the private plane (vRack/WireGuard); outbound fetches to `*.{public/system suffix}` hosts pin their connect here instead of resolving public DNS, so tenant→tenant calls never hairpin through the public edge (`docs/architecture/effects-and-handlers.md`). Unset = inert |
 | `S3_*` / `AWS_*` | blob/log/tape backend (see §2.4) |
 
 ### 2.2 `rewind-cp` (control plane) — `rewind-cp <port>`
@@ -179,7 +180,11 @@ Optional: `S3_KEY_PREFIX_BASE` (default `""` — use `prod/`), `S3_USE_TLS`
 | `:9101` (CP raft) | CP ↔ CP | private |
 
 Ports above are **recommended canonical values**, operator-set. The front→worker
-hop is private h2c (TLS terminates at the front).
+hop is private h2c (TLS terminates at the front). With the tenant door enabled
+(`REWIND_INTERNAL_FRONT`, §2.1) workers additionally dial the fronts' `:443` on
+the private-plane interface (worker → front, TLS) for tenant→tenant fetches —
+the fronts bind `0.0.0.0`, so this needs no extra listener, just private-plane
+reachability of `:443` between the nodes.
 
 > **⚠ Security — the private plane has NO app-layer auth (verified §10).** The
 > raft transports (`:8501`, `:9101`) are unauthenticated and unencrypted, and the
