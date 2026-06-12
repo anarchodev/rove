@@ -69,6 +69,7 @@ def spawn_rewind(name, port, data_dir, multinode=None):
     env = dict(os.environ)
     env["REWIND_ADMIN_DOMAIN"] = f"{name}.localhost"
     env["REWIND_MOVE_SECRET"] = MOVE_SECRET
+    env["REWIND_ROOT_TOKEN"] = "smoke-nonprod-root-token-0123456789abcdef"  # non-default: rewind rejects unset/default
     if multinode:
         node_id, voters, peers = multinode
         env["REWIND_NODE_ID"] = str(node_id)

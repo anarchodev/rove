@@ -31,15 +31,20 @@ PORT = int(os.environ.get("REWIND_SMOKE_PORT", "18097"))
 DATA_DIR = f"/tmp/rewind-smoke-{os.getpid()}"
 BIN = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin", "rewind")
 ADMIN_HOST = "admin.localhost"
-ROOT_TOKEN = "rewindtestroottokenpadding0123456789abcd"  # matches src/rewind/main.zig
+ROOT_TOKEN = "smoke-nonprod-root-token-0123456789abcdef"  # non-default: rewind rejects the default
 
 
 def spawn():
+    # rewind refuses to boot on an unset/default REWIND_ROOT_TOKEN, so set
+    # it explicitly (the curl_put auth below uses the same value).
+    env = dict(os.environ)
+    env["REWIND_ROOT_TOKEN"] = ROOT_TOKEN
     p = subprocess.Popen(
         [BIN, DATA_DIR, str(PORT)],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env=env,
     )
     # Wait for the listen line.
     deadline = time.time() + 15

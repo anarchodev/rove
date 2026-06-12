@@ -30,12 +30,16 @@ const files_mod = @import("rove-files");
 const Bridge = bridge_mod.Bridge;
 const Worker = rjs.Worker(.{});
 
-/// 2e smoke: the host the admin surface answers on + the root bearer.
-/// Overridable via env (`REWIND_ADMIN_DOMAIN` / `REWIND_ROOT_TOKEN`) so a
-/// two-cluster Phase-3 deployment can give each cluster a DISTINCT admin
-/// domain — the front-door routing proof keys off "Host matches this
-/// cluster's admin domain → 204, else mismatch" (two_cluster_smoke.py).
+/// The host the admin surface answers on. Overridable via env
+/// (`REWIND_ADMIN_DOMAIN`) so a two-cluster deployment can give each
+/// cluster a DISTINCT admin domain — the front-door routing proof keys
+/// off "Host matches this cluster's admin domain → 204, else mismatch"
+/// (two_cluster_smoke.py).
 const DEFAULT_ADMIN_API_DOMAIN = "admin.localhost";
+/// NOT a usable default — a tripwire. The boot path (`main`) refuses to
+/// start when `REWIND_ROOT_TOKEN` is unset, empty, or equal to this, so
+/// a misconfigured node can never silently serve the admin surface on a
+/// known token. Smokes set `REWIND_ROOT_TOKEN` to their own value.
 const DEFAULT_ADMIN_ROOT_TOKEN = "rewindtestroottokenpadding0123456789abcd";
 
 // ── Signal-driven shutdown ────────────────────────────────────────────
@@ -480,7 +484,26 @@ pub fn main() !void {
     try std.fs.cwd().makePath(data_dir);
 
     const admin_api_domain = std.posix.getenv("REWIND_ADMIN_DOMAIN") orelse DEFAULT_ADMIN_API_DOMAIN;
-    const admin_root_token = std.posix.getenv("REWIND_ROOT_TOKEN") orelse DEFAULT_ADMIN_ROOT_TOKEN;
+    // The root token gates the admin/`__root__` surface (`/_system/admin-kv`,
+    // `platform.root.*`). Refuse to boot on an unset, empty, or default token:
+    // a silent fallback to the compiled-in test value would leave the admin
+    // surface wide open on a misconfigured node. The constant below is a
+    // tripwire, never a usable default — every deployment (and every smoke,
+    // via `REWIND_ROOT_TOKEN`) must set a strong, unique value.
+    const admin_root_token = blk: {
+        const t = std.posix.getenv("REWIND_ROOT_TOKEN") orelse {
+            std.log.err("rewind: REWIND_ROOT_TOKEN is not set — refusing to boot. " ++
+                "Set it to a strong, unique secret (the admin/root surface must " ++
+                "never run on an unset or default token).", .{});
+            return error.RootTokenNotConfigured;
+        };
+        if (t.len == 0 or std.mem.eql(u8, t, DEFAULT_ADMIN_ROOT_TOKEN)) {
+            std.log.err("rewind: REWIND_ROOT_TOKEN is empty or equals the compiled-in " ++
+                "default — refusing to boot. Set it to a strong, unique secret.", .{});
+            return error.RootTokenInsecure;
+        }
+        break :blk t;
+    };
     // Test-only outbound escape hatch for smoke topologies whose
     // upstream echo tenants live on loopback over plaintext h2c.
     // Relaxes ONLY the loopback block + the TLS-always rule on

@@ -133,7 +133,8 @@ All three binaries are positional-arg + env-var configured. **Verified against
 | `REWIND_ADMIN_DOMAIN` | admin/`__root__` tenant host |
 | `REWIND_ROOT_TOKEN` | admin bootstrap token |
 | `REWIND_PUBLIC_SUFFIX` | customer tenant wildcard eTLD+1 (`rewindjs.app`) |
-| `REWIND_INTERNAL_FRONT` | tenant door: comma-sep **bare IPs** of the fronts on the private plane (vRack/WireGuard); outbound fetches to `*.{public/system suffix}` hosts pin their connect here instead of resolving public DNS, so tenant→tenant calls never hairpin through the public edge (`docs/architecture/effects-and-handlers.md`). Unset = inert |
+| `REWIND_INTERNAL_FRONT` | tenant door: comma-sep **bare IPs** of the fronts on the private plane (vRack/WireGuard); outbound fetches to `*.{public/system suffix}` hosts pin their connect here instead of resolving public DNS, so tenant→tenant calls never hairpin through the public edge (`docs/architecture/effects-and-handlers.md`). The door fires **only for the front's TLS port** (so a `…:9090` URL can't be pinned at the co-located CP) — `:443` by default; set `REWIND_INTERNAL_FRONT_PORT` only if the front's TLS port differs (test topologies). Unset = inert |
+| `REWIND_INTERNAL_FRONT_PORT` | tenant door: the front TLS port the door accepts + pins (default `443`). Operators leave it unset in prod; test harnesses set it to the front's high port |
 | `S3_*` / `AWS_*` | blob/log/tape backend (see §2.4) |
 
 ### 2.2 `rewind-cp` (control plane) — `rewind-cp <port>`

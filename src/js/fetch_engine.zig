@@ -99,6 +99,20 @@ pub const BLOB_ORIGIN_PREFIX = @import("blob_sessions.zig").BLOB_ORIGIN_PREFIX;
 /// the deployment, and a deployment has at most a handful of fronts.
 const MAX_DOOR_ADDRS = 4;
 
+/// Default front public TLS port — the only port the tenant door fires
+/// for unless `REWIND_INTERNAL_FRONT_PORT` overrides it (`door_port`).
+/// `CURLOPT_RESOLVE` remaps the address of `host:port` but never the
+/// port, and CP (`:9090`), worker h2c (`:8443`), and raft (`:8501`/
+/// `:9101`) are co-located on the front boxes — so a `host:9090` URL
+/// would otherwise pin straight at an internal service's private-plane
+/// address. The door declines any other port (see `tenantDoorPin`), so
+/// reaching an internal port is impossible by construction rather than
+/// resting on the coincidence that those ports speak plaintext while the
+/// door is https-only. Matches the front's `:443` listener (deploy plan
+/// §2.5); test topologies set `REWIND_INTERNAL_FRONT_PORT` to the front's
+/// high port.
+const FRONT_TLS_PORT: u16 = 443;
+
 pub const FetchEngine = struct {
     allocator: std.mem.Allocator,
     node: *NodeState,
@@ -114,9 +128,12 @@ pub const FetchEngine = struct {
     /// path: the URL/Host/SNI are untouched (the front routes by Host
     /// and serves the same wildcard cert on the private interface),
     /// TLS verification stays on, and the target tenant sees an
-    /// ordinary inbound request. The entries are bare IPs — the URL's
-    /// own port carries over, because CURLOPT_RESOLVE remaps the
-    /// address of `host:port`, never the port.
+    /// ordinary inbound request. The entries are bare IPs and the door
+    /// only fires for the front's TLS port (`FRONT_TLS_PORT`):
+    /// CURLOPT_RESOLVE remaps the address of `host:port` but never the
+    /// port, and CP/worker/raft are co-located on the front boxes, so a
+    /// `host:9090` URL would otherwise pin at an internal port. Non-443
+    /// door hosts fall to the public path instead (see `tenantDoorPin`).
     ///
     /// SSRF posture: a door-matched host skips DNS + the blocklist
     /// (the pinned address is platform-configured, never
@@ -128,6 +145,11 @@ pub const FetchEngine = struct {
     door_addr_count: u8 = 0,
     door_suffixes: [2][]const u8 = .{ "", "" },
     door_suffix_count: u8 = 0,
+    /// The URL port the door fires for — the front's TLS port. Defaults
+    /// to `FRONT_TLS_PORT` (443); `REWIND_INTERNAL_FRONT_PORT` overrides
+    /// it for test topologies whose front binds a high port. A door host
+    /// on any other port is declined (`tenantDoorPin`).
+    door_port: u16 = FRONT_TLS_PORT,
 
     thread: ?std.Thread = null,
     multi: ?*blob_curl_multi.Multi = null,
@@ -171,11 +193,25 @@ pub const FetchEngine = struct {
         errdefer allocator.destroy(self);
         self.* = .{ .allocator = allocator, .node = node };
         if (std.posix.getenv("REWIND_INTERNAL_FRONT")) |csv| {
-            if (csv.len > 0) try self.parseDoorConfig(
-                csv,
-                std.posix.getenv("REWIND_PUBLIC_SUFFIX"),
-                std.posix.getenv("REWIND_SYSTEM_SUFFIX"),
-            );
+            if (csv.len > 0) {
+                try self.parseDoorConfig(
+                    csv,
+                    std.posix.getenv("REWIND_PUBLIC_SUFFIX"),
+                    std.posix.getenv("REWIND_SYSTEM_SUFFIX"),
+                );
+                // The door fires only for the front's TLS port (443 in
+                // prod). Test topologies whose front binds a high port
+                // set REWIND_INTERNAL_FRONT_PORT so the door still applies.
+                if (std.posix.getenv("REWIND_INTERNAL_FRONT_PORT")) |ps| {
+                    self.door_port = std.fmt.parseInt(u16, ps, 10) catch {
+                        std.log.err(
+                            "rove-js fetch_engine: bad REWIND_INTERNAL_FRONT_PORT '{s}' — want a port number",
+                            .{ps},
+                        );
+                        return error.TenantDoorMisconfig;
+                    };
+                }
+            }
         }
         return self;
     }
@@ -269,6 +305,16 @@ pub const FetchEngine = struct {
         if (self.door_addr_count == 0) return null;
         const parsed = ssrf_mod.parseUrl(url) catch return null;
         if (!self.doorHostMatch(parsed.host)) return null;
+        // Only ever pin the front's TLS port (`door_port`, 443 in prod).
+        // The pin preserves the URL's port, and CP/worker/raft are
+        // co-located on the front boxes, so a `…:9090` / `…:8443` URL
+        // would otherwise pin at an internal service's address. Decline
+        // any other port: it falls to the public path (`checkUrl`), where
+        // the host resolves to the front's PUBLIC address and the
+        // internal port simply isn't exposed there. (`parseUrl` defaults
+        // the port to 443 when the URL omits it, so ordinary door traffic
+        // is unaffected.)
+        if (parsed.port != self.door_port) return null;
         // NoSpaceLeft can only mean a host far beyond DNS's 255-byte
         // cap — decline the door; checkUrl rejects it as unresolvable.
         return buildResolvePin(buf, parsed.host, parsed.port, self.door_addrs[0..self.door_addr_count]) catch null;
@@ -1077,7 +1123,7 @@ test "tenant door: parseDoorConfig + label-boundary host match" {
     try std.testing.expectError(error.TenantDoorMisconfig, fe3.parseDoorConfig("10.99.0.1:443", "rewindjs.app", null));
 }
 
-test "tenant door: pin redirects host to internal fronts, URL port preserved" {
+test "tenant door: pin redirects host to internal fronts, only port 443" {
     var fe: FetchEngine = .{ .allocator = std.testing.allocator, .node = undefined };
     try fe.parseDoorConfig("10.99.0.1,10.99.0.2", "rewindjs.app", null);
 
@@ -1085,9 +1131,23 @@ test "tenant door: pin redirects host to internal fronts, URL port preserved" {
     const pin = fe.tenantDoorPin("https://B.rewindjs.app/x", &buf).?;
     try std.testing.expectEqualStrings("b.rewindjs.app:443:10.99.0.1,10.99.0.2", pin);
 
+    // A door host on a NON-443 port (e.g. the co-located CP :9090 or
+    // worker h2c :8443) is declined — the pin would otherwise aim at an
+    // internal service on the front's private-plane address. Declining
+    // sends it to the public path, where the host's public address has
+    // no such port exposed.
     var buf2: [768]u8 = undefined;
-    const pin2 = fe.tenantDoorPin("https://b.rewindjs.app:8443/x", &buf2).?;
-    try std.testing.expectEqualStrings("b.rewindjs.app:8443:10.99.0.1,10.99.0.2", pin2);
+    try std.testing.expect(fe.tenantDoorPin("https://b.rewindjs.app:8443/x", &buf2) == null);
+    try std.testing.expect(fe.tenantDoorPin("https://b.rewindjs.app:9090/x", &buf2) == null);
+
+    // door_port override (test topologies whose front binds a high port,
+    // via REWIND_INTERNAL_FRONT_PORT): the matching port now pins, and
+    // 443 — along with every other port — is declined.
+    fe.door_port = 8443;
+    const pin_hi = fe.tenantDoorPin("https://b.rewindjs.app:8443/x", &buf2).?;
+    try std.testing.expectEqualStrings("b.rewindjs.app:8443:10.99.0.1,10.99.0.2", pin_hi);
+    try std.testing.expect(fe.tenantDoorPin("https://b.rewindjs.app/x", &buf2) == null);
+    fe.door_port = 443;
 
     // Non-matching host / unparseable URL → the door declines and the
     // regular checkUrl gate owns the verdict.
