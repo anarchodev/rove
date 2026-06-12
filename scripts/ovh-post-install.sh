@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ovh-post-install.sh — OVH installer post-installation script for the V2
-# production hosts (gra-1 / sbg-1 / bhs-1). Runs ONCE as root on first boot.
+# production hosts (bhs-1 / bhs-2 / bhs-3). Runs ONCE as root on first boot.
 #
 # Scope is deliberately minimal: deploy user + ssh key, runtime shared libs,
 # the one-time root steps from scripts/systemd/v2/README.md, and the host
