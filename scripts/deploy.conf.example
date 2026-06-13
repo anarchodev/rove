@@ -1,6 +1,7 @@
-# deploy.conf — config for scripts/deploy.sh. Copy to scripts/deploy.conf
-# (gitignored) and edit. deploy.sh ships ONLY binaries + restarts; it never
-# pushes env files / secrets (those are provisioned out-of-band).
+# deploy.conf — config for scripts/deploy.sh. Copy to
+# ~/.config/rove/deploy.conf (preferred — survives worktree churn) or the
+# legacy scripts/deploy.conf, and edit. deploy.sh ships ONLY binaries +
+# restarts; it never pushes env files / secrets (provisioned out-of-band).
 
 # SSH targets for the 3 nodes, space-separated. One at a time, in order.
 # Order is not safety-critical (one host fully restarts + rejoins quorum
