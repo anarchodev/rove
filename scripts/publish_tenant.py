@@ -19,8 +19,9 @@ Bundle layout:
     anything else outside _static/ is skipped with a warning (e.g. a
     source-of-truth index.html that a handler embeds).
 
-Config comes from the operator env file (default .env.prod at the repo
-root): S3_* / AWS_*, LOOP46_SERVICES_JWT_SECRET, REWIND_ROOT_TOKEN,
+Config comes from the operator env file (default ~/.config/rove/prod.env,
+legacy fallback .env.prod at the repo root): S3_* / AWS_*,
+LOOP46_SERVICES_JWT_SECRET, REWIND_ROOT_TOKEN,
 REWIND_ADMIN_DOMAIN, REWIND_MOVE_SECRET (only for --provision/--host),
 ADMIN_OPS_SECRET (only for --host), ROVE_PUBLISH_SSH (the host the release
 call tunnels through), ROVE_WORKER_URLS, ROVE_CP_URL_INTERNAL.
@@ -47,6 +48,15 @@ from smoke_lib import mint_jwt  # noqa: E402
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 FILES_PORT = 18180
+
+
+def default_env_file() -> pathlib.Path:
+    """Operator secrets live at ~/.config/rove/prod.env (survives worktree
+    churn; mirrors the hosts' ~/.config/rove/common.env). Fall back to the
+    legacy repo-root .env.prod if the XDG copy isn't present."""
+    xdg = pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or pathlib.Path.home() / ".config")
+    cand = xdg / "rove" / "prod.env"
+    return cand if cand.exists() else REPO / ".env.prod"
 
 CONTENT_TYPES = {  # extends mimetypes for the cases we care about
     ".mjs": "text/javascript; charset=utf-8",
@@ -131,7 +141,7 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("tenant")
     ap.add_argument("bundle", type=pathlib.Path)
-    ap.add_argument("--env", type=pathlib.Path, default=REPO / ".env.prod")
+    ap.add_argument("--env", type=pathlib.Path, default=default_env_file())
     ap.add_argument("--provision", action="store_true",
                     help="provision the tenant first (409/conflict = already placed, fine)")
     ap.add_argument("--host", action="append", default=[],

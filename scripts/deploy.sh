@@ -15,16 +15,24 @@
 # current one is healthy. Aborts the rollout if a node doesn't recover.
 #
 # Usage:
-#   cp scripts/deploy.conf.example scripts/deploy.conf   # edit it
+#   cp scripts/deploy.conf.example ~/.config/rove/deploy.conf  # edit it
 #   scripts/deploy.sh                 # build + test + rolling deploy
 #   ROVE_SKIP_TESTS=1 scripts/deploy.sh
 #
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONF="${ROVE_DEPLOY_CONF:-$REPO_ROOT/scripts/deploy.conf}"
+# Config lives at ~/.config/rove/deploy.conf (survives worktree churn);
+# repo-root scripts/deploy.conf is the legacy fallback. Override with
+# ROVE_DEPLOY_CONF.
+CONF="${ROVE_DEPLOY_CONF:-}"
+if [ -z "$CONF" ]; then
+    for c in "${XDG_CONFIG_HOME:-$HOME/.config}/rove/deploy.conf" "$REPO_ROOT/scripts/deploy.conf"; do
+        [ -f "$c" ] && CONF="$c" && break
+    done
+fi
 # shellcheck disable=SC1090
-[ -f "$CONF" ] && source "$CONF"
+[ -n "$CONF" ] && [ -f "$CONF" ] && source "$CONF"
 
 : "${ROVE_HOSTS:?set ROVE_HOSTS in scripts/deploy.conf (see deploy.conf.example)}"
 SSH="${ROVE_SSH:-ssh}"
