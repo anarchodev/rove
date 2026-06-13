@@ -67,7 +67,16 @@ fi
 # ── health probe (runs on-host over ssh; private ports aren't public) ──
 # wait_health <host> <service> [readiness_url]
 wait_health(){
-    local host="$1" svc="$2" url="${3:-}" unit="rewind-$svc.service" t=0
+    # Two `local` statements: in one statement bash word-expands every
+    # argument BEFORE any assignment lands, so `unit="rewind-$svc…"` would
+    # read the caller's (unset) svc — set -u aborts. Bit us on the first
+    # real roll.
+    local host="$1" svc="$2" url="${3:-}" t=0
+    local unit="rewind-$svc.service"
+    # The worker is h2c-ONLY (accept_http1=false) — a plain HTTP/1.1 curl
+    # never connects a stream. Found on the first real prod roll.
+    local curl_flags="-fsS -m5 -o /dev/null"
+    [ "$svc" = worker ] && curl_flags="$curl_flags --http2-prior-knowledge"
     # liveness: unit is active
     until $SSH "$host" "$RUSER_ENV systemctl --user is-active --quiet '$unit'"; do
         t=$((t+1)); [ "$t" -lt "$HEALTH_TIMEOUT" ] || die "$host: $unit not active after ${HEALTH_TIMEOUT}s"
@@ -75,12 +84,39 @@ wait_health(){
     done
     # readiness: endpoint answers (cp/worker only; front is liveness-only)
     if [ -n "$url" ]; then
-        until $SSH "$host" "curl -fsS -m5 -o /dev/null '$url'"; do
+        until $SSH "$host" "curl $curl_flags '$url'"; do
             t=$((t+2)); [ "$t" -lt "$HEALTH_TIMEOUT" ] || die "$host: $svc not ready ($url) after ${HEALTH_TIMEOUT}s"
             sleep 2
         done
     fi
     ok "$host: $svc healthy"
+}
+
+# cp readiness. `/_cp/leader` is 200 ONLY on the directory leader (it's
+# the HA discovery probe) — a restarted node that rejoins as a FOLLOWER
+# answers 503 forever, so gating a node on its own 200 deadlocks the
+# roll (bit us on the first real one). Ready =
+#   (a) the local CP answers HTTP at all (any status: serving), and
+#   (b) SOME node answers 200 (the directory raft has a leader).
+wait_cp_ready(){
+    local host="$1" t=0
+    until $SSH "$host" "curl -s -m5 -o /dev/null http://localhost:9090/_cp/leader"; do
+        t=$((t+2)); [ "$t" -lt "$HEALTH_TIMEOUT" ] || die "$host: cp not serving after ${HEALTH_TIMEOUT}s"
+        sleep 2
+    done
+    ok "$host: cp serving"
+    t=0
+    while :; do
+        local h
+        for h in $ROVE_HOSTS; do
+            if $SSH "$h" "curl -fsS -m5 -o /dev/null http://localhost:9090/_cp/leader" 2>/dev/null; then
+                ok "directory leader present (via $h)"
+                return 0
+            fi
+        done
+        t=$((t+2)); [ "$t" -lt "$HEALTH_TIMEOUT" ] || die "directory raft has no leader after ${HEALTH_TIMEOUT}s"
+        sleep 2
+    done
 }
 
 # ── 2. Rolling deploy, one host fully before the next ─────────────────
@@ -103,7 +139,8 @@ for host in $ROVE_HOSTS; do
 
     log "[$host] restart cp → worker → front"
     $SSH "$host" "$RUSER_ENV systemctl --user restart rewind-cp.service"     || die "$host: cp restart failed"
-    wait_health "$host" cp     "http://localhost:9090/_cp/leader"
+    wait_health "$host" cp
+    wait_cp_ready "$host"
     $SSH "$host" "$RUSER_ENV systemctl --user restart rewind-worker.service" || die "$host: worker restart failed"
     wait_health "$host" worker "http://localhost:8443/_system/health"
     $SSH "$host" "$RUSER_ENV systemctl --user restart rewind-front.service"  || die "$host: front restart failed"
@@ -114,4 +151,7 @@ for host in $ROVE_HOSTS; do
     ok "$host: done"
 done
 
-log "Rolling deploy complete — all 3 nodes updated + healthy"
+# NOTE: until the third voter exists, restarting either of the 2 live
+# nodes drops raft below quorum for the restart window — writes stall
+# briefly and resume on rejoin. Zero-downtime claims start at 3 nodes.
+log "Rolling deploy complete — all nodes updated + healthy"
