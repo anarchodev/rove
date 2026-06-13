@@ -45,6 +45,7 @@ TimeoutStopSec=10
 # share between the worker (bulk) and the idle CP.
 CPUWeight=3000
 MemoryHigh=4G
+LimitNOFILE=524288
 
 # Hardening. Reads the TLS cert under %h/.rove; writes nothing to disk.
 ProtectSystem=strict
