@@ -35,6 +35,10 @@ TimeoutStopSec=30
 CPUWeight=10000
 MemoryHigh=48G
 
+# Per-worker io_uring rings + registered fds + per-tenant LMDB maps blow
+# through the 1024 default soft limit at boot (UserFdQuotaExceeded).
+LimitNOFILE=524288
+
 # Hardening.
 ProtectSystem=strict
 ProtectHome=read-only
