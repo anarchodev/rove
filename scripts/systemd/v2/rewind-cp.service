@@ -54,6 +54,7 @@ TimeoutStopSec=20
 CPUWeight=1000
 MemoryMin=256M
 MemoryHigh=2G
+LimitNOFILE=524288
 
 # Hardening (mirrors the V1 units).
 ProtectSystem=strict
