@@ -494,6 +494,48 @@ fn serveStaticByKey(
         return 304;
     }
 
+    // Top-level documents (`text/html`) MUST be served same-origin and
+    // inline. A 302 on a navigation moves the browser's origin to the
+    // S3 host, so the document's relative asset paths (`./app.js`),
+    // same-origin `fetch()`s, and reload-after-expiry all break. The
+    // worker therefore reads the (small) document from the blob store
+    // and serves the bytes itself. This does NOT regress the worker-RAM
+    // principle: only the entry document is inlined — every subresource
+    // (CSS/JS/images, below) still 302s to the blob store, because a
+    // redirect on a *subresource* fetch doesn't change the document
+    // origin. HEAD needs neither the body nor a blob fetch.
+    if (isHtmlDocument(entry.content_type)) {
+        const body: ?[]u8 = if (is_head) null else (tc.slot.blob_backend.blobStore().get(
+            &entry.hash_hex,
+            allocator,
+        ) catch |err| {
+            std.log.warn(
+                "rove-js: inline html fetch for {s} failed: {s}",
+                .{ key, @errorName(err) },
+            );
+            return err;
+        });
+        const hdrs = try packRespHeaders(allocator, &.{
+            .{ .name = "content-type", .value = entry.content_type },
+            .{ .name = "etag", .value = etag },
+            // The document lives at a stable path and changes on
+            // redeploy (it is NOT content-addressed by URL), so
+            // revalidate every load; the etag short-circuits the body.
+            .{ .name = "cache-control", .value = "public, max-age=0, must-revalidate" },
+        });
+        try finalizeResponse(
+            server,
+            ent,
+            sid,
+            sess,
+            200,
+            hdrs,
+            if (body) |b| b.ptr else null,
+            if (body) |b| @intCast(b.len) else 0,
+        );
+        return 200;
+    }
+
     // Phase 4 of `docs/deployment-snapshots-plan.md`: 302-redirect
     // to a presigned S3 URL instead of proxying bytes through the
     // worker. The browser fetches directly from S3 — the worker
@@ -533,8 +575,8 @@ fn serveStaticByKey(
     defer allocator.free(url);
 
     // HEAD and GET both emit the same 302 (no body either way per
-    // RFC 9110 §9.3.2 — and 302 doesn't carry one).
-    _ = is_head;
+    // RFC 9110 §9.3.2 — and 302 doesn't carry one). `is_head` is
+    // consumed by the inline-document branch above.
     try emitStaticRedirectWithEtag(
         server,
         allocator,
@@ -546,6 +588,15 @@ fn serveStaticByKey(
         presign_expires_secs,
     );
     return 302;
+}
+
+/// True if `content_type` is an HTML document (`text/html`, with or
+/// without a `; charset=…` parameter). These are served inline rather
+/// than redirected so a top-level navigation stays same-origin.
+fn isHtmlDocument(content_type: []const u8) bool {
+    const prefix = "text/html";
+    return content_type.len >= prefix.len and
+        std.ascii.eqlIgnoreCase(content_type[0..prefix.len], prefix);
 }
 
 /// True if `inm` (If-None-Match header value) contains a tag equal to
@@ -668,6 +719,17 @@ fn emitStaticRedirect(
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
+
+test "isHtmlDocument: matches text/html with and without params" {
+    try std.testing.expect(isHtmlDocument("text/html"));
+    try std.testing.expect(isHtmlDocument("text/html; charset=utf-8"));
+    try std.testing.expect(isHtmlDocument("Text/HTML")); // case-insensitive
+    try std.testing.expect(!isHtmlDocument("text/javascript; charset=utf-8"));
+    try std.testing.expect(!isHtmlDocument("text/css"));
+    try std.testing.expect(!isHtmlDocument("application/json"));
+    try std.testing.expect(!isHtmlDocument("")); // empty content-type → redirect
+    try std.testing.expect(!isHtmlDocument("text/ht")); // shorter than prefix
+}
 
 test "etagMatches: single tag" {
     try std.testing.expect(etagMatches("\"abc\"", "\"abc\""));
