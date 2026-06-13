@@ -3,9 +3,9 @@
 
 Drives the OVH control API (vRack attach, server/NIC inventory, task
 polling) without the manager UI. Credentials come from the environment —
-keep them in the git-ignored `.env.ovh` at the repo root and source it:
+keep them in `~/.config/rove/ovh.env` (0600) and source it:
 
-    set -a; . ./.env.ovh; set +a
+    set -a; . ~/.config/rove/ovh.env; set +a
 
   OVH_ENDPOINT      eu | ca | us, or a full base URL (default eu).
                     Use the entity your OVH ACCOUNT lives in — the
@@ -59,7 +59,7 @@ def main() -> int:
         app_secret = os.environ["OVH_APP_SECRET"]
         consumer_key = os.environ["OVH_CONSUMER_KEY"]
     except KeyError as e:
-        print(f"missing {e.args[0]} — source .env.ovh first (see header)", file=sys.stderr)
+        print(f"missing {e.args[0]} — source ~/.config/rove/ovh.env first (see header)", file=sys.stderr)
         return 2
 
     url = base + path

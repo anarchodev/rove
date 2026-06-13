@@ -12,15 +12,19 @@ group leadership settles are normal).
 Bundle layout:
     <bundle>/
       *.mjs / **/*.mjs        handler sources (compiled server-side);
-                              _middlewares/, _rp/ etc. ride along
+                              index.mjs, _middlewares/, _rp/ etc. ride along
       _static/**              static assets, served at their path sans
                               _static/ (the worker only consults
                               _static/-prefixed manifest keys)
-    anything else outside _static/ is skipped with a warning (e.g. a
-    source-of-truth index.html that a handler embeds).
+      _config/**              deployed as static; config_mirror replicates
+                              it to kv at release (e.g. the auth tenant's
+                              _config/oidc/default.json client registry)
+    codemirror-entry.mjs (build source) and anything else is skipped.
+    Classification mirrors classify() in src/files_server/bootstrap.zig.
 
-Config comes from the operator env file (default .env.prod at the repo
-root): S3_* / AWS_*, LOOP46_SERVICES_JWT_SECRET, REWIND_ROOT_TOKEN,
+Config comes from the operator env file (default ~/.config/rove/prod.env,
+legacy fallback .env.prod at the repo root): S3_* / AWS_*,
+LOOP46_SERVICES_JWT_SECRET, REWIND_ROOT_TOKEN,
 REWIND_ADMIN_DOMAIN, REWIND_MOVE_SECRET (only for --provision/--host),
 ADMIN_OPS_SECRET (only for --host), ROVE_PUBLISH_SSH (the host the release
 call tunnels through), ROVE_WORKER_URLS, ROVE_CP_URL_INTERNAL.
@@ -47,6 +51,15 @@ from smoke_lib import mint_jwt  # noqa: E402
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 FILES_PORT = 18180
+
+
+def default_env_file() -> pathlib.Path:
+    """Operator secrets live at ~/.config/rove/prod.env (survives worktree
+    churn; mirrors the hosts' ~/.config/rove/common.env). Fall back to the
+    legacy repo-root .env.prod if the XDG copy isn't present."""
+    xdg = pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or pathlib.Path.home() / ".config")
+    cand = xdg / "rove" / "prod.env"
+    return cand if cand.exists() else REPO / ".env.prod"
 
 CONTENT_TYPES = {  # extends mimetypes for the cases we care about
     ".mjs": "text/javascript; charset=utf-8",
@@ -131,7 +144,7 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("tenant")
     ap.add_argument("bundle", type=pathlib.Path)
-    ap.add_argument("--env", type=pathlib.Path, default=REPO / ".env.prod")
+    ap.add_argument("--env", type=pathlib.Path, default=default_env_file())
     ap.add_argument("--provision", action="store_true",
                     help="provision the tenant first (409/conflict = already placed, fine)")
     ap.add_argument("--host", action="append", default=[],
@@ -155,19 +168,27 @@ def main() -> int:
         sys.exit(f"{args.bundle}: not a directory")
 
     # ── classify the bundle ──────────────────────────────────────────
+    # Mirrors classify() in src/files_server/bootstrap.zig EXACTLY (the
+    # platform-bundle walker): _static/ AND _config/ are static (the
+    # latter mirrors to kv via config_mirror at release — e.g. the auth
+    # tenant's _config/oidc/default.json client registry); the build
+    # source codemirror-entry.mjs is dropped; every other .mjs (index,
+    # _middlewares/*, _rp/*, …) compiles to a handler.
     handlers, statics, skipped = [], [], []
     for p in sorted(args.bundle.rglob("*")):
         if not p.is_file():
             continue
         rel = p.relative_to(args.bundle).as_posix()
-        if rel.startswith("_static/"):
+        if rel.startswith("_static/") or rel.startswith("_config/"):
             statics.append((rel, p))
-        elif p.suffix == ".mjs":
+        elif rel == "codemirror-entry.mjs":
+            skipped.append(rel)
+        elif rel.endswith(".mjs"):
             handlers.append((rel, p))
         else:
             skipped.append(rel)
     if skipped:
-        print(f"  ! skipping (not .mjs, not _static/): {', '.join(skipped)}")
+        print(f"  ! skipping (build source / non-deployable): {', '.join(skipped)}")
     if not handlers and not statics:
         sys.exit("bundle has nothing to publish")
     print(f"bundle: {len(handlers)} handler(s), {len(statics)} static(s)")
