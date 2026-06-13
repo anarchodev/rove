@@ -215,8 +215,13 @@ A pre-deploy checklist.
 - [x] **`/deploy` skill** (`.claude/skills/deploy/SKILL.md`) — the approval-gated
   release procedure (§6): show the diff, human go/no-go, run `deploy.sh`,
   validate, tag `prod-deployed`.
-- [ ] **`scripts/rove-cert-deploy.sh`** — the certbot `--deploy-hook` for the
-  Tier-1 wildcard (§4.1): rsync the renewed cert to all 3 fronts + reload each.
+- [x] **`scripts/rove-cert-deploy.sh`** — the certbot deploy hook for the
+  Tier-1 wildcard (§4.1): installs the renewed cert on every front (local +
+  ssh peers) + restarts each (front cert hot-reload unproven — §10 open item,
+  restart is the safe form). Installed at
+  `/etc/letsencrypt/renewal-hooks/deploy/` on the certbot host; note it does
+  NOT fire on the very first issuance — run it once manually with
+  `RENEWED_LINEAGE=/etc/letsencrypt/live/platform`.
 - [ ] **`docs/v2-deployment.md`** — the full V2 runbook (the `README.md` is a
   condensed install; the runbook adds membership changes, cert rotation,
   lost-quorum recovery, validation curls). Replaces V1 `architecture/deployment-and-logs.md`.
