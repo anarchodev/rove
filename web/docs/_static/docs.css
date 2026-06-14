@@ -1,26 +1,30 @@
-/* rewind.js docs — shares the marketing brand language (dark/amber,
-   serif prose + mono code) in a sidebar documentation layout. */
+/* rewind.js docs — shares the product design language (Catppuccin
+   Mocha dark, mauve brand, Geist prose + JetBrains Mono code) in a
+   sidebar documentation layout. Token NAMES are kept (--bg/--ink/
+   --amber/--green) so the docs HTML needs no edits; only the values
+   move onto the canonical rewind.css palette. */
+@import url('https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
 :root {
-  --bg: #0f1210;
-  --bg-raise: #141815;
-  --bg-code: #0c0f0d;
-  --line: #232a24;
-  --line-soft: #1b211c;
-  --ink: #c8cfc4;
-  --ink-dim: #79836f;
-  --ink-faint: #4a5444;
-  --amber: #ffb454;
-  --amber-deep: #c97f1e;
-  --green: #9ece6a;
-  --red: #f7768e;
-  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Charter, Georgia, serif;
-  --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  --bg: #1e1e2e;          /* base   */
+  --bg-raise: #181825;    /* mantle */
+  --bg-code: #11111b;     /* crust  */
+  --line: #313244;        /* surface-0 */
+  --line-soft: #232337;
+  --ink: #cdd6f4;         /* text   */
+  --ink-dim: #7f849c;     /* overlay1 */
+  --ink-faint: #585b70;   /* surface2 */
+  --amber: #cba6f7;       /* mauve — brand accent (name kept) */
+  --amber-deep: #9d7cd8;  /* deep mauve — eyebrows, group labels */
+  --green: #a6e3a1;       /* green — strings / code accent */
+  --red: #f38ba8;         /* pink — error */
+  --serif: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --mono: 'JetBrains Mono', 'SF Mono', 'Cascadia Code', Consolas, monospace;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html { scroll-behavior: smooth; }
 body {
   background:
-    radial-gradient(1100px 520px at 78% -12%, #1a1f17 0%, transparent 60%),
+    radial-gradient(1100px 520px at 78% -12%, #282640 0%, transparent 60%),
     var(--bg);
   color: var(--ink);
   font-family: var(--serif);
@@ -28,7 +32,7 @@ body {
   line-height: 1.66;
   -webkit-font-smoothing: antialiased;
 }
-::selection { background: var(--amber); color: #161208; }
+::selection { background: var(--amber); color: #11111b; }
 a { color: var(--amber); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
@@ -67,7 +71,7 @@ p, li { color: var(--ink); }
 .lede { font-size: 20px; color: var(--ink); max-width: 60ch; }
 ul, ol { margin: 14px 0 14px 24px; }
 li { margin: 7px 0; }
-strong { color: #e4e8df; font-weight: 600; }
+strong { color: #e6e9f5; font-weight: 600; }
 em { color: var(--amber); font-style: italic; }
 
 code {
@@ -84,7 +88,7 @@ pre code { background: none; border: none; padding: 0; color: var(--ink); font-s
 pre .c { color: var(--ink-faint); }     /* comment  */
 pre .k { color: var(--amber); }          /* keyword  */
 pre .s { color: var(--green); }          /* string   */
-pre .f { color: #7aa2f7; }               /* function/ident accent */
+pre .f { color: #89b4fa; }               /* blue — function/ident accent */
 
 table { width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 15px; }
 th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
