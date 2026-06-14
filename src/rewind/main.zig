@@ -642,6 +642,19 @@ pub fn main() !void {
     // apply is leader-skipped (no `notifyApply`), so this fires only on
     // followers — exactly where the inline release enqueue never ran.
     bridge.setApplyObserver(.{ .ctx = &node_state, .func = onDeployApply });
+    // Cold-start: eagerly open every known tenant and enqueue its current
+    // deployment load, so the loader-thread prewarm (resident, compressed
+    // HTML) runs at boot. The apply-observer above only fires while the
+    // raft log still re-applies `_deploy/current` during catch-up — once
+    // the log is compacted past that entry, a restarted node would never
+    // load the deployment (503 forever, with no blocking serve fallback to
+    // mask it). Reading the committed marker straight from app.db here is
+    // the durable trigger. Idempotent (the loader content-address-dedups).
+    const eager = node_state.deploy.eagerOpenTenants() catch |err| blk: {
+        std.log.warn("rewind: cold-start eager-open failed: {s}", .{@errorName(err)});
+        break :blk 0;
+    };
+    if (eager > 0) std.log.info("rewind: cold-start opened {d} tenant(s) for deployment load", .{eager});
     try node_state.startFetchEngine();
     // Async serve-or-forward engine. rewind runs a single worker (idx 0).
     try node_state.startProxyEngine(1);
