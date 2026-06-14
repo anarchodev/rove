@@ -2445,6 +2445,10 @@ fn resolveRequest(
                 if (slot.pinCurrent()) |snap| {
                     const tc = worker_mod.TenantFiles{ .slot = slot, .snap = snap };
                     defer tc.release();
+                    // Content-addressed assets first (the admin SPA's
+                    // subresources 302 here), then the normal static path.
+                    if (try respb.serveAssetByHash(server, allocator, ent, sid, sess, tc, path, rh, std.mem.eql(u8, method, "HEAD"))) |_|
+                        return .handled;
                     const outcome = try respb.tryServeStatic(server, allocator, ent, sid, sess, tc, method, path, rh);
                     if (outcome != .miss) return .handled;
                 }
