@@ -504,7 +504,13 @@ fn serveStaticByKey(
     // path ⇒ ETag / revalidate (the etag short-circuits the body).
     if (isHtmlDocument(entry.content_type)) {
         if (entry.inline_bytes) |doc| {
-            try serveInline(server, allocator, ent, sid, sess, entry.content_type, etag, HTML_CACHE_CONTROL, doc, is_head);
+            // `doc` is snapshot-owned; the response is sent after dispatch
+            // returns, so copy into the per-request allocator (which lives
+            // until the response completes) to avoid a use-after-free. The
+            // snapshot is pinned now, so the read is safe. HEAD needs no
+            // body, so no copy.
+            const body = if (is_head) doc else try allocator.dupe(u8, doc);
+            try serveInline(server, allocator, ent, sid, sess, entry.content_type, etag, HTML_CACHE_CONTROL, body, is_head);
             return 200;
         }
         // Rare: oversized HTML (not held resident) or a prewarm failure.
