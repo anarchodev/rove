@@ -13,6 +13,7 @@ const h2 = @import("rove-h2");
 const files_mod = @import("rove-files");
 
 const dispatcher_mod = @import("dispatcher.zig");
+const static_cache = @import("static_cache.zig");
 
 // ── Header lookup ─────────────────────────────────────────────────────
 
@@ -494,99 +495,164 @@ fn serveStaticByKey(
         return 304;
     }
 
-    // Top-level documents (`text/html`) MUST be served same-origin and
-    // inline. A 302 on a navigation moves the browser's origin to the
-    // S3 host, so the document's relative asset paths (`./app.js`),
-    // same-origin `fetch()`s, and reload-after-expiry all break. The
-    // worker therefore reads the (small) document from the blob store
-    // and serves the bytes itself. This does NOT regress the worker-RAM
-    // principle: only the entry document is inlined — every subresource
-    // (CSS/JS/images, below) still 302s to the blob store, because a
-    // redirect on a *subresource* fetch doesn't change the document
-    // origin. HEAD needs neither the body nor a blob fetch.
+    // Top-level documents (`text/html`) MUST be served inline
+    // same-origin — a 302 on a navigation moves the browser's origin,
+    // breaking the document's relative asset paths and same-origin
+    // fetches. The bytes are held resident on the snapshot entry
+    // (prewarmed on the loader thread; docs/static-asset-serving.md §3),
+    // so this never touches S3 on the dispatch thread. Stable mutable
+    // path ⇒ ETag / revalidate (the etag short-circuits the body).
     if (isHtmlDocument(entry.content_type)) {
-        const body: ?[]u8 = if (is_head) null else (tc.slot.blob_backend.blobStore().get(
+        if (entry.inline_bytes) |doc| {
+            try serveInline(server, allocator, ent, sid, sess, entry.content_type, etag, HTML_CACHE_CONTROL, doc, is_head);
+            return 200;
+        }
+        // Rare: oversized HTML (not held resident) or a prewarm failure.
+        // A one-off blocking read so the document still serves correctly
+        // (a document can't fall back to a redirect). HEAD needs neither.
+        const body = if (is_head) &[_]u8{} else (tc.slot.blob_backend.blobStore().get(
             &entry.hash_hex,
             allocator,
         ) catch |err| {
-            std.log.warn(
-                "rove-js: inline html fetch for {s} failed: {s}",
-                .{ key, @errorName(err) },
-            );
+            std.log.warn("rove-js: html fallback fetch for {s} failed: {s}", .{ key, @errorName(err) });
             return err;
         });
-        const hdrs = try packRespHeaders(allocator, &.{
-            .{ .name = "content-type", .value = entry.content_type },
-            .{ .name = "etag", .value = etag },
-            // The document lives at a stable path and changes on
-            // redeploy (it is NOT content-addressed by URL), so
-            // revalidate every load; the etag short-circuits the body.
-            .{ .name = "cache-control", .value = "public, max-age=0, must-revalidate" },
-        });
-        try finalizeResponse(
-            server,
-            ent,
-            sid,
-            sess,
-            200,
-            hdrs,
-            if (body) |b| b.ptr else null,
-            if (body) |b| @intCast(b.len) else 0,
-        );
+        try serveInline(server, allocator, ent, sid, sess, entry.content_type, etag, HTML_CACHE_CONTROL, body, is_head);
         return 200;
     }
 
-    // Phase 4 of `docs/deployment-snapshots-plan.md`: 302-redirect
-    // to a presigned S3 URL instead of proxying bytes through the
-    // worker. The browser fetches directly from S3 — the worker
-    // never reads or buffers the asset. Cache-Control on the
-    // redirect itself matches the signed-URL TTL so a re-request
-    // inside that window doesn't even round-trip to the worker.
-    //
-    // Hash-addressed assets are immutable, so the browser caches
-    // them indefinitely via etag once fetched. The signed URL just
-    // gates blob-store access — after expiry the browser re-asks
-    // the worker for a fresh redirect, gets a new signed URL, and
-    // re-validates via If-None-Match.
-    const presign_expires_secs: u32 = 3600;
-    const url = (tc.slot.blob_backend.presignGet(
-        &entry.hash_hex,
-        presign_expires_secs,
-        entry.content_type,
-        allocator,
-    ) catch |err| {
-        std.log.warn(
-            "rove-js: static presign for {s} failed: {s}",
-            .{ key, @errorName(err) },
-        );
-        return err;
-    }) orelse {
-        // Worker invariant: `blob_backend` is always the S3 variant
-        // (see `openTenantSlotNode` → `BlobBackend.openPerTenant`),
-        // which always returns Some. A null here means someone
-        // wired an `http` variant for file-blobs — that's an
-        // architectural bug, not a request-level failure.
-        std.log.err(
-            "rove-js: static presign for {s} returned null — blob_backend variant doesn't support presigning",
-            .{key},
-        );
-        return error.PresignNotSupported;
-    };
-    defer allocator.free(url);
+    // Non-HTML statics 302 to their immutable, content-addressed
+    // same-origin URL `/_assets/{hash}` (served by `serveAssetByHash`
+    // from the LRU). The redirect itself revalidates — the path→hash
+    // mapping changes per deploy — but the bytes it points at are
+    // immutable, so they cache forever once fetched. HEAD and GET emit
+    // the same redirect (no body).
+    const loc = try std.fmt.allocPrint(allocator, "/_assets/{s}", .{entry.hash_hex});
+    defer allocator.free(loc);
+    try emitStaticRedirectWithEtag(server, allocator, ent, sid, sess, loc, etag, 0);
+    return 302;
+}
 
-    // HEAD and GET both emit the same 302 (no body either way per
-    // RFC 9110 §9.3.2 — and 302 doesn't carry one). `is_head` is
-    // consumed by the inline-document branch above.
-    try emitStaticRedirectWithEtag(
+/// Cache-Control for served HTML documents: a stable mutable URL that
+/// changes per deploy, so revalidate every load (the strong ETag makes
+/// the revalidation a cheap 304 when unchanged).
+const HTML_CACHE_CONTROL = "public, max-age=0, must-revalidate";
+
+/// Cache-Control for content-addressed `/_assets/{hash}` responses:
+/// immutable, cache for a year, never revalidate.
+const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
+
+/// Emit a 200 with `body` (omitted for HEAD, but the headers match GET).
+/// `body` is referenced, not copied — it must outlive the response (the
+/// caller's per-request allocator owns it).
+fn serveInline(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    content_type: []const u8,
+    etag: []const u8,
+    cache_control: []const u8,
+    body: []const u8,
+    is_head: bool,
+) !void {
+    const hdrs = if (content_type.len == 0)
+        try packRespHeaders(allocator, &.{
+            .{ .name = "etag", .value = etag },
+            .{ .name = "cache-control", .value = cache_control },
+        })
+    else
+        try packRespHeaders(allocator, &.{
+            .{ .name = "content-type", .value = content_type },
+            .{ .name = "etag", .value = etag },
+            .{ .name = "cache-control", .value = cache_control },
+        });
+    // The response path reads but never mutates the body; constCast is
+    // safe (callers own immutable LRU copies / resident snapshot bytes).
+    try finalizeResponse(
         server,
-        allocator,
         ent,
         sid,
         sess,
-        url,
-        etag,
-        presign_expires_secs,
+        200,
+        hdrs,
+        if (is_head) null else @constCast(body.ptr),
+        if (is_head) 0 else @intCast(body.len),
     );
+}
+
+/// Serve `/_assets/{hash}` — a content-addressed, immutable static. The
+/// hash must belong to the pinned deployment (gate via `statics_by_hash`).
+/// LRU hit → inline (non-blocking). LRU miss → 302 to a presigned S3 URL
+/// (the browser fetches; the dispatch thread never does a blocking read).
+/// Returns the status, or null if the path isn't a well-formed asset hash
+/// (so the caller can fall through to normal routing).
+pub fn serveAssetByHash(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    tc: anytype,
+    path: []const u8,
+    rh: h2.ReqHeaders,
+    is_head: bool,
+) !?u16 {
+    const prefix = "/_assets/";
+    const qmark = std.mem.indexOfScalar(u8, path, '?');
+    const path_no_q = if (qmark) |q| path[0..q] else path;
+    if (!std.mem.startsWith(u8, path_no_q, prefix)) return null;
+    const hash = path_no_q[prefix.len..];
+    if (hash.len != files_mod.HASH_HEX_LEN) return null;
+    for (hash) |c| if (!std.ascii.isHex(c)) return null;
+
+    // Gate: only serve hashes this deployment actually references.
+    const content_type = (tc.snap.statics_by_hash.get(hash)) orelse {
+        try finalizeResponse(server, ent, sid, sess, 404, .{ .fields = null, .count = 0 }, null, 0);
+        return 404;
+    };
+
+    // Strong ETag = the hash. Immutable, so revalidation is rare, but
+    // honor If-None-Match anyway (a cheap 304).
+    var etag_buf: [files_mod.HASH_HEX_LEN + 2]u8 = undefined;
+    etag_buf[0] = '"';
+    @memcpy(etag_buf[1 .. 1 + files_mod.HASH_HEX_LEN], hash[0..files_mod.HASH_HEX_LEN]);
+    etag_buf[1 + files_mod.HASH_HEX_LEN] = '"';
+    const etag = etag_buf[0..];
+    const inm = findHeader(rh, "if-none-match");
+    if (inm != null and etagMatches(inm.?, etag)) {
+        try emitStatic304(server, allocator, ent, sid, sess, etag);
+        return 304;
+    }
+
+    // LRU hit → serve the bytes inline (copied into the request
+    // allocator, so the response owns them). Non-blocking.
+    if (static_cache.instance()) |sc| {
+        if (try sc.getCopy(hash, allocator)) |hit| {
+            try serveInline(server, allocator, ent, sid, sess, hit.content_type, etag, IMMUTABLE_CACHE_CONTROL, hit.bytes, is_head);
+            return 200;
+        }
+    }
+
+    // LRU miss → 302 to a presigned S3 URL (browser fetches; the
+    // dispatch thread never blocks on a read). Weaker (~1h) caching for
+    // this one cold asset until it's prewarmed again.
+    const presign_expires_secs: u32 = 3600;
+    const url = (tc.slot.blob_backend.presignGet(
+        hash[0..files_mod.HASH_HEX_LEN],
+        presign_expires_secs,
+        content_type,
+        allocator,
+    ) catch |err| {
+        std.log.warn("rove-js: asset presign for {s} failed: {s}", .{ hash, @errorName(err) });
+        return err;
+    }) orelse {
+        std.log.err("rove-js: asset presign for {s} returned null", .{hash});
+        return error.PresignNotSupported;
+    };
+    defer allocator.free(url);
+    try emitStaticRedirectWithEtag(server, allocator, ent, sid, sess, url, etag, presign_expires_secs);
     return 302;
 }
 
