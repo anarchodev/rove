@@ -52,6 +52,9 @@ const blob = @import("rove-blob");
 const curl = blob.curl;
 const Entity = rove.Entity;
 
+const route_resolver = @import("route_resolver.zig");
+const RouteResolver = route_resolver.RouteResolver;
+
 /// Per-entity correlation component, merged into the front's h2
 /// `request_row`. On proxy-created entities (upstream pump entities,
 /// connect entities) it points at the owning Flow / Upstream; on
@@ -79,6 +82,12 @@ pub const CHUNK_MAX: u32 = 64 * 1024;
 
 /// Reconnect backoff for a backend node whose connect failed.
 const CONNECT_BACKOFF_NS: i128 = 500 * std.time.ns_per_ms;
+
+/// How long a request parks waiting for a cold route resolution before
+/// it gives up with a retryable 503. Bounds the worst case for a
+/// never-seen host when the CP is slow/down (vs. the old behavior of
+/// freezing the whole loop for the libcurl timeout).
+const ROUTE_WAIT_NS: i128 = 2500 * std.time.ns_per_ms;
 
 // ── Small shared helpers (formerly in main.zig) ───────────────────────
 
@@ -148,12 +157,17 @@ fn freeNodes(a: std.mem.Allocator, nodes: [][]u8) void {
     a.free(nodes);
 }
 
-// ── Route cache (host → cluster nodes, short TTL) ─────────────────────
+// ── Route cache (host → cluster nodes, single TTL) ────────────────────
 //
-// Single-threaded (one poll loop), no locking. A stale entry is safe —
-// serve-or-forward at the DP corrects a wrong cluster, so the only
-// cost is a hop. Entries expire on read; no active eviction (size is
-// bounded by distinct active hosts).
+// Single-threaded (one poll loop), no locking. No active eviction (size
+// bounded by distinct active hosts). A fresh entry (within `ttl_ns`) is
+// served inline; past the TTL the host re-resolves by PARKING (the
+// off-loop resolver answers, the parked flow resumes) — never by
+// blocking the poll loop, and never by serving a stale entry. Re-
+// resolving past the TTL (instead of serving stale) is what keeps a
+// tenant MOVE correct: serving the cached old cluster after it evicted
+// the tenant returns a relayed 404, so we must re-resolve, not serve
+// stale. The TTL therefore also bounds move-propagation latency.
 pub const RouteCache = struct {
     allocator: std.mem.Allocator,
     map: std.StringHashMapUnmanaged(CacheEntry) = .empty,
@@ -206,16 +220,13 @@ pub const RouteCache = struct {
     }
 };
 
-const CpRoute = union(enum) {
-    not_found,
-    moving,
-    placed: [][]u8, // owned node URLs
-};
-
 const RouteResult = union(enum) {
     nodes: []const []const u8, // cache-owned; valid for this loop iteration
     moving,
     not_found,
+    /// No cached route — a resolve was enqueued; the caller parks the
+    /// request until `drainRouteCompletions` lands the answer.
+    pending,
 };
 
 // ── The proxy ─────────────────────────────────────────────────────────
@@ -231,6 +242,16 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// order). `REWIND_CP_URL`.
         cp_urls: []const []const u8,
         cache: *RouteCache,
+        /// Off-loop CP route resolver — the poll loop never blocks on a
+        /// `/_cp/route` query.
+        resolver: *RouteResolver,
+        /// host → flows parked awaiting a cold route resolution. Keys
+        /// are allocator-owned host copies. Mirrors the `up.waiters`
+        /// park-on-connect pattern, keyed by host instead of upstream.
+        route_waiters: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(*Flow)) = .empty,
+        /// Hosts with a resolve in flight (dedupe). Loop-thread only —
+        /// no lock. Keys are allocator-owned host copies.
+        route_pending: std.StringHashMapUnmanaged(void) = .empty,
         /// host → backend pool entry, keyed by node origin URL.
         pool: std.StringHashMapUnmanaged(*Upstream) = .empty,
         /// (upstream Session entity, stream id) → flow, for correlating
@@ -345,6 +366,12 @@ pub fn Proxy(comptime FrontH2: type) type {
             /// downstream sink's `drained` (window repayment).
             down_drained: u32 = 0,
 
+            // route resolution (cold-host park)
+            /// Parked in `route_waiters` awaiting a CP route answer; no
+            /// upstream attempt started yet, body still buffering.
+            awaiting_route: bool = false,
+            route_deadline_ns: i128 = 0,
+
             // upstream attempt
             nodes: [][]u8 = &.{},
             node_idx: usize = 0,
@@ -403,6 +430,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             server: *FrontH2,
             cp_urls: []const []const u8,
             cache: *RouteCache,
+            resolver: *RouteResolver,
         ) Self {
             return .{
                 .allocator = allocator,
@@ -410,6 +438,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 .server = server,
                 .cp_urls = cp_urls,
                 .cache = cache,
+                .resolver = resolver,
             };
         }
 
@@ -423,6 +452,17 @@ pub fn Proxy(comptime FrontH2: type) type {
             self.pool.deinit(self.allocator);
             self.flows_by_up.deinit(self.allocator);
             self.tunnels_by_up.deinit(self.allocator);
+            // Parked flows themselves leak at shutdown (like live flows
+            // — the process is exiting); free the map's own keys/lists.
+            var rw = self.route_waiters.iterator();
+            while (rw.next()) |e| {
+                self.allocator.free(e.key_ptr.*);
+                e.value_ptr.deinit(self.allocator);
+            }
+            self.route_waiters.deinit(self.allocator);
+            var rp = self.route_pending.keyIterator();
+            while (rp.next()) |k| self.allocator.free(k.*);
+            self.route_pending.deinit(self.allocator);
         }
 
         /// One proxy turn — run after `server.poll…()` each loop
@@ -430,6 +470,10 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// stream are seen before its pump turn, and terminal events
         /// last.
         pub fn run(self: *Self, now_ns: i128) !void {
+            // Land any routes the resolver finished since last cycle
+            // BEFORE intake, so this cycle's requests for the same host
+            // hit the cache instead of re-parking.
+            try self.drainRouteCompletions(now_ns);
             try self.intakeStreaming(now_ns);
             try self.intakeClassic(now_ns);
             try self.intakeWsUpgrades(now_ns);
@@ -444,6 +488,9 @@ pub fn Proxy(comptime FrontH2: type) type {
             try self.consumeUpstreamTerminal();
             try self.reg.flush();
             try self.consumeServerTerminal();
+            try self.reg.flush();
+            // 503 any flow that parked too long on a cold route.
+            self.expireParkedRoutes(now_ns);
             try self.reg.flush();
         }
 
@@ -484,7 +531,9 @@ pub fn Proxy(comptime FrontH2: type) type {
                         flow.down_gone = true;
                     },
                 }
-                self.startAttempt(flow);
+                // A parked (cold-route) flow starts its attempt when the
+                // route lands; here the body just buffers into the sink.
+                if (!flow.awaiting_route) self.startAttempt(flow);
             }
         }
 
@@ -518,7 +567,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     rb.len = 0;
                 }
                 flow.body_complete = true;
-                self.startAttempt(flow);
+                if (!flow.awaiting_route) self.startAttempt(flow);
             }
         }
 
@@ -551,16 +600,20 @@ pub fn Proxy(comptime FrontH2: type) type {
                     continue;
                 };
                 const host = hostOnly(authority_raw);
-                const route = self.resolveRoute(host, now_ns) catch {
-                    self.server.wsUpgradeReject(ent, 503);
-                    continue;
-                };
+                const route = self.resolveRoute(host, now_ns);
                 const nodes: []const []const u8 = switch (route) {
                     .not_found => {
                         self.server.wsUpgradeReject(ent, 404);
                         continue;
                     },
                     .moving => {
+                        self.server.wsUpgradeReject(ent, 503);
+                        continue;
+                    },
+                    // Cold route: the resolve is enqueued; reject
+                    // retryably and the client reconnects once cached.
+                    // (WS tunnels have no Flow to park — see plan.)
+                    .pending => {
                         self.server.wsUpgradeReject(ent, 503);
                         continue;
                     },
@@ -859,12 +912,8 @@ pub fn Proxy(comptime FrontH2: type) type {
             };
             const host = hostOnly(authority_raw);
 
-            const route = self.resolveRoute(host, now_ns) catch {
-                std.log.warn("front: CP route lookup for {s} failed → 503", .{host});
-                try self.replyStatus(coll, ent, sid, sess, 503);
-                return null;
-            };
-            const nodes: []const []const u8 = switch (route) {
+            const route = self.resolveRoute(host, now_ns);
+            switch (route) {
                 .not_found => {
                     std.log.warn("front: no placement for host {s} → 404", .{host});
                     try self.replyStatus(coll, ent, sid, sess, 404);
@@ -876,11 +925,11 @@ pub fn Proxy(comptime FrontH2: type) type {
                     try self.replyStatus(coll, ent, sid, sess, 503);
                     return null;
                 },
-                .nodes => |n| n,
-            };
-            if (nodes.len == 0) {
-                try self.replyStatus(coll, ent, sid, sess, 502);
-                return null;
+                .nodes => |n| if (n.len == 0) {
+                    try self.replyStatus(coll, ent, sid, sess, 502);
+                    return null;
+                },
+                .pending => {}, // park below — resolve already enqueued
             }
 
             const flow = try self.allocator.create(Flow);
@@ -898,11 +947,25 @@ pub fn Proxy(comptime FrontH2: type) type {
                 self.allocator.free(flow.authority);
                 return e;
             };
-            flow.nodes = dupNodes(self.allocator, nodes) catch |e| {
-                self.allocator.free(flow.authority);
-                self.allocator.free(flow.host);
-                return e;
-            };
+            switch (route) {
+                .nodes => |n| flow.nodes = dupNodes(self.allocator, n) catch |e| {
+                    self.allocator.free(flow.authority);
+                    self.allocator.free(flow.host);
+                    return e;
+                },
+                .pending => {
+                    // Cold host: park (body still buffers via the sink)
+                    // until the resolve lands or the deadline fires.
+                    flow.awaiting_route = true;
+                    flow.route_deadline_ns = now_ns + ROUTE_WAIT_NS;
+                    self.parkRouteWaiter(flow) catch |e| {
+                        self.allocator.free(flow.authority);
+                        self.allocator.free(flow.host);
+                        return e;
+                    };
+                },
+                else => unreachable,
+            }
             self.live_flows += 1;
             return flow;
         }
@@ -1601,12 +1664,15 @@ pub fn Proxy(comptime FrontH2: type) type {
             // STRICTLY gated on detach: until the downstream entity is
             // reaped from response_out, its FlowRef points here.
             if (!flow.detached) return;
-            if (flow.attempt_live or flow.waiting_conn) return;
+            if (flow.attempt_live or flow.waiting_conn or flow.awaiting_route) return;
             if (flow.sink_refs != 0 or flow.pending_terminals != 0) return;
             self.unmapAttempt(flow);
             flow.body.deinit(self.allocator);
             flow.resp_queue.deinit(self.allocator);
-            freeNodes(self.allocator, flow.nodes);
+            // A parked flow torn down before its route landed never got
+            // a heap node list — its `.nodes` is still the empty default
+            // (`&.{}`), which must not be passed to free.
+            if (flow.nodes.len != 0) freeNodes(self.allocator, flow.nodes);
             self.allocator.free(flow.authority);
             self.allocator.free(flow.host);
             self.allocator.destroy(flow);
@@ -1805,71 +1871,150 @@ pub fn Proxy(comptime FrontH2: type) type {
             return .{ .fields = p.fields, .count = p.count, ._buf = p.buf, ._buf_len = p.buf_len };
         }
 
-        // ── Route resolution (CP, curl — control plane only) ──────────
+        // ── Route resolution (off-loop; never blocks) ─────────────────
 
-        fn resolveRoute(self: *Self, host: []const u8, now_ns: i128) !RouteResult {
+        /// Non-blocking. A fresh cache hit returns nodes inline; a miss
+        /// (no entry or past TTL) enqueues an off-loop resolve and
+        /// returns `.pending` for the caller to park on. The CP is never
+        /// contacted on this thread, and a stale entry is never served
+        /// (so a tenant move re-resolves correctly past the TTL).
+        fn resolveRoute(self: *Self, host: []const u8, now_ns: i128) RouteResult {
             if (self.cache.get(host, now_ns)) |nodes| return .{ .nodes = nodes };
-            switch (try self.cpRouteQuery(host)) {
-                .not_found => return .not_found,
-                .moving => return .moving,
-                .placed => |owned| {
-                    try self.cache.putOwned(host, owned, now_ns);
-                    return .{ .nodes = owned };
-                },
+            self.enqueueResolve(host);
+            return .pending;
+        }
+
+        /// Enqueue an off-loop CP resolve for `host`, deduped: at most
+        /// one in-flight resolve per host even if N requests for a cold
+        /// host arrive in the same cycle.
+        fn enqueueResolve(self: *Self, host: []const u8) void {
+            if (self.route_pending.contains(host)) return;
+            const key = self.allocator.dupe(u8, host) catch return; // best-effort
+            self.route_pending.put(self.allocator, key, {}) catch {
+                self.allocator.free(key);
+                return;
+            };
+            self.resolver.enqueue(host) catch {
+                // Couldn't enqueue — re-arm so a later request retries.
+                if (self.route_pending.fetchRemove(host)) |kv| self.allocator.free(kv.key);
+            };
+        }
+
+        /// Park a flow awaiting a cold route. Mirrors `up.waiters`, but
+        /// keyed by host. The bucket key is an owned dupe (separate from
+        /// `flow.host`), freed when the bucket is resumed/failed.
+        fn parkRouteWaiter(self: *Self, flow: *Flow) !void {
+            const gop = try self.route_waiters.getOrPut(self.allocator, flow.host);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = self.allocator.dupe(u8, flow.host) catch |e| {
+                    self.route_waiters.removeByPtr(gop.key_ptr);
+                    return e;
+                };
+                gop.value_ptr.* = .empty;
+            }
+            try gop.value_ptr.append(self.allocator, flow);
+        }
+
+        /// Drain off-loop resolutions: update the cache and resume (or
+        /// fail) the flows parked on each host. Runs first in `run()`.
+        fn drainRouteCompletions(self: *Self, now_ns: i128) !void {
+            var completions = self.resolver.takeCompletions();
+            defer completions.deinit(self.allocator);
+            for (completions.items) |c| {
+                // Re-arm dedupe so future refreshes can enqueue again.
+                if (self.route_pending.fetchRemove(c.host)) |kv| self.allocator.free(kv.key);
+                switch (c.outcome) {
+                    .placed => |nodes| {
+                        // Resume from the freshly-resolved nodes directly
+                        // (NOT via cache.get — a TTL of 0 would read the
+                        // just-stored entry as already expired). putOwned
+                        // takes ownership after; the waiters dup their own.
+                        self.resumeRouteWaiters(c.host, nodes);
+                        self.cache.putOwned(c.host, nodes, now_ns) catch {
+                            freeNodes(self.allocator, nodes);
+                        };
+                    },
+                    // Move in progress / gone: stop serving the stale
+                    // entry and surface a retryable 503 / 404.
+                    .moving => {
+                        self.cache.invalidate(c.host);
+                        self.failRouteWaiters(c.host, 503);
+                    },
+                    .not_found => {
+                        self.cache.invalidate(c.host);
+                        self.failRouteWaiters(c.host, 404);
+                    },
+                    // Transient CP failure: don't touch the cache (a
+                    // fresh entry, if any, keeps serving other requests);
+                    // the cold parked flows get a retryable 503.
+                    .err => self.failRouteWaiters(c.host, 503),
+                }
+                self.allocator.free(c.host);
             }
         }
 
-        fn cpRouteQuery(self: *Self, host: []const u8) !CpRoute {
-            const a = self.allocator;
-            const suffix = try std.fmt.allocPrint(a, "/_cp/route?host={s}", .{host});
-            defer a.free(suffix);
-
-            var last_err: anyerror = error.CpUnreachable;
-            for (self.cp_urls) |base| {
-                const url = std.fmt.allocPrint(a, "{s}{s}", .{ base, suffix }) catch |e| {
-                    last_err = e;
-                    continue;
-                };
-                defer a.free(url);
-                var easy = curl.Easy.init(a) catch |e| {
-                    last_err = e;
-                    continue;
-                };
-                defer easy.deinit();
-                var resp = easy.request(a, .{
-                    .method = .GET,
-                    .url = url,
-                    .headers = &[_]curl.Header{},
-                    .body = "",
-                    .http_version = .h2c_prior_knowledge,
-                    .verify_tls = false,
-                }) catch |e| {
-                    std.log.warn("front: CP route {s} on {s} failed: {s}", .{ host, base, @errorName(e) });
-                    last_err = e;
-                    continue;
-                };
-                defer resp.deinit(a);
-
-                if (resp.status == 404) return .not_found;
-                if (resp.status != 200) {
-                    last_err = error.CpBadStatus;
+        fn resumeRouteWaiters(self: *Self, host: []const u8, nodes: []const []const u8) void {
+            const kv = self.route_waiters.fetchRemove(host) orelse return;
+            var list = kv.value;
+            self.allocator.free(kv.key);
+            defer list.deinit(self.allocator);
+            for (list.items) |flow| {
+                flow.awaiting_route = false;
+                if (flow.down_gone or !flow.down_alive) {
+                    self.teardownFlow(flow);
                     continue;
                 }
-                const body = resp.body orelse "";
-                var parsed = std.json.parseFromSlice(struct {
-                    cluster: []const u8 = "",
-                    tenant: []const u8 = "",
-                    moving: bool = false,
-                    nodes: []const []const u8 = &.{},
-                }, a, body, .{ .ignore_unknown_fields = true }) catch {
-                    last_err = error.CpBadBody;
+                if (nodes.len == 0) {
+                    self.finishWithStatus(flow, 502);
+                    continue;
+                }
+                flow.nodes = dupNodes(self.allocator, nodes) catch {
+                    self.finishWithStatus(flow, 503);
                     continue;
                 };
-                defer parsed.deinit();
-                if (parsed.value.moving) return .moving;
-                return .{ .placed = try dupNodes(a, parsed.value.nodes) };
+                self.startAttempt(flow);
             }
-            return last_err;
+        }
+
+        fn failRouteWaiters(self: *Self, host: []const u8, code: u16) void {
+            const kv = self.route_waiters.fetchRemove(host) orelse return;
+            var list = kv.value;
+            self.allocator.free(kv.key);
+            defer list.deinit(self.allocator);
+            for (list.items) |flow| {
+                flow.awaiting_route = false;
+                if (flow.down_gone or !flow.down_alive) {
+                    self.teardownFlow(flow);
+                } else {
+                    self.finishWithStatus(flow, code);
+                }
+            }
+        }
+
+        /// 503 any flow whose cold-route park outlived `ROUTE_WAIT_NS`.
+        /// Emptied buckets are left in place — they're reclaimed when
+        /// the still-in-flight resolve for that host completes (its
+        /// `route_pending` entry guarantees it will).
+        fn expireParkedRoutes(self: *Self, now_ns: i128) void {
+            var it = self.route_waiters.iterator();
+            while (it.next()) |e| {
+                const list = e.value_ptr;
+                var i: usize = 0;
+                while (i < list.items.len) {
+                    const flow = list.items[i];
+                    if (now_ns >= flow.route_deadline_ns) {
+                        _ = list.swapRemove(i);
+                        flow.awaiting_route = false;
+                        if (flow.down_gone or !flow.down_alive) {
+                            self.teardownFlow(flow);
+                        } else {
+                            self.finishWithStatus(flow, 503);
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
         }
     };
 }
@@ -1892,4 +2037,40 @@ fn resolveOrigin(a: std.mem.Allocator, origin: []const u8) !std.net.Address {
     defer list.deinit();
     if (list.addrs.len == 0) return error.UnknownHostName;
     return list.addrs[0];
+}
+
+// ── Tests ──────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "RouteCache: fresh hit within TTL, miss past it (re-resolve, no stale serve)" {
+    const ttl_ns: i128 = 100;
+    var cache = RouteCache.init(testing.allocator, ttl_ns);
+    defer cache.deinit();
+
+    const nodes = try dupNodes(testing.allocator, &.{ "http://a:1", "http://b:1" });
+    try cache.putOwned("acme.example", nodes, 1000); // expires at 1100
+
+    // Within TTL: hit.
+    try testing.expectEqual(@as(usize, 2), cache.get("acme.example", 1050).?.len);
+    // At/after expiry: miss → caller parks + re-resolves (never serves
+    // the stale entry, so a move past the TTL routes correctly).
+    try testing.expect(cache.get("acme.example", 1100) == null);
+    try testing.expect(cache.get("acme.example", 1200) == null);
+    // Unknown host: miss.
+    try testing.expect(cache.get("nope.example", 1050) == null);
+}
+
+test "RouteCache: putOwned refreshes the entry in place and frees the old nodes" {
+    var cache = RouteCache.init(testing.allocator, 100);
+    defer cache.deinit();
+
+    try cache.putOwned("h", try dupNodes(testing.allocator, &.{"http://old:1"}), 1000);
+    // Re-store with a new list; the old one must be freed (testing
+    // allocator catches a leak) and the expiry pushed out.
+    try cache.putOwned("h", try dupNodes(testing.allocator, &.{ "http://new:1", "http://new:2" }), 1200);
+    try testing.expectEqual(@as(usize, 2), cache.get("h", 1250).?.len);
+
+    cache.invalidate("h");
+    try testing.expect(cache.get("h", 1250) == null);
 }

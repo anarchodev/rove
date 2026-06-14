@@ -41,6 +41,7 @@ const rove = @import("rove");
 const h2 = @import("rove-h2");
 const blob = @import("rove-blob");
 const proxy_mod = @import("proxy.zig");
+const route_resolver_mod = @import("route_resolver.zig");
 
 const curl = blob.curl;
 
@@ -129,6 +130,61 @@ const CertSync = struct {
     }
 };
 
+/// Runs `CertSync.sync` on a dedicated thread so the periodic CP cert
+/// pull never blocks the poll loop — a slow/unreachable CP would
+/// otherwise freeze serving for every host on every `REWIND_CERT_SYNC_MS`
+/// tick. Safe because the TLS host store it writes
+/// (`putHostCertInMemory`) takes `store_rw` exclusively while the
+/// in-handshake SNI reader takes it shared (h2/tls.zig). The first pass
+/// runs on the thread too, so a brand-new domain's first connection in
+/// the boot window falls back to the wildcard until the pass lands —
+/// the same gap the periodic sync already tolerated, just at startup.
+const CertSyncThread = struct {
+    cs: CertSync,
+    period_ns: u64,
+    stop: std.atomic.Value(bool),
+    wake: std.Thread.ResetEvent,
+    thread: ?std.Thread,
+
+    fn start(
+        allocator: std.mem.Allocator,
+        cp_urls: []const []const u8,
+        tls: *h2.TlsConfig,
+        period_ns: u64,
+    ) !*CertSyncThread {
+        const self = try allocator.create(CertSyncThread);
+        self.* = .{
+            .cs = .{ .allocator = allocator, .cp_urls = cp_urls, .tls = tls },
+            .period_ns = period_ns,
+            .stop = std.atomic.Value(bool).init(false),
+            .wake = .{},
+            .thread = null,
+        };
+        self.thread = std.Thread.spawn(.{}, threadMain, .{self}) catch |e| {
+            allocator.destroy(self);
+            return e;
+        };
+        return self;
+    }
+
+    fn threadMain(self: *CertSyncThread) void {
+        self.cs.sync(); // first pass: repopulate the SNI store after a restart
+        while (!self.stop.load(.acquire)) {
+            // Wakes on the period (Timeout) or on `shutdown` (wake.set).
+            self.wake.timedWait(self.period_ns) catch {};
+            if (self.stop.load(.acquire)) break;
+            self.cs.sync();
+        }
+    }
+
+    fn shutdownAndDestroy(self: *CertSyncThread, allocator: std.mem.Allocator) void {
+        self.stop.store(true, .release);
+        self.wake.set();
+        if (self.thread) |t| t.join();
+        allocator.destroy(self);
+    }
+};
+
 /// Split the CP's packed cert frame (`[4B BE cert_len][cert_pem][key_pem]`).
 const UnpackedCert = struct { cert: []const u8, key: []const u8 };
 fn unpackCert(frame: []const u8) ?UnpackedCert {
@@ -145,6 +201,13 @@ fn cleanupResponses(server: *FrontH2) !void {
 
 fn getEnvCfg(name: []const u8) []const u8 {
     return std.posix.getenv(name) orelse "";
+}
+
+/// Parse a millisecond config env var, falling back to `default` when
+/// unset or unparseable.
+fn envMs(name: []const u8, default: i128) i128 {
+    const s = std.posix.getenv(name) orelse return default;
+    return std.fmt.parseInt(i128, std.mem.trim(u8, s, " \t"), 10) catch default;
 }
 
 // ── Phase 5: the :80 plaintext listener (ACME HTTP-01 + HTTP→HTTPS redirect) ──
@@ -311,14 +374,23 @@ pub fn main() !void {
         return error.MissingCpUrl;
     }
 
-    // Route-cache TTL (ms). A stale entry costs at most a serve-or-forward hop,
-    // so keep it short but non-zero to keep the CP off the per-request path.
-    const cache_ms: i128 = blk: {
-        const s = std.posix.getenv("REWIND_ROUTE_CACHE_MS") orelse break :blk 1000;
-        break :blk std.fmt.parseInt(i128, std.mem.trim(u8, s, " \t"), 10) catch 1000;
-    };
+    // Route-cache TTL (ms). Within the TTL a host is served from cache
+    // (the CP is not consulted); past it the next request re-resolves by
+    // PARKING off the poll loop (never blocking it, never serving a
+    // stale entry — so a tenant move re-routes correctly past the TTL).
+    // The TTL thus also bounds move-propagation latency.
+    const cache_ms = envMs("REWIND_ROUTE_CACHE_MS", 1_000);
     var cache = proxy_mod.RouteCache.init(allocator, cache_ms * std.time.ns_per_ms);
     defer cache.deinit();
+
+    // Off-loop route resolver: CP `/_cp/route` queries run on this
+    // background thread so a slow/stuck CP never freezes the poll loop.
+    // Shut down (join) before the cache/proxy deinit so no late
+    // completion outlives them; its own deinit frees undrained items.
+    const resolver = try route_resolver_mod.RouteResolver.init(allocator, cp_urls);
+    defer resolver.deinit();
+    try resolver.start();
+    defer resolver.shutdown();
 
     var reg = try rove.Registry.init(allocator, .{
         .max_entities = 8192,
@@ -362,7 +434,7 @@ pub fn main() !void {
         .websocket_upgrades = false,
         .websocket_surface = true,
     });
-    var proxy = Proxy.init(allocator, &reg, server, cp_urls, &cache);
+    var proxy = Proxy.init(allocator, &reg, server, cp_urls, &cache, resolver);
     // Teardown order matters: `server.destroy()` releases any still-live
     // body sinks, and those callbacks walk proxy-owned Flow state — so the
     // server must go down while the proxy is still alive. One defer block
@@ -407,21 +479,18 @@ pub fn main() !void {
     defer if (server80) |s| s.destroy();
 
     // Proactive cert sync (only meaningful when we terminate TLS). Period from
-    // `REWIND_CERT_SYNC_MS` (default 2000); first pass runs before serving so a
-    // restart re-populates the SNI store immediately.
-    var cert_sync: ?CertSync = if (tls_config) |t|
-        .{ .allocator = allocator, .cp_urls = cp_urls, .tls = t }
+    // `REWIND_CERT_SYNC_MS` (default 2000). Runs on its OWN thread so the
+    // periodic CP pull never blocks the poll loop.
+    const cert_sync_ms = envMs("REWIND_CERT_SYNC_MS", 2000);
+    const cert_sync_thread: ?*CertSyncThread = if (tls_config) |t|
+        try CertSyncThread.start(allocator, cp_urls, t, @intCast(cert_sync_ms * std.time.ns_per_ms))
     else
         null;
-    const cert_sync_ms: i128 = blk: {
-        const s = std.posix.getenv("REWIND_CERT_SYNC_MS") orelse break :blk 2000;
-        break :blk std.fmt.parseInt(i128, std.mem.trim(u8, s, " \t"), 10) catch 2000;
-    };
-    const cert_sync_period_ns: i128 = cert_sync_ms * std.time.ns_per_ms;
-    var last_cert_sync_ns: i128 = 0;
-    if (cert_sync) |*cs| cs.sync();
+    // Join (and free) the cert-sync thread before tls_config.destroy() and
+    // the cp_urls free — declared last here so LIFO runs it first.
+    defer if (cert_sync_thread) |cst| cst.shutdownAndDestroy(allocator);
 
-    std.log.info("rewind-front: listening on 0.0.0.0:{d} (cp {d} node(s), route cache {d}ms, tls {s}, streaming proxy)", .{ port, cp_urls.len, cache_ms, if (tls_config != null) "on" else "off (h2c)" });
+    std.log.info("rewind-front: listening on 0.0.0.0:{d} (cp {d} node(s), route cache {d}ms (off-loop resolve), tls {s}, streaming proxy)", .{ port, cp_urls.len, cache_ms, if (tls_config != null) "on" else "off (h2c)" });
     while (!stop_flag.load(.acquire)) {
         server.pollWithTimeout(10 * std.time.ns_per_ms) catch |err| switch (err) {
             error.SignalInterrupt => continue,
@@ -440,14 +509,6 @@ pub fn main() !void {
             try reg80_ptr.?.flush();
             try cleanupResponses(s80);
             try reg80_ptr.?.flush();
-        }
-
-        if (cert_sync) |*cs| {
-            const now_ns = std.time.nanoTimestamp();
-            if (now_ns - last_cert_sync_ns > cert_sync_period_ns) {
-                last_cert_sync_ns = now_ns;
-                cs.sync();
-            }
         }
     }
     std.log.info("rewind-front: shut down", .{});

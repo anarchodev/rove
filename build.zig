@@ -1121,6 +1121,12 @@ pub fn build(b: *std.Build) void {
     const front_step = b.step("rewind-front", "Build the V2 front-door binary (Phase 3b)");
     front_step.dependOn(&b.addInstallArtifact(front_exe, .{}).step);
 
+    // Front-door inline tests (route cache + off-loop resolver).
+    const front_tests = b.addTest(.{ .root_module = front_mod });
+    const front_test_step = b.step("front-test", "Run the rewind-front unit tests");
+    front_test_step.dependOn(&b.addRunArtifact(front_tests).step);
+    test_step.dependOn(&b.addRunArtifact(front_tests).step);
+
     // ── rewind-cp: the V2 control plane (docs/v2-front-door-architecture.md).
     // The authoritative, replicated directory: owns placement + the host→tenant
     // index, hosts the directory raft group (its OWN small cluster), and
