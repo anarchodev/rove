@@ -513,6 +513,17 @@ hr {
 }
 .panel__body  { padding: var(--sp-4); }
 
+/* Card — the generic raised surface used by the marketing site and
+   any page that wants a bordered container without the panel's
+   header/overflow chrome. Padding + shadow are set by the caller
+   (inline or a page overlay) so one class serves both the dense
+   dashboard card and the chunky marketing card. */
+.card {
+  background: var(--mantle);
+  border: var(--border-1);
+  border-radius: var(--r-lg);
+}
+
 /* Rail — the dense, scrollable sidebar pattern. Used for the
    modules list in the replay shell, the prefix tree in KV, etc.
    Distinct from panel because it has no internal padding — children
