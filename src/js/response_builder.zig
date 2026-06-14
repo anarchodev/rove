@@ -14,6 +14,7 @@ const files_mod = @import("rove-files");
 
 const dispatcher_mod = @import("dispatcher.zig");
 const static_cache = @import("static_cache.zig");
+const gzip = @import("gzip.zig");
 
 // ── Header lookup ─────────────────────────────────────────────────────
 
@@ -498,32 +499,45 @@ fn serveStaticByKey(
     // Top-level documents (`text/html`) MUST be served inline
     // same-origin — a 302 on a navigation moves the browser's origin,
     // breaking the document's relative asset paths and same-origin
-    // fetches. The bytes are held resident on the snapshot entry
-    // (prewarmed on the loader thread; docs/static-asset-serving.md §3),
-    // so this never touches S3 on the dispatch thread. Stable mutable
-    // path ⇒ ETag / revalidate (the etag short-circuits the body).
+    // fetches. The bytes are held resident (gzip-compressed) on the
+    // snapshot entry, fetched + compressed at deploy load (bounded by the
+    // tenant's plan), so the dispatch thread NEVER touches blob storage
+    // here. Stable mutable path ⇒ ETag / revalidate (the etag
+    // short-circuits the body).
     if (isHtmlDocument(entry.content_type)) {
-        if (entry.inline_bytes) |doc| {
-            // `doc` is snapshot-owned; the response is sent after dispatch
-            // returns, so copy into the per-request allocator (which lives
-            // until the response completes) to avoid a use-after-free. The
-            // snapshot is pinned now, so the read is safe. HEAD needs no
-            // body, so no copy.
-            const body = if (is_head) doc else try allocator.dupe(u8, doc);
-            try serveInline(server, allocator, ent, sid, sess, entry.content_type, etag, HTML_CACHE_CONTROL, body, is_head);
+        const gz = entry.resident_gzip orelse {
+            // Invariant: a published deployment holds every HTML doc
+            // resident (a failed prewarm fails the load, never publishes).
+            // A null here is a corrupt snapshot — fail loud, and NEVER
+            // fall back to a blocking blob read on the dispatch thread.
+            std.log.err(
+                "rove-js: HTML {s} not resident — deployment invariant violated (serving 500)",
+                .{key},
+            );
+            try setSimpleResponse(server, ent, sid, sess, 500, "static document unavailable\n", allocator);
+            return 500;
+        };
+
+        // HEAD: headers only (advertise the gzip representation + Vary).
+        if (is_head) {
+            try serveInline(server, allocator, ent, sid, sess, entry.content_type, etag, HTML_CACHE_CONTROL, "gzip", true, &[_]u8{}, true);
             return 200;
         }
-        // Rare: oversized HTML (not held resident) or a prewarm failure.
-        // A one-off blocking read so the document still serves correctly
-        // (a document can't fall back to a redirect). HEAD needs neither.
-        const body = if (is_head) &[_]u8{} else (tc.slot.blob_backend.blobStore().get(
-            &entry.hash_hex,
-            allocator,
-        ) catch |err| {
-            std.log.warn("rove-js: html fallback fetch for {s} failed: {s}", .{ key, @errorName(err) });
-            return err;
-        });
-        try serveInline(server, allocator, ent, sid, sess, entry.content_type, etag, HTML_CACHE_CONTROL, body, is_head);
+
+        // The stored bytes ARE gzip. Serve them verbatim to the ~all
+        // clients that accept gzip (no decompression, smaller wire); copy
+        // into the per-request allocator (lives until the response
+        // completes — the snapshot copy must not be handed to h2).
+        if (acceptsGzip(rh)) {
+            const body = try allocator.dupe(u8, gz);
+            try serveInline(server, allocator, ent, sid, sess, entry.content_type, etag, HTML_CACHE_CONTROL, "gzip", true, body, false);
+            return 200;
+        }
+
+        // Rare: a client that doesn't accept gzip → decompress into the
+        // per-request arena and serve identity (still Vary, no encoding).
+        const body = try gzip.decompress(allocator, gz, entry.resident_raw_len);
+        try serveInline(server, allocator, ent, sid, sess, entry.content_type, etag, HTML_CACHE_CONTROL, null, true, body, false);
         return 200;
     }
 
@@ -560,20 +574,35 @@ fn serveInline(
     content_type: []const u8,
     etag: []const u8,
     cache_control: []const u8,
+    /// Non-null → emit `content-encoding` (e.g. "gzip" for the stored,
+    /// pre-compressed HTML served verbatim).
+    content_encoding: ?[]const u8,
+    /// Emit `vary: accept-encoding` so a shared cache keys gzip vs.
+    /// identity correctly (set for HTML, whichever encoding this response
+    /// uses; not for single-representation `/_assets`).
+    vary_accept_encoding: bool,
     body: []const u8,
     is_head: bool,
 ) !void {
-    const hdrs = if (content_type.len == 0)
-        try packRespHeaders(allocator, &.{
-            .{ .name = "etag", .value = etag },
-            .{ .name = "cache-control", .value = cache_control },
-        })
-    else
-        try packRespHeaders(allocator, &.{
-            .{ .name = "content-type", .value = content_type },
-            .{ .name = "etag", .value = etag },
-            .{ .name = "cache-control", .value = cache_control },
-        });
+    var pairs: [5]RespHeaderPair = undefined;
+    var n: usize = 0;
+    if (content_type.len != 0) {
+        pairs[n] = .{ .name = "content-type", .value = content_type };
+        n += 1;
+    }
+    pairs[n] = .{ .name = "etag", .value = etag };
+    n += 1;
+    pairs[n] = .{ .name = "cache-control", .value = cache_control };
+    n += 1;
+    if (content_encoding) |ce| {
+        pairs[n] = .{ .name = "content-encoding", .value = ce };
+        n += 1;
+    }
+    if (vary_accept_encoding) {
+        pairs[n] = .{ .name = "vary", .value = "accept-encoding" };
+        n += 1;
+    }
+    const hdrs = try packRespHeaders(allocator, pairs[0..n]);
     // The response path reads but never mutates the body; constCast is
     // safe (callers own immutable LRU copies / resident snapshot bytes).
     try finalizeResponse(
@@ -636,7 +665,7 @@ pub fn serveAssetByHash(
     // allocator, so the response owns them). Non-blocking.
     if (static_cache.instance()) |sc| {
         if (try sc.getCopy(hash, allocator)) |hit| {
-            try serveInline(server, allocator, ent, sid, sess, hit.content_type, etag, IMMUTABLE_CACHE_CONTROL, hit.bytes, is_head);
+            try serveInline(server, allocator, ent, sid, sess, hit.content_type, etag, IMMUTABLE_CACHE_CONTROL, null, false, hit.bytes, is_head);
             return 200;
         }
     }
@@ -669,6 +698,14 @@ fn isHtmlDocument(content_type: []const u8) bool {
     const prefix = "text/html";
     return content_type.len >= prefix.len and
         std.ascii.eqlIgnoreCase(content_type[0..prefix.len], prefix);
+}
+
+/// True if the request's `Accept-Encoding` lists gzip. A plain substring
+/// match — we don't honor q-values (no browser sends `gzip;q=0`, and the
+/// non-gzip path is a correct identity fallback anyway).
+fn acceptsGzip(rh: h2.ReqHeaders) bool {
+    const ae = findHeader(rh, "accept-encoding") orelse return false;
+    return std.ascii.indexOfIgnoreCase(ae, "gzip") != null;
 }
 
 /// True if `inm` (If-None-Match header value) contains a tag equal to

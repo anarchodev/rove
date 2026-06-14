@@ -66,6 +66,12 @@ pub const PlanLimits = struct {
     rate: RateLimitCaps,
     /// Inbound request body ceiling — 413 above this (Lever 2).
     max_body_bytes: u32,
+    /// Total raw (uncompressed) bytes of HTML documents a deployment may
+    /// hold resident in worker RAM. The worker holds every HTML doc
+    /// resident (gzip-compressed) so the serve path never touches blob
+    /// storage; a deploy whose HTML exceeds this budget is rejected at
+    /// load (Lever 2, sibling of max_body_bytes).
+    max_resident_html_bytes: u32,
     /// Tape/log read-window in days — list/query clamp to the last N days
     /// (Lever 3; a read-path clamp, not GC).
     retention_days: u32,
@@ -84,6 +90,7 @@ pub fn table(t: Tier) PlanLimits {
             // A few MB — generous-but-finite, coherent with the 256 KB
             // streaming QUEUE_BYTES_CAP (docs/architecture/control-plane.md Lever 2).
             .max_body_bytes = 4 * 1024 * 1024,
+            .max_resident_html_bytes = 4 * 1024 * 1024,
             .retention_days = 7,
         },
         .pro => .{
@@ -94,6 +101,7 @@ pub fn table(t: Tier) PlanLimits {
                 .email_refill_per_sec = 100,
             },
             .max_body_bytes = 32 * 1024 * 1024,
+            .max_resident_html_bytes = 32 * 1024 * 1024,
             .retention_days = 30,
         },
         .enterprise => .{
@@ -104,6 +112,7 @@ pub fn table(t: Tier) PlanLimits {
                 .email_refill_per_sec = 1_000,
             },
             .max_body_bytes = 256 * 1024 * 1024,
+            .max_resident_html_bytes = 256 * 1024 * 1024,
             .retention_days = 365,
         },
     };
@@ -118,6 +127,7 @@ pub const Overrides = struct {
     email_capacity: ?u32 = null,
     email_refill_per_sec: ?u32 = null,
     max_body_bytes: ?u32 = null,
+    max_resident_html_bytes: ?u32 = null,
     retention_days: ?u32 = null,
 };
 
@@ -129,6 +139,7 @@ pub fn effective(tier: Tier, ov: Overrides) PlanLimits {
     if (ov.email_capacity) |v| p.rate.email_capacity = v;
     if (ov.email_refill_per_sec) |v| p.rate.email_refill_per_sec = v;
     if (ov.max_body_bytes) |v| p.max_body_bytes = v;
+    if (ov.max_resident_html_bytes) |v| p.max_resident_html_bytes = v;
     if (ov.retention_days) |v| p.retention_days = v;
     return p;
 }

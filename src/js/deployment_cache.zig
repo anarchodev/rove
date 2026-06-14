@@ -30,6 +30,7 @@ const static_cache = @import("static_cache.zig");
 const BlobBytes = bytecode_cache_mod.BlobBytes;
 const BytecodeCache = bytecode_cache_mod.BytecodeCache;
 const MsgRouter = msg_router_mod.MsgRouter;
+const gzip = @import("gzip.zig");
 const testing = std.testing;
 
 /// Metadata about a static file in the active deployment. Bytes are
@@ -38,13 +39,19 @@ const testing = std.testing;
 pub const StaticEntry = struct {
     content_type: []u8, // owned, may be empty
     hash_hex: [files_mod.HASH_HEX_LEN]u8,
-    /// HTML documents only: the prewarmed bytes, owned. Documents must
-    /// serve inline same-origin (a redirect on a navigation moves the
-    /// browser origin), so they can't use the LRU+redirect path that
-    /// other statics do — they're held resident for the snapshot's life
-    /// instead. Null for non-HTML statics (those go through the LRU) and
-    /// for oversized HTML (rare; falls back to a one-off blocking read).
-    inline_bytes: ?[]u8 = null,
+    /// HTML documents only: the prewarmed bytes, GZIP-compressed, owned.
+    /// Documents must serve inline same-origin (a redirect on a navigation
+    /// moves the browser origin), so they can't use the LRU+redirect path
+    /// other statics use — they're held resident (compressed) for the
+    /// snapshot's life. A deploy publishes ONLY when every HTML doc is
+    /// resident (bounded by the tenant's plan), so the serve path never
+    /// touches blob storage; a null here for an HTML entry is therefore an
+    /// invariant violation, not a fallback. Null for non-HTML statics
+    /// (those go through the LRU + /_assets redirect).
+    resident_gzip: ?[]u8 = null,
+    /// Uncompressed length of `resident_gzip` (for Content-Length on the
+    /// decompress path + the per-deployment plan budget). 0 for non-HTML.
+    resident_raw_len: u32 = 0,
 };
 
 /// Per-tenant code state held by the worker. Owns its own KvStore,
@@ -408,7 +415,7 @@ pub const TenantFilesSnapshot = struct {
         while (st_it.next()) |entry| {
             allocator.free(entry.key_ptr.*);
             allocator.free(entry.value_ptr.*.content_type);
-            if (entry.value_ptr.*.inline_bytes) |b| allocator.free(b);
+            if (entry.value_ptr.*.resident_gzip) |b| allocator.free(b);
         }
         self.statics.deinit(allocator);
         var sbh_it = self.statics_by_hash.iterator();
@@ -1165,11 +1172,6 @@ fn mirrorDeployConfig(
 /// huge blob in RAM, and the LRU stays useful for the many-small case).
 const PREWARM_MAX_ASSET_BYTES: usize = 4 << 20;
 
-/// Largest HTML document held resident on its snapshot entry (documents
-/// can't use the redirect fallback). Generous — entry documents are KB;
-/// a larger one falls back to a one-off blocking read at serve time.
-const HTML_INLINE_MAX_BYTES: usize = 8 << 20;
-
 /// True for `text/html` (with or without a `; charset=…` parameter).
 /// Mirrors response_builder.isHtmlDocument — documents serve inline.
 fn isHtmlContentType(content_type: []const u8) bool {
@@ -1191,6 +1193,32 @@ fn prewarmStatic(
     defer allocator.free(bytes);
     if (bytes.len > PREWARM_MAX_ASSET_BYTES) return;
     sc.put(hash_hex, content_type, bytes) catch {};
+}
+
+/// Fetch a blob with a few retries. HTML prewarm runs on the loader
+/// thread; a transient blob-store blip must not fail the deploy on the
+/// first try. A real failure after the retries DOES propagate (and so
+/// fails the deployment load) — correct, since we won't publish a
+/// deployment whose HTML can't serve without blocking.
+fn fetchBlobRetry(
+    bs: blob_mod.BlobStore,
+    hash_hex: *const [files_mod.HASH_HEX_LEN]u8,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    const max_attempts: u8 = 3;
+    var attempt: u8 = 1;
+    while (true) : (attempt += 1) {
+        if (bs.get(hash_hex, allocator)) |bytes| {
+            return bytes;
+        } else |err| {
+            if (attempt >= max_attempts) return err;
+            std.log.warn(
+                "prewarm: HTML blob fetch attempt {d}/{d} failed: {s}",
+                .{ attempt, max_attempts, @errorName(err) },
+            );
+            std.Thread.sleep(@as(u64, 50) * std.time.ns_per_ms * attempt);
+        }
+    }
 }
 
 /// build a new `TenantFilesSnapshot` that we atomic-swap onto
@@ -1296,7 +1324,7 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
         while (it.next()) |e| {
             allocator.free(e.key_ptr.*);
             allocator.free(e.value_ptr.*.content_type);
-            if (e.value_ptr.*.inline_bytes) |b| allocator.free(b);
+            if (e.value_ptr.*.resident_gzip) |b| allocator.free(b);
         }
         next_statics.deinit(allocator);
     }
@@ -1319,6 +1347,12 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
         }
         next_triggers.deinit(allocator);
     }
+
+    // HTML documents are held resident (the serve path never touches blob
+    // storage), bounded by the tenant's plan. Track the running raw total
+    // and reject the deploy if it exceeds the budget.
+    const plan = slot.effectivePlan();
+    var html_resident_raw: u64 = 0;
 
     for (manifest.entries) |entry| {
         const path_copy = try allocator.dupe(u8, entry.path);
@@ -1373,21 +1407,33 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
                 errdefer allocator.free(ct_copy);
 
                 // HTML documents serve inline same-origin (no redirect),
-                // so hold their bytes resident on the entry. Every other
-                // static goes through the shared LRU + /_assets redirect.
-                // Both reads happen here on the loader thread, off the
-                // dispatch loop. Best-effort: a fetch failure leaves the
-                // asset to its serve-time fallback.
-                var inline_bytes: ?[]u8 = null;
-                errdefer if (inline_bytes) |b| allocator.free(b);
+                // so hold their bytes resident (gzip-compressed) on the
+                // entry — the serve path must never touch blob storage.
+                // Every other static goes through the shared LRU +
+                // /_assets redirect. Both reads happen here on the loader
+                // thread, off the dispatch loop. A fetch failure or a
+                // plan-budget overflow FAILS the load (returns an error
+                // that aborts the reload before the snapshot is published),
+                // so we never publish a deployment whose HTML can't serve
+                // without blocking.
+                var resident_gzip: ?[]u8 = null;
+                var resident_raw_len: u32 = 0;
+                errdefer if (resident_gzip) |b| allocator.free(b);
                 if (isHtmlContentType(entry.content_type)) {
-                    if (bs.get(&entry.source_hex, allocator)) |hb| {
-                        if (hb.len <= HTML_INLINE_MAX_BYTES) {
-                            inline_bytes = hb;
-                        } else {
-                            allocator.free(hb); // pathological; serve-time fallback
-                        }
-                    } else |_| {}
+                    const hb = try fetchBlobRetry(bs, &entry.source_hex, allocator);
+                    defer allocator.free(hb);
+
+                    html_resident_raw += hb.len;
+                    if (html_resident_raw > plan.max_resident_html_bytes) {
+                        std.log.err(
+                            "deployment {s}: HTML resident budget exceeded ({d} > {d} bytes) — deploy rejected",
+                            .{ slot.instance_id, html_resident_raw, plan.max_resident_html_bytes },
+                        );
+                        return error.HtmlResidentBudgetExceeded;
+                    }
+
+                    resident_gzip = try gzip.compress(allocator, hb);
+                    resident_raw_len = @intCast(hb.len);
                 } else if (static_cache.instance()) |sc| {
                     prewarmStatic(sc, bs, &entry.source_hex, entry.content_type, allocator);
                 }
@@ -1405,12 +1451,13 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
                 }
 
                 // LAST fallible op in this iteration — ownership of
-                // path_copy / ct_copy / inline_bytes transfers here, so
+                // path_copy / ct_copy / resident_gzip transfers here, so
                 // nothing after can error into a double free.
                 try next_statics.put(allocator, path_copy, .{
                     .content_type = ct_copy,
                     .hash_hex = entry.source_hex,
-                    .inline_bytes = inline_bytes,
+                    .resident_gzip = resident_gzip,
+                    .resident_raw_len = resident_raw_len,
                 });
             },
         }

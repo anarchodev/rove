@@ -527,6 +527,9 @@ pub fn build(b: *std.Build) void {
     js_mod.linkSystemLibrary("nghttp2", .{});
     js_mod.linkSystemLibrary("ssl", .{});
     js_mod.linkSystemLibrary("crypto", .{});
+    // libz for resident-HTML gzip (src/js/gzip.zig); Zig 0.15 flate is
+    // incomplete, so we use libz directly (same as the log server).
+    js_mod.linkSystemLibrary("z", .{});
 
     const js_tests = b.addTest(.{ .root_module = js_mod });
     test_step.dependOn(&b.addRunArtifact(js_tests).step);
