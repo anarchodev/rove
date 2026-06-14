@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rewind.js docs — quickstart</title>
+<meta name="description" content="The anatomy of a rewind.js handler bundle and the publish → release → serve lifecycle.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23121512'/%3E%3Cpath d='M9 4 L4.5 8 L9 12 Z M13 4 L8.5 8 L13 12 Z' fill='%23ffb454'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/docs.css">
+</head>
+<body>
+<div class="wrap">
+<aside>
+  <a class="brand" href="/"><span class="glyph">◀◀&hairsp;</span>rewind<b>.js</b></a>
+  <div class="tagline">documentation</div>
+  <nav>
+    <div class="group">Start</div>
+    <a href="/">Overview</a>
+    <a href="/quickstart" class="active">Quickstart</a>
+    <div class="group">Reference</div>
+    <a href="/handlers">Handlers</a>
+    <a href="/effects">Effects &amp; replay</a>
+    <div class="group">More</div>
+    <a href="https://rewindjs.com">rewindjs.com</a>
+  </nav>
+</aside>
+<main>
+<article>
+  <div class="kicker">Quickstart</div>
+  <h1>From a function to a URL.</h1>
+  <p class="lede">A rewind.js app is a small bundle: one handler module, plus any
+     static files. You publish the bundle, flip it live, and it serves. Here's
+     the whole shape.</p>
+
+  <div class="note"><b>Pre-launch.</b> Hosted sign-up isn't open yet, so there's
+     no <code>npm i</code> step to run today. This page is the conceptual
+     anatomy — the handler contract and the deploy lifecycle — so the pieces are
+     familiar when the door opens.</div>
+
+  <h2>1. The bundle</h2>
+  <p>A tenant's deploy bundle is a directory. Two conventions matter:</p>
+<pre><code>myapp/
+  index.mjs        <span class="c">// the handler — default export = inbound HTTP</span>
+  _static/         <span class="c">// static assets, served at their path sans _static/</span>
+    style.css
+    logo.svg</code></pre>
+  <p>Everything under <code>_static/</code> is served as a static asset.
+     Documents are served inline same-origin; other assets resolve to immutable,
+     content-addressed URLs that cache forever. Your <code>index.mjs</code> is
+     compiled to bytecode at publish time.</p>
+
+  <h2>2. The handler</h2>
+  <p>The default export runs on every inbound request. It's a pure function of
+     the <code>request</code> global and the tenant's <code>kv</code>; it returns
+     the response body.</p>
+<pre><code><span class="c">// index.mjs</span>
+<span class="k">export default function</span> () {
+  <span class="k">if</span> (request.method === <span class="s">"POST"</span>) {
+    kv.<span class="f">set</span>(<span class="s">"note/"</span> + <span class="f">Date</span>.<span class="f">now</span>(), request.body);
+    response.status = 201;
+    <span class="k">return</span> <span class="s">"saved"</span>;
+  }
+  <span class="k">const</span> notes = kv.<span class="f">prefix</span>(<span class="s">"note/"</span>, <span class="s">""</span>, 100);
+  <span class="k">return</span> { count: notes.length, notes };
+}</code></pre>
+  <p>The <code>request</code> surface (<code>method</code>, <code>path</code>,
+     <code>headers</code>, <code>query</code>, <code>body</code>) and the ambient
+     <code>response</code> head (<code>status</code>, <code>headers</code>,
+     <code>cookies</code>) are covered in <a href="/handlers">Handlers</a>.</p>
+
+  <h2>3. Publish → release → serve</h2>
+  <p>Deployment is two phases, so a build is never half-live:</p>
+  <ol>
+    <li><strong>Publish.</strong> The bundle is uploaded; sources compile to
+        bytecode and assets are stored content-addressed. This produces an
+        immutable <em>deployment</em> with an id — staged, not yet serving.</li>
+    <li><strong>Release.</strong> A single atomic flip points the tenant at that
+        deployment id. The next request serves the new code; in-flight requests
+        finish on the old one. Rolling back is the same flip to a prior id.</li>
+  </ol>
+  <div class="note">Releases commit through the same replicated log as your data,
+     so "it's live" means a quorum agreed it's live — not that one machine
+     hopes so.</div>
+
+  <h2>4. It serves</h2>
+  <p>Your tenant answers on its host. A request flows: edge TLS → router →
+     your handler (a fresh, deterministic activation) → response. Every external
+     read along the way is taped, so that exact request can be replayed later.</p>
+<pre><code>$ curl https://myapp.example/         <span class="c"># GET → your default export</span>
+{<span class="s">"count"</span>:0,<span class="s">"notes"</span>:[]}</code></pre>
+
+  <h2>Next</h2>
+  <p>You've seen the shape. The reference goes deeper:
+     <a href="/handlers">Handlers</a> for the full activation surface, and
+     <a href="/effects">Effects &amp; replay</a> for how outbound work stays
+     deterministic.</p>
+
+  <div class="nextprev">
+    <a href="/"><span class="dir">Prev</span>← Overview</a>
+    <a class="fwd" href="/handlers"><span class="dir">Next</span>Handlers →</a>
+  </div>
+  <footer>© 2026 Loop46, Inc. · rewind.js</footer>
+</article>
+</main>
+</div>
+</body>
+</html>

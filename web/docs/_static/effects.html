@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rewind.js docs — effects &amp; replay</title>
+<meta name="description" content="The rewind.js effect model: the determinism invariant, the four primitives, and how durable effects compose on one outbound primitive.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23121512'/%3E%3Cpath d='M9 4 L4.5 8 L9 12 Z M13 4 L8.5 8 L13 12 Z' fill='%23ffb454'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/docs.css">
+</head>
+<body>
+<div class="wrap">
+<aside>
+  <a class="brand" href="/"><span class="glyph">◀◀&hairsp;</span>rewind<b>.js</b></a>
+  <div class="tagline">documentation</div>
+  <nav>
+    <div class="group">Start</div>
+    <a href="/">Overview</a>
+    <a href="/quickstart">Quickstart</a>
+    <div class="group">Reference</div>
+    <a href="/handlers">Handlers</a>
+    <a href="/effects" class="active">Effects &amp; replay</a>
+    <div class="group">More</div>
+    <a href="https://rewindjs.com">rewindjs.com</a>
+  </nav>
+</aside>
+<main>
+<article>
+  <div class="kicker">Reference</div>
+  <h1>Effects &amp; replay</h1>
+  <p class="lede">A handler is pure, but real apps talk to the world. The effect
+     model is how outbound work happens <em>without</em> giving up determinism —
+     which is what keeps every request replayable.</p>
+
+  <h2>The invariant</h2>
+  <p>Inside an activation your code is imperative, but the platform records every
+     non-deterministic read so the activation can be re-run identically. The one
+     rule that makes that hold:</p>
+  <div class="note"><b>An effect may return data to a handler only as a recorded
+     message.</b> Nothing reaches your code through a back channel; results come
+     back as a new, taped activation.</div>
+  <p>So you never <code>await</code> a fetch and read its body inline. You
+     <em>start</em> the fetch as an effect and handle its result in a separate
+     export (<code>onResult</code>), where the response arrives as
+     <code>request.result</code> — a recorded message. On replay, that message is
+     served from the tape, not the network.</p>
+
+  <h2>The four primitives</h2>
+  <p>The whole engine, minus your handlers, is four primitives — two singletons
+     and two open families. Every named effect is a composition of them.</p>
+  <table>
+    <tr><th>Primitive</th><th>Is</th></tr>
+    <tr><td><strong>The Model</strong> (singleton)</td><td>the durable, replicated <code>kv</code> — the only state that survives between activations</td></tr>
+    <tr><td><strong>The Continuation</strong> (singleton)</td><td>a held connection waiting to resume — what <code>next()</code> produces</td></tr>
+    <tr><td><strong>Msg origins</strong> (open family)</td><td>the ways an activation can start: inbound HTTP, a fetch result, a timer, a kv change, a webhook delivery…</td></tr>
+    <tr><td><strong>Cmd runtimes</strong> (open family)</td><td>the outbound effects: the one HTTP primitive, the kv writeset, timers…</td></tr>
+  </table>
+  <p>Two corollaries fall out, and they're the reason replay is possible at all:
+     <strong>inputs are durable</strong> (recorded as messages) and
+     <strong>outputs are derivable</strong> (re-running the inputs reproduces
+     them).</p>
+
+  <h2>Durability is composed, not built in</h2>
+  <p>There is <em>one</em> outbound primitive: a single HTTP send. The durable
+     effects you actually call — <code>webhook.send</code>,
+     <code>email.send</code>, <code>retry.*</code> — are JavaScript libraries that
+     compose retry, idempotency, and at-least-once delivery <em>on top of</em>
+     that primitive plus <code>kv</code>. The runtime doesn't special-case them;
+     they're recipes, which means you can read them, and write your own.</p>
+<pre><code><span class="c">// ephemeral: tied to this connection, dies if the caller leaves</span>
+on.<span class="f">fetch</span>(url, opts);            <span class="c">// → resumes onResult with the taped response</span>
+
+<span class="c">// durable: a new request that runs whether or not anyone's connected</span>
+webhook.<span class="f">send</span>({ url, body });    <span class="c">// retried to completion, survives restarts</span></code></pre>
+
+  <h2>Scope is the verb</h2>
+  <p>Whether an effect is ephemeral or durable is decided by <em>which verb you
+     call</em>, not a flag. A continuation's durability is forced by its scope:
+     a connection-scoped hold is moot if the caller disconnects (so it needn't be
+     persisted); a tenant-scoped effect must survive anything (so it is). The
+     grammar position <em>is</em> the guarantee.</p>
+  <table>
+    <tr><th></th><th>Ephemeral (connection)</th><th>Durable (tenant)</th></tr>
+    <tr><td>Output</td><td><code>stream.write</code></td><td>— (write to <code>kv</code>)</td></tr>
+    <tr><td>Trigger</td><td><code>on.timer</code> / <code>on.fetch</code> / <code>on.kv</code></td><td><code>schedule</code> / <code>cron</code> / <code>webhook.send</code></td></tr>
+  </table>
+
+  <h2>Why this is the product</h2>
+  <p>Every other property — replay a production request, step a bug in a
+     simulator, prove a fix against the exact recorded inputs — is downstream of
+     these rules. Keep the handler pure and the effects recorded, and the
+     platform can hand you a perfect reproduction of anything that ever ran.
+     That's the whole bet.</p>
+
+  <div class="nextprev">
+    <a href="/handlers"><span class="dir">Prev</span>← Handlers</a>
+    <a class="fwd" href="/"><span class="dir">Back to</span>Overview →</a>
+  </div>
+  <footer>© 2026 Loop46, Inc. · rewind.js — pure functions · taped effects · replayable state</footer>
+</article>
+</main>
+</div>
+</body>
+</html>
