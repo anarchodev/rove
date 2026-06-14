@@ -17,8 +17,16 @@ set -euo pipefail
 
 LINEAGE=${RENEWED_LINEAGE:-/etc/letsencrypt/live/platform}
 DEPLOY_USER=rove
-# Peer hosts running rewind-front (ssh targets), space-separated.
-PEERS=${ROVE_CERT_PEERS:-148.113.208.58}
+# Peer hosts running rewind-front (ssh targets) to distribute the renewed
+# cert to — the OTHER fronts besides this (the certbot) host. No prod hosts
+# are hardcoded here (this script ships in a public repo): set via
+# ROVE_CERT_PEERS, or list them (space/newline-separated) in a root-readable
+# /etc/rove/cert-peers on the certbot host. Empty ⇒ local front only.
+PEERS="${ROVE_CERT_PEERS:-}"
+if [ -z "$PEERS" ] && [ -r /etc/rove/cert-peers ]; then
+    PEERS="$(tr '\n' ' ' < /etc/rove/cert-peers)"
+fi
+[ -z "$PEERS" ] && echo "rove-cert-deploy: no peers (ROVE_CERT_PEERS / /etc/rove/cert-peers) — updating local front only" >&2
 
 HOME_DIR=$(getent passwd "$DEPLOY_USER" | cut -d: -f6)
 TLS_DIR="$HOME_DIR/.rove/tls"
