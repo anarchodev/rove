@@ -25,6 +25,7 @@ const bytecode_cache_mod = @import("bytecode_cache.zig");
 const deployment_loader_mod = @import("deployment_loader.zig");
 const msg_router_mod = @import("msg_router.zig");
 const plan_mod = @import("rove-plan");
+const static_cache = @import("static_cache.zig");
 
 const BlobBytes = bytecode_cache_mod.BlobBytes;
 const BytecodeCache = bytecode_cache_mod.BytecodeCache;
@@ -37,6 +38,13 @@ const testing = std.testing;
 pub const StaticEntry = struct {
     content_type: []u8, // owned, may be empty
     hash_hex: [files_mod.HASH_HEX_LEN]u8,
+    /// HTML documents only: the prewarmed bytes, owned. Documents must
+    /// serve inline same-origin (a redirect on a navigation moves the
+    /// browser origin), so they can't use the LRU+redirect path that
+    /// other statics do — they're held resident for the snapshot's life
+    /// instead. Null for non-HTML statics (those go through the LRU) and
+    /// for oversized HTML (rare; falls back to a one-off blocking read).
+    inline_bytes: ?[]u8 = null,
 };
 
 /// Per-tenant code state held by the worker. Owns its own KvStore,
@@ -352,6 +360,12 @@ pub const TenantFilesSnapshot = struct {
     /// Static files keyed by stored path; bytes fetched on demand
     /// from the slot's `blob_backend`.
     statics: std.StringHashMapUnmanaged(StaticEntry),
+    /// Reverse index: content hash (64-hex, owned) → content_type
+    /// (owned). Lets the `/_assets/{hash}` serve path validate a hash
+    /// belongs to this deployment and recover its content-type in O(1)
+    /// without scanning `statics`. Both key and value owned by the
+    /// snapshot.
+    statics_by_hash: std.StringHashMapUnmanaged([]u8) = .empty,
     /// Trigger registry. Sorted descending by prefix length so a
     /// forward scan visits innermost (most-specific) triggers first.
     triggers: []TriggerEntry,
@@ -394,8 +408,15 @@ pub const TenantFilesSnapshot = struct {
         while (st_it.next()) |entry| {
             allocator.free(entry.key_ptr.*);
             allocator.free(entry.value_ptr.*.content_type);
+            if (entry.value_ptr.*.inline_bytes) |b| allocator.free(b);
         }
         self.statics.deinit(allocator);
+        var sbh_it = self.statics_by_hash.iterator();
+        while (sbh_it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        self.statics_by_hash.deinit(allocator);
         for (self.triggers) |t| {
             allocator.free(t.prefix);
             allocator.free(t.module_path);
@@ -1139,6 +1160,39 @@ fn mirrorDeployConfig(
 
 /// Pull a specific deployment manifest from the per-tenant
 /// `deployments/` BlobBackend, fetch every referenced bytecode, and
+/// Largest single static asset prewarmed into the in-memory LRU. Bigger
+/// assets serve via the redirect fallback (so the worker never holds a
+/// huge blob in RAM, and the LRU stays useful for the many-small case).
+const PREWARM_MAX_ASSET_BYTES: usize = 4 << 20;
+
+/// Largest HTML document held resident on its snapshot entry (documents
+/// can't use the redirect fallback). Generous — entry documents are KB;
+/// a larger one falls back to a one-off blocking read at serve time.
+const HTML_INLINE_MAX_BYTES: usize = 8 << 20;
+
+/// True for `text/html` (with or without a `; charset=…` parameter).
+/// Mirrors response_builder.isHtmlDocument — documents serve inline.
+fn isHtmlContentType(content_type: []const u8) bool {
+    const p = "text/html";
+    return content_type.len >= p.len and std.ascii.eqlIgnoreCase(content_type[0..p.len], p);
+}
+
+/// Fetch one static blob and seed it into the shared LRU. Loader-thread
+/// only (the `get` is a blocking S3 read). Best-effort — any failure
+/// just leaves the asset to the redirect fallback at serve time.
+fn prewarmStatic(
+    sc: *static_cache.StaticCache,
+    bs: blob_mod.BlobStore,
+    hash_hex: *const [files_mod.HASH_HEX_LEN]u8,
+    content_type: []const u8,
+    allocator: std.mem.Allocator,
+) void {
+    const bytes = bs.get(hash_hex, allocator) catch return;
+    defer allocator.free(bytes);
+    if (bytes.len > PREWARM_MAX_ASSET_BYTES) return;
+    sc.put(hash_hex, content_type, bytes) catch {};
+}
+
 /// build a new `TenantFilesSnapshot` that we atomic-swap onto
 /// `slot.current`. The old snapshot's slot-reference drops, but
 /// pinned in-flight readers keep it alive until they release. Used
@@ -1242,8 +1296,19 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
         while (it.next()) |e| {
             allocator.free(e.key_ptr.*);
             allocator.free(e.value_ptr.*.content_type);
+            if (e.value_ptr.*.inline_bytes) |b| allocator.free(b);
         }
         next_statics.deinit(allocator);
+    }
+
+    var next_statics_by_hash: std.StringHashMapUnmanaged([]u8) = .empty;
+    errdefer {
+        var it = next_statics_by_hash.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            allocator.free(e.value_ptr.*);
+        }
+        next_statics_by_hash.deinit(allocator);
     }
 
     var next_triggers: std.ArrayList(TriggerEntry) = .empty;
@@ -1306,9 +1371,46 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
             .static => {
                 const ct_copy = try allocator.dupe(u8, entry.content_type);
                 errdefer allocator.free(ct_copy);
+
+                // HTML documents serve inline same-origin (no redirect),
+                // so hold their bytes resident on the entry. Every other
+                // static goes through the shared LRU + /_assets redirect.
+                // Both reads happen here on the loader thread, off the
+                // dispatch loop. Best-effort: a fetch failure leaves the
+                // asset to its serve-time fallback.
+                var inline_bytes: ?[]u8 = null;
+                errdefer if (inline_bytes) |b| allocator.free(b);
+                if (isHtmlContentType(entry.content_type)) {
+                    if (bs.get(&entry.source_hex, allocator)) |hb| {
+                        if (hb.len <= HTML_INLINE_MAX_BYTES) {
+                            inline_bytes = hb;
+                        } else {
+                            allocator.free(hb); // pathological; serve-time fallback
+                        }
+                    } else |_| {}
+                } else if (static_cache.instance()) |sc| {
+                    prewarmStatic(sc, bs, &entry.source_hex, entry.content_type, allocator);
+                }
+
+                // Reverse hash→content_type index (deduped: a hash may
+                // appear under several paths). Its own block so the dupe
+                // errdefers scope here and don't double-fire if the
+                // next_statics.put below fails.
+                if (!next_statics_by_hash.contains(&entry.source_hex)) {
+                    const hk = try allocator.dupe(u8, &entry.source_hex);
+                    errdefer allocator.free(hk);
+                    const hct = try allocator.dupe(u8, entry.content_type);
+                    errdefer allocator.free(hct);
+                    try next_statics_by_hash.put(allocator, hk, hct);
+                }
+
+                // LAST fallible op in this iteration — ownership of
+                // path_copy / ct_copy / inline_bytes transfers here, so
+                // nothing after can error into a double free.
                 try next_statics.put(allocator, path_copy, .{
                     .content_type = ct_copy,
                     .hash_hex = entry.source_hex,
+                    .inline_bytes = inline_bytes,
                 });
             },
         }
@@ -1356,6 +1458,7 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
         .bytecodes = next_bc,
         .source_hashes = next_source_hashes,
         .statics = next_statics,
+        .statics_by_hash = next_statics_by_hash,
         .triggers = triggers_slice,
         .subscriptions = subscriptions_slice,
         .manifest_bytes = json_bytes,

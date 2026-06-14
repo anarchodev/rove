@@ -2445,6 +2445,10 @@ fn resolveRequest(
                 if (slot.pinCurrent()) |snap| {
                     const tc = worker_mod.TenantFiles{ .slot = slot, .snap = snap };
                     defer tc.release();
+                    // Content-addressed assets first (the admin SPA's
+                    // subresources 302 here), then the normal static path.
+                    if (try respb.serveAssetByHash(server, allocator, ent, sid, sess, tc, path, rh, std.mem.eql(u8, method, "HEAD"))) |_|
+                        return .handled;
                     const outcome = try respb.tryServeStatic(server, allocator, ent, sid, sess, tc, method, path, rh);
                     if (outcome != .miss) return .handled;
                 }
@@ -2784,6 +2788,14 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // HEAD route through here; HEAD gets identical headers but no
         // body (RFC 9110 §9.3.2).
         if (!is_admin_request and (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "HEAD"))) {
+            // Content-addressed assets: `/_assets/{hash}` served from the
+            // in-memory LRU (immutable), miss → presigned redirect. Both
+            // non-blocking. Null = not an asset path → normal static/route.
+            if (try respb.serveAssetByHash(server, allocator, ent, sid, sess, tc, path, rh, std.mem.eql(u8, method, "HEAD"))) |status| {
+                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, status, .ok, &.{}, &.{}, .{}, null, .inbound, 0);
+                processed += 1;
+                continue;
+            }
             const static_outcome = try respb.tryServeStatic(
                 server,
                 allocator,
