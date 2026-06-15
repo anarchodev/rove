@@ -138,6 +138,18 @@ def main() -> int:
         check(f"direct POST follower (node {followers[0] + 1}) → 421",
               wf.status == 421, f"got {wf.status} {wf.body!r}")
 
+        # NOTE on the front leader cache (proxy.zig `LeaderCache`): the front
+        # learns the leader from a 421→success re-aim and starts subsequent
+        # requests for the host there, removing the redirect tax. Its LOGIC is
+        # unit-tested deterministically (note/startIdx/drop/stale-fallback in
+        # proxy.zig). It isn't asserted here because exercising it end-to-end
+        # needs the elected leader at a non-zero node index (uncontrollable),
+        # and serving a customer handler right after a forced leadership change
+        # depends on the promoted node's deployment-load path — an orthogonal,
+        # timing-sensitive concern that `leader_failover_smoke_v2` deliberately
+        # avoids too. The re-aim itself is observable in production via the
+        # `[front] 421 re-aim` info log (rare once the cache is warm).
+
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
         return 1
