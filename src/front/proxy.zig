@@ -89,6 +89,15 @@ const CONNECT_BACKOFF_NS: i128 = 500 * std.time.ns_per_ms;
 /// freezing the whole loop for the libcurl timeout).
 const ROUTE_WAIT_NS: i128 = 2500 * std.time.ns_per_ms;
 
+/// A flow whose request is fully sent upstream but that produces no
+/// response headers within this window is treated as a stuck stream: the
+/// upstream stream is RST and the client gets a 504, rather than hanging
+/// until the h2 idle GC (or forever, if the connection never goes idle —
+/// see the front-door TTFB investigation). Set well above the worker
+/// handler budget (<=10s) so slow-but-valid handlers aren't killed; this
+/// only bounds the genuinely-stuck case.
+const RESPONSE_WAIT_NS: i128 = 30_000 * std.time.ns_per_ms;
+
 // ── Small shared helpers (formerly in main.zig) ───────────────────────
 
 pub fn headerValue(rh: h2.ReqHeaders, name: []const u8) ?[]const u8 {
@@ -392,6 +401,11 @@ pub fn Proxy(comptime FrontH2: type) type {
 
             // response relay
             resp_started: bool = false,
+            /// Armed (to `now + RESPONSE_WAIT_NS`) once the request body
+            /// is fully forwarded and we're awaiting response headers. If
+            /// it fires before `resp_started`, the upstream is stuck: RST
+            /// it and 504 the client instead of hanging. 0 = not armed.
+            response_deadline_ns: i128 = 0,
             resp_streaming: bool = false,
             resp_queue: std.ArrayListUnmanaged(u8) = .empty,
             resp_eof: bool = false,
@@ -491,6 +505,8 @@ pub fn Proxy(comptime FrontH2: type) type {
             try self.reg.flush();
             // 503 any flow that parked too long on a cold route.
             self.expireParkedRoutes(now_ns);
+            // 504 any flow stuck awaiting upstream response headers.
+            self.expireStalledResponses(now_ns);
             try self.reg.flush();
         }
 
@@ -2014,6 +2030,38 @@ pub fn Proxy(comptime FrontH2: type) type {
                         i += 1;
                     }
                 }
+            }
+        }
+
+        /// 504 any flow whose request was fully forwarded upstream but
+        /// that has gone `RESPONSE_WAIT_NS` with no response headers — a
+        /// stuck stream that otherwise hangs the client until the h2 idle
+        /// GC (or forever, if the connection never goes idle). Gated on
+        /// `body_complete` so a slow upload in progress isn't mistaken for
+        /// a stall, and on `!resp_started` so a streaming response isn't
+        /// cut off. `abandonAttempt` mutates `flows_by_up`, so collect the
+        /// stalled flows first, then act.
+        fn expireStalledResponses(self: *Self, now_ns: i128) void {
+            var stalled: [32]*Flow = undefined;
+            var n: usize = 0;
+            var it = self.flows_by_up.valueIterator();
+            while (it.next()) |fp| {
+                const flow = fp.*;
+                if (flow.resp_started or !flow.body_complete) continue;
+                if (flow.response_deadline_ns == 0) {
+                    flow.response_deadline_ns = now_ns + RESPONSE_WAIT_NS;
+                    continue;
+                }
+                if (now_ns >= flow.response_deadline_ns) {
+                    stalled[n] = flow;
+                    n += 1;
+                    if (n == stalled.len) break;
+                }
+            }
+            for (stalled[0..n]) |flow| {
+                std.log.warn("front: upstream response timeout (host={s}) -> 504", .{flow.host});
+                self.abandonAttempt(flow); // RST_STREAM to the stuck upstream
+                self.finishWithStatus(flow, 504); // 504 to the client + teardown
             }
         }
     };
