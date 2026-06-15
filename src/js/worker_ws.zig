@@ -40,6 +40,9 @@ const Request = dispatcher_mod.Request;
 
 const worker_mod = @import("worker.zig");
 const worker_streaming = @import("worker_streaming.zig");
+const worker_drain = @import("worker_drain.zig");
+const globals = @import("globals.zig");
+const builtin_modules_mod = @import("builtin_modules.zig");
 const captureLogWithId = worker_mod.captureLogWithId;
 const resolveDeployment = worker_mod.resolveDeployment;
 const StreamResumeStage = worker_streaming.StreamResumeStage;
@@ -442,6 +445,22 @@ fn fireWsMessage(
     }
     var chunk_opcodes: std.ArrayListUnmanaged(u8) = .empty;
     defer chunk_opcodes.deinit(allocator);
+    // `on.fetch` from `onMessage` accumulates here; bound to the chain +
+    // submitted post-commit on the read-only `next()` arm (the result
+    // resumes via `resumeBoundFetchChainWs`).
+    var pending_fetches: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
+    defer {
+        for (pending_fetches.items) |*pf| pf.deinit(allocator);
+        pending_fetches.deinit(allocator);
+    }
+    // `on.kv` / `on.timer` from `onMessage` accumulate here; installed as a
+    // `StreamWakes` component on the chain (`installWsWakes`) so the sweep
+    // fires them and `resumeWakeChainWs` resumes onWake over the socket.
+    var pending_wakes: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer {
+        for (pending_wakes.items) |*pw| pw.deinit(allocator);
+        pending_wakes.deinit(allocator);
+    }
 
     const request: Request = .{
         .method = "POST",
@@ -449,12 +468,15 @@ fn fireWsMessage(
         .body = body,
         .query = null,
         .activation = .{ .ws_message = .{ .opcode = opcode, .data = payload } },
+        .activation_entity = chain_ent,
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
         .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
         .effects = .{
             .pending_stream_chunks = &stream_chunks,
             .pending_stream_chunk_opcodes = &chunk_opcodes,
+            .pending_fetches = &pending_fetches,
+            .pending_wakes = &pending_wakes,
         },
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
@@ -508,6 +530,9 @@ fn fireWsMessage(
         },
         .continuation => |*cval| {
             const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, .ws_message, path, chain_ctx.correlation_id);
+            const wrote = p.ws.ops.items.len > 0;
+            // Snap the §8.4 read baseline before shipWsFrames may transfer txn.
+            const read_version = p.txn.readVersion();
             const fw_seq = shipWsFrames(worker, conn_ent, &stream_chunks, &chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, false) catch |perr| {
                 std.log.warn("rove-js ws-message (next+writes): propose failed: {s}", .{@errorName(perr)});
                 p.txn_done = true;
@@ -528,6 +553,20 @@ fn fireWsMessage(
             // writes, or the read-only speculation barrier) — close the
             // gate so later frames queue behind it in arrival order.
             if (fw_seq != 0) armWsGate(worker, conn_ent, chain_ctx.tenant_id, fw_seq);
+            // Bind + submit any `on.fetch` this frame issued (post-commit on
+            // the read-only arm). A WRITING frame can't (commit-gated bind
+            // from a resume isn't wired — same limit as the HTTP path); a
+            // read-only `think()` keeps `on.fetch` working.
+            if (!wrote) {
+                worker_drain.flushResumeFetches(worker, chain_ent, &pending_fetches, true);
+            } else if (pending_fetches.items.len > 0) {
+                std.log.warn(
+                    "rove-js ws onMessage: {d} on.fetch from a WRITING frame dropped (issue on.fetch from a read-only frame) tenant={s}",
+                    .{ pending_fetches.items.len, chain_ctx.tenant_id },
+                );
+            }
+            // Arm any on.kv/on.timer this frame registered (rides the chain).
+            if (pending_wakes.items.len > 0) installWsWakes(worker, chain_ent, &pending_wakes, read_version);
             captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .ws_message, fw_seq);
         },
         .stream => |*s2| {
@@ -547,6 +586,440 @@ fn fireWsMessage(
             p.txn.rollback() catch {};
             p.txn_done = true;
             captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .ws_message, 0);
+            effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+            tearDownWsChain(worker, conn_ent);
+        },
+    }
+}
+
+/// Resolve the WS connection entity holding `chain_ent`, or null if it's not a
+/// WS chain (an ordinary HTTP continuation). Linear over the held-WS conns —
+/// there are few, and this is only consulted when a bound-fetch result lands on
+/// a parked continuation.
+pub fn wsConnForChain(worker: anytype, chain_ent: rove.Entity) ?rove.Entity {
+    var it = worker.ws_conns.iterator();
+    while (it.next()) |e| {
+        if (e.value_ptr.chain.eql(chain_ent)) return e.key_ptr.*;
+    }
+    return null;
+}
+
+/// Install (or replace) the chain's `StreamWakes` from this frame's
+/// `on.kv`/`on.timer` registrations — the WS analog of worker_dispatch's
+/// `armContWakesIfAny`. Idempotent re-arm: frees the prior registration's
+/// owned memory first (reg.set overwrites in place, it does not deinit the
+/// old one). Call only when `pending.items.len > 0` (an empty frame leaves
+/// the existing wakes armed — they ride the chain across resumes).
+fn installWsWakes(
+    worker: anytype,
+    chain_ent: rove.Entity,
+    pending: *std.ArrayListUnmanaged(globals.PendingWakeReg),
+    read_version: u64,
+) void {
+    const allocator = worker.allocator;
+    const server = worker.h2;
+
+    if (server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamWakes)) |old| {
+        for (old.kv_prefixes) |pfx| allocator.free(pfx);
+        if (old.kv_prefixes.len > 0) allocator.free(old.kv_prefixes);
+        if (old.wake_to) |t| allocator.free(t);
+        old.pending_wakes.deinit(allocator);
+        old.* = .{};
+    } else |_| {}
+
+    var interval_ms: i64 = 0;
+    var wake_to: ?[]u8 = null;
+    var prefixes: std.ArrayListUnmanaged([]u8) = .empty;
+    for (pending.items) |reg| {
+        switch (reg.kind) {
+            .timer => interval_ms = reg.interval_ms,
+            .kv => if (reg.prefix.len > 0) {
+                const dup = allocator.dupe(u8, reg.prefix) catch continue;
+                prefixes.append(allocator, dup) catch allocator.free(dup);
+            },
+        }
+        if (reg.to) |t| {
+            if (wake_to) |old_to| allocator.free(old_to);
+            wake_to = allocator.dupe(u8, t) catch null;
+        }
+    }
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    const next_wake_ns: i64 = if (interval_ms > 0)
+        now_ns + interval_ms * std.time.ns_per_ms
+    else
+        std.math.maxInt(i64);
+    const kv_prefixes = prefixes.toOwnedSlice(allocator) catch {
+        for (prefixes.items) |pfx| allocator.free(pfx);
+        prefixes.deinit(allocator);
+        if (wake_to) |t| allocator.free(t);
+        return; // OOM — leave the chain unarmed rather than leak
+    };
+    server.reg.set(chain_ent, &worker.parked_continuations, components_mod.StreamWakes, .{
+        .interval_ms = interval_ms,
+        .next_wake_ns = next_wake_ns,
+        .kv_prefixes = kv_prefixes,
+        .read_version = read_version,
+        .wake_to = wake_to,
+    }) catch {};
+}
+
+/// WS sibling of `worker_drain.resumeBoundFetchChain`: an `on.fetch` issued from
+/// a held WebSocket chain's `onMessage` completed — re-invoke the `{to}` export
+/// (e.g. `onLLM`) with the result as a `.fetch_chunk` activation, and ship its
+/// `stream.write` frames back over the SAME socket via `shipWsFrames`. (The HTTP
+/// path's `resolveParked` would stamp a meaningless h2 response onto a WS conn.)
+/// Mirrors `fireWsMessage`'s structure, swapping the activation. Owns `ev`.
+pub fn resumeBoundFetchChainWs(
+    worker: anytype,
+    chain_ent: rove.Entity,
+    conn_ent: rove.Entity,
+    ev: *components_mod.UpstreamFetchEvent,
+) void {
+    defer components_mod.UpstreamFetchEvent.deinitItem(ev, worker.allocator);
+
+    const allocator = worker.allocator;
+    const server = worker.h2;
+    const chain_ctx = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.ChainContext) catch return;
+    const chain_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamChain) catch return;
+
+    const path = chain_st.module_path;
+    var p = worker_streaming.firePrep(worker, chain_ctx.tenant_id, path, "ws-fetch-resume") orelse {
+        effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+        tearDownWsChain(worker, conn_ent);
+        return;
+    };
+    defer p.deinit(allocator);
+    const tc = p.dep.tc;
+
+    // The resumed export reads its chunk via the activation; `request.ctx`
+    // carries the held chain's threaded ctx (same `{ctx}` body as fireWsMessage).
+    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json}) catch return;
+    defer allocator.free(body);
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
+    defer allocator.free(spath);
+
+    const fetches_pending: u32 = blk: {
+        const cnt = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.BoundFetchCount) catch break :blk 0;
+        break :blk cnt.pending;
+    };
+
+    var stream_chunks: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (stream_chunks.items) |ch| allocator.free(ch);
+        stream_chunks.deinit(allocator);
+    }
+    var chunk_opcodes: std.ArrayListUnmanaged(u8) = .empty;
+    defer chunk_opcodes.deinit(allocator);
+    var pending_fetches: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
+    defer {
+        for (pending_fetches.items) |*pf| pf.deinit(allocator);
+        pending_fetches.deinit(allocator);
+    }
+    var pending_wakes: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer {
+        for (pending_wakes.items) |*pw| pw.deinit(allocator);
+        pending_wakes.deinit(allocator);
+    }
+
+    const request: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = body,
+        .fn_override = ev.resolvedExport(),
+        .is_system_module = builtin_modules_mod.isBuiltinPath(path),
+        .activation = .{ .fetch_chunk = .{
+            .id = ev.fetch_id,
+            .seq = ev.seq,
+            .byte_offset = ev.byte_offset,
+            .bytes = ev.bytes,
+            .headers = ev.fetch_headers,
+            .final = ev.final,
+            .terminal_status = if (ev.final) ev.terminal_status else 0,
+            .terminal_ok = if (ev.final) ev.terminal_ok else false,
+            .body_truncated = if (ev.final) ev.body_truncated else false,
+        } },
+        .activation_entity = chain_ent,
+        .activation_fetches_pending = fetches_pending,
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .admin = .{ .platform = p.dep.inst.platform },
+        .effects = .{
+            .pending_stream_chunks = &stream_chunks,
+            .pending_stream_chunk_opcodes = &chunk_opcodes,
+            .pending_fetches = &pending_fetches,
+            .pending_wakes = &pending_wakes,
+        },
+    };
+
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    const run_oc = worker.dispatcher.runOutcome(
+        p.dep.inst.kv,
+        p.txn,
+        &p.ws,
+        p.dep.bc,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        tc.snap.triggers,
+        request,
+        &budget,
+    ) catch {
+        p.txn.rollback() catch {};
+        p.txn_done = true;
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+        effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+        tearDownWsChain(worker, conn_ent);
+        return;
+    };
+
+    var oc = run_oc;
+    switch (oc) {
+        .terminal => |*r| {
+            defer r.deinit(allocator);
+            if (r.exception.len > 0) {
+                p.txn.rollback() catch {};
+                p.txn_done = true;
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+                r.console = &.{};
+                r.exception = &.{};
+                effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+                tearDownWsChain(worker, conn_ent);
+                return;
+            }
+            const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, @intCast(@max(@min(r.status, 599), 100)), .fetch_chunk, path, chain_ctx.correlation_id);
+            const fw_seq = shipWsFrames(worker, conn_ent, &stream_chunks, &chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, true) catch |perr| {
+                std.log.warn("rove-js ws-fetch-resume (terminal+writes): propose failed: {s}", .{@errorName(perr)});
+                p.txn_done = true;
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+                tearDownWsChain(worker, conn_ent);
+                return;
+            };
+            p.txn_done = true;
+            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .fetch_chunk, fw_seq);
+            r.console = &.{};
+            r.exception = &.{};
+            tearDownWsChain(worker, conn_ent);
+        },
+        .continuation => |*cval| {
+            const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, .fetch_chunk, path, chain_ctx.correlation_id);
+            const wrote = p.ws.ops.items.len > 0;
+            const read_version = p.txn.readVersion();
+            const fw_seq = shipWsFrames(worker, conn_ent, &stream_chunks, &chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, false) catch |perr| {
+                std.log.warn("rove-js ws-fetch-resume (next+writes): propose failed: {s}", .{@errorName(perr)});
+                p.txn_done = true;
+                cval.deinit(allocator);
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+                effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+                tearDownWsChain(worker, conn_ent);
+                return;
+            };
+            p.txn_done = true;
+            // next(): keep the chain parked; thread the new ctx forward
+            // (same repark as fireWsMessage's .continuation arm).
+            if (chain_st.ctx_json.len > 0) allocator.free(chain_st.ctx_json);
+            chain_st.ctx_json = cval.ctx_json;
+            cval.ctx_json = &.{};
+            chain_st.activation_count += 1;
+            cval.deinit(allocator);
+            if (fw_seq != 0) armWsGate(worker, conn_ent, chain_ctx.tenant_id, fw_seq);
+            if (!wrote) {
+                worker_drain.flushResumeFetches(worker, chain_ent, &pending_fetches, true);
+            } else if (pending_fetches.items.len > 0) {
+                std.log.warn(
+                    "rove-js ws-fetch-resume: {d} on.fetch from a WRITING resume dropped (not wired) tenant={s}",
+                    .{ pending_fetches.items.len, chain_ctx.tenant_id },
+                );
+            }
+            if (pending_wakes.items.len > 0) installWsWakes(worker, chain_ent, &pending_wakes, read_version);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .fetch_chunk, fw_seq);
+        },
+        .stream => |*s2| {
+            // A streamed-response descriptor is out of scope on WS (the
+            // connection IS the stream): roll back, close, tear down.
+            s2.deinit(allocator);
+            p.txn.rollback() catch {};
+            p.txn_done = true;
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 501, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+            effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+            tearDownWsChain(worker, conn_ent);
+        },
+        .no_onheaders, .no_onchunk => {
+            p.txn.rollback() catch {};
+            p.txn_done = true;
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+            effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+            tearDownWsChain(worker, conn_ent);
+        },
+    }
+}
+
+/// Resume a held WS chain whose `on.kv`/`on.timer` wake fired (routed here by
+/// `sweepParkedContinuations`'s WS branch). Runs the `wake_to`/`onWake` export
+/// and ships its `stream.write` frames over the socket via `shipWsFrames` — the
+/// WS sibling of `worker_drain.resumeContinuation`'s wake path (which ships via
+/// the HTTP `resolveParked`). Drains the §9.4 kv-match ring so it doesn't
+/// re-fire; the timer's `next_wake_ns` is advanced by the sweep itself.
+pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove.Entity) void {
+    const allocator = worker.allocator;
+    const server = worker.h2;
+    const chain_ctx = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.ChainContext) catch return;
+    const chain_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamChain) catch return;
+    const wakes_st = server.reg.get(chain_ent, &worker.parked_continuations, components_mod.StreamWakes) catch return;
+
+    // Consume the kv-match ring — this resume is the "go look" edge; the
+    // entries must not re-fire next sweep (onWake re-reads authoritative kv).
+    if (wakes_st.pending_wakes.len > 0) {
+        if (wakes_st.pending_wakes.drainInto(allocator)) |drained| {
+            for (drained.wakes) |*we| we.deinit(allocator);
+            if (drained.wakes.len > 0) allocator.free(drained.wakes);
+        } else |_| {}
+    }
+
+    const path = chain_st.module_path;
+    var p = worker_streaming.firePrep(worker, chain_ctx.tenant_id, path, "ws-wake") orelse {
+        effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+        tearDownWsChain(worker, conn_ent);
+        return;
+    };
+    defer p.deinit(allocator);
+    const tc = p.dep.tc;
+
+    // Wake resume targets the named export with positional `[ctx]` — same
+    // request shape as resumeContinuation's wake arm (body stays empty).
+    const resume_fn: []const u8 = if (wakes_st.wake_to) |t| t else "onWake";
+    const args_json = std.fmt.allocPrint(allocator, "[{s}]", .{chain_st.ctx_json}) catch return;
+    defer allocator.free(args_json);
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
+    defer allocator.free(spath);
+
+    var stream_chunks: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (stream_chunks.items) |ch| allocator.free(ch);
+        stream_chunks.deinit(allocator);
+    }
+    var chunk_opcodes: std.ArrayListUnmanaged(u8) = .empty;
+    defer chunk_opcodes.deinit(allocator);
+    var pending_fetches: std.ArrayListUnmanaged(globals.PendingFetch) = .empty;
+    defer {
+        for (pending_fetches.items) |*pf| pf.deinit(allocator);
+        pending_fetches.deinit(allocator);
+    }
+    var pending_wakes: std.ArrayListUnmanaged(globals.PendingWakeReg) = .empty;
+    defer {
+        for (pending_wakes.items) |*pw| pw.deinit(allocator);
+        pending_wakes.deinit(allocator);
+    }
+
+    const request: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = "",
+        .fn_override = resume_fn,
+        .fn_args_json = args_json,
+        .is_system_module = builtin_modules_mod.isBuiltinPath(path),
+        .activation = .{ .wake_batch = .{} },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .admin = .{ .platform = p.dep.inst.platform },
+        .effects = .{
+            .pending_stream_chunks = &stream_chunks,
+            .pending_stream_chunk_opcodes = &chunk_opcodes,
+            .pending_fetches = &pending_fetches,
+            .pending_wakes = &pending_wakes,
+        },
+    };
+
+    var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
+    const run_oc = worker.dispatcher.runOutcome(
+        p.dep.inst.kv,
+        p.txn,
+        &p.ws,
+        p.dep.bc,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        tc.snap.triggers,
+        request,
+        &budget,
+    ) catch {
+        p.txn.rollback() catch {};
+        p.txn_done = true;
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .wake_batch, 0);
+        effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+        tearDownWsChain(worker, conn_ent);
+        return;
+    };
+
+    var oc = run_oc;
+    switch (oc) {
+        .terminal => |*r| {
+            defer r.deinit(allocator);
+            if (r.exception.len > 0) {
+                p.txn.rollback() catch {};
+                p.txn_done = true;
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, .wake_batch, 0);
+                r.console = &.{};
+                r.exception = &.{};
+                effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+                tearDownWsChain(worker, conn_ent);
+                return;
+            }
+            const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, @intCast(@max(@min(r.status, 599), 100)), .wake_batch, path, chain_ctx.correlation_id);
+            const fw_seq = shipWsFrames(worker, conn_ent, &stream_chunks, &chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, true) catch |perr| {
+                std.log.warn("rove-js ws-wake (terminal+writes): propose failed: {s}", .{@errorName(perr)});
+                p.txn_done = true;
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .wake_batch, 0);
+                tearDownWsChain(worker, conn_ent);
+                return;
+            };
+            p.txn_done = true;
+            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .wake_batch, fw_seq);
+            r.console = &.{};
+            r.exception = &.{};
+            tearDownWsChain(worker, conn_ent);
+        },
+        .continuation => |*cval| {
+            const lh = worker_streaming.fireLogHeader(p.request_id, tc.snap.deployment_id, 200, .wake_batch, path, chain_ctx.correlation_id);
+            const wrote = p.ws.ops.items.len > 0;
+            const read_version = p.txn.readVersion();
+            const fw_seq = shipWsFrames(worker, conn_ent, &stream_chunks, &chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, false) catch |perr| {
+                std.log.warn("rove-js ws-wake (next+writes): propose failed: {s}", .{@errorName(perr)});
+                p.txn_done = true;
+                cval.deinit(allocator);
+                effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+                tearDownWsChain(worker, conn_ent);
+                return;
+            };
+            p.txn_done = true;
+            if (chain_st.ctx_json.len > 0) allocator.free(chain_st.ctx_json);
+            chain_st.ctx_json = cval.ctx_json;
+            cval.ctx_json = &.{};
+            chain_st.activation_count += 1;
+            cval.deinit(allocator);
+            if (fw_seq != 0) armWsGate(worker, conn_ent, chain_ctx.tenant_id, fw_seq);
+            if (!wrote) {
+                worker_drain.flushResumeFetches(worker, chain_ent, &pending_fetches, true);
+            } else if (pending_fetches.items.len > 0) {
+                std.log.warn("rove-js ws-wake: {d} on.fetch from a WRITING resume dropped tenant={s}", .{ pending_fetches.items.len, chain_ctx.tenant_id });
+            }
+            // Re-arm if onWake registered new on.kv/on.timer; else the
+            // existing StreamWakes rides along (kv prefixes stay watched,
+            // the timer keeps recurring).
+            if (pending_wakes.items.len > 0) installWsWakes(worker, chain_ent, &pending_wakes, read_version);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .wake_batch, fw_seq);
+        },
+        .stream => |*s2| {
+            s2.deinit(allocator);
+            p.txn.rollback() catch {};
+            p.txn_done = true;
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 501, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .wake_batch, 0);
+            effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
+            tearDownWsChain(worker, conn_ent);
+        },
+        .no_onheaders, .no_onchunk => {
+            p.txn.rollback() catch {};
+            p.txn_done = true;
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .wake_batch, 0);
             effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
             tearDownWsChain(worker, conn_ent);
         },

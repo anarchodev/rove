@@ -249,7 +249,14 @@ pub const Dispatcher = struct {
             .pending_wakes = request.effects.pending_wakes,
             .pending_stream_chunks = request.effects.pending_stream_chunks,
             .pending_stream_chunk_opcodes = request.effects.pending_stream_chunk_opcodes,
-            .ws_frame_output = request.activation == .ws_message,
+            // `stream.write` means a WS frame (→ .continuation, not the
+            // HTTP cont→stream transition) whenever output goes to a WS
+            // socket: a `ws_message` activation, OR a bound-fetch resume on
+            // a held WS chain (which wires the WS opcode accumulator —
+            // `resumeBoundFetchChainWs`). HTTP fetch resumes leave the
+            // opcodes null and keep the `.stream` transition.
+            .ws_frame_output = request.activation == .ws_message or
+                request.effects.pending_stream_chunk_opcodes != null,
             .is_system_module = request.is_system_module,
         };
 
