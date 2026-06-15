@@ -98,6 +98,13 @@ const ROUTE_WAIT_NS: i128 = 2500 * std.time.ns_per_ms;
 /// only bounds the genuinely-stuck case.
 const RESPONSE_WAIT_NS: i128 = 30_000 * std.time.ns_per_ms;
 
+/// How long a live upstream conn may carry tunnels waiting for its peer to
+/// advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL` before they give up
+/// (re-aim/502). The bit normally lands within one RTT of connect-complete;
+/// this only bounds a genuinely non-RFC-8441 upstream (our h2c worker always
+/// advertises, so in practice it never fires).
+const SETTLE_WAIT_NS: i128 = 2000 * std.time.ns_per_ms;
+
 // ── Small shared helpers (formerly in main.zig) ───────────────────────
 
 pub fn headerValue(rh: h2.ReqHeaders, name: []const u8) ?[]const u8 {
@@ -298,8 +305,15 @@ pub fn Proxy(comptime FrontH2: type) type {
             sess: Entity = Entity.nil,
             addr: ?std.net.Address = null,
             last_fail_ns: i128 = 0,
-            /// Flows/tunnels waiting on the in-flight connect.
+            /// Flows/tunnels waiting on the in-flight connect — AND tunnels
+            /// re-parked here on a live conn whose peer hasn't yet advertised
+            /// ENABLE_CONNECT_PROTOCOL (its SETTINGS trails connect-complete).
+            /// `drainSettledTunnels` resumes those once the bit lands.
             waiters: std.ArrayListUnmanaged(Waiter) = .empty,
+            /// Deadline for a live conn to advertise extended-connect while
+            /// tunnels wait in `waiters`. 0 = unset (no tunnel awaiting
+            /// SETTINGS). Stamped/cleared by `drainSettledTunnels`.
+            settle_deadline_ns: i128 = 0,
         };
 
         /// One WS tunnel: a downstream h1 Upgrade paired with an upstream
@@ -498,6 +512,10 @@ pub fn Proxy(comptime FrontH2: type) type {
             try self.intakeWsUpgrades(now_ns);
             try self.reg.flush();
             try self.consumeConnects(now_ns);
+            // Resume tunnels parked on a live conn awaiting its peer
+            // ENABLE_CONNECT_PROTOCOL SETTINGS (cold-leg race), now that this
+            // cycle's server poll may have landed that frame.
+            self.drainSettledTunnels(now_ns);
             try self.reg.flush();
             try self.consumeResponseHeaders();
             try self.reg.flush();
@@ -724,8 +742,22 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// requires the peer's ENABLE_CONNECT_PROTOCOL before submitting.
         fn submitTunnel(self: *Self, t: *WsTunnel, sess: Entity) void {
             if (!self.server.connExtendedConnect(sess)) {
-                std.log.warn("front: {s} has no extended-connect — cannot tunnel WS", .{t.nodes[t.node_idx]});
-                self.tunnelAttemptFailed(t);
+                // Live conn, but the peer's ENABLE_CONNECT_PROTOCOL SETTINGS
+                // hasn't arrived yet — common on a freshly-`.up` leg (its
+                // SETTINGS trails connect-complete). Re-park on the pool
+                // entry's existing waiter list (the same home as a tunnel
+                // awaiting connect) rather than failing; drainSettledTunnels
+                // resumes it once the bit lands. The old immediate give-up
+                // surfaced a transient 502 on cold upstream connections.
+                const up = self.poolEntry(t.nodes[t.node_idx]) catch {
+                    self.tunnelAttemptFailed(t);
+                    return;
+                };
+                up.waiters.append(self.allocator, .{ .tunnel = t }) catch {
+                    self.tunnelAttemptFailed(t);
+                    return;
+                };
+                t.waiting_conn = true;
                 return;
             }
             const packed_hdrs = self.packTunnelHeaders(t) catch {
@@ -1274,6 +1306,51 @@ pub fn Proxy(comptime FrontH2: type) type {
                     }
                 },
             };
+        }
+
+        /// Resume tunnels re-parked in `up.waiters` on a live conn that hadn't
+        /// yet advertised ENABLE_CONNECT_PROTOCOL (the SETTINGS-trails-connect
+        /// race). Iterates the small, stable `pool` map — never an entity
+        /// column — so there is no cross-lifetime pointer deref (the bug class
+        /// that sank the first attempt at this fix). A `drainWaiters(false)`
+        /// can re-aim a tunnel and thereby `poolEntry`-insert a new pool entry,
+        /// so snapshot the (heap-stable) `*Upstream` set before acting.
+        fn drainSettledTunnels(self: *Self, now_ns: i128) void {
+            var ups: [64]*Upstream = undefined;
+            var n: usize = 0;
+            var it = self.pool.valueIterator();
+            while (it.next()) |up_ptr| {
+                if (n >= ups.len) {
+                    // Implausible (pool size ≈ cluster nodes); the rest are
+                    // serviced next cycle — their deadlines still bound them.
+                    std.log.warn("front: pool exceeds {d} entries — settling sweep deferred some", .{ups.len});
+                    break;
+                }
+                ups[n] = up_ptr.*;
+                n += 1;
+            }
+            for (ups[0..n]) |up| {
+                if (up.state != .up or up.waiters.items.len == 0) {
+                    up.settle_deadline_ns = 0;
+                    continue;
+                }
+                if (self.reg.isStale(up.sess)) {
+                    // Conn died under the waiters — fail them (they re-aim).
+                    up.state = .down;
+                    up.sess = Entity.nil;
+                    up.settle_deadline_ns = 0;
+                    self.drainWaiters(up, false);
+                } else if (self.server.connExtendedConnect(up.sess)) {
+                    up.settle_deadline_ns = 0;
+                    self.drainWaiters(up, true);
+                } else if (up.settle_deadline_ns == 0) {
+                    up.settle_deadline_ns = now_ns + SETTLE_WAIT_NS;
+                } else if (now_ns >= up.settle_deadline_ns) {
+                    std.log.warn("front: {s} never advertised extended-connect within {d}ms — failing {d} waiting WS tunnel(s)", .{ up.origin, @divTrunc(SETTLE_WAIT_NS, std.time.ns_per_ms), up.waiters.items.len });
+                    up.settle_deadline_ns = 0;
+                    self.drainWaiters(up, false);
+                }
+            }
         }
 
         // ── Response relay ────────────────────────────────────────────
