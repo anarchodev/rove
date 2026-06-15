@@ -61,6 +61,7 @@ const respb = @import("response_builder.zig");
 
 const worker_mod = @import("worker.zig");
 const worker_streaming = @import("worker_streaming.zig");
+const worker_ws = @import("worker_ws.zig");
 const durable_wake = @import("durable_wake.zig");
 const bodies_mod = @import("rove-bodies");
 const proxy_engine_mod = @import("proxy_engine.zig");
@@ -2197,7 +2198,7 @@ pub fn resumeBoundFetchChain(
 ///
 /// Caller invariant: READ-ONLY arms only, called AFTER `txn.commit`
 /// — no effect escapes before its activation committed (L4).
-fn flushResumeFetches(
+pub fn flushResumeFetches(
     worker: anytype,
     ent: rove.Entity,
     pending: *std.ArrayListUnmanaged(globals.PendingFetch),
@@ -2417,6 +2418,12 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
     }
 
     for (wake_due.items) |e| {
+        // A held WS chain ships its onWake frames over the socket — route
+        // to the ws-aware resume (shipWsFrames), not the HTTP resolveParked.
+        if (worker_ws.wsConnForChain(worker, e.ent)) |conn_ent| {
+            worker_ws.resumeWakeChainWs(worker, e.ent, conn_ent);
+            continue;
+        }
         // `on.*` connection wake (no callee outcome). Best-effort: on
         // failure the entity stays parked and the next tick / interval
         // retries; a thrown/erroring onWake resolves via
