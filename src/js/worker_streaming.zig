@@ -60,6 +60,7 @@ const deployment_cache = @import("deployment_cache.zig");
 
 const worker_mod = @import("worker.zig");
 const worker_drain = @import("worker_drain.zig");
+const worker_ws = @import("worker_ws.zig");
 const dispatch = @import("worker_dispatch.zig");
 const bodies_mod = @import("rove-bodies");
 const ParkedUnit = worker_mod.ParkedUnit;
@@ -2698,7 +2699,14 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
         const rel_wid = ev.coord_worker_id;
         const rel_seq = ev.coord_seq;
         if (ready_cont) {
-            worker_drain.resumeBoundFetchChain(worker, held_ent, &ev);
+            // A held WS chain reparks in place (no h2 response) — route its
+            // bound-fetch resume through the ws-aware path that ships frames
+            // via shipWsFrames instead of resolveParked.
+            if (worker_ws.wsConnForChain(worker, held_ent)) |conn_ent| {
+                worker_ws.resumeBoundFetchChainWs(worker, held_ent, conn_ent, &ev);
+            } else {
+                worker_drain.resumeBoundFetchChain(worker, held_ent, &ev);
+            }
         } else {
             // Steady-state stream (stream_data_out) OR the brief
             // post-commit window in stream_response_in before h2's
