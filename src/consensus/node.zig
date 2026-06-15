@@ -61,6 +61,23 @@ pub const WriteSet = writeset.WriteSet;
 pub const Envelope = envelope.Envelope;
 pub const RangeResult = kvstore.RangeResult;
 
+/// Per-group raft configuration handed to every `createGroupEpoch`. We
+/// enable `pre_vote`: a follower that was partitioned, or a hibernated
+/// group that wakes, first probes whether an election is winnable before
+/// bumping its term — so a node that cannot win cannot disrupt a healthy
+/// leader by forcing a term change (and cannot ratchet terms during a
+/// mass-wake). The remaining `raft::Config` knobs (check_quorum, the
+/// min/max election-tick window, lease reads, priority for leadership
+/// transfer) are now reachable through `GroupConfig` but left at raft
+/// defaults pending their own validation. All nodes run the same binary,
+/// so pre_vote is uniform cluster-wide; a rolling deploy has a transient
+/// mixed-pre_vote window, acceptable pre-launch (dev clusters are wiped).
+const group_raft_config: raft.manager.GroupConfig = blk: {
+    var cfg = raft.manager.defaultGroupConfig();
+    cfg.pre_vote = true;
+    break :blk cfg;
+};
+
 /// Default hibernation idle window (Phase 6, `multiraft-scaling-learnings
 /// §3.1`): a group with no propose / non-heartbeat step for this long drops
 /// out of the active set and is no longer ticked. Comfortably longer than
@@ -727,6 +744,7 @@ pub const Node = struct {
             epoch,
             raft.manager.grouped_file_storage_vtable,
             gfs,
+            &group_raft_config,
         );
         // After createGroupEpoch succeeds the manager owns `gfs`; cancel
         // the local errdefer so a later failure here doesn't double-free.
