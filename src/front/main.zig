@@ -277,6 +277,10 @@ fn acmeChallengeLookup(a: std.mem.Allocator, cp_urls: []const []const u8, token:
             .body = "",
             .http_version = .h2c_prior_knowledge,
             .verify_tls = false,
+            // Runs on the :80 thread now (off the :443 loop), but still
+            // bound tight so a slow CP can't pile up other :80 requests.
+            .connect_timeout_ms = 1000,
+            .timeout_ms = 2000,
         }) catch continue;
         defer resp.deinit(a);
         if (resp.status != 200) continue;
@@ -490,6 +494,21 @@ pub fn main() !void {
     // the cp_urls free — declared last here so LIFO runs it first.
     defer if (cert_sync_thread) |cst| cst.shutdownAndDestroy(allocator);
 
+    // The :80 listener (ACME HTTP-01 + HTTP→HTTPS redirect) runs on its OWN
+    // thread, NOT the :443 poll loop. Its ACME challenge lookup does a
+    // blocking CP curl; on the main loop a slow CP would freeze :443
+    // (accept/TLS handshakes stall → new HTTPS connections hang). Isolated
+    // here, that blocking can only ever delay other :80 work. server80 +
+    // reg80 are exclusive to this thread (the :443 loop never touches them);
+    // shared state is read-only cp_urls + the atomic stop flag.
+    var port80_thread: ?std.Thread = null;
+    if (server80) |s80| {
+        port80_thread = try std.Thread.spawn(.{}, port80Loop, .{ s80, reg80_ptr.?, allocator, cp_urls });
+    }
+    // Join the :80 thread before its server/registry are destroyed (declared
+    // after those defers → LIFO runs this first).
+    defer if (port80_thread) |t| t.join();
+
     std.log.info("rewind-front: listening on 0.0.0.0:{d} (cp {d} node(s), route cache {d}ms (off-loop resolve), tls {s}, streaming proxy)", .{ port, cp_urls.len, cache_ms, if (tls_config != null) "on" else "off (h2c)" });
     while (!stop_flag.load(.acquire)) {
         server.pollWithTimeout(10 * std.time.ns_per_ms) catch |err| switch (err) {
@@ -497,19 +516,26 @@ pub fn main() !void {
             else => return err,
         };
         try proxy.run(std.time.nanoTimestamp());
-
-        // Phase 5: drain the low-traffic :80 listener non-blocking (its latency
-        // budget — ACME validation, redirects — tolerates the ~10ms main cycle).
-        if (server80) |s80| {
-            s80.poll(0) catch |err| switch (err) {
-                error.SignalInterrupt => {},
-                else => return err,
-            };
-            try processPort80(s80, allocator, cp_urls);
-            try reg80_ptr.?.flush();
-            try cleanupResponses(s80);
-            try reg80_ptr.?.flush();
-        }
     }
     std.log.info("rewind-front: shut down", .{});
+}
+
+/// The :80 listener loop — its own thread (see the spawn site). Owns
+/// `s80` + `reg80` exclusively. Blocking work here (the ACME challenge
+/// CP lookup) cannot stall the :443 poll loop.
+fn port80Loop(s80: *FrontH2, reg80: *rove.Registry, allocator: std.mem.Allocator, cp_urls: []const []const u8) void {
+    while (!stop_flag.load(.acquire)) {
+        s80.poll(10 * std.time.ns_per_ms) catch |err| switch (err) {
+            error.SignalInterrupt => continue,
+            else => {
+                std.log.err("rewind-front :80: poll failed: {s}", .{@errorName(err)});
+                return;
+            },
+        };
+        processPort80(s80, allocator, cp_urls) catch |err|
+            std.log.warn("rewind-front :80: process failed: {s}", .{@errorName(err)});
+        reg80.flush() catch {};
+        cleanupResponses(s80) catch {};
+        reg80.flush() catch {};
+    }
 }
