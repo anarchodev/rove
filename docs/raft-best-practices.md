@@ -109,10 +109,10 @@ Listed by value.
 - **Uniform config cluster-wide.** All nodes run the same binary, so
   pre_vote/check_quorum are uniform; a rolling deploy has a transient
   mixed-config window (acceptable pre-launch — dev clusters are wiped).
-- **Fork pin durability.** The pinned fork commit `f6075137` is on the fork's
-  `feat/config-ffi` branch, NOT `main` (promoting it to main was deferred to
-  a PR). PR/tag it on the fork so the pinned commit can't be GC'd before the
-  next FFI change re-pins anyway.
+- **Fork pin durability — resolved.** The pinned fork commit `f6075137` is now
+  on the fork's `main` (fast-forwarded `443c592..f607513`), so it's reachable
+  from mainline and won't be GC'd if a feature branch is deleted. The next FFI
+  change (transfer_leader / read_index) branches from fork `main` and re-pins.
 
 ## Pointers
 
