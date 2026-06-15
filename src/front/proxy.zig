@@ -1032,7 +1032,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 return;
             }
             const addr = up.addr orelse blk: {
-                const a = resolveOrigin(self.allocator, up.origin) catch {
+                const a = resolveOrigin(up.origin) catch {
                     up.last_fail_ns = now;
                     self.waiterFailed(waiter);
                     return;
@@ -2022,7 +2022,14 @@ pub fn Proxy(comptime FrontH2: type) type {
 /// Parse a node origin (`http://host:port`) into a socket address.
 /// IP literals resolve directly; hostnames go through the blocking
 /// resolver (private-network names; resolved once per pool entry).
-fn resolveOrigin(a: std.mem.Allocator, origin: []const u8) !std.net.Address {
+/// Parse a node origin (`http://host:port`) into a socket address.
+/// Origins MUST be IP literals — production uses vRack private IPs
+/// (REWIND_CLUSTERS). A hostname is REJECTED, not resolved:
+/// `std.net.getAddressList` is a blocking DNS call and this runs on the
+/// :443 poll loop, which must never block (a slow resolver would stall
+/// accept/TLS for every tenant). A hostname origin is a config error —
+/// fail loud + fast (the caller fails the connect over) instead.
+fn resolveOrigin(origin: []const u8) !std.net.Address {
     var rest = origin;
     if (std.mem.indexOf(u8, rest, "://")) |i| rest = rest[i + 3 ..];
     if (std.mem.indexOfScalar(u8, rest, '/')) |i| rest = rest[0..i];
@@ -2032,11 +2039,13 @@ fn resolveOrigin(a: std.mem.Allocator, origin: []const u8) !std.net.Address {
         host = rest[0..i];
         port = try std.fmt.parseInt(u16, rest[i + 1 ..], 10);
     }
-    if (std.net.Address.parseIp(host, port)) |addr| return addr else |_| {}
-    const list = try std.net.getAddressList(a, host, port);
-    defer list.deinit();
-    if (list.addrs.len == 0) return error.UnknownHostName;
-    return list.addrs[0];
+    return std.net.Address.parseIp(host, port) catch {
+        std.log.err(
+            "front: origin {s} is not an IP literal — hostname origins are unsupported (would block the poll loop on DNS); set IP-literal origins in REWIND_CLUSTERS",
+            .{origin},
+        );
+        return error.HostnameOriginUnsupported;
+    };
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
