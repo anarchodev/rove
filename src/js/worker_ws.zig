@@ -130,8 +130,19 @@ fn serviceWsConnects(worker: anytype) void {
             server.wsConnectReject(ent, 404);
             continue;
         };
-        _ = inst;
-        if (!worker.raft.isLeader()) {
+        // Per-tenant-group leadership (V2 multi-raft): `worker.raft` is the
+        // node-global Bridge and its `isLeader()` is an unconditional
+        // single-node stub — checking it accepts the connect on ANY node, so
+        // the first writing frame then fails `NotLeader` with no re-aim (a
+        // held tunnel can't 421 mid-connection). Check THIS instance's group
+        // instead, so a non-leader node rejects with 421 here and the front
+        // re-aims the tunnel to the leader before the 101 (mirrors
+        // v2_move.zig:230 and the HTTP write path's NotLeader→421 contract).
+        const gid = worker.raft.registerTenant(inst.id) catch {
+            server.wsConnectReject(ent, 500);
+            continue;
+        };
+        if (!worker.raft.isLeaderOf(gid)) {
             server.wsConnectReject(ent, 421);
             continue;
         }
