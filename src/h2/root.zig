@@ -522,7 +522,13 @@ const Stream = struct {
 
         const need: u32 = @intCast(name_len + value_len);
         if (self.hdr_strbuf_len + need > self.hdr_strbuf_cap) {
-            const new_cap = if (self.hdr_strbuf_cap > 0) self.hdr_strbuf_cap * 2 else 1024;
+            // Grow until the buffer actually fits: a single header field
+            // (reassembled across CONTINUATION frames) can exceed double the
+            // current cap, in which case one doubling leaves the @memcpy below
+            // writing past the allocation — a remote heap overflow (h2spec
+            // http2/6.10). Loop the doubling so new_cap >= len + need.
+            var new_cap: u32 = if (self.hdr_strbuf_cap > 0) self.hdr_strbuf_cap else 1024;
+            while (new_cap < self.hdr_strbuf_len + need) new_cap *|= 2;
             const old = if (self.hdr_strbuf) |b| b[0..self.hdr_strbuf_cap] else @as([]u8, &.{});
             const new_buf = self.allocator.realloc(old, new_cap) catch return false;
             self.hdr_strbuf = new_buf.ptr;
