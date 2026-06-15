@@ -683,6 +683,21 @@ pub fn main() !void {
 
     while (!stop_flag.load(.acquire)) std.Thread.sleep(100 * std.time.ns_per_ms);
     th.join();
+    // Graceful leadership handoff: BEFORE tearing the pump down, hand every
+    // group this node leads to a caught-up follower so a rolling restart (the
+    // `/deploy` path) costs ~one heartbeat per group instead of a full
+    // election timeout. The pump still runs here (it lives in this scope and
+    // is stopped only by the `bridge.stopPump` below), so it drives the
+    // resulting MsgTimeoutNow → step-down readies and republishes `is_leader`.
+    // Wait a bounded window for the handoffs to land. Single-node returns 0
+    // and skips the wait.
+    const handed_off = bridge.transferAllLeadership();
+    if (handed_off > 0) {
+        std.log.info("rewind: handed off leadership of {d} group(s); draining", .{handed_off});
+        var spins: usize = 0;
+        while (bridge.leadsAnyGroup() and spins < 200) : (spins += 1)
+            std.Thread.sleep(10 * std.time.ns_per_ms); // up to ~2s grace
+    }
     // Teardown order: the pump fires the deploy apply observer into
     // `node_state` (`setApplyObserver` above), but `node_state`'s defer —
     // declared after the bridge — deinits BEFORE `bridge.deinit` joins the

@@ -187,7 +187,7 @@ pub const GroupSig = struct {
 /// one, enqueues a pointer, and blocks on `done` until the pump has
 /// executed it and stamped `err` — so the struct outlives the wait.
 const ControlCmd = struct {
-    const Kind = enum { create_group_epoch, destroy_group };
+    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership };
     kind: Kind,
     gid: u64,
     /// Borrowed from the gid's `GroupSig.id_str` (pointer-stable); used by
@@ -196,6 +196,8 @@ const ControlCmd = struct {
     epoch: u64 = 0,
     /// Result, written by the pump before signaling `done`.
     err: ?Error = null,
+    /// `transfer_all_leadership` writes the number of groups it handed off here.
+    count: usize = 0,
     done: std.Thread.ResetEvent = .{},
 };
 
@@ -674,6 +676,22 @@ pub const Bridge = struct {
         return self.runControl(&cmd);
     }
 
+    /// Graceful shutdown: hand off leadership of every group this node leads
+    /// to a caught-up follower BEFORE stopping the pump, so a rolling restart
+    /// (the `/deploy` path) costs ~one heartbeat per led group instead of a
+    /// full election timeout. Runs on the pump thread (control cmd). Returns
+    /// the number of groups handed off. No-op returning 0 on a single-node
+    /// deployment (the sole voter leads everything with no follower to hand to)
+    /// or if the pump is already stopped. The caller should then poll
+    /// `leadsAnyGroup` for a bounded grace window so the `MsgTimeoutNow` →
+    /// new-leader round-trips land while the pump is still running.
+    pub fn transferAllLeadership(self: *Bridge) usize {
+        if (self.node.isSingleNode()) return 0;
+        var cmd: ControlCmd = .{ .kind = .transfer_all_leadership, .gid = 0 };
+        self.runControl(&cmd) catch return 0;
+        return cmd.count;
+    }
+
     /// Enqueue a control command for the pump thread and block until it
     /// runs. Requires the pump thread (the only `Manager` toucher) to be
     /// live; the move path always runs under `startPump`.
@@ -710,6 +728,30 @@ pub const Bridge = struct {
                 },
                 .destroy_group => blk: {
                     self.node.destroyGroupAndReclaim(cmd.gid) catch |e| break :blk e;
+                    break :blk null;
+                },
+                .transfer_all_leadership => blk: {
+                    // Graceful shutdown: hand off leadership of every group
+                    // this node currently leads. Snapshot the led gids under
+                    // the lock (reading each `is_leader` atomic, like
+                    // `leadsAnyGroup`), then release it before driving the
+                    // Manager — `transferLeadershipAway` is pump-side and
+                    // takes no bridge lock.
+                    var gids: std.ArrayListUnmanaged(u64) = .empty;
+                    defer gids.deinit(self.allocator);
+                    {
+                        self.mutex.lock();
+                        defer self.mutex.unlock();
+                        var it = self.groups.iterator();
+                        while (it.next()) |entry| {
+                            if (entry.value_ptr.*.is_leader.load(.acquire))
+                                gids.append(self.allocator, entry.key_ptr.*) catch {};
+                        }
+                    }
+                    cmd.count = 0;
+                    for (gids.items) |gid| {
+                        if (self.node.transferLeadershipAway(gid) != null) cmd.count += 1;
+                    }
                     break :blk null;
                 },
             };

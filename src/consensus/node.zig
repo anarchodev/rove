@@ -835,6 +835,17 @@ pub const Node = struct {
         try self.mgr.campaign(tenant_id);
     }
 
+    /// Graceful pre-shutdown leadership handoff for `tenant_id`'s group: if
+    /// this node leads it, transfer leadership to the most caught-up follower
+    /// so a rolling restart costs ~one heartbeat instead of a full election
+    /// timeout. Returns the transferee node id, or null if this node does not
+    /// lead the group / is the sole voter / the group is unknown. Pump-thread
+    /// only (drives the Manager). No-op on a group this node has not created.
+    pub fn transferLeadershipAway(self: *Node, tenant_id: u64) ?u64 {
+        if (self.groups.get(tenant_id) == null) return null;
+        return self.mgr.transferLeadershipAway(tenant_id);
+    }
+
     /// Whether this node is the raft leader of `tenant_id`'s group. False
     /// for a group this node has not created yet (a tenant the bridge has
     /// `registerTenant`'d but whose `createGroupEpoch`/`ensureGroup` has not
