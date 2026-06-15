@@ -510,12 +510,38 @@ pub fn main() !void {
     defer if (port80_thread) |t| t.join();
 
     std.log.info("rewind-front: listening on 0.0.0.0:{d} (cp {d} node(s), route cache {d}ms (off-loop resolve), tls {s}, streaming proxy)", .{ port, cp_urls.len, cache_ms, if (tls_config != null) "on" else "off (h2c)" });
+    // Self-activating connection-setup diagnostic. The front has no
+    // metrics endpoint and the io-layer resource-exhaustion logs are
+    // per-decade gated, so connection-setup collapse is invisible. Emit
+    // a one-line counter snapshot (rate-limited ~1/s) whenever the front
+    // is under setup stress — buffer ring filling, ENOBUFS, admission
+    // denials, or handshakes/conns piling up. Quiet at idle.
+    var diag_last_ns: i128 = 0;
+    var diag_prev_enobufs: u64 = 0;
+    var diag_prev_admission: u64 = 0;
     while (!stop_flag.load(.acquire)) {
         server.pollWithTimeout(10 * std.time.ns_per_ms) catch |err| switch (err) {
             error.SignalInterrupt => continue,
             else => return err,
         };
-        try proxy.run(std.time.nanoTimestamp());
+        const now = std.time.nanoTimestamp();
+        try proxy.run(now);
+        if (now - diag_last_ns >= std.time.ns_per_s) {
+            const s = server.connStats();
+            const stressed = s.recv_outstanding * 4 > s.buf_count or
+                s.recv_enobufs != diag_prev_enobufs or
+                s.admission_denied != diag_prev_admission or
+                s.conn_tls_handshake > 16 or s.conn_active > 32 or s.io_connections > 32;
+            if (stressed) {
+                std.log.warn("front-diag: outstanding={d}/{d} enobufs={d} admission_denied={d} conn_active={d} tls_handshake={d} io_conns={d} resp_in={d} resp_out={d}", .{
+                    s.recv_outstanding, s.buf_count, s.recv_enobufs, s.admission_denied,
+                    s.conn_active,      s.conn_tls_handshake, s.io_connections, s.response_in, s.response_out,
+                });
+            }
+            diag_prev_enobufs = s.recv_enobufs;
+            diag_prev_admission = s.admission_denied;
+            diag_last_ns = now;
+        }
     }
     std.log.info("rewind-front: shut down", .{});
 }

@@ -1317,91 +1317,20 @@ fn handleMetrics(
     var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
     const w = &aw.writer;
 
-    const io = worker.h2.io;
-    const h2_srv = worker.h2;
+    // io-ring + connection-depth metrics: shared formatter (rove-h2),
+    // identical on the worker and the front so the two can't drift.
+    try worker.h2.writeConnMetrics(w);
 
-    // ── io: registered-buffer-ring conservation ──────────────────────
-    //
-    // The pair that would have caught the leak immediately. If
-    // io_recv_completions_total minus the sum of returned_total
-    // ever approaches buf_count, the kernel and our ring accounting
-    // disagree — see also the panic check in `readsTriage` that
-    // turns this into an abort.
-    const returned_drain = io.recv_buffers_returned;
-    const returned_deinit = io.cleanup_ctx.recv_buffers_returned_via_deinit;
-    const completions = io.recv_completions_with_data;
-    const outstanding = completions -| (returned_drain + returned_deinit);
-
+    // raft-pending is worker-only (the front has no raft path) — emit it
+    // separately. Sum the three siblings: "how many entities are parked
+    // on raft commit," not which destination.
     try w.print(
-        \\# HELP io_recv_completions_total recv CQEs that carried data (one buffer consumed from the registered ring each).
-        \\# TYPE io_recv_completions_total counter
-        \\io_recv_completions_total {d}
-        \\# HELP io_recv_buffers_returned_total buffers returned to the registered ring, by source.
-        \\# TYPE io_recv_buffers_returned_total counter
-        \\io_recv_buffers_returned_total{{src="drain"}} {d}
-        \\io_recv_buffers_returned_total{{src="deinit"}} {d}
-        \\# HELP io_recv_outstanding buffers currently held by the kernel (completions - returned). Must stay below buf_count.
-        \\# TYPE io_recv_outstanding gauge
-        \\io_recv_outstanding {d}
-        \\# HELP io_recv_buf_count registered ring capacity (--buf-count).
-        \\# TYPE io_recv_buf_count gauge
-        \\io_recv_buf_count {d}
-        \\# HELP io_recv_enobufs_total recv completions with -ENOBUFS (kernel had no buffer to give).
-        \\# TYPE io_recv_enobufs_total counter
-        \\io_recv_enobufs_total {d}
-        \\# HELP io_admission_denied_total accepts refused because in-flight conns ≥ admission budget.
-        \\# TYPE io_admission_denied_total counter
-        \\io_admission_denied_total {d}
-        \\
-    , .{
-        completions,
-        returned_drain,
-        returned_deinit,
-        outstanding,
-        @as(u64, io.buf_count),
-        h2_srv.recv_enobufs_total,
-        io.admission_denied_total,
-    });
-
-    // ── h2: collection-depth gauges ───────────────────────────────────
-    //
-    // Steady-state visibility into where requests + connections
-    // pile up. Sustained growth on any one of these is a stall
-    // signal — request_out climbing means dispatch is behind,
-    // raft_pending climbing means raft commit is behind, etc.
-    try w.print(
-        \\# HELP h2_request_out_size requests received, waiting for dispatch.
-        \\# TYPE h2_request_out_size gauge
-        \\h2_request_out_size {d}
         \\# HELP h2_raft_pending_size requests parked on raft commit.
         \\# TYPE h2_raft_pending_size gauge
         \\h2_raft_pending_size {d}
-        \\# HELP h2_response_in_size responses ready to dispatch back through h2.
-        \\# TYPE h2_response_in_size gauge
-        \\h2_response_in_size {d}
-        \\# HELP h2_response_out_size responses in-flight on the send path.
-        \\# TYPE h2_response_out_size gauge
-        \\h2_response_out_size {d}
-        \\# HELP h2_conn_active_size active h2 sessions.
-        \\# TYPE h2_conn_active_size gauge
-        \\h2_conn_active_size {d}
-        \\# HELP h2_conn_tls_handshake_size connections still in TLS handshake.
-        \\# TYPE h2_conn_tls_handshake_size gauge
-        \\h2_conn_tls_handshake_size {d}
-        \\# HELP h2_io_connections_size raw tcp connections owned by the io layer (pre-handshake or post-handshake unclaimed).
-        \\# TYPE h2_io_connections_size gauge
-        \\h2_io_connections_size {d}
         \\
     , .{
-        h2_srv.request_out.entitySlice().len,
-        // Phase 5: sum the three siblings; the gauge is "how many
-        // entities are parked on raft commit," not which destination.
         worker.raft_pending_response.entitySlice().len + worker.raft_pending_cont.entitySlice().len + worker.raft_pending_stream.entitySlice().len,
-        h2_srv.response_in.entitySlice().len,
-        h2_srv.response_out.entitySlice().len,
-        h2_srv._conn_active.entitySlice().len,
-        h2_srv._conn_tls_handshake.entitySlice().len,
-        io.connections.entitySlice().len,
     });
 
     // ── leader/follower role ──────────────────────────────────────────

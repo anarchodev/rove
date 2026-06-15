@@ -2474,6 +2474,106 @@ pub fn H2(comptime opts: Options) type {
         // Public API
         // =============================================================
 
+        /// A snapshot of the io-buffer-ring + connection-depth counters
+        /// for this server. Shared by the worker's /_system/metrics and
+        /// the front's metrics/diagnostics so the two can't drift.
+        pub const ConnStats = struct {
+            recv_completions: u64,
+            recv_returned_drain: u64,
+            recv_returned_deinit: u64,
+            recv_outstanding: u64,
+            buf_count: u64,
+            recv_enobufs: u64,
+            admission_denied: u64,
+            request_out: usize,
+            response_in: usize,
+            response_out: usize,
+            conn_active: usize,
+            conn_tls_handshake: usize,
+            io_connections: usize,
+        };
+
+        pub fn connStats(self: *Self) ConnStats {
+            const drain = self.io.recv_buffers_returned;
+            const deinit_r = self.io.cleanup_ctx.recv_buffers_returned_via_deinit;
+            const comp = self.io.recv_completions_with_data;
+            return .{
+                .recv_completions = comp,
+                .recv_returned_drain = drain,
+                .recv_returned_deinit = deinit_r,
+                .recv_outstanding = comp -| (drain + deinit_r),
+                .buf_count = @as(u64, self.io.buf_count),
+                .recv_enobufs = self.recv_enobufs_total,
+                .admission_denied = self.io.admission_denied_total,
+                .request_out = self.request_out.entitySlice().len,
+                .response_in = self.response_in.entitySlice().len,
+                .response_out = self.response_out.entitySlice().len,
+                .conn_active = self._conn_active.entitySlice().len,
+                .conn_tls_handshake = self._conn_tls_handshake.entitySlice().len,
+                .io_connections = self.io.connections.entitySlice().len,
+            };
+        }
+
+        /// Emit the io-ring + connection-depth metrics in Prometheus text
+        /// to `w`. Used by both the worker and front metrics surfaces.
+        pub fn writeConnMetrics(self: *Self, w: anytype) !void {
+            const s = self.connStats();
+            try w.print(
+                \\# HELP io_recv_completions_total recv CQEs that carried data (one buffer consumed from the registered ring each).
+                \\# TYPE io_recv_completions_total counter
+                \\io_recv_completions_total {d}
+                \\# HELP io_recv_buffers_returned_total buffers returned to the registered ring, by source.
+                \\# TYPE io_recv_buffers_returned_total counter
+                \\io_recv_buffers_returned_total{{src="drain"}} {d}
+                \\io_recv_buffers_returned_total{{src="deinit"}} {d}
+                \\# HELP io_recv_outstanding buffers currently held by the kernel (completions - returned). Must stay below buf_count.
+                \\# TYPE io_recv_outstanding gauge
+                \\io_recv_outstanding {d}
+                \\# HELP io_recv_buf_count registered ring capacity (--buf-count).
+                \\# TYPE io_recv_buf_count gauge
+                \\io_recv_buf_count {d}
+                \\# HELP io_recv_enobufs_total recv completions with -ENOBUFS (kernel had no buffer to give).
+                \\# TYPE io_recv_enobufs_total counter
+                \\io_recv_enobufs_total {d}
+                \\# HELP io_admission_denied_total accepts refused because in-flight conns ≥ admission budget.
+                \\# TYPE io_admission_denied_total counter
+                \\io_admission_denied_total {d}
+                \\# HELP h2_request_out_size requests received, waiting for dispatch.
+                \\# TYPE h2_request_out_size gauge
+                \\h2_request_out_size {d}
+                \\# HELP h2_response_in_size responses ready to dispatch back through h2.
+                \\# TYPE h2_response_in_size gauge
+                \\h2_response_in_size {d}
+                \\# HELP h2_response_out_size responses in-flight on the send path.
+                \\# TYPE h2_response_out_size gauge
+                \\h2_response_out_size {d}
+                \\# HELP h2_conn_active_size active h2 sessions.
+                \\# TYPE h2_conn_active_size gauge
+                \\h2_conn_active_size {d}
+                \\# HELP h2_conn_tls_handshake_size connections still in TLS handshake.
+                \\# TYPE h2_conn_tls_handshake_size gauge
+                \\h2_conn_tls_handshake_size {d}
+                \\# HELP h2_io_connections_size raw tcp connections owned by the io layer (pre-handshake or post-handshake unclaimed).
+                \\# TYPE h2_io_connections_size gauge
+                \\h2_io_connections_size {d}
+                \\
+            , .{
+                s.recv_completions,
+                s.recv_returned_drain,
+                s.recv_returned_deinit,
+                s.recv_outstanding,
+                s.buf_count,
+                s.recv_enobufs,
+                s.admission_denied,
+                s.request_out,
+                s.response_in,
+                s.response_out,
+                s.conn_active,
+                s.conn_tls_handshake,
+                s.io_connections,
+            });
+        }
+
         pub fn create(reg: *Registry, allocator: std.mem.Allocator, addr: std.net.Address, io_opts: rio.IoOptions, h2_opts: H2Options) !*Self {
             try ensureCallbacks();
 
