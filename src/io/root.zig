@@ -57,6 +57,23 @@ pub const Fd = struct {
     pub fn deinit(_: std.mem.Allocator, items: []Fd, ctx: *DeinitCtx) void {
         for (items) |item| {
             if (item.fd >= 0 and @as(u32, @intCast(item.fd)) < ctx.max_connections) {
+                // Graceful close: shut the socket down before freeing its
+                // direct-descriptor slot. `close_direct` alone is not enough —
+                // a connection torn down while a recv is still armed keeps the
+                // socket alive (the slot ref the recv holds outlives the close),
+                // so the peer never observes a close (h2spec http2/5.4.1); and a
+                // bare close() with unread RX bytes emits a TCP RST instead of a
+                // clean FIN (h2spec generic/5, http2/7). SHUT_RDWR sends the FIN
+                // and completes the pending recv (dropping the slot ref), so the
+                // hard-linked close then frees the slot. Hard-link (not soft) so
+                // the close still runs if shutdown reports the socket already
+                // gone (e.g. ENOTCONN after the peer's own FIN).
+                const sh = getSqeOrSubmit(ctx.ring) catch
+                    @panic("SQ full during Fd.deinit shutdown even after submit — ring too small");
+                sh.prep_shutdown(@intCast(item.fd), linux.SHUT.RDWR);
+                sh.flags |= linux.IOSQE_FIXED_FILE | linux.IOSQE_IO_HARDLINK;
+                sh.user_data = INTERNAL_SENTINEL;
+
                 const sqe = getSqeOrSubmit(ctx.ring) catch
                     @panic("SQ full during Fd.deinit even after submit — ring too small");
                 sqe.prep_close_direct(@intCast(item.fd));
