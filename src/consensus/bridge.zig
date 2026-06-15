@@ -583,17 +583,24 @@ pub const Bridge = struct {
         return sig.faulted_seq.load(.acquire);
     }
 
-    /// V1-compat NODE-WIDE leader shim — **unconditionally true**, even
-    /// on a multi-node node. V2 leadership is per-GROUP; there is no
-    /// meaningful node-wide answer, so any call site gating a per-tenant
-    /// decision on this is wrong and must use `isLeaderOf(gid)` (the
-    /// config-mirror and boot-subscription gates were migrated; the
-    /// remaining caller is the log flusher, whose batches only exist on
-    /// nodes serving the tenant — i.e. its leader — so the vestigial
-    /// always-true answer is behavior-preserving there).
-    pub fn isLeader(self: *Bridge) bool {
-        _ = self;
-        return true;
+    /// Node-wide leadership for OBSERVABILITY ONLY: true iff this node is the
+    /// raft leader of at least one group it carries. V2 leadership is
+    /// per-GROUP — there is no single node-wide leader — so this must NEVER
+    /// gate a per-tenant decision (use `isLeaderOf(gid)` for that; the old
+    /// always-true `isLeader()` shim was deleted because it silently no-op'd
+    /// such gates). Used by `/_system/leader` and the `raft_is_leader` metric
+    /// as a "does this node serve any group as leader" signal. Single-node
+    /// short-circuits true (the sole voter leads every group, and groups form
+    /// lazily so the map may be empty), preserving the smoke readiness probe.
+    pub fn leadsAnyGroup(self: *Bridge) bool {
+        if (self.node.isSingleNode()) return true;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var it = self.groups.valueIterator();
+        while (it.next()) |sig| {
+            if (sig.*.is_leader.load(.acquire)) return true;
+        }
+        return false;
     }
 
     /// Per-group leadership (Phase 5 multi-node). True when this node is the
@@ -603,7 +610,7 @@ pub const Bridge = struct {
     /// never replicates) and to let the move orchestrator await a freshly
     /// formed destination group's election (`v2-leader`). On a SINGLE-node
     /// node the sole voter leads every group it creates, so this is
-    /// unconditionally true (matching the no-arg `isLeader`); the per-group
+    /// unconditionally true; the per-group
     /// `mgr.isLeader` would otherwise read false for a tenant whose group
     /// has not yet been lazily created on the single node. Reads the
     /// pump-published `is_leader` atomic (never the Manager directly), so it

@@ -79,7 +79,7 @@ cutover.
 | `h2_conn_active_size` | gauge | active h2 sessions |
 | `h2_conn_tls_handshake_size` | gauge | connections still in TLS handshake |
 | `h2_io_connections_size` | gauge | raw tcp conns owned by io layer |
-| `raft_is_leader` | gauge | 1 if this node is leader, else 0 |
+| `raft_is_leader` | gauge | 1 if this node leads ≥1 tenant group, else 0 (V2 leadership is per-group) |
 | `kvexp_put_total` | counter | kvexp engine put operations |
 | `kvexp_get_total` | counter | kvexp engine get operations |
 | `kvexp_txn_commit_total` | counter | kvexp engine transaction commits |
