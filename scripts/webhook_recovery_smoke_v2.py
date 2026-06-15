@@ -65,17 +65,16 @@ CBFIRE_SRC = r'''export function fireDelayed(url, tag, delay_ms) {
 }'''
 
 CBRESULT_SRC = r'''export default function () {
-    const wrap = JSON.parse(request.body);
-    const result = (wrap && wrap.ctx && wrap.ctx.result) || {};
-    const context = (wrap && wrap.ctx && wrap.ctx.context) || null;
+    // Unified flattened on_result surface (handler-shape §7).
+    const ctx = request.ctx || {};
     const record = {
-        ok: result.ok,
-        status: result.status,
-        body: result.body,
-        context: context,
-        error: result.error || null,
+        ok: request.ok,
+        status: request.status,
+        body: request.body,
+        context: ctx.context || null,
+        error: ctx.error || null,
     };
-    kv.set("cb/result/" + result.id, JSON.stringify(record));
+    kv.set("cb/result/" + ctx.id, JSON.stringify(record));
 }'''
 
 ACME_INDEX_SRC = 'export function handler() { return "acme-ready"; }\n'

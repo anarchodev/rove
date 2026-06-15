@@ -77,8 +77,13 @@ export function onBlob() {
 # connectionless activation), not a `module/export` pair.
 PUTRESULT_SRC = """
 export default function () {
-  const ctx = JSON.parse(request.body).ctx;
-  kv.set("put_result", JSON.stringify({ result: ctx.result, context: ctx.context }));
+  // Unified flattened on_result surface (handler-shape §7): request.ok/
+  // .status top-level, blob hash + echoed context on request.ctx.
+  const ctx = request.ctx || {};
+  kv.set("put_result", JSON.stringify({
+    result: { ok: request.ok, status: request.status, hash: ctx.hash },
+    context: ctx.context,
+  }));
 }
 """
 

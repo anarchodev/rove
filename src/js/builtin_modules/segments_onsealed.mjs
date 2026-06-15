@@ -25,10 +25,12 @@ function pad(seq) {
 }
 
 export default function () {
-    const body = JSON.parse(request.body).ctx;
-    const result = body.result || {};
-    const c = body.context || {};
-    if (!result.ok) {
+    // Unified effect-result surface (handler-shape §7): a blob.put
+    // on_result arrives flattened — `request.ok`/`.status` top-level,
+    // the blob `hash` + echoed `context` on `request.ctx`.
+    const ctx = request.ctx || {};
+    const c = ctx.context || {};
+    if (!request.ok) {
         // Marker evidence persists per blob.put semantics; next seal
         // retries. Nothing to clean.
         return { status: 200 };
@@ -41,7 +43,7 @@ export default function () {
     }
 
     kv.set("_seg/" + stream + "/s/" + pad(first), JSON.stringify({
-        hash: result.hash,
+        hash: ctx.hash,
         first_seq: first,
         last_seq: last,
         count: c.count,

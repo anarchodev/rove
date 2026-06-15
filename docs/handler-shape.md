@@ -403,7 +403,7 @@ export function onChunk() {
 }
 
 export function onPut() {                        // each PUT result resumes here (held)
-  if (request.result.status >= 400) { response.status = 502; return 'storage failed'; }
+  if (request.status >= 400) { response.status = 502; return 'storage failed'; }
   return next();
 }
 ```
@@ -418,8 +418,8 @@ export default function () {
 }
 
 export function onUpstream() {
-  response.status = request.result.status;       // forward upstream's status verbatim
-  return request.result.body;
+  response.status = request.status;              // forward upstream's status verbatim
+  return request.body;
 }
 ```
 
@@ -452,8 +452,10 @@ export default function () {
   return 'queued';                               // respond immediately; the above outlive this request
 }
 
-export function onCharge() {                      // connectionless — no socket; does work, returns nothing
-  kv.set(`charges/${request.result.body.id}`, request.result.body);
+export function onCharge() {                      // connectionless on_result — no socket; does work, returns nothing
+  if (!request.ok) return;                        // delivery failed (request.ctx.error says why)
+  const charge = JSON.parse(request.body);        // the response on the flattened surface
+  kv.set(`charges/${charge.id}`, charge);
 }
 
 export function onBoot()  { kv.set('booted_at', now()); }
@@ -504,7 +506,7 @@ export default function () {
 }
 
 export function onResult() {
-  const ctx = { ...request.ctx, [request.fetchId]: request.result };
+  const ctx = { ...request.ctx, [request.fetchId]: { status: request.status, body: request.body } };
   if (ctx.a && ctx.b) return combine(ctx.a, ctx.b);
   return next(ctx);                               // still waiting on the other
 }
@@ -551,14 +553,22 @@ rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
   `.query`, `.cookies`, `.ip`, `.unmaskedIp()`.
 - **`onChunk`:** `request.body` = THIS chunk; `request.done`;
   `request.chunkSeq` (from 0).
-- **Connection wakes / fetch resumes:** `request.ctx`, plus
-  `request.result` (`on.fetch` whole / `webhook.send`), `request.body` +
-  `request.fetchId` (streamed `on.fetch` chunk), or `request.key` /
-  `request.value` (`on.kv`).
+- **Connection wakes / fetch resumes** (`on.fetch` / `blob.get`):
+  `request.ctx`, plus `request.body` (the response bytes — the whole
+  body for a non-streamed fetch, this chunk for a streamed one) with
+  `request.status` / `request.ok` / `request.done` / `request.fetchId`
+  at the **top level**; or `request.key` / `request.value` (`on.kv`).
+  There is **no `request.result`** — every effect result reads the same
+  flattened way (see the on_result note below).
 - **Connectionless fires** (`onBoot`, `onSubscription`, a `cron`/
-  `schedule` target, an `onResult` callback): origin-specific fields
-  (`deploymentId`, `result`, `request.activation.msg`, …) but **no**
-  HTTP `headers`/`body`, and the connection verbs are inert (§2.4).
+  `schedule` target): origin-specific fields (`deploymentId`,
+  `request.activation.msg`, …) but **no** inbound HTTP `headers`/`body`,
+  and the connection verbs are inert (§2.4). A `webhook.send` /
+  `blob.put` **`on_result` callback** is the exception — it carries the
+  delivery result on the **same flattened surface** as a fetch resume:
+  `request.body` / `request.status` / `request.ok` / `request.done`,
+  with the echoed `context` + delivery metadata (`attempts`, `error`,
+  `id`, blob `hash`) on `request.ctx`.
 
 ### 7.1 The request surface is read-recorded
 

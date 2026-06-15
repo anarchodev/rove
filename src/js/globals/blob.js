@@ -64,7 +64,10 @@ globalThis.blob = {
    * @param {string} [opts.content_type] - Stored Content-Type,
    *   returned on direct GETs of the object.
    * @param {string} [opts.on_result] - Module path receiving the
-   *   terminal result as `request.ctx.result = {hash, ok, status}`.
+   *   terminal result on the unified flattened surface (handler-shape
+   *   §7): `request.ok` / `request.status` top-level, the stored `hash`
+   *   + echoed `context` on `request.ctx` (`request.ctx.hash`,
+   *   `request.ctx.context`).
    * @param {*} [opts.context] - Opaque payload echoed to `on_result`.
    * @returns {string} The object's sha256 hash (64 hex chars).
    *
@@ -127,7 +130,7 @@ globalThis.blob = {
    *   blob.get(JSON.parse(kv.get(`media/${id}`)).hash, { to: "onBlob" });
    *   return next();
    * }
-   * export function onBlob() { return request.result.body; }
+   * export function onBlob() { return request.body; } // flattened: bytes on request.body, request.status top-level
    */
   get(hash, opts) {
     opts = opts || {};
