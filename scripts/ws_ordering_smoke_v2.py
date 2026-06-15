@@ -98,7 +98,9 @@ def main() -> int:
             failures.append(label)
 
     with V2Cluster.spawn("wsorder", nodes=1) as c:
-        node_port = c.node_ports[0]
+        # WS goes THROUGH THE FRONT (RFC 8441 Extended CONNECT tunnel) — the
+        # worker is h2c-only, so a raw h1 Upgrade must terminate at the front.
+        ws_port = c.front_port
         host = c.host_for(TENANT)
 
         print("step 1: provision + deploy")
@@ -113,7 +115,7 @@ def main() -> int:
 
         print("step 2: burst of 5 frames in ONE TCP segment (one wsDrive → "
               "back-to-back activations inside the commit window)")
-        sock = ws_connect(node_port, host)
+        sock = ws_connect(ws_port, host)
         try:
             sock.sendall(b"".join(encode_frame(OP_TEXT, p) for p in BURST))
             replies = []
@@ -144,7 +146,7 @@ def main() -> int:
         print("step 3: second burst then immediate hard drop (onDisconnect "
               "races the in-flight commit)")
         if alive:
-            s2 = ws_connect(node_port, host)
+            s2 = ws_connect(ws_port, host)
             send_frame(s2, OP_TEXT, b"persist:v3")
             # Drop without reading the reply and without a Close frame — the
             # stale-sweep onDisconnect (read-only, sees v3's speculative
