@@ -1684,6 +1684,10 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // segments composes kv + blob + TextDecoder (all above) — pure
     // JS, no natives of its own (blob-storage-plan §6; `docs/architecture/routing-and-ingress.md`).
     evalSnippet(ctx, "segments.js", SEGMENTS_JS);
+    // browser.* is pure protocol/formatting over the ambient `stream`
+    // global (referenced lazily at call time, so order-independent) —
+    // the server side of web/rove-agent.js. No natives of its own.
+    evalSnippet(ctx, "browser.js", BROWSER_JS);
     // users is standalone (kv + crypto.{randomBytes,sha256}).
     evalSnippet(ctx, "users.js", USERS_JS);
     // activitypub depends on base64url/hex/btoa + crypto + http +
@@ -1946,6 +1950,7 @@ const USERS_JS = @embedFile("users_js");
 const ACTIVITYPUB_JS = @embedFile("activitypub_js");
 const BLOB_JS = @embedFile("blob_js");
 const SEGMENTS_JS = @embedFile("segments_js");
+const BROWSER_JS = @embedFile("browser_js");
 
 /// (public name, embedded source) for every `globals/*.js` file. The
 /// single list the Phase-A lints below pivot on: each `.src` is an
@@ -1980,6 +1985,7 @@ const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "activitypub", .src = ACTIVITYPUB_JS },
     .{ .name = "blob", .src = BLOB_JS },
     .{ .name = "segments", .src = SEGMENTS_JS },
+    .{ .name = "browser", .src = BROWSER_JS },
 };
 
 fn installNamespace(ctx: *c.JSContext, global: c.JSValue, ns: NamespaceBindings) void {
@@ -3059,6 +3065,11 @@ test "harden: _system unreachable post-installStatic, shims still bound (Phase A
         \\  if (typeof platform !== "object" ||
         \\      typeof platform.root.get !== "function")
         \\    throw new Error("platform nested shim broke");
+        \\  if (typeof browser !== "object" ||
+        \\      typeof browser.message !== "function" ||
+        \\      typeof browser.act !== "function" ||
+        \\      typeof browser.render !== "function")
+        \\    throw new Error("browser shim broke (IIFE snapshot-freeze regression)");
         \\  return true;
         \\})();
     ;
