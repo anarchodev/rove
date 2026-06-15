@@ -674,6 +674,17 @@ pub const H2Options = struct {
     /// peer; either way, freeing the slot is the right move. Set
     /// to 0 to disable (legacy behavior).
     idle_timeout_ns: u64 = 10 * std.time.ns_per_s,
+    /// Idle reap timeout for CLIENT-direction connections (this
+    /// instance acting as an h2 client — e.g. the front door's pooled
+    /// front→worker legs). 0 (default) ⇒ fall back to
+    /// `idle_timeout_ns`. The front door sets this BELOW the worker's
+    /// server-side `idle_timeout_ns` so the front always recycles a
+    /// pooled upstream connection before the worker reaps it — the
+    /// standard "LB idle < backend keepalive" rule, which keeps the
+    /// reuse-vs-reap teardown on the side that owns the next request
+    /// (clean recycle between requests) instead of reacting to the
+    /// peer's GOAWAY mid-reuse. See the front-door TTFB investigation.
+    client_idle_timeout_ns: u64 = 0,
     tls_config: ?*TlsConfig = null,
     /// Headers-first request emission (`docs/architecture/routing-and-ingress.md`
     /// §3.5.1). Off (default): request entities appear in
@@ -2712,6 +2723,15 @@ pub fn H2(comptime opts: Options) type {
 
             self.sweepOrphanedInbound();
             if (has_client) self.sweepOrphanedClient();
+            try self.reg.flush();
+
+            // Idle reap runs HERE — after reads were fed to nghttp2 above
+            // — so a request that just arrived on an idle connection has
+            // refreshed `last_active_ns` and survives. The GOAWAY it
+            // queues flushes on the next `pollPrelude`/`driveAllSends`.
+            // (Cures the idle-keepalive reuse-vs-reap race; see
+            // `reapIdleConnections` + the front-door TTFB investigation.)
+            try self.reapIdleConnections();
             try self.reg.flush();
 
             try self.writesAccount();
@@ -4892,10 +4912,6 @@ pub fn H2(comptime opts: Options) type {
         fn driveAllSends(self: *Self) !void {
             const entities = self._conn_active.entitySlice();
             const now = monotonicNs();
-            // Grace window for a GOAWAY'd idle connection to finish
-            // closing before we force-destroy it (backstop for a peer
-            // that stops reading after we signal GOAWAY).
-            const GOAWAY_DRAIN_GRACE_NS: u64 = 2 * std.time.ns_per_s;
 
             for (entities) |ent| {
                 if (self.reg.isStale(ent)) continue;
@@ -4903,42 +4919,25 @@ pub fn H2(comptime opts: Options) type {
                 const conn_ptr = self.reg.get(ent, &self._conn_active, Conn) catch continue;
 
                 // h1 connections have no nghttp2 session to drive — responses
-                // are written synchronously in `http1WriteResponse`. They still
-                // need idle reaping (a keep-alive conn the client leaves open, or
-                // a `Connection: close`/error conn awaiting its write to drain),
-                // which the nghttp2 path below does only for h2.
-                if (conn_ptr.ng_session == null) {
-                    if (conn_ptr.h1 != null and self.h2_opts.idle_timeout_ns > 0 and
-                        conn_ptr.last_active_ns > 0 and
-                        now -| conn_ptr.last_active_ns > self.h2_opts.idle_timeout_ns)
-                    {
-                        try self.reg.destroy(ent);
-                    }
-                    continue;
-                }
+                // are written synchronously in `http1WriteResponse`. Idle
+                // reaping for them happens in `reapIdleConnections` (run
+                // AFTER reads), so a just-arrived request isn't reaped out
+                // from under itself.
+                if (conn_ptr.ng_session == null) continue;
 
-                // Graceful idle reap (h2): queue a GOAWAY and let the
-                // flush path below put it on the wire, then reap once the
-                // peer finishes (want_read/want_write both drain) or the
-                // grace deadline fires. A silent destroy here strands a
-                // client mid-reuse — the idle-keepalive reuse race (see
-                // the front-door TTFB investigation). `draining` is
-                // sticky: late traffic that refreshes last_active must not
-                // cancel a reap already in progress.
-                if (conn_ptr.draining) {
-                    if (now >= conn_ptr.drain_deadline_ns) {
-                        try self.reg.destroy(ent);
-                        continue;
-                    }
-                } else if (self.h2_opts.idle_timeout_ns > 0 and conn_ptr.last_active_ns > 0 and
-                    now -| conn_ptr.last_active_ns > self.h2_opts.idle_timeout_ns)
-                {
-                    _ = c.nghttp2_session_terminate_session(conn_ptr.ng_session.?, c.NGHTTP2_NO_ERROR);
-                    conn_ptr.draining = true;
-                    conn_ptr.drain_deadline_ns = now + GOAWAY_DRAIN_GRACE_NS;
-                    // fall through: the want_write flush below emits the
-                    // GOAWAY this pass; the want_write==0 && want_read==0
-                    // branch reaps once the peer acks/closes.
+                // Graceful idle reap (h2): the idle DETECTION that queues
+                // the GOAWAY now lives in `reapIdleConnections`, which runs
+                // in `pollPostlude` AFTER inbound reads are fed to nghttp2 —
+                // so a request that just arrived on an idle connection
+                // refreshes `last_active_ns` and is never reaped out from
+                // under itself (the idle-keepalive reuse race; see the
+                // front-door TTFB investigation). Here we only FINISH a
+                // reap already in progress: flush the queued GOAWAY (the
+                // want_write path below) and force-destroy once the peer
+                // drains or the grace deadline fires. `draining` is sticky.
+                if (conn_ptr.draining and now >= conn_ptr.drain_deadline_ns) {
+                    try self.reg.destroy(ent);
+                    continue;
                 }
 
                 const ng_session = conn_ptr.ng_session.?;
@@ -5058,6 +5057,63 @@ pub fn H2(comptime opts: Options) type {
                 }
 
                 conn_ptr.last_active_ns = now;
+            }
+        }
+
+        /// Idle-connection reaper. Runs in `pollPostlude` AFTER inbound
+        /// reads have been fed to nghttp2 (`readsFeedData`) — so a
+        /// request that just arrived on an idle connection has already
+        /// refreshed `last_active_ns` and is NOT reaped out from under
+        /// itself. This ordering is the cure for the idle-keepalive
+        /// reuse-vs-reap race (the front-door TTFB stall): when the
+        /// detection ran in `driveAllSends` (BEFORE reads), a reuse
+        /// request landing exactly as the idle timer expired was
+        /// terminated before it was ever read, stranding the client.
+        ///
+        /// For h2 we queue a graceful GOAWAY (`terminate_session`) and
+        /// mark the connection `draining`; the next `driveAllSends` pass
+        /// flushes the GOAWAY and the drain finalizes there. For h1
+        /// (no nghttp2 session) we destroy directly. The CLIENT-direction
+        /// timeout (`client_idle_timeout_ns`, 0 ⇒ fall back to the
+        /// server-side `idle_timeout_ns`) lets the front door recycle a
+        /// pooled upstream leg before the worker reaps it.
+        fn reapIdleConnections(self: *Self) !void {
+            // Grace window for a GOAWAY'd idle connection to finish
+            // closing before `driveAllSends` force-destroys it (backstop
+            // for a peer that stops reading after we signal GOAWAY).
+            const GOAWAY_DRAIN_GRACE_NS: u64 = 2 * std.time.ns_per_s;
+            const entities = self._conn_active.entitySlice();
+            const now = monotonicNs();
+
+            for (entities) |ent| {
+                if (self.reg.isStale(ent)) continue;
+                const conn_ptr = self.reg.get(ent, &self._conn_active, Conn) catch continue;
+
+                // Direction-aware idle budget: client legs may reap
+                // sooner than server connections (LB-idle < backend-idle).
+                const timeout: u64 = if (conn_ptr.direction == .client and
+                    self.h2_opts.client_idle_timeout_ns > 0)
+                    self.h2_opts.client_idle_timeout_ns
+                else
+                    self.h2_opts.idle_timeout_ns;
+                if (timeout == 0 or conn_ptr.last_active_ns == 0) continue;
+                if (now -| conn_ptr.last_active_ns <= timeout) continue;
+
+                // h1: no session to drain — destroy directly.
+                if (conn_ptr.ng_session == null) {
+                    if (conn_ptr.h1 != null) try self.reg.destroy(ent);
+                    continue;
+                }
+
+                // h2: already draining ⇒ leave it to `driveAllSends`.
+                if (conn_ptr.draining) continue;
+
+                // Initiate a graceful reap: GOAWAY now, flush + finalize
+                // in `driveAllSends`. `draining` is sticky so late traffic
+                // that refreshes `last_active_ns` can't cancel it.
+                _ = c.nghttp2_session_terminate_session(conn_ptr.ng_session.?, c.NGHTTP2_NO_ERROR);
+                conn_ptr.draining = true;
+                conn_ptr.drain_deadline_ns = now + GOAWAY_DRAIN_GRACE_NS;
             }
         }
 

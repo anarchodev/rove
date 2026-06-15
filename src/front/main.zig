@@ -384,6 +384,22 @@ pub fn main() !void {
     // stale entry — so a tenant move re-routes correctly past the TTL).
     // The TTL thus also bounds move-propagation latency.
     const cache_ms = envMs("REWIND_ROUTE_CACHE_MS", 1_000);
+    // Browser-facing h2 idle-connection reap timeout. 30 s (vs the 10 s
+    // rove-h2 default) — a longer keepalive cuts reconnect churn and,
+    // since the reap is now graceful (GOAWAY queued AFTER reads are fed
+    // to nghttp2, so a just-arrived reuse request is never reaped out
+    // from under itself), fewer reaps means fewer race opportunities.
+    // The cure is the graceful close + reap-after-reads ordering in
+    // rove-h2, not this value; the knob stays for tuning.
+    const idle_ms = envMs("REWIND_FRONT_IDLE_TIMEOUT_MS", 30_000);
+    // Upstream (front→worker) idle reap timeout. Set BELOW the worker's
+    // server-side idle timeout (10 s rove-h2 default) so the FRONT
+    // recycles a pooled h2c leg before the worker reaps it — the
+    // standard "LB idle < backend keepalive" rule. This keeps the
+    // reuse-vs-reap teardown on the side that owns the next request
+    // (clean recycle between requests) rather than reacting to the
+    // worker's GOAWAY mid-reuse (the front→worker 502 seen in repro).
+    const upstream_idle_ms = envMs("REWIND_FRONT_UPSTREAM_IDLE_TIMEOUT_MS", 5_000);
     var cache = proxy_mod.RouteCache.init(allocator, cache_ms * std.time.ns_per_ms);
     defer cache.deinit();
 
@@ -424,6 +440,8 @@ pub fn main() !void {
         .reuseport = true,
     }, .{
         .tls_config = tls_config,
+        .idle_timeout_ns = @intCast(idle_ms * std.time.ns_per_ms),
+        .client_idle_timeout_ns = @intCast(upstream_idle_ms * std.time.ns_per_ms),
         // Streaming proxy: early-emit inbound h2 requests (server side)
         // and upstream responses (client side); the proxy relays both
         // as they arrive. Worker-matched 1 MiB stream windows bound
