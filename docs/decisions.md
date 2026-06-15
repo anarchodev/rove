@@ -495,6 +495,42 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   webhook-recovery (durable wake), and blob+segments smokes + dispatcher unit
   tests.
 
+### 4.8 Browser-agent surface (`browser.*`) — same-origin, vendor-neutral, structural-by-default
+- **Decision** ("a Playwright for LLMs", 2026-06-15; `handler-shape.md` §5.9,
+  shim `globals/browser.js`, SDK `web/rove-agent.js`): offer an LLM-drives-a-UI
+  surface **scoped to the customer's own app** — an in-page same-origin SDK over
+  a held WebSocket, paired with a `browser.*` JS-shim (same pattern as
+  `webhook.send`). An agent acting inside the customer's *own* page is roughly
+  equivalent to JS the customer can already run there → **no new trust
+  boundary**, no install, no cross-origin reach.
+- **Vendor-neutral brain**: the LLM call is the customer's own `on.fetch` with
+  their key; `browser.tools()` returns a generic action schema the customer
+  adapts to their model (the reference handler shows the Claude wiring). Durable
+  reasoning state (goal, transcript) rides `kv`; the live tab + socket are
+  ephemeral hands that re-derive on reload (durable-brain / ephemeral-hands).
+- **Perception is structural by default**: an enriched DOM/accessibility
+  snapshot (geometry + computed visibility + occlusion), pixel-free and
+  token-cheap. True pixel capture (`getDisplayMedia` → `blob.put`) is a separate
+  **opt-in** tier, not the default. The triad is DOM = *what*, screenshot =
+  *how it looks*, replay = *why*.
+- **Safety split**: rove-enforced & non-disableable (same-origin only; a visible
+  "agent is driving · STOP" indicator + kill switch; screenshots only via the
+  explicit consent path) vs customer-configured policy (which actions need human
+  confirmation — `browser.confirm` — element allowlists, marking untrusted
+  page content as a prompt-injection surface).
+- **Pluggable brain**: the snapshot/action protocol is brain-agnostic, so the
+  same surface can later be driven by the end-user's local Claude over **MCP**
+  (a relay + session-pairing handshake) with no SDK/protocol change.
+- **Replay-context channel** (the differentiator) is **deferred + security-gated**:
+  `getReplay(sinceSeq)` must wait on the log-server JWT becoming tenant/session-
+  scoped (`log_server/standalone.zig` discards the verify — the latent-CRITICAL
+  from the 2026-06 audit). The protocol carries the session id from day one so
+  this lights up without a retrofit.
+- **Rejected**: a general "drive the user's whole browser" extension — a loaded
+  gun an untrusted customer wields against their end-users (confused-deputy,
+  prompt-injection, nothing rove can vouch for). Scoping to the customer's own
+  app drops the scary part while keeping the LLM-enhanced-app use case.
+
 ---
 
 ## 5. Readset replication
