@@ -236,6 +236,74 @@ pub const RouteCache = struct {
     }
 };
 
+// ── Leader hint cache (host → leader node origin) ─────────────────────
+//
+// The worker dispatch-gate makes every follower 421 a *dynamic* request
+// (static is served node-local before the gate, so it never enters the 421
+// path). So a 2xx that follows a 421 in a flow can only have come from the
+// leader — we record it here (`note`) and start the next request for that
+// host AT the leader (`startIdx`), skipping the sequential redirect scan
+// that would otherwise tax every read. Self-correcting: after a leadership
+// change or tenant move the stale origin isn't found in the fresh `nodes`,
+// so `startIdx` returns 0 and the next 421 re-learns; if the cached leader
+// is found DOWN, the flow's transport-error path calls `drop`. Independent
+// of `RouteCache` (which can be TTL-disabled, re-resolving every request),
+// so the hint survives route re-resolution. Keys + values are owned.
+const LeaderCache = struct {
+    map: std.StringHashMapUnmanaged([]u8) = .empty,
+
+    fn deinit(self: *LeaderCache, a: std.mem.Allocator) void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            a.free(e.key_ptr.*);
+            a.free(e.value_ptr.*);
+        }
+        self.map.deinit(a);
+    }
+
+    /// Index of the cached leader for `host` within `nodes`, or 0 when
+    /// there's no hint or the hinted origin is absent (stale → scan + relearn).
+    fn startIdx(self: *const LeaderCache, host: []const u8, nodes: []const []const u8) usize {
+        const origin = self.map.get(host) orelse return 0;
+        for (nodes, 0..) |n, i| {
+            if (std.mem.eql(u8, n, origin)) return i;
+        }
+        return 0;
+    }
+
+    /// Record `origin` as the leader for `host`. Idempotent; replaces a
+    /// changed value (freeing the old), dupes the key on first insert.
+    /// Best-effort: an allocation failure just skips the hint (correctness
+    /// is the 421 re-aim; this is only the optimization).
+    fn note(self: *LeaderCache, a: std.mem.Allocator, host: []const u8, origin: []const u8) void {
+        const gop = self.map.getOrPut(a, host) catch return;
+        if (gop.found_existing) {
+            if (std.mem.eql(u8, gop.value_ptr.*, origin)) return;
+            a.free(gop.value_ptr.*);
+        } else {
+            const key = a.dupe(u8, host) catch {
+                _ = self.map.remove(host);
+                return;
+            };
+            gop.key_ptr.* = key;
+        }
+        gop.value_ptr.* = a.dupe(u8, origin) catch {
+            const k = gop.key_ptr.*;
+            _ = self.map.remove(host);
+            a.free(k);
+            return;
+        };
+    }
+
+    /// Forget the cached leader for `host` (the node we started at is down).
+    fn drop(self: *LeaderCache, a: std.mem.Allocator, host: []const u8) void {
+        if (self.map.fetchRemove(host)) |kv| {
+            a.free(kv.key);
+            a.free(kv.value);
+        }
+    }
+};
+
 const RouteResult = union(enum) {
     nodes: []const []const u8, // cache-owned; valid for this loop iteration
     moving,
@@ -270,6 +338,9 @@ pub fn Proxy(comptime FrontH2: type) type {
         route_pending: std.StringHashMapUnmanaged(void) = .empty,
         /// host → backend pool entry, keyed by node origin URL.
         pool: std.StringHashMapUnmanaged(*Upstream) = .empty,
+        /// host → leader node origin, to start each request at the leader
+        /// and skip the redirect scan. See `LeaderCache`.
+        leaders: LeaderCache = .{},
         /// (upstream Session entity, stream id) → flow, for correlating
         /// h2-created `client_response_receiving` entities (which carry
         /// no FlowRef).
@@ -403,6 +474,10 @@ pub fn Proxy(comptime FrontH2: type) type {
             // upstream attempt
             nodes: [][]u8 = &.{},
             node_idx: usize = 0,
+            /// Set once this flow has seen a 421 (not-leader) from some
+            /// node. A later 2xx then provably came from the leader (see
+            /// `leaders`), so we record `nodes[node_idx]` as the leader.
+            saw_421: bool = false,
             attempt: u32 = 0,
             /// Pump entities issued but not yet seen terminal in
             /// `client_response_out` — the flow may not be freed while
@@ -496,6 +571,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             var rp = self.route_pending.keyIterator();
             while (rp.next()) |k| self.allocator.free(k.*);
             self.route_pending.deinit(self.allocator);
+            self.leaders.deinit(self.allocator);
         }
 
         /// One proxy turn — run after `server.poll…()` each loop
@@ -1023,10 +1099,14 @@ pub fn Proxy(comptime FrontH2: type) type {
                 return e;
             };
             switch (route) {
-                .nodes => |n| flow.nodes = dupNodes(self.allocator, n) catch |e| {
-                    self.allocator.free(flow.authority);
-                    self.allocator.free(flow.host);
-                    return e;
+                .nodes => |n| {
+                    flow.nodes = dupNodes(self.allocator, n) catch |e| {
+                        self.allocator.free(flow.authority);
+                        self.allocator.free(flow.host);
+                        return e;
+                    };
+                    // Start at the cached leader (if any) — skip the scan.
+                    flow.node_idx = self.leaders.startIdx(flow.host, flow.nodes);
                 },
                 .pending => {
                     // Cold host: park (body still buffers via the sink)
@@ -1201,6 +1281,10 @@ pub fn Proxy(comptime FrontH2: type) type {
                 return;
             }
             if (flow.canRetry() and flow.node_idx + 1 < flow.nodes.len) {
+                // A node we routed to is down. If it was the cached leader
+                // (we start there), drop the hint so we re-learn instead of
+                // dialing the dead node on every future request.
+                if (conn_died) self.leaders.drop(self.allocator, flow.host);
                 flow.node_idx += 1;
                 self.startAttempt(flow);
                 return;
@@ -1218,6 +1302,15 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// mid-election) surface a plain retryable 503 rather than the
         /// internal re-aim status.
         fn handle421(self: *Self, flow: *Flow) void {
+            // Remember we were redirected: a later 2xx in this flow is
+            // then provably from the leader (see `noteLeader`).
+            flow.saw_421 = true;
+            // Re-aim is rare once the leader cache is warm — it signals a
+            // leadership change (or a cold/first request), so info-level is
+            // the right volume, not per-request noise.
+            std.log.info("front: 421 re-aim host={s} off node={s}", .{
+                flow.host, flow.nodes[flow.node_idx],
+            });
             self.abandonAttempt(flow);
             if (flow.canRetry() and flow.node_idx + 1 < flow.nodes.len) {
                 flow.node_idx += 1;
@@ -1394,6 +1487,9 @@ pub fn Proxy(comptime FrontH2: type) type {
                     self.finishWithStatus(flow, 502);
                     continue;
                 };
+                // A 2xx (any non-421 served head) after a 421 in this flow
+                // is provably from the leader — cache it for next time.
+                if (flow.saw_421) self.leaders.note(self.allocator, flow.host, flow.nodes[flow.node_idx]);
                 self.relayHead(flow, status.code, packed_hdrs);
                 flow.resp_streaming = true;
 
@@ -1682,6 +1778,9 @@ pub fn Proxy(comptime FrontH2: type) type {
                         self.handle421(flow);
                         continue;
                     }
+                    // A non-421 buffered response after a 421 in this flow
+                    // is provably from the leader — cache it for next time.
+                    if (flow.saw_421) self.leaders.note(self.allocator, flow.host, flow.nodes[flow.node_idx]);
                     const packed_hdrs = self.packDownstreamHeaders(rh) catch h2.RespHeaders{ .fields = null, .count = 0 };
                     // Steal the body for the downstream entity (raw
                     // overwrite; allocators match).
@@ -2093,6 +2192,8 @@ pub fn Proxy(comptime FrontH2: type) type {
                         self.finishWithStatus(flow, 503);
                         continue;
                     };
+                    // Start at the cached leader (if any) — skip the scan.
+                    flow.node_idx = self.leaders.startIdx(flow.host, flow.nodes);
                     self.startAttempt(flow);
                 },
                 .tunnel => |t| {
@@ -2264,4 +2365,52 @@ test "RouteCache: putOwned refreshes the entry in place and frees the old nodes"
 
     cache.invalidate("h");
     try testing.expect(cache.get("h", 1250) == null);
+}
+
+test "LeaderCache: note seeds the start index; stale origin falls back to 0" {
+    const a = testing.allocator;
+    var lc: LeaderCache = .{};
+    defer lc.deinit(a);
+
+    const nodes = &[_][]const u8{ "http://n1:1", "http://n2:1", "http://n3:1" };
+
+    // Cold: no hint → start at 0 (the front then scans + learns).
+    try testing.expectEqual(@as(usize, 0), lc.startIdx("acme", nodes));
+
+    // Learn the leader is n3 → subsequent requests start at index 2 directly
+    // (no redirect scan — the tax is gone).
+    lc.note(a, "acme", "http://n3:1");
+    try testing.expectEqual(@as(usize, 2), lc.startIdx("acme", nodes));
+
+    // A different host is independent.
+    lc.note(a, "beta", "http://n2:1");
+    try testing.expectEqual(@as(usize, 1), lc.startIdx("beta", nodes));
+
+    // Stale hint after a move/membership change: the cached origin is no
+    // longer in `nodes` → fall back to 0 so the next 421 re-learns.
+    const moved_nodes = &[_][]const u8{ "http://m1:1", "http://m2:1" };
+    try testing.expectEqual(@as(usize, 0), lc.startIdx("acme", moved_nodes));
+}
+
+test "LeaderCache: note replaces in place (no leak); drop forgets" {
+    const a = testing.allocator;
+    var lc: LeaderCache = .{};
+    defer lc.deinit(a);
+
+    const nodes = &[_][]const u8{ "http://n1:1", "http://n2:1", "http://n3:1" };
+
+    lc.note(a, "acme", "http://n1:1");
+    // Re-note with a new leader (leadership changed): the old value must be
+    // freed in place (testing allocator catches a leak) and the index move.
+    lc.note(a, "acme", "http://n3:1");
+    try testing.expectEqual(@as(usize, 2), lc.startIdx("acme", nodes));
+    // Idempotent re-note of the same value is a no-op.
+    lc.note(a, "acme", "http://n3:1");
+    try testing.expectEqual(@as(usize, 2), lc.startIdx("acme", nodes));
+
+    // drop forgets → back to a cold start.
+    lc.drop(a, "acme");
+    try testing.expectEqual(@as(usize, 0), lc.startIdx("acme", nodes));
+    // drop of an absent host is a harmless no-op.
+    lc.drop(a, "acme");
 }

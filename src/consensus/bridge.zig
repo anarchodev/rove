@@ -621,6 +621,16 @@ pub const Bridge = struct {
         return sig.is_leader.load(.acquire);
     }
 
+    /// True when this node runs as the sole voter (no peers). The worker's
+    /// dispatch-gate uses this to skip the per-tenant leader redirect on
+    /// single-node / dev deployments: the sole node leads every group,
+    /// there are no followers that could serve a stale read, and a group
+    /// may not be lazily created at gate time (so `gidForTenant` can read
+    /// null even though this node would lead it).
+    pub fn isSingleNode(self: *Bridge) bool {
+        return self.node.isSingleNode();
+    }
+
     // ── Move control (any thread; executes on the pump thread) ───────
 
     /// Quiesce a tenant for a move: stop admitting new proposes
