@@ -98,12 +98,6 @@ const ROUTE_WAIT_NS: i128 = 2500 * std.time.ns_per_ms;
 /// only bounds the genuinely-stuck case.
 const RESPONSE_WAIT_NS: i128 = 30_000 * std.time.ns_per_ms;
 
-/// How long a WS tunnel waits for a live upstream conn to advertise
-/// `SETTINGS_ENABLE_CONNECT_PROTOCOL` before giving up (re-aim/502). The
-/// peer SETTINGS normally lands within one RTT of connect-complete; this
-/// only bounds a genuinely non-RFC-8441 upstream.
-const SETTINGS_WAIT_NS: i128 = 2000 * std.time.ns_per_ms;
-
 // ── Small shared helpers (formerly in main.zig) ───────────────────────
 
 pub fn headerValue(rh: h2.ReqHeaders, name: []const u8) ?[]const u8 {
@@ -329,13 +323,6 @@ pub fn Proxy(comptime FrontH2: type) type {
             /// WS has no body to buffer; the downstream socket just waits.
             awaiting_route: bool = false,
             route_deadline_ns: i128 = 0,
-            /// Parked on a live pool conn whose peer SETTINGS hasn't yet
-            /// advertised ENABLE_CONNECT_PROTOCOL (a freshly-`.up` leg —
-            /// its SETTINGS trails connect-complete). Re-checked each cycle
-            /// by `serviceTunnelSettingsWaiters` until the bit shows up or
-            /// `settings_deadline_ns` fires. `up_sess` holds the conn.
-            awaiting_settings: bool = false,
-            settings_deadline_ns: i128 = 0,
             up_sess: Entity = Entity.nil,
             up_sid: u32 = 0,
             waiting_conn: bool = false,
@@ -511,10 +498,6 @@ pub fn Proxy(comptime FrontH2: type) type {
             try self.intakeWsUpgrades(now_ns);
             try self.reg.flush();
             try self.consumeConnects(now_ns);
-            // Resume tunnels parked on a live conn awaiting its peer
-            // ENABLE_CONNECT_PROTOCOL SETTINGS (cold-leg race), now that
-            // this cycle's server poll may have landed that frame.
-            self.serviceTunnelSettingsWaiters(now_ns);
             try self.reg.flush();
             try self.consumeResponseHeaders();
             try self.reg.flush();
@@ -741,14 +724,8 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// requires the peer's ENABLE_CONNECT_PROTOCOL before submitting.
         fn submitTunnel(self: *Self, t: *WsTunnel, sess: Entity) void {
             if (!self.server.connExtendedConnect(sess)) {
-                // Live conn, but the peer's ENABLE_CONNECT_PROTOCOL SETTINGS
-                // hasn't been seen yet — common on a freshly-`.up` leg whose
-                // SETTINGS trails connect-complete. Park and re-check next
-                // cycle (serviceTunnelSettingsWaiters) instead of failing;
-                // the old immediate give-up surfaced a transient 502 on cold
-                // upstream connections.
-                t.up_sess = sess;
-                t.awaiting_settings = true;
+                std.log.warn("front: {s} has no extended-connect — cannot tunnel WS", .{t.nodes[t.node_idx]});
+                self.tunnelAttemptFailed(t);
                 return;
             }
             const packed_hdrs = self.packTunnelHeaders(t) catch {
@@ -2076,49 +2053,6 @@ pub fn Proxy(comptime FrontH2: type) type {
                 },
                 .tunnel => |t| self.failParkedTunnel(t, code),
             };
-        }
-
-        /// Resume (or expire) WS tunnels parked in `submitTunnel` waiting for
-        /// their upstream conn's `ENABLE_CONNECT_PROTOCOL` SETTINGS. A parked
-        /// tunnel is referenced only by its still-undecided `ws_upgrade_out`
-        /// entity's FlowRef (no CONNECT stream opened yet), so sweep that
-        /// collection. Submit once the bit shows up; re-aim if the conn died;
-        /// give up past `SETTINGS_WAIT_NS` (a genuinely non-RFC-8441 upstream).
-        fn serviceTunnelSettingsWaiters(self: *Self, now_ns: i128) void {
-            const coll = &self.server.ws_upgrade_out;
-            const flow_refs = coll.column(FlowRef);
-            for (flow_refs) |fr| {
-                if (!fr.tunnel) continue;
-                const p = fr.ptr orelse continue;
-                const t: *WsTunnel = @ptrCast(@alignCast(p));
-                if (!t.awaiting_settings) continue;
-                if (t.down_gone or self.reg.isStale(t.down_conn)) {
-                    t.awaiting_settings = false;
-                    self.finishTunnel(t);
-                    continue;
-                }
-                if (self.reg.isStale(t.up_sess)) {
-                    // Pool conn died while we waited — re-aim (next node).
-                    t.awaiting_settings = false;
-                    t.settings_deadline_ns = 0;
-                    self.tunnelAttemptFailed(t);
-                    continue;
-                }
-                if (self.server.connExtendedConnect(t.up_sess)) {
-                    t.awaiting_settings = false;
-                    t.settings_deadline_ns = 0;
-                    self.submitTunnel(t, t.up_sess);
-                    continue;
-                }
-                if (t.settings_deadline_ns == 0) {
-                    t.settings_deadline_ns = now_ns + SETTINGS_WAIT_NS;
-                } else if (now_ns >= t.settings_deadline_ns) {
-                    std.log.warn("front: {s} never advertised extended-connect — failing WS tunnel", .{t.nodes[t.node_idx]});
-                    t.awaiting_settings = false;
-                    t.settings_deadline_ns = 0;
-                    self.tunnelAttemptFailed(t);
-                }
-            }
         }
 
         /// 503 any flow whose cold-route park outlived `ROUTE_WAIT_NS`.
