@@ -254,10 +254,10 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// Off-loop CP route resolver — the poll loop never blocks on a
         /// `/_cp/route` query.
         resolver: *RouteResolver,
-        /// host → flows parked awaiting a cold route resolution. Keys
-        /// are allocator-owned host copies. Mirrors the `up.waiters`
+        /// host → flows/tunnels parked awaiting a cold route resolution.
+        /// Keys are allocator-owned host copies. Mirrors the `up.waiters`
         /// park-on-connect pattern, keyed by host instead of upstream.
-        route_waiters: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(*Flow)) = .empty,
+        route_waiters: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(Waiter)) = .empty,
         /// Hosts with a resolve in flight (dedupe). Loop-thread only —
         /// no lock. Keys are allocator-owned host copies.
         route_pending: std.StringHashMapUnmanaged(void) = .empty,
@@ -318,6 +318,11 @@ pub fn Proxy(comptime FrontH2: type) type {
             nodes: [][]u8 = &.{},
             node_idx: usize = 0,
             attempt: u32 = 0,
+            /// Parked in `route_waiters` awaiting a cold-route resolve — no
+            /// upstream attempt started yet (mirrors `Flow.awaiting_route`).
+            /// WS has no body to buffer; the downstream socket just waits.
+            awaiting_route: bool = false,
+            route_deadline_ns: i128 = 0,
             up_sess: Entity = Entity.nil,
             up_sid: u32 = 0,
             waiting_conn: bool = false,
@@ -617,7 +622,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 };
                 const host = hostOnly(authority_raw);
                 const route = self.resolveRoute(host, now_ns);
-                const nodes: []const []const u8 = switch (route) {
+                switch (route) {
                     .not_found => {
                         self.server.wsUpgradeReject(ent, 404);
                         continue;
@@ -626,18 +631,13 @@ pub fn Proxy(comptime FrontH2: type) type {
                         self.server.wsUpgradeReject(ent, 503);
                         continue;
                     },
-                    // Cold route: the resolve is enqueued; reject
-                    // retryably and the client reconnects once cached.
-                    // (WS tunnels have no Flow to park — see plan.)
-                    .pending => {
-                        self.server.wsUpgradeReject(ent, 503);
+                    .nodes => |n| if (n.len == 0) {
+                        self.server.wsUpgradeReject(ent, 502);
                         continue;
                     },
-                    .nodes => |n| n,
-                };
-                if (nodes.len == 0) {
-                    self.server.wsUpgradeReject(ent, 502);
-                    continue;
+                    // Cold route: the resolve is enqueued; park the tunnel
+                    // (like a cold Flow) and resume when the answer lands.
+                    .pending => {},
                 }
 
                 const t = self.allocator.create(WsTunnel) catch {
@@ -662,17 +662,31 @@ pub fn Proxy(comptime FrontH2: type) type {
                     self.server.wsUpgradeReject(ent, 503);
                     continue;
                 };
-                t.nodes = dupNodes(self.allocator, nodes) catch {
-                    self.allocator.free(t.authority);
-                    self.allocator.free(t.host);
-                    self.allocator.destroy(t);
-                    self.server.wsUpgradeReject(ent, 503);
-                    continue;
-                };
+                switch (route) {
+                    .nodes => |n| t.nodes = dupNodes(self.allocator, n) catch {
+                        self.allocator.free(t.authority);
+                        self.allocator.free(t.host);
+                        self.allocator.destroy(t);
+                        self.server.wsUpgradeReject(ent, 503);
+                        continue;
+                    },
+                    .pending => {
+                        t.awaiting_route = true;
+                        t.route_deadline_ns = now_ns + ROUTE_WAIT_NS;
+                        self.parkRouteWaiter(host, .{ .tunnel = t }) catch {
+                            self.allocator.free(t.authority);
+                            self.allocator.free(t.host);
+                            self.allocator.destroy(t);
+                            self.server.wsUpgradeReject(ent, 503);
+                            continue;
+                        };
+                    },
+                    else => unreachable,
+                }
                 self.live_tunnels += 1;
                 fr.ptr = @ptrCast(t);
                 fr.tunnel = true;
-                self.startTunnelAttempt(t);
+                if (!t.awaiting_route) self.startTunnelAttempt(t);
             }
         }
 
@@ -832,6 +846,19 @@ pub fn Proxy(comptime FrontH2: type) type {
             self.allocator.destroy(t);
         }
 
+        /// Terminal failure of a route-parked tunnel: reject the still-held
+        /// Upgrade with `code` (retryable), unless the downstream already
+        /// died — `finishTunnel` then just reaps the handle. No upstream
+        /// attempt was ever started, so there are no terminals to await.
+        fn failParkedTunnel(self: *Self, t: *WsTunnel, code: u16) void {
+            t.awaiting_route = false;
+            if (!t.decided and !t.down_gone and !self.reg.isStale(t.down_conn)) {
+                t.decided = true;
+                self.server.wsUpgradeReject(t.upgrade_ent, code);
+            }
+            self.finishTunnel(t);
+        }
+
         // Tunnel sinks. Downstream socket bytes → `up_buf` (pumped as
         // upstream chunks); upstream response bytes → the downstream
         // write queue. Both run on the poll thread.
@@ -974,7 +1001,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     // until the resolve lands or the deadline fires.
                     flow.awaiting_route = true;
                     flow.route_deadline_ns = now_ns + ROUTE_WAIT_NS;
-                    self.parkRouteWaiter(flow) catch |e| {
+                    self.parkRouteWaiter(flow.host, .{ .flow = flow }) catch |e| {
                         self.allocator.free(flow.authority);
                         self.allocator.free(flow.host);
                         return e;
@@ -1919,16 +1946,16 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// Park a flow awaiting a cold route. Mirrors `up.waiters`, but
         /// keyed by host. The bucket key is an owned dupe (separate from
         /// `flow.host`), freed when the bucket is resumed/failed.
-        fn parkRouteWaiter(self: *Self, flow: *Flow) !void {
-            const gop = try self.route_waiters.getOrPut(self.allocator, flow.host);
+        fn parkRouteWaiter(self: *Self, host: []const u8, waiter: Waiter) !void {
+            const gop = try self.route_waiters.getOrPut(self.allocator, host);
             if (!gop.found_existing) {
-                gop.key_ptr.* = self.allocator.dupe(u8, flow.host) catch |e| {
+                gop.key_ptr.* = self.allocator.dupe(u8, host) catch |e| {
                     self.route_waiters.removeByPtr(gop.key_ptr);
                     return e;
                 };
                 gop.value_ptr.* = .empty;
             }
-            try gop.value_ptr.append(self.allocator, flow);
+            try gop.value_ptr.append(self.allocator, waiter);
         }
 
         /// Drain off-loop resolutions: update the cache and resume (or
@@ -1974,22 +2001,40 @@ pub fn Proxy(comptime FrontH2: type) type {
             var list = kv.value;
             self.allocator.free(kv.key);
             defer list.deinit(self.allocator);
-            for (list.items) |flow| {
-                flow.awaiting_route = false;
-                if (flow.down_gone or !flow.down_alive) {
-                    self.teardownFlow(flow);
-                    continue;
-                }
-                if (nodes.len == 0) {
-                    self.finishWithStatus(flow, 502);
-                    continue;
-                }
-                flow.nodes = dupNodes(self.allocator, nodes) catch {
-                    self.finishWithStatus(flow, 503);
-                    continue;
-                };
-                self.startAttempt(flow);
-            }
+            for (list.items) |w| switch (w) {
+                .flow => |flow| {
+                    flow.awaiting_route = false;
+                    if (flow.down_gone or !flow.down_alive) {
+                        self.teardownFlow(flow);
+                        continue;
+                    }
+                    if (nodes.len == 0) {
+                        self.finishWithStatus(flow, 502);
+                        continue;
+                    }
+                    flow.nodes = dupNodes(self.allocator, nodes) catch {
+                        self.finishWithStatus(flow, 503);
+                        continue;
+                    };
+                    self.startAttempt(flow);
+                },
+                .tunnel => |t| {
+                    t.awaiting_route = false;
+                    if (t.down_gone or self.reg.isStale(t.down_conn)) {
+                        self.finishTunnel(t);
+                        continue;
+                    }
+                    if (nodes.len == 0) {
+                        self.failParkedTunnel(t, 502);
+                        continue;
+                    }
+                    t.nodes = dupNodes(self.allocator, nodes) catch {
+                        self.failParkedTunnel(t, 503);
+                        continue;
+                    };
+                    self.startTunnelAttempt(t);
+                },
+            };
         }
 
         fn failRouteWaiters(self: *Self, host: []const u8, code: u16) void {
@@ -1997,14 +2042,17 @@ pub fn Proxy(comptime FrontH2: type) type {
             var list = kv.value;
             self.allocator.free(kv.key);
             defer list.deinit(self.allocator);
-            for (list.items) |flow| {
-                flow.awaiting_route = false;
-                if (flow.down_gone or !flow.down_alive) {
-                    self.teardownFlow(flow);
-                } else {
-                    self.finishWithStatus(flow, code);
-                }
-            }
+            for (list.items) |w| switch (w) {
+                .flow => |flow| {
+                    flow.awaiting_route = false;
+                    if (flow.down_gone or !flow.down_alive) {
+                        self.teardownFlow(flow);
+                    } else {
+                        self.finishWithStatus(flow, code);
+                    }
+                },
+                .tunnel => |t| self.failParkedTunnel(t, code),
+            };
         }
 
         /// 503 any flow whose cold-route park outlived `ROUTE_WAIT_NS`.
@@ -2017,14 +2065,23 @@ pub fn Proxy(comptime FrontH2: type) type {
                 const list = e.value_ptr;
                 var i: usize = 0;
                 while (i < list.items.len) {
-                    const flow = list.items[i];
-                    if (now_ns >= flow.route_deadline_ns) {
+                    const w = list.items[i];
+                    const deadline = switch (w) {
+                        .flow => |flow| flow.route_deadline_ns,
+                        .tunnel => |t| t.route_deadline_ns,
+                    };
+                    if (now_ns >= deadline) {
                         _ = list.swapRemove(i);
-                        flow.awaiting_route = false;
-                        if (flow.down_gone or !flow.down_alive) {
-                            self.teardownFlow(flow);
-                        } else {
-                            self.finishWithStatus(flow, 503);
+                        switch (w) {
+                            .flow => |flow| {
+                                flow.awaiting_route = false;
+                                if (flow.down_gone or !flow.down_alive) {
+                                    self.teardownFlow(flow);
+                                } else {
+                                    self.finishWithStatus(flow, 503);
+                                }
+                            },
+                            .tunnel => |t| self.failParkedTunnel(t, 503),
                         }
                     } else {
                         i += 1;
