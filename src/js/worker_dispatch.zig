@@ -2471,12 +2471,16 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     // dispatch as `.inbound_headers`.
     const body_inbounds = server.request_out.column(worker_mod.BodyInbound);
 
-    // Per-tenant leadership is enforced at propose time: a handler that
-    // writes against a group this node doesn't lead gets `NotLeader` →
-    // 421 and the front re-aims to the leader (decisions.md §10.5c). There
-    // is no node-wide leader gate here — in V2 a node leads some tenants'
-    // groups and follows others, and reads serve from any node — so we
-    // dispatch every request and let the per-group propose decide.
+    // Per-tenant leadership is enforced at TWO points. The dispatch-gate
+    // (per request, below — just before handler execution) 421s any
+    // request whose tenant group this node doesn't lead, BEFORE running
+    // the handler: this is what makes reads strict-serializable, since a
+    // read-only handler never reaches the propose-time gate and would
+    // otherwise serve from a lagging follower. The propose-time gate
+    // (`NotLeader` → 421, decisions.md §10.5c) remains as the backstop for
+    // a leadership change between the dispatch check and commit. In V2 a
+    // node leads some tenants' groups and follows others, so the gate is
+    // per-tenant, not node-wide; single-node leads everything and skips it.
 
     // Batch state. Set lazily on the first handler-bound request we
     // see; subsequent requests in the same walk that target a
@@ -2764,6 +2768,29 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             processed += 1;
             continue;
         };
+
+        // Dispatch-gate (strict-serializable reads): only the leader of
+        // the request's tenant group runs the handler. A non-leader 421s
+        // HERE — before any handler logic, kv read, or batch join — so the
+        // front re-aims to the leader and reads can never serve from a
+        // lagging follower. The kv state and writes target `scope_inst`'s
+        // group (`anchor = scope_inst`; proposeBatch uses `anchor_id`), so
+        // leadership of THAT group is what matters — not `handler_inst`'s
+        // (they differ for admin-on-behalf-of-tenant requests). Immutable
+        // serving ran above and stays node-local: static assets, hashed
+        // blobs, and the 404 from the shared deployment snapshot carry no
+        // consistency stake. Single-node leads everything (guarded so a
+        // not-yet-lazily-created group can't false-redirect in dev). No
+        // tenant-log capture: a redirect is routing plumbing, not a
+        // request outcome — the leader logs the real one.
+        if (!worker.raft.isSingleNode()) {
+            const lead_gid = worker.raft.gidForTenant(scope_inst.id) orelse 0;
+            if (lead_gid == 0 or !worker.raft.isLeaderOf(lead_gid)) {
+                try respb.setSimpleResponse(server, ent, sid, sess, 421, "not leader for this tenant; retry against the cluster leader\n", allocator);
+                processed += 1;
+                continue;
+            }
+        }
 
         if (worker.penalty_box.isBoxed(handler_inst.id, dep_id, received_ns)) {
             try respb.setSimpleResponse(server, ent, sid, sess, 503, "tenant temporarily disabled (cpu budget)\n", allocator);
