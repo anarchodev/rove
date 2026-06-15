@@ -61,20 +61,35 @@ pub const WriteSet = writeset.WriteSet;
 pub const Envelope = envelope.Envelope;
 pub const RangeResult = kvstore.RangeResult;
 
-/// Per-group raft configuration handed to every `createGroupEpoch`. We
-/// enable `pre_vote`: a follower that was partitioned, or a hibernated
-/// group that wakes, first probes whether an election is winnable before
-/// bumping its term — so a node that cannot win cannot disrupt a healthy
-/// leader by forcing a term change (and cannot ratchet terms during a
-/// mass-wake). The remaining `raft::Config` knobs (check_quorum, the
-/// min/max election-tick window, lease reads, priority for leadership
-/// transfer) are now reachable through `GroupConfig` but left at raft
-/// defaults pending their own validation. All nodes run the same binary,
-/// so pre_vote is uniform cluster-wide; a rolling deploy has a transient
-/// mixed-pre_vote window, acceptable pre-launch (dev clusters are wiped).
+/// Per-group raft configuration handed to every `createGroupEpoch`.
+///
+/// `pre_vote`: a follower that was partitioned, or a hibernated group that
+/// wakes, first probes whether an election is winnable before bumping its
+/// term — so a node that cannot win cannot disrupt a healthy leader by
+/// forcing a term change (and cannot ratchet terms during a mass-wake).
+///
+/// `check_quorum`: a leader that stops hearing from a quorum steps down
+/// within ~one election timeout, instead of serving reads indefinitely as a
+/// deposed-but-unaware leader after a partition. This bounds the only
+/// remaining strict-serializable-read gap left by the dispatch-gate (the
+/// gate routes reads to whoever *believes* it leads; check_quorum makes a
+/// partitioned ex-leader stop believing). Safe under hibernation: a
+/// hibernated leader isn't ticked, so it never evaluates check_quorum and
+/// can't spuriously step down; an *active* leader's heartbeats are still
+/// answered by hibernated followers (a stepped heartbeat notifies → ready →
+/// the response is sent, independent of the active set), so the quorum check
+/// is satisfied in normal operation. read_index (LeaseBased reads) would
+/// close the gap fully but needs an FFI method (RawNode.read_index) that
+/// isn't surfaced yet; check_quorum is the cheap, no-per-read-cost bound.
+///
+/// The remaining tunables (election-tick window, priority for leadership
+/// transfer) stay at raft defaults pending their own need. All nodes run
+/// the same binary so these are uniform cluster-wide; a rolling deploy has a
+/// transient mixed-config window, acceptable pre-launch (dev clusters wiped).
 const group_raft_config: raft.manager.GroupConfig = blk: {
     var cfg = raft.manager.defaultGroupConfig();
     cfg.pre_vote = true;
+    cfg.check_quorum = true;
     break :blk cfg;
 };
 
