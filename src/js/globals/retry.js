@@ -19,17 +19,19 @@
 //     context: { charge_id: 42 },
 //   });
 //
-//   // The on_result handler. Post-Phase-5-PR-3 the event arrives
-//   // as `request.body.ctx.result` + `request.body.ctx.context`
-//   // (the webhook.send → __system/webhook_onresult shim → __rove_next
-//   // chain). `retry.shouldRetry` / `retry.next` accept the flat
-//   // event shape; build it from the new ctx-wrapped body:
+//   // The on_result handler. The event arrives on the unified
+//   // flattened surface (handler-shape §7): the response on
+//   // `request.body` / `request.status` / `request.ok`, with the
+//   // delivery metadata + echoed `context` on `request.ctx`.
+//   // `retry.shouldRetry` / `retry.next` accept the flat event shape;
+//   // assemble it from that surface:
 //   //
 //   //   charges/handler.mjs
 //   //   export default function () {
-//   //     const wrap = JSON.parse(request.body);
-//   //     const event = Object.assign({}, wrap.ctx.result,
-//   //                                 { context: wrap.ctx.context });
+//   //     const event = {
+//   //       ok: request.ok, status: request.status, body: request.body,
+//   //       error: request.ctx.error, context: request.ctx.context,
+//   //     };
 //   //     if (retry.shouldRetry(event)) { retry.next(event); return; }
 //   //     const ctx = retry.stripContext(event);
 //   //     if (event.ok) kv.set(`charge/${ctx.charge_id}`, event.body);
@@ -78,11 +80,13 @@ function backoffMsFor(retry_state, next_attempt) {
  *   context: { charge_id: 42 },
  * });
  *
- * // charges/handler.mjs — the on_result handler.
+ * // charges/handler.mjs — the on_result handler. The result arrives
+ * // on the unified flattened surface (handler-shape §7).
  * export default function () {
- *   const wrap = JSON.parse(request.body);
- *   const event = Object.assign({}, wrap.ctx.result,
- *                               { context: wrap.ctx.context });
+ *   const event = {
+ *     ok: request.ok, status: request.status, body: request.body,
+ *     error: request.ctx.error, context: request.ctx.context,
+ *   };
  *   if (retry.shouldRetry(event)) { retry.next(event); return; }
  *   const ctx = retry.stripContext(event);
  *   // ... your terminal handling ...

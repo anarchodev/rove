@@ -2479,6 +2479,73 @@ pub fn installRequest(
         }
     }
 
+    // ── Unified effect-result surface (handler-shape.md §7) ──
+    // A customer `on_result` hop (`webhook.send` / `blob.put` /
+    // `retry.send`) arrives as `.send_callback` with
+    // `request.body = {"ctx":{result, context}}`. Present it like a
+    // bound-fetch FINAL so EVERY effect-result resume reads the same
+    // way: `request.body` = the response bytes, top-level
+    // `request.status`/`.ok`/`.done`, and the delivery metadata + echoed
+    // `context` on `request.ctx`. There is no `request.result` — it
+    // never existed in any path (decisions.md §3.x; this deletes the
+    // last doc fiction). Two non-matching send_callback shapes are
+    // skipped deliberately:
+    //   • §6.4 held-sync resume — body is `{ctx, outcome}` (top-level
+    //     `outcome`); its surface is the 2-arg `onResult(ctx, outcome)`.
+    //   • webhook_onresult's own self-hops — `{ctx:{id,…}}`, no
+    //     `result` object, so the discriminator below misses them.
+    if (request.activation == .send_callback and request.body.len > 0) hoist: {
+        const buf = state.allocator.allocSentinel(u8, request.body.len, 0) catch break :hoist;
+        defer state.allocator.free(buf);
+        @memcpy(buf, request.body);
+        const parsed = c.JS_ParseJSON(ctx, buf.ptr, request.body.len, "<send_callback>");
+        if (c.JS_IsException(parsed)) {
+            _ = c.JS_GetException(ctx); // not JSON — leave request as-is
+            break :hoist;
+        }
+        defer c.JS_FreeValue(ctx, parsed);
+
+        // Held-sync resume carries a top-level `outcome` — skip it.
+        const outcome = c.JS_GetPropertyStr(ctx, parsed, "outcome");
+        const is_heldsync = !c.JS_IsUndefined(outcome) and !c.JS_IsNull(outcome);
+        c.JS_FreeValue(ctx, outcome);
+        if (is_heldsync) break :hoist;
+
+        const cb_ctx = c.JS_GetPropertyStr(ctx, parsed, "ctx");
+        defer c.JS_FreeValue(ctx, cb_ctx);
+        if (!c.JS_IsObject(cb_ctx)) break :hoist;
+        const result = c.JS_GetPropertyStr(ctx, cb_ctx, "result");
+        defer c.JS_FreeValue(ctx, result);
+        if (!c.JS_IsObject(result)) break :hoist; // not a result delivery
+
+        // Hoist the response onto the bound-style surface. `body` is a
+        // setter-less read-taping accessor by default — DEFINE replaces
+        // it (a plain [[Set]] would silently no-op); the bytes are
+        // derived from the (taped) fetch response, so no extra taping.
+        // JS_GetPropertyStr returns an owned ref that Set/Define steals.
+        _ = c.JS_DefinePropertyValueStr(ctx, req_obj, "body", c.JS_GetPropertyStr(ctx, result, "body"), c.JS_PROP_C_W_E);
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "status", c.JS_GetPropertyStr(ctx, result, "status"));
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "ok", c.JS_GetPropertyStr(ctx, result, "ok"));
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "done", js_true);
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "body_truncated", c.JS_GetPropertyStr(ctx, result, "body_truncated"));
+
+        // request.ctx = the delivery envelope: the echoed customer
+        // `context` plus the per-path metadata that isn't part of the
+        // universal response surface — webhook's `attempts`/`error`/
+        // `id`/`headers`, blob's `hash`. Mirrors the bound path lifting
+        // its threaded ctx to request.ctx. Fields absent for a given
+        // path (blob has no attempts; webhook has no hash) read
+        // undefined.
+        const out_ctx = c.JS_NewObject(ctx);
+        _ = c.JS_SetPropertyStr(ctx, out_ctx, "context", c.JS_GetPropertyStr(ctx, cb_ctx, "context"));
+        _ = c.JS_SetPropertyStr(ctx, out_ctx, "attempts", c.JS_GetPropertyStr(ctx, result, "attempts"));
+        _ = c.JS_SetPropertyStr(ctx, out_ctx, "error", c.JS_GetPropertyStr(ctx, result, "error"));
+        _ = c.JS_SetPropertyStr(ctx, out_ctx, "id", c.JS_GetPropertyStr(ctx, result, "id"));
+        _ = c.JS_SetPropertyStr(ctx, out_ctx, "headers", c.JS_GetPropertyStr(ctx, result, "headers"));
+        _ = c.JS_SetPropertyStr(ctx, out_ctx, "hash", c.JS_GetPropertyStr(ctx, result, "hash"));
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", out_ctx);
+    }
+
     _ = c.JS_SetPropertyStr(ctx, req_obj, "activation", activation_obj);
 
     _ = c.JS_SetPropertyStr(ctx, global, "request", req_obj);

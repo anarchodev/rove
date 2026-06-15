@@ -464,6 +464,37 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   (the read-recording model makes it the handler-code author's explicit,
   auditable choice instead).
 
+### 4.7 One effect-result surface — flattened, no `request.result`
+- **Decision** (2026-06-15): every effect-result resume — a bound `on.fetch` /
+  `blob.get` (held chain) **and** a connectionless `webhook.send` / `blob.put` /
+  `retry` `on_result` callback — presents the result the **same** way: the
+  response bytes on `request.body`, `request.status` / `request.ok` /
+  `request.done` at the **top level**, and the echoed customer `context` +
+  per-path delivery metadata (`attempts`, `error`, `id`, `headers`, blob `hash`)
+  on `request.ctx`. **`request.result` does not exist** in any path — it was a
+  doc fiction referenced in ~6 sites and implemented nowhere.
+- **Why**: the surface had drifted into two real shapes — the bound path was
+  already flattened (`request.body` + top-level status, the shipped/verified
+  `onFetchChunk` contract), while the connectionless `on_result` arrived as a
+  nested `JSON.parse(request.body).ctx.result` envelope. Two shapes for one
+  concept is the "converge to one pattern" smell; the docs papering it with a
+  third, non-existent `request.result` made it worse. The bound shape won
+  because it's the one customers already use and the only one that also models
+  streaming chunks.
+- **Mechanism**: the `on_result` hop is a `.send_callback` activation whose body
+  is `{"ctx":{result, context}}`. The runtime (`globals.zig`) detects that
+  shape (a `.ctx.result` object, with no top-level `outcome` — which
+  distinguishes it from the §13 held-sync `{ctx, outcome}` resume and from
+  `webhook_onresult`'s own self-hops, which carry no `result`) and hoists it
+  onto the flattened surface. No new envelope type, no marker. The internal
+  shims (`oidc`/`segments_onsealed`/…) that consume a result were migrated to
+  read the flattened surface — they are not back-compat-frozen (pre-real-user).
+- **Rejected**: making `request.result` real (a second way to read the same
+  thing — option-multiplication); standardizing on `request.ctx.result` (keeps
+  a `result` indirection the bound path never had). Verified e2e by the webhook,
+  webhook-recovery (durable wake), and blob+segments smokes + dispatcher unit
+  tests.
+
 ---
 
 ## 5. Readset replication

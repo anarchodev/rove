@@ -737,19 +737,25 @@ class OIDCRelyingParty {
     return this._pollPage(st.return_to);
   }
 
-  // The callback event the on_result modules receive (synthesized
-  // request body shape post-Phase-5-PR-3: the webhook_onresult shim
-  // chains via `__rove_next(on_result, { ctx: { result, context } })`,
-  // so `request.body` JSON-parses to `{ctx: {result, context}}`. We
-  // flatten back to the legacy `{ok, status, body, context, ...}`
-  // shape so the OIDC RP's `completeToken` / `completeJwks` keep
-  // working unchanged.
+  // The callback event the on_result modules receive. The webhook.send
+  // result arrives on the unified flattened surface (handler-shape §7):
+  // `request.body`/`.status`/`.ok` top-level, with the delivery
+  // metadata + echoed `context` on `request.ctx`. We assemble the
+  // `{ok, status, body, context, ...}` event the OIDC RP's
+  // `completeToken` / `completeJwks` expect.
   _event() {
-    let parsed;
-    try { parsed = JSON.parse(request.body || "{}"); } catch (_) { return {}; }
-    const ctx = (parsed && parsed.ctx) || {};
-    const result = ctx.result || {};
-    return Object.assign({}, result, { context: ctx.context });
+    const ctx = request.ctx || {};
+    return {
+      ok: request.ok,
+      status: request.status,
+      body: request.body,
+      body_truncated: request.body_truncated,
+      headers: ctx.headers || {},
+      attempts: ctx.attempts,
+      error: ctx.error,
+      id: ctx.id,
+      context: ctx.context,
+    };
   }
 
   /**
