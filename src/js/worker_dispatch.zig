@@ -1144,7 +1144,11 @@ fn tryHandleSystem(
     // on followers — same shape as the customer-tenant leader-skip
     // response so tooling can treat both the same way.
     if (std.mem.eql(u8, sys_rest, "leader")) {
-        if (worker.raft.isLeader()) {
+        // V2 leadership is per-tenant-group; this node-wide probe reports
+        // whether this node leads ANY group (readiness/serves-as-leader),
+        // NOT per-tenant routing — clients still get a per-tenant 421 re-aim
+        // at propose time. Single-node always 200 (preserves smoke probes).
+        if (worker.raft.leadsAnyGroup()) {
             try respb.setSystemResponse(server, ent, sid, sess, 200, "leader\n", allocator, cors_origin, null);
         } else {
             try respb.setSystemResponse(server, ent, sid, sess, 503, "not leader; retry against the cluster leader\n", allocator, cors_origin, null);
@@ -1338,11 +1342,11 @@ fn handleMetrics(
     // Helps an operator scraping a fleet tell which node is leader
     // without running a separate /_system/leader probe.
     try w.print(
-        \\# HELP raft_is_leader 1 if this node is the raft leader, 0 otherwise.
+        \\# HELP raft_is_leader 1 if this node leads at least one tenant group, 0 otherwise (V2 leadership is per-group).
         \\# TYPE raft_is_leader gauge
         \\raft_is_leader {d}
         \\
-    , .{@intFromBool(worker.raft.isLeader())});
+    , .{@intFromBool(worker.raft.leadsAnyGroup())});
 
     // ── kvexp: per-node manifest counters / histograms ────────────────
     //
@@ -1412,7 +1416,7 @@ fn handleMetrics(
         \\# HELP bound_fetch_spool_depth_peak peak queued spool entries (producer-ahead-of-consumer depth) across this worker's bound-fetch spools.
         \\# TYPE bound_fetch_spool_depth_peak gauge
         \\bound_fetch_spool_depth_peak {d}
-        \\# HELP log_records_dropped_total per-request log records permanently lost in flushLogs (writeBatch failure / lost-leadership mid-tick) — lossy-on-failure by design.
+        \\# HELP log_records_dropped_total per-request log records permanently lost in flushLogs (writeBatch failure) — lossy-on-failure by design.
         \\# TYPE log_records_dropped_total counter
         \\log_records_dropped_total {d}
         \\
@@ -2467,11 +2471,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     // dispatch as `.inbound_headers`.
     const body_inbounds = server.request_out.column(worker_mod.BodyInbound);
 
-    // Leader-only request handling. Followers serve no client traffic
-    // — they just replicate the leader's raft entries. Any request
-    // that lands on a follower is bounced with 503 + a hint so the
-    // client retries against the leader.
-    const is_leader = worker.raft.isLeader();
+    // Per-tenant leadership is enforced at propose time: a handler that
+    // writes against a group this node doesn't lead gets `NotLeader` →
+    // 421 and the front re-aims to the leader (decisions.md §10.5c). There
+    // is no node-wide leader gate here — in V2 a node leads some tenants'
+    // groups and follows others, and reads serve from any node — so we
+    // dispatch every request and let the per-group propose decide.
 
     // Batch state. Set lazily on the first handler-bound request we
     // see; subsequent requests in the same walk that target a
@@ -2547,12 +2552,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
     var processed: usize = 0;
 
     for (entities, sids, sessions, req_hdrs, req_bodies, body_waits, body_inbounds) |ent, sid, sess, rh, req_body, body_wait, body_inbound| {
-        if (!is_leader) {
-            try respb.setSimpleResponse(server, ent, sid, sess, 503, "not leader; retry against the cluster leader\n", allocator);
-            processed += 1;
-            continue;
-        }
-
         const received_ns: i64 = @intCast(std.time.nanoTimestamp());
 
         const method = respb.findHeader(rh, ":method") orelse "GET";

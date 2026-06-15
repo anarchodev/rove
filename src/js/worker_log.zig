@@ -424,14 +424,11 @@ pub fn flushLogs(worker: anytype) !void {
         allocator.free(records);
     }
 
-    if (!worker.raft.isLeader()) {
-        std.log.warn(
-            "rove-js flushLogs: dropping {d}-record batch — lost leadership mid-tick",
-            .{records.len},
-        );
-        worker.log_records_dropped_total += records.len;
-        return;
-    }
+    // No node-wide leadership gate: V2 log batches are per-NODE (one S3
+    // object per flush window per node, demuxed by `tenant_id` on read),
+    // not per-group, so flushing is independent of which tenants' groups
+    // this node leads. (The old `worker.raft.isLeader()` gate was a V1
+    // node-wide shim that always returned true anyway.)
 
     var node_buf: [8]u8 = undefined;
     const node_id_hex = std.fmt.bufPrint(&node_buf, "{x:0>8}", .{worker.raft.config.node_id}) catch unreachable;
