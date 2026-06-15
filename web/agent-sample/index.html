@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rove browser-agent sample</title>
+</head>
+<body>
+  <h1>Rove browser-agent sample</h1>
+  <p>A trivial page for the agent to operate. The agent (driven by the
+     handler in <code>agent/index.mjs</code>, served at <code>/agent</code>)
+     sees this DOM and drives it.</p>
+
+  <form id="signup" onsubmit="return false">
+    <label>Email <input id="email" name="email" type="email" placeholder="you@example.com"></label>
+    <button id="continue" type="submit">Continue</button>
+  </form>
+  <p id="out" aria-live="polite"></p>
+
+  <!-- The SDK. In a deployed bundle this is served from the tenant's
+       _static/ at /_static/rove-agent.js (copy of web/rove-agent.js). -->
+  <script src="/_static/rove-agent.js"></script>
+  <script>
+    document.getElementById('signup').addEventListener('submit', () => {
+      document.getElementById('out').textContent =
+        'Continued with: ' + document.getElementById('email').value;
+    });
+
+    // Start the agent: render the indicator + kill switch, open the WS
+    // to the handler, and begin the snapshot→act loop. Same-origin only.
+    window.roveAgent = rove.agent.start({
+      endpoint: '/agent',
+      goal: 'Type test@example.com into the email field, then click Continue.',
+      // confirm: async (action) => window.confirm(action.prompt),
+    });
+  </script>
+</body>
+</html>
