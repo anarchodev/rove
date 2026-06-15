@@ -138,6 +138,23 @@ def main() -> int:
         check(f"direct POST follower (node {followers[0] + 1}) → 421",
               wf.status == 421, f"got {wf.status} {wf.body!r}")
 
+        # check_quorum × hibernation: a leader that idles past the hibernate
+        # window stops ticking and so never evaluates check_quorum — it must
+        # NOT spuriously step down. Idle quietly, then confirm leadership is
+        # unchanged and the gate still serves (the group wakes cleanly, the
+        # leader is still the leader, followers still 421).
+        print("step 10: ⭐ idle past hibernation — leader stable under check_quorum")
+        time.sleep(4.0)  # exceed the (default 2s) hibernate window
+        lead2 = c.leader_node("acme")
+        check("leader unchanged after idle (no spurious step-down)",
+              lead2 == lead, f"was node {lead + 1}, now {None if lead2 is None else lead2 + 1}")
+        r = c.node_request("/?fn=handler", node=lead, host=host)
+        check(f"direct GET leader (node {lead + 1}) after idle → 200 value",
+              r.status == 200 and VALUE in r.body, f"got {r.status} {r.body!r}")
+        rf = c.node_request("/?fn=handler", node=followers[0], host=host)
+        check(f"direct GET follower (node {followers[0] + 1}) after idle → 421",
+              rf.status == 421, f"got {rf.status} {rf.body!r}")
+
         # NOTE on the front leader cache (proxy.zig `LeaderCache`): the front
         # learns the leader from a 421→success re-aim and starts subsequent
         # requests for the host there, removing the redirect tax. Its LOGIC is
