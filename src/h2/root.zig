@@ -185,6 +185,16 @@ pub const Conn = struct {
     /// is non-null the connection is driven entirely by `http1Feed` /
     /// `http1WriteResponse` (docs/v2-edge-http1-ingress.md).
     h1: ?*Http1Conn = null,
+    /// Graceful idle reap. When the idle GC decides to close an h2
+    /// connection it queues a GOAWAY and sets `draining` instead of
+    /// destroying outright, so the frame actually reaches the client —
+    /// a silent close strands a client mid-reuse (the idle-keepalive
+    /// reuse race: a request put on a connection the server already
+    /// killed hangs until the client's own timeout, or forever).
+    /// `drain_deadline_ns` is the backstop for a peer that never
+    /// finishes closing.
+    draining: bool = false,
+    drain_deadline_ns: u64 = 0,
 
     pub fn deinit(_: std.mem.Allocator, items: []Conn) void {
         for (items) |*item| {
@@ -4782,6 +4792,10 @@ pub fn H2(comptime opts: Options) type {
         fn driveAllSends(self: *Self) !void {
             const entities = self._conn_active.entitySlice();
             const now = monotonicNs();
+            // Grace window for a GOAWAY'd idle connection to finish
+            // closing before we force-destroy it (backstop for a peer
+            // that stops reading after we signal GOAWAY).
+            const GOAWAY_DRAIN_GRACE_NS: u64 = 2 * std.time.ns_per_s;
 
             for (entities) |ent| {
                 if (self.reg.isStale(ent)) continue;
@@ -4803,11 +4817,28 @@ pub fn H2(comptime opts: Options) type {
                     continue;
                 }
 
-                if (self.h2_opts.idle_timeout_ns > 0 and conn_ptr.last_active_ns > 0 and
+                // Graceful idle reap (h2): queue a GOAWAY and let the
+                // flush path below put it on the wire, then reap once the
+                // peer finishes (want_read/want_write both drain) or the
+                // grace deadline fires. A silent destroy here strands a
+                // client mid-reuse — the idle-keepalive reuse race (see
+                // the front-door TTFB investigation). `draining` is
+                // sticky: late traffic that refreshes last_active must not
+                // cancel a reap already in progress.
+                if (conn_ptr.draining) {
+                    if (now >= conn_ptr.drain_deadline_ns) {
+                        try self.reg.destroy(ent);
+                        continue;
+                    }
+                } else if (self.h2_opts.idle_timeout_ns > 0 and conn_ptr.last_active_ns > 0 and
                     now -| conn_ptr.last_active_ns > self.h2_opts.idle_timeout_ns)
                 {
-                    try self.reg.destroy(ent);
-                    continue;
+                    _ = c.nghttp2_session_terminate_session(conn_ptr.ng_session.?, c.NGHTTP2_NO_ERROR);
+                    conn_ptr.draining = true;
+                    conn_ptr.drain_deadline_ns = now + GOAWAY_DRAIN_GRACE_NS;
+                    // fall through: the want_write flush below emits the
+                    // GOAWAY this pass; the want_write==0 && want_read==0
+                    // branch reaps once the peer acks/closes.
                 }
 
                 const ng_session = conn_ptr.ng_session.?;
