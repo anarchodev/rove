@@ -130,6 +130,21 @@ pub const DEFAULT_AUTO_DEMOTE_LAG: u64 = 10_000;
 /// short value.
 pub const DEFAULT_AUTO_DEMOTE_NS: i64 = 5 * std.time.ns_per_s;
 
+/// Raft logical-tick cadence. raft ticks are LOGICAL — `election_tick` /
+/// `heartbeat_tick` (set in `group_raft_config`) are counts of these, so the
+/// wall-clock election timeout is `election_tick × tick_interval`. The pump
+/// loop runs as fast as it can (a 1ms idle backoff, faster under load), so
+/// ticking once per *cycle* would couple the election timeout to load — slower
+/// under a write burst, faster when idle — and make "what is our election
+/// timeout?" unanswerable. Gating the tick on a fixed monotonic interval
+/// decouples it: `tickGroups` fires at most once per `tick_interval_ns`
+/// regardless of loop speed, so `election_tick × tick_interval_ns` is a stable,
+/// justifiable number. The default preserves the historical ~1ms idle cadence
+/// (so behavior is unchanged) while also CAPPING the rate under load; raise it
+/// (env `REWIND_RAFT_TICK_MS`) once a soak has measured the broadcast-time +
+/// pause-jitter tail this must clear (see docs/raft-best-practices.md).
+pub const DEFAULT_TICK_NS: i64 = 1 * std.time.ns_per_ms;
+
 /// Resolves the store a replicated entry applies to, keyed by the
 /// envelope's tenant id string. Two callers need it:
 ///
@@ -407,6 +422,12 @@ pub const Node = struct {
     auto_demote_lag: u64 = DEFAULT_AUTO_DEMOTE_LAG,
     auto_demote_interval_ns: i64 = DEFAULT_AUTO_DEMOTE_NS,
     last_auto_demote_ns: i64 = 0,
+    /// Raft logical-tick cadence + last-tick wall-clock (see `DEFAULT_TICK_NS`).
+    /// `pump` fires `mgr.tickGroups` at most once per `tick_interval_ns`, so the
+    /// election timeout (`election_tick × tick_interval_ns`) is decoupled from
+    /// the pump loop speed. Tests that want fast elections set this small.
+    tick_interval_ns: i64 = DEFAULT_TICK_NS,
+    last_tick_ns: i64 = 0,
     /// Whether `durabilizeTick` also COMPACTS the WAL (single-node only) after
     /// durabilizing — truncating the log up to the durabilized index so it stays
     /// bounded. ON. Safe because durabilize folds the overlay into LMDB (and
@@ -908,6 +929,14 @@ pub const Node = struct {
         return self.mgr.applyLocalSnapshot(tenant_id, index, term);
     }
 
+    /// Snapshot the cross-node heartbeat round-trip histogram (broadcast-time
+    /// samples), or null on a single-node node (no transport). Lock-free read
+    /// (atomic buckets) — safe off the pump thread.
+    pub fn heartbeatRttSnapshot(self: *Node) ?kvlimbs.MicrosHistogram.Snapshot {
+        const t = self.transport orelse return null;
+        return t.heartbeatRttSnapshot();
+    }
+
     /// Whether this node is the raft leader of `tenant_id`'s group. False
     /// for a group this node has not created yet (a tenant the bridge has
     /// `registerTenant`'d but whose `createGroupEpoch`/`ensureGroup` has not
@@ -1112,7 +1141,20 @@ pub const Node = struct {
     /// sink — but the drain+release is still required to honour the
     /// pollReady/release pairing invariant.
     pub fn pump(self: *Node) Error!bool {
-        _ = self.mgr.tickGroups(self.active.items);
+        // Raft logical tick — interval-gated so the wall-clock election timeout
+        // is `election_tick × tick_interval_ns`, a fixed number, rather than
+        // floating with the pump loop / fsync cadence (see `DEFAULT_TICK_NS`).
+        // pollReady / processReady / transport I/O below still run EVERY cycle;
+        // only the tick is gated. Single-tick-when-due (not catch-up bursts):
+        // after a stall the timer just resumes, which is conservative — slower
+        // elections, never a spurious burst.
+        {
+            const now = nowNs();
+            if (now - self.last_tick_ns >= self.tick_interval_ns) {
+                self.last_tick_ns = now;
+                _ = self.mgr.tickGroups(self.active.items);
+            }
+        }
         const ready = self.mgr.pollReady(self.ready_buf);
 
         self.apply_err = null;

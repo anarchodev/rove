@@ -80,6 +80,7 @@
 const std = @import("std");
 const node_mod = @import("node.zig");
 const envelope = @import("envelope.zig");
+const kvlimbs = @import("kvlimbs");
 
 pub const Node = node_mod.Node;
 pub const WriteSet = node_mod.WriteSet;
@@ -296,6 +297,15 @@ pub const Bridge = struct {
     /// Pump-thread-only: wall-clock of the last FULL leadership scan
     /// (see `refreshLeadership` / `LEADER_SCAN_INTERVAL_NS`).
     last_leader_scan_ns: i64 = 0,
+    /// Count of follower→leader promotion edges this node has observed across
+    /// all groups (incremented in `refreshOneLocked`). With `pre_vote` on, a
+    /// term is only bumped by a node that can win, so a promotion edge ≈ an
+    /// election that changed the leader — the spurious-election signal a soak
+    /// watches: after the initial one-per-group formation, the cluster-wide sum
+    /// should stay flat under steady load. Surfaced as
+    /// `raft_leadership_acquisitions_total` in `/_system/metrics`. Written on
+    /// the pump thread, read lock-free by the worker.
+    leadership_acquisitions: std.atomic.Value(u64) = .init(0),
 
     pump_thread: ?std.Thread = null,
     stop: std.atomic.Value(bool) = .init(false),
@@ -618,6 +628,20 @@ pub const Bridge = struct {
             if (sig.*.is_leader.load(.acquire)) return true;
         }
         return false;
+    }
+
+    /// Cluster-wide count of follower→leader promotion edges this node has
+    /// observed (spurious-election signal — see `leadership_acquisitions`).
+    /// Lock-free; worker-thread entry point for `/_system/metrics`.
+    pub fn leadershipAcquisitions(self: *const Bridge) u64 {
+        return self.leadership_acquisitions.load(.acquire);
+    }
+
+    /// Snapshot the heartbeat round-trip histogram (broadcast-time samples), or
+    /// null on a single-node node. Worker-thread entry point for
+    /// `/_system/metrics`; the histogram's atomic buckets make it lock-free.
+    pub fn heartbeatRttSnapshot(self: *Bridge) ?kvlimbs.MicrosHistogram.Snapshot {
+        return self.node.heartbeatRttSnapshot();
     }
 
     /// Per-group leadership (Phase 5 multi-node). True when this node is the
@@ -1013,12 +1037,17 @@ pub const Bridge = struct {
     /// follower→leader promotion edge. Caller holds `mutex`; pump thread.
     fn refreshOneLocked(self: *Bridge, sig: *GroupSig, gid: u64, single: bool) void {
         const now = self.node.isLeader(gid);
+        const promoted_edge = now and !sig.was_leader;
+        // Count every false→true promotion edge (incl. single-node formation)
+        // for the spurious-election metric; the reader nets out the expected
+        // one-per-group baseline.
+        if (promoted_edge) _ = self.leadership_acquisitions.fetchAdd(1, .monotonic);
         // false→true promotion edge: queue for the worker's on-promotion
         // recovery hook. Skipped on a single node — the sole voter leads
         // every group from creation and never fails over, so there is no
         // old-leader RAM state to reconstruct (and the leader already
         // loaded the deployment + armed watermarks inline at release).
-        if (!single and now and !sig.was_leader) {
+        if (!single and promoted_edge) {
             self.promoted.append(self.allocator, sig.gid) catch {};
         }
         sig.was_leader = now;

@@ -51,6 +51,15 @@
 const std = @import("std");
 const raft = @import("raft_rs_zig");
 const raftnet = @import("raft-net");
+const kvlimbs = @import("kvlimbs");
+
+/// µs-bucketed latency histogram (atomic buckets — safe to snapshot from the
+/// worker thread while the pump writes it). Reused for heartbeat RTT.
+pub const MicrosHistogram = kvlimbs.MicrosHistogram;
+
+fn nowNs() i64 {
+    return @intCast(std.time.nanoTimestamp());
+}
 
 const RaftNet = raftnet.RaftNet;
 const rpc = raftnet.rpc;
@@ -103,6 +112,18 @@ pub const Transport = struct {
     /// node silently dropping a group's traffic is operator-visible.
     step_skip_count: u64 = 0,
 
+    /// Broadcast-time observability (raft-best-practices §"how to size
+    /// election/heartbeat"). `hb_sent_ns[peer]` is the wall-clock at which this
+    /// node last sent a `MsgHeartbeat` to that peer (raft_net peer id =
+    /// node_id-1; 0 = no outstanding heartbeat). On the matching inbound
+    /// `MsgHeartbeatResponse`, the send→response delta is observed into
+    /// `hb_rtt` — an empirical leader↔follower round-trip (incl. pump-loop
+    /// latency on both ends), i.e. the `broadcastTime` the election timeout must
+    /// sit well above. Pump-thread only (queueOut + onRecv); the histogram's
+    /// atomic buckets let `/_system/metrics` snapshot it from the worker thread.
+    hb_sent_ns: []i64,
+    hb_rtt: MicrosHistogram = .{},
+
     pub const Config = struct {
         /// This node's raft id (1-based, must be ≤ peers.len).
         node_id: u64,
@@ -122,6 +143,10 @@ pub const Transport = struct {
         errdefer allocator.free(outbufs);
         for (outbufs) |*ob| ob.* = .{};
 
+        const hb_sent_ns = allocator.alloc(i64, cfg.peers.len) catch return Error.OutOfMemory;
+        errdefer allocator.free(hb_sent_ns);
+        @memset(hb_sent_ns, 0);
+
         self.* = .{
             .allocator = allocator,
             .node_id = cfg.node_id,
@@ -129,6 +154,7 @@ pub const Transport = struct {
             .net = undefined,
             .manager = cfg.manager,
             .outbufs = outbufs,
+            .hb_sent_ns = hb_sent_ns,
         };
 
         // raft_net node/peer ids are 0-based; raft node ids are 1-based.
@@ -149,6 +175,7 @@ pub const Transport = struct {
         self.net.deinit();
         for (self.outbufs) |*ob| ob.body.deinit(a);
         a.free(self.outbufs);
+        a.free(self.hb_sent_ns);
         self.step_scratch.deinit(a);
         self.woke.deinit(a);
         self.recv_floors.deinit(a);
@@ -172,6 +199,13 @@ pub const Transport = struct {
         self.recv_floors.clearRetainingCapacity();
     }
 
+    /// Snapshot the heartbeat round-trip histogram (broadcast-time samples).
+    /// Lock-free: the histogram's atomic buckets are written on the pump thread
+    /// (queueOut/onRecv) and read here from the worker thread (`/_system/metrics`).
+    pub fn heartbeatRttSnapshot(self: *const Transport) MicrosHistogram.Snapshot {
+        return self.hb_rtt.snapshot();
+    }
+
     /// Whether a raw eraftpb message is a heartbeat / heartbeat-response —
     /// the wire bytes for `MsgHeartbeat` (8) / `MsgHeartbeatResponse` (9).
     /// `msg_type` is eraftpb field 1, a varint, so the encoding is
@@ -185,11 +219,26 @@ pub const Transport = struct {
         return bytes[1] == 8 or bytes[1] == 9;
     }
 
+    /// `MsgHeartbeat` (8) — leader→follower keep-alive (the RTT probe).
+    inline fn isHeartbeatReq(bytes: []const u8) bool {
+        return bytes.len >= 2 and bytes[0] == 0x08 and bytes[1] == 8;
+    }
+
+    /// `MsgHeartbeatResponse` (9) — follower→leader ack (closes the RTT).
+    inline fn isHeartbeatResp(bytes: []const u8) bool {
+        return bytes.len >= 2 and bytes[0] == 0x08 and bytes[1] == 9;
+    }
+
     /// Buffer one outbound message (from `Manager.takeMessages`) for its
     /// destination node, to be coalesced + sent at `flush`. `to` is a raft
     /// node id; a message to self (shouldn't happen) is dropped.
     pub fn queueOut(self: *Transport, to: u64, group_id: u64, epoch: u64, floor: u64, msg: []const u8) void {
         if (to == self.node_id or to == 0 or to > self.cluster_size) return;
+        // Broadcast-time probe: stamp the moment we send a heartbeat to this
+        // peer so the matching response (in `onRecv`) yields the RTT. One
+        // outstanding heartbeat per peer; a later send just overwrites the
+        // stamp (a dropped response is harmless — it won't be matched).
+        if (isHeartbeatReq(msg)) self.hb_sent_ns[to - 1] = nowNs();
         const ob = &self.outbufs[to - 1];
         const a = self.allocator;
         // Roll back to this mark on a partial append: a header without
@@ -251,7 +300,9 @@ pub const Transport = struct {
     /// `payload` is valid only for this call; `stepBatch` reads it before
     /// returning, so the entry pointers into it are safe.
     fn onRecv(from_id: u32, payload: []const u8, ctx: ?*anyopaque) void {
-        _ = from_id; // the sender id is inside each eraftpb message
+        // `from_id` is the raft_net peer id of the SENDER (= its node_id-1) —
+        // used below to close the heartbeat RTT. Stepping still reads each
+        // message's own `from` field; `from_id` only attributes the round-trip.
         const self: *Transport = @ptrCast(@alignCast(ctx.?));
         if (payload.len < 4) return;
         const count = std.mem.readInt(u32, payload[0..4], .little);
@@ -284,6 +335,19 @@ pub const Transport = struct {
             }
             // Real raft traffic wakes a hibernated group; heartbeats do not.
             if (!isHeartbeatLike(msg)) self.woke.append(self.allocator, group_id) catch {};
+
+            // Close the broadcast-time probe: a heartbeat response from `from_id`
+            // pairs with the last heartbeat we sent that peer. Observe the RTT
+            // (µs) and clear the stamp so a duplicate/late response isn't
+            // re-counted against a newer send.
+            if (isHeartbeatResp(msg) and from_id < self.cluster_size) {
+                const sent = self.hb_sent_ns[from_id];
+                if (sent != 0) {
+                    const rtt_ns = nowNs() - sent;
+                    if (rtt_ns > 0) self.hb_rtt.observe(@intCast(@divTrunc(rtt_ns, std.time.ns_per_us)));
+                    self.hb_sent_ns[from_id] = 0;
+                }
+            }
         }
         const stepped = self.manager.stepBatch(self.step_scratch.items);
         // stepBatch skips bad entries silently (unknown group, stale

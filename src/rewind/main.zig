@@ -600,6 +600,19 @@ pub fn main() !void {
     if (std.posix.getenv("REWIND_AUTO_DEMOTE_MS")) |v| {
         if (std.fmt.parseInt(i64, v, 10)) |ms| bridge.node.auto_demote_interval_ns = ms * std.time.ns_per_ms else |_| {}
     }
+    // Raft logical-tick cadence (ms). The wall-clock election timeout is
+    // `election_tick × this` (see node.zig DEFAULT_TICK_NS); the default
+    // preserves the historical ~1ms cadence. Raise it once a soak has measured
+    // the broadcast-time + pause-jitter tail it must clear
+    // (docs/raft-best-practices.md "how to size election/heartbeat").
+    if (std.posix.getenv("REWIND_RAFT_TICK_MS")) |v| {
+        if (std.fmt.parseInt(i64, v, 10)) |ms| {
+            if (ms > 0) {
+                bridge.node.tick_interval_ns = ms * std.time.ns_per_ms;
+                std.log.info("rewind: raft tick interval = {d}ms (election timeout ≈ election_tick × {d}ms)", .{ ms, ms });
+            }
+        } else |_| {}
+    }
     // Boot-time group recovery: re-stand-up the tenant raft groups this node
     // persisted (its node-local manifest) so a restarted node rejoins its
     // groups and catches up to the live state — the leader replicates the
