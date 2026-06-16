@@ -8,11 +8,12 @@
 //!
 //! Header is fixed: `{"alg":"HS256","typ":"JWT"}`.
 //! Payload is `{"exp":<unix_ms>}` for the basic services-token
-//! shape, or `{"exp":<unix_ms>,"caps":["<cap>",...]}` when the token
-//! grants extra cluster-internal capabilities (e.g. `release`,
-//! `admin-kv`) used by `files-server-standalone` to push platform
-//! deploys + config to the worker without holding the operator's
-//! root bearer.
+//! shape, or `{"exp":<unix_ms>,"tenant":"<id>"?,"caps":["<cap>",...]}`
+//! when the token grants cluster-internal capabilities (e.g. `release`,
+//! `admin-kv`, `logs-read`). The optional `tenant` scope confines the
+//! token to one tenant: `verifyWithCapAndTenant` rejects it for any
+//! other tenant, and (crucially) rejects an unscoped token outright —
+//! so an "any authenticated caller" token can't read across tenants.
 //!
 //! The HMAC secret is shared between the worker process (which mints
 //! tokens at `/_system/services-token`) and every standalone service
@@ -31,6 +32,13 @@ pub const Error = error{
     MissingCap,
     UnsupportedAlg,
     InvalidCap,
+    /// Mint: `tenant` contained a character outside `[a-zA-Z0-9_-]`.
+    InvalidTenant,
+    /// Verify: token's `tenant` claim is absent or doesn't match the
+    /// tenant the verifier required. A token minted without a tenant
+    /// scope NEVER satisfies a tenant-scoped verify — closes the
+    /// "any authenticated caller sees any tenant" gap.
+    WrongTenant,
     OutOfMemory,
 };
 
@@ -79,6 +87,13 @@ pub const MintOptions = struct {
     /// matching cap so the receiving worker can authorize without
     /// a separate root bearer.
     caps: []const []const u8 = &.{},
+    /// Optional tenant scope. When set, the token is only valid for
+    /// operations on this tenant — a verifier calling
+    /// `verifyWithCapAndTenant` rejects it for any other tenant.
+    /// Mint enforces `[a-zA-Z0-9_-]` (so the substring-based verify
+    /// needs no JSON unescaping, same as caps). Null = unscoped (the
+    /// legacy "any tenant" shape; a tenant-scoped verify rejects it).
+    tenant: ?[]const u8 = null,
 };
 
 /// Mint a token. Caller frees with `allocator.free`. Output is pure
@@ -98,6 +113,16 @@ pub fn mint(allocator: std.mem.Allocator, secret: []const u8, opts: MintOptions)
             if (!ok) return Error.InvalidCap;
         }
     }
+    if (opts.tenant) |t| {
+        if (t.len == 0 or t.len > 64) return Error.InvalidTenant;
+        for (t) |b| {
+            const ok = (b >= 'a' and b <= 'z') or
+                (b >= 'A' and b <= 'Z') or
+                (b >= '0' and b <= '9') or
+                b == '-' or b == '_';
+            if (!ok) return Error.InvalidTenant;
+        }
+    }
 
     var payload_json = std.ArrayList(u8).empty;
     defer payload_json.deinit(allocator);
@@ -105,6 +130,11 @@ pub fn mint(allocator: std.mem.Allocator, secret: []const u8, opts: MintOptions)
     var exp_buf: [24]u8 = undefined;
     const exp_str = std.fmt.bufPrint(&exp_buf, "{d}", .{opts.exp_ms}) catch unreachable;
     payload_json.appendSlice(allocator, exp_str) catch return Error.OutOfMemory;
+    if (opts.tenant) |t| {
+        payload_json.appendSlice(allocator, ",\"tenant\":\"") catch return Error.OutOfMemory;
+        payload_json.appendSlice(allocator, t) catch return Error.OutOfMemory;
+        payload_json.append(allocator, '"') catch return Error.OutOfMemory;
+    }
     if (opts.caps.len > 0) {
         payload_json.appendSlice(allocator, ",\"caps\":[") catch return Error.OutOfMemory;
         for (opts.caps, 0..) |c, i| {
@@ -147,7 +177,7 @@ pub fn mint(allocator: std.mem.Allocator, secret: []const u8, opts: MintOptions)
 /// expiry check is timing-trivial. Does NOT check capabilities — use
 /// `verifyWithCap` when a specific cap is required.
 pub fn verify(secret: []const u8, token: []const u8, now_ms: i64) Error!Payload {
-    _ = try verifyAndDecodePayload(secret, token, now_ms, null);
+    _ = try verifyAndDecodePayload(secret, token, now_ms, null, null);
     // verifyAndDecodePayload does the work; reuse its result.
     return verifyOnly(secret, token, now_ms);
 }
@@ -157,7 +187,24 @@ pub fn verify(secret: []const u8, token: []const u8, now_ms: i64) Error!Payload 
 /// `required`. Use this on the worker side for `/_system/release`
 /// and `/_system/admin-kv`.
 pub fn verifyWithCap(secret: []const u8, token: []const u8, now_ms: i64, required: []const u8) Error!Payload {
-    return verifyAndDecodePayload(secret, token, now_ms, required);
+    return verifyAndDecodePayload(secret, token, now_ms, required, null);
+}
+
+/// Verify + require both a capability AND a tenant scope. Returns the
+/// payload on success. `Error.MissingCap` if the cap is absent;
+/// `Error.WrongTenant` if the token's `tenant` claim is absent or
+/// doesn't equal `tenant`. This is the tenant-scoped gate: a token
+/// minted for tenant A (or with no tenant at all) cannot act on tenant
+/// B. Use it where a service must confine a caller to one tenant
+/// (e.g. log query scoped to the tenant in the request path).
+pub fn verifyWithCapAndTenant(
+    secret: []const u8,
+    token: []const u8,
+    now_ms: i64,
+    required: []const u8,
+    tenant: []const u8,
+) Error!Payload {
+    return verifyAndDecodePayload(secret, token, now_ms, required, tenant);
 }
 
 /// Sign an arbitrary payload JSON. Used by callers that need a richer
@@ -293,6 +340,7 @@ fn verifyAndDecodePayload(
     token: []const u8,
     now_ms: i64,
     required_cap: ?[]const u8,
+    required_tenant: ?[]const u8,
 ) Error!Payload {
     const first_dot = std.mem.indexOfScalar(u8, token, '.') orelse return Error.Malformed;
     const header_b64 = token[0..first_dot];
@@ -332,6 +380,9 @@ fn verifyAndDecodePayload(
     if (required_cap) |cap| {
         if (!hasCap(json, cap)) return Error.MissingCap;
     }
+    if (required_tenant) |t| {
+        if (!hasTenant(json, t)) return Error.WrongTenant;
+    }
     return .{ .exp_ms = exp_ms };
 }
 
@@ -370,6 +421,21 @@ fn hasCap(json: []const u8, cap: []const u8) bool {
     @memcpy(needle_buf[1 .. 1 + cap.len], cap);
     needle_buf[1 + cap.len] = '"';
     return std.mem.indexOf(u8, list, needle_buf[0 .. 2 + cap.len]) != null;
+}
+
+/// Substring-search the payload JSON for `"tenant":"<expected>"`. The
+/// trailing quote delimits, so tenant `acme` does not match a token
+/// scoped to `acme-prod`. Tenant is validated to `[a-zA-Z0-9_-]` at
+/// mint, so the JSON-encoded form is just `"tenant":"<id>"` — no
+/// escaping to undo. A token with no `tenant` field never matches.
+fn hasTenant(json: []const u8, expected: []const u8) bool {
+    if (expected.len == 0 or expected.len > 64) return false;
+    const prefix = "\"tenant\":\"";
+    var needle_buf: [prefix.len + 64 + 1]u8 = undefined;
+    @memcpy(needle_buf[0..prefix.len], prefix);
+    @memcpy(needle_buf[prefix.len..][0..expected.len], expected);
+    needle_buf[prefix.len + expected.len] = '"';
+    return std.mem.indexOf(u8, json, needle_buf[0 .. prefix.len + expected.len + 1]) != null;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -496,4 +562,77 @@ test "mint rejects caps with invalid chars" {
         .exp_ms = 1_000,
         .caps = &.{""},
     }));
+}
+
+test "tenant-scoped token: verifyWithCapAndTenant accepts matching cap + tenant" {
+    const a = testing.allocator;
+    const tok = try mint(a, "k", .{
+        .exp_ms = 1_000_000,
+        .caps = &.{"logs-read"},
+        .tenant = "acme-prod",
+    });
+    defer a.free(tok);
+    const p = try verifyWithCapAndTenant("k", tok, 0, "logs-read", "acme-prod");
+    try testing.expectEqual(@as(i64, 1_000_000), p.exp_ms);
+}
+
+test "tenant-scoped token: rejects a different tenant" {
+    const a = testing.allocator;
+    const tok = try mint(a, "k", .{
+        .exp_ms = 1_000_000,
+        .caps = &.{"logs-read"},
+        .tenant = "acme-prod",
+    });
+    defer a.free(tok);
+    try testing.expectError(Error.WrongTenant, verifyWithCapAndTenant("k", tok, 0, "logs-read", "globex-prod"));
+}
+
+test "tenant-scoped verify rejects a token with NO tenant claim (the gap)" {
+    // The core fix: an unscoped (legacy "any tenant") token must never
+    // satisfy a tenant-scoped verify, or the cross-tenant read gap stays.
+    const a = testing.allocator;
+    const tok = try mint(a, "k", .{ .exp_ms = 1_000_000, .caps = &.{"logs-read"} });
+    defer a.free(tok);
+    try testing.expectError(Error.WrongTenant, verifyWithCapAndTenant("k", tok, 0, "logs-read", "acme-prod"));
+}
+
+test "tenant-scoped verify still enforces the cap" {
+    const a = testing.allocator;
+    const tok = try mint(a, "k", .{ .exp_ms = 1_000_000, .caps = &.{"admin-kv"}, .tenant = "acme" });
+    defer a.free(tok);
+    // right tenant, wrong cap → MissingCap (cap checked before tenant)
+    try testing.expectError(Error.MissingCap, verifyWithCapAndTenant("k", tok, 0, "logs-read", "acme"));
+}
+
+test "hasTenant delimits on quotes (acme != acme-prod)" {
+    const a = testing.allocator;
+    const tok = try mint(a, "k", .{ .exp_ms = 1_000_000, .caps = &.{"logs-read"}, .tenant = "acme-prod" });
+    defer a.free(tok);
+    // a verify scoped to "acme" must NOT match a token scoped to "acme-prod"
+    try testing.expectError(Error.WrongTenant, verifyWithCapAndTenant("k", tok, 0, "logs-read", "acme"));
+    _ = try verifyWithCapAndTenant("k", tok, 0, "logs-read", "acme-prod");
+}
+
+test "system tenant ids (underscores) are valid tenant scopes" {
+    const a = testing.allocator;
+    const tok = try mint(a, "k", .{ .exp_ms = 1_000_000, .caps = &.{"admin-kv"}, .tenant = "__admin__" });
+    defer a.free(tok);
+    _ = try verifyWithCapAndTenant("k", tok, 0, "admin-kv", "__admin__");
+}
+
+test "mint rejects tenant with invalid chars" {
+    const a = testing.allocator;
+    try testing.expectError(Error.InvalidTenant, mint(a, "k", .{ .exp_ms = 1_000, .tenant = "has space" }));
+    try testing.expectError(Error.InvalidTenant, mint(a, "k", .{ .exp_ms = 1_000, .tenant = "with\"quote" }));
+    try testing.expectError(Error.InvalidTenant, mint(a, "k", .{ .exp_ms = 1_000, .tenant = "" }));
+}
+
+test "tenant scope is back-compatible: plain verify + verifyWithCap ignore it" {
+    const a = testing.allocator;
+    const tok = try mint(a, "k", .{ .exp_ms = 1_000_000, .caps = &.{"logs-read"}, .tenant = "acme" });
+    defer a.free(tok);
+    // a tenant-unaware verifier still works on a tenant-scoped token
+    const p = try verify("k", tok, 0);
+    try testing.expectEqual(@as(i64, 1_000_000), p.exp_ms);
+    _ = try verifyWithCap("k", tok, 0, "logs-read");
 }

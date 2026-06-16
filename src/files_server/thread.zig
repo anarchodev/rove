@@ -311,8 +311,9 @@ fn handleOne(
             const msg = switch (err) {
                 jwt.Error.Expired => "token expired\n",
                 jwt.Error.BadSignature => "bad signature\n",
-                jwt.Error.Malformed, jwt.Error.UnsupportedAlg => "malformed token\n",
+                jwt.Error.Malformed, jwt.Error.UnsupportedAlg, jwt.Error.InvalidTenant => "malformed token\n",
                 jwt.Error.MissingCap, jwt.Error.InvalidCap => "missing required capability\n",
+                jwt.Error.WrongTenant => "token not valid for this tenant\n",
                 jwt.Error.OutOfMemory => "out of memory\n",
             };
             try setResponse(server, cfg, ent, sid, sess, 401, null, msg);
