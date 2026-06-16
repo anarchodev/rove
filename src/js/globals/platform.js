@@ -102,9 +102,13 @@
     compile(files, opts) {
       opts = opts || {};
       const body = JSON.stringify({ scope: opts.scope, files });
+      // `opts.ctx` threads forward across the compile re-entry — it's echoed
+      // in the result as `request.ctx.app` (the bound resume otherwise only
+      // surfaces the compile output). Use it to carry e.g. the deploy's
+      // target + composed static entries into the onCompiled handler.
       return sysOn.fetch(
         "http://rove-compile.internal/",
-        { method: "POST", body },
+        { method: "POST", body, ctx: opts.ctx },
         { to: opts.name || "onFetchResult" },
       );
     },
