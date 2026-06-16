@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is rove
 
-Rove is a Zig systems library for building distributed serverless worker infrastructure. It provides content-addressed code deployment, a QuickJS-based JS runtime, an HTTP/2 server, and a distributed KV store with Raft consensus. Third-party dependencies are **pinned and fetched at build time** — Zig/C packages (`arenajs`, `kvexp`, and the V2 engine `raft-rs-zig`) via `build.zig.zon`; the V2 raft engine's Rust crates via Cargo. The first build needs network. This replaced the former vendor-everything / offline-build mandate when the V2 raft-rs Rust closure proved too large to vendor (see `docs/decisions.md` §10.11). **The V1→V2 cutover is done (branch `v2`):** the V1 product binary `loop46`, the willemt-raft engine (`vendor/raft/` + `src/kv/{cluster,raft_node,raft_log,…}.zig`), and the sqlite raft log are all retired. The V2 worker is `rewind` (`src/rewind/main.zig`); per-tenant consensus is the `Bridge` (`src/consensus/bridge.zig`) + raft-rs. There are no vendored deps left.
+Rove is a Zig systems library for building distributed serverless worker infrastructure. It provides content-addressed code deployment, a QuickJS-based JS runtime, an HTTP/2 server, and a distributed KV store with Raft consensus. Third-party dependencies are **pinned and fetched at build time** — Zig/C packages (`arenajs`, `kvexp`, and the V2 engine `raft-rs-zig`) via `build.zig.zon`; the V2 raft engine's Rust crates via Cargo. The first build needs network. This replaced the former vendor-everything / offline-build mandate when the V2 raft-rs Rust closure proved too large to vendor (see `docs/decisions.md` §10.11). **The V1→V2 cutover is done (branch `v2`):** the V1 product binary `loop46`, the willemt-raft engine (`vendor/raft/` + `src/kv/{cluster,raft_node,raft_log,…}.zig`), and the sqlite raft log are all retired. The V2 worker is `rewind-worker` (`src/rewind/main.zig`); per-tenant consensus is the `Bridge` (`src/consensus/bridge.zig`) + raft-rs. There are no vendored deps left.
 
 ## Product direction
 
@@ -16,7 +16,7 @@ Rove is a Zig systems library for building distributed serverless worker infrast
 zig build              # Build all modules and examples
 zig build test         # Run all unit tests (inline Zig tests across all modules)
                        # — fixed at the V1 cutover (was broken by frozen V1 modules)
-zig build rewind       # Build the V2 worker binary (src/rewind/main.zig)
+zig build rewind-worker # Build the V2 worker binary (src/rewind/main.zig)
 zig build rewind-cp    # Build the V2 control plane (directory + provisioning)
 zig build rewind-front # Build the V2 stateless front door (Host→cluster proxy)
 zig build files-server-v2  # Build the cluster-free V2 deploy publisher
@@ -26,11 +26,11 @@ zig build h2-echo-server  # Run the HTTP/2 echo server example
 ```
 
 Requires Zig 0.15.0+ and a Rust toolchain (pinned by `rust-toolchain.toml`) for
-the consensus-linked steps — anything that pulls in the bridge (`rewind`,
+the consensus-linked steps — anything that pulls in the bridge (`rewind-worker`,
 `rewind-cp`, `v2-test`, `js-v2`, the aggregate `test` via rove-js) builds
 raft-rs-zig's Rust FFI via cargo; the bare `zig build` install step does not.
 System libraries: nghttp2, OpenSSL (ssl + crypto), libcurl, liblmdb (via
-kvexp), zlib; SQLite3 only for the log-server standalone binary and its
+kvexp), zlib; SQLite3 only for the `rewind-logs` binary and its
 `log-server-test` step.
 
 ## Smoke tests
@@ -84,11 +84,11 @@ consensus (src/consensus/, V2): node.zig (per-tenant raft-rs groups, pump,
 cp-directory (src/cp/directory.zig): tenant→cluster routing, backed by a
            directory raft group via the bridge
 
-binaries:  rewind        (src/rewind/)  the worker — rove-js on the bridge
+binaries:  rewind-worker (src/rewind/)  the worker — rove-js on the bridge
            rewind-cp     (src/cp/)      replicated directory + provisioning + moves
            rewind-front  (src/front/)   stateless Host→cluster proxy — no raft state
            files-server-v2     (src/files_server/main.zig)  deploy publisher
-           log-server-standalone (src/log_server/main.zig)  log query surface
+           rewind-logs   (src/log_server/main.zig)  log query surface
 ```
 
 **`raft-kv` is the spine-free KV facade** (`src/kv/kvlimbs.zig`) — the
@@ -138,7 +138,7 @@ Retired type bytes — the decoder rejects each loudly, so any stale raft-log en
 
 Blob bytes (source, bytecode, static assets, log/tape batches) are **not** carried through raft envelopes — a 1MB static blob per envelope would blow the raft log size/latency budget. They live in S3-shaped object storage: `S3BlobStore` in `rove-blob` (path-style, SigV4-signed; tested against OVH, works against AWS / MinIO / R2 / B2). There is no filesystem backend — production is multi-node and every node must read the same content-addressed store, so S3 is mandatory even single-node (smokes source `.env` first).
 
-Config is env-driven via `rove-blob`'s `env.zig` (`S3_ENDPOINT` / `S3_REGION` / `S3_BUCKET` / `S3_KEY_PREFIX_BASE` / `S3_USE_TLS` / `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), read identically by `rewind`, `rewind-cp`, and the log-server so every per-tenant backend opens against the same store. Per-tenant scoping is the key prefix `{key_prefix_base}{instance_id}/{file-blobs|log-blobs}/`, so leader and followers hit identical keys.
+Config is env-driven via `rove-blob`'s `env.zig` (`S3_ENDPOINT` / `S3_REGION` / `S3_BUCKET` / `S3_KEY_PREFIX_BASE` / `S3_USE_TLS` / `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), read identically by `rewind-worker`, `rewind-cp`, and the log-server so every per-tenant backend opens against the same store. Per-tenant scoping is the key prefix `{key_prefix_base}{instance_id}/{file-blobs|log-blobs}/`, so leader and followers hit identical keys.
 
 Raft replicates the manifest (the `file/{path}` key → `{hash, kind, content_type}` pointer); the shared backend serves the bytes referenced by those hashes. Followers apply the manifest ops; readers fetch the blob bytes from S3.
 
@@ -147,7 +147,7 @@ Raft replicates the manifest (the `file/{path}` key → `{hash, kind, content_ty
 Pins live in `build.zig.zon` (Zig/C packages) and each Rust crate's `Cargo.lock`. The first `zig build` fetches; subsequent builds use the Zig package cache. To bump a dep, re-run `zig fetch --save=<name> git+https://…#<commit>`.
 - **arenajs** (`anarchodev/arenajs`) — fork of quickjs-ng with a dual bump arena (base + per-request); per-request reset is one cursor write instead of memcpy. Replaces the previously-vendored quickjs-ng + deterministic-init patch. Its own `build.zig` compiles the quickjs/arena C sources into a static lib; rove links it.
 - **kvexp** (`anarchodev/kvexp`) — first-party pure-Zig multi-tenant embedded KV (LMDB-backed) used as the per-tenant state engine under `TrackedTxn`'s speculative overlay.
-- **raft-rs-zig** (`anarchodev/raft-rs-zig`) — V2 multi-raft engine (TiKV raft-rs, one group per tenant) behind a Zig wrapper; its `build.zig` runs `cargo build` for the Rust FFI. Linked by every consensus-shaped step (`rewind`, `rewind-cp`, `v2-test`, `js-v2`, the aggregate `test` via rove-js's bridge import); the bare `zig build` install step never invokes cargo.
+- **raft-rs-zig** (`anarchodev/raft-rs-zig`) — V2 multi-raft engine (TiKV raft-rs, one group per tenant) behind a Zig wrapper; its `build.zig` runs `cargo build` for the Rust FFI. Linked by every consensus-shaped step (`rewind-worker`, `rewind-cp`, `v2-test`, `js-v2`, the aggregate `test` via rove-js's bridge import); the bare `zig build` install step never invokes cargo.
 - ~~**willemt/raft**~~ — V1 consensus library, **deleted at the V2 cutover** (along with `vendor/` entirely). V2 consensus is `raft-rs-zig` (fetched).
 
 ## Conventions

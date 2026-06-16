@@ -37,7 +37,7 @@ to mirror `three_node_smoke`, orthogonal to handler serving.)
     ⭐ a fresh write commits on the surviving 2-node quorum + reads back
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
-Build: `zig build rewind rewind-cp rewind-front files-server-v2`
+Build: `zig build rewind-worker rewind-cp rewind-front files-server-v2`
 """
 
 from __future__ import annotations

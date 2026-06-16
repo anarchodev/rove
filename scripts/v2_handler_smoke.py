@@ -22,7 +22,7 @@ Flow:
      the handler's body. Proves: CP provision → publish → load → serve.
 
 Build first:
-  zig build rewind && zig build rewind-cp && zig build rewind-front \
+  zig build rewind-worker && zig build rewind-cp && zig build rewind-front \
     && zig build files-server-v2
 Needs S3 env (the V2 blob backend is S3-only): `set -a; . ./.env; set +a` first.
 """
@@ -44,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from v2_topology import spawn_cp, spawn_front, await_line, CP_BIN, FRONT_BIN  # noqa: E402
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin")
-REWIND = os.path.join(BINDIR, "rewind")
+REWIND = os.path.join(BINDIR, "rewind-worker")
 FILES_V2 = os.path.join(BINDIR, "files-server-v2")
 
 PNODE = int(os.environ.get("NODE_PORT", "18251"))
@@ -218,7 +218,7 @@ def main():
     for b in (REWIND, CP_BIN, FRONT_BIN, FILES_V2):
         if not os.path.exists(b):
             raise SystemExit(
-                f"{b} not found — run `zig build rewind && zig build rewind-cp "
+                f"{b} not found — run `zig build rewind-worker && zig build rewind-cp "
                 f"&& zig build rewind-front && zig build files-server-v2`")
     if not os.environ.get("S3_ENDPOINT"):
         raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")

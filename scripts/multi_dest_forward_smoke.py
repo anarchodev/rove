@@ -21,7 +21,7 @@ dual-write walks it, re-aiming past 421s (non-leader dest nodes). This proves:
                        raft peers :19521/22/23
 
 Run S3-first:  `set -a; . ./.env; set +a; python3 scripts/multi_dest_forward_smoke.py`
-Build first:   `zig build rewind && zig build rewind-cp`
+Build first:   `zig build rewind-worker && zig build rewind-cp`
 """
 
 import os
@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from v2_topology import spawn_cp, await_line, CP_BIN
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin")
-REWIND = os.path.join(BINDIR, "rewind")
+REWIND = os.path.join(BINDIR, "rewind-worker")
 
 PA = 19510                       # cluster-1 (source)
 P2 = [19511, 19512, 19513]       # cluster-2 HTTP ports
@@ -169,7 +169,7 @@ def stop_all():
 def main():
     for b in (REWIND, CP_BIN):
         if not os.path.exists(b):
-            raise SystemExit(f"{b} missing — `zig build rewind && zig build rewind-cp`")
+            raise SystemExit(f"{b} missing — `zig build rewind-worker && zig build rewind-cp`")
     if not os.environ.get("S3_ENDPOINT"):
         raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
 

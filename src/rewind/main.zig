@@ -599,7 +599,7 @@ pub fn main() !void {
     try bridge.startPump();
 
     // Per-tenant request-log / tape batches → S3. The only tape-query surface,
-    // `log-server-standalone`, reads S3-only (its indexer LISTs + serves
+    // `rewind-logs`, reads S3-only (its indexer LISTs + serves
     // `/v1/{tenant}/list` + `/show`), so a local `FsBatchStore` would be
     // unreadable by it — writer (fs) and reader (S3) never met, which is why
     // captured tapes could never be queried back out for replay. Build the

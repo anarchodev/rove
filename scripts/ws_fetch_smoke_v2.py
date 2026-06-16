@@ -14,7 +14,7 @@ Asserts:
   2. the result resumes onUpstream → "fetched:200:hello-upstream" frame
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
-Binaries: `zig build rewind rewind-cp rewind-front files-server-v2`.
+Binaries: `zig build rewind-worker rewind-cp rewind-front files-server-v2`.
 """
 
 from __future__ import annotations

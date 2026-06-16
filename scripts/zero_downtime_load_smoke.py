@@ -19,7 +19,7 @@ flip→evict window). The exit criteria:
     cluster-B  :19032   (destination)
 
 Requires S3 env — `set -a; . ./.env; set +a` first.
-Build:  `zig build rewind && zig build rewind-cp`
+Build:  `zig build rewind-worker && zig build rewind-cp`
 """
 
 import json
@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from v2_topology import spawn_cp, CP_BIN
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin")
-REWIND = os.path.join(BINDIR, "rewind")
+REWIND = os.path.join(BINDIR, "rewind-worker")
 
 PCP, PA, PB = 19030, 19031, 19032
 SECRET = "rewindmovesecretpadding0123456789abcdef0"
@@ -166,7 +166,7 @@ def stop_all():
 def main():
     for b in (REWIND, CP_BIN):
         if not os.path.exists(b):
-            raise SystemExit(f"{b} missing — `zig build rewind && zig build rewind-cp`")
+            raise SystemExit(f"{b} missing — `zig build rewind-worker && zig build rewind-cp`")
     if not os.environ.get("S3_ENDPOINT"):
         raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
 

@@ -26,7 +26,7 @@ Asserts:
   7. abrupt TCP drop (no Close) → stale-chain sweep fires `onDisconnect`
 
 Needs S3 env (V2 blob backend is S3-only): `set -a; . ./.env; set +a` first.
-Binaries: `zig build rewind rewind-cp rewind-front files-server-v2`.
+Binaries: `zig build rewind-worker rewind-cp rewind-front files-server-v2`.
 """
 
 from __future__ import annotations

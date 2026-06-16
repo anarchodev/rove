@@ -1,4 +1,4 @@
-//! `log-server-standalone` — the request-log query API.
+//! `rewind-logs` — the request-log query API.
 //!
 //! The operator runs this binary alongside the `rewind` worker and
 //! points the worker at it via `--log-public-base`. Both processes
@@ -23,7 +23,7 @@
 //!                                when BLOB_BACKEND=s3 (default ``).
 //!
 //! Usage:
-//!   log-server-standalone --data-dir <path> --listen <host:port> \
+//!   rewind-logs --data-dir <path> --listen <host:port> \
 //!                         [--tls-cert <path> --tls-key <path>] \
 //!                         [--cors-origin <origin>] \
 //!                         [--index-db <path>] \
@@ -65,7 +65,7 @@ const Cli = struct {
 
 fn usage(stderr: *std.fs.File.Writer) !void {
     try stderr.interface.writeAll(
-        \\usage: log-server-standalone --data-dir <path>
+        \\usage: rewind-logs --data-dir <path>
         \\                             --listen <host:port>
         \\                             [--tls-cert <path> --tls-key <path>]
         \\                             [--cors-origin <origin>]
@@ -265,7 +265,7 @@ pub fn main() !void {
     const scheme: []const u8 = if (tls_config != null) "https" else "http";
     var stdout_buf: [128]u8 = undefined;
     var sw = std.fs.File.stdout().writer(&stdout_buf);
-    try sw.interface.print("log-server-standalone listening on {s}://{s} (port {d})\n", .{
+    try sw.interface.print("rewind-logs listening on {s}://{s} (port {d})\n", .{
         scheme, cli.listen, handle.port,
     });
     try sw.interface.flush();

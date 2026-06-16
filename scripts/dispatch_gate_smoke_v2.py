@@ -22,7 +22,7 @@ the internal `/_system/v2-kv` endpoint, which short-circuits before the gate.
       reads and writes)
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
-Build: `zig build rewind rewind-cp rewind-front files-server-v2`
+Build: `zig build rewind-worker rewind-cp rewind-front files-server-v2`
 """
 
 from __future__ import annotations

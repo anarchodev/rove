@@ -28,7 +28,7 @@ BOOT-TIME GROUP RECOVERY (the engine path this asserts):
   RESTARTS, rejoins its `acme` group, and catches up to the post-kill value.
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
-Build: `zig build rewind rewind-cp rewind-front files-server-v2`
+Build: `zig build rewind-worker rewind-cp rewind-front files-server-v2`
 """
 
 from __future__ import annotations

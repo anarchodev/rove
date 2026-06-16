@@ -42,9 +42,9 @@ from v2_topology import spawn_cp, spawn_front, await_ready, CP_BIN, FRONT_BIN  #
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BIN_DIR = REPO_ROOT / "zig-out" / "bin"
-REWIND = BIN_DIR / "rewind"
+REWIND = BIN_DIR / "rewind-worker"
 FILES_V2 = BIN_DIR / "files-server-v2"
-LOG_SERVER = BIN_DIR / "log-server-standalone"
+LOG_SERVER = BIN_DIR / "rewind-logs"
 
 # Fixed shared secrets (smokes don't need rotation; these match the rewind
 # defaults / v2_handler_smoke so behavior is reproducible).
@@ -194,7 +194,7 @@ class V2Cluster:
             raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
         for b in (REWIND, CP_BIN, FRONT_BIN, FILES_V2):
             if not Path(b).exists():
-                raise SystemExit(f"{b} missing — `zig build rewind rewind-cp "
+                raise SystemExit(f"{b} missing — `zig build rewind-worker rewind-cp "
                                  f"rewind-front files-server-v2`")
         base = _free_base(http_base)
         rbase = _free_base(raft_base)
@@ -250,7 +250,7 @@ class V2Cluster:
         env["S3_KEY_PREFIX_BASE"] = self.s3_prefix
         # Scope this cluster's request-log/tape batches under the same per-run
         # S3 prefix as its blobs (the shared bucket hosts every smoke run), so
-        # a co-spawned `log-server-standalone` reads exactly this cluster's
+        # a co-spawned `rewind-logs` reads exactly this cluster's
         # batches. rewind defaults the log key prefix to LOG_S3_KEY_PREFIX.
         env["LOG_S3_KEY_PREFIX"] = self.s3_prefix
         if self.unsafe_outbound:
@@ -331,10 +331,10 @@ class V2Cluster:
     def log_url(self) -> str:
         return f"http://127.0.0.1:{self.log_port}"
 
-    # ── log-server-standalone (tape / request-log query surface) ───────
+    # ── rewind-logs (tape / request-log query surface) ───────
     def spawn_log_server(self, *, poll_interval_ms: int = 200,
                          startup_timeout_s: float = 5.0):
-        """Spawn `log-server-standalone` (h2c) reading THIS cluster's request-
+        """Spawn `rewind-logs` (h2c) reading THIS cluster's request-
         log / tape batches from S3. It shares the cluster's S3 connection +
         per-run `LOG_S3_KEY_PREFIX` (so it sees exactly the batches the rewind
         workers flushed) and the services JWT secret (auth = a valid signed

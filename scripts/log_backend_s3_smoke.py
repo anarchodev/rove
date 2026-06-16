@@ -56,7 +56,7 @@ def main() -> int:
     )
 
     # Manually spawn log-server pointing at our log_port=0 (auto-bind).
-    bin_ls = BIN_DIR / "log-server-standalone"
+    bin_ls = BIN_DIR / "rewind-logs"
     ls_log = Path("/tmp/lbs-server.out")
     ls_log.write_text("")
     ls_proc = subprocess.Popen(
