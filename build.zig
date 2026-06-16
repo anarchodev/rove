@@ -483,6 +483,10 @@ pub fn build(b: *std.Build) void {
         // a Zig rebuild for trivial copy edits.
         .{ .name = "starter_index_mjs", .path = "src/js/starter/index.mjs" },
         .{ .name = "starter_static_index_html", .path = "src/js/starter/_static/index.html" },
+        // The genesis __admin__ deploy app (rewind-cli-plan §4.1 (f)) — baked
+        // so a virgin cluster self-bootstraps deploy capability with no
+        // external push; the full admin is then published THROUGH it.
+        .{ .name = "genesis_admin_mjs", .path = "src/js/starter/genesis_admin.mjs" },
     };
     for (js_runtime_files) |f| {
         js_mod.addAnonymousImport(f.name, .{

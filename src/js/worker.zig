@@ -2258,6 +2258,80 @@ pub fn Worker(comptime opts: Options) type {
             }
         }
 
+        /// Genesis (rewind-cli-plan §4.1 (f)): deploy the BAKED `__admin__`
+        /// deploy app iff `__admin__` has no deployment yet — so a virgin
+        /// cluster self-bootstraps deploy capability with no external push, and
+        /// the full admin is then published THROUGH the app. Driven from the
+        /// worker poll loop (gated by a one-shot flag), NOT the promotion edge:
+        /// a single-node `__admin__` group is born leader (no follower→leader
+        /// edge), so we gate on an explicit `isLeaderOf` check instead.
+        ///
+        /// Returns true once `__admin__` HAS a deployment (genesis or the full
+        /// admin) — the caller stops polling. Returns false to retry (group not
+        /// formed / not leader yet). Idempotent + never clobbers a real
+        /// deployment: the `_deploy/current` check (read from the speculative
+        /// overlay) settles it once anything is deployed. No dispatch batch
+        /// here, so it commits + proposes directly (like `handleRelease`).
+        pub fn ensureGenesisAdmin(self: *Self) bool {
+            const a = self.allocator;
+            const inst = (self.node.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch return false) orelse return false;
+            if (inst.kv.get("_deploy/current")) |cur| {
+                a.free(cur);
+                return true; // already deployed (genesis ran, or the full admin) — done
+            } else |_| {}
+            // Only the leader of __admin__'s group deploys genesis. Group not
+            // formed yet, or we're a follower → retry on a later tick.
+            const gid = self.raft.gidForTenant(tenant_mod.ADMIN_INSTANCE_ID) orelse return false;
+            if (!self.raft.isLeaderOf(gid)) return false;
+            const compile_fn = self.compile_fn orelse return false;
+
+            var release_ws = kv_mod.WriteSet.init(a);
+            defer release_ws.deinit();
+            const dep_id = starter.deployGenesisAdminContent(
+                a,
+                inst.dir,
+                inst.id,
+                self.node.blob_backend_cfg,
+                compile_fn,
+                self.compile_ctx,
+                &release_ws,
+            ) catch |err| {
+                std.log.warn("genesis-admin: stage failed: {s}", .{@errorName(err)});
+                return false;
+            };
+
+            // Speculative-commit `_deploy/current` locally (makes the idempotency
+            // check above true immediately) + propose envelope-0 so followers
+            // see it. We lead __admin__'s group (checked above), so propose lands.
+            var txn = inst.kv.beginTrackedImmediate() catch |err| {
+                std.log.warn("genesis-admin: txn open failed: {s}", .{@errorName(err)});
+                return false;
+            };
+            for (release_ws.ops.items) |op| switch (op) {
+                .put => |p| txn.put(p.key, p.value) catch {
+                    txn.rollback() catch {};
+                    return false;
+                },
+                .delete => |d| txn.delete(d.key) catch {
+                    txn.rollback() catch {};
+                    return false;
+                },
+            };
+            txn.commit() catch |err| {
+                std.log.warn("genesis-admin: commit failed: {s}", .{@errorName(err)});
+                return false;
+            };
+            _ = raft_propose.proposeWriteSet(self, &release_ws, inst.id, "") catch |err| {
+                std.log.warn("genesis-admin: propose failed: {s}", .{@errorName(err)});
+                return false;
+            };
+            std.log.info("genesis-admin: deployed baked deploy app → __admin__ dep_id={x:0>16}", .{dep_id});
+            if (self.node.deploy.deployment_loader) |loader| {
+                loader.enqueue(inst.id, dep_id) catch {};
+            }
+            return true;
+        }
+
         /// Trampoline for `platform.releases.publish(tenant_id,
         /// dep_id)`. Stamps `_deploy/current = hex(dep_id)` on the
         /// target tenant's app.db (one-shot kvexp speculative
