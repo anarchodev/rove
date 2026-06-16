@@ -23,7 +23,6 @@ const bodies_mod = @import("rove-bodies");
 const jwt = @import("rove-jwt");
 const tenant_mod = @import("rove-tenant");
 const blob_mod = @import("rove-blob");
-const files_server_mod = @import("rove-files-server");
 const config_mirror = @import("config_mirror.zig");
 const effect_mod = @import("effect/root.zig");
 

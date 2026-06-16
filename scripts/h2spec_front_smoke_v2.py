@@ -24,7 +24,7 @@ need. (A bare IP `:authority` would 404 at the worker: no suffix, no alias.)
 
 Usage:
     set -a; . ./.env; set +a            # S3 env (V2 has no fs blob backend)
-    zig build rewind-worker rewind-cp rewind-front files-server-v2
+    zig build rewind-worker rewind-cp rewind-front
     python3 scripts/h2spec_front_smoke_v2.py                 # full suite
     python3 scripts/h2spec_front_smoke_v2.py http2/6.8       # just GOAWAY
     python3 scripts/h2spec_front_smoke_v2.py http2/5.1 http2/6.8 generic/4

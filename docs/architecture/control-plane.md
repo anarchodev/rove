@@ -173,7 +173,7 @@ lost (decisions.md §10.5).
 - **ACME renewal** (timer-driven, expiry-aware reissue) is the tracked follow-up
   in `auth-and-domains.md` (leader-elected issuance itself is shipped).
 - **Plan-enforcement test follow-ups** (non-blocking; the deployed-handler e2e
-  and 429 halves are closed by `scripts/v2_handler_smoke.py` +
+  and 429 halves are closed by `scripts/ctl_smoke_v2.py` +
   `rate_limit_smoke_v2.py`): a `413` body-gate e2e smoke, and wiring the smoke
   topology's log-server `cp_url` so the retention clamp is exercised
   end-to-end.
