@@ -297,22 +297,37 @@ deploy from the primitives, returns the dep_id. Plus the bug-class fix:
 `worker.tryDoorFetch` is the ONE trusted-internal-door partition across all
 three fetch-submit sites.
 
-### 4.2 End-state — two coexisting deploy paths (NOT a route-narrow)
+### 4.2 End-state — one production path + a break-glass hatch
 
 The original §4.1 (f) said "narrow the Zig `/_system/deploy` to system-tenant
-bootstrap." On building it out, the cleaner end-state is **coexistence**, not a
-narrow:
+bootstrap." Genesis (the baked `__admin__` deploy app, auto-deployed on
+leadership — `worker.ensureGenesisAdmin`) changes the calculus and gives the
+clean end-state:
 
-- **Composed JS deploy (the product/customer surface)** — the standing
-  `__admin__` deploy app. Request-driven, composed from `platform.*`, runs on
-  the same surface customers use. The dashboard (`web/admin`) POSTs bundles
-  here; it's the dogfooding path.
-- **Zig `/_system/deploy` (the operator/bootstrap/break-glass substrate)** —
-  stays. It bootstraps the system tenants (incl. the deploy app itself onto
-  `__admin__` — the chicken-and-egg), backs the smoke harness's
-  `deploy_handlers` (which legitimately deploys *customer* tenants in ~50
-  tests), and is the operator break-glass (`publish_tenant.py` stays on it —
-  it's the operator CLI, not the product surface).
+- **The composed JS deploy app is the ONE production / customer deploy
+  mechanism.** It runs on `__admin__`, composes deploys from `platform.*`, and
+  (because `__admin__` can deploy a new `__admin__`) self-hosts *everything*
+  after genesis: customer tenants, `__replay__`/`__auth__`, and even its own
+  updates. The dashboard POSTs bundles here.
+- **Genesis is native-baked, NOT the route.** A virgin cluster auto-deploys the
+  embedded minimal deploy app (`deployBakedBundle`); the full admin is then
+  published THROUGH it. So the route plays no part in normal bring-up.
+- **The Zig `/_system/deploy` route is the BREAK-GLASS hatch** — root-gated,
+  not customer-facing. Its one irreducible job: push a known-good bundle when a
+  bad `__admin__` deploy bricks the app itself (the app can't fix itself if its
+  own deploy handler is broken). Every control plane needs a recovery path that
+  doesn't depend on the thing it recovers; this is it. It is NOT a second
+  production mechanism, so "why two?" is answered: there is one production path
+  (the app) and one recovery hatch (the route).
+
+The smoke harness's `deploy_handlers` currently still uses the route as a
+test-time fast-path (it deploys *customer* tenants; no clobbering). Repointing
+the harness through the app — so every smoke exercises the *production* path —
+is a worthwhile **test-quality** step (a one-function change to `deploy_bundle`
+plus a full-suite revalidation), but it is NOT required for the "one production
+mechanism" goal, which genesis already achieved. `publish_tenant.py` likewise
+stays on the route as the operator/break-glass CLI; repointing it at the app is
+optional dogfooding (prod-validated, not testable from here).
 
 A hard narrow was rejected: it would break the harness + `publish_tenant`, and
 routing the harness *through* a `__admin__`-hosted app is fragile (a smoke that
