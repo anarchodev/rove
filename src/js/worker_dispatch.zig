@@ -855,14 +855,9 @@ fn finalizeBatch(
             // engine. Partition them out in place.
             var keep: usize = 0;
             for (batch_pending_fetches.items) |pf| {
-                if (blob_receive_mod.isReceiveUrl(pf.url)) {
-                    worker.armBlobReceive(pf);
-                } else if (deploy_thread_mod.isCompileUrl(pf.url)) {
-                    // platform.compile (rewind-cli-plan §4.1): compile-door
-                    // fetches go to the background DeployThread, never the
-                    // engine — sibling to the blob-receive door above.
-                    worker.submitCompile(pf);
-                } else {
+                // Trusted internal doors (receive/compile/stampManifest) →
+                // worker-local subsystem; everything else → the engine.
+                if (!worker.tryDoorFetch(pf)) {
                     batch_pending_fetches.items[keep] = pf;
                     keep += 1;
                 }

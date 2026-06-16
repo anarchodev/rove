@@ -2373,7 +2373,6 @@ pub fn Worker(comptime opts: Options) type {
                 .release_publish = &Self.releasePublishTrampoline,
                 .scope_kv_write = &Self.scopeKvWriteTrampoline,
                 .scope_blob_put = &Self.scopeBlobPutTrampoline,
-                .stamp_manifest = &Self.stampManifestTrampoline,
             };
         }
 
@@ -2407,48 +2406,63 @@ pub fn Worker(comptime opts: Options) type {
             try dt.enqueue(.{ .compile_id = self.next_compile_id, .kind = .blob_put, .tenant_id = t, .key = k, .payload = p });
         }
 
-        /// `platform.scope(t).deploy.stampManifest(entries)` (rewind-cli-plan
-        /// §4.1): compute the content-addressed dep_id + encode the manifest
-        /// (the native format), and enqueue its deferred PUT into the TARGET
-        /// tenant's `deployments/`. Returns the dep_id synchronously (it's
-        /// derivable from the entries). `entries_json` is the app's composed
-        /// entry array `[{path, kind, source_hex, bytecode_hex?,
-        /// content_type?}]` (JSON-stringified by the binding) — the app owns
-        /// composition; the engine owns the manifest format + id.
-        pub fn stampManifestTrampoline(
-            ctx: *anyopaque,
-            allocator: std.mem.Allocator,
-            target_id: []const u8,
-            entries_json: []const u8,
-        ) anyerror!u64 {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            if ((self.node.tenant.getInstance(target_id) catch return error.InstanceNotFound) == null)
-                return error.InstanceNotFound;
-            const dt = self.deploy_thread orelse return error.DeployThreadUnavailable;
+        /// `platform.scope(t).deploy.stampManifest(entries)` submit door
+        /// (rewind-cli-plan §4.1) — the deploy's STAGING BARRIER. Bound like
+        /// `platform.compile`: lowers to an on.fetch to `rove-stage.internal`;
+        /// the handler `next()`s so the finalize seam binds it. We compute the
+        /// content-addressed dep_id + encode the manifest (the native format)
+        /// and enqueue a `manifest_put` job carrying the dep_id + chain
+        /// routing. Being the LAST FIFO job for the deploy, its completion
+        /// proves all prior bytecode + static PUTs are durable; the
+        /// DeployThread then emits the bound `{ok, dep_id}` event that resumes
+        /// the held chain — safe to release, no race. ADMIN-ONLY.
+        pub fn submitStampManifest(self: *Self, pf_in: globals.PendingFetch) void {
+            var pf = pf_in;
+            defer pf.deinit(self.allocator);
+            const a = self.allocator;
+            const router = &self.node.router;
 
-            var parsed = std.json.parseFromSlice([]const struct {
-                path: []const u8,
-                kind: []const u8,
-                source_hex: []const u8,
-                bytecode_hex: []const u8 = "",
-                content_type: []const u8 = "",
-            }, allocator, entries_json, .{ .ignore_unknown_fields = true }) catch return error.InvalidEntries;
+            const fail = struct {
+                fn emit(rt: *MsgRouter, alloc: std.mem.Allocator, p: *const globals.PendingFetch, status: u16, msg: []const u8) void {
+                    const cj = std.fmt.allocPrint(alloc, "{{\"ok\":false,\"status\":{d},\"error\":\"{s}\"}}", .{ status, msg }) catch return;
+                    deploy_thread_mod.routeCompileEvent(rt, alloc, p.id, p.tenant_id, p.name, status, false, cj);
+                }
+            }.emit;
+
+            if (!std.mem.eql(u8, pf.tenant_id, tenant_mod.ADMIN_INSTANCE_ID)) {
+                std.log.warn("rove-js stampManifest: non-admin tenant {s} rejected", .{pf.tenant_id});
+                return fail(router, a, &pf, 403, "stampManifest is admin-only");
+            }
+            const dt = self.deploy_thread orelse return fail(router, a, &pf, 503, "deploy thread not started");
+
+            var parsed = std.json.parseFromSlice(struct {
+                scope: []const u8,
+                entries: []const struct {
+                    path: []const u8,
+                    kind: []const u8,
+                    source_hex: []const u8,
+                    bytecode_hex: []const u8 = "",
+                    content_type: []const u8 = "",
+                },
+            }, a, pf.body, .{ .ignore_unknown_fields = true }) catch
+                return fail(router, a, &pf, 400, "expected {scope, entries:[...]}");
             defer parsed.deinit();
-            const items = parsed.value;
-            if (items.len == 0 or items.len > 256) return error.InvalidEntries;
+            const p = parsed.value;
+            if (p.scope.len == 0 or p.entries.len == 0 or p.entries.len > 256)
+                return fail(router, a, &pf, 400, "scope required + 1..256 entries");
 
-            // Build native entries (borrow parsed strings — valid for this call).
-            const entries = try allocator.alloc(files_mod.FileStore.Entry, items.len);
-            defer allocator.free(entries);
-            for (items, 0..) |it, i| {
-                files_mod.validatePath(it.path) catch return error.InvalidEntries;
+            const entries = a.alloc(files_mod.FileStore.Entry, p.entries.len) catch
+                return fail(router, a, &pf, 500, "out of memory");
+            defer a.free(entries);
+            for (p.entries, 0..) |it, i| {
+                files_mod.validatePath(it.path) catch return fail(router, a, &pf, 400, "invalid path");
                 const kind: files_mod.Kind = if (std.mem.eql(u8, it.kind, "handler"))
                     .handler
                 else if (std.mem.eql(u8, it.kind, "static"))
                     .static
                 else
-                    return error.InvalidEntries;
-                if (it.source_hex.len != files_mod.HASH_HEX_LEN) return error.InvalidEntries;
+                    return fail(router, a, &pf, 400, "kind must be handler|static");
+                if (it.source_hex.len != files_mod.HASH_HEX_LEN) return fail(router, a, &pf, 400, "bad source_hex");
                 var e: files_mod.FileStore.Entry = .{
                     .path = @constCast(it.path),
                     .kind = kind,
@@ -2458,26 +2472,71 @@ pub fn Worker(comptime opts: Options) type {
                 };
                 @memcpy(&e.source_hex, it.source_hex[0..files_mod.HASH_HEX_LEN]);
                 if (kind == .handler) {
-                    if (it.bytecode_hex.len != files_mod.HASH_HEX_LEN) return error.InvalidEntries;
+                    if (it.bytecode_hex.len != files_mod.HASH_HEX_LEN) return fail(router, a, &pf, 400, "bad bytecode_hex");
                     @memcpy(&e.bytecode_hex, it.bytecode_hex[0..files_mod.HASH_HEX_LEN]);
                 }
                 entries[i] = e;
             }
 
             const dep_id = files_mod.manifest_json.computeDeploymentId(entries);
-            const json = try files_mod.manifest_json.encode(self.allocator, dep_id, entries); // owned → job
-            errdefer self.allocator.free(json);
+            const json = files_mod.manifest_json.encode(a, dep_id, entries) catch
+                return fail(router, a, &pf, 500, "manifest encode failed");
+            // `json` is owned → transferred to the job below (or freed on any
+            // dupe/enqueue failure before then).
             var key_buf: [25]u8 = undefined;
             const key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
 
-            const a = self.allocator;
-            const t = try a.dupe(u8, target_id);
-            errdefer a.free(t);
-            const k = try a.dupe(u8, key);
-            errdefer a.free(k);
+            const t = a.dupe(u8, p.scope) catch {
+                a.free(json);
+                return fail(router, a, &pf, 500, "out of memory");
+            };
+            const k = a.dupe(u8, key) catch {
+                a.free(json);
+                a.free(t);
+                return fail(router, a, &pf, 500, "out of memory");
+            };
+            const chain = a.dupe(u8, pf.tenant_id) catch {
+                a.free(json);
+                a.free(t);
+                a.free(k);
+                return fail(router, a, &pf, 500, "out of memory");
+            };
+            const fid = a.dupe(u8, pf.id) catch {
+                a.free(json);
+                a.free(t);
+                a.free(k);
+                a.free(chain);
+                return fail(router, a, &pf, 500, "out of memory");
+            };
+            const nm: []u8 = if (pf.name.len != 0) (a.dupe(u8, pf.name) catch {
+                a.free(json);
+                a.free(t);
+                a.free(k);
+                a.free(chain);
+                a.free(fid);
+                return fail(router, a, &pf, 500, "out of memory");
+            }) else &.{};
+
             self.next_compile_id += 1;
-            try dt.enqueue(.{ .compile_id = self.next_compile_id, .kind = .manifest_put, .tenant_id = t, .key = k, .payload = json });
-            return dep_id;
+            dt.enqueue(.{
+                .compile_id = self.next_compile_id,
+                .kind = .manifest_put,
+                .tenant_id = t,
+                .key = k,
+                .payload = json,
+                .chain_tenant = chain,
+                .fetch_id = fid,
+                .name = nm,
+                .dep_id = dep_id,
+            }) catch {
+                a.free(json);
+                a.free(t);
+                a.free(k);
+                a.free(chain);
+                a.free(fid);
+                if (nm.len != 0) a.free(nm);
+                return fail(router, a, &pf, 503, "deploy queue unavailable");
+            };
         }
 
         /// Phase 5 PR-3: `_system.continuation.resumeIfBound`
@@ -2704,6 +2763,30 @@ pub fn Worker(comptime opts: Options) type {
                 job.markGone();
                 job.failNow();
             };
+        }
+
+        /// The "trusted internal door" partition for a PendingFetch — the
+        /// ONE place that decides a fetch goes to a worker-local subsystem
+        /// instead of libcurl. Returns true (and consumes `pf`) if it was a
+        /// door; false → the caller submits it to the FetchEngine. EVERY
+        /// fetch-submit site (interpretCmd, the inbound read-only flush, the
+        /// bound-resume flush) routes through this so a new door can't be
+        /// half-wired — the bug class that hid `rove-stage.internal` from the
+        /// resume path + `rove-compile.internal` from the read-only path.
+        pub fn tryDoorFetch(self: *Self, pf: globals.PendingFetch) bool {
+            if (blob_receive_mod.isReceiveUrl(pf.url)) {
+                self.armBlobReceive(pf);
+                return true;
+            }
+            if (deploy_thread_mod.isCompileUrl(pf.url)) {
+                self.submitCompile(pf);
+                return true;
+            }
+            if (deploy_thread_mod.isStageUrl(pf.url)) {
+                self.submitStampManifest(pf);
+                return true;
+            }
+            return false;
         }
 
         /// `platform.compile` submit door (`rove-cli-plan.md` §4.1). The

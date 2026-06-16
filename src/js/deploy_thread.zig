@@ -52,6 +52,19 @@ pub fn isCompileUrl(url: []const u8) bool {
     return std.mem.startsWith(u8, url, COMPILE_ORIGIN_PREFIX);
 }
 
+/// `platform.scope(t).deploy.stampManifest` lowers to an on.fetch to this
+/// origin. Intercepted in `interpretCmd` (sibling to the compile door) →
+/// `worker.submitStampManifest`. It's the deploy's STAGING BARRIER: the
+/// manifest_put is the last FIFO job on the single DeployThread, so its
+/// completion proves all prior bytecode + static PUTs for the deploy are
+/// durable — the bound completion event re-enters the held chain with the
+/// dep_id, and the app can release without racing staging.
+pub const STAGE_ORIGIN_PREFIX = "http://rove-stage.internal/";
+
+pub fn isStageUrl(url: []const u8) bool {
+    return std.mem.startsWith(u8, url, STAGE_ORIGIN_PREFIX);
+}
+
 pub const DeployThread = struct {
     allocator: std.mem.Allocator,
     /// Shared blob backend config (`NodeState.blob_backend_cfg`). Per
@@ -100,11 +113,15 @@ pub const DeployThread = struct {
         /// PUT rides here off the poll loop. Fire-and-forget (`key`=hash,
         /// `payload`=bytes).
         blob_put,
-        /// Deferred cross-tenant manifest PUT into the SCOPE tenant's
-        /// `deployments/` (`platform.scope(t).deploy.stampManifest`). The
-        /// dep_id is returned to JS synchronously (derivable from the
-        /// entries); the PUT rides here. Fire-and-forget (`key`=manifest
-        /// key, `payload`=manifest JSON).
+        /// The deploy's STAGING BARRIER + manifest write
+        /// (`platform.scope(t).deploy.stampManifest`). PUTs the manifest
+        /// into the SCOPE tenant's `deployments/`, then — because it is the
+        /// LAST FIFO job for the deploy (statics' blob_put + the bytecode
+        /// compile_batch all preceded it) — its completion proves the whole
+        /// deploy is durable, so it emits a BOUND completion event
+        /// (`{ok, dep_id}` in ctx_json) to resume the held chain. `key`=
+        /// manifest key, `payload`=manifest JSON, `dep_id` for the event;
+        /// `chain_tenant`/`fetch_id`/`name` route the resume.
         manifest_put,
     };
 
@@ -137,6 +154,8 @@ pub const DeployThread = struct {
         /// blob_put: the blob bytes. manifest_put: the manifest JSON.
         /// Owned.
         payload: []u8 = &.{},
+        /// manifest_put: the dep_id to carry in the bound completion event.
+        dep_id: u64 = 0,
     };
 
     /// A finished full-stage deploy. On success `status == 200` and
@@ -251,7 +270,7 @@ pub const DeployThread = struct {
                     .stage => self.putResult(job.compile_id, self.processStage(ctx_ptr, &job)),
                     .compile_batch => self.processCompileBatch(ctx_ptr, &job),
                     .blob_put => self.processKeyedPut(&job, "file-blobs"),
-                    .manifest_put => self.processKeyedPut(&job, "deployments"),
+                    .manifest_put => self.processManifestPut(&job),
                 }
                 freeJob(self.allocator, &job);
             }
@@ -305,22 +324,47 @@ pub const DeployThread = struct {
     }
 
     /// Deferred cross-tenant content-addressed PUT into the SCOPE tenant's
-    /// `{subdir}` backend (`blob_put` → file-blobs, `manifest_put` →
-    /// deployments). Fire-and-forget: the deterministic key/dep_id was
-    /// already returned to JS synchronously; this just lands the bytes off
-    /// the poll loop. Content-addressed, so a retry/redeploy is safe.
+    /// `{subdir}` backend (`blob_put` → file-blobs). Fire-and-forget: the
+    /// hash was already returned to JS synchronously; this lands the bytes
+    /// off the poll loop. Content-addressed, so a retry/redeploy is safe.
+    /// (A failed static PUT only logs — durability/retry of an individual
+    /// static is the owed-marker follow-up; the `manifest_put` barrier
+    /// guarantees ORDERING, not per-blob success.)
     fn processKeyedPut(self: *DeployThread, job: *Job, subdir: []const u8) void {
         var be = blob_mod.BlobBackend.openPerTenant(self.allocator, self.blob_cfg, job.tenant_id, subdir) catch |err| {
             std.log.warn("deploy thread: {s} open {s}/{s} failed: {s}", .{ @tagName(job.kind), job.tenant_id, subdir, @errorName(err) });
             return;
         };
         defer be.deinit();
-        // Idempotent skip-if-present (content-addressed) for file-blobs;
-        // manifests are dep_id-keyed (also content-addressed) so the same
-        // skip applies. Best-effort: a failed PUT logs; the deploy's
-        // release step is the customer's gate, not this.
         files_mod.putBlobIfMissingTo(be.blobStore(), job.key, job.payload) catch |err|
             std.log.warn("deploy thread: {s} PUT {s}/{s}/{s} failed: {s}", .{ @tagName(job.kind), job.tenant_id, subdir, job.key, @errorName(err) });
+    }
+
+    /// The staging-barrier manifest write: PUT the manifest into the SCOPE
+    /// tenant's `deployments/`, then emit the bound completion event. Being
+    /// the LAST FIFO job for the deploy, its completion proves every prior
+    /// bytecode + static PUT has run — so the held chain resumes safe to
+    /// release. `ctx_json` = `{ok, dep_id}`.
+    fn processManifestPut(self: *DeployThread, job: *Job) void {
+        const router = self.router orelse {
+            std.log.err("deploy thread: manifest_put with no router; chain id={s} will reap on deadline", .{job.fetch_id});
+            return;
+        };
+        const a = self.allocator;
+        var put_ok = true;
+        if (blob_mod.BlobBackend.openPerTenant(a, self.blob_cfg, job.tenant_id, "deployments")) |be_const| {
+            var be = be_const;
+            defer be.deinit();
+            files_mod.putBlobIfMissingTo(be.blobStore(), job.key, job.payload) catch |err| {
+                std.log.warn("deploy thread: manifest_put PUT {s}/deployments/{s} failed: {s}", .{ job.tenant_id, job.key, @errorName(err) });
+                put_ok = false;
+            };
+        } else |err| {
+            std.log.warn("deploy thread: manifest_put open {s}/deployments failed: {s}", .{ job.tenant_id, @errorName(err) });
+            put_ok = false;
+        }
+        const ctx_json = std.fmt.allocPrint(a, "{{\"ok\":{s},\"dep_id\":\"{x:0>16}\"}}", .{ if (put_ok) "true" else "false", job.dep_id }) catch return;
+        routeCompileEvent(router, a, job.fetch_id, job.chain_tenant, job.name, if (put_ok) 200 else 502, put_ok, ctx_json);
     }
 
     /// Compile + stage the batch into the SCOPE tenant, then emit ONE

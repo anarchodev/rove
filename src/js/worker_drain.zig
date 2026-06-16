@@ -2284,6 +2284,11 @@ pub fn flushResumeFetches(
                 cnt.pending +%= 1;
             } else |_| {}
         }
+        // Trusted internal doors (compile / stampManifest / receive) go to
+        // the worker-local subsystem, never the engine — AFTER the bind
+        // registration above so the door's completion event resumes THIS
+        // held chain. `tryDoorFetch` consumes the fetch.
+        if (worker.tryDoorFetch(pf.*)) continue;
         submit.append(allocator, pf.*) catch {
             pf.deinit(allocator);
             continue;
