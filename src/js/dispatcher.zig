@@ -1058,6 +1058,87 @@ test "dispatch: retry.shouldRetry / retry.stripContext logic" {
     try testing.expect(std.mem.indexOf(u8, resp.body[pipe..], "_retry") == null);
 }
 
+// Endpoint A (decisions.md): a customer `on_result` hop (webhook.send /
+// blob.put / retry) AND a §6.4 held-sync resume both arrive as a
+// `.send_callback` whose body is `{"ctx":{result,context}}`. The runtime
+// hoists it onto the SAME flattened surface a bound fetch resume uses:
+// `request.body` = response bytes, top-level `request.status`/`.ok`/`.done`,
+// the THREADED ctx (the echoed `context`) on `request.ctx` (bare), and the
+// per-delivery metadata on `request.activation.*`. There is NO
+// `request.result` and no positional `outcome`.
+test "dispatch: connectionless on_result presents the flattened result surface (no request.result)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\return [
+        \\  "status=" + request.status,
+        \\  "ok=" + request.ok,
+        \\  "done=" + request.done,
+        \\  "body=" + request.body,
+        \\  "ctx.order=" + request.ctx.order,
+        \\  "act.attempts=" + request.activation.attempts,
+        \\  "act.error=" + request.activation.error,
+        \\  "result=" + (typeof request.result),
+        \\].join(" ");
+    , .{
+        .method = "POST",
+        .path = "/_result",
+        .activation = .send_callback,
+        .trace = .{ .request_id = 1 },
+        .body =
+        \\{"ctx":{"result":{"id":"abc","ok":true,"status":200,"body":"PONG","headers":{},"body_truncated":false,"attempts":1,"error":null},"context":{"order":42}}}
+        ,
+    });
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings(
+        "status=200 ok=true done=true body=PONG ctx.order=42 act.attempts=1 act.error=null result=undefined",
+        resp.body,
+    );
+}
+
+// The hoist fires only on a result DELIVERY — a `.send_callback` body that
+// is NOT `{"ctx":{result,…}}` (e.g. webhook_onresult's own bookkeeping
+// self-hop, `{"ctx":{id,…}}` with no `result` object) is left untouched:
+// `request.status` stays undefined and the raw body survives.
+test "dispatch: send_callback without a result object is left unflattened" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var resp = try runOne(&d, kv,
+        \\const parsed = JSON.parse(request.body);
+        \\return "status=" + request.status + " id=" + parsed.ctx.id;
+    , .{
+        .method = "POST",
+        .path = "/_result",
+        .activation = .send_callback,
+        .trace = .{ .request_id = 1 },
+        .body =
+        \\{"ctx":{"id":"send-7","note":"self-hop"}}
+        ,
+    });
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings("status=undefined id=send-7", resp.body);
+}
+
 test "dispatch: request.session.id surfaces resolved sid" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

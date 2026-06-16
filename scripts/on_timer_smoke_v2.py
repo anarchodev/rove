@@ -46,7 +46,8 @@ export default function () {
     return next({ tag: req.tag || "t" });
 }
 
-export function onWake(ctx) {
+export function onWake() {
+    const ctx = request.ctx || {};
     return "woke:" + ctx.tag;
 }
 """

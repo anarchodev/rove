@@ -598,6 +598,31 @@ pub fn main() !void {
     // touching the worker handle's txn state. Set BEFORE startPump so the
     // first replicated entry already routes here.
     bridge.setStoreResolver(.{ .ctx = &pump_stores, .func = PumpStores.resolve });
+    // Auto-demote policy (conf_change Phase 2): a far-behind, presumed-dead
+    // voter is demoted to a learner so it stops pinning the WAL-compaction
+    // floor. Defaults are baked into Node; env overrides tune the lag threshold
+    // (entries; 0 disables) and the evaluation cadence (ms). Set before
+    // startPump (the pump owns the Node thereafter).
+    if (std.posix.getenv("REWIND_AUTO_DEMOTE_LAG")) |v| {
+        bridge.node.auto_demote_lag = std.fmt.parseInt(u64, v, 10) catch bridge.node.auto_demote_lag;
+        std.log.info("rewind: auto-demote lag threshold = {d} entries{s}", .{ bridge.node.auto_demote_lag, if (bridge.node.auto_demote_lag == 0) " (disabled)" else "" });
+    }
+    if (std.posix.getenv("REWIND_AUTO_DEMOTE_MS")) |v| {
+        if (std.fmt.parseInt(i64, v, 10)) |ms| bridge.node.auto_demote_interval_ns = ms * std.time.ns_per_ms else |_| {}
+    }
+    // Raft logical-tick cadence (ms). The wall-clock election timeout is
+    // `election_tick × this` (see node.zig DEFAULT_TICK_NS); the default
+    // preserves the historical ~1ms cadence. Raise it once a soak has measured
+    // the broadcast-time + pause-jitter tail it must clear
+    // (docs/raft-best-practices.md "how to size election/heartbeat").
+    if (std.posix.getenv("REWIND_RAFT_TICK_MS")) |v| {
+        if (std.fmt.parseInt(i64, v, 10)) |ms| {
+            if (ms > 0) {
+                bridge.node.tick_interval_ns = ms * std.time.ns_per_ms;
+                std.log.info("rewind: raft tick interval = {d}ms (election timeout ≈ election_tick × {d}ms)", .{ ms, ms });
+            }
+        } else |_| {}
+    }
     // Boot-time group recovery: re-stand-up the tenant raft groups this node
     // persisted (its node-local manifest) so a restarted node rejoins its
     // groups and catches up to the live state — the leader replicates the
@@ -693,6 +718,21 @@ pub fn main() !void {
 
     while (!stop_flag.load(.acquire)) std.Thread.sleep(100 * std.time.ns_per_ms);
     th.join();
+    // Graceful leadership handoff: BEFORE tearing the pump down, hand every
+    // group this node leads to a caught-up follower so a rolling restart (the
+    // `/deploy` path) costs ~one heartbeat per group instead of a full
+    // election timeout. The pump still runs here (it lives in this scope and
+    // is stopped only by the `bridge.stopPump` below), so it drives the
+    // resulting MsgTimeoutNow → step-down readies and republishes `is_leader`.
+    // Wait a bounded window for the handoffs to land. Single-node returns 0
+    // and skips the wait.
+    const handed_off = bridge.transferAllLeadership();
+    if (handed_off > 0) {
+        std.log.info("rewind: handed off leadership of {d} group(s); draining", .{handed_off});
+        var spins: usize = 0;
+        while (bridge.leadsAnyGroup() and spins < 200) : (spins += 1)
+            std.Thread.sleep(10 * std.time.ns_per_ms); // up to ~2s grace
+    }
     // Teardown order: the pump fires the deploy apply observer into
     // `node_state` (`setApplyObserver` above), but `node_state`'s defer —
     // declared after the bridge — deinits BEFORE `bridge.deinit` joins the

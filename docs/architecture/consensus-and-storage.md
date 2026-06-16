@@ -252,19 +252,33 @@ Three mechanisms keep the WAL bounded and a restart correct:
   producers pre-ack — the bridge keeps an acked high-water so a
   fire-and-forget propose can't pin the floor). A slot whose fold could not
   reach `applied_idx` **stays dirty** and is finished by a later tick.
-- **Compaction (single-node).** After durabilizing, a single-node node truncates
-  the shared WAL up to the durabilized index (`compact_wal = true`, on). Safe
-  because the data up to that point was folded into LMDB and the watermark
-  stamped *before* the truncate. The tick flushes the WAL once before its
-  first truncate: under the async-append flow the durable `HardState.commit`
-  lags the live commit by one fsync, and truncating past a non-durable commit
-  would panic `RawNode::new` at recovery. Multi-node nodes durabilize
-  (bounding replay) but do **not** truncate: truncating safely needs a
-  follower-match-index floor, and a lagging follower would then need a
-  data-carrying snapshot, which is not wired. **This is the one known
-  limitation in the storage layer** — it bounds nothing worse than WAL growth
-  on a long-lived multi-node group; correctness holds. (Physical segment-file
-  GC — reclaiming fully-compacted segments — is likewise still open.)
+- **Compaction (single- and multi-node).** After durabilizing, a node truncates
+  the shared WAL (`compact_wal = true`, on). Safe because the data up to the
+  truncate point was folded into LMDB and the watermark stamped *before* the
+  truncate; the tick flushes the WAL once before its first truncate (the
+  async-append durable `HardState.commit` lags the live commit by one fsync, and
+  truncating past a non-durable commit would panic `RawNode::new` at recovery).
+  Single-node truncates to the durabilized index. **Multi-node compacts in
+  lockstep, snapshot-free**: the LEADER floors the truncate point at the
+  cluster-wide **min match index** (`raft_manager_min_match_index`) and
+  *propagates* that floor on its outbound raft messages (a per-record `floor`
+  field in `transport.zig`); a FOLLOWER truncates to the floor it last received
+  (`slot.propagated_floor`, monotonic). Both stop at the same point, so no node
+  ever compacts past an entry a voter still needs — a lagging/returning voter
+  always catches up from the **log**, never an in-raft snapshot, and nothing
+  dumps the store on any node's hot path. A down voter pins the floor (the WAL
+  grows during its outage, bounded by it, and self-heals on its return); a
+  permanently-dead voter holds the floor until it is removed (conf_change).
+  Physical segment-file GC reclaims fully-compacted segments via `noteCompaction`.
+- **New-member catch-up is out-of-band, not in-raft.** rove does **not** use
+  raft's in-protocol snapshot (`MsgSnapshot`) at all. A genuinely new group
+  member — a conf_change learner, or a tenant-move destination — bootstraps its
+  store out-of-band via the move bundle (`dumpTenantBundle` on a follower / the
+  worker request thread, off the leader's hot path → `loadTenantBundle` on the
+  destination → join raft already caught up, so raft replicates only the tail).
+  An earlier in-raft snapshot path (leader-generated `MsgSnapshot`, S3-staged
+  bundle) was built then removed: it put a store dump on the leader's serving
+  hot path, and lockstep compaction means existing voters never need it.
 - **Crash recovery.** At boot the Node opens the WAL with `SharedWal.open` (not
   `init`): it CRC-scans the segments, physically truncates only a *torn tail*,
   and buckets recovered records by `group_id`. `Bridge.recoverGroups` reads the

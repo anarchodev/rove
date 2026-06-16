@@ -60,12 +60,14 @@ HELDSYNC_SRC = r"""export default function () {
 }
 """
 
-ONRESULT_SRC = r"""export function onResult(ctx, outcome) {
-    if (!outcome.ok) {
+ONRESULT_SRC = r"""export function onResult() {
+    // Endpoint A: ctx IS request.ctx; result flattened on request.*.
+    const ctx = request.ctx || {};
+    if (!request.ok) {
         response.status = 502;
-        return "heldsync upstream failed: " + (outcome.error || outcome.reason || outcome.status);
+        return "heldsync upstream failed: " + (request.activation.error || request.status);
     }
-    return "heldsync:" + ctx.tag + ":" + outcome.body;
+    return "heldsync:" + ctx.tag + ":" + request.body;
 }
 """
 

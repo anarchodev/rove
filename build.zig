@@ -453,6 +453,10 @@ pub fn build(b: *std.Build) void {
         .{ .name = "activitypub_js", .path = "src/js/globals/activitypub.js" },
         .{ .name = "blob_js", .path = "src/js/globals/blob.js" },
         .{ .name = "segments_js", .path = "src/js/globals/segments.js" },
+        // browser.* — server-side surface for the in-page browser-agent
+        // SDK (web/rove-agent.js). Pure protocol/formatting over the
+        // ambient `stream`; vendor-neutral.
+        .{ .name = "browser_js", .path = "src/js/globals/browser.js" },
 
         // Built-in handler modules — compiled to bytecode at NodeState
         // init, resolved via the `__system/` module-path prefix

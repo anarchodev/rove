@@ -1359,6 +1359,31 @@ fn handleMetrics(
         \\
     , .{@intFromBool(worker.raft.leadsAnyGroup())});
 
+    // ── raft failover / broadcast-time observability ──────────────────
+    //
+    // The inputs for sizing election/heartbeat timeouts in THIS environment
+    // (docs/raft-best-practices.md "how to size ..."):
+    //   raft_leadership_acquisitions_total — follower→leader promotion edges.
+    //     The spurious-election signal: ~1 per group at formation, then FLAT
+    //     under steady load. A rising count under no real failures means the
+    //     election timeout is below the pause/jitter tail — widen it.
+    //   raft_heartbeat_rtt_us — measured leader↔follower round-trip
+    //     (broadcastTime). The election timeout must sit well above this; mean
+    //     = _sum / _count. Absent on a single-node node (no transport).
+    try w.print(
+        \\# HELP raft_leadership_acquisitions_total follower→leader promotion edges observed on this node (spurious-election signal; ~1/group at formation, flat after).
+        \\# TYPE raft_leadership_acquisitions_total counter
+        \\raft_leadership_acquisitions_total {d}
+        \\
+    , .{worker.raft.leadershipAcquisitions()});
+    if (worker.raft.heartbeatRttSnapshot()) |rtt| {
+        try w.print(
+            \\# HELP raft_heartbeat_rtt_us leader↔follower heartbeat round-trip in microseconds (broadcast time; election timeout must sit well above this).
+            \\
+        , .{});
+        try writeMicrosHistogram(w, "raft_heartbeat_rtt_us", rtt);
+    }
+
     // ── kvexp: per-node manifest counters / histograms ────────────────
     //
     // Every KvStore on this node attaches to the same `cluster.kv`
