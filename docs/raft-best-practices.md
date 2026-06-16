@@ -57,6 +57,105 @@ These are fields on `RaftGroupConfig` / `defaultGroupConfig()`, settable in
   LeaseBased also requires `check_quorum` (already on); raft `validate()`
   enforces that.
 
+## How to size election / heartbeat timeouts in our environment
+
+Don't inherit a number — *derive* it. The governing inequality (Raft paper) is
+
+    broadcastTime  ≪  electionTimeout  ≪  MTBF
+
+and both bounds are measurable on our hardware. This is the procedure and the
+tooling that backs it (all shipped: tick-decoupling + metrics in `a6c74ea`, soak
+in `7c6b6ae`).
+
+### Prerequisite: the tick is a stable clock (done)
+
+raft ticks are *logical* — `election_tick` / `heartbeat_tick` are counts of them,
+so the wall-clock election timeout = `election_tick × tick_interval`. The pump
+used to tick once per loop *cycle*, coupling the timeout to load (faster when
+idle, slower under a write burst + fsync) — which makes "what is our election
+timeout?" unanswerable. `node.tick_interval_ns` now gates the tick at a fixed
+monotonic interval (env `REWIND_RAFT_TICK_MS`, default 1ms), so
+`election_tick × tick_interval` is a real, stable number. Without this, nothing
+below is meaningful.
+
+Defaults today: `election_tick=10`, `heartbeat_tick=3`, tick=1ms ⇒ **election
+timeout ≈ 10–20ms** (raft randomizes 1×–2×), **heartbeat ≈ 3ms**.
+
+### The three quantities (and how to read each one here)
+
+| Term | What it bounds | How to measure on our boxes |
+|---|---|---|
+| **broadcastTime** | the *floor* — heartbeat must clear it | `/_system/metrics` → `raft_heartbeat_rtt_us` (mean = `_sum/_count`). Leader↔follower round-trip incl. pump-loop latency on both ends. |
+| **pause / jitter tail** | the real *low-end* — election timeout must clear the LONGEST "leader alive but heartbeat landed late" gap | fsync tail (`fio`, or instrument `wal.flush`), scheduler latency (`cyclictest`), and *empirically*: run load and watch `raft_leadership_acquisitions_total` for any rise. No GC (Zig), so fsync + scheduler preemption dominate. |
+| **MTBF / failover SLO** | the *ceiling* — election timeout ≈ leaderless window on a real crash | `leader_failover_smoke_v2`'s `ELECTION_FAILOVER_S`. 3 dedicated bare-metal nodes ⇒ MTBF months ⇒ the ceiling is loose; the binding constraint is the pause tail on the low end. |
+
+### Compose (with margin)
+
+- `heartbeat ≈ 3–5 × p99(broadcastTime)` — a few RTTs of slack.
+- `electionTimeout ≈ max( 10 × heartbeat, p999(pause tail) × 2–3 )` — it must
+  satisfy **both** the industry 10:1 ratio **and** clear the measured pause tail.
+- Keep raft's `[T, 2T]` randomization; make sure lockstep `tickGroups` doesn't
+  collapse it (the thundering-herd note above).
+
+Today's defaults violate both guides: the ratio is `10:3 ≈ 3.3:1` (vs the 5:1
+raft-rs / 10:1 etcd norm), and ~15ms sits inside a realistic fsync/scheduler
+tail. That's the case for widening — see the soak result.
+
+### Validate empirically — the soak (`scripts/raft_soak_v2.py`)
+
+The number is only *justified* by zero spurious elections under load. The soak is
+meaningful only if three things hold (it enforces all three):
+
+1. **WAL on real disk, not tmpfs.** `/tmp` is tmpfs (RAM) on our dev boxes, so
+   the WAL fsync is a no-op and a too-tight timeout *cannot* flake — fsync stalls
+   are the dominant trigger. The soak forces `V2_SMOKE_DATA_BASE` onto real disk
+   and **refuses to run on tmpfs**. (This silently invalidated the first runs —
+   always confirm `SOAK_WAL_FSTYPE`.)
+2. **Realistic, uncapped load.** h2load through the *front door* against the real
+   handler write path (front → worker → JS `kv.set` → propose → commit), with the
+   tenant plan raised to effectively-unlimited so it isn't rate-throttled. (The
+   single-threaded front saturates past ~64 concurrent streams → 5xx; ~32, i.e.
+   `RAFT_SOAK_CLIENTS=8 RAFT_SOAK_STREAMS=4`, maximizes clean throughput.)
+3. **Counts spurious elections** = `raft_leadership_acquisitions_total` delta
+   beyond the one-per-group formation baseline. Correctly sized ⇒ **0**.
+
+Run at the candidate tick, then wider, and compare:
+
+    REWIND_RAFT_TICK_MS=10 RAFT_SOAK_SECONDS=3600 python3 scripts/raft_soak_v2.py
+
+### Measured baseline + recommendation
+
+Dev box (btrfs/NVMe, ~2750 req/s real writes, 90s): **broadcastTime ≈ 2ms; ZERO
+spurious elections at BOTH the default ~15–20ms timeout AND
+`REWIND_RAFT_TICK_MS=10` (~100–300ms), at identical throughput.** So widening to
+the etcd / Raft-paper band is *free* here and buys pause-tail margin.
+
+→ **Recommendation: set `REWIND_RAFT_TICK_MS=10` in prod** (election ≈ 100–300ms,
+heartbeat ≈ 30ms — the industry band), then run a *multi-hour* soak on the actual
+BHS hardware before locking it. Caveats on the dev result: single box (all 3
+nodes + the load generator share one CPU = *more* scheduler contention than the
+3-machine BHS cluster — so clean here is weak evidence it's clean there, but not
+the real topology); 90s is short (the pause tail is a rare-event distribution —
+soak hours for a production decision); throughput is front-bound, not
+cluster-bound.
+
+### Industry reference (for calibration)
+
+| System | Heartbeat | Election timeout |
+|---|---|---|
+| Raft paper (Ongaro/Ousterhout) | RTT (0.5–20ms) | 150–300ms |
+| etcd | 100ms | 1000ms |
+| HashiCorp raft (Consul/Nomad/Vault) | 1000ms | 1000ms (+500ms leader lease) |
+| TiKV (raft-rs — same engine) | ~2s | ~10s |
+| MongoDB | 2s | 10s |
+| **rove (today, default tick)** | **~3ms** | **~15–20ms** |
+
+The rule every implementation encodes: **heartbeat ≈ network RTT; election ≈ 10×
+heartbeat; both ≫ broadcastTime and ≪ MTBF.** rove is currently an order of
+magnitude tighter than the tightest mainstream default on *both* the absolute
+value and the ratio — defensible only on a dedicated sub-ms LAN, and the reason
+to move toward `REWIND_RAFT_TICK_MS=10`.
+
 ## Blocked on NEW FFI methods (need extern "C" fns in the fork)
 
 These are `RawNode` methods, not config. Each needs: a Rust
