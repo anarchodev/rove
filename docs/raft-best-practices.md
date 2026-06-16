@@ -18,7 +18,7 @@ highest-value remaining items are *RawNode methods*, which need NEW `extern
 | Dispatch-gate (strict-serializable reads) | only the tenant group's leader runs the handler; a non-leader 421s BEFORE executing, so reads can't serve from a lagging follower. One gate for reads and writes | `worker_dispatch.zig`; `bridge.isSingleNode` |
 | Leader-hint cache | the front learns the leader from a 421→success re-aim and routes there directly — removes the per-read redirect tax; self-correcting on leadership change / dead leader | `front/proxy.zig` `LeaderCache` |
 | **transfer_leader** (graceful shutdown) | on SIGTERM the outgoing node hands every group it leads to the most caught-up *voter* before stopping the pump, so a rolling restart (`/deploy`) costs ~one heartbeat per group instead of a full election timeout | fork `raft_manager_transfer_leadership_away` (NEW extern fn, fork `feat/transfer-leader`) → `manager.transferLeadershipAway`; `node.zig` / `bridge.transferAllLeadership` (pump-thread control cmd); `rewind/main.zig` shutdown call + bounded drain |
-| **Multi-node WAL compaction + snapshots** | multi-node nodes now truncate the shared WAL (was single-node-only). The leader floors compaction at the cluster-wide min match index, capped by `wal_retention_max` (`REWIND_WAL_RETENTION_MAX`); a follower below the floor is caught up by a **data-carrying snapshot** (the tenant store bundle, S3-staged) instead of the log. All S3 I/O is off the pump (`SnapshotTemporarilyUnavailable` retry on generate; deferred-apply gate on receive). Unblocks `conf_change` (a learner bootstraps from a snapshot). | fork `raft_manager_min_match_index` / `raft_manager_pending_snapshot` + GroupedFileStorage `setSnapshotHooks` + `MemStorage.apply_snapshot` + `process_ready` snapshot handling (fork `feat/multinode-snapshot`); `consensus/snapshot.zig` (off-pump stager), `node.zig` provider/apply hooks + `durabilizeTick` floor, `kvstore.zig` `dumpTenantBundleReadOnly`/`loadSnapshotBundle`, `bridge.enableSnapshots`, `rewind/main.zig` |
+| **Multi-node WAL compaction (snapshot-free, lockstep)** | multi-node nodes now truncate the shared WAL (was single-node-only). The leader floors compaction at the cluster-wide **min match index** and **propagates that floor** on its outbound raft messages; a follower truncates to the same floor (`propagated_floor`). No node ever compacts past an entry a voter still needs, so a lagging/returning voter always catches up from the **log** — no in-raft snapshot, no dump on any node's hot path. WAL self-heals: a down voter pins the floor (WAL grows during the outage), advances on its return. A genuinely *new* member (conf_change learner / tenant move) bootstraps **out-of-band** (the move's follower-sourced off-pump bundle), not via raft. | fork `raft_manager_min_match_index`; `node.zig` `durabilizeTick` floor + `outboundFloor`/`applyRecvFloor`/`propagated_floor`, `transport.zig` per-record `floor` field + `drainFloors` (branch `feat/multinode-snapshot`) |
 
 Read-consistency contract is now **strict-serializable leader reads** (was
 eventual / read-your-writes-only-within-a-handler). The only residual gap is
@@ -72,21 +72,24 @@ is the worked example of the full FFI-method → re-pin → wiring path.)
 2. **`propose_conf_change` / `apply_conf_change` — membership changes /
    learners.** Add/remove voters one at a time; join new nodes as learners
    and promote after catch-up (avoids shrinking the quorum). **Now the top
-   remaining item** — and its hard prerequisite is met: data-carrying snapshots
-   ship (above), so a learner bootstraps from a snapshot instead of replaying
-   the whole log. Still needs: a `set_conf_state` storage callback (ConfState
-   is only read at `initial_state` / written via snapshot metadata today) + the
-   pump apply-path calling `apply_conf_change` on each committed conf-change
-   entry + CP node-join orchestration (learner-join → catch-up → promote). The
+   remaining item.** A learner does NOT catch up via an in-raft snapshot — it
+   bootstraps its tenant store **out-of-band** (the existing tenant-move bundle
+   pattern: dump on a follower/worker thread, off the leader's hot path; load;
+   then join raft already caught up, so raft replicates only the tail). Still
+   needs: a `set_conf_state` storage callback (ConfState is only read at
+   `initial_state` / written via snapshot metadata today) + the pump apply-path
+   calling `apply_conf_change` on each committed conf-change entry + CP node-join
+   orchestration (out-of-band bootstrap → learner-join → catch-up → promote). The
    GPF that blocked the early spike is fixed on fork `main` (`5092bc6`). Needed
    for runtime cluster growth (no `addCluster` runtime endpoint — see OVH prod).
 
-3. **`request_snapshot`** — follower-INITIATED snapshot pull. Mostly moot now:
-   leader-driven snapshots ship (a leader that finds a follower below its
-   `first_index` generates + sends one via the storage `snapshot` provider).
-   This method only adds the follower *proactively* asking — not needed for the
-   leader-driven catch-up path; revisit only if a follower must short-circuit
-   to a snapshot without waiting for the leader to notice.
+3. **`request_snapshot` — not needed.** rove does NOT use raft's in-protocol
+   snapshot transport for catch-up: existing voters catch up from the log
+   (lockstep min-match compaction never truncates past a voter), and a genuinely
+   new member bootstraps out-of-band (above). So neither the follower-initiated
+   pull nor the leader-driven `MsgSnapshot` path is wired — by design. An earlier
+   in-raft snapshot implementation was built then removed in favour of this
+   simpler model (it put a store dump on the leader's serving hot path).
 
 4. **`report_unreachable` / `report_snapshot`** — let the leader back off a
    dead/slow follower's send loop instead of spinning. Quality-of-implementation

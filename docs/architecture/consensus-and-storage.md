@@ -258,32 +258,27 @@ Three mechanisms keep the WAL bounded and a restart correct:
   truncate; the tick flushes the WAL once before its first truncate (the
   async-append durable `HardState.commit` lags the live commit by one fsync, and
   truncating past a non-durable commit would panic `RawNode::new` at recovery).
-  Single-node truncates to the durabilized index. **Multi-node** floors the
-  truncate point at the cluster-wide **min match index** (`raft_manager_min_match_index`)
-  — the leader keeps every entry a lagging voter still needs, so a slightly-behind
-  follower catches up from the log — capped by `wal_retention_max`
-  (`REWIND_WAL_RETENTION_MAX`, default `DEFAULT_WAL_RETENTION`): a voter further
-  behind than the cap is compacted past and caught up by a **data-carrying
-  snapshot** instead, bounding WAL growth during a follower outage. Multi-node
-  compaction is gated on snapshots being enabled (`snap_stager`), so the catch-up
-  net always exists. Physical segment-file GC reclaims fully-compacted segments
-  via `noteCompaction`.
-- **Snapshots (multi-node catch-up + the conf_change prerequisite).** When a
-  follower's `next_index` falls below the leader's `first_index`, raft-rs calls
-  the storage `snapshot` provider; rove dumps the tenant store read-only at
-  `durabilized_idx` (fast, pump-safe) and stages the bundle in S3
-  (`…/raft-snap/{idx}`) on an **off-pump** thread (`consensus/snapshot.zig`),
-  reporting `SnapshotTemporarilyUnavailable` until the upload lands (raft-rs
-  retries). The `MsgSnapshot` carries only a tiny descriptor — the bytes never
-  ride raft. On the follower, the pump's snapshot gate (`drivePendingSnapshot`,
-  via `raft_manager_pending_snapshot` — peeks the pending snapshot *without*
-  consuming a ready) fetches the bundle off-pump to a local staging file and
-  **defers** applying until it lands; then `process_ready` applies it
-  synchronously (`loadSnapshotBundle` → store + watermark advance together to the
-  snapshot index). A snapshot is installed durably before raft's `applied`
-  advances (the fork marks the ready persisted via `on_persist_ready` so
-  `advance_apply` doesn't outrun `persisted`). Validated by
-  `snapshot_catchup_smoke_v2` (forces the path with a tiny retention cap).
+  Single-node truncates to the durabilized index. **Multi-node compacts in
+  lockstep, snapshot-free**: the LEADER floors the truncate point at the
+  cluster-wide **min match index** (`raft_manager_min_match_index`) and
+  *propagates* that floor on its outbound raft messages (a per-record `floor`
+  field in `transport.zig`); a FOLLOWER truncates to the floor it last received
+  (`slot.propagated_floor`, monotonic). Both stop at the same point, so no node
+  ever compacts past an entry a voter still needs — a lagging/returning voter
+  always catches up from the **log**, never an in-raft snapshot, and nothing
+  dumps the store on any node's hot path. A down voter pins the floor (the WAL
+  grows during its outage, bounded by it, and self-heals on its return); a
+  permanently-dead voter holds the floor until it is removed (conf_change).
+  Physical segment-file GC reclaims fully-compacted segments via `noteCompaction`.
+- **New-member catch-up is out-of-band, not in-raft.** rove does **not** use
+  raft's in-protocol snapshot (`MsgSnapshot`) at all. A genuinely new group
+  member — a conf_change learner, or a tenant-move destination — bootstraps its
+  store out-of-band via the move bundle (`dumpTenantBundle` on a follower / the
+  worker request thread, off the leader's hot path → `loadTenantBundle` on the
+  destination → join raft already caught up, so raft replicates only the tail).
+  An earlier in-raft snapshot path (leader-generated `MsgSnapshot`, S3-staged
+  bundle) was built then removed: it put a store dump on the leader's serving
+  hot path, and lockstep compaction means existing voters never need it.
 - **Crash recovery.** At boot the Node opens the WAL with `SharedWal.open` (not
   `init`): it CRC-scans the segments, physically truncates only a *torn tail*,
   and buckets recovered records by `group_id`. `Bridge.recoverGroups` reads the
