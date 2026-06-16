@@ -237,18 +237,16 @@ fn workerMain(args: *WorkerCtx) !void {
     args.ready.set();
 
     var blocked_tenants: rjs.BlockedTenants = .{};
-    // Genesis (rewind-cli-plan §4.1 (f)): once we lead __admin__'s group and it
-    // has no deployment, deploy the baked deploy app so the cluster
-    // self-bootstraps. Polled (not promotion-edge) because a single-node group
-    // is born leader; the flag latches once __admin__ has any deployment.
-    var genesis_admin_done = false;
+    // Deploy capability is bootstrapped explicitly via `POST /_system/reset`
+    // (rewind-cli-plan §4) — the operator/harness deploys the baked `__admin__`
+    // app once, then publishes the full admin + customers THROUGH it. The same
+    // endpoint is break-glass (re-run to recover a bricked control tenant). No
+    // auto-deploy-on-boot magic.
     while (!stop_flag.load(.acquire)) {
         worker.pollWithTimeout(1 * std.time.ns_per_ms) catch |err| switch (err) {
             error.SignalInterrupt => continue,
             else => return err,
         };
-
-        if (!genesis_admin_done) genesis_admin_done = worker.ensureGenesisAdmin();
 
         try rjs.drainRequestReceiving(worker);
         try rjs.drainBodyPending(worker);

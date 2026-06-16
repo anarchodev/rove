@@ -59,18 +59,17 @@ def main() -> int:
             failures.append(label)
 
     with V2Cluster.spawn("admindeploy", nodes=1) as c:
-        print("step 1: provision __admin__ + target — genesis auto-deploys the baked deploy app")
-        r = c.provision("__admin__")
-        check("provision __admin__ → 204/409", r.status in (204, 409), f"got {r.status} {r.body!r}")
+        print("step 1: bootstrap the baked deploy app via POST /_system/reset")
+        c._ensure_admin_app()  # provision __admin__ + POST /_system/reset + wait 405
         r = c.provision(TARGET)
         check("provision target → 204", r.status == 204, f"got {r.status} {r.body!r}")
-        # NO explicit bootstrap: when this node leads __admin__'s group, genesis
-        # deploys the BAKED deploy app (rewind-cli-plan §4.1 (f)). The app
-        # answers on "/" — a GET → 405 POST-only confirms it's live.
+        # /_system/reset (root, no body) deployed the BAKED deploy app
+        # (rewind-cli-plan §4). The app answers on "/" — a GET → 405 POST-only
+        # confirms it's live.
         r = c.wait_for_handler("__admin__", "/", want_status=405, timeout_s=30.0)
-        check("genesis deploy app live (GET / → 405 POST-only)", r.status == 405, f"got {r.status} {r.body!r}")
+        check("reset deploy app live (GET / → 405 POST-only)", r.status == 405, f"got {r.status} {r.body!r}")
         if r.status != 405:
-            c.dump_node_log(grep=["genesis", "deploy", "admin", "promot", "loader", "error", "warn"])
+            c.dump_node_log(grep=["reset", "deploy", "admin", "loader", "error", "warn"])
 
         print("step 2: POST a bundle for `target` to the standing app")
         r = post_bundle(c, token=c.root_token, tenant=TARGET,

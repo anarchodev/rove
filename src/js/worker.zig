@@ -2258,32 +2258,30 @@ pub fn Worker(comptime opts: Options) type {
             }
         }
 
-        /// Genesis (rewind-cli-plan §4.1 (f)): deploy the BAKED `__admin__`
-        /// deploy app iff `__admin__` has no deployment yet — so a virgin
-        /// cluster self-bootstraps deploy capability with no external push, and
-        /// the full admin is then published THROUGH the app. Driven from the
-        /// worker poll loop (gated by a one-shot flag), NOT the promotion edge:
-        /// a single-node `__admin__` group is born leader (no follower→leader
-        /// edge), so we gate on an explicit `isLeaderOf` check instead.
+        pub const ResetError = error{ AdminNotInitialized, NotLeader, StageFailed, ProposeFailed };
+
+        /// `POST /_system/reset` (rewind-cli-plan §4) — bootstrap + break-glass.
+        /// (Re)deploy the BAKED `__admin__` deploy app and stamp
+        /// `_deploy/current`, so a virgin OR bricked control tenant recovers
+        /// deploy capability with no external bundle. The full admin and every
+        /// customer deploy are then published THROUGH the app — this is the ONLY
+        /// path that deploys the embedded bundle, and it accepts NO arbitrary
+        /// input.
         ///
-        /// Returns true once `__admin__` HAS a deployment (genesis or the full
-        /// admin) — the caller stops polling. Returns false to retry (group not
-        /// formed / not leader yet). Idempotent + never clobbers a real
-        /// deployment: the `_deploy/current` check (read from the speculative
-        /// overlay) settles it once anything is deployed. No dispatch batch
-        /// here, so it commits + proposes directly (like `handleRelease`).
-        pub fn ensureGenesisAdmin(self: *Self) bool {
+        /// Idempotent by construction: the baked bundle is content-addressed, so
+        /// re-running produces the same `dep_id` and merely re-stamps the release
+        /// marker (recovering a bricked deployment). No dispatch batch here, so
+        /// it commits + proposes directly (like `handleRelease`). Returns the
+        /// deployed `dep_id`; `error.NotLeader` if this node doesn't lead
+        /// `__admin__`'s group (caller retries against the leader).
+        pub fn deployBakedAdmin(self: *Self) ResetError!u64 {
             const a = self.allocator;
-            const inst = (self.node.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch return false) orelse return false;
-            if (inst.kv.get("_deploy/current")) |cur| {
-                a.free(cur);
-                return true; // already deployed (genesis ran, or the full admin) — done
-            } else |_| {}
-            // Only the leader of __admin__'s group deploys genesis. Group not
-            // formed yet, or we're a follower → retry on a later tick.
-            const gid = self.raft.gidForTenant(tenant_mod.ADMIN_INSTANCE_ID) orelse return false;
-            if (!self.raft.isLeaderOf(gid)) return false;
-            const compile_fn = self.compile_fn orelse return false;
+            const inst = (self.node.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch return error.AdminNotInitialized) orelse return error.AdminNotInitialized;
+            // Only the leader of __admin__'s group stamps the release; the group
+            // must be formed + led for the propose to land.
+            const gid = self.raft.gidForTenant(tenant_mod.ADMIN_INSTANCE_ID) orelse return error.NotLeader;
+            if (!self.raft.isLeaderOf(gid)) return error.NotLeader;
+            const compile_fn = self.compile_fn orelse return error.StageFailed;
 
             var release_ws = kv_mod.WriteSet.init(a);
             defer release_ws.deinit();
@@ -2296,40 +2294,40 @@ pub fn Worker(comptime opts: Options) type {
                 self.compile_ctx,
                 &release_ws,
             ) catch |err| {
-                std.log.warn("genesis-admin: stage failed: {s}", .{@errorName(err)});
-                return false;
+                std.log.warn("reset: stage failed: {s}", .{@errorName(err)});
+                return error.StageFailed;
             };
 
-            // Speculative-commit `_deploy/current` locally (makes the idempotency
-            // check above true immediately) + propose envelope-0 so followers
-            // see it. We lead __admin__'s group (checked above), so propose lands.
+            // Speculative-commit `_deploy/current` locally + propose envelope-0
+            // so followers see it. We lead __admin__'s group (checked above), so
+            // the propose lands.
             var txn = inst.kv.beginTrackedImmediate() catch |err| {
-                std.log.warn("genesis-admin: txn open failed: {s}", .{@errorName(err)});
-                return false;
+                std.log.warn("reset: txn open failed: {s}", .{@errorName(err)});
+                return error.StageFailed;
             };
             for (release_ws.ops.items) |op| switch (op) {
                 .put => |p| txn.put(p.key, p.value) catch {
                     txn.rollback() catch {};
-                    return false;
+                    return error.StageFailed;
                 },
                 .delete => |d| txn.delete(d.key) catch {
                     txn.rollback() catch {};
-                    return false;
+                    return error.StageFailed;
                 },
             };
             txn.commit() catch |err| {
-                std.log.warn("genesis-admin: commit failed: {s}", .{@errorName(err)});
-                return false;
+                std.log.warn("reset: commit failed: {s}", .{@errorName(err)});
+                return error.StageFailed;
             };
             _ = raft_propose.proposeWriteSet(self, &release_ws, inst.id, "") catch |err| {
-                std.log.warn("genesis-admin: propose failed: {s}", .{@errorName(err)});
-                return false;
+                std.log.warn("reset: propose failed: {s}", .{@errorName(err)});
+                return error.ProposeFailed;
             };
-            std.log.info("genesis-admin: deployed baked deploy app → __admin__ dep_id={x:0>16}", .{dep_id});
+            std.log.info("reset: deployed baked deploy app → __admin__ dep_id={x:0>16}", .{dep_id});
             if (self.node.deploy.deployment_loader) |loader| {
                 loader.enqueue(inst.id, dep_id) catch {};
             }
-            return true;
+            return dep_id;
         }
 
         /// Trampoline for `platform.releases.publish(tenant_id,

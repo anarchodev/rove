@@ -369,25 +369,80 @@ class V2Cluster:
         b = content.encode() if isinstance(content, str) else content
         return base64.b64encode(b).decode()
 
-    def deploy_bundle(self, tenant: str, files: list[dict], *, node: int = 0) -> str:
-        """POST a full bundle to the worker's `/_system/deploy` (files-server
-        dissolved into the worker — docs/rewind-cli-plan.md §4). `files` is a
-        list of `{"path","kind","content_type","b64"}` dicts. The worker
-        compiles handlers, content-addresses every file into the tenant's own
-        blobs, and stamps the manifest (off the poll loop, on the background
-        DeployThread). Returns the hex dep_id. Does NOT release.
+    def _ensure_admin_app(self) -> None:
+        """Idempotently bring up the standing __admin__ deploy app. Provision
+        __admin__ (forms its raft group), then POST /_system/reset (root-gated,
+        no body) — the worker's bootstrap+break-glass endpoint that (re)deploys
+        the BAKED deploy app and stamps _deploy/current (rewind-cli-plan §4).
+        reset stamps the release via raft, so a follower 503s — try each node
+        until the leader accepts. The app answers POST on "/" — a GET → 405
+        confirms it's live. Runs once per cluster."""
+        if getattr(self, "_admin_app_ready", False):
+            return
+        self.provision("__admin__")  # 204 or 409 (already) — both fine
+        deadline = time.time() + 30.0
+        last = None
+        while time.time() < deadline:
+            for n in range(len(self.node_ports)):
+                last = _curl(f"{self.node_url(n)}/_system/reset", method="POST",
+                             host=self.admin_host(n),
+                             headers={"Authorization": f"Bearer {self.root_token}"},
+                             timeout=30.0)
+                if last.status == 200:
+                    break
+            if last is not None and last.status == 200:
+                break
+            time.sleep(0.2)
+        if last is None or last.status != 200:
+            self.dump_node_log(grep=["reset", "deploy", "admin", "leader",
+                                     "loader", "error", "warn"])
+            raise RuntimeError(
+                f"/_system/reset bootstrap failed: "
+                f"{last.status if last else '?'} {last.body if last else ''!r}")
+        r = self.wait_for_handler("__admin__", "/", want_status=405, timeout_s=30.0)
+        if r.status != 405:
+            self.dump_node_log(grep=["reset", "deploy", "admin", "loader",
+                                     "error", "warn"])
+            raise RuntimeError(f"deploy app not live after reset: {r.status} {r.body!r}")
+        self._admin_app_ready = True
 
-        Deploy is not raft-gated (it writes content-addressed blobs, not a raft
-        entry), so any node accepts it — `node` just picks which to hit."""
+    def deploy_bundle(self, tenant: str, files: list[dict], *, node: int = 0) -> str:
+        """Deploy a full bundle by POSTing it to the standing __admin__ deploy
+        app through the front door (rewind-cli-plan §4 — the ONE deploy path;
+        the Zig /_system/deploy route is gone). `files` is a list of
+        `{"path","kind","content_type","b64"}` dicts. The app compiles handlers
+        (platform.compile), content-addresses every file into the TARGET
+        tenant's own blobs (cross-tenant platform.scope(t).blob.put), and stamps
+        the manifest (platform.scope(t).deploy.stampManifest — an S3 PUT, any
+        node). Returns the hex dep_id. Does NOT release.
+
+        `node` is vestigial (the front Host-routes to __admin__); kept for
+        call-site compatibility."""
+        import base64
         import json
-        r = _curl(f"{self.node_url(node)}/_system/deploy", method="POST",
-                  host=self.admin_host(node),
+        self._ensure_admin_app()
+        handlers, statics = [], []
+        for f in files:
+            if f.get("kind") == "static":
+                statics.append({"path": f["path"],
+                                "content_type": f.get("content_type",
+                                                      "application/octet-stream"),
+                                "b64": f["b64"]})
+            else:
+                handlers.append({"path": f["path"],
+                                 "source": base64.b64decode(f["b64"]).decode()})
+        r = _curl(f"{self.front_url()}/", method="POST",
+                  host=self.host_for("__admin__"),
                   headers={"Authorization": f"Bearer {self.root_token}",
                            "Content-Type": "application/json"},
-                  data=json.dumps({"tenant_id": tenant, "files": files}))
+                  data=json.dumps({"tenant": tenant, "handlers": handlers,
+                                   "statics": statics}), timeout=30.0)
         if r.status != 200:
             raise RuntimeError(f"deploy {tenant}: {r.status} {r.body}")
-        return json.loads(r.body)["dep_id"]  # 16-hex-digit string
+        payload = json.loads(r.body)
+        if payload.get("ok") is not True or not payload.get("dep_id"):
+            raise RuntimeError(f"deploy {tenant}: bad payload {r.body[:200]!r}")
+        return payload["dep_id"]  # 16-hex-digit string
 
     def release(self, tenant: str, dep_id: str | int, *, node: int = 0) -> HttpResponse:
         """POST the release flip. Leader-aware: the release proposes through
