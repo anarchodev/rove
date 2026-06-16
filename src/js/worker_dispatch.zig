@@ -3472,12 +3472,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 // requests get none, and the JS callables reject at the
                 // gate before reaching any trampoline. Scope reads go
                 // direct in globals.zig (no trampoline).
-                .platform_caps = if (handler_inst.platform != null) .{
-                    .ctx = @ptrCast(worker),
-                    .deploy_starter = &@TypeOf(worker.*).deployStarterTrampoline,
-                    .release_publish = &@TypeOf(worker.*).releasePublishTrampoline,
-                    .scope_kv_write = &@TypeOf(worker.*).scopeKvWriteTrampoline,
-                } else null,
+                .platform_caps = worker.adminPlatformCaps(handler_inst),
             },
             .trampolines = .{
                 // Phase 5 PR-3: §6.4 held-sync resume hook trampoline.

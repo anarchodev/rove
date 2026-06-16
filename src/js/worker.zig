@@ -2359,6 +2359,127 @@ pub fn Worker(comptime opts: Options) type {
             try self.applyTargetWrite(allocator, inst, target_id, &ws);
         }
 
+        /// The admin-handler platform capability bundle for `inst` —
+        /// `null` for non-admin instances. ONE source of truth so every
+        /// DispatchState construction site (inbound + every resume path:
+        /// bound-fetch / cont / fetch-event) wires the SAME caps; a
+        /// resume that forgot one silently broke privileged platform
+        /// writes (e.g. `platform.scope().blob` from a bound resume).
+        pub fn adminPlatformCaps(self: *Self, inst: *const tenant_mod.Instance) ?globals.PlatformCaps {
+            if (inst.platform == null) return null;
+            return .{
+                .ctx = @ptrCast(self),
+                .deploy_starter = &Self.deployStarterTrampoline,
+                .release_publish = &Self.releasePublishTrampoline,
+                .scope_kv_write = &Self.scopeKvWriteTrampoline,
+                .scope_blob_put = &Self.scopeBlobPutTrampoline,
+                .stamp_manifest = &Self.stampManifestTrampoline,
+            };
+        }
+
+        /// `platform.scope(t).blob.put` (rewind-cli-plan §4.1): stage a
+        /// content-addressed blob into the TARGET tenant's `file-blobs`.
+        /// The hash was already computed + returned to JS synchronously
+        /// (derivable from the bytes); this enqueues the deferred S3 PUT
+        /// on the background DeployThread (off the poll loop). Cross-tenant
+        /// — the admin tenant stages into any tenant, like `scope().kv`.
+        pub fn scopeBlobPutTrampoline(
+            ctx: *anyopaque,
+            _: std.mem.Allocator,
+            target_id: []const u8,
+            hash: []const u8,
+            bytes: []const u8,
+        ) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if ((self.node.tenant.getInstance(target_id) catch return error.InstanceNotFound) == null)
+                return error.InstanceNotFound;
+            const dt = self.deploy_thread orelse return error.DeployThreadUnavailable;
+            // Job memory uses the WORKER allocator (outlives the request
+            // tick — the DeployThread holds it across ticks).
+            const a = self.allocator;
+            const t = try a.dupe(u8, target_id);
+            errdefer a.free(t);
+            const k = try a.dupe(u8, hash);
+            errdefer a.free(k);
+            const p = try a.dupe(u8, bytes);
+            errdefer a.free(p);
+            self.next_compile_id += 1;
+            try dt.enqueue(.{ .compile_id = self.next_compile_id, .kind = .blob_put, .tenant_id = t, .key = k, .payload = p });
+        }
+
+        /// `platform.scope(t).deploy.stampManifest(entries)` (rewind-cli-plan
+        /// §4.1): compute the content-addressed dep_id + encode the manifest
+        /// (the native format), and enqueue its deferred PUT into the TARGET
+        /// tenant's `deployments/`. Returns the dep_id synchronously (it's
+        /// derivable from the entries). `entries_json` is the app's composed
+        /// entry array `[{path, kind, source_hex, bytecode_hex?,
+        /// content_type?}]` (JSON-stringified by the binding) — the app owns
+        /// composition; the engine owns the manifest format + id.
+        pub fn stampManifestTrampoline(
+            ctx: *anyopaque,
+            allocator: std.mem.Allocator,
+            target_id: []const u8,
+            entries_json: []const u8,
+        ) anyerror!u64 {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if ((self.node.tenant.getInstance(target_id) catch return error.InstanceNotFound) == null)
+                return error.InstanceNotFound;
+            const dt = self.deploy_thread orelse return error.DeployThreadUnavailable;
+
+            var parsed = std.json.parseFromSlice([]const struct {
+                path: []const u8,
+                kind: []const u8,
+                source_hex: []const u8,
+                bytecode_hex: []const u8 = "",
+                content_type: []const u8 = "",
+            }, allocator, entries_json, .{ .ignore_unknown_fields = true }) catch return error.InvalidEntries;
+            defer parsed.deinit();
+            const items = parsed.value;
+            if (items.len == 0 or items.len > 256) return error.InvalidEntries;
+
+            // Build native entries (borrow parsed strings — valid for this call).
+            const entries = try allocator.alloc(files_mod.FileStore.Entry, items.len);
+            defer allocator.free(entries);
+            for (items, 0..) |it, i| {
+                files_mod.validatePath(it.path) catch return error.InvalidEntries;
+                const kind: files_mod.Kind = if (std.mem.eql(u8, it.kind, "handler"))
+                    .handler
+                else if (std.mem.eql(u8, it.kind, "static"))
+                    .static
+                else
+                    return error.InvalidEntries;
+                if (it.source_hex.len != files_mod.HASH_HEX_LEN) return error.InvalidEntries;
+                var e: files_mod.FileStore.Entry = .{
+                    .path = @constCast(it.path),
+                    .kind = kind,
+                    .content_type = @constCast(it.content_type),
+                    .source_hex = undefined,
+                    .bytecode_hex = @splat(0),
+                };
+                @memcpy(&e.source_hex, it.source_hex[0..files_mod.HASH_HEX_LEN]);
+                if (kind == .handler) {
+                    if (it.bytecode_hex.len != files_mod.HASH_HEX_LEN) return error.InvalidEntries;
+                    @memcpy(&e.bytecode_hex, it.bytecode_hex[0..files_mod.HASH_HEX_LEN]);
+                }
+                entries[i] = e;
+            }
+
+            const dep_id = files_mod.manifest_json.computeDeploymentId(entries);
+            const json = try files_mod.manifest_json.encode(self.allocator, dep_id, entries); // owned → job
+            errdefer self.allocator.free(json);
+            var key_buf: [25]u8 = undefined;
+            const key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
+
+            const a = self.allocator;
+            const t = try a.dupe(u8, target_id);
+            errdefer a.free(t);
+            const k = try a.dupe(u8, key);
+            errdefer a.free(k);
+            self.next_compile_id += 1;
+            try dt.enqueue(.{ .compile_id = self.next_compile_id, .kind = .manifest_put, .tenant_id = t, .key = k, .payload = json });
+            return dep_id;
+        }
+
         /// Phase 5 PR-3: `_system.continuation.resumeIfBound`
         /// trampoline. Returns true when a parked continuation on
         /// this worker is bound to `send_id` and the tenant

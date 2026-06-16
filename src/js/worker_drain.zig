@@ -1547,7 +1547,7 @@ fn resumeContinuation(
         .activation = if (wake) .{ .wake_batch = .{} } else .send_callback,
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
         .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
-        .admin = .{ .platform = inst.platform },
+        .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
         .effects = .{ .pending_fetches = &pending_fetches },
     };
     std.log.info("rove-js corr: resume corr={s} request_id={d} tenant={s}", .{ correlation_id orelse "(none)", request_id, inst.id });
@@ -1990,7 +1990,7 @@ pub fn resumeBoundFetchChain(
         .activation_fetches_pending = fetches_pending,
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
         .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
-        .admin = .{ .platform = inst.platform },
+        .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
         .trampolines = .{
             .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
             .resume_if_bound_ctx = @ptrCast(worker),
@@ -3151,7 +3151,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
         .activation_fetches_pending = fetches_pending,
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
         .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
-        .admin = .{ .platform = inst.platform },
+        .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
         .trampolines = .{
             .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
             .resume_if_bound_ctx = @ptrCast(worker),

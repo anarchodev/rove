@@ -27,15 +27,23 @@
    */
   globalThis.platform = {
     /**
-     * Get a kv accessor scoped to another instance's `app.db`. The
-     * explicit cross-tenant accessor (replaces the old X-Rove-Scope
-     * global-kv rebind).
+     * Get accessors scoped to another instance — the explicit
+     * cross-tenant grant (replaces the old X-Rove-Scope global-kv rebind).
      *
      * @param {string} id - Target instance id (non-empty).
-     * @returns {{kv:{get:function,set:function,delete:function,prefix:function}}}
-     *   `kv` has the same four methods as the global {@link kv}, bound
-     *   to instance `id`. Unknown id throws
-     *   `Error{code:"InstanceNotFound"}`.
+     * @returns {{kv:object, blob:object, deploy:object}}
+     *   - `kv` — `{get, set, delete, prefix}`, the same as the global
+     *     {@link kv}, bound to instance `id`.
+     *   - `blob` — `{put(bytes, {content_type})}`: stage a content-addressed
+     *     blob into `id`'s file-blobs; returns the sha256 hash synchronously
+     *     (the PUT defers off the poll loop). The blob twin of `kv`.
+     *   - `deploy` — `{stampManifest(entries)}`: write a deployment manifest
+     *     into `id`'s deployments/ from the app's composed `entries`
+     *     (`[{path, kind, source_hex, bytecode_hex?, content_type?}]`);
+     *     returns the dep_id (16-hex). Compose deploys with
+     *     {@link platform.compile} + `blob.put` + `stampManifest`, then
+     *     activate with {@link platform.releases.publish}.
+     *   Unknown id throws `Error{code:"InstanceNotFound"}`.
      *
      * @example
      * const { kv: tenantKv } = platform.scope(req.instanceId);
