@@ -18,10 +18,10 @@ export default function () {
     return next({ tag: req.tag || "t" });
 }
 
-// Resumed by the timer wake. A timer carries no callee outcome, so the
-// runtime invokes `onWake(ctx)` with just the parked ctx. Returning a
-// value is terminal — flushed to the held socket, completing the one
-// synchronous request.
-export function onWake(ctx) {
+// Resumed by the timer wake. The parked `next({ctx})` rides
+// `request.ctx` (Endpoint A). Returning a value is terminal — flushed to
+// the held socket, completing the one synchronous request.
+export function onWake() {
+    const ctx = request.ctx || {};
     return "woke:" + ctx.tag;
 }

@@ -506,7 +506,7 @@ fn resumeStream(
     // field (a timer wake has no callee result). Handlers read
     // `request.activation` (set via the dispatcher's
     // `activation_source` field, exposed in globals) to branch.
-    const body = try std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json});
+    const body = try synthCtxBody(allocator, chain_st.ctx_json);
     defer allocator.free(body);
     const spath = try std.fmt.allocPrint(allocator, "/{s}", .{path});
     defer allocator.free(spath);
@@ -933,7 +933,7 @@ pub fn resumeBoundFetchStream(
     // engines — request.body is overridden in globals.zig with the
     // chunk bytes for bound fetch_chunk activations
     // (`activation_entity != null` gate).
-    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json}) catch return;
+    const body = synthCtxBody(allocator, chain_st.ctx_json) catch return;
     defer allocator.free(body);
     // Custom `name:` override (matches resumeBoundFetchChain's
     // first-chunk handling) — else the conventional fetch export
@@ -1228,6 +1228,28 @@ pub fn resumeBoundFetchStream(
 // is the `FinishSpec` axes plus the Request each one synthesizes.
 // `firePrep` owns the prep block (deployment pin, txn, writeset,
 // readset, request-id mint); `runFire` owns the run + outcome switch.
+
+/// Synthesize a continuation resume's request body: the `next({ctx})`
+/// payload as the `{"ctx":<ctx_json>}` envelope that `installRequest`
+/// (`globals.zig`) lifts back to `request.ctx`. The SINGLE producer of the
+/// shape every WS / SSE / wake / continuation / durable-wake resume emits —
+/// kept paired with the one `liftThreadedCtx` reader so the two can't drift
+/// (decisions.md §4.9; the divergence that motivated Endpoint A was ~14
+/// copies of this format string). `ctx_json` is JSON text embedded verbatim
+/// (`"{}"` / `"null"` for none / a `msg`/`ctx` payload). Caller owns the result.
+pub fn synthCtxBody(allocator: std.mem.Allocator, ctx_json: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{ctx_json});
+}
+
+/// Synthesize an effect-RESULT delivery body: `{"ctx":{result, context}}` —
+/// the shape the `send_callback` hoist flattens onto `request.body`/`.status`
+/// (metadata → `request.activation`, `context` → `request.ctx`). Used by a
+/// bound effect's `on_result` hop AND a §6.4 held-sync resume (the held
+/// handler's threaded ctx fills `context`), so both read one way. Args are
+/// JSON text. Caller owns the result.
+pub fn synthResultBody(allocator: std.mem.Allocator, result_json: []const u8, context_json: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{{\"ctx\":{{\"result\":{s},\"context\":{s}}}}}", .{ result_json, context_json });
+}
 
 /// Prep state shared by every connectionless fire. Build with
 /// `firePrep`; `deinit` releases everything not explicitly handed
@@ -1664,7 +1686,7 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
     var p = firePrep(worker, chain_ctx.tenant_id, path, "stream-disconnect") orelse return;
     defer p.deinit(allocator);
 
-    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json}) catch return;
+    const body = synthCtxBody(allocator, chain_st.ctx_json) catch return;
     defer allocator.free(body);
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
     defer allocator.free(spath);
@@ -1758,7 +1780,7 @@ pub fn fireSubscriptionActivation(
     // correlation_id. (The handler can pass ctx forward via its
     // own kv state if it wants persistent chain state across
     // fires; the platform doesn't carry any.)
-    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{{}}}}", .{}) catch return;
+    const body = synthCtxBody(allocator, "{}") catch return;
     defer allocator.free(body);
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
     defer allocator.free(spath);
@@ -1913,7 +1935,7 @@ fn fireDurableWakeActivation(worker: anytype, dw: *effect_mod.msg.DurableWake) v
     // The customer target reads `request.activation.msg`; also surface
     // the msg as `request.body = {"ctx": <msg>}` for uniformity with
     // the other fire paths (`JSON.parse(request.body).ctx`).
-    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{dw.msg_json}) catch return;
+    const body = synthCtxBody(allocator, dw.msg_json) catch return;
     defer allocator.free(body);
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
     defer allocator.free(spath);
@@ -2001,7 +2023,7 @@ fn fireChainedActivation(
     defer p.deinit(allocator);
 
     const ctx_src: []const u8 = if (sc.ctx_json.len > 0) sc.ctx_json else "null";
-    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{ctx_src}) catch return;
+    const body = synthCtxBody(allocator, ctx_src) catch return;
     defer allocator.free(body);
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
     defer allocator.free(spath);
@@ -3030,7 +3052,7 @@ pub fn fireFetchEventActivation(
     // Body `{ctx: <ctx_json>}`. `ctx_json` is the chain ctx the
     // originating `http.fetch` call passed; empty → `{}`.
     const ctx_src: []const u8 = if (event.ctx_json.len > 0) event.ctx_json else "{}";
-    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{ctx_src}) catch return;
+    const body = synthCtxBody(allocator, ctx_src) catch return;
     defer allocator.free(body);
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
     defer allocator.free(spath);

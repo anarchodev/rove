@@ -56,6 +56,14 @@ MOVE_SECRET = "rewindmovesecretpadding0123456789abcdef0"
 JWT_SECRET_HEX = "a" * 64  # LOOP46_SERVICES_JWT_SECRET
 PUBLIC_SUFFIX = "localhost"
 
+# Base dir for node/cp/files/log DATA dirs (the raft WAL lives here). Defaults to
+# /tmp — which on most Linux distros is TMPFS (RAM), making the WAL fsync a no-op.
+# That's fine (fast) for functional smokes, but USELESS for an fsync-sensitive
+# soak: a too-tight election timeout only flakes when fsync actually STALLS on
+# real disk. Set V2_SMOKE_DATA_BASE to a real-disk path (e.g. under $HOME) so the
+# WAL fsync hits the NVMe and the pause tail is real.
+_DATA_BASE = os.environ.get("V2_SMOKE_DATA_BASE", "/tmp")
+
 # ── fn-RPC dispatch recipe ──────────────────────────────────────────────
 # The platform invokes only the activation's conventional export
 # (decisions.md §4.5) — `?fn=`/`{fn,args}` routing is handler JS. This is
@@ -103,6 +111,31 @@ def rpc_wrap(src: str) -> str:
     names = list(dict.fromkeys(_EXPORT_FN_RE.findall(src)))
     assert names, "rpc_wrap: no exported named functions found"
     return RPC_SHIM + src + "\nexport default __rpc({ " + ", ".join(names) + " });\n"
+
+
+def metric_counter(text: str, name: str) -> Optional[float]:
+    """Value of a single Prometheus counter/gauge line `name <value>` in the
+    `/_system/metrics` text, or None if absent."""
+    for line in text.splitlines():
+        if line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == name:
+            try:
+                return float(parts[1])
+            except ValueError:
+                return None
+    return None
+
+
+def metric_hist_mean_us(text: str, name: str) -> Optional[tuple[float, int]]:
+    """(_sum/_count, _count) for a Prometheus histogram `name` in µs, or None if
+    no samples. For `raft_heartbeat_rtt_us` this is (mean broadcastTime µs, n)."""
+    s = metric_counter(text, name + "_sum")
+    c = metric_counter(text, name + "_count")
+    if s is None or c is None or c == 0:
+        return None
+    return (s / c, int(c))
 
 
 def _free_base(default: int) -> int:
@@ -206,9 +239,9 @@ class V2Cluster:
             front_port=front_port or (base + 51),
             log_port=base + 53,
             s3_prefix=f"v2smoke-{tag}-{pid}/",
-            data_dirs=[Path(f"/tmp/v2smoke-{tag}-n{i}-{pid}") for i in range(nodes)],
-            cp_data_dir=Path(f"/tmp/v2smoke-{tag}-cp-{pid}"),
-            log_data_dir=Path(f"/tmp/v2smoke-{tag}-log-{pid}"),
+            data_dirs=[Path(f"{_DATA_BASE}/v2smoke-{tag}-n{i}-{pid}") for i in range(nodes)],
+            cp_data_dir=Path(f"{_DATA_BASE}/v2smoke-{tag}-cp-{pid}"),
+            log_data_dir=Path(f"{_DATA_BASE}/v2smoke-{tag}-log-{pid}"),
             unsafe_outbound=unsafe_outbound,
         )
         for d in (*c.data_dirs, c.cp_data_dir):
@@ -615,19 +648,28 @@ class V2Cluster:
             print(f"    | {ln}")
 
     # ── multi-node (failover smokes) ───────────────────────────────────
+    def leader_now(self, tenant: str, *, nodes: Optional[list[int]] = None) -> Optional[int]:
+        """Single-shot (NO polling): index of a live node whose
+        `/_system/v2-leader` returns 200 for `tenant`, else None. For tight
+        failover-timing loops where the 0.4s `leader_node` poll is too coarse."""
+        for i in (nodes if nodes is not None else range(len(self.node_ports))):
+            if i not in self.node_procs or self.node_procs[i].poll() is not None:
+                continue
+            r = _curl(f"{self.node_url(i)}/_system/v2-leader?tenant={tenant}",
+                      headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+            if r.status == 200:
+                return i
+        return None
+
     def leader_node(self, tenant: str, *, deadline_s: float = 20.0) -> Optional[int]:
         """Index of the node currently leading `tenant`'s raft group (the node
         whose `/_system/v2-leader` returns 200), or None. Polls until a leader
         appears (a freshly-formed/re-elected group needs a moment)."""
         deadline = time.time() + deadline_s
         while time.time() < deadline:
-            for i, port in enumerate(self.node_ports):
-                if i not in self.node_procs or self.node_procs[i].poll() is not None:
-                    continue
-                r = _curl(f"{self.node_url(i)}/_system/v2-leader?tenant={tenant}",
-                          headers={"X-Rewind-Move-Secret": MOVE_SECRET})
-                if r.status == 200:
-                    return i
+            got = self.leader_now(tenant)
+            if got is not None:
+                return got
             time.sleep(0.4)
         return None
 
@@ -642,6 +684,24 @@ class V2Cluster:
         except subprocess.TimeoutExpired:
             p.kill()
             p.wait()
+
+    def kill_node(self, i: int) -> None:
+        """SIGKILL node `i` — a HARD crash with NO graceful leadership handoff
+        (unlike `stop_node`'s SIGTERM, which triggers transfer_leader). Use this
+        to measure ELECTION-timeout failover (the latency `election_tick` governs)
+        rather than the graceful ~one-heartbeat handoff."""
+        p = self.node_procs.get(i)
+        if p is None or p.poll() is not None:
+            return
+        p.send_signal(signal.SIGKILL)
+        p.wait()
+
+    def metrics(self, node: int = 0) -> str:
+        """Fetch the node's Prometheus `/_system/metrics` text (root-token gated).
+        Returns "" if the node is down / unreachable."""
+        r = _curl(f"{self.node_url(node)}/_system/metrics",
+                  headers={"Authorization": f"Bearer {self.root_token}"})
+        return r.body if r.status == 200 else ""
 
     def start_node(self, i: int) -> None:
         """Re-spawn node `i` with its original voter/peer config (rejoins the

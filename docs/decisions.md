@@ -464,6 +464,125 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   (the read-recording model makes it the handler-code author's explicit,
   auditable choice instead).
 
+### 4.7 One effect-result surface — flattened, no `request.result`
+- **Partially superseded by §4.9** (2026-06-15): the flatten-the-result decision
+  stands, but where the *threaded ctx* and *delivery metadata* live changed —
+  §4.7 put both on `request.ctx` (as `{context, attempts, error, id, headers,
+  hash}`); §4.9 makes `request.ctx` the **bare** threaded value and moves the
+  metadata to `request.activation.*`. Read §4.9 for the current contract.
+- **Decision** (2026-06-15): every effect-result resume — a bound `on.fetch` /
+  `blob.get` (held chain) **and** a connectionless `webhook.send` / `blob.put` /
+  `retry` `on_result` callback — presents the result the **same** way: the
+  response bytes on `request.body`, `request.status` / `request.ok` /
+  `request.done` at the **top level**, and the echoed customer `context` +
+  per-path delivery metadata (`attempts`, `error`, `id`, `headers`, blob `hash`)
+  on `request.ctx`. **`request.result` does not exist** in any path — it was a
+  doc fiction referenced in ~6 sites and implemented nowhere.
+- **Why**: the surface had drifted into two real shapes — the bound path was
+  already flattened (`request.body` + top-level status, the shipped/verified
+  `onFetchChunk` contract), while the connectionless `on_result` arrived as a
+  nested `JSON.parse(request.body).ctx.result` envelope. Two shapes for one
+  concept is the "converge to one pattern" smell; the docs papering it with a
+  third, non-existent `request.result` made it worse. The bound shape won
+  because it's the one customers already use and the only one that also models
+  streaming chunks.
+- **Mechanism**: the `on_result` hop is a `.send_callback` activation whose body
+  is `{"ctx":{result, context}}`. The runtime (`globals.zig`) detects that
+  shape (a `.ctx.result` object, with no top-level `outcome` — which
+  distinguishes it from the §13 held-sync `{ctx, outcome}` resume and from
+  `webhook_onresult`'s own self-hops, which carry no `result`) and hoists it
+  onto the flattened surface. No new envelope type, no marker. The internal
+  shims (`oidc`/`segments_onsealed`/…) that consume a result were migrated to
+  read the flattened surface — they are not back-compat-frozen (pre-real-user).
+- **Rejected**: making `request.result` real (a second way to read the same
+  thing — option-multiplication); standardizing on `request.ctx.result` (keeps
+  a `result` indirection the bound path never had). Verified e2e by the webhook,
+  webhook-recovery (durable wake), and blob+segments smokes + dispatcher unit
+  tests.
+
+### 4.9 One ctx convention — `request.ctx` for every `next()` continuation (Endpoint A)
+- **Decision** (2026-06-15): there is **one** way an `on*` handler reads the state
+  threaded into it. Every activation that is a continuation of a prior
+  `next({ctx})` on the same chain reads that payload as **`request.ctx`**;
+  results (effect responses, callee outcomes) flatten onto **`request.body`** +
+  top-level **`request.status`/`.ok`/`.done`**; and per-activation metadata
+  (delivery `attempts`/`error`/`id`/`headers`, blob `hash`, the wake `wakes[]`)
+  lives on **`request.activation.*`**. The single rule: **`request.ctx` = what you
+  threaded · `request.body`/`.status` = the result · `request.activation` = why/how
+  this activation fired.** `request.ctx` is simply `undefined` on the first
+  activation of a chain (nothing threaded yet) and on a standalone scheduled
+  `durable_wake` (it carries `request.activation.msg`, not a threaded ctx).
+- **Why**: the surface had drifted into **three** shapes for the same idea. (1)
+  `request.ctx` for fetch resumes / `onChunk` / `send_callback`. (2) A **positional
+  argument** `onWake(ctx)` for wakes — and only over WS; the SSE wake path passed
+  a `{"ctx":…}` body that nothing lifted, so `onWake(ctx)` silently got `undefined`
+  there. (3) A positional `onResult(ctx, outcome)` for the §13/§6.4 held-sync
+  resume, with the result as a second arg. Three spellings of "the runtime handed
+  me something" is the converge-to-one-pattern smell; it also blocked threading
+  transient per-frame state through a held WS `onMessage` without a kv round-trip
+  (the browser-agent screenshot bounce surfaced it). We picked `request.ctx`
+  (Endpoint A) over positional-args-everywhere because the handler model is
+  no-arg functions reading `request`/`response` globals, the first activation has
+  no ctx to pass (an always-`undefined` first param is worse than `request.ctx`
+  reading `undefined`), and `onResult` shows positional args aren't even uniform
+  (sometimes two).
+- **Mechanism**: `installRequest` (`globals.zig`) lifts the `next({ctx})` payload
+  from the synthesized `{"ctx":…}` body to `request.ctx` for `ws_message` /
+  `disconnect` / `kv_wake` / `wake_batch` / `timer` (the kinds that replace
+  `request.body` — bound fetch, inbound chunk — lift inline first). The wake +
+  held-sync resume paths (`worker_ws.resumeWakeChainWs`,
+  `worker_drain.resumeContinuation`) stopped passing positional `[ctx]` /
+  `[ctx, outcome]` and now build the same `{"ctx":…}` body envelope; a held-sync
+  outcome is wrapped into the **same** `{"ctx":{result, context}}` shape an
+  `on_result` hop uses (the held handler's threaded ctx fills `context`), so the
+  one `send_callback` hoist serves both — flattening `result` → `request.body`/
+  `.status`, `context` → `request.ctx`, metadata → `request.activation.*`.
+- **Migrated** (pre-real-user, no back-compat): `onWake(ctx)` → `onWake()` reading
+  `request.ctx`; held-sync `onResult(ctx, outcome)` → `onResult()` reading
+  `request.body`/`.ok`/`request.ctx`; the on_result shims (`oidc._event`,
+  `segments_onsealed`) + examples + smokes moved metadata reads from `request.ctx.*`
+  to `request.activation.*`. Verified e2e by the heldsync (+concurrent), webhook,
+  webhook-recovery, blob (+segments), on_kv, on_timer, ws-wake, and browser-agent
+  smokes + dispatcher unit tests. **Note**: `blob.seal`/`blob.receive`'s
+  `request.ctx.hash` is a *threaded* ctx (the seal/receive `next({hash})`), not
+  delivery metadata — it stays on `request.ctx`.
+
+### 4.8 Browser-agent surface (`browser.*`) — same-origin, vendor-neutral, structural-by-default
+- **Decision** ("a Playwright for LLMs", 2026-06-15; `handler-shape.md` §5.9,
+  shim `globals/browser.js`, SDK `web/rove-agent.js`): offer an LLM-drives-a-UI
+  surface **scoped to the customer's own app** — an in-page same-origin SDK over
+  a held WebSocket, paired with a `browser.*` JS-shim (same pattern as
+  `webhook.send`). An agent acting inside the customer's *own* page is roughly
+  equivalent to JS the customer can already run there → **no new trust
+  boundary**, no install, no cross-origin reach.
+- **Vendor-neutral brain**: the LLM call is the customer's own `on.fetch` with
+  their key; `browser.tools()` returns a generic action schema the customer
+  adapts to their model (the reference handler shows the Claude wiring). Durable
+  reasoning state (goal, transcript) rides `kv`; the live tab + socket are
+  ephemeral hands that re-derive on reload (durable-brain / ephemeral-hands).
+- **Perception is structural by default**: an enriched DOM/accessibility
+  snapshot (geometry + computed visibility + occlusion), pixel-free and
+  token-cheap. True pixel capture (`getDisplayMedia` → `blob.put`) is a separate
+  **opt-in** tier, not the default. The triad is DOM = *what*, screenshot =
+  *how it looks*, replay = *why*.
+- **Safety split**: rove-enforced & non-disableable (same-origin only; a visible
+  "agent is driving · STOP" indicator + kill switch; screenshots only via the
+  explicit consent path) vs customer-configured policy (which actions need human
+  confirmation — `browser.confirm` — element allowlists, marking untrusted
+  page content as a prompt-injection surface).
+- **Pluggable brain**: the snapshot/action protocol is brain-agnostic, so the
+  same surface can later be driven by the end-user's local Claude over **MCP**
+  (a relay + session-pairing handshake) with no SDK/protocol change.
+- **Replay-context channel** (the differentiator) is **deferred + security-gated**:
+  `getReplay(sinceSeq)` must wait on the log-server JWT becoming tenant/session-
+  scoped (`log_server/standalone.zig` discards the verify — the latent-CRITICAL
+  from the 2026-06 audit). The protocol carries the session id from day one so
+  this lights up without a retrofit.
+- **Rejected**: a general "drive the user's whole browser" extension — a loaded
+  gun an untrusted customer wields against their end-users (confused-deputy,
+  prompt-injection, nothing rove can vouch for). Scoping to the customer's own
+  app drops the scary part while keeping the LLM-enhanced-app use case.
+
 ---
 
 ## 5. Readset replication

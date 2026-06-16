@@ -1769,6 +1769,10 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // segments composes kv + blob + TextDecoder (all above) — pure
     // JS, no natives of its own (blob-storage-plan §6; `docs/architecture/routing-and-ingress.md`).
     evalSnippet(ctx, "segments.js", SEGMENTS_JS);
+    // browser.* is pure protocol/formatting over the ambient `stream`
+    // global (referenced lazily at call time, so order-independent) —
+    // the server side of web/rove-agent.js. No natives of its own.
+    evalSnippet(ctx, "browser.js", BROWSER_JS);
     // users is standalone (kv + crypto.{randomBytes,sha256}).
     evalSnippet(ctx, "users.js", USERS_JS);
     // activitypub depends on base64url/hex/btoa + crypto + http +
@@ -2031,6 +2035,7 @@ const USERS_JS = @embedFile("users_js");
 const ACTIVITYPUB_JS = @embedFile("activitypub_js");
 const BLOB_JS = @embedFile("blob_js");
 const SEGMENTS_JS = @embedFile("segments_js");
+const BROWSER_JS = @embedFile("browser_js");
 
 /// (public name, embedded source) for every `globals/*.js` file. The
 /// single list the Phase-A lints below pivot on: each `.src` is an
@@ -2065,6 +2070,7 @@ const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "activitypub", .src = ACTIVITYPUB_JS },
     .{ .name = "blob", .src = BLOB_JS },
     .{ .name = "segments", .src = SEGMENTS_JS },
+    .{ .name = "browser", .src = BROWSER_JS },
 };
 
 fn installNamespace(ctx: *c.JSContext, global: c.JSValue, ns: NamespaceBindings) void {
@@ -2120,6 +2126,29 @@ fn evalSnippet(ctx: *c.JSContext, name: [*:0]const u8, source: []const u8) void 
 /// globals populated from the incoming request. Called AFTER
 /// `Snapshot.restore` on every request. Cheap — just a handful of
 /// `JS_SetPropertyStr` calls.
+/// Lift a held chain's `next({ctx})` payload onto `request.ctx`, given a
+/// synthesized `{"ctx":<ctx_json>}` body. The continuation resumes whose
+/// `Request.body` IS that envelope (`.ws_message`, `.disconnect`) share
+/// this so every held-connection `on*` handler reads ctx the same way the
+/// fetch-resume path does. NUL-terminate before `JS_ParseJSON` (quickjs
+/// requires it); a non-JSON / ctx-less body simply leaves `request.ctx`
+/// unset. The kinds that REPLACE `request.body` (bound fetch, inbound
+/// chunk) lift their ctx inline before the swap instead.
+fn liftThreadedCtx(ctx: *c.JSContext, req_obj: c.JSValue, body: []const u8, allocator: std.mem.Allocator) void {
+    if (body.len == 0) return;
+    const buf = allocator.allocSentinel(u8, body.len, 0) catch return;
+    defer allocator.free(buf);
+    @memcpy(buf, body);
+    const parsed = c.JS_ParseJSON(ctx, buf.ptr, body.len, "<chain ctx>");
+    if (c.JS_IsException(parsed)) {
+        _ = c.JS_GetException(ctx); // clear; leave request.ctx unset
+        return;
+    }
+    defer c.JS_FreeValue(ctx, parsed);
+    // Setter consumes the ctx_val reference.
+    _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", c.JS_GetPropertyStr(ctx, parsed, "ctx"));
+}
+
 pub fn installRequest(
     ctx: *c.JSContext,
     state: *DispatchState,
@@ -2487,6 +2516,25 @@ pub fn installRequest(
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "data", data_val);
     }
 
+    // Endpoint A — uniform ctx threading (decisions.md, supersedes §4.7's
+    // ctx-envelope): every activation that is a continuation of a prior
+    // `next({ctx})` reads that payload as `request.ctx`. These kinds carry
+    // it as the synthesized `{"ctx":<ctx_json>}` body (the WS / SSE / wake
+    // / continuation resume paths all build that envelope), so lift it once
+    // here. The kinds that REPLACE `request.body` with their own bytes
+    // (`fetch_chunk`, `inbound_chunk`) lift inline before the swap; the
+    // result-bearing `send_callback` lifts in its hoist below. `request.ctx`
+    // is simply undefined on the first activation of a chain (no prior
+    // `next`).
+    if (request.activation == .ws_message or
+        request.activation == .disconnect or
+        request.activation == .kv_wake or
+        request.activation == .wake_batch or
+        request.activation == .timer)
+    {
+        liftThreadedCtx(ctx, req_obj, request.body, state.allocator);
+    }
+
     // gap 2.4 / inbound-chunk-plan: streaming inbound body chunk.
     // `Request.body` carries the raw chunk; re-surface it as a
     // Uint8Array (chunks are arbitrary bytes — same posture as the
@@ -2556,6 +2604,64 @@ pub fn installRequest(
         } else |_| {
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "msg", js_null);
         }
+    }
+
+    // ── Unified effect-result surface (handler-shape.md §7, Endpoint A) ──
+    // A customer `on_result` hop (`webhook.send` / `blob.put` / `retry.send`)
+    // AND a §6.4 held-sync resume both arrive as `.send_callback` with
+    // `request.body = {"ctx":{result, context}}` — the held-sync producer
+    // (worker_drain.resumeContinuation) now wraps the outcome into the SAME
+    // shape, so there is ONE surface. Present it exactly like a bound-fetch
+    // FINAL: `request.body` = the response bytes, top-level
+    // `request.status`/`.ok`/`.done`; the THREADED ctx (the echoed `context`
+    // for an on_result hop, the held handler's `next({ctx})` for held-sync)
+    // on `request.ctx`; and the per-delivery metadata that is NOT part of the
+    // universal response surface (`attempts`/`error`/`id`/`headers` for
+    // webhook, `hash` for blob) on `request.activation.*` — "why/how this
+    // activation fired." This keeps the one rule whole: `request.ctx` = what
+    // you threaded, `request.body`/`.status` = the result, `request.activation`
+    // = metadata. There is no `request.result`.
+    if (request.activation == .send_callback and request.body.len > 0) hoist: {
+        const buf = state.allocator.allocSentinel(u8, request.body.len, 0) catch break :hoist;
+        defer state.allocator.free(buf);
+        @memcpy(buf, request.body);
+        const parsed = c.JS_ParseJSON(ctx, buf.ptr, request.body.len, "<send_callback>");
+        if (c.JS_IsException(parsed)) {
+            _ = c.JS_GetException(ctx); // not JSON — leave request as-is
+            break :hoist;
+        }
+        defer c.JS_FreeValue(ctx, parsed);
+
+        const cb_ctx = c.JS_GetPropertyStr(ctx, parsed, "ctx");
+        defer c.JS_FreeValue(ctx, cb_ctx);
+        if (!c.JS_IsObject(cb_ctx)) break :hoist;
+        const result = c.JS_GetPropertyStr(ctx, cb_ctx, "result");
+        defer c.JS_FreeValue(ctx, result);
+        if (!c.JS_IsObject(result)) break :hoist; // not a result delivery
+                                                  // (webhook_onresult self-hops)
+
+        // Result → the universal response surface. `body` is a setter-less
+        // read-taping accessor by default — DEFINE replaces it (a plain
+        // [[Set]] no-ops); the bytes derive from the taped fetch response,
+        // so no extra taping. JS_GetPropertyStr returns an owned ref that
+        // Set/Define steals.
+        _ = c.JS_DefinePropertyValueStr(ctx, req_obj, "body", c.JS_GetPropertyStr(ctx, result, "body"), c.JS_PROP_C_W_E);
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "status", c.JS_GetPropertyStr(ctx, result, "status"));
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "ok", c.JS_GetPropertyStr(ctx, result, "ok"));
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "done", js_true);
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "body_truncated", c.JS_GetPropertyStr(ctx, result, "body_truncated"));
+
+        // request.ctx = the bare threaded value (what the customer passed
+        // as `context:` / `next({ctx})`) — NOT an envelope.
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", c.JS_GetPropertyStr(ctx, cb_ctx, "context"));
+
+        // Delivery metadata → request.activation.* (absent fields read
+        // undefined: blob has no attempts/error; webhook has no hash).
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "attempts", c.JS_GetPropertyStr(ctx, result, "attempts"));
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "error", c.JS_GetPropertyStr(ctx, result, "error"));
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "id", c.JS_GetPropertyStr(ctx, result, "id"));
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "headers", c.JS_GetPropertyStr(ctx, result, "headers"));
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "hash", c.JS_GetPropertyStr(ctx, result, "hash"));
     }
 
     _ = c.JS_SetPropertyStr(ctx, req_obj, "activation", activation_obj);
@@ -3144,6 +3250,11 @@ test "harden: _system unreachable post-installStatic, shims still bound (Phase A
         \\  if (typeof platform !== "object" ||
         \\      typeof platform.root.get !== "function")
         \\    throw new Error("platform nested shim broke");
+        \\  if (typeof browser !== "object" ||
+        \\      typeof browser.message !== "function" ||
+        \\      typeof browser.act !== "function" ||
+        \\      typeof browser.render !== "function")
+        \\    throw new Error("browser shim broke (IIFE snapshot-freeze regression)");
         \\  return true;
         \\})();
     ;

@@ -62,8 +62,9 @@ export default function () {
     if (owed_raw == null) return { status: 200 };
     const owed = JSON.parse(owed_raw);
 
-    // Result shape — the customer's on_result handler receives
-    // this as request.body.ctx.result.
+    // Result shape — handed to __rove_next as {ctx:{result, context}};
+    // the runtime then flattens it onto the customer's on_result request
+    // surface (request.body/.status/.ok + request.ctx; globals.zig).
     const body_text = (a.kind === "fetch_chunk")
         ? new TextDecoder().decode(a.bytes)
         : (ctx.result_body || "");

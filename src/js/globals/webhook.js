@@ -121,10 +121,11 @@ globalThis.webhook = {
    *   is written but no `http.fetch` happens until the wake fires).
    *   Omit or `<= now` for fire-as-soon-as-handler-commits.
    * @param {string} [opts.on_result] - Module path of a customer
-   *   result handler. Receives the terminal event as
-   *   `request.body.ctx.result = {ok, status, body, headers,
-   *   body_truncated, attempts, error?, context, id}` — the
-   *   `__system/webhook_onresult` shim chains via `__rove_next`.
+   *   result handler. Receives the terminal event on the unified
+   *   flattened surface (handler-shape §7): the response on
+   *   `request.body` / `request.status` / `request.ok` /
+   *   `request.body_truncated`, with `{attempts, error?, id, headers,
+   *   context}` on `request.ctx`. There is no `request.result`.
    * @param {*} [opts.context] - Opaque customer payload echoed back
    *   on the result event.
    * @returns {string} The marker id. Same value as the `handle` when

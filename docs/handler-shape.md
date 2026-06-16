@@ -403,7 +403,7 @@ export function onChunk() {
 }
 
 export function onPut() {                        // each PUT result resumes here (held)
-  if (request.result.status >= 400) { response.status = 502; return 'storage failed'; }
+  if (request.status >= 400) { response.status = 502; return 'storage failed'; }
   return next();
 }
 ```
@@ -418,8 +418,8 @@ export default function () {
 }
 
 export function onUpstream() {
-  response.status = request.result.status;       // forward upstream's status verbatim
-  return request.result.body;
+  response.status = request.status;              // forward upstream's status verbatim
+  return request.body;
 }
 ```
 
@@ -452,8 +452,10 @@ export default function () {
   return 'queued';                               // respond immediately; the above outlive this request
 }
 
-export function onCharge() {                      // connectionless — no socket; does work, returns nothing
-  kv.set(`charges/${request.result.body.id}`, request.result.body);
+export function onCharge() {                      // connectionless on_result — no socket; does work, returns nothing
+  if (!request.ok) return;                        // delivery failed (request.ctx.error says why)
+  const charge = JSON.parse(request.body);        // the response on the flattened surface
+  kv.set(`charges/${charge.id}`, charge);
 }
 
 export function onBoot()  { kv.set('booted_at', now()); }
@@ -504,7 +506,7 @@ export default function () {
 }
 
 export function onResult() {
-  const ctx = { ...request.ctx, [request.fetchId]: request.result };
+  const ctx = { ...request.ctx, [request.fetchId]: { status: request.status, body: request.body } };
   if (ctx.a && ctx.b) return combine(ctx.a, ctx.b);
   return next(ctx);                               // still waiting on the other
 }
@@ -519,6 +521,57 @@ each `next(ctx)` updates the threaded `ctx` the next resume reads — so
 the join is race-free with no lock. `next` (not committing) the whole
 time, because the response could be `200` or, via `onTimeout`, `504`.
 This is `Promise.all` from primitives — no dedicated combinator.
+
+### 5.9 Browser agent — let an LLM drive your own UI (`browser.*`)
+
+`browser.*` is a JS-shim (same pattern as `webhook.send` — `globals/browser.js`)
+for building "a Playwright for LLMs" **scoped to the customer's own app**: the
+in-page SDK (`_static/rove-agent.js`) opens a held WebSocket, sends an enriched,
+pixel-free DOM/accessibility **snapshot** (`[ref] role "name" = value (state)`),
+and executes ref-targeted actions the handler sends back. The handler is the
+*brain wiring*, not the brain — the LLM call is the customer's own `on.fetch`
+with their key; durable reasoning state lives in `kv` (the durable-brain /
+ephemeral-hands split). Scope is **same-origin only by construction** — an agent
+acting inside the customer's own page is ~equivalent to JS they could already
+run there, so there's no new trust boundary (see `decisions.md` §4.8).
+
+```js
+// Held WS chain: each page snapshot → call the LLM → send one action.
+export function onMessage() {
+  const frame = browser.message(request);                 // decode the ws_message
+  const ctx = request.ctx || {};
+  if (!frame) return next(ctx);
+  if (frame.t === "hello") { kv.set(`goal/${frame.sid}`, frame.goal); return next({ sid: frame.sid }); }
+  if (frame.t !== "snapshot") return next(ctx);           // result/bye/confirm_result
+
+  browser.status("thinking…");
+  on.fetch(LLM_URL, { method: "POST", headers: authHeaders(),
+    body: JSON.stringify({ model, tools: browser.tools(),  // vendor-neutral action schema
+      messages: history(ctx.sid).concat({ role: "user", content: browser.render(frame) }) }) },
+    { to: "onLLM" });                                      // binds to THIS held chain
+  return next(ctx);                                        // read-only turn — a writing frame can't bind on.fetch
+}
+
+export function onLLM() {                                  // flattened result surface (§7): request.body/.status/.done
+  if (!request.done || request.status >= 400) { browser.status("LLM error"); return next(request.ctx); }
+  const reply = JSON.parse(new TextDecoder().decode(request.body));
+  const action = pickAction(reply);                        // adapt the model's tool call → {op, ref, ...}
+  if (!action) { browser.done(reply.text); return next(request.ctx); }
+  if (isDestructive(action)) { browser.confirm({ id: action.id, prompt: "Allow?", action }); }
+  else browser.act(action);                                // page executes, auto-sends a fresh snapshot → onMessage
+  return next(request.ctx);
+}
+```
+
+Perception is **structural by default** (DOM + geometry + computed visibility +
+occlusion); pixel screenshots are a separate **opt-in** tier (`getDisplayMedia` →
+`blob.put`). The SDK renders a non-disableable "agent is driving · STOP"
+indicator + kill switch. The protocol carries a session id so a later
+**replay-context** channel can show the brain *why* the page reached its state
+(DOM = what, screenshot = how, replay = why — security-gated, `decisions.md`
+§4.8). The brain is pluggable: the same snapshot/action protocol can be driven
+by the customer's handler-hosted LLM (above) or, as a fast-follow, the
+end-user's own local Claude over MCP — no change to the SDK or page protocol.
 
 ## 6. Validation — exhaustiveness without a type system
 
@@ -551,14 +604,33 @@ rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
   `.query`, `.cookies`, `.ip`, `.unmaskedIp()`.
 - **`onChunk`:** `request.body` = THIS chunk; `request.done`;
   `request.chunkSeq` (from 0).
-- **Connection wakes / fetch resumes:** `request.ctx`, plus
-  `request.result` (`on.fetch` whole / `webhook.send`), `request.body` +
-  `request.fetchId` (streamed `on.fetch` chunk), or `request.key` /
-  `request.value` (`on.kv`).
+- **`next()` continuations — one ctx rule (`decisions.md §4.9`):** every
+  activation that exists because a prior activation called `next({ctx})`
+  reads that payload as **`request.ctx`** — `onMessage`, `onChunk`,
+  `onWake` (`on.kv`/`on.timer`), `onDisconnect`, a bound `on.fetch`/
+  `blob.get` resume, and an `on_result` callback, all the same way.
+  `request.ctx` is `undefined` on the **first** activation of a chain
+  (nothing threaded yet) and on a standalone scheduled `durable_wake`
+  (which carries `request.activation.msg`). `on.kv`/`on.timer` are edge
+  ("go look") wakes — they carry **no** matched key/value; `onWake`
+  re-reads authoritative `kv`, and which keys fired is on
+  `request.activation.wakes[]` if you need it.
+- **Fetch / effect results — one flattened surface:** a bound `on.fetch` /
+  `blob.get` resume **and** a `webhook.send` / `blob.put` / `retry`
+  `on_result` callback (and a §6.4 held-sync resume) present the result
+  identically — the response bytes on **`request.body`** (the whole body
+  for a non-streamed fetch, this chunk for a streamed one), with
+  `request.status` / `request.ok` / `request.done` (+ `request.fetchId` /
+  `request.chunkSeq` for fetch chunks) at the **top level**; the threaded
+  ctx / echoed `context` on **`request.ctx`** (bare); and per-delivery
+  metadata (`attempts`, `error`, `id`, `headers`, blob `hash`) on
+  **`request.activation.*`**. There is **no `request.result`**. (Exception:
+  `blob.seal`/`blob.receive` resume with the threaded `{hash, len}` on
+  `request.ctx` — that *is* the ctx you threaded, not delivery metadata.)
 - **Connectionless fires** (`onBoot`, `onSubscription`, a `cron`/
-  `schedule` target, an `onResult` callback): origin-specific fields
-  (`deploymentId`, `result`, `request.activation.msg`, …) but **no**
-  HTTP `headers`/`body`, and the connection verbs are inert (§2.4).
+  `schedule` target): origin-specific fields (`deploymentId`,
+  `request.activation.msg`, …) but **no** inbound HTTP `headers`/`body`,
+  and the connection verbs are inert (§2.4).
 
 ### 7.1 The request surface is read-recorded
 
