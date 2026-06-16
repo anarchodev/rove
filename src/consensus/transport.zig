@@ -26,10 +26,13 @@
 //! payload is never a connection's first frame). Our payload is:
 //!
 //!     [count:u32 LE]
-//!     count × [group_id:u64 LE][epoch:u64 LE][msg_len:u32 LE][msg bytes]
+//!     count × [group_id:u64 LE][epoch:u64 LE][floor:u64 LE][msg_len:u32 LE][msg bytes]
 //!
 //! `msg bytes` is the opaque rust-protobuf `eraftpb::Message` from
 //! `takeMessages`, fed verbatim to the peer's `stepBatch`/`stepFenced`.
+//! `floor` is the leader's cluster-wide min-match WAL-compaction floor for the
+//! group (`maxInt` = none, from a non-leader sender); the follower compacts to
+//! it in lockstep so the shared WAL bounds without a data-carrying snapshot.
 //!
 //! ## Node-id mapping
 //!
@@ -90,6 +93,11 @@ pub const Transport = struct {
     /// thread); cleared by `drainWoke`. Dups are fine — `bumpActive` is
     /// idempotent — so no per-message dedup.
     woke: std.ArrayListUnmanaged(u64) = .empty,
+    /// gid → highest WAL-compaction floor a LEADER stamped on inbound messages
+    /// since the last `drainFloors`. The pump drains it each cycle and records
+    /// it on each group's slot so a FOLLOWER compacts to the same floor as the
+    /// leader (lockstep, snapshot-free). Pump-thread only.
+    recv_floors: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     /// Total inbound messages `stepBatch` skipped (unknown group / epoch
     /// fence / decode failure) — rate-limited-logged in `onRecv` so a
     /// node silently dropping a group's traffic is operator-visible.
@@ -143,6 +151,7 @@ pub const Transport = struct {
         a.free(self.outbufs);
         self.step_scratch.deinit(a);
         self.woke.deinit(a);
+        self.recv_floors.deinit(a);
         a.destroy(self);
     }
 
@@ -152,6 +161,15 @@ pub const Transport = struct {
     pub fn drainWoke(self: *Transport, out: *std.ArrayListUnmanaged(u64), a: std.mem.Allocator) !void {
         try out.appendSlice(a, self.woke.items);
         self.woke.clearRetainingCapacity();
+    }
+
+    /// Visit each (gid, leader-stamped floor) received since the last call,
+    /// then clear. The pump uses it to advance each group's follower
+    /// compaction floor. Pump-thread only (drains what `onRecv` filled).
+    pub fn drainFloors(self: *Transport, ctx: anytype, comptime apply: fn (@TypeOf(ctx), u64, u64) void) void {
+        var it = self.recv_floors.iterator();
+        while (it.next()) |e| apply(ctx, e.key_ptr.*, e.value_ptr.*);
+        self.recv_floors.clearRetainingCapacity();
     }
 
     /// Whether a raw eraftpb message is a heartbeat / heartbeat-response —
@@ -170,7 +188,7 @@ pub const Transport = struct {
     /// Buffer one outbound message (from `Manager.takeMessages`) for its
     /// destination node, to be coalesced + sent at `flush`. `to` is a raft
     /// node id; a message to self (shouldn't happen) is dropped.
-    pub fn queueOut(self: *Transport, to: u64, group_id: u64, epoch: u64, msg: []const u8) void {
+    pub fn queueOut(self: *Transport, to: u64, group_id: u64, epoch: u64, floor: u64, msg: []const u8) void {
         if (to == self.node_id or to == 0 or to > self.cluster_size) return;
         const ob = &self.outbufs[to - 1];
         const a = self.allocator;
@@ -180,11 +198,15 @@ pub const Transport = struct {
         // the receiver would mis-parse the rest of the cycle's messages,
         // not reject them). Dropping the whole record is safe — raft
         // re-emits on the next tick.
+        // `floor` is the cluster-wide min match index the LEADER stamps so
+        // followers learn the safe WAL-compaction floor (lockstep compaction);
+        // `maxInt` from a non-leader sender means "no floor", ignored on recv.
         const mark = ob.body.items.len;
-        var hdr: [20]u8 = undefined;
+        var hdr: [28]u8 = undefined;
         std.mem.writeInt(u64, hdr[0..8], group_id, .little);
         std.mem.writeInt(u64, hdr[8..16], epoch, .little);
-        std.mem.writeInt(u32, hdr[16..20], @intCast(msg.len), .little);
+        std.mem.writeInt(u64, hdr[16..24], floor, .little);
+        std.mem.writeInt(u32, hdr[24..28], @intCast(msg.len), .little);
         ob.body.appendSlice(a, &hdr) catch return;
         ob.body.appendSlice(a, msg) catch {
             ob.body.shrinkRetainingCapacity(mark);
@@ -237,11 +259,12 @@ pub const Transport = struct {
         self.step_scratch.clearRetainingCapacity();
         var i: u32 = 0;
         while (i < count) : (i += 1) {
-            if (off + 20 > payload.len) break;
+            if (off + 28 > payload.len) break;
             const group_id = std.mem.readInt(u64, payload[off..][0..8], .little);
             const epoch = std.mem.readInt(u64, payload[off + 8 ..][0..8], .little);
-            const msg_len = std.mem.readInt(u32, payload[off + 16 ..][0..4], .little);
-            off += 20;
+            const floor = std.mem.readInt(u64, payload[off + 16 ..][0..8], .little);
+            const msg_len = std.mem.readInt(u32, payload[off + 24 ..][0..4], .little);
+            off += 28;
             if (off + msg_len > payload.len) break;
             const msg = payload[off .. off + msg_len];
             off += msg_len;
@@ -251,6 +274,14 @@ pub const Transport = struct {
                 .msg_ptr = msg.ptr,
                 .msg_len = msg.len,
             }) catch return;
+            // The leader's WAL-compaction floor for this group (maxInt = none).
+            // Keep the highest seen this batch; the pump drains it post-tick.
+            if (floor != std.math.maxInt(u64)) {
+                const gop = self.recv_floors.getOrPut(self.allocator, group_id) catch null;
+                if (gop) |e| {
+                    if (!e.found_existing or floor > e.value_ptr.*) e.value_ptr.* = floor;
+                }
+            }
             // Real raft traffic wakes a hibernated group; heartbeats do not.
             if (!isHeartbeatLike(msg)) self.woke.append(self.allocator, group_id) catch {};
         }
@@ -286,16 +317,17 @@ test "transport: coalesced envelope round-trips message bytes" {
     var body: std.ArrayListUnmanaged(u8) = .empty;
     defer body.deinit(a);
 
-    const msgs = [_]struct { gid: u64, epoch: u64, bytes: []const u8 }{
-        .{ .gid = 7, .epoch = 0, .bytes = "vote-req-bytes" },
-        .{ .gid = 7, .epoch = 3, .bytes = "append-entries" },
-        .{ .gid = 42, .epoch = 1, .bytes = "x" },
+    const msgs = [_]struct { gid: u64, epoch: u64, floor: u64, bytes: []const u8 }{
+        .{ .gid = 7, .epoch = 0, .floor = std.math.maxInt(u64), .bytes = "vote-req-bytes" },
+        .{ .gid = 7, .epoch = 3, .floor = 1234, .bytes = "append-entries" },
+        .{ .gid = 42, .epoch = 1, .floor = 0, .bytes = "x" },
     };
     for (msgs) |m| {
-        var hdr: [20]u8 = undefined;
+        var hdr: [28]u8 = undefined;
         std.mem.writeInt(u64, hdr[0..8], m.gid, .little);
         std.mem.writeInt(u64, hdr[8..16], m.epoch, .little);
-        std.mem.writeInt(u32, hdr[16..20], @intCast(m.bytes.len), .little);
+        std.mem.writeInt(u64, hdr[16..24], m.floor, .little);
+        std.mem.writeInt(u32, hdr[24..28], @intCast(m.bytes.len), .little);
         try body.appendSlice(a, &hdr);
         try body.appendSlice(a, m.bytes);
     }
@@ -316,12 +348,14 @@ test "transport: coalesced envelope round-trips message bytes" {
     while (i < count) : (i += 1) {
         const gid = std.mem.readInt(u64, p[off..][0..8], .little);
         const epoch = std.mem.readInt(u64, p[off + 8 ..][0..8], .little);
-        const mlen = std.mem.readInt(u32, p[off + 16 ..][0..4], .little);
-        off += 20;
+        const floor = std.mem.readInt(u64, p[off + 16 ..][0..8], .little);
+        const mlen = std.mem.readInt(u32, p[off + 24 ..][0..4], .little);
+        off += 28;
         const msg = p[off .. off + mlen];
         off += mlen;
         try testing.expectEqual(msgs[i].gid, gid);
         try testing.expectEqual(msgs[i].epoch, epoch);
+        try testing.expectEqual(msgs[i].floor, floor);
         try testing.expectEqualStrings(msgs[i].bytes, msg);
         seen += 1;
     }
