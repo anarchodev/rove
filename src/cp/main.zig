@@ -218,6 +218,10 @@ const Router = struct {
     /// `REWIND_ACME_DIRECTORY` is unset. Serves `/_cp/acme-challenge?token=`
     /// from its in-memory challenge store.
     acme: ?*acme_issuer.Handle = null,
+    /// Opt-in: run the additive membership reconciler each reconcile tick
+    /// (`REWIND_CP_RECONCILE_MEMBERSHIP=1`). OFF by default — a continuous
+    /// unattended actor on prod must be deliberately enabled.
+    reconcile_membership: bool = false,
 
     /// Reply helper: set an immediate status (no body) on the request
     /// entity and move it to response_in.
@@ -1079,6 +1083,38 @@ const Router = struct {
         }
     }
 
+    /// Additive membership reconciler (Phase 4, opt-in `reconcile_membership`).
+    /// On the directory leader, converge each placed tenant's DP group
+    /// membership to its cluster's node set: for the first not-caught-up node
+    /// per group per pass, take a LEARNER-FIRST `ensureMember` step. ADDITIVE
+    /// ONLY — never removes/migrates/destroys; skips `moving` tenants (defers to
+    /// an in-flight move). Blocking HTTP on the loop (like `reconcileStuckMoves`),
+    /// bounded to one node per group per pass.
+    fn reconcileMembership(self: *Router) void {
+        if (!self.reconcile_membership) return;
+        if (!self.directory.isLeader()) return; // single writer
+        const a = self.allocator;
+        const tenants = self.directory.listPlacements(a) catch return;
+        defer {
+            for (tenants) |t| a.free(t);
+            a.free(tenants);
+        }
+        for (tenants) |tenant| {
+            const res = self.directory.resolve(tenant) orelse continue;
+            if (res.moving) continue; // defer to an in-flight move
+            const nodes = res.cluster.nodes; // pointer-stable past resolve
+            if (nodes.len == 0) continue;
+            const leader_url = self.findDestLeaderUrl(nodes, tenant) orelse continue;
+            defer a.free(leader_url);
+            // One membership change per group per pass: advance the FIRST
+            // not-caught-up node, then re-observe next pass.
+            for (nodes, 0..) |node_url, i| {
+                const node_id: u64 = @intCast(i + 1); // POSITIONAL id (nodes[i] ↔ raft id i+1)
+                if (self.ensureMember(tenant, node_url, node_id, leader_url) != .done) break;
+            }
+        }
+    }
+
     // ── Zero-downtime move (Phase 7 slice c) ─────────────────────────
 
     /// Orchestrate a ZERO-DOWNTIME tenant move — the source keeps serving the
@@ -1369,9 +1405,16 @@ const Router = struct {
         const hosted = self.nodeHostsGroup(node_url, tenant);
 
         if (is_voter) {
-            // A configured voter that isn't caught up: DEMOTE to learner so a
-            // stuck voter can't disrupt elections while it catches up.
-            return if (self.reconcileConfChange(leader_url, tenant, node_id, "demote")) .progressed else .failed;
+            // A HOSTED voter that's stuck (has a group instance but is behind +
+            // campaigning) disrupts elections — DEMOTE it to a learner so it
+            // stops voting while it catches up (the __admin__ lesson).
+            if (hosted)
+                return if (self.reconcileConfChange(leader_url, tenant, node_id, "demote")) .progressed else .failed;
+            // A FRESH voter (already a member, no local group instance — a wiped
+            // or never-formed replica) is bootstrapped DIRECTLY, no conf_change:
+            // the proven fresh_voter_join path. (Demote-then-bootstrap races the
+            // leader's commit vs the new snapshot baseline → a commit_to panic.)
+            return if (self.bootstrapMember(leader_url, node_url, tenant)) .progressed else .failed;
         }
         if (is_learner) {
             if (!hosted)
@@ -1717,7 +1760,11 @@ pub fn main() !void {
         h.join();
     };
 
-    var router = Router{ .allocator = allocator, .directory = directory, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx, .acme = acme_handle };
+    const reconcile_membership = blk: {
+        const v = std.posix.getenv("REWIND_CP_RECONCILE_MEMBERSHIP") orelse break :blk false;
+        break :blk std.mem.eql(u8, std.mem.trim(u8, v, " \t"), "1");
+    };
+    var router = Router{ .allocator = allocator, .directory = directory, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx, .acme = acme_handle, .reconcile_membership = reconcile_membership };
 
     // Periodic stuck-move reconciliation on the directory leader (between
     // request batches; never overlaps a synchronous move — see
@@ -1751,6 +1798,7 @@ pub fn main() !void {
             if (now_ns - last_reconcile_ns > reconcile_period_ns) {
                 last_reconcile_ns = now_ns;
                 router.reconcileStuckMoves();
+                router.reconcileMembership();
             }
         }
     }
