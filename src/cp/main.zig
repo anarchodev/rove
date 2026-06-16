@@ -1310,6 +1310,156 @@ const Router = struct {
     /// Blocking libcurl call to a backend's move surface, presenting the
     /// move secret plus any `extra_headers` (e.g. `X-Rewind-Tenant`,
     /// `X-Rewind-Plan`). Returns status + an owned copy of the response body.
+    // ── membership reconciler: ensureMember (Phase 3) ───────────────────────
+    //
+    // Composes the proven out-of-band endpoints into a LEARNER-FIRST step
+    // machine that converges a node toward a caught-up voter. Additive/safe:
+    // the only voting-power removal is a demote-to-learner of a STUCK voter (so
+    // it can't disrupt elections while it catches up — the __admin__ lesson);
+    // it never shrinks/migrates/destroys. All over the private CP network via
+    // backendCall (move-secret auto-added). Blocking HTTP on the CP loop, like
+    // reconcileStuckMoves; the reconciler does one node per group per pass.
+    const EnsureResult = enum { done, progressed, failed };
+    /// caught-up tolerance: matched/applied within this of leader_last counts as
+    /// caught up (raft replicates the tail in well under this; avoids flapping
+    /// as leader_last advances on a live group).
+    const RECONCILE_SLACK: u64 = 16;
+    const PeerJson = struct { id: u64 = 0, matched: u64 = 0, recent_active: bool = false };
+    const MemberStatusJson = struct {
+        leader_last: u64 = 0,
+        voters: []const u64 = &.{},
+        learners: []const u64 = &.{},
+        peers: []const PeerJson = &.{},
+    };
+    fn idIn(list: []const u64, id: u64) bool {
+        for (list) |x| if (x == id) return true;
+        return false;
+    }
+
+    /// Advance node `node_id` (at `node_url`) ONE step toward being a caught-up
+    /// voter of `tenant`'s group, talking to `leader_url`. `.done` when already a
+    /// caught-up voter, `.progressed` after a step (re-check next pass), `.failed`
+    /// on a transient error (retry next pass).
+    fn ensureMember(self: *Router, tenant: []const u8, node_url: []const u8, node_id: u64, leader_url: []const u8) EnsureResult {
+        const a = self.allocator;
+        // The leader is trivially a caught-up voter of its own group.
+        if (std.mem.eql(u8, node_url, leader_url)) return .done;
+
+        // 1. Observe the leader's per-peer view.
+        const ms_path = std.fmt.allocPrint(a, "/_system/v2-member-status?tenant={s}", .{tenant}) catch return .failed;
+        defer a.free(ms_path);
+        const ms_resp = self.backendCall(leader_url, ms_path, .GET, "", &.{}) catch return .failed;
+        defer a.free(ms_resp.body);
+        if (ms_resp.status != 200) return .failed;
+        var parsed = std.json.parseFromSlice(MemberStatusJson, a, ms_resp.body, .{ .ignore_unknown_fields = true }) catch return .failed;
+        defer parsed.deinit();
+        const ms = parsed.value;
+
+        const is_voter = idIn(ms.voters, node_id);
+        const is_learner = idIn(ms.learners, node_id);
+        if (is_voter) {
+            for (ms.peers) |p| {
+                if (p.id == node_id) {
+                    if (p.recent_active and p.matched + RECONCILE_SLACK >= ms.leader_last) return .done;
+                    break;
+                }
+            }
+        }
+
+        const hosted = self.nodeHostsGroup(node_url, tenant);
+
+        if (is_voter) {
+            // A configured voter that isn't caught up: DEMOTE to learner so a
+            // stuck voter can't disrupt elections while it catches up.
+            return if (self.reconcileConfChange(leader_url, tenant, node_id, "demote")) .progressed else .failed;
+        }
+        if (is_learner) {
+            if (!hosted)
+                return if (self.bootstrapMember(leader_url, node_url, tenant)) .progressed else .failed;
+            const applied = self.nodeApplied(node_url, tenant) orelse return .progressed;
+            if (applied + RECONCILE_SLACK >= ms.leader_last)
+                return if (self.reconcileConfChange(leader_url, tenant, node_id, "promote")) .progressed else .failed;
+            return .progressed; // catching up
+        }
+        // Absent: bootstrap (if needed) then AddLearner.
+        if (!hosted and !self.bootstrapMember(leader_url, node_url, tenant)) return .failed;
+        return if (self.reconcileConfChange(leader_url, tenant, node_id, "add")) .progressed else .failed;
+    }
+
+    /// Whether `node_url` hosts a local group instance for `tenant` (confstate
+    /// 200 vs 404).
+    fn nodeHostsGroup(self: *Router, node_url: []const u8, tenant: []const u8) bool {
+        const a = self.allocator;
+        const path = std.fmt.allocPrint(a, "/_system/v2-confstate?tenant={s}", .{tenant}) catch return false;
+        defer a.free(path);
+        const resp = self.backendCall(node_url, path, .GET, "", &.{}) catch return false;
+        defer a.free(resp.body);
+        return resp.status == 200;
+    }
+
+    /// `node_url`'s durabilized applied index for `tenant` (learner catch-up
+    /// signal), or null.
+    fn nodeApplied(self: *Router, node_url: []const u8, tenant: []const u8) ?u64 {
+        const a = self.allocator;
+        const path = std.fmt.allocPrint(a, "/_system/v2-applied-baseline?tenant={s}", .{tenant}) catch return null;
+        defer a.free(path);
+        const resp = self.backendCall(node_url, path, .GET, "", &.{}) catch return null;
+        defer a.free(resp.body);
+        if (resp.status != 200) return null;
+        var p = std.json.parseFromSlice(struct { index: u64 = 0, term: u64 = 0 }, a, resp.body, .{ .ignore_unknown_fields = true }) catch return null;
+        defer p.deinit();
+        return p.value.index;
+    }
+
+    /// Propose a conf-change (`add`/`promote`/`demote`/`remove`) on `leader_url`.
+    fn reconcileConfChange(self: *Router, leader_url: []const u8, tenant: []const u8, node_id: u64, op: []const u8) bool {
+        const a = self.allocator;
+        const body = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\",\"node_id\":{d},\"op\":\"{s}\"}}", .{ tenant, node_id, op }) catch return false;
+        defer a.free(body);
+        const resp = self.backendCall(leader_url, "/_system/v2-confchange", .POST, body, &.{}) catch return false;
+        defer a.free(resp.body);
+        if (resp.status != 204) {
+            std.log.warn("rewind-cp: reconcile confchange {s} node={d} {s} → {d}", .{ op, node_id, tenant, resp.status });
+            return false;
+        }
+        std.log.info("rewind-cp: reconcile confchange {s} node={d} on {s}", .{ op, node_id, tenant });
+        return true;
+    }
+
+    /// Out-of-band bootstrap of `tenant`'s group onto `node_url`: pull the
+    /// leader's baseline {index,term} + snapshot bundle, attach (create group +
+    /// load) on the node, then install the data-free raft baseline so the leader
+    /// replicates the tail.
+    fn bootstrapMember(self: *Router, leader_url: []const u8, node_url: []const u8, tenant: []const u8) bool {
+        const a = self.allocator;
+        const bpath = std.fmt.allocPrint(a, "/_system/v2-applied-baseline?tenant={s}", .{tenant}) catch return false;
+        defer a.free(bpath);
+        const bresp = self.backendCall(leader_url, bpath, .GET, "", &.{}) catch return false;
+        defer a.free(bresp.body);
+        if (bresp.status != 200) return false;
+        var bp = std.json.parseFromSlice(struct { index: u64 = 0, term: u64 = 0 }, a, bresp.body, .{ .ignore_unknown_fields = true }) catch return false;
+        defer bp.deinit();
+
+        const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch return false;
+        defer a.free(tbody);
+        const snap = self.backendCall(leader_url, "/_system/v2-snapshot", .POST, tbody, &.{}) catch return false;
+        defer a.free(snap.body);
+        if (snap.status != 200) return false;
+
+        var th = [_]curl.Header{.{ .name = TENANT_HEADER, .value = tenant }};
+        const ar = self.backendCall(node_url, "/_system/v2-attach", .POST, snap.body, &th) catch return false;
+        defer a.free(ar.body);
+        if (ar.status != 204) return false;
+
+        const asbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\",\"index\":{d},\"term\":{d}}}", .{ tenant, bp.value.index, bp.value.term }) catch return false;
+        defer a.free(asbody);
+        const asr = self.backendCall(node_url, "/_system/v2-apply-snapshot", .POST, asbody, &.{}) catch return false;
+        defer a.free(asr.body);
+        if (asr.status != 204) return false;
+        std.log.info("rewind-cp: reconcile bootstrapped {s} onto {s} (baseline {d}/{d})", .{ tenant, node_url, bp.value.index, bp.value.term });
+        return true;
+    }
+
     fn backendCall(
         self: *Router,
         base_url: []const u8,
