@@ -80,6 +80,7 @@
 const std = @import("std");
 const node_mod = @import("node.zig");
 const envelope = @import("envelope.zig");
+const kvlimbs = @import("kvlimbs");
 
 pub const Node = node_mod.Node;
 pub const WriteSet = node_mod.WriteSet;
@@ -187,13 +188,27 @@ pub const GroupSig = struct {
 /// one, enqueues a pointer, and blocks on `done` until the pump has
 /// executed it and stamped `err` — so the struct outlives the wait.
 const ControlCmd = struct {
-    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership };
+    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state, apply_local_snapshot, log_term };
     kind: Kind,
     gid: u64,
     /// Borrowed from the gid's `GroupSig.id_str` (pointer-stable); used by
     /// `create_group_epoch` to open the tenant's group store.
     id_str: []const u8 = &.{},
     epoch: u64 = 0,
+    /// `propose_conf_change`: the raft node id to change + the op (0 add_voter /
+    /// 1 remove / 2 add_learner — matches `raft.Manager.ConfChange`).
+    node_id: u64 = 0,
+    cc_type: u8 = 0,
+    /// `apply_local_snapshot`: the baseline {index, term} to install.
+    /// `log_term`: `snap_index` is the query index, `snap_term` the result.
+    snap_index: u64 = 0,
+    snap_term: u64 = 0,
+    /// `conf_state`: caller buffers to fill + the counts written back.
+    cs_voters: []u64 = &.{},
+    cs_learners: []u64 = &.{},
+    cs_voters_len: usize = 0,
+    cs_learners_len: usize = 0,
+    cs_ok: bool = false,
     /// Result, written by the pump before signaling `done`.
     err: ?Error = null,
     /// `transfer_all_leadership` writes the number of groups it handed off here.
@@ -282,6 +297,15 @@ pub const Bridge = struct {
     /// Pump-thread-only: wall-clock of the last FULL leadership scan
     /// (see `refreshLeadership` / `LEADER_SCAN_INTERVAL_NS`).
     last_leader_scan_ns: i64 = 0,
+    /// Count of follower→leader promotion edges this node has observed across
+    /// all groups (incremented in `refreshOneLocked`). With `pre_vote` on, a
+    /// term is only bumped by a node that can win, so a promotion edge ≈ an
+    /// election that changed the leader — the spurious-election signal a soak
+    /// watches: after the initial one-per-group formation, the cluster-wide sum
+    /// should stay flat under steady load. Surfaced as
+    /// `raft_leadership_acquisitions_total` in `/_system/metrics`. Written on
+    /// the pump thread, read lock-free by the worker.
+    leadership_acquisitions: std.atomic.Value(u64) = .init(0),
 
     pump_thread: ?std.Thread = null,
     stop: std.atomic.Value(bool) = .init(false),
@@ -355,6 +379,7 @@ pub const Bridge = struct {
     pub fn setApplyObserver(self: *Bridge, observer: node_mod.ApplyObserver) void {
         self.node.apply_observer = observer;
     }
+
 
     /// Point follower-apply at the worker's own per-tenant serving store
     /// (Phase 5 "Full HA"). In `worker_overlay` mode a follower has no local
@@ -605,6 +630,20 @@ pub const Bridge = struct {
         return false;
     }
 
+    /// Cluster-wide count of follower→leader promotion edges this node has
+    /// observed (spurious-election signal — see `leadership_acquisitions`).
+    /// Lock-free; worker-thread entry point for `/_system/metrics`.
+    pub fn leadershipAcquisitions(self: *const Bridge) u64 {
+        return self.leadership_acquisitions.load(.acquire);
+    }
+
+    /// Snapshot the heartbeat round-trip histogram (broadcast-time samples), or
+    /// null on a single-node node. Worker-thread entry point for
+    /// `/_system/metrics`; the histogram's atomic buckets make it lock-free.
+    pub fn heartbeatRttSnapshot(self: *Bridge) ?kvlimbs.MicrosHistogram.Snapshot {
+        return self.node.heartbeatRttSnapshot();
+    }
+
     /// Per-group leadership (Phase 5 multi-node). True when this node is the
     /// raft leader of `gid`'s group — used to leader-gate the move surface
     /// (`v2-bundle` / `v2-kv` PUT reject fast on a follower so the front
@@ -692,6 +731,49 @@ pub const Bridge = struct {
         return cmd.count;
     }
 
+    /// Operator-triggered membership change on `gid`'s group (conf_change Phase 1):
+    /// `cc_type` 0 = add voter / promote, 1 = remove, 2 = add learner / demote.
+    /// Runs on the pump (the only Manager toucher); leader-gated + quorum-guarded
+    /// in the FFI (`Error.NotLeader` / `Error.ConfChangeQuorumGuard`). The
+    /// committed change applies + persists durably via the apply path.
+    pub fn proposeConfChange(self: *Bridge, gid: u64, node_id: u64, cc_type: u8) Error!void {
+        var cmd: ControlCmd = .{ .kind = .propose_conf_change, .gid = gid, .node_id = node_id, .cc_type = cc_type };
+        return self.runControl(&cmd);
+    }
+
+    pub const ConfStateView = struct { voters: []const u64, learners: []const u64 };
+
+    /// Read `gid`'s current membership into the caller's buffers (slices into
+    /// them on success). Runs a pump-thread control cmd. Null for an unknown
+    /// group or if the pump is down.
+    pub fn confState(self: *Bridge, gid: u64, voters_buf: []u64, learners_buf: []u64) ?ConfStateView {
+        var cmd: ControlCmd = .{ .kind = .conf_state, .gid = gid, .cs_voters = voters_buf, .cs_learners = learners_buf };
+        self.runControl(&cmd) catch return null;
+        if (!cmd.cs_ok) return null;
+        return .{ .voters = voters_buf[0..cmd.cs_voters_len], .learners = learners_buf[0..cmd.cs_learners_len] };
+    }
+
+    /// The term of the log entry at `index` on `gid`'s group (0 if compacted /
+    /// beyond the log / unknown / pump down). A leader reports `term(applied)`
+    /// for a returning learner's promote-back baseline. Pump-thread control cmd.
+    pub fn logTerm(self: *Bridge, gid: u64, index: u64) u64 {
+        var cmd: ControlCmd = .{ .kind = .log_term, .gid = gid, .snap_index = index };
+        self.runControl(&cmd) catch return 0;
+        return cmd.snap_term;
+    }
+
+    /// Install a DATA-FREE snapshot baseline at {index, term} into `gid`'s LOCAL
+    /// group (conf_change promote-back). The node must be a below-floor learner;
+    /// the KV state for `index` must already be loaded out-of-band (the move
+    /// bundle). Fast-forwards the raft log baseline so the leader can replicate
+    /// the tail and the node can be promoted back. Pump-thread control cmd.
+    /// `Error.NotLeader` if this node leads the group; `Error.SnapshotStale` if
+    /// `index` is not ahead of committed.
+    pub fn applyLocalSnapshot(self: *Bridge, gid: u64, index: u64, term: u64) Error!void {
+        var cmd: ControlCmd = .{ .kind = .apply_local_snapshot, .gid = gid, .snap_index = index, .snap_term = term };
+        return self.runControl(&cmd);
+    }
+
     /// Enqueue a control command for the pump thread and block until it
     /// runs. Requires the pump thread (the only `Manager` toucher) to be
     /// live; the move path always runs under `startPump`.
@@ -728,6 +810,26 @@ pub const Bridge = struct {
                 },
                 .destroy_group => blk: {
                     self.node.destroyGroupAndReclaim(cmd.gid) catch |e| break :blk e;
+                    break :blk null;
+                },
+                .propose_conf_change => blk: {
+                    self.node.proposeConfChange(cmd.gid, cmd.node_id, @enumFromInt(cmd.cc_type)) catch |e| break :blk e;
+                    break :blk null;
+                },
+                .conf_state => blk: {
+                    if (self.node.confState(cmd.gid, cmd.cs_voters, cmd.cs_learners)) |cs| {
+                        cmd.cs_voters_len = cs.voters.len;
+                        cmd.cs_learners_len = cs.learners.len;
+                        cmd.cs_ok = true;
+                    }
+                    break :blk null;
+                },
+                .log_term => blk: {
+                    cmd.snap_term = self.node.logTerm(cmd.gid, cmd.snap_index);
+                    break :blk null;
+                },
+                .apply_local_snapshot => blk: {
+                    self.node.applyLocalSnapshot(cmd.gid, cmd.snap_index, cmd.snap_term) catch |e| break :blk e;
                     break :blk null;
                 },
                 .transfer_all_leadership => blk: {
@@ -935,12 +1037,17 @@ pub const Bridge = struct {
     /// follower→leader promotion edge. Caller holds `mutex`; pump thread.
     fn refreshOneLocked(self: *Bridge, sig: *GroupSig, gid: u64, single: bool) void {
         const now = self.node.isLeader(gid);
+        const promoted_edge = now and !sig.was_leader;
+        // Count every false→true promotion edge (incl. single-node formation)
+        // for the spurious-election metric; the reader nets out the expected
+        // one-per-group baseline.
+        if (promoted_edge) _ = self.leadership_acquisitions.fetchAdd(1, .monotonic);
         // false→true promotion edge: queue for the worker's on-promotion
         // recovery hook. Skipped on a single node — the sole voter leads
         // every group from creation and never fails over, so there is no
         // old-leader RAM state to reconstruct (and the leader already
         // loaded the deployment + armed watermarks inline at release).
-        if (!single and now and !sig.was_leader) {
+        if (!single and promoted_edge) {
             self.promoted.append(self.allocator, sig.gid) catch {};
         }
         sig.was_leader = now;

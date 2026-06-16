@@ -121,14 +121,29 @@ def main() -> int:
             c.dump_node_log(node=lead, grep=["leader", "handed", "shut", "drain"])
 
         print("step 6: ⭐ a survivor leads again quickly (handoff, not a timeout)")
-        new_lead = c.leader_node("acme", deadline_s=FAST_RELEAD_S + 2.0)
-        relead_s = time.time() - t0
+        # Fine-grained (10ms single-shot poll, not the 0.4s leader_node loop) so
+        # the measured handoff resolves the ~one-heartbeat transfer rather than
+        # rounding up to the poll interval.
+        new_lead = None
+        relead_s = None
+        deadline = t0 + FAST_RELEAD_S + 2.0
+        while time.time() < deadline:
+            got = c.leader_now("acme", nodes=survivors)
+            if got is not None:
+                new_lead = got
+                relead_s = time.time() - t0
+                break
+            time.sleep(0.01)
         check("new leader promoted among survivors",
               new_lead is not None and new_lead in survivors,
-              f"new_lead={new_lead}, {relead_s:.2f}s after SIGTERM")
+              f"new_lead={new_lead}, {relead_s if relead_s is not None else float('nan'):.3f}s after SIGTERM")
+        if relead_s is not None:
+            # Parseable timing line (grep GRACEFUL_HANDOFF_S=... from CI logs).
+            print(f"       GRACEFUL_HANDOFF_S={relead_s:.3f}  (SIGTERM → survivor leads, "
+                  f"node {new_lead + 1 if new_lead is not None else '?'})")
         check(f"re-leadership was fast (≤{FAST_RELEAD_S}s)",
-              new_lead is not None and relead_s <= FAST_RELEAD_S,
-              f"{relead_s:.2f}s")
+              relead_s is not None and relead_s <= FAST_RELEAD_S,
+              f"{relead_s if relead_s is not None else float('nan'):.3f}s")
 
         print("step 7: a fresh write commits on the new leader + reads back")
         wrote = False
