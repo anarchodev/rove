@@ -284,13 +284,42 @@ Load-bearing distinction: **chain tenant ≠ scope tenant.** Blobs stage into
 `__admin__` chain — the `DeployThread` job carries both, plus the `fetch_id` and
 resume `name`, and routes the completion event to the *chain* tenant.
 
-Build order: (a) `rove-files.compileAndStage` ✓, (b) `DeployThread`
-batch-compile mode ✓, (c) the `platform.compile` binding + `rove-compile.internal`
-lowering + `interpretCmd` special-case, (d) `DeployThread`→router completion
-emit, (e) move customer deploy into the `__admin__` app + the cross-tenant blob
-primitive, (f) narrow the Zig `/_system/deploy` route to system-tenant
-bootstrap only. (a)+(b) are landed + unit-tested; (c)/(d) are the held-chain
-integration.
+Build order — **all landed + green (smokes: `platform_compile`,
+`platform_deploy`, `admin_deploy`):** (a) `rove-files.compileAndStage`; (b)
+`DeployThread` batch-compile mode; (c) the `platform.compile` binding +
+`rove-compile.internal` lowering + `interpretCmd`/door special-case; (d) the
+`DeployThread`→router bound completion + the `stampManifest` staging barrier
+(its completion proves the whole deploy durable, so no release race); (e) the
+cross-tenant `platform.scope(t).blob.put` + `deploy.stampManifest` primitives;
+(f) the standing **`__admin__` deploy app** (`scripts/admin_deploy_app.mjs`) —
+request-driven (`POST {tenant, handlers, statics}` + root bearer), composes the
+deploy from the primitives, returns the dep_id. Plus the bug-class fix:
+`worker.tryDoorFetch` is the ONE trusted-internal-door partition across all
+three fetch-submit sites.
+
+### 4.2 End-state — two coexisting deploy paths (NOT a route-narrow)
+
+The original §4.1 (f) said "narrow the Zig `/_system/deploy` to system-tenant
+bootstrap." On building it out, the cleaner end-state is **coexistence**, not a
+narrow:
+
+- **Composed JS deploy (the product/customer surface)** — the standing
+  `__admin__` deploy app. Request-driven, composed from `platform.*`, runs on
+  the same surface customers use. The dashboard (`web/admin`) POSTs bundles
+  here; it's the dogfooding path.
+- **Zig `/_system/deploy` (the operator/bootstrap/break-glass substrate)** —
+  stays. It bootstraps the system tenants (incl. the deploy app itself onto
+  `__admin__` — the chicken-and-egg), backs the smoke harness's
+  `deploy_handlers` (which legitimately deploys *customer* tenants in ~50
+  tests), and is the operator break-glass (`publish_tenant.py` stays on it —
+  it's the operator CLI, not the product surface).
+
+A hard narrow was rejected: it would break the harness + `publish_tenant`, and
+routing the harness *through* a `__admin__`-hosted app is fragile (a smoke that
+deploys `__admin__` clobbers the app). The two paths produce identical
+artifacts (same `compileAndStage` + `manifest_json` + content-addressing), so
+they're interchangeable at the storage layer; the split is purely *who calls
+what* (product vs operator), which is the right boundary.
 
 ## 5. `/ops/assign-domain` — resolved (and why `host add` is two writes)
 
