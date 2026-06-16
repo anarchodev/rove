@@ -111,6 +111,40 @@ pub const DEFAULT_HIBERNATE_NS: i64 = 2 * std.time.ns_per_s;
 /// replay and lets the WAL be truncated. Tests override with a short value.
 pub const DEFAULT_DURABILIZE_NS: i64 = 500 * std.time.ns_per_ms;
 
+/// Auto-demote policy (conf_change Phase 2): on the leader, a peer voter that
+/// is BOTH this many entries behind the leader's last index AND `!recent_active`
+/// (no contact within ~an election timeout, under check_quorum) is demoted to a
+/// learner. A permanently-dead voter pins the voters-only WAL-compaction floor
+/// (`minMatchIndex`) → unbounded WAL growth; demoting it unpins the floor so the
+/// log truncates again. No availability loss: a dead voter could never form
+/// quorum anyway, so the live nodes were already load-bearing; demote just makes
+/// the voter math honest (and lets the learner be promoted back out-of-band once
+/// it returns and catches up). The lag threshold is the anti-flap: a node must
+/// be gone long enough to fall this far behind, and `recent_active` recovers the
+/// instant one heartbeat ack arrives. 0 disables auto-demote.
+pub const DEFAULT_AUTO_DEMOTE_LAG: u64 = 10_000;
+
+/// How often the pump evaluates the auto-demote policy over its led+dirty
+/// groups. Coarse (the WAL-growth pressure it relieves is slow); well above the
+/// election timeout so `recent_active` is meaningful. Tests override with a
+/// short value.
+pub const DEFAULT_AUTO_DEMOTE_NS: i64 = 5 * std.time.ns_per_s;
+
+/// Raft logical-tick cadence. raft ticks are LOGICAL — `election_tick` /
+/// `heartbeat_tick` (set in `group_raft_config`) are counts of these, so the
+/// wall-clock election timeout is `election_tick × tick_interval`. The pump
+/// loop runs as fast as it can (a 1ms idle backoff, faster under load), so
+/// ticking once per *cycle* would couple the election timeout to load — slower
+/// under a write burst, faster when idle — and make "what is our election
+/// timeout?" unanswerable. Gating the tick on a fixed monotonic interval
+/// decouples it: `tickGroups` fires at most once per `tick_interval_ns`
+/// regardless of loop speed, so `election_tick × tick_interval_ns` is a stable,
+/// justifiable number. The default preserves the historical ~1ms idle cadence
+/// (so behavior is unchanged) while also CAPPING the rate under load; raise it
+/// (env `REWIND_RAFT_TICK_MS`) once a soak has measured the broadcast-time +
+/// pause-jitter tail this must clear (see docs/raft-best-practices.md).
+pub const DEFAULT_TICK_NS: i64 = 1 * std.time.ns_per_ms;
+
 /// Resolves the store a replicated entry applies to, keyed by the
 /// envelope's tenant id string. Two callers need it:
 ///
@@ -291,6 +325,14 @@ pub const TenantSlot = struct {
     /// `applied_idx > durabilized_idx` ⇒ this group has committed-but-not-yet-
     /// durable writes (it is "dirty"). Single-node compacts the WAL up to here.
     durabilized_idx: u64 = 0,
+    /// The WAL-compaction floor this group's LEADER last propagated (the
+    /// cluster-wide min match index, stamped on inbound transport messages and
+    /// drained by `applyRecvFloor`). A FOLLOWER truncates its WAL to this floor
+    /// so it compacts in lockstep with the leader — never past an entry a voter
+    /// still needs (snapshot-free). 0 (no floor yet ⇒ no follower truncation)
+    /// until the first leader message lands; unused on the leader (it uses its
+    /// own live `minMatchIndex`). Monotonic.
+    propagated_floor: u64 = 0,
     /// Whether this slot is in `Node.dirty` (committed since last durabilize),
     /// so `applyEntry` enqueues it at most once.
     in_dirty: bool = false,
@@ -375,6 +417,17 @@ pub const Node = struct {
     /// the overlay into LMDB is an fsync, amortized over many commits.
     last_durabilize_ns: i64 = 0,
     durabilize_interval_ns: i64 = DEFAULT_DURABILIZE_NS,
+    /// Auto-demote policy (see `DEFAULT_AUTO_DEMOTE_LAG`): lag threshold in
+    /// entries (0 disables), evaluation cadence, and last-run wall-clock.
+    auto_demote_lag: u64 = DEFAULT_AUTO_DEMOTE_LAG,
+    auto_demote_interval_ns: i64 = DEFAULT_AUTO_DEMOTE_NS,
+    last_auto_demote_ns: i64 = 0,
+    /// Raft logical-tick cadence + last-tick wall-clock (see `DEFAULT_TICK_NS`).
+    /// `pump` fires `mgr.tickGroups` at most once per `tick_interval_ns`, so the
+    /// election timeout (`election_tick × tick_interval_ns`) is decoupled from
+    /// the pump loop speed. Tests that want fast elections set this small.
+    tick_interval_ns: i64 = DEFAULT_TICK_NS,
+    last_tick_ns: i64 = 0,
     /// Whether `durabilizeTick` also COMPACTS the WAL (single-node only) after
     /// durabilizing — truncating the log up to the durabilized index so it stays
     /// bounded. ON. Safe because durabilize folds the overlay into LMDB (and
@@ -397,10 +450,10 @@ pub const Node = struct {
     /// abort), and the full V2 smoke suite (rewind / tenant_move / three_node /
     /// cp_move_recovery / zero_downtime_move) passes.
     ///
-    /// Still single-node-only by design (the `single and …` guard below):
-    /// multi-node compaction needs a follower-match-index floor — a lagging
-    /// follower would need a data-carrying snapshot, which is not wired — so a
-    /// multi-node node durabilizes (bounding replay) but does not truncate.
+    /// Multi-node compaction is now on too (`durabilizeTick`): leader and
+    /// follower both truncate to the cluster-wide min match index (the leader
+    /// propagates it on its messages), so a lagging voter always catches up from
+    /// the log — snapshot-free.
     compact_wal: bool = true,
     /// Set true while a group's recovery drain (`createGroupCore`) re-applies
     /// the replayed WAL tail: forces the store WRITE even in `worker_overlay`
@@ -846,6 +899,44 @@ pub const Node = struct {
         return self.mgr.transferLeadershipAway(tenant_id);
     }
 
+    /// Propose a membership change on `tenant_id`'s group (leader-gated +
+    /// quorum-guarded in the FFI). The committed change applies + persists via
+    /// the pump apply path. Pump-thread only.
+    pub fn proposeConfChange(self: *Node, tenant_id: u64, node_id: u64, change: raft.Manager.ConfChange) Error!void {
+        return self.mgr.proposeConfChange(tenant_id, node_id, change);
+    }
+
+    /// Read `tenant_id`'s current membership into the caller's buffers; null for
+    /// an unknown group. Pump-thread only (reads the Manager).
+    pub fn confState(self: *Node, tenant_id: u64, voters_buf: []u64, learners_buf: []u64) ?raft.Manager.ConfStateView {
+        return self.mgr.confState(tenant_id, voters_buf, learners_buf);
+    }
+
+    /// The term of the log entry at `index` on `tenant_id`'s group (0 if
+    /// compacted / beyond the log / unknown). The leader reports `term(applied)`
+    /// so a returning learner's promote-back baseline matches its log.
+    /// Pump-thread only.
+    pub fn logTerm(self: *Node, tenant_id: u64, index: u64) u64 {
+        return self.mgr.logTerm(tenant_id, index);
+    }
+
+    /// Install a DATA-FREE snapshot baseline at {index, term} into `tenant_id`'s
+    /// LOCAL group (conf_change promote-back). The node must be a below-floor
+    /// learner; the KV state for `index` must already be loaded out-of-band (the
+    /// move bundle). Fast-forwards the raft log baseline so the leader can
+    /// replicate the tail and the node can be promoted back. Pump-thread only.
+    pub fn applyLocalSnapshot(self: *Node, tenant_id: u64, index: u64, term: u64) Error!void {
+        return self.mgr.applyLocalSnapshot(tenant_id, index, term);
+    }
+
+    /// Snapshot the cross-node heartbeat round-trip histogram (broadcast-time
+    /// samples), or null on a single-node node (no transport). Lock-free read
+    /// (atomic buckets) — safe off the pump thread.
+    pub fn heartbeatRttSnapshot(self: *Node) ?kvlimbs.MicrosHistogram.Snapshot {
+        const t = self.transport orelse return null;
+        return t.heartbeatRttSnapshot();
+    }
+
     /// Whether this node is the raft leader of `tenant_id`'s group. False
     /// for a group this node has not created yet (a tenant the bridge has
     /// `registerTenant`'d but whose `createGroupEpoch`/`ensureGroup` has not
@@ -1050,7 +1141,20 @@ pub const Node = struct {
     /// sink — but the drain+release is still required to honour the
     /// pollReady/release pairing invariant.
     pub fn pump(self: *Node) Error!bool {
-        _ = self.mgr.tickGroups(self.active.items);
+        // Raft logical tick — interval-gated so the wall-clock election timeout
+        // is `election_tick × tick_interval_ns`, a fixed number, rather than
+        // floating with the pump loop / fsync cadence (see `DEFAULT_TICK_NS`).
+        // pollReady / processReady / transport I/O below still run EVERY cycle;
+        // only the tick is gated. Single-tick-when-due (not catch-up bursts):
+        // after a stall the timer just resumes, which is conservative — slower
+        // elections, never a spurious burst.
+        {
+            const now = nowNs();
+            if (now - self.last_tick_ns >= self.tick_interval_ns) {
+                self.last_tick_ns = now;
+                _ = self.mgr.tickGroups(self.active.items);
+            }
+        }
         const ready = self.mgr.pollReady(self.ready_buf);
 
         self.apply_err = null;
@@ -1130,12 +1234,12 @@ pub const Node = struct {
             // Multi-node: buffered per destination node, stamped with the
             // group's migration epoch, for the coalesced flush below.
             for (ready) |g| {
-                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g) };
+                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g), .floor = self.outboundFloor(g) };
                 self.mgr.takeMessages(g, sendMsgCb, &sctx) catch {};
                 self.mgr.release(g);
             }
             for (ready2) |g| {
-                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g) };
+                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g), .floor = self.outboundFloor(g) };
                 self.mgr.takeMessages(g, sendMsgCb, &sctx) catch {};
                 self.mgr.release(g);
             }
@@ -1169,10 +1273,18 @@ pub const Node = struct {
             self.woke_scratch.clearRetainingCapacity();
             t.drainWoke(&self.woke_scratch, self.allocator) catch {};
             for (self.woke_scratch.items) |gid| self.bumpActive(gid) catch {};
+            // Record each group's leader-propagated compaction floor so a
+            // follower truncates its WAL in lockstep (snapshot-free bound).
+            t.drainFloors(self, Node.applyRecvFloor);
         }
 
         // Hibernate: stop ticking any group idle past its deadline.
         self.sweepHibernated(now);
+
+        // Leader-side auto-demote: drop a far-behind, presumed-dead voter to a
+        // learner so it stops pinning the WAL-compaction floor. Before the
+        // durabilize so a demote's higher floor takes effect this same tick.
+        self.autoDemoteTick(now);
 
         // Checkpoint: fold each dirty store's overlay into LMDB + stamp its
         // watermark + (single-node) compact the WAL. Interval-gated, O(dirty).
@@ -1188,18 +1300,20 @@ pub const Node = struct {
     /// Checkpoint dirty stores (V2 port of V1's `Cluster.tickSnapshot`).
     /// Interval-gated. For each group with committed-but-not-durable writes,
     /// fold its overlay into LMDB + stamp `lastAppliedRaftIdx` (one atomic
-    /// durabilize), then — SINGLE-NODE ONLY — compact the shared WAL up to the
-    /// durabilized index so the log is bounded. Multi-node compaction is unsafe
-    /// without a follower-match-index floor (a lagging follower would need a
-    /// data-carrying snapshot, which is not wired), so a multi-node node
-    /// durabilizes (bounding replay) but does not yet truncate. Pump-thread
-    /// only. All dirty groups are flushed in one tick so the shared WAL's
-    /// interleaved commits clear together.
+    /// durabilize), then compact the shared WAL up to the durabilized index so
+    /// the log stays bounded. Single-node always compacts. Multi-node compacts
+    /// in lockstep: the LEADER floors the truncate point at its live cluster-wide
+    /// min match index (`minMatchIndex`) and propagates that floor on its
+    /// outbound messages; a FOLLOWER truncates to the propagated floor
+    /// (`propagated_floor`). Both stop at the same point, so no node compacts
+    /// past an entry a voter still needs — a lagging/returning voter catches up
+    /// from the LOG, never a snapshot (snapshot-free). Pump-thread only. All
+    /// dirty groups are flushed in one tick so the shared WAL's interleaved
+    /// commits clear together.
     fn durabilizeTick(self: *Node, now: i64) void {
         if (self.dirty.items.len == 0) return;
         if (now - self.last_durabilize_ns < self.durabilize_interval_ns) return;
         self.last_durabilize_ns = now;
-        const single = self.isSingleNode();
         // Under the async-append flow the durable HardState.commit lags
         // the live commit by one fsync (it rides the NEXT ready's hard
         // state). Compaction must never truncate past a commit index that
@@ -1225,6 +1339,17 @@ pub const Node = struct {
             // nothing is awaited.
             var target = slot.applied_idx;
             if (self.durabilize_floor) |f| target = @min(target, f.func(f.ctx, gid));
+            // Multi-node WAL compaction floor — snapshot-free + lockstep: the
+            // LEADER floors the truncate point at its live cluster-wide min match
+            // index; a FOLLOWER uses the floor the leader propagated on its
+            // messages (`propagated_floor`, 0 ⇒ none yet ⇒ no truncation). Both
+            // truncate to the SAME floor, so no node ever compacts past an entry
+            // a voter still needs — a lagging/returning voter catches up from the
+            // LOG, never a snapshot. Single-node ({self}) ⇒ min_match = own match
+            // ≥ applied ⇒ target. Constrains only truncation; the LMDB fold of
+            // the full applied tail above is unaffected.
+            const floor: u64 = if (self.mgr.isLeader(gid)) self.mgr.minMatchIndex(gid) else slot.propagated_floor;
+            const compact_target = @min(target, floor);
             if (target <= slot.durabilized_idx) {
                 // Nothing foldable yet — keep the slot dirty and retry
                 // next tick (the worker ack raises the floor).
@@ -1245,7 +1370,11 @@ pub const Node = struct {
                 keep += 1;
                 continue;
             };
-            if (single and self.compact_wal) {
+            // Compact when enabled (single-, leader-, AND follower-side now —
+            // everyone truncates to the same propagated floor). Skip when
+            // `compact_target` is 0 (a follower that hasn't heard a floor yet)
+            // so a floorless group doesn't trigger the pre-compact flush.
+            if (self.compact_wal and compact_target > 0) {
                 if (!compaction_flushed) {
                     self.wal.flush() catch |e| {
                         // Can't make the commit index durable — skip ALL
@@ -1261,7 +1390,11 @@ pub const Node = struct {
                     };
                     compaction_flushed = true;
                 }
-                slot.gfs.compact(target) catch |e| {
+                // Truncate to `compact_target` (≤ `target`): the leader's
+                // min-match floor keeps the log entries lagging followers still
+                // need. No-op when `compact_target` is at/below the current
+                // sentinel.
+                slot.gfs.compact(compact_target) catch |e| {
                     std.log.warn("v2 wal compact gid={d}: {s}", .{ gid, @errorName(e) });
                 };
             }
@@ -1275,6 +1408,63 @@ pub const Node = struct {
             }
         }
         self.dirty.shrinkRetainingCapacity(keep);
+    }
+
+    /// Leader-side auto-demote policy (conf_change Phase 2). For each group this
+    /// node leads with un-durabilized writes (so the log is actively advancing
+    /// and a dead voter is pinning the WAL floor), demote the first voter that
+    /// is BOTH far behind (`lag > auto_demote_lag`) AND `!recent_active` to a
+    /// learner — it can no longer form quorum anyway, so this loses no real
+    /// availability while unpinning `minMatchIndex` so the WAL truncates. At most
+    /// one demote per group per pass (a raft conf-change must commit before the
+    /// next is proposed). Interval-gated + warmup-skipped so a freshly-started or
+    /// freshly-elected leader gives peers a window to check in first. Gated on
+    /// `compact_wal` (the only benefit is unpinning compaction) and a non-zero
+    /// `auto_demote_lag`. Pump-thread only.
+    fn autoDemoteTick(self: *Node, now: i64) void {
+        if (self.auto_demote_lag == 0 or !self.compact_wal) return;
+        if (self.dirty.items.len == 0) return;
+        // Warmup: the first pass after start/elect just stamps the clock and
+        // returns, so peers get a full interval to report in before we judge
+        // them dead (`last_auto_demote_ns` starts at 0 ⇒ would fire immediately).
+        if (self.last_auto_demote_ns == 0) {
+            self.last_auto_demote_ns = now;
+            return;
+        }
+        if (now - self.last_auto_demote_ns < self.auto_demote_interval_ns) return;
+        self.last_auto_demote_ns = now;
+
+        var ids_buf: [16]u64 = undefined;
+        var matched_buf: [16]u64 = undefined;
+        var active_buf: [16]u8 = undefined;
+        var prog_buf: [16]raft.Manager.VoterProgress = undefined;
+        for (self.dirty.items) |gid| {
+            if (!self.mgr.isLeader(gid)) continue;
+            const view = self.mgr.voterProgress(gid, &ids_buf, &matched_buf, &active_buf, &prog_buf) orelse continue;
+            for (view.peers) |p| {
+                if (p.recent_active) continue; // still in contact — keep it
+                const lag = view.leader_last -| p.matched;
+                if (lag <= self.auto_demote_lag) continue;
+                // Demote this dead, far-behind voter to a learner. One per group
+                // per pass; the FFI quorum-guard refuses a demote that would drop
+                // below 2 voters (swallowed — expected, not an error here).
+                self.mgr.proposeConfChange(gid, p.id, .add_learner) catch |e| switch (e) {
+                    raft.Error.ConfChangeQuorumGuard => {
+                        std.log.debug("v2 auto-demote gid={d} node={d}: refused (would drop below 2 voters)", .{ gid, p.id });
+                        break;
+                    },
+                    else => {
+                        std.log.warn("v2 auto-demote gid={d} node={d}: propose failed: {s}", .{ gid, p.id, @errorName(e) });
+                        break;
+                    },
+                };
+                std.log.info(
+                    "v2 auto-demote gid={d}: voter {d} demoted to learner (lag={d} > {d}, !recent_active) — unpinning WAL floor",
+                    .{ gid, p.id, lag, self.auto_demote_lag },
+                );
+                break; // one conf-change per group per pass
+            }
+        }
     }
 
     /// Enqueue `slot` for the next `durabilizeTick` if not already (its
@@ -1505,6 +1695,10 @@ pub const Node = struct {
         node: *Node,
         group_id: u64,
         epoch: u64,
+        /// The leader's WAL-compaction floor (cluster-wide min match) stamped
+        /// on every outbound message so followers compact in lockstep;
+        /// `maxInt` when this node is not the group's leader (no floor to send).
+        floor: u64,
     };
 
     /// `takeMessages` callback: buffer one outbound raft message into the
@@ -1519,7 +1713,23 @@ pub const Node = struct {
         const ctx: *SendCtx = @ptrCast(@alignCast(ud.?));
         const t = ctx.node.transport orelse return;
         const bytes = if (msg_len == 0) &[_]u8{} else msg_bytes[0..msg_len];
-        t.queueOut(to, ctx.group_id, ctx.epoch, bytes);
+        t.queueOut(to, ctx.group_id, ctx.epoch, ctx.floor, bytes);
+    }
+
+    /// The WAL-compaction floor to stamp on `gid`'s outbound messages.
+    /// `minMatchIndex` is the cluster-wide min match on the leader and `maxInt`
+    /// (no floor) off-leader — exactly the per-recipient floor semantics, so a
+    /// follower receives + adopts the leader's floor and compacts in lockstep.
+    fn outboundFloor(self: *Node, gid: u64) u64 {
+        return self.mgr.minMatchIndex(gid);
+    }
+
+    /// Transport `drainFloors` callback: record the leader-sent compaction
+    /// floor for `gid` on its slot (monotonic). `durabilizeTick` truncates a
+    /// follower's WAL to this floor. Pump-thread only.
+    fn applyRecvFloor(self: *Node, gid: u64, floor: u64) void {
+        const slot = self.groups.get(gid) orelse return;
+        if (floor > slot.propagated_floor) slot.propagated_floor = floor;
     }
 };
 

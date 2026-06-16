@@ -26,10 +26,13 @@
 //! payload is never a connection's first frame). Our payload is:
 //!
 //!     [count:u32 LE]
-//!     count × [group_id:u64 LE][epoch:u64 LE][msg_len:u32 LE][msg bytes]
+//!     count × [group_id:u64 LE][epoch:u64 LE][floor:u64 LE][msg_len:u32 LE][msg bytes]
 //!
 //! `msg bytes` is the opaque rust-protobuf `eraftpb::Message` from
 //! `takeMessages`, fed verbatim to the peer's `stepBatch`/`stepFenced`.
+//! `floor` is the leader's cluster-wide min-match WAL-compaction floor for the
+//! group (`maxInt` = none, from a non-leader sender); the follower compacts to
+//! it in lockstep so the shared WAL bounds without a data-carrying snapshot.
 //!
 //! ## Node-id mapping
 //!
@@ -48,6 +51,15 @@
 const std = @import("std");
 const raft = @import("raft_rs_zig");
 const raftnet = @import("raft-net");
+const kvlimbs = @import("kvlimbs");
+
+/// µs-bucketed latency histogram (atomic buckets — safe to snapshot from the
+/// worker thread while the pump writes it). Reused for heartbeat RTT.
+pub const MicrosHistogram = kvlimbs.MicrosHistogram;
+
+fn nowNs() i64 {
+    return @intCast(std.time.nanoTimestamp());
+}
 
 const RaftNet = raftnet.RaftNet;
 const rpc = raftnet.rpc;
@@ -90,10 +102,27 @@ pub const Transport = struct {
     /// thread); cleared by `drainWoke`. Dups are fine — `bumpActive` is
     /// idempotent — so no per-message dedup.
     woke: std.ArrayListUnmanaged(u64) = .empty,
+    /// gid → highest WAL-compaction floor a LEADER stamped on inbound messages
+    /// since the last `drainFloors`. The pump drains it each cycle and records
+    /// it on each group's slot so a FOLLOWER compacts to the same floor as the
+    /// leader (lockstep, snapshot-free). Pump-thread only.
+    recv_floors: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     /// Total inbound messages `stepBatch` skipped (unknown group / epoch
     /// fence / decode failure) — rate-limited-logged in `onRecv` so a
     /// node silently dropping a group's traffic is operator-visible.
     step_skip_count: u64 = 0,
+
+    /// Broadcast-time observability (raft-best-practices §"how to size
+    /// election/heartbeat"). `hb_sent_ns[peer]` is the wall-clock at which this
+    /// node last sent a `MsgHeartbeat` to that peer (raft_net peer id =
+    /// node_id-1; 0 = no outstanding heartbeat). On the matching inbound
+    /// `MsgHeartbeatResponse`, the send→response delta is observed into
+    /// `hb_rtt` — an empirical leader↔follower round-trip (incl. pump-loop
+    /// latency on both ends), i.e. the `broadcastTime` the election timeout must
+    /// sit well above. Pump-thread only (queueOut + onRecv); the histogram's
+    /// atomic buckets let `/_system/metrics` snapshot it from the worker thread.
+    hb_sent_ns: []i64,
+    hb_rtt: MicrosHistogram = .{},
 
     pub const Config = struct {
         /// This node's raft id (1-based, must be ≤ peers.len).
@@ -114,6 +143,10 @@ pub const Transport = struct {
         errdefer allocator.free(outbufs);
         for (outbufs) |*ob| ob.* = .{};
 
+        const hb_sent_ns = allocator.alloc(i64, cfg.peers.len) catch return Error.OutOfMemory;
+        errdefer allocator.free(hb_sent_ns);
+        @memset(hb_sent_ns, 0);
+
         self.* = .{
             .allocator = allocator,
             .node_id = cfg.node_id,
@@ -121,6 +154,7 @@ pub const Transport = struct {
             .net = undefined,
             .manager = cfg.manager,
             .outbufs = outbufs,
+            .hb_sent_ns = hb_sent_ns,
         };
 
         // raft_net node/peer ids are 0-based; raft node ids are 1-based.
@@ -141,8 +175,10 @@ pub const Transport = struct {
         self.net.deinit();
         for (self.outbufs) |*ob| ob.body.deinit(a);
         a.free(self.outbufs);
+        a.free(self.hb_sent_ns);
         self.step_scratch.deinit(a);
         self.woke.deinit(a);
+        self.recv_floors.deinit(a);
         a.destroy(self);
     }
 
@@ -152,6 +188,22 @@ pub const Transport = struct {
     pub fn drainWoke(self: *Transport, out: *std.ArrayListUnmanaged(u64), a: std.mem.Allocator) !void {
         try out.appendSlice(a, self.woke.items);
         self.woke.clearRetainingCapacity();
+    }
+
+    /// Visit each (gid, leader-stamped floor) received since the last call,
+    /// then clear. The pump uses it to advance each group's follower
+    /// compaction floor. Pump-thread only (drains what `onRecv` filled).
+    pub fn drainFloors(self: *Transport, ctx: anytype, comptime apply: fn (@TypeOf(ctx), u64, u64) void) void {
+        var it = self.recv_floors.iterator();
+        while (it.next()) |e| apply(ctx, e.key_ptr.*, e.value_ptr.*);
+        self.recv_floors.clearRetainingCapacity();
+    }
+
+    /// Snapshot the heartbeat round-trip histogram (broadcast-time samples).
+    /// Lock-free: the histogram's atomic buckets are written on the pump thread
+    /// (queueOut/onRecv) and read here from the worker thread (`/_system/metrics`).
+    pub fn heartbeatRttSnapshot(self: *const Transport) MicrosHistogram.Snapshot {
+        return self.hb_rtt.snapshot();
     }
 
     /// Whether a raw eraftpb message is a heartbeat / heartbeat-response —
@@ -167,11 +219,26 @@ pub const Transport = struct {
         return bytes[1] == 8 or bytes[1] == 9;
     }
 
+    /// `MsgHeartbeat` (8) — leader→follower keep-alive (the RTT probe).
+    inline fn isHeartbeatReq(bytes: []const u8) bool {
+        return bytes.len >= 2 and bytes[0] == 0x08 and bytes[1] == 8;
+    }
+
+    /// `MsgHeartbeatResponse` (9) — follower→leader ack (closes the RTT).
+    inline fn isHeartbeatResp(bytes: []const u8) bool {
+        return bytes.len >= 2 and bytes[0] == 0x08 and bytes[1] == 9;
+    }
+
     /// Buffer one outbound message (from `Manager.takeMessages`) for its
     /// destination node, to be coalesced + sent at `flush`. `to` is a raft
     /// node id; a message to self (shouldn't happen) is dropped.
-    pub fn queueOut(self: *Transport, to: u64, group_id: u64, epoch: u64, msg: []const u8) void {
+    pub fn queueOut(self: *Transport, to: u64, group_id: u64, epoch: u64, floor: u64, msg: []const u8) void {
         if (to == self.node_id or to == 0 or to > self.cluster_size) return;
+        // Broadcast-time probe: stamp the moment we send a heartbeat to this
+        // peer so the matching response (in `onRecv`) yields the RTT. One
+        // outstanding heartbeat per peer; a later send just overwrites the
+        // stamp (a dropped response is harmless — it won't be matched).
+        if (isHeartbeatReq(msg)) self.hb_sent_ns[to - 1] = nowNs();
         const ob = &self.outbufs[to - 1];
         const a = self.allocator;
         // Roll back to this mark on a partial append: a header without
@@ -180,11 +247,15 @@ pub const Transport = struct {
         // the receiver would mis-parse the rest of the cycle's messages,
         // not reject them). Dropping the whole record is safe — raft
         // re-emits on the next tick.
+        // `floor` is the cluster-wide min match index the LEADER stamps so
+        // followers learn the safe WAL-compaction floor (lockstep compaction);
+        // `maxInt` from a non-leader sender means "no floor", ignored on recv.
         const mark = ob.body.items.len;
-        var hdr: [20]u8 = undefined;
+        var hdr: [28]u8 = undefined;
         std.mem.writeInt(u64, hdr[0..8], group_id, .little);
         std.mem.writeInt(u64, hdr[8..16], epoch, .little);
-        std.mem.writeInt(u32, hdr[16..20], @intCast(msg.len), .little);
+        std.mem.writeInt(u64, hdr[16..24], floor, .little);
+        std.mem.writeInt(u32, hdr[24..28], @intCast(msg.len), .little);
         ob.body.appendSlice(a, &hdr) catch return;
         ob.body.appendSlice(a, msg) catch {
             ob.body.shrinkRetainingCapacity(mark);
@@ -229,7 +300,9 @@ pub const Transport = struct {
     /// `payload` is valid only for this call; `stepBatch` reads it before
     /// returning, so the entry pointers into it are safe.
     fn onRecv(from_id: u32, payload: []const u8, ctx: ?*anyopaque) void {
-        _ = from_id; // the sender id is inside each eraftpb message
+        // `from_id` is the raft_net peer id of the SENDER (= its node_id-1) —
+        // used below to close the heartbeat RTT. Stepping still reads each
+        // message's own `from` field; `from_id` only attributes the round-trip.
         const self: *Transport = @ptrCast(@alignCast(ctx.?));
         if (payload.len < 4) return;
         const count = std.mem.readInt(u32, payload[0..4], .little);
@@ -237,11 +310,12 @@ pub const Transport = struct {
         self.step_scratch.clearRetainingCapacity();
         var i: u32 = 0;
         while (i < count) : (i += 1) {
-            if (off + 20 > payload.len) break;
+            if (off + 28 > payload.len) break;
             const group_id = std.mem.readInt(u64, payload[off..][0..8], .little);
             const epoch = std.mem.readInt(u64, payload[off + 8 ..][0..8], .little);
-            const msg_len = std.mem.readInt(u32, payload[off + 16 ..][0..4], .little);
-            off += 20;
+            const floor = std.mem.readInt(u64, payload[off + 16 ..][0..8], .little);
+            const msg_len = std.mem.readInt(u32, payload[off + 24 ..][0..4], .little);
+            off += 28;
             if (off + msg_len > payload.len) break;
             const msg = payload[off .. off + msg_len];
             off += msg_len;
@@ -251,8 +325,29 @@ pub const Transport = struct {
                 .msg_ptr = msg.ptr,
                 .msg_len = msg.len,
             }) catch return;
+            // The leader's WAL-compaction floor for this group (maxInt = none).
+            // Keep the highest seen this batch; the pump drains it post-tick.
+            if (floor != std.math.maxInt(u64)) {
+                const gop = self.recv_floors.getOrPut(self.allocator, group_id) catch null;
+                if (gop) |e| {
+                    if (!e.found_existing or floor > e.value_ptr.*) e.value_ptr.* = floor;
+                }
+            }
             // Real raft traffic wakes a hibernated group; heartbeats do not.
             if (!isHeartbeatLike(msg)) self.woke.append(self.allocator, group_id) catch {};
+
+            // Close the broadcast-time probe: a heartbeat response from `from_id`
+            // pairs with the last heartbeat we sent that peer. Observe the RTT
+            // (µs) and clear the stamp so a duplicate/late response isn't
+            // re-counted against a newer send.
+            if (isHeartbeatResp(msg) and from_id < self.cluster_size) {
+                const sent = self.hb_sent_ns[from_id];
+                if (sent != 0) {
+                    const rtt_ns = nowNs() - sent;
+                    if (rtt_ns > 0) self.hb_rtt.observe(@intCast(@divTrunc(rtt_ns, std.time.ns_per_us)));
+                    self.hb_sent_ns[from_id] = 0;
+                }
+            }
         }
         const stepped = self.manager.stepBatch(self.step_scratch.items);
         // stepBatch skips bad entries silently (unknown group, stale
@@ -286,16 +381,17 @@ test "transport: coalesced envelope round-trips message bytes" {
     var body: std.ArrayListUnmanaged(u8) = .empty;
     defer body.deinit(a);
 
-    const msgs = [_]struct { gid: u64, epoch: u64, bytes: []const u8 }{
-        .{ .gid = 7, .epoch = 0, .bytes = "vote-req-bytes" },
-        .{ .gid = 7, .epoch = 3, .bytes = "append-entries" },
-        .{ .gid = 42, .epoch = 1, .bytes = "x" },
+    const msgs = [_]struct { gid: u64, epoch: u64, floor: u64, bytes: []const u8 }{
+        .{ .gid = 7, .epoch = 0, .floor = std.math.maxInt(u64), .bytes = "vote-req-bytes" },
+        .{ .gid = 7, .epoch = 3, .floor = 1234, .bytes = "append-entries" },
+        .{ .gid = 42, .epoch = 1, .floor = 0, .bytes = "x" },
     };
     for (msgs) |m| {
-        var hdr: [20]u8 = undefined;
+        var hdr: [28]u8 = undefined;
         std.mem.writeInt(u64, hdr[0..8], m.gid, .little);
         std.mem.writeInt(u64, hdr[8..16], m.epoch, .little);
-        std.mem.writeInt(u32, hdr[16..20], @intCast(m.bytes.len), .little);
+        std.mem.writeInt(u64, hdr[16..24], m.floor, .little);
+        std.mem.writeInt(u32, hdr[24..28], @intCast(m.bytes.len), .little);
         try body.appendSlice(a, &hdr);
         try body.appendSlice(a, m.bytes);
     }
@@ -316,12 +412,14 @@ test "transport: coalesced envelope round-trips message bytes" {
     while (i < count) : (i += 1) {
         const gid = std.mem.readInt(u64, p[off..][0..8], .little);
         const epoch = std.mem.readInt(u64, p[off + 8 ..][0..8], .little);
-        const mlen = std.mem.readInt(u32, p[off + 16 ..][0..4], .little);
-        off += 20;
+        const floor = std.mem.readInt(u64, p[off + 16 ..][0..8], .little);
+        const mlen = std.mem.readInt(u32, p[off + 24 ..][0..4], .little);
+        off += 28;
         const msg = p[off .. off + mlen];
         off += mlen;
         try testing.expectEqual(msgs[i].gid, gid);
         try testing.expectEqual(msgs[i].epoch, epoch);
+        try testing.expectEqual(msgs[i].floor, floor);
         try testing.expectEqualStrings(msgs[i].bytes, msg);
         seen += 1;
     }

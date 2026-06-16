@@ -134,6 +134,16 @@ pub fn tryHandleV2(
         try handleLoadMerge(server, allocator, worker, ent, sid, sess, method, rh, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-plan")) {
         try handlePlan(server, allocator, worker, ent, sid, sess, method, path, body);
+    } else if (std.mem.eql(u8, sys_rest, "v2-confchange")) {
+        try handleConfChange(server, allocator, worker, ent, sid, sess, method, body);
+    } else if (std.mem.eql(u8, sys_rest, "v2-confstate")) {
+        try handleConfState(server, allocator, worker, ent, sid, sess, method, path);
+    } else if (std.mem.eql(u8, sys_rest, "v2-applied-baseline")) {
+        try handleAppliedBaseline(server, allocator, worker, ent, sid, sess, method, path);
+    } else if (std.mem.eql(u8, sys_rest, "v2-load-replace")) {
+        try handleLoadReplace(server, allocator, worker, ent, sid, sess, method, rh, body);
+    } else if (std.mem.eql(u8, sys_rest, "v2-apply-snapshot")) {
+        try handleApplySnapshot(server, allocator, worker, ent, sid, sess, method, body);
     } else {
         try respb.setSystemResponse(server, ent, sid, sess, 404, "unknown v2 move endpoint\n", allocator, null, null);
     }
@@ -809,6 +819,218 @@ fn queryParam(path: []const u8, key: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
     }
     return null;
+}
+
+// ── v2-confchange / v2-confstate: manual membership change (conf_change Ph1) ──
+
+/// `POST /_system/v2-confchange {tenant, node_id, op}` — operator-triggered
+/// membership change on `tenant`'s raft group (leader-gated). `op`:
+/// `demote`/`add` → learner (AddLearnerNode), `promote` → voter (AddNode),
+/// `remove` → drop. A demote of a far-behind voter takes it out of the
+/// voters-only WAL-compaction floor so the log truncates again.
+fn handleConfChange(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    body: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+    var parsed = std.json.parseFromSlice(
+        struct { tenant: []const u8, node_id: u64, op: []const u8 },
+        allocator,
+        body,
+        .{ .ignore_unknown_fields = true },
+    ) catch return reply(server, allocator, ent, sid, sess, 400, "expected {tenant, node_id, op}\n");
+    defer parsed.deinit();
+    const v = parsed.value;
+    if (v.tenant.len == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "empty tenant\n");
+    const cc_type: u8 =
+        if (std.mem.eql(u8, v.op, "demote") or std.mem.eql(u8, v.op, "add")) 2 else if (std.mem.eql(u8, v.op, "promote")) 0 else if (std.mem.eql(u8, v.op, "remove")) 1 else return reply(server, allocator, ent, sid, sess, 400, "op must be demote|promote|add|remove\n");
+    const gid = worker.raft.gidForTenant(v.tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
+    if (!worker.raft.isLeaderOf(gid))
+        return reply(server, allocator, ent, sid, sess, 421, "not the leader for this tenant; try another node\n");
+    worker.raft.proposeConfChange(gid, v.node_id, cc_type) catch |e| switch (e) {
+        error.NotLeader => return reply(server, allocator, ent, sid, sess, 421, "not the leader\n"),
+        error.ConfChangeQuorumGuard => return reply(server, allocator, ent, sid, sess, 409, "refused: would leave fewer than 2 voters\n"),
+        else => return reply(server, allocator, ent, sid, sess, 500, "conf-change propose failed\n"),
+    };
+    return reply(server, allocator, ent, sid, sess, 204, "");
+}
+
+/// `GET /_system/v2-confstate?tenant=` → `{"voters":[…],"learners":[…]}` for
+/// the tenant's group on this node (operator + smoke membership query).
+fn handleConfState(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    path: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "GET"))
+        return reply(server, allocator, ent, sid, sess, 405, "GET only\n");
+    const tenant = queryParam(path, "tenant") orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing ?tenant\n");
+    const gid = worker.raft.gidForTenant(tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
+    var voters_buf: [16]u64 = undefined;
+    var learners_buf: [16]u64 = undefined;
+    const cs = worker.raft.confState(gid, &voters_buf, &learners_buf) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "no conf state for this group\n");
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var w = buf.writer(allocator);
+    w.writeAll("{\"voters\":[") catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    for (cs.voters, 0..) |id, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        w.print("{d}", .{id}) catch {};
+    }
+    w.writeAll("],\"learners\":[") catch {};
+    for (cs.learners, 0..) |id, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        w.print("{d}", .{id}) catch {};
+    }
+    w.writeAll("]}\n") catch {};
+    const out = buf.toOwnedSlice(allocator) catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
+}
+
+// ── promote-back: out-of-band rejoin of a below-floor learner (Ph2) ──
+//
+// A node auto-demoted to a learner that then fell below the WAL-compaction
+// floor can't catch up by replication (the leader compacted past it) and rove
+// has no in-protocol snapshot transport. It rejoins out-of-band:
+//   1. GET  v2-applied-baseline (on the leader)  → {index X, term T}
+//   2. GET  v2-snapshot         (on the leader)  → a store bundle (⊇ X)
+//   3. POST v2-load-replace     (on the learner) → overwrite-load the bundle
+//   4. POST v2-apply-snapshot   (on the learner, {index:X, term:T}) → install a
+//      DATA-FREE raft baseline at X, so the leader can replicate the tail (> X)
+//   5. POST v2-confchange {op:promote} (on the leader) → back to a voter
+// The orchestrator (CP / smoke) sequences these; each endpoint is a passive
+// primitive, like the tenant-move surface.
+
+/// `GET /_system/v2-applied-baseline?tenant=` → `{"index":X,"term":T}` where X
+/// is the leader's durabilized applied index (the safe lower bound for an
+/// out-of-band bundle — the bundle reflects at least this much) and T is the
+/// term of the log entry at X (so the learner's baseline matches the leader's
+/// log). Leader-gated (only the leader tracks term-by-index meaningfully).
+fn handleAppliedBaseline(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    path: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "GET"))
+        return reply(server, allocator, ent, sid, sess, 405, "GET only\n");
+    const tenant = queryParam(path, "tenant") orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing ?tenant\n");
+    const gid = worker.raft.gidForTenant(tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
+    if (!worker.raft.isLeaderOf(gid))
+        return reply(server, allocator, ent, sid, sess, 421, "not the leader for this tenant; try another node\n");
+    const inst = (worker.node.tenant.getInstance(tenant) catch null) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "unknown tenant\n");
+    const index = inst.kv.lastAppliedRaftIdx() catch
+        return reply(server, allocator, ent, sid, sess, 500, "applied-index read failed\n");
+    const term = worker.raft.logTerm(gid, index);
+    const out = std.fmt.allocPrint(allocator, "{{\"index\":{d},\"term\":{d}}}\n", .{ index, term }) catch
+        return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
+}
+
+/// `POST /_system/v2-load-replace` (bundle bytes + `X-Rewind-Tenant`) — true
+/// REPLACE-load a bundle into an existing (stale) store: every existing pair is
+/// deleted, then the bundle's pairs are written, in one atomic kvexp Txn, so the
+/// store ends EXACTLY equal to the bundle. The promote-back store reset for a
+/// returning learner whose data is older than the source's — a key the source
+/// deleted while the learner was gone is removed, not left as a phantom (which
+/// would make the promoted-back voter diverge from the cluster). Unlike
+/// `v2-load-merge`'s insert-if-absent (zero-downtime move).
+fn handleLoadReplace(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    rh: h2.ReqHeaders,
+    body: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+    const tenant = respb.findHeader(rh, TENANT_HEADER) orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Tenant\n");
+    const inst = ensureInstance(worker, tenant) catch
+        return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
+    inst.kv.loadTenantBundleReplace(body) catch
+        return reply(server, allocator, ent, sid, sess, 400, "replace load failed\n");
+    inst.kv.delete(FORWARD_MARKER) catch |err| switch (err) {
+        error.NotFound => {},
+        else => std.log.warn("v2-load-replace: clearing inherited {s} failed: {s}", .{ FORWARD_MARKER, @errorName(err) }),
+    };
+    try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
+}
+
+/// `POST /_system/v2-apply-snapshot {tenant, index, term}` — install a data-free
+/// raft baseline at {index, term} into this node's LOCAL group (promote-back
+/// step 4). Must be a learner/follower (a leader can't restore to itself). The
+/// KV state for `index` must already be loaded (v2-load-replace). After this the
+/// leader replicates the tail (> index) from its log; promote to a voter once
+/// caught up.
+///
+/// On the store watermark: this does NOT stamp the kvexp `lastAppliedRaftIdx` to
+/// `index`. It intentionally lags (the bundle load used `durabilize(0)`), and
+/// that is SAFE — raft recovers its applied index from the WAL compaction marker
+/// the snapshot installs, never from the store watermark (`group_raft_config`
+/// passes no `applied`; `durable_idx` only seeds rove's `slot.applied_idx`
+/// bookkeeping). A crash in the rejoin window therefore recovers cleanly: raft
+/// is at `index`, the store data ≤ index is durable from the bundle, and the
+/// watermark self-heals on the next applied write. Proven by the crash-in-window
+/// leg of `scripts/promote_back_smoke_v2.py` — keep it green if this changes.
+fn handleApplySnapshot(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    body: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+    var parsed = std.json.parseFromSlice(
+        struct { tenant: []const u8, index: u64, term: u64 },
+        allocator,
+        body,
+        .{ .ignore_unknown_fields = true },
+    ) catch return reply(server, allocator, ent, sid, sess, 400, "expected {tenant, index, term}\n");
+    defer parsed.deinit();
+    const v = parsed.value;
+    const gid = worker.raft.gidForTenant(v.tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
+    if (worker.raft.isLeaderOf(gid))
+        return reply(server, allocator, ent, sid, sess, 409, "this node leads the group; a leader can't restore a snapshot to itself\n");
+    worker.raft.applyLocalSnapshot(gid, v.index, v.term) catch |e| switch (e) {
+        error.SnapshotStale => return reply(server, allocator, ent, sid, sess, 409, "index not ahead of committed; nothing to install\n"),
+        error.NotLeader => return reply(server, allocator, ent, sid, sess, 409, "node leads the group\n"),
+        else => return reply(server, allocator, ent, sid, sess, 500, "apply-snapshot failed\n"),
+    };
+    return reply(server, allocator, ent, sid, sess, 204, "");
 }
 
 /// Stamp a plain status + message response (no CORS — internal surface).
