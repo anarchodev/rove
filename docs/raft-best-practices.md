@@ -21,9 +21,11 @@ highest-value remaining items are *RawNode methods*, which need NEW `extern
 | **Multi-node WAL compaction (snapshot-free, lockstep)** | multi-node nodes now truncate the shared WAL (was single-node-only). The leader floors compaction at the cluster-wide **min match index** and **propagates that floor** on its outbound raft messages; a follower truncates to the same floor (`propagated_floor`). No node ever compacts past an entry a voter still needs, so a lagging/returning voter always catches up from the **log** — no in-raft snapshot, no dump on any node's hot path. WAL self-heals: a down voter pins the floor (WAL grows during the outage), advances on its return. A genuinely *new* member (conf_change learner / tenant move) bootstraps **out-of-band** (the move's follower-sourced off-pump bundle), not via raft. | fork `raft_manager_min_match_index`; `node.zig` `durabilizeTick` floor + `outboundFloor`/`applyRecvFloor`/`propagated_floor`, `transport.zig` per-record `floor` field + `drainFloors` (branch `feat/multinode-snapshot`) |
 
 Read-consistency contract is now **strict-serializable leader reads** (was
-eventual / read-your-writes-only-within-a-handler). The only residual gap is
-the deposed-leader window, now *bounded* by check_quorum (see `read_index`
-below to eliminate it).
+eventual / read-your-writes-only-within-a-handler). The only residual gap is a
+**partition-window stale read on clean read-only requests**, consciously
+accepted and bounded by check_quorum — see "`read_index` — consciously not
+done" below for the precise scope, the scenario, and why Safe-mode read_index
+(the only thing that would close it) isn't worth its per-read cost.
 
 Validation: `dispatch_gate_smoke_v2` (gate + idle/hibernation), plus
 `rewind_smoke`, `three_node_smoke`, `leader_failover_smoke_v2`; `LeaderCache`
@@ -51,8 +53,9 @@ These are fields on `RaftGroupConfig` / `defaultGroupConfig()`, settable in
 - `applied` (restart applied-index), `batch_append`, `skip_bcast_commit`,
   `max_uncommitted_size`, `max_committed_size_per_ready` — situational.
 - `read_only_option` (Safe / LeaseBased) — settable, but **inert without the
-  `read_index` method** (below). LeaseBased also requires `check_quorum`
-  (already on); raft `validate()` enforces that.
+  `read_index` method**, which is **consciously not built** (see below).
+  LeaseBased also requires `check_quorum` (already on); raft `validate()`
+  enforces that.
 
 ## Blocked on NEW FFI methods (need extern "C" fns in the fork)
 
@@ -62,12 +65,64 @@ These are `RawNode` methods, not config. Each needs: a Rust
 Listed by value. (`transfer_leader` was #1 here and is now **Done** above — it
 is the worked example of the full FFI-method → re-pin → wiring path.)
 
-1. **`read_index` — ReadIndex / LeaseBased linearizable reads.**
-   Eliminates the deposed-leader window entirely (check_quorum only *bounds*
-   it). The `read_only_option` config is already settable but does nothing
-   until this method exists and the read path calls it. Cost: a heartbeat
-   round per read (batchable). Only needed if the check_quorum bound isn't
-   tight enough for the contract. (`RawNode::read_index(rctx)`.)
+1. **`read_index` — ReadIndex / LeaseBased linearizable reads. CONSCIOUSLY NOT
+   DONE** (decided 2026-06-16). Keeping the analysis so nobody re-derives it.
+
+   **The residual gap is exactly one code path.** A read-bearing activation
+   resolves three ways in `worker_dispatch.zig`'s `finalizeBatch`:
+   - **Handler writes** → `proposeBatch` + park; the response releases only when
+     `committedSeq` passes the seq (`drainRaftPending`), 421 on fault.
+     Linearized through the log.
+   - **Read-only, but a read crossed an uncommitted speculative overlay**
+     (`txn.sawSpeculation()`) → the **idiom-0 barrier**: an empty-writeset
+     propose + park, released only on commit. Also linearized through the log.
+   - **Clean read-only batch** (`saw_speculation == false`) → *"no raft hop"*:
+     the txn splices out locally and the response releases from local applied
+     state.
+
+   read_index would only ever touch the **third** path — the one read that
+   returns without any raft round-trip. The first two already wait for a commit;
+   note the idiom-0 barrier gives *read-your-writes* (vs this node's own
+   uncommitted chain), which is **orthogonal** to cross-cluster freshness — a
+   stale read of another node's newer commit has no local speculation to trip
+   it.
+
+   **What the gap actually is** — a partition-window *stale* read, never a lost
+   write. Partition `{A} | {B,C}`: C+B form the new majority and commit W′,
+   W″…; deposed-but-not-yet-stepped-down A (still passing the local-role
+   dispatch-gate) serves a clean read missing W′. The *opposite* direction — A
+   returns a read of a "committed" write that then vanishes — **cannot happen**:
+   raft Leader Completeness guarantees a quorum-committed entry survives every
+   future election (any new leader needs a vote from a node that holds it, and
+   the vote restriction forbids electing a less-complete log), and the fork
+   already counts an entry toward the commit quorum only after its fsync
+   (`584122a` + the `advance_append_async`/`on_persist` split). So the only
+   exposure is bounded staleness on clean reads, gated by all of: an active
+   partition, a client that reaches minority-side A but not the majority, and A
+   still inside its pre-step-down window. `check_quorum` ends it within ~one
+   election timeout (A stops hearing a quorum → steps down → dispatch-gate flips
+   to 421).
+
+   **Why not close it.** Only **Safe** mode would eliminate the window — a
+   heartbeat-quorum round-trip *at read time*, so minority-side A can't confirm
+   and the read becomes a re-aim instead of a stale value. That is a quorum RTT
+   on the **common** clean-read path. **LeaseBased buys ~nothing**: its lease
+   expires on missed heartbeat rounds, i.e. the same ~election-timeout bound
+   check_quorum already gives, plus a clock-drift assumption. So the choice is
+   binary — tax every clean read to close a partition-only, time-bounded,
+   isolated-client staleness window, or accept the check_quorum bound. We accept
+   the bound; bounded staleness on clean reads during a partition is a mild,
+   conventional anomaly and not worth a per-read round-trip.
+
+   **If the contract ever needs strict-linearizable clean reads:** build
+   `RawNode::read_index(rctx)` → surface `ready.read_states()` in
+   `process_ready` (a `ReadState{index, ctx}` keyed by a unique ctx) → a bridge
+   confirm/poll control-cmd → wire it **only** into the third path above (the
+   `saw_speculation == false` branch): request a read index, serve once
+   `applied >= index`, else 421 if leadership can't be confirmed. Use **Safe**
+   mode (LeaseBased is not worth the clock assumption for no real gain). Cost is
+   a quorum heartbeat round per clean read (batchable across concurrent reads on
+   a group).
 
 2. **`propose_conf_change` / `apply_conf_change` — membership changes /
    learners.** Add/remove voters one at a time; join new nodes as learners
@@ -115,7 +170,7 @@ is the worked example of the full FFI-method → re-pin → wiring path.)
   `main`). For durability the fork `main` should be fast-forwarded onto
   `06df085` so the pin is reachable from mainline and survives the feature
   branch being deleted — same practice as the `f6075137` re-pin
-  (`443c592..f607513`). The next FFI change (read_index / conf_change) branches
+  (`443c592..f607513`). Any future FFI change branches
   from fork `main` and re-pins likewise.
 
 ## Pointers
