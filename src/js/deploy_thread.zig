@@ -59,14 +59,30 @@ pub const DeployThread = struct {
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
 
-    /// Completed results, keyed by `compile_id`. The thread inserts;
-    /// the worker's drain `fetchRemove`s. Mutex-guarded — the only
-    /// cross-thread shared map.
+    /// Completed full-stage results (`/_system/deploy`), keyed by
+    /// `compile_id`. The thread inserts; the worker's drain
+    /// `fetchRemove`s. Guarded by `results_mutex`.
     results: std.AutoHashMapUnmanaged(u64, Result) = .empty,
+    /// Completed batch-compile results (`platform.compile`), keyed by
+    /// `compile_id`. Same mutex. Values own their `files` slice + each
+    /// file's `path` — `takeCompileResult` transfers ownership to the
+    /// caller (which frees after firing `on_result`).
+    compile_results: std.AutoHashMapUnmanaged(u64, CompileResult) = .empty,
     results_mutex: std.Thread.Mutex = .{},
+
+    pub const JobKind = enum {
+        /// Full deploy: compile + stage + stamp manifest → dep_id
+        /// (the `/_system/deploy` route). Result in `results`.
+        stage,
+        /// Batch compile handler sources + stage source/bytecode blobs,
+        /// return per-file hashes, NO manifest (the `platform.compile`
+        /// primitive). Result in `compile_results`.
+        compile_batch,
+    };
 
     pub const Job = struct {
         compile_id: u64,
+        kind: JobKind = .stage,
         /// Owned copy of the target tenant id.
         tenant_id: []u8,
         /// Owned inputs — each `path` / `content_type` / `bytes` slice
@@ -75,11 +91,29 @@ pub const DeployThread = struct {
         inputs: []files_mod.DeployInput,
     };
 
-    /// A finished deploy. On success `status == 200` and `dep_id` is the
-    /// content-addressed deployment id; otherwise `status` is the HTTP
-    /// status and `msg` a static (no-ownership) error string.
+    /// A finished full-stage deploy. On success `status == 200` and
+    /// `dep_id` is the content-addressed deployment id; otherwise
+    /// `status` is the HTTP status and `msg` a static error string.
     pub const Result = struct {
         dep_id: u64 = 0,
+        status: u16 = 200,
+        msg: []const u8 = "",
+    };
+
+    /// One compiled handler's content-addressed hashes — the owned
+    /// (cross-thread) form of `files.CompiledFile` (the `path` is duped
+    /// because the job's inputs are freed once it runs).
+    pub const CompiledOut = struct {
+        path: []u8,
+        source_hex: [files_mod.HASH_HEX_LEN]u8,
+        bytecode_hex: [files_mod.HASH_HEX_LEN]u8,
+    };
+
+    /// A finished batch compile. On success `status == 200` and `files`
+    /// holds one entry per input; otherwise `files` is empty and `msg`
+    /// is a static error string. The caller owns `files` + each `path`.
+    pub const CompileResult = struct {
+        files: []CompiledOut = &.{},
         status: u16 = 200,
         msg: []const u8 = "",
     };
@@ -106,10 +140,14 @@ pub const DeployThread = struct {
 
     pub fn deinit(self: *DeployThread) void {
         // Caller must have shutdown by here. Free any jobs the thread
-        // never reached + the (small, value-only) results map.
+        // never reached + both results maps (compile_results values own
+        // their files/paths; takers that never ran leave them here).
         for (self.queue.items) |*job| freeJob(self.allocator, job);
         self.queue.deinit(self.allocator);
         self.results.deinit(self.allocator);
+        var it = self.compile_results.valueIterator();
+        while (it.next()) |r| freeCompileResult(self.allocator, r);
+        self.compile_results.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -139,6 +177,28 @@ pub const DeployThread = struct {
             // OOM recording the result: the parked request will reap on
             // its deadline (504). Nothing else we can do here.
             std.log.err("deploy thread: failed to record result for compile {d}", .{compile_id});
+        };
+    }
+
+    /// Pop a completed batch-compile result by `compile_id`, or null if
+    /// still running. The caller OWNS `files` + each `path` and must free
+    /// them (via `freeCompileResult`) after firing `on_result`.
+    pub fn takeCompileResult(self: *DeployThread, compile_id: u64) ?CompileResult {
+        self.results_mutex.lock();
+        defer self.results_mutex.unlock();
+        const kv = self.compile_results.fetchRemove(compile_id) orelse return null;
+        return kv.value;
+    }
+
+    fn putCompileResult(self: *DeployThread, compile_id: u64, result: CompileResult) void {
+        self.results_mutex.lock();
+        defer self.results_mutex.unlock();
+        self.compile_results.put(self.allocator, compile_id, result) catch {
+            // OOM recording the result: free the owned files so they
+            // don't leak; the parked request reaps on its deadline.
+            var r = result;
+            freeCompileResult(self.allocator, &r);
+            std.log.err("deploy thread: failed to record compile-batch result for {d}", .{compile_id});
         };
     }
 
@@ -178,14 +238,16 @@ pub const DeployThread = struct {
             if (self.stop.load(.acquire)) break;
             while (self.popOne()) |job_val| {
                 var job = job_val;
-                const result = self.processJob(ctx_ptr, &job);
-                self.putResult(job.compile_id, result);
+                switch (job.kind) {
+                    .stage => self.putResult(job.compile_id, self.processStage(ctx_ptr, &job)),
+                    .compile_batch => self.putCompileResult(job.compile_id, self.processCompileBatch(ctx_ptr, &job)),
+                }
                 freeJob(self.allocator, &job);
             }
         }
     }
 
-    fn processJob(self: *DeployThread, ctx_ptr: ?*qjs.Context, job: *Job) Result {
+    fn processStage(self: *DeployThread, ctx_ptr: ?*qjs.Context, job: *Job) Result {
         const ctx = ctx_ptr orelse return .{ .status = 500, .msg = "compiler unavailable" };
 
         var file_be = blob_mod.BlobBackend.openPerTenant(
@@ -230,6 +292,57 @@ pub const DeployThread = struct {
         };
         return .{ .dep_id = dep_id, .status = 200 };
     }
+
+    fn processCompileBatch(self: *DeployThread, ctx_ptr: ?*qjs.Context, job: *Job) CompileResult {
+        const ctx = ctx_ptr orelse return .{ .status = 500, .msg = "compiler unavailable" };
+
+        var file_be = blob_mod.BlobBackend.openPerTenant(
+            self.allocator,
+            self.blob_cfg,
+            job.tenant_id,
+            "file-blobs",
+        ) catch |err| {
+            std.log.warn("deploy thread: open file-blobs for {s} failed: {s}", .{ job.tenant_id, @errorName(err) });
+            return .{ .status = 502, .msg = "blob backend open failed" };
+        };
+        defer file_be.deinit();
+
+        const compiled = files_mod.compileAndStage(
+            self.allocator,
+            file_be.blobStore(),
+            compileThunk,
+            ctx,
+            job.inputs,
+        ) catch |err| {
+            std.log.warn("deploy thread: compile-batch {s} (compile {d}) failed: {s}", .{ job.tenant_id, job.compile_id, @errorName(err) });
+            return switch (err) {
+                error.CompileFailed => .{ .status = 400, .msg = "compile failed" },
+                error.InvalidManifest => .{ .status = 400, .msg = "invalid input (duplicate paths or too many entries)" },
+                error.InvalidPath => .{ .status = 400, .msg = "invalid path" },
+                error.Blob => .{ .status = 502, .msg = "blob storage error" },
+                error.OutOfMemory => .{ .status = 500, .msg = "out of memory" },
+                else => .{ .status = 500, .msg = "compile failed" },
+            };
+        };
+        defer self.allocator.free(compiled); // the CompiledFile slice (paths borrow `job.inputs`)
+
+        // Copy into owned `CompiledOut` (dup each path — `job.inputs` is
+        // freed once this job returns). On OOM mid-build, free what we
+        // staged and surface 500.
+        const out = self.allocator.alloc(CompiledOut, compiled.len) catch
+            return .{ .status = 500, .msg = "out of memory" };
+        var built: usize = 0;
+        for (compiled) |cf| {
+            const path_owned = self.allocator.dupe(u8, cf.path) catch {
+                for (out[0..built]) |*o| self.allocator.free(o.path);
+                self.allocator.free(out);
+                return .{ .status = 500, .msg = "out of memory" };
+            };
+            out[built] = .{ .path = path_owned, .source_hex = cf.source_hex, .bytecode_hex = cf.bytecode_hex };
+            built += 1;
+        }
+        return .{ .files = out, .status = 200 };
+    }
 };
 
 /// `files.CompileFn` over this thread's QuickJS context. `ctx_opaque`
@@ -259,6 +372,15 @@ fn freeJob(allocator: std.mem.Allocator, job: *DeployThread.Job) void {
     }
     allocator.free(job.inputs);
     allocator.free(job.tenant_id);
+}
+
+/// Free a `CompileResult`'s owned memory (each file's `path` + the
+/// `files` slice). Public — the worker's drain calls it after firing
+/// `on_result`. No-op on the empty/error result.
+pub fn freeCompileResult(allocator: std.mem.Allocator, r: *DeployThread.CompileResult) void {
+    for (r.files) |*f| allocator.free(f.path);
+    if (r.files.len != 0) allocator.free(r.files);
+    r.files = &.{};
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -332,4 +454,38 @@ test "result map round-trips and a take consumes it" {
     try testing.expectEqual(@as(u16, 200), r.status);
     // Consumed — a second take is null.
     try testing.expect(dt.takeResult(5) == null);
+}
+
+test "compile_results round-trip + take transfers owned files" {
+    const a = testing.allocator;
+    const dt = try DeployThread.init(a, test_cfg);
+    defer dt.deinit();
+
+    try testing.expect(dt.takeCompileResult(9) == null);
+
+    // Build an owned CompileResult the way processCompileBatch would.
+    const files = try a.alloc(DeployThread.CompiledOut, 1);
+    files[0] = .{
+        .path = try a.dupe(u8, "index.mjs"),
+        .source_hex = @splat('a'),
+        .bytecode_hex = @splat('b'),
+    };
+    dt.putCompileResult(9, .{ .files = files, .status = 200 });
+
+    var taken = dt.takeCompileResult(9).?;
+    try testing.expectEqual(@as(usize, 1), taken.files.len);
+    try testing.expectEqualStrings("index.mjs", taken.files[0].path);
+    try testing.expect(dt.takeCompileResult(9) == null);
+    // Caller owns it now — free it (leak-checked).
+    freeCompileResult(a, &taken);
+}
+
+test "deinit frees un-taken compile_results" {
+    const a = testing.allocator;
+    const dt = try DeployThread.init(a, test_cfg);
+    const files = try a.alloc(DeployThread.CompiledOut, 1);
+    files[0] = .{ .path = try a.dupe(u8, "x.mjs"), .source_hex = @splat('a'), .bytecode_hex = @splat('b') };
+    dt.putCompileResult(11, .{ .files = files, .status = 200 });
+    // Never taken — deinit must free the owned files (leak-checked).
+    dt.deinit();
 }

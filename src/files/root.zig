@@ -601,6 +601,73 @@ pub fn stageDeployment(
     return dep_id;
 }
 
+/// One compiled handler's content-addressed hashes (the result of
+/// `compileAndStage`). `path` borrows the caller's input slice.
+pub const CompiledFile = struct {
+    path: []const u8,
+    source_hex: [HASH_HEX_LEN]u8,
+    bytecode_hex: [HASH_HEX_LEN]u8,
+};
+
+/// Batch-compile handler sources and content-address BOTH the source and
+/// the bytecode blob into `blob` (the target tenant's file-blobs backend).
+/// Returns one `CompiledFile` per input — the caller stamps the manifest
+/// from these hashes (NO manifest is written here; that's the JS deploy
+/// handler's job). This is the off-hot-path executor behind the
+/// `platform.compile` primitive: compile is slow (so it runs on the
+/// background `DeployThread`, not inline) but deterministic + idempotent
+/// (so identical inputs → identical hashes → PUTs land on the same keys,
+/// and replay needs no tape — it recomputes).
+///
+/// Every input is treated as a handler (compiled). Statics don't belong
+/// here — the deploy handler stages those itself via a (cross-tenant)
+/// `blob.put`. Bounded to 256 entries; rejects invalid/duplicate paths.
+/// Caller owns the returned slice (free with the same allocator); each
+/// `path` borrows the corresponding input.
+pub fn compileAndStage(
+    allocator: std.mem.Allocator,
+    blob: BlobStore,
+    compile: CompileFn,
+    compile_ctx: ?*anyopaque,
+    inputs: []const DeployInput,
+) Error![]CompiledFile {
+    if (inputs.len > 256) return Error.InvalidManifest;
+
+    for (inputs, 0..) |in_a, i| {
+        try validatePath(in_a.path);
+        for (inputs[0..i]) |in_b| {
+            if (std.mem.eql(u8, in_a.path, in_b.path)) return Error.InvalidManifest;
+        }
+    }
+
+    const out = allocator.alloc(CompiledFile, inputs.len) catch return Error.OutOfMemory;
+    errdefer allocator.free(out);
+
+    for (inputs, 0..) |in, i| {
+        var src_hex: [HASH_HEX_LEN]u8 = undefined;
+        hashHex(in.bytes, &src_hex);
+        try putBlobIfMissingTo(blob, &src_hex, in.bytes);
+
+        // Filename must be NUL-terminated for quickjs.
+        var fname_buf: [MAX_PATH_LEN + 1]u8 = undefined;
+        @memcpy(fname_buf[0..in.path.len], in.path);
+        fname_buf[in.path.len] = 0;
+        const fname: [:0]const u8 = fname_buf[0..in.path.len :0];
+
+        const bytecode = compile(compile_ctx, in.bytes, fname, allocator) catch
+            return Error.CompileFailed;
+        defer allocator.free(bytecode);
+
+        var bc_hex: [HASH_HEX_LEN]u8 = undefined;
+        hashHex(bytecode, &bc_hex);
+        try putBlobIfMissingTo(blob, &bc_hex, bytecode);
+
+        out[i] = .{ .path = in.path, .source_hex = src_hex, .bytecode_hex = bc_hex };
+    }
+
+    return out;
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────
 
 /// Content-addressed PUT: skip if the key already exists. Lets multiple
@@ -1173,4 +1240,66 @@ test "stageDeployment: rejects path traversal" {
     defer m.deinit();
     const inputs = [_]DeployInput{.{ .path = "../etc/passwd", .kind = .static, .bytes = "x" }};
     try testing.expectError(Error.InvalidPath, stageDeployment(a, b.blobStore(), m.blobStore(), passthroughCompile, null, &inputs));
+}
+
+// ── compileAndStage (batch compile → per-file hashes) tests ────────────
+
+test "compileAndStage: stages source + bytecode blobs, returns hashes" {
+    const a = testing.allocator;
+    var blob = MemBlobStore.init(a);
+    defer blob.deinit();
+
+    const inputs = [_]DeployInput{
+        .{ .path = "index.mjs", .kind = .handler, .bytes = "export default () => 1;" },
+        .{ .path = "api/index.mjs", .kind = .handler, .bytes = "export default () => 2;" },
+    };
+    const out = try compileAndStage(a, blob.blobStore(), passthroughCompile, null, &inputs);
+    defer a.free(out);
+
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqualStrings("index.mjs", out[0].path);
+    try testing.expectEqualStrings("api/index.mjs", out[1].path);
+    // Both the source AND bytecode blobs landed for every handler.
+    for (out) |cf| {
+        try testing.expect(try blob.blobStore().exists(&cf.source_hex));
+        try testing.expect(try blob.blobStore().exists(&cf.bytecode_hex));
+    }
+    // Distinct sources → distinct source hashes (and distinct bytecode).
+    try testing.expect(!std.mem.eql(u8, &out[0].source_hex, &out[1].source_hex));
+    try testing.expect(!std.mem.eql(u8, &out[0].bytecode_hex, &out[1].bytecode_hex));
+}
+
+test "compileAndStage: idempotent — identical inputs yield identical hashes" {
+    const a = testing.allocator;
+    var blob = MemBlobStore.init(a);
+    defer blob.deinit();
+    const inputs = [_]DeployInput{.{ .path = "index.mjs", .kind = .handler, .bytes = "x" }};
+
+    const o1 = try compileAndStage(a, blob.blobStore(), passthroughCompile, null, &inputs);
+    defer a.free(o1);
+    const o2 = try compileAndStage(a, blob.blobStore(), passthroughCompile, null, &inputs);
+    defer a.free(o2);
+    try testing.expectEqualSlices(u8, &o1[0].source_hex, &o2[0].source_hex);
+    try testing.expectEqualSlices(u8, &o1[0].bytecode_hex, &o2[0].bytecode_hex);
+}
+
+test "compileAndStage: compile failure surfaces as CompileFailed" {
+    const a = testing.allocator;
+    var blob = MemBlobStore.init(a);
+    defer blob.deinit();
+    const inputs = [_]DeployInput{.{ .path = "bad.mjs", .kind = .handler, .bytes = "syntax(" }};
+    try testing.expectError(Error.CompileFailed, compileAndStage(a, blob.blobStore(), failingCompile, null, &inputs));
+}
+
+test "compileAndStage: rejects duplicate + traversal paths" {
+    const a = testing.allocator;
+    var blob = MemBlobStore.init(a);
+    defer blob.deinit();
+    const dup = [_]DeployInput{
+        .{ .path = "index.mjs", .kind = .handler, .bytes = "a" },
+        .{ .path = "index.mjs", .kind = .handler, .bytes = "b" },
+    };
+    try testing.expectError(Error.InvalidManifest, compileAndStage(a, blob.blobStore(), passthroughCompile, null, &dup));
+    const bad = [_]DeployInput{.{ .path = "../x.mjs", .kind = .handler, .bytes = "a" }};
+    try testing.expectError(Error.InvalidPath, compileAndStage(a, blob.blobStore(), passthroughCompile, null, &bad));
 }

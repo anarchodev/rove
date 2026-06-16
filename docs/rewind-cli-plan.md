@@ -237,6 +237,61 @@ only on the **private plane** (operator + first-party website via the internal
 front) or also **publicly** (external customer tooling) — the same trust call
 as the eventual customer CLI; private-plane-only is the safe launch default.
 
+### 4.1 Next evolution — deploy as composable admin-tenant JS (`platform.compile`)
+
+**Status: in progress (2026-06-15).** The Zig `/_system/deploy` route (above)
+is the bootstrap/transition substrate; the next step makes *customer* deploys a
+**rewind.js app on the `__admin__` tenant** composed from two privileged
+primitives, so the deploy logic is hackable JS on the same surface customers
+use (the dogfood/agent-surface direction). The admin tenant is already the
+platform trust-root (it holds `platform.root.*` + the cross-tenant
+`platform.scope(t).kv.*` grant), so this widens *what* it can do, not *who* can
+do damage.
+
+Two primitives:
+1. **`platform.compile(files[], {scope, name})`** — admin-only. Source →
+   bytecode is the one irreducibly-native bit (`JS_WriteObject`, not reachable
+   from sandboxed JS). **Async** (re-entry, not a Promise) because compile is
+   slow → off the hot path; **the result is safe to use on arrival + needs no
+   replay tape** because `(source) → bytecode` is deterministic + idempotent
+   (the same property that lets `blob.put` return a hash sync + defer the PUT —
+   determinism, not speed, is why). Returns `[{path, source_hex, bytecode_hex}]`.
+2. **cross-tenant `platform.scope(t).blob.*`** — the blob twin of the existing
+   cross-tenant kv grant, for staging statics + stamping the manifest into the
+   target tenant. (Compile itself stages the handler source+bytecode blobs into
+   `scope`'s `file-blobs` **natively on the background thread** — no JS
+   cross-tenant blob needed for that half.)
+
+**Implementation — ride the bound-fetch machinery (no parallel engine).**
+Verified against the held-chain trace: `platform.compile` lowers to a
+**connection-scoped `PendingFetch`** to a magic origin `rove-compile.internal`
+(sources+scope in the JSON body, `name` = the resume export) — exactly how
+`blob.put` rides a fetch to `rove-blob.internal`. The handler returns `next()`,
+so the finalize seam **binds it** (`registerBoundFetchTrampoline`, the existing
+path). `interpretCmd`'s `http_fetch` arm special-cases the compile origin
+(sibling to the `isReceiveUrl`/`armBlobReceive` blob check) → hands it to the
+`DeployThread`. On completion the `DeployThread` builds an
+`UpstreamFetchEvent{bind=true, fetch_id=<the PendingFetch id>, tenant_id=<chain
+tenant>, bytes=hashesJSON, final=true, terminal_status/ok, stream=false, name}`
+and calls `node.router.enqueueFetchEventForTenant` — the **existing** bound
+resume (`dispatchSpoolHead` → `resumeBoundFetchChain`) re-invokes the resume
+export on the **held connection** and answers with the dep_id. So bind +
+resume + held-respond are all reused; only the *backend* (compiler vs libcurl)
+and the *completion source* differ.
+
+Load-bearing distinction: **chain tenant ≠ scope tenant.** Blobs stage into
+`scope` (the target); the held connection + resume live on the issuing
+`__admin__` chain — the `DeployThread` job carries both, plus the `fetch_id` and
+resume `name`, and routes the completion event to the *chain* tenant.
+
+Build order: (a) `rove-files.compileAndStage` ✓, (b) `DeployThread`
+batch-compile mode ✓, (c) the `platform.compile` binding + `rove-compile.internal`
+lowering + `interpretCmd` special-case, (d) `DeployThread`→router completion
+emit, (e) move customer deploy into the `__admin__` app + the cross-tenant blob
+primitive, (f) narrow the Zig `/_system/deploy` route to system-tenant
+bootstrap only. (a)+(b) are landed + unit-tested; (c)/(d) are the held-chain
+integration.
+
 ## 5. `/ops/assign-domain` — resolved (and why `host add` is two writes)
 
 `POST {worker}/ops/assign-domain` (`publish_tenant.py:292`) is **live, not
