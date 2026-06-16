@@ -138,6 +138,12 @@ pub fn tryHandleV2(
         try handleConfChange(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-confstate")) {
         try handleConfState(server, allocator, worker, ent, sid, sess, method, path);
+    } else if (std.mem.eql(u8, sys_rest, "v2-applied-baseline")) {
+        try handleAppliedBaseline(server, allocator, worker, ent, sid, sess, method, path);
+    } else if (std.mem.eql(u8, sys_rest, "v2-load-replace")) {
+        try handleLoadReplace(server, allocator, worker, ent, sid, sess, method, rh, body);
+    } else if (std.mem.eql(u8, sys_rest, "v2-apply-snapshot")) {
+        try handleApplySnapshot(server, allocator, worker, ent, sid, sess, method, body);
     } else {
         try respb.setSystemResponse(server, ent, sid, sess, 404, "unknown v2 move endpoint\n", allocator, null, null);
     }
@@ -896,6 +902,124 @@ fn handleConfState(
     w.writeAll("]}\n") catch {};
     const out = buf.toOwnedSlice(allocator) catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
+}
+
+// ── promote-back: out-of-band rejoin of a below-floor learner (Ph2) ──
+//
+// A node auto-demoted to a learner that then fell below the WAL-compaction
+// floor can't catch up by replication (the leader compacted past it) and rove
+// has no in-protocol snapshot transport. It rejoins out-of-band:
+//   1. GET  v2-applied-baseline (on the leader)  → {index X, term T}
+//   2. GET  v2-snapshot         (on the leader)  → a store bundle (⊇ X)
+//   3. POST v2-load-replace     (on the learner) → overwrite-load the bundle
+//   4. POST v2-apply-snapshot   (on the learner, {index:X, term:T}) → install a
+//      DATA-FREE raft baseline at X, so the leader can replicate the tail (> X)
+//   5. POST v2-confchange {op:promote} (on the leader) → back to a voter
+// The orchestrator (CP / smoke) sequences these; each endpoint is a passive
+// primitive, like the tenant-move surface.
+
+/// `GET /_system/v2-applied-baseline?tenant=` → `{"index":X,"term":T}` where X
+/// is the leader's durabilized applied index (the safe lower bound for an
+/// out-of-band bundle — the bundle reflects at least this much) and T is the
+/// term of the log entry at X (so the learner's baseline matches the leader's
+/// log). Leader-gated (only the leader tracks term-by-index meaningfully).
+fn handleAppliedBaseline(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    path: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "GET"))
+        return reply(server, allocator, ent, sid, sess, 405, "GET only\n");
+    const tenant = queryParam(path, "tenant") orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing ?tenant\n");
+    const gid = worker.raft.gidForTenant(tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
+    if (!worker.raft.isLeaderOf(gid))
+        return reply(server, allocator, ent, sid, sess, 421, "not the leader for this tenant; try another node\n");
+    const inst = (worker.node.tenant.getInstance(tenant) catch null) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "unknown tenant\n");
+    const index = inst.kv.lastAppliedRaftIdx() catch
+        return reply(server, allocator, ent, sid, sess, 500, "applied-index read failed\n");
+    const term = worker.raft.logTerm(gid, index);
+    const out = std.fmt.allocPrint(allocator, "{{\"index\":{d},\"term\":{d}}}\n", .{ index, term }) catch
+        return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
+}
+
+/// `POST /_system/v2-load-replace` (bundle bytes + `X-Rewind-Tenant`) — OVERWRITE
+/// -load a bundle into an existing (stale) store: the bundle's value wins for
+/// every key it carries. The promote-back store reset for a returning learner,
+/// whose data is older than the source's. (Unlike `v2-load-merge`'s insert-if
+/// -absent, used by the zero-downtime move.) NOTE: this overwrites + adds but
+/// does not yet DROP keys deleted on the source after the learner died — a
+/// SET-mostly workload is exact; a delete-heavy one needs a clear-first (TODO).
+fn handleLoadReplace(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    rh: h2.ReqHeaders,
+    body: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+    const tenant = respb.findHeader(rh, TENANT_HEADER) orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Tenant\n");
+    const inst = ensureInstance(worker, tenant) catch
+        return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
+    inst.kv.loadTenantBundle(body) catch
+        return reply(server, allocator, ent, sid, sess, 400, "replace load failed\n");
+    inst.kv.delete(FORWARD_MARKER) catch |err| switch (err) {
+        error.NotFound => {},
+        else => std.log.warn("v2-load-replace: clearing inherited {s} failed: {s}", .{ FORWARD_MARKER, @errorName(err) }),
+    };
+    try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
+}
+
+/// `POST /_system/v2-apply-snapshot {tenant, index, term}` — install a data-free
+/// raft baseline at {index, term} into this node's LOCAL group (promote-back
+/// step 4). Must be a learner/follower (a leader can't restore to itself). The
+/// KV state for `index` must already be loaded (v2-load-replace). After this the
+/// leader replicates the tail (> index) from its log; promote to a voter once
+/// caught up.
+fn handleApplySnapshot(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    body: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+    var parsed = std.json.parseFromSlice(
+        struct { tenant: []const u8, index: u64, term: u64 },
+        allocator,
+        body,
+        .{ .ignore_unknown_fields = true },
+    ) catch return reply(server, allocator, ent, sid, sess, 400, "expected {tenant, index, term}\n");
+    defer parsed.deinit();
+    const v = parsed.value;
+    const gid = worker.raft.gidForTenant(v.tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
+    if (worker.raft.isLeaderOf(gid))
+        return reply(server, allocator, ent, sid, sess, 409, "this node leads the group; a leader can't restore a snapshot to itself\n");
+    worker.raft.applyLocalSnapshot(gid, v.index, v.term) catch |e| switch (e) {
+        error.SnapshotStale => return reply(server, allocator, ent, sid, sess, 409, "index not ahead of committed; nothing to install\n"),
+        error.NotLeader => return reply(server, allocator, ent, sid, sess, 409, "node leads the group\n"),
+        else => return reply(server, allocator, ent, sid, sess, 500, "apply-snapshot failed\n"),
+    };
+    return reply(server, allocator, ent, sid, sess, 204, "");
 }
 
 /// Stamp a plain status + message response (no CORS — internal surface).
