@@ -29,8 +29,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_lib_v2 import V2Cluster, _curl  # noqa: E402
 
-APP_SRC = (Path(__file__).resolve().parent / "admin_deploy_app.mjs").read_text()
-
 TARGET = "target"
 TARGET_HANDLER = "export default function(){ return 'served-by-standing-app\\n'; }\n"
 TARGET_STATIC = "static-by-standing-app\n"
@@ -61,21 +59,18 @@ def main() -> int:
             failures.append(label)
 
     with V2Cluster.spawn("admindeploy", nodes=1) as c:
-        print("step 1: provision __admin__ + target; bootstrap the deploy app onto __admin__ (Zig route)")
+        print("step 1: provision __admin__ + target — genesis auto-deploys the baked deploy app")
         r = c.provision("__admin__")
         check("provision __admin__ → 204/409", r.status in (204, 409), f"got {r.status} {r.body!r}")
         r = c.provision(TARGET)
         check("provision target → 204", r.status == 204, f"got {r.status} {r.body!r}")
-        try:
-            c.deploy_handlers("__admin__", {"index.mjs": APP_SRC})
-            check("bootstrap deploy app onto __admin__", True)
-        except RuntimeError as e:
-            check("bootstrap deploy app", False, str(e))
-            print("\nFAILURES:", failures)
-            return 1
-        # The app answers on "/" — confirm it's live (a GET → 405 POST-only).
+        # NO explicit bootstrap: when this node leads __admin__'s group, genesis
+        # deploys the BAKED deploy app (rewind-cli-plan §4.1 (f)). The app
+        # answers on "/" — a GET → 405 POST-only confirms it's live.
         r = c.wait_for_handler("__admin__", "/", want_status=405, timeout_s=30.0)
-        check("deploy app live (GET / → 405 POST-only)", r.status == 405, f"got {r.status} {r.body!r}")
+        check("genesis deploy app live (GET / → 405 POST-only)", r.status == 405, f"got {r.status} {r.body!r}")
+        if r.status != 405:
+            c.dump_node_log(grep=["genesis", "deploy", "admin", "promot", "loader", "error", "warn"])
 
         print("step 2: POST a bundle for `target` to the standing app")
         r = post_bundle(c, token=c.root_token, tenant=TARGET,
