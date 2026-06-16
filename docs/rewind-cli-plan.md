@@ -74,38 +74,70 @@ tunneled over SSH because the targets are private-plane only).
   whether it lands together with a *consolidated admin API* (§4). The
   recommendation below is to ship thin first, then consolidate.
 
-## 2. Proposed command surface
+## 2. Command surface — two binaries, split by credential
 
-One binary, `rewind` (operator-facing; distinct from the `rewind` worker —
-see §6 naming note). Subcommands map to the *actual operations*, not to
-one flagged megacall:
+**Two binaries, not one** (decided 2026-06-16), split by *who holds the
+credential* — which keeps the platform-dangerous verbs out of anything a
+customer could ever run:
+
+- **`rewind`** (customer + operator-scoped) — **tenant verbs, OIDC-primary,
+  root-capable.** Operates on tenants you're authorized for; the server scopes
+  by your credential (OIDC = your tenants; root = any). This is the binary
+  shipped to customers; the name was reserved for it (§6). **Not yet built** —
+  OIDC doesn't exist until the `__auth__` IdP is deployed (auth chicken-and-egg,
+  §7 / Step 3), so today every real operation is root and lives in `rewind-ops`.
+- **`rewind-ops`** (operator-only) — **platform verbs, root + move-secret +
+  ops-secret.** Never shipped to customers. **Built** (`zig build rewind-ops`,
+  `src/cli/ops.zig` over the shared `src/cli/common.zig`).
+
+A few verbs (`deploy`/`release`/`rollback`/`status`) are duplicated across the
+two: same operation, different authority/scope — `rewind deploy myapp` (OIDC,
+your tenant) vs `rewind-ops deploy marketing` (root, first-party). The logic is
+written once in `common.zig`; each binary wires its own auth. (Detail: §6.)
+
+### `rewind-ops` verbs — audited against the live server primitives
+
+The set below comes from auditing what the CP / worker / `__admin__` app
+actually expose, **not** from porting `publish_tenant.py`. Built + green
+(`scripts/rewind_cli_smoke_v2.py`):
 
 ```
-rewind provision <tenant> [--cluster prod] [--host H ...]
-rewind publish   <tenant> <bundle> [--release] [--verify-host H]
-rewind release   <tenant> <dep_id>
-rewind rollback  <tenant>                 # release the parent of current
-rewind host add  <host> <tenant>
-rewind host rm   <host>
-rewind status    <tenant>                 # placement, current dep_id, host maps
-rewind deployments <tenant>               # list deployment ids + parents
+rewind-ops bootstrap                              # provision __admin__ (CP) + reset
+rewind-ops reset                                  # (re)deploy the baked __admin__ app
+rewind-ops deploy <tenant> <bundle> [--release]   # classify + POST to the app
+rewind-ops release <tenant> <dep_id_hex>          # flip _deploy/current (leader-retry)
+rewind-ops provision <tenant> [--cluster C] [--host H]   # CP /_control/provision
+rewind-ops move <tenant> <cluster> [--live] --yes        # CP /_control/move[-live]
+rewind-ops host add <host> <tenant>               # CP host index + worker /ops alias
+rewind-ops plan set <tenant> <plan>               # CP /_control/plan
+rewind-ops status <host>                          # CP /_cp/route + /_cp/plan
 ```
 
 Design notes:
 
-- **`publish` defaults to NOT releasing.** It compiles, uploads, stamps a
-  manifest, and prints the `dep_id` — then stops. `--release` (or a
-  separate `rewind release`) flips it live. This makes the
-  approval-gated-deploy stance (`_deploy/current` stays human-gated) the
-  default behavior, not an honor system. Today's script always releases.
-- **`provision` and `publish` are separate verbs**, not a `--provision`
-  flag on publish. First-time bring-up is
-  `rewind provision X && rewind publish X ./bundle --release`.
-- **`rollback` becomes a first-class verb.** The deployment manifest
-  already carries `parent_id`; releasing the parent is a rollback. Today
-  there is no rollback path at all.
-- **`status` / `deployments` are new** read surfaces — there is no way to
-  ask "what's live for this tenant?" today without reading raft/S3 by hand.
+- **`deploy` defaults to NOT releasing** — it stages + prints the `dep_id`;
+  `--release` (or `rewind-ops release`) flips it. Keeps the approval-gated
+  stance the default, not an honor system. (`publish_tenant` always released.)
+- **`move` requires `--yes`** — it repoints live routing, the riskiest verb.
+- **`host add` is two writes** (§5): the CP directory index (front routing) +
+  the worker domain alias (`/ops/assign-domain`, gated by a *third* secret,
+  `ADMIN_OPS_SECRET`). One verb, two endpoints.
+- **Three secrets gate the operator surface today** — root (workers + deploy
+  app), `REWIND_MOVE_SECRET` (CP `/_control/*`), `ADMIN_OPS_SECRET` (worker
+  alias). Step 3 (OIDC + scoped caps, §7) is what consolidates them.
+
+### Gaps the audit surfaced (not yet buildable)
+
+- **`status` is host-keyed**, because the CP route read (`/_cp/route?host=…`)
+  is host-keyed. A tenant-keyed `status <tenant>` needs a one-line CP read
+  (`/_cp/route?tenant=T` → `directory.resolve(tenant)`).
+- **`deployments` / `rollback` are blocked.** The current `dep_id` + release
+  history live in the tenant's `app.db` (`_deploy/current`, `_release/{ts}`)
+  with **no read endpoint**. Add a `GET /history/{tenant}` to the deploy app
+  (composable — reads via `platform.scope(t).kv`) rather than the engine.
+- **`host rm` has no primitive** — the CP only `setHost`; a delete is needed.
+- **`cert set` / `config set` (admin-kv)** exist as server primitives
+  (`/_control/cert`, `/_system/admin-kv`) but are deferred (niche).
 
 ## 3. Phase A — thin CLI (no server changes)
 

@@ -1106,21 +1106,22 @@ pub fn build(b: *std.Build) void {
     const cp_step = b.step("rewind-cp", "Build the V2 control-plane binary");
     cp_step.dependOn(&b.addInstallArtifact(cp_exe, .{}).step);
 
-    // ── rewind: the operator CLI (docs/rewind-cli-plan.md §2–§3, §6). A thin,
-    // typed, std-only client — operator env reader + curl/ssh transport +
-    // bundle classifier — for reset / bootstrap / deploy / release. No rove
-    // modules, no system libs, no raft/cargo linkage (so it builds standalone).
-    const cli_mod = b.createModule(.{
-        .root_source_file = b.path("src/cli/main.zig"),
+    // ── rewind-ops: the platform/operator CLI (docs/rewind-cli-plan.md §2–§3,
+    // §6). The privileged half of the split (root + move-secret + ops-secret);
+    // the OIDC-scoped customer `rewind` binary lands later, sharing
+    // src/cli/common.zig. std-only — operator env reader + curl/ssh transport +
+    // bundle classifier — no rove modules, no system libs, no raft/cargo linkage.
+    const ops_mod = b.createModule(.{
+        .root_source_file = b.path("src/cli/ops.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const cli_exe = b.addExecutable(.{ .name = "rewind", .root_module = cli_mod });
-    const cli_step = b.step("rewind", "Build the rewind operator CLI");
-    cli_step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);
+    const ops_exe = b.addExecutable(.{ .name = "rewind-ops", .root_module = ops_mod });
+    const ops_step = b.step("rewind-ops", "Build the rewind-ops operator CLI");
+    ops_step.dependOn(&b.addInstallArtifact(ops_exe, .{}).step);
 
-    const cli_tests = b.addTest(.{ .root_module = cli_mod });
-    const cli_test_step = b.step("rewind-cli-test", "Run the rewind CLI unit tests");
-    cli_test_step.dependOn(&b.addRunArtifact(cli_tests).step);
-    test_step.dependOn(&b.addRunArtifact(cli_tests).step);
+    const ops_tests = b.addTest(.{ .root_module = ops_mod });
+    const ops_test_step = b.step("rewind-ops-test", "Run the rewind-ops CLI unit tests");
+    ops_test_step.dependOn(&b.addRunArtifact(ops_tests).step);
+    test_step.dependOn(&b.addRunArtifact(ops_tests).step);
 }

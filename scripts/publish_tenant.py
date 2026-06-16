@@ -3,10 +3,12 @@
 
 DEPRECATED / BROKEN (2026-06-16): the `/_system/deploy` route this posts to was
 removed when deploy moved into the standing __admin__ app (rewind-cli-plan §4.2).
-Use the `rewind` operator CLI instead: `zig build rewind` then
-`rewind deploy <tenant> <bundle> --release` (provision/host mapping are not yet
-ported to the CLI — see plan §2). Kept here only for its --provision/--host
-reference until those verbs land in `rewind`.
+Use the `rewind-ops` operator CLI instead: `zig build rewind-ops` then
+`rewind-ops bootstrap` / `provision <tenant> --host H` / `deploy <tenant> <bundle>
+--release` / `move` / `plan set` / `status` — it covers every operation this
+script welded together (host add lands once the full admin app exposes
+/ops/assign-domain on the bootstrapped path). This file is retained only for
+historical reference.
 
 The codified form of the proven publish path (deploy-plan §8 item 4). The
 build/stage step now lives IN the worker (files-server dissolved,
