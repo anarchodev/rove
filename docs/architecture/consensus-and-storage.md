@@ -252,19 +252,38 @@ Three mechanisms keep the WAL bounded and a restart correct:
   producers pre-ack — the bridge keeps an acked high-water so a
   fire-and-forget propose can't pin the floor). A slot whose fold could not
   reach `applied_idx` **stays dirty** and is finished by a later tick.
-- **Compaction (single-node).** After durabilizing, a single-node node truncates
-  the shared WAL up to the durabilized index (`compact_wal = true`, on). Safe
-  because the data up to that point was folded into LMDB and the watermark
-  stamped *before* the truncate. The tick flushes the WAL once before its
-  first truncate: under the async-append flow the durable `HardState.commit`
-  lags the live commit by one fsync, and truncating past a non-durable commit
-  would panic `RawNode::new` at recovery. Multi-node nodes durabilize
-  (bounding replay) but do **not** truncate: truncating safely needs a
-  follower-match-index floor, and a lagging follower would then need a
-  data-carrying snapshot, which is not wired. **This is the one known
-  limitation in the storage layer** — it bounds nothing worse than WAL growth
-  on a long-lived multi-node group; correctness holds. (Physical segment-file
-  GC — reclaiming fully-compacted segments — is likewise still open.)
+- **Compaction (single- and multi-node).** After durabilizing, a node truncates
+  the shared WAL (`compact_wal = true`, on). Safe because the data up to the
+  truncate point was folded into LMDB and the watermark stamped *before* the
+  truncate; the tick flushes the WAL once before its first truncate (the
+  async-append durable `HardState.commit` lags the live commit by one fsync, and
+  truncating past a non-durable commit would panic `RawNode::new` at recovery).
+  Single-node truncates to the durabilized index. **Multi-node** floors the
+  truncate point at the cluster-wide **min match index** (`raft_manager_min_match_index`)
+  — the leader keeps every entry a lagging voter still needs, so a slightly-behind
+  follower catches up from the log — capped by `wal_retention_max`
+  (`REWIND_WAL_RETENTION_MAX`, default `DEFAULT_WAL_RETENTION`): a voter further
+  behind than the cap is compacted past and caught up by a **data-carrying
+  snapshot** instead, bounding WAL growth during a follower outage. Multi-node
+  compaction is gated on snapshots being enabled (`snap_stager`), so the catch-up
+  net always exists. Physical segment-file GC reclaims fully-compacted segments
+  via `noteCompaction`.
+- **Snapshots (multi-node catch-up + the conf_change prerequisite).** When a
+  follower's `next_index` falls below the leader's `first_index`, raft-rs calls
+  the storage `snapshot` provider; rove dumps the tenant store read-only at
+  `durabilized_idx` (fast, pump-safe) and stages the bundle in S3
+  (`…/raft-snap/{idx}`) on an **off-pump** thread (`consensus/snapshot.zig`),
+  reporting `SnapshotTemporarilyUnavailable` until the upload lands (raft-rs
+  retries). The `MsgSnapshot` carries only a tiny descriptor — the bytes never
+  ride raft. On the follower, the pump's snapshot gate (`drivePendingSnapshot`,
+  via `raft_manager_pending_snapshot` — peeks the pending snapshot *without*
+  consuming a ready) fetches the bundle off-pump to a local staging file and
+  **defers** applying until it lands; then `process_ready` applies it
+  synchronously (`loadSnapshotBundle` → store + watermark advance together to the
+  snapshot index). A snapshot is installed durably before raft's `applied`
+  advances (the fork marks the ready persisted via `on_persist_ready` so
+  `advance_apply` doesn't outrun `persisted`). Validated by
+  `snapshot_catchup_smoke_v2` (forces the path with a tiny retention cap).
 - **Crash recovery.** At boot the Node opens the WAL with `SharedWal.open` (not
   `init`): it CRC-scans the segments, physically truncates only a *torn tail*,
   and buckets recovered records by `group_id`. `Bridge.recoverGroups` reads the
