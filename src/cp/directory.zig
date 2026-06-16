@@ -297,6 +297,25 @@ pub const Directory = struct {
         return out.toOwnedSlice(a) catch return Error.OutOfMemory;
     }
 
+    /// All placed tenant ids (owned dups; caller frees each + the slice). The
+    /// membership reconciler iterates these as DESIRED state, resolving each to
+    /// its cluster + skipping `moving` ones. Mirrors `collectMoving` without the
+    /// state filter.
+    pub fn listPlacements(self: *Directory, a: std.mem.Allocator) Error![][]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var out: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (out.items) |t| a.free(t);
+            out.deinit(a);
+        }
+        var it = self.placements.keyIterator();
+        while (it.next()) |k| {
+            out.append(a, a.dupe(u8, k.*) catch return Error.OutOfMemory) catch return Error.OutOfMemory;
+        }
+        return out.toOwnedSlice(a) catch return Error.OutOfMemory;
+    }
+
     /// Whether THIS CP node leads the directory raft group — i.e. directory
     /// WRITES (the move flip) can commit here. Reads work on any node (the
     /// apply-driven projection), but a write proposed on a follower faults,
