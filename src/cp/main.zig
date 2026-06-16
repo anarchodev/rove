@@ -1386,6 +1386,19 @@ pub fn main() !void {
         std.log.info("rewind-cp: multi-node CP id={d} voters={d} listen={s}", .{ mn.node_id, mn.voters.len, mn.listen_str });
         break :blk try Bridge.initMultiNode(allocator, cp_data_dir, mn.node_id, mn.voters, mn.listen_addr, mn.peers);
     } else try Bridge.initSingleNode(allocator, cp_data_dir);
+    // Raft logical-tick cadence (ms). Keep the CP directory group's election
+    // timing in lockstep with the workers' tenant groups — same hardware, same
+    // number — so election timeout ≈ election_tick × this is uniform across the
+    // node (docs/raft-best-practices.md "how to size election/heartbeat"). The
+    // default preserves the historical ~1ms cadence. Set BEFORE startPump.
+    if (std.posix.getenv("REWIND_RAFT_TICK_MS")) |v| {
+        if (std.fmt.parseInt(i64, v, 10)) |ms| {
+            if (ms > 0) {
+                cp_bridge.node.tick_interval_ns = ms * std.time.ns_per_ms;
+                std.log.info("rewind-cp: raft tick interval = {d}ms (election timeout ≈ election_tick × {d}ms)", .{ ms, ms });
+            }
+        } else |_| {}
+    }
     const directory = try Directory.initReplicated(allocator, cp_bridge);
     // Teardown order matters: the pump fires the directory's apply observer,
     // so the pump must STOP (`cp_bridge.deinit` → `stopPump`) before the
