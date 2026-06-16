@@ -472,7 +472,8 @@ const Router = struct {
         const is_plan = std.mem.eql(u8, path, "/_control/plan");
         const is_host = std.mem.eql(u8, path, "/_control/host");
         const is_cert = std.mem.eql(u8, path, "/_control/cert");
-        if (!(is_move or is_move_live or is_provision or is_plan or is_host or is_cert) or !std.mem.eql(u8, method_s, "POST")) {
+        const is_cluster = std.mem.eql(u8, path, "/_control/cluster");
+        if (!(is_move or is_move_live or is_provision or is_plan or is_host or is_cert or is_cluster) or !std.mem.eql(u8, method_s, "POST")) {
             try replyStatus(server, ent, sid, sess, 404);
             return;
         }
@@ -503,12 +504,43 @@ const Router = struct {
             try self.handleHost(server, ent, sid, sess, body)
         else if (is_cert)
             try self.handleCert(server, ent, sid, sess, body)
+        else if (is_cluster)
+            try self.handleCluster(server, ent, sid, sess, body)
         else if (is_provision)
             try self.handleProvision(server, ent, sid, sess, body)
         else if (is_move_live)
             try self.handleMoveLive(server, ent, sid, sess, body)
         else
             try self.handleMove(server, ent, sid, sess, body);
+    }
+
+    /// `POST /_control/cluster {id, nodes:[url,…]}` — define/update a cluster's
+    /// node set (the runtime "grow" primitive: add a node to a cluster so the
+    /// membership reconciler backfills the placed tenants onto it). A directory
+    /// WRITE: leader-gated (a follower already forwarded above), replicated via
+    /// `addCluster`. Idempotent — re-defining with the same nodes is a no-op
+    /// apply. NOTE: node identity is currently positional (`nodes[i]` ↔ raft id
+    /// i+1), matching `REWIND_VOTERS`; the explicit-id model is the SSOT cleanup.
+    fn handleCluster(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
+        const a = self.allocator;
+        var parsed = std.json.parseFromSlice(struct {
+            id: []const u8,
+            nodes: []const []const u8,
+        }, a, body, .{ .ignore_unknown_fields = true }) catch {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        };
+        defer parsed.deinit();
+        if (parsed.value.id.len == 0 or parsed.value.nodes.len == 0) {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        }
+        self.directory.addCluster(parsed.value.id, parsed.value.nodes) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        std.log.info("rewind-cp: cluster {s} set to {d} node(s)", .{ parsed.value.id, parsed.value.nodes.len });
+        try replyStatus(server, ent, sid, sess, 204);
     }
 
     /// `POST /_control/provision {tenant, cluster, host?}` — stand up a
