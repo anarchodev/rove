@@ -865,6 +865,17 @@ pub const KvStore = struct {
         return self.loadBundleImpl(bundle, .{ .skip_existing = true });
     }
 
+    /// True REPLACE load (raft conf-change promote-back): every existing pair
+    /// is deleted before the bundle's pairs are written — one atomic kvexp Txn
+    /// — so the store ends EXACTLY equal to the bundle. Re-seats a STALE store
+    /// from an authoritative snapshot: a key the source deleted after this node
+    /// last saw it is removed, not left behind as a phantom (which would make a
+    /// promoted-back voter diverge from the cluster). Unlike `loadTenantBundle`
+    /// (overwrite + add only) and `loadTenantBundleMerge` (insert-if-absent).
+    pub fn loadTenantBundleReplace(self: *KvStore, bundle: []const u8) Error!void {
+        return self.loadBundleImpl(bundle, .{ .clear_existing = true });
+    }
+
     fn loadBundleImpl(self: *KvStore, bundle: []const u8, opts: kvexp.LoadBundleOptions) Error!void {
         var stream = std.io.fixedBufferStream(bundle);
         _ = kvexp.loadTenantBundle(self.manifest, stream.reader(), opts) catch return Error.Sqlite;

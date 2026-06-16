@@ -951,13 +951,14 @@ fn handleAppliedBaseline(
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
 }
 
-/// `POST /_system/v2-load-replace` (bundle bytes + `X-Rewind-Tenant`) — OVERWRITE
-/// -load a bundle into an existing (stale) store: the bundle's value wins for
-/// every key it carries. The promote-back store reset for a returning learner,
-/// whose data is older than the source's. (Unlike `v2-load-merge`'s insert-if
-/// -absent, used by the zero-downtime move.) NOTE: this overwrites + adds but
-/// does not yet DROP keys deleted on the source after the learner died — a
-/// SET-mostly workload is exact; a delete-heavy one needs a clear-first (TODO).
+/// `POST /_system/v2-load-replace` (bundle bytes + `X-Rewind-Tenant`) — true
+/// REPLACE-load a bundle into an existing (stale) store: every existing pair is
+/// deleted, then the bundle's pairs are written, in one atomic kvexp Txn, so the
+/// store ends EXACTLY equal to the bundle. The promote-back store reset for a
+/// returning learner whose data is older than the source's — a key the source
+/// deleted while the learner was gone is removed, not left as a phantom (which
+/// would make the promoted-back voter diverge from the cluster). Unlike
+/// `v2-load-merge`'s insert-if-absent (zero-downtime move).
 fn handleLoadReplace(
     server: anytype,
     allocator: std.mem.Allocator,
@@ -975,7 +976,7 @@ fn handleLoadReplace(
         return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Tenant\n");
     const inst = ensureInstance(worker, tenant) catch
         return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
-    inst.kv.loadTenantBundle(body) catch
+    inst.kv.loadTenantBundleReplace(body) catch
         return reply(server, allocator, ent, sid, sess, 400, "replace load failed\n");
     inst.kv.delete(FORWARD_MARKER) catch |err| switch (err) {
         error.NotFound => {},
