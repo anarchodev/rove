@@ -588,6 +588,18 @@ pub fn main() !void {
     // touching the worker handle's txn state. Set BEFORE startPump so the
     // first replicated entry already routes here.
     bridge.setStoreResolver(.{ .ctx = &pump_stores, .func = PumpStores.resolve });
+    // Auto-demote policy (conf_change Phase 2): a far-behind, presumed-dead
+    // voter is demoted to a learner so it stops pinning the WAL-compaction
+    // floor. Defaults are baked into Node; env overrides tune the lag threshold
+    // (entries; 0 disables) and the evaluation cadence (ms). Set before
+    // startPump (the pump owns the Node thereafter).
+    if (std.posix.getenv("REWIND_AUTO_DEMOTE_LAG")) |v| {
+        bridge.node.auto_demote_lag = std.fmt.parseInt(u64, v, 10) catch bridge.node.auto_demote_lag;
+        std.log.info("rewind: auto-demote lag threshold = {d} entries{s}", .{ bridge.node.auto_demote_lag, if (bridge.node.auto_demote_lag == 0) " (disabled)" else "" });
+    }
+    if (std.posix.getenv("REWIND_AUTO_DEMOTE_MS")) |v| {
+        if (std.fmt.parseInt(i64, v, 10)) |ms| bridge.node.auto_demote_interval_ns = ms * std.time.ns_per_ms else |_| {}
+    }
     // Boot-time group recovery: re-stand-up the tenant raft groups this node
     // persisted (its node-local manifest) so a restarted node rejoins its
     // groups and catches up to the live state — the leader replicates the
