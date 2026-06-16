@@ -32,6 +32,13 @@
       endpoint: '/agent',
       goal: 'Type test@example.com into the email field, then click Continue.',
       // confirm: async (action) => window.confirm(action.prompt),
+
+      // Opt into the pixel-screenshot tier. The brain can now request a
+      // screenshot; the FIRST one triggers a one-time screen-share consent
+      // prompt (and the browser's own "sharing" indicator). The handler
+      // also gates the tool on the `_config/screenshots` flag, so set that
+      // (kv `_config/screenshots` = "1") to actually offer it to the model.
+      screenshots: true,
     });
   </script>
 </body>

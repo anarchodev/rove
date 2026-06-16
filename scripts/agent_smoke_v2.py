@@ -19,9 +19,11 @@ Asserts:
   1. WS upgrade through the front (tenant Host → /agent)
   2. the agent issues `type test@example.com` on the email ref
   3. then `click` on the Continue ref
-  4. then finishes (a `done` frame)
-  5. the page state reflects the typed value (loop actually round-tripped)
-  6. kv holds the goal + a non-empty transcript (durable step-log checkpointed)
+  4. then requests a `screenshot`, and the page's pixels reach the model as an
+     image block AND get stored content-addressed via blob.put (Phase 4)
+  5. then finishes (a `done` frame)
+  6. the page state reflects the typed value (loop actually round-tripped)
+  7. kv holds the goal + a non-empty transcript (durable step-log checkpointed)
 
 Needs S3 env (V2 blob backend is S3-only): `set -a; . ./.env; set +a` first.
 Binaries: `zig build rewind rewind-cp rewind-front files-server-v2`.
@@ -60,18 +62,30 @@ ACCEPT_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
 # ── stub LLM: scripted Claude /v1/messages responses ──────────────────
-# One tool_use per turn (type → click), then a text-only turn = done.
+# One tool_use per turn (type → click → screenshot), then a text-only
+# turn = done. The screenshot turn proves the brain can TRIGGER a capture
+# and that the pixels round-trip back into the next turn as an image.
 STUB_RESPONSES = [
     {"role": "assistant", "content": [
         {"type": "tool_use", "id": "t1", "name": "type",
          "input": {"ref": "1", "text": "test@example.com"}}]},
     {"role": "assistant", "content": [
         {"type": "tool_use", "id": "t2", "name": "click", "input": {"ref": "2"}}]},
+    {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "t3", "name": "screenshot", "input": {}}]},
     {"role": "assistant", "content": [{"type": "text", "text": "Done."}]},
 ]
 
+# A known fake image the page emulator "captures". Content is opaque to the
+# handler (it just stores the bytes + forwards the base64), so any bytes do;
+# we only need the hash to be predictable to assert blob.put stored it.
+SHOT_BYTES = b"\xff\xd8\xff\xe0\x00\x10JFIF rove-fake-screenshot \xff\xd9"
+SHOT_B64 = base64.b64encode(SHOT_BYTES).decode()
+SHOT_HASH = hashlib.sha256(SHOT_BYTES).hexdigest()
+
 
 STUB_HITS = [0]
+STUB_BODIES: list = []  # every request body the handler sent the model
 
 
 class StubLLM(BaseHTTPRequestHandler):
@@ -79,8 +93,11 @@ class StubLLM(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("content-length", 0) or 0)
-        if length:
-            self.rfile.read(length)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            STUB_BODIES.append(json.loads(raw))
+        except Exception:
+            STUB_BODIES.append(None)
         STUB_HITS[0] += 1
         sys.stderr.write(f"[stub] hit #{STUB_HITS[0]} {self.path}\n")
         i = min(self._n[0], len(STUB_RESPONSES) - 1)
@@ -168,6 +185,26 @@ def ws_connect(port: int, host_header: str, path: str) -> socket.socket:
     return sock
 
 
+# Does an LLM request body carry an image content block (the screenshot
+# the brain saw)? It rides nested inside a tool_result block's content.
+def _has_image(body) -> bool:
+    for m in (body or {}).get("messages", []):
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for blk in content:
+            if not isinstance(blk, dict):
+                continue
+            if blk.get("type") == "image":
+                return True
+            inner = blk.get("content")
+            if isinstance(inner, list):
+                for ib in inner:
+                    if isinstance(ib, dict) and ib.get("type") == "image":
+                        return True
+    return False
+
+
 # ── the page emulator: drive the loop like rove-agent.js would ────────
 def drive(sock):
     elements = [
@@ -221,8 +258,17 @@ def drive(sock):
                 send_text(sock, {"t": "result", "sid": SID, "id": msg.get("id"), "ok": True})
                 snapshot()
             elif op_ == "snapshot":
-                snapshot()
+                # result BEFORE the snapshot: the snapshot must be the LAST
+                # frame so a handler that issues a bound fetch on it (e.g. the
+                # screenshot bounce) isn't disrupted by a trailing frame.
                 send_text(sock, {"t": "result", "sid": SID, "id": msg.get("id"), "ok": True})
+                snapshot()
+            elif op_ == "screenshot":
+                # Reply with a `screenshot` frame carrying the captured image
+                # — this IS the tool result, so no `result`/snapshot follows
+                # (mirrors rove-agent.js after getDisplayMedia).
+                send_text(sock, {"t": "screenshot", "sid": SID, "id": msg.get("id"),
+                                 "ok": True, "mime": "image/jpeg", "data": SHOT_B64})
             else:
                 send_text(sock, {"t": "result", "sid": SID, "id": msg.get("id"), "ok": True})
     return acts, done, elements
@@ -263,7 +309,8 @@ def main() -> int:
 
         print("step 2: point the handler's LLM at the stub (kv _config/*)")
         cfg = {"_config/llm_endpoint": f"http://127.0.0.1:{stub_port}/v1/messages",
-               "_config/anthropic_api_key": "test", "_config/llm_model": "stub"}
+               "_config/anthropic_api_key": "test", "_config/llm_model": "stub",
+               "_config/screenshots": "1"}  # offer the opt-in screenshot tool
         for k, v in cfg.items():
             r = c.admin_kv_put(TENANT, k, v)
             check(f"set {k}", r.status == 204, f"got {r.status} {r.body!r}")
@@ -301,6 +348,15 @@ def main() -> int:
         check("agent clicked Continue",
               bool(click_acts) and str(click_acts[0].get("ref")) == "2",
               f"acts={[a.get('op') for a in acts]}")
+
+        # ── Phase 4: brain-triggered screenshot ─────────────────────────
+        shot_acts = [a for a in acts if a.get("op") == "screenshot"]
+        check("agent requested a screenshot", bool(shot_acts),
+              f"acts={[a.get('op') for a in acts]}")
+        check("model received the screenshot as an image block",
+              any(_has_image(b) for b in STUB_BODIES),
+              "no image content block in any LLM request")
+
         check("agent finished (done frame)", done is not None, f"done={done!r}")
         check("page state reflects the typed value",
               any(e.get("ref") == "1" and e.get("value") == "test@example.com"
@@ -316,6 +372,14 @@ def main() -> int:
         m = c.admin_kv_get(TENANT, f"agent/{SID}/msgs")
         check("kv transcript checkpointed", m.status == 200 and "tool_use" in m.body,
               f"got {m.status} {m.body[:120]!r}")
+        # The screenshot bytes were stored content-addressed (blob.put) and a
+        # pointer written to the step-log under the known sha256 of SHOT_BYTES.
+        s = c.admin_kv_get(TENANT, f"agent/{SID}/shots/{SHOT_HASH}")
+        check("screenshot stored via blob.put (kv pointer)",
+              s.status == 200 and SHOT_HASH in s.body,
+              f"got {s.status} {s.body[:120]!r}")
+        if s.status != 200:
+            c.dump_node_log(grep=["blob", "shot", "WRITING", "ws ", "error", "warn"])
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
