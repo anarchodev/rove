@@ -261,6 +261,8 @@ pub const PlatformCaps = struct {
     /// `platform.scope(t).blob.put`: stage a content-addressed blob into
     /// the target tenant's file-blobs (deferred S3 PUT off the poll loop).
     /// The hash is computed + returned by the binding; this just lands it.
+    /// (`stampManifest` is NOT a cap — it's a bound submit door, like
+    /// `platform.compile`, so its completion can barrier on staging.)
     scope_blob_put: ?*const fn (
         ctx: *anyopaque,
         allocator: std.mem.Allocator,
@@ -268,15 +270,6 @@ pub const PlatformCaps = struct {
         hash: []const u8,
         bytes: []const u8,
     ) anyerror!void = null,
-    /// `platform.scope(t).deploy.stampManifest`: compute the dep_id + encode
-    /// the manifest from the app's entries (JSON), enqueue its deferred PUT
-    /// into the target tenant's deployments/. Returns the dep_id.
-    stamp_manifest: ?*const fn (
-        ctx: *anyopaque,
-        allocator: std.mem.Allocator,
-        target_id: []const u8,
-        entries_json: []const u8,
-    ) anyerror!u64 = null,
 };
 
 /// §2.6 durable-wake fan-out input: one due `_sched/by_time` entry the
@@ -1475,15 +1468,13 @@ fn jsPlatformScope(
     const blob_obj = c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, blob_obj, "_scope_id", c.JS_NewStringLen(ctx, id.ptr, id.len));
     _ = c.JS_SetPropertyStr(ctx, blob_obj, "put", c.JS_NewCFunction2(ctx, jsScopeBlobPut, "put", 2, c.JS_CFUNC_generic, 0));
-    // Cross-tenant deploy: stamp the manifest into the target's deployments/.
-    const deploy_obj = c.JS_NewObject(ctx);
-    _ = c.JS_SetPropertyStr(ctx, deploy_obj, "_scope_id", c.JS_NewStringLen(ctx, id.ptr, id.len));
-    _ = c.JS_SetPropertyStr(ctx, deploy_obj, "stampManifest", c.JS_NewCFunction2(ctx, jsScopeDeployStampManifest, "stampManifest", 1, c.JS_CFUNC_generic, 0));
 
     const scope_obj = c.JS_NewObject(ctx);
     _ = c.JS_SetPropertyStr(ctx, scope_obj, "kv", kv_obj);
     _ = c.JS_SetPropertyStr(ctx, scope_obj, "blob", blob_obj);
-    _ = c.JS_SetPropertyStr(ctx, scope_obj, "deploy", deploy_obj);
+    // `scope_obj.deploy.stampManifest` is added by the platform.js shim — it
+    // lowers to a bound on.fetch (the staging barrier), not a native sync
+    // call, so it can resume the held chain only once staging is durable.
     return scope_obj;
 }
 
@@ -1548,58 +1539,6 @@ fn jsScopeBlobPut(
         },
     };
     return c.JS_NewStringLen(ctx, &hash_hex, hash_hex.len);
-}
-
-/// `platform.scope(t).deploy.stampManifest(entries)` → the dep_id (16-hex
-/// string). `entries` is `[{path, kind, source_hex, bytecode_hex?,
-/// content_type?}]` — the app's composed manifest entries. The engine
-/// computes the content-addressed dep_id + encodes the manifest (its native
-/// format) and stages its deferred PUT into the target's deployments/.
-fn jsScopeDeployStampManifest(
-    ctx: ?*c.JSContext,
-    this: c.JSValue,
-    argc: c_int,
-    argv: [*c]c.JSValue,
-) callconv(.c) c.JSValue {
-    if (argc < 1) return js_undefined;
-    const state = getState(ctx);
-    if (state.platform == null) {
-        _ = c.JS_ThrowTypeError(ctx, "platform is only available on the admin handler");
-        return js_exception;
-    }
-    const caps = state.platform_caps orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform.scope().deploy is not configured on this worker");
-        return js_exception;
-    };
-    const fn_ptr = caps.stamp_manifest orelse {
-        _ = c.JS_ThrowTypeError(ctx, "platform.scope().deploy is not configured on this worker");
-        return js_exception;
-    };
-
-    const id = scopeIdFromThis(state, ctx, this) catch return js_exception;
-    defer state.allocator.free(id);
-
-    // Stringify the entries array → JSON the trampoline parses in Zig.
-    const js_str = c.JS_JSONStringify(ctx, argv[0], js_undefined, js_undefined);
-    defer c.JS_FreeValue(ctx, js_str);
-    if (c.JS_IsException(js_str)) return js_exception;
-    const entries_json = valueToOwnedString(state, ctx, js_str) catch return js_exception;
-    defer state.allocator.free(entries_json);
-
-    const dep_id = fn_ptr(caps.ctx, state.allocator, id, entries_json) catch |err| switch (err) {
-        error.InstanceNotFound => return jsThrowInstanceNotFound(ctx),
-        error.InvalidEntries => {
-            _ = c.JS_ThrowTypeError(ctx, "stampManifest: invalid entries (need [{path,kind,source_hex,bytecode_hex?,content_type?}], ≤256)");
-            return js_exception;
-        },
-        else => {
-            state.pending_kv_error = err;
-            return js_undefined;
-        },
-    };
-    var hex_buf: [16]u8 = undefined;
-    const hex = std.fmt.bufPrint(&hex_buf, "{x:0>16}", .{dep_id}) catch unreachable;
-    return c.JS_NewStringLen(ctx, hex.ptr, hex.len);
 }
 
 fn jsScopeKvGet(

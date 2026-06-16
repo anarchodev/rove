@@ -352,21 +352,10 @@ pub fn interpretCmd(
             drain_ptr.is_draining = true;
         },
         .http_fetch => |pf| {
-            // blob.receive (§3.5.1 slice B): the receive-door URL
-            // never reaches libcurl — arm the inbound upload on this
-            // worker (thread-affine with its h2 instance) instead.
-            if (blob_receive_mod.isReceiveUrl(pf.url)) {
-                worker.armBlobReceive(pf);
-                return;
-            }
-            // platform.compile (rewind-cli-plan §4.1): the compile-door
-            // URL never reaches libcurl — hand the bundle to the worker's
-            // background DeployThread, which compiles + stages + emits the
-            // terminal bound event that resumes the held admin chain.
-            if (deploy_thread_mod.isCompileUrl(pf.url)) {
-                worker.submitCompile(pf);
-                return;
-            }
+            // Trusted internal doors (blob.receive / platform.compile /
+            // stampManifest) never reach libcurl — route to the worker-local
+            // subsystem. ONE partition for every submit site (worker.zig).
+            if (worker.tryDoorFetch(pf)) return;
             const engine = worker.node.fetch_engine orelse {
                 var pfm = pf;
                 pfm.deinit(allocator);

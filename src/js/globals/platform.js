@@ -50,7 +50,24 @@
      * const profile = tenantKv.get("profile");
      */
     scope(id) {
-      return sys.scope(id);
+      const s = sys.scope(id);
+      // deploy.stampManifest is the deploy's STAGING BARRIER — it lowers to
+      // a bound on.fetch (not a native sync call) so it resumes your handler
+      // only once the manifest (the last staging write) AND every prior
+      // bytecode/static PUT is durable. Return next() after it; the result
+      // arrives at the `name` export (default onStamped) as
+      // `request.ctx = {ok, dep_id}`.
+      s.deploy = {
+        stampManifest(entries, opts) {
+          opts = opts || {};
+          return sysOn.fetch(
+            "http://rove-stage.internal/",
+            { method: "POST", body: JSON.stringify({ scope: id, entries }) },
+            { to: opts.name || "onStamped" },
+          );
+        },
+      };
+      return s;
     },
 
     /**

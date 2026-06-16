@@ -17,10 +17,11 @@ the front door — which serves the handler + static that the ADMIN tenant
 staged cross-tenant into it. Proves the whole composed deploy works as JS on
 __admin__ using only platform.* primitives.
 
-CAVEAT (known follow-up): blob.put / stampManifest DEFER their S3 PUTs (off
-the poll loop, fire-and-forget), so release can race staging. This smoke lets
-the deferred PUTs settle before releasing; the production flow needs an
-owed-marker / staging-complete signal so release never races (tracked in §4.1).
+stampManifest is the async STAGING BARRIER: it's the last FIFO job on the
+worker's single DeployThread, so its completion proves every prior bytecode +
+static PUT is durable. The held chain resumes (onStamped) only then, so the
+release never races staging — no sleep. (Per-static PUT *failure* detection is
+still a follow-up — the barrier guarantees ordering, not per-blob success.)
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
 """
@@ -29,7 +30,6 @@ from __future__ import annotations
 
 import json
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -43,8 +43,10 @@ TARGET = "target"
 TARGET_HANDLER_SRC = "export default function(){ return 'deployed-by-admin\\n'; }\n"
 TARGET_STATIC = "static-by-admin\n"
 
-# The __admin__ app: compile handlers (→ onCompiled), then stage statics +
-# stamp the manifest cross-tenant into TARGET, returning the dep_id.
+# The __admin__ app composes the deploy: compile handlers (→ onCompiled),
+# stage statics + stamp the manifest cross-tenant into TARGET; stampManifest
+# is the async STAGING BARRIER, so onStamped fires only once the whole deploy
+# is durable, and returns the dep_id (no race, no sleep).
 ADMIN_SRC = (
     'const TARGET = "%s";\n' % TARGET
     + "export default function () {\n"
@@ -57,16 +59,21 @@ ADMIN_SRC = (
     + "export function onCompiled() {\n"
     + "  try {\n"
     + "  const ctx = request.ctx;\n"
-    + "  if (!ctx || !ctx.ok) { response.status = 500; return JSON.stringify(ctx || { ok: false }); }\n"
+    + "  if (!ctx || !ctx.ok) { response.status = 500; return JSON.stringify({ stage: \"compile\", ctx: ctx || null }); }\n"
     + "  const entries = ctx.results.map(function (r) {\n"
     + "    return { path: r.path, kind: \"handler\", source_hex: r.source_hex, bytecode_hex: r.bytecode_hex };\n"
     + "  });\n"
     + "  const h = platform.scope(TARGET).blob.put(%s, { content_type: \"text/plain; charset=utf-8\" });\n" % json.dumps(TARGET_STATIC)
     + "  entries.push({ path: \"_static/hi.txt\", kind: \"static\", source_hex: h, content_type: \"text/plain; charset=utf-8\" });\n"
-    + "  const depId = platform.scope(TARGET).deploy.stampManifest(entries);\n"
-    + "  response.status = 200;\n"
-    + "  return JSON.stringify({ ok: true, dep_id: depId });\n"
+    + "  platform.scope(TARGET).deploy.stampManifest(entries, { name: \"onStamped\" });\n"
+    + "  return next();\n"
     + "  } catch (e) { response.status = 200; return JSON.stringify({ ok: false, error: String(e), stack: (e && e.stack) || null }); }\n"
+    + "}\n"
+    + "export function onStamped() {\n"
+    + "  // request.ctx = {ok, dep_id} — the staging barrier: every bytecode +\n"
+    + "  // static + the manifest PUT is durable by the time this fires.\n"
+    + "  response.status = 200;\n"
+    + "  return JSON.stringify(request.ctx);\n"
     + "}\n"
 )
 
@@ -113,8 +120,7 @@ def main() -> int:
             print("\nFAILURES:", failures)
             return 1
 
-        print("step 4: let the deferred cross-tenant PUTs settle, then release the staged dep_id")
-        time.sleep(3)  # blob.put + stampManifest defer their S3 PUTs (see CAVEAT)
+        print("step 4: release the staged dep_id (no sleep — onStamped fired AFTER staging was durable)")
         rel = c.release(TARGET, int(dep_hex, 16))
         check("release target → 204", rel.status == 204, f"got {rel.status} {rel.body!r}")
 
