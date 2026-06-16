@@ -1,39 +1,36 @@
-//! Background deploy/compile thread. The worker's `/_system/deploy`
-//! handler parses an inbound bundle, hands the owned bytes here, and
-//! parks the HTTP request; this thread compiles every handler source
-//! to bytecode, content-addresses every file into the *target tenant's
-//! own* blob backends, and stamps a deployment manifest — entirely OFF
-//! the worker poll loop (`feedback: front_door_never_blocks_loop`).
+//! Background deploy/compile thread. Backs the `platform.*` deploy
+//! primitives the standing `__admin__` deploy app composes (`platform.compile`
+//! / `platform.scope(t).blob.put` / `platform.scope(t).deploy.stampManifest`
+//! — `docs/rewind-cli-plan.md` §4). Each is issued as an `on.fetch` to a
+//! trusted-door origin that `interpretCmd` intercepts and hands here; this
+//! thread does the blocking work — compile handler sources to bytecode,
+//! content-address files into the *target tenant's own* blob backends, PUT
+//! the manifest — entirely OFF the worker poll loop
+//! (`feedback: front_door_never_blocks_loop`).
 //!
 //! ## Why a dedicated thread (and a dedicated compiler)
 //!
-//! Compilation (`Context.compileToBytecode`, a privileged engine op)
-//! plus the S3 PUTs `stageDeployment` issues are both blocking work
-//! measured in tens-to-hundreds of ms. Running them on the poll loop
-//! would stall every tenant the worker serves. The worker already owns
-//! a `QjsCompiler` used by `deployStarterTrampoline` ON the poll loop,
-//! so this thread can NOT share it (concurrent use of one QuickJS
-//! runtime races). Instead it owns its own runtime/context, created on
-//! and used only by this thread — zero shared mutable JS state.
+//! Compilation (`Context.compileToBytecode`, a privileged engine op) plus the
+//! S3 PUTs are blocking work measured in tens-to-hundreds of ms. Running them
+//! on the poll loop would stall every tenant the worker serves. The worker
+//! already owns a `QjsCompiler` used by `deployStarterTrampoline` ON the poll
+//! loop, so this thread can NOT share it (concurrent use of one QuickJS
+//! runtime races). Instead it owns its own runtime/context, created on and
+//! used only by this thread — zero shared mutable JS state.
 //!
 //! ## Model (mirrors `DeploymentLoader`)
 //!
-//! 1. `enqueue(job)` appends a `Job` (owned tenant id + owned inputs)
+//! 1. `enqueue(job)` appends a `Job` (owned tenant id + owned payload/inputs)
 //!    and wakes the thread.
 //! 2. The thread pops one job at a time (the single compiler runtime
-//!    serializes naturally), opens the tenant's `file-blobs` +
-//!    `deployments` backends from the shared `BackendConfig`, runs
-//!    `files.stageDeployment`, and records a `Result` keyed by the
-//!    job's `compile_id`.
-//! 3. The worker's `drainCompilePending` (per tick) calls
-//!    `takeResult(compile_id)`; on a hit it stamps the staged HTTP
-//!    response (`{"dep_id":"…"}` on success, an error body otherwise)
-//!    and ships it. No raft, nothing replicated — staging writes the
-//!    tenant's own content-addressed blobs; `release` (a separate raft
-//!    step) later flips `_deploy/current` to the returned dep_id.
-//!
-//! Completion is observed by polling `results` each tick (same posture
-//! as `fetch_pending_durability` / `forward_pending`); no eventfd wake.
+//!    serializes naturally) and runs it by kind: `compile_batch` compiles +
+//!    stages bytecode blobs; `blob_put` lands a deferred content-addressed
+//!    PUT; `manifest_put` PUTs the manifest (the deploy's staging barrier).
+//! 3. Each job's completion is delivered back to the held `__admin__` chain
+//!    as a BOUND `UpstreamFetchEvent` through the `MsgRouter` (`compile_batch`
+//!    + `manifest_put`), resuming the parked handler. No raft, nothing
+//!    replicated — staging writes the tenant's own content-addressed blobs;
+//!    `release` (a separate raft step) later flips `_deploy/current`.
 
 const std = @import("std");
 const blob_mod = @import("rove-blob");
@@ -89,18 +86,7 @@ pub const DeployThread = struct {
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
 
-    /// Completed full-stage results (`/_system/deploy`), keyed by
-    /// `compile_id`. The thread inserts; the worker's drain
-    /// `fetchRemove`s. Guarded by `results_mutex`. (`compile_batch`
-    /// jobs don't use this — they emit a terminal event directly.)
-    results: std.AutoHashMapUnmanaged(u64, Result) = .empty,
-    results_mutex: std.Thread.Mutex = .{},
-
     pub const JobKind = enum {
-        /// Full deploy: compile + stage + stamp manifest → dep_id
-        /// (the `/_system/deploy` route). Result in `results`, picked
-        /// up by `drainCompilePending`.
-        stage,
         /// Batch compile handler sources + stage source/bytecode blobs
         /// into the SCOPE tenant, then emit a terminal `UpstreamFetchEvent`
         /// (the per-file hashes in `ctx_json`) through the router to resume
@@ -127,7 +113,7 @@ pub const DeployThread = struct {
 
     pub const Job = struct {
         compile_id: u64,
-        kind: JobKind = .stage,
+        kind: JobKind,
         /// Owned copy of the target tenant id. For `compile_batch` /
         /// `blob_put` / `manifest_put` this is the SCOPE tenant.
         tenant_id: []u8,
@@ -164,15 +150,6 @@ pub const DeployThread = struct {
         dep_id: u64 = 0,
     };
 
-    /// A finished full-stage deploy. On success `status == 200` and
-    /// `dep_id` is the content-addressed deployment id; otherwise
-    /// `status` is the HTTP status and `msg` a static error string.
-    pub const Result = struct {
-        dep_id: u64 = 0,
-        status: u16 = 200,
-        msg: []const u8 = "",
-    };
-
     pub fn init(
         allocator: std.mem.Allocator,
         blob_cfg: blob_mod.BackendConfig,
@@ -199,11 +176,9 @@ pub const DeployThread = struct {
 
     pub fn deinit(self: *DeployThread) void {
         // Caller must have shutdown by here. Free any jobs the thread
-        // never reached + both results maps (compile_results values own
-        // their files/paths; takers that never ran leave them here).
+        // never reached (their owned tenant id / inputs / payload).
         for (self.queue.items) |*job| freeJob(self.allocator, job);
         self.queue.deinit(self.allocator);
-        self.results.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -214,26 +189,6 @@ pub const DeployThread = struct {
         defer self.queue_mutex.unlock();
         try self.queue.append(self.allocator, job);
         self.wake.set();
-    }
-
-    /// Pop a completed result by `compile_id`, or null if the job is
-    /// still running (or never existed). Called from the worker poll
-    /// loop each tick.
-    pub fn takeResult(self: *DeployThread, compile_id: u64) ?Result {
-        self.results_mutex.lock();
-        defer self.results_mutex.unlock();
-        const kv = self.results.fetchRemove(compile_id) orelse return null;
-        return kv.value;
-    }
-
-    fn putResult(self: *DeployThread, compile_id: u64, result: Result) void {
-        self.results_mutex.lock();
-        defer self.results_mutex.unlock();
-        self.results.put(self.allocator, compile_id, result) catch {
-            // OOM recording the result: the parked request will reap on
-            // its deadline (504). Nothing else we can do here.
-            std.log.err("deploy thread: failed to record result for compile {d}", .{compile_id});
-        };
     }
 
     fn popOne(self: *DeployThread) ?Job {
@@ -273,7 +228,6 @@ pub const DeployThread = struct {
             while (self.popOne()) |job_val| {
                 var job = job_val;
                 switch (job.kind) {
-                    .stage => self.putResult(job.compile_id, self.processStage(ctx_ptr, &job)),
                     .compile_batch => self.processCompileBatch(ctx_ptr, &job),
                     .blob_put => self.processKeyedPut(&job, "file-blobs"),
                     .manifest_put => self.processManifestPut(&job),
@@ -281,52 +235,6 @@ pub const DeployThread = struct {
                 freeJob(self.allocator, &job);
             }
         }
-    }
-
-    fn processStage(self: *DeployThread, ctx_ptr: ?*qjs.Context, job: *Job) Result {
-        const ctx = ctx_ptr orelse return .{ .status = 500, .msg = "compiler unavailable" };
-
-        var file_be = blob_mod.BlobBackend.openPerTenant(
-            self.allocator,
-            self.blob_cfg,
-            job.tenant_id,
-            "file-blobs",
-        ) catch |err| {
-            std.log.warn("deploy thread: open file-blobs for {s} failed: {s}", .{ job.tenant_id, @errorName(err) });
-            return .{ .status = 502, .msg = "blob backend open failed" };
-        };
-        defer file_be.deinit();
-
-        var mani_be = blob_mod.BlobBackend.openPerTenant(
-            self.allocator,
-            self.blob_cfg,
-            job.tenant_id,
-            "deployments",
-        ) catch |err| {
-            std.log.warn("deploy thread: open deployments for {s} failed: {s}", .{ job.tenant_id, @errorName(err) });
-            return .{ .status = 502, .msg = "manifest backend open failed" };
-        };
-        defer mani_be.deinit();
-
-        const dep_id = files_mod.stageDeployment(
-            self.allocator,
-            file_be.blobStore(),
-            mani_be.blobStore(),
-            compileThunk,
-            ctx,
-            job.inputs,
-        ) catch |err| {
-            std.log.warn("deploy thread: stage {s} (compile {d}) failed: {s}", .{ job.tenant_id, job.compile_id, @errorName(err) });
-            return switch (err) {
-                error.CompileFailed => .{ .status = 400, .msg = "compile failed" },
-                error.InvalidManifest => .{ .status = 400, .msg = "invalid manifest (duplicate paths or too many entries)" },
-                error.InvalidPath => .{ .status = 400, .msg = "invalid path" },
-                error.Blob => .{ .status = 502, .msg = "blob storage error" },
-                error.OutOfMemory => .{ .status = 500, .msg = "out of memory" },
-                else => .{ .status = 500, .msg = "deploy failed" },
-            };
-        };
-        return .{ .dep_id = dep_id, .status = 200 };
     }
 
     /// Deferred cross-tenant content-addressed PUT into the SCOPE tenant's
@@ -550,6 +458,7 @@ fn makeJob(compile_id: u64, tenant: []const u8) !DeployThread.Job {
     };
     return .{
         .compile_id = compile_id,
+        .kind = .compile_batch,
         .tenant_id = try testing.allocator.dupe(u8, tenant),
         .inputs = inputs,
     };
@@ -580,19 +489,6 @@ test "deinit frees jobs the thread never reached" {
     // deinit (leak-checked by the test allocator).
     try dt.enqueue(try makeJob(3, "gamma"));
     dt.deinit();
-}
-
-test "result map round-trips and a take consumes it" {
-    const dt = try DeployThread.init(testing.allocator, test_cfg, null);
-    defer dt.deinit();
-
-    try testing.expect(dt.takeResult(5) == null);
-    dt.putResult(5, .{ .dep_id = 0x42, .status = 200 });
-    const r = dt.takeResult(5).?;
-    try testing.expectEqual(@as(u64, 0x42), r.dep_id);
-    try testing.expectEqual(@as(u16, 200), r.status);
-    // Consumed — a second take is null.
-    try testing.expect(dt.takeResult(5) == null);
 }
 
 test "freeJob frees compile_batch routing fields" {

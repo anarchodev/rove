@@ -70,7 +70,6 @@ const ProxyOutcome = proxy_engine_mod.ProxyOutcome;
 const ParkedUnit = worker_mod.ParkedUnit;
 const RaftWait = worker_mod.RaftWait;
 const ForwardWait = worker_mod.ForwardWait;
-const CompileWait = worker_mod.CompileWait;
 const BodyDurabilityWait = worker_mod.BodyDurabilityWait;
 const TenantFiles = worker_mod.TenantFiles;
 const captureLogWithId = worker_mod.captureLogWithId;
@@ -541,62 +540,6 @@ fn finalizeForward(worker: anytype, ent: rove.Entity, status: u16, body: []u8) !
     try server.reg.move(ent, &worker.forward_pending, &server.response_in);
 }
 
-// ── /_system/deploy compile-park drain ────────────────────────────────
-
-/// Per-tick drain for `/_system/deploy` (`docs/rewind-cli-plan.md` §4).
-/// Walks `compile_pending`, and for each parked request polls the
-/// background `DeployThread` for a result keyed by its `CompileWait
-/// .compile_id`. On a hit it stamps the staged HTTP response — a
-/// `{"dep_id":"<016x>"}` 200 on success, or the thread's error status +
-/// message — and ships it; on `deadline_ns` expiry it reaps a 504. The
-/// poll loop is never blocked: the compile + S3 PUTs all ran on the
-/// thread. Mirrors `drainForwardPending`, but the response is built here
-/// (deploy doesn't know its dep_id at park time).
-pub fn drainCompilePending(worker: anytype) !void {
-    const dt = worker.deploy_thread orelse return;
-    const parked = worker.compile_pending.entitySlice();
-    if (parked.len == 0) return;
-
-    const allocator = worker.allocator;
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
-    // Snapshot before the loop: `reg.move` defers to flush, so the
-    // entity + wait slices stay valid across the whole pass.
-    const waits = worker.compile_pending.column(CompileWait);
-
-    var i: usize = 0;
-    while (i < parked.len) : (i += 1) {
-        const ent = parked[i];
-        const cid = waits[i].compile_id;
-
-        if (dt.takeResult(cid)) |result| {
-            if (result.status == 200) {
-                const body = try std.fmt.allocPrint(allocator, "{{\"dep_id\":\"{x:0>16}\"}}\n", .{result.dep_id});
-                try finalizeCompile(worker, ent, 200, body, "application/json");
-            } else {
-                const body = try std.fmt.allocPrint(allocator, "{s}\n", .{result.msg});
-                try finalizeCompile(worker, ent, result.status, body, null);
-            }
-        } else if (waits[i].deadline_ns != 0 and now_ns >= waits[i].deadline_ns) {
-            const body = try allocator.dupe(u8, "deploy timed out\n");
-            try finalizeCompile(worker, ent, 504, body, null);
-        }
-    }
-}
-
-/// Stamp a status + (allocator-owned) body + CORS/content-type headers
-/// onto a parked deploy entity in `compile_pending` and move it to
-/// `response_in`. `body` ownership transfers to the h2 response (freed
-/// after the stream ships). The entity's h2 sid/session were stamped at
-/// park time and ride the move (`reg.move` preserves every component).
-fn finalizeCompile(worker: anytype, ent: rove.Entity, status: u16, body: []u8, content_type: ?[]const u8) !void {
-    const server = worker.h2;
-    const hdrs = try respb.buildSystemRespHeaders(worker.allocator, worker.admin_origin, false, content_type);
-    try server.reg.set(ent, &worker.compile_pending, h2.Status, .{ .code = status });
-    try server.reg.set(ent, &worker.compile_pending, h2.RespHeaders, hdrs);
-    try server.reg.set(ent, &worker.compile_pending, h2.RespBody, .{ .data = body.ptr, .len = @intCast(body.len) });
-    try server.reg.set(ent, &worker.compile_pending, h2.H2IoResult, .{ .err = 0 });
-    try server.reg.move(ent, &worker.compile_pending, &server.response_in);
-}
 
 // ── Shared deployment-resolve ─────────────────────────────────────────
 
