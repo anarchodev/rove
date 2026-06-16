@@ -1105,4 +1105,22 @@ pub fn build(b: *std.Build) void {
     const cp_exe = b.addExecutable(.{ .name = "rewind-cp", .root_module = cp_mod });
     const cp_step = b.step("rewind-cp", "Build the V2 control-plane binary");
     cp_step.dependOn(&b.addInstallArtifact(cp_exe, .{}).step);
+
+    // ── rewind: the operator CLI (docs/rewind-cli-plan.md §2–§3, §6). A thin,
+    // typed, std-only client — operator env reader + curl/ssh transport +
+    // bundle classifier — for reset / bootstrap / deploy / release. No rove
+    // modules, no system libs, no raft/cargo linkage (so it builds standalone).
+    const cli_mod = b.createModule(.{
+        .root_source_file = b.path("src/cli/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const cli_exe = b.addExecutable(.{ .name = "rewind", .root_module = cli_mod });
+    const cli_step = b.step("rewind", "Build the rewind operator CLI");
+    cli_step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);
+
+    const cli_tests = b.addTest(.{ .root_module = cli_mod });
+    const cli_test_step = b.step("rewind-cli-test", "Run the rewind CLI unit tests");
+    cli_test_step.dependOn(&b.addRunArtifact(cli_tests).step);
+    test_step.dependOn(&b.addRunArtifact(cli_tests).step);
 }
