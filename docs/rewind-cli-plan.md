@@ -313,7 +313,151 @@ back-compat — `feedback_no_prelaunch_backcompat`):
 - docs: `CLAUDE.md`, `PLAN.md` §13, `v2-production-deploy-plan.md` §2.1; a
   few memory lines
 
-## 7. Out of scope
+## 7. Auth consolidation
+
+The auth sprawl is a symptom of the same disease as the deploy ad-hoc-ness:
+**many separately-exposed, separately-authenticated surfaces.** Dissolving
+surfaces (§4) is most of the cure; the rest is collapsing onto a model the
+worker already has.
+
+### What actually exists (the map)
+
+Three secrets + two OIDC planes — not five independent secrets:
+
+| Credential | Reach | Operator-facing? |
+|---|---|---|
+| `REWIND_ROOT_TOKEN` | worker `/_system/*` (bearer) | yes (break-glass) |
+| `REWIND_MOVE_SECRET` | worker `/_system/v2-*` + CP `/_control/*` | yes **and** internal (cp↔worker) |
+| `LOOP46_SERVICES_JWT_SECRET` | minted at worker `/_system/services-token`; verified by log-server + files-server | **no** — internal S2S |
+| `ADMIN_OPS_SECRET` | `/ops/assign-domain` on the interim admin bundle | yes — **interim**, dies with the OIDC dashboard |
+| OIDC session `__Host-rove_sid` | operator dashboard (`web/admin/`) | the *real* operator plane |
+| `__auth__` IdP | customer accounts | separate, correct — leave it |
+
+`REWIND_MOVE_SECRET` is misnamed: it gates *all* privileged CP mutations
+(`/_control/provision` / `host` / `plan` / `cert` / `move`) **and** the
+worker's cross-cluster move handshake (`/_system/v2-*`), and is shared
+cp↔worker as a service-to-service credential — not just "moves." It's really
+the control-plane / cross-cluster orchestration secret.
+
+Key facts (`src/js/auth.zig:64-78`, `src/js/worker_dispatch.zig:1202-1292`,
+`src/jwt/root.zig:44-64`): the worker `/_system/*` surface **already accepts
+session-cookie OR root bearer**, and there is **already a capability-token
+system** (`release` / `admin-kv` / `raft-snapshot` caps) minted via
+`/_system/services-token`. So the model exists; it just isn't the default path
+and the caps are coarse.
+
+### Two gaps, not a redesign
+
+1. **Raw secrets are operator/browser-facing.** The move secret rides on the
+   operator's shell; the services JWT is held *in the browser* for log queries
+   (`web/admin/_static/api.js` `getServicesToken`).
+2. **Capabilities aren't tenant-scoped** — flagged "coarse, any tenant." This
+   is the *same* root cause as the log-server tenant-scoping gap
+   (`standalone.zig:389`, the audit's open latent-critical).
+
+### Target: two planes + one enabling change
+
+- **Operator → one identity: the admin-tenant OIDC session.** Everything
+  operator-facing (deploy, release, provision, host, move, log query) flows
+  through the admin tenant, which mints **scoped capability tokens
+  server-side**. Move secret + services JWT become **internal-plane S2S only**
+  (never on a shell, never in a browser); root token = break-glass.
+- **Customer → `__auth__`, untouched.**
+
+The single high-leverage change: **add a tenant scope to the capability
+token** (`{exp, caps, tenant}`). It (a) closes the log-server gap *and* the
+coarse-cap gap with one fix, (b) lets the admin tenant mint a per-tenant
+`logs-read` cap, and (c) composes with §4 — deploy/release/log-read all become
+worker-minted, tenant-scoped caps obtained after one OIDC login.
+
+### Log query: internal-only, through the admin chokepoint
+
+Log query stays needed (the indexer is irreducible — request logs are written
+**per-node, interleaved across tenants** as one S3 PUT/flush; the sqlite index
+demuxes them per-tenant — so the worker can't cheaply serve them and it does
+*not* dissolve like files-server). But its **exposed surface** dissolves:
+
+- **`rewind-logs` goes internal-plane only** — no public front route, no CORS,
+  **no services token in the browser**.
+- The **admin tenant reaches it via an internal fetch** — the same mechanism
+  `blob.*` already uses (`http://rove-blob.internal/…` rewritten by the fetch
+  engine, `fetch_engine.zig:708`). A privileged `rewind-logs.internal` host,
+  callable **only by `__admin__`**, carrying a tenant-scoped `logs-read` cap.
+- **Tenant-scoping moves out of log-server** (where it's missing) **into the
+  admin app** (where user→tenant authz already lives). The
+  `standalone.zig:389` gap is *deleted*, not patched — log-server trusts the
+  scoped cap.
+- **How the call is authenticated — verified reuse, not a new key.** The
+  worker attaches the credential when it issues the internal host; the
+  handler's JS never touches key material. This is the proven `blob.internal`
+  pattern: the fetch engine already SigV4-signs internal outbound fetches from
+  platform-held config (`fetch_engine.zig:567`), and a worker→log-server
+  JWT+Bearer S2S path already exists (`worker_log.zig:299`). So log query
+  reuses the existing services-JWT mint (tenant-scoped per the change above) —
+  **no new secret.**
+- **The fetch-engine gate is the primary control; the token is
+  defense-in-depth.** Only `__admin__` can form `rewind-logs.internal` (the
+  routing gate) and log-server is internal-plane only (network isolation). The
+  attached token is belt-and-suspenders so a network slip alone doesn't expose
+  logs — you could even run gate-only (the worker's own h2c stance).
+- **Asymmetric ("admin owns a private key") was considered and rejected.**
+  ECDSA exists only as a *customer handler recipe* (`crypto.ecdsaSign`,
+  bring-your-own-key in kv); there is **no platform per-tenant signing
+  identity**, so it would be new build — and it buys nothing here (the
+  "verifier can't forge" property only matters for an independently-
+  compromisable foreign trust domain, which a co-located internal service is
+  not).
+- One new bit to build: the internal fetch is **cross-tenant** (admin → any
+  tenant's logs), vs `blob.internal`'s own-tenant scope — analogous to
+  `platform.scope`'s admin cross-tenant kv grant. The host-rewrite mechanism
+  is proven; the privileged cross-tenant variant is the addition.
+- Live "tail my logs" is a **separate future feature** (a worker
+  `/_system/logs/stream`), not a reason the indexed surface changes.
+
+### After: the standing secrets
+
+The useful distinction is **standing secrets** (long-lived keys) vs **derived
+tokens** (ephemeral, minted on demand). The plan pushes operations onto derived
+tokens, leaving a small standing set — none operator-facing day-to-day:
+
+| Standing secret | Role | Operator/browser-facing? |
+|---|---|---|
+| Services-JWT HMAC (`LOOP46_SERVICES_JWT_SECRET`) | signs all internal capability tokens; verified by the services | no — internal only |
+| `REWIND_MOVE_SECRET` | cp↔worker control / cross-cluster orchestration | no — internal only (operator ops go via the session) |
+| `REWIND_ROOT_TOKEN` | break-glass | operator, but not day-to-day |
+| S3/AWS creds | blob backend (fetch-engine SigV4 attach) | no — platform infra |
+| OIDC IdP config (operator) + `__auth__` (customer) | the two identity planes | their own planes |
+
+**Derived, ephemeral (not standing keys):** tenant-scoped capability tokens —
+`deploy` / `release` / `logs-read` / `admin-kv` / `raft-snapshot` — all signed
+by the services-JWT HMAC, ~5-min expiry, worker-attached, never human-held.
+
+**Retired:** `ADMIN_OPS_SECRET` (→ session-gated admin RPC); files-server's
+separate trust domain (no binary — §4); the services token *in the browser*;
+the operator's day-to-day raw move-secret / root-token use.
+
+**Net:** an operator holds **one** thing day-to-day — their dashboard login.
+Behind it, one internal HMAC signs every short-lived scoped token; the move
+secret + S3 creds sit in platform config (internal); the root token is
+break-glass; customer auth is its own `__auth__` plane.
+
+Note `REWIND_MOVE_SECRET` is **moved, not eliminated**: it comes off the
+operator's shell (operator ops go via the session) and becomes cp↔worker
+internal-only — but it remains a distinct standing key.
+
+**Considered and rejected — folding the move secret into the one HMAC.** It's
+tempting to mint `provision` / `move` caps from the same services-JWT HMAC and
+drop the move secret entirely (a *single* internal signing key). Rejected as a
+**deliberate blast-radius boundary**: the services-JWT HMAC is the *busy* key —
+minted constantly, attached to many internal fetches — so it's the likeliest to
+leak. Signing the rarely-used, high-destruction operations (move / provision /
+cert rewrite) with that *same* key means one leak = total platform compromise.
+Keeping orchestration behind its own quiet key means a services-HMAC leak still
+can't move tenants or rewrite certs. Two keys (one busy, one quiet
+high-privilege) beats one key that does everything — consistent with weighting
+safety over minimalism.
+
+## 8. Out of scope
 
 - **Binary deploys** (`deploy.sh` / `/deploy`) — unchanged.
 - **Runtime cluster management** (no `addCluster` endpoint exists yet;
