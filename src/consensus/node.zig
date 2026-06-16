@@ -912,6 +912,21 @@ pub const Node = struct {
         return self.mgr.confState(tenant_id, voters_buf, learners_buf);
     }
 
+    /// Per-peer replication progress on `tenant_id`'s group from the LEADER's
+    /// view: fills `ids`/`matched`/`active` (same length) with each peer voter's
+    /// raft id, `matched` index, and `recent_active`, and returns `{len,
+    /// leader_last}`. Null on a follower / unknown group (only the leader tracks
+    /// peer progress) — the reconciler's "is node N a CAUGHT-UP member" signal,
+    /// which conf_state alone can't give (a phantom voter shows in `voters` with
+    /// `matched=0`). Pump-thread only (reads the Manager).
+    pub const VoterProgressRaw = struct { len: usize, leader_last: u64 };
+    pub fn voterProgress(self: *Node, tenant_id: u64, ids: []u64, matched: []u64, active: []u8) ?VoterProgressRaw {
+        var out_scratch: [32]raft.Manager.VoterProgress = undefined;
+        const cap = @min(@min(ids.len, matched.len), @min(active.len, out_scratch.len));
+        const view = self.mgr.voterProgress(tenant_id, ids, matched, active, out_scratch[0..cap]) orelse return null;
+        return .{ .len = view.peers.len, .leader_last = view.leader_last };
+    }
+
     /// The term of the log entry at `index` on `tenant_id`'s group (0 if
     /// compacted / beyond the log / unknown). The leader reports `term(applied)`
     /// so a returning learner's promote-back baseline matches its log.

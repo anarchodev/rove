@@ -188,7 +188,7 @@ pub const GroupSig = struct {
 /// one, enqueues a pointer, and blocks on `done` until the pump has
 /// executed it and stamped `err` — so the struct outlives the wait.
 const ControlCmd = struct {
-    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state, apply_local_snapshot, log_term };
+    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term };
     kind: Kind,
     gid: u64,
     /// Borrowed from the gid's `GroupSig.id_str` (pointer-stable); used by
@@ -209,6 +209,14 @@ const ControlCmd = struct {
     cs_voters_len: usize = 0,
     cs_learners_len: usize = 0,
     cs_ok: bool = false,
+    /// `voter_progress`: caller buffers (parallel: id/matched/active) filled by
+    /// the pump from the leader's per-peer view; len + leader_last written back.
+    vp_ids: []u64 = &.{},
+    vp_matched: []u64 = &.{},
+    vp_active: []u8 = &.{},
+    vp_len: usize = 0,
+    vp_leader_last: u64 = 0,
+    vp_ok: bool = false,
     /// Result, written by the pump before signaling `done`.
     err: ?Error = null,
     /// `transfer_all_leadership` writes the number of groups it handed off here.
@@ -753,6 +761,20 @@ pub const Bridge = struct {
         return .{ .voters = voters_buf[0..cmd.cs_voters_len], .learners = learners_buf[0..cmd.cs_learners_len] };
     }
 
+    pub const VoterProgressView = struct { len: usize, leader_last: u64 };
+
+    /// Per-peer replication progress on `gid`'s group from the LEADER's view:
+    /// fills the parallel `ids`/`matched`/`active` buffers (same length) and
+    /// returns `{len, leader_last}`. Null on a follower / unknown group / pump
+    /// down. The reconciler's "is node N a caught-up member" truth signal
+    /// (conf_state alone lies — a phantom voter has `matched=0`). Control cmd.
+    pub fn voterProgress(self: *Bridge, gid: u64, ids: []u64, matched: []u64, active: []u8) ?VoterProgressView {
+        var cmd: ControlCmd = .{ .kind = .voter_progress, .gid = gid, .vp_ids = ids, .vp_matched = matched, .vp_active = active };
+        self.runControl(&cmd) catch return null;
+        if (!cmd.vp_ok) return null;
+        return .{ .len = cmd.vp_len, .leader_last = cmd.vp_leader_last };
+    }
+
     /// The term of the log entry at `index` on `gid`'s group (0 if compacted /
     /// beyond the log / unknown / pump down). A leader reports `term(applied)`
     /// for a returning learner's promote-back baseline. Pump-thread control cmd.
@@ -821,6 +843,14 @@ pub const Bridge = struct {
                         cmd.cs_voters_len = cs.voters.len;
                         cmd.cs_learners_len = cs.learners.len;
                         cmd.cs_ok = true;
+                    }
+                    break :blk null;
+                },
+                .voter_progress => blk: {
+                    if (self.node.voterProgress(cmd.gid, cmd.vp_ids, cmd.vp_matched, cmd.vp_active)) |vp| {
+                        cmd.vp_len = vp.len;
+                        cmd.vp_leader_last = vp.leader_last;
+                        cmd.vp_ok = true;
                     }
                     break :blk null;
                 },
