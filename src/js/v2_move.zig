@@ -134,6 +134,10 @@ pub fn tryHandleV2(
         try handleLoadMerge(server, allocator, worker, ent, sid, sess, method, rh, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-plan")) {
         try handlePlan(server, allocator, worker, ent, sid, sess, method, path, body);
+    } else if (std.mem.eql(u8, sys_rest, "v2-confchange")) {
+        try handleConfChange(server, allocator, worker, ent, sid, sess, method, body);
+    } else if (std.mem.eql(u8, sys_rest, "v2-confstate")) {
+        try handleConfState(server, allocator, worker, ent, sid, sess, method, path);
     } else {
         try respb.setSystemResponse(server, ent, sid, sess, 404, "unknown v2 move endpoint\n", allocator, null, null);
     }
@@ -809,6 +813,89 @@ fn queryParam(path: []const u8, key: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
     }
     return null;
+}
+
+// ── v2-confchange / v2-confstate: manual membership change (conf_change Ph1) ──
+
+/// `POST /_system/v2-confchange {tenant, node_id, op}` — operator-triggered
+/// membership change on `tenant`'s raft group (leader-gated). `op`:
+/// `demote`/`add` → learner (AddLearnerNode), `promote` → voter (AddNode),
+/// `remove` → drop. A demote of a far-behind voter takes it out of the
+/// voters-only WAL-compaction floor so the log truncates again.
+fn handleConfChange(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    body: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+    var parsed = std.json.parseFromSlice(
+        struct { tenant: []const u8, node_id: u64, op: []const u8 },
+        allocator,
+        body,
+        .{ .ignore_unknown_fields = true },
+    ) catch return reply(server, allocator, ent, sid, sess, 400, "expected {tenant, node_id, op}\n");
+    defer parsed.deinit();
+    const v = parsed.value;
+    if (v.tenant.len == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "empty tenant\n");
+    const cc_type: u8 =
+        if (std.mem.eql(u8, v.op, "demote") or std.mem.eql(u8, v.op, "add")) 2 else if (std.mem.eql(u8, v.op, "promote")) 0 else if (std.mem.eql(u8, v.op, "remove")) 1 else return reply(server, allocator, ent, sid, sess, 400, "op must be demote|promote|add|remove\n");
+    const gid = worker.raft.gidForTenant(v.tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
+    if (!worker.raft.isLeaderOf(gid))
+        return reply(server, allocator, ent, sid, sess, 421, "not the leader for this tenant; try another node\n");
+    worker.raft.proposeConfChange(gid, v.node_id, cc_type) catch |e| switch (e) {
+        error.NotLeader => return reply(server, allocator, ent, sid, sess, 421, "not the leader\n"),
+        error.ConfChangeQuorumGuard => return reply(server, allocator, ent, sid, sess, 409, "refused: would leave fewer than 2 voters\n"),
+        else => return reply(server, allocator, ent, sid, sess, 500, "conf-change propose failed\n"),
+    };
+    return reply(server, allocator, ent, sid, sess, 204, "");
+}
+
+/// `GET /_system/v2-confstate?tenant=` → `{"voters":[…],"learners":[…]}` for
+/// the tenant's group on this node (operator + smoke membership query).
+fn handleConfState(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    path: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "GET"))
+        return reply(server, allocator, ent, sid, sess, 405, "GET only\n");
+    const tenant = queryParam(path, "tenant") orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing ?tenant\n");
+    const gid = worker.raft.gidForTenant(tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
+    var voters_buf: [16]u64 = undefined;
+    var learners_buf: [16]u64 = undefined;
+    const cs = worker.raft.confState(gid, &voters_buf, &learners_buf) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "no conf state for this group\n");
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var w = buf.writer(allocator);
+    w.writeAll("{\"voters\":[") catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    for (cs.voters, 0..) |id, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        w.print("{d}", .{id}) catch {};
+    }
+    w.writeAll("],\"learners\":[") catch {};
+    for (cs.learners, 0..) |id, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        w.print("{d}", .{id}) catch {};
+    }
+    w.writeAll("]}\n") catch {};
+    const out = buf.toOwnedSlice(allocator) catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
 }
 
 /// Stamp a plain status + message response (no CORS — internal surface).
