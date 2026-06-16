@@ -12,7 +12,7 @@ headers; now `proxyToCluster` relays them (lowercased for h2, minus hop-by-hop
 + framing headers). The gate: a GET routed THROUGH the front carries the
 backend's `content-type`, and the body is intact.
 
-Build first:  zig build rewind && zig build rewind-cp && zig build rewind-front
+Build first:  zig build rewind-worker && zig build rewind-cp && zig build rewind-front
 Needs S3 env (the worker's blob backend): `set -a; . ./.env; set +a` first.
 """
 
@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from v2_topology import spawn_cp, spawn_front, await_line, CP_BIN, FRONT_BIN  # noqa: E402
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin")
-REWIND = os.path.join(BINDIR, "rewind")
+REWIND = os.path.join(BINDIR, "rewind-worker")
 
 PF = int(os.environ.get("FRONT_PORT", "18300"))
 PCP = int(os.environ.get("CP_PORT", "18305"))
@@ -107,7 +107,7 @@ def stop_all():
 def main():
     for b in (REWIND, CP_BIN, FRONT_BIN):
         if not os.path.exists(b):
-            raise SystemExit(f"{b} not found — run `zig build rewind && zig build rewind-cp && zig build rewind-front`")
+            raise SystemExit(f"{b} not found — run `zig build rewind-worker && zig build rewind-cp && zig build rewind-front`")
     if not os.environ.get("S3_ENDPOINT"):
         raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
 

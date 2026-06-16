@@ -536,7 +536,7 @@ pub fn build(b: *std.Build) void {
 
     // V1→V2 cutover: `rove-snapshot` (src/loop46/snapshot.zig, willemt
     // RaftNode) and the `loop46` product binary (src/loop46/, V1 cluster +
-    // sqlite raft) were RETIRED — the V2 worker is `rewind`
+    // sqlite raft) were RETIRED — the V2 worker is `rewind-worker`
     // (src/rewind/main.zig). Both broke the aggregate `test` step and the
     // default install on the v2 branch. Their per-tenant raft is the `Bridge`
     // (src/consensus/bridge.zig) + raft-rs.
@@ -612,11 +612,11 @@ pub fn build(b: *std.Build) void {
     // rendezvous, no `--sse-public-base`, no `SSE_INTERNAL_TOKEN`.
     // See `docs/sse-plan.md` + `docs/connection-actor-plan.md` §6.2.
 
-    // log-server-standalone: Phase 5.5 (a) step 2 — runs the new
+    // rewind-logs: Phase 5.5 (a) step 2 — runs the new
     // S3-direct logs indexer + h2 query API as a standalone process.
     // Smoke driver populates the batch-store dir directly on disk
     // (no worker yet); step 3 wires the worker's flush path into S3.
-    const ls_standalone_mod = b.addModule("log-server-standalone", .{
+    const ls_standalone_mod = b.addModule("rewind-logs", .{
         .root_source_file = b.path("src/log_server/main.zig"),
         .target = target,
         .optimize = optimize,
@@ -631,7 +631,7 @@ pub fn build(b: *std.Build) void {
     ls_standalone_mod.link_libc = true;
     ls_standalone_mod.linkSystemLibrary("sqlite3", .{});
     const ls_standalone = b.addExecutable(.{
-        .name = "log-server-standalone",
+        .name = "rewind-logs",
         .root_module = ls_standalone_mod,
     });
     b.installArtifact(ls_standalone);
@@ -1072,7 +1072,7 @@ pub fn build(b: *std.Build) void {
     const js_v2_step = b.step("js-v2", "Compile rove-js against the V2 facade + bridge (Phase 2c)");
     js_v2_step.dependOn(&b.addRunArtifact(js_v2_test).step);
 
-    // ── rewind: the V2 single-node worker binary (v2-build-order
+    // ── rewind-worker: the V2 single-node worker binary (v2-build-order
     // §Phase 2d). The V2 counterpart of `loop46` — the reused rove-js
     // worker stack on the per-tenant bridge instead of the willemt cluster.
     // Building this is also the FORCING FUNCTION for the Phase-2c generic
@@ -1098,8 +1098,8 @@ pub fn build(b: *std.Build) void {
     rewind_mod.linkSystemLibrary("nghttp2", .{});
     rewind_mod.linkSystemLibrary("ssl", .{});
     rewind_mod.linkSystemLibrary("crypto", .{});
-    const rewind_exe = b.addExecutable(.{ .name = "rewind", .root_module = rewind_mod });
-    const rewind_step = b.step("rewind", "Build the V2 rewind worker binary (Phase 2d)");
+    const rewind_exe = b.addExecutable(.{ .name = "rewind-worker", .root_module = rewind_mod });
+    const rewind_step = b.step("rewind-worker", "Build the V2 rewind worker binary (Phase 2d)");
     rewind_step.dependOn(&b.addInstallArtifact(rewind_exe, .{}).step);
 
     // ── rewind-front: the V2 front door (docs/v2-front-door-architecture.md).

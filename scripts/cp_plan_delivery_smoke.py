@@ -37,7 +37,7 @@ Requires S3 env (the move ships a bundle; there is no fs BlobBackend) — source
 the repo `.env` first:
   `set -a; . ./.env; set +a; python3 scripts/cp_plan_delivery_smoke.py`
 
-Build first:  `zig build rewind && zig build rewind-cp`
+Build first:  `zig build rewind-worker && zig build rewind-cp`
 """
 
 import json
@@ -51,7 +51,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from v2_topology import spawn_cp, await_line, CP_BIN
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin")
-REWIND = os.path.join(BINDIR, "rewind")
+REWIND = os.path.join(BINDIR, "rewind-worker")
 
 PCP = int(os.environ.get("CP_PORT", "18213"))
 P1 = int(os.environ.get("C1_PORT", "18211"))
@@ -188,7 +188,7 @@ def stop_all():
 def main():
     for b in (REWIND, CP_BIN):
         if not os.path.exists(b):
-            raise SystemExit(f"{b} not found — run `zig build rewind && zig build rewind-cp`")
+            raise SystemExit(f"{b} not found — run `zig build rewind-worker && zig build rewind-cp`")
     if not os.environ.get("S3_ENDPOINT"):
         raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
 
