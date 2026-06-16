@@ -135,30 +135,11 @@ pub const FileStore = struct {
         self.kv.put(key, value) catch return Error.Kv;
     }
 
-    /// Content-addressed PUT: skip if the key already exists in the
-    /// blob store. Lets multiple cluster nodes bootstrap the same
-    /// shared S3 backend concurrently without conflicting on PUT for
-    /// identical bytes (some object stores reject overlapping
-    /// conditional writes for the same key — OVH OS in particular).
-    /// Retries up to ~1s on PUT errors so the loser of a race waits
-    /// for the winner's write to land + becomes visible via exists().
+    /// Content-addressed PUT (method form): delegates to the free
+    /// `putBlobIfMissingTo` so the stateless `stageDeployment` path
+    /// shares the exact skip-if-present + race-retry behaviour.
     fn putBlobIfMissing(self: *FileStore, key: []const u8, bytes: []const u8) Error!void {
-        if (self.blob.exists(key) catch false) return;
-        var attempt: u8 = 0;
-        while (attempt < 6) : (attempt += 1) {
-            self.blob.put(key, bytes) catch {
-                // Sleep with exponential backoff (50ms, 100ms, 200ms,
-                // 400ms, 800ms) then re-check. Identical content
-                // means whoever wins is fine; we just need to confirm
-                // the key landed.
-                const delay_ms: u64 = @as(u64, 50) << @as(u6, @intCast(attempt));
-                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
-                if (self.blob.exists(key) catch false) return;
-                continue;
-            };
-            return;
-        }
-        return Error.Blob;
+        return putBlobIfMissingTo(self.blob, key, bytes);
     }
 
     fn kvDelete(self: *FileStore, key: []const u8) Error!void {
@@ -523,7 +504,127 @@ pub const FileStore = struct {
     }
 };
 
+// ── Stateless deploy (no working-tree kv) ──────────────────────────────
+
+/// One file's bytes + metadata for a stateless deploy. The caller (the
+/// worker's `/_system/deploy` handler) supplies the raw bytes; there is
+/// no persistent working-tree index.
+pub const DeployInput = struct {
+    path: []const u8,
+    kind: Kind,
+    /// Content-type to stamp on a `.static` entry. Ignored for handlers
+    /// (their wire type comes from the response object at serve time).
+    content_type: []const u8 = "",
+    /// Handler source (compiled here) or static content bytes.
+    bytes: []const u8,
+};
+
+/// Stateless deploy: compile + content-address + stamp a manifest with
+/// NO persistent working-tree kv (unlike `FileStore`, which keeps a
+/// `file/` + `bytecode/` index). For each input, write its blob
+/// content-addressed (skip-if-present); for handlers also compile to
+/// bytecode and write that blob. Then compute the content-addressed
+/// deployment id over the entry set, encode the manifest JSON, and write
+/// it to `manifest_backend` at `manifest_json.manifestKey`. Returns the
+/// dep_id. Does NOT flip `_deploy/current` — release is a separate,
+/// raft-replicated step.
+///
+/// `blob` is the tenant's file-blobs backend (source + bytecode);
+/// `manifest_backend` is the tenant's `deployments/` backend. Idempotent
+/// at the storage layer: identical inputs → identical dep_id → PUTs land
+/// on the same keys with identical bytes.
+///
+/// Bounded to 256 entries (matches `computeDeploymentId`). Rejects
+/// invalid or duplicate paths so the manifest is unambiguous.
+pub fn stageDeployment(
+    allocator: std.mem.Allocator,
+    blob: BlobStore,
+    manifest_backend: BlobStore,
+    compile: CompileFn,
+    compile_ctx: ?*anyopaque,
+    inputs: []const DeployInput,
+) Error!u64 {
+    if (inputs.len > 256) return Error.InvalidManifest;
+
+    // Validate + reject duplicate paths up front.
+    for (inputs, 0..) |in_a, i| {
+        try validatePath(in_a.path);
+        if (in_a.path.len > MAX_PATH_LEN) return Error.InvalidPath;
+        if (in_a.kind == .static and in_a.content_type.len > MAX_CT_LEN)
+            return Error.InvalidPath;
+        for (inputs[0..i]) |in_b| {
+            if (std.mem.eql(u8, in_a.path, in_b.path)) return Error.InvalidManifest;
+        }
+    }
+
+    const entries = allocator.alloc(FileStore.Entry, inputs.len) catch return Error.OutOfMemory;
+    defer allocator.free(entries);
+
+    for (inputs, 0..) |in, i| {
+        var src_hex: [HASH_HEX_LEN]u8 = undefined;
+        hashHex(in.bytes, &src_hex);
+        try putBlobIfMissingTo(blob, &src_hex, in.bytes);
+
+        var bc_hex: [HASH_HEX_LEN]u8 = @splat(0);
+        if (in.kind == .handler) {
+            // Filename must be NUL-terminated for quickjs.
+            var fname_buf: [MAX_PATH_LEN + 1]u8 = undefined;
+            @memcpy(fname_buf[0..in.path.len], in.path);
+            fname_buf[in.path.len] = 0;
+            const fname: [:0]const u8 = fname_buf[0..in.path.len :0];
+
+            const bytecode = compile(compile_ctx, in.bytes, fname, allocator) catch
+                return Error.CompileFailed;
+            defer allocator.free(bytecode);
+            hashHex(bytecode, &bc_hex);
+            try putBlobIfMissingTo(blob, &bc_hex, bytecode);
+        }
+
+        entries[i] = .{
+            .path = @constCast(in.path),
+            .kind = in.kind,
+            .content_type = @constCast(if (in.kind == .static) in.content_type else ""),
+            .source_hex = src_hex,
+            .bytecode_hex = bc_hex,
+        };
+    }
+
+    const dep_id = manifest_json.computeDeploymentId(entries);
+    const manifest_bytes = manifest_json.encode(allocator, dep_id, entries) catch
+        return Error.OutOfMemory;
+    defer allocator.free(manifest_bytes);
+
+    var key_buf: [25]u8 = undefined;
+    const key = manifest_json.manifestKey(&key_buf, dep_id);
+    try putBlobIfMissingTo(manifest_backend, key, manifest_bytes);
+
+    return dep_id;
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────
+
+/// Content-addressed PUT: skip if the key already exists. Lets multiple
+/// cluster nodes bootstrap the same shared S3 backend concurrently
+/// without conflicting on PUT for identical bytes (some object stores
+/// reject overlapping conditional writes for the same key — OVH OS in
+/// particular). Retries up to ~1s on PUT errors so the loser of a race
+/// waits for the winner's write to land + become visible via exists().
+fn putBlobIfMissingTo(blob: BlobStore, key: []const u8, bytes: []const u8) Error!void {
+    if (blob.exists(key) catch false) return;
+    var attempt: u8 = 0;
+    while (attempt < 6) : (attempt += 1) {
+        blob.put(key, bytes) catch {
+            // Exponential backoff (50ms, 100ms, … 800ms) then re-check;
+            // identical content means whoever wins is fine.
+            const delay_ms: u64 = @as(u64, 50) << @as(u6, @intCast(attempt));
+            std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+            if (blob.exists(key) catch false) return;
+            continue;
+        };
+        return;
+    }
+    return Error.Blob;
+}
 
 fn hashHex(bytes: []const u8, out: *[HASH_HEX_LEN]u8) void {
     var digest: [32]u8 = undefined;
@@ -976,4 +1077,100 @@ test "assembleManifest produces mixed handler + static entries with content-type
 test {
     _ = manifest_json;
     _ = app_manifest;
+}
+
+// ── stageDeployment (stateless deploy) tests ───────────────────────────
+
+test "stageDeployment: stages handler + static, writes manifest, content-addressed id" {
+    const a = testing.allocator;
+    var blob = MemBlobStore.init(a);
+    defer blob.deinit();
+    var mani = MemBlobStore.init(a);
+    defer mani.deinit();
+
+    const inputs = [_]DeployInput{
+        .{ .path = "index.mjs", .kind = .handler, .bytes = "export default () => 1;" },
+        .{ .path = "_static/x.html", .kind = .static, .content_type = "text/html; charset=utf-8", .bytes = "<h1>hi</h1>" },
+    };
+    const dep_id = try stageDeployment(a, blob.blobStore(), mani.blobStore(), passthroughCompile, null, &inputs);
+
+    // Manifest written + decodes to our two entries (input order preserved).
+    var key_buf: [25]u8 = undefined;
+    const key = manifest_json.manifestKey(&key_buf, dep_id);
+    const mbytes = try mani.blobStore().get(key, a);
+    defer a.free(mbytes);
+    var m = try manifest_json.decode(a, mbytes);
+    defer m.deinit();
+    try testing.expectEqual(dep_id, m.id);
+    try testing.expectEqual(@as(usize, 2), m.entries.len);
+    try testing.expectEqualStrings("index.mjs", m.entries[0].path);
+    try testing.expectEqual(Kind.handler, m.entries[0].kind);
+    try testing.expectEqualStrings("_static/x.html", m.entries[1].path);
+    try testing.expectEqual(Kind.static, m.entries[1].kind);
+    try testing.expectEqualStrings("text/html; charset=utf-8", m.entries[1].content_type);
+
+    // Source blobs present for both; bytecode blob present only for the handler.
+    try testing.expect(try blob.blobStore().exists(&m.entries[0].source_hex));
+    try testing.expect(try blob.blobStore().exists(&m.entries[0].bytecode_hex));
+    try testing.expect(try blob.blobStore().exists(&m.entries[1].source_hex));
+    const zero: [HASH_HEX_LEN]u8 = @splat(0);
+    try testing.expectEqualSlices(u8, &zero, &m.entries[1].bytecode_hex);
+}
+
+test "stageDeployment: idempotent — identical inputs yield the same dep_id" {
+    const a = testing.allocator;
+    var b = MemBlobStore.init(a);
+    defer b.deinit();
+    var m = MemBlobStore.init(a);
+    defer m.deinit();
+    const inputs = [_]DeployInput{.{ .path = "index.mjs", .kind = .handler, .bytes = "x" }};
+    const id1 = try stageDeployment(a, b.blobStore(), m.blobStore(), passthroughCompile, null, &inputs);
+    const id2 = try stageDeployment(a, b.blobStore(), m.blobStore(), passthroughCompile, null, &inputs);
+    try testing.expectEqual(id1, id2);
+}
+
+test "stageDeployment: different content yields a different dep_id" {
+    const a = testing.allocator;
+    var b = MemBlobStore.init(a);
+    defer b.deinit();
+    var m = MemBlobStore.init(a);
+    defer m.deinit();
+    const in_a = [_]DeployInput{.{ .path = "index.mjs", .kind = .handler, .bytes = "one" }};
+    const in_b = [_]DeployInput{.{ .path = "index.mjs", .kind = .handler, .bytes = "two" }};
+    const id_a = try stageDeployment(a, b.blobStore(), m.blobStore(), passthroughCompile, null, &in_a);
+    const id_b = try stageDeployment(a, b.blobStore(), m.blobStore(), passthroughCompile, null, &in_b);
+    try testing.expect(id_a != id_b);
+}
+
+test "stageDeployment: compile failure surfaces as CompileFailed" {
+    const a = testing.allocator;
+    var b = MemBlobStore.init(a);
+    defer b.deinit();
+    var m = MemBlobStore.init(a);
+    defer m.deinit();
+    const inputs = [_]DeployInput{.{ .path = "bad.mjs", .kind = .handler, .bytes = "syntax(" }};
+    try testing.expectError(Error.CompileFailed, stageDeployment(a, b.blobStore(), m.blobStore(), failingCompile, null, &inputs));
+}
+
+test "stageDeployment: rejects duplicate paths" {
+    const a = testing.allocator;
+    var b = MemBlobStore.init(a);
+    defer b.deinit();
+    var m = MemBlobStore.init(a);
+    defer m.deinit();
+    const inputs = [_]DeployInput{
+        .{ .path = "index.mjs", .kind = .handler, .bytes = "a" },
+        .{ .path = "index.mjs", .kind = .handler, .bytes = "b" },
+    };
+    try testing.expectError(Error.InvalidManifest, stageDeployment(a, b.blobStore(), m.blobStore(), passthroughCompile, null, &inputs));
+}
+
+test "stageDeployment: rejects path traversal" {
+    const a = testing.allocator;
+    var b = MemBlobStore.init(a);
+    defer b.deinit();
+    var m = MemBlobStore.init(a);
+    defer m.deinit();
+    const inputs = [_]DeployInput{.{ .path = "../etc/passwd", .kind = .static, .bytes = "x" }};
+    try testing.expectError(Error.InvalidPath, stageDeployment(a, b.blobStore(), m.blobStore(), passthroughCompile, null, &inputs));
 }
