@@ -2041,6 +2041,29 @@ fn evalSnippet(ctx: *c.JSContext, name: [*:0]const u8, source: []const u8) void 
 /// globals populated from the incoming request. Called AFTER
 /// `Snapshot.restore` on every request. Cheap — just a handful of
 /// `JS_SetPropertyStr` calls.
+/// Lift a held chain's `next({ctx})` payload onto `request.ctx`, given a
+/// synthesized `{"ctx":<ctx_json>}` body. The continuation resumes whose
+/// `Request.body` IS that envelope (`.ws_message`, `.disconnect`) share
+/// this so every held-connection `on*` handler reads ctx the same way the
+/// fetch-resume path does. NUL-terminate before `JS_ParseJSON` (quickjs
+/// requires it); a non-JSON / ctx-less body simply leaves `request.ctx`
+/// unset. The kinds that REPLACE `request.body` (bound fetch, inbound
+/// chunk) lift their ctx inline before the swap instead.
+fn liftThreadedCtx(ctx: *c.JSContext, req_obj: c.JSValue, body: []const u8, allocator: std.mem.Allocator) void {
+    if (body.len == 0) return;
+    const buf = allocator.allocSentinel(u8, body.len, 0) catch return;
+    defer allocator.free(buf);
+    @memcpy(buf, body);
+    const parsed = c.JS_ParseJSON(ctx, buf.ptr, body.len, "<chain ctx>");
+    if (c.JS_IsException(parsed)) {
+        _ = c.JS_GetException(ctx); // clear; leave request.ctx unset
+        return;
+    }
+    defer c.JS_FreeValue(ctx, parsed);
+    // Setter consumes the ctx_val reference.
+    _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", c.JS_GetPropertyStr(ctx, parsed, "ctx"));
+}
+
 pub fn installRequest(
     ctx: *c.JSContext,
     state: *DispatchState,
@@ -2408,6 +2431,25 @@ pub fn installRequest(
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "data", data_val);
     }
 
+    // Endpoint A — uniform ctx threading (decisions.md, supersedes §4.7's
+    // ctx-envelope): every activation that is a continuation of a prior
+    // `next({ctx})` reads that payload as `request.ctx`. These kinds carry
+    // it as the synthesized `{"ctx":<ctx_json>}` body (the WS / SSE / wake
+    // / continuation resume paths all build that envelope), so lift it once
+    // here. The kinds that REPLACE `request.body` with their own bytes
+    // (`fetch_chunk`, `inbound_chunk`) lift inline before the swap; the
+    // result-bearing `send_callback` lifts in its hoist below. `request.ctx`
+    // is simply undefined on the first activation of a chain (no prior
+    // `next`).
+    if (request.activation == .ws_message or
+        request.activation == .disconnect or
+        request.activation == .kv_wake or
+        request.activation == .wake_batch or
+        request.activation == .timer)
+    {
+        liftThreadedCtx(ctx, req_obj, request.body, state.allocator);
+    }
+
     // gap 2.4 / inbound-chunk-plan: streaming inbound body chunk.
     // `Request.body` carries the raw chunk; re-surface it as a
     // Uint8Array (chunks are arbitrary bytes — same posture as the
@@ -2479,21 +2521,21 @@ pub fn installRequest(
         }
     }
 
-    // ── Unified effect-result surface (handler-shape.md §7) ──
-    // A customer `on_result` hop (`webhook.send` / `blob.put` /
-    // `retry.send`) arrives as `.send_callback` with
-    // `request.body = {"ctx":{result, context}}`. Present it like a
-    // bound-fetch FINAL so EVERY effect-result resume reads the same
-    // way: `request.body` = the response bytes, top-level
-    // `request.status`/`.ok`/`.done`, and the delivery metadata + echoed
-    // `context` on `request.ctx`. There is no `request.result` — it
-    // never existed in any path (decisions.md §3.x; this deletes the
-    // last doc fiction). Two non-matching send_callback shapes are
-    // skipped deliberately:
-    //   • §6.4 held-sync resume — body is `{ctx, outcome}` (top-level
-    //     `outcome`); its surface is the 2-arg `onResult(ctx, outcome)`.
-    //   • webhook_onresult's own self-hops — `{ctx:{id,…}}`, no
-    //     `result` object, so the discriminator below misses them.
+    // ── Unified effect-result surface (handler-shape.md §7, Endpoint A) ──
+    // A customer `on_result` hop (`webhook.send` / `blob.put` / `retry.send`)
+    // AND a §6.4 held-sync resume both arrive as `.send_callback` with
+    // `request.body = {"ctx":{result, context}}` — the held-sync producer
+    // (worker_drain.resumeContinuation) now wraps the outcome into the SAME
+    // shape, so there is ONE surface. Present it exactly like a bound-fetch
+    // FINAL: `request.body` = the response bytes, top-level
+    // `request.status`/`.ok`/`.done`; the THREADED ctx (the echoed `context`
+    // for an on_result hop, the held handler's `next({ctx})` for held-sync)
+    // on `request.ctx`; and the per-delivery metadata that is NOT part of the
+    // universal response surface (`attempts`/`error`/`id`/`headers` for
+    // webhook, `hash` for blob) on `request.activation.*` — "why/how this
+    // activation fired." This keeps the one rule whole: `request.ctx` = what
+    // you threaded, `request.body`/`.status` = the result, `request.activation`
+    // = metadata. There is no `request.result`.
     if (request.activation == .send_callback and request.body.len > 0) hoist: {
         const buf = state.allocator.allocSentinel(u8, request.body.len, 0) catch break :hoist;
         defer state.allocator.free(buf);
@@ -2505,45 +2547,36 @@ pub fn installRequest(
         }
         defer c.JS_FreeValue(ctx, parsed);
 
-        // Held-sync resume carries a top-level `outcome` — skip it.
-        const outcome = c.JS_GetPropertyStr(ctx, parsed, "outcome");
-        const is_heldsync = !c.JS_IsUndefined(outcome) and !c.JS_IsNull(outcome);
-        c.JS_FreeValue(ctx, outcome);
-        if (is_heldsync) break :hoist;
-
         const cb_ctx = c.JS_GetPropertyStr(ctx, parsed, "ctx");
         defer c.JS_FreeValue(ctx, cb_ctx);
         if (!c.JS_IsObject(cb_ctx)) break :hoist;
         const result = c.JS_GetPropertyStr(ctx, cb_ctx, "result");
         defer c.JS_FreeValue(ctx, result);
         if (!c.JS_IsObject(result)) break :hoist; // not a result delivery
+                                                  // (webhook_onresult self-hops)
 
-        // Hoist the response onto the bound-style surface. `body` is a
-        // setter-less read-taping accessor by default — DEFINE replaces
-        // it (a plain [[Set]] would silently no-op); the bytes are
-        // derived from the (taped) fetch response, so no extra taping.
-        // JS_GetPropertyStr returns an owned ref that Set/Define steals.
+        // Result → the universal response surface. `body` is a setter-less
+        // read-taping accessor by default — DEFINE replaces it (a plain
+        // [[Set]] no-ops); the bytes derive from the taped fetch response,
+        // so no extra taping. JS_GetPropertyStr returns an owned ref that
+        // Set/Define steals.
         _ = c.JS_DefinePropertyValueStr(ctx, req_obj, "body", c.JS_GetPropertyStr(ctx, result, "body"), c.JS_PROP_C_W_E);
         _ = c.JS_SetPropertyStr(ctx, req_obj, "status", c.JS_GetPropertyStr(ctx, result, "status"));
         _ = c.JS_SetPropertyStr(ctx, req_obj, "ok", c.JS_GetPropertyStr(ctx, result, "ok"));
         _ = c.JS_SetPropertyStr(ctx, req_obj, "done", js_true);
         _ = c.JS_SetPropertyStr(ctx, req_obj, "body_truncated", c.JS_GetPropertyStr(ctx, result, "body_truncated"));
 
-        // request.ctx = the delivery envelope: the echoed customer
-        // `context` plus the per-path metadata that isn't part of the
-        // universal response surface — webhook's `attempts`/`error`/
-        // `id`/`headers`, blob's `hash`. Mirrors the bound path lifting
-        // its threaded ctx to request.ctx. Fields absent for a given
-        // path (blob has no attempts; webhook has no hash) read
-        // undefined.
-        const out_ctx = c.JS_NewObject(ctx);
-        _ = c.JS_SetPropertyStr(ctx, out_ctx, "context", c.JS_GetPropertyStr(ctx, cb_ctx, "context"));
-        _ = c.JS_SetPropertyStr(ctx, out_ctx, "attempts", c.JS_GetPropertyStr(ctx, result, "attempts"));
-        _ = c.JS_SetPropertyStr(ctx, out_ctx, "error", c.JS_GetPropertyStr(ctx, result, "error"));
-        _ = c.JS_SetPropertyStr(ctx, out_ctx, "id", c.JS_GetPropertyStr(ctx, result, "id"));
-        _ = c.JS_SetPropertyStr(ctx, out_ctx, "headers", c.JS_GetPropertyStr(ctx, result, "headers"));
-        _ = c.JS_SetPropertyStr(ctx, out_ctx, "hash", c.JS_GetPropertyStr(ctx, result, "hash"));
-        _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", out_ctx);
+        // request.ctx = the bare threaded value (what the customer passed
+        // as `context:` / `next({ctx})`) — NOT an envelope.
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", c.JS_GetPropertyStr(ctx, cb_ctx, "context"));
+
+        // Delivery metadata → request.activation.* (absent fields read
+        // undefined: blob has no attempts/error; webhook has no hash).
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "attempts", c.JS_GetPropertyStr(ctx, result, "attempts"));
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "error", c.JS_GetPropertyStr(ctx, result, "error"));
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "id", c.JS_GetPropertyStr(ctx, result, "id"));
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "headers", c.JS_GetPropertyStr(ctx, result, "headers"));
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "hash", c.JS_GetPropertyStr(ctx, result, "hash"));
     }
 
     _ = c.JS_SetPropertyStr(ctx, req_obj, "activation", activation_obj);

@@ -65,16 +65,16 @@ CBFIRE_SRC = r'''export function fireDelayed(url, tag, delay_ms) {
 }'''
 
 CBRESULT_SRC = r'''export default function () {
-    // Unified flattened on_result surface (handler-shape §7).
-    const ctx = request.ctx || {};
+    // Unified flattened on_result surface (handler-shape §7, Endpoint A).
+    const a = request.activation || {};
     const record = {
         ok: request.ok,
         status: request.status,
         body: request.body,
-        context: ctx.context || null,
-        error: ctx.error || null,
+        context: request.ctx ?? null,
+        error: a.error || null,
     };
-    kv.set("cb/result/" + ctx.id, JSON.stringify(record));
+    kv.set("cb/result/" + a.id, JSON.stringify(record));
 }'''
 
 ACME_INDEX_SRC = 'export function handler() { return "acme-ready"; }\n'

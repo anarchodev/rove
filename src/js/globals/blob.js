@@ -65,9 +65,9 @@ globalThis.blob = {
    *   returned on direct GETs of the object.
    * @param {string} [opts.on_result] - Module path receiving the
    *   terminal result on the unified flattened surface (handler-shape
-   *   §7): `request.ok` / `request.status` top-level, the stored `hash`
-   *   + echoed `context` on `request.ctx` (`request.ctx.hash`,
-   *   `request.ctx.context`).
+   *   §7): `request.ok` / `request.status` top-level, the echoed
+   *   `context` (the threaded value) IS `request.ctx`, and the stored
+   *   `hash` is on `request.activation.hash`.
    * @param {*} [opts.context] - Opaque payload echoed to `on_result`.
    * @returns {string} The object's sha256 hash (64 hex chars).
    *

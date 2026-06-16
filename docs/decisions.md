@@ -465,6 +465,11 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   auditable choice instead).
 
 ### 4.7 One effect-result surface — flattened, no `request.result`
+- **Partially superseded by §4.9** (2026-06-15): the flatten-the-result decision
+  stands, but where the *threaded ctx* and *delivery metadata* live changed —
+  §4.7 put both on `request.ctx` (as `{context, attempts, error, id, headers,
+  hash}`); §4.9 makes `request.ctx` the **bare** threaded value and moves the
+  metadata to `request.activation.*`. Read §4.9 for the current contract.
 - **Decision** (2026-06-15): every effect-result resume — a bound `on.fetch` /
   `blob.get` (held chain) **and** a connectionless `webhook.send` / `blob.put` /
   `retry` `on_result` callback — presents the result the **same** way: the
@@ -494,6 +499,53 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   a `result` indirection the bound path never had). Verified e2e by the webhook,
   webhook-recovery (durable wake), and blob+segments smokes + dispatcher unit
   tests.
+
+### 4.9 One ctx convention — `request.ctx` for every `next()` continuation (Endpoint A)
+- **Decision** (2026-06-15): there is **one** way an `on*` handler reads the state
+  threaded into it. Every activation that is a continuation of a prior
+  `next({ctx})` on the same chain reads that payload as **`request.ctx`**;
+  results (effect responses, callee outcomes) flatten onto **`request.body`** +
+  top-level **`request.status`/`.ok`/`.done`**; and per-activation metadata
+  (delivery `attempts`/`error`/`id`/`headers`, blob `hash`, the wake `wakes[]`)
+  lives on **`request.activation.*`**. The single rule: **`request.ctx` = what you
+  threaded · `request.body`/`.status` = the result · `request.activation` = why/how
+  this activation fired.** `request.ctx` is simply `undefined` on the first
+  activation of a chain (nothing threaded yet) and on a standalone scheduled
+  `durable_wake` (it carries `request.activation.msg`, not a threaded ctx).
+- **Why**: the surface had drifted into **three** shapes for the same idea. (1)
+  `request.ctx` for fetch resumes / `onChunk` / `send_callback`. (2) A **positional
+  argument** `onWake(ctx)` for wakes — and only over WS; the SSE wake path passed
+  a `{"ctx":…}` body that nothing lifted, so `onWake(ctx)` silently got `undefined`
+  there. (3) A positional `onResult(ctx, outcome)` for the §13/§6.4 held-sync
+  resume, with the result as a second arg. Three spellings of "the runtime handed
+  me something" is the converge-to-one-pattern smell; it also blocked threading
+  transient per-frame state through a held WS `onMessage` without a kv round-trip
+  (the browser-agent screenshot bounce surfaced it). We picked `request.ctx`
+  (Endpoint A) over positional-args-everywhere because the handler model is
+  no-arg functions reading `request`/`response` globals, the first activation has
+  no ctx to pass (an always-`undefined` first param is worse than `request.ctx`
+  reading `undefined`), and `onResult` shows positional args aren't even uniform
+  (sometimes two).
+- **Mechanism**: `installRequest` (`globals.zig`) lifts the `next({ctx})` payload
+  from the synthesized `{"ctx":…}` body to `request.ctx` for `ws_message` /
+  `disconnect` / `kv_wake` / `wake_batch` / `timer` (the kinds that replace
+  `request.body` — bound fetch, inbound chunk — lift inline first). The wake +
+  held-sync resume paths (`worker_ws.resumeWakeChainWs`,
+  `worker_drain.resumeContinuation`) stopped passing positional `[ctx]` /
+  `[ctx, outcome]` and now build the same `{"ctx":…}` body envelope; a held-sync
+  outcome is wrapped into the **same** `{"ctx":{result, context}}` shape an
+  `on_result` hop uses (the held handler's threaded ctx fills `context`), so the
+  one `send_callback` hoist serves both — flattening `result` → `request.body`/
+  `.status`, `context` → `request.ctx`, metadata → `request.activation.*`.
+- **Migrated** (pre-real-user, no back-compat): `onWake(ctx)` → `onWake()` reading
+  `request.ctx`; held-sync `onResult(ctx, outcome)` → `onResult()` reading
+  `request.body`/`.ok`/`request.ctx`; the on_result shims (`oidc._event`,
+  `segments_onsealed`) + examples + smokes moved metadata reads from `request.ctx.*`
+  to `request.activation.*`. Verified e2e by the heldsync (+concurrent), webhook,
+  webhook-recovery, blob (+segments), on_kv, on_timer, ws-wake, and browser-agent
+  smokes + dispatcher unit tests. **Note**: `blob.seal`/`blob.receive`'s
+  `request.ctx.hash` is a *threaded* ctx (the seal/receive `next({hash})`), not
+  delivery metadata — it stays on `request.ctx`.
 
 ### 4.8 Browser-agent surface (`browser.*`) — same-origin, vendor-neutral, structural-by-default
 - **Decision** ("a Playwright for LLMs", 2026-06-15; `handler-shape.md` §5.9,

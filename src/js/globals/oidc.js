@@ -744,17 +744,19 @@ class OIDCRelyingParty {
   // `{ok, status, body, context, ...}` event the OIDC RP's
   // `completeToken` / `completeJwks` expect.
   _event() {
-    const ctx = request.ctx || {};
+    // Endpoint A: result flattened on `request.*`; delivery metadata on
+    // `request.activation.*`; `request.ctx` IS the echoed customer context.
+    const a = request.activation || {};
     return {
       ok: request.ok,
       status: request.status,
       body: request.body,
       body_truncated: request.body_truncated,
-      headers: ctx.headers || {},
-      attempts: ctx.attempts,
-      error: ctx.error,
-      id: ctx.id,
-      context: ctx.context,
+      headers: a.headers || {},
+      attempts: a.attempts,
+      error: a.error,
+      id: a.id,
+      context: request.ctx,
     };
   }
 

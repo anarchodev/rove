@@ -59,17 +59,18 @@ CBFIRE_SRC = '''export function fire(url, tag) {
 }'''
 
 CBRESULT_SRC = '''export default function () {
-    // Unified flattened on_result surface (handler-shape §7): response
-    // on request.body/.status/.ok, delivery metadata + context on request.ctx.
-    const ctx = request.ctx || {};
+    // Unified flattened on_result surface (handler-shape §7, Endpoint A):
+    // response on request.body/.status/.ok, echoed context IS request.ctx,
+    // delivery metadata on request.activation.*.
+    const a = request.activation || {};
     const record = {
         ok: request.ok,
         status: request.status,
         body: request.body,
-        context: ctx.context || null,
-        error: ctx.error || null,
+        context: request.ctx ?? null,
+        error: a.error || null,
     };
-    kv.set("cb/result/" + ctx.id, JSON.stringify(record));
+    kv.set("cb/result/" + a.id, JSON.stringify(record));
 }'''
 
 ACME_INDEX_SRC = 'export function handler() { return "acme-ready"; }\n'
