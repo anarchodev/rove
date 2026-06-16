@@ -7,8 +7,8 @@
             .hash = "arenajs-0.1.0-QYKxaXfpKQBAGWB9a0vlIjcksniFgJ2ZlsskOBvaPlvH",
         },
         .kvexp = .{
-            .url = "git+https://github.com/anarchodev/kvexp#c50762326f061c23b7035f89b2ec81fe5c2f8c88",
-            .hash = "kvexp-0.1.0-1hj5RAadBAAeVQom02FO0Dv1GWfz_uiDO-RZeXMTnYMS",
+            .url = "git+https://github.com/anarchodev/kvexp#5492725ecf1a4f6d156f33f0f1ea108474928910",
+            .hash = "kvexp-0.1.0-1hj5REGrBADks96RasHWMf0ZjwkxkO37RqpRB58PBxnl",
         },
         .raft_rs_zig = .{
             .url = "git+https://github.com/anarchodev/raft-rs-zig#e07dfddcb2dca52ac67cc7342769b9c22a9029c9",

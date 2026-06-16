@@ -40,7 +40,8 @@ HANDLER_SRC = """\
 export function handler() {
     if (request.method === "POST") {
         const body = JSON.parse(request.body || "{}");
-        kv.set("cc/value", body.value ?? "");
+        if (body.del) { kv.delete(body.del); response.status = 204; return ""; }
+        kv.set(body.key ?? "cc/value", body.value ?? "");
         response.status = 204;
         return "";
     }
@@ -50,6 +51,7 @@ export function handler() {
 """
 
 KEY = "cc/value"
+PHANTOM = "cc/phantom"
 SECRET = ["-H", f"X-Rewind-Move-Secret: {MOVE_SECRET}"]
 
 
@@ -131,9 +133,11 @@ def main() -> int:
             check("deploy", False, str(e))
             return 1
 
-        print("step 2: seed; confirm 3 voters")
+        print("step 2: seed cc/value + cc/phantom; confirm 3 voters hold the phantom")
         c.wait_for_handler("acme", "/?fn=handler", want_body="value:none")
         c.request_retry("acme", "/?fn=handler", method="POST", data='{"value":"seed"}', want_status=204)
+        c.request_retry("acme", "/?fn=handler", method="POST",
+                        data=f'{{"key":"{PHANTOM}","value":"present"}}', want_status=204)
         cs = confstate(lead0)
         check("3 voters at start", cs is not None and len(cs["voters"]) == 3, f"cs={cs}")
 
@@ -145,13 +149,19 @@ def main() -> int:
         check("demote → 204", confchange(lead, vnid, "demote") == 204)
         cs = wait_membership(lead, vnid, learner=True)
         check(f"node {vnid} is a learner", cs is not None and vnid in cs["learners"], f"cs={cs}")
+        check(f"victim holds {PHANTOM} before it dies",
+              c.admin_kv_get("acme", PHANTOM, node=victim).status == 200)
         c.stop_node(victim)
 
-        print("step 4: advance + compact the log well past the victim's frozen match")
+        print("step 4: advance + compact past the victim's match; DELETE the phantom")
         for i in range(150):
             c.request_retry("acme", "/?fn=handler", method="POST",
                             data=f'{{"value":"adv-{i}"}}', want_status=204, deadline_s=10)
         latest = "adv-149"
+        # Delete a key the (stopped) victim still holds — it must NOT survive on
+        # the rejoined node, or the promoted-back voter diverges from the cluster.
+        c.request_retry("acme", "/?fn=handler", method="POST",
+                        data=f'{{"del":"{PHANTOM}"}}', want_status=204, deadline_s=10)
         # Let several durabilize+compact cycles (500ms each) truncate below the
         # victim's stale match, so on restart it is genuinely below the floor.
         time.sleep(8.0)
@@ -209,6 +219,13 @@ def main() -> int:
             time.sleep(0.5)
         check("⭐ fresh write replicated to the rejoined voter", caught,
               "the below-floor learner is a productive voter again")
+
+        # ⭐ The phantom key deleted on the cluster while the victim was gone must
+        # NOT survive the replace-load — else the rejoined voter diverges.
+        pg = c.admin_kv_get("acme", PHANTOM, node=victim)
+        gone = pg.status != 200 or not pg.body or "present" not in pg.body
+        check("⭐ source-deleted phantom key is GONE on the rejoined node (no divergence)",
+              gone, f"got {pg.status} {pg.body!r}")
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
