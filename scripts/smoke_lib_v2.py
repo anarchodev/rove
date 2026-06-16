@@ -56,6 +56,14 @@ MOVE_SECRET = "rewindmovesecretpadding0123456789abcdef0"
 JWT_SECRET_HEX = "a" * 64  # LOOP46_SERVICES_JWT_SECRET
 PUBLIC_SUFFIX = "localhost"
 
+# Base dir for node/cp/files/log DATA dirs (the raft WAL lives here). Defaults to
+# /tmp — which on most Linux distros is TMPFS (RAM), making the WAL fsync a no-op.
+# That's fine (fast) for functional smokes, but USELESS for an fsync-sensitive
+# soak: a too-tight election timeout only flakes when fsync actually STALLS on
+# real disk. Set V2_SMOKE_DATA_BASE to a real-disk path (e.g. under $HOME) so the
+# WAL fsync hits the NVMe and the pause tail is real.
+_DATA_BASE = os.environ.get("V2_SMOKE_DATA_BASE", "/tmp")
+
 # ── fn-RPC dispatch recipe ──────────────────────────────────────────────
 # The platform invokes only the activation's conventional export
 # (decisions.md §4.5) — `?fn=`/`{fn,args}` routing is handler JS. This is
@@ -234,10 +242,10 @@ class V2Cluster:
             files_port=files_port or (base + 52),
             log_port=base + 53,
             s3_prefix=f"v2smoke-{tag}-{pid}/",
-            data_dirs=[Path(f"/tmp/v2smoke-{tag}-n{i}-{pid}") for i in range(nodes)],
-            cp_data_dir=Path(f"/tmp/v2smoke-{tag}-cp-{pid}"),
-            files_data_dir=Path(f"/tmp/v2smoke-{tag}-files-{pid}"),
-            log_data_dir=Path(f"/tmp/v2smoke-{tag}-log-{pid}"),
+            data_dirs=[Path(f"{_DATA_BASE}/v2smoke-{tag}-n{i}-{pid}") for i in range(nodes)],
+            cp_data_dir=Path(f"{_DATA_BASE}/v2smoke-{tag}-cp-{pid}"),
+            files_data_dir=Path(f"{_DATA_BASE}/v2smoke-{tag}-files-{pid}"),
+            log_data_dir=Path(f"{_DATA_BASE}/v2smoke-{tag}-log-{pid}"),
             unsafe_outbound=unsafe_outbound,
         )
         for d in (*c.data_dirs, c.cp_data_dir, c.files_data_dir):
