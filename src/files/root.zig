@@ -676,7 +676,7 @@ pub fn compileAndStage(
 /// reject overlapping conditional writes for the same key — OVH OS in
 /// particular). Retries up to ~1s on PUT errors so the loser of a race
 /// waits for the winner's write to land + become visible via exists().
-fn putBlobIfMissingTo(blob: BlobStore, key: []const u8, bytes: []const u8) Error!void {
+pub fn putBlobIfMissingTo(blob: BlobStore, key: []const u8, bytes: []const u8) Error!void {
     if (blob.exists(key) catch false) return;
     var attempt: u8 = 0;
     while (attempt < 6) : (attempt += 1) {

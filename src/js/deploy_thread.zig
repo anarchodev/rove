@@ -94,19 +94,31 @@ pub const DeployThread = struct {
         /// the held chain on the CHAIN tenant (the `platform.compile`
         /// primitive). No manifest — the JS handler stamps it.
         compile_batch,
+        /// Deferred cross-tenant content-addressed blob PUT into the SCOPE
+        /// tenant's `file-blobs` (`platform.scope(t).blob.put`). The hash
+        /// is returned to JS synchronously (derivable from the bytes); the
+        /// PUT rides here off the poll loop. Fire-and-forget (`key`=hash,
+        /// `payload`=bytes).
+        blob_put,
+        /// Deferred cross-tenant manifest PUT into the SCOPE tenant's
+        /// `deployments/` (`platform.scope(t).deploy.stampManifest`). The
+        /// dep_id is returned to JS synchronously (derivable from the
+        /// entries); the PUT rides here. Fire-and-forget (`key`=manifest
+        /// key, `payload`=manifest JSON).
+        manifest_put,
     };
 
     pub const Job = struct {
         compile_id: u64,
         kind: JobKind = .stage,
-        /// Owned copy of the target tenant id. For `compile_batch` this
-        /// is the SCOPE tenant (where source+bytecode blobs stage).
+        /// Owned copy of the target tenant id. For `compile_batch` /
+        /// `blob_put` / `manifest_put` this is the SCOPE tenant.
         tenant_id: []u8,
         /// Owned inputs — each `path` / `content_type` / `bytes` slice
         /// is an allocator-owned copy. Freed (with the slice itself)
-        /// by `freeJob` after the job runs.
-        inputs: []files_mod.DeployInput,
-        // ── compile_batch-only routing (empty `&.{}` for stage jobs) ──
+        /// by `freeJob` after the job runs. Empty for `*_put` jobs.
+        inputs: []files_mod.DeployInput = &.{},
+        // ── compile_batch-only routing (empty `&.{}` for other kinds) ──
         /// The tenant holding the bound chain (the issuing `__admin__`)
         /// — where the terminal event routes + the held socket resumes.
         /// Distinct from `tenant_id` (the scope). Owned.
@@ -118,6 +130,13 @@ pub const DeployThread = struct {
         /// Resume export override (`on.fetch`'s `to`); empty → the
         /// default (`onFetchResult`). Owned.
         name: []u8 = &.{},
+        // ── *_put-only payload (empty `&.{}` for other kinds) ──
+        /// blob_put: the content hash (file-blobs key). manifest_put: the
+        /// manifest key. Owned.
+        key: []u8 = &.{},
+        /// blob_put: the blob bytes. manifest_put: the manifest JSON.
+        /// Owned.
+        payload: []u8 = &.{},
     };
 
     /// A finished full-stage deploy. On success `status == 200` and
@@ -231,6 +250,8 @@ pub const DeployThread = struct {
                 switch (job.kind) {
                     .stage => self.putResult(job.compile_id, self.processStage(ctx_ptr, &job)),
                     .compile_batch => self.processCompileBatch(ctx_ptr, &job),
+                    .blob_put => self.processKeyedPut(&job, "file-blobs"),
+                    .manifest_put => self.processKeyedPut(&job, "deployments"),
                 }
                 freeJob(self.allocator, &job);
             }
@@ -281,6 +302,25 @@ pub const DeployThread = struct {
             };
         };
         return .{ .dep_id = dep_id, .status = 200 };
+    }
+
+    /// Deferred cross-tenant content-addressed PUT into the SCOPE tenant's
+    /// `{subdir}` backend (`blob_put` → file-blobs, `manifest_put` →
+    /// deployments). Fire-and-forget: the deterministic key/dep_id was
+    /// already returned to JS synchronously; this just lands the bytes off
+    /// the poll loop. Content-addressed, so a retry/redeploy is safe.
+    fn processKeyedPut(self: *DeployThread, job: *Job, subdir: []const u8) void {
+        var be = blob_mod.BlobBackend.openPerTenant(self.allocator, self.blob_cfg, job.tenant_id, subdir) catch |err| {
+            std.log.warn("deploy thread: {s} open {s}/{s} failed: {s}", .{ @tagName(job.kind), job.tenant_id, subdir, @errorName(err) });
+            return;
+        };
+        defer be.deinit();
+        // Idempotent skip-if-present (content-addressed) for file-blobs;
+        // manifests are dep_id-keyed (also content-addressed) so the same
+        // skip applies. Best-effort: a failed PUT logs; the deploy's
+        // release step is the customer's gate, not this.
+        files_mod.putBlobIfMissingTo(be.blobStore(), job.key, job.payload) catch |err|
+            std.log.warn("deploy thread: {s} PUT {s}/{s}/{s} failed: {s}", .{ @tagName(job.kind), job.tenant_id, subdir, job.key, @errorName(err) });
     }
 
     /// Compile + stage the batch into the SCOPE tenant, then emit ONE
@@ -416,10 +456,13 @@ fn freeJob(allocator: std.mem.Allocator, job: *DeployThread.Job) void {
     }
     allocator.free(job.inputs);
     allocator.free(job.tenant_id);
-    // compile_batch-only routing fields (empty `&.{}` for stage jobs).
+    // compile_batch-only routing fields (empty `&.{}` for other kinds).
     if (job.chain_tenant.len != 0) allocator.free(job.chain_tenant);
     if (job.fetch_id.len != 0) allocator.free(job.fetch_id);
     if (job.name.len != 0) allocator.free(job.name);
+    // *_put-only payload (empty `&.{}` for other kinds).
+    if (job.key.len != 0) allocator.free(job.key);
+    if (job.payload.len != 0) allocator.free(job.payload);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
