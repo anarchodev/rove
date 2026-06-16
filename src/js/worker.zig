@@ -195,23 +195,6 @@ pub const RaftWait = struct {
     deadline_ns: i64 = 0,
 };
 
-/// Per-entity park record for `/_system/deploy` (`docs/rewind-cli-plan.md`
-/// §4 — files-server dissolution). The handler hands the parsed bundle
-/// to the background `DeployThread`, stamps this component, and moves the
-/// request entity into `compile_pending`. `drainCompilePending` polls the
-/// thread's result map by `compile_id` each tick; on completion it stamps
-/// the staged HTTP response and ships it, on `deadline_ns` it reaps 504.
-///
-/// Unlike `RaftWait`, the response is NOT staged at park time — deploy
-/// doesn't know its `dep_id` until the compile/stage finishes, so the
-/// drain builds the response post-completion.
-pub const CompileWait = struct {
-    /// Worker-monotonic id matching the enqueued `DeployThread.Job`.
-    compile_id: u64 = 0,
-    /// Absolute `std.time.nanoTimestamp()` reap deadline.
-    deadline_ns: i64 = 0,
-};
-
 /// Per-entity park record for async serve-or-forward (`proxy_engine.zig`).
 /// When `resolveRequest` can't resolve a tenant locally and a control
 /// plane is configured, it stamps this component, submits a
@@ -1249,7 +1232,6 @@ pub fn Worker(comptime opts: Options) type {
     // stores.
     const merged_request_row = rove.Row(&.{
         RaftWait,
-        CompileWait,
         ForwardWait,
         BodyDurabilityWait,
         BodyInbound,
@@ -1357,24 +1339,16 @@ pub fn Worker(comptime opts: Options) type {
         /// `StreamRow` as `raft_pending_*` so `reg.move` preserves the
         /// h2 sid/session/headers the response needs.
         forward_pending: StreamColl,
-        /// `/_system/deploy` park (`docs/rewind-cli-plan.md` §4). A
-        /// deploy request parks here with a `CompileWait` while the
-        /// background `DeployThread` compiles + stages the bundle off
-        /// the poll loop; `drainCompilePending` walks this collection
-        /// each tick, matching the thread's result back to the parked
-        /// entity and moving it to `response_in`. Same `StreamRow` as
-        /// `raft_pending_*` so `reg.move` preserves the h2 sid/session
-        /// the response needs.
-        compile_pending: StreamColl,
-        /// Background compile+stage thread for `/_system/deploy`. Owns
-        /// its own QuickJS runtime (the poll-loop `compile_fn` is used
-        /// by `deployStarterTrampoline` — can't share one runtime
-        /// across threads). Null until `startDeployThread`; library /
-        /// test builds that never deploy leave it null.
+        /// Background compile/stage thread backing the `platform.*` deploy
+        /// primitives (`docs/rewind-cli-plan.md` §4). Owns its own QuickJS
+        /// runtime (the poll-loop `compile_fn` is used by
+        /// `deployStarterTrampoline` — can't share one runtime across
+        /// threads). Null until `startDeployThread`; library / test builds
+        /// that never deploy leave it null.
         deploy_thread: ?*deploy_thread_mod.DeployThread = null,
-        /// Worker-monotonic id stamped on each deploy job + its
-        /// `CompileWait`. Poll-loop only (no lock). Starts at 0;
-        /// pre-incremented so the first job is 1 (0 stays a sentinel).
+        /// Worker-monotonic id stamped on each `DeployThread.Job`
+        /// (`compile_batch` / `blob_put` / `manifest_put`). Poll-loop only
+        /// (no lock). Starts at 0; pre-incremented so the first job is 1.
         next_compile_id: u64 = 0,
         /// Slice 4-fetch-park: parked outbound-fetch chunk events
         /// (large chunks waiting on durability). Plain
@@ -1807,7 +1781,6 @@ pub fn Worker(comptime opts: Options) type {
                 .raft_pending_stream = try StreamColl.init(allocator),
                 .body_pending = try StreamColl.init(allocator),
                 .forward_pending = try StreamColl.init(allocator),
-                .compile_pending = try StreamColl.init(allocator),
                 .parked_continuations = try StreamColl.init(allocator),
                 .parked_units = try ParkedUnitColl.init(allocator),
                 .blob_sessions = try BlobSessionColl.init(allocator),
@@ -1860,7 +1833,6 @@ pub fn Worker(comptime opts: Options) type {
             errdefer self.raft_pending_stream.deinit();
             errdefer self.body_pending.deinit();
             errdefer self.forward_pending.deinit();
-            errdefer self.compile_pending.deinit();
             errdefer self.parked_continuations.deinit();
             errdefer self.parked_units.deinit();
             errdefer self.blob_sessions.deinit();
@@ -1872,7 +1844,6 @@ pub fn Worker(comptime opts: Options) type {
             reg.registerCollection(&self.raft_pending_stream);
             reg.registerCollection(&self.body_pending);
             reg.registerCollection(&self.forward_pending);
-            reg.registerCollection(&self.compile_pending);
             reg.registerCollection(&self.parked_continuations);
             reg.registerCollection(&self.parked_units);
             reg.registerCollection(&self.blob_sessions);
@@ -2119,7 +2090,6 @@ pub fn Worker(comptime opts: Options) type {
             self.raft_pending_stream.deinit();
             self.body_pending.deinit();
             self.forward_pending.deinit();
-            self.compile_pending.deinit();
             // Slice 4-fetch-park: drop any still-parked fetch
             // chunks at shutdown (best-effort, same lossy posture
             // as the log flusher's final drain). Each entry owns
@@ -3254,7 +3224,6 @@ pub const drainRaftPending = worker_drain.drainRaftPending;
 pub const drainForwardPending = worker_drain.drainForwardPending;
 pub const drainBodyPending = worker_drain.drainBodyPending;
 pub const drainFetchPendingDurability = worker_drain.drainFetchPendingDurability;
-pub const drainCompilePending = worker_drain.drainCompilePending;
 pub const resolveDeployment = worker_drain.resolveDeployment;
 pub const resumeBoundContinuation = worker_drain.resumeBoundContinuation;
 pub const drainPendingBoundResumes = worker_drain.drainPendingBoundResumes;

@@ -251,7 +251,6 @@ fn workerMain(args: *WorkerCtx) !void {
         try rjs.drainRequestReceiving(worker);
         try rjs.drainBodyPending(worker);
         try rjs.drainFetchPendingDurability(worker);
-        try rjs.drainCompilePending(worker);
         _ = try rjs.dispatchOnce(worker, &blocked_tenants);
         try rjs.drainRaftPending(worker);
         runPromotionHook(worker, args.worker_idx);

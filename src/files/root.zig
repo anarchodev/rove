@@ -507,8 +507,8 @@ pub const FileStore = struct {
 // ── Stateless deploy (no working-tree kv) ──────────────────────────────
 
 /// One file's bytes + metadata for a stateless deploy. The caller (the
-/// worker's `/_system/deploy` handler) supplies the raw bytes; there is
-/// no persistent working-tree index.
+/// worker's `DeployThread`, driven by the `platform.*` deploy primitives)
+/// supplies the raw bytes; there is no persistent working-tree index.
 pub const DeployInput = struct {
     path: []const u8,
     kind: Kind,
