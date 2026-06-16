@@ -1,8 +1,9 @@
-// Standing __admin__ deploy app (docs/rewind-cli-plan.md §4.1 (f)) — composes
-// a customer deploy entirely from platform.* primitives, no Zig deploy route.
-// This is what publish_tenant + the smoke harness POST bundles to; the Zig
-// /_system/deploy route then only bootstraps the system tenants (incl. THIS
-// app onto __admin__).
+// Standing __admin__ deploy app (docs/rewind-cli-plan.md §4) — composes a
+// customer deploy entirely from platform.* primitives, no Zig deploy route.
+// This is the ONE arbitrary-bundle deploy path: publish_tenant + the smoke
+// harness POST bundles HERE. This app itself is deployed from a baked copy by
+// `POST /_system/reset` (root-gated, no body — bootstrap + break-glass); reset
+// deploys ONLY this embedded bundle, never arbitrary input.
 //
 // Wire: POST (Host = the admin host), Authorization: Bearer <root token>, body
 //   { "tenant": "<id>",

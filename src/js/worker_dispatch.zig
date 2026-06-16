@@ -1103,8 +1103,6 @@ fn tryHandleSystem(
     // there is no global "admin or cap" pass.
     const required_cap: ?[]const u8 = if (std.mem.eql(u8, sys_rest, "release"))
         jwt.Cap.RELEASE
-    else if (std.mem.eql(u8, sys_rest, "deploy"))
-        jwt.Cap.DEPLOY
     else if (std.mem.eql(u8, sys_rest, "admin-kv"))
         jwt.Cap.ADMIN_KV
     else if (std.mem.startsWith(u8, sys_rest, "raft-snapshot/"))
@@ -1139,15 +1137,14 @@ fn tryHandleSystem(
         return true;
     }
 
-    // Compile + stage a bundle into the target tenant's own content-
-    // addressed blobs and stamp a deployment manifest
-    // (`docs/rewind-cli-plan.md` §4 — files-server dissolved into the
-    // worker). The compile + S3 PUTs run on the background DeployThread;
-    // this request PARKS in `compile_pending` and `drainCompilePending`
-    // ships the `{"dep_id":"…"}` response once staging finishes. Does
-    // NOT flip `_deploy/current` — that is a separate `/_system/release`.
-    if (std.mem.eql(u8, sys_rest, "deploy")) {
-        try handleDeploy(server, allocator, worker, ent, sid, sess, method, body, cors_origin);
+    // Bootstrap + break-glass (`docs/rewind-cli-plan.md` §4). Root-token
+    // gated, NO body: (re)deploy the BAKED `__admin__` deploy app and stamp
+    // `_deploy/current`, recovering a virgin or bricked control tenant. Every
+    // ARBITRARY deploy (the full admin, customers) goes THROUGH the deployed
+    // app — this route only ever deploys the embedded bundle, idempotently
+    // (content-addressed → same dep_id on re-run).
+    if (std.mem.eql(u8, sys_rest, "reset")) {
+        try handleReset(server, allocator, worker, ent, sid, sess, method, cors_origin);
         return true;
     }
 
@@ -1955,6 +1952,43 @@ fn handleRelease(
     defer ws_local.deinit();
     worker_mod.parkKvWakes(worker, seq, parsed.value.tenant_id, &ws_local, release_cmds) catch |perr|
         std.log.warn("release: parkKvWakes (tenant={s}) failed: {s}", .{ parsed.value.tenant_id, @errorName(perr) });
+}
+
+/// `POST /_system/reset` — bootstrap + break-glass (`docs/rewind-cli-plan.md`
+/// §4). Root-token gated, NO body. (Re)deploys the BAKED `__admin__` deploy app
+/// + stamps `_deploy/current` via `worker.deployBakedAdmin`. Synchronous (rare,
+/// operator-triggered) — runs inline on the poll loop. Returns
+/// `{"ok":true,"dep_id":"<016x>"}`; 503 if this node doesn't lead `__admin__`'s
+/// group (retry against the leader).
+fn handleReset(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    cors_origin: ?[]const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "POST")) {
+        try respb.setSystemResponse(server, ent, sid, sess, 405, "POST only\n", allocator, cors_origin, null);
+        return;
+    }
+    const dep_id = worker.deployBakedAdmin() catch |err| {
+        const status: u16 = switch (err) {
+            error.NotLeader, error.AdminNotInitialized => 503,
+            else => 500,
+        };
+        const msg = switch (err) {
+            error.NotLeader => "not leader of __admin__ group; retry against the leader\n",
+            error.AdminNotInitialized => "__admin__ tenant not initialized\n",
+            else => "reset failed\n",
+        };
+        try respb.setSystemResponse(server, ent, sid, sess, status, msg, allocator, cors_origin, null);
+        return;
+    };
+    const body = try std.fmt.allocPrint(allocator, "{{\"ok\":true,\"dep_id\":\"{x:0>16}\"}}\n", .{dep_id});
+    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, body, allocator, cors_origin, "application/json");
 }
 
 /// How long a parked `/_system/deploy` request waits for the background
