@@ -991,6 +991,16 @@ fn handleLoadReplace(
 /// KV state for `index` must already be loaded (v2-load-replace). After this the
 /// leader replicates the tail (> index) from its log; promote to a voter once
 /// caught up.
+///
+/// On the store watermark: this does NOT stamp the kvexp `lastAppliedRaftIdx` to
+/// `index`. It intentionally lags (the bundle load used `durabilize(0)`), and
+/// that is SAFE — raft recovers its applied index from the WAL compaction marker
+/// the snapshot installs, never from the store watermark (`group_raft_config`
+/// passes no `applied`; `durable_idx` only seeds rove's `slot.applied_idx`
+/// bookkeeping). A crash in the rejoin window therefore recovers cleanly: raft
+/// is at `index`, the store data ≤ index is durable from the bundle, and the
+/// watermark self-heals on the next applied write. Proven by the crash-in-window
+/// leg of `scripts/promote_back_smoke_v2.py` — keep it green if this changes.
 fn handleApplySnapshot(
     server: anytype,
     allocator: std.mem.Allocator,

@@ -205,6 +205,26 @@ def main() -> int:
         cs = wait_membership(lead, vnid, learner=False)
         check(f"node {vnid} is a voter again", cs is not None and vnid in cs["voters"], f"cs={cs}")
 
+        print("step 8b: ⭐ CRASH the victim in the rejoin window (before any heal write)")
+        # The raft baseline is in the WAL, the bundle data is in LMDB, but the
+        # store watermark may still be stale. Recovery must reconcile (raft drives
+        # applied from the WAL compaction marker, not the store watermark) — no
+        # applied>committed panic, no compacted-gap. Restart and confirm it's
+        # back as a voter member that still holds the bundle data.
+        # Confirm the victim itself persisted the promote first, so the crash
+        # lands AFTER the rejoin completed but BEFORE any healing write.
+        check("victim sees itself a voter pre-crash",
+              wait_membership(victim, vnid, learner=False, deadline_s=20.0) is not None)
+        c.stop_node(victim)
+        time.sleep(1.0)
+        c.start_node(victim)
+        cs = wait_membership(victim, vnid, learner=False, deadline_s=30.0)
+        check(f"node {vnid} recovered as a voter after a rejoin-window crash",
+              cs is not None and vnid in cs["voters"], f"cs={cs}")
+        rg = c.admin_kv_get("acme", KEY, node=victim)
+        check("recovered victim still holds the bundle data", rg.status == 200 and latest in rg.body,
+              f"got {rg.status} {rg.body!r}")
+
         print("step 9: ⭐ a FRESH write replicates to the rejoined voter")
         # Historical state came via the bundle; this proves the raft handshake —
         # the leader replicates a NEW entry (> baseline) and the victim applies it.
