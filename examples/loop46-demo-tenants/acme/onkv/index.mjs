@@ -26,11 +26,12 @@ export default function () {
     return next({ prefix });
 }
 
-// Resumed by a kv match. An `on.*` wake carries no callee outcome, so
-// `onWake(ctx)` runs with just the parked ctx; it re-reads authoritative
-// kv state ("go look" edge wake) and returns a terminal flushed to the
-// held socket, completing the one synchronous request.
-export function onWake(ctx) {
+// Resumed by a kv match. The parked `next({ctx})` rides `request.ctx`
+// (Endpoint A) — `onWake` re-reads authoritative kv state ("go look"
+// edge wake) and returns a terminal flushed to the held socket,
+// completing the one synchronous request.
+export function onWake() {
+    const ctx = request.ctx || {};
     const v = kv.get(ctx.prefix + "flag");
     return "woke:" + (v ?? "none");
 }

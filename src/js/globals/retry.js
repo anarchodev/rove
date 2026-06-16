@@ -30,7 +30,7 @@
 //   //   export default function () {
 //   //     const event = {
 //   //       ok: request.ok, status: request.status, body: request.body,
-//   //       error: request.ctx.error, context: request.ctx.context,
+//   //       error: request.activation.error, context: request.ctx,
 //   //     };
 //   //     if (retry.shouldRetry(event)) { retry.next(event); return; }
 //   //     const ctx = retry.stripContext(event);
@@ -85,7 +85,7 @@ function backoffMsFor(retry_state, next_attempt) {
  * export default function () {
  *   const event = {
  *     ok: request.ok, status: request.status, body: request.body,
- *     error: request.ctx.error, context: request.ctx.context,
+ *     error: request.activation.error, context: request.ctx,
  *   };
  *   if (retry.shouldRetry(event)) { retry.next(event); return; }
  *   const ctx = retry.stripContext(event);

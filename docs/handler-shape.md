@@ -604,22 +604,33 @@ rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
   `.query`, `.cookies`, `.ip`, `.unmaskedIp()`.
 - **`onChunk`:** `request.body` = THIS chunk; `request.done`;
   `request.chunkSeq` (from 0).
-- **Connection wakes / fetch resumes** (`on.fetch` / `blob.get`):
-  `request.ctx`, plus `request.body` (the response bytes — the whole
-  body for a non-streamed fetch, this chunk for a streamed one) with
-  `request.status` / `request.ok` / `request.done` / `request.fetchId`
-  at the **top level**; or `request.key` / `request.value` (`on.kv`).
-  There is **no `request.result`** — every effect result reads the same
-  flattened way (see the on_result note below).
+- **`next()` continuations — one ctx rule (`decisions.md §4.9`):** every
+  activation that exists because a prior activation called `next({ctx})`
+  reads that payload as **`request.ctx`** — `onMessage`, `onChunk`,
+  `onWake` (`on.kv`/`on.timer`), `onDisconnect`, a bound `on.fetch`/
+  `blob.get` resume, and an `on_result` callback, all the same way.
+  `request.ctx` is `undefined` on the **first** activation of a chain
+  (nothing threaded yet) and on a standalone scheduled `durable_wake`
+  (which carries `request.activation.msg`). `on.kv`/`on.timer` are edge
+  ("go look") wakes — they carry **no** matched key/value; `onWake`
+  re-reads authoritative `kv`, and which keys fired is on
+  `request.activation.wakes[]` if you need it.
+- **Fetch / effect results — one flattened surface:** a bound `on.fetch` /
+  `blob.get` resume **and** a `webhook.send` / `blob.put` / `retry`
+  `on_result` callback (and a §6.4 held-sync resume) present the result
+  identically — the response bytes on **`request.body`** (the whole body
+  for a non-streamed fetch, this chunk for a streamed one), with
+  `request.status` / `request.ok` / `request.done` (+ `request.fetchId` /
+  `request.chunkSeq` for fetch chunks) at the **top level**; the threaded
+  ctx / echoed `context` on **`request.ctx`** (bare); and per-delivery
+  metadata (`attempts`, `error`, `id`, `headers`, blob `hash`) on
+  **`request.activation.*`**. There is **no `request.result`**. (Exception:
+  `blob.seal`/`blob.receive` resume with the threaded `{hash, len}` on
+  `request.ctx` — that *is* the ctx you threaded, not delivery metadata.)
 - **Connectionless fires** (`onBoot`, `onSubscription`, a `cron`/
   `schedule` target): origin-specific fields (`deploymentId`,
   `request.activation.msg`, …) but **no** inbound HTTP `headers`/`body`,
-  and the connection verbs are inert (§2.4). A `webhook.send` /
-  `blob.put` **`on_result` callback** is the exception — it carries the
-  delivery result on the **same flattened surface** as a fetch resume:
-  `request.body` / `request.status` / `request.ok` / `request.done`,
-  with the echoed `context` + delivery metadata (`attempts`, `error`,
-  `id`, blob `hash`) on `request.ctx`.
+  and the connection verbs are inert (§2.4).
 
 ### 7.1 The request surface is read-recorded
 

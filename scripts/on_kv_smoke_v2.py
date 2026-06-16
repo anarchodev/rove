@@ -62,7 +62,8 @@ export default function () {
     return next({ prefix });
 }
 
-export function onWake(ctx) {
+export function onWake() {
+    const ctx = request.ctx || {};
     const v = kv.get(ctx.prefix + "flag");
     return "woke:" + (v ?? "none");
 }

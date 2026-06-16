@@ -62,8 +62,12 @@ HELDSYNC_SRC = r"""export default function () {
 }
 """
 
-ONRESULT_SRC = r"""export function onResult(ctx, outcome) {
-    if (!outcome.ok) {
+ONRESULT_SRC = r"""export function onResult() {
+    // Endpoint A: threaded ctx IS request.ctx; the webhook result is
+    // flattened on request.ok/.body/.status; delivery metadata (error)
+    // is on request.activation.*.
+    const ctx = request.ctx || {};
+    if (!request.ok) {
         if (ctx.retry_to && ctx.tries < 1) {
             webhook.send({
                 url: ctx.retry_to,
@@ -78,9 +82,9 @@ ONRESULT_SRC = r"""export function onResult(ctx, outcome) {
             });
         }
         response.status = 502;
-        return "heldsync upstream failed: " + (outcome.error || outcome.reason || outcome.status);
+        return "heldsync upstream failed: " + (request.activation.error || request.status);
     }
-    return "heldsync:" + ctx.tag + ":" + outcome.body;
+    return "heldsync:" + ctx.tag + ":" + request.body;
 }
 """
 

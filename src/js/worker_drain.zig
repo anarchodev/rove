@@ -1428,18 +1428,19 @@ fn resumeContinuation(
         break :blk if (sw.wake_to) |t| t else "onWake";
     } else cont_fn_name;
     const named: bool = wake or cont_fn_name != null;
-    const args_json: []const u8 = if (wake)
-        try std.fmt.allocPrint(allocator, "[{s}]", .{cont_ctx_json})
-    else if (cont_fn_name != null)
-        try std.fmt.allocPrint(allocator, "[{s},{s}]", .{ cont_ctx_json, outcome_json })
+    // Endpoint A (decisions.md): the resume's threaded ctx + (for a
+    // callback) the effect outcome ride the synthesized body envelope —
+    // `installRequest` lifts ctx → `request.ctx` and flattens a callback's
+    // `result` → `request.body`/`.status` (+ metadata on
+    // `request.activation.*`). NOT positional args. A wake has no outcome,
+    // so it carries the bare `{"ctx":…}`; a callback wraps the outcome into
+    // the SAME `{"ctx":{result, context}}` shape an `on_result` hop uses
+    // (the held handler's threaded ctx fills the `context` slot).
+    const body = if (wake)
+        try worker_streaming.synthCtxBody(allocator, cont_ctx_json)
     else
-        try allocator.dupe(u8, "[]");
-    defer allocator.free(args_json);
-    const body = if (named)
-        ""
-    else
-        try std.fmt.allocPrint(allocator, "{{\"ctx\":{s},\"outcome\":{s}}}", .{ cont_ctx_json, outcome_json });
-    defer if (!named) allocator.free(body);
+        try worker_streaming.synthResultBody(allocator, outcome_json, cont_ctx_json);
+    defer allocator.free(body);
     const spath = try std.fmt.allocPrint(allocator, "/{s}", .{path});
     defer allocator.free(spath);
 
@@ -1478,10 +1479,11 @@ fn resumeContinuation(
         .body = body,
         .query = null,
         // First-class resume target: the named export (wake_to /
-        // cont_fn_name) + its positional args. Null for the
-        // default-export form, whose payload rides `body` instead.
+        // cont_fn_name). Null → the default export. The threaded ctx +
+        // outcome ride `body` (Endpoint A); the resume export reads
+        // `request.ctx` / `request.body` — no positional args.
         .fn_override = if (named) resume_fn else null,
-        .fn_args_json = args_json,
+        .fn_args_json = "[]",
         // Inherit the chain id from the parking request so every tape row
         // of this chain shares one correlation_id; mark this activation as
         // a send-callback resume (streaming-handlers-plan §6) — or
@@ -1848,7 +1850,7 @@ pub fn resumeBoundFetchChain(
     // handler reads `request.body` for the chunk bytes from the
     // activation_fetch_bytes slot, not from request.body.
     const ctx_src: []const u8 = if (ev.ctx_json.len > 0) ev.ctx_json else "{}";
-    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{ctx_src}) catch return;
+    const body = worker_streaming.synthCtxBody(allocator, ctx_src) catch return;
     defer allocator.free(body);
     // First-class resume target (decisions.md §4.5) — no synthetic
     // `?fn=` query; the path stays the real module path.

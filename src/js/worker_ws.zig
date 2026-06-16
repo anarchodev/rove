@@ -442,7 +442,7 @@ fn fireWsMessage(
     defer p.deinit(allocator);
     const tc = p.dep.tc;
 
-    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json}) catch return;
+    const body = worker_streaming.synthCtxBody(allocator, chain_st.ctx_json) catch return;
     defer allocator.free(body);
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
     defer allocator.free(spath);
@@ -704,7 +704,7 @@ pub fn resumeBoundFetchChainWs(
 
     // The resumed export reads its chunk via the activation; `request.ctx`
     // carries the held chain's threaded ctx (same `{ctx}` body as fireWsMessage).
-    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json}) catch return;
+    const body = worker_streaming.synthCtxBody(allocator, chain_st.ctx_json) catch return;
     defer allocator.free(body);
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
     defer allocator.free(spath);
@@ -895,11 +895,13 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     defer p.deinit(allocator);
     const tc = p.dep.tc;
 
-    // Wake resume targets the named export with positional `[ctx]` — same
-    // request shape as resumeContinuation's wake arm (body stays empty).
+    // Wake resume targets the named export; the threaded ctx rides the
+    // `{"ctx":…}` body envelope (Endpoint A) — `installRequest` lifts it to
+    // `request.ctx`, so `onWake` reads `request.ctx` like every other
+    // continuation. No positional args.
     const resume_fn: []const u8 = if (wakes_st.wake_to) |t| t else "onWake";
-    const args_json = std.fmt.allocPrint(allocator, "[{s}]", .{chain_st.ctx_json}) catch return;
-    defer allocator.free(args_json);
+    const body = worker_streaming.synthCtxBody(allocator, chain_st.ctx_json) catch return;
+    defer allocator.free(body);
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
     defer allocator.free(spath);
 
@@ -924,9 +926,9 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     const request: Request = .{
         .method = "POST",
         .path = spath,
-        .body = "",
+        .body = body,
         .fn_override = resume_fn,
-        .fn_args_json = args_json,
+        .fn_args_json = "[]",
         .is_system_module = builtin_modules_mod.isBuiltinPath(path),
         .activation = .{ .wake_batch = .{} },
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
@@ -1131,7 +1133,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
     defer p.deinit(allocator);
     const tc = p.dep.tc;
 
-    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{chain_st.ctx_json}) catch return;
+    const body = worker_streaming.synthCtxBody(allocator, chain_st.ctx_json) catch return;
     defer allocator.free(body);
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
     defer allocator.free(spath);
