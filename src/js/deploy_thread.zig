@@ -147,6 +147,12 @@ pub const DeployThread = struct {
         /// Resume export override (`on.fetch`'s `to`); empty → the
         /// default (`onFetchResult`). Owned.
         name: []u8 = &.{},
+        /// compile_batch: the issue-time `ctx` (on.fetch's threaded ctx,
+        /// raw JSON) echoed back in the completion under `app` so the
+        /// handler can thread state across the compile re-entry (e.g. the
+        /// deploy app's `{target, statics}`). `"null"`/empty when absent.
+        /// Owned.
+        app_ctx: []u8 = &.{},
         // ── *_put-only payload (empty `&.{}` for other kinds) ──
         /// blob_put: the content hash (file-blobs key). manifest_put: the
         /// manifest key. Owned.
@@ -407,17 +413,20 @@ pub const DeployThread = struct {
         };
         defer a.free(compiled); // the CompiledFile slice (paths borrow `job.inputs`)
 
-        const ctx_json = buildResultsJson(a, compiled) catch
+        const ctx_json = buildResultsJson(a, compiled, job.app_ctx) catch
             return fail(self, router, job, 500, "out of memory");
         routeCompileEvent(router, a, job.fetch_id, job.chain_tenant, job.name, 200, true, ctx_json);
     }
 };
 
-/// Build the `ctx_json` payload for a successful compile batch:
-/// `{"ok":true,"results":[{"path","source_hex","bytecode_hex"},...]}`.
-/// Paths are pre-validated (lowercase/digits/`-_./`) so no JSON escaping
-/// is needed; hashes are hex. Caller owns the result.
-fn buildResultsJson(allocator: std.mem.Allocator, compiled: []const files_mod.CompiledFile) ![]u8 {
+/// Build the `ctx_json` payload (→ the resume export's `request.ctx`) for a
+/// successful compile batch:
+/// `{"ok":true,"results":[{"path","source_hex","bytecode_hex"},...],"app":<ctx>}`.
+/// `app` echoes the issue-time on.fetch `ctx` (raw JSON) so the handler can
+/// thread state across the compile re-entry (e.g. the deploy app's
+/// `{target, statics}`). Paths are pre-validated (no JSON escaping needed);
+/// hashes are hex. Caller owns the result.
+fn buildResultsJson(allocator: std.mem.Allocator, compiled: []const files_mod.CompiledFile, app_ctx: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
@@ -426,7 +435,10 @@ fn buildResultsJson(allocator: std.mem.Allocator, compiled: []const files_mod.Co
         if (i != 0) try w.writeByte(',');
         try w.print("{{\"path\":\"{s}\",\"source_hex\":\"{s}\",\"bytecode_hex\":\"{s}\"}}", .{ cf.path, &cf.source_hex, &cf.bytecode_hex });
     }
-    try w.writeAll("]}");
+    // Echo the threaded app ctx raw (it's already a JSON value; "null" when absent).
+    try w.writeAll("],\"app\":");
+    try w.writeAll(if (app_ctx.len == 0) "null" else app_ctx);
+    try w.writeAll("}");
     return buf.toOwnedSlice(allocator);
 }
 
@@ -504,6 +516,7 @@ fn freeJob(allocator: std.mem.Allocator, job: *DeployThread.Job) void {
     if (job.chain_tenant.len != 0) allocator.free(job.chain_tenant);
     if (job.fetch_id.len != 0) allocator.free(job.fetch_id);
     if (job.name.len != 0) allocator.free(job.name);
+    if (job.app_ctx.len != 0) allocator.free(job.app_ctx);
     // *_put-only payload (empty `&.{}` for other kinds).
     if (job.key.len != 0) allocator.free(job.key);
     if (job.payload.len != 0) allocator.free(job.payload);

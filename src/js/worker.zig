@@ -2884,6 +2884,20 @@ pub fn Worker(comptime opts: Options) type {
                 freeInputs(a, inputs, built);
                 return fail(router, a, &pf, 500, "out of memory");
             }) else &.{};
+            // Echo the on.fetch issue-time ctx back in the completion (under
+            // `app`) so the handler can thread state across the compile
+            // re-entry (the deploy app's {target, statics}).
+            const app_ctx_owned: []u8 = if (pf.ctx_json.len != 0 and !std.mem.eql(u8, pf.ctx_json, "null"))
+                (a.dupe(u8, pf.ctx_json) catch {
+                    a.free(scope_owned);
+                    a.free(chain_owned);
+                    a.free(fid_owned);
+                    if (name_owned.len != 0) a.free(name_owned);
+                    freeInputs(a, inputs, built);
+                    return fail(router, a, &pf, 500, "out of memory");
+                })
+            else
+                &.{};
 
             self.next_compile_id += 1;
             dt.enqueue(.{
@@ -2894,11 +2908,13 @@ pub fn Worker(comptime opts: Options) type {
                 .chain_tenant = chain_owned,
                 .fetch_id = fid_owned,
                 .name = name_owned,
+                .app_ctx = app_ctx_owned,
             }) catch {
                 a.free(scope_owned);
                 a.free(chain_owned);
                 a.free(fid_owned);
                 if (name_owned.len != 0) a.free(name_owned);
+                if (app_ctx_owned.len != 0) a.free(app_ctx_owned);
                 freeInputs(a, inputs, built);
                 return fail(router, a, &pf, 503, "deploy queue unavailable");
             };
