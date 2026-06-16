@@ -25,9 +25,13 @@
 //
 // Perception is structural by DEFAULT (DOM + geometry + occlusion) —
 // cheap, reliable, and enough to operate an app. Pixel screenshots are
-// an OPT-IN tier (getDisplayMedia) added separately for visual
-// diagnosis. The session id carried on every frame lets the brain
-// later correlate browser state with server-side replay (the "why").
+// an OPT-IN tier: the brain *requests* one (a `screenshot` action), and
+// only if the page was started with `screenshots: true` does the SDK
+// capture via getDisplayMedia (one browser consent prompt, the browser's
+// own "sharing" indicator). The frame rides back base64-encoded; the
+// handler stores it and shows it to the model. The session id carried on
+// every frame lets the brain later correlate browser state with
+// server-side replay (the "why").
 
 (function (root) {
     'use strict';
@@ -37,6 +41,8 @@
     const SNAPSHOT_MAX_ELEMENTS = 400;   // bound the frame size
     const TEXT_CAP = 240;                // cap any single text field
     const REF_ATTR = 'data-rove-ref';
+    const SHOT_MAX_WIDTH = 1280;         // downscale screenshots to bound bytes
+    const SHOT_QUALITY = 0.6;            // JPEG quality for screenshots
 
     class AgentClient {
         constructor(opts) {
@@ -47,6 +53,15 @@
             this._root = opts.captureRoot || document.body;
             this._confirm = opts.confirm || null;     // async (action) => bool
             this._onStatus = opts.onStatus || null;
+
+            // Opt-in pixel-screenshot tier. Off by default — when off, a
+            // `screenshot` action from the brain is refused without ever
+            // touching getDisplayMedia (no consent prompt). When on, the
+            // first capture prompts once and the stream is reused after.
+            this._screenshots = !!opts.screenshots;
+            this._shotMaxWidth = opts.screenshotMaxWidth || SHOT_MAX_WIDTH;
+            this._shotQuality = opts.screenshotQuality || SHOT_QUALITY;
+            this._display = null;          // { stream, video } once granted
 
             // A client-generated correlation id. The handler maps it to
             // the authoritative rove session; both flow on every frame
@@ -78,6 +93,7 @@
             this._closed = true;
             this._send({ t: 'bye', sid: this._sid, reason: reason || 'stopped' });
             if (this._ws) { try { this._ws.close(); } catch (_) {} this._ws = null; }
+            this._releaseDisplay();
             this._removeIndicator();
         }
 
@@ -154,10 +170,19 @@
         async _onAct(msg) {
             // Some ops are pure perception requests (no DOM mutation).
             if (msg.op === 'snapshot') {
-                this._sendSnapshot();
+                // Ack BEFORE the snapshot so the snapshot is the LAST frame:
+                // a handler that issues a bound fetch on it (e.g. feeding a
+                // requested screenshot to the brain) isn't disrupted by a
+                // trailing result frame reparking the chain. Mutating ops
+                // already follow this result-then-fresh-state order below.
                 this._send({ t: 'result', sid: this._sid, id: msg.id, ok: true });
+                this._sendSnapshot();
                 return;
             }
+            // Screenshot is perception too, but pixel-level and consent-gated;
+            // it replies with a `screenshot` frame carrying the image, not a
+            // bare `result` + snapshot.
+            if (msg.op === 'screenshot') return this._onScreenshot(msg);
             let ok = true, error = null;
             try {
                 this._execAction(msg);
@@ -186,6 +211,74 @@
                 approved = await this._defaultConfirm(action);
             }
             this._send({ t: 'confirm_result', sid: this._sid, id: msg.id, approved });
+        }
+
+        // ── Screenshots (opt-in, getDisplayMedia) ───────────────
+
+        async _onScreenshot(msg) {
+            if (!this._screenshots) {
+                // The brain asked for pixels but the customer never enabled
+                // the tier — refuse without prompting. (The handler also
+                // hides the tool when disabled; this is the belt-and-braces.)
+                this._send({ t: 'screenshot', sid: this._sid, id: msg.id,
+                             ok: false, error: 'screenshots not enabled' });
+                return;
+            }
+            try {
+                const shot = await this._capture();
+                this._setStatus('📸 shared a screenshot');
+                this._send({ t: 'screenshot', sid: this._sid, id: msg.id,
+                             ok: true, mime: shot.mime, data: shot.data });
+            } catch (err) {
+                this._send({ t: 'screenshot', sid: this._sid, id: msg.id,
+                             ok: false, error: String(err && err.message || err) });
+            }
+        }
+
+        // Capture one downscaled JPEG frame of the page. The first call
+        // prompts for screen-share consent (getDisplayMedia) and keeps the
+        // stream; later calls reuse it, so the agent can take several shots
+        // after a single grant.
+        async _capture() {
+            const md = root.navigator && root.navigator.mediaDevices;
+            if (!md || !md.getDisplayMedia)
+                throw new Error('getDisplayMedia unsupported in this browser');
+            if (!this._display || !this._display.stream.active) {
+                const stream = await md.getDisplayMedia({
+                    video: { displaySurface: 'browser' }, audio: false,
+                });
+                const video = document.createElement('video');
+                video.muted = true;
+                video.playsInline = true;
+                video.srcObject = stream;
+                await video.play();
+                const track = stream.getVideoTracks()[0];
+                // If the user ends sharing via the browser UI, drop the
+                // stream so the next shot re-prompts rather than erroring.
+                if (track) track.addEventListener('ended', () => { this._display = null; });
+                this._display = { stream, video };
+            }
+            const video = this._display.video;
+            if (!video.videoWidth) await new Promise((r) => setTimeout(r, 120));
+            const vw = video.videoWidth || innerWidth;
+            const vh = video.videoHeight || innerHeight;
+            const scale = Math.min(1, this._shotMaxWidth / vw);
+            const cw = Math.max(1, Math.round(vw * scale));
+            const ch = Math.max(1, Math.round(vh * scale));
+            const canvas = document.createElement('canvas');
+            canvas.width = cw;
+            canvas.height = ch;
+            canvas.getContext('2d').drawImage(video, 0, 0, cw, ch);
+            const dataUrl = canvas.toDataURL('image/jpeg', this._shotQuality);
+            return { mime: 'image/jpeg', data: dataUrl.slice(dataUrl.indexOf(',') + 1) };
+        }
+
+        _releaseDisplay() {
+            if (this._display && this._display.stream) {
+                try { this._display.stream.getTracks().forEach((t) => t.stop()); }
+                catch (_) {}
+            }
+            this._display = null;
         }
 
         // ── Actions (synthetic events, same-origin) ─────────────

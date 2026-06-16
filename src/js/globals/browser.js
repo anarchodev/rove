@@ -16,8 +16,14 @@
 // and the handler only ever talks to its own connections.
 //
 // Protocol (must match web/rove-agent.js):
-//   page → handler : hello | snapshot | result | confirm_result | bye
+//   page → handler : hello | snapshot | result | screenshot | confirm_result | bye
 //   handler → page : act | status | confirm | done
+//
+// Screenshots are an opt-in pixel tier: the brain sends an `act` with
+// `op:"screenshot"` (only present in `tools({screenshots:true})`), the
+// page captures via getDisplayMedia (one consent prompt) and replies
+// with a `screenshot` frame; `browser.image(frame)` decodes it to bytes
+// you `blob.put` for the record and base64 you hand to the model.
 //
 // Evaluated as a global script (no module/exports) after the native
 // bindings install. IIFE-wrapped: a bare top-level definition corrupts
@@ -148,10 +154,16 @@
      * Claude adaptation). Returned as plain data so it works with any
      * LLM surface.
      *
+     * @param {object} [opts]
+     * @param {boolean} [opts.screenshots] - Include the opt-in
+     *   `screenshot` op. Only set this when the page SDK was started
+     *   with `screenshots: true`; otherwise the model would call a tool
+     *   the page will refuse. Pixels are a fallback for when structure
+     *   isn't enough — gate them on a `_config` flag, not by default.
      * @returns {Array<{op:string, desc:string, params:object}>}
      */
-    tools() {
-      return [
+    tools(opts) {
+      const list = [
         { op: "click", desc: "Click an element by its snapshot ref.",
           params: { ref: "string — element ref from the snapshot" } },
         { op: "type", desc: "Type text into an editable element.",
@@ -162,6 +174,38 @@
           params: { path: "string — same-origin URL or path" } },
         { op: "snapshot", desc: "Request a fresh page snapshot.", params: {} },
       ];
+      if (opts && opts.screenshots) {
+        list.push({ op: "screenshot",
+          desc: "Capture a pixel screenshot of the page (the user grants " +
+                "screen-share once). Use only when the structural snapshot " +
+                "isn't enough — visual layout, canvas/video, color or font " +
+                "rendering. Prefer snapshot otherwise; it's cheaper.",
+          params: {} });
+      }
+      return list;
+    },
+
+    /**
+     * Decode an inbound `screenshot` frame (the page's reply to an
+     * `op:"screenshot"` action). Returns `{ok:true, mime, bytes, data}`
+     * — `bytes` a Uint8Array to {@link blob.put} for the durable record,
+     * `data` the raw base64 to hand your model as an image block — or
+     * `{ok:false, error}` if the user declined / capture failed, or
+     * `null` if `frame` isn't a screenshot frame.
+     *
+     * @param {object} frame - A decoded frame from {@link browser.message}.
+     * @returns {{ok:boolean, mime?:string, bytes?:Uint8Array, data?:string, error?:string}|null}
+     */
+    image(frame) {
+      if (!frame || frame.t !== "screenshot") return null;
+      if (!frame.ok) return { ok: false, error: frame.error || "screenshot failed" };
+      const mime = frame.mime || "image/jpeg";
+      let bytes;
+      // base64url.decode is liberal — it accepts the standard alphabet +
+      // padding the page's canvas.toDataURL emits.
+      try { bytes = base64url.decode(frame.data || ""); }
+      catch (_) { return { ok: false, error: "undecodable screenshot data" }; }
+      return { ok: true, mime, bytes, data: frame.data };
     },
   };
 })();

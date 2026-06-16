@@ -51,6 +51,10 @@ export function onMessage() {
     case "snapshot":
       return think(frame, ctx);
 
+    case "screenshot":
+      // The pixels the brain asked for came back — feed them to the model.
+      return onShot(frame, ctx);
+
     case "confirm_result": {
       const sid = ctx.sid;
       if (frame.approved && ctx.pending_action) {
@@ -81,7 +85,6 @@ export function onMessage() {
 function think(frame, ctx) {
   const sid = frame.sid || ctx.sid;
   const goal = kv.get(`agent/${sid}/goal`) || "";
-  const msgs = load(sid);
   const view = "Page:\n" + browser.render(frame);
 
   // Remember ref → name for this snapshot so we can apply the
@@ -89,13 +92,34 @@ function think(frame, ctx) {
   const refs = {};
   for (const e of frame.elements || []) if (e.name) refs[e.ref] = e.name;
 
+  // Did a screenshot the brain requested just land (threaded by onShot on
+  // the chain ctx)? If so, the tool_result for that call is the IMAGE (plus
+  // the fresh structural view for grounding) — the model sees the pixels it
+  // asked for. onLLM does the durable blob.put (think() stays read-only).
+  const pendingShot = ctx.shot || null;
+
   // Claude requires the turn after a tool_use to LEAD with a matching
   // tool_result; the first turn is a plain user message. We build it but
   // do NOT persist here — this activation stays READ-ONLY so on.fetch can
   // bind from the held WS chain (a writing frame can't). onLLM persists the
   // user turn + refs on resume (durable-brain / ephemeral-hands).
   let userTurn;
-  if (ctx.pending_tool_id) {
+  if (pendingShot && pendingShot.tool_id) {
+    let content;
+    if (pendingShot.data) {
+      content = [
+        { type: "image",
+          source: { type: "base64", media_type: pendingShot.mime, data: pendingShot.data } },
+        { type: "text", text: view },
+      ];
+    } else {
+      content = "Screenshot unavailable: " + (pendingShot.error || "unknown") + ".\n" + view;
+    }
+    userTurn = {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: pendingShot.tool_id, content }],
+    };
+  } else if (ctx.pending_tool_id) {
     const note = ctx.denied ? "User DENIED the previous action. " : "";
     userTurn = {
       role: "user",
@@ -104,6 +128,39 @@ function think(frame, ctx) {
   } else {
     userTurn = { role: "user", content: `Goal: ${goal}\n\n${view}` };
   }
+  return callLLM(sid, userTurn, {
+    sid, user_turn: userTurn, refs,
+    // onLLM (a write activation) stores the pixels durably; think() is
+    // read-only so it can't.
+    record_shot: pendingShot && pendingShot.data
+      ? { mime: pendingShot.mime, data: pendingShot.data } : null,
+  });
+}
+
+// ── The page returned a screenshot the brain requested ──────────────
+// The LLM turn that carries the pixels into the model MUST be issued from
+// a read-only frame (a binding on.fetch can't come from one that writes),
+// so onShot doesn't call the model itself: it threads the pixels forward
+// on the chain ctx and bounces through a fresh snapshot. think() (read-
+// only) then sends the image as the screenshot tool_result; onLLM does the
+// durable blob.put. No kv needed — the held WS chain threads ctx across
+// frames (request.ctx), same as a fetch resume.
+function onShot(frame, ctx) {
+  const sid = ctx.sid;
+  const img = browser.image(frame);
+  const shot = (img && img.ok)
+    ? { tool_id: ctx.pending_tool_id, mime: img.mime, data: img.data }
+    : { tool_id: ctx.pending_tool_id, error: (img && img.error) || "unknown" };
+  browser.status(img && img.ok ? "looking at the screen…" : "screenshot unavailable");
+  browser.act({ op: "snapshot" });
+  return next({ sid, pending_tool_id: ctx.pending_tool_id, refs: ctx.refs || {}, shot });
+}
+
+// ── Shared LLM turn: hold the chain, call the model, wake onLLM ──────
+// READ-ONLY (no kv writes) so the on.fetch can bind to the held WS chain.
+function callLLM(sid, userTurn, parkCtx) {
+  const msgs = load(sid);
+  const screenshots = kv.get("_config/screenshots") === "1";
   browser.status("thinking…");
 
   const endpoint = kv.get("_config/llm_endpoint") || "https://api.anthropic.com/v1/messages";
@@ -125,15 +182,16 @@ function think(frame, ctx) {
         model,
         max_tokens: 1024,
         system: SYSTEM_PROMPT,
-        tools: claudeTools(),
+        // Offer the pixel-screenshot tool only when the operator enabled
+        // it (and the page SDK was started with screenshots:true).
+        tools: claudeTools(screenshots),
         messages: msgs.concat([userTurn]),
       }),
       timeout_ms: 30_000,
     },
     { to: "onLLM" },
   );
-  // Thread the unsaved user turn + refs to onLLM, which persists them.
-  return next({ sid, user_turn: userTurn, refs });
+  return next(parkCtx);
 }
 
 // ── Activation: the LLM responded ───────────────────────────────────
@@ -153,6 +211,10 @@ export function onLLM() {
   try { body = JSON.parse(raw || "{}"); } catch (_) { body = {}; }
   const msgs = load(sid);
   if (ctx.user_turn) msgs.push(ctx.user_turn); // persist now (think() was read-only)
+  // think() attached the screenshot as the tool_result; store the pixels
+  // content-addressed now (the durable record + replay), a write think()
+  // couldn't do while issuing the LLM fetch read-only.
+  if (ctx.record_shot) recordShot(sid, ctx.record_shot);
   msgs.push({ role: "assistant", content: body.content });
   save(sid, msgs);
 
@@ -180,7 +242,9 @@ export function onLLM() {
   }
 
   browser.act(action);
-  return next({ sid, pending_tool_id: tu.id });
+  // Forward refs so a screenshot result (which brings no fresh snapshot)
+  // can still apply the destructive-action policy on the next turn.
+  return next({ sid, pending_tool_id: tu.id, refs });
 }
 
 // ── Activation: the page's connection dropped ───────────────────────
@@ -194,8 +258,9 @@ export function onDisconnect() {
 
 // Adapt the shim's vendor-neutral tool list to Claude's tool schema.
 // Inference: `?` in a param description → optional; "number" → number.
-function claudeTools() {
-  return browser.tools().map((t) => {
+// `screenshots` toggles the opt-in pixel-capture tool.
+function claudeTools(screenshots) {
+  return browser.tools({ screenshots: !!screenshots }).map((t) => {
     const properties = {};
     const required = [];
     for (const pname of Object.keys(t.params)) {
@@ -214,6 +279,17 @@ function load(sid) {
 
 function save(sid, msgs) {
   kv.set(`agent/${sid}/msgs`, JSON.stringify(trim(msgs)));
+}
+
+// Store a screenshot content-addressed and index it in the durable
+// step-log (idempotent — same pixels → same hash). `shot` is
+// `{mime, data}` with `data` a base64 string. Non-fatal on failure: the
+// model still gets the inline pixels; this is the record, not perception.
+function recordShot(sid, shot) {
+  try {
+    const hash = blob.put(base64url.decode(shot.data), { content_type: shot.mime });
+    kv.set(`agent/${sid}/shots/${hash}`, JSON.stringify({ hash, mime: shot.mime }));
+  } catch (_) {}
 }
 
 // Keep the transcript bounded. Drop from the front but never strip a
