@@ -854,6 +854,19 @@ pub const Node = struct {
         return self.mgr.transferLeadershipAway(tenant_id);
     }
 
+    /// Propose a membership change on `tenant_id`'s group (leader-gated +
+    /// quorum-guarded in the FFI). The committed change applies + persists via
+    /// the pump apply path. Pump-thread only.
+    pub fn proposeConfChange(self: *Node, tenant_id: u64, node_id: u64, change: raft.Manager.ConfChange) Error!void {
+        return self.mgr.proposeConfChange(tenant_id, node_id, change);
+    }
+
+    /// Read `tenant_id`'s current membership into the caller's buffers; null for
+    /// an unknown group. Pump-thread only (reads the Manager).
+    pub fn confState(self: *Node, tenant_id: u64, voters_buf: []u64, learners_buf: []u64) ?raft.Manager.ConfStateView {
+        return self.mgr.confState(tenant_id, voters_buf, learners_buf);
+    }
+
     /// Whether this node is the raft leader of `tenant_id`'s group. False
     /// for a group this node has not created yet (a tenant the bridge has
     /// `registerTenant`'d but whose `createGroupEpoch`/`ensureGroup` has not

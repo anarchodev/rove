@@ -187,13 +187,23 @@ pub const GroupSig = struct {
 /// one, enqueues a pointer, and blocks on `done` until the pump has
 /// executed it and stamped `err` — so the struct outlives the wait.
 const ControlCmd = struct {
-    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership };
+    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state };
     kind: Kind,
     gid: u64,
     /// Borrowed from the gid's `GroupSig.id_str` (pointer-stable); used by
     /// `create_group_epoch` to open the tenant's group store.
     id_str: []const u8 = &.{},
     epoch: u64 = 0,
+    /// `propose_conf_change`: the raft node id to change + the op (0 add_voter /
+    /// 1 remove / 2 add_learner — matches `raft.Manager.ConfChange`).
+    node_id: u64 = 0,
+    cc_type: u8 = 0,
+    /// `conf_state`: caller buffers to fill + the counts written back.
+    cs_voters: []u64 = &.{},
+    cs_learners: []u64 = &.{},
+    cs_voters_len: usize = 0,
+    cs_learners_len: usize = 0,
+    cs_ok: bool = false,
     /// Result, written by the pump before signaling `done`.
     err: ?Error = null,
     /// `transfer_all_leadership` writes the number of groups it handed off here.
@@ -693,6 +703,28 @@ pub const Bridge = struct {
         return cmd.count;
     }
 
+    /// Operator-triggered membership change on `gid`'s group (conf_change Phase 1):
+    /// `cc_type` 0 = add voter / promote, 1 = remove, 2 = add learner / demote.
+    /// Runs on the pump (the only Manager toucher); leader-gated + quorum-guarded
+    /// in the FFI (`Error.NotLeader` / `Error.ConfChangeQuorumGuard`). The
+    /// committed change applies + persists durably via the apply path.
+    pub fn proposeConfChange(self: *Bridge, gid: u64, node_id: u64, cc_type: u8) Error!void {
+        var cmd: ControlCmd = .{ .kind = .propose_conf_change, .gid = gid, .node_id = node_id, .cc_type = cc_type };
+        return self.runControl(&cmd);
+    }
+
+    pub const ConfStateView = struct { voters: []const u64, learners: []const u64 };
+
+    /// Read `gid`'s current membership into the caller's buffers (slices into
+    /// them on success). Runs a pump-thread control cmd. Null for an unknown
+    /// group or if the pump is down.
+    pub fn confState(self: *Bridge, gid: u64, voters_buf: []u64, learners_buf: []u64) ?ConfStateView {
+        var cmd: ControlCmd = .{ .kind = .conf_state, .gid = gid, .cs_voters = voters_buf, .cs_learners = learners_buf };
+        self.runControl(&cmd) catch return null;
+        if (!cmd.cs_ok) return null;
+        return .{ .voters = voters_buf[0..cmd.cs_voters_len], .learners = learners_buf[0..cmd.cs_learners_len] };
+    }
+
     /// Enqueue a control command for the pump thread and block until it
     /// runs. Requires the pump thread (the only `Manager` toucher) to be
     /// live; the move path always runs under `startPump`.
@@ -729,6 +761,18 @@ pub const Bridge = struct {
                 },
                 .destroy_group => blk: {
                     self.node.destroyGroupAndReclaim(cmd.gid) catch |e| break :blk e;
+                    break :blk null;
+                },
+                .propose_conf_change => blk: {
+                    self.node.proposeConfChange(cmd.gid, cmd.node_id, @enumFromInt(cmd.cc_type)) catch |e| break :blk e;
+                    break :blk null;
+                },
+                .conf_state => blk: {
+                    if (self.node.confState(cmd.gid, cmd.cs_voters, cmd.cs_learners)) |cs| {
+                        cmd.cs_voters_len = cs.voters.len;
+                        cmd.cs_learners_len = cs.learners.len;
+                        cmd.cs_ok = true;
+                    }
                     break :blk null;
                 },
                 .transfer_all_leadership => blk: {
