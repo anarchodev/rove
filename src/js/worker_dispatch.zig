@@ -41,6 +41,8 @@ const panic_mod = @import("panic.zig");
 const worker_mod = @import("worker.zig");
 const components_mod = @import("components.zig");
 const session_mod = @import("session.zig");
+const files_mod = @import("rove-files");
+const deploy_thread_mod = @import("deploy_thread.zig");
 
 // Edge-proxy detection. rove-h2 is HTTP/2-only and TLS deployments
 // rely on ALPN — direct exposure to the public internet silently
@@ -83,6 +85,7 @@ fn checkProxyWarning(rh: h2.ReqHeaders) void {
 
 const Request = dispatcher_mod.Request;
 const RaftWait = worker_mod.RaftWait;
+const CompileWait = worker_mod.CompileWait;
 const ForwardWait = worker_mod.ForwardWait;
 const proxy_engine_mod = @import("proxy_engine.zig");
 
@@ -1101,6 +1104,8 @@ fn tryHandleSystem(
     // there is no global "admin or cap" pass.
     const required_cap: ?[]const u8 = if (std.mem.eql(u8, sys_rest, "release"))
         jwt.Cap.RELEASE
+    else if (std.mem.eql(u8, sys_rest, "deploy"))
+        jwt.Cap.DEPLOY
     else if (std.mem.eql(u8, sys_rest, "admin-kv"))
         jwt.Cap.ADMIN_KV
     else if (std.mem.startsWith(u8, sys_rest, "raft-snapshot/"))
@@ -1132,6 +1137,18 @@ fn tryHandleSystem(
     // `publishRelease` RPC instead.
     if (std.mem.eql(u8, sys_rest, "release")) {
         try handleRelease(server, allocator, worker, ent, sid, sess, method, body, cors_origin);
+        return true;
+    }
+
+    // Compile + stage a bundle into the target tenant's own content-
+    // addressed blobs and stamp a deployment manifest
+    // (`docs/rewind-cli-plan.md` §4 — files-server dissolved into the
+    // worker). The compile + S3 PUTs run on the background DeployThread;
+    // this request PARKS in `compile_pending` and `drainCompilePending`
+    // ships the `{"dep_id":"…"}` response once staging finishes. Does
+    // NOT flip `_deploy/current` — that is a separate `/_system/release`.
+    if (std.mem.eql(u8, sys_rest, "deploy")) {
+        try handleDeploy(server, allocator, worker, ent, sid, sess, method, body, cors_origin);
         return true;
     }
 
@@ -1939,6 +1956,183 @@ fn handleRelease(
     defer ws_local.deinit();
     worker_mod.parkKvWakes(worker, seq, parsed.value.tenant_id, &ws_local, release_cmds) catch |perr|
         std.log.warn("release: parkKvWakes (tenant={s}) failed: {s}", .{ parsed.value.tenant_id, @errorName(perr) });
+}
+
+/// How long a parked `/_system/deploy` request waits for the background
+/// compile + stage before `drainCompilePending` reaps it 504. Generous
+/// vs `commit_wait_timeout_ns` (2s) because staging does real S3 PUTs
+/// (source + bytecode + statics) plus a compile per handler.
+const DEPLOY_DEADLINE_NS: i64 = 60 * std.time.ns_per_s;
+
+/// Free a partially- or fully-built owned `DeployInput` slice (the
+/// handler's transfer-to-thread payload) before it reaches the thread.
+/// Mirrors `deploy_thread.freeJob`'s per-input frees. `wa` MUST be the
+/// worker allocator the inputs were built with (NOT the request
+/// allocator — the thread outlives the request tick).
+fn freeDeployInputsPartial(wa: std.mem.Allocator, inputs: []files_mod.DeployInput, built: usize) void {
+    for (inputs[0..built]) |*in| {
+        wa.free(in.path);
+        if (in.content_type.len != 0) wa.free(@constCast(in.content_type));
+        wa.free(@constCast(in.bytes));
+    }
+    wa.free(inputs);
+}
+
+/// `POST /_system/deploy` — compile + stage a bundle into the target
+/// tenant's OWN content-addressed blobs and stamp a deployment manifest
+/// (`docs/rewind-cli-plan.md` §4). Body shape (JSON; file bytes are
+/// base64 for binary safety):
+///
+///   {"tenant_id":"acme","files":[
+///       {"path":"index.mjs","kind":"handler","b64":"…"},
+///       {"path":"_static/logo.png","kind":"static",
+///        "content_type":"image/png","b64":"…"}]}
+///
+/// Parses + validates + base64-decodes inline (cheap), hands the owned
+/// bytes to the worker's background `DeployThread` (which runs the
+/// compile + S3 PUTs OFF the poll loop), stamps a `CompileWait`, and
+/// parks the entity in `compile_pending`. `drainCompilePending` ships
+/// the `{"dep_id":"<016x>"}` 200 once staging finishes. Does NOT flip
+/// `_deploy/current` — activation is a separate `/_system/release`.
+fn handleDeploy(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    body: []const u8,
+    cors_origin: ?[]const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "POST")) {
+        try respb.setSystemResponse(server, ent, sid, sess, 405, "POST only\n", allocator, cors_origin, null);
+        return;
+    }
+    const dt = worker.deploy_thread orelse {
+        try respb.setSystemResponse(server, ent, sid, sess, 503, "deploy thread not started\n", allocator, cors_origin, null);
+        return;
+    };
+
+    var parsed = std.json.parseFromSlice(struct {
+        tenant_id: []const u8,
+        files: []const struct {
+            path: []const u8,
+            kind: []const u8,
+            content_type: []const u8 = "",
+            b64: []const u8,
+        },
+    }, allocator, body, .{ .ignore_unknown_fields = true }) catch {
+        try respb.setSystemResponse(server, ent, sid, sess, 400, "expected {\"tenant_id\":\"...\",\"files\":[{\"path\",\"kind\",\"b64\"}]}\n", allocator, cors_origin, null);
+        return;
+    };
+    defer parsed.deinit();
+    const p = parsed.value;
+
+    if (p.tenant_id.len == 0) {
+        try respb.setSystemResponse(server, ent, sid, sess, 400, "tenant_id required\n", allocator, cors_origin, null);
+        return;
+    }
+    if (p.files.len == 0) {
+        try respb.setSystemResponse(server, ent, sid, sess, 400, "at least one file required\n", allocator, cors_origin, null);
+        return;
+    }
+    if (p.files.len > 256) {
+        try respb.setSystemResponse(server, ent, sid, sess, 400, "too many files (max 256)\n", allocator, cors_origin, null);
+        return;
+    }
+    // Reject unknown tenants up front — don't spin up S3 prefixes for
+    // garbage tenant ids from a stale session.
+    const inst_opt = worker.node.tenant.getInstance(p.tenant_id) catch null;
+    if (inst_opt == null) {
+        try respb.setSystemResponse(server, ent, sid, sess, 404, "unknown tenant\n", allocator, cors_origin, null);
+        return;
+    }
+
+    // Build the owned DeployInput[] with the WORKER allocator — the
+    // thread holds these across ticks, so they must outlive the request
+    // (the `allocator` param may be request-scoped).
+    const wa = worker.allocator;
+    const decoder = std.base64.standard.Decoder;
+    const inputs = wa.alloc(files_mod.DeployInput, p.files.len) catch {
+        try respb.setSystemResponse(server, ent, sid, sess, 500, "out of memory\n", allocator, cors_origin, null);
+        return;
+    };
+    var built: usize = 0;
+    var build_err: ?[]const u8 = null;
+    for (p.files) |f| {
+        const kind: files_mod.Kind = if (std.mem.eql(u8, f.kind, "handler"))
+            .handler
+        else if (std.mem.eql(u8, f.kind, "static"))
+            .static
+        else {
+            build_err = "file.kind must be \"handler\" or \"static\"\n";
+            break;
+        };
+        const dec_len = decoder.calcSizeForSlice(f.b64) catch {
+            build_err = "invalid base64 in file.b64\n";
+            break;
+        };
+        const bytes = wa.alloc(u8, dec_len) catch {
+            build_err = "out of memory\n";
+            break;
+        };
+        decoder.decode(bytes, f.b64) catch {
+            wa.free(bytes);
+            build_err = "invalid base64 in file.b64\n";
+            break;
+        };
+        const path_owned = wa.dupe(u8, f.path) catch {
+            wa.free(bytes);
+            build_err = "out of memory\n";
+            break;
+        };
+        // Empty content-type stays the "" literal (un-owned) so freeJob
+        // skips it; only a non-empty static content-type is duped.
+        const ct_owned: []const u8 = if (kind == .static and f.content_type.len != 0)
+            (wa.dupe(u8, f.content_type) catch {
+                wa.free(bytes);
+                wa.free(path_owned);
+                build_err = "out of memory\n";
+                break;
+            })
+        else
+            "";
+        inputs[built] = .{ .path = path_owned, .kind = kind, .content_type = ct_owned, .bytes = bytes };
+        built += 1;
+    }
+    if (build_err) |msg| {
+        freeDeployInputsPartial(wa, inputs, built);
+        const status: u16 = if (std.mem.eql(u8, msg, "out of memory\n")) 500 else 400;
+        try respb.setSystemResponse(server, ent, sid, sess, status, msg, allocator, cors_origin, null);
+        return;
+    }
+
+    const tenant_owned = wa.dupe(u8, p.tenant_id) catch {
+        freeDeployInputsPartial(wa, inputs, built);
+        try respb.setSystemResponse(server, ent, sid, sess, 500, "out of memory\n", allocator, cors_origin, null);
+        return;
+    };
+
+    worker.next_compile_id += 1;
+    const cid = worker.next_compile_id;
+    dt.enqueue(.{ .compile_id = cid, .tenant_id = tenant_owned, .inputs = inputs }) catch {
+        freeDeployInputsPartial(wa, inputs, built);
+        wa.free(tenant_owned);
+        try respb.setSystemResponse(server, ent, sid, sess, 503, "deploy queue unavailable\n", allocator, cors_origin, null);
+        return;
+    };
+
+    // Park: stamp the h2 identity components (they ride the move so the
+    // drain can ship the response) + CompileWait, then move into
+    // `compile_pending`. No response is staged here — the dep_id isn't
+    // known until the thread finishes, so `drainCompilePending` builds
+    // the response post-completion.
+    try server.reg.set(ent, &server.request_out, h2.StreamId, sid);
+    try server.reg.set(ent, &server.request_out, h2.Session, sess);
+    const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, DEPLOY_DEADLINE_NS));
+    try server.reg.set(ent, &server.request_out, CompileWait, .{ .compile_id = cid, .deadline_ns = deadline_ns });
+    try server.reg.move(ent, &server.request_out, &worker.compile_pending);
 }
 
 /// Body shape: `{"pairs":[{"key":"<k>","value":"<v>"}, ...]}`. Writes

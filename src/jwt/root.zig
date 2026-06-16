@@ -57,6 +57,12 @@ pub const Cap = struct {
     /// `_deploy/current` for any tenant. Issued to files-server so
     /// it can ship admin/replay deploys without the root bearer.
     pub const RELEASE = "release";
+    /// Token bearer may POST `/_system/deploy` to compile + stage a
+    /// bundle into a tenant's own content-addressed blobs and stamp a
+    /// deployment manifest (build/stage half of the deploy split;
+    /// `release` activates the staged dep_id). Issued so the operator
+    /// CLI / first-party website can publish without the root bearer.
+    pub const DEPLOY = "deploy";
     /// Token bearer may POST `/_system/admin-kv` to write key/value
     /// pairs into `__admin__/app.db`. Issued to files-server for
     /// platform-config bootstrap (resend_key, platform_email_from,

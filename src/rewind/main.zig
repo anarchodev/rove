@@ -228,6 +228,11 @@ fn workerMain(args: *WorkerCtx) !void {
     });
     defer worker.destroy();
 
+    // Background compile+stage thread for `/_system/deploy`
+    // (docs/rewind-cli-plan.md §4 — files-server dissolution). Owns its
+    // own QuickJS runtime so it never races the poll-loop compiler.
+    try worker.startDeployThread();
+
     std.log.info("rewind worker {d}: ready (SO_REUSEPORT)", .{args.worker_idx});
     args.ready.set();
 
@@ -241,6 +246,7 @@ fn workerMain(args: *WorkerCtx) !void {
         try rjs.drainRequestReceiving(worker);
         try rjs.drainBodyPending(worker);
         try rjs.drainFetchPendingDurability(worker);
+        try rjs.drainCompilePending(worker);
         _ = try rjs.dispatchOnce(worker, &blocked_tenants);
         try rjs.drainRaftPending(worker);
         runPromotionHook(worker, args.worker_idx);

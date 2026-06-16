@@ -86,6 +86,7 @@ pub const drainRaftPending = worker.drainRaftPending;
 pub const drainForwardPending = worker.drainForwardPending;
 pub const drainBodyPending = worker.drainBodyPending;
 pub const drainFetchPendingDurability = worker.drainFetchPendingDurability;
+pub const drainCompilePending = worker.drainCompilePending;
 pub const drainPendingBoundResumes = worker.drainPendingBoundResumes;
 pub const sweepParkedContinuations = worker.sweepParkedContinuations;
 pub const pumpInboundChunks = worker.pumpInboundChunks;
@@ -119,4 +120,5 @@ test {
     _ = deployment_loader;
     _ = @import("worker_inbound_chunk.zig");
     _ = @import("static_cache.zig");
+    _ = @import("deploy_thread.zig");
 }
