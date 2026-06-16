@@ -291,6 +291,14 @@ pub const TenantSlot = struct {
     /// `applied_idx > durabilized_idx` ⇒ this group has committed-but-not-yet-
     /// durable writes (it is "dirty"). Single-node compacts the WAL up to here.
     durabilized_idx: u64 = 0,
+    /// The WAL-compaction floor this group's LEADER last propagated (the
+    /// cluster-wide min match index, stamped on inbound transport messages and
+    /// drained by `applyRecvFloor`). A FOLLOWER truncates its WAL to this floor
+    /// so it compacts in lockstep with the leader — never past an entry a voter
+    /// still needs (snapshot-free). 0 (no floor yet ⇒ no follower truncation)
+    /// until the first leader message lands; unused on the leader (it uses its
+    /// own live `minMatchIndex`). Monotonic.
+    propagated_floor: u64 = 0,
     /// Whether this slot is in `Node.dirty` (committed since last durabilize),
     /// so `applyEntry` enqueues it at most once.
     in_dirty: bool = false,
@@ -397,10 +405,10 @@ pub const Node = struct {
     /// abort), and the full V2 smoke suite (rewind / tenant_move / three_node /
     /// cp_move_recovery / zero_downtime_move) passes.
     ///
-    /// Multi-node compaction is now on too (the `durabilizeTick` guard below):
-    /// the LEADER truncates to the cluster-wide min match index so a lagging
-    /// voter always catches up from the log (snapshot-free); followers don't
-    /// truncate until floor propagation lands.
+    /// Multi-node compaction is now on too (`durabilizeTick`): leader and
+    /// follower both truncate to the cluster-wide min match index (the leader
+    /// propagates it on its messages), so a lagging voter always catches up from
+    /// the log — snapshot-free.
     compact_wal: bool = true,
     /// Set true while a group's recovery drain (`createGroupCore`) re-applies
     /// the replayed WAL tail: forces the store WRITE even in `worker_overlay`
@@ -1130,12 +1138,12 @@ pub const Node = struct {
             // Multi-node: buffered per destination node, stamped with the
             // group's migration epoch, for the coalesced flush below.
             for (ready) |g| {
-                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g) };
+                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g), .floor = self.outboundFloor(g) };
                 self.mgr.takeMessages(g, sendMsgCb, &sctx) catch {};
                 self.mgr.release(g);
             }
             for (ready2) |g| {
-                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g) };
+                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g), .floor = self.outboundFloor(g) };
                 self.mgr.takeMessages(g, sendMsgCb, &sctx) catch {};
                 self.mgr.release(g);
             }
@@ -1169,6 +1177,9 @@ pub const Node = struct {
             self.woke_scratch.clearRetainingCapacity();
             t.drainWoke(&self.woke_scratch, self.allocator) catch {};
             for (self.woke_scratch.items) |gid| self.bumpActive(gid) catch {};
+            // Record each group's leader-propagated compaction floor so a
+            // follower truncates its WAL in lockstep (snapshot-free bound).
+            t.drainFloors(self, Node.applyRecvFloor);
         }
 
         // Hibernate: stop ticking any group idle past its deadline.
@@ -1190,18 +1201,18 @@ pub const Node = struct {
     /// fold its overlay into LMDB + stamp `lastAppliedRaftIdx` (one atomic
     /// durabilize), then compact the shared WAL up to the durabilized index so
     /// the log stays bounded. Single-node always compacts. Multi-node compacts
-    /// only on the LEADER, flooring the truncate point at the cluster-wide min
-    /// match index (`minMatchIndex`) so it retains every entry a lagging voter
-    /// still needs — that voter catches up from the LOG, never a snapshot
-    /// (snapshot-free). Followers don't truncate yet (floor propagation, which
-    /// lets them compact to the same floor in lockstep, is the next step).
-    /// Pump-thread only. All dirty groups are flushed in one tick so the shared
-    /// WAL's interleaved commits clear together.
+    /// in lockstep: the LEADER floors the truncate point at its live cluster-wide
+    /// min match index (`minMatchIndex`) and propagates that floor on its
+    /// outbound messages; a FOLLOWER truncates to the propagated floor
+    /// (`propagated_floor`). Both stop at the same point, so no node compacts
+    /// past an entry a voter still needs — a lagging/returning voter catches up
+    /// from the LOG, never a snapshot (snapshot-free). Pump-thread only. All
+    /// dirty groups are flushed in one tick so the shared WAL's interleaved
+    /// commits clear together.
     fn durabilizeTick(self: *Node, now: i64) void {
         if (self.dirty.items.len == 0) return;
         if (now - self.last_durabilize_ns < self.durabilize_interval_ns) return;
         self.last_durabilize_ns = now;
-        const single = self.isSingleNode();
         // Under the async-append flow the durable HardState.commit lags
         // the live commit by one fsync (it rides the NEXT ready's hard
         // state). Compaction must never truncate past a commit index that
@@ -1227,17 +1238,17 @@ pub const Node = struct {
             // nothing is awaited.
             var target = slot.applied_idx;
             if (self.durabilize_floor) |f| target = @min(target, f.func(f.ctx, gid));
-            // Multi-node WAL compaction floor — snapshot-free: the LEADER floors
-            // the truncate point at the cluster-wide min match index, so it
-            // retains every entry a lagging voter still needs and that voter
-            // catches up from the LOG (never a snapshot). `minMatchIndex` returns
-            // maxInt off-leader; combined with the leader-only guard below, a
-            // follower does NOT truncate yet (floor propagation — having
-            // followers compact to the same floor in lockstep — is the next
-            // step; until then leader-only compaction is correct + snapshot-free,
-            // it just leaves follower-role groups pinning shared-WAL segments).
-            // Single-node ({self}) ⇒ min_match = own match ≥ applied ⇒ target.
-            const compact_target = if (single) target else @min(target, self.mgr.minMatchIndex(gid));
+            // Multi-node WAL compaction floor — snapshot-free + lockstep: the
+            // LEADER floors the truncate point at its live cluster-wide min match
+            // index; a FOLLOWER uses the floor the leader propagated on its
+            // messages (`propagated_floor`, 0 ⇒ none yet ⇒ no truncation). Both
+            // truncate to the SAME floor, so no node ever compacts past an entry
+            // a voter still needs — a lagging/returning voter catches up from the
+            // LOG, never a snapshot. Single-node ({self}) ⇒ min_match = own match
+            // ≥ applied ⇒ target. Constrains only truncation; the LMDB fold of
+            // the full applied tail above is unaffected.
+            const floor: u64 = if (self.mgr.isLeader(gid)) self.mgr.minMatchIndex(gid) else slot.propagated_floor;
+            const compact_target = @min(target, floor);
             if (target <= slot.durabilized_idx) {
                 // Nothing foldable yet — keep the slot dirty and retry
                 // next tick (the worker ack raises the floor).
@@ -1258,12 +1269,11 @@ pub const Node = struct {
                 keep += 1;
                 continue;
             };
-            // Compact when enabled: single-node always; multi-node only on the
-            // LEADER (it floors at min_match above; followers don't truncate
-            // until floor propagation lands). A non-leader's `compact_target`
-            // would be `target` (own applied) — unsafe past min_match — so the
-            // guard, not just the floor, gates it off.
-            if (self.compact_wal and (single or self.mgr.isLeader(gid))) {
+            // Compact when enabled (single-, leader-, AND follower-side now —
+            // everyone truncates to the same propagated floor). Skip when
+            // `compact_target` is 0 (a follower that hasn't heard a floor yet)
+            // so a floorless group doesn't trigger the pre-compact flush.
+            if (self.compact_wal and compact_target > 0) {
                 if (!compaction_flushed) {
                     self.wal.flush() catch |e| {
                         // Can't make the commit index durable — skip ALL
@@ -1527,6 +1537,10 @@ pub const Node = struct {
         node: *Node,
         group_id: u64,
         epoch: u64,
+        /// The leader's WAL-compaction floor (cluster-wide min match) stamped
+        /// on every outbound message so followers compact in lockstep;
+        /// `maxInt` when this node is not the group's leader (no floor to send).
+        floor: u64,
     };
 
     /// `takeMessages` callback: buffer one outbound raft message into the
@@ -1541,7 +1555,23 @@ pub const Node = struct {
         const ctx: *SendCtx = @ptrCast(@alignCast(ud.?));
         const t = ctx.node.transport orelse return;
         const bytes = if (msg_len == 0) &[_]u8{} else msg_bytes[0..msg_len];
-        t.queueOut(to, ctx.group_id, ctx.epoch, bytes);
+        t.queueOut(to, ctx.group_id, ctx.epoch, ctx.floor, bytes);
+    }
+
+    /// The WAL-compaction floor to stamp on `gid`'s outbound messages.
+    /// `minMatchIndex` is the cluster-wide min match on the leader and `maxInt`
+    /// (no floor) off-leader — exactly the per-recipient floor semantics, so a
+    /// follower receives + adopts the leader's floor and compacts in lockstep.
+    fn outboundFloor(self: *Node, gid: u64) u64 {
+        return self.mgr.minMatchIndex(gid);
+    }
+
+    /// Transport `drainFloors` callback: record the leader-sent compaction
+    /// floor for `gid` on its slot (monotonic). `durabilizeTick` truncates a
+    /// follower's WAL to this floor. Pump-thread only.
+    fn applyRecvFloor(self: *Node, gid: u64, floor: u64) void {
+        const slot = self.groups.get(gid) orelse return;
+        if (floor > slot.propagated_floor) slot.propagated_floor = floor;
     }
 };
 
