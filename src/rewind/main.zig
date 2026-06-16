@@ -588,23 +588,6 @@ pub fn main() !void {
     // touching the worker handle's txn state. Set BEFORE startPump so the
     // first replicated entry already routes here.
     bridge.setStoreResolver(.{ .ctx = &pump_stores, .func = PumpStores.resolve });
-    // Multi-node: enable S3-staged raft snapshots so a lagging/returning
-    // follower (below the WAL compaction floor) is caught up by a snapshot of
-    // the tenant store instead of an unbounded log — and multi-node WAL
-    // compaction is unlocked. BEFORE startPump (group lifecycle is
-    // single-threaded until the pump owns the Manager) and BEFORE recoverGroups
-    // so recovered groups also get the hooks. Single-node never compacts past
-    // its own applied index, so it needs no snapshots.
-    if (!bridge.isSingleNode()) {
-        // Optional WAL-retention override (smokes set it tiny to force the
-        // snapshot catch-up path; unset → DEFAULT_WAL_RETENTION).
-        const retention: ?u64 = if (std.posix.getenv("REWIND_WAL_RETENTION_MAX")) |s|
-            std.fmt.parseInt(u64, s, 10) catch null
-        else
-            null;
-        bridge.enableSnapshots(blob_owned.cfg, retention) catch |e|
-            std.log.warn("rewind: enableSnapshots failed (snapshots/compaction off): {s}", .{@errorName(e)});
-    }
     // Boot-time group recovery: re-stand-up the tenant raft groups this node
     // persisted (its node-local manifest) so a restarted node rejoins its
     // groups and catches up to the live state — the leader replicates the

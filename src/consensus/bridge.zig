@@ -80,7 +80,6 @@
 const std = @import("std");
 const node_mod = @import("node.zig");
 const envelope = @import("envelope.zig");
-const blob = @import("rove-blob");
 
 pub const Node = node_mod.Node;
 pub const WriteSet = node_mod.WriteSet;
@@ -357,15 +356,6 @@ pub const Bridge = struct {
         self.node.apply_observer = observer;
     }
 
-    /// Enable S3-staged raft snapshots (multi-node production). The worker
-    /// (`rewind`) calls this with the process blob config so a lagging /
-    /// returning follower is caught up by a snapshot of the tenant store
-    /// instead of an unbounded log, and multi-node WAL compaction is unlocked.
-    /// Must be called before `startPump`. Safe to leave unset (single-node /
-    /// tests): snapshots stay off and compaction stays single-node-only.
-    pub fn enableSnapshots(self: *Bridge, blob_cfg: blob.BackendConfig, retention_max: ?u64) Error!void {
-        return self.node.enableSnapshots(blob_cfg, retention_max);
-    }
 
     /// Point follower-apply at the worker's own per-tenant serving store
     /// (Phase 5 "Full HA"). In `worker_overlay` mode a follower has no local

@@ -52,8 +52,6 @@ const kvstore = kvlimbs.kvstore;
 const writeset = kvlimbs.writeset;
 const envelope = @import("envelope.zig");
 const transport_mod = @import("transport.zig");
-const snapshot = @import("snapshot.zig");
-const blob = @import("rove-blob");
 
 pub const Transport = transport_mod.Transport;
 pub const PeerAddr = transport_mod.PeerAddr;
@@ -104,22 +102,6 @@ const group_raft_config: raft.manager.GroupConfig = blk: {
 /// avoids re-waking a barely-idle group. Tests override `Node.hibernate_ns`
 /// with a short value so the hibernate/wake transitions are observable fast.
 pub const DEFAULT_HIBERNATE_NS: i64 = 2 * std.time.ns_per_s;
-
-/// Upper bound on a staged snapshot bundle read back from disk for apply — a
-/// tenant store image. Generous (256 MiB) vs. the realistic MB-scale tenant;
-/// a bundle larger than this is a corrupt/hostile stage and is rejected.
-const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
-
-/// Default cap on how many raft entries a leader retains below its durabilized
-/// point for a LAGGING voter (multi-node compaction). In steady state every
-/// voter is caught up, so compaction follows the min-match floor and retains
-/// almost nothing; this only bites during a follower outage — the leader keeps
-/// up to this many entries so a briefly-down voter (e.g. a deploy restart)
-/// catches up cheaply from the log, then compacts PAST a voter further behind
-/// than this and catches it up with a snapshot instead, bounding WAL growth.
-/// Overridable via `REWIND_WAL_RETENTION_MAX` (smokes set it tiny to force the
-/// snapshot path; tests override the field directly).
-pub const DEFAULT_WAL_RETENTION: u64 = 8192;
 
 /// Default durabilize cadence (V2 port of V1's `Cluster.tickSnapshot`
 /// interval): how often the pump folds each dirty tenant store's in-memory
@@ -415,16 +397,11 @@ pub const Node = struct {
     /// abort), and the full V2 smoke suite (rewind / tenant_move / three_node /
     /// cp_move_recovery / zero_downtime_move) passes.
     ///
-    /// Still single-node-only by design (the `single and …` guard below):
-    /// multi-node compaction needs a follower-match-index floor — a lagging
-    /// follower would need a data-carrying snapshot, which is not wired — so a
-    /// multi-node node durabilizes (bounding replay) but does not truncate.
+    /// Multi-node compaction is now on too (the `durabilizeTick` guard below):
+    /// the LEADER truncates to the cluster-wide min match index so a lagging
+    /// voter always catches up from the log (snapshot-free); followers don't
+    /// truncate until floor propagation lands.
     compact_wal: bool = true,
-    /// Max entries retained below the durabilized point for a lagging voter
-    /// before the leader compacts past it + snapshots it (see
-    /// `DEFAULT_WAL_RETENTION`). Set from `REWIND_WAL_RETENTION_MAX` by rewind;
-    /// tests/smokes lower it to force the snapshot catch-up path.
-    wal_retention_max: u64 = DEFAULT_WAL_RETENTION,
     /// Set true while a group's recovery drain (`createGroupCore`) re-applies
     /// the replayed WAL tail: forces the store WRITE even in `worker_overlay`
     /// mode (where the leader normally skips it because the worker's txn wrote
@@ -492,15 +469,6 @@ pub const Node = struct {
     /// the bare-node tests, which read the node's own `slot.store`.
     store_resolver: ?StoreResolver = null,
 
-    /// Off-pump raft snapshot stager (S3-staged tenant bundles). Null until
-    /// `enableSnapshots` is called with a blob config — only the multi-node
-    /// production path (rewind) does so. When null, snapshots are disabled and
-    /// `durabilizeTick` keeps the historical single-node-only compaction
-    /// (no follower-match floor, no truncation in multi-node). When set, a
-    /// group's `gfs` gets the snapshot hooks at creation and multi-node
-    /// compaction is unlocked. Owned; freed in `deinit`.
-    snap_stager: ?*snapshot.Stager = null,
-
     /// Stand up a single-node node (voter id 1, voter set `{1}`).
     pub fn initSingleNode(allocator: std.mem.Allocator, data_dir: []const u8) Error!*Node {
         return Node.init(allocator, data_dir, 1, &.{1});
@@ -537,102 +505,6 @@ pub const Node = struct {
     /// (the sole voter leads every group it ever creates).
     pub fn isSingleNode(self: *const Node) bool {
         return self.voters.len == 1;
-    }
-
-    /// Enable S3-staged raft snapshots (multi-node production path). Builds the
-    /// off-pump stager from `blob_cfg`; thereafter every group created gets the
-    /// snapshot generate/apply hooks and `durabilizeTick` unlocks multi-node WAL
-    /// compaction (a lagging follower below the compaction floor is caught up by
-    /// a snapshot instead of the log). Idempotent. Single-node / test nodes
-    /// never call this — snapshots stay off and compaction stays single-node.
-    pub fn enableSnapshots(self: *Node, blob_cfg: blob.BackendConfig, retention_max: ?u64) Error!void {
-        if (self.snap_stager != null) return;
-        if (retention_max) |r| self.wal_retention_max = r;
-        self.snap_stager = snapshot.Stager.init(self.allocator, self.data_dir, blob_cfg) catch
-            return Error.Io;
-        // Wire any groups that already exist (recovery created them before the
-        // bridge enabled snapshots).
-        var it = self.groups.iterator();
-        while (it.next()) |e| e.value_ptr.*.gfs.setSnapshotHooks(self, snapshotProvider, snapshotApply);
-    }
-
-    /// Storage `snapshot` provider (pump thread, via `gfs.snapshotCb`). Returns
-    /// the descriptor for a ready snapshot, or -1 (TemporarilyUnavailable) while
-    /// one is being prepared off-pump. The snapshot is the tenant's store dumped
-    /// at `durabilized_idx`; the descriptor body is empty (the follower derives
-    /// the S3 key from gid→id_str + the metadata index).
-    fn snapshotProvider(
-        ctx: ?*anyopaque,
-        gid: u64,
-        request_index: u64,
-        out_data: [*c][*c]const u8,
-        out_data_len: [*c]usize,
-        out_meta_index: [*c]u64,
-        out_meta_term: [*c]u64,
-    ) callconv(.c) i32 {
-        const self: *Node = @ptrCast(@alignCast(ctx.?));
-        const stager = self.snap_stager orelse return -1;
-        const slot = self.groups.get(gid) orelse return -1;
-        const dump_idx = slot.durabilized_idx;
-        // Can't satisfy a request for an index we haven't durabilized to yet —
-        // raft retries after the next durabilize advances the materialized point.
-        if (dump_idx == 0 or dump_idx < request_index) return -1;
-        if (stager.genReadyIdx(gid, request_index)) |idx| {
-            out_data.* = null;
-            out_data_len.* = 0;
-            out_meta_index.* = idx;
-            out_meta_term.* = 0; // gfs derives the authoritative term from its log
-            return 0;
-        }
-        if (!stager.genBusy(gid)) {
-            // Dump the durable store image (read-only, fast, pump-safe) and hand
-            // it to the off-pump uploader; report Unavailable for this round.
-            const bundle = slot.store.dumpTenantBundleReadOnly(self.allocator) catch return -1;
-            defer self.allocator.free(bundle);
-            stager.enqueueUpload(gid, slot.id_str, dump_idx, bundle);
-        }
-        return -1;
-    }
-
-    /// Storage `apply_snapshot` handler (pump thread, via `gfs.applySnapshotCb`).
-    /// By the time raft delivers the snapshot in a ready, the pump's snapshot
-    /// gate (`drivePendingSnapshot`) has already staged the bytes locally, so
-    /// this loads them synchronously into the tenant store + advances the
-    /// watermark to `meta_index`. Returns 0 on success.
-    fn snapshotApply(
-        ctx: ?*anyopaque,
-        gid: u64,
-        data: [*c]const u8,
-        data_len: usize,
-        meta_index: u64,
-        meta_term: u64,
-    ) callconv(.c) i32 {
-        _ = data;
-        _ = data_len;
-        _ = meta_term;
-        const self: *Node = @ptrCast(@alignCast(ctx.?));
-        const stager = self.snap_stager orelse return -1;
-        const slot = self.groups.get(gid) orelse return -1;
-        const path = stager.stagedPath(gid, meta_index) catch return -1;
-        defer self.allocator.free(path);
-        const bytes = std.fs.cwd().readFileAlloc(self.allocator, path, MAX_SNAPSHOT_BYTES) catch |e| {
-            std.log.warn("v2 snapshot apply gid={d} idx={d} read: {s}", .{ gid, meta_index, @errorName(e) });
-            return -1;
-        };
-        defer self.allocator.free(bytes);
-        // Load into the follower's serving store (worker_overlay) or the node's
-        // own store. The bundle's pairs replace state; the watermark stamps to
-        // meta_index so store + lastAppliedRaftIdx advance together.
-        const store = self.storeFor(slot, slot.id_str) orelse slot.store;
-        store.loadSnapshotBundle(bytes, meta_index) catch |e| {
-            std.log.warn("v2 snapshot apply gid={d} idx={d} load: {s}", .{ gid, meta_index, @errorName(e) });
-            return -1;
-        };
-        slot.applied_idx = meta_index;
-        slot.durabilized_idx = meta_index;
-        stager.clearApplied(gid, meta_index);
-        std.log.info("v2 snapshot applied gid={d} idx={d} ({d} bytes)", .{ gid, meta_index, bytes.len });
-        return 0;
     }
 
     pub fn init(
@@ -694,11 +566,6 @@ pub const Node = struct {
         const a = self.allocator;
         // Stop the network first (it borrows the Manager via step).
         if (self.transport) |t| t.deinit();
-        // Stop the snapshot stager (joins its off-pump worker thread). The
-        // pump is already stopped by the bridge before node teardown, so no
-        // pump call will re-enter the stager; the worker only touches S3 +
-        // local files, never the Node.
-        if (self.snap_stager) |s| s.deinit();
         // Destroy groups first — `Manager.deinit` frees each group's
         // `GroupedFileStorage` via its destroy-vtable. The WAL is
         // borrowed by those storages, so it must outlive them: tear the
@@ -900,10 +767,6 @@ pub const Node = struct {
 
         self.groups.put(self.allocator, tenant_id, slot) catch return Error.OutOfMemory;
         errdefer _ = self.groups.remove(tenant_id);
-        // Wire the S3-staged snapshot hooks (multi-node prod path). The ctx is
-        // the Node; the generate/apply callbacks resolve slot + stager by gid.
-        if (self.snap_stager != null)
-            gfs.setSnapshotHooks(self, snapshotProvider, snapshotApply);
         // Record in the node-local manifest so a restart can recover this
         // group (see `groups_manifest`). Best-effort + idempotent: re-recording
         // the same (id_str → epoch) on a recovery-path create is a no-op write;
@@ -1015,7 +878,6 @@ pub const Node = struct {
         self.mgr.destroyGroup(tenant_id) catch return Error.DestroyGroupFailed;
         self.wal.noteGroupDestroyed(tenant_id);
         self.dropActive(tenant_id);
-        if (self.snap_stager) |s| s.forgetGroup(tenant_id);
         // Drop from the recovery manifest BEFORE freeing the slot (we need its
         // `id_str`): a tenant moved off this node must not be re-stood-up on the
         // next restart.
@@ -1162,28 +1024,6 @@ pub const Node = struct {
         return slot.applied_idx;
     }
 
-    /// Snapshot gate for `gid` in the pump's ready loop. If the group has a
-    /// snapshot pending application whose bytes are not yet staged locally,
-    /// kick the off-pump fetch and return true so the caller DEFERS
-    /// `processReady` this cycle — the apply is synchronous, so the payload
-    /// must be in hand first (`raft_manager_pending_snapshot` lets us see it
-    /// without consuming the ready). Returns false when there is no pending
-    /// snapshot or it is already staged (apply proceeds), and always false when
-    /// snapshots are disabled.
-    fn drivePendingSnapshot(self: *Node, gid: u64) bool {
-        const stager = self.snap_stager orelse return false;
-        const pend = self.mgr.pendingSnapshot(gid) orelse return false;
-        const slot = self.groups.get(gid) orelse return false;
-        switch (stager.ensureFetched(gid, slot.id_str, pend.index)) {
-            .staged => return false, // bytes on disk → let processReady apply
-            .fetching, .kicked => {
-                // Keep the group active so it re-polls until the fetch lands.
-                self.bumpActive(gid) catch {};
-                return true;
-            },
-        }
-    }
-
     /// Drive one ready cycle across the active set. Returns true if any
     /// group had committed entries to apply this cycle.
     ///
@@ -1223,10 +1063,6 @@ pub const Node = struct {
             // on its persist watermark). Every processed ready is queued
             // for the post-fsync ack.
             for (ready) |g| {
-                // Snapshot gate: defer a group whose pending snapshot bytes
-                // aren't staged locally yet (the fetch runs off-pump). It stays
-                // ready and re-polls next cycle; `release` below still pairs.
-                if (self.drivePendingSnapshot(g)) continue;
                 self.mgr.processReady(g, applyCb, self) catch |e| {
                     self.apply_err = self.apply_err orelse mapRaftErr(e);
                 };
@@ -1269,7 +1105,6 @@ pub const Node = struct {
                 // runs even if nothing else is ready.
                 ready2 = self.mgr.pollReady(self.ready_buf2);
                 for (ready2) |g| {
-                    if (self.drivePendingSnapshot(g)) continue;
                     self.mgr.processReady(g, applyCb, self) catch |e| {
                         self.apply_err = self.apply_err orelse mapRaftErr(e);
                     };
@@ -1355,14 +1190,13 @@ pub const Node = struct {
     /// fold its overlay into LMDB + stamp `lastAppliedRaftIdx` (one atomic
     /// durabilize), then compact the shared WAL up to the durabilized index so
     /// the log stays bounded. Single-node always compacts. Multi-node compacts
-    /// only when snapshots are enabled (`snap_stager`), and the LEADER additionally
-    /// floors the compaction point at the cluster-wide min match index
-    /// (`minMatchIndex`) — it retains everything every voter still needs, so a
-    /// slightly-behind follower catches up from the log and only a follower that
-    /// has fallen below the floor (or a promoted ex-follower's laggard peer) is
-    /// caught up by a data-carrying snapshot. Pump-thread only. All dirty groups
-    /// are flushed in one tick so the shared WAL's interleaved commits clear
-    /// together.
+    /// only on the LEADER, flooring the truncate point at the cluster-wide min
+    /// match index (`minMatchIndex`) so it retains every entry a lagging voter
+    /// still needs — that voter catches up from the LOG, never a snapshot
+    /// (snapshot-free). Followers don't truncate yet (floor propagation, which
+    /// lets them compact to the same floor in lockstep, is the next step).
+    /// Pump-thread only. All dirty groups are flushed in one tick so the shared
+    /// WAL's interleaved commits clear together.
     fn durabilizeTick(self: *Node, now: i64) void {
         if (self.dirty.items.len == 0) return;
         if (now - self.last_durabilize_ns < self.durabilize_interval_ns) return;
@@ -1393,21 +1227,17 @@ pub const Node = struct {
             // nothing is awaited.
             var target = slot.applied_idx;
             if (self.durabilize_floor) |f| target = @min(target, f.func(f.ctx, gid));
-            // Multi-node compaction floor. On the LEADER, retain down to the
-            // slowest voter's match so it catches up from the log — but never
-            // keep more than `wal_retention_max` entries below the durabilized
-            // point: a voter further behind than that is caught up by a snapshot
-            // instead, which bounds WAL growth during a follower outage.
-            // `minMatchIndex` is maxInt off-leader, so a follower compacts to its
-            // own durable point and single-node is unaffected ({self} ⇒ own match
-            // ≥ applied). Constrains only the truncation target; the durabilize
-            // (LMDB fold) of the full applied tail above is unaffected.
-            var compact_target = target;
-            if (!single) {
-                const min_match = self.mgr.minMatchIndex(gid);
-                const retain_floor = if (target > self.wal_retention_max) target - self.wal_retention_max else 0;
-                compact_target = @min(target, @max(min_match, retain_floor));
-            }
+            // Multi-node WAL compaction floor — snapshot-free: the LEADER floors
+            // the truncate point at the cluster-wide min match index, so it
+            // retains every entry a lagging voter still needs and that voter
+            // catches up from the LOG (never a snapshot). `minMatchIndex` returns
+            // maxInt off-leader; combined with the leader-only guard below, a
+            // follower does NOT truncate yet (floor propagation — having
+            // followers compact to the same floor in lockstep — is the next
+            // step; until then leader-only compaction is correct + snapshot-free,
+            // it just leaves follower-role groups pinning shared-WAL segments).
+            // Single-node ({self}) ⇒ min_match = own match ≥ applied ⇒ target.
+            const compact_target = if (single) target else @min(target, self.mgr.minMatchIndex(gid));
             if (target <= slot.durabilized_idx) {
                 // Nothing foldable yet — keep the slot dirty and retry
                 // next tick (the worker ack raises the floor).
@@ -1428,9 +1258,12 @@ pub const Node = struct {
                 keep += 1;
                 continue;
             };
-            // Compact when enabled: single-node always; multi-node only with
-            // snapshots wired (a follower below the floor is caught up by one).
-            if (self.compact_wal and (single or self.snap_stager != null)) {
+            // Compact when enabled: single-node always; multi-node only on the
+            // LEADER (it floors at min_match above; followers don't truncate
+            // until floor propagation lands). A non-leader's `compact_target`
+            // would be `target` (own applied) — unsafe past min_match — so the
+            // guard, not just the floor, gates it off.
+            if (self.compact_wal and (single or self.mgr.isLeader(gid))) {
                 if (!compaction_flushed) {
                     self.wal.flush() catch |e| {
                         // Can't make the commit index durable — skip ALL
@@ -1447,9 +1280,9 @@ pub const Node = struct {
                     compaction_flushed = true;
                 }
                 // Truncate to `compact_target` (≤ `target`): the leader's
-                // min-match clamp keeps the log entries lagging followers still
-                // need; a follower truncates to its own durable point. No-op
-                // when `compact_target` is at/below the current sentinel.
+                // min-match floor keeps the log entries lagging followers still
+                // need. No-op when `compact_target` is at/below the current
+                // sentinel.
                 slot.gfs.compact(compact_target) catch |e| {
                     std.log.warn("v2 wal compact gid={d}: {s}", .{ gid, @errorName(e) });
                 };

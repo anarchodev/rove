@@ -841,39 +841,6 @@ pub const KvStore = struct {
         return buf.toOwnedSlice(allocator) catch return Error.OutOfMemory;
     }
 
-    /// Snapshot-generation variant of `dumpTenantBundle`: serialize this
-    /// store's committed pairs WITHOUT a `durabilize(0)` first, so the bundle
-    /// reflects exactly the durable LMDB state (= the durabilized raft index in
-    /// its header), never the in-memory overlay. This is what a raft *snapshot*
-    /// needs — a consistent image at a KNOWN raft index — and, because it only
-    /// opens a read snapshot (no write), it is safe to call on the raft pump
-    /// thread without an extra fold (the pump's `durabilizeTick` already
-    /// maintains the durable point). Caller takes the snapshot index from the
-    /// matching `durabilized_idx`.
-    pub fn dumpTenantBundleReadOnly(self: *KvStore, allocator: std.mem.Allocator) Error![]u8 {
-        var snap = self.manifest.openSnapshot() catch return Error.Sqlite;
-        defer snap.close();
-
-        var buf: std.ArrayList(u8) = .empty;
-        errdefer buf.deinit(allocator);
-        var w = buf.writer(allocator);
-        kvexp.dumpTenantBundle(&snap, self.store_id, &w) catch return Error.Sqlite;
-        return buf.toOwnedSlice(allocator) catch return Error.OutOfMemory;
-    }
-
-    /// Install a raft snapshot bundle: load the pairs and stamp the durable
-    /// watermark to `raft_idx` (the snapshot's index) in one fold, so on the
-    /// follower the store and `lastAppliedRaftIdx` advance together to the
-    /// snapshot point. Unlike `loadTenantBundle` (which uses `durabilize(0)` to
-    /// leave the watermark untouched — a fresh move-destination sequence), a
-    /// snapshot REPLACES state at a known raft index, so the watermark must
-    /// move with it. The load + watermark stamp are one exclusive kvexp txn.
-    pub fn loadSnapshotBundle(self: *KvStore, bundle: []const u8, raft_idx: u64) Error!void {
-        var stream = std.io.fixedBufferStream(bundle);
-        _ = kvexp.loadTenantBundle(self.manifest, stream.reader(), .{}) catch return Error.Sqlite;
-        self.manifest.durabilize(raft_idx) catch return Error.Io;
-    }
-
     /// Load a migration bundle (produced by `dumpTenantBundle` on the
     /// source) into this handle's manifest, creating the store the bundle
     /// names if absent and committing every pair in one txn. The MOVE

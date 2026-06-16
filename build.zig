@@ -977,9 +977,6 @@ pub fn build(b: *std.Build) void {
     // requirement for the Phase-2 seam.
     v2_node_mod.addImport("kvlimbs", kv_mod);
     v2_node_mod.addImport("raft-net", raftnet_mod);
-    // rove-blob: raft snapshots stage the per-tenant store bundle in S3
-    // (src/consensus/snapshot.zig, pulled in relatively by node.zig).
-    v2_node_mod.addImport("rove-blob", blob_mod);
     const v2_node_test = b.addTest(.{ .root_module = v2_node_mod });
 
     // ── V2 Phase 6 — hibernation / active-set pump-cost microbench ─────
@@ -1043,10 +1040,6 @@ pub fn build(b: *std.Build) void {
     v2_bridge_mod.addImport("raft_rs_zig", raft_dep.module("raft_rs_zig"));
     v2_bridge_mod.addImport("kvlimbs", kv_mod);
     v2_bridge_mod.addImport("raft-net", raftnet_mod);
-    // rove-blob: raft snapshot bundles are S3-staged (consensus/snapshot.zig).
-    // This is the shared bridge module instance js_mod / rewind_mod / cp_mod
-    // all import, so adding it here threads rove-blob into every consumer.
-    v2_bridge_mod.addImport("rove-blob", blob_mod);
     const v2_bridge_test = b.addTest(.{ .root_module = v2_bridge_mod });
     const run_v2_bridge_test = b.addRunArtifact(v2_bridge_test);
     v2_test_step.dependOn(&run_v2_bridge_test.step);
