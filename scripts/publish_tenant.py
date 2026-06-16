@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """publish_tenant.py — publish a tenant bundle to the production cluster.
 
+DEPRECATED / BROKEN (2026-06-16): the `/_system/deploy` route this posts to was
+removed when deploy moved into the standing __admin__ app (rewind-cli-plan §4.2).
+Use the `rewind` operator CLI instead: `zig build rewind` then
+`rewind deploy <tenant> <bundle> --release` (provision/host mapping are not yet
+ported to the CLI — see plan §2). Kept here only for its --provision/--host
+reference until those verbs land in `rewind`.
+
 The codified form of the proven publish path (deploy-plan §8 item 4). The
 build/stage step now lives IN the worker (files-server dissolved,
 docs/rewind-cli-plan.md §4): one `POST /_system/deploy` over the private plane
