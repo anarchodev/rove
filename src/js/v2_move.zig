@@ -138,6 +138,8 @@ pub fn tryHandleV2(
         try handleConfChange(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-confstate")) {
         try handleConfState(server, allocator, worker, ent, sid, sess, method, path);
+    } else if (std.mem.eql(u8, sys_rest, "v2-member-status")) {
+        try handleMemberStatus(server, allocator, worker, ent, sid, sess, method, path);
     } else if (std.mem.eql(u8, sys_rest, "v2-applied-baseline")) {
         try handleAppliedBaseline(server, allocator, worker, ent, sid, sess, method, path);
     } else if (std.mem.eql(u8, sys_rest, "v2-load-replace")) {
@@ -898,6 +900,69 @@ fn handleConfState(
     for (cs.learners, 0..) |id, i| {
         if (i > 0) w.writeByte(',') catch {};
         w.print("{d}", .{id}) catch {};
+    }
+    w.writeAll("]}\n") catch {};
+    const out = buf.toOwnedSlice(allocator) catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
+}
+
+/// `GET /_system/v2-member-status?tenant=` → the LEADER's per-peer replication
+/// view — the membership reconciler's "is node N a caught-up member" signal,
+/// which `v2-confstate` alone can't give (a phantom voter shows in `voters`
+/// with `matched=0`). Shape:
+///   {"leader_last":N,"voters":[…],"learners":[…],
+///    "peers":[{"id":I,"matched":M,"recent_active":B}, …]}
+/// `peers` is the peer VOTERS (self excluded) with their match index + activity;
+/// combined with `voters`/`learners` (the ConfState) the caller derives, per
+/// desired node, whether it is a caught-up voter (`matched ≈ leader_last &&
+/// recent_active`), a learner, or absent. 409 on a non-leader (only the leader
+/// tracks peer progress — query `v2-leader` first); 404 if the group is not on
+/// this node.
+fn handleMemberStatus(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    path: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "GET"))
+        return reply(server, allocator, ent, sid, sess, 405, "GET only\n");
+    const tenant = queryParam(path, "tenant") orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing ?tenant\n");
+    const gid = worker.raft.gidForTenant(tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
+    var ids: [16]u64 = undefined;
+    var matched: [16]u64 = undefined;
+    var active: [16]u8 = undefined;
+    const vp = worker.raft.voterProgress(gid, &ids, &matched, &active) orelse
+        return reply(server, allocator, ent, sid, sess, 409, "not leader; query v2-leader first\n");
+    var voters_buf: [16]u64 = undefined;
+    var learners_buf: [16]u64 = undefined;
+    const cs = worker.raft.confState(gid, &voters_buf, &learners_buf);
+    const voters: []const u64 = if (cs) |c| c.voters else &.{};
+    const learners: []const u64 = if (cs) |c| c.learners else &.{};
+
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var w = buf.writer(allocator);
+    w.print("{{\"leader_last\":{d},\"voters\":[", .{vp.leader_last}) catch
+        return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    for (voters, 0..) |id, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        w.print("{d}", .{id}) catch {};
+    }
+    w.writeAll("],\"learners\":[") catch {};
+    for (learners, 0..) |id, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        w.print("{d}", .{id}) catch {};
+    }
+    w.writeAll("],\"peers\":[") catch {};
+    for (0..vp.len) |i| {
+        if (i > 0) w.writeByte(',') catch {};
+        w.print("{{\"id\":{d},\"matched\":{d},\"recent_active\":{}}}", .{ ids[i], matched[i], active[i] != 0 }) catch {};
     }
     w.writeAll("]}\n") catch {};
     const out = buf.toOwnedSlice(allocator) catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
