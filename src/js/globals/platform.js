@@ -14,6 +14,9 @@
 
 (function () {
   const sys = _system.platform;
+  // `on.fetch` native (captured before `_harden.js` deletes `_system`) —
+  // `platform.compile` lowers to a bound fetch to a trusted compile door.
+  const sysOn = _system.on;
 
   /**
    * Admin control plane: cross-tenant kv access, the platform root
@@ -40,6 +43,45 @@
      */
     scope(id) {
       return sys.scope(id);
+    },
+
+    /**
+     * Compile handler sources to bytecode + content-address them into
+     * `scope`'s blobs, off the hot path (`rewind-cli-plan.md` §4.1).
+     * Admin-only (the issuing tenant is checked natively). Source →
+     * bytecode is the one irreducibly-native deploy step; it's async
+     * (compile is slow) but its result is deterministic + idempotent, so
+     * it needs no replay tape.
+     *
+     * **Bound, like {@link on.fetch}:** the call binds to the held chain,
+     * so you must `return next()` after it; the result resumes your
+     * handler at the `name` export (default `onFetchResult`) with
+     * `request.ctx = {ok, results:[{path, source_hex, bytecode_hex}]}`
+     * (or `{ok:false, status, error}`). Compose the manifest from those
+     * hashes + your statics and stamp it there. Stage/activate is still a
+     * separate `platform.releases.publish`.
+     *
+     * @param {Array<{path:string, source:string}>} files - Handler sources.
+     * @param {object} opts
+     * @param {string} opts.scope - Target instance id (where blobs stage).
+     * @param {string} [opts.name="onFetchResult"] - Resume export.
+     * @returns {string} The bound fetch id.
+     *
+     * @example
+     * platform.compile(handlers, { scope: tenant, name: "onCompiled" });
+     * return next();
+     * // export function onCompiled(request) {
+     * //   const { results } = request.ctx; ...stamp manifest...
+     * // }
+     */
+    compile(files, opts) {
+      opts = opts || {};
+      const body = JSON.stringify({ scope: opts.scope, files });
+      return sysOn.fetch(
+        "http://rove-compile.internal/",
+        { method: "POST", body },
+        { to: opts.name || "onFetchResult" },
+      );
     },
 
     /**
