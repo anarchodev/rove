@@ -891,6 +891,23 @@ pub const Node = struct {
         return self.mgr.confState(tenant_id, voters_buf, learners_buf);
     }
 
+    /// The term of the log entry at `index` on `tenant_id`'s group (0 if
+    /// compacted / beyond the log / unknown). The leader reports `term(applied)`
+    /// so a returning learner's promote-back baseline matches its log.
+    /// Pump-thread only.
+    pub fn logTerm(self: *Node, tenant_id: u64, index: u64) u64 {
+        return self.mgr.logTerm(tenant_id, index);
+    }
+
+    /// Install a DATA-FREE snapshot baseline at {index, term} into `tenant_id`'s
+    /// LOCAL group (conf_change promote-back). The node must be a below-floor
+    /// learner; the KV state for `index` must already be loaded out-of-band (the
+    /// move bundle). Fast-forwards the raft log baseline so the leader can
+    /// replicate the tail and the node can be promoted back. Pump-thread only.
+    pub fn applyLocalSnapshot(self: *Node, tenant_id: u64, index: u64, term: u64) Error!void {
+        return self.mgr.applyLocalSnapshot(tenant_id, index, term);
+    }
+
     /// Whether this node is the raft leader of `tenant_id`'s group. False
     /// for a group this node has not created yet (a tenant the bridge has
     /// `registerTenant`'d but whose `createGroupEpoch`/`ensureGroup` has not

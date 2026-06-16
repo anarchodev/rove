@@ -187,7 +187,7 @@ pub const GroupSig = struct {
 /// one, enqueues a pointer, and blocks on `done` until the pump has
 /// executed it and stamped `err` — so the struct outlives the wait.
 const ControlCmd = struct {
-    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state };
+    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state, apply_local_snapshot, log_term };
     kind: Kind,
     gid: u64,
     /// Borrowed from the gid's `GroupSig.id_str` (pointer-stable); used by
@@ -198,6 +198,10 @@ const ControlCmd = struct {
     /// 1 remove / 2 add_learner — matches `raft.Manager.ConfChange`).
     node_id: u64 = 0,
     cc_type: u8 = 0,
+    /// `apply_local_snapshot`: the baseline {index, term} to install.
+    /// `log_term`: `snap_index` is the query index, `snap_term` the result.
+    snap_index: u64 = 0,
+    snap_term: u64 = 0,
     /// `conf_state`: caller buffers to fill + the counts written back.
     cs_voters: []u64 = &.{},
     cs_learners: []u64 = &.{},
@@ -725,6 +729,27 @@ pub const Bridge = struct {
         return .{ .voters = voters_buf[0..cmd.cs_voters_len], .learners = learners_buf[0..cmd.cs_learners_len] };
     }
 
+    /// The term of the log entry at `index` on `gid`'s group (0 if compacted /
+    /// beyond the log / unknown / pump down). A leader reports `term(applied)`
+    /// for a returning learner's promote-back baseline. Pump-thread control cmd.
+    pub fn logTerm(self: *Bridge, gid: u64, index: u64) u64 {
+        var cmd: ControlCmd = .{ .kind = .log_term, .gid = gid, .snap_index = index };
+        self.runControl(&cmd) catch return 0;
+        return cmd.snap_term;
+    }
+
+    /// Install a DATA-FREE snapshot baseline at {index, term} into `gid`'s LOCAL
+    /// group (conf_change promote-back). The node must be a below-floor learner;
+    /// the KV state for `index` must already be loaded out-of-band (the move
+    /// bundle). Fast-forwards the raft log baseline so the leader can replicate
+    /// the tail and the node can be promoted back. Pump-thread control cmd.
+    /// `Error.NotLeader` if this node leads the group; `Error.SnapshotStale` if
+    /// `index` is not ahead of committed.
+    pub fn applyLocalSnapshot(self: *Bridge, gid: u64, index: u64, term: u64) Error!void {
+        var cmd: ControlCmd = .{ .kind = .apply_local_snapshot, .gid = gid, .snap_index = index, .snap_term = term };
+        return self.runControl(&cmd);
+    }
+
     /// Enqueue a control command for the pump thread and block until it
     /// runs. Requires the pump thread (the only `Manager` toucher) to be
     /// live; the move path always runs under `startPump`.
@@ -773,6 +798,14 @@ pub const Bridge = struct {
                         cmd.cs_learners_len = cs.learners.len;
                         cmd.cs_ok = true;
                     }
+                    break :blk null;
+                },
+                .log_term => blk: {
+                    cmd.snap_term = self.node.logTerm(cmd.gid, cmd.snap_index);
+                    break :blk null;
+                },
+                .apply_local_snapshot => blk: {
+                    self.node.applyLocalSnapshot(cmd.gid, cmd.snap_index, cmd.snap_term) catch |e| break :blk e;
                     break :blk null;
                 },
                 .transfer_all_leadership => blk: {
