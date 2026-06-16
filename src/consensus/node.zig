@@ -111,6 +111,25 @@ pub const DEFAULT_HIBERNATE_NS: i64 = 2 * std.time.ns_per_s;
 /// replay and lets the WAL be truncated. Tests override with a short value.
 pub const DEFAULT_DURABILIZE_NS: i64 = 500 * std.time.ns_per_ms;
 
+/// Auto-demote policy (conf_change Phase 2): on the leader, a peer voter that
+/// is BOTH this many entries behind the leader's last index AND `!recent_active`
+/// (no contact within ~an election timeout, under check_quorum) is demoted to a
+/// learner. A permanently-dead voter pins the voters-only WAL-compaction floor
+/// (`minMatchIndex`) → unbounded WAL growth; demoting it unpins the floor so the
+/// log truncates again. No availability loss: a dead voter could never form
+/// quorum anyway, so the live nodes were already load-bearing; demote just makes
+/// the voter math honest (and lets the learner be promoted back out-of-band once
+/// it returns and catches up). The lag threshold is the anti-flap: a node must
+/// be gone long enough to fall this far behind, and `recent_active` recovers the
+/// instant one heartbeat ack arrives. 0 disables auto-demote.
+pub const DEFAULT_AUTO_DEMOTE_LAG: u64 = 10_000;
+
+/// How often the pump evaluates the auto-demote policy over its led+dirty
+/// groups. Coarse (the WAL-growth pressure it relieves is slow); well above the
+/// election timeout so `recent_active` is meaningful. Tests override with a
+/// short value.
+pub const DEFAULT_AUTO_DEMOTE_NS: i64 = 5 * std.time.ns_per_s;
+
 /// Resolves the store a replicated entry applies to, keyed by the
 /// envelope's tenant id string. Two callers need it:
 ///
@@ -383,6 +402,11 @@ pub const Node = struct {
     /// the overlay into LMDB is an fsync, amortized over many commits.
     last_durabilize_ns: i64 = 0,
     durabilize_interval_ns: i64 = DEFAULT_DURABILIZE_NS,
+    /// Auto-demote policy (see `DEFAULT_AUTO_DEMOTE_LAG`): lag threshold in
+    /// entries (0 disables), evaluation cadence, and last-run wall-clock.
+    auto_demote_lag: u64 = DEFAULT_AUTO_DEMOTE_LAG,
+    auto_demote_interval_ns: i64 = DEFAULT_AUTO_DEMOTE_NS,
+    last_auto_demote_ns: i64 = 0,
     /// Whether `durabilizeTick` also COMPACTS the WAL (single-node only) after
     /// durabilizing — truncating the log up to the durabilized index so it stays
     /// bounded. ON. Safe because durabilize folds the overlay into LMDB (and
@@ -1198,6 +1222,11 @@ pub const Node = struct {
         // Hibernate: stop ticking any group idle past its deadline.
         self.sweepHibernated(now);
 
+        // Leader-side auto-demote: drop a far-behind, presumed-dead voter to a
+        // learner so it stops pinning the WAL-compaction floor. Before the
+        // durabilize so a demote's higher floor takes effect this same tick.
+        self.autoDemoteTick(now);
+
         // Checkpoint: fold each dirty store's overlay into LMDB + stamp its
         // watermark + (single-node) compact the WAL. Interval-gated, O(dirty).
         self.durabilizeTick(now);
@@ -1320,6 +1349,63 @@ pub const Node = struct {
             }
         }
         self.dirty.shrinkRetainingCapacity(keep);
+    }
+
+    /// Leader-side auto-demote policy (conf_change Phase 2). For each group this
+    /// node leads with un-durabilized writes (so the log is actively advancing
+    /// and a dead voter is pinning the WAL floor), demote the first voter that
+    /// is BOTH far behind (`lag > auto_demote_lag`) AND `!recent_active` to a
+    /// learner — it can no longer form quorum anyway, so this loses no real
+    /// availability while unpinning `minMatchIndex` so the WAL truncates. At most
+    /// one demote per group per pass (a raft conf-change must commit before the
+    /// next is proposed). Interval-gated + warmup-skipped so a freshly-started or
+    /// freshly-elected leader gives peers a window to check in first. Gated on
+    /// `compact_wal` (the only benefit is unpinning compaction) and a non-zero
+    /// `auto_demote_lag`. Pump-thread only.
+    fn autoDemoteTick(self: *Node, now: i64) void {
+        if (self.auto_demote_lag == 0 or !self.compact_wal) return;
+        if (self.dirty.items.len == 0) return;
+        // Warmup: the first pass after start/elect just stamps the clock and
+        // returns, so peers get a full interval to report in before we judge
+        // them dead (`last_auto_demote_ns` starts at 0 ⇒ would fire immediately).
+        if (self.last_auto_demote_ns == 0) {
+            self.last_auto_demote_ns = now;
+            return;
+        }
+        if (now - self.last_auto_demote_ns < self.auto_demote_interval_ns) return;
+        self.last_auto_demote_ns = now;
+
+        var ids_buf: [16]u64 = undefined;
+        var matched_buf: [16]u64 = undefined;
+        var active_buf: [16]u8 = undefined;
+        var prog_buf: [16]raft.Manager.VoterProgress = undefined;
+        for (self.dirty.items) |gid| {
+            if (!self.mgr.isLeader(gid)) continue;
+            const view = self.mgr.voterProgress(gid, &ids_buf, &matched_buf, &active_buf, &prog_buf) orelse continue;
+            for (view.peers) |p| {
+                if (p.recent_active) continue; // still in contact — keep it
+                const lag = view.leader_last -| p.matched;
+                if (lag <= self.auto_demote_lag) continue;
+                // Demote this dead, far-behind voter to a learner. One per group
+                // per pass; the FFI quorum-guard refuses a demote that would drop
+                // below 2 voters (swallowed — expected, not an error here).
+                self.mgr.proposeConfChange(gid, p.id, .add_learner) catch |e| switch (e) {
+                    raft.Error.ConfChangeQuorumGuard => {
+                        std.log.debug("v2 auto-demote gid={d} node={d}: refused (would drop below 2 voters)", .{ gid, p.id });
+                        break;
+                    },
+                    else => {
+                        std.log.warn("v2 auto-demote gid={d} node={d}: propose failed: {s}", .{ gid, p.id, @errorName(e) });
+                        break;
+                    },
+                };
+                std.log.info(
+                    "v2 auto-demote gid={d}: voter {d} demoted to learner (lag={d} > {d}, !recent_active) — unpinning WAL floor",
+                    .{ gid, p.id, lag, self.auto_demote_lag },
+                );
+                break; // one conf-change per group per pass
+            }
+        }
     }
 
     /// Enqueue `slot` for the next `durabilizeTick` if not already (its
