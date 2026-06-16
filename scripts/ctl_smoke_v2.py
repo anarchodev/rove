@@ -3,9 +3,9 @@
 harness (`smoke_lib_v2`). Proves the harness end to end:
 
   - provision a tenant via the CP
-  - deploy two routes (root + /api) via files-server-v2
+  - deploy two routes (root + /api) via the worker /_system/deploy
   - GET each through the front door (Host→cluster routing)
-  - a wrong-secret JWT is rejected by the files-server (401)
+  - a wrong-secret token is rejected by /_system/deploy (401)
 
 Dropped from the V1 ctl_smoke (don't map to V2): TLS/https (V2 is h2c),
 3-node follower-503 (V2 is serve-or-forward via the front door, not
@@ -66,13 +66,18 @@ def main() -> int:
             check("GET /api?fn=handler → ctl-api", r.status == 200 and "ctl-api" in r.body,
                   f"got {r.status} {r.body!r}")
 
-        print("step 4: wrong-secret JWT is rejected by the files-server (401)")
+        print("step 4: a wrong-secret token is rejected by /_system/deploy (401)")
+        import base64
+        import json as _json
         wrong = mint_jwt("00" * 32, {"exp": int((time.time() + 300) * 1000)})
         from smoke_lib_v2 import _curl
-        r = _curl(f"{c.files_origin()}/acme/upload", method="POST",
-                  headers={"Authorization": f"Bearer {wrong}", "X-Rove-Path": "index.mjs"},
-                  data=ROOT_SRC)
-        check("upload with wrong JWT → 401", r.status == 401, f"got {r.status}")
+        r = _curl(f"{c.node_url()}/_system/deploy", method="POST", host=c.admin_host(),
+                  headers={"Authorization": f"Bearer {wrong}",
+                           "Content-Type": "application/json"},
+                  data=_json.dumps({"tenant_id": "acme", "files": [
+                      {"path": "index.mjs", "kind": "handler", "content_type": "",
+                       "b64": base64.b64encode(ROOT_SRC.encode()).decode()}]}))
+        check("deploy with wrong token → 401", r.status == 401, f"got {r.status}")
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")

@@ -256,37 +256,11 @@ pub fn build(b: *std.Build) void {
     acme_mod.linkSystemLibrary("crypto", .{});
     acme_mod.addImport("rove-blob", blob_mod);
 
-    // ── rove-files-server: per-instance code operations (Phase 5) ──
-    //
-    // Compile + upload + deploy + source fetch, wrapping rove-files.
-    // Each operation opens its own per-instance SQLite connection so
-    // it's safe to call off the worker's h2 thread — later slices add
-    // a thread pool and an h2 proxy endpoint for `/_system/files/*`.
-    // Needs libc + nghttp2/ssl/crypto because it pulls in rove-qjs,
-    // which transitively brings in the C runtime link requirements.
-    const files_server_mod = b.addModule("rove-files-server", .{
-        .root_source_file = b.path("src/files_server/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    files_server_mod.link_libc = true;
-    files_server_mod.linkSystemLibrary("nghttp2", .{});
-    files_server_mod.linkSystemLibrary("ssl", .{});
-    files_server_mod.linkSystemLibrary("crypto", .{});
-    files_server_mod.addImport("rove", rove_mod);
-    files_server_mod.addImport("rove-io", io_mod);
-    files_server_mod.addImport("rove-h2", h2_mod);
-    files_server_mod.addImport("raft-kv", kv_mod);
-    files_server_mod.addImport("rove-blob", blob_mod);
-    files_server_mod.addImport("rove-files", files_mod);
-    files_server_mod.addImport("rove-qjs", qjs_mod);
-    files_server_mod.addImport("rove-jwt", jwt_mod);
-    // Admin + replay tenant bundles are NOT embedded — they're read
-    // from disk at bootstrap by files-server-standalone via its
-    // `--web-root <path>` flag (see src/files_server/bootstrap.zig
-    // and examples/files_server_standalone.zig). Production deploys
-    // ship `web/` alongside the binary; dev iteration is "restart
-    // files-server-standalone, no rebuild required."
+    // rove-files-server was dissolved into the worker's `/_system/deploy`
+    // endpoint (docs/rewind-cli-plan.md §4): the worker already links
+    // rove-files + rove-qjs + rove-blob, so compile + content-address +
+    // stamp-manifest now runs IN the worker (on the background
+    // DeployThread). The separate binary + its trust domain are gone.
 
     // ── Tests ──
     const test_step = b.step("test", "Run all unit tests");
@@ -338,10 +312,6 @@ pub fn build(b: *std.Build) void {
     // rove-bodies tests
     const bodies_tests = b.addTest(.{ .root_module = bodies_mod });
     test_step.dependOn(&b.addRunArtifact(bodies_tests).step);
-
-    // rove-files-server tests
-    const files_server_tests = b.addTest(.{ .root_module = files_server_mod });
-    test_step.dependOn(&b.addRunArtifact(files_server_tests).step);
 
     // rove-log-server tests — a dedicated `log-server-test` step, kept OUT of
     // the aggregate `test`: the shared module stays sqlite-free (sqlite is
@@ -448,10 +418,6 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-tenant", tenant_mod);
     js_mod.addImport("rove-ssrf", ssrf_mod);
     js_mod.addImport("rove-plan", plan_mod);
-    // Worker reads the per-deployment manifest at release time so the
-    // _config/ → kv mirror (config_mirror.zig) can stage config rows
-    // alongside the _deploy/current flip.
-    js_mod.addImport("rove-files-server", files_server_mod);
     // JS-side runtime polyfills evaluated into every dispatcher's QJS
     // context after the native CFunction bindings install.
     // retry.js provides a customer-side retry helper layered on
@@ -577,32 +543,12 @@ pub fn build(b: *std.Build) void {
     // `sweepOwedRetriesOnPromotion` covers the same shape; see
     // `scripts/webhook_recovery_smoke.py` for end-to-end coverage.
 
-    // V1→V2 cutover: `files-server-standalone` (examples/files_server_standalone.zig,
-    // its own willemt-raft `Cluster`) was RETIRED — replaced by `files-server-v2`
-    // below (cluster-free; the flip is the worker's `/_system/release`).
-
-    // files-server-v2: the cluster-free V2 deploy artifact (branch `v2`).
-    // The V1 `files-server-standalone` brings up its own willemt-raft cluster
-    // (dead on V2); this one is a pure compile + manifest + blob-write service
-    // that shares the rewind worker's BlobBackend and delegates the
-    // `_deploy/current` flip to the worker's `/_system/release`. Behind its own
-    // named step (not the default install) so it builds on the V2 branch where
-    // the V1 binaries don't.
-    const fs_v2_mod = b.addModule("files-server-v2", .{
-        .root_source_file = b.path("src/files_server/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    fs_v2_mod.addImport("rove-files-server", files_server_mod);
-    fs_v2_mod.addImport("rove-blob", blob_mod);
-    fs_v2_mod.addImport("rove-h2", h2_mod);
-    fs_v2_mod.addImport("raft-kv", kv_mod);
-    const fs_v2_exe = b.addExecutable(.{
-        .name = "files-server-v2",
-        .root_module = fs_v2_mod,
-    });
-    const fs_v2_step = b.step("files-server-v2", "Build the cluster-free V2 files-server (deploy publisher)");
-    fs_v2_step.dependOn(&b.addInstallArtifact(fs_v2_exe, .{}).step);
+    // files-server (V1 `files-server-standalone` and the cluster-free V2
+    // `files-server-v2`) is RETIRED — dissolved into the worker's
+    // `/_system/deploy` endpoint (docs/rewind-cli-plan.md §4). Compile +
+    // manifest + blob-write run IN the worker on the background
+    // DeployThread; the `_deploy/current` flip stays the worker's
+    // `/_system/release`. No separate deploy binary or trust domain.
 
     // sse-server-standalone: RETIRED (task #10 Phase 3). The SSE
     // notification service now runs as a loop46-internal thread

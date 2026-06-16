@@ -2,11 +2,22 @@
 
 > 🟢 **As-built reference.** How customer code is published and loaded, how
 > static assets are served, and how request logs reach a queryable store. Owns
-> the `files-server-v2` publisher, the worker's deployment loader (`src/js/
-> deployment_cache.zig` + siblings), `src/blob/`, and `src/log_server/`. Neither
-> path goes through raft for bytes — both ride the shared content-addressed
-> store / S3. Why: [decisions.md §7](../decisions.md) (the customer-logs vs
-> operator-signals split) and §11 (deployment/logs storage decisions).
+> the publish path (now the worker's `/_system/deploy`), the worker's
+> deployment loader (`src/js/deployment_cache.zig` + siblings), `src/blob/`,
+> and `src/log_server/`. Neither path goes through raft for bytes — both ride
+> the shared content-addressed store / S3. Why: [decisions.md §7](../decisions.md)
+> (the customer-logs vs operator-signals split) and §11 (deployment/logs
+> storage decisions).
+>
+> ⚠️ **Update (2026-06-15): files-server dissolved.** The separate
+> `files-server-v2` publisher binary is **gone** — compile + content-address +
+> stamp-manifest now run **in the worker** on a background `DeployThread`
+> behind `POST /_system/deploy` (sibling to `/_system/release`). The mechanism
+> below (compile → content-addressed blobs → manifest in the per-tenant
+> `deployments/` backend → `_deploy/current` flip) is unchanged; only the
+> *host* moved from a standalone binary into the worker. Where this doc says
+> "files-server", read "the worker's `/_system/deploy`". See
+> [rewind-cli-plan.md §4](../rewind-cli-plan.md) for the why + the design.
 
 ## The shape in one paragraph
 

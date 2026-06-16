@@ -19,7 +19,6 @@ zig build test         # Run all unit tests (inline Zig tests across all modules
 zig build rewind-worker # Build the V2 worker binary (src/rewind/main.zig)
 zig build rewind-cp    # Build the V2 control plane (directory + provisioning)
 zig build rewind-front # Build the V2 stateless front door (Host→cluster proxy)
-zig build files-server-v2  # Build the cluster-free V2 deploy publisher
 zig build v2-test      # V2 raft substrate tests
 zig build echo-server  # Run the TCP echo server example
 zig build h2-echo-server  # Run the HTTP/2 echo server example
@@ -48,8 +47,10 @@ python3 scripts/tenant_move_smoke.py   # live tenant move cluster-1 → cluster-
 ```
 
 `scripts/smoke_lib_v2.py` is the V2 harness — `V2Cluster.spawn` brings up
-rewind-cp + front door + rewind node(s) + files-server-v2 and exposes
-`provision` / `deploy_handlers` / `wait_for_handler`; `scripts/v2_topology.py`
+rewind-cp + front door + rewind node(s) and exposes `provision` /
+`deploy_handlers` / `wait_for_handler` (deploys go through the worker's
+`/_system/deploy` — files-server dissolved, `docs/rewind-cli-plan.md` §4);
+`scripts/v2_topology.py`
 holds the per-binary spawn primitives. The functional smokes were ported as
 `*_smoke_v2.py` (~40 of them); the original un-suffixed versions spawn the
 retired `loop46` binary via `smoke_lib.py` and are dead — `smoke_lib.py`
@@ -73,8 +74,8 @@ rove-tenant (account/domain metadata) ────┤
 rove-qjs (arenajs JS engine wrapper) ─────┤
 rove-acme (ACME HTTP-01 client) ──────────┤
                                           ↓
-                  rove-js (worker dispatcher; imports bridge + the above)
-                  rove-files-server (compile/deploy HTTP surface)
+                  rove-js (worker dispatcher; imports bridge + the above;
+                           compiles + stages deploys via /_system/deploy)
                   rove-log-server (log query HTTP surface)
 
 consensus (src/consensus/, V2): node.zig (per-tenant raft-rs groups, pump,
@@ -87,8 +88,9 @@ cp-directory (src/cp/directory.zig): tenant→cluster routing, backed by a
 binaries:  rewind-worker (src/rewind/)  the worker — rove-js on the bridge
            rewind-cp     (src/cp/)      replicated directory + provisioning + moves
            rewind-front  (src/front/)   stateless Host→cluster proxy — no raft state
-           files-server-v2     (src/files_server/main.zig)  deploy publisher
            rewind-logs   (src/log_server/main.zig)  log query surface
+           (deploy/publish is the worker's /_system/deploy — no separate
+            files-server binary; docs/rewind-cli-plan.md §4)
 ```
 
 **`raft-kv` is the spine-free KV facade** (`src/kv/kvlimbs.zig`) — the

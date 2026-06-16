@@ -21,7 +21,7 @@ thread, spawned by `Worker.create`, was already running) + a per-cluster
 
 Needs S3 env: `set -a; . ./.env; set +a` first.  Also needs `node` (the .mjs
 driver) and a default `zig build` (for `rewind-logs`).
-Build: `zig build rewind-worker rewind-cp rewind-front files-server-v2` + `zig build`
+Build: `zig build rewind-worker rewind-cp rewind-front` + `zig build`
 """
 
 from __future__ import annotations
@@ -192,31 +192,23 @@ def main() -> int:
                 # ── step 5: compose the replay bundle + run the WASM driver. ─
                 if tapes.get("kv_tape_b64"):
                     print("step 5: ⭐ compose a replay bundle + run the WASM driver")
-                    dep_hex = f"{rec['deployment_id']:016x}"
-                    jwt_hdr = {"Authorization": f"Bearer {c.services_jwt}"}
-                    mf = _curl(f"{c.files_origin()}/{TENANT}/deployments/{dep_hex}",
-                               headers=jwt_hdr)
-                    handler_entries = []
-                    if mf.status == 200:
-                        try:
-                            handler_entries = [e for e in json.loads(mf.body).get("entries", [])
-                                               if e.get("kind") == "handler"]
-                        except json.JSONDecodeError:
-                            pass
-                    check(f"manifest dep_id={dep_hex} has handler entries",
-                          bool(handler_entries), f"got {mf.status} {mf.body[:120]!r}")
-
-                    modules = []
-                    for e in handler_entries:
-                        src = _curl(f"{c.files_origin()}/{TENANT}/source/{e['hash']}",
-                                    headers=jwt_hdr)
-                        if src.status != 200:
-                            check(f"source fetch {e['path']}", False,
-                                  f"got {src.status}")
-                            handler_entries = []
-                            break
-                        modules.append({"path": e["path"], "hash": e["hash"],
-                                        "source": src.body})
+                    # files-server is dissolved (docs/rewind-cli-plan.md §4),
+                    # so there's no /deployments + /source read-back surface.
+                    # The smoke already HAS the deployed source locally, so
+                    # compose the replay bundle from it directly — the hash is
+                    # just sha256 of the source bytes (what stageDeployment
+                    # content-addresses on).
+                    import hashlib
+                    deployed = {"index.mjs": rpc_wrap(HANDLER_SRC)}
+                    handler_entries = [
+                        {"path": p, "hash": hashlib.sha256(s.encode()).hexdigest(),
+                         "kind": "handler"}
+                        for p, s in deployed.items()
+                    ]
+                    modules = [{"path": p, "hash": e["hash"], "source": s}
+                               for (p, s), e in zip(deployed.items(), handler_entries)]
+                    check("composed replay bundle from local source",
+                          bool(handler_entries), f"entries={len(handler_entries)}")
 
                     if handler_entries:
                         entry_path = next((e["path"] for e in handler_entries
