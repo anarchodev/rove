@@ -39,6 +39,7 @@ const h2 = @import("rove-h2");
 const globals_mod = @import("../globals.zig");
 const components_mod = @import("../components.zig");
 const blob_receive_mod = @import("../blob_receive.zig");
+const deploy_thread_mod = @import("../deploy_thread.zig");
 
 /// Output the handler emits to its return. Released by the
 /// reconciler's commit arm (`Continuation.releaseOnCommit` →
@@ -356,6 +357,14 @@ pub fn interpretCmd(
             // worker (thread-affine with its h2 instance) instead.
             if (blob_receive_mod.isReceiveUrl(pf.url)) {
                 worker.armBlobReceive(pf);
+                return;
+            }
+            // platform.compile (rewind-cli-plan §4.1): the compile-door
+            // URL never reaches libcurl — hand the bundle to the worker's
+            // background DeployThread, which compiles + stages + emits the
+            // terminal bound event that resumes the held admin chain.
+            if (deploy_thread_mod.isCompileUrl(pf.url)) {
+                worker.submitCompile(pf);
                 return;
             }
             const engine = worker.node.fetch_engine orelse {

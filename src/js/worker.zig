@@ -2145,6 +2145,7 @@ pub fn Worker(comptime opts: Options) type {
             const dt = try deploy_thread_mod.DeployThread.init(
                 self.allocator,
                 self.node.blob_backend_cfg,
+                &self.node.router,
             );
             errdefer dt.deinit();
             try dt.start();
@@ -2581,6 +2582,121 @@ pub fn Worker(comptime opts: Options) type {
             job.start() catch {
                 job.markGone();
                 job.failNow();
+            };
+        }
+
+        /// `platform.compile` submit door (`rove-cli-plan.md` §4.1). The
+        /// shim issues an `on.fetch` to `rove-compile.internal`; the
+        /// finalize seam binds it (connection_scoped + held); `interpretCmd`
+        /// routes the URL here instead of libcurl. We parse `{scope, files}`
+        /// from the fetch body, hand a `compile_batch` job to the
+        /// DeployThread, and let it emit the terminal bound event that
+        /// resumes the held chain. ADMIN-ONLY: only `__admin__` may compile
+        /// (cross-tenant staging) — the issuing tenant is native-set on the
+        /// PendingFetch, not forgeable by JS. On any rejection we route a
+        /// failure event so the held chain resolves instead of hanging.
+        pub fn submitCompile(self: *Self, pf_in: globals.PendingFetch) void {
+            var pf = pf_in;
+            defer pf.deinit(self.allocator);
+            const a = self.allocator;
+            const router = &self.node.router;
+
+            const fail = struct {
+                fn emit(rt: *MsgRouter, alloc: std.mem.Allocator, p: *const globals.PendingFetch, status: u16, msg: []const u8) void {
+                    const cj = std.fmt.allocPrint(alloc, "{{\"ok\":false,\"status\":{d},\"error\":\"{s}\"}}", .{ status, msg }) catch return;
+                    deploy_thread_mod.routeCompileEvent(rt, alloc, p.id, p.tenant_id, p.name, status, false, cj);
+                }
+            }.emit;
+
+            if (!std.mem.eql(u8, pf.tenant_id, tenant_mod.ADMIN_INSTANCE_ID)) {
+                std.log.warn("rove-js compile: non-admin tenant {s} attempted platform.compile; rejecting", .{pf.tenant_id});
+                return fail(router, a, &pf, 403, "platform.compile is admin-only");
+            }
+            const dt = self.deploy_thread orelse return fail(router, a, &pf, 503, "deploy thread not started");
+
+            var parsed = std.json.parseFromSlice(struct {
+                scope: []const u8,
+                files: []const struct { path: []const u8, source: []const u8 },
+            }, a, pf.body, .{ .ignore_unknown_fields = true }) catch
+                return fail(router, a, &pf, 400, "expected {scope, files:[{path,source}]}");
+            defer parsed.deinit();
+            const p = parsed.value;
+            if (p.scope.len == 0) return fail(router, a, &pf, 400, "scope required");
+            if (p.files.len == 0) return fail(router, a, &pf, 400, "at least one file required");
+            if (p.files.len > 256) return fail(router, a, &pf, 400, "too many files (max 256)");
+
+            // Build owned DeployInput[] (all handlers).
+            const inputs = a.alloc(files_mod.DeployInput, p.files.len) catch
+                return fail(router, a, &pf, 500, "out of memory");
+            var built: usize = 0;
+            const inputs_ok = blk: {
+                for (p.files) |f| {
+                    const path_owned = a.dupe(u8, f.path) catch break :blk false;
+                    const src_owned = a.dupe(u8, f.source) catch {
+                        a.free(path_owned);
+                        break :blk false;
+                    };
+                    inputs[built] = .{ .path = path_owned, .kind = .handler, .content_type = "", .bytes = src_owned };
+                    built += 1;
+                }
+                break :blk true;
+            };
+            const freeInputs = struct {
+                fn f(alloc: std.mem.Allocator, ins: []files_mod.DeployInput, n: usize) void {
+                    for (ins[0..n]) |*in| {
+                        alloc.free(in.path);
+                        alloc.free(in.bytes);
+                    }
+                    alloc.free(ins);
+                }
+            }.f;
+            if (!inputs_ok) {
+                freeInputs(a, inputs, built);
+                return fail(router, a, &pf, 500, "out of memory");
+            }
+
+            // Owned routing fields (scope to stage into; chain tenant + fetch
+            // id + resume export to route the completion back to the held
+            // admin chain). On any dupe failure, free everything.
+            const scope_owned = a.dupe(u8, p.scope) catch {
+                freeInputs(a, inputs, built);
+                return fail(router, a, &pf, 500, "out of memory");
+            };
+            const chain_owned = a.dupe(u8, pf.tenant_id) catch {
+                a.free(scope_owned);
+                freeInputs(a, inputs, built);
+                return fail(router, a, &pf, 500, "out of memory");
+            };
+            const fid_owned = a.dupe(u8, pf.id) catch {
+                a.free(scope_owned);
+                a.free(chain_owned);
+                freeInputs(a, inputs, built);
+                return fail(router, a, &pf, 500, "out of memory");
+            };
+            const name_owned: []u8 = if (pf.name.len != 0) (a.dupe(u8, pf.name) catch {
+                a.free(scope_owned);
+                a.free(chain_owned);
+                a.free(fid_owned);
+                freeInputs(a, inputs, built);
+                return fail(router, a, &pf, 500, "out of memory");
+            }) else &.{};
+
+            self.next_compile_id += 1;
+            dt.enqueue(.{
+                .compile_id = self.next_compile_id,
+                .kind = .compile_batch,
+                .tenant_id = scope_owned,
+                .inputs = inputs,
+                .chain_tenant = chain_owned,
+                .fetch_id = fid_owned,
+                .name = name_owned,
+            }) catch {
+                a.free(scope_owned);
+                a.free(chain_owned);
+                a.free(fid_owned);
+                if (name_owned.len != 0) a.free(name_owned);
+                freeInputs(a, inputs, built);
+                return fail(router, a, &pf, 503, "deploy queue unavailable");
             };
         }
 
