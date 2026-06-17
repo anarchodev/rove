@@ -188,7 +188,7 @@ pub const GroupSig = struct {
 /// one, enqueues a pointer, and blocks on `done` until the pump has
 /// executed it and stamped `err` — so the struct outlives the wait.
 const ControlCmd = struct {
-    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term, last_index };
+    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term, last_index, applied_index };
     kind: Kind,
     gid: u64,
     /// Borrowed from the gid's `GroupSig.id_str` (pointer-stable); used by
@@ -816,6 +816,17 @@ pub const Bridge = struct {
         return cmd.snap_index;
     }
 
+    /// This group's LIVE applied index on the leader (`slot.applied_idx`) — the
+    /// out-of-band baseline a new member is born at. Always >= the leader's first
+    /// (compacted) log index, so the baseline points at an entry the leader still
+    /// holds (unlike the durabilized store watermark, which lags under churn).
+    /// Pump op. 0 on unknown group / pump failure.
+    pub fn appliedIndex(self: *Bridge, gid: u64) u64 {
+        var cmd: ControlCmd = .{ .kind = .applied_index, .gid = gid };
+        self.runControl(&cmd) catch return 0;
+        return cmd.snap_index;
+    }
+
     /// Install a DATA-FREE snapshot baseline at {index, term} into `gid`'s LOCAL
     /// group (conf_change promote-back). The node must be a below-floor learner;
     /// the KV state for `index` must already be loaded out-of-band (the move
@@ -921,6 +932,10 @@ pub const Bridge = struct {
                 },
                 .last_index => blk: {
                     cmd.snap_index = self.node.lastIndex(cmd.gid);
+                    break :blk null;
+                },
+                .applied_index => blk: {
+                    cmd.snap_index = self.node.appliedIndex(cmd.gid);
                     break :blk null;
                 },
                 .apply_local_snapshot => blk: {
