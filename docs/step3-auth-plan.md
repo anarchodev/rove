@@ -242,11 +242,25 @@ the shift lands when it's live. The full retirement of the root token is the
 > ops through the dashboard; the release-reconciler + reset-via-CP (which retire
 > the root token) are the larger follow-on arc captured there.
 
-### B5. Build the `rewind` customer CLI — *M*
+### B5. Build the `rewind` customer CLI — *M (in progress)*
 Shares `src/cli/common.zig` with `rewind-ops` (bundle classifier + mint),
-but authenticates via OIDC (device/redirect login → session) instead of
-raw secrets. Verbs: `deploy` / `release` / `logs <tenant>`, each
-obtaining a tenant-scoped cap after one login. Depends on B1.
+but authenticates via OIDC (device login → session) instead of raw secrets.
+Verbs: `deploy` / `release` / `logs <tenant>`, each obtaining a tenant-scoped
+cap after one login.
+
+- **B5a — device-authorization grant + confirm page — ✅ done/verified.** A CLI
+  can't host a browser/redirect, so the dogfooded `oidc.provider()` gained the
+  RFC 8628 device grant (`POST /device_authorization`; the `/device` login-gated
+  **explicit-approve** confirm page — anti-phishing: shows the code, never
+  auto-approves a pre-filled link; the `device_code` arm in `/token`). Verified
+  end-to-end by `scripts/oidc_smoke_v2.py` (codes → pending → approve → tokens →
+  single-use). This is the CLI's login mechanism.
+- **Remaining:** the `src/cli/rewind` binary (`login` via device grant + verbs),
+  a **session→tenant-scoped-cap mint** (ownership-checked), an ownership check on
+  `publishRelease`, and a **customer deploy surface** (the open fork: a new
+  customer-scoped endpoint vs the in-progress §4.1 admin deploy-app). Worker
+  rename (§6) is already done. Verbs ride `common.zig` (the bundle classifier is
+  shared).
 
 **Track B exit:** an operator holds **one** thing day-to-day — their
 dashboard login. One internal HMAC signs every short-lived scoped token;
