@@ -959,11 +959,12 @@ pub const Node = struct {
         return .{ .len = view.peers.len, .leader_last = view.leader_last };
     }
 
-    /// The term of the log entry at `index` on `tenant_id`'s group (0 if
-    /// compacted / beyond the log / unknown). The leader reports `term(applied)`
-    /// so a returning learner's promote-back baseline matches its log.
-    /// Pump-thread only.
-    pub fn logTerm(self: *Node, tenant_id: u64, index: u64) u64 {
+    /// The term of the log entry at `index` on `tenant_id`'s group, or `null` when
+    /// no term is resolvable (compacted / beyond the log / unknown group) — DISTINCT
+    /// from a genuine term of 0 at the genesis index. The leader reports
+    /// `term(applied)` so a returning learner's promote-back baseline matches its
+    /// log. Pump-thread only.
+    pub fn logTerm(self: *Node, tenant_id: u64, index: u64) ?u64 {
         return self.mgr.logTerm(tenant_id, index);
     }
 
