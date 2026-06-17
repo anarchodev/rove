@@ -48,7 +48,7 @@ pub const Env = struct {
 const OVERLAY_VARS = [_][]const u8{
     "REWIND_ROOT_TOKEN", "REWIND_ADMIN_DOMAIN", "ROVE_WORKER_URLS",
     "ROVE_PUBLISH_SSH",  "ROVE_CP_URL_INTERNAL", "REWIND_MOVE_SECRET",
-    "ADMIN_OPS_SECRET",  "ROVE_CLUSTER",
+    "ROVE_CLUSTER",
 };
 
 /// Default operator env path: $XDG_CONFIG_HOME/rove/prod.env (or

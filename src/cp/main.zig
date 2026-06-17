@@ -648,6 +648,17 @@ const Router = struct {
             try replyStatus(server, ent, sid, sess, 500);
             return;
         };
+        // Propagate the worker-side `__root__/domain/{host}` alias to the
+        // tenant's serving cluster (step3-auth-plan.md B3). The CP owns
+        // host→tenant, so it pushes the alias the workers need for local
+        // custom-host resolution (`resolveDomain`) — no operator-held worker
+        // secret (`ADMIN_OPS_SECRET` retired). If it didn't land (tenant
+        // unplaced, or no reachable leader), the directory mapping still
+        // stands; report 503 so the operator re-runs once the tenant is placed.
+        if (!self.pushDomainToServingCluster(parsed.value.tenant, parsed.value.host)) {
+            try replyStatus(server, ent, sid, sess, 503);
+            return;
+        }
         const msg = std.fmt.allocPrint(a, "host {s} -> {s}\n", .{ parsed.value.host, parsed.value.tenant }) catch {
             try replyStatus(server, ent, sid, sess, 200);
             return;
@@ -708,6 +719,32 @@ const Router = struct {
                 std.log.warn("rewind-cp: v2-plan push for {s} on {s} failed: {s}", .{ tenant, base, @errorName(err) });
             }
         }
+    }
+
+    /// Push a `host → tenant` worker alias to the tenant's serving cluster: a
+    /// `POST /_system/v2-domain {host, tenant}` to the cluster's nodes. The
+    /// alias is a leader-gated `__root__` write, so only the group leader
+    /// accepts (204) and the rest answer 421 — fan out, succeed on the first
+    /// 204. Returns false if the tenant is unplaced or no node took it (the
+    /// caller surfaces that). Mirror of `pushPlanToServingCluster`, but GATED
+    /// (a half-mapped host must not report success — step3-auth-plan.md B3).
+    fn pushDomainToServingCluster(self: *Router, tenant: []const u8, host: []const u8) bool {
+        const a = self.allocator;
+        const res = self.directory.resolve(tenant) orelse return false; // unplaced
+        const payload = std.json.Stringify.valueAlloc(a, .{ .host = host, .tenant = tenant }, .{}) catch return false;
+        defer a.free(payload);
+        for (res.cluster.nodes) |base| {
+            if (self.backendCall(base, "/_system/v2-domain", .POST, payload, &.{})) |resp| {
+                var r = resp;
+                defer r.deinit(a);
+                if (r.status == 204) return true; // the leader took it
+                if (r.status != 421)
+                    std.log.warn("rewind-cp: v2-domain push for {s}={s} on {s} → {d}", .{ host, tenant, base, r.status });
+            } else |err| {
+                std.log.warn("rewind-cp: v2-domain push for {s}={s} on {s} failed: {s}", .{ host, tenant, base, @errorName(err) });
+            }
+        }
+        return false;
     }
 
     /// Forward a `/_control/*` request to the CP node that currently leads the

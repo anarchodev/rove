@@ -89,6 +89,30 @@ pub fn proposeWriteSet(
 // The type-2 encoder `apply.encodeRootWriteSetEnvelope` stays —
 // proposeBatch and acme.zig use it directly.)
 
+/// Propose a single `__root__` writeset (type=2 → `{data_dir}/__root__.db`)
+/// through `anchor_id`'s raft group. Narrow standalone proposer re-added for
+/// the control-plane domain-alias write (`/_system/v2-domain`, step3-auth-plan
+/// B3): the caller must have already committed the write to its root overlay
+/// speculatively (so the leader sees it; the durabilize floor folds it on the
+/// `noteWorkerCommitted` ack); followers apply this envelope. Returns the
+/// proposed group/seq for the caller to await.
+pub fn proposeRoot(
+    worker: anytype,
+    anchor_id: []const u8,
+    writeset: *const kv_mod.WriteSet,
+) !Proposed {
+    const allocator = worker.allocator;
+    const gid = try worker.raft.registerTenant(anchor_id);
+    const ws_bytes = try writeset.encode(allocator);
+    defer allocator.free(ws_bytes);
+    const root_env = try apply_mod.encodeRootWriteSetEnvelope(allocator, ws_bytes);
+    defer allocator.free(root_env);
+    // proposeMulti with a single inner does a bare propose (no multi wrapper)
+    // and does not take ownership of `root_env` — freed by the defer above
+    // after it returns.
+    return proposeMulti(worker, gid, &.{root_env});
+}
+
 /// Propose a dynamic list of already-encoded, **non-multi** inner
 /// envelopes. Replaces the per-producer fixed `[N][]u8` arrays — the
 /// multi wire format already supports up to 255 inners (u8 count) and
