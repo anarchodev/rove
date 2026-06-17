@@ -188,13 +188,16 @@ pub const GroupSig = struct {
 /// one, enqueues a pointer, and blocks on `done` until the pump has
 /// executed it and stamped `err` — so the struct outlives the wait.
 const ControlCmd = struct {
-    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term };
+    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term, last_index };
     kind: Kind,
     gid: u64,
     /// Borrowed from the gid's `GroupSig.id_str` (pointer-stable); used by
     /// `create_group_epoch` to open the tenant's group store.
     id_str: []const u8 = &.{},
     epoch: u64 = 0,
+    /// `create_group_epoch`: birth the group with THIS node as a learner
+    /// (joining an existing group) rather than a voter — see node.createGroupCore.
+    as_learner: bool = false,
     /// `propose_conf_change`: the raft node id to change + the op (0 add_voter /
     /// 1 remove / 2 add_learner — matches `raft.Manager.ConfChange`).
     node_id: u64 = 0,
@@ -721,10 +724,12 @@ pub const Bridge = struct {
     /// reachable at last_index 0 (where a leader heartbeat carrying commit > 0
     /// would trip raft's commit_to fatal!). The reconciler bootstrap path: the
     /// kvexp state for `index` must already be loaded into the store. `index` 0
-    /// behaves exactly like `createGroupEpoch` (no baseline).
-    pub fn createGroupAtBaseline(self: *Bridge, gid: u64, epoch: u64, index: u64, term: u64) Error!void {
+    /// behaves exactly like `createGroupEpoch` (no baseline). `as_learner` births
+    /// the group with this node as a non-voting learner (joining an existing
+    /// group via the reconciler's learner-first path) — see node.createGroupCore.
+    pub fn createGroupAtBaseline(self: *Bridge, gid: u64, epoch: u64, index: u64, term: u64, as_learner: bool) Error!void {
         const sig = self.sigFor(gid) orelse return Error.UnknownTenant;
-        var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .snap_index = index, .snap_term = term };
+        var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .snap_index = index, .snap_term = term, .as_learner = as_learner };
         return self.runControl(&cmd);
     }
 
@@ -796,6 +801,15 @@ pub const Bridge = struct {
         return cmd.snap_term;
     }
 
+    /// This group's local raft last log index (any replica) — the reconciler's
+    /// learner→promote catch-up signal. Pump op (the Manager is pump-only). 0 on
+    /// unknown group / pump failure.
+    pub fn lastIndex(self: *Bridge, gid: u64) u64 {
+        var cmd: ControlCmd = .{ .kind = .last_index, .gid = gid };
+        self.runControl(&cmd) catch return 0;
+        return cmd.snap_index;
+    }
+
     /// Install a DATA-FREE snapshot baseline at {index, term} into `gid`'s LOCAL
     /// group (conf_change promote-back). The node must be a below-floor learner;
     /// the KV state for `index` must already be loaded out-of-band (the move
@@ -839,7 +853,7 @@ pub const Bridge = struct {
         for (batch[0..n]) |cmd| {
             cmd.err = switch (cmd.kind) {
                 .create_group_epoch => blk: {
-                    _ = self.node.createGroupAtEpoch(cmd.gid, cmd.id_str, cmd.epoch) catch |e| break :blk e;
+                    _ = self.node.createGroupAtEpoch(cmd.gid, cmd.id_str, cmd.epoch, cmd.as_learner) catch |e| break :blk e;
                     // Atomic baseline (createGroupAtBaseline): install the data-free
                     // snapshot in the SAME pump op as group creation so the fresh
                     // group is never observable at last_index 0 between creation and
@@ -876,6 +890,10 @@ pub const Bridge = struct {
                 },
                 .log_term => blk: {
                     cmd.snap_term = self.node.logTerm(cmd.gid, cmd.snap_index);
+                    break :blk null;
+                },
+                .last_index => blk: {
+                    cmd.snap_index = self.node.lastIndex(cmd.gid);
                     break :blk null;
                 },
                 .apply_local_snapshot => blk: {
