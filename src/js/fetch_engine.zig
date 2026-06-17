@@ -58,6 +58,8 @@ const components_mod = @import("components.zig");
 const worker_mod = @import("worker.zig");
 const globals = @import("globals.zig");
 const ssrf_mod = @import("rove-ssrf");
+const jwt = @import("rove-jwt");
+const tenant_mod = @import("rove-tenant");
 
 const NodeState = worker_mod.NodeState;
 const PendingFetch = globals.PendingFetch;
@@ -94,6 +96,15 @@ const HELD_MAX_PER_TENANT: u32 = 16;
 /// definition lives in `blob_sessions.zig` (leaf) so the P2 seal
 /// binding can name it without an import cycle.
 pub const BLOB_ORIGIN_PREFIX = @import("blob_sessions.zig").BLOB_ORIGIN_PREFIX;
+
+/// The `rewind-logs.internal` trusted door (step3-auth-plan.md A2/A3;
+/// rewind-cli-plan.md §7). The `__admin__` chokepoint fetches
+/// `http://rewind-logs.internal/v1/{tenant}/...`; the fetch engine mints a
+/// tenant-scoped `logs-read` capability token, rewrites the host to the
+/// platform-configured internal log-server base, and attaches the token as
+/// Bearer. Only `__admin__` may form this host (the routing gate). Mirrors
+/// `BLOB_ORIGIN_PREFIX`'s own-tenant door, but cross-tenant by design.
+pub const LOGS_ORIGIN_PREFIX = "http://rewind-logs.internal/";
 
 /// Upper bound on `REWIND_INTERNAL_FRONT` entries — one per front in
 /// the deployment, and a deployment has at most a handful of fronts.
@@ -565,8 +576,15 @@ pub const FetchEngine = struct {
         var pin_buf: [768]u8 = undefined;
         var resolve_pin: ?[:0]const u8 = null;
         const is_blob_door = std.mem.startsWith(u8, pf.url, BLOB_ORIGIN_PREFIX);
+        const is_logs_door = std.mem.startsWith(u8, pf.url, LOGS_ORIGIN_PREFIX);
         if (is_blob_door) {
             try self.rewriteAndSignBlobFetch(pf, method, &headers_list);
+        } else if (is_logs_door) {
+            // `rewind-logs.internal` door: rewrite to the internal log-server
+            // base + attach a tenant-scoped `logs-read` token. Like the blob
+            // door, the rewritten URL targets a platform-configured internal
+            // origin (never customer-controlled), so it skips the SSRF gate.
+            try self.rewriteAndAuthLogsFetch(pf, method, &headers_list);
         } else if (self.tenantDoorPin(pf.url, &pin_buf)) |pin| {
             // Tenant door: the host is one of OUR tenant hostnames —
             // pin the connect to the internal front addresses (private
@@ -612,6 +630,11 @@ pub const FetchEngine = struct {
             .verify_tls = !ssrf_mod.test_allow_plaintext,
             .follow_redirects = is_blob_door,
             .resolve_pin = resolve_pin,
+            // The standalone log-server is h2c-only (nghttp2 prior-knowledge),
+            // so a plaintext logs-door fetch must force cleartext HTTP/2 —
+            // same stance as the worker→log push (`worker_log.sendPushChunk`).
+            // A TLS internal base (https) negotiates h2 via ALPN as usual.
+            .http2_prior_knowledge = is_logs_door and std.mem.startsWith(u8, pf.url, "http://"),
         };
 
         const ctx = try self.allocator.create(FetchCtx);
@@ -762,6 +785,75 @@ pub const FetchEngine = struct {
             headers_list.appendAssumeCapacity(.{ .name = owned_name, .value = v });
             attached += 1;
         }
+    }
+
+    /// `rewind-logs.internal` trusted door (step3-auth-plan.md A2/A3). The
+    /// `__admin__` chokepoint fetches `http://rewind-logs.internal/v1/{tenant}/…`;
+    /// here we mint a TENANT-SCOPED `logs-read` capability token, rewrite the
+    /// host to the platform-configured internal log-server base, and attach the
+    /// token as `Authorization: Bearer`. The log-server then verifies cap +
+    /// tenant (`standalone.zig`, `verifyWithCapAndTenant`).
+    ///
+    /// Cross-tenant by design: `__admin__` reads ANY tenant's logs, so the
+    /// scope is taken from the URL PATH (`/v1/{tenant}/…`), not `pf.tenant_id`
+    /// (which is always `__admin__` here). The routing gate — only `__admin__`
+    /// may form this host — is the primary control; the token is
+    /// defense-in-depth. The signing secret never enters JS space.
+    fn rewriteAndAuthLogsFetch(
+        self: *FetchEngine,
+        pf: *PendingFetch,
+        method: blob_curl_multi.Method,
+        headers_list: *std.ArrayListUnmanaged(blob_curl_multi.Header),
+    ) !void {
+        // Routing gate: only the admin tenant may use the logs door.
+        if (!std.mem.eql(u8, pf.tenant_id, tenant_mod.ADMIN_INSTANCE_ID))
+            return error.LogsDoorForbidden;
+        const secret = self.node.services_jwt_secret orelse return error.LogsDoorUnconfigured;
+        const base = self.node.log_internal_base orelse return error.LogsDoorUnconfigured;
+        // Read-only surface: the log query routes are all GET.
+        if (method != .GET) return error.LogsMethodDenied;
+
+        // Path after the door prefix, e.g. `v1/{tenant}/list?limit=20`.
+        const remainder = pf.url[LOGS_ORIGIN_PREFIX.len..];
+        const target_tenant = parseLogsTenant(remainder) orelse return error.LogsBadPath;
+
+        const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
+        const token = jwt.mint(self.allocator, secret, .{
+            .exp_ms = now_ms + 60 * 1000,
+            .caps = &.{jwt.Cap.LOGS_READ},
+            .tenant = target_tenant,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // InvalidTenant: the path segment held a char outside [a-zA-Z0-9_-].
+            else => return error.LogsBadPath,
+        };
+        defer self.allocator.free(token);
+
+        // Rewrite the host to the internal log-server base. `base` carries no
+        // trailing slash (e.g. `http://127.0.0.1:9000`); `remainder` carries no
+        // leading slash, so one `/` joins them.
+        const new_url = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ base, remainder });
+        self.allocator.free(pf.url);
+        pf.url = new_url;
+
+        // Drop any JS-supplied `authorization` header, then attach ours — the
+        // handler never sets credentials; the engine owns this header.
+        var i: usize = 0;
+        while (i < headers_list.items.len) {
+            const h = headers_list.items[i];
+            if (std.ascii.eqlIgnoreCase(h.name, "authorization")) {
+                self.allocator.free(h.name);
+                self.allocator.free(h.value);
+                _ = headers_list.swapRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+        try headers_list.ensureUnusedCapacity(self.allocator, 1);
+        const owned_name = try self.allocator.dupe(u8, "authorization");
+        errdefer self.allocator.free(owned_name);
+        const auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{token});
+        headers_list.appendAssumeCapacity(.{ .name = owned_name, .value = auth_value });
     }
 
     /// Adjust the per-tenant held count by `delta` (+1 or -1).
@@ -1229,6 +1321,32 @@ fn parseMethod(s: []const u8) ?blob_curl_multi.Method {
 /// digest as `crypto.sha256` renders it). Anything else — uppercase,
 /// path separators, traversal attempts — is rejected before the key
 /// is interpolated into an S3 path.
+/// Extract `{tenant}` from a `v1/{tenant}/…` log-query path (the part after
+/// the `rewind-logs.internal/` door prefix), ignoring any `?query`. Returns
+/// null if the shape doesn't match. The tenant's character set is enforced
+/// downstream by `jwt.mint` (rejects anything outside `[a-zA-Z0-9_-]`).
+fn parseLogsTenant(remainder: []const u8) ?[]const u8 {
+    const q = std.mem.indexOfScalar(u8, remainder, '?');
+    const path = if (q) |i| remainder[0..i] else remainder;
+    const v1 = "v1/";
+    if (!std.mem.startsWith(u8, path, v1)) return null;
+    const after = path[v1.len..];
+    const slash = std.mem.indexOfScalar(u8, after, '/') orelse return null;
+    const tenant = after[0..slash];
+    if (tenant.len == 0) return null;
+    return tenant;
+}
+
+test "parseLogsTenant pulls the tenant from v1/{tenant}/… (and ignores query)" {
+    try std.testing.expectEqualStrings("acme", parseLogsTenant("v1/acme/list").?);
+    try std.testing.expectEqualStrings("acme", parseLogsTenant("v1/acme/list?limit=20").?);
+    try std.testing.expectEqualStrings("globex", parseLogsTenant("v1/globex/show/abc123").?);
+    try std.testing.expect(parseLogsTenant("v1/acme") == null); // no trailing route
+    try std.testing.expect(parseLogsTenant("v1//list") == null); // empty tenant
+    try std.testing.expect(parseLogsTenant("health") == null); // not a v1 path
+    try std.testing.expect(parseLogsTenant("v2/acme/list") == null);
+}
+
 fn isSha256HexLower(s: []const u8) bool {
     if (s.len != 64) return false;
     for (s) |b| {
