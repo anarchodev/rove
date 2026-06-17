@@ -279,6 +279,23 @@ def main() -> int:
                            data=json.dumps({"tenant": "nope", "cluster": c.cluster_id}))
             check("non-operator CP provision → 403", r.status == 403, f"got {r.status}")
 
+        # ── B5: publishRelease ownership gate (step3-auth-plan.md B5). ─────
+        # Same call, different principal: an operator (is_root) bypasses
+        # ownership and falls through to the not-found check (404); a
+        # non-operator who doesn't own the tenant is blocked at the gate (403,
+        # and the gate fires BEFORE the existence check so it doesn't leak).
+        def rpc(cookie, fn, args):
+            return c.tls_curl(app_origin + "/", method="POST",
+                              headers={"Cookie": cookie, "content-type": "application/json"},
+                              data=json.dumps({"fn": fn, "args": args}))
+        r = rpc(op_cookie, "publishRelease", ["not-mine", 1])
+        check("operator (is_root) bypasses ownership → 404 not-found",
+              r.status == 404, f"got {r.status} {r.body[:120]!r}")
+        if cust_cookie:
+            r = rpc(cust_cookie, "publishRelease", ["not-mine", 1])
+            check("non-owner publishRelease → 403 (blocked before existence)",
+                  r.status == 403, f"got {r.status} {r.body[:120]!r}")
+
     if failures:
         print(f"\nFAILED ({len(failures)}): {failures}")
         return 1

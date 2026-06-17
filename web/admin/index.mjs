@@ -149,9 +149,13 @@ export function deleteKv(key) {
 // Raft consensus settles in the background; bytecode load
 // happens on the loader thread.
 //
-// Replaces the old `/_system/release` system route. Customer
-// flow: customer pushes manifest to files-server, then calls
-// this with the dep_id it returned.
+// Replaces the old `/_system/release` system route. Customer flow: stage a
+// bundle (→ dep_id), then call this with that dep_id.
+//
+// Authz (step3-auth-plan.md B5): an operator (is_root) may release any tenant;
+// a non-operator may release ONLY a tenant they own (`account/{hash}/instances/
+// {id}` via `ownedInstances`). Previously this checked nothing — any
+// authenticated session could release any tenant.
 export function publishRelease(instance_id, dep_id) {
     if (!validId(instance_id)) {
         response.status = 400;
@@ -161,6 +165,12 @@ export function publishRelease(instance_id, dep_id) {
     if (!Number.isFinite(n) || n < 1) {
         response.status = 400;
         return { error: "dep_id must be a positive integer" };
+    }
+    const auth = request.auth || {};
+    if (!auth.sub) return jsonError(401, "unauthenticated");
+    if (!auth.is_root &&
+        ownedInstances(accountHashFor(auth.sub)).indexOf(instance_id) === -1) {
+        return jsonError(403, "not your instance");
     }
     try {
         platform.releases.publish(instance_id, n);
