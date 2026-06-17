@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stand up the `__auth__` OIDC IdP on a V2 cluster and verify the IdP
-conformance end to end (step3-auth-plan.md B1). V2 port of the IdP-conformance
-half of the (V1, retired) scripts/oidc_smoke.py.
+conformance end to end (step3-auth-plan.md B1 + B5a). V2 port of the
+IdP-conformance half of the (V1, retired) scripts/oidc_smoke.py.
 
 What it proves:
   - the real `web/auth` app deploys to a provisioned `__auth__` tenant and its
@@ -11,7 +11,11 @@ What it proves:
   - the magic-link login binds the platform session, and the full PKCE
     authorization-code flow yields an id_token whose RS256 signature verifies
     against the published JWKS (a pure-Python check — that verify IS the gate);
-  - the refresh_token grant yields a fresh, verifying id_token.
+  - the refresh_token grant yields a fresh, verifying id_token;
+  - the RFC 8628 device-authorization grant (the CLI flow, B5a): device+user
+    codes, authorization_pending before approval, a login-gated confirm page
+    (explicit Approve, shows the code — anti-phishing), tokens after approval,
+    and single-use device_code (re-poll → expired_token).
 
 The RP-gate half (admin dashboard logging in against __auth__) belongs to
 Track B's dashboard bring-up (B2), not here — this stands up the IdP itself.
@@ -245,11 +249,89 @@ def main() -> int:
             check("refresh grant → fresh id_token verifies", False,
                   f"got {tr2.status} {tr2.body[:160]!r}")
 
+        # ── 5. Device authorization grant (RFC 8628 — the CLI flow). ──────
+        # This block plays BOTH roles: the CLI (device_authorization + poll
+        # /token) and the browser (login + the explicit /device approve).
+        DEV_EMAIL = "device-user@example.com"
+        r = idp("/device_authorization", method="POST",
+                headers={"content-type": "application/x-www-form-urlencoded"},
+                data=urllib.parse.urlencode({"client_id": CLIENT, "scope": "openid"}))
+        da = json.loads(r.body) if r.status == 200 else {}
+        check("POST /device_authorization → device+user codes",
+              r.status == 200 and da.get("device_code") and da.get("user_code") and
+              da.get("verification_uri") and da.get("interval"),
+              f"got {r.status} {r.body[:160]!r}")
+        if r.status != 200:
+            print(f"\nFAILURES: {failures}")
+            return 1
+
+        def device_poll():
+            return token_grant({
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": da["device_code"], "client_id": CLIENT,
+            })
+
+        # CLI polls BEFORE approval → authorization_pending (HTTP 400).
+        r = device_poll()
+        b = json.loads(r.body) if r.body else {}
+        check("device poll before approval → authorization_pending",
+              r.status == 400 and b.get("error") == "authorization_pending",
+              f"got {r.status} {b.get('error')!r}")
+
+        # Browser: magic-link login → session (the approval gate).
+        r = idp("/login", method="POST",
+                headers={"content-type": "application/x-www-form-urlencoded"},
+                data=urllib.parse.urlencode({"email": DEV_EMAIL, "return_to": ISS + "/device"}))
+        magic = json.loads(r.body).get("magic_link", "") if r.status == 200 else ""
+        m = re.search(r"__Host-rove_sid=[^;]+", r.headers.get("set-cookie", ""))
+        check("device login → magic_link + sid", r.status == 200 and bool(magic) and bool(m),
+              f"got {r.status}")
+        if not (magic and m):
+            print(f"\nFAILURES: {failures}")
+            return 1
+        dcookie = m.group(0)
+        idp(path_of(magic), headers={"Cookie": dcookie})  # bind the session
+
+        # Browser: the pre-filled confirm page shows the code + an explicit
+        # Approve (anti-phishing: login-gated, no auto-approve from the URL).
+        r = idp("/device?user_code=" + urllib.parse.quote(da["user_code"]),
+                headers={"Cookie": dcookie})
+        check("GET /device confirm page shows the code + Approve",
+              r.status == 200 and da["user_code"] in r.body and "Approve" in r.body,
+              f"got {r.status}")
+        # Browser: explicit Approve.
+        r = idp("/device", method="POST",
+                headers={"content-type": "application/x-www-form-urlencoded", "Cookie": dcookie},
+                data=urllib.parse.urlencode({"user_code": da["user_code"], "action": "approve"}))
+        check("POST /device approve → Approved",
+              r.status == 200 and "Approved" in r.body, f"got {r.status} {r.body[:120]!r}")
+
+        # CLI polls AFTER approval → tokens; verify the id_token.
+        r = device_poll()
+        dtok = json.loads(r.body) if r.status == 200 else {}
+        ok_tok = bool(r.status == 200 and dtok.get("id_token"))
+        if ok_tok:
+            hdr, claims, sig, si = parse_jwt(dtok["id_token"])
+            keys = jwks()
+            ok_tok = (hdr["alg"] == "RS256" and hdr["kid"] in keys and
+                      verify_rs256(keys[hdr["kid"]], si, sig) and
+                      claims["iss"] == ISS and claims["aud"] == CLIENT and
+                      claims["sub"] == DEV_EMAIL and claims["exp"] > time.time())
+        check("device poll after approval → id_token RS256-verifies (sub=device user)",
+              ok_tok, f"got {r.status} {r.body[:160]!r}")
+
+        # device_code is single-use → re-poll yields expired_token.
+        r = device_poll()
+        b = json.loads(r.body) if r.body else {}
+        check("device_code single-use (re-poll → expired_token)",
+              r.status == 400 and b.get("error") == "expired_token",
+              f"got {r.status} {b.get('error')!r}")
+
     if failures:
         print(f"\nFAILED ({len(failures)}): {failures}")
         return 1
-    print("\nPASS — __auth__ IdP stood up: discovery + magic-link + PKCE "
-          "authorization-code + refresh, id_token RS256-verified against JWKS.")
+    print("\nPASS — __auth__ IdP: discovery + magic-link + PKCE auth-code + "
+          "refresh + RFC 8628 device grant (login-gated confirm), all RS256-verified.")
     return 0
 
 
