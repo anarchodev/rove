@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """V2 membership-reconciler smoke — a wiped node AUTO-HEALS, no manual ops.
 
-⚠️ CURRENTLY RED — surfaces a real raft bug (NOT a reconciler-logic bug). The
-reconciler correctly activates, observes, and drives the learner-first sequence,
-but the bootstrapped node SIGABRTs in raft-rs commit_to (raft_log.rs:292,
-"to_commit out of range [last_index]"): the apply-snapshot baseline is the
-leader's APPLIED index while the leader's COMMIT is higher, so the leader's next
-heartbeat carries commit > the node's last_index and raft fatal!s instead of
-clamping. fresh_voter_join + the manual prod fix use the same path but didn't
-reliably hit it (quiescent + fast). FIX is in the bootstrap baseline / apply-
-snapshot ordering — see project_bhs3_cp_membership_reconciler memory.
-
+GREEN. Previously surfaced the attach→apply-snapshot WINDOW bug: the reconciler
+created the group (last_index 0) then installed the baseline in a SEPARATE op, and
+a leader heartbeat carrying commit > 0 could reach the empty group first → raft-rs
+commit_to fatal! ("to_commit out of range [last_index 0]"). Fixed by making attach
+install the baseline ATOMICALLY (X-Rewind-Baseline-* → createGroupAtBaseline, one
+pump op): the fresh group is never observable at last_index 0. The baseline = the
+leader's current applied index, which is ≥ the wiped node's stale Progress.match,
+so the leader's heartbeat commit = min(match, committed) can never exceed the
+node's new last_index. fresh_voter_join (manual, separate apply-snapshot) won the
+race by quiescent+fast pacing; the reconciler lost it deterministically.
 
 The end-to-end gate for docs/cp-membership-reconciler-plan.md (Phases 3+4). With
 REWIND_CP_RECONCILE_MEMBERSHIP=1, the CP's additive, learner-first reconciler
@@ -121,7 +121,11 @@ def main() -> int:
               f"last kv={rg.status}/{rg.body!r} cs={cs}")
         if not healed:
             print(f"       node {vnid} alive? {c.node_procs[victim].poll()} (None=running)")
-            c.dump_node_log(node=victim, grep=["error", "panic", "fatal", "attach", "snapshot", "recover", "applied", "committed", "abort"])
+            log = c.log_paths.get(f"n{vnid}")
+            if log and os.path.exists(log):
+                print(f"       --- node {vnid} full log tail (40) ---")
+                for ln in open(log).read().splitlines()[-40:]:
+                    print("       | " + ln)
 
         if healed:
             print(f"step 4: ⭐ a FRESH write replicates to the auto-rejoined node {vnid}")
