@@ -1,9 +1,9 @@
 //! `rewind-ops` — the platform/operator CLI (docs/rewind-cli-plan.md §2–§3,
 //! §6). The privileged half of the split: every verb here carries an operator
-//! secret (root token → workers + deploy app; REWIND_MOVE_SECRET → CP control;
-//! ADMIN_OPS_SECRET → the worker domain alias). Never shipped to customers —
-//! the OIDC-scoped tenant verbs live in the separate `rewind` binary (built
-//! when the __auth__ IdP lands; both reuse `common.zig`).
+//! secret (root token → workers + deploy app; REWIND_MOVE_SECRET → CP control,
+//! which now also propagates the worker domain alias). Never shipped to
+//! customers — the OIDC-scoped tenant verbs live in the separate `rewind`
+//! binary (built when the __auth__ IdP lands; both reuse `common.zig`).
 //!
 //! Verbs (audited against the live server primitives, not just the old script):
 //!   bootstrap                       provision __admin__ via the CP + reset —
@@ -14,14 +14,14 @@
 //!   release <tenant> <dep_id_hex>   flip _deploy/current (leader-aware retry).
 //!   provision <tenant> [--cluster C] [--host H]   create+place a tenant (CP).
 //!   move <tenant> <cluster> [--live] --yes        relocate a tenant (CP).
-//!   host add <host> <tenant>        map a domain → tenant (CP index + worker alias).
+//!   host add <host> <tenant>        map a domain → tenant (CP index; CP pushes the worker alias).
 //!   plan set <tenant> <plan>        set a tenant's plan/limits blob (CP).
 //!   status <host>                   resolve a host → tenant/cluster/nodes + plan.
 //!
 //! Config: operator env file (default ~/.config/rove/prod.env, then ./.env.prod,
 //! --env override; OS env overlays). Vars: REWIND_ROOT_TOKEN, REWIND_ADMIN_DOMAIN,
 //! ROVE_WORKER_URLS, ROVE_CLUSTER, ROVE_PUBLISH_SSH?, ROVE_CP_URL_INTERNAL,
-//! REWIND_MOVE_SECRET, ADMIN_OPS_SECRET (host add).
+//! REWIND_MOVE_SECRET.
 
 const std = @import("std");
 const c = @import("common.zig");
@@ -155,9 +155,13 @@ fn cmdMove(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, cluster:
     }
 }
 
-/// Map a host → tenant. TWO writes (plan §5): the CP directory index (front
-/// routing) AND the worker domain alias (so a worker recognizes the custom
-/// host on direct/relayed requests). Gated by move-secret + ADMIN_OPS_SECRET.
+/// Map a host → tenant. ONE move-secret-gated call: the CP records the
+/// directory index (front routing) AND propagates the worker `__root__/domain`
+/// alias to the tenant's serving cluster (`/_system/v2-domain`), so a worker
+/// recognizes the custom host on direct/relayed requests. The CP owns
+/// host→tenant end-to-end now — no second operator secret (`ADMIN_OPS_SECRET`
+/// retired, step3-auth-plan.md B3). A 503 means the alias didn't land (tenant
+/// unplaced / no reachable leader) — provision the tenant first, then retry.
 fn cmdHostAdd(a: std.mem.Allocator, env: *const c.Env, host: []const u8, tenant: []const u8) void {
     var body = std.ArrayList(u8){};
     body.appendSlice(a, "{\"host\":") catch oom();
@@ -166,28 +170,9 @@ fn cmdHostAdd(a: std.mem.Allocator, env: *const c.Env, host: []const u8, tenant:
     c.writeJsonString(&body, a, tenant);
     body.append(a, '}') catch oom();
 
-    const r1 = c.cpPost(a, env, "/_control/host", body.items, 30);
-    if (r1.code != 200 and r1.code != 204) fatal("CP host map {s}: {d} {s}", .{ host, r1.code, c.trunc(r1.body) });
-
-    // Worker domain alias via the __admin__ app /ops/assign-domain (Bearer ADMIN_OPS_SECRET).
-    const ops = env.require("ADMIN_OPS_SECRET");
-    const admin = env.require("REWIND_ADMIN_DOMAIN");
-    const headers = [_]Header{
-        .{ .name = "Host", .value = admin },
-        .{ .name = "Authorization", .value = std.fmt.allocPrint(a, "Bearer {s}", .{ops}) catch oom() },
-        .{ .name = "Content-Type", .value = "application/json" },
-    };
-    var aliased = false;
-    for (c.workerUrls(env, a)) |w| {
-        const r2 = c.workerPost(a, env, w, "/ops/assign-domain", &headers, body.items, 30);
-        if (r2.code == 204) {
-            aliased = true;
-            break;
-        }
-        std.debug.print("  alias via {s}: {d} {s} (trying next)\n", .{ w, r2.code, c.trunc(r2.body) });
-    }
-    if (!aliased) fatal("worker domain alias {s} failed on every worker", .{host});
-    std.debug.print("host {s} → {s} (CP index + worker alias)\n", .{ host, tenant });
+    const r = c.cpPost(a, env, "/_control/host", body.items, 30);
+    if (r.code != 200 and r.code != 204) fatal("host map {s}: {d} {s}", .{ host, r.code, c.trunc(r.body) });
+    std.debug.print("host {s} → {s} (CP directory + worker alias)\n", .{ host, tenant });
 }
 
 /// POST /_control/plan {tenant, plan} — set the tenant's opaque plan/limits blob.

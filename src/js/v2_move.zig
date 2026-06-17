@@ -134,6 +134,8 @@ pub fn tryHandleV2(
         try handleLoadMerge(server, allocator, worker, ent, sid, sess, method, rh, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-plan")) {
         try handlePlan(server, allocator, worker, ent, sid, sess, method, path, body);
+    } else if (std.mem.eql(u8, sys_rest, "v2-domain")) {
+        try handleDomain(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-confchange")) {
         try handleConfChange(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-confstate")) {
@@ -264,6 +266,78 @@ fn commitWrite(worker: anytype, allocator: std.mem.Allocator, tenant: []const u8
     worker.raft.noteWorkerCommitted(proposed.group_id, proposed.seq);
     if (!awaitCommit(worker, proposed.group_id, proposed.seq)) return 504;
     return 0;
+}
+
+// ── v2-domain: set a `__root__/domain/{host}` → tenant alias ──────────
+//
+// The CP calls this (move-secret S2S) after recording `host → tenant` in its
+// directory, so a worker on the owning cluster can resolve a CUSTOM host →
+// instance locally (`tenant.resolveDomain`). Replaces the retired
+// `ADMIN_OPS_SECRET`-gated `/ops/assign-domain` JS route (step3-auth-plan.md
+// B3): the CP now owns host→tenant end-to-end and propagates the worker alias,
+// so `host add` is a single CP call and there's no second operator secret. The
+// alias is a `__root__` write — leader-gated, replicated as a type-2
+// root_writeset (followers apply it).
+fn validHost(host: []const u8) bool {
+    if (host.len == 0 or host.len > 253) return false;
+    for (host) |b| {
+        const ok = (b >= 'a' and b <= 'z') or (b >= '0' and b <= '9') or
+            b == '.' or b == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+fn commitRootDomain(worker: anytype, allocator: std.mem.Allocator, host: []const u8, tenant: []const u8) u16 {
+    // Leader gate (same convention as commitWrite): only the group leader may
+    // take the immediate-commit + propose; a follower would speculatively
+    // commit then fault the propose with no undo. 421 → the CP re-aims.
+    const gid = worker.raft.registerTenant(tenant_mod.ADMIN_INSTANCE_ID) catch return 500;
+    if (!worker.raft.isLeaderOf(gid)) return 421;
+
+    const key = std.fmt.allocPrint(allocator, "domain/{s}", .{host}) catch return 500;
+    defer allocator.free(key);
+
+    var txn = worker.node.tenant.root.beginTrackedImmediate() catch return 500;
+    var ws = kv_mod.WriteSet.init(allocator);
+    defer ws.deinit();
+    txn.put(key, tenant) catch {
+        txn.rollback() catch {};
+        return 500;
+    };
+    ws.addPut(key, tenant) catch {
+        txn.rollback() catch {};
+        return 500;
+    };
+    txn.commit() catch return 500;
+
+    const proposed = raft_propose.proposeRoot(worker, tenant_mod.ADMIN_INSTANCE_ID, &ws) catch return 503;
+    worker.raft.noteWorkerCommitted(proposed.group_id, proposed.seq);
+    if (!awaitCommit(worker, proposed.group_id, proposed.seq)) return 504;
+    return 0;
+}
+
+fn handleDomain(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    body: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+    const Body = struct { host: []const u8, tenant: []const u8 };
+    var parsed = std.json.parseFromSlice(Body, allocator, body, .{ .ignore_unknown_fields = true }) catch
+        return reply(server, allocator, ent, sid, sess, 400, "expected {\"host\",\"tenant\"}\n");
+    defer parsed.deinit();
+    if (!validHost(parsed.value.host) or parsed.value.tenant.len == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "host = lowercase fqdn, tenant required\n");
+    const status = commitRootDomain(worker, allocator, parsed.value.host, parsed.value.tenant);
+    if (status == 0) return reply(server, allocator, ent, sid, sess, 204, "");
+    return reply(server, allocator, ent, sid, sess, status, "domain alias write failed\n");
 }
 
 // ── v2-bundle: quiesce + dump (source) ───────────────────────────────

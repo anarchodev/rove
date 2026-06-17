@@ -10,12 +10,14 @@ the live server primitives:
   - serve acme/ + acme/hi.txt through the front door
   - `status acme.localhost`  resolve host → tenant/cluster (CP read)
   - `plan set acme <blob>`   set the tenant's plan/limits blob (CP)
+  - `host add <custom> acme`  map a custom domain → tenant; the CP records the
+    directory index AND propagates the worker `__root__/domain` alias, so the
+    worker resolves the custom host locally (step3-auth-plan.md B3 —
+    `ADMIN_OPS_SECRET` retired; a single move-secret CP call now).
   - `move acme … ` (no --yes) refuses (the risk guard)
   - `reset`                  idempotent re-deploy of the baked app
 
-Not exercised here: `host add` — its second write hits /ops/assign-domain, which
-lives in the FULL admin (web/admin_interim), not the baked deploy app, so it
-needs the full admin deployed first. `move` (real) needs a second cluster.
+`move` (real) needs a second cluster, so only the risk-guard is exercised.
 
 Needs S3 env: `set -a; . ./.env; set +a` first; and `zig build rewind-ops`.
 """
@@ -104,6 +106,17 @@ def main() -> int:
         served = (r.status == 200 and "cli-static" in r.body) or (
             r.status == 302 and bool(r.headers.get("location")))
         check("GET acme/hi.txt → static", served, f"got {r.status}")
+
+        print("step 4b: rewind-ops host add <custom> acme — CP propagates the alias")
+        # A custom host that does NOT match the {id}.localhost wildcard, so a
+        # successful resolve proves the CP-propagated __root__/domain alias (not
+        # the wildcard fallback). One move-secret CP call; no ADMIN_OPS_SECRET.
+        custom = "cli-custom.test"
+        rc, out = ops("host", "add", custom, "acme")
+        check("host add → rc 0", rc == 0, f"rc={rc} {out.strip()[:160]!r}")
+        r = cl.request("acme", "/", host=custom, timeout=15.0)
+        check("custom host resolves to acme via the CP-propagated alias",
+              r.status == 200 and "cli-served" in r.body, f"got {r.status} {r.body[:120]!r}")
 
         print("step 5: rewind-ops status acme.localhost (CP read)")
         rc, out = ops("status", cl.host_for("acme"))

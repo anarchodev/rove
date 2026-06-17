@@ -5,9 +5,9 @@ DEPRECATED / BROKEN (2026-06-16): the `/_system/deploy` route this posts to was
 removed when deploy moved into the standing __admin__ app (rewind-cli-plan §4.2).
 Use the `rewind-ops` operator CLI instead: `zig build rewind-ops` then
 `rewind-ops bootstrap` / `provision <tenant> --host H` / `deploy <tenant> <bundle>
---release` / `move` / `plan set` / `status` — it covers every operation this
-script welded together (host add lands once the full admin app exposes
-/ops/assign-domain on the bootstrapped path). This file is retained only for
+--release` / `move` / `plan set` / `status` / `host add` — it covers every
+operation this script welded together (host add is a single move-secret CP call
+now; the CP propagates the worker alias). This file is retained only for
 historical reference.
 
 The codified form of the proven publish path (deploy-plan §8 item 4). The
@@ -35,7 +35,7 @@ Bundle layout:
 Config comes from the operator env file (default ~/.config/rove/prod.env,
 legacy fallback .env.prod at the repo root): REWIND_ROOT_TOKEN (gates both
 /_system/deploy and /_system/release), REWIND_ADMIN_DOMAIN, REWIND_MOVE_SECRET
-(only for --provision/--host), ADMIN_OPS_SECRET (only for --host),
+(only for --provision/--host),
 ROVE_PUBLISH_SSH (the host the deploy + release calls tunnel through),
 ROVE_WORKER_URLS, ROVE_CP_URL_INTERNAL. (S3_*/AWS_* + the services-JWT secret
 are no longer needed here — the worker owns the blob backend now.)
@@ -247,6 +247,11 @@ def main() -> int:
     print(f"released {args.tenant} @ {dep_id}")
 
     # ── custom hosts (optional) ──────────────────────────────────────
+    # One move-secret call: the CP records the directory index AND propagates
+    # the worker `__root__/domain` alias to the serving cluster (step3-auth-plan
+    # B3). 503 = the alias didn't land (tenant unplaced / no leader) — provision
+    # first, then retry. `ADMIN_OPS_SECRET` + the worker /ops/assign-domain call
+    # are retired.
     for host in args.host:
         ms = env["REWIND_MOVE_SECRET"]
         code, out = ssh_curl(ssh_target, "-X", "POST", f"{cp_url}/_control/host",
@@ -254,17 +259,8 @@ def main() -> int:
                              "-H", "Content-Type: application/json",
                              "-d", json.dumps({"host": host, "tenant": args.tenant}))
         if code not in (200, 204):
-            sys.exit(f"CP host map {host}: {code} {out}")
-        ops = env["ADMIN_OPS_SECRET"]
-        code, out = ssh_curl(ssh_target, "--http2-prior-knowledge",
-                             "-X", "POST", f"{workers[0]}/ops/assign-domain",
-                             "-H", f"Host: {admin_host}",
-                             "-H", f"Authorization: Bearer {ops}",
-                             "-H", "Content-Type: application/json",
-                             "-d", json.dumps({"host": host, "tenant": args.tenant}))
-        if code != 204:
-            sys.exit(f"worker domain alias {host}: {code} {out}")
-        print(f"host mapped: {host} → {args.tenant}")
+            sys.exit(f"host map {host}: {code} {out}")
+        print(f"host mapped: {host} → {args.tenant} (CP directory + worker alias)")
 
     # ── verify ───────────────────────────────────────────────────────
     if args.verify_host:
