@@ -367,12 +367,20 @@ The smoke harness's `deploy_bundle` POSTs to the app through the front door
 so every smoke now exercises the *production* deploy path. `publish_tenant.py`
 likewise POSTs bundles to the app; only `/_system/reset` is operator-native.
 
-## 5. `/ops/assign-domain` — resolved (and why `host add` is two writes)
+## 5. `/ops/assign-domain` — RETIRED (resolved by step3 B3)
 
-`POST {worker}/ops/assign-domain` (`publish_tenant.py:292`) is **live, not
-dead** — it is not a Zig route. It is a handler route in
+> **Update (step3-auth-plan.md B3):** `/ops/assign-domain` + `ADMIN_OPS_SECRET`
+> are **gone**. `host add` is now a **single** move-secret CP call: the CP
+> (which owns `host → tenant`) propagates the worker `__root__/domain` alias to
+> the serving cluster over its existing S2S channel (`/_system/v2-domain`), so
+> there's no second operator secret and no dual-write drift. `web/admin_interim`
+> is deleted; the dashboard keeps the session-gated `assignDomain`. The rest of
+> this section is the historical analysis that led there.
+
+`POST {worker}/ops/assign-domain` (`publish_tenant.py:292`) was **live, not
+dead** — it was not a Zig route. It was a handler route in
 `web/admin_interim/index.mjs:39`, a rewind.js app deployed to the
-`__admin__` tenant (hence the call carries `Host: {admin_host}`). It is:
+`__admin__` tenant (hence the call carries `Host: {admin_host}`). It was:
 
 - bearer-gated by `OPS_SECRET`, baked into the bundle at deploy time
   (= `ADMIN_OPS_SECRET` in the operator env; handlers can't read process
@@ -464,7 +472,7 @@ Three secrets + two OIDC planes — not five independent secrets:
 | `REWIND_ROOT_TOKEN` | worker `/_system/*` (bearer) | yes (break-glass) |
 | `REWIND_MOVE_SECRET` | worker `/_system/v2-*` + CP `/_control/*` | yes **and** internal (cp↔worker) |
 | `LOOP46_SERVICES_JWT_SECRET` | minted at worker `/_system/services-token`; verified by log-server + files-server | **no** — internal S2S |
-| `ADMIN_OPS_SECRET` | `/ops/assign-domain` on the interim admin bundle | yes — **interim**, dies with the OIDC dashboard |
+| ~~`ADMIN_OPS_SECRET`~~ | ~~`/ops/assign-domain` on the interim admin bundle~~ | **RETIRED (step3 B3)** — CP propagates the alias |
 | OIDC session `__Host-rove_sid` | operator dashboard (`web/admin/`) | the *real* operator plane |
 | `__auth__` IdP | customer accounts | separate, correct — leave it |
 
