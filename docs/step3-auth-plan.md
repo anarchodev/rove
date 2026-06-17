@@ -193,10 +193,28 @@ files were exercised; the browser SPA (`_static/api.js`) is still stale vs the
 dissolved files-server — its cleanup + the **A5** log-chokepoint wiring both
 ride this same admin-app surface and harness next.
 
-### B3. Retire `ADMIN_OPS_SECRET` — *S*
-Fold `web/admin_interim/`'s `/ops/assign-domain` + `/ops/resolve-domain`
-into the full admin app behind the OIDC session. Drop the bearer secret
-(`rewind-cli-plan.md:565`). Depends on B2.
+### B3. Retire `ADMIN_OPS_SECRET` — ✅ done/verified
+Done via the **CP-ownership** route (not a like-for-like fold): the secret only
+existed because the domain-alias write lived in a *tenant JS handler*
+(`web/admin_interim`) that couldn't check the worker's root token, so it baked
+its own bearer. The investigation found the worker has **no CP fallback** for
+custom-host resolution (`resolveDomain` is local-only) and the CP **didn't
+propagate** the alias — so the CP, which already owns `host → tenant`, now does:
+- **worker**: new move-secret `/_system/v2-domain {host, tenant}` route
+  (`v2_move.zig`) proposes the `__root__/domain` alias (leader-gated type-2
+  root_writeset, via `raft_propose.proposeRoot`);
+- **CP**: `handleHost` propagates the alias to the tenant's serving cluster
+  (`pushDomainToServingCluster`, mirrors `pushPlanToServingCluster`) — **gated**
+  (503 if it didn't land, so a half-mapped host can't report success);
+- **CLI/automation**: `rewind-ops host add` + `publish_tenant --host` collapse
+  to a **single** move-secret CP call; the dashboard keeps session-gated
+  `assignDomain`. `web/admin_interim` deleted; `ADMIN_OPS_SECRET` removed from
+  `common.zig`/`ops.zig`/`publish_tenant.py`.
+
+**Verified** by `scripts/rewind_cli_smoke_v2.py` (new step 4b): `host add` →
+single CP call; a **non-wildcard** custom host (`cli-custom.test`) resolves to
+its tenant via the CP-propagated alias → `200`. No drift (one source of truth),
+self-heal-on-move noted as a follow-up (re-push on attach).
 
 ### B4. Move operator secrets off the shell — *S (delivery, not code)*
 Operator day-to-day becomes the dashboard login; behind it the admin
