@@ -73,8 +73,11 @@ fn cmdDeploy(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, bundle
     const body = c.deployBody(a, tenant, b);
     const headers = authHeaders(a, env);
     var dep: ?[]const u8 = null;
+    // POST /v1/deploy — the one deploy path (rewind-cli-plan Track 0). The
+    // baked genesis bootstrap app is path-agnostic; the standing web/admin app
+    // OWNS /v1/deploy (root-token M2M gate), so deploys work in both worlds.
     for (c.workerUrls(env, a)) |w| {
-        const r = c.workerPost(a, env, w, "/", headers, body, 120);
+        const r = c.workerPost(a, env, w, "/v1/deploy", headers, body, 120);
         if (r.code == 200) {
             dep = c.extractDepId(a, r.body) orelse fatal("deploy: 200 but no dep_id: {s}", .{r.body});
             break;

@@ -1062,6 +1062,53 @@ class OIDCRelyingParty {
   }
 
   /**
+   * CLI/device gateway (rewind-cli-plan Track 3): exchange an IdP
+   * `id_token` — obtained by the `rewind` CLI via the RFC 8628 device
+   * grant — for an RP session bound to THIS request's sid. No browser
+   * redirect: the CLI POSTs `{id_token}`; we read `request.session.id`
+   * (the platform `__Host-rove_sid` minted on this request), verify the
+   * id_token against the JWKS (async refetch when the signing `kid` is
+   * unknown, finishing in {@link OIDCRelyingParty#completeJwks}), and
+   * write `_rp/sess/{sid}`. The CLI captures the Set-Cookie sid, polls
+   * {@link OIDCRelyingParty#pollStatus} until authed, then presents the
+   * sid to ownership-gated endpoints (deploy, publishRelease) — the SAME
+   * session a browser holds, so no new authority surface.
+   *
+   * Returns 200 `{authed:true}` when JWKS was cached (verified inline),
+   * 202 `{status:"verifying"}` when JWKS is being refetched (poll), or
+   * 4xx on a bad/absent token.
+   *
+   * @param {string} id_token - The IdP-signed id_token from `/token`.
+   */
+  exchangeToken(id_token) {
+    const sid = request.session && request.session.id;
+    if (!sid) { response.status = 400; return { error: "no session context" }; }
+    if (!id_token) { response.status = 400; return { error: "id_token required" }; }
+    const dec = jwt.decode(id_token);
+    if (!dec) { response.status = 400; return { error: "malformed id_token" }; }
+
+    const cachedRaw = kv.get(this.cfg.jwks_path);
+    if (cachedRaw != null) {
+      const cached = JSON.parse(cachedRaw);
+      const kid = dec.header && dec.header.kid;
+      if ((cached.keys || []).some((k) => k.kid === kid)) {
+        const res = this._finish(id_token, cached, sid, null);
+        if (res === "ok") { response.status = 200; return { authed: true }; }
+        response.status = 401; return { error: res };
+      }
+    }
+    // Unknown/absent kid → refetch JWKS, finish in completeJwks (callback).
+    webhook.send({
+      url: this.cfg.issuer + "/.well-known/jwks.json",
+      method: "GET",
+      on_result: this.cfg.jwks_module,
+      context: { sid, id_token },
+    });
+    response.status = 202;
+    return { status: "verifying" };
+  }
+
+  /**
    * Resolve the authenticated subject for this request's sid.
    * Typically called from an auth middleware. Sweeps expired rows.
    *

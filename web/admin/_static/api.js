@@ -7,19 +7,19 @@
 // (`credentials: "include"`). No tokens in localStorage, no
 // rove_session cookie, no client-held credential.
 //
-// Every RPC call is still a named function on the `__admin__` handler:
+// Every RPC call is a named function on the `__admin__` handler:
 // `?fn=<name>` (GET, URL-encoded JSON args) or `POST {fn, args}`.
+// Path-routed surfaces (deploy, logs, cp) are plain same-origin fetches
+// that carry the session cookie.
 //
-// Two scopes for the admin handler, both reached on the bare admin
-// host (`app.loop46.me`):
-// 1. No header                  → `kv` = root store (tenant / domain
-//                                  CRUD + session store).
-// 2. `X-Rove-Scope: <id>`       → `kv` = {id}'s app.db (per-tenant
-//                                  KV browsing).
+// Two scopes for the RPC handler, both reached on the bare admin host:
+// 1. No header             → `kv` = root store (tenant / domain CRUD).
+// 2. `X-Rove-Scope: <id>`  → per-tenant KV browsing (platform.scope).
 //
-// Out-of-band: logs + files calls go cross-origin to
-// `logs.{public_suffix}` / `files.{public_suffix}` via a short-lived
-// HS256 JWT minted at `/_system/services-token` on the worker.
+// Logs, deploy, and cluster (CP) ops go through the admin app's OWN
+// same-origin chokepoints (`/v1/logs/*`, `/v1/deploy`, `/v1/cp/*`),
+// which issue the privileged internal-door fetches server-side. No
+// services token, log token, or move-secret ever enters the browser.
 
 const BASE_KEY = "rove.admin.api_base";
 
@@ -42,8 +42,7 @@ function adminBase() {
 
 /// Call a named export on the admin handler. `?fn=<name>&args=...` for
 /// GET, JSON body for POST. Sends cookies. `scope` sets the target
-/// tenant via the `X-Rove-Scope` header; the server rebinds `kv` to
-/// that tenant's store on handler dispatch.
+/// tenant via the `X-Rove-Scope` header for per-tenant KV browsing.
 async function rpc(fn, args, { method = "GET", scope = null } = {}) {
   const argsArr = args ?? [];
   const base = adminBase();
@@ -74,8 +73,8 @@ async function rpc(fn, args, { method = "GET", scope = null } = {}) {
   return parsed;
 }
 
-/// Minimal JSON POST used by /v1/login, /v1/logout. Returns the parsed
-/// body or throws on non-2xx.
+/// Minimal JSON POST used by /v1/logout. Returns the parsed body or
+/// throws on non-2xx. Always same-origin, cookie-authenticated.
 async function postJson(url, body) {
   const res = await fetch(url, {
     method: "POST",
@@ -91,50 +90,10 @@ async function postJson(url, body) {
   return parsed;
 }
 
-async function rawGet(base, path) {
-  const res = await fetch(base + path, { credentials: "include" });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new ApiError(res.status, res.statusText, txt);
-  }
-  return res;
-}
-
-/// Phase 5.5(a) Step B / Phase 5.5(e) Step F1 — single JWT minted by
-/// the worker at /_system/services-token, good for all standalone
-/// services (log-server, files-server). Cached until ~1 minute
-/// before exp; reset to null on 401 so the next call re-mints.
-let _servicesTokenCache = null; // { token, log_url, files_url, refresh_at_ms } | null
-
-async function getServicesToken() {
-  const now = Date.now();
-  if (_servicesTokenCache && now < _servicesTokenCache.refresh_at_ms) return _servicesTokenCache;
-  const res = await rawGet(adminBase(), "/_system/services-token");
-  const body = await res.json();
-  _servicesTokenCache = {
-    token: body.token,
-    log_url: body.log_url.replace(/\/+$/, ""),
-    files_url: body.files_url.replace(/\/+$/, ""),
-    refresh_at_ms: body.exp_ms - 60_000,
-  };
-  return _servicesTokenCache;
-}
-
-/// Cross-origin fetch helper: stamps the JWT, retries once on 401,
-/// throws ApiError on any other failure. `service` picks the URL
-/// base from the token cache ("log_url" or "files_url"); `init` is
-/// passed through to fetch (for POST/PUT bodies, custom headers).
-async function serviceFetch(service, path, init) {
-  let creds = await getServicesToken();
-  const opts = init || {};
-  const headers = { ...(opts.headers || {}), authorization: "Bearer " + creds.token };
-  let res = await fetch(creds[service] + path, { ...opts, headers });
-  if (res.status === 401) {
-    _servicesTokenCache = null;
-    creds = await getServicesToken();
-    headers.authorization = "Bearer " + creds.token;
-    res = await fetch(creds[service] + path, { ...opts, headers });
-  }
+/// Same-origin GET against an admin chokepoint path (logs / cp reads).
+/// Carries the RP session cookie; throws ApiError on non-2xx.
+async function originGet(path) {
+  const res = await fetch(adminBase() + path, { credentials: "same-origin" });
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
     throw new ApiError(res.status, res.statusText, txt);
@@ -145,68 +104,45 @@ async function serviceFetch(service, path, init) {
 // Logs go through the admin app's OWN chokepoint (`/v1/logs/*`), which issues
 // the privileged `rewind-logs.internal` door fetch server-side — the worker
 // mints a tenant-scoped `logs-read` cap and the log-server verifies it
-// (step3-auth-plan.md A5). So there is NO services token in the browser for
-// logs: same-origin, carrying the RP session cookie. Call sites keep passing
-// the log-server path shape `/v1/{inst}/...`; the chokepoint mounts it under
+// (step3-auth-plan.md A5). So there is NO services token in the browser:
+// same-origin, carrying the RP session cookie. Call sites keep passing the
+// log-server path shape `/v1/{inst}/...`; the chokepoint mounts it under
 // `/v1/logs/`.
 async function logFetch(path) {
-  const res = await fetch(path.replace(/^\/v1\//, "/v1/logs/"),
-                          { credentials: "same-origin" });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new ApiError(res.status, res.statusText, txt);
-  }
-  return res;
+  return originGet(path.replace(/^\/v1\//, "/v1/logs/"));
 }
 
-// NOTE: `filesFetch` (+ `getServicesToken`/`serviceFetch` above) is dead — the
-// files-server was dissolved (rewind-cli-plan.md §4), so `composeReplayBundle`'s
-// deployment/source reads below are already broken pending the separate
-// files-path reckoning. Logs no longer touch the services token.
-const filesFetch = (path, init) => serviceFetch("files_url", path, init);
-
-/// URL-encode a file path that may contain `/` separators. Slashes are
-/// preserved; each segment gets `encodeURIComponent`'d.
-function encodePath(path) {
-  return path.split("/").map(encodeURIComponent).join("/");
-}
-
-/// SHA-256(bytes) → 64-char lowercase hex string. Used by the
-/// two-phase deploy to address each file by its content hash before
-/// asking the server which blobs it already has.
-///
-/// `bytes` can be a Uint8Array, ArrayBuffer, or a string (encoded
-/// UTF-8 via TextEncoder). Returns a Promise.
-export async function hashBytes(bytes) {
-  let buffer;
-  if (typeof bytes === "string") {
-    buffer = new TextEncoder().encode(bytes);
-  } else if (bytes instanceof ArrayBuffer) {
-    buffer = bytes;
-  } else if (bytes && bytes.buffer instanceof ArrayBuffer) {
-    buffer = bytes;
-  } else {
-    throw new TypeError("hashBytes: expected Uint8Array, ArrayBuffer, or string");
-  }
-  const digest = await crypto.subtle.digest("SHA-256", buffer);
-  const view = new Uint8Array(digest);
-  let out = "";
-  for (const b of view) out += b.toString(16).padStart(2, "0");
+/// base64 → Uint8Array (browser-side; statics + tape decode).
+function decodeB64(s) {
+  if (!s) return null;
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
+}
+
+/// Uint8Array | ArrayBuffer | string → base64 (for the deploy bundle's
+/// static entries).
+function encodeB64(bytes) {
+  let view;
+  if (typeof bytes === "string") view = new TextEncoder().encode(bytes);
+  else if (bytes instanceof ArrayBuffer) view = new Uint8Array(bytes);
+  else view = bytes;
+  let bin = "";
+  for (let i = 0; i < view.length; i++) bin += String.fromCharCode(view[i]);
+  return btoa(bin);
 }
 
 export const api = {
   // ── Auth ─────────────────────────────────────────────────────────
   // Login is the OIDC RP handshake: a full-page navigation to
-  // `/_rp/login` (see pages/login.js) — there is no token/signup
-  // form and no client-held credential.
+  // `/_rp/login` (see pages/login.js) — there is no token/signup form
+  // and no client-held credential.
   logout() {
     return postJson(adminBase() + "/v1/logout", {});
   },
   /// Provision the caller's first instance. Identity is the
-  /// OIDC-verified session `sub` server-side — `name` is the only
-  /// arg. Errors: 409 = name unavailable / reserved, 400 = invalid
-  /// name, 403 = account_limit_reached.
+  /// OIDC-verified session `sub` server-side — `name` is the only arg.
   provisionInstance(name) {
     return rpc("provisionInstance", [name], { method: "POST" });
   },
@@ -260,167 +196,107 @@ export const api = {
     return rpc("deleteKv", [key], { method: "POST", scope: instance_id });
   },
 
-  // ── Out-of-band: files (cross-origin via JWT) ─────────────────────
+  // ── Deploy (the one bundle path: POST /v1/deploy) ────────────────
   //
-  // Phase 5.5(e) Step F1 — the dashboard talks to the standalone
-  // files-server directly at `https://files.{public_suffix}`. Auth
-  // is the same JWT minted at /_system/services-token; CORS allows
-  // the admin origin.
-  async listFiles(instance_id) {
-    const res = await filesFetch(`/${encodeURIComponent(instance_id)}/list`);
-    return res.json();
-  },
-  async getFile(instance_id, path) {
-    const res = await filesFetch(
-      `/${encodeURIComponent(instance_id)}/file/${encodePath(path)}`);
-    return res.json();
-  },
-  async putFile(instance_id, path, content, contentType) {
-    const res = await filesFetch(
-      `/${encodeURIComponent(instance_id)}/file/${encodePath(path)}`,
-      {
-        method: "PUT",
-        headers: { "Content-Type": contentType || "application/octet-stream" },
-        body: content,
-      },
-    );
-    return res.text();
-  },
-
-  // ── Two-phase deploy: check → upload blobs → commit manifest ─────
+  // rewind-cli-plan Track 0 — the standing dashboard app OWNS /v1/deploy.
+  // The browser POSTs the full bundle ({tenant, handlers, statics}); the
+  // server composes the deploy from platform.* (compile + content-address
+  // + stampManifest barrier) and returns { ok, dep_id }. Ownership-gated
+  // server-side (is_root OR the session owns the tenant). Replaces the old
+  // two-phase files-server upload — the files-server was dissolved
+  // (rewind-cli-plan §4).
   //
-  // The protocol mirrors PLAN §2.4 and swaps in cleanly for presigned
-  // S3 uploads later: the client always follows whatever URL the
-  // server hands back in `/blobs/check`. Hash files client-side with
-  // SHA-256 (`hashBytes` below); 64 lowercase hex chars.
-
-  async checkBlobs(instance_id, hashes) {
-    const res = await filesFetch(
-      `/${encodeURIComponent(instance_id)}/blobs/check`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ hashes }),
-      },
-    );
-    return res.json(); // { missing: [...], uploads: {hash: {url, method, expires_in}} }
-  },
-
-  /// Upload one blob. `uploadInfo` comes from `checkBlobs`' `uploads`
-  /// object. URLs are resolved against the files-server's base.
-  /// Future S3-presign mode would return absolute https URLs; the
-  /// `startsWith("http")` branch handles that case without auth.
-  async uploadBlob(uploadInfo, bytes) {
-    if (uploadInfo.url.startsWith("http")) {
-      // Presigned (e.g. S3) URL: no auth, no credentials.
-      const headers = { ...(uploadInfo.headers || {}) };
-      const res = await fetch(uploadInfo.url, {
-        method: uploadInfo.method || "PUT",
-        headers,
-        body: bytes,
-      });
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        throw new ApiError(res.status, res.statusText, txt);
+  // `files` is `{ path: { source } }` for handlers and
+  // `{ path: { bytes, content_type } }` for statics (a `_static/`-prefixed
+  // path, or any entry carrying `bytes`, is treated as a static).
+  async deploy(instance_id, files) {
+    const handlers = [];
+    const statics = [];
+    for (const [path, f] of Object.entries(files)) {
+      const isStatic = f.bytes != null || path.startsWith("_static/") ||
+                       path.startsWith("_config/");
+      if (isStatic) {
+        statics.push({
+          path,
+          content_type: f.content_type || "application/octet-stream",
+          b64: encodeB64(f.bytes ?? f.source ?? ""),
+        });
+      } else {
+        handlers.push({ path, source: f.source ?? "" });
       }
-      return;
     }
-    // Same-files-server upload — needs the JWT.
-    await filesFetch(uploadInfo.url, {
-      method: uploadInfo.method || "PUT",
-      headers: { ...(uploadInfo.headers || {}) },
-      body: bytes,
-    });
-  },
-
-  async deployManifest(instance_id, files, { parent_id = null, comment = null } = {}) {
-    const body = { files };
-    if (parent_id !== null) body.parent_id = parent_id;
-    if (comment !== null) body.comment = comment;
-    const res = await filesFetch(
-      `/${encodeURIComponent(instance_id)}/deployments`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      },
-    );
-    return res.json(); // { id, parent_id }
-  },
-
-  /// Phase 5.5(e) F2 — push the deploy id back to the worker so it
-  /// reloads bytecodes immediately. Replaces the legacy 2-second
-  /// `refreshDeployments` polling loop. Same-origin POST against the
-  /// admin host (cookie-authenticated). Idempotent — repeating the
-  /// same {tenant_id, dep_id} is a no-op.
-  async releaseDeployment(instance_id, dep_id) {
-    const res = await fetch(adminBase() + "/_system/release", {
+    const res = await fetch(adminBase() + "/v1/deploy", {
       method: "POST",
       credentials: "include",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tenant_id: instance_id, dep_id }),
+      body: JSON.stringify({ tenant: instance_id, handlers, statics }),
     });
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new ApiError(res.status, res.statusText, txt);
-    }
+    const body = await res.json().catch(() => null);
+    if (!res.ok) throw new ApiError(res.status, res.statusText, body);
+    return body; // { ok: true, dep_id: "<016x>" }
   },
 
-  /// High-level helper: takes a map `{path: {bytes, kind, content_type?}}`,
-  /// hashes each, uploads missing blobs in parallel, and commits the
-  /// manifest. Returns the deploy result `{id, parent_id}`.
-  ///
-  /// `bytes` must be a Uint8Array or ArrayBuffer. `kind` is
-  /// "handler" or "static". Pass `parent_id` (hex string) to CAS
-  /// against `deployment/current`; omit to skip the check.
-  async bulkDeploy(instance_id, files, { parent_id = null, comment = null } = {}) {
-    // Hash each file client-side. crypto.subtle.digest is async but
-    // runs in parallel if we Promise.all them.
-    const entries = await Promise.all(Object.entries(files).map(async ([path, f]) => {
-      const hash = await hashBytes(f.bytes);
-      return { path, hash, bytes: f.bytes, kind: f.kind, content_type: f.content_type };
-    }));
+  /// Flip the live deployment pointer. `dep_id` is the hex string from
+  /// `deploy`. Ownership-gated server-side (publishRelease — step3 B5).
+  /// Same-origin RPC; the worker proposes the release through raft.
+  releaseDeployment(instance_id, dep_id) {
+    const n = typeof dep_id === "string" ? parseInt(dep_id, 16) : dep_id;
+    return rpc("publishRelease", [instance_id, n], { method: "POST" });
+  },
 
-    const hashes = entries.map((e) => e.hash);
-    const check = await this.checkBlobs(instance_id, hashes);
-
-    // Upload missing blobs in parallel (the browser caps per-host
-    // concurrency automatically; no need to throttle by hand).
-    const byHash = new Map(entries.map((e) => [e.hash, e]));
-    await Promise.all(
-      check.missing.map((hash) => {
-        const info = check.uploads[hash];
-        const entry = byHash.get(hash);
-        return this.uploadBlob(info, entry.bytes);
-      })
-    );
-
-    // Commit the manifest.
-    const manifest = {};
-    for (const e of entries) {
-      manifest[e.path] = { hash: e.hash, kind: e.kind };
-      if (e.content_type) manifest[e.path].content_type = e.content_type;
-    }
-    const result = await this.deployManifest(instance_id, manifest, { parent_id, comment });
-    // The dashboard / CLI is the source of truth for "this deploy is
-    // live now". Tell the worker to reload before resolving the
-    // promise so the next request lands on the new code. The
-    // numeric id comes back as a hex string from the files-server.
-    const dep_id_num = typeof result.id === "string" ? parseInt(result.id, 16) : result.id;
-    await this.releaseDeployment(instance_id, dep_id_num);
+  /// High-level helper: deploy a bundle then release it. Returns the
+  /// deploy result `{ ok, dep_id }`.
+  async deployAndRelease(instance_id, files) {
+    const result = await this.deploy(instance_id, files);
+    await this.releaseDeployment(instance_id, result.dep_id);
     return result;
   },
 
-  // ── Out-of-band: logs ─────────────────────────────────────────────
+  // ── Operator: cluster control plane (is_root only) ───────────────
   //
-  // Phase 5.5(a) Step B — the dashboard talks to the standalone
-  // log-server directly at `https://logs.{public_suffix}` (cross-
-  // origin), not through the worker proxy. Auth is a short-lived
-  // HS256 JWT minted at `/_system/services-token` on the worker. The
-  // token + base URL are cached for a few minutes; refresh on demand.
+  // The cluster-management surface — the GUI twin of `rewind-ops`. Each
+  // call goes through the admin app's /v1/cp/* chokepoint, which issues
+  // the `rewind-cp.internal` door fetch (the worker attaches the
+  // move-secret) — no CP secret in the browser (step3-auth-plan.md B4).
+  // All are operator-only; a non-operator session gets 403.
+  async cpProvision(tenant, cluster, host) {
+    return this._cpPost("provision", { tenant, cluster, host });
+  },
+  async cpMove(tenant, cluster, { live = false } = {}) {
+    return this._cpPost("move", { tenant, cluster, live });
+  },
+  async cpHost(host, tenant) {
+    return this._cpPost("host", { host, tenant });
+  },
+  async cpPlan(tenant, plan) {
+    return this._cpPost("plan", { tenant, plan });
+  },
+  async _cpPost(op, body) {
+    const res = await fetch(adminBase() + "/v1/cp/" + op, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const txt = await res.text();
+    if (!res.ok) throw new ApiError(res.status, res.statusText, txt);
+    return txt ? JSON.parse(txt) : null;
+  },
+  /// Placement read for a host → `{cluster, tenant, moving, nodes}`.
+  async clusterRoute(host) {
+    const res = await originGet("/v1/cp/route?host=" + encodeURIComponent(host));
+    return res.json();
+  },
+  /// Plan read for a tenant.
+  async clusterPlan(tenant) {
+    const res = await originGet("/v1/cp/plan?tenant=" + encodeURIComponent(tenant));
+    return res.json();
+  },
+
+  // ── Logs (same-origin chokepoint, RP cookie) ─────────────────────
   //
-  // request_ids are decimal numbers (the standalone's wire shape);
-  // pagination cursor is `{received_ns, request_id}`.
+  // request_ids are decimal numbers; pagination cursor is
+  // `{received_ns, request_id}`.
   async listLogs(instance_id, { limit = 100, after = null } = {}) {
     const params = { limit: String(limit) };
     if (after) {
@@ -444,114 +320,36 @@ export const api = {
     return res.text();
   },
 
-  // ── Replay bundle composer (PLAN §10.12) ────────────────────────
+  // ── Replay bundle composer ───────────────────────────────────────
   //
-  // Builds the bundle the replay shell consumes by fetching the log
-  // record + the deployment manifest the request was dispatched
-  // against + handler source bytes + captured tape blobs. Log fetches
-  // go through the worker's /_system/log/* proxy → standalone
-  // log-server (S3-backed). Files fetches stay on the worker's
-  // files-server's subdomain. The composed bundle is then handed to
-  // the replay shell on `replay.<suffix>` via postMessage — see
-  // `replayOpen` below.
+  // Composes the bundle the WASM replay shell consumes. The log record
+  // (fetched via the same-origin logs chokepoint) carries the captured
+  // tapes + scalars + request body INLINE, so those are available today.
   //
-  // The manifest is loaded by the request's captured deployment_id,
-  // not the current pointer — replays of older requests get the
-  // historical source the handler actually ran with. If retention
-  // has GC'd that deployment, we fall back to the current manifest
-  // and surface a `historical_manifest_missing` flag so the replay
-  // shell can warn the user.
+  // GAP (rewind-cli-plan Track 2): the handler MODULE SOURCES + the
+  // historical deployment manifest used to come from the files-server,
+  // which was dissolved (§4). Reading them back now requires a
+  // cross-tenant blob/manifest READ door (the write twin —
+  // platform.scope(t).blob.put — exists; the read door does not yet).
+  // Until that door lands, `modules`/`entry_source` come back empty and
+  // `sources_unavailable` is set so the replay shell can explain why it
+  // can't step through source. This same door also unblocks the Code
+  // tab's edit-existing-files flow.
   async composeReplayBundle(instance_id, request_id) {
     const inst = encodeURIComponent(instance_id);
     const rid = encodeURIComponent(String(request_id));
 
     const recordRes = await logFetch(`/v1/${inst}/show/${rid}`);
-    const recordWrap = await recordRes.json();
-    const record = recordWrap.record;
-
-    // Hex-encoded deployment id matches the files-server's
-    // /{inst}/deployments/{hex} route shape.
-    const depHex = (record.deployment_id ?? 0).toString(16).padStart(16, "0");
-    let manifest;
-    let historicalManifestMissing = false;
-    try {
-      const r = await filesFetch(`/${inst}/deployments/${depHex}`);
-      manifest = await r.json();
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 404) {
-        // Historical deployment GC'd or otherwise unreachable —
-        // fall back to current. Replay shell can flag the mismatch.
-        historicalManifestMissing = true;
-        const r = await filesFetch(`/${inst}/list`);
-        manifest = await r.json();
-      } else {
-        throw err;
-      }
-    }
-
-    // Find the handler entry. PLAN §2.4 says the default export at
-    // `index.mjs` (or `index.js` post-compile) is the catch-all
-    // entrypoint. Fall back to the first .mjs/.js entry if neither
-    // exact name is present.
-    let entryHash = null;
-    let entryPath = null;
-    const entries = manifest.entries || [];
-    for (const e of entries) {
-      if (e.path === "index.mjs" || e.path === "index.js") {
-        entryHash = e.hash; entryPath = e.path; break;
-      }
-    }
-    if (!entryHash) {
-      for (const e of entries) {
-        if (e.kind === "handler" && (e.path.endsWith(".mjs") || e.path.endsWith(".js"))) {
-          entryHash = e.hash; entryPath = e.path; break;
-        }
-      }
-    }
-
-    // Fetch source bytes for EVERY handler entry, not just the
-    // entry. This lets the replay shell build an importmap so
-    // multi-file handlers' sibling imports (`import "./lib/foo"`)
-    // resolve to the right blob inside the iframe. Static entries
-    // are skipped — they aren't part of the JS module graph.
-    const handlerEntries = entries.filter((e) => e.kind === "handler");
-    const sources = await Promise.all(handlerEntries.map(async (e) => {
-      const r = await filesFetch(`/${inst}/source/${encodeURIComponent(e.hash)}`);
-      return { path: e.path, hash: e.hash, source: await r.text() };
-    }));
-    let entrySource = "";
-    for (const s of sources) {
-      if (s.path === entryPath) entrySource = s.source;
-    }
-
-    // Tape + body bytes ride inline in the LogRecord (post-Phase-
-    // 5.5 a-2). The /show endpoint range-reads the whole record
-    // line in a single round trip; we just base64-decode the
-    // channels we care about for the replay shell.
+    const record = (await recordRes.json()).record;
     const tapesField = record.tapes || {};
-    function decodeB64(s) {
-      if (!s) return null;
-      const bin = atob(s);
-      const out = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-      return out;
-    }
+
     const tapeBlobs = {
       kv: decodeB64(tapesField.kv_tape_b64),
-      // Read-taping: the lazily-recorded request-surface reads
-      // (header names + values, body-read marker, ip reads). The
-      // replay shell rebuilds `request` from these — see
-      // web/replay/_static/request-replay.mjs.
       request_reads: decodeB64(tapesField.request_reads_tape_b64),
     };
-    // `docs/primitive-gaps.md` §9 + fold-in: two captured-request
-    // scalars in the bundle. Replay shell hands `seed` to
-    // `arena_set_random_seed` and `timestamp_ns` to
-    // `arena_set_date_now`, so `Math.random` / `crypto.*` /
-    // `Date.now()` / `new Date()` all reproduce the original
-    // request's sequences. `0n` is the safe pre-§9 default.
     const seed = tapesField.seed != null ? BigInt(tapesField.seed) : 0n;
-    const timestamp_ns = tapesField.timestamp_ns != null ? BigInt(tapesField.timestamp_ns) : 0n;
+    const timestamp_ns = tapesField.timestamp_ns != null
+      ? BigInt(tapesField.timestamp_ns) : 0n;
     const bodyBytes = decodeB64(tapesField.request_body_b64);
 
     return {
@@ -563,11 +361,6 @@ export const api = {
         method: record.method,
         path: record.path,
         host: record.host,
-        // Replay shell decodes these to a string (UTF-8) and stamps
-        // `window.request.body`. Null when the request had no body
-        // OR the worker chose not to capture (no tenant log open at
-        // capture time). Truncated bodies get an explicit flag so
-        // the shell can warn the handler may see less than original.
         body_bytes: bodyBytes,
         body_truncated: !!tapesField.request_body_truncated,
       },
@@ -577,43 +370,28 @@ export const api = {
         console: record.console,
         exception: record.exception,
       },
-      entry_path: entryPath,
-      entry_source_hash: entryHash,
-      entry_source: entrySource,
-      // Every handler in the deployment's manifest, not just the
-      // captured imports — the replay shell builds an importmap from
-      // this so any `import` in any module resolves. Sources fetched
-      // by hash; the entry itself is also in here.
-      modules: sources,
+      entry_path: null,
+      entry_source: "",
+      modules: [],
       seed,
       timestamp_ns,
       tape_blobs: tapeBlobs,
-      // The activation kind drives which export the replay epilogue
-      // invokes (request-replay.mjs exportForActivation — mirrors
-      // rpc_dispatch.defaultExportForKind).
       activation: record.activation,
-      // True iff the historical manifest was unreachable and the
-      // shell got the CURRENT manifest as a fallback. Replay shell
-      // surfaces this in the side-effects panel so the user knows
-      // the source they're stepping through may not match what
-      // originally ran.
-      historical_manifest_missing: historicalManifestMissing,
+      // Source/manifest reads await the cross-tenant read door (see above).
+      sources_unavailable: true,
+      historical_manifest_missing: true,
     };
   },
 
   /// Open the replay shell in a new tab and send it the bundle via
-  /// postMessage. The shell is at `replay.<suffix>` — derived from
-  /// the dashboard's own origin by replacing the `app.` label.
-  /// Returns the opened window (caller can close it on error).
+  /// postMessage. The shell is at `replay.<suffix>` — derived from the
+  /// dashboard's own origin by replacing the `app.` label.
   replayOpen(bundle) {
     const replayOrigin = window.location.origin.replace("://app.", "://replay.");
     const popup = window.open(replayOrigin + "/", "_blank");
     if (!popup) {
       throw new Error("popup blocked — allow popups for the dashboard");
     }
-    // The shell sends `replay:ready` once it's listening; we reply
-    // with `replay:bundle`. We can't deliver the bundle until then —
-    // postMessage to a not-yet-loaded page is dropped.
     function onMsg(e) {
       if (e.origin !== replayOrigin) return;
       if (e.source !== popup) return;
@@ -623,9 +401,6 @@ export const api = {
       }
     }
     window.addEventListener("message", onMsg);
-    // 30s safety net — give up if the shell never reports ready
-    // (popup blocker, navigation away, etc.). At that point the
-    // dashboard has nothing to clean up — user just closes the tab.
     setTimeout(() => window.removeEventListener("message", onMsg), 30_000);
     return popup;
   },

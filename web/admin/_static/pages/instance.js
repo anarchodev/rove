@@ -490,6 +490,13 @@ function renderKv(root, { instanceId, api, showError, clearError }) {
 
 // ── Code panel ─────────────────────────────────────────────────────
 
+// The Code tab builds a deploy bundle IN THE BROWSER (a "draft") and ships it
+// in one shot via POST /v1/deploy + release (api.deployAndRelease) — the
+// files-server's per-file upload/edit API was dissolved (rewind-cli-plan §4).
+// Loading the CURRENTLY-deployed files back into the editor needs a
+// cross-tenant blob/manifest READ door (the write twin exists; the read door
+// does not yet) — until it lands this tab edits a fresh draft rather than the
+// live deployment.
 function renderCode(root, { instanceId, api, showError, clearError }) {
   const el = document.createElement("div");
   el.className = "code-panel";
@@ -498,15 +505,16 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
       <aside class="file-list">
         <div class="toolbar">
           <button type="button" class="new-file">New</button>
-          <button type="button" class="refresh">Refresh</button>
+          <button type="button" class="deploy" disabled>Deploy</button>
         </div>
+        <p class="draft-note muted">Draft bundle — Deploy ships every file at
+          once. Loading existing deployed files awaits the read door.</p>
         <ul></ul>
       </aside>
       <section class="editor">
         <div class="editor-header">
           <span class="current-path muted">(no file selected)</span>
           <span class="editor-meta muted"></span>
-          <button type="button" class="save" disabled>Save</button>
         </div>
         <div class="editor-body" tabindex="-1"></div>
       </section>
@@ -515,14 +523,16 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
   root.appendChild(el);
 
   const list = el.querySelector(".file-list ul");
-  const refreshBtn = el.querySelector(".refresh");
+  const deployBtn = el.querySelector(".deploy");
   const newBtn = el.querySelector(".new-file");
   const pathLabel = el.querySelector(".current-path");
   const metaLabel = el.querySelector(".editor-meta");
-  const saveBtn = el.querySelector(".save");
   const editorMount = el.querySelector(".editor-body");
 
-  let selected = null; // { path, kind, content_type, original }
+  // Draft bundle: path → { kind, content_type, source }. Editing updates
+  // `source` live; Deploy ships the whole map.
+  const draft = {};
+  let selected = null; // { path, kind, content_type }
   let cm = null;       // { view, langCompartment, EditorView, EditorState, ... }
   let cmLoading = null; // in-flight import promise
 
@@ -537,8 +547,9 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
       const editableCompartment = new CM.Compartment();
       const docChanged = CM.EditorView.updateListener.of((u) => {
         if (!u.docChanged || !selected) return;
-        const cur = u.state.doc.toString();
-        saveBtn.disabled = cur === selected.original;
+        // Live-write the edit into the draft; Deploy ships the whole map.
+        draft[selected.path].source = u.state.doc.toString();
+        deployBtn.disabled = Object.keys(draft).length === 0;
       });
       const state = CM.EditorState.create({
         doc: "",
@@ -566,41 +577,29 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
     return cmLoading;
   }
 
-  async function loadList() {
-    refreshBtn.disabled = true;
-    clearError();
-    try {
-      const res = await api.listFiles(instanceId);
-      const entries = res.entries ?? [];
-      list.replaceChildren();
-      if (entries.length === 0) {
-        const li = document.createElement("li");
-        li.className = "empty";
-        li.innerHTML = `<em>no deployment</em>`;
-        list.appendChild(li);
-      } else {
-        for (const e of entries) list.appendChild(buildFileLi(e));
-      }
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 401) {
-        location.hash = "#/login";
-        return;
-      }
-      showError(`Load files failed: ${err.message}`);
-    } finally {
-      refreshBtn.disabled = false;
+  function renderDraft() {
+    list.replaceChildren();
+    const paths = Object.keys(draft).sort();
+    deployBtn.disabled = paths.length === 0;
+    if (paths.length === 0) {
+      const li = document.createElement("li");
+      li.className = "empty";
+      li.innerHTML = `<em>empty draft — add a file with New</em>`;
+      list.appendChild(li);
+      return;
     }
+    for (const p of paths) list.appendChild(buildFileLi(p, draft[p]));
   }
 
-  function buildFileLi(entry) {
+  function buildFileLi(path, entry) {
     const li = document.createElement("li");
     li.className = `file file-${entry.kind}`;
-    li.dataset.path = entry.path;
+    li.dataset.path = path;
     li.innerHTML = `
       <span class="file-kind">${entry.kind === "handler" ? "JS" : "—"}</span>
-      <span class="file-path">${escapeHtml(entry.path)}</span>
+      <span class="file-path">${escapeHtml(path)}</span>
     `;
-    li.addEventListener("click", () => openFile(entry.path));
+    li.addEventListener("click", () => openFile(path));
     return li;
   }
 
@@ -616,12 +615,13 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
 
   async function openFile(path) {
     clearError();
+    const entry = draft[path];
+    if (!entry) return;
     for (const node of list.querySelectorAll("li")) {
       node.classList.toggle("active", node.dataset.path === path);
     }
     pathLabel.textContent = path;
-    metaLabel.textContent = "Loading…";
-    saveBtn.disabled = true;
+    metaLabel.textContent = "Loading editor…";
 
     let editor;
     try {
@@ -629,63 +629,47 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
     } catch {
       return; // showError already invoked inside ensureEditor
     }
-    // Disable while we fetch.
+    selected = { path, kind: entry.kind, content_type: entry.content_type };
     editor.view.dispatch({
-      effects: editor.editableCompartment.reconfigure(
-        editor.CM.EditorView.editable.of(false),
-      ),
+      changes: { from: 0, to: editor.view.state.doc.length, insert: entry.source },
+      effects: [
+        editor.langCompartment.reconfigure(langFor(editor.CM, path)),
+        editor.editableCompartment.reconfigure(
+          editor.CM.EditorView.editable.of(true),
+        ),
+      ],
     });
+    metaLabel.textContent =
+      `${entry.kind} · ${entry.content_type || "(no content-type)"} · draft`;
+  }
 
+  deployBtn.addEventListener("click", async () => {
+    if (Object.keys(draft).length === 0) return;
+    deployBtn.disabled = true;
+    const orig = deployBtn.textContent;
+    deployBtn.textContent = "Deploying…";
+    clearError();
     try {
-      const file = await api.getFile(instanceId, path);
-      selected = {
-        path,
-        kind: file.kind,
-        content_type: file.content_type,
-        original: file.content ?? "",
-      };
-      editor.view.dispatch({
-        changes: { from: 0, to: editor.view.state.doc.length, insert: selected.original },
-        effects: [
-          editor.langCompartment.reconfigure(langFor(editor.CM, path)),
-          editor.editableCompartment.reconfigure(
-            editor.CM.EditorView.editable.of(true),
-          ),
-        ],
-      });
-      metaLabel.textContent = `${file.kind} · ${file.content_type || "(no content-type)"} · ${selected.original.length} bytes`;
-      saveBtn.disabled = true; // enable only when dirty
+      // draft entries → api.deploy's {path: {source}|{bytes,content_type}} map.
+      const files = {};
+      for (const [p, e] of Object.entries(draft)) {
+        files[p] = e.kind === "handler"
+          ? { source: e.source }
+          : { source: e.source, content_type: e.content_type };
+      }
+      const result = await api.deployAndRelease(instanceId, files);
+      metaLabel.textContent = `deployed + released · dep ${result.dep_id}`;
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         location.hash = "#/login";
         return;
       }
-      showError(`Open failed: ${err.message}`);
-      metaLabel.textContent = "";
-    }
-  }
-
-  saveBtn.addEventListener("click", async () => {
-    if (!selected || !cm) return;
-    saveBtn.disabled = true;
-    saveBtn.textContent = "Saving…";
-    try {
-      const body = cm.view.state.doc.toString();
-      const ct = selected.content_type && selected.content_type.length > 0
-        ? selected.content_type
-        : (selected.kind === "handler" ? "application/javascript" : "application/octet-stream");
-      await api.putFile(instanceId, selected.path, body, ct);
-      selected.original = body;
-      metaLabel.textContent = `${selected.kind} · ${ct} · ${body.length} bytes · saved`;
-    } catch (err) {
-      showError(`Save failed: ${err.message}`);
-      saveBtn.disabled = false;
+      showError(`Deploy failed: ${err.message}`);
     } finally {
-      saveBtn.textContent = "Save";
+      deployBtn.textContent = orig;
+      deployBtn.disabled = Object.keys(draft).length === 0;
     }
   });
-
-  refreshBtn.addEventListener("click", loadList);
 
   newBtn.addEventListener("click", async () => {
     const raw = prompt(
@@ -712,17 +696,12 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
       ? `export default function (req) {\n  return "hello from ${path}\\n";\n}\n`
       : "";
 
-    try {
-      await api.putFile(instanceId, path, starter, contentType);
-    } catch (err) {
-      showError(`Create failed: ${err.message}`);
-      return;
-    }
-    await loadList();
+    draft[path] = { kind, content_type: contentType, source: starter };
+    renderDraft();
     await openFile(path);
   });
 
-  loadList();
+  renderDraft();
   return () => {
     if (cm) {
       cm.view.destroy();

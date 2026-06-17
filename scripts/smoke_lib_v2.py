@@ -547,7 +547,12 @@ class V2Cluster:
             else:
                 handlers.append({"path": f["path"],
                                  "source": base64.b64decode(f["b64"]).decode()})
-        r = _curl(f"{self.front_url()}/", method="POST",
+        # POST /v1/deploy — THE one deploy path (Track 0). The baked genesis
+        # bootstrap app is path-agnostic (any POST = deploy), so this works
+        # during bring-up; once web/admin is the standing __admin__ app it OWNS
+        # /v1/deploy (genesis's POST "/" became web/admin's RPC dispatcher), so
+        # deploys keep working after the dashboard replaces the bootstrap app.
+        r = _curl(f"{self.front_url()}/v1/deploy", method="POST",
                   host=self.host_for("__admin__"),
                   headers={"Authorization": f"Bearer {self.root_token}",
                            "Content-Type": "application/json"},

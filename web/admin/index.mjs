@@ -347,6 +347,10 @@ function handleLogQuery(path, qs) {
 // Operator-only (is_root). The result rides `onFetchResult` (shared with the
 // log chokepoint — both just relay the upstream verbatim).
 const CP_DOOR = "http://rewind-cp.internal/_control/";
+// CP read surface (GET _cp/route?host= / _cp/plan?tenant=) — the cluster page
+// reads placement + plan through the same door (the worker attaches the
+// move-secret). Operator-only, like the control ops.
+const CP_READ = "http://rewind-cp.internal/_cp/";
 
 function handleCpOp(cpPath, body) {
     const auth = request.auth || {};
@@ -357,6 +361,18 @@ function handleCpOp(cpPath, body) {
         body: body,
         headers: { "content-type": "application/json" },
     });
+    return next();
+}
+
+// GET cluster-status reads (operator-only): /v1/cp/route?host=H and
+// /v1/cp/plan?tenant=T → the CP _cp/* read surface via the door. Powers the
+// #/cluster operator page's placement/plan lookups (the GUI twin of
+// `rewind-ops status`).
+function handleCpRead(cpSub, qs) {
+    const auth = request.auth || {};
+    if (!auth.sub) return jsonError(401, "unauthenticated");
+    if (!auth.is_root) return jsonError(403, "operator only");
+    on.fetch(CP_READ + cpSub + (qs ? "?" + qs : ""));
     return next();
 }
 
@@ -372,6 +388,90 @@ export function onFetchResult() {
     response.status = 502;
     return JSON.stringify({ error: "internal door fetch failed",
                             status: request.status || 0 });
+}
+
+// ── Deploy surface (Track 0 — the standing app owns the one arbitrary-
+// bundle deploy path) ───────────────────────────────────────────────
+//
+// Folds the baked genesis_admin.mjs composition INTO the standing
+// dashboard so deploys survive once web/admin replaces the bootstrap app
+// on __admin__ (they collided on POST /). Composed entirely from
+// platform.* primitives — no Zig deploy route:
+//   1. stage statics  → platform.scope(t).blob.put  (sync hash + deferred PUT)
+//   2. compile handlers → platform.compile (async, bound; resumes onCompiled)
+//   3. stamp manifest → platform.scope(t).deploy.stampManifest (the staging
+//      BARRIER; resumes onStamped only once every PUT is durable)
+//
+// Authz: an operator (is_root — root token via _middlewares M2M path, or an
+// operator OIDC session) may deploy any tenant; a customer session may deploy
+// ONLY a tenant they own (same gate as publishRelease). Does NOT release —
+// activation stays a separate, gated publishRelease call.
+//
+// Wire (POST /v1/deploy): { tenant, handlers:[{path,source}],
+//   statics:[{path,content_type,b64}] } → 200 { ok:true, dep_id:"<016x>" }.
+function bytesFromB64(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+}
+
+function handleDeploy(body) {
+    const auth = request.auth || {};
+    let b;
+    try { b = JSON.parse(body); }
+    catch (e) { return jsonError(400, "expected JSON {tenant, handlers, statics}"); }
+    const target = b.tenant;
+    if (!validId(target)) return jsonError(400, "invalid tenant");
+    if (!auth.is_root) {
+        if (!auth.sub) return jsonError(401, "unauthenticated");
+        if (ownedInstances(accountHashFor(auth.sub)).indexOf(target) === -1) {
+            return jsonError(403, "not your instance");
+        }
+    }
+    const handlers = b.handlers || [];
+    const statics = b.statics || [];
+
+    const staticEntries = statics.map(function (s) {
+        const hash = platform.scope(target).blob.put(bytesFromB64(s.b64), {
+            content_type: s.content_type,
+        });
+        return { path: s.path, kind: "static",
+                 source_hex: hash, content_type: s.content_type };
+    });
+
+    platform.compile(handlers, {
+        scope: target,
+        name: "onCompiled",
+        ctx: { target: target, statics: staticEntries },
+    });
+    return next();
+}
+
+// Compile bound-resume (continuation — skips _middlewares). Composes the full
+// manifest from returned bytecode hashes + the threaded statics, then stamps.
+export function onCompiled() {
+    const ctx = request.ctx;
+    if (!ctx || !ctx.ok) {
+        response.status = 500;
+        return JSON.stringify({ stage: "compile", ctx: ctx || null });
+    }
+    const app = ctx.app || {};
+    const entries = ctx.results
+        .map(function (r) {
+            return { path: r.path, kind: "handler",
+                     source_hex: r.source_hex, bytecode_hex: r.bytecode_hex };
+        })
+        .concat(app.statics || []);
+    platform.scope(app.target).deploy.stampManifest(entries, { name: "onStamped" });
+    return next();
+}
+
+// stampManifest barrier resume — the whole deploy is durable here.
+export function onStamped() {
+    response.status = 200;
+    response.headers = { "content-type": "application/json" };
+    return JSON.stringify(request.ctx); // { ok, dep_id }
 }
 
 // ── fn-RPC dispatch (JS recipe) ─────────────────────────────────────
@@ -441,6 +541,19 @@ export default function() {
     if (method === "POST" && path === "/v1/logout")  return rp.logout();
     if (method === "GET"  && path === "/v1/session") return handleSession();
 
+    // CLI/device gateway (Track 3): the `rewind` customer CLI POSTs its
+    // device-grant id_token here → RP session bound to this request's sid.
+    // Pre-auth (the CLI has no session yet — this establishes one).
+    if (method === "POST" && path === "/v1/cli/exchange") {
+        let b; try { b = JSON.parse(request.body || "{}"); } catch (_) { b = {}; }
+        return rp.exchangeToken(b.id_token);
+    }
+
+    // Deploy chokepoint (Track 0). request.auth is set by _middlewares —
+    // either an operator root-token (M2M) or an OIDC session; handleDeploy
+    // gates on is_root OR ownership of the target tenant.
+    if (method === "POST" && path === "/v1/deploy") return handleDeploy(request.body || "{}");
+
     // Log query chokepoint → rewind-logs.internal door (A5).
     if (method === "GET" && path.startsWith("/v1/logs/")) {
         return handleLogQuery(path, q === -1 ? "" : fullPath.slice(q + 1));
@@ -456,6 +569,13 @@ export default function() {
         let live = false;
         try { live = !!JSON.parse(request.body || "{}").live; } catch (_) {}
         return handleCpOp(live ? "move-live" : "move", request.body || "{}");
+    }
+    // CP read surface for the cluster page (operator-only).
+    if (method === "GET" && path === "/v1/cp/route") {
+        return handleCpRead("route", q === -1 ? "" : fullPath.slice(q + 1));
+    }
+    if (method === "GET" && path === "/v1/cp/plan") {
+        return handleCpRead("plan", q === -1 ? "" : fullPath.slice(q + 1));
     }
 
     response.status = 404;

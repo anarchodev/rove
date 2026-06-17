@@ -22,6 +22,21 @@ relevant section so the next design pass doesn't fight the code.
 shell (commit 8565634), the `web/*/_static/` path move (commits
 3c0f456/df83636), and the rewind.js rename.
 
+**Implementation note (2026-06-17, rewind-cli-plan Track 2):** the
+files-server was dissolved (rewind-cli-plan §4); deploy is now a single
+ownership-gated `POST /v1/deploy` (handlers+statics in one bundle →
+`platform.compile` + content-address + stampManifest barrier → `{ok,
+dep_id}`), released via the `publishRelease` RPC. The Code tab is now an
+in-browser **draft bundle → Deploy** flow (no per-file files-server
+upload). A new operator **`#/cluster`** page (`pages/cluster.js`,
+is_root-only) drives provision/move/host/plan + placement/plan reads
+through the `/v1/cp/*` chokepoints. **Open gap:** loading the
+currently-deployed files back into the Code editor, and composing the
+replay bundle's module sources, both need a cross-tenant blob/manifest
+**read** door (the write twin `platform.scope(t).blob.put` exists; the
+read door does not yet). Until it lands, the Code tab edits a fresh draft
+and the replay bundle carries tapes/scalars but `sources_unavailable`.
+
 ---
 
 ## 1. Product context (the one-paragraph version)

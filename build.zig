@@ -1128,4 +1128,18 @@ pub fn build(b: *std.Build) void {
     const ops_test_step = b.step("rewind-ops-test", "Run the rewind-ops CLI unit tests");
     ops_test_step.dependOn(&b.addRunArtifact(ops_tests).step);
     test_step.dependOn(&b.addRunArtifact(ops_tests).step);
+
+    // ── rewind: the OIDC customer CLI (docs/rewind-cli-plan.md §6, Track 3).
+    // The customer-shippable half of the split — carries an OIDC session
+    // (device-grant login → /v1/cli/exchange), never a platform secret.
+    // Shares src/cli/common.zig with rewind-ops; std-only (TLS curl + cookie
+    // jar transport), no rove modules / system libs / raft linkage.
+    const cli_mod = b.createModule(.{
+        .root_source_file = b.path("src/cli/rewind.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const cli_exe = b.addExecutable(.{ .name = "rewind", .root_module = cli_mod });
+    const cli_step = b.step("rewind", "Build the rewind customer CLI");
+    cli_step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);
 }
