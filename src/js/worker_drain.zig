@@ -575,22 +575,29 @@ pub fn resolveDeployment(
     const inst = (worker.node.tenant.getInstance(tenant_id) catch return error.ResumeNoInstance) orelse
         return error.ResumeNoInstance;
     const bc = blk: {
-        if (tc.snap.bytecodes.get(module_path)) |bb| break :blk bb.bytes;
-        const mjs = try std.fmt.allocPrint(allocator, "{s}.mjs", .{module_path});
-        defer allocator.free(mjs);
-        if (tc.snap.bytecodes.get(mjs)) |bb| break :blk bb.bytes;
-        const js = try std.fmt.allocPrint(allocator, "{s}.js", .{module_path});
-        defer allocator.free(js);
-        if (tc.snap.bytecodes.get(js)) |bb| break :blk bb.bytes;
-        // Phase 5 PR-2b: `__system/<name>` falls through to the
-        // node-level built-in registry. Bytecode compiled once at
-        // NodeState init from sources baked into the binary; shared
-        // across tenants. The handler runs in the tenant's context,
-        // so it sees the tenant's globals (kv, http, __rove_next).
+        // Phase 5 PR-2b: `__system/<name>` resolves against the node-level
+        // built-in registry (exact — NO walk-up, or a `__system/*` path would
+        // wrongly fall back to the tenant's own `index.mjs`). Bytecode compiled
+        // once at NodeState init from sources baked into the binary; shared
+        // across tenants. The handler runs in the tenant's context, so it sees
+        // the tenant's globals (kv, http, __rove_next).
         if (builtin_modules_mod.isBuiltinPath(module_path)) {
+            const mjs = try std.fmt.allocPrint(allocator, "{s}.mjs", .{module_path});
+            defer allocator.free(mjs);
             if (worker.node.builtin_modules.get(module_path)) |b| break :blk b;
             if (worker.node.builtin_modules.get(mjs)) |b| break :blk b;
+            return error.ResumeNoBytecode;
         }
+        // Tenant module: resolve with the SAME walk-up catch-all as inbound
+        // dispatch (`worker.findBytecode`). A continuation's path is the
+        // dispatch route's `module_base` (the path-derived name); when the
+        // handler ran via a catch-all (a default export at `index.mjs` serving
+        // an arbitrary route, e.g. `__admin__` answering `/v1/logs/...`), the
+        // path-derived module doesn't exist as a file — walk up to the
+        // `index.mjs` that actually ran, where `onFetchResult` lives. Without
+        // this a bound `on.fetch` from such a handler resumes to
+        // ResumeNoBytecode (step3-auth-plan.md A5).
+        if (try worker_mod.findBytecode(tc, module_path, allocator)) |b| break :blk b;
         return error.ResumeNoBytecode;
     };
     return .{ .inst = inst, .tc = tc, .bc = bc };

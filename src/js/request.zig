@@ -193,6 +193,25 @@ pub const Activation = union(enum) {
         };
     }
 
+    /// True for activations that RESUME a handler's own prior async work
+    /// (callbacks, wakes, held-stream lifecycle) rather than carrying a fresh
+    /// external request. `_middlewares` is an authn/authz gate for the trust
+    /// boundary — the inbound request — and a continuation already ran behind
+    /// that gate, so the dispatcher SKIPS middleware for these. Otherwise a
+    /// tenant's own auth middleware 401s its own callbacks: the reason
+    /// `__system/*` modules were special-cased, and the bound-fetch-through-
+    /// middleware footgun A5 surfaced (an `onFetchResult` resume — a
+    /// `fetch_chunk` — short-circuited by `__admin__`'s RP guard). Auth that a
+    /// continuation needs is threaded via its ctx, not re-derived here. New
+    /// activation kinds default to NON-continuation (gated) — the safe side.
+    pub fn isContinuation(self: Activation) bool {
+        return switch (self) {
+            .inbound, .inbound_headers, .ws_message, .inbound_chunk => false,
+            .send_callback, .timer, .disconnect, .kv_wake, .wake_batch,
+            .subscription_fire, .fetch_chunk, .durable_wake => true,
+        };
+    }
+
     /// Build the payload-LESS arm matching `src`. For sources that carry a
     /// payload, the caller must build the arm explicitly — reaching here
     /// with one is an invariant violation (the source set a payload-source
