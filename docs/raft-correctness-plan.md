@@ -52,6 +52,7 @@ build break:
 | `c5c9a9c` | FFI | `apply_local_snapshot` rejects a term-0 baseline (new code `-5`) — engine backstop for the `commit_to`-past-empty-log fatal. `conf_state`/`voter_progress` null-check out-pointers. Loud logs on dropped outbound messages / failed committed conf-changes. |
 | `6165419` | wrapper | Map FFI `-1`→`Error.UnknownGroup` in `step`/`stepFenced`/`proposeConfChange`/`applyLocalSnapshot`. `applyLocalSnapshot` input gate (`index>0 && term>0`) + `-5`→`InvalidBaseline`. Loud-log discarded truncation in `confState`/`voterProgress`. `appendEntriesCb` `GapInLog` → panic. |
 | `87ed59e` | WAL | C1: fsync the compaction marker before `gcSealed` unlinks the segment it protects (`compact` + `applyLocalSnapshot`). C2: `roll()` fsyncs the new header + parent dir. C4: malformed fixed-size (hardstate/compaction) record → reject. C5: `initRecover` propagates confstate corruption. S3: `discoverSealedSegments` distinguishes `FileNotFound` from I/O error. C3: `gcSealed` logs a failed unlink. |
+| `f34e8c6` | FFI+wrapper | **A1**: `raft_manager_log_term` gains an out-param + i32 rc (0 ok / -1 unknown group / -2 no term at index); `manager.logTerm` → `?u64`, `null` distinct from a genuine term 0. |
 
 ### rove `feat/cp-membership-reconciler` (pushed)
 
@@ -59,6 +60,7 @@ build break:
 |---|---|
 | `29c4c25` | DP: `v2-attach` baseline header → 400 on garbage (was `catch 0`), reject `index>0 && term==0`; `v2-confchange` rejects `node_id==0`; `v2-apply-snapshot` rejects `index==0`/`term==0`. Consensus: tear down a half-born group if the atomic baseline install fails; `Error.InvalidBaseline` term-0 guard. CP reconciler: tri-state `nodeGroupState` (remove only on confirmed-404, never on a probe error); `.failed` vs `.progressed` so one stuck node can't starve backfill; boot refusal when the reconciler is enabled without `REWIND_MOVE_SECRET`. Transport: oversize-frame loud teardown + flush-side coalescing cap; unknown-peer loud teardown; fixed reconnect backoff; recv self-heal sweep. |
 | `49d9974` | Bump raft-rs-zig pin `da0129f → 87ed59e`. |
+| (A1) | `Node.logTerm`/`Bridge.logTerm` → `?u64` (control cmd carries an `lt_ok` flag, mirroring `vp_ok`); `v2-applied-baseline` uses `orelse 409` instead of the `term==0` band-aid; pin → `f34e8c6`. |
 
 ## Remaining work
 
@@ -67,16 +69,13 @@ repos and needs the protocol above.
 
 ### A. Coordinated cross-repo
 
-**A1 — `logTerm` has no error channel (HIGH, coordinated).**
-`raft_manager_log_term` returns `u64`, collapsing {compacted, beyond-log, unknown
-group, genuine term-0} all into `0`. The reconciler stamps this as the promote-back
-baseline term; on an unknown-group drift it would build a `{index, term:0}`
-baseline. The engine now rejects term-0 (`-5`) and the wrapper gates `term>0`, so
-the *crash* is contained — but the reconciler still can't tell "unknown group" from
-"real term 0", so it silently fails to promote instead of surfacing the drift.
-Fix: add an out-param (mirror `last_index`'s `(out_term, rc)` shape) →
-`manager.logTerm` returns `?u64` → rove `Node.logTerm` + the reconciler caller →
-pin bump. Signature change ⇒ land per the protocol.
+**A1 — `logTerm` error channel — DONE** (raft-rs-zig `f34e8c6`, rove this branch).
+`raft_manager_log_term` no longer collapses {compacted, beyond-log, unknown group,
+genuine term-0} into `0`: it takes an out-param + i32 rc (0 / -1 unknown-group / -2
+no-term-at-index), `manager.logTerm`/`Node.logTerm`/`Bridge.logTerm` return `?u64`
+(`null` distinct from a real 0), and `v2-applied-baseline` refuses with 409 via
+`orelse` rather than the old `term==0` band-aid. Landed as a coordinated signature
+change per the protocol (FFI+wrapper pushed, then rove caller + pin bump together).
 
 **A2 — `applyLocalSnapshot` doesn't stamp the store durability watermark (MEDIUM,
 known Ph2 hazard).** After installing a baseline at index N, the raft log baseline
@@ -154,10 +153,10 @@ are reasoned, not proven.
 
 ## Suggested sequencing
 
-1. **A1 (logTerm error channel)** — highest-value coordinated fix; closes the last
-   silent drift signal on the promote path. Do it next, per the protocol.
+1. ~~**A1 (logTerm error channel)**~~ — DONE (`f34e8c6` + this branch).
 2. **A2 (snapshot watermark)** + **D (crash-injection harness)** together — the
-   harness is what proves A2 (and retroactively the landed C1/C2).
+   harness is what proves A2 (and retroactively the landed C1/C2). Highest-value
+   remaining coordinated fix; do next.
 3. **B1–B3** — rove reconciler hardening; independent, land anytime.
 4. **C1/C2/C4** — engine robustness; additive, land + bump.
 5. **B4 / C5** — informational / cosmetic; opportunistic.

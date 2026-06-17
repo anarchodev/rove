@@ -1062,19 +1062,18 @@ fn handleAppliedBaseline(
         return reply(server, allocator, ent, sid, sess, 404, "unknown tenant\n");
     const index = inst.kv.lastAppliedRaftIdx() catch
         return reply(server, allocator, ent, sid, sess, 500, "applied-index read failed\n");
-    const term = worker.raft.logTerm(gid, index);
-    // A baseline is the pair {index, term-of-the-log-entry-at-index}. If the
-    // leader's own log can't resolve a term for `index` (term == 0 for index > 0:
-    // the index is beyond last_index, below the compaction floor, or the store
-    // watermark has drifted ahead of the raft log), there is NO valid baseline to
-    // hand out. Returning {index, term:0} would feed an OUT-OF-BAND snapshot a
-    // bogus term, which raft-rs's `restore` then treats as a same-term match and
-    // fast-forwards `commit_to(index)` past the follower's empty log → `fatal!`.
-    // Refuse instead: the reconciler skips this group this pass and retries once
-    // the leader's log covers its watermark (a transient inconsistency) — and a
-    // term-0 baseline never reaches a follower, so the abort only ever fires on a
-    // genuinely new invariant break, exactly as it should.
-    if (term == 0 and index > 0)
+    // A baseline is the pair {index, term-of-the-log-entry-at-index}. logTerm now
+    // returns null when the leader's own log can't resolve a term for `index` (it
+    // is beyond last_index, below the compaction floor, or the store watermark has
+    // drifted ahead of the raft log) — there is NO valid baseline to hand out.
+    // Handing back {index, term:0} would feed an OUT-OF-BAND snapshot a bogus term,
+    // which raft-rs's `restore` treats as a same-term match and fast-forwards
+    // `commit_to(index)` past the follower's empty log → `fatal!`. Refuse instead:
+    // the reconciler retries once the leader's log covers its watermark. null is
+    // DISTINCT from a genuine term 0 (the genesis index) — the error channel no
+    // longer collapses "no term" into a fake 0 — so the abort only ever fires on a
+    // real invariant break, exactly as it should.
+    const term = worker.raft.logTerm(gid, index) orelse
         return reply(server, allocator, ent, sid, sess, 409, "no term-valid baseline (leader log does not cover the applied index)\n");
     const out = std.fmt.allocPrint(allocator, "{{\"index\":{d},\"term\":{d}}}\n", .{ index, term }) catch
         return reply(server, allocator, ent, sid, sess, 500, "oom\n");
