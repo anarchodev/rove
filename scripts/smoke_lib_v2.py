@@ -375,12 +375,28 @@ class V2Cluster:
         await_ready(p, "logsrv", "listening on", timeout=startup_timeout_s)
         return p
 
-    def log_get(self, subpath: str, *, timeout: float = 15.0) -> HttpResponse:
-        """GET `{log_url}/v1/{subpath}` with the services JWT (the standalone
-        verifies sig+exp). E.g. `log_get(f"{tenant}/list?limit=20")` or
-        `log_get(f"{tenant}/show/{request_id}")`."""
+    def log_scoped_token(self, tenant: str, *, caps=("logs-read",),
+                         ttl_s: int = 300) -> str:
+        """Mint a TENANT-SCOPED `logs-read` services token. The log-server
+        verifies cap + tenant (step3-auth-plan.md A4 / rewind-cli-plan.md §7),
+        so a read token must carry both `caps:[logs-read]` and the tenant it
+        reads. Exposed so negative tests can mint deliberately-mismatched
+        tokens (wrong tenant / missing cap / unscoped)."""
+        payload = {"exp": int((time.time() + ttl_s) * 1000), "tenant": tenant}
+        if caps:
+            payload["caps"] = list(caps)
+        return mint_jwt(JWT_SECRET_HEX, payload)
+
+    def log_get(self, subpath: str, *, timeout: float = 15.0,
+                tenant: Optional[str] = None) -> HttpResponse:
+        """GET `{log_url}/v1/{subpath}` with a tenant-scoped `logs-read` token.
+        The tenant defaults to the first path segment (e.g. `acme/list?limit=20`
+        → scoped to `acme`); pass `tenant=` to override. E.g.
+        `log_get(f"{tenant}/list?limit=20")` or `log_get(f"{tenant}/show/{rid}")`."""
+        t = tenant or subpath.split("/", 1)[0]
+        token = self.log_scoped_token(t)
         return _curl(f"{self.log_url()}/v1/{subpath}",
-                     headers={"Authorization": f"Bearer {self.services_jwt}"},
+                     headers={"Authorization": f"Bearer {token}"},
                      timeout=timeout)
 
     # ── provisioning + deploy ──────────────────────────────────────────
