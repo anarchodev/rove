@@ -61,11 +61,14 @@ change"), but A doesn't *wait* on B.
 Dependency order. A1→A2→A4 is the critical path; A3 and A5 can land in
 parallel once A1 is in.
 
-> **Status (2026-06-16):** A1 ✅, A4 ✅, A6 ✅ landed — the enforcement
-> boundary is closed and verified (`scripts/log_tenant_scope_smoke_v2.py`:
-> unscoped / cross-tenant / missing-cap tokens all 401, correctly-scoped 200).
-> A2/A3/A5 (the worker fetch-engine door + admin chokepoint — the prod
-> scoped-*minter*) remain.
+> **Status (2026-06-16):** A1 ✅, A4 ✅, A6 ✅, **A2 ✅, A3 ✅** landed +
+> runtime-verified. The enforcement boundary is closed
+> (`scripts/log_tenant_scope_smoke_v2.py`: unscoped / cross-tenant /
+> missing-cap → 401, scoped → 200) AND the worker minter (the
+> `rewind-logs.internal` fetch-engine door) is proven end-to-end
+> (`scripts/logs_door_smoke_v2.py`: `__admin__` reads a tenant's logs → 200;
+> a non-admin tenant → refused 502). **A5 is deferred to Track B** (see
+> below) — it's the dashboard's consumer wiring, not an engine gap.
 >
 > **Discovery that reorders the rest:** the §7 design cites the worker→
 > log-server S2S path as "already exists" (`worker_log.zig`), but in the
@@ -115,16 +118,35 @@ lines 389-393. Note `route` is parsed *after* the gate today (line 427);
 the tenant must be in hand before verify, so the route parse moves above
 the JWT gate. Depends on A1 (the cap) + A2 (scoped tokens in flight).
 
-### A5. Admin chokepoint + drop the browser-held token — *M*
+### A5. Admin chokepoint + drop the browser-held token — *M* — **DEFERRED to Track B**
 `web/admin/` + `web/admin/_static/api.js`. Move log queries server-side:
-the `__admin__` handler receives the query, issues the A3 internal fetch,
-returns results. Remove `getServicesToken` / direct browser→log-server
-calls. Make `rewind-logs` internal-plane only — no public front route,
-no CORS. Depends on A3 + A4.
+the `__admin__` handler issues the A3 door fetch and returns results;
+remove `getServicesToken` / the browser→log-server cross-origin calls.
 
-**Track A exit:** a valid token reads exactly one tenant's logs; the
-log-server has no public surface; no token sits in a browser. The audit's
-latent-critical is closed. **None of this needed OIDC.**
+**Why deferred (decided 2026-06-16):** A5 is the dashboard's *consumer*
+wiring, and the engine mechanism it needs (the door) is done + proven. The
+remaining work can't be done cleanly or tested now because:
+1. `web/admin/` is gated by the OIDC RP guard (`oidc.rp("default").guard()`)
+   — it won't run until `__auth__` is deployed (Track B / B1).
+2. `web/admin/_static/api.js` is **already stale**: its `composeReplayBundle`
+   + log/files helpers call `filesFetch` against the **dissolved
+   files-server** (gone — `rewind-cli-plan.md` §4), so the file needs a
+   Track-B reckoning regardless. Swapping just the log path in would be a
+   half-fix in a file that's broken on another axis.
+3. Browser-token removal is only observable once the dashboard deploys.
+
+So A5 lands with the dashboard (Track B, after B1/B2): wire the admin log
+route to `on.fetch("http://rewind-logs.internal/v1/{tenant}/…")` (the
+pattern proven by `scripts/logs_door_smoke_v2.py`) and delete the
+browser-held services token. The security property (the log-server rejects
+any non-tenant-scoped token) is already enforced by A4 today, independent of
+this UI wiring.
+
+**Track A exit (substantially reached):** the log-server rejects every
+non-tenant-scoped read token (A4, shipped + verified) and the worker mints
+tenant-scoped tokens only for `__admin__` via the door (A2/A3, shipped +
+verified). The remaining browser-token removal (A5) is dashboard plumbing
+that rides Track B. **None of A1–A3 needed OIDC.**
 
 ---
 
