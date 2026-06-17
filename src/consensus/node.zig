@@ -974,6 +974,21 @@ pub const Node = struct {
         return self.mgr.lastIndex(tenant_id) orelse 0;
     }
 
+    /// This group's LIVE applied index on this node (`slot.applied_idx`: the
+    /// highest committed entry whose writeset is folded into the store's overlay).
+    /// On the leader this is the correct out-of-band baseline for a new member: it
+    /// is ALWAYS >= the leader's first (compacted) log index, because compaction
+    /// floors the truncate point at `min(applied, …)` (see `durabilizeTick`), so a
+    /// learner born here starts at an entry the leader still holds. The durabilized
+    /// store watermark (`lastAppliedRaftIdx`) is NOT a safe baseline source — it
+    /// lags `applied_idx` by up to one durabilize cycle and under continuous churn
+    /// sits BELOW the compaction floor, stranding the learner. 0 on unknown group.
+    /// Pump-thread only (reads pump-owned slot state).
+    pub fn appliedIndex(self: *Node, tenant_id: u64) u64 {
+        const slot = self.groups.get(tenant_id) orelse return 0;
+        return slot.applied_idx;
+    }
+
     /// Install a DATA-FREE snapshot baseline at {index, term} into `tenant_id`'s
     /// LOCAL group (conf_change promote-back). The node must be a below-floor
     /// learner; the KV state for `index` must already be loaded out-of-band (the
