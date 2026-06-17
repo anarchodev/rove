@@ -32,6 +32,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -159,8 +160,13 @@ def _curl(url: str, *, method: str = "GET", headers: Optional[dict] = None,
             data = data.encode()
         args += ["--data-binary", "@-"]
     args.append(url)
-    proc = subprocess.run(args, input=data if data is not None else b"",
-                          capture_output=True, timeout=timeout)
+    return _curl_run(args, data if data is not None else b"", timeout)
+
+
+def _curl_run(args: list, data: bytes, timeout: float) -> HttpResponse:
+    """Run a built curl argv (with `-D - -o -`) and parse status/headers/body.
+    Shared by `_curl` (h2c) and `V2Cluster.tls_curl` (https)."""
+    proc = subprocess.run(args, input=data, capture_output=True, timeout=timeout)
     # Exit 55 = "failed sending data": the server replied before reading the
     # whole upload and reset the rest (RST_STREAM NO_ERROR — legal h2; an
     # onHeaders handler answering from headers alone does this on purpose).
@@ -189,6 +195,22 @@ def _curl(url: str, *, method: str = "GET", headers: Optional[dict] = None,
     return HttpResponse(status=status, body=body, headers=headers_out)
 
 
+def _gen_self_signed(prefix: str) -> tuple[str, str]:
+    """Self-signed `*.localhost` cert+key (SAN also covers `localhost`) for the
+    TLS front. Verification is OFF everywhere it's used — curl `-k`, and the
+    worker's outbound `verify_tls=false` under `unsafe_outbound` — so validity
+    is irrelevant; this only needs to make the TLS handshake + SNI succeed."""
+    cert = f"/tmp/v2smoke-{prefix}-cert.pem"
+    key = f"/tmp/v2smoke-{prefix}-key.pem"
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+         "-keyout", key, "-out", cert, "-days", "1",
+         "-subj", "/CN=*.localhost",
+         "-addext", "subjectAltName=DNS:*.localhost,DNS:localhost"],
+        check=True, capture_output=True)
+    return cert, key
+
+
 @dataclass
 class V2Cluster:
     tag: str
@@ -212,6 +234,15 @@ class V2Cluster:
     # (rove-ssrf, wired 2026-06-11) blocks in production. ssrf_smoke_v2
     # passes unsafe_outbound=False to test the production posture.
     unsafe_outbound: bool = True
+    # Optional second, TLS-terminating front (step3-auth-plan.md B2). When set,
+    # a `rewind-front` runs with REWIND_TLS_CERT/KEY on this port, and every
+    # worker's tenant door (REWIND_INTERNAL_FRONT) pins outbound tenant-host
+    # fetches HERE — so a server-side hop like the OIDC RP→IdP token exchange
+    # reaches the IdP over real TLS with a consistent `https://{host}:{port}`
+    # issuer. The h2c front (front_port) still serves deploys + plain requests.
+    tls_front_port: int = 0
+    tls_cert_path: str = ""
+    tls_key_path: str = ""
     _voters: str = ""
     _peers: str = ""
 
@@ -220,7 +251,8 @@ class V2Cluster:
     def spawn(cls, tag: str, *, nodes: int = 1, http_base: int = 18300,
               raft_base: int = 18400, cp_port: int = 0, front_port: int = 0,
               cluster_id: str = "cluster-1",
-              unsafe_outbound: bool = True) -> "V2Cluster":
+              unsafe_outbound: bool = True,
+              tls_idp: bool = False) -> "V2Cluster":
         if not os.environ.get("S3_ENDPOINT"):
             raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
         for b in (REWIND, CP_BIN, FRONT_BIN):
@@ -232,12 +264,17 @@ class V2Cluster:
         pid = os.getpid()
         node_ports = [base + i for i in range(nodes)]
         raft_ports = [rbase + i for i in range(nodes)]
+        cert_path, key_path = ("", "")
+        if tls_idp:
+            cert_path, key_path = _gen_self_signed(f"{tag}-{pid}")
         c = cls(
             tag=tag, cluster_id=cluster_id,
             node_ports=node_ports, raft_ports=raft_ports,
             cp_port=cp_port or (base + 50),
             front_port=front_port or (base + 51),
             log_port=base + 53,
+            tls_front_port=(base + 54) if tls_idp else 0,
+            tls_cert_path=cert_path, tls_key_path=key_path,
             s3_prefix=f"v2smoke-{tag}-{pid}/",
             data_dirs=[Path(f"{_DATA_BASE}/v2smoke-{tag}-n{i}-{pid}") for i in range(nodes)],
             cp_data_dir=Path(f"{_DATA_BASE}/v2smoke-{tag}-cp-{pid}"),
@@ -262,6 +299,18 @@ class V2Cluster:
                  move_secret=MOVE_SECRET)
         spawn_front(self.procs, self.front_port,
                     f"http://127.0.0.1:{self.cp_port}", route_cache_ms=0)
+        if self.tls_front_port:
+            # Second front, TLS-terminating, same CP. The workers' tenant door
+            # pins outbound to THIS port (see _spawn_node), so RP→IdP rides real
+            # TLS; deploys + plain requests stay on the h2c front above.
+            spawn_front(self.procs, self.tls_front_port,
+                        f"http://127.0.0.1:{self.cp_port}", route_cache_ms=0,
+                        name="front-tls",
+                        extra_env={"REWIND_TLS_CERT": self.tls_cert_path,
+                                   "REWIND_TLS_KEY": self.tls_key_path,
+                                   # Disable the privileged :80 ACME/redirect
+                                   # listener (TLS mode defaults it to 80).
+                                   "REWIND_HTTP_PORT": "0"})
         # Deploy now runs IN the worker (/_system/deploy) — no files-server to
         # spawn. The services JWT stays minted client-side for the log-server
         # query surface (spawn_log_server verifies sig+exp).
@@ -297,7 +346,11 @@ class V2Cluster:
         # door smoke), the door only fires for the front's TLS port. Our test
         # front binds a high port, not 443, so tell the worker which port to
         # accept — otherwise the door declines every test fetch.
-        if env.get("REWIND_INTERNAL_FRONT"):
+        if self.tls_front_port:
+            # OIDC RP→IdP (and any tenant-host outbound) pins to the TLS front.
+            env["REWIND_INTERNAL_FRONT"] = "127.0.0.1"
+            env["REWIND_INTERNAL_FRONT_PORT"] = str(self.tls_front_port)
+        elif env.get("REWIND_INTERNAL_FRONT"):
             env["REWIND_INTERNAL_FRONT_PORT"] = str(self.front_port)
         log = f"/tmp/v2smoke-{self.tag}-n{i + 1}-{os.getpid()}.log"
         self.log_paths[f"n{i + 1}"] = log
@@ -592,6 +645,36 @@ class V2Cluster:
         """GET through the FRONT door (Host→cluster routing)."""
         return self.request(tenant, path, host=host, headers=headers,
                             timeout=timeout)
+
+    # ── TLS front (OIDC / RP flows, B2) ────────────────────────────────
+    def tls_origin(self, tenant: str) -> str:
+        """`https://{tenant}.{suffix}:{tls_front_port}` — an IdP/app origin on
+        the TLS front. Use as the OIDC issuer / RP redirect base so the wire
+        host:port matches the `https://{host}` the IdP signs into `iss`."""
+        return f"https://{self.host_for(tenant)}:{self.tls_front_port}"
+
+    def tls_curl(self, url: str, *, method: str = "GET",
+                 data: Optional[bytes | str] = None,
+                 headers: Optional[dict] = None,
+                 timeout: float = 15.0) -> HttpResponse:
+        """HTTPS request to the TLS front. `url` is absolute
+        (`https://{host}:{tls_front_port}{path}`); its host is `--resolve`'d to
+        127.0.0.1 so SNI + Host both carry the tenant host. No redirect-follow
+        (captures Location/Set-Cookie); `-k` — the front cert is self-signed."""
+        u = urllib.parse.urlparse(url)
+        host, port = u.hostname, (u.port or self.tls_front_port)
+        args = ["curl", "-sS", "--http2", "-k",
+                "--resolve", f"{host}:{port}:127.0.0.1",
+                "-D", "-", "-o", "-", "-m", str(int(timeout)), "-X", method]
+        if headers:
+            for k, v in headers.items():
+                args += ["-H", f"{k}: {v}"]
+        if data is not None:
+            if isinstance(data, str):
+                data = data.encode()
+            args += ["--data-binary", "@-"]
+        args.append(url)
+        return _curl_run(args, data if data is not None else b"", timeout)
 
     def node_request(self, path: str, *, method: str = "GET", node: int = 0,
                      host: Optional[str] = None, data: Optional[bytes | str] = None,
