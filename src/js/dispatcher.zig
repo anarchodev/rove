@@ -172,8 +172,9 @@ pub const Dispatcher = struct {
     ///     conventional export (`rpc_dispatch.parseDispatch`); the
     ///     retired customer `?fn=`/`{fn,args}` shapes are opaque
     ///     payload (decisions.md §4.5).
-    ///   - `Request.fn_args_json` is a JSON array spread into
-    ///     positional arguments (resume payloads: ctx / outcome).
+    ///   - The invoked export gets no positional arguments — resume
+    ///     payloads (ctx / outcome) ride `Request.body` and the
+    ///     `Request.activation` union, read through the request surface.
     ///   - The handler's **return value** becomes the response body
     ///     (strings emit as-is; everything else is `JSON.stringify`'d).
     ///   - Status / headers / cookies flow through the ambient
@@ -1903,7 +1904,7 @@ test "dispatch: short handler does not trip budget" {
     try testing.expectEqualStrings("fast", resp.body);
 }
 
-test "dispatch: .mjs module + internal fn_override dispatch with positional args" {
+test "dispatch: .mjs module + internal fn_override dispatch" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1919,12 +1920,12 @@ test "dispatch: .mjs module + internal fn_override dispatch with positional args
     var ctx = try rt.newContext();
     defer ctx.deinit();
     const bytecode = try ctx.compileToBytecode(
-        \\export function greet(path) {
-        \\    return "hi " + path;
+        \\export function greet() {
+        \\    return "hi " + request.path;
         \\}
-        \\export function shout(path) {
+        \\export function shout() {
         \\    response.status = 201;
-        \\    return ("HI " + path).toUpperCase();
+        \\    return ("HI " + request.path).toUpperCase();
         \\}
         \\export default function () {
         \\    return "default-ran";
@@ -1938,7 +1939,7 @@ test "dispatch: .mjs module + internal fn_override dispatch with positional args
 
     var d = try Dispatcher.init(testing.allocator); defer d.deinit();
 
-    // fn_override=greet with args ["/hello"] → "hi /hello", status 200.
+    // fn_override=greet reads request.path → "hi /hello", status 200.
     {
         var txn = try kv.beginTrackedImmediate();
         defer txn.rollback() catch {};
@@ -1949,7 +1950,6 @@ test "dispatch: .mjs module + internal fn_override dispatch with positional args
             .method = "GET",
             .path = "/hello",
             .fn_override = "greet",
-            .fn_args_json = "[\"/hello\"]",
         }, &budget);
         defer resp.deinit(testing.allocator);
         try testing.expectEqual(@as(i32, 200), resp.status);
@@ -1967,7 +1967,6 @@ test "dispatch: .mjs module + internal fn_override dispatch with positional args
             .method = "GET",
             .path = "/hello",
             .fn_override = "shout",
-            .fn_args_json = "[\"/hello\"]",
         }, &budget);
         defer resp.deinit(testing.allocator);
         try testing.expectEqual(@as(i32, 201), resp.status);
@@ -2181,7 +2180,7 @@ test "dispatch: middleware without `before` export → 500" {
     try testing.expect(std.mem.indexOf(u8, resp.body, "before") != null);
 }
 
-test "dispatch: middleware applies to ?fn=<named> RPC dispatch too" {
+test "dispatch: middleware applies to fn_override named-export dispatch too" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -2192,8 +2191,8 @@ test "dispatch: middleware applies to ?fn=<named> RPC dispatch too" {
     defer d.deinit();
 
     // Important property: middleware fires before *any* dispatch,
-    // including the dashboard's `?fn=<named-export>` RPC path.
-    // Without this admin's named-export RPCs would bypass the auth
+    // including the internal named-export (fn_override) resume path.
+    // Without this admin's named-export resumes would bypass the auth
     // gate entirely.
     var resp = try runWithMiddleware(
         &d,
@@ -3226,8 +3225,8 @@ test "dispatch: async module handler gets unwrapped" {
     var ctx = try rt.newContext();
     defer ctx.deinit();
     const bytecode = try ctx.compileToBytecode(
-        \\export async function fetchLike(path) {
-        \\    const v = await Promise.resolve("async " + path);
+        \\export async function fetchLike() {
+        \\    const v = await Promise.resolve("async " + request.path);
         \\    response.status = 202;
         \\    return v;
         \\}
@@ -3248,7 +3247,6 @@ test "dispatch: async module handler gets unwrapped" {
         .method = "GET",
         .path = "/x",
         .fn_override = "fetchLike",
-        .fn_args_json = "[\"/x\"]",
     }, &budget);
     defer resp.deinit(testing.allocator);
     try testing.expectEqual(@as(i32, 202), resp.status);
@@ -3287,17 +3285,18 @@ test "dispatch: request.query exposes raw query string" {
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    // Dispatch fn has to be set via `fn=` for runOne's wrapper export;
-    // we check the full query including the `fn=` entry round-trips.
+    // The query string is opaque payload — `runOne` dispatches via
+    // fn_override, not the query. We check the full query round-trips
+    // verbatim to `request.query`.
     var resp = try runOne(
         &d,
         kv,
         \\return String(request.query);
     ,
-        .{ .method = "GET", .path = "/", .query = "fn=go&name=alice&tags=x%20y" },
+        .{ .method = "GET", .path = "/", .query = "q=go&name=alice&tags=x%20y" },
     );
     defer resp.deinit(testing.allocator);
-    try testing.expectEqualStrings("fn=go&name=alice&tags=x%20y", resp.body);
+    try testing.expectEqualStrings("q=go&name=alice&tags=x%20y", resp.body);
 }
 
 

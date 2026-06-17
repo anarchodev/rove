@@ -877,7 +877,6 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
         .path = spath,
         .body = body,
         .fn_override = resume_fn,
-        .fn_args_json = "[]",
         .is_system_module = builtin_modules_mod.isBuiltinPath(path),
         .activation = .{ .wake_batch = .{} },
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
