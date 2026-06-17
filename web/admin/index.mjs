@@ -327,9 +327,32 @@ function handleLogQuery(path, qs) {
     return next();
 }
 
-// Buffered on.fetch result for the log chokepoint — relay the log-server's
-// JSON (status + body) back to the dashboard. A door/log-server failure
-// (e.g. an expired cap) surfaces as 502.
+// ── Control-plane chokepoint (step3-auth-plan.md B4) ────────────────
+//
+// Operators drive CP control ops — provision / move / host / plan —
+// through the dashboard, NOT by holding the move-secret on a shell. The
+// admin issues a buffered `on.fetch` at the privileged `rewind-cp.internal`
+// door; the worker (only for `__admin__`) attaches the move-secret and
+// rewrites to the CP. So no CP secret enters the browser/operator shell.
+// Operator-only (is_root). The result rides `onFetchResult` (shared with the
+// log chokepoint — both just relay the upstream verbatim).
+const CP_DOOR = "http://rewind-cp.internal/_control/";
+
+function handleCpOp(cpPath, body) {
+    const auth = request.auth || {};
+    if (!auth.sub) return jsonError(401, "unauthenticated");
+    if (!auth.is_root) return jsonError(403, "operator only");
+    on.fetch(CP_DOOR + cpPath, {
+        method: "POST",
+        body: body,
+        headers: { "content-type": "application/json" },
+    });
+    return next();
+}
+
+// Buffered on.fetch result for the log + CP chokepoints — relay the upstream
+// status + body back to the dashboard. A door/upstream failure (e.g. an expired
+// cap, or the CP unreachable) surfaces as 502.
 export function onFetchResult() {
     response.headers = { "content-type": "application/json" };
     if (request.ok) {
@@ -337,7 +360,7 @@ export function onFetchResult() {
         return new TextDecoder().decode(request.body || new Uint8Array());
     }
     response.status = 502;
-    return JSON.stringify({ error: "log query failed",
+    return JSON.stringify({ error: "internal door fetch failed",
                             status: request.status || 0 });
 }
 
@@ -411,6 +434,18 @@ export default function() {
     // Log query chokepoint → rewind-logs.internal door (A5).
     if (method === "GET" && path.startsWith("/v1/logs/")) {
         return handleLogQuery(path, q === -1 ? "" : fullPath.slice(q + 1));
+    }
+
+    // CP control chokepoint → rewind-cp.internal door (B4). The operator
+    // POSTs the same {tenant, …} body the CP /_control/* routes expect; the
+    // worker attaches the move-secret. `move` picks move-live when body.live.
+    if (method === "POST" && path === "/v1/cp/provision") return handleCpOp("provision", request.body || "{}");
+    if (method === "POST" && path === "/v1/cp/host")      return handleCpOp("host", request.body || "{}");
+    if (method === "POST" && path === "/v1/cp/plan")      return handleCpOp("plan", request.body || "{}");
+    if (method === "POST" && path === "/v1/cp/move") {
+        let live = false;
+        try { live = !!JSON.parse(request.body || "{}").live; } catch (_) {}
+        return handleCpOp(live ? "move-live" : "move", request.body || "{}");
     }
 
     response.status = 404;

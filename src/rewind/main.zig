@@ -692,6 +692,12 @@ pub fn main() !void {
     // door (borrowed; both outlive node_state per defer ordering above).
     node_state.services_jwt_secret = services_jwt_secret;
     node_state.log_internal_base = log_internal_base;
+    // Step 3 B4: the `rewind-cp.internal` door — the move-secret (already read
+    // for the move surface) + a CP base (the first configured CP node; the CP
+    // forwards control writes to its leader). Both borrowed (env / cp_urls live
+    // for the process). Either unset → the CP door is disabled.
+    node_state.move_secret = move_secret;
+    node_state.cp_internal_base = if (cp_urls.len > 0) cp_urls[0] else null;
     node_state.wireInternal();
     try node_state.deploy.startDeploymentLoader();
     // Continuous follower deployment loading: fire on every committed
