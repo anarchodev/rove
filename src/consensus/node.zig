@@ -980,7 +980,26 @@ pub const Node = struct {
     /// move bundle). Fast-forwards the raft log baseline so the leader can
     /// replicate the tail and the node can be promoted back. Pump-thread only.
     pub fn applyLocalSnapshot(self: *Node, tenant_id: u64, index: u64, term: u64) Error!void {
-        return self.mgr.applyLocalSnapshot(tenant_id, index, term);
+        try self.mgr.applyLocalSnapshot(tenant_id, index, term);
+        // A2: the baseline fast-forwarded the raft LOG to `index` and the KV state
+        // for `index` is already in the store (the out-of-band bundle). Stamp the
+        // store's DURABLE applied watermark to `index` as well — otherwise a crash
+        // in the rejoin window recovers a store BELOW the raft baseline while the
+        // WAL no longer holds entries ≤ index (compacted below the baseline) → the
+        // gap between the store watermark and the raft baseline is unrecoverable
+        // (lost coverage / divergence). Synchronous, not deferred to
+        // durabilizeTick, so the watermark is durable before this returns; stamping
+        // the store at/ahead of the (not-yet-durable) raft snapshot errs safe — a
+        // store AHEAD of raft only re-applies idempotently on recovery, a store
+        // BEHIND raft loses data. For a data-free baseline the overlay is empty, so
+        // durabilize() just writes the watermark.
+        const slot = self.groups.get(tenant_id) orelse return; // just installed ⇒ present
+        if (index > slot.durabilized_idx) {
+            const store = self.storeFor(slot, slot.id_str) orelse return Error.UnroutedApply;
+            try store.setLastAppliedRaftIdx(index);
+            if (index > slot.applied_idx) slot.applied_idx = index;
+            slot.durabilized_idx = index;
+        }
     }
 
     /// Snapshot the cross-node heartbeat round-trip histogram (broadcast-time
