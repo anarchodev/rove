@@ -80,6 +80,14 @@ const OutBuf = struct {
     body: std.ArrayListUnmanaged(u8) = .empty,
 };
 
+/// Per-record header in the coalesced body: [group_id:u64][epoch:u64][floor:u64][len:u32].
+const RECORD_HDR_SIZE: usize = 28;
+/// A coalesced frame is [HEADER_SIZE][count:u32][body] and MUST fit the receiver's
+/// fixed recv buffer (raft_net's RECV_BUF_SIZE) — an oversize frame can't be
+/// reassembled and is torn down loudly on the recv side. Cap the body accordingly;
+/// queueOut flushes early when the next record would blow it.
+const MAX_FRAME_BODY: usize = @as(usize, raftnet.RECV_BUF_SIZE) - rpc.HEADER_SIZE - 4;
+
 pub const Transport = struct {
     allocator: std.mem.Allocator,
     /// This node's raft id (1-based).
@@ -241,6 +249,14 @@ pub const Transport = struct {
         if (isHeartbeatReq(msg)) self.hb_sent_ns[to - 1] = nowNs();
         const ob = &self.outbufs[to - 1];
         const a = self.allocator;
+        // Cap the coalesced frame so it never exceeds the receiver's fixed recv
+        // buffer: if appending this record would blow MAX_FRAME_BODY, flush what's
+        // buffered first and start a fresh frame (the recv side handles multiple
+        // frames per read). A single record larger than the cap still goes out
+        // alone — surfaced loudly on the recv side, not a silent wedge; keep
+        // raft's max_size_per_msg under RECV_BUF_SIZE so that can't happen.
+        if (ob.count > 0 and ob.body.items.len + RECORD_HDR_SIZE + msg.len > MAX_FRAME_BODY)
+            self.flushPeer(to - 1, ob);
         // Roll back to this mark on a partial append: a header without
         // its message bytes would shift every later record's framing in
         // the coalesced envelope (the CRC covers the corrupt payload, so
@@ -264,28 +280,32 @@ pub const Transport = struct {
         ob.count += 1;
     }
 
-    /// Flush each destination's coalesced envelope as one framed send.
-    /// Send errors (peer not yet connected, queue full) are soft — raft
-    /// re-emits on the next heartbeat/election tick.
-    pub fn flush(self: *Transport) void {
+    /// Emit one destination's coalesced envelope as a single framed send and
+    /// reset its buffer. Send errors (peer not yet connected, queue full) are
+    /// soft — raft re-emits on the next heartbeat/election tick.
+    fn flushPeer(self: *Transport, peer_id: usize, ob: *OutBuf) void {
+        if (ob.count == 0) return;
         const a = self.allocator;
-        for (self.outbufs, 0..) |*ob, peer_id| {
-            if (ob.count == 0) continue;
-            defer {
-                ob.count = 0;
-                ob.body.clearRetainingCapacity();
-            }
-            const payload_len = 4 + ob.body.items.len;
-            const frame = a.alloc(u8, rpc.HEADER_SIZE + payload_len) catch continue;
-            defer a.free(frame);
-            // payload = [count][body]; frame header = [len BE][crc BE].
-            std.mem.writeInt(u32, frame[rpc.HEADER_SIZE..][0..4], ob.count, .little);
-            @memcpy(frame[rpc.HEADER_SIZE + 4 ..], ob.body.items);
-            const payload = frame[rpc.HEADER_SIZE..];
-            std.mem.writeInt(u32, frame[0..4], @intCast(payload_len), .big);
-            std.mem.writeInt(u32, frame[4..8], rpc.checksum(payload), .big);
-            self.net.send(@intCast(peer_id), frame) catch {};
+        defer {
+            ob.count = 0;
+            ob.body.clearRetainingCapacity();
         }
+        const payload_len = 4 + ob.body.items.len;
+        const frame = a.alloc(u8, rpc.HEADER_SIZE + payload_len) catch return;
+        defer a.free(frame);
+        // payload = [count][body]; frame header = [len BE][crc BE].
+        std.mem.writeInt(u32, frame[rpc.HEADER_SIZE..][0..4], ob.count, .little);
+        @memcpy(frame[rpc.HEADER_SIZE + 4 ..], ob.body.items);
+        const payload = frame[rpc.HEADER_SIZE..];
+        std.mem.writeInt(u32, frame[0..4], @intCast(payload_len), .big);
+        std.mem.writeInt(u32, frame[4..8], rpc.checksum(payload), .big);
+        self.net.send(@intCast(peer_id), frame) catch {};
+    }
+
+    /// Flush each destination's coalesced envelope (queueOut may already have
+    /// flushed earlier frames mid-cycle when the cap was hit).
+    pub fn flush(self: *Transport) void {
+        for (self.outbufs, 0..) |*ob, peer_id| self.flushPeer(peer_id, ob);
     }
 
     /// Drive the io_uring transport once: flush queued sends, accept, and

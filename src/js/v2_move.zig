@@ -395,14 +395,24 @@ fn handleAttach(
     // last_index 0 — eliminating the attach→apply-snapshot window where a leader
     // heartbeat carrying commit > 0 would crash the fresh group. Plain attach
     // (moves, empty-attach) omits the headers and creates at epoch with no baseline.
-    const baseline_index: u64 = blk: {
-        const s = respb.findHeader(rh, BASELINE_INDEX_HEADER) orelse break :blk 0;
-        break :blk std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch 0;
-    };
-    const baseline_term: u64 = blk: {
-        const s = respb.findHeader(rh, BASELINE_TERM_HEADER) orelse break :blk 0;
-        break :blk std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch 0;
-    };
+    // Baseline headers: ABSENT → no baseline (plain attach). PRESENT but
+    // unparseable → hard 400. A malformed header must NEVER silently collapse
+    // to "no baseline" (catch 0) and route the reconciler bootstrap into the
+    // last_index-0 birth path — the exact crash window documented above.
+    const baseline_index: u64 = if (respb.findHeader(rh, BASELINE_INDEX_HEADER)) |s|
+        (std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch
+            return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ BASELINE_INDEX_HEADER ++ "\n"))
+    else
+        0;
+    const baseline_term: u64 = if (respb.findHeader(rh, BASELINE_TERM_HEADER)) |s|
+        (std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch
+            return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ BASELINE_TERM_HEADER ++ "\n"))
+    else
+        0;
+    // INVARIANT: a baseline at index>0 must carry a real term (a term-0 baseline
+    // crashes raft's restore — Bridge.InvalidBaseline enforces the same at install).
+    if (baseline_index > 0 and baseline_term == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "baseline index>0 requires a nonzero term\n");
     // Join an EXISTING group as a non-voting learner (the reconciler adds a node
     // learner-first: a born-voter would campaign past a high-term leader and
     // deadlock). The leader must already hold the matching AddLearner conf-change.
@@ -890,6 +900,10 @@ fn handleConfChange(
     const v = parsed.value;
     if (v.tenant.len == 0)
         return reply(server, allocator, ent, sid, sess, 400, "empty tenant\n");
+    // node id 0 is raft's invalid/sentinel id — reject rather than forward it
+    // into proposeConfChange where it would target a nonexistent member.
+    if (v.node_id == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "node_id must be nonzero\n");
     const cc_type: u8 =
         if (std.mem.eql(u8, v.op, "demote") or std.mem.eql(u8, v.op, "add")) 2 else if (std.mem.eql(u8, v.op, "promote")) 0 else if (std.mem.eql(u8, v.op, "remove")) 1 else return reply(server, allocator, ent, sid, sess, 400, "op must be demote|promote|add|remove\n");
     const gid = worker.raft.gidForTenant(v.tenant) orelse
@@ -1167,6 +1181,13 @@ fn handleApplySnapshot(
     ) catch return reply(server, allocator, ent, sid, sess, 400, "expected {tenant, index, term}\n");
     defer parsed.deinit();
     const v = parsed.value;
+    // A data-free baseline must be a real {index>0, term>0} pair. index 0 is a
+    // no-op (nothing ahead of committed) and term 0 crashes raft's restore —
+    // reject both at the door instead of relying on the downstream SnapshotStale.
+    if (v.index == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "index must be nonzero\n");
+    if (v.term == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "index>0 requires a nonzero term\n");
     const gid = worker.raft.gidForTenant(v.tenant) orelse
         return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
     if (worker.raft.isLeaderOf(gid))

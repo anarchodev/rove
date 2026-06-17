@@ -290,6 +290,11 @@ pub const Error = error{
     GroupExists,
     /// A proposed write did not commit + apply within the pump budget.
     NotCommitted,
+    /// A data-free baseline was supplied with index>0 but term==0. A term-0
+    /// baseline makes raft-rs's restore fast-forward commit_to past an empty
+    /// log → fatal!. The producer (v2-applied-baseline) refuses to emit one;
+    /// the installer refuses to accept one. An invariant, enforced both ends.
+    InvalidBaseline,
     OutOfMemory,
 } || envelope.Error || raft.Error || kvstore.Error || writeset.DecodeError;
 
