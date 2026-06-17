@@ -278,6 +278,14 @@ class V2Cluster:
         env["REWIND_VOTERS"] = voters
         env["REWIND_PEERS"] = peers
         env["S3_KEY_PREFIX_BASE"] = self.s3_prefix
+        # Step 3 (step3-auth-plan.md A2/A3): wire the `rewind-logs.internal`
+        # fetch-engine door so the `__admin__` chokepoint reads tenant logs
+        # with a worker-minted, tenant-scoped `logs-read` token. The secret is
+        # the SAME hex the co-spawned log-server verifies with; the base points
+        # at the log-server's deterministic port. Harmless when no door fetch
+        # fires (the door is gated to `__admin__` outbound only).
+        env["LOOP46_SERVICES_JWT_SECRET"] = JWT_SECRET_HEX
+        env["REWIND_LOG_INTERNAL_BASE"] = f"http://127.0.0.1:{self.log_port}"
         # Scope this cluster's request-log/tape batches under the same per-run
         # S3 prefix as its blobs (the shared bucket hosts every smoke run), so
         # a co-spawned `rewind-logs` reads exactly this cluster's

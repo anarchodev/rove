@@ -866,6 +866,21 @@ pub const NodeState = struct {
     /// `reloadDeployment` can leader-gate + propose the config mirror.
     raft: *Bridge,
 
+    /// Shared HMAC secret (raw bytes, hex-decoded from
+    /// `LOOP46_SERVICES_JWT_SECRET`) used to MINT tenant-scoped capability
+    /// tokens for cluster-internal fetches — currently the
+    /// `rewind-logs.internal` door (`fetch_engine.rewriteAndAuthLogsFetch`).
+    /// The same secret the log-server verifies with. Borrowed; owned by
+    /// `main.zig`. Null → the internal-logs door returns
+    /// `error.LogsDoorUnconfigured`. (step3-auth-plan.md A2/A3.)
+    services_jwt_secret: ?[]const u8 = null,
+
+    /// Worker's internal-plane base URL for the standalone log-server
+    /// (e.g. `http://127.0.0.1:9000`, no trailing slash). The fetch engine
+    /// rewrites `http://rewind-logs.internal/v1/…` to this base. Borrowed;
+    /// owned by `main.zig`. Null → the door is disabled.
+    log_internal_base: ?[]const u8 = null,
+
     /// Per-tenant deployment cache subsystem — tenant-slot map +
     /// node-wide bytecode cache + deployment-loader thread + manifest
     /// config. Extracted into `DeploymentCache` (`deployment_cache`

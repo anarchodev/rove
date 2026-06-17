@@ -545,6 +545,31 @@ pub fn main() !void {
     const cp_urls = try parseUrlList(allocator, std.posix.getenv("REWIND_CP_URL") orelse "");
     defer freeUrlList(allocator, cp_urls);
 
+    // Step 3 (step3-auth-plan.md A2/A3): wire the `rewind-logs.internal`
+    // fetch-engine door so the `__admin__` chokepoint reads tenant logs with a
+    // worker-minted, tenant-scoped `logs-read` token. The secret is the SAME
+    // hex `LOOP46_SERVICES_JWT_SECRET` the log-server verifies with (hex-decoded
+    // to raw HMAC bytes here, matching the log-server). Both optional: unset →
+    // the door is disabled (`error.LogsDoorUnconfigured`).
+    const services_jwt_secret: ?[]const u8 = blk: {
+        const hex = std.posix.getenv("LOOP46_SERVICES_JWT_SECRET") orelse break :blk null;
+        if (hex.len == 0 or hex.len % 2 != 0) {
+            std.log.err("rewind: LOOP46_SERVICES_JWT_SECRET must be even-length hex", .{});
+            std.process.exit(2);
+        }
+        const bytes = try allocator.alloc(u8, hex.len / 2);
+        _ = std.fmt.hexToBytes(bytes, hex) catch {
+            std.log.err("rewind: LOOP46_SERVICES_JWT_SECRET is not valid hex", .{});
+            std.process.exit(2);
+        };
+        break :blk bytes;
+    };
+    defer if (services_jwt_secret) |s| allocator.free(s);
+    // Worker's internal-plane view of the standalone log-server (no trailing
+    // slash, e.g. `http://127.0.0.1:9000`). Env memory lives for the process,
+    // so no dup/free.
+    const log_internal_base: ?[]const u8 = std.posix.getenv("REWIND_LOG_INTERNAL_BASE");
+
     // Blob backend (fs or s3) — process-wide, env-selected.
     var blob_owned = try blob_mod.env.loadFromEnv(allocator);
     defer blob_owned.deinit(allocator);
@@ -663,6 +688,10 @@ pub fn main() !void {
     // coordinator, msg router, builtin modules).
     var node_state = try rjs.NodeState.init(allocator, node_tenant, blob_owned.cfg, bridge);
     defer node_state.deinit();
+    // Step 3: hand the node the credential + base for the `rewind-logs.internal`
+    // door (borrowed; both outlive node_state per defer ordering above).
+    node_state.services_jwt_secret = services_jwt_secret;
+    node_state.log_internal_base = log_internal_base;
     node_state.wireInternal();
     try node_state.deploy.startDeploymentLoader();
     // Continuous follower deployment loading: fire on every committed
