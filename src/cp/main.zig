@@ -1100,17 +1100,29 @@ const Router = struct {
             a.free(tenants);
         }
         for (tenants) |tenant| {
-            const res = self.directory.resolve(tenant) orelse continue;
+            // resolveOwned (not resolve): the node set is held across the blocking
+            // backendCalls below, and a concurrent re-address (applyClusterLocal on
+            // the pump thread — exactly the /_control/cluster grow that adds a
+            // node) frees `resolve`'s projection-aliased slice → use-after-free.
+            // The owned copy is taken under the directory lock.
+            var res = (self.directory.resolveOwned(a, tenant) catch continue) orelse continue;
+            defer res.deinit(a);
             if (res.moving) continue; // defer to an in-flight move
-            const nodes = res.cluster.nodes; // pointer-stable past resolve
+            const nodes = res.nodes;
             if (nodes.len == 0) continue;
             const leader_url = self.findDestLeaderUrl(nodes, tenant) orelse continue;
             defer a.free(leader_url);
-            // One membership change per group per pass: advance the FIRST
-            // not-caught-up node, then re-observe next pass.
+            // One membership CHANGE per group per pass: a node that's already
+            // good (.done) → check the next; a transient failure (.failed) →
+            // try the NEXT node (a single unreachable node must not starve the
+            // rest of the cluster from being backfilled); a real mutation
+            // (.progressed) → stop and re-observe next pass.
             for (nodes, 0..) |node_url, i| {
                 const node_id: u64 = @intCast(i + 1); // POSITIONAL id (nodes[i] ↔ raft id i+1)
-                if (self.ensureMember(tenant, node_url, node_id, leader_url) != .done) break;
+                switch (self.ensureMember(tenant, node_url, node_id, leader_url)) {
+                    .done, .failed => continue,
+                    .progressed => break,
+                }
             }
         }
     }
@@ -1393,72 +1405,103 @@ const Router = struct {
 
         const is_voter = idIn(ms.voters, node_id);
         const is_learner = idIn(ms.learners, node_id);
+        var voter_recent_active = false;
         if (is_voter) {
             for (ms.peers) |p| {
                 if (p.id == node_id) {
+                    voter_recent_active = p.recent_active;
                     if (p.recent_active and p.matched + RECONCILE_SLACK >= ms.leader_last) return .done;
                     break;
                 }
             }
         }
 
-        const hosted = self.nodeHostsGroup(node_url, tenant);
+        // OBSERVE whether the node holds a local instance. CRITICAL: distinguish
+        // a CONFIRMED-absent (a clean 404 from a reachable node) from an UNKNOWN
+        // (unreachable / errored / 5xx). A configured voter is removed ONLY when
+        // its absence is confirmed — never on a probe failure, or a merely
+        // rebooting/partitioned healthy voter gets torn out of the config (and a
+        // rolling deploy makes voters transiently unreachable by design).
+        const host = self.nodeGroupState(node_url, tenant);
+        if (host == .unknown) return .failed; // can't observe → never mutate; retry next pass
 
         if (is_voter) {
-            // A HOSTED voter that's stuck (has a group instance but is behind +
-            // campaigning) disrupts elections — DEMOTE it to a learner so it
-            // stops voting while it catches up (the __admin__ lesson). Its
-            // instance keeps the leader's Progress.match honest, so this is safe.
-            if (hosted)
-                return if (self.reconcileConfChange(leader_url, tenant, node_id, "demote")) .progressed else .failed;
-            // A PHANTOM voter (configured voter, NO local instance — wiped or
-            // never-formed) is REMOVED, not bootstrapped in place. Bootstrapping a
-            // voter relies on the leader's Progress.match (stale-HIGH from before
-            // the wipe) lining up with the new baseline EXACTLY — and the leader's
-            // heartbeat carries commit = min(match, committed), so if the node is
-            // reborn below that match raft fatal!s (commit_to out of range). The
-            // baseline can't be pinned reliably (the durable watermark lags),
-            // so it races. Removing the node drops the leader's Progress entirely;
-            // the next pass re-adds it as a LEARNER with a FRESH match=0, so the
-            // leader can never send a commit beyond the node's log. The phantom
-            // contributes no quorum anyway, so removing it loses nothing. This is
-            // the structural fix — the panic becomes impossible, not just unlikely.
+            if (host == .hosted) {
+                // DEMOTE only a STUCK voter — one the leader has NOT heard from
+                // within an election timeout (recent_active=false under
+                // check_quorum: partitioned / dead / campaigning without acking
+                // appends — the __admin__ wall). Demoting it stops it disrupting
+                // elections while it catches up. A RESPONSIVE voter that is merely
+                // BEHIND (recent_active but lagging under write load) is catching
+                // up fine via normal replication and is NOT disrupting elections —
+                // demoting it just churns healthy voters on a busy group (B1).
+                // Leave it; raft replicates the tail.
+                if (!voter_recent_active)
+                    return if (self.reconcileConfChange(leader_url, tenant, node_id, "demote")) .progressed else .failed;
+                return .done; // responsive, just behind — no membership change needed
+            }
+            // host == .absent: a CONFIRMED phantom voter (configured voter,
+            // reachable, NO local instance — wiped or never-formed) is REMOVED,
+            // not bootstrapped in place. Bootstrapping a voter relies on the
+            // leader's Progress.match (stale-HIGH from before the wipe) lining up
+            // with the new baseline EXACTLY — and the leader's heartbeat carries
+            // commit = min(match, committed), so if the node is reborn below that
+            // match raft fatal!s (commit_to out of range). Removing the node drops
+            // the leader's Progress entirely; the next pass re-adds it as a
+            // LEARNER with a FRESH match=0, so the leader can never send a commit
+            // beyond the node's log. The manager's ConfChangeQuorumGuard refuses
+            // any remove that would drop below 2 voters, so this can't lose
+            // quorum. Structural fix — the panic becomes impossible, not unlikely.
             return if (self.reconcileConfChange(leader_url, tenant, node_id, "remove")) .progressed else .failed;
         }
         if (is_learner) {
-            if (!hosted)
+            if (host == .absent)
                 return if (self.bootstrapMember(leader_url, node_url, tenant, true)) .progressed else .failed;
-            const applied = self.nodeApplied(node_url, tenant) orelse return .progressed;
-            if (applied + RECONCILE_SLACK >= ms.leader_last)
+            const last_idx = self.nodeLastIndex(node_url, tenant) orelse return .progressed;
+            if (last_idx + RECONCILE_SLACK >= ms.leader_last)
                 return if (self.reconcileConfChange(leader_url, tenant, node_id, "promote")) .progressed else .failed;
             return .progressed; // catching up
         }
-        // Absent: bootstrap as a learner (if needed) then AddLearner on the
-        // leader. The born-learner idles (no campaign) until the leader's
-        // AddLearner lets it replicate, then it catches up + is promoted next pass.
-        if (!hosted and !self.bootstrapMember(leader_url, node_url, tenant, true)) return .failed;
+        // Absent from the config entirely: bootstrap as a learner (only if the
+        // node doesn't already host the group) then AddLearner on the leader. The
+        // born-learner idles (no campaign) until the leader's AddLearner lets it
+        // replicate, then it catches up + is promoted next pass.
+        if (host == .absent and !self.bootstrapMember(leader_url, node_url, tenant, true)) return .failed;
         return if (self.reconcileConfChange(leader_url, tenant, node_id, "add")) .progressed else .failed;
     }
 
-    /// Whether `node_url` hosts a local group instance for `tenant` (confstate
-    /// 200 vs 404).
-    fn nodeHostsGroup(self: *Router, node_url: []const u8, tenant: []const u8) bool {
+    const HostState = enum { hosted, absent, unknown };
+    /// Observe whether `node_url` holds a local group instance for `tenant`:
+    /// `.hosted` (confstate 200), `.absent` (a clean 404 — reachable, no
+    /// instance), or `.unknown` (unreachable / error / unexpected status). The
+    /// hosted-vs-absent-vs-unknown distinction is load-bearing: the reconciler
+    /// must never treat "can't reach the node" as "the node is empty".
+    fn nodeGroupState(self: *Router, node_url: []const u8, tenant: []const u8) HostState {
         const a = self.allocator;
-        const path = std.fmt.allocPrint(a, "/_system/v2-confstate?tenant={s}", .{tenant}) catch return false;
+        const path = std.fmt.allocPrint(a, "/_system/v2-confstate?tenant={s}", .{tenant}) catch return .unknown;
         defer a.free(path);
-        const resp = self.backendCall(node_url, path, .GET, "", &.{}) catch return false;
+        const resp = self.backendCall(node_url, path, .GET, "", &.{}) catch return .unknown;
         defer a.free(resp.body);
-        return resp.status == 200;
+        return switch (resp.status) {
+            200 => .hosted,
+            404 => .absent,
+            else => .unknown,
+        };
     }
 
-    /// `node_url`'s durabilized applied index for `tenant` (learner catch-up
-    /// signal), or null.
-    /// A node's OWN raft committed index — its catch-up progress, read from the
-    /// NON-leader-gated `v2-committed` (a learner is never the leader, so the
-    /// leader-gated `v2-applied-baseline` would 421; and a born-learner's store
-    /// watermark is pre-seeded by the bundle, so it can't stand in for replication
-    /// progress). Compared against the leader's `leader_last` to gate promotion.
-    fn nodeApplied(self: *Router, node_url: []const u8, tenant: []const u8) ?u64 {
+    /// `node_url`'s own raft LOG last index for `tenant` (the learner→promote
+    /// catch-up signal), or null. Read from the NON-leader-gated `v2-last-index`
+    /// (a learner is never the leader, so the leader-gated `v2-applied-baseline`
+    /// would 421). This is the raft log's `last_index()` — entries RECEIVED into
+    /// the log, which is the right promote gate: it is compared against the
+    /// leader's own `leader_last` (also `last_index()`), so like is compared with
+    /// like, and a node whose LOG has caught up is a valid voter (raft votes on
+    /// log position, not apply). An out-of-band baseline (`apply_local_snapshot`)
+    /// advances `last_index` directly, unlike the commit-seq atomic or the
+    /// bundle-seeded store watermark, so a quiescent caught-up learner still trips
+    /// the gate. (Earlier this was misnamed/-documented as an "applied/committed
+    /// index" read from a `v2-committed` endpoint — neither exists; B2.)
+    fn nodeLastIndex(self: *Router, node_url: []const u8, tenant: []const u8) ?u64 {
         const a = self.allocator;
         const path = std.fmt.allocPrint(a, "/_system/v2-last-index?tenant={s}", .{tenant}) catch return null;
         defer a.free(path);
@@ -1794,6 +1837,13 @@ pub fn main() !void {
         const v = std.posix.getenv("REWIND_CP_RECONCILE_MEMBERSHIP") orelse break :blk false;
         break :blk std.mem.eql(u8, std.mem.trim(u8, v, " \t"), "1");
     };
+    // The reconciler drives every DP membership call through backendCall, which
+    // presents the move secret. Enabling it without REWIND_MOVE_SECRET would
+    // panic on the first tick (move_secret.?). Refuse at boot instead.
+    if (reconcile_membership and move_secret == null) {
+        std.log.err("rewind-cp: REWIND_CP_RECONCILE_MEMBERSHIP=1 requires REWIND_MOVE_SECRET", .{});
+        return error.MissingMoveSecret;
+    }
     var router = Router{ .allocator = allocator, .directory = directory, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx, .acme = acme_handle, .reconcile_membership = reconcile_membership };
 
     // Periodic stuck-move reconciliation on the directory leader (between

@@ -290,6 +290,11 @@ pub const Error = error{
     GroupExists,
     /// A proposed write did not commit + apply within the pump budget.
     NotCommitted,
+    /// A data-free baseline was supplied with index>0 but term==0. A term-0
+    /// baseline makes raft-rs's restore fast-forward commit_to past an empty
+    /// log → fatal!. The producer (v2-applied-baseline) refuses to emit one;
+    /// the installer refuses to accept one. An invariant, enforced both ends.
+    InvalidBaseline,
     OutOfMemory,
 } || envelope.Error || raft.Error || kvstore.Error || writeset.DecodeError;
 
@@ -954,11 +959,12 @@ pub const Node = struct {
         return .{ .len = view.peers.len, .leader_last = view.leader_last };
     }
 
-    /// The term of the log entry at `index` on `tenant_id`'s group (0 if
-    /// compacted / beyond the log / unknown). The leader reports `term(applied)`
-    /// so a returning learner's promote-back baseline matches its log.
-    /// Pump-thread only.
-    pub fn logTerm(self: *Node, tenant_id: u64, index: u64) u64 {
+    /// The term of the log entry at `index` on `tenant_id`'s group, or `null` when
+    /// no term is resolvable (compacted / beyond the log / unknown group) — DISTINCT
+    /// from a genuine term of 0 at the genesis index. The leader reports
+    /// `term(applied)` so a returning learner's promote-back baseline matches its
+    /// log. Pump-thread only.
+    pub fn logTerm(self: *Node, tenant_id: u64, index: u64) ?u64 {
         return self.mgr.logTerm(tenant_id, index);
     }
 
@@ -974,7 +980,26 @@ pub const Node = struct {
     /// move bundle). Fast-forwards the raft log baseline so the leader can
     /// replicate the tail and the node can be promoted back. Pump-thread only.
     pub fn applyLocalSnapshot(self: *Node, tenant_id: u64, index: u64, term: u64) Error!void {
-        return self.mgr.applyLocalSnapshot(tenant_id, index, term);
+        try self.mgr.applyLocalSnapshot(tenant_id, index, term);
+        // A2: the baseline fast-forwarded the raft LOG to `index` and the KV state
+        // for `index` is already in the store (the out-of-band bundle). Stamp the
+        // store's DURABLE applied watermark to `index` as well — otherwise a crash
+        // in the rejoin window recovers a store BELOW the raft baseline while the
+        // WAL no longer holds entries ≤ index (compacted below the baseline) → the
+        // gap between the store watermark and the raft baseline is unrecoverable
+        // (lost coverage / divergence). Synchronous, not deferred to
+        // durabilizeTick, so the watermark is durable before this returns; stamping
+        // the store at/ahead of the (not-yet-durable) raft snapshot errs safe — a
+        // store AHEAD of raft only re-applies idempotently on recovery, a store
+        // BEHIND raft loses data. For a data-free baseline the overlay is empty, so
+        // durabilize() just writes the watermark.
+        const slot = self.groups.get(tenant_id) orelse return; // just installed ⇒ present
+        if (index > slot.durabilized_idx) {
+            const store = self.storeFor(slot, slot.id_str) orelse return Error.UnroutedApply;
+            try store.setLastAppliedRaftIdx(index);
+            if (index > slot.applied_idx) slot.applied_idx = index;
+            slot.durabilized_idx = index;
+        }
     }
 
     /// Snapshot the cross-node heartbeat round-trip histogram (broadcast-time
