@@ -17,6 +17,7 @@ import * as login from "./pages/login.js";
 import * as provision from "./pages/provision.js";
 import * as instances from "./pages/instances.js";
 import * as instance from "./pages/instance.js";
+import * as cluster from "./pages/cluster.js";
 
 // Route resolver. Static routes map exactly; `#/instance/:id` is a
 // parameterized route so we match its prefix.
@@ -24,6 +25,7 @@ function resolveRoute(hash) {
   if (hash === "#/login") return { page: login, params: {} };
   if (hash === "#/provision") return { page: provision, params: {} };
   if (hash === "#/instances") return { page: instances, params: {} };
+  if (hash === "#/cluster") return { page: cluster, params: {} };
   if (hash.startsWith("#/instance/")) {
     const id = decodeURIComponent(hash.slice("#/instance/".length));
     if (id.length > 0) return { page: instance, params: { id } };

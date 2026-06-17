@@ -279,6 +279,21 @@ def main() -> int:
                            data=json.dumps({"tenant": "nope", "cluster": c.cluster_id}))
             check("non-operator CP provision → 403", r.status == 403, f"got {r.status}")
 
+        # CP read surface for the #/cluster operator page: GET /v1/cp/route?host=
+        # → placement JSON via the door. (Track 2 — the GUI twin of `rewind-ops
+        # status`.) Operator → 200 with a route; non-operator → 403.
+        r = c.tls_curl(app_origin + "/v1/cp/route?host=" +
+                       urllib.parse.quote(c.host_for("viaui")),
+                       headers={"Cookie": op_cookie}, timeout=30.0)
+        check("operator cluster-status read (/v1/cp/route) → 200 + route",
+              r.status == 200 and '"tenant"' in r.body,
+              f"got {r.status} {r.body[:160]!r}")
+        if cust_cookie:
+            r = c.tls_curl(app_origin + "/v1/cp/route?host=x",
+                           headers={"Cookie": cust_cookie})
+            check("non-operator cluster-status read → 403", r.status == 403,
+                  f"got {r.status}")
+
         # ── B5: publishRelease ownership gate (step3-auth-plan.md B5). ─────
         # Same call, different principal: an operator (is_root) bypasses
         # ownership and falls through to the not-found check (404); a
@@ -296,11 +311,62 @@ def main() -> int:
             check("non-owner publishRelease → 403 (blocked before existence)",
                   r.status == 403, f"got {r.status} {r.body[:120]!r}")
 
+        # ── Track 0: deploy through the STANDING dashboard app (/v1/deploy). ─
+        # The keystone. web/admin replaced the baked genesis app on __admin__,
+        # so deploys must still work — they now ride web/admin's /v1/deploy,
+        # gated by root-token (M2M operator/bootstrap) OR session-ownership.
+        TRIVIAL = "export default function(){ return 'hi'; }"
+
+        def deploy_via(cookie, tenant, *, root=False):
+            hdrs = {"content-type": "application/json"}
+            if root:
+                hdrs["Authorization"] = "Bearer " + c.root_token
+            elif cookie:
+                hdrs["Cookie"] = cookie
+            body = json.dumps({"tenant": tenant,
+                               "handlers": [{"path": "index.mjs", "source": TRIVIAL}],
+                               "statics": []})
+            return c.tls_curl(app_origin + "/v1/deploy", method="POST",
+                              headers=hdrs, data=body, timeout=30.0)
+
+        # (a) operator root-token deploy to a provisioned tenant → 200 + dep_id.
+        c.provision("dep0")
+        r = deploy_via(None, "dep0", root=True)
+        ok = False
+        try:
+            p = json.loads(r.body)
+            ok = r.status == 200 and p.get("ok") is True and bool(p.get("dep_id"))
+        except Exception:
+            ok = False
+        check("root-token deploy via standing app /v1/deploy → 200 + dep_id", ok,
+              f"got {r.status} {r.body[:160]!r}")
+        if not ok:
+            c.dump_node_log(grep=["deploy", "compile", "stamp", "blob",
+                                  "middlew", "auth", "error", "warn"])
+
+        # (c) a customer provisions THEIR OWN instance, then deploys to it → 200.
+        owned = None
+        if cust_cookie:
+            r = rpc(cust_cookie, "provisionInstance", ["custapp"])
+            check("customer provisions own instance → 201", r.status == 201,
+                  f"got {r.status} {r.body[:120]!r}")
+            if r.status == 201:
+                owned = "custapp"
+        if owned:
+            r = deploy_via(cust_cookie, owned)
+            check("owner-session deploy own tenant via /v1/deploy → 200",
+                  r.status == 200, f"got {r.status} {r.body[:160]!r}")
+            # (b) the same customer deploying a tenant they DON'T own → 403.
+            r = deploy_via(cust_cookie, "dep0")
+            check("non-owner deploy via /v1/deploy → 403", r.status == 403,
+                  f"got {r.status} {r.body[:120]!r}")
+
     if failures:
         print(f"\nFAILED ({len(failures)}): {failures}")
         return 1
     print("\nPASS — OIDC RP login + log chokepoint (A5) + CP control chokepoint "
-          "(B4) through the dashboard, no operator-held log/CP secret.")
+          "(B4) + deploy chokepoint (Track 0: /v1/deploy on the standing app, "
+          "root-token + ownership-gated) through the dashboard.")
     return 0
 
 

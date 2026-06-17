@@ -11,7 +11,10 @@ export function render(root, { goto, api }) {
   wrap.innerHTML = `
     <header class="page-header">
       <h1>Instances</h1>
-      <button type="button" class="logout">Sign out</button>
+      <nav class="page-nav">
+        <a class="cluster-link" href="#/cluster" hidden>Cluster</a>
+        <button type="button" class="logout">Sign out</button>
+      </nav>
     </header>
     <p class="error" hidden></p>
 
@@ -56,6 +59,12 @@ export function render(root, { goto, api }) {
   const createForm = wrap.querySelector(".create-form");
   const assignForm = wrap.querySelector(".assign-form");
   const logoutBtn = wrap.querySelector(".logout");
+  const clusterLink = wrap.querySelector(".cluster-link");
+
+  // Reveal the operator-only cluster-management link for is_root sessions.
+  api.whoami().then((who) => {
+    if (who && who.is_root) clusterLink.hidden = false;
+  }).catch(() => {});
 
   function showError(msg) {
     errorBox.textContent = msg;

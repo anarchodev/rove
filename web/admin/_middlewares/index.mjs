@@ -13,6 +13,10 @@ const PRE_AUTH_PATHS = [
     "/_rp/login", "/_rp/callback", "/_rp/poll",
     // Logout must work without a live session.
     "/v1/logout",
+    // CLI device-grant token exchange establishes the session — it can't
+    // require one. The real gate is the cryptographic id_token verify inside
+    // oidc.rp.exchangeToken (same as the _rp/* completion modules).
+    "/v1/cli/exchange",
     // The async-completion on_result modules. callback_dispatch runs
     // dispatcher.run → _middlewares BEFORE the module, and a
     // synthesized callback request has NO request.session — so
@@ -23,12 +27,33 @@ const PRE_AUTH_PATHS = [
     "/_rp/complete", "/_rp/jwks",
 ];
 
+// Machine-to-machine routes that accept a platform root-token bearer in
+// addition to (or instead of) an OIDC session. This is the operator /
+// bootstrap / break-glass path for `rewind-ops` and `POST /_system/reset`
+// continuity — NOT a human login path (the dashboard UI stays pure-OIDC).
+// A valid root token grants operator authority (is_root) with no `sub`;
+// the deploy handler gates on is_root OR session-ownership of the target.
+const M2M_PATHS = ["/v1/deploy"];
+
 export function before() {
     const fullPath = request.path;
     const q = fullPath.indexOf("?");
     const path = q === -1 ? fullPath : fullPath.slice(0, q);
 
     if (PRE_AUTH_PATHS.indexOf(path) !== -1) return; // continue
+
+    // M2M root-token bearer (operator/bootstrap). Only honored on M2M_PATHS;
+    // everywhere else the dashboard is a pure OIDC relying party.
+    if (M2M_PATHS.indexOf(path) !== -1) {
+        const hdr = request.headers["authorization"] || "";
+        const tok = hdr.indexOf("Bearer ") === 0 ? hdr.slice(7) : "";
+        if (tok && platform.auth.checkRootToken(tok)) {
+            request.auth = { sub: null, is_root: true, root: true };
+            return; // continue → handler
+        }
+        // No/invalid root token → fall through to the OIDC guard so a
+        // logged-in customer can deploy their own tenant via session.
+    }
 
     const auth = oidc.rp("default").guard();
     if (!auth) {
