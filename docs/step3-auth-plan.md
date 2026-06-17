@@ -216,16 +216,25 @@ single CP call; a **non-wildcard** custom host (`cli-custom.test`) resolves to
 its tenant via the CP-propagated alias → `200`. No drift (one source of truth),
 self-heal-on-move noted as a follow-up (re-push on attach).
 
-### B4. Move operator secrets off the shell — *M (needs a CP door, not just delivery)*
+### B4. Move operator secrets off the shell — ✅ door done/verified (delivery rides prod)
 The plan's original "delivery, not code" was wrong (like B3): the dashboard
 covers the worker-plane ops (deploy/release/logs via OIDC), but
-provision/move/host/plan are **CP** ops (move-secret) the dashboard **can't
-reach** — `platform.*` has no control-plane accessor. So getting move-secret
-off the *day-to-day* shell needs code: an `__admin__`-only **`rewind-cp.internal`
-door** (the A5 logs-door pattern: the worker attaches the move-secret + rewrites
-to the CP) + dashboard `/v1/cp/{provision,move,host,plan}` routes. Then the
-operator does CP ops through the OIDC dashboard; move-secret is engine-held
-(off the shell); `rewind-ops` is break-glass.
+provision/move/host/plan are **CP** ops (move-secret) the dashboard **couldn't
+reach** — `platform.*` has no control-plane accessor. **Done** via the A5
+logs-door pattern: an `__admin__`-only **`rewind-cp.internal` door**
+(`fetch_engine.rewriteAndAuthCpFetch`) gates to `__admin__`, attaches the
+move-secret, rewrites to the configured CP base (restricted to `_control/`/`_cp/`);
+`web/admin` exposes `/v1/cp/{provision,move,host,plan}` (is_root-gated) over it.
+So the operator drives CP control through the OIDC dashboard with **no CP secret
+of their own** — the worker holds + attaches it. **Verified** by
+`scripts/oidc_rp_smoke_v2.py` (operator provisions via `/v1/cp/provision` → 204,
+placement confirmed by a move-secret re-provision → 409; non-operator → 403).
+
+The remaining *delivery* (actually removing `REWIND_MOVE_SECRET` from the
+operator's `prod.env`, leaving `rewind-ops` break-glass with the root token)
+rides the **prod dashboard deploy** — the day-to-day path is the dashboard, so
+the shift lands when it's live. The full retirement of the root token is the
+`cp-desired-state-target.md` arc (release reconciler + reset-via-CP).
 
 > **North star (`cp-desired-state-target.md`):** B4 is one step toward the CP
 > owning *all* per-tenant desired-state (incl. release) with workers
