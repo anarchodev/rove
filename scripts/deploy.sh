@@ -106,6 +106,17 @@ wait_health(){
 # roll (bit us on the first real one). Ready =
 #   (a) the local CP answers HTTP at all (any status: serving), and
 #   (b) SOME node answers 200 (the directory raft has a leader).
+#
+# (b) MUST scan the whole CP membership, not just the deploy targets: the
+# directory leader can sit on a node we're NOT deploying (e.g. a member
+# that's intentionally excluded from ROVE_HOSTS), and a follower's 503
+# carries no leader hint — so probing only ROVE_HOSTS false-negatives
+# "no leader" while the cluster is perfectly healthy (this bit the
+# 3-node roll: bhs-3 led, only bhs-1/2 were probed). ROVE_CLUSTER_HOSTS
+# lists every CP member's SSH target; it defaults to ROVE_HOSTS for the
+# common case where the deploy set IS the whole cluster. A bounded
+# connect timeout keeps a down/excluded member from hanging the probe.
+SSH_PROBE="$SSH -o ConnectTimeout=8 -o BatchMode=yes"
 wait_cp_ready(){
     local host="$1" t=0
     until $SSH "$host" "curl -s -m5 -o /dev/null http://localhost:9090/_cp/leader"; do
@@ -116,13 +127,13 @@ wait_cp_ready(){
     t=0
     while :; do
         local h
-        for h in $ROVE_HOSTS; do
-            if $SSH "$h" "curl -fsS -m5 -o /dev/null http://localhost:9090/_cp/leader" 2>/dev/null; then
+        for h in ${ROVE_CLUSTER_HOSTS:-$ROVE_HOSTS}; do
+            if $SSH_PROBE "$h" "curl -fsS -m5 -o /dev/null http://localhost:9090/_cp/leader" 2>/dev/null; then
                 ok "directory leader present (via $h)"
                 return 0
             fi
         done
-        t=$((t+2)); [ "$t" -lt "$HEALTH_TIMEOUT" ] || die "directory raft has no leader after ${HEALTH_TIMEOUT}s"
+        t=$((t+2)); [ "$t" -lt "$HEALTH_TIMEOUT" ] || die "directory raft has no leader after ${HEALTH_TIMEOUT}s (probed: ${ROVE_CLUSTER_HOSTS:-$ROVE_HOSTS})"
         sleep 2
     done
 }
