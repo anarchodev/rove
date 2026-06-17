@@ -338,6 +338,19 @@ fn processRequests(
     }
 }
 
+/// Map a JWT verify failure to a terse 401 body. Shared by the push
+/// (plain verify) and read (tenant-scoped verify) gates.
+fn jwtErrMsg(err: jwt.Error) []const u8 {
+    return switch (err) {
+        jwt.Error.Expired => "token expired\n",
+        jwt.Error.BadSignature => "bad signature\n",
+        jwt.Error.Malformed, jwt.Error.UnsupportedAlg, jwt.Error.InvalidTenant => "malformed token\n",
+        jwt.Error.MissingCap, jwt.Error.InvalidCap => "missing required capability\n",
+        jwt.Error.WrongTenant => "token not valid for this tenant\n",
+        jwt.Error.OutOfMemory => "out of memory\n",
+    };
+}
+
 fn handleOne(
     server: *LogH2,
     allocator: std.mem.Allocator,
@@ -386,46 +399,54 @@ fn handleOne(
         return;
     }
 
-    // JWT gate. The worker mints these at /_system/log-token after
-    // its own auth check (cookie or bearer); the standalone trusts
-    // the signed `exp` and otherwise treats every token as authorized
-    // for every tenant. Per-tenant scoping moves into the token in a
-    // future revision.
-    if (rctx.cfg.jwt_secret) |secret| {
-        if (!std.mem.startsWith(u8, authz, "Bearer ")) {
-            try setResponse(server, ent, sid, sess, 401, "missing bearer token\n", rctx.cfg);
-            return;
-        }
-        const token = authz["Bearer ".len..];
-        const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
-        _ = jwt.verify(secret, token, now_ms) catch |err| {
-            const msg = switch (err) {
-                jwt.Error.Expired => "token expired\n",
-                jwt.Error.BadSignature => "bad signature\n",
-                jwt.Error.Malformed, jwt.Error.UnsupportedAlg, jwt.Error.InvalidTenant => "malformed token\n",
-                jwt.Error.MissingCap, jwt.Error.InvalidCap => "missing required capability\n",
-                jwt.Error.WrongTenant => "token not valid for this tenant\n",
-                jwt.Error.OutOfMemory => "out of memory\n",
-            };
-            try setResponse(server, ent, sid, sess, 401, msg, rctx.cfg);
-            return;
-        };
-    } else {
+    // JWT gate. Two shapes, by route:
+    //   • READ routes (`/v1/{tenant}/list|count|show`) require a
+    //     TENANT-SCOPED `logs-read` capability token —
+    //     `verifyWithCapAndTenant` rejects an unscoped ("any tenant")
+    //     token AND a token scoped to a different tenant. This is the
+    //     chokepoint guarantee (rewind-cli-plan.md §7; step3-auth-plan.md
+    //     A4): the worker's fetch engine mints the scoped token when it
+    //     rewrites the `rewind-logs.internal` host the `__admin__`
+    //     chokepoint issues. Closes the audit's open latent-critical —
+    //     the old "trusts `exp`, treats every token as any-tenant" gap is
+    //     deleted, not patched.
+    //   • The worker→log-server batch PUSH (`/v1/_internal/batch-pushed`)
+    //     is inherently multi-tenant ingestion (one S3 flush interleaves
+    //     tenants), so it can't be tenant-scoped; it takes a plain
+    //     signature+expiry verify. TODO(step3): give the push path its own
+    //     `logs-push` cap so a read token can't drive ingestion.
+    const secret = rctx.cfg.jwt_secret orelse {
         try setResponse(server, ent, sid, sess, 401, "auth not configured\n", rctx.cfg);
         return;
+    };
+    if (!std.mem.startsWith(u8, authz, "Bearer ")) {
+        try setResponse(server, ent, sid, sess, 401, "missing bearer token\n", rctx.cfg);
+        return;
     }
+    const token = authz["Bearer ".len..];
+    const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
 
     // Worker → log-server push: indexer fetches the named batch
     // directly without waiting for the LIST polling cycle to catch
-    // up. See `indexer.indexOneKey` for the why.
+    // up. See `indexer.indexOneKey` for the why. Plain verify (see above).
     if (is_push) {
+        _ = jwt.verify(secret, token, now_ms) catch |err| {
+            try setResponse(server, ent, sid, sess, 401, jwtErrMsg(err), rctx.cfg);
+            return;
+        };
         const body: []const u8 = if (rb.data) |d| d[0..rb.len] else "";
         try handleBatchPushed(server, allocator, rctx, ent, sid, sess, body);
         return;
     }
 
+    // Read route — parse first so the tenant is in hand for the
+    // tenant-scoped verify below.
     const route = parseRoute(path) orelse {
         try setResponse(server, ent, sid, sess, 404, "not found\n", rctx.cfg);
+        return;
+    };
+    _ = jwt.verifyWithCapAndTenant(secret, token, now_ms, jwt.Cap.LOGS_READ, route.tenant_id) catch |err| {
+        try setResponse(server, ent, sid, sess, 401, jwtErrMsg(err), rctx.cfg);
         return;
     };
     // Retention read-clamp (docs/architecture/control-plane.md Lever 3): resolve the tenant's

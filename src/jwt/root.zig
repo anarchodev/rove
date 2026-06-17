@@ -69,6 +69,14 @@ pub const Cap = struct {
     /// fetch the offered snapshot. Out-of-band from the consensus
     /// control plane so the bulk transfer can't starve heartbeats.
     pub const RAFT_SNAPSHOT = "raft-snapshot";
+    /// Token bearer may read one tenant's request logs from the
+    /// log-server. ALWAYS minted tenant-scoped (`{caps:[logs-read],
+    /// tenant}`): the log-server verifies with `verifyWithCapAndTenant`,
+    /// so an unscoped token can't read across tenants. Minted by the
+    /// worker's fetch engine when it rewrites the privileged
+    /// `rewind-logs.internal` host the `__admin__` chokepoint issues
+    /// (rewind-cli-plan.md §7; step3-auth-plan.md A2/A3).
+    pub const LOGS_READ = "logs-read";
 };
 
 pub const Payload = struct {
@@ -568,11 +576,11 @@ test "tenant-scoped token: verifyWithCapAndTenant accepts matching cap + tenant"
     const a = testing.allocator;
     const tok = try mint(a, "k", .{
         .exp_ms = 1_000_000,
-        .caps = &.{"logs-read"},
+        .caps = &.{Cap.LOGS_READ},
         .tenant = "acme-prod",
     });
     defer a.free(tok);
-    const p = try verifyWithCapAndTenant("k", tok, 0, "logs-read", "acme-prod");
+    const p = try verifyWithCapAndTenant("k", tok, 0, Cap.LOGS_READ, "acme-prod");
     try testing.expectEqual(@as(i64, 1_000_000), p.exp_ms);
 }
 
