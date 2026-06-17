@@ -411,8 +411,14 @@ path — a decision to make when the dashboard replaces `admin_interim`.
 
 ## 6. Naming — rename the worker, free `rewind` for the client
 
-The worker binary is `rewind` today, which collides with naming a client
-CLI `rewind`. **Decision: rename the worker binary `rewind` →
+> **DONE.** The worker binary is `rewind-worker` (`build.zig:1055` exe +
+> step; `scripts/smoke_lib_v2.py:47`; `scripts/deploy.sh` restarts
+> `rewind-worker.service`; `scripts/systemd/v2/rewind-worker.service`
+> `ExecStart=…/rewind-worker`). The command name `rewind` is free for the
+> customer CLI (B5). The rest of this section is the original rationale.
+
+The worker binary was `rewind`, which collided with naming a client
+CLI `rewind`. **Decision (executed): rename the worker binary `rewind` →
 `rewind-worker` and reserve the command name `rewind` for the
 customer/developer CLI.** Three reasons:
 
