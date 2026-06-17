@@ -1407,25 +1407,36 @@ const Router = struct {
         if (is_voter) {
             // A HOSTED voter that's stuck (has a group instance but is behind +
             // campaigning) disrupts elections — DEMOTE it to a learner so it
-            // stops voting while it catches up (the __admin__ lesson).
+            // stops voting while it catches up (the __admin__ lesson). Its
+            // instance keeps the leader's Progress.match honest, so this is safe.
             if (hosted)
                 return if (self.reconcileConfChange(leader_url, tenant, node_id, "demote")) .progressed else .failed;
-            // A FRESH voter (already a member, no local group instance — a wiped
-            // or never-formed replica) is bootstrapped DIRECTLY, no conf_change:
-            // the proven fresh_voter_join path. (Demote-then-bootstrap races the
-            // leader's commit vs the new snapshot baseline → a commit_to panic.)
-            return if (self.bootstrapMember(leader_url, node_url, tenant)) .progressed else .failed;
+            // A PHANTOM voter (configured voter, NO local instance — wiped or
+            // never-formed) is REMOVED, not bootstrapped in place. Bootstrapping a
+            // voter relies on the leader's Progress.match (stale-HIGH from before
+            // the wipe) lining up with the new baseline EXACTLY — and the leader's
+            // heartbeat carries commit = min(match, committed), so if the node is
+            // reborn below that match raft fatal!s (commit_to out of range). The
+            // baseline can't be pinned reliably (the durable watermark lags),
+            // so it races. Removing the node drops the leader's Progress entirely;
+            // the next pass re-adds it as a LEARNER with a FRESH match=0, so the
+            // leader can never send a commit beyond the node's log. The phantom
+            // contributes no quorum anyway, so removing it loses nothing. This is
+            // the structural fix — the panic becomes impossible, not just unlikely.
+            return if (self.reconcileConfChange(leader_url, tenant, node_id, "remove")) .progressed else .failed;
         }
         if (is_learner) {
             if (!hosted)
-                return if (self.bootstrapMember(leader_url, node_url, tenant)) .progressed else .failed;
+                return if (self.bootstrapMember(leader_url, node_url, tenant, true)) .progressed else .failed;
             const applied = self.nodeApplied(node_url, tenant) orelse return .progressed;
             if (applied + RECONCILE_SLACK >= ms.leader_last)
                 return if (self.reconcileConfChange(leader_url, tenant, node_id, "promote")) .progressed else .failed;
             return .progressed; // catching up
         }
-        // Absent: bootstrap (if needed) then AddLearner.
-        if (!hosted and !self.bootstrapMember(leader_url, node_url, tenant)) return .failed;
+        // Absent: bootstrap as a learner (if needed) then AddLearner on the
+        // leader. The born-learner idles (no campaign) until the leader's
+        // AddLearner lets it replicate, then it catches up + is promoted next pass.
+        if (!hosted and !self.bootstrapMember(leader_url, node_url, tenant, true)) return .failed;
         return if (self.reconcileConfChange(leader_url, tenant, node_id, "add")) .progressed else .failed;
     }
 
@@ -1442,16 +1453,21 @@ const Router = struct {
 
     /// `node_url`'s durabilized applied index for `tenant` (learner catch-up
     /// signal), or null.
+    /// A node's OWN raft committed index — its catch-up progress, read from the
+    /// NON-leader-gated `v2-committed` (a learner is never the leader, so the
+    /// leader-gated `v2-applied-baseline` would 421; and a born-learner's store
+    /// watermark is pre-seeded by the bundle, so it can't stand in for replication
+    /// progress). Compared against the leader's `leader_last` to gate promotion.
     fn nodeApplied(self: *Router, node_url: []const u8, tenant: []const u8) ?u64 {
         const a = self.allocator;
-        const path = std.fmt.allocPrint(a, "/_system/v2-applied-baseline?tenant={s}", .{tenant}) catch return null;
+        const path = std.fmt.allocPrint(a, "/_system/v2-last-index?tenant={s}", .{tenant}) catch return null;
         defer a.free(path);
         const resp = self.backendCall(node_url, path, .GET, "", &.{}) catch return null;
         defer a.free(resp.body);
         if (resp.status != 200) return null;
-        var p = std.json.parseFromSlice(struct { index: u64 = 0, term: u64 = 0 }, a, resp.body, .{ .ignore_unknown_fields = true }) catch return null;
+        var p = std.json.parseFromSlice(struct { last_index: u64 = 0 }, a, resp.body, .{ .ignore_unknown_fields = true }) catch return null;
         defer p.deinit();
-        return p.value.index;
+        return p.value.last_index;
     }
 
     /// Propose a conf-change (`add`/`promote`/`demote`/`remove`) on `leader_url`.
@@ -1473,7 +1489,7 @@ const Router = struct {
     /// leader's baseline {index,term} + snapshot bundle, attach (create group +
     /// load) on the node, then install the data-free raft baseline so the leader
     /// replicates the tail.
-    fn bootstrapMember(self: *Router, leader_url: []const u8, node_url: []const u8, tenant: []const u8) bool {
+    fn bootstrapMember(self: *Router, leader_url: []const u8, node_url: []const u8, tenant: []const u8, as_learner: bool) bool {
         const a = self.allocator;
         const bpath = std.fmt.allocPrint(a, "/_system/v2-applied-baseline?tenant={s}", .{tenant}) catch return false;
         defer a.free(bpath);
@@ -1500,15 +1516,20 @@ const Router = struct {
         defer a.free(bidx);
         const bterm = std.fmt.allocPrint(a, "{d}", .{bp.value.term}) catch return false;
         defer a.free(bterm);
+        // Join as a non-voting learner (born-learner) when ADDING this node to
+        // the group — a learner doesn't campaign, so it follows the leader and
+        // catches up instead of deadlocking a high-term group. A configured
+        // VOTER rejoining (fresh_voter_join) omits this → born voter, as before.
         var th = [_]curl.Header{
             .{ .name = TENANT_HEADER, .value = tenant },
             .{ .name = "X-Rewind-Baseline-Index", .value = bidx },
             .{ .name = "X-Rewind-Baseline-Term", .value = bterm },
+            .{ .name = "X-Rewind-Join-As-Learner", .value = if (as_learner) "1" else "0" },
         };
         const ar = self.backendCall(node_url, "/_system/v2-attach", .POST, snap.body, &th) catch return false;
         defer a.free(ar.body);
         if (ar.status != 204) return false;
-        std.log.info("rewind-cp: reconcile bootstrapped {s} onto {s} (atomic baseline {d}/{d})", .{ tenant, node_url, bp.value.index, bp.value.term });
+        std.log.info("rewind-cp: reconcile bootstrapped {s} onto {s} (atomic baseline {d}/{d}, learner={})", .{ tenant, node_url, bp.value.index, bp.value.term, as_learner });
         return true;
     }
 

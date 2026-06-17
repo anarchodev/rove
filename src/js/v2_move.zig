@@ -75,6 +75,9 @@ const PLAN_HEADER = "x-rewind-plan";
 // the fresh group observable at last_index 0 (see bridge.createGroupAtBaseline).
 const BASELINE_INDEX_HEADER = "x-rewind-baseline-index";
 const BASELINE_TERM_HEADER = "x-rewind-baseline-term";
+// "1" → birth the local group with this node as a non-voting LEARNER (joining an
+// existing group learner-first) instead of a voter from the static voter set.
+const JOIN_LEARNER_HEADER = "x-rewind-join-as-learner";
 
 /// Source-side marker key (in the tenant's own `inst.kv`) holding the
 /// destination node list — comma-separated base URLs, leader first — while a
@@ -148,6 +151,8 @@ pub fn tryHandleV2(
         try handleMemberStatus(server, allocator, worker, ent, sid, sess, method, path);
     } else if (std.mem.eql(u8, sys_rest, "v2-applied-baseline")) {
         try handleAppliedBaseline(server, allocator, worker, ent, sid, sess, method, path);
+    } else if (std.mem.eql(u8, sys_rest, "v2-last-index")) {
+        try handleLastIndex(server, allocator, worker, ent, sid, sess, method, path);
     } else if (std.mem.eql(u8, sys_rest, "v2-load-replace")) {
         try handleLoadReplace(server, allocator, worker, ent, sid, sess, method, rh, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-apply-snapshot")) {
@@ -398,8 +403,15 @@ fn handleAttach(
         const s = respb.findHeader(rh, BASELINE_TERM_HEADER) orelse break :blk 0;
         break :blk std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch 0;
     };
+    // Join an EXISTING group as a non-voting learner (the reconciler adds a node
+    // learner-first: a born-voter would campaign past a high-term leader and
+    // deadlock). The leader must already hold the matching AddLearner conf-change.
+    const join_as_learner = if (respb.findHeader(rh, JOIN_LEARNER_HEADER)) |s|
+        std.mem.eql(u8, std.mem.trim(u8, s, " "), "1")
+    else
+        false;
     if (baseline_index > 0) {
-        worker.raft.createGroupAtBaseline(gid, 1, baseline_index, baseline_term) catch |err| switch (err) {
+        worker.raft.createGroupAtBaseline(gid, 1, baseline_index, baseline_term, join_as_learner) catch |err| switch (err) {
             error.GroupExists => {}, // idempotent re-attach
             else => return reply(server, allocator, ent, sid, sess, 500, "group attach (baseline) failed\n"),
         };
@@ -1037,7 +1049,50 @@ fn handleAppliedBaseline(
     const index = inst.kv.lastAppliedRaftIdx() catch
         return reply(server, allocator, ent, sid, sess, 500, "applied-index read failed\n");
     const term = worker.raft.logTerm(gid, index);
+    // A baseline is the pair {index, term-of-the-log-entry-at-index}. If the
+    // leader's own log can't resolve a term for `index` (term == 0 for index > 0:
+    // the index is beyond last_index, below the compaction floor, or the store
+    // watermark has drifted ahead of the raft log), there is NO valid baseline to
+    // hand out. Returning {index, term:0} would feed an OUT-OF-BAND snapshot a
+    // bogus term, which raft-rs's `restore` then treats as a same-term match and
+    // fast-forwards `commit_to(index)` past the follower's empty log → `fatal!`.
+    // Refuse instead: the reconciler skips this group this pass and retries once
+    // the leader's log covers its watermark (a transient inconsistency) — and a
+    // term-0 baseline never reaches a follower, so the abort only ever fires on a
+    // genuinely new invariant break, exactly as it should.
+    if (term == 0 and index > 0)
+        return reply(server, allocator, ent, sid, sess, 409, "no term-valid baseline (leader log does not cover the applied index)\n");
     const out = std.fmt.allocPrint(allocator, "{{\"index\":{d},\"term\":{d}}}\n", .{ index, term }) catch
+        return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
+}
+
+/// `GET /_system/v2-last-index?tenant=` → `{"last_index":N}` — this node's local
+/// raft last log index for the group. UNLIKE `v2-applied-baseline` this is NOT
+/// leader-gated, so a LEARNER (never the leader) can report its own catch-up. The
+/// reconciler gates learner→promote on it vs the leader's `leader_last`. Why
+/// last_index (not the commit-seq atomic or the store watermark): an out-of-band
+/// baseline (`apply_local_snapshot`) advances `last_index` directly, so a born-
+/// learner is "caught up" the moment its baseline lands — whereas commit-seq only
+/// moves on freshly committed entries (a quiescent learner would never trip it),
+/// and the store watermark is pre-seeded by the bundle (high before any replay).
+fn handleLastIndex(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    path: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "GET"))
+        return reply(server, allocator, ent, sid, sess, 405, "GET only\n");
+    const tenant = queryParam(path, "tenant") orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing ?tenant\n");
+    const gid = worker.raft.gidForTenant(tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
+    const out = std.fmt.allocPrint(allocator, "{{\"last_index\":{d}}}\n", .{worker.raft.lastIndex(gid)}) catch
         return reply(server, allocator, ent, sid, sess, 500, "oom\n");
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
 }
