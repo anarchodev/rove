@@ -152,13 +152,31 @@ that rides Track B. **None of A1–A3 needed OIDC.**
 
 ## Track B — operator OIDC plane (gated on `__auth__` deploy)
 
-### B1. Deploy the `__auth__` IdP tenant — *S (deploy, not build)*
+> **Status (2026-06-16):** **B1 done at the local/cluster level + verified.**
+> `scripts/oidc_smoke_v2.py` stands up `__auth__` on a V2 cluster end-to-end —
+> provision + deploy the real `web/auth` app, discovery (host-relative `iss`,
+> RS256+S256), magic-link login, PKCE authorization-code, `/token`, **id_token
+> RS256-verified against the published JWKS**, refresh grant (10/10 green). The
+> IdP plumbing is all wired (config-mirror, keyset genesis/rotation, wildcard
+> host routing). What remains for B1 is the **production publish** of `__auth__`
+> (a `/publish` of the `web/auth` bundle to the real cluster — billed, gated)
+> plus prod config (resend key for real magic-link email, operator allowlist).
+> B2–B5 then fall out.
+
+### B1. Deploy the `__auth__` IdP tenant — *S (deploy, not build)* — ✅ local/verified
 The app is written (`web/auth/index.mjs`): magic-link authN + dogfooded
-`oidc.provider()`. Bootstrap it like `__admin__` (via `/_system/reset`),
-reachable at `auth.{system_suffix}`, configure `_config/oidc/default.json`
-(client_id/redirect_uri/issuer) + the magic-link email key. **This is the
-single unblock** for everything else in B. The chicken-and-egg the
-customer CLI waits on dissolves here.
+`oidc.provider()`. Deployed like any tenant — provision `__auth__`, deploy
+the bundle (handler + `_config/oidc/default.json`, which config-mirrors to
+kv on release); reachable via the wildcard host (`__auth__.{suffix}`) or an
+explicit `auth.{suffix}` alias. **Verified locally** by
+`scripts/oidc_smoke_v2.py`. **This is the single unblock** for everything
+else in B. The chicken-and-egg the customer CLI waits on dissolves here.
+
+> **Discovery:** unlike the log-server door, `__auth__`'s plumbing was fully
+> wired — the only gaps were operator data-seeding (config/clients via the
+> move-secret `v2-kv` seam; no `__admin__`/files-server bootstrap needed) and
+> the actual prod publish. The V1 `scripts/oidc_smoke.py` (retired loop46) is
+> superseded by `oidc_smoke_v2.py`.
 
 ### B2. Light up the admin dashboard end-to-end — *S*
 The RP guard (`_middlewares/index.mjs:33`) and token exchange
