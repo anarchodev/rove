@@ -1491,7 +1491,6 @@ fn resumeContinuation(
         // outcome ride `body` (Endpoint A); the resume export reads
         // `request.ctx` / `request.body` — no positional args.
         .fn_override = if (named) resume_fn else null,
-        .fn_args_json = "[]",
         // Inherit the chain id from the parking request so every tape row
         // of this chain shares one correlation_id; mark this activation as
         // a send-callback resume (streaming-handlers-plan §6) — or

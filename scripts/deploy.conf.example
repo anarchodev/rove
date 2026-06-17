@@ -3,11 +3,19 @@
 # legacy scripts/deploy.conf, and edit. deploy.sh ships ONLY binaries +
 # restarts; it never pushes env files / secrets (provisioned out-of-band).
 
-# SSH targets for the 3 nodes, space-separated. One at a time, in order.
-# Order is not safety-critical (one host fully restarts + rejoins quorum
-# before the next; CP re-elects sub-second and clients retry the CP list),
-# but listing a known follower first is a nice-to-have.
+# SSH targets to DEPLOY, space-separated. One at a time, in order. Order
+# is not safety-critical (one host fully restarts + rejoins quorum before
+# the next; CP re-elects sub-second and clients retry the CP list), but
+# listing a known follower first is a nice-to-have.
 ROVE_HOSTS="rove@host-1 rove@host-2 rove@host-3"
+
+# SSH targets of EVERY CP (directory-raft) member — used only by the
+# leader-readiness probe between restarts. Defaults to ROVE_HOSTS. Set it
+# explicitly when the cluster has members you are NOT deploying (e.g. a
+# node held back on an older build): the directory leader may live on one
+# of those, and a follower's 503 gives no leader hint, so the probe must
+# be able to reach the leader's node or it false-negatives "no leader".
+# ROVE_CLUSTER_HOSTS="rove@host-1 rove@host-2 rove@host-3 rove@host-4"
 
 # Remote bin dir, relative to the SSH user's home.
 ROVE_BIN_DIR=".local/bin"

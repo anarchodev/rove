@@ -69,6 +69,15 @@ fn constantTimeEql(a: []const u8, b: []const u8) bool {
 /// DP" — the plan rides attach on a move). Absent header ⇒ no plan delivered
 /// (the tenant stays free until a live push / the next attach).
 const PLAN_HEADER = "x-rewind-plan";
+// Optional atomic-baseline headers on v2-attach: when both are present the group
+// is created AND given a data-free raft baseline at {index, term} in one pump op
+// (createGroupAtBaseline) — the reconciler bootstrap path, which must never leave
+// the fresh group observable at last_index 0 (see bridge.createGroupAtBaseline).
+const BASELINE_INDEX_HEADER = "x-rewind-baseline-index";
+const BASELINE_TERM_HEADER = "x-rewind-baseline-term";
+// "1" → birth the local group with this node as a non-voting LEARNER (joining an
+// existing group learner-first) instead of a voter from the static voter set.
+const JOIN_LEARNER_HEADER = "x-rewind-join-as-learner";
 
 /// Source-side marker key (in the tenant's own `inst.kv`) holding the
 /// destination node list — comma-separated base URLs, leader first — while a
@@ -140,8 +149,12 @@ pub fn tryHandleV2(
         try handleConfChange(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-confstate")) {
         try handleConfState(server, allocator, worker, ent, sid, sess, method, path);
+    } else if (std.mem.eql(u8, sys_rest, "v2-member-status")) {
+        try handleMemberStatus(server, allocator, worker, ent, sid, sess, method, path);
     } else if (std.mem.eql(u8, sys_rest, "v2-applied-baseline")) {
         try handleAppliedBaseline(server, allocator, worker, ent, sid, sess, method, path);
+    } else if (std.mem.eql(u8, sys_rest, "v2-last-index")) {
+        try handleLastIndex(server, allocator, worker, ent, sid, sess, method, path);
     } else if (std.mem.eql(u8, sys_rest, "v2-load-replace")) {
         try handleLoadReplace(server, allocator, worker, ent, sid, sess, method, rh, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-apply-snapshot")) {
@@ -451,10 +464,47 @@ fn handleAttach(
 
     const gid = worker.raft.registerTenant(tenant) catch
         return reply(server, allocator, ent, sid, sess, 500, "register failed\n");
-    worker.raft.createGroupEpoch(gid, 1) catch |err| switch (err) {
-        error.GroupExists => {}, // idempotent re-attach
-        else => return reply(server, allocator, ent, sid, sess, 500, "group attach failed\n"),
-    };
+    // A reconciler bootstrap supplies the leader's baseline {index, term} so the
+    // group is created already at that baseline (atomic) rather than at an empty
+    // last_index 0 — eliminating the attach→apply-snapshot window where a leader
+    // heartbeat carrying commit > 0 would crash the fresh group. Plain attach
+    // (moves, empty-attach) omits the headers and creates at epoch with no baseline.
+    // Baseline headers: ABSENT → no baseline (plain attach). PRESENT but
+    // unparseable → hard 400. A malformed header must NEVER silently collapse
+    // to "no baseline" (catch 0) and route the reconciler bootstrap into the
+    // last_index-0 birth path — the exact crash window documented above.
+    const baseline_index: u64 = if (respb.findHeader(rh, BASELINE_INDEX_HEADER)) |s|
+        (std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch
+            return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ BASELINE_INDEX_HEADER ++ "\n"))
+    else
+        0;
+    const baseline_term: u64 = if (respb.findHeader(rh, BASELINE_TERM_HEADER)) |s|
+        (std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch
+            return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ BASELINE_TERM_HEADER ++ "\n"))
+    else
+        0;
+    // INVARIANT: a baseline at index>0 must carry a real term (a term-0 baseline
+    // crashes raft's restore — Bridge.InvalidBaseline enforces the same at install).
+    if (baseline_index > 0 and baseline_term == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "baseline index>0 requires a nonzero term\n");
+    // Join an EXISTING group as a non-voting learner (the reconciler adds a node
+    // learner-first: a born-voter would campaign past a high-term leader and
+    // deadlock). The leader must already hold the matching AddLearner conf-change.
+    const join_as_learner = if (respb.findHeader(rh, JOIN_LEARNER_HEADER)) |s|
+        std.mem.eql(u8, std.mem.trim(u8, s, " "), "1")
+    else
+        false;
+    if (baseline_index > 0) {
+        worker.raft.createGroupAtBaseline(gid, 1, baseline_index, baseline_term, join_as_learner) catch |err| switch (err) {
+            error.GroupExists => {}, // idempotent re-attach
+            else => return reply(server, allocator, ent, sid, sess, 500, "group attach (baseline) failed\n"),
+        };
+    } else {
+        worker.raft.createGroupEpoch(gid, 1) catch |err| switch (err) {
+            error.GroupExists => {}, // idempotent re-attach
+            else => return reply(server, allocator, ent, sid, sess, 500, "group attach failed\n"),
+        };
+    }
     try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
 }
 
@@ -924,6 +974,10 @@ fn handleConfChange(
     const v = parsed.value;
     if (v.tenant.len == 0)
         return reply(server, allocator, ent, sid, sess, 400, "empty tenant\n");
+    // node id 0 is raft's invalid/sentinel id — reject rather than forward it
+    // into proposeConfChange where it would target a nonexistent member.
+    if (v.node_id == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "node_id must be nonzero\n");
     const cc_type: u8 =
         if (std.mem.eql(u8, v.op, "demote") or std.mem.eql(u8, v.op, "add")) 2 else if (std.mem.eql(u8, v.op, "promote")) 0 else if (std.mem.eql(u8, v.op, "remove")) 1 else return reply(server, allocator, ent, sid, sess, 400, "op must be demote|promote|add|remove\n");
     const gid = worker.raft.gidForTenant(v.tenant) orelse
@@ -978,6 +1032,69 @@ fn handleConfState(
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
 }
 
+/// `GET /_system/v2-member-status?tenant=` → the LEADER's per-peer replication
+/// view — the membership reconciler's "is node N a caught-up member" signal,
+/// which `v2-confstate` alone can't give (a phantom voter shows in `voters`
+/// with `matched=0`). Shape:
+///   {"leader_last":N,"voters":[…],"learners":[…],
+///    "peers":[{"id":I,"matched":M,"recent_active":B}, …]}
+/// `peers` is the peer VOTERS (self excluded) with their match index + activity;
+/// combined with `voters`/`learners` (the ConfState) the caller derives, per
+/// desired node, whether it is a caught-up voter (`matched ≈ leader_last &&
+/// recent_active`), a learner, or absent. 409 on a non-leader (only the leader
+/// tracks peer progress — query `v2-leader` first); 404 if the group is not on
+/// this node.
+fn handleMemberStatus(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    path: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "GET"))
+        return reply(server, allocator, ent, sid, sess, 405, "GET only\n");
+    const tenant = queryParam(path, "tenant") orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing ?tenant\n");
+    const gid = worker.raft.gidForTenant(tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
+    var ids: [16]u64 = undefined;
+    var matched: [16]u64 = undefined;
+    var active: [16]u8 = undefined;
+    const vp = worker.raft.voterProgress(gid, &ids, &matched, &active) orelse
+        return reply(server, allocator, ent, sid, sess, 409, "not leader; query v2-leader first\n");
+    var voters_buf: [16]u64 = undefined;
+    var learners_buf: [16]u64 = undefined;
+    const cs = worker.raft.confState(gid, &voters_buf, &learners_buf);
+    const voters: []const u64 = if (cs) |c| c.voters else &.{};
+    const learners: []const u64 = if (cs) |c| c.learners else &.{};
+
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var w = buf.writer(allocator);
+    w.print("{{\"leader_last\":{d},\"voters\":[", .{vp.leader_last}) catch
+        return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    for (voters, 0..) |id, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        w.print("{d}", .{id}) catch {};
+    }
+    w.writeAll("],\"learners\":[") catch {};
+    for (learners, 0..) |id, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        w.print("{d}", .{id}) catch {};
+    }
+    w.writeAll("],\"peers\":[") catch {};
+    for (0..vp.len) |i| {
+        if (i > 0) w.writeByte(',') catch {};
+        w.print("{{\"id\":{d},\"matched\":{d},\"recent_active\":{}}}", .{ ids[i], matched[i], active[i] != 0 }) catch {};
+    }
+    w.writeAll("]}\n") catch {};
+    const out = buf.toOwnedSlice(allocator) catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
+}
+
 // ── promote-back: out-of-band rejoin of a below-floor learner (Ph2) ──
 //
 // A node auto-demoted to a learner that then fell below the WAL-compaction
@@ -1019,8 +1136,50 @@ fn handleAppliedBaseline(
         return reply(server, allocator, ent, sid, sess, 404, "unknown tenant\n");
     const index = inst.kv.lastAppliedRaftIdx() catch
         return reply(server, allocator, ent, sid, sess, 500, "applied-index read failed\n");
-    const term = worker.raft.logTerm(gid, index);
+    // A baseline is the pair {index, term-of-the-log-entry-at-index}. logTerm now
+    // returns null when the leader's own log can't resolve a term for `index` (it
+    // is beyond last_index, below the compaction floor, or the store watermark has
+    // drifted ahead of the raft log) — there is NO valid baseline to hand out.
+    // Handing back {index, term:0} would feed an OUT-OF-BAND snapshot a bogus term,
+    // which raft-rs's `restore` treats as a same-term match and fast-forwards
+    // `commit_to(index)` past the follower's empty log → `fatal!`. Refuse instead:
+    // the reconciler retries once the leader's log covers its watermark. null is
+    // DISTINCT from a genuine term 0 (the genesis index) — the error channel no
+    // longer collapses "no term" into a fake 0 — so the abort only ever fires on a
+    // real invariant break, exactly as it should.
+    const term = worker.raft.logTerm(gid, index) orelse
+        return reply(server, allocator, ent, sid, sess, 409, "no term-valid baseline (leader log does not cover the applied index)\n");
     const out = std.fmt.allocPrint(allocator, "{{\"index\":{d},\"term\":{d}}}\n", .{ index, term }) catch
+        return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
+}
+
+/// `GET /_system/v2-last-index?tenant=` → `{"last_index":N}` — this node's local
+/// raft last log index for the group. UNLIKE `v2-applied-baseline` this is NOT
+/// leader-gated, so a LEARNER (never the leader) can report its own catch-up. The
+/// reconciler gates learner→promote on it vs the leader's `leader_last`. Why
+/// last_index (not the commit-seq atomic or the store watermark): an out-of-band
+/// baseline (`apply_local_snapshot`) advances `last_index` directly, so a born-
+/// learner is "caught up" the moment its baseline lands — whereas commit-seq only
+/// moves on freshly committed entries (a quiescent learner would never trip it),
+/// and the store watermark is pre-seeded by the bundle (high before any replay).
+fn handleLastIndex(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    path: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "GET"))
+        return reply(server, allocator, ent, sid, sess, 405, "GET only\n");
+    const tenant = queryParam(path, "tenant") orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing ?tenant\n");
+    const gid = worker.raft.gidForTenant(tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
+    const out = std.fmt.allocPrint(allocator, "{{\"last_index\":{d}}}\n", .{worker.raft.lastIndex(gid)}) catch
         return reply(server, allocator, ent, sid, sess, 500, "oom\n");
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
 }
@@ -1095,6 +1254,13 @@ fn handleApplySnapshot(
     ) catch return reply(server, allocator, ent, sid, sess, 400, "expected {tenant, index, term}\n");
     defer parsed.deinit();
     const v = parsed.value;
+    // A data-free baseline must be a real {index>0, term>0} pair. index 0 is a
+    // no-op (nothing ahead of committed) and term 0 crashes raft's restore —
+    // reject both at the door instead of relying on the downstream SnapshotStale.
+    if (v.index == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "index must be nonzero\n");
+    if (v.term == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "index>0 requires a nonzero term\n");
     const gid = worker.raft.gidForTenant(v.tenant) orelse
         return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
     if (worker.raft.isLeaderOf(gid))

@@ -218,6 +218,10 @@ const Router = struct {
     /// `REWIND_ACME_DIRECTORY` is unset. Serves `/_cp/acme-challenge?token=`
     /// from its in-memory challenge store.
     acme: ?*acme_issuer.Handle = null,
+    /// Opt-in: run the additive membership reconciler each reconcile tick
+    /// (`REWIND_CP_RECONCILE_MEMBERSHIP=1`). OFF by default — a continuous
+    /// unattended actor on prod must be deliberately enabled.
+    reconcile_membership: bool = false,
 
     /// Reply helper: set an immediate status (no body) on the request
     /// entity and move it to response_in.
@@ -472,7 +476,8 @@ const Router = struct {
         const is_plan = std.mem.eql(u8, path, "/_control/plan");
         const is_host = std.mem.eql(u8, path, "/_control/host");
         const is_cert = std.mem.eql(u8, path, "/_control/cert");
-        if (!(is_move or is_move_live or is_provision or is_plan or is_host or is_cert) or !std.mem.eql(u8, method_s, "POST")) {
+        const is_cluster = std.mem.eql(u8, path, "/_control/cluster");
+        if (!(is_move or is_move_live or is_provision or is_plan or is_host or is_cert or is_cluster) or !std.mem.eql(u8, method_s, "POST")) {
             try replyStatus(server, ent, sid, sess, 404);
             return;
         }
@@ -503,12 +508,43 @@ const Router = struct {
             try self.handleHost(server, ent, sid, sess, body)
         else if (is_cert)
             try self.handleCert(server, ent, sid, sess, body)
+        else if (is_cluster)
+            try self.handleCluster(server, ent, sid, sess, body)
         else if (is_provision)
             try self.handleProvision(server, ent, sid, sess, body)
         else if (is_move_live)
             try self.handleMoveLive(server, ent, sid, sess, body)
         else
             try self.handleMove(server, ent, sid, sess, body);
+    }
+
+    /// `POST /_control/cluster {id, nodes:[url,…]}` — define/update a cluster's
+    /// node set (the runtime "grow" primitive: add a node to a cluster so the
+    /// membership reconciler backfills the placed tenants onto it). A directory
+    /// WRITE: leader-gated (a follower already forwarded above), replicated via
+    /// `addCluster`. Idempotent — re-defining with the same nodes is a no-op
+    /// apply. NOTE: node identity is currently positional (`nodes[i]` ↔ raft id
+    /// i+1), matching `REWIND_VOTERS`; the explicit-id model is the SSOT cleanup.
+    fn handleCluster(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
+        const a = self.allocator;
+        var parsed = std.json.parseFromSlice(struct {
+            id: []const u8,
+            nodes: []const []const u8,
+        }, a, body, .{ .ignore_unknown_fields = true }) catch {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        };
+        defer parsed.deinit();
+        if (parsed.value.id.len == 0 or parsed.value.nodes.len == 0) {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        }
+        self.directory.addCluster(parsed.value.id, parsed.value.nodes) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        std.log.info("rewind-cp: cluster {s} set to {d} node(s)", .{ parsed.value.id, parsed.value.nodes.len });
+        try replyStatus(server, ent, sid, sess, 204);
     }
 
     /// `POST /_control/provision {tenant, cluster, host?}` — stand up a
@@ -1084,6 +1120,50 @@ const Router = struct {
         }
     }
 
+    /// Additive membership reconciler (Phase 4, opt-in `reconcile_membership`).
+    /// On the directory leader, converge each placed tenant's DP group
+    /// membership to its cluster's node set: for the first not-caught-up node
+    /// per group per pass, take a LEARNER-FIRST `ensureMember` step. ADDITIVE
+    /// ONLY — never removes/migrates/destroys; skips `moving` tenants (defers to
+    /// an in-flight move). Blocking HTTP on the loop (like `reconcileStuckMoves`),
+    /// bounded to one node per group per pass.
+    fn reconcileMembership(self: *Router) void {
+        if (!self.reconcile_membership) return;
+        if (!self.directory.isLeader()) return; // single writer
+        const a = self.allocator;
+        const tenants = self.directory.listPlacements(a) catch return;
+        defer {
+            for (tenants) |t| a.free(t);
+            a.free(tenants);
+        }
+        for (tenants) |tenant| {
+            // resolveOwned (not resolve): the node set is held across the blocking
+            // backendCalls below, and a concurrent re-address (applyClusterLocal on
+            // the pump thread — exactly the /_control/cluster grow that adds a
+            // node) frees `resolve`'s projection-aliased slice → use-after-free.
+            // The owned copy is taken under the directory lock.
+            var res = (self.directory.resolveOwned(a, tenant) catch continue) orelse continue;
+            defer res.deinit(a);
+            if (res.moving) continue; // defer to an in-flight move
+            const nodes = res.nodes;
+            if (nodes.len == 0) continue;
+            const leader_url = self.findDestLeaderUrl(nodes, tenant) orelse continue;
+            defer a.free(leader_url);
+            // One membership CHANGE per group per pass: a node that's already
+            // good (.done) → check the next; a transient failure (.failed) →
+            // try the NEXT node (a single unreachable node must not starve the
+            // rest of the cluster from being backfilled); a real mutation
+            // (.progressed) → stop and re-observe next pass.
+            for (nodes, 0..) |node_url, i| {
+                const node_id: u64 = @intCast(i + 1); // POSITIONAL id (nodes[i] ↔ raft id i+1)
+                switch (self.ensureMember(tenant, node_url, node_id, leader_url)) {
+                    .done, .failed => continue,
+                    .progressed => break,
+                }
+            }
+        }
+    }
+
     // ── Zero-downtime move (Phase 7 slice c) ─────────────────────────
 
     /// Orchestrate a ZERO-DOWNTIME tenant move — the source keeps serving the
@@ -1315,6 +1395,224 @@ const Router = struct {
     /// Blocking libcurl call to a backend's move surface, presenting the
     /// move secret plus any `extra_headers` (e.g. `X-Rewind-Tenant`,
     /// `X-Rewind-Plan`). Returns status + an owned copy of the response body.
+    // ── membership reconciler: ensureMember (Phase 3) ───────────────────────
+    //
+    // Composes the proven out-of-band endpoints into a LEARNER-FIRST step
+    // machine that converges a node toward a caught-up voter. Additive/safe:
+    // the only voting-power removal is a demote-to-learner of a STUCK voter (so
+    // it can't disrupt elections while it catches up — the __admin__ lesson);
+    // it never shrinks/migrates/destroys. All over the private CP network via
+    // backendCall (move-secret auto-added). Blocking HTTP on the CP loop, like
+    // reconcileStuckMoves; the reconciler does one node per group per pass.
+    const EnsureResult = enum { done, progressed, failed };
+    /// caught-up tolerance: matched/applied within this of leader_last counts as
+    /// caught up (raft replicates the tail in well under this; avoids flapping
+    /// as leader_last advances on a live group).
+    const RECONCILE_SLACK: u64 = 16;
+    const PeerJson = struct { id: u64 = 0, matched: u64 = 0, recent_active: bool = false };
+    const MemberStatusJson = struct {
+        leader_last: u64 = 0,
+        voters: []const u64 = &.{},
+        learners: []const u64 = &.{},
+        peers: []const PeerJson = &.{},
+    };
+    fn idIn(list: []const u64, id: u64) bool {
+        for (list) |x| if (x == id) return true;
+        return false;
+    }
+
+    /// Advance node `node_id` (at `node_url`) ONE step toward being a caught-up
+    /// voter of `tenant`'s group, talking to `leader_url`. `.done` when already a
+    /// caught-up voter, `.progressed` after a step (re-check next pass), `.failed`
+    /// on a transient error (retry next pass).
+    fn ensureMember(self: *Router, tenant: []const u8, node_url: []const u8, node_id: u64, leader_url: []const u8) EnsureResult {
+        const a = self.allocator;
+        // The leader is trivially a caught-up voter of its own group.
+        if (std.mem.eql(u8, node_url, leader_url)) return .done;
+
+        // 1. Observe the leader's per-peer view.
+        const ms_path = std.fmt.allocPrint(a, "/_system/v2-member-status?tenant={s}", .{tenant}) catch return .failed;
+        defer a.free(ms_path);
+        const ms_resp = self.backendCall(leader_url, ms_path, .GET, "", &.{}) catch return .failed;
+        defer a.free(ms_resp.body);
+        if (ms_resp.status != 200) return .failed;
+        var parsed = std.json.parseFromSlice(MemberStatusJson, a, ms_resp.body, .{ .ignore_unknown_fields = true }) catch return .failed;
+        defer parsed.deinit();
+        const ms = parsed.value;
+
+        const is_voter = idIn(ms.voters, node_id);
+        const is_learner = idIn(ms.learners, node_id);
+        var voter_recent_active = false;
+        if (is_voter) {
+            for (ms.peers) |p| {
+                if (p.id == node_id) {
+                    voter_recent_active = p.recent_active;
+                    if (p.recent_active and p.matched + RECONCILE_SLACK >= ms.leader_last) return .done;
+                    break;
+                }
+            }
+        }
+
+        // OBSERVE whether the node holds a local instance. CRITICAL: distinguish
+        // a CONFIRMED-absent (a clean 404 from a reachable node) from an UNKNOWN
+        // (unreachable / errored / 5xx). A configured voter is removed ONLY when
+        // its absence is confirmed — never on a probe failure, or a merely
+        // rebooting/partitioned healthy voter gets torn out of the config (and a
+        // rolling deploy makes voters transiently unreachable by design).
+        const host = self.nodeGroupState(node_url, tenant);
+        if (host == .unknown) return .failed; // can't observe → never mutate; retry next pass
+
+        if (is_voter) {
+            if (host == .hosted) {
+                // DEMOTE only a STUCK voter — one the leader has NOT heard from
+                // within an election timeout (recent_active=false under
+                // check_quorum: partitioned / dead / campaigning without acking
+                // appends — the __admin__ wall). Demoting it stops it disrupting
+                // elections while it catches up. A RESPONSIVE voter that is merely
+                // BEHIND (recent_active but lagging under write load) is catching
+                // up fine via normal replication and is NOT disrupting elections —
+                // demoting it just churns healthy voters on a busy group (B1).
+                // Leave it; raft replicates the tail.
+                if (!voter_recent_active)
+                    return if (self.reconcileConfChange(leader_url, tenant, node_id, "demote")) .progressed else .failed;
+                return .done; // responsive, just behind — no membership change needed
+            }
+            // host == .absent: a CONFIRMED phantom voter (configured voter,
+            // reachable, NO local instance — wiped or never-formed) is REMOVED,
+            // not bootstrapped in place. Bootstrapping a voter relies on the
+            // leader's Progress.match (stale-HIGH from before the wipe) lining up
+            // with the new baseline EXACTLY — and the leader's heartbeat carries
+            // commit = min(match, committed), so if the node is reborn below that
+            // match raft fatal!s (commit_to out of range). Removing the node drops
+            // the leader's Progress entirely; the next pass re-adds it as a
+            // LEARNER with a FRESH match=0, so the leader can never send a commit
+            // beyond the node's log. The manager's ConfChangeQuorumGuard refuses
+            // any remove that would drop below 2 voters, so this can't lose
+            // quorum. Structural fix — the panic becomes impossible, not unlikely.
+            return if (self.reconcileConfChange(leader_url, tenant, node_id, "remove")) .progressed else .failed;
+        }
+        if (is_learner) {
+            if (host == .absent)
+                return if (self.bootstrapMember(leader_url, node_url, tenant, true)) .progressed else .failed;
+            const last_idx = self.nodeLastIndex(node_url, tenant) orelse return .progressed;
+            if (last_idx + RECONCILE_SLACK >= ms.leader_last)
+                return if (self.reconcileConfChange(leader_url, tenant, node_id, "promote")) .progressed else .failed;
+            return .progressed; // catching up
+        }
+        // Absent from the config entirely: bootstrap as a learner (only if the
+        // node doesn't already host the group) then AddLearner on the leader. The
+        // born-learner idles (no campaign) until the leader's AddLearner lets it
+        // replicate, then it catches up + is promoted next pass.
+        if (host == .absent and !self.bootstrapMember(leader_url, node_url, tenant, true)) return .failed;
+        return if (self.reconcileConfChange(leader_url, tenant, node_id, "add")) .progressed else .failed;
+    }
+
+    const HostState = enum { hosted, absent, unknown };
+    /// Observe whether `node_url` holds a local group instance for `tenant`:
+    /// `.hosted` (confstate 200), `.absent` (a clean 404 — reachable, no
+    /// instance), or `.unknown` (unreachable / error / unexpected status). The
+    /// hosted-vs-absent-vs-unknown distinction is load-bearing: the reconciler
+    /// must never treat "can't reach the node" as "the node is empty".
+    fn nodeGroupState(self: *Router, node_url: []const u8, tenant: []const u8) HostState {
+        const a = self.allocator;
+        const path = std.fmt.allocPrint(a, "/_system/v2-confstate?tenant={s}", .{tenant}) catch return .unknown;
+        defer a.free(path);
+        const resp = self.backendCall(node_url, path, .GET, "", &.{}) catch return .unknown;
+        defer a.free(resp.body);
+        return switch (resp.status) {
+            200 => .hosted,
+            404 => .absent,
+            else => .unknown,
+        };
+    }
+
+    /// `node_url`'s own raft LOG last index for `tenant` (the learner→promote
+    /// catch-up signal), or null. Read from the NON-leader-gated `v2-last-index`
+    /// (a learner is never the leader, so the leader-gated `v2-applied-baseline`
+    /// would 421). This is the raft log's `last_index()` — entries RECEIVED into
+    /// the log, which is the right promote gate: it is compared against the
+    /// leader's own `leader_last` (also `last_index()`), so like is compared with
+    /// like, and a node whose LOG has caught up is a valid voter (raft votes on
+    /// log position, not apply). An out-of-band baseline (`apply_local_snapshot`)
+    /// advances `last_index` directly, unlike the commit-seq atomic or the
+    /// bundle-seeded store watermark, so a quiescent caught-up learner still trips
+    /// the gate. (Earlier this was misnamed/-documented as an "applied/committed
+    /// index" read from a `v2-committed` endpoint — neither exists; B2.)
+    fn nodeLastIndex(self: *Router, node_url: []const u8, tenant: []const u8) ?u64 {
+        const a = self.allocator;
+        const path = std.fmt.allocPrint(a, "/_system/v2-last-index?tenant={s}", .{tenant}) catch return null;
+        defer a.free(path);
+        const resp = self.backendCall(node_url, path, .GET, "", &.{}) catch return null;
+        defer a.free(resp.body);
+        if (resp.status != 200) return null;
+        var p = std.json.parseFromSlice(struct { last_index: u64 = 0 }, a, resp.body, .{ .ignore_unknown_fields = true }) catch return null;
+        defer p.deinit();
+        return p.value.last_index;
+    }
+
+    /// Propose a conf-change (`add`/`promote`/`demote`/`remove`) on `leader_url`.
+    fn reconcileConfChange(self: *Router, leader_url: []const u8, tenant: []const u8, node_id: u64, op: []const u8) bool {
+        const a = self.allocator;
+        const body = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\",\"node_id\":{d},\"op\":\"{s}\"}}", .{ tenant, node_id, op }) catch return false;
+        defer a.free(body);
+        const resp = self.backendCall(leader_url, "/_system/v2-confchange", .POST, body, &.{}) catch return false;
+        defer a.free(resp.body);
+        if (resp.status != 204) {
+            std.log.warn("rewind-cp: reconcile confchange {s} node={d} {s} → {d}", .{ op, node_id, tenant, resp.status });
+            return false;
+        }
+        std.log.info("rewind-cp: reconcile confchange {s} node={d} on {s}", .{ op, node_id, tenant });
+        return true;
+    }
+
+    /// Out-of-band bootstrap of `tenant`'s group onto `node_url`: pull the
+    /// leader's baseline {index,term} + snapshot bundle, attach (create group +
+    /// load) on the node, then install the data-free raft baseline so the leader
+    /// replicates the tail.
+    fn bootstrapMember(self: *Router, leader_url: []const u8, node_url: []const u8, tenant: []const u8, as_learner: bool) bool {
+        const a = self.allocator;
+        const bpath = std.fmt.allocPrint(a, "/_system/v2-applied-baseline?tenant={s}", .{tenant}) catch return false;
+        defer a.free(bpath);
+        const bresp = self.backendCall(leader_url, bpath, .GET, "", &.{}) catch return false;
+        defer a.free(bresp.body);
+        if (bresp.status != 200) return false;
+        var bp = std.json.parseFromSlice(struct { index: u64 = 0, term: u64 = 0 }, a, bresp.body, .{ .ignore_unknown_fields = true }) catch return false;
+        defer bp.deinit();
+
+        const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch return false;
+        defer a.free(tbody);
+        const snap = self.backendCall(leader_url, "/_system/v2-snapshot", .POST, tbody, &.{}) catch return false;
+        defer a.free(snap.body);
+        if (snap.status != 200) return false;
+
+        // Attach AND install the baseline atomically (X-Rewind-Baseline-* headers
+        // → createGroupAtBaseline on the worker). A separate v2-apply-snapshot
+        // POST would leave a window where the freshly-attached empty group
+        // (last_index 0) is reachable; a leader heartbeat carrying commit > 0
+        // arriving in that window crashes raft (commit_to out of range). One
+        // atomic op closes it. The store bundle (snap.body) is loaded by attach
+        // before the group is created, so the baseline's data is already present.
+        const bidx = std.fmt.allocPrint(a, "{d}", .{bp.value.index}) catch return false;
+        defer a.free(bidx);
+        const bterm = std.fmt.allocPrint(a, "{d}", .{bp.value.term}) catch return false;
+        defer a.free(bterm);
+        // Join as a non-voting learner (born-learner) when ADDING this node to
+        // the group — a learner doesn't campaign, so it follows the leader and
+        // catches up instead of deadlocking a high-term group. A configured
+        // VOTER rejoining (fresh_voter_join) omits this → born voter, as before.
+        var th = [_]curl.Header{
+            .{ .name = TENANT_HEADER, .value = tenant },
+            .{ .name = "X-Rewind-Baseline-Index", .value = bidx },
+            .{ .name = "X-Rewind-Baseline-Term", .value = bterm },
+            .{ .name = "X-Rewind-Join-As-Learner", .value = if (as_learner) "1" else "0" },
+        };
+        const ar = self.backendCall(node_url, "/_system/v2-attach", .POST, snap.body, &th) catch return false;
+        defer a.free(ar.body);
+        if (ar.status != 204) return false;
+        std.log.info("rewind-cp: reconcile bootstrapped {s} onto {s} (atomic baseline {d}/{d}, learner={})", .{ tenant, node_url, bp.value.index, bp.value.term, as_learner });
+        return true;
+    }
+
     fn backendCall(
         self: *Router,
         base_url: []const u8,
@@ -1572,7 +1870,18 @@ pub fn main() !void {
         h.join();
     };
 
-    var router = Router{ .allocator = allocator, .directory = directory, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx, .acme = acme_handle };
+    const reconcile_membership = blk: {
+        const v = std.posix.getenv("REWIND_CP_RECONCILE_MEMBERSHIP") orelse break :blk false;
+        break :blk std.mem.eql(u8, std.mem.trim(u8, v, " \t"), "1");
+    };
+    // The reconciler drives every DP membership call through backendCall, which
+    // presents the move secret. Enabling it without REWIND_MOVE_SECRET would
+    // panic on the first tick (move_secret.?). Refuse at boot instead.
+    if (reconcile_membership and move_secret == null) {
+        std.log.err("rewind-cp: REWIND_CP_RECONCILE_MEMBERSHIP=1 requires REWIND_MOVE_SECRET", .{});
+        return error.MissingMoveSecret;
+    }
+    var router = Router{ .allocator = allocator, .directory = directory, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx, .acme = acme_handle, .reconcile_membership = reconcile_membership };
 
     // Periodic stuck-move reconciliation on the directory leader (between
     // request batches; never overlaps a synchronous move — see
@@ -1606,6 +1915,7 @@ pub fn main() !void {
             if (now_ns - last_reconcile_ns > reconcile_period_ns) {
                 last_reconcile_ns = now_ns;
                 router.reconcileStuckMoves();
+                router.reconcileMembership();
             }
         }
     }
