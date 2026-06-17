@@ -853,15 +853,33 @@ pub const Bridge = struct {
         for (batch[0..n]) |cmd| {
             cmd.err = switch (cmd.kind) {
                 .create_group_epoch => blk: {
+                    // INVARIANT (enforced both ends): a baseline at index>0 MUST
+                    // carry a real term. A term-0 baseline makes raft-rs's restore
+                    // fast-forward commit_to past an empty log → fatal!. The producer
+                    // (v2-applied-baseline) refuses to emit one (409); refuse to
+                    // install one too rather than silently birthing a crash-prone group.
+                    if (cmd.snap_index > 0 and cmd.snap_term == 0) {
+                        std.log.err("v2 bridge: refusing term-0 baseline for gid {d} at index {d}", .{ cmd.gid, cmd.snap_index });
+                        break :blk Error.InvalidBaseline;
+                    }
                     _ = self.node.createGroupAtEpoch(cmd.gid, cmd.id_str, cmd.epoch, cmd.as_learner) catch |e| break :blk e;
                     // Atomic baseline (createGroupAtBaseline): install the data-free
                     // snapshot in the SAME pump op as group creation so the fresh
                     // group is never observable at last_index 0 between creation and
                     // baseline. Without this, a leader heartbeat carrying commit > 0
                     // can reach the empty group first and trip raft's commit_to
-                    // fatal! (to_commit out of range [last_index 0]).
-                    if (cmd.snap_index > 0)
-                        self.node.applyLocalSnapshot(cmd.gid, cmd.snap_index, cmd.snap_term) catch |e| break :blk e;
+                    // fatal! (to_commit out of range [last_index 0]). If the install
+                    // fails, TEAR THE HALF-BORN GROUP DOWN — leaving it live at
+                    // last_index 0 is the exact window this path exists to close
+                    // (a labeled break is not an error return, so errdefer won't
+                    // fire here; roll back explicitly).
+                    if (cmd.snap_index > 0) {
+                        self.node.applyLocalSnapshot(cmd.gid, cmd.snap_index, cmd.snap_term) catch |e| {
+                            self.node.destroyGroupAndReclaim(cmd.gid) catch |de|
+                                std.log.err("v2 bridge: rollback of half-born gid {d} failed: {s}", .{ cmd.gid, @errorName(de) });
+                            break :blk e;
+                        };
+                    }
                     break :blk null;
                 },
                 .destroy_group => blk: {
