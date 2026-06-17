@@ -364,14 +364,11 @@ pub const Request = struct {
     /// never via the customer-visible body or query string (the
     /// `{fn,args}` envelope is retired, decisions.md §4.5). Null →
     /// the activation kind's conventional export
-    /// (`rpc_dispatch.defaultExportForKind`). Borrowed slice owned by
+    /// (`rpc_dispatch.defaultExportForKind`). The export is invoked
+    /// with no positional arguments — resume payloads (ctx / outcome)
+    /// ride `body` and the `activation` union. Borrowed slice owned by
     /// the dispatching worker frame.
     fn_override: ?[]const u8 = null,
-    /// Positional-args JSON array literal for `fn_override` calls
-    /// (e.g. `[{...ctx}]`, `[{...ctx},{...outcome}]`). One
-    /// `JS_ParseJSON` + spread on the qjs side. Ignored when
-    /// `fn_override` is null.
-    fn_args_json: []const u8 = "[]",
     /// Wire HTTP headers, lowercase per HTTP/2. Surfaced to JS as
     /// `request.headers` (pseudo-headers filtered) and `request.cookies`.
     /// Null = none supplied (test paths that don't care).

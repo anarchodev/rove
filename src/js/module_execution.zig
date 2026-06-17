@@ -275,10 +275,10 @@ pub fn runMiddleware(
 /// Evaluate the module top-level, drain jobs, look up `exports[fn]`
 /// (fn = the resume path's `Request.fn_override`, else the activation
 /// kind's conventional export — `rpc_dispatch.parseDispatch`), and
-/// call it with positional `args` spread in. The return value
-/// becomes the response body; status/headers/cookies come from the
-/// ambient `response` global. See `Dispatcher.run` for the full
-/// contract.
+/// call it with no positional arguments (resume payloads ride
+/// `request.body` / `request.activation`). The return value becomes
+/// the response body; status/headers/cookies come from the ambient
+/// `response` global. See `Dispatcher.run` for the full contract.
 pub fn runModule(
     d: *Dispatcher,
     rt: *qjs.Runtime,
@@ -291,11 +291,11 @@ pub fn runModule(
     const ns = try evalModule(d, rt, ctx, fun_val_in, budget, pending);
     defer c.JS_FreeValue(ctx.raw, ns);
 
-    // ── Resolve the target export + args for this activation. ─────
-    var dispatch = try rpc_dispatch.parseDispatch(d.allocator, request);
-    defer dispatch.deinit(d.allocator);
+    // ── Resolve the target export for this activation. ─────
+    const fn_name = try rpc_dispatch.parseDispatch(d.allocator, request);
+    defer d.allocator.free(fn_name);
 
-    const fn_name_z = std.fmt.allocPrintSentinel(d.allocator, "{s}", .{dispatch.fn_name}, 0) catch
+    const fn_name_z = std.fmt.allocPrintSentinel(d.allocator, "{s}", .{fn_name}, 0) catch
         return error.OutOfMemory;
     defer d.allocator.free(fn_name_z);
 
@@ -332,59 +332,21 @@ pub fn runModule(
         pending.body = std.fmt.allocPrint(
             d.allocator,
             "module export \"{s}\" not found or not a function\n",
-            .{dispatch.fn_name},
+            .{fn_name},
         ) catch return error.OutOfMemory;
         return;
     }
 
-    // Parse the args array as a single JSON value, then pull each
-    // element by index. Cheaper than re-parsing per element, and
-    // lets qjs handle all the nested-value construction in one pass.
-    //
-    // `JS_ParseJSON` (like `JS_Eval`) reads one byte past the
-    // declared length for UTF-8 validation, so the source MUST be
-    // NUL-terminated. Copy into an allocSentinel buffer.
-    const args_text = dispatch.args_json_text;
-    const args_text_z = d.allocator.allocSentinel(u8, args_text.len, 0) catch
-        return error.OutOfMemory;
-    defer d.allocator.free(args_text_z);
-    @memcpy(args_text_z, args_text);
-    const args_arr = c.JS_ParseJSON(
-        ctx.raw,
-        args_text_z.ptr,
-        args_text.len,
-        "<args>",
-    );
-    defer c.JS_FreeValue(ctx.raw, args_arr);
-    if (c.JS_IsException(args_arr)) {
-        pending.status = 400;
-        pending.body = std.fmt.allocPrint(d.allocator, "args JSON parse failed\n", .{}) catch
-            return error.OutOfMemory;
-        _ = ctx.takeException();
-        return;
-    }
-    const args_len_val = c.JS_GetPropertyStr(ctx.raw, args_arr, "length");
-    defer c.JS_FreeValue(ctx.raw, args_len_val);
-    var args_len: u32 = 0;
-    _ = c.JS_ToUint32(ctx.raw, &args_len, args_len_val);
-
-    const args_js = d.allocator.alloc(c.JSValue, args_len) catch
-        return error.OutOfMemory;
-    defer {
-        for (args_js) |v| c.JS_FreeValue(ctx.raw, v);
-        d.allocator.free(args_js);
-    }
-    var idx: u32 = 0;
-    while (idx < args_len) : (idx += 1) {
-        args_js[idx] = c.JS_GetPropertyUint32(ctx.raw, args_arr, idx);
-    }
-
+    // The export is called with no positional arguments. Resume
+    // payloads (ctx / outcome) ride `request.body` and the typed
+    // `request.activation` union, read through the request surface so
+    // every read is taped (decisions.md §4.5).
     const ret = c.JS_Call(
         ctx.raw,
         handler,
         globals.js_undefined,
-        @intCast(args_js.len),
-        if (args_js.len == 0) null else args_js.ptr,
+        0,
+        null,
     );
     var ret_val: qjs.Value = .{ .raw = ret, .ctx = ctx.raw };
     defer ret_val.deinit();

@@ -2,9 +2,11 @@
 //!
 //! Extracted from `dispatcher.zig`. The platform invokes exactly ONE
 //! export per activation: the resume path's first-class target
-//! (`Request.fn_override` + `Request.fn_args_json`, set by the worker's
-//! resume engines) or, when none is named, the activation kind's
-//! conventional export (`defaultExportForKind`).
+//! (`Request.fn_override`, set by the worker's resume engines) or, when
+//! none is named, the activation kind's conventional export
+//! (`defaultExportForKind`). The export is always called with no
+//! positional arguments — resume payloads ride `request.body` and the
+//! `request.activation` union.
 //!
 //! The former customer-facing `{fn,args}` JSON-body envelope and
 //! `?fn=name&args=` query dispatch are RETIRED (decisions.md §4.5):
@@ -20,59 +22,33 @@ const request_mod = @import("request.zig");
 const Request = request_mod.Request;
 const ActivationSource = request_mod.ActivationSource;
 
-/// Resolved `(fn, args)` for one activation. `args_json_text` is a raw
-/// JSON array literal (e.g. `[]`, `[{...ctx},{...outcome}]`); the
-/// caller does one `JS_ParseJSON` on it and spreads the elements into
-/// the handler call.
-pub const DispatchCall = struct {
-    fn_name: []u8,
-    args_json_text: []u8,
-
-    pub fn deinit(self: *DispatchCall, allocator: std.mem.Allocator) void {
-        allocator.free(self.fn_name);
-        allocator.free(self.args_json_text);
-        self.* = undefined;
-    }
-};
-
+/// Resolve which export an activation invokes. Returns the owned
+/// export name; the platform calls it with no positional arguments —
+/// resume payloads (ctx / outcome) ride `request.body` and the typed
+/// `request.activation` union, read through the request surface so
+/// every read is taped (decisions.md §4.5). Caller owns the returned
+/// slice.
 pub fn parseDispatch(
     allocator: std.mem.Allocator,
     request: Request,
-) error{OutOfMemory}!DispatchCall {
+) error{OutOfMemory}![]u8 {
     // Headers-first dispatch targets `onHeaders` unconditionally, and
     // chunk dispatch targets `onChunk` (gap 2.4) — these are the
     // activation's structural contract; no override applies (no
     // resume engine sets one on them).
-    if (request.activation == .inbound_headers) {
-        const fn_owned = try allocator.dupe(u8, "onHeaders");
-        errdefer allocator.free(fn_owned);
-        return .{ .fn_name = fn_owned, .args_json_text = try allocator.dupe(u8, "[]") };
-    }
-    if (request.activation == .inbound_chunk) {
-        const fn_owned = try allocator.dupe(u8, "onChunk");
-        errdefer allocator.free(fn_owned);
-        return .{ .fn_name = fn_owned, .args_json_text = try allocator.dupe(u8, "[]") };
-    }
+    if (request.activation == .inbound_headers) return allocator.dupe(u8, "onHeaders");
+    if (request.activation == .inbound_chunk) return allocator.dupe(u8, "onChunk");
 
     // Internal resume-path target (send-callback / wake / bound-fetch /
     // subscription / chained dispatch) — first-class on the Request,
     // never parsed out of the body or query.
     if (request.fn_override) |fn_name| {
-        if (fn_name.len > 0) {
-            const fn_owned = try allocator.dupe(u8, fn_name);
-            errdefer allocator.free(fn_owned);
-            return .{
-                .fn_name = fn_owned,
-                .args_json_text = try allocator.dupe(u8, request.fn_args_json),
-            };
-        }
+        if (fn_name.len > 0) return allocator.dupe(u8, fn_name);
     }
 
     // The activation kind's conventional export (handler-surface
     // Phase 4, docs/handler-shape.md §3).
-    const fn_owned = try allocator.dupe(u8, defaultExportForKind(request.activation.source()));
-    errdefer allocator.free(fn_owned);
-    return .{ .fn_name = fn_owned, .args_json_text = try allocator.dupe(u8, "[]") };
+    return allocator.dupe(u8, defaultExportForKind(request.activation.source()));
 }
 
 /// Handler-surface Phase 4: map an activation source to its conventional
@@ -99,40 +75,37 @@ fn defaultExportForKind(src: ActivationSource) []const u8 {
 
 const testing = std.testing;
 
-test "parseDispatch: inbound with no override → default, empty args" {
-    var call = try parseDispatch(testing.allocator, .{
+test "parseDispatch: inbound with no override → default export" {
+    const fn_name = try parseDispatch(testing.allocator, .{
         .method = "POST",
         .path = "/",
         .body = "{\"fn\":\"ignored\",\"args\":[1]}",
-        .query = "fn=also-ignored",
+        .query = "x=also-ignored",
     });
-    defer call.deinit(testing.allocator);
+    defer testing.allocator.free(fn_name);
     // Body and query are opaque payload — the retired envelope shapes
     // must NOT influence dispatch.
-    try testing.expectEqualStrings("default", call.fn_name);
-    try testing.expectEqualStrings("[]", call.args_json_text);
+    try testing.expectEqualStrings("default", fn_name);
 }
 
-test "parseDispatch: fn_override wins and carries its args" {
-    var call = try parseDispatch(testing.allocator, .{
+test "parseDispatch: fn_override wins" {
+    const fn_name = try parseDispatch(testing.allocator, .{
         .method = "POST",
         .path = "/",
         .activation = .send_callback,
         .fn_override = "onCharge",
-        .fn_args_json = "[{\"k\":1},{\"ok\":true}]",
     });
-    defer call.deinit(testing.allocator);
-    try testing.expectEqualStrings("onCharge", call.fn_name);
-    try testing.expectEqualStrings("[{\"k\":1},{\"ok\":true}]", call.args_json_text);
+    defer testing.allocator.free(fn_name);
+    try testing.expectEqualStrings("onCharge", fn_name);
 }
 
 test "parseDispatch: empty fn_override falls back to the conventional export" {
-    var call = try parseDispatch(testing.allocator, .{
+    const fn_name = try parseDispatch(testing.allocator, .{
         .method = "POST",
         .path = "/",
         .activation = .{ .wake_batch = .{} },
         .fn_override = "",
     });
-    defer call.deinit(testing.allocator);
-    try testing.expectEqualStrings("onWake", call.fn_name);
+    defer testing.allocator.free(fn_name);
+    try testing.expectEqualStrings("onWake", fn_name);
 }
