@@ -62,6 +62,7 @@ build break:
 | `49d9974` | Bump raft-rs-zig pin `da0129f → 87ed59e`. |
 | `9d5fc0f` | **A1** (rove half): `Node.logTerm`/`Bridge.logTerm` → `?u64` (the `log_term` control cmd carries an `lt_ok` flag, mirroring `vp_ok`); `v2-applied-baseline` uses `orelse 409` instead of the `term==0` band-aid; pin → `f34e8c6`. |
 | (this branch) | **A2**: `node.applyLocalSnapshot` stamps the store's durable applied watermark (`setLastAppliedRaftIdx`) to the baseline index + bumps `slot.applied_idx`/`durabilized_idx`. **D**: `scripts/raft_soak_prod.py` crash/recovery soak. |
+| (this branch) | **B1**: demote only a STUCK (`!recent_active`) voter, not a responsive-but-lagging one. **B2**: `nodeApplied`→`nodeLastIndex` + corrected comment (the signal was already correct). **B3**: `Directory.resolveOwned` deep-copies the node set under the lock — fixes a re-address UAF in the reconcile pass. |
 
 ## Remaining work
 
@@ -89,24 +90,34 @@ re-applies idempotently on recovery; a store BEHIND loses data. Exercised by
 
 ### B. rove-only (from the first reconciler audit)
 
-**B1 — Demote-on-transient-lag churn (MEDIUM).** `ensureMember`: a hosted voter
-that is `recent_active` but lags more than `RECONCILE_SLACK=16` (a write burst)
-falls through to `demote`. On a busy group this demote/promote-cycles healthy
-voters. Gate the demote on `!recent_active` (genuinely stuck), or widen/relativize
-the slack. `src/cp/main.zig` (`ensureMember`).
+**B1 — Demote-on-transient-lag churn — DONE.** `ensureMember` now demotes a hosted
+voter only when it is NOT `recent_active` (genuinely stuck: partitioned / dead /
+campaigning-without-acking — the __admin__ wall). A responsive voter that is merely
+behind (`recent_active`, lagging under write load) is left alone (`.done`) — it is
+catching up via normal replication and isn't disrupting elections, so demoting it
+only churned healthy voters on a busy group. `src/cp/main.zig`.
 
-**B2 — `nodeApplied` semantics (MEDIUM, verify).** The comment says "applied /
-committed (`v2-committed`)" but the code reads `v2-last-index`/`last_index`. If
-that is log-received rather than applied, the promote gate can fire before the
-learner has applied. Confirm the `v2-last-index` semantics match `leader_last` and
-fix the comment or the signal. `src/cp/main.zig` (`nodeApplied`).
+**B2 — `nodeApplied` semantics — DONE (verified correct; doc/name fixed).** Traced
+`v2-last-index` → the FFI's `raft_log.last_index()` (entries RECEIVED), and
+`leader_last` is the leader's `last_index()` too — so the gate compares like with
+like, and a node whose LOG has caught up is a valid voter (raft votes on log
+position, not apply). The SIGNAL was right; the misleading comment ("applied /
+committed (`v2-committed`)" — no such endpoint) and the name were fixed
+(`nodeApplied` → `nodeLastIndex`). `src/cp/main.zig`.
 
-**B3 — Cluster re-address use-after-free (MEDIUM, verify thread model).**
-`applyClusterLocal` frees the old `nodes` array while a reconcile pass may hold
-`res.cluster.nodes` across blocking HTTP. Safe only if directory apply and the
-reconcile pass are on the same thread (blocking the loop). Confirm; if the
-directory raft applies off-thread, snapshot the node set into pass-local storage.
-`src/cp/main.zig` + `src/cp/directory.zig`.
+**B3 — Cluster re-address use-after-free — DONE (was real).** Confirmed:
+`reconcileMembership` runs on the CP main loop, `applyClusterLocal` (which frees the
+old `nodes` array on re-address — exactly the `/_control/cluster` grow) runs on the
+pump thread under the directory mutex — different threads — and `resolve`'s
+`ClusterRef.nodes` aliases the freed projection (its "stable for its lifetime"
+claim is violated by re-address). Fixed: new `Directory.resolveOwned` deep-copies
+the node set UNDER THE LOCK; the reconciler uses it + `deinit`s per tenant. (A copy
+*after* `resolve` returns wouldn't close it — the array can be freed in the
+unlock→copy window; the copy must be under the lock.) `src/cp/main.zig` +
+`src/cp/directory.zig`. NOTE: the move paths (`reconcileStuckMoves`,
+`handleMoveLive`, `clusterById`) hold `resolve`/`clusterById` refs across blocking
+calls too — same latent UAF, but operator-driven + transient (a re-address mid-move
+is far rarer); left as a follow-up.
 
 **B4 — Lower / informational.** member-status `recent_active` idle false-negative
 (heartbeats keep it true — low); `lastIndex`/`logTerm` = 0 conflation surfaced to
@@ -165,7 +176,9 @@ rename durability.
 2. ~~**A2 (snapshot watermark)** + **D (soak harness)**~~ — DONE (soak green). Still
    open under D: re-run the soak under `dm-flakey` to cover the C1/C2 fsync ordering
    under real power loss.
-3. **B1–B3** — rove reconciler hardening; independent, land anytime.
+3. ~~**B1–B3**~~ — DONE (this branch). Remaining under B: the move-path re-address
+   UAF (`reconcileStuckMoves`/`handleMoveLive`/`clusterById`, operator-driven) and
+   B4 (informational).
 4. **C1/C2/C4** — engine robustness; additive, land + bump.
 5. **B4 / C5** — informational / cosmetic; opportunistic.
 
