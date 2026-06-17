@@ -19,7 +19,7 @@ group spanning three `rewind-cp` nodes. This proves the Slice-2 exit:
       └─ cluster-2 → rewind :19092   (movetenant ends here)
 
 Run S3-first:  `set -a; . ./.env; set +a; python3 scripts/cp_ha_smoke.py`
-Build first:   `zig build rewind && zig build rewind-cp`
+Build first:   `zig build rewind-worker && zig build rewind-cp`
 """
 
 import json
@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from v2_topology import spawn_cp, await_ready, CP_BIN
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin")
-REWIND = os.path.join(BINDIR, "rewind")
+REWIND = os.path.join(BINDIR, "rewind-worker")
 
 # DP cluster HTTP ports.
 P1 = int(os.environ.get("C1_PORT", "19091"))
@@ -209,7 +209,7 @@ def stop_all():
 def main():
     for b in (REWIND, CP_BIN):
         if not os.path.exists(b):
-            raise SystemExit(f"{b} not found — run `zig build rewind && zig build rewind-cp`")
+            raise SystemExit(f"{b} not found — run `zig build rewind-worker && zig build rewind-cp`")
     if not os.environ.get("S3_ENDPOINT"):
         raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
 

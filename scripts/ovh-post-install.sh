@@ -25,7 +25,7 @@ chmod 0600 "/home/$DEPLOY_USER/.ssh/authorized_keys"
 
 # ── runtime deps: shared libs the binaries link + deploy.sh's tools ─────
 # Package names are Debian-12 era; on Debian 13 some carry t64 suffixes
-# (libcurl4t64, liblmdb0t64). After first boot, `ldd ~/.local/bin/rewind`
+# (libcurl4t64, liblmdb0t64). After first boot, `ldd ~/.local/bin/rewind-worker`
 # is the authority on what's missing.
 export DEBIAN_FRONTEND=noninteractive
 apt-get update

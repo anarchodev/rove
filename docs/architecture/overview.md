@@ -20,7 +20,7 @@ Five binaries, each a `zig build` step:
 
 | Binary | Build step | Role | Owns doc |
 |---|---|---|---|
-| **rewind** | `zig build rewind` | The **worker / data-plane node**. Runs the QuickJS (arenajs) handler runtime, hosts a per-tenant `Bridge` over the multi-raft `Node`, serves HTTP/2. One per cluster node. | [consensus-and-storage](consensus-and-storage.md), [effects-and-handlers](effects-and-handlers.md) |
+| **rewind-worker** | `zig build rewind-worker` | The **worker / data-plane node**. Runs the QuickJS (arenajs) handler runtime, hosts a per-tenant `Bridge` over the multi-raft `Node`, serves HTTP/2. One per cluster node. | [consensus-and-storage](consensus-and-storage.md), [effects-and-handlers](effects-and-handlers.md) |
 | **rewind-front** | `zig build rewind-front` | The **front door**. Stateless edge: terminates TLS (own ACME), routes `Host → cluster` via the directory, proxies leader-aware, orchestrates tenant moves. | [routing-and-ingress](routing-and-ingress.md) |
 | **rewind-cp** | `zig build rewind-cp` | The **control plane**. The authoritative tenant directory + provisioning; per-tenant operational state (plan/limits). | [control-plane](control-plane.md) |
 | **files-server-v2** | `zig build files-server-v2` | The **deploy publisher**. Cluster-free: compiles/uploads a deployment, writes the S3 manifest, signals the release. | [deployment-and-logs](deployment-and-logs.md) |

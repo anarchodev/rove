@@ -120,7 +120,7 @@ consistent under customer JS load.
 All three binaries are positional-arg + env-var configured. **Verified against
 `src/{cp,front,rewind}/main.zig` + `src/blob/env.zig` 2026-06-08.**
 
-### 2.1 `rewind` (DP worker) — `rewind <data_dir> <http_port>`
+### 2.1 `rewind-worker` (DP worker) — `rewind-worker <data_dir> <http_port>`
 
 | Env | Meaning |
 |---|---|
@@ -296,7 +296,7 @@ the plan-tier levers (`architecture/control-plane.md`, shipped) +
 2. **OVH Object Storage:** one bucket; create an S3 credential; set
    `S3_KEY_PREFIX_BASE` (e.g. `prod/`). Create the **second-region bucket** for
    interim DR backups.
-3. **Build + ship binaries:** `zig build rewind rewind-cp rewind-front`
+3. **Build + ship binaries:** `zig build rewind-worker rewind-cp rewind-front`
    (ReleaseFast) → `rsync` `rewind`, `rewind-cp`, `rewind-front` to
    `~/.local/bin` on each host.
 4. **Env files:** `~/.config/rove/common.env` (shared) + `~/.config/rove/node.env`

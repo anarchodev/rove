@@ -3,7 +3,7 @@
 
 Proves the full V2 replay arc end to end: a handler that exercises the live
 tape channels deploys + serves, the `rewind` worker CAPTURES the tape and its
-flusher PUTs the request-log batch to S3, a co-spawned `log-server-standalone`
+flusher PUTs the request-log batch to S3, a co-spawned `rewind-logs`
 QUERIES it back out (`/v1/{t}/list` + `/show/{id}`, carrying `kv_tape_b64` /
 `module_tree_b64` / `seed` / `timestamp_ns`), and `scripts/replay_wasm_smoke.mjs`
 (unchanged, cluster-agnostic) composes the `composeReplay`-shaped bundle
@@ -13,15 +13,15 @@ FUNC_ENTER tracing.
 
 The engine gap this closed (commit history): the V2 `rewind` worker captured
 tapes but wrote request-log batches to a LOCAL `FsBatchStore`, while the only
-tape-query binary, `log-server-standalone`, reads S3-only — writer (fs) and
+tape-query binary, `rewind-logs`, reads S3-only — writer (fs) and
 reader (S3) never met, so no bundle could be assembled. Fixed by building the
 batch store in `src/rewind/main.zig` from the blob S3 config (the flusher
 thread, spawned by `Worker.create`, was already running) + a per-cluster
 `LOG_S3_KEY_PREFIX` so the co-spawned indexer reads exactly this run's batches.
 
 Needs S3 env: `set -a; . ./.env; set +a` first.  Also needs `node` (the .mjs
-driver) and a default `zig build` (for `log-server-standalone`).
-Build: `zig build rewind rewind-cp rewind-front files-server-v2` + `zig build`
+driver) and a default `zig build` (for `rewind-logs`).
+Build: `zig build rewind-worker rewind-cp rewind-front` + `zig build`
 """
 
 from __future__ import annotations
@@ -147,10 +147,10 @@ def main() -> int:
 
             # ── step 4: the captured tape is QUERYABLE back out of S3. ──────
             # rewind's flusher PUTs request-log/tape batches to the S3 batch
-            # store; a co-spawned log-server-standalone (same bucket + per-run
+            # store; a co-spawned rewind-logs (same bucket + per-run
             # LOG_S3_KEY_PREFIX) LISTs + serves them. This is the writer↔reader
             # meeting that gap D closed (was fs-write vs S3-read).
-            print("step 4: ⭐ query the captured tape back via log-server-standalone")
+            print("step 4: ⭐ query the captured tape back via rewind-logs")
             c.spawn_log_server()
             recs = []
             deadline = time.time() + 30.0
@@ -192,31 +192,23 @@ def main() -> int:
                 # ── step 5: compose the replay bundle + run the WASM driver. ─
                 if tapes.get("kv_tape_b64"):
                     print("step 5: ⭐ compose a replay bundle + run the WASM driver")
-                    dep_hex = f"{rec['deployment_id']:016x}"
-                    jwt_hdr = {"Authorization": f"Bearer {c.services_jwt}"}
-                    mf = _curl(f"{c.files_origin()}/{TENANT}/deployments/{dep_hex}",
-                               headers=jwt_hdr)
-                    handler_entries = []
-                    if mf.status == 200:
-                        try:
-                            handler_entries = [e for e in json.loads(mf.body).get("entries", [])
-                                               if e.get("kind") == "handler"]
-                        except json.JSONDecodeError:
-                            pass
-                    check(f"manifest dep_id={dep_hex} has handler entries",
-                          bool(handler_entries), f"got {mf.status} {mf.body[:120]!r}")
-
-                    modules = []
-                    for e in handler_entries:
-                        src = _curl(f"{c.files_origin()}/{TENANT}/source/{e['hash']}",
-                                    headers=jwt_hdr)
-                        if src.status != 200:
-                            check(f"source fetch {e['path']}", False,
-                                  f"got {src.status}")
-                            handler_entries = []
-                            break
-                        modules.append({"path": e["path"], "hash": e["hash"],
-                                        "source": src.body})
+                    # files-server is dissolved (docs/rewind-cli-plan.md §4),
+                    # so there's no /deployments + /source read-back surface.
+                    # The smoke already HAS the deployed source locally, so
+                    # compose the replay bundle from it directly — the hash is
+                    # just sha256 of the source bytes (what stageDeployment
+                    # content-addresses on).
+                    import hashlib
+                    deployed = {"index.mjs": rpc_wrap(HANDLER_SRC)}
+                    handler_entries = [
+                        {"path": p, "hash": hashlib.sha256(s.encode()).hexdigest(),
+                         "kind": "handler"}
+                        for p, s in deployed.items()
+                    ]
+                    modules = [{"path": p, "hash": e["hash"], "source": s}
+                               for (p, s), e in zip(deployed.items(), handler_entries)]
+                    check("composed replay bundle from local source",
+                          bool(handler_entries), f"entries={len(handler_entries)}")
 
                     if handler_entries:
                         entry_path = next((e["path"] for e in handler_entries

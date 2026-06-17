@@ -228,10 +228,20 @@ fn workerMain(args: *WorkerCtx) !void {
     });
     defer worker.destroy();
 
+    // Background compile+stage thread for `/_system/deploy`
+    // (docs/rewind-cli-plan.md §4 — files-server dissolution). Owns its
+    // own QuickJS runtime so it never races the poll-loop compiler.
+    try worker.startDeployThread();
+
     std.log.info("rewind worker {d}: ready (SO_REUSEPORT)", .{args.worker_idx});
     args.ready.set();
 
     var blocked_tenants: rjs.BlockedTenants = .{};
+    // Deploy capability is bootstrapped explicitly via `POST /_system/reset`
+    // (rewind-cli-plan §4) — the operator/harness deploys the baked `__admin__`
+    // app once, then publishes the full admin + customers THROUGH it. The same
+    // endpoint is break-glass (re-run to recover a bricked control tenant). No
+    // auto-deploy-on-boot magic.
     while (!stop_flag.load(.acquire)) {
         worker.pollWithTimeout(1 * std.time.ns_per_ms) catch |err| switch (err) {
             error.SignalInterrupt => continue,
@@ -624,7 +634,7 @@ pub fn main() !void {
     try bridge.startPump();
 
     // Per-tenant request-log / tape batches → S3. The only tape-query surface,
-    // `log-server-standalone`, reads S3-only (its indexer LISTs + serves
+    // `rewind-logs`, reads S3-only (its indexer LISTs + serves
     // `/v1/{tenant}/list` + `/show`), so a local `FsBatchStore` would be
     // unreadable by it — writer (fs) and reader (S3) never met, which is why
     // captured tapes could never be queried back out for replay. Build the

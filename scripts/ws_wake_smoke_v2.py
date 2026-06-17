@@ -14,7 +14,7 @@ Asserts:
   3. `timer` → on.timer armed, reply "armed", then "tick" within ~2s
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
-Binaries: `zig build rewind rewind-cp rewind-front files-server-v2`.
+Binaries: `zig build rewind-worker rewind-cp rewind-front`.
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 //! Filesystem `BatchStore` backend. Files live at
 //! `{base_dir}/{key}` — keys are hierarchical (`{tenant}/{node}/{batch}.{ext}`)
 //! so the on-disk layout mirrors S3 exactly. Used by the cross-
-//! process worker → log-server-standalone path when the operator
+//! process worker → rewind-logs path when the operator
 //! hasn't wired S3 (typical local dev / smoke).
 //!
 //! Phase 5.5(a) step 3 originally retired the on-disk batch store

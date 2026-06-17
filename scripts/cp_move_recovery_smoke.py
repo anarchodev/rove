@@ -30,7 +30,7 @@ crash durability.
       └─ cluster-bh  → :19042           (black hole — makes the dest attach hang)
 
 Run S3-first:  `set -a; . ./.env; set +a; python3 scripts/cp_move_recovery_smoke.py`
-Build first:   `zig build rewind && zig build rewind-cp`
+Build first:   `zig build rewind-worker && zig build rewind-cp`
 """
 
 import json
@@ -46,7 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from v2_topology import spawn_cp, await_ready, CP_BIN
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin")
-REWIND = os.path.join(BINDIR, "rewind")
+REWIND = os.path.join(BINDIR, "rewind-worker")
 
 P1 = 19041            # cluster-1 (source, real)
 PBH = 19042           # cluster-bh (dest) — black hole
@@ -226,7 +226,7 @@ def stop_all():
 def main():
     for b in (REWIND, CP_BIN):
         if not os.path.exists(b):
-            raise SystemExit(f"{b} not found — run `zig build rewind && zig build rewind-cp`")
+            raise SystemExit(f"{b} not found — run `zig build rewind-worker && zig build rewind-cp`")
     if not os.environ.get("S3_ENDPOINT"):
         raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
 
