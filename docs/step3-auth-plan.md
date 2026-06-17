@@ -152,16 +152,20 @@ that rides Track B. **None of A1–A3 needed OIDC.**
 
 ## Track B — operator OIDC plane (gated on `__auth__` deploy)
 
-> **Status (2026-06-16):** **B1 done at the local/cluster level + verified.**
-> `scripts/oidc_smoke_v2.py` stands up `__auth__` on a V2 cluster end-to-end —
-> provision + deploy the real `web/auth` app, discovery (host-relative `iss`,
-> RS256+S256), magic-link login, PKCE authorization-code, `/token`, **id_token
-> RS256-verified against the published JWKS**, refresh grant (10/10 green). The
-> IdP plumbing is all wired (config-mirror, keyset genesis/rotation, wildcard
-> host routing). What remains for B1 is the **production publish** of `__auth__`
-> (a `/publish` of the `web/auth` bundle to the real cluster — billed, gated)
-> plus prod config (resend key for real magic-link email, operator allowlist).
-> B2–B5 then fall out.
+> **Status (2026-06-16):** **B1 + B2 done at the local/cluster level + verified.**
+> `scripts/oidc_smoke_v2.py` stands up `__auth__` end-to-end (discovery,
+> magic-link, PKCE auth-code, `/token`, **id_token RS256-verified vs JWKS**,
+> refresh — 10/10). `scripts/oidc_rp_smoke_v2.py` then lights up the **dashboard
+> RP**: `__auth__` (IdP) + `web/admin` (RP) with the full handshake — `/_rp/login`
+> → IdP `/authorize` → magic-link → `/_rp/callback` → poll → session — operator
+> → **is_root:true**, non-operator → **is_root:false**. Required new harness
+> support: a second, TLS-terminating front (`spawn(tls_idp=True)`) because the
+> RP token exchange is server-side and the IdP signs `https` issuers (§0); the
+> worker tenant door pins RP→IdP to it. What remains for B1/B2 is the
+> **production publish** of `__auth__` + `web/admin` (a `/publish` to the real
+> TLS cluster — billed, gated) + prod config (resend key, operator allowlist).
+> B3–B5 then fall out, and **A5** (route admin logs through the door) is now
+> testable on the B2 harness.
 
 ### B1. Deploy the `__auth__` IdP tenant — *S (deploy, not build)* — ✅ local/verified
 The app is written (`web/auth/index.mjs`): magic-link authN + dogfooded
@@ -178,11 +182,18 @@ else in B. The chicken-and-egg the customer CLI waits on dissolves here.
 > the actual prod publish. The V1 `scripts/oidc_smoke.py` (retired loop46) is
 > superseded by `oidc_smoke_v2.py`.
 
-### B2. Light up the admin dashboard end-to-end — *S*
-The RP guard (`_middlewares/index.mjs:33`) and token exchange
-(`_rp/complete.mjs`) are written. Once B1 exists, deploy the full
-`web/admin/` app against it and verify the OIDC login → session-cookie →
-guarded RPC loop. Depends on B1.
+### B2. Light up the admin dashboard end-to-end — *S* — ✅ local/verified
+The RP guard (`_middlewares/index.mjs`) and token exchange (`_rp/complete.mjs`,
+`_rp/jwks.mjs`) are written. **Verified locally** by
+`scripts/oidc_rp_smoke_v2.py`: deploy `web/admin` to `__admin__`, seed the RP
+config + operator allowlist (via the `v2-kv` seam), and drive the full OIDC
+login → session-cookie → guarded `/v1/session` loop (operator is_root, customer
+not). Needed the **TLS-front smoke harness** (the RP→IdP token exchange is
+server-side and the IdP signs `https` issuers, so the hop must ride real TLS;
+the door pins it to a second TLS front). Note: only the `web/admin` *handler*
+files were exercised; the browser SPA (`_static/api.js`) is still stale vs the
+dissolved files-server — its cleanup + the **A5** log-chokepoint wiring both
+ride this same admin-app surface and harness next.
 
 ### B3. Retire `ADMIN_OPS_SECRET` — *S*
 Fold `web/admin_interim/`'s `/ops/assign-domain` + `/ops/resolve-domain`
