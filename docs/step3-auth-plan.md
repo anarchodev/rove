@@ -17,6 +17,33 @@ Locked decisions live in `architecture/auth-and-domains.md` (the
 two-planes model, `platform.scope` cross-tenant grant, no `X-Rove-Scope`)
 and `decisions.md`. Don't re-litigate those here.
 
+## Milestone (2026-06-17) — the security-critical arc is done + verified
+
+Built + locally verified on `worktree-docs+rewind-cli-plan` (24 commits,
+unpushed):
+- **Track A — COMPLETE (A1–A6).** The audit's cross-tenant log-read hole is
+  closed end-to-end: the log-server rejects non-tenant-scoped tokens (A4), the
+  worker mints scoped `logs-read` caps only for `__admin__` via the
+  `rewind-logs.internal` door (A2/A3), and the dashboard reads logs through that
+  operator-gated chokepoint with no browser token (A5). A platform dispatcher
+  fix (continuations skip middleware; resume walk-up) was required and shipped.
+- **Track B operator plane — done:** `__auth__` IdP stood up (B1), dashboard RP
+  login (B2), `ADMIN_OPS_SECRET` retired via CP-owned domain alias (B3), the
+  `rewind-cp.internal` door for operator CP ops via the dashboard (B4). Plus
+  **B5a** (the RFC 8628 device grant — the CLI login mechanism) and the
+  `publishRelease` ownership gate.
+- Each verified by a smoke (`log_tenant_scope`, `logs_door`, `oidc_smoke`,
+  `oidc_rp_smoke` + the `tls_idp` harness); `zig build test` green.
+
+**Not done (the next arcs, deliberately deferred):**
+1. **Prod publish** of `web/auth` + `web/admin` (gated `/publish`) — makes B1–B4
+   real and unblocks the B4 *delivery* (move-secret off the operator shell).
+2. **B5 customer-auth crux** — the `rewind` CLI + the cap-mint fork + the
+   customer deploy surface (partly gated on §4.1). Design holistically; see B5.
+3. **`cp-desired-state-target.md`** — the north star (CP owns all desired-state
+   incl. release; one S2S key; root token retires). The largest arc.
+4. `web/admin/_static/api.js` files-server cleanup (separate, pre-existing).
+
 ## What already exists (the ledger)
 
 | Piece | Where | State |
@@ -255,12 +282,32 @@ cap after one login.
   auto-approves a pre-filled link; the `device_code` arm in `/token`). Verified
   end-to-end by `scripts/oidc_smoke_v2.py` (codes → pending → approve → tokens →
   single-use). This is the CLI's login mechanism.
-- **Remaining:** the `src/cli/rewind` binary (`login` via device grant + verbs),
-  a **session→tenant-scoped-cap mint** (ownership-checked), an ownership check on
-  `publishRelease`, and a **customer deploy surface** (the open fork: a new
-  customer-scoped endpoint vs the in-progress §4.1 admin deploy-app). Worker
-  rename (§6) is already done. Verbs ride `common.zig` (the bundle classifier is
-  shared).
+- **`publishRelease` ownership gate — ✅ done/verified.** It checked *nothing*
+  (any session could release any tenant); now operator (is_root) → any, else
+  owner-only (`ownedInstances`), gate before the existence check. Verified in
+  `oidc_rp_smoke_v2` (operator → 404 not-found, non-owner → 403).
+- **Remaining — the customer-auth crux (a coherent next arc, partly gated on
+  §4.1 + the prod deploy):** the `src/cli/rewind` binary (`login` via device
+  grant + verbs over `common.zig`), the **cap-mint** (the genuine fork — see
+  below), and the **customer deploy surface** (new customer-scoped endpoint vs
+  the in-progress §4.1 admin deploy-app). The §6 worker rename is already done.
+
+  **The cap-mint is a real design fork**, surfaced 2026-06-17 (a held cap is
+  useless without consumers, and the HMAC is worker-only — `jwt.js` decodes
+  only):
+  - *Held-cap model* (literal "cap"): a 4th **mint-door** (worker signs) + the
+    admin guard accepting a CLI bearer to authorize the mint + the deploy/release
+    worker endpoints learning to verify customer tenant-caps. Most of B5's
+    engine; the mint alone ships nothing.
+  - *Gateway model* (reuses A5/B4 + the ownership gate above): the CLI presents
+    its OIDC **id_token** to the admin endpoints; the admin ownership-gates and
+    mints door-caps server-side (no customer-held cap). Less surface — but the
+    **synchronous** admin guard must *verify* a bearer id_token (RS256 vs
+    `__auth__`'s rotating JWKS), and JWKS verification is inherently async (why
+    the RP flow uses `webhook.send`→`completeJwks`). So it has its own complexity.
+
+  Design these together (cap-vs-gateway + the deploy surface + the CLI), not
+  piecemeal.
 
 **Track B exit:** an operator holds **one** thing day-to-day — their
 dashboard login. One internal HMAC signs every short-lived scoped token;
