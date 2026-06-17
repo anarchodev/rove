@@ -35,6 +35,28 @@ function _b64urlRandom(n) {
   return base64url.encode(b);
 }
 
+// RFC 8628 §6.1 user_code: short, human-typeable. 8 chars from a
+// 20-char alphabet (no vowels → no accidental words; no 0/O/1/I/L →
+// no transcription ambiguity), formatted `XXXX-XXXX`. Single-use +
+// ~10-min TTL, and it only NAMES a pending request (not a credential),
+// so the mild modulo bias is irrelevant.
+function _deviceUserCode() {
+  const A = "BCDFGHJKLMNPQRSTVWXZ";
+  const b = new Uint8Array(8);
+  crypto.getRandomValues(b);
+  let s = "";
+  for (let i = 0; i < 8; i++) {
+    if (i === 4) s += "-";
+    s += A[b[i] % A.length];
+  }
+  return s;
+}
+
+function _escHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
 // S256: base64url(SHA-256(ascii(verifier))). crypto.sha256 returns
 // hex; reuse oauth.js's hex.decode bridge.
 function _s256(verifier) {
@@ -70,6 +92,13 @@ class OIDCProvider {
       code_path: config.code_path || ("_oidc/code/" + name),
       at_path: config.at_path || ("_oidc/at/" + name),
       rt_path: config.rt_path || ("_oidc/rt/" + name),
+      // RFC 8628 device grant (the CLI flow). device_path: device_code →
+      // request; device_user_path: user_code → device_code (the /device page
+      // lookup). Codes are short-lived + single-use.
+      device_path: config.device_path || ("_oidc/device/" + name),
+      device_user_path: config.device_user_path || ("_oidc/device_user/" + name),
+      device_ttl_ms: config.device_ttl_ms || 10 * 60 * 1000,
+      device_interval_s: config.device_interval_s || 5,
       code_ttl_ms: config.code_ttl_ms || 60 * 1000,
       id_token_ttl_ms: config.id_token_ttl_ms || 15 * 60 * 1000, // §4.6
       refresh_ttl_ms: config.refresh_ttl_ms || 30 * 24 * 60 * 60 * 1000,
@@ -288,6 +317,14 @@ class OIDCProvider {
     if (m === "POST" && path === "/token") {
       return this._token();
     }
+    // RFC 8628 device grant (the CLI flow): the CLI POSTs here for codes,
+    // the user approves at the login-gated /device confirm page.
+    if (m === "POST" && path === "/device_authorization") {
+      return this._deviceAuth();
+    }
+    if (path === "/device") {
+      return this._deviceVerify();
+    }
     // Internal-routed scheduled key-rotation tick (§4.6). Reached
     // only via the in-cluster webhook.send self-fire; an external POST
     // here is benign — _advance is deadline-gated, so it can't force
@@ -311,9 +348,11 @@ class OIDCProvider {
       issuer: iss,
       authorization_endpoint: iss + "/authorize",
       token_endpoint: iss + "/token",
+      device_authorization_endpoint: iss + "/device_authorization",
       jwks_uri: iss + "/.well-known/jwks.json",
       response_types_supported: ["code"],
-      grant_types_supported: ["authorization_code", "refresh_token"],
+      grant_types_supported: ["authorization_code", "refresh_token",
+        "urn:ietf:params:oauth:grant-type:device_code"],
       subject_types_supported: ["public"],
       id_token_signing_alg_values_supported: ["RS256"],
       code_challenge_methods_supported: ["S256"],
@@ -428,6 +467,122 @@ class OIDCProvider {
     return null;
   }
 
+  // ── RFC 8628 device grant (the CLI flow) ──────────────────────────
+  //
+  // POST /device_authorization: the CLI (no browser/redirect) asks for a
+  // device_code (its polling handle) + a short user_code the human enters in a
+  // browser. The user_code only NAMES a pending request — not a credential.
+  _deviceAuth() {
+    const f = new URLSearchParams(request.body || "");
+    const client_id = f.get("client_id");
+    const scope = f.get("scope") || "openid";
+    const client = this._client(client_id);
+    if (!client) return this._tokenErr("invalid_client", "unknown client_id");
+
+    const device_code = _b64urlRandom(32);
+    const user_code = _deviceUserCode();
+    const now = Date.now();
+    kv.set(this.cfg.device_path + "/" + device_code, JSON.stringify({
+      client_id, scope, user_code, status: "pending", sub: null,
+      exp: now + this.cfg.device_ttl_ms,
+    }));
+    kv.set(this.cfg.device_user_path + "/" + user_code, device_code);
+
+    const iss = this._iss();
+    const verification_uri = iss + "/device";
+    return this._json({
+      device_code,
+      user_code,
+      verification_uri,
+      verification_uri_complete:
+        verification_uri + "?user_code=" + encodeURIComponent(user_code),
+      expires_in: _OIDC_SECONDS(this.cfg.device_ttl_ms),
+      interval: this.cfg.device_interval_s,
+    });
+  }
+
+  _deviceHtml(status, body) {
+    response.status = status;
+    response.headers = { "content-type": "text/html; charset=utf-8" };
+    return "<!doctype html><meta charset=utf-8><title>Link a device</title>" + body;
+  }
+
+  // GET/POST /device — the human verification + EXPLICIT confirm page. The
+  // anti-phishing controls (rewind-cli-plan §… / the device-code phishing
+  // class): (1) require an authenticated IdP session, (2) require a conscious
+  // Approve click that shows the code so the user confirms it matches their
+  // terminal — a pre-filled `?user_code=` link NEVER auto-approves.
+  _deviceVerify() {
+    const sid = request.session && request.session.id;
+    const sess_raw = sid ? kv.get(this.cfg.session_path + "/" + sid) : null;
+    const m = request.method;
+    const reqQuery = new URLSearchParams(request.query || "");
+    if (sess_raw == null) {
+      // No session → bounce to the IdP login, returning here (keep the code).
+      const uc = reqQuery.get("user_code");
+      const here = this._iss() + "/device" +
+        (uc ? "?user_code=" + encodeURIComponent(uc) : "");
+      response.status = 302;
+      response.headers = {
+        location: this.cfg.login_path + "?return_to=" + encodeURIComponent(here),
+      };
+      return null;
+    }
+    const sess = JSON.parse(sess_raw);
+
+    let user_code, action = null;
+    if (m === "POST") {
+      const f = new URLSearchParams(request.body || "");
+      user_code = (f.get("user_code") || "").trim().toUpperCase();
+      action = f.get("action");
+    } else {
+      user_code = (reqQuery.get("user_code") || "").trim().toUpperCase();
+    }
+    // Sanitize: the code charset is [A-Z-] only — also makes it HTML-safe.
+    user_code = user_code.replace(/[^A-Z-]/g, "");
+
+    if (!user_code) {
+      return this._deviceHtml(200,
+        "<h1>Link a device</h1><p>Enter the code shown in your terminal.</p>" +
+        '<form method=get action="/device">' +
+        '<input name=user_code placeholder="XXXX-XXXX" required>' +
+        "<button>Continue</button></form>");
+    }
+
+    const device_code = kv.get(this.cfg.device_user_path + "/" + user_code);
+    const raw = device_code ? kv.get(this.cfg.device_path + "/" + device_code) : null;
+    if (raw == null) {
+      return this._deviceHtml(400,
+        "<h1>Invalid code</h1><p>That code is unknown, used, or expired.</p>");
+    }
+    const st = JSON.parse(raw);
+    if (Date.now() > st.exp) {
+      return this._deviceHtml(400,
+        "<h1>Code expired</h1><p>Start the login again from your terminal.</p>");
+    }
+
+    if (m === "POST") {
+      st.status = action === "approve" ? "approved" : "denied";
+      if (st.status === "approved") st.sub = sess.sub;
+      kv.set(this.cfg.device_path + "/" + device_code, JSON.stringify(st));
+      return this._deviceHtml(200, st.status === "approved"
+        ? "<h1>Approved</h1><p>You can return to your terminal.</p>"
+        : "<h1>Denied</h1><p>No device was linked.</p>");
+    }
+
+    // GET with a valid pending code → the explicit confirm form.
+    return this._deviceHtml(200,
+      "<h1>Approve this device?</h1>" +
+      "<p>A device is requesting access to your account (<b>" +
+      _escHtml(sess.sub) + "</b>).</p>" +
+      "<p>Confirm this code matches the one in your terminal:</p>" +
+      "<p style='font-size:1.5em;font-family:monospace'>" + user_code + "</p>" +
+      '<form method=post action="/device">' +
+      '<input type=hidden name=user_code value="' + user_code + '">' +
+      "<button name=action value=approve>Approve</button> " +
+      "<button name=action value=deny>Deny</button></form>");
+  }
+
   _tokenErr(code, desc) {
     return this._json({ error: code, error_description: desc || "" }, 400);
   }
@@ -527,6 +682,41 @@ class OIDCProvider {
       }
       return this._issueTokens(
         keyset, st.client_id, st.sub, st.scope, st.nonce, st.auth_time);
+    }
+
+    // RFC 8628: the CLI polls here with its device_code until the user
+    // approves (or it expires). Errors are the device-grant set the CLI
+    // acts on: authorization_pending (keep polling), access_denied,
+    // expired_token.
+    if (grant === "urn:ietf:params:oauth:grant-type:device_code") {
+      const device_code = f.get("device_code");
+      const client_id = f.get("client_id");
+      if (!device_code) return this._tokenErr("invalid_request", "missing device_code");
+      const key = this.cfg.device_path + "/" + device_code;
+      const raw = kv.get(key);
+      if (raw == null) return this._tokenErr("expired_token", "unknown or expired device_code");
+      const st = JSON.parse(raw);
+      if (st.client_id !== client_id) {
+        return this._tokenErr("invalid_grant", "client_id mismatch");
+      }
+      if (Date.now() > st.exp) {
+        kv.delete(key);
+        if (st.user_code) kv.delete(this.cfg.device_user_path + "/" + st.user_code);
+        return this._tokenErr("expired_token", "device_code expired");
+      }
+      if (st.status === "pending") {
+        return this._tokenErr("authorization_pending", "waiting for user approval");
+      }
+      if (st.status !== "approved") {
+        kv.delete(key);
+        if (st.user_code) kv.delete(this.cfg.device_user_path + "/" + st.user_code);
+        return this._tokenErr("access_denied", "the user denied the request");
+      }
+      // Approved → issue + consume (single-use: drop the device + index rows).
+      kv.delete(key);
+      if (st.user_code) kv.delete(this.cfg.device_user_path + "/" + st.user_code);
+      return this._issueTokens(
+        keyset, st.client_id, st.sub, st.scope, null, _OIDC_SECONDS(Date.now()));
     }
 
     return this._tokenErr("unsupported_grant_type", String(grant));
