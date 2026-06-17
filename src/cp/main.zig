@@ -1489,17 +1489,26 @@ const Router = struct {
         defer a.free(snap.body);
         if (snap.status != 200) return false;
 
-        var th = [_]curl.Header{.{ .name = TENANT_HEADER, .value = tenant }};
+        // Attach AND install the baseline atomically (X-Rewind-Baseline-* headers
+        // → createGroupAtBaseline on the worker). A separate v2-apply-snapshot
+        // POST would leave a window where the freshly-attached empty group
+        // (last_index 0) is reachable; a leader heartbeat carrying commit > 0
+        // arriving in that window crashes raft (commit_to out of range). One
+        // atomic op closes it. The store bundle (snap.body) is loaded by attach
+        // before the group is created, so the baseline's data is already present.
+        const bidx = std.fmt.allocPrint(a, "{d}", .{bp.value.index}) catch return false;
+        defer a.free(bidx);
+        const bterm = std.fmt.allocPrint(a, "{d}", .{bp.value.term}) catch return false;
+        defer a.free(bterm);
+        var th = [_]curl.Header{
+            .{ .name = TENANT_HEADER, .value = tenant },
+            .{ .name = "X-Rewind-Baseline-Index", .value = bidx },
+            .{ .name = "X-Rewind-Baseline-Term", .value = bterm },
+        };
         const ar = self.backendCall(node_url, "/_system/v2-attach", .POST, snap.body, &th) catch return false;
         defer a.free(ar.body);
         if (ar.status != 204) return false;
-
-        const asbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\",\"index\":{d},\"term\":{d}}}", .{ tenant, bp.value.index, bp.value.term }) catch return false;
-        defer a.free(asbody);
-        const asr = self.backendCall(node_url, "/_system/v2-apply-snapshot", .POST, asbody, &.{}) catch return false;
-        defer a.free(asr.body);
-        if (asr.status != 204) return false;
-        std.log.info("rewind-cp: reconcile bootstrapped {s} onto {s} (baseline {d}/{d})", .{ tenant, node_url, bp.value.index, bp.value.term });
+        std.log.info("rewind-cp: reconcile bootstrapped {s} onto {s} (atomic baseline {d}/{d})", .{ tenant, node_url, bp.value.index, bp.value.term });
         return true;
     }
 

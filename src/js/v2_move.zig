@@ -69,6 +69,12 @@ fn constantTimeEql(a: []const u8, b: []const u8) bool {
 /// DP" — the plan rides attach on a move). Absent header ⇒ no plan delivered
 /// (the tenant stays free until a live push / the next attach).
 const PLAN_HEADER = "x-rewind-plan";
+// Optional atomic-baseline headers on v2-attach: when both are present the group
+// is created AND given a data-free raft baseline at {index, term} in one pump op
+// (createGroupAtBaseline) — the reconciler bootstrap path, which must never leave
+// the fresh group observable at last_index 0 (see bridge.createGroupAtBaseline).
+const BASELINE_INDEX_HEADER = "x-rewind-baseline-index";
+const BASELINE_TERM_HEADER = "x-rewind-baseline-term";
 
 /// Source-side marker key (in the tenant's own `inst.kv`) holding the
 /// destination node list — comma-separated base URLs, leader first — while a
@@ -379,10 +385,30 @@ fn handleAttach(
 
     const gid = worker.raft.registerTenant(tenant) catch
         return reply(server, allocator, ent, sid, sess, 500, "register failed\n");
-    worker.raft.createGroupEpoch(gid, 1) catch |err| switch (err) {
-        error.GroupExists => {}, // idempotent re-attach
-        else => return reply(server, allocator, ent, sid, sess, 500, "group attach failed\n"),
+    // A reconciler bootstrap supplies the leader's baseline {index, term} so the
+    // group is created already at that baseline (atomic) rather than at an empty
+    // last_index 0 — eliminating the attach→apply-snapshot window where a leader
+    // heartbeat carrying commit > 0 would crash the fresh group. Plain attach
+    // (moves, empty-attach) omits the headers and creates at epoch with no baseline.
+    const baseline_index: u64 = blk: {
+        const s = respb.findHeader(rh, BASELINE_INDEX_HEADER) orelse break :blk 0;
+        break :blk std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch 0;
     };
+    const baseline_term: u64 = blk: {
+        const s = respb.findHeader(rh, BASELINE_TERM_HEADER) orelse break :blk 0;
+        break :blk std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch 0;
+    };
+    if (baseline_index > 0) {
+        worker.raft.createGroupAtBaseline(gid, 1, baseline_index, baseline_term) catch |err| switch (err) {
+            error.GroupExists => {}, // idempotent re-attach
+            else => return reply(server, allocator, ent, sid, sess, 500, "group attach (baseline) failed\n"),
+        };
+    } else {
+        worker.raft.createGroupEpoch(gid, 1) catch |err| switch (err) {
+            error.GroupExists => {}, // idempotent re-attach
+            else => return reply(server, allocator, ent, sid, sess, 500, "group attach failed\n"),
+        };
+    }
     try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
 }
 

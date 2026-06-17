@@ -716,6 +716,18 @@ pub const Bridge = struct {
         return self.runControl(&cmd);
     }
 
+    /// Create `gid`'s group at `epoch` AND install a data-free raft baseline at
+    /// {index, term} in the SAME pump op — atomic, so the fresh group is never
+    /// reachable at last_index 0 (where a leader heartbeat carrying commit > 0
+    /// would trip raft's commit_to fatal!). The reconciler bootstrap path: the
+    /// kvexp state for `index` must already be loaded into the store. `index` 0
+    /// behaves exactly like `createGroupEpoch` (no baseline).
+    pub fn createGroupAtBaseline(self: *Bridge, gid: u64, epoch: u64, index: u64, term: u64) Error!void {
+        const sig = self.sigFor(gid) orelse return Error.UnknownTenant;
+        var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .snap_index = index, .snap_term = term };
+        return self.runControl(&cmd);
+    }
+
     /// Destroy a tenant's raft group + reclaim its WAL on the pump thread
     /// (move source cleanup). Blocks until done. (Phase 4 source evict.)
     pub fn destroyGroup(self: *Bridge, gid: u64) Error!void {
@@ -828,6 +840,14 @@ pub const Bridge = struct {
             cmd.err = switch (cmd.kind) {
                 .create_group_epoch => blk: {
                     _ = self.node.createGroupAtEpoch(cmd.gid, cmd.id_str, cmd.epoch) catch |e| break :blk e;
+                    // Atomic baseline (createGroupAtBaseline): install the data-free
+                    // snapshot in the SAME pump op as group creation so the fresh
+                    // group is never observable at last_index 0 between creation and
+                    // baseline. Without this, a leader heartbeat carrying commit > 0
+                    // can reach the empty group first and trip raft's commit_to
+                    // fatal! (to_commit out of range [last_index 0]).
+                    if (cmd.snap_index > 0)
+                        self.node.applyLocalSnapshot(cmd.gid, cmd.snap_index, cmd.snap_term) catch |e| break :blk e;
                     break :blk null;
                 },
                 .destroy_group => blk: {
