@@ -128,6 +128,10 @@ const Peer = struct {
     send_pending: bool,
 
     reconnect_at_ns: i64,
+    /// The previous reconnect delay, tracked explicitly so backoff actually
+    /// doubles (0 = never backed off → start at RECONNECT_INITIAL_NS). Deriving
+    /// it from clock skew between deadline and fire time pinned it near 2×initial.
+    reconnect_backoff_ns: i64 = 0,
 
     /// For accepted (inbound) connections: the peer_id we've identified this
     /// connection as. maxInt(u32) until IDENT arrives.
@@ -406,6 +410,20 @@ pub const RaftNet = struct {
             self.submitConnect(@intCast(i)) catch {};
         }
 
+        // Re-arm recv on any live connection with no read in flight. A prior
+        // submitRecv may have been skipped on a transient SQE-full (the `catch {}`
+        // sites below); without this sweep that peer's reads would be stranded
+        // silently until a recv CQE that can never arrive. Idempotent: submitRecv
+        // no-ops when a read is already pending, the fd is dead, or the buffer is
+        // full — so this only ever heals a genuinely-stranded connection.
+        for (self.peers, 0..) |*p, i| {
+            if (p.fd >= 0) self.submitRecv(p, @intCast(i)) catch {};
+        }
+        for (self.accepted.items, 0..) |p, ai| {
+            if (p.fd >= 0)
+                self.submitRecv(p, @as(u32, @intCast(self.peers.len)) + @as(u32, @intCast(ai))) catch {};
+        }
+
         if (wait_timeout_ns > 0) {
             // Best-effort: if the ring is full, skip the timeout
             // (next tick will retry). The wait below degrades to
@@ -598,6 +616,7 @@ pub const RaftNet = struct {
 
         peer.state = .connected;
         peer.reconnect_at_ns = 0;
+        peer.reconnect_backoff_ns = 0; // healthy again → next drop restarts at INITIAL
 
         self.submitRecv(peer, idx) catch {
             peerTeardown(self, peer, now_ns, .outbound);
@@ -661,6 +680,23 @@ pub const RaftNet = struct {
             const header = peer.recv_buf[0..raft_rpc.HEADER_SIZE];
             const payload_len = raft_rpc.frameLen(header);
             const expected_crc = raft_rpc.frameCrc(header);
+            // A frame larger than the recv buffer can NEVER be fully buffered:
+            // submitRecv stops re-arming once the buffer fills, and we'd wait for
+            // bytes that can't fit — the connection wedges forever with no teardown
+            // and no signal. On a trusted vRack an oversize length means corruption
+            // or a producer that blew the coalescing cap; either way the connection
+            // is unusable. Fail LOUD and tear it down rather than stall silently.
+            // (This bound also forecloses the `frame_total` u32 overflow that a
+            // garbage length field would otherwise trip on the add below.)
+            const MAX_PAYLOAD: u32 = RECV_BUF_SIZE - @as(u32, @intCast(raft_rpc.HEADER_SIZE));
+            if (payload_len > MAX_PAYLOAD) {
+                std.log.err(
+                    "raft_net node{d}: oversize frame from peer idx={d} (payload {d} > max {d}) — tearing down",
+                    .{ self.node_id, idx, payload_len, MAX_PAYLOAD },
+                );
+                peerTeardown(self, peer, 0, if (idx < self.peers.len) .outbound else .inbound);
+                return;
+            }
             const frame_total: u32 = @as(u32, @intCast(raft_rpc.HEADER_SIZE)) + payload_len;
             if (peer.recv_len < frame_total) break;
 
@@ -687,8 +723,21 @@ pub const RaftNet = struct {
                     const sender = std.mem.readInt(u32, payload[1..5], .big);
                     if (sender < self.peers.len and sender != self.node_id) {
                         peer.identified_as = sender;
+                        handled = true;
+                    } else {
+                        // A node id not in this node's static peer set (e.g. a
+                        // freshly added host before addPeer). We can't route its
+                        // traffic — every later frame would be SILENTLY dropped at
+                        // on_recv below (from_id stays maxInt). Fail LOUD and drop
+                        // the connection so the gap is visible (the reconciler must
+                        // addPeer the new node first), not an invisible swallow.
+                        std.log.warn(
+                            "raft_net node{d}: IDENT from unknown node id {d} (static peer set size {d}) — dropping; addPeer required",
+                            .{ self.node_id, sender, self.peers.len },
+                        );
+                        peerTeardown(self, peer, 0, .inbound);
+                        return;
                     }
-                    handled = true;
                 } else {
                     // First frame wasn't IDENT — drop the connection.
                     peerTeardown(self, peer, 0, .inbound);
@@ -740,13 +789,15 @@ fn peerTeardown(self: *RaftNet, peer: *Peer, now_ns: i64, kind: Kind) void {
     switch (kind) {
         .outbound => {
             peer.state = .disconnected;
-            if (peer.reconnect_at_ns == 0) {
-                peer.reconnect_at_ns = now_ns + RECONNECT_INITIAL_NS;
-            } else {
-                var delay: i64 = (now_ns - peer.reconnect_at_ns + RECONNECT_INITIAL_NS) * 2;
-                if (delay > RECONNECT_MAX_NS) delay = RECONNECT_MAX_NS;
-                peer.reconnect_at_ns = now_ns + delay;
-            }
+            // Exponential backoff on the PREVIOUS delay (not clock skew): first
+            // teardown → INITIAL, each subsequent → ×2 capped at MAX. Reset to 0
+            // on a successful connect (handleConnect) so a healthy peer that
+            // later drops restarts from INITIAL.
+            peer.reconnect_backoff_ns = if (peer.reconnect_backoff_ns == 0)
+                RECONNECT_INITIAL_NS
+            else
+                @min(peer.reconnect_backoff_ns * 2, RECONNECT_MAX_NS);
+            peer.reconnect_at_ns = now_ns + peer.reconnect_backoff_ns;
         },
         .inbound => {
             peer.state = .disconnected;

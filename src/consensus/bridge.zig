@@ -188,13 +188,16 @@ pub const GroupSig = struct {
 /// one, enqueues a pointer, and blocks on `done` until the pump has
 /// executed it and stamped `err` — so the struct outlives the wait.
 const ControlCmd = struct {
-    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state, apply_local_snapshot, log_term };
+    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term, last_index };
     kind: Kind,
     gid: u64,
     /// Borrowed from the gid's `GroupSig.id_str` (pointer-stable); used by
     /// `create_group_epoch` to open the tenant's group store.
     id_str: []const u8 = &.{},
     epoch: u64 = 0,
+    /// `create_group_epoch`: birth the group with THIS node as a learner
+    /// (joining an existing group) rather than a voter — see node.createGroupCore.
+    as_learner: bool = false,
     /// `propose_conf_change`: the raft node id to change + the op (0 add_voter /
     /// 1 remove / 2 add_learner — matches `raft.Manager.ConfChange`).
     node_id: u64 = 0,
@@ -209,6 +212,17 @@ const ControlCmd = struct {
     cs_voters_len: usize = 0,
     cs_learners_len: usize = 0,
     cs_ok: bool = false,
+    /// `voter_progress`: caller buffers (parallel: id/matched/active) filled by
+    /// the pump from the leader's per-peer view; len + leader_last written back.
+    vp_ids: []u64 = &.{},
+    vp_matched: []u64 = &.{},
+    vp_active: []u8 = &.{},
+    vp_len: usize = 0,
+    vp_leader_last: u64 = 0,
+    vp_ok: bool = false,
+    /// `log_term`: true iff a term was resolvable at the index (distinguishes a
+    /// genuine term of 0 from "unknown group / compacted / beyond log").
+    lt_ok: bool = false,
     /// Result, written by the pump before signaling `done`.
     err: ?Error = null,
     /// `transfer_all_leadership` writes the number of groups it handed off here.
@@ -708,6 +722,20 @@ pub const Bridge = struct {
         return self.runControl(&cmd);
     }
 
+    /// Create `gid`'s group at `epoch` AND install a data-free raft baseline at
+    /// {index, term} in the SAME pump op — atomic, so the fresh group is never
+    /// reachable at last_index 0 (where a leader heartbeat carrying commit > 0
+    /// would trip raft's commit_to fatal!). The reconciler bootstrap path: the
+    /// kvexp state for `index` must already be loaded into the store. `index` 0
+    /// behaves exactly like `createGroupEpoch` (no baseline). `as_learner` births
+    /// the group with this node as a non-voting learner (joining an existing
+    /// group via the reconciler's learner-first path) — see node.createGroupCore.
+    pub fn createGroupAtBaseline(self: *Bridge, gid: u64, epoch: u64, index: u64, term: u64, as_learner: bool) Error!void {
+        const sig = self.sigFor(gid) orelse return Error.UnknownTenant;
+        var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .snap_index = index, .snap_term = term, .as_learner = as_learner };
+        return self.runControl(&cmd);
+    }
+
     /// Destroy a tenant's raft group + reclaim its WAL on the pump thread
     /// (move source cleanup). Blocks until done. (Phase 4 source evict.)
     pub fn destroyGroup(self: *Bridge, gid: u64) Error!void {
@@ -753,13 +781,39 @@ pub const Bridge = struct {
         return .{ .voters = voters_buf[0..cmd.cs_voters_len], .learners = learners_buf[0..cmd.cs_learners_len] };
     }
 
-    /// The term of the log entry at `index` on `gid`'s group (0 if compacted /
-    /// beyond the log / unknown / pump down). A leader reports `term(applied)`
-    /// for a returning learner's promote-back baseline. Pump-thread control cmd.
-    pub fn logTerm(self: *Bridge, gid: u64, index: u64) u64 {
+    pub const VoterProgressView = struct { len: usize, leader_last: u64 };
+
+    /// Per-peer replication progress on `gid`'s group from the LEADER's view:
+    /// fills the parallel `ids`/`matched`/`active` buffers (same length) and
+    /// returns `{len, leader_last}`. Null on a follower / unknown group / pump
+    /// down. The reconciler's "is node N a caught-up member" truth signal
+    /// (conf_state alone lies — a phantom voter has `matched=0`). Control cmd.
+    pub fn voterProgress(self: *Bridge, gid: u64, ids: []u64, matched: []u64, active: []u8) ?VoterProgressView {
+        var cmd: ControlCmd = .{ .kind = .voter_progress, .gid = gid, .vp_ids = ids, .vp_matched = matched, .vp_active = active };
+        self.runControl(&cmd) catch return null;
+        if (!cmd.vp_ok) return null;
+        return .{ .len = cmd.vp_len, .leader_last = cmd.vp_leader_last };
+    }
+
+    /// The term of the log entry at `index` on `gid`'s group, or `null` when no
+    /// term is resolvable — compacted / beyond the log / unknown group / pump
+    /// down. A leader reports `term(applied)` for a returning learner's
+    /// promote-back baseline. `null` is DISTINCT from a genuine term of 0 (the
+    /// genesis index), so a caller never stamps a fake 0 into a baseline.
+    /// Pump-thread control cmd.
+    pub fn logTerm(self: *Bridge, gid: u64, index: u64) ?u64 {
         var cmd: ControlCmd = .{ .kind = .log_term, .gid = gid, .snap_index = index };
+        self.runControl(&cmd) catch return null;
+        return if (cmd.lt_ok) cmd.snap_term else null;
+    }
+
+    /// This group's local raft last log index (any replica) — the reconciler's
+    /// learner→promote catch-up signal. Pump op (the Manager is pump-only). 0 on
+    /// unknown group / pump failure.
+    pub fn lastIndex(self: *Bridge, gid: u64) u64 {
+        var cmd: ControlCmd = .{ .kind = .last_index, .gid = gid };
         self.runControl(&cmd) catch return 0;
-        return cmd.snap_term;
+        return cmd.snap_index;
     }
 
     /// Install a DATA-FREE snapshot baseline at {index, term} into `gid`'s LOCAL
@@ -805,7 +859,33 @@ pub const Bridge = struct {
         for (batch[0..n]) |cmd| {
             cmd.err = switch (cmd.kind) {
                 .create_group_epoch => blk: {
-                    _ = self.node.createGroupAtEpoch(cmd.gid, cmd.id_str, cmd.epoch) catch |e| break :blk e;
+                    // INVARIANT (enforced both ends): a baseline at index>0 MUST
+                    // carry a real term. A term-0 baseline makes raft-rs's restore
+                    // fast-forward commit_to past an empty log → fatal!. The producer
+                    // (v2-applied-baseline) refuses to emit one (409); refuse to
+                    // install one too rather than silently birthing a crash-prone group.
+                    if (cmd.snap_index > 0 and cmd.snap_term == 0) {
+                        std.log.err("v2 bridge: refusing term-0 baseline for gid {d} at index {d}", .{ cmd.gid, cmd.snap_index });
+                        break :blk Error.InvalidBaseline;
+                    }
+                    _ = self.node.createGroupAtEpoch(cmd.gid, cmd.id_str, cmd.epoch, cmd.as_learner) catch |e| break :blk e;
+                    // Atomic baseline (createGroupAtBaseline): install the data-free
+                    // snapshot in the SAME pump op as group creation so the fresh
+                    // group is never observable at last_index 0 between creation and
+                    // baseline. Without this, a leader heartbeat carrying commit > 0
+                    // can reach the empty group first and trip raft's commit_to
+                    // fatal! (to_commit out of range [last_index 0]). If the install
+                    // fails, TEAR THE HALF-BORN GROUP DOWN — leaving it live at
+                    // last_index 0 is the exact window this path exists to close
+                    // (a labeled break is not an error return, so errdefer won't
+                    // fire here; roll back explicitly).
+                    if (cmd.snap_index > 0) {
+                        self.node.applyLocalSnapshot(cmd.gid, cmd.snap_index, cmd.snap_term) catch |e| {
+                            self.node.destroyGroupAndReclaim(cmd.gid) catch |de|
+                                std.log.err("v2 bridge: rollback of half-born gid {d} failed: {s}", .{ cmd.gid, @errorName(de) });
+                            break :blk e;
+                        };
+                    }
                     break :blk null;
                 },
                 .destroy_group => blk: {
@@ -824,8 +904,23 @@ pub const Bridge = struct {
                     }
                     break :blk null;
                 },
+                .voter_progress => blk: {
+                    if (self.node.voterProgress(cmd.gid, cmd.vp_ids, cmd.vp_matched, cmd.vp_active)) |vp| {
+                        cmd.vp_len = vp.len;
+                        cmd.vp_leader_last = vp.leader_last;
+                        cmd.vp_ok = true;
+                    }
+                    break :blk null;
+                },
                 .log_term => blk: {
-                    cmd.snap_term = self.node.logTerm(cmd.gid, cmd.snap_index);
+                    if (self.node.logTerm(cmd.gid, cmd.snap_index)) |t| {
+                        cmd.snap_term = t;
+                        cmd.lt_ok = true;
+                    }
+                    break :blk null;
+                },
+                .last_index => blk: {
+                    cmd.snap_index = self.node.lastIndex(cmd.gid);
                     break :blk null;
                 },
                 .apply_local_snapshot => blk: {

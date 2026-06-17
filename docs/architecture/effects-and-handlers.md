@@ -49,7 +49,7 @@ arm).
   fetch, by event shape), `onDisconnect` (client close), plus the connectionless
   origins (`onBoot` / `onSubscription`; the manifest cron subscription and its
   `onCron` export retired with durable-wake P5(b) — recurrence is the `cron()`
-  verb); `{to}` / `?fn=` overrides.
+  verb); the bound-fetch `{to}` override names its export directly.
   `activationKindForExport` maps kind → export name.
 - **Return is a disposition**: a terminal body closes the interaction;
   `next({ctx?})` parks it for the next wake. The response head is the ambient
