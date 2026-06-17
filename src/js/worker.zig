@@ -881,6 +881,20 @@ pub const NodeState = struct {
     /// owned by `main.zig`. Null → the door is disabled.
     log_internal_base: ?[]const u8 = null,
 
+    /// Platform move-secret (`REWIND_MOVE_SECRET`) the fetch engine attaches to
+    /// the `rewind-cp.internal` door so the `__admin__` dashboard drives CP
+    /// control ops without an operator-held CP secret. Borrowed; owned by
+    /// `main.zig`. Null → the CP door returns `error.CpDoorUnconfigured`.
+    /// (step3-auth-plan.md B4.)
+    move_secret: ?[]const u8 = null,
+
+    /// Worker's internal-plane base URL for the control plane (a CP node origin,
+    /// e.g. `http://127.0.0.1:9090`, no trailing slash). The fetch engine
+    /// rewrites `http://rewind-cp.internal/_control/…` to this base. Any CP node
+    /// works — the CP forwards control writes to its leader. Borrowed; owned by
+    /// `main.zig`. Null → the CP door is disabled.
+    cp_internal_base: ?[]const u8 = null,
+
     /// Per-tenant deployment cache subsystem — tenant-slot map +
     /// node-wide bytecode cache + deployment-loader thread + manifest
     /// config. Extracted into `DeploymentCache` (`deployment_cache`

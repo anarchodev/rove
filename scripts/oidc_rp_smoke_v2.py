@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dashboard RP login over OIDC + log chokepoint (step3-auth-plan.md B2 + A5).
+"""Dashboard OIDC RP login + log chokepoint + CP chokepoint (step3 B2 + A5 + B4).
 
 Stands up __auth__ (IdP) + web/admin (relying party) on a V2 cluster with a
 TLS-terminating front, then drives the full browser-shaped OIDC handshake:
@@ -12,6 +12,11 @@ Then A5: the dashboard reads tenant logs THROUGH the admin app (GET
 no services token in the browser. Operator → 200 (the worker minted a
 tenant-scoped logs-read cap; the log-server verified it); unauthed → 401;
 non-operator → 403.
+
+Then B4: the operator drives a CP control op through the dashboard (POST
+/v1/cp/provision), which issues the `rewind-cp.internal` door fetch — the worker
+attaches the move-secret, so no CP secret on the operator shell. Verified placed
+via a move-secret re-provision (→ 409); non-operator → 403.
 
 Why TLS: the RP completes login via a SERVER-SIDE token exchange (webhook.send
 to the IdP /token + JWKS), and the IdP signs an `https://{host}` issuer (§0).
@@ -249,11 +254,36 @@ def main() -> int:
             check("non-operator log query → 403", r.status == 403,
                   f"got {r.status} {r.body[:120]!r}")
 
+        # ── B4: CP control op through the dashboard chokepoint (the door). ─
+        # Operator provisions a NEW tenant via /v1/cp/provision — the admin
+        # issues the rewind-cp.internal door fetch (the worker attaches the
+        # move-secret); the operator holds NO CP secret. Then verify it really
+        # placed: a move-secret re-provision returns 409 (already exists).
+        prov_body = json.dumps({"tenant": "viaui", "cluster": c.cluster_id,
+                                "host": c.host_for("viaui")})
+        r = c.tls_curl(app_origin + "/v1/cp/provision", method="POST",
+                       headers={"Cookie": op_cookie, "content-type": "application/json"},
+                       data=prov_body, timeout=30.0)
+        check("operator CP provision via chokepoint → 204", r.status == 204,
+              f"got {r.status} {r.body[:160]!r}")
+        if r.status != 204:
+            c.dump_node_log(grep=["cp door", "cpdoor", "provision", "fetch",
+                                  "502", "error", "warn"])
+        r2 = c.provision("viaui")  # move-secret re-provision (harness verify)
+        check("dashboard-provisioned tenant is placed in the CP (re-provision → 409)",
+              r2.status == 409, f"got {r2.status} {r2.body!r}")
+        # Non-operator → 403 (operator-only).
+        if cust_cookie:
+            r = c.tls_curl(app_origin + "/v1/cp/provision", method="POST",
+                           headers={"Cookie": cust_cookie, "content-type": "application/json"},
+                           data=json.dumps({"tenant": "nope", "cluster": c.cluster_id}))
+            check("non-operator CP provision → 403", r.status == 403, f"got {r.status}")
+
     if failures:
         print(f"\nFAILED ({len(failures)}): {failures}")
         return 1
-    print("\nPASS — operator (is_root) + non-operator completed OIDC RP login "
-          "against __auth__ over TLS.")
+    print("\nPASS — OIDC RP login + log chokepoint (A5) + CP control chokepoint "
+          "(B4) through the dashboard, no operator-held log/CP secret.")
     return 0
 
 

@@ -327,6 +327,12 @@ class V2Cluster:
         env["REWIND_VOTERS"] = voters
         env["REWIND_PEERS"] = peers
         env["S3_KEY_PREFIX_BASE"] = self.s3_prefix
+        # Step 3 B4: the CP base for the `rewind-cp.internal` door (the worker's
+        # node.cp_internal_base = cp_urls[0]), so the __admin__ dashboard can
+        # drive CP control ops. cluster_id stays unset → serve-or-forward off
+        # (the door only needs cp_urls), so existing smokes' miss behavior is
+        # unchanged.
+        env["REWIND_CP_URL"] = f"http://127.0.0.1:{self.cp_port}"
         # Step 3 (step3-auth-plan.md A2/A3): wire the `rewind-logs.internal`
         # fetch-engine door so the `__admin__` chokepoint reads tenant logs
         # with a worker-minted, tenant-scoped `logs-read` token. The secret is

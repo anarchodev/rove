@@ -106,6 +106,16 @@ pub const BLOB_ORIGIN_PREFIX = @import("blob_sessions.zig").BLOB_ORIGIN_PREFIX;
 /// `BLOB_ORIGIN_PREFIX`'s own-tenant door, but cross-tenant by design.
 pub const LOGS_ORIGIN_PREFIX = "http://rewind-logs.internal/";
 
+/// The `rewind-cp.internal` trusted door (step3-auth-plan.md B4;
+/// cp-desired-state-target.md). The `__admin__` chokepoint fetches
+/// `http://rewind-cp.internal/_control/…` (or `/_cp/…` reads); the fetch engine
+/// attaches the platform move-secret (`X-Rewind-Move-Secret`) and rewrites the
+/// host to the configured CP base. So the operator does CP control ops
+/// (provision / move / host / plan) through the OIDC dashboard with NO
+/// operator-held CP secret — the worker holds it. Only `__admin__` may form
+/// this host (the routing gate). Mirrors `LOGS_ORIGIN_PREFIX`.
+pub const CP_ORIGIN_PREFIX = "http://rewind-cp.internal/";
+
 /// Upper bound on `REWIND_INTERNAL_FRONT` entries — one per front in
 /// the deployment, and a deployment has at most a handful of fronts.
 const MAX_DOOR_ADDRS = 4;
@@ -577,6 +587,7 @@ pub const FetchEngine = struct {
         var resolve_pin: ?[:0]const u8 = null;
         const is_blob_door = std.mem.startsWith(u8, pf.url, BLOB_ORIGIN_PREFIX);
         const is_logs_door = std.mem.startsWith(u8, pf.url, LOGS_ORIGIN_PREFIX);
+        const is_cp_door = std.mem.startsWith(u8, pf.url, CP_ORIGIN_PREFIX);
         if (is_blob_door) {
             try self.rewriteAndSignBlobFetch(pf, method, &headers_list);
         } else if (is_logs_door) {
@@ -585,6 +596,11 @@ pub const FetchEngine = struct {
             // door, the rewritten URL targets a platform-configured internal
             // origin (never customer-controlled), so it skips the SSRF gate.
             try self.rewriteAndAuthLogsFetch(pf, method, &headers_list);
+        } else if (is_cp_door) {
+            // `rewind-cp.internal` door: rewrite to the CP base + attach the
+            // move-secret. Same SSRF-exempt internal-origin posture as the
+            // logs/blob doors.
+            try self.rewriteAndAuthCpFetch(pf, method, &headers_list);
         } else if (self.tenantDoorPin(pf.url, &pin_buf)) |pin| {
             // Tenant door: the host is one of OUR tenant hostnames —
             // pin the connect to the internal front addresses (private
@@ -634,7 +650,7 @@ pub const FetchEngine = struct {
             // so a plaintext logs-door fetch must force cleartext HTTP/2 —
             // same stance as the worker→log push (`worker_log.sendPushChunk`).
             // A TLS internal base (https) negotiates h2 via ALPN as usual.
-            .http2_prior_knowledge = is_logs_door and std.mem.startsWith(u8, pf.url, "http://"),
+            .http2_prior_knowledge = (is_logs_door or is_cp_door) and std.mem.startsWith(u8, pf.url, "http://"),
         };
 
         const ctx = try self.allocator.create(FetchCtx);
@@ -854,6 +870,57 @@ pub const FetchEngine = struct {
         errdefer self.allocator.free(owned_name);
         const auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{token});
         headers_list.appendAssumeCapacity(.{ .name = owned_name, .value = auth_value });
+    }
+
+    /// `rewind-cp.internal` trusted door (step3-auth-plan.md B4). The `__admin__`
+    /// dashboard fetches `http://rewind-cp.internal/_control/…` (control ops) or
+    /// `/_cp/…` (reads); here we attach the platform move-secret and rewrite the
+    /// host to the configured CP base. So an operator drives CP control ops
+    /// (provision/move/host/plan) through the OIDC dashboard with NO CP secret
+    /// of their own — the worker holds it. Only `__admin__` may form this host
+    /// (the routing gate); the move-secret never enters JS space. Restricted to
+    /// the CP's `_control/`+`_cp/` surfaces so the door can't proxy arbitrary
+    /// paths.
+    fn rewriteAndAuthCpFetch(
+        self: *FetchEngine,
+        pf: *PendingFetch,
+        method: blob_curl_multi.Method,
+        headers_list: *std.ArrayListUnmanaged(blob_curl_multi.Header),
+    ) !void {
+        if (!std.mem.eql(u8, pf.tenant_id, tenant_mod.ADMIN_INSTANCE_ID))
+            return error.CpDoorForbidden;
+        const secret = self.node.move_secret orelse return error.CpDoorUnconfigured;
+        const base = self.node.cp_internal_base orelse return error.CpDoorUnconfigured;
+        if (method != .POST and method != .GET) return error.CpMethodDenied;
+
+        // Path after the door prefix, e.g. `_control/provision` / `_cp/route?…`.
+        const remainder = pf.url[CP_ORIGIN_PREFIX.len..];
+        const path_only = if (std.mem.indexOfScalar(u8, remainder, '?')) |q| remainder[0..q] else remainder;
+        if (!std.mem.startsWith(u8, path_only, "_control/") and
+            !std.mem.startsWith(u8, path_only, "_cp/"))
+            return error.CpBadPath;
+
+        const new_url = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ base, remainder });
+        self.allocator.free(pf.url);
+        pf.url = new_url;
+
+        // Drop any JS-supplied move-secret header; attach the real one.
+        var i: usize = 0;
+        while (i < headers_list.items.len) {
+            const h = headers_list.items[i];
+            if (std.ascii.eqlIgnoreCase(h.name, "x-rewind-move-secret")) {
+                self.allocator.free(h.name);
+                self.allocator.free(h.value);
+                _ = headers_list.swapRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+        try headers_list.ensureUnusedCapacity(self.allocator, 1);
+        const owned_name = try self.allocator.dupe(u8, "x-rewind-move-secret");
+        errdefer self.allocator.free(owned_name);
+        const owned_val = try self.allocator.dupe(u8, secret);
+        headers_list.appendAssumeCapacity(.{ .name = owned_name, .value = owned_val });
     }
 
     /// Adjust the per-tenant held count by `delta` (+1 or -1).
