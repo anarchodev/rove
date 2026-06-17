@@ -395,14 +395,24 @@ fn handleAttach(
     // last_index 0 — eliminating the attach→apply-snapshot window where a leader
     // heartbeat carrying commit > 0 would crash the fresh group. Plain attach
     // (moves, empty-attach) omits the headers and creates at epoch with no baseline.
-    const baseline_index: u64 = blk: {
-        const s = respb.findHeader(rh, BASELINE_INDEX_HEADER) orelse break :blk 0;
-        break :blk std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch 0;
-    };
-    const baseline_term: u64 = blk: {
-        const s = respb.findHeader(rh, BASELINE_TERM_HEADER) orelse break :blk 0;
-        break :blk std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch 0;
-    };
+    // Baseline headers: ABSENT → no baseline (plain attach). PRESENT but
+    // unparseable → hard 400. A malformed header must NEVER silently collapse
+    // to "no baseline" (catch 0) and route the reconciler bootstrap into the
+    // last_index-0 birth path — the exact crash window documented above.
+    const baseline_index: u64 = if (respb.findHeader(rh, BASELINE_INDEX_HEADER)) |s|
+        (std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch
+            return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ BASELINE_INDEX_HEADER ++ "\n"))
+    else
+        0;
+    const baseline_term: u64 = if (respb.findHeader(rh, BASELINE_TERM_HEADER)) |s|
+        (std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch
+            return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ BASELINE_TERM_HEADER ++ "\n"))
+    else
+        0;
+    // INVARIANT: a baseline at index>0 must carry a real term (a term-0 baseline
+    // crashes raft's restore — Bridge.InvalidBaseline enforces the same at install).
+    if (baseline_index > 0 and baseline_term == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "baseline index>0 requires a nonzero term\n");
     // Join an EXISTING group as a non-voting learner (the reconciler adds a node
     // learner-first: a born-voter would campaign past a high-term leader and
     // deadlock). The leader must already hold the matching AddLearner conf-change.
@@ -890,6 +900,10 @@ fn handleConfChange(
     const v = parsed.value;
     if (v.tenant.len == 0)
         return reply(server, allocator, ent, sid, sess, 400, "empty tenant\n");
+    // node id 0 is raft's invalid/sentinel id — reject rather than forward it
+    // into proposeConfChange where it would target a nonexistent member.
+    if (v.node_id == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "node_id must be nonzero\n");
     const cc_type: u8 =
         if (std.mem.eql(u8, v.op, "demote") or std.mem.eql(u8, v.op, "add")) 2 else if (std.mem.eql(u8, v.op, "promote")) 0 else if (std.mem.eql(u8, v.op, "remove")) 1 else return reply(server, allocator, ent, sid, sess, 400, "op must be demote|promote|add|remove\n");
     const gid = worker.raft.gidForTenant(v.tenant) orelse
@@ -1048,19 +1062,18 @@ fn handleAppliedBaseline(
         return reply(server, allocator, ent, sid, sess, 404, "unknown tenant\n");
     const index = inst.kv.lastAppliedRaftIdx() catch
         return reply(server, allocator, ent, sid, sess, 500, "applied-index read failed\n");
-    const term = worker.raft.logTerm(gid, index);
-    // A baseline is the pair {index, term-of-the-log-entry-at-index}. If the
-    // leader's own log can't resolve a term for `index` (term == 0 for index > 0:
-    // the index is beyond last_index, below the compaction floor, or the store
-    // watermark has drifted ahead of the raft log), there is NO valid baseline to
-    // hand out. Returning {index, term:0} would feed an OUT-OF-BAND snapshot a
-    // bogus term, which raft-rs's `restore` then treats as a same-term match and
-    // fast-forwards `commit_to(index)` past the follower's empty log → `fatal!`.
-    // Refuse instead: the reconciler skips this group this pass and retries once
-    // the leader's log covers its watermark (a transient inconsistency) — and a
-    // term-0 baseline never reaches a follower, so the abort only ever fires on a
-    // genuinely new invariant break, exactly as it should.
-    if (term == 0 and index > 0)
+    // A baseline is the pair {index, term-of-the-log-entry-at-index}. logTerm now
+    // returns null when the leader's own log can't resolve a term for `index` (it
+    // is beyond last_index, below the compaction floor, or the store watermark has
+    // drifted ahead of the raft log) — there is NO valid baseline to hand out.
+    // Handing back {index, term:0} would feed an OUT-OF-BAND snapshot a bogus term,
+    // which raft-rs's `restore` treats as a same-term match and fast-forwards
+    // `commit_to(index)` past the follower's empty log → `fatal!`. Refuse instead:
+    // the reconciler retries once the leader's log covers its watermark. null is
+    // DISTINCT from a genuine term 0 (the genesis index) — the error channel no
+    // longer collapses "no term" into a fake 0 — so the abort only ever fires on a
+    // real invariant break, exactly as it should.
+    const term = worker.raft.logTerm(gid, index) orelse
         return reply(server, allocator, ent, sid, sess, 409, "no term-valid baseline (leader log does not cover the applied index)\n");
     const out = std.fmt.allocPrint(allocator, "{{\"index\":{d},\"term\":{d}}}\n", .{ index, term }) catch
         return reply(server, allocator, ent, sid, sess, 500, "oom\n");
@@ -1167,6 +1180,13 @@ fn handleApplySnapshot(
     ) catch return reply(server, allocator, ent, sid, sess, 400, "expected {tenant, index, term}\n");
     defer parsed.deinit();
     const v = parsed.value;
+    // A data-free baseline must be a real {index>0, term>0} pair. index 0 is a
+    // no-op (nothing ahead of committed) and term 0 crashes raft's restore —
+    // reject both at the door instead of relying on the downstream SnapshotStale.
+    if (v.index == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "index must be nonzero\n");
+    if (v.term == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "index>0 requires a nonzero term\n");
     const gid = worker.raft.gidForTenant(v.tenant) orelse
         return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
     if (worker.raft.isLeaderOf(gid))

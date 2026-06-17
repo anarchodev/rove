@@ -682,6 +682,37 @@ pub const Directory = struct {
         };
     }
 
+    /// A tenant's placement with the cluster id + node set DEEP-COPIED into
+    /// caller-owned storage. Caller calls `deinit`.
+    pub const OwnedResolution = struct {
+        id: []u8,
+        nodes: [][]u8,
+        moving: bool,
+        pub fn deinit(self: *OwnedResolution, a: std.mem.Allocator) void {
+            freeNodes(a, self.nodes);
+            a.free(self.id);
+        }
+    };
+
+    /// Like `resolve`, but the cluster id + node set are copied UNDER THE LOCK
+    /// into owned storage — safe to hold across blocking I/O. `resolve`'s
+    /// `ClusterRef.nodes` aliases the projection, which a concurrent re-address
+    /// (`applyClusterLocal` on the pump thread — e.g. a `/_control/cluster` grow)
+    /// frees out from under a held ref. Any caller that keeps the result past the
+    /// lock while doing blocking work (the membership reconciler) MUST use this.
+    /// Copying after `resolve` returns is NOT enough — the array can be freed in
+    /// the window between unlock and the copy; the copy has to happen under the lock.
+    pub fn resolveOwned(self: *Directory, a: std.mem.Allocator, tenant_id: []const u8) Error!?OwnedResolution {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const p = self.placements.get(tenant_id) orelse return null;
+        const c = self.clusters.items[p.cluster_idx];
+        const nodes = try dupeNodes(a, c.nodes);
+        errdefer freeNodes(a, nodes);
+        const id = a.dupe(u8, c.id) catch return Error.OutOfMemory;
+        return OwnedResolution{ .id = id, .nodes = nodes, .moving = p.state == .moving };
+    }
+
     /// Resolve a cluster id to its `ClusterRef` (the move orchestrator
     /// needs the destination cluster's node set). Null if unknown.
     pub fn clusterById(self: *Directory, cluster_id: []const u8) ?ClusterRef {

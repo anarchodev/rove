@@ -220,6 +220,9 @@ const ControlCmd = struct {
     vp_len: usize = 0,
     vp_leader_last: u64 = 0,
     vp_ok: bool = false,
+    /// `log_term`: true iff a term was resolvable at the index (distinguishes a
+    /// genuine term of 0 from "unknown group / compacted / beyond log").
+    lt_ok: bool = false,
     /// Result, written by the pump before signaling `done`.
     err: ?Error = null,
     /// `transfer_all_leadership` writes the number of groups it handed off here.
@@ -792,13 +795,16 @@ pub const Bridge = struct {
         return .{ .len = cmd.vp_len, .leader_last = cmd.vp_leader_last };
     }
 
-    /// The term of the log entry at `index` on `gid`'s group (0 if compacted /
-    /// beyond the log / unknown / pump down). A leader reports `term(applied)`
-    /// for a returning learner's promote-back baseline. Pump-thread control cmd.
-    pub fn logTerm(self: *Bridge, gid: u64, index: u64) u64 {
+    /// The term of the log entry at `index` on `gid`'s group, or `null` when no
+    /// term is resolvable — compacted / beyond the log / unknown group / pump
+    /// down. A leader reports `term(applied)` for a returning learner's
+    /// promote-back baseline. `null` is DISTINCT from a genuine term of 0 (the
+    /// genesis index), so a caller never stamps a fake 0 into a baseline.
+    /// Pump-thread control cmd.
+    pub fn logTerm(self: *Bridge, gid: u64, index: u64) ?u64 {
         var cmd: ControlCmd = .{ .kind = .log_term, .gid = gid, .snap_index = index };
-        self.runControl(&cmd) catch return 0;
-        return cmd.snap_term;
+        self.runControl(&cmd) catch return null;
+        return if (cmd.lt_ok) cmd.snap_term else null;
     }
 
     /// This group's local raft last log index (any replica) — the reconciler's
@@ -853,15 +859,33 @@ pub const Bridge = struct {
         for (batch[0..n]) |cmd| {
             cmd.err = switch (cmd.kind) {
                 .create_group_epoch => blk: {
+                    // INVARIANT (enforced both ends): a baseline at index>0 MUST
+                    // carry a real term. A term-0 baseline makes raft-rs's restore
+                    // fast-forward commit_to past an empty log → fatal!. The producer
+                    // (v2-applied-baseline) refuses to emit one (409); refuse to
+                    // install one too rather than silently birthing a crash-prone group.
+                    if (cmd.snap_index > 0 and cmd.snap_term == 0) {
+                        std.log.err("v2 bridge: refusing term-0 baseline for gid {d} at index {d}", .{ cmd.gid, cmd.snap_index });
+                        break :blk Error.InvalidBaseline;
+                    }
                     _ = self.node.createGroupAtEpoch(cmd.gid, cmd.id_str, cmd.epoch, cmd.as_learner) catch |e| break :blk e;
                     // Atomic baseline (createGroupAtBaseline): install the data-free
                     // snapshot in the SAME pump op as group creation so the fresh
                     // group is never observable at last_index 0 between creation and
                     // baseline. Without this, a leader heartbeat carrying commit > 0
                     // can reach the empty group first and trip raft's commit_to
-                    // fatal! (to_commit out of range [last_index 0]).
-                    if (cmd.snap_index > 0)
-                        self.node.applyLocalSnapshot(cmd.gid, cmd.snap_index, cmd.snap_term) catch |e| break :blk e;
+                    // fatal! (to_commit out of range [last_index 0]). If the install
+                    // fails, TEAR THE HALF-BORN GROUP DOWN — leaving it live at
+                    // last_index 0 is the exact window this path exists to close
+                    // (a labeled break is not an error return, so errdefer won't
+                    // fire here; roll back explicitly).
+                    if (cmd.snap_index > 0) {
+                        self.node.applyLocalSnapshot(cmd.gid, cmd.snap_index, cmd.snap_term) catch |e| {
+                            self.node.destroyGroupAndReclaim(cmd.gid) catch |de|
+                                std.log.err("v2 bridge: rollback of half-born gid {d} failed: {s}", .{ cmd.gid, @errorName(de) });
+                            break :blk e;
+                        };
+                    }
                     break :blk null;
                 },
                 .destroy_group => blk: {
@@ -889,7 +913,10 @@ pub const Bridge = struct {
                     break :blk null;
                 },
                 .log_term => blk: {
-                    cmd.snap_term = self.node.logTerm(cmd.gid, cmd.snap_index);
+                    if (self.node.logTerm(cmd.gid, cmd.snap_index)) |t| {
+                        cmd.snap_term = t;
+                        cmd.lt_ok = true;
+                    }
                     break :blk null;
                 },
                 .last_index => blk: {
