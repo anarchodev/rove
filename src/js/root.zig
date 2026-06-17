@@ -119,4 +119,5 @@ test {
     _ = deployment_loader;
     _ = @import("worker_inbound_chunk.zig");
     _ = @import("static_cache.zig");
+    _ = @import("deploy_thread.zig");
 }

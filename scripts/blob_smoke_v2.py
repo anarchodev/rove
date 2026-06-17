@@ -28,7 +28,7 @@ against real S3 (the V2 blob backend is S3-only):
      presigned URL (large bodies don't materialize in JS — arena).
 
 Needs S3 env (`set -a; . ./.env; set +a`) and binaries:
-`zig build rewind rewind-cp rewind-front files-server-v2`.
+`zig build rewind-worker rewind-cp rewind-front`.
 
 Port base 18700 (see the per-smoke port table convention).
 """

@@ -4,9 +4,10 @@
 The V1 `smoke_lib.Cluster` spawned a 3-node `loop46` cluster over TLS with
 leader-direct addressing + follower-503 semantics. V2 is a different shape:
 per-tenant raft groups behind a CP (directory + provisioning) and a stateless
-front door (Host→cluster proxy, serve-or-forward), plaintext h2c, with a
-cluster-free `files-server-v2` publishing deployments to S3. So this is a
-purpose-built V2 harness rather than a drop-in for the V1 `Cluster`.
+front door (Host→cluster proxy, serve-or-forward), plaintext h2c, with deploys
+compiled + staged IN the worker (`/_system/deploy` — files-server dissolved,
+docs/rewind-cli-plan.md §4). So this is a purpose-built V2 harness rather than
+a drop-in for the V1 `Cluster`.
 
 `V2Cluster` brings up the topology and exposes the deploy contract the
 functional smokes need:
@@ -42,12 +43,11 @@ from v2_topology import spawn_cp, spawn_front, await_ready, CP_BIN, FRONT_BIN  #
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BIN_DIR = REPO_ROOT / "zig-out" / "bin"
-REWIND = BIN_DIR / "rewind"
-FILES_V2 = BIN_DIR / "files-server-v2"
-LOG_SERVER = BIN_DIR / "log-server-standalone"
+REWIND = BIN_DIR / "rewind-worker"
+LOG_SERVER = BIN_DIR / "rewind-logs"
 
 # Fixed shared secrets (smokes don't need rotation; these match the rewind
-# defaults / v2_handler_smoke so behavior is reproducible).
+# defaults so behavior is reproducible).
 # A non-default token: rewind refuses to boot on an unset/empty/default
 # REWIND_ROOT_TOKEN (src/rewind/main.zig). The harness exports this to
 # each worker (`REWIND_ROOT_TOKEN`) and uses it for admin-surface auth.
@@ -197,12 +197,10 @@ class V2Cluster:
     raft_ports: list[int]
     cp_port: int
     front_port: int
-    files_port: int
     log_port: int
     s3_prefix: str
     data_dirs: list[Path]
     cp_data_dir: Path
-    files_data_dir: Path
     log_data_dir: Path
     procs: list = field(default_factory=list)
     node_procs: dict = field(default_factory=dict)  # node index → Popen (for stop/start)
@@ -221,14 +219,14 @@ class V2Cluster:
     @classmethod
     def spawn(cls, tag: str, *, nodes: int = 1, http_base: int = 18300,
               raft_base: int = 18400, cp_port: int = 0, front_port: int = 0,
-              files_port: int = 0, cluster_id: str = "cluster-1",
+              cluster_id: str = "cluster-1",
               unsafe_outbound: bool = True) -> "V2Cluster":
         if not os.environ.get("S3_ENDPOINT"):
             raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
-        for b in (REWIND, CP_BIN, FRONT_BIN, FILES_V2):
+        for b in (REWIND, CP_BIN, FRONT_BIN):
             if not Path(b).exists():
-                raise SystemExit(f"{b} missing — `zig build rewind rewind-cp "
-                                 f"rewind-front files-server-v2`")
+                raise SystemExit(f"{b} missing — `zig build rewind-worker rewind-cp "
+                                 f"rewind-front`")
         base = _free_base(http_base)
         rbase = _free_base(raft_base)
         pid = os.getpid()
@@ -239,16 +237,14 @@ class V2Cluster:
             node_ports=node_ports, raft_ports=raft_ports,
             cp_port=cp_port or (base + 50),
             front_port=front_port or (base + 51),
-            files_port=files_port or (base + 52),
             log_port=base + 53,
             s3_prefix=f"v2smoke-{tag}-{pid}/",
             data_dirs=[Path(f"{_DATA_BASE}/v2smoke-{tag}-n{i}-{pid}") for i in range(nodes)],
             cp_data_dir=Path(f"{_DATA_BASE}/v2smoke-{tag}-cp-{pid}"),
-            files_data_dir=Path(f"{_DATA_BASE}/v2smoke-{tag}-files-{pid}"),
             log_data_dir=Path(f"{_DATA_BASE}/v2smoke-{tag}-log-{pid}"),
             unsafe_outbound=unsafe_outbound,
         )
-        for d in (*c.data_dirs, c.cp_data_dir, c.files_data_dir):
+        for d in (*c.data_dirs, c.cp_data_dir):
             subprocess.run(["rm", "-rf", str(d)])
         c._boot(nodes)
         return c
@@ -266,8 +262,9 @@ class V2Cluster:
                  move_secret=MOVE_SECRET)
         spawn_front(self.procs, self.front_port,
                     f"http://127.0.0.1:{self.cp_port}", route_cache_ms=0)
-        self._spawn_files()
-        # services JWT is minted client-side (files-server-v2 verifies sig+exp).
+        # Deploy now runs IN the worker (/_system/deploy) — no files-server to
+        # spawn. The services JWT stays minted client-side for the log-server
+        # query surface (spawn_log_server verifies sig+exp).
         self.services_jwt = mint_jwt(JWT_SECRET_HEX,
                                      {"exp": int((time.time() + 3600) * 1000)})
 
@@ -283,7 +280,7 @@ class V2Cluster:
         env["S3_KEY_PREFIX_BASE"] = self.s3_prefix
         # Scope this cluster's request-log/tape batches under the same per-run
         # S3 prefix as its blobs (the shared bucket hosts every smoke run), so
-        # a co-spawned `log-server-standalone` reads exactly this cluster's
+        # a co-spawned `rewind-logs` reads exactly this cluster's
         # batches. rewind defaults the log key prefix to LOG_S3_KEY_PREFIX.
         env["LOG_S3_KEY_PREFIX"] = self.s3_prefix
         if self.unsafe_outbound:
@@ -305,18 +302,6 @@ class V2Cluster:
         self.node_procs[i] = p
         await_ready(p, f"n{i + 1}", "listening on")
 
-    def _spawn_files(self) -> None:
-        env = dict(os.environ)
-        env["LOOP46_SERVICES_JWT_SECRET"] = JWT_SECRET_HEX
-        env["S3_KEY_PREFIX_BASE"] = self.s3_prefix
-        p = subprocess.Popen(
-            [str(FILES_V2), "--data-dir", str(self.files_data_dir),
-             "--listen", f"127.0.0.1:{self.files_port}"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-        p._name = "files-v2"
-        self.procs.append(p)
-        await_ready(p, "files-v2", "listening on")
-
     def shutdown(self) -> None:
         for p in self.procs:
             if p.poll() is None:
@@ -335,8 +320,7 @@ class V2Cluster:
                 name = getattr(p, "_name", "?")
                 print(f"TEARDOWN: {name} (pid {p.pid}) exited rc={p.returncode}")
                 print("\n".join("  | " + l for l in tail.splitlines()[-40:]))
-        for d in (*self.data_dirs, self.cp_data_dir, self.files_data_dir,
-                  self.log_data_dir):
+        for d in (*self.data_dirs, self.cp_data_dir, self.log_data_dir):
             subprocess.run(["rm", "-rf", str(d)])
 
     def __enter__(self) -> "V2Cluster":
@@ -358,16 +342,13 @@ class V2Cluster:
     def front_url(self) -> str:
         return f"http://127.0.0.1:{self.front_port}"
 
-    def files_origin(self) -> str:
-        return f"http://127.0.0.1:{self.files_port}"
-
     def log_url(self) -> str:
         return f"http://127.0.0.1:{self.log_port}"
 
-    # ── log-server-standalone (tape / request-log query surface) ───────
+    # ── rewind-logs (tape / request-log query surface) ───────
     def spawn_log_server(self, *, poll_interval_ms: int = 200,
                          startup_timeout_s: float = 5.0):
-        """Spawn `log-server-standalone` (h2c) reading THIS cluster's request-
+        """Spawn `rewind-logs` (h2c) reading THIS cluster's request-
         log / tape batches from S3. It shares the cluster's S3 connection +
         per-run `LOG_S3_KEY_PREFIX` (so it sees exactly the batches the rewind
         workers flushed) and the services JWT secret (auth = a valid signed
@@ -415,18 +396,86 @@ class V2Cluster:
             data=json.dumps({"tenant": tenant, "cluster": self.cluster_id, "host": host}),
         )
 
-    def upload_source(self, tenant: str, path: str, content: bytes | str) -> HttpResponse:
-        return _curl(f"{self.files_origin()}/{tenant}/upload", method="POST",
-                     headers={"Authorization": f"Bearer {self.services_jwt}",
-                              "X-Rove-Path": path},
-                     data=content)
+    @staticmethod
+    def _b64(content: bytes | str) -> str:
+        import base64
+        b = content.encode() if isinstance(content, str) else content
+        return base64.b64encode(b).decode()
 
-    def deploy(self, tenant: str) -> str:
-        r = _curl(f"{self.files_origin()}/{tenant}/deploy", method="POST",
-                  headers={"Authorization": f"Bearer {self.services_jwt}"})
+    def _ensure_admin_app(self) -> None:
+        """Idempotently bring up the standing __admin__ deploy app. Provision
+        __admin__ (forms its raft group), then POST /_system/reset (root-gated,
+        no body) — the worker's bootstrap+break-glass endpoint that (re)deploys
+        the BAKED deploy app and stamps _deploy/current (rewind-cli-plan §4).
+        reset stamps the release via raft, so a follower 503s — try each node
+        until the leader accepts. The app answers POST on "/" — a GET → 405
+        confirms it's live. Runs once per cluster."""
+        if getattr(self, "_admin_app_ready", False):
+            return
+        self.provision("__admin__")  # 204 or 409 (already) — both fine
+        deadline = time.time() + 30.0
+        last = None
+        while time.time() < deadline:
+            for n in range(len(self.node_ports)):
+                last = _curl(f"{self.node_url(n)}/_system/reset", method="POST",
+                             host=self.admin_host(n),
+                             headers={"Authorization": f"Bearer {self.root_token}"},
+                             timeout=30.0)
+                if last.status == 200:
+                    break
+            if last is not None and last.status == 200:
+                break
+            time.sleep(0.2)
+        if last is None or last.status != 200:
+            self.dump_node_log(grep=["reset", "deploy", "admin", "leader",
+                                     "loader", "error", "warn"])
+            raise RuntimeError(
+                f"/_system/reset bootstrap failed: "
+                f"{last.status if last else '?'} {last.body if last else ''!r}")
+        r = self.wait_for_handler("__admin__", "/", want_status=405, timeout_s=30.0)
+        if r.status != 405:
+            self.dump_node_log(grep=["reset", "deploy", "admin", "loader",
+                                     "error", "warn"])
+            raise RuntimeError(f"deploy app not live after reset: {r.status} {r.body!r}")
+        self._admin_app_ready = True
+
+    def deploy_bundle(self, tenant: str, files: list[dict], *, node: int = 0) -> str:
+        """Deploy a full bundle by POSTing it to the standing __admin__ deploy
+        app through the front door (rewind-cli-plan §4 — the ONE deploy path;
+        the Zig /_system/deploy route is gone). `files` is a list of
+        `{"path","kind","content_type","b64"}` dicts. The app compiles handlers
+        (platform.compile), content-addresses every file into the TARGET
+        tenant's own blobs (cross-tenant platform.scope(t).blob.put), and stamps
+        the manifest (platform.scope(t).deploy.stampManifest — an S3 PUT, any
+        node). Returns the hex dep_id. Does NOT release.
+
+        `node` is vestigial (the front Host-routes to __admin__); kept for
+        call-site compatibility."""
+        import base64
+        import json
+        self._ensure_admin_app()
+        handlers, statics = [], []
+        for f in files:
+            if f.get("kind") == "static":
+                statics.append({"path": f["path"],
+                                "content_type": f.get("content_type",
+                                                      "application/octet-stream"),
+                                "b64": f["b64"]})
+            else:
+                handlers.append({"path": f["path"],
+                                 "source": base64.b64decode(f["b64"]).decode()})
+        r = _curl(f"{self.front_url()}/", method="POST",
+                  host=self.host_for("__admin__"),
+                  headers={"Authorization": f"Bearer {self.root_token}",
+                           "Content-Type": "application/json"},
+                  data=json.dumps({"tenant": tenant, "handlers": handlers,
+                                   "statics": statics}), timeout=30.0)
         if r.status != 200:
             raise RuntimeError(f"deploy {tenant}: {r.status} {r.body}")
-        return r.body.strip()
+        payload = json.loads(r.body)
+        if payload.get("ok") is not True or not payload.get("dep_id"):
+            raise RuntimeError(f"deploy {tenant}: bad payload {r.body[:200]!r}")
+        return payload["dep_id"]  # 16-hex-digit string
 
     def release(self, tenant: str, dep_id: str | int, *, node: int = 0) -> HttpResponse:
         """POST the release flip. Leader-aware: the release proposes through
@@ -448,108 +497,59 @@ class V2Cluster:
 
     def deploy_handlers(self, tenant: str, files: dict[str, str], *,
                         node: int = 0) -> str:
-        """upload each → deploy → release. Returns dep_id. (Tenant must already
-        be provisioned.)"""
-        for path, content in files.items():
-            r = self.upload_source(tenant, path, content)
-            if r.status != 204:
-                raise RuntimeError(f"upload {tenant}/{path}: {r.status} {r.body}")
-        dep_id = self.deploy(tenant)
-        r = self.release(tenant, dep_id, node=node)
+        """Deploy handler sources (all compiled) + release. Returns the dep_id
+        (decimal str). (Tenant must already be provisioned.)"""
+        bundle = [{"path": p, "kind": "handler", "content_type": "",
+                   "b64": self._b64(c)} for p, c in files.items()]
+        dep_hex = self.deploy_bundle(tenant, bundle, node=node)
+        r = self.release(tenant, int(dep_hex, 16), node=node)
         if r.status != 204:
-            raise RuntimeError(f"release {tenant}/{dep_id}: {r.status} {r.body}")
-        return dep_id
+            raise RuntimeError(f"release {tenant}/{dep_hex}: {r.status} {r.body}")
+        return str(int(dep_hex, 16))
 
     def deploy_with_static(self, tenant: str, handler_files: dict[str, str],
                            static_files: dict[str, tuple], *, node: int = 0) -> str:
         """Deploy handlers PLUS one or more STATIC manifest entries (e.g. a
-        `_config/*.json` row) via the files-server presign manifest flow — the
-        only way to stamp a `.static` entry (the `/upload`+`/deploy` contract
-        always compiles sources as `.handler`). This is what drives the
-        deploy-time `_config/` → kv mirror (`src/js/config_mirror.zig` via the
-        loader's `reloadDeployment`).
+        `_config/*.json` row) in ONE `/_system/deploy` bundle, then release.
+        Statics drive the deploy-time `_config/` → kv mirror
+        (`src/js/config_mirror.zig` via the loader's `reloadDeployment`).
 
-        `static_files` maps path → `(bytes_or_str, content_type)`. Flow: upload
-        + compile the handlers via /upload+/deploy (server-authoritative source
-        hashes, read back from the manifest), PUT each static blob by its
-        sha256, then POST a MERGED manifest (handlers + statics) and release it.
-        Returns the new dep_id (decimal str)."""
-        import hashlib
-        for path, content in handler_files.items():
-            r = self.upload_source(tenant, path, content)
-            if r.status != 204:
-                raise RuntimeError(f"upload {tenant}/{path}: {r.status} {r.body}")
-        # Compile + stamp the handlers; read back the server-authoritative
-        # manifest so we reference the exact source hashes it stored.
-        base_id = self.deploy(tenant)
-        mf = _curl(f"{self.files_origin()}/{tenant}/deployments/{int(base_id):016x}",
-                   headers={"Authorization": f"Bearer {self.services_jwt}"})
-        if mf.status != 200:
-            raise RuntimeError(f"read manifest {tenant}/{base_id}: {mf.status} {mf.body}")
-        files = {e["path"]: {"hash": e["hash"], "kind": e["kind"],
-                             "content_type": e.get("content_type", "")}
-                 for e in json.loads(mf.body).get("entries", [])}
-        # Presign-upload each static blob (the server verifies sha256), then add
-        # it to the manifest as a `.static` entry.
-        for path, (content, content_type) in static_files.items():
-            b = content.encode() if isinstance(content, str) else content
-            h = hashlib.sha256(b).hexdigest()
-            pr = _curl(f"{self.files_origin()}/{tenant}/blobs/{h}", method="PUT",
-                       headers={"Authorization": f"Bearer {self.services_jwt}"}, data=b)
-            if pr.status != 204:
-                raise RuntimeError(f"put blob {tenant}/{path}: {pr.status} {pr.body}")
-            files[path] = {"hash": h, "kind": "static", "content_type": content_type}
-        dr = _curl(f"{self.files_origin()}/{tenant}/deployments", method="POST",
-                   headers={"Authorization": f"Bearer {self.services_jwt}",
-                            "Content-Type": "application/json"},
-                   data=json.dumps({"files": files}))
-        if dr.status != 201:
-            raise RuntimeError(f"deployments POST {tenant}: {dr.status} {dr.body}")
-        new_id = int(json.loads(dr.body)["id"], 16)
-        r = self.release(tenant, new_id, node=node)
+        `static_files` maps path → `(bytes_or_str, content_type)`. The worker
+        stamps an explicit manifest from exactly this bundle (no carry-forward
+        of prior entries). Returns the new dep_id (decimal str)."""
+        bundle = [{"path": p, "kind": "handler", "content_type": "",
+                   "b64": self._b64(c)} for p, c in handler_files.items()]
+        bundle += [{"path": p, "kind": "static", "content_type": ct,
+                    "b64": self._b64(content)}
+                   for p, (content, ct) in static_files.items()]
+        dep_hex = self.deploy_bundle(tenant, bundle, node=node)
+        r = self.release(tenant, int(dep_hex, 16), node=node)
         if r.status != 204:
-            raise RuntimeError(f"release {tenant}/{new_id}: {r.status} {r.body}")
-        return str(new_id)
+            raise RuntimeError(f"release {tenant}/{dep_hex}: {r.status} {r.body}")
+        return str(int(dep_hex, 16))
 
     def deploy_manifest(self, tenant: str, files: dict[str, tuple[str, bytes | str]],
                         *, node: int = 0) -> str:
         """Content-addressed deploy with explicit per-file kind. `files` maps
         each path → (kind, content) where kind is "handler" or "static".
-        Handlers compile server-side; statics are stored verbatim. This is the
-        only way to deploy a non-JS file (e.g. a subscription `spec.json`,
-        which the loader requires to be `kind=static`) — the `/upload` flow
-        compiles every file. PUTs each blob by sha256 hash, stamps the
-        manifest, then releases. Returns dep_id. (Tenant must be provisioned.)"""
-        import hashlib
-        import json as _json
-        manifest: dict[str, dict] = {}
+        Handlers compile server-side; statics are stored verbatim (content-type
+        inferred: `.json`→application/json, else application/octet-stream). The
+        only way to deploy a non-JS file (e.g. a subscription `spec.json`, which
+        the loader requires to be `kind=static`). Returns dep_id (decimal str).
+        (Tenant must be provisioned.)"""
+        bundle = []
         for path, (kind, content) in files.items():
-            if isinstance(content, str):
-                content = content.encode()
-            h = hashlib.sha256(content).hexdigest()
-            r = _curl(f"{self.files_origin()}/{tenant}/blobs/{h}", method="PUT",
-                      headers={"Authorization": f"Bearer {self.services_jwt}"},
-                      data=content)
-            if r.status not in (200, 201, 204):
-                raise RuntimeError(f"put blob {tenant}/{path} ({h[:12]}): "
-                                   f"{r.status} {r.body}")
-            entry = {"hash": h, "kind": kind}
+            ct = ""
             if kind == "static":
-                entry["content_type"] = "application/json" if path.endswith(".json") \
+                ct = "application/json" if path.endswith(".json") \
                     else "application/octet-stream"
-            manifest[path] = entry
-        r = _curl(f"{self.files_origin()}/{tenant}/deployments", method="POST",
-                  headers={"Authorization": f"Bearer {self.services_jwt}",
-                           "Content-Type": "application/json"},
-                  data=_json.dumps({"files": manifest}))
-        if r.status != 201:
-            raise RuntimeError(f"deployments {tenant}: {r.status} {r.body}")
-        # `id` is a 16-hex-digit string; release() wants the decimal value.
-        dep_id = int(_json.loads(r.body)["id"], 16)
-        r = self.release(tenant, dep_id, node=node)
+            bundle.append({"path": path, "kind": kind, "content_type": ct,
+                           "b64": self._b64(content)})
+        dep_hex = self.deploy_bundle(tenant, bundle, node=node)
+        r = self.release(tenant, int(dep_hex, 16), node=node)
         if r.status != 204:
-            raise RuntimeError(f"release {tenant}/{dep_id}: {r.status} {r.body}")
-        return str(dep_id)
+            raise RuntimeError(f"release {tenant}/{dep_hex}: {r.status} {r.body}")
+        return str(int(dep_hex, 16))
 
     # ── serving ────────────────────────────────────────────────────────
     def request(self, tenant: str, path: str = "/", *, method: str = "GET",

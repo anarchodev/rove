@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 """publish_tenant.py — publish a tenant bundle to the production cluster.
 
-The codified form of the proven publish path (deploy-plan §8 item 4):
-spawn files-server-v2 locally against the prod S3 backend, upload + compile
-handler sources, PUT static blobs, stamp an EXPLICIT manifest (the bundle
-is the source of truth — this kills the /deploy carry-forward trap where
-prior static entries ride into the new manifest), then flip the release on
-a worker over the private plane (leader-aware retry; transient 503s while
+DEPRECATED / BROKEN (2026-06-16): the `/_system/deploy` route this posts to was
+removed when deploy moved into the standing __admin__ app (rewind-cli-plan §4.2).
+Use the `rewind-ops` operator CLI instead: `zig build rewind-ops` then
+`rewind-ops bootstrap` / `provision <tenant> --host H` / `deploy <tenant> <bundle>
+--release` / `move` / `plan set` / `status` — it covers every operation this
+script welded together (host add lands once the full admin app exposes
+/ops/assign-domain on the bootstrapped path). This file is retained only for
+historical reference.
+
+The codified form of the proven publish path (deploy-plan §8 item 4). The
+build/stage step now lives IN the worker (files-server dissolved,
+docs/rewind-cli-plan.md §4): one `POST /_system/deploy` over the private plane
+hands the whole bundle (handlers + statics, base64) to a worker, which
+compiles, content-addresses every file into the tenant's own blobs, and stamps
+an EXPLICIT manifest (the bundle is the source of truth — no carry-forward).
+Then flip the release on a worker (leader-aware retry; transient 503s while
 group leadership settles are normal).
 
 Bundle layout:
@@ -23,11 +33,12 @@ Bundle layout:
     Classification mirrors classify() in src/files_server/bootstrap.zig.
 
 Config comes from the operator env file (default ~/.config/rove/prod.env,
-legacy fallback .env.prod at the repo root): S3_* / AWS_*,
-LOOP46_SERVICES_JWT_SECRET, REWIND_ROOT_TOKEN,
-REWIND_ADMIN_DOMAIN, REWIND_MOVE_SECRET (only for --provision/--host),
-ADMIN_OPS_SECRET (only for --host), ROVE_PUBLISH_SSH (the host the release
-call tunnels through), ROVE_WORKER_URLS, ROVE_CP_URL_INTERNAL.
+legacy fallback .env.prod at the repo root): REWIND_ROOT_TOKEN (gates both
+/_system/deploy and /_system/release), REWIND_ADMIN_DOMAIN, REWIND_MOVE_SECRET
+(only for --provision/--host), ADMIN_OPS_SECRET (only for --host),
+ROVE_PUBLISH_SSH (the host the deploy + release calls tunnel through),
+ROVE_WORKER_URLS, ROVE_CP_URL_INTERNAL. (S3_*/AWS_* + the services-JWT secret
+are no longer needed here — the worker owns the blob backend now.)
 
 Usage:
     scripts/publish_tenant.py marketing web/marketing
@@ -35,22 +46,17 @@ Usage:
     scripts/publish_tenant.py marketing web/marketing --verify-host rewindjs.com
 """
 import argparse
-import atexit
-import hashlib
 import json
 import mimetypes
 import os
 import pathlib
 import shlex
 import subprocess
+import base64
 import sys
 import time
 
-sys.path.insert(0, str(pathlib.Path(__file__).parent))
-from smoke_lib import mint_jwt  # noqa: E402
-
 REPO = pathlib.Path(__file__).resolve().parent.parent
-FILES_PORT = 18180
 
 
 def default_env_file() -> pathlib.Path:
@@ -108,35 +114,17 @@ def ssh_curl(ssh_target: str, *curl_args, timeout: int = 20):
     return (int(code) if code else 0), body
 
 
-def spawn_files_server(env: dict) -> str:
-    """Start files-server-v2 against the prod S3 backend; killed at exit."""
-    binary = REPO / "zig-out/bin/files-server-v2"
-    if not binary.exists():
-        sys.exit("zig-out/bin/files-server-v2 missing — run: "
-                 "zig build files-server-v2 -Doptimize=ReleaseFast")
-    proc_env = dict(os.environ)
-    for k in ("S3_ENDPOINT", "S3_REGION", "S3_BUCKET", "S3_KEY_PREFIX_BASE",
-              "S3_USE_TLS", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
-              "LOOP46_SERVICES_JWT_SECRET"):
-        if k in env:
-            proc_env[k] = env[k]
-    data_dir = pathlib.Path("/tmp/publish-fsv2")
-    data_dir.mkdir(exist_ok=True)
-    log = open("/tmp/publish-fsv2.log", "w")
-    proc = subprocess.Popen([str(binary), "--data-dir", str(data_dir),
-                             "--listen", f"127.0.0.1:{FILES_PORT}"],
-                            env=proc_env, stdout=log, stderr=log)
-    atexit.register(proc.terminate)
-    origin = f"http://127.0.0.1:{FILES_PORT}"
-    for _ in range(50):
-        if proc.poll() is not None:
-            sys.exit(f"files-server-v2 exited rc={proc.returncode} — "
-                     f"see /tmp/publish-fsv2.log")
-        code, _ = curl(f"{origin}/", timeout=2)
-        if code:  # any HTTP answer (401 expected) means it's up
-            return origin
-        time.sleep(0.1)
-    sys.exit("files-server-v2 did not come up — see /tmp/publish-fsv2.log")
+def ssh_curl_stdin(ssh_target: str, *curl_args, data: bytes, timeout: int = 120):
+    """Like ssh_curl, but streams the request body over ssh stdin
+    (`curl --data-binary @-`) so a large deploy bundle doesn't hit ARG_MAX on
+    the remote command line."""
+    quoted = " ".join(shlex.quote(a) for a in curl_args)
+    r = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", ssh_target,
+         f"curl -s --max-time {timeout} -w '\\n%{{http_code}}' {quoted}"],
+        input=data, capture_output=True)
+    body, _, code = r.stdout.decode().rpartition("\n")
+    return (int(code) if code else 0), body
 
 
 def main() -> int:
@@ -160,9 +148,7 @@ def main() -> int:
     workers = (env.get("ROVE_WORKER_URLS") or sys.exit("ROVE_WORKER_URLS not in env file")).split(",")
     cp_url = env.get("ROVE_CP_URL_INTERNAL", "http://10.0.0.1:9090")
     admin_host = env["REWIND_ADMIN_DOMAIN"]
-    jwt = mint_jwt(env["LOOP46_SERVICES_JWT_SECRET"],
-                   {"exp": int((time.time() + 3600) * 1000)})
-    auth = f"Authorization: Bearer {jwt}"
+    rt = env["REWIND_ROOT_TOKEN"]
 
     if not args.bundle.is_dir():
         sys.exit(f"{args.bundle}: not a directory")
@@ -207,57 +193,39 @@ def main() -> int:
         else:
             sys.exit(f"provision failed: {code} {out}")
 
-    fs = spawn_files_server(env)
-
-    # ── handlers: upload + compile ───────────────────────────────────
-    manifest: dict[str, dict] = {}
-    if handlers:
-        for rel, p in handlers:
-            code, out = curl("-X", "POST", f"{fs}/{args.tenant}/upload",
-                             "-H", auth, "-H", f"X-Rove-Path: {rel}",
-                             "--data-binary", "@-", data=p.read_bytes())
-            if code != 204:
-                sys.exit(f"upload {rel}: {code} {out}")
-        code, out = curl("-X", "POST", f"{fs}/{args.tenant}/deploy", "-H", auth)
-        if code != 200:
-            sys.exit(f"deploy (compile) failed: {code} {out}")
-        base_id = int(out.strip())
-        # Read back the server-authoritative manifest; keep ONLY this
-        # bundle's handlers (drops carried-forward entries).
-        code, out = curl(f"{fs}/{args.tenant}/deployments/{base_id:016x}", "-H", auth)
-        if code != 200:
-            sys.exit(f"manifest read-back failed: {code} {out}")
-        ours = {rel for rel, _ in handlers}
-        for e in json.loads(out)["entries"]:
-            if e["kind"] != "static" and e["path"] in ours:
-                manifest[e["path"]] = {"hash": e["hash"], "kind": e["kind"],
-                                       "content_type": e.get("content_type", "")}
-        missing = ours - set(manifest)
-        if missing:
-            sys.exit(f"compiled manifest is missing handlers: {missing}")
-
-    # ── statics: content-addressed blob PUTs ─────────────────────────
+    # ── compile + stage on a worker (/_system/deploy) over the private plane ─
+    # files-server is dissolved (docs/rewind-cli-plan.md §4): one POST hands
+    # the whole bundle (handlers + statics, base64) to the worker, which
+    # compiles, content-addresses every file into the tenant's own blobs, and
+    # stamps an EXPLICIT manifest (no carry-forward). Deploy isn't raft-gated
+    # so any worker accepts it; try each until one answers 200.
+    files_payload = []
+    for rel, p in handlers:
+        files_payload.append({"path": rel, "kind": "handler", "content_type": "",
+                              "b64": base64.b64encode(p.read_bytes()).decode()})
     for rel, p in statics:
-        b = p.read_bytes()
-        h = hashlib.sha256(b).hexdigest()
-        code, out = curl("-X", "PUT", f"{fs}/{args.tenant}/blobs/{h}",
-                         "-H", auth, "--data-binary", "@-", data=b)
-        if code not in (200, 201, 204):
-            sys.exit(f"blob {rel}: {code} {out}")
-        manifest[rel] = {"hash": h, "kind": "static", "content_type": content_type(p)}
+        files_payload.append({"path": rel, "kind": "static",
+                              "content_type": content_type(p),
+                              "b64": base64.b64encode(p.read_bytes()).decode()})
+    deploy_body = json.dumps({"tenant_id": args.tenant, "files": files_payload}).encode()
 
-    # ── stamp the explicit manifest ──────────────────────────────────
-    code, out = curl("-X", "POST", f"{fs}/{args.tenant}/deployments",
-                     "-H", auth, "-H", "Content-Type: application/json",
-                     "--data-binary", "@-",
-                     data=json.dumps({"files": manifest}).encode())
-    if code != 201:
-        sys.exit(f"manifest POST failed: {code} {out}")
-    dep_id = int(json.loads(out)["id"], 16)
-    print(f"deployment stamped: {dep_id} ({len(manifest)} file(s))")
+    dep_id = None
+    for w in workers:
+        code, out = ssh_curl_stdin(
+            ssh_target, "--http2-prior-knowledge", "-X", "POST",
+            f"{w}/_system/deploy", "-H", f"Host: {admin_host}",
+            "-H", f"Authorization: Bearer {rt}",
+            "-H", "Content-Type: application/json", "--data-binary", "@-",
+            data=deploy_body)
+        if code == 200:
+            dep_id = int(json.loads(out)["dep_id"], 16)
+            break
+        print(f"  deploy via {w}: {code} {out[:200]} (trying next)")
+    if dep_id is None:
+        sys.exit("deploy (/_system/deploy) failed on every worker")
+    print(f"deployment staged: {dep_id} ({len(files_payload)} file(s))")
 
     # ── release flip (leader-aware + leadership-settling retries) ────
-    rt = env["REWIND_ROOT_TOKEN"]
     body = json.dumps({"tenant_id": args.tenant, "dep_id": dep_id})
     released = False
     for attempt in range(6):

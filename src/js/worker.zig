@@ -90,6 +90,7 @@ const worker_upload_checkpoint = @import("worker_upload_checkpoint.zig");
 const worker_streaming = @import("worker_streaming.zig");
 const worker_ws = @import("worker_ws.zig");
 const worker_drain = @import("worker_drain.zig");
+const deploy_thread_mod = @import("deploy_thread.zig");
 const panic_mod = @import("panic.zig");
 const penalty_mod = @import("penalty.zig");
 const limiter_mod = @import("limiter.zig");
@@ -1338,6 +1339,17 @@ pub fn Worker(comptime opts: Options) type {
         /// `StreamRow` as `raft_pending_*` so `reg.move` preserves the
         /// h2 sid/session/headers the response needs.
         forward_pending: StreamColl,
+        /// Background compile/stage thread backing the `platform.*` deploy
+        /// primitives (`docs/rewind-cli-plan.md` §4). Owns its own QuickJS
+        /// runtime (the poll-loop `compile_fn` is used by
+        /// `deployStarterTrampoline` — can't share one runtime across
+        /// threads). Null until `startDeployThread`; library / test builds
+        /// that never deploy leave it null.
+        deploy_thread: ?*deploy_thread_mod.DeployThread = null,
+        /// Worker-monotonic id stamped on each `DeployThread.Job`
+        /// (`compile_batch` / `blob_put` / `manifest_put`). Poll-loop only
+        /// (no lock). Starts at 0; pre-incremented so the first job is 1.
+        next_compile_id: u64 = 0,
         /// Slice 4-fetch-park: parked outbound-fetch chunk events
         /// (large chunks waiting on durability). Plain
         /// `ArrayListUnmanaged` rather than a rove `Collection`
@@ -2063,6 +2075,16 @@ pub fn Worker(comptime opts: Options) type {
             self.parked_continuations.deinit();
             self.parked_units.deinit();
             self.blob_sessions.deinit();
+            // Stop the background deploy thread before tearing down the
+            // collections it can never touch (it only touches its own
+            // queue/result map, but join here makes shutdown ordering
+            // explicit). Any still-parked deploy entities ship nothing
+            // — best-effort, same lossy-on-shutdown posture as the rest.
+            if (self.deploy_thread) |dt| {
+                dt.shutdown();
+                dt.deinit();
+                self.deploy_thread = null;
+            }
             self.raft_pending_response.deinit();
             self.raft_pending_cont.deinit();
             self.raft_pending_stream.deinit();
@@ -2080,6 +2102,24 @@ pub fn Worker(comptime opts: Options) type {
             // `manifest_easy` lives on NodeState — main.zig owns it.
             self.h2.destroy();
             allocator.destroy(self);
+        }
+
+        /// Start the background compile+stage thread that backs
+        /// `/_system/deploy` (`docs/rewind-cli-plan.md` §4). Idempotent
+        /// guard: a second call is a no-op. Opens the thread against the
+        /// node's shared blob backend config so each job writes the
+        /// target tenant's own `file-blobs/` + `deployments/` keys.
+        /// Call once after `create`, before serving.
+        pub fn startDeployThread(self: *Self) !void {
+            if (self.deploy_thread != null) return;
+            const dt = try deploy_thread_mod.DeployThread.init(
+                self.allocator,
+                self.node.blob_backend_cfg,
+                &self.node.router,
+            );
+            errdefer dt.deinit();
+            try dt.start();
+            self.deploy_thread = dt;
         }
 
         /// Forward to the h2 poll loop. Exposed so callers don't have to
@@ -2188,6 +2228,78 @@ pub fn Worker(comptime opts: Options) type {
             }
         }
 
+        pub const ResetError = error{ AdminNotInitialized, NotLeader, StageFailed, ProposeFailed };
+
+        /// `POST /_system/reset` (rewind-cli-plan §4) — bootstrap + break-glass.
+        /// (Re)deploy the BAKED `__admin__` deploy app and stamp
+        /// `_deploy/current`, so a virgin OR bricked control tenant recovers
+        /// deploy capability with no external bundle. The full admin and every
+        /// customer deploy are then published THROUGH the app — this is the ONLY
+        /// path that deploys the embedded bundle, and it accepts NO arbitrary
+        /// input.
+        ///
+        /// Idempotent by construction: the baked bundle is content-addressed, so
+        /// re-running produces the same `dep_id` and merely re-stamps the release
+        /// marker (recovering a bricked deployment). No dispatch batch here, so
+        /// it commits + proposes directly (like `handleRelease`). Returns the
+        /// deployed `dep_id`; `error.NotLeader` if this node doesn't lead
+        /// `__admin__`'s group (caller retries against the leader).
+        pub fn deployBakedAdmin(self: *Self) ResetError!u64 {
+            const a = self.allocator;
+            const inst = (self.node.tenant.getInstance(tenant_mod.ADMIN_INSTANCE_ID) catch return error.AdminNotInitialized) orelse return error.AdminNotInitialized;
+            // Only the leader of __admin__'s group stamps the release; the group
+            // must be formed + led for the propose to land.
+            const gid = self.raft.gidForTenant(tenant_mod.ADMIN_INSTANCE_ID) orelse return error.NotLeader;
+            if (!self.raft.isLeaderOf(gid)) return error.NotLeader;
+            const compile_fn = self.compile_fn orelse return error.StageFailed;
+
+            var release_ws = kv_mod.WriteSet.init(a);
+            defer release_ws.deinit();
+            const dep_id = starter.deployGenesisAdminContent(
+                a,
+                inst.dir,
+                inst.id,
+                self.node.blob_backend_cfg,
+                compile_fn,
+                self.compile_ctx,
+                &release_ws,
+            ) catch |err| {
+                std.log.warn("reset: stage failed: {s}", .{@errorName(err)});
+                return error.StageFailed;
+            };
+
+            // Speculative-commit `_deploy/current` locally + propose envelope-0
+            // so followers see it. We lead __admin__'s group (checked above), so
+            // the propose lands.
+            var txn = inst.kv.beginTrackedImmediate() catch |err| {
+                std.log.warn("reset: txn open failed: {s}", .{@errorName(err)});
+                return error.StageFailed;
+            };
+            for (release_ws.ops.items) |op| switch (op) {
+                .put => |p| txn.put(p.key, p.value) catch {
+                    txn.rollback() catch {};
+                    return error.StageFailed;
+                },
+                .delete => |d| txn.delete(d.key) catch {
+                    txn.rollback() catch {};
+                    return error.StageFailed;
+                },
+            };
+            txn.commit() catch |err| {
+                std.log.warn("reset: commit failed: {s}", .{@errorName(err)});
+                return error.StageFailed;
+            };
+            _ = raft_propose.proposeWriteSet(self, &release_ws, inst.id, "") catch |err| {
+                std.log.warn("reset: propose failed: {s}", .{@errorName(err)});
+                return error.ProposeFailed;
+            };
+            std.log.info("reset: deployed baked deploy app → __admin__ dep_id={x:0>16}", .{dep_id});
+            if (self.node.deploy.deployment_loader) |loader| {
+                loader.enqueue(inst.id, dep_id) catch {};
+            }
+            return dep_id;
+        }
+
         /// Trampoline for `platform.releases.publish(tenant_id,
         /// dep_id)`. Stamps `_deploy/current = hex(dep_id)` on the
         /// target tenant's app.db (one-shot kvexp speculative
@@ -2287,6 +2399,186 @@ pub fn Worker(comptime opts: Options) type {
                 .delete => try ws.addDelete(key),
             }
             try self.applyTargetWrite(allocator, inst, target_id, &ws);
+        }
+
+        /// The admin-handler platform capability bundle for `inst` —
+        /// `null` for non-admin instances. ONE source of truth so every
+        /// DispatchState construction site (inbound + every resume path:
+        /// bound-fetch / cont / fetch-event) wires the SAME caps; a
+        /// resume that forgot one silently broke privileged platform
+        /// writes (e.g. `platform.scope().blob` from a bound resume).
+        pub fn adminPlatformCaps(self: *Self, inst: *const tenant_mod.Instance) ?globals.PlatformCaps {
+            if (inst.platform == null) return null;
+            return .{
+                .ctx = @ptrCast(self),
+                .deploy_starter = &Self.deployStarterTrampoline,
+                .release_publish = &Self.releasePublishTrampoline,
+                .scope_kv_write = &Self.scopeKvWriteTrampoline,
+                .scope_blob_put = &Self.scopeBlobPutTrampoline,
+            };
+        }
+
+        /// `platform.scope(t).blob.put` (rewind-cli-plan §4.1): stage a
+        /// content-addressed blob into the TARGET tenant's `file-blobs`.
+        /// The hash was already computed + returned to JS synchronously
+        /// (derivable from the bytes); this enqueues the deferred S3 PUT
+        /// on the background DeployThread (off the poll loop). Cross-tenant
+        /// — the admin tenant stages into any tenant, like `scope().kv`.
+        pub fn scopeBlobPutTrampoline(
+            ctx: *anyopaque,
+            _: std.mem.Allocator,
+            target_id: []const u8,
+            hash: []const u8,
+            bytes: []const u8,
+        ) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if ((self.node.tenant.getInstance(target_id) catch return error.InstanceNotFound) == null)
+                return error.InstanceNotFound;
+            const dt = self.deploy_thread orelse return error.DeployThreadUnavailable;
+            // Job memory uses the WORKER allocator (outlives the request
+            // tick — the DeployThread holds it across ticks).
+            const a = self.allocator;
+            const t = try a.dupe(u8, target_id);
+            errdefer a.free(t);
+            const k = try a.dupe(u8, hash);
+            errdefer a.free(k);
+            const p = try a.dupe(u8, bytes);
+            errdefer a.free(p);
+            self.next_compile_id += 1;
+            try dt.enqueue(.{ .compile_id = self.next_compile_id, .kind = .blob_put, .tenant_id = t, .key = k, .payload = p });
+        }
+
+        /// `platform.scope(t).deploy.stampManifest(entries)` submit door
+        /// (rewind-cli-plan §4.1) — the deploy's STAGING BARRIER. Bound like
+        /// `platform.compile`: lowers to an on.fetch to `rove-stage.internal`;
+        /// the handler `next()`s so the finalize seam binds it. We compute the
+        /// content-addressed dep_id + encode the manifest (the native format)
+        /// and enqueue a `manifest_put` job carrying the dep_id + chain
+        /// routing. Being the LAST FIFO job for the deploy, its completion
+        /// proves all prior bytecode + static PUTs are durable; the
+        /// DeployThread then emits the bound `{ok, dep_id}` event that resumes
+        /// the held chain — safe to release, no race. ADMIN-ONLY.
+        pub fn submitStampManifest(self: *Self, pf_in: globals.PendingFetch) void {
+            var pf = pf_in;
+            defer pf.deinit(self.allocator);
+            const a = self.allocator;
+            const router = &self.node.router;
+
+            const fail = struct {
+                fn emit(rt: *MsgRouter, alloc: std.mem.Allocator, p: *const globals.PendingFetch, status: u16, msg: []const u8) void {
+                    const cj = std.fmt.allocPrint(alloc, "{{\"ok\":false,\"status\":{d},\"error\":\"{s}\"}}", .{ status, msg }) catch return;
+                    deploy_thread_mod.routeCompileEvent(rt, alloc, p.id, p.tenant_id, p.name, status, false, cj);
+                }
+            }.emit;
+
+            if (!std.mem.eql(u8, pf.tenant_id, tenant_mod.ADMIN_INSTANCE_ID)) {
+                std.log.warn("rove-js stampManifest: non-admin tenant {s} rejected", .{pf.tenant_id});
+                return fail(router, a, &pf, 403, "stampManifest is admin-only");
+            }
+            const dt = self.deploy_thread orelse return fail(router, a, &pf, 503, "deploy thread not started");
+
+            var parsed = std.json.parseFromSlice(struct {
+                scope: []const u8,
+                entries: []const struct {
+                    path: []const u8,
+                    kind: []const u8,
+                    source_hex: []const u8,
+                    bytecode_hex: []const u8 = "",
+                    content_type: []const u8 = "",
+                },
+            }, a, pf.body, .{ .ignore_unknown_fields = true }) catch
+                return fail(router, a, &pf, 400, "expected {scope, entries:[...]}");
+            defer parsed.deinit();
+            const p = parsed.value;
+            if (p.scope.len == 0 or p.entries.len == 0 or p.entries.len > 256)
+                return fail(router, a, &pf, 400, "scope required + 1..256 entries");
+
+            const entries = a.alloc(files_mod.FileStore.Entry, p.entries.len) catch
+                return fail(router, a, &pf, 500, "out of memory");
+            defer a.free(entries);
+            for (p.entries, 0..) |it, i| {
+                files_mod.validatePath(it.path) catch return fail(router, a, &pf, 400, "invalid path");
+                const kind: files_mod.Kind = if (std.mem.eql(u8, it.kind, "handler"))
+                    .handler
+                else if (std.mem.eql(u8, it.kind, "static"))
+                    .static
+                else
+                    return fail(router, a, &pf, 400, "kind must be handler|static");
+                if (it.source_hex.len != files_mod.HASH_HEX_LEN) return fail(router, a, &pf, 400, "bad source_hex");
+                var e: files_mod.FileStore.Entry = .{
+                    .path = @constCast(it.path),
+                    .kind = kind,
+                    .content_type = @constCast(it.content_type),
+                    .source_hex = undefined,
+                    .bytecode_hex = @splat(0),
+                };
+                @memcpy(&e.source_hex, it.source_hex[0..files_mod.HASH_HEX_LEN]);
+                if (kind == .handler) {
+                    if (it.bytecode_hex.len != files_mod.HASH_HEX_LEN) return fail(router, a, &pf, 400, "bad bytecode_hex");
+                    @memcpy(&e.bytecode_hex, it.bytecode_hex[0..files_mod.HASH_HEX_LEN]);
+                }
+                entries[i] = e;
+            }
+
+            const dep_id = files_mod.manifest_json.computeDeploymentId(entries);
+            const json = files_mod.manifest_json.encode(a, dep_id, entries) catch
+                return fail(router, a, &pf, 500, "manifest encode failed");
+            // `json` is owned → transferred to the job below (or freed on any
+            // dupe/enqueue failure before then).
+            var key_buf: [25]u8 = undefined;
+            const key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
+
+            const t = a.dupe(u8, p.scope) catch {
+                a.free(json);
+                return fail(router, a, &pf, 500, "out of memory");
+            };
+            const k = a.dupe(u8, key) catch {
+                a.free(json);
+                a.free(t);
+                return fail(router, a, &pf, 500, "out of memory");
+            };
+            const chain = a.dupe(u8, pf.tenant_id) catch {
+                a.free(json);
+                a.free(t);
+                a.free(k);
+                return fail(router, a, &pf, 500, "out of memory");
+            };
+            const fid = a.dupe(u8, pf.id) catch {
+                a.free(json);
+                a.free(t);
+                a.free(k);
+                a.free(chain);
+                return fail(router, a, &pf, 500, "out of memory");
+            };
+            const nm: []u8 = if (pf.name.len != 0) (a.dupe(u8, pf.name) catch {
+                a.free(json);
+                a.free(t);
+                a.free(k);
+                a.free(chain);
+                a.free(fid);
+                return fail(router, a, &pf, 500, "out of memory");
+            }) else &.{};
+
+            self.next_compile_id += 1;
+            dt.enqueue(.{
+                .compile_id = self.next_compile_id,
+                .kind = .manifest_put,
+                .tenant_id = t,
+                .key = k,
+                .payload = json,
+                .chain_tenant = chain,
+                .fetch_id = fid,
+                .name = nm,
+                .dep_id = dep_id,
+            }) catch {
+                a.free(json);
+                a.free(t);
+                a.free(k);
+                a.free(chain);
+                a.free(fid);
+                if (nm.len != 0) a.free(nm);
+                return fail(router, a, &pf, 503, "deploy queue unavailable");
+            };
         }
 
         /// Phase 5 PR-3: `_system.continuation.resumeIfBound`
@@ -2512,6 +2804,161 @@ pub fn Worker(comptime opts: Options) type {
             job.start() catch {
                 job.markGone();
                 job.failNow();
+            };
+        }
+
+        /// The "trusted internal door" partition for a PendingFetch — the
+        /// ONE place that decides a fetch goes to a worker-local subsystem
+        /// instead of libcurl. Returns true (and consumes `pf`) if it was a
+        /// door; false → the caller submits it to the FetchEngine. EVERY
+        /// fetch-submit site (interpretCmd, the inbound read-only flush, the
+        /// bound-resume flush) routes through this so a new door can't be
+        /// half-wired — the bug class that hid `rove-stage.internal` from the
+        /// resume path + `rove-compile.internal` from the read-only path.
+        pub fn tryDoorFetch(self: *Self, pf: globals.PendingFetch) bool {
+            if (blob_receive_mod.isReceiveUrl(pf.url)) {
+                self.armBlobReceive(pf);
+                return true;
+            }
+            if (deploy_thread_mod.isCompileUrl(pf.url)) {
+                self.submitCompile(pf);
+                return true;
+            }
+            if (deploy_thread_mod.isStageUrl(pf.url)) {
+                self.submitStampManifest(pf);
+                return true;
+            }
+            return false;
+        }
+
+        /// `platform.compile` submit door (`rove-cli-plan.md` §4.1). The
+        /// shim issues an `on.fetch` to `rove-compile.internal`; the
+        /// finalize seam binds it (connection_scoped + held); `interpretCmd`
+        /// routes the URL here instead of libcurl. We parse `{scope, files}`
+        /// from the fetch body, hand a `compile_batch` job to the
+        /// DeployThread, and let it emit the terminal bound event that
+        /// resumes the held chain. ADMIN-ONLY: only `__admin__` may compile
+        /// (cross-tenant staging) — the issuing tenant is native-set on the
+        /// PendingFetch, not forgeable by JS. On any rejection we route a
+        /// failure event so the held chain resolves instead of hanging.
+        pub fn submitCompile(self: *Self, pf_in: globals.PendingFetch) void {
+            var pf = pf_in;
+            defer pf.deinit(self.allocator);
+            const a = self.allocator;
+            const router = &self.node.router;
+
+            const fail = struct {
+                fn emit(rt: *MsgRouter, alloc: std.mem.Allocator, p: *const globals.PendingFetch, status: u16, msg: []const u8) void {
+                    const cj = std.fmt.allocPrint(alloc, "{{\"ok\":false,\"status\":{d},\"error\":\"{s}\"}}", .{ status, msg }) catch return;
+                    deploy_thread_mod.routeCompileEvent(rt, alloc, p.id, p.tenant_id, p.name, status, false, cj);
+                }
+            }.emit;
+
+            if (!std.mem.eql(u8, pf.tenant_id, tenant_mod.ADMIN_INSTANCE_ID)) {
+                std.log.warn("rove-js compile: non-admin tenant {s} attempted platform.compile; rejecting", .{pf.tenant_id});
+                return fail(router, a, &pf, 403, "platform.compile is admin-only");
+            }
+            const dt = self.deploy_thread orelse return fail(router, a, &pf, 503, "deploy thread not started");
+
+            var parsed = std.json.parseFromSlice(struct {
+                scope: []const u8,
+                files: []const struct { path: []const u8, source: []const u8 },
+            }, a, pf.body, .{ .ignore_unknown_fields = true }) catch
+                return fail(router, a, &pf, 400, "expected {scope, files:[{path,source}]}");
+            defer parsed.deinit();
+            const p = parsed.value;
+            if (p.scope.len == 0) return fail(router, a, &pf, 400, "scope required");
+            if (p.files.len == 0) return fail(router, a, &pf, 400, "at least one file required");
+            if (p.files.len > 256) return fail(router, a, &pf, 400, "too many files (max 256)");
+
+            // Build owned DeployInput[] (all handlers).
+            const inputs = a.alloc(files_mod.DeployInput, p.files.len) catch
+                return fail(router, a, &pf, 500, "out of memory");
+            var built: usize = 0;
+            const inputs_ok = blk: {
+                for (p.files) |f| {
+                    const path_owned = a.dupe(u8, f.path) catch break :blk false;
+                    const src_owned = a.dupe(u8, f.source) catch {
+                        a.free(path_owned);
+                        break :blk false;
+                    };
+                    inputs[built] = .{ .path = path_owned, .kind = .handler, .content_type = "", .bytes = src_owned };
+                    built += 1;
+                }
+                break :blk true;
+            };
+            const freeInputs = struct {
+                fn f(alloc: std.mem.Allocator, ins: []files_mod.DeployInput, n: usize) void {
+                    for (ins[0..n]) |*in| {
+                        alloc.free(in.path);
+                        alloc.free(in.bytes);
+                    }
+                    alloc.free(ins);
+                }
+            }.f;
+            if (!inputs_ok) {
+                freeInputs(a, inputs, built);
+                return fail(router, a, &pf, 500, "out of memory");
+            }
+
+            // Owned routing fields (scope to stage into; chain tenant + fetch
+            // id + resume export to route the completion back to the held
+            // admin chain). On any dupe failure, free everything.
+            const scope_owned = a.dupe(u8, p.scope) catch {
+                freeInputs(a, inputs, built);
+                return fail(router, a, &pf, 500, "out of memory");
+            };
+            const chain_owned = a.dupe(u8, pf.tenant_id) catch {
+                a.free(scope_owned);
+                freeInputs(a, inputs, built);
+                return fail(router, a, &pf, 500, "out of memory");
+            };
+            const fid_owned = a.dupe(u8, pf.id) catch {
+                a.free(scope_owned);
+                a.free(chain_owned);
+                freeInputs(a, inputs, built);
+                return fail(router, a, &pf, 500, "out of memory");
+            };
+            const name_owned: []u8 = if (pf.name.len != 0) (a.dupe(u8, pf.name) catch {
+                a.free(scope_owned);
+                a.free(chain_owned);
+                a.free(fid_owned);
+                freeInputs(a, inputs, built);
+                return fail(router, a, &pf, 500, "out of memory");
+            }) else &.{};
+            // Echo the on.fetch issue-time ctx back in the completion (under
+            // `app`) so the handler can thread state across the compile
+            // re-entry (the deploy app's {target, statics}).
+            const app_ctx_owned: []u8 = if (pf.ctx_json.len != 0 and !std.mem.eql(u8, pf.ctx_json, "null"))
+                (a.dupe(u8, pf.ctx_json) catch {
+                    a.free(scope_owned);
+                    a.free(chain_owned);
+                    a.free(fid_owned);
+                    if (name_owned.len != 0) a.free(name_owned);
+                    freeInputs(a, inputs, built);
+                    return fail(router, a, &pf, 500, "out of memory");
+                })
+            else
+                &.{};
+
+            self.next_compile_id += 1;
+            dt.enqueue(.{
+                .compile_id = self.next_compile_id,
+                .kind = .compile_batch,
+                .tenant_id = scope_owned,
+                .inputs = inputs,
+                .chain_tenant = chain_owned,
+                .fetch_id = fid_owned,
+                .name = name_owned,
+                .app_ctx = app_ctx_owned,
+            }) catch {
+                a.free(scope_owned);
+                a.free(chain_owned);
+                a.free(fid_owned);
+                if (name_owned.len != 0) a.free(name_owned);
+                if (app_ctx_owned.len != 0) a.free(app_ctx_owned);
+                freeInputs(a, inputs, built);
+                return fail(router, a, &pf, 503, "deploy queue unavailable");
             };
         }
 

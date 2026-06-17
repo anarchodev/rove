@@ -540,6 +540,7 @@ fn finalizeForward(worker: anytype, ent: rove.Entity, status: u16, body: []u8) !
     try server.reg.move(ent, &worker.forward_pending, &server.response_in);
 }
 
+
 // ── Shared deployment-resolve ─────────────────────────────────────────
 
 /// Handler-cmds Phase 8: the deployment + bytecode resolution that
@@ -1491,7 +1492,7 @@ fn resumeContinuation(
         .activation = if (wake) .{ .wake_batch = .{} } else .send_callback,
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
         .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
-        .admin = .{ .platform = inst.platform },
+        .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
         .effects = .{ .pending_fetches = &pending_fetches },
     };
     std.log.info("rove-js corr: resume corr={s} request_id={d} tenant={s}", .{ correlation_id orelse "(none)", request_id, inst.id });
@@ -1934,7 +1935,7 @@ pub fn resumeBoundFetchChain(
         .activation_fetches_pending = fetches_pending,
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
         .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
-        .admin = .{ .platform = inst.platform },
+        .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
         .trampolines = .{
             .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
             .resume_if_bound_ctx = @ptrCast(worker),
@@ -2228,6 +2229,11 @@ pub fn flushResumeFetches(
                 cnt.pending +%= 1;
             } else |_| {}
         }
+        // Trusted internal doors (compile / stampManifest / receive) go to
+        // the worker-local subsystem, never the engine — AFTER the bind
+        // registration above so the door's completion event resumes THIS
+        // held chain. `tryDoorFetch` consumes the fetch.
+        if (worker.tryDoorFetch(pf.*)) continue;
         submit.append(allocator, pf.*) catch {
             pf.deinit(allocator);
             continue;
@@ -3095,7 +3101,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
         .activation_fetches_pending = fetches_pending,
         .trace = .{ .readset = &readset, .request_id = request_id, .correlation_id = correlation_id },
         .plan = .{ .limiter = &worker.limiter, .instance_id = inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
-        .admin = .{ .platform = inst.platform },
+        .admin = .{ .platform = inst.platform, .platform_caps = worker.adminPlatformCaps(inst) },
         .trampolines = .{
             .resume_if_bound = &@TypeOf(worker.*).resumeIfBoundTrampoline,
             .resume_if_bound_ctx = @ptrCast(worker),

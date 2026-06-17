@@ -14,6 +14,9 @@
 
 (function () {
   const sys = _system.platform;
+  // `on.fetch` native (captured before `_harden.js` deletes `_system`) —
+  // `platform.compile` lowers to a bound fetch to a trusted compile door.
+  const sysOn = _system.on;
 
   /**
    * Admin control plane: cross-tenant kv access, the platform root
@@ -24,22 +27,90 @@
    */
   globalThis.platform = {
     /**
-     * Get a kv accessor scoped to another instance's `app.db`. The
-     * explicit cross-tenant accessor (replaces the old X-Rove-Scope
-     * global-kv rebind).
+     * Get accessors scoped to another instance — the explicit
+     * cross-tenant grant (replaces the old X-Rove-Scope global-kv rebind).
      *
      * @param {string} id - Target instance id (non-empty).
-     * @returns {{kv:{get:function,set:function,delete:function,prefix:function}}}
-     *   `kv` has the same four methods as the global {@link kv}, bound
-     *   to instance `id`. Unknown id throws
-     *   `Error{code:"InstanceNotFound"}`.
+     * @returns {{kv:object, blob:object, deploy:object}}
+     *   - `kv` — `{get, set, delete, prefix}`, the same as the global
+     *     {@link kv}, bound to instance `id`.
+     *   - `blob` — `{put(bytes, {content_type})}`: stage a content-addressed
+     *     blob into `id`'s file-blobs; returns the sha256 hash synchronously
+     *     (the PUT defers off the poll loop). The blob twin of `kv`.
+     *   - `deploy` — `{stampManifest(entries)}`: write a deployment manifest
+     *     into `id`'s deployments/ from the app's composed `entries`
+     *     (`[{path, kind, source_hex, bytecode_hex?, content_type?}]`);
+     *     returns the dep_id (16-hex). Compose deploys with
+     *     {@link platform.compile} + `blob.put` + `stampManifest`, then
+     *     activate with {@link platform.releases.publish}.
+     *   Unknown id throws `Error{code:"InstanceNotFound"}`.
      *
      * @example
      * const { kv: tenantKv } = platform.scope(req.instanceId);
      * const profile = tenantKv.get("profile");
      */
     scope(id) {
-      return sys.scope(id);
+      const s = sys.scope(id);
+      // deploy.stampManifest is the deploy's STAGING BARRIER — it lowers to
+      // a bound on.fetch (not a native sync call) so it resumes your handler
+      // only once the manifest (the last staging write) AND every prior
+      // bytecode/static PUT is durable. Return next() after it; the result
+      // arrives at the `name` export (default onStamped) as
+      // `request.ctx = {ok, dep_id}`.
+      s.deploy = {
+        stampManifest(entries, opts) {
+          opts = opts || {};
+          return sysOn.fetch(
+            "http://rove-stage.internal/",
+            { method: "POST", body: JSON.stringify({ scope: id, entries }) },
+            { to: opts.name || "onStamped" },
+          );
+        },
+      };
+      return s;
+    },
+
+    /**
+     * Compile handler sources to bytecode + content-address them into
+     * `scope`'s blobs, off the hot path (`rewind-cli-plan.md` §4.1).
+     * Admin-only (the issuing tenant is checked natively). Source →
+     * bytecode is the one irreducibly-native deploy step; it's async
+     * (compile is slow) but its result is deterministic + idempotent, so
+     * it needs no replay tape.
+     *
+     * **Bound, like {@link on.fetch}:** the call binds to the held chain,
+     * so you must `return next()` after it; the result resumes your
+     * handler at the `name` export (default `onFetchResult`) with
+     * `request.ctx = {ok, results:[{path, source_hex, bytecode_hex}]}`
+     * (or `{ok:false, status, error}`). Compose the manifest from those
+     * hashes + your statics and stamp it there. Stage/activate is still a
+     * separate `platform.releases.publish`.
+     *
+     * @param {Array<{path:string, source:string}>} files - Handler sources.
+     * @param {object} opts
+     * @param {string} opts.scope - Target instance id (where blobs stage).
+     * @param {string} [opts.name="onFetchResult"] - Resume export.
+     * @returns {string} The bound fetch id.
+     *
+     * @example
+     * platform.compile(handlers, { scope: tenant, name: "onCompiled" });
+     * return next();
+     * // export function onCompiled(request) {
+     * //   const { results } = request.ctx; ...stamp manifest...
+     * // }
+     */
+    compile(files, opts) {
+      opts = opts || {};
+      const body = JSON.stringify({ scope: opts.scope, files });
+      // `opts.ctx` threads forward across the compile re-entry — it's echoed
+      // in the result as `request.ctx.app` (the bound resume otherwise only
+      // surfaces the compile output). Use it to carry e.g. the deploy's
+      // target + composed static entries into the onCompiled handler.
+      return sysOn.fetch(
+        "http://rove-compile.internal/",
+        { method: "POST", body, ctx: opts.ctx },
+        { to: opts.name || "onFetchResult" },
+      );
     },
 
     /**

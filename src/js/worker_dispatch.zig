@@ -23,7 +23,6 @@ const bodies_mod = @import("rove-bodies");
 const jwt = @import("rove-jwt");
 const tenant_mod = @import("rove-tenant");
 const blob_mod = @import("rove-blob");
-const files_server_mod = @import("rove-files-server");
 const config_mirror = @import("config_mirror.zig");
 const effect_mod = @import("effect/root.zig");
 
@@ -41,6 +40,7 @@ const panic_mod = @import("panic.zig");
 const worker_mod = @import("worker.zig");
 const components_mod = @import("components.zig");
 const session_mod = @import("session.zig");
+const deploy_thread_mod = @import("deploy_thread.zig");
 
 // Edge-proxy detection. rove-h2 is HTTP/2-only and TLS deployments
 // rely on ALPN — direct exposure to the public internet silently
@@ -853,9 +853,9 @@ fn finalizeBatch(
             // engine. Partition them out in place.
             var keep: usize = 0;
             for (batch_pending_fetches.items) |pf| {
-                if (blob_receive_mod.isReceiveUrl(pf.url)) {
-                    worker.armBlobReceive(pf);
-                } else {
+                // Trusted internal doors (receive/compile/stampManifest) →
+                // worker-local subsystem; everything else → the engine.
+                if (!worker.tryDoorFetch(pf)) {
                     batch_pending_fetches.items[keep] = pf;
                     keep += 1;
                 }
@@ -1132,6 +1132,17 @@ fn tryHandleSystem(
     // `publishRelease` RPC instead.
     if (std.mem.eql(u8, sys_rest, "release")) {
         try handleRelease(server, allocator, worker, ent, sid, sess, method, body, cors_origin);
+        return true;
+    }
+
+    // Bootstrap + break-glass (`docs/rewind-cli-plan.md` §4). Root-token
+    // gated, NO body: (re)deploy the BAKED `__admin__` deploy app and stamp
+    // `_deploy/current`, recovering a virgin or bricked control tenant. Every
+    // ARBITRARY deploy (the full admin, customers) goes THROUGH the deployed
+    // app — this route only ever deploys the embedded bundle, idempotently
+    // (content-addressed → same dep_id on re-run).
+    if (std.mem.eql(u8, sys_rest, "reset")) {
+        try handleReset(server, allocator, worker, ent, sid, sess, method, cors_origin);
         return true;
     }
 
@@ -1965,6 +1976,44 @@ fn handleRelease(
     worker_mod.parkKvWakes(worker, seq, parsed.value.tenant_id, &ws_local, release_cmds) catch |perr|
         std.log.warn("release: parkKvWakes (tenant={s}) failed: {s}", .{ parsed.value.tenant_id, @errorName(perr) });
 }
+
+/// `POST /_system/reset` — bootstrap + break-glass (`docs/rewind-cli-plan.md`
+/// §4). Root-token gated, NO body. (Re)deploys the BAKED `__admin__` deploy app
+/// + stamps `_deploy/current` via `worker.deployBakedAdmin`. Synchronous (rare,
+/// operator-triggered) — runs inline on the poll loop. Returns
+/// `{"ok":true,"dep_id":"<016x>"}`; 503 if this node doesn't lead `__admin__`'s
+/// group (retry against the leader).
+fn handleReset(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    cors_origin: ?[]const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "POST")) {
+        try respb.setSystemResponse(server, ent, sid, sess, 405, "POST only\n", allocator, cors_origin, null);
+        return;
+    }
+    const dep_id = worker.deployBakedAdmin() catch |err| {
+        const status: u16 = switch (err) {
+            error.NotLeader, error.AdminNotInitialized => 503,
+            else => 500,
+        };
+        const msg = switch (err) {
+            error.NotLeader => "not leader of __admin__ group; retry against the leader\n",
+            error.AdminNotInitialized => "__admin__ tenant not initialized\n",
+            else => "reset failed\n",
+        };
+        try respb.setSystemResponse(server, ent, sid, sess, status, msg, allocator, cors_origin, null);
+        return;
+    };
+    const body = try std.fmt.allocPrint(allocator, "{{\"ok\":true,\"dep_id\":\"{x:0>16}\"}}\n", .{dep_id});
+    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, body, allocator, cors_origin, "application/json");
+}
+
 
 /// Body shape: `{"pairs":[{"key":"<k>","value":"<v>"}, ...]}`. Writes
 /// each pair into `__admin__/app.db` via a raft-replicated envelope
@@ -3299,12 +3348,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 // requests get none, and the JS callables reject at the
                 // gate before reaching any trampoline. Scope reads go
                 // direct in globals.zig (no trampoline).
-                .platform_caps = if (handler_inst.platform != null) .{
-                    .ctx = @ptrCast(worker),
-                    .deploy_starter = &@TypeOf(worker.*).deployStarterTrampoline,
-                    .release_publish = &@TypeOf(worker.*).releasePublishTrampoline,
-                    .scope_kv_write = &@TypeOf(worker.*).scopeKvWriteTrampoline,
-                } else null,
+                .platform_caps = worker.adminPlatformCaps(handler_inst),
             },
             .trampolines = .{
                 // Phase 5 PR-3: §6.4 held-sync resume hook trampoline.

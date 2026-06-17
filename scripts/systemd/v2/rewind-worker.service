@@ -1,4 +1,4 @@
-# User-scoped service unit for the V2 data-plane worker (rewind).
+# User-scoped service unit for the V2 data-plane worker (rewind-worker).
 # See rewind-cp.service for the install recipe + the 3-process picture.
 # Full plan: docs/v2-production-deploy-plan.md.
 #
@@ -19,7 +19,7 @@ Type=simple
 EnvironmentFile=%h/.config/rove/common.env
 EnvironmentFile=%h/.config/rove/node.env
 ExecStartPre=/usr/bin/install -d -m0700 %h/.rove/data/worker
-ExecStart=%h/.local/bin/rewind %h/.rove/data/worker 8443
+ExecStart=%h/.local/bin/rewind-worker %h/.rove/data/worker 8443
 
 # Restart=always is load-bearing for boot-time tenant-group recovery: a
 # restarted node re-joins every tenant raft group it hosts and catches

@@ -17,7 +17,7 @@ store reopens and a follow-up write still commits.
 Requires S3 env (there is no fs BlobBackend) — source the repo `.env`
 first, e.g.  `set -a; . ./.env; set +a; python3 scripts/rewind_smoke.py`.
 
-Build first:  `zig build rewind`
+Build first:  `zig build rewind-worker`
 """
 
 import json
@@ -29,7 +29,7 @@ import time
 
 PORT = int(os.environ.get("REWIND_SMOKE_PORT", "18097"))
 DATA_DIR = f"/tmp/rewind-smoke-{os.getpid()}"
-BIN = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin", "rewind")
+BIN = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin", "rewind-worker")
 ADMIN_HOST = "admin.localhost"
 ROOT_TOKEN = "smoke-nonprod-root-token-0123456789abcdef"  # non-default: rewind rejects the default
 
@@ -88,7 +88,7 @@ def stop(p):
 
 def main():
     if not os.path.exists(BIN):
-        raise SystemExit(f"{BIN} not found — run `zig build rewind` first")
+        raise SystemExit(f"{BIN} not found — run `zig build rewind-worker` first")
     if not os.environ.get("S3_ENDPOINT"):
         raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
 

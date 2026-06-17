@@ -43,7 +43,7 @@ SETCAP="${ROVE_SETCAP:-0}"
 SKIP_TESTS="${ROVE_SKIP_TESTS:-0}"
 HEALTH_TIMEOUT=60
 
-BINS=(rewind rewind-cp rewind-front)
+BINS=(rewind-worker rewind-cp rewind-front)
 OUT="$REPO_ROOT/zig-out/bin"
 
 # `systemctl --user` over a non-login ssh session needs the user-bus env.
@@ -58,7 +58,7 @@ die(){ printf '%sFATAL: %s%s\n' "$c_err" "$*" "$c_off" >&2; exit 1; }
 
 # ── 1. Build + test gate ──────────────────────────────────────────────
 log "Building V2 binaries (ReleaseFast)"
-( cd "$REPO_ROOT" && zig build rewind rewind-cp rewind-front -Doptimize=ReleaseFast ) \
+( cd "$REPO_ROOT" && zig build rewind-worker rewind-cp rewind-front -Doptimize=ReleaseFast ) \
     || die "build failed"
 for b in "${BINS[@]}"; do [ -x "$OUT/$b" ] || die "missing build output: $OUT/$b"; done
 ok "built ${BINS[*]}"

@@ -148,7 +148,7 @@ pub fn spawn(config: Config) !*Handle {
 
 fn threadMain(h: *Handle) void {
     runThread(h) catch |err| {
-        std.log.err("log-server-standalone: thread exited: {s}", .{@errorName(err)});
+        std.log.err("rewind-logs: thread exited: {s}", .{@errorName(err)});
     };
 }
 
@@ -182,9 +182,9 @@ fn runThread(h: *Handle) !void {
     h.ready.set();
 
     if (h.config.tls_config != null) {
-        std.log.info("log-server-standalone: h2 (TLS) on port {d}", .{h.port});
+        std.log.info("rewind-logs: h2 (TLS) on port {d}", .{h.port});
     } else {
-        std.log.info("log-server-standalone: h2c on 127.0.0.1:{d}", .{h.port});
+        std.log.info("rewind-logs: h2c on 127.0.0.1:{d}", .{h.port});
     }
 
     var retention = RetentionCache.init(allocator);
@@ -329,9 +329,9 @@ fn processRequests(
 
     for (entities, sids, sessions, req_hdrs, req_bodies) |ent, sid, sess, rh, rb| {
         handleOne(server, allocator, rctx, ent, sid, sess, rh, rb) catch |err| {
-            std.log.warn("log-server-standalone: handler error: {s}", .{@errorName(err)});
+            std.log.warn("rewind-logs: handler error: {s}", .{@errorName(err)});
             setResponse(server, ent, sid, sess, 500, "internal error\n", rctx.cfg) catch |se| std.log.err(
-                "log-server-standalone: 500 write failed: {s}",
+                "rewind-logs: 500 write failed: {s}",
                 .{@errorName(se)},
             );
         };
@@ -402,8 +402,9 @@ fn handleOne(
             const msg = switch (err) {
                 jwt.Error.Expired => "token expired\n",
                 jwt.Error.BadSignature => "bad signature\n",
-                jwt.Error.Malformed, jwt.Error.UnsupportedAlg => "malformed token\n",
+                jwt.Error.Malformed, jwt.Error.UnsupportedAlg, jwt.Error.InvalidTenant => "malformed token\n",
                 jwt.Error.MissingCap, jwt.Error.InvalidCap => "missing required capability\n",
+                jwt.Error.WrongTenant => "token not valid for this tenant\n",
                 jwt.Error.OutOfMemory => "out of memory\n",
             };
             try setResponse(server, ent, sid, sess, 401, msg, rctx.cfg);

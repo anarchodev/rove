@@ -9,7 +9,7 @@ Topology, spec, and the full runbook: [`docs/v2-production-deploy-plan.md`](../.
 | Unit | Binary | Listens | Role |
 |---|---|---|---|
 | `rewind-cp.service` | `rewind-cp` | `:9090` + raft `:9101` | directory raft + `/_control` + `/_cp` |
-| `rewind-worker.service` | `rewind` | `:8443` h2c + raft `:8501` | DP multi-raft + JS dispatch |
+| `rewind-worker.service` | `rewind-worker` | `:8443` h2c + raft `:8501` | DP multi-raft + JS dispatch |
 | `rewind-front.service` | `rewind-front` | `:443` + `:80` | stateless public TLS edge |
 
 Start order is encoded via `After=`/`Wants=`: **cp → worker → front**.
@@ -25,8 +25,8 @@ root parts are already done.
 
 ```bash
 # 1. binaries (or just run scripts/deploy.sh from your workstation)
-zig build rewind rewind-cp rewind-front -Doptimize=ReleaseFast
-install -D -m0755 zig-out/bin/rewind       ~/.local/bin/rewind
+zig build rewind-worker rewind-cp rewind-front -Doptimize=ReleaseFast
+install -D -m0755 zig-out/bin/rewind-worker ~/.local/bin/rewind-worker
 install -D -m0755 zig-out/bin/rewind-cp    ~/.local/bin/rewind-cp
 install -D -m0755 zig-out/bin/rewind-front ~/.local/bin/rewind-front
 

@@ -28,6 +28,15 @@ const files_mod = @import("rove-files");
 
 const STARTER_INDEX_MJS = @embedFile("starter_index_mjs");
 const STARTER_STATIC_INDEX_HTML = @embedFile("starter_static_index_html");
+/// The genesis `__admin__` deploy app (rewind-cli-plan §4.1 (f)) — the
+/// minimal handler that composes deploys from `platform.*`. Baked so a
+/// virgin cluster self-bootstraps deploy capability; the full admin is then
+/// published THROUGH it.
+const GENESIS_ADMIN_MJS = @embedFile("genesis_admin_mjs");
+
+/// One baked handler / static file for `deployBakedBundle`.
+pub const BakedHandler = struct { path: []const u8, source: []const u8 };
+pub const BakedStatic = struct { path: []const u8, content: []const u8, content_type: []const u8 };
 
 /// Write the initial deployment for a freshly-created instance. Opens
 /// its own short-lived kv + blob-store connections, pushes the two
@@ -52,6 +61,61 @@ pub fn deployStarterContent(
     compile_fn: files_mod.CompileFn,
     compile_ctx: ?*anyopaque,
     release_ws: *kv_mod.WriteSet,
+) !u64 {
+    return deployBakedBundle(
+        allocator,
+        inst_dir,
+        inst_id,
+        blob_cfg,
+        compile_fn,
+        compile_ctx,
+        release_ws,
+        &.{.{ .path = "index.mjs", .source = STARTER_INDEX_MJS }},
+        &.{.{ .path = "_static/index.html", .content = STARTER_STATIC_INDEX_HTML, .content_type = "text/html; charset=utf-8" }},
+    );
+}
+
+/// Deploy the genesis `__admin__` deploy app (rewind-cli-plan §4.1 (f)) — the
+/// baked minimal handler that composes deploys from `platform.*`. One handler,
+/// no statics. Same staging path as the starter; the caller proposes
+/// `release_ws`'s `_deploy/current` through raft.
+pub fn deployGenesisAdminContent(
+    allocator: std.mem.Allocator,
+    inst_dir: []const u8,
+    inst_id: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
+    compile_fn: files_mod.CompileFn,
+    compile_ctx: ?*anyopaque,
+    release_ws: *kv_mod.WriteSet,
+) !u64 {
+    return deployBakedBundle(
+        allocator,
+        inst_dir,
+        inst_id,
+        blob_cfg,
+        compile_fn,
+        compile_ctx,
+        release_ws,
+        &.{.{ .path = "index.mjs", .source = GENESIS_ADMIN_MJS }},
+        &.{},
+    );
+}
+
+/// Stage a baked bundle (compile + content-address each file, write the
+/// manifest to the tenant's `deployments/` backend) and stage
+/// `_deploy/current = dep_id` into `release_ws`. Shared by the starter +
+/// genesis-admin deploys. Opens its own short-lived scratch kv + blob
+/// connections and closes them on the way out.
+pub fn deployBakedBundle(
+    allocator: std.mem.Allocator,
+    inst_dir: []const u8,
+    inst_id: []const u8,
+    blob_cfg: blob_mod.BackendConfig,
+    compile_fn: files_mod.CompileFn,
+    compile_ctx: ?*anyopaque,
+    release_ws: *kv_mod.WriteSet,
+    handlers: []const BakedHandler,
+    statics: []const BakedStatic,
 ) !u64 {
     // Same scratch-only role as bootstrap.zig's
     // `.bootstrap-scratch.kv` — `files_mod.FileStore.init` demands
@@ -89,8 +153,8 @@ pub fn deployStarterContent(
         compile_ctx,
     );
 
-    try store.putSource("index.mjs", STARTER_INDEX_MJS);
-    try store.putStatic("_static/index.html", STARTER_STATIC_INDEX_HTML, "text/html; charset=utf-8");
+    for (handlers) |h| try store.putSource(h.path, h.source);
+    for (statics) |s| try store.putStatic(s.path, s.content, s.content_type);
 
     const entries = try store.assembleManifest();
     defer store.freeEntries(entries);

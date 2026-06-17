@@ -27,7 +27,7 @@ that window would be missed — gap-free overlap ordering + the atomic cutover
 are slice (c). The smoke takes no writes in that window.
 
 Requires S3 env (no fs BlobBackend) — `set -a; . ./.env; set +a` first.
-Build:  `zig build rewind`
+Build:  `zig build rewind-worker`
 """
 
 import os
@@ -37,7 +37,7 @@ import sys
 import time
 
 BINDIR = os.path.join(os.path.dirname(__file__), "..", "zig-out", "bin")
-REWIND = os.path.join(BINDIR, "rewind")
+REWIND = os.path.join(BINDIR, "rewind-worker")
 
 PSRC = int(os.environ.get("SRC_PORT", "18121"))
 PDST = int(os.environ.get("DST_PORT", "18122"))
@@ -165,7 +165,7 @@ def stop_all():
 
 def main():
     if not os.path.exists(REWIND):
-        raise SystemExit(f"{REWIND} not found — run `zig build rewind`")
+        raise SystemExit(f"{REWIND} not found — run `zig build rewind-worker`")
     if not os.environ.get("S3_ENDPOINT"):
         raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
 
