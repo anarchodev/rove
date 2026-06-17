@@ -216,13 +216,22 @@ single CP call; a **non-wildcard** custom host (`cli-custom.test`) resolves to
 its tenant via the CP-propagated alias → `200`. No drift (one source of truth),
 self-heal-on-move noted as a follow-up (re-push on attach).
 
-### B4. Move operator secrets off the shell — *S (delivery, not code)*
-Operator day-to-day becomes the dashboard login; behind it the admin
-mints short-lived scoped caps per op. `REWIND_MOVE_SECRET` becomes
-cp↔worker S2S only; `REWIND_ROOT_TOKEN` stays break-glass; `rewind-ops`
-keeps only the break-glass path. Per §7 "After: the standing secrets" —
-move-secret is *moved, not eliminated* (its own quiet high-privilege key,
-deliberately not folded into the busy services-HMAC). Depends on B2.
+### B4. Move operator secrets off the shell — *M (needs a CP door, not just delivery)*
+The plan's original "delivery, not code" was wrong (like B3): the dashboard
+covers the worker-plane ops (deploy/release/logs via OIDC), but
+provision/move/host/plan are **CP** ops (move-secret) the dashboard **can't
+reach** — `platform.*` has no control-plane accessor. So getting move-secret
+off the *day-to-day* shell needs code: an `__admin__`-only **`rewind-cp.internal`
+door** (the A5 logs-door pattern: the worker attaches the move-secret + rewrites
+to the CP) + dashboard `/v1/cp/{provision,move,host,plan}` routes. Then the
+operator does CP ops through the OIDC dashboard; move-secret is engine-held
+(off the shell); `rewind-ops` is break-glass.
+
+> **North star (`cp-desired-state-target.md`):** B4 is one step toward the CP
+> owning *all* per-tenant desired-state (incl. release) with workers
+> reconciling — one S2S key, root token retired. B4 routes the operator's CP
+> ops through the dashboard; the release-reconciler + reset-via-CP (which retire
+> the root token) are the larger follow-on arc captured there.
 
 ### B5. Build the `rewind` customer CLI — *M*
 Shares `src/cli/common.zig` with `rewind-ops` (bundle classifier + mint),

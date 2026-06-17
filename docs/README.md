@@ -60,6 +60,7 @@ Active work on the current (V2) line. Each folds into `architecture/` on ship.
 
 - [v2-production-deploy-plan.md](v2-production-deploy-plan.md) — first production topology (not yet built)
 - [step3-auth-plan.md](step3-auth-plan.md) — Step 3 auth consolidation: sequenced execution plan (OIDC machinery is written; remaining = wire + deploy + close the log-server tenant-scoping gap). Design rationale in `rewind-cli-plan.md` §7
+- [cp-desired-state-target.md](cp-desired-state-target.md) — north-star (not yet built): CP owns all per-tenant desired-state incl. release; workers reconcile; one S2S key (move-secret); root token retires. The arc B3/B4 point at
 - [websocket-plan.md](websocket-plan.md) — inbound WS (single-node baseline shipped 2026-06-09: transport + worker seam + smoke; remaining: broadcast recipe docs, outbound WS)
 - [inbound-chunk-plan.md](inbound-chunk-plan.md) — streaming inbound body / `onChunk` (gap 2.4; S1–S5 shipped 2026-06-10 incl. per-chunk tape; front-door streaming proxy + h1 inbound streaming shipped 2026-06-11 — gap fully closed)
 - [tape-minimization.md](tape-minimization.md) — the minimal replay tape (4 record kinds) + tape-by-reference design
