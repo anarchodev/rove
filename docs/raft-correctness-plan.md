@@ -52,7 +52,7 @@ build break:
 | `c5c9a9c` | FFI | `apply_local_snapshot` rejects a term-0 baseline (new code `-5`) — engine backstop for the `commit_to`-past-empty-log fatal. `conf_state`/`voter_progress` null-check out-pointers. Loud logs on dropped outbound messages / failed committed conf-changes. |
 | `6165419` | wrapper | Map FFI `-1`→`Error.UnknownGroup` in `step`/`stepFenced`/`proposeConfChange`/`applyLocalSnapshot`. `applyLocalSnapshot` input gate (`index>0 && term>0`) + `-5`→`InvalidBaseline`. Loud-log discarded truncation in `confState`/`voterProgress`. `appendEntriesCb` `GapInLog` → panic. |
 | `87ed59e` | WAL | C1: fsync the compaction marker before `gcSealed` unlinks the segment it protects (`compact` + `applyLocalSnapshot`). C2: `roll()` fsyncs the new header + parent dir. C4: malformed fixed-size (hardstate/compaction) record → reject. C5: `initRecover` propagates confstate corruption. S3: `discoverSealedSegments` distinguishes `FileNotFound` from I/O error. C3: `gcSealed` logs a failed unlink. |
-| `f34e8c6` | FFI+wrapper | **A1**: `raft_manager_log_term` gains an out-param + i32 rc (0 ok / -1 unknown group / -2 no term at index); `manager.logTerm` → `?u64`, `null` distinct from a genuine term 0. |
+| `f34e8c6` | FFI+wrapper | **A1**: `raft_manager_log_term` → out-param + i32 rc (0 ok / -1 unknown-group / -2 no-term-at-index); `manager.logTerm` → `?u64`, `null` distinct from a genuine term 0. |
 
 ### rove `feat/cp-membership-reconciler` (pushed)
 
@@ -60,7 +60,8 @@ build break:
 |---|---|
 | `29c4c25` | DP: `v2-attach` baseline header → 400 on garbage (was `catch 0`), reject `index>0 && term==0`; `v2-confchange` rejects `node_id==0`; `v2-apply-snapshot` rejects `index==0`/`term==0`. Consensus: tear down a half-born group if the atomic baseline install fails; `Error.InvalidBaseline` term-0 guard. CP reconciler: tri-state `nodeGroupState` (remove only on confirmed-404, never on a probe error); `.failed` vs `.progressed` so one stuck node can't starve backfill; boot refusal when the reconciler is enabled without `REWIND_MOVE_SECRET`. Transport: oversize-frame loud teardown + flush-side coalescing cap; unknown-peer loud teardown; fixed reconnect backoff; recv self-heal sweep. |
 | `49d9974` | Bump raft-rs-zig pin `da0129f → 87ed59e`. |
-| (A1) | `Node.logTerm`/`Bridge.logTerm` → `?u64` (control cmd carries an `lt_ok` flag, mirroring `vp_ok`); `v2-applied-baseline` uses `orelse 409` instead of the `term==0` band-aid; pin → `f34e8c6`. |
+| `9d5fc0f` | **A1** (rove half): `Node.logTerm`/`Bridge.logTerm` → `?u64` (the `log_term` control cmd carries an `lt_ok` flag, mirroring `vp_ok`); `v2-applied-baseline` uses `orelse 409` instead of the `term==0` band-aid; pin → `f34e8c6`. |
+| (this branch) | **A2**: `node.applyLocalSnapshot` stamps the store's durable applied watermark (`setLastAppliedRaftIdx`) to the baseline index + bumps `slot.applied_idx`/`durabilized_idx`. **D**: `scripts/raft_soak_prod.py` crash/recovery soak. |
 
 ## Remaining work
 
@@ -69,21 +70,22 @@ repos and needs the protocol above.
 
 ### A. Coordinated cross-repo
 
-**A1 — `logTerm` error channel — DONE** (raft-rs-zig `f34e8c6`, rove this branch).
+**A1 — `logTerm` error channel — DONE** (raft-rs-zig `f34e8c6`, rove `9d5fc0f`).
 `raft_manager_log_term` no longer collapses {compacted, beyond-log, unknown group,
-genuine term-0} into `0`: it takes an out-param + i32 rc (0 / -1 unknown-group / -2
-no-term-at-index), `manager.logTerm`/`Node.logTerm`/`Bridge.logTerm` return `?u64`
-(`null` distinct from a real 0), and `v2-applied-baseline` refuses with 409 via
-`orelse` rather than the old `term==0` band-aid. Landed as a coordinated signature
-change per the protocol (FFI+wrapper pushed, then rove caller + pin bump together).
+genuine term-0} into `0`: an out-param + i32 rc (0 / -1 unknown-group / -2 no-term)
+threads `?u64` through `manager`/`Node`/`Bridge.logTerm` (via an `lt_ok` control-cmd
+flag), and `v2-applied-baseline` refuses with 409 via `orelse`. `null` is distinct
+from a genuine term 0, so no caller stamps a fake 0 into a baseline. Landed as a
+coordinated signature change per the protocol.
 
-**A2 — `applyLocalSnapshot` doesn't stamp the store durability watermark (MEDIUM,
-known Ph2 hazard).** After installing a baseline at index N, the raft log baseline
-is N but the kvexp store's `lastAppliedRaftIdx` / `slot.applied_idx` are not moved
-to N. A crash in the rejoin window recovers a store below N while the WAL no longer
-holds entries ≤ N → silent divergence / lost coverage. Fix lives at the
-`node.applyLocalSnapshot` seam (rove `src/consensus/node.zig`) — stamp the store
-watermark in the same op; verify against `promote_back` + a crash-injection test.
+**A2 — store watermark on `applyLocalSnapshot` — DONE** (rove, this branch).
+`node.applyLocalSnapshot` now synchronously stamps the store's durable applied
+watermark (`setLastAppliedRaftIdx`) to the baseline index and bumps
+`slot.applied_idx`/`durabilized_idx`, so a crash in the rejoin window can't recover
+a store BELOW the raft baseline (entries ≤ index gone from the WAL). Stamping at /
+ahead of the not-yet-durable raft snapshot errs safe — a store AHEAD of raft only
+re-applies idempotently on recovery; a store BEHIND loses data. Exercised by
+`promote_back` + the soak (D).
 
 ### B. rove-only (from the first reconciler audit)
 
@@ -142,25 +144,33 @@ fns (the manager handle is process-lifetime, never null in practice — cosmetic
 consistency); `MAX_REPLAY_PAYLOAD` aggregate cap (S2, low); `file_storage.zig`
 `truncate_at` unguarded index (benchmark-only backend, low).
 
-### D. Cross-cutting validation gap
+### D. Crash/recovery soak — DONE (harness); power-loss coverage still open
 
-Crash-consistency (the C1/C2 fsync-ordering fixes, A2's watermark, C3's rename
-durability) is **not** unit-tested — the WAL suite covers normal operation only.
-Build a fault/crash-injection harness (kill between marker-write and GC, between
-`roll` header-write and the next flush, in the rejoin window) — `scripts/
-raft_soak_prod.py` is the natural home for a soak/kill loop. Until then these fixes
-are reasoned, not proven.
+`scripts/raft_soak_prod.py`: a 3-node cluster under write churn + ungraceful
+`kill_node` (crash-recovery of an intact replica) + `wipe→reconciler-heal` rounds
+(the A2 promote-back rejoin window), asserting after each round that quorum holds,
+the victim rejoins as a caught-up voter, and every ACKED write is intact on every
+node (no loss / no divergence). Validated green (incl. killing the leader mid-churn).
+
+**Caveat — what it does NOT prove:** a process SIGKILL does not drop the page cache
+(the kernel still flushes dirty pages), so the soak validates recovery LOGIC + A2's
+*persisted* watermark, but NOT the C1/C2 fsync ORDERING under true power loss. That
+needs power-loss tooling — run the node processes on a `dm-flakey` mount with
+`drop_writes`, or a VM hard-poweroff. Open until then: C1/C2 under power loss, C3
+rename durability.
 
 ## Suggested sequencing
 
-1. ~~**A1 (logTerm error channel)**~~ — DONE (`f34e8c6` + this branch).
-2. **A2 (snapshot watermark)** + **D (crash-injection harness)** together — the
-   harness is what proves A2 (and retroactively the landed C1/C2). Highest-value
-   remaining coordinated fix; do next.
+1. ~~**A1 (logTerm error channel)**~~ — DONE (`f34e8c6` + `9d5fc0f`).
+2. ~~**A2 (snapshot watermark)** + **D (soak harness)**~~ — DONE (soak green). Still
+   open under D: re-run the soak under `dm-flakey` to cover the C1/C2 fsync ordering
+   under real power loss.
 3. **B1–B3** — rove reconciler hardening; independent, land anytime.
 4. **C1/C2/C4** — engine robustness; additive, land + bump.
 5. **B4 / C5** — informational / cosmetic; opportunistic.
 
-Do not enable `REWIND_CP_RECONCILE_MEMBERSHIP=1` on prod until A1 + A2 land and the
-crash-injection harness (D) is green — A2 is a data-coverage hazard and A1 is the
-drift-visibility gap the reconciler exists to surface.
+A1, A2, and the soak (D) are landed/green, so the original prod-enable gate is met
+for the promote-path hazards. Before enabling `REWIND_CP_RECONCILE_MEMBERSHIP=1` on
+prod, two things still warrant attention: extend D to power-loss tooling (`dm-flakey`)
+to actually prove the C1/C2 fsync ordering, and weigh the B-series reconciler
+hardening (esp. B1 demote-churn under load).
