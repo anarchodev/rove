@@ -294,6 +294,53 @@ function handleSession() {
     return { is_root: !!a.is_root, sub: a.sub || null, owned: owned };
 }
 
+// ── Log query chokepoint (step3-auth-plan.md A5) ────────────────────
+//
+// The dashboard reads a tenant's request logs THROUGH the admin app, not
+// by holding a services token in the browser. The admin issues a buffered
+// `on.fetch` at the privileged `rewind-logs.internal` door: the worker
+// (only for `__admin__`) mints a tenant-scoped `logs-read` capability and
+// the log-server verifies cap+tenant (`standalone.zig`, A4). So the token
+// never enters JS/the browser, and the read is confined to one tenant.
+//
+// Cross-tenant read is operator-only for now (is_root); per-owner scoping
+// (a customer reading their own instance's logs) is a follow-up that reuses
+// `ownedInstances`. The result comes back in `onFetchResult` (the buffered
+// on.fetch convention) and is relayed verbatim.
+const LOG_DOOR = "http://rewind-logs.internal/v1/";
+
+function handleLogQuery(path, qs) {
+    const auth = request.auth || {};
+    if (!auth.sub) return jsonError(401, "unauthenticated");
+    if (!auth.is_root) return jsonError(403, "operator only");
+    // path = /v1/logs/{tenant}/{list|count|show/{id}}
+    const rest = path.slice("/v1/logs/".length);
+    const slash = rest.indexOf("/");
+    if (slash < 1) return jsonError(400, "bad log path");
+    const tenant = rest.slice(0, slash);
+    const sub = rest.slice(slash + 1);
+    if (!validId(tenant)) return jsonError(400, "invalid tenant");
+    if (sub !== "list" && sub !== "count" && !sub.startsWith("show/")) {
+        return jsonError(404, "no such log route");
+    }
+    on.fetch(LOG_DOOR + tenant + "/" + sub + (qs ? "?" + qs : ""));
+    return next();
+}
+
+// Buffered on.fetch result for the log chokepoint — relay the log-server's
+// JSON (status + body) back to the dashboard. A door/log-server failure
+// (e.g. an expired cap) surfaces as 502.
+export function onFetchResult() {
+    response.headers = { "content-type": "application/json" };
+    if (request.ok) {
+        response.status = request.status;
+        return new TextDecoder().decode(request.body || new Uint8Array());
+    }
+    response.status = 502;
+    return JSON.stringify({ error: "log query failed",
+                            status: request.status || 0 });
+}
+
 // ── fn-RPC dispatch (JS recipe) ─────────────────────────────────────
 //
 // The platform no longer interprets `?fn=` / `{fn,args}` (decisions.md
@@ -360,6 +407,11 @@ export default function() {
 
     if (method === "POST" && path === "/v1/logout")  return rp.logout();
     if (method === "GET"  && path === "/v1/session") return handleSession();
+
+    // Log query chokepoint → rewind-logs.internal door (A5).
+    if (method === "GET" && path.startsWith("/v1/logs/")) {
+        return handleLogQuery(path, q === -1 ? "" : fullPath.slice(q + 1));
+    }
 
     response.status = 404;
     return { error: "not found" };

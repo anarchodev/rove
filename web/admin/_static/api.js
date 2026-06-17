@@ -142,7 +142,27 @@ async function serviceFetch(service, path, init) {
   return res;
 }
 
-const logFetch = (path, init) => serviceFetch("log_url", path, init);
+// Logs go through the admin app's OWN chokepoint (`/v1/logs/*`), which issues
+// the privileged `rewind-logs.internal` door fetch server-side — the worker
+// mints a tenant-scoped `logs-read` cap and the log-server verifies it
+// (step3-auth-plan.md A5). So there is NO services token in the browser for
+// logs: same-origin, carrying the RP session cookie. Call sites keep passing
+// the log-server path shape `/v1/{inst}/...`; the chokepoint mounts it under
+// `/v1/logs/`.
+async function logFetch(path) {
+  const res = await fetch(path.replace(/^\/v1\//, "/v1/logs/"),
+                          { credentials: "same-origin" });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new ApiError(res.status, res.statusText, txt);
+  }
+  return res;
+}
+
+// NOTE: `filesFetch` (+ `getServicesToken`/`serviceFetch` above) is dead — the
+// files-server was dissolved (rewind-cli-plan.md §4), so `composeReplayBundle`'s
+// deployment/source reads below are already broken pending the separate
+// files-path reckoning. Logs no longer touch the services token.
 const filesFetch = (path, init) => serviceFetch("files_url", path, init);
 
 /// URL-encode a file path that may contain `/` separators. Slashes are

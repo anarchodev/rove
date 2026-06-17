@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Dashboard RP login over OIDC against __auth__ (step3-auth-plan.md B2).
+"""Dashboard RP login over OIDC + log chokepoint (step3-auth-plan.md B2 + A5).
 
 Stands up __auth__ (IdP) + web/admin (relying party) on a V2 cluster with a
 TLS-terminating front, then drives the full browser-shaped OIDC handshake:
 app /_rp/login → IdP /authorize → magic-link → /_rp/callback → poll → session.
 Proves an operator (in the `_admin/operator/*` allowlist) logs in to
 is_root:true, and a non-operator logs in to is_root:false.
+
+Then A5: the dashboard reads tenant logs THROUGH the admin app (GET
+/v1/logs/{tenant}/list), which issues the `rewind-logs.internal` door fetch —
+no services token in the browser. Operator → 200 (the worker minted a
+tenant-scoped logs-read cap; the log-server verified it); unauthed → 401;
+non-operator → 403.
 
 Why TLS: the RP completes login via a SERVER-SIDE token exchange (webhook.send
 to the IdP /token + JWKS), and the IdP signs an `https://{host}` issuer (§0).
@@ -132,6 +138,7 @@ def main() -> int:
                          tls_idp=True) as c:
         app_origin = c.tls_origin("__admin__")    # https://__admin__.localhost:{tls}
         auth_base = c.tls_origin("__auth__")       # https://__auth__.localhost:{tls}
+        c.spawn_log_server()                       # A5: the door target
 
         # Deploy app up, then __auth__ (IdP), then web/admin (RP) — the admin
         # deploy is LAST (it replaces the baked deploy app).
@@ -207,6 +214,7 @@ def main() -> int:
               f"got {r.status} {who}")
 
         # Non-operator login → is_root:false.
+        cust_cookie = None
         try:
             cust_cookie = idp_login(c, email=CUSTOMER, app_origin=app_origin,
                                     auth_base=auth_base)
@@ -217,6 +225,29 @@ def main() -> int:
                   f"got {r.status} {who}")
         except RuntimeError as e:
             check("non-operator completed the OIDC RP handshake", False, str(e)[:240])
+
+        # ── A5: log query through the admin chokepoint (the door). ─────────
+        # Operator reads acme's logs via /v1/logs/{tenant}/list — the admin
+        # issues the rewind-logs.internal door fetch (no browser token). Empty
+        # index is fine: a 200 with a records envelope proves door → scoped
+        # cap → log-server verify → relay.
+        r = c.tls_curl(app_origin + "/v1/logs/acme/list?limit=5",
+                       headers={"Cookie": op_cookie}, timeout=30.0)
+        check("operator log query via chokepoint → 200 + records",
+              r.status == 200 and '"records"' in r.body,
+              f"got {r.status} {r.body[:160]!r}")
+        if r.status != 200:
+            c.dump_node_log(grep=["door", "logs", "onfetch", "fetch", "middlew",
+                                  "auth", "guard", "502", "error", "warn"])
+        # Unauthenticated → 401 at the middleware guard (never reaches the door).
+        r = c.tls_curl(app_origin + "/v1/logs/acme/list")
+        check("unauthenticated log query → 401", r.status == 401, f"got {r.status}")
+        # Non-operator (authed, not is_root) → 403 (cross-tenant read is op-only).
+        if cust_cookie:
+            r = c.tls_curl(app_origin + "/v1/logs/acme/list",
+                           headers={"Cookie": cust_cookie})
+            check("non-operator log query → 403", r.status == 403,
+                  f"got {r.status} {r.body[:120]!r}")
 
     if failures:
         print(f"\nFAILED ({len(failures)}): {failures}")
