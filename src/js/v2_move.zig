@@ -1110,10 +1110,20 @@ fn handleMemberStatus(
 // primitive, like the tenant-move surface.
 
 /// `GET /_system/v2-applied-baseline?tenant=` → `{"index":X,"term":T}` where X
-/// is the leader's durabilized applied index (the safe lower bound for an
-/// out-of-band bundle — the bundle reflects at least this much) and T is the
-/// term of the log entry at X (so the learner's baseline matches the leader's
-/// log). Leader-gated (only the leader tracks term-by-index meaningfully).
+/// is the leader's LIVE applied index (`slot.applied_idx`) and T is the term of
+/// the log entry at X (so the learner's baseline matches the leader's log).
+/// Leader-gated (only the leader tracks term-by-index meaningfully).
+///
+/// X is the live applied index, NOT the durabilized store watermark
+/// (`lastAppliedRaftIdx`). The watermark lags `applied_idx` by up to one
+/// durabilize cycle (DEFAULT_DURABILIZE_NS) and under continuous churn sits BELOW
+/// the leader's compaction floor — handing it back as a baseline strands the new
+/// member below the leader's first log index (the prod __admin__ wall). The live
+/// applied index is always >= that floor (compaction truncates to
+/// `min(applied, …)`), so the baseline always points at an entry the leader still
+/// holds. The bundle (`v2-snapshot`, read separately) reflects applied at its own
+/// — later — instant, so it is a superset of X; the tail above X re-applies
+/// idempotently.
 fn handleAppliedBaseline(
     server: anytype,
     allocator: std.mem.Allocator,
@@ -1132,10 +1142,11 @@ fn handleAppliedBaseline(
         return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
     if (!worker.raft.isLeaderOf(gid))
         return reply(server, allocator, ent, sid, sess, 421, "not the leader for this tenant; try another node\n");
-    const inst = (worker.node.tenant.getInstance(tenant) catch null) orelse
-        return reply(server, allocator, ent, sid, sess, 404, "unknown tenant\n");
-    const index = inst.kv.lastAppliedRaftIdx() catch
-        return reply(server, allocator, ent, sid, sess, 500, "applied-index read failed\n");
+    // The live applied index (slot.applied_idx). index 0 = genesis (nothing
+    // applied yet): logTerm(gid, 0) resolves to the genesis sentinel term 0, so
+    // this flows through to a {0,0} baseline = a plain (snapshot-free) born attach
+    // — exactly as before, no special case.
+    const index = worker.raft.appliedIndex(gid);
     // A baseline is the pair {index, term-of-the-log-entry-at-index}. logTerm now
     // returns null when the leader's own log can't resolve a term for `index` (it
     // is beyond last_index, below the compaction floor, or the store watermark has
