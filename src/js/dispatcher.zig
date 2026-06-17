@@ -316,6 +316,11 @@ pub const Dispatcher = struct {
         // modules are trusted; middleware doesn't apply.
         const mw_bytecode_opt: ?[]const u8 = blk: {
             if (request.is_system_module) break :blk null;
+            // Continuations (callbacks, wakes, held-stream lifecycle) resume a
+            // handler's own async work behind the gate the inbound request
+            // already passed — running the auth middleware on them re-gates and
+            // 401s the tenant's own callbacks (`Activation.isContinuation`).
+            if (request.activation.isContinuation()) break :blk null;
             if (bytecodes) |bcs| {
                 if (bcs.get("_middlewares/index.mjs")) |bb| break :blk bb.bytes;
                 if (bcs.get("_middlewares/index.js")) |bb| break :blk bb.bytes;
