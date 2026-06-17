@@ -445,6 +445,11 @@ back-compat — `feedback_no_prelaunch_backcompat`):
 
 ## 7. Auth consolidation
 
+> **Execution plan:** the sequenced, dependency-ordered "what's built /
+> what's left" breakdown lives in
+> [`step3-auth-plan.md`](step3-auth-plan.md). This section is the design
+> rationale; that doc is the build order.
+
 The auth sprawl is a symptom of the same disease as the deploy ad-hoc-ness:
 **many separately-exposed, separately-authenticated surfaces.** Dissolving
 surfaces (§4) is most of the cure; the rest is collapsing onto a model the
