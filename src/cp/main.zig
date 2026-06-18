@@ -595,7 +595,17 @@ const Router = struct {
         // 1. Empty-attach to every node → form the group across the cluster
         //    (gap #4: multi-node formation with no move, no bundle). A new
         //    tenant has no plan yet → free tier until `/_control/plan`.
-        if (!self.attachToAll(nodes, "", tenant, null)) {
+        //    Phase 2e (cluster node-set SSOT): birth the group with THIS cluster's
+        //    node set as the voter set (raft ids are positional — node i → id i+1,
+        //    the REWIND_PEERS convention — so the set is `1,2,…,nodes.len`). CP is
+        //    the single source; every node is told the SAME set, retiring the
+        //    per-node `REWIND_VOTERS` for tenant formation.
+        const birth_voters = clusterVotersCsv(a, nodes.len) catch {
+            try replyStatus(server, ent, sid, sess, 500);
+            return;
+        };
+        defer a.free(birth_voters);
+        if (!self.attachToAll(nodes, "", tenant, null, birth_voters)) {
             self.evictAll(tenant, nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;
@@ -933,7 +943,7 @@ const Router = struct {
         //    enforces the right limits from its first request.
         const plan_blob = self.directory.planForOwned(a, tenant) catch null;
         defer if (plan_blob) |p| a.free(p);
-        if (!self.attachToAll(dest_nodes, dump.body, tenant, plan_blob)) {
+        if (!self.attachToAll(dest_nodes, dump.body, tenant, plan_blob, null)) {
             self.evictAll(tenant, dest_nodes, tbody);
             self.resumeAll(tenant, src_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
@@ -1009,13 +1019,35 @@ const Router = struct {
     /// the first post-move request (docs/v2-cp-operational-state.md). True only
     /// if all returned 204 (idempotent re-attach included). On the first
     /// failure returns false; the caller evicts the partially-attached set.
-    fn attachToAll(self: *Router, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8, plan: ?[]const u8) bool {
+    /// The cluster's voter set as a comma-separated raft-id list `1,2,…,n` (raft
+    /// ids are positional — node index i → id i+1, the `REWIND_PEERS` convention).
+    /// Caller frees. The Phase 2e cluster node-set SSOT for a fresh tenant group.
+    fn clusterVotersCsv(a: std.mem.Allocator, n: usize) ![]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(a);
+        var i: usize = 1;
+        while (i <= n) : (i += 1) {
+            if (i != 1) try buf.append(a, ',');
+            try buf.writer(a).print("{d}", .{i});
+        }
+        return buf.toOwnedSlice(a);
+    }
+
+    fn attachToAll(self: *Router, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8, plan: ?[]const u8, birth_voters: ?[]const u8) bool {
         const a = self.allocator;
-        var hdrs: [2]curl.Header = undefined;
+        var hdrs: [3]curl.Header = undefined;
         hdrs[0] = .{ .name = TENANT_HEADER, .value = tenant };
         var nh: usize = 1;
         if (plan) |p| {
             hdrs[nh] = .{ .name = PLAN_HEADER, .value = p };
+            nh += 1;
+        }
+        // Phase 2e (cluster node-set SSOT): the cluster's node set as the born
+        // group's voter set, the CP-owned single source of truth — the SAME set
+        // for every node, so the group forms consistently without depending on
+        // each node's static `REWIND_VOTERS`. Null → the node falls back to its env.
+        if (birth_voters) |v| {
+            hdrs[nh] = .{ .name = "X-Rewind-Voters", .value = v };
             nh += 1;
         }
         for (dest_nodes) |base| {
@@ -1234,7 +1266,7 @@ const Router = struct {
         //    from the first forwarded write onward.
         const plan_blob = self.directory.planForOwned(a, tenant) catch null;
         defer if (plan_blob) |p| a.free(p);
-        if (!self.attachToAll(dest_nodes, "", tenant, plan_blob)) {
+        if (!self.attachToAll(dest_nodes, "", tenant, plan_blob, null)) {
             self.evictAll(tenant, dest_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;

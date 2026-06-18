@@ -551,7 +551,15 @@ fn handleAttach(
             else => return reply(server, allocator, ent, sid, sess, 500, "group attach (baseline) failed\n"),
         };
     } else {
-        worker.raft.createGroupEpoch(gid, epoch) catch |err| switch (err) {
+        // Phase 2e (cluster node-set SSOT): a plain (no-baseline) formation —
+        // provision's empty-attach — is born with the CP-supplied cluster node set
+        // (`X-Rewind-Voters`) instead of this node's static `REWIND_VOTERS`. Absent
+        // → null → `REWIND_VOTERS` (unchanged). Parsed onto the handler stack; the
+        // blocking control op keeps it alive.
+        var birth_buf: [16]u64 = undefined;
+        const birth_voters = parseIdList(respb.findHeader(rh, VOTERS_HEADER), &birth_buf) catch
+            return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ VOTERS_HEADER ++ "\n");
+        worker.raft.createGroupEpoch(gid, epoch, birth_voters) catch |err| switch (err) {
             error.GroupExists => {}, // idempotent re-attach
             else => return reply(server, allocator, ent, sid, sess, 500, "group attach failed\n"),
         };

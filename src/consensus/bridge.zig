@@ -212,6 +212,11 @@ const ControlCmd = struct {
     /// promote-back, unchanged). Borrowed from the caller stack for the call.
     snap_voters: ?[]const u64 = null,
     snap_learners: ?[]const u64 = null,
+    /// `create_group_epoch` (Phase 2e — cluster node-set SSOT): the initial voter
+    /// set a FRESH group is born with, supplied by the control plane (the cluster
+    /// node set) instead of the node's static `REWIND_VOTERS`. Null → `self.voters`
+    /// (unchanged). Borrowed from the caller stack for the blocking call.
+    birth_voters: ?[]const u64 = null,
     /// `conf_state`: caller buffers to fill + the counts written back.
     cs_voters: []u64 = &.{},
     cs_learners: []u64 = &.{},
@@ -774,9 +779,13 @@ pub const Bridge = struct {
     /// `registerTenant`'d (so `gid` resolves and `id_str` is stable) and
     /// its kvexp state already loaded into the worker store. Blocks until
     /// the pump has created + led the group. (Phase 4 destination attach.)
-    pub fn createGroupEpoch(self: *Bridge, gid: u64, epoch: u64) Error!void {
+    /// `birth_voters` (Phase 2e — cluster node-set SSOT): the initial voter set the
+    /// fresh group is born with (the CP-supplied cluster node set). Null →
+    /// `REWIND_VOTERS` (unchanged). The plain (no-baseline) formation path, e.g.
+    /// provision's empty-attach.
+    pub fn createGroupEpoch(self: *Bridge, gid: u64, epoch: u64, birth_voters: ?[]const u64) Error!void {
         const sig = self.sigFor(gid) orelse return Error.UnknownTenant;
-        var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch };
+        var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .birth_voters = birth_voters };
         return self.runControl(&cmd);
     }
 
@@ -953,7 +962,7 @@ pub const Bridge = struct {
                         std.log.err("v2 bridge: refusing term-0 baseline for gid {d} at index {d}", .{ cmd.gid, cmd.snap_index });
                         break :blk Error.InvalidBaseline;
                     }
-                    _ = self.node.createGroupAtEpoch(cmd.gid, cmd.id_str, cmd.epoch, cmd.as_learner) catch |e| break :blk e;
+                    _ = self.node.createGroupAtEpoch(cmd.gid, cmd.id_str, cmd.epoch, cmd.as_learner, cmd.birth_voters) catch |e| break :blk e;
                     // Atomic baseline (createGroupAtBaseline): install the data-free
                     // snapshot in the SAME pump op as group creation so the fresh
                     // group is never observable at last_index 0 between creation and
@@ -1757,7 +1766,7 @@ test "bridge: move control — attach at epoch, quiesce holds writes, destroy re
     // Destination-attach shape: register the tenant, then stand up its
     // group at a migration epoch (epoch+1 over the source's birth epoch).
     const gid = try bridge.registerTenant("mover");
-    try bridge.createGroupEpoch(gid, 1);
+    try bridge.createGroupEpoch(gid, 1, null);
 
     // A post-attach write commits through the freshly-attached group.
     var ws = WriteSet.init(a);
@@ -2092,5 +2101,5 @@ test "bridge: createGroupEpoch requires a running pump thread" {
     defer bridge.deinit();
     const gid = try bridge.registerTenant("x");
     // No startPump → control ops have no executor.
-    try testing.expectError(Error.PumpNotRunning, bridge.createGroupEpoch(gid, 1));
+    try testing.expectError(Error.PumpNotRunning, bridge.createGroupEpoch(gid, 1, null));
 }

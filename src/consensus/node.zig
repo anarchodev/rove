@@ -679,7 +679,7 @@ pub const Node = struct {
         // Birth OR restart: recover any durable WAL records for this group
         // (a no-op on a never-seen group). On a restart this replays the
         // committed log back into the store.
-        return self.createGroupCore(tenant_id, id_str, 0, true, false);
+        return self.createGroupCore(tenant_id, id_str, 0, true, false, null);
     }
 
     /// Attach a tenant group at an explicit migration fence `epoch` (the
@@ -697,13 +697,13 @@ pub const Node = struct {
     /// (voters = the rest), for joining an existing group safely — see
     /// `createGroupCore`. The default (false) births a voter from the static
     /// voter set (a move destination / a configured voter rejoining).
-    pub fn createGroupAtEpoch(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64, as_learner: bool) Error!*TenantSlot {
+    pub fn createGroupAtEpoch(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64, as_learner: bool, voters_override: ?[]const u64) Error!*TenantSlot {
         if (self.groups.get(tenant_id) != null) return Error.GroupExists;
         self.mgr.clearTombstone(tenant_id) catch {};
         // A migration attach is a FRESH group — its state arrives via the
         // bundle, not the WAL — so do NOT replay any (stale) recovered records
         // for this gid.
-        return self.createGroupCore(tenant_id, id_str, epoch, false, as_learner);
+        return self.createGroupCore(tenant_id, id_str, epoch, false, as_learner, voters_override);
     }
 
     /// A group recorded in the node-local manifest (see `groups_manifest`):
@@ -721,7 +721,7 @@ pub const Node = struct {
     /// single-threaded, like `ensureGroup`. Idempotent.
     pub fn recoverGroup(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64) Error!*TenantSlot {
         if (self.groups.get(tenant_id)) |slot| return slot;
-        return self.createGroupCore(tenant_id, id_str, epoch, true, false);
+        return self.createGroupCore(tenant_id, id_str, epoch, true, false, null);
     }
 
     /// Record (or update) a group in the node-local recovery manifest, then
@@ -808,7 +808,14 @@ pub const Node = struct {
     /// the raft group at `epoch`, register the slot, and drive it to
     /// leader (single-node campaign). Caller has already verified the
     /// group does not exist.
-    fn createGroupCore(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64, recover: bool, as_learner: bool) Error!*TenantSlot {
+    /// `voters_override` (Phase 2e — cluster node-set SSOT): the initial voter set
+    /// a FRESH group is born with, supplied by the control plane (the cluster's
+    /// node set, the single source of truth) instead of this node's static
+    /// `REWIND_VOTERS` env. Null → fall back to `self.voters` (unchanged). Ignored
+    /// on the `recover` path (a rejoining group restores its membership from the
+    /// WAL) and immaterial under a baseline (the baseline's ConfState overwrites
+    /// the born membership — Phase 2d).
+    fn createGroupCore(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64, recover: bool, as_learner: bool, voters_override: ?[]const u64) Error!*TenantSlot {
         // {data_dir}/{tenant_id}/app.db
         const dir = std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ self.data_dir, tenant_id }) catch
             return Error.OutOfMemory;
@@ -839,13 +846,20 @@ pub const Node = struct {
         // __admin__ wall). Split self out of the voter set into a sole learner.
         // Fresh-group only: `recover` restores the persisted membership from the
         // WAL, so a rejoining node keeps whatever role it last held.
+        // The born ConfState's voter set: the CP-supplied cluster node set when
+        // given (Phase 2e SSOT), else this node's static `REWIND_VOTERS`.
+        const base_voters = voters_override orelse self.voters;
+        if (!recover) std.log.info(
+            "v2 node: gid={d} born voters={any} source={s}",
+            .{ tenant_id, base_voters, if (voters_override != null) "cp-ssot" else "rewind_voters" },
+        );
         var voters_scratch: [64]u64 = undefined;
         const learner_self = [_]u64{self.node_id};
-        var voters_slice: []const u64 = self.voters;
+        var voters_slice: []const u64 = base_voters;
         var learners_slice: []const u64 = &.{};
         if (as_learner and !recover) {
             var n: usize = 0;
-            for (self.voters) |v| {
+            for (base_voters) |v| {
                 if (v != self.node_id and n < voters_scratch.len) {
                     voters_scratch[n] = v;
                     n += 1;
