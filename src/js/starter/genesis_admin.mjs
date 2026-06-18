@@ -1,23 +1,108 @@
-// Standing __admin__ deploy app (docs/rewind-cli-plan.md §4) — composes a
-// customer deploy entirely from platform.* primitives, no Zig deploy route.
-// This is the ONE arbitrary-bundle deploy path: publish_tenant + the smoke
-// harness POST bundles HERE. This app itself is deployed from a baked copy by
-// `POST /_system/reset` (root-gated, no body — bootstrap + break-glass); reset
-// deploys ONLY this embedded bundle, never arbitrary input.
+// Standing __admin__ deploy app — per-file WORKSPACE deploy. Files are
+// uploaded ONE AT A TIME into a durable per-tenant workspace, then a release
+// is CUT from whatever's currently in the workspace. This replaces the old
+// single mega-POST (it base64-buffered the whole bundle in the JS heap and hit
+// QuickJS's per-context memory limit — InternalError: out of memory — on any
+// real static-bearing bundle). Per-file keeps each request small.
 //
-// Wire: POST (Host = the admin host), Authorization: Bearer <root token>, body
-//   { "tenant": "<id>",
-//     "handlers": [{ "path": "index.mjs", "source": "<text>" }, ...],
-//     "statics":  [{ "path": "_static/x", "content_type": "...", "b64": "..." }, ...] }
-// Returns 200 { "ok": true, "dep_id": "<016x>" } once staging is durable (the
-// stampManifest barrier). Does NOT release — activation stays a separate,
-// gated /_system/release (the approval-gated stance).
+// Workspace model: `scope(t).kv` holds `_workspace/{path}` → the staged
+// manifest entry (kind, content_type, source_hex, bytecode_hex). The bytes are
+// content-addressed in S3 via `blob.put` (statics) / `platform.compile`
+// (handlers → source + bytecode blobs). `cut` reads the workspace + stamps a
+// manifest (the immutable deployment). Activation stays separate + gated
+// (`/_system/release`).
+//
+// This is the bootstrap/break-glass app (root-token only); the standing
+// web/admin app owns the same surface + ownership-gating once deployed.
+//
+// Wire (root bearer, POST JSON):
+//   /v1/deploy/reset  {tenant}                              → clear workspace
+//   /v1/deploy/file   {tenant, path, kind, source | b64,
+//                      content_type?}                       → stage one file
+//   /v1/deploy/cut    {tenant}                              → {ok, dep_id}
+
+const WS = "_workspace/";
 
 function bytesFromB64(b64) {
-  const bin = atob(b64);
+  const bin = atob(b64 || "");
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
+}
+
+function jerr(status, msg) {
+  response.status = status;
+  return JSON.stringify({ ok: false, error: msg });
+}
+
+// Clear the workspace so a `deploy <bundle>` means EXACTLY that bundle (no
+// carry-forward of files a prior deploy left behind).
+function wsReset(b) {
+  if (!b.tenant) return jerr(400, "tenant required");
+  const sk = platform.scope(b.tenant).kv;
+  const rows = sk.prefix(WS, "", 1000);
+  for (let i = 0; i < rows.length; i++) sk.delete(rows[i].key);
+  return JSON.stringify({ ok: true, cleared: rows.length });
+}
+
+// Stage one file into the workspace. Static → content-address now (sync hash).
+// Handler → compile (async, bound); onFileStaged writes the entry once the
+// source+bytecode blobs are staged.
+function wsFile(b) {
+  if (!b.tenant || !b.path) return jerr(400, "tenant + path required");
+  if (b.kind === "static") {
+    const hash = platform.scope(b.tenant).blob.put(bytesFromB64(b.b64), {
+      content_type: b.content_type || "",
+    });
+    platform.scope(b.tenant).kv.set(WS + b.path, JSON.stringify({
+      kind: "static", content_type: b.content_type || "", source_hex: hash,
+    }));
+    return JSON.stringify({ ok: true, path: b.path, hash: hash });
+  }
+  platform.compile([{ path: b.path, source: b.source || "" }], {
+    scope: b.tenant, name: "onFileStaged",
+    ctx: { target: b.tenant, path: b.path, content_type: b.content_type || "" },
+  });
+  return next();
+}
+
+export function onFileStaged() {
+  const ctx = request.ctx;
+  if (!ctx || !ctx.ok) {
+    response.status = 500;
+    return JSON.stringify({ stage: "compile", ctx: ctx || null });
+  }
+  const app = ctx.app || {};
+  const r = ctx.results[0];
+  platform.scope(app.target).kv.set(WS + app.path, JSON.stringify({
+    kind: "handler", content_type: app.content_type || "",
+    source_hex: r.source_hex, bytecode_hex: r.bytecode_hex,
+  }));
+  response.status = 200;
+  return JSON.stringify({ ok: true, path: app.path, hash: r.source_hex });
+}
+
+// Cut a release from whatever is in the workspace → stampManifest (the staging
+// barrier) → dep_id. Does NOT activate (that's the separate /_system/release).
+function wsCut(b) {
+  if (!b.tenant) return jerr(400, "tenant required");
+  const rows = platform.scope(b.tenant).kv.prefix(WS, "", 1000);
+  if (rows.length === 0) return jerr(400, "workspace empty — nothing to cut");
+  const entries = rows.map(function (row) {
+    const e = JSON.parse(row.value);
+    return {
+      path: row.key.slice(WS.length), kind: e.kind,
+      content_type: e.content_type || "",
+      source_hex: e.source_hex, bytecode_hex: e.bytecode_hex || "",
+    };
+  });
+  platform.scope(b.tenant).deploy.stampManifest(entries, { name: "onCut" });
+  return next();
+}
+
+export function onCut() {
+  response.status = 200;
+  return JSON.stringify(request.ctx); // { ok, dep_id }
 }
 
 export default function () {
@@ -32,69 +117,11 @@ export default function () {
     return "unauthenticated\n";
   }
   let b;
-  try {
-    b = JSON.parse(request.body);
-  } catch (e) {
-    response.status = 400;
-    return "expected JSON {tenant, handlers, statics}\n";
-  }
-  const target = b.tenant;
-  if (!target) {
-    response.status = 400;
-    return "tenant required\n";
-  }
-  const handlers = b.handlers || [];
-  const statics = b.statics || [];
-
-  // Stage statics now: cross-tenant content-addressed write (sync hash +
-  // deferred PUT). Build the static manifest entries from the returned hashes.
-  const staticEntries = statics.map(function (s) {
-    const hash = platform.scope(target).blob.put(bytesFromB64(s.b64), {
-      content_type: s.content_type,
-    });
-    return {
-      path: s.path,
-      kind: "static",
-      source_hex: hash,
-      content_type: s.content_type,
-    };
-  });
-
-  // Compile the handlers (async, bound); thread {target, statics} forward so
-  // onCompiled can compose the full manifest after the bytecode hashes return.
-  platform.compile(handlers, {
-    scope: target,
-    name: "onCompiled",
-    ctx: { target: target, statics: staticEntries },
-  });
-  return next();
-}
-
-export function onCompiled() {
-  const ctx = request.ctx;
-  if (!ctx || !ctx.ok) {
-    response.status = 500;
-    return JSON.stringify({ stage: "compile", ctx: ctx || null });
-  }
-  const app = ctx.app || {};
-  const entries = ctx.results
-    .map(function (r) {
-      return {
-        path: r.path,
-        kind: "handler",
-        source_hex: r.source_hex,
-        bytecode_hex: r.bytecode_hex,
-      };
-    })
-    .concat(app.statics || []);
-  // stampManifest is the staging BARRIER — onStamped fires only once the
-  // manifest + every prior bytecode/static PUT is durable.
-  platform.scope(app.target).deploy.stampManifest(entries, { name: "onStamped" });
-  return next();
-}
-
-export function onStamped() {
-  // request.ctx = { ok, dep_id } — the whole deploy is durable here.
-  response.status = 200;
-  return JSON.stringify(request.ctx);
+  try { b = JSON.parse(request.body); }
+  catch (e) { return jerr(400, "expected JSON body"); }
+  const p = request.path;
+  if (p === "/v1/deploy/reset") return wsReset(b);
+  if (p === "/v1/deploy/file") return wsFile(b);
+  if (p === "/v1/deploy/cut") return wsCut(b);
+  return jerr(404, "unknown deploy route");
 }

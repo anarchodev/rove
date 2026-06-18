@@ -196,44 +196,43 @@ export const api = {
     return rpc("deleteKv", [key], { method: "POST", scope: instance_id });
   },
 
-  // ── Deploy (the one bundle path: POST /v1/deploy) ────────────────
+  // ── Deploy (per-file workspace flow) ─────────────────────────────
   //
-  // rewind-cli-plan Track 0 — the standing dashboard app OWNS /v1/deploy.
-  // The browser POSTs the full bundle ({tenant, handlers, statics}); the
-  // server composes the deploy from platform.* (compile + content-address
-  // + stampManifest barrier) and returns { ok, dep_id }. Ownership-gated
-  // server-side (is_root OR the session owns the tenant). Replaces the old
-  // two-phase files-server upload — the files-server was dissolved
-  // (rewind-cli-plan §4).
+  // Files upload ONE AT A TIME into a durable per-tenant workspace, then a
+  // release is cut from it: POST /v1/deploy/reset (clear) → /v1/deploy/file
+  // per file (handler source compiles, static content-addresses) →
+  // /v1/deploy/cut (stampManifest → dep_id). Each request is small (the old
+  // single mega-POST OOM'd the deploy app's JS heap on real bundles).
+  // Ownership-gated server-side (is_root OR the session owns the tenant).
   //
   // `files` is `{ path: { source } }` for handlers and
-  // `{ path: { bytes, content_type } }` for statics (a `_static/`-prefixed
-  // path, or any entry carrying `bytes`, is treated as a static).
-  async deploy(instance_id, files) {
-    const handlers = [];
-    const statics = [];
-    for (const [path, f] of Object.entries(files)) {
-      const isStatic = f.bytes != null || path.startsWith("_static/") ||
-                       path.startsWith("_config/");
-      if (isStatic) {
-        statics.push({
-          path,
-          content_type: f.content_type || "application/octet-stream",
-          b64: encodeB64(f.bytes ?? f.source ?? ""),
-        });
-      } else {
-        handlers.push({ path, source: f.source ?? "" });
-      }
-    }
-    const res = await fetch(adminBase() + "/v1/deploy", {
+  // `{ path: { bytes, content_type } }` for statics (a `_static/`- or
+  // `_config/`-prefixed path, or any entry carrying `bytes`, is a static).
+  async _deployFile(instance_id, sub, body) {
+    const res = await fetch(adminBase() + "/v1/deploy/" + sub, {
       method: "POST",
       credentials: "include",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tenant: instance_id, handlers, statics }),
+      body: JSON.stringify(body),
     });
-    const body = await res.json().catch(() => null);
-    if (!res.ok) throw new ApiError(res.status, res.statusText, body);
-    return body; // { ok: true, dep_id: "<016x>" }
+    const parsed = await res.json().catch(() => null);
+    if (!res.ok) throw new ApiError(res.status, res.statusText, parsed);
+    return parsed;
+  },
+  async deploy(instance_id, files) {
+    await this._deployFile(instance_id, "reset", { tenant: instance_id });
+    for (const [path, f] of Object.entries(files)) {
+      const isStatic = f.bytes != null || path.startsWith("_static/") ||
+                       path.startsWith("_config/");
+      const body = isStatic
+        ? { tenant: instance_id, path, kind: "static",
+            content_type: f.content_type || "application/octet-stream",
+            b64: encodeB64(f.bytes ?? f.source ?? "") }
+        : { tenant: instance_id, path, kind: "handler", source: f.source ?? "" };
+      await this._deployFile(instance_id, "file", body);
+    }
+    return this._deployFile(instance_id, "cut", { tenant: instance_id });
+    // { ok: true, dep_id: "<016x>" }
   },
 
   /// Flip the live deployment pointer. `dep_id` is the hex string from

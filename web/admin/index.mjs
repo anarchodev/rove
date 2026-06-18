@@ -390,85 +390,107 @@ export function onFetchResult() {
                             status: request.status || 0 });
 }
 
-// ── Deploy surface (Track 0 — the standing app owns the one arbitrary-
-// bundle deploy path) ───────────────────────────────────────────────
+// ── Deploy surface — per-file WORKSPACE deploy ──────────────────────
 //
-// Folds the baked genesis_admin.mjs composition INTO the standing
-// dashboard so deploys survive once web/admin replaces the bootstrap app
-// on __admin__ (they collided on POST /). Composed entirely from
-// platform.* primitives — no Zig deploy route:
-//   1. stage statics  → platform.scope(t).blob.put  (sync hash + deferred PUT)
-//   2. compile handlers → platform.compile (async, bound; resumes onCompiled)
-//   3. stamp manifest → platform.scope(t).deploy.stampManifest (the staging
-//      BARRIER; resumes onStamped only once every PUT is durable)
+// Files are uploaded ONE AT A TIME into a durable per-tenant workspace
+// (`scope(t).kv` `_workspace/{path}` → the staged entry; bytes are
+// content-addressed in S3 via blob.put/compile), then a release is CUT from
+// whatever's in the workspace (stampManifest). This replaces the old single
+// mega-POST, which base64-buffered the whole bundle in the JS heap and hit
+// QuickJS's per-context memory limit (InternalError: out of memory) on any
+// real static-bearing bundle. Per-file keeps each request small.
 //
-// Authz: an operator (is_root — root token via _middlewares M2M path, or an
-// operator OIDC session) may deploy any tenant; a customer session may deploy
-// ONLY a tenant they own (same gate as publishRelease). Does NOT release —
-// activation stays a separate, gated publishRelease call.
+// Authz (each op): an operator (is_root — root token via _middlewares M2M, or
+// an operator OIDC session) may deploy any tenant; a customer session may
+// deploy ONLY a tenant they own. Does NOT activate — that's publishRelease.
 //
-// Wire (POST /v1/deploy): { tenant, handlers:[{path,source}],
-//   statics:[{path,content_type,b64}] } → 200 { ok:true, dep_id:"<016x>" }.
+// Wire (POST):
+//   /v1/deploy/reset {tenant}                             → clear workspace
+//   /v1/deploy/file  {tenant, path, kind, source | b64,
+//                     content_type?}                      → stage one file
+//   /v1/deploy/cut   {tenant}                             → {ok, dep_id}
+const WS = "_workspace/";
+
 function bytesFromB64(b64) {
-    const bin = atob(b64);
+    const bin = atob(b64 || "");
     const out = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
     return out;
 }
 
-function handleDeploy(body) {
+// Parse + ownership-gate a deploy op. Returns the body on success, or null
+// after stamping the error response.
+function deployGate(body) {
     const auth = request.auth || {};
     let b;
-    try { b = JSON.parse(body); }
-    catch (e) { return jsonError(400, "expected JSON {tenant, handlers, statics}"); }
-    const target = b.tenant;
-    if (!validId(target)) return jsonError(400, "invalid tenant");
+    try { b = JSON.parse(body); } catch (e) { jsonError(400, "expected JSON body"); return null; }
+    if (!validId(b.tenant)) { jsonError(400, "invalid tenant"); return null; }
     if (!auth.is_root) {
-        if (!auth.sub) return jsonError(401, "unauthenticated");
-        if (ownedInstances(accountHashFor(auth.sub)).indexOf(target) === -1) {
-            return jsonError(403, "not your instance");
+        if (!auth.sub) { jsonError(401, "unauthenticated"); return null; }
+        if (ownedInstances(accountHashFor(auth.sub)).indexOf(b.tenant) === -1) {
+            jsonError(403, "not your instance"); return null;
         }
     }
-    const handlers = b.handlers || [];
-    const statics = b.statics || [];
+    return b;
+}
 
-    const staticEntries = statics.map(function (s) {
-        const hash = platform.scope(target).blob.put(bytesFromB64(s.b64), {
-            content_type: s.content_type,
-        });
-        return { path: s.path, kind: "static",
-                 source_hex: hash, content_type: s.content_type };
-    });
+function handleWsReset(body) {
+    const b = deployGate(body); if (!b) return null;
+    const sk = platform.scope(b.tenant).kv;
+    const rows = sk.prefix(WS, "", 1000);
+    for (let i = 0; i < rows.length; i++) sk.delete(rows[i].key);
+    return { ok: true, cleared: rows.length };
+}
 
-    platform.compile(handlers, {
-        scope: target,
-        name: "onCompiled",
-        ctx: { target: target, statics: staticEntries },
+function handleWsFile(body) {
+    const b = deployGate(body); if (!b) return null;
+    if (!b.path) return jsonError(400, "path required");
+    if (b.kind === "static") {
+        const hash = platform.scope(b.tenant).blob.put(bytesFromB64(b.b64),
+            { content_type: b.content_type || "" });
+        platform.scope(b.tenant).kv.set(WS + b.path, JSON.stringify({
+            kind: "static", content_type: b.content_type || "", source_hex: hash }));
+        return { ok: true, path: b.path, hash: hash };
+    }
+    platform.compile([{ path: b.path, source: b.source || "" }], {
+        scope: b.tenant, name: "onFileStaged",
+        ctx: { target: b.tenant, path: b.path, content_type: b.content_type || "" },
     });
     return next();
 }
 
-// Compile bound-resume (continuation — skips _middlewares). Composes the full
-// manifest from returned bytecode hashes + the threaded statics, then stamps.
-export function onCompiled() {
+// compile bound-resume (continuation — skips _middlewares) → record the entry.
+export function onFileStaged() {
     const ctx = request.ctx;
     if (!ctx || !ctx.ok) {
         response.status = 500;
         return JSON.stringify({ stage: "compile", ctx: ctx || null });
     }
     const app = ctx.app || {};
-    const entries = ctx.results
-        .map(function (r) {
-            return { path: r.path, kind: "handler",
-                     source_hex: r.source_hex, bytecode_hex: r.bytecode_hex };
-        })
-        .concat(app.statics || []);
-    platform.scope(app.target).deploy.stampManifest(entries, { name: "onStamped" });
+    const r = ctx.results[0];
+    platform.scope(app.target).kv.set(WS + app.path, JSON.stringify({
+        kind: "handler", content_type: app.content_type || "",
+        source_hex: r.source_hex, bytecode_hex: r.bytecode_hex }));
+    response.status = 200;
+    return JSON.stringify({ ok: true, path: app.path, hash: r.source_hex });
+}
+
+function handleWsCut(body) {
+    const b = deployGate(body); if (!b) return null;
+    const rows = platform.scope(b.tenant).kv.prefix(WS, "", 1000);
+    if (rows.length === 0) return jsonError(400, "workspace empty — nothing to cut");
+    const entries = rows.map(function (row) {
+        const e = JSON.parse(row.value);
+        return { path: row.key.slice(WS.length), kind: e.kind,
+                 content_type: e.content_type || "",
+                 source_hex: e.source_hex, bytecode_hex: e.bytecode_hex || "" };
+    });
+    platform.scope(b.tenant).deploy.stampManifest(entries, { name: "onCut" });
     return next();
 }
 
-// stampManifest barrier resume — the whole deploy is durable here.
-export function onStamped() {
+// stampManifest barrier resume — the cut deployment is durable here.
+export function onCut() {
     response.status = 200;
     response.headers = { "content-type": "application/json" };
     return JSON.stringify(request.ctx); // { ok, dep_id }
@@ -650,10 +672,12 @@ export default function() {
         return rp.exchangeToken(b.id_token);
     }
 
-    // Deploy chokepoint (Track 0). request.auth is set by _middlewares —
-    // either an operator root-token (M2M) or an OIDC session; handleDeploy
+    // Deploy chokepoint — per-file workspace flow. request.auth is set by
+    // _middlewares (operator root-token M2M or an OIDC session); each op
     // gates on is_root OR ownership of the target tenant.
-    if (method === "POST" && path === "/v1/deploy") return handleDeploy(request.body || "{}");
+    if (method === "POST" && path === "/v1/deploy/reset") return handleWsReset(request.body || "{}");
+    if (method === "POST" && path === "/v1/deploy/file")  return handleWsFile(request.body || "{}");
+    if (method === "POST" && path === "/v1/deploy/cut")   return handleWsCut(request.body || "{}");
 
     // Log query chokepoint → rewind-logs.internal door (A5).
     if (method === "GET" && path.startsWith("/v1/logs/")) {

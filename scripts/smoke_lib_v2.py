@@ -523,46 +523,49 @@ class V2Cluster:
         self._admin_app_ready = True
 
     def deploy_bundle(self, tenant: str, files: list[dict], *, node: int = 0) -> str:
-        """Deploy a full bundle by POSTing it to the standing __admin__ deploy
-        app through the front door (rewind-cli-plan §4 — the ONE deploy path;
-        the Zig /_system/deploy route is gone). `files` is a list of
-        `{"path","kind","content_type","b64"}` dicts. The app compiles handlers
-        (platform.compile), content-addresses every file into the TARGET
-        tenant's own blobs (cross-tenant platform.scope(t).blob.put), and stamps
-        the manifest (platform.scope(t).deploy.stampManifest — an S3 PUT, any
-        node). Returns the hex dep_id. Does NOT release.
+        """Deploy a full bundle via the per-file WORKSPACE flow against the
+        standing __admin__ deploy app (genesis during bring-up, web/admin once
+        standing). `files` is a list of `{"path","kind","content_type","b64"}`
+        dicts. Sequence: reset the workspace → upload each file
+        (/v1/deploy/file: a handler's source compiles, a static content-
+        addresses into the TARGET tenant's blobs) → cut a release
+        (/v1/deploy/cut: stampManifest from the workspace). Each request is
+        small — this replaces the old single mega-POST, which base64-buffered
+        the whole bundle in the deploy app's JS heap and OOM'd on real bundles.
+        Returns the hex dep_id. Does NOT release/activate.
 
-        `node` is vestigial (the front Host-routes to __admin__); kept for
-        call-site compatibility."""
+        `node` is vestigial (the front Host-routes to __admin__)."""
         import base64
         import json
         self._ensure_admin_app()
-        handlers, statics = [], []
+
+        def post(sub: str, body: dict, timeout: float = 30.0):
+            return _curl(f"{self.front_url()}/v1/deploy/{sub}", method="POST",
+                         host=self.host_for("__admin__"),
+                         headers={"Authorization": f"Bearer {self.root_token}",
+                                  "Content-Type": "application/json"},
+                         data=json.dumps(body), timeout=timeout)
+
+        r = post("reset", {"tenant": tenant})
+        if r.status != 200:
+            raise RuntimeError(f"deploy {tenant} reset: {r.status} {r.body}")
         for f in files:
             if f.get("kind") == "static":
-                statics.append({"path": f["path"],
-                                "content_type": f.get("content_type",
-                                                      "application/octet-stream"),
-                                "b64": f["b64"]})
+                body = {"tenant": tenant, "path": f["path"], "kind": "static",
+                        "content_type": f.get("content_type", "application/octet-stream"),
+                        "b64": f["b64"]}
             else:
-                handlers.append({"path": f["path"],
-                                 "source": base64.b64decode(f["b64"]).decode()})
-        # POST /v1/deploy — THE one deploy path (Track 0). The baked genesis
-        # bootstrap app is path-agnostic (any POST = deploy), so this works
-        # during bring-up; once web/admin is the standing __admin__ app it OWNS
-        # /v1/deploy (genesis's POST "/" became web/admin's RPC dispatcher), so
-        # deploys keep working after the dashboard replaces the bootstrap app.
-        r = _curl(f"{self.front_url()}/v1/deploy", method="POST",
-                  host=self.host_for("__admin__"),
-                  headers={"Authorization": f"Bearer {self.root_token}",
-                           "Content-Type": "application/json"},
-                  data=json.dumps({"tenant": tenant, "handlers": handlers,
-                                   "statics": statics}), timeout=30.0)
+                body = {"tenant": tenant, "path": f["path"], "kind": "handler",
+                        "source": base64.b64decode(f["b64"]).decode()}
+            r = post("file", body)
+            if r.status != 200:
+                raise RuntimeError(f"deploy {tenant} file {f['path']}: {r.status} {r.body}")
+        r = post("cut", {"tenant": tenant})
         if r.status != 200:
-            raise RuntimeError(f"deploy {tenant}: {r.status} {r.body}")
+            raise RuntimeError(f"deploy {tenant} cut: {r.status} {r.body}")
         payload = json.loads(r.body)
         if payload.get("ok") is not True or not payload.get("dep_id"):
-            raise RuntimeError(f"deploy {tenant}: bad payload {r.body[:200]!r}")
+            raise RuntimeError(f"deploy {tenant} cut: bad payload {r.body[:200]!r}")
         return payload["dep_id"]  # 16-hex-digit string
 
     def release(self, tenant: str, dep_id: str | int, *, node: int = 0) -> HttpResponse:

@@ -359,32 +359,44 @@ pub fn classify(a: std.mem.Allocator, bundle_path: []const u8) Bundle {
     return .{ .handlers = handlers.items, .statics = statics.items, .skipped = skipped.items };
 }
 
-/// Encode the deploy-app wire body: {tenant, handlers:[{path,source}],
-/// statics:[{path,content_type,b64}]}.
-pub fn deployBody(a: std.mem.Allocator, tenant: []const u8, b: Bundle) []const u8 {
+// ── per-file workspace deploy bodies ───────────────────────────────────────
+// The deploy app takes one file per request (reset → file × N → cut), so a
+// large bundle never buffers in the deploy app's JS heap. Shared by rewind-ops
+// and the rewind customer CLI.
+
+/// `{"tenant":"<id>"}` — for /v1/deploy/{reset,cut}.
+pub fn tenantBody(a: std.mem.Allocator, tenant: []const u8) []const u8 {
     var out = std.ArrayList(u8){};
     out.appendSlice(a, "{\"tenant\":") catch oom();
     writeJsonString(&out, a, tenant);
-    out.appendSlice(a, ",\"handlers\":[") catch oom();
-    for (b.handlers, 0..) |h, i| {
-        if (i != 0) out.append(a, ',') catch oom();
-        out.appendSlice(a, "{\"path\":") catch oom();
-        writeJsonString(&out, a, h.path);
-        out.appendSlice(a, ",\"source\":") catch oom();
-        writeJsonString(&out, a, h.source);
-        out.append(a, '}') catch oom();
-    }
-    out.appendSlice(a, "],\"statics\":[") catch oom();
-    for (b.statics, 0..) |s, i| {
-        if (i != 0) out.append(a, ',') catch oom();
-        out.appendSlice(a, "{\"path\":") catch oom();
-        writeJsonString(&out, a, s.path);
-        out.appendSlice(a, ",\"content_type\":") catch oom();
-        writeJsonString(&out, a, s.content_type);
-        out.appendSlice(a, ",\"b64\":") catch oom();
-        writeJsonString(&out, a, s.b64);
-        out.append(a, '}') catch oom();
-    }
-    out.appendSlice(a, "]}") catch oom();
+    out.append(a, '}') catch oom();
+    return out.items;
+}
+
+/// `{"tenant","kind":"handler","path","source"}` — one handler for /v1/deploy/file.
+pub fn fileBodyHandler(a: std.mem.Allocator, tenant: []const u8, h: Handler) []const u8 {
+    var out = std.ArrayList(u8){};
+    out.appendSlice(a, "{\"tenant\":") catch oom();
+    writeJsonString(&out, a, tenant);
+    out.appendSlice(a, ",\"kind\":\"handler\",\"path\":") catch oom();
+    writeJsonString(&out, a, h.path);
+    out.appendSlice(a, ",\"source\":") catch oom();
+    writeJsonString(&out, a, h.source);
+    out.append(a, '}') catch oom();
+    return out.items;
+}
+
+/// `{"tenant","kind":"static","path","content_type","b64"}` — one static.
+pub fn fileBodyStatic(a: std.mem.Allocator, tenant: []const u8, s: Static) []const u8 {
+    var out = std.ArrayList(u8){};
+    out.appendSlice(a, "{\"tenant\":") catch oom();
+    writeJsonString(&out, a, tenant);
+    out.appendSlice(a, ",\"kind\":\"static\",\"path\":") catch oom();
+    writeJsonString(&out, a, s.path);
+    out.appendSlice(a, ",\"content_type\":") catch oom();
+    writeJsonString(&out, a, s.content_type);
+    out.appendSlice(a, ",\"b64\":") catch oom();
+    writeJsonString(&out, a, s.b64);
+    out.append(a, '}') catch oom();
     return out.items;
 }

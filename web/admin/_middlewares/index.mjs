@@ -33,7 +33,7 @@ const PRE_AUTH_PATHS = [
 // continuity — NOT a human login path (the dashboard UI stays pure-OIDC).
 // A valid root token grants operator authority (is_root) with no `sub`;
 // the deploy handler gates on is_root OR session-ownership of the target.
-const M2M_PATHS = ["/v1/deploy"];
+const M2M_PATHS = ["/v1/deploy/reset", "/v1/deploy/file", "/v1/deploy/cut"];
 
 export function before() {
     const fullPath = request.path;

@@ -70,23 +70,39 @@ fn cmdDeploy(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, bundle
     if (b.handlers.len == 0 and b.statics.len == 0) fatal("bundle {s} has nothing to publish", .{bundle_path});
     std.debug.print("bundle: {d} handler(s), {d} static(s)\n", .{ b.handlers.len, b.statics.len });
 
-    const body = c.deployBody(a, tenant, b);
     const headers = authHeaders(a, env);
-    var dep: ?[]const u8 = null;
-    // POST /v1/deploy — the one deploy path (rewind-cli-plan Track 0). The
-    // baked genesis bootstrap app is path-agnostic; the standing web/admin app
-    // OWNS /v1/deploy (root-token M2M gate), so deploys work in both worlds.
-    for (c.workerUrls(env, a)) |w| {
-        const r = c.workerPost(a, env, w, "/v1/deploy", headers, body, 120);
-        if (r.code == 200) {
-            dep = c.extractDepId(a, r.body) orelse fatal("deploy: 200 but no dep_id: {s}", .{r.body});
-            break;
-        }
-        std.debug.print("  deploy via {s}: {d} {s} (trying next)\n", .{ w, r.code, c.trunc(r.body) });
+    // Per-file WORKSPACE deploy: reset the workspace → upload each file →
+    // cut a release. Each request is small; the old single mega-POST
+    // base64-buffered the whole bundle in the deploy app's JS heap and OOM'd
+    // on any real static-bearing bundle.
+    _ = deployPost(a, env, "/v1/deploy/reset", headers, c.tenantBody(a, tenant), "reset");
+    for (b.handlers) |h| {
+        _ = deployPost(a, env, "/v1/deploy/file", headers, c.fileBodyHandler(a, tenant, h), h.path);
     }
-    const dep_id = dep orelse fatal("deploy failed on every worker", .{});
+    for (b.statics) |s| {
+        _ = deployPost(a, env, "/v1/deploy/file", headers, c.fileBodyStatic(a, tenant, s), s.path);
+    }
+    const cut = deployPost(a, env, "/v1/deploy/cut", headers, c.tenantBody(a, tenant), "cut");
+    const dep_id = c.extractDepId(a, cut.body) orelse fatal("cut: 200 but no dep_id: {s}", .{cut.body});
     std.debug.print("deployment staged: {s} ({d} file(s)) — NOT released\n", .{ dep_id, b.handlers.len + b.statics.len });
     if (release) cmdRelease(a, env, tenant, dep_id);
+}
+
+/// POST a deploy sub-request to the standing app, leader-retrying across the
+/// workers (a non-leader 421/503s). Returns the 200 Resp or fatals after
+/// retries. `label` names the step in errors (path / "reset" / "cut").
+fn deployPost(a: std.mem.Allocator, env: *const c.Env, sub: []const u8, headers: []const c.Header, body: []const u8, label: []const u8) c.Resp {
+    const workers = c.workerUrls(env, a);
+    var attempt: usize = 0;
+    while (attempt < 6) : (attempt += 1) {
+        for (workers) |w| {
+            const r = c.workerPost(a, env, w, sub, headers, body, 120);
+            if (r.code == 200) return r;
+            std.debug.print("  {s} via {s}: {d} {s} (trying next)\n", .{ label, w, r.code, c.trunc(r.body) });
+        }
+        std.Thread.sleep(2 * std.time.ns_per_s);
+    }
+    fatal("deploy step '{s}' failed on every worker", .{label});
 }
 
 /// Flip _deploy/current via /_system/release. Leader-gated → 6× round-robin retry.
