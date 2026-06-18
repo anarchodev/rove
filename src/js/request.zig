@@ -411,13 +411,6 @@ pub const Request = struct {
     /// onFetchChunk activations (includes the current fetch). Cross-source
     /// like `activation_entity`; 0 elsewhere.
     activation_fetches_pending: u32 = 0,
-    /// §9.4 write-pressure: count of chunks dropped from the held stream's
-    /// `StreamChunks` queue since the last surfacing. Snapshotted + reset on
-    /// each stream-chain activation; surfaces as
-    /// `request.activation.write_pressure.dropped_chunks`. Read on every
-    /// activation (0 for non-stream), so it stays top-level rather than in a
-    /// union arm.
-    activation_write_pressure_dropped: u32 = 0,
 
     /// What caused this activation + its per-source payload.
     activation: Activation = .inbound,

@@ -547,11 +547,6 @@ fn resumeStream(
         batch_owned = drained.wakes;
         batch_lost_oldest = drained.lost_oldest;
     }
-    // §9.4 write-pressure: snapshot + reset the chunk-queue drop
-    // counter so this activation sees the count of chunks dropped
-    // since the last activation (one-shot signal — handler decides
-    // whether to refetch / resync / throttle / terminate).
-    const dropped_chunks_snapshot = chunks_st.takeDropped();
     // Handler-surface Phase 2: a resumed stream handler re-arms its
     // wakes via `on.*` and emits more output via `stream.write()`, just
     // like the first hop. Wire both accumulators so `finishResponse`
@@ -589,7 +584,6 @@ fn resumeStream(
             .{ .wake_batch = .{ .wakes = batch_owned, .lost_oldest = batch_lost_oldest } }
         else
             dispatcher_mod.Activation.fromSource(activation),
-        .activation_write_pressure_dropped = dropped_chunks_snapshot,
         .trace = .{
             .readset = &readset,
             .request_id = request_id,
@@ -961,7 +955,6 @@ pub fn resumeBoundFetchStream(
         break :blk tl.id_minter.nextRequestId() catch 0;
     };
 
-    const dropped_chunks_snapshot = chunks_st.takeDropped();
     // Snapshot fetchesPending — same shape as resumeBoundFetchChain.
     // Entity is in `stream_data_out` or `stream_response_in` at
     // this point; both carry BoundFetchCount via the merged Row.
@@ -1008,7 +1001,6 @@ pub fn resumeBoundFetchStream(
         } },
         .activation_entity = ent,
         .activation_fetches_pending = fetches_pending,
-        .activation_write_pressure_dropped = dropped_chunks_snapshot,
         .trace = .{
             .readset = &readset,
             .request_id = request_id,
@@ -1118,7 +1110,11 @@ pub fn resumeBoundFetchStream(
             flushFireFetches(worker, &pending_fetches);
             if (r.body.len > 0) {
                 const owned = allocator.dupe(u8, r.body) catch return;
-                chunks_st.tryAppend(allocator, owned) catch {};
+                // Lossless: never silently drop. The producer-pacing gate
+                // keeps the queue below the soft cap, so this can only fail if
+                // a single chunk blows the hard cap — close loudly, don't drop.
+                chunks_st.tryAppend(allocator, owned) catch |e|
+                    std.log.err("rove-js bound-fetch stream: terminal chunk append failed ({s}) — closing", .{@errorName(e)});
             }
             markStreamDrainingAnywhere(server, ent);
             chain_st.activation_count += 1;
@@ -1189,7 +1185,14 @@ pub fn resumeBoundFetchStream(
             // Headers on subsequent hops ignored; free.
             if (s2.headers) |h| allocator.free(h);
             s2.headers = null;
-            for (s2.chunks) |c| chunks_st.tryAppend(allocator, c) catch {};
+            // Lossless: the producer-pacing gate (dispatchSpoolHead) keeps the
+            // queue below the soft cap before dispatching this chunk, so the
+            // hard cap is only reachable if one chunk alone exceeds it — close
+            // loudly rather than silently drop (tryAppend frees `c` on error).
+            for (s2.chunks) |c| chunks_st.tryAppend(allocator, c) catch |e| {
+                std.log.err("rove-js bound-fetch stream: chunk append failed ({s}) — closing", .{@errorName(e)});
+                markStreamDrainingAnywhere(server, ent);
+            };
             if (s2.chunks.len > 0) allocator.free(s2.chunks);
             s2.chunks = &.{};
             if (chain_st.ctx_json.len > 0) allocator.free(chain_st.ctx_json);
@@ -1691,21 +1694,12 @@ pub fn fireDisconnectActivation(worker: anytype, ent: rove.Entity) void {
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{path}) catch return;
     defer allocator.free(spath);
 
-    // §9.4 write-pressure: snapshot + reset the chunk-queue drop
-    // counter so the disconnect activation sees what was lost.
-    // (No socket to flush to anymore, but the handler can still
-    // log / persist an "ended with N dropped frames" marker.)
-    const dropped_chunks_snapshot: u32 = blk: {
-        const sc = server.reg.get(ent, &server.response_out, components_mod.StreamChunks) catch break :blk 0;
-        break :blk sc.takeDropped();
-    };
     const request: Request = .{
         .method = "POST",
         .path = spath,
         .body = body,
         .query = null,
         .activation = .disconnect,
-        .activation_write_pressure_dropped = dropped_chunks_snapshot,
         .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = chain_ctx.correlation_id },
         .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
@@ -2656,6 +2650,22 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
             );
             dropSpool(worker, key);
             return;
+        }
+
+        // Backpressure (lossless): if this is a STREAM chain whose output queue
+        // is already at the soft high-water, DON'T feed it — leave the head
+        // spooled. `serviceParkedStreams` drains the queue one chunk/tick and
+        // `drainSpools` retries this each tick, so a fast upstream is paced to
+        // the client without dropping. The spool is the backlog (RAM-bounded by
+        // its own eviction-to-coordinator). Continuations (first chunk, pre-
+        // stream) are never gated — they open the stream.
+        if (ready_stream and !ready_cont) {
+            const sc: ?*components_mod.StreamChunks =
+                (server.reg.get(held_ent, &server.stream_data_out, components_mod.StreamChunks) catch null) orelse
+                (server.reg.get(held_ent, &server.stream_response_in, components_mod.StreamChunks) catch null);
+            if (sc) |chunks| {
+                if (chunks.atSoftCap()) return;
+            }
         }
 
         // Head entity is ready. If the head chunk's inline bytes were

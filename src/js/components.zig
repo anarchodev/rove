@@ -105,41 +105,49 @@ pub const StreamChain = struct {
 /// "no chunks queued" state; nothing distinguishes it from "no
 /// stream attached" — that's the collection's job.
 ///
-/// §9.4 write-pressure: a soft byte cap on the queue caps the
-/// runtime's memory exposure to a misbehaving handler that returns
-/// gigabytes of chunks. On enqueue-overflow the runtime drops the
-/// excess (newest-first; the start of the stream is what the
-/// customer chose to send earlier) and increments `dropped_chunks`.
-/// The next activation reads `request.activation.write_pressure
-/// .dropped_chunks`; the runtime resets the counter after surfacing
-/// it (one-shot signal per activation).
+/// `stream.write` output is LOSSLESS — the queue NEVER silently drops a
+/// chunk. Two caps with different jobs:
+///   - SOFT cap (`QUEUE_SOFT_CAP`): the backpressure high-water. A producer
+///     that can be paced — a bound fetch feeding the stream — is NOT dispatched
+///     while the queue is at/over this (the spool holds the backlog; see
+///     `dispatchSpoolHead`). So a fast upstream never outruns a slow client.
+///   - HARD cap (`QUEUE_HARD_CAP`): a backstop for the one case that can't be
+///     paced — a single synchronous activation that `stream.write`s more than
+///     this in one go. `tryAppend` then returns `error.StreamBufferFull` (the
+///     binding surfaces it as a loud JS throw: "paginate with next()"). Never a
+///     silent drop.
 pub const StreamChunks = struct {
     queue: std.ArrayListUnmanaged([]u8) = .empty,
     /// Running sum of `queue.items[i].len` — kept in lockstep with
-    /// the queue so `tryAppend` is O(1).
+    /// the queue so `tryAppend`/`atSoftCap` are O(1).
     queue_bytes: usize = 0,
-    /// Cumulative chunks dropped since the last surfacing. Reset
-    /// to 0 after the runtime stamps it onto a Request.
-    dropped_chunks: u32 = 0,
 
-    /// Soft cap on `queue_bytes`. Conservative default; per-tenant
-    /// override hook is cheap to add later. Sized for ~one MTU's
-    /// worth of buffered SSE frames plus headroom — heartbeats /
-    /// kv-update fanout patterns sit far below this; pathological
-    /// returns hit the cap and surface via `dropped_chunks`.
-    pub const QUEUE_BYTES_CAP: usize = 256 * 1024;
+    /// Backpressure high-water. A bound-fetch producer pauses (leaves its
+    /// chunk spooled) while `queue_bytes >= QUEUE_SOFT_CAP`. Sized at one max
+    /// fetch chunk so one chunk is in flight at a time, drained one/tick.
+    pub const QUEUE_SOFT_CAP: usize = 256 * 1024;
 
-    /// Enqueue `chunk` (ownership transferred on success). On
-    /// cap-overflow: free `chunk` and increment `dropped_chunks`
-    /// — §9.4 newest-first drop posture preserves the start of
-    /// stream. Returns the standard ArrayList append error only on
-    /// allocator failure; cap-overflow is silently surfaced via
-    /// the counter, not as an error.
-    pub fn tryAppend(self: *StreamChunks, allocator: std.mem.Allocator, chunk: []u8) std.mem.Allocator.Error!void {
-        if (self.queue_bytes + chunk.len > QUEUE_BYTES_CAP) {
+    /// Hard ceiling for a single un-paceable synchronous activation's writes.
+    /// `tryAppend` past this errors (loud) rather than dropping or buffering
+    /// unboundedly. Generous so normal handlers never hit it.
+    pub const QUEUE_HARD_CAP: usize = 4 * 1024 * 1024;
+
+    /// True when the queue is at/over the backpressure high-water — the
+    /// producer-pacing gate reads this to decide whether to feed more.
+    pub fn atSoftCap(self: *const StreamChunks) bool {
+        return self.queue_bytes >= QUEUE_SOFT_CAP;
+    }
+
+    /// Enqueue `chunk` (ownership transferred on success). LOSSLESS: never
+    /// drops. Past the HARD cap it frees `chunk` and returns
+    /// `error.StreamBufferFull` (a single synchronous activation overran the
+    /// buffer — the binding throws so the customer sees it). Allocator failure
+    /// surfaces as `error.OutOfMemory`. The SOFT cap is enforced upstream by
+    /// the producer-pacing gate, not here.
+    pub fn tryAppend(self: *StreamChunks, allocator: std.mem.Allocator, chunk: []u8) error{ OutOfMemory, StreamBufferFull }!void {
+        if (self.queue_bytes + chunk.len > QUEUE_HARD_CAP) {
             allocator.free(chunk);
-            self.dropped_chunks +%= 1;
-            return;
+            return error.StreamBufferFull;
         }
         self.queue.append(allocator, chunk) catch |e| {
             allocator.free(chunk);
@@ -157,14 +165,6 @@ pub const StreamChunks = struct {
         const chunk = self.queue.orderedRemove(0);
         self.queue_bytes -= chunk.len;
         return chunk;
-    }
-
-    /// Snapshot + reset `dropped_chunks`. Called by resume engines
-    /// to stamp the count onto the next activation's Request.
-    pub fn takeDropped(self: *StreamChunks) u32 {
-        const n = self.dropped_chunks;
-        self.dropped_chunks = 0;
-        return n;
     }
 
     pub fn deinit(allocator: std.mem.Allocator, items: []StreamChunks) void {
@@ -654,39 +654,40 @@ test "StreamChunks.tryAppend tracks bytes; popOldest reverses (Gap 2.2 Phase H)"
     try testing.expectEqual(@as(?[]u8, null), sc.popOldest());
 }
 
-test "StreamChunks.tryAppend drops + counts on cap overflow" {
+test "StreamChunks.tryAppend errors (lossless, no drop) on HARD cap overflow" {
     const a = testing.allocator;
     var sc: StreamChunks = .{};
     defer StreamChunks.deinit(a, (&sc)[0..1]);
 
-    // Fill ~most of the cap with one big chunk.
-    const big_len: usize = StreamChunks.QUEUE_BYTES_CAP - 10;
+    // Fill ~most of the HARD cap with one big chunk.
+    const big_len: usize = StreamChunks.QUEUE_HARD_CAP - 10;
     const big = try a.alloc(u8, big_len);
     @memset(big, 'X');
     try sc.tryAppend(a, big);
 
-    // Small chunk that fits — should succeed.
+    // Small chunk that fits — succeeds.
     try sc.tryAppend(a, try a.dupe(u8, "fits"));
-    try testing.expectEqual(@as(u32, 0), sc.dropped_chunks);
 
-    // Chunk that would exceed cap — should drop.
+    // A chunk that would exceed the HARD cap — ERRORS (never silently dropped).
+    // tryAppend frees the chunk on error, so no leak.
     const overflow = try a.alloc(u8, 100);
     @memset(overflow, 'Y');
-    try sc.tryAppend(a, overflow);
-    try testing.expectEqual(@as(u32, 1), sc.dropped_chunks);
+    try testing.expectError(error.StreamBufferFull, sc.tryAppend(a, overflow));
+    // Queue unchanged by the rejected append.
     try testing.expectEqual(@as(usize, big_len + 4), sc.queue_bytes);
     try testing.expectEqual(@as(usize, 2), sc.queue.items.len);
 }
 
-test "StreamChunks.takeDropped snapshots + resets" {
+test "StreamChunks.atSoftCap reflects the backpressure high-water" {
     const a = testing.allocator;
     var sc: StreamChunks = .{};
     defer StreamChunks.deinit(a, (&sc)[0..1]);
 
-    sc.dropped_chunks = 7;
-    try testing.expectEqual(@as(u32, 7), sc.takeDropped());
-    try testing.expectEqual(@as(u32, 0), sc.dropped_chunks);
-    try testing.expectEqual(@as(u32, 0), sc.takeDropped());
+    try testing.expect(!sc.atSoftCap());
+    const chunk = try a.alloc(u8, StreamChunks.QUEUE_SOFT_CAP);
+    @memset(chunk, 'Z');
+    try sc.tryAppend(a, chunk);
+    try testing.expect(sc.atSoftCap()); // at the high-water → producer pauses
 }
 
 test "StreamWakes deinit frees kv_prefixes spine + entries" {

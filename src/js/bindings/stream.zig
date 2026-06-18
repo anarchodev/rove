@@ -27,6 +27,7 @@ const qjs = @import("rove-qjs");
 const c = qjs.c;
 
 const globals = @import("../globals.zig");
+const components = @import("../components.zig");
 
 const js_undefined = globals.js_undefined;
 const js_exception = globals.js_exception;
@@ -133,6 +134,16 @@ pub fn jsStreamWrite(
         _ = c.JS_ThrowInternalError(ctx, "stream.write: out of memory");
         return js_exception;
     };
+    // Lossless backstop: a single activation can't be backpressured mid-run, so
+    // cap its cumulative writes at the hard ceiling and throw (never drop). The
+    // bound-fetch / wake paths produce one chunk per activation and pace via the
+    // queue's soft cap; this only fires on a synchronous flood (a `for` loop
+    // writing > the cap in one go) — the fix is to paginate with `next()`.
+    if (state.stream_pending_bytes + bytes.len > components.StreamChunks.QUEUE_HARD_CAP) {
+        state.allocator.free(bytes);
+        _ = c.JS_ThrowRangeError(ctx, "stream.write: too many bytes buffered in one activation; emit fewer per activation and continue with next()");
+        return js_exception;
+    }
     // Writing implies the stream is open — `start()` is optional.
     state.stream_started = true;
     list.append(state.allocator, bytes) catch {
@@ -140,6 +151,7 @@ pub fn jsStreamWrite(
         _ = c.JS_ThrowInternalError(ctx, "stream.write: out of memory");
         return js_exception;
     };
+    state.stream_pending_bytes += bytes.len;
     // websocket-plan §5: on a WS connection activation, record this
     // chunk's frame opcode in lockstep (text iff the arg was a string,
     // binary otherwise) so the worker frames it correctly. Null on

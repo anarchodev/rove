@@ -431,6 +431,12 @@ pub const DispatchState = struct {
     /// irrelevant and chunks are plain bytes. Same caller-owned model
     /// as `pending_stream_chunks` — the worker frees both lists.
     pending_stream_chunk_opcodes: ?*std.ArrayListUnmanaged(u8) = null,
+    /// Running sum of `stream.write` bytes THIS activation. Lossless
+    /// stream.write throws (not drops) when a single activation's writes
+    /// exceed `StreamChunks.QUEUE_HARD_CAP` — bounding per-activation memory
+    /// and telling the customer loudly to paginate with `next()`. Reset per
+    /// dispatch (the field is fresh on each DispatchState).
+    stream_pending_bytes: usize = 0,
     /// Phase 5 PR-2b: true ⇒ the dispatched module is a `__system/`
     /// built-in (e.g. the webhook shim's `webhook_onresult.mjs`).
     /// `isCustomerWriteReserved` is skipped so the shim can write
@@ -2346,16 +2352,10 @@ pub fn installRequest(
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "overflow", overflow);
     }
 
-    // §9.4 write-pressure surface. Always present on stream-chain
-    // activations (wake_batch + disconnect today); 0 on other
-    // activation kinds. Field shape mirrors `overflow` — a small
-    // object so future counters (e.g. queue-drain stalls) can land
-    // alongside `dropped_chunks` without breaking the schema.
-    {
-        const wp = c.JS_NewObject(ctx);
-        _ = c.JS_SetPropertyStr(ctx, wp, "dropped_chunks", c.JS_NewInt64(ctx, @intCast(request.activation_write_pressure_dropped)));
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "write_pressure", wp);
-    }
+    // (Removed: the §9.4 `write_pressure.dropped_chunks` surface. stream.write
+    // is lossless now — the runtime never drops; it backpressures the producer
+    // or throws loudly on a single-activation overrun. There is nothing to
+    // surface.)
 
     // Gap 2.1 subscription_fire payload. The activation's `name`
     // is the subscription's directory name; `source` carries the
