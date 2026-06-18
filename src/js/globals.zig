@@ -20,6 +20,7 @@ const std = @import("std");
 const qjs = @import("rove-qjs");
 const kv_mod = @import("raft-kv");
 const tape_mod = @import("rove-tape");
+const log_mod = @import("rove-log");
 const tenant_mod = @import("rove-tenant");
 const h2 = @import("rove-h2");
 const rove = @import("rove");
@@ -332,6 +333,12 @@ pub const DispatchState = struct {
     /// Accumulated `console.log` output. Owned by the dispatcher; reset
     /// between requests.
     console: *std.ArrayList(u8),
+    /// Accumulated user-defined index tags from `request.tag(k,v)`.
+    /// Owned by the dispatcher (a per-dispatch buffer, like `console`);
+    /// `finishResponse` moves them onto the Response/Continuation so
+    /// they reach the log record even across a `next()`. Each key/value
+    /// is an owned dupe; capped at `log_mod.MAX_TAGS`.
+    tags: *std.ArrayList(log_mod.Tag),
     /// Set if a kv-level error needs to bubble back to the caller after
     /// the JS runs. We can't throw from inside the C callback cleanly in
     /// all cases, so we record the first error and let the dispatcher
@@ -1012,6 +1019,85 @@ fn jsConsoleLog(
         state.console.appendSlice(state.allocator, s) catch return js_exception;
     }
     state.console.append(state.allocator, '\n') catch return js_exception;
+    return js_undefined;
+}
+
+// ── request.tag(key, value) ─────────────────────────────────────────
+//
+// Attach a low-cardinality index tag to this request's log record.
+// Indexed by the log-server so a later query can filter
+// `?tag.<key>=<value>` (and the `/session/{id}` sugar route filters
+// `tag.session`). The browser-agent tags its connection
+// `session = <app sid>` so the brain's `getReplay` pulls just this
+// session's activations. Bounded + fail-loud (a cap/charset violation
+// is a handler bug → throws, surfacing in the record's exception/console
+// rather than silently dropping). Re-tagging an existing key updates it.
+fn jsRequestTag(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    const state = getState(ctx);
+    if (argc < 2 or !c.JS_IsString(argv[0]) or !c.JS_IsString(argv[1])) {
+        _ = c.JS_ThrowTypeError(ctx, "request.tag(key, value) requires two string arguments");
+        return js_exception;
+    }
+    const key = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    defer state.allocator.free(key);
+    const val = valueToOwnedString(state, ctx, argv[1]) catch return js_exception;
+    defer state.allocator.free(val);
+
+    if (key.len == 0 or key.len > log_mod.MAX_TAG_KEY_LEN) {
+        _ = c.JS_ThrowTypeError(ctx, "request.tag: key length must be 1..32 bytes");
+        return js_exception;
+    }
+    if (key[0] == '_') {
+        _ = c.JS_ThrowTypeError(ctx, "request.tag: keys starting with '_' are reserved");
+        return js_exception;
+    }
+    for (key) |ch| {
+        const ok = (ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or ch == '_';
+        if (!ok) {
+            _ = c.JS_ThrowTypeError(ctx, "request.tag: key must match [a-z0-9_]");
+            return js_exception;
+        }
+    }
+    if (val.len == 0 or val.len > log_mod.MAX_TAG_VALUE_LEN) {
+        _ = c.JS_ThrowTypeError(ctx, "request.tag: value length must be 1..64 bytes");
+        return js_exception;
+    }
+    for (val) |ch| {
+        if (ch < 0x20) {
+            _ = c.JS_ThrowTypeError(ctx, "request.tag: value must not contain control characters");
+            return js_exception;
+        }
+    }
+
+    // Update in place if the key is already set this activation.
+    for (state.tags.items) |*t| {
+        if (std.mem.eql(u8, t.key, key)) {
+            const new_v = state.allocator.dupe(u8, val) catch return js_exception;
+            state.allocator.free(t.value);
+            t.value = new_v;
+            return js_undefined;
+        }
+    }
+    // New key — enforce the per-record cap (fail loud, don't truncate).
+    if (state.tags.items.len >= log_mod.MAX_TAGS) {
+        _ = c.JS_ThrowTypeError(ctx, "request.tag: too many tags (max 4 per request)");
+        return js_exception;
+    }
+    const k = state.allocator.dupe(u8, key) catch return js_exception;
+    const v = state.allocator.dupe(u8, val) catch {
+        state.allocator.free(k);
+        return js_exception;
+    };
+    state.tags.append(state.allocator, .{ .key = k, .value = v }) catch {
+        state.allocator.free(k);
+        state.allocator.free(v);
+        return js_exception;
+    };
     return js_undefined;
 }
 
@@ -2166,6 +2252,20 @@ pub fn installRequest(
     definePropertyGetter(ctx, req_obj, "cookies", c.JS_NewCFunction2(ctx, @ptrCast(&jsCookiesGetter), "cookies", 0, c.JS_CFUNC_getter_magic, 0));
     definePropertyGetter(ctx, req_obj, "ip", c.JS_NewCFunction2(ctx, @ptrCast(&jsIpGetter), "ip", 0, c.JS_CFUNC_getter_magic, 0));
     _ = c.JS_SetPropertyStr(ctx, req_obj, "unmaskedIp", c.JS_NewCFunction2(ctx, jsUnmaskedIp, "unmaskedIp", 0, c.JS_CFUNC_generic, 0));
+    // request.tag(key, value): attach a low-cardinality index tag to
+    // this request's log record (see `jsRequestTag`).
+    _ = c.JS_SetPropertyStr(ctx, req_obj, "tag", c.JS_NewCFunction2(ctx, jsRequestTag, "tag", 2, c.JS_CFUNC_generic, 0));
+    // request.correlation_id: the engine per-chain id (stable across a
+    // held connection's activations). The reserved `_corr` index tag is
+    // derived from it; a handler can also store it to map its own app
+    // session id ↔ correlation_id across reconnects. Empty string when
+    // the dispatch carries no chain context.
+    _ = c.JS_SetPropertyStr(ctx, req_obj, "correlation_id", c.JS_NewStringLen(ctx, state.correlation_id.ptr, state.correlation_id.len));
+    // request.tenant: the handler's own instance id. Needed to address
+    // the self-tenant `rewind-logs.internal/v1/{tenant}/…` door (the
+    // engine pins the read to this same id, so it can't reach another
+    // tenant's logs). Not a secret — it's the tenant's own id.
+    _ = c.JS_SetPropertyStr(ctx, req_obj, "tenant", c.JS_NewStringLen(ctx, state.instance_id.ptr, state.instance_id.len));
 
     // request.session = {id: "<64hex>"} when the worker resolved a
     // session cookie (or freshly minted one) for this request, else

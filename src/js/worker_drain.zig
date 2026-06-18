@@ -1198,7 +1198,7 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
         ctx.txn.rollback() catch {};
         ctx.txn_done.* = true;
         resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, "stream resume alloc failed\n") catch {};
-        captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 500, .fault, &.{}, &.{}, .{}, ctx.correlation_id, ctx.activation, 0);
+        captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 500, .fault, &.{}, &.{}, .{}, ctx.correlation_id, &.{}, ctx.activation, 0);
         return;
     };
 
@@ -1253,12 +1253,12 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
             ctx.txn_owned.* = false;
             ctx.txn_done.* = true;
             resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, "stream resume write replication failed\n") catch {};
-            captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 500, .fault, &.{}, &.{}, .{}, ctx.correlation_id, ctx.activation, 0);
+            captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 500, .fault, &.{}, &.{}, .{}, ctx.correlation_id, &.{}, ctx.activation, 0);
             return;
         };
         ctx.txn_owned.* = false;
         ctx.txn_done.* = true;
-        captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 0, .ok, &.{}, &.{}, .{}, ctx.correlation_id, ctx.activation, stream_seq);
+        captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 0, .ok, &.{}, &.{}, .{}, ctx.correlation_id, &.{}, ctx.activation, stream_seq);
         return;
     }
 
@@ -1313,7 +1313,7 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
         for (stream_kv_prefixes) |p| allocator.free(p);
         if (stream_kv_prefixes.len > 0) allocator.free(stream_kv_prefixes);
         resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, "stream resume header build failed\n") catch {};
-        captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", cont_path_for_log, "", ctx.deployment_id, ctx.now_ns, 500, .fault, &.{}, &.{}, .{}, ctx.correlation_id, ctx.activation, 0);
+        captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", cont_path_for_log, "", ctx.deployment_id, ctx.now_ns, 500, .fault, &.{}, &.{}, .{}, ctx.correlation_id, &.{}, ctx.activation, 0);
         return;
     };
     for (parsed_headers) |h| {
@@ -1329,7 +1329,7 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     // collections; flushResumeFetches' parked_continuations count bump
     // soft-fails there) — they drop with a register failure.
     if (ctx.pending_fetches) |pf| flushResumeFetches(worker, ctx.ent, pf, false);
-    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", cont_path_for_log, "", ctx.deployment_id, ctx.now_ns, 0, .ok, &.{}, &.{}, .{}, ctx.correlation_id, ctx.activation, 0);
+    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", cont_path_for_log, "", ctx.deployment_id, ctx.now_ns, 0, .ok, &.{}, &.{}, .{}, ctx.correlation_id, &.{}, ctx.activation, 0);
 }
 
 /// 503 (retriable) when this activation's failure was an invalidated txn
@@ -1536,7 +1536,7 @@ fn resumeContinuation(
                 // source = send_callback so the row shares the chain
                 // id with the inbound entry and the replay UX groups
                 // them.
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, act_src, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, &.{}, act_src, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1594,14 +1594,14 @@ fn resumeContinuation(
                     txn_owned = false; // helper destroyed it
                     txn_done = true;
                     resolveParked(worker, ent, sid, sess, 500, "continuation write replication failed\n") catch {};
-                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", dep_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, corr_id, act_src, 0);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", dep_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, corr_id, &.{}, act_src, 0);
                     return;
                 };
                 // proposeAndParkContResume took ownership of txn (moved
                 // into pending_txns) and body_dup (stamped onto entity).
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", dep_id, now_ns, st, .ok, console_owned, exception_owned, .{}, corr_id, act_src, cont_seq);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", dep_id, now_ns, st, .ok, console_owned, exception_owned, .{}, corr_id, &.{}, act_src, cont_seq);
                 if (pending_fetches.items.len > 0) std.log.warn(
                     "rove-js cont-resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ pending_fetches.items.len, tenant_id },
@@ -1619,7 +1619,7 @@ fn resumeContinuation(
             flushResumeFetches(worker, ent, &pending_fetches, false);
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
             try resolveParked(worker, ent, sid, sess, st, r.body);
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, act_src, 0);
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, &.{}, act_src, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -1714,7 +1714,7 @@ fn resumeContinuation(
                     txn_owned = false;
                     txn_done = true;
                     resolveParked(worker, ent, sid, sess, 500, "continuation write replication failed\n") catch {};
-                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", dep_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_id, act_src, 0);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", dep_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_id, &.{}, act_src, 0);
                     return;
                 };
                 txn_owned = false;
@@ -1722,7 +1722,7 @@ fn resumeContinuation(
                 // Log the repark hop's tape row. status=0 (parked,
                 // same as the inbound trampoline open hop's
                 // captureSuccess shape).
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", dep_id, now_ns, 0, .ok, &.{}, &.{}, .{}, corr_id, act_src, repark_seq);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", dep_id, now_ns, 0, .ok, &.{}, &.{}, .{}, corr_id, &.{}, act_src, repark_seq);
                 if (pending_fetches.items.len > 0) std.log.warn(
                     "rove-js cont-resume: {d} connection-scoped fetch(es) from a WRITING repark dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ pending_fetches.items.len, tenant_id },
@@ -2001,7 +2001,7 @@ pub fn resumeBoundFetchChain(
                 txn.rollback() catch {};
                 txn_done = true;
                 resolveParked(worker, ent, sid, sess, 500, "bound-fetch handler exception\n") catch {};
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, .fetch_chunk, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, &.{}, .fetch_chunk, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -2048,12 +2048,12 @@ pub fn resumeBoundFetchChain(
                     txn_owned = false;
                     txn_done = true;
                     resolveParked(worker, ent, sid, sess, 500, "bound-fetch replication failed\n") catch {};
-                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, correlation_id, .fetch_chunk, 0);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, correlation_id, &.{}, .fetch_chunk, 0);
                     return;
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, .{}, correlation_id, .fetch_chunk, seq);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, .{}, correlation_id, &.{}, .fetch_chunk, seq);
                 if (pending_fetches.items.len > 0) std.log.warn(
                     "rove-js bound-fetch resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ pending_fetches.items.len, tenant_id },
@@ -2070,7 +2070,7 @@ pub fn resumeBoundFetchChain(
             // fetches drop (scope rule), unbound ones still fire.
             flushResumeFetches(worker, ent, &pending_fetches, false);
             resolveParked(worker, ent, sid, sess, st, r.body) catch {};
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, .fetch_chunk, 0);
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, &.{}, .fetch_chunk, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -2132,7 +2132,7 @@ pub fn resumeBoundFetchChain(
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, .fetch_chunk, seq);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, &.{}, .fetch_chunk, seq);
                 if (pending_fetches.items.len > 0) std.log.warn(
                     "rove-js bound-fetch resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ pending_fetches.items.len, tenant_id },
@@ -3156,7 +3156,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
                 txn.rollback() catch {};
                 txn_done = true;
                 resolveParked(worker, ent, sid, sess, 500, "inbound-chunk handler exception\n") catch {};
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, .inbound_chunk, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, &.{}, .inbound_chunk, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return true;
@@ -3203,12 +3203,12 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
                     txn_owned = false;
                     txn_done = true;
                     resolveParked(worker, ent, sid, sess, 500, "inbound-chunk replication failed\n") catch {};
-                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .fault, console_owned, exception_owned, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, .inbound_chunk, 0);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .fault, console_owned, exception_owned, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, &.{}, .inbound_chunk, 0);
                     return true;
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, .inbound_chunk, seq);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, &.{}, .inbound_chunk, seq);
                 return true;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -3219,7 +3219,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
             txn_done = true;
             flushResumeFetches(worker, ent, &pending_fetches, false);
             resolveParked(worker, ent, sid, sess, st, r.body) catch {};
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, .inbound_chunk, 0);
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, &.{}, .inbound_chunk, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -3273,7 +3273,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, .inbound_chunk, seq);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, &.{}, .inbound_chunk, seq);
                 if (pending_fetches.items.len > 0) std.log.warn(
                     "rove-js inbound-chunk resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ pending_fetches.items.len, tenant_id },
@@ -3302,7 +3302,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
             // read-only on EVERY chunk — without this record the
             // upload would be unreplayable). Status 0 = the
             // parked-hop convention.
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, .inbound_chunk, 0);
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, &.{}, .inbound_chunk, 0);
         },
         .stream => |*s| {
             resumeIntoStream(worker, s, .{
