@@ -302,22 +302,21 @@ Verified against the raft-0.7.0 source (the crate TiKV uses), not memory:
   and the joiner adopts it. Validated by `membership_from_snapshot_smoke_v2`
   (the `-6`/409 self-omit guard is the distinguisher). Absent headers →
   membership-neutral (unchanged).
-- **2d-3 — reconciler integration: OPEN (first attempt REVERTED).** Naively
-  reordering `ensureMember` to add-learner-FIRST (so the baseline can carry the
-  member) **hit `raft_log.rs:292` `to_commit N out of range [last_index N-1]`** —
-  the commit_to panic. Under the reconciler's concurrent write load, a node born at
-  the baseline (= leader's APPLIED index) gets a heartbeat carrying the leader's
-  COMMITTED index (already ahead) → abort. The existing **bootstrap-THEN-add**
-  ordering is deliberately panic-safe (the node's group exists + the leader's
-  Progress starts fresh match=0 BEFORE the leader tracks/commits to it); add-first
-  breaks that. So 2d-3 must NOT reorder. Candidate: keep bootstrap-then-add, but
-  have the reconciler pass an **augmented ConfState** (the leader's current
-  ConfState + the joining node as a learner) so the baseline satisfies raft.rs:2581
-  WITHOUT requiring the leader's AddLearner to commit first — needs careful
-  validation that the brief leader-doesn't-know-the-node window is safe. The
-  membership_from_snapshot smoke passed BECAUSE it is quiescent (no commit advance
-  between add and attach); the reconciler is not. Delete the `initWithLearners`
-  hack only once 2d-3 lands.
+- **2d-3 — reconciler integration ✅ LANDED via augmented ConfState (`678b885`).**
+  `bootstrapMember` reads the leader's CURRENT ConfState and bootstraps the joiner
+  with that set PLUS itself as a learner (the augmented set, carried by the
+  baseline). This satisfies raft.rs:2581 (recipient is in the ConfState) WITHOUT
+  reordering, so the panic-safe **bootstrap-THEN-add** order is preserved — the
+  leader doesn't track/commit to the node until the AddLearner that FOLLOWS the
+  bootstrap. (The FIRST attempt reordered to add-FIRST and hit `raft_log.rs:292`
+  `to_commit out of range`: the leader committed to the node before its group
+  existed at a consistent baseline. The augmented approach changes only the
+  ConfState CONTENT, not the order.) Validated: membership_reconciler **6/6, ZERO
+  crashes** (vs the reorder's 1/3 abort) + the join-path suite green. Runtime proof
+  the augmentation is correct: a self-omitting ConfState 409s via the `-6` guard,
+  so 6/6 heals succeeding ⇒ the node was correctly in the augmented set. Delete the
+  `initWithLearners` hack is still open (the born set is overwritten by the
+  baseline ConfState, so the hack is now inert for the reconciler path).
 - **2e — cluster node-set SSOT ✅ LANDED (`8830341`).** A fresh tenant group is born
   with the **CP-supplied cluster node set** (`createGroupCore` `voters_override`,
   threaded via `v2-attach`'s `X-Rewind-Voters`; CP `handleProvision` passes
