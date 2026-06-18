@@ -97,14 +97,16 @@ def _curl_to_file(url, path, *, data=None):
     return subprocess.run(args, capture_output=True, text=True).stdout.strip()
 
 
-def _attach_file(url, path, *, tenant, index, term, as_learner):
+def _attach_file(url, path, *, tenant, index, term, as_learner, epoch=None):
     args = ["curl", "-s", "-w", "%{http_code}", "-m", "20",
             "--http2-prior-knowledge", "-X", "POST", *SECRET,
             "-H", f"X-Rewind-Tenant: {tenant}",
             "-H", f"X-Rewind-Baseline-Index: {index}",
             "-H", f"X-Rewind-Baseline-Term: {term}",
-            "-H", f"X-Rewind-Join-As-Learner: {'1' if as_learner else '0'}",
-            "--data-binary", f"@{path}", url]
+            "-H", f"X-Rewind-Join-As-Learner: {'1' if as_learner else '0'}"]
+    if epoch is not None:  # birth the group at the leader's epoch, not the default 1
+        args += ["-H", f"X-Rewind-Epoch: {epoch}"]
+    args += ["--data-binary", f"@{path}", url]
     return subprocess.run(args, capture_output=True, text=True).stdout.strip()
 
 
@@ -216,6 +218,7 @@ def main() -> int:
             st, body = _curl_json(url(lead, "v2-applied-baseline?tenant=acme"))
             check("applied-baseline → 200", st == 200, f"got {st} {body!r}")
             base = json.loads(body) if st == 200 else {"index": 0, "term": 0}
+            check("baseline carries the leader's epoch", "epoch" in base, f"base={base}")
             ms = member_status(lead)
             leader_last0 = ms.get("leader_last", 0) if ms else 0
             # ⭐ the diagnostic: on the unfixed engine the baseline lags far below
@@ -228,7 +231,8 @@ def main() -> int:
                   _curl_to_file(url(lead, "v2-snapshot"), bpath, data='{"tenant":"acme"}') == "200")
             check("attach (join-as-learner) → 204",
                   _attach_file(url(victim, "v2-attach"), bpath, tenant="acme",
-                               index=base["index"], term=base["term"], as_learner=True) == "204")
+                               index=base["index"], term=base["term"], as_learner=True,
+                               epoch=base.get("epoch")) == "204")
 
             cs_v = confstate(victim)
             check(f"⭐ node {vnid} born as a LEARNER (not voter)",

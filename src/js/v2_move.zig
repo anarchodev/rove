@@ -78,6 +78,12 @@ const BASELINE_TERM_HEADER = "x-rewind-baseline-term";
 // "1" → birth the local group with this node as a non-voting LEARNER (joining an
 // existing group learner-first) instead of a voter from the static voter set.
 const JOIN_LEARNER_HEADER = "x-rewind-join-as-learner";
+// The leader's migration epoch for the group being joined (from
+// `v2-applied-baseline`). The attached group MUST be born at this epoch or the
+// leader's epoch-stamped messages are fenced out. ABSENT defaults to 1 — the
+// epoch every provisioned tenant has (provision/move attaches omit the header,
+// so their long-standing behavior is unchanged).
+const EPOCH_HEADER = "x-rewind-epoch";
 
 /// Source-side marker key (in the tenant's own `inst.kv`) holding the
 /// destination node list — comma-separated base URLs, leader first — while a
@@ -494,13 +500,23 @@ fn handleAttach(
         std.mem.eql(u8, std.mem.trim(u8, s, " "), "1")
     else
         false;
+    // Birth the group at the leader's actual epoch (X-Rewind-Epoch). Default 1
+    // when absent (provision/move attaches don't send it — unchanged). Without
+    // this, joining a non-epoch-1 group (genesis `__admin__` at epoch 0, or a
+    // moved tenant at epoch >1) births the replica at the wrong epoch → the
+    // leader's messages are FENCED → the join silently stalls.
+    const epoch: u64 = if (respb.findHeader(rh, EPOCH_HEADER)) |s|
+        (std.fmt.parseInt(u64, std.mem.trim(u8, s, " "), 10) catch
+            return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ EPOCH_HEADER ++ "\n"))
+    else
+        1;
     if (baseline_index > 0) {
-        worker.raft.createGroupAtBaseline(gid, 1, baseline_index, baseline_term, join_as_learner) catch |err| switch (err) {
+        worker.raft.createGroupAtBaseline(gid, epoch, baseline_index, baseline_term, join_as_learner) catch |err| switch (err) {
             error.GroupExists => {}, // idempotent re-attach
             else => return reply(server, allocator, ent, sid, sess, 500, "group attach (baseline) failed\n"),
         };
     } else {
-        worker.raft.createGroupEpoch(gid, 1) catch |err| switch (err) {
+        worker.raft.createGroupEpoch(gid, epoch) catch |err| switch (err) {
             error.GroupExists => {}, // idempotent re-attach
             else => return reply(server, allocator, ent, sid, sess, 500, "group attach failed\n"),
         };
@@ -1160,7 +1176,14 @@ fn handleAppliedBaseline(
     // real invariant break, exactly as it should.
     const term = worker.raft.logTerm(gid, index) orelse
         return reply(server, allocator, ent, sid, sess, 409, "no term-valid baseline (leader log does not cover the applied index)\n");
-    const out = std.fmt.allocPrint(allocator, "{{\"index\":{d},\"term\":{d}}}\n", .{ index, term }) catch
+    // The leader's migration epoch for the group. A joining node MUST birth its
+    // local group at this epoch (passed back via `X-Rewind-Epoch` on the attach),
+    // or the leader's messages — stamped with this epoch — are fenced out at the
+    // receiver and the join silently stalls. Genesis groups (e.g. `__admin__`,
+    // born via `ensureGroup`) are epoch 0; provisioned tenants are epoch 1; a
+    // moved tenant is higher. Hard-coding 1 only ever worked for the first class.
+    const epoch = worker.raft.groupEpoch(gid);
+    const out = std.fmt.allocPrint(allocator, "{{\"index\":{d},\"term\":{d},\"epoch\":{d}}}\n", .{ index, term, epoch }) catch
         return reply(server, allocator, ent, sid, sess, 500, "oom\n");
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
 }

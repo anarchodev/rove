@@ -989,6 +989,20 @@ pub const Node = struct {
         return slot.applied_idx;
     }
 
+    /// This group's migration epoch on this node — the value the transport
+    /// stamps on every outbound raft message for the group (`mgr.groupEpoch`,
+    /// see the SendCtx stamping in `flushOutbound`). A node joining an existing
+    /// group MUST birth its local group at the SAME epoch, or the leader's
+    /// messages (stamped with the leader's epoch) are FENCED at the receiver and
+    /// silently dropped — the join never completes. Genesis groups born via
+    /// `ensureGroup` are epoch 0 (e.g. the bootstrap `__admin__` root group);
+    /// provisioned/attached groups are epoch 1; a moved group is higher. So the
+    /// join must read this and pass it to `v2-attach` rather than assume 1.
+    /// 0 on unknown group. Pump-thread only.
+    pub fn groupEpoch(self: *Node, tenant_id: u64) u64 {
+        return self.mgr.groupEpoch(tenant_id);
+    }
+
     /// Install a DATA-FREE snapshot baseline at {index, term} into `tenant_id`'s
     /// LOCAL group (conf_change promote-back). The node must be a below-floor
     /// learner; the KV state for `index` must already be loaded out-of-band (the

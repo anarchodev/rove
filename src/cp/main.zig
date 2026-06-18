@@ -1576,7 +1576,7 @@ const Router = struct {
         const bresp = self.backendCall(leader_url, bpath, .GET, "", &.{}) catch return false;
         defer a.free(bresp.body);
         if (bresp.status != 200) return false;
-        var bp = std.json.parseFromSlice(struct { index: u64 = 0, term: u64 = 0 }, a, bresp.body, .{ .ignore_unknown_fields = true }) catch return false;
+        var bp = std.json.parseFromSlice(struct { index: u64 = 0, term: u64 = 0, epoch: u64 = 1 }, a, bresp.body, .{ .ignore_unknown_fields = true }) catch return false;
         defer bp.deinit();
 
         const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch return false;
@@ -1596,6 +1596,11 @@ const Router = struct {
         defer a.free(bidx);
         const bterm = std.fmt.allocPrint(a, "{d}", .{bp.value.term}) catch return false;
         defer a.free(bterm);
+        // Birth the joining group at the LEADER's epoch, not a hard-coded 1, or
+        // the leader's epoch-stamped messages are fenced out and the join stalls
+        // (the genesis `__admin__` group is epoch 0; a moved tenant is >1).
+        const bepoch = std.fmt.allocPrint(a, "{d}", .{bp.value.epoch}) catch return false;
+        defer a.free(bepoch);
         // Join as a non-voting learner (born-learner) when ADDING this node to
         // the group — a learner doesn't campaign, so it follows the leader and
         // catches up instead of deadlocking a high-term group. A configured
@@ -1604,12 +1609,13 @@ const Router = struct {
             .{ .name = TENANT_HEADER, .value = tenant },
             .{ .name = "X-Rewind-Baseline-Index", .value = bidx },
             .{ .name = "X-Rewind-Baseline-Term", .value = bterm },
+            .{ .name = "X-Rewind-Epoch", .value = bepoch },
             .{ .name = "X-Rewind-Join-As-Learner", .value = if (as_learner) "1" else "0" },
         };
         const ar = self.backendCall(node_url, "/_system/v2-attach", .POST, snap.body, &th) catch return false;
         defer a.free(ar.body);
         if (ar.status != 204) return false;
-        std.log.info("rewind-cp: reconcile bootstrapped {s} onto {s} (atomic baseline {d}/{d}, learner={})", .{ tenant, node_url, bp.value.index, bp.value.term, as_learner });
+        std.log.info("rewind-cp: reconcile bootstrapped {s} onto {s} (atomic baseline {d}/{d} epoch {d}, learner={})", .{ tenant, node_url, bp.value.index, bp.value.term, bp.value.epoch, as_learner });
         return true;
     }
 
