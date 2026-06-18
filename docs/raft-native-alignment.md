@@ -318,8 +318,14 @@ Verified against the raft-0.7.0 source (the crate TiKV uses), not memory:
   membership_from_snapshot smoke passed BECAUSE it is quiescent (no commit advance
   between add and attach); the reconciler is not. Delete the `initWithLearners`
   hack only once 2d-3 lands.
-- **2e — cluster node-set SSOT (DECIDED: not per-tenant placement).** Per the
-  topology lens above, the "initial voter set" is NOT a per-tenant fact — it is
+- **2e — cluster node-set SSOT ✅ LANDED (`8830341`).** A fresh tenant group is born
+  with the **CP-supplied cluster node set** (`createGroupCore` `voters_override`,
+  threaded via `v2-attach`'s `X-Rewind-Voters`; CP `handleProvision` passes
+  `1..nodes.len`), not each node's `REWIND_VOTERS`. Verified `source=cp-ssot`
+  end-to-end (1- and 3-node). `REWIND_VOTERS` stays the irreducible genesis/lazy
+  fallback. Additive (CP set == env set today, so behavior-identical; the SOURCE
+  changes). Scoped to provision; moves still pass null. Rationale (per the topology
+  lens above): the "initial voter set" is NOT a per-tenant fact — it is
   ONE cluster-level fact ("this cluster's node set"), shared by every tenant. So
   2e is **"promote the cluster node set to a CP-owned SSOT,"** not "decide each
   tenant's voters." The **single-voter-birth-then-grow** option (TiKV's per-Region
