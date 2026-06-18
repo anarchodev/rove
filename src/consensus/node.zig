@@ -724,23 +724,41 @@ pub const Node = struct {
         return self.createGroupCore(tenant_id, id_str, epoch, true, false);
     }
 
-    /// Record (or update) a group in the node-local recovery manifest.
-    /// Best-effort: a manifest failure is logged, never propagated — the live
-    /// group already exists; recovery is a resilience feature, not a gate.
-    /// Pump-thread (group lifecycle); `KvStore.put` self-commits.
+    /// Record (or update) a group in the node-local recovery manifest, then
+    /// DURABILIZE it (fold the manifest's kvexp overlay into LMDB). Best-effort:
+    /// a manifest failure is logged, never propagated — the live group already
+    /// exists; recovery is a resilience feature, not a gate. Pump-thread (group
+    /// lifecycle).
+    ///
+    /// The durabilize is load-bearing: `KvStore.put` commits only to the kvexp
+    /// VOLATILE overlay (like a tenant write before `durabilizeTick` folds it).
+    /// The manifest store is never on the `dirty` durabilize path, so without an
+    /// explicit fold here a hard crash (SIGKILL) loses every non-genesis group's
+    /// record — on restart `recoverGroups` reads an empty manifest and the node
+    /// silently drops that tenant's raft messages ("unknown group") forever. The
+    /// fold is an fsync, but group create/move is rare, so the cost is fine.
     fn recordGroup(self: *Node, id_str: []const u8, epoch: u64) void {
         var buf: [24]u8 = undefined;
         const ep = std.fmt.bufPrint(&buf, "{d}", .{epoch}) catch return;
-        self.groups_manifest.put(id_str, ep) catch |err| std.log.warn(
-            "v2 node: group manifest record {s} failed: {s}",
+        self.groups_manifest.put(id_str, ep) catch |err| {
+            std.log.warn("v2 node: group manifest record {s} failed: {s}", .{ id_str, @errorName(err) });
+            return;
+        };
+        self.groups_manifest.checkpoint() catch |err| std.log.warn(
+            "v2 node: group manifest durabilize {s} failed: {s} (record may not survive a crash)",
             .{ id_str, @errorName(err) },
         );
     }
 
-    /// Remove a group from the recovery manifest (move-out). Best-effort.
+    /// Remove a group from the recovery manifest (move-out) + durabilize the
+    /// delete (so a crash can't resurrect a moved-out group's record). Best-effort.
     fn forgetGroup(self: *Node, id_str: []const u8) void {
-        self.groups_manifest.delete(id_str) catch |err| std.log.warn(
-            "v2 node: group manifest forget {s} failed: {s}",
+        self.groups_manifest.delete(id_str) catch |err| {
+            std.log.warn("v2 node: group manifest forget {s} failed: {s}", .{ id_str, @errorName(err) });
+            return;
+        };
+        self.groups_manifest.checkpoint() catch |err| std.log.warn(
+            "v2 node: group manifest durabilize (forget {s}) failed: {s}",
             .{ id_str, @errorName(err) },
         );
     }
