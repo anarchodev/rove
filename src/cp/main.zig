@@ -1525,7 +1525,7 @@ const Router = struct {
         }
         if (is_learner) {
             if (host == .absent)
-                return if (self.bootstrapMember(leader_url, node_url, tenant, true)) .progressed else .failed;
+                return if (self.bootstrapMember(leader_url, node_url, tenant, node_id, true)) .progressed else .failed;
             const last_idx = self.nodeLastIndex(node_url, tenant) orelse return .progressed;
             if (last_idx + RECONCILE_SLACK >= ms.leader_last)
                 return if (self.reconcileConfChange(leader_url, tenant, node_id, "promote")) .progressed else .failed;
@@ -1535,7 +1535,7 @@ const Router = struct {
         // node doesn't already host the group) then AddLearner on the leader. The
         // born-learner idles (no campaign) until the leader's AddLearner lets it
         // replicate, then it catches up + is promoted next pass.
-        if (host == .absent and !self.bootstrapMember(leader_url, node_url, tenant, true)) return .failed;
+        if (host == .absent and !self.bootstrapMember(leader_url, node_url, tenant, node_id, true)) return .failed;
         return if (self.reconcileConfChange(leader_url, tenant, node_id, "add")) .progressed else .failed;
     }
 
@@ -1601,14 +1601,35 @@ const Router = struct {
     /// leader's baseline {index,term} + snapshot bundle, attach (create group +
     /// load) on the node, then install the data-free raft baseline so the leader
     /// replicates the tail.
-    fn bootstrapMember(self: *Router, leader_url: []const u8, node_url: []const u8, tenant: []const u8, as_learner: bool) bool {
+    /// Format a raft-id list as `a,b,c`, optionally appending one more id. Caller
+    /// frees. The Phase 2d augmented-ConfState membership headers.
+    fn joinIdsAug(a: std.mem.Allocator, ids: []const u64, extra: ?u64) ![]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(a);
+        for (ids, 0..) |id, i| {
+            if (i != 0) try buf.append(a, ',');
+            try buf.writer(a).print("{d}", .{id});
+        }
+        if (extra) |e| {
+            if (ids.len != 0) try buf.append(a, ',');
+            try buf.writer(a).print("{d}", .{e});
+        }
+        return buf.toOwnedSlice(a);
+    }
+
+    fn bootstrapMember(self: *Router, leader_url: []const u8, node_url: []const u8, tenant: []const u8, node_id: u64, as_learner: bool) bool {
         const a = self.allocator;
         const bpath = std.fmt.allocPrint(a, "/_system/v2-applied-baseline?tenant={s}", .{tenant}) catch return false;
         defer a.free(bpath);
         const bresp = self.backendCall(leader_url, bpath, .GET, "", &.{}) catch return false;
         defer a.free(bresp.body);
         if (bresp.status != 200) return false;
-        var bp = std.json.parseFromSlice(struct { index: u64 = 0, term: u64 = 0, epoch: u64 = 1 }, a, bresp.body, .{ .ignore_unknown_fields = true }) catch return false;
+        var bp = std.json.parseFromSlice(
+            struct { index: u64 = 0, term: u64 = 0, epoch: u64 = 1, voters: []const u64 = &.{}, learners: []const u64 = &.{} },
+            a,
+            bresp.body,
+            .{ .ignore_unknown_fields = true },
+        ) catch return false;
         defer bp.deinit();
 
         const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch return false;
@@ -1633,21 +1654,42 @@ const Router = struct {
         // (the genesis `__admin__` group is epoch 0; a moved tenant is >1).
         const bepoch = std.fmt.allocPrint(a, "{d}", .{bp.value.epoch}) catch return false;
         defer a.free(bepoch);
+        // Membership SSOT (Phase 2d), the AUGMENTED-ConfState approach: the
+        // baseline carries the leader's CURRENT ConfState PLUS this node as a
+        // learner, so the joiner learns its membership from the snapshot
+        // (raft.rs:2629) AND satisfies the recipient-must-be-in-the-ConfState rule
+        // (raft.rs:2581) WITHOUT requiring the leader's AddLearner to commit first.
+        // Crucially this keeps the panic-safe bootstrap-THEN-add ORDER: the leader
+        // does not track/commit-to this node until the AddLearner that FOLLOWS this
+        // bootstrap, so it can never send a commit past the node's just-installed
+        // baseline (the `to_commit out of range` abort the add-FIRST reorder hit).
+        // `add_self` augments only when the leader's view doesn't already list the
+        // node (the absent-from-config first touch); when it is already a learner
+        // (re-bootstrap) the set is the leader's as-is.
+        const add_self = !idIn(bp.value.voters, node_id) and !idIn(bp.value.learners, node_id);
+        const voters_csv = joinIdsAug(a, bp.value.voters, null) catch return false;
+        defer a.free(voters_csv);
+        const learners_csv = joinIdsAug(a, bp.value.learners, if (add_self) node_id else null) catch return false;
+        defer a.free(learners_csv);
+
         // Join as a non-voting learner (born-learner) when ADDING this node to
         // the group — a learner doesn't campaign, so it follows the leader and
-        // catches up instead of deadlocking a high-term group. A configured
-        // VOTER rejoining (fresh_voter_join) omits this → born voter, as before.
+        // catches up instead of deadlocking a high-term group. The baseline's
+        // ConfState (above) is authoritative for the final role; this seeds the
+        // pre-baseline born state.
         var th = [_]curl.Header{
             .{ .name = TENANT_HEADER, .value = tenant },
             .{ .name = "X-Rewind-Baseline-Index", .value = bidx },
             .{ .name = "X-Rewind-Baseline-Term", .value = bterm },
             .{ .name = "X-Rewind-Epoch", .value = bepoch },
             .{ .name = "X-Rewind-Join-As-Learner", .value = if (as_learner) "1" else "0" },
+            .{ .name = "X-Rewind-Voters", .value = voters_csv },
+            .{ .name = "X-Rewind-Learners", .value = learners_csv },
         };
         const ar = self.backendCall(node_url, "/_system/v2-attach", .POST, snap.body, &th) catch return false;
         defer a.free(ar.body);
         if (ar.status != 204) return false;
-        std.log.info("rewind-cp: reconcile bootstrapped {s} onto {s} (atomic baseline {d}/{d} epoch {d}, learner={})", .{ tenant, node_url, bp.value.index, bp.value.term, bp.value.epoch, as_learner });
+        std.log.info("rewind-cp: reconcile bootstrapped {s} onto {s} (atomic baseline {d}/{d} epoch {d}, learner={}, conf_state voters=[{s}] learners=[{s}])", .{ tenant, node_url, bp.value.index, bp.value.term, bp.value.epoch, as_learner, voters_csv, learners_csv });
         return true;
     }
 
