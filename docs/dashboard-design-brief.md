@@ -30,12 +30,20 @@ dep_id}`), released via the `publishRelease` RPC. The Code tab is now an
 in-browser **draft bundle → Deploy** flow (no per-file files-server
 upload). A new operator **`#/cluster`** page (`pages/cluster.js`,
 is_root-only) drives provision/move/host/plan + placement/plan reads
-through the `/v1/cp/*` chokepoints. **Open gap:** loading the
-currently-deployed files back into the Code editor, and composing the
-replay bundle's module sources, both need a cross-tenant blob/manifest
-**read** door (the write twin `platform.scope(t).blob.put` exists; the
-read door does not yet). Until it lands, the Code tab edits a fresh draft
-and the replay bundle carries tapes/scalars but `sources_unavailable`.
+through the `/v1/cp/*` chokepoints.
+
+**Read door (2026-06-17, follow-up — landed):** the cross-tenant
+blob/manifest **read** door now exists as the symmetric twin of the write
+path: `platform.scope(t).blob.get(hash)` + `platform.scope(t).deploy.readManifest(dep)`
+lower to an `__admin__`-gated `rove-blob-read.internal` fetch the engine
+rewrites to the target tenant's S3 prefix + SigV4-signs (the only native
+piece). The admin app composes the rest in JS — `GET /v1/sources/{tenant}/
+{dep|current}` reads the manifest then each handler's source blob and
+returns `{entries:[{path,kind,content_type,source_hex,source?}]}`. The
+**replay bundle** now fills `modules`/`entry_source` from the request's
+captured `deployment_id`; the **Code tab** loads the current deployment's
+handlers for editing (statics are listed and Deploy warns before dropping
+any not re-added — their bytes aren't pulled into the text editor).
 
 ---
 

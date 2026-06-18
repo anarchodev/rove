@@ -474,6 +474,107 @@ export function onStamped() {
     return JSON.stringify(request.ctx); // { ok, dep_id }
 }
 
+// ── Source read (cross-tenant read door) ────────────────────────────
+//
+// Composes a deployment's handler sources from the general cross-tenant read
+// primitives (`platform.scope(t).deploy.readManifest` + `scope(t).blob.get`) —
+// the engine just signs the S3 reads; the assembly is JS. Powers the Code
+// tab's edit-existing flow + the replay bundle's module sources. Because rove
+// has no suspended await, the per-handler source reads are threaded
+// sequentially through the fetch `ctx` across re-entries (manifest → source 0
+// → source 1 → … → respond). Handler count is small (a deployment's .mjs
+// files), so the O(N) round trips are cheap.
+//
+// GET /v1/sources/{tenant}/{dep_hex|current}. Authz mirrors deploy/release:
+// operator (is_root) any tenant; a customer only their own.
+function handleReadSources(tenant, depArg) {
+    const auth = request.auth || {};
+    if (!auth.is_root && !auth.sub) return jsonError(401, "unauthenticated");
+    if (!validId(tenant)) return jsonError(400, "invalid tenant");
+    if (!auth.is_root &&
+        ownedInstances(accountHashFor(auth.sub)).indexOf(tenant) === -1) {
+        return jsonError(403, "not your instance");
+    }
+    let dep = depArg;
+    if (dep === "current") {
+        let cur;
+        try { cur = platform.scope(tenant).kv.get("_deploy/current"); }
+        catch (e) { return jsonError(404, "instance not found"); }
+        if (!cur) return jsonError(404, "no current deployment");
+        dep = cur; // stored as hex
+    }
+    if (!/^[0-9a-fA-F]{1,16}$/.test(dep)) return jsonError(400, "bad dep_id");
+    platform.scope(tenant).deploy.readManifest(dep,
+        { name: "onManifest", ctx: { tenant: tenant, dep: dep } });
+    return next();
+}
+
+// Read-door continuation: the manifest JSON arrives on request.body. Parse it,
+// then kick off the sequential handler-source reads (or finish if there are
+// none).
+export function onManifest() {
+    const ctx = request.ctx || {};
+    if (!request.ok) {
+        response.headers = { "content-type": "application/json" };
+        response.status = request.status === 404 ? 404 : 502;
+        return JSON.stringify({ error: "manifest read failed", status: request.status || 0 });
+    }
+    let manifest;
+    try { manifest = JSON.parse(new TextDecoder().decode(request.body || new Uint8Array())); }
+    catch (e) { response.status = 502; return JSON.stringify({ error: "manifest parse failed" }); }
+    // manifest_json stores the source/content hash under "hash".
+    const entries = (manifest.entries || []).map((e) => ({
+        path: e.path, kind: e.kind, content_type: e.content_type, hash: e.hash,
+    }));
+    const handlers = entries.filter((e) => e.kind === "handler");
+    if (handlers.length === 0) return finishSources(ctx.dep, entries, []);
+    platform.scope(ctx.tenant).blob.get(handlers[0].hash, {
+        name: "onModuleSource",
+        ctx: { tenant: ctx.tenant, dep: ctx.dep, entries: entries, idx: 0, acc: [] },
+    });
+    return next();
+}
+
+// Read-door continuation: one handler's source bytes arrive on request.body.
+// Accumulate, then either read the next handler or assemble the response.
+export function onModuleSource() {
+    const ctx = request.ctx || {};
+    const handlers = (ctx.entries || []).filter((e) => e.kind === "handler");
+    const src = request.ok
+        ? new TextDecoder().decode(request.body || new Uint8Array()) : null;
+    const acc = ctx.acc.concat([{
+        path: handlers[ctx.idx].path, source: src, missing: !request.ok,
+    }]);
+    const nextIdx = ctx.idx + 1;
+    if (nextIdx < handlers.length) {
+        platform.scope(ctx.tenant).blob.get(handlers[nextIdx].hash, {
+            name: "onModuleSource",
+            ctx: { tenant: ctx.tenant, dep: ctx.dep, entries: ctx.entries, idx: nextIdx, acc: acc },
+        });
+        return next();
+    }
+    return finishSources(ctx.dep, ctx.entries, acc);
+}
+
+// Merge handler sources into the manifest entries + respond (releases the held
+// chain). Handlers carry `source` (or `missing:true` if the blob read failed);
+// statics carry metadata only.
+function finishSources(dep, entries, sources) {
+    const srcByPath = {};
+    for (const s of sources) srcByPath[s.path] = s;
+    const out = entries.map((e) => {
+        const r = { path: e.path, kind: e.kind, content_type: e.content_type, source_hex: e.hash };
+        if (e.kind === "handler") {
+            const s = srcByPath[e.path];
+            if (s && s.source != null) r.source = s.source; else r.missing = true;
+        }
+        return r;
+    });
+    response.status = 200;
+    response.headers = { "content-type": "application/json" };
+    return JSON.stringify({ ok: true, dep_id: dep, entries: out });
+}
+
 // ── fn-RPC dispatch (JS recipe) ─────────────────────────────────────
 //
 // The platform no longer interprets `?fn=` / `{fn,args}` (decisions.md
@@ -557,6 +658,14 @@ export default function() {
     // Log query chokepoint → rewind-logs.internal door (A5).
     if (method === "GET" && path.startsWith("/v1/logs/")) {
         return handleLogQuery(path, q === -1 ? "" : fullPath.slice(q + 1));
+    }
+
+    // Source read → rove-blob-read.internal door. /v1/sources/{tenant}/{dep|current}.
+    if (method === "GET" && path.startsWith("/v1/sources/")) {
+        const rest = path.slice("/v1/sources/".length);
+        const slash = rest.indexOf("/");
+        if (slash < 1) return jsonError(400, "bad sources path");
+        return handleReadSources(rest.slice(0, slash), rest.slice(slash + 1));
     }
 
     // CP control chokepoint → rewind-cp.internal door (B4). The operator

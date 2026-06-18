@@ -320,21 +320,31 @@ export const api = {
     return res.text();
   },
 
+  // ── Source read (cross-tenant read door) ─────────────────────────
+  //
+  // Reads a deployment's handler sources back through the admin app's
+  // /v1/sources chokepoint, which composes the cross-tenant read door
+  // (platform.scope(t).deploy.readManifest + scope(t).blob.get) — the
+  // read twin of the deploy path. `dep` is a 16-hex dep_id, or "current"
+  // for the live deployment (resolved server-side from _deploy/current).
+  // Returns {ok, dep_id, entries:[{path, kind, content_type, source_hex,
+  // source?, missing?}]} — handlers carry `source`; statics metadata only.
+  async readSources(instance_id, dep = "current") {
+    const res = await originGet(
+      `/v1/sources/${encodeURIComponent(instance_id)}/${encodeURIComponent(String(dep))}`);
+    return res.json();
+  },
+
   // ── Replay bundle composer ───────────────────────────────────────
   //
   // Composes the bundle the WASM replay shell consumes. The log record
   // (fetched via the same-origin logs chokepoint) carries the captured
-  // tapes + scalars + request body INLINE, so those are available today.
-  //
-  // GAP (rewind-cli-plan Track 2): the handler MODULE SOURCES + the
-  // historical deployment manifest used to come from the files-server,
-  // which was dissolved (§4). Reading them back now requires a
-  // cross-tenant blob/manifest READ door (the write twin —
-  // platform.scope(t).blob.put — exists; the read door does not yet).
-  // Until that door lands, `modules`/`entry_source` come back empty and
-  // `sources_unavailable` is set so the replay shell can explain why it
-  // can't step through source. This same door also unblocks the Code
-  // tab's edit-existing-files flow.
+  // tapes + scalars + request body INLINE; the handler MODULE SOURCES come
+  // from the read door (`readSources`), keyed by the request's captured
+  // `deployment_id` so a replay steps through the source the handler
+  // ACTUALLY ran with. If that deployment's blobs were GC'd (or the read
+  // fails), `modules` is empty and `sources_unavailable` is set so the
+  // replay shell can explain why it can't show source.
   async composeReplayBundle(instance_id, request_id) {
     const inst = encodeURIComponent(instance_id);
     const rid = encodeURIComponent(String(request_id));
@@ -342,6 +352,25 @@ export const api = {
     const recordRes = await logFetch(`/v1/${inst}/show/${rid}`);
     const record = (await recordRes.json()).record;
     const tapesField = record.tapes || {};
+
+    // Historical module sources via the read door (by captured dep_id).
+    let modules = [];
+    let entryPath = null;
+    let entrySource = "";
+    let sourcesUnavailable = false;
+    try {
+      const depHex = (record.deployment_id ?? 0).toString(16);
+      const sr = await this.readSources(instance_id, depHex);
+      const handlers = (sr.entries || [])
+        .filter((e) => e.kind === "handler" && e.source != null);
+      modules = handlers.map((e) => ({ path: e.path, hash: e.source_hex, source: e.source }));
+      const entry = handlers.find((e) => e.path === "index.mjs" || e.path === "index.js")
+        || handlers[0];
+      if (entry) { entryPath = entry.path; entrySource = entry.source; }
+      if (handlers.length === 0) sourcesUnavailable = true;
+    } catch (_) {
+      sourcesUnavailable = true;
+    }
 
     const tapeBlobs = {
       kv: decodeB64(tapesField.kv_tape_b64),
@@ -370,16 +399,15 @@ export const api = {
         console: record.console,
         exception: record.exception,
       },
-      entry_path: null,
-      entry_source: "",
-      modules: [],
+      entry_path: entryPath,
+      entry_source: entrySource,
+      modules,
       seed,
       timestamp_ns,
       tape_blobs: tapeBlobs,
       activation: record.activation,
-      // Source/manifest reads await the cross-tenant read door (see above).
-      sources_unavailable: true,
-      historical_manifest_missing: true,
+      sources_unavailable: sourcesUnavailable,
+      historical_manifest_missing: sourcesUnavailable,
     };
   },
 

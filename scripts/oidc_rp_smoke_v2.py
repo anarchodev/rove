@@ -333,9 +333,11 @@ def main() -> int:
         c.provision("dep0")
         r = deploy_via(None, "dep0", root=True)
         ok = False
+        dep0_dep = None
         try:
             p = json.loads(r.body)
             ok = r.status == 200 and p.get("ok") is True and bool(p.get("dep_id"))
+            dep0_dep = p.get("dep_id")
         except Exception:
             ok = False
         check("root-token deploy via standing app /v1/deploy → 200 + dep_id", ok,
@@ -352,13 +354,52 @@ def main() -> int:
                   f"got {r.status} {r.body[:120]!r}")
             if r.status == 201:
                 owned = "custapp"
+        cust_dep = None
         if owned:
             r = deploy_via(cust_cookie, owned)
             check("owner-session deploy own tenant via /v1/deploy → 200",
                   r.status == 200, f"got {r.status} {r.body[:160]!r}")
+            try: cust_dep = json.loads(r.body).get("dep_id")
+            except Exception: pass
             # (b) the same customer deploying a tenant they DON'T own → 403.
             r = deploy_via(cust_cookie, "dep0")
             check("non-owner deploy via /v1/deploy → 403", r.status == 403,
+                  f"got {r.status} {r.body[:120]!r}")
+
+        # ── Read door: read deployed sources cross-tenant (/v1/sources). ────
+        # The general cross-tenant read door (platform.scope(t).blob.get +
+        # deploy.readManifest) composed in the admin app. Operator reads any
+        # tenant's deployed handler source back; the source round-trips exactly.
+        # Owner reads their own; a non-owner is refused.
+        def read_sources(cookie, tenant, dep):
+            return c.tls_curl(app_origin + "/v1/sources/" + tenant + "/" + dep,
+                              headers={"Cookie": cookie}, timeout=30.0)
+        if dep0_dep:
+            r = read_sources(op_cookie, "dep0", dep0_dep)
+            src = None
+            try:
+                body = json.loads(r.body)
+                ents = body.get("entries") or []
+                src = next((e.get("source") for e in ents if e.get("path") == "index.mjs"), None)
+            except Exception:
+                pass
+            check("operator reads dep0 source via read door → 200 + exact source",
+                  r.status == 200 and src == TRIVIAL,
+                  f"got {r.status} src={src!r}")
+            if r.status != 200 or src != TRIVIAL:
+                c.dump_node_log(grep=["blob-read", "blobread", "read door", "manifest",
+                                      "sources", "onManifest", "sigv4", "error", "warn"])
+            # Non-owner customer cannot read dep0's sources.
+            if cust_cookie:
+                r = read_sources(cust_cookie, "dep0", dep0_dep)
+                check("non-owner read dep0 sources → 403", r.status == 403,
+                      f"got {r.status} {r.body[:120]!r}")
+        # Owner reads their OWN tenant's source (current pointer → after deploy
+        # the customer can also release; here we read by explicit dep_id).
+        if cust_cookie and cust_dep:
+            r = read_sources(cust_cookie, "custapp", cust_dep)
+            check("owner reads own tenant source via read door → 200",
+                  r.status == 200 and '"entries"' in r.body,
                   f"got {r.status} {r.body[:120]!r}")
 
     if failures:
@@ -366,7 +407,8 @@ def main() -> int:
         return 1
     print("\nPASS — OIDC RP login + log chokepoint (A5) + CP control chokepoint "
           "(B4) + deploy chokepoint (Track 0: /v1/deploy on the standing app, "
-          "root-token + ownership-gated) through the dashboard.")
+          "root-token + ownership-gated) + source read door (cross-tenant "
+          "scope(t).blob.get + readManifest, composed in JS) through the dashboard.")
     return 0
 
 

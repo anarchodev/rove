@@ -51,6 +51,26 @@
      */
     scope(id) {
       const s = sys.scope(id);
+      // Cross-tenant blob READ — the read twin of `blob.put`. Bound, like
+      // {@link blob.get}: it lowers to an on.fetch at the admin-only
+      // `rove-blob-read.internal` door (rewritten to `id`'s S3 prefix +
+      // SigV4-signed natively). The bytes resume on `request.body` at the
+      // `name` export (default onFetchResult); thread state with `opts.ctx`
+      // (→ `request.ctx`). Return next() after it. Compose the replay bundle /
+      // Code-tab sources from these reads in JS — no native assembly.
+      s.blob.get = function (hash, opts) {
+        opts = opts || {};
+        const fetch_opts = {
+          method: "GET",
+          max_response_chunk_bytes: opts.max_bytes || 8 * 1024 * 1024,
+        };
+        if (opts.ctx !== undefined) fetch_opts.ctx = opts.ctx;
+        return sysOn.fetch(
+          "http://rove-blob-read.internal/" + id + "/blob/" + hash,
+          fetch_opts,
+          { to: opts.name || "onFetchResult" },
+        );
+      };
       // deploy.stampManifest is the deploy's STAGING BARRIER — it lowers to
       // a bound on.fetch (not a native sync call) so it resumes your handler
       // only once the manifest (the last staging write) AND every prior
@@ -64,6 +84,22 @@
             "http://rove-stage.internal/",
             { method: "POST", body: JSON.stringify({ scope: id, entries }) },
             { to: opts.name || "onStamped" },
+          );
+        },
+        // readManifest is the READ twin of stampManifest: it reads `id`'s
+        // deployment manifest for `dep_id` (16-hex) off the read door. The raw
+        // manifest JSON resumes on `request.body` at `name` (default
+        // onFetchResult) — parse it in JS, then read each handler entry's
+        // source with `scope(id).blob.get(hash)`. The current dep_id is
+        // `scope(id).kv.get("_deploy/current")`.
+        readManifest(dep_id, opts) {
+          opts = opts || {};
+          const fetch_opts = { method: "GET" };
+          if (opts.ctx !== undefined) fetch_opts.ctx = opts.ctx;
+          return sysOn.fetch(
+            "http://rove-blob-read.internal/" + id + "/manifest/" + dep_id,
+            fetch_opts,
+            { to: opts.name || "onFetchResult" },
           );
         },
       };

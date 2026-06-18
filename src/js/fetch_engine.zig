@@ -60,6 +60,7 @@ const globals = @import("globals.zig");
 const ssrf_mod = @import("rove-ssrf");
 const jwt = @import("rove-jwt");
 const tenant_mod = @import("rove-tenant");
+const files_mod = @import("rove-files");
 
 const NodeState = worker_mod.NodeState;
 const PendingFetch = globals.PendingFetch;
@@ -115,6 +116,20 @@ pub const LOGS_ORIGIN_PREFIX = "http://rewind-logs.internal/";
 /// operator-held CP secret — the worker holds it. Only `__admin__` may form
 /// this host (the routing gate). Mirrors `LOGS_ORIGIN_PREFIX`.
 pub const CP_ORIGIN_PREFIX = "http://rewind-cp.internal/";
+
+/// The `rove-blob-read.internal` trusted door — the cross-tenant READ twin of
+/// `platform.scope(t).blob.put` (which writes file-blobs). The `__admin__`
+/// dashboard fetches `http://rove-blob-read.internal/{tenant}/blob/{hash}` (a
+/// source/content blob from `{tenant}/file-blobs/`) or
+/// `.../{tenant}/manifest/{dep_hex}` (the deployment manifest from
+/// `{tenant}/deployments/`); the fetch engine rewrites to the real S3 endpoint
+/// with the TARGET tenant's prefix + SigV4-signs it. Cross-tenant by design —
+/// the tenant comes from the URL PATH, not `pf.tenant_id` (always `__admin__`
+/// here); only `__admin__` may form this host (the routing gate). GET/HEAD
+/// only. The dashboard composes the replay bundle / Code-tab sources in JS from
+/// these reads (no native assembly). Mirrors `BLOB_ORIGIN_PREFIX`'s own-tenant
+/// signing, `LOGS_ORIGIN_PREFIX`'s cross-tenant + __admin__-gated posture.
+pub const BLOB_READ_ORIGIN_PREFIX = "http://rove-blob-read.internal/";
 
 /// Upper bound on `REWIND_INTERNAL_FRONT` entries — one per front in
 /// the deployment, and a deployment has at most a handful of fronts.
@@ -586,10 +601,16 @@ pub const FetchEngine = struct {
         var pin_buf: [768]u8 = undefined;
         var resolve_pin: ?[:0]const u8 = null;
         const is_blob_door = std.mem.startsWith(u8, pf.url, BLOB_ORIGIN_PREFIX);
+        const is_blob_read_door = std.mem.startsWith(u8, pf.url, BLOB_READ_ORIGIN_PREFIX);
         const is_logs_door = std.mem.startsWith(u8, pf.url, LOGS_ORIGIN_PREFIX);
         const is_cp_door = std.mem.startsWith(u8, pf.url, CP_ORIGIN_PREFIX);
         if (is_blob_door) {
             try self.rewriteAndSignBlobFetch(pf, method, &headers_list);
+        } else if (is_blob_read_door) {
+            // Cross-tenant blob READ door: rewrite to the TARGET tenant's S3
+            // prefix (from the URL path) + SigV4-sign. __admin__-gated; same
+            // SSRF-exempt internal-origin posture as the blob/logs/cp doors.
+            try self.rewriteAndSignBlobReadFetch(pf, method, &headers_list);
         } else if (is_logs_door) {
             // `rewind-logs.internal` door: rewrite to the internal log-server
             // base + attach a tenant-scoped `logs-read` token. Like the blob
@@ -644,7 +665,7 @@ pub const FetchEngine = struct {
             // some other entry point.
             .timeout_ms = if (pf.held) 0 else pf.timeout_ms,
             .verify_tls = !ssrf_mod.test_allow_plaintext,
-            .follow_redirects = is_blob_door,
+            .follow_redirects = is_blob_door or is_blob_read_door,
             .resolve_pin = resolve_pin,
             // The standalone log-server is h2c-only (nghttp2 prior-knowledge),
             // so a plaintext logs-door fetch must force cleartext HTTP/2 —
@@ -758,13 +779,28 @@ pub const FetchEngine = struct {
         self.allocator.free(pf.url);
         pf.url = new_url;
 
+        try self.signAndAttachS3(method_name, path, pf.body, headers_list);
+    }
+
+    /// SigV4-sign `path` (path-style S3) for the configured blob endpoint and
+    /// attach the three auth headers, dropping every JS-supplied header except
+    /// `content-type`. Shared by the own-tenant blob door and the cross-tenant
+    /// blob-read door (the signing is identical — only the key prefix differs).
+    fn signAndAttachS3(
+        self: *FetchEngine,
+        method_name: []const u8,
+        path: []const u8,
+        body: []const u8,
+        headers_list: *std.ArrayListUnmanaged(blob_curl_multi.Header),
+    ) !void {
+        const cfg = &self.node.blob_backend_cfg;
         var ts_buf: [16]u8 = undefined;
         blob_sigv4.formatAmzDate(&ts_buf, std.time.timestamp());
         const signed = try blob_sigv4.sign(self.allocator, .{
             .method = method_name,
             .path = path,
             .host = cfg.endpoint,
-            .body = pf.body,
+            .body = body,
             .access_key = cfg.access_key,
             .secret_key = cfg.secret_key,
             .region = cfg.region,
@@ -772,9 +808,8 @@ pub const FetchEngine = struct {
             .timestamp = &ts_buf,
         });
         const values = [3][]u8{ signed.authorization, signed.x_amz_date, signed.x_amz_content_sha256 };
-        // Until a value is appended to `headers_list` (whose caller-
-        // side defer frees name+value of every entry), it is ours to
-        // free on the error path. `attached` tracks the handoff.
+        // Until a value is appended to `headers_list` (whose caller-side defer
+        // frees name+value of every entry), it is ours to free on error.
         var attached: usize = 0;
         errdefer for (values[attached..]) |v| self.allocator.free(v);
 
@@ -791,9 +826,9 @@ pub const FetchEngine = struct {
             _ = headers_list.swapRemove(i);
         }
 
-        // Attach the three SigV4 headers. Names are dup'd so every
-        // entry uniformly owns name + value (the caller's defer
-        // frees both); the signed values transfer ownership in.
+        // Attach the three SigV4 headers. Names are dup'd so every entry
+        // uniformly owns name + value (the caller's defer frees both); the
+        // signed values transfer ownership in.
         try headers_list.ensureUnusedCapacity(self.allocator, 3);
         const names = [3][]const u8{ "authorization", "x-amz-date", "x-amz-content-sha256" };
         for (names, values) |n, v| {
@@ -801,6 +836,69 @@ pub const FetchEngine = struct {
             headers_list.appendAssumeCapacity(.{ .name = owned_name, .value = v });
             attached += 1;
         }
+    }
+
+    /// Cross-tenant blob READ door (`rove-blob-read.internal`) — the read twin
+    /// of `platform.scope(t).blob.put`. Rewrites
+    /// `{tenant}/blob/{hash}` → `{key_prefix_base}{tenant}/file-blobs/{hash}`
+    /// and `{tenant}/manifest/{dep_hex}` →
+    /// `{key_prefix_base}{tenant}/deployments/{manifestKey}` on the real S3
+    /// endpoint, then SigV4-signs. Only `__admin__` may form this host (the
+    /// routing gate); the TARGET tenant comes from the URL PATH (cross-tenant
+    /// by design). GET/HEAD only — there is no write/delete through this door.
+    fn rewriteAndSignBlobReadFetch(
+        self: *FetchEngine,
+        pf: *PendingFetch,
+        method: blob_curl_multi.Method,
+        headers_list: *std.ArrayListUnmanaged(blob_curl_multi.Header),
+    ) !void {
+        // Routing gate: only the admin tenant may use the read door.
+        if (!std.mem.eql(u8, pf.tenant_id, tenant_mod.ADMIN_INSTANCE_ID))
+            return error.BlobReadForbidden;
+        const cfg = &self.node.blob_backend_cfg;
+        if (cfg.endpoint.len == 0) return error.BlobBackendUnconfigured;
+        const method_name = switch (method) {
+            .GET => "GET",
+            .HEAD => "HEAD",
+            else => return error.BlobMethodDenied,
+        };
+
+        // Parse `{tenant}/{kind}/{key}` from the URL tail.
+        const remainder = pf.url[BLOB_READ_ORIGIN_PREFIX.len..];
+        var it = std.mem.splitScalar(u8, remainder, '/');
+        const tenant = it.next() orelse return error.BlobReadBadPath;
+        const kind = it.next() orelse return error.BlobReadBadPath;
+        const ukey = it.rest();
+        if (!isValidScopeId(tenant)) return error.BlobReadBadPath;
+
+        // Resolve the subdir + the actual blob key by kind. The charset/format
+        // checks pin the key so it can't escape the tenant prefix.
+        var key_buf: [25]u8 = undefined;
+        var subdir: []const u8 = undefined;
+        var blob_key: []const u8 = undefined;
+        if (std.mem.eql(u8, kind, "blob")) {
+            if (!isSha256HexLower(ukey)) return error.BlobReadBadPath;
+            subdir = "file-blobs";
+            blob_key = ukey;
+        } else if (std.mem.eql(u8, kind, "manifest")) {
+            const dep_id = std.fmt.parseInt(u64, ukey, 16) catch return error.BlobReadBadPath;
+            subdir = "deployments";
+            blob_key = files_mod.manifest_json.manifestKey(&key_buf, dep_id);
+        } else return error.BlobReadBadPath;
+
+        const path = try std.fmt.allocPrint(
+            self.allocator,
+            "/{s}/{s}{s}/{s}/{s}",
+            .{ cfg.bucket, cfg.key_prefix_base, tenant, subdir, blob_key },
+        );
+        defer self.allocator.free(path);
+
+        const scheme = if (cfg.use_tls) "https" else "http";
+        const new_url = try std.fmt.allocPrint(self.allocator, "{s}://{s}{s}", .{ scheme, cfg.endpoint, path });
+        self.allocator.free(pf.url);
+        pf.url = new_url;
+
+        try self.signAndAttachS3(method_name, path, pf.body, headers_list);
     }
 
     /// `rewind-logs.internal` trusted door (step3-auth-plan.md A2/A3). The
@@ -1412,6 +1510,19 @@ test "parseLogsTenant pulls the tenant from v1/{tenant}/… (and ignores query)"
     try std.testing.expect(parseLogsTenant("v1//list") == null); // empty tenant
     try std.testing.expect(parseLogsTenant("health") == null); // not a v1 path
     try std.testing.expect(parseLogsTenant("v2/acme/list") == null);
+}
+
+/// Tenant-id charset gate for the cross-tenant read door — `[A-Za-z0-9_-]`,
+/// 1..64. Forbidding `/` and `.` means a path segment can't escape the
+/// constructed `{tenant}/{subdir}/...` S3 prefix.
+fn isValidScopeId(s: []const u8) bool {
+    if (s.len == 0 or s.len > 64) return false;
+    for (s) |b| {
+        const ok = (b >= 'A' and b <= 'Z') or (b >= 'a' and b <= 'z') or
+            (b >= '0' and b <= '9') or b == '_' or b == '-';
+        if (!ok) return false;
+    }
+    return true;
 }
 
 fn isSha256HexLower(s: []const u8) bool {

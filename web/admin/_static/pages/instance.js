@@ -507,8 +507,9 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
           <button type="button" class="new-file">New</button>
           <button type="button" class="deploy" disabled>Deploy</button>
         </div>
-        <p class="draft-note muted">Draft bundle — Deploy ships every file at
-          once. Loading existing deployed files awaits the read door.</p>
+        <p class="draft-note muted">Current handlers loaded for editing. Deploy
+          ships the whole bundle at once (you'll be warned before any current
+          static is dropped).</p>
         <ul></ul>
       </aside>
       <section class="editor">
@@ -532,6 +533,11 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
   // Draft bundle: path → { kind, content_type, source }. Editing updates
   // `source` live; Deploy ships the whole map.
   const draft = {};
+  // Static paths in the CURRENTLY-deployed bundle (loaded via the read door
+  // for reference). They're not editable here (binary-safe), and Deploy ships
+  // only the draft — so if any of these aren't re-added, Deploy would drop
+  // them. We warn before that happens.
+  let currentStatics = [];
   let selected = null; // { path, kind, content_type }
   let cm = null;       // { view, langCompartment, EditorView, EditorState, ... }
   let cmLoading = null; // in-flight import promise
@@ -645,6 +651,16 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
 
   deployBtn.addEventListener("click", async () => {
     if (Object.keys(draft).length === 0) return;
+    // Deploy ships ONLY the draft. If the live deployment has statics that
+    // aren't in the draft, deploying would drop them — confirm first.
+    const dropping = currentStatics.filter((p) => !(p in draft));
+    if (dropping.length > 0 &&
+        !window.confirm(
+          "Deploying replaces the live deployment. These static assets are " +
+          "not in your draft and will be DROPPED:\n\n  " + dropping.join("\n  ") +
+          "\n\nContinue?")) {
+      return;
+    }
     deployBtn.disabled = true;
     const orig = deployBtn.textContent;
     deployBtn.textContent = "Deploying…";
@@ -701,7 +717,33 @@ function renderCode(root, { instanceId, api, showError, clearError }) {
     await openFile(path);
   });
 
-  renderDraft();
+  // Load the CURRENT deployment's handler sources into the draft (edit-existing
+  // via the cross-tenant read door). Handlers become editable; statics are
+  // recorded in `currentStatics` so Deploy can warn before dropping them (their
+  // bytes aren't pulled into the text editor). No deployment yet → empty draft.
+  async function loadCurrent() {
+    try {
+      const res = await api.readSources(instanceId, "current");
+      const entries = res.entries || [];
+      for (const e of entries) {
+        if (e.kind === "handler" && e.source != null) {
+          draft[e.path] = {
+            kind: "handler",
+            content_type: e.content_type || "application/javascript",
+            source: e.source,
+          };
+        } else if (e.kind === "static") {
+          currentStatics.push(e.path);
+        }
+      }
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) { location.hash = "#/login"; return; }
+      // 404 (no current deployment) or read failure → start from an empty draft.
+    }
+    renderDraft();
+  }
+
+  loadCurrent();
   return () => {
     if (cm) {
       cm.view.destroy();
