@@ -2642,6 +2642,17 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
 
         checkProxyWarning(rh);
 
+        // raft Phase 2.5: the streamed-snapshot dest is the ONE `/_system` route
+        // that must NOT buffer whole — it feeds inbound chunks straight into a
+        // `StreamLoader` via a dedicated `BodySink` (no S3 chunk-tape). Arm it
+        // here, while the body is still arriving; the entity parks in
+        // `snapshot_streams` and `drainSnapshotStreams` sends the response.
+        if (body_inbound.receiving and std.mem.startsWith(u8, path, "/_system/v2-snapshot-stream")) {
+            try v2_move.armSnapshotStream(server, allocator, worker, ent, sid, sess, method, rh);
+            processed += 1;
+            continue;
+        }
+
         // headers_first: `/_system/*` routes are platform surface, not
         // customer handlers — never headers-first (a tenant-move
         // `v2-kv` bundle POST must arrive whole). Flip to classic

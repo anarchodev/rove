@@ -296,6 +296,9 @@ fn workerMain(args: *WorkerCtx) !void {
         runPromotionHook(worker, args.worker_idx);
         drainSnapshotCatchupJobs(worker, catchup);
         try rjs.drainForwardPending(worker);
+        // raft Phase 2.5: finalize completed streamed-snapshot transfers
+        // (install the baseline + respond) parked in `snapshot_streams`.
+        try rjs.drainSnapshotStreams(worker);
         rjs.drainSpools(worker);
         try rjs.sweepParkedContinuations(worker);
         // Gap 2.4 (docs/inbound-chunk-plan.md S2): fire the next staged

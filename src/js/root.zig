@@ -86,6 +86,7 @@ pub const dispatchOnce = worker.dispatchOnce;
 pub const drainRequestReceiving = worker.drainRequestReceiving;
 pub const drainRaftPending = worker.drainRaftPending;
 pub const drainForwardPending = worker.drainForwardPending;
+pub const drainSnapshotStreams = @import("v2_move.zig").drainSnapshotStreams;
 pub const drainBodyPending = worker.drainBodyPending;
 pub const drainFetchPendingDurability = worker.drainFetchPendingDurability;
 pub const drainPendingBoundResumes = worker.drainPendingBoundResumes;

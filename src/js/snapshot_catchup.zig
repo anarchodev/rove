@@ -6,18 +6,20 @@
 //! `ProgressState::Snapshot` (it fell below the leader's compacted first_index
 //! under mechanism-A compaction) and enqueues a `(gid, peer, baseline)` job on
 //! the bridge. The poll loop drains that queue (`drainSnapshotCatchupJobs`) and
-//! hands each job to THIS thread, so the heavy work — a full store-bundle dump
-//! plus two blocking HTTP POSTs — runs off BOTH the pump (shared multi-raft) and
-//! the customer poll loop. Per job it:
-//!   1. dumps the leader's tenant store via a private sibling handle (two-handle
-//!      model — never the worker's own txn-stateful handle);
-//!   2. `POST /_system/v2-load-replace` the bundle to the peer (replace-load);
-//!   3. `POST /_system/v2-apply-snapshot {index, term}` to install the data-free
-//!      raft baseline on the peer.
+//! hands each job to THIS thread, so the heavy work — a held-snapshot store dump
+//! streamed over one blocking HTTP upload — runs off BOTH the pump (shared
+//! multi-raft) and the customer poll loop. Per job it:
+//!   1. opens a held-snapshot `StreamDumper` over the leader's tenant manifest
+//!      (consistent MVCC view via overlay capture — no `durabilize` fsync);
+//!   2. `POST /_system/v2-snapshot-stream` — a chunked upload whose body IS the
+//!      pair stream (libcurl pulls from the dumper at the wire's drain rate, so
+//!      a multi-GB store is never buffered whole), with the data-free baseline
+//!      `{tenant, index, term}` carried in headers. The dest applies in bounded
+//!      txns and, on clean END_STREAM, installs the raft baseline — ONE call vs
+//!      the retired v2-load-replace + v2-apply-snapshot pair (raft Phase 2.5).
 //! The peer's `match` then advances past the leader's first_index, raft clears
-//! `StateSnapshot`, and the tail replicates normally. This is exactly the
-//! `promote_back` sequence (steps 3+4), now auto-orchestrated by the native
-//! trigger instead of a CP/smoke operator.
+//! `StateSnapshot`, and the tail replicates normally — the `promote_back`
+//! sequence, now streamed + auto-orchestrated by the native trigger.
 //!
 //! Leader-push first (the leader dumps + pushes); a follower-sourced offload is
 //! a later optimization. On completion (success OR failure) the job clears its
@@ -34,6 +36,43 @@ const curl = blob_mod.curl;
 
 const TENANT_HEADER = "X-Rewind-Tenant";
 const MOVE_SECRET_HEADER = "X-Rewind-Move-Secret";
+const SNAP_INDEX_HEADER = "x-rewind-snapshot-index";
+const SNAP_TERM_HEADER = "x-rewind-snapshot-term";
+
+/// Upload producer over a held-snapshot `StreamDumper` (raft Phase 2.5): libcurl
+/// pulls the next wire slice via `fill` only as fast as the peer's receive
+/// window drains, so the body is never materialized whole.
+const DumpProducerCtx = struct {
+    dumper: *kv_mod.StreamDumper,
+    /// Absolute wall-clock deadline (ms). The held snapshot's read txn pins LMDB
+    /// pages for the whole transfer, so the leader's DB grows by roughly
+    /// write_rate × transfer_time. Past the deadline we ABORT (fail loud) rather
+    /// than let a too-hot/too-large tenant balloon the leader unboundedly.
+    deadline_ms: i64,
+    failed: bool = false,
+    timed_out: bool = false,
+
+    fn fill(dst: []u8, ctx: *anyopaque) ?usize {
+        const self: *DumpProducerCtx = @ptrCast(@alignCast(ctx));
+        if (std.time.milliTimestamp() > self.deadline_ms) {
+            self.timed_out = true;
+            return null; // abort the upload — bounds the page-pinning window
+        }
+        return self.dumper.pull(dst) catch {
+            self.failed = true;
+            return null; // abort the upload (CURL_READFUNC_ABORT)
+        };
+    }
+};
+
+/// Max wall-clock per-transfer duration (`REWIND_SNAPSHOT_XFER_MAX_MS`, default
+/// 10 min) — the page-pinning bound. A transfer that overruns is aborted +
+/// logged loudly and retried next trigger tick from a fresh snapshot.
+fn readXferMaxMs() i64 {
+    const default_ms: i64 = 10 * 60 * 1000;
+    const s = std.posix.getenv("REWIND_SNAPSHOT_XFER_MAX_MS") orelse return default_ms;
+    return std.fmt.parseInt(i64, s, 10) catch default_ms;
+}
 
 pub const SnapshotCatchupThread = struct {
     allocator: std.mem.Allocator,
@@ -51,6 +90,9 @@ pub const SnapshotCatchupThread = struct {
     /// catch-up disabled for that peer (logged loudly — a stranded peer is an
     /// operator-visible problem, not a silent strand).
     peer_urls: []const []const u8,
+    /// Page-pinning bound: max wall-clock per-transfer duration
+    /// (`REWIND_SNAPSHOT_XFER_MAX_MS`). Read once at init.
+    xfer_max_ms: i64 = 10 * 60 * 1000,
 
     queue: std.ArrayListUnmanaged(Job) = .empty,
     queue_mutex: std.Thread.Mutex = .{},
@@ -84,6 +126,7 @@ pub const SnapshotCatchupThread = struct {
             .bridge = bridge,
             .move_secret = move_secret,
             .peer_urls = peer_urls,
+            .xfer_max_ms = readXferMaxMs(),
         };
         return self;
     }
@@ -163,86 +206,105 @@ pub const SnapshotCatchupThread = struct {
         const secret = self.move_secret orelse {
             std.log.warn(
                 "v2 snapshot-catchup gid={d} peer={d}: REWIND_MOVE_SECRET unset — the peer's " ++
-                    "v2-load-replace / v2-apply-snapshot is gated; cannot push",
+                    "v2-snapshot-stream is gated; cannot push",
                 .{ job.gid, job.peer },
             );
             return;
         };
-
-        // 1. Dump the leader's tenant store via a PRIVATE sibling handle (the
-        //    two-handle model — never the worker's txn-stateful handle). A read
-        //    txn under LMDB MVCC is safe concurrent with the poll loop.
         const inst = (self.tenant.getInstance(job.id_str) catch null) orelse {
             std.log.warn("v2 snapshot-catchup gid={d} peer={d}: no instance for {s}", .{ job.gid, job.peer, job.id_str });
             return;
         };
-        const h = kv_mod.KvStore.attachSibling(a, inst.kv, kv_mod.hashStoreId(job.id_str), inst.kv.counter) catch |e| {
-            std.log.warn("v2 snapshot-catchup gid={d} peer={d}: attachSibling failed: {s}", .{ job.gid, job.peer, @errorName(e) });
-            return;
-        };
-        defer h.close();
-        const bundle = h.dumpTenantBundle(a) catch |e| {
-            std.log.warn("v2 snapshot-catchup gid={d} peer={d}: dump failed: {s}", .{ job.gid, job.peer, @errorName(e) });
-            return;
-        };
-        defer a.free(bundle);
 
-        // 2. Replace-load the bundle on the peer.
-        const lr = self.post(base, "/_system/v2-load-replace", secret, bundle, job.id_str) catch |e| {
-            std.log.warn("v2 snapshot-catchup gid={d} peer={d}: v2-load-replace transport: {s}", .{ job.gid, job.peer, @errorName(e) });
+        // Open a held-snapshot dumper over the leader's live tenant manifest.
+        // `openSnapshot` captures a consistent MVCC view (read txn + a copy of
+        // the committed overlay) WITHOUT forcing a `durabilize` — no
+        // leader-poll-loop fsync contention, unlike the retired single-shot
+        // `dumpTenantBundle`. The read txn pins LMDB pages for the transfer's
+        // lifetime (the page-pinning cost the transfer deadline bounds).
+        var dumper = kv_mod.StreamDumper.init(a, inst.kv.manifest, inst.kv.store_id) catch |e| {
+            std.log.warn("v2 snapshot-catchup gid={d} peer={d}: snapshot open failed: {s}", .{ job.gid, job.peer, @errorName(e) });
             return;
         };
-        if (lr != 204) {
-            std.log.warn("v2 snapshot-catchup gid={d} peer={d}: v2-load-replace → {d}", .{ job.gid, job.peer, lr });
-            return;
-        }
+        defer dumper.deinit();
 
-        // 3. Install the data-free raft baseline {index, term} on the peer.
-        const snap_body = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\",\"index\":{d},\"term\":{d}}}", .{ job.id_str, job.index, job.term }) catch return;
-        defer a.free(snap_body);
-        const as = self.post(base, "/_system/v2-apply-snapshot", secret, snap_body, null) catch |e| {
-            std.log.warn("v2 snapshot-catchup gid={d} peer={d}: v2-apply-snapshot transport: {s}", .{ job.gid, job.peer, @errorName(e) });
+        const status = self.streamUpload(base, secret, job, &dumper) catch |e| {
+            switch (e) {
+                // Fail loud: the page-pinning bound tripped. The tenant is too
+                // large/hot to transfer within REWIND_SNAPSHOT_XFER_MAX_MS;
+                // aborting keeps the leader's DB from ballooning. Retries next
+                // trigger tick — raise the knob (or investigate) if it recurs.
+                error.SnapshotTransferDeadline => std.log.warn(
+                    "v2 snapshot-catchup gid={d} peer={d}: transfer exceeded REWIND_SNAPSHOT_XFER_MAX_MS " ++
+                        "({d}ms) and was aborted to bound leader page-pinning; will retry next tick",
+                    .{ job.gid, job.peer, self.xfer_max_ms },
+                ),
+                else => std.log.warn(
+                    "v2 snapshot-catchup gid={d} peer={d}: v2-snapshot-stream transport: {s}",
+                    .{ job.gid, job.peer, @errorName(e) },
+                ),
+            }
             return;
         };
-        switch (as) {
+        switch (status) {
             204 => std.log.info(
-                "v2 snapshot-catchup gid={d} peer={d}: caught up to baseline {d}/{d} (out-of-band)",
+                "v2 snapshot-catchup gid={d} peer={d}: streamed catch-up to baseline {d}/{d}",
                 .{ job.gid, job.peer, job.index, job.term },
             ),
             // 409 = the peer already advanced past `index` via replication in the
-            // window (SnapshotStale) or became the leader — benign, it's no longer
+            // window (SnapshotStale) or became the leader — benign, no longer
             // behind. Anything else is a real failure (retried next trigger tick).
-            409 => std.log.info("v2 snapshot-catchup gid={d} peer={d}: apply-snapshot 409 (already ahead / now leader) — benign", .{ job.gid, job.peer }),
-            else => std.log.warn("v2 snapshot-catchup gid={d} peer={d}: v2-apply-snapshot → {d}", .{ job.gid, job.peer, as }),
+            409 => std.log.info("v2 snapshot-catchup gid={d} peer={d}: v2-snapshot-stream 409 (already ahead / now leader) — benign", .{ job.gid, job.peer }),
+            else => std.log.warn("v2 snapshot-catchup gid={d} peer={d}: v2-snapshot-stream → {d}", .{ job.gid, job.peer, status }),
         }
     }
 
-    /// One blocking POST to a peer's `/_system/*` (h2c, move-secret-gated). Like
-    /// the move forward-stream this is an internal low-rate path, not a hot path.
-    /// `tenant_hdr` (non-null) adds `X-Rewind-Tenant` (load-replace keys the
-    /// tenant by header, apply-snapshot by body). Returns the HTTP status.
-    fn post(self: *Self, base: []const u8, path: []const u8, secret: []const u8, body: []const u8, tenant_hdr: ?[]const u8) !u16 {
+    /// Stream the held snapshot to the peer's `/_system/v2-snapshot-stream` as a
+    /// chunked upload — the body is the pure pair stream, the data-free baseline
+    /// `{tenant, index, term}` rides in headers (one call, vs the retired
+    /// v2-load-replace + v2-apply-snapshot pair). One blocking call on this
+    /// off-loop thread; libcurl pulls from the dumper at the wire's drain rate.
+    /// Returns the HTTP status; errors on transport or mid-stream dump failure.
+    fn streamUpload(self: *Self, base: []const u8, secret: []const u8, job: *Job, dumper: *kv_mod.StreamDumper) !u16 {
         const a = self.allocator;
-        const url = try std.fmt.allocPrint(a, "{s}{s}", .{ base, path });
+        const url = try std.fmt.allocPrint(a, "{s}/_system/v2-snapshot-stream", .{base});
         defer a.free(url);
+        const idx_str = try std.fmt.allocPrint(a, "{d}", .{job.index});
+        defer a.free(idx_str);
+        const term_str = try std.fmt.allocPrint(a, "{d}", .{job.term});
+        defer a.free(term_str);
 
         var headers: std.ArrayListUnmanaged(curl.Header) = .empty;
         defer headers.deinit(a);
         try headers.append(a, .{ .name = MOVE_SECRET_HEADER, .value = secret });
+        try headers.append(a, .{ .name = TENANT_HEADER, .value = job.id_str });
+        try headers.append(a, .{ .name = SNAP_INDEX_HEADER, .value = idx_str });
+        try headers.append(a, .{ .name = SNAP_TERM_HEADER, .value = term_str });
         try headers.append(a, .{ .name = "Content-Type", .value = "application/octet-stream" });
-        if (tenant_hdr) |t| try headers.append(a, .{ .name = TENANT_HEADER, .value = t });
 
+        var pctx: DumpProducerCtx = .{
+            .dumper = dumper,
+            .deadline_ms = std.time.milliTimestamp() + self.xfer_max_ms,
+        };
+        // curl's TOTAL-transfer timeout sits just past our deadline so OUR
+        // check fires first with the page-pinning-specific message (curl is the
+        // backstop for a wedged connection).
+        const curl_timeout_ms: u32 = @intCast(@min(self.xfer_max_ms + 60_000, @as(i64, std.math.maxInt(u32))));
         var easy = try curl.Easy.init(a);
         defer easy.deinit();
-        var resp = try easy.request(a, .{
+        var resp = try easy.requestUpload(a, .{
             .method = .POST,
             .url = url,
             .headers = headers.items,
-            .body = body,
             .http_version = .h2c_prior_knowledge,
             .verify_tls = false,
-        });
+            .timeout_ms = curl_timeout_ms,
+        }, .{ .ctx = &pctx, .fill = &DumpProducerCtx.fill });
         defer resp.deinit(a);
+        // Producer-side aborts surface as a curl error above OR a short body;
+        // distinguish them from a clean non-204 so the retry is attributed.
+        if (pctx.timed_out) return error.SnapshotTransferDeadline;
+        if (pctx.failed) return error.SnapshotDumpFailed;
         return resp.status;
     }
 };

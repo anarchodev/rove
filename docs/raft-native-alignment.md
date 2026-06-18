@@ -356,99 +356,91 @@ Verified against the raft-0.7.0 source (the crate TiKV uses), not memory:
   lens), not bespoke-to-collapse. Dead fork `min_match_index` FFI left for a later
   fork cleanup. **This closes out Phase 2 (membership SSOT).**
 
-## Phase 2.5 — chunked-streaming snapshot transfer (multi-GB)
+## Phase 2.5 — chunked-streaming snapshot transfer (multi-GB) — BUILT 2026-06-18
 
-**Why before Phase 3.** Both the out-of-band catch-up (Phase 1) and the
-cross-cluster move share ONE primitive — `dumpTenantBundle` — and it does not
-scale past ~hundreds of MB. A multi-GB tenant can neither be caught up nor moved
-today. Phase 3 (move-via-conf-change) is moot for large tenants until this lands,
-so it sequences here.
+**Status: built + smoke-verified** (catch-up path; the move path's buffered
+endpoints are retained and un-regressed). The design below is as-built; a couple
+of choices diverged from the original plan and are flagged inline.
 
-### The wall (current single-shot path)
+**Why before Phase 3.** The out-of-band catch-up (Phase 1) and the cross-cluster
+move shared ONE primitive — the single-shot `dumpTenantBundle` — which does not
+scale past ~hundreds of MB. Phase 3 (move-via-conf-change) is moot for large
+tenants until this lands.
 
-`KvStore.dumpTenantBundle` (`src/kv/kvstore.zig:831`) → `kvexp.dumpTenantBundle`
-(`manifest.zig:3003`): `durabilize(0)`, `openSnapshot`, then write **every pair
-into one `ArrayList(u8)`** → `toOwnedSlice`. That single buffer is:
-1. returned by `v2-snapshot` as **one HTTP response body** (no chunking/backpressure),
-2. loaded on the dest by `loadTenantBundleReplace/Merge` (`loadBundleImpl`) in
-   **one atomic kvexp txn**.
+### The wall (the retired single-shot path)
 
-At multi-GB this fails on all three: a multi-GB RAM allocation on source AND dest
-simultaneously, a single unbounded HTTP body (OOM / timeout), the source's read
-txn pinning LMDB pages for the whole transfer (env growth), and a giant single
-write txn on the dest. The catch-up driver (`src/js/snapshot_catchup.zig`) inherits
-all of it (plus the `durabilize(0)`-contends-with-the-write-loop issue noted in
-Phase 1's known limitations).
+`KvStore.dumpTenantBundle` → `kvexp.dumpTenantBundle`: `durabilize(0)`,
+`openSnapshot`, write **every pair into one `ArrayList(u8)`**. That buffer was
+shipped as **one HTTP body** and loaded on the dest in **one atomic kvexp txn**.
+At multi-GB that's a multi-GB allocation on source AND dest, one unbounded HTTP
+body, a giant single write txn, and a read txn pinning pages for the whole
+transfer. The catch-up driver inherited all of it (plus the
+`durabilize(0)`-contends-with-the-write-loop issue from Phase 1).
 
-### Primitives already in hand (this is assembly, not invention)
+### As built
 
-- **Resumable consistent-snapshot cursor:** `snap.scanPrefix(store_id, "")` →
-  `SnapshotPrefixCursor` (`manifest.zig:2771`) with `next()`/`key()`/`value()`,
-  backed by `lmdb.Cursor.seekGe`/`first`/`next` (`lmdb.zig:248`). A single
-  `openSnapshot` held across the whole stream gives one consistent read view;
-  `seekGe(last_key)` resumes after any boundary.
-- **Wire format is already a forward-only pair stream:** `[magic][version]
-  [store_id][n_pairs]` then per-pair `[klen u16][vlen u32][key][val]`. Chunking is
-  just "stop after K bytes, resume the cursor" — no format change needed (the
-  `n_pairs` count-pass is the one piece to drop or move to a trailer, since a
-  streaming source shouldn't pre-scan the whole store).
-- **Streaming HTTP + backpressure:** the front-door streaming proxy
-  (`src/front/proxy.zig`, h2c with e2e backpressure) already proves the machinery;
-  the worker is h2c. A chunked response body's h2 stream flow-control IS the
-  backpressure — the source writes only as fast as the dest reads.
-- **Prior art:** the legacy paged snapshot transfer (`raft_snapshot.zig` +
-  `KvStore.collectPrefix`, `kvstore.zig:659`) already did cursor+count paging
-  before the single-shot `dumpTenantBundle` replaced it — a reference for the
-  paging shape.
+The catch-up driver now streams; the move keeps the buffered endpoints (a later
+adopter when large-tenant moves need it).
 
-### Design
-
-- **Source — stream under one snapshot.** Open `v2-snapshot` (or a new
-  `v2-snapshot-stream`) as a **streaming response**: `openSnapshot` once, then a
-  `scanPrefix` cursor, emitting the existing pair format in **bounded chunks**
-  (e.g. ~4 MB) as h2 DATA frames. Drop the O(N) `n_pairs` pre-count (or emit it as
-  a trailer). Memory is bounded by the chunk size, not the store size. The read
-  view is consistent for the whole stream.
-- **Wire — chunked body, flow-controlled.** No new framing; the pair stream is
-  self-delimiting. h2 stream flow control provides e2e backpressure for free.
-  Optional: a resumable transfer (the receiver reports `last_key`, a reconnect
-  `seekGe(last_key)`s) so a dropped connection mid-multi-GB doesn't restart — a
-  nice-to-have, deferred.
-- **Dest — incremental bounded-txn apply.** Read the stream, applying each chunk
-  in its **own bounded kvexp txn** rather than one giant txn. Replace semantics
-  (catch-up): clear the store in one txn, then stream-insert in bounded txns; a
-  crash mid-stream is safe because the group's apply watermark is NOT advanced
-  until the WHOLE load completes and `apply_local_snapshot {index,term}` installs
-  the baseline — a half-loaded store is never authoritative, and a retry re-clears
-  (idempotent). Merge semantics (move): each chunk inserts-if-absent, naturally
-  incremental.
-- **Both callers switch.** `snapshot_catchup.zig` and the move
-  (`v2-snapshot`/`v2-load-*`) consume the streaming path; the single-shot
-  `dumpTenantBundle` stays only for small in-process uses (or is retired).
+- **Codec — `src/kv/snapshot_stream.zig` (pure Zig, round-trip tested).** Two
+  halves over the existing pair framing, but with its OWN magic (`STREAM_MAGIC`,
+  distinct from `BUNDLE_MAGIC`) and **no `n_pairs`** (single-pass source; the
+  stream ends at body EOF):
+  - `StreamDumper` — PULL-model source. `openSnapshot` once (NO `durabilize` —
+    overlay capture sees committed pairs, so no leader-poll-loop fsync
+    contention), a held `SnapshotPrefixCursor`, staging exactly ONE pair at a time
+    into a caller buffer. Memory bounded to one pair.
+  - `StreamLoader` — PUSH-model dest. Parses frames split across ANY chunk
+    boundary; applies in **bounded kvexp txns** (commit per `batch_max_*`).
+    REPLACE clears the store in the first batch. The lease is held only for the
+    duration of a single `feed()` call (never across calls) so the worker thread
+    can't deadlock re-acquiring the tenant's non-reentrant lease.
+- **Transport — libcurl producer-pull upload (NOT a streaming response).** The
+  *leader pushes* (Phase 1's leader-detect trigger is leader-side, and etcd/TiKV
+  push out-of-band snapshot data), so the source issues a chunked upload via
+  `curl.Easy.requestUpload` (`CURLOPT_READFUNCTION` pulls from the `StreamDumper`
+  only as the wire drains — true backpressure, bytes never leave Zig). This is the
+  plan's one real divergence: pull-via-streaming-response would have put the dest
+  hook on the JS-coupled `StreamChain`/`serviceParkedStreams` path; push keeps the
+  one new server-side hook on the simpler inbound side.
+- **Endpoint — one call.** `POST /_system/v2-snapshot-stream`: body is the pure
+  pair stream; the data-free baseline `{tenant, index, term}` rides in headers —
+  collapsing the retired two-call `v2-load-replace` + `v2-apply-snapshot`.
+- **Dest wiring — rove-native, no S3.** Customer `onChunk` streaming round-trips
+  >cap chunks through the S3 chunk-tape durability gate — WRONG for an internal
+  snapshot. So `v2-snapshot-stream` is intercepted before the `/_system`
+  buffer-flip and gets a dedicated `h2.BodySink` (`src/js/snapshot_sink.zig`) that
+  feeds the `StreamLoader` directly. State is rove-native: a heap `Box` (the stable
+  `BodySink` ctx) owned by a `SnapshotStream` *component* on the request entity
+  (refcounted with the sink — NO side map); the entity parks via collection
+  membership (`request_out → snapshot_streams → response_in`). On END_STREAM,
+  `drainSnapshotStreams` finalizes: `StreamLoader.finish()` → `durabilize(0)` →
+  `applyLocalSnapshot {index,term}` → 204.
 
 ### Consistency + the baseline
 
-The baseline `{index, term}` must be the snapshot's read point: read the durable
-apply watermark **in the same `openSnapshot` txn** as the cursor, so `{pairs,
-apply_index}` are mutually consistent (the design's existing invariant — Phase 1).
-The committed tail above the baseline flows via normal replication / the move
-forward-stream, so the streamed snapshot may even be slightly stale without harm
-(the tail / insert-if-absent reconciles it).
+Unchanged from Phase 1: the baseline is the leader's apply point; a half-loaded
+store is never authoritative because the dest installs the raft baseline only on
+clean END_STREAM, and a mid-stream abort retries (REPLACE re-clears, idempotent).
 
-### Residual costs + open questions
+### Page-pinning bound
 
-- **Read-txn page pinning at GB scale.** One LMDB read txn held across a multi-GB
-  transfer pins the pages it reads → the env can grow by the write volume during
-  the transfer. Bounded by transfer time (fast LAN); for a high-write multi-GB
-  tenant the alternative is materialize-to-local-temp first (copy out, then stream
-  off the copy) — decide with a measurement.
-- **Chunk size** tuning (latency vs syscall/txn overhead) — start ~4 MB, measure.
-- **Resumable transfer** across a dropped connection — deferred unless multi-GB
-  transfers prove flaky.
-- **Effort:** a real piece of work (new streaming endpoint + receiver loop +
-  bounded-txn apply + the snapshot/move callers), not a tweak. Gate on a smoke
-  that moves/catches-up a synthetically-large (multi-GB) tenant with bounded RSS
-  on both ends.
+The held read txn pins LMDB pages for the transfer's lifetime → the leader's env
+can grow by write_rate × transfer_time. Bounded by `REWIND_SNAPSHOT_XFER_MAX_MS`
+(default 10 min): the source aborts + logs loudly past the deadline and retries
+next trigger tick from a fresh snapshot, rather than ballooning the leader. (A
+materialize-to-temp alternative for pathologically-hot tenants stays open.)
+
+### Verified
+
+`scripts/snapshot_stream_large_smoke_v2.py` — a ~50 MiB store (server-generated
+256 KiB values) streamed to a peer stranded past the compaction buffer, recovered
+to the leader's `last_index`, sampled big values read back byte-exact across
+multiple dest batches. `snapshot_trigger_smoke_v2` passes via the new path;
+`promote_back_smoke_v2` (the retained buffered path) un-regressed; unit 634/635.
+(~50 MiB is a proxy for multi-GB — true multi-GB is impractical in a quick smoke;
+the bounded-memory property is architectural + unit-tested. RSS sampling was
+dropped as mmap-confounded in favor of byte-exact-at-scale.)
 
 ## Phase 3 — evaluate move-via-conf-change
 

@@ -51,6 +51,11 @@ const curl = blob.curl;
 
 const MOVE_SECRET_HEADER = "x-rewind-move-secret";
 const TENANT_HEADER = "x-rewind-tenant";
+// raft Phase 2.5 streamed-snapshot baseline (carried in headers so the body is
+// the pure pair stream — collapses v2-load-replace + v2-apply-snapshot into one).
+const SNAP_INDEX_HEADER = "x-rewind-snapshot-index";
+const SNAP_TERM_HEADER = "x-rewind-snapshot-term";
+const snapshot_sink_mod = @import("snapshot_sink.zig");
 
 /// Constant-time byte-slice equality for secret comparison: the
 /// compare time depends only on the (non-secret) length, never on how
@@ -1372,6 +1377,115 @@ fn handleApplySnapshot(
         else => return reply(server, allocator, ent, sid, sess, 500, "apply-snapshot failed\n"),
     };
     return reply(server, allocator, ent, sid, sess, 204, "");
+}
+
+/// raft Phase 2.5 dest: arm a streamed-snapshot `BodySink` for a
+/// `POST /_system/v2-snapshot-stream`. Auth + parse the baseline {tenant, index,
+/// term} from headers (the body is the pure pair stream), resolve the local
+/// group + instance, then attach the sink and park the entity in
+/// `snapshot_streams`. The 204/4xx/5xx is sent later by `drainSnapshotStreams`
+/// (on END_STREAM), since the body streams over many ticks. Always handles the
+/// request (responds on any rejection; on success the response is deferred).
+pub fn armSnapshotStream(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    rh: h2.ReqHeaders,
+) !void {
+    const secret = worker.move_secret orelse
+        return reply(server, allocator, ent, sid, sess, 404, "move surface disabled\n");
+    const presented = respb.findHeader(rh, MOVE_SECRET_HEADER) orelse "";
+    if (!constantTimeEql(presented, secret))
+        return reply(server, allocator, ent, sid, sess, 401, "bad move secret\n");
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+    const tenant = respb.findHeader(rh, TENANT_HEADER) orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Tenant\n");
+    const idx_s = respb.findHeader(rh, SNAP_INDEX_HEADER) orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Snapshot-Index\n");
+    const term_s = respb.findHeader(rh, SNAP_TERM_HEADER) orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Snapshot-Term\n");
+    const index = std.fmt.parseInt(u64, idx_s, 10) catch
+        return reply(server, allocator, ent, sid, sess, 400, "bad snapshot index\n");
+    const term = std.fmt.parseInt(u64, term_s, 10) catch
+        return reply(server, allocator, ent, sid, sess, 400, "bad snapshot term\n");
+    // A data-free baseline must be a real {index>0, term>0} (mirrors
+    // handleApplySnapshot — index 0 is a no-op, term 0 crashes raft's restore).
+    if (index == 0 or term == 0)
+        return reply(server, allocator, ent, sid, sess, 400, "index and term must be nonzero\n");
+
+    const gid = worker.raft.gidForTenant(tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
+    if (worker.raft.isLeaderOf(gid))
+        return reply(server, allocator, ent, sid, sess, 409, "leader can't restore a snapshot to itself\n");
+    const inst = ensureInstance(worker, tenant) catch
+        return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
+
+    var loader = kv_mod.StreamLoader.init(allocator, inst.kv.manifest, .{ .clear_existing = true }) catch
+        return reply(server, allocator, ent, sid, sess, 500, "loader init failed\n");
+    // Box.create COPIES `loader` into the heap box (which then owns its
+    // key/val buffers); on success the local must NOT be deinit'd.
+    const box = snapshot_sink_mod.Box.create(allocator, loader, gid, index, term) catch {
+        loader.deinit();
+        return reply(server, allocator, ent, sid, sess, 500, "snapshot box alloc failed\n");
+    };
+    if (!worker.armSnapshotStreamSink(ent, sess.entity, sid.id, box))
+        return reply(server, allocator, ent, sid, sess, 503, "snapshot stream could not be armed\n");
+    // Armed — the entity is parked in `snapshot_streams`; `drainSnapshotStreams`
+    // sends the response once the body completes.
+}
+
+/// raft Phase 2.5 dest tick: finalize streamed-snapshot transfers parked in
+/// `snapshot_streams`. END_STREAM → finish + durabilize + install the data-free
+/// raft baseline → 204; a parse/apply failure → 500; a benign already-ahead /
+/// leader race → 409; a client reset → destroy (no response possible). The
+/// entity moves to `response_in` (h2 sends the reply) or is destroyed; either
+/// way its `SnapshotStream` component releases the box.
+pub fn drainSnapshotStreams(worker: anytype) !void {
+    const server = worker.h2;
+    const coll = &worker.snapshot_streams;
+    const entities = coll.entitySlice();
+    const states = coll.column(snapshot_sink_mod.SnapshotStream);
+    for (entities, states) |ent, *ss| {
+        const box = ss.box orelse continue;
+        if (box.aborted) {
+            // Client reset mid-upload: no response is possible. Destroy — the
+            // component deinit drops the box's component ref (the sink ref
+            // releases when h2 reaps the stream).
+            try server.reg.destroy(ent);
+            continue;
+        }
+        if (!box.eof and !box.failed) continue; // body still streaming
+
+        var status: u16 = 204;
+        if (box.failed) {
+            status = 500;
+        } else if (box.commit()) |_| {
+            worker.raft.applyLocalSnapshot(box.gid, box.index, box.term, null, null) catch |e| switch (e) {
+                // Already advanced past `index` via replication during the
+                // stream, or now leads — benign (driver treats 409 as success).
+                error.SnapshotStale, error.NotLeader, error.SelfNotInConfState => status = 409,
+                else => status = 500,
+            };
+        } else |_| {
+            status = 500;
+        }
+
+        // Detach the component's box ref now (the sink keeps its own ref until
+        // h2 reaps the stream) so the value carried to `response_in` is inert.
+        box.unref();
+        ss.box = null;
+
+        server.reg.set(ent, coll, h2.Status, .{ .code = status }) catch {};
+        server.reg.set(ent, coll, h2.RespHeaders, .{ .fields = null, .count = 0 }) catch {};
+        server.reg.set(ent, coll, h2.RespBody, .{ .data = null, .len = 0 }) catch {};
+        server.reg.set(ent, coll, h2.H2IoResult, .{ .err = 0 }) catch {};
+        try server.reg.move(ent, coll, &server.response_in);
+    }
 }
 
 /// Stamp a plain status + message response (no CORS — internal surface).
