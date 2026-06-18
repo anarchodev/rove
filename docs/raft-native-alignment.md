@@ -242,12 +242,29 @@ Verified against the raft-0.7.0 source (the crate TiKV uses), not memory:
   prs (membership-neutral, unchanged); all current callers pass null, so it is
   behavior-neutral (full apply_local_snapshot suite green). `-6` guard enforces the
   self-in-ConfState constraint above.
-- **2d — born-empty joiner + consistent baseline read.** Extend
-  `v2-applied-baseline` to return the leader's ConfState alongside `{index,term}`
-  (one read); the join path (catch-up driver / reconciler / move) passes it to
-  `v2-apply-snapshot` → `apply_local_snapshot`, after the leader has conf-change-
-  added the joiner. Born group starts empty; membership comes from the baseline.
-  Delete the `initWithLearners` born-learner hack.
+- **2d-1 + 2d-2 — worker-side capability ✅ landed (`7ae9695`).**
+  `v2-applied-baseline` returns the leader's ConfState alongside `{index,term,epoch}`
+  in one consistent read; `v2-attach` accepts `X-Rewind-Voters`/`X-Rewind-Learners`
+  → threaded to `apply_local_snapshot`, so a baseline carries the source membership
+  and the joiner adopts it. Validated by `membership_from_snapshot_smoke_v2`
+  (the `-6`/409 self-omit guard is the distinguisher). Absent headers →
+  membership-neutral (unchanged).
+- **2d-3 — reconciler integration: OPEN (first attempt REVERTED).** Naively
+  reordering `ensureMember` to add-learner-FIRST (so the baseline can carry the
+  member) **hit `raft_log.rs:292` `to_commit N out of range [last_index N-1]`** —
+  the commit_to panic. Under the reconciler's concurrent write load, a node born at
+  the baseline (= leader's APPLIED index) gets a heartbeat carrying the leader's
+  COMMITTED index (already ahead) → abort. The existing **bootstrap-THEN-add**
+  ordering is deliberately panic-safe (the node's group exists + the leader's
+  Progress starts fresh match=0 BEFORE the leader tracks/commits to it); add-first
+  breaks that. So 2d-3 must NOT reorder. Candidate: keep bootstrap-then-add, but
+  have the reconciler pass an **augmented ConfState** (the leader's current
+  ConfState + the joining node as a learner) so the baseline satisfies raft.rs:2581
+  WITHOUT requiring the leader's AddLearner to commit first — needs careful
+  validation that the brief leader-doesn't-know-the-node window is safe. The
+  membership_from_snapshot smoke passed BECAUSE it is quiescent (no commit advance
+  between add and attach); the reconciler is not. Delete the `initWithLearners`
+  hack only once 2d-3 lands.
 - **2e — genesis bootstrap (DECISION).** Initial group formation still needs a
   bootstrap voter set (even etcd keeps `--initial-cluster`). Decide: provision/CP
   passes the initial voters per-group (retire `REWIND_VOTERS` fully), vs. keep
