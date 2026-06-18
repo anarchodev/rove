@@ -94,62 +94,84 @@ raft-rs drive the whole snapshot lifecycle, exactly as etcd/TiKV do, and have
 rove supply only the bytes transport. We diverge **only** where a concrete,
 scrutinized constraint forces it.
 
-**Native machinery to use (stop stubbing):**
-- **Leader `snapshot()`** (`storage.zig:299`): return a real snapshot —
-  `{index, term, ConfState}` metadata + the data — instead of `-1`. Use raft-rs's
-  **async pattern**: if a fresh-enough snapshot isn't staged yet, return
-  `SnapshotTemporarilyUnavailable` and stage it **off-pump** (the two-handle
-  consistent read we already use for moves); serve it on raft's retry. This is
-  precisely how etcd generates snapshots lazily — no hot-path block.
-- **`MsgSnapshot`** already rides our transport (`lib.rs:1534/1683`) — no new
-  wire path for the *trigger/metadata*.
-- **Receiver `apply_snapshot`** (`storage.zig:361`): apply the data + set
-  ConfState from the metadata (the storage confstate path) — *this is what
-  unlocks Phase 2*.
-- **`report_snapshot`** (new FFI — not currently wrapped): wire it so the leader's
-  Progress state machine tracks send success/failure natively, instead of us
-  inferring catch-up.
-- **`Progress::state`** (extend `voter_progress`): expose Probe/Replicate/Snapshot
-  so observability matches raft's own model.
+**Settled shape: native *trigger*, out-of-band *data*.** We use raft-rs's
+snapshot *signaling* (the `StateSnapshot` catch-up state machine) but keep rove's
+out-of-band data delivery — which is what avoids the one hard part (receiver-side
+async apply). Concretely:
 
-**The one scrutinized divergence — large snapshot bytes.** Our coalesced
-io_uring transport can't carry an MB-scale snapshot inline, and a leader
-*streaming* bytes on the serving path is the concern behind the earlier
-rejection. etcd hit the identical wall and solved it **within** the native model:
-metadata rides `MsgSnapshot`, the bytes stream over a **dedicated side channel**
-(`/raft/snapshot`). rove's aligned equivalent: the snapshot data is a small
-**S3 pointer** (we already stage tenant bundles to S3 for moves); the receiver's
-`apply_snapshot` fetches the bundle from S3. So the leader **generates** the
-snapshot (off-pump) but **never streams the bytes** — S3 does. That satisfies the
-hot-path concern *inside* the native machinery, rather than replacing it.
+- **`snapshotCb` stays `Unavailable`** (`storage.zig:299`) — it is the "this peer
+  is behind" *signal*. raft holds the peer in `StateSnapshot` and retries
+  (verified-safe back-off); it never strands silently and never blocks.
+- **Detect `StateSnapshot`** on the leader — the one new FFI: extend
+  `voter_progress` to expose `Progress::state` (Probe/Replicate/Snapshot). This is
+  the trigger.
+- **Auto-orchestrate the existing `promote_back` sequence** on detection: the
+  behind peer pulls the bundle (consistent read-txn cursor, streamed in chunks,
+  **direct peer→peer over `v2-snapshot` — no S3**) → `v2-load-replace` **on its
+  worker (off-pump)** → `apply_local_snapshot {index, term, conf_state}` **on its
+  pump (fast, data-free)**. Its `match` advances → `StateSnapshot` clears → the
+  leader replicates the tail.
 
-> **Re-opens a prior decision.** This is leader-*generated* snapshots, which were
-> previously removed (`736a718`/fork `1ad54fc`) in favor of follower-sourced
-> out-of-band bootstrap. Under the new mandate that rejection is itself a
-> divergence to justify. The hot-path objection is addressed by **async
-> generation + S3 bytes** (etcd's own approach); the residual question is whether
-> leader-side *generation* (an off-pump consistent dump) is acceptable. My read:
-> yes — etcd/TiKV do exactly this, and we already do the equivalent off-pump dump
-> for moves. **Follower-sourcing becomes a fallback** (the leader can name a
-> caught-up voter as the S3 stager if we want generation off the leader too), not
-> the primary design — it's the more divergent option and must earn its place.
+**Why not bytes-in-`MsgSnapshot` (the etcd-native data path):** raft-rs applies a
+received snapshot on the *pump* (`restore` → `apply_snapshot` during the Ready).
+A large load there blocks **every tenant** on that node (shared multi-raft pump).
+The out-of-band split — heavy load on the worker, only the fast baseline install
+on the pump — is exactly how `promote_back` already sidesteps that. So we reuse it
+rather than building a TiKV-style async apply worker. The data is a logical
+key/value stream (cursor under a read txn), so the receiver applies it **in
+place** (replace for a snapshot, insert-if-absent for a move) — **no env swap**,
+and **one mechanism for both snapshot and move**. The baseline reflects the
+durable apply watermark read in the same txn; the committed tail flows via normal
+replication.
 
-**Then delete:** the `min_match_index` learner inclusion (B), the voters-only
-floor *and* `propagated_floor` (compact to applied — raft snapshots laggards
-now), the snapshot-free `-1` stubs, the birth-window concern, and the
-`high_churn_learner` smoke's reliance on the floor.
+> **Re-opens a prior decision — and lands close to it.** Leader-generated
+> data-carrying `MsgSnapshot` was removed before (`736a718`) in favor of
+> out-of-band follower-sourced bootstrap. Re-examined under the mandate: the
+> *native trigger* (StateSnapshot) is the part worth adopting (it replaces the
+> snapshot-free strand + the floor-pin); the *data path* stays out-of-band,
+> because that's what keeps the heavy work off the shared pump. So we leverage
+> raft-rs's catch-up state machine without taking its on-pump data apply.
 
-**Residual caveats** (all of which etcd/TiKV already carry, so they're
-"intended" costs, not rove-specific): snapshot generation cost (bounded by
-async + retention); the append-vs-snapshot ordering gate (raft's `StateSnapshot`
-handles it); S3 availability for the bytes (same dependency as moves).
+**Earlier detour (reverted):** a first cut added a GFS "staging slot" so
+`snapshotCb` could *serve* bytes. That assumed bytes-in-`MsgSnapshot`; with the
+out-of-band data path it's unused — reverted. The conf_state-in-`MsgSnapshot`
+vtable plumbing is likewise unused (conf_state rides the out-of-band baseline
+instead, which Phase 2 needs anyway).
+
+### I4 compaction — DECIDED: fixed catch-up buffer (mechanism **A**)
+
+`durabilizeTick` compacts to `max(0, durable_apply_watermark − grace_count)`,
+**per node, independently**. A peer within `grace_count` of the cap catches up
+from the log; anyone further back triggers `StateSnapshot` → the out-of-band
+catch-up above. Chosen over the peer-aware min-match floor (B-mechanism) for
+simplicity: it **deletes the coordination** — no `min_match_index` for the
+compaction decision, no `propagated_floor` wire field, no lockstep, no
+recent_active filter (B). The fixed buffer is the bound, so a dead/stuck peer
+can't pin the WAL (it falls out of the buffer and snapshots). One knob
+(`grace_count`, etcd's ~5000), with a **global cap** escape hatch if the
+multi-tenant shared-WAL footprint (`Σ grace_count` across hot groups) gets
+uncomfortable. Trade-off + the rejected alternative (B, tighter WAL but
+coordinated + more snapshots) are in the commit history of this doc.
+
+**Then delete (I4):** `min_match_index`-for-compaction, the voters-only floor +
+`propagated_floor`, the recent_active learner-floor (B from the prior branch),
+the birth-window concern, the snapshot-free `-1` strand semantics, and the
+`high_churn_learner` smoke's reliance on the floor (it becomes a
+snapshot-catch-up smoke).
+
+**Residual caveats:** the source holds a read txn for the transfer (LMDB page
+pinning → temporary env growth; mitigated by fast LAN transfer, or
+materialize-to-local-temp); the append-vs-baseline ordering (the out-of-band
+load completes before `apply_local_snapshot` advances `match`, so the tail never
+applies onto an unloaded store).
 
 ## Phase 2 — membership SSOT (kill `REWIND_VOTERS`)
 
-Once snapshots carry the real **ConfState** (Phase 1 sends it in the snapshot
-metadata, and `apply_snapshot` sets it via the storage confstate path instead of
-the static init), a joining node learns its membership **from the snapshot +
-conf-change log** — the raft-native way. Then:
+Once the out-of-band baseline carries the real **ConfState** (the source's
+membership, passed through `v2-apply-snapshot` → `apply_local_snapshot`, instead
+of the membership-neutral "keep current prs" it does today), a joining node
+learns its membership **from the baseline + the replicated conf-change log** —
+not the static env. Then:
 
 - Retire `REWIND_VOTERS`; group ConfState is whatever the replicated state says.
 - Delete the `initWithLearners` born-learner hack (a joiner is a learner because
