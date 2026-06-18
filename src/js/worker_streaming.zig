@@ -326,8 +326,23 @@ pub fn serviceParkedStreams(worker: anytype) !void {
         // No wake registered (interval_ms == 0 AND no kv match):
         // the chain was "stream a finite batch + close" (the §3.3
         // degenerate shape — `acme/stream/index.mjs`). Close now
-        // that the initial chunks have shipped.
-        if (wakes_comp.interval_ms == 0 and wakes_comp.kv_prefixes.len == 0) {
+        // that the initial chunks have shipped — UNLESS an in-flight
+        // bound fetch is still feeding this stream. A chain opened via
+        // `on.fetch({stream}) → stream.write()` in onChunk + `next()`
+        // (the `__system/static` streamer, docs/streaming-model.md §7)
+        // registers no timer/kv wake; its subsequent chunks arrive
+        // through `resumeBoundFetchStream`, NOT a wake. Auto-closing the
+        // instant the queue first drains races the next bound chunk and
+        // truncates the response (the static-serve teardown bug). While
+        // `BoundFetchCount.pending > 0` the feeding fetch hasn't sent its
+        // `final` event, so stay idle and wait for the next chunk; the
+        // final chunk's terminal arm sets `is_draining` (handled above),
+        // which is what actually closes the stream.
+        const pending_binds: u32 = blk: {
+            const cnt = server.reg.get(p.ent, &server.stream_data_out, components_mod.BoundFetchCount) catch break :blk 0;
+            break :blk cnt.pending;
+        };
+        if (pending_binds == 0 and wakes_comp.interval_ms == 0 and wakes_comp.kv_prefixes.len == 0) {
             try server.reg.move(p.ent, &server.stream_data_out, &server.stream_close_in);
             continue;
         }
@@ -2637,18 +2652,35 @@ fn dispatchSpoolHead(worker: anytype, fetch_id: []const u8) void {
         const ready_stream = server.reg.isInCollection(held_ent, &server.stream_data_out) or
             server.reg.isInCollection(held_ent, &server.stream_response_in);
         if (!ready_cont and !ready_stream) {
-            if (server.reg.isInCollection(held_ent, &worker.raft_pending_cont) or
-                server.reg.isInCollection(held_ent, &worker.raft_pending_stream))
-            {
-                return;
+            // The held entity isn't in a receivable collection right now.
+            // It is only genuinely GONE if it's stale (destroyed/recycled) —
+            // in that case no future tick can deliver, so drop the spool.
+            //
+            // Otherwise the entity is ALIVE but transiently parked somewhere
+            // a chunk can't be delivered into THIS tick:
+            //   • awaiting a raft commit (`raft_pending_*`),
+            //   • a deferred move in flight (`isMoving`),
+            //   • mid h2 send — a stream entity cycles
+            //     `stream_data_out → stream_data_in → _stream_data_sending →
+            //     stream_data_out` for EVERY chunk shipped, and
+            //     `response_in → _response_sending` on the head send,
+            //   • on the terminal/close path (`stream_close_in` /
+            //     `response_in` / `response_out`), about to be destroyed —
+            //     at which point `isStale` flips (or `scanAndCancelBoundFetches`
+            //     drops the spool) on a later tick.
+            // In every one of these the chunk must STAY spooled; `drainSpools`
+            // retries next tick once the entity returns to a receivable
+            // collection. Enumerating the "alive" collections here is fragile
+            // (the one-tick `_stream_data_sending` window — missed by an
+            // earlier enumeration — was the residual large-static truncation):
+            // invert it — stale ⇒ drop, alive ⇒ retry.
+            if (server.reg.isStale(held_ent)) {
+                std.log.info(
+                    "rove-js chunk-spool: held entity destroyed for fetch_id={s}; dropping {d} spooled chunk(s)",
+                    .{ key, sp.len() },
+                );
+                dropSpool(worker, key);
             }
-            // Entity not in any tracked collection — destroyed /
-            // recycled, no commit will move it back. Drop the spool.
-            std.log.info(
-                "rove-js chunk-spool: entity for fetch_id={s} not in any tracked collection; dropping {d} spooled chunk(s)",
-                .{ key, sp.len() },
-            );
-            dropSpool(worker, key);
             return;
         }
 
