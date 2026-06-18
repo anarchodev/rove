@@ -87,12 +87,17 @@ pool.**
 
 ### Verdicts
 
-- **#1 snapshot stub → ALIGN.** Pure workaround for a disabled primitive. Adopt
-  raft-rs's native snapshot path (Phase 1).
-- **#2 lockstep floor → ALIGN (delete).** Exists only to compensate for #1. Once
-  snapshots work, compact freely and snapshot laggards, as raft intends.
-- **#3 static `REWIND_VOTERS` → ALIGN (delete).** Membership belongs in the
-  replicated state; a joiner learns it from the snapshot's ConfState (Phase 2).
+- **#1 snapshot stub → ALIGN ✅ DONE (Phase 1).** Native trigger
+  (`matched+1<first_index`) + out-of-band catch-up; mechanism-A compaction.
+- **#2 lockstep floor → DELETED ✅ (Phase 2f, `198481a`).** The whole apparatus
+  (min-match floor, `propagated_floor`, the wire field) is gone; compaction is
+  per-node + snapshot laggards, as raft intends.
+- **#3 static `REWIND_VOTERS` → ALIGN ✅ DONE for tenants (Phase 2c/2d/2e).**
+  Membership now lives in the replicated state: a joiner learns it from the
+  snapshot's ConfState (2c/2d), and fresh formation uses the CP-owned cluster
+  node-set SSOT (2e). `REWIND_VOTERS` remains only as the irreducible genesis
+  bootstrap (the topology lens: genesis keeps a static config like etcd's
+  `--initial-cluster`).
 - **#4 bespoke move → OPEN.** TiKV moves replicas via conf-change; evaluate
   whether ours can too (Phase 3). May be a *justified divergence* (disjoint
   cluster meshes + routing-during-overlap) — decide with evidence.
@@ -339,10 +344,17 @@ Verified against the raft-0.7.0 source (the crate TiKV uses), not memory:
   CP-passed set (the `cp/main.zig:527` "explicit-id model is the SSOT cleanup"
   direction). Open sub-question: pass the set at provision time vs. derive it from
   a replicated cluster-membership record.
-- **2f — collapse the reconciler + phantom-voter machinery** once membership is
-  ConfState-SSOT. The reconciler's job narrows to the genuine rove need —
-  converging a cluster's tenant groups onto the cluster node set after a
-  topology change (node add/remove/replace) — not per-tenant placement.
+- **2f — delete the floor apparatus ✅ LANDED (`198481a`).** Removes ledger
+  deviation #2 (the lockstep WAL-compaction floor), already neutered by mechanism-A
+  in 2b. Deleted: the per-record `floor` wire field (transport header 28→20 bytes),
+  `recv_floors`, `drainFloors`, `SendCtx.floor`, `applyRecvFloor`,
+  `propagated_floor`. Wire-format change, gated on the FULL raft suite (15/15,
+  0 panics, 0 undecodable msgs) + v2-test. **Retained** (NOT deleted): the
+  `createGroupCore` born-learner hack — `as_learner` can pair with baseline index 0
+  (no baseline to overwrite the born set), so it stays a safety net. The reconciler
+  itself stays — its job is genuine (cluster-topology convergence per the topology
+  lens), not bespoke-to-collapse. Dead fork `min_match_index` FFI left for a later
+  fork cleanup. **This closes out Phase 2 (membership SSOT).**
 
 ## Phase 2.5 — chunked-streaming snapshot transfer (multi-GB)
 
