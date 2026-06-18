@@ -1299,9 +1299,13 @@ fn handleApplySnapshot(
         return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
     if (worker.raft.isLeaderOf(gid))
         return reply(server, allocator, ent, sid, sess, 409, "this node leads the group; a leader can't restore a snapshot to itself\n");
-    worker.raft.applyLocalSnapshot(gid, v.index, v.term) catch |e| switch (e) {
+    // Phase 2c: membership-neutral (null ConfState) — keeps the group's current
+    // prs, the unchanged promote-back/catch-up behavior. Phase 2d wires the
+    // source's ConfState through the body so a joiner learns its membership here.
+    worker.raft.applyLocalSnapshot(gid, v.index, v.term, null, null) catch |e| switch (e) {
         error.SnapshotStale => return reply(server, allocator, ent, sid, sess, 409, "index not ahead of committed; nothing to install\n"),
         error.NotLeader => return reply(server, allocator, ent, sid, sess, 409, "node leads the group\n"),
+        error.SelfNotInConfState => return reply(server, allocator, ent, sid, sess, 409, "supplied membership omits this node; add it to the group first\n"),
         else => return reply(server, allocator, ent, sid, sess, 500, "apply-snapshot failed\n"),
     };
     return reply(server, allocator, ent, sid, sess, 204, "");

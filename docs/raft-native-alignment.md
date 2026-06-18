@@ -212,6 +212,49 @@ not the static env. Then:
 
 Blocked by Phase 1 (snapshots must carry ConfState first).
 
+### raft-rs / TiKV cross-check (2026-06-17) — the mechanism + a hard constraint
+
+Verified against the raft-0.7.0 source (the crate TiKV uses), not memory:
+- **Validated direction.** `Raft::restore` rebuilds membership from the snapshot's
+  ConfState — `confchange::restore(&mut self.prs, last_index, cs)` (`raft.rs:2629`).
+  A node learning membership from a snapshot IS the native mechanism (it is how
+  TiKV peers learn their region membership); the static `REWIND_VOTERS` is the
+  divergence we remove.
+- **Hard constraint (`raft.rs:2581-2598`).** `restore` THROWS AWAY a snapshot whose
+  ConfState does not contain the recipient ("attempted to restore snapshot but it
+  is not in the ConfState"). So the membership a baseline carries **must already
+  include the joining node** ⇒ the join sequence is **conf-change-add the node on
+  the leader FIRST, then install its baseline** — exactly TiKV's add-peer-then-
+  snapshot ordering. The fork FFI now enforces this up front (`-6`
+  `SelfNotInConfState`) instead of letting `restore` silently drop the baseline.
+- **Consistency requirement.** The ConfState a baseline carries must match the
+  membership AS OF the baseline's index. TiKV generates snapshot metadata at one
+  point; rove reads the index (`v2-applied-baseline`) and the ConfState
+  (`v2-confstate`) via SEPARATE endpoints — a TOCTOU if membership changes between
+  them. Phase 2d MUST read `{index, term, conf_state}` from ONE consistent read
+  (extend `v2-applied-baseline` to also return the ConfState), not two calls.
+
+### Decomposition (steps)
+
+- **2c — ConfState-carrying baseline (foundation) ✅ landed.** Optional `(voters,
+  learners)` threaded through `apply_local_snapshot` (fork FFI as primitive u64
+  arrays — sidesteps the 2a cross-`@cImport` struct landmine). Null = keep current
+  prs (membership-neutral, unchanged); all current callers pass null, so it is
+  behavior-neutral (full apply_local_snapshot suite green). `-6` guard enforces the
+  self-in-ConfState constraint above.
+- **2d — born-empty joiner + consistent baseline read.** Extend
+  `v2-applied-baseline` to return the leader's ConfState alongside `{index,term}`
+  (one read); the join path (catch-up driver / reconciler / move) passes it to
+  `v2-apply-snapshot` → `apply_local_snapshot`, after the leader has conf-change-
+  added the joiner. Born group starts empty; membership comes from the baseline.
+  Delete the `initWithLearners` born-learner hack.
+- **2e — genesis bootstrap (DECISION).** Initial group formation still needs a
+  bootstrap voter set (even etcd keeps `--initial-cluster`). Decide: provision/CP
+  passes the initial voters per-group (retire `REWIND_VOTERS` fully), vs. keep
+  `REWIND_VOTERS` only for genesis. Surfaces before 2e.
+- **2f — collapse the reconciler + phantom-voter machinery** once membership is
+  ConfState-SSOT.
+
 ## Phase 2.5 — chunked-streaming snapshot transfer (multi-GB)
 
 **Why before Phase 3.** Both the out-of-band catch-up (Phase 1) and the

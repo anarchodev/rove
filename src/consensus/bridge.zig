@@ -206,6 +206,12 @@ const ControlCmd = struct {
     /// `log_term`: `snap_index` is the query index, `snap_term` the result.
     snap_index: u64 = 0,
     snap_term: u64 = 0,
+    /// `apply_local_snapshot` (Phase 2 — membership SSOT): the source leader's
+    /// ConfState the baseline carries, so a joiner learns its membership from the
+    /// snapshot. Null → keep the group's current membership (membership-neutral
+    /// promote-back, unchanged). Borrowed from the caller stack for the call.
+    snap_voters: ?[]const u64 = null,
+    snap_learners: ?[]const u64 = null,
     /// `conf_state`: caller buffers to fill + the counts written back.
     cs_voters: []u64 = &.{},
     cs_learners: []u64 = &.{},
@@ -896,8 +902,8 @@ pub const Bridge = struct {
     /// the tail and the node can be promoted back. Pump-thread control cmd.
     /// `Error.NotLeader` if this node leads the group; `Error.SnapshotStale` if
     /// `index` is not ahead of committed.
-    pub fn applyLocalSnapshot(self: *Bridge, gid: u64, index: u64, term: u64) Error!void {
-        var cmd: ControlCmd = .{ .kind = .apply_local_snapshot, .gid = gid, .snap_index = index, .snap_term = term };
+    pub fn applyLocalSnapshot(self: *Bridge, gid: u64, index: u64, term: u64, voters: ?[]const u64, learners: ?[]const u64) Error!void {
+        var cmd: ControlCmd = .{ .kind = .apply_local_snapshot, .gid = gid, .snap_index = index, .snap_term = term, .snap_voters = voters, .snap_learners = learners };
         return self.runControl(&cmd);
     }
 
@@ -953,7 +959,7 @@ pub const Bridge = struct {
                     // (a labeled break is not an error return, so errdefer won't
                     // fire here; roll back explicitly).
                     if (cmd.snap_index > 0) {
-                        self.node.applyLocalSnapshot(cmd.gid, cmd.snap_index, cmd.snap_term) catch |e| {
+                        self.node.applyLocalSnapshot(cmd.gid, cmd.snap_index, cmd.snap_term, cmd.snap_voters, cmd.snap_learners) catch |e| {
                             self.node.destroyGroupAndReclaim(cmd.gid) catch |de|
                                 std.log.err("v2 bridge: rollback of half-born gid {d} failed: {s}", .{ cmd.gid, @errorName(de) });
                             break :blk e;
@@ -1005,7 +1011,7 @@ pub const Bridge = struct {
                     break :blk null;
                 },
                 .apply_local_snapshot => blk: {
-                    self.node.applyLocalSnapshot(cmd.gid, cmd.snap_index, cmd.snap_term) catch |e| break :blk e;
+                    self.node.applyLocalSnapshot(cmd.gid, cmd.snap_index, cmd.snap_term, cmd.snap_voters, cmd.snap_learners) catch |e| break :blk e;
                     break :blk null;
                 },
                 .transfer_all_leadership => blk: {

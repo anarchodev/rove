@@ -1052,8 +1052,8 @@ pub const Node = struct {
     /// learner; the KV state for `index` must already be loaded out-of-band (the
     /// move bundle). Fast-forwards the raft log baseline so the leader can
     /// replicate the tail and the node can be promoted back. Pump-thread only.
-    pub fn applyLocalSnapshot(self: *Node, tenant_id: u64, index: u64, term: u64) Error!void {
-        try self.mgr.applyLocalSnapshot(tenant_id, index, term);
+    pub fn applyLocalSnapshot(self: *Node, tenant_id: u64, index: u64, term: u64, voters: ?[]const u64, learners: ?[]const u64) Error!void {
+        try self.mgr.applyLocalSnapshot(tenant_id, index, term, voters, learners);
         // A2: the baseline fast-forwarded the raft LOG to `index` and the KV state
         // for `index` is already in the store (the out-of-band bundle). Stamp the
         // store's DURABLE applied watermark to `index` as well — otherwise a crash
