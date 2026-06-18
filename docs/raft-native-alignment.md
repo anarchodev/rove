@@ -212,6 +212,100 @@ not the static env. Then:
 
 Blocked by Phase 1 (snapshots must carry ConfState first).
 
+## Phase 2.5 — chunked-streaming snapshot transfer (multi-GB)
+
+**Why before Phase 3.** Both the out-of-band catch-up (Phase 1) and the
+cross-cluster move share ONE primitive — `dumpTenantBundle` — and it does not
+scale past ~hundreds of MB. A multi-GB tenant can neither be caught up nor moved
+today. Phase 3 (move-via-conf-change) is moot for large tenants until this lands,
+so it sequences here.
+
+### The wall (current single-shot path)
+
+`KvStore.dumpTenantBundle` (`src/kv/kvstore.zig:831`) → `kvexp.dumpTenantBundle`
+(`manifest.zig:3003`): `durabilize(0)`, `openSnapshot`, then write **every pair
+into one `ArrayList(u8)`** → `toOwnedSlice`. That single buffer is:
+1. returned by `v2-snapshot` as **one HTTP response body** (no chunking/backpressure),
+2. loaded on the dest by `loadTenantBundleReplace/Merge` (`loadBundleImpl`) in
+   **one atomic kvexp txn**.
+
+At multi-GB this fails on all three: a multi-GB RAM allocation on source AND dest
+simultaneously, a single unbounded HTTP body (OOM / timeout), the source's read
+txn pinning LMDB pages for the whole transfer (env growth), and a giant single
+write txn on the dest. The catch-up driver (`src/js/snapshot_catchup.zig`) inherits
+all of it (plus the `durabilize(0)`-contends-with-the-write-loop issue noted in
+Phase 1's known limitations).
+
+### Primitives already in hand (this is assembly, not invention)
+
+- **Resumable consistent-snapshot cursor:** `snap.scanPrefix(store_id, "")` →
+  `SnapshotPrefixCursor` (`manifest.zig:2771`) with `next()`/`key()`/`value()`,
+  backed by `lmdb.Cursor.seekGe`/`first`/`next` (`lmdb.zig:248`). A single
+  `openSnapshot` held across the whole stream gives one consistent read view;
+  `seekGe(last_key)` resumes after any boundary.
+- **Wire format is already a forward-only pair stream:** `[magic][version]
+  [store_id][n_pairs]` then per-pair `[klen u16][vlen u32][key][val]`. Chunking is
+  just "stop after K bytes, resume the cursor" — no format change needed (the
+  `n_pairs` count-pass is the one piece to drop or move to a trailer, since a
+  streaming source shouldn't pre-scan the whole store).
+- **Streaming HTTP + backpressure:** the front-door streaming proxy
+  (`src/front/proxy.zig`, h2c with e2e backpressure) already proves the machinery;
+  the worker is h2c. A chunked response body's h2 stream flow-control IS the
+  backpressure — the source writes only as fast as the dest reads.
+- **Prior art:** the legacy paged snapshot transfer (`raft_snapshot.zig` +
+  `KvStore.collectPrefix`, `kvstore.zig:659`) already did cursor+count paging
+  before the single-shot `dumpTenantBundle` replaced it — a reference for the
+  paging shape.
+
+### Design
+
+- **Source — stream under one snapshot.** Open `v2-snapshot` (or a new
+  `v2-snapshot-stream`) as a **streaming response**: `openSnapshot` once, then a
+  `scanPrefix` cursor, emitting the existing pair format in **bounded chunks**
+  (e.g. ~4 MB) as h2 DATA frames. Drop the O(N) `n_pairs` pre-count (or emit it as
+  a trailer). Memory is bounded by the chunk size, not the store size. The read
+  view is consistent for the whole stream.
+- **Wire — chunked body, flow-controlled.** No new framing; the pair stream is
+  self-delimiting. h2 stream flow control provides e2e backpressure for free.
+  Optional: a resumable transfer (the receiver reports `last_key`, a reconnect
+  `seekGe(last_key)`s) so a dropped connection mid-multi-GB doesn't restart — a
+  nice-to-have, deferred.
+- **Dest — incremental bounded-txn apply.** Read the stream, applying each chunk
+  in its **own bounded kvexp txn** rather than one giant txn. Replace semantics
+  (catch-up): clear the store in one txn, then stream-insert in bounded txns; a
+  crash mid-stream is safe because the group's apply watermark is NOT advanced
+  until the WHOLE load completes and `apply_local_snapshot {index,term}` installs
+  the baseline — a half-loaded store is never authoritative, and a retry re-clears
+  (idempotent). Merge semantics (move): each chunk inserts-if-absent, naturally
+  incremental.
+- **Both callers switch.** `snapshot_catchup.zig` and the move
+  (`v2-snapshot`/`v2-load-*`) consume the streaming path; the single-shot
+  `dumpTenantBundle` stays only for small in-process uses (or is retired).
+
+### Consistency + the baseline
+
+The baseline `{index, term}` must be the snapshot's read point: read the durable
+apply watermark **in the same `openSnapshot` txn** as the cursor, so `{pairs,
+apply_index}` are mutually consistent (the design's existing invariant — Phase 1).
+The committed tail above the baseline flows via normal replication / the move
+forward-stream, so the streamed snapshot may even be slightly stale without harm
+(the tail / insert-if-absent reconciles it).
+
+### Residual costs + open questions
+
+- **Read-txn page pinning at GB scale.** One LMDB read txn held across a multi-GB
+  transfer pins the pages it reads → the env can grow by the write volume during
+  the transfer. Bounded by transfer time (fast LAN); for a high-write multi-GB
+  tenant the alternative is materialize-to-local-temp first (copy out, then stream
+  off the copy) — decide with a measurement.
+- **Chunk size** tuning (latency vs syscall/txn overhead) — start ~4 MB, measure.
+- **Resumable transfer** across a dropped connection — deferred unless multi-GB
+  transfers prove flaky.
+- **Effort:** a real piece of work (new streaming endpoint + receiver loop +
+  bounded-txn apply + the snapshot/move callers), not a tweak. Gate on a smoke
+  that moves/catches-up a synthetically-large (multi-GB) tenant with bounded RSS
+  on both ends.
+
 ## Phase 3 — evaluate move-via-conf-change
 
 Open question, decided after P1/P2. Can a cross-cluster move be
@@ -260,9 +354,13 @@ This is the consensus engine. Every phase:
 
 ## Sequencing
 
-1. **Phase 1** (follower-sourced snapshots) — keystone; unblocks the rest.
+1. **Phase 1** (follower-sourced snapshots) — keystone; unblocks the rest. ✅ landed
+   (step 2b, `d09744a`), with the trigger CORRECTION (`matched+1<first_index`).
 2. **Phase 2** (membership SSOT) — unlocked by P1's ConfState-carrying snapshots.
-3. **Phase 3** (move-via-conf-change) — evaluate; may or may not land.
+3. **Phase 2.5** (chunked-streaming snapshot transfer) — makes the snapshot/move
+   primitive scale to multi-GB tenants; prerequisite for large-tenant moves, so it
+   precedes Phase 3.
+4. **Phase 3** (move-via-conf-change) — evaluate; may or may not land.
 
 Then: redeploy, and the `__admin__` 3-voter re-add (and any future under-load
 backfill) is a non-event — a laggard just gets a snapshot.
