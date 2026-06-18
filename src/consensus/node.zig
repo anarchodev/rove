@@ -342,14 +342,6 @@ pub const TenantSlot = struct {
     /// `applied_idx > durabilized_idx` ⇒ this group has committed-but-not-yet-
     /// durable writes (it is "dirty"). Single-node compacts the WAL up to here.
     durabilized_idx: u64 = 0,
-    /// VESTIGIAL under mechanism-A compaction — always 0. Formerly the leader's
-    /// propagated cluster-wide min-match floor that a FOLLOWER compacted to in
-    /// lockstep (the snapshot-free workaround). Mechanism A compacts each node
-    /// independently to a fixed buffer below its own watermark and snapshots a
-    /// laggard out-of-band, so no floor is propagated (the leader stamps `maxInt`)
-    /// and `applyRecvFloor` never fires. Kept until a transport wire-shrink
-    /// removes the floor field + `applyRecvFloor` + this together.
-    propagated_floor: u64 = 0,
     /// Whether this slot is in `Node.dirty` (committed since last durabilize),
     /// so `applyEntry` enqueues it at most once.
     in_dirty: bool = false,
@@ -1392,20 +1384,16 @@ pub const Node = struct {
             // dup-tolerant and re-notifies if work landed mid-round).
             // Single-node: queued to a transport-less sink (a no-op).
             // Multi-node: buffered per destination node, stamped with the
-            // group's migration epoch, for the coalesced flush below.
-            // `.floor = maxInt` ⇒ "no compaction floor" on the wire. Under
-            // mechanism-A compaction each node compacts independently to a fixed
-            // buffer below its own durable watermark (no cross-node min-match
-            // floor), so the leader no longer propagates one. The 8-byte wire
-            // field stays (a receiver reads maxInt and skips it — `onRecv`); it
-            // is vestigial, slated for removal with a transport wire-shrink.
+            // group's migration epoch, for the coalesced flush below. (No
+            // cross-node compaction floor is sent — mechanism-A compaction is
+            // per-node; the floor wire field was removed in Phase 2f.)
             for (ready) |g| {
-                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g), .floor = std.math.maxInt(u64) };
+                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g) };
                 self.mgr.takeMessages(g, sendMsgCb, &sctx) catch {};
                 self.mgr.release(g);
             }
             for (ready2) |g| {
-                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g), .floor = std.math.maxInt(u64) };
+                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g) };
                 self.mgr.takeMessages(g, sendMsgCb, &sctx) catch {};
                 self.mgr.release(g);
             }
@@ -1439,9 +1427,6 @@ pub const Node = struct {
             self.woke_scratch.clearRetainingCapacity();
             t.drainWoke(&self.woke_scratch, self.allocator) catch {};
             for (self.woke_scratch.items) |gid| self.bumpActive(gid) catch {};
-            // Record each group's leader-propagated compaction floor so a
-            // follower truncates its WAL in lockstep (snapshot-free bound).
-            t.drainFloors(self, Node.applyRecvFloor);
         }
 
         // Hibernate: stop ticking any group idle past its deadline.
@@ -1861,10 +1846,6 @@ pub const Node = struct {
         node: *Node,
         group_id: u64,
         epoch: u64,
-        /// The leader's WAL-compaction floor (cluster-wide min match) stamped
-        /// on every outbound message so followers compact in lockstep;
-        /// `maxInt` when this node is not the group's leader (no floor to send).
-        floor: u64,
     };
 
     /// `takeMessages` callback: buffer one outbound raft message into the
@@ -1879,20 +1860,9 @@ pub const Node = struct {
         const ctx: *SendCtx = @ptrCast(@alignCast(ud.?));
         const t = ctx.node.transport orelse return;
         const bytes = if (msg_len == 0) &[_]u8{} else msg_bytes[0..msg_len];
-        t.queueOut(to, ctx.group_id, ctx.epoch, ctx.floor, bytes);
+        t.queueOut(to, ctx.group_id, ctx.epoch, bytes);
     }
 
-    /// Transport `drainFloors` callback — INERT under mechanism-A compaction.
-    /// The leader now stamps `maxInt` (no floor) on every outbound message, so
-    /// `onRecv` never records a floor and `recv_floors` stays empty: this is a
-    /// no-op every cycle. Kept (with the `drainFloors` drain that feeds it) only
-    /// so the transport's floor wire-field has a reader until a dedicated
-    /// wire-shrink removes the field, `propagated_floor`, and this callback
-    /// together. Pump-thread only.
-    fn applyRecvFloor(self: *Node, gid: u64, floor: u64) void {
-        const slot = self.groups.get(gid) orelse return;
-        if (floor > slot.propagated_floor) slot.propagated_floor = floor;
-    }
 };
 
 /// Narrow a raft-rs error to the node's `Error` set (they overlap, but
