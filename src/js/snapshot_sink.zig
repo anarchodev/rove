@@ -23,6 +23,17 @@
 const std = @import("std");
 const kv = @import("raft-kv");
 
+/// What the dest does once the body completes.
+pub const Mode = enum {
+    /// Catch-up / promote-back: clear + `applyLocalSnapshot {index,term}` into
+    /// an EXISTING group (the source was the group's leader).
+    replace,
+    /// Zero-downtime move: insert-if-absent into an already-attached group that
+    /// is already taking live forwards — NO baseline install (the forward delta
+    /// rides raft), and the inherited forward marker is dropped on finish.
+    merge,
+};
+
 /// Heap, refcounted streaming-transfer state. Its address is the `h2.BodySink`
 /// ctx, so it must NOT live in a rove column (those relocate on flush).
 pub const Box = struct {
@@ -32,9 +43,13 @@ pub const Box = struct {
     refs: u32 = 2,
 
     loader: kv.StreamLoader,
-    /// Raft group + data-free baseline to install once the body completes
+    mode: Mode,
+    /// Owned tenant id — the finalize resolves the instance by it (merge marker
+    /// delete; also handy for logging). Freed in `unref`.
+    tenant: []u8,
+    /// Raft group + data-free baseline to install on a `.replace` finish
     /// (carried in request headers — collapses the old two-call v2-load-replace
-    /// + v2-apply-snapshot into one streamed call).
+    /// + v2-apply-snapshot into one streamed call). Unused for `.merge`.
     gid: u64,
     index: u64,
     term: u64,
@@ -52,12 +67,24 @@ pub const Box = struct {
     pub fn create(
         allocator: std.mem.Allocator,
         loader: kv.StreamLoader,
+        mode: Mode,
+        tenant: []const u8,
         gid: u64,
         index: u64,
         term: u64,
     ) error{OutOfMemory}!*Box {
+        const t = try allocator.dupe(u8, tenant);
+        errdefer allocator.free(t);
         const self = try allocator.create(Box);
-        self.* = .{ .allocator = allocator, .loader = loader, .gid = gid, .index = index, .term = term };
+        self.* = .{
+            .allocator = allocator,
+            .loader = loader,
+            .mode = mode,
+            .tenant = t,
+            .gid = gid,
+            .index = index,
+            .term = term,
+        };
         return self;
     }
 
@@ -65,21 +92,23 @@ pub const Box = struct {
         self.refs -= 1;
         if (self.refs > 0) return;
         self.loader.deinit();
+        self.allocator.free(self.tenant);
         self.allocator.destroy(self);
     }
 
-    /// Finalize the apply: validate the stream ended cleanly + flush the loaded
-    /// pairs to disk BEFORE the caller advances the raft index. Returns the
-    /// store id the stream named.
-    pub fn commit(self: *Box) kv.snapshot_stream.Error!u64 {
-        const store_id = try self.loader.finish();
-        // Data must be durable before the raft baseline advances the applied
-        // index — a crash in the window then recovers a store ≤ index on disk.
-        // durabilize(0): fold overlay → LMDB without disturbing the watermark
-        // (the snapshot's compaction marker carries the applied index, exactly
-        // as the buffered v2-load-replace + v2-apply-snapshot path relies on).
+    /// Validate the stream ended cleanly; returns the store id. (Each feed
+    /// already committed its batch; this just checks the clean-end boundary.)
+    pub fn finish(self: *Box) kv.snapshot_stream.Error!u64 {
+        return self.loader.finish();
+    }
+
+    /// Fold the loaded pairs overlay → LMDB. Must run BEFORE a `.replace`
+    /// advances the raft index (a crash in the window then recovers a store ≤
+    /// index on disk); for `.merge` it just durabilizes the inserted data.
+    /// `durabilize(0)` leaves the watermark untouched — the snapshot/forward
+    /// path carries the applied index, not the store watermark.
+    pub fn durabilize(self: *Box) kv.snapshot_stream.Error!void {
         self.loader.manifest.durabilize(0) catch return kv.snapshot_stream.Error.Kvexp;
-        return store_id;
     }
 
     // ── h2.BodySink callbacks (run on the worker thread == h2 poll thread) ──

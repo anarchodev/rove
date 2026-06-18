@@ -55,6 +55,10 @@ const TENANT_HEADER = "x-rewind-tenant";
 // the pure pair stream — collapses v2-load-replace + v2-apply-snapshot into one).
 const SNAP_INDEX_HEADER = "x-rewind-snapshot-index";
 const SNAP_TERM_HEADER = "x-rewind-snapshot-term";
+// "replace" (default, catch-up/promote-back) | "merge" (zero-downtime move).
+const SNAP_MODE_HEADER = "x-rewind-snapshot-mode";
+// v2-snapshot-push: the dest node base URL the source streams to.
+const DEST_HEADER = "x-rewind-dest";
 const snapshot_sink_mod = @import("snapshot_sink.zig");
 
 /// Constant-time byte-slice equality for secret comparison: the
@@ -157,6 +161,8 @@ pub fn tryHandleV2(
         try handleForwardEnd(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-snapshot")) {
         try handleSnapshot(server, allocator, worker, ent, sid, sess, method, body);
+    } else if (std.mem.eql(u8, sys_rest, "v2-snapshot-push")) {
+        try armSnapshotPush(server, allocator, worker, ent, sid, sess, method, rh);
     } else if (std.mem.eql(u8, sys_rest, "v2-load-merge")) {
         try handleLoadMerge(server, allocator, worker, ent, sid, sess, method, rh, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-plan")) {
@@ -1405,31 +1411,52 @@ pub fn armSnapshotStream(
         return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
     const tenant = respb.findHeader(rh, TENANT_HEADER) orelse
         return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Tenant\n");
-    const idx_s = respb.findHeader(rh, SNAP_INDEX_HEADER) orelse
-        return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Snapshot-Index\n");
-    const term_s = respb.findHeader(rh, SNAP_TERM_HEADER) orelse
-        return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Snapshot-Term\n");
-    const index = std.fmt.parseInt(u64, idx_s, 10) catch
-        return reply(server, allocator, ent, sid, sess, 400, "bad snapshot index\n");
-    const term = std.fmt.parseInt(u64, term_s, 10) catch
-        return reply(server, allocator, ent, sid, sess, 400, "bad snapshot term\n");
-    // A data-free baseline must be a real {index>0, term>0} (mirrors
-    // handleApplySnapshot — index 0 is a no-op, term 0 crashes raft's restore).
-    if (index == 0 or term == 0)
-        return reply(server, allocator, ent, sid, sess, 400, "index and term must be nonzero\n");
-
-    const gid = worker.raft.gidForTenant(tenant) orelse
-        return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
-    if (worker.raft.isLeaderOf(gid))
-        return reply(server, allocator, ent, sid, sess, 409, "leader can't restore a snapshot to itself\n");
+    const mode: snapshot_sink_mod.Mode =
+        if (respb.findHeader(rh, SNAP_MODE_HEADER)) |m|
+            (if (std.mem.eql(u8, std.mem.trim(u8, m, " "), "merge")) .merge else .replace)
+        else
+            .replace;
     const inst = ensureInstance(worker, tenant) catch
         return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
 
-    var loader = kv_mod.StreamLoader.init(allocator, inst.kv.manifest, .{ .clear_existing = true }) catch
+    var gid: u64 = 0;
+    var index: u64 = 0;
+    var term: u64 = 0;
+    var loader_opts: kv_mod.StreamLoaderOptions = undefined;
+    switch (mode) {
+        .merge => {
+            // Zero-downtime move: insert-if-absent into the already-attached,
+            // already-forwarded group. No baseline, no leadership check — like
+            // v2-load-merge, it applies out-of-band on EVERY destination node.
+            loader_opts = .{ .clear_existing = false, .skip_existing = true };
+        },
+        .replace => {
+            // Catch-up / promote-back: a data-free baseline must be a real
+            // {index>0, term>0} (index 0 is a no-op, term 0 crashes restore),
+            // and a leader can't restore a snapshot to itself.
+            const idx_s = respb.findHeader(rh, SNAP_INDEX_HEADER) orelse
+                return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Snapshot-Index\n");
+            const term_s = respb.findHeader(rh, SNAP_TERM_HEADER) orelse
+                return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Snapshot-Term\n");
+            index = std.fmt.parseInt(u64, idx_s, 10) catch
+                return reply(server, allocator, ent, sid, sess, 400, "bad snapshot index\n");
+            term = std.fmt.parseInt(u64, term_s, 10) catch
+                return reply(server, allocator, ent, sid, sess, 400, "bad snapshot term\n");
+            if (index == 0 or term == 0)
+                return reply(server, allocator, ent, sid, sess, 400, "index and term must be nonzero\n");
+            gid = worker.raft.gidForTenant(tenant) orelse
+                return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
+            if (worker.raft.isLeaderOf(gid))
+                return reply(server, allocator, ent, sid, sess, 409, "leader can't restore a snapshot to itself\n");
+            loader_opts = .{ .clear_existing = true };
+        },
+    }
+
+    var loader = kv_mod.StreamLoader.init(allocator, inst.kv.manifest, loader_opts) catch
         return reply(server, allocator, ent, sid, sess, 500, "loader init failed\n");
     // Box.create COPIES `loader` into the heap box (which then owns its
     // key/val buffers); on success the local must NOT be deinit'd.
-    const box = snapshot_sink_mod.Box.create(allocator, loader, gid, index, term) catch {
+    const box = snapshot_sink_mod.Box.create(allocator, loader, mode, tenant, gid, index, term) catch {
         loader.deinit();
         return reply(server, allocator, ent, sid, sess, 500, "snapshot box alloc failed\n");
     };
@@ -1440,11 +1467,12 @@ pub fn armSnapshotStream(
 }
 
 /// raft Phase 2.5 dest tick: finalize streamed-snapshot transfers parked in
-/// `snapshot_streams`. END_STREAM → finish + durabilize + install the data-free
-/// raft baseline → 204; a parse/apply failure → 500; a benign already-ahead /
-/// leader race → 409; a client reset → destroy (no response possible). The
-/// entity moves to `response_in` (h2 sends the reply) or is destroyed; either
-/// way its `SnapshotStream` component releases the box.
+/// `snapshot_streams`. END_STREAM → finish + durabilize, then by mode: `.replace`
+/// installs the data-free raft baseline (catch-up); `.merge` drops the inherited
+/// forward marker (zero-downtime move, no raft op) → 204. A parse/apply failure
+/// → 500; a benign already-ahead/leader race → 409; a client reset → destroy (no
+/// response possible). The entity moves to `response_in` (h2 sends the reply) or
+/// is destroyed; either way its `SnapshotStream` component releases the box.
 pub fn drainSnapshotStreams(worker: anytype) !void {
     const server = worker.h2;
     const coll = &worker.snapshot_streams;
@@ -1464,27 +1492,126 @@ pub fn drainSnapshotStreams(worker: anytype) !void {
         var status: u16 = 204;
         if (box.failed) {
             status = 500;
-        } else if (box.commit()) |_| {
-            worker.raft.applyLocalSnapshot(box.gid, box.index, box.term, null, null) catch |e| switch (e) {
-                // Already advanced past `index` via replication during the
-                // stream, or now leads — benign (driver treats 409 as success).
-                error.SnapshotStale, error.NotLeader, error.SelfNotInConfState => status = 409,
-                else => status = 500,
-            };
+        } else if (box.finish()) |_| {
+            switch (box.mode) {
+                .replace => {
+                    if (box.durabilize()) |_| {
+                        // Data durable → advance the raft baseline.
+                        worker.raft.applyLocalSnapshot(box.gid, box.index, box.term, null, null) catch |e| switch (e) {
+                            // Already advanced past `index` via replication during
+                            // the stream, or now leads — benign (driver treats 409
+                            // as success).
+                            error.SnapshotStale, error.NotLeader, error.SelfNotInConfState => status = 409,
+                            else => status = 500,
+                        };
+                    } else |_| status = 500;
+                },
+                .merge => {
+                    // Drop the source's inherited forward marker (the snapshot
+                    // carried it insert-if-absent), THEN durabilize. No raft op —
+                    // the forward delta already rides the dest group's log.
+                    if (worker.node.tenant.getInstance(box.tenant) catch null) |inst| {
+                        inst.kv.delete(FORWARD_MARKER) catch |e| switch (e) {
+                            error.NotFound => {},
+                            else => std.log.warn("v2-snapshot-stream merge: clearing {s} failed: {s}", .{ FORWARD_MARKER, @errorName(e) }),
+                        };
+                    }
+                    if (box.durabilize()) |_| {} else |_| status = 500;
+                },
+            }
         } else |_| {
             status = 500;
         }
 
-        // Detach the component's box ref now (the sink keeps its own ref until
-        // h2 reaps the stream) so the value carried to `response_in` is inert.
+        // Stage the response + queue the move FIRST (fail-loud: a set/move on a
+        // live in-collection entity only fails on OOM, which propagates). Detach
+        // the box ref LAST, so a failure here leaves the box attached + the
+        // entity parked → retried next tick, never orphaned with a null box.
+        try server.reg.set(ent, coll, h2.Status, .{ .code = status });
+        try server.reg.set(ent, coll, h2.RespHeaders, .{ .fields = null, .count = 0 });
+        try server.reg.set(ent, coll, h2.RespBody, .{ .data = null, .len = 0 });
+        try server.reg.set(ent, coll, h2.H2IoResult, .{ .err = 0 });
+        try server.reg.move(ent, coll, &server.response_in);
+        // The sink keeps its own ref until h2 reaps the stream; the value carried
+        // into `response_in` is now inert.
         box.unref();
         ss.box = null;
+    }
+}
 
-        server.reg.set(ent, coll, h2.Status, .{ .code = status }) catch {};
-        server.reg.set(ent, coll, h2.RespHeaders, .{ .fields = null, .count = 0 }) catch {};
-        server.reg.set(ent, coll, h2.RespBody, .{ .data = null, .len = 0 }) catch {};
-        server.reg.set(ent, coll, h2.H2IoResult, .{ .err = 0 }) catch {};
-        try server.reg.move(ent, coll, &server.response_in);
+/// raft Phase 2.5 SOURCE side of a streamed move: `POST /_system/v2-snapshot-push`
+/// (CP-triggered). Park the request + enqueue an off-loop job that streams this
+/// tenant's held snapshot directly to `X-Rewind-Dest` (a dest node base URL) in
+/// the given mode (default `merge` — the zero-downtime move). The 204/5xx is sent
+/// by `drainSnapshotPushes` once the dest finishes — deferred, since a multi-GB
+/// stream must not block the worker loop. Leader-gated like `v2-snapshot` (only
+/// the source leader's store is authoritative at the move point).
+pub fn armSnapshotPush(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    rh: h2.ReqHeaders,
+) !void {
+    const secret = worker.move_secret orelse
+        return reply(server, allocator, ent, sid, sess, 404, "move surface disabled\n");
+    const presented = respb.findHeader(rh, MOVE_SECRET_HEADER) orelse "";
+    if (!constantTimeEql(presented, secret))
+        return reply(server, allocator, ent, sid, sess, 401, "bad move secret\n");
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+    const tenant = respb.findHeader(rh, TENANT_HEADER) orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Tenant\n");
+    const dest = respb.findHeader(rh, DEST_HEADER) orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Dest\n");
+    const mode: snapshot_sink_mod.Mode =
+        if (respb.findHeader(rh, SNAP_MODE_HEADER)) |m|
+            (if (std.mem.eql(u8, std.mem.trim(u8, m, " "), "replace")) .replace else .merge)
+        else
+            .merge;
+
+    const gid = worker.raft.gidForTenant(tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 409, "tenant not active on this cluster\n");
+    if (!worker.raft.isLeaderOf(gid))
+        return reply(server, allocator, ent, sid, sess, 421, "not the leader for this tenant; try another node\n");
+
+    const driver = worker.snapshot_push_driver orelse
+        return reply(server, allocator, ent, sid, sess, 503, "snapshot push driver not wired\n");
+
+    // Park FIRST (deferred move — walk-safe), then enqueue. The job streams
+    // off-loop; `drainSnapshotPushes` matches the completion back to this entity.
+    try server.reg.move(ent, &server.request_out, &worker.snapshot_pushes);
+    driver.enqueuePush(ent, tenant, dest, mode) catch
+        return reply(server, allocator, ent, sid, sess, 500, "enqueue failed\n");
+    // No reply — deferred to drainSnapshotPushes on completion.
+}
+
+/// raft Phase 2.5 SOURCE tick: respond to parked `v2-snapshot-push` requests as
+/// the off-loop driver finishes them. Each completion carries the parked
+/// `Entity` + the dest's HTTP status (0 = local/transport failure → 502).
+pub fn drainSnapshotPushes(worker: anytype, driver: anytype) !void {
+    const server = worker.h2;
+    var completions: std.ArrayListUnmanaged(@TypeOf(driver.*).PushCompletion) = .empty;
+    defer completions.deinit(worker.allocator);
+    try driver.drainPushCompletions(&completions);
+    for (completions.items) |c| {
+        if (server.reg.isStale(c.entity)) continue; // CP gave up / connection gone
+        if (!server.reg.isInCollection(c.entity, &worker.snapshot_pushes)) {
+            // The park move hasn't flushed yet (a completion that beat the same
+            // tick's flush — vanishingly rare given network RTT ≫ flush). Re-post
+            // so we match it next tick rather than drop the reply.
+            driver.postCompletion(c.entity, c.status);
+            continue;
+        }
+        const status: u16 = if (c.status == 0) 502 else c.status;
+        try server.reg.set(c.entity, &worker.snapshot_pushes, h2.Status, .{ .code = status });
+        try server.reg.set(c.entity, &worker.snapshot_pushes, h2.RespHeaders, .{ .fields = null, .count = 0 });
+        try server.reg.set(c.entity, &worker.snapshot_pushes, h2.RespBody, .{ .data = null, .len = 0 });
+        try server.reg.set(c.entity, &worker.snapshot_pushes, h2.H2IoResult, .{ .err = 0 });
+        try server.reg.move(c.entity, &worker.snapshot_pushes, &server.response_in);
     }
 }
 

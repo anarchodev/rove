@@ -1295,17 +1295,11 @@ const Router = struct {
             return;
         }
 
-        // 4. Snapshot the source leader (non-quiescing; it keeps serving).
-        var snap = self.snapshotFromLeader(src_nodes, tbody) orelse {
-            self.forwardEndOnLeader(src_nodes, tenant);
-            self.evictAll(tenant, dest_nodes, tbody);
-            try replyStatus(server, ent, sid, sess, 502);
-            return;
-        };
-        defer snap.deinit(a);
-
-        // 5. Load-merge the snapshot into every dest node (insert-if-absent).
-        if (!self.loadMergeToAll(dest_nodes, snap.body, tenant)) {
+        // 4+5. Stream the source leader's non-quiescing snapshot directly to
+        //      every dest node in merge mode (insert-if-absent). The source
+        //      pushes peer→peer; the CP no longer buffers the bundle, so a
+        //      multi-GB tenant moves with bounded memory on all three parties.
+        if (!self.streamMergeToAll(src_nodes, dest_nodes, tenant)) {
             self.forwardEndOnLeader(src_nodes, tenant);
             self.evictAll(tenant, dest_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
@@ -1396,32 +1390,47 @@ const Router = struct {
         }
     }
 
-    /// Dump the source LEADER's NON-quiescing snapshot (try each source node's
-    /// leader-gated `/_system/v2-snapshot` until one 200s). Owned body.
-    fn snapshotFromLeader(self: *Router, src_nodes: []const []const u8, tbody: []const u8) ?BackendResp {
-        const a = self.allocator;
-        for (src_nodes) |base| {
-            const resp = self.backendCall(base, "/_system/v2-snapshot", .POST, tbody, &.{}) catch continue;
-            if (resp.status == 200) return resp;
-            var r = resp;
-            r.deinit(a);
+    /// raft Phase 2.5: STREAM the source leader's non-quiescing snapshot directly
+    /// to every destination node in merge mode (insert-if-absent) — the source
+    /// pushes peer→peer, so the CP never buffers a (multi-GB) bundle. Replaces the
+    /// retired buffered `v2-snapshot` (dump→CP) + `v2-load-merge` (CP→dest) fan.
+    fn streamMergeToAll(self: *Router, src_nodes: []const []const u8, dest_nodes: []const []const u8, tenant: []const u8) bool {
+        for (dest_nodes) |dest| {
+            if (!self.snapshotPushToLeader(src_nodes, tenant, dest)) return false;
         }
-        return null;
+        return true;
     }
 
-    /// Load-merge a snapshot (insert-if-absent) into every destination node.
-    fn loadMergeToAll(self: *Router, dest_nodes: []const []const u8, bundle: []const u8, tenant: []const u8) bool {
+    /// Try each source node's leader-gated `/_system/v2-snapshot-push` until one
+    /// accepts (the leader streams its held snapshot to `dest` in merge mode and
+    /// only then responds). Blocks for the whole transfer — generous timeout; the
+    /// source's own page-pinning deadline aborts first if the tenant is too big.
+    fn snapshotPushToLeader(self: *Router, src_nodes: []const []const u8, tenant: []const u8, dest: []const u8) bool {
         const a = self.allocator;
-        for (dest_nodes) |base| {
-            const resp = self.backendCall(base, "/_system/v2-load-merge", .POST, bundle, &.{.{ .name = TENANT_HEADER, .value = tenant }}) catch |err| {
-                std.log.warn("rewind-cp: v2-load-merge on {s} failed: {s}", .{ base, @errorName(err) });
-                return false;
+        const hdrs = [_]curl.Header{
+            .{ .name = TENANT_HEADER, .value = tenant },
+            .{ .name = "x-rewind-dest", .value = dest },
+            .{ .name = "x-rewind-snapshot-mode", .value = "merge" },
+        };
+        for (src_nodes) |base| {
+            const resp = self.backendCallTimeout(base, "/_system/v2-snapshot-push", .POST, "", &hdrs, 40 * 60 * 1000) catch |err| {
+                std.log.warn("rewind-cp: v2-snapshot-push on {s} → {s}", .{ base, @errorName(err) });
+                continue;
             };
             var r = resp;
             defer r.deinit(a);
-            if (r.status != 204) return false;
+            switch (r.status) {
+                // 204 = streamed + merged; 409 = dest already had it (benign).
+                204, 409 => return true,
+                // 421 = this source node isn't the leader; try the next.
+                421 => continue,
+                else => {
+                    std.log.warn("rewind-cp: v2-snapshot-push on {s} → {d}", .{ base, r.status });
+                    return false;
+                },
+            }
         }
-        return true;
+        return false;
     }
 
     /// Blocking libcurl call to a backend's move surface, presenting the
@@ -1701,6 +1710,23 @@ const Router = struct {
         body: []const u8,
         extra_headers: []const curl.Header,
     ) !BackendResp {
+        return self.backendCallTimeout(base_url, path_suffix, method, body, extra_headers, 15_000);
+    }
+
+    /// `backendCall` with an explicit total-transfer deadline. A streamed move
+    /// push (`v2-snapshot-push`) holds the CP↔source call open for the WHOLE
+    /// transfer (the source parks until its off-loop push lands), so it needs a
+    /// generous timeout — the source's own `REWIND_SNAPSHOT_XFER_MAX_MS` deadline
+    /// aborts + responds first; this is the wedged-source backstop.
+    fn backendCallTimeout(
+        self: *Router,
+        base_url: []const u8,
+        path_suffix: []const u8,
+        method: curl.Method,
+        body: []const u8,
+        extra_headers: []const curl.Header,
+        timeout_ms: u32,
+    ) !BackendResp {
         const a = self.allocator;
         const url = try std.fmt.allocPrint(a, "{s}{s}", .{ base_url, path_suffix });
         defer a.free(url);
@@ -1719,6 +1745,7 @@ const Router = struct {
             .body = body,
             .http_version = .h2c_prior_knowledge,
             .verify_tls = false,
+            .timeout_ms = timeout_ms,
         });
         defer resp.deinit(a);
 

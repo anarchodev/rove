@@ -64,6 +64,7 @@ const blob_sessions_mod = @import("blob_sessions.zig");
 const blob_receive_mod = @import("blob_receive.zig");
 const inbound_chunk_mod = @import("worker_inbound_chunk.zig");
 const snapshot_sink_mod = @import("snapshot_sink.zig");
+const snapshot_catchup_mod = @import("snapshot_catchup.zig");
 const files_mod = @import("rove-files");
 const log_mod = @import("rove-log");
 const log_server_mod = @import("rove-log-server");
@@ -1416,6 +1417,17 @@ pub fn Worker(comptime opts: Options) type {
         /// entity here; `drainSnapshotStreams` finalizes (install baseline →
         /// `response_in`) or destroys it. Same StreamRow as every h2 collection.
         snapshot_streams: StreamColl,
+        /// raft Phase 2.5 SOURCE side of a streamed move: CP-trigger entities
+        /// (`POST /_system/v2-snapshot-push`) parked while the off-loop driver
+        /// streams the held snapshot to a dest. Membership IS "push in flight";
+        /// `drainSnapshotPushes` responds + moves to `response_in` on completion.
+        /// Same StreamRow as every h2 collection. No per-entity component — the
+        /// push job state lives in the driver's `Job` (transport state, off-rove).
+        snapshot_pushes: StreamColl,
+        /// The off-loop streaming driver, shared with snapshot catch-up. Set by
+        /// the run loop (main.zig) after both exist; `armSnapshotPush` enqueues
+        /// move-push jobs here. Null until wired (push surface inert).
+        snapshot_push_driver: ?*snapshot_catchup_mod.SnapshotCatchupThread = null,
         /// Streaming-handlers Phase 2b-ii: per-entity DATA side-store
         /// for active `__rove_stream(...)` chains. The entity lives
         /// in the h2 module's `stream_data_out` collection (h2 owns
@@ -1825,6 +1837,7 @@ pub fn Worker(comptime opts: Options) type {
                 .forward_pending = try StreamColl.init(allocator),
                 .parked_continuations = try StreamColl.init(allocator),
                 .snapshot_streams = try StreamColl.init(allocator),
+                .snapshot_pushes = try StreamColl.init(allocator),
                 .parked_units = try ParkedUnitColl.init(allocator),
                 .blob_sessions = try BlobSessionColl.init(allocator),
                 .msg_inbox = effect_mod.MsgInbox.init(allocator),
@@ -1878,6 +1891,7 @@ pub fn Worker(comptime opts: Options) type {
             errdefer self.forward_pending.deinit();
             errdefer self.parked_continuations.deinit();
             errdefer self.snapshot_streams.deinit();
+            errdefer self.snapshot_pushes.deinit();
             errdefer self.parked_units.deinit();
             errdefer self.blob_sessions.deinit();
             errdefer self.tenant_logs.clearAllEntries(allocator);
@@ -1890,6 +1904,7 @@ pub fn Worker(comptime opts: Options) type {
             reg.registerCollection(&self.forward_pending);
             reg.registerCollection(&self.parked_continuations);
             reg.registerCollection(&self.snapshot_streams);
+            reg.registerCollection(&self.snapshot_pushes);
             reg.registerCollection(&self.parked_units);
             reg.registerCollection(&self.blob_sessions);
 

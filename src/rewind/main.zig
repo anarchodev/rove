@@ -272,6 +272,9 @@ fn workerMain(args: *WorkerCtx) !void {
     defer catchup.deinit();
     try catchup.start();
     defer catchup.shutdown();
+    // raft Phase 2.5: the same off-loop driver also runs CP-triggered move
+    // pushes (`/_system/v2-snapshot-push` → `armSnapshotPush` enqueues here).
+    worker.snapshot_push_driver = catchup;
 
     std.log.info("rewind worker {d}: ready (SO_REUSEPORT)", .{args.worker_idx});
     args.ready.set();
@@ -297,8 +300,10 @@ fn workerMain(args: *WorkerCtx) !void {
         drainSnapshotCatchupJobs(worker, catchup);
         try rjs.drainForwardPending(worker);
         // raft Phase 2.5: finalize completed streamed-snapshot transfers
-        // (install the baseline + respond) parked in `snapshot_streams`.
+        // (install the baseline + respond) parked in `snapshot_streams`, and
+        // respond to parked CP-triggered move pushes as the driver finishes them.
         try rjs.drainSnapshotStreams(worker);
+        try rjs.drainSnapshotPushes(worker, catchup);
         rjs.drainSpools(worker);
         try rjs.sweepParkedContinuations(worker);
         // Gap 2.4 (docs/inbound-chunk-plan.md S2): fire the next staged

@@ -171,6 +171,12 @@ pub const LoaderOptions = struct {
     /// the catch-up / promote-back semantics. With false, pairs overwrite but
     /// destination-only keys survive (additive).
     clear_existing: bool = true,
+    /// MERGE (zero-downtime move): insert-if-absent — a key already present in
+    /// the destination (a NEWER value a live forward already wrote) is KEPT and
+    /// the stream's older value dropped. Mutually exclusive with `clear_existing`
+    /// (a cleared store has nothing to preserve); set `clear_existing = false`
+    /// alongside this.
+    skip_existing: bool = false,
     /// Commit the in-flight txn once it accumulates this many pairs …
     batch_max_pairs: usize = 4096,
     /// … or this many key+value bytes, whichever first. Bounds resident memory
@@ -366,7 +372,12 @@ pub const StreamLoader = struct {
 
     fn applyPair(self: *StreamLoader, k: []const u8, v: []const u8) Error!void {
         try self.ensureStoreReady();
-        self.txn.?.put(k, v) catch return Error.Kvexp;
+        if (self.opts.skip_existing) {
+            // MERGE: keep a destination-present (newer, forwarded) value.
+            _ = self.txn.?.putIfAbsent(k, v) catch return Error.Kvexp;
+        } else {
+            self.txn.?.put(k, v) catch return Error.Kvexp;
+        }
         self.total_pairs += 1;
         self.batch_pairs += 1;
         self.batch_bytes += k.len + v.len;
@@ -631,6 +642,47 @@ test "snapshot stream REPLACE clears destination-only stale keys" {
     const da = try scanPairs(a, dst.manifest, store_id);
     defer freePairs(a, da);
     try testing.expectEqual(@as(usize, 2), da.len);
+}
+
+test "snapshot stream MERGE keeps destination-present (forwarded) values" {
+    const a = testing.allocator;
+    const store_id: u64 = 0x77;
+
+    var src = try TestManifest.init();
+    defer src.deinit();
+    var dst = try TestManifest.init();
+    defer dst.deinit();
+
+    try writePairs(src.manifest, store_id, &.{
+        .{ .key = @constCast("alpha"), .val = @constCast("snap-old") },
+        .{ .key = @constCast("beta"), .val = @constCast("2") },
+        .{ .key = @constCast("gamma"), .val = @constCast("3") },
+    });
+    // Destination already holds a NEWER "alpha" (a live forward) the snapshot
+    // must not clobber, plus its own "delta".
+    try writePairs(dst.manifest, store_id, &.{
+        .{ .key = @constCast("alpha"), .val = @constCast("forwarded-new") },
+        .{ .key = @constCast("delta"), .val = @constCast("d") },
+    });
+
+    var prng = std.Random.DefaultPrng.init(99);
+    const wire = try dumpToWire(a, src.manifest, store_id, &prng);
+    defer a.free(wire);
+
+    var loader = try StreamLoader.init(a, dst.manifest, .{ .clear_existing = false, .skip_existing = true });
+    defer loader.deinit();
+    try loader.feed(wire);
+    _ = try loader.finish();
+
+    const got = try scanPairs(a, dst.manifest, store_id);
+    defer freePairs(a, got);
+    // alpha=forwarded-new (kept), beta/gamma added, delta survives → 4 keys.
+    try testing.expectEqual(@as(usize, 4), got.len);
+    for (got) |p| {
+        if (std.mem.eql(u8, p.key, "alpha")) try testing.expectEqualStrings("forwarded-new", p.val);
+        if (std.mem.eql(u8, p.key, "beta")) try testing.expectEqualStrings("2", p.val);
+        if (std.mem.eql(u8, p.key, "delta")) try testing.expectEqualStrings("d", p.val);
+    }
 }
 
 test "snapshot stream finish() rejects a truncated body" {

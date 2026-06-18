@@ -379,8 +379,8 @@ transfer. The catch-up driver inherited all of it (plus the
 
 ### As built
 
-The catch-up driver now streams; the move keeps the buffered endpoints (a later
-adopter when large-tenant moves need it).
+Both the catch-up driver AND the zero-downtime move now stream (the brief-pause
+move keeps the buffered `v2-bundle`/`v2-attach` — small tenants, paused anyway).
 
 - **Codec — `src/kv/snapshot_stream.zig` (pure Zig, round-trip tested).** Two
   halves over the existing pair framing, but with its OWN magic (`STREAM_MAGIC`,
@@ -417,6 +417,32 @@ adopter when large-tenant moves need it).
   `drainSnapshotStreams` finalizes: `StreamLoader.finish()` → `durabilize(0)` →
   `applyLocalSnapshot {index,term}` → 204.
 
+### Zero-downtime move — source push (CP-triggered)
+
+The move reuses the same primitives, source-pushing direct to each dest (the CP
+no longer buffers a bundle):
+
+- **Dest — `merge` mode.** `v2-snapshot-stream?mode=merge` (header) drives
+  `StreamLoader.skip_existing` (insert-if-absent — a live-forwarded newer key is
+  kept), with NO baseline install and NO leadership check (applies on every dest
+  node, like the retired `v2-load-merge`); on finish it drops the inherited
+  `_move/forward` marker + `durabilize`s. `Box.Mode` carries replace-vs-merge.
+- **Source — `POST /_system/v2-snapshot-push`.** CP-triggered, leader-gated. Parks
+  the request in a `snapshot_pushes` collection (membership = "push in flight"; no
+  per-entity component — the job params live in the off-loop driver's `Job`) and
+  enqueues a move-push on the shared `SnapshotCatchupThread` (it now serves both
+  internal catch-up and CP-triggered pushes). A multi-GB stream must not block the
+  worker loop, so the reply is **deferred**: the driver streams off-loop, posts
+  `{Entity, status}` to a mutex-guarded completion inbox (the `proxy_engine`
+  `ProxyResultInbox` seam — the one cross-thread channel; the thread never touches
+  rove state), and `drainSnapshotPushes` matches the Entity handle back to its
+  parked request → `response_in`.
+- **CP — `streamMergeToAll`.** Per dest node, trigger the source leader to stream
+  in merge mode (`snapshotPushToLeader`, generous timeout — the source's own
+  page-pinning deadline aborts first). Replaces `snapshotFromLeader` (dump→CP) +
+  `loadMergeToAll` (CP→dest); the CP never holds the bundle. The brief-pause move's
+  `v2-bundle`/`v2-attach` stay buffered (small, paused tenants).
+
 ### Consistency + the baseline
 
 Unchanged from Phase 1: the baseline is the leader's apply point; a half-loaded
@@ -437,10 +463,14 @@ materialize-to-temp alternative for pathologically-hot tenants stays open.)
 256 KiB values) streamed to a peer stranded past the compaction buffer, recovered
 to the leader's `last_index`, sampled big values read back byte-exact across
 multiple dest batches. `snapshot_trigger_smoke_v2` passes via the new path;
-`promote_back_smoke_v2` (the retained buffered path) un-regressed; unit 634/635.
+`zero_downtime_move_smoke.py` Leg 2 (`move-live`) now drives the streamed merge
+push end-to-end (source serves throughout, dest serves after the flip);
+`promote_back_smoke_v2` (the retained buffered path) un-regressed; unit 635/636.
 (~50 MiB is a proxy for multi-GB — true multi-GB is impractical in a quick smoke;
 the bounded-memory property is architectural + unit-tested. RSS sampling was
-dropped as mmap-confounded in favor of byte-exact-at-scale.)
+dropped as mmap-confounded in favor of byte-exact-at-scale.) Worker-side state is
+rove-native throughout (collections + components, Entity-handle cross-refs, no
+side maps for entity state) and fail-fast (no `catch {}` on the new paths).
 
 ## Phase 3 — evaluate move-via-conf-change
 
