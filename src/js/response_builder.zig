@@ -14,7 +14,6 @@ const files_mod = @import("rove-files");
 
 const dispatcher_mod = @import("dispatcher.zig");
 const static_cache = @import("static_cache.zig");
-const gzip = @import("gzip.zig");
 
 // ── Header lookup ─────────────────────────────────────────────────────
 
@@ -384,10 +383,22 @@ pub fn setRateLimitedResponse(
 
 // ── Static file dispatch ──────────────────────────────────────────────
 
+/// A static matched but its bytes aren't resident in the LRU — the caller
+/// streams it from the tenant's file-blobs via the `__system/static` builtin
+/// (engine-fired, hash injected). `content_type` borrows the snapshot entry
+/// (valid for the pinned-snapshot request lifetime); the caller builds the
+/// `etag` from `hash_hex`.
+pub const StreamStatic = struct {
+    hash_hex: [files_mod.HASH_HEX_LEN]u8,
+    content_type: []const u8,
+};
+
 /// Result of a static-file lookup/serve attempt. `miss` means the
-/// caller should fall through to handler routing.
+/// caller should fall through to handler routing; `stream_static` means
+/// the bytes weren't in the LRU and must stream via `__system/static`.
 pub const StaticOutcome = union(enum) {
     served: u16,
+    stream_static: StreamStatic,
     miss: void,
 };
 
@@ -436,30 +447,30 @@ pub fn tryServeStatic(
     var key_buf: [8 + files_mod.MAX_PATH_LEN + 16]u8 = undefined;
     if (rel.len == 0) {
         const key = std.fmt.bufPrint(&key_buf, "_static/index.html", .{}) catch return .miss;
-        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, key, rh, is_head)) |st| {
-            return .{ .served = st };
+        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, key, rh, is_head)) |oc| {
+            return oc;
         }
         return .miss;
     }
 
     // Exact match: `_static/<rel>`.
     if (std.fmt.bufPrint(&key_buf, "_static/{s}", .{rel})) |k| {
-        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, k, rh, is_head)) |st| {
-            return .{ .served = st };
+        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, k, rh, is_head)) |oc| {
+            return oc;
         }
     } else |_| {}
 
     // `.html` suffix: `_static/<rel>.html`.
     if (std.fmt.bufPrint(&key_buf, "_static/{s}.html", .{rel})) |k| {
-        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, k, rh, is_head)) |st| {
-            return .{ .served = st };
+        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, k, rh, is_head)) |oc| {
+            return oc;
         }
     } else |_| {}
 
     // Directory index: `_static/<rel>/index.html`.
     if (std.fmt.bufPrint(&key_buf, "_static/{s}/index.html", .{rel})) |k| {
-        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, k, rh, is_head)) |st| {
-            return .{ .served = st };
+        if (try serveStaticByKey(server, allocator, ent, sid, sess, tc, k, rh, is_head)) |oc| {
+            return oc;
         }
     } else |_| {}
 
@@ -478,7 +489,7 @@ fn serveStaticByKey(
     key: []const u8,
     rh: h2.ReqHeaders,
     is_head: bool,
-) !?u16 {
+) !?StaticOutcome {
     const entry = tc.snap.statics.get(key) orelse return null;
 
     // Build the strong ETag value (`"<hex>"`) once; shared by 200 and 304.
@@ -493,70 +504,38 @@ fn serveStaticByKey(
     const inm = findHeader(rh, "if-none-match");
     if (inm != null and etagMatches(inm.?, etag)) {
         try emitStatic304(server, allocator, ent, sid, sess, etag);
-        return 304;
+        return .{ .served = 304 };
     }
 
-    // Top-level documents (`text/html`) MUST be served inline
-    // same-origin — a 302 on a navigation moves the browser's origin,
-    // breaking the document's relative asset paths and same-origin
-    // fetches. The bytes are held resident (gzip-compressed) on the
-    // snapshot entry, fetched + compressed at deploy load (bounded by the
-    // tenant's plan), so the dispatch thread NEVER touches blob storage
-    // here. Stable mutable path ⇒ ETag / revalidate (the etag
-    // short-circuits the body).
-    if (isHtmlDocument(entry.content_type)) {
-        const gz = entry.resident_gzip orelse {
-            // Invariant: a published deployment holds every HTML doc
-            // resident (a failed prewarm fails the load, never publishes).
-            // A null here is a corrupt snapshot — fail loud, and NEVER
-            // fall back to a blocking blob read on the dispatch thread.
-            std.log.err(
-                "rove-js: HTML {s} not resident — deployment invariant violated (serving 500)",
-                .{key},
-            );
-            try setSimpleResponse(server, ent, sid, sess, 500, "static document unavailable\n", allocator);
-            return 500;
-        };
-
-        // HEAD: headers only (advertise the gzip representation + Vary).
-        if (is_head) {
-            try serveInline(server, allocator, ent, sid, sess, entry.content_type, etag, HTML_CACHE_CONTROL, "gzip", true, &[_]u8{}, true);
-            return 200;
+    // EVERY static — incl. `text/html` — is served at its stable, MUTABLE
+    // friendly path (no 302 to `/_assets/{hash}`): a redirect rebases a
+    // document's origin AND an ES module's base URL, breaking relative
+    // imports (`./api.js`). Stable mutable path ⇒ ETag + revalidate (the
+    // etag short-circuits to a 304 above).
+    //
+    // LRU hit → serve the bytes inline (a pure memory copy under the cache
+    // lock; the dispatch thread never blocks on storage). Identity encoding
+    // (the LRU holds raw bytes); a CF edge / the browser caches via the ETag.
+    if (static_cache.instance()) |sc| {
+        if (try sc.getCopy(&entry.hash_hex, allocator)) |hit| {
+            const body: []const u8 = if (is_head) &[_]u8{} else hit.bytes;
+            try serveInline(server, allocator, ent, sid, sess, hit.content_type, etag, STATIC_REVALIDATE_CACHE_CONTROL, null, false, body, is_head);
+            return .{ .served = 200 };
         }
-
-        // The stored bytes ARE gzip. Serve them verbatim to the ~all
-        // clients that accept gzip (no decompression, smaller wire); copy
-        // into the per-request allocator (lives until the response
-        // completes — the snapshot copy must not be handed to h2).
-        if (acceptsGzip(rh)) {
-            const body = try allocator.dupe(u8, gz);
-            try serveInline(server, allocator, ent, sid, sess, entry.content_type, etag, HTML_CACHE_CONTROL, "gzip", true, body, false);
-            return 200;
-        }
-
-        // Rare: a client that doesn't accept gzip → decompress into the
-        // per-request arena and serve identity (still Vary, no encoding).
-        const body = try gzip.decompress(allocator, gz, entry.resident_raw_len);
-        try serveInline(server, allocator, ent, sid, sess, entry.content_type, etag, HTML_CACHE_CONTROL, null, true, body, false);
-        return 200;
     }
 
-    // Non-HTML statics 302 to their immutable, content-addressed
-    // same-origin URL `/_assets/{hash}` (served by `serveAssetByHash`
-    // from the LRU). The redirect itself revalidates — the path→hash
-    // mapping changes per deploy — but the bytes it points at are
-    // immutable, so they cache forever once fetched. HEAD and GET emit
-    // the same redirect (no body).
-    const loc = try std.fmt.allocPrint(allocator, "/_assets/{s}", .{entry.hash_hex});
-    defer allocator.free(loc);
-    try emitStaticRedirectWithEtag(server, allocator, ent, sid, sess, loc, etag, 0);
-    return 302;
+    // LRU miss (cold / evicted / oversized) → stream it from the tenant's
+    // own file-blobs via the `__system/static` builtin. NEVER a redirect
+    // (would rebase relative imports) and NEVER a blocking read here (the
+    // builtin's fetch runs on the FetchPool thread).
+    return .{ .stream_static = .{ .hash_hex = entry.hash_hex, .content_type = entry.content_type } };
 }
 
-/// Cache-Control for served HTML documents: a stable mutable URL that
-/// changes per deploy, so revalidate every load (the strong ETag makes
-/// the revalidation a cheap 304 when unchanged).
-const HTML_CACHE_CONTROL = "public, max-age=0, must-revalidate";
+/// Cache-Control for statics served at their stable, MUTABLE friendly path
+/// (every kind now — HTML/JS/CSS/…): the path→bytes mapping changes per
+/// deploy, so revalidate every load. The strong ETag (= content hash) makes
+/// the revalidation a cheap 304 when unchanged, and lets a CF edge cache it.
+const STATIC_REVALIDATE_CACHE_CONTROL = "public, max-age=0, must-revalidate";
 
 /// Cache-Control for content-addressed `/_assets/{hash}` responses:
 /// immutable, cache for a year, never revalidate.
@@ -691,23 +670,6 @@ pub fn serveAssetByHash(
     return 302;
 }
 
-/// True if `content_type` is an HTML document (`text/html`, with or
-/// without a `; charset=…` parameter). These are served inline rather
-/// than redirected so a top-level navigation stays same-origin.
-fn isHtmlDocument(content_type: []const u8) bool {
-    const prefix = "text/html";
-    return content_type.len >= prefix.len and
-        std.ascii.eqlIgnoreCase(content_type[0..prefix.len], prefix);
-}
-
-/// True if the request's `Accept-Encoding` lists gzip. A plain substring
-/// match — we don't honor q-values (no browser sends `gzip;q=0`, and the
-/// non-gzip path is a correct identity fallback anyway).
-fn acceptsGzip(rh: h2.ReqHeaders) bool {
-    const ae = findHeader(rh, "accept-encoding") orelse return false;
-    return std.ascii.indexOfIgnoreCase(ae, "gzip") != null;
-}
-
 /// True if `inm` (If-None-Match header value) contains a tag equal to
 /// `etag`. Handles comma-separated lists and the `*` wildcard.
 pub fn etagMatches(inm: []const u8, etag: []const u8) bool {
@@ -828,17 +790,6 @@ fn emitStaticRedirect(
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
-
-test "isHtmlDocument: matches text/html with and without params" {
-    try std.testing.expect(isHtmlDocument("text/html"));
-    try std.testing.expect(isHtmlDocument("text/html; charset=utf-8"));
-    try std.testing.expect(isHtmlDocument("Text/HTML")); // case-insensitive
-    try std.testing.expect(!isHtmlDocument("text/javascript; charset=utf-8"));
-    try std.testing.expect(!isHtmlDocument("text/css"));
-    try std.testing.expect(!isHtmlDocument("application/json"));
-    try std.testing.expect(!isHtmlDocument("")); // empty content-type → redirect
-    try std.testing.expect(!isHtmlDocument("text/ht")); // shorter than prefix
-}
 
 test "etagMatches: single tag" {
     try std.testing.expect(etagMatches("\"abc\"", "\"abc\""));

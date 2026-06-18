@@ -30,7 +30,6 @@ const static_cache = @import("static_cache.zig");
 const BlobBytes = bytecode_cache_mod.BlobBytes;
 const BytecodeCache = bytecode_cache_mod.BytecodeCache;
 const MsgRouter = msg_router_mod.MsgRouter;
-const gzip = @import("gzip.zig");
 const testing = std.testing;
 
 /// Metadata about a static file in the active deployment. Bytes are
@@ -39,19 +38,9 @@ const testing = std.testing;
 pub const StaticEntry = struct {
     content_type: []u8, // owned, may be empty
     hash_hex: [files_mod.HASH_HEX_LEN]u8,
-    /// HTML documents only: the prewarmed bytes, GZIP-compressed, owned.
-    /// Documents must serve inline same-origin (a redirect on a navigation
-    /// moves the browser origin), so they can't use the LRU+redirect path
-    /// other statics use — they're held resident (compressed) for the
-    /// snapshot's life. A deploy publishes ONLY when every HTML doc is
-    /// resident (bounded by the tenant's plan), so the serve path never
-    /// touches blob storage; a null here for an HTML entry is therefore an
-    /// invariant violation, not a fallback. Null for non-HTML statics
-    /// (those go through the LRU + /_assets redirect).
-    resident_gzip: ?[]u8 = null,
-    /// Uncompressed length of `resident_gzip` (for Content-Length on the
-    /// decompress path + the per-deployment plan budget). 0 for non-HTML.
-    resident_raw_len: u32 = 0,
+    // Every static (incl. HTML) is served at its friendly path from the shared
+    // LRU (hit) or streamed from file-blobs via `__system/static` (miss) — none
+    // are held resident on the entry. The entry is just the path→hash mapping.
 };
 
 /// Per-tenant code state held by the worker. Owns its own KvStore,
@@ -415,7 +404,6 @@ pub const TenantFilesSnapshot = struct {
         while (st_it.next()) |entry| {
             allocator.free(entry.key_ptr.*);
             allocator.free(entry.value_ptr.*.content_type);
-            if (entry.value_ptr.*.resident_gzip) |b| allocator.free(b);
         }
         self.statics.deinit(allocator);
         var sbh_it = self.statics_by_hash.iterator();
@@ -1172,13 +1160,6 @@ fn mirrorDeployConfig(
 /// huge blob in RAM, and the LRU stays useful for the many-small case).
 const PREWARM_MAX_ASSET_BYTES: usize = 4 << 20;
 
-/// True for `text/html` (with or without a `; charset=…` parameter).
-/// Mirrors response_builder.isHtmlDocument — documents serve inline.
-fn isHtmlContentType(content_type: []const u8) bool {
-    const p = "text/html";
-    return content_type.len >= p.len and std.ascii.eqlIgnoreCase(content_type[0..p.len], p);
-}
-
 /// Fetch one static blob and seed it into the shared LRU. Loader-thread
 /// only (the `get` is a blocking S3 read). Best-effort — any failure
 /// just leaves the asset to the redirect fallback at serve time.
@@ -1324,7 +1305,6 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
         while (it.next()) |e| {
             allocator.free(e.key_ptr.*);
             allocator.free(e.value_ptr.*.content_type);
-            if (e.value_ptr.*.resident_gzip) |b| allocator.free(b);
         }
         next_statics.deinit(allocator);
     }
@@ -1348,12 +1328,11 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
         next_triggers.deinit(allocator);
     }
 
-    // HTML documents are held resident (the serve path never touches blob
-    // storage), bounded by the tenant's plan. Track the running raw total
-    // and reject the deploy if it exceeds the budget.
-    const plan = slot.effectivePlan();
-    var html_resident_raw: u64 = 0;
-
+    // Every static (incl. HTML) is prewarmed into the shared LRU and served
+    // inline at its friendly path on a hit; an LRU miss (cold/evicted/over the
+    // per-asset cap) streams from file-blobs via `__system/static`. So nothing
+    // is held resident on the snapshot entry and there is no per-tenant resident
+    // budget — the LRU is globally byte-capped (REWIND_STATIC_CACHE_MB).
     for (manifest.entries) |entry| {
         const path_copy = try allocator.dupe(u8, entry.path);
         errdefer allocator.free(path_copy);
@@ -1406,35 +1385,13 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
                 const ct_copy = try allocator.dupe(u8, entry.content_type);
                 errdefer allocator.free(ct_copy);
 
-                // HTML documents serve inline same-origin (no redirect),
-                // so hold their bytes resident (gzip-compressed) on the
-                // entry — the serve path must never touch blob storage.
-                // Every other static goes through the shared LRU +
-                // /_assets redirect. Both reads happen here on the loader
-                // thread, off the dispatch loop. A fetch failure or a
-                // plan-budget overflow FAILS the load (returns an error
-                // that aborts the reload before the snapshot is published),
-                // so we never publish a deployment whose HTML can't serve
-                // without blocking.
-                var resident_gzip: ?[]u8 = null;
-                var resident_raw_len: u32 = 0;
-                errdefer if (resident_gzip) |b| allocator.free(b);
-                if (isHtmlContentType(entry.content_type)) {
-                    const hb = try fetchBlobRetry(bs, &entry.source_hex, allocator);
-                    defer allocator.free(hb);
-
-                    html_resident_raw += hb.len;
-                    if (html_resident_raw > plan.max_resident_html_bytes) {
-                        std.log.err(
-                            "deployment {s}: HTML resident budget exceeded ({d} > {d} bytes) — deploy rejected",
-                            .{ slot.instance_id, html_resident_raw, plan.max_resident_html_bytes },
-                        );
-                        return error.HtmlResidentBudgetExceeded;
-                    }
-
-                    resident_gzip = try gzip.compress(allocator, hb);
-                    resident_raw_len = @intCast(hb.len);
-                } else if (static_cache.instance()) |sc| {
+                // Prewarm EVERY static (incl. HTML) into the shared LRU on the
+                // loader thread (off the dispatch loop). A hit serves inline; a
+                // miss streams via `__system/static`. Best-effort + bounded:
+                // `prewarmStatic` skips assets over the per-asset cap (they take
+                // the stream path) and silently no-ops when the LRU is disabled
+                // (REWIND_STATIC_CACHE_MB=0 → CF-only / stream-everything).
+                if (static_cache.instance()) |sc| {
                     prewarmStatic(sc, bs, &entry.source_hex, entry.content_type, allocator);
                 }
 
@@ -1451,13 +1408,11 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
                 }
 
                 // LAST fallible op in this iteration — ownership of
-                // path_copy / ct_copy / resident_gzip transfers here, so
-                // nothing after can error into a double free.
+                // path_copy / ct_copy transfers here, so nothing after can
+                // error into a double free.
                 try next_statics.put(allocator, path_copy, .{
                     .content_type = ct_copy,
                     .hash_hex = entry.source_hex,
-                    .resident_gzip = resident_gzip,
-                    .resident_raw_len = resident_raw_len,
                 });
             },
         }

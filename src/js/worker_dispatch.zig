@@ -2186,6 +2186,12 @@ const ResolvedDispatch = struct {
     handler_inst: *const tenant_mod.Instance,
     scope_inst: *const tenant_mod.Instance,
     is_admin: bool,
+    /// Set when a static matched but its bytes weren't LRU-resident: the
+    /// dispatch is forced to the `__system/static` builtin (which streams the
+    /// blob), with the hash/content-type passed via the forced route's query.
+    /// Only the admin static path sets it here; the customer static path sets
+    /// its own loop-local equivalent inline in `dispatchOnce`.
+    stream_static: ?respb.StreamStatic = null,
 };
 
 const ResolveResult = union(enum) {
@@ -2476,7 +2482,18 @@ fn resolveRequest(
                     if (try respb.serveAssetByHash(server, allocator, ent, sid, sess, tc, path, rh, std.mem.eql(u8, method, "HEAD"))) |_|
                         return .handled;
                     const outcome = try respb.tryServeStatic(server, allocator, ent, sid, sess, tc, method, path, rh);
-                    if (outcome != .miss) return .handled;
+                    switch (outcome) {
+                        .served => return .handled,
+                        // Bytes not LRU-resident → stream via __system/static,
+                        // dispatching as the admin tenant (its own file-blobs).
+                        .stream_static => |ss| return .{ .dispatch = .{
+                            .handler_inst = ai,
+                            .scope_inst = ai,
+                            .is_admin = true,
+                            .stream_static = ss,
+                        } },
+                        .miss => {},
+                    }
                 }
             }
         }
@@ -2703,6 +2720,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         const handler_inst = resolved.handler_inst;
         const scope_inst = resolved.scope_inst;
         const is_admin_request = resolved.is_admin;
+        // Set when a static matched but missed the LRU → force the dispatch to
+        // the `__system/static` streamer (admin path sets it via `resolved`;
+        // the customer static block below sets it inline). Drives the forced
+        // route + skips the leader-gate/penalty (static serving is node-local).
+        var stream_static: ?respb.StreamStatic = resolved.stream_static;
 
         // Lazy-open the tenant log eagerly on every request, BEFORE
         // any of the early-exit `captureLog` paths below (rate-limit,
@@ -2845,11 +2867,21 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                     processed += 1;
                     continue;
                 },
+                .stream_static => |ss| stream_static = ss,
                 .miss => {},
             }
         }
 
-        var route = router_mod.resolveRoute(allocator, path) catch |err| {
+        // A static missed the LRU → force the dispatch to the `__system/static`
+        // streamer, passing {hash, content_type} via the route's query (the
+        // builtin parses request.query). No `/_assets` redirect (would rebase
+        // relative ES-module imports) and no blocking read here.
+        var route = if (stream_static) |ss| blk: {
+            const q = try std.fmt.allocPrint(allocator, "{{\"hash\":\"{s}\",\"ct\":\"{s}\"}}", .{ ss.hash_hex[0..], ss.content_type });
+            errdefer allocator.free(q);
+            const mb = try allocator.dupe(u8, "__system/static");
+            break :blk router_mod.Route{ .allocator = allocator, .module_base = mb, .query = q };
+        } else router_mod.resolveRoute(allocator, path) catch |err| {
             std.log.warn("rove-js router failed: {s}", .{@errorName(err)});
             try respb.setErrorResponse(server, ent, sid, sess);
             worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
@@ -2858,16 +2890,27 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         };
         defer route.deinit();
 
-        const bytecode = (try worker_mod.findBytecode(tc, route.module_base, allocator)) orelse {
-            // Convention 404: serve `_static/_404.html` if the tenant
-            // has it. Otherwise fall back to the built-in text body.
-            if (!try respb.serveConvention404(server, allocator, ent, sid, sess, tc)) {
-                try respb.setSimpleResponse(server, ent, sid, sess, 404, "not found\n", allocator);
-            }
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 404, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
-            processed += 1;
-            continue;
-        };
+        // The forced static-stream route resolves against the node-level
+        // built-in registry (exact — NOT findBytecode's tenant walk-up, which
+        // would fall through `__system/static` up to the tenant's index.mjs).
+        const bytecode = if (stream_static != null)
+            (worker.node.builtin_modules.get("__system/static.mjs") orelse {
+                // The builtin is baked in; absence is an invariant violation.
+                try respb.setSimpleResponse(server, ent, sid, sess, 500, "static streamer unavailable\n", allocator);
+                processed += 1;
+                continue;
+            })
+        else
+            (try worker_mod.findBytecode(tc, route.module_base, allocator)) orelse {
+                // Convention 404: serve `_static/_404.html` if the tenant
+                // has it. Otherwise fall back to the built-in text body.
+                if (!try respb.serveConvention404(server, allocator, ent, sid, sess, tc)) {
+                    try respb.setSimpleResponse(server, ent, sid, sess, 404, "not found\n", allocator);
+                }
+                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 404, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
+                processed += 1;
+                continue;
+            };
 
         // Dispatch-gate (strict-serializable reads): only the leader of
         // the request's tenant group runs the handler. A non-leader 421s
@@ -2883,7 +2926,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // not-yet-lazily-created group can't false-redirect in dev). No
         // tenant-log capture: a redirect is routing plumbing, not a
         // request outcome — the leader logs the real one.
-        if (!worker.raft.isSingleNode()) {
+        // `__system/static` streaming is node-local immutable serving (same
+        // stake as the static/_assets serving that ran above) — exempt it from
+        // the leader-gate so any node can serve a static, and from the penalty
+        // box (it's platform code, not the tenant's handler).
+        if (stream_static == null and !worker.raft.isSingleNode()) {
             const lead_gid = worker.raft.gidForTenant(scope_inst.id) orelse 0;
             if (lead_gid == 0 or !worker.raft.isLeaderOf(lead_gid)) {
                 try respb.setSimpleResponse(server, ent, sid, sess, 421, "not leader for this tenant; retry against the cluster leader\n", allocator);
@@ -2892,7 +2939,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             }
         }
 
-        if (worker.penalty_box.isBoxed(handler_inst.id, dep_id, received_ns)) {
+        if (stream_static == null and worker.penalty_box.isBoxed(handler_inst.id, dep_id, received_ns)) {
             try respb.setSimpleResponse(server, ent, sid, sess, 503, "tenant temporarily disabled (cpu budget)\n", allocator);
             worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 503, .timeout, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
             processed += 1;
