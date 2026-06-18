@@ -111,6 +111,18 @@ pub const DEFAULT_HIBERNATE_NS: i64 = 2 * std.time.ns_per_s;
 /// replay and lets the WAL be truncated. Tests override with a short value.
 pub const DEFAULT_DURABILIZE_NS: i64 = 500 * std.time.ns_per_ms;
 
+/// Mechanism-A compaction (raft-native-alignment §I4): the fixed catch-up
+/// buffer. `durabilizeTick` compacts the WAL to `durable_apply_watermark −
+/// grace`, PER NODE INDEPENDENTLY — no cross-node min-match floor, no propagated
+/// floor, no lockstep. A peer within `grace` entries of the cap catches up from
+/// the log; anyone further back trips raft's `StateSnapshot` and is recovered by
+/// the out-of-band snapshot catch-up driver. The fixed buffer is the bound: a
+/// dead/stuck peer falls out of it and snapshots rather than pinning the WAL.
+/// ~etcd's `SnapshotCatchUpEntries` (5000). One knob (`REWIND_SNAPSHOT_GRACE`);
+/// 0 means "compact to the durable watermark" (snapshot any peer not exactly
+/// caught up — valid, just snapshot-heavy).
+pub const DEFAULT_SNAPSHOT_GRACE: u64 = 5_000;
+
 /// Auto-demote policy (conf_change Phase 2): on the leader, a peer voter that
 /// is BOTH this many entries behind the leader's last index AND `!recent_active`
 /// (no contact within ~an election timeout, under check_quorum) is demoted to a
@@ -330,13 +342,13 @@ pub const TenantSlot = struct {
     /// `applied_idx > durabilized_idx` ⇒ this group has committed-but-not-yet-
     /// durable writes (it is "dirty"). Single-node compacts the WAL up to here.
     durabilized_idx: u64 = 0,
-    /// The WAL-compaction floor this group's LEADER last propagated (the
-    /// cluster-wide min match index, stamped on inbound transport messages and
-    /// drained by `applyRecvFloor`). A FOLLOWER truncates its WAL to this floor
-    /// so it compacts in lockstep with the leader — never past an entry a voter
-    /// still needs (snapshot-free). 0 (no floor yet ⇒ no follower truncation)
-    /// until the first leader message lands; unused on the leader (it uses its
-    /// own live `minMatchIndex`). Monotonic.
+    /// VESTIGIAL under mechanism-A compaction — always 0. Formerly the leader's
+    /// propagated cluster-wide min-match floor that a FOLLOWER compacted to in
+    /// lockstep (the snapshot-free workaround). Mechanism A compacts each node
+    /// independently to a fixed buffer below its own watermark and snapshots a
+    /// laggard out-of-band, so no floor is propagated (the leader stamps `maxInt`)
+    /// and `applyRecvFloor` never fires. Kept until a transport wire-shrink
+    /// removes the floor field + `applyRecvFloor` + this together.
     propagated_floor: u64 = 0,
     /// Whether this slot is in `Node.dirty` (committed since last durabilize),
     /// so `applyEntry` enqueues it at most once.
@@ -427,6 +439,11 @@ pub const Node = struct {
     auto_demote_lag: u64 = DEFAULT_AUTO_DEMOTE_LAG,
     auto_demote_interval_ns: i64 = DEFAULT_AUTO_DEMOTE_NS,
     last_auto_demote_ns: i64 = 0,
+    /// Mechanism-A compaction catch-up buffer (see `DEFAULT_SNAPSHOT_GRACE`):
+    /// `durabilizeTick` keeps this many entries below the durable apply watermark
+    /// in the WAL so a peer within the buffer catches up from the log; a peer
+    /// further back trips `StateSnapshot` and is recovered out-of-band.
+    snapshot_grace: u64 = DEFAULT_SNAPSHOT_GRACE,
     /// Raft logical-tick cadence + last-tick wall-clock (see `DEFAULT_TICK_NS`).
     /// `pump` fires `mgr.tickGroups` at most once per `tick_interval_ns`, so the
     /// election timeout (`election_tick × tick_interval_ns`) is decoupled from
@@ -1344,13 +1361,19 @@ pub const Node = struct {
             // Single-node: queued to a transport-less sink (a no-op).
             // Multi-node: buffered per destination node, stamped with the
             // group's migration epoch, for the coalesced flush below.
+            // `.floor = maxInt` ⇒ "no compaction floor" on the wire. Under
+            // mechanism-A compaction each node compacts independently to a fixed
+            // buffer below its own durable watermark (no cross-node min-match
+            // floor), so the leader no longer propagates one. The 8-byte wire
+            // field stays (a receiver reads maxInt and skips it — `onRecv`); it
+            // is vestigial, slated for removal with a transport wire-shrink.
             for (ready) |g| {
-                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g), .floor = self.outboundFloor(g) };
+                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g), .floor = std.math.maxInt(u64) };
                 self.mgr.takeMessages(g, sendMsgCb, &sctx) catch {};
                 self.mgr.release(g);
             }
             for (ready2) |g| {
-                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g), .floor = self.outboundFloor(g) };
+                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g), .floor = std.math.maxInt(u64) };
                 self.mgr.takeMessages(g, sendMsgCb, &sctx) catch {};
                 self.mgr.release(g);
             }
@@ -1411,16 +1434,15 @@ pub const Node = struct {
     /// Checkpoint dirty stores (V2 port of V1's `Cluster.tickSnapshot`).
     /// Interval-gated. For each group with committed-but-not-durable writes,
     /// fold its overlay into LMDB + stamp `lastAppliedRaftIdx` (one atomic
-    /// durabilize), then compact the shared WAL up to the durabilized index so
-    /// the log stays bounded. Single-node always compacts. Multi-node compacts
-    /// in lockstep: the LEADER floors the truncate point at its live cluster-wide
-    /// min match index (`minMatchIndex`) and propagates that floor on its
-    /// outbound messages; a FOLLOWER truncates to the propagated floor
-    /// (`propagated_floor`). Both stop at the same point, so no node compacts
-    /// past an entry a voter still needs — a lagging/returning voter catches up
-    /// from the LOG, never a snapshot (snapshot-free). Pump-thread only. All
-    /// dirty groups are flushed in one tick so the shared WAL's interleaved
-    /// commits clear together.
+    /// durabilize), then compact the shared WAL so the log stays bounded.
+    /// Compaction is mechanism A (raft-native-alignment §I4): truncate to a FIXED
+    /// catch-up buffer (`snapshot_grace`) below the durable apply watermark, PER
+    /// NODE INDEPENDENTLY — no cross-node min-match floor, no lockstep, no
+    /// leader/follower asymmetry. A peer within the buffer catches up from the
+    /// log; a peer further back trips raft's `StateSnapshot` and is recovered by
+    /// the out-of-band snapshot catch-up driver. Pump-thread only. All dirty
+    /// groups are flushed in one tick so the shared WAL's interleaved commits
+    /// clear together.
     fn durabilizeTick(self: *Node, now: i64) void {
         if (self.dirty.items.len == 0) return;
         if (now - self.last_durabilize_ns < self.durabilize_interval_ns) return;
@@ -1450,17 +1472,18 @@ pub const Node = struct {
             // nothing is awaited.
             var target = slot.applied_idx;
             if (self.durabilize_floor) |f| target = @min(target, f.func(f.ctx, gid));
-            // Multi-node WAL compaction floor — snapshot-free + lockstep: the
-            // LEADER floors the truncate point at its live cluster-wide min match
-            // index; a FOLLOWER uses the floor the leader propagated on its
-            // messages (`propagated_floor`, 0 ⇒ none yet ⇒ no truncation). Both
-            // truncate to the SAME floor, so no node ever compacts past an entry
-            // a voter still needs — a lagging/returning voter catches up from the
-            // LOG, never a snapshot. Single-node ({self}) ⇒ min_match = own match
-            // ≥ applied ⇒ target. Constrains only truncation; the LMDB fold of
-            // the full applied tail above is unaffected.
-            const floor: u64 = if (self.mgr.isLeader(gid)) self.mgr.minMatchIndex(gid) else slot.propagated_floor;
-            const compact_target = @min(target, floor);
+            // Mechanism-A WAL compaction (raft-native-alignment §I4): truncate to
+            // a FIXED catch-up buffer below the durable apply watermark, PER NODE
+            // INDEPENDENTLY — no cross-node min-match floor, no propagated floor,
+            // no leader/follower asymmetry. A peer within `snapshot_grace` of the
+            // cap catches up from the log; a peer further back trips raft's
+            // `StateSnapshot` and is recovered out-of-band by the snapshot
+            // catch-up driver (the `snapshotTriggerTick` → `SnapshotCatchupThread`
+            // path). The fixed buffer is the bound: a dead/stuck peer falls out of
+            // it and snapshots rather than pinning the WAL. Constrains only
+            // truncation; the LMDB fold of the full applied tail above is
+            // unaffected.
+            const compact_target = target -| self.snapshot_grace;
             if (target <= slot.durabilized_idx) {
                 // Nothing foldable yet — keep the slot dirty and retry
                 // next tick (the worker ack raises the floor).
@@ -1827,17 +1850,13 @@ pub const Node = struct {
         t.queueOut(to, ctx.group_id, ctx.epoch, ctx.floor, bytes);
     }
 
-    /// The WAL-compaction floor to stamp on `gid`'s outbound messages.
-    /// `minMatchIndex` is the cluster-wide min match on the leader and `maxInt`
-    /// (no floor) off-leader — exactly the per-recipient floor semantics, so a
-    /// follower receives + adopts the leader's floor and compacts in lockstep.
-    fn outboundFloor(self: *Node, gid: u64) u64 {
-        return self.mgr.minMatchIndex(gid);
-    }
-
-    /// Transport `drainFloors` callback: record the leader-sent compaction
-    /// floor for `gid` on its slot (monotonic). `durabilizeTick` truncates a
-    /// follower's WAL to this floor. Pump-thread only.
+    /// Transport `drainFloors` callback — INERT under mechanism-A compaction.
+    /// The leader now stamps `maxInt` (no floor) on every outbound message, so
+    /// `onRecv` never records a floor and `recv_floors` stays empty: this is a
+    /// no-op every cycle. Kept (with the `drainFloors` drain that feeds it) only
+    /// so the transport's floor wire-field has a reader until a dedicated
+    /// wire-shrink removes the field, `propagated_floor`, and this callback
+    /// together. Pump-thread only.
     fn applyRecvFloor(self: *Node, gid: u64, floor: u64) void {
         const slot = self.groups.get(gid) orelse return;
         if (floor > slot.propagated_floor) slot.propagated_floor = floor;

@@ -94,23 +94,53 @@ raft-rs drive the whole snapshot lifecycle, exactly as etcd/TiKV do, and have
 rove supply only the bytes transport. We diverge **only** where a concrete,
 scrutinized constraint forces it.
 
-**Settled shape: native *trigger*, out-of-band *data*.** We use raft-rs's
-snapshot *signaling* (the `StateSnapshot` catch-up state machine) but keep rove's
-out-of-band data delivery — which is what avoids the one hard part (receiver-side
-async apply). Concretely:
+**Settled shape: leader-side trigger, out-of-band data, leader-push.** We keep
+rove's out-of-band data delivery (which is what avoids the hard part —
+receiver-side async apply) and detect the behind-peer ourselves on the leader.
+Concretely:
 
-- **`snapshotCb` stays `Unavailable`** (`storage.zig:299`) — it is the "this peer
-  is behind" *signal*. raft holds the peer in `StateSnapshot` and retries
-  (verified-safe back-off); it never strands silently and never blocks.
-- **Detect `StateSnapshot`** on the leader — the one new FFI: extend
-  `voter_progress` to expose `Progress::state` (Probe/Replicate/Snapshot). This is
-  the trigger.
-- **Auto-orchestrate the existing `promote_back` sequence** on detection: the
-  behind peer pulls the bundle (consistent read-txn cursor, streamed in chunks,
-  **direct peer→peer over `v2-snapshot` — no S3**) → `v2-load-replace` **on its
-  worker (off-pump)** → `apply_local_snapshot {index, term, conf_state}` **on its
-  pump (fast, data-free)**. Its `match` advances → `StateSnapshot` clears → the
-  leader replicates the tail.
+- **`snapshotCb` stays `Unavailable`** (`storage.zig:299`) — rove never delivers
+  data via `MsgSnapshot`, so the leader's storage never produces one.
+- **Trigger on `matched + 1 < first_index`** (the one FFI, `snapshot_pending_peers`):
+  the peer's next-needed entry is below the leader's compacted first index, gated
+  on `recent_active`. This is exactly the condition raft itself uses internally to
+  decide a snapshot is needed; we read it from `Progress` rather than wait for a
+  `ProgressState::Snapshot` that our model never produces (see the **CORRECTION**
+  below).
+- **Auto-orchestrate a leader-push** on detection (pump `snapshotTriggerTick` →
+  worker `SnapshotCatchupThread`): the leader dumps its store (consistent
+  read-txn cursor via a sibling handle, **direct peer→peer over
+  `REWIND_PEER_URLS` — no S3**) → `POST v2-load-replace` **on the peer (its worker,
+  off-pump)** → `POST v2-apply-snapshot {index, term}` **on the peer (its pump,
+  fast, data-free)**. The peer's `match` advances past `first_index` → it is no
+  longer below the floor → the leader replicates the tail.
+
+> **CORRECTION (2026-06-17) — the "native `StateSnapshot` trigger" was a mistake.**
+> A peer enters `ProgressState::Snapshot` ONLY when `prepare_send_snapshot`
+> actually obtains a snapshot from storage (`raft.rs:716` `become_snapshot`). With
+> rove's `snapshotCb` permanently `Unavailable`, `prepare_send_snapshot` returns
+> early at `raft.rs:689` BEFORE `become_snapshot`, so the peer sits in `Probe`
+> forever and NEVER enters `Snapshot`. The earlier "verified-safe back-off, raft
+> parks the peer in StateSnapshot" claim was wrong (confirmed against raft-0.7.0
+> source + the reference `MemStorage`, which returns Unavailable only *once* while
+> "generating", then a real snapshot). So `snapshot_pending_peers` filters on
+> `matched + 1 < first_index`, not progress state.
+>
+> **What TiKV/etcd do (and how we relate).** Both — TiKV on this exact crate —
+> confirm the OUT-OF-BAND DATA half: `snapshot()` returns Unavailable only while
+> async-generating, then returns a **metadata-only** snapshot; the bulk ships on a
+> side channel (TiKV's Snap Worker over gRPC streams; etcd's `snap.Message`
+> `ReadCloser`), and the receiver applies it **asynchronously, off the raft
+> thread** ("its large size would block the thread"). rove's split — heavy
+> `v2-load-replace` on the worker, fast data-free `apply_local_snapshot` on the
+> pump — is the same principle, so the data design is *validated*, not divergent.
+> The one **justified divergence**: TiKV eventually returns a real metadata
+> snapshot so the peer enters `Snapshot` and raft **pauses replication to it**
+> (flow control); we keep `Unavailable` and detect-and-push from the leader. Cost
+> of the divergence: one cheap failed `snapshot()` call per heartbeat per lagging
+> peer (an error return, no data). Benefit: no receiver-side `MsgSnapshot`
+> interception and no raft async-storage machinery. Evaluated + accepted; the
+> fully-native flow-control variant is a possible later refinement.
 
 **Why not bytes-in-`MsgSnapshot` (the etcd-native data path):** raft-rs applies a
 received snapshot on the *pump* (`restore` → `apply_snapshot` during the Ready).

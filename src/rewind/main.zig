@@ -102,6 +102,10 @@ const WorkerCtx = struct {
     move_secret: ?[]const u8,
     cluster_id: ?[]const u8,
     cp_urls: []const []const u8,
+    /// Peer HTTP base URLs indexed by raft id − 1 (`REWIND_PEER_URLS`) — the
+    /// leader-push target for the out-of-band snapshot catch-up driver. Empty
+    /// (single-node / unset) → the catch-up thread logs + no-ops any job.
+    peer_urls: []const []const u8,
     ready: *std.Thread.ResetEvent,
 };
 
@@ -145,6 +149,27 @@ fn onDeployApply(ctx: *anyopaque, gid: u64, id_str: []const u8, key: []const u8,
     const node: *rjs.NodeState = @ptrCast(@alignCast(ctx));
     const dep_id = std.fmt.parseInt(u64, value, 16) catch return;
     node.deploy.enqueueDeployment(id_str, dep_id);
+}
+
+/// Poll-loop hook: move the pump's queued snapshot catch-up jobs onto the
+/// background `SnapshotCatchupThread` (raft-native-alignment Phase 1). Cheap —
+/// drains the bridge queue (resolving each gid's tenant id) and hands off the
+/// heavy store-dump + HTTP push to the thread. The borrowed `id_str` is duped
+/// into the owned job before enqueue. On an enqueue failure (OOM) the in-flight
+/// mark is cleared so the pump re-triggers next tick rather than stranding.
+fn drainSnapshotCatchupJobs(worker: anytype, catchup: *rjs.SnapshotCatchupThread) void {
+    var buf: [16]bridge_mod.SnapshotCatchup = undefined;
+    const n = worker.raft.drainSnapshotCatchup(&buf);
+    for (buf[0..n]) |j| {
+        const id_dup = worker.allocator.dupe(u8, j.id_str) catch {
+            worker.raft.clearSnapshotCatchup(j.gid, j.peer);
+            continue;
+        };
+        catchup.enqueue(.{ .gid = j.gid, .peer = j.peer, .index = j.index, .term = j.term, .id_str = id_dup }) catch {
+            worker.allocator.free(id_dup);
+            worker.raft.clearSnapshotCatchup(j.gid, j.peer);
+        };
+    }
 }
 
 fn runPromotionHook(worker: anytype, worker_idx: usize) void {
@@ -233,6 +258,21 @@ fn workerMain(args: *WorkerCtx) !void {
     // own QuickJS runtime so it never races the poll-loop compiler.
     try worker.startDeployThread();
 
+    // Out-of-band snapshot catch-up driver (raft-native-alignment Phase 1):
+    // the pump's `snapshotTriggerTick` queues a `(gid, peer)` for any peer in
+    // `StateSnapshot`; this thread dumps the leader's store + pushes
+    // `v2-load-replace` + `v2-apply-snapshot` to the peer, off the poll loop.
+    const catchup = try rjs.SnapshotCatchupThread.init(
+        allocator,
+        args.node.tenant,
+        args.raft,
+        args.move_secret,
+        args.peer_urls,
+    );
+    defer catchup.deinit();
+    try catchup.start();
+    defer catchup.shutdown();
+
     std.log.info("rewind worker {d}: ready (SO_REUSEPORT)", .{args.worker_idx});
     args.ready.set();
 
@@ -254,6 +294,7 @@ fn workerMain(args: *WorkerCtx) !void {
         _ = try rjs.dispatchOnce(worker, &blocked_tenants);
         try rjs.drainRaftPending(worker);
         runPromotionHook(worker, args.worker_idx);
+        drainSnapshotCatchupJobs(worker, catchup);
         try rjs.drainForwardPending(worker);
         rjs.drainSpools(worker);
         try rjs.sweepParkedContinuations(worker);
@@ -545,6 +586,14 @@ pub fn main() !void {
     const cp_urls = try parseUrlList(allocator, std.posix.getenv("REWIND_CP_URL") orelse "");
     defer freeUrlList(allocator, cp_urls);
 
+    // Peer HTTP base URLs indexed by raft id − 1 (the worker analog of CP's
+    // `REWIND_CP_PEER_URLS`): the leader-push target for the out-of-band
+    // snapshot catch-up driver (raft-native-alignment Phase 1). DISTINCT from
+    // `REWIND_PEERS` (the raft transport `host:port`s); these are the workers'
+    // HTTP `/_system/` listen origins. Unset (single-node) → catch-up disabled.
+    const peer_urls = try parseUrlList(allocator, std.posix.getenv("REWIND_PEER_URLS") orelse "");
+    defer freeUrlList(allocator, peer_urls);
+
     // Step 3 (step3-auth-plan.md A2/A3): wire the `rewind-logs.internal`
     // fetch-engine door so the `__admin__` chokepoint reads tenant logs with a
     // worker-minted, tenant-scoped `logs-read` token. The secret is the SAME
@@ -634,6 +683,14 @@ pub fn main() !void {
     }
     if (std.posix.getenv("REWIND_AUTO_DEMOTE_MS")) |v| {
         if (std.fmt.parseInt(i64, v, 10)) |ms| bridge.node.auto_demote_interval_ns = ms * std.time.ns_per_ms else |_| {}
+    }
+    // Mechanism-A compaction catch-up buffer (entries kept below the durable
+    // apply watermark; see node.zig DEFAULT_SNAPSHOT_GRACE). A peer further back
+    // than this trips StateSnapshot → out-of-band catch-up. Smokes set it low to
+    // force the snapshot path; prod leaves the default. Set before startPump.
+    if (std.posix.getenv("REWIND_SNAPSHOT_GRACE")) |v| {
+        bridge.node.snapshot_grace = std.fmt.parseInt(u64, v, 10) catch bridge.node.snapshot_grace;
+        std.log.info("rewind: snapshot grace buffer = {d} entries", .{bridge.node.snapshot_grace});
     }
     // Raft logical-tick cadence (ms). The wall-clock election timeout is
     // `election_tick × this` (see node.zig DEFAULT_TICK_NS); the default
@@ -745,6 +802,7 @@ pub fn main() !void {
         .move_secret = move_secret,
         .cluster_id = cluster_id,
         .cp_urls = cp_urls,
+        .peer_urls = peer_urls,
         .ready = &ready,
     };
     var th = try std.Thread.spawn(.{}, workerThreadEntry, .{&ctx});
