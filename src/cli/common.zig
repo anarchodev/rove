@@ -296,7 +296,9 @@ pub fn extractDepId(a: std.mem.Allocator, body: []const u8) ?[]const u8 {
 // ── bundle classification (mirrors publish_tenant.py) ──────────────────────
 
 pub const Handler = struct { path: []const u8, source: []const u8 };
-pub const Static = struct { path: []const u8, content_type: []const u8, b64: []const u8 };
+/// Statics stream straight to S3 (raw bytes → PUT /v1/upload), so carry the raw
+/// file bytes (no base64 — the JSON deploy path is handlers-only now).
+pub const Static = struct { path: []const u8, content_type: []const u8, bytes: []const u8 };
 pub const Bundle = struct { handlers: []Handler, statics: []Static, skipped: [][]const u8 };
 
 pub fn contentType(path: []const u8) []const u8 {
@@ -334,10 +336,7 @@ pub fn classify(a: std.mem.Allocator, bundle_path: []const u8) Bundle {
             fatal("read {s}: {s}", .{ full, @errorName(err) });
 
         if (std.mem.startsWith(u8, rel, "_static/") or std.mem.startsWith(u8, rel, "_config/")) {
-            const enc = std.base64.standard.Encoder;
-            const b64 = a.alloc(u8, enc.calcSize(bytes.len)) catch oom();
-            _ = enc.encode(b64, bytes);
-            statics.append(a, .{ .path = rel, .content_type = contentType(rel), .b64 = b64 }) catch oom();
+            statics.append(a, .{ .path = rel, .content_type = contentType(rel), .bytes = bytes }) catch oom();
         } else if (std.mem.eql(u8, rel, "codemirror-entry.mjs")) {
             skipped.append(a, rel) catch oom();
         } else if (std.mem.endsWith(u8, rel, ".mjs")) {
@@ -386,17 +385,28 @@ pub fn fileBodyHandler(a: std.mem.Allocator, tenant: []const u8, h: Handler) []c
     return out.items;
 }
 
-/// `{"tenant","kind":"static","path","content_type","b64"}` — one static.
-pub fn fileBodyStatic(a: std.mem.Allocator, tenant: []const u8, s: Static) []const u8 {
+/// Percent-encode a query-component value (RFC 3986 unreserved kept raw).
+fn pctEncode(out: *std.ArrayList(u8), a: std.mem.Allocator, v: []const u8) void {
+    for (v) |ch| {
+        const unreserved = (ch >= 'A' and ch <= 'Z') or (ch >= 'a' and ch <= 'z') or
+            (ch >= '0' and ch <= '9') or ch == '-' or ch == '_' or ch == '.' or ch == '~';
+        if (unreserved) {
+            out.append(a, ch) catch oom();
+        } else {
+            out.appendSlice(a, std.fmt.allocPrint(a, "%{X:0>2}", .{ch}) catch oom()) catch oom();
+        }
+    }
+}
+
+/// `/v1/upload?tenant=X&path=Y&content_type=Z` — the streamed-static PUT URL
+/// path (the raw file bytes ride the body). `base` is the worker/admin origin.
+pub fn uploadPath(a: std.mem.Allocator, tenant: []const u8, s: Static) []const u8 {
     var out = std.ArrayList(u8){};
-    out.appendSlice(a, "{\"tenant\":") catch oom();
-    writeJsonString(&out, a, tenant);
-    out.appendSlice(a, ",\"kind\":\"static\",\"path\":") catch oom();
-    writeJsonString(&out, a, s.path);
-    out.appendSlice(a, ",\"content_type\":") catch oom();
-    writeJsonString(&out, a, s.content_type);
-    out.appendSlice(a, ",\"b64\":") catch oom();
-    writeJsonString(&out, a, s.b64);
-    out.append(a, '}') catch oom();
+    out.appendSlice(a, "/v1/upload?tenant=") catch oom();
+    pctEncode(&out, a, tenant);
+    out.appendSlice(a, "&path=") catch oom();
+    pctEncode(&out, a, s.path);
+    out.appendSlice(a, "&content_type=") catch oom();
+    pctEncode(&out, a, s.content_type);
     return out.items;
 }

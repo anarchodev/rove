@@ -249,6 +249,22 @@ fn deployStep(a: std.mem.Allocator, cfg: *const Cfg, sub: []const u8, body: []co
     c.fatal("deploy {s}: no leader after retries", .{label});
 }
 
+/// PUT a static's raw bytes to /v1/upload (streamed to S3) over the session
+/// cookie, retrying on a not-leader 421/503.
+fn uploadStep(a: std.mem.Allocator, cfg: *const Cfg, upath: []const u8, body: []const u8, label: []const u8) c.Resp {
+    const url = std.fmt.allocPrint(a, "{s}{s}", .{ cfg.admin_url, upath }) catch c.oom();
+    var attempt: usize = 0;
+    while (attempt < 6) : (attempt += 1) {
+        const r = httpCall(a, cfg, "PUT", url, &.{}, body, true, 180);
+        if (r.code == 200) return r;
+        if (r.code == 401) c.fatal("not signed in — run `rewind login`", .{});
+        if (r.code == 403) c.fatal("you don't own this instance", .{});
+        if (r.code != 421 and r.code != 503) c.fatal("upload {s} failed: {d} {s}", .{ label, r.code, c.trunc(r.body) });
+        std.Thread.sleep(2 * std.time.ns_per_s);
+    }
+    c.fatal("upload {s}: no leader after retries", .{label});
+}
+
 /// `rewind deploy <tenant> <bundle> [--release]` — per-file workspace deploy.
 fn cmdDeploy(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, bundle: []const u8, release: bool) void {
     const b = c.classify(a, bundle);
@@ -260,10 +276,10 @@ fn cmdDeploy(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, bundle: 
     if (b.handlers.len == 0 and b.statics.len == 0) c.fatal("bundle {s} has nothing to publish", .{bundle});
     std.debug.print("bundle: {d} handler(s), {d} static(s)\n", .{ b.handlers.len, b.statics.len });
 
-    // reset workspace → upload each file → cut a release (each request small).
+    // reset workspace → handlers (JSON) + statics (streamed raw PUT) → cut.
     _ = deployStep(a, cfg, "reset", c.tenantBody(a, tenant), "reset");
     for (b.handlers) |h| _ = deployStep(a, cfg, "file", c.fileBodyHandler(a, tenant, h), h.path);
-    for (b.statics) |s| _ = deployStep(a, cfg, "file", c.fileBodyStatic(a, tenant, s), s.path);
+    for (b.statics) |s| _ = uploadStep(a, cfg, c.uploadPath(a, tenant, s), s.bytes, s.path);
     const cut = deployStep(a, cfg, "cut", c.tenantBody(a, tenant), "cut");
     const dep_id = c.extractDepId(a, cut.body) orelse c.fatal("cut: 200 but no dep_id: {s}", .{cut.body});
     std.debug.print("deployment staged: {s} ({d} file(s)) — NOT released\n", .{ dep_id, b.handlers.len + b.statics.len });

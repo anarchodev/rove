@@ -219,17 +219,32 @@ export const api = {
     if (!res.ok) throw new ApiError(res.status, res.statusText, parsed);
     return parsed;
   },
+  /// Stream one static's raw bytes straight to S3 (PUT /v1/upload).
+  async _uploadStatic(instance_id, path, content_type, bytes) {
+    const qs = new URLSearchParams({ tenant: instance_id, path, content_type }).toString();
+    const res = await fetch(adminBase() + "/v1/upload?" + qs, {
+      method: "PUT",
+      credentials: "include",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: bytes,
+    });
+    const parsed = await res.json().catch(() => null);
+    if (!res.ok) throw new ApiError(res.status, res.statusText, parsed);
+    return parsed;
+  },
   async deploy(instance_id, files) {
     await this._deployFile(instance_id, "reset", { tenant: instance_id });
     for (const [path, f] of Object.entries(files)) {
       const isStatic = f.bytes != null || path.startsWith("_static/") ||
                        path.startsWith("_config/");
-      const body = isStatic
-        ? { tenant: instance_id, path, kind: "static",
-            content_type: f.content_type || "application/octet-stream",
-            b64: encodeB64(f.bytes ?? f.source ?? "") }
-        : { tenant: instance_id, path, kind: "handler", source: f.source ?? "" };
-      await this._deployFile(instance_id, "file", body);
+      if (isStatic) {
+        const bytes = f.bytes != null ? f.bytes : new TextEncoder().encode(f.source ?? "");
+        await this._uploadStatic(instance_id, path,
+                                 f.content_type || "application/octet-stream", bytes);
+      } else {
+        await this._deployFile(instance_id, "file",
+          { tenant: instance_id, path, kind: "handler", source: f.source ?? "" });
+      }
     }
     return this._deployFile(instance_id, "cut", { tenant: instance_id });
     // { ok: true, dep_id: "<016x>" }

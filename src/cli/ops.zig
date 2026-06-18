@@ -79,8 +79,9 @@ fn cmdDeploy(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, bundle
     for (b.handlers) |h| {
         _ = deployPost(a, env, "/v1/deploy/file", headers, c.fileBodyHandler(a, tenant, h), h.path);
     }
+    // Statics STREAM straight to S3 (raw bytes → PUT /v1/upload) — no buffering.
     for (b.statics) |s| {
-        _ = deployPost(a, env, "/v1/deploy/file", headers, c.fileBodyStatic(a, tenant, s), s.path);
+        _ = uploadStatic(a, env, c.uploadPath(a, tenant, s), headers, s.bytes, s.path);
     }
     const cut = deployPost(a, env, "/v1/deploy/cut", headers, c.tenantBody(a, tenant), "cut");
     const dep_id = c.extractDepId(a, cut.body) orelse fatal("cut: 200 but no dep_id: {s}", .{cut.body});
@@ -103,6 +104,22 @@ fn deployPost(a: std.mem.Allocator, env: *const c.Env, sub: []const u8, headers:
         std.Thread.sleep(2 * std.time.ns_per_s);
     }
     fatal("deploy step '{s}' failed on every worker", .{label});
+}
+
+/// PUT a static's raw bytes to /v1/upload (streamed to S3), leader-retrying.
+fn uploadStatic(a: std.mem.Allocator, env: *const c.Env, upath: []const u8, headers: []const c.Header, body: []const u8, label: []const u8) c.Resp {
+    const workers = c.workerUrls(env, a);
+    var attempt: usize = 0;
+    while (attempt < 6) : (attempt += 1) {
+        for (workers) |w| {
+            const url = std.fmt.allocPrint(a, "{s}{s}", .{ w, upath }) catch oom();
+            const r = c.call(a, env, "PUT", url, headers, body, 180);
+            if (r.code == 200) return r;
+            std.debug.print("  upload {s} via {s}: {d} {s} (trying next)\n", .{ label, w, r.code, c.trunc(r.body) });
+        }
+        std.Thread.sleep(2 * std.time.ns_per_s);
+    }
+    fatal("upload '{s}' failed on every worker", .{label});
 }
 
 /// Flip _deploy/current via /_system/release. Leader-gated → 6× round-robin retry.
