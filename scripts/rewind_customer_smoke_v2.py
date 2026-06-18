@@ -245,11 +245,21 @@ def main() -> int:
         TRIVIAL = "export default function(){ return 'from cli'; }"
 
         def cli_deploy(tenant):
-            return c.tls_curl(app_origin + "/v1/deploy", method="POST",
-                              headers={"Cookie": cli_cookie, "content-type": "application/json"},
-                              data=json.dumps({"tenant": tenant,
-                                               "handlers": [{"path": "index.mjs", "source": TRIVIAL}],
-                                               "statics": []}), timeout=30.0)
+            # Per-file workspace flow (reset → file → cut), the same the rewind
+            # binary drives. The ownership gate fires on each op, so a non-owner
+            # is refused at reset.
+            hdrs = {"Cookie": cli_cookie, "content-type": "application/json"}
+
+            def op(sub, body):
+                return c.tls_curl(app_origin + "/v1/deploy/" + sub, method="POST",
+                                  headers=hdrs, data=json.dumps(body), timeout=30.0)
+
+            r = op("reset", {"tenant": tenant})
+            if r.status != 200:
+                return r  # auth failure (403/401) surfaces at the first op
+            op("file", {"tenant": tenant, "kind": "handler",
+                        "path": "index.mjs", "source": TRIVIAL})
+            return op("cut", {"tenant": tenant})
         r = cli_deploy("custapp")
         dep_id = None
         try:
