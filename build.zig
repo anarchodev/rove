@@ -478,6 +478,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "builtin_blob_onresult_mjs", .path = "src/js/builtin_modules/blob_onresult.mjs" },
         // blob-storage §6 (docs/architecture/routing-and-ingress.md) — segments.seal's swap half.
         .{ .name = "builtin_segments_onsealed_mjs", .path = "src/js/builtin_modules/segments_onsealed.mjs" },
+        // Engine-fired deploy-static streamer ("onStatic") — cold/large static serve.
+        .{ .name = "builtin_static_mjs", .path = "src/js/builtin_modules/static.mjs" },
 
         // Starter content baked into the freshly-created tenant's
         // first deployment — see `deployStarterContent` in

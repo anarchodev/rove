@@ -87,6 +87,14 @@ const MODULES = [_]struct {
         .path = "__system/segments_onsealed.mjs",
         .src = @embedFile("builtin_segments_onsealed_mjs"),
     },
+    .{
+        // Engine-fired deploy-static streamer ("onStatic"): on an LRU miss for
+        // a stable static path, the engine dispatches here with the content
+        // hash injected (request.ctx) and this streams the blob from the
+        // tenant's own file-blobs to the held connection.
+        .path = "__system/static.mjs",
+        .src = @embedFile("builtin_static_mjs"),
+    },
 };
 
 /// Compile every built-in module to QJS bytecode and return an

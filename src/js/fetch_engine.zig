@@ -131,6 +131,19 @@ pub const CP_ORIGIN_PREFIX = "http://rewind-cp.internal/";
 /// signing, `LOGS_ORIGIN_PREFIX`'s cross-tenant + __admin__-gated posture.
 pub const BLOB_READ_ORIGIN_PREFIX = "http://rove-blob-read.internal/";
 
+/// The `rove-static.internal` trusted door — the OWN-tenant read of a deploy
+/// static (a `file-blobs/{hash}` object), used by the `__system/static` builtin
+/// to stream an asset straight to the held connection on an LRU miss. Unlike
+/// `BLOB_ORIGIN_PREFIX` (own-tenant, but `app-blobs/` — the customer runtime
+/// blob store), this reads `file-blobs/` where deploy statics + source live; and
+/// unlike `BLOB_READ_ORIGIN_PREFIX` it is NOT cross-tenant / admin-gated — the
+/// tenant is `pf.tenant_id` (the request's own tenant, stamped by the engine),
+/// so a handler can only ever reach its OWN file-blobs. URL shape
+/// `http://rove-static.internal/{hash}`; GET only (no write/delete). Streams
+/// when the fetch sets `stream: true`. The hash is engine-injected (the
+/// `onStatic` dispatch), never customer-supplied.
+pub const STATIC_ORIGIN_PREFIX = "http://rove-static.internal/";
+
 /// Upper bound on `REWIND_INTERNAL_FRONT` entries — one per front in
 /// the deployment, and a deployment has at most a handful of fronts.
 const MAX_DOOR_ADDRS = 4;
@@ -602,10 +615,18 @@ pub const FetchEngine = struct {
         var resolve_pin: ?[:0]const u8 = null;
         const is_blob_door = std.mem.startsWith(u8, pf.url, BLOB_ORIGIN_PREFIX);
         const is_blob_read_door = std.mem.startsWith(u8, pf.url, BLOB_READ_ORIGIN_PREFIX);
+        const is_static_door = std.mem.startsWith(u8, pf.url, STATIC_ORIGIN_PREFIX);
         const is_logs_door = std.mem.startsWith(u8, pf.url, LOGS_ORIGIN_PREFIX);
         const is_cp_door = std.mem.startsWith(u8, pf.url, CP_ORIGIN_PREFIX);
         if (is_blob_door) {
             try self.rewriteAndSignBlobFetch(pf, method, &headers_list);
+        } else if (is_static_door) {
+            // Own-tenant deploy-static READ door (`__system/static` streamer):
+            // rewrite to THIS tenant's `file-blobs/{hash}` + SigV4-sign. Tenant
+            // is `pf.tenant_id` (own-tenant, like the blob door), so a handler
+            // can only ever reach its own file-blobs. Same SSRF-exempt
+            // internal-origin posture (rewritten to the configured S3 endpoint).
+            try self.rewriteAndSignStaticFetch(pf, method, &headers_list);
         } else if (is_blob_read_door) {
             // Cross-tenant blob READ door: rewrite to the TARGET tenant's S3
             // prefix (from the URL path) + SigV4-sign. __admin__-gated; same
@@ -665,7 +686,7 @@ pub const FetchEngine = struct {
             // some other entry point.
             .timeout_ms = if (pf.held) 0 else pf.timeout_ms,
             .verify_tls = !ssrf_mod.test_allow_plaintext,
-            .follow_redirects = is_blob_door or is_blob_read_door,
+            .follow_redirects = is_blob_door or is_blob_read_door or is_static_door,
             .resolve_pin = resolve_pin,
             // The standalone log-server is h2c-only (nghttp2 prior-knowledge),
             // so a plaintext logs-door fetch must force cleartext HTTP/2 —
@@ -780,6 +801,47 @@ pub const FetchEngine = struct {
         pf.url = new_url;
 
         try self.signAndAttachS3(method_name, path, pf.body, headers_list);
+    }
+
+    /// Own-tenant deploy-static READ door (`rove-static.internal`) — rewrite
+    /// `{hash}` → `{key_prefix_base}{tenant}/file-blobs/{hash}` on the real S3
+    /// endpoint and SigV4-sign. Tenant is `pf.tenant_id` (own-tenant, stamped by
+    /// the engine — a handler can only ever reach its own file-blobs); the hash
+    /// is engine-injected by the `onStatic` dispatch. GET only — this door never
+    /// writes or deletes. Mirrors `rewriteAndSignBlobFetch`; only the subdir
+    /// (`file-blobs` vs `app-blobs`) differs.
+    fn rewriteAndSignStaticFetch(
+        self: *FetchEngine,
+        pf: *PendingFetch,
+        method: blob_curl_multi.Method,
+        headers_list: *std.ArrayListUnmanaged(blob_curl_multi.Header),
+    ) !void {
+        const cfg = &self.node.blob_backend_cfg;
+        if (cfg.endpoint.len == 0) return error.BlobBackendUnconfigured;
+        if (pf.tenant_id.len == 0) return error.BlobNoTenant;
+
+        const hash = pf.url[STATIC_ORIGIN_PREFIX.len..];
+        if (!isSha256HexLower(hash)) return error.BlobBadKey;
+
+        if (method != .GET) return error.BlobMethodDenied;
+
+        const path = try std.fmt.allocPrint(
+            self.allocator,
+            "/{s}/{s}{s}/file-blobs/{s}",
+            .{ cfg.bucket, cfg.key_prefix_base, pf.tenant_id, hash },
+        );
+        defer self.allocator.free(path);
+
+        const scheme = if (cfg.use_tls) "https" else "http";
+        const new_url = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}://{s}{s}",
+            .{ scheme, cfg.endpoint, path },
+        );
+        self.allocator.free(pf.url);
+        pf.url = new_url;
+
+        try self.signAndAttachS3("GET", path, pf.body, headers_list);
     }
 
     /// SigV4-sign `path` (path-style S3) for the configured blob endpoint and
