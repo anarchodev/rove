@@ -546,18 +546,24 @@ class V2Cluster:
                                   "Content-Type": "application/json"},
                          data=json.dumps(body), timeout=timeout)
 
+        import urllib.parse
         r = post("reset", {"tenant": tenant})
         if r.status != 200:
             raise RuntimeError(f"deploy {tenant} reset: {r.status} {r.body}")
         for f in files:
             if f.get("kind") == "static":
-                body = {"tenant": tenant, "path": f["path"], "kind": "static",
-                        "content_type": f.get("content_type", "application/octet-stream"),
-                        "b64": f["b64"]}
+                # Statics STREAM straight to S3 (raw body → scope(t).blob.receive)
+                # via PUT /v1/upload — no base64-JSON buffering.
+                qs = urllib.parse.urlencode({
+                    "tenant": tenant, "path": f["path"],
+                    "content_type": f.get("content_type", "application/octet-stream")})
+                r = _curl(f"{self.front_url()}/v1/upload?{qs}", method="PUT",
+                          host=self.host_for("__admin__"),
+                          headers={"Authorization": f"Bearer {self.root_token}"},
+                          data=base64.b64decode(f["b64"]), timeout=60.0)
             else:
-                body = {"tenant": tenant, "path": f["path"], "kind": "handler",
-                        "source": base64.b64decode(f["b64"]).decode()}
-            r = post("file", body)
+                r = post("file", {"tenant": tenant, "path": f["path"], "kind": "handler",
+                                  "source": base64.b64decode(f["b64"]).decode()})
             if r.status != 200:
                 raise RuntimeError(f"deploy {tenant} file {f['path']}: {r.status} {r.body}")
         r = post("cut", {"tenant": tenant})

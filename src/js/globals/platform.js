@@ -17,6 +17,9 @@
   // `on.fetch` native (captured before `_harden.js` deletes `_system`) —
   // `platform.compile` lowers to a bound fetch to a trusted compile door.
   const sysOn = _system.on;
+  // `blob.receive` native — `platform.scope(t).blob.receive` lowers to a
+  // cross-tenant streamed upload (extra target + ctx args, admin-gated).
+  const sysBlobReceive = _system.blob.receive;
 
   /**
    * Admin control plane: cross-tenant kv access, the platform root
@@ -58,6 +61,19 @@
       // `name` export (default onFetchResult); thread state with `opts.ctx`
       // (→ `request.ctx`). Return next() after it. Compose the replay bundle /
       // Code-tab sources from these reads in JS — no native assembly.
+      // Cross-tenant STREAMED upload — the streaming twin of blob.put. Pipes
+      // the inbound request body straight to `id`'s file-blobs (zero JS
+      // buffering, no chunk activations), resuming `to` with
+      // `request.ctx = {hash, len, app:<opts.ctx>}` when durable. onHeaders-only
+      // (like blob.receive); for large statics the deploy app uses this instead
+      // of base64-buffering through blob.put.
+      s.blob.receive = function (opts) {
+        opts = opts || {};
+        return sysBlobReceive(
+          opts.to, id,
+          JSON.stringify(opts.ctx !== undefined ? opts.ctx : null),
+        );
+      };
       s.blob.get = function (hash, opts) {
         opts = opts || {};
         const fetch_opts = {

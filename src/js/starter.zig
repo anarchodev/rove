@@ -33,6 +33,10 @@ const STARTER_STATIC_INDEX_HTML = @embedFile("starter_static_index_html");
 /// virgin cluster self-bootstraps deploy capability; the full admin is then
 /// published THROUGH it.
 const GENESIS_ADMIN_MJS = @embedFile("genesis_admin_mjs");
+/// The streamed static-upload module (routed at `/v1/upload`) — baked into the
+/// genesis bundle as a second handler so the bootstrap can stream large statics
+/// into the admin it publishes. Same source as web/admin's upload module.
+const GENESIS_UPLOAD_MJS = @embedFile("upload_mjs");
 
 /// One baked handler / static file for `deployBakedBundle`.
 pub const BakedHandler = struct { path: []const u8, source: []const u8 };
@@ -96,7 +100,10 @@ pub fn deployGenesisAdminContent(
         compile_fn,
         compile_ctx,
         release_ws,
-        &.{.{ .path = "index.mjs", .source = GENESIS_ADMIN_MJS }},
+        &.{
+            .{ .path = "index.mjs", .source = GENESIS_ADMIN_MJS },
+            .{ .path = "v1/upload/index.mjs", .source = GENESIS_UPLOAD_MJS },
+        },
         &.{},
     );
 }

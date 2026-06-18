@@ -386,6 +386,36 @@ pub fn jsBlobReceive(
         return js_exception;
     }
 
+    // Optional cross-tenant target (argv[1]) + echoed ctx JSON (argv[2]) — set
+    // by the `platform.scope(t).blob.receive` shim. A non-empty target streams
+    // into THAT tenant's file-blobs and is admin-only; absent = own-tenant.
+    var target: ?[]const u8 = null;
+    var target_c: ?[*:0]const u8 = null;
+    defer if (target_c) |p| c.JS_FreeCString(ctx, p);
+    if (argc >= 2 and c.JS_IsString(argv[1])) {
+        var tl: usize = 0;
+        const tc = c.JS_ToCStringLen(ctx, &tl, argv[1]);
+        if (tc != null) {
+            target_c = tc;
+            if (tl > 0) target = @as([*]const u8, @ptrCast(tc))[0..tl];
+        }
+    }
+    if (target != null and state.platform == null) {
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive: scoped receive is admin-only");
+        return js_exception;
+    }
+    var app_ctx_json: []const u8 = "{}";
+    var ctx_c: ?[*:0]const u8 = null;
+    defer if (ctx_c) |p| c.JS_FreeCString(ctx, p);
+    if (target != null and argc >= 3 and c.JS_IsString(argv[2])) {
+        var cl: usize = 0;
+        const cc = c.JS_ToCStringLen(ctx, &cl, argv[2]);
+        if (cc != null) {
+            ctx_c = cc;
+            if (cl > 0) app_ctx_json = @as([*]const u8, @ptrCast(cc))[0..cl];
+        }
+    }
+
     const a = state.allocator;
     const fetch_id = http_b.deriveFetchIdHex(a, state.request_id, state.http_fetch_index) catch {
         _ = c.JS_ThrowTypeError(ctx, "blob.receive: out of memory");
@@ -400,9 +430,11 @@ pub fn jsBlobReceive(
         for (built.items) |s| a.free(s);
         built.deinit(a);
     }
-    const url = dupePrint(a, &built, "{s}{d}.{d}", .{
+    const url = (if (target) |t| dupePrint(a, &built, "{s}{d}.{d}?scope={s}", .{
+        blob_receive.RECEIVE_ORIGIN_PREFIX, ent.index, ent.generation, t,
+    }) else dupePrint(a, &built, "{s}{d}.{d}", .{
         blob_receive.RECEIVE_ORIGIN_PREFIX, ent.index, ent.generation,
-    }) orelse {
+    })) orelse {
         _ = c.JS_ThrowTypeError(ctx, "blob.receive: out of memory");
         return js_exception;
     };
@@ -414,7 +446,7 @@ pub fn jsBlobReceive(
         _ = c.JS_ThrowTypeError(ctx, "blob.receive: out of memory");
         return js_exception;
     };
-    const ctx_json = dupePrint(a, &built, "{{}}", .{}) orelse {
+    const ctx_json = dupePrint(a, &built, "{s}", .{app_ctx_json}) orelse {
         _ = c.JS_ThrowTypeError(ctx, "blob.receive: out of memory");
         return js_exception;
     };

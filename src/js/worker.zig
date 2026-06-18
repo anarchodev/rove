@@ -2794,11 +2794,18 @@ pub fn Worker(comptime opts: Options) type {
             var pf = pf_in;
             defer pf.deinit(self.allocator);
 
+            // Cross-tenant (admin) receive: the URL carries `?scope={target}`
+            // → stage into the target tenant's file-blobs. `pf.ctx_json` is the
+            // issue-time ctx echoed back to the resume export. `pf.tenant_id`
+            // stays the chain holder (where the resume lands).
+            const target = blob_receive_mod.targetFromReceiveUrl(pf.url);
             const job = blob_receive_mod.Job.create(
                 self.allocator,
                 &self.node.router,
                 &self.node.blob_backend_cfg,
                 pf.tenant_id,
+                target,
+                pf.ctx_json,
                 pf.id,
                 pf.name,
                 null,

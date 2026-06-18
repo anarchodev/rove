@@ -17,6 +17,10 @@ const PRE_AUTH_PATHS = [
     // require one. The real gate is the cryptographic id_token verify inside
     // oidc.rp.exchangeToken (same as the _rp/* completion modules).
     "/v1/cli/exchange",
+    // The streamed static-upload module (v1/upload/index.mjs) is onHeaders-only
+    // and does its OWN auth (root token OR session-ownership) in onHeaders —
+    // the buffered RP guard here must not run on its headers-first dispatch.
+    "/v1/upload",
     // The async-completion on_result modules. callback_dispatch runs
     // dispatcher.run → _middlewares BEFORE the module, and a
     // synthesized callback request has NO request.session — so

@@ -52,11 +52,28 @@ pub fn isReceiveUrl(url: []const u8) bool {
 /// is parked by commit time.
 pub fn entityFromReceiveUrl(url: []const u8) ?rove.Entity {
     if (!isReceiveUrl(url)) return null;
-    const tail = url[RECEIVE_ORIGIN_PREFIX.len..];
+    var tail = url[RECEIVE_ORIGIN_PREFIX.len..];
+    // Cross-tenant receives carry a `?scope={target}` query — the entity is the
+    // `{index}.{generation}` before it.
+    if (std.mem.indexOfScalar(u8, tail, '?')) |q| tail = tail[0..q];
     const dot = std.mem.indexOfScalar(u8, tail, '.') orelse return null;
     const index = std.fmt.parseInt(u32, tail[0..dot], 10) catch return null;
     const generation = std.fmt.parseInt(u32, tail[dot + 1 ..], 10) catch return null;
     return .{ .index = index, .generation = generation };
+}
+
+/// Cross-tenant receive target tenant, from the `?scope={target}` query — the
+/// blob streams into THAT tenant's `file-blobs/` prefix instead of the issuing
+/// tenant's `app-blobs/`. `null` for an own-tenant receive (no query). Only the
+/// admin handler forms a scoped URL (`platform.scope(t).blob.receive`); the
+/// staging-tenant gate is the platform-only binding.
+pub fn targetFromReceiveUrl(url: []const u8) ?[]const u8 {
+    if (!isReceiveUrl(url)) return null;
+    const tail = url[RECEIVE_ORIGIN_PREFIX.len..];
+    const marker = "?scope=";
+    const i = std.mem.indexOf(u8, tail, marker) orelse return null;
+    const v = tail[i + marker.len ..];
+    return if (v.len == 0) null else v;
 }
 
 pub fn formatReceiveUrl(allocator: std.mem.Allocator, ent: rove.Entity) ![]u8 {
@@ -79,7 +96,18 @@ pub const Job = struct {
     refs: std.atomic.Value(u8) = .init(2),
 
     // Immutable after create():
+    /// The tenant holding the chain (where the terminal event routes + the
+    /// `{to}` export resumes). For own-tenant receives this is also the S3
+    /// staging tenant; for cross-tenant (admin) receives the staging tenant is
+    /// `target_id`.
     tenant_id: []u8,
+    /// Cross-tenant staging tenant (`null` → stage into `tenant_id`). When set,
+    /// bytes stream into `{target_id}/file-blobs/`; else `{tenant_id}/app-blobs/`.
+    target_id: ?[]u8,
+    /// Issue-time `ctx` (JSON) echoed back in the completion under `app` so the
+    /// admin deploy app can thread {tenant, path, content_type} across the
+    /// receive re-entry. Empty when absent.
+    app_ctx: []u8,
     fetch_id: []u8,
     /// Customer `{to}` export the terminal event resumes.
     name: []u8,
@@ -104,6 +132,8 @@ pub const Job = struct {
         router: *msg_router_mod.MsgRouter,
         cfg: *const blob_mod.backend.BackendConfig,
         tenant_id: []const u8,
+        target_id: ?[]const u8,
+        app_ctx: []const u8,
         fetch_id: []const u8,
         name: []const u8,
         content_type: ?[]const u8,
@@ -112,6 +142,10 @@ pub const Job = struct {
         errdefer allocator.destroy(self);
         const tenant_owned = try allocator.dupe(u8, tenant_id);
         errdefer allocator.free(tenant_owned);
+        const target_owned: ?[]u8 = if (target_id) |t| try allocator.dupe(u8, t) else null;
+        errdefer if (target_owned) |t| allocator.free(t);
+        const ctx_owned = try allocator.dupe(u8, app_ctx);
+        errdefer allocator.free(ctx_owned);
         const id_owned = try allocator.dupe(u8, fetch_id);
         errdefer allocator.free(id_owned);
         const name_owned = try allocator.dupe(u8, name);
@@ -120,6 +154,8 @@ pub const Job = struct {
         self.* = .{
             .allocator = allocator,
             .tenant_id = tenant_owned,
+            .target_id = target_owned,
+            .app_ctx = ctx_owned,
             .fetch_id = id_owned,
             .name = name_owned,
             .content_type = ct_owned,
@@ -135,6 +171,8 @@ pub const Job = struct {
         for (self.chunks.items) |ch| self.allocator.free(ch);
         self.chunks.deinit(self.allocator);
         self.allocator.free(self.tenant_id);
+        if (self.target_id) |t| self.allocator.free(t);
+        self.allocator.free(self.app_ctx);
         self.allocator.free(self.fetch_id);
         self.allocator.free(self.name);
         if (self.content_type) |ct| self.allocator.free(ct);
@@ -247,11 +285,15 @@ pub const Job = struct {
     fn run(self: *Job) !void {
         const a = self.allocator;
 
+        // Cross-tenant (admin) receive stages into the TARGET tenant's deploy
+        // namespace (`file-blobs`); an own-tenant receive uses `app-blobs`.
+        const stage_tenant = self.target_id orelse self.tenant_id;
+        const subdir: []const u8 = if (self.target_id != null) "file-blobs" else "app-blobs";
         var backend = try blob_mod.backend.BlobBackend.openPerTenant(
             a,
             self.cfg.*,
-            self.tenant_id,
-            "app-blobs",
+            stage_tenant,
+            subdir,
         );
         defer backend.deinit();
         const s3 = &backend.inner.s3;
@@ -391,14 +433,17 @@ pub const Job = struct {
             components_mod.UpstreamFetchEvent.deinitItem(&ev, a);
             return;
         };
+        // `app` echoes the issue-time ctx (raw JSON) so a cross-tenant deploy
+        // receive can thread {tenant, path, content_type} to its `{to}` export.
+        const app: []const u8 = if (self.app_ctx.len == 0) "null" else self.app_ctx;
         ev.ctx_json = blk: {
             if (hash_hex) |h| {
-                break :blk std.fmt.allocPrint(a, "{{\"hash\":\"{s}\",\"len\":{d}}}", .{ h, len }) catch {
+                break :blk std.fmt.allocPrint(a, "{{\"hash\":\"{s}\",\"len\":{d},\"app\":{s}}}", .{ h, len, app }) catch {
                     components_mod.UpstreamFetchEvent.deinitItem(&ev, a);
                     return;
                 };
             }
-            break :blk std.fmt.allocPrint(a, "{{\"error\":\"receive failed\"}}", .{}) catch {
+            break :blk std.fmt.allocPrint(a, "{{\"error\":\"receive failed\",\"app\":{s}}}", .{app}) catch {
                 components_mod.UpstreamFetchEvent.deinitItem(&ev, a);
                 return;
             };

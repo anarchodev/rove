@@ -23,13 +23,6 @@
 
 const WS = "_workspace/";
 
-function bytesFromB64(b64) {
-  const bin = atob(b64 || "");
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
 function jerr(status, msg) {
   response.status = status;
   return JSON.stringify({ ok: false, error: msg });
@@ -45,20 +38,14 @@ function wsReset(b) {
   return JSON.stringify({ ok: true, cleared: rows.length });
 }
 
-// Stage one file into the workspace. Static → content-address now (sync hash).
-// Handler → compile (async, bound); onFileStaged writes the entry once the
-// source+bytecode blobs are staged.
+// Stage one HANDLER into the workspace: compile (async, bound); onFileStaged
+// records the entry once the source+bytecode blobs are staged. STATICS do not
+// come through here — they stream straight to S3 via PUT /v1/upload
+// (scope(t).blob.receive), which records their workspace entry directly.
 function wsFile(b) {
   if (!b.tenant || !b.path) return jerr(400, "tenant + path required");
-  if (b.kind === "static") {
-    const hash = platform.scope(b.tenant).blob.put(bytesFromB64(b.b64), {
-      content_type: b.content_type || "",
-    });
-    platform.scope(b.tenant).kv.set(WS + b.path, JSON.stringify({
-      kind: "static", content_type: b.content_type || "", source_hex: hash,
-    }));
-    return JSON.stringify({ ok: true, path: b.path, hash: hash });
-  }
+  if (b.kind !== "handler")
+    return jerr(400, "kind must be 'handler' (statics stream via PUT /v1/upload)");
   platform.compile([{ path: b.path, source: b.source || "" }], {
     scope: b.tenant, name: "onFileStaged",
     ctx: { target: b.tenant, path: b.path, content_type: b.content_type || "" },

@@ -411,13 +411,6 @@ export function onFetchResult() {
 //   /v1/deploy/cut   {tenant}                             → {ok, dep_id}
 const WS = "_workspace/";
 
-function bytesFromB64(b64) {
-    const bin = atob(b64 || "");
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
-}
-
 // Parse + ownership-gate a deploy op. Returns the body on success, or null
 // after stamping the error response.
 function deployGate(body) {
@@ -445,13 +438,10 @@ function handleWsReset(body) {
 function handleWsFile(body) {
     const b = deployGate(body); if (!b) return null;
     if (!b.path) return jsonError(400, "path required");
-    if (b.kind === "static") {
-        const hash = platform.scope(b.tenant).blob.put(bytesFromB64(b.b64),
-            { content_type: b.content_type || "" });
-        platform.scope(b.tenant).kv.set(WS + b.path, JSON.stringify({
-            kind: "static", content_type: b.content_type || "", source_hex: hash }));
-        return { ok: true, path: b.path, hash: hash };
-    }
+    // Statics stream straight to S3 via PUT /v1/upload (scope(t).blob.receive),
+    // which records their own workspace entry — only handlers come through here.
+    if (b.kind !== "handler")
+        return jsonError(400, "kind must be 'handler' (statics stream via PUT /v1/upload)");
     platform.compile([{ path: b.path, source: b.source || "" }], {
         scope: b.tenant, name: "onFileStaged",
         ctx: { target: b.tenant, path: b.path, content_type: b.content_type || "" },
