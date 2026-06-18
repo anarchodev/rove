@@ -519,7 +519,9 @@ fn serveStaticByKey(
     if (static_cache.instance()) |sc| {
         if (try sc.getCopy(&entry.hash_hex, allocator)) |hit| {
             const body: []const u8 = if (is_head) &[_]u8{} else hit.bytes;
-            try serveInline(server, allocator, ent, sid, sess, hit.content_type, etag, STATIC_REVALIDATE_CACHE_CONTROL, null, false, body, is_head);
+            // content-type from the manifest entry (authoritative) — the LRU
+            // stores only bytes.
+            try serveInline(server, allocator, ent, sid, sess, entry.content_type, etag, STATIC_REVALIDATE_CACHE_CONTROL, null, false, body, is_head);
             return .{ .served = 200 };
         }
     }
@@ -644,7 +646,9 @@ pub fn serveAssetByHash(
     // allocator, so the response owns them). Non-blocking.
     if (static_cache.instance()) |sc| {
         if (try sc.getCopy(hash, allocator)) |hit| {
-            try serveInline(server, allocator, ent, sid, sess, hit.content_type, etag, IMMUTABLE_CACHE_CONTROL, null, false, hit.bytes, is_head);
+            // content-type from the snapshot's statics_by_hash (the gate
+            // above) — the LRU stores only bytes.
+            try serveInline(server, allocator, ent, sid, sess, content_type, etag, IMMUTABLE_CACHE_CONTROL, null, false, hit.bytes, is_head);
             return 200;
         }
     }

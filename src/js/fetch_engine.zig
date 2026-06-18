@@ -61,6 +61,7 @@ const ssrf_mod = @import("rove-ssrf");
 const jwt = @import("rove-jwt");
 const tenant_mod = @import("rove-tenant");
 const files_mod = @import("rove-files");
+const static_cache = @import("static_cache.zig");
 
 const NodeState = worker_mod.NodeState;
 const PendingFetch = globals.PendingFetch;
@@ -618,9 +619,19 @@ pub const FetchEngine = struct {
         const is_static_door = std.mem.startsWith(u8, pf.url, STATIC_ORIGIN_PREFIX);
         const is_logs_door = std.mem.startsWith(u8, pf.url, LOGS_ORIGIN_PREFIX);
         const is_cp_door = std.mem.startsWith(u8, pf.url, CP_ORIGIN_PREFIX);
+        // Read-through cache target (static door only): capture the content
+        // hash from the URL BEFORE the rewrite replaces it, so the tee can warm
+        // the LRU on completion.
+        var static_cache_hash: ?[files_mod.HASH_HEX_LEN]u8 = null;
         if (is_blob_door) {
             try self.rewriteAndSignBlobFetch(pf, method, &headers_list);
         } else if (is_static_door) {
+            const tail = pf.url[STATIC_ORIGIN_PREFIX.len..];
+            if (isSha256HexLower(tail)) {
+                var hb: [files_mod.HASH_HEX_LEN]u8 = undefined;
+                @memcpy(&hb, tail[0..files_mod.HASH_HEX_LEN]);
+                static_cache_hash = hb;
+            }
             // Own-tenant deploy-static READ door (`__system/static` streamer):
             // rewrite to THIS tenant's `file-blobs/{hash}` + SigV4-sign. Tenant
             // is `pf.tenant_id` (own-tenant, like the blob door), so a handler
@@ -709,6 +720,7 @@ pub const FetchEngine = struct {
             else
                 @as(u64, @max(@as(usize, pf.max_response_chunk_bytes), 1)),
             .held = pf.held,
+            .cache_hash = static_cache_hash,
             .transfer = undefined, // wired below
         };
         // From here on, the FetchCtx owns the pf — clear the
@@ -1235,11 +1247,22 @@ const FetchCtx = struct {
     /// `final: true` event in `onDoneCb`. Empty in `stream: true`.
     body_buf: std.ArrayListUnmanaged(u8) = .empty,
 
+    /// Read-through cache (the `rove-static.internal` door only): when set,
+    /// accumulate the response here and, on a clean ≤cap completion, insert it
+    /// into the static LRU so the next request for this hash is an inline hit
+    /// (evicted/cold assets self-heal). Null for every other fetch.
+    cache_hash: ?[files_mod.HASH_HEX_LEN]u8 = null,
+    cache_buf: std.ArrayListUnmanaged(u8) = .empty,
+    /// Set once accumulation passes the per-asset cap — stop buffering + don't
+    /// cache (the asset stays on the stream path; no huge blob held in RAM).
+    cache_drop: bool = false,
+
     fn deinit(self: *FetchCtx) void {
         var pf = self.pf;
         pf.deinit(self.allocator);
         self.headers.deinit(self.allocator);
         self.body_buf.deinit(self.allocator);
+        self.cache_buf.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -1293,6 +1316,20 @@ fn onChunkCb(bytes: []const u8, ctx: ?*anyopaque) bool {
         s.capped = true;
     }
     s.total += take.len;
+
+    // Read-through tee (static door): accumulate until the per-asset cap, then
+    // give up caching this one (free the buffer; keep streaming).
+    if (s.cache_hash != null and !s.cache_drop) {
+        if (s.cache_buf.items.len + take.len > static_cache.PER_ASSET_MAX_BYTES) {
+            s.cache_drop = true;
+            s.cache_buf.clearAndFree(s.allocator);
+        } else {
+            s.cache_buf.appendSlice(s.allocator, take) catch {
+                s.cache_drop = true;
+                s.cache_buf.clearAndFree(s.allocator);
+            };
+        }
+    }
 
     if (s.stream_mode) {
         // Stream mode: emit per writeback, split into ≤ max_chunk.
@@ -1362,6 +1399,20 @@ fn onDoneCb(transfer: *blob_curl_multi.Transfer, result: blob_curl_multi.Result,
                 "rove-js fetch_engine: emit final-empty tenant={s} id={s}: {s}",
                 .{ s.pf.tenant_id, s.pf.id, @errorName(err) },
             );
+    }
+
+    // Read-through tee: a clean, complete, ≤cap static-door response warms the
+    // LRU keyed by content hash, so the next request is an inline hit. Skip on
+    // any transport error, non-2xx, cap-truncation, or oversize-drop (partial /
+    // wrong bytes must never poison the content-addressed cache).
+    if (s.cache_hash) |h| {
+        if (transport_ok and !s.capped and !s.cache_drop and
+            result.status >= 200 and result.status < 300)
+        {
+            if (static_cache.instance()) |sc| {
+                sc.put(&h, s.cache_buf.items) catch {};
+            }
+        }
     }
 
     // Engine-thread bookkeeping: remove from inflight + free ctx.

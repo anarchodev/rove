@@ -1153,27 +1153,20 @@ fn mirrorDeployConfig(
     }
 }
 
-/// Pull a specific deployment manifest from the per-tenant
-/// `deployments/` BlobBackend, fetch every referenced bytecode, and
-/// Largest single static asset prewarmed into the in-memory LRU. Bigger
-/// assets serve via the redirect fallback (so the worker never holds a
-/// huge blob in RAM, and the LRU stays useful for the many-small case).
-const PREWARM_MAX_ASSET_BYTES: usize = 4 << 20;
-
 /// Fetch one static blob and seed it into the shared LRU. Loader-thread
-/// only (the `get` is a blocking S3 read). Best-effort — any failure
-/// just leaves the asset to the redirect fallback at serve time.
+/// only (the `get` is a blocking S3 read). Best-effort — any failure just
+/// leaves the asset to the stream path at serve time. The LRU stores only
+/// hash→bytes (content-type comes from the manifest at serve time); put()
+/// itself skips assets over the per-asset cap.
 fn prewarmStatic(
     sc: *static_cache.StaticCache,
     bs: blob_mod.BlobStore,
     hash_hex: *const [files_mod.HASH_HEX_LEN]u8,
-    content_type: []const u8,
     allocator: std.mem.Allocator,
 ) void {
     const bytes = bs.get(hash_hex, allocator) catch return;
     defer allocator.free(bytes);
-    if (bytes.len > PREWARM_MAX_ASSET_BYTES) return;
-    sc.put(hash_hex, content_type, bytes) catch {};
+    sc.put(hash_hex, bytes) catch {};
 }
 
 /// Fetch a blob with a few retries. HTML prewarm runs on the loader
@@ -1392,7 +1385,7 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
                 // the stream path) and silently no-ops when the LRU is disabled
                 // (REWIND_STATIC_CACHE_MB=0 → CF-only / stream-everything).
                 if (static_cache.instance()) |sc| {
-                    prewarmStatic(sc, bs, &entry.source_hex, entry.content_type, allocator);
+                    prewarmStatic(sc, bs, &entry.source_hex, allocator);
                 }
 
                 // Reverse hash→content_type index (deduped: a hash may

@@ -19,20 +19,26 @@ const files_mod = @import("rove-files");
 
 pub const HASH_HEX_LEN = files_mod.HASH_HEX_LEN; // 64
 
-/// One cached asset. Heap-owned by the cache; `bytes` and `content_type`
-/// are owned copies. `prev`/`next` thread the LRU list (head = MRU).
+/// Largest single asset the LRU will hold. Bigger assets are skipped (they
+/// take the stream path) so the worker never holds a huge blob in RAM and the
+/// cache stays useful for the many-small case. Mirrors the loader-side prewarm
+/// cap + the read-through tee's accumulation bound.
+pub const PER_ASSET_MAX_BYTES: usize = 4 << 20;
+
+/// One cached asset. Heap-owned by the cache; `bytes` is an owned copy. The
+/// content-type is NOT stored — both serve paths carry the authoritative type
+/// from the deployment manifest (the LRU is just hash→bytes). `prev`/`next`
+/// thread the LRU list (head = MRU).
 const Entry = struct {
     hash_hex: [HASH_HEX_LEN]u8,
-    content_type: []u8,
     bytes: []u8,
     prev: ?*Entry = null,
     next: ?*Entry = null,
 };
 
-/// What `getCopy` hands back — both slices live in the caller's allocator.
+/// What `getCopy` hands back — the bytes live in the caller's allocator.
 pub const Hit = struct {
     bytes: []u8,
-    content_type: []u8,
 };
 
 pub const StaticCache = struct {
@@ -56,7 +62,6 @@ pub const StaticCache = struct {
     }
 
     fn freeEntry(self: *StaticCache, e: *Entry) void {
-        self.allocator.free(e.content_type);
         self.allocator.free(e.bytes);
         self.allocator.destroy(e);
     }
@@ -83,18 +88,18 @@ pub const StaticCache = struct {
         self.pushFront(e);
     }
 
-    /// Insert `bytes`/`content_type` under `hash_hex` (an owned copy is
-    /// made). Idempotent: a present hash is just promoted to MRU (same
-    /// content). Oversized blobs (> cap) are skipped — they fall back to
-    /// the redirect path. Called off the dispatch loop (loader thread).
+    /// Insert `bytes` under `hash_hex` (an owned copy is made). Idempotent: a
+    /// present hash is just promoted to MRU (same content, content-addressed).
+    /// Oversized blobs (> the per-asset cap or the whole cache) are skipped —
+    /// they take the stream path. Called off the dispatch loop (loader thread
+    /// prewarm) or from the read-through tee on the fetch-engine thread.
     pub fn put(
         self: *StaticCache,
         hash_hex: []const u8,
-        content_type: []const u8,
         bytes: []const u8,
     ) !void {
         if (hash_hex.len != HASH_HEX_LEN) return;
-        if (bytes.len > self.cap_bytes) return; // never cacheable
+        if (bytes.len > PER_ASSET_MAX_BYTES or bytes.len > self.cap_bytes) return;
 
         self.mu.lock();
         defer self.mu.unlock();
@@ -107,8 +112,6 @@ pub const StaticCache = struct {
         const e = try self.allocator.create(Entry);
         errdefer self.allocator.destroy(e);
         @memcpy(&e.hash_hex, hash_hex[0..HASH_HEX_LEN]);
-        e.content_type = try self.allocator.dupe(u8, content_type);
-        errdefer self.allocator.free(e.content_type);
         e.bytes = try self.allocator.dupe(u8, bytes);
         errdefer self.allocator.free(e.bytes);
         e.prev = null;
@@ -134,9 +137,9 @@ pub const StaticCache = struct {
         }
     }
 
-    /// Look up `hash_hex`; on hit, copy the bytes + content-type into
-    /// `out` and promote to MRU. Returns null on miss. The copy lets the
-    /// response own its bytes independent of later eviction.
+    /// Look up `hash_hex`; on hit, copy the bytes into `out` and promote to
+    /// MRU. Returns null on miss. The copy lets the response own its bytes
+    /// independent of later eviction.
     pub fn getCopy(
         self: *StaticCache,
         hash_hex: []const u8,
@@ -148,9 +151,7 @@ pub const StaticCache = struct {
         const e = self.map.get(hash_hex) orelse return null;
         self.touch(e);
         const bytes = try out.dupe(u8, e.bytes);
-        errdefer out.free(bytes);
-        const ct = try out.dupe(u8, e.content_type);
-        return .{ .bytes = bytes, .content_type = ct };
+        return .{ .bytes = bytes };
     }
 };
 
@@ -202,12 +203,10 @@ test "put/getCopy round-trips and copies into the caller allocator" {
     var c = StaticCache.init(testing.allocator, 1 << 20);
     defer c.deinit();
     const key = mkhash('a');
-    try c.put(&key, "text/css", "body{}");
+    try c.put(&key, "body{}");
     const hit = (try c.getCopy(&key, testing.allocator)).?;
     defer testing.allocator.free(hit.bytes);
-    defer testing.allocator.free(hit.content_type);
     try testing.expectEqualStrings("body{}", hit.bytes);
-    try testing.expectEqualStrings("text/css", hit.content_type);
 }
 
 test "miss returns null" {
@@ -221,8 +220,8 @@ test "put is idempotent for a present hash (content-addressed)" {
     var c = StaticCache.init(testing.allocator, 1 << 20);
     defer c.deinit();
     const key = mkhash('a');
-    try c.put(&key, "text/css", "body{}");
-    try c.put(&key, "text/css", "body{}");
+    try c.put(&key, "body{}");
+    try c.put(&key, "body{}");
     try testing.expectEqual(@as(usize, 6), c.total_bytes); // not doubled
     try testing.expectEqual(@as(u32, 1), c.map.count());
 }
@@ -234,22 +233,19 @@ test "LRU evicts the least-recently-used to stay within cap" {
     const a = mkhash('a');
     const b = mkhash('b');
     const d = mkhash('d');
-    try c.put(&a, "", "aaaa");
-    try c.put(&b, "", "bbbb");
+    try c.put(&a, "aaaa");
+    try c.put(&b, "bbbb");
     // touch a so b is the LRU
     {
         const hit = (try c.getCopy(&a, testing.allocator)).?;
         testing.allocator.free(hit.bytes);
-        testing.allocator.free(hit.content_type);
     }
-    try c.put(&d, "", "dddd"); // 12 > 10 → evict LRU (b)
+    try c.put(&d, "dddd"); // 12 > 10 → evict LRU (b)
     try testing.expect((try c.getCopy(&b, testing.allocator)) == null);
     const ha = (try c.getCopy(&a, testing.allocator)).?;
     testing.allocator.free(ha.bytes);
-    testing.allocator.free(ha.content_type);
     const hd = (try c.getCopy(&d, testing.allocator)).?;
     testing.allocator.free(hd.bytes);
-    testing.allocator.free(hd.content_type);
     try testing.expect(c.total_bytes <= 10);
 }
 
@@ -257,7 +253,7 @@ test "oversized blob (> cap) is skipped" {
     var c = StaticCache.init(testing.allocator, 4);
     defer c.deinit();
     const key = mkhash('a');
-    try c.put(&key, "", "toolong"); // 7 > 4
+    try c.put(&key, "toolong"); // 7 > 4
     try testing.expect((try c.getCopy(&key, testing.allocator)) == null);
     try testing.expectEqual(@as(usize, 0), c.total_bytes);
 }
