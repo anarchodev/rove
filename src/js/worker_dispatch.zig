@@ -105,6 +105,12 @@ const SuccessRec = struct {
     deployment_id: u64,
     received_ns: i64,
     tapes: log_mod.TapePayloads,
+    /// User-defined index tags for the TERMINAL case (moved out of
+    /// `resp.tags`; owned here, freed in `captureSuccess` after the
+    /// borrow-capture, or by the teardown on an early-error drop). For
+    /// the continuation case the tags live on `cont.tags` instead —
+    /// `captureSuccess` reads from whichever applies.
+    tags: []log_mod.Tag = &.{},
     /// Pre-minted id reused on commit-time log capture so the log
     /// record shares its id with any webhook rows `webhook.send`
     /// wrote during this request's handler.
@@ -558,7 +564,20 @@ fn captureSuccess(
     const exception_owned = s.exception_owned;
     s.console_owned = &.{};
     s.exception_owned = &.{};
-    worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, status, outcome, console_owned, exception_owned, s.tapes, s.correlation_id, .inbound, raft_seq);
+    // Tags for the log: from the continuation if this is a held
+    // next() hop, else the terminal tags owned by the SuccessRec.
+    // BORROWED into the record (duped); we free the terminal copy
+    // after (the continuation copy is freed via `s.cont.deinit`).
+    const tags_for_log: []const log_mod.Tag = if (s.cont) |*ct| ct.tags else s.tags;
+    worker_mod.captureLogWithId(worker, anchor_id, s.request_id, s.method, s.path, s.host, s.deployment_id, s.received_ns, status, outcome, console_owned, exception_owned, s.tapes, s.correlation_id, tags_for_log, .inbound, raft_seq);
+    if (s.cont == null) {
+        for (s.tags) |t| {
+            worker.allocator.free(t.key);
+            worker.allocator.free(t.value);
+        }
+        if (s.tags.len > 0) worker.allocator.free(s.tags);
+        s.tags = &.{};
+    }
 }
 
 /// The raft-pending sibling an in-flight success parks on, keyed by
@@ -2618,6 +2637,13 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         for (successes.items) |*s| {
             if (s.console_owned.len > 0) allocator.free(s.console_owned);
             if (s.exception_owned.len > 0) allocator.free(s.exception_owned);
+            // Terminal tags (continuation tags ride `s.cont`, freed
+            // below). No-op after `captureSuccess` nulled them.
+            for (s.tags) |t| {
+                allocator.free(t.key);
+                allocator.free(t.value);
+            }
+            if (s.tags.len > 0) allocator.free(s.tags);
             // Safety net: a continuation descriptor still here means an
             // early-error exit before finalizeBatch consumed it. The
             // finalize helpers null `s.cont` after transfer, so this
@@ -2704,7 +2730,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         const slot = worker_mod.getOrOpenTenantSlot(worker, handler_inst) catch |err| {
             std.log.warn("rove-js: lazy openTenantSlot({s}) failed: {s}", .{ handler_inst.id, @errorName(err) });
             try respb.setSimpleResponse(server, ent, sid, sess, 500, "tenant code state missing\n", allocator);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 500, .handler_error, &.{}, &.{}, .{}, null, .inbound, 0);
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 500, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
             processed += 1;
             continue;
         };
@@ -2714,7 +2740,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // sees one deployment version completely.
         const snap = slot.pinCurrent() orelse {
             try respb.setSimpleResponse(server, ent, sid, sess, 503, "no deployment for this tenant\n", allocator);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 503, .no_deployment, &.{}, &.{}, .{}, null, .inbound, 0);
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, 0, received_ns, 503, .no_deployment, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
             processed += 1;
             continue;
         };
@@ -2761,7 +2787,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         if (!allowed) {
             const retry_after = worker.limiter.retryAfterSeconds(scope_inst.id, .request);
             try respb.setRateLimitedResponse(server, ent, sid, sess, allocator, retry_after);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 429, .handler_error, &.{}, &.{}, .{}, null, .inbound, 0);
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 429, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
             processed += 1;
             continue;
         }
@@ -2798,7 +2824,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // in-memory LRU (immutable), miss → presigned redirect. Both
             // non-blocking. Null = not an asset path → normal static/route.
             if (try respb.serveAssetByHash(server, allocator, ent, sid, sess, tc, path, rh, std.mem.eql(u8, method, "HEAD"))) |status| {
-                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, status, .ok, &.{}, &.{}, .{}, null, .inbound, 0);
+                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, status, .ok, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
                 processed += 1;
                 continue;
             }
@@ -2815,7 +2841,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             );
             switch (static_outcome) {
                 .served => |status| {
-                    worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, status, .ok, &.{}, &.{}, .{}, null, .inbound, 0);
+                    worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, status, .ok, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
                     processed += 1;
                     continue;
                 },
@@ -2826,7 +2852,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         var route = router_mod.resolveRoute(allocator, path) catch |err| {
             std.log.warn("rove-js router failed: {s}", .{@errorName(err)});
             try respb.setErrorResponse(server, ent, sid, sess);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, .{}, null, .inbound, 0);
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
             processed += 1;
             continue;
         };
@@ -2838,7 +2864,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             if (!try respb.serveConvention404(server, allocator, ent, sid, sess, tc)) {
                 try respb.setSimpleResponse(server, ent, sid, sess, 404, "not found\n", allocator);
             }
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 404, .handler_error, &.{}, &.{}, .{}, null, .inbound, 0);
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 404, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
             processed += 1;
             continue;
         };
@@ -2868,7 +2894,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
 
         if (worker.penalty_box.isBoxed(handler_inst.id, dep_id, received_ns)) {
             try respb.setSimpleResponse(server, ent, sid, sess, 503, "tenant temporarily disabled (cpu budget)\n", allocator);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 503, .timeout, &.{}, &.{}, .{}, null, .inbound, 0);
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 503, .timeout, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
             processed += 1;
             continue;
         }
@@ -2940,7 +2966,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 // up-front 413) so a declared-huge body never buffers.
                 if (declared_len > body_cap) {
                     try respb.setSimpleResponse(server, ent, sid, sess, 413, "payload too large\n", allocator);
-                    worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 413, .handler_error, &.{}, &.{}, .{}, null, .inbound, 0);
+                    worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 413, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
                     processed += 1;
                     continue;
                 }
@@ -2978,7 +3004,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // every non-chunk dispatch (chunk handlers take any size).
         if (!headers_first_dispatch and !chunk_dispatch and (declared_len > body_cap or body.len > body_cap)) {
             try respb.setSimpleResponse(server, ent, sid, sess, 413, "payload too large\n", allocator);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 413, .handler_error, &.{}, &.{}, .{}, null, .inbound, 0);
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 413, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
             processed += 1;
             continue;
         }
@@ -3008,7 +3034,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // deferred commit at raft confirmation.
             const new_txn = allocator.create(kv_mod.KvStore.TrackedTxn) catch {
                 try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn alloc failed\n", allocator);
-                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{}, null, .inbound, 0);
+                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
                 processed += 1;
                 continue;
             };
@@ -3016,7 +3042,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 allocator.destroy(new_txn);
                 std.log.warn("rove-js beginTrackedImmediate({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
                 try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn begin failed\n", allocator);
-                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{}, null, .inbound, 0);
+                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
                 processed += 1;
                 continue;
             };
@@ -3034,7 +3060,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 }
                 std.log.warn("rove-js open tracked txn ({s}) failed: {s}", .{ scope_inst.id, @errorName(err) });
                 try respb.setSimpleResponse(server, ent, sid, sess, 500, "txn open failed\n", allocator);
-                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{}, null, .inbound, 0);
+                worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
                 processed += 1;
                 continue;
             };
@@ -3196,7 +3222,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         }
         if (body_gate_failed) {
             try respb.setSimpleResponse(server, ent, sid, sess, 503, "body durability gate failed\n", allocator);
-            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 503, .fault, &.{}, &.{}, .{}, null, .inbound, 0);
+            worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 503, .fault, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
             processed += 1;
             continue;
         }
@@ -3444,7 +3470,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // failure mode (e.g. step through the same kv reads to see
             // why the handler hit the CPU budget).
             const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
-            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, status, outcome, &.{}, &.{}, tape_payloads, correlation_id, .inbound, 0);
+            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, status, outcome, &.{}, &.{}, tape_payloads, correlation_id, &.{}, .inbound, 0);
             processed += 1;
             continue;
         };
@@ -3538,7 +3564,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                         worker_mod.releaseInboundChunkParks(worker, job);
                         job.kill();
                         try respb.setSimpleResponse(server, ent, sid, sess, 413, "payload too large\n", allocator);
-                        worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 413, .handler_error, &.{}, &.{}, .{}, null, .inbound, 0);
+                        worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 413, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
                     }
                 }
                 processed += 1;
@@ -3695,7 +3721,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // message (e.g. `Date.now()`) resolves to the same value
             // it did originally.
             const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
-            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, console_owned, exception_owned, tape_payloads, correlation_id, .inbound, 0);
+            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .handler_error, console_owned, exception_owned, tape_payloads, correlation_id, &.{}, .inbound, 0);
             processed += 1;
             continue;
         }
@@ -3713,7 +3739,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             // the kv error — lets replay reach the same failure
             // point with the same prior reads.
             const tape_payloads = worker_mod.captureTapes(worker, &readset, body);
-            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, tape_payloads, correlation_id, .inbound, 0);
+            worker_mod.captureLogWithId(worker, scope_inst.id, request_id, method, path, host, dep_id, received_ns, 500, .kv_error, &.{}, &.{}, tape_payloads, correlation_id, &.{}, .inbound, 0);
             processed += 1;
             continue;
         }
@@ -3896,6 +3922,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         const exception_owned = resp.exception;
         resp.console = &.{};
         resp.exception = &.{};
+        // Move the terminal tags out of resp (empty for the
+        // continuation case — those ride `cont.tags`).
+        const tags_owned = resp.tags;
+        resp.tags = &.{};
 
         // Handler-surface Phase 1: a held `next(...)` carries its
         // on.timer/on.kv registrations to the park site, which arms the
@@ -3919,6 +3949,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             .body_len = body_len,
             .console_owned = console_owned,
             .exception_owned = exception_owned,
+            .tags = tags_owned,
             .method = method,
             .path = path,
             .host = host,

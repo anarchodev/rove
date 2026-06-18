@@ -3455,6 +3455,7 @@ test "captureLog appends a record to the worker's node-wide buffer" {
         empty,
         .{},
         "test-correlation-id",
+        &.{},
         .inbound,
         12345,
     );
@@ -3526,6 +3527,7 @@ test "captureLog records correlation_id + send_callback activation (Phase 1b)" {
         empty,
         .{},
         "chain-abc-123",
+        &.{},
         .send_callback,
         0,
     );

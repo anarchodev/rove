@@ -39,6 +39,13 @@ export function onMessage() {
   const ctx = request.ctx || {};
   if (!frame) return next(ctx);
 
+  // Tag every frame's activation with the session id so the durable
+  // replay log can be filtered by `tag.session` (cross-reconnect).
+  // getReplay also works without this via the auto `_corr` tag, but
+  // tagging makes the session explicit + survives reconnects.
+  const tagSid = frame.sid || ctx.sid;
+  if (tagSid) request.tag("session", tagSid);
+
   switch (frame.t) {
     case "hello": {
       // New run: reset the transcript, stash the goal.
@@ -84,6 +91,23 @@ export function onMessage() {
 // ── Decide the next action: call the LLM with the current view ──────
 function think(frame, ctx) {
   const sid = frame.sid || ctx.sid;
+
+  // Pending getReplay (the model asked "why?"): this is a read-only WS
+  // frame, so it can bind the replay fetch (a writing frame like onLLM
+  // can't). Issue it now and park for onReplay. We bounced through a
+  // snapshot only to reach a read-only frame — the snapshot view itself
+  // is unused on this turn.
+  if (ctx.replay_tool_id) {
+    browser.status("reading session replay…");
+    const ok = browser.getReplay(request, { to: "onReplay" });
+    if (ok) {
+      return next({ sid, replay_tool_id: ctx.replay_tool_id, refs: ctx.refs || {} });
+    }
+    // Couldn't issue (no connection ctx) — tell the model next turn.
+    const note = { role: "user", content: [{ type: "tool_result", tool_use_id: ctx.replay_tool_id, content: "Replay unavailable." }] };
+    return callLLM(sid, note, { sid, user_turn: note, refs: ctx.refs || {} });
+  }
+
   const goal = kv.get(`agent/${sid}/goal`) || "";
   const view = "Page:\n" + browser.render(frame);
 
@@ -156,11 +180,32 @@ function onShot(frame, ctx) {
   return next({ sid, pending_tool_id: ctx.pending_tool_id, refs: ctx.refs || {}, shot });
 }
 
+// ── Activation: the replay log came back ────────────────────────────
+// onReplay is a read-only fetch callback, so it can bind the next LLM
+// turn directly: feed the session's recent activations back to the
+// model as the getReplay tool_result. callLLM stays read-only.
+export function onReplay() {
+  const ctx = request.ctx || {};
+  const sid = ctx.sid;
+  let view;
+  if (!request.done || (request.status || 0) >= 400) {
+    view = "Replay unavailable (status " + (request.status || "?") + ").";
+  } else {
+    view = browser.renderReplay(browser.replayResult(request));
+  }
+  const userTurn = {
+    role: "user",
+    content: [{ type: "tool_result", tool_use_id: ctx.replay_tool_id, content: view }],
+  };
+  return callLLM(sid, userTurn, { sid, user_turn: userTurn, refs: ctx.refs || {} });
+}
+
 // ── Shared LLM turn: hold the chain, call the model, wake onLLM ──────
 // READ-ONLY (no kv writes) so the on.fetch can bind to the held WS chain.
 function callLLM(sid, userTurn, parkCtx) {
   const msgs = load(sid);
   const screenshots = kv.get("_config/screenshots") === "1";
+  const replay = kv.get("_config/replay") !== "0"; // on by default
   browser.status("thinking…");
 
   const endpoint = kv.get("_config/llm_endpoint") || "https://api.anthropic.com/v1/messages";
@@ -184,7 +229,7 @@ function callLLM(sid, userTurn, parkCtx) {
         system: SYSTEM_PROMPT,
         // Offer the pixel-screenshot tool only when the operator enabled
         // it (and the page SDK was started with screenshots:true).
-        tools: claudeTools(screenshots),
+        tools: claudeTools(screenshots, replay),
         messages: msgs.concat([userTurn]),
       }),
       timeout_ms: 30_000,
@@ -230,6 +275,16 @@ export function onLLM() {
     return next({ sid });
   }
 
+  // getReplay: the model wants this session's server-side history. We
+  // can't bind the replay fetch from here (onLLM persisted the
+  // transcript above → this is a writing frame). Bounce through a
+  // snapshot so think() (read-only) issues it; see think()/onReplay.
+  if (tu.name === "getReplay") {
+    browser.status("checking server logs…");
+    browser.act({ op: "snapshot", id: tu.id });
+    return next({ sid, replay_tool_id: tu.id, refs });
+  }
+
   // Tool name IS the op; the input carries ref/text/path.
   const action = Object.assign({ op: tu.name, id: tu.id }, tu.input || {});
 
@@ -259,8 +314,8 @@ export function onDisconnect() {
 // Adapt the shim's vendor-neutral tool list to Claude's tool schema.
 // Inference: `?` in a param description → optional; "number" → number.
 // `screenshots` toggles the opt-in pixel-capture tool.
-function claudeTools(screenshots) {
-  return browser.tools({ screenshots: !!screenshots }).map((t) => {
+function claudeTools(screenshots, replay) {
+  return browser.tools({ screenshots: !!screenshots, replay: !!replay }).map((t) => {
     const properties = {};
     const required = [];
     for (const pname of Object.keys(t.params)) {

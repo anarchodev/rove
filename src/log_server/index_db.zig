@@ -59,6 +59,15 @@ const SCHEMA: [:0]const u8 =
     \\CREATE INDEX IF NOT EXISTS log_idx_status  ON log_index (tenant_id, status, received_ns DESC);
     \\CREATE INDEX IF NOT EXISTS log_idx_failure ON log_index (tenant_id, received_ns DESC) WHERE outcome != 'ok';
     \\CREATE INDEX IF NOT EXISTS log_idx_deploy  ON log_index (tenant_id, deployment_id, received_ns DESC);
+    \\CREATE TABLE IF NOT EXISTS log_tags (
+    \\    tenant_id   TEXT NOT NULL,
+    \\    request_id  INTEGER NOT NULL,
+    \\    key         TEXT NOT NULL,
+    \\    value       TEXT NOT NULL,
+    \\    received_ns INTEGER NOT NULL,
+    \\    PRIMARY KEY (tenant_id, request_id, key)
+    \\);
+    \\CREATE INDEX IF NOT EXISTS log_tags_lookup ON log_tags (tenant_id, key, value, received_ns DESC);
 ;
 
 /// Owning handle for a `log_index.db` connection. Open once at process
@@ -123,6 +132,7 @@ pub const IndexDb = struct {
 
         try execBatchInsert(self.db, idx, ndjson_key, indexed_at_ns);
         try execLogIndexInserts(self.db, idx, ndjson_key, header_size);
+        try execLogTagsInserts(self.db, idx);
         try setMetaInTxn(self.db, "last_seen_key", ndjson_key);
 
         if (c.sqlite3_exec(self.db, "COMMIT;", null, null, null) != c.SQLITE_OK)
@@ -211,16 +221,26 @@ pub const IndexDb = struct {
         after_request_id: u64,
         floor_received_ns: i64,
         limit: u32,
+        /// Optional tag filter: when both are non-null, only records
+        /// carrying a `log_tags` row `(key=tag_key, value=tag_value)`
+        /// are returned. Backs `?tag.k=v` and the `/session/{id}`
+        /// sugar route (`tag_key = "session"`). Null → no tag filter.
+        tag_key: ?[]const u8,
+        tag_value: ?[]const u8,
     ) Error!ListResult {
         const sql =
             \\SELECT tenant_id, request_id, received_ns, duration_ns, method, path, host,
             \\       status, outcome, deployment_id
-            \\FROM log_index
-            \\WHERE tenant_id = ?
+            \\FROM log_index li
+            \\WHERE li.tenant_id = ?
             \\  AND (?2 = 0 OR
             \\       received_ns < ?2 OR
             \\       (received_ns = ?2 AND request_id < ?3))
             \\  AND (?5 = 0 OR received_ns >= ?5)
+            \\  AND (?6 IS NULL OR EXISTS (
+            \\       SELECT 1 FROM log_tags t
+            \\        WHERE t.tenant_id = li.tenant_id AND t.request_id = li.request_id
+            \\          AND t.key = ?6 AND t.value = ?7))
             \\ORDER BY received_ns DESC, request_id DESC
             \\LIMIT ?4
         ;
@@ -233,6 +253,13 @@ pub const IndexDb = struct {
         _ = c.sqlite3_bind_int64(st, 3, @intCast(after_request_id));
         _ = c.sqlite3_bind_int64(st, 4, @intCast(limit));
         _ = c.sqlite3_bind_int64(st, 5, floor_received_ns);
+        if (tag_key != null and tag_value != null) {
+            bindText(st.?, 6, tag_key.?);
+            bindText(st.?, 7, tag_value.?);
+        } else {
+            _ = c.sqlite3_bind_null(st, 6);
+            _ = c.sqlite3_bind_null(st, 7);
+        }
 
         var rows: std.ArrayListUnmanaged(ListRow) = .empty;
         errdefer {
@@ -403,6 +430,55 @@ fn execLogIndexInserts(
     }
 }
 
+/// Reserved tag key: the engine-populated per-chain correlation id.
+/// `request.tag` rejects `_`-prefixed keys, so this can't collide with
+/// a user tag. Lets `?tag._corr=<id>` filter by the engine session key
+/// even when the handler set no `session` tag of its own.
+pub const RESERVED_CORR_TAG = "_corr";
+
+/// Insert each record's user tags (+ the reserved `_corr` tag derived
+/// from its correlation_id) into `log_tags`. `INSERT OR IGNORE` on the
+/// (tenant_id, request_id, key) primary key keeps re-indexing
+/// idempotent. Runs inside the same transaction as the log_index
+/// inserts.
+fn execLogTagsInserts(db: *c.sqlite3, idx: *const sidecar.IdxFile) Error!void {
+    const sql =
+        \\INSERT OR IGNORE INTO log_tags
+        \\(tenant_id, request_id, key, value, received_ns)
+        \\VALUES (?,?,?,?,?)
+    ;
+    var st: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql.ptr, -1, &st, null) != c.SQLITE_OK) return Error.Sqlite;
+    defer _ = c.sqlite3_finalize(st);
+
+    for (idx.records) |r| {
+        if (r.correlation_id.len > 0)
+            try bindTagRow(st.?, r.tenant_id, r.request_id, RESERVED_CORR_TAG, r.correlation_id, r.received_ns);
+        for (r.tags) |t| {
+            if (t.key.len == 0 or t.value.len == 0) continue;
+            try bindTagRow(st.?, r.tenant_id, r.request_id, t.key, t.value, r.received_ns);
+        }
+    }
+}
+
+fn bindTagRow(
+    st: *c.sqlite3_stmt,
+    tenant_id: []const u8,
+    request_id: u64,
+    key: []const u8,
+    value: []const u8,
+    received_ns: i64,
+) Error!void {
+    _ = c.sqlite3_reset(st);
+    _ = c.sqlite3_clear_bindings(st);
+    bindText(st, 1, tenant_id);
+    _ = c.sqlite3_bind_int64(st, 2, @intCast(request_id));
+    bindText(st, 3, key);
+    bindText(st, 4, value);
+    _ = c.sqlite3_bind_int64(st, 5, received_ns);
+    if (c.sqlite3_step(st) != c.SQLITE_DONE) return Error.Sqlite;
+}
+
 fn setMetaInTxn(db: *c.sqlite3, key: []const u8, value: []const u8) Error!void {
     var st: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(
@@ -510,7 +586,7 @@ test "insertBatch + queryList round-trips, newest-first" {
     const ndjson_key = "_logs/00000001/00000000000000000100-1730764800000.ndjson";
     try idx.insertBatch(&batch, ndjson_key, 0);
 
-    var list = try idx.queryList("acme", 0, 0, 0, 10);
+    var list = try idx.queryList("acme", 0, 0, 0, 10, null, null);
     defer list.deinit();
     try testing.expectEqual(@as(usize, 2), list.rows.len);
     // Newest first.
@@ -521,19 +597,65 @@ test "insertBatch + queryList round-trips, newest-first" {
 
     // Pagination: cursor at (received_ns=2000, id=101) returns the
     // older row only.
-    var p2 = try idx.queryList("acme", 2_000, 101, 0, 10);
+    var p2 = try idx.queryList("acme", 2_000, 101, 0, 10, null, null);
     defer p2.deinit();
     try testing.expectEqual(@as(usize, 1), p2.rows.len);
     try testing.expectEqual(@as(u64, 100), p2.rows[0].request_id);
 
     // Retention read-clamp (Lever 3): a floor of 1500 hides the
     // received_ns=1000 record, leaving only the 2000 one — in list AND count.
-    var clamped = try idx.queryList("acme", 0, 0, 1_500, 10);
+    var clamped = try idx.queryList("acme", 0, 0, 1_500, 10, null, null);
     defer clamped.deinit();
     try testing.expectEqual(@as(usize, 1), clamped.rows.len);
     try testing.expectEqual(@as(u64, 101), clamped.rows[0].request_id);
     try testing.expectEqual(@as(u64, 2), try idx.queryCount("acme", 0)); // no clamp
     try testing.expectEqual(@as(u64, 1), try idx.queryCount("acme", 1_500)); // clamped
+}
+
+test "queryList filters by tag (user session + reserved _corr)" {
+    const a = testing.allocator;
+    const db_path = try tempPath(a, "tags");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        a.free(db_path);
+    }
+
+    var idx = try IndexDb.open(a, db_path);
+    defer idx.close();
+
+    var tags_a = [_]sidecar.Tag{.{ .key = "session", .value = "S1" }};
+    var tags_b = [_]sidecar.Tag{.{ .key = "session", .value = "S2" }};
+    var records = [_]sidecar.Record{
+        .{ .tenant_id = "acme", .request_id = 1, .received_ns = 1_000, .duration_ns = 1, .method = "GET", .path = "/a", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .correlation_id = "C1", .tags = &tags_a, .offset = 0, .length = 10 },
+        .{ .tenant_id = "acme", .request_id = 2, .received_ns = 2_000, .duration_ns = 1, .method = "GET", .path = "/b", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .correlation_id = "C1", .tags = &tags_b, .offset = 10, .length = 10 },
+    };
+    const batch = sidecar.IdxFile{
+        .node_id = "00000001",
+        .batch_id = "tagbatch",
+        .ndjson_size = 20,
+        .ndjson_sha256 = "d",
+        .first_received_ns = 1_000,
+        .last_received_ns = 2_000,
+        .records = &records,
+    };
+    try idx.insertBatch(&batch, "_logs/00000001/tagbatch.ndjson", 0);
+
+    // tag.session=S1 → only request 1.
+    var s1 = try idx.queryList("acme", 0, 0, 0, 10, "session", "S1");
+    defer s1.deinit();
+    try testing.expectEqual(@as(usize, 1), s1.rows.len);
+    try testing.expectEqual(@as(u64, 1), s1.rows[0].request_id);
+
+    // Reserved _corr tag is auto-derived from correlation_id → both rows
+    // share C1, so the engine session key returns the whole connection.
+    var c1 = try idx.queryList("acme", 0, 0, 0, 10, "_corr", "C1");
+    defer c1.deinit();
+    try testing.expectEqual(@as(usize, 2), c1.rows.len);
+
+    // Unknown tag value → no rows (not an error).
+    var none = try idx.queryList("acme", 0, 0, 0, 10, "session", "nope");
+    defer none.deinit();
+    try testing.expectEqual(@as(usize, 0), none.rows.len);
 }
 
 test "insertBatch is idempotent on the same sidecar key" {
@@ -577,7 +699,7 @@ test "insertBatch is idempotent on the same sidecar key" {
     try idx.insertBatch(&batch, ndjson_key, 0);
     try idx.insertBatch(&batch, ndjson_key, 0);
 
-    var list = try idx.queryList("globex", 0, 0, 0, 10);
+    var list = try idx.queryList("globex", 0, 0, 0, 10, null, null);
     defer list.deinit();
     try testing.expectEqual(@as(usize, 1), list.rows.len);
 }

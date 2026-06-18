@@ -573,15 +573,48 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
 - **Pluggable brain**: the snapshot/action protocol is brain-agnostic, so the
   same surface can later be driven by the end-user's local Claude over **MCP**
   (a relay + session-pairing handshake) with no SDK/protocol change.
-- **Replay-context channel** (the differentiator) is **deferred + security-gated**:
-  `getReplay(sinceSeq)` must wait on the log-server JWT becoming tenant/session-
-  scoped (`log_server/standalone.zig` discards the verify — the latent-CRITICAL
-  from the 2026-06 audit). The protocol carries the session id from day one so
-  this lights up without a retrofit.
+- **Replay-context channel** (the differentiator) **SHIPPED 2026-06-17** as
+  `browser.getReplay` — see §4.10. The earlier security gate (log-server JWT not
+  tenant-scoped) was closed first: `standalone.zig` now uses
+  `verifyWithCapAndTenant`, and the read flows through the tenant-pinned
+  `rewind-logs.internal` door.
 - **Rejected**: a general "drive the user's whole browser" extension — a loaded
   gun an untrusted customer wields against their end-users (confused-deputy,
   prompt-injection, nothing rove can vouch for). Scoping to the customer's own
   app drops the scary part while keeping the LLM-enhanced-app use case.
+
+### 4.10 Replay-context channel + user-defined index tags (2026-06-17)
+- **Decision**: ship `browser.getReplay` (the "why" tier — DOM=what,
+  screenshot=how, replay=why) on a general **user-defined index-tag** facility
+  rather than a bespoke session column. A handler attaches low-cardinality tags
+  to its request's log record via `request.tag(key, value)`; the log-server
+  indexes them in a `log_tags` companion table, so queries filter `?tag.k=v`
+  (and `/v1/{tenant}/session/{id}` is sugar for `tag.session`). Session-replay
+  is then just *a tag query*, not a one-off.
+- **Session key = the engine `correlation_id`**, auto-stamped on EVERY activation
+  of a held connection (verified stable across `ws_message` + bound-fetch
+  resumes) and surfaced to JS as `request.correlation_id`. The indexer derives a
+  reserved **`_corr`** tag from it, so `getReplay` returns a whole connection's
+  activations with **zero per-frame handler tagging**. The user `session` tag
+  (the app's own id) is the cross-reconnect bonus.
+- **Bounds (low-cardinality posture, fail-loud)**: ≤4 tags/record, keys
+  `[a-z0-9_]` (leading `_` reserved for engine tags), value ≤64 B. A violation
+  **throws** (`request.tag` is a handler bug surfaced on the record, not a silent
+  truncation). Capture rides the existing `console`-style path: tags move onto
+  the `Response`/`Continuation` in `finishResponse` so they survive a `next()`
+  (the dominant browser-agent path), and into the ndjson + sidecar so the indexer
+  populates `log_tags` without decompressing.
+- **Self-tenant logs door (Option A)**: ANY tenant may form
+  `rewind-logs.internal` for its OWN logs — the engine pins the minted
+  `logs-read` token to `pf.tenant_id` and requires the URL tenant to match, so a
+  customer can read only its own logs; only `__admin__` may target another
+  tenant (the operator path). Safe-by-construction: the read scope is the
+  engine's, not the JS's.
+- **Rejected**: positional `user1…userN` columns (opaque; meaning drifts across
+  deploys) — named tags are self-documenting and the write cost is off the
+  request hot path (the async indexer writes `log_tags`). Also rejected: a
+  bespoke `session_id` column threaded end-to-end — `correlation_id` already
+  exists captured + replicated + in the ndjson, so it only needed indexing.
 
 ---
 

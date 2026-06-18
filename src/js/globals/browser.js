@@ -182,7 +182,99 @@
                 "rendering. Prefer snapshot otherwise; it's cheaper.",
           params: {} });
       }
+      if (opts && opts.replay) {
+        list.push({ op: "getReplay",
+          desc: "Fetch this session's recent SERVER-SIDE activations (handler " +
+                "runs, their kv reads/writes and effects, status + timing) from " +
+                "the durable replay log. Use when the page state seems wrong and " +
+                "you need the CAUSE, not just the visible symptom — the snapshot " +
+                "shows WHAT, this shows WHY.",
+          params: {} });
+      }
       return list;
+    },
+
+    /**
+     * Pull this session's recent handler activations from the durable
+     * replay log — the "why" channel. Issues a read-only fetch through
+     * the internal `rewind-logs.internal` door, which the engine pins to
+     * THIS handler's own tenant (it can't reach another tenant's logs).
+     * The result wakes `opts.to`; the handler must `return next(...)`
+     * after this to hold the connection across the round-trip — same
+     * shape as `on.fetch`.
+     *
+     * Defaults to filtering by the engine per-connection session key
+     * (`request.correlation_id`, indexed as the reserved `_corr` tag),
+     * which is stamped on EVERY activation automatically — no per-frame
+     * tagging needed. Pass `opts.session` to filter by a
+     * `request.tag("session", …)` value instead (survives reconnects).
+     *
+     * @param {object} request - the handler's `request`.
+     * @param {object} opts - `{to, since?, limit?, session?}`. `to` is the
+     *   callback export name (required); `since` an `after_received_ns`
+     *   cursor; `limit` max records (default 50).
+     * @returns {boolean} false if it couldn't issue (no tenant/connection).
+     */
+    getReplay(request, opts) {
+      opts = opts || {};
+      const tenant = request && request.tenant;
+      if (!tenant || !opts.to) return false;
+      const limit = opts.limit || 50;
+      let url;
+      if (opts.session) {
+        url = "http://rewind-logs.internal/v1/" + tenant +
+          "/session/" + encodeURIComponent(opts.session) + "?limit=" + limit;
+      } else {
+        const corr = (request.correlation_id) || "";
+        if (!corr) return false;
+        url = "http://rewind-logs.internal/v1/" + tenant +
+          "/list?tag._corr=" + encodeURIComponent(corr) + "&limit=" + limit;
+      }
+      if (opts.since) url += "&after_received_ns=" + opts.since;
+      on.fetch(url, { method: "GET" }, { to: opts.to });
+      return true;
+    },
+
+    /**
+     * Decode the replay-fetch result delivered to your `getReplay`
+     * callback. Reads the bound-fetch `request.body` (JSON) into
+     * `{records: [...], next_cursor}`. Each record:
+     * `{request_id, received_ns, duration_ns, status, method, path,
+     * host, outcome}`. Returns `{records: []}` on any decode failure.
+     *
+     * @param {object} request - the callback's `request`.
+     * @returns {{records: Array, next_cursor: object|null}}
+     */
+    replayResult(request) {
+      let raw = request && request.body;
+      if (raw == null) return { records: [] };
+      if (typeof raw !== "string") {
+        try { raw = new TextDecoder().decode(raw); } catch (_) { return { records: [] }; }
+      }
+      try {
+        const o = JSON.parse(raw);
+        return { records: o.records || [], next_cursor: o.next_cursor || null };
+      } catch (_) { return { records: [] }; }
+    },
+
+    /**
+     * Render a {@link browser.replayResult} into compact, LLM-friendly
+     * text — one line per activation, newest first.
+     *
+     * @param {object} result - from {@link browser.replayResult}.
+     * @returns {string}
+     */
+    renderReplay(result) {
+      const recs = (result && result.records) || [];
+      if (!recs.length) return "No recent server-side activity for this session.";
+      const lines = ["Recent server activations (newest first):"];
+      for (const r of recs) {
+        const ms = Math.round((r.duration_ns || 0) / 1e6);
+        lines.push(
+          "#" + r.request_id + " " + (r.method || "") + " " + (r.path || "") +
+          " → " + r.status + " " + (r.outcome || "") + " (" + ms + "ms)");
+      }
+      return lines.join("\n");
     },
 
     /**

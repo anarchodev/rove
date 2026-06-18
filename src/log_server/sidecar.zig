@@ -10,6 +10,14 @@
 
 const std = @import("std");
 
+/// One user-defined index tag on a record (mirrors `rove-log`'s
+/// `Tag`). Defined locally so the sidecar owns its wire shape with no
+/// cross-module dependency. Owned key/value on parse.
+pub const Tag = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
 /// Wire-format version. Bumped when the on-disk schema changes
 /// in a backward-incompatible way; readers reject unknown versions.
 pub const VERSION: u32 = 1;
@@ -36,6 +44,16 @@ pub const Record = struct {
     /// Stored as a string in JSON so the sidecar is human-readable.
     outcome: []const u8,
     deployment_id: u64,
+    /// Per-chain correlation id (engine per-connection session key).
+    /// Carried in the sidecar so the indexer can populate the reserved
+    /// `_corr` tag without decompressing the ndjson frame. Empty when
+    /// the record had no chain context. Optional on parse (older
+    /// sidecars omit it). Owned on parse.
+    correlation_id: []const u8 = "",
+    /// User-defined index tags (≤`MAX_TAGS`). Carried so the indexer
+    /// inserts `log_tags` rows without decompressing. Optional on parse.
+    /// Owned key/value on parse.
+    tags: []Tag = &.{},
     /// Byte offset into the (decompressed) `.ndjson` payload where
     /// this record's line begins. The dashboard issues a ranged GET
     /// `[offset, offset+length)` to fetch one record without
@@ -49,6 +67,12 @@ pub const Record = struct {
         allocator.free(self.path);
         allocator.free(self.host);
         allocator.free(self.outcome);
+        if (self.correlation_id.len > 0) allocator.free(self.correlation_id);
+        for (self.tags) |t| {
+            allocator.free(t.key);
+            allocator.free(t.value);
+        }
+        if (self.tags.len > 0) allocator.free(self.tags);
         self.* = undefined;
     }
 };
@@ -144,6 +168,8 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ParseError!IdxFile
             .status = @intCast(try getInt(ro, "status")),
             .outcome = try dupeStr(allocator, ro, "outcome"),
             .deployment_id = try getInt(ro, "deployment_id"),
+            .correlation_id = try dupeStrOpt(allocator, ro, "correlation_id"),
+            .tags = try parseTags(allocator, ro),
             .offset = try getInt(ro, "offset"),
             .length = @intCast(try getInt(ro, "length")),
         };
@@ -187,8 +213,11 @@ pub fn encode(allocator: std.mem.Allocator, idx: *const IdxFile) ![]u8 {
         try writeJsonString(w, r.host);
         try w.print(",\"status\":{d},\"outcome\":", .{r.status});
         try writeJsonString(w, r.outcome);
-        try w.print(",\"deployment_id\":{d},\"offset\":{d},\"length\":{d}}}", .{
-            r.deployment_id,
+        try w.print(",\"deployment_id\":{d},\"correlation_id\":", .{r.deployment_id});
+        try writeJsonString(w, r.correlation_id);
+        try w.writeAll(",\"tags\":");
+        try writeTags(w, r.tags);
+        try w.print(",\"offset\":{d},\"length\":{d}}}", .{
             r.offset,
             r.length,
         });
@@ -210,6 +239,62 @@ fn dupeStr(
     return allocator.dupe(u8, s) catch ParseError.OutOfMemory;
 }
 
+/// Like `dupeStr` but returns `""` (static, not owned) when the field
+/// is absent. For optional fields added after the format shipped, so
+/// older sidecars still parse.
+fn dupeStrOpt(
+    allocator: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+    name: []const u8,
+) ParseError![]const u8 {
+    const v = obj.get(name) orelse return "";
+    const s = switch (v) {
+        .string => |x| x,
+        else => return "",
+    };
+    if (s.len == 0) return "";
+    return allocator.dupe(u8, s) catch ParseError.OutOfMemory;
+}
+
+/// Parse the optional `tags` object (`{"k":"v",...}`) into an owned
+/// `[]Tag`. Absent / empty / non-object → `&.{}`. Non-string values
+/// are skipped. Owned key/value bytes.
+fn parseTags(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ParseError![]Tag {
+    const v = obj.get("tags") orelse return &.{};
+    const tobj = switch (v) {
+        .object => |o| o,
+        else => return &.{},
+    };
+    const n_max = tobj.count();
+    if (n_max == 0) return &.{};
+    const list = allocator.alloc(Tag, n_max) catch return ParseError.OutOfMemory;
+    var n: usize = 0;
+    errdefer {
+        for (list[0..n]) |t| {
+            allocator.free(t.key);
+            allocator.free(t.value);
+        }
+        allocator.free(list);
+    }
+    var it = tobj.iterator();
+    while (it.next()) |e| {
+        const val = switch (e.value_ptr.*) {
+            .string => |s| s,
+            else => continue,
+        };
+        const k = allocator.dupe(u8, e.key_ptr.*) catch return ParseError.OutOfMemory;
+        errdefer allocator.free(k);
+        const val_dup = allocator.dupe(u8, val) catch return ParseError.OutOfMemory;
+        list[n] = .{ .key = k, .value = val_dup };
+        n += 1;
+    }
+    if (n == 0) {
+        allocator.free(list);
+        return &.{};
+    }
+    return allocator.realloc(list, n) catch list[0..n];
+}
+
 fn getInt(obj: std.json.ObjectMap, name: []const u8) ParseError!u64 {
     const v = obj.get(name) orelse return ParseError.MissingField;
     return switch (v) {
@@ -222,6 +307,18 @@ fn getInt(obj: std.json.ObjectMap, name: []const u8) ParseError!u64 {
         .number_string => |s| std.fmt.parseInt(u64, s, 10) catch return ParseError.InvalidJson,
         else => ParseError.InvalidJson,
     };
+}
+
+/// Emit tags as a JSON object `{"k":"v",...}` (`{}` when empty).
+fn writeTags(w: *std.Io.Writer, tags: []const Tag) !void {
+    try w.writeByte('{');
+    for (tags, 0..) |t, i| {
+        if (i > 0) try w.writeByte(',');
+        try writeJsonString(w, t.key);
+        try w.writeByte(':');
+        try writeJsonString(w, t.value);
+    }
+    try w.writeByte('}');
 }
 
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
@@ -244,6 +341,7 @@ const testing = std.testing;
 
 test "encode → parse round-trip" {
     const a = testing.allocator;
+    var tags0 = [_]Tag{ .{ .key = "session", .value = "S1" }, .{ .key = "flow", .value = "checkout" } };
     var records = [_]Record{
         .{
             .tenant_id = "acme",
@@ -256,6 +354,8 @@ test "encode → parse round-trip" {
             .status = 200,
             .outcome = "ok",
             .deployment_id = 7,
+            .correlation_id = "corr-1",
+            .tags = &tags0,
             .offset = 0,
             .length = 412,
         },
@@ -297,6 +397,14 @@ test "encode → parse round-trip" {
     try testing.expectEqualStrings("/api/foo", parsed.records[0].path);
     try testing.expectEqualStrings("handler_error", parsed.records[1].outcome);
     try testing.expectEqual(@as(u32, 380), parsed.records[1].length);
+    // correlation_id + tags round-trip on record 0; record 1 omitted
+    // them (defaults stay empty).
+    try testing.expectEqualStrings("corr-1", parsed.records[0].correlation_id);
+    try testing.expectEqual(@as(usize, 2), parsed.records[0].tags.len);
+    try testing.expectEqualStrings("session", parsed.records[0].tags[0].key);
+    try testing.expectEqualStrings("S1", parsed.records[0].tags[0].value);
+    try testing.expectEqualStrings("", parsed.records[1].correlation_id);
+    try testing.expectEqual(@as(usize, 0), parsed.records[1].tags.len);
 }
 
 test "parse rejects wrong version" {

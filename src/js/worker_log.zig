@@ -252,6 +252,11 @@ pub fn captureLog(
     exception_owned: []u8,
     tapes: log_mod.TapePayloads,
     correlation_id: ?[]const u8,
+    /// User-defined index tags (`request.tag`). BORROWED — duped into
+    /// the record here, caller keeps ownership (freed when its
+    /// Response/Continuation deinits). Pass `&.{}` on paths with no
+    /// handler tags (early errors, faults).
+    tags: []const log_mod.Tag,
     activation: log_mod.ActivationSource,
     /// Phase 5b: the raft seq the envelope carrying this request's
     /// writeset was proposed at. Pass 0 for paths with no associated
@@ -274,6 +279,7 @@ pub fn captureLog(
         exception_owned,
         tapes,
         correlation_id,
+        tags,
         activation,
         raft_seq,
     );
@@ -301,6 +307,7 @@ pub fn captureLogWithId(
     exception_owned: []u8,
     tapes: log_mod.TapePayloads,
     correlation_id: ?[]const u8,
+    tags: []const log_mod.Tag,
     activation: log_mod.ActivationSource,
     raft_seq: u64,
 ) void {
@@ -319,6 +326,7 @@ pub fn captureLogWithId(
         exception_owned,
         tapes,
         correlation_id,
+        tags,
         activation,
         raft_seq,
     ) catch |err| {
@@ -346,6 +354,7 @@ fn captureLogInner(
     exception_owned: []u8,
     tapes: log_mod.TapePayloads,
     correlation_id: ?[]const u8,
+    tags: []const log_mod.Tag,
     activation: log_mod.ActivationSource,
     raft_seq: u64,
 ) !void {
@@ -369,6 +378,9 @@ fn captureLogInner(
         "";
     errdefer if (a_corr.len > 0) allocator.free(a_corr);
 
+    const a_tags = try dupeTags(allocator, tags);
+    errdefer freeTags(allocator, a_tags);
+
     const id = request_id orelse try tl.id_minter.nextRequestId();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
 
@@ -387,9 +399,43 @@ fn captureLogInner(
         .exception = exception_owned,
         .tapes = tapes,
         .correlation_id = a_corr,
+        .tags = a_tags,
         .activation = activation,
         .raft_seq = raft_seq,
     });
+}
+
+/// Dupe borrowed tags into an owned `[]Tag` for the LogRecord. Caps at
+/// `MAX_TAGS` defensively (the JS surface already enforces it). Empty
+/// in → `&.{}` (no alloc).
+fn dupeTags(allocator: std.mem.Allocator, tags: []const log_mod.Tag) ![]log_mod.Tag {
+    if (tags.len == 0) return &.{};
+    const n = @min(tags.len, log_mod.MAX_TAGS);
+    const out = try allocator.alloc(log_mod.Tag, n);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |t| {
+            allocator.free(t.key);
+            allocator.free(t.value);
+        }
+        allocator.free(out);
+    }
+    for (tags[0..n]) |t| {
+        const k = try allocator.dupe(u8, t.key);
+        errdefer allocator.free(k);
+        const v = try allocator.dupe(u8, t.value);
+        out[filled] = .{ .key = k, .value = v };
+        filled += 1;
+    }
+    return out;
+}
+
+fn freeTags(allocator: std.mem.Allocator, tags: []log_mod.Tag) void {
+    for (tags) |t| {
+        allocator.free(t.key);
+        allocator.free(t.value);
+    }
+    if (tags.len > 0) allocator.free(tags);
 }
 
 // ── Batch flush + push-to-log-server ──────────────────────────────────

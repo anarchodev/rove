@@ -566,12 +566,44 @@ export function onLLM() {                                  // flattened result s
 Perception is **structural by default** (DOM + geometry + computed visibility +
 occlusion); pixel screenshots are a separate **opt-in** tier (`getDisplayMedia` →
 `blob.put`). The SDK renders a non-disableable "agent is driving · STOP"
-indicator + kill switch. The protocol carries a session id so a later
-**replay-context** channel can show the brain *why* the page reached its state
-(DOM = what, screenshot = how, replay = why — security-gated, `decisions.md`
-§4.8). The brain is pluggable: the same snapshot/action protocol can be driven
-by the customer's handler-hosted LLM (above) or, as a fast-follow, the
-end-user's own local Claude over MCP — no change to the SDK or page protocol.
+indicator + kill switch. The brain is pluggable: the same snapshot/action
+protocol can be driven by the customer's handler-hosted LLM (above) or, as a
+fast-follow, the end-user's own local Claude over MCP — no change to the SDK or
+page protocol.
+
+**Replay context — the "why" channel (`browser.getReplay`).** The third
+perception tier (DOM = what, screenshot = how, **replay = why**). `getReplay`
+pulls this session's recent *server-side* activations — handler runs, their kv
+reads/writes and effects, status + timing — from the durable log so the brain
+can root-cause a wrong UI instead of guessing from the symptom. It's a brain
+tool (`browser.tools({replay:true})`): the model emits `getReplay`, the handler
+issues it from a **read-only** frame (a writing frame can't bind the fetch — same
+rule as `on.fetch`), and feeds the result back as the tool's result.
+
+```js
+browser.getReplay(request, { to: "onReplay" });   // read-only frame; then return next(...)
+export function onReplay() {                        // fetch callback (read-only)
+  const text = browser.renderReplay(browser.replayResult(request));
+  return callLLM(request.ctx.sid, toolResult(text), parkCtx);  // feed it back to the model
+}
+```
+
+It reads through the internal `rewind-logs.internal` door, which the engine pins
+to **this handler's own tenant** — a customer can read only its own logs, never
+another's (`decisions.md` §4.8/§4.10). By default it filters by the engine
+per-connection session key (`request.correlation_id`, auto-stamped on every
+activation as the reserved `_corr` tag), so no per-frame tagging is needed; pass
+`{session}` to filter by a `request.tag("session", …)` value instead (survives
+reconnects).
+
+**User-defined index tags (`request.tag`).** Not browser-specific — any handler
+can attach low-cardinality index tags to its request's log record:
+`request.tag("flow", "checkout")`. The log query surface then filters
+`?tag.flow=checkout` (and `/v1/{tenant}/session/{id}` is sugar for
+`tag.session`). Bounded + fail-loud: ≤4 tags/record, keys `[a-z0-9_]` (a leading
+`_` is reserved for engine tags like `_corr`), value ≤64 bytes — a violation
+throws (it's a handler bug, not a silent drop). Keep values low-cardinality (a
+plan, a flow, a session — never a per-row unique like a raw user id).
 
 ## 6. Validation — exhaustiveness without a type system
 

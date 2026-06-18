@@ -810,20 +810,26 @@ pub const FetchEngine = struct {
     /// token as `Authorization: Bearer`. The log-server then verifies cap +
     /// tenant (`standalone.zig`, `verifyWithCapAndTenant`).
     ///
-    /// Cross-tenant by design: `__admin__` reads ANY tenant's logs, so the
-    /// scope is taken from the URL PATH (`/v1/{tenant}/…`), not `pf.tenant_id`
-    /// (which is always `__admin__` here). The routing gate — only `__admin__`
-    /// may form this host — is the primary control; the token is
-    /// defense-in-depth. The signing secret never enters JS space.
+    /// Two grants, decided by the calling tenant (step3-auth-plan.md §4,
+    /// Option A):
+    ///   • ANY tenant may read its OWN logs — the URL tenant in
+    ///     `/v1/{tenant}/…` MUST equal `pf.tenant_id`. This is what the
+    ///     browser-agent handler uses for `getReplay` (self-tenant,
+    ///     safe-by-construction: the engine pins the token to the
+    ///     caller's own tenant, so the URL can't reach another's logs).
+    ///   • `__admin__` may target ANY tenant (the operator/cross-tenant
+    ///     path) — its `pf.tenant_id` is `__admin__`, so the scope is
+    ///     taken from the URL PATH instead.
+    /// Either way the minted token is scoped to the URL's `target_tenant`,
+    /// so the log-server's `verifyWithCapAndTenant` pins the read. The
+    /// signing secret never enters JS space.
     fn rewriteAndAuthLogsFetch(
         self: *FetchEngine,
         pf: *PendingFetch,
         method: blob_curl_multi.Method,
         headers_list: *std.ArrayListUnmanaged(blob_curl_multi.Header),
     ) !void {
-        // Routing gate: only the admin tenant may use the logs door.
-        if (!std.mem.eql(u8, pf.tenant_id, tenant_mod.ADMIN_INSTANCE_ID))
-            return error.LogsDoorForbidden;
+        const is_admin = std.mem.eql(u8, pf.tenant_id, tenant_mod.ADMIN_INSTANCE_ID);
         const secret = self.node.services_jwt_secret orelse return error.LogsDoorUnconfigured;
         const base = self.node.log_internal_base orelse return error.LogsDoorUnconfigured;
         // Read-only surface: the log query routes are all GET.
@@ -832,6 +838,11 @@ pub const FetchEngine = struct {
         // Path after the door prefix, e.g. `v1/{tenant}/list?limit=20`.
         const remainder = pf.url[LOGS_ORIGIN_PREFIX.len..];
         const target_tenant = parseLogsTenant(remainder) orelse return error.LogsBadPath;
+
+        // Self-tenant grant: a non-admin caller may only read its own
+        // logs. __admin__ skips this (it reads from the URL path).
+        if (!is_admin and !std.mem.eql(u8, pf.tenant_id, target_tenant))
+            return error.LogsDoorForbidden;
 
         const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
         const token = jwt.mint(self.allocator, secret, .{

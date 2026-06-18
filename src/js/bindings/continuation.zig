@@ -26,6 +26,7 @@
 const std = @import("std");
 const qjs = @import("rove-qjs");
 const c = qjs.c;
+const log_mod = @import("rove-log");
 
 const globals = @import("../globals.zig");
 
@@ -67,11 +68,24 @@ pub const Continuation = struct {
     /// the next hop's request body as ctx + the injected effect
     /// outcome (Phase 3b-iii); 3b-i only captures it.
     ctx_json: []u8,
+    /// User-defined index tags set via `request.tag(k,v)` during the
+    /// activation that returned this continuation. Owned slice + owned
+    /// key/value. Harvested in `finishResponse` from the DispatchState
+    /// (a continuation otherwise carries no console/tape — tags are the
+    /// one observability field that must survive a `next()` so the
+    /// browser-agent's per-frame activations are tagged with their
+    /// session). The capture site BORROWS these into the LogRecord.
+    tags: []log_mod.Tag = &.{},
 
     pub fn deinit(self: *Continuation, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
         if (self.fn_name) |f| allocator.free(f);
         allocator.free(self.ctx_json);
+        for (self.tags) |t| {
+            allocator.free(t.key);
+            allocator.free(t.value);
+        }
+        if (self.tags.len > 0) allocator.free(self.tags);
     }
 };
 
