@@ -23,6 +23,59 @@ it. Every item below carries a verdict: **align** (adopt the native path),
 **justified divergence** (keep, with the reason), or **open** (scrutinize before
 deciding).
 
+## Topology: rove is disjoint clusters, not a homogeneous pool
+
+This is the lens that decides *which* of raft-rs/TiKV's mechanisms rove actually
+needs — and it explains several divergences before we get to them.
+
+**TiKV** scales one **homogeneous pool of stores** (dozens–hundreds). Its unit is
+the **Region** (a key-range shard) keeping ~3 replicas on **3 of the N stores**,
+and the **Placement Driver continuously rebalances** — add a replica on store X
+(conf-change + snapshot), drop it from store Y — for load, failure domains, and
+draining. Regions split/merge. So a Region's membership is an *ever-changing
+3-of-N subset of the pool* and **cannot** be static config: it must be replicated
+state driven by conf-change, with a snapshot to seed each freshly-placed replica.
+**Most of TiKV's membership machinery exists because groups float across the
+pool** — dynamic per-group membership, single-voter birth then grow, snapshot-on-
+placement, PD rebalancing.
+
+**rove is not a pool.** A **cluster is a small fixed node set** (today 3:
+bhs-1/2/3), and **every tenant group lives on *all* nodes of its cluster** —
+all-of-N, not 3-of-N. There is no per-tenant placement and no within-cluster
+rebalancing; the initial voter set of every tenant is identical ("this cluster's
+nodes"). rove **scales by adding clusters, not by growing one** — a tenant that
+must move lands on a *different* cluster via the cross-cluster move, and clusters
+are deliberately **disjoint transport meshes**. The cluster *is* the placement
+unit; tenants move between clusters rather than replicas rebalancing within a pool.
+
+**What this means for the arc:**
+
+- **The machinery rove genuinely needs** is for **cluster-topology change** — a
+  node joining/leaving the *cluster* (bhs-3 coming up, a dead node replaced, a
+  wiped node recovering). Those affect **every tenant uniformly** (all groups
+  add/remove the same node) and the new node has no data → snapshot. That is
+  exactly **Phase 1 + Phase 2** (snapshot carries ConfState; joiner learns from
+  it), and it is correctly raft-rs-aligned.
+- **The machinery rove does NOT need** is TiKV's per-group placement: single-voter
+  birth + grow, PD-style rebalancing, 3-of-N selection. Those serve a pool
+  elasticity rove doesn't have. (This kills the "single-voter genesis + grow"
+  option for Phase 2 — see there.)
+- **It reframes membership as a CLUSTER-LEVEL fact**, not a per-tenant one: there
+  is one authoritative node set per cluster, shared by every tenant. A topology
+  change is a *cluster-wide* fan-out (conf-change + snapshot to every tenant
+  group), not a per-tenant decision.
+- **It retroactively justifies the Phase 3 divergence.** rove's bespoke
+  cross-cluster move looks un-TiKV-like, but it's the right shape *because rove is
+  disjoint clusters, not one mesh* — TiKV's conf-change rebalancing assumes a
+  single pool, which rove deliberately does not have.
+
+**Caveat (keep honest):** this holds only while rove stays **cluster-granular**.
+If rove ever wanted within-cluster scaling (place tenants on subsets of a large
+node set), it *would* pull in TiKV's placement machinery — but that is a different
+product than the disjoint-3-node-clusters model the docs commit to. The
+locked direction is **moving tenants between clusters, not a homogeneous node
+pool.**
+
 ## The deviations (grounded)
 
 | # | Deviation | Where | Raft-native equivalent | What re-aligning deletes |
@@ -265,12 +318,26 @@ Verified against the raft-0.7.0 source (the crate TiKV uses), not memory:
   membership_from_snapshot smoke passed BECAUSE it is quiescent (no commit advance
   between add and attach); the reconciler is not. Delete the `initWithLearners`
   hack only once 2d-3 lands.
-- **2e — genesis bootstrap (DECISION).** Initial group formation still needs a
-  bootstrap voter set (even etcd keeps `--initial-cluster`). Decide: provision/CP
-  passes the initial voters per-group (retire `REWIND_VOTERS` fully), vs. keep
-  `REWIND_VOTERS` only for genesis. Surfaces before 2e.
+- **2e — cluster node-set SSOT (DECIDED: not per-tenant placement).** Per the
+  topology lens above, the "initial voter set" is NOT a per-tenant fact — it is
+  ONE cluster-level fact ("this cluster's node set"), shared by every tenant. So
+  2e is **"promote the cluster node set to a CP-owned SSOT,"** not "decide each
+  tenant's voters." The **single-voter-birth-then-grow** option (TiKV's per-Region
+  model) is **REJECTED** — it serves pool elasticity rove doesn't have and adds a
+  per-tenant grow cost for no benefit. The model: CP owns the authoritative node
+  list (it already has `REWIND_CLUSTERS`); every tenant group is born from it, and
+  a cluster topology change (add/remove a node) fans out as a conf-change +
+  snapshot to every tenant group. Genesis groups (CP directory, `__admin__`) keep
+  an irreducible static bootstrap — like etcd's `--initial-cluster`; that floor
+  cannot be snapshot-driven (nothing to snapshot from yet) and is correct.
+  `REWIND_VOTERS` (the per-node env) is retired for tenants in favor of the
+  CP-passed set (the `cp/main.zig:527` "explicit-id model is the SSOT cleanup"
+  direction). Open sub-question: pass the set at provision time vs. derive it from
+  a replicated cluster-membership record.
 - **2f — collapse the reconciler + phantom-voter machinery** once membership is
-  ConfState-SSOT.
+  ConfState-SSOT. The reconciler's job narrows to the genuine rove need —
+  converging a cluster's tenant groups onto the cluster node set after a
+  topology change (node add/remove/replace) — not per-tenant placement.
 
 ## Phase 2.5 — chunked-streaming snapshot transfer (multi-GB)
 
@@ -368,16 +435,26 @@ forward-stream, so the streamed snapshot may even be slightly stale without harm
 
 ## Phase 3 — evaluate move-via-conf-change
 
-Open question, decided after P1/P2. Can a cross-cluster move be
+Open question, decided after P1/P2. Could a cross-cluster move be
 `addLearner(new nodes) → snapshot → promote → removeNode(old)` (TiKV region
 move), with the directory routing following the membership — collapsing the
 fresh-group + forward + flip + epoch apparatus into conf-change + snapshot?
 
-**Caveats that may block it:** clusters are likely disjoint transport meshes (a
-group spanning both clusters needs cross-cluster raft connectivity); and
-"who serves during the membership overlap" is a real routing question the
-directory-flip currently answers atomically. May not be viable — evaluate, don't
-assume.
+**Leaning: justified divergence (keep the bespoke move) — per the topology lens.**
+TiKV's conf-change move works *because all stores are one homogeneous pool with
+cross-store raft connectivity*; a Region replica can be added on any store via
+conf-change because every store can talk raft to every other. **rove's clusters
+are deliberately disjoint transport meshes** (the whole scaling model is "move
+tenants between clusters," not "grow one pool" — see the topology section). A
+single raft group spanning two clusters would need cross-cluster raft
+connectivity, breaking the disjoint-mesh property on purpose introduced for
+isolation/blast-radius. And "who serves during the membership overlap" is a real
+routing question the directory-flip answers atomically. So the move-via-conf-change
+is likely *not* the rove-native path; the bespoke move (fresh group on the
+destination cluster + forward stream + atomic directory flip + epoch fence) is the
+justified divergence — it is the cross-*cluster* analog of TiKV's within-pool
+rebalance, at the granularity rove actually scales by. Confirm with evidence, but
+the topology framing makes "keep it" the expected verdict, not "align it away."
 
 ## Cross-cutting
 
