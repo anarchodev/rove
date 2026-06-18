@@ -39,6 +39,35 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// A low-cardinality, user-defined index tag attached to a request's
+/// log record. Set by the handler via `request.tag(key, value)` and
+/// indexed in the log-server's `log_tags` table so log queries can
+/// filter `?tag.<key>=<value>` (and the `/v1/{tenant}/session/{id}`
+/// sugar route filters `tag.session`). The browser-agent tags its
+/// connection with `session = <app sid>` so the brain's `getReplay`
+/// can pull just this session's activations.
+///
+/// Bounded by design (rove's low-cardinality posture): ≤`MAX_TAGS`
+/// per record, key/value lengths capped, keys restricted to
+/// `[a-z0-9_]`. A leading `_` is RESERVED for engine-populated tags
+/// (e.g. `_corr`, derived from `correlation_id`) — `request.tag`
+/// rejects it. `key`/`value` are allocator-owned by the `LogRecord`.
+pub const Tag = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+/// Max user tags per record. Tags are an observability index, not a
+/// payload — keep cardinality low. Over-cap is a handler bug
+/// (`request.tag` throws), not a silent truncation.
+pub const MAX_TAGS: usize = 4;
+/// Tag key length cap. Keys are `[a-z0-9_]`.
+pub const MAX_TAG_KEY_LEN: usize = 32;
+/// Tag value length cap. Values should be low-cardinality (a plan
+/// name, a flow id, a session id) — never a per-row unique like a
+/// raw user id with millions of distinct values.
+pub const MAX_TAG_VALUE_LEN: usize = 64;
+
 /// Per-request lifecycle outcome.
 pub const Outcome = enum(u8) {
     ok = 0,
@@ -267,6 +296,15 @@ pub const LogRecord = struct {
     /// JS exception message if the handler threw. Empty otherwise.
     exception: []const u8,
     tapes: TapePayloads = .{},
+    /// Low-cardinality user-defined index tags (≤`MAX_TAGS`), set by
+    /// the handler via `request.tag(k, v)`. Owned slice with owned
+    /// key/value bytes; `deinit` frees them. Empty (`&.{}`) when the
+    /// handler set none. The log-server indexes these into `log_tags`
+    /// for `?tag.k=v` filtering; the leader-captured record carries
+    /// them. Like `console`/`exception`, follower-rebuilt records (the
+    /// readset-replication path, which has no `LogHeader` tag field)
+    /// omit them — tags are leader-captured observability.
+    tags: []Tag = &.{},
     /// Per-chain identifier (streaming-handlers-plan §6). Empty
     /// string when the record has no chain context (pre-Phase-1
     /// records, or paths where the runtime couldn't synthesize one
@@ -294,6 +332,11 @@ pub const LogRecord = struct {
         allocator.free(self.console);
         allocator.free(self.exception);
         if (self.correlation_id.len > 0) allocator.free(self.correlation_id);
+        for (self.tags) |t| {
+            allocator.free(t.key);
+            allocator.free(t.value);
+        }
+        if (self.tags.len > 0) allocator.free(self.tags);
         self.tapes.deinit(allocator);
         self.* = undefined;
     }

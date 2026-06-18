@@ -85,6 +85,17 @@ pub fn writeBatch(
         return Error.OutOfMemory;
     defer allocator.free(idx_records);
 
+    // Flatten all records' tags into one borrowed `sidecar.Tag` buffer
+    // so each sidecar Record can point at its sub-slice (the sidecar
+    // Tag type mirrors `log_mod.Tag` but is a distinct type; the bytes
+    // are borrowed from the LogRecord and live until `sidecar.encode`
+    // below). One alloc instead of per-record.
+    var total_tags: usize = 0;
+    for (sorted) |r| total_tags += r.tags.len;
+    const all_tags = allocator.alloc(sidecar.Tag, total_tags) catch return Error.OutOfMemory;
+    defer allocator.free(all_tags);
+    var tag_cursor: usize = 0;
+
     // Per-record JSON scratch buffer. Reused across records;
     // grows to the largest record's size and stays there for the
     // lifetime of writeBatch.
@@ -106,6 +117,11 @@ pub fn writeBatch(
         const offset = frames.items.len;
         try deflater.appendFrame(allocator, &frames, json_scratch.items);
         const length = frames.items.len - offset;
+        const tags_start = tag_cursor;
+        for (r.tags) |t| {
+            all_tags[tag_cursor] = .{ .key = t.key, .value = t.value };
+            tag_cursor += 1;
+        }
         idx_records[i] = .{
             .tenant_id = r.tenant_id,
             .request_id = r.request_id,
@@ -117,6 +133,8 @@ pub fn writeBatch(
             .status = r.status,
             .outcome = outcomeName(r.outcome),
             .deployment_id = r.deployment_id,
+            .correlation_id = r.correlation_id,
+            .tags = all_tags[tags_start..tag_cursor],
             .offset = offset,
             .length = @intCast(length),
         };
@@ -238,6 +256,8 @@ fn encodeRecordJson(
     try writeJsonString(w, r.exception);
     try w.writeAll(",\"correlation_id\":");
     try writeJsonString(w, r.correlation_id);
+    try w.writeAll(",\"tags\":");
+    try writeTags(w, r.tags);
     try w.writeAll(",\"activation\":");
     try writeJsonString(w, activationName(r.activation));
     try w.writeAll(",\"tapes\":");
@@ -327,6 +347,18 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
         else => try w.writeByte(b),
     };
     try w.writeByte('"');
+}
+
+/// Emit user tags as a JSON object `{"k":"v",...}` (`{}` when empty).
+fn writeTags(w: *std.Io.Writer, tags: []const log_mod.Tag) !void {
+    try w.writeByte('{');
+    for (tags, 0..) |t, i| {
+        if (i > 0) try w.writeByte(',');
+        try writeJsonString(w, t.key);
+        try w.writeByte(':');
+        try writeJsonString(w, t.value);
+    }
+    try w.writeByte('}');
 }
 
 /// Emit `tapes` as `{name_b64: "<base64>", ...}`. Empty channels
