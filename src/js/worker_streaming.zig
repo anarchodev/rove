@@ -618,7 +618,7 @@ fn resumeStream(
         txn.rollback() catch {};
         txn_done = true;
         markStreamDraining(server, ent);
-        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, activation, 0);
         return;
     };
 
@@ -631,7 +631,7 @@ fn resumeStream(
                 txn.rollback() catch {};
                 txn_done = true;
                 markStreamDraining(server, ent);
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, activation, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, r.tags, activation, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -682,7 +682,7 @@ fn resumeStream(
                     // than a half-open stream. Helper has already
                     // freed `stage.chunks`; the defer is a no-op.
                     markStreamDraining(server, ent);
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, chain_ctx.correlation_id, activation, 0);
+                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, chain_ctx.correlation_id, r.tags, activation, 0);
                     r.console = &.{};
                     r.exception = &.{};
                     return;
@@ -697,7 +697,7 @@ fn resumeStream(
                 // then closes (chunks-empty + is_draining).
                 chain_st.activation_count += 1;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, activation, fw_seq);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, r.tags, activation, fw_seq);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -719,7 +719,7 @@ fn resumeStream(
             markStreamDraining(server, ent);
             chain_st.activation_count += 1;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, activation, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, r.tags, activation, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -733,7 +733,7 @@ fn resumeStream(
             txn.rollback() catch {};
             txn_done = true;
             markStreamDraining(server, ent);
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, activation, 0);
         },
         .stream => |*s2| {
             // Effect-reification Phase 4.0.b: stream + writes —
@@ -789,7 +789,7 @@ fn resumeStream(
                     txn_owned = false;
                     txn_done = true;
                     markStreamDraining(server, ent);
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation, 0);
+                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, activation, 0);
                     return;
                 };
                 txn_owned = false;
@@ -844,7 +844,7 @@ fn resumeStream(
             wakes_st.kv_prefixes = s2.kv_prefixes;
             s2.kv_prefixes = &.{};
             chain_st.activation_count += 1;
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation, fw_seq);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, activation, fw_seq);
         },
         // Only `.inbound_headers` / `.inbound_chunk` activations
         // produce these; stream resumes never dispatch as one.
@@ -853,7 +853,7 @@ fn resumeStream(
             txn.rollback() catch {};
             txn_done = true;
             markStreamDraining(server, ent);
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, activation, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, activation, 0);
         },
     }
 }
@@ -1046,7 +1046,7 @@ pub fn resumeBoundFetchStream(
         txn.rollback() catch {};
         txn_done = true;
         markStreamDrainingAnywhere(server, ent);
-        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
         return;
     };
 
@@ -1061,7 +1061,7 @@ pub fn resumeBoundFetchStream(
                 txn.rollback() catch {};
                 txn_done = true;
                 markStreamDrainingAnywhere(server, ent);
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, r.tags, .fetch_chunk, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1094,7 +1094,7 @@ pub fn resumeBoundFetchStream(
                     txn_owned = false;
                     txn_done = true;
                     markStreamDrainingAnywhere(server, ent);
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, chain_ctx.correlation_id, r.tags, .fetch_chunk, 0);
                     r.console = &.{};
                     r.exception = &.{};
                     return;
@@ -1103,7 +1103,7 @@ pub fn resumeBoundFetchStream(
                 txn_done = true;
                 chain_st.activation_count += 1;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .fetch_chunk, fw_seq);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, r.tags, .fetch_chunk, fw_seq);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1123,7 +1123,7 @@ pub fn resumeBoundFetchStream(
             markStreamDrainingAnywhere(server, ent);
             chain_st.activation_count += 1;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, r.tags, .fetch_chunk, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -1134,7 +1134,7 @@ pub fn resumeBoundFetchStream(
             txn.rollback() catch {};
             txn_done = true;
             markStreamDrainingAnywhere(server, ent);
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
         },
         .stream => |*s2| {
             // stream({write}) on a stream-state chain: append write
@@ -1172,7 +1172,7 @@ pub fn resumeBoundFetchStream(
                     txn_owned = false;
                     txn_done = true;
                     markStreamDrainingAnywhere(server, ent);
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
                     return;
                 };
                 txn_owned = false;
@@ -1207,7 +1207,7 @@ pub fn resumeBoundFetchStream(
             wakes_st.kv_prefixes = s2.kv_prefixes;
             s2.kv_prefixes = &.{};
             chain_st.activation_count += 1;
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .fetch_chunk, fw_seq);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .fetch_chunk, fw_seq);
         },
         // Only `.inbound_headers` / `.inbound_chunk` activations
         // produce these; stream resumes never dispatch as one.
@@ -1216,7 +1216,7 @@ pub fn resumeBoundFetchStream(
             txn.rollback() catch {};
             txn_done = true;
             markStreamDrainingAnywhere(server, ent);
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
         },
     }
 }
@@ -1468,7 +1468,7 @@ pub fn runFire(
     ) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
-        captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
+        captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, &.{}, spec.act, 0);
         return;
     };
 
@@ -1480,7 +1480,7 @@ pub fn runFire(
             if (r.exception.len > 0) {
                 p.txn.rollback() catch {};
                 p.txn_done = true;
-                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, r.console, r.exception, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
+                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, r.console, r.exception, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, r.tags, spec.act, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1492,21 +1492,21 @@ pub fn runFire(
                     std.log.warn("rove-js " ++ spec.site ++ " ({s}): propose failed: {s}", .{ label, @errorName(perr) });
                     p.txn_owned = false; // helper rolled back + destroyed the txn
                     p.txn_done = true;
-                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, r.console, r.exception, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
+                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, r.console, r.exception, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, r.tags, spec.act, 0);
                     r.console = &.{};
                     r.exception = &.{};
                     return;
                 };
                 p.txn_owned = false;
                 p.txn_done = true;
-                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, fw_seq);
+                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, r.tags, spec.act, fw_seq);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
             }
             commitReadOnlyFire(p, spec.site ++ ".commit(terminal)");
             flushFireFetches(worker, &pending_fetches);
-            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, st, .ok, r.console, r.exception, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, r.tags, spec.act, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -1543,12 +1543,12 @@ pub fn runFire(
                     std.log.warn("rove-js " ++ spec.site ++ " ({s}): cont-return propose failed: {s}", .{ label, @errorName(perr) });
                     p.txn_owned = false;
                     p.txn_done = true;
-                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
+                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, cval.tags, spec.act, 0);
                     return;
                 };
                 p.txn_owned = false;
                 p.txn_done = true;
-                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, fw_seq);
+                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, cval.tags, spec.act, fw_seq);
                 return;
             }
             if (comptime spec.readonly_cont_commits) {
@@ -1558,7 +1558,7 @@ pub fn runFire(
                 p.txn.rollback() catch {};
                 p.txn_done = true;
             }
-            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, cval.tags, spec.act, 0);
         },
         .stream => |*s2| {
             s2.deinit(allocator);
@@ -1581,17 +1581,17 @@ pub fn runFire(
                     std.log.warn("rove-js " ++ spec.site ++ " ({s}): stream-return propose failed: {s}", .{ label, @errorName(perr) });
                     p.txn_owned = false;
                     p.txn_done = true;
-                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
+                    captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .fault, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, &.{}, spec.act, 0);
                     return;
                 };
                 p.txn_owned = false;
                 p.txn_done = true;
-                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, fw_seq);
+                captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, &.{}, spec.act, fw_seq);
                 return;
             }
             commitReadOnlyFire(p, spec.site ++ ".commit(stream)");
             flushFireFetches(worker, &pending_fetches);
-            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 200, .ok, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, &.{}, spec.act, 0);
         },
         // Only `.inbound_headers` / `.inbound_chunk` activations
         // produce these; connectionless fires never dispatch as one.
@@ -1599,7 +1599,7 @@ pub fn runFire(
         .no_onheaders, .no_onchunk => {
             p.txn.rollback() catch {};
             p.txn_done = true;
-            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, spec.act, 0);
+            captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, &.{}, spec.act, 0);
         },
     }
 }

@@ -208,12 +208,21 @@ pub const Dispatcher = struct {
         var console_buf: std.ArrayList(u8) = .empty;
         errdefer console_buf.deinit(self.allocator);
 
+        // Per-dispatch user-tag accumulator (`request.tag`). Owned here
+        // like `console_buf`; `finishResponse` MOVES the tags onto the
+        // Response/Continuation (so they survive a `next()`), or frees
+        // them on the drop paths. The errdefer covers error returns
+        // before that hand-off (e.g. kv_error).
+        var tags_buf: std.ArrayList(log_mod.Tag) = .empty;
+        errdefer freeTagsBuf(self.allocator, &tags_buf);
+
         var state = globals.DispatchState{
             .allocator = self.allocator,
             .kv = kv,
             .txn = txn,
             .writeset = writeset,
             .console = &console_buf,
+            .tags = &tags_buf,
             .readset = request.trace.readset,
             // `docs/primitive-gaps.md` §9 — Zig-side PRNG retired.
             // arenajs's per-request xorshift64star state is the
@@ -331,7 +340,7 @@ pub const Dispatcher = struct {
         if (mw_bytecode_opt) |mw_bc| {
             const mw_fun_val = (try module_execution.loadModuleBytecode(&ctx, self.allocator, mw_bc, &pending,
                 "_middlewares/index.mjs is not an ES module")) orelse
-                return finishResponse(self, &state, &pending, &console_buf);
+                return finishResponse(self, &state, &pending, &console_buf, &tags_buf);
             module_execution.runMiddleware(self, &rt, &ctx, mw_fun_val, budget, &pending) catch |err| switch (err) {
                 error.Interrupted => return DispatchError.Interrupted,
                 error.OutOfMemory => return DispatchError.OutOfMemory,
@@ -340,12 +349,12 @@ pub const Dispatcher = struct {
         }
 
         if (pending.short_circuit) {
-            return finishResponse(self, &state, &pending, &console_buf);
+            return finishResponse(self, &state, &pending, &console_buf, &tags_buf);
         }
 
         const fun_val = (try module_execution.loadModuleBytecode(&ctx, self.allocator, bytecode, &pending,
             "handler bytecode is not an ES module (.mjs)")) orelse
-            return finishResponse(self, &state, &pending, &console_buf);
+            return finishResponse(self, &state, &pending, &console_buf, &tags_buf);
 
         module_execution.runModule(self, &rt, &ctx, fun_val, request, budget, &pending) catch |err| switch (err) {
             error.Interrupted => return DispatchError.Interrupted,
@@ -353,7 +362,7 @@ pub const Dispatcher = struct {
             error.JsException => {}, // pending.exception already populated
         };
 
-        return finishResponse(self, &state, &pending, &console_buf);
+        return finishResponse(self, &state, &pending, &console_buf, &tags_buf);
     }
 
     /// Back-compat dispatch: run, and collapse a `.continuation` to a
@@ -426,21 +435,35 @@ pub const Dispatcher = struct {
     }
 };
 
+/// Free a per-dispatch tag accumulator: the owned key/value bytes of
+/// each entry, then the buffer. Used on the drop paths (probe miss,
+/// stream, error) where the tags don't move onto a Response/Continuation.
+fn freeTagsBuf(allocator: std.mem.Allocator, tags_buf: *std.ArrayList(log_mod.Tag)) void {
+    for (tags_buf.items) |t| {
+        allocator.free(t.key);
+        allocator.free(t.value);
+    }
+    tags_buf.deinit(allocator);
+}
+
 fn finishResponse(
     d: *Dispatcher,
     state: *globals.DispatchState,
     pending: *PendingResponse,
     console_buf: *std.ArrayList(u8),
+    tags_buf: *std.ArrayList(log_mod.Tag),
 ) DispatchError!RunOutcome {
     // Headers-first / chunk probe miss — before everything else:
     // nothing ran, so there is no kv error / stream / continuation to
     // reconcile.
     if (pending.no_onheaders) {
         console_buf.deinit(d.allocator);
+        freeTagsBuf(d.allocator, tags_buf);
         return .no_onheaders;
     }
     if (pending.no_onchunk) {
         console_buf.deinit(d.allocator);
+        freeTagsBuf(d.allocator, tags_buf);
         return .no_onchunk;
     }
 
@@ -483,6 +506,9 @@ fn finishResponse(
             };
             c2.deinit(d.allocator); // path/fn_name/ctx_json — ctx was dup'd into `s`
             console_buf.deinit(d.allocator);
+            // Streams don't carry a tag set today (no log record per
+            // chunk write); drop what the handler set.
+            freeTagsBuf(d.allocator, tags_buf);
             return .{ .stream = s };
         }
         // Terminal close: ship the buffered chunks before the final body.
@@ -496,7 +522,16 @@ fn finishResponse(
     if (pending.continuation) |cont| {
         pending.continuation = null;
         console_buf.deinit(d.allocator);
-        return .{ .continuation = cont };
+        // Tags must survive a `next()` — move them onto the
+        // continuation so the held-chain capture site records them
+        // (this is the browser-agent's per-frame session tag).
+        var c2 = cont;
+        c2.tags = tags_buf.toOwnedSlice(d.allocator) catch {
+            freeTagsBuf(d.allocator, tags_buf);
+            c2.deinit(d.allocator);
+            return DispatchError.OutOfMemory;
+        };
+        return .{ .continuation = c2 };
     }
     const console_bytes = console_buf.toOwnedSlice(d.allocator) catch
         return DispatchError.OutOfMemory;
@@ -519,6 +554,9 @@ fn finishResponse(
         }
     }
 
+    const tags_slice = tags_buf.toOwnedSlice(d.allocator) catch
+        return DispatchError.OutOfMemory;
+
     return .{ .terminal = .{
         .status = pending.status,
         .body = pending.body,
@@ -527,6 +565,7 @@ fn finishResponse(
         .exception = pending.exception,
         .set_cookies = set_cookies,
         .headers = headers_slice,
+        .tags = tags_slice,
     } };
 }
 
@@ -1393,6 +1432,68 @@ test "dispatch: console.log captured into response.console" {
     defer resp.deinit(testing.allocator);
 
     try testing.expectEqualStrings("hello world\nline2\n", resp.console);
+}
+
+test "dispatch: request.tag captured into response.tags (update-in-place)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var resp = try runOne(
+        &d,
+        kv,
+        \\request.tag("session", "S1");
+        \\request.tag("flow", "checkout");
+        \\request.tag("session", "S2"); // same key → updates in place
+        \\return "x";
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 2), resp.tags.len);
+    var saw_session = false;
+    var saw_flow = false;
+    for (resp.tags) |t| {
+        if (std.mem.eql(u8, t.key, "session")) {
+            try testing.expectEqualStrings("S2", t.value);
+            saw_session = true;
+        }
+        if (std.mem.eql(u8, t.key, "flow")) {
+            try testing.expectEqualStrings("checkout", t.value);
+            saw_flow = true;
+        }
+    }
+    try testing.expect(saw_session and saw_flow);
+}
+
+test "dispatch: request.tag rejects reserved + over-cap (fail loud)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    // A reserved `_`-prefixed key throws → the handler exception is
+    // surfaced on the Response (caught, not a crash).
+    var resp = try runOne(
+        &d,
+        kv,
+        \\request.tag("_corr", "nope");
+        \\return "x";
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expect(resp.exception.len > 0);
 }
 
 test "dispatch: response.headers emitted, reserved names filtered, custom CT overrides auto-json" {

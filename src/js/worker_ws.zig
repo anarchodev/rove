@@ -449,7 +449,7 @@ fn finishWsResume(
             if (r.exception.len > 0) {
                 p.txn.rollback() catch {};
                 p.txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, act, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, &.{}, act, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
@@ -460,13 +460,13 @@ fn finishWsResume(
             const fw_seq = shipWsFrames(worker, conn_ent, stream_chunks, chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, true) catch |perr| {
                 std.log.warn("rove-js {s} (terminal+writes): propose failed: {s}", .{ tag, @errorName(perr) });
                 p.txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, act, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, act, 0);
                 tearDownWsChain(worker, conn_ent);
                 return;
             };
             p.txn_done = true;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, act, fw_seq);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, r.tags, act, fw_seq);
             r.console = &.{};
             r.exception = &.{};
             tearDownWsChain(worker, conn_ent);
@@ -480,7 +480,7 @@ fn finishWsResume(
                 std.log.warn("rove-js {s} (next+writes): propose failed: {s}", .{ tag, @errorName(perr) });
                 p.txn_done = true;
                 cval.deinit(allocator);
-                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, act, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, act, 0);
                 effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
                 tearDownWsChain(worker, conn_ent);
                 return;
@@ -491,6 +491,13 @@ fn finishWsResume(
             chain_st.ctx_json = cval.ctx_json;
             cval.ctx_json = &.{};
             chain_st.activation_count += 1;
+            // Capture the log (with this frame's session tags) BEFORE
+            // freeing the continuation — `cval.tags` is borrowed here
+            // (duped into the record), so it must outlive the call.
+            // ws_message frames return next(), so this is the dominant
+            // browser-agent capture path — without it the per-frame
+            // activations carry no `session` tag.
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, cval.tags, act, fw_seq);
             cval.deinit(allocator);
             // §4.5 input gate: a writing frame's output is commit-gated — close
             // the gate so later frames queue behind it in arrival order.
@@ -505,7 +512,6 @@ fn finishWsResume(
             }
             // Arm any on.kv/on.timer this frame registered (rides the chain).
             if (pending_wakes.items.len > 0) installWsWakes(worker, chain_ent, pending_wakes, read_version);
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, act, fw_seq);
         },
         .stream => |*s2| {
             // A streamed-response descriptor is out of scope on WS (the
@@ -513,7 +519,7 @@ fn finishWsResume(
             s2.deinit(allocator);
             p.txn.rollback() catch {};
             p.txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 501, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, act, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 501, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, act, 0);
             effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
             tearDownWsChain(worker, conn_ent);
         },
@@ -522,7 +528,7 @@ fn finishWsResume(
         .no_onheaders, .no_onchunk => {
             p.txn.rollback() catch {};
             p.txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, act, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, act, 0);
             effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
             tearDownWsChain(worker, conn_ent);
         },
@@ -620,7 +626,7 @@ fn fireWsMessage(
     ) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .ws_message, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .ws_message, 0);
         effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
         tearDownWsChain(worker, conn_ent);
         return;
@@ -803,7 +809,7 @@ pub fn resumeBoundFetchChainWs(
     ) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .fetch_chunk, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
         effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
         tearDownWsChain(worker, conn_ent);
         return;
@@ -904,7 +910,7 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     ) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .wake_batch, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .wake_batch, 0);
         effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
         tearDownWsChain(worker, conn_ent);
         return;
@@ -1037,7 +1043,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
     ) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .disconnect, 0);
         return;
     };
 
@@ -1057,12 +1063,12 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
             std.log.warn("rove-js ws-disconnect: propose failed: {s}", .{@errorName(perr)});
             p.txn_owned = false;
             p.txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .disconnect, 0);
             return;
         };
         p.txn_owned = false;
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .disconnect, 0);
         return;
     }
     p.txn.commit() catch |e| switch (e) {
@@ -1078,5 +1084,5 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         ),
     };
     p.txn_done = true;
-    captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, .disconnect, 0);
+    captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .disconnect, 0);
 }

@@ -455,7 +455,13 @@ fn handleOne(
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
     const floor_ns = rctx.retention.floorNs(rctx.cfg, route.tenant_id, now_ns);
     switch (route.kind) {
-        .list => try handleList(server, allocator, rctx.db, ent, sid, sess, route.tenant_id, route.query, floor_ns, rctx.cfg),
+        .list => {
+            const tf = parseTagFilter(route.query);
+            try handleList(server, allocator, rctx.db, ent, sid, sess, route.tenant_id, route.query, floor_ns, rctx.cfg, if (tf) |t| t.key else null, if (tf) |t| t.value else null);
+        },
+        // Replay sugar: list this session's activations, newest-first.
+        // `/session/{id}` ≡ `/list?tag.session={id}`.
+        .session => try handleList(server, allocator, rctx.db, ent, sid, sess, route.tenant_id, route.query, floor_ns, rctx.cfg, "session", route.tail),
         .show => try handleShow(server, allocator, rctx.store, rctx.db, ent, sid, sess, route.tenant_id, route.tail, floor_ns, rctx.cfg),
         .count => try handleCount(server, allocator, rctx.db, ent, sid, sess, route.tenant_id, floor_ns, rctx.cfg),
     }
@@ -508,19 +514,22 @@ fn handleBatchPushed(
     try setResponse(server, ent, sid, sess, 204, "", rctx.cfg);
 }
 
-const RouteKind = enum { list, show, count };
+const RouteKind = enum { list, show, count, session };
 
 const ParsedRoute = struct {
     kind: RouteKind,
     tenant_id: []const u8,
-    /// For `show`: the request_id segment. Empty otherwise.
+    /// For `show`: the request_id segment. For `session`: the session
+    /// id (filters `tag.session`). Empty otherwise.
     tail: []const u8,
     /// Raw query string (after `?`). Empty if absent.
     query: []const u8,
 };
 
-/// `/v1/{tenant_id}/list[?...]` or `/v1/{tenant_id}/show/{request_id}`.
-/// Returns null on shape mismatch (caller responds 404).
+/// `/v1/{tenant_id}/list[?...]`, `/v1/{tenant_id}/show/{request_id}`,
+/// `/v1/{tenant_id}/count`, or `/v1/{tenant_id}/session/{session_id}`
+/// (replay sugar for `list?tag.session={session_id}`). Returns null on
+/// shape mismatch (caller responds 404).
 fn parseRoute(path: []const u8) ?ParsedRoute {
     const q_idx = std.mem.indexOfScalar(u8, path, '?');
     const path_no_query = if (q_idx) |i| path[0..i] else path;
@@ -545,6 +554,30 @@ fn parseRoute(path: []const u8) ?ParsedRoute {
         if (tail.len == 0) return null;
         return .{ .kind = .show, .tenant_id = tenant_id, .tail = tail, .query = query };
     }
+    if (std.mem.startsWith(u8, remainder, "session/")) {
+        const tail = remainder["session/".len..];
+        if (tail.len == 0) return null;
+        return .{ .kind = .session, .tenant_id = tenant_id, .tail = tail, .query = query };
+    }
+    return null;
+}
+
+/// Extract a single `tag.<key>=<value>` filter from the query string,
+/// if present. Returns the (key, value) borrowing into `query`, or null
+/// when no `tag.` param is present. Only the first is honored — one tag
+/// filter per query keeps the index plan simple (multi-tag AND can be
+/// added when a customer needs it). The `<value>` is NOT percent-decoded
+/// here; low-cardinality tag values are `[a-z0-9_]`-shaped by convention.
+fn parseTagFilter(query: []const u8) ?struct { key: []const u8, value: []const u8 } {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        if (!std.mem.startsWith(u8, pair, "tag.")) continue;
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const key = pair["tag.".len..eq];
+        const value = pair[eq + 1 ..];
+        if (key.len == 0 or value.len == 0) continue;
+        return .{ .key = key, .value = value };
+    }
     return null;
 }
 
@@ -561,12 +594,16 @@ fn handleList(
     query: []const u8,
     floor_received_ns: i64,
     cfg: *const Config,
+    /// Optional `tag.<key>=<value>` filter (or `"session"` + the id for
+    /// the `/session/{id}` sugar route). Null → unfiltered list.
+    tag_key: ?[]const u8,
+    tag_value: ?[]const u8,
 ) !void {
     const limit = parseUint(u32, query, "limit", 100);
     const after_received_ns = parseInt(i64, query, "after_received_ns", 0);
     const after_request_id = parseUint(u64, query, "after_request_id", 0);
 
-    var list = db.queryList(tenant_id, after_received_ns, after_request_id, floor_received_ns, limit) catch |err| {
+    var list = db.queryList(tenant_id, after_received_ns, after_request_id, floor_received_ns, limit, tag_key, tag_value) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "list failed: {s}\n", .{@errorName(err)});
         try setResponseOwned(server, ent, sid, sess, 500, msg, cfg);
         return;
@@ -951,6 +988,25 @@ test "parseRoute matches /v1/{tenant}/count" {
     try testing.expectEqual(RouteKind.count, r.kind);
     try testing.expectEqualStrings("acme", r.tenant_id);
     try testing.expectEqualStrings("", r.tail);
+}
+
+test "parseRoute matches /v1/{tenant}/session/{id}" {
+    const r = parseRoute("/v1/acme/session/abc-123?limit=20").?;
+    try testing.expectEqual(RouteKind.session, r.kind);
+    try testing.expectEqualStrings("acme", r.tenant_id);
+    try testing.expectEqualStrings("abc-123", r.tail);
+    try testing.expectEqualStrings("limit=20", r.query);
+    // Empty session id is a 404 (no tail).
+    try testing.expect(parseRoute("/v1/acme/session/") == null);
+}
+
+test "parseTagFilter pulls a tag.k=v from the query" {
+    const tf = parseTagFilter("limit=20&tag.session=s1&after_received_ns=5").?;
+    try testing.expectEqualStrings("session", tf.key);
+    try testing.expectEqualStrings("s1", tf.value);
+    try testing.expect(parseTagFilter("limit=20") == null);
+    try testing.expect(parseTagFilter("tag.=v") == null);
+    try testing.expect(parseTagFilter("tag.k=") == null);
 }
 
 test "parseRoute rejects bad shapes" {

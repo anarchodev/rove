@@ -467,11 +467,21 @@ pub const Response = struct {
     /// `content-type: application/json` when true. Suppressed when the
     /// handler set a content-type via `response.headers`.
     body_is_json: bool = false,
+    /// User-defined index tags set via `request.tag(k,v)` during this
+    /// activation (≤`MAX_TAGS`). Owned slice + owned key/value; `deinit`
+    /// frees them. The capture site BORROWS these into the LogRecord
+    /// (duped there), so this Response keeps ownership. Empty = none.
+    tags: []log_mod.Tag = &.{},
 
     pub fn deinit(self: *Response, allocator: std.mem.Allocator) void {
         allocator.free(self.body);
         allocator.free(self.console);
         allocator.free(self.exception);
+        for (self.tags) |t| {
+            allocator.free(t.key);
+            allocator.free(t.value);
+        }
+        if (self.tags.len > 0) allocator.free(self.tags);
         for (self.set_cookies) |cookie| allocator.free(cookie);
         if (self.set_cookies.len > 0) allocator.free(self.set_cookies);
         for (self.headers) |h| {
