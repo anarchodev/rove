@@ -143,6 +143,42 @@ fn cmdRelease(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, dep_i
     fatal("release flip failed on every worker after retries", .{});
 }
 
+/// PUT a system KV key via the worker's move-secret-gated `/_system/v2-kv`
+/// (leader-gated → 6× round-robin retry). The bootstrap seam for operator
+/// allowlist + OIDC RP config: those keys grant access, so there's no
+/// operator-gated endpoint to write them through (chicken-and-egg) — the
+/// move-secret is the out-of-band authority, same surface a tenant move uses.
+fn cmdKvPut(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, key: []const u8, value: []const u8) void {
+    const ms = env.require("REWIND_MOVE_SECRET");
+    const headers = [_]Header{
+        .{ .name = "X-Rewind-Move-Secret", .value = ms },
+        .{ .name = "Content-Type", .value = "application/json" },
+    };
+    var body = std.ArrayList(u8){};
+    body.appendSlice(a, "{\"tenant\":") catch oom();
+    c.writeJsonString(&body, a, tenant);
+    body.appendSlice(a, ",\"key\":") catch oom();
+    c.writeJsonString(&body, a, key);
+    body.appendSlice(a, ",\"value\":") catch oom();
+    c.writeJsonString(&body, a, value);
+    body.appendSlice(a, "}") catch oom();
+
+    const workers = c.workerUrls(env, a);
+    var attempt: usize = 0;
+    while (attempt < 6) : (attempt += 1) {
+        for (workers) |w| {
+            const r = c.workerPost(a, env, w, "/_system/v2-kv", &headers, body.items, 30);
+            if (r.code == 200 or r.code == 204) {
+                std.debug.print("kv-put {s} [{s}] → {d}\n", .{ tenant, key, r.code });
+                return;
+            }
+            std.debug.print("  kv-put via {s}: {d} {s} (trying next)\n", .{ w, r.code, c.trunc(r.body) });
+        }
+        std.Thread.sleep(2 * std.time.ns_per_s);
+    }
+    fatal("kv-put '{s}' failed on every worker after retries", .{key});
+}
+
 // ── placement / routing verbs (CP, move-secret) ─────────────────────────────
 
 /// POST /_control/provision {tenant, cluster, host?}. 204 = placed, 409 = already.
@@ -264,6 +300,7 @@ const usage =
     \\  rewind-ops move <tenant> <cluster> [--live] --yes        relocate a tenant
     \\  rewind-ops host add <host> <tenant>           map a domain → tenant
     \\  rewind-ops plan set <tenant> <plan>           set a tenant's plan/limits blob
+    \\  rewind-ops kv-put <tenant> <key> [value]     seed a system kv key (move-secret; operator/OIDC bootstrap)
     \\  rewind-ops status <host>                      resolve a host → tenant/cluster/plan
     \\
     \\options:
@@ -359,6 +396,9 @@ pub fn main() void {
         if (p.len < 1 or !std.mem.eql(u8, p[0], "set")) fatal("plan needs: set <tenant> <plan>", .{});
         if (p.len < 3) fatal("plan set needs <tenant> <plan>", .{});
         cmdPlan(a, &env, p[1], p[2]);
+    } else if (std.mem.eql(u8, cmd, "kv-put")) {
+        if (p.len < 2) fatal("kv-put needs <tenant> <key> [value] (value defaults to empty)", .{});
+        cmdKvPut(a, &env, p[0], p[1], if (p.len >= 3) p[2] else "");
     } else if (std.mem.eql(u8, cmd, "status")) {
         if (p.len < 1) fatal("status needs <host>", .{});
         cmdStatus(a, &env, p[0]);
