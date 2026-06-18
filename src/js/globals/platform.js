@@ -37,15 +37,16 @@
      * @returns {{kv:object, blob:object, deploy:object}}
      *   - `kv` — `{get, set, delete, prefix}`, the same as the global
      *     {@link kv}, bound to instance `id`.
-     *   - `blob` — `{put(bytes, {content_type})}`: stage a content-addressed
-     *     blob into `id`'s file-blobs; returns the sha256 hash synchronously
-     *     (the PUT defers off the poll loop). The blob twin of `kv`.
-     *   - `deploy` — `{stampManifest(entries)}`: write a deployment manifest
-     *     into `id`'s deployments/ from the app's composed `entries`
+     *   - `blob` — `{get(hash, {to}), receive({to, ctx})}`: cross-tenant blob
+     *     READ (resumes `to` with the bytes) + STREAMED write (pipe the inbound
+     *     body straight into `id`'s file-blobs, no JS buffering). There is no
+     *     sync `put` — cross-tenant writes stream via `receive`.
+     *   - `deploy` — `{stampManifest(entries), readManifest(dep)}`: write/read a
+     *     deployment manifest in `id`'s deployments/ from composed `entries`
      *     (`[{path, kind, source_hex, bytecode_hex?, content_type?}]`);
-     *     returns the dep_id (16-hex). Compose deploys with
-     *     {@link platform.compile} + `blob.put` + `stampManifest`, then
-     *     activate with {@link platform.releases.publish}.
+     *     stampManifest returns the dep_id (16-hex). Compose deploys with
+     *     {@link platform.compile} (handlers) + `blob.receive` (statics) +
+     *     `stampManifest`, then activate with {@link platform.releases.publish}.
      *   Unknown id throws `Error{code:"InstanceNotFound"}`.
      *
      * @example

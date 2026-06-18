@@ -318,16 +318,24 @@ def main() -> int:
         TRIVIAL = "export default function(){ return 'hi'; }"
 
         def deploy_via(cookie, tenant, *, root=False):
+            # Per-file workspace flow: reset → file(handler) → cut. The auth
+            # gate fires on each op, so a non-owner is refused at reset.
             hdrs = {"content-type": "application/json"}
             if root:
                 hdrs["Authorization"] = "Bearer " + c.root_token
             elif cookie:
                 hdrs["Cookie"] = cookie
-            body = json.dumps({"tenant": tenant,
-                               "handlers": [{"path": "index.mjs", "source": TRIVIAL}],
-                               "statics": []})
-            return c.tls_curl(app_origin + "/v1/deploy", method="POST",
-                              headers=hdrs, data=body, timeout=30.0)
+
+            def op(sub, body):
+                return c.tls_curl(app_origin + "/v1/deploy/" + sub, method="POST",
+                                  headers=hdrs, data=json.dumps(body), timeout=30.0)
+
+            r = op("reset", {"tenant": tenant})
+            if r.status != 200:
+                return r  # auth failure (403/401) surfaces at the first op
+            op("file", {"tenant": tenant, "kind": "handler",
+                        "path": "index.mjs", "source": TRIVIAL})
+            return op("cut", {"tenant": tenant})
 
         # (a) operator root-token deploy to a provisioned tenant → 200 + dep_id.
         c.provision("dep0")

@@ -2443,38 +2443,7 @@ pub fn Worker(comptime opts: Options) type {
                 .deploy_starter = &Self.deployStarterTrampoline,
                 .release_publish = &Self.releasePublishTrampoline,
                 .scope_kv_write = &Self.scopeKvWriteTrampoline,
-                .scope_blob_put = &Self.scopeBlobPutTrampoline,
             };
-        }
-
-        /// `platform.scope(t).blob.put` (rewind-cli-plan §4.1): stage a
-        /// content-addressed blob into the TARGET tenant's `file-blobs`.
-        /// The hash was already computed + returned to JS synchronously
-        /// (derivable from the bytes); this enqueues the deferred S3 PUT
-        /// on the background DeployThread (off the poll loop). Cross-tenant
-        /// — the admin tenant stages into any tenant, like `scope().kv`.
-        pub fn scopeBlobPutTrampoline(
-            ctx: *anyopaque,
-            _: std.mem.Allocator,
-            target_id: []const u8,
-            hash: []const u8,
-            bytes: []const u8,
-        ) anyerror!void {
-            const self: *Self = @ptrCast(@alignCast(ctx));
-            if ((self.node.tenant.getInstance(target_id) catch return error.InstanceNotFound) == null)
-                return error.InstanceNotFound;
-            const dt = self.deploy_thread orelse return error.DeployThreadUnavailable;
-            // Job memory uses the WORKER allocator (outlives the request
-            // tick — the DeployThread holds it across ticks).
-            const a = self.allocator;
-            const t = try a.dupe(u8, target_id);
-            errdefer a.free(t);
-            const k = try a.dupe(u8, hash);
-            errdefer a.free(k);
-            const p = try a.dupe(u8, bytes);
-            errdefer a.free(p);
-            self.next_compile_id += 1;
-            try dt.enqueue(.{ .compile_id = self.next_compile_id, .kind = .blob_put, .tenant_id = t, .key = k, .payload = p });
         }
 
         /// `platform.scope(t).deploy.stampManifest(entries)` submit door

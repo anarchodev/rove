@@ -93,21 +93,15 @@ pub const DeployThread = struct {
         /// the held chain on the CHAIN tenant (the `platform.compile`
         /// primitive). No manifest — the JS handler stamps it.
         compile_batch,
-        /// Deferred cross-tenant content-addressed blob PUT into the SCOPE
-        /// tenant's `file-blobs` (`platform.scope(t).blob.put`). The hash
-        /// is returned to JS synchronously (derivable from the bytes); the
-        /// PUT rides here off the poll loop. Fire-and-forget (`key`=hash,
-        /// `payload`=bytes).
-        blob_put,
         /// The deploy's STAGING BARRIER + manifest write
         /// (`platform.scope(t).deploy.stampManifest`). PUTs the manifest
-        /// into the SCOPE tenant's `deployments/`, then — because it is the
-        /// LAST FIFO job for the deploy (statics' blob_put + the bytecode
-        /// compile_batch all preceded it) — its completion proves the whole
-        /// deploy is durable, so it emits a BOUND completion event
-        /// (`{ok, dep_id}` in ctx_json) to resume the held chain. `key`=
-        /// manifest key, `payload`=manifest JSON, `dep_id` for the event;
-        /// `chain_tenant`/`fetch_id`/`name` route the resume.
+        /// into the SCOPE tenant's `deployments/`, then — being the LAST FIFO
+        /// job for the deploy (the bytecode compile_batch preceded it; statics
+        /// stream straight to S3 via blob.receive before the cut) — its
+        /// completion proves the whole deploy is durable, so it emits a BOUND
+        /// completion event (`{ok, dep_id}` in ctx_json) to resume the held
+        /// chain. `key`=manifest key, `payload`=manifest JSON, `dep_id` for the
+        /// event; `chain_tenant`/`fetch_id`/`name` route the resume.
         manifest_put,
     };
 
@@ -229,29 +223,11 @@ pub const DeployThread = struct {
                 var job = job_val;
                 switch (job.kind) {
                     .compile_batch => self.processCompileBatch(ctx_ptr, &job),
-                    .blob_put => self.processKeyedPut(&job, "file-blobs"),
                     .manifest_put => self.processManifestPut(&job),
                 }
                 freeJob(self.allocator, &job);
             }
         }
-    }
-
-    /// Deferred cross-tenant content-addressed PUT into the SCOPE tenant's
-    /// `{subdir}` backend (`blob_put` → file-blobs). Fire-and-forget: the
-    /// hash was already returned to JS synchronously; this lands the bytes
-    /// off the poll loop. Content-addressed, so a retry/redeploy is safe.
-    /// (A failed static PUT only logs — durability/retry of an individual
-    /// static is the owed-marker follow-up; the `manifest_put` barrier
-    /// guarantees ORDERING, not per-blob success.)
-    fn processKeyedPut(self: *DeployThread, job: *Job, subdir: []const u8) void {
-        var be = blob_mod.BlobBackend.openPerTenant(self.allocator, self.blob_cfg, job.tenant_id, subdir) catch |err| {
-            std.log.warn("deploy thread: {s} open {s}/{s} failed: {s}", .{ @tagName(job.kind), job.tenant_id, subdir, @errorName(err) });
-            return;
-        };
-        defer be.deinit();
-        files_mod.putBlobIfMissingTo(be.blobStore(), job.key, job.payload) catch |err|
-            std.log.warn("deploy thread: {s} PUT {s}/{s}/{s} failed: {s}", .{ @tagName(job.kind), job.tenant_id, subdir, job.key, @errorName(err) });
     }
 
     /// The staging-barrier manifest write: PUT the manifest into the SCOPE
