@@ -974,6 +974,15 @@ pub const Node = struct {
         return self.mgr.lastIndex(tenant_id) orelse 0;
     }
 
+    /// Peer ids in `StateSnapshot` on this (leader) node for `tenant_id` — peers
+    /// that fell below the compaction floor and need an out-of-band catch-up
+    /// (the snapshot-free `snapshotCb` parks them here). Writes into `ids`,
+    /// returns the populated prefix, or null if not leader / unknown group. The
+    /// snapshot-trigger tick polls this over led groups. Pump-thread only.
+    pub fn snapshotPendingPeers(self: *Node, tenant_id: u64, ids: []u64) ?[]u64 {
+        return self.mgr.snapshotPendingPeers(tenant_id, ids);
+    }
+
     /// This group's LIVE applied index on this node (`slot.applied_idx`: the
     /// highest committed entry whose writeset is folded into the store's overlay).
     /// On the leader this is the correct out-of-band baseline for a new member: it
