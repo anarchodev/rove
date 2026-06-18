@@ -188,7 +188,7 @@ pub const GroupSig = struct {
 /// one, enqueues a pointer, and blocks on `done` until the pump has
 /// executed it and stamped `err` — so the struct outlives the wait.
 const ControlCmd = struct {
-    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term, last_index, applied_index };
+    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term, last_index, applied_index, group_epoch };
     kind: Kind,
     gid: u64,
     /// Borrowed from the gid's `GroupSig.id_str` (pointer-stable); used by
@@ -827,6 +827,16 @@ pub const Bridge = struct {
         return cmd.snap_index;
     }
 
+    /// This group's migration epoch on the leader — a joining node must birth its
+    /// local group at this exact epoch or the leader's messages are fenced out.
+    /// Pump op. 0 on unknown group / pump failure (also the genuine genesis epoch,
+    /// which is correct — a genesis group IS epoch 0).
+    pub fn groupEpoch(self: *Bridge, gid: u64) u64 {
+        var cmd: ControlCmd = .{ .kind = .group_epoch, .gid = gid };
+        self.runControl(&cmd) catch return 0;
+        return cmd.snap_index;
+    }
+
     /// Install a DATA-FREE snapshot baseline at {index, term} into `gid`'s LOCAL
     /// group (conf_change promote-back). The node must be a below-floor learner;
     /// the KV state for `index` must already be loaded out-of-band (the move
@@ -936,6 +946,10 @@ pub const Bridge = struct {
                 },
                 .applied_index => blk: {
                     cmd.snap_index = self.node.appliedIndex(cmd.gid);
+                    break :blk null;
+                },
+                .group_epoch => blk: {
+                    cmd.snap_index = self.node.groupEpoch(cmd.gid);
                     break :blk null;
                 },
                 .apply_local_snapshot => blk: {
