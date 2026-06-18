@@ -84,6 +84,13 @@ const JOIN_LEARNER_HEADER = "x-rewind-join-as-learner";
 // epoch every provisioned tenant has (provision/move attaches omit the header,
 // so their long-standing behavior is unchanged).
 const EPOCH_HEADER = "x-rewind-epoch";
+// Phase 2d (membership SSOT): the leader's ConfState (comma-separated raft ids)
+// the baseline carries, so a joiner learns its membership from the snapshot
+// instead of a static voter set. The reconciler reads these from the leader's
+// `v2-applied-baseline` (one consistent read) and forwards them on the attach.
+// Absent → membership-neutral (the group's born/current prs, unchanged).
+const VOTERS_HEADER = "x-rewind-voters";
+const LEARNERS_HEADER = "x-rewind-learners";
 
 /// Source-side marker key (in the tenant's own `inst.kv`) holding the
 /// destination node list — comma-separated base URLs, leader first — while a
@@ -425,6 +432,24 @@ fn handleBundle(
 
 // ── v2-attach: load bundle + stand up the group (destination) ─────────
 
+/// Parse a comma-separated list of raft node ids (e.g. the `X-Rewind-Voters`
+/// header) into `buf`, returning the populated prefix — or null when the header
+/// is absent (membership-neutral). Errors on a non-numeric / overflowing token,
+/// or more than `buf.len` ids (a 3-node cluster never approaches the cap).
+fn parseIdList(header: ?[]const u8, buf: []u64) !?[]const u64 {
+    const s = header orelse return null;
+    var n: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, s, ',');
+    while (it.next()) |tok| {
+        const t = std.mem.trim(u8, tok, " ");
+        if (t.len == 0) continue;
+        if (n >= buf.len) return error.TooManyIds;
+        buf[n] = try std.fmt.parseInt(u64, t, 10);
+        n += 1;
+    }
+    return buf[0..n];
+}
+
 fn handleAttach(
     server: anytype,
     allocator: std.mem.Allocator,
@@ -511,8 +536,18 @@ fn handleAttach(
     else
         1;
     if (baseline_index > 0) {
-        worker.raft.createGroupAtBaseline(gid, epoch, baseline_index, baseline_term, join_as_learner) catch |err| switch (err) {
+        // Phase 2d: optional ConfState (membership SSOT). Parsed onto the handler
+        // stack — `createGroupAtBaseline` BLOCKS on the pump ControlCmd, so these
+        // buffers outlive the install. Absent headers → null → membership-neutral.
+        var voters_buf: [16]u64 = undefined;
+        var learners_buf: [16]u64 = undefined;
+        const voters = parseIdList(respb.findHeader(rh, VOTERS_HEADER), &voters_buf) catch
+            return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ VOTERS_HEADER ++ "\n");
+        const learners = parseIdList(respb.findHeader(rh, LEARNERS_HEADER), &learners_buf) catch
+            return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ LEARNERS_HEADER ++ "\n");
+        worker.raft.createGroupAtBaseline(gid, epoch, baseline_index, baseline_term, join_as_learner, voters, learners) catch |err| switch (err) {
             error.GroupExists => {}, // idempotent re-attach
+            error.SelfNotInConfState => return reply(server, allocator, ent, sid, sess, 409, "supplied membership omits this node; add it to the group first\n"),
             else => return reply(server, allocator, ent, sid, sess, 500, "group attach (baseline) failed\n"),
         };
     } else {
@@ -1183,8 +1218,28 @@ fn handleAppliedBaseline(
     // born via `ensureGroup`) are epoch 0; provisioned tenants are epoch 1; a
     // moved tenant is higher. Hard-coding 1 only ever worked for the first class.
     const epoch = worker.raft.groupEpoch(gid);
-    const out = std.fmt.allocPrint(allocator, "{{\"index\":{d},\"term\":{d},\"epoch\":{d}}}\n", .{ index, term, epoch }) catch
+    // Phase 2d (membership SSOT): return the leader's ConfState in the SAME
+    // response, so a joiner reads {index, term, epoch, conf_state} in ONE call and
+    // installs a baseline carrying the real membership — instead of a second
+    // `v2-confstate` call that could race a conf-change (the TOCTOU the
+    // raft-rs/TiKV cross-check flagged). The membership a baseline carries must
+    // match the membership at `index`; one read keeps them consistent.
+    var voters_buf: [16]u64 = undefined;
+    var learners_buf: [16]u64 = undefined;
+    const cs = worker.raft.confState(gid, &voters_buf, &learners_buf) orelse
+        return reply(server, allocator, ent, sid, sess, 500, "conf_state unavailable\n");
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var w = buf.writer(allocator);
+    w.print("{{\"index\":{d},\"term\":{d},\"epoch\":{d},\"voters\":[", .{ index, term, epoch }) catch
         return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    for (cs.voters, 0..) |v, i| w.print("{s}{d}", .{ if (i == 0) "" else ",", v }) catch
+        return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    w.writeAll("],\"learners\":[") catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    for (cs.learners, 0..) |l, i| w.print("{s}{d}", .{ if (i == 0) "" else ",", l }) catch
+        return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    w.writeAll("]}\n") catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    const out = buf.toOwnedSlice(allocator) catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
 }
 

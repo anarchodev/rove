@@ -788,9 +788,15 @@ pub const Bridge = struct {
     /// behaves exactly like `createGroupEpoch` (no baseline). `as_learner` births
     /// the group with this node as a non-voting learner (joining an existing
     /// group via the reconciler's learner-first path) — see node.createGroupCore.
-    pub fn createGroupAtBaseline(self: *Bridge, gid: u64, epoch: u64, index: u64, term: u64, as_learner: bool) Error!void {
+    /// `voters`/`learners` (Phase 2d — membership SSOT): the source leader's
+    /// ConfState the installed baseline carries, so the joining node learns its
+    /// real membership from the snapshot rather than the static voter set. Null →
+    /// membership-neutral (the born/current prs). The supplied membership MUST
+    /// contain this node (`Error.SelfNotInConfState` otherwise — the leader must
+    /// have conf-change-added it first).
+    pub fn createGroupAtBaseline(self: *Bridge, gid: u64, epoch: u64, index: u64, term: u64, as_learner: bool, voters: ?[]const u64, learners: ?[]const u64) Error!void {
         const sig = self.sigFor(gid) orelse return Error.UnknownTenant;
-        var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .snap_index = index, .snap_term = term, .as_learner = as_learner };
+        var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .snap_index = index, .snap_term = term, .as_learner = as_learner, .snap_voters = voters, .snap_learners = learners };
         return self.runControl(&cmd);
     }
 
