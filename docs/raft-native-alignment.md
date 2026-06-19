@@ -98,9 +98,10 @@ pool.**
   node-set SSOT (2e). `REWIND_VOTERS` remains only as the irreducible genesis
   bootstrap (the topology lens: genesis keeps a static config like etcd's
   `--initial-cluster`).
-- **#4 bespoke move → OPEN.** TiKV moves replicas via conf-change; evaluate
-  whether ours can too (Phase 3). May be a *justified divergence* (disjoint
-  cluster meshes + routing-during-overlap) — decide with evidence.
+- **#4 bespoke move → CLOSED (justified divergence).** Evaluated as Phase 3 and
+  kept: the disjoint raft transport meshes make move-via-conf-change
+  architecturally incompatible (it needs cross-cluster raft connectivity), so the
+  bespoke move stays. Recorded in `decisions.md` §10.12 (2026-06-19).
 - **Prior "follower-sourced / no leader snapshot" decision → RE-OPENED.** It is
   itself a divergence from the native (leader-generated) path. The hot-path
   reason is addressable inside the native model (async generation + S3 bytes), so
@@ -491,14 +492,21 @@ dropped as mmap-confounded in favor of byte-exact-at-scale.) Worker-side state i
 rove-native throughout (collections + components, Entity-handle cross-refs, no
 side maps for entity state) and fail-fast (no `catch {}` on the new paths).
 
-## Phase 3 — evaluate move-via-conf-change
+## Phase 3 — evaluate move-via-conf-change → CLOSED (keep bespoke)
 
-Open question, decided after P1/P2. Could a cross-cluster move be
+**Decided 2026-06-19 — `decisions.md` §10.12.** Evaluated after P1/P2/P2.5: the
+bespoke move stays; move-via-conf-change is a rejected alternative (justified
+divergence). The arc's machinery (ConfState-carrying snapshots, streamed transfer,
+learner→promote) removed every *mechanical* objection, leaving one *topological*
+one that is decisive — see below. The original question and reasoning are kept
+for the record.
+
+The question was: could a cross-cluster move be
 `addLearner(new nodes) → snapshot → promote → removeNode(old)` (TiKV region
 move), with the directory routing following the membership — collapsing the
 fresh-group + forward + flip + epoch apparatus into conf-change + snapshot?
 
-**Leaning: justified divergence (keep the bespoke move) — per the topology lens.**
+**Verdict: justified divergence (keep the bespoke move) — per the topology lens.**
 TiKV's conf-change move works *because all stores are one homogeneous pool with
 cross-store raft connectivity*; a Region replica can be added on any store via
 conf-change because every store can talk raft to every other. **rove's clusters
@@ -555,7 +563,8 @@ This is the consensus engine. Every phase:
 3. **Phase 2.5** (chunked-streaming snapshot transfer) — makes the snapshot/move
    primitive scale to multi-GB tenants; prerequisite for large-tenant moves, so it
    precedes Phase 3.
-4. **Phase 3** (move-via-conf-change) — evaluate; may or may not land.
+4. **Phase 3** (move-via-conf-change) — evaluated, CLOSED: keep the bespoke move
+   (justified divergence, `decisions.md` §10.12). No code.
 
 Then: redeploy, and the `__admin__` 3-voter re-add (and any future under-load
 backfill) is a non-event — a laggard just gets a snapshot.

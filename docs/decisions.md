@@ -966,6 +966,35 @@ prototype before V2 wrote code.
   information. `zig fetch --save=<name> git+https://…#<commit>` needs the
   **full SHA**.
 
+### 10.12 Cross-cluster move stays bespoke — not raft conf-change
+- **Decision** (2026-06-19, closing Phase 3 of `raft-native-alignment.md` after
+  the arc's P1/P2/P2.5 landed): a cross-cluster tenant move stays the **bespoke**
+  path (§10.6: fresh group on the destination cluster + HTTP forward-stream
+  dual-write + atomic directory flip + epoch fence). It is **not** a raft
+  conf-change (`addLearner(dest) → snapshot → promote → removeNode(src)` on one
+  group, routing following membership) — even though P1/P2/P2.5 built all the
+  conf-change *machinery* (ConfState-carrying snapshots, streamed multi-GB
+  transfer, the learner→promote reconciler), so the objection is no longer
+  mechanical.
+- **Why (topology, not mechanics)**: rove's clusters are **deliberately disjoint
+  raft transport meshes** — isolation / blast-radius is the point, and the scaling
+  model is "move tenants *between* isolated clusters," not "grow one homogeneous
+  pool." TiKV's conf-change move works *because* every store is mutually
+  raft-reachable; a single rove group spanning two clusters would need
+  cross-cluster raft connectivity, breaking the disjoint mesh on purpose. The
+  bespoke move already does the cross-cluster data transfer over an **HTTP
+  side-channel** (`v2-forward-begin` dual-write + `v2-snapshot-push` stream) and
+  never joins the two raft meshes — so its apparatus is the *cost of preserving
+  isolation*, the cross-*cluster* analog of TiKV's within-pool rebalance at the
+  granularity rove actually scales by. "Who serves during the membership overlap"
+  is also a real routing question the atomic directory-flip answers cleanly.
+- **Rejected**: move-via-conf-change. Now mechanically possible (post-arc) but
+  architecturally incompatible with the disjoint-mesh design.
+- **Reopens only if** a deployment runs clusters on a **shared transport mesh**
+  (all nodes mutually raft-reachable, isolation relaxed) — then conf-change move
+  becomes viable and arguably simpler. That is a *product/topology* decision, not
+  a consensus-mechanics one; today's topology + the isolation goal say no.
+
 ---
 
 ## 11. Deployment & log storage
