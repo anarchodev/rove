@@ -852,26 +852,14 @@ pub const KvStore = struct {
         return self.loadBundleImpl(bundle, .{});
     }
 
-    /// Insert-if-absent load (Phase 7 zero-downtime move). A key already
-    /// present in the store — written by a live forward that arrived while
-    /// this snapshot was streaming in — is preserved, and the bundle's
-    /// (older) value for it is dropped. So the destination can take the live
-    /// forward stream AND load the snapshot out-of-band without the snapshot
-    /// clobbering a newer forwarded key. Loaded in one exclusive kvexp txn,
-    /// so it is race-free against concurrent forward-applies (kvexp's
-    /// single-writer lease serializes them). Out-of-band from raft — the
-    /// bytes never enter the raft log (only the forward delta does).
-    pub fn loadTenantBundleMerge(self: *KvStore, bundle: []const u8) Error!void {
-        return self.loadBundleImpl(bundle, .{ .skip_existing = true });
-    }
-
     /// True REPLACE load (raft conf-change promote-back): every existing pair
     /// is deleted before the bundle's pairs are written — one atomic kvexp Txn
     /// — so the store ends EXACTLY equal to the bundle. Re-seats a STALE store
     /// from an authoritative snapshot: a key the source deleted after this node
     /// last saw it is removed, not left behind as a phantom (which would make a
     /// promoted-back voter diverge from the cluster). Unlike `loadTenantBundle`
-    /// (overwrite + add only) and `loadTenantBundleMerge` (insert-if-absent).
+    /// (overwrite + add only). The zero-downtime move's insert-if-absent load is
+    /// now the streamed path (`snapshot_stream.StreamLoader`, `mode=merge`).
     pub fn loadTenantBundleReplace(self: *KvStore, bundle: []const u8) Error!void {
         return self.loadBundleImpl(bundle, .{ .clear_existing = true });
     }

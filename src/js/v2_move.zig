@@ -159,8 +159,6 @@ pub fn tryHandleV2(
         try handleSnapshot(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-snapshot-push")) {
         try armSnapshotPush(server, allocator, worker, ent, sid, sess, method, rh);
-    } else if (std.mem.eql(u8, sys_rest, "v2-load-merge")) {
-        try handleLoadMerge(server, allocator, worker, ent, sid, sess, method, rh, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-plan")) {
         try handlePlan(server, allocator, worker, ent, sid, sess, method, path, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-domain")) {
@@ -638,49 +636,6 @@ fn handleSnapshot(
     const bundle = inst.kv.dumpTenantBundle(allocator) catch
         return reply(server, allocator, ent, sid, sess, 500, "snapshot dump failed\n");
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, bundle, allocator, null, "application/octet-stream");
-}
-
-// ── v2-load-merge: insert-if-absent snapshot load (destination) ──────
-
-/// `POST /_system/v2-load-merge` (bundle bytes + `X-Rewind-Tenant`) — load a
-/// non-quiescing snapshot into an already-attached (empty) destination group,
-/// INSERT-IF-ABSENT: a key a live forward already wrote (newer) is kept; the
-/// snapshot's older value is dropped. This is the zero-downtime move's
-/// out-of-band snapshot load — the bytes go straight into `inst.kv`, never
-/// the raft log (only the forward delta replicates through raft). One
-/// exclusive kvexp txn, so it is race-free against concurrent forward-applies
-/// on this node. Fanned to EVERY destination node by the orchestrator (like
-/// the attach fan-out). The instance + group already exist (empty-attach).
-fn handleLoadMerge(
-    server: anytype,
-    allocator: std.mem.Allocator,
-    worker: anytype,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    method: []const u8,
-    rh: h2.ReqHeaders,
-    body: []const u8,
-) !void {
-    if (!std.mem.eql(u8, method, "POST"))
-        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
-    const tenant = respb.findHeader(rh, TENANT_HEADER) orelse
-        return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Tenant\n");
-    const inst = ensureInstance(worker, tenant) catch
-        return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
-    inst.kv.loadTenantBundleMerge(body) catch
-        return reply(server, allocator, ent, sid, sess, 400, "merge load failed\n");
-    // The snapshot was dumped from the SOURCE's store, which holds the
-    // source's `_move/forward` marker (it lives in the tenant store today).
-    // The destination must NEVER inherit it — after the flip it would read
-    // that stale target and forward to it (often itself), deadlocking its own
-    // worker. Drop it. (Cleaner long-term: keep the forward marker out of the
-    // tenant data store entirely so it never enters a snapshot.)
-    inst.kv.delete(FORWARD_MARKER) catch |err| switch (err) {
-        error.NotFound => {},
-        else => std.log.warn("v2-load-merge: clearing inherited {s} failed: {s}", .{ FORWARD_MARKER, @errorName(err) }),
-    };
-    try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
 }
 
 // ── v2-leader: per-tenant leadership probe ───────────────────────────
@@ -1209,8 +1164,8 @@ fn handleLastIndex(
 /// store ends EXACTLY equal to the bundle. The promote-back store reset for a
 /// returning learner whose data is older than the source's — a key the source
 /// deleted while the learner was gone is removed, not left as a phantom (which
-/// would make the promoted-back voter diverge from the cluster). Unlike
-/// `v2-load-merge`'s insert-if-absent (zero-downtime move).
+/// would make the promoted-back voter diverge from the cluster). Unlike the
+/// streamed merge load's insert-if-absent (zero-downtime move).
 fn handleLoadReplace(
     server: anytype,
     allocator: std.mem.Allocator,
@@ -1337,8 +1292,8 @@ pub fn armSnapshotStream(
     switch (mode) {
         .merge => {
             // Zero-downtime move: insert-if-absent into the already-attached,
-            // already-forwarded group. No baseline, no leadership check — like
-            // v2-load-merge, it applies out-of-band on EVERY destination node.
+            // already-forwarded group. No baseline, no leadership check — it
+            // applies out-of-band on EVERY destination node.
             loader_opts = .{ .clear_existing = false, .skip_existing = true };
         },
         .replace => {
