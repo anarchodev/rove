@@ -11,8 +11,10 @@
 const PRE_AUTH_PATHS = [
     // The browser-facing RP handshake endpoints.
     "/_rp/login", "/_rp/callback", "/_rp/poll",
-    // Logout must work without a live session.
-    "/v1/logout",
+    // Logout must work without a live session. `/_rp/logout` is the browser
+    // full-logout (clears RP session + 302s to the IdP end-session endpoint);
+    // `/v1/logout` is the RP-session-only XHR primitive.
+    "/_rp/logout", "/v1/logout",
     // CLI device-grant token exchange establishes the session — it can't
     // require one. The real gate is the cryptographic id_token verify inside
     // oidc.rp.exchangeToken (same as the _rp/* completion modules).

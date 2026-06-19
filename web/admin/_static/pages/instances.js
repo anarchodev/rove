@@ -186,9 +186,11 @@ export function render(root, { goto, api }) {
 
   createForm.addEventListener("submit", onCreate);
   assignForm.addEventListener("submit", onAssign);
-  logoutBtn.addEventListener("click", async () => {
-    try { await api.logout(); } catch {}
-    goto("#/login");
+  // Full RP-Initiated logout: a whole-page navigation to /_rp/logout, which
+  // clears the RP session AND ends the IdP SSO session (an XHR clear alone
+  // leaves the IdP session live → the login interstitial silently re-logs in).
+  logoutBtn.addEventListener("click", () => {
+    window.location.assign("/_rp/logout?return_to=" + encodeURIComponent("/#/login"));
   });
 
   root.appendChild(wrap);

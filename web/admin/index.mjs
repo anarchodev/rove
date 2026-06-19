@@ -650,6 +650,9 @@ export default function() {
     if (method === "GET"  && path === "/_rp/login")    return rp.beginLogin();
     if (method === "GET"  && path === "/_rp/callback") return rp.handleCallback();
     if (method === "GET"  && path === "/_rp/poll")     return rp.pollStatus();
+    // Browser-facing full logout (RP-Initiated): clears the RP session AND
+    // ends the IdP SSO session so /authorize stops silently re-logging in.
+    if (method === "GET"  && path === "/_rp/logout")   return rp.logoutRedirect();
 
     if (method === "POST" && path === "/v1/logout")  return rp.logout();
     if (method === "GET"  && path === "/v1/session") return handleSession();

@@ -327,11 +327,55 @@ def main() -> int:
               r.status == 400 and b.get("error") == "expired_token",
               f"got {r.status} {b.get('error')!r}")
 
+        # ── RP-Initiated Logout (end_session) ────────────────────────────
+        # The "logout actually logs you out" path: clearing only the RP
+        # session left the IdP SSO session live, so the login interstitial's
+        # /authorize silently re-logged the user in. /logout must drop the
+        # IdP session AND only redirect to a registered-origin target.
+        check("discovery advertises end_session_endpoint",
+              disc.get("end_session_endpoint") == ISS + "/logout",
+              f"got {disc.get('end_session_endpoint')!r}")
+        lo_authorize = "/authorize?" + urllib.parse.urlencode({
+            "client_id": CLIENT, "redirect_uri": REDIRECT,
+            "response_type": "code", "scope": "openid",
+            "state": "lo-" + b64url(os.urandom(6)),
+            "code_challenge": challenge, "code_challenge_method": "S256",
+            "nonce": "lo-" + b64url(os.urandom(6)),
+        })
+        r = idp("/login", method="POST",
+                headers={"content-type": "application/x-www-form-urlencoded"},
+                data="email=" + LOGIN_EMAIL + "&return_to=" +
+                     urllib.parse.quote(ISS + lo_authorize))
+        lo_m = re.search(r"__Host-rove_sid=[^;]+", r.headers.get("set-cookie", ""))
+        lo_cookie = lo_m.group(0) if lo_m else ""
+        lo_magic = json.loads(r.body).get("magic_link", "") if r.status == 200 else ""
+        if lo_cookie and lo_magic:
+            idp(path_of(lo_magic), headers={"Cookie": lo_cookie})  # bind session
+        r = idp(lo_authorize, headers={"Cookie": lo_cookie})
+        check("logout: pre-logout /authorize → code (logged in)",
+              r.status == 302 and "code=" in r.headers.get("location", ""),
+              f"got {r.status} loc={r.headers.get('location','')!r}")
+        bye = "https://rp.smoke.test/bye"   # same origin as the registered redirect
+        r = idp("/logout?post_logout_redirect_uri=" + urllib.parse.quote(bye),
+                headers={"Cookie": lo_cookie})
+        check("logout → 302 to registered post_logout_redirect_uri",
+              r.status == 302 and r.headers.get("location", "") == bye,
+              f"got {r.status} loc={r.headers.get('location','')!r}")
+        r = idp(lo_authorize, headers={"Cookie": lo_cookie})
+        check("post-logout /authorize → bounced to /login (IdP session cleared)",
+              r.status == 302 and "/login" in r.headers.get("location", ""),
+              f"got {r.status} loc={r.headers.get('location','')!r}")
+        r = idp("/logout?post_logout_redirect_uri=" +
+                urllib.parse.quote("https://evil.example/x"))
+        check("logout open-redirect defense (unregistered origin → 200, no 302)",
+              r.status == 200 and "evil.example" not in r.headers.get("location", ""),
+              f"got {r.status} loc={r.headers.get('location','')!r}")
+
     if failures:
         print(f"\nFAILED ({len(failures)}): {failures}")
         return 1
     print("\nPASS — __auth__ IdP: discovery + magic-link + PKCE auth-code + "
-          "refresh + RFC 8628 device grant (login-gated confirm), all RS256-verified.")
+          "refresh + RFC 8628 device grant + RP-initiated logout, all RS256-verified.")
     return 0
 
 

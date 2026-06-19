@@ -314,6 +314,10 @@ class OIDCProvider {
     if (m === "GET" && path === "/authorize") {
       return this._authorize();
     }
+    // OIDC RP-Initiated Logout — end the IdP SSO session for this browser.
+    if (m === "GET" && path === "/logout") {
+      return this._endSession();
+    }
     if (m === "POST" && path === "/token") {
       return this._token();
     }
@@ -349,6 +353,7 @@ class OIDCProvider {
       authorization_endpoint: iss + "/authorize",
       token_endpoint: iss + "/token",
       device_authorization_endpoint: iss + "/device_authorization",
+      end_session_endpoint: iss + "/logout",
       jwks_uri: iss + "/.well-known/jwks.json",
       response_types_supported: ["code"],
       grant_types_supported: ["authorization_code", "refresh_token",
@@ -380,6 +385,48 @@ class OIDCProvider {
     };
     response.status = 200;
     return JSON.stringify({ keys });
+  }
+
+  // OIDC RP-Initiated Logout (openid-connect-rpinitiated-1_0). Delete THIS
+  // browser's IdP SSO session row so the next `/authorize` no longer silently
+  // re-issues a code (the "logout doesn't log me out" gap: clearing only the
+  // RP session left the IdP session live, and the login interstitial's
+  // auto-/authorize rode it straight back in). Then bounce to
+  // `post_logout_redirect_uri` IFF its origin is a registered client's —
+  // the path is the RP's to choose, the origin is not (open-redirect defense).
+  // No id_token_hint required (v1): the session row keys on the platform sid.
+  _endSession() {
+    const sid = request.session && request.session.id;
+    if (sid) kv.delete(this.cfg.session_path + "/" + sid);
+    const q = new URLSearchParams(request.query || "");
+    const plru = q.get("post_logout_redirect_uri");
+    if (plru && this._isRegisteredLogoutTarget(plru)) {
+      response.status = 302;
+      response.headers = { location: plru };
+      return null;
+    }
+    response.status = 200;
+    response.headers = { "content-type": "text/html; charset=utf-8" };
+    return "<!doctype html><meta charset=utf-8><title>Signed out</title>" +
+      "<p>You have been signed out.</p>";
+  }
+
+  // True iff `uri`'s origin (scheme://host[:port]) matches a registered
+  // client redirect_uri's origin. Origin-only — the RP lands the user on its
+  // own post-logout path; we guard the destination host, not the path.
+  _isRegisteredLogoutTarget(uri) {
+    const origin = (u) => {
+      const m = /^([a-z][a-z0-9+.\-]*:\/\/[^\/?#]+)/i.exec(u || "");
+      return m ? m[1].toLowerCase() : null;
+    };
+    const want = origin(uri);
+    if (!want) return false;
+    for (const c of this.cfg.clients) {
+      for (const ru of this._resolveRedirects(c)) {
+        if (origin(ru) === want) return true;
+      }
+    }
+    return false;
   }
 
   // Redirect back to the RP with an OAuth2 error — ONLY after
@@ -1164,6 +1211,33 @@ class OIDCRelyingParty {
     response.status = 200;
     response.headers = { "content-type": "application/json" };
     return JSON.stringify({ ok: true });
+  }
+
+  /**
+   * `GET /_rp/logout` handler — full RP-Initiated Logout (the browser flow).
+   * Clears this sid's RP session, then 302s the browser to the IdP
+   * `end_session_endpoint` (`${issuer}/logout`) so the IdP SSO session is
+   * dropped too. Without the IdP hop, the login interstitial's auto-`/authorize`
+   * finds the still-live IdP session and silently re-logs the user in — i.e.
+   * `logout()` alone looks like a no-op. The IdP validates + bounces back to a
+   * same-origin `?return_to=` path on THIS RP (default `post_login`).
+   *
+   * @returns {null} (302 set on `response`).
+   * @example
+   * // _rp/logout/index.mjs  (browser GET — a full-page navigation, not XHR)
+   * export default () => oidc.rp("default").logoutRedirect();
+   */
+  logoutRedirect() {
+    const sid = request.session && request.session.id;
+    if (sid) kv.delete(this.cfg.sess_path + "/" + sid);
+    const q = new URLSearchParams(request.query || "");
+    const back = "https://" + request.host + this._safePath(q.get("return_to"));
+    response.status = 302;
+    response.headers = {
+      location: this.cfg.issuer + "/logout?post_logout_redirect_uri=" +
+        encodeURIComponent(back),
+    };
+    return null;
   }
 }
 
