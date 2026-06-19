@@ -2894,7 +2894,9 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             break :blk router_mod.Route{ .allocator = allocator, .module_base = mb, .query = q };
         } else router_mod.resolveRoute(allocator, path) catch |err| {
             std.log.warn("rove-js router failed: {s}", .{@errorName(err)});
-            try respb.setErrorResponse(server, ent, sid, sess);
+            const msg = std.fmt.allocPrint(allocator, "route resolution failed: {s}\n", .{@errorName(err)}) catch null;
+            defer if (msg) |m| allocator.free(m);
+            try respb.setSimpleResponse(server, ent, sid, sess, 500, msg orelse "route resolution failed\n", allocator);
             worker_mod.captureLog(worker, scope_inst.id, method, path, host, dep_id, received_ns, 500, .handler_error, &.{}, &.{}, .{}, null, &.{}, .inbound, 0);
             processed += 1;
             continue;
@@ -3520,7 +3522,17 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             } else if (invalidated) {
                 try respb.setSimpleResponse(server, ent, sid, sess, 503, "speculative dependency rolled back; retry\n", allocator);
             } else {
-                try respb.setErrorResponse(server, ent, sid, sess);
+                // Was a bodyless, journald-silent 500 (only the tape saw it) —
+                // which made the prod __admin__ deploy-500 undiagnosable. Surface
+                // the actual DispatchError in BOTH the response body and journald,
+                // tagged with the correlation id so it ties to the tape/replay record.
+                std.log.warn(
+                    "rove-js dispatch error: tenant={s} method={s} path={s} corr={s} err={s}",
+                    .{ scope_inst.id, method, path, correlation_id, @errorName(err) },
+                );
+                const msg = std.fmt.allocPrint(allocator, "dispatch error: {s}\n", .{@errorName(err)}) catch null;
+                defer if (msg) |m| allocator.free(m);
+                try respb.setSimpleResponse(server, ent, sid, sess, 500, msg orelse "dispatch error\n", allocator);
             }
             // Preserve whatever tapes the handler produced before the
             // dispatcher kill / error. The captured prefix is what the

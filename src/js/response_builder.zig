@@ -197,6 +197,15 @@ pub fn finalizeResponse(
     body_ptr: ?[*]u8,
     body_len: u32,
 ) !void {
+    // Observability: every 5xx that flows through the canned-response
+    // chokepoint gets a journald line (these otherwise only land on the
+    // tenant tape via captureLog, invisible to an operator tailing the
+    // worker journal — the empty-body deploy-500 hunt that motivated this).
+    // body_len==0 is flagged because a bodyless 5xx tells the operator
+    // nothing on its own.
+    if (status_code >= 500) {
+        std.log.warn("rove-5xx: status={d} body_len={d} (canned response on send path)", .{ status_code, body_len });
+    }
     try server.reg.set(ent, &server.request_out, h2.Status, .{ .code = status_code });
     try server.reg.set(ent, &server.request_out, h2.RespHeaders, hdrs);
     try server.reg.set(ent, &server.request_out, h2.RespBody, .{ .data = body_ptr, .len = body_len });
@@ -256,17 +265,6 @@ pub fn overwrite503InPending(
         .data = body.ptr,
         .len = @intCast(body.len),
     });
-}
-
-/// Write a canned `500 Internal Server Error` response onto an entity
-/// and queue its move to `response_in`.
-pub fn setErrorResponse(
-    server: anytype,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-) !void {
-    try finalizeResponse(server, ent, sid, sess, 500, .{ .fields = null, .count = 0 }, null, 0);
 }
 
 /// Write a canned status + body response, allocating an h2-owned copy
