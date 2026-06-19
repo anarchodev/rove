@@ -224,6 +224,17 @@ def stop_all():
 
 
 def main():
+    # OBSOLETE pending the moving-hold cleanup (raft-native-alignment move
+    # convergence): the brief-pause move was retired, and zero-downtime
+    # `handleMoveLive` never sets the `moving` hold (the source stays active
+    # until the atomic flip — a `moving`-503 would BE downtime). So a move can no
+    # longer get stuck `moving`, and this smoke can't induce the state it tests.
+    # It's removed together with the now-dead reconcileStuckMoves / directory
+    # moving-state / front `.moving` machinery in the follow-up cleanup.
+    print("SKIPPED — obsolete: move-live has no `moving` hold (see the moving-hold "
+          "cleanup follow-up; this smoke is removed with that machinery).")
+    return 0
+
     for b in (REWIND, CP_BIN):
         if not os.path.exists(b):
             raise SystemExit(f"{b} not found — run `zig build rewind-worker && zig build rewind-cp`")

@@ -512,10 +512,11 @@ const Router = struct {
             try self.handleCluster(server, ent, sid, sess, body)
         else if (is_provision)
             try self.handleProvision(server, ent, sid, sess, body)
-        else if (is_move_live)
-            try self.handleMoveLive(server, ent, sid, sess, body)
         else
-            try self.handleMove(server, ent, sid, sess, body);
+            // Convergence (raft-native-alignment): the brief-pause move was
+            // dropped — `move` and `move-live` are the SAME (zero-downtime) move.
+            // Both route names accepted so existing callers don't break.
+            try self.handleMoveLive(server, ent, sid, sess, body);
     }
 
     /// `POST /_control/cluster {id, nodes:[url,…]}` — define/update a cluster's
@@ -854,165 +855,6 @@ const Router = struct {
         return null;
     }
 
-    /// Orchestrate a brief-pause tenant move (v2-build-order
-    /// §Phase 4): hold the tenant → dump+quiesce on source → ship the
-    /// bundle to the destination → attach there → **flip the directory**
-    /// (the commit point) → evict the source. On any pre-flip failure the
-    /// directory reverts and the source is resumed, so a failed move is a
-    /// no-op the tenant survives.
-    fn handleMove(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
-        const a = self.allocator;
-        var parsed = std.json.parseFromSlice(struct {
-            tenant: []const u8,
-            dest: []const u8,
-        }, a, body, .{ .ignore_unknown_fields = true }) catch {
-            try replyStatus(server, ent, sid, sess, 400);
-            return;
-        };
-        defer parsed.deinit();
-        const tenant = parsed.value.tenant;
-        const dest = parsed.value.dest;
-        if (tenant.len == 0 or dest.len == 0) {
-            try replyStatus(server, ent, sid, sess, 400);
-            return;
-        }
-
-        const resolution = self.directory.resolve(tenant) orelse {
-            try replyStatus(server, ent, sid, sess, 404); // unknown tenant
-            return;
-        };
-        if (resolution.moving) {
-            try replyStatus(server, ent, sid, sess, 409); // already moving
-            return;
-        }
-        const src = resolution.cluster;
-        if (std.mem.eql(u8, src.id, dest)) {
-            try replyStatus(server, ent, sid, sess, 400); // already on dest
-            return;
-        }
-        const dest_ref = self.directory.clusterById(dest) orelse {
-            try replyStatus(server, ent, sid, sess, 400); // unknown dest cluster
-            return;
-        };
-        // The node lists are pointer-stable for the directory's lifetime, so
-        // these slices stay valid across the blocking backend calls below.
-        const src_nodes = src.nodes;
-        const dest_nodes = dest_ref.nodes;
-
-        const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch {
-            try replyStatus(server, ent, sid, sess, 500);
-            return;
-        };
-        defer a.free(tbody);
-
-        // Per-step timing — the move is a chain of blocking back-end calls +
-        // directory raft commits; this surfaces which step stalls when the
-        // whole move runs long. Kept in tree (diagnostic state is not
-        // temporary).
-        var t_ms: i64 = std.time.milliTimestamp();
-        const T = struct {
-            fn lap(prev: *i64, comptime label: []const u8) void {
-                const now = std.time.milliTimestamp();
-                std.log.info("rewind-cp: move step {s}: {d}ms", .{ label, now - prev.* });
-                prev.* = now;
-            }
-        };
-
-        self.directory.beginMove(tenant) catch {
-            try replyStatus(server, ent, sid, sess, 500);
-            return;
-        };
-        T.lap(&t_ms, "beginMove");
-
-        // 1. Quiesce + dump the source LEADER (v2-bundle is leader-gated —
-        //    a follower 421s, so try each source node until one returns the
-        //    bundle). Single-node source → one node, the leader.
-        var dump = self.bundleFromLeader(src_nodes, tbody) orelse {
-            self.resumeAll(tenant, src_nodes, tbody);
-            try replyStatus(server, ent, sid, sess, 502);
-            return;
-        };
-        defer dump.deinit(a);
-        T.lap(&t_ms, "bundle");
-
-        // 2. Attach on EVERY destination node (the group is formed across the
-        //    whole destination cluster: each node loads the bundle + creates
-        //    its incarnation at the migration epoch). All must 204; on any
-        //    failure, evict the nodes that did attach + resume the source. The
-        //    tenant's plan blob (if any) rides attach so the destination
-        //    enforces the right limits from its first request.
-        const plan_blob = self.directory.planForOwned(a, tenant) catch null;
-        defer if (plan_blob) |p| a.free(p);
-        if (!self.attachToAll(dest_nodes, dump.body, tenant, plan_blob, null)) {
-            self.evictAll(tenant, dest_nodes, tbody);
-            self.resumeAll(tenant, src_nodes, tbody);
-            try replyStatus(server, ent, sid, sess, 502);
-            return;
-        }
-        T.lap(&t_ms, "attach");
-
-        // 3. Await the freshly formed destination group's election so
-        //    post-move traffic finds a leader immediately (v2-leader polls).
-        if (!self.awaitDestLeader(dest_nodes, tenant)) {
-            self.evictAll(tenant, dest_nodes, tbody);
-            self.resumeAll(tenant, src_nodes, tbody);
-            try replyStatus(server, ent, sid, sess, 504);
-            return;
-        }
-        T.lap(&t_ms, "awaitDestLeader");
-
-        // 4. Flip the directory — the atomic commit point of the move.
-        self.directory.move(tenant, dest) catch {
-            // Both tenant + dest were validated above; a failure here is
-            // an invariant violation. Leave moving-held + surface 500.
-            try replyStatus(server, ent, sid, sess, 500);
-            return;
-        };
-        T.lap(&t_ms, "flip");
-
-        // 5. Evict the source on EVERY source node (destroy each group
-        //    incarnation + drop the instance). Best-effort: the move already
-        //    committed; a stale source group is reclaimed lazily and never
-        //    serves traffic again.
-        self.evictAll(tenant, src_nodes, tbody);
-        T.lap(&t_ms, "evict");
-
-        const msg = std.fmt.allocPrint(a, "moved {s}: {s} -> {s}\n", .{ tenant, src.id, dest }) catch {
-            try replyStatus(server, ent, sid, sess, 200);
-            return;
-        };
-        try replyText(server, ent, sid, sess, 200, msg);
-    }
-
-    /// Try each source node's leader-gated `/_system/v2-bundle` until one
-    /// returns 200 (the group leader) and hand back its bundle body. A
-    /// follower 421s (no quiesce taken there); the LEADER 423s while its
-    /// worker overlay is still catching up to the quiesce point (parked
-    /// txns promote between that worker's dispatches, so the dump must
-    /// wait a tick or two) — retry the SAME node briefly, it holds the
-    /// quiesce. Null if no node produced a bundle (none is the leader /
-    /// all unreachable / drain never settled). The caller owns the
-    /// returned `BackendResp`.
-    fn bundleFromLeader(self: *Router, src_nodes: []const []const u8, tbody: []const u8) ?BackendResp {
-        const a = self.allocator;
-        for (src_nodes) |base| {
-            var attempts: u32 = 0;
-            while (attempts < 80) : (attempts += 1) { // ≈2s at 25ms — the worker's commit-wait window
-                const resp = self.backendCall(base, "/_system/v2-bundle", .POST, tbody, &.{}) catch |err| {
-                    std.log.warn("rewind-cp: v2-bundle on {s} failed: {s}", .{ base, @errorName(err) });
-                    break; // node unreachable — try the next one
-                };
-                if (resp.status == 200) return resp;
-                var r = resp;
-                const status = r.status;
-                r.deinit(a);
-                if (status != 423) break; // 421 follower / other — try the next node
-                std.Thread.sleep(25 * std.time.ns_per_ms);
-            }
-        }
-        return null;
-    }
-
     /// Fan a `/_system/v2-attach` (bundle + `X-Rewind-Tenant`, plus the
     /// tenant's `X-Rewind-Plan` blob when set) out to every destination node.
     /// The plan rides attach so the destination enforces the right limits from
@@ -1099,20 +941,13 @@ const Router = struct {
         }
     }
 
-    /// Abort path: revert the directory hold + resume EVERY source node (lift
-    /// the leader's quiesce; a no-op on followers that never quiesced) so a
-    /// failed move leaves the tenant serving where it started. Best-effort.
-    fn resumeAll(self: *Router, tenant: []const u8, src_nodes: []const []const u8, tbody: []const u8) void {
-        const a = self.allocator;
+    /// Abort path: revert the directory hold (the source stays authoritative
+    /// where it started) + stop any live forward stream a stuck zero-downtime
+    /// move left dual-writing on the source. Best-effort. (The brief-pause
+    /// quiesce/`v2-resume` leg is gone — the move never quiesces now.)
+    fn abortStuckMove(self: *Router, tenant: []const u8, src_nodes: []const []const u8) void {
         self.directory.abortMove(tenant) catch {};
-        for (src_nodes) |base| {
-            if (self.backendCall(base, "/_system/v2-resume", .POST, tbody, &.{})) |r| {
-                var rr = r;
-                rr.deinit(a);
-            } else |err| {
-                std.log.warn("rewind-cp: resume source {s} ({s}) failed: {s}", .{ tenant, base, @errorName(err) });
-            }
-        }
+        self.forwardEndOnLeader(src_nodes, tenant);
     }
 
     // ── Stuck-move reconciliation (move crash recovery) ──────────────
@@ -1142,13 +977,11 @@ const Router = struct {
         for (moving) |tenant| {
             const res = self.directory.resolve(tenant) orelse continue;
             if (!res.moving) continue; // raced a completing move — skip
-            const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch continue;
-            defer a.free(tbody);
-            std.log.warn("rewind-cp: reconciling stuck move for {s} (abort + resume source {s})", .{ tenant, res.cluster.id });
-            // resumeAll: abortMove (revert to active) + best-effort resume each
-            // source node (lift a brief-pause quiesce). The source node list is
-            // pointer-stable past the resolve.
-            self.resumeAll(tenant, res.cluster.nodes, tbody);
+            std.log.warn("rewind-cp: reconciling stuck move for {s} (abort + forward-end source {s})", .{ tenant, res.cluster.id });
+            // abortMove (revert to active) + forward-end the source (stop a stuck
+            // zero-downtime move's dual-write). Node list is pointer-stable past
+            // the resolve.
+            self.abortStuckMove(tenant, res.cluster.nodes);
         }
     }
 

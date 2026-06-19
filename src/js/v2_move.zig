@@ -1,24 +1,24 @@
-//! V2 Phase 4 — the cluster-internal tenant-MOVE surface.
+//! V2 — the cluster-internal tenant-MOVE surface.
 //!
-//! v2-build-order §Phase 4 ("Quiesce + brief-pause move"). These
-//! `/_system/v2-*` endpoints are the data-plane half of moving a tenant
-//! from one single-node cluster to another; the front door
-//! (`rewind-front`) is the orchestrator that calls them in sequence and
-//! flips the routing directory at the commit point. Each endpoint runs on
-//! the reused rove-js worker, so it has the worker's per-tenant
-//! `cluster.kv` stores (`worker.node.tenant`) and the V2 per-tenant raft
-//! bridge (`worker.raft`).
+//! The data-plane half of moving a tenant from one cluster to another; the CP
+//! (`rewind-cp`) orchestrates, calling these in sequence and flipping the
+//! routing directory at the commit point. Each endpoint runs on the rove-js
+//! worker, so it has the worker's per-tenant `cluster.kv` stores
+//! (`worker.node.tenant`) and the V2 per-tenant raft bridge (`worker.raft`).
 //!
-//!   v2-kv     — seed (PUT) / read (GET) a tenant store through the real
-//!               propose→commit path. The move smoke's write + read-back.
-//!   v2-bundle — quiesce the tenant + dump its key-space as a migration
-//!               bundle (source). The bundle ships KV state only; blobs
-//!               are served from the shared content-addressed store.
-//!   v2-attach — load a bundle into a fresh instance + stand up its raft
-//!               group at the migration epoch (destination).
-//!   v2-evict  — destroy the source raft group + drop the instance once
-//!               the directory has flipped (source cleanup).
-//!   v2-resume — lift a quiesce (abort path: the move never completed).
+//! The move is ZERO-DOWNTIME (the source serves throughout) — the brief-pause
+//! variant (quiesce + bundle dump + `v2-bundle`/`v2-resume`) was retired in the
+//! raft-native-alignment convergence; there is one move now.
+//!
+//!   v2-kv       — seed (PUT) / read (GET) a tenant store through the real
+//!                 propose→commit path. The move smoke's write + read-back.
+//!   v2-attach   — stand up a fresh group at the migration epoch (destination);
+//!                 the snapshot data arrives separately via the streamed merge.
+//!   v2-snapshot-stream?mode=merge — the streamed insert-if-absent snapshot load
+//!                 (dest); pushed by the source's `v2-snapshot-push` (Phase 2.5).
+//!   v2-forward-* — open/close the source→dest live-write forward stream.
+//!   v2-evict    — destroy the source raft group + drop the instance once the
+//!                 directory has flipped (source cleanup).
 //!
 //! ## Auth
 //!
@@ -143,14 +143,10 @@ pub fn tryHandleV2(
 
     if (std.mem.eql(u8, sys_rest, "v2-kv")) {
         try handleKv(server, allocator, worker, ent, sid, sess, method, path, body);
-    } else if (std.mem.eql(u8, sys_rest, "v2-bundle")) {
-        try handleBundle(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-attach")) {
         try handleAttach(server, allocator, worker, ent, sid, sess, method, rh, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-evict")) {
         try handleEvict(server, allocator, worker, ent, sid, sess, method, body);
-    } else if (std.mem.eql(u8, sys_rest, "v2-resume")) {
-        try handleResume(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-leader")) {
         try handleLeader(server, allocator, worker, ent, sid, sess, method, path);
     } else if (std.mem.eql(u8, sys_rest, "v2-apply")) {
@@ -377,70 +373,6 @@ fn handleDomain(
     return reply(server, allocator, ent, sid, sess, status, "domain alias write failed\n");
 }
 
-// ── v2-bundle: quiesce + dump (source) ───────────────────────────────
-
-fn handleBundle(
-    server: anytype,
-    allocator: std.mem.Allocator,
-    worker: anytype,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    method: []const u8,
-    body: []const u8,
-) !void {
-    if (!std.mem.eql(u8, method, "POST"))
-        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
-    const tenant = parseTenant(allocator, body) orelse
-        return reply(server, allocator, ent, sid, sess, 400, "expected {\"tenant\"}\n");
-    defer allocator.free(tenant);
-
-    const gid = worker.raft.gidForTenant(tenant) orelse
-        return reply(server, allocator, ent, sid, sess, 409, "tenant not active on this cluster\n");
-
-    // Leader gate (Phase 5 multi-node): the bundle must be dumped from the
-    // node that leads the tenant's group — the only node taking live writes,
-    // so quiescing it is what makes the snapshot a consistent point. A
-    // follower 421s so the front door's bundle step retries the next node.
-    // Single node → always leader, so the milestone path is unchanged.
-    if (!worker.raft.isLeaderOf(gid))
-        return reply(server, allocator, ent, sid, sess, 421, "not the leader for this tenant; try another node\n");
-
-    // Quiesce: stop admitting writes, then wait for in-flight to drain to
-    // applied == committed so the dump is a consistent point.
-    const drained_to = worker.raft.quiesce(gid) catch
-        return reply(server, allocator, ent, sid, sess, 500, "quiesce failed\n");
-    if (!awaitCommit(worker, gid, drained_to)) {
-        worker.raft.unquiesce(gid);
-        return reply(server, allocator, ent, sid, sess, 504, "drain timed out\n");
-    }
-    // `committedSeq >= drained_to` proves raft commit + apply-skip, but a
-    // parked customer write's TrackedTxn only promotes into the store in
-    // drainRaftPending — which runs between dispatches on THIS worker
-    // thread, so it cannot make progress while we block here, and a dump
-    // taken now would silently MISS raft-committed writes (the move then
-    // destroys the source group → acked data lost). Reply 423: the CP
-    // retries shortly; between attempts the worker loop drains and the
-    // overlay catches up. The quiesce stays held across retries (no new
-    // writes; same keep-quiesced contract as the 200 path — an abandoned
-    // move releases it via v2-resume).
-    if (!worker.raft.workerAckedThrough(gid, drained_to)) {
-        return reply(server, allocator, ent, sid, sess, 423, "overlay drain in progress; retry\n");
-    }
-
-    const inst = (worker.node.tenant.getInstance(tenant) catch null) orelse {
-        worker.raft.unquiesce(gid);
-        return reply(server, allocator, ent, sid, sess, 404, "unknown tenant\n");
-    };
-    const bundle = inst.kv.dumpTenantBundle(allocator) catch {
-        worker.raft.unquiesce(gid);
-        return reply(server, allocator, ent, sid, sess, 500, "bundle dump failed\n");
-    };
-    // The tenant stays quiesced — the move continues with attach on the
-    // destination + evict here. An aborted move calls v2-resume.
-    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, bundle, allocator, null, "application/octet-stream");
-}
-
 // ── v2-attach: load bundle + stand up the group (destination) ─────────
 
 /// Parse a comma-separated list of raft node ids (e.g. the `X-Rewind-Voters`
@@ -602,27 +534,6 @@ fn handleEvict(
     }
     worker.node.tenant.deleteInstance(tenant) catch |err|
         std.log.warn("v2-evict: deleteInstance({s}) failed: {s}", .{ tenant, @errorName(err) });
-    try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
-}
-
-// ── v2-resume: lift a quiesce (abort path) ───────────────────────────
-
-fn handleResume(
-    server: anytype,
-    allocator: std.mem.Allocator,
-    worker: anytype,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    method: []const u8,
-    body: []const u8,
-) !void {
-    if (!std.mem.eql(u8, method, "POST"))
-        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
-    const tenant = parseTenant(allocator, body) orelse
-        return reply(server, allocator, ent, sid, sess, 400, "expected {\"tenant\"}\n");
-    defer allocator.free(tenant);
-    if (worker.raft.gidForTenant(tenant)) |gid| worker.raft.unquiesce(gid);
     try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
 }
 

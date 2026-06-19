@@ -142,10 +142,17 @@ re-provision 409 / unknown-cluster 400).
     UI nicety** — it must hold server-side, or a direct query bypasses it.
     Real compacting GC is deferred until the storage cost matters.
 
-## Zero-downtime move (Phase 7)
+## Zero-downtime move (the only move)
 
-The Phase-4 brief-pause move (above) is shipped and proven
-(`scripts/tenant_move_smoke.py`). Phase 7 removes the pause:
+> **Convergence (raft-native-alignment):** the brief-pause move (quiesce +
+> bundle dump described above) was **retired** — there is now ONE move, the
+> zero-downtime one. `/_control/move` routes to it. The bundle transfer is
+> **streamed** source→dest (Phase 2.5, `docs/raft-native-alignment.md`), not
+> buffered through the CP. The brief-pause-specific machinery (`v2-bundle` /
+> `v2-resume` / bridge quiesce, and the now-dead `moving`-hold +
+> stuck-move reconciliation) is being removed; the section above is historical.
+
+The zero-downtime move keeps the source online throughout:
 
 - **Serve-or-forward** — a DP node that doesn't own a tenant asks the CP and
   forwards to the owner (the owner never re-forwards; loop-safe).

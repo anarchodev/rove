@@ -93,10 +93,6 @@ pub const Error = error{
     UnknownTenant,
     /// The bridge is shutting down; no further proposes accepted.
     ShuttingDown,
-    /// A `propose` arrived for a tenant the move orchestration has
-    /// quiesced (`quiesce`) — its writes are held while its bundle ships
-    /// to the destination cluster (v2-build-order §Phase 4).
-    Quiesced,
     /// A control command (`createGroupEpoch` / `destroyGroup`) could not
     /// be serviced because the pump thread is not running.
     PumpNotRunning,
@@ -175,11 +171,6 @@ pub const GroupSig = struct {
     /// this so an already-acked entry never enters `awaiting_worker`.
     /// Guarded by `Bridge.mutex`.
     worker_acked_seq: u64 = 0,
-    /// Set by `quiesce` while this tenant is being moved off the node:
-    /// `propose` rejects (`Error.Quiesced`) so no new write is admitted
-    /// once the bundle snapshot is being taken. Single writer at a time
-    /// (the move orchestration); read lock-free on the propose path.
-    quiescing: std.atomic.Value(bool) = .init(false),
 };
 
 /// A pump-thread-only control operation, handed worker thread → pump
@@ -577,9 +568,6 @@ pub const Bridge = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const sig = self.groups.get(gid) orelse return Error.UnknownTenant;
-        // Held while the tenant is mid-move: refuse new writes so the
-        // source bundle snapshot is a quiescent point (Phase 4).
-        if (sig.quiescing.load(.acquire)) return Error.Quiesced;
         // Fail fast on a non-leader: raft-rs 0.7 unconditionally FORWARDS
         // a follower's proposal to the leader (`step_follower` MsgPropose),
         // so without this gate the entry would commit cluster-wide while
@@ -751,28 +739,6 @@ pub const Bridge = struct {
 
     // ── Move control (any thread; executes on the pump thread) ───────
 
-    /// Quiesce a tenant for a move: stop admitting new proposes
-    /// (`Error.Quiesced`) and return the highest seq already accepted, so
-    /// the caller can wait for `committedSeq(gid) >= that` to know the
-    /// in-flight writes have drained to `applied == committed`. The bundle
-    /// snapshot is then a consistent point. Idempotent. `Error.UnknownTenant`
-    /// if the gid is unregistered. (v2-build-order §Phase 4 quiesce.)
-    pub fn quiesce(self: *Bridge, gid: u64) Error!u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const sig = self.groups.get(gid) orelse return Error.UnknownTenant;
-        sig.quiescing.store(true, .release);
-        return sig.next_seq;
-    }
-
-    /// Lift a `quiesce` (move aborted / never completed). Re-admits
-    /// proposes. On a *successful* move the source group is destroyed
-    /// instead, so this is the abort/rollback seam. Idempotent.
-    pub fn unquiesce(self: *Bridge, gid: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.groups.get(gid)) |sig| sig.quiescing.store(false, .release);
-    }
 
     /// Attach a freshly-loaded tenant's raft group at `epoch` on the pump
     /// thread (move destination). The tenant must already be
@@ -1752,7 +1718,7 @@ test "bridge: pump thread drives commits end to end" {
     try testing.expectEqualStrings("v", got);
 }
 
-test "bridge: move control — attach at epoch, quiesce holds writes, destroy reclaims" {
+test "bridge: move control — attach at epoch, destroy reclaims" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1780,13 +1746,6 @@ test "bridge: move control — attach at epoch, quiesce holds writes, destroy re
         std.Thread.sleep(1 * std.time.ns_per_ms);
     }
     try testing.expectEqual(seq, bridge.committedSeq(gid));
-
-    // Quiesce: the watermark is at next_seq (nothing in flight) and new
-    // proposes are now refused.
-    const drained_to = try bridge.quiesce(gid);
-    try testing.expectEqual(seq, drained_to);
-    try testing.expectEqual(seq, bridge.committedSeq(gid));
-    try testing.expectError(Error.Quiesced, bridge.propose(gid, env));
 
     // Source cleanup: destroy the group + reclaim its WAL. The node slot
     // is gone afterward (a read on the node store errors UnknownGroup).

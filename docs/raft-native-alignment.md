@@ -379,8 +379,9 @@ transfer. The catch-up driver inherited all of it (plus the
 
 ### As built
 
-Both the catch-up driver AND the zero-downtime move now stream (the brief-pause
-move keeps the buffered `v2-bundle`/`v2-attach` — small tenants, paused anyway).
+Both the catch-up driver AND the move now stream. (The move CONVERGED to one
+path: the brief-pause/quiesce move was retired — see "Move convergence" below —
+so `/_control/move` is the zero-downtime, streamed move.)
 
 - **Codec — `src/kv/snapshot_stream.zig` (pure Zig, round-trip tested).** Two
   halves over the existing pair framing, but with its OWN magic (`STREAM_MAGIC`,
@@ -440,8 +441,26 @@ no longer buffers a bundle):
 - **CP — `streamMergeToAll`.** Per dest node, trigger the source leader to stream
   in merge mode (`snapshotPushToLeader`, generous timeout — the source's own
   page-pinning deadline aborts first). Replaces `snapshotFromLeader` (dump→CP) +
-  `loadMergeToAll` (CP→dest); the CP never holds the bundle. The brief-pause move's
-  `v2-bundle`/`v2-attach` stay buffered (small, paused tenants).
+  `loadMergeToAll` (CP→dest); the CP never holds the bundle.
+
+### Move convergence — one move, no brief-pause
+
+Once the move streamed (above), the **brief-pause move was retired** — there is
+ONE move now. The brief-pause path (quiesce the source, dump a bundle, ship it,
+flip) only ever existed as the simple/fast variant for small tenants where a
+momentary pause is fine; it bought nothing a real stakeholder values (operators
+don't care about a few seconds on a rare admin op; tenants want no downtime) and
+cost a second code path + a footgun default (a large brief-pause move would
+balloon CP memory). `/_control/move` and `/_control/move-live` both route to the
+zero-downtime move; `rewind-ops move` is always-live.
+
+Removed with it: `v2-bundle` / `v2-resume`, the bridge **quiesce** machinery
+(`quiesce`/`unquiesce`/`Quiesced` + the propose-path check). **Still dead, removal
+deferred to a follow-up:** the `moving`-hold + stuck-move reconciliation
+(`reconcileStuckMoves`/`abortStuckMove`/`collectMoving`, directory
+`beginMove`/`abortMove`/`moving`-state, front-door `.moving → 503`) — the
+zero-downtime move never sets `moving` (a `moving`-503 would BE downtime), so a
+move can't get stuck `moving`; `cp_move_recovery_smoke` is obsolete (skipped).
 
 ### Consistency + the baseline
 

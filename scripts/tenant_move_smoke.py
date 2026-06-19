@@ -2,8 +2,9 @@
 """V2 Phase-4 exit smoke ⭐ THE MILESTONE (v2-build-order §Phase 4,
 docs/v2-phase4-tenant-move.md).
 
-Moves a live tenant from one single-node cluster to another with a brief
-pause and proves the data survives + the new cluster serves it:
+Moves a live tenant from one single-node cluster to another (zero-downtime —
+the source serves throughout) and proves the data survives + the new cluster
+serves it:
 
     rewind-cp :18093    (move orchestrator + routing directory)
     front door :18090   (stateless proxy; resolves placement from the CP)
@@ -15,10 +16,10 @@ pause and proves the data survives + the new cluster serves it:
 The tenant store is seeded + read through the cluster-internal move
 surface (`/_system/v2-kv`, gated by REWIND_MOVE_SECRET): a PUT writes
 through the real propose→commit path; a GET reads the kvexp store. The
-move itself is one call to the CP's `POST /_control/move`, which
-quiesces + dumps the source, ships the bundle to the destination, attaches
-its raft group at the migration epoch, flips the routing directory (the
-commit point), and evicts the source.
+move itself is one call to the CP's `POST /_control/move` (the zero-downtime
+move — the brief-pause/quiesce variant was retired): empty-attach the dest,
+forward live writes, STREAM the snapshot source→dest (insert-if-absent), flip
+the routing directory (the commit point), and evict the source.
 
 Proof legs:
   A. seed on c1 (direct) + read-back on c1 → value is there.
