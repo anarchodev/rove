@@ -455,12 +455,12 @@ balloon CP memory). `/_control/move` and `/_control/move-live` both route to the
 zero-downtime move; `rewind-ops move` is always-live.
 
 Removed with it: `v2-bundle` / `v2-resume`, the bridge **quiesce** machinery
-(`quiesce`/`unquiesce`/`Quiesced` + the propose-path check). **Still dead, removal
-deferred to a follow-up:** the `moving`-hold + stuck-move reconciliation
-(`reconcileStuckMoves`/`abortStuckMove`/`collectMoving`, directory
-`beginMove`/`abortMove`/`moving`-state, front-door `.moving → 503`) — the
-zero-downtime move never sets `moving` (a `moving`-503 would BE downtime), so a
-move can't get stuck `moving`; `cp_move_recovery_smoke` is obsolete (skipped).
+(`quiesce`/`unquiesce`/`Quiesced` + the propose-path check). Also removed: the
+`moving`-hold + stuck-move reconciliation (`reconcileStuckMoves`/`abortStuckMove`/
+`collectMoving`, directory `beginMove`/`abortMove`/`moving`-state, front-door
+`.moving → 503`) — the zero-downtime move never sets `moving` (a `moving`-503
+would BE downtime), so a move can't get stuck `moving`; the obsolete
+`cp_move_recovery_smoke` was deleted with it.
 
 ### Consistency + the baseline
 

@@ -284,7 +284,7 @@ const Router = struct {
     // ── Control plane: owner lookup (routing + serve-or-forward) ──────
 
     /// `GET /_cp/route?host=H` — return the cluster that currently owns the
-    /// tenant for `H`, as JSON `{cluster, tenant, moving, nodes:[…]}`, or 404
+    /// tenant for `H`, as JSON `{cluster, tenant, nodes:[…]}`, or 404
     /// if the host maps to no tenant / the tenant is unplaced. The front door
     /// caches this for routing; a DP cluster that can't serve a request
     /// locally consults it and forwards to the owner (serve-or-forward) — so a
@@ -344,7 +344,7 @@ const Router = struct {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(a);
         const w = buf.writer(a);
-        try w.print("{{\"cluster\":\"{s}\",\"tenant\":\"{s}\",\"moving\":{},\"nodes\":[", .{ resolution.cluster.id, tenant, resolution.moving });
+        try w.print("{{\"cluster\":\"{s}\",\"tenant\":\"{s}\",\"nodes\":[", .{ resolution.cluster.id, tenant });
         for (resolution.cluster.nodes, 0..) |n, i| {
             if (i > 0) try w.writeByte(',');
             try w.print("\"{s}\"", .{n});
@@ -941,56 +941,11 @@ const Router = struct {
         }
     }
 
-    /// Abort path: revert the directory hold (the source stays authoritative
-    /// where it started) + stop any live forward stream a stuck zero-downtime
-    /// move left dual-writing on the source. Best-effort. (The brief-pause
-    /// quiesce/`v2-resume` leg is gone — the move never quiesces now.)
-    fn abortStuckMove(self: *Router, tenant: []const u8, src_nodes: []const []const u8) void {
-        self.directory.abortMove(tenant) catch {};
-        self.forwardEndOnLeader(src_nodes, tenant);
-    }
-
-    // ── Stuck-move reconciliation (move crash recovery) ──────────────
-
-    /// Reconcile moves the directory durably recorded as in-flight but that no
-    /// orchestration is completing. The `moving` hold is durable, so a CP crash
-    /// between `beginMove` and the terminal `move`/`abortMove` leaves a tenant
-    /// stuck `moving` forever (front door 503s its traffic, source quiesced).
-    /// The flip is the move's commit point, so a still-`moving` placement means
-    /// the flip never happened and the SOURCE remains authoritative: abort the
-    /// move (revert to active) + resume the source.
-    ///
-    /// Runs ONLY on the directory leader (abort is a directory write), from the
-    /// serve loop between request batches. The CP is single-threaded and a move
-    /// orchestration is fully synchronous within one `handleControl` (one
-    /// serve-loop iteration), so this never overlaps a live move — any tenant
-    /// `moving` when this runs is a genuine stuck move from a prior / crashed
-    /// orchestration, safe to abort.
-    fn reconcileStuckMoves(self: *Router) void {
-        if (!self.directory.isLeader()) return;
-        const a = self.allocator;
-        const moving = self.directory.collectMoving(a) catch return;
-        defer {
-            for (moving) |t| a.free(t);
-            a.free(moving);
-        }
-        for (moving) |tenant| {
-            const res = self.directory.resolve(tenant) orelse continue;
-            if (!res.moving) continue; // raced a completing move — skip
-            std.log.warn("rewind-cp: reconciling stuck move for {s} (abort + forward-end source {s})", .{ tenant, res.cluster.id });
-            // abortMove (revert to active) + forward-end the source (stop a stuck
-            // zero-downtime move's dual-write). Node list is pointer-stable past
-            // the resolve.
-            self.abortStuckMove(tenant, res.cluster.nodes);
-        }
-    }
-
     /// Additive membership reconciler (Phase 4, opt-in `reconcile_membership`).
     /// On the directory leader, converge each placed tenant's DP group
     /// membership to its cluster's node set: for the first not-caught-up node
     /// per group per pass, take a LEARNER-FIRST `ensureMember` step. ADDITIVE
-    /// ONLY — never removes/migrates/destroys; skips `moving` tenants (defers to
-    /// an in-flight move). Blocking HTTP on the loop (like `reconcileStuckMoves`),
+    /// ONLY — never removes/migrates/destroys. Blocking HTTP on the loop,
     /// bounded to one node per group per pass.
     fn reconcileMembership(self: *Router) void {
         if (!self.reconcile_membership) return;
@@ -1009,7 +964,6 @@ const Router = struct {
             // The owned copy is taken under the directory lock.
             var res = (self.directory.resolveOwned(a, tenant) catch continue) orelse continue;
             defer res.deinit(a);
-            if (res.moving) continue; // defer to an in-flight move
             const nodes = res.nodes;
             if (nodes.len == 0) continue;
             const leader_url = self.findDestLeaderUrl(nodes, tenant) orelse continue;
@@ -1073,10 +1027,6 @@ const Router = struct {
             try replyStatus(server, ent, sid, sess, 404);
             return;
         };
-        if (resolution.moving) {
-            try replyStatus(server, ent, sid, sess, 409);
-            return;
-        }
         const src = resolution.cluster;
         if (std.mem.eql(u8, src.id, dest)) {
             try replyStatus(server, ent, sid, sess, 400);
@@ -1276,8 +1226,8 @@ const Router = struct {
     // the only voting-power removal is a demote-to-learner of a STUCK voter (so
     // it can't disrupt elections while it catches up — the __admin__ lesson);
     // it never shrinks/migrates/destroys. All over the private CP network via
-    // backendCall (move-secret auto-added). Blocking HTTP on the CP loop, like
-    // reconcileStuckMoves; the reconciler does one node per group per pass.
+    // backendCall (move-secret auto-added). Blocking HTTP on the CP loop; the
+    // reconciler does one node per group per pass.
     const EnsureResult = enum { done, progressed, failed };
     /// caught-up tolerance: matched/applied within this of leader_last counts as
     /// caught up (raft replicates the tail in well under this; avoids flapping
@@ -1823,10 +1773,9 @@ pub fn main() !void {
     }
     var router = Router{ .allocator = allocator, .directory = directory, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx, .acme = acme_handle, .reconcile_membership = reconcile_membership };
 
-    // Periodic stuck-move reconciliation on the directory leader (between
-    // request batches; never overlaps a synchronous move — see
-    // `reconcileStuckMoves`). last=0 → the first iteration reconciles, so a CP
-    // restart / failover cleans up a crashed move within one tick. Period from
+    // Periodic membership reconciliation on the directory leader (between
+    // request batches). last=0 → the first iteration reconciles, so a CP
+    // restart / failover converges membership within one tick. Period from
     // `REWIND_CP_RECONCILE_SECS` (default 5); 0 disables reconciliation.
     const reconcile_secs: i128 = blk: {
         const s = std.posix.getenv("REWIND_CP_RECONCILE_SECS") orelse break :blk 5;
@@ -1854,7 +1803,6 @@ pub fn main() !void {
             const now_ns = std.time.nanoTimestamp();
             if (now_ns - last_reconcile_ns > reconcile_period_ns) {
                 last_reconcile_ns = now_ns;
-                router.reconcileStuckMoves();
                 router.reconcileMembership();
             }
         }

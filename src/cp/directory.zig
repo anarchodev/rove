@@ -14,7 +14,7 @@
 //! across HA nodes, so the authoritative state lives in a **replicated
 //! kvexp store** behind our own `bridge`/`Node` raft substrate — a single
 //! "directory" raft group (gid = hash of `__directory__`). Each mutating
-//! op (`addCluster` / `assign` / `move` / `beginMove` / `abortMove`)
+//! op (`addCluster` / `assign` / `move`)
 //! encodes a writeset and **proposes it through the directory group,
 //! awaiting commit** before it takes effect; the directory flip is
 //! therefore one committed raft write.
@@ -106,24 +106,19 @@ pub const ClusterRef = struct {
     nodes: []const []const u8,
 };
 
-/// A tenant's placement. `active` — served normally by `cluster_idx`.
-/// `moving` — a move is in flight; the front door holds the tenant's
-/// requests (brief-pause move) until `move` flips placement (or `abortMove`
-/// reverts to active). Kept as a struct (not a bare cluster id) so added
-/// state rides alongside the cluster without touching `clusterFor`'s callers.
+/// A tenant's placement. Kept as a struct (not a bare cluster id) so added
+/// state can ride alongside the cluster without touching `clusterFor`'s callers.
+/// The move converged to one zero-downtime path that keeps the source serving
+/// until the atomic `move` flip, so there is no mid-move hold state.
 pub const Placement = struct {
-    state: State = .active,
     /// Index into `clusters` (the cluster currently serving this tenant).
     cluster_idx: usize,
-
-    pub const State = enum { active, moving };
 };
 
 /// What `resolve` hands the router: the cluster currently responsible for
-/// a tenant plus whether the tenant is mid-move (hold its traffic).
+/// a tenant.
 pub const Resolution = struct {
     cluster: ClusterRef,
-    moving: bool,
 };
 
 pub const Directory = struct {
@@ -274,33 +269,9 @@ pub const Directory = struct {
         return self.clusters.items.len == 0;
     }
 
-    /// Collect the tenant ids currently in `moving` state (owned dups; caller
-    /// frees each + the slice). The reconciler uses this to find moves the
-    /// directory durably recorded as in-flight — a CP crash between `beginMove`
-    /// and the terminal `move`/`abortMove` leaves a tenant stuck `moving`
-    /// forever, since the `moving` hold is now durable. (docs/v2-cp-directory-
-    /// replication.md move-crash recovery.)
-    pub fn collectMoving(self: *Directory, a: std.mem.Allocator) Error![][]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        var out: std.ArrayListUnmanaged([]u8) = .empty;
-        errdefer {
-            for (out.items) |t| a.free(t);
-            out.deinit(a);
-        }
-        var it = self.placements.iterator();
-        while (it.next()) |e| {
-            if (e.value_ptr.state == .moving) {
-                out.append(a, a.dupe(u8, e.key_ptr.*) catch return Error.OutOfMemory) catch return Error.OutOfMemory;
-            }
-        }
-        return out.toOwnedSlice(a) catch return Error.OutOfMemory;
-    }
-
     /// All placed tenant ids (owned dups; caller frees each + the slice). The
     /// membership reconciler iterates these as DESIRED state, resolving each to
-    /// its cluster + skipping `moving` ones. Mirrors `collectMoving` without the
-    /// state filter.
+    /// its cluster.
     pub fn listPlacements(self: *Directory, a: std.mem.Allocator) Error![][]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -453,14 +424,10 @@ pub const Directory = struct {
         try self.applyClusterLocal(id, node_buf[0..n]);
     }
 
-    /// Parse a `placement/*` value (`state:cluster_id`) and upsert it.
+    /// Parse a `placement/*` value (`cluster_id`) and upsert it.
     fn applyPlacementFromValue(self: *Directory, tenant: []const u8, value: []const u8) Error!void {
-        const colon = std.mem.indexOfScalar(u8, value, ':') orelse return Error.BadConfig;
-        const state_s = value[0..colon];
-        const cluster_id = value[colon + 1 ..];
-        const idx = self.cluster_idx.get(cluster_id) orelse return Error.UnknownCluster;
-        const state: Placement.State = if (std.mem.eql(u8, state_s, "moving")) .moving else .active;
-        try self.applyPlacementLocal(tenant, idx, state);
+        const idx = self.cluster_idx.get(value) orelse return Error.UnknownCluster;
+        try self.applyPlacementLocal(tenant, idx);
     }
 
     // ── Write path: replicate → apply observer materializes ──────────
@@ -616,7 +583,7 @@ pub const Directory = struct {
             defer self.mutex.unlock();
             if (self.cluster_idx.get(cluster_id) == null) return Error.UnknownCluster;
         }
-        return self.writePlacement(tenant_id, cluster_id, .active);
+        return self.writePlacement(tenant_id, cluster_id);
     }
 
     /// Re-place an already-placed tenant onto `dest_cluster_id`. The
@@ -631,24 +598,22 @@ pub const Directory = struct {
             if (self.cluster_idx.get(dest_cluster_id) == null) return Error.UnknownCluster;
             if (self.placements.getPtr(tenant_id) == null) return Error.UnknownTenant;
         }
-        return self.writePlacement(tenant_id, dest_cluster_id, .active);
+        return self.writePlacement(tenant_id, dest_cluster_id);
     }
 
-    /// Build + apply a `placement/{tenant}` = `{state}:{cluster}` write
+    /// Build + apply a `placement/{tenant}` = `{cluster}` write
     /// (replicated → apply observer materializes it; inline ephemerally).
     /// The caller has already validated under a brief lock; this holds no
     /// lock across the replicate/await (see `applyDirWrite`).
-    fn writePlacement(self: *Directory, tenant: []const u8, cluster_id: []const u8, state: Placement.State) Error!void {
+    fn writePlacement(self: *Directory, tenant: []const u8, cluster_id: []const u8) Error!void {
         const a = self.allocator;
         const key = std.fmt.allocPrint(a, "placement/{s}", .{tenant}) catch return Error.OutOfMemory;
         defer a.free(key);
-        const value = std.fmt.allocPrint(a, "{s}:{s}", .{ @tagName(state), cluster_id }) catch return Error.OutOfMemory;
-        defer a.free(value);
-        return self.applyDirWrite(key, value);
+        return self.applyDirWrite(key, cluster_id);
     }
 
     /// Upsert a placement into the in-memory projection (no replication).
-    fn applyPlacementLocal(self: *Directory, tenant_id: []const u8, cluster_idx: usize, state: Placement.State) Error!void {
+    fn applyPlacementLocal(self: *Directory, tenant_id: []const u8, cluster_idx: usize) Error!void {
         const gop = self.placements.getOrPut(self.allocator, tenant_id) catch return Error.OutOfMemory;
         if (!gop.found_existing) {
             const key_dup = self.allocator.dupe(u8, tenant_id) catch {
@@ -657,7 +622,7 @@ pub const Directory = struct {
             };
             gop.key_ptr.* = key_dup;
         }
-        gop.value_ptr.* = .{ .state = state, .cluster_idx = cluster_idx };
+        gop.value_ptr.* = .{ .cluster_idx = cluster_idx };
     }
 
     /// Resolve a tenant to the cluster currently serving it, or null if the
@@ -668,18 +633,14 @@ pub const Directory = struct {
         return if (self.resolve(tenant_id)) |r| r.cluster else null;
     }
 
-    /// Hot-path read with move state: the serving cluster plus whether the
-    /// tenant is mid-move. The router holds (503) a `moving` tenant's
-    /// requests. Slices are pointer-stable; safe to hold past the lock.
+    /// Hot-path read: the serving cluster for a tenant. Slices are
+    /// pointer-stable; safe to hold past the lock.
     pub fn resolve(self: *Directory, tenant_id: []const u8) ?Resolution {
         self.mutex.lock();
         defer self.mutex.unlock();
         const p = self.placements.get(tenant_id) orelse return null;
         const c = self.clusters.items[p.cluster_idx];
-        return .{
-            .cluster = .{ .id = c.id, .nodes = c.nodes },
-            .moving = p.state == .moving,
-        };
+        return .{ .cluster = .{ .id = c.id, .nodes = c.nodes } };
     }
 
     /// A tenant's placement with the cluster id + node set DEEP-COPIED into
@@ -687,7 +648,6 @@ pub const Directory = struct {
     pub const OwnedResolution = struct {
         id: []u8,
         nodes: [][]u8,
-        moving: bool,
         pub fn deinit(self: *OwnedResolution, a: std.mem.Allocator) void {
             freeNodes(a, self.nodes);
             a.free(self.id);
@@ -710,7 +670,7 @@ pub const Directory = struct {
         const nodes = try dupeNodes(a, c.nodes);
         errdefer freeNodes(a, nodes);
         const id = a.dupe(u8, c.id) catch return Error.OutOfMemory;
-        return OwnedResolution{ .id = id, .nodes = nodes, .moving = p.state == .moving };
+        return OwnedResolution{ .id = id, .nodes = nodes };
     }
 
     /// Resolve a cluster id to its `ClusterRef` (the move orchestrator
@@ -721,38 +681,6 @@ pub const Directory = struct {
         const idx = self.cluster_idx.get(cluster_id) orelse return null;
         const c = self.clusters.items[idx];
         return .{ .id = c.id, .nodes = c.nodes };
-    }
-
-    // ── Move state (control plane writes; front door orchestration) ──
-
-    /// Mark a tenant `moving` — the front door holds its requests while
-    /// its bundle ships to the destination. The placement still points at
-    /// the source cluster (so an abort just reverts to `active`). Rejects
-    /// an unknown tenant. Replicates the state change.
-    pub fn beginMove(self: *Directory, tenant_id: []const u8) Error!void {
-        return self.setMoveState(tenant_id, .moving);
-    }
-
-    /// Revert a `beginMove` without changing placement — the move failed
-    /// before the directory flip, so the tenant resumes on its source
-    /// cluster. Rejects an unknown tenant. Replicates the state change.
-    pub fn abortMove(self: *Directory, tenant_id: []const u8) Error!void {
-        return self.setMoveState(tenant_id, .active);
-    }
-
-    fn setMoveState(self: *Directory, tenant_id: []const u8, state: Placement.State) Error!void {
-        // The placement keeps pointing at its current cluster across a
-        // begin/abort; only the state changes. Capture the current cluster id
-        // under a brief lock (its slice is pointer-stable, so it stays valid
-        // after release), then replicate the full `{state}:{cluster}` value
-        // without holding the lock (see `applyDirWrite`).
-        const cluster_id = blk: {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            const p = self.placements.getPtr(tenant_id) orelse return Error.UnknownTenant;
-            break :blk self.clusters.items[p.cluster_idx].id;
-        };
-        return self.writePlacement(tenant_id, cluster_id, state);
     }
 
     // ── Plan / limits (admin-plane writes, DP reads) ─────────────────
@@ -1197,37 +1125,21 @@ test "directory: multi-node cluster carries every node origin" {
     try testing.expectEqualStrings("http://h:9", dir.clusterFor("t").?.nodes[0]);
 }
 
-test "directory: beginMove holds, move flips, abort reverts" {
+test "directory: assign places, move flips the directory" {
     var dir = Directory.init(testing.allocator);
     defer dir.deinit();
     try addNode1(&dir, "c1", "http://h:1");
     try addNode1(&dir, "c2", "http://h:2");
     try dir.assign("t", "c1");
 
-    // Active on c1.
+    // Placed on c1.
     var r = dir.resolve("t").?;
     try testing.expectEqualStrings("c1", r.cluster.id);
-    try testing.expect(!r.moving);
 
-    // beginMove holds traffic but keeps the source placement.
-    try dir.beginMove("t");
-    r = dir.resolve("t").?;
-    try testing.expectEqualStrings("c1", r.cluster.id);
-    try testing.expect(r.moving);
-
-    // The directory flip commits the move: now active on c2.
+    // The directory flip commits the move: now served by c2.
     try dir.move("t", "c2");
     r = dir.resolve("t").?;
     try testing.expectEqualStrings("c2", r.cluster.id);
-    try testing.expect(!r.moving);
-
-    // A second move that aborts reverts to the (now) source c2.
-    try dir.beginMove("t");
-    try testing.expect(dir.resolve("t").?.moving);
-    try dir.abortMove("t");
-    r = dir.resolve("t").?;
-    try testing.expectEqualStrings("c2", r.cluster.id);
-    try testing.expect(!r.moving);
 
     // clusterById resolves the destination's node set for the orchestrator.
     try testing.expectEqualStrings("http://h:1", dir.clusterById("c1").?.nodes[0]);
@@ -1334,95 +1246,6 @@ test "directory: replicated placement survives a CP restart (Slice 1 exit)" {
     }
 }
 
-test "directory: replicated move state (moving) survives a restart" {
-    const a = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(a, ".");
-    defer a.free(dir_path);
-
-    {
-        const bridge = try Bridge.initSingleNode(a, dir_path);
-        const d = try Directory.initReplicated(a, bridge);
-        // Stop the pump (→ no more apply-observer fires) before freeing the
-        // directory the observer points at: declare `destroy` first so it
-        // runs LAST, `bridge.deinit` second so it runs first.
-        defer d.destroy();
-        defer bridge.deinit();
-        try bridge.startPump();
-        try d.addCluster("c1", &.{"http://h:1"});
-        try d.assign("t", "c1");
-        try d.beginMove("t"); // held mid-move when the CP "crashes"
-        try testing.expect(d.resolve("t").?.moving);
-    }
-    {
-        const bridge = try Bridge.initSingleNode(a, dir_path);
-        const d = try Directory.initReplicated(a, bridge);
-        // Stop the pump (→ no more apply-observer fires) before freeing the
-        // directory the observer points at: declare `destroy` first so it
-        // runs LAST, `bridge.deinit` second so it runs first.
-        defer d.destroy();
-        defer bridge.deinit();
-        // The moving hold is durable — the recovered CP still holds traffic
-        // until an operator completes or aborts the move.
-        const r = d.resolve("t") orelse return error.TestUnexpectedResult;
-        try testing.expectEqualStrings("c1", r.cluster.id);
-        try testing.expect(r.moving);
-    }
-}
-
-test "directory: stuck 'moving' is collectable + abortable (Slice 2 recovery)" {
-    // The move-crash recovery primitives: a durable `moving` state (a CP crash
-    // between beginMove and the terminal move/abort) is found by
-    // `collectMoving` and cleared by `abortMove` (revert to active on the
-    // source — the flip never committed, so the source stays authoritative).
-    const a = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(a, ".");
-    defer a.free(dir_path);
-
-    const bridge = try Bridge.initSingleNode(a, dir_path);
-    const d = try Directory.initReplicated(a, bridge);
-    defer d.destroy();
-    defer bridge.deinit();
-    try bridge.startPump();
-
-    try d.addCluster("c1", &.{"http://h:1"});
-    try d.addCluster("c2", &.{"http://h:2"});
-    try d.assign("alice", "c1");
-    try d.assign("bob", "c1");
-    // bob is mid-move (stuck); alice is healthy/active.
-    try d.beginMove("bob");
-
-    // collectMoving finds ONLY the stuck tenant.
-    {
-        const moving = try d.collectMoving(a);
-        defer {
-            for (moving) |t| a.free(t);
-            a.free(moving);
-        }
-        try testing.expectEqual(@as(usize, 1), moving.len);
-        try testing.expectEqualStrings("bob", moving[0]);
-    }
-
-    // Reconcile = abortMove (revert to active on the source). bob resumes
-    // active on c1 (its placement never flipped); alice is untouched.
-    try d.abortMove("bob");
-    try testing.expect(!d.resolve("bob").?.moving);
-    try testing.expectEqualStrings("c1", d.resolve("bob").?.cluster.id);
-
-    // Nothing is moving anymore.
-    {
-        const moving = try d.collectMoving(a);
-        defer {
-            for (moving) |t| a.free(t);
-            a.free(moving);
-        }
-        try testing.expectEqual(@as(usize, 0), moving.len);
-    }
-}
-
 // ── Multi-node CP — Slice 2: apply-driven projection / HA ───────────────
 
 test "directory: a leader's write replicates to FOLLOWER projections (Slice 2A)" {
@@ -1512,7 +1335,7 @@ test "directory: a leader's write replicates to FOLLOWER projections (Slice 2A)"
     // Write cluster + placement THROUGH the leader bridge (proposePut), then
     // pump until every node has committed seq 2 (the placement).
     _ = try bridges[li].proposePut(dir_gid, "cluster/west", "http://w:1,http://w:2");
-    const pseq = try bridges[li].proposePut(dir_gid, "placement/acme", "active:west");
+    const pseq = try bridges[li].proposePut(dir_gid, "placement/acme", "west");
     var done = false;
     var s2: u32 = 0;
     while (s2 < 3000 and !done) : (s2 += 1) {
@@ -1539,6 +1362,5 @@ test "directory: a leader's write replicates to FOLLOWER projections (Slice 2A)"
         try testing.expectEqualStrings("west", r.cluster.id);
         try testing.expectEqual(@as(usize, 2), r.cluster.nodes.len);
         try testing.expectEqualStrings("http://w:2", r.cluster.nodes[1]);
-        try testing.expect(!r.moving);
     }
 }

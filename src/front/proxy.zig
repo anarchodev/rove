@@ -306,7 +306,6 @@ const LeaderCache = struct {
 
 const RouteResult = union(enum) {
     nodes: []const []const u8, // cache-owned; valid for this loop iteration
-    moving,
     not_found,
     /// No cached route — a resolve was enqueued; the caller parks the
     /// request until `drainRouteCompletions` lands the answer.
@@ -721,10 +720,6 @@ pub fn Proxy(comptime FrontH2: type) type {
                         self.server.wsUpgradeReject(ent, 404);
                         continue;
                     },
-                    .moving => {
-                        self.server.wsUpgradeReject(ent, 503);
-                        continue;
-                    },
                     .nodes => |n| if (n.len == 0) {
                         self.server.wsUpgradeReject(ent, 502);
                         continue;
@@ -1068,12 +1063,6 @@ pub fn Proxy(comptime FrontH2: type) type {
                 .not_found => {
                     std.log.warn("front: no placement for host {s} → 404", .{host});
                     try self.replyStatus(coll, ent, sid, sess, 404);
-                    return null;
-                },
-                // Mid-move: hold the tenant's traffic with a retryable
-                // 503 until the directory flip completes.
-                .moving => {
-                    try self.replyStatus(coll, ent, sid, sess, 503);
                     return null;
                 },
                 .nodes => |n| if (n.len == 0) {
@@ -2153,12 +2142,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                             freeNodes(self.allocator, nodes);
                         };
                     },
-                    // Move in progress / gone: stop serving the stale
-                    // entry and surface a retryable 503 / 404.
-                    .moving => {
-                        self.cache.invalidate(c.host);
-                        self.failRouteWaiters(c.host, 503);
-                    },
+                    // Gone: stop serving the stale entry and surface 404.
                     .not_found => {
                         self.cache.invalidate(c.host);
                         self.failRouteWaiters(c.host, 404);
