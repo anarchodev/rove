@@ -310,14 +310,41 @@ ordinary customer `kv.set` — so a customer can today collide with their own
 webhook/scheduler state.
 
 - **DECIDED (2026-06-18):** reserve the **entire leading-`_` keyspace** from
-  customer writes. Route the JS-shim writes (`_send/`, `_blob/`, `_sched/`)
-  through a *privileged* write path instead of the customer-guarded `kv.set`, so
-  the shims keep working while customers are blocked from the whole `_`
-  namespace.
+  customer writes. Route the JS-shim writes through a *privileged* write path
+  instead of the customer-guarded `kv.set`, so the shims keep working while
+  customers are blocked from the whole `_` namespace.
 - Customers get the entire non-`_` keyspace; platform owns all of `_`. One rule,
   documented, forever-extensible.
-- Reads of reserved keys should also be blocked (today `kv.get`/`kv.prefix` have
-  no restriction — a customer can read platform keys in their own store).
+- Reads of reserved keys are NOT blocked and must not be — `_config/` is a
+  documented customer-readable namespace (`kv.js`/`reserved.zig`). Reservation is
+  a write-side concern only.
+
+> **CORRECTION (2026-06-19, during impl):** the shims write more `_`-prefixes
+> than the original audit's three. Enumerated from `src/js/globals/*.js`, the
+> prefixes written from JS-shim code (some in non-`__system/` handler context,
+> `is_system_module=false`) are at least: `_send/` (webhook), `_blob/` (blob),
+> `_sched/` (scheduler), and — crucially — `_oidc/`, `_rp/`, `_admin/`
+> (`oidc.js`) and `_seg/` (`segments.js`). So the privileged path / writable
+> allowlist must cover all of these, not just three.
+>
+> **Also:** `_harden.js` (which deletes `globalThis._system`) is documented in
+> `globals.zig` as **"NOT a privilege boundary"** (natives self-gate; deletion
+> is API hygiene). A `_system.kv.setReserved` that bypasses the guard purely by
+> being unreachable would lean on `_harden` as a boundary. Since the reservation
+> is per-tenant integrity-hygiene (a customer writing a `_` key only corrupts
+> their OWN store — no cross-tenant impact), that reliance is the same risk class
+> as the reservation itself, but it is a deviation from the stated principle and
+> needs a conscious call. Two viable shapes:
+>   - **(b) allowlist:** reserve all `_` from customers EXCEPT the verified
+>     shim-writable prefixes above; `reserved.zig`-only, no native/freeze/auth
+>     surgery, zero regression risk, and a strict prerequisite for (a). Residual:
+>     customers can still write the shim prefixes in their own store (per-tenant
+>     self-footgun). Needs multi-binary smoke verification that the allowlist is
+>     complete (a missing entry throws `reserved_key` inside a live shim).
+>   - **(a) privileged binding:** add `_system.kv.setReserved`/`deleteReserved`,
+>     edit webhook/blob/scheduler/oidc/segments shims to capture `_system.kv` and
+>     use it, reserve ALL `_`. Closes the footgun but touches auth-sensitive and
+>     base-snapshot-eval (segfault-prone) code.
 
 ### 7.2 KV write-time limits — **do now (also a correctness bug)**
 
@@ -354,15 +381,25 @@ doesn't reject them).
 ### 7.4 Tenant ID charset/length — **do now**
 
 Tenant/instance ID is **customer-chosen**, capped at 64 chars
-(`tenant/root.zig:84`) but with **no enforced charset**. It's the permanent
-primary identity (URL host, S3 key segment, log scope) — a customer who picks an
-ID with a `.`/`/`/uppercase/unicode char that a future validator would reject is
-stuck, and *we* are stuck serving it.
+(`tenant/root.zig:84`). It's the permanent primary identity (URL host, S3 key
+segment, log scope).
 
-- **Decision:** lock a strict spec at provision now — recommend
-  `^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$` (DNS-label-safe, lowercase, no
-  leading/trailing/double hyphen), reserve the `__*__` form (already used by
-  `__admin__`/`__root__`/`__auth__`). Validate in `tenant/root.zig` provisioning.
+> **CORRECTION (2026-06-19):** the audit's "no enforced charset" was wrong.
+> `validateInstanceId` (`tenant/root.zig:812`) already enforces 1–64 chars and
+> `[a-zA-Z0-9_-]` (rejects spaces, slashes — tested at :1106). So this item is
+> *tightening*, not adding-from-scratch.
+
+- **Decision:** if instance_id will ever be a DNS subdomain
+  (`*.rewindjs.app`), tighten to DNS-label-safe now —
+  `^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$` (lowercase, hyphen-only — **drop `_`**,
+  which is invalid in DNS labels; no leading/trailing/double hyphen; ≤63). This
+  is the strictest plausible spec; loosening later is always safe, tightening is
+  not.
+- **Carve-out required:** the platform's own reserved tenants use the `__*__`
+  form (`__admin__`/`__root__`/`__auth__`/`__replay__`), which a DNS-label-safe
+  validator would reject. Confirm whether those are created via
+  `validateInstanceId` and, if so, exempt the `__*__` form. So this is not a
+  one-line regex swap.
 
 ### 7.5 Customer-visible IDs — **decided now**
 
