@@ -326,6 +326,12 @@ class V2Cluster:
         env["REWIND_NODE_ID"] = str(i + 1)
         env["REWIND_VOTERS"] = voters
         env["REWIND_PEERS"] = peers
+        # Peer HTTP base URLs indexed by raft id − 1 (the worker analog of CP's
+        # REWIND_CP_PEER_URLS): the leader-push target for the out-of-band
+        # snapshot catch-up driver (raft-native-alignment Phase 1). Distinct from
+        # REWIND_PEERS (the raft transport host:ports).
+        env["REWIND_PEER_URLS"] = ",".join(
+            f"http://127.0.0.1:{p}" for p in self.node_ports)
         env["S3_KEY_PREFIX_BASE"] = self.s3_prefix
         # Step 3 B4: the CP base for the `rewind-cp.internal` door (the worker's
         # node.cp_internal_base = cp_urls[0]), so the __admin__ dashboard can

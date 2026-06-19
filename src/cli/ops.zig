@@ -13,7 +13,7 @@
 //!   deploy <tenant> <bundle> [--release]   classify + POST to the standing app.
 //!   release <tenant> <dep_id_hex>   flip _deploy/current (leader-aware retry).
 //!   provision <tenant> [--cluster C] [--host H]   create+place a tenant (CP).
-//!   move <tenant> <cluster> [--live] --yes        relocate a tenant (CP).
+//!   move <tenant> <cluster> --yes                 relocate a tenant (zero-downtime) (CP).
 //!   host add <host> <tenant>        map a domain → tenant (CP index; CP pushes the worker alias).
 //!   plan set <tenant> <plan>        set a tenant's plan/limits blob (CP).
 //!   status <host>                   resolve a host → tenant/cluster/nodes + plan.
@@ -208,9 +208,11 @@ fn cmdBootstrap(a: std.mem.Allocator, env: *const c.Env) void {
     std.debug.print("bootstrap complete — deploy capability live; publish with `rewind-ops deploy`\n", .{});
 }
 
-/// POST /_control/move|move-live {tenant, cluster}. Guarded by --yes (the
-/// riskiest verb — it repoints live routing).
-fn cmdMove(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, cluster: []const u8, live: bool, yes: bool) void {
+/// POST /_control/move {tenant, cluster}. Guarded by --yes (the riskiest verb —
+/// it repoints live routing). The move is zero-downtime (the source serves
+/// throughout); a large tenant can take a while to stream, hence the long CP
+/// deadline.
+fn cmdMove(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, cluster: []const u8, yes: bool) void {
     if (!yes) fatal("move repoints live routing for {s} → {s}. Re-run with --yes to confirm.", .{ tenant, cluster });
     var body = std.ArrayList(u8){};
     body.appendSlice(a, "{\"tenant\":") catch oom();
@@ -218,10 +220,9 @@ fn cmdMove(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, cluster:
     body.appendSlice(a, ",\"cluster\":") catch oom();
     c.writeJsonString(&body, a, cluster);
     body.append(a, '}') catch oom();
-    const path = if (live) "/_control/move-live" else "/_control/move";
-    const r = c.cpPost(a, env, path, body.items, 120);
+    const r = c.cpPost(a, env, "/_control/move", body.items, 3600);
     if (r.code == 200 or r.code == 204) {
-        std.debug.print("moved {s} → {s}{s}\n", .{ tenant, cluster, if (live) " (live)" else "" });
+        std.debug.print("moved {s} → {s}\n", .{ tenant, cluster });
     } else {
         fatal("move {s} → {s}: {d} {s}", .{ tenant, cluster, r.code, c.trunc(r.body) });
     }
@@ -297,7 +298,7 @@ const usage =
     \\  rewind-ops deploy <tenant> <bundle> [--release]   publish a bundle through the app
     \\  rewind-ops release <tenant> <dep_id_hex>      flip _deploy/current live
     \\  rewind-ops provision <tenant> [--cluster C] [--host H]   create+place a tenant
-    \\  rewind-ops move <tenant> <cluster> [--live] --yes        relocate a tenant
+    \\  rewind-ops move <tenant> <cluster> --yes                 relocate a tenant (zero-downtime)
     \\  rewind-ops host add <host> <tenant>           map a domain → tenant
     \\  rewind-ops plan set <tenant> <plan>           set a tenant's plan/limits blob
     \\  rewind-ops kv-put <tenant> <key> [value]     seed a system kv key (move-secret; operator/OIDC bootstrap)
@@ -313,7 +314,6 @@ const Flags = struct {
     cluster: ?[]const u8 = null,
     host: ?[]const u8 = null,
     release: bool = false,
-    live: bool = false,
     yes: bool = false,
 };
 
@@ -350,7 +350,9 @@ pub fn main() void {
         } else if (std.mem.eql(u8, arg, "--release")) {
             flags.release = true;
         } else if (std.mem.eql(u8, arg, "--live")) {
-            flags.live = true;
+            // Tolerated no-op: the move is always zero-downtime now (the
+            // brief-pause variant was retired). Accepted so old invocations
+            // don't error.
         } else if (std.mem.eql(u8, arg, "--yes")) {
             flags.yes = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
@@ -383,7 +385,7 @@ pub fn main() void {
         cmdProvision(a, &env, p[0], cluster, flags.host);
     } else if (std.mem.eql(u8, cmd, "move")) {
         if (p.len < 2) fatal("move needs <tenant> <cluster>", .{});
-        cmdMove(a, &env, p[0], p[1], flags.live, flags.yes);
+        cmdMove(a, &env, p[0], p[1], flags.yes);
     } else if (std.mem.eql(u8, cmd, "host")) {
         if (p.len < 1) fatal("host needs a subcommand: add <host> <tenant>", .{});
         if (std.mem.eql(u8, p[0], "add")) {

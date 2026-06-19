@@ -28,6 +28,7 @@
 
 pub const kvstore = @import("kvstore.zig");
 pub const writeset = @import("writeset.zig");
+pub const snapshot_stream = @import("snapshot_stream.zig");
 
 // ── Flat facade (Phase 2) ────────────────────────────────────────────
 //
@@ -49,6 +50,11 @@ pub const WriteSetOp = writeset.Op;
 pub const applyEncodedWriteSet = writeset.applyEncoded;
 pub const scanWriteSetPutValue = writeset.scanPutValue;
 pub const decodeWriteSetOps = writeset.decodeOps;
+
+// snapshot_stream.zig (raft Phase 2.5 streaming transfer codec)
+pub const StreamDumper = snapshot_stream.StreamDumper;
+pub const StreamLoader = snapshot_stream.StreamLoader;
+pub const StreamLoaderOptions = snapshot_stream.LoaderOptions;
 
 // kvstore.zig
 pub const KvStore = kvstore.KvStore;
@@ -85,3 +91,15 @@ pub const decodeEnvelope = envelope_codec.decodeEnvelope;
 pub const encodeEnvelope = envelope_codec.encodeEnvelope;
 pub const encodeMulti = envelope_codec.encodeMulti;
 pub const decodeMultiInner = envelope_codec.decodeMultiInner;
+
+// Pull the imported files' inline tests into the `raft-kv` test build —
+// a bare `pub const = @import(...)` does NOT (Zig only runs tests from files
+// referenced by a `test` block / refAllDecls from the test root). Without this
+// `zig build kv-test` silently runs zero tests.
+test {
+    _ = kvstore;
+    _ = writeset;
+    _ = snapshot_stream;
+    _ = envelope_codec;
+    _ = dispatch_metrics;
+}

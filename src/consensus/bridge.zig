@@ -93,10 +93,6 @@ pub const Error = error{
     UnknownTenant,
     /// The bridge is shutting down; no further proposes accepted.
     ShuttingDown,
-    /// A `propose` arrived for a tenant the move orchestration has
-    /// quiesced (`quiesce`) — its writes are held while its bundle ships
-    /// to the destination cluster (v2-build-order §Phase 4).
-    Quiesced,
     /// A control command (`createGroupEpoch` / `destroyGroup`) could not
     /// be serviced because the pump thread is not running.
     PumpNotRunning,
@@ -175,11 +171,6 @@ pub const GroupSig = struct {
     /// this so an already-acked entry never enters `awaiting_worker`.
     /// Guarded by `Bridge.mutex`.
     worker_acked_seq: u64 = 0,
-    /// Set by `quiesce` while this tenant is being moved off the node:
-    /// `propose` rejects (`Error.Quiesced`) so no new write is admitted
-    /// once the bundle snapshot is being taken. Single writer at a time
-    /// (the move orchestration); read lock-free on the propose path.
-    quiescing: std.atomic.Value(bool) = .init(false),
 };
 
 /// A pump-thread-only control operation, handed worker thread → pump
@@ -206,6 +197,17 @@ const ControlCmd = struct {
     /// `log_term`: `snap_index` is the query index, `snap_term` the result.
     snap_index: u64 = 0,
     snap_term: u64 = 0,
+    /// `apply_local_snapshot` (Phase 2 — membership SSOT): the source leader's
+    /// ConfState the baseline carries, so a joiner learns its membership from the
+    /// snapshot. Null → keep the group's current membership (membership-neutral
+    /// promote-back, unchanged). Borrowed from the caller stack for the call.
+    snap_voters: ?[]const u64 = null,
+    snap_learners: ?[]const u64 = null,
+    /// `create_group_epoch` (Phase 2e — cluster node-set SSOT): the initial voter
+    /// set a FRESH group is born with, supplied by the control plane (the cluster
+    /// node set) instead of the node's static `REWIND_VOTERS`. Null → `self.voters`
+    /// (unchanged). Borrowed from the caller stack for the blocking call.
+    birth_voters: ?[]const u64 = null,
     /// `conf_state`: caller buffers to fill + the counts written back.
     cs_voters: []u64 = &.{},
     cs_learners: []u64 = &.{},
@@ -243,6 +245,41 @@ const FaultReq = struct {
 const AwaitAck = struct {
     seq: u64,
     idx: u64,
+};
+
+/// One out-of-band snapshot catch-up job, handed pump thread → worker thread
+/// (the snapshot-trigger half of the raft-native alignment arc). The pump
+/// detects a peer in `ProgressState::Snapshot` (fell below the leader's
+/// compaction first_index) and enqueues the bundle's baseline {index, term}
+/// it computed on-thread (appliedIndex + logTerm are pump-only). The worker's
+/// `SnapshotCatchupThread` then dumps the leader's store + pushes
+/// `v2-load-replace` + `v2-apply-snapshot {index, term}` to the peer, so the
+/// peer's `match` advances past first_index and `StateSnapshot` clears. The
+/// `(gid, peer)` pair is deduped in `catchup_inflight` while a job is live so
+/// the same lagging peer isn't re-pushed every tick.
+const CatchupJob = struct {
+    gid: u64,
+    peer: u64,
+    /// Baseline the worker installs via `v2-apply-snapshot`, snapshotted on the
+    /// pump at enqueue time. The store dump the worker takes later reflects a
+    /// LATER applied instant (⊇ this index), so the leader's tail above `index`
+    /// re-applies idempotently — the same ordering CP's `bootstrapMember` uses
+    /// (read baseline, THEN dump the bundle).
+    index: u64,
+    term: u64,
+};
+
+/// Worker-facing resolved form of a `CatchupJob` (`drainSnapshotCatchup` adds
+/// the gid's pointer-stable `id_str`). The `SnapshotCatchupThread` consumes it.
+pub const SnapshotCatchup = struct {
+    gid: u64,
+    peer: u64,
+    index: u64,
+    term: u64,
+    /// Pointer-stable `GroupSig.id_str` — the tenant string for the store dump +
+    /// the `X-Rewind-Tenant` header. Borrowed; valid until the group is destroyed
+    /// (the worker dups it into the job before any await).
+    id_str: []const u8,
 };
 
 /// One queued propose, handed worker thread → pump thread.
@@ -296,6 +333,18 @@ pub const Bridge = struct {
     /// creates and never fails over, so nothing is ever queued here. Guarded
     /// by `mutex`.
     promoted: std.ArrayListUnmanaged(u64) = .empty,
+    /// Out-of-band snapshot catch-up jobs the pump's `snapshotTriggerTick`
+    /// detected (a peer in `StateSnapshot`), awaiting the worker's
+    /// `SnapshotCatchupThread`. Appended by the pump, drained by the worker.
+    /// Guarded by `mutex`. Multi-node only.
+    snapshot_catchup: std.ArrayListUnmanaged(CatchupJob) = .empty,
+    /// `(gid, peer)` pairs with a catch-up job in flight (enqueued but not yet
+    /// completed), so a lagging peer isn't re-pushed every trigger tick while
+    /// its transfer is running. The pump checks it before enqueuing; the worker
+    /// clears the entry when the job finishes (success or failure → re-trigger
+    /// next tick). Key = `gid ^ (peer << 1)` is ambiguous, so pack both: the
+    /// set stores `(gid, peer)` via a 128-bit key. Guarded by `mutex`.
+    catchup_inflight: std.AutoHashMapUnmanaged(u128, void) = .empty,
     /// Move-orchestration control ops awaiting the pump thread (group
     /// create-at-epoch / destroy). Pointers to caller-stack `ControlCmd`s;
     /// guarded by `mutex`. Drained + executed in `pumpOnce`.
@@ -311,6 +360,9 @@ pub const Bridge = struct {
     /// Pump-thread-only: wall-clock of the last FULL leadership scan
     /// (see `refreshLeadership` / `LEADER_SCAN_INTERVAL_NS`).
     last_leader_scan_ns: i64 = 0,
+    /// Pump-thread-only: wall-clock of the last `snapshotTriggerTick`
+    /// (interval-gated by `SNAPSHOT_TRIGGER_INTERVAL_NS`).
+    last_snapshot_trigger_ns: i64 = 0,
     /// Count of follower→leader promotion edges this node has observed across
     /// all groups (incremented in `refreshOneLocked`). With `pre_vote` on, a
     /// term is only bumped by a node that can win, so a promotion edge ≈ an
@@ -427,6 +479,8 @@ pub const Bridge = struct {
         self.by_id.deinit(a);
         self.in_flight.deinit(a);
         self.promoted.deinit(a);
+        self.snapshot_catchup.deinit(a);
+        self.catchup_inflight.deinit(a);
         self.fault_requests.deinit(a);
         self.sweep_scratch.deinit(a);
         // Any items still queued at teardown own their payloads.
@@ -514,9 +568,6 @@ pub const Bridge = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const sig = self.groups.get(gid) orelse return Error.UnknownTenant;
-        // Held while the tenant is mid-move: refuse new writes so the
-        // source bundle snapshot is a quiescent point (Phase 4).
-        if (sig.quiescing.load(.acquire)) return Error.Quiesced;
         // Fail fast on a non-leader: raft-rs 0.7 unconditionally FORWARDS
         // a follower's proposal to the leader (`step_follower` MsgPropose),
         // so without this gate the entry would commit cluster-wide while
@@ -688,37 +739,19 @@ pub const Bridge = struct {
 
     // ── Move control (any thread; executes on the pump thread) ───────
 
-    /// Quiesce a tenant for a move: stop admitting new proposes
-    /// (`Error.Quiesced`) and return the highest seq already accepted, so
-    /// the caller can wait for `committedSeq(gid) >= that` to know the
-    /// in-flight writes have drained to `applied == committed`. The bundle
-    /// snapshot is then a consistent point. Idempotent. `Error.UnknownTenant`
-    /// if the gid is unregistered. (v2-build-order §Phase 4 quiesce.)
-    pub fn quiesce(self: *Bridge, gid: u64) Error!u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const sig = self.groups.get(gid) orelse return Error.UnknownTenant;
-        sig.quiescing.store(true, .release);
-        return sig.next_seq;
-    }
-
-    /// Lift a `quiesce` (move aborted / never completed). Re-admits
-    /// proposes. On a *successful* move the source group is destroyed
-    /// instead, so this is the abort/rollback seam. Idempotent.
-    pub fn unquiesce(self: *Bridge, gid: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.groups.get(gid)) |sig| sig.quiescing.store(false, .release);
-    }
 
     /// Attach a freshly-loaded tenant's raft group at `epoch` on the pump
     /// thread (move destination). The tenant must already be
     /// `registerTenant`'d (so `gid` resolves and `id_str` is stable) and
     /// its kvexp state already loaded into the worker store. Blocks until
     /// the pump has created + led the group. (Phase 4 destination attach.)
-    pub fn createGroupEpoch(self: *Bridge, gid: u64, epoch: u64) Error!void {
+    /// `birth_voters` (Phase 2e — cluster node-set SSOT): the initial voter set the
+    /// fresh group is born with (the CP-supplied cluster node set). Null →
+    /// `REWIND_VOTERS` (unchanged). The plain (no-baseline) formation path, e.g.
+    /// provision's empty-attach.
+    pub fn createGroupEpoch(self: *Bridge, gid: u64, epoch: u64, birth_voters: ?[]const u64) Error!void {
         const sig = self.sigFor(gid) orelse return Error.UnknownTenant;
-        var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch };
+        var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .birth_voters = birth_voters };
         return self.runControl(&cmd);
     }
 
@@ -730,9 +763,15 @@ pub const Bridge = struct {
     /// behaves exactly like `createGroupEpoch` (no baseline). `as_learner` births
     /// the group with this node as a non-voting learner (joining an existing
     /// group via the reconciler's learner-first path) — see node.createGroupCore.
-    pub fn createGroupAtBaseline(self: *Bridge, gid: u64, epoch: u64, index: u64, term: u64, as_learner: bool) Error!void {
+    /// `voters`/`learners` (Phase 2d — membership SSOT): the source leader's
+    /// ConfState the installed baseline carries, so the joining node learns its
+    /// real membership from the snapshot rather than the static voter set. Null →
+    /// membership-neutral (the born/current prs). The supplied membership MUST
+    /// contain this node (`Error.SelfNotInConfState` otherwise — the leader must
+    /// have conf-change-added it first).
+    pub fn createGroupAtBaseline(self: *Bridge, gid: u64, epoch: u64, index: u64, term: u64, as_learner: bool, voters: ?[]const u64, learners: ?[]const u64) Error!void {
         const sig = self.sigFor(gid) orelse return Error.UnknownTenant;
-        var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .snap_index = index, .snap_term = term, .as_learner = as_learner };
+        var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .snap_index = index, .snap_term = term, .as_learner = as_learner, .snap_voters = voters, .snap_learners = learners };
         return self.runControl(&cmd);
     }
 
@@ -844,8 +883,8 @@ pub const Bridge = struct {
     /// the tail and the node can be promoted back. Pump-thread control cmd.
     /// `Error.NotLeader` if this node leads the group; `Error.SnapshotStale` if
     /// `index` is not ahead of committed.
-    pub fn applyLocalSnapshot(self: *Bridge, gid: u64, index: u64, term: u64) Error!void {
-        var cmd: ControlCmd = .{ .kind = .apply_local_snapshot, .gid = gid, .snap_index = index, .snap_term = term };
+    pub fn applyLocalSnapshot(self: *Bridge, gid: u64, index: u64, term: u64, voters: ?[]const u64, learners: ?[]const u64) Error!void {
+        var cmd: ControlCmd = .{ .kind = .apply_local_snapshot, .gid = gid, .snap_index = index, .snap_term = term, .snap_voters = voters, .snap_learners = learners };
         return self.runControl(&cmd);
     }
 
@@ -889,7 +928,7 @@ pub const Bridge = struct {
                         std.log.err("v2 bridge: refusing term-0 baseline for gid {d} at index {d}", .{ cmd.gid, cmd.snap_index });
                         break :blk Error.InvalidBaseline;
                     }
-                    _ = self.node.createGroupAtEpoch(cmd.gid, cmd.id_str, cmd.epoch, cmd.as_learner) catch |e| break :blk e;
+                    _ = self.node.createGroupAtEpoch(cmd.gid, cmd.id_str, cmd.epoch, cmd.as_learner, cmd.birth_voters) catch |e| break :blk e;
                     // Atomic baseline (createGroupAtBaseline): install the data-free
                     // snapshot in the SAME pump op as group creation so the fresh
                     // group is never observable at last_index 0 between creation and
@@ -901,7 +940,7 @@ pub const Bridge = struct {
                     // (a labeled break is not an error return, so errdefer won't
                     // fire here; roll back explicitly).
                     if (cmd.snap_index > 0) {
-                        self.node.applyLocalSnapshot(cmd.gid, cmd.snap_index, cmd.snap_term) catch |e| {
+                        self.node.applyLocalSnapshot(cmd.gid, cmd.snap_index, cmd.snap_term, cmd.snap_voters, cmd.snap_learners) catch |e| {
                             self.node.destroyGroupAndReclaim(cmd.gid) catch |de|
                                 std.log.err("v2 bridge: rollback of half-born gid {d} failed: {s}", .{ cmd.gid, @errorName(de) });
                             break :blk e;
@@ -953,7 +992,7 @@ pub const Bridge = struct {
                     break :blk null;
                 },
                 .apply_local_snapshot => blk: {
-                    self.node.applyLocalSnapshot(cmd.gid, cmd.snap_index, cmd.snap_term) catch |e| break :blk e;
+                    self.node.applyLocalSnapshot(cmd.gid, cmd.snap_index, cmd.snap_term, cmd.snap_voters, cmd.snap_learners) catch |e| break :blk e;
                     break :blk null;
                 },
                 .transfer_all_leadership => blk: {
@@ -1116,7 +1155,54 @@ pub const Bridge = struct {
         //    order as the active-set tick; pre-hibernation that is fine.
         self.refreshLeadership();
 
+        // 6. Snapshot-trigger tick: detect peers in `StateSnapshot` (fell below
+        //    the leader's compaction first_index under mechanism-A compaction)
+        //    and enqueue an out-of-band catch-up for the worker thread. The
+        //    native trigger that replaces the lockstep WAL floor.
+        self.snapshotTriggerTick();
+
         return did_work;
+    }
+
+    /// How often `snapshotTriggerTick` scans the active set for `StateSnapshot`
+    /// peers. The in-flight dedup means a re-scan while a transfer runs is a
+    /// no-op, so this only bounds detection latency for a freshly-stranded peer.
+    const SNAPSHOT_TRIGGER_INTERVAL_NS: i64 = 100 * std.time.ns_per_ms;
+
+    /// Pump thread: over the active groups this node leads, find peers raft holds
+    /// in `ProgressState::Snapshot` (the snapshot-free `snapshotCb` parks a peer
+    /// here once it falls below the leader's compacted first_index) and enqueue an
+    /// out-of-band catch-up for each. The baseline {index, term} is computed HERE
+    /// (pump-only `appliedIndex` + `logTerm`); the worker's `SnapshotCatchupThread`
+    /// dumps the store + pushes it to the peer. Interval-gated; reads pump-owned
+    /// `node.active` + node accessors with the bridge mutex NOT held (enqueue takes
+    /// it internally). O(active peers).
+    fn snapshotTriggerTick(self: *Bridge) void {
+        if (self.node.isSingleNode()) return;
+        const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+        if (now_ns - self.last_snapshot_trigger_ns < SNAPSHOT_TRIGGER_INTERVAL_NS) return;
+        self.last_snapshot_trigger_ns = now_ns;
+        var ids_buf: [16]u64 = undefined;
+        for (self.node.active.items) |gid| {
+            const peers = self.node.snapshotPendingPeers(gid, &ids_buf) orelse continue; // not leader / unknown
+            if (peers.len == 0) continue;
+            // Baseline the peer will install: the leader's live applied index +
+            // the term of its log entry there. `logTerm` is null when the leader's
+            // own log can't resolve a term (watermark drifted ahead of the log) —
+            // skip this tick and retry once the log covers it, exactly as
+            // `v2-applied-baseline` refuses rather than hand out a bogus term.
+            const index = self.node.appliedIndex(gid);
+            if (index == 0) continue; // nothing applied yet — nothing to snapshot
+            const term = self.node.logTerm(gid, index) orelse continue;
+            for (peers) |peer| {
+                if (self.enqueueSnapshotCatchup(gid, peer, index, term)) {
+                    std.log.info(
+                        "v2 snapshot-trigger gid={d}: peer {d} in StateSnapshot — queued out-of-band catch-up to baseline {d}/{d}",
+                        .{ gid, peer, index, term },
+                    );
+                }
+            }
+        }
     }
 
     /// How often `refreshLeadership` falls back to a FULL all-groups scan.
@@ -1209,6 +1295,61 @@ pub const Bridge = struct {
             n += 1;
         }
         return n;
+    }
+
+    fn catchupKey(gid: u64, peer: u64) u128 {
+        return (@as(u128, gid) << 64) | @as(u128, peer);
+    }
+
+    /// Pump thread: enqueue an out-of-band snapshot catch-up for a `StateSnapshot`
+    /// peer, unless one is already in flight for this `(gid, peer)`. Returns true
+    /// iff a job was queued (so the caller can log only on a fresh trigger). The
+    /// baseline {index, term} was computed by the caller on the pump thread.
+    pub fn enqueueSnapshotCatchup(self: *Bridge, gid: u64, peer: u64, index: u64, term: u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const key = catchupKey(gid, peer);
+        if (self.catchup_inflight.contains(key)) return false;
+        self.snapshot_catchup.append(self.allocator, .{ .gid = gid, .peer = peer, .index = index, .term = term }) catch return false;
+        self.catchup_inflight.put(self.allocator, key, {}) catch {
+            // Couldn't mark in-flight — drop the job we just queued rather than
+            // leave it un-deduped (it would be re-pushed every tick).
+            _ = self.snapshot_catchup.pop();
+            return false;
+        };
+        return true;
+    }
+
+    /// Worker thread: drain up to `out.len` catch-up jobs, resolving each gid's
+    /// `id_str` (pointer-stable, like `drainPromotions`). The `(gid, peer)` stays
+    /// in `catchup_inflight` until the worker calls `clearSnapshotCatchup` when the
+    /// transfer finishes. Returns the populated prefix count.
+    pub fn drainSnapshotCatchup(self: *Bridge, out: []SnapshotCatchup) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var n: usize = 0;
+        while (n < out.len) {
+            if (self.snapshot_catchup.items.len == 0) break;
+            const job = self.snapshot_catchup.orderedRemove(0);
+            const sig = self.groups.get(job.gid) orelse {
+                // Group vanished between enqueue and drain — drop the in-flight mark.
+                _ = self.catchup_inflight.remove(catchupKey(job.gid, job.peer));
+                continue;
+            };
+            out[n] = .{ .gid = job.gid, .peer = job.peer, .index = job.index, .term = job.term, .id_str = sig.id_str };
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Worker thread: a catch-up transfer finished (success or failure) — clear the
+    /// `(gid, peer)` in-flight mark so the pump re-triggers next tick if the peer is
+    /// still behind (a failed push retries; a successful one clears `StateSnapshot`
+    /// so `snapshotPendingPeers` no longer lists it).
+    pub fn clearSnapshotCatchup(self: *Bridge, gid: u64, peer: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.catchup_inflight.remove(catchupKey(gid, peer));
     }
 
     /// Boot-time recovery: re-stand-up every tenant group this node persisted
@@ -1577,7 +1718,7 @@ test "bridge: pump thread drives commits end to end" {
     try testing.expectEqualStrings("v", got);
 }
 
-test "bridge: move control — attach at epoch, quiesce holds writes, destroy reclaims" {
+test "bridge: move control — attach at epoch, destroy reclaims" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1591,7 +1732,7 @@ test "bridge: move control — attach at epoch, quiesce holds writes, destroy re
     // Destination-attach shape: register the tenant, then stand up its
     // group at a migration epoch (epoch+1 over the source's birth epoch).
     const gid = try bridge.registerTenant("mover");
-    try bridge.createGroupEpoch(gid, 1);
+    try bridge.createGroupEpoch(gid, 1, null);
 
     // A post-attach write commits through the freshly-attached group.
     var ws = WriteSet.init(a);
@@ -1605,13 +1746,6 @@ test "bridge: move control — attach at epoch, quiesce holds writes, destroy re
         std.Thread.sleep(1 * std.time.ns_per_ms);
     }
     try testing.expectEqual(seq, bridge.committedSeq(gid));
-
-    // Quiesce: the watermark is at next_seq (nothing in flight) and new
-    // proposes are now refused.
-    const drained_to = try bridge.quiesce(gid);
-    try testing.expectEqual(seq, drained_to);
-    try testing.expectEqual(seq, bridge.committedSeq(gid));
-    try testing.expectError(Error.Quiesced, bridge.propose(gid, env));
 
     // Source cleanup: destroy the group + reclaim its WAL. The node slot
     // is gone afterward (a read on the node store errors UnknownGroup).
@@ -1926,5 +2060,5 @@ test "bridge: createGroupEpoch requires a running pump thread" {
     defer bridge.deinit();
     const gid = try bridge.registerTenant("x");
     // No startPump → control ops have no executor.
-    try testing.expectError(Error.PumpNotRunning, bridge.createGroupEpoch(gid, 1));
+    try testing.expectError(Error.PumpNotRunning, bridge.createGroupEpoch(gid, 1, null));
 }

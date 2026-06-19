@@ -272,6 +272,46 @@ is the worked example of the full FFI-method → re-pin → wiring path.)
   (`443c592..f607513`). Any future FFI change branches
   from fork `main` and re-pins likewise.
 
+## Open follow-ups (low priority)
+
+### `check_quorum` self-step-down double-election on leader death
+
+`scripts/leader_failover_smoke_v2.py` asserts a CLEAN single re-election after a
+SIGKILL of the leader: exactly one survivor's `raft_leadership_acquisitions_total`
+rises, by exactly 1. It is intermittently RED, and that flakiness is a deliberate
+signal — **left in place, not hardened** — because it surfaces real failover
+behavior. Characterized 2026-06-17 (15-run samples):
+
+| tick (`REWIND_RAFT_TICK_MS`) | flake rate | shapes |
+|---|---|---|
+| 1ms (smoke default), pre-arc baseline `222ef0b` | 9/15 (60%) | both |
+| 1ms, branch `feat/high-churn-learner` | 5/15 (33%) | both |
+| **10ms (production-realistic)** | **2/15 (13%)** | only `(X,2.0)` |
+
+Two distinct mechanisms; the realistic-tick run separated them:
+
+1. **Dueling candidates** (`bumped=[(a,1),(b,1)]`, leadership bounces between the
+   two survivors). Their randomized election timeouts collided. The randomization
+   window is `election_tick × tick`, so a 1ms tick gives a ~10ms spread vs ~100ms
+   at 10ms. **Eliminated entirely at the realistic tick** — a pure artifact of the
+   smoke's compressed clock.
+2. **`check_quorum` self-step-down** (`bumped=[(X,2.0)]`, one node wins, steps
+   *itself* down, re-wins, the other never leads). A freshly-elected leader that
+   can't confirm quorum contact within its first election-timeout window demotes
+   itself; with one of three voters SIGKILL'd it hangs on the single surviving
+   peer's contact, and a brief lapse trips it. **Persists at ~13% even at 10ms.**
+   Hypothesis to investigate: the new leader's first quorum window fails because
+   the old leader's abrupt death churns the transport (raft-net) — the surviving
+   peer's contact is briefly delayed during reconnect. A longer first-heartbeat
+   grace, or warming the surviving-peer link, may close it.
+
+**Safety is never violated** — every failing run passes all data checks, including
+a post-failover write committed + replicated to both survivors. This is a liveness
+hiccup only (an extra ~150ms election), data-safe, and **pre-existing** (the
+pre-arc baseline flakes harder than the current branch, so the snapshot-catch-up /
+mechanism-A work neither caused nor worsened it). Low priority; recovery stays
+fast. Do NOT "fix" by relaxing the assertion — the point is the watchdog.
+
 ## Pointers
 
 - Strict-serializable read design + the eventual→strict reasoning: the

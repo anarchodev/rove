@@ -111,6 +111,18 @@ pub const DEFAULT_HIBERNATE_NS: i64 = 2 * std.time.ns_per_s;
 /// replay and lets the WAL be truncated. Tests override with a short value.
 pub const DEFAULT_DURABILIZE_NS: i64 = 500 * std.time.ns_per_ms;
 
+/// Mechanism-A compaction (raft-native-alignment §I4): the fixed catch-up
+/// buffer. `durabilizeTick` compacts the WAL to `durable_apply_watermark −
+/// grace`, PER NODE INDEPENDENTLY — no cross-node min-match floor, no propagated
+/// floor, no lockstep. A peer within `grace` entries of the cap catches up from
+/// the log; anyone further back trips raft's `StateSnapshot` and is recovered by
+/// the out-of-band snapshot catch-up driver. The fixed buffer is the bound: a
+/// dead/stuck peer falls out of it and snapshots rather than pinning the WAL.
+/// ~etcd's `SnapshotCatchUpEntries` (5000). One knob (`REWIND_SNAPSHOT_GRACE`);
+/// 0 means "compact to the durable watermark" (snapshot any peer not exactly
+/// caught up — valid, just snapshot-heavy).
+pub const DEFAULT_SNAPSHOT_GRACE: u64 = 5_000;
+
 /// Auto-demote policy (conf_change Phase 2): on the leader, a peer voter that
 /// is BOTH this many entries behind the leader's last index AND `!recent_active`
 /// (no contact within ~an election timeout, under check_quorum) is demoted to a
@@ -330,14 +342,6 @@ pub const TenantSlot = struct {
     /// `applied_idx > durabilized_idx` ⇒ this group has committed-but-not-yet-
     /// durable writes (it is "dirty"). Single-node compacts the WAL up to here.
     durabilized_idx: u64 = 0,
-    /// The WAL-compaction floor this group's LEADER last propagated (the
-    /// cluster-wide min match index, stamped on inbound transport messages and
-    /// drained by `applyRecvFloor`). A FOLLOWER truncates its WAL to this floor
-    /// so it compacts in lockstep with the leader — never past an entry a voter
-    /// still needs (snapshot-free). 0 (no floor yet ⇒ no follower truncation)
-    /// until the first leader message lands; unused on the leader (it uses its
-    /// own live `minMatchIndex`). Monotonic.
-    propagated_floor: u64 = 0,
     /// Whether this slot is in `Node.dirty` (committed since last durabilize),
     /// so `applyEntry` enqueues it at most once.
     in_dirty: bool = false,
@@ -427,6 +431,11 @@ pub const Node = struct {
     auto_demote_lag: u64 = DEFAULT_AUTO_DEMOTE_LAG,
     auto_demote_interval_ns: i64 = DEFAULT_AUTO_DEMOTE_NS,
     last_auto_demote_ns: i64 = 0,
+    /// Mechanism-A compaction catch-up buffer (see `DEFAULT_SNAPSHOT_GRACE`):
+    /// `durabilizeTick` keeps this many entries below the durable apply watermark
+    /// in the WAL so a peer within the buffer catches up from the log; a peer
+    /// further back trips `StateSnapshot` and is recovered out-of-band.
+    snapshot_grace: u64 = DEFAULT_SNAPSHOT_GRACE,
     /// Raft logical-tick cadence + last-tick wall-clock (see `DEFAULT_TICK_NS`).
     /// `pump` fires `mgr.tickGroups` at most once per `tick_interval_ns`, so the
     /// election timeout (`election_tick × tick_interval_ns`) is decoupled from
@@ -662,7 +671,7 @@ pub const Node = struct {
         // Birth OR restart: recover any durable WAL records for this group
         // (a no-op on a never-seen group). On a restart this replays the
         // committed log back into the store.
-        return self.createGroupCore(tenant_id, id_str, 0, true, false);
+        return self.createGroupCore(tenant_id, id_str, 0, true, false, null);
     }
 
     /// Attach a tenant group at an explicit migration fence `epoch` (the
@@ -680,13 +689,13 @@ pub const Node = struct {
     /// (voters = the rest), for joining an existing group safely — see
     /// `createGroupCore`. The default (false) births a voter from the static
     /// voter set (a move destination / a configured voter rejoining).
-    pub fn createGroupAtEpoch(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64, as_learner: bool) Error!*TenantSlot {
+    pub fn createGroupAtEpoch(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64, as_learner: bool, voters_override: ?[]const u64) Error!*TenantSlot {
         if (self.groups.get(tenant_id) != null) return Error.GroupExists;
         self.mgr.clearTombstone(tenant_id) catch {};
         // A migration attach is a FRESH group — its state arrives via the
         // bundle, not the WAL — so do NOT replay any (stale) recovered records
         // for this gid.
-        return self.createGroupCore(tenant_id, id_str, epoch, false, as_learner);
+        return self.createGroupCore(tenant_id, id_str, epoch, false, as_learner, voters_override);
     }
 
     /// A group recorded in the node-local manifest (see `groups_manifest`):
@@ -704,26 +713,44 @@ pub const Node = struct {
     /// single-threaded, like `ensureGroup`. Idempotent.
     pub fn recoverGroup(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64) Error!*TenantSlot {
         if (self.groups.get(tenant_id)) |slot| return slot;
-        return self.createGroupCore(tenant_id, id_str, epoch, true, false);
+        return self.createGroupCore(tenant_id, id_str, epoch, true, false, null);
     }
 
-    /// Record (or update) a group in the node-local recovery manifest.
-    /// Best-effort: a manifest failure is logged, never propagated — the live
-    /// group already exists; recovery is a resilience feature, not a gate.
-    /// Pump-thread (group lifecycle); `KvStore.put` self-commits.
+    /// Record (or update) a group in the node-local recovery manifest, then
+    /// DURABILIZE it (fold the manifest's kvexp overlay into LMDB). Best-effort:
+    /// a manifest failure is logged, never propagated — the live group already
+    /// exists; recovery is a resilience feature, not a gate. Pump-thread (group
+    /// lifecycle).
+    ///
+    /// The durabilize is load-bearing: `KvStore.put` commits only to the kvexp
+    /// VOLATILE overlay (like a tenant write before `durabilizeTick` folds it).
+    /// The manifest store is never on the `dirty` durabilize path, so without an
+    /// explicit fold here a hard crash (SIGKILL) loses every non-genesis group's
+    /// record — on restart `recoverGroups` reads an empty manifest and the node
+    /// silently drops that tenant's raft messages ("unknown group") forever. The
+    /// fold is an fsync, but group create/move is rare, so the cost is fine.
     fn recordGroup(self: *Node, id_str: []const u8, epoch: u64) void {
         var buf: [24]u8 = undefined;
         const ep = std.fmt.bufPrint(&buf, "{d}", .{epoch}) catch return;
-        self.groups_manifest.put(id_str, ep) catch |err| std.log.warn(
-            "v2 node: group manifest record {s} failed: {s}",
+        self.groups_manifest.put(id_str, ep) catch |err| {
+            std.log.warn("v2 node: group manifest record {s} failed: {s}", .{ id_str, @errorName(err) });
+            return;
+        };
+        self.groups_manifest.checkpoint() catch |err| std.log.warn(
+            "v2 node: group manifest durabilize {s} failed: {s} (record may not survive a crash)",
             .{ id_str, @errorName(err) },
         );
     }
 
-    /// Remove a group from the recovery manifest (move-out). Best-effort.
+    /// Remove a group from the recovery manifest (move-out) + durabilize the
+    /// delete (so a crash can't resurrect a moved-out group's record). Best-effort.
     fn forgetGroup(self: *Node, id_str: []const u8) void {
-        self.groups_manifest.delete(id_str) catch |err| std.log.warn(
-            "v2 node: group manifest forget {s} failed: {s}",
+        self.groups_manifest.delete(id_str) catch |err| {
+            std.log.warn("v2 node: group manifest forget {s} failed: {s}", .{ id_str, @errorName(err) });
+            return;
+        };
+        self.groups_manifest.checkpoint() catch |err| std.log.warn(
+            "v2 node: group manifest durabilize (forget {s}) failed: {s}",
             .{ id_str, @errorName(err) },
         );
     }
@@ -773,7 +800,14 @@ pub const Node = struct {
     /// the raft group at `epoch`, register the slot, and drive it to
     /// leader (single-node campaign). Caller has already verified the
     /// group does not exist.
-    fn createGroupCore(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64, recover: bool, as_learner: bool) Error!*TenantSlot {
+    /// `voters_override` (Phase 2e — cluster node-set SSOT): the initial voter set
+    /// a FRESH group is born with, supplied by the control plane (the cluster's
+    /// node set, the single source of truth) instead of this node's static
+    /// `REWIND_VOTERS` env. Null → fall back to `self.voters` (unchanged). Ignored
+    /// on the `recover` path (a rejoining group restores its membership from the
+    /// WAL) and immaterial under a baseline (the baseline's ConfState overwrites
+    /// the born membership — Phase 2d).
+    fn createGroupCore(self: *Node, tenant_id: u64, id_str: []const u8, epoch: u64, recover: bool, as_learner: bool, voters_override: ?[]const u64) Error!*TenantSlot {
         // {data_dir}/{tenant_id}/app.db
         const dir = std.fmt.allocPrint(self.allocator, "{s}/{d}", .{ self.data_dir, tenant_id }) catch
             return Error.OutOfMemory;
@@ -804,13 +838,20 @@ pub const Node = struct {
         // __admin__ wall). Split self out of the voter set into a sole learner.
         // Fresh-group only: `recover` restores the persisted membership from the
         // WAL, so a rejoining node keeps whatever role it last held.
+        // The born ConfState's voter set: the CP-supplied cluster node set when
+        // given (Phase 2e SSOT), else this node's static `REWIND_VOTERS`.
+        const base_voters = voters_override orelse self.voters;
+        if (!recover) std.log.info(
+            "v2 node: gid={d} born voters={any} source={s}",
+            .{ tenant_id, base_voters, if (voters_override != null) "cp-ssot" else "rewind_voters" },
+        );
         var voters_scratch: [64]u64 = undefined;
         const learner_self = [_]u64{self.node_id};
-        var voters_slice: []const u64 = self.voters;
+        var voters_slice: []const u64 = base_voters;
         var learners_slice: []const u64 = &.{};
         if (as_learner and !recover) {
             var n: usize = 0;
-            for (self.voters) |v| {
+            for (base_voters) |v| {
                 if (v != self.node_id and n < voters_scratch.len) {
                     voters_scratch[n] = v;
                     n += 1;
@@ -974,6 +1015,15 @@ pub const Node = struct {
         return self.mgr.lastIndex(tenant_id) orelse 0;
     }
 
+    /// Peer ids in `StateSnapshot` on this (leader) node for `tenant_id` — peers
+    /// that fell below the compaction floor and need an out-of-band catch-up
+    /// (the snapshot-free `snapshotCb` parks them here). Writes into `ids`,
+    /// returns the populated prefix, or null if not leader / unknown group. The
+    /// snapshot-trigger tick polls this over led groups. Pump-thread only.
+    pub fn snapshotPendingPeers(self: *Node, tenant_id: u64, ids: []u64) ?[]u64 {
+        return self.mgr.snapshotPendingPeers(tenant_id, ids);
+    }
+
     /// This group's LIVE applied index on this node (`slot.applied_idx`: the
     /// highest committed entry whose writeset is folded into the store's overlay).
     /// On the leader this is the correct out-of-band baseline for a new member: it
@@ -1008,8 +1058,8 @@ pub const Node = struct {
     /// learner; the KV state for `index` must already be loaded out-of-band (the
     /// move bundle). Fast-forwards the raft log baseline so the leader can
     /// replicate the tail and the node can be promoted back. Pump-thread only.
-    pub fn applyLocalSnapshot(self: *Node, tenant_id: u64, index: u64, term: u64) Error!void {
-        try self.mgr.applyLocalSnapshot(tenant_id, index, term);
+    pub fn applyLocalSnapshot(self: *Node, tenant_id: u64, index: u64, term: u64, voters: ?[]const u64, learners: ?[]const u64) Error!void {
+        try self.mgr.applyLocalSnapshot(tenant_id, index, term, voters, learners);
         // A2: the baseline fast-forwarded the raft LOG to `index` and the KV state
         // for `index` is already in the store (the out-of-band bundle). Stamp the
         // store's DURABLE applied watermark to `index` as well — otherwise a crash
@@ -1334,14 +1384,16 @@ pub const Node = struct {
             // dup-tolerant and re-notifies if work landed mid-round).
             // Single-node: queued to a transport-less sink (a no-op).
             // Multi-node: buffered per destination node, stamped with the
-            // group's migration epoch, for the coalesced flush below.
+            // group's migration epoch, for the coalesced flush below. (No
+            // cross-node compaction floor is sent — mechanism-A compaction is
+            // per-node; the floor wire field was removed in Phase 2f.)
             for (ready) |g| {
-                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g), .floor = self.outboundFloor(g) };
+                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g) };
                 self.mgr.takeMessages(g, sendMsgCb, &sctx) catch {};
                 self.mgr.release(g);
             }
             for (ready2) |g| {
-                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g), .floor = self.outboundFloor(g) };
+                var sctx: SendCtx = .{ .node = self, .group_id = g, .epoch = self.mgr.groupEpoch(g) };
                 self.mgr.takeMessages(g, sendMsgCb, &sctx) catch {};
                 self.mgr.release(g);
             }
@@ -1375,9 +1427,6 @@ pub const Node = struct {
             self.woke_scratch.clearRetainingCapacity();
             t.drainWoke(&self.woke_scratch, self.allocator) catch {};
             for (self.woke_scratch.items) |gid| self.bumpActive(gid) catch {};
-            // Record each group's leader-propagated compaction floor so a
-            // follower truncates its WAL in lockstep (snapshot-free bound).
-            t.drainFloors(self, Node.applyRecvFloor);
         }
 
         // Hibernate: stop ticking any group idle past its deadline.
@@ -1402,16 +1451,15 @@ pub const Node = struct {
     /// Checkpoint dirty stores (V2 port of V1's `Cluster.tickSnapshot`).
     /// Interval-gated. For each group with committed-but-not-durable writes,
     /// fold its overlay into LMDB + stamp `lastAppliedRaftIdx` (one atomic
-    /// durabilize), then compact the shared WAL up to the durabilized index so
-    /// the log stays bounded. Single-node always compacts. Multi-node compacts
-    /// in lockstep: the LEADER floors the truncate point at its live cluster-wide
-    /// min match index (`minMatchIndex`) and propagates that floor on its
-    /// outbound messages; a FOLLOWER truncates to the propagated floor
-    /// (`propagated_floor`). Both stop at the same point, so no node compacts
-    /// past an entry a voter still needs — a lagging/returning voter catches up
-    /// from the LOG, never a snapshot (snapshot-free). Pump-thread only. All
-    /// dirty groups are flushed in one tick so the shared WAL's interleaved
-    /// commits clear together.
+    /// durabilize), then compact the shared WAL so the log stays bounded.
+    /// Compaction is mechanism A (raft-native-alignment §I4): truncate to a FIXED
+    /// catch-up buffer (`snapshot_grace`) below the durable apply watermark, PER
+    /// NODE INDEPENDENTLY — no cross-node min-match floor, no lockstep, no
+    /// leader/follower asymmetry. A peer within the buffer catches up from the
+    /// log; a peer further back trips raft's `StateSnapshot` and is recovered by
+    /// the out-of-band snapshot catch-up driver. Pump-thread only. All dirty
+    /// groups are flushed in one tick so the shared WAL's interleaved commits
+    /// clear together.
     fn durabilizeTick(self: *Node, now: i64) void {
         if (self.dirty.items.len == 0) return;
         if (now - self.last_durabilize_ns < self.durabilize_interval_ns) return;
@@ -1441,17 +1489,18 @@ pub const Node = struct {
             // nothing is awaited.
             var target = slot.applied_idx;
             if (self.durabilize_floor) |f| target = @min(target, f.func(f.ctx, gid));
-            // Multi-node WAL compaction floor — snapshot-free + lockstep: the
-            // LEADER floors the truncate point at its live cluster-wide min match
-            // index; a FOLLOWER uses the floor the leader propagated on its
-            // messages (`propagated_floor`, 0 ⇒ none yet ⇒ no truncation). Both
-            // truncate to the SAME floor, so no node ever compacts past an entry
-            // a voter still needs — a lagging/returning voter catches up from the
-            // LOG, never a snapshot. Single-node ({self}) ⇒ min_match = own match
-            // ≥ applied ⇒ target. Constrains only truncation; the LMDB fold of
-            // the full applied tail above is unaffected.
-            const floor: u64 = if (self.mgr.isLeader(gid)) self.mgr.minMatchIndex(gid) else slot.propagated_floor;
-            const compact_target = @min(target, floor);
+            // Mechanism-A WAL compaction (raft-native-alignment §I4): truncate to
+            // a FIXED catch-up buffer below the durable apply watermark, PER NODE
+            // INDEPENDENTLY — no cross-node min-match floor, no propagated floor,
+            // no leader/follower asymmetry. A peer within `snapshot_grace` of the
+            // cap catches up from the log; a peer further back trips raft's
+            // `StateSnapshot` and is recovered out-of-band by the snapshot
+            // catch-up driver (the `snapshotTriggerTick` → `SnapshotCatchupThread`
+            // path). The fixed buffer is the bound: a dead/stuck peer falls out of
+            // it and snapshots rather than pinning the WAL. Constrains only
+            // truncation; the LMDB fold of the full applied tail above is
+            // unaffected.
+            const compact_target = target -| self.snapshot_grace;
             if (target <= slot.durabilized_idx) {
                 // Nothing foldable yet — keep the slot dirty and retry
                 // next tick (the worker ack raises the floor).
@@ -1797,10 +1846,6 @@ pub const Node = struct {
         node: *Node,
         group_id: u64,
         epoch: u64,
-        /// The leader's WAL-compaction floor (cluster-wide min match) stamped
-        /// on every outbound message so followers compact in lockstep;
-        /// `maxInt` when this node is not the group's leader (no floor to send).
-        floor: u64,
     };
 
     /// `takeMessages` callback: buffer one outbound raft message into the
@@ -1815,24 +1860,9 @@ pub const Node = struct {
         const ctx: *SendCtx = @ptrCast(@alignCast(ud.?));
         const t = ctx.node.transport orelse return;
         const bytes = if (msg_len == 0) &[_]u8{} else msg_bytes[0..msg_len];
-        t.queueOut(to, ctx.group_id, ctx.epoch, ctx.floor, bytes);
+        t.queueOut(to, ctx.group_id, ctx.epoch, bytes);
     }
 
-    /// The WAL-compaction floor to stamp on `gid`'s outbound messages.
-    /// `minMatchIndex` is the cluster-wide min match on the leader and `maxInt`
-    /// (no floor) off-leader — exactly the per-recipient floor semantics, so a
-    /// follower receives + adopts the leader's floor and compacts in lockstep.
-    fn outboundFloor(self: *Node, gid: u64) u64 {
-        return self.mgr.minMatchIndex(gid);
-    }
-
-    /// Transport `drainFloors` callback: record the leader-sent compaction
-    /// floor for `gid` on its slot (monotonic). `durabilizeTick` truncates a
-    /// follower's WAL to this floor. Pump-thread only.
-    fn applyRecvFloor(self: *Node, gid: u64, floor: u64) void {
-        const slot = self.groups.get(gid) orelse return;
-        if (floor > slot.propagated_floor) slot.propagated_floor = floor;
-    }
 };
 
 /// Narrow a raft-rs error to the node's `Error` set (they overlap, but

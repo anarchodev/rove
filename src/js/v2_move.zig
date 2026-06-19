@@ -1,24 +1,24 @@
-//! V2 Phase 4 — the cluster-internal tenant-MOVE surface.
+//! V2 — the cluster-internal tenant-MOVE surface.
 //!
-//! v2-build-order §Phase 4 ("Quiesce + brief-pause move"). These
-//! `/_system/v2-*` endpoints are the data-plane half of moving a tenant
-//! from one single-node cluster to another; the front door
-//! (`rewind-front`) is the orchestrator that calls them in sequence and
-//! flips the routing directory at the commit point. Each endpoint runs on
-//! the reused rove-js worker, so it has the worker's per-tenant
-//! `cluster.kv` stores (`worker.node.tenant`) and the V2 per-tenant raft
-//! bridge (`worker.raft`).
+//! The data-plane half of moving a tenant from one cluster to another; the CP
+//! (`rewind-cp`) orchestrates, calling these in sequence and flipping the
+//! routing directory at the commit point. Each endpoint runs on the rove-js
+//! worker, so it has the worker's per-tenant `cluster.kv` stores
+//! (`worker.node.tenant`) and the V2 per-tenant raft bridge (`worker.raft`).
 //!
-//!   v2-kv     — seed (PUT) / read (GET) a tenant store through the real
-//!               propose→commit path. The move smoke's write + read-back.
-//!   v2-bundle — quiesce the tenant + dump its key-space as a migration
-//!               bundle (source). The bundle ships KV state only; blobs
-//!               are served from the shared content-addressed store.
-//!   v2-attach — load a bundle into a fresh instance + stand up its raft
-//!               group at the migration epoch (destination).
-//!   v2-evict  — destroy the source raft group + drop the instance once
-//!               the directory has flipped (source cleanup).
-//!   v2-resume — lift a quiesce (abort path: the move never completed).
+//! The move is ZERO-DOWNTIME (the source serves throughout) — the brief-pause
+//! variant (quiesce + bundle dump + `v2-bundle`/`v2-resume`) was retired in the
+//! raft-native-alignment convergence; there is one move now.
+//!
+//!   v2-kv       — seed (PUT) / read (GET) a tenant store through the real
+//!                 propose→commit path. The move smoke's write + read-back.
+//!   v2-attach   — stand up a fresh group at the migration epoch (destination);
+//!                 the snapshot data arrives separately via the streamed merge.
+//!   v2-snapshot-stream?mode=merge — the streamed insert-if-absent snapshot load
+//!                 (dest); pushed by the source's `v2-snapshot-push` (Phase 2.5).
+//!   v2-forward-* — open/close the source→dest live-write forward stream.
+//!   v2-evict    — destroy the source raft group + drop the instance once the
+//!                 directory has flipped (source cleanup).
 //!
 //! ## Auth
 //!
@@ -51,6 +51,15 @@ const curl = blob.curl;
 
 const MOVE_SECRET_HEADER = "x-rewind-move-secret";
 const TENANT_HEADER = "x-rewind-tenant";
+// raft Phase 2.5 streamed-snapshot baseline (carried in headers so the body is
+// the pure pair stream — collapses v2-load-replace + v2-apply-snapshot into one).
+const SNAP_INDEX_HEADER = "x-rewind-snapshot-index";
+const SNAP_TERM_HEADER = "x-rewind-snapshot-term";
+// "replace" (default, catch-up/promote-back) | "merge" (zero-downtime move).
+const SNAP_MODE_HEADER = "x-rewind-snapshot-mode";
+// v2-snapshot-push: the dest node base URL the source streams to.
+const DEST_HEADER = "x-rewind-dest";
+const snapshot_sink_mod = @import("snapshot_sink.zig");
 
 /// Constant-time byte-slice equality for secret comparison: the
 /// compare time depends only on the (non-secret) length, never on how
@@ -84,6 +93,13 @@ const JOIN_LEARNER_HEADER = "x-rewind-join-as-learner";
 // epoch every provisioned tenant has (provision/move attaches omit the header,
 // so their long-standing behavior is unchanged).
 const EPOCH_HEADER = "x-rewind-epoch";
+// Phase 2d (membership SSOT): the leader's ConfState (comma-separated raft ids)
+// the baseline carries, so a joiner learns its membership from the snapshot
+// instead of a static voter set. The reconciler reads these from the leader's
+// `v2-applied-baseline` (one consistent read) and forwards them on the attach.
+// Absent → membership-neutral (the group's born/current prs, unchanged).
+const VOTERS_HEADER = "x-rewind-voters";
+const LEARNERS_HEADER = "x-rewind-learners";
 
 /// Source-side marker key (in the tenant's own `inst.kv`) holding the
 /// destination node list — comma-separated base URLs, leader first — while a
@@ -127,14 +143,10 @@ pub fn tryHandleV2(
 
     if (std.mem.eql(u8, sys_rest, "v2-kv")) {
         try handleKv(server, allocator, worker, ent, sid, sess, method, path, body);
-    } else if (std.mem.eql(u8, sys_rest, "v2-bundle")) {
-        try handleBundle(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-attach")) {
         try handleAttach(server, allocator, worker, ent, sid, sess, method, rh, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-evict")) {
         try handleEvict(server, allocator, worker, ent, sid, sess, method, body);
-    } else if (std.mem.eql(u8, sys_rest, "v2-resume")) {
-        try handleResume(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-leader")) {
         try handleLeader(server, allocator, worker, ent, sid, sess, method, path);
     } else if (std.mem.eql(u8, sys_rest, "v2-apply")) {
@@ -145,6 +157,8 @@ pub fn tryHandleV2(
         try handleForwardEnd(server, allocator, worker, ent, sid, sess, method, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-snapshot")) {
         try handleSnapshot(server, allocator, worker, ent, sid, sess, method, body);
+    } else if (std.mem.eql(u8, sys_rest, "v2-snapshot-push")) {
+        try armSnapshotPush(server, allocator, worker, ent, sid, sess, method, rh);
     } else if (std.mem.eql(u8, sys_rest, "v2-load-merge")) {
         try handleLoadMerge(server, allocator, worker, ent, sid, sess, method, rh, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-plan")) {
@@ -359,71 +373,25 @@ fn handleDomain(
     return reply(server, allocator, ent, sid, sess, status, "domain alias write failed\n");
 }
 
-// ── v2-bundle: quiesce + dump (source) ───────────────────────────────
-
-fn handleBundle(
-    server: anytype,
-    allocator: std.mem.Allocator,
-    worker: anytype,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    method: []const u8,
-    body: []const u8,
-) !void {
-    if (!std.mem.eql(u8, method, "POST"))
-        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
-    const tenant = parseTenant(allocator, body) orelse
-        return reply(server, allocator, ent, sid, sess, 400, "expected {\"tenant\"}\n");
-    defer allocator.free(tenant);
-
-    const gid = worker.raft.gidForTenant(tenant) orelse
-        return reply(server, allocator, ent, sid, sess, 409, "tenant not active on this cluster\n");
-
-    // Leader gate (Phase 5 multi-node): the bundle must be dumped from the
-    // node that leads the tenant's group — the only node taking live writes,
-    // so quiescing it is what makes the snapshot a consistent point. A
-    // follower 421s so the front door's bundle step retries the next node.
-    // Single node → always leader, so the milestone path is unchanged.
-    if (!worker.raft.isLeaderOf(gid))
-        return reply(server, allocator, ent, sid, sess, 421, "not the leader for this tenant; try another node\n");
-
-    // Quiesce: stop admitting writes, then wait for in-flight to drain to
-    // applied == committed so the dump is a consistent point.
-    const drained_to = worker.raft.quiesce(gid) catch
-        return reply(server, allocator, ent, sid, sess, 500, "quiesce failed\n");
-    if (!awaitCommit(worker, gid, drained_to)) {
-        worker.raft.unquiesce(gid);
-        return reply(server, allocator, ent, sid, sess, 504, "drain timed out\n");
-    }
-    // `committedSeq >= drained_to` proves raft commit + apply-skip, but a
-    // parked customer write's TrackedTxn only promotes into the store in
-    // drainRaftPending — which runs between dispatches on THIS worker
-    // thread, so it cannot make progress while we block here, and a dump
-    // taken now would silently MISS raft-committed writes (the move then
-    // destroys the source group → acked data lost). Reply 423: the CP
-    // retries shortly; between attempts the worker loop drains and the
-    // overlay catches up. The quiesce stays held across retries (no new
-    // writes; same keep-quiesced contract as the 200 path — an abandoned
-    // move releases it via v2-resume).
-    if (!worker.raft.workerAckedThrough(gid, drained_to)) {
-        return reply(server, allocator, ent, sid, sess, 423, "overlay drain in progress; retry\n");
-    }
-
-    const inst = (worker.node.tenant.getInstance(tenant) catch null) orelse {
-        worker.raft.unquiesce(gid);
-        return reply(server, allocator, ent, sid, sess, 404, "unknown tenant\n");
-    };
-    const bundle = inst.kv.dumpTenantBundle(allocator) catch {
-        worker.raft.unquiesce(gid);
-        return reply(server, allocator, ent, sid, sess, 500, "bundle dump failed\n");
-    };
-    // The tenant stays quiesced — the move continues with attach on the
-    // destination + evict here. An aborted move calls v2-resume.
-    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, bundle, allocator, null, "application/octet-stream");
-}
-
 // ── v2-attach: load bundle + stand up the group (destination) ─────────
+
+/// Parse a comma-separated list of raft node ids (e.g. the `X-Rewind-Voters`
+/// header) into `buf`, returning the populated prefix — or null when the header
+/// is absent (membership-neutral). Errors on a non-numeric / overflowing token,
+/// or more than `buf.len` ids (a 3-node cluster never approaches the cap).
+fn parseIdList(header: ?[]const u8, buf: []u64) !?[]const u64 {
+    const s = header orelse return null;
+    var n: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, s, ',');
+    while (it.next()) |tok| {
+        const t = std.mem.trim(u8, tok, " ");
+        if (t.len == 0) continue;
+        if (n >= buf.len) return error.TooManyIds;
+        buf[n] = try std.fmt.parseInt(u64, t, 10);
+        n += 1;
+    }
+    return buf[0..n];
+}
 
 fn handleAttach(
     server: anytype,
@@ -511,12 +479,30 @@ fn handleAttach(
     else
         1;
     if (baseline_index > 0) {
-        worker.raft.createGroupAtBaseline(gid, epoch, baseline_index, baseline_term, join_as_learner) catch |err| switch (err) {
+        // Phase 2d: optional ConfState (membership SSOT). Parsed onto the handler
+        // stack — `createGroupAtBaseline` BLOCKS on the pump ControlCmd, so these
+        // buffers outlive the install. Absent headers → null → membership-neutral.
+        var voters_buf: [16]u64 = undefined;
+        var learners_buf: [16]u64 = undefined;
+        const voters = parseIdList(respb.findHeader(rh, VOTERS_HEADER), &voters_buf) catch
+            return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ VOTERS_HEADER ++ "\n");
+        const learners = parseIdList(respb.findHeader(rh, LEARNERS_HEADER), &learners_buf) catch
+            return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ LEARNERS_HEADER ++ "\n");
+        worker.raft.createGroupAtBaseline(gid, epoch, baseline_index, baseline_term, join_as_learner, voters, learners) catch |err| switch (err) {
             error.GroupExists => {}, // idempotent re-attach
+            error.SelfNotInConfState => return reply(server, allocator, ent, sid, sess, 409, "supplied membership omits this node; add it to the group first\n"),
             else => return reply(server, allocator, ent, sid, sess, 500, "group attach (baseline) failed\n"),
         };
     } else {
-        worker.raft.createGroupEpoch(gid, epoch) catch |err| switch (err) {
+        // Phase 2e (cluster node-set SSOT): a plain (no-baseline) formation —
+        // provision's empty-attach — is born with the CP-supplied cluster node set
+        // (`X-Rewind-Voters`) instead of this node's static `REWIND_VOTERS`. Absent
+        // → null → `REWIND_VOTERS` (unchanged). Parsed onto the handler stack; the
+        // blocking control op keeps it alive.
+        var birth_buf: [16]u64 = undefined;
+        const birth_voters = parseIdList(respb.findHeader(rh, VOTERS_HEADER), &birth_buf) catch
+            return reply(server, allocator, ent, sid, sess, 400, "malformed " ++ VOTERS_HEADER ++ "\n");
+        worker.raft.createGroupEpoch(gid, epoch, birth_voters) catch |err| switch (err) {
             error.GroupExists => {}, // idempotent re-attach
             else => return reply(server, allocator, ent, sid, sess, 500, "group attach failed\n"),
         };
@@ -548,27 +534,6 @@ fn handleEvict(
     }
     worker.node.tenant.deleteInstance(tenant) catch |err|
         std.log.warn("v2-evict: deleteInstance({s}) failed: {s}", .{ tenant, @errorName(err) });
-    try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
-}
-
-// ── v2-resume: lift a quiesce (abort path) ───────────────────────────
-
-fn handleResume(
-    server: anytype,
-    allocator: std.mem.Allocator,
-    worker: anytype,
-    ent: rove.Entity,
-    sid: h2.StreamId,
-    sess: h2.Session,
-    method: []const u8,
-    body: []const u8,
-) !void {
-    if (!std.mem.eql(u8, method, "POST"))
-        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
-    const tenant = parseTenant(allocator, body) orelse
-        return reply(server, allocator, ent, sid, sess, 400, "expected {\"tenant\"}\n");
-    defer allocator.free(tenant);
-    if (worker.raft.gidForTenant(tenant)) |gid| worker.raft.unquiesce(gid);
     try respb.setSystemResponse(server, ent, sid, sess, 204, "", allocator, null, null);
 }
 
@@ -1183,8 +1148,28 @@ fn handleAppliedBaseline(
     // born via `ensureGroup`) are epoch 0; provisioned tenants are epoch 1; a
     // moved tenant is higher. Hard-coding 1 only ever worked for the first class.
     const epoch = worker.raft.groupEpoch(gid);
-    const out = std.fmt.allocPrint(allocator, "{{\"index\":{d},\"term\":{d},\"epoch\":{d}}}\n", .{ index, term, epoch }) catch
+    // Phase 2d (membership SSOT): return the leader's ConfState in the SAME
+    // response, so a joiner reads {index, term, epoch, conf_state} in ONE call and
+    // installs a baseline carrying the real membership — instead of a second
+    // `v2-confstate` call that could race a conf-change (the TOCTOU the
+    // raft-rs/TiKV cross-check flagged). The membership a baseline carries must
+    // match the membership at `index`; one read keeps them consistent.
+    var voters_buf: [16]u64 = undefined;
+    var learners_buf: [16]u64 = undefined;
+    const cs = worker.raft.confState(gid, &voters_buf, &learners_buf) orelse
+        return reply(server, allocator, ent, sid, sess, 500, "conf_state unavailable\n");
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var w = buf.writer(allocator);
+    w.print("{{\"index\":{d},\"term\":{d},\"epoch\":{d},\"voters\":[", .{ index, term, epoch }) catch
         return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    for (cs.voters, 0..) |v, i| w.print("{s}{d}", .{ if (i == 0) "" else ",", v }) catch
+        return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    w.writeAll("],\"learners\":[") catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    for (cs.learners, 0..) |l, i| w.print("{s}{d}", .{ if (i == 0) "" else ",", l }) catch
+        return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    w.writeAll("]}\n") catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    const out = buf.toOwnedSlice(allocator) catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
 }
 
@@ -1299,12 +1284,246 @@ fn handleApplySnapshot(
         return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
     if (worker.raft.isLeaderOf(gid))
         return reply(server, allocator, ent, sid, sess, 409, "this node leads the group; a leader can't restore a snapshot to itself\n");
-    worker.raft.applyLocalSnapshot(gid, v.index, v.term) catch |e| switch (e) {
+    // Phase 2c: membership-neutral (null ConfState) — keeps the group's current
+    // prs, the unchanged promote-back/catch-up behavior. Phase 2d wires the
+    // source's ConfState through the body so a joiner learns its membership here.
+    worker.raft.applyLocalSnapshot(gid, v.index, v.term, null, null) catch |e| switch (e) {
         error.SnapshotStale => return reply(server, allocator, ent, sid, sess, 409, "index not ahead of committed; nothing to install\n"),
         error.NotLeader => return reply(server, allocator, ent, sid, sess, 409, "node leads the group\n"),
+        error.SelfNotInConfState => return reply(server, allocator, ent, sid, sess, 409, "supplied membership omits this node; add it to the group first\n"),
         else => return reply(server, allocator, ent, sid, sess, 500, "apply-snapshot failed\n"),
     };
     return reply(server, allocator, ent, sid, sess, 204, "");
+}
+
+/// raft Phase 2.5 dest: arm a streamed-snapshot `BodySink` for a
+/// `POST /_system/v2-snapshot-stream`. Auth + parse the baseline {tenant, index,
+/// term} from headers (the body is the pure pair stream), resolve the local
+/// group + instance, then attach the sink and park the entity in
+/// `snapshot_streams`. The 204/4xx/5xx is sent later by `drainSnapshotStreams`
+/// (on END_STREAM), since the body streams over many ticks. Always handles the
+/// request (responds on any rejection; on success the response is deferred).
+pub fn armSnapshotStream(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    rh: h2.ReqHeaders,
+) !void {
+    const secret = worker.move_secret orelse
+        return reply(server, allocator, ent, sid, sess, 404, "move surface disabled\n");
+    const presented = respb.findHeader(rh, MOVE_SECRET_HEADER) orelse "";
+    if (!constantTimeEql(presented, secret))
+        return reply(server, allocator, ent, sid, sess, 401, "bad move secret\n");
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+    const tenant = respb.findHeader(rh, TENANT_HEADER) orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Tenant\n");
+    const mode: snapshot_sink_mod.Mode =
+        if (respb.findHeader(rh, SNAP_MODE_HEADER)) |m|
+            (if (std.mem.eql(u8, std.mem.trim(u8, m, " "), "merge")) .merge else .replace)
+        else
+            .replace;
+    const inst = ensureInstance(worker, tenant) catch
+        return reply(server, allocator, ent, sid, sess, 500, "provision failed\n");
+
+    var gid: u64 = 0;
+    var index: u64 = 0;
+    var term: u64 = 0;
+    var loader_opts: kv_mod.StreamLoaderOptions = undefined;
+    switch (mode) {
+        .merge => {
+            // Zero-downtime move: insert-if-absent into the already-attached,
+            // already-forwarded group. No baseline, no leadership check — like
+            // v2-load-merge, it applies out-of-band on EVERY destination node.
+            loader_opts = .{ .clear_existing = false, .skip_existing = true };
+        },
+        .replace => {
+            // Catch-up / promote-back: a data-free baseline must be a real
+            // {index>0, term>0} (index 0 is a no-op, term 0 crashes restore),
+            // and a leader can't restore a snapshot to itself.
+            const idx_s = respb.findHeader(rh, SNAP_INDEX_HEADER) orelse
+                return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Snapshot-Index\n");
+            const term_s = respb.findHeader(rh, SNAP_TERM_HEADER) orelse
+                return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Snapshot-Term\n");
+            index = std.fmt.parseInt(u64, idx_s, 10) catch
+                return reply(server, allocator, ent, sid, sess, 400, "bad snapshot index\n");
+            term = std.fmt.parseInt(u64, term_s, 10) catch
+                return reply(server, allocator, ent, sid, sess, 400, "bad snapshot term\n");
+            if (index == 0 or term == 0)
+                return reply(server, allocator, ent, sid, sess, 400, "index and term must be nonzero\n");
+            gid = worker.raft.gidForTenant(tenant) orelse
+                return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
+            if (worker.raft.isLeaderOf(gid))
+                return reply(server, allocator, ent, sid, sess, 409, "leader can't restore a snapshot to itself\n");
+            loader_opts = .{ .clear_existing = true };
+        },
+    }
+
+    var loader = kv_mod.StreamLoader.init(allocator, inst.kv.manifest, loader_opts) catch
+        return reply(server, allocator, ent, sid, sess, 500, "loader init failed\n");
+    // Box.create COPIES `loader` into the heap box (which then owns its
+    // key/val buffers); on success the local must NOT be deinit'd.
+    const box = snapshot_sink_mod.Box.create(allocator, loader, mode, tenant, gid, index, term) catch {
+        loader.deinit();
+        return reply(server, allocator, ent, sid, sess, 500, "snapshot box alloc failed\n");
+    };
+    if (!worker.armSnapshotStreamSink(ent, sess.entity, sid.id, box))
+        return reply(server, allocator, ent, sid, sess, 503, "snapshot stream could not be armed\n");
+    // Armed — the entity is parked in `snapshot_streams`; `drainSnapshotStreams`
+    // sends the response once the body completes.
+}
+
+/// raft Phase 2.5 dest tick: finalize streamed-snapshot transfers parked in
+/// `snapshot_streams`. END_STREAM → finish + durabilize, then by mode: `.replace`
+/// installs the data-free raft baseline (catch-up); `.merge` drops the inherited
+/// forward marker (zero-downtime move, no raft op) → 204. A parse/apply failure
+/// → 500; a benign already-ahead/leader race → 409; a client reset → destroy (no
+/// response possible). The entity moves to `response_in` (h2 sends the reply) or
+/// is destroyed; either way its `SnapshotStream` component releases the box.
+pub fn drainSnapshotStreams(worker: anytype) !void {
+    const server = worker.h2;
+    const coll = &worker.snapshot_streams;
+    const entities = coll.entitySlice();
+    const states = coll.column(snapshot_sink_mod.SnapshotStream);
+    for (entities, states) |ent, *ss| {
+        const box = ss.box orelse continue;
+        if (box.aborted) {
+            // Client reset mid-upload: no response is possible. Destroy — the
+            // component deinit drops the box's component ref (the sink ref
+            // releases when h2 reaps the stream).
+            try server.reg.destroy(ent);
+            continue;
+        }
+        if (!box.eof and !box.failed) continue; // body still streaming
+
+        var status: u16 = 204;
+        if (box.failed) {
+            status = 500;
+        } else if (box.finish()) |_| {
+            switch (box.mode) {
+                .replace => {
+                    if (box.durabilize()) |_| {
+                        // Data durable → advance the raft baseline.
+                        worker.raft.applyLocalSnapshot(box.gid, box.index, box.term, null, null) catch |e| switch (e) {
+                            // Already advanced past `index` via replication during
+                            // the stream, or now leads — benign (driver treats 409
+                            // as success).
+                            error.SnapshotStale, error.NotLeader, error.SelfNotInConfState => status = 409,
+                            else => status = 500,
+                        };
+                    } else |_| status = 500;
+                },
+                .merge => {
+                    // Drop the source's inherited forward marker (the snapshot
+                    // carried it insert-if-absent), THEN durabilize. No raft op —
+                    // the forward delta already rides the dest group's log.
+                    if (worker.node.tenant.getInstance(box.tenant) catch null) |inst| {
+                        inst.kv.delete(FORWARD_MARKER) catch |e| switch (e) {
+                            error.NotFound => {},
+                            else => std.log.warn("v2-snapshot-stream merge: clearing {s} failed: {s}", .{ FORWARD_MARKER, @errorName(e) }),
+                        };
+                    }
+                    if (box.durabilize()) |_| {} else |_| status = 500;
+                },
+            }
+        } else |_| {
+            status = 500;
+        }
+
+        // Stage the response + queue the move FIRST (fail-loud: a set/move on a
+        // live in-collection entity only fails on OOM, which propagates). Detach
+        // the box ref LAST, so a failure here leaves the box attached + the
+        // entity parked → retried next tick, never orphaned with a null box.
+        try server.reg.set(ent, coll, h2.Status, .{ .code = status });
+        try server.reg.set(ent, coll, h2.RespHeaders, .{ .fields = null, .count = 0 });
+        try server.reg.set(ent, coll, h2.RespBody, .{ .data = null, .len = 0 });
+        try server.reg.set(ent, coll, h2.H2IoResult, .{ .err = 0 });
+        try server.reg.move(ent, coll, &server.response_in);
+        // The sink keeps its own ref until h2 reaps the stream; the value carried
+        // into `response_in` is now inert.
+        box.unref();
+        ss.box = null;
+    }
+}
+
+/// raft Phase 2.5 SOURCE side of a streamed move: `POST /_system/v2-snapshot-push`
+/// (CP-triggered). Park the request + enqueue an off-loop job that streams this
+/// tenant's held snapshot directly to `X-Rewind-Dest` (a dest node base URL) in
+/// the given mode (default `merge` — the zero-downtime move). The 204/5xx is sent
+/// by `drainSnapshotPushes` once the dest finishes — deferred, since a multi-GB
+/// stream must not block the worker loop. Leader-gated like `v2-snapshot` (only
+/// the source leader's store is authoritative at the move point).
+pub fn armSnapshotPush(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    rh: h2.ReqHeaders,
+) !void {
+    const secret = worker.move_secret orelse
+        return reply(server, allocator, ent, sid, sess, 404, "move surface disabled\n");
+    const presented = respb.findHeader(rh, MOVE_SECRET_HEADER) orelse "";
+    if (!constantTimeEql(presented, secret))
+        return reply(server, allocator, ent, sid, sess, 401, "bad move secret\n");
+    if (!std.mem.eql(u8, method, "POST"))
+        return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
+    const tenant = respb.findHeader(rh, TENANT_HEADER) orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Tenant\n");
+    const dest = respb.findHeader(rh, DEST_HEADER) orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing X-Rewind-Dest\n");
+    const mode: snapshot_sink_mod.Mode =
+        if (respb.findHeader(rh, SNAP_MODE_HEADER)) |m|
+            (if (std.mem.eql(u8, std.mem.trim(u8, m, " "), "replace")) .replace else .merge)
+        else
+            .merge;
+
+    const gid = worker.raft.gidForTenant(tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 409, "tenant not active on this cluster\n");
+    if (!worker.raft.isLeaderOf(gid))
+        return reply(server, allocator, ent, sid, sess, 421, "not the leader for this tenant; try another node\n");
+
+    const driver = worker.snapshot_push_driver orelse
+        return reply(server, allocator, ent, sid, sess, 503, "snapshot push driver not wired\n");
+
+    // Park FIRST (deferred move — walk-safe), then enqueue. The job streams
+    // off-loop; `drainSnapshotPushes` matches the completion back to this entity.
+    try server.reg.move(ent, &server.request_out, &worker.snapshot_pushes);
+    driver.enqueuePush(ent, tenant, dest, mode) catch
+        return reply(server, allocator, ent, sid, sess, 500, "enqueue failed\n");
+    // No reply — deferred to drainSnapshotPushes on completion.
+}
+
+/// raft Phase 2.5 SOURCE tick: respond to parked `v2-snapshot-push` requests as
+/// the off-loop driver finishes them. Each completion carries the parked
+/// `Entity` + the dest's HTTP status (0 = local/transport failure → 502).
+pub fn drainSnapshotPushes(worker: anytype, driver: anytype) !void {
+    const server = worker.h2;
+    var completions: std.ArrayListUnmanaged(@TypeOf(driver.*).PushCompletion) = .empty;
+    defer completions.deinit(worker.allocator);
+    try driver.drainPushCompletions(&completions);
+    for (completions.items) |c| {
+        if (server.reg.isStale(c.entity)) continue; // CP gave up / connection gone
+        if (!server.reg.isInCollection(c.entity, &worker.snapshot_pushes)) {
+            // The park move hasn't flushed yet (a completion that beat the same
+            // tick's flush — vanishingly rare given network RTT ≫ flush). Re-post
+            // so we match it next tick rather than drop the reply.
+            driver.postCompletion(c.entity, c.status);
+            continue;
+        }
+        const status: u16 = if (c.status == 0) 502 else c.status;
+        try server.reg.set(c.entity, &worker.snapshot_pushes, h2.Status, .{ .code = status });
+        try server.reg.set(c.entity, &worker.snapshot_pushes, h2.RespHeaders, .{ .fields = null, .count = 0 });
+        try server.reg.set(c.entity, &worker.snapshot_pushes, h2.RespBody, .{ .data = null, .len = 0 });
+        try server.reg.set(c.entity, &worker.snapshot_pushes, h2.H2IoResult, .{ .err = 0 });
+        try server.reg.move(c.entity, &worker.snapshot_pushes, &server.response_in);
+    }
 }
 
 /// Stamp a plain status + message response (no CORS — internal surface).

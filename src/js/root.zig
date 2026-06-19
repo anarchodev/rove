@@ -56,6 +56,8 @@ pub const ssrf = @import("rove-ssrf");
 pub const session = @import("session.zig");
 pub const deployment_loader = @import("deployment_loader.zig");
 pub const DeploymentLoader = deployment_loader.DeploymentLoader;
+pub const snapshot_catchup = @import("snapshot_catchup.zig");
+pub const SnapshotCatchupThread = snapshot_catchup.SnapshotCatchupThread;
 
 pub const Budget = dispatcher.Budget;
 pub const PenaltyBox = penalty.PenaltyBox;
@@ -84,6 +86,8 @@ pub const dispatchOnce = worker.dispatchOnce;
 pub const drainRequestReceiving = worker.drainRequestReceiving;
 pub const drainRaftPending = worker.drainRaftPending;
 pub const drainForwardPending = worker.drainForwardPending;
+pub const drainSnapshotStreams = @import("v2_move.zig").drainSnapshotStreams;
+pub const drainSnapshotPushes = @import("v2_move.zig").drainSnapshotPushes;
 pub const drainBodyPending = worker.drainBodyPending;
 pub const drainFetchPendingDurability = worker.drainFetchPendingDurability;
 pub const drainPendingBoundResumes = worker.drainPendingBoundResumes;

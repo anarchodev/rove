@@ -304,7 +304,7 @@ hard-state bug — a recovered group loading a stale `commit = 0` →
 index; the async flow retires that mechanism but keeps the regression tests.)
 Compaction is verified to survive compact→recover across restart under the
 full V2 smoke suite (`rewind` / `tenant_move` / `three_node` /
-`cp_move_recovery` / `zero_downtime_move`).
+`zero_downtime_move`).
 
 ## Shutdown ordering (pump before observer targets)
 

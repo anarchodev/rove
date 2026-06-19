@@ -39,7 +39,6 @@ const CP_TOTAL_TIMEOUT_MS: u32 = 2000;
 pub const Outcome = union(enum) {
     placed: [][]u8,
     not_found,
-    moving,
     /// Every CP node failed (unreachable / bad status / bad body).
     err,
 };
@@ -214,11 +213,9 @@ pub const RouteResolver = struct {
             var parsed = std.json.parseFromSlice(struct {
                 cluster: []const u8 = "",
                 tenant: []const u8 = "",
-                moving: bool = false,
                 nodes: []const []const u8 = &.{},
             }, a, body, .{ .ignore_unknown_fields = true }) catch continue;
             defer parsed.deinit();
-            if (parsed.value.moving) return .moving;
             const owned = dupNodes(a, parsed.value.nodes) catch return .err;
             return .{ .placed = owned };
         }

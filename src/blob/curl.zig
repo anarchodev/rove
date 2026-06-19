@@ -136,6 +136,17 @@ pub const Request = struct {
     verify_tls: bool = true,
 };
 
+/// Caller-supplied producer for a STREAMED request body (`requestUpload`).
+/// libcurl pulls via the read callback only as fast as the wire drains, so the
+/// producer is naturally backpressured and the body is never materialized whole
+/// (raft Phase 2.5 snapshot transfer: `fill` drains a held-snapshot cursor).
+pub const UploadProducer = struct {
+    ctx: *anyopaque,
+    /// Fill `dst` with the next body bytes; return the count (0 == end of body).
+    /// Return `null` to ABORT the transfer (libcurl reports CURLE_ABORTED_BY_CALLBACK).
+    fill: *const fn (dst: []u8, ctx: *anyopaque) ?usize,
+};
+
 pub const Easy = struct {
     allocator: std.mem.Allocator,
     handle: *c.CURL,
@@ -329,6 +340,99 @@ pub const Easy = struct {
         return .{
             .status = status,
             .body = body_owned,
+            .headers = try hdr_list.toOwnedSlice(allocator),
+        };
+    }
+
+    /// Issue one PUT/POST whose REQUEST body is streamed from `producer`
+    /// (pulled via `CURLOPT_READFUNCTION`) instead of a fixed `req.body` — for
+    /// multi-GB bodies that must not be materialized whole. No `INFILESIZE` /
+    /// `POSTFIELDSIZE` is set, so the length is unknown: over the h2c worker
+    /// link curl emits DATA frames reading from `producer.fill` until it
+    /// returns 0. The RESPONSE is buffered like `request` (these are small
+    /// status replies). `req.body` is ignored. POST keeps its verb via
+    /// CUSTOMREQUEST while UPLOAD enables the read-callback path.
+    pub fn requestUpload(
+        self: *Easy,
+        allocator: std.mem.Allocator,
+        req: Request,
+        producer: UploadProducer,
+    ) Error!Response {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        c.curl_easy_reset(self.handle);
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_ERRORBUFFER, &self.err_buf);
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_FOLLOWLOCATION, @as(c_long, 0));
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_TCP_KEEPALIVE, @as(c_long, 1));
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_USERAGENT, "rove");
+
+        const url_z = try allocator.dupeZ(u8, req.url);
+        defer allocator.free(url_z);
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_URL, url_z.ptr);
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_TIMEOUT_MS, @as(c_long, req.timeout_ms));
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_CONNECTTIMEOUT_MS, @as(c_long, req.connect_timeout_ms));
+
+        switch (req.http_version) {
+            .auto => {},
+            .h2c_prior_knowledge => _ = c.curl_easy_setopt(self.handle, c.CURLOPT_HTTP_VERSION, @as(c_long, c.CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE)),
+        }
+        if (!req.verify_tls) {
+            _ = c.curl_easy_setopt(self.handle, c.CURLOPT_SSL_VERIFYPEER, @as(c_long, 0));
+            _ = c.curl_easy_setopt(self.handle, c.CURLOPT_SSL_VERIFYHOST, @as(c_long, 0));
+        }
+
+        // UPLOAD=1 enables the read-callback streaming path (unknown length —
+        // no INFILESIZE). POST keeps its verb via CUSTOMREQUEST.
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_UPLOAD, @as(c_long, 1));
+        if (req.method == .POST) {
+            _ = c.curl_easy_setopt(self.handle, c.CURLOPT_CUSTOMREQUEST, "POST");
+        }
+
+        var slist: ?*c.curl_slist = null;
+        defer if (slist != null) c.curl_slist_free_all(slist);
+        for (req.headers) |h| {
+            const line = try std.fmt.allocPrintSentinel(allocator, "{s}: {s}", .{ h.name, h.value }, 0);
+            defer allocator.free(line);
+            slist = c.curl_slist_append(slist, line.ptr);
+        }
+        if (slist != null) _ = c.curl_easy_setopt(self.handle, c.CURLOPT_HTTPHEADER, slist);
+
+        var prod = producer;
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_READFUNCTION, @as(*const fn (*anyopaque, usize, usize, *anyopaque) callconv(.c) usize, &uploadRead));
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_READDATA, @as(*anyopaque, @ptrCast(&prod)));
+
+        var resp_buf: std.ArrayList(u8) = .empty;
+        errdefer resp_buf.deinit(allocator);
+        var write_ctx: WriteCtx = .{ .allocator = allocator, .buf = &resp_buf };
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_WRITEFUNCTION, @as(*const fn (*anyopaque, usize, usize, *anyopaque) callconv(.c) usize, &writeResp));
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_WRITEDATA, @as(*anyopaque, @ptrCast(&write_ctx)));
+
+        var hdr_list: std.ArrayListUnmanaged(Header) = .empty;
+        errdefer {
+            for (hdr_list.items) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            hdr_list.deinit(allocator);
+        }
+        var hdr_ctx: HeaderCtx = .{ .allocator = allocator, .list = &hdr_list };
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_HEADERFUNCTION, @as(*const fn (*anyopaque, usize, usize, *anyopaque) callconv(.c) usize, &headerResp));
+        _ = c.curl_easy_setopt(self.handle, c.CURLOPT_HEADERDATA, @as(*anyopaque, @ptrCast(&hdr_ctx)));
+
+        const rc = c.curl_easy_perform(self.handle);
+        if (rc != c.CURLE_OK) {
+            std.log.warn("curl upload: {s} {s} failed: rc={d} msg={s}", .{
+                @tagName(req.method), req.url, rc, std.mem.sliceTo(&self.err_buf, 0),
+            });
+            return Error.CurlCallFailed;
+        }
+        if (write_ctx.alloc_failed or hdr_ctx.alloc_failed) return Error.OutOfMemory;
+
+        var status_long: c_long = 0;
+        _ = c.curl_easy_getinfo(self.handle, c.CURLINFO_RESPONSE_CODE, &status_long);
+        return .{
+            .status = @intCast(@max(status_long, 0)),
+            .body = try resp_buf.toOwnedSlice(allocator),
             .headers = try hdr_list.toOwnedSlice(allocator),
         };
     }
@@ -605,6 +709,17 @@ fn readBody(ptr: *anyopaque, size: usize, nmemb: usize, userdata: *anyopaque) ca
         @memcpy(dst[0..n], cursor.src[cursor.pos..][0..n]);
         cursor.pos += n;
     }
+    return n;
+}
+
+/// `CURLOPT_READFUNCTION` trampoline for `requestUpload`: pulls the next body
+/// slice from the caller's `UploadProducer`. Returning `CURL_READFUNC_ABORT`
+/// (producer signalled failure via `null`) tells libcurl to abort the transfer.
+fn uploadRead(ptr: *anyopaque, size: usize, nmemb: usize, userdata: *anyopaque) callconv(.c) usize {
+    const prod: *UploadProducer = @ptrCast(@alignCast(userdata));
+    const cap = size * nmemb;
+    const dst: [*]u8 = @ptrCast(ptr);
+    const n = prod.fill(dst[0..cap], prod.ctx) orelse return c.CURL_READFUNC_ABORT;
     return n;
 }
 

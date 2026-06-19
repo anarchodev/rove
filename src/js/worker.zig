@@ -63,6 +63,8 @@ const blob_mod = @import("rove-blob");
 const blob_sessions_mod = @import("blob_sessions.zig");
 const blob_receive_mod = @import("blob_receive.zig");
 const inbound_chunk_mod = @import("worker_inbound_chunk.zig");
+const snapshot_sink_mod = @import("snapshot_sink.zig");
+const snapshot_catchup_mod = @import("snapshot_catchup.zig");
 const files_mod = @import("rove-files");
 const log_mod = @import("rove-log");
 const log_server_mod = @import("rove-log-server");
@@ -1271,6 +1273,11 @@ pub fn Worker(comptime opts: Options) type {
         components_mod.StreamWakes,
         components_mod.StreamDraining,
         components_mod.BoundFetchCount,
+        // raft Phase 2.5 streamed-snapshot dest state (inert {box=null} on every
+        // non-snapshot stream entity). In the shared StreamRow so `arm` can set
+        // the box in-place in `request_out` and the deferred move to
+        // `snapshot_streams` CARRIES the value (rove-library #10).
+        snapshot_sink_mod.SnapshotStream,
     }).merge(opts.request_row);
 
     const H2Type = h2.H2(.{
@@ -1403,6 +1410,24 @@ pub fn Worker(comptime opts: Options) type {
         /// collection so moves preserve all components — mirrors
         /// `raft_pending` exactly.
         parked_continuations: StreamColl,
+        /// raft Phase 2.5 streamed-snapshot dest: request entities receiving a
+        /// `/_system/v2-snapshot-stream` body. Membership IS the "parked,
+        /// mid-snapshot-stream" state (out of the dispatch walk); the per-entity
+        /// `SnapshotStream` component owns the streaming `Box`. `arm` moves the
+        /// entity here; `drainSnapshotStreams` finalizes (install baseline →
+        /// `response_in`) or destroys it. Same StreamRow as every h2 collection.
+        snapshot_streams: StreamColl,
+        /// raft Phase 2.5 SOURCE side of a streamed move: CP-trigger entities
+        /// (`POST /_system/v2-snapshot-push`) parked while the off-loop driver
+        /// streams the held snapshot to a dest. Membership IS "push in flight";
+        /// `drainSnapshotPushes` responds + moves to `response_in` on completion.
+        /// Same StreamRow as every h2 collection. No per-entity component — the
+        /// push job state lives in the driver's `Job` (transport state, off-rove).
+        snapshot_pushes: StreamColl,
+        /// The off-loop streaming driver, shared with snapshot catch-up. Set by
+        /// the run loop (main.zig) after both exist; `armSnapshotPush` enqueues
+        /// move-push jobs here. Null until wired (push surface inert).
+        snapshot_push_driver: ?*snapshot_catchup_mod.SnapshotCatchupThread = null,
         /// Streaming-handlers Phase 2b-ii: per-entity DATA side-store
         /// for active `__rove_stream(...)` chains. The entity lives
         /// in the h2 module's `stream_data_out` collection (h2 owns
@@ -1811,6 +1836,8 @@ pub fn Worker(comptime opts: Options) type {
                 .body_pending = try StreamColl.init(allocator),
                 .forward_pending = try StreamColl.init(allocator),
                 .parked_continuations = try StreamColl.init(allocator),
+                .snapshot_streams = try StreamColl.init(allocator),
+                .snapshot_pushes = try StreamColl.init(allocator),
                 .parked_units = try ParkedUnitColl.init(allocator),
                 .blob_sessions = try BlobSessionColl.init(allocator),
                 .msg_inbox = effect_mod.MsgInbox.init(allocator),
@@ -1863,6 +1890,8 @@ pub fn Worker(comptime opts: Options) type {
             errdefer self.body_pending.deinit();
             errdefer self.forward_pending.deinit();
             errdefer self.parked_continuations.deinit();
+            errdefer self.snapshot_streams.deinit();
+            errdefer self.snapshot_pushes.deinit();
             errdefer self.parked_units.deinit();
             errdefer self.blob_sessions.deinit();
             errdefer self.tenant_logs.clearAllEntries(allocator);
@@ -1874,6 +1903,8 @@ pub fn Worker(comptime opts: Options) type {
             reg.registerCollection(&self.body_pending);
             reg.registerCollection(&self.forward_pending);
             reg.registerCollection(&self.parked_continuations);
+            reg.registerCollection(&self.snapshot_streams);
+            reg.registerCollection(&self.snapshot_pushes);
             reg.registerCollection(&self.parked_units);
             reg.registerCollection(&self.blob_sessions);
 
@@ -3006,6 +3037,52 @@ pub fn Worker(comptime opts: Options) type {
                 return null;
             };
             return job;
+        }
+
+        /// raft Phase 2.5: attach a streamed-snapshot `BodySink` (ctx = the heap
+        /// `box`, refcounted: this sink ref + the `SnapshotStream` component
+        /// ref) and park the request entity in `snapshot_streams`. The box is
+        /// set on the component IN PLACE in `request_out` (its StreamRow carries
+        /// `SnapshotStream`), then a DEFERRED move carries the value over to
+        /// `snapshot_streams` — safe to call mid-dispatch-walk (no immediate op
+        /// that would perturb the walk's column slices). Returns false (caller
+        /// responds) if the stream is already gone or an enqueue OOMs; the box's
+        /// refcount frees it on whichever refs were taken.
+        pub fn armSnapshotStreamSink(
+            self: *Self,
+            ent: rove.Entity,
+            conn_entity: rove.Entity,
+            stream_id: u32,
+            box: *snapshot_sink_mod.Box,
+        ) bool {
+            const s: h2.BodySink = .{
+                .ctx = box,
+                .push = &snapshot_sink_mod.Sink.push,
+                .finish = &snapshot_sink_mod.Sink.finish,
+                .abort = &snapshot_sink_mod.Sink.abort,
+                .drained = &snapshot_sink_mod.Sink.drained,
+                .release = &snapshot_sink_mod.Sink.release,
+            };
+            switch (self.h2.requestBodySink(conn_entity, stream_id, s)) {
+                .streaming, .eof => {},
+                .gone => {
+                    box.unref(); // sink ref (h2 took none)
+                    box.unref(); // component ref (never set)
+                    return false;
+                },
+            }
+            self.reg.set(ent, &self.h2.request_out, snapshot_sink_mod.SnapshotStream, .{ .box = box }) catch {
+                // h2 holds the sink ref (released on stream reap); drop the
+                // component ref we accounted for at create time.
+                box.unref();
+                return false;
+            };
+            self.reg.move(ent, &self.h2.request_out, &self.snapshot_streams) catch {
+                // The component now owns the box (freed on the entity's
+                // teardown); the entity stays in request_out. Caller responds.
+                return false;
+            };
+            return true;
         }
 
         /// Resolve a request entity's stream identity (its h2 Session
