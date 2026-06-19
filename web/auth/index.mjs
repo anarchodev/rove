@@ -53,16 +53,19 @@ function loginForm(return_to, msg) {
 // signup uses).
 function startLogin() {
   const f = new URLSearchParams(request.body || "");
-  const email = (f.get("email") || "").trim().toLowerCase();
+  // NB: name this `addr`, NOT `email` — a local `email` would shadow the
+  // global `email` API object, turning `email.send(...)` below into
+  // `String.prototype.send` (undefined) → "TypeError: not a function".
+  const addr = (f.get("email") || "").trim().toLowerCase();
   const return_to = safeReturnTo(f.get("return_to"));
-  if (!email || email.indexOf("@") < 1) {
+  if (!addr || addr.indexOf("@") < 1) {
     return loginForm(return_to, "Enter a valid email.");
   }
 
   const opaque = rand();
   // sha256-at-rest: a leaked kv can't replay live magic tokens.
   kv.set(MAGIC_PREFIX + crypto.sha256(opaque), JSON.stringify({
-    email,
+    email: addr,
     return_to,
     exp: Date.now() + MAGIC_TTL_MS,
   }));
@@ -73,7 +76,7 @@ function startLogin() {
     email.send({
       key: resendKey,
       from: kv.get("platform_email_from") || "login@" + request.host,
-      to: email,
+      to: addr,
       subject: "Your sign-in link",
       text: "Sign in: " + link + "\n\nThis link expires in 15 minutes.",
     });
