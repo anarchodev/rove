@@ -40,6 +40,7 @@ const blob_sessions_mod = @import("blob_sessions.zig");
 const textcodec_b = @import("bindings/textcodec.zig");
 const td = @import("trigger_dispatch.zig");
 const reserved = @import("reserved.zig");
+const reserved_headers = @import("reserved_headers.zig");
 const bytecode_cache_mod = @import("bytecode_cache.zig");
 
 
@@ -2810,6 +2811,13 @@ fn installHeaders(
             // (see STRIPPED_IP_HEADERS).
             if (name.len > 0 and name[0] == ':') continue;
             if (isStrippedIpHeader(name)) continue;
+
+            // Strip platform-reserved internal headers (`x-rewind-*`,
+            // `x-rove-internal-*`) so the customer handler can neither read
+            // internal topology nor spoof a header an internal endpoint
+            // might trust. See `reserved_headers.zig`. (`x-rove-correlation-id`
+            // is NOT reserved and stays visible.)
+            if (reserved_headers.isReservedInternalHeader(name)) continue;
 
             // The getter's magic is the FIELD INDEX — no per-getter
             // heap state; the getter reads name+value back out of
