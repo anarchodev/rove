@@ -996,9 +996,9 @@ const Router = struct {
     ///   2. await the dest group's leader (its URL is the forward target).
     ///   3. forward-begin on the source leader → it dual-writes every commit
     ///      to the dest leader (synchronous).
-    ///   4. snapshot the source leader (non-quiescing — it keeps serving).
-    ///   5. load-merge the snapshot into every dest node (insert-if-absent,
-    ///      out-of-band from raft).
+    ///   4-5. stream the source leader's non-quiescing snapshot peer→peer into
+    ///      every dest node in merge mode (insert-if-absent, out-of-band from
+    ///      raft) — the CP never buffers the bundle.
     ///   6. flip the directory — the atomic commit point.
     ///   7. evict the source — drops its instance + group + forward marker,
     ///      so it stops serving + forwarding; serve-or-forward routes any
@@ -1176,7 +1176,7 @@ const Router = struct {
     /// raft Phase 2.5: STREAM the source leader's non-quiescing snapshot directly
     /// to every destination node in merge mode (insert-if-absent) — the source
     /// pushes peer→peer, so the CP never buffers a (multi-GB) bundle. Replaces the
-    /// retired buffered `v2-snapshot` (dump→CP) + `v2-load-merge` (CP→dest) fan.
+    /// retired buffered dump→CP→dest fan (the old `v2-load-merge` load endpoint).
     fn streamMergeToAll(self: *Router, src_nodes: []const []const u8, dest_nodes: []const []const u8, tenant: []const u8) bool {
         for (dest_nodes) |dest| {
             if (!self.snapshotPushToLeader(src_nodes, tenant, dest)) return false;
