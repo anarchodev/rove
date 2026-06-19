@@ -1784,6 +1784,14 @@ pub fn main() !void {
     const reconcile_period_ns: i128 = reconcile_secs * std.time.ns_per_s;
     var last_reconcile_ns: i128 = 0;
 
+    // One-shot placement-format migration (MIGRATION SHIM — delete with the
+    // `applyPlacementFromValue` tolerant read once prod is swept): on the first
+    // serve-loop pass where this node leads the directory, rewrite every
+    // placement in the current bare `{cluster}` format, overwriting any retired
+    // `{state}:{cluster}` value left on disk. Followers skip (isLeader false);
+    // the leader runs it once and never again.
+    var placements_migrated = false;
+
     std.log.info("rewind-cp: listening on 0.0.0.0:{d} (move control {s}, reconcile {s})", .{
         port,
         if (move_secret != null) "enabled" else "disabled",
@@ -1798,6 +1806,15 @@ pub fn main() !void {
         try reg.flush();
         try cleanupResponses(server);
         try reg.flush();
+
+        if (!placements_migrated and router.directory.isLeader()) {
+            if (router.directory.migratePlacements(allocator)) |cnt| {
+                placements_migrated = true;
+                std.log.info("rewind-cp: placement-format migration rewrote {d} placement(s) in the current format", .{cnt});
+            } else |e| {
+                std.log.warn("rewind-cp: placement-format migration deferred: {s}", .{@errorName(e)});
+            }
+        }
 
         if (reconcile_secs > 0) {
             const now_ns = std.time.nanoTimestamp();

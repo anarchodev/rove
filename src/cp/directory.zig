@@ -287,6 +287,31 @@ pub const Directory = struct {
         return out.toOwnedSlice(a) catch return Error.OutOfMemory;
     }
 
+    /// One-time format migration: rewrite EVERY placement in the current bare
+    /// `{cluster}` durable format, overwriting any retired `{state}:{cluster}`
+    /// value left on disk by pre-arc prod (read today via the
+    /// `applyPlacementFromValue` tolerant shim). Idempotent — rewriting a
+    /// new-format placement re-emits the same bytes. Returns the count rewritten.
+    /// Each `writePlacement` proposes through the directory group, so this only
+    /// commits on the leader (a follower faults); callers run it leader-gated.
+    /// MIGRATION SHIM — delete this + the tolerant read once prod is swept.
+    pub fn migratePlacements(self: *Directory, a: std.mem.Allocator) Error!usize {
+        const tenants = try self.listPlacements(a);
+        defer {
+            for (tenants) |t| a.free(t);
+            a.free(tenants);
+        }
+        var n: usize = 0;
+        for (tenants) |t| {
+            // `resolve`'s cluster id is pointer-stable (owned cluster storage),
+            // safe to pass into the lock-free `writePlacement`.
+            const r = self.resolve(t) orelse continue;
+            try self.writePlacement(t, r.cluster.id);
+            n += 1;
+        }
+        return n;
+    }
+
     /// Whether THIS CP node leads the directory raft group — i.e. directory
     /// WRITES (the move flip) can commit here. Reads work on any node (the
     /// apply-driven projection), but a write proposed on a follower faults,
@@ -1018,6 +1043,45 @@ test "directory: applyPlacementFromValue tolerates the retired {state}:{cluster}
 
     // An unknown cluster still surfaces (prefix stripped, then lookup fails).
     try testing.expectError(error.UnknownCluster, dir.applyPlacementFromValue("x", "active:nope"));
+}
+
+test "directory: migratePlacements rewrites retired-format on-disk values to bare cluster" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir_path);
+
+    const bridge = try Bridge.initSingleNode(a, dir_path);
+    const d = try Directory.initReplicated(a, bridge);
+    defer d.destroy();
+    defer bridge.deinit();
+    try bridge.startPump();
+
+    try d.addCluster("west", &.{"http://w:1"});
+    // Inject a pre-arc on-disk placement in the retired `{state}:{cluster}` form,
+    // bypassing writePlacement (which emits the new bare format). The apply
+    // observer materializes it through the tolerant shim.
+    const seq = try bridge.proposePut(d.dir_gid, "placement/acme", "active:west");
+    var w: u32 = 0;
+    while (w < 5000 and bridge.committedSeq(d.dir_gid) < seq) : (w += 1) std.Thread.sleep(std.time.ns_per_ms);
+    try testing.expectEqualStrings("west", d.clusterFor("acme").?.id); // shim read works
+
+    // Migrate: every placement rewritten in the bare format.
+    const n = try d.migratePlacements(a);
+    try testing.expect(n >= 1);
+
+    // The on-disk value no longer carries the retired `active:` prefix.
+    const cursor = try a.dupe(u8, "");
+    defer a.free(cursor);
+    var rr = bridge.node.prefix(d.dir_gid, "placement/", cursor, 256) catch unreachable;
+    defer rr.deinit();
+    var found: ?[]const u8 = null;
+    for (rr.entries) |e| {
+        if (std.mem.eql(u8, e.key, "placement/acme")) found = e.value;
+    }
+    try testing.expect(found != null);
+    try testing.expectEqualStrings("west", found.?);
 }
 
 test "directory: move flips placement (the Phase-4 seam)" {
