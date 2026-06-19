@@ -425,8 +425,22 @@ pub const Directory = struct {
     }
 
     /// Parse a `placement/*` value (`cluster_id`) and upsert it.
+    ///
+    /// MIGRATION SHIM (remove once prod placements are all rewritten in the new
+    /// format): tolerate the retired `{state}:{cluster}` durable format written
+    /// by pre-arc prod by stripping a leading `active:`/`moving:`. New writes
+    /// emit the bare `{cluster}` (see `writePlacement`); a bare value never
+    /// starts with those prefixes, so this never misfires on new data. A move or
+    /// re-provision rewrites each placement to the new format; after a full
+    /// sweep this branch is dead and the shim can be deleted.
     fn applyPlacementFromValue(self: *Directory, tenant: []const u8, value: []const u8) Error!void {
-        const idx = self.cluster_idx.get(value) orelse return Error.UnknownCluster;
+        const cluster_id = if (std.mem.startsWith(u8, value, "active:"))
+            value["active:".len..]
+        else if (std.mem.startsWith(u8, value, "moving:"))
+            value["moving:".len..]
+        else
+            value;
+        const idx = self.cluster_idx.get(cluster_id) orelse return Error.UnknownCluster;
         try self.applyPlacementLocal(tenant, idx);
     }
 
@@ -983,6 +997,27 @@ test "directory: addCluster + assign + clusterFor round-trips" {
     try testing.expectEqualStrings("cluster-2", b.id);
 
     try testing.expect(dir.clusterFor("nobody") == null);
+}
+
+test "directory: applyPlacementFromValue tolerates the retired {state}:{cluster} format" {
+    // MIGRATION SHIM coverage: pre-arc prod wrote `active:{cluster}` /
+    // `moving:{cluster}`; the new bare `{cluster}` write coexists. All three
+    // must resolve to the same placement.
+    var dir = Directory.init(testing.allocator);
+    defer dir.deinit();
+    try addNode1(&dir, "west", "http://w:1");
+
+    try dir.applyPlacementFromValue("legacy_active", "active:west");
+    try testing.expectEqualStrings("west", dir.clusterFor("legacy_active").?.id);
+
+    try dir.applyPlacementFromValue("legacy_moving", "moving:west");
+    try testing.expectEqualStrings("west", dir.clusterFor("legacy_moving").?.id);
+
+    try dir.applyPlacementFromValue("current", "west");
+    try testing.expectEqualStrings("west", dir.clusterFor("current").?.id);
+
+    // An unknown cluster still surfaces (prefix stripped, then lookup fails).
+    try testing.expectError(error.UnknownCluster, dir.applyPlacementFromValue("x", "active:nope"));
 }
 
 test "directory: move flips placement (the Phase-4 seam)" {
