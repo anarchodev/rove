@@ -478,6 +478,25 @@ fields are ignored), so additive growth is safe. The reservations to make now:
 5. Gate Phase-9 encryption-at-rest on an alg-id + key-version ciphertext envelope
    (§7.8) — design now even though code is later.
 
+> **IMPLEMENTATION STATUS (2026-06-20, branch
+> `worktree-docs+format-versioning-audit`).** All five MUST items landed; full
+> `zig build test` green after each.
+> 1. **DONE** `40ed6c9` — `reserved.zig` denies all leading-`_` except the
+>    verified `SHIM_WRITABLE_PREFIXES` allowlist (option (b)). Privileged-binding
+>    (a) — to also close the per-tenant self-footgun on the shim prefixes —
+>    remains deferred. **Final gate before merge: a live auth/oidc smoke** to
+>    confirm the allowlist is complete at runtime (static grep is clean).
+> 2. **DONE** `5e22a06` — `kv.set`/`kv.delete` reject oversized writes fail-fast
+>    (`key_too_large`/`value_too_large`); caps referenced from the canonical
+>    kvexp `snapshot_stream` constants.
+> 3. **DONE** `c2932c8` — `x-rewind-*` / `x-rove-internal-*` stripped inbound +
+>    rejected on responses (`reserved_headers.zig`); `x-rove-correlation-id`
+>    preserved.
+> 4. **DONE** `f20c2de` — `validateInstanceId` tightened to DNS-label-safe with
+>    a `__*__` platform carve-out.
+> 5. **DONE** — Phase-9 design gate written into PLAN.md §Phase 9 (self-
+>    describing ciphertext envelope mandatory; code still UNBUILT).
+
 **SHOULD (cheap headroom, do during the freeze):**
 6. Type-prefix displayed IDs (`dep_`/`req_`); stop surfacing `worker_id` in
    `request_id`; document cursor opacity (§7.5).
