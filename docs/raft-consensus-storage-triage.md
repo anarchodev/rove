@@ -105,6 +105,48 @@ drift). The next probe is the raft-rs async-append commit-advance path
 `{applied_idx, commit_index, last_index}` instrumentation on prod — not the rove
 apply layer.
 
+#### Engine commit-accounting audit result (2026-06-20, code-verified)
+
+Audited raft-rs-zig's async-append flow (`raft-sys/src/lib.rs`
+`process_ready` / `on_persist` / `apply_local_snapshot`):
+
+- **Normal-path commit accounting is CORRECT.** `process_ready` calls
+  `advance_append_async(ready)` (records the append **without** advancing the
+  persist watermark) and stashes the persistence-asserting messages (append
+  acks / vote responses) in `pending_persist`; the watermark only advances in
+  `raft_manager_on_persist` (`on_persist_ready`, line 1767), called by the rove
+  pump **after** `wal.flush()`. So the leader's own entries and followers' acks
+  count toward commit **only once fsynced** — commit == fsynced-majority. The
+  §10.5b fix holds. **No sub-majority commit-advance exists in the normal
+  flow.** This further narrows the `__auth__` trigger away from "premature
+  commit."
+
+- **The live suspect is the out-of-band catch-up/move baseline path** (the
+  arc's Phase 1 / 2.5). `raft_manager_apply_local_snapshot` (lib.rs:1212)
+  synthesizes a data-free `MsgSnapshot` and steps it, so raft's `restore`
+  **fast-forwards `raft_log.committed` to the baseline `index`** while the KV
+  state arrives **out-of-band** (`v2-snapshot-stream` → the store; line 1274
+  "data left empty"). Correctness depends on the baseline `index` and the
+  shipped store bytes being **mutually consistent** — and the baseline index is
+  the leader's `slot.applied_idx`, which `raft-native-alignment.md` already
+  flags as drifting (*"applied=52 vs committed/last=66 on a prod leader"*) and
+  load-bearing-but-unverified. During the rolling restarts, a node that fell
+  below the compaction floor (`matched + 1 < first_index`) receives exactly
+  this baseline; if the `applied_idx`-derived index disagrees with the shipped
+  store state, the receiver fast-forwards commit to an index whose store state
+  diverges from the leader's — a **permanent, log-agreed store fork**, which is
+  the observed `__auth__` shape. This is arc-introduced, matches the incident
+  memory, and matches the drift observation.
+
+  **Next probe (this is now the RC-1 trigger hunt):** audit baseline
+  construction consistency on the rove side — `v2-applied-baseline` (reads
+  `slot.applied_idx`) and the snapshot dump (`v2-snapshot-stream` /
+  `StreamDumper`, `openSnapshot`) — and prove `{baseline index}` and
+  `{shipped store snapshot}` are read from ONE consistent point (same txn /
+  cursor), and that `applied_idx` can never point past or behind the store's
+  durable content. Instrument per-node `{applied_idx, commit_index,
+  last_index, store durable watermark}` on prod to catch the drift empirically.
+
 #### Original hazard analysis (retained for record)
 
 **Verdict (as first written): VERIFIED hazard class; prod trigger partially
