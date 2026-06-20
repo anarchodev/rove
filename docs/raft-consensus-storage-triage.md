@@ -43,7 +43,50 @@ Agent findings were then **re-verified against the source by hand** before
 landing here. Two high-confidence agent findings were **refuted** that way (see
 "False positives") — agent output is evidence, not conclusion.
 
-## Incident root cause (REOPENED 2026-06-20)
+## Incident root cause — RESOLVED (2026-06-20, post-deploy log read)
+
+After deploying the read-only diagnostics (controlled delta off the prod-deployed
+commit), the `v2-log-entry` readout settled it **decisively**:
+
+- All three nodes' `__auth__` raft logs (entries **1–111, fully scanned + decoded**)
+  contain **only OIDC runtime writes** (`_oidc/magic`, `_oidc/code`,
+  `_config/oidc/default`). **No node's log contains a `_deploy/current` write at
+  all** — confirmed by a bulletproof substring search over the raw entry bytes.
+- Yet every node **serves** a `_deploy/current` value (node 1/3 = OLD `ba78…`,
+  node 2 = fix `77d40f1`), and all are **fully applied** (`applied = durabilized =
+  last_index = 111`). The restart did not heal it (recovery resumes from the
+  durabilized watermark).
+
+**Therefore the `_deploy/current` value is ORPHANED applied-state with no
+surviving log entry on ANY node.** The entries that wrote it were applied/folded
+into the stores, then **truncated/replaced out of the log** during the heavy term
+churn (term 169 over 111 entries — constant elections), and the applied store
+state was **never rolled back**. node 1 and node 2 had applied *different* values
+before the truncation → permanent divergent store residue the current (converged)
+log cannot reproduce.
+
+**Root cause (airtight): the state machine is not a deterministic function of the
+committed log — the speculative-apply / fold survives a log-suffix truncation
+with no rollback** (the architectural invariant: *nothing folds until it cannot
+roll back; the store never needs an undo path*). The **trigger** is RC-2's fence
+storm (node 3 logged **358,000** dropped/fenced inbound messages → constant
+re-elections → repeated uncommitted-suffix truncation); the **mechanism** is
+apply-without-rollback turning that churn into permanent store divergence. This is
+the *broad* form of the same invariant RC-1 lives under — but via the
+leader-change/truncation path, not catch-up.
+
+This **subsumes and orders** the earlier candidates: RC-1/catch-up (exonerated,
+dormant), apply-drift (refuted, fully applied), orphan-vs-divergent-log (resolved:
+orphan — the value is in no log). The two fixes that close the incident: **(1)
+RC-2** — stop the silent fence/drop that drives the election churn (the trigger);
+**(2) the apply/fold truncation-safety invariant** — the store must be derivable
+from / rolled back to the committed log (the mechanism).
+
+**Operational note:** the divergence is still LIVE (leader node 1 serves OLD →
+login broken). Converging it needs a fresh `_deploy/current` write through the
+current leader (re-publish `__auth__`) — separate from the code fixes.
+
+## Incident root cause (earlier hypotheses — superseded by RESOLVED above)
 
 RC-1 was chased to a real, correct fix but **exonerated as the `__auth__` cause**
 (forensics: catch-up / move / reconciler all dormant for `__auth__`). The
