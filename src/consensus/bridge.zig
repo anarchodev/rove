@@ -179,7 +179,7 @@ pub const GroupSig = struct {
 /// one, enqueues a pointer, and blocks on `done` until the pump has
 /// executed it and stamped `err` — so the struct outlives the wait.
 const ControlCmd = struct {
-    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term, last_index, baseline_index, applied_raw, durabilized_raw, group_epoch };
+    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term, last_index, baseline_index, applied_raw, durabilized_raw, log_entry, group_epoch };
     kind: Kind,
     gid: u64,
     /// Borrowed from the gid's `GroupSig.id_str` (pointer-stable); used by
@@ -194,9 +194,14 @@ const ControlCmd = struct {
     node_id: u64 = 0,
     cc_type: u8 = 0,
     /// `apply_local_snapshot`: the baseline {index, term} to install.
-    /// `log_term`: `snap_index` is the query index, `snap_term` the result.
+    /// `log_term` / `log_entry`: `snap_index` is the query index, `snap_term` the
+    /// result term.
     snap_index: u64 = 0,
     snap_term: u64 = 0,
+    /// `log_entry` (diagnostic): caller buffer (in) for the entry's data + the
+    /// bytes written (out). `lt_ok` flags a resolved entry.
+    entry_buf: ?[]u8 = null,
+    entry_len: usize = 0,
     /// `apply_local_snapshot` (Phase 2 — membership SSOT): the source leader's
     /// ConfState the baseline carries, so a joiner learns its membership from the
     /// snapshot. Null → keep the group's current membership (membership-neutral
@@ -846,6 +851,18 @@ pub const Bridge = struct {
         return if (cmd.lt_ok) cmd.snap_term else null;
     }
 
+    pub const LogEntry = struct { term: u64, data: []const u8 };
+
+    /// Diagnostic: read the raft LOG entry at `index` for `gid` into `buf` (the
+    /// replicated log content). Null on unknown group / no entry / buf too small.
+    /// `data` slices into `buf`. Pump op.
+    pub fn logEntry(self: *Bridge, gid: u64, index: u64, buf: []u8) ?LogEntry {
+        var cmd: ControlCmd = .{ .kind = .log_entry, .gid = gid, .snap_index = index, .entry_buf = buf };
+        self.runControl(&cmd) catch return null;
+        if (!cmd.lt_ok) return null;
+        return .{ .term = cmd.snap_term, .data = buf[0..cmd.entry_len] };
+    }
+
     /// This group's local raft last log index (any replica) — the reconciler's
     /// learner→promote catch-up signal. Pump op (the Manager is pump-only). 0 on
     /// unknown group / pump failure.
@@ -983,6 +1000,16 @@ pub const Bridge = struct {
                         cmd.vp_len = vp.len;
                         cmd.vp_leader_last = vp.leader_last;
                         cmd.vp_ok = true;
+                    }
+                    break :blk null;
+                },
+                .log_entry => blk: {
+                    if (cmd.entry_buf) |buf| {
+                        if (self.node.logEntry(cmd.gid, cmd.snap_index, buf)) |e| {
+                            cmd.snap_term = e.term;
+                            cmd.entry_len = e.data.len;
+                            cmd.lt_ok = true;
+                        }
                     }
                     break :blk null;
                 },

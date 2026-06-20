@@ -175,6 +175,8 @@ pub fn tryHandleV2(
         try handleLastIndex(server, allocator, worker, ent, sid, sess, method, path);
     } else if (std.mem.eql(u8, sys_rest, "v2-raft-state")) {
         try handleRaftState(server, allocator, worker, ent, sid, sess, method, path);
+    } else if (std.mem.eql(u8, sys_rest, "v2-log-entry")) {
+        try handleLogEntry(server, allocator, worker, ent, sid, sess, method, path);
     } else if (std.mem.eql(u8, sys_rest, "v2-load-replace")) {
         try handleLoadReplace(server, allocator, worker, ent, sid, sess, method, rh, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-apply-snapshot")) {
@@ -1188,6 +1190,57 @@ fn handleRaftState(
         allocator,
         "{{\"last_index\":{d},\"applied_idx\":{d},\"durabilized_idx\":{d},\"term_at_last\":{d},\"epoch\":{d},\"leader\":{}}}\n",
         .{ last, worker.raft.appliedRaw(gid), worker.raft.durabilizedRaw(gid), term, worker.raft.groupEpoch(gid), worker.raft.isLeaderOf(gid) },
+    ) catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
+}
+
+/// `GET /_system/v2-log-entry?tenant=&index=` → this node's raft LOG entry at
+/// `index` as `{index, term, len, data_hex}` — hex of the raw entry bytes (the
+/// origin-frame `[magic|origin|seq]` + envelope `[type|id_len|id|payload]` +
+/// writeset). Read-only, NOT leader-gated. The diagnostic that distinguishes an
+/// orphaned speculative fold (store != log) from divergent committed logs across
+/// nodes — the store value alone can't. The client decodes the hex (keys/values
+/// are ASCII), so there is no in-engine envelope parsing here (robust +
+/// format-agnostic).
+fn handleLogEntry(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    path: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "GET"))
+        return reply(server, allocator, ent, sid, sess, 405, "GET only\n");
+    const tenant = queryParam(path, "tenant") orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing ?tenant\n");
+    const index_s = queryParam(path, "index") orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing ?index\n");
+    const index = std.fmt.parseInt(u64, index_s, 10) catch
+        return reply(server, allocator, ent, sid, sess, 400, "bad ?index\n");
+    const gid = worker.raft.gidForTenant(tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
+    // Entries are small (a kv writeset). 64 KiB covers any tenant write; a larger
+    // entry returns null (engine -3 buf-too-small) → 404, surfaced loudly here.
+    const buf = allocator.alloc(u8, 64 * 1024) catch
+        return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    defer allocator.free(buf);
+    const e = worker.raft.logEntry(gid, index, buf) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "no entry at index (compacted / beyond log / too large)\n");
+    const hex_chars = "0123456789abcdef";
+    const hexbuf = allocator.alloc(u8, e.data.len * 2) catch
+        return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    defer allocator.free(hexbuf);
+    for (e.data, 0..) |b, i| {
+        hexbuf[i * 2] = hex_chars[b >> 4];
+        hexbuf[i * 2 + 1] = hex_chars[b & 0x0f];
+    }
+    const out = std.fmt.allocPrint(
+        allocator,
+        "{{\"index\":{d},\"term\":{d},\"len\":{d},\"data_hex\":\"{s}\"}}\n",
+        .{ index, e.term, e.data.len, hexbuf },
     ) catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
 }

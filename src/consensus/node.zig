@@ -1005,6 +1005,14 @@ pub const Node = struct {
     /// from a genuine term of 0 at the genesis index. The leader reports
     /// `term(applied)` so a returning learner's promote-back baseline matches its
     /// log. Pump-thread only.
+    /// Diagnostic: read this node's raft LOG entry at `index` into `buf` (the
+    /// replicated log content — distinct from the served store; settles an
+    /// orphaned fold vs divergent logs). Null on unknown group / no entry / buf
+    /// too small. Pump-thread only (the Manager + raft_log are pump-owned).
+    pub fn logEntry(self: *Node, tenant_id: u64, index: u64, buf: []u8) ?raft.Manager.LogEntry {
+        return self.mgr.logEntry(tenant_id, index, buf);
+    }
+
     pub fn logTerm(self: *Node, tenant_id: u64, index: u64) ?u64 {
         return self.mgr.logTerm(tenant_id, index);
     }
