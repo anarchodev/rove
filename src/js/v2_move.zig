@@ -1082,7 +1082,7 @@ fn handleAppliedBaseline(
     // applied yet): logTerm(gid, 0) resolves to the genesis sentinel term 0, so
     // this flows through to a {0,0} baseline = a plain (snapshot-free) born attach
     // — exactly as before, no special case.
-    const index = worker.raft.appliedIndex(gid);
+    const index = worker.raft.baselineIndex(gid);
     // A baseline is the pair {index, term-of-the-log-entry-at-index}. logTerm now
     // returns null when the leader's own log can't resolve a term for `index` (it
     // is beyond last_index, below the compaction floor, or the store watermark has

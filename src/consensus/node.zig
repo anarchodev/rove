@@ -1024,19 +1024,34 @@ pub const Node = struct {
         return self.mgr.snapshotPendingPeers(tenant_id, ids);
     }
 
-    /// This group's LIVE applied index on this node (`slot.applied_idx`: the
-    /// highest committed entry whose writeset is folded into the store's overlay).
-    /// On the leader this is the correct out-of-band baseline for a new member: it
-    /// is ALWAYS >= the leader's first (compacted) log index, because compaction
-    /// floors the truncate point at `min(applied, …)` (see `durabilizeTick`), so a
-    /// learner born here starts at an entry the leader still holds. The durabilized
-    /// store watermark (`lastAppliedRaftIdx`) is NOT a safe baseline source — it
-    /// lags `applied_idx` by up to one durabilize cycle and under continuous churn
-    /// sits BELOW the compaction floor, stranding the learner. 0 on unknown group.
-    /// Pump-thread only (reads pump-owned slot state).
-    pub fn appliedIndex(self: *Node, tenant_id: u64) u64 {
+    /// This group's out-of-band catch-up / move BASELINE index: the durable folded
+    /// watermark (`slot.durabilized_idx`), NOT the live `applied_idx`.
+    ///
+    /// The baseline ships alongside a `StreamDumper.openSnapshot` dump whose content
+    /// is the COMMITTED/folded overlay — everything up to `durabilized_idx`. The
+    /// baseline index MUST NOT exceed that: the receiver's `apply_local_snapshot`
+    /// fast-forwards `committed` to the baseline, and any write above what the
+    /// snapshot actually contains is then ≤ its commit / below `first_index`, so it
+    /// never replays → a PERMANENT store fork at an agreed log index (the 2026-06-20
+    /// prod `__auth__` divergence; `docs/raft-consensus-storage-triage.md` RC-1).
+    ///
+    /// `applied_idx` is WRONG here: under `worker_overlay` a skipped own-propose
+    /// bumps `applied_idx` while its store write still sits in the worker's open txn
+    /// (folded only on `noteWorkerCommitted`), so `applied_idx > durabilized_idx` (the
+    /// snapshot content). Shipping `applied_idx` over-claims past the snapshot.
+    ///
+    /// `durabilized_idx` is still a SAFE baseline for the tail to replicate:
+    /// mechanism-A compaction truncates to `durabilized_idx − snapshot_grace`
+    /// (`durabilizeTick`), so `durabilized_idx` sits `snapshot_grace` entries ABOVE
+    /// the leader's first (compacted) index — the member born here starts at an entry
+    /// the leader still holds. (The prior comment's claim that the durable watermark
+    /// "sits below the compaction floor" was inverted; the floor is
+    /// `durabilized − grace`.) 0 on unknown group, and 0 for a fresh group with
+    /// nothing folded yet — the trigger skips index 0, correctly deferring catch-up
+    /// until a consistent snapshot exists. Pump-thread only (reads pump-owned slot).
+    pub fn baselineIndex(self: *Node, tenant_id: u64) u64 {
         const slot = self.groups.get(tenant_id) orelse return 0;
-        return slot.applied_idx;
+        return slot.durabilized_idx;
     }
 
     /// This group's migration epoch on this node — the value the transport
