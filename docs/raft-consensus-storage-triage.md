@@ -69,8 +69,46 @@ never "add a store rollback."
 
 ### RC-1 — The fold gate is not provably truncation-safe (Bug A; the `__auth__` loss)
 
-**Verdict: VERIFIED hazard class; prod trigger partially pinned. Highest
-priority.**
+**Verdict: hazard class real; the rove-side triggers are REFUTED on closer read
+(see "Pinning result" below). The live trigger is NOT in the rove apply/overlay
+layer — it is engine-level commit/apply accounting. Still highest priority, but
+the hunt has moved one layer down.**
+
+#### Pinning result (2026-06-20, code-verified)
+
+Three candidate rove-side triggers were chased and **all refuted by source**:
+
+- **C4 (`flush`-before-`on_persist`) is HONORED on the production path.** The
+  only production `on_persist` caller is the rove pump (`node.zig:1348`),
+  guarded by the cycle's `wal.flush()` (`node.zig:1330`). Every `on_persist`
+  caller inside raft-rs-zig `manager.zig` (690, 709, 948, 1008, 1129) is a
+  **test helper or test body** (`processReadyAndPersist`, `captureRealVote`,
+  `hsReproPump`, `threadReproPump`, the async-append test). So no production
+  path acks persistence without a covering fsync. The C4 *assertion* is still
+  worth adding as defense-in-depth (it would catch a future non-flush-guarded
+  caller), but it is **not the fix** for this incident.
+- **`worker_overlay` proposer-skip is deterministic under a correct commit.**
+  `applyEntry` (`node.zig:1719-1744`): on skip, the worker txn folds the
+  identical bytes gated on `committed_seq`; otherwise the pump writes the same
+  committed value. proposer-store == follower-store == committed entry, *as long
+  as a committed entry is never truncated* — which true raft guarantees.
+- **Authoritative multi-apply is atomic + fail-loud** (`node.zig:1756-1786`):
+  every inner uses `try` (decode error → `apply_err`), not `catch continue`.
+
+Conclusion: the rove apply/overlay/commit-gate layer is safe **under a correct
+raft commit**. The `__auth__` orphan therefore implies an **engine-level
+commit/apply anomaly** — an entry reported committed (so the worker folded it)
+that was later truncated. `raft-native-alignment.md` already records the lead:
+*"applied=52 vs committed/last=66 on a prod leader"* (apply/commit accounting
+drift). The next probe is the raft-rs async-append commit-advance path
+(`raft-sys/src/lib.rs` `on_persist_ready` → commit) and per-node
+`{applied_idx, commit_index, last_index}` instrumentation on prod — not the rove
+apply layer.
+
+#### Original hazard analysis (retained for record)
+
+**Verdict (as first written): VERIFIED hazard class; prod trigger partially
+pinned.** Superseded by the pinning result above for the C4 sub-cause.
 
 The fold (`worker_drain.commitAndTake` → durable store) is gated on
 `committed_seq`, advanced by `Bridge.onCommitted` from the **post-fsync** commit
@@ -284,10 +322,16 @@ open before anything is called "confirmed":
 
 ## Suggested fix sequencing
 
-1. **RC-1 / C4 assertion first.** It is the gate the whole model rests on and
-   the likely prod trigger; the debug "dirty-since-flush" assert turns an
-   unenforced contract into a loud test, then the truncation-after-fold soak
-   proves the gate. (decisions.md §10.5b is the prose this enforces.)
+1. **RC-1 — now an engine-level hunt (the rove-side triggers are refuted).**
+   The live `__auth__` trigger is an engine commit/apply anomaly (a committed
+   entry that was truncated), not the rove apply layer. Next steps: (a)
+   instrument per-node `{applied_idx, commit_index, last_index}` and confirm/
+   quantify the known apply/commit drift; (b) audit the raft-rs async-append
+   commit-advance accounting (`raft-sys/src/lib.rs` `on_persist_ready` → commit)
+   for a path that advances commit without a fsynced voter-majority. Land the
+   C4 debug assertion as **defense-in-depth** (cheap regression guard), but it
+   is not this incident's fix. Keep the bridge-OOM early-return fix (the one
+   real, narrow rove-side over-report) on this track.
 2. **RC-2 form-or-buffer + per-group alarm.** Self-contained, clear fix, and it
    is the confirmed `__admin__` mechanism.
 3. **RC-3, RC-4** — bounded, lower blast radius.
