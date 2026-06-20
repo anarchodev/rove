@@ -69,10 +69,72 @@ never "add a store rollback."
 
 ### RC-1 — The fold gate is not provably truncation-safe (Bug A; the `__auth__` loss)
 
-**Verdict: hazard class real; the rove-side triggers are REFUTED on closer read
+**Verdict: ROOT CAUSE PINNED (high confidence, code-verified design
+inconsistency; reproducing test still pending). The `__auth__` fork is the
+out-of-band catch-up baseline OVER-CLAIMING its index relative to the snapshot
+data it ships. Not the apply/overlay layer, not engine commit accounting —
+the baseline construction in the arc's catch-up driver. Highest priority.**
+
+#### ROOT CAUSE — catch-up baseline index over-claims vs the snapshot it ships
+
+The out-of-band catch-up (Phase 1) captures the baseline index and the snapshot
+data at **two different times on two different threads, with no invariant that
+`index ≤ snapshot content`:**
+
+- **Baseline index** = `Node.appliedIndex(gid)` = `slot.applied_idx`, read at
+  **trigger time on the PUMP thread** (`bridge.zig:1194`,
+  `snapshotTriggerTick`), then baked into the enqueued `CatchupJob`.
+- **Snapshot data** = the committed/folded overlay, captured **later on the
+  DRIVER thread** when the job runs (`snapshot_catchup.zig:305`,
+  `StreamDumper.init` → `openSnapshot`: "a copy of the committed overlay").
+
+`applied_idx` **leads** the committed overlay: on the leader, its own proposes
+are `worker_overlay`-skipped — `applyEntry` (`node.zig:1733-1744`) bumps
+`applied_idx` **without** writing the store; the write reaches the committed
+overlay only when the **worker thread folds** it (`TrackedTxn.commit` on
+`committed_seq`, `worker_drain.zig:150`). So at dump time the folded snapshot can
+be missing the most-recently-applied entries that `applied_idx` already counts.
+When `applied_idx(trigger) > folded-content(dump)`, the baseline **over-claims**:
+the receiver `apply_local_snapshot` fast-forwards `committed` to an index whose
+writes the snapshot lacks, and those entries are now ≤ its commit / below
+`first_index`, so they never replicate from the log either → **permanent store
+fork at an agreed log index.**
+
+This is exactly `__auth__`: node 2 (leader/source) had applied its own
+`_deploy/current=fix` (`applied_idx` bumped) but the worker had not yet folded
+it into the snapshot; the catch-up dump shipped a baseline **past** the fix
+without the fix data to nodes 1 & 3 → they serve OLD, node 2 (after its worker
+folds) serves the fix. The `appliedIndex` doc comment (`node.zig:1027-1039`)
+shows the inverted reasoning: it chose `applied_idx` *because* it leads the store
+watermark — but the baseline index must match what the **snapshot contains**, not
+the apply frontier that runs ahead of it.
+
+The deeper flaw is the **non-atomic capture**: index (pump, trigger time) and
+data (driver, run time) are read at unrelated points. Between them the leader
+keeps applying; nothing constrains their relationship in either direction.
+
+**Fix direction (aligned with the invariant + TiKV's model):** capture the
+baseline index and the snapshot data from **ONE consistent point**. The baseline
+index must be the applied/fold watermark **of the snapshot's own MVCC view**,
+read in the same txn that produces the data — so `index ≤ content` holds by
+construction. Concretely: `StreamDumper`/`openSnapshot` returns
+`{snapshot, applied_index_of_this_view}` atomically, and the shipped baseline is
+that index — never a separately-read live `applied_idx`. This is TiKV's
+shape (snapshot metadata index == the state machine's applied index *as
+snapshotted*). It also removes the trigger-vs-run time skew entirely.
+
+**Reproducing test (the gate before this is "fixed"):** on a 3-node group,
+drive continuous leader-local writes (so `applied_idx` leads the unfolded
+overlay), force a peer below the compaction floor to trigger catch-up, and assert
+the peer's post-catch-up store contains **every** acked write up to its installed
+commit (no fork). Today nothing exercises the index-leads-fold window.
+
+#### Earlier verdict (superseded by the root cause above)
+
+hazard class real; the rove-side triggers are REFUTED on closer read
 (see "Pinning result" below). The live trigger is NOT in the rove apply/overlay
-layer — it is engine-level commit/apply accounting. Still highest priority, but
-the hunt has moved one layer down.**
+layer — it is engine-level commit/apply accounting. (Superseded: the engine
+accounting is correct; the defect is the baseline construction above.)
 
 #### Pinning result (2026-06-20, code-verified)
 
