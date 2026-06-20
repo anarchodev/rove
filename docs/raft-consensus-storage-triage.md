@@ -43,6 +43,37 @@ Agent findings were then **re-verified against the source by hand** before
 landing here. Two high-confidence agent findings were **refuted** that way (see
 "False positives") — agent output is evidence, not conclusion.
 
+## Incident root cause (REOPENED 2026-06-20)
+
+RC-1 was chased to a real, correct fix but **exonerated as the `__auth__` cause**
+(forensics: catch-up / move / reconciler all dormant for `__auth__`). The
+observed prod state is therefore **still unexplained**:
+
+- `__auth__`: all 3 nodes at `last_index = 107` (logs same length), stores fork —
+  leader node 1 = OLD, node 2 = fix, node 3 = OLD. With catch-up/move/reconciler
+  ruled out, the fork is **apply-side**, on a never-compacted, low-traffic group
+  across rolling restarts.
+
+**Leading hypothesis: apply/commit drift.** `raft-native-alignment.md` records
+the fingerprint — *"applied=52 vs committed/last=66 on a prod leader."* If a
+node's `applied_idx` lags its committed log (apply stuck / wedged), its served
+store sits BEHIND its log: the fix write committed in every node's log
+(index ≤ 107) but node 1 / node 3 never APPLIED it to their store while node 2
+did; the leader (node 1) then serves its stale store → OLD login code. Fits the
+shape (equal logs, forked stores) with no catch-up.
+
+**Decisive forensics to run next:**
+1. Per-node `{applied_idx, commit_index, last_index}` for `__auth__` — is apply
+   drifting BELOW commit on node 1 / node 3? (direct test of the hypothesis.)
+2. Compare the actual per-node LOG CONTENTS at the `_deploy/current` entry's
+   index. Identical entries + forked stores ⇒ apply-side fork (the hypothesis);
+   DIFFERING entries at the same index ⇒ a truncation/term anomaly (a different,
+   more serious engine safety violation).
+3. node-3 journal (was unreachable) for apply errors / wedged-apply around the
+   deploy window.
+
+Until these run, the incident cause is **open**; RC-1's fix does not close it.
+
 ## The architectural invariant (the acceptance criterion)
 
 The speculative overlay model has one load-bearing rule:
@@ -69,11 +100,18 @@ never "add a store rollback."
 
 ### RC-1 — The fold gate is not provably truncation-safe (Bug A; the `__auth__` loss)
 
-**Verdict: ROOT CAUSE PINNED (high confidence, code-verified design
-inconsistency; reproducing test still pending). The `__auth__` fork is the
-out-of-band catch-up baseline OVER-CLAIMING its index relative to the snapshot
-data it ships. Not the apply/overlay layer, not engine commit accounting —
-the baseline construction in the arc's catch-up driver. Highest priority.**
+**Verdict: REAL latent bug — FIXED + unit-gated — but EXONERATED as the prod
+`__auth__` cause (forensics 2026-06-20).** RC-1 only fires on the out-of-band
+catch-up / move / reconciler-join baseline paths. Prod forensics rule all three
+out for `__auth__`: `REWIND_SNAPSHOT_GRACE` is unset (default **5000**) and
+`__auth__` has **107** log entries (≪ 5000), so it never compacts → no peer can
+fall below `first_index` → the out-of-band catch-up never triggers; node-1 and
+node-2 journals show **zero** catch-up / `apply_local` / `StateSnapshot` events
+in their entire history; no tenant *move* occurred (single cluster); the
+reconciler is off. So RC-1 did **not** cause the incident — it is a latent bug
+that would bite once a tenant exceeds the compaction grace. **The `__auth__`
+root cause is REOPENED — see "Incident root cause (reopened)" below.** The
+mechanism analysis is retained because the fix is correct and the bug is real.
 
 #### ROOT CAUSE — catch-up baseline index over-claims vs the snapshot it ships
 
