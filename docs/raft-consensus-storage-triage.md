@@ -95,9 +95,30 @@ description, now confirmed against live state.
   reporting a false-identical prefix.
 
 Distinguishing A from B requires node 2's **log entry content** at the deploy
-index (and node 2/3 `applied_idx`) — which no endpoint exposes today. The
-inference "node 2's store is an orphan" is only valid in case A; do not assert it
-until the log content is read.
+index (and node 2/3 `applied_idx`). The inference "node 2's store is an orphan"
+is only valid in case A; do not assert it until the log content is read.
+
+**Diagnostic instrumentation — BUILT + verified (2026-06-20), ready for a
+controlled-delta deploy:**
+- **Named fence drops** (`transport.zig`): a `stepBatch` skip now logs each batch
+  entry's `gid` + `msg_epoch` + `local_epoch` + sender + reason
+  (`fenced(epoch)` / `unknown-group?` / `undecodable`) — fixes RC-2's blind spot
+  so the *inducing* event (a legit message fenced during a term change) is
+  attributable. Zig-only.
+- **`GET /_system/v2-raft-state?tenant=`** (not leader-gated): per-node
+  `{last_index, applied_idx, durabilized_idx, term_at_last, epoch, leader}` —
+  exposes followers' `applied`/`durabilized` (invisible today) and the
+  `applied − durabilized` fold-lag gap. Zig-only.
+- **`GET /_system/v2-log-entry?tenant=&index=`** (not leader-gated):
+  `{index, term, len, data_hex}` — the raw LOG entry bytes; the client decodes
+  the frame+envelope+writeset (ASCII keys/values) to read what each node's log
+  actually holds at the deploy index. **This is the A-vs-B disambiguator.**
+  Needs the engine FFI `raft_manager_log_entry` (raft-rs-zig `9a214aa`, pinned).
+
+Once deployed: read `v2-log-entry` at the `_deploy/current` index on all three
+nodes — node 2's log == OLD ⇒ case A (orphaned fold); node 2's log == fix ⇒
+case B (divergent committed logs / election-safety violation). Then audit the
+epoch-fence × raft-safety path (the suspected inducer) and fix RC-2.
 
 **Decisive next step (no endpoint exposes log-entry content today):** a READ-ONLY
 diagnostic — read each node's raft log entry by index (term + decoded envelope
