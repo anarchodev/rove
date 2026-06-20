@@ -358,6 +358,23 @@ pub const Transport = struct {
                     "v2 transport node {d}: stepBatch skipped {d}/{d} inbound messages (unknown group / fenced / undecodable) — {d} total",
                     .{ self.node_id, skipped, self.step_scratch.items.len, self.step_skip_count },
                 );
+                // RC-2 observability: name the gid + epoch mismatch + sender so a
+                // silent quorum-degradation is diagnosable (which tenant, which
+                // peer, fenced-vs-unknown). `stepBatch` returns only a count, so we
+                // dump the whole (small) batch — the skipped entries are in here.
+                // `local_epoch` vs `msg_epoch`: differ ⇒ epoch FENCE; local 0 with
+                // msg>0 ⇒ likely UNKNOWN GROUP (group absent / not yet attached);
+                // equal ⇒ UNDECODABLE. Bounded scan; pump-thread, only on a skip.
+                var j: usize = 0;
+                while (j < self.step_scratch.items.len and j < 16) : (j += 1) {
+                    const e = self.step_scratch.items[j];
+                    const local_epoch = self.manager.groupEpoch(e.group_id);
+                    const reason = if (local_epoch == e.epoch) "undecodable" else if (local_epoch == 0) "unknown-group?" else "fenced(epoch)";
+                    std.log.warn(
+                        "v2 transport node {d}:   skip-detail gid={d} msg_epoch={d} local_epoch={d} from=node{d} reason={s}",
+                        .{ self.node_id, e.group_id, e.epoch, local_epoch, from_id + 1, reason },
+                    );
+                }
             }
         }
     }

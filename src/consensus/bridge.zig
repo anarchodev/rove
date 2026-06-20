@@ -179,7 +179,7 @@ pub const GroupSig = struct {
 /// one, enqueues a pointer, and blocks on `done` until the pump has
 /// executed it and stamped `err` — so the struct outlives the wait.
 const ControlCmd = struct {
-    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term, last_index, baseline_index, group_epoch };
+    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term, last_index, baseline_index, applied_raw, durabilized_raw, group_epoch };
     kind: Kind,
     gid: u64,
     /// Borrowed from the gid's `GroupSig.id_str` (pointer-stable); used by
@@ -866,6 +866,20 @@ pub const Bridge = struct {
         return cmd.snap_index;
     }
 
+    /// Diagnostic: this node's RAW apply watermark for `gid` (`slot.applied_idx`).
+    pub fn appliedRaw(self: *Bridge, gid: u64) u64 {
+        var cmd: ControlCmd = .{ .kind = .applied_raw, .gid = gid };
+        self.runControl(&cmd) catch return 0;
+        return cmd.snap_index;
+    }
+
+    /// Diagnostic: this node's durable folded watermark for `gid`.
+    pub fn durabilizedRaw(self: *Bridge, gid: u64) u64 {
+        var cmd: ControlCmd = .{ .kind = .durabilized_raw, .gid = gid };
+        self.runControl(&cmd) catch return 0;
+        return cmd.snap_index;
+    }
+
     /// This group's migration epoch on the leader — a joining node must birth its
     /// local group at this exact epoch or the leader's messages are fenced out.
     /// Pump op. 0 on unknown group / pump failure (also the genuine genesis epoch,
@@ -985,6 +999,14 @@ pub const Bridge = struct {
                 },
                 .baseline_index => blk: {
                     cmd.snap_index = self.node.baselineIndex(cmd.gid);
+                    break :blk null;
+                },
+                .applied_raw => blk: {
+                    cmd.snap_index = self.node.appliedRaw(cmd.gid);
+                    break :blk null;
+                },
+                .durabilized_raw => blk: {
+                    cmd.snap_index = self.node.durabilizedRaw(cmd.gid);
                     break :blk null;
                 },
                 .group_epoch => blk: {

@@ -173,6 +173,8 @@ pub fn tryHandleV2(
         try handleAppliedBaseline(server, allocator, worker, ent, sid, sess, method, path);
     } else if (std.mem.eql(u8, sys_rest, "v2-last-index")) {
         try handleLastIndex(server, allocator, worker, ent, sid, sess, method, path);
+    } else if (std.mem.eql(u8, sys_rest, "v2-raft-state")) {
+        try handleRaftState(server, allocator, worker, ent, sid, sess, method, path);
     } else if (std.mem.eql(u8, sys_rest, "v2-load-replace")) {
         try handleLoadReplace(server, allocator, worker, ent, sid, sess, method, rh, body);
     } else if (std.mem.eql(u8, sys_rest, "v2-apply-snapshot")) {
@@ -1155,6 +1157,38 @@ fn handleLastIndex(
         return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
     const out = std.fmt.allocPrint(allocator, "{{\"last_index\":{d}}}\n", .{worker.raft.lastIndex(gid)}) catch
         return reply(server, allocator, ent, sid, sess, 500, "oom\n");
+    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
+}
+
+/// `GET /_system/v2-raft-state?tenant=` → this node's per-group raft state, for
+/// diagnostics (the RC-1 / `__auth__` fork hunt). NOT leader-gated — every node
+/// reports its OWN `{last_index, applied_idx, durabilized_idx, term_at_last,
+/// epoch, leader}`. The `applied_idx − durabilized_idx` gap is the worker-overlay
+/// fold lag (the RC-1 over-claim window); comparing `applied_idx` + the served
+/// store across nodes exposes an apply-side fork that `last_index` alone hides.
+fn handleRaftState(
+    server: anytype,
+    allocator: std.mem.Allocator,
+    worker: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    method: []const u8,
+    path: []const u8,
+) !void {
+    if (!std.mem.eql(u8, method, "GET"))
+        return reply(server, allocator, ent, sid, sess, 405, "GET only\n");
+    const tenant = queryParam(path, "tenant") orelse
+        return reply(server, allocator, ent, sid, sess, 400, "missing ?tenant\n");
+    const gid = worker.raft.gidForTenant(tenant) orelse
+        return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
+    const last = worker.raft.lastIndex(gid);
+    const term = worker.raft.logTerm(gid, last) orelse 0;
+    const out = std.fmt.allocPrint(
+        allocator,
+        "{{\"last_index\":{d},\"applied_idx\":{d},\"durabilized_idx\":{d},\"term_at_last\":{d},\"epoch\":{d},\"leader\":{}}}\n",
+        .{ last, worker.raft.appliedRaw(gid), worker.raft.durabilizedRaw(gid), term, worker.raft.groupEpoch(gid), worker.raft.isLeaderOf(gid) },
+    ) catch return reply(server, allocator, ent, sid, sess, 500, "oom\n");
     try respb.setSystemResponseOwned(server, ent, sid, sess, 200, out, allocator, null, "application/json");
 }
 

@@ -1054,6 +1054,23 @@ pub const Node = struct {
         return slot.durabilized_idx;
     }
 
+    /// Diagnostic: this group's RAW live apply watermark (`slot.applied_idx`) on
+    /// THIS node — the highest committed entry the pump has applied. The gap
+    /// `applied_idx − durabilized_idx` is the worker-overlay fold lag (the RC-1
+    /// window). 0 on unknown group. Pump-thread only.
+    pub fn appliedRaw(self: *Node, tenant_id: u64) u64 {
+        const slot = self.groups.get(tenant_id) orelse return 0;
+        return slot.applied_idx;
+    }
+
+    /// Diagnostic: this group's durable folded watermark (`slot.durabilized_idx`)
+    /// on THIS node — what `openSnapshot` content reflects. 0 on unknown group.
+    /// Pump-thread only. (Same value `baselineIndex` ships; named for the readout.)
+    pub fn durabilizedRaw(self: *Node, tenant_id: u64) u64 {
+        const slot = self.groups.get(tenant_id) orelse return 0;
+        return slot.durabilized_idx;
+    }
+
     /// This group's migration epoch on this node — the value the transport
     /// stamps on every outbound raft message for the group (`mgr.groupEpoch`,
     /// see the SendCtx stamping in `flushOutbound`). A node joining an existing
