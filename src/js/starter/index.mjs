@@ -7,8 +7,8 @@
 // (request.method, request.path, request.body, request.query).
 // Return a string (or an object — we'll JSON.stringify it).
 export default function () {
-  const count = parseInt(kv.get("_starter_hits") ?? "0", 10) + 1;
-  kv.set("_starter_hits", String(count));
+  const count = parseInt(kv.get("starter_hits") ?? "0", 10) + 1;
+  kv.set("starter_hits", String(count));
   return {
     message: "Your Loop46 API is live",
     path: request.path,
