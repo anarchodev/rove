@@ -123,11 +123,27 @@ that index — never a separately-read live `applied_idx`. This is TiKV's
 shape (snapshot metadata index == the state machine's applied index *as
 snapshotted*). It also removes the trigger-vs-run time skew entirely.
 
-**Reproducing test (the gate before this is "fixed"):** on a 3-node group,
-drive continuous leader-local writes (so `applied_idx` leads the unfolded
-overlay), force a peer below the compaction floor to trigger catch-up, and assert
-the peer's post-catch-up store contains **every** acked write up to its installed
-commit (no fork). Today nothing exercises the index-leads-fold window.
+**STATUS: FIX LANDED + unit-verified (commit `0fcaa73`); 3-node integration
+smoke still pending before this is fully closed.** The baseline source
+(`Node.baselineIndex`, formerly `appliedIndex`, every caller a baseline source)
+now returns `slot.durabilized_idx` — the folded watermark `≤` the snapshot
+content by construction, and still `snapshot_grace` entries above the compaction
+floor so the tail replicates. The inverted doc comment that justified
+`applied_idx` is corrected.
+
+**Reproducing test — DONE at the unit level (red→green):** `bridge.zig`,
+*"catch-up baseline index never exceeds the durable snapshot content watermark"*
+— folds write 1, then commits write 2 without acking the worker txn (so
+`applied_idx > durabilized_idx`, the fold-lag window) and asserts the baseline
+index `≤ durabilized_idx`. RED on the old code (returned `applied_idx`), GREEN
+after the fix. `v2-test` + `rewind-worker` + `rewind-cp` build clean.
+
+**Still pending (the integration gate):** a 3-node smoke that drives continuous
+leader-local writes, forces a peer below the compaction floor to trigger
+catch-up, and asserts the peer's post-catch-up store contains **every** acked
+write up to its installed commit (no fork). The unit test proves the invariant at
+the seam; the smoke proves it end-to-end through the real catch-up path. Do not
+call RC-1 closed until that is green.
 
 #### Earlier verdict (superseded by the root cause above)
 
