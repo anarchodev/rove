@@ -484,8 +484,11 @@ fields are ignored), so additive growth is safe. The reservations to make now:
 > 1. **DONE** `40ed6c9` — `reserved.zig` denies all leading-`_` except the
 >    verified `SHIM_WRITABLE_PREFIXES` allowlist (option (b)). Privileged-binding
 >    (a) — to also close the per-tenant self-footgun on the shim prefixes —
->    remains deferred. **Final gate before merge: a live auth/oidc smoke** to
->    confirm the allowlist is complete at runtime (static grep is clean).
+>    remains deferred. **Allowlist runtime-verified:** `oidc_smoke_v2`
+>    (provider `_oidc/` writes) and `oidc_rp_smoke_v2` (relying-party `_rp/`
+>    writes + operator dashboard / log + CP chokepoints) both PASS against
+>    binaries built with all four changes — confirming the allowlist is complete
+>    and that items 2–4 don't regress the auth stack. Static grep also clean.
 > 2. **DONE** `5e22a06` — `kv.set`/`kv.delete` reject oversized writes fail-fast
 >    (`key_too_large`/`value_too_large`); caps referenced from the canonical
 >    kvexp `snapshot_stream` constants.
