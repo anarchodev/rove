@@ -54,25 +54,65 @@ observed prod state is therefore **still unexplained**:
   ruled out, the fork is **apply-side**, on a never-compacted, low-traffic group
   across rolling restarts.
 
-**Leading hypothesis: apply/commit drift.** `raft-native-alignment.md` records
-the fingerprint — *"applied=52 vs committed/last=66 on a prod leader."* If a
-node's `applied_idx` lags its committed log (apply stuck / wedged), its served
-store sits BEHIND its log: the fix write committed in every node's log
-(index ≤ 107) but node 1 / node 3 never APPLIED it to their store while node 2
-did; the leader (node 1) then serves its stale store → OLD login code. Fits the
-shape (equal logs, forked stores) with no catch-up.
+### Forensics (2026-06-20) — leader apply-drift REFUTED; "committed write lost on leader change" established; orphan-vs-divergent-log UNRESOLVED
 
-**Decisive forensics to run next:**
-1. Per-node `{applied_idx, commit_index, last_index}` for `__auth__` — is apply
-   drifting BELOW commit on node 1 / node 3? (direct test of the hypothesis.)
-2. Compare the actual per-node LOG CONTENTS at the `_deploy/current` entry's
-   index. Identical entries + forked stores ⇒ apply-side fork (the hypothesis);
-   DIFFERING entries at the same index ⇒ a truncation/term anomaly (a different,
-   more serious engine safety violation).
-3. node-3 journal (was unreachable) for apply errors / wedged-apply around the
-   deploy window.
+Per-node `__auth__` state read from prod:
 
-Until these run, the incident cause is **open**; RC-1's fix does not close it.
+| node | role | last_index | applied | matched (leader view) | `_deploy/current` |
+|---|---|---|---|---|---|
+| 1 | leader | 107 | **107** (term 167) | — | OLD |
+| 2 | follower | 107 | — | 107, active | **fix** |
+| 3 | follower | 107 | — | 107, active | OLD |
+
+- **Leader apply-drift REFUTED.** node 1 (leader) `applied_idx = 107 = last_index`
+  — fully applied. Its store is OLD because *its log yields OLD* at the deploy
+  index (the fix write is not the live value in node 1's log).
+- **term = 167 at index 107** — ~1.5 terms/entry: massive leadership churn
+  (rolling restarts + hibernation re-elections) — the environmental amplifier.
+- `matched=107` for both peers only proves identical log **length**, and
+  `applied-baseline` is **leader-gated**, so **node 2's / node 3's `applied_idx`
+  and their log *contents* are unknown** from the current endpoints.
+
+**Established:** a committed+verified write (`_deploy/current=fix`, served live)
+was LOST across a leader change — node 2 holds it, the (now-leader) node 1 and
+node 3 do not, all at the same converged log length. This is the incident-memory
+description, now confirmed against live state.
+
+**NOT yet distinguished — two candidate sub-cases (both serious):**
+- **(A) Orphaned speculative fold** — node 2's *log* == OLD (same as the leader),
+  but node 2's *store* = fix is a fold that was never rolled back when node 2's
+  log entry was replaced on a leader change. Store ≠ log. This is the broad
+  speculative-overlay-survives-truncation hazard (alignment doc OPEN item, the
+  same invariant RC-1 lives under) via the leader-change path. Requires node 2 to
+  have folded a write that wasn't truncation-safe → a **premature/false commit**
+  (a non-majority or non-fsynced ack counted — plausibly **fence-induced, RC-2**,
+  during a term change; if so the commit-accounting "correct" verdict has a hole
+  under fencing/churn), or a follower acking pre-fsync that didn't survive its
+  restart.
+- **(B) Divergent committed logs** — node 2's *log* actually = fix at the deploy
+  index while node 1's = OLD, i.e. a committed entry differs across nodes. That
+  is a raft **election-safety violation** (more serious than A), with `matched`
+  reporting a false-identical prefix.
+
+Distinguishing A from B requires node 2's **log entry content** at the deploy
+index (and node 2/3 `applied_idx`) — which no endpoint exposes today. The
+inference "node 2's store is an orphan" is only valid in case A; do not assert it
+until the log content is read.
+
+**Decisive next step (no endpoint exposes log-entry content today):** a READ-ONLY
+diagnostic — read each node's raft log entry by index (term + decoded envelope
+key/value) + the durable applied watermark — deployed controlled-delta, to (1)
+confirm node 2's log[deploy-index] == OLD (orphan confirmed, not divergent logs),
+and (2) find the term where fix→OLD flipped, then reconstruct that term's
+election / commit / fence sequence. Alternative without a deploy: read + decode
+node 2's on-disk WAL for the `_deploy/current` entries.
+
+Until that runs, the precise sub-mechanism is **open**; the *class* (orphaned
+speculative fold on leader change) is established. The general hardening is the
+speculative-overlay invariant (decisions §10.5 / the alignment doc's OPEN item):
+the durable fold must be truncation-safe, OR rollback-on-truncation must exist —
+the same invariant RC-1 lives under, now shown to bite via the leader-change path
+too, independent of catch-up.
 
 ## The architectural invariant (the acceptance criterion)
 
