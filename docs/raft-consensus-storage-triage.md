@@ -123,8 +123,9 @@ that index — never a separately-read live `applied_idx`. This is TiKV's
 shape (snapshot metadata index == the state machine's applied index *as
 snapshotted*). It also removes the trigger-vs-run time skew entirely.
 
-**STATUS: FIX LANDED + unit-verified (commit `0fcaa73`); 3-node integration
-smoke still pending before this is fully closed.** The baseline source
+**STATUS: CLOSED — fix landed (`0fcaa73`), deterministic unit gate green, and a
+3-node end-to-end convergence smoke green through the real out-of-band path.**
+The baseline source
 (`Node.baselineIndex`, formerly `appliedIndex`, every caller a baseline source)
 now returns `slot.durabilized_idx` — the folded watermark `≤` the snapshot
 content by construction, and still `snapshot_grace` entries above the compaction
@@ -138,12 +139,23 @@ floor so the tail replicates. The inverted doc comment that justified
 index `≤ durabilized_idx`. RED on the old code (returned `applied_idx`), GREEN
 after the fix. `v2-test` + `rewind-worker` + `rewind-cp` build clean.
 
-**Still pending (the integration gate):** a 3-node smoke that drives continuous
-leader-local writes, forces a peer below the compaction floor to trigger
-catch-up, and asserts the peer's post-catch-up store contains **every** acked
-write up to its installed commit (no fork). The unit test proves the invariant at
-the seam; the smoke proves it end-to-end through the real catch-up path. Do not
-call RC-1 closed until that is green.
+**End-to-end smoke — LANDED + green:** `scripts/snapshot_catchup_no_fork_smoke_v2.py`.
+3-node cluster, `REWIND_SNAPSHOT_GRACE=20`; a follower is stranded past the
+compaction floor (gap ≫ grace), then recovers via the **real out-of-band
+baseline + snapshot stream** under a concurrent JS-handler churn (the
+worker_overlay write path). It then compares **every** acked distinct key on the
+recovered victim against the leader — a fork would show as a missing/stale key.
+Green on the fixed code over 1000+ keys, multiple runs, zero fork.
+
+**HONESTY — the smoke is convergence coverage, NOT a deterministic reproducer.**
+On the buggy code (`baselineIndex` → `applied_idx`) it did **not** fork in 3
+runs: the over-claim is `applied(trigger) − folded(openSnapshot)`, and folding
+usually catches up to `applied` by the time the driver opens the snapshot, so the
+window rarely lands at cluster scale (consistent with the prod fork being
+*intermittent*). The smoke therefore proves the catch-up path **converges with no
+fork**, but the **deterministic regression gate is the unit test** (which forces
+`applied > durabilized` by withholding the worker ack — red→green). Both are
+green; do not rely on the smoke alone to catch a regression here.
 
 #### Earlier verdict (superseded by the root cause above)
 
