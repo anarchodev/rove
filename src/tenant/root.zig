@@ -809,14 +809,40 @@ fn bytesToHex(src: []const u8, dst: []u8) void {
 
 // ── Validation ─────────────────────────────────────────────────────────
 
+/// Platform-reserved tenant ids (the `__name__` form). Exempt from the
+/// DNS-label spec below — they are internal singletons that never resolve as
+/// a public subdomain. Customers cannot create them: the `__…__` form fails
+/// DNS validation (underscores), and only these exact ids are exempted.
+const RESERVED_INSTANCE_IDS = [_][]const u8{
+    ADMIN_INSTANCE_ID,
+    REPLAY_INSTANCE_ID,
+    AUTH_INSTANCE_ID,
+};
+
+/// A DNS host label is capped at 63 octets, and an instance id may serve as
+/// a `{id}.<zone>` subdomain.
+const MAX_DNS_LABEL_LEN: usize = 63;
+
+/// Validate a tenant/instance id. Customer ids are locked to a DNS-label-safe
+/// spec — `^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$` — so an id can safely become
+/// a public subdomain: lowercase only (DNS is case-insensitive), no `_`
+/// (invalid in DNS host labels), no leading/trailing hyphen, ≤63 octets. This
+/// is the strictest plausible spec, locked pre-customer; loosening later is
+/// always safe, tightening is not (docs/format-versioning-audit.md §7.4).
+/// Platform-reserved `__…__` ids are exempted.
 fn validateInstanceId(id: []const u8) Error!void {
     if (id.len == 0 or id.len > MAX_INSTANCE_ID_LEN) return Error.InvalidInstanceId;
-    for (id) |b| {
+    for (RESERVED_INSTANCE_IDS) |r| {
+        if (std.mem.eql(u8, id, r)) return;
+    }
+    if (id.len > MAX_DNS_LABEL_LEN) return Error.InvalidInstanceId;
+    for (id, 0..) |b, i| {
         const ok = (b >= 'a' and b <= 'z') or
-            (b >= 'A' and b <= 'Z') or
             (b >= '0' and b <= '9') or
-            b == '-' or b == '_';
+            b == '-';
         if (!ok) return Error.InvalidInstanceId;
+        // No leading or trailing hyphen.
+        if (b == '-' and (i == 0 or i == id.len - 1)) return Error.InvalidInstanceId;
     }
 }
 
@@ -1102,13 +1128,31 @@ test "reopening a tenant finds existing instances on lazy resolve" {
     }
 }
 
-test "validateInstanceId rejects bad ids" {
+test "validateInstanceId enforces DNS-label-safe spec" {
     try testing.expectError(Error.InvalidInstanceId, validateInstanceId(""));
     try testing.expectError(Error.InvalidInstanceId, validateInstanceId("has space"));
     try testing.expectError(Error.InvalidInstanceId, validateInstanceId("with/slash"));
     try testing.expectError(Error.InvalidInstanceId, validateInstanceId("../evil"));
+    // Pre-customer tightening (§7.4): no uppercase, no underscore, no
+    // leading/trailing hyphen, ≤63 octets.
+    try testing.expectError(Error.InvalidInstanceId, validateInstanceId("ACME"));
+    try testing.expectError(Error.InvalidInstanceId, validateInstanceId("acme_v2"));
+    try testing.expectError(Error.InvalidInstanceId, validateInstanceId("-acme"));
+    try testing.expectError(Error.InvalidInstanceId, validateInstanceId("acme-"));
+    try testing.expectError(Error.InvalidInstanceId, validateInstanceId("-"));
+    try testing.expectError(Error.InvalidInstanceId, validateInstanceId("a" ** 64));
+    // Customers cannot squat the reserved `__…__` form.
+    try testing.expectError(Error.InvalidInstanceId, validateInstanceId("__evil__"));
+
+    // Valid customer ids.
+    try validateInstanceId("a");
     try validateInstanceId("acme");
-    try validateInstanceId("ACME-123_v2");
+    try validateInstanceId("acme-123");
+    try validateInstanceId("a" ** 63);
+    // Platform-reserved tenants are exempt from the DNS spec.
+    try validateInstanceId("__admin__");
+    try validateInstanceId("__auth__");
+    try validateInstanceId("__replay__");
 }
 
 test "authenticate matches root_token_secret" {
