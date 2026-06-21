@@ -82,9 +82,34 @@ RC-2** — stop the silent fence/drop that drives the election churn (the trigge
 **(2) the apply/fold truncation-safety invariant** — the store must be derivable
 from / rolled back to the committed log (the mechanism).
 
-**Operational note:** the divergence is still LIVE (leader node 1 serves OLD →
-login broken). Converging it needs a fresh `_deploy/current` write through the
-current leader (re-publish `__auth__`) — separate from the code fixes.
+**Operational note — HEALED 2026-06-20.** The divergence was converged by a
+fresh full re-publish (`rewind-ops deploy __auth__ web/auth --release` — NOT a
+bare `release` flip: the deploy *manifest* writes were truncated too, so all
+three nodes needed a fresh manifest+blobs+marker committed through the leader,
+not just a marker pointing at an absent manifest — that orphaned manifest is the
+`resolveDeployment failed: ResumeNoDeployment` seen in the journal). Post-heal:
+all three nodes serve `_deploy/current = 77d40f1…` at a converged `last_index=113`
+(2 fresh entries applied on all three), `https://auth.rewindjs.com/login → 200`.
+This is a state heal only — it does **not** close the code paths below, and a
+binary deploy (rolling restart) is itself the churn trigger, so the platform
+deploy must follow RC-2, not precede it.
+
+**Deployed-code reachability (the live question: can `ec527b2` still reach a
+premature fold?). Yes.** The fold gate is one line — `committed_seq` advances in
+`Bridge.onCommitted` off raft's commit hook — with NO independent rove-side check
+that a folded entry stays in the log; truncation-safety rests entirely on the
+engine's "committed" meaning "fsynced-majority, never-truncatable." Three
+reachable paths in the deployed binary: **(1)** an unidentified premature-commit
+path proven *by existence* (the `__auth__` orphan is real, yet RC-1 and the OOM
+path below don't fit its conditions → a third, unpinned path — suspect: engine
+commit-advance under fence/term churn, or worker_overlay leader-change apply
+asymmetry; reachable for ANY tenant under the fence storm that is prod's current
+normal); **(2)** the `awaiting_worker` OOM fall-through in `onCommitted` — **FIXED
+on this branch** (early-return on OOM instead of advancing `committed_seq`;
+fail-loud via `apply_err`); **(3)** RC-1 baseline over-claim — fix `0fcaa73` is
+**NOT in the deployed lineage** (`baselineIndex` still returns `applied_idx`),
+reachable for >compaction-grace / moved / reconciler-on tenants, dormant for
+`__auth__`.
 
 ## Incident root cause (earlier hypotheses — superseded by RESOLVED above)
 
@@ -174,9 +199,14 @@ node 2's on-disk WAL for the `_deploy/current` entries.
 Until that runs, the precise sub-mechanism is **open**; the *class* (orphaned
 speculative fold on leader change) is established. The general hardening is the
 speculative-overlay invariant (decisions §10.5 / the alignment doc's OPEN item):
-the durable fold must be truncation-safe, OR rollback-on-truncation must exist —
-the same invariant RC-1 lives under, now shown to bite via the leader-change path
-too, independent of catch-up.
+**the durable fold must be truncation-safe — full stop.** There is NO
+"rollback-on-truncation" alternative, and earlier drafts that hedged with one
+were wrong: by the model's central invariant a fold only fires for an entry that
+*cannot* roll back, so a needed fold-rollback is always proof the fold fired too
+early upstream (a premature/false commit), never a feature to build. The fix
+space is "make the gate provably truncation-safe," never "add a store undo path."
+This is the same invariant RC-1 lives under, now shown to bite via the
+leader-change path too, independent of catch-up.
 
 ## The architectural invariant (the acceptance criterion)
 

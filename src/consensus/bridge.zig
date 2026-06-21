@@ -1509,7 +1509,16 @@ pub const Bridge = struct {
             // PAST the entry. Surface it as a pump apply error instead.
             if (self.node.apply_mode == .worker_overlay and seq > sig.worker_acked_seq) {
                 sig.awaiting_worker.append(self.allocator, .{ .seq = seq, .idx = raft_index }) catch {
+                    // OOM recording this entry's durabilize-floor cap. We must
+                    // NOT fall through to advance `committed_seq`: the worker
+                    // folds on that watermark, and with the floor entry missing
+                    // durabilize/compaction can run PAST this entry → false
+                    // durability / premature fold (the exact unrepairable state
+                    // — a fold has no rollback by construction). Set the fatal
+                    // apply_err and bail; the pump aborts loudly before any
+                    // unsafe fold. (Triage RC-1: bridge-OOM fall-through.)
                     self.node.apply_err = node_mod.Error.OutOfMemory;
+                    return;
                 };
             }
             // Proposes are per-tenant FIFO so commits arrive in seq order;
