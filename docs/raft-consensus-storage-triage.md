@@ -474,23 +474,49 @@ Files: `src/consensus/node.zig` (worker_overlay skip ~1706-1799, two-pass pump
       `committed_seq` does **not** advance (early-return) and the durabilize
       floor stays capped.
 
-### RC-2 — Transport silently black-holes raft traffic; no `maybe_create_peer` (Bug B; the `__admin__` strand)
+### RC-2 — Transport silently black-holes raft traffic for a should-host group (Bug B; the `__admin__` strand)
 
-**Verdict: VERIFIED. Matches the prod evidence directly. High priority.**
+**Verdict: VERIFIED symptom. REFRAMED 2026-06-20 — the fix is the CP reconciler,
+NOT a transport-level `maybe_create_peer`.** Two of the three sub-fixes are
+already shipped; the naive form-or-buffer is unsafe and would not even reach the
+strand.
 
 `stepBatch` drops inbound messages for an unknown or epoch-fenced group
-(`transport.zig:346`), and the per-node group record is **best-effort**:
-`node.zig:901` records the group with the explicit note "a manifest failure must
-not abort a working group," and the groups-manifest store is not on the
-durabilize path — so a hard crash loses a non-genesis group's record, and on
-restart the node drops that tenant's raft traffic **forever**, degrading quorum
-to N-1 with only a rate-limited aggregate warning that does not even name the
-group. There is no equivalent of TiKV's `maybe_create_peer` (an inbound
-vote/heartbeat/append for a group a node *should* host creates or buffers the
-peer rather than dropping it).
+(`transport.zig:346`). Originally read as needing a TiKV-style `maybe_create_peer`
+(form the group from an inbound message). **That form-or-buffer is UNSAFE and
+WRONG here, and we are NOT building it:**
+- **Unsafe (resurrection):** a node receiving a message for an unknown group
+  (local epoch 0) cannot distinguish "a group I host but missed the attach for"
+  from "a group that MOVED AWAY from me" (a stale-epoch straggler). Forming
+  speculatively at the message's epoch can resurrect a moved-away tenant on the
+  wrong cluster — a consistency violation strictly worse than the silent drop.
+  Only the CP knows the authoritative placement+epoch, and the pump/recv thread
+  must not block on a CP query. (Lifecycle audit 2026-06-20.)
+- **Wrong target:** it would not fix the `__admin__` strand. Live state confirms
+  node 3 is genuinely never-added (`n1/n2 confstate {1,2}`, n3 = "no conf state",
+  `last_index = 0`, term 258). Since node 3 is not in the leader's confstate, the
+  leader never SENDS to it — so no inbound message ever arrives to trigger
+  forming. A non-member cannot self-heal from traffic it never receives.
 
-Directly explains node 3 `__admin__` at `last_index = 0` serving a stale store,
-and the per-restart `skipped … unknown group / fenced` journal warnings.
+**What is already done (do not redo):**
+- **Durable group record** — `recordGroup` now `put`s + `checkpoint()`s (an
+  fsync) so a crashed node's groups survive restart and re-attach via
+  `recoverGroups`. Landed `9ded66d`, deployed in `ec527b2`. (This is the crash-
+  loss half the original RC-2 text described as missing — it is fixed.)
+- **Per-group named alarm** — a `stepBatch` skip now logs each entry's
+  `gid + msg_epoch + local_epoch + sender + reason`
+  (fenced / unknown-group? / undecodable). Landed `0528e52`, deployed.
+
+**The real remaining fix = RC-6 (enable the reconciler), not a transport change.**
+The SAFE, authoritative form-or-buffer already exists: the CP membership
+reconciler (`reconcileMembership`/`ensureMember`, `cp/main.zig`) reads the
+directory (the truth), observes that node 3 is absent from `__admin__`, and
+bootstraps it via `v2-attach` at the correct epoch → learner → promote. It is
+**OFF in prod** (`REWIND_CP_RECONCILE_MEMBERSHIP` unset) only because of RC-6's
+demote-on-transient hazard. So: **harden RC-6 (never demote a transiently-
+unreachable voter; prefer the add-direction), then enable it** — that heals the
+node-3 `__admin__` strand and turns the transport silent-drop into a self-healing
+condition. See RC-6.
 
 Sub-findings (same subsystem, lower severity):
 - `transport.zig:316/321` — a truncated coalesced frame `break`s the parse loop,
@@ -504,14 +530,15 @@ Files: `src/consensus/transport.zig` (onRecv/stepBatch 305-361),
 ~760-901).
 
 **Reproducing-test checklist (RC-2):**
-- [ ] Form a group on 3 nodes; SIGKILL one; confirm its group record survives
-      restart (it must be durable, or recovered from the WAL ConfState) and the
-      group re-attaches. Today it can be lost.
-- [ ] On inbound raft traffic for a group this node should host (it is in the
-      cluster voter set) but does not have, form-or-buffer the group instead of
-      dropping. Assert quorum returns to N without operator action.
-- [ ] Per-group loud alarm when a node drops traffic for a group it should host
-      (silent quorum degradation must fail loud).
+- [x] Form a group on 3 nodes; SIGKILL one; confirm its group record survives
+      restart and the group re-attaches. **DONE** — `recordGroup` checkpoint fsync
+      (`9ded66d`); the record is durable, `recoverGroups` re-stands it up.
+- [x] Per-group loud alarm when a node drops traffic (named fence drops,
+      `0528e52`).
+- [ ] ~~Form-or-buffer from an inbound message~~ — **REJECTED as unsafe** (stale-
+      epoch resurrection; cannot reach a non-member). Replaced by RC-6: enable the
+      hardened reconciler and assert it re-adds an absent voter (node 3 → group)
+      without operator action and never demotes a transiently-unreachable voter.
 - [ ] Coalesced-frame test: corrupt one record mid-batch; assert only that
       record is dropped, the rest still step.
 
