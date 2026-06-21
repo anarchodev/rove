@@ -1876,3 +1876,49 @@ pub fn main() !void {
     }
     std.log.info("rewind-cp: shut down", .{});
 }
+
+// ── RC-6 demote hysteresis ───────────────────────────────────────────────────
+
+test "RC-6: demote needs sustained inactivity — a recovery before the grace resets it" {
+    const a = std.testing.allocator;
+    // Only the demote-timer fields are exercised by demoteGraceElapsed /
+    // clearDemoteTimer; the rest of Router is never touched here.
+    var r: Router = undefined;
+    r.allocator = a;
+    r.demote_inactive_since = .empty;
+    defer {
+        var it = r.demote_inactive_since.iterator();
+        while (it.next()) |e| a.free(e.key_ptr.*);
+        r.demote_inactive_since.deinit(a);
+    }
+
+    // grace 0: the SECOND consecutive inactive observation is already past the
+    // window. Even so, a demote NEVER fires on the FIRST observation — a single
+    // !recent_active reading is always treated as a transient.
+    r.demote_grace_ns = 0;
+
+    // SUSTAINED candidate (the genuinely-stuck voter): obs #1 starts the timer
+    // (no demote), obs #2 is past the (zero) grace → demote. This proves the
+    // mechanism still demotes a real stuck voter.
+    try std.testing.expect(!r.demoteGraceElapsed("stuck", 2)); // obs #1 — never on first sight
+    try std.testing.expect(r.demoteGraceElapsed("stuck", 2)); // obs #2 — sustained → demote
+
+    // TRANSIENT-THEN-RECOVER (the rolling-restart hazard): SAME grace (0), SAME
+    // two inactive observations — but the voter RECOVERS (timer cleared) in
+    // between, so the post-recovery observation is a fresh "first" and must NOT
+    // demote. The recovery is the only difference from the sustained case above,
+    // and it flips the outcome demote → no-demote.
+    try std.testing.expect(!r.demoteGraceElapsed("flap", 3)); // obs #1 inactive (transient)
+    r.clearDemoteTimer("flap", 3); //                            recovered: recent_active again
+    try std.testing.expect(!r.demoteGraceElapsed("flap", 3)); // obs after recovery — NOT demoted
+
+    // Distinct (tenant,node) keys never share a window.
+    try std.testing.expect(!r.demoteGraceElapsed("flap", 4)); // different node → own fresh timer
+    try std.testing.expect(!r.demoteGraceElapsed("other", 3)); // different tenant → own fresh timer
+
+    // A real (non-zero) grace never demotes within the window, across repeated
+    // observations — a voter inactive for < grace is left a voter.
+    r.demote_grace_ns = 60 * std.time.ns_per_s;
+    try std.testing.expect(!r.demoteGraceElapsed("slow", 5));
+    try std.testing.expect(!r.demoteGraceElapsed("slow", 5)); // still within 60s → no demote
+}

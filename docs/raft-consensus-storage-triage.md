@@ -632,11 +632,16 @@ Files: `src/cp/main.zig` (`ensureMember` demote branch + `demoteGraceElapsed` /
       `membership_reconciler_smoke_v2.py` runs with `REWIND_CP_DEMOTE_GRACE_MS=1000`
       and still demotes a permanently-stuck voter (it stays inactive across the
       window), proving the path lands a pass later, not instantly.
-- [ ] **Transient-unreachable voter (rolling restart) under an enabled reconciler;
-      assert it is NOT demoted** — the direct hazard test: a voter that goes
-      `!recent_active` for < grace then recovers must keep its timer cleared and
-      never lose voting power. Land this before flipping
-      `REWIND_CP_RECONCILE_MEMBERSHIP=1` in prod.
+- [x] **Transient-then-recover voter is NOT demoted** — the direct hazard test,
+      deterministic (`rewind-cp-test`, `src/cp/main.zig`): with the SAME grace and
+      the SAME two `!recent_active` observations, a `clearDemoteTimer` (recovery)
+      in between flips the outcome demote→no-demote, while the continuously-inactive
+      case demotes. An e2e smoke is intentionally avoided here: a fully-stopped node
+      hits the `host == .unknown` guard (never demoted anyway), and the only true
+      reachable-but-`!recent_active` window is the sub-second post-restart race —
+      too flaky for a gate. The invariant lives in the timer logic; that is tested
+      directly. (The `membership_reconciler_smoke_v2.py` with grace=1s remains the
+      end-to-end coverage that a genuinely-stuck voter still demotes + heals.)
 
 ---
 
