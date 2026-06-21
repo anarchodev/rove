@@ -604,22 +604,39 @@ Files: `src/cp/main.zig` (`handleMoveLive` ~1026-1101, `handleProvision`
 - [ ] Wrong-length-but-CRC-valid compaction marker; assert loud reject, not
       silent skip.
 
-### RC-6 — Demote-on-transient (CP reconciler) — DORMANT
+### RC-6 — Demote-on-transient (CP reconciler) — HARDENED (still gated off)
 
-**Verdict: real but disabled in prod; gate before enabling.**
+**Verdict: real; demote path HARDENED 2026-06-20; reconciler still off in prod
+pending the end-to-end gate + a deliberate enable.** This is the gating fix for
+the RC-2 reframe (the reconciler is the safe authoritative form-or-buffer).
 
-`ensureMember` can demote a voter judged not-`recent_active`; a rolling restart
-makes a healthy voter transiently unreachable, and a stale `recent_active`
-reading could shrink the voter set (enabling sub-majority commit — RC-1's
-trigger by another route). The reconciler is **off** in prod, so this did not
-cause today's incident, but it must be hardened before
-`REWIND_CP_RECONCILE_MEMBERSHIP=1` is ever set.
+`ensureMember` demoted a voter on a SINGLE `!recent_active` reading; a rolling
+restart makes a healthy voter transiently unreachable, so a one-shot demote could
+shrink the voter set (enabling sub-majority commit — RC-1's trigger by another
+route). **Fix:** demote now requires SUSTAINED inactivity. A demote candidate's
+first `!recent_active` observation starts a per-`tenant|node_id` grace timer; the
+demote fires only after it has stayed continuously inactive for
+`demote_grace_ns` (default **60s**, > a worker restart + group recover; tunable
+via `REWIND_CP_DEMOTE_GRACE_MS`). Any other observed state — responsive again, or
+no longer a hosted voter — clears the timer, so a long-ago transient can never
+carry into a later window. The existing guards remain: never mutate on a probe
+failure (`host == .unknown`), and `ConfChangeQuorumGuard` refuses any change
+below 2 voters.
 
-Files: `src/cp/main.zig` (`ensureMember` ~1286-1301).
+Files: `src/cp/main.zig` (`ensureMember` demote branch + `demoteGraceElapsed` /
+`clearDemoteTimer` + `demote_grace_ns`/`demote_inactive_since` on `Router`).
 
 **Reproducing-test checklist (RC-6):**
-- [ ] Transient-unreachable voter (rolling restart) under an enabled reconciler;
-      assert it is **not** demoted (only a genuinely stuck/partitioned voter is).
+- [x] Demote requires a SECOND observation past the grace (never on first sight) —
+      unit-level logic verified by construction; the end-to-end
+      `membership_reconciler_smoke_v2.py` runs with `REWIND_CP_DEMOTE_GRACE_MS=1000`
+      and still demotes a permanently-stuck voter (it stays inactive across the
+      window), proving the path lands a pass later, not instantly.
+- [ ] **Transient-unreachable voter (rolling restart) under an enabled reconciler;
+      assert it is NOT demoted** — the direct hazard test: a voter that goes
+      `!recent_active` for < grace then recovers must keep its timer cleared and
+      never lose voting power. Land this before flipping
+      `REWIND_CP_RECONCILE_MEMBERSHIP=1` in prod.
 
 ---
 

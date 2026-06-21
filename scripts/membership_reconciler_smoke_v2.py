@@ -42,6 +42,13 @@ from pathlib import Path
 # Enable the reconciler + run it often, BEFORE the lib spawns the CP (env-inherited).
 os.environ["REWIND_CP_RECONCILE_MEMBERSHIP"] = "1"
 os.environ["REWIND_CP_RECONCILE_SECS"] = "2"
+# RC-6 demote hysteresis: a demote now requires SUSTAINED inactivity past a grace
+# window (default 60s, to ride out a rolling restart). Shrink it here so the smoke
+# still demotes a permanently-stuck voter promptly — it stays inactive across the
+# window, so a small grace proves the path without a 60s wait. (Also exercises the
+# new "never demote on the first observation" property: the demote lands a pass
+# later, not on first sight.)
+os.environ["REWIND_CP_DEMOTE_GRACE_MS"] = "1000"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET  # noqa: E402
