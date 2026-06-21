@@ -179,7 +179,7 @@ pub const GroupSig = struct {
 /// one, enqueues a pointer, and blocks on `done` until the pump has
 /// executed it and stamped `err` — so the struct outlives the wait.
 const ControlCmd = struct {
-    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term, last_index, baseline_index, applied_raw, durabilized_raw, log_entry, group_epoch };
+    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, transfer_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term, last_index, baseline_index, applied_raw, durabilized_raw, log_entry, group_epoch };
     kind: Kind,
     gid: u64,
     /// Borrowed from the gid's `GroupSig.id_str` (pointer-stable); used by
@@ -803,6 +803,16 @@ pub const Bridge = struct {
         return cmd.count;
     }
 
+    /// Diagnostic/test: force a leadership handoff of ONE group to its most
+    /// caught-up follower (no-op if this node is not its leader). Returns 1 if a
+    /// handoff was initiated, else 0. Drives the churn soak's leadership flips.
+    pub fn transferLeadership(self: *Bridge, gid: u64) usize {
+        if (self.node.isSingleNode()) return 0;
+        var cmd: ControlCmd = .{ .kind = .transfer_leadership, .gid = gid };
+        self.runControl(&cmd) catch return 0;
+        return cmd.count;
+    }
+
     /// Operator-triggered membership change on `gid`'s group (conf_change Phase 1):
     /// `cc_type` 0 = add voter / promote, 1 = remove, 2 = add learner / demote.
     /// Runs on the pump (the only Manager toucher); leader-gated + quorum-guarded
@@ -1066,6 +1076,13 @@ pub const Bridge = struct {
                     for (gids.items) |gid| {
                         if (self.node.transferLeadershipAway(gid) != null) cmd.count += 1;
                     }
+                    break :blk null;
+                },
+                .transfer_leadership => blk: {
+                    // Diagnostic/test: force a leadership handoff of ONE group to
+                    // its most caught-up follower (no-op if not the leader). Used by
+                    // the churn soak to flip leadership under in-flight writes.
+                    cmd.count = if (self.node.transferLeadershipAway(cmd.gid) != null) 1 else 0;
                     break :blk null;
                 },
             };
