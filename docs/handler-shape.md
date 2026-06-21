@@ -751,7 +751,35 @@ registry, runtime config injection) is post-launch.
 The validator lives in `rove-files` (`app_manifest.zig`); see the
 self-hosters marketplace plan for the consuming side.
 
-## 9. What's gone (vs prior streaming revisions)
+## 9. Reserved for the platform (names you must not use)
+
+Pre-customer, the platform claims these namespaces so it can grow the surface
+later without colliding with anything a handler already relies on. Reserving a
+name now is free; reclaiming one after handlers depend on it is a breaking
+change (Hyrum's law). See `format-versioning-audit.md` §7.1/§7.3/§7.6.
+
+- **Export names.** Handlers dispatch by export name (§3). The `on*` prefix is
+  the activation-handler namespace; `onError` / `onPanic` are specifically
+  reserved for a future uncaught-exception callback (§12 open question; today a
+  throw → runtime 500). Don't export `onError`/`onPanic` for your own use.
+- **Effect option keys.** Every effect options object (`on.fetch`,
+  `webhook.send`, `http.subscribe`, `blob.*`, `email.send`, …) reserves keys
+  beginning with `$` for future platform directives (e.g. a `$rewind` hint
+  block). Unknown keys are ignored today — keep your own option keys to plain
+  identifiers so a future platform directive can't collide with them.
+- **`request.*` fields.** The request object reserves the `request.rewind`
+  namespace for future platform-provided per-activation metadata. Your own
+  per-chain state lives on `request.ctx` (your shape, threaded via `next({ctx})`).
+- **`kv` keys.** Any leading-`_` key is platform-reserved (§2.5;
+  `format-versioning-audit.md` §7.1). Customer keys use the non-`_` space.
+- **HTTP headers.** `x-rewind-*` and `x-rove-internal-*` are stripped from the
+  inbound `request.headers` and rejected from responses
+  (`format-versioning-audit.md` §7.3). `x-rove-correlation-id` is the one
+  platform-set header you may read.
+- **Reserved identities.** The `__name__` tenant form (`__admin__`, `__auth__`,
+  `__replay__`) and `__system/*` module paths are platform-only.
+
+## 10. What's gone (vs prior streaming revisions)
 
 - `request.activation.kind` switch → runtime dispatches by export name
 - `__rove_stream({…})` / the `stream` **return verb** → `stream.start()`
@@ -766,7 +794,7 @@ self-hosters marketplace plan for the consuming side.
 - `ctx.state` scratchpad → forbidden; durable state in `kv`, ephemeral
   connection state in `ctx`
 
-## 10. What's unchanged
+## 11. What's unchanged
 
 - The engine model: pure function per activation, arena reset between
   activations, no closure smuggling
@@ -780,7 +808,7 @@ self-hosters marketplace plan for the consuming side.
 - The substrate: blob coordinator, readset replication, content-
   addressed extents; the 64 KiB internal coalesce budget
 
-## 11. Open questions
+## 12. Open questions
 
 1. **`stream.*` / `on.*` as ambient namespaces vs imports.** Current:
    `stream`/`on`/`kv`/`response` are ambient (effects/state); only `next`
@@ -795,7 +823,7 @@ self-hosters marketplace plan for the consuming side.
 4. **`default` vs `onInbound`.** Keep `default` for the familiar simple
    case; alias to `onInbound` internally.
 
-## 12. Relation to other plans
+## 13. Relation to other plans
 
 - `effect-algebra.md` §6 — the scope model; §6.3 `bind`/`detach`
   retirement; §6.4 watch-before-write; §6.5 "grammar position = scope."

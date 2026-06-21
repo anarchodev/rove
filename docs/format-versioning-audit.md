@@ -511,6 +511,23 @@ fields are ignored), so additive growth is safe. The reservations to make now:
 10. The Part I format version bytes / `src/version.zig` registry + the
     `js_engine_version` stamp (Part I §6, Phases 0–1).
 
+> **SHOULD STATUS (2026-06-20).**
+> - **7 DONE** — handler-shape.md §9 "Reserved for the platform": export names
+>   (`onError`/`onPanic`, `on*`), `$`-prefixed effect option keys,
+>   `request.rewind.*`, plus cross-refs to the kv / header / identity
+>   reservations. Doc-only (the names are unused today; reserving = documenting
+>   so a future feature can claim them without breaking handlers).
+> - **9 PARTIAL** — service-JWT payload now carries `"v":1` (`7bf2528`). The
+>   `kid` + N-secret rotation window (the valuable half) is deferred; these
+>   tokens are internal + ~5-min, so versioning value is modest.
+> - **6 / 8 / 10 — OPEN, need direction:** 6 (ID prefixing) hinges on *how* to
+>   hide `worker_id` (reversible encoding still leaks it; true hide needs an
+>   opaque/derived id, which trades off log-lookup-ability) and touches the
+>   deploy API + smokes; 8 (subdomain reservation) needs the public-zone model
+>   (`*.rewindjs.app`?); 10 is the directly-requested **js-engine-version**
+>   stamp + format version-bytes — a multi-file vertical slice best done as its
+>   own focused effort (Part I §6).
+
 **DECIDED (2026-06-18):**
 - KV: blanket leading-`_` reservation (§7.1), not the single-`_rove/`-prefix
   variant.
