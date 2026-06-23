@@ -1,10 +1,20 @@
 ---
 title: Format & Protocol Versioning Audit (pre-launch)
-status: draft — audit complete, decisions pending
+status: in progress — all 5 MUST landed (smoke-verified); SHOULD 7/8 done, 6/9 partial; item-10 slice remains
 date: 2026-06-18
+updated: 2026-06-23
 ---
 
 # Format & Protocol Versioning Audit
+
+> **Resume note (2026-06-23).** Implementation lives on the unmerged worktree
+> branch `worktree-docs+format-versioning-audit` (do **not** merge/deploy — other
+> deploy work is in flight). Status of every item is in §8. All 5 MUST items and
+> SHOULD 7/8 are landed; 6/9 are partial. The one remaining focused effort is the
+> **item-10 slice** (Part I format version-bytes + js-engine-version stamp +
+> the item-6 `req_`/`dep_` prefix), which needs a coordinated dev-data wipe —
+> start it as its own dedicated run. See §8 and `src/qjs/snap.zig` /
+> `src/tape/root.zig` / `web/replay/_static/rtap.mjs`.
 
 Pre-launch sweep of every wire protocol, on-disk format, and persisted
 key-schema in `rove`, with the current versioning status of each and a
