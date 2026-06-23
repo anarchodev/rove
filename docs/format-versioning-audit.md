@@ -511,22 +511,31 @@ fields are ignored), so additive growth is safe. The reservations to make now:
 10. The Part I format version bytes / `src/version.zig` registry + the
     `js_engine_version` stamp (Part I §6, Phases 0–1).
 
-> **SHOULD STATUS (2026-06-20).**
+> **SHOULD STATUS (2026-06-23).**
 > - **7 DONE** — handler-shape.md §9 "Reserved for the platform": export names
 >   (`onError`/`onPanic`, `on*`), `$`-prefixed effect option keys,
->   `request.rewind.*`, plus cross-refs to the kv / header / identity
->   reservations. Doc-only (the names are unused today; reserving = documenting
->   so a future feature can claim them without breaking handlers).
-> - **9 PARTIAL** — service-JWT payload now carries `"v":1` (`7bf2528`). The
->   `kid` + N-secret rotation window (the valuable half) is deferred; these
->   tokens are internal + ~5-min, so versioning value is modest.
-> - **6 / 8 / 10 — OPEN, need direction:** 6 (ID prefixing) hinges on *how* to
->   hide `worker_id` (reversible encoding still leaks it; true hide needs an
->   opaque/derived id, which trades off log-lookup-ability) and touches the
->   deploy API + smokes; 8 (subdomain reservation) needs the public-zone model
->   (`*.rewindjs.app`?); 10 is the directly-requested **js-engine-version**
->   stamp + format version-bytes — a multi-file vertical slice best done as its
->   own focused effort (Part I §6).
+>   `request.rewind.*`, plus the platform-identifiers-are-opaque contract and
+>   cross-refs to the kv / header / identity reservations. Doc-only (reserving =
+>   documenting so a future feature can claim it without breaking handlers).
+> - **8 DONE** `5ffd2a8` — `validateInstanceId` denies a curated set of
+>   platform/infra subdomain labels (auth/api/app/admin/www/…), so a customer
+>   can't claim `{label}.<zone>` via the wildcard route. `acme` deliberately
+>   left available (example-tenant convention; ACME label is `_acme-challenge`).
+> - **9 PARTIAL** `7bf2528` — service-JWT payload carries `"v":1`. The `kid` +
+>   N-secret rotation window (the valuable half) is deferred; tokens are
+>   internal + ~5-min, so versioning value is modest.
+> - **6 PARTIAL** — DECIDED "prefix + document opaque." The *document-opaque*
+>   half landed (handler-shape.md §9: platform ids are opaque, don't parse —
+>   this is the part that preserves our freedom to change them). The `req_`/`dep_`
+>   prefix itself is **all-or-nothing across surfaces** (deployment_loader.zig,
+>   web/admin JS deploy app, trigger_dispatch.zig `request.actor`, log-server
+>   indexer+flush_writer query/`/show/{id}`, CLI, + several smokes that assert
+>   bare hex), so it's a focused cross-cutting effort — bundle with item 10.
+> - **10 — REMAINING FOCUSED EFFORT (full slice, DECIDED):** the js-engine-version
+>   stamp where replay reads it lives in the replicated tape/readset
+>   (READSET_VERSION 6→7 + rtap.mjs mirror + dev-data wipe), coupled to the
+>   Part I format-version-bytes Phase 1 (entry frame, envelope codec, transport
+>   frame byte, cert packing). The natural next dedicated effort.
 
 **DECIDED (2026-06-18):**
 - KV: blanket leading-`_` reservation (§7.1), not the single-`_rove/`-prefix

@@ -778,6 +778,15 @@ change (Hyrum's law). See `format-versioning-audit.md` §7.1/§7.3/§7.6.
   platform-set header you may read.
 - **Reserved identities.** The `__name__` tenant form (`__admin__`, `__auth__`,
   `__replay__`) and `__system/*` module paths are platform-only.
+- **Platform identifiers are opaque.** Treat every platform-issued id —
+  `request.actor.request_id`, a deployment id, a fetch/subscription id, a
+  session id — as an opaque token. Compare it for equality and pass it back
+  verbatim where an API expects it, but do **not** parse, decode, slice, or
+  assume an ordering/structure: the encoding (length, charset, any embedded
+  fields such as the node that minted it) is an internal detail that may change.
+  The platform will move these to type-prefixed forms (`req_…`, `dep_…`); a
+  handler that depends on the bare-hex shape will break (`format-versioning-audit.md`
+  §7.5).
 
 ## 10. What's gone (vs prior streaming revisions)
 
