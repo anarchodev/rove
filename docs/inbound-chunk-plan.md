@@ -7,8 +7,15 @@
 > (the 1 MB ceiling), §5.3 (worked example), §7 (`request` fields).
 > Design constraint held: rides the shipped `blob.receive` transport
 > (`BodyMode.sink` + drained-repay flow control, `src/h2/root.zig`) —
-> **zero new h2 surface.** See "Remaining work" below for what keeps
-> this plan in-flight.
+> **zero new h2 surface.**
+>
+> **COMPLETE (2026-06-24).** All slices, the front-door / h1 streaming
+> follow-ups, and the final client-abort teardown smoke are shipped —
+> the gap is fully closed (see "Remaining work" below). The doc would
+> fold-and-delete per the docs lifecycle, but it is the cited `S2`
+> design reference for ~9 source files (`worker_inbound_chunk.zig`,
+> `worker_drain.zig`, …) with no equivalent anchor in `architecture/`,
+> so it is **retained in place as that reference** rather than deleted.
 
 ## The contract being wired (from handler-shape.md)
 
@@ -116,7 +123,7 @@ body inbound → respond + `flipInboundBodyToDiscard` (exists).
   their path. Smoke step 7 asserts 50+ chunk records queryable via
   log-server with both tape forms present.
 
-## Remaining work (keeps this plan in-flight)
+## Remaining work (all closed 2026-06-24)
 
 - ~~**Front door.**~~ Shipped 2026-06-11: the front-door streaming
   proxy (`src/front/proxy.zig`) forwards h2 request bodies as they
@@ -129,9 +136,18 @@ body inbound → respond + `flipInboundBodyToDiscard` (exists).
   upload multi-fires `onChunk` worker-direct AND through the front;
   `scripts/h1_streaming_smoke_v2.py`. See
   `architecture/routing-and-ingress.md` (HTTP/1.1 ingress).
-- **Client-abort smoke.** Mid-upload disconnect exercises the
-  sink-abort + held-chain disconnect teardown; covered by code paths
-  shared with WS/streaming but not yet asserted end-to-end.
-- When these close, fold-and-delete per the docs lifecycle
-  (mechanics → `architecture/effects-and-handlers.md`, why →
-  `decisions.md`).
+- ~~**Client-abort smoke.**~~ Shipped 2026-06-24
+  (`scripts/inbound_chunk_smoke_v2.py` step 8). A rate-limited >cap
+  upload is severed mid-stream (client disconnect while the body is
+  still inbound) and the assertions prove `BodySink.abort` tears down
+  the held chunk chain: the per-upload kv counter advances while
+  inbound, then **freezes** at the disconnect (no fire drains after the
+  socket closed), and the worker stays responsive (a fresh full upload
+  still streams + completes). `sinkAbort` sets `aborted`, which gates
+  `fireReady`/`prepareFires` so the chain stops — the smoke asserts that
+  behaviour rather than scraping a log line.
+- **All tails closed (2026-06-24).** Mechanics live in
+  `architecture/effects-and-handlers.md` + `routing-and-ingress.md`;
+  the why is in `decisions.md` §3.5. The plan is **not** deleted (the
+  fold-and-delete lifecycle): it is the cited `S2` reference for ~9
+  source files, so it stays as that anchor.

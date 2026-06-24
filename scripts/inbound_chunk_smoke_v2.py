@@ -17,6 +17,11 @@ front-door streaming proxy landed 2026-06-11):
   4. classic cap: a default-only module + a > cap body → 413
   5. early terminal: an onChunk module that rejects on the first chunk
      answers while the body is still inbound
+  8. client abort mid-upload: a throttled >cap upload severed while the
+     body is still inbound — the held chunk chain sink-aborts (fires
+     stop, counter stays put) and the worker stays responsive (a fresh
+     full upload still completes). Closes the last "Remaining work" tail
+     of `docs/inbound-chunk-plan.md`.
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
 Ports: http_base=19500 (see the per-smoke port table convention).
@@ -26,7 +31,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -72,6 +79,26 @@ export default function () {
   return "classic:" + request.body.length;
 }
 """
+
+
+def _upload_proc(c, path, host, upl, body_file, rate="1500k"):
+    """POST a rate-limited body DIRECT to the node, streaming to a PIPE.
+    We kill this process mid-upload (while the request body is still
+    inbound) to simulate a client disconnect — the worker-side
+    `BodySink.abort` must tear down the held chunk chain. `--limit-rate`
+    paces the body over the wire so there is a real mid-stream window."""
+    url = f"{c.node_url()}{path}"
+    args = [
+        "curl", "-sS", "--http2-prior-knowledge",
+        "--limit-rate", rate,
+        "-H", f"Host: {host}",
+        "-H", f"x-upl: {upl}",
+        "--max-time", "120",
+        "-D", "-", "-o", "-", "-X", "POST",
+        "--data-binary", f"@{body_file}",
+        url,
+    ]
+    return subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 def main() -> int:
@@ -213,6 +240,82 @@ def main() -> int:
         check("both tape forms present (inline ≤16K + BodyRef >16K)",
               inline_seen and ref_seen,
               f"inline={inline_seen} ref={ref_seen}")
+
+        # ── step 8: client abort mid-upload → BodySink.abort tears down
+        # the held chunk chain. The body must cross the 4 MB cap so it is
+        # firing per-chunk (sub-cap accumulates and single-fires on EOF,
+        # which an abort would simply discard — no held chain to tear).
+        # Each fire commits `upl/abort`++ via raft, so the durable counter
+        # is the observable: it advances while inbound, then FREEZES at the
+        # abort (no fire drains after the socket closed), and the worker
+        # stays live for the next upload.
+        print("step 8: ⭐ client abort mid-upload — sink-abort tears down the chain")
+
+        def read_count():
+            g = c.admin_kv_get("acme", "upl/abort")
+            if g.status != 200:
+                return 0
+            try:
+                return int(g.body.strip())
+            except ValueError:
+                return 0
+
+        tmp = tempfile.NamedTemporaryFile(prefix="ichunk-abort-", delete=False)
+        try:
+            tmp.write(os.urandom(24 * 1024 * 1024))  # ≫ 4 MB cap; ~16 s at 1500k
+            tmp.flush()
+            tmp.close()
+            host = c.host_for("acme")
+            proc = _upload_proc(c, "/up", host, "abort", tmp.name)
+            # Wait until chunk fires begin committing mid-upload (counter
+            # crosses the cap), then sever — proving we abort a *held* chain,
+            # not a completed or still-accumulating one.
+            started = 0
+            deadline = time.time() + 30.0
+            while time.time() < deadline:
+                if proc.poll() is not None:  # upload finished before we cut it
+                    break
+                started = read_count()
+                if started > 0:
+                    break
+                time.sleep(0.3)
+            mid_stream = started > 0 and proc.poll() is None
+            check("chunks firing mid-upload before abort (counter > 0, still inbound)",
+                  mid_stream, f"count={started} proc_done={proc.poll() is not None}")
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        finally:
+            os.unlink(tmp.name)
+
+        # Let any single in-flight fire settle, then confirm the counter is
+        # frozen — the held chain tore down rather than draining buffered
+        # chunks after the client vanished.
+        time.sleep(2.0)
+        n1 = read_count()
+        time.sleep(2.0)
+        n2 = read_count()
+        check("held chain torn down: counter frozen after abort (no post-disconnect fires)",
+              n1 > 0 and n2 == n1, f"n1={n1} n2={n2}")
+
+        # The worker is not wedged or leaking the aborted chain: a fresh
+        # full upload still streams and completes.
+        after = os.urandom(8 * 1024 * 1024)
+        r = c.node_request("/up", method="POST", host=host, data=after,
+                           headers={"x-upl": "after"})
+        ok = r.status == 200
+        abody = {}
+        if ok:
+            try:
+                abody = json.loads(r.body)
+            except json.JSONDecodeError:
+                ok = False
+        check("worker healthy after abort: fresh upload → 200, ordered multi-fire",
+              ok and abody.get("bytes") == len(after) and abody.get("lastSeq", 0) >= 1
+              and abody.get("ordered") is True,
+              f"got {r.status} body={abody}")
 
     print()
     if failures:
