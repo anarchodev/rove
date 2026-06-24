@@ -904,7 +904,16 @@ pub const Bridge = struct {
     /// have conf-change-added it first).
     pub fn createGroupAtBaseline(self: *Bridge, gid: u64, epoch: u64, index: u64, term: u64, as_learner: bool, voters: ?[]const u64, learners: ?[]const u64) Error!void {
         const sig = self.sigFor(gid) orelse return Error.UnknownTenant;
-        var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .snap_index = index, .snap_term = term, .as_learner = as_learner, .snap_voters = voters, .snap_learners = learners };
+        // BIRTH the group with the baseline's membership (`birth_voters = voters`),
+        // not just the post-birth snapshot ConfState (`snap_voters`). Without this
+        // the group is born via the `self.voters` FALLBACK first and the snapshot
+        // only corrects it afterwards — benign on a static cluster (self.voters is
+        // the full set) but FATAL on a genesis node, whose self.voters is `{self}`:
+        // it births a rogue sole-self group (auto-campaign + a half-init group that
+        // errors → double-free crash) before the snapshot can fix it. Born with the
+        // real membership directly, the fallback is never taken (matches the
+        // no-baseline `createGroupEpoch` path, which already births with `voters`).
+        var cmd: ControlCmd = .{ .kind = .create_group_epoch, .gid = gid, .id_str = sig.id_str, .epoch = epoch, .snap_index = index, .snap_term = term, .as_learner = as_learner, .birth_voters = voters, .snap_voters = voters, .snap_learners = learners };
         return self.runControl(&cmd);
     }
 

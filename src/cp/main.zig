@@ -1584,6 +1584,16 @@ const Router = struct {
         ) catch return false;
         defer bp.deinit();
 
+        // The leader's ConfState must be non-empty for a live group. An EMPTY
+        // voter set means the leader's group is mid-birth (ConfState not yet
+        // committed/applied) — bootstrapping a joiner from it would send an empty
+        // `X-Rewind-Voters`, and the joiner would fall back to `{self}` (a rogue
+        // sole-self group). Refuse + retry next pass rather than birth a split.
+        if (bp.value.voters.len == 0) {
+            std.log.warn("rewind-cp: bootstrap {s} onto {s}: leader baseline has EMPTY voters (index={d} term={d} epoch={d}); retrying", .{ tenant, node_url, bp.value.index, bp.value.term, bp.value.epoch });
+            return false;
+        }
+
         const tbody = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\"}}", .{tenant}) catch return false;
         defer a.free(tbody);
         const snap = self.backendCall(leader_url, "/_system/v2-snapshot", .POST, tbody, &.{}) catch return false;
