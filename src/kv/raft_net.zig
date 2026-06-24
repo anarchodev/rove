@@ -48,6 +48,25 @@ pub const PeerAddr = struct {
     mode: PeerMode = .voter,
 };
 
+/// Resolves a raft node id to its transport address on demand. This is the
+/// seam (cluster-genesis-and-membership §3.3) that lets the peer table be fed
+/// by the CP node-address registry instead of a static positional peer array:
+/// the transport consults the resolver the first time it has a message for a
+/// node id it hasn't dialed yet, and registers the peer via `addPeer`. Returns
+/// null when the address isn't known yet — the message is dropped (raft
+/// re-emits) and resolution is retried on the next message. `node_id` is the
+/// 1-based raft id (callers speak raft node ids; the transport owns the
+/// `peer_id = node_id - 1` conversion). Borrowed: `resolve` must not retain the
+/// returned `PeerAddr` slices past the call — the transport copies what it needs.
+pub const PeerResolver = struct {
+    ctx: ?*anyopaque,
+    resolveFn: *const fn (ctx: ?*anyopaque, node_id: u64) ?PeerAddr,
+
+    pub fn resolve(self: PeerResolver, node_id: u64) ?PeerAddr {
+        return self.resolveFn(self.ctx, node_id);
+    }
+};
+
 pub const RecvFn = *const fn (from_id: u32, payload: []const u8, ctx: ?*anyopaque) void;
 
 pub const Error = error{

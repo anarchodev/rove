@@ -981,6 +981,9 @@ pub fn build(b: *std.Build) void {
     v2_transport_mod.link_libc = true;
     v2_transport_mod.addImport("raft_rs_zig", raft_dep.module("raft_rs_zig"));
     v2_transport_mod.addImport("raft-net", raftnet_mod);
+    // transport.zig pulls MicrosHistogram from the kvlimbs facade; needed once
+    // a test instantiates the Transport struct (not just the wire codec).
+    v2_transport_mod.addImport("kvlimbs", kv_mod);
     const v2_transport_test = b.addTest(.{ .root_module = v2_transport_mod });
     v2_test_step.dependOn(&b.addRunArtifact(v2_transport_test).step);
     const run_v2_node_test = b.addRunArtifact(v2_node_test);

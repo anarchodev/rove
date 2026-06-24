@@ -161,6 +161,15 @@ pub const Directory = struct {
     /// (survives moves), so it's a sibling axis here, not per-cluster
     /// `__root__.db` like V1 (v2-front-door-architecture.md). Owned key + value.
     certs: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// `{cluster}/{id}` → packed node transport address (`packNodeAddr`:
+    /// `raft_addr \t cp_raft_addr \t http_url`) — the node-address registry, the
+    /// rove analog of PD's store-address table (cluster-genesis-and-membership
+    /// §3.2). The single source of truth for raft id → transport address, for
+    /// both worker tenant groups and the CP directory group; it lets a node be
+    /// configured with only its own identity and learn its peers' addresses from
+    /// here (replacing the static positional `REWIND_PEERS`). Replicated like the
+    /// other axes; placement-independent. Owned key + value.
+    node_addrs: std.StringHashMapUnmanaged([]u8) = .empty,
 
     const OwnedCluster = struct {
         id: []u8,
@@ -258,6 +267,13 @@ pub const Directory = struct {
             a.free(e.value_ptr.*);
         }
         self.certs.deinit(a);
+        // `node_addrs` keys AND values are owned dups (see `applyNodeAddrLocal`).
+        var nit = self.node_addrs.iterator();
+        while (nit.next()) |e| {
+            a.free(e.key_ptr.*);
+            a.free(e.value_ptr.*);
+        }
+        self.node_addrs.deinit(a);
     }
 
     /// True when no cluster has been registered yet — the front door seeds
@@ -407,6 +423,27 @@ pub const Directory = struct {
             cursor = try a.dupe(u8, last);
             if (done) break;
         }
+
+        // Node-address registry (`node/{cluster}/{id}` → packed addr),
+        // independent of clusters — feeds the peer resolver.
+        a.free(cursor);
+        cursor = try a.dupe(u8, "");
+        while (true) {
+            var rr = node.prefix(self.dir_gid, "node/", cursor, 256) catch return Error.Replication;
+            defer rr.deinit();
+            if (rr.entries.len == 0) break;
+            for (rr.entries) |e| {
+                const suffix = e.key["node/".len..];
+                self.applyNodeAddrLocal(suffix, e.value) catch |err| {
+                    std.log.warn("cp directory replay: bad node-addr {s}: {s}", .{ suffix, @errorName(err) });
+                };
+            }
+            const done = rr.entries.len < 256;
+            const last = rr.entries[rr.entries.len - 1].key;
+            a.free(cursor);
+            cursor = try a.dupe(u8, last);
+            if (done) break;
+        }
     }
 
     /// Parse a `cluster/*` value (`url1,url2,…`) and upsert the cluster into
@@ -497,6 +534,8 @@ pub const Directory = struct {
             try self.applyHostLocal(key["host/".len..], value);
         } else if (std.mem.startsWith(u8, key, "cert/")) {
             try self.applyCertLocal(key["cert/".len..], value);
+        } else if (std.mem.startsWith(u8, key, "node/")) {
+            try self.applyNodeAddrLocal(key["node/".len..], value);
         }
     }
 
@@ -876,6 +915,151 @@ pub const Directory = struct {
         gop.value_ptr.* = val_dup;
     }
 
+    // ── Node-address registry (operator writes, peer resolver reads) ─────
+    //
+    // The rove analog of PD's store-address table: raft id → transport address,
+    // keyed `node/{cluster}/{id}`. A node configured with only its own identity
+    // (cluster-genesis-and-membership §3.1) registers itself here; peers resolve
+    // each other's addresses from here instead of a static positional
+    // `REWIND_PEERS`. The CP directory group uses it for its own membership too.
+
+    /// A node's transport addresses, split out of the packed registry value.
+    /// `raft_addr` is the load-bearing field (the worker raft-net `host:port`);
+    /// `cp_raft_addr` is the CP directory raft `host:port` (CP nodes only);
+    /// `http_url` is the node's HTTP origin. Borrowed from the packed bytes.
+    pub const NodeAddr = struct {
+        raft_addr: []const u8,
+        cp_raft_addr: []const u8,
+        http_url: []const u8,
+    };
+
+    /// Packed node-address frame version (`docs/format-versioning-audit.md`).
+    /// A leading version byte so adding a field later is a soft upgrade;
+    /// `unpackNodeAddr` rejects other values. Frozen v1.
+    pub const NODE_ADDR_PACK_VERSION: u8 = 1;
+
+    /// One entry of a cluster's node-address list (owned packed bytes — unpack
+    /// with `unpackNodeAddr`). Caller `deinit`s each.
+    pub const NodeAddrEntry = struct {
+        id: u64,
+        bytes: []u8,
+        pub fn deinit(self: *NodeAddrEntry, a: std.mem.Allocator) void {
+            a.free(self.bytes);
+        }
+    };
+
+    /// Pack the three address fields into the registry value (`[version]` then
+    /// the fields tab-joined). Caller owns the result. Inputs must not contain a
+    /// tab (the field separator) — `setNodeAddr` validates that.
+    pub fn packNodeAddr(a: std.mem.Allocator, raft_addr: []const u8, cp_raft_addr: []const u8, http_url: []const u8) Error![]u8 {
+        const out = a.alloc(u8, 1 + raft_addr.len + 1 + cp_raft_addr.len + 1 + http_url.len) catch return Error.OutOfMemory;
+        out[0] = NODE_ADDR_PACK_VERSION;
+        var i: usize = 1;
+        @memcpy(out[i..][0..raft_addr.len], raft_addr);
+        i += raft_addr.len;
+        out[i] = '\t';
+        i += 1;
+        @memcpy(out[i..][0..cp_raft_addr.len], cp_raft_addr);
+        i += cp_raft_addr.len;
+        out[i] = '\t';
+        i += 1;
+        @memcpy(out[i..][0..http_url.len], http_url);
+        return out;
+    }
+
+    /// Split a packed registry value into its address fields (borrowed from
+    /// `bytes`), or null if malformed / an unknown version / a missing
+    /// `raft_addr`. `cp_raft_addr` / `http_url` may be empty.
+    pub fn unpackNodeAddr(bytes: []const u8) ?NodeAddr {
+        if (bytes.len < 1 or bytes[0] != NODE_ADDR_PACK_VERSION) return null;
+        var it = std.mem.splitScalar(u8, bytes[1..], '\t');
+        const raft_addr = it.next() orelse return null;
+        const cp_raft_addr = it.next() orelse "";
+        const http_url = it.next() orelse "";
+        if (raft_addr.len == 0) return null;
+        return .{ .raft_addr = raft_addr, .cp_raft_addr = cp_raft_addr, .http_url = http_url };
+    }
+
+    /// Register (or re-register) a node's transport addresses:
+    /// `node/{cluster}/{id} = packNodeAddr(...)`. Idempotent on (cluster, id) —
+    /// a repeat overwrites (re-IP). `raft_addr` is required; the others may be
+    /// empty. Replicates before it takes effect (apply observer materializes it
+    /// on the leader AND every follower).
+    pub fn setNodeAddr(self: *Directory, cluster: []const u8, id: u64, raft_addr: []const u8, cp_raft_addr: []const u8, http_url: []const u8) Error!void {
+        if (cluster.len == 0 or id == 0 or raft_addr.len == 0) return Error.BadConfig;
+        // A tab would corrupt the field framing; reject loudly rather than store
+        // an unparseable value. A '/' in the cluster would break key parsing.
+        if (std.mem.indexOfScalar(u8, cluster, '/') != null) return Error.BadConfig;
+        for ([_][]const u8{ raft_addr, cp_raft_addr, http_url }) |f| {
+            if (std.mem.indexOfScalar(u8, f, '\t') != null) return Error.BadConfig;
+        }
+        const a = self.allocator;
+        const key = std.fmt.allocPrint(a, "node/{s}/{d}", .{ cluster, id }) catch return Error.OutOfMemory;
+        defer a.free(key);
+        const value = try packNodeAddr(a, raft_addr, cp_raft_addr, http_url);
+        defer a.free(value);
+        return self.applyDirWrite(key, value);
+    }
+
+    /// A node's packed address frame as an OWNED copy (caller frees + unpacks),
+    /// or null if unregistered. Owned because a re-register (re-IP) can free the
+    /// projection value under a concurrent apply.
+    pub fn nodeAddrOwned(self: *Directory, a: std.mem.Allocator, cluster: []const u8, id: u64) Error!?[]u8 {
+        const suffix = std.fmt.allocPrint(a, "{s}/{d}", .{ cluster, id }) catch return Error.OutOfMemory;
+        defer a.free(suffix);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const v = self.node_addrs.get(suffix) orelse return null;
+        return a.dupe(u8, v) catch return Error.OutOfMemory;
+    }
+
+    /// Every registered node in `cluster` (owned packed bytes; caller `deinit`s
+    /// each entry + frees the slice). The peer resolver bulk-loads this to learn
+    /// a cluster's id → address map.
+    pub fn listClusterNodeAddrs(self: *Directory, a: std.mem.Allocator, cluster: []const u8) Error![]NodeAddrEntry {
+        const prefix = std.fmt.allocPrint(a, "{s}/", .{cluster}) catch return Error.OutOfMemory;
+        defer a.free(prefix);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var out: std.ArrayListUnmanaged(NodeAddrEntry) = .empty;
+        errdefer {
+            for (out.items) |*e| e.deinit(a);
+            out.deinit(a);
+        }
+        var it = self.node_addrs.iterator();
+        while (it.next()) |e| {
+            const suffix = e.key_ptr.*;
+            if (!std.mem.startsWith(u8, suffix, prefix)) continue;
+            const id_str = suffix[prefix.len..];
+            const id = std.fmt.parseInt(u64, id_str, 10) catch continue;
+            const bytes = a.dupe(u8, e.value_ptr.*) catch return Error.OutOfMemory;
+            out.append(a, .{ .id = id, .bytes = bytes }) catch {
+                a.free(bytes);
+                return Error.OutOfMemory;
+            };
+        }
+        return out.toOwnedSlice(a) catch return Error.OutOfMemory;
+    }
+
+    /// Upsert a packed node address into the in-memory projection (no
+    /// replication). The committed-state applier, shared by replay + the
+    /// post-commit observer. `suffix` is the key's `{cluster}/{id}` part.
+    fn applyNodeAddrLocal(self: *Directory, suffix: []const u8, value: []const u8) Error!void {
+        const a = self.allocator;
+        const val_dup = a.dupe(u8, value) catch return Error.OutOfMemory;
+        errdefer a.free(val_dup);
+        const gop = self.node_addrs.getOrPut(a, suffix) catch return Error.OutOfMemory;
+        if (!gop.found_existing) {
+            gop.key_ptr.* = a.dupe(u8, suffix) catch {
+                _ = self.node_addrs.remove(suffix);
+                return Error.OutOfMemory;
+            };
+        } else {
+            a.free(gop.value_ptr.*);
+        }
+        gop.value_ptr.* = val_dup;
+    }
+
     /// Collect the hosts in the domain index that have NO cert yet (owned dups;
     /// caller frees each + the slice). The ACME issuer's work-list: every
     /// mapped host without a `cert/{host}` is a pending issuance.
@@ -1072,6 +1256,75 @@ test "directory: setHost + hostTenantForOwned round-trip, update, unset→null" 
         try testing.expectEqualStrings("bob", t);
     }
     try testing.expectError(error.BadConfig, dir.seedHosts("missing-equals"));
+}
+
+test "directory: setNodeAddr registry round-trips, re-registers, lists per cluster" {
+    var dir = Directory.init(testing.allocator);
+    defer dir.deinit();
+    const a = testing.allocator;
+
+    // unregistered → null
+    try testing.expect((try dir.nodeAddrOwned(a, "prod", 1)) == null);
+
+    // register node 1 with all three fields
+    try dir.setNodeAddr("prod", 1, "10.0.0.1:9001", "10.0.0.1:9101", "http://10.0.0.1:8080");
+    {
+        const v = (try dir.nodeAddrOwned(a, "prod", 1)).?;
+        defer a.free(v);
+        const na = Directory.unpackNodeAddr(v).?;
+        try testing.expectEqualStrings("10.0.0.1:9001", na.raft_addr);
+        try testing.expectEqualStrings("10.0.0.1:9101", na.cp_raft_addr);
+        try testing.expectEqualStrings("http://10.0.0.1:8080", na.http_url);
+    }
+
+    // re-register (re-IP) overwrites; old value freed — no leak
+    try dir.setNodeAddr("prod", 1, "10.0.0.9:9001", "", "");
+    {
+        const v = (try dir.nodeAddrOwned(a, "prod", 1)).?;
+        defer a.free(v);
+        const na = Directory.unpackNodeAddr(v).?;
+        try testing.expectEqualStrings("10.0.0.9:9001", na.raft_addr);
+        try testing.expectEqualStrings("", na.cp_raft_addr);
+        try testing.expectEqualStrings("", na.http_url);
+    }
+
+    // a second node + a node in a different cluster
+    try dir.setNodeAddr("prod", 2, "10.0.0.2:9001", "", "");
+    try dir.setNodeAddr("staging", 1, "10.1.0.1:9001", "", "");
+
+    // list is scoped to the cluster and parses ids
+    {
+        const entries = try dir.listClusterNodeAddrs(a, "prod");
+        defer {
+            for (entries) |*e| e.deinit(a);
+            a.free(entries);
+        }
+        try testing.expectEqual(@as(usize, 2), entries.len);
+        var seen1 = false;
+        var seen2 = false;
+        for (entries) |e| {
+            const na = Directory.unpackNodeAddr(e.bytes).?;
+            if (e.id == 1) {
+                seen1 = true;
+                try testing.expectEqualStrings("10.0.0.9:9001", na.raft_addr);
+            } else if (e.id == 2) {
+                seen2 = true;
+                try testing.expectEqualStrings("10.0.0.2:9001", na.raft_addr);
+            } else return error.UnexpectedId;
+        }
+        try testing.expect(seen1 and seen2);
+    }
+
+    // validation: empty cluster / id 0 / empty raft_addr / '/' in cluster / tab in a field
+    try testing.expectError(error.BadConfig, dir.setNodeAddr("", 1, "h:1", "", ""));
+    try testing.expectError(error.BadConfig, dir.setNodeAddr("prod", 0, "h:1", "", ""));
+    try testing.expectError(error.BadConfig, dir.setNodeAddr("prod", 3, "", "", ""));
+    try testing.expectError(error.BadConfig, dir.setNodeAddr("a/b", 1, "h:1", "", ""));
+    try testing.expectError(error.BadConfig, dir.setNodeAddr("prod", 3, "h:1", "x\ty", ""));
+
+    // unpack rejects a bad version / empty raft_addr
+    try testing.expect(Directory.unpackNodeAddr(&[_]u8{ 9, 'a' }) == null);
+    try testing.expect(Directory.unpackNodeAddr(&[_]u8{Directory.NODE_ADDR_PACK_VERSION}) == null);
 }
 
 test "directory: setCert + certForOwned round-trip, pack/unpack, uncerted list" {

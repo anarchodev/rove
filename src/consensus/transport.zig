@@ -75,6 +75,7 @@ const rpc = raftnet.rpc;
 const StepBatchEntry = raft.manager.StepBatchEntry;
 
 pub const PeerAddr = raftnet.PeerAddr;
+pub const PeerResolver = raftnet.PeerResolver;
 
 pub const Error = error{
     OutOfMemory,
@@ -106,15 +107,35 @@ const FRAME_PREFIX_SIZE: usize = 1 + 4;
 /// body accordingly; queueOut flushes early when the next record would blow it.
 const MAX_FRAME_BODY: usize = @as(usize, raftnet.RECV_BUF_SIZE) - rpc.HEADER_SIZE - FRAME_PREFIX_SIZE;
 
+/// Peer-slot capacity: the largest cluster this node will ever address. The
+/// per-destination buffers (`outbufs`, `hb_sent_ns`) and `raft_net`'s peer
+/// table are sized to this at init, so a node born in a small cluster can grow
+/// (cluster-genesis-and-membership §3.3) up to this bound without re-allocating
+/// the hot-path buffers. Matches the directory's `MAX_CLUSTER_NODES`.
+pub const MAX_CLUSTER_NODES: usize = 16;
+
 pub const Transport = struct {
     allocator: std.mem.Allocator,
     /// This node's raft id (1-based).
     node_id: u64,
-    /// Cluster size == number of peer slots (raft_net peer ids 0..size-1).
-    cluster_size: usize,
+    /// Peer-slot capacity (raft_net peer ids 0..cap-1). The destination
+    /// buffers are sized to this so the cluster can grow up to `cap` without
+    /// re-allocating the hot path; a node id beyond it is dropped at `queueOut`.
+    cap: usize,
     net: *RaftNet,
     /// Borrowed — the Node's `Manager`. Inbound messages step into it.
     manager: *raft.Manager,
+    /// Resolves a raft node id → transport address the first time we address a
+    /// peer we haven't dialed yet (the growth seam). Defaults to a static
+    /// resolver over the init-time peer list (`static_peers`), so a cluster
+    /// configured the old way behaves identically — every initial peer is
+    /// already configured in `raft_net`, so the resolver is never consulted.
+    /// `1c` injects a CP-registry-backed resolver here instead.
+    resolver: PeerResolver,
+    /// Owned copy of the init-time peer addresses (host strings duped), backing
+    /// the default static resolver. Indexed by `node_id - 1`. Present even when
+    /// a custom resolver is supplied (then unused), freed at deinit.
+    static_peers: []PeerAddr,
 
     /// Per-destination outbound buffers, indexed by raft_net peer id
     /// (`node_id - 1`). Self slot is present but never used.
@@ -155,32 +176,53 @@ pub const Transport = struct {
         node_id: u64,
         listen_addr: std.net.Address,
         /// Peer addresses indexed by raft_net peer id: `peers[k]` is the
-        /// address of raft node `k + 1`. `len == cluster size`.
+        /// address of raft node `k + 1`. These are the peers known at init —
+        /// the cluster can later grow beyond them via the resolver. May be just
+        /// `{self}` for a node born single-voter.
         peers: []const PeerAddr,
         /// Borrowed Manager to step inbound messages into.
         manager: *raft.Manager,
+        /// Optional address resolver for nodes added after init (the growth
+        /// seam). When null, a static resolver over `peers` is synthesized, so
+        /// statically-configured clusters behave exactly as before.
+        resolver: ?PeerResolver = null,
+        /// Largest cluster this node will ever address; sizes the destination
+        /// buffers + the `raft_net` peer table. Must be ≥ `peers.len`.
+        max_nodes: usize = MAX_CLUSTER_NODES,
     };
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) Error!*Transport {
+        std.debug.assert(cfg.max_nodes >= cfg.peers.len);
         const self = allocator.create(Transport) catch return Error.OutOfMemory;
         errdefer allocator.destroy(self);
 
-        const outbufs = allocator.alloc(OutBuf, cfg.peers.len) catch return Error.OutOfMemory;
+        // Size the destination buffers to capacity (not the init-time peer
+        // count) so growth never re-allocates the hot path.
+        const outbufs = allocator.alloc(OutBuf, cfg.max_nodes) catch return Error.OutOfMemory;
         errdefer allocator.free(outbufs);
         for (outbufs) |*ob| ob.* = .{};
 
-        const hb_sent_ns = allocator.alloc(i64, cfg.peers.len) catch return Error.OutOfMemory;
+        const hb_sent_ns = allocator.alloc(i64, cfg.max_nodes) catch return Error.OutOfMemory;
         errdefer allocator.free(hb_sent_ns);
         @memset(hb_sent_ns, 0);
+
+        // Default static resolver: dupe the init-time peer addresses so it does
+        // not depend on the caller's slice lifetime. Duped unconditionally
+        // (≤ max_nodes entries, init-time only); when a custom resolver is
+        // supplied these go unused but are freed at deinit.
+        const static_peers = dupePeers(allocator, cfg.peers) catch return Error.OutOfMemory;
+        errdefer freePeers(allocator, static_peers);
 
         self.* = .{
             .allocator = allocator,
             .node_id = cfg.node_id,
-            .cluster_size = cfg.peers.len,
+            .cap = cfg.max_nodes,
             .net = undefined,
             .manager = cfg.manager,
             .outbufs = outbufs,
             .hb_sent_ns = hb_sent_ns,
+            .resolver = cfg.resolver orelse .{ .ctx = self, .resolveFn = staticResolve },
+            .static_peers = static_peers,
         };
 
         // raft_net node/peer ids are 0-based; raft node ids are 1-based.
@@ -190,10 +232,36 @@ pub const Transport = struct {
             .listen_addr = cfg.listen_addr,
             .on_recv = onRecv,
             .user_ctx = self,
-            .max_nodes = @intCast(cfg.peers.len),
+            .max_nodes = @intCast(cfg.max_nodes),
         }) catch return Error.TransportInit;
         self.net = net;
         return self;
+    }
+
+    /// Default resolver: index the duped init-time peer list by `node_id - 1`.
+    /// Returns null for ids beyond the init set — a statically-configured
+    /// cluster never grows, so those are genuinely-unknown nodes to drop.
+    fn staticResolve(ctx: ?*anyopaque, node_id: u64) ?PeerAddr {
+        const self: *Transport = @ptrCast(@alignCast(ctx.?));
+        if (node_id == 0 or node_id > self.static_peers.len) return null;
+        return self.static_peers[node_id - 1];
+    }
+
+    fn dupePeers(a: std.mem.Allocator, peers: []const PeerAddr) ![]PeerAddr {
+        const out = try a.alloc(PeerAddr, peers.len);
+        errdefer a.free(out);
+        var done: usize = 0;
+        errdefer for (out[0..done]) |p| a.free(p.host);
+        for (peers, 0..) |p, i| {
+            out[i] = .{ .host = try a.dupe(u8, p.host), .port = p.port, .mode = p.mode };
+            done = i + 1;
+        }
+        return out;
+    }
+
+    fn freePeers(a: std.mem.Allocator, peers: []PeerAddr) void {
+        for (peers) |p| a.free(p.host);
+        a.free(peers);
     }
 
     pub fn deinit(self: *Transport) void {
@@ -202,6 +270,7 @@ pub const Transport = struct {
         for (self.outbufs) |*ob| ob.body.deinit(a);
         a.free(self.outbufs);
         a.free(self.hb_sent_ns);
+        freePeers(a, self.static_peers);
         self.step_scratch.deinit(a);
         self.woke.deinit(a);
         a.destroy(self);
@@ -249,7 +318,18 @@ pub const Transport = struct {
     /// destination node, to be coalesced + sent at `flush`. `to` is a raft
     /// node id; a message to self (shouldn't happen) is dropped.
     pub fn queueOut(self: *Transport, to: u64, group_id: u64, epoch: u64, msg: []const u8) void {
-        if (to == self.node_id or to == 0 or to > self.cluster_size) return;
+        if (to == self.node_id or to == 0 or to > self.cap) return;
+        // Growth seam: the first time we have a message for a node we haven't
+        // dialed yet, resolve its address and register it so `raft_net`'s
+        // reconnect loop starts dialing. A node still unknown to the resolver is
+        // dropped (raft re-emits next tick). In the static path every initial
+        // peer is already configured, so this is never taken — identical
+        // behavior. `peer_id = node_id - 1`.
+        const peer_id: u32 = @intCast(to - 1);
+        if (!self.net.isPeerConfigured(peer_id)) {
+            const pa = self.resolver.resolve(to) orelse return;
+            self.net.addPeer(peer_id, pa) catch return;
+        }
         // Broadcast-time probe: stamp the moment we send a heartbeat to this
         // peer so the matching response (in `onRecv`) yields the RTT. One
         // outstanding heartbeat per peer; a later send just overwrites the
@@ -369,7 +449,7 @@ pub const Transport = struct {
             // pairs with the last heartbeat we sent that peer. Observe the RTT
             // (µs) and clear the stamp so a duplicate/late response isn't
             // re-counted against a newer send.
-            if (isHeartbeatResp(msg) and from_id < self.cluster_size) {
+            if (isHeartbeatResp(msg) and from_id < self.cap) {
                 const sent = self.hb_sent_ns[from_id];
                 if (sent != 0) {
                     const rtt_ns = nowNs() - sent;
@@ -470,4 +550,96 @@ test "transport: coalesced envelope round-trips message bytes" {
     }
     try testing.expectEqual(@as(usize, 3), seen);
     try testing.expectEqual(p.len, off);
+}
+
+test "transport: queueOut resolves + registers a peer beyond the init set (growth seam)" {
+    // The cluster-genesis growth seam (§3.3): a node born knowing only a subset
+    // of the cluster can still address a node it learns later — the first
+    // outbound message to an unknown id hits the resolver and registers the
+    // peer in raft_net. No raft FFI stepping here (the manager is never
+    // touched by queueOut); we assert purely on raft_net's peer table.
+    const a = testing.allocator;
+
+    const Res = struct {
+        fn resolve(ctx: ?*anyopaque, node_id: u64) ?PeerAddr {
+            _ = ctx;
+            // Knows node 3 only; everything else is genuinely unknown.
+            if (node_id == 3) return .{ .host = "127.0.0.1", .port = 19099 };
+            return null;
+        }
+    };
+
+    var mgr = raft.Manager.init() catch return error.SkipZigTest;
+    defer mgr.deinit();
+
+    // Bind an ephemeral port — this test never connects, accepts, or ticks.
+    const listen = try std.net.Address.parseIp("127.0.0.1", 0);
+    // Born knowing only {self = node 1, node 2}; node 3 is learned via the
+    // resolver, mirroring a node that genesis'd small and grew.
+    var peers = [_]PeerAddr{
+        .{ .host = "127.0.0.1", .port = 18090 }, // node 1 (self slot)
+        .{ .host = "127.0.0.1", .port = 18091 }, // node 2
+    };
+    const t = Transport.init(a, .{
+        .node_id = 1,
+        .listen_addr = listen,
+        .peers = &peers,
+        .manager = &mgr,
+        .resolver = .{ .ctx = null, .resolveFn = Res.resolve },
+    }) catch |e| {
+        // No io_uring / socket in the sandbox → skip rather than fail.
+        if (e == Error.TransportInit) return error.SkipZigTest;
+        return e;
+    };
+    defer t.deinit();
+
+    // Capacity is the max, not the init-time peer count.
+    try testing.expectEqual(MAX_CLUSTER_NODES, t.cap);
+    // Node 3 (raft_net peer_id 2) is unknown at birth.
+    try testing.expect(!t.net.isPeerConfigured(2));
+
+    // A message addressed to node 3 hits the resolver → registers the peer so
+    // raft_net's reconnect loop will dial it.
+    t.queueOut(3, 7, 0, "append-entries");
+    try testing.expect(t.net.isPeerConfigured(2));
+
+    // A node the resolver doesn't know (node 5, peer_id 4) is dropped — never
+    // registered, never indexed past the configured slots.
+    t.queueOut(5, 7, 0, "x");
+    try testing.expect(!t.net.isPeerConfigured(4));
+
+    // Beyond capacity is ignored at the guard (no out-of-bounds, no panic).
+    t.queueOut(@as(u64, MAX_CLUSTER_NODES) + 1, 7, 0, "x");
+}
+
+test "transport: the default static resolver does not grow past the init set" {
+    // With no custom resolver, a node addressed beyond its static peer list is
+    // dropped — the old positional behavior, preserved. Proves the static path
+    // never silently fabricates a peer.
+    const a = testing.allocator;
+
+    var mgr = raft.Manager.init() catch return error.SkipZigTest;
+    defer mgr.deinit();
+
+    const listen = try std.net.Address.parseIp("127.0.0.1", 0);
+    var peers = [_]PeerAddr{
+        .{ .host = "127.0.0.1", .port = 18092 }, // node 1 (self slot)
+        .{ .host = "127.0.0.1", .port = 18093 }, // node 2
+    };
+    const t = Transport.init(a, .{
+        .node_id = 1,
+        .listen_addr = listen,
+        .peers = &peers,
+        .manager = &mgr,
+    }) catch |e| {
+        if (e == Error.TransportInit) return error.SkipZigTest;
+        return e;
+    };
+    defer t.deinit();
+
+    // Node 3 is outside the static set → the default resolver returns null → no
+    // registration.
+    try testing.expect(!t.net.isPeerConfigured(2));
+    t.queueOut(3, 7, 0, "append-entries");
+    try testing.expect(!t.net.isPeerConfigured(2));
 }

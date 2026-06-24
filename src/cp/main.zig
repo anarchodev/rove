@@ -493,7 +493,8 @@ const Router = struct {
         const is_host = std.mem.eql(u8, path, "/_control/host");
         const is_cert = std.mem.eql(u8, path, "/_control/cert");
         const is_cluster = std.mem.eql(u8, path, "/_control/cluster");
-        if (!(is_move or is_move_live or is_provision or is_plan or is_host or is_cert or is_cluster) or !std.mem.eql(u8, method_s, "POST")) {
+        const is_node_addr = std.mem.eql(u8, path, "/_control/node-address");
+        if (!(is_move or is_move_live or is_provision or is_plan or is_host or is_cert or is_cluster or is_node_addr) or !std.mem.eql(u8, method_s, "POST")) {
             try replyStatus(server, ent, sid, sess, 404);
             return;
         }
@@ -526,6 +527,8 @@ const Router = struct {
             try self.handleCert(server, ent, sid, sess, body)
         else if (is_cluster)
             try self.handleCluster(server, ent, sid, sess, body)
+        else if (is_node_addr)
+            try self.handleNodeAddress(server, ent, sid, sess, body)
         else if (is_provision)
             try self.handleProvision(server, ent, sid, sess, body)
         else
@@ -561,6 +564,39 @@ const Router = struct {
             return;
         };
         std.log.info("rewind-cp: cluster {s} set to {d} node(s)", .{ parsed.value.id, parsed.value.nodes.len });
+        try replyStatus(server, ent, sid, sess, 204);
+    }
+
+    /// `POST /_control/node-address {cluster, id, raft_addr, cp_raft_addr?,
+    /// http_url?}` — register a node's transport addresses in the directory
+    /// node-address registry (cluster-genesis-and-membership §3.2). The explicit
+    /// raft id → address binding that replaces the static positional
+    /// `REWIND_PEERS`; the peer resolver reads it so a node configured with only
+    /// its own identity can dial its peers. A directory WRITE: leader-gated (a
+    /// follower already forwarded above), replicated via `setNodeAddr`.
+    /// Idempotent on (cluster, id) — a repeat re-registers (re-IP).
+    fn handleNodeAddress(self: *Router, server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, body: []const u8) !void {
+        const a = self.allocator;
+        var parsed = std.json.parseFromSlice(struct {
+            cluster: []const u8,
+            id: u64,
+            raft_addr: []const u8,
+            cp_raft_addr: []const u8 = "",
+            http_url: []const u8 = "",
+        }, a, body, .{ .ignore_unknown_fields = true }) catch {
+            try replyStatus(server, ent, sid, sess, 400);
+            return;
+        };
+        defer parsed.deinit();
+        const v = parsed.value;
+        self.directory.setNodeAddr(v.cluster, v.id, v.raft_addr, v.cp_raft_addr, v.http_url) catch |err| {
+            // BadConfig (empty cluster/raft_addr, id 0, bad chars) → 400;
+            // replication/other → 500.
+            const code: u16 = if (err == error.BadConfig) 400 else 500;
+            try replyStatus(server, ent, sid, sess, code);
+            return;
+        };
+        std.log.info("rewind-cp: node-address {s}/{d} → {s}", .{ v.cluster, v.id, v.raft_addr });
         try replyStatus(server, ent, sid, sess, 204);
     }
 
