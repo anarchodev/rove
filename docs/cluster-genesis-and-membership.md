@@ -294,6 +294,25 @@ The point of the whole exercise: **tests bring clusters up the real way.**
    node = self-only. Hard cut (pre-launch).
 4. **Harness + genesis smoke** (§4) — reshape `V2Cluster`; add
    `genesis_smoke_v2.py` as the CI gate; de-`campaign()` the unit tests.
+   - **Genesis smoke — DONE + GREEN.** `V2Cluster.spawn(..., genesis=True)`
+     brings up a single-node CP (reconciler ON) + N self-only genesis workers,
+     registers each node's raft address, and `genesis_smoke_v2.py` asserts the
+     full path end to end: provision births `{1}` → reconciler grows to 3
+     voters → write replicates to all 3 → publish + serve through the front →
+     ⭐ kill the leader, a survivor serves the replicated data + accepts a
+     post-failover write. Two consecutive clean passes.
+   - **Bug surfaced + FIXED by the smoke** (the exact class the 2026-06-24
+     outage was: an untested genesis path): `Bridge.createGroupAtBaseline`
+     stored the joiner's membership only in `snap_voters` (the post-birth
+     snapshot ConfState) and left `birth_voters` null — so the group was BORN
+     via the `self.voters` fallback and the snapshot only corrected it after.
+     Benign on a static cluster (self.voters = full set) but FATAL on a genesis
+     node (self.voters = `{self}`): it births a rogue sole-self group that
+     auto-campaigns + a half-init group that errors → double-free crash, before
+     the snapshot can fix it. Fix: born with the baseline's membership directly
+     (`birth_voters = voters`), matching the no-baseline `createGroupEpoch`
+     path. Plus a CP guard: `bootstrapMember` refuses to attach from a leader
+     baseline with EMPTY voters (a mid-birth group) and retries.
    - **Genesis binary mode — DONE (worker).** `isSingleNode()` redefined to
      `transport == null` (was `voters.len == 1`) so a genesis node — which has a
      transport but `voters = {self}` — tracks the real leadership atomics and is

@@ -245,6 +245,7 @@ class V2Cluster:
     tls_key_path: str = ""
     _voters: str = ""
     _peers: str = ""
+    genesis: bool = False
 
     # ── lifecycle ──────────────────────────────────────────────────────
     @classmethod
@@ -252,7 +253,8 @@ class V2Cluster:
               raft_base: int = 18400, cp_port: int = 0, front_port: int = 0,
               cluster_id: str = "cluster-1",
               unsafe_outbound: bool = True,
-              tls_idp: bool = False) -> "V2Cluster":
+              tls_idp: bool = False,
+              genesis: bool = False) -> "V2Cluster":
         if not os.environ.get("S3_ENDPOINT"):
             raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
         for b in (REWIND, CP_BIN, FRONT_BIN):
@@ -280,10 +282,14 @@ class V2Cluster:
             cp_data_dir=Path(f"{_DATA_BASE}/v2smoke-{tag}-cp-{pid}"),
             log_data_dir=Path(f"{_DATA_BASE}/v2smoke-{tag}-log-{pid}"),
             unsafe_outbound=unsafe_outbound,
+            genesis=genesis,
         )
         for d in (*c.data_dirs, c.cp_data_dir):
             subprocess.run(["rm", "-rf", str(d)])
-        c._boot(nodes)
+        if genesis:
+            c._boot_genesis(nodes)
+        else:
+            c._boot(nodes)
         return c
 
     def _boot(self, nodes: int) -> None:
@@ -317,15 +323,126 @@ class V2Cluster:
         self.services_jwt = mint_jwt(JWT_SECRET_HEX,
                                      {"exp": int((time.time() + 3600) * 1000)})
 
-    def _spawn_node(self, i: int, voters: str, peers: str) -> None:
+    def _boot_genesis(self, nodes: int) -> None:
+        """Genesis bring-up (cluster-genesis-and-membership §4): each worker
+        boots SELF-ONLY (genesis mode — no static voter/peer set), a single-node
+        CP runs with the membership reconciler ENABLED, and every node's raft
+        address is registered with the CP. A later `provision` then births the
+        tenant group as the sole voter {1} on node 1; the reconciler grows it to
+        all `nodes` learner-first. This exercises the real first-deploy /
+        post-wipe path the cold-multi formation never could (the 2026-06-24
+        prod-genesis-gap outage)."""
+        self._voters = ",".join(str(i + 1) for i in range(nodes))
+        self._peers = ",".join(f"127.0.0.1:{rp}" for rp in self.raft_ports)
+        # CP + front log to FILES (not PIPEs): the genesis grow is CP-driven, so
+        # the reconciler's attach/conf-change decisions must be inspectable, and
+        # an un-drained CP pipe would wedge mid-run (the classic multi-process
+        # smoke flake). Node workers already file-log via `_spawn_node`.
+        log_dir = f"/tmp/v2smoke-{self.tag}-{os.getpid()}-cplog"
+        subprocess.run(["mkdir", "-p", log_dir])
+        self.log_paths["cp"] = os.path.join(log_dir, f"cp-{os.getpid()}.log")
+        self.log_paths["front"] = os.path.join(log_dir, f"front-{os.getpid()}.log")
+        for i in range(nodes):
+            self._spawn_node(i, "", "", genesis=True)
+        nodes_csv = ",".join(f"http://127.0.0.1:{p}" for p in self.node_ports)
+        # Single-node CP with the reconciler ON (fast period for the smoke), so a
+        # born-{self} tenant group is grown to the full node set automatically.
+        spawn_cp(self.procs, self.cp_port,
+                 clusters=f"{self.cluster_id}={nodes_csv}",
+                 hosts="", placement="", cp_data_dir=str(self.cp_data_dir),
+                 move_secret=MOVE_SECRET,
+                 reconcile_secs=1, log_dir=log_dir,
+                 extra_env={"REWIND_CP_RECONCILE_MEMBERSHIP": "1",
+                            # short demote grace so a smoke converges quickly; the
+                            # grow path never demotes a healthy node anyway.
+                            "REWIND_CP_DEMOTE_GRACE_MS": "3000"})
+        # Register each node's raft transport address with the CP registry
+        # (node/{cluster}/{id} → raft_addr), the id→address map the leader dials
+        # to grow the group and the joiner learns via §4d attach-carry.
+        for i in range(nodes):
+            self.register_node_addr(i)
+        spawn_front(self.procs, self.front_port,
+                    f"http://127.0.0.1:{self.cp_port}", route_cache_ms=0,
+                    log_dir=log_dir)
+        self.services_jwt = mint_jwt(JWT_SECRET_HEX,
+                                     {"exp": int((time.time() + 3600) * 1000)})
+
+    def _cp_url(self) -> str:
+        return f"http://127.0.0.1:{self.cp_port}"
+
+    def _cp_post(self, path: str, body: dict, *, timeout: float = 15.0) -> HttpResponse:
+        """POST a `/_control/*` op to the CP with the move-secret."""
+        return _curl(f"{self._cp_url()}{path}", method="POST",
+                     headers={"X-Rewind-Move-Secret": MOVE_SECRET,
+                              "Content-Type": "application/json"},
+                     data=json.dumps(body), timeout=timeout)
+
+    def register_node_addr(self, i: int) -> HttpResponse:
+        """Register node `i`'s raft transport address with the CP node-address
+        registry (POST /_control/node-address). Raises on a non-204."""
+        r = self._cp_post("/_control/node-address", {
+            "cluster": self.cluster_id,
+            "id": i + 1,
+            "raft_addr": f"127.0.0.1:{self.raft_ports[i]}",
+            "http_url": self.node_url(i),
+        })
+        if r.status != 204:
+            raise SystemExit(f"node-address register n{i + 1} → {r.status}: {r.body!r}")
+        return r
+
+    def _member_status(self, tenant: str):
+        """The leader's per-peer membership view for `tenant`'s group, or None if
+        no node answers as leader. Tries each node's leader-gated
+        `/_system/v2-member-status` (a follower 421s)."""
+        for i in range(len(self.node_ports)):
+            r = _curl(f"{self.node_url(i)}/_system/v2-member-status?tenant="
+                      f"{urllib.parse.quote(tenant)}", timeout=5.0,
+                      headers={"X-Rewind-Move-Secret": MOVE_SECRET})
+            if r.status == 200:
+                try:
+                    return json.loads(r.body)
+                except Exception:
+                    return None
+        return None
+
+    def wait_for_membership(self, tenant: str, *, voters: int,
+                            timeout: float = 40.0) -> dict:
+        """Block until `tenant`'s group has grown to exactly `voters` caught-up
+        voters (the reconciler converged the born-{self} group to the full node
+        set). Returns the leader's member-status. Raises on timeout."""
+        deadline = time.time() + timeout
+        last = None
+        while time.time() < deadline:
+            ms = self._member_status(tenant)
+            if ms is not None:
+                last = ms
+                vs = ms.get("voters", [])
+                if len(vs) >= voters:
+                    return ms
+            time.sleep(0.5)
+        raise SystemExit(
+            f"membership for {tenant} did not reach {voters} voters within "
+            f"{timeout}s (last={last})")
+
+    def _spawn_node(self, i: int, voters: str, peers: str,
+                    genesis: bool = False) -> None:
         env = dict(os.environ)
         env["REWIND_ADMIN_DOMAIN"] = f"n{i + 1}.localhost"
         env["REWIND_PUBLIC_SUFFIX"] = PUBLIC_SUFFIX
         env["REWIND_ROOT_TOKEN"] = self.root_token
         env["REWIND_MOVE_SECRET"] = MOVE_SECRET
         env["REWIND_NODE_ID"] = str(i + 1)
-        env["REWIND_VOTERS"] = voters
-        env["REWIND_PEERS"] = peers
+        if genesis:
+            # Genesis first-boot (cluster-genesis-and-membership §3.4): own raft
+            # id + listen addr, NOTHING else. No static voter/peer set — the node
+            # boots self-only (groups born {self}) and the CP grows it into the
+            # cluster by conf-change (provision births {1} on node 1; the RC-6
+            # reconciler grows to the full set, riding §4d attach-carry). Omitting
+            # REWIND_VOTERS/REWIND_PEERS is what trips `parseGenesis`.
+            env["REWIND_RAFT_ADDR"] = f"127.0.0.1:{self.raft_ports[i]}"
+        else:
+            env["REWIND_VOTERS"] = voters
+            env["REWIND_PEERS"] = peers
         # Peer HTTP base URLs indexed by raft id − 1 (the worker analog of CP's
         # REWIND_CP_PEER_URLS): the leader-push target for the out-of-band
         # snapshot catch-up driver (raft-native-alignment Phase 1). Distinct from
