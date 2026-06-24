@@ -248,11 +248,15 @@ The point of the whole exercise: **tests bring clusters up the real way.**
        write to a node it knows **only** via the resolver (omitted from its
        static peers). Added `raft_net.isPeerConnected` for the
        connection-gated, race-free election in that test.
-     - **Deferred to Phase 2/3 (born-self-only):** the *attach* direction — a
-       joining node learning the existing members' addresses (it pulls from the
-       registry / they ride attach). Inert while static `REWIND_PEERS` is still
-       present, so not built yet; the end-to-end cold grow is the Phase-4 genesis
-       smoke.
+     - **4d attach-carry — DONE.** The *attach* direction: the reconciler's
+       bootstrap attach (`bootstrapMember`) now carries the existing members'
+       raft addresses as `X-Rewind-Peer-Addrs: id@host:port,…`
+       (`peerAddrsHeader` ← `listClusterNodeAddrs`, joiner skipped); the worker's
+       `handleAttach` `learnPeerAddr`s each BEFORE the group is created, so a
+       genesis-booted joiner (empty peer registry) can dial the leader to ACK its
+       appends the moment the first one lands. Closes the reverse of 1c's
+       conf-change `raft_addr` (leader-learns-joiner). Header omitted on a
+       static-`REWIND_PEERS` cluster (registry empty → no-op).
 2. **Single-voter genesis + CP-directory self-grow** (§3.4, §3.5) — groups
    born `{self}`; the CP grows its own directory group; tenant reconciler reads
    the registry. Now a cluster can genesis-1-then-grow end to end.
@@ -267,14 +271,18 @@ The point of the whole exercise: **tests bring clusters up the real way.**
      grows to a second node by `add_learner` conf-change and replicates a write.
      **Additive**: no production caller passes `voters_override={self}` yet
      (provision still births the full set), so production behavior is unchanged.
+   - **2d provision-flip — DONE (reconciler-gated).** `handleProvision` now
+     births the group as the sole voter `{1}` on the FIRST node only when a
+     membership reconciler is present (`reconcile_membership`) — it auto-leads
+     (no election race) and the RC-6 reconciler grows it to the full node set
+     learner-first (riding 4d's attach-carry). A cluster with NO reconciler keeps
+     the legacy born-multi formation (full node set on every node), so static
+     clusters are unchanged. The genesis smoke (reconciler ON) validates the
+     born-`{self}`+grow path end to end.
    - **REMAINING (gated on the Phase-4 genesis smoke).** Flipping production is
      the risky, behavior-changing half and — per the 2026-06-24 outage (an
      unvalidated genesis path took prod down) — must NOT land before a
      multi-process from-empty smoke can validate it:
-     - **Provision births `{self}` + grows.** Today provision empty-attaches to
-       ALL nodes with the full `X-Rewind-Voters` set (cold-multi). Change to:
-       birth `{self}` on ONE node, let the RC-6 reconciler grow it. Needs the
-       Phase-4 harness to exercise it.
      - **2c — CP directory self-grow.** The directory group is born via
        `ensureGroup(recover=true)` → `initRecover(self.voters)` (full
        `REWIND_CP_VOTERS`); it never grows. Genesis wants it born `{self}` on a

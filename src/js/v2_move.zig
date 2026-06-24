@@ -100,6 +100,14 @@ const EPOCH_HEADER = "x-rewind-epoch";
 // Absent → membership-neutral (the group's born/current prs, unchanged).
 const VOTERS_HEADER = "x-rewind-voters";
 const LEARNERS_HEADER = "x-rewind-learners";
+// Genesis §4d (attach-carry): the existing members' raft transport addresses,
+// `id@host:port,id@host:port,…`, the CP carries on the reconciler's bootstrap
+// attach so a genesis-booted joiner — which booted self-only with an EMPTY peer
+// registry — can dial the leader to ACK its appends (and reach the other members
+// for elections). The leader already learns the JOINER's address from the
+// conf-change `raft_addr`; this is the reverse direction. Absent → nothing
+// learned (a static-`REWIND_PEERS` cluster already knows every peer).
+const PEER_ADDRS_HEADER = "x-rewind-peer-addrs";
 
 /// Source-side marker key (in the tenant's own `inst.kv`) holding the
 /// destination node list — comma-separated base URLs, leader first — while a
@@ -457,6 +465,26 @@ fn handleAttach(
     if (respb.findHeader(rh, PLAN_HEADER)) |plan_blob| {
         applyPlanBlob(worker, allocator, tenant, plan_blob) catch |err|
             std.log.warn("v2-attach: applyPlanBlob({s}) failed: {s}", .{ tenant, @errorName(err) });
+    }
+
+    // Genesis §4d (attach-carry): learn the existing members' raft addresses
+    // BEFORE the group is created, so the moment the leader's first append lands
+    // this node can dial back to ACK it. A genesis joiner booted with an empty
+    // peer registry knows no addresses otherwise; a static cluster carries no
+    // header and already knows every peer (no-op). Best-effort per entry — a
+    // malformed token is skipped, never fatal (the conf-change still drives the
+    // join; a missing address just delays this node's reachability one pass).
+    if (respb.findHeader(rh, PEER_ADDRS_HEADER)) |pa| {
+        var it = std.mem.tokenizeScalar(u8, pa, ',');
+        while (it.next()) |tok| {
+            const t = std.mem.trim(u8, tok, " ");
+            const at = std.mem.indexOfScalar(u8, t, '@') orelse continue;
+            const id = std.fmt.parseInt(u64, t[0..at], 10) catch continue;
+            const addr = t[at + 1 ..];
+            if (id == 0 or addr.len == 0) continue;
+            worker.raft.learnPeerAddr(id, addr) catch |err|
+                std.log.warn("v2-attach: learnPeerAddr({d}, {s}) failed: {s}", .{ id, addr, @errorName(err) });
+        }
     }
 
     const gid = worker.raft.registerTenant(tenant) catch

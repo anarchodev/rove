@@ -645,27 +645,39 @@ const Router = struct {
         };
         defer a.free(tbody);
 
-        // 1. Empty-attach to every node → form the group across the cluster
-        //    (gap #4: multi-node formation with no move, no bundle). A new
-        //    tenant has no plan yet → free tier until `/_control/plan`.
-        //    Phase 2e (cluster node-set SSOT): birth the group with THIS cluster's
-        //    node set as the voter set (raft ids are positional — node i → id i+1,
-        //    the REWIND_PEERS convention — so the set is `1,2,…,nodes.len`). CP is
-        //    the single source; every node is told the SAME set, retiring the
-        //    per-node `REWIND_VOTERS` for tenant formation.
-        const birth_voters = clusterVotersCsv(a, nodes.len) catch {
+        // 1. Form the group. TWO births, by whether a membership reconciler is
+        //    present to GROW a single-voter group:
+        //
+        //    - Genesis §2d (born-{self}+grow, when `reconcile_membership`): birth
+        //      the group as the SOLE voter `{1}` on the FIRST node ONLY. A
+        //      born-`{self}` group auto-leads immediately (no election race —
+        //      sidesteps the cold-multi-election bug that took prod down,
+        //      `project_prod_genesis_gap`), and the RC-6 reconciler grows it to
+        //      the full node set learner-first over the next passes. This is the
+        //      path the genesis smoke validates.
+        //    - Legacy (no reconciler): birth the full node set on EVERY node
+        //      (`1,2,…,nodes.len`) — the cold-multi formation kept for
+        //      static-config clusters that have no reconciler to finish a grow.
+        //
+        //    Either way a new tenant has no plan yet → free tier until
+        //    `/_control/plan`. Raft ids are positional (node i ↔ id i+1).
+        const grow = self.reconcile_membership;
+        const birth_nodes: []const []const u8 = if (grow) nodes[0..1] else nodes;
+        const birth_voters = (if (grow) a.dupe(u8, "1") else clusterVotersCsv(a, nodes.len)) catch {
             try replyStatus(server, ent, sid, sess, 500);
             return;
         };
         defer a.free(birth_voters);
-        if (!self.attachToAll(nodes, "", tenant, null, birth_voters)) {
-            self.evictAll(tenant, nodes, tbody);
+        if (!self.attachToAll(birth_nodes, "", tenant, null, birth_voters)) {
+            self.evictAll(tenant, birth_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 502);
             return;
         }
-        // 2. Await the formed group's election so the first request finds a leader.
-        if (!self.awaitDestLeader(nodes, tenant)) {
-            self.evictAll(tenant, nodes, tbody);
+        // 2. Await the formed group's leader so the first request finds one. A
+        //    born-`{self}` group auto-leads, so this returns at once; a born-multi
+        //    group waits out its election.
+        if (!self.awaitDestLeader(birth_nodes, tenant)) {
+            self.evictAll(tenant, birth_nodes, tbody);
             try replyStatus(server, ent, sid, sess, 504);
             return;
         }
@@ -1423,7 +1435,7 @@ const Router = struct {
         }
         if (is_learner) {
             if (host == .absent)
-                return if (self.bootstrapMember(leader_url, node_url, tenant, node_id, true)) .progressed else .failed;
+                return if (self.bootstrapMember(leader_url, node_url, tenant, node_id, true, cluster_id)) .progressed else .failed;
             const last_idx = self.nodeLastIndex(node_url, tenant) orelse return .progressed;
             if (last_idx + RECONCILE_SLACK >= ms.leader_last)
                 return if (self.reconcileConfChange(leader_url, tenant, node_id, "promote", raft_addr)) .progressed else .failed;
@@ -1433,7 +1445,7 @@ const Router = struct {
         // node doesn't already host the group) then AddLearner on the leader. The
         // born-learner idles (no campaign) until the leader's AddLearner lets it
         // replicate, then it catches up + is promoted next pass.
-        if (host == .absent and !self.bootstrapMember(leader_url, node_url, tenant, node_id, true)) return .failed;
+        if (host == .absent and !self.bootstrapMember(leader_url, node_url, tenant, node_id, true, cluster_id)) return .failed;
         return if (self.reconcileConfChange(leader_url, tenant, node_id, "add", raft_addr)) .progressed else .failed;
     }
 
@@ -1532,7 +1544,32 @@ const Router = struct {
         return buf.toOwnedSlice(a);
     }
 
-    fn bootstrapMember(self: *Router, leader_url: []const u8, node_url: []const u8, tenant: []const u8, node_id: u64, as_learner: bool) bool {
+    /// Build the genesis §4d attach-carry header — `id@raft_addr,…` for every
+    /// REGISTERED cluster node EXCEPT `skip_id` (the joiner itself) — so a
+    /// genesis-booted joiner learns the existing members' transport addresses and
+    /// can ACK the leader's appends. Owned; null/empty when nothing is registered
+    /// (a static-`REWIND_PEERS` cluster), in which case the header is omitted.
+    fn peerAddrsHeader(self: *Router, cluster_id: []const u8, skip_id: u64) ?[]u8 {
+        const a = self.allocator;
+        const entries = self.directory.listClusterNodeAddrs(a, cluster_id) catch return null;
+        defer {
+            for (entries) |*e| e.deinit(a);
+            a.free(entries);
+        }
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(a);
+        for (entries) |e| {
+            if (e.id == skip_id) continue;
+            const na = Directory.unpackNodeAddr(e.bytes) orelse continue;
+            if (na.raft_addr.len == 0) continue;
+            if (out.items.len != 0) out.append(a, ',') catch return null;
+            out.writer(a).print("{d}@{s}", .{ e.id, na.raft_addr }) catch return null;
+        }
+        if (out.items.len == 0) return null;
+        return out.toOwnedSlice(a) catch null;
+    }
+
+    fn bootstrapMember(self: *Router, leader_url: []const u8, node_url: []const u8, tenant: []const u8, node_id: u64, as_learner: bool, cluster_id: []const u8) bool {
         const a = self.allocator;
         const bpath = std.fmt.allocPrint(a, "/_system/v2-applied-baseline?tenant={s}", .{tenant}) catch return false;
         defer a.free(bpath);
@@ -1592,7 +1629,12 @@ const Router = struct {
         // catches up instead of deadlocking a high-term group. The baseline's
         // ConfState (above) is authoritative for the final role; this seeds the
         // pre-baseline born state.
-        var th = [_]curl.Header{
+        // Genesis §4d (attach-carry): the existing members' raft addresses, so a
+        // genesis joiner can ACK the leader. Null on a static cluster → header
+        // omitted. Lives until the call below.
+        const peer_addrs = self.peerAddrsHeader(cluster_id, node_id);
+        defer if (peer_addrs) |pa| a.free(pa);
+        var th_buf = [_]curl.Header{
             .{ .name = TENANT_HEADER, .value = tenant },
             .{ .name = "X-Rewind-Baseline-Index", .value = bidx },
             .{ .name = "X-Rewind-Baseline-Term", .value = bterm },
@@ -1600,8 +1642,10 @@ const Router = struct {
             .{ .name = "X-Rewind-Join-As-Learner", .value = if (as_learner) "1" else "0" },
             .{ .name = "X-Rewind-Voters", .value = voters_csv },
             .{ .name = "X-Rewind-Learners", .value = learners_csv },
+            .{ .name = "X-Rewind-Peer-Addrs", .value = peer_addrs orelse "" },
         };
-        const ar = self.backendCall(node_url, "/_system/v2-attach", .POST, snap.body, &th) catch return false;
+        const th: []const curl.Header = if (peer_addrs != null) th_buf[0..8] else th_buf[0..7];
+        const ar = self.backendCall(node_url, "/_system/v2-attach", .POST, snap.body, th) catch return false;
         defer a.free(ar.body);
         if (ar.status != 204) return false;
         std.log.info("rewind-cp: reconcile bootstrapped {s} onto {s} (atomic baseline {d}/{d} epoch {d}, learner={}, conf_state voters=[{s}] learners=[{s}])", .{ tenant, node_url, bp.value.index, bp.value.term, bp.value.epoch, as_learner, voters_csv, learners_csv });
