@@ -179,7 +179,7 @@ pub const GroupSig = struct {
 /// one, enqueues a pointer, and blocks on `done` until the pump has
 /// executed it and stamped `err` — so the struct outlives the wait.
 const ControlCmd = struct {
-    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term, last_index, applied_index, group_epoch };
+    const Kind = enum { create_group_epoch, destroy_group, transfer_all_leadership, transfer_leadership, propose_conf_change, conf_state, voter_progress, apply_local_snapshot, log_term, last_index, baseline_index, applied_raw, durabilized_raw, log_entry, group_epoch };
     kind: Kind,
     gid: u64,
     /// Borrowed from the gid's `GroupSig.id_str` (pointer-stable); used by
@@ -194,9 +194,14 @@ const ControlCmd = struct {
     node_id: u64 = 0,
     cc_type: u8 = 0,
     /// `apply_local_snapshot`: the baseline {index, term} to install.
-    /// `log_term`: `snap_index` is the query index, `snap_term` the result.
+    /// `log_term` / `log_entry`: `snap_index` is the query index, `snap_term` the
+    /// result term.
     snap_index: u64 = 0,
     snap_term: u64 = 0,
+    /// `log_entry` (diagnostic): caller buffer (in) for the entry's data + the
+    /// bytes written (out). `lt_ok` flags a resolved entry.
+    entry_buf: ?[]u8 = null,
+    entry_len: usize = 0,
     /// `apply_local_snapshot` (Phase 2 — membership SSOT): the source leader's
     /// ConfState the baseline carries, so a joiner learns its membership from the
     /// snapshot. Null → keep the group's current membership (membership-neutral
@@ -251,7 +256,7 @@ const AwaitAck = struct {
 /// (the snapshot-trigger half of the raft-native alignment arc). The pump
 /// detects a peer in `ProgressState::Snapshot` (fell below the leader's
 /// compaction first_index) and enqueues the bundle's baseline {index, term}
-/// it computed on-thread (appliedIndex + logTerm are pump-only). The worker's
+/// it computed on-thread (baselineIndex + logTerm are pump-only). The worker's
 /// `SnapshotCatchupThread` then dumps the leader's store + pushes
 /// `v2-load-replace` + `v2-apply-snapshot {index, term}` to the peer, so the
 /// peer's `match` advances past first_index and `StateSnapshot` clears. The
@@ -798,6 +803,16 @@ pub const Bridge = struct {
         return cmd.count;
     }
 
+    /// Diagnostic/test: force a leadership handoff of ONE group to its most
+    /// caught-up follower (no-op if this node is not its leader). Returns 1 if a
+    /// handoff was initiated, else 0. Drives the churn soak's leadership flips.
+    pub fn transferLeadership(self: *Bridge, gid: u64) usize {
+        if (self.node.isSingleNode()) return 0;
+        var cmd: ControlCmd = .{ .kind = .transfer_leadership, .gid = gid };
+        self.runControl(&cmd) catch return 0;
+        return cmd.count;
+    }
+
     /// Operator-triggered membership change on `gid`'s group (conf_change Phase 1):
     /// `cc_type` 0 = add voter / promote, 1 = remove, 2 = add learner / demote.
     /// Runs on the pump (the only Manager toucher); leader-gated + quorum-guarded
@@ -846,6 +861,18 @@ pub const Bridge = struct {
         return if (cmd.lt_ok) cmd.snap_term else null;
     }
 
+    pub const LogEntry = struct { term: u64, data: []const u8 };
+
+    /// Diagnostic: read the raft LOG entry at `index` for `gid` into `buf` (the
+    /// replicated log content). Null on unknown group / no entry / buf too small.
+    /// `data` slices into `buf`. Pump op.
+    pub fn logEntry(self: *Bridge, gid: u64, index: u64, buf: []u8) ?LogEntry {
+        var cmd: ControlCmd = .{ .kind = .log_entry, .gid = gid, .snap_index = index, .entry_buf = buf };
+        self.runControl(&cmd) catch return null;
+        if (!cmd.lt_ok) return null;
+        return .{ .term = cmd.snap_term, .data = buf[0..cmd.entry_len] };
+    }
+
     /// This group's local raft last log index (any replica) — the reconciler's
     /// learner→promote catch-up signal. Pump op (the Manager is pump-only). 0 on
     /// unknown group / pump failure.
@@ -860,8 +887,22 @@ pub const Bridge = struct {
     /// (compacted) log index, so the baseline points at an entry the leader still
     /// holds (unlike the durabilized store watermark, which lags under churn).
     /// Pump op. 0 on unknown group / pump failure.
-    pub fn appliedIndex(self: *Bridge, gid: u64) u64 {
-        var cmd: ControlCmd = .{ .kind = .applied_index, .gid = gid };
+    pub fn baselineIndex(self: *Bridge, gid: u64) u64 {
+        var cmd: ControlCmd = .{ .kind = .baseline_index, .gid = gid };
+        self.runControl(&cmd) catch return 0;
+        return cmd.snap_index;
+    }
+
+    /// Diagnostic: this node's RAW apply watermark for `gid` (`slot.applied_idx`).
+    pub fn appliedRaw(self: *Bridge, gid: u64) u64 {
+        var cmd: ControlCmd = .{ .kind = .applied_raw, .gid = gid };
+        self.runControl(&cmd) catch return 0;
+        return cmd.snap_index;
+    }
+
+    /// Diagnostic: this node's durable folded watermark for `gid`.
+    pub fn durabilizedRaw(self: *Bridge, gid: u64) u64 {
+        var cmd: ControlCmd = .{ .kind = .durabilized_raw, .gid = gid };
         self.runControl(&cmd) catch return 0;
         return cmd.snap_index;
     }
@@ -972,6 +1013,16 @@ pub const Bridge = struct {
                     }
                     break :blk null;
                 },
+                .log_entry => blk: {
+                    if (cmd.entry_buf) |buf| {
+                        if (self.node.logEntry(cmd.gid, cmd.snap_index, buf)) |e| {
+                            cmd.snap_term = e.term;
+                            cmd.entry_len = e.data.len;
+                            cmd.lt_ok = true;
+                        }
+                    }
+                    break :blk null;
+                },
                 .log_term => blk: {
                     if (self.node.logTerm(cmd.gid, cmd.snap_index)) |t| {
                         cmd.snap_term = t;
@@ -983,8 +1034,16 @@ pub const Bridge = struct {
                     cmd.snap_index = self.node.lastIndex(cmd.gid);
                     break :blk null;
                 },
-                .applied_index => blk: {
-                    cmd.snap_index = self.node.appliedIndex(cmd.gid);
+                .baseline_index => blk: {
+                    cmd.snap_index = self.node.baselineIndex(cmd.gid);
+                    break :blk null;
+                },
+                .applied_raw => blk: {
+                    cmd.snap_index = self.node.appliedRaw(cmd.gid);
+                    break :blk null;
+                },
+                .durabilized_raw => blk: {
+                    cmd.snap_index = self.node.durabilizedRaw(cmd.gid);
                     break :blk null;
                 },
                 .group_epoch => blk: {
@@ -1017,6 +1076,13 @@ pub const Bridge = struct {
                     for (gids.items) |gid| {
                         if (self.node.transferLeadershipAway(gid) != null) cmd.count += 1;
                     }
+                    break :blk null;
+                },
+                .transfer_leadership => blk: {
+                    // Diagnostic/test: force a leadership handoff of ONE group to
+                    // its most caught-up follower (no-op if not the leader). Used by
+                    // the churn soak to flip leadership under in-flight writes.
+                    cmd.count = if (self.node.transferLeadershipAway(cmd.gid) != null) 1 else 0;
                     break :blk null;
                 },
             };
@@ -1173,7 +1239,7 @@ pub const Bridge = struct {
     /// in `ProgressState::Snapshot` (the snapshot-free `snapshotCb` parks a peer
     /// here once it falls below the leader's compacted first_index) and enqueue an
     /// out-of-band catch-up for each. The baseline {index, term} is computed HERE
-    /// (pump-only `appliedIndex` + `logTerm`); the worker's `SnapshotCatchupThread`
+    /// (pump-only `baselineIndex` + `logTerm`); the worker's `SnapshotCatchupThread`
     /// dumps the store + pushes it to the peer. Interval-gated; reads pump-owned
     /// `node.active` + node accessors with the bridge mutex NOT held (enqueue takes
     /// it internally). O(active peers).
@@ -1191,7 +1257,7 @@ pub const Bridge = struct {
             // own log can't resolve a term (watermark drifted ahead of the log) —
             // skip this tick and retry once the log covers it, exactly as
             // `v2-applied-baseline` refuses rather than hand out a bogus term.
-            const index = self.node.appliedIndex(gid);
+            const index = self.node.baselineIndex(gid);
             if (index == 0) continue; // nothing applied yet — nothing to snapshot
             const term = self.node.logTerm(gid, index) orelse continue;
             for (peers) |peer| {
@@ -1443,7 +1509,16 @@ pub const Bridge = struct {
             // PAST the entry. Surface it as a pump apply error instead.
             if (self.node.apply_mode == .worker_overlay and seq > sig.worker_acked_seq) {
                 sig.awaiting_worker.append(self.allocator, .{ .seq = seq, .idx = raft_index }) catch {
+                    // OOM recording this entry's durabilize-floor cap. We must
+                    // NOT fall through to advance `committed_seq`: the worker
+                    // folds on that watermark, and with the floor entry missing
+                    // durabilize/compaction can run PAST this entry → false
+                    // durability / premature fold (the exact unrepairable state
+                    // — a fold has no rollback by construction). Set the fatal
+                    // apply_err and bail; the pump aborts loudly before any
+                    // unsafe fold. (Triage RC-1: bridge-OOM fall-through.)
                     self.node.apply_err = node_mod.Error.OutOfMemory;
+                    return;
                 };
             }
             // Proposes are per-tenant FIFO so commits arrive in seq order;
@@ -2047,6 +2122,86 @@ test "bridge: durabilize floor holds until the worker acks the skipped entry's t
     }
     try testing.expectEqual(slot.applied_idx, slot.durabilized_idx);
     try testing.expect(!slot.in_dirty);
+}
+
+test "bridge: catch-up baseline index never exceeds the durable snapshot content watermark" {
+    // RC-1 regression (the prod __auth__ store fork). The out-of-band catch-up /
+    // move ships {baseline index, snapshot}. The snapshot (StreamDumper.openSnapshot)
+    // reflects the COMMITTED/folded overlay, whose watermark is `durabilized_idx`.
+    // The baseline index MUST be <= that, or the receiver's apply_local_snapshot
+    // fast-forwards commit PAST writes the snapshot lacks -> permanent store fork at
+    // an agreed log index. The dangerous window: a worker_overlay own-propose whose
+    // entry is APPLIED (applied_idx bumped) but not yet FOLDED (worker txn open), so
+    // applied_idx > durabilized_idx. Before the fix the baseline source returned
+    // applied_idx (over-claim); it must return the folded watermark.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const bridge = try Bridge.initSingleNode(a, dir);
+    defer bridge.deinit();
+    bridge.setWorkerOverlay();
+    bridge.node.durabilize_interval_ns = 0; // fold every cycle
+
+    const store_path = try std.fmt.allocPrintSentinel(a, "{s}/worker.db", .{dir}, 0);
+    defer a.free(store_path);
+    const worker_store = try node_mod.KvStore.open(a, store_path);
+    defer worker_store.close();
+    const Res = struct {
+        store: *node_mod.KvStore,
+        fn resolve(ctx: *anyopaque, gid: u64, id_str: []const u8) ?*node_mod.KvStore {
+            _ = gid;
+            _ = id_str;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.store;
+        }
+    };
+    var res: Res = .{ .store = worker_store };
+    bridge.setStoreResolver(.{ .ctx = &res, .func = Res.resolve });
+
+    const gid = try bridge.registerTenant("flo");
+
+    // Write 1: propose, commit, ack the worker txn, and let durabilize FOLD it.
+    // durabilized_idx now tracks a real folded entry (not 0).
+    var ws1 = WriteSet.init(a);
+    defer ws1.deinit();
+    try ws1.addPut("k1", "v1");
+    const env1 = try encodeWs(a, "flo", &ws1);
+    defer a.free(env1);
+    const seq1 = try bridge.propose(gid, env1);
+    var spins: u32 = 0;
+    while (bridge.committedSeq(gid) < seq1 and spins < 400) : (spins += 1) _ = try bridge.pumpOnce();
+    try testing.expectEqual(seq1, bridge.committedSeq(gid));
+    bridge.noteWorkerCommitted(gid, seq1);
+    const slot = bridge.node.groups.get(gid).?;
+    spins = 0;
+    while (slot.durabilized_idx < slot.applied_idx and spins < 20) : (spins += 1) _ = try bridge.pumpOnce();
+    try testing.expectEqual(slot.applied_idx, slot.durabilized_idx);
+    const folded = slot.durabilized_idx;
+    try testing.expect(folded > 0);
+
+    // Write 2: propose + commit but do NOT ack the worker txn — durabilize cannot
+    // fold past it, so applied_idx advances ABOVE durabilized_idx (the fold-lag
+    // window). The folded snapshot still only contains write 1.
+    var ws2 = WriteSet.init(a);
+    defer ws2.deinit();
+    try ws2.addPut("k2", "v2");
+    const env2 = try encodeWs(a, "flo", &ws2);
+    defer a.free(env2);
+    const seq2 = try bridge.propose(gid, env2);
+    spins = 0;
+    while (bridge.committedSeq(gid) < seq2 and spins < 400) : (spins += 1) _ = try bridge.pumpOnce();
+    spins = 0;
+    while (spins < 10) : (spins += 1) _ = try bridge.pumpOnce();
+    try testing.expect(slot.durabilized_idx < slot.applied_idx); // window exists
+    try testing.expectEqual(folded, slot.durabilized_idx); // snapshot still = write 1
+
+    // THE INVARIANT: the baseline index shipped with the (folded) snapshot must not
+    // exceed what the snapshot contains. RED before the fix (returned applied_idx).
+    try testing.expect(bridge.node.baselineIndex(gid) <= slot.durabilized_idx);
+    try testing.expectEqual(slot.durabilized_idx, bridge.node.baselineIndex(gid));
 }
 
 test "bridge: createGroupEpoch requires a running pump thread" {

@@ -1117,6 +1117,14 @@ pub fn build(b: *std.Build) void {
     const cp_step = b.step("rewind-cp", "Build the V2 control-plane binary");
     cp_step.dependOn(&b.addInstallArtifact(cp_exe, .{}).step);
 
+    // cp unit tests as a SEPARATE step — deliberately NOT added to the aggregate
+    // `test`: cp_mod imports the raft-rs `bridge` (cargo linkage), kept out of the
+    // lightweight `zig build test` (same reason rewind/main.zig is). Run with
+    // `zig build rewind-cp-test`.
+    const cp_tests = b.addTest(.{ .root_module = cp_mod });
+    const cp_test_step = b.step("rewind-cp-test", "Run the rewind-cp unit tests");
+    cp_test_step.dependOn(&b.addRunArtifact(cp_tests).step);
+
     // ── rewind-ops: the platform/operator CLI (docs/rewind-cli-plan.md §2–§3,
     // §6). The privileged half of the split (root + move-secret + ops-secret);
     // the OIDC-scoped customer `rewind` binary lands later, sharing

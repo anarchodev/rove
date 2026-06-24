@@ -223,6 +223,21 @@ const Router = struct {
     /// unattended actor on prod must be deliberately enabled.
     reconcile_membership: bool = false,
 
+    /// RC-6 demote hysteresis. A reconciler demote-to-learner of a voter judged
+    /// `!recent_active` must require SUSTAINED inactivity, never a single reading:
+    /// a rolling deploy makes a HEALTHY voter transiently unreachable for the
+    /// length of its restart, and a one-shot demote would tear that voter out of
+    /// the config — shrinking the voter set and enabling sub-majority commit
+    /// (RC-1's trigger by another route). A demote candidate's FIRST
+    /// `!recent_active` observation starts a timer (keyed `tenant|node_id`); the
+    /// demote fires only after it has stayed inactive for `demote_grace_ns`. Any
+    /// other observed state (responsive again, or no longer a hosted voter) clears
+    /// the timer, so a long-ago transient never carries into a later window.
+    /// Tunable via `REWIND_CP_DEMOTE_GRACE_MS` (default 60s — comfortably longer
+    /// than a worker restart + group recover).
+    demote_grace_ns: i128 = 60 * std.time.ns_per_s,
+    demote_inactive_since: std.StringHashMapUnmanaged(i128) = .empty,
+
     /// Reply helper: set an immediate status (no body) on the request
     /// entity and move it to response_in.
     fn replyStatus(server: *CpH2, ent: rove.Entity, sid: h2.StreamId, sess: h2.Session, code: u16) !void {
@@ -1245,6 +1260,33 @@ const Router = struct {
         return false;
     }
 
+    /// RC-6 hysteresis: true iff `node_id` of `tenant` has been a continuous
+    /// demote candidate (`!recent_active`, still a hosted voter) for at least
+    /// `demote_grace_ns`. The FIRST call starts the timer and returns false, so a
+    /// single `!recent_active` reading (a transient restart) never demotes.
+    fn demoteGraceElapsed(self: *Router, tenant: []const u8, node_id: u64) bool {
+        var kbuf: [512]u8 = undefined;
+        const key = std.fmt.bufPrint(&kbuf, "{s}|{d}", .{ tenant, node_id }) catch return false;
+        const now = std.time.nanoTimestamp();
+        if (self.demote_inactive_since.getPtr(key)) |since|
+            return now - since.* >= self.demote_grace_ns;
+        // First observation — start the grace window; never demote on it.
+        const owned = self.allocator.dupe(u8, key) catch return false;
+        self.demote_inactive_since.put(self.allocator, owned, now) catch {
+            self.allocator.free(owned);
+            return false;
+        };
+        return false;
+    }
+
+    /// Clear `node_id` of `tenant`'s demote grace timer — the voter recovered
+    /// (recent_active) or left the hosted-voter state, so the window resets.
+    fn clearDemoteTimer(self: *Router, tenant: []const u8, node_id: u64) void {
+        var kbuf: [512]u8 = undefined;
+        const key = std.fmt.bufPrint(&kbuf, "{s}|{d}", .{ tenant, node_id }) catch return;
+        if (self.demote_inactive_since.fetchRemove(key)) |kv| self.allocator.free(kv.key);
+    }
+
     /// Advance node `node_id` (at `node_url`) ONE step toward being a caught-up
     /// voter of `tenant`'s group, talking to `leader_url`. `.done` when already a
     /// caught-up voter, `.progressed` after a step (re-check next pass), `.failed`
@@ -1271,7 +1313,10 @@ const Router = struct {
             for (ms.peers) |p| {
                 if (p.id == node_id) {
                     voter_recent_active = p.recent_active;
-                    if (p.recent_active and p.matched + RECONCILE_SLACK >= ms.leader_last) return .done;
+                    if (p.recent_active and p.matched + RECONCILE_SLACK >= ms.leader_last) {
+                        self.clearDemoteTimer(tenant, node_id); // responsive + caught up → reset grace
+                        return .done;
+                    }
                     break;
                 }
             }
@@ -1286,6 +1331,13 @@ const Router = struct {
         const host = self.nodeGroupState(node_url, tenant);
         if (host == .unknown) return .failed; // can't observe → never mutate; retry next pass
 
+        // RC-6 hysteresis bookkeeping: keep a demote grace timer ONLY while the
+        // node is an actual demote candidate (a hosted voter the leader hasn't
+        // heard from). Any other observed state resets it, so a transient
+        // inactivity long ago can't carry into a later window and demote instantly.
+        if (!(is_voter and host == .hosted and !voter_recent_active))
+            self.clearDemoteTimer(tenant, node_id);
+
         if (is_voter) {
             if (host == .hosted) {
                 // DEMOTE only a STUCK voter — one the leader has NOT heard from
@@ -1297,8 +1349,17 @@ const Router = struct {
                 // up fine via normal replication and is NOT disrupting elections —
                 // demoting it just churns healthy voters on a busy group (B1).
                 // Leave it; raft replicates the tail.
-                if (!voter_recent_active)
+                if (!voter_recent_active) {
+                    // RC-6: demote only after SUSTAINED inactivity
+                    // (REWIND_CP_DEMOTE_GRACE_MS). A single !recent_active reading
+                    // is a transient restart, not a stuck voter, and tearing out a
+                    // healthy-but-restarting voter shrinks the voter set →
+                    // sub-majority commit (RC-1's trigger). Wait out the grace; a
+                    // genuinely stuck voter stays inactive across it and is demoted.
+                    if (!self.demoteGraceElapsed(tenant, node_id)) return .done;
+                    self.clearDemoteTimer(tenant, node_id);
                     return if (self.reconcileConfChange(leader_url, tenant, node_id, "demote")) .progressed else .failed;
+                }
                 return .done; // responsive, just behind — no membership change needed
             }
             // host == .absent: a CONFIRMED phantom voter (configured voter,
@@ -1771,7 +1832,13 @@ pub fn main() !void {
         std.log.err("rewind-cp: REWIND_CP_RECONCILE_MEMBERSHIP=1 requires REWIND_MOVE_SECRET", .{});
         return error.MissingMoveSecret;
     }
-    var router = Router{ .allocator = allocator, .directory = directory, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx, .acme = acme_handle, .reconcile_membership = reconcile_membership };
+    // RC-6 demote hysteresis grace (default 60s); tunable for tests/operators.
+    const demote_grace_ns: i128 = blk: {
+        const v = std.posix.getenv("REWIND_CP_DEMOTE_GRACE_MS") orelse break :blk 60 * std.time.ns_per_s;
+        const ms = std.fmt.parseInt(i64, std.mem.trim(u8, v, " \t"), 10) catch break :blk 60 * std.time.ns_per_s;
+        break :blk @as(i128, ms) * std.time.ns_per_ms;
+    };
+    var router = Router{ .allocator = allocator, .directory = directory, .move_secret = move_secret, .cp_peer_urls = cp_peer_urls, .self_cp_idx = cp_self_idx, .acme = acme_handle, .reconcile_membership = reconcile_membership, .demote_grace_ns = demote_grace_ns };
 
     // Periodic membership reconciliation on the directory leader (between
     // request batches). last=0 → the first iteration reconciles, so a CP
@@ -1808,4 +1875,50 @@ pub fn main() !void {
         }
     }
     std.log.info("rewind-cp: shut down", .{});
+}
+
+// ── RC-6 demote hysteresis ───────────────────────────────────────────────────
+
+test "RC-6: demote needs sustained inactivity — a recovery before the grace resets it" {
+    const a = std.testing.allocator;
+    // Only the demote-timer fields are exercised by demoteGraceElapsed /
+    // clearDemoteTimer; the rest of Router is never touched here.
+    var r: Router = undefined;
+    r.allocator = a;
+    r.demote_inactive_since = .empty;
+    defer {
+        var it = r.demote_inactive_since.iterator();
+        while (it.next()) |e| a.free(e.key_ptr.*);
+        r.demote_inactive_since.deinit(a);
+    }
+
+    // grace 0: the SECOND consecutive inactive observation is already past the
+    // window. Even so, a demote NEVER fires on the FIRST observation — a single
+    // !recent_active reading is always treated as a transient.
+    r.demote_grace_ns = 0;
+
+    // SUSTAINED candidate (the genuinely-stuck voter): obs #1 starts the timer
+    // (no demote), obs #2 is past the (zero) grace → demote. This proves the
+    // mechanism still demotes a real stuck voter.
+    try std.testing.expect(!r.demoteGraceElapsed("stuck", 2)); // obs #1 — never on first sight
+    try std.testing.expect(r.demoteGraceElapsed("stuck", 2)); // obs #2 — sustained → demote
+
+    // TRANSIENT-THEN-RECOVER (the rolling-restart hazard): SAME grace (0), SAME
+    // two inactive observations — but the voter RECOVERS (timer cleared) in
+    // between, so the post-recovery observation is a fresh "first" and must NOT
+    // demote. The recovery is the only difference from the sustained case above,
+    // and it flips the outcome demote → no-demote.
+    try std.testing.expect(!r.demoteGraceElapsed("flap", 3)); // obs #1 inactive (transient)
+    r.clearDemoteTimer("flap", 3); //                            recovered: recent_active again
+    try std.testing.expect(!r.demoteGraceElapsed("flap", 3)); // obs after recovery — NOT demoted
+
+    // Distinct (tenant,node) keys never share a window.
+    try std.testing.expect(!r.demoteGraceElapsed("flap", 4)); // different node → own fresh timer
+    try std.testing.expect(!r.demoteGraceElapsed("other", 3)); // different tenant → own fresh timer
+
+    // A real (non-zero) grace never demotes within the window, across repeated
+    // observations — a voter inactive for < grace is left a voter.
+    r.demote_grace_ns = 60 * std.time.ns_per_s;
+    try std.testing.expect(!r.demoteGraceElapsed("slow", 5));
+    try std.testing.expect(!r.demoteGraceElapsed("slow", 5)); // still within 60s → no demote
 }
