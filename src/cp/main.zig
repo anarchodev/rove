@@ -392,7 +392,8 @@ const Router = struct {
     }
 
     /// `GET /_cp/cert?host=H` — the host's packed TLS cert+key frame
-    /// (`[4B cert_len][cert][key]`, application/octet-stream), or 404 if no
+    /// (`[1B version][4B cert_len][cert][key]`, application/octet-stream;
+    /// served verbatim — the front door unpacks), or 404 if no
     /// cert is stored (the front door then SNI-falls-back to the platform
     /// wildcard / refuses). The stateless front-door pool pulls this for SNI
     /// termination (gap #3). No auth: it serves only over the private CP

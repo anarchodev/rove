@@ -79,7 +79,11 @@
 
 const std = @import("std");
 const node_mod = @import("node.zig");
-const envelope = @import("envelope.zig");
+/// Re-exported (`pub`) so the format-version registry can read the
+/// entry-frame magic + coalesced-transport frame version through the
+/// worker's `bridge` import (`src/version.zig`).
+pub const envelope = @import("envelope.zig");
+pub const transport = @import("transport.zig");
 const kvlimbs = @import("kvlimbs");
 
 pub const Node = node_mod.Node;

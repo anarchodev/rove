@@ -213,6 +213,14 @@ pub const TapePayloads = struct {
     /// scalar — no per-call tape entries. Zero is the default for
     /// non-handler paths.
     timestamp_ns: i64 = 0,
+    /// The JS engine version that executed this request
+    /// (`docs/format-versioning-audit.md` §4). Copied from
+    /// `Readset.js_engine_version` at capture; surfaced in the log
+    /// JSON so the replayer can later fetch the matching engine.
+    /// Zero = unknown (non-handler / pre-stamp paths). A passenger on
+    /// the record co-located with the other per-request execution
+    /// scalars (`seed`/`timestamp_ns`).
+    js_engine_version: u16 = 0,
     kv_tape_bytes: []const u8 = &.{},
     module_tree_bytes: []const u8 = &.{},
     /// `docs/readset-replication-plan.md` Phase 2c-2. Per-`http.fetch`
@@ -270,6 +278,62 @@ pub const TapePayloads = struct {
     }
 };
 
+// ── Customer-facing ID formatting (format-versioning-audit.md §7.5) ────
+//
+// All customer-visible IDs carry a Stripe-style type prefix so every ID
+// format stays versionable behind its prefix and reads as opaque. The
+// INTERNAL representation is unchanged (request/deployment ids stay a
+// u64 — `worker_id<<48 | seq` for requests — in the index, cursors, and
+// storage); the prefix is applied only at customer boundaries: the JS
+// `request.actor.request_id` surface and the logs API the dashboard
+// serves (`/show`, the list + its cursor). Documented opaque — customers
+// must NOT parse these (handler-shape.md §9). The raw hex still encodes
+// `worker_id`; the prefix signalling "opaque, don't parse" is the agreed
+// mitigation (opaque-by-contract decision, 2026-06-23) rather than a
+// reversible mix.
+pub const REQUEST_ID_PREFIX = "req_";
+pub const DEPLOYMENT_ID_PREFIX = "dep_";
+/// Session / fetch ids are 64-hex (CSPRNG / SHA-256), not the u64 form
+/// above, so they're prefixed by plain concatenation at their JS
+/// surfaces (`request.session.id`, `activation.fetch_id`) rather than
+/// through `formatPrefixedId`. The internal cookie / router-key / S3-key
+/// representations stay bare. Same opaque-token contract (§7.5).
+pub const SESSION_ID_PREFIX = "sess_";
+pub const FETCH_ID_PREFIX = "ftch_";
+/// Buffer size a `formatPrefixedId` caller must provide: longest req/dep
+/// prefix (4) + 16 hex digits.
+pub const PREFIXED_ID_BUF: usize = 4 + 16;
+
+/// Write `{prefix}{id:0>16x}` into `buf`, returning the written slice.
+/// `buf` must be ≥ `prefix.len + 16` bytes (`PREFIXED_ID_BUF`).
+pub fn formatPrefixedId(buf: []u8, prefix: []const u8, id: u64) []const u8 {
+    @memcpy(buf[0..prefix.len], prefix);
+    _ = std.fmt.bufPrint(buf[prefix.len..], "{x:0>16}", .{id}) catch unreachable;
+    return buf[0 .. prefix.len + 16];
+}
+
+/// Parse a `{prefix}{16hex}` customer id back to the internal u64, or
+/// null if the prefix is missing or the hex is malformed. The logs API
+/// uses this to accept the same opaque token it handed out (the `/show`
+/// path segment and the list `after_request_id` cursor).
+pub fn parsePrefixedId(prefix: []const u8, s: []const u8) ?u64 {
+    if (!std.mem.startsWith(u8, s, prefix)) return null;
+    return std.fmt.parseInt(u64, s[prefix.len..], 16) catch null;
+}
+
+test "prefixed id round-trips and rejects bad input" {
+    var buf: [PREFIXED_ID_BUF]u8 = undefined;
+    // worker_id 0xCAFE in the top 16 bits, seq 1 — the real mint shape.
+    const id: u64 = (@as(u64, 0xCAFE) << 48) | 1;
+    const s = formatPrefixedId(&buf, REQUEST_ID_PREFIX, id);
+    try std.testing.expectEqualStrings("req_cafe000000000001", s);
+    try std.testing.expectEqual(id, parsePrefixedId(REQUEST_ID_PREFIX, s).?);
+    // Wrong prefix / malformed hex / bare hex all reject.
+    try std.testing.expect(parsePrefixedId(DEPLOYMENT_ID_PREFIX, s) == null);
+    try std.testing.expect(parsePrefixedId(REQUEST_ID_PREFIX, "req_xyz") == null);
+    try std.testing.expect(parsePrefixedId(REQUEST_ID_PREFIX, "cafe000000000001") == null);
+}
+
 /// One request's log entry. All `[]const u8` fields are owned by the
 /// record (allocated via the buffer's allocator). `deinit` frees them.
 pub const LogRecord = struct {
@@ -278,6 +342,10 @@ pub const LogRecord = struct {
     /// tenants — the indexer demuxes on this field. Owned slice.
     tenant_id: []const u8,
     /// Combined identifier: upper 16 bits = worker_id, lower 48 = seq.
+    /// INTERNAL u64 (index key + pagination cursor). Surfaced to
+    /// customers only as the opaque prefixed `req_<16hex>` form
+    /// (`formatPrefixedId` / `REQUEST_ID_PREFIX`) — never the bare
+    /// integer. See §7.5.
     request_id: u64,
     /// The deployment that was active when this request ran.
     /// Pulled from `TenantFiles.current_deployment_id`. Replay needs

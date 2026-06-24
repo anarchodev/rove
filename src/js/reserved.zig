@@ -13,11 +13,17 @@
 //!   allowed; the fire-time guard skips dispatch on platform keys.
 //!
 //! - `isCustomerWriteReserved` (runtime guard on `kv.set` / `kv.delete`):
-//!   rejects any key starting with a platform prefix. Customer code has
-//!   no business writing into `_callback/`, `_audit/`, etc. — those
-//!   are platform-write-only. Platform writes bypass `jsKvSet` and
-//!   write directly via `state.txn.put`, so this check catches only
-//!   the spoofing path through `kv.set`.
+//!   the ENTIRE leading-`_` keyspace is platform-reserved against customer
+//!   writes, EXCEPT the `SHIM_WRITABLE_PREFIXES` the JS shims must write
+//!   from ordinary handler context. Reserving the whole namespace (rather
+//!   than an enumerated list) is the pre-customer lock-in fix: any NEW
+//!   platform `_…/` key family is safe to introduce later without
+//!   colliding with customer data (docs/format-versioning-audit.md §7.1).
+//!   Customers get the entire non-`_` keyspace. Reads are NOT guarded
+//!   (`_config/` is a documented customer-readable namespace). Platform Zig
+//!   writers bypass `jsKvSet` and write via `state.txn.put` directly, and
+//!   `__system/` modules bypass via `is_system_module`, so this check fires
+//!   only on customer (or shim) JS through `kv.set`.
 
 const std = @import("std");
 
@@ -59,26 +65,11 @@ const std = @import("std");
 ///   `_triggers/`        → trigger module bytecode (manifest, not app.db)
 ///   `_sessions/`        → reserved for future platform session storage
 ///
-/// `_send/` USED to be reserved (the Zig http.send binding wrote to
-/// `_send/owed/{id}` from privileged code; the apply-time
-/// classifier armed SendDispatch on each put). Phase 5 PR-3
-/// retired the Zig kernel — `webhook.send` (the JS-shim in
-/// `globals/webhook.js`) is now customer JS that writes the
-/// marker via ordinary `kv.set`. So the prefix is no longer
-/// platform-only; the only effect a customer faking the key has is
-/// queuing the JS-shim retry sweep to attempt their request — which
-/// is exactly what calling webhook.send does. No spoofing surface.
-///
-/// `_blob/` follows the `_send/` rule: the `blob.put` JS shim
-/// (`globals/blob.js`) writes its `_blob/owed/{hash}` marker via
-/// ordinary `kv.set`, so the prefix CANNOT be platform-reserved (the
-/// write guard would reject the shim itself). A customer faking the
-/// key creates a stale marker nobody consumes — no spoofing surface.
-///
-/// `_events/` was reserved for SSE event rows under the legacy worker
-/// pump; the centralized sse-server retired that storage layer
-/// (sse-plan §7), so the prefix is no longer special — customer code
-/// is free to use it.
+/// Used only by `isReservedTriggerPrefix` (the deploy-load trigger guard).
+/// The customer-WRITE guard no longer pivots on this enumerated list — it
+/// reserves the whole leading-`_` keyspace minus `SHIM_WRITABLE_PREFIXES`
+/// (see below). This list stays as the catalog of *known* platform-owned
+/// namespaces for the bidirectional trigger-prefix collision check.
 pub const PLATFORM_KV_PREFIXES = [_][]const u8{
     "_app/",
     "_audit/",
@@ -89,6 +80,38 @@ pub const PLATFORM_KV_PREFIXES = [_][]const u8{
     "_magic/",
     "_triggers/",
     "_sessions/",
+};
+
+/// Leading-`_` prefixes that platform JS *shims* write into a tenant's own
+/// store from ordinary (non-`__system/`) handler context. These CANNOT be
+/// denied to `kv.set` without breaking the shim itself, so they are the
+/// explicit exception to the blanket leading-`_` reservation.
+///
+/// They are "platform-managed but not platform-reserved": a customer that
+/// writes one of these in their OWN store only corrupts their own durability
+/// markers (a per-tenant self-footgun — no cross-tenant or platform-integrity
+/// impact, since every store is per-tenant). Fully closing that footgun would
+/// require a privileged write binding the shims capture pre-`_harden`
+/// (docs/format-versioning-audit.md §7.1 option (a)); deferred.
+///
+/// Enumerated by auditing every `kv.set`/`kv.delete` in `globals/*.js`
+/// (their default config paths). Keep in sync when a shim adds a `_`-prefix:
+///   `_send/`  — webhook.send durability marker (globals/webhook.js)
+///   `_blob/`  — blob.put durability marker (globals/blob.js)
+///   `_sched/` — durable scheduler queue, by_id + by_time (globals/scheduler.js)
+///   `_seg/`   — append-only segment streams (globals/segments.js)
+///   `_oidc/`  — OIDC provider state: session/keyset/code/at/rt/device
+///               (globals/oidc.js, provider() defaults)
+///   `_rp/`    — OIDC relying-party state: state/sess/jwks (globals/oidc.js)
+/// (`_admin/operator/` is READ-only from shims — the is_root allowlist,
+/// seeded out-of-band via rewind-ops — so it stays fully reserved.)
+pub const SHIM_WRITABLE_PREFIXES = [_][]const u8{
+    "_send/",
+    "_blob/",
+    "_sched/",
+    "_seg/",
+    "_oidc/",
+    "_rp/",
 };
 
 /// Customer trigger registration prefix collides with a platform
@@ -102,16 +125,20 @@ pub fn isReservedTriggerPrefix(prefix: []const u8) bool {
     return false;
 }
 
-/// Customer `kv.set` / `kv.delete` target lands in a platform-reserved
-/// namespace. Platform writes bypass these JS bindings and reach
-/// `state.txn` / `state.writeset` directly, so this only fires when
-/// customer code (or buggy customer-loaded modules) tries to spoof a
-/// platform key.
+/// Customer `kv.set` / `kv.delete` target lands in the platform-reserved
+/// keyspace: any key with a leading `_`, EXCEPT the `SHIM_WRITABLE_PREFIXES`
+/// the JS shims must write from handler context. Customers own the entire
+/// non-`_` keyspace. Reserving the whole `_` namespace (vs. an enumerated
+/// list) is what lets the platform claim new `_…/` key families later
+/// without colliding with customer data. Platform Zig writes bypass these JS
+/// bindings (`state.txn`/`state.writeset` directly) and `__system/` modules
+/// bypass via `is_system_module`, so this only fires on customer/shim JS.
 pub fn isCustomerWriteReserved(key: []const u8) bool {
-    for (PLATFORM_KV_PREFIXES) |p| {
-        if (std.mem.startsWith(u8, key, p)) return true;
+    if (key.len == 0 or key[0] != '_') return false;
+    for (SHIM_WRITABLE_PREFIXES) |p| {
+        if (std.mem.startsWith(u8, key, p)) return false;
     }
-    return false;
+    return true;
 }
 
 test "isReservedTriggerPrefix: catch-all is allowed" {
@@ -161,7 +188,7 @@ test "isReservedTriggerPrefix: deeper-than-platform blocked (would catch system 
     try std.testing.expect(isReservedTriggerPrefix("_callback/specific_id"));
 }
 
-test "isCustomerWriteReserved: platform prefixes blocked" {
+test "isCustomerWriteReserved: known platform prefixes blocked" {
     try std.testing.expect(isCustomerWriteReserved("_app/manifest"));
     try std.testing.expect(isCustomerWriteReserved("_callback/xyz"));
     try std.testing.expect(isCustomerWriteReserved("_audit/anything"));
@@ -169,29 +196,40 @@ test "isCustomerWriteReserved: platform prefixes blocked" {
     try std.testing.expect(isCustomerWriteReserved("_log/next_request_seq"));
     try std.testing.expect(isCustomerWriteReserved("_magic/token"));
     try std.testing.expect(isCustomerWriteReserved("_triggers/users/index.mjs"));
+    try std.testing.expect(isCustomerWriteReserved("_deploy/current"));
+    // `_admin/` is read-only from shims (is_root allowlist) → reserved.
+    try std.testing.expect(isCustomerWriteReserved("_admin/operator/abc"));
 }
 
-test "isCustomerWriteReserved: _events/ no longer reserved" {
-    try std.testing.expect(!isCustomerWriteReserved("_events/sid/0001-000001"));
+test "isCustomerWriteReserved: whole leading-_ keyspace reserved" {
+    // The pre-customer lock-in fix: ANY leading-`_` key not in the
+    // shim-writable allowlist is reserved, including ones with no platform
+    // owner today (so we can claim them later). Retired prefixes
+    // (`_events/`, `_outbox/`, `_dlq/`) and bare `_foo` are now reserved.
+    try std.testing.expect(isCustomerWriteReserved("_events/sid/0001"));
+    try std.testing.expect(isCustomerWriteReserved("_outbox/abc"));
+    try std.testing.expect(isCustomerWriteReserved("_dlq/abc"));
+    try std.testing.expect(isCustomerWriteReserved("_outbox_inflight/abc"));
+    try std.testing.expect(isCustomerWriteReserved("_my_data"));
+    try std.testing.expect(isCustomerWriteReserved("_"));
+    try std.testing.expect(isCustomerWriteReserved("_anything/at/all"));
 }
 
-test "isCustomerWriteReserved: customer keys allowed" {
+test "isCustomerWriteReserved: shim-writable prefixes allowed" {
+    // The JS shims write these from customer handler context, so they
+    // must remain writable through `kv.set` (see SHIM_WRITABLE_PREFIXES).
+    try std.testing.expect(!isCustomerWriteReserved("_send/owed/abc"));
+    try std.testing.expect(!isCustomerWriteReserved("_blob/owed/deadbeef"));
+    try std.testing.expect(!isCustomerWriteReserved("_sched/by_id/abc"));
+    try std.testing.expect(!isCustomerWriteReserved("_sched/by_time/000/abc"));
+    try std.testing.expect(!isCustomerWriteReserved("_seg/room/h/0001"));
+    try std.testing.expect(!isCustomerWriteReserved("_oidc/session/sid"));
+    try std.testing.expect(!isCustomerWriteReserved("_rp/sess/sid"));
+}
+
+test "isCustomerWriteReserved: customer (non-_) keys allowed" {
     try std.testing.expect(!isCustomerWriteReserved(""));
     try std.testing.expect(!isCustomerWriteReserved("users/alice"));
     try std.testing.expect(!isCustomerWriteReserved("my_audit/"));
     try std.testing.expect(!isCustomerWriteReserved("orders/123"));
-    // Single-leading-underscore keys without trailing slash aren't
-    // reserved (only the prefixes that include `/` are).
-    try std.testing.expect(!isCustomerWriteReserved("_my_data"));
-    // Historical drainer prefixes are no longer reserved (Phase 5.5
-    // (d) deleted the drainer; the prefix names are now free for
-    // customer use).
-    try std.testing.expect(!isCustomerWriteReserved("_outbox/abc"));
-    try std.testing.expect(!isCustomerWriteReserved("_dlq/abc"));
-    try std.testing.expect(!isCustomerWriteReserved("_outbox_inflight/abc"));
-}
-
-test "isCustomerWriteReserved: exact prefix without trailing key part is blocked" {
-    // The prefix itself counts as a write into the namespace.
-    try std.testing.expect(isCustomerWriteReserved("_callback/"));
 }

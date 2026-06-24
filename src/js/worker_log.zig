@@ -138,6 +138,7 @@ pub fn captureTapes(
     var payloads: log_mod.TapePayloads = .{
         .seed = readset.seed,
         .timestamp_ns = readset.timestamp_ns,
+        .js_engine_version = readset.js_engine_version,
     };
 
     const channels = [_]struct {

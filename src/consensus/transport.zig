@@ -25,8 +25,17 @@
 //! and CRC-checks it on receive (and handles the IDENT handshake, so our
 //! payload is never a connection's first frame). Our payload is:
 //!
+//!     [version:u8]
 //!     [count:u32 LE]
 //!     count × [group_id:u64 LE][epoch:u64 LE][msg_len:u32 LE][msg bytes]
+//!
+//! The leading `version` byte is a single frame-level discriminant
+//! (`docs/format-versioning-audit.md` §3.2 — "version without widening
+//! the per-record header"): one byte amortized over a whole coalesced
+//! frame, zero per-record growth, so the deliberately-shrunk 20-byte
+//! record header (Phase 2f) is untouched. The decoder rejects an unknown
+//! version loudly (rate-limited) rather than mis-stepping garbage into
+//! the Manager.
 //!
 //! `msg bytes` is the opaque rust-protobuf `eraftpb::Message` from
 //! `takeMessages`, fed verbatim to the peer's `stepBatch`/`stepFenced`.
@@ -84,11 +93,18 @@ const OutBuf = struct {
 /// (The WAL-compaction `floor` field was removed in Phase 2f — mechanism-A
 /// compaction is per-node, so no cross-node floor is propagated.)
 const RECORD_HDR_SIZE: usize = 20;
-/// A coalesced frame is [HEADER_SIZE][count:u32][body] and MUST fit the receiver's
-/// fixed recv buffer (raft_net's RECV_BUF_SIZE) — an oversize frame can't be
-/// reassembled and is torn down loudly on the recv side. Cap the body accordingly;
-/// queueOut flushes early when the next record would blow it.
-const MAX_FRAME_BODY: usize = @as(usize, raftnet.RECV_BUF_SIZE) - rpc.HEADER_SIZE - 4;
+/// Coalesced-frame version byte (`docs/format-versioning-audit.md` §3.2).
+/// Bump when the frame/record layout changes; the decoder rejects any
+/// other value loudly. Frozen v1 at the pre-launch format freeze.
+pub const FRAME_VERSION: u8 = 1;
+/// Bytes the frame prepends to the body before the records: `version:u8`
+/// + `count:u32`.
+const FRAME_PREFIX_SIZE: usize = 1 + 4;
+/// A coalesced frame is [HEADER_SIZE][version:u8][count:u32][body] and MUST fit
+/// the receiver's fixed recv buffer (raft_net's RECV_BUF_SIZE) — an oversize
+/// frame can't be reassembled and is torn down loudly on the recv side. Cap the
+/// body accordingly; queueOut flushes early when the next record would blow it.
+const MAX_FRAME_BODY: usize = @as(usize, raftnet.RECV_BUF_SIZE) - rpc.HEADER_SIZE - FRAME_PREFIX_SIZE;
 
 pub const Transport = struct {
     allocator: std.mem.Allocator,
@@ -116,6 +132,11 @@ pub const Transport = struct {
     /// fence / decode failure) — rate-limited-logged in `onRecv` so a
     /// node silently dropping a group's traffic is operator-visible.
     step_skip_count: u64 = 0,
+    /// Total inbound frames dropped for an unrecognized frame-version byte
+    /// (a peer running an incompatible binary / a stale pre-freeze frame) —
+    /// rate-limited-logged in `onRecv`. Should be 0 in a uniform cluster;
+    /// nonzero means a deploy skew or a format that needed a data wipe.
+    bad_frame_count: u64 = 0,
 
     /// Broadcast-time observability (raft-best-practices §"how to size
     /// election/heartbeat"). `hb_sent_ns[peer]` is the wall-clock at which this
@@ -273,12 +294,13 @@ pub const Transport = struct {
             ob.count = 0;
             ob.body.clearRetainingCapacity();
         }
-        const payload_len = 4 + ob.body.items.len;
+        const payload_len = FRAME_PREFIX_SIZE + ob.body.items.len;
         const frame = a.alloc(u8, rpc.HEADER_SIZE + payload_len) catch return;
         defer a.free(frame);
-        // payload = [count][body]; frame header = [len BE][crc BE].
-        std.mem.writeInt(u32, frame[rpc.HEADER_SIZE..][0..4], ob.count, .little);
-        @memcpy(frame[rpc.HEADER_SIZE + 4 ..], ob.body.items);
+        // payload = [version][count][body]; frame header = [len BE][crc BE].
+        frame[rpc.HEADER_SIZE] = FRAME_VERSION;
+        std.mem.writeInt(u32, frame[rpc.HEADER_SIZE + 1 ..][0..4], ob.count, .little);
+        @memcpy(frame[rpc.HEADER_SIZE + FRAME_PREFIX_SIZE ..], ob.body.items);
         const payload = frame[rpc.HEADER_SIZE..];
         std.mem.writeInt(u32, frame[0..4], @intCast(payload_len), .big);
         std.mem.writeInt(u32, frame[4..8], rpc.checksum(payload), .big);
@@ -307,9 +329,22 @@ pub const Transport = struct {
         // used below to close the heartbeat RTT. Stepping still reads each
         // message's own `from` field; `from_id` only attributes the round-trip.
         const self: *Transport = @ptrCast(@alignCast(ctx.?));
-        if (payload.len < 4) return;
-        const count = std.mem.readInt(u32, payload[0..4], .little);
-        var off: usize = 4;
+        if (payload.len < FRAME_PREFIX_SIZE) return;
+        const ver = payload[0];
+        if (ver != FRAME_VERSION) {
+            // A peer on an incompatible binary, or a stale pre-freeze frame.
+            // Drop loudly (rate-limited) rather than mis-stepping garbage.
+            self.bad_frame_count +%= 1;
+            if (self.bad_frame_count == 1 or self.bad_frame_count % 1000 == 0) {
+                std.log.warn(
+                    "v2 transport node {d}: dropped inbound frame with unknown version {d} (expected {d}) — {d} total; check for deploy skew / un-wiped data",
+                    .{ self.node_id, ver, FRAME_VERSION, self.bad_frame_count },
+                );
+            }
+            return;
+        }
+        const count = std.mem.readInt(u32, payload[1..5], .little);
+        var off: usize = FRAME_PREFIX_SIZE;
         self.step_scratch.clearRetainingCapacity();
         var i: u32 = 0;
         while (i < count) : (i += 1) {
@@ -407,6 +442,7 @@ test "transport: coalesced envelope round-trips message bytes" {
     }
     var payload: std.ArrayListUnmanaged(u8) = .empty;
     defer payload.deinit(a);
+    try payload.append(a, FRAME_VERSION);
     var cnt: [4]u8 = undefined;
     std.mem.writeInt(u32, &cnt, msgs.len, .little);
     try payload.appendSlice(a, &cnt);
@@ -414,9 +450,10 @@ test "transport: coalesced envelope round-trips message bytes" {
 
     // Decode.
     const p = payload.items;
-    const count = std.mem.readInt(u32, p[0..4], .little);
+    try testing.expectEqual(FRAME_VERSION, p[0]);
+    const count = std.mem.readInt(u32, p[1..5], .little);
     try testing.expectEqual(@as(u32, 3), count);
-    var off: usize = 4;
+    var off: usize = FRAME_PREFIX_SIZE;
     var seen: usize = 0;
     var i: u32 = 0;
     while (i < count) : (i += 1) {

@@ -306,7 +306,15 @@ CP plan axis (`architecture/control-plane.md` "Operational state").
 - **SQLite page encryption — vendored AES-GCM VFS (preferred) vs SQLCipher (decide in this phase)**.
 - Blob encryption paths.
 - Tape encryption.
-- Key-rotation format stamped with version byte; rotation tooling deferred.
+- **DESIGN GATE (pre-customer, format-versioning-audit.md §7.8):** every
+  ciphertext written by this phase MUST carry a self-describing envelope —
+  `[alg_id][key_version][nonce/iv]…[tag]` — with a documented `alg_id` space,
+  from the very first byte persisted. This is the one-shot window: once customer
+  data is encrypted, an envelope that lacks an algorithm id and a key version
+  can never rotate the cipher or the key without a migration we can't do
+  retroactively. Bare ciphertext (or a version byte without an algorithm id) is
+  rejected at design review. Rotation *tooling* stays deferred; the *envelope*
+  is non-negotiable.
 
 ### Phase 10 — Custom domains + polish — UNBUILT (DNS-01 wildcard + per-host HTTP-01 issuers exist; the customer-facing tier does not)
 

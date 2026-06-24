@@ -40,6 +40,7 @@ const blob_sessions_mod = @import("blob_sessions.zig");
 const textcodec_b = @import("bindings/textcodec.zig");
 const td = @import("trigger_dispatch.zig");
 const reserved = @import("reserved.zig");
+const reserved_headers = @import("reserved_headers.zig");
 const bytecode_cache_mod = @import("bytecode_cache.zig");
 
 
@@ -655,6 +656,68 @@ fn valueToOwnedString(
 
 // ── kv.* ──────────────────────────────────────────────────────────────
 
+/// kv key / value size caps — THE canonical kvexp limits, referenced through
+/// `snapshot_stream` so they can never drift. A write that exceeds them
+/// succeeds in the local overlay but fails later at snapshot / tenant-move
+/// (`StreamKeyTooLarge` / `StreamValueTooLarge`), which would surface as an
+/// opaque replication failure, not a handler error. We reject it fail-fast
+/// here at write time with a clean, branchable JS error instead
+/// (docs/format-versioning-audit.md §7.2). Conservative by design: these can
+/// be RAISED later without breaking anyone, never lowered.
+const KV_KEY_MAX: usize = kv_mod.snapshot_stream.STREAM_KEY_MAX;
+const KV_VAL_MAX: usize = kv_mod.snapshot_stream.STREAM_VAL_MAX;
+
+const KvSizeViolation = enum { key, value };
+
+/// Pure size check shared by `jsKvSet` (key + value) and `jsKvDelete` (key
+/// only — pass `null` for `val_len`). Returns which limit was exceeded, or
+/// null if the write is within bounds.
+fn kvSizeViolation(key_len: usize, val_len: ?usize) ?KvSizeViolation {
+    if (key_len > KV_KEY_MAX) return .key;
+    if (val_len) |vl| if (vl > KV_VAL_MAX) return .value;
+    return null;
+}
+
+/// Throw `Error{message, code}` for an oversized `kv.set` / `kv.delete`.
+/// `code` is `key_too_large` / `value_too_large` so customer JS can branch on
+/// `err.code` (same shape as the `reserved_key` error).
+fn throwKvTooLarge(ctx: ?*c.JSContext, which: KvSizeViolation) c.JSValue {
+    const state = getState(ctx);
+    const desc = switch (which) {
+        .key => .{ "key", "key_too_large", KV_KEY_MAX },
+        .value => .{ "value", "value_too_large", KV_VAL_MAX },
+    };
+    const msg = std.fmt.allocPrintSentinel(
+        state.allocator,
+        "kv: {s} exceeds the {d}-byte limit",
+        .{ desc[0], desc[2] },
+        0,
+    ) catch return c.JS_ThrowOutOfMemory(ctx);
+    defer state.allocator.free(msg);
+
+    const err = c.JS_NewError(ctx);
+    if (c.JS_IsException(err)) return err;
+    _ = c.JS_SetPropertyStr(ctx, err, "message", c.JS_NewStringLen(ctx, msg.ptr, msg.len));
+    _ = c.JS_SetPropertyStr(ctx, err, "code", c.JS_NewStringLen(ctx, desc[1], desc[1].len));
+    return c.JS_Throw(ctx, err);
+}
+
+test "kvSizeViolation enforces canonical kv limits" {
+    // Drift guard: these must stay the kvexp caps (via snapshot_stream).
+    try std.testing.expectEqual(@as(usize, 256), KV_KEY_MAX);
+    try std.testing.expectEqual(@as(usize, 1 << 20), KV_VAL_MAX);
+    // Within bounds (boundary values inclusive).
+    try std.testing.expectEqual(@as(?KvSizeViolation, null), kvSizeViolation(256, 1 << 20));
+    try std.testing.expectEqual(@as(?KvSizeViolation, null), kvSizeViolation(0, 0));
+    try std.testing.expectEqual(@as(?KvSizeViolation, null), kvSizeViolation(10, null));
+    // Over a cap.
+    try std.testing.expectEqual(@as(?KvSizeViolation, .key), kvSizeViolation(257, 0));
+    try std.testing.expectEqual(@as(?KvSizeViolation, .key), kvSizeViolation(257, null));
+    try std.testing.expectEqual(@as(?KvSizeViolation, .value), kvSizeViolation(10, (1 << 20) + 1));
+    // Key is reported first when both exceed.
+    try std.testing.expectEqual(@as(?KvSizeViolation, .key), kvSizeViolation(300, (1 << 20) + 1));
+}
+
 /// Throw `Error{message: "...", code: "reserved_key"}` for a customer
 /// `kv.set` / `kv.delete` against a platform-reserved namespace. Same
 /// shape as the `rate_limited` error from `email.send` so customer
@@ -737,6 +800,14 @@ fn jsKvSet(
     // they need to write `_send/owed/{id}` markers.
     if (!state.is_system_module and reserved.isCustomerWriteReserved(key_str)) {
         return throwReservedKey(ctx, key_str);
+    }
+
+    // Reject oversized writes fail-fast with a clean error (see KV_KEY_MAX /
+    // KV_VAL_MAX). Applies to system writes too — anything over the kvexp cap
+    // fails at snapshot regardless, so checking early can't break a working
+    // path, only surface the failure cleanly.
+    if (kvSizeViolation(key_str.len, val_str.len)) |which| {
+        return throwKvTooLarge(ctx, which);
     }
 
     // `docs/primitive-gaps.md` §8 — kv.set is an OUTPUT, not an
@@ -831,6 +902,12 @@ fn jsKvDelete(
     // Phase 5 PR-2b: `__system/` built-ins bypass.
     if (!state.is_system_module and reserved.isCustomerWriteReserved(key_str)) {
         return throwReservedKey(ctx, key_str);
+    }
+
+    // Reject an over-long key (no value to check on delete). A key over the
+    // cap can't exist (puts are capped), so this is mostly contract hygiene.
+    if (kvSizeViolation(key_str.len, null)) |which| {
+        return throwKvTooLarge(ctx, which);
     }
 
     // Fast path mirrors jsKvSet — no triggers means no savepoint, no
@@ -2281,7 +2358,12 @@ pub fn installRequest(
     // means the null branch is rare in production handler code.
     if (state.session_id) |sid| {
         const session_obj = c.JS_NewObject(ctx);
-        _ = c.JS_SetPropertyStr(ctx, session_obj, "id", c.JS_NewStringLen(ctx, &sid, sid.len));
+        // Customer-visible: opaque `sess_<64hex>` form (§7.5). The cookie
+        // / internal store keep the bare hex.
+        var sid_buf: [log_mod.SESSION_ID_PREFIX.len + 64]u8 = undefined;
+        @memcpy(sid_buf[0..log_mod.SESSION_ID_PREFIX.len], log_mod.SESSION_ID_PREFIX);
+        @memcpy(sid_buf[log_mod.SESSION_ID_PREFIX.len..], &sid);
+        _ = c.JS_SetPropertyStr(ctx, session_obj, "id", c.JS_NewStringLen(ctx, &sid_buf, sid_buf.len));
         _ = c.JS_SetPropertyStr(ctx, req_obj, "session", session_obj);
     } else {
         _ = c.JS_SetPropertyStr(ctx, req_obj, "session", js_null);
@@ -2403,7 +2485,13 @@ pub fn installRequest(
     if (request.activation == .fetch_chunk) {
         const fc = request.activation.fetch_chunk;
         if (fc.id) |fid| {
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "fetch_id", c.JS_NewStringLen(ctx, fid.ptr, fid.len));
+            // Customer-visible: opaque `ftch_<hex>` form (§7.5). The
+            // msg-router key / S3 upload key keep the bare hex.
+            var fid_buf: [log_mod.FETCH_ID_PREFIX.len + 64]u8 = undefined;
+            @memcpy(fid_buf[0..log_mod.FETCH_ID_PREFIX.len], log_mod.FETCH_ID_PREFIX);
+            @memcpy(fid_buf[log_mod.FETCH_ID_PREFIX.len..][0..fid.len], fid);
+            const fid_str = fid_buf[0 .. log_mod.FETCH_ID_PREFIX.len + fid.len];
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "fetch_id", c.JS_NewStringLen(ctx, fid_str.ptr, fid_str.len));
         }
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "seq", c.JS_NewInt64(ctx, @intCast(fc.seq)));
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "byteOffset", c.JS_NewInt64(ctx, @intCast(fc.byte_offset)));
@@ -2810,6 +2898,13 @@ fn installHeaders(
             // (see STRIPPED_IP_HEADERS).
             if (name.len > 0 and name[0] == ':') continue;
             if (isStrippedIpHeader(name)) continue;
+
+            // Strip platform-reserved internal headers (`x-rewind-*`,
+            // `x-rove-internal-*`) so the customer handler can neither read
+            // internal topology nor spoof a header an internal endpoint
+            // might trust. See `reserved_headers.zig`. (`x-rove-correlation-id`
+            // is NOT reserved and stays visible.)
+            if (reserved_headers.isReservedInternalHeader(name)) continue;
 
             // The getter's magic is the FIELD INDEX — no per-getter
             // heap state; the getter reads name+value back out of

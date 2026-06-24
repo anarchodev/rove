@@ -809,15 +809,80 @@ fn bytesToHex(src: []const u8, dst: []u8) void {
 
 // ── Validation ─────────────────────────────────────────────────────────
 
+/// Platform-reserved tenant ids (the `__name__` form). Exempt from the
+/// DNS-label spec below — they are internal singletons that never resolve as
+/// a public subdomain. Customers cannot create them: the `__…__` form fails
+/// DNS validation (underscores), and only these exact ids are exempted.
+const RESERVED_INSTANCE_IDS = [_][]const u8{
+    ADMIN_INSTANCE_ID,
+    REPLAY_INSTANCE_ID,
+    AUTH_INSTANCE_ID,
+};
+
+/// A DNS host label is capped at 63 octets, and an instance id may serve as
+/// a `{id}.<zone>` subdomain.
+const MAX_DNS_LABEL_LEN: usize = 63;
+
+/// Subdomain labels reserved away from customer instance ids. Because an id
+/// auto-routes as `{id}.<platform-zone>` (the wildcard public suffix,
+/// `REWIND_PUBLIC_SUFFIX`), a customer who provisioned `auth`/`api`/… would
+/// claim a platform-looking subdomain on our own zone — so we deny these at
+/// provisioning, pre-customer, while it's free to do so
+/// (docs/format-versioning-audit.md §7.7). Curated platform-product + infra
+/// labels; extend as new platform surfaces appear. NOT generic business words
+/// (blog/shop/docs/…) — those stay available to customers. All lowercase
+/// (ids are already lowercased by the DNS check), so an exact match suffices.
+const RESERVED_SUBDOMAIN_LABELS = [_][]const u8{
+    // platform product surfaces
+    "admin",  "api",      "app",      "account", "accounts", "auth",
+    "billing","console",  "dashboard","login",   "logout",   "signup",
+    "register",
+    // brand / ops
+    "rewind", "ops",      "internal", "system",  "status",
+    // well-known infra / RFC-ish
+    "www",    "mail",     "smtp",     "imap",    "pop",      "ftp",
+    "sftp",   "ssh",      "ns",       "ns1",     "ns2",      "mx",
+    "dns",    "cdn",      "static",   "assets",  "media",    "blob",
+    "proxy",  "gateway",  "vpn",      "ssl",     "tls",
+    "webhook","webhooks", "email",    "ws",      "wss",      "autoconfig",
+    "autodiscover",
+    // NOTE: the ACME http-01 / dns-01 challenge label is `_acme-challenge`
+    // (leading `_` → already an invalid instance id); bare `acme` is left
+    // available so it doesn't collide with the `acme` example-tenant used
+    // throughout the test + smoke suite.
+};
+
+fn isReservedSubdomainLabel(id: []const u8) bool {
+    for (RESERVED_SUBDOMAIN_LABELS) |r| {
+        if (std.mem.eql(u8, id, r)) return true;
+    }
+    return false;
+}
+
+/// Validate a tenant/instance id. Customer ids are locked to a DNS-label-safe
+/// spec — `^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$` — so an id can safely become
+/// a public subdomain: lowercase only (DNS is case-insensitive), no `_`
+/// (invalid in DNS host labels), no leading/trailing hyphen, ≤63 octets. This
+/// is the strictest plausible spec, locked pre-customer; loosening later is
+/// always safe, tightening is not (docs/format-versioning-audit.md §7.4).
+/// Platform-reserved `__…__` ids are exempted.
 fn validateInstanceId(id: []const u8) Error!void {
     if (id.len == 0 or id.len > MAX_INSTANCE_ID_LEN) return Error.InvalidInstanceId;
-    for (id) |b| {
-        const ok = (b >= 'a' and b <= 'z') or
-            (b >= 'A' and b <= 'Z') or
-            (b >= '0' and b <= '9') or
-            b == '-' or b == '_';
-        if (!ok) return Error.InvalidInstanceId;
+    for (RESERVED_INSTANCE_IDS) |r| {
+        if (std.mem.eql(u8, id, r)) return;
     }
+    if (id.len > MAX_DNS_LABEL_LEN) return Error.InvalidInstanceId;
+    for (id, 0..) |b, i| {
+        const ok = (b >= 'a' and b <= 'z') or
+            (b >= '0' and b <= '9') or
+            b == '-';
+        if (!ok) return Error.InvalidInstanceId;
+        // No leading or trailing hyphen.
+        if (b == '-' and (i == 0 or i == id.len - 1)) return Error.InvalidInstanceId;
+    }
+    // Reserve platform/infra subdomain labels — a customer must not be able to
+    // become `auth.<zone>` / `api.<zone>` / … via the wildcard route (§7.7).
+    if (isReservedSubdomainLabel(id)) return Error.InvalidInstanceId;
 }
 
 fn validateHost(host: []const u8) Error!void {
@@ -1102,13 +1167,40 @@ test "reopening a tenant finds existing instances on lazy resolve" {
     }
 }
 
-test "validateInstanceId rejects bad ids" {
+test "validateInstanceId enforces DNS-label-safe spec" {
     try testing.expectError(Error.InvalidInstanceId, validateInstanceId(""));
     try testing.expectError(Error.InvalidInstanceId, validateInstanceId("has space"));
     try testing.expectError(Error.InvalidInstanceId, validateInstanceId("with/slash"));
     try testing.expectError(Error.InvalidInstanceId, validateInstanceId("../evil"));
+    // Pre-customer tightening (§7.4): no uppercase, no underscore, no
+    // leading/trailing hyphen, ≤63 octets.
+    try testing.expectError(Error.InvalidInstanceId, validateInstanceId("ACME"));
+    try testing.expectError(Error.InvalidInstanceId, validateInstanceId("acme_v2"));
+    try testing.expectError(Error.InvalidInstanceId, validateInstanceId("-acme"));
+    try testing.expectError(Error.InvalidInstanceId, validateInstanceId("acme-"));
+    try testing.expectError(Error.InvalidInstanceId, validateInstanceId("-"));
+    try testing.expectError(Error.InvalidInstanceId, validateInstanceId("a" ** 64));
+    // Customers cannot squat the reserved `__…__` form.
+    try testing.expectError(Error.InvalidInstanceId, validateInstanceId("__evil__"));
+    // Reserved subdomain labels (§7.7): a customer can't become `auth.<zone>`.
+    try testing.expectError(Error.InvalidInstanceId, validateInstanceId("auth"));
+    try testing.expectError(Error.InvalidInstanceId, validateInstanceId("api"));
+    try testing.expectError(Error.InvalidInstanceId, validateInstanceId("app"));
+    try testing.expectError(Error.InvalidInstanceId, validateInstanceId("admin"));
+    try testing.expectError(Error.InvalidInstanceId, validateInstanceId("www"));
+
+    // Valid customer ids (incl. ones that merely contain a reserved label).
+    try validateInstanceId("a");
     try validateInstanceId("acme");
-    try validateInstanceId("ACME-123_v2");
+    try validateInstanceId("acme-123");
+    try validateInstanceId("my-api");
+    try validateInstanceId("admintest");
+    try validateInstanceId("apixzy");
+    try validateInstanceId("a" ** 63);
+    // Platform-reserved tenants are exempt from the DNS spec.
+    try validateInstanceId("__admin__");
+    try validateInstanceId("__auth__");
+    try validateInstanceId("__replay__");
 }
 
 test "authenticate matches root_token_secret" {

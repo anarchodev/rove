@@ -239,9 +239,16 @@ fn encodeRecordJson(
     const w = &aw.writer;
     try w.writeAll("{\"tenant_id\":");
     try writeJsonString(w, r.tenant_id);
+    // Customer-visible ids are the opaque prefixed form (§7.5); the
+    // dashboard fetches this record JSON verbatim via `/show`. Internal
+    // u64s stay in the sidecar/index. Prefix+hex is alnum — no escaping.
+    var rid_buf: [log_mod.PREFIXED_ID_BUF]u8 = undefined;
+    var dep_buf: [log_mod.PREFIXED_ID_BUF]u8 = undefined;
+    const rid = log_mod.formatPrefixedId(&rid_buf, log_mod.REQUEST_ID_PREFIX, r.request_id);
+    const dep = log_mod.formatPrefixedId(&dep_buf, log_mod.DEPLOYMENT_ID_PREFIX, r.deployment_id);
     try w.print(
-        ",\"request_id\":{d},\"deployment_id\":{d},\"received_ns\":{d},\"duration_ns\":{d},\"status\":{d},\"outcome\":",
-        .{ r.request_id, r.deployment_id, r.received_ns, r.duration_ns, r.status },
+        ",\"request_id\":\"{s}\",\"deployment_id\":\"{s}\",\"received_ns\":{d},\"duration_ns\":{d},\"status\":{d},\"outcome\":",
+        .{ rid, dep, r.received_ns, r.duration_ns, r.status },
     );
     try writeJsonString(w, outcomeName(r.outcome));
     try w.writeAll(",\"method\":");
@@ -385,6 +392,11 @@ fn writeTapePayloads(
     // 2^53. JSON.parse → Number truncates the low bits; reading a
     // string + BigInt() is precise.
     try w.print("\"seed\":\"{d}\",\"timestamp_ns\":\"{d}\"", .{ t.seed, t.timestamp_ns });
+    // The JS engine version that ran the request (`format-versioning-audit.md`
+    // §4). A small u16 — safe as a plain JSON number. The replay driver reads
+    // it to fetch the matching engine WASM (a no-op today: one engine, so the
+    // bundled engine always matches; the stamp keeps old requests attributable).
+    try w.print(",\"js_engine_version\":{d}", .{t.js_engine_version});
     try writeBytesField(allocator, w, "kv_tape_b64", t.kv_tape_bytes, false);
     try writeBytesField(allocator, w, "module_tree_b64", t.module_tree_bytes, false);
     try writeBytesField(allocator, w, "fetch_responses_tape_b64", t.fetch_responses_tape_bytes, false);
@@ -455,6 +467,9 @@ fn makeRecord(allocator: std.mem.Allocator, id: u64, path: []const u8) !log_mod.
         .outcome = .ok,
         .console = try allocator.dupe(u8, ""),
         .exception = try allocator.dupe(u8, ""),
+        // Non-zero engine stamp so the served-JSON assertion below proves
+        // the replay-critical field is emitted (§4).
+        .tapes = .{ .js_engine_version = 1 },
     };
 }
 
@@ -524,6 +539,11 @@ test "writeBatch emits one object with embedded sidecar + frames" {
         const json = out_buf[0..written];
         try testing.expect(std.mem.startsWith(u8, json, "{\"tenant_id\":"));
         try testing.expect(std.mem.endsWith(u8, json, "}"));
+        // Customer-visible ids are the opaque prefixed form (§7.5), not
+        // bare integers; the replay-critical engine stamp is present (§4).
+        try testing.expect(std.mem.indexOf(u8, json, "\"request_id\":\"req_0000000000000001\"") != null);
+        try testing.expect(std.mem.indexOf(u8, json, "\"deployment_id\":\"dep_0000000000000001\"") != null);
+        try testing.expect(std.mem.indexOf(u8, json, "\"js_engine_version\":1") != null);
     }
 
     // Sha256 in sidecar matches the frames-region bytes.

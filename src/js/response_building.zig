@@ -11,6 +11,7 @@ const qjs = @import("rove-qjs");
 const c = qjs.c;
 
 const globals = @import("globals.zig");
+const reserved_headers = @import("reserved_headers.zig");
 const request_mod = @import("request.zig");
 const ResponseHeader = request_mod.ResponseHeader;
 
@@ -198,7 +199,25 @@ fn isEmittableHeaderName(name: []const u8) bool {
     for (reserved) |n| {
         if (std.ascii.eqlIgnoreCase(name, n)) return false;
     }
+    // Platform-reserved internal header prefixes (`x-rewind-*`,
+    // `x-rove-internal-*`) — a customer handler must not emit these
+    // downstream. See `reserved_headers.zig`.
+    if (reserved_headers.isReservedInternalHeader(name)) return false;
     return true;
+}
+
+test "isEmittableHeaderName rejects platform-reserved internal prefixes" {
+    // Hop-by-hop / platform-managed (pre-existing).
+    try testing.expect(!isEmittableHeaderName("set-cookie"));
+    try testing.expect(!isEmittableHeaderName("content-length"));
+    // Platform-reserved internal header prefixes — a handler can't emit them.
+    try testing.expect(!isEmittableHeaderName("x-rewind-tenant"));
+    try testing.expect(!isEmittableHeaderName("X-Rewind-Move-Secret"));
+    try testing.expect(!isEmittableHeaderName("x-rove-internal-foo"));
+    // Ordinary + the one customer-facing tracing header stay emittable.
+    try testing.expect(isEmittableHeaderName("content-type"));
+    try testing.expect(isEmittableHeaderName("x-custom"));
+    try testing.expect(isEmittableHeaderName("x-rove-correlation-id"));
 }
 
 /// Header values must not contain CR / LF (header-injection) or NUL.

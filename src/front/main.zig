@@ -185,13 +185,20 @@ const CertSyncThread = struct {
     }
 };
 
-/// Split the CP's packed cert frame (`[4B BE cert_len][cert_pem][key_pem]`).
+/// Split the CP's packed cert frame
+/// (`[1B version][4B BE cert_len][cert_pem][key_pem]`). The front door
+/// deliberately does not link `cp-directory` (rove + h2 + curl only), so
+/// this mirrors `Directory.unpackCert` / `CERT_PACK_VERSION` by hand —
+/// keep the two in lockstep when the cert frame changes
+/// (`docs/format-versioning-audit.md` §3.4).
+const CERT_PACK_VERSION: u8 = 1;
 const UnpackedCert = struct { cert: []const u8, key: []const u8 };
 fn unpackCert(frame: []const u8) ?UnpackedCert {
-    if (frame.len < 4) return null;
-    const clen = std.mem.readInt(u32, frame[0..4], .big);
-    if (4 + clen > frame.len) return null;
-    return .{ .cert = frame[4 .. 4 + clen], .key = frame[4 + clen ..] };
+    if (frame.len < 5) return null;
+    if (frame[0] != CERT_PACK_VERSION) return null;
+    const clen = std.mem.readInt(u32, frame[1..5], .big);
+    if (5 + clen > frame.len) return null;
+    return .{ .cert = frame[5 .. 5 + clen], .key = frame[5 + clen ..] };
 }
 
 fn cleanupResponses(server: *FrontH2) !void {

@@ -134,7 +134,12 @@ pub fn mint(allocator: std.mem.Allocator, secret: []const u8, opts: MintOptions)
 
     var payload_json = std.ArrayList(u8).empty;
     defer payload_json.deinit(allocator);
-    payload_json.appendSlice(allocator, "{\"exp\":") catch return Error.OutOfMemory;
+    // `"v":1` versions the claims schema so a future claim change is
+    // detectable (format-versioning-audit.md §7.8). Verifiers ignore it
+    // (substring-based parse), so it's back-compatible across mixed binaries
+    // during a rolling deploy. The `kid` + multi-secret rotation window is the
+    // heavier half of §7.8 and stays deferred (needs an N-secret config).
+    payload_json.appendSlice(allocator, "{\"v\":1,\"exp\":") catch return Error.OutOfMemory;
     var exp_buf: [24]u8 = undefined;
     const exp_str = std.fmt.bufPrint(&exp_buf, "{d}", .{opts.exp_ms}) catch unreachable;
     payload_json.appendSlice(allocator, exp_str) catch return Error.OutOfMemory;
@@ -456,6 +461,21 @@ test "mint + verify round-trip" {
     const tok = try mint(a, secret, .{ .exp_ms = 1_000_000_000 });
     defer a.free(tok);
     const got = try verify(secret, tok, 999_999_999);
+    try testing.expectEqual(@as(i64, 1_000_000_000), got.exp_ms);
+}
+
+test "mint stamps claims-schema version v:1" {
+    const a = testing.allocator;
+    const secret = "hunter2-and-then-some";
+    const tok = try mint(a, secret, .{ .exp_ms = 1_000_000_000, .caps = &.{"logs-read"}, .tenant = "acme" });
+    defer a.free(tok);
+    var buf: [256]u8 = undefined;
+    const payload = try verifyAndCopyPayload(secret, tok, 999_999_999, &buf);
+    try testing.expect(std.mem.indexOf(u8, payload, "\"v\":1") != null);
+    // The version field doesn't disturb the existing claims.
+    try testing.expect(std.mem.indexOf(u8, payload, "\"exp\":1000000000") != null);
+    try testing.expect(std.mem.indexOf(u8, payload, "\"tenant\":\"acme\"") != null);
+    const got = try verifyWithCapAndTenant(secret, tok, 999_999_999, "logs-read", "acme");
     try testing.expectEqual(@as(i64, 1_000_000_000), got.exp_ms);
 }
 

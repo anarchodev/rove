@@ -1466,6 +1466,7 @@ fn resumeContinuation(
     defer ws.deinit();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
     var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    readset.js_engine_version = dispatcher_mod.JS_ENGINE_VERSION;
     defer readset.deinit();
     const request_id: u64 = blk: {
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
@@ -1876,6 +1877,7 @@ pub fn resumeBoundFetchChain(
     defer ws.deinit();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
     var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    readset.js_engine_version = dispatcher_mod.JS_ENGINE_VERSION;
     defer readset.deinit();
     const request_id: u64 = blk: {
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
@@ -3025,6 +3027,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
     defer ws.deinit();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
     var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    readset.js_engine_version = dispatcher_mod.JS_ENGINE_VERSION;
     defer readset.deinit();
     const request_id: u64 = blk: {
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
