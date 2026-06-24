@@ -257,6 +257,19 @@ The point of the whole exercise: **tests bring clusters up the real way.**
        appends the moment the first one lands. Closes the reverse of 1c's
        conf-change `raft_addr` (leader-learns-joiner). Header omitted on a
        static-`REWIND_PEERS` cluster (registry empty → no-op).
+     - **Conf-change-context mesh — DONE.** attach-carry teaches a joiner only
+       the members present AT ITS join time, so a follower added before a later
+       peer never learned that peer (node 2 had node 3 in its ConfState but no
+       address — failover then depended on which survivor campaigned). The fix
+       rides the address through the REPLICATED LOG like the membership: a
+       conf-change is proposed with the changing node's address as the entry
+       CONTEXT (raft-rs-zig FFI extension — `propose_conf_change(context, cc)` +
+       a manager-level committed-conf-change observer), and EVERY replica's
+       `Bridge.ccObserve` `learnPeerAddr`s it as the change applies. Verified:
+       node 2 learns node 3 the moment node 3's add commits (the full N×N mesh).
+       Needed an FFI bump (raft-rs-zig `af87cd1`) + re-pin. (Residual leg-E
+       failover flake in the genesis smoke is the pre-existing cross-codebase
+       election-timing flake, NOT the mesh — which is now complete.)
 2. **Single-voter genesis + CP-directory self-grow** (§3.4, §3.5) — groups
    born `{self}`; the CP grows its own directory group; tenant reconciler reads
    the registry. Now a cluster can genesis-1-then-grow end to end.

@@ -79,6 +79,7 @@
 
 const std = @import("std");
 const node_mod = @import("node.zig");
+const raft = @import("raft_rs_zig");
 /// Re-exported (`pub`) so the format-version registry can read the
 /// entry-frame magic + coalesced-transport frame version through the
 /// worker's `bridge` import (`src/version.zig`).
@@ -208,6 +209,12 @@ const ControlCmd = struct {
     /// 1 remove / 2 add_learner — matches `raft.Manager.ConfChange`).
     node_id: u64 = 0,
     cc_type: u8 = 0,
+    /// `propose_conf_change`: the entry context replicated with the committed
+    /// change (the changing node's transport address), so every replica learns
+    /// id→addr via the conf-change observer on apply. Aliases the caller's slice
+    /// — valid because `runControl` blocks until the pump drains the cmd. Empty
+    /// for a remove/demote or a still-static cluster.
+    cc_context: []const u8 = &.{},
     /// `apply_local_snapshot`: the baseline {index, term} to install.
     /// `log_term` / `log_entry`: `snap_index` is the query index, `snap_term` the
     /// result term.
@@ -331,6 +338,13 @@ pub const Bridge = struct {
     /// by `learnPeer` from the static seed at boot AND from attach / conf-change
     /// headers, so the transport can dial peers it learned at runtime.
     peer_registry: ?*node_mod.PeerRegistry = null,
+
+    /// Stable storage for the committed-conf-change observer (the manager keeps a
+    /// pointer to it). Registered by `enablePeerRegistry`; its callback learns the
+    /// changing node's address from the conf-change context on EVERY replica, so
+    /// id→addr rides the log like the membership (cluster-genesis-and-membership
+    /// §3.3 — the apply-side completion of point-to-point attach-carry).
+    cc_observer: raft.Manager.ConfChangeObserver = undefined,
 
     /// This bridge incarnation's random identity, stamped (with the seq)
     /// into every proposed entry's origin frame. The commit hook and the
@@ -521,6 +535,23 @@ pub const Bridge = struct {
         const reg = node_mod.PeerRegistry.create(self.allocator) catch return Error.OutOfMemory;
         self.peer_registry = reg;
         self.node.setPeerResolver(reg.resolver());
+        // Learn a changing node's address from the committed conf-change context
+        // on EVERY replica as it applies (not just the proposing leader): the
+        // apply-side half of dynamic addressing, so a follower added before a
+        // later peer still learns that peer when its add commits.
+        self.cc_observer = .{ .ctx = self, .func = ccObserve };
+        self.node.setConfChangeObserver(&self.cc_observer);
+    }
+
+    /// Conf-change observer callback (fires on the pump thread during apply, on
+    /// every replica). `context` is the changing node's transport address;
+    /// `learnPeerAddr` is insert-only + thread-safe. Empty context (remove/demote
+    /// or a static cluster) → nothing to learn.
+    fn ccObserve(ctx: *anyopaque, node_id: u64, context: []const u8) void {
+        const self: *Bridge = @ptrCast(@alignCast(ctx));
+        if (context.len == 0) return;
+        self.learnPeerAddr(node_id, context) catch |err|
+            std.log.warn("v2 bridge: cc-observer learnPeerAddr({d}) failed: {s}", .{ node_id, @errorName(err) });
     }
 
     /// Teach the registry `node_id → host:port` (insert-only). No-op if the
@@ -955,8 +986,12 @@ pub const Bridge = struct {
     /// Runs on the pump (the only Manager toucher); leader-gated + quorum-guarded
     /// in the FFI (`Error.NotLeader` / `Error.ConfChangeQuorumGuard`). The
     /// committed change applies + persists durably via the apply path.
-    pub fn proposeConfChange(self: *Bridge, gid: u64, node_id: u64, cc_type: u8) Error!void {
-        var cmd: ControlCmd = .{ .kind = .propose_conf_change, .gid = gid, .node_id = node_id, .cc_type = cc_type };
+    /// `context` (the changing node's transport address) rides the committed
+    /// conf-change so every replica learns id→addr via the conf-change observer
+    /// on apply — the address propagates through the log like the membership.
+    /// Empty for a remove/demote / still-static cluster.
+    pub fn proposeConfChange(self: *Bridge, gid: u64, node_id: u64, cc_type: u8, context: []const u8) Error!void {
+        var cmd: ControlCmd = .{ .kind = .propose_conf_change, .gid = gid, .node_id = node_id, .cc_type = cc_type, .cc_context = context };
         return self.runControl(&cmd);
     }
 
@@ -1131,7 +1166,7 @@ pub const Bridge = struct {
                     break :blk null;
                 },
                 .propose_conf_change => blk: {
-                    self.node.proposeConfChange(cmd.gid, cmd.node_id, @enumFromInt(cmd.cc_type)) catch |e| break :blk e;
+                    self.node.proposeConfChange(cmd.gid, cmd.node_id, @enumFromInt(cmd.cc_type), cmd.cc_context) catch |e| break :blk e;
                     break :blk null;
                 },
                 .conf_state => blk: {

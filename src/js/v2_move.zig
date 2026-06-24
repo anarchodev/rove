@@ -977,13 +977,17 @@ fn handleConfChange(
         return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
     if (!worker.raft.isLeaderOf(gid))
         return reply(server, allocator, ent, sid, sess, 421, "not the leader for this tenant; try another node\n");
-    // Learn the joining node's address BEFORE proposing, so by the time the add
-    // commits and raft addresses it, the transport can already resolve + dial.
-    // Insert-only + no-op when the registry is disabled or the addr is absent.
+    // Learn the joining node's address BEFORE proposing, so THIS (leader) node
+    // can dial it the moment the add commits. Insert-only + no-op when the
+    // registry is disabled or the addr is absent.
     if (v.raft_addr.len > 0)
         worker.raft.learnPeerAddr(v.node_id, v.raft_addr) catch
             return reply(server, allocator, ent, sid, sess, 400, "malformed raft_addr\n");
-    worker.raft.proposeConfChange(gid, v.node_id, cc_type) catch |e| switch (e) {
+    // Carry the address as the conf-change CONTEXT, so every OTHER replica learns
+    // it via the conf-change observer as the change applies (the apply-side
+    // completion of point-to-point addressing: a follower added before this node
+    // still learns it). Empty for a demote/remove.
+    worker.raft.proposeConfChange(gid, v.node_id, cc_type, v.raft_addr) catch |e| switch (e) {
         error.NotLeader => return reply(server, allocator, ent, sid, sess, 421, "not the leader\n"),
         error.ConfChangeQuorumGuard => return reply(server, allocator, ent, sid, sess, 409, "refused: would leave fewer than 2 voters\n"),
         else => return reply(server, allocator, ent, sid, sess, 500, "conf-change propose failed\n"),

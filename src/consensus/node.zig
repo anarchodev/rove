@@ -1116,8 +1116,18 @@ pub const Node = struct {
     /// Propose a membership change on `tenant_id`'s group (leader-gated +
     /// quorum-guarded in the FFI). The committed change applies + persists via
     /// the pump apply path. Pump-thread only.
-    pub fn proposeConfChange(self: *Node, tenant_id: u64, node_id: u64, change: raft.Manager.ConfChange) Error!void {
-        return self.mgr.proposeConfChange(tenant_id, node_id, change);
+    /// `context` rides the committed conf-change entry (the joining node's
+    /// transport address) so every replica learns id→addr via the
+    /// conf-change observer as the change applies. Empty = no context.
+    pub fn proposeConfChange(self: *Node, tenant_id: u64, node_id: u64, change: raft.Manager.ConfChange, context: []const u8) Error!void {
+        return self.mgr.proposeConfChange(tenant_id, node_id, change, context);
+    }
+
+    /// Install the committed-conf-change observer on this node's manager (see
+    /// `raft.Manager.setConfChangeObserver`). `obs` is caller-owned + must
+    /// outlive the node. Call before the pump starts.
+    pub fn setConfChangeObserver(self: *Node, obs: *const raft.Manager.ConfChangeObserver) void {
+        self.mgr.setConfChangeObserver(obs);
     }
 
     /// Read `tenant_id`'s current membership into the caller's buffers; null for
@@ -1789,7 +1799,7 @@ pub const Node = struct {
                 // Demote this dead, far-behind voter to a learner. One per group
                 // per pass; the FFI quorum-guard refuses a demote that would drop
                 // below 2 voters (swallowed — expected, not an error here).
-                self.mgr.proposeConfChange(gid, p.id, .add_learner) catch |e| switch (e) {
+                self.mgr.proposeConfChange(gid, p.id, .add_learner, "") catch |e| switch (e) {
                     raft.Error.ConfChangeQuorumGuard => {
                         std.log.debug("v2 auto-demote gid={d} node={d}: refused (would drop below 2 voters)", .{ gid, p.id });
                         break;
@@ -2612,7 +2622,7 @@ test "Phase 2: a group born {self} on a multi-node node auto-leads, then grows +
     try testing.expect(nodes[0].transport.?.net.isPeerConnected(1));
 
     // Grow: the leader formally adds node 2 as a learner by conf-change.
-    try nodes[0].proposeConfChange(tenant, 2, .add_learner);
+    try nodes[0].proposeConfChange(tenant, 2, .add_learner, "");
 
     // A write on the leader must replicate to the grown-in node.
     var ws = WriteSet.init(a);
@@ -2720,7 +2730,7 @@ test "Phase 2: two genesis nodes (self-only, registry-only addressing) form + gr
     // Grow FIRST: until node 2 is a member, the leader's raft has no reason to
     // send to it, so (with no static peer) it would never dial. The add_learner
     // makes raft address node 2 → the leader dials it via the registry.
-    try nodes[0].proposeConfChange(tenant, 2, .add_learner);
+    try nodes[0].proposeConfChange(tenant, 2, .add_learner, "");
 
     var ws = WriteSet.init(a);
     defer ws.deinit();
