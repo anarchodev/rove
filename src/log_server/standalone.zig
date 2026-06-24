@@ -53,11 +53,16 @@ pub const Config = struct {
     /// Where the indexer reads sidecars + ndjson from (and where
     /// /show range-reads the payload).
     store: batch_store_mod.BatchStore,
-    /// Local SQLite index. The indexer thread + the h2 server share
-    /// one connection — WAL would let us split, but a single thread
-    /// owning both is simpler and matches the actual workload (one
-    /// indexer + one event loop).
+    /// Local SQLite index — the **writer** connection. Used by the
+    /// indexer thread (`pollOnce`) and by the h2 server thread for the
+    /// push path (`/v1/_internal/batch-pushed` → `indexOneKey`). Two
+    /// threads, so it's FULLMUTEX (see `index_db.IndexDb`).
     db: *index_db_mod.IndexDb,
+    /// Second connection to the same WAL file — the **reader**, used by
+    /// the h2 server thread for the query surface (/list, /show,
+    /// /count) so reads get their own snapshot and never wait on the
+    /// writer's connection mutex during an `insertBatch`.
+    read_db: *index_db_mod.IndexDb,
     /// Where to bind the h2 listener. Pass `0` for an ephemeral
     /// port; the resolved port is written to `Handle.port`.
     bind_addr: std.net.Address,
@@ -195,6 +200,7 @@ fn runThread(h: *Handle) !void {
         .cfg = &h.config,
         .store = h.config.store,
         .db = h.config.db,
+        .read_db = h.config.read_db,
         .retention = &retention,
     };
 
@@ -225,7 +231,10 @@ fn cleanupResponses(server: *LogH2) !void {
 const ReqCtx = struct {
     cfg: *const Config,
     store: batch_store_mod.BatchStore,
+    /// Writer connection — used only by the push path on this thread.
     db: *index_db_mod.IndexDb,
+    /// Reader connection — used by the /list, /show, /count handlers.
+    read_db: *index_db_mod.IndexDb,
     retention: *RetentionCache,
 };
 
@@ -458,13 +467,13 @@ fn handleOne(
     switch (route.kind) {
         .list => {
             const tf = parseTagFilter(route.query);
-            try handleList(server, allocator, rctx.db, ent, sid, sess, route.tenant_id, route.query, floor_ns, rctx.cfg, if (tf) |t| t.key else null, if (tf) |t| t.value else null);
+            try handleList(server, allocator, rctx.read_db, ent, sid, sess, route.tenant_id, route.query, floor_ns, rctx.cfg, if (tf) |t| t.key else null, if (tf) |t| t.value else null);
         },
         // Replay sugar: list this session's activations, newest-first.
         // `/session/{id}` ≡ `/list?tag.session={id}`.
-        .session => try handleList(server, allocator, rctx.db, ent, sid, sess, route.tenant_id, route.query, floor_ns, rctx.cfg, "session", route.tail),
-        .show => try handleShow(server, allocator, rctx.store, rctx.db, ent, sid, sess, route.tenant_id, route.tail, floor_ns, rctx.cfg),
-        .count => try handleCount(server, allocator, rctx.db, ent, sid, sess, route.tenant_id, floor_ns, rctx.cfg),
+        .session => try handleList(server, allocator, rctx.read_db, ent, sid, sess, route.tenant_id, route.query, floor_ns, rctx.cfg, "session", route.tail),
+        .show => try handleShow(server, allocator, rctx.store, rctx.read_db, ent, sid, sess, route.tenant_id, route.tail, floor_ns, rctx.cfg),
+        .count => try handleCount(server, allocator, rctx.read_db, ent, sid, sess, route.tenant_id, floor_ns, rctx.cfg),
     }
 }
 

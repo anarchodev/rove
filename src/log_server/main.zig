@@ -246,13 +246,21 @@ pub fn main() !void {
         try std.fmt.allocPrintSentinel(allocator, "{s}/log_index.db", .{cli.data_dir}, 0);
     defer allocator.free(index_db_path);
 
+    // Writer connection (indexer + push path); open it first so the
+    // WAL/shm files exist for the reader. Reader connection serves the
+    // query surface on its own handle so /list|/show|/count never wait
+    // on the writer mutex mid-index. Closed after `handle.shutdown()`
+    // joins both threads (defers run LIFO).
     var db = try log_server.index_db.IndexDb.open(allocator, index_db_path);
     defer db.close();
+    var read_db = try log_server.index_db.IndexDb.openReader(allocator, index_db_path);
+    defer read_db.close();
 
     const handle = try log_server.standalone.spawn(.{
         .allocator = allocator,
         .store = batch_store,
         .db = db,
+        .read_db = read_db,
         .bind_addr = listen_addr,
         .max_connections = cli.max_connections,
         .tls_config = tls_config,

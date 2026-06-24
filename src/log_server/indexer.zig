@@ -3,27 +3,48 @@
 //! inserts the records into `log_index.db`.
 //!
 //! Each pass:
-//!   1. LIST every key in the batch store (no cross-pass cursor — see below).
-//!   2. For each `.ndjson` key, range-GET the head bytes
+//!   1. Enumerate the `_logs/{node}/` prefixes present in the store
+//!      (`listNodePrefixes`, a skip-scan — see below).
+//!   2. For each node, LIST keys strictly after that node's persisted
+//!      catch-up cursor (`_meta` key `cursor:{node_prefix}`).
+//!   3. For each `.ndjson` key, range-GET the head bytes
 //!      (`HEAD_FETCH_BYTES`), parse `[u32 LE sidecar_size][sidecar JSON]`,
 //!      refetch with a larger range if the sidecar exceeds the
 //!      initial fetch size.
-//!   3. Pass `header_size = 4 + sidecar_size` to `index_db.insertBatch`
+//!   4. Pass `header_size = 4 + sidecar_size` to `index_db.insertBatch`
 //!      so per-record offsets stored in `log_index` are file-relative.
-//!      Both `batches` and `log_index` insert with `OR IGNORE`, so
-//!      already-indexed batches cost a PK lookup and skip writes.
-//!   4. `_meta.last_seen_key` is updated for observability + future
-//!      cursor-based optimization, but isn't consulted on read.
+//!      Both `batches` and `log_index` insert with `OR IGNORE`, so a
+//!      batch the push path already indexed costs a PK lookup, no write.
+//!   5. Advance + persist the node's cursor to the last LISTed key.
 //!
-//! ## Why a full scan instead of `--start-after` cursor
+//! ## Per-node `start-after` cursor
 //!
 //! `docs/logs-plan.md` §4.3 sketches an `S3 LIST --start-after last`
 //! optimization. The `_logs/{node}/{batch}` key shape IS lex-monotonic
-//! per node, but a cluster-wide cursor is fragile if a new node first
-//! emits a batch whose key sorts earlier than the current cursor.
-//! Per-pass full scan with `INSERT OR IGNORE` dedup is simpler and
-//! cheap (cost dominated by the S3 LIST itself). Cursor refinement
-//! with per-`node` book-keeping is a v2 task.
+//! per node (batch_id leads with the monotonic first-request-id, so it
+//! never goes backward even under clock skew), so a PER-NODE cursor is
+//! sound — a new batch always sorts after the node's cursor, and a key
+//! written while the indexer was down is picked up on resume. The
+//! cluster-wide cursor that the old full-scan avoided was fragile only
+//! because a fresh node could emit a key sorting earlier than it; one
+//! cursor per node removes that hazard.
+//!
+//! Node discovery is a skip-scan over `_logs/` (`listNodePrefixes`):
+//! list one key, extract its `_logs/{node}/` prefix, jump the cursor
+//! past that whole node, repeat. O(nodes) tiny LISTs — no delimiter
+//! support needed from the backend, so it works identically on S3 /
+//! memory / fs. Per pass the cost is O(nodes), not O(objects-ever-
+//! written) as the full scan was; idle passes that find nothing cost a
+//! handful of empty LISTs regardless of how much history has accrued.
+//!
+//! The cursor always advances to the last LISTed key, even past a batch
+//! that failed to read (logged + counted in `skipped_invalid`) — so a
+//! permanently-bad object never wedges the scan and a node never
+//! re-walks its whole history. A transiently-unreadable batch (partial
+//! PUT, list-after-write lag) is recovered by the worker→log-server
+//! push path (`indexOneKey`), which indexes by direct GET independent
+//! of this cursor; missing both is within the logs' lossy-on-failure
+//! contract (`docs/logs-plan.md`).
 //!
 //! Two surfaces:
 //!   - `pollOnce` runs a single pass and returns. Useful for tests
@@ -62,9 +83,13 @@ pub const Stats = struct {
     skipped_invalid: u32 = 0,
 };
 
+/// Root prefix every batch key lives under: `_logs/{node}/{batch}.ndjson`.
+const LOGS_PREFIX: []const u8 = "_logs/";
+
 /// One polling pass. Returns counts so callers (and tests) can assert
-/// what was indexed. Walks the entire batch store every pass; dedup
-/// is handled by `INSERT OR IGNORE` in `index_db.insertBatch`.
+/// what was indexed. Discovers the node prefixes present in the store,
+/// then catches each one up from its persisted cursor; dedup against
+/// the push path is handled by `INSERT OR IGNORE` in `insertBatch`.
 pub fn pollOnce(
     allocator: std.mem.Allocator,
     store: batch_store_mod.BatchStore,
@@ -73,18 +98,39 @@ pub fn pollOnce(
 ) Error!Stats {
     var stats: Stats = .{};
 
-    // Page through everything strictly greater than the previous
-    // page's last key. Within a single pass this is monotonic (keys
-    // already exist), so the cursor-based pagination IS safe — only
-    // ACROSS passes does using a cursor break under interleaved
-    // tenant arrivals (see module doc). Per pass we always start at
-    // `""` so newly-arrived sidecars whose keys sort earlier than
-    // anything indexed get picked up too.
-    var cursor_owned = try allocator.dupe(u8, "");
-    defer allocator.free(cursor_owned);
+    const node_prefixes = listNodePrefixes(allocator, store) catch
+        return Error.BatchStore;
+    defer batch_store_mod.freeListResult(allocator, node_prefixes);
+
+    for (node_prefixes) |node_prefix| {
+        try pollNode(allocator, store, db, node_prefix, page_size, &stats);
+    }
+    return stats;
+}
+
+/// Catch one node up: page `node_prefix` strictly after the node's
+/// persisted cursor (`_meta` key `cursor:{node_prefix}`), index each
+/// `.ndjson` batch, and persist the advanced cursor after every page so
+/// a crash mid-catch-up resumes where it left off. The cursor advances
+/// to the last LISTed key even past a read failure — see the module doc
+/// for why that's safe (push path recovers transient misses).
+fn pollNode(
+    allocator: std.mem.Allocator,
+    store: batch_store_mod.BatchStore,
+    db: *index_db_mod.IndexDb,
+    node_prefix: []const u8,
+    page_size: u32,
+    stats: *Stats,
+) Error!void {
+    const meta_key = try cursorMetaKey(allocator, node_prefix);
+    defer allocator.free(meta_key);
+
+    var cursor: []u8 = (db.getMeta(meta_key) catch return Error.Sqlite) orelse
+        try allocator.dupe(u8, "");
+    defer allocator.free(cursor);
 
     while (true) {
-        const keys = store.list("", cursor_owned, page_size, allocator) catch
+        const keys = store.list(node_prefix, cursor, page_size, allocator) catch
             return Error.BatchStore;
         defer batch_store_mod.freeListResult(allocator, keys);
         if (keys.len == 0) break;
@@ -112,18 +158,94 @@ pub fn pollOnce(
             stats.records_indexed += @intCast(idx.records.len);
         }
 
-        // Advance the in-pass cursor to keep paginating; resets on
-        // the next pollOnce invocation.
+        // Advance + persist the cursor to the last LISTed key so the
+        // next page (and the next pass, and a restart) resumes here.
         const last_key = keys[keys.len - 1];
         const new_cursor = try allocator.dupe(u8, last_key);
-        allocator.free(cursor_owned);
-        cursor_owned = new_cursor;
+        allocator.free(cursor);
+        cursor = new_cursor;
+        db.setMeta(meta_key, cursor) catch return Error.Sqlite;
 
-        // Short page → no more keys; stop.
+        // Short page → caught up for this node.
         if (keys.len < page_size) break;
     }
+}
 
-    return stats;
+/// The `_meta` key under which a node's catch-up cursor is persisted.
+/// Caller frees.
+fn cursorMetaKey(allocator: std.mem.Allocator, node_prefix: []const u8) Error![]u8 {
+    return std.fmt.allocPrint(allocator, "cursor:{s}", .{node_prefix}) catch
+        return Error.OutOfMemory;
+}
+
+/// Extract `_logs/{node}/` from a batch key, or null if the key isn't
+/// under `_logs/` or carries no node segment. Returned slice borrows
+/// from `key`.
+fn nodePrefixOf(key: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, key, LOGS_PREFIX)) return null;
+    const rest = key[LOGS_PREFIX.len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    return key[0 .. LOGS_PREFIX.len + slash + 1];
+}
+
+/// Smallest string that sorts strictly after every key beginning with
+/// `prefix` — used as `start-after` to skip an entire node in one jump.
+/// `prefix` always ends in '/' (0x2F), so incrementing the last byte to
+/// '0' (0x30) lands below the next node's prefix (node ids are
+/// fixed-width, so the differing node byte orders the two before this
+/// appended byte ever matters). Caller frees.
+fn prefixUpperBound(allocator: std.mem.Allocator, prefix: []const u8) Error![]u8 {
+    std.debug.assert(prefix.len > 0);
+    std.debug.assert(prefix[prefix.len - 1] != 0xff);
+    const buf = allocator.dupe(u8, prefix) catch return Error.OutOfMemory;
+    buf[buf.len - 1] += 1;
+    return buf;
+}
+
+/// Enumerate the distinct `_logs/{node}/` prefixes in the store via a
+/// skip-scan: list one key, record its node prefix, jump past that node
+/// (`prefixUpperBound`), repeat. O(nodes) LISTs of max=1, using only the
+/// `list` primitive (no backend delimiter support needed). Caller frees
+/// with `batch_store_mod.freeListResult`.
+fn listNodePrefixes(
+    allocator: std.mem.Allocator,
+    store: batch_store_mod.BatchStore,
+) Error![][]const u8 {
+    var prefixes: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (prefixes.items) |p| allocator.free(p);
+        prefixes.deinit(allocator);
+    }
+
+    var after = allocator.dupe(u8, "") catch return Error.OutOfMemory;
+    defer allocator.free(after);
+
+    while (true) {
+        const keys = store.list(LOGS_PREFIX, after, 1, allocator) catch
+            return Error.BatchStore;
+        defer batch_store_mod.freeListResult(allocator, keys);
+        if (keys.len == 0) break;
+        const key = keys[0];
+
+        // Next `start-after`: jump past this whole node when the key has
+        // a node segment, else step one key forward. Either way `after`
+        // strictly increases, so the scan terminates. Compute the bound
+        // BEFORE appending `owned` so a later error here can't leave a
+        // dangling errdefer that double-frees an already-appended entry.
+        const next: []u8 = if (nodePrefixOf(key)) |np| blk: {
+            const bound = try prefixUpperBound(allocator, np);
+            errdefer allocator.free(bound);
+            const owned = allocator.dupe(u8, np) catch return Error.OutOfMemory;
+            errdefer allocator.free(owned);
+            prefixes.append(allocator, owned) catch return Error.OutOfMemory;
+            break :blk bound;
+        } else allocator.dupe(u8, key) catch return Error.OutOfMemory;
+
+        allocator.free(after);
+        after = next;
+    }
+
+    return prefixes.toOwnedSlice(allocator) catch return Error.OutOfMemory;
 }
 
 /// Index a single batch key by direct GET (no LIST roundtrip).
@@ -377,7 +499,7 @@ test "pollOnce indexes a single sidecar end-to-end" {
     try testing.expectEqual(@as(u64, 7), list.rows[0].request_id);
 }
 
-test "pollOnce is idempotent across runs" {
+test "pollOnce cursor skips already-indexed batches on the next pass" {
     const a = testing.allocator;
     const m = try batch_store_mod.MemoryBatchStore.init(a);
     defer m.deinit();
@@ -408,14 +530,15 @@ test "pollOnce is idempotent across runs" {
     };
     try writeSidecar(a, store, "00000001", "b1-001", &records);
 
-    _ = try pollOnce(a, store, db, 32);
+    const stats1 = try pollOnce(a, store, db, 32);
+    try testing.expectEqual(@as(u32, 1), stats1.batches_indexed);
+
+    // Per-node cursor: the second pass resumes start-after the indexed
+    // key, so it re-reads NOTHING — the proof the cursor advanced and
+    // persisted. (The old full-scan re-walked the sidecar every pass.)
     const stats2 = try pollOnce(a, store, db, 32);
-    // Full-scan model: the second pass DOES see the sidecar again,
-    // but `INSERT OR IGNORE` in `index_db.insertBatch` keeps the
-    // table state idempotent. Records-indexed counts the per-row
-    // INSERT calls regardless of whether they actually wrote.
-    try testing.expectEqual(@as(u32, 1), stats2.sidecars_seen);
-    try testing.expectEqual(@as(u32, 1), stats2.batches_indexed);
+    try testing.expectEqual(@as(u32, 0), stats2.sidecars_seen);
+    try testing.expectEqual(@as(u32, 0), stats2.batches_indexed);
 
     // Still exactly one row in the index after both passes.
     var list = try db.queryList("acme", 0, 0, 0, 10, null, null);
@@ -456,9 +579,9 @@ test "pollOnce picks up newly-arrived sidecars across passes" {
     const s1 = try pollOnce(a, store, db, 32);
     try testing.expectEqual(@as(u32, 1), s1.batches_indexed);
 
-    // New sidecar arrives — second pass walks both sidecars again
-    // (full-scan model). The new one INSERTs; the old one is a
-    // no-op via `OR IGNORE`. End state: both rows in the index.
+    // New sidecar arrives with a later (lex-greater) key. The per-node
+    // cursor resumes start-after b1, so the second pass reads ONLY the
+    // new b2 — not b1 again. End state: both rows in the index.
     var r2 = [_]sidecar.Record{
         .{
             .tenant_id = "acme",
@@ -477,8 +600,8 @@ test "pollOnce picks up newly-arrived sidecars across passes" {
     };
     try writeSidecar(a, store, "00000001", "b2", &r2);
     const s2 = try pollOnce(a, store, db, 32);
-    try testing.expectEqual(@as(u32, 2), s2.sidecars_seen);
-    try testing.expectEqual(@as(u32, 2), s2.batches_indexed);
+    try testing.expectEqual(@as(u32, 1), s2.sidecars_seen);
+    try testing.expectEqual(@as(u32, 1), s2.batches_indexed);
 
     var list = try db.queryList("acme", 0, 0, 0, 10, null, null);
     defer list.deinit();
@@ -511,4 +634,86 @@ test "pollOnce skips garbage objects" {
     try testing.expectEqual(@as(u32, 0), stats.batches_indexed);
     try testing.expectEqual(@as(u32, 1), stats.skipped_invalid);
     try testing.expectEqual(@as(u32, 1), stats.skipped_non_sidecars);
+}
+
+test "nodePrefixOf + prefixUpperBound" {
+    const a = testing.allocator;
+
+    try testing.expectEqualStrings(
+        "_logs/00000001/",
+        nodePrefixOf("_logs/00000001/00000000000000000007-1730764800000.ndjson").?,
+    );
+    // A bare node marker still yields its own prefix.
+    try testing.expectEqualStrings("_logs/00000002/", nodePrefixOf("_logs/00000002/").?);
+    // Not under _logs/, or no node segment → null.
+    try testing.expect(nodePrefixOf("other/00000001/b.ndjson") == null);
+    try testing.expect(nodePrefixOf("_logs/00000001") == null);
+
+    // The bound replaces the trailing '/' (0x2F) with '0' (0x30) and
+    // sorts strictly above every key under the prefix but below the
+    // next fixed-width node prefix.
+    const bound = try prefixUpperBound(a, "_logs/00000001/");
+    defer a.free(bound);
+    try testing.expectEqualStrings("_logs/000000010", bound);
+    try testing.expect(std.mem.lessThan(u8, "_logs/00000001/zzz.ndjson", bound));
+    try testing.expect(std.mem.lessThan(u8, bound, "_logs/00000002/"));
+}
+
+test "listNodePrefixes enumerates each node once via skip-scan" {
+    const a = testing.allocator;
+    const m = try batch_store_mod.MemoryBatchStore.init(a);
+    defer m.deinit();
+    const store = m.batchStore();
+
+    // Three nodes, several batches each, plus a non-_logs object that
+    // must be ignored entirely.
+    try store.put("_logs/00000001/b1.ndjson", "x");
+    try store.put("_logs/00000001/b2.ndjson", "x");
+    try store.put("_logs/00000002/b1.ndjson", "x");
+    try store.put("_logs/00000003/b1.ndjson", "x");
+    try store.put("_logs/00000003/b2.ndjson", "x");
+    try store.put("other/ignore-me", "x");
+
+    const prefixes = try listNodePrefixes(a, store);
+    defer batch_store_mod.freeListResult(a, prefixes);
+    try testing.expectEqual(@as(usize, 3), prefixes.len);
+    try testing.expectEqualStrings("_logs/00000001/", prefixes[0]);
+    try testing.expectEqualStrings("_logs/00000002/", prefixes[1]);
+    try testing.expectEqualStrings("_logs/00000003/", prefixes[2]);
+}
+
+test "pollOnce advances each node's cursor independently" {
+    const a = testing.allocator;
+    const m = try batch_store_mod.MemoryBatchStore.init(a);
+    defer m.deinit();
+    const store = m.batchStore();
+    const db_path = try tempDbPath(a, "multinode");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        a.free(db_path);
+    }
+    var db = try index_db_mod.IndexDb.open(a, db_path);
+    defer db.close();
+
+    var n1 = [_]sidecar.Record{.{ .tenant_id = "acme", .request_id = 1, .received_ns = 100, .duration_ns = 1, .method = "GET", .path = "/a", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .offset = 0, .length = 1 }};
+    var n2 = [_]sidecar.Record{.{ .tenant_id = "acme", .request_id = 2, .received_ns = 200, .duration_ns = 1, .method = "GET", .path = "/b", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .offset = 0, .length = 1 }};
+    try writeSidecar(a, store, "00000001", "00000000000000000001-1", &n1);
+    try writeSidecar(a, store, "00000002", "00000000000000000002-1", &n2);
+
+    // First pass indexes both nodes (one batch each).
+    const s1 = try pollOnce(a, store, db, 32);
+    try testing.expectEqual(@as(u32, 2), s1.batches_indexed);
+
+    // A new batch on node 1 only. The node-2 cursor must NOT cause its
+    // single batch to re-index, and node 1 must pick up just the new one.
+    var n1b = [_]sidecar.Record{.{ .tenant_id = "acme", .request_id = 3, .received_ns = 300, .duration_ns = 1, .method = "GET", .path = "/c", .host = "h", .status = 200, .outcome = "ok", .deployment_id = 1, .offset = 0, .length = 1 }};
+    try writeSidecar(a, store, "00000001", "00000000000000000003-1", &n1b);
+
+    const s2 = try pollOnce(a, store, db, 32);
+    try testing.expectEqual(@as(u32, 1), s2.sidecars_seen);
+    try testing.expectEqual(@as(u32, 1), s2.batches_indexed);
+
+    var list = try db.queryList("acme", 0, 0, 0, 10, null, null);
+    defer list.deinit();
+    try testing.expectEqual(@as(usize, 3), list.rows.len);
 }

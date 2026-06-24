@@ -70,41 +70,71 @@ const SCHEMA: [:0]const u8 =
     \\CREATE INDEX IF NOT EXISTS log_tags_lookup ON log_tags (tenant_id, key, value, received_ns DESC);
 ;
 
-/// Owning handle for a `log_index.db` connection. Open once at process
-/// start; the indexer thread + the HTTP API each open their own
-/// connection (WAL handles the concurrency).
+/// Owning handle for a `log_index.db` connection.
+///
+/// Two connections share one WAL-mode file (`docs/architecture/deployment-and-logs.md`):
+///
+///   - The **writer** (`open`) is opened by the indexer thread's owner
+///     and is ALSO used by the h2 server thread for the push path
+///     (`/v1/_internal/batch-pushed` → `indexOneKey` → `insertBatch`).
+///     Two threads touch it, so it stays FULLMUTEX (serialized).
+///   - The **reader** (`openReader`) is opened per process and used by
+///     the h2 server thread alone for the query surface (/list, /show,
+///     /count). Single-threaded, so NOMUTEX — and on its own
+///     connection, so a list/show/count never waits on the writer's
+///     connection mutex while the indexer is mid-`insertBatch`. WAL
+///     gives the reader a consistent snapshot without blocking the
+///     writer.
+///
+/// Before the split both roles shared ONE FULLMUTEX connection, so
+/// every read serialized against every indexer write — the index's
+/// near-term scaling ceiling. WAL was already on; the split just hands
+/// reads their own handle.
 pub const IndexDb = struct {
     allocator: std.mem.Allocator,
     db: *c.sqlite3,
 
+    /// Open the read+write connection (writer + push path). Creates the
+    /// file + schema if absent. Open this BEFORE `openReader` so the
+    /// WAL/shm sidecar files exist when the reader attaches.
     pub fn open(allocator: std.mem.Allocator, path: [:0]const u8) Error!*IndexDb {
+        return openConn(allocator, path, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_FULLMUTEX, true);
+    }
+
+    /// Open a second connection for the query surface only. Opened
+    /// READWRITE (not READONLY — a read-only handle can't create the
+    /// WAL/shm sidecars, and dodging that pitfall is simpler than
+    /// guarding it) but the query helpers never write through it.
+    /// NOMUTEX: a single thread (the h2 event loop) owns it. Must be
+    /// opened after `open` has created the schema.
+    pub fn openReader(allocator: std.mem.Allocator, path: [:0]const u8) Error!*IndexDb {
+        return openConn(allocator, path, c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_NOMUTEX, false);
+    }
+
+    fn openConn(
+        allocator: std.mem.Allocator,
+        path: [:0]const u8,
+        open_flags: c_int,
+        run_schema: bool,
+    ) Error!*IndexDb {
         var db: ?*c.sqlite3 = null;
-        // FULLMUTEX (serialized mode): this ONE connection handle is
-        // shared by two threads — the indexer thread writes (pollOnce →
-        // insert*) and the h2 server thread reads (/list, /show, /count)
-        // — so SQLite must serialize every core call on it. NOMUTEX here
-        // was a latent bug: concurrent /show queries during active
-        // indexing corrupted SQLite's per-connection state and crashed
-        // the process (#GP, surfaced at teardown). Statements are
-        // prepared+finalized per call (never shared across threads), so
-        // connection-level serialization is sufficient and complete.
-        const rc = c.sqlite3_open_v2(
-            path.ptr,
-            &db,
-            c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_FULLMUTEX,
-            null,
-        );
+        const rc = c.sqlite3_open_v2(path.ptr, &db, open_flags, null);
         if (rc != c.SQLITE_OK or db == null) return Error.Sqlite;
         errdefer _ = c.sqlite3_close_v2(db);
 
         // WAL + sane defaults. 5s busy timeout shields against the rare
-        // contention spike (e.g. a checkpoint landing during a query).
+        // contention spike (e.g. a checkpoint landing during a query,
+        // or the writer + push path briefly contending the WAL lock).
+        // `journal_mode=WAL` is a no-op once the file is already WAL,
+        // so the reader re-asserting it is harmless.
         if (c.sqlite3_exec(db, "PRAGMA journal_mode=WAL;", null, null, null) != c.SQLITE_OK)
             return Error.JournalMode;
         _ = c.sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", null, null, null);
         _ = c.sqlite3_exec(db, "PRAGMA busy_timeout=5000;", null, null, null);
-        if (c.sqlite3_exec(db, SCHEMA.ptr, null, null, null) != c.SQLITE_OK)
-            return Error.Sqlite;
+        if (run_schema) {
+            if (c.sqlite3_exec(db, SCHEMA.ptr, null, null, null) != c.SQLITE_OK)
+                return Error.Sqlite;
+        }
 
         const self = allocator.create(IndexDb) catch return Error.OutOfMemory;
         self.* = .{ .allocator = allocator, .db = db.? };
@@ -533,6 +563,16 @@ fn tempPath(allocator: std.mem.Allocator, tag: []const u8) ![:0]u8 {
     return path;
 }
 
+/// Remove the `-wal` / `-shm` sidecars a WAL connection leaves next to
+/// `db_path`. Best-effort; ignores missing files.
+fn deleteWalSidecars(db_path: []const u8) void {
+    var buf: [512]u8 = undefined;
+    inline for (.{ "-wal", "-shm" }) |suffix| {
+        const p = std.fmt.bufPrint(&buf, "{s}{s}", .{ db_path, suffix }) catch return;
+        std.fs.cwd().deleteFile(p) catch {};
+    }
+}
+
 fn fixtureBatch(records_count: usize, base_request_id: u64, base_ns: i64) sidecar.IdxFile {
     // Caller manages records storage; these tests use a static slice.
     _ = records_count;
@@ -794,4 +834,55 @@ test "_meta last_seen_key tracks the most recent insertBatch" {
     const v2 = (try idx.getMeta("last_seen_key")).?;
     defer a.free(v2);
     try testing.expectEqualStrings("_logs/00000001/b2.ndjson", v2);
+}
+
+test "openReader sees rows committed by the writer connection" {
+    const a = testing.allocator;
+    const db_path = try tempPath(a, "split");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        deleteWalSidecars(db_path); // WAL/shm left by the two connections
+        a.free(db_path);
+    }
+
+    // Writer opened first (creates the file + schema + WAL), then a
+    // separate reader connection — the production wiring.
+    var writer = try IndexDb.open(a, db_path);
+    defer writer.close();
+    var reader = try IndexDb.openReader(a, db_path);
+    defer reader.close();
+
+    var records = [_]sidecar.Record{
+        .{
+            .tenant_id = "acme",
+            .request_id = 42,
+            .received_ns = 1_000,
+            .duration_ns = 5,
+            .method = "GET",
+            .path = "/split",
+            .host = "h.test",
+            .status = 200,
+            .outcome = "ok",
+            .deployment_id = 1,
+            .offset = 0,
+            .length = 10,
+        },
+    };
+    const batch = sidecar.IdxFile{
+        .node_id = "00000001",
+        .batch_id = "b1",
+        .ndjson_size = 10,
+        .ndjson_sha256 = "abc",
+        .first_received_ns = 1_000,
+        .last_received_ns = 1_000,
+        .records = &records,
+    };
+    try writer.insertBatch(&batch, "_logs/00000001/b1.ndjson", 0);
+
+    // The reader (own connection, WAL snapshot) sees the committed row.
+    var list = try reader.queryList("acme", 0, 0, 0, 10, null, null);
+    defer list.deinit();
+    try testing.expectEqual(@as(usize, 1), list.rows.len);
+    try testing.expectEqual(@as(u64, 42), list.rows[0].request_id);
+    try testing.expectEqual(@as(u64, 1), try reader.queryCount("acme", 0));
 }
