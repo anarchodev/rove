@@ -89,6 +89,8 @@ const kvlimbs = @import("kvlimbs");
 pub const Node = node_mod.Node;
 pub const WriteSet = node_mod.WriteSet;
 pub const PeerAddr = node_mod.PeerAddr;
+pub const PeerResolver = node_mod.PeerResolver;
+pub const PeerRegistry = node_mod.PeerRegistry;
 pub const StoreResolver = node_mod.StoreResolver;
 pub const ApplyObserver = node_mod.ApplyObserver;
 
@@ -323,6 +325,13 @@ pub const Bridge = struct {
     /// Compatibility surface for the reused worker's `.raft.config.*` reads.
     config: Config = .{},
 
+    /// Runtime peer-address registry (cluster-genesis-and-membership §3.3),
+    /// owned here and injected as the transport's resolver by
+    /// `enablePeerRegistry`. Null until enabled (single-node / pre-enable). Fed
+    /// by `learnPeer` from the static seed at boot AND from attach / conf-change
+    /// headers, so the transport can dial peers it learned at runtime.
+    peer_registry: ?*node_mod.PeerRegistry = null,
+
     /// This bridge incarnation's random identity, stamped (with the seq)
     /// into every proposed entry's origin frame. The commit hook and the
     /// skip query match on it — see the file header. Random per boot
@@ -474,6 +483,41 @@ pub const Bridge = struct {
         self.node.apply_observer = observer;
     }
 
+    /// Install a runtime peer-address resolver (a CP-fed `PeerRegistry`) on the
+    /// node's transport, so it can dial peers learned at runtime instead of from
+    /// static config (cluster-genesis-and-membership §3.3). No-op single-node.
+    /// Pre-pump only (see `Transport.setResolver`).
+    pub fn setPeerResolver(self: *Bridge, r: node_mod.PeerResolver) void {
+        self.node.setPeerResolver(r);
+    }
+
+    /// Create the bridge-owned `PeerRegistry` and make it the transport's
+    /// resolver. Idempotent. Pre-pump only. After this the transport addresses
+    /// peers ONLY through the registry, so callers MUST seed it (`learnPeer`)
+    /// with the statically-known peers before the pump starts, or the node
+    /// can't dial anyone until the CP teaches it addresses.
+    pub fn enablePeerRegistry(self: *Bridge) Error!void {
+        if (self.peer_registry != null) return;
+        const reg = node_mod.PeerRegistry.create(self.allocator) catch return Error.OutOfMemory;
+        self.peer_registry = reg;
+        self.node.setPeerResolver(reg.resolver());
+    }
+
+    /// Teach the registry `node_id → host:port` (insert-only). No-op if the
+    /// registry isn't enabled. Thread-safe (callable from an h2 handler while
+    /// the pump resolves).
+    pub fn learnPeer(self: *Bridge, node_id: u64, host: []const u8, port: u16) Error!void {
+        const reg = self.peer_registry orelse return;
+        return reg.learn(node_id, host, port);
+    }
+
+    /// Teach the registry `node_id → addr` where `addr` is the `host:port` wire
+    /// form the CP carries on attach / conf-change. No-op if not enabled.
+    pub fn learnPeerAddr(self: *Bridge, node_id: u64, addr: []const u8) Error!void {
+        const reg = self.peer_registry orelse return;
+        return reg.learnAddr(node_id, addr);
+    }
+
 
     /// Point follower-apply at the worker's own per-tenant serving store
     /// (Phase 5 "Full HA"). In `worker_overlay` mode a follower has no local
@@ -493,7 +537,10 @@ pub const Bridge = struct {
         self.stopPump();
 
         const a = self.allocator;
+        // Free the node (and its transport, which borrows the registry's
+        // resolver) BEFORE the registry it points at.
         self.node.deinit();
+        if (self.peer_registry) |reg| reg.destroy();
 
         var it = self.groups.valueIterator();
         while (it.next()) |sig_ptr| {

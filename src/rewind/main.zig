@@ -681,7 +681,14 @@ pub fn main() !void {
     const bridge = if (try parseMultiNode(allocator)) |mn| blk: {
         defer mn.deinit(allocator);
         std.log.info("rewind: multi-node id={d} voters={d} listen={s}", .{ mn.node_id, mn.voters.len, mn.listen_str });
-        break :blk try Bridge.initMultiNode(allocator, data_dir, mn.node_id, mn.voters, mn.listen_addr, mn.peers);
+        const b = try Bridge.initMultiNode(allocator, data_dir, mn.node_id, mn.voters, mn.listen_addr, mn.peers);
+        // Route peer addressing through the runtime registry (genesis §3.3),
+        // seeded with the statically-configured peers — so today's behavior is
+        // unchanged, but attach / conf-change can teach it nodes beyond the
+        // static set, and Phase 3 can drop the static seed entirely.
+        b.enablePeerRegistry() catch return error.OutOfMemory;
+        for (mn.peers, 0..) |p, i| try b.learnPeer(@intCast(i + 1), p.host, p.port);
+        break :blk b;
     } else try Bridge.initSingleNode(allocator, data_dir);
     defer bridge.deinit();
     bridge.setWorkerOverlay();

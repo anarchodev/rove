@@ -1027,7 +1027,7 @@ const Router = struct {
             // (.progressed) → stop and re-observe next pass.
             for (nodes, 0..) |node_url, i| {
                 const node_id: u64 = @intCast(i + 1); // POSITIONAL id (nodes[i] ↔ raft id i+1)
-                switch (self.ensureMember(tenant, node_url, node_id, leader_url)) {
+                switch (self.ensureMember(tenant, node_url, node_id, leader_url, res.id)) {
                     .done, .failed => continue,
                     .progressed => break,
                 }
@@ -1328,10 +1328,18 @@ const Router = struct {
     /// voter of `tenant`'s group, talking to `leader_url`. `.done` when already a
     /// caught-up voter, `.progressed` after a step (re-check next pass), `.failed`
     /// on a transient error (retry next pass).
-    fn ensureMember(self: *Router, tenant: []const u8, node_url: []const u8, node_id: u64, leader_url: []const u8) EnsureResult {
+    fn ensureMember(self: *Router, tenant: []const u8, node_url: []const u8, node_id: u64, leader_url: []const u8, cluster_id: []const u8) EnsureResult {
         const a = self.allocator;
         // The leader is trivially a caught-up voter of its own group.
         if (std.mem.eql(u8, node_url, leader_url)) return .done;
+
+        // The joining node's raft transport address from the registry (genesis
+        // §3.3), carried on the add/promote conf-change so the leader can dial
+        // it. Empty when the node isn't registered (a still-static cluster —
+        // the leader falls back to its static peers). Owned; freed below.
+        const raft_addr_owned: ?[]u8 = self.raftAddrFor(cluster_id, node_id);
+        defer if (raft_addr_owned) |ra| a.free(ra);
+        const raft_addr: []const u8 = raft_addr_owned orelse "";
 
         // 1. Observe the leader's per-peer view.
         const ms_path = std.fmt.allocPrint(a, "/_system/v2-member-status?tenant={s}", .{tenant}) catch return .failed;
@@ -1395,7 +1403,7 @@ const Router = struct {
                     // genuinely stuck voter stays inactive across it and is demoted.
                     if (!self.demoteGraceElapsed(tenant, node_id)) return .done;
                     self.clearDemoteTimer(tenant, node_id);
-                    return if (self.reconcileConfChange(leader_url, tenant, node_id, "demote")) .progressed else .failed;
+                    return if (self.reconcileConfChange(leader_url, tenant, node_id, "demote", raft_addr)) .progressed else .failed;
                 }
                 return .done; // responsive, just behind — no membership change needed
             }
@@ -1411,14 +1419,14 @@ const Router = struct {
             // beyond the node's log. The manager's ConfChangeQuorumGuard refuses
             // any remove that would drop below 2 voters, so this can't lose
             // quorum. Structural fix — the panic becomes impossible, not unlikely.
-            return if (self.reconcileConfChange(leader_url, tenant, node_id, "remove")) .progressed else .failed;
+            return if (self.reconcileConfChange(leader_url, tenant, node_id, "remove", raft_addr)) .progressed else .failed;
         }
         if (is_learner) {
             if (host == .absent)
                 return if (self.bootstrapMember(leader_url, node_url, tenant, node_id, true)) .progressed else .failed;
             const last_idx = self.nodeLastIndex(node_url, tenant) orelse return .progressed;
             if (last_idx + RECONCILE_SLACK >= ms.leader_last)
-                return if (self.reconcileConfChange(leader_url, tenant, node_id, "promote")) .progressed else .failed;
+                return if (self.reconcileConfChange(leader_url, tenant, node_id, "promote", raft_addr)) .progressed else .failed;
             return .progressed; // catching up
         }
         // Absent from the config entirely: bootstrap as a learner (only if the
@@ -1426,7 +1434,7 @@ const Router = struct {
         // born-learner idles (no campaign) until the leader's AddLearner lets it
         // replicate, then it catches up + is promoted next pass.
         if (host == .absent and !self.bootstrapMember(leader_url, node_url, tenant, node_id, true)) return .failed;
-        return if (self.reconcileConfChange(leader_url, tenant, node_id, "add")) .progressed else .failed;
+        return if (self.reconcileConfChange(leader_url, tenant, node_id, "add", raft_addr)) .progressed else .failed;
     }
 
     const HostState = enum { hosted, absent, unknown };
@@ -1473,9 +1481,26 @@ const Router = struct {
     }
 
     /// Propose a conf-change (`add`/`promote`/`demote`/`remove`) on `leader_url`.
-    fn reconcileConfChange(self: *Router, leader_url: []const u8, tenant: []const u8, node_id: u64, op: []const u8) bool {
+    /// The joining node's raft transport address (`host:port`) from the
+    /// directory registry, OWNED (caller frees), or null if unregistered. The
+    /// genesis §3.3 address the reconciler carries on a conf-change add/promote.
+    fn raftAddrFor(self: *Router, cluster_id: []const u8, node_id: u64) ?[]u8 {
         const a = self.allocator;
-        const body = std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\",\"node_id\":{d},\"op\":\"{s}\"}}", .{ tenant, node_id, op }) catch return false;
+        const packed_bytes = (self.directory.nodeAddrOwned(a, cluster_id, node_id) catch return null) orelse return null;
+        defer a.free(packed_bytes);
+        const na = Directory.unpackNodeAddr(packed_bytes) orelse return null;
+        if (na.raft_addr.len == 0) return null;
+        return a.dupe(u8, na.raft_addr) catch null;
+    }
+
+    fn reconcileConfChange(self: *Router, leader_url: []const u8, tenant: []const u8, node_id: u64, op: []const u8, raft_addr: []const u8) bool {
+        const a = self.allocator;
+        // Carry the address only when known (add/promote of a registered node);
+        // a demote/remove or a still-static cluster sends the bare body.
+        const body = if (raft_addr.len > 0)
+            std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\",\"node_id\":{d},\"op\":\"{s}\",\"raft_addr\":\"{s}\"}}", .{ tenant, node_id, op, raft_addr }) catch return false
+        else
+            std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\",\"node_id\":{d},\"op\":\"{s}\"}}", .{ tenant, node_id, op }) catch return false;
         defer a.free(body);
         const resp = self.backendCall(leader_url, "/_system/v2-confchange", .POST, body, &.{}) catch return false;
         defer a.free(resp.body);

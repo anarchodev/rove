@@ -284,6 +284,14 @@ pub const Transport = struct {
         self.woke.clearRetainingCapacity();
     }
 
+    /// Swap in a peer-address resolver (e.g. a CP-fed `PeerRegistry`). MUST be
+    /// called before the pump starts — `queueOut` (pump thread) reads
+    /// `self.resolver` with no lock, so a post-pump swap would race. The default
+    /// static resolver stays until this is called, so it's safe to skip.
+    pub fn setResolver(self: *Transport, r: PeerResolver) void {
+        self.resolver = r;
+    }
+
     /// Snapshot the heartbeat round-trip histogram (broadcast-time samples).
     /// Lock-free: the histogram's atomic buckets are written on the pump thread
     /// (queueOut/onRecv) and read here from the worker thread (`/_system/metrics`).

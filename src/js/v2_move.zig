@@ -926,7 +926,11 @@ fn handleConfChange(
     if (!std.mem.eql(u8, method, "POST"))
         return reply(server, allocator, ent, sid, sess, 405, "POST only\n");
     var parsed = std.json.parseFromSlice(
-        struct { tenant: []const u8, node_id: u64, op: []const u8 },
+        // `raft_addr` (optional `host:port`) is the joining node's transport
+        // address, carried so the leader can dial it the moment the add commits
+        // (cluster-genesis-and-membership §3.3) instead of relying on static
+        // config. Absent for a demote/remove or a still-static cluster.
+        struct { tenant: []const u8, node_id: u64, op: []const u8, raft_addr: []const u8 = "" },
         allocator,
         body,
         .{ .ignore_unknown_fields = true },
@@ -945,6 +949,12 @@ fn handleConfChange(
         return reply(server, allocator, ent, sid, sess, 404, "tenant not active on this node\n");
     if (!worker.raft.isLeaderOf(gid))
         return reply(server, allocator, ent, sid, sess, 421, "not the leader for this tenant; try another node\n");
+    // Learn the joining node's address BEFORE proposing, so by the time the add
+    // commits and raft addresses it, the transport can already resolve + dial.
+    // Insert-only + no-op when the registry is disabled or the addr is absent.
+    if (v.raft_addr.len > 0)
+        worker.raft.learnPeerAddr(v.node_id, v.raft_addr) catch
+            return reply(server, allocator, ent, sid, sess, 400, "malformed raft_addr\n");
     worker.raft.proposeConfChange(gid, v.node_id, cc_type) catch |e| switch (e) {
         error.NotLeader => return reply(server, allocator, ent, sid, sess, 421, "not the leader\n"),
         error.ConfChangeQuorumGuard => return reply(server, allocator, ent, sid, sess, 409, "refused: would leave fewer than 2 voters\n"),

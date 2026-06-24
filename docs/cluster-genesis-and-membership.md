@@ -1,6 +1,6 @@
 ---
 title: Cluster Genesis & Membership — bootstrap-one-then-grow
-status: in progress — Phase 1 (1a + 1b landed; 1c next). See §6.
+status: in progress — Phase 1 complete (1a + 1b + 1c landed); Phase 2 next. See §6.
 date: 2026-06-24
 ---
 
@@ -230,12 +230,29 @@ The point of the whole exercise: **tests bring clusters up the real way.**
      `POST /_control/node-address` handler (`cp/main.zig`). Full three-field
      shape stored now so Phase-2 CP-directory self-grow needs no migration.
      Unit-tested in `directory.zig`. Nothing reads the registry yet — that's 1c.
-   - **1c — NEXT.** Carry the joining node's raft transport address on
-     `/_system/v2-attach` + `/_system/v2-confchange` (CP sources it from the
-     registry; worker installs it into a `RegistryResolver` injected via
-     `Transport.Config.resolver`). This is what finally lets static config be
-     deleted (Phase 3). Wire it, then prove an end-to-end grow (overlaps the
-     Phase-4 genesis smoke).
+   - **1c — DONE.** Worker resolver fed from the registry + conf-change carries
+     the joining node's address:
+     - `PeerRegistry` (`node.zig`) — insert-only id→addr map; the `Bridge` owns
+       one (`enablePeerRegistry` / `learnPeer` / `learnPeerAddr`) and injects its
+       resolver via `Transport.setResolver` (a pre-pump setter, like
+       `setStoreResolver`). The worker enables it and **seeds it from the static
+       `REWIND_PEERS`**, so today's behavior is unchanged but addressing now runs
+       through the registry — Phase 3 just drops the static seed.
+     - `/_system/v2-confchange` carries an optional `raft_addr`; the worker
+       `learnPeer`s it before proposing, so the leader can dial a newly-added
+       node the moment the add commits. The CP reconciler (`ensureMember` →
+       `reconcileConfChange`) sources it from the directory registry
+       (`raftAddrFor` → `nodeAddrOwned`). Empty/absent for a still-static cluster
+       → falls back to static peers.
+     - Proven by a deterministic `node.zig` test: a leader replicates a committed
+       write to a node it knows **only** via the resolver (omitted from its
+       static peers). Added `raft_net.isPeerConnected` for the
+       connection-gated, race-free election in that test.
+     - **Deferred to Phase 2/3 (born-self-only):** the *attach* direction — a
+       joining node learning the existing members' addresses (it pulls from the
+       registry / they ride attach). Inert while static `REWIND_PEERS` is still
+       present, so not built yet; the end-to-end cold grow is the Phase-4 genesis
+       smoke.
 2. **Single-voter genesis + CP-directory self-grow** (§3.4, §3.5) — groups
    born `{self}`; the CP grows its own directory group; tenant reconciler reads
    the registry. Now a cluster can genesis-1-then-grow end to end.

@@ -55,6 +55,77 @@ const transport_mod = @import("transport.zig");
 
 pub const Transport = transport_mod.Transport;
 pub const PeerAddr = transport_mod.PeerAddr;
+pub const PeerResolver = transport_mod.PeerResolver;
+
+/// An in-memory raft node id → transport address map, fed by the control plane
+/// (attach / conf-change carry the joining node's address; the directory
+/// node-address registry is the durable source) and consulted by the transport
+/// to dial a peer it learned at runtime rather than from static config
+/// (cluster-genesis-and-membership §3.3). One per worker / CP process, shared by
+/// every raft group (all groups on a cluster ride the same physical nodes).
+///
+/// **Insert-only.** A node id's address is learned once and never freed/moved
+/// (re-IP is out of scope for v1, §7), so a host slice handed out by `resolve`
+/// stays valid after the brief lookup lock is dropped — the transport copies it
+/// into a `std.net.Address` synchronously inside `queueOut`. Heap-allocated so
+/// its address is stable for the `PeerResolver.ctx` it hands the transport.
+pub const PeerRegistry = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
+    map: std.AutoHashMapUnmanaged(u64, Entry) = .empty,
+
+    const Entry = struct { host: []u8, port: u16 };
+
+    pub fn create(allocator: std.mem.Allocator) Error!*PeerRegistry {
+        const self = allocator.create(PeerRegistry) catch return Error.OutOfMemory;
+        self.* = .{ .allocator = allocator };
+        return self;
+    }
+
+    pub fn destroy(self: *PeerRegistry) void {
+        const a = self.allocator;
+        var it = self.map.valueIterator();
+        while (it.next()) |e| a.free(e.host);
+        self.map.deinit(a);
+        a.destroy(self);
+    }
+
+    /// Learn `node_id → host:port` (insert-only — a repeat for a known id is
+    /// ignored). Thread-safe; callable from the worker's h2 handler thread while
+    /// the pump thread resolves.
+    pub fn learn(self: *PeerRegistry, node_id: u64, host: []const u8, port: u16) Error!void {
+        if (node_id == 0) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.map.contains(node_id)) return;
+        const h = self.allocator.dupe(u8, host) catch return Error.OutOfMemory;
+        errdefer self.allocator.free(h);
+        self.map.put(self.allocator, node_id, .{ .host = h, .port = port }) catch return Error.OutOfMemory;
+    }
+
+    /// Parse `host:port` and learn it (the wire form the CP carries).
+    pub fn learnAddr(self: *PeerRegistry, node_id: u64, addr: []const u8) Error!void {
+        const colon = std.mem.lastIndexOfScalar(u8, addr, ':') orelse return Error.BadConfig;
+        const port = std.fmt.parseInt(u16, addr[colon + 1 ..], 10) catch return Error.BadConfig;
+        return self.learn(node_id, addr[0..colon], port);
+    }
+
+    /// The `PeerResolver` view to hand the transport. `ctx` is `self`, whose
+    /// address is stable (heap-allocated).
+    pub fn resolver(self: *PeerRegistry) PeerResolver {
+        return .{ .ctx = self, .resolveFn = resolveImpl };
+    }
+
+    fn resolveImpl(ctx: ?*anyopaque, node_id: u64) ?PeerAddr {
+        const self: *PeerRegistry = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const e = self.map.get(node_id) orelse return null;
+        // host stays valid past the unlock (insert-only); the transport copies
+        // it synchronously in queueOut.
+        return .{ .host = e.host, .port = e.port };
+    }
+};
 
 pub const KvStore = kvstore.KvStore;
 pub const WriteSet = writeset.WriteSet;
@@ -287,6 +358,9 @@ pub const ApplyMode = enum {
 };
 
 pub const Error = error{
+    /// A malformed config value — e.g. a peer-registry `host:port` with no
+    /// colon or an unparseable port (`PeerRegistry.learnAddr`).
+    BadConfig,
     /// A committed entry named a group with no live tenant slot — an
     /// invariant violation (we only apply entries for groups we created).
     UnknownGroup,
@@ -564,6 +638,13 @@ pub const Node = struct {
             .manager = &self.mgr,
         }) catch return Error.Io;
         return self;
+    }
+
+    /// Install a runtime peer-address resolver on the transport (the CP-fed
+    /// `PeerRegistry`). No-op on a single-node node (no transport). MUST be
+    /// called before the pump starts (see `Transport.setResolver`).
+    pub fn setPeerResolver(self: *Node, r: PeerResolver) void {
+        if (self.transport) |t| t.setResolver(r);
     }
 
     /// True when this node is the sole voter (no transport, campaign at
@@ -1928,6 +2009,47 @@ fn mapRaftErr(e: anyerror) Error {
 
 const testing = std.testing;
 
+test "PeerRegistry: learn / resolve / insert-only / learnAddr parsing" {
+    const a = testing.allocator;
+    const reg = try PeerRegistry.create(a);
+    defer reg.destroy();
+
+    const r = reg.resolver();
+
+    // unknown id → null
+    try testing.expect(r.resolve(7) == null);
+
+    // learn + resolve
+    try reg.learn(2, "10.0.0.2", 9001);
+    {
+        const pa = r.resolve(2).?;
+        try testing.expectEqualStrings("10.0.0.2", pa.host);
+        try testing.expectEqual(@as(u16, 9001), pa.port);
+    }
+
+    // insert-only: a repeat for a known id is ignored (re-IP is out of scope)
+    try reg.learn(2, "10.9.9.9", 1);
+    {
+        const pa = r.resolve(2).?;
+        try testing.expectEqualStrings("10.0.0.2", pa.host);
+        try testing.expectEqual(@as(u16, 9001), pa.port);
+    }
+
+    // learnAddr parses host:port (the wire form the CP carries)
+    try reg.learnAddr(3, "192.168.1.5:7000");
+    {
+        const pa = r.resolve(3).?;
+        try testing.expectEqualStrings("192.168.1.5", pa.host);
+        try testing.expectEqual(@as(u16, 7000), pa.port);
+    }
+
+    // malformed addr → BadConfig; id 0 ignored
+    try testing.expectError(error.BadConfig, reg.learnAddr(4, "no-colon"));
+    try testing.expectError(error.BadConfig, reg.learnAddr(4, "h:notaport"));
+    try reg.learn(0, "x", 1); // no-op, no entry
+    try testing.expect(r.resolve(0) == null);
+}
+
 test "Phase 1 exit: propose a writeset, it commits + applies, a read sees it" {
     const a = testing.allocator;
 
@@ -2194,6 +2316,135 @@ test "Phase 5: 3-node cluster elects a leader + replicates a committed write" {
         defer a.free(v);
         try testing.expectEqualStrings("replicated", v);
     };
+}
+
+test "Phase 1c: the leader replicates over a peer it knows ONLY via the resolver" {
+    // The growth seam end to end: node 1 is born WITHOUT node 3 in its static
+    // peer list — its only path to node 3 is a PeerRegistry resolver (the CP-fed
+    // address map). If the write reaches node 3, the resolver carried real raft
+    // traffic, not just the static positional array. (Nodes 2 + 3 keep full
+    // static peers; only node 1 → node 3 exercises the resolver.)
+    const a = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(root);
+
+    const voters = [_]u64{ 1, 2, 3 };
+    const dirs = [_][]u8{
+        try std.fmt.allocPrint(a, "{s}/n1", .{root}),
+        try std.fmt.allocPrint(a, "{s}/n2", .{root}),
+        try std.fmt.allocPrint(a, "{s}/n3", .{root}),
+    };
+    defer for (dirs) |d| a.free(d);
+
+    var nodes: [3]*Node = undefined;
+    var alive = [_]bool{ false, false, false };
+    defer for (nodes, 0..) |n, i| if (alive[i]) n.deinit();
+
+    const pid: u32 = @intCast(std.os.linux.getpid());
+    var won_base: u16 = 0;
+    var attempt: u32 = 0;
+    while (attempt < 24) : (attempt += 1) {
+        const base: u16 = @intCast(20000 + ((pid +% (attempt +% 100) *% 619) % 4000) * 8);
+        var ok = true;
+        for (0..3) |i| {
+            var peers: [3]PeerAddr = undefined;
+            for (&peers, 0..) |*p, k| p.* = .{ .host = "127.0.0.1", .port = base + @as(u16, @intCast(k)) };
+            // Node 1 (i==0) is born blind to node 3: only {node1, node2}.
+            const peer_slice: []const PeerAddr = if (i == 0) peers[0..2] else peers[0..3];
+            const addr = std.net.Address.parseIp("127.0.0.1", base + @as(u16, @intCast(i))) catch {
+                ok = false;
+                break;
+            };
+            nodes[i] = Node.initMultiNode(a, dirs[i], @intCast(i + 1), &voters, addr, peer_slice) catch {
+                ok = false;
+                break;
+            };
+            alive[i] = true;
+        }
+        if (ok) {
+            won_base = base;
+            break;
+        }
+        for (0..3) |i| if (alive[i]) {
+            nodes[i].deinit();
+            alive[i] = false;
+        };
+    }
+    if (!(alive[0] and alive[1] and alive[2])) return error.SkipZigTest; // no free window
+
+    // Feed node 1 the resolver with node 3's address — the address it does NOT
+    // have statically. (Node 1 already knows node 2 statically.)
+    const registry = try PeerRegistry.create(a);
+    defer registry.destroy();
+    try registry.learn(3, "127.0.0.1", won_base + 2);
+    nodes[0].setPeerResolver(registry.resolver());
+
+    const tenant: u64 = 100;
+    const id = "tenant-100";
+    for (nodes) |n| _ = try n.ensureGroup(tenant, id);
+
+    // Node 1 MUST be the leader (so leader → node 3 rides the resolver, not a
+    // peer's static config). The election timeout is ~election_tick (10) × 1ms
+    // tick, and a log-disadvantaged node can't win a re-election after another
+    // leads (raft safety rejects its stale-log vote) — so node 1 has to win
+    // term 1. Pump until node 1's outbound link to node 2 is up (so its vote
+    // request can actually land), then campaign once, immediately — before any
+    // peer's election timer fires. On loopback all links come up together, so
+    // node 1 leads cleanly.
+    var linked = false;
+    var w: u32 = 0;
+    while (w < 400 and !linked) : (w += 1) {
+        for (nodes) |n| _ = try n.pump();
+        linked = nodes[0].transport.?.net.isPeerConnected(1); // node 2
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(linked);
+    try nodes[0].campaign(tenant);
+    var leader_ok = false;
+    var s: u32 = 0;
+    while (s < 600 and !leader_ok) : (s += 1) {
+        for (nodes) |n| _ = try n.pump();
+        leader_ok = nodes[0].isLeader(tenant);
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    if (!leader_ok) std.debug.print("\n[1c-dbg] leader_ok=false n1={} n2={} n3={} p2cfg={} p3cfg={}\n", .{ nodes[0].isLeader(tenant), nodes[1].isLeader(tenant), nodes[2].isLeader(tenant), nodes[0].transport.?.net.isPeerConfigured(1), nodes[0].transport.?.net.isPeerConfigured(2) });
+    try testing.expect(leader_ok);
+
+    var ws = WriteSet.init(a);
+    defer ws.deinit();
+    try ws.addPut("k", "via-resolver");
+    const ws_bytes = try ws.encode(a);
+    defer a.free(ws_bytes);
+    const env = try envelope.encodeWriteSet(a, id, ws_bytes);
+    defer a.free(env);
+    try nodes[0].propose(tenant, env);
+
+    // The proof: node 3 — reachable from the leader ONLY through the resolver —
+    // applies the write.
+    var on_n3 = false;
+    var spins2: u32 = 0;
+    while (spins2 < 4000 and !on_n3) : (spins2 += 1) {
+        for (nodes) |n| _ = try n.pump();
+        if (nodes[2].get(tenant, "k")) |v| {
+            a.free(v);
+            on_n3 = true;
+        } else |_| {}
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    if (!on_n3) std.debug.print("\n[1c-dbg] on_n3=false n1leader={} n2leader={} p3cfg={}\n", .{ nodes[0].isLeader(tenant), nodes[1].isLeader(tenant), nodes[0].transport.?.net.isPeerConfigured(2) });
+    try testing.expect(on_n3);
+    const v3 = try nodes[2].get(tenant, "k");
+    defer a.free(v3);
+    try testing.expectEqualStrings("via-resolver", v3);
+
+    // Node 1 stayed the leader throughout — so the value reached node 3 over
+    // node 1's resolver-dialed link, not because node 2 (full static peers) took
+    // over and replicated it. Plus node 1's resolver slot for node 3 is live.
+    try testing.expect(nodes[0].isLeader(tenant));
+    try testing.expect(nodes[0].transport.?.net.isPeerConfigured(2)); // node 3, learned via resolver
 }
 
 test "two tenants get independent stores on the same node" {

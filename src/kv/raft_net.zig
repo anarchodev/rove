@@ -404,6 +404,14 @@ pub const RaftNet = struct {
         return self.peers[peer_id].configured;
     }
 
+    /// True if the OUTBOUND connection to `peer_id` is established (raft can
+    /// send to it). Observability for tests/operators — a peer can be
+    /// configured (in the table) yet still dialing.
+    pub fn isPeerConnected(self: *const RaftNet, peer_id: u32) bool {
+        if (peer_id >= self.peers.len) return false;
+        return self.peers[peer_id].state == .connected;
+    }
+
     /// Drive one tick. `now_ns` is a monotonic timestamp used for reconnect
     /// timing. If `wait` is true, blocks until at least one CQE arrives.
     /// Drive the io_uring ring forward and (optionally) block on it.
