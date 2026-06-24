@@ -79,18 +79,26 @@ pub const IndexDb = struct {
 
     pub fn open(allocator: std.mem.Allocator, path: [:0]const u8) Error!*IndexDb {
         var db: ?*c.sqlite3 = null;
+        // FULLMUTEX (serialized mode): this ONE connection handle is
+        // shared by two threads — the indexer thread writes (pollOnce →
+        // insert*) and the h2 server thread reads (/list, /show, /count)
+        // — so SQLite must serialize every core call on it. NOMUTEX here
+        // was a latent bug: concurrent /show queries during active
+        // indexing corrupted SQLite's per-connection state and crashed
+        // the process (#GP, surfaced at teardown). Statements are
+        // prepared+finalized per call (never shared across threads), so
+        // connection-level serialization is sufficient and complete.
         const rc = c.sqlite3_open_v2(
             path.ptr,
             &db,
-            c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_NOMUTEX,
+            c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_FULLMUTEX,
             null,
         );
         if (rc != c.SQLITE_OK or db == null) return Error.Sqlite;
         errdefer _ = c.sqlite3_close_v2(db);
 
-        // WAL + sane defaults: many readers (HTTP API), one writer
-        // (indexer). 5s busy timeout shields against the rare cross-
-        // connection contention spike (e.g. checkpoint during a query).
+        // WAL + sane defaults. 5s busy timeout shields against the rare
+        // contention spike (e.g. a checkpoint landing during a query).
         if (c.sqlite3_exec(db, "PRAGMA journal_mode=WAL;", null, null, null) != c.SQLITE_OK)
             return Error.JournalMode;
         _ = c.sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", null, null, null);
