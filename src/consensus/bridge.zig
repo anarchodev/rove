@@ -440,6 +440,26 @@ pub const Bridge = struct {
         return Bridge.init(allocator, node);
     }
 
+    /// Stand up a GENESIS bridge (cluster-genesis-and-membership §3.4): a node
+    /// configured with only its own id + raft `listen_addr`, no static voters or
+    /// peers. It has a transport (so it can grow) with a `PeerRegistry` already
+    /// enabled as its resolver — empty at boot; peers are learned from the CP via
+    /// attach / conf-change. Groups are born `{self}` and grown by conf-change.
+    /// Like the other inits it does NOT start the pump — call `startPump`.
+    pub fn initGenesis(
+        allocator: std.mem.Allocator,
+        data_dir: []const u8,
+        node_id: u64,
+        listen_addr: std.net.Address,
+    ) Error!*Bridge {
+        const node = try Node.initGenesis(allocator, data_dir, node_id, listen_addr);
+        errdefer node.deinit();
+        const self = try Bridge.init(allocator, node);
+        errdefer self.deinit();
+        try self.enablePeerRegistry();
+        return self;
+    }
+
     pub fn init(allocator: std.mem.Allocator, node: *Node) Error!*Bridge {
         const self = allocator.create(Bridge) catch return Error.OutOfMemory;
         // origin 0 is the reserved "hookless" identity (bare proposes);

@@ -640,6 +640,32 @@ pub const Node = struct {
         return self;
     }
 
+    /// Stand up a GENESIS node (cluster-genesis-and-membership §3.4): configured
+    /// with only its own identity — `node_id` + its raft `listen_addr` — and NO
+    /// static voter set or peer list. It HAS a transport (so it can grow), but
+    /// births its groups as `{self}` and learns peer addresses at runtime via the
+    /// resolver (the caller installs a `PeerRegistry` — see `Bridge.initGenesis`).
+    /// `self.voters = {node_id}` is the born-`{self}` fallback for groups created
+    /// without an explicit membership override; `isSingleNode` is still false
+    /// (a transport is present), so leadership tracks the real atomics once a
+    /// group grows.
+    pub fn initGenesis(
+        allocator: std.mem.Allocator,
+        data_dir: []const u8,
+        node_id: u64,
+        listen_addr: std.net.Address,
+    ) Error!*Node {
+        const self = try Node.init(allocator, data_dir, node_id, &[_]u64{node_id});
+        errdefer self.deinit();
+        self.transport = Transport.init(allocator, .{
+            .node_id = node_id,
+            .listen_addr = listen_addr,
+            .peers = &.{}, // self-only; peers learned via the resolver
+            .manager = &self.mgr,
+        }) catch return Error.Io;
+        return self;
+    }
+
     /// Install a runtime peer-address resolver on the transport (the CP-fed
     /// `PeerRegistry`). No-op on a single-node node (no transport). MUST be
     /// called before the pump starts (see `Transport.setResolver`).
@@ -647,12 +673,19 @@ pub const Node = struct {
         if (self.transport) |t| t.setResolver(r);
     }
 
-    /// True when this node is the sole voter (no transport, campaign at
-    /// group birth). Multi-node nodes elect via ticks. Public so the bridge
-    /// can answer `isLeaderOf` true for every group on a single-node node
-    /// (the sole voter leads every group it ever creates).
+    /// True when this node has NO cross-node transport — it can never have a
+    /// peer, so it leads every group it creates and there is nothing to elect or
+    /// transfer. The bridge uses this to answer `isLeaderOf` true unconditionally
+    /// and to skip the not-leader propose gate / leadership transfers.
+    ///
+    /// Defined on transport presence, NOT `voters.len`, because a GENESIS node
+    /// (cluster-genesis-and-membership §3.4) has a transport but births its
+    /// groups as a single voter `{self}` and grows them later — it must use the
+    /// real leadership atomics so it's correctly seen as a FOLLOWER once a group
+    /// it created moves leadership elsewhere. (Per-group "born sole self" auto-
+    /// campaign is a separate, group-local decision in `createGroupCore`.)
     pub fn isSingleNode(self: *const Node) bool {
-        return self.voters.len == 1;
+        return self.transport == null;
     }
 
     pub fn init(
@@ -2553,6 +2586,112 @@ test "Phase 2: a group born {self} on a multi-node node auto-leads, then grows +
     defer a.free(v2);
     try testing.expectEqualStrings("grown", v2);
     // Node 1 stayed leader; node 2 caught up as a follower/learner.
+    try testing.expect(nodes[0].isLeader(tenant));
+}
+
+test "Phase 2: two genesis nodes (self-only, registry-only addressing) form + grow a group" {
+    // The full genesis binary capability: BOTH nodes boot via `initGenesis` —
+    // configured with only their own id + raft addr, NO static peer list — and
+    // learn each other's address ONLY through the registry (as the CP would
+    // teach them via attach / conf-change). Node 1 births the group {self},
+    // auto-leads, and grows node 2 in. Exercises the raft_net self-only init
+    // (self slot beyond the empty static `peers`) end to end.
+    const a = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(root);
+
+    const dirs = [_][]u8{
+        try std.fmt.allocPrint(a, "{s}/n1", .{root}),
+        try std.fmt.allocPrint(a, "{s}/n2", .{root}),
+    };
+    defer for (dirs) |d| a.free(d);
+
+    // Registries outlive the nodes' transports (declared first → freed last).
+    const regs = [_]*PeerRegistry{ try PeerRegistry.create(a), try PeerRegistry.create(a) };
+    defer for (regs) |r| r.destroy();
+
+    var nodes: [2]*Node = undefined;
+    var alive = [_]bool{ false, false };
+    defer for (nodes, 0..) |n, i| if (alive[i]) n.deinit();
+
+    const pid: u32 = @intCast(std.os.linux.getpid());
+    var ports: [2]u16 = undefined;
+    var attempt: u32 = 0;
+    while (attempt < 24) : (attempt += 1) {
+        const base: u16 = @intCast(20000 + ((pid +% (attempt +% 300) *% 619) % 4000) * 8);
+        var ok = true;
+        for (0..2) |i| {
+            ports[i] = base + @as(u16, @intCast(i));
+            const addr = std.net.Address.parseIp("127.0.0.1", ports[i]) catch {
+                ok = false;
+                break;
+            };
+            // Genesis: each node knows ONLY its own identity + addr.
+            nodes[i] = Node.initGenesis(a, dirs[i], @intCast(i + 1), addr) catch {
+                ok = false;
+                break;
+            };
+            alive[i] = true;
+        }
+        if (ok) break;
+        for (0..2) |i| if (alive[i]) {
+            nodes[i].deinit();
+            alive[i] = false;
+        };
+    }
+    if (!(alive[0] and alive[1])) return error.SkipZigTest;
+
+    // Wire each node's registry resolver, then teach addresses the way the CP
+    // would: the leader learns the joiner (conf-change carry), the joiner learns
+    // the leader (attach carry). Neither has any static peer.
+    for (0..2) |i| nodes[i].setPeerResolver(regs[i].resolver());
+    try regs[0].learn(2, "127.0.0.1", ports[1]); // node 1 learns node 2
+    try regs[1].learn(1, "127.0.0.1", ports[0]); // node 2 learns node 1
+
+    const tenant: u64 = 100;
+    const id = "tenant-100";
+    const epoch: u64 = 1;
+
+    // Node 1 births the group {self} (a fresh creation — recover=false — as
+    // provision does) and auto-leads: no static voter set, no campaign call.
+    _ = try nodes[0].createGroupAtEpoch(tenant, id, epoch, false, &[_]u64{1});
+    try testing.expect(nodes[0].isLeader(tenant));
+
+    // Node 2 joins as a learner of the {1}-led group.
+    _ = try nodes[1].createGroupAtEpoch(tenant, id, epoch, true, &[_]u64{1});
+    try testing.expect(!nodes[1].isLeader(tenant));
+
+    // Grow FIRST: until node 2 is a member, the leader's raft has no reason to
+    // send to it, so (with no static peer) it would never dial. The add_learner
+    // makes raft address node 2 → the leader dials it via the registry.
+    try nodes[0].proposeConfChange(tenant, 2, .add_learner);
+
+    var ws = WriteSet.init(a);
+    defer ws.deinit();
+    try ws.addPut("k", "genesis-grown");
+    const ws_bytes = try ws.encode(a);
+    defer a.free(ws_bytes);
+    const env = try envelope.encodeWriteSet(a, id, ws_bytes);
+    defer a.free(env);
+    try nodes[0].propose(tenant, env);
+
+    var on_n2 = false;
+    var spins: u32 = 0;
+    while (spins < 4000 and !on_n2) : (spins += 1) {
+        for (nodes) |n| _ = try n.pump();
+        if (nodes[1].get(tenant, "k")) |v| {
+            a.free(v);
+            on_n2 = true;
+        } else |_| {}
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(on_n2);
+    const v2 = try nodes[1].get(tenant, "k");
+    defer a.free(v2);
+    try testing.expectEqualStrings("genesis-grown", v2);
     try testing.expect(nodes[0].isLeader(tenant));
 }
 

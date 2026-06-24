@@ -286,6 +286,22 @@ The point of the whole exercise: **tests bring clusters up the real way.**
    node = self-only. Hard cut (pre-launch).
 4. **Harness + genesis smoke** (§4) — reshape `V2Cluster`; add
    `genesis_smoke_v2.py` as the CI gate; de-`campaign()` the unit tests.
+   - **Genesis binary mode — DONE (worker).** `isSingleNode()` redefined to
+     `transport == null` (was `voters.len == 1`) so a genesis node — which has a
+     transport but `voters = {self}` — tracks the real leadership atomics and is
+     correctly demoted to follower once a group it created grows (all 7 call
+     sites are "no peers / always leader / nothing to transfer", which is exactly
+     "no transport"). `raft_net` init sets up the self slot from `node_id` even
+     when the static `peers` list is empty/short (self-only boot). New
+     `Node.initGenesis` / `Bridge.initGenesis` (own id + raft addr, no
+     voters/peers, transport + empty `PeerRegistry` resolver). Worker boots
+     genesis when `REWIND_NODE_ID` + `REWIND_RAFT_ADDR` are set and
+     `REWIND_VOTERS`/`REWIND_PEERS` are absent (`parseGenesis`). Verified: the
+     worker boots genesis (`genesis node id=1 …` → `listening on …`); a unit test
+     stands up TWO genesis nodes (self-only, registry-only addressing, no static
+     peers) that form a born-`{self}` group and grow it by conf-change +
+     replicate (deterministic 6/6). CP genesis mode (single-node CP already
+     births its directory `{self}` via `isSingleNode`) + the smoke script remain.
 5. **genesis.sh + deploy split + docs** (§5).
 6. **Bring prod back** on the new path — genesis node 1, grow to 3. This is
    the first real exercise of the codified path (and validates it end to end).

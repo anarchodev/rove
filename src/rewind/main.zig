@@ -505,6 +505,43 @@ fn parseMultiNode(a: std.mem.Allocator) !?MultiNode {
     };
 }
 
+/// Genesis first-boot config (cluster-genesis-and-membership §3.4): this node's
+/// own raft id + its raft listen `host:port`, and NOTHING else — no voter set,
+/// no peer list. The node boots self-only (a transport with a `PeerRegistry`,
+/// groups born `{self}`) and is grown into the cluster by the CP via conf-change.
+///   - `REWIND_NODE_ID`    this node's 1-based raft id.
+///   - `REWIND_RAFT_ADDR`  this node's raft transport `host:port` (an IP literal;
+///                         DISTINCT from the HTTP listen port, argv[2]).
+/// Returns null (→ fall through to the static multi-node / single-node paths)
+/// when either is unset, OR when a static `REWIND_VOTERS`/`REWIND_PEERS` is also
+/// present (that's the legacy multi-node path, kept until Phase 3 deletes it).
+const Genesis = struct {
+    node_id: u64,
+    listen_addr: std.net.Address,
+    listen_str: []u8,
+    fn deinit(self: *const Genesis, a: std.mem.Allocator) void {
+        a.free(self.listen_str);
+    }
+};
+
+fn parseGenesis(a: std.mem.Allocator) !?Genesis {
+    const node_id_s = std.posix.getenv("REWIND_NODE_ID") orelse return null;
+    const raft_addr_s = std.posix.getenv("REWIND_RAFT_ADDR") orelse return null;
+    if (std.posix.getenv("REWIND_VOTERS") != null or std.posix.getenv("REWIND_PEERS") != null)
+        return null;
+    const node_id = try std.fmt.parseInt(u64, std.mem.trim(u8, node_id_s, " \t"), 10);
+    if (node_id == 0) return error.BadNodeId;
+    const t = std.mem.trim(u8, raft_addr_s, " \t");
+    const colon = std.mem.lastIndexOfScalar(u8, t, ':') orelse return error.BadRaftAddr;
+    const port = try std.fmt.parseInt(u16, t[colon + 1 ..], 10);
+    const listen_addr = try std.net.Address.parseIp(t[0..colon], port);
+    return Genesis{
+        .node_id = node_id,
+        .listen_addr = listen_addr,
+        .listen_str = try a.dupe(u8, t),
+    };
+}
+
 /// Parse a `;`/`,`-separated list of origins into an owned, owned-element
 /// slice (a single URL → a one-element list; empty input → empty slice).
 fn parseUrlList(a: std.mem.Allocator, config: []const u8) ![]const []const u8 {
@@ -678,7 +715,13 @@ pub fn main() !void {
     // multi-node (Phase 5 HA) node is configured by env — this node's
     // 1-based raft id, the voter set, and the per-node raft transport
     // addresses (distinct from the HTTP port). See `parseMultiNode`.
-    const bridge = if (try parseMultiNode(allocator)) |mn| blk: {
+    const bridge = if (try parseGenesis(allocator)) |g| blk: {
+        defer g.deinit(allocator);
+        std.log.info("rewind: genesis node id={d} raft_addr={s}", .{ g.node_id, g.listen_str });
+        // Self-only boot: a transport with an (empty) PeerRegistry already its
+        // resolver; groups born {self}, grown by the CP via conf-change.
+        break :blk try Bridge.initGenesis(allocator, data_dir, g.node_id, g.listen_addr);
+    } else if (try parseMultiNode(allocator)) |mn| blk: {
         defer mn.deinit(allocator);
         std.log.info("rewind: multi-node id={d} voters={d} listen={s}", .{ mn.node_id, mn.voters.len, mn.listen_str });
         const b = try Bridge.initMultiNode(allocator, data_dir, mn.node_id, mn.voters, mn.listen_addr, mn.peers);

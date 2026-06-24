@@ -218,7 +218,11 @@ pub const RaftNet = struct {
     ) !*RaftNet {
         if (cfg.peers.len > std.math.maxInt(u16)) return Error.PeerCountTooLarge;
         if (cfg.peers.len > cfg.max_nodes) return Error.PeerCountTooLarge;
-        if (cfg.node_id >= cfg.peers.len) return Error.InvalidPeerId;
+        // Self must fit the peer table, but need NOT be within the static `peers`
+        // list: a genesis node boots with only its own identity (empty/short
+        // `peers`) and learns its peers later via the resolver. The self slot is
+        // set up explicitly below.
+        if (cfg.node_id >= cfg.max_nodes) return Error.InvalidPeerId;
 
         const self = try allocator.create(RaftNet);
         errdefer allocator.destroy(self);
@@ -269,6 +273,13 @@ pub const RaftNet = struct {
             peers[peer_id].state = .disconnected;
             peers[peer_id].addr = addr;
             peers[peer_id].recv_buf = buf;
+        }
+        // Ensure the self slot is configured even when `peers` didn't contain it
+        // (the genesis / self-only case — `peers` empty or shorter than node_id).
+        // Self is never dialed, so it needs no addr or recv buffer.
+        if (!peers[cfg.node_id].configured) {
+            peers[cfg.node_id].configured = true;
+            peers[cfg.node_id].state = .self_slot;
         }
 
         const listen_fd = try makeListenSocket(cfg.listen_addr);
