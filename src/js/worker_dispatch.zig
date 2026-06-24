@@ -2946,6 +2946,12 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         if (stream_static == null and !worker.raft.isSingleNode()) {
             const lead_gid = worker.raft.gidForTenant(scope_inst.id) orelse 0;
             if (lead_gid == 0 or !worker.raft.isLeaderOf(lead_gid)) {
+                // Nudge the group awake: if it has hibernated and its leader is
+                // gone, this rejected write would otherwise never wake it to
+                // re-elect (a group wakes only on a real propose / step, never
+                // a gate-rejected one). Harmless when a leader exists — the
+                // woken group re-hibernates without campaigning (pre_vote).
+                if (lead_gid != 0) worker.raft.requestWake(lead_gid);
                 try respb.setSimpleResponse(server, ent, sid, sess, 421, "not leader for this tenant; retry against the cluster leader\n", allocator);
                 processed += 1;
                 continue;

@@ -358,6 +358,16 @@ pub const Bridge = struct {
     /// create-at-epoch / destroy). Pointers to caller-stack `ControlCmd`s;
     /// guarded by `mutex`. Drained + executed in `pumpOnce`.
     control_inbox: std.ArrayListUnmanaged(*ControlCmd) = .empty,
+    /// Gids the worker thread asked the pump to re-tick (`bumpActive`) — set
+    /// by `requestWake` at the write leader-gates when this node is NOT the
+    /// leader. Without this, a hibernated tenant group whose leader died never
+    /// re-elects: every write is rejected at the leader-gate BEFORE any propose,
+    /// and only a propose / non-heartbeat step wakes a group (heartbeats don't),
+    /// so the frozen follower election timer never resumes. Draining this wakes
+    /// the group → its election timer runs → it campaigns (pre_vote-gated, so a
+    /// wake while a leader still exists just re-hibernates without disruption).
+    /// Guarded by `mutex`; deduped (a gid appears at most once per cycle).
+    wake_inbox: std.ArrayListUnmanaged(u64) = .empty,
     /// Worker-thread commit-wait timeouts awaiting pump-side execution
     /// (`requestFault` → `drainFaultRequests`) — the fault must be
     /// serialized with the pump's skip/commit decisions. Guarded by
@@ -499,6 +509,7 @@ pub const Bridge = struct {
         // released every queued waiter (err = ShuttingDown + done.set),
         // so the list is empty — this just frees its capacity.
         self.control_inbox.deinit(a);
+        self.wake_inbox.deinit(a);
         a.destroy(self);
     }
 
@@ -619,6 +630,29 @@ pub const Bridge = struct {
         };
         sig.next_seq = seq;
         return seq;
+    }
+
+    /// Worker thread → pump: ask the pump to re-tick (`bumpActive`) `gid`'s
+    /// group next cycle. Called from the write leader-gates when this node is
+    /// NOT the leader. If the group has hibernated and its leader is gone,
+    /// nothing else would wake it to re-elect — a rejected write never reaches
+    /// the propose that bumps, and heartbeats don't count as activity — so the
+    /// tenant stays write-unavailable indefinitely. Waking restarts the frozen
+    /// follower election timer; the resulting pre_vote/vote traffic is a
+    /// non-heartbeat step that wakes the surviving peers too, so a single nudge
+    /// cascades into a full election. Idempotent + cheap: a no-op when the gid
+    /// is already queued this cycle, and harmless if a leader actually exists
+    /// (the woken group hears the leader's heartbeats and re-hibernates without
+    /// campaigning — pre_vote gates the spurious election). Safe from any
+    /// thread (takes `mutex`).
+    pub fn requestWake(self: *Bridge, gid: u64) void {
+        if (self.stop.load(.acquire)) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.wake_inbox.items) |g| if (g == gid) return; // dedup (small list, drained each cycle)
+        // Best-effort: a dropped wake (OOM) just re-arms on the next rejected
+        // write — the front retries the leaderless group until it elects.
+        self.wake_inbox.append(self.allocator, gid) catch {};
     }
 
     /// Convenience over `propose`: build a type-0 writeset envelope putting
@@ -1200,6 +1234,28 @@ pub const Bridge = struct {
                 std.log.warn("v2 bridge propose gid={d}: {s}", .{ item.gid, @errorName(e) });
                 self.faultTenant(item.gid);
             };
+        }
+
+        // 2b. Service wake requests: re-tick (`bumpActive`) any group the
+        //     worker asked us to wake (a write hit a non-leader gate). Without
+        //     this a hibernated group whose leader died never re-elects. Drain
+        //     under the lock, bump OUTSIDE it (bumpActive mutates pump-owned
+        //     node state and must not run with the bridge mutex held). Done
+        //     before `node.pump()` so a woken group ticks THIS cycle.
+        {
+            var wakes: std.ArrayListUnmanaged(u64) = .empty;
+            defer wakes.deinit(self.allocator);
+            {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                if (self.wake_inbox.items.len > 0) {
+                    wakes.appendSlice(self.allocator, self.wake_inbox.items) catch {};
+                    self.wake_inbox.clearRetainingCapacity();
+                }
+            }
+            if (wakes.items.len > 0) did_work = true;
+            for (wakes.items) |gid| self.node.bumpActive(gid) catch |e|
+                std.log.warn("v2 bridge wake gid={d}: {s}", .{ gid, @errorName(e) });
         }
 
         // 3. Drive one ready cycle: commits + applies + fires the commit
@@ -1966,6 +2022,153 @@ test "Phase 5c: 3-bridge cluster replicates via the leader; a follower propose i
     }
     try testing.expectEqual(f_committed, bridges[follower].committedSeq(gid));
     try testing.expectEqual(f_faulted, bridges[follower].faultedSeq(gid));
+}
+
+test "bridge: a hibernated group whose leader died re-elects on a requestWake nudge" {
+    // Regression for the leg-F failover flake (a real availability bug): a
+    // tenant group that has HIBERNATED (idle past `hibernate_ns`) and whose
+    // leader then dies never re-elects on its own — every write is rejected at
+    // the leader-gate BEFORE any propose, and only a propose / non-heartbeat
+    // step wakes a group, so the frozen follower election timers stay frozen.
+    // `requestWake` (called from those gates) re-ticks the group; the campaign
+    // it triggers cascades to the surviving peer (a vote is a non-heartbeat
+    // step → wakes it), and the survivors elect a new leader.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(root);
+
+    const voters = [_]u64{ 1, 2, 3 };
+    const dirs = [_][]u8{
+        try std.fmt.allocPrint(a, "{s}/w1", .{root}),
+        try std.fmt.allocPrint(a, "{s}/w2", .{root}),
+        try std.fmt.allocPrint(a, "{s}/w3", .{root}),
+    };
+    defer for (dirs) |d| a.free(d);
+
+    var bridges: [3]*Bridge = undefined;
+    var alive = [_]bool{ false, false, false };
+    defer for (bridges, 0..) |b, i| if (alive[i]) b.deinit();
+
+    const pid: u32 = @intCast(std.os.linux.getpid());
+    var attempt: u32 = 0;
+    while (attempt < 24) : (attempt += 1) {
+        const bp: u16 = @intCast(31000 + ((pid +% attempt *% 619) % 3000) * 8);
+        var ok = true;
+        for (0..3) |i| {
+            var peers: [3]node_mod.PeerAddr = undefined;
+            for (&peers, 0..) |*p, k| p.* = .{ .host = "127.0.0.1", .port = bp + @as(u16, @intCast(k)) };
+            const addr = std.net.Address.parseIp("127.0.0.1", bp + @as(u16, @intCast(i))) catch {
+                ok = false;
+                break;
+            };
+            bridges[i] = Bridge.initMultiNode(a, dirs[i], @intCast(i + 1), &voters, addr, &peers) catch {
+                ok = false;
+                break;
+            };
+            // Short hibernate window: long enough to elect, short enough to
+            // idle past within the test.
+            bridges[i].node.hibernate_ns = 150 * std.time.ns_per_ms;
+            alive[i] = true;
+        }
+        if (ok) break;
+        for (0..3) |i| if (alive[i]) {
+            bridges[i].deinit();
+            alive[i] = false;
+        };
+    }
+    if (!(alive[0] and alive[1] and alive[2])) return error.SkipZigTest;
+
+    const gid = try bridges[0].registerTenant("t");
+    _ = try bridges[1].registerTenant("t");
+    _ = try bridges[2].registerTenant("t");
+    for (bridges) |b| _ = try b.node.ensureGroup(gid, "t");
+
+    // Warm the mesh and elect node 0.
+    var warm: u32 = 0;
+    while (warm < 80) : (warm += 1) {
+        for (bridges) |b| _ = try b.pumpOnce();
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try bridges[0].node.campaign(gid);
+
+    var leader: ?usize = null;
+    var spins: u32 = 0;
+    while (spins < 2000 and leader == null) : (spins += 1) {
+        for (bridges) |b| _ = try b.pumpOnce();
+        for (bridges, 0..) |b, i| if (b.node.isLeader(gid)) {
+            leader = i;
+        };
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(leader != null);
+    const ld = leader.?;
+
+    // Recent real activity, then idle the cluster well past the hibernate
+    // window so every node drops the group from its active (ticked) set.
+    {
+        var ws = WriteSet.init(a);
+        defer ws.deinit();
+        try ws.addPut("k", "v");
+        const env = try encodeWs(a, "t", &ws);
+        defer a.free(env);
+        _ = try bridges[ld].propose(gid, env);
+        var done = false;
+        var s: u32 = 0;
+        while (s < 2000 and !done) : (s += 1) {
+            for (bridges) |b| _ = try b.pumpOnce();
+            done = true;
+            for (bridges) |b| {
+                const v = b.node.get(gid, "k") catch {
+                    done = false;
+                    break;
+                };
+                a.free(v);
+            }
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+        try testing.expect(done);
+    }
+    var idle: u32 = 0;
+    while (idle < 400) : (idle += 1) {
+        for (bridges) |b| _ = try b.pumpOnce();
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    // The group hibernated everywhere — without this the rest of the test is
+    // vacuous (an active group would re-elect on its own, no wake needed).
+    for (bridges) |b| try testing.expectEqual(@as(usize, 0), b.node.active.items.len);
+
+    // Leader dies: stop pumping it. From here only the two survivors run.
+    const s0 = (ld + 1) % 3;
+    const s1 = (ld + 2) % 3;
+
+    // Negative control: with the group frozen and no wake, the survivors never
+    // campaign on their own — pump them well past several election timeouts and
+    // assert neither becomes leader. (This is the bug: writes 421 forever.)
+    var quiet: u32 = 0;
+    while (quiet < 250) : (quiet += 1) {
+        _ = try bridges[s0].pumpOnce();
+        _ = try bridges[s1].pumpOnce();
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(!bridges[s0].node.isLeader(gid));
+    try testing.expect(!bridges[s1].node.isLeader(gid));
+
+    // The fix: a write at the leader-gate nudges ONE survivor awake. Its
+    // campaign cascades (the vote request wakes the other survivor), and they
+    // elect a new leader among the two-of-three quorum.
+    bridges[s0].requestWake(gid);
+    var reelected: ?usize = null;
+    var rs: u32 = 0;
+    while (rs < 2000 and reelected == null) : (rs += 1) {
+        _ = try bridges[s0].pumpOnce();
+        _ = try bridges[s1].pumpOnce();
+        if (bridges[s0].node.isLeader(gid)) reelected = s0;
+        if (bridges[s1].node.isLeader(gid)) reelected = s1;
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(reelected != null);
 }
 
 test "bridge: identity binding — foreign + faulted entries write the store and never credit a waiter" {

@@ -277,7 +277,12 @@ fn commitWrite(worker: anytype, allocator: std.mem.Allocator, tenant: []const u8
     // `isLeaderOf` resolvable on a single node (the sole voter leads every
     // group).
     const gid = worker.raft.registerTenant(tenant) catch return 500;
-    if (!worker.raft.isLeaderOf(gid)) return 421;
+    if (!worker.raft.isLeaderOf(gid)) {
+        // Wake a hibernated leaderless group toward re-election — a gate-
+        // rejected write never reaches the propose that would bump it awake.
+        worker.raft.requestWake(gid);
+        return 421;
+    }
 
     const inst = ensureInstance(worker, tenant) catch return 500;
 
@@ -330,7 +335,12 @@ fn commitRootDomain(worker: anytype, allocator: std.mem.Allocator, host: []const
     // take the immediate-commit + propose; a follower would speculatively
     // commit then fault the propose with no undo. 421 → the CP re-aims.
     const gid = worker.raft.registerTenant(tenant_mod.ADMIN_INSTANCE_ID) catch return 500;
-    if (!worker.raft.isLeaderOf(gid)) return 421;
+    if (!worker.raft.isLeaderOf(gid)) {
+        // Wake a hibernated leaderless group toward re-election — a gate-
+        // rejected write never reaches the propose that would bump it awake.
+        worker.raft.requestWake(gid);
+        return 421;
+    }
 
     const key = std.fmt.allocPrint(allocator, "domain/{s}", .{host}) catch return 500;
     defer allocator.free(key);
