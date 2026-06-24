@@ -238,6 +238,15 @@ fn handleKv(
 
     // Commit through the real leader-gated propose path.
     const rc = commitWrite(worker, allocator, tenant, key, value);
+    if (rc == 421) {
+        // Not the leader — stamp the believed leader's raft id so the front
+        // redirects a non-replayable write straight there (else it bounces
+        // 421→503 once its leader hint goes stale). Same header the customer
+        // dispatch gate emits.
+        const gid = worker.raft.gidForTenant(tenant) orelse 0;
+        const leader_id = if (gid != 0) worker.raft.leaderOf(gid) else 0;
+        return respb.setNotLeaderResponse(server, ent, sid, sess, allocator, "not leader for this tenant; retry against the cluster leader\n", leader_id);
+    }
     if (rc != 0) return reply(server, allocator, ent, sid, sess, rc, "write failed\n");
 
     // Zero-downtime overlap (Phase 7 slice b): if a move is forwarding this

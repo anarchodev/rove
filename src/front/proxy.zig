@@ -119,6 +119,34 @@ pub fn headerValue(rh: h2.ReqHeaders, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Same lookup over a RESPONSE header set (worker → front). Used to read the
+/// `x-rewind-leader` redirect hint off a 421.
+pub fn respHeaderValue(rh: h2.RespHeaders, name: []const u8) ?[]const u8 {
+    const fields = rh.fields orelse return null;
+    var i: u32 = 0;
+    while (i < rh.count) : (i += 1) {
+        const f = fields[i];
+        if (std.ascii.eqlIgnoreCase(f.name[0..f.name_len], name)) {
+            return f.value[0..f.value_len];
+        }
+    }
+    return null;
+}
+
+/// Map the worker's `x-rewind-leader` raft id to a serving origin in `nodes`.
+/// The cluster node list is ordered by raft node id (the `REWIND_CLUSTERS` /
+/// voter-set contract: `nodes[i]` is raft node `i+1`, the same ordering the
+/// move/attach fan-out relies on), so leader id `L` → `nodes[L-1]`. Returns
+/// null for a missing/unparseable header or an id outside `1..nodes.len`
+/// (then the caller forgets its stale hint and re-scans, rather than trusting
+/// a bad map).
+fn leaderOriginHint(rh: h2.RespHeaders, nodes: []const []const u8) ?[]const u8 {
+    const v = respHeaderValue(rh, "x-rewind-leader") orelse return null;
+    const id = std.fmt.parseInt(u64, v, 10) catch return null;
+    if (id == 0 or id > nodes.len) return null;
+    return nodes[id - 1];
+}
+
 /// Strip a `:port` suffix from an `:authority` / Host value, matching
 /// the worker's `hostOnly`. Leaves bare hostnames untouched.
 pub fn hostOnly(authority: []const u8) []const u8 {
@@ -1290,10 +1318,28 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// replayable; otherwise (or when nodes are exhausted —
         /// mid-election) surface a plain retryable 503 rather than the
         /// internal re-aim status.
-        fn handle421(self: *Self, flow: *Flow) void {
+        fn handle421(self: *Self, flow: *Flow, rh: h2.RespHeaders) void {
             // Remember we were redirected: a later 2xx in this flow is
             // then provably from the leader (see `noteLeader`).
             flow.saw_421 = true;
+            // Learn the leader from the worker's `x-rewind-leader` redirect
+            // hint — works even for a NON-replayable request, which can't
+            // re-aim to discover the leader itself and would otherwise bounce
+            // 421→503 forever once its cached hint went stale. If the hint is
+            // absent (unknown leader: mid-election) or maps nowhere, FORGET
+            // the stale hint so the next request re-scans instead of starting
+            // at a node that's no longer the leader.
+            if (leaderOriginHint(rh, flow.nodes)) |origin| {
+                if (std.mem.eql(u8, origin, flow.nodes[flow.node_idx])) {
+                    // Hint points back at the node that just refused — stale
+                    // (a just-stepped-down leader). Drop, don't loop on it.
+                    self.leaders.drop(self.allocator, flow.host);
+                } else {
+                    self.leaders.note(self.allocator, flow.host, origin);
+                }
+            } else {
+                self.leaders.drop(self.allocator, flow.host);
+            }
             // Re-aim is rare once the leader cache is warm — it signals a
             // leadership change (or a cold/first request), so info-level is
             // the right volume, not per-request noise.
@@ -1466,7 +1512,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     continue;
                 }
                 if (status.code == 421) {
-                    self.handle421(flow);
+                    self.handle421(flow, rh);
                     continue;
                 }
                 // Relay the head downstream and switch the flow to
@@ -1764,7 +1810,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     // Complete buffered response (END_STREAM at/near
                     // HEADERS — no early emit happened).
                     if (status.code == 421) {
-                        self.handle421(flow);
+                        self.handle421(flow, rh);
                         continue;
                     }
                     // A non-421 buffered response after a 421 in this flow
@@ -2397,4 +2443,30 @@ test "LeaderCache: note replaces in place (no leak); drop forgets" {
     try testing.expectEqual(@as(usize, 0), lc.startIdx("acme", nodes));
     // drop of an absent host is a harmless no-op.
     lc.drop(a, "acme");
+}
+
+test "leaderOriginHint maps the x-rewind-leader raft id to its positional node" {
+    const nodes = &[_][]const u8{ "http://n1:1", "http://n2:1", "http://n3:1" };
+
+    // Build a RespHeaders carrying a single `x-rewind-leader: <val>`.
+    const mk = struct {
+        fn go(field: *h2.HeaderField, val: []const u8) h2.RespHeaders {
+            const name = "x-rewind-leader";
+            field.* = .{ .name = name.ptr, .name_len = name.len, .value = val.ptr, .value_len = @intCast(val.len) };
+            return .{ .fields = @as([*]h2.HeaderField, @ptrCast(field)), .count = 1 };
+        }
+    }.go;
+    var f: h2.HeaderField = undefined;
+
+    // raft id L → nodes[L-1] (cluster list ordered by node id).
+    try testing.expectEqualStrings("http://n1:1", leaderOriginHint(mk(&f, "1"), nodes).?);
+    try testing.expectEqualStrings("http://n2:1", leaderOriginHint(mk(&f, "2"), nodes).?);
+    try testing.expectEqualStrings("http://n3:1", leaderOriginHint(mk(&f, "3"), nodes).?);
+    // Unknown (0), out of range, or unparseable → null (caller forgets its
+    // stale hint and re-scans rather than trusting a bad map).
+    try testing.expect(leaderOriginHint(mk(&f, "0"), nodes) == null);
+    try testing.expect(leaderOriginHint(mk(&f, "4"), nodes) == null);
+    try testing.expect(leaderOriginHint(mk(&f, "nope"), nodes) == null);
+    // No hint header at all → null.
+    try testing.expect(leaderOriginHint(.{ .fields = null, .count = 0 }, nodes) == null);
 }

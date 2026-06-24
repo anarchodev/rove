@@ -1138,6 +1138,15 @@ pub const Node = struct {
         return self.mgr.isLeader(tenant_id);
     }
 
+    /// The raft id this node believes leads `tenant_id`'s group, or 0 when
+    /// unknown (mid-election / no recent leader contact) or the group doesn't
+    /// exist here yet. The bridge publishes it to workers as
+    /// `GroupSig.leader_id` so a non-leader can redirect a write to the leader.
+    pub fn leaderId(self: *const Node, tenant_id: u64) u64 {
+        if (self.groups.get(tenant_id) == null) return 0;
+        return self.mgr.leaderId(tenant_id);
+    }
+
     /// True when `tenant_id`'s raft group exists on this node. Pump-thread
     /// only (same ownership as every `groups` reader); the bridge publishes
     /// it to workers as `GroupSig.formed` once per leadership refresh.

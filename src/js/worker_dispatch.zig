@@ -2952,7 +2952,11 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
                 // a gate-rejected one). Harmless when a leader exists — the
                 // woken group re-hibernates without campaigning (pre_vote).
                 if (lead_gid != 0) worker.raft.requestWake(lead_gid);
-                try respb.setSimpleResponse(server, ent, sid, sess, 421, "not leader for this tenant; retry against the cluster leader\n", allocator);
+                // Stamp the believed leader's raft id so the front can redirect
+                // a non-replayable request straight to the leader (else it
+                // bounces 421→503 forever once its hint goes stale).
+                const leader_id = if (lead_gid != 0) worker.raft.leaderOf(lead_gid) else 0;
+                try respb.setNotLeaderResponse(server, ent, sid, sess, allocator, "not leader for this tenant; retry against the cluster leader\n", leader_id);
                 processed += 1;
                 continue;
             }

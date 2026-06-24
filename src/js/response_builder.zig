@@ -379,6 +379,32 @@ pub fn setRateLimitedResponse(
     try finalizeResponse(server, ent, sid, sess, 429, hdrs, body.ptr, @intCast(body.len));
 }
 
+/// 421 not-leader response, stamping `x-rewind-leader: <raft-id>` when
+/// `leader_id` is non-zero (the front maps the id to a serving origin and
+/// redirects there — critical for a non-replayable request, which can't be
+/// re-aimed and would otherwise bounce 421→503 until a replayable request
+/// re-learns the leader). `leader_id == 0` (unknown leader: mid-election /
+/// no contact) omits the header — the front then forgets its stale hint and
+/// re-scans. Shared by the customer dispatch gate and the move/v2-kv gates.
+pub fn setNotLeaderResponse(
+    server: anytype,
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    leader_id: u64,
+) !void {
+    const copy = try allocator.dupe(u8, body);
+    var hdrs: h2.RespHeaders = .{ .fields = null, .count = 0 };
+    if (leader_id != 0) {
+        const id_str = try std.fmt.allocPrint(allocator, "{d}", .{leader_id});
+        defer allocator.free(id_str);
+        hdrs = try packRespHeaders(allocator, &.{.{ .name = "x-rewind-leader", .value = id_str }});
+    }
+    try finalizeResponse(server, ent, sid, sess, 421, hdrs, copy.ptr, @intCast(copy.len));
+}
+
 // ── Static file dispatch ──────────────────────────────────────────────
 
 /// A static matched but its bytes aren't resident in the LRU — the caller

@@ -137,6 +137,15 @@ pub const GroupSig = struct {
     /// an atomic; one pump cycle stale at worst (fine for the rare move /
     /// leader-probe callers that read it).
     is_leader: std.atomic.Value(bool) = .init(false),
+    /// The raft id this group currently believes leads it (0 = unknown:
+    /// mid-election / freshly formed / no recent leader contact). Published
+    /// alongside `is_leader` each pump cycle (`node.leaderId`) and read
+    /// lock-free by the worker via `leaderOf` — so a NON-leader node can tell
+    /// the front WHO to redirect a not-leader write to (the front maps the
+    /// raft id to a serving origin and routes a non-retryable request straight
+    /// to the leader instead of bouncing 421→503). One pump cycle stale at
+    /// worst, same as `is_leader`.
+    leader_id: std.atomic.Value(u64) = .init(0),
     /// Whether the group EXISTS on this node, published by the pump's
     /// leadership refresh (`refreshOneLocked` → `node.hasGroup`). Gates the
     /// fail-fast follower check in `propose`: a registered tenant whose
@@ -770,6 +779,20 @@ pub const Bridge = struct {
         return sig.is_leader.load(.acquire);
     }
 
+    /// The raft id this node believes leads `gid`'s group, or 0 when unknown
+    /// (mid-election / freshly formed / no recent leader contact / unknown
+    /// gid). Reads the pump-published `leader_id` atomic (never the Manager
+    /// directly), worker-thread-safe, one pump cycle stale at worst. The
+    /// worker stamps this on a 421 not-leader response so the front can
+    /// redirect a non-retryable (non-replayable) write straight to the leader
+    /// rather than bouncing it 421→503 until a replayable request re-learns
+    /// the leader. 0 on a single node (no redirect target — the front skips
+    /// leader-gating there anyway).
+    pub fn leaderOf(self: *Bridge, gid: u64) u64 {
+        const sig = self.sigFor(gid) orelse return 0;
+        return sig.leader_id.load(.acquire);
+    }
+
     /// True when this node runs as the sole voter (no peers). The worker's
     /// dispatch-gate uses this to skip the per-tenant leader redirect on
     /// single-node / dev deployments: the sole node leads every group,
@@ -1388,6 +1411,7 @@ pub const Bridge = struct {
         }
         sig.was_leader = now;
         sig.is_leader.store(now, .release);
+        sig.leader_id.store(self.node.leaderId(gid), .release);
         sig.formed.store(self.node.hasGroup(gid), .release);
     }
 
