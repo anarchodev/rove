@@ -986,12 +986,17 @@ pub const Node = struct {
         errdefer self.dropActive(tenant_id);
         try self.growReadyBuf();
 
-        // Single-node: force this group to leader so proposes commit
-        // immediately (no peers to elect from). Multi-node lets the
-        // election fire via ticks (or an explicit `campaign` from the
-        // bootstrap) — campaigning here would race the peers that have not
-        // yet created the group.
-        if (self.isSingleNode()) {
+        // Campaign-to-leader at birth when this node is the group's SOLE voter —
+        // either a single-node node (no transport) OR a multi-node node birthing
+        // a group as `{self}` (cluster-genesis-and-membership §3.4: genesis
+        // groups are born single-voter and grown by conf-change). A sole-voter
+        // group has no peers to elect from and no race — no other node shares
+        // this membership — so it leads immediately. A born-MULTI group still
+        // elects via ticks; campaigning here would race the peers that have not
+        // yet created the group. (`as_learner` splits self out of `voters_slice`,
+        // so a learner is never sole-self and never campaigns.)
+        const born_sole_self = !recover and voters_slice.len == 1 and voters_slice[0] == self.node_id;
+        if (self.isSingleNode() or born_sole_self) {
             try self.mgr.campaign(tenant_id);
             var spins: u32 = 0;
             while (!self.mgr.isLeader(tenant_id) and spins < 100) : (spins += 1) {
@@ -2445,6 +2450,110 @@ test "Phase 1c: the leader replicates over a peer it knows ONLY via the resolver
     // over and replicated it. Plus node 1's resolver slot for node 3 is live.
     try testing.expect(nodes[0].isLeader(tenant));
     try testing.expect(nodes[0].transport.?.net.isPeerConfigured(2)); // node 3, learned via resolver
+}
+
+test "Phase 2: a group born {self} on a multi-node node auto-leads, then grows + replicates" {
+    // The genesis primitive (cluster-genesis-and-membership §3.4): a node that
+    // HAS a transport births a group as a single-voter {self} group — which
+    // auto-campaigns and leads with NO election race (no other node shares the
+    // membership) — then grows to a second node by conf-change. Both nodes know
+    // each other statically here (this isolates born-{self}+grow, not the
+    // resolver); voters={1,2} so neither is isSingleNode.
+    const a = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(root);
+
+    const voters = [_]u64{ 1, 2 };
+    const dirs = [_][]u8{
+        try std.fmt.allocPrint(a, "{s}/n1", .{root}),
+        try std.fmt.allocPrint(a, "{s}/n2", .{root}),
+    };
+    defer for (dirs) |d| a.free(d);
+
+    var nodes: [2]*Node = undefined;
+    var alive = [_]bool{ false, false };
+    defer for (nodes, 0..) |n, i| if (alive[i]) n.deinit();
+
+    const pid: u32 = @intCast(std.os.linux.getpid());
+    var attempt: u32 = 0;
+    while (attempt < 24) : (attempt += 1) {
+        const base: u16 = @intCast(20000 + ((pid +% (attempt +% 200) *% 619) % 4000) * 8);
+        var ok = true;
+        for (0..2) |i| {
+            var peers: [2]PeerAddr = undefined;
+            for (&peers, 0..) |*p, k| p.* = .{ .host = "127.0.0.1", .port = base + @as(u16, @intCast(k)) };
+            const addr = std.net.Address.parseIp("127.0.0.1", base + @as(u16, @intCast(i))) catch {
+                ok = false;
+                break;
+            };
+            nodes[i] = Node.initMultiNode(a, dirs[i], @intCast(i + 1), &voters, addr, &peers) catch {
+                ok = false;
+                break;
+            };
+            alive[i] = true;
+        }
+        if (ok) break;
+        for (0..2) |i| if (alive[i]) {
+            nodes[i].deinit();
+            alive[i] = false;
+        };
+    }
+    if (!(alive[0] and alive[1])) return error.SkipZigTest; // no free window
+
+    const tenant: u64 = 100;
+    const id = "tenant-100";
+    const epoch: u64 = 1;
+
+    // Node 1 births the group as {self=1}: it must lead IMMEDIATELY, with no
+    // explicit campaign and no warm-up — the born-{self} auto-campaign.
+    _ = try nodes[0].createGroupAtEpoch(tenant, id, epoch, false, &[_]u64{1});
+    try testing.expect(nodes[0].isLeader(tenant));
+
+    // Node 2 joins as a learner of the {1}-led group (the reconciler bootstrap
+    // shape): born voters={1}, learner={2}; it never campaigns.
+    _ = try nodes[1].createGroupAtEpoch(tenant, id, epoch, true, &[_]u64{1});
+    try testing.expect(!nodes[1].isLeader(tenant));
+
+    // Warm the mesh so the leader can reach the learner.
+    var warm: u32 = 0;
+    while (warm < 400 and !nodes[0].transport.?.net.isPeerConnected(1)) : (warm += 1) {
+        for (nodes) |n| _ = try n.pump();
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(nodes[0].transport.?.net.isPeerConnected(1));
+
+    // Grow: the leader formally adds node 2 as a learner by conf-change.
+    try nodes[0].proposeConfChange(tenant, 2, .add_learner);
+
+    // A write on the leader must replicate to the grown-in node.
+    var ws = WriteSet.init(a);
+    defer ws.deinit();
+    try ws.addPut("k", "grown");
+    const ws_bytes = try ws.encode(a);
+    defer a.free(ws_bytes);
+    const env = try envelope.encodeWriteSet(a, id, ws_bytes);
+    defer a.free(env);
+    try nodes[0].propose(tenant, env);
+
+    var on_n2 = false;
+    var spins: u32 = 0;
+    while (spins < 4000 and !on_n2) : (spins += 1) {
+        for (nodes) |n| _ = try n.pump();
+        if (nodes[1].get(tenant, "k")) |v| {
+            a.free(v);
+            on_n2 = true;
+        } else |_| {}
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expect(on_n2);
+    const v2 = try nodes[1].get(tenant, "k");
+    defer a.free(v2);
+    try testing.expectEqualStrings("grown", v2);
+    // Node 1 stayed leader; node 2 caught up as a follower/learner.
+    try testing.expect(nodes[0].isLeader(tenant));
 }
 
 test "two tenants get independent stores on the same node" {

@@ -1,6 +1,6 @@
 ---
 title: Cluster Genesis & Membership — bootstrap-one-then-grow
-status: in progress — Phase 1 complete (1a + 1b + 1c landed); Phase 2 next. See §6.
+status: in progress — Phase 1 complete; Phase 2 mechanism landed (production flip gated on Phase-4 smoke). See §6.
 date: 2026-06-24
 ---
 
@@ -256,6 +256,32 @@ The point of the whole exercise: **tests bring clusters up the real way.**
 2. **Single-voter genesis + CP-directory self-grow** (§3.4, §3.5) — groups
    born `{self}`; the CP grows its own directory group; tenant reconciler reads
    the registry. Now a cluster can genesis-1-then-grow end to end.
+   - **2a/2b mechanism — DONE (additive, not yet wired into production).**
+     `createGroupCore` now campaigns-to-leader at birth when this node is the
+     group's SOLE voter — either a single-node node OR a multi-node node birthing
+     a group as `{self}` (`born_sole_self`). A born-`{self}` group leads
+     immediately with no election race; a born-multi group still elects via
+     ticks (unchanged). The born-`{self}` membership itself rides the existing
+     `voters_override` param (`= {self.node_id}`). Proven by a deterministic
+     `node.zig` test: a multi-node node births a group `{self}`, auto-leads, then
+     grows to a second node by `add_learner` conf-change and replicates a write.
+     **Additive**: no production caller passes `voters_override={self}` yet
+     (provision still births the full set), so production behavior is unchanged.
+   - **REMAINING (gated on the Phase-4 genesis smoke).** Flipping production is
+     the risky, behavior-changing half and — per the 2026-06-24 outage (an
+     unvalidated genesis path took prod down) — must NOT land before a
+     multi-process from-empty smoke can validate it:
+     - **Provision births `{self}` + grows.** Today provision empty-attaches to
+       ALL nodes with the full `X-Rewind-Voters` set (cold-multi). Change to:
+       birth `{self}` on ONE node, let the RC-6 reconciler grow it. Needs the
+       Phase-4 harness to exercise it.
+     - **2c — CP directory self-grow.** The directory group is born via
+       `ensureGroup(recover=true)` → `initRecover(self.voters)` (full
+       `REWIND_CP_VOTERS`); it never grows. Genesis wants it born `{self}` on a
+       fresh CP and grown toward registered CP nodes (analog of the tenant
+       reconciler, on the directory group). Requires distinguishing FRESH (born
+       `{self}`) from RESTART (recover the WAL confstate) in the directory init —
+       new consensus code (§7), validated by the genesis smoke.
 3. **Delete static config** (§3.1) — remove the voter/peer/cluster env + CLI;
    node = self-only. Hard cut (pre-launch).
 4. **Harness + genesis smoke** (§4) — reshape `V2Cluster`; add
