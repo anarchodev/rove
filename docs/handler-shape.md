@@ -784,9 +784,12 @@ change (Hyrum's law). See `format-versioning-audit.md` §7.1/§7.3/§7.6.
   verbatim where an API expects it, but do **not** parse, decode, slice, or
   assume an ordering/structure: the encoding (length, charset, any embedded
   fields such as the node that minted it) is an internal detail that may change.
-  The platform will move these to type-prefixed forms (`req_…`, `dep_…`); a
-  handler that depends on the bare-hex shape will break (`format-versioning-audit.md`
-  §7.5).
+  These now carry Stripe-style type prefixes — `request.actor.request_id` is
+  `req_…`, a deployment id is `dep_…`, `request.session.id` is `sess_…`, and
+  `activation.fetch_id` is `ftch_…` — precisely so the format stays versionable
+  behind the prefix. Treat everything after the prefix as opaque; a handler that
+  depends on a bare-hex shape (or the prefix's exact contents) will break
+  (`format-versioning-audit.md` §7.5).
 
 ## 10. What's gone (vs prior streaming revisions)
 

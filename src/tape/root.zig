@@ -101,6 +101,12 @@ pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
 /// 5 → 6 by the read-taped request surface: the `.request_reads`
 /// channel was added (count 4 → 5) — the lazily-recorded inbound
 /// request inputs (header names/values, body-read flag, ip reads).
+/// 6 → 7 by the format-versioning freeze (`docs/format-versioning-audit.md`
+/// §4): a `js_engine_version: u16` scalar was added to the header
+/// (after `seed`), so every replicated request records which JS engine
+/// executed it. Header grows 22 → 24 bytes. This bump rides in the
+/// durable raft log (type-0 envelopes carry the readset), so it forces
+/// a pre-launch data-dir wipe — old v6 readsets are rejected loudly.
 /// Pre-launch — hard cutover, no old raft logs to migrate. The parser
 /// accepts exactly this version and rejects anything else loudly; the
 /// version byte is a format guard, not a compatibility band. BodyRefs
@@ -108,7 +114,7 @@ pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
 /// (`_pool/{batch_id:0>20}`). When the format changes, bump this and
 /// delete the old shape in the same change — do not add a
 /// min-supported fallback.
-pub const READSET_VERSION: u16 = 6;
+pub const READSET_VERSION: u16 = 7;
 pub const READSET_CHANNEL_COUNT: usize = 5;
 
 /// Renumbered contiguously by `docs/primitive-gaps.md` §9 +
@@ -647,6 +653,18 @@ pub const Readset = struct {
     /// Production callers derive it from `timestamp_ns`; tests pass
     /// a fixed value for determinism.
     seed: u64,
+    /// The JS engine version (`qjs/version.zig` `JS_ENGINE_VERSION`)
+    /// that executed this request — the authoritative per-request
+    /// stamp the replayer reads to fetch the matching engine
+    /// (`docs/format-versioning-audit.md` §4). Replicated in the
+    /// readset header (a peer of `seed`/`timestamp_ns`, the other
+    /// per-request execution-context scalars) so a follower-rebuilt
+    /// record carries the same engine the leader ran. Production
+    /// callers set it from `qjs.JS_ENGINE_VERSION` at the dispatch
+    /// site; 0 is the "unknown engine" default for tests / non-handler
+    /// paths. One engine per binary today, so selection is a no-op
+    /// until the first semantics-affecting bump (Phase 3, post-GA).
+    js_engine_version: u16 = 0,
     kv: Tape,
     module: Tape,
     /// `docs/readset-replication-plan.md` Phase 2c-2: one entry per
@@ -715,13 +733,14 @@ pub const Readset = struct {
     /// Serialize the whole readset to a single blob suitable for the
     /// raft entry's readset section
     /// (`docs/readset-replication-plan.md` Phase 3 + 5a). Wire format
-    /// (READSET_VERSION = 6):
+    /// (READSET_VERSION = 7):
     ///
     /// ```
     /// [u32  magic = READSET_MAGIC ('RREA')]
     /// [u16  version = READSET_VERSION]
-    /// [i64  timestamp_ns  big-endian]
-    /// [u64  seed          big-endian]
+    /// [i64  timestamp_ns       big-endian]
+    /// [u64  seed               big-endian]
+    /// [u16  js_engine_version  big-endian]   // §4 format-versioning freeze
     /// for each of the 5 channels in fixed order:
     ///   [u32 blob_len BE][blob_bytes]   // blob is a full Tape.serialize()
     /// [u32 log_header_len BE][log_header_bytes]   // Phase 5a
@@ -746,11 +765,12 @@ pub const Readset = struct {
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
 
-        var header: [4 + 2 + 8 + 8]u8 = undefined;
+        var header: [4 + 2 + 8 + 8 + 2]u8 = undefined;
         std.mem.writeInt(u32, header[0..4], READSET_MAGIC, .big);
         std.mem.writeInt(u16, header[4..6], READSET_VERSION, .big);
         std.mem.writeInt(i64, header[6..14], self.timestamp_ns, .big);
         std.mem.writeInt(u64, header[14..22], self.seed, .big);
+        std.mem.writeInt(u16, header[22..24], self.js_engine_version, .big);
         try buf.appendSlice(allocator, &header);
 
         const channels = [_]*const Tape{
@@ -800,6 +820,9 @@ pub const Readset = struct {
 pub const ParsedReadset = struct {
     timestamp_ns: i64,
     seed: u64,
+    /// The JS engine version that ran the request (§4 freeze). Mirrors
+    /// `Readset.js_engine_version`; 0 means unknown / pre-stamp.
+    js_engine_version: u16,
     /// Borrowed slices into the input bytes, one per channel in
     /// fixed order (kv, module, fetch_responses, trigger_payload,
     /// request_reads).
@@ -813,16 +836,17 @@ pub const ParsedReadset = struct {
 };
 
 pub fn parseReadset(bytes: []const u8) (ParseError || log_mod.LogHeaderParseError)!ParsedReadset {
-    if (bytes.len < 4 + 2 + 8 + 8) return ParseError.Truncated;
+    if (bytes.len < 4 + 2 + 8 + 8 + 2) return ParseError.Truncated;
     const magic = std.mem.readInt(u32, bytes[0..4], .big);
     if (magic != READSET_MAGIC) return ParseError.BadMagic;
     const version = std.mem.readInt(u16, bytes[4..6], .big);
     if (version != READSET_VERSION) return ParseError.UnsupportedVersion;
     const timestamp_ns = std.mem.readInt(i64, bytes[6..14], .big);
     const seed = std.mem.readInt(u64, bytes[14..22], .big);
+    const js_engine_version = std.mem.readInt(u16, bytes[22..24], .big);
 
     var blobs: [READSET_CHANNEL_COUNT][]const u8 = undefined;
-    var cur: usize = 22;
+    var cur: usize = 24;
     var i: usize = 0;
     while (i < READSET_CHANNEL_COUNT) : (i += 1) {
         if (cur + 4 > bytes.len) return ParseError.Truncated;
@@ -847,6 +871,7 @@ pub fn parseReadset(bytes: []const u8) (ParseError || log_mod.LogHeaderParseErro
     return .{
         .timestamp_ns = timestamp_ns,
         .seed = seed,
+        .js_engine_version = js_engine_version,
         .blobs = blobs,
         .log_header = lh,
     };
@@ -1436,6 +1461,7 @@ test "module tape: specifier + hash roundtrip" {
 test "readset: serialize + parseReadset roundtrip" {
     var rs = Readset.init(testing.allocator, 1_700_000_000_000_000_000, 0xDEADBEEFCAFEBABE);
     defer rs.deinit();
+    rs.js_engine_version = 7;
     try rs.kv.appendKv(.get, "k", "v", .ok);
     try rs.module.appendModule("./h.js", "a" ** 64);
     try rs.fetch_responses.appendFetchResponse(
@@ -1462,6 +1488,7 @@ test "readset: serialize + parseReadset roundtrip" {
     const parsed = try parseReadset(bytes);
     try testing.expectEqual(@as(i64, 1_700_000_000_000_000_000), parsed.timestamp_ns);
     try testing.expectEqual(@as(u64, 0xDEADBEEFCAFEBABE), parsed.seed);
+    try testing.expectEqual(@as(u16, 7), parsed.js_engine_version);
     try testing.expect(parsed.log_header == null);
 
     // Each blob is a self-contained tape; re-parse to confirm the

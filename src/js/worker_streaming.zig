@@ -541,6 +541,7 @@ fn resumeStream(
     defer ws.deinit();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
     var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    readset.js_engine_version = dispatcher_mod.JS_ENGINE_VERSION;
     defer readset.deinit();
     const request_id: u64 = blk: {
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
@@ -964,6 +965,7 @@ pub fn resumeBoundFetchStream(
     defer ws.deinit();
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
     var readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    readset.js_engine_version = dispatcher_mod.JS_ENGINE_VERSION;
     defer readset.deinit();
     const request_id: u64 = blk: {
         const tl = worker.tenant_logs.get(inst.id) orelse break :blk 0;
@@ -1322,11 +1324,13 @@ pub fn firePrep(
         return null;
     };
     const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    var rs_init = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns));
+    rs_init.js_engine_version = dispatcher_mod.JS_ENGINE_VERSION;
     return .{
         .dep = dep,
         .txn = txn,
         .ws = kv_mod.WriteSet.init(allocator),
-        .readset = tape_mod.Readset.init(allocator, now_ns, @bitCast(now_ns)),
+        .readset = rs_init,
         .now_ns = now_ns,
         .request_id = blk: {
             const tl = worker.tenant_logs.get(dep.inst.id) orelse break :blk 0;

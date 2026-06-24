@@ -34,6 +34,7 @@ const rove = @import("rove");
 const rio = @import("rove-io");
 const h2 = @import("rove-h2");
 
+const log_mod = @import("rove-log");
 const batch_store_mod = @import("batch_store.zig");
 const index_db_mod = @import("index_db.zig");
 const indexer_mod = @import("indexer.zig");
@@ -601,7 +602,14 @@ fn handleList(
 ) !void {
     const limit = parseUint(u32, query, "limit", 100);
     const after_received_ns = parseInt(i64, query, "after_received_ns", 0);
-    const after_request_id = parseUint(u64, query, "after_request_id", 0);
+    // The cursor is the opaque `req_<16hex>` token from `next_cursor`
+    // (§7.5). Tolerate a bare-hex/missing value (→ 0, the unfiltered
+    // start) so a hand-built or truncated cursor degrades to "from the
+    // top" rather than erroring.
+    const after_request_id: u64 = if (queryStr(query, "after_request_id")) |s|
+        (log_mod.parsePrefixedId(log_mod.REQUEST_ID_PREFIX, s) orelse 0)
+    else
+        0;
 
     var list = db.queryList(tenant_id, after_received_ns, after_request_id, floor_received_ns, limit, tag_key, tag_value) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "list failed: {s}\n", .{@errorName(err)});
@@ -627,8 +635,10 @@ fn handleShow(
     floor_received_ns: i64,
     cfg: *const Config,
 ) !void {
-    const request_id = std.fmt.parseInt(u64, request_id_str, 10) catch {
-        try setResponse(server, ent, sid, sess, 400, "invalid request id (want decimal u64)\n", cfg);
+    // The path segment is the opaque `req_<16hex>` token (§7.5) — the
+    // same form `/list` and `request.actor.request_id` hand out.
+    const request_id = log_mod.parsePrefixedId(log_mod.REQUEST_ID_PREFIX, request_id_str) orelse {
+        try setResponse(server, ent, sid, sess, 400, "invalid request id (want req_<16hex>)\n", cfg);
         return;
     };
     var maybe = db.queryShow(tenant_id, request_id) catch |err| {
@@ -775,9 +785,13 @@ fn renderListJson(
         const last = &rows[rows.len - 1];
         var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
         defer buf = aw.toArrayList();
+        // Hand back the cursor request_id as the opaque prefixed token the
+        // client passes verbatim to `?after_request_id=` (§7.5).
+        var cur_buf: [log_mod.PREFIXED_ID_BUF]u8 = undefined;
+        const cur_rid = log_mod.formatPrefixedId(&cur_buf, log_mod.REQUEST_ID_PREFIX, last.request_id);
         try aw.writer.print(
-            "],\"next_cursor\":{{\"received_ns\":{d},\"request_id\":{d}}}}}\n",
-            .{ last.received_ns, last.request_id },
+            "],\"next_cursor\":{{\"received_ns\":{d},\"request_id\":\"{s}\"}}}}\n",
+            .{ last.received_ns, cur_rid },
         );
     }
     return buf.toOwnedSlice(allocator);
@@ -790,9 +804,14 @@ fn writeRowJson(
 ) !void {
     var aw = std.Io.Writer.Allocating.fromArrayList(allocator, buf);
     defer buf.* = aw.toArrayList();
+    // Customer-visible ids as opaque prefixed tokens (§7.5).
+    var rid_buf: [log_mod.PREFIXED_ID_BUF]u8 = undefined;
+    var dep_buf: [log_mod.PREFIXED_ID_BUF]u8 = undefined;
+    const rid = log_mod.formatPrefixedId(&rid_buf, log_mod.REQUEST_ID_PREFIX, r.request_id);
+    const dep = log_mod.formatPrefixedId(&dep_buf, log_mod.DEPLOYMENT_ID_PREFIX, r.deployment_id);
     try aw.writer.print(
-        "{{\"request_id\":{d},\"received_ns\":{d},\"duration_ns\":{d},\"status\":{d},\"deployment_id\":{d},\"method\":",
-        .{ r.request_id, r.received_ns, r.duration_ns, r.status, r.deployment_id },
+        "{{\"request_id\":\"{s}\",\"received_ns\":{d},\"duration_ns\":{d},\"status\":{d},\"deployment_id\":\"{s}\",\"method\":",
+        .{ rid, r.received_ns, r.duration_ns, r.status, dep },
     );
     try writeJsonString(&aw.writer, r.method);
     try aw.writer.writeAll(",\"path\":");
@@ -953,6 +972,19 @@ fn parseUint(comptime T: type, query: []const u8, key: []const u8, default: T) T
         return std.fmt.parseInt(T, pair[eq + 1 ..], 10) catch default;
     }
     return default;
+}
+
+/// Raw string value of a query key, or null if absent. Used for the
+/// `after_request_id` cursor, which is the opaque `req_<16hex>` token we
+/// handed out in `next_cursor` (§7.5), not a bare integer.
+fn queryStr(query: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (!std.mem.eql(u8, pair[0..eq], key)) continue;
+        return pair[eq + 1 ..];
+    }
+    return null;
 }
 
 fn parseInt(comptime T: type, query: []const u8, key: []const u8, default: T) T {

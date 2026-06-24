@@ -40,6 +40,12 @@
 
 const std = @import("std");
 
+/// Re-exported so the format-version registry (`src/version.zig`) can
+/// reach the readset wire version + the customer-id prefixes through the
+/// worker's existing `rove-js` import (no extra build-graph edges).
+pub const tape = @import("rove-tape");
+pub const log = @import("rove-log");
+
 pub const dispatcher = @import("dispatcher.zig");
 pub const effect = @import("effect/root.zig");
 pub const globals = @import("globals.zig");

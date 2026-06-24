@@ -1,6 +1,6 @@
 ---
 title: Format & Protocol Versioning Audit (pre-launch)
-status: in progress — all 5 MUST landed (smoke-verified); SHOULD 7/8 done, 6/9 partial; item-10 slice remains
+status: all 5 MUST + all 9 SHOULD landed (build + unit + e2e smoke verified); pre-prod-deploy data wipe still required
 date: 2026-06-18
 updated: 2026-06-23
 ---
@@ -9,12 +9,18 @@ updated: 2026-06-23
 
 > **Resume note (2026-06-23).** Implementation lives on the unmerged worktree
 > branch `worktree-docs+format-versioning-audit` (do **not** merge/deploy — other
-> deploy work is in flight). Status of every item is in §8. All 5 MUST items and
-> SHOULD 7/8 are landed; 6/9 are partial. The one remaining focused effort is the
-> **item-10 slice** (Part I format version-bytes + js-engine-version stamp +
-> the item-6 `req_`/`dep_` prefix), which needs a coordinated dev-data wipe —
-> start it as its own dedicated run. See §8 and `src/qjs/snap.zig` /
-> `src/tape/root.zig` / `web/replay/_static/rtap.mjs`.
+> deploy work is in flight). **All 5 MUST and all 9 SHOULD items are now landed**
+> (the item-10 format-version-bytes + js-engine-version slice and item-6 id
+> prefixes were completed 2026-06-23). `zig build test` + `rewind-worker`/`-cp`/
+> `-front` + `v2-test` all green; `inbound_chunk_smoke_v2` passes end-to-end
+> (deploy → serve → log-server `/list`→`/show` round-trip on the prefixed ids,
+> 562 readset-v7 records indexed). `rewind-worker --version` dumps the registry.
+> Status of every item is in §8. **One operational task remains before any prod
+> deploy of this branch: a coordinated data-dir wipe** — `READSET_VERSION` 6→7
+> rides in the durable raft log (type-0 envelopes carry the readset), so old v6
+> entries are rejected loudly after upgrade. Smokes wipe automatically (fresh
+> temp dirs); prod does not. See §6 (Validation) and `decisions.md`
+> no-pre-launch-back-compat.
 
 Pre-launch sweep of every wire protocol, on-disk format, and persisted
 key-schema in `rove`, with the current versioning status of each and a
@@ -59,7 +65,7 @@ Legend — **Ver?**: explicit version field present today. **Tier**: see §2.
 
 | Format | File | Layout | Ver? | Tier |
 |---|---|---|---|---|
-| Coalesced raft transport | `src/consensus/transport.zig:22-35`, `RECORD_HDR_SIZE=20 :86` | `[u32 count]·[u64 group][u64 epoch][u32 msg_len][msg]…` (msg = raft-rs protobuf) | none (epoch fences staleness) | **B-hot** |
+| Coalesced raft transport | `src/consensus/transport.zig:22-35`, `RECORD_HDR_SIZE=20` | `[u8 ver][u32 count]·[u64 group][u64 epoch][u32 msg_len][msg]…` (msg = raft-rs protobuf) | **yes (v1 frame byte)** + epoch fences | **B-hot** |
 | Raft-net frame codec | `src/kv/raft_rpc.zig:18-47` | `[u32 BE len][u32 BE crc][payload]`; ident handshake type=5 | MsgType enum | B-hot |
 | Snapshot stream wire | `src/kv/snapshot_stream.zig:43-52` | `[u32 LE MAGIC "MGS2"][u8 ver=1][u64 store_id]·[u16 klen][u32 vlen][k][v]…` | **yes (v1)** | B |
 | Snapshot sink endpoint | `src/js/snapshot_sink.zig` + `POST /_system/v2-snapshot-stream` | headers `{mode,tenant,index,term,move-secret}` + stream body | path `v2-` | B |
@@ -97,8 +103,8 @@ Legend — **Ver?**: explicit version field present today. **Tier**: see §2.
 | Format | File | Layout | Ver? | Tier |
 |---|---|---|---|---|
 | Per-channel tape | `src/tape/root.zig:73,82` | `[u32 MAGIC "RTAP"][u16 ver=5][u16 channel][u32 count][entries…]` | **yes (v5)** | A* |
-| Readset bundle (whole request) | `src/tape/root.zig:88-111,741-786` | `[u32 "RREA"][u16 ver=6][i64 ts_ns][u64 seed]·5 channel blobs·LogHeader` | **yes (v6)** | A* |
-| WASM parser mirror | `web/replay/_static/rtap.mjs` | mirrors the above in JS | tracks v5/v6 | A* |
+| Readset bundle (whole request) | `src/tape/root.zig:88-117,741-786` | `[u32 "RREA"][u16 ver=7][i64 ts_ns][u64 seed][u16 js_engine_version]·5 channel blobs·LogHeader` | **yes (v7)** | A* |
+| WASM parser mirror | `web/replay/_static/rtap.mjs` | mirrors **per-tape** blobs only (NOT RREA — see §4 step 3) | tracks tape v5 | A* |
 
 `A*` = log-persisted (tapes ride inline in `LogRecord`) **and** must stay
 in lockstep with the JS-side `rtap.mjs` parser.
@@ -130,7 +136,7 @@ Source: `src/cp/directory.zig`.
 | `placement/{tenant}` | bare `{cluster_id}` | none | **already post-wipe shape** (was `{state}:{cluster}`) |
 | `plan/{tenant}` | opaque JSON | in-payload | CP dumb, DP parses |
 | `host/{host}` | `{tenant_id}` | none | domain index |
-| `cert/{host}` | **packed binary** `[u32 BE cert_len][cert_pem][key_pem]` (`directory.zig:804-828`) | none | brittle; needs a version byte |
+| `cert/{host}` | **packed binary** `[u8 v=1][u32 BE cert_len][cert_pem][key_pem]` (`directory.zig` `packCert`/`CERT_PACK_VERSION`) | **yes (v1)** | front-door mirror in `front/main.zig` |
 
 ### 1h. Tokens / credentials
 
@@ -230,9 +236,17 @@ when the arenajs pin moves in a semantics-affecting way. Keep a mapping
 2. `src/log/root.zig:275-326` — add `js_engine_version: u16` to `LogRecord`
    (passenger field), set at dispatch from `snapshot.version`. Carries into the
    ndjson log batch. *(Phase 0.)*
-3. `src/tape/root.zig:741-786` — add `js_engine_version` to the readset bundle
-   wire, bump `READSET_VERSION` 6→7, mirror in `web/replay/_static/rtap.mjs`.
-   This is the authoritative per-request stamp the replayer reads. *(Phase 1.)*
+3. `src/tape/root.zig` — add `js_engine_version: u16` to the readset header
+   (a peer of `seed`/`timestamp_ns`), bump `READSET_VERSION` 6→7, header 22→24B.
+   This is the authoritative per-request stamp. *(Phase 1 — **DONE** 2026-06-23.)*
+   **Correction:** the original plan said "mirror in `rtap.mjs`," but `rtap.mjs`
+   only parses per-tape blobs, NOT the RREA readset — replay reads `seed` /
+   `timestamp_ns` (and now `js_engine_version`) from a structured **bundle JSON**
+   the log-server builds (`flush_writer` emits it; `web/admin/_static/api.js`
+   composes it; `web/replay/_static/wasm-app.mjs` reads `bundle.js_engine_version`
+   and errors if it ever mismatches `REPLAY_ENGINE_VERSION`). So the real
+   "mirror" is the bundle JSON + `wasm-app.mjs`, which is where it landed. No
+   `rtap.mjs` change was needed.
 4. `src/files/manifest_json.zig` — add optional `"js_engine_version"` to the
    deployment manifest as the *default* for the deploy; per-request readset wins
    if present (covers a worker upgraded mid-deploy). *(Phase 2.)*
@@ -259,14 +273,26 @@ when the arenajs pin moves in a semantics-affecting way. Keep a mapping
 - **raft-rs WAL / kvexp internal versions** — do raft-rs-zig and kvexp expose any
   on-disk format version we can read at open() for the audit log? If so, log it
   at startup; if not, the dependency commit pin is the only handle.
-- **Entry-frame version vs. wipe** — since we wipe pre-launch, do we even add an
-  explicit entry-frame version, or declare `0xF7`-magic == v1 and reserve
-  `0xF8` for v2? (Cheaper, equally fail-loud, but less self-describing.)
+- **Entry-frame version vs. wipe** — **RESOLVED (2026-06-23): magic-IS-the-version.**
+  `0xF7` == entry-frame v1; the next change reserves `0xF8`. No per-entry version
+  byte was added (Tier-A, every raft entry — `wire width vs interpretation`).
+  Same idiom for the envelope codec (the type byte is the discriminant; v1 is the
+  current 0/1/2 set, the next change reserves a new type). Both are recorded in
+  the registry (`src/rewind/version.zig` `ENTRY_FRAME_VERSION` /
+  `ENVELOPE_FORMAT_VERSION`) and the decoders already reject unknown
+  discriminants loudly. The two formats that had NO discriminant DID get an
+  explicit leading version byte: the coalesced transport frame (one byte per
+  frame, not per record) and the packed cert frame.
 - **`_meta/schema_version` granularity** — one bundle key per store vs. per
   namespace. Bundle is simpler; per-namespace is finer for independent shim
   upgrades. Lean bundle.
-- **engine-version bump policy** — what counts as "semantics-affecting" enough to
-  bump `JS_ENGINE_VERSION`? Need a written SOP so the integer stays meaningful.
+- **engine-version bump policy** — **RESOLVED (2026-06-23): SOP written** in
+  `src/qjs/version.zig`'s doc comment (bump on observable numeric/string/`Intl`/
+  `Date`/regex formatting changes, emitted-bytecode changes, or PRNG/clock
+  plumbing changes; do NOT bump for allocator/perf/GC/build-flag changes). The
+  file also keeps the `version → arenajs commit` map. The WASM replay engine
+  mirrors the constant as `REPLAY_ENGINE_VERSION` in `wasm-app.mjs` (bump in
+  lockstep when the WASM is rebuilt from a semantics-affecting pin).
 
 ## 6. Proposed phasing
 
@@ -534,18 +560,30 @@ fields are ignored), so additive growth is safe. The reservations to make now:
 > - **9 PARTIAL** `7bf2528` — service-JWT payload carries `"v":1`. The `kid` +
 >   N-secret rotation window (the valuable half) is deferred; tokens are
 >   internal + ~5-min, so versioning value is modest.
-> - **6 PARTIAL** — DECIDED "prefix + document opaque." The *document-opaque*
->   half landed (handler-shape.md §9: platform ids are opaque, don't parse —
->   this is the part that preserves our freedom to change them). The `req_`/`dep_`
->   prefix itself is **all-or-nothing across surfaces** (deployment_loader.zig,
->   web/admin JS deploy app, trigger_dispatch.zig `request.actor`, log-server
->   indexer+flush_writer query/`/show/{id}`, CLI, + several smokes that assert
->   bare hex), so it's a focused cross-cutting effort — bundle with item 10.
-> - **10 — REMAINING FOCUSED EFFORT (full slice, DECIDED):** the js-engine-version
->   stamp where replay reads it lives in the replicated tape/readset
->   (READSET_VERSION 6→7 + rtap.mjs mirror + dev-data wipe), coupled to the
->   Part I format-version-bytes Phase 1 (entry frame, envelope codec, transport
->   frame byte, cert packing). The natural next dedicated effort.
+> - **6 DONE** (2026-06-23) — type prefixes on all customer-visible ids, applied
+>   **only at customer boundaries** (internal u64 / hex / router-keys / S3-keys /
+>   manifest stay bare): `request.actor.request_id`→`req_<16hex>`
+>   (`trigger_dispatch.zig`), `request.session.id`→`sess_<64hex>` +
+>   `activation.fetch_id`→`ftch_<64hex>` (`globals.zig`), and the served logs API
+>   (`flush_writer` record JSON + `standalone` list/cursor/`/show`)→`req_`/`dep_`
+>   prefixed strings, with `web/admin/_static/api.js` updated to match. Central
+>   format/parse helpers live in `rove-log` (`formatPrefixedId` /
+>   `parsePrefixedId` / the prefix consts). **worker_id removal**: per the
+>   2026-06-23 decision we kept the *opaque-by-contract* form — the internal u64
+>   (worker_id in the top 16 bits) is unchanged for index/pagination/uniqueness;
+>   the `req_` prefix + the documented don't-parse contract is the mitigation
+>   (NOT a reversible mix). Verified e2e by `inbound_chunk_smoke_v2` (`/list`→
+>   `/show` round-trip) + a flush_writer unit assertion on the served JSON.
+> - **10 DONE** (2026-06-23) — js-engine-version stamp + Part I format-version
+>   bytes. `JS_ENGINE_VERSION` const (`src/qjs/version.zig`) → `Snapshot.version`
+>   → stamped on every production `Readset` → `READSET_VERSION` 6→7 (header
+>   22→24B) → `TapePayloads`/`LogRecord` → served log JSON → replay bundle →
+>   `wasm-app.mjs` (engine-mismatch guard). Format-version bytes: coalesced
+>   transport frame (`transport.zig` `FRAME_VERSION`), packed cert
+>   (`directory.zig` `CERT_PACK_VERSION` + the front-door's mirror); entry-frame /
+>   envelope use magic-IS-the-version (see §5). Registry + `rewind --version`
+>   dump in `src/rewind/version.zig`. The READSET bump forces the pre-prod data
+>   wipe noted in the resume note + §6.
 
 **DECIDED (2026-06-18):**
 - KV: blanket leading-`_` reservation (§7.1), not the single-`_rove/`-prefix

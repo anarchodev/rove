@@ -777,26 +777,35 @@ pub const Directory = struct {
 
     // ── Cert state (ACME issuer / operator writes, front-door reads; gap #3) ─
 
-    /// A host's packed TLS cert+key (`[4B BE cert_len][cert_pem][key_pem]`),
-    /// split into PEM slices. Front doors feed these straight into OpenSSL.
+    /// A host's packed TLS cert+key
+    /// (`[1B version][4B BE cert_len][cert_pem][key_pem]`), split into PEM
+    /// slices. Front doors feed these straight into OpenSSL.
     pub const Cert = struct { cert_pem: []const u8, key_pem: []const u8 };
+
+    /// Packed-cert format version (`docs/format-versioning-audit.md` §3.4).
+    /// A leading version byte so a future cert-frame change (extra fields,
+    /// a chain split) is a soft upgrade; `unpackCert` rejects other values.
+    /// Frozen v1 at the pre-launch format freeze.
+    pub const CERT_PACK_VERSION: u8 = 1;
 
     /// Pack a cert+key into the on-wire/at-rest frame (caller owns the result).
     pub fn packCert(a: std.mem.Allocator, cert_pem: []const u8, key_pem: []const u8) Error![]u8 {
-        const out = a.alloc(u8, 4 + cert_pem.len + key_pem.len) catch return Error.OutOfMemory;
-        std.mem.writeInt(u32, out[0..4], @intCast(cert_pem.len), .big);
-        @memcpy(out[4 .. 4 + cert_pem.len], cert_pem);
-        @memcpy(out[4 + cert_pem.len ..], key_pem);
+        const out = a.alloc(u8, 1 + 4 + cert_pem.len + key_pem.len) catch return Error.OutOfMemory;
+        out[0] = CERT_PACK_VERSION;
+        std.mem.writeInt(u32, out[1..5], @intCast(cert_pem.len), .big);
+        @memcpy(out[5 .. 5 + cert_pem.len], cert_pem);
+        @memcpy(out[5 + cert_pem.len ..], key_pem);
         return out;
     }
 
     /// Split a packed frame into its PEM slices (borrowed from `packed_bytes`),
-    /// or null if the frame is malformed.
+    /// or null if the frame is malformed or carries an unknown version.
     pub fn unpackCert(packed_bytes: []const u8) ?Cert {
-        if (packed_bytes.len < 4) return null;
-        const clen = std.mem.readInt(u32, packed_bytes[0..4], .big);
-        if (4 + clen > packed_bytes.len) return null;
-        return .{ .cert_pem = packed_bytes[4 .. 4 + clen], .key_pem = packed_bytes[4 + clen ..] };
+        if (packed_bytes.len < 5) return null;
+        if (packed_bytes[0] != CERT_PACK_VERSION) return null;
+        const clen = std.mem.readInt(u32, packed_bytes[1..5], .big);
+        if (5 + clen > packed_bytes.len) return null;
+        return .{ .cert_pem = packed_bytes[5 .. 5 + clen], .key_pem = packed_bytes[5 + clen ..] };
     }
 
     /// Store a host's cert: `cert/{host} = packCert(cert, key)`. Written by the
@@ -1078,9 +1087,16 @@ test "directory: setCert + certForOwned round-trip, pack/unpack, uncerted list" 
     {
         const packed_bytes = (try dir.certForOwned(a, "acme.com")).?;
         defer a.free(packed_bytes);
+        // Frame carries the version byte first (`docs/format-versioning-audit.md` §3.4).
+        try testing.expectEqual(Directory.CERT_PACK_VERSION, packed_bytes[0]);
         const u = Directory.unpackCert(packed_bytes).?;
         try testing.expectEqualStrings("CERTPEM", u.cert_pem);
         try testing.expectEqualStrings("KEYPEM", u.key_pem);
+        // An unknown version is rejected loudly (null), not mis-split.
+        var bad = a.dupe(u8, packed_bytes) catch unreachable;
+        defer a.free(bad);
+        bad[0] = 0xFE;
+        try testing.expect(Directory.unpackCert(bad) == null);
     }
 
     // renewal replaces (old value freed — no leak under the testing allocator)

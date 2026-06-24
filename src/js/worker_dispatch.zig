@@ -3135,6 +3135,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // JS exception or CPU-budget kill rolls back only this handler's
         // writes without poisoning the rest of the batch.
         var readset = tape_mod.Readset.init(allocator, received_ns, @bitCast(received_ns));
+        readset.js_engine_version = dispatcher_mod.JS_ENGINE_VERSION;
         defer readset.deinit();
 
         // Inbound body → readset BodyRef. §5.1 invariant: a handler

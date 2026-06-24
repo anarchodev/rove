@@ -27,6 +27,12 @@ pub const snap = @import("snap.zig");
 pub const Snapshot = snap.Snapshot;
 pub const InitFn = snap.InitFn;
 
+/// JS engine version (`version.zig`) — the replay-critical interpreter
+/// identity stamped into every request. Re-exported so worker/dispatch
+/// code reads one canonical constant.
+pub const version = @import("version.zig");
+pub const JS_ENGINE_VERSION = version.JS_ENGINE_VERSION;
+
 pub const Error = error{
     RuntimeCreateFailed,
     ContextCreateFailed,

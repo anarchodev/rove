@@ -36,6 +36,7 @@
 
 const std = @import("std");
 const root = @import("root.zig");
+const version_mod = @import("version.zig");
 
 pub const c = root.c;
 
@@ -90,6 +91,12 @@ pub const InitFn = *const fn (
 pub const Snapshot = struct {
     rt: *c.JSRuntime,
     ctx: *c.JSContext,
+    /// The JS engine version this snapshot's runtime embodies
+    /// (`version.zig`). Stamped per-request into the `LogRecord` and the
+    /// replicated readset header so replay can later fetch the matching
+    /// engine. Set from the compile-time constant at create; one engine
+    /// per binary today (selection is a no-op until the first bump).
+    version: u16 = version_mod.JS_ENGINE_VERSION,
 
     pub const Restored = struct {
         runtime: root.Runtime,
@@ -115,7 +122,7 @@ pub const Snapshot = struct {
         // sweep at vendor/arenajs/arena-test262.c).
         c.JS_FreezeRuntime(rt);
 
-        return .{ .rt = rt, .ctx = ctx };
+        return .{ .rt = rt, .ctx = ctx, .version = version_mod.JS_ENGINE_VERSION };
     }
 
     pub fn deinit(self: *Snapshot) void {

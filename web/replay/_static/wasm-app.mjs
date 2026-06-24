@@ -34,6 +34,16 @@ import { buildRequestEpilogue, exportForActivation } from "./request-replay.mjs"
 import { CursorEngine } from "./cursor.mjs";
 import getArenaJs from "./qjs_arena_wasm.js";
 
+// The JS engine version of the arenajs WASM bundled with this replayer
+// (`qjs_arena_wasm.{js,wasm}`). MUST track the server-side
+// `qjs/version.zig` `JS_ENGINE_VERSION` of the same arenajs pin
+// (format-versioning-audit.md §4). A capture stamped with a different
+// version can't be faithfully replayed by this build until per-version
+// engine fetch ships (Phase 3); we surface a clear error instead of
+// replaying on the wrong interpreter. Bump in lockstep with the Zig
+// constant when the WASM is rebuilt from a semantics-affecting pin.
+const REPLAY_ENGINE_VERSION = 1;
+
 // ── DOM refs (lookup once at module load) ────────────────────────────
 const $ = {
     crumb:           document.getElementById("appbar-crumb"),
@@ -1241,6 +1251,21 @@ async function main() {
     // `new Date()` reproduce the original request's sequences.
     const seed = bundle.seed != null ? BigInt(bundle.seed) : 0n;
     const timestamp_ns = bundle.timestamp_ns != null ? BigInt(bundle.timestamp_ns) : 0n;
+
+    // The JS engine version that produced the captured request
+    // (format-versioning-audit.md §4). Today there is exactly one engine, so
+    // the bundled WASM always matches and selection is a no-op — we only read
+    // it to surface a clear error if a future capture demands an engine this
+    // build doesn't ship. When we publish per-version engines (Phase 3), this
+    // is where the driver fetches `qjs_wasm_{version}.wasm` instead.
+    const captureEngine = bundle.js_engine_version ?? 0;
+    if (captureEngine !== 0 && captureEngine !== REPLAY_ENGINE_VERSION) {
+        renderError(new Error(
+            `this capture ran on JS engine v${captureEngine}, but this replayer ` +
+            `bundles engine v${REPLAY_ENGINE_VERSION}; per-version engine fetch ` +
+            `is not shipped yet (format-versioning-audit.md §4 Phase 3)`));
+        return;
+    }
 
     let mat;
     try {

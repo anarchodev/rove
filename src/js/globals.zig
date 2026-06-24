@@ -2358,7 +2358,12 @@ pub fn installRequest(
     // means the null branch is rare in production handler code.
     if (state.session_id) |sid| {
         const session_obj = c.JS_NewObject(ctx);
-        _ = c.JS_SetPropertyStr(ctx, session_obj, "id", c.JS_NewStringLen(ctx, &sid, sid.len));
+        // Customer-visible: opaque `sess_<64hex>` form (§7.5). The cookie
+        // / internal store keep the bare hex.
+        var sid_buf: [log_mod.SESSION_ID_PREFIX.len + 64]u8 = undefined;
+        @memcpy(sid_buf[0..log_mod.SESSION_ID_PREFIX.len], log_mod.SESSION_ID_PREFIX);
+        @memcpy(sid_buf[log_mod.SESSION_ID_PREFIX.len..], &sid);
+        _ = c.JS_SetPropertyStr(ctx, session_obj, "id", c.JS_NewStringLen(ctx, &sid_buf, sid_buf.len));
         _ = c.JS_SetPropertyStr(ctx, req_obj, "session", session_obj);
     } else {
         _ = c.JS_SetPropertyStr(ctx, req_obj, "session", js_null);
@@ -2480,7 +2485,13 @@ pub fn installRequest(
     if (request.activation == .fetch_chunk) {
         const fc = request.activation.fetch_chunk;
         if (fc.id) |fid| {
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "fetch_id", c.JS_NewStringLen(ctx, fid.ptr, fid.len));
+            // Customer-visible: opaque `ftch_<hex>` form (§7.5). The
+            // msg-router key / S3 upload key keep the bare hex.
+            var fid_buf: [log_mod.FETCH_ID_PREFIX.len + 64]u8 = undefined;
+            @memcpy(fid_buf[0..log_mod.FETCH_ID_PREFIX.len], log_mod.FETCH_ID_PREFIX);
+            @memcpy(fid_buf[log_mod.FETCH_ID_PREFIX.len..][0..fid.len], fid);
+            const fid_str = fid_buf[0 .. log_mod.FETCH_ID_PREFIX.len + fid.len];
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "fetch_id", c.JS_NewStringLen(ctx, fid_str.ptr, fid_str.len));
         }
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "seq", c.JS_NewInt64(ctx, @intCast(fc.seq)));
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "byteOffset", c.JS_NewInt64(ctx, @intCast(fc.byte_offset)));

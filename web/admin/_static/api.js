@@ -373,7 +373,9 @@ export const api = {
     let entrySource = "";
     let sourcesUnavailable = false;
     try {
-      const depHex = (record.deployment_id ?? 0).toString(16);
+      // record.deployment_id is the opaque `dep_<16hex>` token (§7.5);
+      // the read door is keyed by the bare hex, so strip the prefix.
+      const depHex = String(record.deployment_id ?? "").replace(/^dep_/, "");
       const sr = await this.readSources(instance_id, depHex);
       const handlers = (sr.entries || [])
         .filter((e) => e.kind === "handler" && e.source != null);
@@ -393,6 +395,12 @@ export const api = {
     const seed = tapesField.seed != null ? BigInt(tapesField.seed) : 0n;
     const timestamp_ns = tapesField.timestamp_ns != null
       ? BigInt(tapesField.timestamp_ns) : 0n;
+    // The JS engine version that ran the captured request
+    // (format-versioning-audit.md §4). The replay driver will use this to
+    // fetch the matching engine WASM once we ship more than one engine; a
+    // no-op today (one engine), but threaded now so old captures stay
+    // attributable. 0 = unknown (pre-stamp / non-handler record).
+    const js_engine_version = tapesField.js_engine_version ?? 0;
     const bodyBytes = decodeB64(tapesField.request_body_b64);
 
     return {
@@ -418,6 +426,7 @@ export const api = {
       modules,
       seed,
       timestamp_ns,
+      js_engine_version,
       tape_blobs: tapeBlobs,
       activation: record.activation,
       sources_unavailable: sourcesUnavailable,

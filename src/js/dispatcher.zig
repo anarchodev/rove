@@ -35,6 +35,14 @@ const stream_mod = @import("bindings/stream.zig");
 const components_mod = @import("components.zig");
 const c = qjs.c;
 
+/// The JS engine version every `Dispatcher`'s snapshot embodies
+/// (`qjs/version.zig`). Re-exported here so dispatch/drain code stamps
+/// one canonical constant into each request's readset
+/// (`docs/format-versioning-audit.md` §4) without each file importing
+/// `rove-qjs` directly. One engine per binary, so this equals every
+/// live `Dispatcher.snapshot.version`.
+pub const JS_ENGINE_VERSION = qjs.JS_ENGINE_VERSION;
+
 pub const DispatchError = error{
     JsException,
     /// A `kv.*` call raised an error that wasn't a plain NotFound. The
@@ -1205,7 +1213,8 @@ test "dispatch: request.session.id surfaces resolved sid" {
     );
     defer resp.deinit(testing.allocator);
 
-    try testing.expectEqualStrings(&known, resp.body);
+    // Customer-visible: the opaque `sess_<64hex>` prefixed form (§7.5).
+    try testing.expectEqualStrings("sess_" ++ known, resp.body);
 }
 
 test "dispatch: request.session is null when no sid resolved" {

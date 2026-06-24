@@ -26,6 +26,7 @@ const tenant_mod = @import("rove-tenant");
 const qjs = @import("rove-qjs");
 const log_server = @import("rove-log-server");
 const files_mod = @import("rove-files");
+const version_registry = @import("version.zig");
 
 const Bridge = bridge_mod.Bridge;
 const Worker = rjs.Worker(.{});
@@ -536,7 +537,20 @@ pub fn main() !void {
 
     var arg_it = std.process.args();
     _ = arg_it.next(); // argv[0]
-    const data_dir = arg_it.next() orelse "/tmp/rewind-data";
+    const first_arg = arg_it.next();
+    // `rewind --version` dumps the format-version registry and exits
+    // (`docs/format-versioning-audit.md` §3.8). Done before any data-dir
+    // / port handling so it works with no environment set up.
+    if (first_arg) |a| {
+        if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "version")) {
+            var stdout_buf: [4096]u8 = undefined;
+            var sw = std.fs.File.stdout().writer(&stdout_buf);
+            try version_registry.dump(&sw.interface);
+            try sw.interface.flush();
+            return;
+        }
+    }
+    const data_dir = first_arg orelse "/tmp/rewind-data";
     const port_str = arg_it.next() orelse "8080";
     const port = try std.fmt.parseInt(u16, port_str, 10);
 
