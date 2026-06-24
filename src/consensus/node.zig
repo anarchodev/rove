@@ -978,7 +978,24 @@ pub const Node = struct {
             raft.GroupedFileStorage.initRecover(self.allocator, self.voters, self.wal, tenant_id) catch return Error.Io
         else
             raft.GroupedFileStorage.initWithLearners(self.allocator, voters_slice, learners_slice, self.wal, tenant_id) catch return Error.Io;
-        errdefer gfs.deinit();
+        // Ownership of `gfs` once it is handed to `createGroupEpoch` below. A bare
+        // `errdefer gfs.deinit()` here was a DOUBLE-FREE — the SIGABRT (GP fault in
+        // raft-rs storage deinit iterating already-freed entries):
+        //   • SUCCESS — the manager owns `gfs` and frees it on `destroyGroup`; a
+        //     plain errdefer would free it AGAIN on any later failure here.
+        //   • FAILURE — `createGroupEpoch` failing for THIS caller means raft-rs's
+        //     `RawNode::new` REJECTED the config (the FFI returns -3). The Rust side
+        //     has ALREADY taken `gfs` into an `FfiStorage` whose `Drop` calls the
+        //     `destroy` vtable — so the FFI freed it; a Zig-side deinit double-frees.
+        //     (The FFI's other failure returns, where it does NOT free — group
+        //     exists / tombstoned / null args — are all pre-empted by the Zig
+        //     guards above: the `self.groups`/`GroupExists` check, `clearTombstone`,
+        //     and a non-zero `self.node_id`. So a failure HERE is only ever the
+        //     RawNode rejection, which freed.)
+        // Either way the manager owns `gfs` from the call onward, so arm the deinit
+        // ONLY for failures BEFORE the handoff (the slot/id_dup allocs below).
+        var gfs_owned_by_mgr = false;
+        errdefer if (!gfs_owned_by_mgr) gfs.deinit();
 
         const slot = self.allocator.create(TenantSlot) catch return Error.OutOfMemory;
         errdefer self.allocator.destroy(slot);
@@ -993,6 +1010,11 @@ pub const Node = struct {
             .durabilized_idx = durable_idx,
         };
 
+        // Hand `gfs` to the manager. Disarm the local deinit FIRST: from this call
+        // onward the FFI owns `gfs` on BOTH outcomes (success → freed on
+        // `destroyGroup`; RawNode rejection → freed by `FfiStorage::drop`), so the
+        // local errdefer must never free it again.
+        gfs_owned_by_mgr = true;
         try self.mgr.createGroupEpoch(
             tenant_id,
             self.node_id,
@@ -1001,8 +1023,8 @@ pub const Node = struct {
             gfs,
             &group_raft_config,
         );
-        // After createGroupEpoch succeeds the manager owns `gfs`; cancel
-        // the local errdefer so a later failure here doesn't double-free.
+        // Success: a later failure below rolls the group back through the manager
+        // (which frees gfs) — a single free, no double-free.
         errdefer self.mgr.destroyGroup(tenant_id) catch {};
 
         self.groups.put(self.allocator, tenant_id, slot) catch return Error.OutOfMemory;
@@ -2117,6 +2139,37 @@ test "Phase 1 exit: propose a writeset, it commits + applies, a read sees it" {
     const got2 = try node.get(tenant, "count");
     defer a.free(got2);
     try testing.expectEqualStrings("1", got2);
+}
+
+test "createGroupAtEpoch: a RawNode-rejected config errors cleanly (no gfs double-free)" {
+    // Regression for the genesis SIGABRT. A born-{self} group attached as a
+    // LEARNER splits self out of the voter set → ConfState{voters:[], learners:
+    // [self]}, which raft-rs's RawNode::new REJECTS (no voters → no quorum). The
+    // FFI returns -3 AFTER taking the storage into an FfiStorage whose Drop frees
+    // it via the destroy vtable (raft-rs-zig manager.zig documents + tests this).
+    // createGroupCore must NOT also free gfs — a bare `errdefer gfs.deinit()`
+    // double-freed it (the GP fault in raft-rs storage deinit). Assert a clean
+    // error, and that the node survives to form a normal group afterwards.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(dir);
+
+    const node = try Node.initSingleNode(a, dir);
+    defer node.deinit();
+
+    // voters_override={1} + as_learner=true → self(1) split out → voters=[], learners=[1].
+    const voters = [_]u64{1};
+    try testing.expectError(Error.CreateGroupFailed, node.createGroupAtEpoch(99, "x", 1, true, &voters));
+
+    // No double-free crash, no leak, and the node is still usable: a normal
+    // single-node group still forms + commits.
+    var ws = WriteSet.init(a);
+    defer ws.deinit();
+    try ws.addPut("k", "v");
+    const applied = try node.proposeWriteSet(7, "ok", &ws);
+    try testing.expect(applied > 0);
 }
 
 test "durabilize: the pump checkpoints the store + stamps the raft watermark" {
