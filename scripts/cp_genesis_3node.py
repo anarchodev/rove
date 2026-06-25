@@ -38,7 +38,12 @@ from v2_topology import spawn_cp  # noqa: E402
 
 HTTP = [19090, 19091, 19092]
 RAFT = [19101, 19102, 19103]
-PEERS = ",".join(f"127.0.0.1:{p}" for p in RAFT)
+# Raft-transport bind IP per node. Default all-loopback (same-IP, distinct port).
+# Set CP_RAFT_HOSTS=127.0.0.1,127.0.0.2,127.0.0.3 to bind DISTINCT IPs — exercises
+# the connect-to-a-specific-peer-IP path that same-IP loopback short-circuits (one
+# cross-host failure class). HTTP stays on 127.0.0.1:<port> for polling.
+RAFT_HOSTS = os.environ.get("CP_RAFT_HOSTS", "127.0.0.1,127.0.0.1,127.0.0.1").split(",")
+PEERS = ",".join(f"{RAFT_HOSTS[i]}:{RAFT[i]}" for i in range(3))
 PEER_URLS = ",".join(f"http://127.0.0.1:{p}" for p in HTTP)
 CLUSTERS = "cluster-1=" + ",".join(f"http://127.0.0.1:{18300 + i}" for i in range(3))
 
