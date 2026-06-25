@@ -208,6 +208,188 @@ fn cmdBootstrap(a: std.mem.Allocator, env: *const c.Env) void {
     std.debug.print("bootstrap complete — deploy capability live; publish with `rewind-ops deploy`\n", .{});
 }
 
+// ── genesis: cold bring-up of a virgin cluster (CP-driven bootstrap-1-grow) ──
+
+const GenNode = struct {
+    id: u64,
+    raft_addr: []const u8,
+    cp_raft_addr: []const u8 = "",
+    http_url: []const u8 = "",
+};
+
+/// Parse `ROVE_GENESIS_NODES` — `id=raft_addr[,cp_raft_addr[,http_url]]`,
+/// `;`-separated, one per node. `raft_addr` is the worker raft transport addr;
+/// `cp_raft_addr` the CP directory-group transport addr; `http_url` the worker
+/// HTTP origin. cp_raft/http are optional but recommended (the reconciler carries
+/// raft_addr on conf-changes; http_url feeds out-of-band catch-up).
+fn parseGenesisNodes(a: std.mem.Allocator, spec: []const u8) []GenNode {
+    var list = std.ArrayList(GenNode){};
+    var it = std.mem.tokenizeScalar(u8, spec, ';');
+    while (it.next()) |raw| {
+        const entry = std.mem.trim(u8, raw, " \t");
+        if (entry.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse
+            fatal("bad ROVE_GENESIS_NODES entry '{s}' (want id=raft_addr[,cp_raft[,http]])", .{entry});
+        const id = std.fmt.parseInt(u64, std.mem.trim(u8, entry[0..eq], " \t"), 10) catch
+            fatal("bad node id in '{s}'", .{entry});
+        var f = std.mem.tokenizeScalar(u8, entry[eq + 1 ..], ',');
+        const raft = f.next() orelse fatal("node {d}: missing raft_addr", .{id});
+        const cp_raft = f.next() orelse "";
+        const http = f.next() orelse "";
+        list.append(a, .{
+            .id = id,
+            .raft_addr = std.mem.trim(u8, raft, " \t"),
+            .cp_raft_addr = std.mem.trim(u8, cp_raft, " \t"),
+            .http_url = std.mem.trim(u8, http, " \t"),
+        }) catch oom();
+    }
+    if (list.items.len == 0) fatal("ROVE_GENESIS_NODES is empty", .{});
+    return list.items;
+}
+
+/// POST /_control/node-address {cluster,id,raft_addr,cp_raft_addr?,http_url?},
+/// retrying — this ALSO gates on the CP directory group having elected a leader
+/// (the write only commits on the leader), so it is the cluster's first
+/// liveness checkpoint in a cold bring-up.
+fn registerNodeAddr(a: std.mem.Allocator, env: *const c.Env, cluster: []const u8, n: GenNode) void {
+    var body = std.ArrayList(u8){};
+    body.appendSlice(a, "{\"cluster\":") catch oom();
+    c.writeJsonString(&body, a, cluster);
+    body.appendSlice(a, std.fmt.allocPrint(a, ",\"id\":{d},\"raft_addr\":", .{n.id}) catch oom()) catch oom();
+    c.writeJsonString(&body, a, n.raft_addr);
+    if (n.cp_raft_addr.len > 0) {
+        body.appendSlice(a, ",\"cp_raft_addr\":") catch oom();
+        c.writeJsonString(&body, a, n.cp_raft_addr);
+    }
+    if (n.http_url.len > 0) {
+        body.appendSlice(a, ",\"http_url\":") catch oom();
+        c.writeJsonString(&body, a, n.http_url);
+    }
+    body.append(a, '}') catch oom();
+
+    var attempt: u32 = 0;
+    while (attempt < 60) : (attempt += 1) {
+        const r = c.cpPost(a, env, "/_control/node-address", body.items, 15);
+        if (r.code == 204) {
+            std.debug.print("  node {d} → {s} registered\n", .{ n.id, n.raft_addr });
+            return;
+        }
+        std.debug.print("  node {d} register: {d} {s} (CP leader settling, retrying)\n", .{ n.id, r.code, c.trunc(r.body) });
+        std.Thread.sleep(2 * std.time.ns_per_s);
+    }
+    fatal("node {d} address registration failed — CP directory group has no leader? (check rewind-cp logs)", .{n.id});
+}
+
+/// POST /_control/provision, retrying (a fresh born-{self} attach can transiently
+/// 5xx while the cluster settles). 204 = placed, 409 = already placed (idempotent).
+fn provisionRetry(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, cluster: []const u8, host: ?[]const u8) void {
+    var body = std.ArrayList(u8){};
+    body.appendSlice(a, "{\"tenant\":") catch oom();
+    c.writeJsonString(&body, a, tenant);
+    body.appendSlice(a, ",\"cluster\":") catch oom();
+    c.writeJsonString(&body, a, cluster);
+    if (host) |h| {
+        body.appendSlice(a, ",\"host\":") catch oom();
+        c.writeJsonString(&body, a, h);
+    }
+    body.append(a, '}') catch oom();
+    var attempt: u32 = 0;
+    while (attempt < 30) : (attempt += 1) {
+        const r = c.cpPost(a, env, "/_control/provision", body.items, 60);
+        switch (r.code) {
+            204 => {
+                std.debug.print("  provisioned {s} on {s}\n", .{ tenant, cluster });
+                return;
+            },
+            409 => {
+                std.debug.print("  {s} already placed (409, ok)\n", .{tenant});
+                return;
+            },
+            else => std.debug.print("  provision {s}: {d} {s} (retrying)\n", .{ tenant, r.code, c.trunc(r.body) }),
+        }
+        std.Thread.sleep(2 * std.time.ns_per_s);
+    }
+    fatal("provision {s} failed after retries", .{tenant});
+}
+
+/// Count elements in a compact-JSON `"key":[…]` array (the worker emits no
+/// spaces). Returns 0 for an absent or empty array.
+fn countJsonArray(body: []const u8, key: []const u8) usize {
+    const needle = std.fmt.allocPrint(std.heap.page_allocator, "\"{s}\":[", .{key}) catch return 0;
+    defer std.heap.page_allocator.free(needle);
+    const start = std.mem.indexOf(u8, body, needle) orelse return 0;
+    const arr = body[start + needle.len ..];
+    const end = std.mem.indexOfScalar(u8, arr, ']') orelse return 0;
+    const inner = std.mem.trim(u8, arr[0..end], " ");
+    if (inner.len == 0) return 0;
+    var n: usize = 1;
+    for (inner) |ch| {
+        if (ch == ',') n += 1;
+    }
+    return n;
+}
+
+/// Poll the workers' leader-gated `/_system/v2-member-status?tenant=` (move-secret)
+/// until the group reports `want` voters — i.e. the CP reconciler finished growing
+/// the born-{self} group to the full node set. Followers 409/421; the leader 200s.
+fn waitVoters(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, want: usize, timeout_s: i64) void {
+    const ms = env.require("REWIND_MOVE_SECRET");
+    const headers = [_]Header{.{ .name = "X-Rewind-Move-Secret", .value = ms }};
+    const path = std.fmt.allocPrint(a, "/_system/v2-member-status?tenant={s}", .{tenant}) catch oom();
+    const deadline = std.time.timestamp() + timeout_s;
+    var last: usize = 0;
+    while (std.time.timestamp() < deadline) {
+        for (c.workerUrls(env, a)) |w| {
+            const url = std.fmt.allocPrint(a, "{s}{s}", .{ w, path }) catch oom();
+            const r = c.call(a, env, "GET", url, &headers, null, 10);
+            if (r.code == 200) {
+                const v = countJsonArray(r.body, "voters");
+                if (v != last) {
+                    std.debug.print("  {s}: voters={d}/{d}\n", .{ tenant, v, want });
+                    last = v;
+                }
+                if (v >= want) {
+                    std.debug.print("  {s} converged to {d} voters ✓\n", .{ tenant, want });
+                    return;
+                }
+            }
+        }
+        std.Thread.sleep(2 * std.time.ns_per_s);
+    }
+    fatal("{s} did not grow to {d} voters within {d}s — check the CP reconciler (REWIND_CP_RECONCILE_MEMBERSHIP=1?)", .{ tenant, want, timeout_s });
+}
+
+/// Cold bring-up of a virgin cluster via the tested bootstrap-1-grow path.
+/// Assumes the binaries are already launched in GENESIS-mode env (workers
+/// self-only — REWIND_NODE_ID+REWIND_RAFT_ADDR, no REWIND_VOTERS/PEERS; CP with
+/// REWIND_CP_RECONCILE_MEMBERSHIP=1). This drives the operator-side sequence:
+///   1. register every node's transport address (gates on the CP directory leader),
+///   2. provision __admin__ (births sole voter {1} on node 1, auto-leads),
+///   3. wait for the reconciler to grow it to all N voters,
+///   4. deploy the baked __admin__ app (reset) → deploy-capable.
+fn cmdGenesis(a: std.mem.Allocator, env: *const c.Env, cluster: []const u8) void {
+    const spec = env.get("ROVE_GENESIS_NODES") orelse
+        fatal("genesis needs ROVE_GENESIS_NODES (\"id=raft_addr[,cp_raft[,http]];…\")", .{});
+    const nodes = parseGenesisNodes(a, spec);
+    std.debug.print("genesis: cold bring-up of {d}-node cluster '{s}'\n", .{ nodes.len, cluster });
+
+    std.debug.print("[1/4] register node addresses (also waits for the CP directory leader)\n", .{});
+    for (nodes) |n| registerNodeAddr(a, env, cluster, n);
+
+    std.debug.print("[2/4] provision __admin__ (births {{1}} on node 1; reconciler grows it)\n", .{});
+    provisionRetry(a, env, "__admin__", cluster, env.require("REWIND_ADMIN_DOMAIN"));
+
+    std.debug.print("[3/4] wait for __admin__ to grow to {d} voters\n", .{nodes.len});
+    waitVoters(a, env, "__admin__", nodes.len, 120);
+
+    std.debug.print("[4/4] deploy the baked __admin__ app (reset)\n", .{});
+    _ = cmdReset(a, env);
+
+    std.debug.print("\ngenesis complete — {d}-node cluster '{s}' is up and deploy-capable.\n", .{ nodes.len, cluster });
+    std.debug.print("  next: provision tenants (`rewind-ops provision <t> --host <h>`) +\n", .{});
+    std.debug.print("        publish bundles (`rewind-ops deploy <t> <bundle> --release`).\n", .{});
+}
+
 /// POST /_control/move {tenant, cluster}. Guarded by --yes (the riskiest verb —
 /// it repoints live routing). The move is zero-downtime (the source serves
 /// throughout); a large tenant can take a while to stream, hence the long CP
@@ -293,7 +475,9 @@ const usage =
     \\rewind-ops — platform/operator CLI (docs/rewind-cli-plan.md)
     \\
     \\usage:
-    \\  rewind-ops bootstrap                          provision __admin__ + reset (virgin cluster)
+    \\  rewind-ops genesis [--cluster C]              cold bring-up from empty (needs ROVE_GENESIS_NODES)
+    \\  rewind-ops node-addr <cluster> <id> <raft_addr> [cp_raft_addr] [http_url]   register a node's transport address
+    \\  rewind-ops bootstrap                          provision __admin__ + reset (cluster already up)
     \\  rewind-ops reset                              (re)deploy the baked __admin__ deploy app
     \\  rewind-ops deploy <tenant> <bundle> [--release]   publish a bundle through the app
     \\  rewind-ops release <tenant> <dep_id_hex>      flip _deploy/current live
@@ -373,6 +557,18 @@ pub fn main() void {
         _ = cmdReset(a, &env);
     } else if (std.mem.eql(u8, cmd, "bootstrap")) {
         cmdBootstrap(a, &env);
+    } else if (std.mem.eql(u8, cmd, "genesis")) {
+        const cluster = flags.cluster orelse env.get("ROVE_CLUSTER") orelse "prod";
+        cmdGenesis(a, &env, cluster);
+    } else if (std.mem.eql(u8, cmd, "node-addr")) {
+        if (p.len < 3) fatal("node-addr needs <cluster> <id> <raft_addr> [cp_raft_addr] [http_url]", .{});
+        const id = std.fmt.parseInt(u64, p[1], 10) catch fatal("node-addr: bad id '{s}'", .{p[1]});
+        registerNodeAddr(a, &env, p[0], .{
+            .id = id,
+            .raft_addr = p[2],
+            .cp_raft_addr = if (p.len >= 4) p[3] else "",
+            .http_url = if (p.len >= 5) p[4] else "",
+        });
     } else if (std.mem.eql(u8, cmd, "deploy")) {
         if (p.len < 2) fatal("deploy needs <tenant> <bundle>", .{});
         cmdDeploy(a, &env, p[0], p[1], flags.release);
