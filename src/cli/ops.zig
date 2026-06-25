@@ -232,8 +232,12 @@ fn parseGenesisNodes(a: std.mem.Allocator, spec: []const u8) []GenNode {
             fatal("bad ROVE_GENESIS_NODES entry '{s}' (want id=raft_addr[,cp_raft[,http]])", .{entry});
         const id = std.fmt.parseInt(u64, std.mem.trim(u8, entry[0..eq], " \t"), 10) catch
             fatal("bad node id in '{s}'", .{entry});
-        var f = std.mem.tokenizeScalar(u8, entry[eq + 1 ..], ',');
-        const raft = f.next() orelse fatal("node {d}: missing raft_addr", .{id});
+        // splitScalar (NOT tokenizeScalar): the fields are POSITIONAL
+        // (raft, cp_raft, http), so an empty middle — `id=raft,,http`, giving an
+        // http_url without a cp_raft_addr — must keep its slot, not collapse.
+        var f = std.mem.splitScalar(u8, entry[eq + 1 ..], ',');
+        const raft = f.next() orelse "";
+        if (std.mem.trim(u8, raft, " \t").len == 0) fatal("node {d}: missing raft_addr", .{id});
         const cp_raft = f.next() orelse "";
         const http = f.next() orelse "";
         list.append(a, .{

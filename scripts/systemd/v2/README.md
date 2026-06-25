@@ -31,10 +31,13 @@ install -D -m0755 zig-out/bin/rewind-cp    ~/.local/bin/rewind-cp
 install -D -m0755 zig-out/bin/rewind-front ~/.local/bin/rewind-front
 
 # 2. env (secrets — chmod 0600; NOT pushed by deploy.sh)
-install -D -m0600 scripts/systemd/v2/common.env.example ~/.config/rove/common.env
-install -D -m0600 scripts/systemd/v2/node.env.example   ~/.config/rove/node.env
+#    Pick the profile — see "Genesis vs rolling" below:
+#      from EMPTY (new / torn-down cluster) → the *.genesis.example pair
+#      onto a RUNNING cluster               → the plain *.example pair
+install -D -m0600 scripts/systemd/v2/common.env.genesis.example ~/.config/rove/common.env
+install -D -m0600 scripts/systemd/v2/node.env.genesis.example   ~/.config/rove/node.env
 $EDITOR ~/.config/rove/common.env   # S3 creds, secrets, topology, suffixes
-$EDITOR ~/.config/rove/node.env     # this host's REWIND_NODE_ID / REWIND_CP_NODE_ID
+$EDITOR ~/.config/rove/node.env     # this host's REWIND_NODE_ID / _CP_NODE_ID / _RAFT_ADDR
 
 # 3. units
 install -D -m0644 scripts/systemd/v2/rewind-cp.service     ~/.config/systemd/user/rewind-cp.service
@@ -79,12 +82,55 @@ closed; this step opens them peer-to-peer.
    nftables peer rule is the **sole** security boundary for these ports
    (no app-layer auth — deploy plan §2.5).
 
-## Ongoing deploys
+## Genesis vs rolling: two modes, two env profiles
+
+A cluster is brought up **once from empty** (genesis), then **upgraded in place**
+(rolling). They use different worker env, and mixing them up is unsafe — so each
+has its own `*.example`:
+
+| | Genesis (from empty) | Rolling (running cluster) |
+|---|---|---|
+| Env | `common.env.genesis.example` + `node.env.genesis.example` | `common.env.example` + `node.env.example` |
+| Worker membership | **self-only**: `REWIND_RAFT_ADDR`, no `REWIND_VOTERS`/`REWIND_PEERS` → groups born `{1}` and grown | static `REWIND_VOTERS`/`REWIND_PEERS` |
+| CP reconciler | `REWIND_CP_RECONCILE_MEMBERSHIP=1` (grows tenant groups) | off (or on as a healer) |
+| Driven by | `rewind-ops genesis` (below) | `scripts/deploy.sh` |
+
+The CP **directory** group is cold-multi static in *both* profiles
+(`REWIND_CP_VOTERS`/`_PEERS`) — a born-`{1,2,3}` group that elects on its own.
+The genesis profile is also steady-state-safe: tenant-group membership is durable
+in the raft WAL, so you do **not** have to swap back to the rolling env after the
+grow.
+
+### Cold genesis bring-up (from empty)
+
+1. Install **binaries** + the **`*.genesis.example`** env (steps 1–4 above) + units, on all 3 hosts.
+2. `systemctl --user start rewind-cp rewind-worker rewind-front` on all 3 — the
+   CP directory group elects (cold-multi); workers boot self-only and idle,
+   holding no tenant groups yet.
+3. From your workstation, run the operator command once (it registers node
+   addresses, provisions `__admin__` as born-`{1}`, waits for the reconciler to
+   grow it to 3 voters, and deploys the baked app):
+
+   ```bash
+   export ROVE_CP_URL_INTERNAL=http://10.0.0.1:9090
+   export ROVE_WORKER_URLS=http://10.0.0.1:8443,http://10.0.0.2:8443,http://10.0.0.3:8443
+   export ROVE_CLUSTER=prod
+   export ROVE_GENESIS_NODES='1=10.0.0.1:8501,10.0.0.1:9101,http://10.0.0.1:8443;2=10.0.0.2:8501,10.0.0.2:9101,http://10.0.0.2:8443;3=10.0.0.3:8501,10.0.0.3:9101,http://10.0.0.3:8443'
+   # REWIND_MOVE_SECRET / REWIND_ROOT_TOKEN / REWIND_ADMIN_DOMAIN from your operator env
+   rewind-ops genesis
+   ```
+
+   It is idempotent — safe to re-run if a step times out. Then provision +
+   publish the rest (`rewind-ops provision …`, `rewind-ops deploy … --release`).
+
+## Ongoing deploys (rolling)
 
 Use [`scripts/deploy.sh`](../../deploy.sh) from your workstation — it builds,
 runs the test gate, and does a quorum-safe rolling restart across all 3 nodes
 (one at a time, health-gated). It pushes **binaries only**; env/secrets are
-provisioned out-of-band by the steps above.
+provisioned out-of-band by the steps above. Use this only on a cluster that is
+already up (it assumes existing data + a leader); for a from-empty cluster use
+the genesis bring-up above.
 
 ## Notes
 
