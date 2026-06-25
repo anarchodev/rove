@@ -64,7 +64,11 @@ def main() -> int:
 
     procs = []
     try:
-        print(f"spawning 3 CP nodes (cold-multi, voters=1,2,3); logs in {log_dir}")
+        # CP_SPAWN_DELAY mimics the real-host ssh launch latency (~1s between
+        # node starts). A simultaneous start gives a full dial mesh; a staggered
+        # start may reproduce the cross-host single-connection-per-pair topology.
+        delay = float(os.environ.get("CP_SPAWN_DELAY", "0"))
+        print(f"spawning 3 CP nodes (cold-multi, voters=1,2,3, stagger={delay}s); logs in {log_dir}")
         for i in range(3):
             spawn_cp(
                 procs, HTTP[i],
@@ -74,6 +78,8 @@ def main() -> int:
                 node_id=i + 1, voters="1,2,3", peers=PEERS, peer_urls=PEER_URLS,
                 name=f"cp{i + 1}", wait=False, log_dir=log_dir,
             )
+            if delay > 0 and i < 2:
+                time.sleep(delay)
 
         # Poll for a directory-group leader.
         deadline = time.time() + 25.0

@@ -49,7 +49,7 @@ for i in 0 1 2; do
   PID[$i]=$($SSH "${H[$i]}" "
     set -a; . \$HOME/.config/rove/common.env 2>/dev/null; set +a
     rm -rf $DATA; mkdir -p $DATA
-    REWIND_CP_NODE_ID=$id REWIND_CP_VOTERS=1,2,3 REWIND_CP_PEERS=$PEERS REWIND_CP_PEER_URLS=$PEER_URLS REWIND_CP_DATA_DIR=$DATA REWIND_CLUSTERS='$CLUSTERS' REWIND_RAFT_TICK_MS=10 nohup $CPBIN 9090 >$DATA/cp.log 2>&1 &
+    REWIND_RAFT_NET_DEBUG=1 REWIND_CP_NODE_ID=$id REWIND_CP_VOTERS=1,2,3 REWIND_CP_PEERS=$PEERS REWIND_CP_PEER_URLS=$PEER_URLS REWIND_CP_DATA_DIR=$DATA REWIND_CLUSTERS='$CLUSTERS' REWIND_RAFT_TICK_MS=${TICK_MS:-10} nohup $CPBIN 9090 >$DATA/cp.log 2>&1 &
     echo \$!
   ")
   echo "  ${H[$i]} (id $id, ${IP[$i]}) → test CP pid ${PID[$i]}"
@@ -75,9 +75,18 @@ if [ -n "$leader" ]; then
 fi
 echo "WEDGED ✗ — no CP leader within 30s on the real hosts"
 echo "    This is the cross-host failure the loopback/distinct-IP runs could NOT catch."
-echo "    Fall back to single-CP-interim for the first bring-up; capture the cp.log tails:"
 for i in 0 1 2; do
-  echo "--- ${H[$i]} cp.log tail ---"
-  $SSH "${H[$i]}" "grep -iE 'leader|campaign|vote|elect|multi-node|listening|error|warn' $DATA/cp.log | tail -12" 2>/dev/null || true
+  echo "--- ${H[$i]} (node $((i+1)), ${IP[$i]}): ALL :9101 socket states (ESTAB/SYN-SENT/SYN-RECV) ---"
+  $SSH "${H[$i]}" "ss -tan 2>/dev/null | grep ':9101' || echo '  (none)'" 2>/dev/null || true
+  # The raft_net dial lifecycle (REWIND_RAFT_NET_DEBUG=1): DIAL / CONNECTED /
+  # connect FAILED / ACCEPT / IDENT / TEARDOWN. This tells us, per directed
+  # edge, which outbound dials this node attempted and whether they ever
+  # established — i.e. exactly which half of the mesh is missing and why
+  # (so_error / errno). A FULL mesh here with still-no-leader = an election
+  # bug, not transport; a missing edge = the dial that never completes.
+  echo "--- ${H[$i]} (node $((i+1))) raft_net dial trace ---"
+  $SSH "${H[$i]}" "grep -E 'DIAL|CONNECTED|FAILED|ACCEPT|IDENT|TEARDOWN' $DATA/cp.log 2>/dev/null | tail -40 || echo '  (none)'" 2>/dev/null || true
+  echo "--- ${H[$i]} (node $((i+1))) cp.log tail ---"
+  $SSH "${H[$i]}" "tail -20 $DATA/cp.log" 2>/dev/null || true
 done
 exit 1

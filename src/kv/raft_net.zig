@@ -28,6 +28,26 @@ pub const MAX_SEND_QUEUE: u32 = 1024;
 pub const RECONNECT_INITIAL_NS: i64 = 100 * std.time.ns_per_ms;
 pub const RECONNECT_MAX_NS: i64 = 5 * std.time.ns_per_s;
 
+// ── dial/connect/teardown tracing (env-gated, logging-only) ────────────
+//
+// The cross-host cold-multi genesis wedge presents as an INCOMPLETE outbound
+// mesh: a node logs as a follower forever because it never managed to dial
+// (and therefore can never `send` to — `send` only uses the outbound slot)
+// some of its peers. Loopback always forms the full mesh, so the failure is
+// invisible in-process; it only shows on the real NICs with real `connect()`
+// latency + the staggered ssh launch. This trace makes the dial lifecycle
+// (DIAL → CONNECTED/FAILED, ACCEPT, IDENT, TEARDOWN) observable on the real
+// nodes so we can see exactly which directed edges never establish and why
+// (errno). Gated on `REWIND_RAFT_NET_DEBUG` so it stays silent in prod (a
+// 3-peer genesis is low-volume, but a busy production node tears connections
+// down on every rolling restart). NOT a behavior change — pure observability,
+// so it does not re-litigate the reverted transport logic patch.
+var g_dbg: i8 = -1;
+fn dbgOn() bool {
+    if (g_dbg < 0) g_dbg = if (std.posix.getenv("REWIND_RAFT_NET_DEBUG") != null) 1 else 0;
+    return g_dbg == 1;
+}
+
 pub const PeerMode = enum {
     /// Counts toward raft quorum. Standard voting follower.
     voter,
@@ -454,8 +474,22 @@ pub const RaftNet = struct {
         // silently until a recv CQE that can never arrive. Idempotent: submitRecv
         // no-ops when a read is already pending, the fd is dead, or the buffer is
         // full — so this only ever heals a genuinely-stranded connection.
+        //
+        // CRITICAL: only re-arm on a peer that is actually `.connected`. A peer
+        // mid-dial is `.connecting` with `fd >= 0` (the connect's POLL.OUT is in
+        // flight) but the TCP handshake has NOT completed. On loopback `connect()`
+        // returns synchronously, so the socket is already usable; on a REAL NIC it
+        // returns EINPROGRESS and the socket sits in SYN_SENT — a recv on it
+        // completes as a CQE with `-EAGAIN`, which `handleRecv` (res <= 0) reads as
+        // a dropped connection and TEARS THE IN-FLIGHT CONNECT DOWN. The torn-down
+        // fd then mis-marks `.connected` in `handleConnect` (see the fd guard
+        // there), yielding a zombie peer that never sends and never redials — the
+        // cross-host cold-multi genesis wedge. `handleConnect` arms the recv itself
+        // the moment the connect succeeds, so gating on `.connected` here loses no
+        // healing and removes the race entirely. Accepted (inbound) slots are
+        // always `.accepted_slot` with a live fd, so they re-arm below unchanged.
         for (self.peers, 0..) |*p, i| {
-            if (p.fd >= 0) self.submitRecv(p, @intCast(i)) catch {};
+            if (p.fd >= 0 and p.state == .connected) self.submitRecv(p, @intCast(i)) catch {};
         }
         for (self.accepted.items, 0..) |p, ai| {
             if (p.fd >= 0)
@@ -557,6 +591,11 @@ pub const RaftNet = struct {
         peer.fd = fd;
         peer.state = .connecting;
 
+        if (dbgOn()) std.log.info(
+            "raft_net node{d}: DIAL → node{d} (peer_idx={d}) {f} fd={d}",
+            .{ self.node_id + 1, peer_idx + 1, peer_idx, addr, fd },
+        );
+
         // Wait for POLLOUT — socket becomes writable when connect finishes.
         const sqe = try self.ring.get_sqe();
         sqe.prep_poll_add(fd, linux.POLL.OUT);
@@ -627,7 +666,13 @@ pub const RaftNet = struct {
                 return;
             };
             const ai: u32 = @intCast(self.accepted.items.len - 1);
+            if (dbgOn()) std.log.info(
+                "raft_net node{d}: ACCEPT inbound conn (accepted_slot={d}) fd={d} — awaiting IDENT",
+                .{ self.node_id + 1, ai, afd },
+            );
             try self.submitRecv(slot, @as(u32, @intCast(self.peers.len)) + ai);
+        } else if (dbgOn()) {
+            std.log.info("raft_net node{d}: accept CQE error res={d}", .{ self.node_id + 1, res });
         }
 
         try self.submitAccept();
@@ -635,6 +680,22 @@ pub const RaftNet = struct {
 
     fn handleConnect(self: *RaftNet, idx: u32, res: i32, now_ns: i64) void {
         const peer = &self.peers[idx];
+
+        // The connect's POLL.OUT CQE can arrive AFTER the peer was already torn
+        // down (e.g. a recv/send CQE on the same fd completed with an error first
+        // and `peerTeardown` closed the fd, setting it to -1). Marking such a peer
+        // `.connected` would create a zombie: `send` sees `.connected` but
+        // `submitSend` no-ops on the dead fd, and the reconnect loop skips it
+        // (`state != .disconnected`) so it never redials — a silent permanent
+        // wedge. If the fd is gone, the connect is moot; leave the peer in whatever
+        // post-teardown state it holds (disconnected + backoff) and bail.
+        if (peer.fd < 0) {
+            if (dbgOn()) std.log.info(
+                "raft_net node{d}: stale connect CQE for node{d} (peer_idx={d}) — fd already torn down, ignoring",
+                .{ self.node_id + 1, idx + 1, idx },
+            );
+            return;
+        }
 
         // Check SO_ERROR to see if the connect actually succeeded.
         var err: c_int = 0;
@@ -648,9 +709,18 @@ pub const RaftNet = struct {
         );
 
         if (res < 0 or err != 0) {
+            if (dbgOn()) std.log.info(
+                "raft_net node{d}: connect FAILED → node{d} (peer_idx={d}) res={d} so_error={d}",
+                .{ self.node_id + 1, idx + 1, idx, res, err },
+            );
             peerTeardown(self, peer, now_ns, .outbound);
             return;
         }
+
+        if (dbgOn()) std.log.info(
+            "raft_net node{d}: CONNECTED → node{d} (peer_idx={d})",
+            .{ self.node_id + 1, idx + 1, idx },
+        );
 
         peer.state = .connected;
         peer.reconnect_at_ns = 0;
@@ -762,6 +832,10 @@ pub const RaftNet = struct {
                     if (sender < self.peers.len and sender != self.node_id) {
                         peer.identified_as = sender;
                         handled = true;
+                        if (dbgOn()) std.log.info(
+                            "raft_net node{d}: IDENT inbound conn (accepted_slot={d}) = node{d}",
+                            .{ self.node_id + 1, idx - @as(u32, @intCast(self.peers.len)), sender + 1 },
+                        );
                     } else {
                         // A node id not in this node's static peer set (e.g. a
                         // freshly added host before addPeer). We can't route its
@@ -815,6 +889,10 @@ pub const RaftNet = struct {
 const Kind = enum { outbound, inbound };
 
 fn peerTeardown(self: *RaftNet, peer: *Peer, now_ns: i64, kind: Kind) void {
+    if (dbgOn()) std.log.info(
+        "raft_net node{d}: TEARDOWN {s} conn (identified_as={d}) fd={d} state={s}",
+        .{ self.node_id + 1, @tagName(kind), peer.identified_as, peer.fd, @tagName(peer.state) },
+    );
     if (peer.fd >= 0) {
         posix.close(peer.fd);
         peer.fd = -1;
