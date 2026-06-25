@@ -42,17 +42,16 @@ done
 echo "=== launch test rewind-cp on each host (real ports, throwaway data) ==="
 for i in 0 1 2; do
   id=$((i + 1))
-  # Source the host's own common.env for S3 creds + REWIND_MOVE_SECRET, then
-  # override the per-node test config. nohup + echo $! returns the remote PID.
-  PID[$i]=$($SSH "${H[$i]}" bash -lc "'
+  # The remote command string: local vars ($DATA/$id/$PEERS/…) expand HERE;
+  # remote vars (\$HOME/\$!) are escaped to expand on the node. The node sources
+  # its own common.env for S3 creds + REWIND_MOVE_SECRET, then nohup's the test CP
+  # and echoes its PID (which $(...) captures).
+  PID[$i]=$($SSH "${H[$i]}" "
     set -a; . \$HOME/.config/rove/common.env 2>/dev/null; set +a
     rm -rf $DATA; mkdir -p $DATA
-    REWIND_CP_NODE_ID=$id REWIND_CP_VOTERS=1,2,3 \
-    REWIND_CP_PEERS=$PEERS REWIND_CP_PEER_URLS=$PEER_URLS \
-    REWIND_CP_DATA_DIR=$DATA REWIND_CLUSTERS=\"$CLUSTERS\" REWIND_RAFT_TICK_MS=10 \
-    nohup $CPBIN 9090 >$DATA/cp.log 2>&1 &
+    REWIND_CP_NODE_ID=$id REWIND_CP_VOTERS=1,2,3 REWIND_CP_PEERS=$PEERS REWIND_CP_PEER_URLS=$PEER_URLS REWIND_CP_DATA_DIR=$DATA REWIND_CLUSTERS='$CLUSTERS' REWIND_RAFT_TICK_MS=10 nohup $CPBIN 9090 >$DATA/cp.log 2>&1 &
     echo \$!
-  '")
+  ")
   echo "  ${H[$i]} (id $id, ${IP[$i]}) → test CP pid ${PID[$i]}"
 done
 
