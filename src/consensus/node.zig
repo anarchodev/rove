@@ -174,6 +174,14 @@ const group_raft_config: raft.manager.GroupConfig = blk: {
 /// with a short value so the hibernate/wake transitions are observable fast.
 pub const DEFAULT_HIBERNATE_NS: i64 = 2 * std.time.ns_per_s;
 
+/// Default leaderless-escalation window (see `Node.leaderless_escalate_ns`): a
+/// group active + leaderless for this long gets a forced (lease-bypassing,
+/// pre-vote-free) campaign. ~15× the ~10ms election timeout — long enough that a
+/// normal election (cold start, or peers whose leases expire on their own)
+/// completes first and never triggers it, short enough that a genuinely wedged
+/// hard-failover recovers in a fraction of a second rather than waiting on luck.
+pub const DEFAULT_LEADERLESS_ESCALATE_NS: i64 = 150 * std.time.ns_per_ms;
+
 /// Default durabilize cadence (V2 port of V1's `Cluster.tickSnapshot`
 /// interval): how often the pump folds each dirty tenant store's in-memory
 /// overlay into LMDB + stamps its raft watermark + (single-node) compacts the
@@ -423,6 +431,16 @@ pub const TenantSlot = struct {
     /// whose buffered writes await the next fsync's `onPersist` ack), so
     /// the pump enqueues it at most once per ack round.
     in_persist_ack: bool = false,
+    /// Wall-clock at which this group was first observed leaderless (this node
+    /// not the leader AND `leaderId == 0`) while in the active set; 0 while a
+    /// leader is known. `escalateLeaderless` arms it and, once the group has
+    /// stayed leaderless past `Node.leaderless_escalate_ns`, FORCE-campaigns
+    /// (`mgr.campaignForce`) — the TiKV wake-to-elect recovery for a hard
+    /// (SIGKILL) leader loss, where a hibernated survivor's normal pre-vote is
+    /// ignored by peers still inside their `check_quorum` lease. Reset to `now`
+    /// after each force so the escalation re-arms (a cooldown), and to 0 the
+    /// moment a leader appears.
+    leaderless_since_ns: i64 = 0,
     /// Borrowed `GroupedFileStorage` for this group — the Manager owns it (via
     /// the storage vtable) and frees it on `destroyGroup`, but we keep the
     /// pointer to drive WAL compaction (`gfs.compact`) without a Manager API.
@@ -599,6 +617,15 @@ pub const Node = struct {
     /// Hibernation idle window (Phase 6). Overridable per node (tests use a
     /// short value); production keeps `DEFAULT_HIBERNATE_NS`.
     hibernate_ns: i64 = DEFAULT_HIBERNATE_NS,
+    /// Leaderless-escalation window: how long an active group may stay
+    /// leaderless (this node not the leader AND `leaderId == 0`) before the pump
+    /// FORCE-campaigns it past peers' `check_quorum` leases (`escalateLeaderless`
+    /// → `mgr.campaignForce`). Comfortably above the election timeout
+    /// (`election_tick × tick_interval` ≈ 10ms) so the cheap normal pre-vote path
+    /// gets a few rounds first — the force-campaign is the BACKSTOP that makes a
+    /// hard (SIGKILL) failover deterministic instead of relying on the peers'
+    /// leases happening to expire in time. Tests override with a short value.
+    leaderless_escalate_ns: i64 = DEFAULT_LEADERLESS_ESCALATE_NS,
     /// Scratch for draining the transport's woke-group list each pump cycle
     /// (the gids that received a non-heartbeat message → `bumpActive`).
     /// Owned; reused to avoid per-cycle allocation.
@@ -1415,10 +1442,56 @@ pub const Node = struct {
                 _ = self.active.swapRemove(i);
                 continue;
             };
-            if (!slot.pinned and now > slot.active_until_ns) {
+            // Keep ticking a LEADERLESS group even past its idle deadline: a
+            // group with no known leader (this node not leading AND `leaderId`
+            // == 0 — e.g. a woken survivor mid-recovery) must keep running its
+            // election timer / escalation, else it would re-hibernate frozen
+            // before electing. A group with a live leader (leaderId != 0,
+            // including this node as leader) hibernates normally.
+            const leaderless = !self.mgr.isLeader(gid) and self.mgr.leaderId(gid) == 0;
+            if (!slot.pinned and !leaderless and now > slot.active_until_ns) {
                 slot.in_active = false;
                 _ = self.active.swapRemove(i);
             } else i += 1;
+        }
+    }
+
+    /// TiKV-style wake-to-elect (the hard-failover recovery): force-campaign any
+    /// ACTIVE group that has stayed leaderless past `leaderless_escalate_ns`.
+    ///
+    /// After a SIGKILL leader loss the surviving voters re-elect on their own
+    /// ONLY if their `check_quorum` leases happen to expire in time — a frozen,
+    /// just-woken survivor whose `election_elapsed` stalled below the timeout
+    /// keeps `leader_id` pointing at the dead leader and IGNORES the normal
+    /// (pre-)vote (raft's disruptive-server lease). A force-campaign
+    /// (`mgr.campaignForce` → `campaign(CAMPAIGN_TRANSFER)`) sends votes that
+    /// carry the transfer context, which receivers honour past their lease — so
+    /// recovery is deterministic instead of timing-dependent.
+    ///
+    /// Trigger: this node is not the leader AND `leaderId == 0` (genuinely
+    /// leaderless — a node mid-pre-vote is a `PreCandidate`, which raft sets to
+    /// `leader_id == INVALID_ID`, so this also catches the wedged re-pre-voting
+    /// case). A live leader (`leaderId != 0`) disarms it, so a healthy group is
+    /// never disrupted. Gated on the escalation window so a normal election
+    /// completes first; `campaignForce` itself is a safe no-op on a leader,
+    /// learner, or pending-conf-change group. Pump-thread only; O(active).
+    fn escalateLeaderless(self: *Node, now: i64) void {
+        for (self.active.items) |gid| {
+            const slot = self.groups.get(gid) orelse continue;
+            const leaderless = !self.mgr.isLeader(gid) and self.mgr.leaderId(gid) == 0;
+            if (!leaderless) {
+                slot.leaderless_since_ns = 0;
+                continue;
+            }
+            if (slot.leaderless_since_ns == 0) {
+                slot.leaderless_since_ns = now;
+            } else if (now - slot.leaderless_since_ns >= self.leaderless_escalate_ns) {
+                self.mgr.campaignForce(gid);
+                // Re-arm the window (cooldown) so the next escalation, if the
+                // forced campaign also loses (split vote), waits another window
+                // rather than force-campaigning every cycle.
+                slot.leaderless_since_ns = now;
+            }
         }
     }
 
@@ -1629,8 +1702,14 @@ pub const Node = struct {
             for (self.woke_scratch.items) |gid| self.bumpActive(gid) catch {};
         }
 
-        // Hibernate: stop ticking any group idle past its deadline.
+        // Hibernate: stop ticking any group idle past its deadline (but keep a
+        // leaderless group ticking so it can recover — see `sweepHibernated`).
         self.sweepHibernated(now);
+
+        // Wake-to-elect: force-campaign any group wedged leaderless past the
+        // escalation window, bypassing peers' check_quorum leases (TiKV-style
+        // hard-failover recovery — see `escalateLeaderless`).
+        self.escalateLeaderless(now);
 
         // Leader-side auto-demote: drop a far-behind, presumed-dead voter to a
         // learner so it stops pinning the WAL-compaction floor. Before the

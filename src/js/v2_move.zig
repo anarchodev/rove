@@ -217,6 +217,13 @@ fn handleKv(
             return reply(server, allocator, ent, sid, sess, 400, "missing ?key\n");
         const inst = (worker.node.tenant.getInstance(tenant) catch null) orelse
             return reply(server, allocator, ent, sid, sess, 404, "unknown tenant\n");
+        // A read means the tenant is in use: nudge its raft group awake. The
+        // read itself is served locally (no leader needed), but if the group
+        // has hibernated and its leader died, nothing else would re-tick it —
+        // so a survivor that only ever sees reads would never re-elect. Wake +
+        // the pump's leaderless escalation recover it. No-op when the group
+        // isn't on this node or is already active.
+        if (worker.raft.gidForTenant(tenant)) |gid| worker.raft.requestWake(gid);
         const val = inst.kv.get(key) catch |err| switch (err) {
             error.NotFound => return reply(server, allocator, ent, sid, sess, 404, "no such key\n"),
             else => return reply(server, allocator, ent, sid, sess, 500, "kv get failed\n"),

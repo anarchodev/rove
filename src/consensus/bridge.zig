@@ -2205,6 +2205,11 @@ test "bridge: a hibernated group whose leader died re-elects on a requestWake nu
             // Short hibernate window: long enough to elect, short enough to
             // idle past within the test.
             bridges[i].node.hibernate_ns = 150 * std.time.ns_per_ms;
+            // Short leaderless-escalation window so the wake-to-elect
+            // force-campaign (`escalateLeaderless` → `mgr.campaignForce`) drives
+            // recovery deterministically, instead of relying on the survivors'
+            // check_quorum leases happening to expire in time.
+            bridges[i].node.leaderless_escalate_ns = 30 * std.time.ns_per_ms;
             alive[i] = true;
         }
         if (ok) break;
