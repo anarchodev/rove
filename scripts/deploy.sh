@@ -1,27 +1,49 @@
 #!/usr/bin/env bash
 #
-# deploy.sh — rolling zero-downtime deploy of the V2 stack to the 3-node
-# production cluster. See docs/v2-production-deploy-plan.md §6.
+# deploy.sh — deploy the V2 stack to the 3-node production cluster. Two modes
+# (docs/v2-production-deploy-plan.md §6):
 #
-# What it does:
-#   1. Builds the 3 V2 binaries (ReleaseFast) and runs the test gate.
-#   2. For each host, one at a time: pushes binaries, restarts cp →
-#      worker → front, waits for health, lets the node settle (raft
-#      rejoin) before moving on. Each raft cluster tolerates 1 node down,
-#      so one-at-a-time keeps quorum the whole way.
+#   ROLLING (default) — zero-downtime update of an ALREADY-FORMED cluster.
+#     One host at a time: push binaries, restart cp → worker → front, wait for
+#     health, settle (raft rejoin) before the next. Each raft cluster tolerates
+#     1 node down, so one-at-a-time keeps quorum the whole way. REFUSES to run
+#     if no directory leader is reachable (a virgin cluster — use genesis).
 #
-# What it does NOT do: push env files / secrets (provisioned out-of-band),
-# run sudo (except optional setcap), or touch the next host until the
-# current one is healthy. Aborts the rollout if a node doesn't recover.
+#   GENESIS (--genesis) — cold bring-up of a VIRGIN cluster from empty. Pushes
+#     binaries to all hosts, starts every CP together so the cold-multi
+#     directory group can form quorum + elect, starts workers (self-only) +
+#     fronts, then drives `rewind-ops genesis` (register addrs → provision
+#     __admin__ born {1} → reconciler grows it to all N → reset/deploy). REFUSES
+#     if a directory leader already exists (the cluster is formed — use rolling),
+#     unless ROVE_GENESIS_FORCE=1. The 2026-06-24 outage was rolling silently
+#     unable to bring a cluster up from empty; this is the split that fixes it.
+#
+# What NEITHER mode does: push env files / secrets (provisioned out-of-band —
+# for genesis the nodes' active EnvironmentFile MUST be the genesis profile,
+# scripts/systemd/v2/*.genesis.example: workers self-only, CP cold-multi +
+# reconciler on), run sudo (except optional setcap).
 #
 # Usage:
 #   cp scripts/deploy.conf.example ~/.config/rove/deploy.conf  # edit it
-#   scripts/deploy.sh                 # build + test + rolling deploy
+#   scripts/deploy.sh                 # rolling: build + test + rolling deploy
+#   scripts/deploy.sh --genesis       # genesis: cold bring-up from empty
 #   ROVE_SKIP_TESTS=1 scripts/deploy.sh
 #
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# ── mode: --genesis | --rolling (default), or ROVE_DEPLOY_MODE ─────────
+MODE="${ROVE_DEPLOY_MODE:-rolling}"
+for arg in "$@"; do
+    case "$arg" in
+        --genesis) MODE=genesis ;;
+        --rolling) MODE=rolling ;;
+        *) echo "unknown arg: $arg (want --genesis | --rolling)" >&2; exit 2 ;;
+    esac
+done
+[ "$MODE" = genesis ] || [ "$MODE" = rolling ] || { echo "bad ROVE_DEPLOY_MODE=$MODE" >&2; exit 2; }
+
 # Config lives at ~/.config/rove/deploy.conf (survives worktree churn);
 # repo-root scripts/deploy.conf is the legacy fallback. Override with
 # ROVE_DEPLOY_CONF.
@@ -42,6 +64,9 @@ SETTLE_SECS="${ROVE_SETTLE_SECS:-10}"
 SETCAP="${ROVE_SETCAP:-0}"
 SKIP_TESTS="${ROVE_SKIP_TESTS:-0}"
 HEALTH_TIMEOUT=60
+# Genesis: how long to wait for the cold-multi directory group to elect after
+# the CPs are started together (cross-host election is ~1-2s; be generous).
+CP_ELECT_TIMEOUT="${ROVE_CP_ELECT_TIMEOUT:-60}"
 
 BINS=(rewind-worker rewind-cp rewind-front)
 OUT="$REPO_ROOT/zig-out/bin"
@@ -56,12 +81,18 @@ log(){ printf '%s== %s ==%s\n' "$c_info" "$*" "$c_off"; }
 ok(){  printf '%s   ✓ %s%s\n' "$c_ok" "$*" "$c_off"; }
 die(){ printf '%sFATAL: %s%s\n' "$c_err" "$*" "$c_off" >&2; exit 1; }
 
-# ── 1. Build + test gate ──────────────────────────────────────────────
-log "Building V2 binaries (ReleaseFast)"
-( cd "$REPO_ROOT" && zig build rewind-worker rewind-cp rewind-front -Doptimize=ReleaseFast ) \
+SSH_PROBE="$SSH -o ConnectTimeout=8 -o BatchMode=yes"
+
+# ── 1. Build + test gate (shared) ─────────────────────────────────────
+# Genesis also needs rewind-ops (the operator drives the membership bring-up
+# through it); it runs locally, so it is built but not pushed to the hosts.
+BUILD_BINS=("${BINS[@]}")
+[ "$MODE" = genesis ] && BUILD_BINS+=(rewind-ops)
+log "Building V2 binaries (ReleaseFast): ${BUILD_BINS[*]}"
+( cd "$REPO_ROOT" && zig build "${BUILD_BINS[@]}" -Doptimize=ReleaseFast ) \
     || die "build failed"
-for b in "${BINS[@]}"; do [ -x "$OUT/$b" ] || die "missing build output: $OUT/$b"; done
-ok "built ${BINS[*]}"
+for b in "${BUILD_BINS[@]}"; do [ -x "$OUT/$b" ] || die "missing build output: $OUT/$b"; done
+ok "built ${BUILD_BINS[*]}"
 
 if [ "$SKIP_TESTS" = 1 ]; then
     printf '%s   ! skipping tests (ROVE_SKIP_TESTS=1)%s\n' "$c_err" "$c_off"
@@ -72,7 +103,7 @@ else
     ok "tests green"
 fi
 
-# ── health probe (runs on-host over ssh; private ports aren't public) ──
+# ── health probes (run on-host over ssh; private ports aren't public) ──
 # wait_health <host> <service> [readiness_url]
 wait_health(){
     # Two `local` statements: in one statement bash word-expands every
@@ -100,23 +131,26 @@ wait_health(){
     ok "$host: $svc healthy"
 }
 
-# cp readiness. `/_cp/leader` is 200 ONLY on the directory leader (it's
-# the HA discovery probe) — a restarted node that rejoins as a FOLLOWER
-# answers 503 forever, so gating a node on its own 200 deadlocks the
-# roll (bit us on the first real one). Ready =
+# True (0) iff SOME CP member currently answers /_cp/leader 200 — i.e. the
+# directory raft has an elected leader. `/_cp/leader` is 200 ONLY on the
+# directory leader (the HA discovery probe); a follower answers 503 with no
+# leader hint, so this MUST scan the whole CP membership (ROVE_CLUSTER_HOSTS,
+# defaulting to ROVE_HOSTS) — the leader can sit on a node we're not deploying.
+# Single pass, no wait. A bounded connect timeout keeps a down member from
+# hanging the probe.
+directory_leader_present(){
+    local h
+    for h in ${ROVE_CLUSTER_HOSTS:-$ROVE_HOSTS}; do
+        if $SSH_PROBE "$h" "curl -fsS -m5 -o /dev/null http://localhost:9090/_cp/leader" 2>/dev/null; then
+            LEADER_VIA="$h"; return 0
+        fi
+    done
+    return 1
+}
+
+# cp readiness for the ROLLING path. Ready =
 #   (a) the local CP answers HTTP at all (any status: serving), and
 #   (b) SOME node answers 200 (the directory raft has a leader).
-#
-# (b) MUST scan the whole CP membership, not just the deploy targets: the
-# directory leader can sit on a node we're NOT deploying (e.g. a member
-# that's intentionally excluded from ROVE_HOSTS), and a follower's 503
-# carries no leader hint — so probing only ROVE_HOSTS false-negatives
-# "no leader" while the cluster is perfectly healthy (this bit the
-# 3-node roll: bhs-3 led, only bhs-1/2 were probed). ROVE_CLUSTER_HOSTS
-# lists every CP member's SSH target; it defaults to ROVE_HOSTS for the
-# common case where the deploy set IS the whole cluster. A bounded
-# connect timeout keeps a down/excluded member from hanging the probe.
-SSH_PROBE="$SSH -o ConnectTimeout=8 -o BatchMode=yes"
 wait_cp_ready(){
     local host="$1" t=0
     until $SSH "$host" "curl -s -m5 -o /dev/null http://localhost:9090/_cp/leader"; do
@@ -126,28 +160,20 @@ wait_cp_ready(){
     ok "$host: cp serving"
     t=0
     while :; do
-        local h
-        for h in ${ROVE_CLUSTER_HOSTS:-$ROVE_HOSTS}; do
-            if $SSH_PROBE "$h" "curl -fsS -m5 -o /dev/null http://localhost:9090/_cp/leader" 2>/dev/null; then
-                ok "directory leader present (via $h)"
-                return 0
-            fi
-        done
+        if directory_leader_present; then ok "directory leader present (via $LEADER_VIA)"; return 0; fi
         t=$((t+2)); [ "$t" -lt "$HEALTH_TIMEOUT" ] || die "directory raft has no leader after ${HEALTH_TIMEOUT}s (probed: ${ROVE_CLUSTER_HOSTS:-$ROVE_HOSTS})"
         sleep 2
     done
 }
 
-# ── 2. Rolling deploy, one host fully before the next ─────────────────
-log "Rolling deploy to: $ROVE_HOSTS"
-for host in $ROVE_HOSTS; do
-    log "[$host] push binaries"
-    # Stage then atomic-rename so a half-copied binary is never executed.
+# Push the 3 binaries to one host (stage + atomic-rename: a half-copied or a
+# running executable is never the one exec'd — rename is ETXTBSY-safe, the old
+# inode lives until the next restart execs).
+push_binaries(){
+    local host="$1" b
     for b in "${BINS[@]}"; do
         $RSYNC -az "$OUT/$b" "$host:$BIN_DIR/.$b.new" || die "$host: rsync $b failed"
     done
-    # Atomic rename (not copy-into): replacing a running executable by
-    # rename is ETXTBSY-safe — the old inode lives until the restart execs.
     $SSH "$host" "set -e; cd \"\$HOME/$BIN_DIR\"; for b in ${BINS[*]}; do chmod 0755 \".\$b.new\"; mv -f \".\$b.new\" \"\$b\"; done" \
         || die "$host: binary install failed"
     if [ "$SETCAP" = 1 ]; then
@@ -155,6 +181,80 @@ for host in $ROVE_HOSTS; do
             || die "$host: setcap failed (ROVE_SETCAP=1)"
     fi
     ok "$host: binaries in place"
+}
+
+# ── 2a. GENESIS: cold bring-up from empty ─────────────────────────────
+if [ "$MODE" = genesis ]; then
+    : "${ROVE_GENESIS_ENV:?genesis needs ROVE_GENESIS_ENV — path to the rewind-ops --env file (ROVE_CP_URL_INTERNAL, ROVE_WORKER_URLS, REWIND_MOVE_SECRET, REWIND_ROOT_TOKEN, REWIND_ADMIN_DOMAIN, ROVE_CLUSTER, ROVE_GENESIS_NODES). See scripts/systemd/v2/*.genesis.example + rewind-ops genesis.}"
+    [ -f "$ROVE_GENESIS_ENV" ] || die "ROVE_GENESIS_ENV not found: $ROVE_GENESIS_ENV"
+
+    log "GENESIS mode — cold bring-up of: $ROVE_HOSTS"
+    # Guard: never genesis a cluster that already has a leader (it is formed;
+    # genesis would split-brain it / fight the existing membership). Rolling is
+    # the right tool. Escape hatch for a deliberate re-genesis after a wipe.
+    if directory_leader_present; then
+        if [ "${ROVE_GENESIS_FORCE:-0}" = 1 ]; then
+            printf '%s   ! directory leader already present (via %s) — proceeding anyway (ROVE_GENESIS_FORCE=1)%s\n' "$c_err" "$LEADER_VIA" "$c_off"
+        else
+            die "a directory leader already exists (via $LEADER_VIA) — the cluster is formed. Use rolling (scripts/deploy.sh), or ROVE_GENESIS_FORCE=1 to override (only after a deliberate data wipe)."
+        fi
+    fi
+
+    log "Push binaries to all hosts"
+    for host in $ROVE_HOSTS; do push_binaries "$host"; done
+
+    # Start every CP TOGETHER so the cold-multi directory group reaches quorum.
+    # A rolling (one-at-a-time) start can't: a lone CP with REWIND_CP_VOTERS=1,2,3
+    # has no peers up to elect with. `restart` starts a stopped unit too, so this
+    # works whether the nodes were down or partially up.
+    log "Start all CP nodes together (cold-multi directory group)"
+    for host in $ROVE_HOSTS; do
+        $SSH "$host" "$RUSER_ENV systemctl --user restart rewind-cp.service" || die "$host: cp start failed"
+        ok "$host: cp started"
+    done
+    log "Wait for the directory group to elect (cold-multi, ~1-2s cross-host)"
+    t=0
+    until directory_leader_present; do
+        t=$((t+2)); [ "$t" -lt "$CP_ELECT_TIMEOUT" ] || die "directory group did NOT elect within ${CP_ELECT_TIMEOUT}s — check rewind-cp logs (REWIND_CP_VOTERS/PEERS set? reachable on :9101? REWIND_RAFT_NET_DEBUG=1 for the dial trace)"
+        sleep 2
+    done
+    ok "directory leader present (via $LEADER_VIA) — cold-multi CP genesis succeeded"
+
+    log "Start workers (self-only) + fronts on all hosts"
+    for host in $ROVE_HOSTS; do
+        $SSH "$host" "$RUSER_ENV systemctl --user restart rewind-worker.service" || die "$host: worker start failed"
+        wait_health "$host" worker "http://localhost:8443/_system/health"
+        $SSH "$host" "$RUSER_ENV systemctl --user restart rewind-front.service"  || die "$host: front start failed"
+        wait_health "$host" front
+    done
+
+    # Drive the operator-side membership bring-up: register addrs → provision
+    # __admin__ (born {1}) → reconciler grows it to all N → reset/deploy. This
+    # is the tested bootstrap-1-grow path (rewind-ops genesis); deploy.sh just
+    # stood the processes up for it.
+    log "Run rewind-ops genesis (register → provision __admin__ → grow → reset)"
+    "$OUT/rewind-ops" genesis --env "$ROVE_GENESIS_ENV" || die "rewind-ops genesis failed — see output above"
+
+    log "GENESIS complete — cluster formed, __admin__ grown + deploy-capable"
+    ok "next: provision tenants + publish bundles; future updates use rolling (scripts/deploy.sh)"
+    exit 0
+fi
+
+# ── 2b. ROLLING: zero-downtime update of a formed cluster ─────────────
+# Guard: rolling restarts one node at a time and gates each on a directory
+# leader — it CANNOT bring a cluster up from empty (a lone cold-multi CP never
+# reaches quorum, so wait_cp_ready would hang then die). The 2026-06-24 outage
+# was exactly this silent failure. Refuse early with a clear pointer to genesis.
+log "Pre-flight: directory leader must be reachable (rolling updates a formed cluster)"
+if ! directory_leader_present; then
+    die "no directory leader reachable on ${ROVE_CLUSTER_HOSTS:-$ROVE_HOSTS} — this looks like a VIRGIN or fully-down cluster. Rolling cannot cold-start it; use: scripts/deploy.sh --genesis"
+fi
+ok "directory leader present (via $LEADER_VIA)"
+
+log "Rolling deploy to: $ROVE_HOSTS"
+for host in $ROVE_HOSTS; do
+    log "[$host] push binaries"
+    push_binaries "$host"
 
     log "[$host] restart cp → worker → front"
     $SSH "$host" "$RUSER_ENV systemctl --user restart rewind-cp.service"     || die "$host: cp restart failed"

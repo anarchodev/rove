@@ -35,3 +35,27 @@ ROVE_SKIP_TESTS=0
 # ssh / rsync commands (override for jump hosts, keys, etc.)
 ROVE_SSH="ssh"
 ROVE_RSYNC="rsync"
+
+# ─── GENESIS mode (scripts/deploy.sh --genesis) ───────────────────────
+# Only needed for a cold bring-up of a VIRGIN cluster from empty. Rolling
+# (the default) ignores everything below.
+#
+# Path to the rewind-ops --env file driving the operator-side membership
+# bring-up (register node addrs → provision __admin__ → grow → reset). It must
+# define: ROVE_CP_URL_INTERNAL, ROVE_WORKER_URLS, REWIND_MOVE_SECRET,
+# REWIND_ROOT_TOKEN, REWIND_ADMIN_DOMAIN, ROVE_CLUSTER, and ROVE_GENESIS_NODES
+# ("id=worker_raft_addr[,cp_raft_addr[,worker_http_url]];…" per node). Commonly
+# your prod.env with ROVE_GENESIS_NODES appended. The CP/worker URLs in it must
+# be reachable from where you run deploy.sh (vRack VPN, or run from a node).
+# PRECONDITION: the nodes' active EnvironmentFile must be the GENESIS profile
+# (scripts/systemd/v2/*.genesis.example — workers self-only, CP cold-multi +
+# REWIND_CP_RECONCILE_MEMBERSHIP=1).
+# ROVE_GENESIS_ENV="$HOME/.config/rove/prod.genesis.env"
+
+# Seconds to wait for the cold-multi directory group to elect after the CPs are
+# started together (cross-host election is ~1-2s; default 60 is generous).
+# ROVE_CP_ELECT_TIMEOUT=60
+
+# Set to 1 to genesis even when a directory leader already exists. ONLY after a
+# deliberate data wipe — genesis on a formed cluster split-brains it.
+# ROVE_GENESIS_FORCE=0

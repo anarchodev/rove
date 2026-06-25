@@ -212,9 +212,15 @@ A pre-deploy checklist.
 - [x] **Retired the 8 V1 units** (`git rm scripts/systemd/rove-*.service|.timer`).
 - [x] **`scripts/deploy.sh`** + `deploy.conf.example` (gitignored real conf):
   build ReleaseFast → `v2-test` + `test` gate → per-host atomic-rename binary
-  push → quorum-safe rolling restart (cp→worker→front, health-gated on
-  `/_cp/leader` + `/_system/health`, settle between hosts). Binaries only — no
-  secrets pushed.
+  push. Two modes: **rolling** (default) = quorum-safe one-at-a-time restart
+  (cp→worker→front, health-gated on `/_cp/leader` + `/_system/health`, settle
+  between hosts) of an already-formed cluster — refuses if no directory leader
+  is reachable; **genesis** (`--genesis`) = cold bring-up from empty — push all,
+  start every CP together so the cold-multi directory elects, start workers
+  (self-only) + fronts, then `rewind-ops genesis` grows `__admin__` to N voters
+  + deploys it — refuses if a leader already exists (`ROVE_GENESIS_FORCE=1` to
+  override). The genesis mode codifies §5 steps 5–8. Binaries only — no secrets
+  pushed (genesis needs the genesis env profile already active on the nodes).
 - [x] **`/deploy` skill** (`.claude/skills/deploy/SKILL.md`) — the approval-gated
   release procedure (§6): show the diff, human go/no-go, run `deploy.sh`,
   validate, tag `prod-deployed`.
