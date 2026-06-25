@@ -232,7 +232,14 @@ if [ "$MODE" = genesis ]; then
             warn "$host: REWIND_VOTERS/REWIND_PEERS set in [$vset] — this is the ROLLING (cold-multi) worker profile, NOT genesis self-only. Switch to the genesis profile (scripts/systemd/v2/common.env.genesis.example) before a real genesis."
             profile_warn=1
         else
-            ok "$host: worker env is self-only (genesis profile)"
+            # Self-only: the worker can't derive its raft listen addr from
+            # REWIND_PEERS, so REWIND_RAFT_ADDR must be set (node.env.genesis).
+            if $SSH "$host" 'grep -qE "^[[:space:]]*REWIND_RAFT_ADDR=" ~/.config/rove/node.env ~/.config/rove/common.env 2>/dev/null'; then
+                ok "$host: worker env is self-only + REWIND_RAFT_ADDR set (genesis profile)"
+            else
+                warn "$host: worker is self-only but REWIND_RAFT_ADDR is UNSET — a genesis worker can't pick its raft listen addr. Add REWIND_RAFT_ADDR=<ip>:8501 to node.env."
+                profile_warn=1
+            fi
         fi
     done
     [ "$profile_warn" = 1 ] && warn "ONE OR MORE NODES are on the rolling worker profile — genesis will likely mis-form __admin__ until they're switched to self-only."
