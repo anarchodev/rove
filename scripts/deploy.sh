@@ -34,12 +34,17 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # ── mode: --genesis | --rolling (default), or ROVE_DEPLOY_MODE ─────────
+# --dry-run: build + test + read-only preflight + print the plan, then STOP
+# before ANY prod mutation (no binary push, no service start/restart, no
+# rewind-ops genesis). Safe to run against a live or down cluster.
 MODE="${ROVE_DEPLOY_MODE:-rolling}"
+DRY_RUN="${ROVE_DRY_RUN:-0}"
 for arg in "$@"; do
     case "$arg" in
         --genesis) MODE=genesis ;;
         --rolling) MODE=rolling ;;
-        *) echo "unknown arg: $arg (want --genesis | --rolling)" >&2; exit 2 ;;
+        --dry-run) DRY_RUN=1 ;;
+        *) echo "unknown arg: $arg (want --genesis | --rolling | --dry-run)" >&2; exit 2 ;;
     esac
 done
 [ "$MODE" = genesis ] || [ "$MODE" = rolling ] || { echo "bad ROVE_DEPLOY_MODE=$MODE" >&2; exit 2; }
@@ -79,7 +84,9 @@ RUSER_ENV='export XDG_RUNTIME_DIR=/run/user/$(id -u);'
 c_info=$'\033[1;36m'; c_ok=$'\033[1;32m'; c_err=$'\033[1;31m'; c_off=$'\033[0m'
 log(){ printf '%s== %s ==%s\n' "$c_info" "$*" "$c_off"; }
 ok(){  printf '%s   ✓ %s%s\n' "$c_ok" "$*" "$c_off"; }
+warn(){ printf '%s   ! %s%s\n' "$c_err" "$*" "$c_off"; }
 die(){ printf '%sFATAL: %s%s\n' "$c_err" "$*" "$c_off" >&2; exit 1; }
+[ "$DRY_RUN" = 1 ] && log "DRY-RUN — build + test + read-only preflight only; no prod mutation"
 
 SSH_PROBE="$SSH -o ConnectTimeout=8 -o BatchMode=yes"
 
@@ -189,6 +196,67 @@ if [ "$MODE" = genesis ]; then
     [ -f "$ROVE_GENESIS_ENV" ] || die "ROVE_GENESIS_ENV not found: $ROVE_GENESIS_ENV"
 
     log "GENESIS mode — cold bring-up of: $ROVE_HOSTS"
+
+    # ── Read-only preflight (runs in both dry-run and real) ───────────
+    log "Preflight: validate genesis env + node reachability/state"
+    # Required vars in the rewind-ops --env file. Check presence only (never
+    # print values — secrets live here).
+    for v in ROVE_GENESIS_NODES ROVE_CP_URL_INTERNAL ROVE_WORKER_URLS REWIND_MOVE_SECRET REWIND_ROOT_TOKEN REWIND_ADMIN_DOMAIN; do
+        grep -qE "^[[:space:]]*$v=" "$ROVE_GENESIS_ENV" || die "ROVE_GENESIS_ENV ($ROVE_GENESIS_ENV) is missing $v"
+    done
+    ok "genesis env has all required vars"
+    gnodes=$(grep -E "^[[:space:]]*ROVE_GENESIS_NODES=" "$ROVE_GENESIS_ENV" | head -1 | cut -d= -f2-)
+    printf '   ROVE_GENESIS_NODES = %s\n' "$gnodes"
+    # Per-host: ssh reachable + current service state (a clean genesis wants the
+    # services DOWN; flag any that are active — they will be restarted, which on
+    # populated data is not a cold genesis).
+    profile_warn=0
+    for host in $ROVE_HOSTS; do
+        $SSH_PROBE "$host" true 2>/dev/null || die "$host: unreachable over ssh"
+        local_active=""
+        for svc in cp worker front; do
+            st=$($SSH "$host" "$RUSER_ENV systemctl --user is-active rewind-$svc.service 2>/dev/null" 2>/dev/null || true)
+            [ "$st" = active ] && local_active="$local_active $svc"
+        done
+        if [ -n "$local_active" ]; then
+            warn "$host: reachable — but ACTIVE services:$local_active (expected all-down for a cold genesis)"
+        else
+            ok "$host: reachable, services down (clean genesis target)"
+        fi
+        # Worker env PROFILE check: bootstrap-1-grow needs workers SELF-ONLY, so
+        # REWIND_VOTERS / REWIND_PEERS must be ABSENT from the active worker env.
+        # If they're set (the rolling/cold-multi profile), the worker boots
+        # cold-multi and the genesis flow's born-{1}+grow assumptions don't hold.
+        vset=$($SSH "$host" 'grep -lE "^[[:space:]]*(REWIND_VOTERS|REWIND_PEERS)=" ~/.config/rove/common.env ~/.config/rove/node.env 2>/dev/null | tr "\n" " "' 2>/dev/null || true)
+        if [ -n "$vset" ]; then
+            warn "$host: REWIND_VOTERS/REWIND_PEERS set in [$vset] — this is the ROLLING (cold-multi) worker profile, NOT genesis self-only. Switch to the genesis profile (scripts/systemd/v2/common.env.genesis.example) before a real genesis."
+            profile_warn=1
+        else
+            ok "$host: worker env is self-only (genesis profile)"
+        fi
+    done
+    [ "$profile_warn" = 1 ] && warn "ONE OR MORE NODES are on the rolling worker profile — genesis will likely mis-form __admin__ until they're switched to self-only."
+    # Preview the leader guard (does NOT mutate). A leader present means the
+    # cluster is already formed → genesis would refuse (unless FORCE).
+    if directory_leader_present; then
+        warn "directory leader ALREADY present (via $LEADER_VIA) — genesis would REFUSE (need ROVE_GENESIS_FORCE=1 after a wipe)"
+    else
+        ok "no directory leader present — virgin/down cluster (genesis target)"
+    fi
+
+    if [ "$DRY_RUN" = 1 ]; then
+        log "DRY-RUN plan (genesis) — would, in order:"
+        echo "   1. push rewind-{worker,cp,front} to: $ROVE_HOSTS"
+        echo "   2. restart rewind-cp on ALL hosts together → wait for the cold-multi directory leader (≤${CP_ELECT_TIMEOUT}s)"
+        echo "   3. restart rewind-worker (self-only) + rewind-front on each host; health-gate each"
+        echo "   4. run: $OUT/rewind-ops genesis --env $ROVE_GENESIS_ENV"
+        echo "      (register node addrs → provision __admin__ {1} → reconciler grows to N → reset/deploy)"
+        echo "   PRECONDITION reminder: each node's active EnvironmentFile must be the GENESIS profile"
+        echo "   (workers self-only: no REWIND_VOTERS/REWIND_PEERS; CP cold-multi + REWIND_CP_RECONCILE_MEMBERSHIP=1)."
+        log "DRY-RUN complete — no prod mutation performed"
+        exit 0
+    fi
+
     # Guard: never genesis a cluster that already has a leader (it is formed;
     # genesis would split-brain it / fight the existing membership). Rolling is
     # the right tool. Escape hatch for a deliberate re-genesis after a wipe.
@@ -250,6 +318,12 @@ if ! directory_leader_present; then
     die "no directory leader reachable on ${ROVE_CLUSTER_HOSTS:-$ROVE_HOSTS} — this looks like a VIRGIN or fully-down cluster. Rolling cannot cold-start it; use: scripts/deploy.sh --genesis"
 fi
 ok "directory leader present (via $LEADER_VIA)"
+
+if [ "$DRY_RUN" = 1 ]; then
+    log "DRY-RUN plan (rolling) — for each host in order ($ROVE_HOSTS): push binaries, restart cp→worker→front, health-gate, settle ${SETTLE_SECS}s"
+    log "DRY-RUN complete — no prod mutation performed"
+    exit 0
+fi
 
 log "Rolling deploy to: $ROVE_HOSTS"
 for host in $ROVE_HOSTS; do
