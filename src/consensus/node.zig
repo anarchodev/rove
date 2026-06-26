@@ -1307,6 +1307,14 @@ pub const Node = struct {
         return t.heartbeatRttSnapshot();
     }
 
+    /// Snapshot the node-wide outbound dial-mesh (configured vs connected
+    /// peers), or null on a single-node node (no transport — no peers to
+    /// reach). Lock-free read off the pump thread; see `Transport.meshSnapshot`.
+    pub fn meshSnapshot(self: *Node) ?transport_mod.Transport.MeshSnapshot {
+        const t = self.transport orelse return null;
+        return t.meshSnapshot();
+    }
+
     /// Whether this node is the raft leader of `tenant_id`'s group. False
     /// for a group this node has not created yet (a tenant the bridge has
     /// `registerTenant`'d but whose `createGroupEpoch`/`ensureGroup` has not

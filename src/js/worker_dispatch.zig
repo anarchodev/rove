@@ -1412,6 +1412,31 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
         \\
     , .{ gc.total, gc.led, gc.no_leader });
 
+    // ── raft outbound dial-mesh health (node-wide; the cross-host wedge) ──
+    //
+    // raftnet_peers_unreachable is THE dial-mesh wedge signal: configured peers
+    // (nodes raft must SEND to) whose outbound connection is NOT established.
+    // 0 on a healthy mesh; a brief spike on a dial/reconnect; SUSTAINED > 0 is
+    // the incident — the cross-host genesis wedge was a zombie-connect that
+    // mis-marked a dead fd, so `send` no-op'd forever (one peer permanently
+    // unreachable, no quorum). Emitted as a stable series (zeros when there's
+    // no transport — a single-node node has no peers to reach).
+    const mesh = worker.raft.meshSnapshot();
+    const mesh_configured: u32 = if (mesh) |m| m.configured else 0;
+    const mesh_connected: u32 = if (mesh) |m| m.connected else 0;
+    try w.print(
+        \\# HELP raftnet_peers_configured non-self raft peers this node must be able to send to (the outbound mesh it should hold).
+        \\# TYPE raftnet_peers_configured gauge
+        \\raftnet_peers_configured {d}
+        \\# HELP raftnet_peers_connected configured peers with an established outbound connection (raft can send to them).
+        \\# TYPE raftnet_peers_connected gauge
+        \\raftnet_peers_connected {d}
+        \\# HELP raftnet_peers_unreachable configured peers with NO outbound connection (configured − connected) — the dial-mesh wedge signal; sustained > 0 = a node raft can't reach (zombie-connect / partition).
+        \\# TYPE raftnet_peers_unreachable gauge
+        \\raftnet_peers_unreachable {d}
+        \\
+    , .{ mesh_configured, mesh_connected, mesh_configured - mesh_connected });
+
     // ── raft failover / broadcast-time observability ──────────────────
     //
     // The inputs for sizing election/heartbeat timeouts in THIS environment

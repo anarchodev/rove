@@ -443,6 +443,26 @@ pub const RaftNet = struct {
         return self.peers[peer_id].state == .connected;
     }
 
+    /// Node-wide outbound-mesh health (pump thread only — reads `self.peers`).
+    /// `configured` counts the non-self peer slots raft must be able to SEND
+    /// to; `connected` is how many of those have an established outbound
+    /// connection (`send` requires `.connected`). `configured - connected` is
+    /// the dial-mesh wedge signal: peers we should be talking to but can't
+    /// (the zombie-connect / partition class — §"the cross-host wedge").
+    /// Inbound (`accepted`) slots are deliberately excluded — `send` never
+    /// uses them, so an inbound-only peer is genuinely unreachable.
+    pub const MeshCounts = struct { configured: u32 = 0, connected: u32 = 0 };
+
+    pub fn meshCounts(self: *const RaftNet) MeshCounts {
+        var c = MeshCounts{};
+        for (self.peers) |*p| {
+            if (!p.configured or p.state == .self_slot) continue;
+            c.configured += 1;
+            if (p.state == .connected) c.connected += 1;
+        }
+        return c;
+    }
+
     /// Drive one tick. `now_ns` is a monotonic timestamp used for reconnect
     /// timing. If `wait` is true, blocks until at least one CQE arrives.
     /// Drive the io_uring ring forward and (optionally) block on it.
@@ -1062,4 +1082,61 @@ test "two RaftNets exchange a frame over loopback" {
     // handshake is consumed internally, so item[0] is the application frame.
     try testing.expectEqualStrings("pong-b-to-a", cap_a.items.items[0].payload);
     try testing.expectEqualStrings("ping-a-to-b", cap_b.items.items[0].payload);
+}
+
+test "meshCounts: self excluded; configured counts non-self, connected tracks the dial" {
+    const allocator = testing.allocator;
+
+    const port_a: u16 = 39311;
+    const port_b: u16 = 39312;
+    const addr_a = try std.net.Address.parseIp("127.0.0.1", port_a);
+    const addr_b = try std.net.Address.parseIp("127.0.0.1", port_b);
+
+    var cap_a = Captured{ .allocator = allocator };
+    defer cap_a.deinit();
+    var cap_b = Captured{ .allocator = allocator };
+    defer cap_b.deinit();
+
+    const peers = [_]PeerAddr{
+        .{ .host = "127.0.0.1", .port = port_a },
+        .{ .host = "127.0.0.1", .port = port_b },
+    };
+
+    const a = try RaftNet.init(allocator, .{
+        .node_id = 0,
+        .peers = &peers,
+        .listen_addr = addr_a,
+        .on_recv = captureRecv,
+        .user_ctx = &cap_a,
+    });
+    defer a.deinit();
+
+    const b = try RaftNet.init(allocator, .{
+        .node_id = 1,
+        .peers = &peers,
+        .listen_addr = addr_b,
+        .on_recv = captureRecv,
+        .user_ctx = &cap_b,
+    });
+    defer b.deinit();
+
+    // Before any tick: the one non-self configured peer is counted but not yet
+    // connected (the self slot is excluded — it never inflates either count).
+    const pre = a.meshCounts();
+    try testing.expectEqual(@as(u32, 1), pre.configured);
+    try testing.expectEqual(@as(u32, 0), pre.connected);
+
+    const deadline_ns: i128 = std.time.nanoTimestamp() + 2 * std.time.ns_per_s;
+    while (std.time.nanoTimestamp() < deadline_ns) {
+        const now: i64 = @intCast(std.time.nanoTimestamp());
+        try a.tick(now, 0);
+        try b.tick(now, 0);
+        if (a.peers[1].state == .connected) break;
+    }
+
+    // Once the outbound dial lands, the same peer moves to connected — so
+    // unreachable (configured − connected) drops to 0, the healthy-mesh state.
+    const post = a.meshCounts();
+    try testing.expectEqual(@as(u32, 1), post.configured);
+    try testing.expectEqual(@as(u32, 1), post.connected);
 }

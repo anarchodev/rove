@@ -891,6 +891,16 @@ pub const Bridge = struct {
         return self.node.heartbeatRttSnapshot();
     }
 
+    /// Snapshot the node-wide outbound dial-mesh for `/_system/metrics`:
+    /// `configured` non-self peers vs how many have a live outbound connection.
+    /// `configured - connected` is THE dial-mesh wedge signal (a peer raft must
+    /// send to but can't — the zombie-connect / partition class that the
+    /// cross-host genesis wedge presented as). null on a single-node node (no
+    /// transport). Worker-thread-safe: reads pump-published atomics.
+    pub fn meshSnapshot(self: *Bridge) ?transport.Transport.MeshSnapshot {
+        return self.node.meshSnapshot();
+    }
+
     /// Per-group leadership (Phase 5 multi-node). True when this node is the
     /// raft leader of `gid`'s group — used to leader-gate the move surface
     /// (`v2-bundle` / `v2-kv` PUT reject fast on a follower so the front

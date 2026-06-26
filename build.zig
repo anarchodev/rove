@@ -915,6 +915,14 @@ pub fn build(b: *std.Build) void {
     const v2_test_step = b.step("v2-test", "V2 raft substrate tests (Phase-0 smoke + Phase-1 per-tenant pump)");
     v2_test_step.dependOn(&run_v2_smoke_test.step);
 
+    // The cross-node wire layer's own inline tests (loopback frame exchange,
+    // mesh-count accounting). raft_net is a named module everywhere else, so
+    // its tests aren't collected by the importers' test artifacts — root a
+    // dedicated test at it so they actually run in the gate.
+    const raftnet_test = b.addTest(.{ .root_module = raftnet_mod });
+    const run_raftnet_test = b.addRunArtifact(raftnet_test);
+    v2_test_step.dependOn(&run_raftnet_test.step);
+
     // ── V2 Phase 1 — data-plane core: the per-tenant pump (single node)
     // (v2-build-order Phase 1). `src/consensus/node.zig` owns a
     // Manager + SharedWal and pumps per-tenant raft groups, applying

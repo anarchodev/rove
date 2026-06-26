@@ -171,6 +171,14 @@ pub const Transport = struct {
     hb_sent_ns: []i64,
     hb_rtt: MicrosHistogram = .{},
 
+    /// Node-wide outbound-mesh health, published each `tick` (pump thread) and
+    /// read lock-free by `/_system/metrics` (worker thread) — the same
+    /// publish-an-atomic discipline as the per-group `is_leader` gauge.
+    /// `configured - connected` is the dial-mesh wedge signal (zombie-connect /
+    /// partition: peers raft must reach but can't). See `RaftNet.meshCounts`.
+    mesh_configured: std.atomic.Value(u32) = .init(0),
+    mesh_connected: std.atomic.Value(u32) = .init(0),
+
     pub const Config = struct {
         /// This node's raft id (1-based, must be ≤ peers.len).
         node_id: u64,
@@ -406,6 +414,24 @@ pub const Transport = struct {
     /// is how long to block for I/O when idle (the pump's idle wait).
     pub fn tick(self: *Transport, now_ns: i64, wait_timeout_ns: u64) !void {
         try self.net.tick(now_ns, wait_timeout_ns);
+        // Publish the outbound dial-mesh snapshot for `/_system/metrics`: pump
+        // thread writes, worker thread reads (lock-free atomics). Done every
+        // cycle so the gauge tracks connect/teardown as it happens.
+        const m = self.net.meshCounts();
+        self.mesh_configured.store(m.configured, .release);
+        self.mesh_connected.store(m.connected, .release);
+    }
+
+    /// Lock-free snapshot of the outbound dial-mesh for `/_system/metrics`
+    /// (worker thread) — reads the atomics published by `tick` on the pump
+    /// thread. One pump cycle stale at worst, same as the `is_leader` gauge.
+    pub const MeshSnapshot = struct { configured: u32, connected: u32 };
+
+    pub fn meshSnapshot(self: *const Transport) MeshSnapshot {
+        return .{
+            .configured = self.mesh_configured.load(.acquire),
+            .connected = self.mesh_connected.load(.acquire),
+        };
     }
 
     /// raft_net recv callback (pump thread). Decode the coalesced envelope
