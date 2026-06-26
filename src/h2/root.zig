@@ -105,6 +105,13 @@ pub const Status = struct {
     code: u16 = 0,
 };
 
+/// Map an HTTP status code to a class index for `http_requests_total`:
+/// [0]=other(0/<100/≥600) [1]=1xx [2]=2xx [3]=3xx [4]=4xx [5]=5xx.
+fn statusClass(code: u16) usize {
+    const cls = code / 100;
+    return if (cls >= 1 and cls <= 5) cls else 0;
+}
+
 pub const H2IoResult = struct {
     err: i32 = 0,
 };
@@ -903,6 +910,16 @@ pub fn H2(comptime opts: Options) type {
         recv_enobufs_total: u64 = 0,
         recv_enobufs_logged: bool = false,
         recv_enobufs_last_logged_decade: u64 = 0,
+        /// Server-side response counts by HTTP status CLASS, indexed
+        /// [0]=other(<100) [1]=1xx [2]=2xx [3]=3xx [4]=4xx [5]=5xx — the RED
+        /// error-rate signal (the serving-path metric the consensus/io gauges
+        /// lacked). NO per-route/tenant labels (the active-series rule), just
+        /// the 6 bounded classes. Bumped in `consumeResponses` for every
+        /// response emitted to a client (h1 + h2); read by `writeConnMetrics`
+        /// on the SAME poll-loop thread, so plain counters (no atomics). On the
+        /// front these are the client-facing statuses it relays (a failed
+        /// upstream forward surfaces here as a 5xx).
+        http_status_class: [6]u64 = .{ 0, 0, 0, 0, 0, 0 },
         /// Consecutive `readsTriage` calls where ENOBUFS fired but
         /// `outstanding` was below half of `buf_count`. Three in a
         /// row aborts the process — see the panic check in
@@ -2589,6 +2606,25 @@ pub fn H2(comptime opts: Options) type {
                 s.conn_tls_handshake,
                 s.io_connections,
             });
+
+            // RED error-rate signal: responses served to clients by status
+            // class. The serving-path counter the consensus/io gauges lacked —
+            // an on-call's first question ("are we serving 5xx, and how many?")
+            // is now answerable + alertable. Bounded labels (5 classes + other);
+            // tenant/route stay OUT (active-series rule) — they're trace
+            // exemplars, not labels.
+            const hc = self.http_status_class;
+            try w.print(
+                \\# HELP http_requests_total responses served to clients by HTTP status class (the RED rate+error signal).
+                \\# TYPE http_requests_total counter
+                \\http_requests_total{{code="1xx"}} {d}
+                \\http_requests_total{{code="2xx"}} {d}
+                \\http_requests_total{{code="3xx"}} {d}
+                \\http_requests_total{{code="4xx"}} {d}
+                \\http_requests_total{{code="5xx"}} {d}
+                \\http_requests_total{{code="other"}} {d}
+                \\
+            , .{ hc[1], hc[2], hc[3], hc[4], hc[5], hc[0] });
         }
 
         pub fn create(reg: *Registry, allocator: std.mem.Allocator, addr: std.net.Address, io_opts: rio.IoOptions, h2_opts: H2Options) !*Self {
@@ -2606,6 +2642,7 @@ pub fn H2(comptime opts: Options) type {
             self.recv_enobufs_logged = false;
             self.recv_enobufs_last_logged_decade = 0;
             self.recv_enobufs_low_outstanding_streak = 0;
+            self.http_status_class = .{ 0, 0, 0, 0, 0, 0 };
             self.body_sinks = .empty;
 
             // Init every collection field. Disabled (client_only with
@@ -2804,6 +2841,10 @@ pub fn H2(comptime opts: Options) type {
             const io_results = self.response_in.column(H2IoResult);
 
             for (entities, sessions, sids, statuses, resp_hdrs, resp_bodies, io_results) |ent, sess, sid, status, rh, rb, *io_res| {
+                // RED error-rate signal: count this client-facing response by
+                // status class BEFORE the per-transport branches, so h1 and h2
+                // (and the early conn-gone bail below) are all counted.
+                self.http_status_class[statusClass(status.code)] += 1;
                 const conn_ptr = getConn(self, sess.entity) orelse {
                     io_res.err = -1;
                     try self.reg.move(ent, &self.response_in, &self.response_out);

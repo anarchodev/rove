@@ -1833,11 +1833,16 @@ fn freeUrlList(a: std.mem.Allocator, urls: []const []const u8) void {
 /// Rendered on the CP main loop (which also writes the counters); the
 /// MetricsServer listener thread only serves the returned bytes. The bridge
 /// gauges read pump-published atomics, so they are safe off the pump thread.
-fn buildCpMetricsText(allocator: std.mem.Allocator, router: *Router, bridge: *Bridge) ![]u8 {
+fn buildCpMetricsText(allocator: std.mem.Allocator, router: *Router, bridge: *Bridge, server: *CpH2) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
     const w = &aw.writer;
+
+    // Shared rove-h2 connection/io-ring metrics + the http_requests_total RED
+    // signal for the CP's control surface (/_cp, /_control). Same poll-loop
+    // thread renders + serves, so it's safe to read the server's counters here.
+    try server.writeConnMetrics(w);
 
     const gc = bridge.groupCounts();
     try w.print(
@@ -2151,7 +2156,7 @@ pub fn main() !void {
             const now_ns = std.time.nanoTimestamp();
             if (now_ns - last_metrics_ns > 2 * std.time.ns_per_s) {
                 last_metrics_ns = now_ns;
-                if (buildCpMetricsText(allocator, &router, cp_bridge)) |txt| {
+                if (buildCpMetricsText(allocator, &router, cp_bridge, server)) |txt| {
                     defer allocator.free(txt);
                     ms.publish(txt);
                 } else |_| {}
