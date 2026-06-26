@@ -1105,6 +1105,7 @@ pub fn build(b: *std.Build) void {
     front_mod.addImport("rove", rove_mod);
     front_mod.addImport("rove-h2", h2_mod);
     front_mod.addImport("rove-blob", blob_mod);
+    front_mod.addImport("metrics-server", metrics_server_mod);
     front_mod.link_libc = true;
     front_mod.linkSystemLibrary("nghttp2", .{});
     front_mod.linkSystemLibrary("ssl", .{});

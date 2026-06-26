@@ -42,6 +42,7 @@ const h2 = @import("rove-h2");
 const blob = @import("rove-blob");
 const proxy_mod = @import("proxy.zig");
 const route_resolver_mod = @import("route_resolver.zig");
+const MetricsServer = @import("metrics-server").MetricsServer;
 
 const curl = blob.curl;
 
@@ -365,6 +366,33 @@ fn freeUrlList(a: std.mem.Allocator, urls: []const []const u8) void {
     a.free(urls);
 }
 
+/// Render the front operator metrics in Prometheus text (caller frees). The
+/// front is a stateless proxy (no raft), so this is the shared rove-h2
+/// connection/io-ring formatter — IDENTICAL to the worker's, so the front's
+/// connection-setup-collapse signals (recv_enobufs, admission_denied,
+/// tls_handshake / conn depth — the things the per-second front-diag log warns
+/// on) are now scrapable instead of grep-only — plus the proxy's live-flow /
+/// tunnel leak canaries. Rendered + published on the :443 poll loop (the only
+/// thread that touches `server`/`proxy`); the MetricsServer thread serves bytes.
+fn buildFrontMetricsText(allocator: std.mem.Allocator, server: *FrontH2, flows: usize, tunnels: usize) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
+    const w = &aw.writer;
+    try server.writeConnMetrics(w);
+    try w.print(
+        \\# HELP front_proxy_flows_active in-flight proxied request flows (leak canary — tracks load, returns to ~0 at idle; a monotonic climb is a flow leak).
+        \\# TYPE front_proxy_flows_active gauge
+        \\front_proxy_flows_active {d}
+        \\# HELP front_proxy_tunnels_active live WebSocket tunnels proxied through the front.
+        \\# TYPE front_proxy_tunnels_active gauge
+        \\front_proxy_tunnels_active {d}
+        \\
+    , .{ flows, tunnels });
+    buf = aw.toArrayList();
+    return try buf.toOwnedSlice(allocator);
+}
+
 pub fn main() !void {
     curl.globalInit();
     const allocator = std.heap.c_allocator;
@@ -544,6 +572,29 @@ pub fn main() !void {
     var diag_last_ns: i128 = 0;
     var diag_prev_enobufs: u64 = 0;
     var diag_prev_admission: u64 = 0;
+
+    // Dedicated operator-metrics HTTP/1.1 listener (mirrors worker/CP): loopback
+    // /metrics on REWIND_FRONT_METRICS_PORT (default 9112 — distinct from worker
+    // 9110 / CP 9111 so all three coexist on a host; 0 disables). Independent
+    // thread+socket so /metrics answers even while the :443 loop is saturated —
+    // exactly the connection-setup-collapse the front-diag log warns about.
+    const front_metrics_srv: ?*MetricsServer = blk: {
+        const mport: u16 = if (std.posix.getenv("REWIND_FRONT_METRICS_PORT")) |s|
+            (std.fmt.parseInt(u16, std.mem.trim(u8, s, " \t"), 10) catch 9112)
+        else
+            9112;
+        if (mport == 0) break :blk null;
+        const maddr = std.net.Address.parseIp("127.0.0.1", mport) catch break :blk null;
+        const srv = MetricsServer.init(allocator, maddr) catch |err| {
+            std.log.warn("rewind-front: metrics listener bind :{d} failed ({s}) — running without /metrics", .{ mport, @errorName(err) });
+            break :blk null;
+        };
+        std.log.info("rewind-front: operator metrics on 127.0.0.1:{d}/metrics", .{mport});
+        break :blk srv;
+    };
+    defer if (front_metrics_srv) |ms| ms.deinit();
+    var last_metrics_ns: i128 = 0;
+
     while (!stop_flag.load(.acquire)) {
         server.pollWithTimeout(10 * std.time.ns_per_ms) catch |err| switch (err) {
             error.SignalInterrupt => continue,
@@ -551,6 +602,19 @@ pub fn main() !void {
         };
         const now = std.time.nanoTimestamp();
         try proxy.run(now);
+
+        // Re-render + publish the metrics snapshot ~every 2s (the :443 loop is
+        // the only thread that may read server/proxy state; the listener thread
+        // serves the published bytes).
+        if (front_metrics_srv) |ms| {
+            if (now - last_metrics_ns >= 2 * std.time.ns_per_s) {
+                last_metrics_ns = now;
+                if (buildFrontMetricsText(allocator, server, proxy.live_flows, proxy.live_tunnels)) |txt| {
+                    defer allocator.free(txt);
+                    ms.publish(txt);
+                } else |_| {}
+            }
+        }
         if (now - diag_last_ns >= std.time.ns_per_s) {
             const s = server.connStats();
             const stressed = s.recv_outstanding * 4 > s.buf_count or
