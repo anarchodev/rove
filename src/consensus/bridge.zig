@@ -852,6 +852,38 @@ pub const Bridge = struct {
         return self.leadership_acquisitions.load(.acquire);
     }
 
+    pub const GroupCounts = struct { total: u32 = 0, led: u32 = 0, no_leader: u32 = 0 };
+
+    /// Aggregate per-group leadership health for `/_system/metrics`. NO
+    /// per-tenant labels (the active-series rule) — just three node-wide counts:
+    ///   total     — raft groups on this node.
+    ///   led       — groups this node currently leads.
+    ///   no_leader — groups this node does NOT lead AND whose leader is unknown
+    ///               (`leader_id == 0`). The WEDGE signal: 0 on a healthy
+    ///               cluster (every follower knows its leader), brief +ve during
+    ///               an election, and SUSTAINED +ve is the incident — both the
+    ///               genesis cold-multi wedge and the __admin__-stuck-at-{1,2}
+    ///               grow wedge presented as no_leader > 0 for >25s. Alert on
+    ///               sustained, not transient. Worker-thread-safe: locks `groups`
+    ///               (like `leadsAnyGroup`) and reads the pump-published atomics.
+    ///               Single-node short-circuits to all-led (sole voter).
+    pub fn groupCounts(self: *Bridge) GroupCounts {
+        var c = GroupCounts{};
+        const single = self.node.isSingleNode();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var it = self.groups.valueIterator();
+        while (it.next()) |sig| {
+            c.total += 1;
+            if (single or sig.*.is_leader.load(.acquire)) {
+                c.led += 1;
+            } else if (sig.*.leader_id.load(.acquire) == 0) {
+                c.no_leader += 1;
+            }
+        }
+        return c;
+    }
+
     /// Snapshot the heartbeat round-trip histogram (broadcast-time samples), or
     /// null on a single-node node. Worker-thread entry point for
     /// `/_system/metrics`; the histogram's atomic buckets make it lock-free.

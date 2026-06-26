@@ -1390,6 +1390,28 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
         \\
     , .{@intFromBool(worker.raft.leadsAnyGroup())});
 
+    // ── per-group leadership health (aggregate; no per-tenant labels) ──
+    //
+    // raft_groups_no_leader is THE wedge signal: groups this node neither leads
+    // nor knows a leader for (leader_id=0). 0 on a healthy cluster (every
+    // follower tracks its leader); a brief spike during an election; SUSTAINED
+    // > 0 is the incident — both the genesis cold-multi wedge and the
+    // __admin__-stuck-at-{1,2} grow wedge held no_leader > 0 for >25s. Alert on
+    // duration, not the transient.
+    const gc = worker.raft.groupCounts();
+    try w.print(
+        \\# HELP raft_groups raft groups on this node.
+        \\# TYPE raft_groups gauge
+        \\raft_groups {d}
+        \\# HELP raft_groups_led groups this node currently leads.
+        \\# TYPE raft_groups_led gauge
+        \\raft_groups_led {d}
+        \\# HELP raft_groups_no_leader groups this node neither leads nor knows a leader for (leader_id=0) — the wedge signal; sustained > 0 = an incident (failed election / lost quorum).
+        \\# TYPE raft_groups_no_leader gauge
+        \\raft_groups_no_leader {d}
+        \\
+    , .{ gc.total, gc.led, gc.no_leader });
+
     // ── raft failover / broadcast-time observability ──────────────────
     //
     // The inputs for sizing election/heartbeat timeouts in THIS environment
