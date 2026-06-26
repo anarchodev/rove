@@ -691,8 +691,38 @@ const Router = struct {
         //    already provisioned (placed) — a host write failure is non-fatal;
         //    retry via `/_control/host`.
         if (parsed.value.host) |host| {
-            if (host.len > 0) self.directory.setHost(host, tenant) catch |err|
-                std.log.warn("rewind-cp: provision {s}: setHost({s}) failed: {s}", .{ tenant, host, @errorName(err) });
+            if (host.len > 0) {
+                self.directory.setHost(host, tenant) catch |err|
+                    std.log.warn("rewind-cp: provision {s}: setHost({s}) failed: {s}", .{ tenant, host, @errorName(err) });
+                // Also push the worker-side `__root__/domain/{host}` alias to the
+                // serving cluster. WITHOUT this the CP resolves host→cluster (front
+                // /_cp/route 200) but the WORKER can't map Host→tenant and 404s the
+                // request — provision --host left every PRIMARY host unreachable
+                // until a manual `host add` (the worker-alias gap). Mirrors
+                // `/_control/host`'s push; kept best-effort here (the tenant is
+                // already placed — the 204 commit point — so a transient push
+                // failure just warns and `/_control/host` re-runs it).
+                // Push to `nodes` directly (NOT pushDomainToServingCluster, which
+                // re-resolves): the placement was just `assign`ed above and isn't
+                // in the local projection yet, so a resolve would return null and
+                // the alias would silently never land.
+                //
+                // Retry briefly: the alias is a leader-gated `__root__` write, and
+                // `__root__` on the serving node can be hibernated/leaderless at
+                // this instant (its first write since the worker came up) — the
+                // worker 421s AND wakes it, so the next attempt lands. Without the
+                // retry a cold `__root__` leaves the host unreachable until a
+                // manual `host add` (which only worked on prod because `__root__`
+                // was already warm). Bounded so a genuinely-down cluster still
+                // returns (best-effort: the tenant is placed = the 204 commit).
+                var dom_try: u32 = 0;
+                const domain_pushed = while (dom_try < 15) : (dom_try += 1) {
+                    if (self.pushDomainToNodes(nodes, tenant, host)) break true;
+                    std.Thread.sleep(200 * std.time.ns_per_ms);
+                } else false;
+                if (!domain_pushed)
+                    std.log.warn("rewind-cp: provision {s}: v2-domain push for host {s} did not land — retry via `host add {s} {s}`", .{ tenant, host, host, tenant });
+            }
         }
         std.log.info("rewind-cp: provisioned {s} on {s} ({d} node(s))", .{ tenant, cluster, nodes.len });
         try replyStatus(server, ent, sid, sess, 204);
@@ -840,11 +870,24 @@ const Router = struct {
     /// caller surfaces that). Mirror of `pushPlanToServingCluster`, but GATED
     /// (a half-mapped host must not report success — step3-auth-plan.md B3).
     fn pushDomainToServingCluster(self: *Router, tenant: []const u8, host: []const u8) bool {
-        const a = self.allocator;
         const res = self.directory.resolve(tenant) orelse return false; // unplaced
+        return self.pushDomainToNodes(res.cluster.nodes, tenant, host);
+    }
+
+    /// Push the `host → tenant` worker alias to an EXPLICIT node set (the
+    /// `/_system/v2-domain` POST), leader-gated: first 204 wins, rest 421.
+    /// Split out of `pushDomainToServingCluster` so a caller that ALREADY holds
+    /// the cluster's nodes can skip the `directory.resolve` lookup. That matters
+    /// in `handleProvision`: the placement is `assign`ed and pushed within the
+    /// same handler, but `resolve` reads the LOCAL projection which the just-
+    /// proposed `assign` hasn't applied yet — so resolve returns null and the
+    /// alias silently never lands (the worker then 404s the host until a manual
+    /// `host add`). Provision passes its own `nodes` here to dodge that race.
+    fn pushDomainToNodes(self: *Router, nodes: []const []const u8, tenant: []const u8, host: []const u8) bool {
+        const a = self.allocator;
         const payload = std.json.Stringify.valueAlloc(a, .{ .host = host, .tenant = tenant }, .{}) catch return false;
         defer a.free(payload);
-        for (res.cluster.nodes) |base| {
+        for (nodes) |base| {
             if (self.backendCall(base, "/_system/v2-domain", .POST, payload, &.{})) |resp| {
                 var r = resp;
                 defer r.deinit(a);
