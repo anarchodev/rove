@@ -170,9 +170,17 @@ test "metrics server serves the published snapshot over HTTP/1.1" {
     const stream = try std.net.tcpConnectToAddress(bound);
     defer stream.close();
     try stream.writeAll("GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
+    // The server writes the head and body as separate writes and closes the
+    // connection (`Connection: close`); read to EOF rather than assuming one
+    // read() returns the whole response (it commonly returns just the head).
+    var resp: std.ArrayListUnmanaged(u8) = .empty;
+    defer resp.deinit(testing.allocator);
     var buf: [512]u8 = undefined;
-    const n = try stream.read(&buf);
-    const resp = buf[0..n];
-    try testing.expect(std.mem.indexOf(u8, resp, "200 OK") != null);
-    try testing.expect(std.mem.indexOf(u8, resp, "rove_test_metric 42") != null);
+    while (true) {
+        const n = try stream.read(&buf);
+        if (n == 0) break;
+        try resp.appendSlice(testing.allocator, buf[0..n]);
+    }
+    try testing.expect(std.mem.indexOf(u8, resp.items, "200 OK") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.items, "rove_test_metric 42") != null);
 }

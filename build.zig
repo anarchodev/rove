@@ -256,6 +256,20 @@ pub fn build(b: *std.Build) void {
     acme_mod.linkSystemLibrary("crypto", .{});
     acme_mod.addImport("rove-blob", blob_mod);
 
+    // ── metrics-server: dedicated operator-metrics HTTP/1.1 listener.
+    //    A std-only loopback server that serves a pre-rendered Prometheus
+    //    snapshot off a separate thread + socket, so `/metrics` stays
+    //    scrapable while the main request path is wedged. Shared by BOTH
+    //    rewind-worker (rove-js) and rewind-cp — each renders its own snapshot
+    //    text and publish()es it; the server is content-agnostic.
+    const metrics_server_mod = b.addModule("metrics-server", .{
+        .root_source_file = b.path("src/metrics_server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const metrics_server_tests = b.addTest(.{ .root_module = metrics_server_mod });
+    const run_metrics_server_tests = b.addRunArtifact(metrics_server_tests);
+
     // rove-files-server was dissolved into the worker's `/_system/deploy`
     // endpoint (docs/rewind-cli-plan.md §4): the worker already links
     // rove-files + rove-qjs + rove-blob, so compile + content-address +
@@ -264,6 +278,9 @@ pub fn build(b: *std.Build) void {
 
     // ── Tests ──
     const test_step = b.step("test", "Run all unit tests");
+
+    // metrics-server (shared by rewind-worker + rewind-cp)
+    test_step.dependOn(&run_metrics_server_tests.step);
 
     // rove tests
     const rove_tests = b.addTest(.{ .root_module = rove_mod });
@@ -418,6 +435,7 @@ pub fn build(b: *std.Build) void {
     js_mod.addImport("rove-tenant", tenant_mod);
     js_mod.addImport("rove-ssrf", ssrf_mod);
     js_mod.addImport("rove-plan", plan_mod);
+    js_mod.addImport("metrics-server", metrics_server_mod);
     // JS-side runtime polyfills evaluated into every dispatcher's QJS
     // context after the native CFunction bindings install.
     // retry.js provides a customer-side retry helper layered on
@@ -1119,6 +1137,7 @@ pub fn build(b: *std.Build) void {
     cp_mod.addImport("cp-directory", v2_cp_dir_mod);
     cp_mod.addImport("bridge", v2_bridge_mod);
     cp_mod.addImport("rove-acme", acme_mod);
+    cp_mod.addImport("metrics-server", metrics_server_mod);
     cp_mod.link_libc = true;
     cp_mod.linkSystemLibrary("nghttp2", .{});
     cp_mod.linkSystemLibrary("ssl", .{});

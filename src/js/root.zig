@@ -115,10 +115,9 @@ pub const drainSpools = worker.drainSpools;
 /// Operator metrics: `buildMetricsText` renders the Prometheus snapshot (worker
 /// thread), `MetricsServer` serves it over a dedicated loopback HTTP/1.1 port.
 pub const buildMetricsText = @import("worker_dispatch.zig").buildMetricsText;
-pub const MetricsServer = @import("metrics_server.zig").MetricsServer;
+pub const MetricsServer = @import("metrics-server").MetricsServer;
 
 test {
-    _ = @import("metrics_server.zig");
     _ = dispatcher;
     _ = effect;
     _ = globals;

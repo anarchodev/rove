@@ -34,6 +34,7 @@ const Directory = directory_mod.Directory;
 const bridge_mod = @import("bridge");
 const Bridge = bridge_mod.Bridge;
 const acme_issuer = @import("acme.zig");
+const MetricsServer = @import("metrics-server").MetricsServer;
 
 const CpH2 = h2.H2(.{});
 
@@ -237,6 +238,17 @@ const Router = struct {
     /// than a worker restart + group recover).
     demote_grace_ns: i128 = 60 * std.time.ns_per_s,
     demote_inactive_since: std.StringHashMapUnmanaged(i128) = .empty,
+
+    /// CP action counters for `/metrics`. The reconciler (which writes these)
+    /// and the metrics render (which reads them) both run on the CP main loop,
+    /// so plain fields suffice — no atomics; the MetricsServer listener thread
+    /// only ever serves the already-rendered byte snapshot. `confchange_failed`
+    /// is the reconciler-wedge signal: a conf-change the leader can't commit
+    /// (the `__admin__`-stuck-at-{1,2} grow) is re-proposed every pass, so a
+    /// climbing failed-count with membership not advancing is the incident.
+    reconcile_passes: u64 = 0,
+    confchange_total: u64 = 0,
+    confchange_failed: u64 = 0,
 
     /// Reply helper: set an immediate status (no body) on the request
     /// entity and move it to response_in.
@@ -1057,6 +1069,7 @@ const Router = struct {
     fn reconcileMembership(self: *Router) void {
         if (!self.reconcile_membership) return;
         if (!self.directory.isLeader()) return; // single writer
+        self.reconcile_passes += 1;
         const a = self.allocator;
         const tenants = self.directory.listPlacements(a) catch return;
         defer {
@@ -1557,9 +1570,14 @@ const Router = struct {
         else
             std.fmt.allocPrint(a, "{{\"tenant\":\"{s}\",\"node_id\":{d},\"op\":\"{s}\"}}", .{ tenant, node_id, op }) catch return false;
         defer a.free(body);
-        const resp = self.backendCall(leader_url, "/_system/v2-confchange", .POST, body, &.{}) catch return false;
+        self.confchange_total += 1;
+        const resp = self.backendCall(leader_url, "/_system/v2-confchange", .POST, body, &.{}) catch {
+            self.confchange_failed += 1;
+            return false;
+        };
         defer a.free(resp.body);
         if (resp.status != 204) {
+            self.confchange_failed += 1;
             std.log.warn("rewind-cp: reconcile confchange {s} node={d} {s} → {d}", .{ op, node_id, tenant, resp.status });
             return false;
         }
@@ -1800,6 +1818,77 @@ fn freeUrlList(a: std.mem.Allocator, urls: []const []const u8) void {
     a.free(urls);
 }
 
+/// Render the CP operator metrics in Prometheus text (caller frees). Two
+/// halves, both node-wide with no per-tenant labels (the observability.md
+/// active-series rule):
+///
+///   1. The directory raft group's health — leadership + the dial-mesh — via
+///      the SAME `Bridge` gauges the worker exposes. The CP runs one raft group
+///      (the replicated directory), so `raft_groups_no_leader` is the directory
+///      wedge signal and `raftnet_peers_unreachable` is the cross-host
+///      CP-genesis wedge the June incident lacked any view of.
+///   2. The reconciler's action counters — liveness (`cp_reconcile_passes`) and
+///      the stuck-conf-change signal (`cp_reconcile_confchange_failed`).
+///
+/// Rendered on the CP main loop (which also writes the counters); the
+/// MetricsServer listener thread only serves the returned bytes. The bridge
+/// gauges read pump-published atomics, so they are safe off the pump thread.
+fn buildCpMetricsText(allocator: std.mem.Allocator, router: *Router, bridge: *Bridge) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
+    const w = &aw.writer;
+
+    const gc = bridge.groupCounts();
+    try w.print(
+        \\# HELP raft_is_leader 1 if this CP leads its directory raft group, 0 otherwise.
+        \\# TYPE raft_is_leader gauge
+        \\raft_is_leader {d}
+        \\# HELP raft_groups raft groups on this node (the CP hosts the replicated directory group).
+        \\# TYPE raft_groups gauge
+        \\raft_groups {d}
+        \\# HELP raft_groups_led groups this node currently leads.
+        \\# TYPE raft_groups_led gauge
+        \\raft_groups_led {d}
+        \\# HELP raft_groups_no_leader groups this node neither leads nor knows a leader for (leader_id=0) — the directory wedge signal; sustained > 0 = a failed CP election / lost quorum.
+        \\# TYPE raft_groups_no_leader gauge
+        \\raft_groups_no_leader {d}
+        \\
+    , .{ @intFromBool(bridge.leadsAnyGroup()), gc.total, gc.led, gc.no_leader });
+
+    const mesh = bridge.meshSnapshot();
+    const mesh_configured: u32 = if (mesh) |m| m.configured else 0;
+    const mesh_connected: u32 = if (mesh) |m| m.connected else 0;
+    try w.print(
+        \\# HELP raftnet_peers_configured non-self CP peers this node must be able to send to (the outbound directory mesh it should hold).
+        \\# TYPE raftnet_peers_configured gauge
+        \\raftnet_peers_configured {d}
+        \\# HELP raftnet_peers_connected configured peers with an established outbound connection (raft can send to them).
+        \\# TYPE raftnet_peers_connected gauge
+        \\raftnet_peers_connected {d}
+        \\# HELP raftnet_peers_unreachable configured peers with NO outbound connection (configured − connected) — the dial-mesh wedge signal; sustained > 0 = a CP node raft can't reach (zombie-connect / partition).
+        \\# TYPE raftnet_peers_unreachable gauge
+        \\raftnet_peers_unreachable {d}
+        \\
+    , .{ mesh_configured, mesh_connected, mesh_configured - mesh_connected });
+
+    try w.print(
+        \\# HELP cp_reconcile_passes_total membership-reconciler passes executed as the directory leader (liveness: a flat count on a node that should lead = the reconciler isn't running).
+        \\# TYPE cp_reconcile_passes_total counter
+        \\cp_reconcile_passes_total {d}
+        \\# HELP cp_reconcile_confchange_total membership conf-changes proposed by the reconciler (add/promote/demote/remove).
+        \\# TYPE cp_reconcile_confchange_total counter
+        \\cp_reconcile_confchange_total {d}
+        \\# HELP cp_reconcile_confchange_failed_total conf-change proposals that did not commit (non-204) — the stuck-grow signal; climbing while membership doesn't advance = a conf-change the leader can't commit (the __admin__-stuck-at-{{1,2}} wedge).
+        \\# TYPE cp_reconcile_confchange_failed_total counter
+        \\cp_reconcile_confchange_failed_total {d}
+        \\
+    , .{ router.reconcile_passes, router.confchange_total, router.confchange_failed });
+
+    buf = aw.toArrayList();
+    return try buf.toOwnedSlice(allocator);
+}
+
 pub fn main() !void {
     curl.globalInit();
     const allocator = std.heap.c_allocator;
@@ -2010,6 +2099,29 @@ pub fn main() !void {
     const reconcile_period_ns: i128 = reconcile_secs * std.time.ns_per_s;
     var last_reconcile_ns: i128 = 0;
 
+    // Dedicated operator-metrics HTTP/1.1 listener (mirrors the worker's): a
+    // loopback /metrics on REWIND_CP_METRICS_PORT (default 9111 — distinct from
+    // the worker's 9110 so both coexist on one host; 0 disables). Independent
+    // thread + socket, so /metrics stays scrapable while the CP loop is wedged
+    // — exactly the directory-election incident this surfaces. A bind failure
+    // logs and runs without it (metrics are optional).
+    const cp_metrics_srv: ?*MetricsServer = blk: {
+        const mport: u16 = if (std.posix.getenv("REWIND_CP_METRICS_PORT")) |s|
+            (std.fmt.parseInt(u16, std.mem.trim(u8, s, " \t"), 10) catch 9111)
+        else
+            9111;
+        if (mport == 0) break :blk null;
+        const maddr = std.net.Address.parseIp("127.0.0.1", mport) catch break :blk null;
+        const srv = MetricsServer.init(allocator, maddr) catch |err| {
+            std.log.warn("rewind-cp: metrics listener bind :{d} failed ({s}) — running without /metrics", .{ mport, @errorName(err) });
+            break :blk null;
+        };
+        std.log.info("rewind-cp: operator metrics on 127.0.0.1:{d}/metrics", .{mport});
+        break :blk srv;
+    };
+    defer if (cp_metrics_srv) |ms| ms.deinit();
+    var last_metrics_ns: i128 = 0;
+
     std.log.info("rewind-cp: listening on 0.0.0.0:{d} (move control {s}, reconcile {s})", .{
         port,
         if (move_secret != null) "enabled" else "disabled",
@@ -2030,6 +2142,19 @@ pub fn main() !void {
             if (now_ns - last_reconcile_ns > reconcile_period_ns) {
                 last_reconcile_ns = now_ns;
                 router.reconcileMembership();
+            }
+        }
+
+        // Re-render + publish the metrics snapshot ~every 2s (the CP loop is the
+        // only thread that may read the counters; the listener serves bytes).
+        if (cp_metrics_srv) |ms| {
+            const now_ns = std.time.nanoTimestamp();
+            if (now_ns - last_metrics_ns > 2 * std.time.ns_per_s) {
+                last_metrics_ns = now_ns;
+                if (buildCpMetricsText(allocator, &router, cp_bridge)) |txt| {
+                    defer allocator.free(txt);
+                    ms.publish(txt);
+                } else |_| {}
             }
         }
     }
