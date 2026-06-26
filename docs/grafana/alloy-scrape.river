@@ -1,0 +1,41 @@
+// Rewind operator-metrics scrape config (Grafana Alloy / River) — the
+// scrape-side half of docs/architecture/observability.md. This is the
+// rewind-specific portion of each node's ~/.config/alloy/config.alloy
+// (creds + the remote_write/loki blocks are provisioned out-of-band and are
+// NOT in this repo). Committed per the observability.md "ship the Alloy config"
+// note so the scrape story is reviewable.
+//
+// Each process serves Prometheus text on a dedicated loopback HTTP/1.1 port
+// (REWIND_{,CP_,FRONT_}METRICS_PORT). Loopback IS the auth — the node-local
+// Alloy is the only scraper. `prometheus.remote_write.gc` is the Grafana Cloud
+// receiver defined elsewhere in config.alloy.
+
+prometheus.scrape "rewind_worker" {
+  targets = [{
+    __address__ = "127.0.0.1:9110",
+    job         = "rewind-worker",
+    instance    = constants.hostname,
+  }]
+  forward_to      = [prometheus.remote_write.gc.receiver]
+  scrape_interval = "30s"
+}
+
+prometheus.scrape "rewind_cp" {
+  targets = [{
+    __address__ = "127.0.0.1:9111",
+    job         = "rewind-cp",
+    instance    = constants.hostname,
+  }]
+  forward_to      = [prometheus.remote_write.gc.receiver]
+  scrape_interval = "30s"
+}
+
+prometheus.scrape "rewind_front" {
+  targets = [{
+    __address__ = "127.0.0.1:9112",
+    job         = "rewind-front",
+    instance    = constants.hostname,
+  }]
+  forward_to      = [prometheus.remote_write.gc.receiver]
+  scrape_interval = "30s"
+}
