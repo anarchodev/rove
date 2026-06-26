@@ -55,6 +55,15 @@ for `severity: page` (the consensus/availability wedges) vs `severity: ticket`
 (degradations). Every rule has a `for:` — a brief election or reconnect is
 normal; the alerts fire only on **sustained** conditions.
 
+**Live deployment (2026-06-26):** these are deployed to the `keeneagle1637`
+Grafana stack as **Grafana-managed** rules (folder **Rewind**, group `rewind`,
+1m eval) — pushed via the Grafana ruler API with a service-account token, since
+that's what the available token scoped to (`alert.rules:write`, not the Mimir
+`rules:write` a `mimirtool` load needs). The YAML above is the equivalent
+portable Mimir-ruler form, kept as the version-controlled source of truth; the
+dashboard JSON is the live dashboard. All 10 evaluate `health=ok`, `inactive`
+on a healthy cluster.
+
 ## What's covered — and what's not (yet)
 
 The **serving RED signal** is in: `http_requests_total{code}` (rate + error ratio,
