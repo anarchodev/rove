@@ -1346,6 +1346,18 @@ fn handleMetrics(
     sess: h2.Session,
     cors_origin: ?[]const u8,
 ) !void {
+    const body = try buildMetricsText(allocator, worker);
+    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, body, allocator, cors_origin, "text/plain; version=0.0.4");
+}
+
+/// Render the operator metrics as Prometheus text into a caller-owned buffer —
+/// the shared body builder behind BOTH `/_system/metrics` (h2c, manual probe)
+/// and the dedicated h1 metrics listener (`metrics_server`, the scrape target).
+/// MUST run on the worker thread: it reads live per-worker h2/dispatch state and
+/// shared raft state with no lock, and the worker thread is that state's only
+/// writer. (The h1 listener never calls this — the worker thread renders and
+/// `publish`es the bytes to it.)
+pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
@@ -1495,12 +1507,11 @@ fn handleMetrics(
         , .{coord.retainedBatchCount()});
     }
 
-    // Move the writer's accumulated bytes back into the ArrayList,
-    // then transfer ownership to the response body. `toArrayList`
-    // does NOT free the writer's buffer — it hands it back to us.
+    // Move the writer's accumulated bytes back into the ArrayList and hand
+    // ownership to the caller. `toArrayList` does NOT free the writer's buffer —
+    // it hands it back to us.
     buf = aw.toArrayList();
-    const body = try buf.toOwnedSlice(allocator);
-    try respb.setSystemResponseOwned(server, ent, sid, sess, 200, body, allocator, cors_origin, "text/plain; version=0.0.4");
+    return try buf.toOwnedSlice(allocator);
 }
 
 /// Render a kvexp.MetricsSnapshot as Prometheus text. Counter totals

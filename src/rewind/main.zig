@@ -108,7 +108,19 @@ const WorkerCtx = struct {
     /// (single-node / unset) → the catch-up thread logs + no-ops any job.
     peer_urls: []const []const u8,
     ready: *std.Thread.ResetEvent,
+    /// Dedicated loopback HTTP/1.1 operator-metrics listener
+    /// (`REWIND_METRICS_PORT`). The worker thread renders the Prometheus
+    /// snapshot every few seconds and `publish`es it here. Null = disabled
+    /// (port 0, or the bind failed — metrics are optional).
+    metrics: ?*rjs.MetricsServer = null,
 };
+
+/// Parse a `u16` port from `name`, falling back to `default` when unset or
+/// malformed. `0` is a valid value (disables the listener at the call site).
+fn parsePortEnv(name: []const u8, default: u16) u16 {
+    const s = std.posix.getenv(name) orelse return default;
+    return std.fmt.parseInt(u16, s, 10) catch default;
+}
 
 /// V2 on-promotion recovery hook — closes the two failover-recovery gaps the
 /// smoke audit surfaced (`leader_failover_smoke_v2` / `durable_wake_smoke_v2`).
@@ -281,6 +293,12 @@ fn workerMain(args: *WorkerCtx) !void {
     args.ready.set();
 
     var blocked_tenants: rjs.BlockedTenants = .{};
+    // Render + publish the operator-metrics snapshot to the loopback HTTP/1.1
+    // listener every ~2s (cheap; the listener serves the latest — a few seconds
+    // stale is nothing for a 60s scrape). `last_metrics_ns = 0` makes the first
+    // iteration publish immediately. The render MUST run on this thread:
+    // buildMetricsText reads live h2/dispatch + raft state only it may touch.
+    var last_metrics_ns: i64 = 0;
     // Deploy capability is bootstrapped explicitly via `POST /_system/reset`
     // (rewind-cli-plan §4) — the operator/harness deploys the baked `__admin__`
     // app once, then publishes the full admin + customers THROUGH it. The same
@@ -329,6 +347,17 @@ fn workerMain(args: *WorkerCtx) !void {
         rjs.serviceSubscriptionFires(worker);
         rjs.drainPendingBoundResumes(worker);
         rjs.serviceFetchEvents(worker);
+
+        if (args.metrics) |ms| {
+            const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+            if (now_ns - last_metrics_ns > 2 * std.time.ns_per_s) {
+                last_metrics_ns = now_ns;
+                if (rjs.buildMetricsText(args.allocator, worker)) |txt| {
+                    ms.publish(txt);
+                    args.allocator.free(txt);
+                } else |_| {}
+            }
+        }
     }
 }
 
@@ -861,6 +890,25 @@ pub fn main() !void {
 
     // One worker thread bound to the listen port (SO_REUSEPORT-ready).
     const addr = try std.net.Address.parseIp("0.0.0.0", port);
+
+    // Dedicated loopback HTTP/1.1 operator-metrics listener — separate from the
+    // h2c data port (:8443) so stock Prometheus/Alloy can scrape it (they can't
+    // speak h2c), and so `/metrics` stays answerable when the main h2 path is
+    // wedged. Bound to 127.0.0.1 (node-local Alloy scrapes; network isolation is
+    // the auth). `REWIND_METRICS_PORT=0` disables it; default 9110.
+    const metrics_srv: ?*rjs.MetricsServer = blk: {
+        const ms_port = parsePortEnv("REWIND_METRICS_PORT", 9110);
+        if (ms_port == 0) break :blk null;
+        const ms_addr = std.net.Address.parseIp("127.0.0.1", ms_port) catch break :blk null;
+        const srv = rjs.MetricsServer.init(allocator, ms_addr) catch |err| {
+            std.log.warn("rewind: operator metrics listener disabled — bind 127.0.0.1:{d} failed ({s})", .{ ms_port, @errorName(err) });
+            break :blk null;
+        };
+        std.log.info("rewind: operator metrics on http://127.0.0.1:{d}/metrics", .{ms_port});
+        break :blk srv;
+    };
+    defer if (metrics_srv) |m| m.deinit();
+
     var ready = std.Thread.ResetEvent{};
     var ctx = WorkerCtx{
         .allocator = allocator,
@@ -876,6 +924,7 @@ pub fn main() !void {
         .cp_urls = cp_urls,
         .peer_urls = peer_urls,
         .ready = &ready,
+        .metrics = metrics_srv,
     };
     var th = try std.Thread.spawn(.{}, workerThreadEntry, .{&ctx});
     ready.wait();
