@@ -9,19 +9,21 @@
 #     1 node down, so one-at-a-time keeps quorum the whole way. REFUSES to run
 #     if no directory leader is reachable (a virgin cluster — use genesis).
 #
-#   GENESIS (--genesis) — cold bring-up of a VIRGIN cluster from empty. Pushes
-#     binaries to all hosts, starts every CP together so the cold-multi
-#     directory group can form quorum + elect, starts workers (self-only) +
-#     fronts, then drives `rewind-ops genesis` (register addrs → provision
-#     __admin__ born {1} → reconciler grows it to all N → reset/deploy). REFUSES
-#     if a directory leader already exists (the cluster is formed — use rolling),
+#   GENESIS (--genesis) — clean-slate cold bring-up of a VIRGIN/wiped cluster.
+#     WIPES ~/.rove/data on all hosts, pushes binaries, starts every CP together
+#     so the cold-multi directory group forms quorum + elects, starts workers
+#     (cold-multi) + fronts, then drives `rewind-ops genesis` (register addrs →
+#     provision __admin__ born {1,2,3} cold-multi → reset/deploy). REFUSES if a
+#     directory leader already exists (the cluster is formed — use rolling),
 #     unless ROVE_GENESIS_FORCE=1. The 2026-06-24 outage was rolling silently
 #     unable to bring a cluster up from empty; this is the split that fixes it.
 #
-# What NEITHER mode does: push env files / secrets (provisioned out-of-band —
-# for genesis the nodes' active EnvironmentFile MUST be the genesis profile,
-# scripts/systemd/v2/*.genesis.example: workers self-only, CP cold-multi +
-# reconciler on), run sudo (except optional setcap).
+# ONE env profile (cold-multi) for both modes: every raft group is born with the
+# full static voter set (REWIND_VOTERS/REWIND_PEERS, REWIND_CP_VOTERS/_PEERS) and
+# elects on its own; the membership reconciler stays OFF (re-armed only for
+# deliberate DR-learner adds). What NEITHER mode does: push env files / secrets
+# (provisioned out-of-band — scripts/systemd/v2/{common,node}.env.example), run
+# sudo (except optional setcap).
 #
 # Usage:
 #   cp scripts/deploy.conf.example ~/.config/rove/deploy.conf  # edit it
@@ -192,7 +194,7 @@ push_binaries(){
 
 # ── 2a. GENESIS: cold bring-up from empty ─────────────────────────────
 if [ "$MODE" = genesis ]; then
-    : "${ROVE_GENESIS_ENV:?genesis needs ROVE_GENESIS_ENV — path to the rewind-ops --env file (ROVE_CP_URL_INTERNAL, ROVE_WORKER_URLS, REWIND_MOVE_SECRET, REWIND_ROOT_TOKEN, REWIND_ADMIN_DOMAIN, ROVE_CLUSTER, ROVE_GENESIS_NODES). See scripts/systemd/v2/*.genesis.example + rewind-ops genesis.}"
+    : "${ROVE_GENESIS_ENV:?genesis needs ROVE_GENESIS_ENV — path to the rewind-ops --env file (ROVE_CP_URL_INTERNAL, ROVE_WORKER_URLS, REWIND_MOVE_SECRET, REWIND_ROOT_TOKEN, REWIND_ADMIN_DOMAIN, ROVE_CLUSTER, ROVE_GENESIS_NODES). See scripts/systemd/v2/{common,node}.env.example + rewind-ops genesis.}"
     [ -f "$ROVE_GENESIS_ENV" ] || die "ROVE_GENESIS_ENV not found: $ROVE_GENESIS_ENV"
 
     log "GENESIS mode — cold bring-up of: $ROVE_HOSTS"
@@ -223,26 +225,19 @@ if [ "$MODE" = genesis ]; then
         else
             ok "$host: reachable, services down (clean genesis target)"
         fi
-        # Worker env PROFILE check: bootstrap-1-grow needs workers SELF-ONLY, so
-        # REWIND_VOTERS / REWIND_PEERS must be ABSENT from the active worker env.
-        # If they're set (the rolling/cold-multi profile), the worker boots
-        # cold-multi and the genesis flow's born-{1}+grow assumptions don't hold.
-        vset=$($SSH "$host" 'grep -lE "^[[:space:]]*(REWIND_VOTERS|REWIND_PEERS)=" ~/.config/rove/common.env ~/.config/rove/node.env 2>/dev/null | tr "\n" " "' 2>/dev/null || true)
-        if [ -n "$vset" ]; then
-            warn "$host: REWIND_VOTERS/REWIND_PEERS set in [$vset] — this is the ROLLING (cold-multi) worker profile, NOT genesis self-only. Switch to the genesis profile (scripts/systemd/v2/common.env.genesis.example) before a real genesis."
-            profile_warn=1
+        # Worker env PROFILE check: cold-multi needs the static voter/peer set
+        # PRESENT in the active worker env — every raft group is born with the
+        # full {1,2,3} and elects on its own. If REWIND_VOTERS/REWIND_PEERS are
+        # absent the worker boots self-only and __admin__ never forms {1,2,3}.
+        if $SSH "$host" 'grep -qE "^[[:space:]]*REWIND_VOTERS=" ~/.config/rove/common.env ~/.config/rove/node.env 2>/dev/null' \
+           && $SSH "$host" 'grep -qE "^[[:space:]]*REWIND_PEERS=" ~/.config/rove/common.env ~/.config/rove/node.env 2>/dev/null'; then
+            ok "$host: worker env is cold-multi (REWIND_VOTERS/REWIND_PEERS set)"
         else
-            # Self-only: the worker can't derive its raft listen addr from
-            # REWIND_PEERS, so REWIND_RAFT_ADDR must be set (node.env.genesis).
-            if $SSH "$host" 'grep -qE "^[[:space:]]*REWIND_RAFT_ADDR=" ~/.config/rove/node.env ~/.config/rove/common.env 2>/dev/null'; then
-                ok "$host: worker env is self-only + REWIND_RAFT_ADDR set (genesis profile)"
-            else
-                warn "$host: worker is self-only but REWIND_RAFT_ADDR is UNSET — a genesis worker can't pick its raft listen addr. Add REWIND_RAFT_ADDR=<ip>:8501 to node.env."
-                profile_warn=1
-            fi
+            warn "$host: REWIND_VOTERS/REWIND_PEERS NOT set — cold-multi genesis needs the static voter set (scripts/systemd/v2/common.env.example); __admin__ will not form {1,2,3} without it."
+            profile_warn=1
         fi
     done
-    [ "$profile_warn" = 1 ] && warn "ONE OR MORE NODES are on the rolling worker profile — genesis will likely mis-form __admin__ until they're switched to self-only."
+    [ "$profile_warn" = 1 ] && warn "ONE OR MORE NODES are missing the cold-multi voter set — fix common.env (REWIND_VOTERS/REWIND_PEERS) before genesis or __admin__ will mis-form."
     # Preview the leader guard (does NOT mutate). A leader present means the
     # cluster is already formed → genesis would refuse (unless FORCE).
     if directory_leader_present; then
@@ -253,13 +248,14 @@ if [ "$MODE" = genesis ]; then
 
     if [ "$DRY_RUN" = 1 ]; then
         log "DRY-RUN plan (genesis) — would, in order:"
-        echo "   1. push rewind-{worker,cp,front} to: $ROVE_HOSTS"
-        echo "   2. restart rewind-cp on ALL hosts together → wait for the cold-multi directory leader (≤${CP_ELECT_TIMEOUT}s)"
-        echo "   3. restart rewind-worker (self-only) + rewind-front on each host; health-gate each"
-        echo "   4. run: $OUT/rewind-ops genesis --env $ROVE_GENESIS_ENV"
-        echo "      (register node addrs → provision __admin__ {1} → reconciler grows to N → reset/deploy)"
-        echo "   PRECONDITION reminder: each node's active EnvironmentFile must be the GENESIS profile"
-        echo "   (workers self-only: no REWIND_VOTERS/REWIND_PEERS; CP cold-multi + REWIND_CP_RECONCILE_MEMBERSHIP=1)."
+        echo "   1. WIPE: stop+disable cp/worker/front + rm ~/.rove/data/{cp,worker} on: $ROVE_HOSTS"
+        echo "   2. push rewind-{worker,cp,front} to all hosts"
+        echo "   3. restart rewind-cp on ALL hosts together → wait for the cold-multi directory leader (≤${CP_ELECT_TIMEOUT}s)"
+        echo "   4. restart rewind-worker (cold-multi) + rewind-front on each host; health-gate each"
+        echo "   5. run: $OUT/rewind-ops genesis --env $ROVE_GENESIS_ENV"
+        echo "      (register node addrs → provision __admin__ born {1,2,3} cold-multi → reset/deploy)"
+        echo "   PRECONDITION reminder: each node's active EnvironmentFile is the cold-multi profile"
+        echo "   (workers REWIND_VOTERS/REWIND_PEERS set; CP cold-multi; reconciler OFF)."
         log "DRY-RUN complete — no prod mutation performed"
         exit 0
     fi
@@ -274,6 +270,20 @@ if [ "$MODE" = genesis ]; then
             die "a directory leader already exists (via $LEADER_VIA) — the cluster is formed. Use rolling (scripts/deploy.sh), or ROVE_GENESIS_FORCE=1 to override (only after a deliberate data wipe)."
         fi
     fi
+
+    # WIPE: genesis is a clean-slate bring-up — stop every service and remove the
+    # raft/data dirs on all hosts so each group is born fresh from empty. Safe by
+    # construction: the leader guard above already refused on a FORMED cluster
+    # (only a virgin/down cluster, or an explicit ROVE_GENESIS_FORCE after a
+    # deliberate decision, reaches here). Destructive + irreversible.
+    log "WIPE: stop services + remove ~/.rove/data/{cp,worker} on all hosts"
+    for host in $ROVE_HOSTS; do
+        for svc in front worker cp; do
+            $SSH "$host" "$RUSER_ENV systemctl --user stop rewind-$svc.service 2>/dev/null; $RUSER_ENV systemctl --user disable rewind-$svc.service 2>/dev/null" >/dev/null 2>&1 || true
+        done
+        $SSH "$host" 'rm -rf ~/.rove/data/cp ~/.rove/data/worker' || die "$host: data wipe failed"
+        ok "$host: services stopped, data wiped"
+    done
 
     log "Push binaries to all hosts"
     for host in $ROVE_HOSTS; do push_binaries "$host"; done
@@ -295,7 +305,7 @@ if [ "$MODE" = genesis ]; then
     done
     ok "directory leader present (via $LEADER_VIA) — cold-multi CP genesis succeeded"
 
-    log "Start workers (self-only) + fronts on all hosts"
+    log "Start workers (cold-multi) + fronts on all hosts"
     for host in $ROVE_HOSTS; do
         $SSH "$host" "$RUSER_ENV systemctl --user restart rewind-worker.service" || die "$host: worker start failed"
         wait_health "$host" worker "http://localhost:8443/_system/health"
@@ -303,14 +313,13 @@ if [ "$MODE" = genesis ]; then
         wait_health "$host" front
     done
 
-    # Drive the operator-side membership bring-up: register addrs → provision
-    # __admin__ (born {1}) → reconciler grows it to all N → reset/deploy. This
-    # is the tested bootstrap-1-grow path (rewind-ops genesis); deploy.sh just
-    # stood the processes up for it.
-    log "Run rewind-ops genesis (register → provision __admin__ → grow → reset)"
+    # Drive the operator-side bring-up: register node addrs → provision __admin__
+    # (born {1,2,3} cold-multi, reconciler off) → reset/deploy the baked app.
+    # deploy.sh just stood the processes up; rewind-ops genesis forms __admin__.
+    log "Run rewind-ops genesis (register → provision __admin__ {1,2,3} → reset)"
     "$OUT/rewind-ops" genesis --env "$ROVE_GENESIS_ENV" || die "rewind-ops genesis failed — see output above"
 
-    log "GENESIS complete — cluster formed, __admin__ grown + deploy-capable"
+    log "GENESIS complete — cluster formed cold-multi, __admin__ deploy-capable"
     ok "next: provision tenants + publish bundles; future updates use rolling (scripts/deploy.sh)"
     exit 0
 fi

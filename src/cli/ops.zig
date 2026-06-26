@@ -208,7 +208,7 @@ fn cmdBootstrap(a: std.mem.Allocator, env: *const c.Env) void {
     std.debug.print("bootstrap complete — deploy capability live; publish with `rewind-ops deploy`\n", .{});
 }
 
-// ── genesis: cold bring-up of a virgin cluster (CP-driven bootstrap-1-grow) ──
+// ── genesis: cold bring-up of a virgin cluster (cold-multi) ──
 
 const GenNode = struct {
     id: u64,
@@ -284,8 +284,8 @@ fn registerNodeAddr(a: std.mem.Allocator, env: *const c.Env, cluster: []const u8
     fatal("node {d} address registration failed — CP directory group has no leader? (check rewind-cp logs)", .{n.id});
 }
 
-/// POST /_control/provision, retrying (a fresh born-{self} attach can transiently
-/// 5xx while the cluster settles). 204 = placed, 409 = already placed (idempotent).
+/// POST /_control/provision, retrying (a fresh cold-multi attach can transiently
+/// 5xx while the group forms + elects). 204 = placed, 409 = already placed (idempotent).
 fn provisionRetry(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, cluster: []const u8, host: ?[]const u8) void {
     var body = std.ArrayList(u8){};
     body.appendSlice(a, "{\"tenant\":") catch oom();
@@ -334,8 +334,9 @@ fn countJsonArray(body: []const u8, key: []const u8) usize {
 }
 
 /// Poll the workers' leader-gated `/_system/v2-member-status?tenant=` (move-secret)
-/// until the group reports `want` voters — i.e. the CP reconciler finished growing
-/// the born-{self} group to the full node set. Followers 409/421; the leader 200s.
+/// until the group reports `want` voters. Under cold-multi the group is born with
+/// the full voter set, so this confirms formation (≈instant) rather than waiting
+/// on a grow. Followers 409/421; the leader 200s.
 fn waitVoters(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, want: usize, timeout_s: i64) void {
     const ms = env.require("REWIND_MOVE_SECRET");
     const headers = [_]Header{.{ .name = "X-Rewind-Move-Secret", .value = ms }};
@@ -360,30 +361,31 @@ fn waitVoters(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, want:
         }
         std.Thread.sleep(2 * std.time.ns_per_s);
     }
-    fatal("{s} did not grow to {d} voters within {d}s — check the CP reconciler (REWIND_CP_RECONCILE_MEMBERSHIP=1?)", .{ tenant, want, timeout_s });
+    fatal("{s} did not form with {d} voters within {d}s — check the cold-multi worker env (REWIND_VOTERS/REWIND_PEERS set on all nodes?) and the worker logs", .{ tenant, want, timeout_s });
 }
 
-/// Cold bring-up of a virgin cluster via the tested bootstrap-1-grow path.
-/// Assumes the binaries are already launched in GENESIS-mode env (workers
-/// self-only — REWIND_NODE_ID+REWIND_RAFT_ADDR, no REWIND_VOTERS/PEERS; CP with
-/// REWIND_CP_RECONCILE_MEMBERSHIP=1). This drives the operator-side sequence:
-///   1. register every node's transport address (gates on the CP directory leader),
-///   2. provision __admin__ (births sole voter {1} on node 1, auto-leads),
-///   3. wait for the reconciler to grow it to all N voters,
+/// Cold bring-up of a virgin/wiped cluster (cold-multi). Assumes the binaries are
+/// already launched on the cold-multi env (workers + CP carry the full static
+/// voter set REWIND_VOTERS/REWIND_PEERS + REWIND_CP_VOTERS/_PEERS; reconciler
+/// OFF). This drives the operator-side sequence:
+///   1. register every node's transport address (gates on the CP directory leader,
+///      and seeds the registry for later DR-learner adds / moves),
+///   2. provision __admin__ (born {1,2,3} cold-multi, elects on its own),
+///   3. confirm __admin__ formed with all N voters,
 ///   4. deploy the baked __admin__ app (reset) → deploy-capable.
 fn cmdGenesis(a: std.mem.Allocator, env: *const c.Env, cluster: []const u8) void {
     const spec = env.get("ROVE_GENESIS_NODES") orelse
         fatal("genesis needs ROVE_GENESIS_NODES (\"id=raft_addr[,cp_raft[,http]];…\")", .{});
     const nodes = parseGenesisNodes(a, spec);
-    std.debug.print("genesis: cold bring-up of {d}-node cluster '{s}'\n", .{ nodes.len, cluster });
+    std.debug.print("genesis: cold bring-up of {d}-node cluster '{s}' (cold-multi)\n", .{ nodes.len, cluster });
 
     std.debug.print("[1/4] register node addresses (also waits for the CP directory leader)\n", .{});
     for (nodes) |n| registerNodeAddr(a, env, cluster, n);
 
-    std.debug.print("[2/4] provision __admin__ (births {{1}} on node 1; reconciler grows it)\n", .{});
+    std.debug.print("[2/4] provision __admin__ (born {{1,2,3}} cold-multi)\n", .{});
     provisionRetry(a, env, "__admin__", cluster, env.require("REWIND_ADMIN_DOMAIN"));
 
-    std.debug.print("[3/4] wait for __admin__ to grow to {d} voters\n", .{nodes.len});
+    std.debug.print("[3/4] confirm __admin__ formed with {d} voters\n", .{nodes.len});
     waitVoters(a, env, "__admin__", nodes.len, 120);
 
     std.debug.print("[4/4] deploy the baked __admin__ app (reset)\n", .{});

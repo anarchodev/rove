@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Validate `rewind-ops genesis` end to end against a real genesis cluster.
 
-V2Cluster.spawn(genesis=True) brings the binaries up self-only + registers node
-addresses, but provisions NOTHING. This test then drives the OPERATOR command —
-`rewind-ops genesis` — to bring the empty cluster to deploy-capable, and asserts
-__admin__ grew to 3 voters. It exercises the command's arg parsing
-(ROVE_GENESIS_NODES), JSON bodies, and the register→provision→wait→reset
-orchestration against the live primitives.
+V2Cluster.spawn(genesis=True) brings the binaries up cold-multi (full static
+voter set) + registers node addresses, but provisions NOTHING. This test then
+drives the OPERATOR command — `rewind-ops genesis` — to bring the empty cluster
+to deploy-capable, and asserts __admin__ formed with 3 voters. It exercises the
+command's arg parsing (ROVE_GENESIS_NODES), JSON bodies, and the
+register→provision→confirm→reset orchestration against the live primitives.
 
 Run:  set -a; . ./.env; set +a
       zig build rewind-worker rewind-cp rewind-front rewind-ops -Doptimize=ReleaseFast

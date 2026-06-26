@@ -1,10 +1,39 @@
 ---
-title: Cluster Genesis & Membership — bootstrap-one-then-grow
-status: in progress — Phase 1 complete; Phase 2 mechanism landed (production flip gated on Phase-4 smoke). See §6.
+title: Cluster Genesis & Membership — cold-multi (bootstrap-grow superseded)
+status: SUPERSEDED by cold-multi for genesis — see the banner. Bootstrap-grow mechanism retained only for DR-learner adds.
 date: 2026-06-24
 ---
 
 # Cluster Genesis & Membership
+
+> ⚠️ **SUPERSEDED (2026-06-26): cold-multi is the one genesis path, not
+> bootstrap-one-then-grow.** This doc below is the design record of the
+> bootstrap-grow arc, written when cold multi-node genesis was believed
+> *fundamentally* broken on real nodes (§0). It is not — that wedge was a
+> `raft_net` **transport** bug (zombie-connect on a torn-down fd; recv armed on
+> a still-`.connecting` socket → the in-flight dial torn down → the connect CQE
+> then mis-marks a dead fd `.connected` → `send` no-ops forever). Fixed in
+> commit `7feac92`; cross-host cold-multi now elects in 1–2 s
+> (`cp_genesis_realhost.sh` 4/4). Combined with the ratified architecture —
+> rove is **small FIXED clusters**, every group fully replicated across its
+> cluster's nodes, scale by adding *clusters* + tenant *moves* (not by growing a
+> store pool) — **cold-multi is the correct fit**, and the one way clusters form:
+> every raft group is born with the full static voter set (`REWIND_VOTERS`/
+> `REWIND_PEERS`, `REWIND_CP_VOTERS`/`_PEERS`) and elects on its own.
+>
+> What this means for the rest of this doc:
+> - **Genesis = cold-multi**, driven by `scripts/deploy.sh --genesis` (wipe →
+>   start all together → cold-form → `rewind-ops genesis` provisions `__admin__`
+>   born `{1,2,3}`). One env profile for genesis and rolling.
+> - The **bootstrap-one-then-grow mechanism** (born-`{self}` auto-lead + the CP
+>   reconciler's learner-add → promote) still **exists in code** but is **off by
+>   default** and used ONLY for deliberate ops — a **DR async-learner add**.
+>   Tenant **moves** are a separate path (`rewind-ops move`). The
+>   timer-promote-before-catchup bug (the `{1,2}` wedge) must be fixed before the
+>   reconciler is re-armed for any promote.
+> - Sections §3.1 (self-only config), §3.4–3.5 (genesis/grow), §5 (deploy
+>   tooling) describe the *old* path; read them as history. The CI gate
+>   (`genesis_smoke_v2.py`) now tests cold-multi.
 
 How a rove cluster is *brought up from nothing* and how nodes *join* it —
 and the decision to make that the **only** path, tested the way it really

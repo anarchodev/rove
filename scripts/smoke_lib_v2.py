@@ -324,41 +324,36 @@ class V2Cluster:
                                      {"exp": int((time.time() + 3600) * 1000)})
 
     def _boot_genesis(self, nodes: int) -> None:
-        """Genesis bring-up (cluster-genesis-and-membership §4): each worker
-        boots SELF-ONLY (genesis mode — no static voter/peer set), a single-node
-        CP runs with the membership reconciler ENABLED, and every node's raft
-        address is registered with the CP. A later `provision` then births the
-        tenant group as the sole voter {1} on node 1; the reconciler grows it to
-        all `nodes` learner-first. This exercises the real first-deploy /
-        post-wipe path the cold-multi formation never could (the 2026-06-24
-        prod-genesis-gap outage)."""
+        """Genesis bring-up (cold-multi, cluster-genesis-and-membership §3): every
+        worker boots cold-multi (the full static voter/peer set), a single-node CP
+        runs with the membership reconciler OFF, and every node's raft address is
+        registered with the CP. A later `provision` then births the tenant group
+        with the full voter set {1..N}, which elects on its own — no grow. This
+        exercises the real first-deploy / post-wipe path the cold-multi formation
+        the 2026-06-24 prod-genesis-gap outage demanded coverage for."""
         self._voters = ",".join(str(i + 1) for i in range(nodes))
         self._peers = ",".join(f"127.0.0.1:{rp}" for rp in self.raft_ports)
-        # CP + front log to FILES (not PIPEs): the genesis grow is CP-driven, so
-        # the reconciler's attach/conf-change decisions must be inspectable, and
-        # an un-drained CP pipe would wedge mid-run (the classic multi-process
-        # smoke flake). Node workers already file-log via `_spawn_node`.
+        # CP + front log to FILES (not PIPEs): an un-drained CP pipe would wedge
+        # mid-run (the classic multi-process smoke flake). Node workers already
+        # file-log via `_spawn_node`.
         log_dir = f"/tmp/v2smoke-{self.tag}-{os.getpid()}-cplog"
         subprocess.run(["mkdir", "-p", log_dir])
         self.log_paths["cp"] = os.path.join(log_dir, f"cp-{os.getpid()}.log")
         self.log_paths["front"] = os.path.join(log_dir, f"front-{os.getpid()}.log")
+        # Workers boot cold-multi (full voter/peer set) — groups born {1..N}.
         for i in range(nodes):
-            self._spawn_node(i, "", "", genesis=True)
+            self._spawn_node(i, self._voters, self._peers)
         nodes_csv = ",".join(f"http://127.0.0.1:{p}" for p in self.node_ports)
-        # Single-node CP with the reconciler ON (fast period for the smoke), so a
-        # born-{self} tenant group is grown to the full node set automatically.
+        # Single-node CP, reconciler OFF — cold-multi groups need no grow;
+        # `provision` births the full voter set directly.
         spawn_cp(self.procs, self.cp_port,
                  clusters=f"{self.cluster_id}={nodes_csv}",
                  hosts="", placement="", cp_data_dir=str(self.cp_data_dir),
-                 move_secret=MOVE_SECRET,
-                 reconcile_secs=1, log_dir=log_dir,
-                 extra_env={"REWIND_CP_RECONCILE_MEMBERSHIP": "1",
-                            # short demote grace so a smoke converges quickly; the
-                            # grow path never demotes a healthy node anyway.
-                            "REWIND_CP_DEMOTE_GRACE_MS": "3000"})
+                 move_secret=MOVE_SECRET, log_dir=log_dir)
         # Register each node's raft transport address with the CP registry
-        # (node/{cluster}/{id} → raft_addr), the id→address map the leader dials
-        # to grow the group and the joiner learns via §4d attach-carry.
+        # (node/{cluster}/{id} → raft_addr). Not needed to FORM a cold-multi group,
+        # but it is the real genesis flow's step 1 and seeds the registry for later
+        # deliberate membership ops (a DR-learner add / a tenant move).
         for i in range(nodes):
             self.register_node_addr(i)
         spawn_front(self.procs, self.front_port,
@@ -407,9 +402,9 @@ class V2Cluster:
 
     def wait_for_membership(self, tenant: str, *, voters: int,
                             timeout: float = 40.0) -> dict:
-        """Block until `tenant`'s group has grown to exactly `voters` caught-up
-        voters (the reconciler converged the born-{self} group to the full node
-        set). Returns the leader's member-status. Raises on timeout."""
+        """Block until `tenant`'s group reports at least `voters` caught-up voters.
+        Under cold-multi the group is born with the full voter set, so this confirms
+        formation (≈instant). Returns the leader's member-status. Raises on timeout."""
         deadline = time.time() + timeout
         last = None
         while time.time() < deadline:
@@ -424,25 +419,18 @@ class V2Cluster:
             f"membership for {tenant} did not reach {voters} voters within "
             f"{timeout}s (last={last})")
 
-    def _spawn_node(self, i: int, voters: str, peers: str,
-                    genesis: bool = False) -> None:
+    def _spawn_node(self, i: int, voters: str, peers: str) -> None:
         env = dict(os.environ)
         env["REWIND_ADMIN_DOMAIN"] = f"n{i + 1}.localhost"
         env["REWIND_PUBLIC_SUFFIX"] = PUBLIC_SUFFIX
         env["REWIND_ROOT_TOKEN"] = self.root_token
         env["REWIND_MOVE_SECRET"] = MOVE_SECRET
         env["REWIND_NODE_ID"] = str(i + 1)
-        if genesis:
-            # Genesis first-boot (cluster-genesis-and-membership §3.4): own raft
-            # id + listen addr, NOTHING else. No static voter/peer set — the node
-            # boots self-only (groups born {self}) and the CP grows it into the
-            # cluster by conf-change (provision births {1} on node 1; the RC-6
-            # reconciler grows to the full set, riding §4d attach-carry). Omitting
-            # REWIND_VOTERS/REWIND_PEERS is what trips `parseGenesis`.
-            env["REWIND_RAFT_ADDR"] = f"127.0.0.1:{self.raft_ports[i]}"
-        else:
-            env["REWIND_VOTERS"] = voters
-            env["REWIND_PEERS"] = peers
+        # Cold-multi: every node carries the full static voter/peer set, so each
+        # raft group is born {1..N} and elects on its own (genesis and steady
+        # state are the same boot — see cluster-genesis-and-membership §banner).
+        env["REWIND_VOTERS"] = voters
+        env["REWIND_PEERS"] = peers
         # Peer HTTP base URLs indexed by raft id − 1 (the worker analog of CP's
         # REWIND_CP_PEER_URLS): the leader-push target for the out-of-band
         # snapshot catch-up driver (raft-native-alignment Phase 1). Distinct from
