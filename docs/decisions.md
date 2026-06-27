@@ -682,6 +682,34 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   read-recording decision (§4.6): exactly the request inputs the handler read,
   with client IPs masked unless the handler explicitly called
   `request.unmaskedIp()`.
+- **Operator metrics ship on a dedicated loopback HTTP/1.1 `/metrics` listener
+  per process, not an auth'd route on the data port** (decided + built
+  2026-06-26; supersedes observability.md §2.1's scrape-JWT-on-`/_system/metrics`
+  plan, which §2.1 had itself listed the dedicated-port form as a *rejected*
+  alternative — reversed here). Each binary serves Prometheus text on
+  `127.0.0.1:<port>` (worker `REWIND_METRICS_PORT`=9110, CP
+  `REWIND_CP_METRICS_PORT`=9111, front `REWIND_FRONT_METRICS_PORT`=9112) off an
+  independent thread + socket. **Why the reversal:** (1) the data ports are
+  h2c-only (`accept_http1=false`) and stock Prometheus/Alloy can't scrape h2c;
+  (2) loopback IS the auth (the node-local Grafana Alloy is the only scraper —
+  the etcd/TiKV operator-metrics shape), so no scrape-JWT to mint/rotate; (3) a
+  separate thread serving a pre-rendered snapshot keeps `/metrics` answerable
+  *while the main request path is wedged* — exactly the incident you're
+  debugging. The shared renderer is `metrics_server.zig` (a top-level build
+  module) + each process's `build*MetricsText`.
+- **The serving RED signal is `http_requests_total{code}`** — bucketed by status
+  CLASS (`1xx`..`5xx`|`other`), counted in the shared rove-h2 response-emit path
+  so worker/CP/front emit it uniformly. Per the no-`tenant_id`/`request_id` rule
+  above, route/method/tenant stay OUT of the labels (trace exemplars, not
+  labels). (Note: this is the bare name + class-only labels, narrower than
+  observability.md §3's planned `rove_http_requests_total{route_class,method,...}`.)
+- **As-built (2026-06-26):** all three processes' metrics + service logs flow to
+  Grafana Cloud (Alloy per node → Prometheus + Loki). The version-controlled
+  dashboards / alert rules / scrape config live in
+  [`grafana/`](architecture/../grafana/) (10 alert rules deployed Grafana-managed;
+  the wedge signals `raft_groups_no_leader` + `raftnet_peers_unreachable` are the
+  headline). observability.md's later phases (latency histogram, exemplars,
+  tracing-to-OTLP) remain future work.
 
 ---
 
@@ -994,6 +1022,33 @@ prototype before V2 wrote code.
   (all nodes mutually raft-reachable, isolation relaxed) — then conf-change move
   becomes viable and arguably simpler. That is a *product/topology* decision, not
   a consensus-mechanics one; today's topology + the isolation goal say no.
+
+### 10.13 Cluster genesis is cold-multi — the ONE deploy path (bootstrap-1-grow superseded)
+- **Decision** (2026-06-26): a cluster is brought up **cold-multi** — every raft
+  group (CP directory + every tenant group) is born with the **full static voter
+  set** (`REWIND_VOTERS`/`REWIND_PEERS`, `REWIND_CP_VOTERS`/`_PEERS`) and elects
+  on its own. Genesis and rolling share **one** env profile; they differ only in
+  what `deploy.sh` does (`--genesis` = wipe → start-all → cold-form → provision
+  `__admin__`; default = quorum-safe rolling restart). The membership reconciler
+  stays **OFF** by default.
+- **Supersedes the bootstrap-one-then-grow arc** (`cluster-genesis-and-membership.md`):
+  groups born sole-voter `{self}` and grown by the CP reconciler. That model was
+  adopted under the belief that cold multi-node genesis was *fundamentally* broken
+  on real nodes (the 2026-06-24 outage: all-followers, no leader). **It wasn't** —
+  the wedge was a `raft_net` transport bug (zombie-connect on a torn-down fd; recv
+  armed on a still-`.connecting` socket tore down the in-flight dial, then the
+  connect CQE mis-marked a dead fd `.connected` so `send` no-op'd forever). Fixed
+  in `7feac92`; cross-host cold-multi now elects in 1–2 s. Validated end-to-end on
+  real prod 2026-06-26 (full wipe → re-genesis → all tenants serving).
+- **Why cold-multi is right (not just simpler):** rove is **small FIXED clusters**,
+  every group fully replicated across its cluster's nodes; scale by adding
+  *clusters* + tenant *moves* (§10.6, §10.12), not by growing a store pool.
+  TiKV-style grow solves a placement problem this topology deliberately doesn't
+  have. Cold-multi also avoids depending on the reconciler's timer-promote-to-voter
+  (which had a promote-before-catch-up bug that wedged a prod grow at `{1,2}`).
+- **The reconciler stays** (off by default), narrowed to deliberate ops — a DR
+  async-learner add. Tenant moves remain a separate path (`rewind-ops move`).
+  Re-arming promote-to-voter requires fixing the catch-up gate first.
 
 ---
 

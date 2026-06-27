@@ -12,6 +12,29 @@
 > commit 4ea5dd0; root-token gated, postmortem-investigation shaped)
 > — see §1 for the inventory. Nothing scrapes it.
 
+> **⏩ AS-BUILT UPDATE (2026-06-26) — the pipeline is LIVE; read this before the
+> phased plan below.** The plan in §2–§7 is partly built and partly *diverged*:
+> - **Scrape surface:** NOT one auth'd `/_system/metrics` (§2.1) — instead a
+>   **dedicated loopback HTTP/1.1 `/metrics` per process** (worker `:9110`, CP
+>   `:9111`, front `:9112`), no auth (loopback is the auth; node-local Alloy is
+>   the only scraper). This is the §2.1 "rejected alternative", reversed — see
+>   [decisions.md §7](../decisions.md) for why (h2c-unscrapable data port +
+>   answerable-while-wedged). Shared `metrics_server.zig` module.
+> - **Pipeline:** Grafana Alloy on each prod node → Grafana Cloud Prometheus
+>   (metrics) + Loki (the three service logs via a journald sidecar). LIVE on all
+>   3 nodes.
+> - **Metrics built:** the §1 io/h2/raft + kvexp inventory, PLUS the consensus
+>   wedge gauges (`raft_groups{,_led,_no_leader}`, `raftnet_peers_{configured,
+>   connected,unreachable}`), CP `cp_reconcile_*`, front `front_proxy_*`, and the
+>   serving RED signal **`http_requests_total{code}`** (status-class only; the
+>   §3 `rove_http_requests_total{route_class,method,…}` is narrower-in-practice).
+> - **Dashboards + alerts:** committed under [`../grafana/`](../grafana/) AND
+>   deployed live (Grafana-managed, 10 rules). The wedge signals
+>   (`raft_groups_no_leader`, `raftnet_peers_unreachable`) are the headline.
+> - **Still future (the plan's later phases):** `http_request_duration_seconds`
+>   latency histogram (the **D** of RED), exemplars (§2.4), tracing→OTLP (§2.5),
+>   dedicated `blob_*`/S3 metrics, JS-handler metrics, raft-rs logs→Loki.
+
 ## 0. Goal + non-goals
 
 **Goal:** ship enough operator telemetry to launch rewind.js and run an
