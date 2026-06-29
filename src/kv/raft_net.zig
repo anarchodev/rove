@@ -69,7 +69,8 @@ pub const PeerAddr = struct {
 };
 
 /// Resolves a raft node id to its transport address on demand. This is the
-/// seam (cluster-genesis-and-membership §3.3) that lets the peer table be fed
+/// seam (consensus-and-storage.md "Cluster genesis & membership", peer-address
+/// resolution) that lets the peer table be fed
 /// by the CP node-address registry instead of a static positional peer array:
 /// the transport consults the resolver the first time it has a message for a
 /// node id it hasn't dialed yet, and registers the peer via `addPeer`. Returns

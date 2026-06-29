@@ -328,7 +328,7 @@ class V2Cluster:
                                      {"exp": int((time.time() + 3600) * 1000)})
 
     def _boot_genesis(self, nodes: int) -> None:
-        """Genesis bring-up (cold-multi, cluster-genesis-and-membership §3): every
+        """Genesis bring-up (cold-multi, consensus-and-storage.md "Cluster genesis & membership"): every
         worker boots cold-multi (the full static voter/peer set), a single-node CP
         runs with the membership reconciler OFF, and every node's raft address is
         registered with the CP. A later `provision` then births the tenant group
@@ -432,7 +432,7 @@ class V2Cluster:
         env["REWIND_NODE_ID"] = str(i + 1)
         # Cold-multi: every node carries the full static voter/peer set, so each
         # raft group is born {1..N} and elects on its own (genesis and steady
-        # state are the same boot — see cluster-genesis-and-membership §banner).
+        # state are the same boot — see consensus-and-storage.md "Cluster genesis & membership" (genesis).
         env["REWIND_VOTERS"] = voters
         env["REWIND_PEERS"] = peers
         # Peer HTTP base URLs indexed by raft id − 1 (the worker analog of CP's

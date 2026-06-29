@@ -110,7 +110,8 @@ const MAX_FRAME_BODY: usize = @as(usize, raftnet.RECV_BUF_SIZE) - rpc.HEADER_SIZ
 /// Peer-slot capacity: the largest cluster this node will ever address. The
 /// per-destination buffers (`outbufs`, `hb_sent_ns`) and `raft_net`'s peer
 /// table are sized to this at init, so a node born in a small cluster can grow
-/// (cluster-genesis-and-membership §3.3) up to this bound without re-allocating
+/// (consensus-and-storage.md "Cluster genesis & membership", peer-address
+/// resolution) up to this bound without re-allocating
 /// the hot-path buffers. Matches the directory's `MAX_CLUSTER_NODES`.
 pub const MAX_CLUSTER_NODES: usize = 16;
 

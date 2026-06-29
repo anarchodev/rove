@@ -581,7 +581,8 @@ const Router = struct {
 
     /// `POST /_control/node-address {cluster, id, raft_addr, cp_raft_addr?,
     /// http_url?}` — register a node's transport addresses in the directory
-    /// node-address registry (cluster-genesis-and-membership §3.2). The explicit
+    /// node-address registry (consensus-and-storage.md "Cluster genesis &
+    /// membership", node-address registry). The explicit
     /// raft id → address binding that replaces the static positional
     /// `REWIND_PEERS`; the peer resolver reads it so a node configured with only
     /// its own identity can dial its peers. A directory WRITE: leader-gated (a

@@ -2,8 +2,10 @@
 
 **Status: north-star, not yet built.** This captures an architecture target
 that emerged from the Step 3 auth work (`step3-auth-plan.md` B4). It is the
-direction the B3/B4 increments point at; it is *not* an active build plan. The
-current incremental step is B4 (the `rewind-cp.internal` door).
+direction the B3/B4 increments point at; it is *not* an active build plan. B3
+and B4 (the `rewind-cp.internal` door) are both done (`step3-auth-plan.md`
+§B4 — door done/verified; only its delivery rides a prod publish); the
+declarative core below (steps 3–5) is the unstarted arc.
 
 ## The idea
 
@@ -57,9 +59,9 @@ reconciler substrate.
 ## Incremental path
 
 1. **B3** ✅ — CP owns `host → tenant`, propagates the worker alias.
-2. **B4** (in progress) — `rewind-cp.internal` door: the operator's CP ops
-   (provision/move/host/plan) flow through the OIDC dashboard; move-secret
-   leaves the *day-to-day* shell.
+2. **B4** ✅ (door done/verified; delivery rides a prod publish) —
+   `rewind-cp.internal` door: the operator's CP ops (provision/move/host/plan)
+   flow through the OIDC dashboard; move-secret leaves the *day-to-day* shell.
 3. **release reconciler** — CP stores desired release per tenant; push-on-change
    + periodic/rejoin convergence to workers (move-secret). Release leaves the
    worker-direct/root-token plane.

@@ -163,8 +163,9 @@ pub const Directory = struct {
     certs: std.StringHashMapUnmanaged([]u8) = .empty,
     /// `{cluster}/{id}` → packed node transport address (`packNodeAddr`:
     /// `raft_addr \t cp_raft_addr \t http_url`) — the node-address registry, the
-    /// rove analog of PD's store-address table (cluster-genesis-and-membership
-    /// §3.2). The single source of truth for raft id → transport address, for
+    /// rove analog of PD's store-address table (consensus-and-storage.md
+    /// "Cluster genesis & membership", node-address registry). The single
+    /// source of truth for raft id → transport address, for
     /// both worker tenant groups and the CP directory group; it lets a node be
     /// configured with only its own identity and learn its peers' addresses from
     /// here (replacing the static positional `REWIND_PEERS`). Replicated like the
@@ -919,7 +920,8 @@ pub const Directory = struct {
     //
     // The rove analog of PD's store-address table: raft id → transport address,
     // keyed `node/{cluster}/{id}`. A node configured with only its own identity
-    // (cluster-genesis-and-membership §3.1) registers itself here; peers resolve
+    // (consensus-and-storage.md "Cluster genesis & membership", node-address
+    // registry) registers itself here; peers resolve
     // each other's addresses from here instead of a static positional
     // `REWIND_PEERS`. The CP directory group uses it for its own membership too.
 

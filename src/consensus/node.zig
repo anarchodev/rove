@@ -61,7 +61,8 @@ pub const PeerResolver = transport_mod.PeerResolver;
 /// (attach / conf-change carry the joining node's address; the directory
 /// node-address registry is the durable source) and consulted by the transport
 /// to dial a peer it learned at runtime rather than from static config
-/// (cluster-genesis-and-membership §3.3). One per worker / CP process, shared by
+/// (consensus-and-storage.md "Cluster genesis & membership", peer-address
+/// resolution). One per worker / CP process, shared by
 /// every raft group (all groups on a cluster ride the same physical nodes).
 ///
 /// **Insert-only.** A node id's address is learned once and never freed/moved
@@ -667,7 +668,8 @@ pub const Node = struct {
         return self;
     }
 
-    /// Stand up a GENESIS node (cluster-genesis-and-membership §3.4): configured
+    /// Stand up a GENESIS node (consensus-and-storage.md "Cluster genesis &
+    /// membership", genesis): configured
     /// with only its own identity — `node_id` + its raft `listen_addr` — and NO
     /// static voter set or peer list. It HAS a transport (so it can grow), but
     /// births its groups as `{self}` and learns peer addresses at runtime via the
@@ -706,7 +708,8 @@ pub const Node = struct {
     /// and to skip the not-leader propose gate / leadership transfers.
     ///
     /// Defined on transport presence, NOT `voters.len`, because a GENESIS node
-    /// (cluster-genesis-and-membership §3.4) has a transport but births its
+    /// (consensus-and-storage.md "Cluster genesis & membership", genesis) has a
+    /// transport but births its
     /// groups as a single voter `{self}` and grows them later — it must use the
     /// real leadership atomics so it's correctly seen as a FOLLOWER once a group
     /// it created moves leadership elsewhere. (Per-group "born sole self" auto-
@@ -1070,7 +1073,8 @@ pub const Node = struct {
 
         // Campaign-to-leader at birth when this node is the group's SOLE voter —
         // either a single-node node (no transport) OR a multi-node node birthing
-        // a group as `{self}` (cluster-genesis-and-membership §3.4: genesis
+        // a group as `{self}` (consensus-and-storage.md "Cluster genesis &
+        // membership": genesis
         // groups are born single-voter and grown by conf-change). A sole-voter
         // group has no peers to elect from and no race — no other node shares
         // this membership — so it leads immediately. A born-MULTI group still
@@ -2636,7 +2640,8 @@ test "Phase 1c: the leader replicates over a peer it knows ONLY via the resolver
 }
 
 test "Phase 2: a group born {self} on a multi-node node auto-leads, then grows + replicates" {
-    // The genesis primitive (cluster-genesis-and-membership §3.4): a node that
+    // The genesis primitive (consensus-and-storage.md "Cluster genesis &
+    // membership", genesis): a node that
     // HAS a transport births a group as a single-voter {self} group — which
     // auto-campaigns and leads with NO election race (no other node shares the
     // membership) — then grows to a second node by conf-change. Both nodes know

@@ -168,6 +168,59 @@ follower must reject *before* a speculative local write that would diverge).
 group id — every node must derive the *same* id or replication can't bind the
 incarnations. (Not a local counter.)
 
+## Cluster genesis & membership
+
+How a cluster is brought up from nothing, how a raft id resolves to a transport
+address, and how membership changes. The decision record (and why cold-multi
+replaced the bootstrap-one-then-grow arc) is `decisions.md` §10.13; this is the
+as-built mechanism. Two formation paths coexist in code, selected by whether a
+membership reconciler is driving the cluster.
+
+**Genesis — cold-multi default, plus a `{self}` primitive.** The default and
+production path is **cold-multi**: every group (the CP directory and each tenant
+group) is born with the **full static voter set**, supplied either by
+`REWIND_VOTERS`/`REWIND_PEERS` (worker) / `REWIND_CP_VOTERS`/`REWIND_CP_PEERS`
+(CP) or by a CP-provided `birth_voters` override (`node.zig` `createGroupCore`,
+`base_voters = voters_override orelse self.voters`; `cp/main.zig` births
+`{1,…,nodes.len}` on every node when the reconciler is off). The whole set
+cold-elects on its own. Alongside it the engine keeps a **genesis primitive**: a
+node configured with only its own identity births a group as the sole voter
+`{self}`, which auto-campaigns and leads with no election race
+(`node.zig` `initGenesis` / the born-`{self}` campaign; `bridge.zig`
+`initGenesis`). The `{self}` primitive is **off the default genesis path** — the
+worker's genesis parse is mutually exclusive with `REWIND_VOTERS`/`REWIND_PEERS`
+(`rewind/main.zig`, returns null if either is set) — and is used only by the
+reconciler-grow / DR-learner / tenant-move paths.
+
+**Node-address registry (the CP directory SSOT).** The CP directory holds a
+replicated registry mapping a raft id to its transport address —
+`node/{cluster}/{id}` → packed `[version:u8][raft_addr \t cp_raft_addr \t
+http_url]` (`cp/directory.zig` `packNodeAddr`/`unpackNodeAddr`). The rove analog
+of TiKV/PD's store-address table. Written via `POST /_control/node-address`
+(`cp/main.zig` `handleNodeAddress`) and by nodes self-registering at genesis;
+replicated through the directory raft group's commit hook; read by the peer
+resolver on demand.
+
+**Peer-address resolution (id → address).** The raft transport resolves a peer
+id to an address lazily — the first time it has a message for an id it hasn't
+dialed (`transport.zig` `queueOut`, the growth seam; `raft_net.zig`
+`PeerResolver`). Default resolver is `staticResolve` (the init-time peer array
+indexed by `id-1`); it is swappable for a dynamic `PeerRegistry` fed by the CP
+node-address registry (`node.zig` `setPeerResolver`; `bridge.zig` runtime
+peer-address registry). Crucially **addresses ride the raft log**: a conf-change
+carries the joining node's transport address in its entry context, and a
+conf-change observer learns id→addr on apply at *every* replica
+(`bridge.zig` `ccObserve` / `cc_context`), so a grow needs no static peer-list
+edit. Tenant move uses the same mechanism via attach-carry headers
+(`js/v2_move.zig`).
+
+**Membership growth.** Adding a node is a conf-change AddLearner → catch-up →
+promote, driven by the RC-6 CP membership reconciler (`cp/directory.zig`
+desired-state iteration, `cp/main.zig` `reconcileMembership`) when
+`REWIND_CP_RECONCILE_MEMBERSHIP=1`; additive-only, learner-first. With the
+reconciler off, clusters are born full (cold-multi) and never grow. See
+`cp-membership-reconciler-plan.md` for the reconciler design.
+
 ## Hibernation (active-set)
 
 With one group per tenant, naively ticking every group every cycle is

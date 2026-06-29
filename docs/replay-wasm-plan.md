@@ -185,9 +185,9 @@ Per-tape:
   for each entry: [u32 len][entry bytes]
 
 All multi-byte ints are big-endian. (The former date / math_random /
-crypto_random channels were retired by tape-minimization §4: the
-readset-header `timestamp_ns` + `seed` scalars replace them, and the
-channel ids were renumbered with the version bump.)
+crypto_random channels were retired in favor of seed/timestamp records —
+`decisions.md` §3.9: the readset-header `timestamp_ns` + `seed` scalars
+replace them, and the channel ids were renumbered with the version bump.)
 ```
 
 Per-channel entry layouts:

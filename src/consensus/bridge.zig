@@ -332,7 +332,8 @@ pub const Bridge = struct {
     /// Compatibility surface for the reused worker's `.raft.config.*` reads.
     config: Config = .{},
 
-    /// Runtime peer-address registry (cluster-genesis-and-membership §3.3),
+    /// Runtime peer-address registry (consensus-and-storage.md "Cluster genesis
+    /// & membership", peer-address resolution),
     /// owned here and injected as the transport's resolver by
     /// `enablePeerRegistry`. Null until enabled (single-node / pre-enable). Fed
     /// by `learnPeer` from the static seed at boot AND from attach / conf-change
@@ -342,8 +343,9 @@ pub const Bridge = struct {
     /// Stable storage for the committed-conf-change observer (the manager keeps a
     /// pointer to it). Registered by `enablePeerRegistry`; its callback learns the
     /// changing node's address from the conf-change context on EVERY replica, so
-    /// id→addr rides the log like the membership (cluster-genesis-and-membership
-    /// §3.3 — the apply-side completion of point-to-point attach-carry).
+    /// id→addr rides the log like the membership (consensus-and-storage.md
+    /// "Cluster genesis & membership", peer-address resolution — the apply-side
+    /// completion of point-to-point attach-carry).
     cc_observer: raft.Manager.ConfChangeObserver = undefined,
 
     /// This bridge incarnation's random identity, stamped (with the seq)
@@ -454,7 +456,8 @@ pub const Bridge = struct {
         return Bridge.init(allocator, node);
     }
 
-    /// Stand up a GENESIS bridge (cluster-genesis-and-membership §3.4): a node
+    /// Stand up a GENESIS bridge (consensus-and-storage.md "Cluster genesis &
+    /// membership", genesis): a node
     /// configured with only its own id + raft `listen_addr`, no static voters or
     /// peers. It has a transport (so it can grow) with a `PeerRegistry` already
     /// enabled as its resolver — empty at boot; peers are learned from the CP via
@@ -519,7 +522,8 @@ pub const Bridge = struct {
 
     /// Install a runtime peer-address resolver (a CP-fed `PeerRegistry`) on the
     /// node's transport, so it can dial peers learned at runtime instead of from
-    /// static config (cluster-genesis-and-membership §3.3). No-op single-node.
+    /// static config (consensus-and-storage.md "Cluster genesis & membership",
+    /// peer-address resolution). No-op single-node.
     /// Pre-pump only (see `Transport.setResolver`).
     pub fn setPeerResolver(self: *Bridge, r: node_mod.PeerResolver) void {
         self.node.setPeerResolver(r);

@@ -198,10 +198,11 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   cap with drop-newest + `dropped_chunks`. Caps are deliberately hard-coded;
   per-tenant configurability is deferred to an operator hook on demand.
 - **Streaming `http.fetch` (gap 2.3, shipped)**: Pattern A (`on_chunk`) fires a
-  handler activation per chunk; Pattern B (`pipe_to`) streams directly to the
-  held response with no handler. **Pattern B bytes are structurally untaped** by
-  construction (they never enter an activation), so the tape cap is an
-  `on_chunk`-only concern. `correlation_id` is the pipe link.
+  handler activation per chunk; the last carries `final: true`. **`pipe_to`
+  (Pattern B) was retired in Phase 5 PR-1** — the three-variant
+  `chunk`/`end`/`pipe_done` shape collapsed into one chunk-with-`final` kind, so
+  `on_chunk` is the only streaming path and there is no longer any
+  structurally-untaped stream (chunk bytes tape by reference — §3.9).
 
 ### 3.6 Per-chain tape cap removed; retention is the right axis
 - **Decision** (2026-05-26): the §6 per-chain tape cap was removed. Its
@@ -210,7 +211,7 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   while aggregate traffic outpaces any single chain by 2–3 orders of magnitude.
   The cap traded a small bound for node-wide mutex traffic on the dispatch hot
   path. Per-tenant retention/sampling (a deferred `tape_mode` knob) is the
-  correct lever.
+  correct lever — see `retention-and-gc.md` §4.
 
 ### 3.7 Durable scheduled wake: one-shot, absolute-time, at-least-once *firing*
 - **Decision** (gap 2.6, P0–P7 shipped in full 2026-06-10): the platform's only
@@ -328,6 +329,44 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
 - **Rejected**: first-address-only pinning — kills the v6→v4 connect fallback
   (`*.localhost` resolves to `::1` first; a v4-only listener then refuses) —
   the gate vets ALL addresses, so pinning all is strictly safer AND compatible.
+
+### 3.9 The minimal tape: four record kinds
+- **Decision** (2026-05-26, §3–§5 shipped; consolidated here when
+  `tape-minimization.md` was retired): a deterministic replay tape records
+  only inputs that re-execution *cannot* reproduce. Replay re-runs the
+  handler, so writes (`kv.set`/`.delete`) are outputs (re-issued by
+  re-running) and own-reads (a `.get` of a key in the same activation's
+  writeset) are not taped. What remains collapses onto **four record kinds**:
+  - **read set** — foreign `kv` gets/prefixes resolving to pre-activation
+    committed state, plus the read-taped inbound request surface
+    (`request_reads`, §4.6); recorded inline when small.
+  - **timestamp** — the per-request `timestamp_ns` scalar; a clock read is
+    genuinely external, neither generative nor referential. `Date.now()` /
+    `new Date()` are pinned per-request (arenajs `JS_SetDateNow`).
+  - **seed** — one per-request PRNG seed; `Math.random` / `crypto.*` draws
+    are recomputed by re-seeding (`JS_SetRandomSeed`), not recorded per-draw.
+    Safe because the WASM replay engine runs rove's *own* JS host compiled to
+    WASM, so the same PRNG executes in lockstep (engine/PRNG version pinned on
+    the tape header).
+  - **CAS extent** — `{address, offset, length}` for bytes that live in a
+    content-addressed store; the tape carries the pointer. `module` always
+    used this (it records a bytecode *hash*); a large kv value or a streamed
+    fetch chunk over the inline threshold becomes one too.
+- **Tape-by-reference for streamed bytes is shipped, not a future design.**
+  `http.fetch` response chunks over the inline threshold PUT to S3 `_pool/`
+  and the `fetch_responses` channel records a `BodyRef{batch_id, offset, len}`
+  extent (`rove-bodies`); `seq` + `bytes_before` give the chunk-boundary list
+  a streamed replay needs. This is the §3.5 `on_chunk` path — and since
+  `pipe_to` was retired (Phase 5 PR-1, see §3.5 note), there is no longer any
+  structurally-untaped streaming path. The one remaining piece is **pinning
+  the referenced `_pool/` bytes against GC** for the tape's lifetime —
+  tracked in `retention-and-gc.md` §3, not here.
+- **LLM-stream replay** (the worst CAS-extent case: non-reproducible by
+  re-execution, re-calling the API costs money and returns different tokens)
+  is captured by this same `on_chunk` + `BodyRef` path; making it an explicit
+  billed opt-in is deferred to a real LLM-stream customer.
+- Wire: `READSET_VERSION` is `7` (`src/tape/root.zig`); channels are `kv` +
+  `module` + `fetch_responses` + `trigger_payload` + `request_reads`.
 
 ---
 
@@ -1031,8 +1070,8 @@ prototype before V2 wrote code.
   what `deploy.sh` does (`--genesis` = wipe → start-all → cold-form → provision
   `__admin__`; default = quorum-safe rolling restart). The membership reconciler
   stays **OFF** by default.
-- **Supersedes the bootstrap-one-then-grow arc** (`cluster-genesis-and-membership.md`):
-  groups born sole-voter `{self}` and grown by the CP reconciler. That model was
+- **Supersedes the bootstrap-one-then-grow arc**: groups born sole-voter
+  `{self}` and grown by the CP reconciler. That model was
   adopted under the belief that cold multi-node genesis was *fundamentally* broken
   on real nodes (the 2026-06-24 outage: all-followers, no leader). **It wasn't** —
   the wedge was a `raft_net` transport bug (zombie-connect on a torn-down fd; recv

@@ -963,7 +963,8 @@ fn handleConfChange(
     var parsed = std.json.parseFromSlice(
         // `raft_addr` (optional `host:port`) is the joining node's transport
         // address, carried so the leader can dial it the moment the add commits
-        // (cluster-genesis-and-membership §3.3) instead of relying on static
+        // (consensus-and-storage.md "Cluster genesis & membership", peer-address
+        // resolution) instead of relying on static
         // config. Absent for a demote/remove or a still-static cluster.
         struct { tenant: []const u8, node_id: u64, op: []const u8, raft_addr: []const u8 = "" },
         allocator,

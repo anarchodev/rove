@@ -1,8 +1,10 @@
 # WebSocket plan — transport, handler shape, and the use cases it unlocks
 
-> **Status**: in progress (single-tenant / single-node). **Inbound model
-> decided 2026-06-07 — see §4.5** (DO-shaped; gap #6 dropped the cost to ~1–2
-> weeks; §4's 6–10-week estimate is superseded). **Handler-API revised 2026-06-08
+> **Status**: inbound WS **shipped** (single-node baseline + WS-through-front,
+> §8.5); **outbound WS is the remaining unbuilt half** (§1, §3 — the libcurl
+> ws-mode fetch + `http.subscribeWs` binding). **Inbound model decided
+> 2026-06-07 — see §4.5** (DO-shaped; gap #6 dropped the cost to ~1–2 weeks;
+> §4's 6–10-week estimate is superseded). **Handler-API revised 2026-06-08
 > to the shipped post-Phase-2 surface** — the held-connection handler is
 > `stream.*` effects + `on.*` waits + `return next()` / terminal + named-export
 > dispatch (`docs/handler-shape.md`), NOT the retired `__rove_stream({write,
@@ -43,9 +45,11 @@ firehose CONSUMER, Pub/Sub, custom WS APIs):
   resumes the held chain as a bound-`on.fetch` chunk activation —
   the same `onFetchChunk` export `http.subscribe`'s streamed reads
   already dispatch to.
-- Tape determinism is **already covered.** Per-chain tape budget
-  (`architecture/routing-and-ingress.md` §3) handles WS frame replay the same way it
-  handles SSE chunks.
+- Tape determinism is **already covered.** WS frames replay the same way
+  as SSE / `on.fetch` chunks: a `fetch_responses` entry per frame, bytes
+  inline when small or by `BodyRef` extent when large (`decisions.md` §3.9).
+  (The former per-chain tape budget was removed — retention is the axis now,
+  `decisions.md` §3.6 / `retention-and-gc.md`.)
 
 **Inbound WebSocket** (server endpoint for chat, presence, collab
 editing, federation inbound):

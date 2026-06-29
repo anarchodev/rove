@@ -2,7 +2,8 @@
 """Genesis smoke ⭐ — bring up a 3-node cluster FROM EMPTY (cold-multi).
 
 This is the CI gate the 2026-06-24 prod outage demanded (project_prod_genesis
-_gap / docs/cluster-genesis-and-membership.md): we had NO test for clean-slate
+_gap / docs/architecture/consensus-and-storage.md, "Cluster genesis &
+membership"): we had NO test for clean-slate
 multi-node bring-up. The ratified architecture is cold-multi — small FIXED
 clusters where every raft group is born with the full static voter set {1..N}
 and elects on its own (scale by adding clusters + tenant moves, not by growing).

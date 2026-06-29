@@ -534,7 +534,8 @@ fn parseMultiNode(a: std.mem.Allocator) !?MultiNode {
     };
 }
 
-/// Genesis first-boot config (cluster-genesis-and-membership §3.4): this node's
+/// Genesis first-boot config (consensus-and-storage.md "Cluster genesis &
+/// membership", genesis): this node's
 /// own raft id + its raft listen `host:port`, and NOTHING else — no voter set,
 /// no peer list. The node boots self-only (a transport with a `PeerRegistry`,
 /// groups born `{self}`) and is grown into the cluster by the CP via conf-change.
