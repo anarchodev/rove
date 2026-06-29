@@ -239,8 +239,7 @@ cookies, starter content. Two policy decisions made here stay load-bearing:
 - **Lazy-creation-on-redeem**: signup only writes a `pending/{name}`
   reservation; tenant creation + starter deploy happen atomically at
   redemption, and a periodic sweep expires stale reservations (otherwise
-  unredeemed signups squat names and leak per-tenant state). Full flow:
-  [`flows/signup.md`](flows/signup.md).
+  unredeemed signups squat names and leak per-tenant state).
 - **The account namespace** `account/{sha256(email)}/...` (plan tier +
   instance-ownership index): signup *and* redeem count owned instances plus
   live reservations against `max_instances` (v1 hardcodes 1); Phase 10 wires
@@ -733,7 +732,7 @@ libraries). The surprises worth flagging for first-run docs:
 
 ### Auth / signup
 
-- **Magic link TTL 30 min, single-use.** A redeemed link 401s on replay. (Was 15 min in early drafts; bumped 2026-04-30 so click-late users land on the happy path — full flow in [`flows/signup.md`](flows/signup.md).)
+- **Magic link TTL 30 min, single-use.** A redeemed link 401s on replay. (Was 15 min in early drafts; bumped 2026-04-30 so click-late users land on the happy path.)
 - **Session cookie is `HttpOnly + Secure + SameSite=Lax`.** `Secure` requires HTTPS; localhost is treated as a secure context by modern browsers, but plain-HTTP non-localhost dev won't get the cookie. Use `curl -H 'Cookie: rove_session=...'` manually for HTTP-only dev.
 - **Signup without Resend key configured** → response body carries `magic_link` in-band so dev + CI smoke tests still work. When a key IS configured, `magic_link` is suppressed and the email is queued via outbox.
 - **Reserved instance names** rejected with 409: `admin`, `api`, `app`, `www`, `__admin__`, `auth`, `login`, `signup`, `logout`, `dashboard`, `static`, `system`, `public`, `root`, `mail`. Collisions on real signups also return 409 with the same body (no enumeration).

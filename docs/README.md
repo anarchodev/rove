@@ -26,7 +26,7 @@ Three durable layers, plus working docs:
 | Customer contracts | `effect-algebra.md`, `handler-shape.md` | The effect model + handler API surface. |
 | In-flight | the `*-plan.md` / `v2-*.md` below | Active work; folds into `architecture/` on ship, then deleted. |
 | Product / strategy | `pricing-model.md`, etc. | Not engine mechanics. |
-| Guides | `activitypub-tutorial.md`, `flows/` | Tutorials. |
+| Guides | `activitypub-tutorial.md` | Tutorials. |
 
 **Lifecycle:** a plan, once shipped, has its *why* harvested into `decisions.md`
 and its *mechanics* folded into the owning `architecture/` doc — then the plan is
@@ -81,4 +81,3 @@ them 2026-06-29: its as-built mechanism folded into
 ## Guides
 
 - [activitypub-tutorial.md](activitypub-tutorial.md) — ActivityPub bot in ~30 lines
-- [flows/signup.md](flows/signup.md) — end-to-end signup walkthrough
