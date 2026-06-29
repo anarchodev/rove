@@ -28,9 +28,10 @@
 >   connected,unreachable}`), CP `cp_reconcile_*`, front `front_proxy_*`, and the
 >   serving RED signal **`http_requests_total{code}`** (status-class only; the
 >   §3 `rove_http_requests_total{route_class,method,…}` is narrower-in-practice).
-> - **Dashboards + alerts:** committed under [`../grafana/`](../grafana/) AND
->   deployed live (Grafana-managed, 10 rules). The wedge signals
->   (`raft_groups_no_leader`, `raftnet_peers_unreachable`) are the headline.
+> - **Dashboards + alerts:** version-controlled in the `rewind-infra` repo
+>   (`grafana/`, alongside the push tooling) AND deployed live (Grafana-managed,
+>   10 rules). The wedge signals (`raft_groups_no_leader`,
+>   `raftnet_peers_unreachable`) are the headline.
 > - **Still future (the plan's later phases):** `http_request_duration_seconds`
 >   latency histogram (the **D** of RED), exemplars (§2.4), tracing→OTLP (§2.5),
 >   dedicated `blob_*`/S3 metrics, JS-handler metrics, raft-rs logs→Loki.
@@ -283,11 +284,11 @@ Pre-req: §2.3 histogram primitive and §2.4 exemplar plumbing landed.
 | `rove_h2_tls_handshake_seconds` | — (no request context yet) |
 | `rove_schedule_timer_drift_seconds` (upgraded from P1 summary) | trace_id of triggering envelope |
 
-Also: ship the **Grafana Agent / Alloy config** under
-`docs/grafana/alloy.river` (or equivalent) so the scrape-side story is
-reproducible. Endpoints, the `scrape` cap JWT path, external_labels for
-`cluster` / `region`. Dashboards land as JSON exports in
-`docs/grafana/dashboards/` so they're reviewable in PRs.
+Also: ship the **Grafana Agent / Alloy config** under the `rewind-infra` repo's
+`grafana/` (as `alloy-scrape.river`) so the scrape-side story is reproducible.
+Endpoints, the `scrape` cap JWT path, external_labels for `cluster` / `region`.
+Dashboards land there as JSON exports in `grafana/dashboards/` so they're
+reviewable in PRs.
 
 ## 5. Phase 3 — saturation, cost, capacity
 

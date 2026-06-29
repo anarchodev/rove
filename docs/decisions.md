@@ -744,8 +744,8 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   observability.md §3's planned `rove_http_requests_total{route_class,method,...}`.)
 - **As-built (2026-06-26):** all three processes' metrics + service logs flow to
   Grafana Cloud (Alloy per node → Prometheus + Loki). The version-controlled
-  dashboards / alert rules / scrape config live in
-  [`grafana/`](architecture/../grafana/) (10 alert rules deployed Grafana-managed;
+  dashboards / alert rules / scrape config live in the `rewind-infra` repo
+  (`grafana/`) (10 alert rules deployed Grafana-managed;
   the wedge signals `raft_groups_no_leader` + `raftnet_peers_unreachable` are the
   headline). observability.md's later phases (latency histogram, exemplars,
   tracing-to-OTLP) remain future work.
