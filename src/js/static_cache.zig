@@ -1,5 +1,6 @@
 //! static_cache.zig — process-wide, byte-bounded LRU of static-asset
-//! bytes, keyed by content hash. See docs/static-asset-serving.md.
+//! bytes, keyed by content hash. See docs/architecture/deployment-and-logs.md
+//! (the static-asset-serving section).
 //!
 //! Content-addressing makes entries immutable (same hash ⇒ same bytes),
 //! so there is no invalidation and identical assets dedupe across tenants

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Smoke for V2 unified streaming static serving
-(docs/static-asset-serving.md; project_static_stream_serve):
+(docs/architecture/deployment-and-logs.md, static-asset-serving section;
+project_static_stream_serve):
 
   - EVERY static (HTML/JS/CSS/…) serves inline at its stable FRIENDLY path
     (200, NOT a 302 to /_assets) with ETag + revalidate cache-control — so an

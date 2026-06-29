@@ -26,7 +26,8 @@ its blobs and a content-addressed manifest to S3, and a *separate* release step
 writes one `_deploy/current` pointer through raft (envelope 0). Workers are pure
 **consumers** — they apply the pointer, then load the manifest + bytecode from
 the shared store, sharing identical bytecode across tenants by content hash, and
-**302-redirect** static assets to presigned S3 instead of buffering them.
+serve static assets from a **bounded in-memory LRU** (cold miss → stream from
+the tenant's file-blobs), never buffering MB-sized bytes on the dispatch thread.
 Request logs bypass raft entirely: each node writes one interleaved, per-record-
 deflated S3 batch per flush, and a standalone `log-server` indexes them into
 SQLite for query.
@@ -43,7 +44,9 @@ SQLite for query.
 | `src/js/deployment_cache.zig` | `TenantSlot`, the immutable refcounted `TenantFilesSnapshot`, the manifest-diff loader. |
 | `src/js/bytecode_cache.zig` | Process-wide, content-addressed (sha256), refcounted bytecode leases — cross-tenant sharing. |
 | `src/js/deployment_loader.zig` | The loader thread: manifest diff → acquire/fetch bytecode blobs. |
-| `src/js/response_builder.zig` | Static-asset 302 to a presigned S3 URL. |
+| `src/js/response_builder.zig` | Static-asset serving: friendly-path lookup (`tryServeStatic`), ETag/304, LRU-hit inline vs `stream_static` on miss; `emitStaticRedirect` (301 trailing-slash canon only). |
+| `src/js/static_cache.zig` | Process-wide byte-capped LRU keyed by content hash (`REWIND_STATIC_CACHE_MB`, default 256; 0 = off); prewarmed on the loader thread. |
+| `src/js/builtin_modules/static.mjs` | The `__system/static` builtin — streams a static blob from the tenant's file-blobs on the fetch thread when the LRU misses. |
 | `src/js/worker_dispatch.zig` | `/_system/release` → writes `_deploy/current` (envelope 0). |
 | `src/log/root.zig`, `src/js/worker_log.zig` | Worker-side per-node log buffer + flush + push-notify. |
 | `src/log_server/*` | Standalone log-server: `flush_writer` (encode), `sidecar`, `indexer`, `index_db` (SQLite), `standalone` (query API). |
@@ -76,10 +79,45 @@ is the flip) — see [decisions.md §11](../decisions.md).
 - **`BytecodeCache`** is process-wide and content-addressed, so identical
   bytecode is shared across tenants and across deployments. A reload reuses the
   unchanged blobs and fetches only what changed — `O(changed files)`.
-- **Static assets** are served as a **302** to a presigned S3 URL (`ETag: <hash>`,
-  `Cache-Control`, 304 on `If-None-Match`). The worker never buffers MB-sized
-  asset bytes; the browser (and the CDN edge) fetches from S3 directly. This was
-  a deliberate pivot away from worker-RAM caching — see [decisions.md §11](../decisions.md).
+### Static asset serving (non-blocking, immutable, content-addressed)
+
+Served from a bounded in-memory LRU; the dispatch thread only ever touches
+memory or hands off a stream — it never issues a synchronous S3 read. (This
+superseded both the original "302 to a presigned S3 URL" — the per-request
+signature defeats content-addressed caching — and an interim blocking inline
+`get()`.)
+
+- **The LRU** (`static_cache.zig`) is process-wide and byte-capped
+  (`REWIND_STATIC_CACHE_MB`, default 256; `0` disables it), keyed by content
+  hash. Content-addressing makes entries immutable (no invalidation) and
+  dedupes across tenants and deployments. v1 read path copies bytes into the
+  per-request allocator under the lock (no refcount/lifetime machinery; the
+  copy is memory-only).
+- **Prewarm at deploy time** — `reloadDeployment` (the loader thread, off the
+  dispatch loop) builds a `statics_by_hash` index on the snapshot and prewarms
+  each static blob's bytes into the LRU via a *synchronous* blob get (blocking
+  is fine there); oversized assets are skipped and fall back to streaming.
+- **Serving** (`tryServeStatic`): friendly-path resolution (`/app.js`, `/` →
+  `index.html`, `.html` suffix, directory index, 301 trailing-slash canon via
+  `emitStaticRedirect`). Every static — **including `text/html`** — is served
+  at its stable, *mutable* friendly path with a strong ETag (= content hash)
+  and `Cache-Control: public, max-age=0, must-revalidate`, so revalidation is
+  a cheap 304. **No 302 to a hashed URL**: a redirect would rebase a document's
+  origin *and* an ES module's base URL, breaking relative imports (`./api.js`).
+  - **LRU hit** → serve inline (pure memory copy, never blocks).
+  - **LRU miss** (cold / evicted / oversized) → `stream_static`: stream the
+    blob from the tenant's own file-blobs via the engine-fired `__system/static`
+    builtin, whose fetch runs on the FetchPool thread — never a redirect, never
+    a blocking read on the dispatch thread.
+- **Immutable `/_assets/{hash}`** is a reserved route serving a
+  content-addressed blob with `public, max-age=31536000, immutable` — permanent
+  caching with no revalidation, available for publish-time ref-rewriting or a
+  Cloudflare edge layer (pure upside; the immutability is already in the
+  headers). Only `kind=static` blobs are served this way; bytecode, logs,
+  tapes, and request bodies never enter this path.
+
+See [decisions.md §11](../decisions.md) for the storage-origin-vs-worker-RAM
+decision this rests on.
 
 ## BlobStore backends & S3 layout
 
