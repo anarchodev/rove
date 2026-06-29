@@ -250,7 +250,7 @@ model retired (§6.3). So:
 | `on.fetch` chunk | `onFetchChunk` (or `to`) | connection | per chunk of a streamed `on.fetch` |
 | `on.fetch` end | `onFetchDone` (or `to`) | connection | a streamed `on.fetch` terminated |
 | `on.kv` / `on.timer` wake | `onWake` (or `to`) | connection | a connection wake fired (held socket) |
-| inbound WebSocket frame | `onMessage` | connection | per complete WS data message; `request.activation = { opcode, data }` (opcode 1 = text → string, 2 = binary → Uint8Array); `stream.write` replies (string → text frame, bytes → binary), `next()` parks for the next frame, a terminal return closes. Replies are strictly in message order, and a frame behind an in-flight durable write activates only after that write commits — so each frame reads its predecessors' writes (websocket-plan §4.5 input gate) |
+| inbound WebSocket frame | `onMessage` | connection | per complete WS data message; `request.activation = { opcode, data }` (opcode 1 = text → string, 2 = binary → Uint8Array); `stream.write` replies (string → text frame, bytes → binary), `next()` parks for the next frame, a terminal return closes. Replies are strictly in message order, and a frame behind an in-flight durable write activates only after that write commits — so each frame reads its predecessors' writes (`architecture/websockets.md`, the input gate) |
 | held client disconnected | `onDisconnect` | connection | the held stream closed early — or the WS client closed / dropped |
 | `webhook.send` result | the `onResult` target | connectionless | a `webhook.send` completed |
 | `cron` / `schedule` fire | the named target | connectionless | scheduled time arrived |

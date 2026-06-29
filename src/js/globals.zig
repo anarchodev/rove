@@ -408,7 +408,7 @@ pub const DispatchState = struct {
     /// pipeline entry. Connection-only — `stream.*` is inert (and this
     /// stays false) when `pending_stream_chunks` is null.
     stream_started: bool = false,
-    /// websocket-plan §5 (piece D): true when this activation's
+    /// architecture/websockets.md (piece D): true when this activation's
     /// `stream.write` output is WS frames, not a streamed HTTP response.
     /// Set by the dispatcher for `.ws_message` activations. Bypasses the
     /// Phase-2 stream bridge (`stream_started` → `Stream` descriptor /
@@ -424,7 +424,7 @@ pub const DispatchState = struct {
     /// at park, then frees the list. Null on connectionless / test paths
     /// ⇒ `stream.*` is inert (the model: connection-only output).
     pending_stream_chunks: ?*std.ArrayListUnmanaged([]u8) = null,
-    /// websocket-plan §5: per-chunk RFC 6455 data opcode, pushed in
+    /// architecture/websockets.md: per-chunk RFC 6455 data opcode, pushed in
     /// lockstep with `pending_stream_chunks` (1 = text, the arg was a
     /// string; 2 = binary, an ArrayBuffer/TypedArray). Non-null only on
     /// a WebSocket connection activation (the worker's `fireWsMessage`
@@ -2393,7 +2393,7 @@ pub fn installRequest(
         .fetch_chunk => "fetch_chunk",
         // §2.6 durable scheduled wake.
         .durable_wake => "durable_wake",
-        // websocket-plan §5: one inbound WS data frame.
+        // architecture/websockets.md: one inbound WS data frame.
         .ws_message => "ws_message",
         // blob-storage-plan §3.5: headers-first inbound — body still
         // inbound, handler decides from headers alone.
@@ -2617,7 +2617,7 @@ pub fn installRequest(
         }
     }
 
-    // websocket-plan §5: one inbound WS data frame →
+    // architecture/websockets.md: one inbound WS data frame →
     // `request.activation = { kind:"ws_message", opcode, data }`.
     // opcode 1 (text) surfaces `data` as a string; opcode 2 (binary)
     // as a fresh Uint8Array copy the handler owns outright (no lifetime

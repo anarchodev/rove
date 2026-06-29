@@ -1190,8 +1190,8 @@ memory.
   at all; the "fan-in needs sequencer + handle + 5-layer security" analysis
   was wrong. Corollary, intentional: broadcast *cannot* be "enumerate the
   connections and push" — fan-out is pub-sub on a trigger (the `on.kv` room
-  recipe in `websocket-plan.md`), a customer recipe rather than a platform
-  API.
+  recipe in `architecture/websockets.md`), a customer recipe rather than a
+  platform API.
 
 ### 13.2 No connection handle in any JS projection (capability-by-construction)
 - **Decision**: customer JS never receives a connection reference, in any

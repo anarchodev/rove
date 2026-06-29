@@ -17,7 +17,7 @@ the piece-D baseline got wrong (this smoke was written against the bug first):
 2. **Strict reply ordering.** Replies on one connection arrive in message
    order even across the durability boundary — a read-only frame's reply must
    not overtake an in-flight writing frame's commit-gated reply (the
-   DO-output-gate semantic; docs/websocket-plan.md §4.5).
+   DO-output-gate semantic; docs/architecture/websockets.md).
 
 The client sends a burst WITHOUT waiting for replies:
     persist:v1   (writing → commit-gated reply)

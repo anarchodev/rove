@@ -28,7 +28,7 @@
 //!     back-compat aliases) — cross-thread inbox drain → in-thread queue
 //!     drain → per-variant fire.
 //!
-//! The inbound WebSocket seam (chain establish/teardown, the §4.5
+//! The inbound WebSocket seam (chain establish/teardown, the
 //! input gate, `serviceWsMessages` → `fireWsMessage` /
 //! `fireWsDisconnect`) lives in `worker_ws.zig`; its commit-gated
 //! write path calls back into `StreamResumeStage` +
@@ -2099,7 +2099,7 @@ pub const StreamResumeStage = struct {
     entity: rove.Entity,
     chunks: std.ArrayListUnmanaged([]u8) = .empty,
     mark_draining: bool = false,
-    /// websocket-plan §5 (piece D): when non-null, the staged `chunks`
+    /// architecture/websockets.md (piece D): when non-null, the staged `chunks`
     /// are outbound WebSocket frames destined for this conn entity (NOT
     /// `stream_data_out` HTTP DATA). The commit arm then builds one
     /// `ws_send` Cmd per chunk (opcode taken from `ws_opcodes`, kept
@@ -2284,7 +2284,7 @@ pub fn proposeForgetfulWrites(
     };
     if (stage_opt) |s| {
         if (s.ws_conn) |conn| {
-            // websocket-plan §5: stage outbound WS frames as commit-
+            // architecture/websockets.md: stage outbound WS frames as commit-
             // gated `ws_send` Cmds (opcode per chunk, parallel to the
             // bytes). `mark_draining` ⇒ append a trailing close frame
             // (opcode 8) AFTER the data so wire order is data-then-close.

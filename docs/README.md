@@ -41,6 +41,7 @@ The maintained set. Subsystem-owned, kept current with the code.
 - **[consensus-and-storage.md](architecture/consensus-and-storage.md)** — multi-raft, the Bridge/Node, per-tenant store, hibernation, tenant-move mechanism, durability/recovery
 - **[effects-and-handlers.md](architecture/effects-and-handlers.md)** — the TEA handler model, the four reified primitives, durability-as-JS-shim, readset replication, held state
 - **[routing-and-ingress.md](architecture/routing-and-ingress.md)** — front door, TLS/ACME, HTTP/1.1+H2+WebSocket ingress, the streaming substrate, blob coordinator
+- **[websockets.md](architecture/websockets.md)** — inbound WS as-built: the DO-shaped tenant model, point-to-point vs broadcast fan-out, per-frame durability + the input gate, the `onMessage`/`onDisconnect` handler surface, front Extended CONNECT (RFC 8441)
 - **[control-plane.md](architecture/control-plane.md)** — the directory, replication, tenant-move orchestration, plan/limits
 - **[deployment-and-logs.md](architecture/deployment-and-logs.md)** — deploy publish, content-addressed assets, BlobStore, log-server
 - **[auth-and-domains.md](architecture/auth-and-domains.md)** — OIDC, custom domains, ACME, service/admin authz
@@ -64,7 +65,7 @@ reference for ~9 source files; see it for that anchor.
 - [v2-production-deploy-plan.md](v2-production-deploy-plan.md) — first production topology (not yet built)
 - [step3-auth-plan.md](step3-auth-plan.md) — Step 3 auth consolidation: sequenced execution plan (OIDC machinery is written; remaining = wire + deploy + close the log-server tenant-scoping gap). Design rationale in `rewind-cli-plan.md` §7
 - [cp-desired-state-target.md](cp-desired-state-target.md) — north-star (not yet built): CP owns all per-tenant desired-state incl. release; workers reconcile; one S2S key (move-secret); root token retires. The arc B3/B4 point at
-- [websocket-plan.md](websocket-plan.md) — inbound WS (single-node baseline shipped 2026-06-09: transport + worker seam + smoke; remaining: broadcast recipe docs, outbound WS)
+- [websocket-plan.md](websocket-plan.md) — **outbound** WS only (a handler as client of an upstream WS server — atproto firehose / Pub/Sub; unbuilt, ~1–2 weeks). Inbound WS shipped → `architecture/websockets.md`
 - [retention-and-gc.md](retention-and-gc.md) — the one compacting GC across log-blobs / kv pages / `_pool` bodies / tape blobs; capacity-based retention; the input-home pinning obligation (unbuilt). The minimal-tape four-record-kinds synthesis now lives in `decisions.md` §3.9
 - [builtin-libs-docs-plan.md](builtin-libs-docs-plan.md) — `_system.*` + JS shim docs
 - [replay-wasm-plan.md](replay-wasm-plan.md) — WASM replay UI (§8.6+ deferred)

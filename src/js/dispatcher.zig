@@ -499,7 +499,7 @@ fn finishResponse(
     // is preserved: `next()` ⇒ `.stream` (re-arm); a terminal ⇒ keep the
     // terminal but prepend the buffered chunks so the final frames ship
     // before END_STREAM.
-    // WS frame output (websocket-plan §5, piece D) skips this bridge
+    // WS frame output (architecture/websockets.md, piece D) skips this bridge
     // entirely: the chunks stay in `pending_stream_chunks` for the worker's
     // `shipWsFrames` (→ `ws_send_in`), `next()` falls through to the plain
     // continuation below, and a terminal keeps its own body (the frames

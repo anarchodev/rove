@@ -105,7 +105,7 @@ pub const Cmd = union(enum) {
     /// pre-4.1.3 — arguably more correct).
     respond: RespondOut,
 
-    /// websocket-plan §5 (piece D): emit one outbound WebSocket frame
+    /// architecture/websockets.md (piece D): emit one outbound WebSocket frame
     /// on commit. Created an entity in `h2.ws_send_in` (Session = the
     /// conn, WsMeta.opcode, ReqBody = bytes) that `consumeWsSends`
     /// RFC-6455-frames on the next h2 poll. Commit-gated so a frame

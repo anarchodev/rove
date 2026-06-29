@@ -1,4 +1,4 @@
-//! Inbound WebSocket worker seam (docs/websocket-plan.md §4.5/§5, piece D).
+//! Inbound WebSocket worker seam (docs/architecture/websockets.md, piece D).
 //! Extracted from `worker_streaming.zig` — same `worker: anytype`
 //! structural-typing shape; the commit-gated write path reuses
 //! `worker_streaming.StreamResumeStage` + `proposeForgetfulWrites`.
@@ -93,7 +93,7 @@ fn tearDownWsChain(worker: anytype, conn_ent: rove.Entity) void {
 }
 
 /// Routing for a WS identity entity, transport-agnostic: an Extended-CONNECT
-/// stream's identity entity (h2, `wsStreamRouting` — websocket-plan §8.5) or
+/// stream's identity entity (h2, `wsStreamRouting` — architecture/websockets.md) or
 /// an h1 ws-mode conn entity (`wsConnRouting`).
 fn wsRouting(server: anytype, ent: rove.Entity) ?struct { authority: []const u8, path: []const u8 } {
     if (server.wsStreamRouting(ent)) |r| return .{ .authority = r.authority, .path = r.path };
@@ -101,7 +101,7 @@ fn wsRouting(server: anytype, ent: rove.Entity) ?struct { authority: []const u8,
     return null;
 }
 
-/// websocket-plan §8.5: disposition pending Extended-CONNECT tunnels BEFORE
+/// architecture/websockets.md: disposition pending Extended-CONNECT tunnels BEFORE
 /// any 200 reaches the front — unknown tenant/host → 404; not the tenant's
 /// leader → 421 (the front re-aims at the next node, the same contract as
 /// request routing; this fixes the h1-direct flaw where the 101 always

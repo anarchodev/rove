@@ -115,7 +115,7 @@ pub const DurableWake = struct {
     msg_json: ?[]const u8 = null,
 };
 
-/// Inbound WebSocket frame payload (`docs/websocket-plan.md` §5).
+/// Inbound WebSocket frame payload (`docs/architecture/websockets.md`).
 /// Surfaces as `request.activation.{opcode, data}` to the `onMessage`
 /// export. `opcode` is the RFC 6455 data opcode (1 = text → `data` is a
 /// string, 2 = binary → `data` is a Uint8Array). `data` is the borrowed
@@ -353,7 +353,7 @@ pub const PendingEffects = struct {
     /// `finishResponse` drains it into the `Stream` descriptor (next() ⇒
     /// keep streaming) or prepends it to the terminal body (close).
     pending_stream_chunks: ?*std.ArrayListUnmanaged([]u8) = null,
-    /// websocket-plan §5: per-chunk WS data opcode accumulator, pushed in
+    /// architecture/websockets.md: per-chunk WS data opcode accumulator, pushed in
     /// lockstep with `pending_stream_chunks`. Non-null only on a WS
     /// connection activation; null elsewhere.
     pending_stream_chunk_opcodes: ?*std.ArrayListUnmanaged(u8) = null,

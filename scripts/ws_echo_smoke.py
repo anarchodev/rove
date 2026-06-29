@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inbound-WebSocket transport smoke (docs/websocket-plan.md §4.6 pieces A/C/E-h2).
+"""Inbound-WebSocket transport smoke (docs/architecture/websockets.md pieces A/C/E-h2).
 
 Drives the `ws-echo` example server (examples/ws_echo_test.zig) with a raw-socket
 RFC 6455 client — no third-party WS library — and asserts the rove-h2 transport:

@@ -151,7 +151,7 @@ pub const ActivationSource = enum(u8) {
     /// the fired entry's two `_sched/` keys are deleted in this
     /// activation's own writeset (exactly-once on the normal path).
     durable_wake = 8,
-    /// Inbound WebSocket frame (`docs/websocket-plan.md` §4.5/§5). A
+    /// Inbound WebSocket frame (`docs/architecture/websockets.md`). A
     /// held WS connection is a parked continuation chain; each complete
     /// inbound data frame (text/binary) resumes it via `fireWsMessage`
     /// with `request.activation = { opcode, data }` dispatched to the

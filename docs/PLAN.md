@@ -166,8 +166,9 @@ sse-server was deleted). Customers write their own streaming handler returning
 `stream(...)`, with watched-prefix kv-write wakes driving frame emission — the
 customer's kv *is* the event log they choose to keep; cross-node correctness
 rides raft. SSE is the default push channel (HTTP/2-native, browser
-auto-reconnect with `Last-Event-ID`); inbound WebSocket is a separate baseline
-([websocket-plan.md](websocket-plan.md)). Surviving locked decision: notification
+auto-reconnect with `Last-Event-ID`); inbound WebSocket is shipped
+([architecture/websockets.md](architecture/websockets.md); outbound WS remains
+[websocket-plan.md](websocket-plan.md)). Surviving locked decision: notification
 ≠ state store, reconnect → state-refetch from kv. Mechanics:
 `architecture/effects-and-handlers.md` + `architecture/routing-and-ingress.md`.
 

@@ -409,7 +409,7 @@ pub const BufferedSendKvOps = effect_mod.cmd.BufferedCmds;
 pub const ParkedUnit = effect_mod.Continuation(BufferedSendKvOps, *kv_mod.KvStore.TrackedTxn);
 
 /// One inbound WS frame held behind its connection's input gate
-/// (websocket-plan §4.5 strict reply ordering). `payload` is an owned
+/// (architecture/websockets.md strict reply ordering). `payload` is an owned
 /// copy — the transport's `ws_message_out` entity is destroyed in the
 /// same tick the frame queues.
 pub const WsQueuedFrame = struct {
@@ -419,7 +419,7 @@ pub const WsQueuedFrame = struct {
 
 /// Per-WS-connection worker state (the `ws_conns` map value).
 ///
-/// `gate_seq != 0` is the **input gate** (websocket-plan §4.5, the DO
+/// `gate_seq != 0` is the **input gate** (architecture/websockets.md, the DO
 /// input-gate analog): a writing frame's forgetful unit is awaiting
 /// raft at that per-tenant seq, so newly-arriving frames queue on
 /// `queue` instead of activating. `flushWsGates` re-opens the gate
@@ -1549,7 +1549,7 @@ pub fn Worker(comptime opts: Options) type {
         /// rove-library principle #8, so a chain transitioning
         /// cont→stream doesn't invalidate the map entry.
         bound_fetch_entities: std.StringHashMapUnmanaged(rove.Entity) = .empty,
-        /// `docs/websocket-plan.md` §4.5/§5 (piece D): per-connection
+        /// `docs/architecture/websockets.md` (piece D): per-connection
         /// held WebSocket chain locator. Maps the h2 connection `Entity`
         /// (the `Session.entity` carried on every `ws_message_out` /
         /// `ws_send_in` entity) → that connection's worker-side state:
@@ -2084,7 +2084,7 @@ pub fn Worker(comptime opts: Options) type {
                 while (it.next()) |entry| allocator.free(entry.key_ptr.*);
                 self.bound_fetch_entities.deinit(allocator);
             }
-            // websocket-plan §5 (piece D): the chain entities themselves
+            // architecture/websockets.md (piece D): the chain entities themselves
             // are reaped via `parked_continuations`/registry teardown on
             // shutdown; free each connection's gated-frame queue, then
             // the map's own storage.

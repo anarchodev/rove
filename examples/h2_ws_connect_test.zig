@@ -1,4 +1,4 @@
-//! Extended-CONNECT WS tunnel test (websocket-plan §8.5) — a server and a
+//! Extended-CONNECT WS tunnel test (architecture/websockets.md) — a server and a
 //! client rove-h2 instance in one process. The client opens an RFC 8441
 //! CONNECT (`:protocol: websocket`), pumps a MASKED text frame as raw tunnel
 //! bytes (what the front relays verbatim from a browser), and asserts:

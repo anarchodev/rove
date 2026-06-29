@@ -116,7 +116,7 @@ pub const Timer = struct {};
 /// activation. Same migration cluster as Timer / Inbound.
 pub const Disconnect = struct {};
 
-/// Inbound WebSocket frame (`docs/websocket-plan.md` §5). NOT routed
+/// Inbound WebSocket frame (`docs/architecture/websockets.md`). NOT routed
 /// through this Msg queue — `serviceWsMessages` drains the h2
 /// `ws_message_out` collection directly each tick and runs `onMessage`
 /// in-line. This empty payload exists solely to satisfy the

@@ -116,8 +116,8 @@ pub const H2IoResult = struct {
     err: i32 = 0,
 };
 
-/// Per-WebSocket-message metadata on a WS seam entity (docs/websocket-plan.md
-/// §4.6). `opcode` is the RFC 6455 data opcode (`ws.Opcode` int): `1` text,
+/// Per-WebSocket-message metadata on a WS seam entity
+/// (docs/architecture/websockets.md). `opcode` is the RFC 6455 data opcode (`ws.Opcode` int): `1` text,
 /// `2` binary on an inbound `ws_message_out` entity (`8` close = client closed);
 /// the same field selects the frame type for an outbound `ws_send_in` entity.
 /// The payload itself rides the entity's `ReqBody` (allocator-owned bytes).
@@ -300,7 +300,7 @@ pub const Http1Conn = struct {
     /// repaying it.
     paused_read: Entity = Entity.nil,
 
-    // ── WebSocket mode (docs/websocket-plan.md §4.5/§4.6) ────────────────────
+    // ── WebSocket mode (docs/architecture/websockets.md) ────────────────────
     /// Set once the `101` Upgrade has been queued: the connection has left the
     /// HTTP request/response model and `buf` now accumulates RFC 6455 frames
     /// (parsed by `wsDrive`, not `http1Drive`).
@@ -330,7 +330,7 @@ pub const Http1Conn = struct {
     ws_authority: []u8 = &.{},
     ws_path: []u8 = &.{},
 
-    // ── WS upgrade surface / raw tunnel (front door; websocket-plan §8.5) ────
+    // ── WS upgrade surface / raw tunnel (front door; architecture/websockets.md) ────
     /// `websocket_surface`: the Upgrade head was emitted to the consumer
     /// (`ws_upgrade_out`) and the connection is parked — no request parse, no
     /// 101 — until `wsUpgradeAccept` / `wsUpgradeReject` decides. Early frame
@@ -387,7 +387,7 @@ pub const Http1Conn = struct {
     }
 };
 
-/// Per-stream WS state for an Extended CONNECT tunnel (websocket-plan §8.5).
+/// Per-stream WS state for an Extended CONNECT tunnel (architecture/websockets.md).
 /// Lives from `wsConnectAccept` to stream close. Inbound stream DATA bytes
 /// accumulate in `buf` and feed the RFC 6455 parser (`wsStreamDrive`);
 /// fragmented messages reassemble in `msg`; outbound framed bytes queue on
@@ -476,7 +476,7 @@ const Stream = struct {
     stream_chunk_data: ?[*]u8 = null,
     stream_chunk_len: u32 = 0,
     stream_chunk_offset: u32 = 0,
-    /// Extended-CONNECT WS stream (websocket-plan §8.5). Set at CONNECT
+    /// Extended-CONNECT WS stream (architecture/websockets.md). Set at CONNECT
     /// detection; `entity` is the identity entity in `ws_connect_out` /
     /// `ws_streams` and stream close destroys it (instead of the
     /// request-entity `serverStreamClose` routing).
@@ -736,8 +736,8 @@ pub const H2Options = struct {
     /// leg), so an Upgrade request degrades to a classic proxied GET
     /// and the backend answers it as plain HTTP.
     websocket_upgrades: bool = true,
-    /// RFC 8441 Extended CONNECT on SERVER sessions (websocket-plan
-    /// §8.5): advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL` and surface
+    /// RFC 8441 Extended CONNECT on SERVER sessions
+    /// (architecture/websockets.md): advertise `SETTINGS_ENABLE_CONNECT_PROTOCOL` and surface
     /// each `:method CONNECT` + `:protocol websocket` stream as an
     /// identity entity in `ws_connect_out` for the consumer's
     /// disposition (`wsConnectAccept` → the stream becomes a live WS
@@ -748,7 +748,7 @@ pub const H2Options = struct {
     /// handshake at the edge.
     extended_connect: bool = false,
     /// Surface h1 `Upgrade: websocket` heads to the consumer instead of
-    /// auto-completing the handshake (websocket-plan §8.5, the front
+    /// auto-completing the handshake (architecture/websockets.md, the front
     /// door): each valid Upgrade emits a `ws_upgrade_out` entity
     /// (Session = conn, ReqHeaders = the head) and the connection
     /// parks until `wsUpgradeAccept(ent, sink)` — deferred 101 +
@@ -757,7 +757,7 @@ pub const H2Options = struct {
     websocket_surface: bool = false,
     /// Accept HTTP/1.1 on server connections (the plaintext first-read
     /// sniff / ALPN-h1). The rewind worker turns this OFF
-    /// (websocket-plan §8.5): h1 termination is the front's job alone —
+    /// (architecture/websockets.md): h1 termination is the front's job alone —
     /// every byte that reaches a worker is h2c. An h1-looking first
     /// read just closes (the firewall-bounded private network has no
     /// legitimate h1 speakers).
@@ -781,7 +781,7 @@ pub fn H2(comptime opts: Options) type {
         .connect = has_client,
     });
 
-    // WebSocket seam row (docs/websocket-plan.md §4.6): one entity per inbound
+    // WebSocket seam row (docs/architecture/websockets.md): one entity per inbound
     // completed message (`ws_message_out`) or outbound frame (`ws_send_in`).
     // Carries the connection (`Session`), the payload (`ReqBody`), the opcode
     // (`WsMeta`), and an error slot (`H2IoResult`), plus the worker's
@@ -831,7 +831,7 @@ pub fn H2(comptime opts: Options) type {
         stream_close_in: StreamColl,
         _stream_data_sending: StreamColl,
 
-        // WebSocket seam (docs/websocket-plan.md §4.6). `ws_message_out` holds a
+        // WebSocket seam (docs/architecture/websockets.md). `ws_message_out` holds a
         // completed inbound message for the consumer (piece D → `onMessage`);
         // `ws_send_in` holds an outbound frame the consumer queued (piece E ←
         // `stream.write`). Outbound backpressure is on the per-conn `ws_out`
@@ -841,7 +841,7 @@ pub fn H2(comptime opts: Options) type {
         ws_message_out: WsColl,
         ws_send_in: WsColl,
 
-        // Extended-CONNECT WS identity entities (websocket-plan §8.5,
+        // Extended-CONNECT WS identity entities (architecture/websockets.md,
         // `extended_connect` instances only). One entity per WS-over-h2
         // stream (Session = conn, StreamId, ReqHeaders = the CONNECT
         // headers). `ws_connect_out`: awaiting the consumer's
@@ -1420,7 +1420,7 @@ pub fn H2(comptime opts: Options) type {
             return .{ .authority = h1c.ws_authority, .path = h1c.ws_path };
         }
 
-        // ── Extended-CONNECT WS (websocket-plan §8.5) ─────────────────
+        // ── Extended-CONNECT WS (architecture/websockets.md) ─────────────────
 
         /// Routing for a WS identity entity (h2 tunnel): `:authority` /
         /// `:path` straight off the CONNECT headers. Valid while the
@@ -1884,7 +1884,7 @@ pub fn H2(comptime opts: Options) type {
             const h2 = nctx.h2;
             const end_stream = frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0;
 
-            // Extended CONNECT (websocket-plan §8.5): `:method CONNECT`
+            // Extended CONNECT (architecture/websockets.md): `:method CONNECT`
             // + `:protocol websocket` opens a WS tunnel, not a request.
             // Emit the identity entity into `ws_connect_out` for the
             // consumer's disposition; inbound DATA holds (window-held)
@@ -4327,7 +4327,7 @@ pub fn H2(comptime opts: Options) type {
             }
         }
 
-        // ── WebSocket transport (docs/websocket-plan.md §4.5/§4.6) ───────────
+        // ── WebSocket transport (docs/architecture/websockets.md) ───────────
         //
         // Pieces A (101 handshake), C (connection mode + inbound frames), and the
         // h2-side of E (outbound framing). The pure RFC 6455 codec lives in
@@ -4358,7 +4358,7 @@ pub fn H2(comptime opts: Options) type {
             return has_upgrade and has_conn_upgrade and has_key;
         }
 
-        /// websocket_surface (websocket-plan §8.5): park the connection and
+        /// websocket_surface (architecture/websockets.md): park the connection and
         /// emit the Upgrade head to the consumer for disposition. The 101 is
         /// DEFERRED — `wsUpgradeAccept` sends it only once the upstream
         /// tunnel exists, so a refused tunnel degrades to a plain HTTP error
@@ -4606,7 +4606,7 @@ pub fn H2(comptime opts: Options) type {
             const h1c = conn_ptr.h1.?;
             switch (frame.opcode) {
                 // Auto-pong: bounce the application data back; the handler never
-                // sees ping/pong (websocket-plan §5).
+                // sees ping/pong (architecture/websockets.md).
                 .ping => try ws.writeFrame(&h1c.ws_out, self.allocator, .pong, frame.payload),
                 .pong => {},
                 .close => {
@@ -4866,7 +4866,7 @@ pub fn H2(comptime opts: Options) type {
                             data_len > 0 and looksLikeHttp1Request(data_ptr[0..data_len]))
                         {
                             // h2c-only instances (the worker —
-                            // websocket-plan §8.5): h1 terminates at the
+                            // architecture/websockets.md): h1 terminates at the
                             // front; refuse rather than swap in.
                             if (!self.h2_opts.accept_http1) {
                                 try self.reg.destroy(conn_ent.entity);

@@ -152,7 +152,7 @@ pub fn jsStreamWrite(
         return js_exception;
     };
     state.stream_pending_bytes += bytes.len;
-    // websocket-plan §5: on a WS connection activation, record this
+    // architecture/websockets.md: on a WS connection activation, record this
     // chunk's frame opcode in lockstep (text iff the arg was a string,
     // binary otherwise) so the worker frames it correctly. Null on
     // SSE/HTTP chains (opcode irrelevant). Push AFTER the chunk append

@@ -1,5 +1,5 @@
 //! WebSocket echo server — proves the rove-h2 inbound WS transport
-//! (docs/websocket-plan.md §4.6 pieces A/C + the h2 side of E) end-to-end,
+//! (docs/architecture/websockets.md pieces A/C + the h2 side of E) end-to-end,
 //! before the worker seam (piece D). Mirrors `h2_stream_test.zig`: it drives
 //! the server's collections directly instead of going through a JS worker.
 //!

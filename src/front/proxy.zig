@@ -40,7 +40,7 @@
 //! WebSocket: the h1 listener surfaces Upgrade heads
 //! (`websocket_surface`), and each accepted connection tunnels
 //! upstream as an RFC 8441 Extended CONNECT stream on the pooled h2c
-//! conn (websocket-plan §8.5) — `WsTunnel` pairs the raw-relay
+//! conn (architecture/websockets.md) — `WsTunnel` pairs the raw-relay
 //! downstream socket with the CONNECT stream; 421 re-aims like any
 //! request; the downstream 101 waits for the upstream 200.
 
@@ -65,7 +65,7 @@ pub const FlowRef = struct {
     ptr: ?*anyopaque = null,
     attempt: u32 = 0,
     /// `ptr` is a *WsTunnel, not a *Flow (Extended-CONNECT WS tunnel
-    /// pump/terminal entities — websocket-plan §8.5).
+    /// pump/terminal entities — architecture/websockets.md).
     tunnel: bool = false,
 };
 
@@ -415,8 +415,8 @@ pub fn Proxy(comptime FrontH2: type) type {
         };
 
         /// One WS tunnel: a downstream h1 Upgrade paired with an upstream
-        /// Extended-CONNECT stream on the pooled h2c conn (websocket-plan
-        /// §8.5). The front never parses frames — bytes relay verbatim in
+        /// Extended-CONNECT stream on the pooled h2c conn
+        /// (architecture/websockets.md). The front never parses frames — bytes relay verbatim in
         /// both directions; the worker unmasks. Freed when `done` with no
         /// outstanding terminals or sink refs.
         const WsTunnel = struct {
@@ -715,7 +715,7 @@ pub fn Proxy(comptime FrontH2: type) type {
 
         /// Shared intake front half: authority → route → Flow. Returns
         /// null after answering the request directly (4xx/5xx).
-        // ── WS tunnels (websocket-plan §8.5) ──────────────────────────
+        // ── WS tunnels (architecture/websockets.md) ──────────────────────────
 
         /// Surfaced h1 Upgrade heads: resolve the route and open the
         /// upstream Extended-CONNECT attempt. The downstream 101 waits

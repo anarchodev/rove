@@ -1,5 +1,5 @@
 //! RFC 6455 WebSocket frame codec for the rove-h2 edge listener
-//! (docs/websocket-plan.md §4.6 piece B).
+//! (docs/architecture/websockets.md piece B).
 //!
 //! The pure, I/O-free half of inbound WebSocket support: handshake-accept
 //! derivation + frame parse/serialize. No sockets, no entities — `root.zig`
@@ -13,7 +13,7 @@
 //!   (the connection layer accumulates continuation frames until FIN), mirroring
 //!   how `http1.zig` leaves body assembly to its driver.
 //! - permessage-deflate / extensions are out of scope (RSV bits must be 0) per
-//!   websocket-plan.md §7.
+//!   architecture/websockets.md
 
 const std = @import("std");
 

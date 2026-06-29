@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inbound-WebSocket WORKER-SEAM smoke (docs/websocket-plan.md §4.6 pieces D+F).
+"""Inbound-WebSocket WORKER-SEAM smoke (docs/architecture/websockets.md pieces D+F).
 
 `ws_echo_smoke.py` proved the rove-h2 transport (pieces A/B/C/E-h2) against the
 collection-driving `ws-echo` example. This smoke proves the piece-D worker seam
@@ -7,7 +7,7 @@ end to end on the real V2 stack: a DEPLOYED JS handler's `onMessage` /
 `onDisconnect` exports served over a raw RFC 6455 connection.
 
 Topology: `V2Cluster` (single rewind node + CP + front + files-server-v2).
-The WS upgrade goes THROUGH THE FRONT DOOR (websocket-plan §8.5): the front
+The WS upgrade goes THROUGH THE FRONT DOOR (architecture/websockets.md): the front
 terminates the handshake and tunnels the connection to the worker as an RFC
 8441 Extended CONNECT stream on the pooled h2c conn — the production path.
 `Host: {tenant}.localhost` routes the tunnel like any request.

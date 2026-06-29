@@ -131,7 +131,7 @@ streaming path. h1→h2c translation is **edge-only**.
   wire bytes so keep-alive framing survives. Non-`headers_first` instances
   (examples, log-server) keep the classic body-complete contract. Proven by
   `scripts/h1_streaming_smoke_v2.py` (through the front).
-- **The worker is h2c-only** (2026-06-12, websocket-plan §8.5): with WS
+- **The worker is h2c-only** (2026-06-12, see `websockets.md`): with WS
   riding Extended CONNECT, nothing pins h1 to the worker —
   `accept_http1 = false` on the rewind instance closes an h1-looking first
   read (and ALPN-h1). h1 termination, like TLS, is the front's job alone;
@@ -139,8 +139,8 @@ streaming path. h1→h2c translation is **edge-only**.
 
 ## WebSocket (RFC 6455)
 
-- **Through the front (the production path, 2026-06-12 — websocket-plan
-  §8.5)**: the front terminates the handshake (`websocket_surface` — the
+- **Through the front (the production path, 2026-06-12 — see `websockets.md`
+  for the full model)**: the front terminates the handshake (`websocket_surface` — the
   Upgrade head surfaces to the proxy; the downstream 101 is DEFERRED until
   the upstream accepts, so a refused tunnel is a plain HTTP error) and
   relays bytes verbatim over an RFC 8441 Extended CONNECT stream

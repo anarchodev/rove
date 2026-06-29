@@ -242,7 +242,7 @@ fn workerMain(args: *WorkerCtx) !void {
             // first. drainRequestReceiving in the tick loop is the
             // disposition point.
             .headers_first = true,
-            // websocket-plan §8.5: WS arrives from the front as RFC 8441
+            // architecture/websockets.md: WS arrives from the front as RFC 8441
             // Extended CONNECT streams on the pooled h2c conns;
             // `serviceWsMessages` dispositions `ws_connect_out`
             // (tenant + leadership at tunnel-open, BEFORE the 200).
@@ -332,7 +332,7 @@ fn workerMain(args: *WorkerCtx) !void {
         // the same tick.
         rjs.pumpInboundChunks(worker);
         try rjs.serviceParkedStreams(worker);
-        // docs/websocket-plan.md §4.5/§5 (piece D): dispatch inbound WS
+        // docs/architecture/websockets.md (piece D): dispatch inbound WS
         // frames (h2 `ws_message_out`) to the held chain's `onMessage` /
         // `onDisconnect` and lower outbound `stream.write`s to `ws_send_in`.
         // Writing frames stage commit-gated sends; the per-connection
