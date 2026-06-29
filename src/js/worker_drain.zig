@@ -2816,7 +2816,7 @@ pub fn scanAndCancelBoundFetches(worker: anytype, ent: rove.Entity) void {
     }
 }
 
-// ── Gap 2.4: inbound-chunk resume engine (`docs/inbound-chunk-plan.md` S2) ──
+// ── Gap 2.4: inbound-chunk resume engine (`docs/architecture/effects-and-handlers.md`) ──
 
 /// Per-tick pump for streaming inbound bodies. For each live job:
 /// janitor stale entities (response shipped / connection died — the

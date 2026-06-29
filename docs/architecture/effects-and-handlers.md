@@ -204,6 +204,65 @@ S3 PUT lands. A body-durability `.failed` returns 503 and does **not** re-submit
   `webhook.send` / `http.subscribe`) never auto-binds, so it can't steal chunks
   from the system result handler.
 
+## Streaming inbound body (the `onChunk` export)
+
+A module exporting `onChunk` receives any-size request bodies per-chunk
+(`request.body` = this chunk, `request.done` flags the last,
+`request.chunkSeq` counts from 0; `next()` awaits the next chunk). The
+customer contract is `handler-shape.md` §3/§4 (the 1 MB `default` ceiling);
+the *why* is `decisions.md` §3.5. As-built mechanism (gap 2.4, shipped
+2026-06-10):
+
+- **Dispatch decision** (`worker_dispatch.zig`, the `body_inbound.receiving`
+  branch): a per-(deployment, module) probe cache
+  (`onChunkLookup`/`onChunkRemember`, mirroring `onHeadersLookup`). Cached-no →
+  classic buffering; cached-yes or unknown → the chunk path. The first
+  `.inbound_chunk` dispatch **probes** like `.inbound_headers`: `runModule`
+  finds no `onChunk` → `RunOutcome.no_onchunk` → roll back the savepoint, cache
+  false, fall back (eof'd ≤ cap → re-dispatch the buffered body as a classic
+  `.inbound`; > cap mid-stream → 413).
+- **Transport**: a worker-owned `BodySink` on the held stream
+  (`requestBodySink`, the same seam `armBlobReceive`/`blob.receive` uses);
+  callbacks run on the worker poll thread (no locks), accumulating into a
+  per-entity `InboundChunkState`. **Accumulate phase** (< cap): bytes append;
+  `drained()` reports them immediately so the window stays open (memory bounded
+  by the cap). **END_STREAM while accumulating** → a single `.inbound_chunk`
+  fire (`body` = whole buffer, `done = true`). **Buffer crosses the cap** →
+  chunked mode: fire the buffer as chunk 0, then per-arrival chunks, and now
+  `drained()` reports bytes only after the chunk's activation completes — so the
+  client throttles to the handler's commit rate (the `blob.receive` backpressure
+  story, reused).
+- **Ordering + read-your-writes**: chunk K+1 dispatches only after K's
+  activation fully resolves (commit + unit release + re-park) — the WS
+  input-gate property, but expressed as **collection membership** rather than a
+  gate flag: the chunk pump fires only for entities in `parked_continuations`
+  with queued chunks. First chunk goes through the normal `dispatchOnce` block;
+  `next()` parks; the pump resumes per queued chunk (`resumeContinuation` with
+  `fn = onChunk`).
+- **Activation vocabulary**: `ActivationSource.inbound_chunk` (= 11) +
+  entity-driven `Msg` arm (chunks ride the entity's component, not the
+  cross-thread queue). Every fire is a recorded, durable-gated activation: the
+  readset's `trigger_payload` carries the bytes (≤ 16 KB inline, larger as a
+  blob-coordinator `BodyRef`, submissions pipelined so the gate's S3 round-trip
+  is off the serial path); per-fire payloads slice at 256 KB (the `.hold`
+  handover arrives as one giant push). Multi-chunk uploads replay like any
+  request.
+- **Caps**: with `onChunk` present the per-request body cap does **not** apply
+  (the contract is any size); the resource bound is backpressure + per-chunk
+  commit. A streaming-total plan knob is future work (plan-tiers).
+- **Failure**: client abort mid-stream → `BodySink.abort` → `sinkAbort` sets
+  `aborted`, which gates `fireReady`/`prepareFires` so the chain stops and the
+  held entity tears down (the existing receiving-stream death path). An early
+  terminal while the body is inbound → respond + `flipInboundBodyToDiscard`.
+
+Code: `worker_inbound_chunk.zig` (the sink Job / prepared-fires queue),
+`worker_drain.zig` (`resumeInboundChunk` / `pumpInboundChunks`),
+`worker_dispatch.zig` (the dispatch-decision sink arm). The front-door
+streaming proxy + h1 early-emit (2026-06-11) carry chunked uploads through the
+edge too — see [`routing-and-ingress.md`](routing-and-ingress.md). Proven by
+`scripts/inbound_chunk_smoke_v2.py` (incl. the log-server tape-query step and
+the client-abort teardown step).
+
 ## Collection lifecycle & held state
 
 State is **collection membership** (decisions.md §3.1). Four orthogonal wait
@@ -240,21 +299,9 @@ the wake to the owning worker, falling back to `hash(tenant)` on a registry miss
   full 2026-06-10; see "Durable scheduled wake" above. The per-feature Zig
   sweeps (`sweepOwedRetries*`, `CronState` + `sweepCronSubscriptions`) are
   deleted.
-- ~~**Streaming inbound body (gap 2.4)**~~ — shipped 2026-06-10
-  (`docs/inbound-chunk-plan.md`): a module exporting `onChunk` receives
-  any-size bodies per-chunk over the `blob.receive` transport seam (a
-  worker-side `BodySink`; window repay rides each fire's resolution, so
-  the client throttles to the handler's commit rate). Chunk K+1 fires
-  only when K's activation committed and re-parked — ordering and
-  read-your-writes are collection membership. Every chunk fire is a
-  recorded, durable-gated activation: the readset's `trigger_payload`
-  carries the payload (≤16 KB inline; larger as a blob-coordinator
-  BodyRef, with submissions pipelined so the gate's S3 round-trip is
-  off the serial path) — multi-chunk uploads replay like any request.
-  Proven by `scripts/inbound_chunk_smoke_v2.py` (incl. the
-  log-server tape-query step). The front-door streaming proxy landed
-  2026-06-11, so chunked uploads also work through the edge
-  (`scripts/front_streaming_smoke_v2.py`).
+- ~~**Streaming inbound body (gap 2.4)**~~ — shipped 2026-06-10; see
+  "Streaming inbound body (the `onChunk` export)" above for the as-built
+  mechanism.
 - ~~**Inbound WebSocket dispatch (piece D)**~~ — shipped 2026-06-09: the worker
   `onMessage`/`onDisconnect` seam (`serviceWsMessages`, `src/js/worker_ws.zig`)
   consumes `ws_message_out` and lowers `stream.write` to `ws_send_in`

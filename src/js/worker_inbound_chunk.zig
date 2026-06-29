@@ -1,4 +1,4 @@
-//! Gap 2.4 (`docs/inbound-chunk-plan.md` S2 + the chunk-tape follow-up):
+//! Gap 2.4 (`docs/architecture/effects-and-handlers.md`, Streaming inbound body):
 //! streaming inbound body → per-chunk `onChunk` activations.
 //!
 //! One `Job` per body-carrying request whose module routes to `onChunk`

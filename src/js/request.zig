@@ -127,7 +127,8 @@ pub const WsMessage = struct {
 };
 
 /// Gap 2.4 streaming-inbound-body chunk payload
-/// (`docs/inbound-chunk-plan.md`). The chunk bytes themselves ride
+/// (`docs/architecture/effects-and-handlers.md`, Streaming inbound body).
+/// The chunk bytes themselves ride
 /// `Request.body` (the documented customer surface is `request.body` =
 /// THIS chunk); this carries the per-chunk bookkeeping that surfaces as
 /// `request.chunkSeq` / `request.done`.
@@ -508,7 +509,8 @@ pub const RunOutcome = union(enum) {
     no_onheaders,
     /// An `.inbound_chunk` probe found no `onChunk` export — the module
     /// wants the classic buffered path (gap 2.4,
-    /// `docs/inbound-chunk-plan.md`). Same posture as `no_onheaders`:
+    /// `docs/architecture/effects-and-handlers.md`). Same posture as
+    /// `no_onheaders`:
     /// the dispatch site rolls back the probe's savepoint, caches the
     /// miss, and re-dispatches as a classic `.inbound`. Never produced
     /// by any other activation kind.

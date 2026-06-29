@@ -57,10 +57,9 @@ The maintained set. Subsystem-owned, kept current with the code.
 Active work on the current (V2) line. Each folds into `architecture/` on ship.
 (Folded + deleted 2026-06-10, all shipped: `v2-build-order`,
 `v2-cutover-checklist`, `durable-wake-plan`, `blob-storage-plan`,
-`plan-tiers` — they survive in git history.) `inbound-chunk-plan.md`
-shipped + fully closed 2026-06-24 (incl. the client-abort teardown
-smoke) but is **retained, not deleted** — it is the cited `S2` design
-reference for ~9 source files; see it for that anchor.
+`plan-tiers` — they survive in git history. `inbound-chunk-plan` joined
+them 2026-06-29: its as-built mechanism folded into
+`architecture/effects-and-handlers.md`, "Streaming inbound body".)
 
 - [v2-production-deploy-plan.md](v2-production-deploy-plan.md) — first production topology (not yet built)
 - [step3-auth-plan.md](step3-auth-plan.md) — Step 3 auth consolidation: sequenced execution plan (OIDC machinery is written; remaining = wire + deploy + close the log-server tenant-scoping gap). Design rationale in `rewind-cli-plan.md` §7

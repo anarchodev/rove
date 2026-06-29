@@ -3047,7 +3047,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             } else if (worker.inbound_chunk_jobs.get(ent) != null or
                 (worker_mod.onChunkLookup(worker, dep_id, route.module_base) orelse true))
             {
-                // Gap 2.4 S2 (inbound-chunk-plan): the module routes to
+                // Gap 2.4 (architecture/effects-and-handlers.md): the module routes to
                 // `onChunk` (cached-yes or unknown — the first fire
                 // probes). Attach the worker-side body sink once; the
                 // job accumulates (≤ cap, single-fire) or streams
@@ -3118,7 +3118,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             }
         }
 
-        // Gap 2.4 (inbound-chunk-plan): any body-carrying classic
+        // Gap 2.4 (architecture/effects-and-handlers.md): any body-carrying classic
         // dispatch routes to `onChunk` when the module exports it —
         // cached-yes or unknown (the first dispatch probes; a
         // `.no_onchunk` outcome below caches the miss and re-walks

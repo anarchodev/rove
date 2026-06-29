@@ -1565,7 +1565,7 @@ pub fn Worker(comptime opts: Options) type {
         /// IS the held lifecycle); this is only the conn→state index,
         /// the WS analog of `bound_fetch_entities`.
         ws_conns: std.AutoHashMapUnmanaged(rove.Entity, WsConnState) = .empty,
-        /// Gap 2.4 (`docs/inbound-chunk-plan.md` S2): live inbound-chunk
+        /// Gap 2.4 (`docs/architecture/effects-and-handlers.md`, Streaming inbound body): live inbound-chunk
         /// jobs, keyed by the request entity. One per body-carrying
         /// request whose module routes to `onChunk`. `dispatchOnce`
         /// stages the FIRST fire (the probe); `pumpInboundChunks` fires
@@ -2998,7 +2998,7 @@ pub fn Worker(comptime opts: Options) type {
             };
         }
 
-        /// Gap 2.4 (`docs/inbound-chunk-plan.md` S2): create the
+        /// Gap 2.4 (`docs/architecture/effects-and-handlers.md`, Streaming inbound body): create the
         /// inbound-chunk job for a receiving request and attach it to
         /// the stream as the h2 body sink. Returns null (and leaves no
         /// references behind) if the stream is already gone. On

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Gap 2.4 smoke — streaming inbound body via the `onChunk` export
-(`docs/inbound-chunk-plan.md` S3).
+(`docs/architecture/effects-and-handlers.md`, Streaming inbound body).
 
 Proves, against a single rewind node (direct — pins the worker-side
 machinery; the edge path is `front_streaming_smoke_v2.py`, since the
@@ -20,8 +20,8 @@ front-door streaming proxy landed 2026-06-11):
   8. client abort mid-upload: a throttled >cap upload severed while the
      body is still inbound — the held chunk chain sink-aborts (fires
      stop, counter stays put) and the worker stays responsive (a fresh
-     full upload still completes). Closes the last "Remaining work" tail
-     of `docs/inbound-chunk-plan.md`.
+     full upload still completes). Exercises the as-built behaviour in
+     `docs/architecture/effects-and-handlers.md` (Streaming inbound body).
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
 Ports: http_base=19500 (see the per-smoke port table convention).

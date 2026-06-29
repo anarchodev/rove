@@ -171,7 +171,7 @@ pub const ActivationSource = enum(u8) {
     /// no Msg carries them (§3.5's pipe_to symmetry).
     inbound_headers = 10,
     /// Streaming inbound body chunk (gap 2.4,
-    /// `docs/inbound-chunk-plan.md` + `docs/handler-shape.md` §4). The
+    /// `docs/architecture/effects-and-handlers.md` + `docs/handler-shape.md` §4). The
     /// handler module exports `onChunk`; the inbound body dispatches
     /// per-chunk — `request.body` = THIS chunk, `request.done` flags
     /// the last, `request.chunkSeq` counts from 0. A body that

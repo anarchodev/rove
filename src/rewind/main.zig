@@ -325,7 +325,7 @@ fn workerMain(args: *WorkerCtx) !void {
         try rjs.drainSnapshotPushes(worker, catchup);
         rjs.drainSpools(worker);
         try rjs.sweepParkedContinuations(worker);
-        // Gap 2.4 (docs/inbound-chunk-plan.md S2): fire the next staged
+        // Gap 2.4 (docs/architecture/effects-and-handlers.md): fire the next staged
         // inbound body chunk into each held `onChunk` chain. Runs after
         // drainRaftPending so a writing chunk's committed entity is back
         // in parked_continuations (the pump's readiness signal) within

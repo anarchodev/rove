@@ -2398,7 +2398,7 @@ pub fn installRequest(
         // blob-storage-plan §3.5: headers-first inbound — body still
         // inbound, handler decides from headers alone.
         .inbound_headers => "inbound_headers",
-        // gap 2.4 / inbound-chunk-plan: streaming inbound body chunk.
+        // gap 2.4 (architecture/effects-and-handlers.md): streaming inbound body chunk.
         .inbound_chunk => "inbound_chunk",
     };
     _ = c.JS_SetPropertyStr(ctx, activation_obj, "kind", c.JS_NewStringLen(ctx, kind.ptr, kind.len));
@@ -2652,7 +2652,7 @@ pub fn installRequest(
         liftThreadedCtx(ctx, req_obj, request.body, state.allocator);
     }
 
-    // gap 2.4 / inbound-chunk-plan: streaming inbound body chunk.
+    // gap 2.4 (architecture/effects-and-handlers.md): streaming inbound body chunk.
     // `Request.body` carries the raw chunk; re-surface it as a
     // Uint8Array (chunks are arbitrary bytes — same posture as the
     // bound-fetch chunk surface above), add the documented top-level
