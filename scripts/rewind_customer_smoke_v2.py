@@ -277,7 +277,7 @@ def main() -> int:
             r = c.tls_curl(app_origin + "/", method="POST",
                            headers={"Cookie": cli_cookie, "content-type": "application/json"},
                            data=json.dumps({"fn": "publishRelease",
-                                            "args": ["custapp", int(dep_id, 16)]}))
+                                            "args": ["custapp", dep_id]}))
             check("CLI release own tenant → 202 queued", r.status == 202,
                   f"got {r.status} {r.body[:120]!r}")
 
