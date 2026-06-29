@@ -1311,11 +1311,19 @@ globalThis.oidc = {
   rp(arg) {
     if (arg == null || typeof arg === "string") {
       const name = arg || "default";
-      const raw = kv.get("_oidc/rp/" + name);
+      // `_oidc/rp/{name}` wins (runtime-mutable via admin setKv); fall back to
+      // the per-deploy template `_config/oidc/rp/{name}` shipped in the RP's
+      // bundle (admin/_config/oidc/rp/{name}.json), so the RP config rides the
+      // deploy declaratively — symmetric with oidc.provider's registry fallback
+      // (above). Without this an operator must hand-seed _oidc/rp after every
+      // wipe or the dashboard 500s.
+      let raw = kv.get("_oidc/rp/" + name);
+      if (raw == null) raw = kv.get("_config/oidc/rp/" + name);
       if (raw == null) {
         throw new Error(
           "oidc.rp: no RP config at _oidc/rp/" + name +
-          " (seeded at bootstrap; or set via admin setKv).");
+          " or _config/oidc/rp/" + name +
+          " (set via admin setKv, or ship _config/oidc/rp/" + name + ".json).");
       }
       return new OIDCRelyingParty(JSON.parse(raw), name);
     }
