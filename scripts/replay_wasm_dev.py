@@ -9,7 +9,7 @@ replay_demo records, click "Replay" on any row to open the WASM
 replay shell (scrubber, source viewport, variables drawer).
 
 Iteration loop:
-  1. Edit any file under web/admin/ or web/replay/
+  1. Edit any file under the apps repo (REWIND_APPS_DIR) admin/ or replay/
   2. Kill files-server-standalone:  pkill -x files-server-standalone
   3. Re-run this script (or just respawn files-server-standalone)
      — bootstrap reads the new bytes from disk and re-deploys
@@ -189,7 +189,7 @@ def main() -> int:
         print("══════════════════════════════════════════════════════════════", flush=True)
         print("", flush=True)
         print(" iteration loop (no zig build needed for UI edits):", flush=True)
-        print("   1. edit web/admin/* or web/replay/*", flush=True)
+        print("   1. edit <apps>/admin/* or <apps>/replay/* (REWIND_APPS_DIR)", flush=True)
         print("   2. Ctrl-C this script", flush=True)
         print("   3. re-run it — Cluster.spawn wipes data dirs, so", flush=True)
         print("      bootstrap re-deploys the admin/replay tenants", flush=True)

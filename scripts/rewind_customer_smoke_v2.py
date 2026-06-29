@@ -41,7 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, REPO_ROOT  # noqa: E402
+from smoke_lib_v2 import V2Cluster, REPO_ROOT, APPS_DIR  # noqa: E402
 
 CUSTOMER = "dev@example.com"
 CLIENT_ID = "admin-dashboard"
@@ -86,9 +86,9 @@ def main() -> int:
         if not ok:
             failures.append(label)
 
-    auth_src = (REPO_ROOT / "web/auth/index.mjs").read_text()
-    auth_cfg = (REPO_ROOT / "web/auth/_config/oidc/default.json").read_text()
-    admin_files = {p: (REPO_ROOT / "web/admin" / p).read_text() for p in
+    auth_src = (APPS_DIR / "auth/index.mjs").read_text()
+    auth_cfg = (APPS_DIR / "auth/_config/oidc/default.json").read_text()
+    admin_files = {p: (APPS_DIR / "admin" / p).read_text() for p in
                    ("index.mjs", "_middlewares/index.mjs",
                     "_rp/complete.mjs", "_rp/jwks.mjs")}
 

@@ -44,7 +44,7 @@ export LOOP46_ROOT_TOKEN="$TOKEN"
     --fresh &
 WORKER_PID=$!
 
-cd "$(dirname "$0")/../web/admin"
+cd "${REWIND_APPS_DIR:-$(dirname "$0")/../web}/admin"
 python3 -m http.server "$UI_PORT" &
 UI_PID=$!
 

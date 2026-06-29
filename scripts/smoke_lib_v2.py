@@ -43,6 +43,10 @@ from smoke_lib import mint_jwt, HttpResponse  # noqa: E402
 from v2_topology import spawn_cp, spawn_front, await_ready, CP_BIN, FRONT_BIN  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# First-party app content (used as fixtures by some smokes). Moved out of the
+# engine repo for rewindjs (private rewind-apps); point via REWIND_APPS_DIR.
+# Falls back to ./web for an operator who keeps apps in-repo.
+APPS_DIR = Path(os.environ.get("REWIND_APPS_DIR") or (REPO_ROOT / "web"))
 BIN_DIR = REPO_ROOT / "zig-out" / "bin"
 REWIND = BIN_DIR / "rewind-worker"
 LOG_SERVER = BIN_DIR / "rewind-logs"

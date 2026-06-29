@@ -41,7 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, REPO_ROOT  # noqa: E402
+from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, REPO_ROOT, APPS_DIR  # noqa: E402
 
 AUTH_HOST = f"__auth__.{PUBLIC_SUFFIX}"          # wildcard-routed to __auth__
 ISS = f"https://{AUTH_HOST}"                      # host-relative issuer
@@ -96,8 +96,8 @@ def main() -> int:
         if not ok:
             failures.append(label)
 
-    auth_src = (REPO_ROOT / "web/auth/index.mjs").read_text()
-    auth_cfg = (REPO_ROOT / "web/auth/_config/oidc/default.json").read_text()
+    auth_src = (APPS_DIR / "auth/index.mjs").read_text()
+    auth_cfg = (APPS_DIR / "auth/_config/oidc/default.json").read_text()
 
     print("=== stand up __auth__ + OIDC conformance ===")
     with V2Cluster.spawn("oidc", nodes=1, http_base=19700, raft_base=19800) as c:

@@ -513,9 +513,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "genesis_admin_mjs", .path = "src/js/starter/genesis_admin.mjs" },
         // The streamed static-upload module (routed at /v1/upload), baked into
         // genesis alongside index.mjs so the bootstrap can stream large statics
-        // (codemirror) into the admin it publishes. Shared with web/admin's
-        // own deploy bundle (same source file).
-        .{ .name = "upload_mjs", .path = "web/admin/v1/upload/index.mjs" },
+        // (codemirror) into the admin it publishes. The operator's admin app
+        // (rewind-apps) carries its own copy of this module for its deploy bundle.
+        .{ .name = "upload_mjs", .path = "src/js/starter/upload.mjs" },
     };
     for (js_runtime_files) |f| {
         js_mod.addAnonymousImport(f.name, .{

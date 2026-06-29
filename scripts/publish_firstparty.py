@@ -36,13 +36,18 @@ Usage:
 """
 import argparse
 import json
+import os
 import pathlib
 import shutil
 import subprocess
 import sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-WEB = REPO / "web"
+# First-party app content (manifest.json + the per-tenant dirs). This driver is
+# operator-neutral and ships in the engine repo; the CONTENT lives in the
+# operator's own repo. Point it via --apps-dir or REWIND_APPS_DIR; falls back to
+# ./web for an operator who keeps apps in-repo. (rewindjs: ~/src/rewind-apps.)
+WEB = pathlib.Path(os.environ.get("REWIND_APPS_DIR") or (REPO / "web"))
 
 
 def load_manifest(path: pathlib.Path) -> dict:
@@ -99,7 +104,7 @@ def publish_tenant(t: dict, defaults: dict, ops_bin: str, env_path: str | None,
     release = release_override if release_override is not None \
         else t.get("release", defaults.get("release", True))
 
-    print(f"\n== {tenant}  (web/{src} → {', '.join(hosts) or '<no custom host>'})")
+    print(f"\n== {tenant}  ({WEB.name}/{src} → {', '.join(hosts) or '<no custom host>'})")
 
     # 1. provision (idempotent — rewind-ops treats 409/already-placed as success)
     if t.get("provision", True):
@@ -126,7 +131,11 @@ def main() -> int:
     ap.add_argument("tenants", nargs="*",
                     help="tenant ids to publish (default: every 'operator' tenant). "
                          "Naming a tenant publishes it regardless of kind.")
-    ap.add_argument("--manifest", type=pathlib.Path, default=WEB / "manifest.json")
+    ap.add_argument("--apps-dir", type=pathlib.Path, default=None,
+                    help="first-party app content root (manifest.json + dirs); "
+                         "default $REWIND_APPS_DIR or ./web")
+    ap.add_argument("--manifest", type=pathlib.Path, default=None,
+                    help="manifest path (default: <apps-dir>/manifest.json)")
     ap.add_argument("--env", default=None,
                     help="operator env file forwarded to rewind-ops "
                          "(default: rewind-ops' own ~/.config/rove/prod.env)")
@@ -140,7 +149,11 @@ def main() -> int:
                     help="print the rewind-ops calls without running them")
     args = ap.parse_args()
 
-    manifest = load_manifest(args.manifest)
+    global WEB
+    if args.apps_dir:
+        WEB = args.apps_dir
+    manifest_path = args.manifest or (WEB / "manifest.json")
+    manifest = load_manifest(manifest_path)
     defaults = manifest.get("defaults", {})
     all_tenants = manifest["tenants"]
     by_id = {t.get("tenant"): t for t in all_tenants}
