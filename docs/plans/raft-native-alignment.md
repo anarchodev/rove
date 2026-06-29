@@ -112,7 +112,7 @@ pool.**
 - **Leader-only reads (dispatch-gate) vs `read_index` → OPEN.** `read_index` /
   lease-read is raft's native linearizable-read + follower-read mechanism; we
   diverged. Justified *only* while we don't need read scaling — re-scrutinize if
-  we do (`docs/raft-best-practices.md` item 2 has the analysis).
+  we do (`docs/plans/raft-best-practices.md` item 2 has the analysis).
 - **Epoch fencing on the transport → tied to #4.** raft has no epochs; ours
   exists for cross-cluster moves. If #4 goes conf-change-native, this may
   disappear; otherwise it's a justified divergence for the move feature.
@@ -550,7 +550,7 @@ This is the consensus engine. Every phase:
   `learner_add`, `fresh_voter_join`, `three_node`, `membership_reconciler`,
   `leader_failover`, `graceful_transfer`, `snap_catchup`, `dispatch_gate`) +
   `v2-test` + `test`, plus a soak on real disk;
-- coordinated fork↔rove via the pin protocol (`docs/raft-correctness-plan.md`):
+- coordinated fork↔rove via the pin protocol (`docs/plans/raft-correctness-plan.md`):
   land fork FFI + push, then bump the rove pin with the caller change together;
 - reverts a prior decision (snapshot-free) deliberately — the new path is
   follower-sourced (leader off the data path), which was the stated preference.

@@ -3,12 +3,12 @@
 > **Status: plan / not yet built (2026-06-08).** The first production deploy
 > of the V2 `rewind` stack, plus the repeatable *feature-done → deploy → docs*
 > workflow. Supersedes the V1 deploy story in
-> [`architecture/deployment-and-logs.md`](architecture/deployment-and-logs.md) +
+> [`architecture/deployment-and-logs.md`](../architecture/deployment-and-logs.md) +
 > `scripts/systemd/*.service`, **all of which target the retired four-binary
 > V1 topology** (`loop46`, `files-server-standalone`, `log-server-standalone`,
 > `sse-server-standalone`) and must not be used. Companions:
-> [`architecture/routing-and-ingress.md`](architecture/routing-and-ingress.md),
-> [`architecture/control-plane.md`](architecture/control-plane.md).
+> [`architecture/routing-and-ingress.md`](../architecture/routing-and-ingress.md),
+> [`architecture/control-plane.md`](../architecture/control-plane.md).
 
 ## 0. The gap this plan closes
 
@@ -135,7 +135,7 @@ All three binaries are positional-arg + env-var configured. **Verified against
 | `REWIND_PUBLIC_SUFFIX` | customer tenant wildcard eTLD+1 (`rewindjs.app`) |
 | `REWIND_INTERNAL_FRONT` | tenant door: comma-sep **bare IPs** of the fronts on the private plane (vRack/WireGuard); outbound fetches to `*.{public/system suffix}` hosts pin their connect here instead of resolving public DNS, so tenant→tenant calls never hairpin through the public edge (`docs/architecture/effects-and-handlers.md`). The door fires **only for the front's TLS port** (so a `…:9090` URL can't be pinned at the co-located CP) — `:443` by default; set `REWIND_INTERNAL_FRONT_PORT` only if the front's TLS port differs (test topologies). Unset = inert |
 | `REWIND_INTERNAL_FRONT_PORT` | tenant door: the front TLS port the door accepts + pins (default `443`). Operators leave it unset in prod; test harnesses set it to the front's high port |
-| `REWIND_RAFT_TICK_MS` | raft logical-tick cadence (ms); election timeout ≈ `election_tick(10) × this`. Default `1` (~15-20ms election, aggressive); prod sets `10` (~100-300ms, the industry band). See `docs/raft-best-practices.md` "how to size" |
+| `REWIND_RAFT_TICK_MS` | raft logical-tick cadence (ms); election timeout ≈ `election_tick(10) × this`. Default `1` (~15-20ms election, aggressive); prod sets `10` (~100-300ms, the industry band). See `docs/plans/raft-best-practices.md` "how to size" |
 | `S3_*` / `AWS_*` | blob/log/tape backend (see §2.4) |
 
 ### 2.2 `rewind-cp` (control plane) — `rewind-cp <port>`
@@ -294,7 +294,7 @@ per-tenant **cap** on custom domains checked at `POST /_control/host`, plus an
 account-level limits). Free tier = subdomains of our domains only; custom domains
 = paid tier / add-on (the Vercel/Netlify model). Post-launch feature, tied to
 the plan-tier levers (`architecture/control-plane.md`, shipped) +
-`docs/pricing-model.md` (not built).
+`docs/strategy/pricing-model.md` (not built).
 
 ## 5. First-deploy runbook (outline — full version → `docs/v2-deployment.md`)
 

@@ -9,8 +9,8 @@
 > **Inbound WS (serving WS endpoints to a tenant's clients) is shipped** —
 > single-node baseline (2026-06-09) + WS-through-the-front via RFC 8441
 > Extended CONNECT (2026-06-12). Its as-built design lives in
-> [`architecture/websockets.md`](architecture/websockets.md); the edge
-> transport is [`architecture/routing-and-ingress.md`](architecture/routing-and-ingress.md)
+> [`architecture/websockets.md`](../architecture/websockets.md); the edge
+> transport is [`architecture/routing-and-ingress.md`](../architecture/routing-and-ingress.md)
 > `## WebSocket`. This doc is **only** the outbound half.
 
 ## 1. Why outbound is close

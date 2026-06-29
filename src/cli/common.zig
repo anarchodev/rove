@@ -1,6 +1,6 @@
 //! Shared infrastructure for the rewind operator CLIs (`rewind-ops` now; the
 //! OIDC-scoped customer `rewind` later). The split is by credential/audience
-//! (docs/rewind-cli-plan.md §6): platform verbs that carry root +
+//! (docs/plans/rewind-cli-plan.md §6): platform verbs that carry root +
 //! move-secret + ops-secret live in `rewind-ops`; tenant verbs that carry an
 //! OIDC session will live in `rewind`. This module is the credential-agnostic
 //! core both reuse: operator env loader, curl/ssh transport, JSON helpers, and

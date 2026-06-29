@@ -2,7 +2,7 @@
 """V2 graceful leadership-transfer smoke.
 
 Proves the `transfer_leader` raft best practice (the #1 item in
-`docs/raft-best-practices.md`): on a GRACEFUL shutdown (SIGTERM, the `/deploy`
+`docs/plans/raft-best-practices.md`): on a GRACEFUL shutdown (SIGTERM, the `/deploy`
 rolling-restart path) the outgoing leader hands each group it leads to a
 caught-up follower via `RawNode::transfer_leader`, so a new leader emerges in
 ~one heartbeat instead of after a full election timeout.

@@ -662,7 +662,7 @@ fn valueToOwnedString(
 /// (`StreamKeyTooLarge` / `StreamValueTooLarge`), which would surface as an
 /// opaque replication failure, not a handler error. We reject it fail-fast
 /// here at write time with a clean, branchable JS error instead
-/// (docs/format-versioning-audit.md §7.2). Conservative by design: these can
+/// (docs/plans/format-versioning-audit.md §7.2). Conservative by design: these can
 /// be RAISED later without breaking anyone, never lowered.
 const KV_KEY_MAX: usize = kv_mod.snapshot_stream.STREAM_KEY_MAX;
 const KV_VAL_MAX: usize = kv_mod.snapshot_stream.STREAM_VAL_MAX;
@@ -1822,7 +1822,7 @@ pub fn installStatic(ctx: *c.JSContext) void {
     //   - webhook.js: legacy webhook.send shim on http.send.
     //   - email.js: Resend wrapper that calls webhook.send (the shim).
     //   - kv/console/crypto/http/events/platform .js: public shims
-    //     over `_system.*` (docs/builtin-libs-docs-plan.md Phase A).
+    //     over `_system.*` (docs/plans/builtin-libs-docs-plan.md Phase A).
     //     Evaluated FIRST so the dependent snippets below (jwt/oauth/
     //     oidc/sessions use `crypto`; retry/webhook/email use `http`)
     //     and customer handlers see the documented top-level names
@@ -1877,7 +1877,7 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // kv + URLSearchParams + TextEncoder (all evaluated above).
     evalSnippet(ctx, "activitypub.js", ACTIVITYPUB_JS);
 
-    // Phase A reachability hardening (docs/builtin-libs-docs-plan.md).
+    // Phase A reachability hardening (docs/plans/builtin-libs-docs-plan.md).
     // Every native shim above captured its slice as
     // `const sys = _system.X` at eval time, so the `_system.*` objects
     // stay alive through those closures — the global holder is dead
@@ -1913,7 +1913,7 @@ const NamespaceBindings = struct {
 };
 
 const STATIC_NAMESPACES = [_]NamespaceBindings{
-    // `_system` is the internal native ABI (docs/builtin-libs-docs-plan.md
+    // `_system` is the internal native ABI (docs/plans/builtin-libs-docs-plan.md
     // Phase A). Unstable, undocumented, never referenced by customer
     // code — every public name is a doc-commented JS shim in
     // `globals/*.js` layered over `_system.*`. Empty holder so the
@@ -2106,7 +2106,7 @@ const GLOBAL_BUILTINS = [_]FnBinding{
     .{ .name = "__rove_fetch", .cfunc = http_b.jsSystemFetch, .argc = 1 },
 };
 
-// Public shims (docs/builtin-libs-docs-plan.md Phase A). JSDoc-carrying
+// Public shims (docs/plans/builtin-libs-docs-plan.md Phase A). JSDoc-carrying
 // JS over `_system.*`; this is the documentation source of truth.
 const KV_JS = @embedFile("kv_js");
 const CONSOLE_JS = @embedFile("console_js");
@@ -3197,7 +3197,7 @@ pub fn install(
     installRequest(ctx, state, request);
 }
 
-// ── Phase A documentation lints (docs/builtin-libs-docs-plan.md) ──
+// ── Phase A documentation lints (docs/plans/builtin-libs-docs-plan.md) ──
 //
 // Run under `zig build test`. (a) — "no customer code references
 // `_system`" — is a repo-tree scan and lives in

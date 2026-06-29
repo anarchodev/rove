@@ -1,4 +1,4 @@
-//! Format-version registry (`docs/format-versioning-audit.md` §3.8) —
+//! Format-version registry (`docs/plans/format-versioning-audit.md` §3.8) —
 //! the single in-binary place that names every wire / on-disk / persisted
 //! format version, so the whole surface is auditable at a glance and the
 //! worker can dump it (`rewind --version`).

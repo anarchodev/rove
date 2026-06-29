@@ -5,14 +5,14 @@
 > batches, and replay tape blobs. It is **one mechanism** — a per-tenant
 > compacting GC over cross-tenant batch objects — not four. This doc
 > consolidates threads previously scattered across
-> [`pricing-model.md`](pricing-model.md) (the capacity model + the
-> "compacting GC rewrite"), [`decisions.md`](decisions.md) (§3.6 the
+> [`pricing-model.md`](../strategy/pricing-model.md) (the capacity model + the
+> "compacting GC rewrite"), [`decisions.md`](../decisions.md) (§3.6 the
 > tape-retention axis, §3.8 the blob delete/GC + pinning openness), and
-> [`architecture/deployment-and-logs.md`](architecture/deployment-and-logs.md)
+> [`architecture/deployment-and-logs.md`](../architecture/deployment-and-logs.md)
 > §6.8 (no log compactor yet). The replay-tape angle was the trigger:
 > tape-minimization left **GC + retention-pinning** as its sole open item,
 > which is not tape-specific and belongs here. The effect-model frame is
-> [`effect-algebra.md`](effect-algebra.md) L3; the four tape record kinds
+> [`effect-algebra.md`](../effect-algebra.md) L3; the four tape record kinds
 > are `decisions.md` §3.9.
 
 ## 1. Why one mechanism, not four

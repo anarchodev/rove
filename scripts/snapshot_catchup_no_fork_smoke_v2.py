@@ -8,7 +8,7 @@ end-to-end: a follower stranded past the compaction floor recovers via the
 out-of-band baseline + snapshot stream and converges to the leader's state with
 **every** acked write intact (no fork).
 
-The bug (RC-1, `docs/raft-consensus-storage-triage.md`): the catch-up baseline
+The bug (RC-1, `docs/plans/raft-consensus-storage-triage.md`): the catch-up baseline
 index was `slot.applied_idx`, which under worker_overlay LEADS the folded
 snapshot content; the receiver `apply_local_snapshot` then fast-forwarded commit
 PAST writes the snapshot lacked, and those entries (≤ its commit / below

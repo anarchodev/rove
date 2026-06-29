@@ -1154,7 +1154,7 @@ fn tryHandleSystem(
         return true;
     }
 
-    // Bootstrap + break-glass (`docs/rewind-cli-plan.md` §4). Root-token
+    // Bootstrap + break-glass (`docs/plans/rewind-cli-plan.md` §4). Root-token
     // gated, NO body: (re)deploy the BAKED `__admin__` deploy app and stamp
     // `_deploy/current`, recovering a virgin or bricked control tenant. Every
     // ARBITRARY deploy (the full admin, customers) goes THROUGH the deployed
@@ -1440,7 +1440,7 @@ pub fn buildMetricsText(allocator: std.mem.Allocator, worker: anytype) ![]u8 {
     // ── raft failover / broadcast-time observability ──────────────────
     //
     // The inputs for sizing election/heartbeat timeouts in THIS environment
-    // (docs/raft-best-practices.md "how to size ..."):
+    // (docs/plans/raft-best-practices.md "how to size ..."):
     //   raft_leadership_acquisitions_total — follower→leader promotion edges.
     //     The spurious-election signal: ~1 per group at formation, then FLAT
     //     under steady load. A rising count under no real failures means the
@@ -2054,7 +2054,7 @@ fn handleRelease(
         std.log.warn("release: parkKvWakes (tenant={s}) failed: {s}", .{ parsed.value.tenant_id, @errorName(perr) });
 }
 
-/// `POST /_system/reset` — bootstrap + break-glass (`docs/rewind-cli-plan.md`
+/// `POST /_system/reset` — bootstrap + break-glass (`docs/plans/rewind-cli-plan.md`
 /// §4). Root-token gated, NO body. (Re)deploys the BAKED `__admin__` deploy app
 /// + stamps `_deploy/current` via `worker.deployBakedAdmin`. Synchronous (rare,
 /// operator-triggered) — runs inline on the poll loop. Returns

@@ -18,7 +18,7 @@
 //!   from ordinary handler context. Reserving the whole namespace (rather
 //!   than an enumerated list) is the pre-customer lock-in fix: any NEW
 //!   platform `_…/` key family is safe to introduce later without
-//!   colliding with customer data (docs/format-versioning-audit.md §7.1).
+//!   colliding with customer data (docs/plans/format-versioning-audit.md §7.1).
 //!   Customers get the entire non-`_` keyspace. Reads are NOT guarded
 //!   (`_config/` is a documented customer-readable namespace). Platform Zig
 //!   writers bypass `jsKvSet` and write via `state.txn.put` directly, and
@@ -92,7 +92,7 @@ pub const PLATFORM_KV_PREFIXES = [_][]const u8{
 /// markers (a per-tenant self-footgun — no cross-tenant or platform-integrity
 /// impact, since every store is per-tenant). Fully closing that footgun would
 /// require a privileged write binding the shims capture pre-`_harden`
-/// (docs/format-versioning-audit.md §7.1 option (a)); deferred.
+/// (docs/plans/format-versioning-audit.md §7.1 option (a)); deferred.
 ///
 /// Enumerated by auditing every `kv.set`/`kv.delete` in `globals/*.js`
 /// (their default config paths). Keep in sync when a shim adds a `_`-prefix:

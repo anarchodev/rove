@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Phase A lint (a): customer/app JS must never reference the internal
-`_system.*` ABI (docs/builtin-libs-docs-plan.md).
+`_system.*` ABI (docs/plans/builtin-libs-docs-plan.md).
 
 The public surface is the doc-commented shims in `src/js/globals/*.js`
 — those are the ONLY legitimate referrers of `_system` and are not

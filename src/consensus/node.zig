@@ -234,7 +234,7 @@ pub const DEFAULT_AUTO_DEMOTE_NS: i64 = 5 * std.time.ns_per_s;
 /// justifiable number. The default preserves the historical ~1ms idle cadence
 /// (so behavior is unchanged) while also CAPPING the rate under load; raise it
 /// (env `REWIND_RAFT_TICK_MS`) once a soak has measured the broadcast-time +
-/// pause-jitter tail this must clear (see docs/raft-best-practices.md).
+/// pause-jitter tail this must clear (see docs/plans/raft-best-practices.md).
 pub const DEFAULT_TICK_NS: i64 = 1 * std.time.ns_per_ms;
 
 /// Resolves the store a replicated entry applies to, keyed by the
@@ -1223,7 +1223,7 @@ pub const Node = struct {
     /// fast-forwards `committed` to the baseline, and any write above what the
     /// snapshot actually contains is then ≤ its commit / below `first_index`, so it
     /// never replays → a PERMANENT store fork at an agreed log index (the 2026-06-20
-    /// prod `__auth__` divergence; `docs/raft-consensus-storage-triage.md` RC-1).
+    /// prod `__auth__` divergence; `docs/plans/raft-consensus-storage-triage.md` RC-1).
     ///
     /// `applied_idx` is WRONG here: under `worker_overlay` a skipped own-propose
     /// bumps `applied_idx` while its store write still sits in the worker's open txn

@@ -828,7 +828,7 @@ const MAX_DNS_LABEL_LEN: usize = 63;
 /// `REWIND_PUBLIC_SUFFIX`), a customer who provisioned `auth`/`api`/… would
 /// claim a platform-looking subdomain on our own zone — so we deny these at
 /// provisioning, pre-customer, while it's free to do so
-/// (docs/format-versioning-audit.md §7.7). Curated platform-product + infra
+/// (docs/plans/format-versioning-audit.md §7.7). Curated platform-product + infra
 /// labels; extend as new platform surfaces appear. NOT generic business words
 /// (blog/shop/docs/…) — those stay available to customers. All lowercase
 /// (ids are already lowercased by the DNS check), so an exact match suffices.
@@ -864,7 +864,7 @@ fn isReservedSubdomainLabel(id: []const u8) bool {
 /// a public subdomain: lowercase only (DNS is case-insensitive), no `_`
 /// (invalid in DNS host labels), no leading/trailing hyphen, ≤63 octets. This
 /// is the strictest plausible spec, locked pre-customer; loosening later is
-/// always safe, tightening is not (docs/format-versioning-audit.md §7.4).
+/// always safe, tightening is not (docs/plans/format-versioning-audit.md §7.4).
 /// Platform-reserved `__…__` ids are exempted.
 fn validateInstanceId(id: []const u8) Error!void {
     if (id.len == 0 or id.len > MAX_INSTANCE_ID_LEN) return Error.InvalidInstanceId;

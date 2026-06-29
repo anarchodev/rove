@@ -7,7 +7,7 @@ non-event, and the `REWIND_VOTERS` / `REWIND_CLUSTERS` drift class disappears.
 
 Status: design locked (this doc), not yet built. Substrate it builds on
 (conf_change, snapshot/baseline bootstrap, `voter_progress`) is **already
-shipped** — see `docs/raft-best-practices.md` and the promote-back work
+shipped** — see `docs/plans/raft-best-practices.md` and the promote-back work
 (`27beb49`, `b1367ee`).
 
 ## Why
@@ -182,7 +182,7 @@ during backfill (retries, no corruption), CP-leader flip mid-`ensureMember`
 ### Phase 6 — follow-on (not blocking)
 Single-source-of-truth completion: derive raft membership from `cluster.nodes`,
 retire `REWIND_VOTERS`; runtime transport peer add/remove for a *truly new* host
-not in the static peer set (the bigger "Path A", `docs/v2-production-deploy-plan.md`
+not in the static peer set (the bigger "Path A", `docs/plans/v2-production-deploy-plan.md`
 §8); the explicit **destructive** ops (`removeMember`/shrink/deprovision) as
 operator-driven — never the reconciler.
 

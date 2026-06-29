@@ -1,6 +1,6 @@
 # Phase 12 — Sim test framework + simulator library
 
-Implements [`docs/PLAN.md`](PLAN.md) §10.7 (simulator primitive) and §10.8 (sim test framework).
+Implements [`docs/PLAN.md`](../PLAN.md) §10.7 (simulator primitive) and §10.8 (sim test framework).
 
 > **CLI naming/host updated 2026-06-10.** This plan predates `decisions.md`
 > §8.3 (2026-05-15): the CLI ships as the **`rewind` npm package** (Node over

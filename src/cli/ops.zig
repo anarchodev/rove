@@ -1,4 +1,4 @@
-//! `rewind-ops` — the platform/operator CLI (docs/rewind-cli-plan.md §2–§3,
+//! `rewind-ops` — the platform/operator CLI (docs/plans/rewind-cli-plan.md §2–§3,
 //! §6). The privileged half of the split: every verb here carries an operator
 //! secret (root token → workers + deploy app; REWIND_MOVE_SECRET → CP control,
 //! which now also propagates the worker domain alias). Never shipped to
@@ -478,7 +478,7 @@ fn cmdStatus(a: std.mem.Allocator, env: *const c.Env, host: []const u8) void {
 // ── arg parsing + dispatch ──────────────────────────────────────────────────
 
 const usage =
-    \\rewind-ops — platform/operator CLI (docs/rewind-cli-plan.md)
+    \\rewind-ops — platform/operator CLI (docs/plans/rewind-cli-plan.md)
     \\
     \\usage:
     \\  rewind-ops genesis [--cluster C]              cold bring-up from empty (needs ROVE_GENESIS_NODES)

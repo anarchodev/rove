@@ -1,5 +1,5 @@
 //! Dest side of the raft Phase 2.5 streaming snapshot transfer
-//! (`docs/raft-native-alignment.md`; codec in `raft-kv`'s `snapshot_stream`).
+//! (`docs/plans/raft-native-alignment.md`; codec in `raft-kv`'s `snapshot_stream`).
 //!
 //! `POST /_system/v2-snapshot-stream` arrives as a streamed inbound body. Rather
 //! than the customer `onChunk` `Job` (which round-trips every >cap chunk through

@@ -267,7 +267,7 @@ fn workerMain(args: *WorkerCtx) !void {
     defer worker.destroy();
 
     // Background compile+stage thread for `/_system/deploy`
-    // (docs/rewind-cli-plan.md §4 — files-server dissolution). Owns its
+    // (docs/plans/rewind-cli-plan.md §4 — files-server dissolution). Owns its
     // own QuickJS runtime so it never races the poll-loop compiler.
     try worker.startDeployThread();
 
@@ -606,7 +606,7 @@ pub fn main() !void {
     _ = arg_it.next(); // argv[0]
     const first_arg = arg_it.next();
     // `rewind --version` dumps the format-version registry and exits
-    // (`docs/format-versioning-audit.md` §3.8). Done before any data-dir
+    // (`docs/plans/format-versioning-audit.md` §3.8). Done before any data-dir
     // / port handling so it works with no environment set up.
     if (first_arg) |a| {
         if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "version")) {
@@ -798,7 +798,7 @@ pub fn main() !void {
     // `election_tick × this` (see node.zig DEFAULT_TICK_NS); the default
     // preserves the historical ~1ms cadence. Raise it once a soak has measured
     // the broadcast-time + pause-jitter tail it must clear
-    // (docs/raft-best-practices.md "how to size election/heartbeat").
+    // (docs/plans/raft-best-practices.md "how to size election/heartbeat").
     if (std.posix.getenv("REWIND_RAFT_TICK_MS")) |v| {
         if (std.fmt.parseInt(i64, v, 10)) |ms| {
             if (ms > 0) {

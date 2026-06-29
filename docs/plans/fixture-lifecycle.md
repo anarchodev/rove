@@ -1,6 +1,6 @@
 # Phase 13 — Fixture lifecycle + worker dry-run
 
-Implements [`docs/PLAN.md`](PLAN.md) §10.9 (fixture lifecycle tooling) and §10.11 (worker dry-run dispatch mode).
+Implements [`docs/PLAN.md`](../PLAN.md) §10.9 (fixture lifecycle tooling) and §10.11 (worker dry-run dispatch mode).
 
 > **CLI naming/host updated 2026-06-10.** Per `decisions.md` §8.3 the CLI is
 > the **`rewind` npm package** (Node over arenajs-WASM), and the V1 `loop46`

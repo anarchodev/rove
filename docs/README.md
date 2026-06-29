@@ -24,9 +24,9 @@ Three durable layers, plus working docs:
 | **What / roadmap** | `PLAN.md` | Product direction, phases. |
 | **How it works (as-built)** | `architecture/` | One doc per subsystem, kept current. |
 | Customer contracts | `effect-algebra.md`, `handler-shape.md` | The effect model + handler API surface. |
-| In-flight | the `*-plan.md` / `v2-*.md` below | Active work; folds into `architecture/` on ship, then deleted. |
-| Product / strategy | `pricing-model.md`, etc. | Not engine mechanics. |
-| Guides | `activitypub-tutorial.md` | Tutorials. |
+| In-flight | `plans/` | Active work; folds into `architecture/` on ship, then deleted. |
+| Product / strategy | `strategy/` | Not engine mechanics. |
+| Guides | `guides/` | Tutorials. |
 
 **Lifecycle:** a plan, once shipped, has its *why* harvested into `decisions.md`
 and its *mechanics* folded into the owning `architecture/` doc — then the plan is
@@ -61,23 +61,23 @@ Active work on the current (V2) line. Each folds into `architecture/` on ship.
 them 2026-06-29: its as-built mechanism folded into
 `architecture/effects-and-handlers.md`, "Streaming inbound body".)
 
-- [v2-production-deploy-plan.md](v2-production-deploy-plan.md) — first production topology (not yet built)
-- [step3-auth-plan.md](step3-auth-plan.md) — Step 3 auth consolidation: sequenced execution plan (OIDC machinery is written; remaining = wire + deploy + close the log-server tenant-scoping gap). Design rationale in `rewind-cli-plan.md` §7
-- [cp-desired-state-target.md](cp-desired-state-target.md) — north-star (not yet built): CP owns all per-tenant desired-state incl. release; workers reconcile; one S2S key (move-secret); root token retires. The arc B3/B4 point at
-- [websocket-plan.md](websocket-plan.md) — **outbound** WS only (a handler as client of an upstream WS server — atproto firehose / Pub/Sub; unbuilt, ~1–2 weeks). Inbound WS shipped → `architecture/websockets.md`
-- [retention-and-gc.md](retention-and-gc.md) — the one compacting GC across log-blobs / kv pages / `_pool` bodies / tape blobs; capacity-based retention; the input-home pinning obligation (unbuilt). The minimal-tape four-record-kinds synthesis now lives in `decisions.md` §3.9
-- [builtin-libs-docs-plan.md](builtin-libs-docs-plan.md) — `_system.*` + JS shim docs
-- [replay-wasm-plan.md](replay-wasm-plan.md) — WASM replay UI (§8.6+ deferred)
-- [sim-test-framework.md](sim-test-framework.md) · [fixture-lifecycle.md](fixture-lifecycle.md) · [agent-surface.md](agent-surface.md) — replay/sim/agent surface (Phase 12–14)
+- [v2-production-deploy-plan.md](plans/v2-production-deploy-plan.md) — first production topology (not yet built)
+- [step3-auth-plan.md](plans/step3-auth-plan.md) — Step 3 auth consolidation: sequenced execution plan (OIDC machinery is written; remaining = wire + deploy + close the log-server tenant-scoping gap). Design rationale in `rewind-cli-plan.md` §7
+- [cp-desired-state-target.md](plans/cp-desired-state-target.md) — north-star (not yet built): CP owns all per-tenant desired-state incl. release; workers reconcile; one S2S key (move-secret); root token retires. The arc B3/B4 point at
+- [websocket-plan.md](plans/websocket-plan.md) — **outbound** WS only (a handler as client of an upstream WS server — atproto firehose / Pub/Sub; unbuilt, ~1–2 weeks). Inbound WS shipped → `architecture/websockets.md`
+- [retention-and-gc.md](plans/retention-and-gc.md) — the one compacting GC across log-blobs / kv pages / `_pool` bodies / tape blobs; capacity-based retention; the input-home pinning obligation (unbuilt). The minimal-tape four-record-kinds synthesis now lives in `decisions.md` §3.9
+- [builtin-libs-docs-plan.md](plans/builtin-libs-docs-plan.md) — `_system.*` + JS shim docs
+- [replay-wasm-plan.md](plans/replay-wasm-plan.md) — WASM replay UI (§8.6+ deferred)
+- [sim-test-framework.md](plans/sim-test-framework.md) · [fixture-lifecycle.md](plans/fixture-lifecycle.md) · [agent-surface.md](plans/agent-surface.md) — replay/sim/agent surface (Phase 12–14)
 
 ## Product & strategy
 
-- [pricing-model.md](pricing-model.md) — pricing model (tier *enforcement* shipped — `architecture/control-plane.md` "Operational state")
-- [platform-accounts-model.md](platform-accounts-model.md) — accounts/orgs/users (product layer, not the engine)
-- [saas-in-a-box.md](saas-in-a-box.md) — the author-platform shape: per-end-customer tenants + the first-party library suite (users/billing/jobs/webhooks/flags/…)
-- [dashboard-design-brief.md](dashboard-design-brief.md) — dashboard/replay UI brief
-- [users-lib-plan.md](users-lib-plan.md) — B2C passwordless auth library
+- [pricing-model.md](strategy/pricing-model.md) — pricing model (tier *enforcement* shipped — `architecture/control-plane.md` "Operational state")
+- [platform-accounts-model.md](strategy/platform-accounts-model.md) — accounts/orgs/users (product layer, not the engine)
+- [saas-in-a-box.md](strategy/saas-in-a-box.md) — the author-platform shape: per-end-customer tenants + the first-party library suite (users/billing/jobs/webhooks/flags/…)
+- [dashboard-design-brief.md](strategy/dashboard-design-brief.md) — dashboard/replay UI brief
+- [users-lib-plan.md](plans/users-lib-plan.md) — B2C passwordless auth library
 
 ## Guides
 
-- [activitypub-tutorial.md](activitypub-tutorial.md) — ActivityPub bot in ~30 lines
+- [activitypub-tutorial.md](guides/activitypub-tutorial.md) — ActivityPub bot in ~30 lines

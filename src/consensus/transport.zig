@@ -30,7 +30,7 @@
 //!     count × [group_id:u64 LE][epoch:u64 LE][msg_len:u32 LE][msg bytes]
 //!
 //! The leading `version` byte is a single frame-level discriminant
-//! (`docs/format-versioning-audit.md` §3.2 — "version without widening
+//! (`docs/plans/format-versioning-audit.md` §3.2 — "version without widening
 //! the per-record header"): one byte amortized over a whole coalesced
 //! frame, zero per-record growth, so the deliberately-shrunk 20-byte
 //! record header (Phase 2f) is untouched. The decoder rejects an unknown
@@ -94,7 +94,7 @@ const OutBuf = struct {
 /// (The WAL-compaction `floor` field was removed in Phase 2f — mechanism-A
 /// compaction is per-node, so no cross-node floor is propagated.)
 const RECORD_HDR_SIZE: usize = 20;
-/// Coalesced-frame version byte (`docs/format-versioning-audit.md` §3.2).
+/// Coalesced-frame version byte (`docs/plans/format-versioning-audit.md` §3.2).
 /// Bump when the frame/record layout changes; the decoder rejects any
 /// other value loudly. Frozen v1 at the pre-launch format freeze.
 pub const FRAME_VERSION: u8 = 1;

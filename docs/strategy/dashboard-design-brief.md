@@ -246,7 +246,7 @@ output) with source view, variable panel, and stepping controls.
   re-running from start with a different stop predicate.
 
 **Still open** (design opportunities — see
-[`replay-wasm-plan.md`](replay-wasm-plan.md) §8 for the
+[`replay-wasm-plan.md`](../plans/replay-wasm-plan.md) §8 for the
 implementation-side roadmap):
 
 - **Breakpoints** — gutter clicks on source lines; the next replay

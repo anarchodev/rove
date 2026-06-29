@@ -110,7 +110,7 @@ re-provision 409 / unknown-cluster 400).
 - **Authority**: the admin app (an ordinary DP tenant holding a capability token)
   writes plans via the CP's capability-gated `/_control/plan`; accounts/orgs/
   billing are product-layer, above the CP (see
-  [`platform-accounts-model.md`](../platform-accounts-model.md)).
+  [`platform-accounts-model.md`](../strategy/platform-accounts-model.md)).
 - **Delivery**: a plan rides the `v2-attach` handshake at cold-start/move
   (`X-Rewind-Plan`); a live tier change is a single-target push to the tenant's
   current cluster (`POST /_system/v2-plan`, a plan-generation bump). Proven by
@@ -147,7 +147,7 @@ re-provision 409 / unknown-cluster 400).
 > **Convergence (raft-native-alignment):** the brief-pause move (quiesce +
 > bundle dump described above) was **retired** — there is now ONE move, the
 > zero-downtime one. `/_control/move` routes to it. The bundle transfer is
-> **streamed** source→dest (Phase 2.5, `docs/raft-native-alignment.md`), not
+> **streamed** source→dest (Phase 2.5, `docs/plans/raft-native-alignment.md`), not
 > buffered through the CP. The brief-pause-specific machinery (`v2-bundle` /
 > `v2-resume` / bridge quiesce, and the now-dead `moving`-hold +
 > stuck-move reconciliation) is being removed; the section above is historical.

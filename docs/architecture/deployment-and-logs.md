@@ -17,7 +17,7 @@
 > `deployments/` backend → `_deploy/current` flip) is unchanged; only the
 > *host* moved from a standalone binary into the worker. Where this doc says
 > "files-server", read "the worker's `/_system/deploy`". See
-> [rewind-cli-plan.md §4](../rewind-cli-plan.md) for the why + the design.
+> [rewind-cli-plan.md §4](../plans/rewind-cli-plan.md) for the why + the design.
 
 ## The shape in one paragraph
 

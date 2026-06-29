@@ -1,5 +1,5 @@
 //! JS engine version — the replay-critical identity of the interpreter
-//! that ran a request (`docs/format-versioning-audit.md` §4).
+//! that ran a request (`docs/plans/format-versioning-audit.md` §4).
 //!
 //! ## Why this exists
 //!

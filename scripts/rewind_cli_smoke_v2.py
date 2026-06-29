@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke for the `rewind-ops` operator CLI (docs/rewind-cli-plan.md §2–§3) — the
+"""Smoke for the `rewind-ops` operator CLI (docs/plans/rewind-cli-plan.md §2–§3) — the
 Zig binary (zig-out/bin/rewind-ops) driven against a live V2Cluster with the
 DIRECT transport (no ROVE_PUBLISH_SSH). Exercises the verb set audited against
 the live server primitives:

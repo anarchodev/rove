@@ -1,7 +1,7 @@
 //! Background deploy/compile thread. Backs the `platform.*` deploy
 //! primitives the standing `__admin__` deploy app composes (`platform.compile`
 //! / `platform.scope(t).blob.put` / `platform.scope(t).deploy.stampManifest`
-//! — `docs/rewind-cli-plan.md` §4). Each is issued as an `on.fetch` to a
+//! — `docs/plans/rewind-cli-plan.md` §4). Each is issued as an `on.fetch` to a
 //! trusted-door origin that `interpretCmd` intercepts and hands here; this
 //! thread does the blocking work — compile handler sources to bytecode,
 //! content-address files into the *target tenant's own* blob backends, PUT

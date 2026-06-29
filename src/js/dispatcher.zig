@@ -38,7 +38,7 @@ const c = qjs.c;
 /// The JS engine version every `Dispatcher`'s snapshot embodies
 /// (`qjs/version.zig`). Re-exported here so dispatch/drain code stamps
 /// one canonical constant into each request's readset
-/// (`docs/format-versioning-audit.md` §4) without each file importing
+/// (`docs/plans/format-versioning-audit.md` §4) without each file importing
 /// `rove-qjs` directly. One engine per binary, so this equals every
 /// live `Dispatcher.snapshot.version`.
 pub const JS_ENGINE_VERSION = qjs.JS_ENGINE_VERSION;

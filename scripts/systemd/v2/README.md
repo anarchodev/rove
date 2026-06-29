@@ -2,7 +2,7 @@
 
 User-scoped systemd units for the V2 three-process stack, **replacing the
 retired V1 four-binary units** (`loop46`/files/log/sse, deleted at this commit).
-Topology, spec, and the full runbook: [`docs/v2-production-deploy-plan.md`](../../../docs/v2-production-deploy-plan.md).
+Topology, spec, and the full runbook: [`docs/plans/v2-production-deploy-plan.md`](../../../docs/plans/v2-production-deploy-plan.md).
 
 ## The 3 processes (co-located, per host)
 

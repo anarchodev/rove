@@ -1929,7 +1929,7 @@ pub fn main() !void {
     // Raft logical-tick cadence (ms). Keep the CP directory group's election
     // timing in lockstep with the workers' tenant groups — same hardware, same
     // number — so election timeout ≈ election_tick × this is uniform across the
-    // node (docs/raft-best-practices.md "how to size election/heartbeat"). The
+    // node (docs/plans/raft-best-practices.md "how to size election/heartbeat"). The
     // default preserves the historical ~1ms cadence. Set BEFORE startPump.
     if (std.posix.getenv("REWIND_RAFT_TICK_MS")) |v| {
         if (std.fmt.parseInt(i64, v, 10)) |ms| {

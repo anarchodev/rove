@@ -822,7 +822,7 @@ pub const Directory = struct {
     /// slices. Front doors feed these straight into OpenSSL.
     pub const Cert = struct { cert_pem: []const u8, key_pem: []const u8 };
 
-    /// Packed-cert format version (`docs/format-versioning-audit.md` §3.4).
+    /// Packed-cert format version (`docs/plans/format-versioning-audit.md` §3.4).
     /// A leading version byte so a future cert-frame change (extra fields,
     /// a chain split) is a soft upgrade; `unpackCert` rejects other values.
     /// Frozen v1 at the pre-launch format freeze.
@@ -935,7 +935,7 @@ pub const Directory = struct {
         http_url: []const u8,
     };
 
-    /// Packed node-address frame version (`docs/format-versioning-audit.md`).
+    /// Packed node-address frame version (`docs/plans/format-versioning-audit.md`).
     /// A leading version byte so adding a field later is a soft upgrade;
     /// `unpackNodeAddr` rejects other values. Frozen v1.
     pub const NODE_ADDR_PACK_VERSION: u8 = 1;
@@ -1342,7 +1342,7 @@ test "directory: setCert + certForOwned round-trip, pack/unpack, uncerted list" 
     {
         const packed_bytes = (try dir.certForOwned(a, "acme.com")).?;
         defer a.free(packed_bytes);
-        // Frame carries the version byte first (`docs/format-versioning-audit.md` §3.4).
+        // Frame carries the version byte first (`docs/plans/format-versioning-audit.md` §3.4).
         try testing.expectEqual(Directory.CERT_PACK_VERSION, packed_bytes[0]);
         const u = Directory.unpackCert(packed_bytes).?;
         try testing.expectEqualStrings("CERTPEM", u.cert_pem);

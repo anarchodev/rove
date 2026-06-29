@@ -9,7 +9,7 @@
 > [`handler-shape.md`](../handler-shape.md) and
 > [`effects-and-handlers.md`](effects-and-handlers.md). **Outbound** WS
 > (a handler as a *client* of an upstream WS server — atproto firehose,
-> Pub/Sub) is a separate, unbuilt plan: [`../websocket-plan.md`](../websocket-plan.md).
+> Pub/Sub) is a separate, unbuilt plan: [`../websocket-plan.md`](../plans/websocket-plan.md).
 
 ## The shape in one paragraph
 

@@ -12,7 +12,7 @@ historical reference.
 
 The codified form of the proven publish path (deploy-plan §8 item 4). The
 build/stage step now lives IN the worker (files-server dissolved,
-docs/rewind-cli-plan.md §4): one `POST /_system/deploy` over the private plane
+docs/plans/rewind-cli-plan.md §4): one `POST /_system/deploy` over the private plane
 hands the whole bundle (handlers + statics, base64) to a worker, which
 compiles, content-addresses every file into the tenant's own blobs, and stamps
 an EXPLICIT manifest (the bundle is the source of truth — no carry-forward).
@@ -194,7 +194,7 @@ def main() -> int:
             sys.exit(f"provision failed: {code} {out}")
 
     # ── compile + stage on a worker (/_system/deploy) over the private plane ─
-    # files-server is dissolved (docs/rewind-cli-plan.md §4): one POST hands
+    # files-server is dissolved (docs/plans/rewind-cli-plan.md §4): one POST hands
     # the whole bundle (handlers + statics, base64) to the worker, which
     # compiles, content-addresses every file into the tenant's own blobs, and
     # stamps an EXPLICIT manifest (no carry-forward). Deploy isn't raft-gated

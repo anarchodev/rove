@@ -1,6 +1,6 @@
 # Phase 14 — AI agent surface (CLI + skill file + scoped tokens)
 
-Implements [`docs/PLAN.md`](PLAN.md) §10.10.
+Implements [`docs/PLAN.md`](../PLAN.md) §10.10.
 
 > **CLI naming/host updated 2026-06-10.** Per `decisions.md` §8.3 the CLI +
 > MCP server ship as one npm package (**`rewind`** / `rewind-mcp`, Node over

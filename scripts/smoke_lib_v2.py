@@ -6,7 +6,7 @@ leader-direct addressing + follower-503 semantics. V2 is a different shape:
 per-tenant raft groups behind a CP (directory + provisioning) and a stateless
 front door (Host→cluster proxy, serve-or-forward), plaintext h2c, with deploys
 compiled + staged IN the worker (`/_system/deploy` — files-server dissolved,
-docs/rewind-cli-plan.md §4). So this is a purpose-built V2 harness rather than
+docs/plans/rewind-cli-plan.md §4). So this is a purpose-built V2 harness rather than
 a drop-in for the V1 `Cluster`.
 
 `V2Cluster` brings up the topology and exposes the deploy contract the

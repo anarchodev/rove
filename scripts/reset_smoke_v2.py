@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Smoke for the worker `POST /_system/reset` endpoint — bootstrap +
-break-glass (docs/rewind-cli-plan.md §4). reset is the ONLY native deploy
+break-glass (docs/plans/rewind-cli-plan.md §4). reset is the ONLY native deploy
 surface: root-token gated, NO body, it (re)deploys the BAKED `__admin__`
 deploy app and stamps `_deploy/current`. Every ARBITRARY deploy (the full
 admin, customers) goes THROUGH that deployed app — there is no arbitrary-bundle

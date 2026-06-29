@@ -7,12 +7,12 @@
 > the standard SaaS vendor stack. Companions:
 > [`platform-accounts-model.md`](platform-accounts-model.md) (accounts/orgs;
 > the dashboard-app pattern this productizes),
-> [`users-lib-plan.md`](users-lib-plan.md) (the auth library; already
+> [`users-lib-plan.md`](../plans/users-lib-plan.md) (the auth library; already
 > planned, P1a–P5), [`pricing-model.md`](pricing-model.md) +
-> [`architecture/control-plane.md`](architecture/control-plane.md) "Operational state" (per-tenant caps/enforcement),
+> [`architecture/control-plane.md`](../architecture/control-plane.md) "Operational state" (per-tenant caps/enforcement),
 > `architecture/auth-and-domains.md` §4.2 (dogfooded customer libraries —
 > the delivery model for everything here), and
-> [`effect-algebra.md`](effect-algebra.md) / [`handler-shape.md`](handler-shape.md)
+> [`effect-algebra.md`](../effect-algebra.md) / [`handler-shape.md`](../handler-shape.md)
 > (the primitives all of this composes over).
 
 ## The product in one paragraph

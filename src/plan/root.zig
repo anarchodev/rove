@@ -15,7 +15,7 @@
 //! tenant's hot-path slot; the log-server reads `retention_days` per query.
 //!
 //! `rove` only ENFORCES tiers — setting one (Stripe → admin app → CP write)
-//! is the product layer's job (docs/platform-accounts-model.md). This module
+//! is the product layer's job (docs/strategy/platform-accounts-model.md). This module
 //! never knows what a dollar is; it only maps a tier name to numbers.
 //!
 //! ## The resolution rule

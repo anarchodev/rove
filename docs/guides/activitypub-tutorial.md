@@ -19,7 +19,7 @@ It exists to show off three things rewind.js is uniquely good at:
 
 The library it uses (`activitypub`) is built in; nothing to install or
 import. It owns no kv namespace and ships full JSDoc — see
-`src/js/globals/activitypub.js` and `docs/builtin-libs-docs-plan.md`.
+`src/js/globals/activitypub.js` and `docs/plans/builtin-libs-docs-plan.md`.
 
 ---
 
@@ -247,7 +247,7 @@ they stitch together through the carried context).
 
 Open that recorded request in the replay/sim surface (`rewind replay
 <id>` / the sim-test framework — PLAN §10.12,
-`docs/sim-test-framework.md`) and you can re-run the verification path
+`docs/plans/sim-test-framework.md`) and you can re-run the verification path
 deterministically and synthesize a regression test from it: a test
 that pins "this real Follow, this real signature, still verifies and
 still produces the right `Accept`" — **without** the remote server,

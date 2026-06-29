@@ -101,7 +101,7 @@ pub const READSET_MAGIC: u32 = 0x52524541; // 'R' 'R' 'E' 'A'
 /// 5 → 6 by the read-taped request surface: the `.request_reads`
 /// channel was added (count 4 → 5) — the lazily-recorded inbound
 /// request inputs (header names/values, body-read flag, ip reads).
-/// 6 → 7 by the format-versioning freeze (`docs/format-versioning-audit.md`
+/// 6 → 7 by the format-versioning freeze (`docs/plans/format-versioning-audit.md`
 /// §4): a `js_engine_version: u16` scalar was added to the header
 /// (after `seed`), so every replicated request records which JS engine
 /// executed it. Header grows 22 → 24 bytes. This bump rides in the
@@ -628,7 +628,7 @@ pub const Tape = struct {
 /// bindings append to the relevant channel.
 ///
 /// Channel shape mirrors the WASM replay engine's `Module.tapes`
-/// 1:1 (`docs/replay-wasm-plan.md` §4) — same five channels, same
+/// 1:1 (`docs/plans/replay-wasm-plan.md` §4) — same five channels, same
 /// names. No translation layer between capture and replay.
 ///
 /// `docs/readset-replication-plan.md` Phase 1 lifted this from
@@ -656,7 +656,7 @@ pub const Readset = struct {
     /// The JS engine version (`qjs/version.zig` `JS_ENGINE_VERSION`)
     /// that executed this request — the authoritative per-request
     /// stamp the replayer reads to fetch the matching engine
-    /// (`docs/format-versioning-audit.md` §4). Replicated in the
+    /// (`docs/plans/format-versioning-audit.md` §4). Replicated in the
     /// readset header (a peer of `seed`/`timestamp_ns`, the other
     /// per-request execution-context scalars) so a follower-rebuilt
     /// record carries the same engine the leader ran. Production

@@ -214,7 +214,7 @@ pub const TapePayloads = struct {
     /// non-handler paths.
     timestamp_ns: i64 = 0,
     /// The JS engine version that executed this request
-    /// (`docs/format-versioning-audit.md` §4). Copied from
+    /// (`docs/plans/format-versioning-audit.md` §4). Copied from
     /// `Readset.js_engine_version` at capture; surfaced in the log
     /// JSON so the replayer can later fetch the matching engine.
     /// Zero = unknown (non-handler / pre-stamp paths). A passenger on

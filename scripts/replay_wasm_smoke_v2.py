@@ -192,7 +192,7 @@ def main() -> int:
                 # ── step 5: compose the replay bundle + run the WASM driver. ─
                 if tapes.get("kv_tape_b64"):
                     print("step 5: ⭐ compose a replay bundle + run the WASM driver")
-                    # files-server is dissolved (docs/rewind-cli-plan.md §4),
+                    # files-server is dissolved (docs/plans/rewind-cli-plan.md §4),
                     # so there's no /deployments + /source read-back surface.
                     # The smoke already HAS the deployed source locally, so
                     # compose the replay bundle from it directly — the hash is

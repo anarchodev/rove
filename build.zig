@@ -271,7 +271,7 @@ pub fn build(b: *std.Build) void {
     const run_metrics_server_tests = b.addRunArtifact(metrics_server_tests);
 
     // rove-files-server was dissolved into the worker's `/_system/deploy`
-    // endpoint (docs/rewind-cli-plan.md §4): the worker already links
+    // endpoint (docs/plans/rewind-cli-plan.md §4): the worker already links
     // rove-files + rove-qjs + rove-blob, so compile + content-address +
     // stamp-manifest now runs IN the worker (on the background
     // DeployThread). The separate binary + its trust domain are gone.
@@ -445,7 +445,7 @@ pub fn build(b: *std.Build) void {
     // textcodec.js polyfills TextEncoder/Decoder.
     const js_runtime_files: []const struct { name: []const u8, path: []const u8 } = &.{
         // Public doc-carrying shims over `_system.*`
-        // (docs/builtin-libs-docs-plan.md Phase A).
+        // (docs/plans/builtin-libs-docs-plan.md Phase A).
         .{ .name = "kv_js", .path = "src/js/globals/kv.js" },
         .{ .name = "console_js", .path = "src/js/globals/console.js" },
         .{ .name = "crypto_js", .path = "src/js/globals/crypto.js" },
@@ -578,7 +578,7 @@ pub fn build(b: *std.Build) void {
 
     // files-server (V1 `files-server-standalone` and the cluster-free V2
     // `files-server-v2`) is RETIRED — dissolved into the worker's
-    // `/_system/deploy` endpoint (docs/rewind-cli-plan.md §4). Compile +
+    // `/_system/deploy` endpoint (docs/plans/rewind-cli-plan.md §4). Compile +
     // manifest + blob-write run IN the worker on the background
     // DeployThread; the `_deploy/current` flip stays the worker's
     // `/_system/release`. No separate deploy binary or trust domain.
@@ -1156,7 +1156,7 @@ pub fn build(b: *std.Build) void {
     const cp_test_step = b.step("rewind-cp-test", "Run the rewind-cp unit tests");
     cp_test_step.dependOn(&b.addRunArtifact(cp_tests).step);
 
-    // ── rewind-ops: the platform/operator CLI (docs/rewind-cli-plan.md §2–§3,
+    // ── rewind-ops: the platform/operator CLI (docs/plans/rewind-cli-plan.md §2–§3,
     // §6). The privileged half of the split (root + move-secret + ops-secret);
     // the OIDC-scoped customer `rewind` binary lands later, sharing
     // src/cli/common.zig. std-only — operator env reader + curl/ssh transport +
@@ -1175,7 +1175,7 @@ pub fn build(b: *std.Build) void {
     ops_test_step.dependOn(&b.addRunArtifact(ops_tests).step);
     test_step.dependOn(&b.addRunArtifact(ops_tests).step);
 
-    // ── rewind: the OIDC customer CLI (docs/rewind-cli-plan.md §6, Track 3).
+    // ── rewind: the OIDC customer CLI (docs/plans/rewind-cli-plan.md §6, Track 3).
     // The customer-shippable half of the split — carries an OIDC session
     // (device-grant login → /v1/cli/exchange), never a platform secret.
     // Shares src/cli/common.zig with rewind-ops; std-only (TLS curl + cookie

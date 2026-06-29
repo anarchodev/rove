@@ -8,7 +8,7 @@ Rove is a Zig systems library for building distributed serverless worker infrast
 
 ## Product direction
 
-`rove` is the engine for **rewind.js**, a purely-functional serverless product. Locked architecture and phased build plan live in [`docs/PLAN.md`](docs/PLAN.md). Read it before making decisions that could contradict existing direction (domain layout, pure-function execution model, Cmd-pattern external effects via **one outbound HTTP primitive** with `webhook.send` / `email.send` / `retry.*` as **JS-shim libraries that compose durability on top of it** — see `effect-algebra.md` §5 (the durability rule) + `decisions.md` §3.3; page-level encryption at rest; etc.). Section 7 of that doc lists decisions that were explicitly considered and rejected — do not re-propose those without new information. **`docs/README.md` is the documentation map.** As-built architecture references live in `docs/architecture/` (`overview`, `consensus-and-storage`, `effects-and-handlers`, `routing-and-ingress`, `websockets`, `control-plane`, `deployment-and-logs`, `auth-and-domains`, `observability`); locked decisions + rejected alternatives in `docs/decisions.md`; in-flight plans + product/strategy docs in `docs/` (per the README map). `docs/effect-algebra.md` (the cross-cutting four-primitive model + trigger-scope axes) and `docs/handler-shape.md` (the customer handler surface) are the customer-facing contracts. PLAN §13 is the live process / surface map.
+`rove` is the engine for **rewind.js**, a purely-functional serverless product. Locked architecture and phased build plan live in [`docs/PLAN.md`](docs/PLAN.md). Read it before making decisions that could contradict existing direction (domain layout, pure-function execution model, Cmd-pattern external effects via **one outbound HTTP primitive** with `webhook.send` / `email.send` / `retry.*` as **JS-shim libraries that compose durability on top of it** — see `effect-algebra.md` §5 (the durability rule) + `decisions.md` §3.3; page-level encryption at rest; etc.). Section 7 of that doc lists decisions that were explicitly considered and rejected — do not re-propose those without new information. **`docs/README.md` is the documentation map.** As-built architecture references live in `docs/architecture/` (`overview`, `consensus-and-storage`, `effects-and-handlers`, `routing-and-ingress`, `websockets`, `control-plane`, `deployment-and-logs`, `auth-and-domains`, `observability`); locked decisions + rejected alternatives in `docs/decisions.md`; in-flight plans in `docs/plans/`, product/strategy docs in `docs/strategy/`, tutorials in `docs/guides/` (per the README map). `docs/effect-algebra.md` (the cross-cutting four-primitive model + trigger-scope axes) and `docs/handler-shape.md` (the customer handler surface) are the customer-facing contracts. PLAN §13 is the live process / surface map.
 
 ## Build commands
 
@@ -49,7 +49,7 @@ python3 scripts/tenant_move_smoke.py   # live tenant move cluster-1 → cluster-
 `scripts/smoke_lib_v2.py` is the V2 harness — `V2Cluster.spawn` brings up
 rewind-cp + front door + rewind node(s) and exposes `provision` /
 `deploy_handlers` / `wait_for_handler` (deploys go through the worker's
-`/_system/deploy` — files-server dissolved, `docs/rewind-cli-plan.md` §4);
+`/_system/deploy` — files-server dissolved, `docs/plans/rewind-cli-plan.md` §4);
 `scripts/v2_topology.py`
 holds the per-binary spawn primitives. The functional smokes were ported as
 `*_smoke_v2.py` (~40 of them); the original un-suffixed versions spawn the
@@ -90,7 +90,7 @@ binaries:  rewind-worker (src/rewind/)  the worker — rove-js on the bridge
            rewind-front  (src/front/)   stateless Host→cluster proxy — no raft state
            rewind-logs   (src/log_server/main.zig)  log query surface
            (deploy/publish is the worker's /_system/deploy — no separate
-            files-server binary; docs/rewind-cli-plan.md §4)
+            files-server binary; docs/plans/rewind-cli-plan.md §4)
 ```
 
 **`raft-kv` is the spine-free KV facade** (`src/kv/kvlimbs.zig`) — the

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Raft election/heartbeat SIZING SOAK (docs/raft-best-practices.md "how to size
+"""Raft election/heartbeat SIZING SOAK (docs/plans/raft-best-practices.md "how to size
 election/heartbeat in our environment").
 
 Drives sustained, HIGH-throughput WRITE load through a 3-node cluster and measures

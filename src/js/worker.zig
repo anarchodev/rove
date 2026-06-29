@@ -1376,7 +1376,7 @@ pub fn Worker(comptime opts: Options) type {
         /// h2 sid/session/headers the response needs.
         forward_pending: StreamColl,
         /// Background compile/stage thread backing the `platform.*` deploy
-        /// primitives (`docs/rewind-cli-plan.md` §4). Owns its own QuickJS
+        /// primitives (`docs/plans/rewind-cli-plan.md` §4). Owns its own QuickJS
         /// runtime (the poll-loop `compile_fn` is used by
         /// `deployStarterTrampoline` — can't share one runtime across
         /// threads). Null until `startDeployThread`; library / test builds
@@ -2165,7 +2165,7 @@ pub fn Worker(comptime opts: Options) type {
         }
 
         /// Start the background compile+stage thread that backs
-        /// `/_system/deploy` (`docs/rewind-cli-plan.md` §4). Idempotent
+        /// `/_system/deploy` (`docs/plans/rewind-cli-plan.md` §4). Idempotent
         /// guard: a second call is a no-op. Opens the thread against the
         /// node's shared blob backend config so each job writes the
         /// target tenant's own `file-blobs/` + `deployments/` keys.

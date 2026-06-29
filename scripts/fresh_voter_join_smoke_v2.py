@@ -16,7 +16,7 @@ The ensureMember sequence (no conf_change — node 3 is already a voter):
 Then the leader replicates the tail (> X) to node 3 automatically, and a FRESH
 write must reach it — proving attach+baseline made it a productive voter.
 
-This is the Phase-3 hard gate for docs/cp-membership-reconciler-plan.md: prove
+This is the Phase-3 hard gate for docs/plans/cp-membership-reconciler-plan.md: prove
 the compose is safe (epoch/membership) on a throwaway tenant BEFORE the reconciler
 drives it on real tenants.
 

@@ -12,7 +12,7 @@ so the leader's heartbeat commit = min(match, committed) can never exceed the
 node's new last_index. fresh_voter_join (manual, separate apply-snapshot) won the
 race by quiescent+fast pacing; the reconciler lost it deterministically.
 
-The end-to-end gate for docs/cp-membership-reconciler-plan.md (Phases 3+4). With
+The end-to-end gate for docs/plans/cp-membership-reconciler-plan.md (Phases 3+4). With
 REWIND_CP_RECONCILE_MEMBERSHIP=1, the CP's additive, learner-first reconciler
 converges DP group membership to the cluster's node set on its own.
 
