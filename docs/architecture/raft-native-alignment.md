@@ -1,12 +1,23 @@
 # Raft-native alignment — getting into raft-rs's intended-use space
 
+> **As-built reference.** This started as a plan and is now the design record
+> for how rove's membership + catch-up were re-aligned onto raft's native state.
+> **All four phases have landed or been formally closed** (Phase 3 decision in
+> [`../decisions.md`](../decisions.md) §10.12); the phase sections below carry
+> their own landing commits and read as history. The still-open *scrutiny* items
+> this doc used to track moved to
+> [`../plans/consensus-robustness-backlog.md`](../plans/consensus-robustness-backlog.md).
+> Kept here (not deleted) because ~10 source files cite it by name for the
+> rationale behind live mechanisms (the snapshot trigger, mechanism-A
+> compaction, the topology lens).
+
 ## Thesis
 
-rove repeatedly routes **membership** and **catch-up** *around* raft's replicated
-state (the log + ConfState + snapshot), substituting out-of-band orchestration or
-static config. Each such bypass has cost us a class of bugs and a pile of bespoke
-machinery. This plan re-integrates: let membership and catch-up flow through
-raft's own state, the way etcd/TiKV (whose `raft-rs` we pin) intend.
+rove had repeatedly routed **membership** and **catch-up** *around* raft's
+replicated state (the log + ConfState + snapshot), substituting out-of-band
+orchestration or static config. Each such bypass had cost a class of bugs and a
+pile of bespoke machinery. This re-integration lets membership and catch-up flow
+through raft's own state, the way etcd/TiKV (whose `raft-rs` we pin) intend.
 
 The deviations are facets of one root pattern, and they collapse onto **two**
 native primitives — **conf-change** and **snapshot** — when re-aligned.
@@ -106,13 +117,10 @@ pool.**
   itself a divergence from the native (leader-generated) path. The hot-path
   reason is addressable inside the native model (async generation + S3 bytes), so
   the divergence is no longer clearly justified — see Phase 1.
-- **Speculative overlay (apply-before-commit + rollback) → OPEN.** raft applies
-  *after* commit; we apply speculatively. Scrutinize: is the latency win worth the
-  rollback path and the divergence? Not obviously harmful, but on the ledger now.
-- **Leader-only reads (dispatch-gate) vs `read_index` → OPEN.** `read_index` /
-  lease-read is raft's native linearizable-read + follower-read mechanism; we
-  diverged. Justified *only* while we don't need read scaling — re-scrutinize if
-  we do (`docs/plans/raft-best-practices.md` item 2 has the analysis).
+- **Speculative overlay (apply-before-commit) and leader-only reads vs
+  `read_index` → OPEN, moved.** These two standing scrutiny questions now live in
+  [`../plans/consensus-robustness-backlog.md`](../plans/consensus-robustness-backlog.md),
+  "Open architectural scrutiny" — this doc is no longer their tracker.
 - **Epoch fencing on the transport → tied to #4.** raft has no epochs; ours
   exists for cross-cluster moves. If #4 goes conf-change-native, this may
   disappear; otherwise it's a justified divergence for the move feature.
@@ -550,7 +558,7 @@ This is the consensus engine. Every phase:
   `learner_add`, `fresh_voter_join`, `three_node`, `membership_reconciler`,
   `leader_failover`, `graceful_transfer`, `snap_catchup`, `dispatch_gate`) +
   `v2-test` + `test`, plus a soak on real disk;
-- coordinated fork↔rove via the pin protocol (`docs/plans/raft-correctness-plan.md`):
+- coordinated fork↔rove via the pin protocol (`../plans/consensus-robustness-backlog.md`):
   land fork FFI + push, then bump the rove pin with the caller change together;
 - reverts a prior decision (snapshot-free) deliberately — the new path is
   follower-sourced (leader off the data path), which was the stated preference.

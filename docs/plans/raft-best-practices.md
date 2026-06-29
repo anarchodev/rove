@@ -19,6 +19,7 @@ highest-value remaining items are *RawNode methods*, which need NEW `extern
 | Leader-hint cache | the front learns the leader from a 421→success re-aim and routes there directly — removes the per-read redirect tax; self-correcting on leadership change / dead leader | `front/proxy.zig` `LeaderCache` |
 | **transfer_leader** (graceful shutdown) | on SIGTERM the outgoing node hands every group it leads to the most caught-up *voter* before stopping the pump, so a rolling restart (`/deploy`) costs ~one heartbeat per group instead of a full election timeout | fork `raft_manager_transfer_leadership_away` (NEW extern fn, fork `feat/transfer-leader`) → `manager.transferLeadershipAway`; `node.zig` / `bridge.transferAllLeadership` (pump-thread control cmd); `rewind/main.zig` shutdown call + bounded drain |
 | **Multi-node WAL compaction (snapshot-free, lockstep)** | multi-node nodes now truncate the shared WAL (was single-node-only). The leader floors compaction at the cluster-wide **min match index** and **propagates that floor** on its outbound raft messages; a follower truncates to the same floor (`propagated_floor`). No node ever compacts past an entry a voter still needs, so a lagging/returning voter always catches up from the **log** — no in-raft snapshot, no dump on any node's hot path. WAL self-heals: a down voter pins the floor (WAL grows during the outage), advances on its return. A genuinely *new* member (conf_change learner / tenant move) bootstraps **out-of-band** (the move's follower-sourced off-pump bundle), not via raft. | fork `raft_manager_min_match_index`; `node.zig` `durabilizeTick` floor + `outboundFloor`/`applyRecvFloor`/`propagated_floor`, `transport.zig` per-record `floor` field + `drainFloors` (branch `feat/multinode-snapshot`) |
+| **`propose_conf_change` / learners / `voter_progress`** | membership changes through the native conf-change path — add voters one at a time, join new nodes as learners and promote after catch-up (never shrinks the quorum). A learner bootstraps its tenant store **out-of-band** (the tenant-move bundle, off the leader's hot path), then joins raft already caught up. The FFI methods now live in `bridge.zig`; CP node-join orchestration (out-of-band bootstrap → learner-join → catch-up → promote) is tracked by `cp-membership-reconciler-plan.md`. | fork conf-change extern fns; `bridge.zig` `proposeConfChange` / `asLearner` / `voterProgress`; see `cp-membership-reconciler-plan.md` |
 
 Read-consistency contract is now **strict-serializable leader reads** (was
 eventual / read-your-writes-only-within-a-handler). The only residual gap is a
@@ -223,21 +224,7 @@ is the worked example of the full FFI-method → re-pin → wiring path.)
    a quorum heartbeat round per clean read (batchable across concurrent reads on
    a group).
 
-2. **`propose_conf_change` / `apply_conf_change` — membership changes /
-   learners.** Add/remove voters one at a time; join new nodes as learners
-   and promote after catch-up (avoids shrinking the quorum). **Now the top
-   remaining item.** A learner does NOT catch up via an in-raft snapshot — it
-   bootstraps its tenant store **out-of-band** (the existing tenant-move bundle
-   pattern: dump on a follower/worker thread, off the leader's hot path; load;
-   then join raft already caught up, so raft replicates only the tail). Still
-   needs: a `set_conf_state` storage callback (ConfState is only read at
-   `initial_state` / written via snapshot metadata today) + the pump apply-path
-   calling `apply_conf_change` on each committed conf-change entry + CP node-join
-   orchestration (out-of-band bootstrap → learner-join → catch-up → promote). The
-   GPF that blocked the early spike is fixed on fork `main` (`5092bc6`). Needed
-   for runtime cluster growth (no `addCluster` runtime endpoint — see OVH prod).
-
-3. **`request_snapshot` — not needed.** rove does NOT use raft's in-protocol
+2. **`request_snapshot` — not needed.** rove does NOT use raft's in-protocol
    snapshot transport for catch-up: existing voters catch up from the log
    (lockstep min-match compaction never truncates past a voter), and a genuinely
    new member bootstraps out-of-band (above). So neither the follower-initiated
@@ -245,11 +232,11 @@ is the worked example of the full FFI-method → re-pin → wiring path.)
    in-raft snapshot implementation was built then removed in favour of this
    simpler model (it put a store dump on the leader's serving hot path).
 
-4. **`report_unreachable` / `report_snapshot`** — let the leader back off a
+3. **`report_unreachable` / `report_snapshot`** — let the leader back off a
    dead/slow follower's send loop instead of spinning. Quality-of-implementation
    for degraded clusters.
 
-5. **`leader_id` accessor** — would let a 421 carry an explicit leader hint.
+4. **`leader_id` accessor** — would let a 421 carry an explicit leader hint.
    NOT needed: the front-side `LeaderCache` learns the leader from
    421→success without it. Listed only so nobody re-derives the need.
 

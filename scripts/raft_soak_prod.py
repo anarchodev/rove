@@ -21,7 +21,7 @@ WHAT THIS DOES *NOT* PROVE
     Reproducing that needs real power-loss tooling (dm-flakey `drop_writes`, or a
     VM hard-poweroff). Running this harness's node processes on a dm-flakey mount
     that drops un-fsynced writes on the kill would extend it to cover C1/C2; that
-    is a follow-up (see docs/plans/raft-correctness-plan.md §D).
+    is a follow-up (see docs/plans/consensus-robustness-backlog.md "Crash-consistency validation").
 
 Usage:  set -a; . ./.env; set +a
         python3 scripts/raft_soak_prod.py [rounds]      # default 6

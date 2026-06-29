@@ -1223,7 +1223,7 @@ pub const Node = struct {
     /// fast-forwards `committed` to the baseline, and any write above what the
     /// snapshot actually contains is then ≤ its commit / below `first_index`, so it
     /// never replays → a PERMANENT store fork at an agreed log index (the 2026-06-20
-    /// prod `__auth__` divergence; `docs/plans/raft-consensus-storage-triage.md` RC-1).
+    /// prod `__auth__` divergence; `docs/plans/consensus-robustness-backlog.md` RC-1).
     ///
     /// `applied_idx` is WRONG here: under `worker_overlay` a skipped own-propose
     /// bumps `applied_idx` while its store write still sits in the worker's open txn

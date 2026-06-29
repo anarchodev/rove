@@ -1,6 +1,6 @@
 //! Background snapshot catch-up driver — the worker-thread half of the
 //! raft-native alignment arc's Phase 1 (native trigger + out-of-band data,
-//! `docs/plans/raft-native-alignment.md`).
+//! `docs/architecture/raft-native-alignment.md`).
 //!
 //! The pump's `snapshotTriggerTick` detects a peer raft holds in
 //! `ProgressState::Snapshot` (it fell below the leader's compacted first_index

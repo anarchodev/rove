@@ -47,6 +47,8 @@ The maintained set. Subsystem-owned, kept current with the code.
 - **[auth-and-domains.md](architecture/auth-and-domains.md)** — OIDC, custom domains, ACME, service/admin authz
 - **[observability.md](architecture/observability.md)** — operator telemetry (Grafana Cloud)
 
+> Design-rationale reference (not a primary subsystem doc, but cited by ~10 source files): [raft-native-alignment.md](architecture/raft-native-alignment.md) — how membership + catch-up were re-aligned onto raft-rs's native model (all phases landed; Phase 3 in `decisions.md` §10.12).
+
 ### Customer-facing contracts (kept alongside)
 
 - **[effect-algebra.md](effect-algebra.md)** — the four-primitive effect model + the trigger-scope axes
@@ -69,6 +71,7 @@ them 2026-06-29: its as-built mechanism folded into
 - [builtin-libs-docs-plan.md](plans/builtin-libs-docs-plan.md) — `_system.*` + JS shim docs
 - [replay-wasm-plan.md](plans/replay-wasm-plan.md) — WASM replay UI (§8.6+ deferred)
 - [sim-test-framework.md](plans/sim-test-framework.md) · [fixture-lifecycle.md](plans/fixture-lifecycle.md) · [agent-surface.md](plans/agent-surface.md) — replay/sim/agent surface (Phase 12–14)
+- [consensus-robustness-backlog.md](plans/consensus-robustness-backlog.md) — open consensus hardening residue (fail-loud fixes, a CP move/provision UAF, the power-loss/`dm-flakey` crash-consistency validation gap) + the governing error-classification + pin-coordination conventions. Consolidates the retired `raft-correctness-plan` + 2026-06-20 storage triage
 
 ## Product & strategy
 

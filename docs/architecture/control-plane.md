@@ -147,7 +147,7 @@ re-provision 409 / unknown-cluster 400).
 > **Convergence (raft-native-alignment):** the brief-pause move (quiesce +
 > bundle dump described above) was **retired** — there is now ONE move, the
 > zero-downtime one. `/_control/move` routes to it. The bundle transfer is
-> **streamed** source→dest (Phase 2.5, `docs/plans/raft-native-alignment.md`), not
+> **streamed** source→dest (Phase 2.5, `docs/architecture/raft-native-alignment.md`), not
 > buffered through the CP. The brief-pause-specific machinery (`v2-bundle` /
 > `v2-resume` / bridge quiesce, and the now-dead `moving`-hold +
 > stuck-move reconciliation) is being removed; the section above is historical.
