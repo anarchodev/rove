@@ -10,9 +10,11 @@
 //! Transport is TLS + a curl cookie jar (vs. rewind-ops' h2c-to-internal).
 //! Shared bundle/JSON/process plumbing comes from common.zig. std-only.
 //!
-//! Config (OS env, or a --env file): REWIND_ADMIN_URL (dashboard origin),
-//! REWIND_IDP_URL (the IdP origin), REWIND_CLIENT_ID (default admin-dashboard),
-//! REWIND_SESSION (cookie-jar path, default ~/.config/rove/rewind.session).
+//! Config resolves OS env first, then a config file: --env <file> if given,
+//! else ~/.config/rewind/config ($XDG_CONFIG_HOME/rewind/config), KEY=VALUE
+//! lines. Keys: REWIND_ADMIN_URL (dashboard origin), REWIND_IDP_URL (the IdP
+//! origin), REWIND_CLIENT_ID (default admin-dashboard), REWIND_SESSION
+//! (cookie-jar path, default ~/.config/rewind/rewind.session).
 //! For self-hosted clusters with a private CA / split-horizon DNS:
 //! REWIND_CACERT (curl --cacert) and REWIND_RESOLVE (curl --resolve entries,
 //! comma-separated host:port:addr).
@@ -71,9 +73,23 @@ fn loadCfg(gpa: std.mem.Allocator, a: std.mem.Allocator, env_path: ?[]const u8) 
 
 fn defaultSessionPath(a: std.mem.Allocator) []const u8 {
     const home = std.process.getEnvVarOwned(a, "HOME") catch return "rewind.session";
-    const dir = std.fs.path.join(a, &.{ home, ".config", "rove" }) catch return "rewind.session";
+    const dir = std.fs.path.join(a, &.{ home, ".config", "rewind" }) catch return "rewind.session";
     std.fs.cwd().makePath(dir) catch {};
     return std.fs.path.join(a, &.{ dir, "rewind.session" }) catch "rewind.session";
+}
+
+/// The customer CLI's default config path: $XDG_CONFIG_HOME/rewind/config (or
+/// ~/.config/rewind/config), KEY=VALUE lines (same format as --env). Falls back
+/// to the shared operator default (rove/prod.env, ./.env.prod) when absent, for
+/// back-compat. An explicit --env <file> overrides this.
+fn defaultConfigPath(a: std.mem.Allocator) ?[]const u8 {
+    const base = (std.process.getEnvVarOwned(a, "XDG_CONFIG_HOME") catch null) orelse blk: {
+        const home = std.process.getEnvVarOwned(a, "HOME") catch return c.defaultEnvPath(a);
+        break :blk std.fs.path.join(a, &.{ home, ".config" }) catch return c.defaultEnvPath(a);
+    };
+    const cand = std.fs.path.join(a, &.{ base, "rewind", "config" }) catch return c.defaultEnvPath(a);
+    std.fs.cwd().access(cand, .{}) catch return c.defaultEnvPath(a);
+    return cand;
 }
 
 // ── transport: TLS curl with a cookie jar ─────────────────────────────────
@@ -730,11 +746,12 @@ const USAGE =
     \\for any tenant you own. No platform secret is ever held by the CLI — the
     \\worker attaches it at the internal door.
     \\
-    \\Config (OS env or the --env file):
+    \\Config — OS env first, then a file: --env <file>, else ~/.config/rewind/config
+    \\(KEY=VALUE lines):
     \\  REWIND_ADMIN_URL   dashboard origin (e.g. https://app.example.com)
     \\  REWIND_IDP_URL     IdP origin (e.g. https://auth.example.com)
     \\  REWIND_CLIENT_ID   OAuth client id (default: admin-dashboard)
-    \\  REWIND_SESSION     cookie-jar path (default: ~/.config/rove/rewind.session)
+    \\  REWIND_SESSION     cookie-jar path (default: ~/.config/rewind/rewind.session)
     \\  REWIND_CACERT      curl --cacert (private CA)
     \\  REWIND_RESOLVE     curl --resolve entries, comma-separated
     \\
@@ -749,7 +766,7 @@ pub fn main() void {
 
     const argv = std.process.argsAlloc(a) catch c.oom();
     var i: usize = 1;
-    var env_path: ?[]const u8 = c.defaultEnvPath(a);
+    var env_path: ?[]const u8 = defaultConfigPath(a);
     // Optional leading --env <file>.
     if (i < argv.len and std.mem.eql(u8, argv[i], "--env")) {
         if (i + 1 >= argv.len) c.fatal("--env needs a path", .{});
