@@ -53,8 +53,11 @@ install -D -m0755 zig-out/bin/rewind-front  ~/.local/bin/rewind-front
 install -D -m0755 zig-out/bin/rewind-logs   ~/.local/bin/rewind-logs
 ```
 
-`scripts/deploy.sh` automates build + ship + rolling/genesis restart across a
-host list (`ROVE_HOSTS`); read it as the reference orchestration.
+`scripts/build.sh` wraps this — it builds all four shipped binaries (+
+`rewind-ops`) at `ReleaseFast` and runs the test gate. The ship + restart
+orchestration (rolling / genesis across a host list) is operator-specific and
+lives outside this public repo; the bring-up steps below are the manual
+equivalent.
 
 ## Configure
 
@@ -239,10 +242,12 @@ together (a lone CP with `REWIND_CP_VOTERS=1,2,3` has no peers to elect with).
    control-plane + deployment docs; our genesis automates this via
    `rewind-ops genesis`).
 
-`scripts/deploy.sh --genesis` does steps 1–4 end to end for our host list;
-`scripts/deploy.sh` (no flag) does a quorum-safe rolling update of an
-already-formed cluster (one node at a time). They're the reference for the
-ordering + health gates even if you orchestrate differently.
+The key invariants to preserve if you script this: **start the CPs together**
+for a cold genesis (a lone cold-multi CP can't elect), **roll one node at a
+time** for updates of a formed cluster (each raft group tolerates one down), and
+**health-gate** each step (cp leader → worker `/_system/health` → front → logs)
+before touching the next host. Our own operator repo's `deploy.sh` implements
+exactly this on top of `scripts/build.sh`.
 
 A **single node** is the same minus the peers: set `REWIND_VOTERS=1` /
 `REWIND_CP_VOTERS=1` (empty peer lists), start the four units in order.

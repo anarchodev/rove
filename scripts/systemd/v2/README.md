@@ -23,9 +23,10 @@ This repo (public) keeps:
 - the **env templates** here — [`common.env.example`](common.env.example) +
   [`node.env.example`](node.env.example) — the documented, secret-free
   reference for every variable each binary reads;
-- the **build + binary-ship engine**, [`scripts/deploy.sh`](../../deploy.sh)
-  (builds `${BINS[@]}` incl. `rewind-logs`, ships to `~/.local/bin`, rolling /
-  genesis restart);
+- the **build engine**, [`scripts/build.sh`](../../build.sh) (builds the deploy
+  binaries incl. `rewind-logs` + the test gate → `zig-out/bin`). The **deploy**
+  (ship + restart, rolling/genesis) moved to the private infra repo's
+  `scripts/deploy.sh`, which calls `build.sh`;
 - the full runbook,
   [`docs/plans/v2-production-deploy-plan.md`](../../../docs/plans/v2-production-deploy-plan.md).
 
