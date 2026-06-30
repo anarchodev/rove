@@ -643,6 +643,10 @@ pub fn build(b: *std.Build) void {
         .root_module = ls_standalone_mod,
     });
     b.installArtifact(ls_standalone);
+    // Named step so `zig build rewind-logs` works (scripts/deploy.sh builds
+    // each shipped binary by name).
+    const ls_step = b.step("rewind-logs", "Build the V2 log-server / tape indexer binary");
+    ls_step.dependOn(&b.addInstallArtifact(ls_standalone, .{}).step);
 
 
     // V1→V2 cutover: `kv-maelstrom` (examples/kv_maelstrom.zig) drove

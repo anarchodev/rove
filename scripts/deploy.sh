@@ -75,7 +75,7 @@ HEALTH_TIMEOUT=60
 # the CPs are started together (cross-host election is ~1-2s; be generous).
 CP_ELECT_TIMEOUT="${ROVE_CP_ELECT_TIMEOUT:-60}"
 
-BINS=(rewind-worker rewind-cp rewind-front)
+BINS=(rewind-worker rewind-cp rewind-front rewind-logs)
 OUT="$REPO_ROOT/zig-out/bin"
 
 # `systemctl --user` over a non-login ssh session needs the user-bus env.
@@ -278,10 +278,12 @@ if [ "$MODE" = genesis ]; then
     # deliberate decision, reaches here). Destructive + irreversible.
     log "WIPE: stop services + remove ~/.rove/data/{cp,worker} on all hosts"
     for host in $ROVE_HOSTS; do
-        for svc in front worker cp; do
+        for svc in front worker cp logs; do
             $SSH "$host" "$RUSER_ENV systemctl --user stop rewind-$svc.service 2>/dev/null; $RUSER_ENV systemctl --user disable rewind-$svc.service 2>/dev/null" >/dev/null 2>&1 || true
         done
-        $SSH "$host" 'rm -rf ~/.rove/data/cp ~/.rove/data/worker' || die "$host: data wipe failed"
+        # rewind-logs' SQLite index is a rebuildable S3-fed cache; wiping it
+        # forces a clean re-index on the fresh cluster.
+        $SSH "$host" 'rm -rf ~/.rove/data/cp ~/.rove/data/worker ~/.rove/data/logs' || die "$host: data wipe failed"
         ok "$host: services stopped, data wiped"
     done
 
@@ -311,6 +313,8 @@ if [ "$MODE" = genesis ]; then
         wait_health "$host" worker "http://localhost:8443/_system/health"
         $SSH "$host" "$RUSER_ENV systemctl --user restart rewind-front.service"  || die "$host: front start failed"
         wait_health "$host" front
+        $SSH "$host" "$RUSER_ENV systemctl --user restart rewind-logs.service" 2>/dev/null \
+            && wait_health "$host" logs || warn "$host: rewind-logs not started (unit not installed? push-config from rewind-infra)"
     done
 
     # Drive the operator-side bring-up: register node addrs → provision __admin__
@@ -354,6 +358,11 @@ for host in $ROVE_HOSTS; do
     wait_health "$host" worker "http://localhost:8443/_system/health"
     $SSH "$host" "$RUSER_ENV systemctl --user restart rewind-front.service"  || die "$host: front restart failed"
     wait_health "$host" front
+    # rewind-logs is stateless (its SQLite index is a rebuildable S3-fed cache,
+    # no raft) — restart anytime, liveness-gate only. `|| true`: a node without
+    # the unit yet (first roll after the move) shouldn't fail the deploy.
+    $SSH "$host" "$RUSER_ENV systemctl --user restart rewind-logs.service" 2>/dev/null \
+        && wait_health "$host" logs || warn "$host: rewind-logs not restarted (unit not installed? push-config from rewind-infra)"
 
     log "[$host] settle ${SETTLE_SECS}s (raft rejoin) before next host"
     sleep "$SETTLE_SECS"
