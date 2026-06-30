@@ -22,6 +22,7 @@
 const std = @import("std");
 const c = @import("common.zig");
 const replay = @import("rove-replay");
+const build_options = @import("build_options");
 
 const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 
@@ -784,6 +785,12 @@ pub fn main() void {
         std.mem.eql(u8, verb, "-h"))
     {
         std.debug.print("{s}", .{USAGE});
+        return;
+    }
+    if (std.mem.eql(u8, verb, "version") or std.mem.eql(u8, verb, "--version") or
+        std.mem.eql(u8, verb, "-V"))
+    {
+        std.debug.print("rewind {s}\n", .{build_options.version});
         return;
     }
     const known = std.mem.eql(u8, verb, "login") or std.mem.eql(u8, verb, "status") or

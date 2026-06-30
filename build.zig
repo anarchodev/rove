@@ -1245,12 +1245,16 @@ pub fn build(b: *std.Build) void {
     // which link the native replay engine via `rove-replay` — so `rewind` now
     // links the JS engine (heavier than the std-only deploy build; acceptable
     // for one unified CLI, plan §2a). No system libs beyond the engine's own.
+    const cli_version = b.option([]const u8, "version", "version string baked into `rewind --version` (CI passes the release tag; defaults to \"dev\")") orelse "dev";
+    const cli_opts = b.addOptions();
+    cli_opts.addOption([]const u8, "version", cli_version);
     const cli_mod = b.createModule(.{
         .root_source_file = b.path("src/cli/rewind.zig"),
         .target = target,
         .optimize = optimize,
     });
     cli_mod.addImport("rove-replay", replay_mod);
+    cli_mod.addImport("build_options", cli_opts.createModule());
     linkReplayEngine(cli_mod, arenajs_dep);
     const cli_exe = b.addExecutable(.{ .name = "rewind", .root_module = cli_mod });
     const cli_step = b.step("rewind", "Build the rewind customer CLI");
