@@ -19,6 +19,112 @@ Implements [`docs/PLAN.md`](../PLAN.md) §10.7 (simulator primitive) and §10.8 
 
 **Public-contract note**: once Phase 12 ships, the **bundle JSON shape** (`src/tape/bundle.zig`) and the **tape blob format** (`src/tape/root.zig`) become external contracts — consumed by the CLI sim, the launch-path browser-replay page on `replay.rewindjs.com`, and the launch-path DAP-attach CLI (`rewind replay <id>`) per PLAN.md §10.12. Changes to either are coordination points across the test runner, the export-fixture tool, the dashboard, and both replay paths. Treat them as versioned interfaces from the start (T4's `replay_available` flag exists partly for forward-compat signaling).
 
+## The model — one run, parameterized (2026-06-30)
+
+The framework is **one operation**, not three. An activation is the pure function
+the engine already runs — `update(Msg, KV snapshot, ctx) → (writeset, Cmds,
+disposition)` (`architecture/effects-and-handlers.md`). Sim, replay, and test are
+all just **running that function against a *world*** and choosing what to do with
+the result. There is no separate replay engine: the simulator (T5/T6) *is* the
+engine, and "replay" is a corner of its input space.
+
+### The world (per activation)
+
+A **world** is everything an activation reads:
+
+- the **`Msg`** — the trigger + payload (`inbound` request, a `fetch_chunk`
+  result, an `on.kv`/`on.timer` wake, a `ws_message`, …);
+- the **read-recorded `request` surface** — headers/body/cookies/ip, captured
+  *on access* (the `request_reads` channel, `handler-shape.md` §7.1);
+- the **pinned KV readset** — the values reads resolve to;
+- the threaded **`ctx`** (`next({ctx})` → `request.ctx`), the only handler state
+  that crosses activations, plus the deterministic **seeds** (clock/random, from
+  `received_ns`).
+
+This is exactly the bundle the tape captures (T2/T3/T4) and the `ReplaySource`
+layers serve (T5). A **recording** is a world that was *captured*; a **fixture**
+is a world that was *authored*. Same shape.
+
+Fetches don't complicate this: `http.fetch` is a `Cmd` (an *output* of an
+activation), and its result arrives as a *new* `Msg` (`fetch_chunk`) — a new
+activation with its own world. So a whole request is a **chain of per-activation
+worlds** linked by `Cmd(http_fetch) → fetch_chunk Msg`; each activation is
+independently runnable, and a "saga run" is the optional composition that feeds
+one activation's emitted fetch result into the next activation's `Msg`. No
+continuation is ever reconstructed — there are no live closures across
+activations, only serializable `ctx`.
+
+### One operation: `run(world, code, on-miss)`
+
+Everything is a parameterization of one run:
+
+| mode | world | code | on-miss | what the output answers |
+|---|---|---|---|---|
+| **replay** | a **captured** recording | the **original** code | **fail-loud** | reproduce — "what actually happened" |
+| **sim / what-if** | captured and/or authored | any (e.g. working tree) | **resolve** | inspect — "what *would* happen if" |
+| **test** | authored (often grown via sim) | any | fail (under-specified) | assert on outputs |
+| **regression** | a recording | original vs changed | — | `diff(run(rec, original), run(rec, changed))` |
+
+**Replay is a degenerate sim** — the corner where the world is a faithful,
+complete recording and the code is the original, so the run provably reproduces
+reality. It is not a separate verb or engine; it is the *named contract*
+`captured ∧ original-code ∧ no-holes`. The value of the name is being able to
+**assert** that contract — to demand "run this and fail if you'd have to invent
+or diverge" — so that "what actually happened" can be trusted. Drop the contract
+and a run can silently fill a gap, and you can no longer tell reconstruction from
+fabrication.
+
+### The on-miss policy *is* the replay↔sim axis
+
+When a run reads something the world doesn't supply (a changed handler takes a
+new branch; an authored world is partial), the engine emits a **typed hole** — a
+read-descriptor `{kind, key, expected-shape, activation}` — and the **calling
+surface binds it**:
+
+- **replay** sets on-miss = **fail-loud** (the `REPLAY DIVERGENCE` already built,
+  §7.1): a miss means the run left reality. Replay therefore needs **no
+  resolver** — a faithful run of the original code against its own recording
+  structurally *cannot* miss.
+- **sim** sets on-miss = **resolve**, bound per surface: the web UI renders the
+  hole as a form field (and the answer authors the fixture); a tty CLI prompts; a
+  flag returns `empty`/`default`; an **LLM** receives the hole as a structured
+  "unresolved read" (Phase 13 `fixture-lifecycle.md` T4) and answers it — which
+  *runs and authors a fixture in the same pass* (lazy world-building: the handler
+  pulls the values it needs, the answers snapshot into a golden fixture). One
+  hole, many bindings — the agent uses the same surface a human does.
+
+So "replay vs sim" is not two verbs; it is the `--miss-policy` already in T7
+(`fail` vs `not_found`/resolve), over one engine.
+
+### Provenance is tracked per read
+
+`on-miss = fail` guarantees **no holes**, but not that the world is *real* — a
+fully-authored world with no holes still isn't "what happened." So each resolved
+read records its **source** (T5 already emits `{source: tape|overlay|buffer}`);
+that per-read provenance is what lets a run claim faithfulness. `captured` (every
+read served from the tape) ∧ `original-code` ∧ `no-holes` ⇒ the run *is* reality;
+anything else is a sim, however complete.
+
+### Why this matters for the agent (the primary CLI user)
+
+The CLI's primary user is an LLM, and the model collapses to one tool with three
+knobs (`world`, `code`, `miss-policy`):
+
+- **replay = the agent's zero-hallucination truth source** — diagnosing a real
+  incident from ground truth; it *cannot* invent, because there are no holes to
+  fill (`--miss-policy fail` on a captured world).
+- **sim = the agent's counterfactual / authoring space** — and *because* it can
+  invent (holes → the LLM answers), it is the part to guard (typed holes,
+  fidelity caveats). Answering holes lazily authors the fixture/test, which feeds
+  Phase 13's `rewind test --auto-fix-from`.
+- **fixing a bug = `diff(replay of the failure, sim of the fix)`** on the same
+  recorded input — the same primitive, two code args, composed.
+
+The honest one-liner: **replay tells you what happened and cannot be wrong; sim
+tells you what-if and is only as good as the world you (or the LLM) supply.**
+Keeping `--source-dir` and hole-resolution *out* of the faithful corner is what
+preserves that distinction.
+
 ## What already exists
 
 - **Tape capture — done.** `uploadTapes` (`src/js/worker.zig:901-938`), `LogRecord.tape_refs` populated, blob storage at `{data_dir}/{id}/log-blobs/`.
