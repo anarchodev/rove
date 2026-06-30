@@ -159,13 +159,19 @@ The current driver is therefore faithful for **`inbound`/`default` only**.
   cheap, high-leverage path.
 - **Replay (captured world)** is faithful for `inbound` today; non-`inbound`
   needs G1+G2 (decode the taped channels) and G3 (persist the dispatch target).
-- **`export-fixture` (capture → authored world)** is a per-activation transcode
-  over the channels (one path, no per-kind branches). It needs G1's decode to
-  read `ctx`/fetch-result, and G3 to author a faithful export. The
-  within-activation KV correctness it needs — a **write-through overlay**
-  (read-your-writes) plus an explicit **`kvAbsent` set** (recorded not-found
-  reads, so `miss-policy=fail` reproduces the recording exactly) — is local to
-  one activation; cross-activation is just separate worlds (§2).
+- **`export-fixture` (capture → authored world)** transcodes a `rewind pull`
+  fixture into a declarative world. The within-activation KV correctness it
+  needs — a **write-through overlay** (read-your-writes) plus an explicit
+  **`kvAbsent` set** (recorded not-found reads, so `miss-policy=fail` reproduces
+  the recording exactly) — is local to one activation; cross-activation is just
+  separate worlds (§2). **Landed 2026-06-30 for the inbound family** (`rewind
+  export-fixture`, `src/replay/export_fixture.zig`): the KV read cursor →
+  initial-snapshot map + `kvAbsent` (the first taped read per key; re-reads /
+  post-write reads are reproduced by the sim overlay), the `request_reads` fold
+  → `request` surface, sources passed through (self-contained), `missPolicy:
+  "fail"`. Non-inbound activations warn — the pulled fixture lacks `ctx` /
+  fetch-result / the resolved export (G1/G3 above), so their worlds are
+  incomplete until the recording-side fix.
 
 Landed 2026-06-30: the declarative-world sim path (`world.zig`, the host's
 `.map` mode + miss policy, `runWorld`, `rewind sim`), now covering **all

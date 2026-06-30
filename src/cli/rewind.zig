@@ -663,6 +663,36 @@ fn cmdSim(a: std.mem.Allocator, world_path: []const u8, source_dir: ?[]const u8,
     }
 }
 
+/// `rewind export-fixture <pulled-fixture.json> [-o world.json]` — transcode a
+/// captured recording (a `rewind pull` fixture) into an editable, offline,
+/// fail-loud declarative sim **world** that `rewind sim` reproduces. Offline.
+/// Faithful for inbound activations; warns on non-inbound (the pulled fixture
+/// lacks ctx / fetch-result / the resolved export — replay-and-sim.md §5).
+fn cmdExportFixture(a: std.mem.Allocator, fixture_path: []const u8, out_file: ?[]const u8) void {
+    const bytes = std.fs.cwd().readFileAlloc(a, fixture_path, 64 << 20) catch |e|
+        c.fatal("export-fixture: read {s}: {s}", .{ fixture_path, @errorName(e) });
+    const activation = replay.exportFixtureActivation(a, bytes);
+    if (!replay.exportFixtureIsInbound(activation)) {
+        std.debug.print(
+            "export-fixture: warning: activation '{s}' is not inbound — the pulled fixture carries no ctx / fetch-result / resolved-export, so the world will be incomplete (replay-and-sim.md §5 G1/G3)\n",
+            .{activation},
+        );
+    }
+    var out = std.ArrayList(u8){};
+    replay.exportFixture(a, bytes, &out) catch |e| switch (e) {
+        error.BadFixture => c.fatal("export-fixture: fixture JSON is malformed", .{}),
+        else => c.fatal("export-fixture: {s}", .{@errorName(e)}),
+    };
+    if (out_file) |path| {
+        std.fs.cwd().writeFile(.{ .sub_path = path, .data = out.items }) catch |e|
+            c.fatal("export-fixture: write {s}: {s}", .{ path, @errorName(e) });
+        std.debug.print("wrote world → {s}\n", .{path});
+    } else {
+        const stdout = std.fs.File.stdout();
+        stdout.writeAll(out.items) catch {};
+    }
+}
+
 fn emitStr(w: *std.Io.Writer, s: []const u8) void {
     std.json.Stringify.value(s, .{}, w) catch c.oom();
 }
@@ -766,6 +796,7 @@ const USAGE =
     \\  rewind [--env <file>] pull <tenant> <req_id> [-o FILE]
     \\  rewind [--env <file>] replay <fixture> [--source-dir DIR] [-o FILE]
     \\  rewind sim <world.json> [--source-dir DIR] [--miss-policy fail|resolve] [-o FILE]
+    \\  rewind export-fixture <pulled-fixture.json> [-o world.json]
     \\  rewind [--env <file>] publish [--apps-dir D] [--only t1,t2] [--include-examples] [--no-release]
     \\  rewind [--env <file>] provision <tenant> [--cluster C] [--host H]
     \\  rewind [--env <file>] host add <host> <tenant>
@@ -831,7 +862,8 @@ pub fn main() void {
         std.mem.eql(u8, verb, "host") or std.mem.eql(u8, verb, "plan") or
         std.mem.eql(u8, verb, "move") or std.mem.eql(u8, verb, "route") or
         std.mem.eql(u8, verb, "logs") or std.mem.eql(u8, verb, "pull") or
-        std.mem.eql(u8, verb, "replay") or std.mem.eql(u8, verb, "sim");
+        std.mem.eql(u8, verb, "replay") or std.mem.eql(u8, verb, "sim") or
+        std.mem.eql(u8, verb, "export-fixture");
     if (!known) {
         std.debug.print("rewind: unknown command '{s}'\n\n{s}", .{ verb, USAGE });
         std.process.exit(2);
@@ -885,6 +917,22 @@ pub fn main() void {
             } else c.fatal("sim: unknown option '{s}'", .{rest[j]});
         }
         cmdSim(a, rest[0], source_dir, miss, out_file);
+        return;
+    }
+
+    // `export-fixture` is offline — a pure transcode of a pulled fixture.
+    if (std.mem.eql(u8, verb, "export-fixture")) {
+        if (rest.len < 1) c.fatal("export-fixture needs <pulled-fixture.json> [-o world.json]", .{});
+        var out_file: ?[]const u8 = null;
+        var j: usize = 1;
+        while (j < rest.len) : (j += 1) {
+            if (std.mem.eql(u8, rest[j], "-o")) {
+                if (j + 1 >= rest.len) c.fatal("-o needs a path", .{});
+                out_file = rest[j + 1];
+                j += 1;
+            } else c.fatal("export-fixture: unknown option '{s}'", .{rest[j]});
+        }
+        cmdExportFixture(a, rest[0], out_file);
         return;
     }
 

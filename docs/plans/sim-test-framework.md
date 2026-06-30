@@ -174,10 +174,27 @@ recording-free half of the replay/sim asymmetry: **sim** of any activation works
 now; **faithful replay** of non-inbound activations still needs the recording to
 persist the dispatch target (`architecture/replay-and-sim.md` §5 G1–G3).
 
-Still ahead (T8–T11): the `_tests/` runner + `expect`/`snapshot`,
-`export-fixture` (capture → authored world; needs the `kvAbsent` set + a
-write-through overlay for within-activation KV), and the production-strip of
-`_tests/`.
+**`export-fixture` landed 2026-06-30 (T10), inbound family.** `rewind
+export-fixture <pulled-fixture.json> [-o world.json]` transcodes a captured
+recording (a `rewind pull` fixture — same JSON `rewind replay` consumes) into an
+editable, offline, fail-loud declarative world `rewind sim` reproduces — the
+bridge from the replay corner to the sim corner. The KV transcode walks the
+ordered read cursor into an **initial-snapshot map** (first taped read per key;
+re-reads / post-write reads drop, reproduced by the sim host's write-through
+overlay) plus a **`kvAbsent`** list (recorded `not_found` reads), so a
+`missPolicy:"fail"` sim reproduces the recording exactly and any *new* read
+diverges. `request_reads` → the `request` surface; sources pass through
+(self-contained); seed/now carried. This rests on the host's **write-through
+overlay** (`kv.set`/`delete` update the read map — read-your-writes) + the
+**`kvAbsent`** read rule (a known absence is `not_found` with no hole), both
+landed same day in `src/replay/host.zig`. Non-inbound activations warn — the
+pulled fixture has no ctx / fetch-result / resolved export
+(`architecture/replay-and-sim.md` §5 G1/G3).
+
+Still ahead (T8/T9/T11): the `_tests/` runner + `expect`/`snapshot` globals
+(a test = `run(authored-world, code, on-miss=fail)` + assertions), and the
+production-strip of `_tests/` (the client-side strip already lives in
+`common.classify`; the server-side 422 reject remains).
 
 ## What already exists
 

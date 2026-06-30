@@ -88,6 +88,11 @@ pub const Host = struct {
     kv_map: std.StringHashMapUnmanaged([]const u8) = .{},
     /// What a missed `kv.get` does in `.map` mode (`.tape` is always fail-loud).
     miss: MissPolicy = .fail,
+    /// Keys the world declares explicitly **absent** (recorded `not_found`
+    /// reads), plus keys the handler `delete`s during the run. A miss on an
+    /// absent key resolves to `not_found` with **NO hole** — a *known* absence,
+    /// so `miss-policy=fail` reproduces a recording exactly. (`.map` mode.)
+    absent: std.StringHashMapUnmanaged(void) = .{},
     /// Typed holes recorded when `.resolve` fills a missed read.
     holes: std.ArrayList(Hole) = .{},
     /// Handler-produced writes (`kv.set` / `kv.delete`), in order.
@@ -148,6 +153,14 @@ fn kvGet(
             out_val_len.* = @intCast(v.len);
             return 0;
         }
+        // A *known* absence (declared in `kvAbsent`, or deleted by the handler)
+        // resolves to not_found with no hole — it's not an under-specified read.
+        if (h.absent.contains(k)) {
+            out_outcome.* = @intFromEnum(decode.KvOutcome.not_found);
+            out_val.* = null;
+            out_val_len.* = 0;
+            return 0;
+        }
         // A read the declared world doesn't supply: record the hole, then let
         // the miss policy decide — `.fail` refuses to invent (divergence),
         // `.resolve` answers `not_found` (the sim corner).
@@ -203,6 +216,13 @@ fn kvSet(
         const kc = h.a.dupe(u8, k) catch return -1;
         const vc = h.a.dupe(u8, v) catch return -1;
         h.writes.append(h.a, .{ .op = .set, .key = kc, .value = vc }) catch return -1;
+        // Read-your-writes: a later get of this key in the same run sees the
+        // value the handler just wrote (the kvexp overlay, in declarative form).
+        // Reuses the writes[] dups — no second copy. (`.map` mode.)
+        if (h.mode == .map) {
+            h.kv_map.put(h.a, kc, vc) catch return -1;
+            _ = h.absent.remove(kc);
+        }
     }
     out_outcome.* = 0; // ok
     return 0;
@@ -217,6 +237,11 @@ fn kvDelete(
     const h = hostOf(user);
     const kc = h.a.dupe(u8, key[0..@intCast(key_len)]) catch return -1;
     h.writes.append(h.a, .{ .op = .delete, .key = kc }) catch return -1;
+    // Read-your-deletes: a later get sees not_found (a known absence, no hole).
+    if (h.mode == .map) {
+        _ = h.kv_map.remove(kc);
+        h.absent.put(h.a, kc, {}) catch return -1;
+    }
     out_outcome.* = 0; // ok
     return 0;
 }
@@ -452,6 +477,48 @@ test "map mode: prefix scans the declared map, sorted" {
         got,
     );
     std.c.free(json);
+}
+
+test "map mode: write-through overlay (read-your-writes) + kvAbsent" {
+    const a = testing.allocator;
+    var map = std.StringHashMapUnmanaged([]const u8){};
+    var absent = std.StringHashMapUnmanaged(void){};
+    try map.put(a, "count", "1");
+    try absent.put(a, "gone", {}); // declared explicitly absent
+    var h = Host{ .a = a, .mode = .map, .kv = &.{}, .kv_map = map, .absent = absent, .miss = .fail };
+    defer {
+        for (h.writes.items) |wr| {
+            a.free(wr.key);
+            if (wr.value.len != 0) a.free(wr.value);
+        }
+        h.writes.deinit(a);
+        h.kv_map.deinit(a);
+        h.absent.deinit(a);
+        for (h.holes.items) |hole| a.free(hole.key);
+        h.holes.deinit(a);
+        if (h.diverged) |d| a.free(d);
+    }
+    var outcome: c_int = -1;
+    var val: [*c]u8 = null;
+    var vlen: c_int = -1;
+
+    // read-your-writes: set then get returns the written value
+    try testing.expectEqual(@as(c_int, 0), kvSet("count", 5, "2", 1, &outcome, &h));
+    try testing.expectEqual(@as(c_int, 0), kvGet("count", 5, &outcome, &val, &vlen, &h));
+    try testing.expectEqualStrings("2", val[0..@intCast(vlen)]);
+    std.c.free(val);
+
+    // a declared-absent key is not_found with NO hole, even under miss=fail
+    try testing.expectEqual(@as(c_int, 0), kvGet("gone", 4, &outcome, &val, &vlen, &h));
+    try testing.expectEqual(@intFromEnum(decode.KvOutcome.not_found), outcome);
+
+    // delete then get → not_found, no hole, no divergence
+    try testing.expectEqual(@as(c_int, 0), kvDelete("count", 5, &outcome, &h));
+    try testing.expectEqual(@as(c_int, 0), kvGet("count", 5, &outcome, &val, &vlen, &h));
+    try testing.expectEqual(@intFromEnum(decode.KvOutcome.not_found), outcome);
+
+    try testing.expectEqual(@as(usize, 0), h.holes.items.len);
+    try testing.expect(h.diverged == null);
 }
 
 test "kv writes captured; sentinel intercepted as output" {

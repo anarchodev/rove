@@ -13,6 +13,13 @@ const decode = @import("tape_decode.zig");
 const hostmod = @import("host.zig");
 const epilogue = @import("epilogue.zig");
 const world = @import("world.zig");
+const export_fixture = @import("export_fixture.zig");
+
+/// Transcode a captured `rewind pull` fixture into a declarative sim world.
+/// Re-exported for the `rewind export-fixture` verb.
+pub const exportFixture = export_fixture.transcode;
+pub const exportFixtureActivation = export_fixture.activationOf;
+pub const exportFixtureIsInbound = export_fixture.isInboundFamily;
 
 // ── arenajs native ABI (qjs-arena-reactor.c) ──
 extern fn arena_init(base_kb: c_int, request_kb: c_int) c_int;
@@ -216,9 +223,11 @@ pub fn runWorld(
     if (wv.ip) |ip|
         try reads.append(a, .{ .kind = .ip_masked, .name = "", .value = ip });
 
-    // ── kv readset → map ──
+    // ── kv readset → map (+ the explicitly-absent set) ──
     var kv_map = std.StringHashMapUnmanaged([]const u8){};
     for (wv.kv) |p| try kv_map.put(a, p.key, p.value);
+    var kv_absent = std.StringHashMapUnmanaged(void){};
+    for (wv.kv_absent) |k| try kv_absent.put(a, k, {});
 
     // ── module sources (inline) ──
     var sources = std.StringHashMapUnmanaged([]const u8){};
@@ -269,6 +278,7 @@ pub fn runWorld(
         .mode = .map,
         .kv = &.{},
         .kv_map = kv_map,
+        .absent = kv_absent,
         .miss = miss,
         .sources = sources,
         .source_dir = source_dir,
@@ -532,4 +542,5 @@ test {
     _ = hostmod;
     _ = epilogue;
     _ = world;
+    _ = export_fixture;
 }

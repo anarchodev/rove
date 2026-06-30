@@ -58,6 +58,10 @@ pub const World = struct {
     ip: ?[]const u8 = null,
     /// The KV readset as a key→value map.
     kv: []const KvPair = &.{},
+    /// Keys explicitly declared **absent** — a read resolves to `not_found`
+    /// with no hole (so `miss-policy=fail` reproduces a recording's not-found
+    /// reads). `export-fixture` fills this from the recorded not-found reads.
+    kv_absent: []const []const u8 = &.{},
     seed: u64 = 0,
     now_ms: u64 = 0,
     miss: host.MissPolicy = .resolve,
@@ -150,6 +154,16 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
             try ps.append(a, .{ .key = e.key_ptr.*, .value = try valueToStr(a, e.value_ptr.*) });
         }
         w.kv = try ps.toOwnedSlice(a);
+    }
+
+    // ── explicitly-absent keys ──
+    if (obj.get("kvAbsent")) |ka| {
+        if (ka != .array) return Error.BadWorld;
+        var ks = std.ArrayList([]const u8){};
+        for (ka.array.items) |e| {
+            if (e == .string) try ks.append(a, e.string);
+        }
+        w.kv_absent = try ks.toOwnedSlice(a);
     }
 
     // ── inline sources ──
