@@ -44,6 +44,7 @@ The maintained set. Subsystem-owned, kept current with the code.
 - **[websockets.md](architecture/websockets.md)** — inbound WS as-built: the DO-shaped tenant model, point-to-point vs broadcast fan-out, per-frame durability + the input gate, the `onMessage`/`onDisconnect` handler surface, front Extended CONNECT (RFC 8441)
 - **[control-plane.md](architecture/control-plane.md)** — the directory, replication, tenant-move orchestration, plan/limits
 - **[deployment-and-logs.md](architecture/deployment-and-logs.md)** — deploy publish, content-addressed assets, BlobStore, log-server
+- **[replay-and-sim.md](architecture/replay-and-sim.md)** — the `run(world, code, on-miss)` model behind `rewind replay`/`sim`: a world = one activation's recorded inputs, a request = `foldl` of per-activation worlds, the five tape channels, and the as-built driver gaps. Read before sim/replay work
 - **[configuration-and-network.md](architecture/configuration-and-network.md)** — per-binary env/port config map, the public/private firewall boundary + its security note, two-tier TLS architecture
 - **[auth-and-domains.md](architecture/auth-and-domains.md)** — OIDC, custom domains, ACME, service/admin authz
 - **[observability.md](architecture/observability.md)** — operator telemetry (Grafana Cloud)

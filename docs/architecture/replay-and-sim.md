@@ -1,0 +1,182 @@
+# Replay & sim — the engine model and the as-built driver
+
+> **Status.** The *model* (§1–§4) is locked — it is a restatement of the
+> determinism contract in [`effect-algebra.md`](../effect-algebra.md),
+> [`handler-shape.md`](../handler-shape.md), and
+> [`effects-and-handlers.md`](effects-and-handlers.md), focused on what
+> replay/sim need. The *as-built driver state* (§5–§6) is a snapshot
+> (2026-06-30) of `src/replay/` + `src/cli/rewind.zig` and the recording side;
+> it drifts as the gaps close. **Read this before touching `rewind replay` /
+> `rewind sim` / `export-fixture`** — the recurring mistake is pattern-matching
+> rewind onto a generic continuation/serverless model, which is wrong in ways
+> that produce bad designs (see §2, the resolved-export nuance, and §5 G3).
+
+## 1. One operation: `run(world, code, on-miss)`
+
+Replay, sim, test, and regression are **one operation** with three knobs, not
+separate engines. The foundation is the determinism boundary
+(`effect-algebra.md` §1):
+
+> An effect may return data to a handler **only as a recorded Msg.**
+
+arenajs makes the **within-activation** non-determinism replayable (it captures
+every non-deterministic read onto a tape); the engine makes the
+**between-activation** flow replayable by recording every Msg (L3). Together
+those are *why* replay/sim can exist.
+
+- **world** — everything one activation reads (see §2). A **recording** is a
+  world that was *captured*; a **fixture** is one that was *authored*. Same
+  shape, different provenance.
+- **code** — the handler module (the recorded source, or a working-tree
+  override — the `--source-dir` "does my change still satisfy this?" lever).
+- **on-miss** — what a read the world doesn't supply does: `fail` (refuse to
+  invent → the replay corner) or `resolve` (answer not_found + record a typed
+  hole → the sim corner). This is the **replay↔sim axis**.
+
+| mode | world | code | on-miss |
+|---|---|---|---|
+| replay | captured | original | fail |
+| sim / what-if | authored and/or captured | any | resolve |
+| test | authored | any | fail |
+| regression | captured | original vs changed | — (diff two runs) |
+
+**Inputs are recorded; outputs are derived** (`effect-algebra.md` §2.5). The
+world carries *inputs* (the Msg, the readset, ctx, seed, bytecode-by-hash). The
+*outputs* — writeset, `Cmd`s, the wire response — are a deterministic function
+of those inputs and are the run's **result**, never part of its world. Don't
+put a response/status into a world expecting it to "play back"; it falls out of
+re-running.
+
+## 2. The activation is the unit; a request is a fold of worlds
+
+An activation is the pure function the engine already runs:
+
+```
+update : (Msg, Ctx) -> (Writeset, Cmd Msg)
+```
+
+run against its recorded **Msg**, a pinned **Model snapshot** (the readset —
+foreign kv reads, fetch-response `BodyRef`s, module hashes, the seed), and the
+threaded **ctx**. That tuple *is* a world.
+
+**A handler is a module of named exports** — the Elm `update` with each
+`case msg of` arm hoisted to `export function on…` (`handler-shape.md` §1).
+Dispatch is **activation-kind → named export**.
+
+**The resolved-export nuance (the thing that is easy to get wrong).** For a
+*callback/continuation* activation — an `on.fetch` result, a `{to}` override, a
+`webhook.send` `onResult` — the export is the **resolved name carried on the
+wake**, *not* derived from the activation kind:
+
+- `UpstreamFetchEvent.resolvedExport()` (`src/js/components.zig:377`): `{to}`
+  name if given, else `onFetchResult` (whole body) / `onFetchChunk`
+  (intermediate) / `onFetchDone` (terminal) by event shape.
+- `defaultExportForKind()` (`src/js/rpc_dispatch.zig:63`) is only the
+  **fallback** when the resume didn't name one: `wake_batch`/`kv_wake`/`timer`
+  → `onWake`, `disconnect` → `onDisconnect`, `ws_message` → `onMessage`,
+  `inbound_headers` → `onHeaders`, `inbound_chunk` → `onChunk`, else `default`.
+  Note `fetch_chunk` falls to `default` here — which is *wrong* for a fetch
+  callback; the real export came from `resolvedExport`, computed at runtime.
+
+So `fetch_chunk` does **not** dispatch to `default`. A world for a callback
+activation must carry *which export ran* (§5 G3).
+
+**A request is `foldl(handlers, kv0, activations)`** (`handler-shape.md` §11) —
+a chain of per-activation worlds linked by `Cmd(http_fetch) → fetch_chunk Msg`.
+Each activation is independently runnable; a "saga" is the optional composition
+that feeds one activation's emitted fetch result into the next activation's Msg.
+There is **no continuation reconstruction** — no live closures cross
+activations, only the serializable `ctx`. The cross-activation "same key, two
+values" worry is a non-issue: each activation has its *own* tape/snapshot, so
+they are simply different worlds.
+
+## 3. What a world must carry, per activation kind
+
+The per-activation `request` surface (`handler-shape.md` §7) is what a world
+declares/captures:
+
+| activation | export | world inputs (beyond kv readset + seed + bytecode) |
+|---|---|---|
+| `inbound` (default) | `default` | `request.method/.path/.headers/.body/.cookies/.ip` (read-recorded) |
+| `inbound_chunk` | `onChunk` | this chunk's bytes (binary), `request.done`, `request.chunkSeq`, `request.ctx` |
+| `on.fetch` result/chunk/done | `onFetchResult`/`Chunk`/`Done` or `{to}` | flattened: `request.body` (bytes), `request.status/.ok/.done/.fetchId`, threaded `request.ctx`, `request.activation.*` metadata |
+| `on.kv`/`on.timer` wake | `onWake` or `{to}` | `request.ctx`; matched keys on `request.activation.wakes[]` (edge — "go look") |
+| `ws_message` | `onMessage` | `request.activation = {opcode, data}`, `request.ctx` |
+| `disconnect` | `onDisconnect` | `request.ctx` |
+| `durable_wake` / `cron` / `schedule` | the named target | `request.activation.msg`; no inbound headers/body; connection verbs inert |
+| `onBoot` / `onSubscription` | `onBoot` / `onSubscription` | origin-specific; no inbound surface |
+
+`request.ctx` is `undefined` on the **first** activation of a chain. The
+request surface is **read-recorded** (`handler-shape.md` §7.1): names always
+recorded, values/body/ip on access; an unrecorded read on replay is a loud
+`REPLAY DIVERGENCE`.
+
+## 4. The five tape channels (capture) vs what the driver decodes (replay)
+
+Capture writes five channels (`src/tape/root.zig:127`):
+
+| channel | carries |
+|---|---|
+| `kv` (0) | ordered kv **reads** (`get`/`prefix` + outcome); `set`/`delete` are outputs, never taped |
+| `module` (1) | resolved module specifier → source hash (bytecode pin) |
+| `fetch_responses` (2) | a fetch result's bytes + terminal `status`/`ok`/`body_truncated` (`worker_streaming.zig:3236`) |
+| `trigger_payload` (3) | the request **body** (inbound) **or** a synthesized `{"ctx": …}` envelope (continuation resume) — `worker_drain.zig:1448`, `liftThreadedCtx` `globals.zig:2253` |
+| `request_reads` (4) | the read-recorded `request` surface (header names/values, body-read flag, ip) |
+
+So the inputs for *every* activation kind are taped — `ctx` rides
+`trigger_payload`, a fetch result rides `fetch_responses`. The capture side is
+(largely) complete.
+
+## 5. As-built driver gaps (snapshot 2026-06-30)
+
+The offline driver (`src/replay/`) and the recording side do **not** yet make
+every activation runnable. Three gaps, in priority order:
+
+- **G1 — the driver decodes only `kv` + `request_reads`.** `root.zig` never
+  decodes `fetch_responses` or `trigger_payload`, and `epilogue.zig` rebuilds
+  only the inbound surface. So `request.ctx` and the flattened fetch-result
+  fields are **absent** on replay → any non-`inbound` activation hits a
+  spurious `REPLAY DIVERGENCE`. The data is taped; the driver just doesn't read
+  it. *(Replay-side fix.)*
+- **G2 — `epilogue.exportForActivation` can't select the right export.** It
+  lacks `fetch_chunk` (falls to `default`) and has no way to honor a resolved
+  export / `{to}`. *(Replay-side fix, but depends on G3 for the input.)*
+- **G3 — the resolved export (the dispatch target) is not persisted.** The
+  `LogRecord` stores only the `ActivationSource` *kind* (`src/log/root.zig:386`);
+  `resolvedExport`'s discriminators (`stream`/`final`, the `{to}` `name`) live
+  only in the live event. The no-`{to}` fetch export is *derivable* from the
+  `fetch_responses` terminal flag, but a **`{to}` override is lost entirely**.
+  Faithful replay of callbacks therefore needs a **recording-side** change:
+  persist the export actually invoked (it is an input per L3/§2.5). *(Recording-side fix.)*
+
+The current driver is therefore faithful for **`inbound`/`default` only**.
+
+## 6. Implications for the sim / export-fixture plan
+
+- **Sim (authored world) works for *any* activation with `world.zig` changes
+  alone** — the author/transcoder declares the activation kind, the export, the
+  Msg, `ctx`, and the fetch-result fields. No recording change. This is the
+  cheap, high-leverage path.
+- **Replay (captured world)** is faithful for `inbound` today; non-`inbound`
+  needs G1+G2 (decode the taped channels) and G3 (persist the dispatch target).
+- **`export-fixture` (capture → authored world)** is a per-activation transcode
+  over the channels (one path, no per-kind branches). It needs G1's decode to
+  read `ctx`/fetch-result, and G3 to author a faithful export. The
+  within-activation KV correctness it needs — a **write-through overlay**
+  (read-your-writes) plus an explicit **`kvAbsent` set** (recorded not-found
+  reads, so `miss-policy=fail` reproduces the recording exactly) — is local to
+  one activation; cross-activation is just separate worlds (§2).
+
+What landed first (2026-06-30): the declarative-world sim path for `inbound`
+(`world.zig`, the host's `.map` mode + miss policy, `runWorld`, `rewind sim`).
+See [`../plans/sim-test-framework.md`](../plans/sim-test-framework.md)
+§"Built 2026-06-30" and §"The model — one run, parameterized".
+
+## 7. See also
+
+- [`effect-algebra.md`](../effect-algebra.md) — §1 determinism boundary, §2.5
+  inputs-durable/outputs-derivable, §6 trigger scope (connection vs tenant).
+- [`handler-shape.md`](../handler-shape.md) — §3 activation kinds → exports,
+  §7 the `request` surface per kind, §11 `foldl` replay.
+- [`effects-and-handlers.md`](effects-and-handlers.md) — the reified primitives,
+  the readset in the raft entry, the continuation runtime.
