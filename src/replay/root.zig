@@ -84,6 +84,52 @@ pub fn run(
         break :blk null;
     };
 
+    // ── non-inbound activation surface (replay-and-sim.md §2-§3) ──
+    // For a callback/continuation the inputs ride two channels the inbound path
+    // ignores: trigger_payload carries the threaded ctx as a `{"ctx": …}`
+    // envelope; fetch_responses carries a fetch result (status/ok/final + body).
+    // Both are reconstructed here and handed to the SAME epilogue the sim path
+    // uses. (BodyRef-to-blob bytes aren't fetchable offline — inline only.)
+    const is_inbound = std.mem.eql(u8, activation, "inbound") or
+        std.mem.eql(u8, activation, "inbound_headers") or
+        std.mem.eql(u8, activation, "inbound_chunk");
+    const ctx_json: ?[]const u8 = if (is_inbound) null else blk: {
+        const b64 = if (tapes) |t| jStr(t, "trigger_payload_b64") else null;
+        const s = b64 orelse break :blk null;
+        const tp = decode.decodeTriggerPayload(a, try b64decode(a, s)) catch break :blk null;
+        if (tp.len == 0 or tp[0].batch_id != decode.NO_BATCH or tp[0].inline_bytes.len == 0)
+            break :blk null;
+        break :blk extractCtx(a, tp[0].inline_bytes);
+    };
+    var fetch_result: ?epilogue.Result = null;
+    var fetch_body: ?[]const u8 = null;
+    var resolved_export: ?[]const u8 = null;
+    if (!is_inbound) {
+        const b64 = if (tapes) |t| jStr(t, "fetch_responses_b64") else null;
+        if (b64) |s| {
+            const fr = decode.decodeFetchResponses(a, try b64decode(a, s)) catch &.{};
+            if (fr.len != 0) {
+                var body = std.ArrayList(u8){};
+                for (fr) |e| try body.appendSlice(a, e.inline_bytes);
+                fetch_body = body.items;
+                const last = fr[fr.len - 1];
+                fetch_result = .{
+                    .status = if (last.final) @as(i64, last.terminal_status) else null,
+                    .ok = if (last.final) last.terminal_ok else null,
+                    .done = last.final,
+                    .fetch_id = last.fetch_id,
+                    .chunk_seq = @as(i64, last.seq),
+                };
+                // Resolve the export by event shape. The `{to}` override is not
+                // recorded (replay-and-sim.md §5 G3), so an overridden callback
+                // replays under its conventional export — a known limit.
+                resolved_export = if (!last.final)
+                    "onFetchChunk"
+                else if (last.seq == 0) "onFetchResult" else "onFetchDone";
+            }
+        }
+    }
+
     // ── module sources (path → handler source) ──
     var sources = std.StringHashMapUnmanaged([]const u8){};
     if (obj.get("sources")) |sv| if (sv == .array) {
@@ -112,14 +158,19 @@ pub fn run(
 
     const binary_body = std.mem.eql(u8, activation, "inbound_chunk") or
         std.mem.eql(u8, activation, "fetch_chunk");
+    // A fetch_chunk's `request.body` is the FETCH result body (from
+    // fetch_responses), not the inbound request body.
+    const eff_body = fetch_body orelse body_bytes;
     const epi = try epilogue.build(a, .{
         .method = method,
         .path = path,
         .host = host_hdr,
         .request_reads = reads,
-        .body_bytes = body_bytes,
-        .export_name = epilogue.exportForActivation(activation),
+        .body_bytes = eff_body,
+        .export_name = resolved_export orelse epilogue.exportForActivation(activation),
         .binary_body = binary_body,
+        .ctx_json = ctx_json,
+        .result = fetch_result,
     });
 
     const full_src = try std.mem.concatWithSentinel(a, u8, &.{ entry_src, epi }, 0);
@@ -489,6 +540,17 @@ fn statusOf(a: std.mem.Allocator, replay_json: []const u8) ?i64 {
         if (jInt(r.object, "status")) |s| return s;
     };
     return null;
+}
+
+/// Extract the threaded ctx from a trigger_payload envelope. A continuation
+/// resume parks the ctx as `{"ctx": <value>}` (`worker_drain.zig` synthCtxBody);
+/// return the inner value re-serialized as JSON text (→ `request.ctx`). null
+/// when the payload isn't a ctx envelope (e.g. a raw inbound body).
+fn extractCtx(a: std.mem.Allocator, envelope: []const u8) ?[]const u8 {
+    const p = std.json.parseFromSlice(std.json.Value, a, envelope, .{}) catch return null;
+    if (p.value != .object) return null;
+    const c = p.value.object.get("ctx") orelse return null;
+    return std.json.Stringify.valueAlloc(a, c, .{}) catch null;
 }
 
 // ── json read/write helpers ──

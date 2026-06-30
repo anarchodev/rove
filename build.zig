@@ -1236,6 +1236,12 @@ pub fn build(b: *std.Build) void {
     const driver_smoke_exe = b.addExecutable(.{ .name = "replay-driver-smoke", .root_module = driver_smoke_mod });
     const driver_smoke_step = b.step("replay-driver-smoke", "Native replay driver end-to-end smoke (Phase 2 §2c)");
     driver_smoke_step.dependOn(&b.addRunArtifact(driver_smoke_exe).step);
+    // A second process (root.run is one-shot): the non-inbound (fetch_chunk)
+    // replay — ctx + flattened fetch result from the trigger_payload +
+    // fetch_responses channels.
+    const driver_smoke_fetch = b.addRunArtifact(driver_smoke_exe);
+    driver_smoke_fetch.addArg("fetch");
+    driver_smoke_step.dependOn(&driver_smoke_fetch.step);
 
     // ── rewind: the OIDC customer CLI (docs/plans/rewind-cli-plan.md §6, Track 3).
     // The customer-shippable half of the split — carries an OIDC session

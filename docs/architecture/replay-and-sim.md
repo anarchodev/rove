@@ -149,7 +149,19 @@ every activation runnable. Three gaps, in priority order:
   Faithful replay of callbacks therefore needs a **recording-side** change:
   persist the export actually invoked (it is an input per L3/§2.5). *(Recording-side fix.)*
 
-The current driver is therefore faithful for **`inbound`/`default` only**.
+**Update 2026-06-30 — G1 closed, G2 closed for the no-`{to}` case.** The driver
+now decodes `trigger_payload` (the `{"ctx": …}` envelope → `request.ctx`) and
+`fetch_responses` (→ the flattened `request.status/.ok/.done/.fetchId` + body),
+and resolves a `fetch_chunk`'s export by event shape (`onFetchResult` /
+`onFetchChunk` / `onFetchDone`); `pull` carries the two channels. So a callback
+activation replays faithfully **as long as it used its conventional export**.
+What remains of **G3**: a `{to}` override is still unrecorded, so an overridden
+callback replays under its conventional export — closing that needs the
+recording to persist the dispatch target (a worker-side change). Inline-bytes
+only — a fetch result whose bytes are a `BodyRef` to a readset blob isn't
+fetchable offline. *Verified against a programmatically-built fixture
+(`replay-driver-smoke fetch`); end-to-end validation against a real worker
+recording is the open gate.*
 
 ## 6. Implications for the sim / export-fixture plan
 
