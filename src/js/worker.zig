@@ -2413,6 +2413,18 @@ pub fn Worker(comptime opts: Options) type {
             var release_ws = kv_mod.WriteSet.init(allocator);
             defer release_ws.deinit();
             try release_ws.addPut("_deploy/current", hex);
+            // Release history: per-tenant `_release/{ts_ms:020}` → `{id:016x}`,
+            // the SAME record the HTTP `/_system/release` path writes — so the
+            // history (read by `/v1/history` → `rewind deployments`) is populated
+            // no matter which release path flipped the pointer (root HTTP or this
+            // JS `platform.releases.publish`). Lex-ordered by ts for a newest-
+            // first reverse scan.
+            var ts_buf: [20]u8 = undefined;
+            const ts_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
+            const ts_str = std.fmt.bufPrint(&ts_buf, "{d:0>20}", .{ts_ms}) catch unreachable;
+            var rk_buf: [32]u8 = undefined;
+            const release_key = std.fmt.bufPrint(&rk_buf, "_release/{s}", .{ts_str}) catch unreachable;
+            try release_ws.addPut(release_key, hex);
             try self.applyTargetWrite(allocator, inst, target_id, &release_ws);
 
             if (self.node.deploy.deployment_loader) |loader| {

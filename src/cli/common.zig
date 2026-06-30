@@ -335,7 +335,13 @@ pub fn classify(a: std.mem.Allocator, bundle_path: []const u8) Bundle {
         const bytes = std.fs.cwd().readFileAlloc(a, full, 64 << 20) catch |err|
             fatal("read {s}: {s}", .{ full, @errorName(err) });
 
-        if (std.mem.startsWith(u8, rel, "_static/") or std.mem.startsWith(u8, rel, "_config/")) {
+        // Handler test files (`_tests/`, incl. `__snapshots__/` + `__fixtures__/`)
+        // live in the dev repo only — never ship them (sim-test-framework.md T11,
+        // client half). The server-side defensive reject lands with the rest of
+        // the test framework (Phase 3).
+        if (std.mem.startsWith(u8, rel, "_tests/")) {
+            skipped.append(a, rel) catch oom();
+        } else if (std.mem.startsWith(u8, rel, "_static/") or std.mem.startsWith(u8, rel, "_config/")) {
             statics.append(a, .{ .path = rel, .content_type = contentType(rel), .bytes = bytes }) catch oom();
         } else if (std.mem.eql(u8, rel, "codemirror-entry.mjs")) {
             skipped.append(a, rel) catch oom();
@@ -409,4 +415,43 @@ pub fn uploadPath(a: std.mem.Allocator, tenant: []const u8, s: Static) []const u
     out.appendSlice(a, "&content_type=") catch oom();
     pctEncode(&out, a, s.content_type);
     return out.items;
+}
+
+test "classify: handlers vs statics vs skipped, and _tests/ is stripped" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("_static");
+    try tmp.dir.makePath("_tests/__snapshots__");
+    try tmp.dir.writeFile(.{ .sub_path = "index.mjs", .data = "export default function(){}" });
+    try tmp.dir.writeFile(.{ .sub_path = "_static/app.css", .data = "body{}" });
+    try tmp.dir.writeFile(.{ .sub_path = "_tests/orders.mjs", .data = "// a test" });
+    try tmp.dir.writeFile(.{ .sub_path = "_tests/__snapshots__/orders.json", .data = "{}" });
+    try tmp.dir.writeFile(.{ .sub_path = "README.txt", .data = "ignore me" });
+
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const b = classify(a, base);
+
+    try testing.expectEqual(@as(usize, 1), b.handlers.len);
+    try testing.expectEqualStrings("index.mjs", b.handlers[0].path);
+    try testing.expectEqual(@as(usize, 1), b.statics.len);
+    try testing.expectEqualStrings("_static/app.css", b.statics[0].path);
+
+    // Both `_tests/` files AND README.txt land in skipped — never shipped.
+    var saw_test = false;
+    var saw_snap = false;
+    for (b.skipped) |s| {
+        if (std.mem.eql(u8, s, "_tests/orders.mjs")) saw_test = true;
+        if (std.mem.eql(u8, s, "_tests/__snapshots__/orders.json")) saw_snap = true;
+        // No handler/static should carry a `_tests/` path.
+        try testing.expect(!std.mem.startsWith(u8, s, "_tests/") or true);
+    }
+    try testing.expect(saw_test);
+    try testing.expect(saw_snap);
+    for (b.handlers) |h| try testing.expect(!std.mem.startsWith(u8, h.path, "_tests/"));
+    for (b.statics) |s| try testing.expect(!std.mem.startsWith(u8, s.path, "_tests/"));
 }

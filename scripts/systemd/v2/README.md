@@ -1,138 +1,37 @@
-# V2 systemd units — production deploy
+# V2 systemd env templates
 
-User-scoped systemd units for the V2 three-process stack, **replacing the
-retired V1 four-binary units** (`loop46`/files/log/sse, deleted at this commit).
-Topology, spec, and the full runbook: [`docs/plans/v2-production-deploy-plan.md`](../../../docs/plans/v2-production-deploy-plan.md).
+The V2 stack is **four** co-located processes per host:
 
-## The 3 processes (co-located, per host)
-
-| Unit | Binary | Listens | Role |
-|---|---|---|---|
-| `rewind-cp.service` | `rewind-cp` | `:9090` + raft `:9101` | directory raft + `/_control` + `/_cp` |
-| `rewind-worker.service` | `rewind-worker` | `:8443` h2c + raft `:8501` | DP multi-raft + JS dispatch |
-| `rewind-front.service` | `rewind-front` | `:443` + `:80` | stateless public TLS edge |
-
-Start order is encoded via `After=`/`Wants=`: **cp → worker → front**.
-
-## First-time install (per host)
-
-Host bootstrap (deploy user, runtime libs, the root-level one-time steps
-below, firewall) is automated by
-[`scripts/ovh-post-install.sh`](../../ovh-post-install.sh) — feed it to the
-OVH installer as the post-installation script. The steps here pick up from
-there (binaries, env/secrets, units, TLS); on a bootstrapped host, steps 5–6's
-root parts are already done.
-
-```bash
-# 1. binaries (or just run scripts/deploy.sh from your workstation)
-zig build rewind-worker rewind-cp rewind-front -Doptimize=ReleaseFast
-install -D -m0755 zig-out/bin/rewind-worker ~/.local/bin/rewind-worker
-install -D -m0755 zig-out/bin/rewind-cp    ~/.local/bin/rewind-cp
-install -D -m0755 zig-out/bin/rewind-front ~/.local/bin/rewind-front
-
-# 2. env (secrets — chmod 0600; NOT pushed by deploy.sh)
-#    ONE profile (cold-multi) for both genesis and rolling — see below.
-install -D -m0600 scripts/systemd/v2/common.env.example ~/.config/rove/common.env
-install -D -m0600 scripts/systemd/v2/node.env.example   ~/.config/rove/node.env
-$EDITOR ~/.config/rove/common.env   # S3 creds, secrets, topology, suffixes
-$EDITOR ~/.config/rove/node.env     # this host's REWIND_NODE_ID / _CP_NODE_ID
-
-# 3. units
-install -D -m0644 scripts/systemd/v2/rewind-cp.service     ~/.config/systemd/user/rewind-cp.service
-install -D -m0644 scripts/systemd/v2/rewind-worker.service ~/.config/systemd/user/rewind-worker.service
-install -D -m0644 scripts/systemd/v2/rewind-front.service  ~/.config/systemd/user/rewind-front.service
-
-# 4. TLS: drop the platform wildcard cert/key
-install -D -m0644 platform.crt ~/.rove/tls/platform.crt
-install -D -m0600 platform.key ~/.rove/tls/platform.key
-
-# 5. privileged ports for the front (one-time, recommended):
-echo 'net.ipv4.ip_unprivileged_port_start=80' | sudo tee /etc/sysctl.d/99-rove.conf
-sudo sysctl --system
-
-# 6. linger (so units run without an active login) + enable
-loginctl enable-linger "$USER"
-systemctl --user daemon-reload
-systemctl --user enable --now rewind-cp.service rewind-worker.service rewind-front.service
-```
-
-## Private plane (vRack) — one-time, before the env files are real
-
-The `10.0.0.x` addresses in `common.env.example` live on the OVH vRack
-between the 3 hosts. The post-install firewall ships with those ports
-closed; this step opens them peer-to-peer.
-
-1. Activate a vRack (free with the servers) and attach each server's
-   **private** network interface to it — OVH Manager → Bare Metal Cloud →
-   vRack → add the 3 servers — or via the API
-   ([`scripts/ovh-api.py`](../../ovh-api.py)).
-2. On each host, as root, with that host's IP and the other two as peers:
-
-   ```bash
-   sudo scripts/vrack-setup.sh 10.0.0.1/24 10.0.0.2,10.0.0.3   # bhs-1
-   ```
-
-   This configures the private NIC (static, no gateway — vRack is plain
-   L2) and opens the §2.5 private-plane ports (8443/8501/9090/9101 + 443
-   tenant door) to the two peers on that NIC only.
-3. Verify from each host: `ping 10.0.0.N` for both peers, and from
-   *outside* confirm the public IP still answers only 22/80/443. The
-   nftables peer rule is the **sole** security boundary for these ports
-   (no app-layer auth — deploy plan §2.5).
-
-## Genesis vs rolling: two modes, ONE profile
-
-A cluster is brought up **once from empty** (genesis), then **upgraded in place**
-(rolling). Both run the **same cold-multi env** (`common.env.example` +
-`node.env.example`) — every node carries the full static voter/peer set
-(`REWIND_VOTERS`/`REWIND_PEERS`, `REWIND_CP_VOTERS`/`_PEERS`) and each raft group
-is born with all N voters and elects on its own. There is no self-only profile
-and no grow step: the modes differ only in what `deploy.sh` *does*, not in the
-env.
-
-| | Genesis (`deploy.sh --genesis`) | Rolling (`deploy.sh`) |
+| Binary | Listens | Role |
 |---|---|---|
-| Cluster state | virgin / wiped (no data, no leader) | formed (data + a leader) |
-| What it does | wipe → start all together → cold-form → provision `__admin__` | quorum-safe one-at-a-time binary swap, data preserved |
-| Membership | every group born `{1,2,3}` cold-multi | unchanged |
+| `rewind-cp` | `:9090` + raft `:9101` | directory raft + `/_control` + `/_cp` |
+| `rewind-worker` | `:8443` h2c + raft `:8501` | DP multi-raft + JS dispatch |
+| `rewind-front` | `:443` + `:80` | stateless public TLS edge |
+| `rewind-logs` | `127.0.0.1:8444` h2c + metrics `:9113` | request-log / tape indexer + query API (per-node, S3-fed) |
 
-The membership **reconciler stays OFF** (`REWIND_CP_RECONCILE_MEMBERSHIP` unset);
-cold-multi groups never need growing. It is re-armed only for deliberate ops
-(a DR async-learner add); tenant **moves** are a separate path (`rewind-ops
-move`), unaffected.
+## Where the units live
 
-### Cold genesis bring-up (from empty / after a wipe)
+The **live systemd unit files were moved to the private operator repo**
+(`rewind-infra`, `systemd/`), alongside the per-cluster env + secrets that
+drive them, and are pushed to the nodes by that repo's `scripts/push-config.sh`
+(`~/.config/systemd/user/` + `daemon-reload`). The unit files are
+operator-neutral `%h`-specifier templates with no secrets, so nothing
+deploy-specific leaks — they simply live next to the config that parameterizes
+them.
 
-Install **binaries** + the **`*.example`** env (steps 1–4 above) + units on all 3
-hosts, then drive it from your workstation with one command:
+This repo (public) keeps:
+- the **env templates** here — [`common.env.example`](common.env.example) +
+  [`node.env.example`](node.env.example) — the documented, secret-free
+  reference for every variable each binary reads;
+- the **build engine**, [`scripts/build.sh`](../../build.sh) (builds the deploy
+  binaries incl. `rewind-logs` + the test gate → `zig-out/bin`). The **deploy**
+  (ship + restart, rolling/genesis) moved to the private infra repo's
+  `scripts/deploy.sh`, which calls `build.sh`;
+- the full runbook,
+  [`docs/plans/v2-production-deploy-plan.md`](../../../docs/plans/v2-production-deploy-plan.md).
 
-```bash
-scripts/deploy.sh --genesis
-```
+## Self-hosting
 
-It builds + runs the test gate, then (guarded — it refuses if a directory leader
-is already present): wipes `~/.rove/data` on all hosts, starts every `rewind-cp`
-**together** so the cold-multi directory group reaches quorum + elects, starts the
-workers + fronts, and runs `rewind-ops genesis` (register node addresses →
-provision `__admin__` born `{1,2,3}` → deploy the baked app). Idempotent on the
-operator side. Then provision + publish the rest (`rewind-ops provision …`,
-`rewind-ops deploy … --release`, or `scripts/publish_firstparty.py`).
-
-## Ongoing deploys (rolling)
-
-Use [`scripts/deploy.sh`](../../deploy.sh) from your workstation — it builds,
-runs the test gate, and does a quorum-safe rolling restart across all 3 nodes
-(one at a time, health-gated). It pushes **binaries only**; env/secrets are
-provisioned out-of-band by the steps above. Use this on a cluster that is already
-up (it refuses on a virgin one and points you at `--genesis`).
-
-## Notes
-
-- **`%h` is NOT expanded inside the env files** (systemd `EnvironmentFile` is
-  plain `KEY=VALUE`). Anything needing the home dir (data dirs, TLS paths) is set
-  via `Environment=` in the unit, where specifiers do expand.
-- **The private plane has no app-layer auth** (raft `:8501`/`:9101`, worker
-  `:8443` h2c). Firewall those to the 3 nodes only — see the security note in the
-  plan §2.5, and set strong `REWIND_MOVE_SECRET` + `REWIND_ROOT_TOKEN`.
-- **Resource directives** (`CPUWeight`/`MemoryHigh`) need cgroup-v2 controller
-  delegation to the user manager to take effect; they're harmless if ignored.
+A standalone, operator-neutral **self-host guide** (with example unit files +
+env + the full bring-up) lives at `docs/guides/self-host.md` — start there if
+you're running rove outside our deploy.

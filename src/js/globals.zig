@@ -1529,13 +1529,31 @@ fn jsPlatformReleasesPublish(
     const tenant_id = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
     defer state.allocator.free(tenant_id);
 
-    var dep_id_f64: f64 = 0;
-    if (c.JS_ToFloat64(ctx, &dep_id_f64, argv[1]) < 0) return js_exception;
-    if (dep_id_f64 < 1 or dep_id_f64 > @as(f64, @floatFromInt(std.math.maxInt(u64)))) {
-        _ = c.JS_ThrowRangeError(ctx, "platform.releases.publish: dep_id must be a positive integer");
-        return js_exception;
+    // dep_id is a sha256-derived u64 (computeDeploymentId), routinely > 2^53, so
+    // a JS number loses precision (JS_ToFloat64). Prefer a HEX STRING — parsed to
+    // an exact u64 here — and keep the number path only as back-compat for the
+    // (small-id) legacy callers.
+    var dep_id: u64 = undefined;
+    if (c.JS_IsString(argv[1])) {
+        const s = valueToOwnedString(state, ctx, argv[1]) catch return js_exception;
+        defer state.allocator.free(s);
+        dep_id = std.fmt.parseInt(u64, s, 16) catch {
+            _ = c.JS_ThrowRangeError(ctx, "platform.releases.publish: dep_id string must be a hex u64");
+            return js_exception;
+        };
+        if (dep_id < 1) {
+            _ = c.JS_ThrowRangeError(ctx, "platform.releases.publish: dep_id must be a positive integer");
+            return js_exception;
+        }
+    } else {
+        var dep_id_f64: f64 = 0;
+        if (c.JS_ToFloat64(ctx, &dep_id_f64, argv[1]) < 0) return js_exception;
+        if (dep_id_f64 < 1 or dep_id_f64 > @as(f64, @floatFromInt(std.math.maxInt(u64)))) {
+            _ = c.JS_ThrowRangeError(ctx, "platform.releases.publish: dep_id must be a positive integer");
+            return js_exception;
+        }
+        dep_id = @intFromFloat(dep_id_f64);
     }
-    const dep_id: u64 = @intFromFloat(dep_id_f64);
 
     fn_ptr(fn_ctx, state.allocator, tenant_id, dep_id) catch |err| switch (err) {
         error.InstanceNotFound => {

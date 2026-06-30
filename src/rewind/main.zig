@@ -103,6 +103,16 @@ const WorkerCtx = struct {
     move_secret: ?[]const u8,
     cluster_id: ?[]const u8,
     cp_urls: []const []const u8,
+    /// Worker→log-server batch-push base (`REWIND_LOG_PUBLIC_BASE`, default the
+    /// internal base). Null disables push; the log-server's LIST poll is the
+    /// catch-up. Enables the worker's batch-pushed fast-path (off the main loop,
+    /// on the dedicated push thread).
+    log_public_base: ?[]const u8,
+    /// Services-JWT HMAC secret the push thread mints its bearer token with
+    /// (the log-server verifies the same secret). Distinct from
+    /// `node_state.services_jwt_secret` (the door-read copy) — the worker config
+    /// needs its own, or `sendPushChunk` short-circuits and push never fires.
+    services_jwt_secret: ?[]const u8,
     /// Peer HTTP base URLs indexed by raft id − 1 (`REWIND_PEER_URLS`) — the
     /// leader-push target for the out-of-band snapshot catch-up driver. Empty
     /// (single-node / unset) → the catch-up thread logs + no-ops any job.
@@ -263,6 +273,8 @@ fn workerMain(args: *WorkerCtx) !void {
         .move_secret = args.move_secret,
         .cluster_id = args.cluster_id,
         .cp_urls = args.cp_urls,
+        .log_public_base = args.log_public_base,
+        .services_jwt_secret = args.services_jwt_secret,
     });
     defer worker.destroy();
 
@@ -707,6 +719,14 @@ pub fn main() !void {
     // slash, e.g. `http://127.0.0.1:9000`). Env memory lives for the process,
     // so no dup/free.
     const log_internal_base: ?[]const u8 = std.posix.getenv("REWIND_LOG_INTERNAL_BASE");
+    // Push target for the worker→log-server batch fast-path. For the single
+    // cluster-scoped log-server (docs/architecture/deployment-and-logs.md) this
+    // is the same address as the query door, so it defaults to the internal
+    // base — setting REWIND_LOG_INTERNAL_BASE enables push too. Unset both →
+    // push disabled, poll is the only path. (NB: a single base is only coherent
+    // for ONE shared log-server; N independent per-node indexers would need
+    // fan-out, not a single base — see the deployment notes.)
+    const log_public_base: ?[]const u8 = std.posix.getenv("REWIND_LOG_PUBLIC_BASE") orelse log_internal_base;
 
     // Blob backend (fs or s3) — process-wide, env-selected.
     var blob_owned = try blob_mod.env.loadFromEnv(allocator);
@@ -923,6 +943,8 @@ pub fn main() !void {
         .move_secret = move_secret,
         .cluster_id = cluster_id,
         .cp_urls = cp_urls,
+        .log_public_base = log_public_base,
+        .services_jwt_secret = services_jwt_secret,
         .peer_urls = peer_urls,
         .ready = &ready,
         .metrics = metrics_srv,

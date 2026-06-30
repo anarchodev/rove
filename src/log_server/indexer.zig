@@ -21,13 +21,17 @@
 //!
 //! `docs/logs-plan.md` §4.3 sketches an `S3 LIST --start-after last`
 //! optimization. The `_logs/{node}/{batch}` key shape IS lex-monotonic
-//! per node (batch_id leads with the monotonic first-request-id, so it
-//! never goes backward even under clock skew), so a PER-NODE cursor is
-//! sound — a new batch always sorts after the node's cursor, and a key
-//! written while the indexer was down is picked up on resume. The
-//! cluster-wide cursor that the old full-scan avoided was fragile only
-//! because a fresh node could emit a key sorting earlier than it; one
-//! cursor per node removes that hazard.
+//! per node because the batch_id leads with the FLUSH-TIME nanos
+//! (`flush_writer.writeBatch`): the per-node flusher runs sequentially,
+//! so a later flush always sorts after an earlier one regardless of
+//! which tenants' records it carries, and the ordering survives process
+//! restarts (wall clock, not a volatile counter). This is load-bearing:
+//! batches are per-node but `request_id` is per-tenant, so a
+//! request-id-first key would NOT be monotonic — a new tenant's id-1
+//! batch flushed after a busy tenant advanced the cursor would sort
+//! before it and be skipped forever. With time-first keys a PER-NODE
+//! cursor is sound — a new batch always sorts after the node's cursor,
+//! and a key written while the indexer was down is picked up on resume.
 //!
 //! Node discovery is a skip-scan over `_logs/` (`listNodePrefixes`):
 //! list one key, extract its `_logs/{node}/` prefix, jump the cursor
@@ -59,8 +63,21 @@ const std = @import("std");
 const batch_store_mod = @import("batch_store.zig");
 const index_db_mod = @import("index_db.zig");
 const sidecar = @import("sidecar.zig");
+const metrics_mod = @import("metrics.zig");
 
 const NDJSON_SUFFIX: []const u8 = ".ndjson";
+
+/// Clock-skew buffer for the per-node cursor. Batch keys lead with the
+/// worker's flush-time nanos, so the per-node `start-after` cursor is sound
+/// AS LONG AS that node's clock never jumps backward relative to a prior
+/// flush. Across an NTP `makestep` or a node identity moving to fresh
+/// hardware, a batch can land with a flush_ns slightly below the cursor and
+/// be skipped. To cover that, the persisted cursor is held back from the true
+/// max by this margin, so each poll re-LISTs the trailing window; batches
+/// already indexed are skipped via the durable `batches` PK (a sqlite lookup,
+/// not an object GET), so the buffer costs LIST calls, not re-reads. 30 s
+/// comfortably covers NTP drift/step; tune up for fleets with looser clocks.
+pub const CURSOR_LAG_NS: i64 = 30 * std.time.ns_per_s;
 
 /// Initial Range-GET length when reading the embedded sidecar header.
 /// Sidecars at 1024 records × ~250 bytes/record JSON ≈ 256 KB. 512 KB
@@ -81,6 +98,9 @@ pub const Stats = struct {
     records_indexed: u32 = 0,
     skipped_non_sidecars: u32 = 0,
     skipped_invalid: u32 = 0,
+    /// Keys re-LISTed inside the clock-skew buffer that were already indexed
+    /// (skipped via the `batches` PK without an object GET).
+    skipped_already: u32 = 0,
 };
 
 /// Root prefix every batch key lives under: `_logs/{node}/{batch}.ndjson`.
@@ -108,12 +128,13 @@ pub fn pollOnce(
     return stats;
 }
 
-/// Catch one node up: page `node_prefix` strictly after the node's
-/// persisted cursor (`_meta` key `cursor:{node_prefix}`), index each
-/// `.ndjson` batch, and persist the advanced cursor after every page so
-/// a crash mid-catch-up resumes where it left off. The cursor advances
-/// to the last LISTed key even past a read failure — see the module doc
-/// for why that's safe (push path recovers transient misses).
+/// Catch one node up: page `node_prefix` after the node's persisted cursor
+/// (`_meta` key `cursor:{node_prefix}`) and index each new `.ndjson` batch.
+/// The persisted cursor is held back from the true max by `CURSOR_LAG_NS`
+/// (the clock-skew buffer), so each poll re-LISTs the trailing window;
+/// already-indexed batches in it are skipped via the durable `batches` PK
+/// without an object GET. The floor is persisted after every page (monotonic,
+/// never backward) so a crash mid-catch-up resumes where it left off.
 fn pollNode(
     allocator: std.mem.Allocator,
     store: batch_store_mod.BatchStore,
@@ -125,12 +146,23 @@ fn pollNode(
     const meta_key = try cursorMetaKey(allocator, node_prefix);
     defer allocator.free(meta_key);
 
-    var cursor: []u8 = (db.getMeta(meta_key) catch return Error.Sqlite) orelse
+    // node_id = the segment between `_logs/` and the trailing `/`.
+    const node_id = node_prefix[LOGS_PREFIX.len .. node_prefix.len - 1];
+
+    // The in-loop paging cursor (real keys, for forward progress through
+    // pages). Seeded from the persisted cursor, which lags the true max by
+    // CURSOR_LAG_NS — so we re-LIST the trailing clock-skew window each poll.
+    var list_cursor: []u8 = (db.getMeta(meta_key) catch return Error.Sqlite) orelse
         try allocator.dupe(u8, "");
-    defer allocator.free(cursor);
+    defer allocator.free(list_cursor);
+
+    // The highest lagged-floor persisted this poll; guards against ever
+    // moving the persisted cursor backward.
+    var floor: []u8 = try allocator.dupe(u8, list_cursor);
+    defer allocator.free(floor);
 
     while (true) {
-        const keys = store.list(node_prefix, cursor, page_size, allocator) catch
+        const keys = store.list(node_prefix, list_cursor, page_size, allocator) catch
             return Error.BatchStore;
         defer batch_store_mod.freeListResult(allocator, keys);
         if (keys.len == 0) break;
@@ -139,6 +171,15 @@ fn pollNode(
             if (!std.mem.endsWith(u8, key, NDJSON_SUFFIX)) {
                 stats.skipped_non_sidecars += 1;
                 continue;
+            }
+            // Cursor-lag re-list: skip a batch already in the durable `batches`
+            // index without paying an object GET (this is what makes the
+            // clock-skew buffer cheap — LIST calls, not re-reads).
+            if (batchIdOf(node_prefix, key)) |bid| {
+                if (db.batchIndexed(node_id, bid) catch false) {
+                    stats.skipped_already += 1;
+                    continue;
+                }
             }
             stats.sidecars_seen += 1;
 
@@ -158,17 +199,60 @@ fn pollNode(
             stats.records_indexed += @intCast(idx.records.len);
         }
 
-        // Advance + persist the cursor to the last LISTed key so the
-        // next page (and the next pass, and a restart) resumes here.
         const last_key = keys[keys.len - 1];
-        const new_cursor = try allocator.dupe(u8, last_key);
-        allocator.free(cursor);
-        cursor = new_cursor;
-        db.setMeta(meta_key, cursor) catch return Error.Sqlite;
+
+        // Advance the paging cursor to the last LISTed key (forward progress).
+        const advanced = try allocator.dupe(u8, last_key);
+        allocator.free(list_cursor);
+        list_cursor = advanced;
+
+        // Persist the LAGGED floor so the NEXT poll re-lists the trailing
+        // window. Falls back to the exact key when the batch_id isn't the
+        // production ns-first shape (e.g. test fixtures → no buffer). Never
+        // moves backward (monotonic across polls + crash-resume).
+        const next_floor: []u8 = (try laggedCursor(allocator, node_prefix, last_key)) orelse
+            try allocator.dupe(u8, last_key);
+        if (std.mem.order(u8, next_floor, floor) == .gt) {
+            db.setMeta(meta_key, next_floor) catch {
+                allocator.free(next_floor);
+                return Error.Sqlite;
+            };
+            allocator.free(floor);
+            floor = next_floor;
+        } else {
+            allocator.free(next_floor);
+        }
 
         // Short page → caught up for this node.
         if (keys.len < page_size) break;
     }
+}
+
+/// The `{batch_id}` segment of `_logs/{node}/{batch_id}.ndjson` (borrowed),
+/// or null if the key doesn't match that shape.
+fn batchIdOf(node_prefix: []const u8, key: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, key, node_prefix)) return null;
+    if (!std.mem.endsWith(u8, key, NDJSON_SUFFIX)) return null;
+    const start = node_prefix.len;
+    const end = key.len - NDJSON_SUFFIX.len;
+    if (end <= start) return null;
+    return key[start..end];
+}
+
+/// A persisted-cursor floor that lags `max_key` by `CURSOR_LAG_NS` in the
+/// flush-time dimension. `{node_prefix}{floor_ns:020}-` sorts just below any
+/// real key whose flush_ns >= floor_ns (the trailing `-` precedes any
+/// request-id digit), so `start-after` it re-LISTs the whole window. Returns
+/// null when the batch_id isn't the production `{flush_ns:020}-{request_id:020}`
+/// shape (test fixtures, legacy keys) — the caller then uses the exact key
+/// (no buffer), which is safe because those paths don't depend on it.
+fn laggedCursor(allocator: std.mem.Allocator, node_prefix: []const u8, max_key: []const u8) Error!?[]u8 {
+    const bid = batchIdOf(node_prefix, max_key) orelse return null;
+    const dash = std.mem.indexOfScalar(u8, bid, '-') orelse return null;
+    const ns = std.fmt.parseInt(u64, bid[0..dash], 10) catch return null;
+    const floor_ns = ns -| @as(u64, @intCast(CURSOR_LAG_NS));
+    return std.fmt.allocPrint(allocator, "{s}{d:0>20}-", .{ node_prefix, floor_ns }) catch
+        return Error.OutOfMemory;
 }
 
 /// The `_meta` key under which a node's catch-up cursor is persisted.
@@ -391,9 +475,16 @@ fn threadMain(h: *Handle) void {
 fn runLoop(h: *Handle) !void {
     std.log.info("log-indexer: started", .{});
     while (!h.stop_flag.load(.acquire)) {
-        _ = pollOnce(h.config.allocator, h.config.store, h.config.db, h.config.page_size) catch |err| {
+        if (pollOnce(h.config.allocator, h.config.store, h.config.db, h.config.page_size)) |stats| {
+            metrics_mod.Metrics.add(&metrics_mod.global.batches_indexed, stats.batches_indexed);
+            metrics_mod.Metrics.add(&metrics_mod.global.records_indexed, stats.records_indexed);
+            metrics_mod.Metrics.add(&metrics_mod.global.skipped_already, stats.skipped_already);
+            metrics_mod.Metrics.add(&metrics_mod.global.skipped_invalid, stats.skipped_invalid);
+        } else |err| {
             std.log.warn("log-indexer: pass error: {s}", .{@errorName(err)});
-        };
+            metrics_mod.Metrics.inc(&metrics_mod.global.poll_errors);
+        }
+        metrics_mod.Metrics.inc(&metrics_mod.global.poll_cycles);
         _ = h.passes_completed.fetchAdd(1, .release);
         std.Thread.sleep(@as(u64, h.config.poll_interval_ms) * std.time.ns_per_ms);
     }
@@ -608,6 +699,57 @@ test "pollOnce picks up newly-arrived sidecars across passes" {
     try testing.expectEqual(@as(usize, 2), list.rows.len);
     try testing.expectEqual(@as(u64, 2), list.rows[0].request_id);
     try testing.expectEqual(@as(u64, 1), list.rows[1].request_id);
+}
+
+test "pollOnce clock-skew buffer rescues a late lower-ns batch" {
+    const a = testing.allocator;
+    const m = try batch_store_mod.MemoryBatchStore.init(a);
+    defer m.deinit();
+    const store = m.batchStore();
+    const db_path = try tempDbPath(a, "skew");
+    defer {
+        std.fs.cwd().deleteFile(db_path) catch {};
+        a.free(db_path);
+    }
+    var db = try index_db_mod.IndexDb.open(a, db_path);
+    defer db.close();
+
+    // Production-shaped batch_ids `{flush_ns:020}-{request_id:020}`. First a
+    // recent flush at 100 s…
+    const hi_ns: u64 = 100 * std.time.ns_per_s;
+    const hi_bid = try std.fmt.allocPrint(a, "{d:0>20}-{d:0>20}", .{ hi_ns, @as(u64, 5) });
+    defer a.free(hi_bid);
+    var hi = [_]sidecar.Record{.{
+        .tenant_id = "acme", .request_id = 5, .received_ns = 5000, .duration_ns = 1,
+        .method = "GET", .path = "/hi", .host = "h.test", .status = 200,
+        .outcome = "ok", .deployment_id = 1, .offset = 0, .length = 1,
+    }};
+    try writeSidecar(a, store, "00000001", hi_bid, &hi);
+    const s1 = try pollOnce(a, store, db, 32);
+    try testing.expectEqual(@as(u32, 1), s1.batches_indexed);
+
+    // …then a batch whose node flushed LATE but with a clock 20 s behind (well
+    // within CURSOR_LAG_NS = 30 s), so its key sorts BELOW the cursor's true
+    // max. The old non-lagged cursor would skip it forever; the buffer re-lists
+    // the window and indexes it.
+    const late_ns: u64 = 80 * std.time.ns_per_s;
+    const late_bid = try std.fmt.allocPrint(a, "{d:0>20}-{d:0>20}", .{ late_ns, @as(u64, 3) });
+    defer a.free(late_bid);
+    var late = [_]sidecar.Record{.{
+        .tenant_id = "acme", .request_id = 3, .received_ns = 3000, .duration_ns = 1,
+        .method = "GET", .path = "/late", .host = "h.test", .status = 200,
+        .outcome = "ok", .deployment_id = 1, .offset = 0, .length = 1,
+    }};
+    try writeSidecar(a, store, "00000001", late_bid, &late);
+
+    const s2 = try pollOnce(a, store, db, 32);
+    try testing.expectEqual(@as(u32, 1), s2.batches_indexed); // the late one
+    try testing.expect(s2.skipped_already >= 1); // hi re-listed but not re-read
+
+    // Both records are now indexed.
+    var list = try db.queryList("acme", 0, 0, 0, 10, null, null);
+    defer list.deinit();
+    try testing.expectEqual(@as(usize, 2), list.rows.len);
 }
 
 test "pollOnce skips garbage objects" {

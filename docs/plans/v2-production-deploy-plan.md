@@ -225,6 +225,17 @@ A pre-deploy checklist.
 - [x] **`/deploy` skill** (`.claude/skills/deploy/SKILL.md`) — the approval-gated
   release procedure (§6): show the diff, human go/no-go, run `deploy.sh`,
   validate, tag `prod-deployed`.
+
+> **Update (build/deploy split + unit move, 2026-06):** the above was later
+> restructured. **Building** stays in this (rove) repo as `scripts/build.sh`
+> (binaries + test gate). The **deploy** (`scripts/deploy.sh` — ship + restart,
+> rolling/genesis) and the **live systemd units** moved to the private
+> `rewind-infra` repo (`scripts/deploy.sh` + `systemd/`), which calls
+> `rove/scripts/build.sh` via `ROVE_REPO`. A fourth co-located process,
+> **`rewind-logs`** (per-node request-log indexer, loopback `:8444` + metrics
+> `:9113`), was added to the stack + the deploy. The `/deploy` skill drives the
+> rewind-infra `deploy.sh`. rove keeps the operator-neutral reference: the
+> `*.env.example` templates + `docs/guides/self-host.md` (with example units).
 - [x] **`scripts/rove-cert-deploy.sh`** — the certbot deploy hook for the
   Tier-1 wildcard (§4.1): installs the renewed cert on every front (local +
   ssh peers) + restarts each (front cert hot-reload unproven — §10 open item,
@@ -329,8 +340,9 @@ the plan-tier levers (`architecture/control-plane.md`, shipped) +
 
 A feature is **not done** until all four of these are true. Encoded as the
 **`/deploy` skill** (`.claude/skills/deploy/SKILL.md`) — the approval-gated
-release procedure that wraps `scripts/deploy.sh` behind a mandatory human
-go/no-go, validates, and records the deployed commit (`prod-deployed` git tag).
+release procedure that wraps the deploy (rove `scripts/build.sh` → rewind-infra
+`scripts/deploy.sh`) behind a mandatory human go/no-go, validates, and records
+the deployed commit (`prod-deployed` git tag).
 Matches the locked "deploys stay approval-gated" stance
 (`project_ai_integration_shape`).
 

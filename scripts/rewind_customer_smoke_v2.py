@@ -276,7 +276,11 @@ def main() -> int:
         if dep_id:
             r = c.tls_curl(app_origin + "/v1/instances/custapp/release", method="POST",
                            headers={"Cookie": cli_cookie, "content-type": "application/json"},
-                           data=json.dumps({"dep_id": int(dep_id, 16)}))
+                           # dep_id rides as a hex STRING: sha256-derived dep_ids
+                           # exceed 2^53, so a JSON number would round at parse
+                           # time and release the wrong deployment (admin
+                           # publishRelease validates /^[0-9a-fA-F]{1,16}$/).
+                           data=json.dumps({"dep_id": dep_id}))
             check("CLI release own tenant → 202 queued", r.status == 202,
                   f"got {r.status} {r.body[:120]!r}")
 

@@ -195,6 +195,23 @@ pub const IndexDb = struct {
         return setMetaInTxn(self.db, key, value);
     }
 
+    /// True if `(node_id, batch_id)` is already recorded in `batches`. The
+    /// indexer's cursor-lag buffer re-LISTs a trailing clock-skew window each
+    /// poll; this PK lookup lets it skip re-GETting a batch it already indexed,
+    /// so the buffer costs LIST calls, not redundant object reads.
+    pub fn batchIndexed(self: *IndexDb, node_id: []const u8, batch_id: []const u8) Error!bool {
+        var st: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, "SELECT 1 FROM batches WHERE node_id = ? AND batch_id = ? LIMIT 1", -1, &st, null) != c.SQLITE_OK)
+            return Error.Sqlite;
+        defer _ = c.sqlite3_finalize(st);
+        bindText(st.?, 1, node_id);
+        bindText(st.?, 2, batch_id);
+        const rc = c.sqlite3_step(st);
+        if (rc == c.SQLITE_ROW) return true;
+        if (rc == c.SQLITE_DONE) return false;
+        return Error.Sqlite;
+    }
+
     /// Total indexed records for `tenant_id`. Cheap because the
     /// (tenant_id, received_ns DESC) primary index makes the count a
     /// covering scan. Used by `/v1/{tenant}/count` so dashboards can

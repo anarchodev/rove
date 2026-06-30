@@ -479,14 +479,18 @@ pub fn flushLogs(worker: anytype) !void {
 
     var node_buf: [8]u8 = undefined;
     const node_id_hex = std.fmt.bufPrint(&node_buf, "{x:0>8}", .{worker.raft.config.node_id}) catch unreachable;
-    const flush_unix_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
+    // Nanos (not millis): the PRIMARY sort component of the batch key, so
+    // the indexer's per-node `start-after` cursor never skips a late batch
+    // (flush-time-first ordering — see `flush_writer.writeBatch`). The
+    // flusher thread is sequential, so ns is strictly increasing per node.
+    const flush_unix_ns: i64 = @intCast(std.time.nanoTimestamp());
 
     const batch_key_opt = log_server_mod.flush_writer.writeBatch(
         allocator,
         worker.log_batch_store,
         node_id_hex,
         records,
-        flush_unix_ms,
+        flush_unix_ns,
     ) catch |err| blk: {
         std.log.warn(
             "rove-js flushLogs: writeBatch ({d} records) failed: {s}",

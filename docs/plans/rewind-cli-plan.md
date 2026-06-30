@@ -13,13 +13,16 @@ good shape:
 | | Platform binaries | Tenant content |
 |---|---|---|
 | What ships | `rewind` / `rewind-cp` / `rewind-front` | a tenant's handler bundle + statics |
-| Driver | `scripts/deploy.sh` (the `/deploy` skill) | `scripts/publish_tenant.py` (the `/publish` skill) |
+| Driver | rove `scripts/build.sh` → rewind-infra `scripts/deploy.sh` (the `/deploy` skill) | `scripts/publish_tenant.py` (the `/publish` skill) |
 | Cadence | rare (engine changes) | every site/handler edit |
 | Reaches | the 3 hosts over SSH + systemctl | S3 + CP + a worker over the private plane |
 
-`deploy.sh` is mature: build → test gate → rolling one-host-at-a-time
-restart (cp → worker → front) with health/leader probes between each,
-aborting if a node fails to rejoin quorum. **It stays as-is.** It is
+The deploy is mature: build (rove `scripts/build.sh`, ReleaseFast + test gate)
+→ ship + rolling one-host-at-a-time restart (cp → worker → front → logs) with
+health/leader probes between each, aborting if a node fails to rejoin quorum.
+(Since this plan was written, building/deploying split across two repos and the
+systemd units + `scripts/deploy.sh` moved to the private rewind-infra repo;
+`rewind-logs` joined the stack. See `docs/guides/self-host.md`.) It is
 infra orchestration, not a tenant operation, and a CLI should not absorb
 it.
 

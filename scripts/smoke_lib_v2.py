@@ -258,6 +258,7 @@ class V2Cluster:
               cluster_id: str = "cluster-1",
               unsafe_outbound: bool = True,
               tls_idp: bool = False,
+              tls_cert: str = "", tls_key: str = "",
               genesis: bool = False) -> "V2Cluster":
         if not os.environ.get("S3_ENDPOINT"):
             raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
@@ -272,7 +273,12 @@ class V2Cluster:
         raft_ports = [rbase + i for i in range(nodes)]
         cert_path, key_path = ("", "")
         if tls_idp:
-            cert_path, key_path = _gen_self_signed(f"{tag}-{pid}")
+            # A caller can pass its own cert/key (e.g. with explicit non-wildcard
+            # SANs, needed when a CLIENT verifies the front cert — curl rejects
+            # the default `*.localhost` wildcard as too-broad). Otherwise fall
+            # back to the generic self-signed cert (fine for `-k` callers).
+            cert_path, key_path = (tls_cert, tls_key) if (tls_cert and tls_key) \
+                else _gen_self_signed(f"{tag}-{pid}")
         c = cls(
             tag=tag, cluster_id=cluster_id,
             node_ports=node_ports, raft_ports=raft_ports,
