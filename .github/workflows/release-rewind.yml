@@ -1,0 +1,74 @@
+name: release-rewind
+
+# Build + publish the `rewind` customer CLI for all supported targets.
+# Zig cross-compiles the whole matrix from a single Linux runner — no per-OS
+# runners, no cross-linking (the CLI links only static arenajs + libc and shells
+# out to `curl` at runtime). `zig build rewind` does NOT pull the raft engine, so
+# no Rust toolchain is needed here.
+#
+# Trigger: push a tag like `v0.1.0`, or run manually with a version input.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build + tag the binaries with (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write   # create the GitHub Release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.2   # keep in sync with the repo's Zig (zig version)
+
+      - name: Resolve version
+        id: ver
+        run: echo "version=${{ github.event.inputs.version || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Cross-compile rewind for every target
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # zig target            -> release asset suffix (os-arch)
+          targets="
+            x86_64-linux-musl:linux-x86_64
+            aarch64-linux-musl:linux-aarch64
+            x86_64-macos:macos-x86_64
+            aarch64-macos:macos-aarch64
+            x86_64-windows-gnu:windows-x86_64
+          "
+          for entry in $targets; do
+            zigt="${entry%%:*}"; name="${entry##*:}"
+            echo "::group::build $zigt"
+            zig build rewind -Dtarget="$zigt" -Doptimize=ReleaseFast -Dversion="$VERSION"
+            if [ "${zigt#*windows}" != "$zigt" ]; then
+              cp zig-out/bin/rewind.exe "dist/rewind-${name}.exe"
+            else
+              cp zig-out/bin/rewind "dist/rewind-${name}"
+            fi
+            echo "::endgroup::"
+          done
+          ( cd dist && sha256sum * > SHA256SUMS )
+          # ship the installer alongside the binaries so `latest/download/install.sh` works
+          cp scripts/ops/install-rewind.sh dist/install.sh
+          ls -la dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.version }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
