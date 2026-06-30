@@ -42,11 +42,18 @@ pub const Source = struct { path: []const u8, kind: []const u8, source: []const 
 pub const World = struct {
     entry: []const u8 = "index.mjs",
     activation: []const u8 = "inbound",
+    /// The export to invoke. For a callback (a fetch result, a `{to}`, an
+    /// `onResult`) this is the *resolved* export name — the runtime doesn't
+    /// derive it from the kind (see `architecture/replay-and-sim.md` §2). When
+    /// null, `runWorld` falls back to the conventional export for the kind.
+    export_name: ?[]const u8 = null,
     method: []const u8 = "GET",
     path: []const u8 = "/",
     host: []const u8 = "",
     headers: []const Header = &.{},
-    /// Present iff the world declares a body (handler reads then resolve).
+    /// Present iff the world declares a body (handler reads then resolve). For
+    /// an `inbound` activation this is the request body; for a fetch-result
+    /// activation it is the *response* body (delivered on `request.body`).
     body: ?[]const u8 = null,
     ip: ?[]const u8 = null,
     /// The KV readset as a key→value map.
@@ -57,6 +64,20 @@ pub const World = struct {
     /// Inline handler sources (path/kind/source); empty when `--source-dir`
     /// serves the working tree instead.
     sources: []const Source = &.{},
+
+    // ── non-inbound activation surface (`architecture/replay-and-sim.md` §3) ──
+    /// The threaded `Ctx` → `request.ctx`. JSON text (any value). `undefined`
+    /// on the first activation of a chain.
+    ctx_json: ?[]const u8 = null,
+    /// `request.activation.*` metadata bag (wakes / msg / error / attempts / …).
+    /// JSON text.
+    activation_json: ?[]const u8 = null,
+    /// The flattened fetch/callback result surface — top-level on `request`.
+    status: ?i64 = null,
+    ok: ?bool = null,
+    done: ?bool = null,
+    fetch_id: ?[]const u8 = null,
+    chunk_seq: ?i64 = null,
 };
 
 pub const Error = error{BadWorld} || std.mem.Allocator.Error;
@@ -70,6 +91,10 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
     var w = World{};
     if (jStr(obj, "entry")) |s| w.entry = s;
     if (jStr(obj, "activation")) |s| w.activation = s;
+    if (jStr(obj, "export")) |s| w.export_name = s;
+    if (obj.get("ctx")) |cv| {
+        if (cv != .null) w.ctx_json = try jsonText(a, cv);
+    }
     if (jStr(obj, "missPolicy")) |s| {
         if (std.mem.eql(u8, s, "fail")) {
             w.miss = .fail;
@@ -90,6 +115,20 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
         if (jStr(r, "ip")) |s| w.ip = s;
         if (r.get("body")) |bv| {
             if (bv != .null) w.body = try valueToStr(a, bv);
+        }
+        // Flattened fetch/callback result surface (`request.status` etc.).
+        w.status = jInt(r, "status");
+        if (r.get("ok")) |v| {
+            if (v == .bool) w.ok = v.bool;
+        }
+        if (r.get("done")) |v| {
+            if (v == .bool) w.done = v.bool;
+        }
+        if (jStr(r, "fetchId")) |s| w.fetch_id = s;
+        w.chunk_seq = jInt(r, "chunkSeq");
+        // `request.activation.*` metadata bag.
+        if (r.get("activation")) |av| {
+            if (av != .null) w.activation_json = try jsonText(a, av);
         }
         if (r.get("headers")) |hv| {
             if (hv != .object) return Error.BadWorld;
@@ -136,9 +175,24 @@ fn valueToStr(a: std.mem.Allocator, v: std.json.Value) Error![]const u8 {
     return std.json.Stringify.valueAlloc(a, v, .{}) catch Error.BadWorld;
 }
 
+/// Serialize any JSON value to JSON *text* — unlike `valueToStr`, a string is
+/// quoted (`"hi"`, not `hi`). Used for `ctx` / `request.activation`, which are
+/// injected into the epilogue as JS values and so must be valid JSON literals.
+fn jsonText(a: std.mem.Allocator, v: std.json.Value) Error![]const u8 {
+    return std.json.Stringify.valueAlloc(a, v, .{}) catch Error.BadWorld;
+}
+
 fn jStr(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const v = o.get(key) orelse return null;
     return if (v == .string) v.string else null;
+}
+fn jInt(o: std.json.ObjectMap, key: []const u8) ?i64 {
+    const v = o.get(key) orelse return null;
+    return switch (v) {
+        .integer => v.integer,
+        .float => @intFromFloat(v.float),
+        else => null,
+    };
 }
 fn jU64(o: std.json.ObjectMap, key: []const u8) ?u64 {
     const v = o.get(key) orelse return null;
@@ -200,6 +254,35 @@ test "fromValue: full declarative world" {
         }
     }
     try testing.expect(saw_jess and saw_rate);
+}
+
+test "fromValue: non-inbound (fetch result) surface" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const json =
+        \\{
+        \\  "entry": "h.mjs", "activation": "fetch_chunk", "export": "onUpstream",
+        \\  "request": { "status": 502, "ok": false, "done": true, "fetchId": "ftch_1",
+        \\               "chunkSeq": 3, "body": "boom",
+        \\               "activation": { "attempts": 2, "error": "timeout" } },
+        \\  "ctx": { "attempt": 2 }
+        \\}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    const w = try fromValue(a, parsed.value);
+
+    try testing.expectEqualStrings("fetch_chunk", w.activation);
+    try testing.expectEqualStrings("onUpstream", w.export_name.?); // {to} override
+    try testing.expectEqual(@as(i64, 502), w.status.?);
+    try testing.expectEqual(false, w.ok.?);
+    try testing.expectEqual(true, w.done.?);
+    try testing.expectEqualStrings("ftch_1", w.fetch_id.?);
+    try testing.expectEqual(@as(i64, 3), w.chunk_seq.?);
+    try testing.expectEqualStrings("boom", w.body.?);
+    // ctx + request.activation are JSON *text* (string values would be quoted).
+    try testing.expectEqualStrings("{\"attempt\":2}", w.ctx_json.?);
+    try testing.expectEqualStrings("{\"attempts\":2,\"error\":\"timeout\"}", w.activation_json.?);
 }
 
 test "fromValue: defaults + resolve policy" {

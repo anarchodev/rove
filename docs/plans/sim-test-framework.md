@@ -157,9 +157,27 @@ model demands.
 
 This subsumes the old T7 `--mode strict|what_if|isolated` knob: the world itself
 declares what's present, `--source-dir` is the *code* knob, and `--miss-policy`
-is the *replay↔sim* knob — three knobs, one `run`. Still ahead (T8–T11): the
-`_tests/` runner + `expect`/`snapshot`, `export-fixture` (capture → authored
-world), and the production-strip of `_tests/`.
+is the *replay↔sim* knob — three knobs, one `run`.
+
+**Extended same day to all activation kinds.** A world isn't limited to
+`inbound`: it declares the `activation` kind, the resolved `export` (a callback's
+`{to}`/`onFetchResult`/`onWake`/… name — the runtime resolves this on the wake,
+not from the kind, so the world must carry it; `architecture/replay-and-sim.md`
+§2), the threaded `ctx` (→ `request.ctx`), the flattened fetch/callback result
+under `request` (`status`/`ok`/`done`/`fetchId`/`chunkSeq`, body delivered on
+`request.body`), and a `request.activation` metadata bag (`wakes`/`msg`/…). The
+host's `.map` mode and miss policy are unchanged; the epilogue gained the
+ctx/result/activation installation (null for inbound → the inbound path is
+byte-identical). Verified by `rewind sim` on a `fetch_chunk`→`onFetchResult`
+gateway world and a `wake_batch`→`onWake` SSE-drain world. This is the cheap,
+recording-free half of the replay/sim asymmetry: **sim** of any activation works
+now; **faithful replay** of non-inbound activations still needs the recording to
+persist the dispatch target (`architecture/replay-and-sim.md` §5 G1–G3).
+
+Still ahead (T8–T11): the `_tests/` runner + `expect`/`snapshot`,
+`export-fixture` (capture → authored world; needs the `kvAbsent` set + a
+write-through overlay for within-activation KV), and the production-strip of
+`_tests/`.
 
 ## What already exists
 

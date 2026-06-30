@@ -39,6 +39,26 @@ pub const Opts = struct {
     /// `request.body` is a byte-exact Uint8Array, so the replay body is base64
     /// (binary), not a decoded string.
     binary_body: bool = false,
+
+    // ── non-inbound activation surface (`architecture/replay-and-sim.md` §3) ──
+    /// The threaded `Ctx` as JSON text → `request.ctx`. null on the first
+    /// activation of a chain (and for inbound, which has no ctx).
+    ctx_json: ?[]const u8 = null,
+    /// `request.activation.*` metadata as JSON text (wakes / msg / …).
+    activation_json: ?[]const u8 = null,
+    /// The flattened fetch/callback result → top-level `request.*`.
+    result: ?Result = null,
+};
+
+/// The flattened fetch/callback result surface (handler-shape §7) — the fields
+/// a `request.body` already covers (the bytes) live in `Opts.body_bytes`;
+/// these are the scalar siblings.
+pub const Result = struct {
+    status: ?i64 = null,
+    ok: ?bool = null,
+    done: ?bool = null,
+    fetch_id: ?[]const u8 = null,
+    chunk_seq: ?i64 = null,
 };
 
 /// Mirror `rpc_dispatch.defaultExportForKind` / the mjs `exportForActivation`.
@@ -52,6 +72,13 @@ pub fn exportForActivation(activation: []const u8) []const u8 {
         .{ "ws_message", "onMessage" },
         .{ "inbound_headers", "onHeaders" },
         .{ "inbound_chunk", "onChunk" },
+        // A fetch result's *real* export is the resolved name (onFetchResult /
+        // onFetchChunk / onFetchDone) carried on the wake, not derivable from
+        // the kind (`architecture/replay-and-sim.md` §2). For an authored world
+        // we default to the whole-body case; an explicit `export` overrides for
+        // chunk/done. (At runtime this kind is dispatched by `resolvedExport`,
+        // never this fallback.)
+        .{ "fetch_chunk", "onFetchResult" },
     };
     inline for (map) |pair| {
         if (std.mem.eql(u8, activation, pair[0])) return pair[1];
@@ -138,6 +165,26 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     try optValue(w, f.ip_masked);
     try w.writeAll(",\"ipRaw\":");
     try optValue(w, f.ip_raw);
+    // ctx / activation are pre-serialized JSON values (null for inbound, so the
+    // inbound surface is byte-identical to before).
+    try w.writeAll(",\"ctx\":");
+    try w.writeAll(opts.ctx_json orelse "null");
+    try w.writeAll(",\"activation\":");
+    try w.writeAll(opts.activation_json orelse "null");
+    try w.writeAll(",\"result\":");
+    if (opts.result) |r| {
+        try w.writeAll("{\"status\":");
+        try optInt(w, r.status);
+        try w.writeAll(",\"ok\":");
+        try optBool(w, r.ok);
+        try w.writeAll(",\"done\":");
+        try optBool(w, r.done);
+        try w.writeAll(",\"fetchId\":");
+        if (r.fetch_id) |s| try jsonStr(w, s) else try w.writeAll("null");
+        try w.writeAll(",\"chunkSeq\":");
+        try optInt(w, r.chunk_seq);
+        try w.writeByte('}');
+    } else try w.writeAll("null");
     try w.writeAll(",\"fn\":");
     try jsonStr(w, opts.export_name);
     try w.writeAll("};\n");
@@ -194,6 +241,18 @@ const EPILOGUE_BODY =
     \\  Object.defineProperty(request, "ip", { enumerable: true, configurable: true,
     \\    get() { if (!D.ipMasked) miss("request.ip"); return D.ipMasked.value || null; } });
     \\  request.unmaskedIp = function () { if (!D.ipRaw) miss("request.unmaskedIp()"); return D.ipRaw.value || null; };
+    \\  // Non-inbound activation surface (null for inbound → no-ops):
+    \\  // the threaded ctx, the request.activation metadata bag, and the
+    \\  // flattened fetch/callback result (request.status/.ok/.done/...).
+    \\  if (D.ctx !== null) request.ctx = D.ctx;
+    \\  if (D.activation !== null) request.activation = D.activation;
+    \\  if (D.result !== null) {
+    \\    if (D.result.status !== null) request.status = D.result.status;
+    \\    if (D.result.ok !== null) request.ok = D.result.ok;
+    \\    if (D.result.done !== null) request.done = D.result.done;
+    \\    if (D.result.fetchId !== null) request.fetchId = D.result.fetchId;
+    \\    if (D.result.chunkSeq !== null) request.chunkSeq = D.result.chunkSeq;
+    \\  }
     \\  globalThis.request = request;
     \\  globalThis.response = { status: 200, headers: {}, cookies: [] };
     \\  let __result = null, __err = null;
@@ -214,6 +273,13 @@ const EPILOGUE_BODY =
     \\  }
     \\
 ;
+
+fn optInt(w: *std.Io.Writer, v: ?i64) !void {
+    if (v) |n| try w.print("{d}", .{n}) else try w.writeAll("null");
+}
+fn optBool(w: *std.Io.Writer, v: ?bool) !void {
+    try w.writeAll(if (v) |b| (if (b) "true" else "false") else "null");
+}
 
 /// `{"value": "<s>"}` or `null` — the ipMasked / ipRaw shape the getters read.
 fn optValue(w: *std.Io.Writer, v: ?[]const u8) !void {

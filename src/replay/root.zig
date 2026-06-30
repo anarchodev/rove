@@ -239,14 +239,25 @@ pub fn runWorld(
 
     const binary_body = std.mem.eql(u8, wv.activation, "inbound_chunk") or
         std.mem.eql(u8, wv.activation, "fetch_chunk");
+    // The resolved export: the world's explicit `export` (the `{to}` / resolved
+    // name a callback needs) wins; else the conventional export for the kind.
+    const export_name = wv.export_name orelse epilogue.exportForActivation(wv.activation);
+    const result: ?epilogue.Result = if (wv.status != null or wv.ok != null or
+        wv.done != null or wv.fetch_id != null or wv.chunk_seq != null)
+        .{ .status = wv.status, .ok = wv.ok, .done = wv.done, .fetch_id = wv.fetch_id, .chunk_seq = wv.chunk_seq }
+    else
+        null;
     const epi = try epilogue.build(a, .{
         .method = wv.method,
         .path = wv.path,
         .host = wv.host,
         .request_reads = reads.items,
         .body_bytes = wv.body,
-        .export_name = epilogue.exportForActivation(wv.activation),
+        .export_name = export_name,
         .binary_body = binary_body,
+        .ctx_json = wv.ctx_json,
+        .activation_json = wv.activation_json,
+        .result = result,
     });
     const full_src = try std.mem.concatWithSentinel(a, u8, &.{ entry_src, epi }, 0);
     const entry_z = try a.dupeZ(u8, wv.entry);
@@ -274,6 +285,7 @@ pub fn runWorld(
     try emitWorld(a, out, .{
         .entry = wv.entry,
         .activation = wv.activation,
+        .export_name = export_name,
         .miss = miss,
         .rc = rc,
         .divergence = host.diverged,
@@ -381,6 +393,7 @@ fn emit(a: std.mem.Allocator, out: *std.ArrayList(u8), args: EmitArgs) !void {
 const EmitWorldArgs = struct {
     entry: []const u8,
     activation: []const u8,
+    export_name: []const u8,
     miss: hostmod.MissPolicy,
     rc: c_int,
     divergence: ?[]const u8,
@@ -404,6 +417,8 @@ fn emitWorld(a: std.mem.Allocator, out: *std.ArrayList(u8), args: EmitWorldArgs)
     try jsonStr(w, args.entry);
     try w.writeAll(",\"activation\":");
     try jsonStr(w, args.activation);
+    try w.writeAll(",\"export\":");
+    try jsonStr(w, args.export_name);
     try w.writeAll(",\"miss_policy\":");
     try jsonStr(w, @tagName(args.miss));
     try w.print(",\"run_rc\":{d},\"divergence\":", .{args.rc});

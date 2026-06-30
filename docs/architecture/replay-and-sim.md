@@ -167,9 +167,16 @@ The current driver is therefore faithful for **`inbound`/`default` only**.
   reads, so `miss-policy=fail` reproduces the recording exactly) — is local to
   one activation; cross-activation is just separate worlds (§2).
 
-What landed first (2026-06-30): the declarative-world sim path for `inbound`
-(`world.zig`, the host's `.map` mode + miss policy, `runWorld`, `rewind sim`).
-See [`../plans/sim-test-framework.md`](../plans/sim-test-framework.md)
+Landed 2026-06-30: the declarative-world sim path (`world.zig`, the host's
+`.map` mode + miss policy, `runWorld`, `rewind sim`), now covering **all
+activation kinds** — a world declares the `activation` kind, the resolved
+`export` (the `{to}` / callback name), the threaded `ctx` (→ `request.ctx`), the
+flattened fetch/callback result (`request.status/.ok/.done/.fetchId/.chunkSeq`),
+and the `request.activation` metadata bag, per the §3 table. So G1/G2/G3 above
+constrain **replay** (captured worlds) only; **sim** of any activation needs no
+recording change, because the authored world supplies the export and the
+result/ctx surface directly. See
+[`../plans/sim-test-framework.md`](../plans/sim-test-framework.md)
 §"Built 2026-06-30" and §"The model — one run, parameterized".
 
 ## 7. See also
