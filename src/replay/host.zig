@@ -42,6 +42,23 @@ pub const KvWrite = struct {
     value: []const u8 = "",
 };
 
+/// How the kv read side resolves the world. `.tape` is replay's ordered cursor
+/// over a captured RTAP tape (any op/key mismatch is a divergence). `.map` is
+/// the declarative-sim mode: reads resolve order-independently against a
+/// key→value map (`kv_map`), and `kv.prefix` scans that map — the world is
+/// *authored*, so it carries no access order to verify against.
+pub const Mode = enum { tape, map };
+
+/// On-miss policy — the replay↔sim axis (`docs/plans/sim-test-framework.md`).
+/// `.fail` refuses to invent (a missed read is a divergence — the replay
+/// corner); `.resolve` returns `not_found` and records a typed hole (sim).
+/// Only consulted in `.map` mode; the `.tape` cursor is always fail-loud.
+pub const MissPolicy = enum { fail, resolve };
+
+/// A typed hole — a read the declared world didn't supply. The calling surface
+/// (CLI flag, UI form, an LLM) binds it; for now we report it on the bundle.
+pub const Hole = struct { op: decode.KvOp, key: []const u8 };
+
 /// `malloc`+copy matching the responder ownership contract (engine `free()`s
 /// it). `nul` appends a trailing NUL for the buffers whose parser reads one
 /// sentinel byte past `len` (`out_src`, `out_json`).
@@ -57,11 +74,22 @@ fn dupC(bytes: []const u8, nul: bool) ?[*c]u8 {
 /// Single-shot: one `Host` drives one `arena_run_module`.
 pub const Host = struct {
     a: std.mem.Allocator,
+    /// Read resolution strategy. `.tape` uses the ordered `kv` cursor below;
+    /// `.map` uses `kv_map` + `miss` (declarative sim). Default `.tape` keeps
+    /// the replay path byte-identical.
+    mode: Mode = .tape,
     /// Recorded kv reads (`.get` / `.prefix`) in capture order. The cursor
     /// advances on each served read; a live read that doesn't match the entry
-    /// at the cursor is a divergence.
+    /// at the cursor is a divergence. (`.tape` mode only.)
     kv: []const decode.KvEntry,
     kv_cursor: usize = 0,
+    /// Declarative world: key→value map reads resolve against (`.map` mode).
+    /// `kv.get` is a lookup; `kv.prefix` scans for matching keys.
+    kv_map: std.StringHashMapUnmanaged([]const u8) = .{},
+    /// What a missed `kv.get` does in `.map` mode (`.tape` is always fail-loud).
+    miss: MissPolicy = .fail,
+    /// Typed holes recorded when `.resolve` fills a missed read.
+    holes: std.ArrayList(Hole) = .{},
     /// Handler-produced writes (`kv.set` / `kv.delete`), in order.
     writes: std.ArrayList(KvWrite) = .{},
     /// Captured `OUTPUT_KEY` payload (the run's parked result JSON).
@@ -83,6 +111,11 @@ pub const Host = struct {
     fn setDiv(self: *Host, comptime fmt: []const u8, args: anytype) void {
         if (self.diverged != null) return; // keep the FIRST divergence
         self.diverged = std.fmt.allocPrint(self.a, fmt, args) catch "divergence (oom formatting detail)";
+    }
+
+    fn recordHole(self: *Host, op: decode.KvOp, key: []const u8) void {
+        const kc = self.a.dupe(u8, key) catch return;
+        self.holes.append(self.a, .{ .op = op, .key = kc }) catch {};
     }
 };
 
@@ -108,6 +141,26 @@ fn kvGet(
 ) callconv(.c) c_int {
     const h = hostOf(user);
     const k = key[0..@intCast(key_len)];
+    if (h.mode == .map) {
+        if (h.kv_map.get(k)) |v| {
+            out_outcome.* = @intFromEnum(decode.KvOutcome.ok);
+            out_val.* = dupC(v, false) orelse return -1;
+            out_val_len.* = @intCast(v.len);
+            return 0;
+        }
+        // A read the declared world doesn't supply: record the hole, then let
+        // the miss policy decide — `.fail` refuses to invent (divergence),
+        // `.resolve` answers `not_found` (the sim corner).
+        h.recordHole(.get, k);
+        if (h.miss == .fail) {
+            h.setDiv("kv.get('{s}') is not in the declared world (miss-policy=fail)", .{k});
+            return 2;
+        }
+        out_outcome.* = @intFromEnum(decode.KvOutcome.not_found);
+        out_val.* = null;
+        out_val_len.* = 0;
+        return 0;
+    }
     if (h.kv_cursor >= h.kv.len) {
         h.setDiv("kv.get('{s}') past end of recorded kv tape", .{k});
         return 2; // exhausted
@@ -184,6 +237,37 @@ fn kvPrefix(
     _ = limit;
     const h = hostOf(user);
     const p = prefix[0..@intCast(prefix_len)];
+    if (h.mode == .map) {
+        // Scan the declared map for keys under the prefix, sorted for a
+        // deterministic result. An empty match is a legitimate answer (the
+        // world declares no such keys), so a prefix scan never holes/diverges.
+        var keys = std.ArrayList([]const u8){};
+        defer keys.deinit(h.a);
+        var it = h.kv_map.iterator();
+        while (it.next()) |kv| {
+            if (std.mem.startsWith(u8, kv.key_ptr.*, p)) keys.append(h.a, kv.key_ptr.*) catch return -1;
+        }
+        std.mem.sort([]const u8, keys.items, {}, lessThanStr);
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(h.a);
+        var aw = std.Io.Writer.Allocating.fromArrayList(h.a, &buf);
+        const w = &aw.writer;
+        w.writeByte('[') catch return -1;
+        for (keys.items, 0..) |kk, i| {
+            if (i != 0) w.writeByte(',') catch return -1;
+            w.writeAll("{\"key\":") catch return -1;
+            writeJsonString(w, kk) catch return -1;
+            w.writeAll(",\"value\":") catch return -1;
+            writeJsonString(w, h.kv_map.get(kk).?) catch return -1;
+            w.writeByte('}') catch return -1;
+        }
+        w.writeByte(']') catch return -1;
+        buf = aw.toArrayList();
+        out_json.* = dupC(buf.items, true) orelse return -1;
+        out_json_len.* = @intCast(buf.items.len);
+        out_outcome.* = 0; // ok
+        return 0;
+    }
     if (h.kv_cursor >= h.kv.len) {
         h.setDiv("kv.prefix('{s}') past end of recorded kv tape", .{p});
         return 2;
@@ -252,6 +336,10 @@ fn moduleLoad(
     return -6;
 }
 
+fn lessThanStr(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('"');
     for (s) |b| switch (b) {
@@ -291,6 +379,79 @@ test "kv read cursor: ordered get hits + divergence on wrong key" {
     // entry 1: get the wrong key -> divergence (-4), cursor not advanced past
     try testing.expect(kvGet("elsewhere", 9, &outcome, &val, &vlen, &h) < 0);
     try testing.expect(h.diverged != null);
+}
+
+test "map mode: get resolves by key, order-independent" {
+    const a = testing.allocator;
+    var map = std.StringHashMapUnmanaged([]const u8){};
+    defer map.deinit(a);
+    try map.put(a, "user/jess", "{\"name\":\"Jess\"}");
+    try map.put(a, "config/rate", "10");
+    var h = Host{ .a = a, .mode = .map, .kv = &.{}, .kv_map = map, .miss = .resolve };
+    defer h.holes.deinit(a);
+
+    var outcome: c_int = -1;
+    var val: [*c]u8 = null;
+    var vlen: c_int = -1;
+    // read config/rate first even though it was inserted second — map lookup
+    try testing.expectEqual(@as(c_int, 0), kvGet("config/rate", 11, &outcome, &val, &vlen, &h));
+    try testing.expectEqual(@intFromEnum(decode.KvOutcome.ok), outcome);
+    try testing.expectEqualStrings("10", val[0..@intCast(vlen)]);
+    std.c.free(val);
+    try testing.expectEqual(@as(usize, 0), h.holes.items.len);
+}
+
+test "map mode: resolve miss → not_found + recorded hole; fail miss → divergence" {
+    const a = testing.allocator;
+    var map = std.StringHashMapUnmanaged([]const u8){};
+    defer map.deinit(a);
+    var outcome: c_int = -1;
+    var val: [*c]u8 = null;
+    var vlen: c_int = -1;
+
+    // resolve: a missing key answers not_found and records a hole
+    var hr = Host{ .a = a, .mode = .map, .kv = &.{}, .kv_map = map, .miss = .resolve };
+    defer {
+        for (hr.holes.items) |hole| a.free(hole.key);
+        hr.holes.deinit(a);
+    }
+    try testing.expectEqual(@as(c_int, 0), kvGet("absent", 6, &outcome, &val, &vlen, &hr));
+    try testing.expectEqual(@intFromEnum(decode.KvOutcome.not_found), outcome);
+    try testing.expectEqual(@as(usize, 1), hr.holes.items.len);
+    try testing.expectEqualStrings("absent", hr.holes.items[0].key);
+
+    // fail: a missing key is a divergence (refuse to invent)
+    var hf = Host{ .a = a, .mode = .map, .kv = &.{}, .kv_map = map, .miss = .fail };
+    defer {
+        for (hf.holes.items) |hole| a.free(hole.key);
+        hf.holes.deinit(a);
+        if (hf.diverged) |d| a.free(d);
+    }
+    try testing.expect(kvGet("absent", 6, &outcome, &val, &vlen, &hf) > 0);
+    try testing.expect(hf.diverged != null);
+}
+
+test "map mode: prefix scans the declared map, sorted" {
+    const a = testing.allocator;
+    var map = std.StringHashMapUnmanaged([]const u8){};
+    defer map.deinit(a);
+    try map.put(a, "orders/2", "b");
+    try map.put(a, "orders/1", "a");
+    try map.put(a, "users/9", "z");
+    var h = Host{ .a = a, .mode = .map, .kv = &.{}, .kv_map = map, .miss = .resolve };
+    defer h.holes.deinit(a);
+
+    var outcome: c_int = -1;
+    var json: [*c]u8 = null;
+    var jlen: c_int = -1;
+    try testing.expectEqual(@as(c_int, 0), kvPrefix("orders/", 7, "", 0, 100, &outcome, &json, &jlen, &h));
+    try testing.expectEqual(@as(c_int, 0), outcome);
+    const got = json[0..@intCast(jlen)];
+    try testing.expectEqualStrings(
+        "[{\"key\":\"orders/1\",\"value\":\"a\"},{\"key\":\"orders/2\",\"value\":\"b\"}]",
+        got,
+    );
+    std.c.free(json);
 }
 
 test "kv writes captured; sentinel intercepted as output" {

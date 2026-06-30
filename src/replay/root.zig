@@ -12,6 +12,7 @@ const std = @import("std");
 const decode = @import("tape_decode.zig");
 const hostmod = @import("host.zig");
 const epilogue = @import("epilogue.zig");
+const world = @import("world.zig");
 
 // ── arenajs native ABI (qjs-arena-reactor.c) ──
 extern fn arena_init(base_kb: c_int, request_kb: c_int) c_int;
@@ -19,6 +20,11 @@ extern fn arena_run_module(entry_name: [*c]const u8, entry_src: [*c]const u8) c_
 extern fn arena_set_trace_mode(mode: c_int) void;
 extern fn arena_set_date_now(lo: u32, hi: u32) void;
 extern fn arena_set_random_seed(lo: u32, hi: u32) void;
+
+/// The on-miss policy a declarative `runWorld` runs under — the replay↔sim
+/// axis. Re-exported so CLI callers can pass `--miss-policy` without importing
+/// the host internals.
+pub const MissPolicy = hostmod.MissPolicy;
 
 pub const Error = error{
     BadFixture,
@@ -167,6 +173,116 @@ pub fn run(
     });
 }
 
+/// Run a **declarative** world (an *authored* fixture, not a captured tape) —
+/// the sim corner of the one engine. KV reads resolve order-independently
+/// against the world's key→value map; `miss_override` (when set) forces the
+/// on-miss policy, else the world's `missPolicy` is used (`fail` = refuse to
+/// invent / `resolve` = answer not_found + record a typed hole). The request
+/// surface is rebuilt by synthesizing `request_reads` entries from the declared
+/// request, so the SAME epilogue serves it — undeclared header reads are
+/// naturally `undefined` (resolve), declared ones serve their value.
+pub fn runWorld(
+    a: std.mem.Allocator,
+    world_json: []const u8,
+    source_dir: ?[]const u8,
+    miss_override: ?hostmod.MissPolicy,
+    out: *std.ArrayList(u8),
+) Error!void {
+    const parsed = std.json.parseFromSlice(std.json.Value, a, world_json, .{}) catch
+        return Error.BadFixture;
+    const wv = world.fromValue(a, parsed.value) catch return Error.BadFixture;
+    const miss = miss_override orelse wv.miss;
+
+    // ── synthesize request_reads from the declared request ──
+    var reads = std.ArrayList(decode.RequestReadEntry){};
+    // header_names: a JSON array of the declared header names.
+    var names_buf = std.ArrayList(u8){};
+    {
+        var aw = std.Io.Writer.Allocating.fromArrayList(a, &names_buf);
+        const w = &aw.writer;
+        try w.writeByte('[');
+        for (wv.headers, 0..) |hh, i| {
+            if (i != 0) try w.writeByte(',');
+            try jsonStr(w, hh.name);
+        }
+        try w.writeByte(']');
+        names_buf = aw.toArrayList();
+    }
+    try reads.append(a, .{ .kind = .header_names, .name = "", .value = names_buf.items });
+    for (wv.headers) |hh|
+        try reads.append(a, .{ .kind = .header_value, .name = hh.name, .value = hh.value });
+    if (wv.body != null)
+        try reads.append(a, .{ .kind = .body_read, .name = "", .value = "" });
+    if (wv.ip) |ip|
+        try reads.append(a, .{ .kind = .ip_masked, .name = "", .value = ip });
+
+    // ── kv readset → map ──
+    var kv_map = std.StringHashMapUnmanaged([]const u8){};
+    for (wv.kv) |p| try kv_map.put(a, p.key, p.value);
+
+    // ── module sources (inline) ──
+    var sources = std.StringHashMapUnmanaged([]const u8){};
+    for (wv.sources) |s| {
+        if (!std.mem.eql(u8, s.kind, "handler")) continue;
+        try sources.put(a, s.path, s.source);
+    }
+
+    // Entry source: working tree (if --source-dir) else the inline world.
+    const entry_src = blk: {
+        if (source_dir) |dir| {
+            const ep = std.fs.path.join(a, &.{ dir, wv.entry }) catch return Error.OutOfMemory;
+            break :blk std.fs.cwd().readFileAlloc(a, ep, 8 << 20) catch
+                return Error.EntrySourceMissing;
+        }
+        break :blk sources.get(wv.entry) orelse return Error.EntrySourceMissing;
+    };
+
+    const binary_body = std.mem.eql(u8, wv.activation, "inbound_chunk") or
+        std.mem.eql(u8, wv.activation, "fetch_chunk");
+    const epi = try epilogue.build(a, .{
+        .method = wv.method,
+        .path = wv.path,
+        .host = wv.host,
+        .request_reads = reads.items,
+        .body_bytes = wv.body,
+        .export_name = epilogue.exportForActivation(wv.activation),
+        .binary_body = binary_body,
+    });
+    const full_src = try std.mem.concatWithSentinel(a, u8, &.{ entry_src, epi }, 0);
+    const entry_z = try a.dupeZ(u8, wv.entry);
+
+    // ── drive the engine (one-shot; same caveats as `run`) ──
+    if (arena_init(8192, 8192) != 0) return Error.ArenaInit;
+    var host = hostmod.Host{
+        .a = a,
+        .mode = .map,
+        .kv = &.{},
+        .kv_map = kv_map,
+        .miss = miss,
+        .sources = sources,
+        .source_dir = source_dir,
+    };
+    host.install();
+
+    const date_ms: u64 = wv.now_ms;
+    arena_set_random_seed(@truncate(wv.seed), @truncate(wv.seed >> 32));
+    arena_set_date_now(@truncate(date_ms), @truncate(date_ms >> 32));
+    arena_set_trace_mode(0);
+
+    const rc = arena_run_module(entry_z.ptr, full_src.ptr);
+
+    try emitWorld(a, out, .{
+        .entry = wv.entry,
+        .activation = wv.activation,
+        .miss = miss,
+        .rc = rc,
+        .divergence = host.diverged,
+        .writes = host.writes.items,
+        .holes = host.holes.items,
+        .run_json = host.output,
+    });
+}
+
 // ── emit helpers ──
 
 const NoOutputArgs = struct {
@@ -262,6 +378,76 @@ fn emit(a: std.mem.Allocator, out: *std.ArrayList(u8), args: EmitArgs) !void {
     try w.print(",\"status_match\":{s}}}", .{if (status_match) "true" else "false"});
 }
 
+const EmitWorldArgs = struct {
+    entry: []const u8,
+    activation: []const u8,
+    miss: hostmod.MissPolicy,
+    rc: c_int,
+    divergence: ?[]const u8,
+    writes: []const hostmod.KvWrite,
+    holes: []const hostmod.Hole,
+    /// The run's parked output (response/result/error/console), or null when the
+    /// run died before the epilogue captured it (e.g. a fail-policy divergence
+    /// or a syntax error).
+    run_json: ?[]const u8,
+};
+
+/// Emit a sim bundle. Same engine output as `emit`, minus the recorded-vs-
+/// replayed comparison (an authored world has no recording to match), plus the
+/// `miss_policy` it ran under and the typed `holes` a `resolve` run filled.
+fn emitWorld(a: std.mem.Allocator, out: *std.ArrayList(u8), args: EmitWorldArgs) !void {
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, out);
+    defer out.* = aw.toArrayList();
+    const w = &aw.writer;
+
+    try w.writeAll("{\"mode\":\"sim\",\"entry\":");
+    try jsonStr(w, args.entry);
+    try w.writeAll(",\"activation\":");
+    try jsonStr(w, args.activation);
+    try w.writeAll(",\"miss_policy\":");
+    try jsonStr(w, @tagName(args.miss));
+    try w.print(",\"run_rc\":{d},\"divergence\":", .{args.rc});
+    try optStr(w, args.divergence);
+
+    // kv writes the handler produced.
+    try w.writeAll(",\"kv_writes\":[");
+    for (args.writes, 0..) |wr, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.writeAll("{\"op\":");
+        try jsonStr(w, @tagName(wr.op));
+        try w.writeAll(",\"key\":");
+        try jsonStr(w, wr.key);
+        if (wr.op == .set) {
+            try w.writeAll(",\"value\":");
+            try jsonStr(w, wr.value);
+        }
+        try w.writeByte('}');
+    }
+    try w.writeByte(']');
+
+    // typed holes — reads the declared world didn't supply (resolve mode).
+    try w.writeAll(",\"holes\":[");
+    for (args.holes, 0..) |hole, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.writeAll("{\"op\":");
+        try jsonStr(w, @tagName(hole.op));
+        try w.writeAll(",\"key\":");
+        try jsonStr(w, hole.key);
+        try w.writeByte('}');
+    }
+    try w.writeByte(']');
+
+    // the run output (response / result / error / console), or null + ok=false
+    // when the run died before capture (e.g. a fail-policy divergence).
+    if (args.run_json) |rj| {
+        try w.writeAll(",\"run\":");
+        try w.writeAll(rj);
+        try w.writeAll(",\"ok\":true}");
+    } else {
+        try w.writeAll(",\"run\":null,\"ok\":false,\"error\":\"the run produced no output (it failed before the handler completed — see divergence / run_rc; a fail miss-policy on an under-specified world lands here)\"}");
+    }
+}
+
 /// Pull `result.status` (handler return), falling back to `response.status`,
 /// from the parked output JSON. A run that threw (non-null `error`) has no
 /// meaningful replayed status — return null so a diverged/errored run never
@@ -330,4 +516,5 @@ test {
     _ = decode;
     _ = hostmod;
     _ = epilogue;
+    _ = world;
 }

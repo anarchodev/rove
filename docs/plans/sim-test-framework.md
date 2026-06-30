@@ -125,6 +125,42 @@ tells you what-if and is only as good as the world you (or the LLM) supply.**
 Keeping `--source-dir` and hole-resolution *out* of the faithful corner is what
 preserves that distinction.
 
+### Built 2026-06-30 — `rewind sim` over a declarative world
+
+The first slice of the one engine for an **authored** world (the sim corner)
+shipped. It reuses the native replay engine (`rove-replay`, the same
+arenajs link `rewind replay` already uses) — no second engine, exactly as the
+model demands.
+
+- **The declarative world** (`src/replay/world.zig`) is a plain JSON document an
+  author or LLM writes: `{ entry, activation, request{method,path,host,headers,
+  body,ip}, kv{key→value}, seed, now_ms, missPolicy, sources[] }`. KV is a
+  key→value **map** (not an ordered tape) because an authored world carries no
+  access order to verify against. Non-string `kv`/`body`/header values are
+  JSON-stringified (so you write `{ "name": "Jess" }`, not a hand-escaped
+  string).
+- **Map-keyed reads + miss policy** (`src/replay/host.zig`): the replay host
+  gained a `.map` mode (order-independent lookup; `kv.prefix` scans the map) and
+  a `MissPolicy` — `fail` (refuse to invent → divergence, the replay corner) or
+  `resolve` (answer `not_found` and record a **typed hole**). The replay
+  cursor path (`.tape`) is byte-identical. The request surface is rebuilt by
+  *synthesizing* `request_reads` entries from the declared request, so the
+  existing epilogue serves it untouched — undeclared header reads are naturally
+  `undefined`.
+- **`runWorld`** (`src/replay/root.zig`) emits a sim bundle: `{ mode:"sim",
+  miss_policy, run_rc, divergence, kv_writes[], holes[], run{response,result,
+  error,console}, ok }`. `holes[]` is the typed-hole list the calling surface
+  binds (CLI/UI/LLM) — the load-bearing T5 provenance, surfaced.
+- **CLI**: `rewind sim <world.json> [--source-dir DIR] [--miss-policy
+  fail|resolve] [-o FILE]` — fully offline (handled before `loadCfg`, like
+  `replay`); the bundle goes to **stdout** so `rewind sim … | jq` works.
+
+This subsumes the old T7 `--mode strict|what_if|isolated` knob: the world itself
+declares what's present, `--source-dir` is the *code* knob, and `--miss-policy`
+is the *replay↔sim* knob — three knobs, one `run`. Still ahead (T8–T11): the
+`_tests/` runner + `expect`/`snapshot`, `export-fixture` (capture → authored
+world), and the production-strip of `_tests/`.
+
 ## What already exists
 
 - **Tape capture — done.** `uploadTapes` (`src/js/worker.zig:901-938`), `LogRecord.tape_refs` populated, blob storage at `{data_dir}/{id}/log-blobs/`.

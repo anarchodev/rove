@@ -633,6 +633,36 @@ fn cmdReplay(a: std.mem.Allocator, fixture_path: []const u8, source_dir: ?[]cons
     }
 }
 
+/// `rewind sim <world.json> [--source-dir DIR] [--miss-policy fail|resolve] [-o FILE]`
+/// — run a DECLARATIVE world (an authored fixture, not a captured tape) through
+/// the same engine. The world is a plain JSON document (request surface, a
+/// key→value KV map, seed/now); reads resolve order-independently, and the
+/// `--miss-policy` (or the world's `missPolicy`) decides what an unsupplied read
+/// does: `resolve` answers not_found and reports a typed hole; `fail` refuses to
+/// invent. Same offline path as `replay` — no dashboard / IdP / network.
+fn cmdSim(a: std.mem.Allocator, world_path: []const u8, source_dir: ?[]const u8, miss: ?replay.MissPolicy, out_file: ?[]const u8) void {
+    const bytes = std.fs.cwd().readFileAlloc(a, world_path, 64 << 20) catch |e|
+        c.fatal("sim: read {s}: {s}", .{ world_path, @errorName(e) });
+    var out = std.ArrayList(u8){};
+    replay.runWorld(a, bytes, source_dir, miss, &out) catch |e| switch (e) {
+        error.EntrySourceMissing => c.fatal("sim: the world has no entry source ('{s}') — add it under \"sources\", or pass --source-dir", .{"index.mjs"}),
+        error.BadFixture => c.fatal("sim: world JSON is malformed", .{}),
+        error.ArenaInit => c.fatal("sim: JS engine failed to initialise", .{}),
+        else => c.fatal("sim: {s}", .{@errorName(e)}),
+    };
+    if (out_file) |path| {
+        std.fs.cwd().writeFile(.{ .sub_path = path, .data = out.items }) catch |e|
+            c.fatal("sim: write {s}: {s}", .{ path, @errorName(e) });
+        std.debug.print("wrote sim result → {s}\n", .{path});
+    } else {
+        // The bundle is the artifact a pipeline/LLM consumes — stdout, so
+        // `rewind sim ... | jq` works (the file-written notice stays on stderr).
+        const stdout = std.fs.File.stdout();
+        stdout.writeAll(out.items) catch {};
+        stdout.writeAll("\n") catch {};
+    }
+}
+
 fn emitStr(w: *std.Io.Writer, s: []const u8) void {
     std.json.Stringify.value(s, .{}, w) catch c.oom();
 }
@@ -735,6 +765,7 @@ const USAGE =
     \\  rewind [--env <file>] logs <tenant> [--limit N] [--after CURSOR]
     \\  rewind [--env <file>] pull <tenant> <req_id> [-o FILE]
     \\  rewind [--env <file>] replay <fixture> [--source-dir DIR] [-o FILE]
+    \\  rewind sim <world.json> [--source-dir DIR] [--miss-policy fail|resolve] [-o FILE]
     \\  rewind [--env <file>] publish [--apps-dir D] [--only t1,t2] [--include-examples] [--no-release]
     \\  rewind [--env <file>] provision <tenant> [--cluster C] [--host H]
     \\  rewind [--env <file>] host add <host> <tenant>
@@ -800,7 +831,7 @@ pub fn main() void {
         std.mem.eql(u8, verb, "host") or std.mem.eql(u8, verb, "plan") or
         std.mem.eql(u8, verb, "move") or std.mem.eql(u8, verb, "route") or
         std.mem.eql(u8, verb, "logs") or std.mem.eql(u8, verb, "pull") or
-        std.mem.eql(u8, verb, "replay");
+        std.mem.eql(u8, verb, "replay") or std.mem.eql(u8, verb, "sim");
     if (!known) {
         std.debug.print("rewind: unknown command '{s}'\n\n{s}", .{ verb, USAGE });
         std.process.exit(2);
@@ -827,6 +858,33 @@ pub fn main() void {
             } else c.fatal("replay: unknown option '{s}'", .{rest[j]});
         }
         cmdReplay(a, rest[0], source_dir, out_file);
+        return;
+    }
+
+    // `sim` is offline too — a declarative world through the same engine.
+    if (std.mem.eql(u8, verb, "sim")) {
+        if (rest.len < 1) c.fatal("sim needs <world.json> [--source-dir DIR] [--miss-policy fail|resolve] [-o FILE]", .{});
+        var source_dir: ?[]const u8 = null;
+        var out_file: ?[]const u8 = null;
+        var miss: ?replay.MissPolicy = null;
+        var j: usize = 1;
+        while (j < rest.len) : (j += 1) {
+            if (std.mem.eql(u8, rest[j], "--source-dir")) {
+                if (j + 1 >= rest.len) c.fatal("--source-dir needs a path", .{});
+                source_dir = rest[j + 1];
+                j += 1;
+            } else if (std.mem.eql(u8, rest[j], "--miss-policy")) {
+                if (j + 1 >= rest.len) c.fatal("--miss-policy needs fail|resolve", .{});
+                const v = rest[j + 1];
+                miss = if (std.mem.eql(u8, v, "fail")) .fail else if (std.mem.eql(u8, v, "resolve") or std.mem.eql(u8, v, "not_found")) .resolve else c.fatal("--miss-policy must be fail|resolve", .{});
+                j += 1;
+            } else if (std.mem.eql(u8, rest[j], "-o")) {
+                if (j + 1 >= rest.len) c.fatal("-o needs a path", .{});
+                out_file = rest[j + 1];
+                j += 1;
+            } else c.fatal("sim: unknown option '{s}'", .{rest[j]});
+        }
+        cmdSim(a, rest[0], source_dir, miss, out_file);
         return;
     }
 
