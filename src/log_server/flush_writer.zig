@@ -50,21 +50,23 @@ pub const Error = error{
 /// offset is file-relative.
 ///
 /// `node_id_hex` is the raft node id zero-padded to u32 hex (8 chars).
-/// `flush_unix_ms` is millis-since-epoch at flush time, used to
-/// disambiguate batch_ids if a node's request_id allocator ever
-/// resets.
+/// `flush_unix_ns` is nanos-since-epoch at flush time and is the PRIMARY
+/// sort component of the batch_id (see below) — the indexer's per-node
+/// catch-up cursor is a lexical `start-after` over these keys, so the
+/// key MUST sort in flush order or a late batch is skipped forever.
 /// Caller frees the returned `[]u8` (the batch's S3 key, e.g.
 /// `_logs/{node_hex}/{batch_id}.ndjson`). Returns null if the batch
 /// was empty. The key is the same value just PUT into `store` — the
 /// caller can push it to log-server (`/v1/_internal/batch-pushed`)
-/// so the indexer fetches it directly without waiting for the LIST
-/// polling cycle to converge.
+/// so the LOCAL node's indexer fetches it directly; the poll path is
+/// still the cross-node completeness guarantee (log-servers don't share
+/// the index), which is exactly why the key must be poll-sound.
 pub fn writeBatch(
     allocator: std.mem.Allocator,
     store: batch_store_mod.BatchStore,
     node_id_hex: []const u8,
     records: []const log_mod.LogRecord,
-    flush_unix_ms: i64,
+    flush_unix_ns: i64,
 ) Error!?[]u8 {
     if (records.len == 0) return null;
 
@@ -145,16 +147,28 @@ pub fn writeBatch(
     const sha_hex = bytesToHex(allocator, sha[0..]) catch return Error.OutOfMemory;
     defer allocator.free(sha_hex);
 
-    // batch_id = `{first_request_id:020d}-{flush_unix_ms:013d}`.
-    // Cast flush_unix_ms to u64 — Zig's `{d:0>13}` formatter prepends
-    // a `+` sign for signed positive integers when width-specified,
-    // which would corrupt the lexical-sort key. Negative timestamps
-    // are nonsensical here (millis since 1970).
-    const flush_ms_u: u64 = @intCast(@max(flush_unix_ms, 0));
+    // batch_id = `{flush_unix_ns:020d}-{first_request_id:020d}`.
+    //
+    // FLUSH TIME FIRST — this is load-bearing for the indexer's poll
+    // path. Batches are per-NODE (multi-tenant) but `request_id` is
+    // per-TENANT (`_log/next_request_seq`), so a request-id-first key
+    // is NOT monotonic across tenants: a brand-new tenant's first
+    // request (id 1) sorts before a busy tenant's id 84, and the
+    // per-node lexical `start-after` cursor that has advanced past 84
+    // would skip the late id-1 batch forever (it never re-LISTs keys
+    // below the cursor). The flusher runs sequentially per node, so the
+    // wall-clock ns at flush time IS monotonic across all tenants and
+    // survives process restarts (unlike a volatile in-RAM counter), so
+    // a later flush always sorts after an earlier one. `request_id` is
+    // a deterministic tiebreaker for the (practically impossible)
+    // same-ns case. Cast to u64 — `{d:0>N}` prepends `+` for signed
+    // positive ints, which would corrupt the lexical key; negative
+    // timestamps are nonsensical (nanos since 1970).
+    const flush_ns_u: u64 = @intCast(@max(flush_unix_ns, 0));
     const batch_id = std.fmt.allocPrint(
         allocator,
-        "{d:0>20}-{d:0>13}",
-        .{ sorted[0].request_id, flush_ms_u },
+        "{d:0>20}-{d:0>20}",
+        .{ flush_ns_u, sorted[0].request_id },
     ) catch return Error.OutOfMemory;
     defer allocator.free(batch_id);
 
@@ -485,15 +499,16 @@ test "writeBatch emits one object with embedded sidecar + frames" {
     defer r1.deinit(a);
     const records = [_]log_mod.LogRecord{ r0, r1 };
 
-    const returned_key = (try writeBatch(a, store, "00000001", &records, 1730764800000)).?;
+    // Flush-time-first key: `_logs/{node}/{flush_ns:020}-{first_req_id:020}`.
+    const returned_key = (try writeBatch(a, store, "00000001", &records, 1730764800000000000)).?;
     defer a.free(returned_key);
     try testing.expectEqualStrings(
-        "_logs/00000001/00000000000000000001-1730764800000.ndjson",
+        "_logs/00000001/01730764800000000000-00000000000000000001.ndjson",
         returned_key,
     );
 
     // Single object exists at the .ndjson key — no separate .idx.json.
-    const obj_key = "_logs/00000001/00000000000000000001-1730764800000.ndjson";
+    const obj_key = "_logs/00000001/01730764800000000000-00000000000000000001.ndjson";
     const obj = try store.get(obj_key, a);
     defer a.free(obj);
 
@@ -554,6 +569,32 @@ test "writeBatch emits one object with embedded sidecar + frames" {
     try testing.expectEqualStrings(expected_hex, idx.ndjson_sha256);
 }
 
+test "writeBatch key sorts by flush time, not request_id (poll-cursor monotonicity)" {
+    const a = testing.allocator;
+    const m = try batch_store_mod.MemoryBatchStore.init(a);
+    defer m.deinit();
+    const store = m.batchStore();
+
+    // A busy tenant flushes request_id 84 first…
+    var hi = try makeRecord(a, 84, "/hi");
+    defer hi.deinit(a);
+    const k_busy = (try writeBatch(a, store, "00000001", &.{hi}, 1000)).?;
+    defer a.free(k_busy);
+
+    // …then a brand-new tenant flushes request_id 1 LATER (higher ns).
+    var lo = try makeRecord(a, 1, "/lo");
+    defer lo.deinit(a);
+    const k_new = (try writeBatch(a, store, "00000001", &.{lo}, 2000)).?;
+    defer a.free(k_new);
+
+    // The later flush MUST sort after the earlier one despite its far
+    // lower request_id — otherwise the per-node `start-after` cursor that
+    // advanced past k_busy would never re-LIST k_new and the new tenant's
+    // record would be invisible forever. This is the regression the
+    // flush-time-first key prevents.
+    try testing.expect(std.mem.lessThan(u8, k_busy, k_new));
+}
+
 test "writeBatch with empty records is a no-op (no PUTs)" {
     const a = testing.allocator;
     const m = try batch_store_mod.MemoryBatchStore.init(a);
@@ -583,11 +624,12 @@ test "writeBatch sorts records by received_ns before encoding" {
     defer lo.deinit(a);
     const records = [_]log_mod.LogRecord{ hi, lo };
 
-    const k = (try writeBatch(a, store, "00000001", &records, 1730764800000)).?;
+    const k = (try writeBatch(a, store, "00000001", &records, 1730764800000000000)).?;
     defer a.free(k);
 
-    // batch_id = first_request_id (after sort) → record at received=1000 → request_id=6.
-    const obj = try store.get("_logs/00000001/00000000000000000006-1730764800000.ndjson", a);
+    // batch_id = `{flush_ns:020}-{first_request_id:020}`; the request_id
+    // tiebreaker is the first record AFTER the received_ns sort → request_id=6.
+    const obj = try store.get("_logs/00000001/01730764800000000000-00000000000000000006.ndjson", a);
     defer a.free(obj);
     const sidecar_size = std.mem.readInt(u32, obj[0..4], .little);
     var idx = try sidecar.parse(a, obj[4 .. 4 + sidecar_size]);

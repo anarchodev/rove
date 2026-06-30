@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const c = @import("common.zig");
+const replay = @import("rove-replay");
 
 const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 
@@ -444,6 +445,190 @@ fn cmdDeployments(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8) voi
     }
 }
 
+// ── replay: pull a recorded request + re-execute it natively (Phase 2) ─────
+
+/// `rewind logs <tenant> [--limit N] [--after CURSOR]` — list recorded request
+/// summaries (GET /v1/logs/{tenant}/list). Prints the log-server's JSON
+/// verbatim (it is already the LLM-/operator-friendly artifact); the operator
+/// picks a `request_id` for `rewind pull`.
+fn cmdLogs(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, limit: ?[]const u8, after: ?[]const u8) void {
+    var url = std.ArrayList(u8){};
+    url.appendSlice(a, std.fmt.allocPrint(a, "{s}/v1/logs/{s}/list", .{ cfg.admin_url, tenant }) catch c.oom()) catch c.oom();
+    var sep: u8 = '?';
+    if (limit) |l| {
+        url.append(a, sep) catch c.oom();
+        sep = '&';
+        url.appendSlice(a, std.fmt.allocPrint(a, "limit={s}", .{l}) catch c.oom()) catch c.oom();
+    }
+    if (after) |cur| {
+        url.append(a, sep) catch c.oom();
+        url.appendSlice(a, std.fmt.allocPrint(a, "after={s}", .{cur}) catch c.oom()) catch c.oom();
+    }
+    const r = httpCall(a, cfg, "GET", url.items, &.{}, null, true, 30);
+    if (r.code == 401) c.fatal("not signed in — run `rewind login`", .{});
+    if (r.code == 403) c.fatal("operator-only — log read needs an operator (is_root) session", .{});
+    if (r.code == 404) c.fatal("logs: {s} not found", .{tenant});
+    if (r.code != 200) c.fatal("logs {s}: {d} {s}", .{ tenant, r.code, c.trunc(r.body) });
+    std.debug.print("{s}\n", .{r.body});
+}
+
+/// `rewind pull <tenant> <req_id> [-o FILE]` — fetch the recorded request
+/// (record + inline tapes via /v1/logs/{tenant}/show/{id}) and its deployment's
+/// handler sources (/v1/sources/{tenant}/{dep_hex}), and write a self-contained
+/// fixture JSON that `rewind replay` re-executes offline forever.
+fn cmdPull(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, req_id: []const u8, out_file: ?[]const u8) void {
+    // 1. the record (with inline tapes).
+    const surl = std.fmt.allocPrint(a, "{s}/v1/logs/{s}/show/{s}", .{ cfg.admin_url, tenant, req_id }) catch c.oom();
+    const sr = httpCall(a, cfg, "GET", surl, &.{}, null, true, 30);
+    if (sr.code == 401) c.fatal("not signed in — run `rewind login`", .{});
+    if (sr.code == 403) c.fatal("operator-only — log read needs an operator (is_root) session", .{});
+    if (sr.code == 404) c.fatal("pull: request {s} not found for {s}", .{ req_id, tenant });
+    if (sr.code != 200) c.fatal("pull show {s}: {d} {s}", .{ req_id, sr.code, c.trunc(sr.body) });
+
+    const rec_p = std.json.parseFromSlice(std.json.Value, a, sr.body, .{}) catch
+        c.fatal("pull: record JSON did not parse", .{});
+    if (rec_p.value != .object) c.fatal("pull: record is not an object", .{});
+    // `/show` wraps the record as `{"record": {...}}` (standalone.zig); unwrap
+    // to the inner object (tolerate a bare record too).
+    const rec_val: std.json.Value = blk: {
+        if (rec_p.value.object.get("record")) |inner| {
+            if (inner == .object) break :blk inner;
+        }
+        break :blk rec_p.value;
+    };
+    const rec = rec_val.object;
+    const dep_id = jStr(rec_val, "deployment_id") orelse
+        c.fatal("pull: record has no deployment_id", .{});
+    const dep_hex = if (std.mem.startsWith(u8, dep_id, "dep_")) dep_id["dep_".len..] else dep_id;
+
+    // 2. the deployment's handler sources.
+    const srcurl = std.fmt.allocPrint(a, "{s}/v1/sources/{s}/{s}", .{ cfg.admin_url, tenant, dep_hex }) catch c.oom();
+    const srr = httpCall(a, cfg, "GET", srcurl, &.{}, null, true, 60);
+    if (srr.code != 200) c.fatal("pull sources {s}: {d} {s}", .{ dep_hex, srr.code, c.trunc(srr.body) });
+    const src_p = std.json.parseFromSlice(std.json.Value, a, srr.body, .{}) catch
+        c.fatal("pull: sources JSON did not parse", .{});
+    const entries = if (src_p.value == .object) src_p.value.object.get("entries") else null;
+
+    // 3. compose the fixture.
+    const tapes_v = rec.get("tapes");
+    const tapes: ?std.json.ObjectMap = if (tapes_v) |t| (if (t == .object) t.object else null) else null;
+
+    var buf = std.ArrayList(u8){};
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, &buf);
+    const w = &aw.writer;
+    w.writeAll("{\"request_id\":") catch c.oom();
+    emitStr(w, jStr(rec_val, "request_id") orelse req_id);
+    w.writeAll(",\"tenant\":") catch c.oom();
+    emitStr(w, tenant);
+    w.writeAll(",\"deployment_id\":") catch c.oom();
+    emitStr(w, dep_id);
+    w.writeAll(",\"activation\":") catch c.oom();
+    emitStr(w, jStr(rec_val, "activation") orelse "inbound");
+    w.writeAll(",\"entry\":\"index.mjs\",\"request\":{\"method\":") catch c.oom();
+    emitStr(w, jStr(rec_val, "method") orelse "GET");
+    w.writeAll(",\"path\":") catch c.oom();
+    emitStr(w, jStr(rec_val, "path") orelse "/");
+    w.writeAll(",\"host\":") catch c.oom();
+    emitStr(w, jStr(rec_val, "host") orelse "");
+    w.writeAll("},\"recorded\":{\"status\":") catch c.oom();
+    w.print("{d}", .{jInt(rec_val, "status") orelse 0}) catch c.oom();
+    w.writeAll(",\"console\":") catch c.oom();
+    emitStr(w, jStr(rec_val, "console") orelse "");
+    w.writeAll(",\"exception\":") catch c.oom();
+    emitStr(w, jStr(rec_val, "exception") orelse "");
+    w.writeAll("}") catch c.oom();
+
+    // tape scalars + channels (the record nests them under `tapes`).
+    if (tapes) |t| {
+        if (jStrM(t, "seed")) |s| {
+            w.writeAll(",\"seed\":") catch c.oom();
+            emitStr(w, s);
+        }
+        if (jStrM(t, "timestamp_ns")) |s| {
+            w.writeAll(",\"timestamp_ns\":") catch c.oom();
+            emitStr(w, s);
+        }
+        if (t.get("js_engine_version")) |jv| if (jv == .integer) {
+            w.print(",\"js_engine_version\":{d}", .{jv.integer}) catch c.oom();
+        };
+        w.writeAll(",\"tapes\":{") catch c.oom();
+        var first = true;
+        // record-field → fixture-field remap; only emit present, non-null blobs.
+        const map = [_][2][]const u8{
+            .{ "kv_tape_b64", "kv_b64" },
+            .{ "module_tree_b64", "module_b64" },
+            .{ "request_reads_tape_b64", "request_reads_b64" },
+            .{ "request_body_b64", "request_body_b64" },
+        };
+        for (map) |m| {
+            if (jStrM(t, m[0])) |b64| {
+                if (!first) w.writeByte(',') catch c.oom();
+                first = false;
+                emitStr(w, m[1]);
+                w.writeByte(':') catch c.oom();
+                emitStr(w, b64);
+            }
+        }
+        w.writeAll("}") catch c.oom();
+    }
+
+    // sources: embed the door's entries array verbatim (root.run reads
+    // path/kind/source). Absent ⇒ empty — replay then fails loud on entry.
+    w.writeAll(",\"sources\":") catch c.oom();
+    if (entries) |e| {
+        std.json.Stringify.value(e, .{}, w) catch c.oom();
+    } else {
+        w.writeAll("[]") catch c.oom();
+    }
+    w.writeAll("}") catch c.oom();
+    buf = aw.toArrayList();
+
+    if (out_file) |path| {
+        std.fs.cwd().writeFile(.{ .sub_path = path, .data = buf.items }) catch |e|
+            c.fatal("pull: write {s}: {s}", .{ path, @errorName(e) });
+        std.debug.print("wrote fixture → {s}  ({s}, dep {s})\n", .{ path, req_id, dep_hex });
+    } else {
+        std.debug.print("{s}\n", .{buf.items});
+    }
+}
+
+/// `rewind replay <fixture> [--source-dir DIR] [-o FILE]` — re-execute the
+/// pulled request natively (links the arenajs replay engine; no Node/WASM/
+/// network) and emit the LLM-JSON result. `--source-dir` serves working-tree
+/// module source instead of the pulled source — "does my local change still
+/// satisfy this recorded request?" (off-tape reads surface as divergence).
+fn cmdReplay(a: std.mem.Allocator, fixture_path: []const u8, source_dir: ?[]const u8, out_file: ?[]const u8) void {
+    const bytes = std.fs.cwd().readFileAlloc(a, fixture_path, 64 << 20) catch |e|
+        c.fatal("replay: read {s}: {s}", .{ fixture_path, @errorName(e) });
+    var out = std.ArrayList(u8){};
+    replay.run(a, bytes, source_dir, &out) catch |e| switch (e) {
+        error.EntrySourceMissing => c.fatal("replay: the fixture has no entry source (index.mjs) — re-pull, or pass --source-dir", .{}),
+        error.BadFixture => c.fatal("replay: fixture JSON is malformed", .{}),
+        error.ArenaInit => c.fatal("replay: JS engine failed to initialise", .{}),
+        else => c.fatal("replay: {s}", .{@errorName(e)}),
+    };
+    if (out_file) |path| {
+        std.fs.cwd().writeFile(.{ .sub_path = path, .data = out.items }) catch |e|
+            c.fatal("replay: write {s}: {s}", .{ path, @errorName(e) });
+        std.debug.print("wrote replay result → {s}\n", .{path});
+    } else {
+        std.debug.print("{s}\n", .{out.items});
+    }
+}
+
+fn emitStr(w: *std.Io.Writer, s: []const u8) void {
+    std.json.Stringify.value(s, .{}, w) catch c.oom();
+}
+fn jStrM(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const v = o.get(key) orelse return null;
+    return if (v == .string) v.string else null;
+}
+fn jInt(v: std.json.Value, key: []const u8) ?i64 {
+    if (v != .object) return null;
+    const f = v.object.get(key) orelse return null;
+    return if (f == .integer) f.integer else null;
+}
+
 // ── manifest-driven publish (replaces scripts/publish_firstparty.py) ───────
 
 fn jStr(v: std.json.Value, key: []const u8) ?[]const u8 {
@@ -530,6 +715,9 @@ const USAGE =
     \\  rewind [--env <file>] release <tenant> <dep_id-hex>
     \\  rewind [--env <file>] rollback <tenant> <dep_id-hex>
     \\  rewind [--env <file>] deployments <tenant>
+    \\  rewind [--env <file>] logs <tenant> [--limit N] [--after CURSOR]
+    \\  rewind [--env <file>] pull <tenant> <req_id> [-o FILE]
+    \\  rewind [--env <file>] replay <fixture> [--source-dir DIR] [-o FILE]
     \\  rewind [--env <file>] publish [--apps-dir D] [--only t1,t2] [--include-examples] [--no-release]
     \\  rewind [--env <file>] provision <tenant> [--cluster C] [--host H]
     \\  rewind [--env <file>] host add <host> <tenant>
@@ -586,16 +774,40 @@ pub fn main() void {
         std.mem.eql(u8, verb, "rollback") or std.mem.eql(u8, verb, "deployments") or
         std.mem.eql(u8, verb, "publish") or std.mem.eql(u8, verb, "provision") or
         std.mem.eql(u8, verb, "host") or std.mem.eql(u8, verb, "plan") or
-        std.mem.eql(u8, verb, "move") or std.mem.eql(u8, verb, "route");
+        std.mem.eql(u8, verb, "move") or std.mem.eql(u8, verb, "route") or
+        std.mem.eql(u8, verb, "logs") or std.mem.eql(u8, verb, "pull") or
+        std.mem.eql(u8, verb, "replay");
     if (!known) {
         std.debug.print("rewind: unknown command '{s}'\n\n{s}", .{ verb, USAGE });
         std.process.exit(2);
     }
 
+    const rest = argv[i..];
+
+    // `replay` is fully offline (no dashboard / IdP) — handle it before
+    // loadCfg so it never demands REWIND_ADMIN_URL / REWIND_IDP_URL.
+    if (std.mem.eql(u8, verb, "replay")) {
+        if (rest.len < 1) c.fatal("replay needs <fixture> [--source-dir DIR] [-o FILE]", .{});
+        var source_dir: ?[]const u8 = null;
+        var out_file: ?[]const u8 = null;
+        var j: usize = 1;
+        while (j < rest.len) : (j += 1) {
+            if (std.mem.eql(u8, rest[j], "--source-dir")) {
+                if (j + 1 >= rest.len) c.fatal("--source-dir needs a path", .{});
+                source_dir = rest[j + 1];
+                j += 1;
+            } else if (std.mem.eql(u8, rest[j], "-o")) {
+                if (j + 1 >= rest.len) c.fatal("-o needs a path", .{});
+                out_file = rest[j + 1];
+                j += 1;
+            } else c.fatal("replay: unknown option '{s}'", .{rest[j]});
+        }
+        cmdReplay(a, rest[0], source_dir, out_file);
+        return;
+    }
+
     var cfg = loadCfg(gpa, a, env_path);
     defer cfg.env.deinit();
-
-    const rest = argv[i..];
     if (std.mem.eql(u8, verb, "login")) {
         cmdLogin(a, &cfg);
     } else if (std.mem.eql(u8, verb, "status")) {
@@ -679,5 +891,34 @@ pub fn main() void {
     } else if (std.mem.eql(u8, verb, "route")) {
         if (rest.len < 1) c.fatal("route needs <host>", .{});
         cmdRoute(a, &cfg, rest[0]);
-    } else unreachable; // verb validated above
+    } else if (std.mem.eql(u8, verb, "logs")) {
+        if (rest.len < 1) c.fatal("logs needs <tenant> [--limit N] [--after CURSOR]", .{});
+        var limit: ?[]const u8 = null;
+        var after: ?[]const u8 = null;
+        var j: usize = 1;
+        while (j < rest.len) : (j += 1) {
+            if (std.mem.eql(u8, rest[j], "--limit")) {
+                if (j + 1 >= rest.len) c.fatal("--limit needs a value", .{});
+                limit = rest[j + 1];
+                j += 1;
+            } else if (std.mem.eql(u8, rest[j], "--after")) {
+                if (j + 1 >= rest.len) c.fatal("--after needs a value", .{});
+                after = rest[j + 1];
+                j += 1;
+            } else c.fatal("logs: unknown option '{s}'", .{rest[j]});
+        }
+        cmdLogs(a, &cfg, rest[0], limit, after);
+    } else if (std.mem.eql(u8, verb, "pull")) {
+        if (rest.len < 2) c.fatal("pull needs <tenant> <req_id> [-o FILE]", .{});
+        var out_file: ?[]const u8 = null;
+        var j: usize = 2;
+        while (j < rest.len) : (j += 1) {
+            if (std.mem.eql(u8, rest[j], "-o")) {
+                if (j + 1 >= rest.len) c.fatal("-o needs a path", .{});
+                out_file = rest[j + 1];
+                j += 1;
+            } else c.fatal("pull: unknown option '{s}'", .{rest[j]});
+        }
+        cmdPull(a, &cfg, rest[0], rest[1], out_file);
+    } else unreachable; // verb validated above (replay handled before loadCfg)
 }

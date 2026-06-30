@@ -191,6 +191,34 @@ pub fn build(b: *std.Build) void {
     qjs_mod.addIncludePath(arenajs_dep.path(".")); // quickjs.h, qjs-arena.h
     qjs_mod.linkLibrary(arenajs_dep.artifact("arenajs"));
 
+    // ── native arenajs replay engine (Phase 2 §2a) ──
+    //
+    // The `arenajs` artifact above is the worker's engine (trace OFF, no host).
+    // The replay/simulator CLI links arenajs's SECOND artifact `arenajs-replay`
+    // (the core TUs + reactor + replay-bindings + trace, ARENA_TRACE_ENABLED=1 —
+    // the same composition the browser `qjs_arena_wasm` target builds). The
+    // trace/snapshot-sensitive cflags live in arenajs's build.zig, not here.
+    const linkReplayEngine = struct {
+        fn f(mod: *std.Build.Module, dep: *std.Build.Dependency) void {
+            mod.link_libc = true;
+            mod.linkSystemLibrary("m", .{});
+            mod.linkSystemLibrary("pthread", .{});
+            mod.addIncludePath(dep.path("."));
+            mod.linkLibrary(dep.artifact("arenajs-replay"));
+        }
+    }.f;
+
+    // replay-spike: de-risk the native link + console/result extraction (§2a).
+    const spike_mod = b.createModule(.{
+        .root_source_file = b.path("src/replay/spike.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    linkReplayEngine(spike_mod, arenajs_dep);
+    const spike_exe = b.addExecutable(.{ .name = "replay-spike", .root_module = spike_mod });
+    const spike_step = b.step("replay-spike", "Native arenajs replay de-risk spike (Phase 2 §2a)");
+    spike_step.dependOn(&b.addInstallArtifact(spike_exe, .{}).step);
+
     // ── rove-jwt: shared HS256 mint + verify for the standalone
     //    services' Authorization gate (log-server, files-server).
     //    Pure stdlib, no external library — see src/jwt/root.zig.
@@ -1175,16 +1203,50 @@ pub fn build(b: *std.Build) void {
     ops_test_step.dependOn(&b.addRunArtifact(ops_tests).step);
     test_step.dependOn(&b.addRunArtifact(ops_tests).step);
 
+    // ── rove-replay: the native replay driver (Phase 2 §2c). Decodes a pulled
+    // fixture, drives arenajs's native replay engine over the recorded tape,
+    // and emits the LLM-JSON artifact. Links `arenajs-replay` (so anything
+    // importing it links the JS engine — see `rewind` below). Self-contained:
+    // no rove modules, no Node/WASM/network at replay time.
+    const replay_mod = b.createModule(.{
+        .root_source_file = b.path("src/replay/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    linkReplayEngine(replay_mod, arenajs_dep);
+
+    const replay_tests = b.addTest(.{ .root_module = replay_mod });
+    const replay_test_step = b.step("replay-test", "Run the native replay driver unit tests");
+    replay_test_step.dependOn(&b.addRunArtifact(replay_tests).step);
+    test_step.dependOn(&b.addRunArtifact(replay_tests).step);
+
+    // replay-driver-smoke: full decode→host→epilogue→extract on the real
+    // engine, in-memory fixture, no cluster (§2c verification).
+    const driver_smoke_mod = b.createModule(.{
+        .root_source_file = b.path("src/replay/driver_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    linkReplayEngine(driver_smoke_mod, arenajs_dep);
+    const driver_smoke_exe = b.addExecutable(.{ .name = "replay-driver-smoke", .root_module = driver_smoke_mod });
+    const driver_smoke_step = b.step("replay-driver-smoke", "Native replay driver end-to-end smoke (Phase 2 §2c)");
+    driver_smoke_step.dependOn(&b.addRunArtifact(driver_smoke_exe).step);
+
     // ── rewind: the OIDC customer CLI (docs/plans/rewind-cli-plan.md §6, Track 3).
     // The customer-shippable half of the split — carries an OIDC session
     // (device-grant login → /v1/cli/exchange), never a platform secret.
-    // Shares src/cli/common.zig with rewind-ops; std-only (TLS curl + cookie
-    // jar transport), no rove modules / system libs / raft linkage.
+    // Shares src/cli/common.zig with rewind-ops; std-only transport (TLS curl +
+    // cookie jar) for the deploy/log verbs. Phase 2 adds `logs`/`pull`/`replay`,
+    // which link the native replay engine via `rove-replay` — so `rewind` now
+    // links the JS engine (heavier than the std-only deploy build; acceptable
+    // for one unified CLI, plan §2a). No system libs beyond the engine's own.
     const cli_mod = b.createModule(.{
         .root_source_file = b.path("src/cli/rewind.zig"),
         .target = target,
         .optimize = optimize,
     });
+    cli_mod.addImport("rove-replay", replay_mod);
+    linkReplayEngine(cli_mod, arenajs_dep);
     const cli_exe = b.addExecutable(.{ .name = "rewind", .root_module = cli_mod });
     const cli_step = b.step("rewind", "Build the rewind customer CLI");
     cli_step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);

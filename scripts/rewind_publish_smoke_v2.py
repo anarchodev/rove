@@ -120,6 +120,10 @@ def main() -> int:
     with V2Cluster.spawn("rwpub", nodes=1, http_base=19980, raft_base=20080,
                          tls_idp=True, tls_cert=cert, tls_key=key) as c:
         tls_port = c.tls_front_port
+        # Phase 2 needs the request-log query surface: the `__admin__`
+        # `rewind-logs.internal` door (LOG_DOOR) reads tenant logs from the
+        # co-spawned log-server (the worker is already wired to its port).
+        c.spawn_log_server()
         # Tenant ids and hosts are distinct: the system tenants are `__admin__` /
         # `__auth__`, but underscored labels are invalid hostnames that TLS cert
         # verification rejects (the harness only gets away with it via `curl -k`).
@@ -283,11 +287,11 @@ def main() -> int:
               f"dep1={dep1} dep2={dep2}")
 
         # v2 is live now.
-        for _ in range(20):
+        for _ in range(35):
             resp = c.tls_curl(c.tls_origin("pubapp") + "/")
             if resp.status == 200 and "v2" in resp.body:
                 break
-            time.sleep(0.3)
+            time.sleep(1.0 if resp.status == 429 else 0.3)
         check("pubapp serves v2 after release", resp.status == 200 and "v2" in resp.body,
               f"got {resp.status} {resp.body[:80]!r}")
 
@@ -303,11 +307,16 @@ def main() -> int:
             r = rw("rollback", "pubapp", dep1)
             check("rewind rollback pubapp <dep1> → released", r.returncode == 0 and "released pubapp" in r.stdout,
                   r.stdout[:300])
-            for _ in range(20):
+            # Time-based with 429 backoff: under the busier cluster the
+            # per-tenant token bucket can stay drained for a while, so give the
+            # rollback propagation a generous window rather than a fixed count.
+            rb_deadline = time.time() + 40.0
+            resp = None
+            while time.time() < rb_deadline:
                 resp = c.tls_curl(c.tls_origin("pubapp") + "/")
                 if resp.status == 200 and "v1" in resp.body:
                     break
-                time.sleep(0.3)
+                time.sleep(1.0 if resp.status == 429 else 0.3)
             check("pubapp serves v1 after rollback", resp.status == 200 and "v1" in resp.body,
                   f"got {resp.status} {resp.body[:80]!r}")
             r = rw("deployments", "pubapp")
@@ -338,18 +347,124 @@ def main() -> int:
             resp = c.tls_curl(c.tls_origin("manifestapp") + "/")
             if resp.status == 200 and "from-manifest" in resp.body:
                 break
-            time.sleep(0.3)
+            time.sleep(1.0 if resp.status == 429 else 0.3)
         check("manifestapp serves after publish", resp.status == 200 and "from-manifest" in resp.body,
               f"got {resp.status} {resp.body[:80]!r}")
 
+        # ── Phase 2: pull a recorded request + replay it natively ─────────
+        # Deploy a handler that READS kv, WRITES kv, and logs — so the recorded
+        # request carries a kv read tape + console the native replay must
+        # reproduce. Then logs → pull → replay, asserting the replay reproduces
+        # the record's OWN console + write-set (no hardcoded counter), and that
+        # a working-tree change (--source-dir) surfaces a tape divergence.
+        rep_dir = Path(tempfile.mkdtemp(prefix="replayapp"))
+        (rep_dir / "index.mjs").write_text(
+            "export default function(){\n"
+            "  const n = kv.get('hits');\n"
+            "  const cur = n === null ? 0 : (+n);\n"
+            "  kv.set('hits', String(cur + 1));\n"
+            "  console.log('hit ' + cur);\n"
+            "  return 'hits=' + cur;\n"
+            "}\n")
+        r = rw("provision", "replayapp", "--cluster", c.cluster_id, "--host", "replayapp.localhost")
+        check("rewind provision replayapp", r.returncode == 0 and
+              ("provisioned replayapp" in r.stdout or "already placed" in r.stdout), r.stdout[:300])
+        r = rw("deploy", "replayapp", str(rep_dir), "--release")
+        check("rewind deploy replayapp --release", r.returncode == 0 and "released replayapp" in r.stdout,
+              r.stdout[:400])
+
+        # Drive a real request through the front so the worker records it.
+        served = False
+        for _ in range(25):
+            resp = c.tls_curl(c.tls_origin("replayapp") + "/")
+            if resp.status == 200 and resp.body.startswith("hits="):
+                served = True
+                break
+            time.sleep(1.0 if resp.status == 429 else 0.3)
+        check("replayapp serves (recorded request)", served, f"got {resp.status} {resp.body[:80]!r}")
+
+        # logs: poll until the indexer surfaces a SERVED replayapp request. We
+        # want a status-200 record (one that actually dispatched the handler +
+        # taped kv/console) — a rate-limited 429 is rejected before dispatch and
+        # carries deployment_id 0 (no manifest to pull), so skip those.
+        req_id = None
+        last = ""
+        deadline = time.time() + 60.0
+        while time.time() < deadline:
+            r = rw("logs", "replayapp")
+            last = r.stdout
+            if r.returncode == 0:
+                try:
+                    recs = json.loads(r.stdout).get("records", [])
+                except (json.JSONDecodeError, ValueError):
+                    recs = []
+                served = [rec for rec in recs if rec.get("status") == 200]
+                if served:
+                    req_id = served[0].get("request_id")
+                    break
+            time.sleep(1.0)
+        if not req_id:
+            # Isolate: does the log-server itself (bypassing the admin door)
+            # have replayapp records, or any tenant's at all?
+            try:
+                direct = c.log_get("replayapp/list?limit=5", timeout=15.0)
+                pub = c.log_get("pubapp/list?limit=5", timeout=15.0)
+                print(f"  [diag] direct replayapp/list: {direct.status} {direct.body[:160]!r}")
+                print(f"  [diag] direct pubapp/list:    {pub.status} {pub.body[:160]!r}")
+            except Exception as e:
+                print(f"  [diag] direct log_get failed: {e}")
+        check("rewind logs lists a recorded request_id", bool(req_id), last[:300])
+
+        if req_id:
+            fixture = Path(tempfile.mkdtemp(prefix="fix")) / "req.json"
+            r = rw("pull", "replayapp", req_id, "-o", str(fixture))
+            check("rewind pull writes a self-contained fixture",
+                  r.returncode == 0 and fixture.exists(), r.stdout[:300])
+
+            # Replay it natively — no Node/WASM/network. Reproduce the record.
+            r = rw("replay", str(fixture))
+            try:
+                art = json.loads(r.stdout)
+            except (json.JSONDecodeError, ValueError):
+                art = {}
+            rec_console = (art.get("recorded") or {}).get("console", "")
+            rep_console = " ".join(art.get("replay", {}).get("console", []))
+            kv_writes = art.get("kv_writes", [])
+            wrote_hits = any(w.get("op") == "set" and w.get("key") == "hits" for w in kv_writes)
+            check("rewind replay reproduces the run (no divergence)",
+                  r.returncode == 0 and art.get("divergence") is None, r.stdout[:400])
+            check("replay reproduces the recorded console",
+                  rec_console.strip() != "" and rec_console.strip() == rep_console.strip(),
+                  f"recorded={rec_console!r} replay={rep_console!r}")
+            check("replay reproduces the kv write-set (hits set)", wrote_hits, str(kv_writes)[:200])
+            check("replay status matches the recording", art.get("status_match") is True,
+                  f"replayed={art.get('replayed_status')} match={art.get('status_match')}")
+
+            # --source-dir: a working-tree handler that reads an OFF-TAPE key
+            # must surface a divergence (the simulate lever), not a silent pass.
+            local = Path(tempfile.mkdtemp(prefix="local"))
+            (local / "index.mjs").write_text(
+                "export default function(){ const x = kv.get('not-on-tape'); return 'x=' + x; }\n")
+            r = rw("replay", str(fixture), "--source-dir", str(local))
+            try:
+                art2 = json.loads(r.stdout)
+            except (json.JSONDecodeError, ValueError):
+                art2 = {}
+            check("rewind replay --source-dir surfaces a divergence on an off-tape read",
+                  art2.get("divergence") is not None and art2.get("status_match") is False,
+                  r.stdout[:400])
+
         if failures:
-            c.dump_node_log(grep=["deploy", "cp", "provision", "release", "history", "error", "warn"])
+            c.dump_node_log(grep=["deploy", "cp", "provision", "release", "history",
+                                  "log", "tape", "error", "warn"])
 
     if failures:
         print(f"\nFAILED ({len(failures)}): {failures}")
         return 1
     print("\nPASS — `rewind` drives login → provision → deploy → deployments → "
-          "rollback → route → publish end-to-end. One CLI, no platform secret.")
+          "rollback → route → publish, then logs → pull → replay (native, "
+          "offline) reproduces a recorded request and catches a working-tree "
+          "divergence. One CLI for deploy + replay, no platform secret.")
     return 0
 
 
