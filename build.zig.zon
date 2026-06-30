@@ -3,8 +3,8 @@
     .version = "0.0.0",
     .dependencies = .{
         .arenajs = .{
-            .url = "git+https://github.com/anarchodev/arenajs#681885b5fffc0b6884a53216144065f4e9fefc04",
-            .hash = "arenajs-0.2.1-QYKxacYGKwBrF3wRab_db-deqhzrORpx7ubBjmkgLqU7",
+            .url = "git+https://github.com/anarchodev/arenajs#2608b062866afcbf1e6142af34e4d7edfaac365f",
+            .hash = "arenajs-0.2.1-QYKxaf0IKwAhL8uBkrsWzjwqT7N5KMpuUV3G5g1LnCVg",
         },
         .kvexp = .{
             .url = "git+https://github.com/anarchodev/kvexp#5492725ecf1a4f6d156f33f0f1ea108474928910",
