@@ -120,7 +120,7 @@
       ]
     },
     {
-      "_comment": "Shim-overhead bench — DIRECT arm. Read-only kv.get loop, native binding called directly. Pair with kvshim. Driven by scripts/kv_shim_overhead_bench.sh.",
+      "_comment": "Shim-overhead bench — DIRECT arm. Read-only kv.get loop, native binding called directly. Pair with kvshim. Driven by scripts/bench/kv_shim_overhead_bench.sh.",
       "id": "kvdirect",
       "domains": ["kvdirect.test"],
       "files": [{"path": "index.mjs", "source": "loop46-demo-tenants/kvdirect/index.mjs"}],

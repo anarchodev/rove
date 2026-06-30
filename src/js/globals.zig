@@ -1905,7 +1905,7 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // per-request cost. NOT a privilege boundary (the natives
     // self-gate, e.g. platform.* checks state.platform) — this is API
     // hygiene: keep `_system.*` free to change. Pairs with
-    // scripts/globals_lint.py (catches refs in-tree; this makes the
+    // scripts/ops/globals_lint.py (catches refs in-tree; this makes the
     // global physically absent at runtime).
     evalSnippet(ctx, "_harden.js", "delete globalThis._system;");
 }
@@ -3219,7 +3219,7 @@ pub fn install(
 //
 // Run under `zig build test`. (a) — "no customer code references
 // `_system`" — is a repo-tree scan and lives in
-// scripts/globals_lint.py: a unit test can't robustly walk
+// scripts/ops/globals_lint.py: a unit test can't robustly walk
 // examples/ + web/ without coupling to cwd/layout. (b) and (c) are
 // hermetic here — they pivot on GLOBALS_FILES + the native-binding
 // arrays in this file, so they need no filesystem and fail at the

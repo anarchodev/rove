@@ -1,7 +1,7 @@
 # rewind CLI — tenant operations, design plan
 
 Status: **proposal, 2026-06-15.** No code yet. This doc proposes a Zig
-`rewind` operator CLI to replace `scripts/publish_tenant.py` and the
+`rewind` operator CLI to replace `scripts/ops/publish_tenant.py` and the
 hand-run curl that surrounds it, and names the server-side seam the CLI
 should eventually consolidate onto.
 
@@ -13,11 +13,11 @@ good shape:
 | | Platform binaries | Tenant content |
 |---|---|---|
 | What ships | `rewind` / `rewind-cp` / `rewind-front` | a tenant's handler bundle + statics |
-| Driver | rove `scripts/build.sh` → rewind-infra `scripts/deploy.sh` (the `/deploy` skill) | `scripts/publish_tenant.py` (the `/publish` skill) |
+| Driver | rove `scripts/ops/build.sh` → rewind-infra `scripts/deploy.sh` (the `/deploy` skill) | `scripts/ops/publish_tenant.py` (the `/publish` skill) |
 | Cadence | rare (engine changes) | every site/handler edit |
 | Reaches | the 3 hosts over SSH + systemctl | S3 + CP + a worker over the private plane |
 
-The deploy is mature: build (rove `scripts/build.sh`, ReleaseFast + test gate)
+The deploy is mature: build (rove `scripts/ops/build.sh`, ReleaseFast + test gate)
 → ship + rolling one-host-at-a-time restart (cp → worker → front → logs) with
 health/leader probes between each, aborting if a node fails to rejoin quorum.
 (Since this plan was written, building/deploying split across two repos and the
@@ -102,7 +102,7 @@ written once in `common.zig`; each binary wires its own auth. (Detail: §6.)
 
 The set below comes from auditing what the CP / worker / `__admin__` app
 actually expose, **not** from porting `publish_tenant.py`. Built + green
-(`scripts/rewind_cli_smoke_v2.py`):
+(`scripts/smoke/rewind_cli_smoke_v2.py`):
 
 ```
 rewind-ops bootstrap                              # provision __admin__ (CP) + reset
@@ -415,7 +415,7 @@ path — a decision to make when the dashboard replaces `admin_interim`.
 ## 6. Naming — rename the worker, free `rewind` for the client
 
 > **DONE.** The worker binary is `rewind-worker` (`build.zig:1055` exe +
-> step; `scripts/smoke_lib_v2.py:47`; `scripts/deploy.sh` restarts
+> step; `scripts/smoke/smoke_lib_v2.py:47`; `scripts/deploy.sh` restarts
 > `rewind-worker.service`; `scripts/systemd/v2/rewind-worker.service`
 > `ExecStart=…/rewind-worker`). The command name `rewind` is free for the
 > customer CLI (B5). The rest of this section is the original rationale.
@@ -454,7 +454,7 @@ back-compat — `feedback_no_prelaunch_backcompat`):
 
 - `build.zig:1101-1102` — exe `.name` + the `b.step("rewind", …)` build step
 - `scripts/systemd/v2/rewind-worker.service:22` ExecStart + the README table
-- `scripts/smoke_lib_v2.py:45` — `REWIND = BIN_DIR / "rewind"`
+- `scripts/smoke/smoke_lib_v2.py:45` — `REWIND = BIN_DIR / "rewind"`
 - `scripts/deploy.sh` — the `BINS=(rewind …)` array entry + push loop (the
   `systemctl restart rewind-worker.service` line is already correct)
 - docs: `CLAUDE.md`, `PLAN.md` §13, `architecture/configuration-and-network.md`

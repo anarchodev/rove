@@ -126,7 +126,7 @@ green tests.
 ## Crash-consistency validation
 
 - [ ] **D power-loss / fsync-ordering gap (from correctness-plan) — the single
-      most important item here; tracked nowhere else.** `scripts/raft_soak_prod.py`
+      most important item here; tracked nowhere else.** `scripts/smoke/raft_soak_prod.py`
       exists and is green: a 3-node cluster under write churn + ungraceful
       `kill_node` + `wipe→reconciler-heal` rounds (the A2 promote-back rejoin
       window), asserting after each round that quorum holds, the victim rejoins
@@ -222,7 +222,7 @@ justified) and are recorded there + in `decisions.md` §10.12.
   `slot.durabilized_idx` (the folded watermark, `≤` snapshot content by
   construction, still `snapshot_grace` entries above the compaction floor); fix
   `0fcaa73`, deterministic unit gate green, plus the
-  `scripts/snapshot_catchup_no_fork_smoke_v2.py` 3-node convergence smoke. **But
+  `scripts/smoke/snapshot_catchup_no_fork_smoke_v2.py` 3-node convergence smoke. **But
   the underlying design lesson is not discharged by the point fix:** the baseline
   index and the snapshot data were captured at **two different times on two
   different threads** with no invariant relating them (index = `appliedIndex` on
@@ -283,4 +283,4 @@ Listed so they are not re-opened. Provenance preserved.
 | B2 (correctness) `nodeApplied`→`nodeLastIndex` | signal was already correct (compares `last_index` like-with-like); name + misleading comment fixed | `src/cp/main.zig` |
 | B3 (correctness) reconciler re-address UAF | `Directory.resolveOwned` deep-copies the node set UNDER THE LOCK; reconciler uses it + `deinit`s per tenant. NOTE: move paths still aliased → **RC-4 (open above)** | `src/cp/main.zig` + `src/cp/directory.zig` |
 | raft-rs-zig WAL (C1–C5 first pass) | `ed29bac` (release-optimized staticlib, closes `-O0` `movaps` GPF in `confchange::restore`), `c5c9a9c` (term-0 baseline reject `-5`, null-checks, loud drops), `6165419` (`-1`→`UnknownGroup`, baseline gate, `GapInLog` panic), `87ed59e` (C1 compaction-marker fsync-before-unlink, C2 `roll()` header+dir fsync, C4 malformed fixed-size reject, C5 confstate corruption propagation, S3 `FileNotFound` distinction, C3 unlink-fail log) | raft-rs-zig `main` |
-| D soak harness | `scripts/raft_soak_prod.py` 3-node crash-recovery + wipe-heal soak, green incl. leader-kill mid-churn | (power-loss coverage still open — see Crash-consistency above) |
+| D soak harness | `scripts/smoke/raft_soak_prod.py` 3-node crash-recovery + wipe-heal soak, green incl. leader-kill mid-churn | (power-loss coverage still open — see Crash-consistency above) |

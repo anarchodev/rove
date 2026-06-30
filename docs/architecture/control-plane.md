@@ -58,7 +58,7 @@ source → attach the destination at a fresh epoch → flip → evict the source
 - **Crash reconcile**: `reconcileStuckMoves` (CP leader, periodic) aborts a
   tenant stuck `moving` and reverts it to active on the source.
 - **Status**: single-node and multi-node HA (3–5 voters) shipped, proven by
-  `scripts/cp_ha_smoke.py` (seed replicates, a follower-forwarded move commits,
+  `scripts/smoke/cp_ha_smoke.py` (seed replicates, a follower-forwarded move commits,
   kill the leader → a survivor promotes and a fresh move commits on quorum).
 
 ## Tenant move orchestration
@@ -98,7 +98,7 @@ relocate via `/_control/move`); a formation failure evicts the half-formed
 groups, so a failed provision is a no-op. No root/instance marker write is
 needed — the CP directory (placement + host axis) plus the empty instance is
 exactly the state a move-in destination ends with. Proven on a real 3-node
-cluster: `scripts/cp_provision_smoke.py` (provision → group forms on all 3
+cluster: `scripts/smoke/cp_provision_smoke.py` (provision → group forms on all 3
 nodes → a write commits + replicates everywhere → the front routes the host →
 re-provision 409 / unknown-cluster 400).
 
@@ -114,7 +114,7 @@ re-provision 409 / unknown-cluster 400).
 - **Delivery**: a plan rides the `v2-attach` handshake at cold-start/move
   (`X-Rewind-Plan`); a live tier change is a single-target push to the tenant's
   current cluster (`POST /_system/v2-plan`, a plan-generation bump). Proven by
-  `scripts/cp_plan_smoke.py` + `cp_plan_delivery_smoke.py`.
+  `scripts/smoke/cp_plan_smoke.py` + `cp_plan_delivery_smoke.py`.
 - **The tier model**: a tenant's plan is `{tier, overrides}` stored verbatim
   (dumb CP); the effective value of any limit is
   `override ?? TIER_TABLE[tier].field`, resolved at **read-time** — changing
@@ -163,7 +163,7 @@ The zero-downtime move keeps the source online throughout:
   clobbering a forwarded write); because forwarding is synchronous it has every
   acked write, so the flip loses nothing. `handleMoveLive` orchestrates this.
 
-Proven under load: `scripts/zero_downtime_load_smoke.py` moves a tenant under
+Proven under load: `scripts/smoke/zero_downtime_load_smoke.py` moves a tenant under
 **continuous load** (a CP-following concurrent writer) with zero failed
 requests and zero lost writes; `multi_dest_forward_smoke.py` proves the
 `_move/forward` marker's full dest-node list (leader-first CSV) re-aims the
@@ -180,7 +180,7 @@ lost (decisions.md §10.5).
 - **ACME renewal** (timer-driven, expiry-aware reissue) is the tracked follow-up
   in `auth-and-domains.md` (leader-elected issuance itself is shipped).
 - **Plan-enforcement test follow-ups** (non-blocking; the deployed-handler e2e
-  and 429 halves are closed by `scripts/ctl_smoke_v2.py` +
+  and 429 halves are closed by `scripts/smoke/ctl_smoke_v2.py` +
   `rate_limit_smoke_v2.py`): a `413` body-gate e2e smoke, and wiring the smoke
   topology's log-server `cp_url` so the retention clamp is exercised
   end-to-end.

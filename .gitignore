@@ -3,3 +3,7 @@
 scripts/__pycache__/
 examples/rust_ffi_smoke/target/
 examples/rust_ffi_smoke/Cargo.lock
+
+# Python bytecode
+__pycache__/
+*.pyc

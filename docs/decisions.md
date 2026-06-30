@@ -242,7 +242,7 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
 - **Manifest `kind=cron` retired outright** (not re-platformed under the hood):
   a `kind=cron` spec.json fails the deploy loudly; sub-minute intervals are a
   self-re-arming `scheduler.after` seeded from `onBoot`
-  (`scripts/scheduler_heartbeat_smoke_v2.py` is the recipe).
+  (`scripts/smoke/scheduler_heartbeat_smoke_v2.py` is the recipe).
 - **Rejected**: a many-timer engine index (queue lives in the JS lib);
   at-least-once *completion* (engine absorbs the retry kernel); interval-cron
   as the primitive; bring-your-own scheduler override (deferred until a

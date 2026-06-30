@@ -55,7 +55,7 @@ install -D -m0755 zig-out/bin/rewind-front  ~/.local/bin/rewind-front
 install -D -m0755 zig-out/bin/rewind-logs   ~/.local/bin/rewind-logs
 ```
 
-`scripts/build.sh` wraps this — it builds all four shipped binaries (+
+`scripts/ops/build.sh` wraps this — it builds all four shipped binaries (+
 `rewind-ops`) at `ReleaseFast` and runs the test gate. The ship + restart
 orchestration (rolling / genesis across a host list) is operator-specific and
 lives outside this public repo; the bring-up steps below are the manual
@@ -249,7 +249,7 @@ for a cold genesis (a lone cold-multi CP can't elect), **roll one node at a
 time** for updates of a formed cluster (each raft group tolerates one down), and
 **health-gate** each step (cp leader → worker `/_system/health` → front → logs)
 before touching the next host. Our own operator repo's `deploy.sh` implements
-exactly this on top of `scripts/build.sh`.
+exactly this on top of `scripts/ops/build.sh`.
 
 A **single node** is the same minus the peers: set `REWIND_VOTERS=1` /
 `REWIND_CP_VOTERS=1` (empty peer lists), start the four units in order.

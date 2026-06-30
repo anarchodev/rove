@@ -67,7 +67,7 @@ cursor API — is the next set of milestones.
   point to avoid full re-runs per step. (§8.8)
 
 ### Smoke coverage landed — see `scripts/replay_wasm_smoke.py` and
-### `scripts/replay_shell_smoke.mjs` (Playwright). Dev bringup is
+### `scripts/smoke/replay_shell_smoke.mjs` (Playwright). Dev bringup is
 ### `scripts/replay_wasm_dev.py` (there is no dev-mode CLI
 ### subcommand).
 
@@ -491,7 +491,7 @@ build-time toggling. It doesn't.
 
 Dev cluster bringup via `scripts/replay_wasm_dev.py` (there is no
 dev-mode CLI subcommand). Smoke coverage in
-`scripts/replay_wasm_smoke.py` and `scripts/replay_shell_smoke.mjs`
+`scripts/replay_wasm_smoke.py` and `scripts/smoke/replay_shell_smoke.mjs`
 (Playwright).
 
 ### 8.2 Source view — DONE

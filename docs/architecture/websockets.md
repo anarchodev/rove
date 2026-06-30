@@ -114,7 +114,7 @@ in-flight write emits inline. Companion read-side dual
 `NotChainHead` (its read crossed *another producer's* in-flight overlay)
 re-ships through an empty-writeset **barrier propose**, so frames computed
 on un-durable state reach the wire only after the chain commits. Smoke:
-`scripts/ws_ordering_smoke_v2.py`.
+`scripts/smoke/ws_ordering_smoke_v2.py`.
 
 ## Handler surface
 
@@ -157,7 +157,7 @@ seam (`ws_message_out` inbound / `ws_send_in` outbound collections). Pieces:
 | C | connection mode switch (`Http1Conn.ws_mode` → `wsDrive`) | ✅ done |
 | D | frame → `onMessage`/`onDisconnect` activation (`serviceWsMessages`, `src/js/worker_ws.zig`) | ✅ done (2026-06-09) |
 | E | outbound framing (`consumeWsSends` / `wsFlush`, one write in flight) | ✅ done |
-| F | functional smoke (`scripts/ws_worker_smoke_v2.py`) | ✅ done (2026-06-09) |
+| F | functional smoke (`scripts/smoke/ws_worker_smoke_v2.py`) | ✅ done (2026-06-09) |
 
 Edge transport detail (handshake, `wsDrive`, the seam) lives in
 `routing-and-ingress.md` `## WebSocket (RFC 6455)`.

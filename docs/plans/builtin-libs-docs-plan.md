@@ -41,7 +41,7 @@ Empirically validated 2026-05-16: the extra JS frame per call costs
 **0.00%** even in the worst case (read-only, 200 `kv.get`/req,
 hot primitive, full TLS+raft cluster). Shim everything; do **not**
 dual-expose hot primitives. Harness:
-`scripts/kv_shim_overhead_bench.sh` + `kvdirect`/`kvshim` tenants.
+`scripts/bench/kv_shim_overhead_bench.sh` + `kvdirect`/`kvshim` tenants.
 
 ### Two documented exceptions (not shims)
 

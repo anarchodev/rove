@@ -629,7 +629,7 @@ fn jInt(v: std.json.Value, key: []const u8) ?i64 {
     return if (f == .integer) f.integer else null;
 }
 
-// ── manifest-driven publish (replaces scripts/publish_firstparty.py) ───────
+// ── manifest-driven publish (replaces scripts/ops/publish_firstparty.py) ───────
 
 fn jStr(v: std.json.Value, key: []const u8) ?[]const u8 {
     if (v != .object) return null;
@@ -649,7 +649,7 @@ fn inList(list: [][]const u8, s: []const u8) bool {
 /// `rewind publish [--apps-dir D] [--only ...] [--include-examples] [--no-release]`
 /// — read `{apps-dir}/manifest.json` and drive provision + host-map + deploy +
 /// release for each first-party tenant. The typed twin of
-/// `scripts/publish_firstparty.py`, over the session cookie (no operator secret).
+/// `scripts/ops/publish_firstparty.py`, over the session cookie (no operator secret).
 fn cmdPublish(a: std.mem.Allocator, cfg: *const Cfg, apps_dir: []const u8, only: [][]const u8, include_examples: bool, no_release: bool) void {
     const mpath = std.fs.path.join(a, &.{ apps_dir, "manifest.json" }) catch c.oom();
     const bytes = std.fs.cwd().readFileAlloc(a, mpath, 4 << 20) catch |e|

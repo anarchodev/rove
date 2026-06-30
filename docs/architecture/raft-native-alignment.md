@@ -487,7 +487,7 @@ materialize-to-temp alternative for pathologically-hot tenants stays open.)
 
 ### Verified
 
-`scripts/snapshot_stream_large_smoke_v2.py` — a ~50 MiB store (server-generated
+`scripts/smoke/snapshot_stream_large_smoke_v2.py` — a ~50 MiB store (server-generated
 256 KiB values) streamed to a peer stranded past the compaction buffer, recovered
 to the leader's `last_index`, sampled big values read back byte-exact across
 multiple dest batches. `snapshot_trigger_smoke_v2` passes via the new path;

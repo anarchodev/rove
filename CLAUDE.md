@@ -40,17 +40,17 @@ handlers (no `pkill -f` fragility). V2 smokes need S3 credentials in the
 environment first (`set -a; . ./.env; set +a`) — V2 has no fs blob backend.
 
 ```bash
-python3 scripts/rewind_smoke.py        # single-node rewind write path (propose → commit → 204)
-python3 scripts/ctl_smoke_v2.py        # provision → deploy → serve through the front door
-python3 scripts/three_node_smoke.py    # ⭐ multi-node HA: move onto a 3-node cluster, kill the leader
-python3 scripts/tenant_move_smoke.py   # live tenant move cluster-1 → cluster-2
+python3 scripts/smoke/rewind_smoke.py        # single-node rewind write path (propose → commit → 204)
+python3 scripts/smoke/ctl_smoke_v2.py        # provision → deploy → serve through the front door
+python3 scripts/smoke/three_node_smoke.py    # ⭐ multi-node HA: move onto a 3-node cluster, kill the leader
+python3 scripts/smoke/tenant_move_smoke.py   # live tenant move cluster-1 → cluster-2
 ```
 
-`scripts/smoke_lib_v2.py` is the V2 harness — `V2Cluster.spawn` brings up
+`scripts/smoke/smoke_lib_v2.py` is the V2 harness — `V2Cluster.spawn` brings up
 rewind-cp + front door + rewind node(s) and exposes `provision` /
 `deploy_handlers` / `wait_for_handler` (deploys go through the worker's
 `/_system/deploy` — files-server dissolved, `docs/plans/rewind-cli-plan.md` §4);
-`scripts/v2_topology.py`
+`scripts/smoke/v2_topology.py`
 holds the per-binary spawn primitives. The functional smokes are the
 `*_smoke_v2.py` set; the original un-suffixed versions spawned the retired
 `loop46` binary via `smoke_lib.py` and were **deleted** (60 scripts) once the V2

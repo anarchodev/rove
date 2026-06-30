@@ -229,7 +229,7 @@ drainer → `webhooks.db` envelopes 4/5/6 → `http.send` + `schedules.db` →
 leader-local `SendDispatch`) are recorded in §7 +
 `architecture/effects-and-handlers.md`. Resend is the email provider
 (decisions.md §1.2). The SSRF-blocklist half of the outbound contract was
-wired 2026-06-11 (decisions.md §3.8; `scripts/ssrf_smoke_v2.py`).
+wired 2026-06-11 (decisions.md §3.8; `scripts/smoke/ssrf_smoke_v2.py`).
 
 ### Phase 4 — Signup + auth — SHIPPED (admin auth re-platformed to OIDC in V2)
 
@@ -726,7 +726,7 @@ libraries). The surprises worth flagging for first-run docs:
   and composes the follow; each hop re-enters the gate). A blocked fetch
   surfaces as a failed outcome (`ok=false, status=0`). decisions.md §3.8;
   as-built: `architecture/routing-and-ingress.md` "Outbound policy gate";
-  smoke: `scripts/ssrf_smoke_v2.py`. The smoke-only
+  smoke: `scripts/smoke/ssrf_smoke_v2.py`. The smoke-only
   `REWIND_UNSAFE_OUTBOUND=1` hatch relaxes loopback + TLS-always for test
   topologies — never production.
 

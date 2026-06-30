@@ -10,7 +10,7 @@
 //! `onMessage` handler will do once piece D lands.
 //!
 //! Run: `zig build ws-echo` (listens on 127.0.0.1:8085). Drive it with any WS
-//! client, e.g. `scripts/ws_echo_smoke.py`.
+//! client, e.g. `scripts/smoke/ws_echo_smoke.py`.
 
 const std = @import("std");
 const rove = @import("rove");

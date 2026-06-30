@@ -89,11 +89,11 @@ Dependency order. A1→A2→A4 is the critical path; A3 and A5 can land in
 parallel once A1 is in.
 
 > **Status (2026-06-16): Track A COMPLETE (A1–A6) + runtime-verified.** The
-> enforcement boundary is closed (`scripts/log_tenant_scope_smoke_v2.py`:
+> enforcement boundary is closed (`scripts/smoke/log_tenant_scope_smoke_v2.py`:
 > unscoped / cross-tenant / missing-cap → 401, scoped → 200), the worker minter
-> (the `rewind-logs.internal` door) is proven (`scripts/logs_door_smoke_v2.py`),
+> (the `rewind-logs.internal` door) is proven (`scripts/smoke/logs_door_smoke_v2.py`),
 > and the admin chokepoint + browser-token removal (A5) is verified on the B2
-> OIDC harness (`scripts/oidc_rp_smoke_v2.py`: operator log query → 200,
+> OIDC harness (`scripts/smoke/oidc_rp_smoke_v2.py`: operator log query → 200,
 > unauth → 401, non-operator → 403). A5 required a platform dispatch fix
 > (continuations skip middleware; resume walk-up — commit `452cf6a`).
 >
@@ -151,7 +151,7 @@ which issues the A3 door fetch (`on.fetch("http://rewind-logs.internal/v1/…")`
 operator-gated and relays the log-server JSON; `api.js`'s `logFetch` now calls
 that same-origin chokepoint (RP session cookie) instead of cross-origin to the
 log-server with a browser-held services token. **Verified** by
-`scripts/oidc_rp_smoke_v2.py` (operator → 200 records, unauth → 401,
+`scripts/smoke/oidc_rp_smoke_v2.py` (operator → 200 records, unauth → 401,
 non-operator → 403).
 
 > **Required a platform fix (commit `452cf6a`):** routing the log read through
@@ -178,9 +178,9 @@ verification rides the B2 OIDC harness, but the mechanism is OIDC-independent).
 ## Track B — operator OIDC plane (gated on `__auth__` deploy)
 
 > **Status (2026-06-16):** **B1 + B2 done at the local/cluster level + verified.**
-> `scripts/oidc_smoke_v2.py` stands up `__auth__` end-to-end (discovery,
+> `scripts/smoke/oidc_smoke_v2.py` stands up `__auth__` end-to-end (discovery,
 > magic-link, PKCE auth-code, `/token`, **id_token RS256-verified vs JWKS**,
-> refresh — 10/10). `scripts/oidc_rp_smoke_v2.py` then lights up the **dashboard
+> refresh — 10/10). `scripts/smoke/oidc_rp_smoke_v2.py` then lights up the **dashboard
 > RP**: `__auth__` (IdP) + `web/admin` (RP) with the full handshake — `/_rp/login`
 > → IdP `/authorize` → magic-link → `/_rp/callback` → poll → session — operator
 > → **is_root:true**, non-operator → **is_root:false**. Required new harness
@@ -198,7 +198,7 @@ The app is written (`web/auth/index.mjs`): magic-link authN + dogfooded
 the bundle (handler + `_config/oidc/default.json`, which config-mirrors to
 kv on release); reachable via the wildcard host (`__auth__.{suffix}`) or an
 explicit `auth.{suffix}` alias. **Verified locally** by
-`scripts/oidc_smoke_v2.py`. **This is the single unblock** for everything
+`scripts/smoke/oidc_smoke_v2.py`. **This is the single unblock** for everything
 else in B. The chicken-and-egg the customer CLI waits on dissolves here.
 
 > **Discovery:** unlike the log-server door, `__auth__`'s plumbing was fully
@@ -210,7 +210,7 @@ else in B. The chicken-and-egg the customer CLI waits on dissolves here.
 ### B2. Light up the admin dashboard end-to-end — *S* — ✅ local/verified
 The RP guard (`_middlewares/index.mjs`) and token exchange (`_rp/complete.mjs`,
 `_rp/jwks.mjs`) are written. **Verified locally** by
-`scripts/oidc_rp_smoke_v2.py`: deploy `web/admin` to `__admin__`, seed the RP
+`scripts/smoke/oidc_rp_smoke_v2.py`: deploy `web/admin` to `__admin__`, seed the RP
 config + operator allowlist (via the `v2-kv` seam), and drive the full OIDC
 login → session-cookie → guarded `/v1/session` loop (operator is_root, customer
 not). Needed the **TLS-front smoke harness** (the RP→IdP token exchange is
@@ -238,7 +238,7 @@ propagate** the alias — so the CP, which already owns `host → tenant`, now d
   `assignDomain`. `web/admin_interim` deleted; `ADMIN_OPS_SECRET` removed from
   `common.zig`/`ops.zig`/`publish_tenant.py`.
 
-**Verified** by `scripts/rewind_cli_smoke_v2.py` (new step 4b): `host add` →
+**Verified** by `scripts/smoke/rewind_cli_smoke_v2.py` (new step 4b): `host add` →
 single CP call; a **non-wildcard** custom host (`cli-custom.test`) resolves to
 its tenant via the CP-propagated alias → `200`. No drift (one source of truth),
 self-heal-on-move noted as a follow-up (re-push on attach).
@@ -254,7 +254,7 @@ move-secret, rewrites to the configured CP base (restricted to `_control/`/`_cp/
 `web/admin` exposes `/v1/cp/{provision,move,host,plan}` (is_root-gated) over it.
 So the operator drives CP control through the OIDC dashboard with **no CP secret
 of their own** — the worker holds + attaches it. **Verified** by
-`scripts/oidc_rp_smoke_v2.py` (operator provisions via `/v1/cp/provision` → 204,
+`scripts/smoke/oidc_rp_smoke_v2.py` (operator provisions via `/v1/cp/provision` → 204,
 placement confirmed by a move-secret re-provision → 409; non-operator → 403).
 
 The remaining *delivery* (actually removing `REWIND_MOVE_SECRET` from the
@@ -280,7 +280,7 @@ cap after one login.
   RFC 8628 device grant (`POST /device_authorization`; the `/device` login-gated
   **explicit-approve** confirm page — anti-phishing: shows the code, never
   auto-approves a pre-filled link; the `device_code` arm in `/token`). Verified
-  end-to-end by `scripts/oidc_smoke_v2.py` (codes → pending → approve → tokens →
+  end-to-end by `scripts/smoke/oidc_smoke_v2.py` (codes → pending → approve → tokens →
   single-use). This is the CLI's login mechanism.
 - **`publishRelease` ownership gate — ✅ done/verified.** It checked *nothing*
   (any session could release any tenant); now operator (is_root) → any, else

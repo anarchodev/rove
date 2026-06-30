@@ -1389,7 +1389,7 @@ fn handleLoadReplace(
 /// bookkeeping). A crash in the rejoin window therefore recovers cleanly: raft
 /// is at `index`, the store data ≤ index is durable from the bundle, and the
 /// watermark self-heals on the next applied write. Proven by the crash-in-window
-/// leg of `scripts/promote_back_smoke_v2.py` — keep it green if this changes.
+/// leg of `scripts/smoke/promote_back_smoke_v2.py` — keep it green if this changes.
 fn handleApplySnapshot(
     server: anytype,
     allocator: std.mem.Allocator,

@@ -102,7 +102,7 @@ argument as the blob door — but still passes the scheme gate
 which the public path allows anyway. Custom domains don't suffix-match and
 take the public path. Unset ⇒ the door is inert (single-node/dev default);
 set with neither suffix configured ⇒ the worker fails loud at boot.
-Smoke: `scripts/tenant_door_smoke_v2.py`.
+Smoke: `scripts/smoke/tenant_door_smoke_v2.py`.
 
 ## Durable scheduled wake (the deferred-fire primitive)
 
@@ -146,7 +146,7 @@ durable next-fire watermark per tenant; everything else is the baked
   it. Durable cron is the `cron(spec, target)` verb over `__system/cron_tick`,
   self-re-arming; a manifest `kind=cron` spec.json fails the deploy loudly
   (sub-minute recurrence = `scheduler.after` seeded from `onBoot`, recipe in
-  `scripts/scheduler_heartbeat_smoke_v2.py`).
+  `scripts/smoke/scheduler_heartbeat_smoke_v2.py`).
 - **Fetch-from-fire wiring**: every `runFire` / cont-resume / stream-resume
   origin owns a commit-gated `Cmd.http_fetch` accumulator
   (`flushFireFetches`, `proposeForgetfulWrites` / `proposeAndParkContResume`
@@ -154,8 +154,8 @@ durable next-fire watermark per tenant; everything else is the baked
   activation was silently dropped, masked by the old owed sweep. One known
   narrow gap: a connection-scoped `on.fetch` bind from a *writing* resume —
   warns loudly.
-- **Smokes**: `scripts/durable_wake_smoke_v2.py` (fire + 3-node leader-kill
-  failover survival + msg-byte cap), `scripts/scheduler_heartbeat_smoke_v2.py`
+- **Smokes**: `scripts/smoke/durable_wake_smoke_v2.py` (fire + 3-node leader-kill
+  failover survival + msg-byte cap), `scripts/smoke/scheduler_heartbeat_smoke_v2.py`
   (interval recurrence + `kind=cron` rejection).
 
 ## Readset replication
@@ -260,7 +260,7 @@ Code: `worker_inbound_chunk.zig` (the sink Job / prepared-fires queue),
 `worker_dispatch.zig` (the dispatch-decision sink arm). The front-door
 streaming proxy + h1 early-emit (2026-06-11) carry chunked uploads through the
 edge too — see [`routing-and-ingress.md`](routing-and-ingress.md). Proven by
-`scripts/inbound_chunk_smoke_v2.py` (incl. the log-server tape-query step and
+`scripts/smoke/inbound_chunk_smoke_v2.py` (incl. the log-server tape-query step and
 the client-abort teardown step).
 
 ## Collection lifecycle & held state
@@ -305,7 +305,7 @@ the wake to the owning worker, falling back to `hash(tenant)` on a registry miss
 - ~~**Inbound WebSocket dispatch (piece D)**~~ — shipped 2026-06-09: the worker
   `onMessage`/`onDisconnect` seam (`serviceWsMessages`, `src/js/worker_ws.zig`)
   consumes `ws_message_out` and lowers `stream.write` to `ws_send_in`
-  (commit-gated for writing frames). Proven by `scripts/ws_worker_smoke_v2.py`.
+  (commit-gated for writing frames). Proven by `scripts/smoke/ws_worker_smoke_v2.py`.
 - **Per-tenant kv-react backpressure has no cap** at the apply-time fan-out (the
   K=32 wake ring bounds the *holder* side only). A small cleanup, deferred until
   measured hot.

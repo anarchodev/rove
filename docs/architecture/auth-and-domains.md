@@ -85,7 +85,7 @@ last-write-wins + sign-only-`current`, not a `_processed` marker.
   this **replaced V1's per-cluster envelope-2 `__root__.db` path**. The front
   door's `CertSync` pulls issued certs into SNI (`putHostCertInMemory`).
   **The CP leader issues; every front serves.** Proven end-to-end against
-  Pebble: `scripts/cp_acme_issue_smoke.py` (issue → cert axis → replicate →
+  Pebble: `scripts/smoke/cp_acme_issue_smoke.py` (issue → cert axis → replicate →
   CertSync → the front serves the issued cert by SNI); the cert axis and edge
   TLS also by `cp_cert_smoke` / `cp_tls_edge_smoke`.
 - **DNS-01 for customer custom-domain wildcards is deferred**

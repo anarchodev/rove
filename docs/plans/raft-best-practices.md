@@ -102,7 +102,7 @@ Today's defaults violate both guides: the ratio is `10:3 ≈ 3.3:1` (vs the 5:1
 raft-rs / 10:1 etcd norm), and ~15ms sits inside a realistic fsync/scheduler
 tail. That's the case for widening — see the soak result.
 
-### Validate empirically — the soak (`scripts/raft_soak_v2.py`)
+### Validate empirically — the soak (`scripts/smoke/raft_soak_v2.py`)
 
 The number is only *justified* by zero spurious elections under load. The soak is
 meaningful only if three things hold (it enforces all three):
@@ -122,7 +122,7 @@ meaningful only if three things hold (it enforces all three):
 
 Run at the candidate tick, then wider, and compare:
 
-    REWIND_RAFT_TICK_MS=10 RAFT_SOAK_SECONDS=3600 python3 scripts/raft_soak_v2.py
+    REWIND_RAFT_TICK_MS=10 RAFT_SOAK_SECONDS=3600 python3 scripts/smoke/raft_soak_v2.py
 
 ### Measured baseline + recommendation
 
@@ -263,7 +263,7 @@ is the worked example of the full FFI-method → re-pin → wiring path.)
 
 ### `check_quorum` self-step-down double-election on leader death
 
-`scripts/leader_failover_smoke_v2.py` asserts a CLEAN single re-election after a
+`scripts/smoke/leader_failover_smoke_v2.py` asserts a CLEAN single re-election after a
 SIGKILL of the leader: exactly one survivor's `raft_leadership_acquisitions_total`
 rises, by exactly 1. It is intermittently RED, and that flakiness is a deliberate
 signal — **left in place, not hardened** — because it surfaces real failover

@@ -61,8 +61,8 @@ wire only after the activation that produced it commits — and a blob coordinat
   phantom inbound body. WebSocket terminates at the edge and tunnels
   upstream as an RFC 8441 Extended CONNECT stream on the same pooled conn
   (2026-06-12 — see the WebSocket section). Proven by
-  `scripts/front_streaming_smoke_v2.py` + `scripts/h1_streaming_smoke_v2.py`
-  + `scripts/ws_worker_smoke_v2.py`.
+  `scripts/smoke/front_streaming_smoke_v2.py` + `scripts/smoke/h1_streaming_smoke_v2.py`
+  + `scripts/smoke/ws_worker_smoke_v2.py`.
 - **Leader-aware proxy**: tries the cluster's nodes in order and stops at the
   first non-421. A follower 421s a write (`Bridge.propose` rejects
   synchronously on a formed group it doesn't lead — nothing enters the log, so
@@ -130,7 +130,7 @@ streaming path. h1→h2c translation is **edge-only**.
   response mid-body flips hold/buffer to discard and drains the remaining
   wire bytes so keep-alive framing survives. Non-`headers_first` instances
   (examples, log-server) keep the classic body-complete contract. Proven by
-  `scripts/h1_streaming_smoke_v2.py` (through the front).
+  `scripts/smoke/h1_streaming_smoke_v2.py` (through the front).
 - **The worker is h2c-only** (2026-06-12, see `websockets.md`): with WS
   riding Extended CONNECT, nothing pins h1 to the worker —
   `accept_http1 = false` on the rewind instance closes an h1-looking first
@@ -151,7 +151,7 @@ streaming path. h1→h2c translation is **edge-only**.
   DATA per-stream (`WsReassembler`) onto the same `ws_message_out` /
   `ws_send_in` seam — the logical WS connection's identity is a per-stream
   entity (`ws_streams`), so the worker seam is transport-agnostic. Proven by
-  `scripts/ws_worker_smoke_v2.py` (all steps through the front) +
+  `scripts/smoke/ws_worker_smoke_v2.py` (all steps through the front) +
   `zig build h2-ws-connect-test`.
 - **Handshake** (h1, at the edge / examples): an h1 `GET` with
   `Upgrade: websocket` is detected in
@@ -165,8 +165,8 @@ streaming path. h1→h2c translation is **edge-only**.
   `conn_write`), serialized with one write in flight per connection.
 - **Status**: shipped end to end. The transport (handshake + framing +
   inbound/outbound collections) is proven by `zig build ws-echo` +
-  `scripts/ws_echo_smoke.py`; the worker-side `onMessage` dispatch seam
-  (piece D, 2026-06-09) by `scripts/ws_worker_smoke_v2.py` (deployed handler,
+  `scripts/smoke/ws_echo_smoke.py`; the worker-side `onMessage` dispatch seam
+  (piece D, 2026-06-09) by `scripts/smoke/ws_worker_smoke_v2.py` (deployed handler,
   durable frames, both disconnect paths) — see `effects-and-handlers.md`.
 
 ## Streaming substrate
@@ -206,7 +206,7 @@ streaming path. h1→h2c translation is **edge-only**.
   loopback block + TLS-always (smoke topologies echo over on-box plaintext
   h2c; the harness sets it on spawned workers). The metadata range stays
   blocked unconditionally. Never set in production. Gate smoke:
-  `scripts/ssrf_smoke_v2.py`.
+  `scripts/smoke/ssrf_smoke_v2.py`.
 
 ## Blob coordinator & chunk spool
 
@@ -279,9 +279,9 @@ naming layer is the customer's kv (decisions.md §3.8). Engine pieces:
   body rides the identical disposition machinery — see the HTTP/1.1 ingress
   section.
 
-Smokes: `scripts/blob_smoke_v2.py` (put/get/url + sessions + `segments.js`),
-`scripts/blob_receive_smoke_v2.py` (12 MiB streamed byte-exact, zero chunk
-activations), `scripts/inbound_body_smoke_v2.py` (headers-first classic
+Smokes: `scripts/smoke/blob_smoke_v2.py` (put/get/url + sessions + `segments.js`),
+`scripts/smoke/blob_receive_smoke_v2.py` (12 MiB streamed byte-exact, zero chunk
+activations), `scripts/smoke/inbound_body_smoke_v2.py` (headers-first classic
 fallback).
 
 ## Held connections (connection-actor)
