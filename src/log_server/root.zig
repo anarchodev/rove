@@ -32,6 +32,7 @@ pub const index_db = @import("index_db.zig");
 pub const indexer = @import("indexer.zig");
 pub const standalone = @import("standalone.zig");
 pub const flush_writer = @import("flush_writer.zig");
+pub const metrics = @import("metrics.zig");
 
 test {
     _ = sidecar;

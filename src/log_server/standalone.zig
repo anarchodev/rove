@@ -38,6 +38,7 @@ const log_mod = @import("rove-log");
 const batch_store_mod = @import("batch_store.zig");
 const index_db_mod = @import("index_db.zig");
 const indexer_mod = @import("indexer.zig");
+const metrics_mod = @import("metrics.zig");
 const jwt = @import("rove-jwt");
 const plan_mod = @import("rove-plan");
 const blob = @import("rove-blob");
@@ -466,14 +467,24 @@ fn handleOne(
     const floor_ns = rctx.retention.floorNs(rctx.cfg, route.tenant_id, now_ns);
     switch (route.kind) {
         .list => {
+            metrics_mod.Metrics.inc(&metrics_mod.global.query_list);
             const tf = parseTagFilter(route.query);
             try handleList(server, allocator, rctx.read_db, ent, sid, sess, route.tenant_id, route.query, floor_ns, rctx.cfg, if (tf) |t| t.key else null, if (tf) |t| t.value else null);
         },
         // Replay sugar: list this session's activations, newest-first.
         // `/session/{id}` ≡ `/list?tag.session={id}`.
-        .session => try handleList(server, allocator, rctx.read_db, ent, sid, sess, route.tenant_id, route.query, floor_ns, rctx.cfg, "session", route.tail),
-        .show => try handleShow(server, allocator, rctx.store, rctx.read_db, ent, sid, sess, route.tenant_id, route.tail, floor_ns, rctx.cfg),
-        .count => try handleCount(server, allocator, rctx.read_db, ent, sid, sess, route.tenant_id, floor_ns, rctx.cfg),
+        .session => {
+            metrics_mod.Metrics.inc(&metrics_mod.global.query_list);
+            try handleList(server, allocator, rctx.read_db, ent, sid, sess, route.tenant_id, route.query, floor_ns, rctx.cfg, "session", route.tail);
+        },
+        .show => {
+            metrics_mod.Metrics.inc(&metrics_mod.global.query_show);
+            try handleShow(server, allocator, rctx.store, rctx.read_db, ent, sid, sess, route.tenant_id, route.tail, floor_ns, rctx.cfg);
+        },
+        .count => {
+            metrics_mod.Metrics.inc(&metrics_mod.global.query_count);
+            try handleCount(server, allocator, rctx.read_db, ent, sid, sess, route.tenant_id, floor_ns, rctx.cfg);
+        },
     }
 }
 
@@ -503,10 +514,12 @@ fn handleBatchPushed(
         // Sanity: only accept keys that look like log batches. Prevents
         // an attacker (already past the JWT gate) from probing arbitrary
         // S3 keys via this endpoint.
+        metrics_mod.Metrics.inc(&metrics_mod.global.push_received);
         if (!std.mem.startsWith(u8, key, "_logs/") or
             !std.mem.endsWith(u8, key, ".ndjson"))
         {
             std.log.warn("log-server: rejecting bad batch key shape: {s}", .{key});
+            metrics_mod.Metrics.inc(&metrics_mod.global.push_errors);
             continue;
         }
         _ = indexer_mod.indexOneKey(allocator, rctx.store, rctx.db, key) catch |err| {
@@ -514,8 +527,10 @@ fn handleBatchPushed(
                 "log-server: indexOneKey {s}: {s}",
                 .{ key, @errorName(err) },
             );
+            metrics_mod.Metrics.inc(&metrics_mod.global.push_errors);
             continue;
         };
+        metrics_mod.Metrics.inc(&metrics_mod.global.push_indexed);
     }
     if (seen == 0) {
         try setResponse(server, ent, sid, sess, 400, "no batch keys in body\n", rctx.cfg);

@@ -631,6 +631,7 @@ pub fn build(b: *std.Build) void {
     ls_standalone_mod.addImport("rove-log-server", log_server_mod);
     ls_standalone_mod.addImport("rove-blob", blob_mod);
     ls_standalone_mod.addImport("rove-h2", h2_mod);
+    ls_standalone_mod.addImport("metrics-server", metrics_server_mod);
     // `rove-log-server` is deliberately sqlite-free (the C lib is linked at the
     // binary level, not the shared module — see `log_server_test_mod` below);
     // its `index_db.zig` needs sqlite3, so this binary links it. (Pre-cutover

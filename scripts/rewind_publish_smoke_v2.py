@@ -37,6 +37,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -453,6 +454,26 @@ def main() -> int:
             check("rewind replay --source-dir surfaces a divergence on an off-tape read",
                   art2.get("divergence") is not None and art2.get("status_match") is False,
                   r.stdout[:400])
+
+        # ── log-server metrics: scrape the loopback Prometheus endpoint ───
+        # Validates the instrumentation AND positively proves the worker→log-
+        # server batch PUSH fast-path is live (push_indexed > 0) — distinct
+        # from the S3 LIST poll doing the indexing.
+        try:
+            mtext = urllib.request.urlopen("http://127.0.0.1:9113/metrics", timeout=5).read().decode()
+        except Exception as e:  # noqa: BLE001
+            mtext = f"(scrape failed: {e})"
+
+        def mval(name):
+            m = re.search(rf"^{re.escape(name)} (\d+)$", mtext, re.M)
+            return int(m.group(1)) if m else -1
+
+        check("log-server /metrics scrapeable + poll running",
+              mval("log_indexer_poll_cycles_total") > 0, mtext[:200])
+        check("log-server metrics: push fast-path live (push_indexed>0)",
+              mval("log_push_indexed_total") > 0,
+              f"received={mval('log_push_received_total')} indexed={mval('log_push_indexed_total')} "
+              f"errors={mval('log_push_errors_total')}")
 
         if failures:
             c.dump_node_log(grep=["deploy", "cp", "provision", "release", "history",

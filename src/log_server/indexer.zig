@@ -63,6 +63,7 @@ const std = @import("std");
 const batch_store_mod = @import("batch_store.zig");
 const index_db_mod = @import("index_db.zig");
 const sidecar = @import("sidecar.zig");
+const metrics_mod = @import("metrics.zig");
 
 const NDJSON_SUFFIX: []const u8 = ".ndjson";
 
@@ -474,9 +475,16 @@ fn threadMain(h: *Handle) void {
 fn runLoop(h: *Handle) !void {
     std.log.info("log-indexer: started", .{});
     while (!h.stop_flag.load(.acquire)) {
-        _ = pollOnce(h.config.allocator, h.config.store, h.config.db, h.config.page_size) catch |err| {
+        if (pollOnce(h.config.allocator, h.config.store, h.config.db, h.config.page_size)) |stats| {
+            metrics_mod.Metrics.add(&metrics_mod.global.batches_indexed, stats.batches_indexed);
+            metrics_mod.Metrics.add(&metrics_mod.global.records_indexed, stats.records_indexed);
+            metrics_mod.Metrics.add(&metrics_mod.global.skipped_already, stats.skipped_already);
+            metrics_mod.Metrics.add(&metrics_mod.global.skipped_invalid, stats.skipped_invalid);
+        } else |err| {
             std.log.warn("log-indexer: pass error: {s}", .{@errorName(err)});
-        };
+            metrics_mod.Metrics.inc(&metrics_mod.global.poll_errors);
+        }
+        metrics_mod.Metrics.inc(&metrics_mod.global.poll_cycles);
         _ = h.passes_completed.fetchAdd(1, .release);
         std.Thread.sleep(@as(u64, h.config.poll_interval_ms) * std.time.ns_per_ms);
     }

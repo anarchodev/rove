@@ -33,11 +33,35 @@ const std = @import("std");
 const log_server = @import("rove-log-server");
 const blob_mod = @import("rove-blob");
 const h2 = @import("rove-h2");
+const MetricsServer = @import("metrics-server").MetricsServer;
 
 var stop_flag: std.atomic.Value(bool) = .init(false);
 
 fn handleSignal(_: c_int) callconv(.c) void {
     stop_flag.store(true, .release);
+}
+
+fn metricsPort() u16 {
+    // 9113 — distinct from worker 9110 / CP 9111 / front 9112 so all four
+    // coexist on a co-located host.
+    const s = std.posix.getenv("REWIND_LOGS_METRICS_PORT") orelse return 9113;
+    return std.fmt.parseInt(u16, std.mem.trim(u8, s, " \t"), 10) catch 9113;
+}
+
+/// Re-render + publish the process-global counters every ~2 s until shutdown.
+/// Sleeps in short slices so it wakes promptly when `stop_flag` is set.
+fn metricsPublishLoop(allocator: std.mem.Allocator, ms: *MetricsServer) void {
+    while (!stop_flag.load(.acquire)) {
+        if (log_server.metrics.render(allocator)) |txt| {
+            ms.publish(txt);
+            allocator.free(txt);
+        } else |_| {}
+        var slept: u64 = 0;
+        while (slept < 2000 and !stop_flag.load(.acquire)) {
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+            slept += 100;
+        }
+    }
 }
 
 fn installSignalHandlers() !void {
@@ -277,6 +301,29 @@ pub fn main() !void {
         scheme, cli.listen, handle.port,
     });
     try sw.interface.flush();
+
+    // Operator metrics on a dedicated loopback HTTP/1.1 listener — the query
+    // port is h2c-only (stock Prometheus/Alloy can't scrape it), same split the
+    // worker uses. A small thread re-renders the process-global counters every
+    // ~2 s. `REWIND_LOGS_METRICS_PORT=0` disables it; default 9113.
+    const metrics_srv: ?*MetricsServer = blk: {
+        const mp = metricsPort();
+        if (mp == 0) break :blk null;
+        const ma = std.net.Address.parseIp("127.0.0.1", mp) catch break :blk null;
+        const srv = MetricsServer.init(allocator, ma) catch |err| {
+            std.log.warn("rewind-logs: metrics listener disabled — bind 127.0.0.1:{d} failed ({s})", .{ mp, @errorName(err) });
+            break :blk null;
+        };
+        std.log.info("rewind-logs: operator metrics on http://127.0.0.1:{d}/metrics", .{mp});
+        break :blk srv;
+    };
+    defer if (metrics_srv) |m| m.deinit();
+    var metrics_thread: ?std.Thread = null;
+    if (metrics_srv) |ms| metrics_thread = std.Thread.spawn(.{}, metricsPublishLoop, .{ allocator, ms }) catch |err| nblk: {
+        std.log.warn("rewind-logs: metrics publish thread failed to spawn: {s}", .{@errorName(err)});
+        break :nblk null;
+    };
+    defer if (metrics_thread) |t| t.join(); // joins BEFORE deinit (LIFO)
 
     try installSignalHandlers();
     h2.TlsConfig.runReloadPoll(tls_config, &stop_flag);
