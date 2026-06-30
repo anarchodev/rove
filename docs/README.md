@@ -44,6 +44,7 @@ The maintained set. Subsystem-owned, kept current with the code.
 - **[websockets.md](architecture/websockets.md)** — inbound WS as-built: the DO-shaped tenant model, point-to-point vs broadcast fan-out, per-frame durability + the input gate, the `onMessage`/`onDisconnect` handler surface, front Extended CONNECT (RFC 8441)
 - **[control-plane.md](architecture/control-plane.md)** — the directory, replication, tenant-move orchestration, plan/limits
 - **[deployment-and-logs.md](architecture/deployment-and-logs.md)** — deploy publish, content-addressed assets, BlobStore, log-server
+- **[configuration-and-network.md](architecture/configuration-and-network.md)** — per-binary env/port config map, the public/private firewall boundary + its security note, two-tier TLS architecture
 - **[auth-and-domains.md](architecture/auth-and-domains.md)** — OIDC, custom domains, ACME, service/admin authz
 - **[observability.md](architecture/observability.md)** — operator telemetry (Grafana Cloud)
 
@@ -63,7 +64,7 @@ Active work on the current (V2) line. Each folds into `architecture/` on ship.
 them 2026-06-29: its as-built mechanism folded into
 `architecture/effects-and-handlers.md`, "Streaming inbound body".)
 
-- [v2-production-deploy-plan.md](plans/v2-production-deploy-plan.md) — first production topology (not yet built)
+- _The operator deploy plan (this operator's topology, hardware spec, DNS/TLS distribution, rollout history) moved to the private `rewind-infra` repo. The operator-neutral binary/port/firewall/TLS reference is [architecture/configuration-and-network.md](architecture/configuration-and-network.md)._
 - [step3-auth-plan.md](plans/step3-auth-plan.md) — Step 3 auth consolidation: sequenced execution plan (OIDC machinery is written; remaining = wire + deploy + close the log-server tenant-scoping gap). Design rationale in `rewind-cli-plan.md` §7
 - [cp-desired-state-target.md](plans/cp-desired-state-target.md) — north-star (not yet built): CP owns all per-tenant desired-state incl. release; workers reconcile; one S2S key (move-secret); root token retires. The arc B3/B4 point at
 - [websocket-plan.md](plans/websocket-plan.md) — **outbound** WS only (a handler as client of an upstream WS server — atproto firehose / Pub/Sub; unbuilt, ~1–2 weeks). Inbound WS shipped → `architecture/websockets.md`

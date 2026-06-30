@@ -6,7 +6,7 @@
 # Scope is deliberately minimal: deploy user + ssh key, runtime shared libs,
 # the one-time root steps from scripts/systemd/v2/README.md, and the host
 # firewall — which is the SOLE security boundary for the private plane
-# (docs/v2-production-deploy-plan.md §2.5: raft + h2c ports have no app-layer
+# (docs/architecture/configuration-and-network.md "Firewall / network plane": raft + h2c ports have no app-layer
 # auth). Everything else (env files, secrets, units, TLS cert, binaries) is
 # provisioned out-of-band per the README — OVH stores this script, so it must
 # never contain S3 creds / REWIND_MOVE_SECRET / REWIND_ROOT_TOKEN.
@@ -63,7 +63,7 @@ table inet filter {
     ip protocol icmp accept
     ip6 nexthdr ipv6-icmp accept
     tcp dport { 22, 80, 443 } accept
-    # private plane — peers only (docs/v2-production-deploy-plan.md §2.5):
+    # private plane — peers only (docs/architecture/configuration-and-network.md "Firewall / network plane"):
     # iifname "vrack0" ip saddr { <peer1>, <peer2> } tcp dport { 8443, 8501, 9090, 9101, 443 } accept
   }
   chain forward {

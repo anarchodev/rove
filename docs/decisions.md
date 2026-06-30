@@ -1209,7 +1209,8 @@ memory.
   `http.fetch`**: a handler can POST any URL, so an internal endpoint that
   mutates connection state must authenticate the platform, not trust its
   caller. The same reasoning keeps fleet keys out of customer-style sandboxes
-  (`v2-production-deploy-plan.md`, cluster-manager section).
+  (the cluster-manager keeps its fleet authority server-side in the admin
+  handler, never shipped to a customer-style sandbox).
 - **Scope of trigger naming**: `trigger(name)` namespacing is DoS/quota
   hardening, **not a confidentiality boundary** — a cross-tenant trigger can
   at most cause a spurious refetch of the woken owner's *own* tenant state;

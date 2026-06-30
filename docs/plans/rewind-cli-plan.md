@@ -457,8 +457,8 @@ back-compat — `feedback_no_prelaunch_backcompat`):
 - `scripts/smoke_lib_v2.py:45` — `REWIND = BIN_DIR / "rewind"`
 - `scripts/deploy.sh` — the `BINS=(rewind …)` array entry + push loop (the
   `systemctl restart rewind-worker.service` line is already correct)
-- docs: `CLAUDE.md`, `PLAN.md` §13, `v2-production-deploy-plan.md` §2.1; a
-  few memory lines
+- docs: `CLAUDE.md`, `PLAN.md` §13, `architecture/configuration-and-network.md`
+  (the `rewind-worker` env table); a few memory lines
 
 ## 7. Auth consolidation
 

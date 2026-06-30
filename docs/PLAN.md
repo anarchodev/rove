@@ -393,8 +393,8 @@ Resolved items moved to §10. Open items:
 - **Phase 10 (custom domains)**: ACME rate-limit strategy for a signup surge.
 
 Resolved since this list was written (recorded so they aren't re-asked):
-admin-UI hosting = platform-hosted dogfood (docs and dashboard are tenants —
-`v2-production-deploy-plan.md`); blob backend = **S3-only, mandatory, no
+admin-UI hosting = platform-hosted dogfood (docs and dashboard are tenants);
+blob backend = **S3-only, mandatory, no
 filesystem variant** (production is multi-node; every node reads the same
 content-addressed store).
 
@@ -770,8 +770,9 @@ libraries). The surprises worth flagging for first-run docs:
 ### Operational
 
 The V2 operator surface (the five binaries, their flags / env, deploy + rollout)
-is **not** documented here — see [`v2-production-deploy-plan.md`](plans/v2-production-deploy-plan.md),
-the `/deploy` skill, and the per-subsystem `architecture/` docs
+is **not** documented here — see [`architecture/configuration-and-network.md`](architecture/configuration-and-network.md)
+(binaries, flags/env, ports, the firewall boundary, TLS) + the operator's own
+deploy specifics in the private `rewind-infra` repo, the `/deploy` skill, and the per-subsystem `architecture/` docs
 (`control-plane.md` for the CP/directory, `consensus-and-storage.md` for node
 config, `deployment-and-logs.md` for the publisher + log-server). The V1
 `loop46`-era flags (`LOOP46_ROOT_TOKEN`, `--snapshot-interval-ms`,

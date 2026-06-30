@@ -6,11 +6,13 @@ up. It carries the **example systemd units** as the public reference (the live
 units for our own deploy live in a separate private repo).
 
 For the architecture behind it, see
-[`architecture/overview.md`](../architecture/overview.md) and
-[`architecture/deployment-and-logs.md`](../architecture/deployment-and-logs.md).
-Our specific production runbook (host spec, vRack, genesis) is
-[`plans/v2-production-deploy-plan.md`](../plans/v2-production-deploy-plan.md) —
-useful as a worked example, not a requirement.
+[`architecture/overview.md`](../architecture/overview.md),
+[`architecture/deployment-and-logs.md`](../architecture/deployment-and-logs.md),
+and [`architecture/configuration-and-network.md`](../architecture/configuration-and-network.md)
+for the per-binary env/port config map, the firewall boundary, and the two-tier
+TLS architecture. Our own production deploy (host spec, vRack, genesis, rollout
+history) lives in the private operator repo (`rewind-infra`) — a worked example,
+not a requirement.
 
 ## The four processes
 

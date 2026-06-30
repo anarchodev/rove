@@ -9,7 +9,7 @@
 # The private plane carries worker h2c (:8443), raft (:8501/:9101), CP http
 # (:9090) and the tenant door (worker→front :443) — none of which have
 # app-layer auth, so the nftables rule written here IS the security
-# boundary (docs/v2-production-deploy-plan.md §2.5). It opens those ports
+# boundary (docs/architecture/configuration-and-network.md "Firewall / network plane"). It opens those ports
 # to the two peer addresses on the vRack NIC only; the public interface
 # stays 22/80/443.
 #

@@ -1,7 +1,8 @@
 #!/bin/bash
 #
 # rove-cert-deploy.sh — certbot deploy hook for the Tier-1 platform
-# wildcard (docs/v2-production-deploy-plan.md §4.1, distribution option B).
+# wildcard (see rove docs/architecture/configuration-and-network.md, "Two-tier
+# TLS architecture"; our certbot/Cloudflare distribution lives in rewind-infra).
 #
 # Install at /etc/letsencrypt/renewal-hooks/deploy/ on the ONE host that
 # runs certbot; certbot executes it as root after every successful

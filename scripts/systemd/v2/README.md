@@ -27,8 +27,11 @@ This repo (public) keeps:
   binaries incl. `rewind-logs` + the test gate → `zig-out/bin`). The **deploy**
   (ship + restart, rolling/genesis) moved to the private infra repo's
   `scripts/deploy.sh`, which calls `build.sh`;
-- the full runbook,
-  [`docs/plans/v2-production-deploy-plan.md`](../../../docs/plans/v2-production-deploy-plan.md).
+- the operator-neutral binary/port/env + firewall + TLS reference,
+  [`docs/architecture/configuration-and-network.md`](../../../docs/architecture/configuration-and-network.md).
+
+The operator's own deploy plan (topology, hardware spec, DNS/TLS distribution,
+rollout history, runbook) lives in the private `rewind-infra` repo.
 
 ## Self-hosting
 

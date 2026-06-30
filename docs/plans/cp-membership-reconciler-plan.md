@@ -182,8 +182,9 @@ during backfill (retries, no corruption), CP-leader flip mid-`ensureMember`
 ### Phase 6 — follow-on (not blocking)
 Single-source-of-truth completion: derive raft membership from `cluster.nodes`,
 retire `REWIND_VOTERS`; runtime transport peer add/remove for a *truly new* host
-not in the static peer set (the bigger "Path A", `docs/plans/v2-production-deploy-plan.md`
-§8); the explicit **destructive** ops (`removeMember`/shrink/deprovision) as
+not in the static peer set (the bigger "Path A" — CP voter add/retire + runtime
+transport peer add/remove, sharing the raft-rs-zig conf-change FFI with the DR
+learner); the explicit **destructive** ops (`removeMember`/shrink/deprovision) as
 operator-driven — never the reconciler.
 
 ## Sequencing, rollout, payoff
