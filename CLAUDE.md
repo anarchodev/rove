@@ -51,11 +51,13 @@ rewind-cp + front door + rewind node(s) and exposes `provision` /
 `deploy_handlers` / `wait_for_handler` (deploys go through the worker's
 `/_system/deploy` — files-server dissolved, `docs/plans/rewind-cli-plan.md` §4);
 `scripts/v2_topology.py`
-holds the per-binary spawn primitives. The functional smokes were ported as
-`*_smoke_v2.py` (~40 of them); the original un-suffixed versions spawn the
-retired `loop46` binary via `smoke_lib.py` and are dead — `smoke_lib.py`
-survives only for helper imports (`mint_jwt`, `HttpResponse`). New smokes
-should follow `ctl_smoke_v2.py` for the canonical shape.
+holds the per-binary spawn primitives. The functional smokes are the
+`*_smoke_v2.py` set; the original un-suffixed versions spawned the retired
+`loop46` binary via `smoke_lib.py` and were **deleted** (60 scripts) once the V2
+ports superseded them — `smoke_lib.py` survives only for helper imports
+(`mint_jwt`, `HttpResponse`, `BIN_DIR`, `_load_dotenv`) that `smoke_lib_v2.py`
+and a couple of V2 smokes still use. New smokes should follow `ctl_smoke_v2.py`
+for the canonical shape.
 
 ## Architecture
 
