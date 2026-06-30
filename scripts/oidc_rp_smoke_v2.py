@@ -42,7 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, REPO_ROOT  # noqa: E402
+from smoke_lib_v2 import V2Cluster, APPS_DIR  # noqa: E402
 
 OPERATOR = "operator@example.com"
 CUSTOMER = "customer@example.com"
@@ -132,11 +132,11 @@ def main() -> int:
         if not ok:
             failures.append(label)
 
-    auth_src = (REPO_ROOT / "web/auth/index.mjs").read_text()
-    auth_cfg = (REPO_ROOT / "web/auth/_config/oidc/default.json").read_text()
-    admin_files = {p: (REPO_ROOT / "web/admin" / p).read_text() for p in
+    auth_src = (APPS_DIR / "auth/index.mjs").read_text()
+    auth_cfg = (APPS_DIR / "auth/_config/oidc/default.json").read_text()
+    admin_files = {p: (APPS_DIR / "admin" / p).read_text() for p in
                    ("index.mjs", "_middlewares/index.mjs",
-                    "_rp/complete.mjs", "_rp/jwks.mjs")}
+                    "_rp/complete.mjs", "_rp/jwks.mjs", "v1/upload/index.mjs")}
 
     print("=== dashboard RP login over OIDC (B2) ===")
     with V2Cluster.spawn("oidcrp", nodes=1, http_base=19900, raft_base=20000,
@@ -299,15 +299,18 @@ def main() -> int:
         # ownership and falls through to the not-found check (404); a
         # non-operator who doesn't own the tenant is blocked at the gate (403,
         # and the gate fires BEFORE the existence check so it doesn't leak).
-        def rpc(cookie, fn, args):
-            return c.tls_curl(app_origin + "/", method="POST",
-                              headers={"Cookie": cookie, "content-type": "application/json"},
-                              data=json.dumps({"fn": fn, "args": args}))
-        r = rpc(op_cookie, "publishRelease", ["not-mine", 1])
+        def rest(cookie, method, path, payload=None):
+            h = {"Cookie": cookie}
+            data = None
+            if payload is not None:
+                h["content-type"] = "application/json"
+                data = json.dumps(payload)
+            return c.tls_curl(app_origin + path, method=method, headers=h, data=data)
+        r = rest(op_cookie, "POST", "/v1/instances/not-mine/release", {"dep_id": 1})
         check("operator (is_root) bypasses ownership → 404 not-found",
               r.status == 404, f"got {r.status} {r.body[:120]!r}")
         if cust_cookie:
-            r = rpc(cust_cookie, "publishRelease", ["not-mine", 1])
+            r = rest(cust_cookie, "POST", "/v1/instances/not-mine/release", {"dep_id": 1})
             check("non-owner publishRelease → 403 (blocked before existence)",
                   r.status == 403, f"got {r.status} {r.body[:120]!r}")
 
@@ -357,7 +360,7 @@ def main() -> int:
         # (c) a customer provisions THEIR OWN instance, then deploys to it → 200.
         owned = None
         if cust_cookie:
-            r = rpc(cust_cookie, "provisionInstance", ["custapp"])
+            r = rest(cust_cookie, "POST", "/v1/instances", {"name": "custapp"})
             check("customer provisions own instance → 201", r.status == 201,
                   f"got {r.status} {r.body[:120]!r}")
             if r.status == 201:

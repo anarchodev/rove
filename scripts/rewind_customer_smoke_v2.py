@@ -274,10 +274,9 @@ def main() -> int:
             c.dump_node_log(grep=["deploy", "compile", "stamp", "auth", "error", "warn"])
 
         if dep_id:
-            r = c.tls_curl(app_origin + "/", method="POST",
+            r = c.tls_curl(app_origin + "/v1/instances/custapp/release", method="POST",
                            headers={"Cookie": cli_cookie, "content-type": "application/json"},
-                           data=json.dumps({"fn": "publishRelease",
-                                            "args": ["custapp", int(dep_id, 16)]}))
+                           data=json.dumps({"dep_id": int(dep_id, 16)}))
             check("CLI release own tenant → 202 queued", r.status == 202,
                   f"got {r.status} {r.body[:120]!r}")
 
