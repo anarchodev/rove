@@ -162,13 +162,17 @@ rewind export-fixture <pulled-fixture.json> [-o world.json]   # a recording → 
 
 Design notes:
 
-- **`replay` is the fail-loud corner** — `run(captured world, original code,
-  on-miss=fail)`: it reproduces "what actually happened" and errors (`REPLAY
-  DIVERGENCE`) rather than inventing. `--source-dir` swaps in working-tree source
-  ("does my change still satisfy this request?"). Covers **all activation kinds**
-  — `inbound`, `fetch_chunk` (ctx + flattened fetch result + resolved `{to}`
-  export), `ws_message` (the frame, text + binary), `wake`/`disconnect` — because
-  the worker now records every callback's Msg (`replay-and-sim.md` §5).
+- **`replay` re-materialises a run for inspection** — `run(captured world,
+  code, on-miss)`. KV reads resolve **by key** against the recorded values (map
+  + write-through overlay), so re-execution is byte-faithful to the JS yet
+  **robust to benign read reordering**; `--source-dir` swaps in working-tree
+  source ("does my change still *behave the same* on the real inputs?"). A read
+  the recording never captured is the `--miss-policy` decision (`fail` = honest
+  divergence, default; `resolve` = best-effort). Faithfulness is an output-level
+  check (`status_match`), not a per-read order check. Covers **all activation
+  kinds** — `inbound`, `fetch_chunk` (ctx + flattened fetch result + resolved
+  `{to}` export), `ws_message` (frame, text + binary), `wake`/`disconnect` —
+  because the worker records every callback's Msg (`replay-and-sim.md` §5).
 - **`sim` is the resolve corner** — `run(authored/partial world, any code,
   on-miss=resolve)`: reads a plain-JSON world (request surface, a key→value KV
   map, seed, `missPolicy`) and, on a missed read, resolves it (returning

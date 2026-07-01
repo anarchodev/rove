@@ -145,7 +145,7 @@ fn runFetchChunkScenario(a: std.mem.Allocator) !void {
     fixture = faw.toArrayList();
 
     var out = std.ArrayList(u8){};
-    try root.run(a, fixture.items, null, &out);
+    try root.run(a, fixture.items, null, .fail, &out);
     const stdout = std.fs.File.stdout();
     try stdout.writeAll("FETCH_CHUNK: ");
     try stdout.writeAll(out.items);
@@ -204,7 +204,7 @@ pub fn main() !void {
     fixture = faw.toArrayList();
 
     var out = std.ArrayList(u8){};
-    try root.run(a, fixture.items, null, &out);
+    try root.run(a, fixture.items, null, .fail, &out);
 
     const stdout = std.fs.File.stdout();
     try stdout.writeAll(out.items);

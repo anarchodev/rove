@@ -47,6 +47,36 @@ of those inputs and are the run's **result**, never part of its world. Don't
 put a response/status into a world expecting it to "play back"; it falls out of
 re-running.
 
+### Resolution is by-key; faithfulness lives at the output
+
+Replay's job is to **re-materialise the run so you can inspect it** (outputs,
+state at each step, a scrubbable timeline) — not to *prove* accuracy on every
+read. Accuracy is a property you rely on *from the capture*. So KV reads resolve
+**by key** against the recorded values (a key→value map + a write-through
+overlay for the handler's own writes), **not** through an ordered cursor.
+Serving the recorded value for each key re-materialises byte-identical JS
+behaviour — the *order* the engine hands out reads is invisible to the handler —
+while being **robust to benign reordering** of independent reads (which an
+ordered cursor spuriously flagged as divergence, a false negative that made
+`replay --source-dir` unusable for refactored code).
+
+The map is a lossy representation of the raw *tape* (it drops read-order, holds
+one value per key) but is **not lossy for executing the JS**: within an
+activation the handler only ever needs the recorded value per key plus its own
+writes, and the overlay supplies the latter (read-modify-read reproduces; a
+pinned per-activation snapshot means no key returns two different values without
+a local write).
+
+**Faithfulness, when you want it, is an output-level assertion** — does the
+re-run reproduce the recorded status / response / writeset (`status_match`)? —
+not a per-read order check. That's the altitude that matters and it's
+implementation-agnostic. The `fail` miss-policy therefore fires only on a read
+the recording **never captured** (an honest "your code walked into territory the
+recording doesn't cover"), never on a reorder. `resolve` makes such a read
+best-effort (`not_found` + a typed hole). The ordered-cursor `.tape` mode
+survives in `host.zig` only as an optional strict / non-determinism audit
+primitive; it is no longer the default replay path.
+
 ## 2. The activation is the unit; a request is a fold of worlds
 
 An activation is the pure function the engine already runs:

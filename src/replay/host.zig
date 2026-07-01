@@ -166,7 +166,7 @@ fn kvGet(
         // `.resolve` answers `not_found` (the sim corner).
         h.recordHole(.get, k);
         if (h.miss == .fail) {
-            h.setDiv("kv.get('{s}') is not in the declared world (miss-policy=fail)", .{k});
+            h.setDiv("kv.get('{s}') has no value in the world — not recorded (replay) / not declared (sim) (miss-policy=fail)", .{k});
             return 2;
         }
         out_outcome.* = @intFromEnum(decode.KvOutcome.not_found);

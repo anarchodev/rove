@@ -48,6 +48,7 @@ pub fn run(
     a: std.mem.Allocator,
     fixture_json: []const u8,
     source_dir: ?[]const u8,
+    miss: hostmod.MissPolicy,
     out: *std.ArrayList(u8),
 ) Error!void {
     const parsed = std.json.parseFromSlice(std.json.Value, a, fixture_json, .{}) catch
@@ -211,13 +212,53 @@ pub fn run(
     const full_src = try std.mem.concatWithSentinel(a, u8, &.{ entry_src, epi }, 0);
     const entry_z = try a.dupeZ(u8, entry);
 
+    // ── KV: the recorded reads → an initial-snapshot MAP (not an ordered
+    // cursor). Replay re-materialises the run by serving each recorded VALUE
+    // by KEY; the write-through overlay reproduces the handler's own writes. So
+    // the JS behaves byte-identically while re-execution is robust to benign
+    // reordering of independent reads (which the cursor spuriously flagged) —
+    // faithfulness is checked at the observable OUTPUT (status/response/writes),
+    // not per-read (docs/architecture/replay-and-sim.md). `miss` = fail (a read
+    // the recording never captured — honest divergence) or resolve (best-effort).
+    var kv_map = std.StringHashMapUnmanaged([]const u8){};
+    var absent = std.StringHashMapUnmanaged(void){};
+    {
+        var seen = std.StringHashMapUnmanaged(void){};
+        for (kv_entries) |e| switch (e.op) {
+            .get => {
+                if (seen.contains(e.key)) continue; // first read = the initial value
+                try seen.put(a, e.key, {});
+                switch (e.outcome) {
+                    .ok => try kv_map.put(a, e.key, e.value),
+                    .not_found => try absent.put(a, e.key, {}),
+                    .err => {},
+                }
+            },
+            .prefix => for (e.results) |row| {
+                if (seen.contains(row.key)) continue;
+                try seen.put(a, row.key, {});
+                try kv_map.put(a, row.key, row.value);
+            },
+            else => {}, // set/delete never appear in a read tape
+        };
+    }
+
     // ── drive the engine ──
     if (arena_init(8192, 8192) != 0) return Error.ArenaInit;
     // One-shot: deliberately NO arena_destroy — under the dual-arena allocator
     // JS_FreeRuntime trips a debug-only gc_obj_list assert; process exit
     // reclaims everything (spike.zig §teardown).
 
-    var host = hostmod.Host{ .a = a, .kv = kv_entries, .sources = sources, .source_dir = source_dir };
+    var host = hostmod.Host{
+        .a = a,
+        .mode = .map,
+        .kv = &.{},
+        .kv_map = kv_map,
+        .absent = absent,
+        .miss = miss,
+        .sources = sources,
+        .source_dir = source_dir,
+    };
     host.install();
 
     const seed = parseU64(jStr(obj, "seed")) orelse 0;
