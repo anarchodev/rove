@@ -253,6 +253,37 @@ const EPILOGUE_BODY =
     \\    if (D.result.fetchId !== null) request.fetchId = D.result.fetchId;
     \\    if (D.result.chunkSeq !== null) request.chunkSeq = D.result.chunkSeq;
     \\  }
+    \\  // ── effect shims ──
+    \\  // The bare replay arena has no ambient effect globals, so a real handler
+    \\  // (TextDecoder / stream.* / on.* / next / webhook.send) would ReferenceError.
+    \\  // Outputs are CAPTURED (not fired) so the bundle shows what the handler did
+    \\  // and re-execution stays deterministic. stream/on/next/TextDecoder are
+    \\  // fully faithful (no side effects to reproduce); webhook/email/schedule/
+    \\  // cron/blob are recorded but do NOT re-run their durability shims (their
+    \\  // kv markers / bytes aren't reproduced — the handler's own kv writes are).
+    \\  const __b2s = (c) => { if (typeof c === "string") return c; let s = ""; for (let i = 0; i < c.length; i++) s += String.fromCharCode(c[i]); return s; };
+    \\  if (typeof globalThis.TextDecoder === "undefined") {
+    \\    globalThis.TextDecoder = function () {};
+    \\    globalThis.TextDecoder.prototype.decode = function (u) { if (u == null) return ""; try { return decodeURIComponent(escape(__b2s(u))); } catch (_) { return __b2s(u); } };
+    \\    globalThis.TextEncoder = function () {};
+    \\    globalThis.TextEncoder.prototype.encode = function (s) { s = String(s); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i) & 0xff; return u; };
+    \\  }
+    \\  const __stream = [];
+    \\  globalThis.stream = { start() {}, write(c) { __stream.push(__b2s(c)); } };
+    \\  const __wakes = [];
+    \\  globalThis.on = {
+    \\    fetch(url, opts, to) { __wakes.push({ kind: "fetch", url, to: (to && to.to) || (opts && opts.to) || null }); },
+    \\    kv(prefix, to) { __wakes.push({ kind: "kv", prefix, to: (to && to.to) || null }); },
+    \\    timer(ms, to) { __wakes.push({ kind: "timer", ms, to: (to && to.to) || null }); },
+    \\  };
+    \\  const __sends = [];
+    \\  globalThis.webhook = { send(url, opts) { __sends.push({ kind: "webhook", url, onResult: (opts && opts.onResult) || null }); } };
+    \\  globalThis.email = { send(opts) { __sends.push({ kind: "email", to: (opts && opts.to) || null }); } };
+    \\  globalThis.schedule = (when, target) => { __sends.push({ kind: "schedule", when, target: target || null }); };
+    \\  globalThis.cron = (spec, target) => { __sends.push({ kind: "cron", spec, target: target || null }); };
+    \\  globalThis.blob = { get() {}, put() {}, receive() {}, seal() {} };
+    \\  globalThis.next = (ctx) => ({ __rove_disposition: "next", ctx: ctx === undefined ? null : ctx });
+    \\  if (typeof request.tag !== "function") request.tag = function () { return request; };
     \\  globalThis.request = request;
     \\  globalThis.response = { status: 200, headers: {}, cookies: [] };
     \\  let __result = null, __err = null;
@@ -266,9 +297,9 @@ const EPILOGUE_BODY =
     \\  }
     \\  let __out;
     \\  try {
-    \\    __out = JSON.stringify({ response: globalThis.response, result: __result, error: __err, console: __logs });
+    \\    __out = JSON.stringify({ response: globalThis.response, result: __result, error: __err, console: __logs, stream: __stream, wakes: __wakes, sends: __sends });
     \\  } catch (e) {
-    \\    __out = JSON.stringify({ response: null, result: null, console: __logs,
+    \\    __out = JSON.stringify({ response: null, result: null, console: __logs, stream: __stream, wakes: __wakes, sends: __sends,
     \\      error: { message: "replay result not JSON-serialisable: " + String((e && e.message) || e), stack: "" } });
     \\  }
     \\

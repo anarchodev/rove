@@ -210,8 +210,13 @@ class.)
 
 Remaining: (a) a `{to}` override is still unrecorded (**G3** — the resolved
 export must be persisted; the no-`{to}` conventional-export case is covered by
-event-shape resolution); (b) `TextDecoder` (and `stream.*`/`next`) are absent in
-the bare replay arena — a handler using them ReferenceErrors on replay; (c)
+event-shape resolution); ~~(b) `TextDecoder`/`stream.*`/`next` absent in the bare
+replay arena~~ **FIXED** — the epilogue now shims `TextDecoder`/`TextEncoder`,
+`stream.*`/`on.*`/`next`/`webhook`/`schedule`/`cron`/`blob`/`request.tag`; outputs
+are captured into the bundle (`stream`/`wakes`/`sends`) rather than fired.
+`stream`/`on`/`next`/`TextDecoder` are fully faithful; `webhook`/`schedule`/
+`cron`/`blob` record but don't re-run their durability shims (their kv markers
+aren't reproduced — the handler's own kv writes are). (c)
 binary WS frames need a `Uint8Array` `request.activation.data` surface. The
 **sim** path (authored worlds) never depended on any of this.
 
