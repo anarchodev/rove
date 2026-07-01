@@ -303,7 +303,7 @@ const EPILOGUE_BODY =
     \\    get(k) { const v = __kvNative.get(k); __effects.push({ kind: "read", key: k, present: v !== undefined && v !== null }); return v; },
     \\    set(k, val) { __effects.push({ kind: "write", key: k, value: val }); return __kvNative.set(k, val); },
     \\    delete(k) { __effects.push({ kind: "delete", key: k }); return __kvNative.delete(k); },
-    \\    prefix(p, opts) { const r = __kvNative.prefix(p, opts); __effects.push({ kind: "read", op: "prefix", key: p, present: true }); return r; },
+    \\    prefix(p, cursor, limit) { const r = __kvNative.prefix(p, { cursor, limit }); __effects.push({ kind: "read", op: "prefix", key: p, present: true }); return r; },
     \\  };
     \\  if (typeof request.tag !== "function") request.tag = function () { return request; };
     \\  globalThis.request = request;

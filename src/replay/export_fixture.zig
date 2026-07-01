@@ -94,12 +94,13 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     const seed = jStr(obj, "seed");
     const ts_ns = jStr(obj, "timestamp_ns");
 
-    // ── KV: get → initial-snapshot map / absent; prefix → both the map (for
-    // later gets) AND kvPrefix (the exact recorded rows, for faithful scans) ──
+    // ── KV: get → initial-snapshot map / absent; prefix → seed the map with the
+    // returned rows (so a replay-time re-scan finds them). No exact-rows are
+    // kept: replay reconstructs the scan from the map (+ the handler's own
+    // re-executed writes), honoring cursor/limit. ──
     var seen = std.StringHashMapUnmanaged(void){};
     var kv = std.ArrayList(KvPair){};
     var absent = std.ArrayList([]const u8){};
-    var prefixes = std.ArrayList(PrefixEntry){};
     for (kv_entries) |e| switch (e.op) {
         .get => {
             if (seen.contains(e.key)) continue; // re-read / post-write — overlay reproduces it
@@ -111,7 +112,6 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
             }
         },
         .prefix => {
-            try prefixes.append(a, .{ .prefix = e.key, .rows = e.results });
             for (e.results) |row| {
                 if (seen.contains(row.key)) continue;
                 try seen.put(a, row.key, {});
@@ -252,25 +252,6 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         }
         try w.writeAll(" ]");
     }
-    if (prefixes.items.len != 0) {
-        try w.writeAll(",\n  \"kvPrefix\": {");
-        for (prefixes.items, 0..) |pe, pi| {
-            if (pi != 0) try w.writeByte(',');
-            try w.writeAll("\n    ");
-            try jsonStr(w, pe.prefix);
-            try w.writeAll(": [");
-            for (pe.rows, 0..) |row, ri| {
-                if (ri != 0) try w.writeByte(',');
-                try w.writeAll("{\"key\": ");
-                try jsonStr(w, row.key);
-                try w.writeAll(", \"value\": ");
-                try jsonStr(w, row.value);
-                try w.writeByte('}');
-            }
-            try w.writeByte(']');
-        }
-        try w.writeAll("\n  }");
-    }
     if (recorded) |r| {
         try w.writeAll(",\n  \"recorded\": {\"status\": ");
         if (r.get("status")) |sv| (if (sv == .integer) try w.print("{d}", .{sv.integer}) else try w.writeAll("null")) else try w.writeAll("null");
@@ -295,8 +276,6 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     }
     try w.writeAll("\n}\n");
 }
-
-const PrefixEntry = struct { prefix: []const u8, rows: []const decode.KvPair };
 
 /// Extract the threaded ctx from a trigger_payload `{"ctx": <value>}` envelope —
 /// the inner value re-serialised as JSON text (→ `world.ctx`). null when not a

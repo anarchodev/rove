@@ -99,13 +99,6 @@ pub fn runWorld(
     for (wv.kv) |p| try kv_map.put(a, p.key, p.value);
     var kv_absent = std.StringHashMapUnmanaged(void){};
     for (wv.kv_absent) |k| try kv_absent.put(a, k, {});
-    // Recorded prefix results, served verbatim (faithful prefix scans).
-    var prefix_results = std.StringHashMapUnmanaged([]const decode.KvPair){};
-    for (wv.kv_prefix) |pe| {
-        const rows = try a.alloc(decode.KvPair, pe.rows.len);
-        for (pe.rows, 0..) |row, i| rows[i] = .{ .key = row.key, .value = row.value };
-        try prefix_results.put(a, pe.prefix, rows);
-    }
 
     // ── module sources (inline) ──
     var sources = std.StringHashMapUnmanaged([]const u8){};
@@ -157,7 +150,6 @@ pub fn runWorld(
         .kv = &.{},
         .kv_map = kv_map,
         .absent = kv_absent,
-        .prefix_results = prefix_results,
         .miss = miss,
         .sources = sources,
         .source_dir = source_dir,

@@ -84,13 +84,8 @@ pub const Host = struct {
     kv: []const decode.KvEntry,
     kv_cursor: usize = 0,
     /// Declarative world: key→value map reads resolve against (`.map` mode).
-    /// `kv.get` is a lookup; `kv.prefix` scans for matching keys.
+    /// `kv.get` is a lookup; `kv.prefix` scans the map (cursor + limit honored).
     kv_map: std.StringHashMapUnmanaged([]const u8) = .{},
-    /// Recorded `kv.prefix` scan results by prefix (`.map` mode). Served
-    /// verbatim when the scanned prefix is recorded — faithful (a flat `kv_map`
-    /// re-scan can over-include a key read individually after the scan, or under
-    /// a `limit`). A prefix not present here falls back to scanning `kv_map`.
-    prefix_results: std.StringHashMapUnmanaged([]const decode.KvPair) = .{},
     /// What a missed `kv.get` does in `.map` mode (`.tape` is always fail-loud).
     miss: MissPolicy = .fail,
     /// Keys the world declares explicitly **absent** (recorded `not_found`
@@ -262,50 +257,35 @@ fn kvPrefix(
     out_json_len: [*c]c_int,
     user: ?*anyopaque,
 ) callconv(.c) c_int {
-    _ = cursor;
-    _ = cursor_len;
-    _ = limit;
     const h = hostOf(user);
     const p = prefix[0..@intCast(prefix_len)];
+    const cur = cursor[0..@intCast(cursor_len)]; // "" = from start; else strictly-greater
     if (h.mode == .map) {
-        // Recorded prefix result → serve the exact rows verbatim (faithful).
-        if (h.prefix_results.get(p)) |rows| {
-            var buf = std.ArrayList(u8){};
-            defer buf.deinit(h.a);
-            var aw = std.Io.Writer.Allocating.fromArrayList(h.a, &buf);
-            const w = &aw.writer;
-            w.writeByte('[') catch return -1;
-            for (rows, 0..) |row, i| {
-                if (i != 0) w.writeByte(',') catch return -1;
-                w.writeAll("{\"key\":") catch return -1;
-                writeJsonString(w, row.key) catch return -1;
-                w.writeAll(",\"value\":") catch return -1;
-                writeJsonString(w, row.value) catch return -1;
-                w.writeByte('}') catch return -1;
-            }
-            w.writeByte(']') catch return -1;
-            buf = aw.toArrayList();
-            out_json.* = dupC(buf.items, true) orelse return -1;
-            out_json_len.* = @intCast(buf.items.len);
-            out_outcome.* = 0;
-            return 0;
-        }
-        // Else scan the declared map for keys under the prefix, sorted for a
-        // deterministic result. An empty match is a legitimate answer (the
-        // world declares no such keys), so a prefix scan never holes/diverges.
+        // Reconstruct the scan from the readset map: keys under the prefix,
+        // sorted, strictly after `cursor`, capped at `limit`. The map holds the
+        // foreign matches; the handler's own writes are refilled by re-execution
+        // (kvSet → kv_map), so no separate recorded-rows are needed. An empty
+        // match is a legitimate answer (a prefix scan never holes/diverges).
         var keys = std.ArrayList([]const u8){};
         defer keys.deinit(h.a);
         var it = h.kv_map.iterator();
         while (it.next()) |kv| {
-            if (std.mem.startsWith(u8, kv.key_ptr.*, p)) keys.append(h.a, kv.key_ptr.*) catch return -1;
+            const k = kv.key_ptr.*;
+            if (!std.mem.startsWith(u8, k, p)) continue;
+            if (cur.len != 0 and std.mem.order(u8, k, cur) != .gt) continue; // strictly > cursor
+            keys.append(h.a, k) catch return -1;
         }
         std.mem.sort([]const u8, keys.items, {}, lessThanStr);
+        const n: usize = if (limit > 0 and @as(usize, @intCast(limit)) < keys.items.len)
+            @intCast(limit)
+        else
+            keys.items.len;
         var buf = std.ArrayList(u8){};
         defer buf.deinit(h.a);
         var aw = std.Io.Writer.Allocating.fromArrayList(h.a, &buf);
         const w = &aw.writer;
         w.writeByte('[') catch return -1;
-        for (keys.items, 0..) |kk, i| {
+        for (keys.items[0..n], 0..) |kk, i| {
             if (i != 0) w.writeByte(',') catch return -1;
             w.writeAll("{\"key\":") catch return -1;
             writeJsonString(w, kk) catch return -1;

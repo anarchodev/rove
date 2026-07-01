@@ -38,11 +38,6 @@ const host = @import("host.zig");
 pub const Header = struct { name: []const u8, value: []const u8 };
 pub const KvPair = struct { key: []const u8, value: []const u8 };
 pub const Source = struct { path: []const u8, kind: []const u8, source: []const u8 };
-/// A recorded `kv.prefix(prefix)` scan result — the EXACT rows it returned.
-/// Served verbatim so a prefix scan is faithful (a flat `kv` map re-scan can
-/// over-include a key that was read individually after the scan, or under a
-/// `limit`). `export-fixture` fills this from the recorded prefix tape entries.
-pub const PrefixEntry = struct { prefix: []const u8, rows: []const KvPair };
 /// The recorded run's observable output — for the output-level faithfulness
 /// check (`status_match`), the honest place fidelity lives (not per-read).
 pub const Recorded = struct {
@@ -74,8 +69,6 @@ pub const World = struct {
     /// with no hole (so `miss-policy=fail` reproduces a recording's not-found
     /// reads). `export-fixture` fills this from the recorded not-found reads.
     kv_absent: []const []const u8 = &.{},
-    /// Recorded prefix scan results, served verbatim (see `PrefixEntry`).
-    kv_prefix: []const PrefixEntry = &.{},
     /// The recorded run's output, for the `status_match` faithfulness check.
     recorded: ?Recorded = null,
     seed: u64 = 0,
@@ -180,24 +173,6 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
             if (e == .string) try ks.append(a, e.string);
         }
         w.kv_absent = try ks.toOwnedSlice(a);
-    }
-
-    // ── recorded prefix results — `{ "orders/": [{"key","value"}, …] }` ──
-    if (obj.get("kvPrefix")) |kp| {
-        if (kp != .object) return Error.BadWorld;
-        var pes = std.ArrayList(PrefixEntry){};
-        var it = kp.object.iterator();
-        while (it.next()) |e| {
-            if (e.value_ptr.* != .array) continue;
-            var rows = std.ArrayList(KvPair){};
-            for (e.value_ptr.array.items) |row| {
-                if (row != .object) continue;
-                const k = jStr(row.object, "key") orelse continue;
-                try rows.append(a, .{ .key = k, .value = jStr(row.object, "value") orelse "" });
-            }
-            try pes.append(a, .{ .prefix = e.key_ptr.*, .rows = try rows.toOwnedSlice(a) });
-        }
-        w.kv_prefix = try pes.toOwnedSlice(a);
     }
 
     // ── recorded output (for status_match) ──
