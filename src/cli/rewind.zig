@@ -819,9 +819,9 @@ const USAGE =
     \\  rewind [--env <file>] deployments <tenant>
     \\  rewind [--env <file>] logs <tenant> [--limit N] [--after CURSOR]
     \\  rewind [--env <file>] pull <tenant> <req_id> [-o FILE]
-    \\  rewind [--env <file>] replay <fixture> [--source-dir DIR] [--miss-policy fail|resolve] [-o FILE]
+    \\  rewind [--env <file>] replay <world.json> [--source-dir DIR] [--miss-policy fail|resolve] [-o FILE]
     \\  rewind sim <world.json> [--source-dir DIR] [--miss-policy fail|resolve] [-o FILE]
-    \\  rewind export-fixture <pulled-fixture.json> [-o world.json]
+    \\  rewind export-fixture <base64-record.json> [-o world.json]
     \\  rewind [--env <file>] publish [--apps-dir D] [--only t1,t2] [--include-examples] [--no-release]
     \\  rewind [--env <file>] provision <tenant> [--cluster C] [--host H]
     \\  rewind [--env <file>] host add <host> <tenant>
