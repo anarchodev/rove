@@ -161,6 +161,149 @@ pub fn runWorld(
         .run_json = host.output,
         .recorded = wv.recorded,
     });
+
+    // Optional `expected` → append a `verify` result (partial, order-independent
+    // match over the bundle). Present ⇒ this is a test/replay assertion; absent
+    // ⇒ plain sim (bundle only).
+    if (wv.expected_json) |ej| appendVerify(a, out, ej) catch {};
+}
+
+/// Partial, order-independent matcher: for each facet the `expected` object
+/// declares, check the produced bundle satisfies it. Splices
+/// `,"verify":{"pass":…,"failures":[…]}` before the bundle's closing `}`. A
+/// facet the expected doesn't mention is not checked ("at least these hold").
+fn appendVerify(a: std.mem.Allocator, out: *std.ArrayList(u8), expected_json: []const u8) !void {
+    const bp = std.json.parseFromSlice(std.json.Value, a, out.items, .{}) catch return;
+    if (bp.value != .object) return;
+    const bundle = bp.value.object;
+    const ep = std.json.parseFromSlice(std.json.Value, a, expected_json, .{}) catch return;
+    if (ep.value != .object) return;
+    const exp = ep.value.object;
+
+    var fails = std.ArrayList(u8){};
+    var fw = std.Io.Writer.Allocating.fromArrayList(a, &fails);
+    const w = &fw.writer;
+    try w.writeByte('[');
+    var nf: usize = 0;
+
+    // response — subset match against bundle.response
+    if (exp.get("response")) |rv| if (rv == .object) {
+        const br: ?std.json.ObjectMap = if (bundle.get("response")) |b| (if (b == .object) b.object else null) else null;
+        var it = rv.object.iterator();
+        while (it.next()) |e| {
+            const got: ?std.json.Value = if (br) |b| b.get(e.key_ptr.*) else null;
+            if (got == null or !valEq(a, got.?, e.value_ptr.*))
+                nf = try emitFail(a, w, nf, "response", e.value_ptr.*, got);
+        }
+    };
+    // disposition / body — direct compare
+    if (exp.get("disposition")) |dv| {
+        const got = bundle.get("disposition");
+        if (got == null or !valEq(a, got.?, dv)) nf = try emitFail(a, w, nf, "disposition", dv, got);
+    }
+    if (exp.get("body")) |bv| {
+        const got = bundle.get("body");
+        if (got == null or !valEq(a, got.?, bv)) nf = try emitFail(a, w, nf, "body", bv, got);
+    }
+
+    // writes / cmds — must be PRESENT somewhere in the effect log (order-free)
+    const effects: []const std.json.Value = if (bundle.get("effects")) |ev|
+        (if (ev == .array) ev.array.items else &.{})
+    else
+        &.{};
+    if (exp.get("writes")) |wv| if (wv == .array) {
+        for (wv.array.items) |want|
+            if (!matchWrite(a, effects, want)) {
+                nf = try emitFail(a, w, nf, "writes", want, null);
+            };
+    };
+    if (exp.get("cmds")) |cv| if (cv == .array) {
+        for (cv.array.items) |want|
+            if (!matchCmd(a, effects, want)) {
+                nf = try emitFail(a, w, nf, "cmds", want, null);
+            };
+    };
+
+    try w.writeByte(']');
+    fails = fw.toArrayList();
+
+    // splice before the bundle's trailing `}`
+    var end = out.items.len;
+    while (end > 0 and (out.items[end - 1] == '\n' or out.items[end - 1] == ' ')) end -= 1;
+    if (end == 0 or out.items[end - 1] != '}') return;
+    var no = std.ArrayList(u8){};
+    try no.appendSlice(a, out.items[0 .. end - 1]);
+    try no.appendSlice(a, ",\"verify\":{\"pass\":");
+    try no.appendSlice(a, if (nf == 0) "true" else "false");
+    try no.appendSlice(a, ",\"failures\":");
+    try no.appendSlice(a, fails.items);
+    try no.appendSlice(a, "}}");
+    out.* = no;
+}
+
+/// Deep value equality via canonical JSON text (fine for scalars/strings — the
+/// common `expected` shape; objects compare by serialized form).
+fn valEq(a: std.mem.Allocator, x: std.json.Value, y: std.json.Value) bool {
+    const sx = std.json.Stringify.valueAlloc(a, x, .{}) catch return false;
+    const sy = std.json.Stringify.valueAlloc(a, y, .{}) catch return false;
+    return std.mem.eql(u8, sx, sy);
+}
+
+fn emitFail(a: std.mem.Allocator, w: *std.Io.Writer, nf: usize, facet: []const u8, want: std.json.Value, got: ?std.json.Value) !usize {
+    _ = a;
+    if (nf != 0) try w.writeByte(',');
+    try w.writeAll("{\"facet\":");
+    try jsonStr(w, facet);
+    try w.writeAll(",\"want\":");
+    try std.json.Stringify.value(want, .{}, w);
+    if (got) |g| {
+        try w.writeAll(",\"got\":");
+        try std.json.Stringify.value(g, .{}, w);
+    }
+    try w.writeByte('}');
+    return nf + 1;
+}
+
+/// A `write` expectation `{key, value?}` must match some `{kind:"write"}` effect.
+fn matchWrite(a: std.mem.Allocator, effects: []const std.json.Value, want: std.json.Value) bool {
+    if (want != .object) return false;
+    for (effects) |e| {
+        if (e != .object) continue;
+        const kind = e.object.get("kind") orelse continue;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "write")) continue;
+        if (want.object.get("key")) |wk| {
+            const ek = e.object.get("key") orelse continue;
+            if (!valEq(a, ek, wk)) continue;
+        }
+        if (want.object.get("value")) |wvv| {
+            const ev = e.object.get("value") orelse continue;
+            if (!valEq(a, ev, wvv)) continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+/// A `cmd` expectation `{kind, url?, to?}` must match some effect of that kind.
+fn matchCmd(a: std.mem.Allocator, effects: []const std.json.Value, want: std.json.Value) bool {
+    if (want != .object) return false;
+    for (effects) |e| {
+        if (e != .object) continue;
+        const kind = e.object.get("kind") orelse continue;
+        if (want.object.get("kind")) |wk| {
+            if (!valEq(a, kind, wk)) continue;
+        }
+        if (want.object.get("url")) |wu| {
+            const eu = e.object.get("url") orelse continue;
+            if (!valEq(a, eu, wu)) continue;
+        }
+        if (want.object.get("to")) |wt| {
+            const et = e.object.get("to") orelse continue;
+            if (!valEq(a, et, wt)) continue;
+        }
+        return true;
+    }
+    return false;
 }
 
 // ── emit helpers ──

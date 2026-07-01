@@ -655,6 +655,8 @@ fn cmdReplay(a: std.mem.Allocator, world_path: []const u8, source_dir: ?[]const 
     } else {
         std.debug.print("{s}\n", .{out.items});
     }
+    // A failed `expected` assertion → non-zero exit (CI-usable).
+    if (std.mem.indexOf(u8, out.items, "\"verify\":{\"pass\":false") != null) std.process.exit(1);
 }
 
 /// `rewind sim <world.json> [--source-dir DIR] [-o FILE]`
@@ -684,6 +686,8 @@ fn cmdSim(a: std.mem.Allocator, world_path: []const u8, source_dir: ?[]const u8,
         stdout.writeAll(out.items) catch {};
         stdout.writeAll("\n") catch {};
     }
+    // A failed `expected` assertion → non-zero exit (CI-usable).
+    if (std.mem.indexOf(u8, out.items, "\"verify\":{\"pass\":false") != null) std.process.exit(1);
 }
 
 /// `rewind export-fixture <pulled-fixture.json> [-o world.json]` — transcode a

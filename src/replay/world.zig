@@ -69,6 +69,10 @@ pub const World = struct {
     kv: []const KvPair = &.{},
     /// The recorded run's output, for the `status_match` faithfulness check.
     recorded: ?Recorded = null,
+    /// Optional `expected` output — a PARTIAL, order-independent assertion over
+    /// the produced bundle (response.status / writes / cmds / disposition). When
+    /// present, `runWorld` appends a `verify` result. Stored as JSON text.
+    expected_json: ?[]const u8 = null,
     seed: u64 = 0,
     now_ms: u64 = 0,
     /// Inline handler sources (path/kind/source); empty when `--source-dir`
@@ -165,6 +169,11 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
                 .exception = jStr(r, "exception"),
             };
         }
+    }
+
+    // ── expected output — a partial assertion over the produced bundle ──
+    if (obj.get("expected")) |ev| {
+        if (ev == .object) w.expected_json = try jsonText(a, ev);
     }
 
     // ── inline sources ──
