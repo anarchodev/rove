@@ -17,13 +17,15 @@
 //!     "body": { "item": "book" }, "ip": "203.0.113.7"
 //!   },
 //!   "kv": { "user/jess": { "name": "Jess" }, "config/rate": "10" },
-//!   "seed": 123, "now_ms": 1700000000000, "missPolicy": "resolve"
+//!   "seed": 123, "now_ms": 1700000000000
 //! }
 //! ```
 //!
-//! KV is a key→value **map** (not an ordered tape) — an authored world carries
-//! no access order to verify against, so `runWorld` resolves reads against the
-//! map order-independently. Non-string values (in `kv`, `request.body`, and
+//! KV is a key→value **map** (not an ordered tape) and a **closed world** — an
+//! authored world carries no access order to verify against, so `runWorld`
+//! resolves reads against the map order-independently, and a key not in the map
+//! is `not_found` (never a divergence). Non-string values (in `kv`,
+//! `request.body`, and
 //! header values) are JSON-stringified, since KV/body are byte strings the
 //! handler parses itself — letting an author write `{ "name": "Jess" }` instead
 //! of a hand-escaped string.
