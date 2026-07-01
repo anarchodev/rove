@@ -86,9 +86,11 @@ customer could ever run:
 - **`rewind`** (customer + operator-scoped) — **tenant verbs, OIDC-primary,
   root-capable.** Operates on tenants you're authorized for; the server scopes
   by your credential (OIDC = your tenants; root = any). This is the binary
-  shipped to customers; the name was reserved for it (§6). **Not yet built** —
-  OIDC doesn't exist until the `__auth__` IdP is deployed (auth chicken-and-egg,
-  §7 / Step 3), so today every real operation is root and lives in `rewind-ops`.
+  shipped to customers; the name was reserved for it (§6). The **online tenant
+  verbs** were gated on the `__auth__` IdP (auth chicken-and-egg, §7 / Step 3;
+  the OIDC plane is now deployed and the customer deploy/release path is green).
+  The **offline debug verbs** (`replay`/`sim`/`export-fixture`/`pull`/`logs`) are
+  built and need no OIDC — they link the replay engine locally (see below).
 - **`rewind-ops`** (operator-only) — **platform verbs, root + move-secret +
   ops-secret.** Never shipped to customers. **Built** (`zig build rewind-ops`,
   `src/cli/ops.zig` over the shared `src/cli/common.zig`).
@@ -141,6 +143,48 @@ Design notes:
 - **`host rm` has no primitive** — the CP only `setHost`; a delete is needed.
 - **`cert set` / `config set` (admin-kv)** exist as server primitives
   (`/_control/cert`, `/_system/admin-kv`) but are deferred (niche).
+
+### `rewind` debug surface — replay + sim (offline; built)
+
+The `rewind` binary also carries the **customer debugging surface** — one engine,
+`run(world, code, on-miss)` (`docs/architecture/replay-and-sim.md`,
+`docs/plans/sim-test-framework.md`). These verbs link the native arenajs replay
+engine directly (`rove-replay`) — **fully offline**: no OIDC, no network, no
+cluster — which is why they shipped ahead of the auth plane (§7).
+
+```
+rewind logs <tenant> [--limit N] [--after CURSOR]        # list recorded requests (LLM-friendly JSON)
+rewind pull <tenant> <req_id> [-o FILE]                  # a recording → a self-contained fixture
+rewind replay <fixture> [--source-dir DIR] [-o FILE]     # re-run the recording offline; fail-loud on divergence
+rewind sim <world.json> [--source-dir DIR] [--miss-policy fail|resolve] [-o FILE]   # run a DECLARATIVE authored world
+rewind export-fixture <pulled-fixture.json> [-o world.json]   # a recording → an editable declarative world
+```
+
+Design notes:
+
+- **`replay` is the fail-loud corner** — `run(captured world, original code,
+  on-miss=fail)`: it reproduces "what actually happened" and errors (`REPLAY
+  DIVERGENCE`) rather than inventing. `--source-dir` swaps in working-tree source
+  ("does my change still satisfy this request?"). Covers **all activation kinds**
+  — `inbound`, `fetch_chunk` (ctx + flattened fetch result + resolved `{to}`
+  export), `ws_message` (the frame, text + binary), `wake`/`disconnect` — because
+  the worker now records every callback's Msg (`replay-and-sim.md` §5).
+- **`sim` is the resolve corner** — `run(authored/partial world, any code,
+  on-miss=resolve)`: reads a plain-JSON world (request surface, a key→value KV
+  map, seed, `missPolicy`) and, on a missed read, resolves it (returning
+  `not_found` + reporting a typed **hole**) instead of diverging. `--miss-policy
+  fail|resolve` *is* the replay↔sim axis over the one engine. Primary user: an
+  LLM (deterministic feedback, structured JSON I/O).
+- **`export-fixture` bridges the two** — transcodes a captured recording into an
+  editable, offline, fail-loud declarative world (KV read cursor → initial-
+  snapshot map + `kvAbsent`), so "what happened in prod" becomes a reusable sim
+  scenario / regression fixture.
+- **Guardrails**: the worker asserts L3 at capture time (a callback that records
+  no Msg panics in debug / loud-logs in prod), and `scripts/smoke/replay_matrix_smoke_v2.py`
+  captures + replays one recording per activation kind as a regression gate.
+
+Still ahead (Phase 12/13, `sim-test-framework.md`): the `_tests/` runner
+(`rewind test` + `expect`/`snapshot`) and the server-side `_tests/` strip.
 
 ## 3. Phase A — thin CLI (no server changes)
 
