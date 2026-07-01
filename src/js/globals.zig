@@ -1039,10 +1039,19 @@ fn jsKvPrefix(
             state.allocator.alloc(tape_mod.KvPair, scan.entries.len) catch null;
         defer if (heap_pairs) |h| state.allocator.free(h);
         const pairs: []tape_mod.KvPair = if (heap_pairs) |h| h else stack_pairs[0..scan.entries.len];
-        for (scan.entries, 0..) |e, i| {
-            pairs[i] = .{ .key = e.key, .value = e.value };
+        // Minimal read set (mirrors the kv.get `skip_tape` gate): a row whose
+        // key is in this activation's own writeset is a read-your-write, not a
+        // foreign read. Keep it OUT of the taped readset — replay reproduces it
+        // by re-executing the handler's own write, then reconstructs the scan
+        // from the map. This keeps the readset disjoint from the writeset, so a
+        // refactored read of such a key can't be served a stale write value.
+        var np: usize = 0;
+        for (scan.entries) |e| {
+            if (state.writeset.containsKey(e.key)) continue;
+            pairs[np] = .{ .key = e.key, .value = e.value };
+            np += 1;
         }
-        rs.kv.appendKvPrefix(prefix_str, cursor_str, limit, pairs, .ok) catch {};
+        rs.kv.appendKvPrefix(prefix_str, cursor_str, limit, pairs[0..np], .ok) catch {};
     }
 
     const arr = c.JS_NewArray(ctx);
