@@ -213,9 +213,22 @@ export must be persisted; the no-`{to}` conventional-export case is covered by
 event-shape resolution); (b) `TextDecoder` (and `stream.*`/`next`) are absent in
 the bare replay arena — a handler using them ReferenceErrors on replay; (c)
 binary WS frames need a `Uint8Array` `request.activation.data` surface. The
-**sim** path (authored worlds) never depended on any of this. The durable
-guard against regression would be an L3 capture-time assertion / per-kind replay
-test matrix.
+**sim** path (authored worlds) never depended on any of this.
+
+**Update 2026-06-30 (d) — regression guards built.** So this class can't
+silently return: (1) an **L3 capture-time assert** (`worker_log.l3AssertMsgRecorded`
+at the `captureLogWithId` chokepoint) — a successful callback activation whose
+Msg channel is known-and-always-populated (`fetch_chunk`→`fetch_responses`,
+`ws_message`→`activation_bytes`) that ships **empty tapes** panics in debug/
+tests (loud-logs in prod — the log path must never crash a live request) and
+names the fix. Zero false positives: kinds whose Msg may legitimately be empty
+(disconnect/boot/edge-wakes) aren't asserted; **extend the switch when a new
+callback kind lands**. Because smokes run Debug workers, *every* smoke is now an
+L3 checker — it caught a deliberately-regressed capture site (fired during the
+deploy flow, before the test even ran). (2) A **per-kind replay matrix**
+(`scripts/smoke/replay_matrix_smoke_v2.py`) captures + replays a real `inbound` /
+`fetch_chunk` / `ws_message` recording and asserts each reproduces. The pure
+predicate `l3MissingChannel` has an inline unit test.
 
 ## 6. Implications for the sim / export-fixture plan
 

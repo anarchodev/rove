@@ -294,6 +294,60 @@ pub fn captureWsFrameTapes(
     return captureTapesWithActivation(worker, readset, ctx_body, framed);
 }
 
+/// L3 capture-time guard (`effect-algebra.md` §2.3 — *every Msg is a recorded
+/// input*). A successful callback activation whose Msg carries data MUST tape
+/// it, or the activation is unreplayable — the empty-tape bug class
+/// (`docs/architecture/replay-and-sim.md` §5) that hid `fetch_chunk` / WS-frame
+/// records shipping with empty `.{}` tapes. Enforced only for kinds whose Msg
+/// channel is known and always-populated (zero false positives); **extend this
+/// switch as new callback kinds land** so a forgotten capture site fails loud
+/// in dev/test instead of silently producing an unreplayable record.
+///
+/// Debug/ReleaseSafe (tests + smokes run Debug workers) → panic. Prod
+/// (ReleaseFast) → loud log only: the log path is best-effort and must never
+/// crash a live request over a capture concern.
+/// Pure half of the guard (testable): the missing Msg-channel description for a
+/// successful callback activation, or null when the invariant holds. Kinds
+/// whose Msg may legitimately be empty (disconnect, boot, edge wakes) return
+/// null; add a channel-per-kind entry only once that kind's Msg is known
+/// non-empty + captured.
+pub fn l3MissingChannel(
+    activation: log_mod.ActivationSource,
+    outcome: log_mod.Outcome,
+    tapes: log_mod.TapePayloads,
+) ?[]const u8 {
+    if (outcome != .ok) return null; // an errored activation may legitimately not tape
+    return switch (activation) {
+        .fetch_chunk => if (tapes.fetch_responses_tape_bytes.len == 0)
+            "fetch_responses (the fetch result)"
+        else
+            null,
+        .ws_message => if (tapes.activation_bytes.len == 0)
+            "activation_bytes (the WS frame)"
+        else
+            null,
+        else => null,
+    };
+}
+
+fn l3AssertMsgRecorded(
+    activation: log_mod.ActivationSource,
+    outcome: log_mod.Outcome,
+    tapes: log_mod.TapePayloads,
+) void {
+    if (l3MissingChannel(activation, outcome, tapes)) |what| {
+        std.log.err(
+            "rove-js L3 VIOLATION: '{s}' activation recorded no Msg — {s} is empty; " ++
+                "this record is UNREPLAYABLE (docs/architecture/replay-and-sim.md §5). " ++
+                "A resume path passed empty tapes — wire its captureFetchChunkTapes/" ++
+                "captureWsFrameTapes/captureTapes.",
+            .{ @tagName(activation), what },
+        );
+        if (std.debug.runtime_safety)
+            @panic("L3 violation: callback activation recorded no Msg (unreplayable) — see the log line above");
+    }
+}
+
 // ── Log record capture ────────────────────────────────────────────────
 
 /// Append a log record for a request that has finished its dispatch
@@ -383,6 +437,7 @@ pub fn captureLogWithId(
     activation: log_mod.ActivationSource,
     raft_seq: u64,
 ) void {
+    l3AssertMsgRecorded(activation, outcome, tapes);
     captureLogInner(
         worker,
         instance_id,
@@ -744,4 +799,29 @@ fn sendPushChunk(
             .{ url, keys.len, resp.status },
         );
     }
+}
+
+test "l3MissingChannel: fires on empty fetch_chunk/ws_message, exempts errors + other kinds" {
+    const testing = std.testing;
+    const empty = log_mod.TapePayloads{};
+
+    // A successful fetch_chunk / ws_message with an empty Msg channel = the bug.
+    try testing.expect(l3MissingChannel(.fetch_chunk, .ok, empty) != null);
+    try testing.expect(l3MissingChannel(.ws_message, .ok, empty) != null);
+
+    // Populated → invariant holds.
+    var fr = log_mod.TapePayloads{};
+    fr.fetch_responses_tape_bytes = "x";
+    try testing.expect(l3MissingChannel(.fetch_chunk, .ok, fr) == null);
+    var ab = log_mod.TapePayloads{};
+    ab.activation_bytes = "x";
+    try testing.expect(l3MissingChannel(.ws_message, .ok, ab) == null);
+
+    // An errored activation may legitimately not tape.
+    try testing.expect(l3MissingChannel(.fetch_chunk, .handler_error, empty) == null);
+
+    // Kinds whose Msg may be empty are not asserted (no false positives).
+    try testing.expect(l3MissingChannel(.inbound, .ok, empty) == null);
+    try testing.expect(l3MissingChannel(.disconnect, .ok, empty) == null);
+    try testing.expect(l3MissingChannel(.wake_batch, .ok, empty) == null);
 }
