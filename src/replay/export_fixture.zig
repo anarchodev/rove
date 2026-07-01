@@ -57,6 +57,9 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     const path = if (req) |r| (jStr(r, "path") orelse "/") else "/";
     const host = if (req) |r| (jStr(r, "host") orelse "") else "";
 
+    const export_name = jStr(obj, "export"); // recorded resolved export ({to}) — G3
+    const recorded = if (obj.get("recorded")) |v| (if (v == .object) v.object else null) else null;
+
     const tapes = if (obj.get("tapes")) |v| (if (v == .object) v.object else null) else null;
     const kv_entries: []const decode.KvEntry = blk: {
         const b64 = if (tapes) |t| jStr(t, "kv_b64") else null;
@@ -73,13 +76,30 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         if (b64) |s| break :blk try b64decode(a, s);
         break :blk null;
     };
+    const fetch_resp: []const decode.FetchResponseEntry = blk: {
+        const b64 = if (tapes) |t| jStr(t, "fetch_responses_b64") else null;
+        if (b64) |s| break :blk decode.decodeFetchResponses(a, try b64decode(a, s)) catch &.{};
+        break :blk &.{};
+    };
+    const trigger: []const decode.TriggerPayloadEntry = blk: {
+        const b64 = if (tapes) |t| jStr(t, "trigger_payload_b64") else null;
+        if (b64) |s| break :blk decode.decodeTriggerPayload(a, try b64decode(a, s)) catch &.{};
+        break :blk &.{};
+    };
+    const activation_bytes: ?[]const u8 = blk: {
+        const b64 = if (tapes) |t| jStr(t, "activation_bytes_b64") else null;
+        if (b64) |s| break :blk try b64decode(a, s);
+        break :blk null;
+    };
     const seed = jStr(obj, "seed");
     const ts_ns = jStr(obj, "timestamp_ns");
 
-    // ── KV: ordered read cursor → initial-snapshot map + absent set ──
+    // ── KV: get → initial-snapshot map / absent; prefix → both the map (for
+    // later gets) AND kvPrefix (the exact recorded rows, for faithful scans) ──
     var seen = std.StringHashMapUnmanaged(void){};
     var kv = std.ArrayList(KvPair){};
     var absent = std.ArrayList([]const u8){};
+    var prefixes = std.ArrayList(PrefixEntry){};
     for (kv_entries) |e| switch (e.op) {
         .get => {
             if (seen.contains(e.key)) continue; // re-read / post-write — overlay reproduces it
@@ -87,18 +107,21 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
             switch (e.outcome) {
                 .ok => try kv.append(a, .{ .key = e.key, .value = e.value }),
                 .not_found => try absent.append(a, e.key),
-                .err => {}, // a read that errored is not a value the world supplies
+                .err => {},
             }
         },
-        .prefix => for (e.results) |row| {
-            if (seen.contains(row.key)) continue;
-            try seen.put(a, row.key, {});
-            try kv.append(a, .{ .key = row.key, .value = row.value });
+        .prefix => {
+            try prefixes.append(a, .{ .prefix = e.key, .rows = e.results });
+            for (e.results) |row| {
+                if (seen.contains(row.key)) continue;
+                try seen.put(a, row.key, {});
+                try kv.append(a, .{ .key = row.key, .value = row.value });
+            }
         },
-        .set, .delete => {}, // writes are outputs — never in a read tape
+        .set, .delete => {},
     };
 
-    // ── request surface: fold request_reads ──
+    // ── request surface: request_reads ──
     var headers = std.ArrayList(decode.RequestReadEntry){};
     var ip: ?[]const u8 = null;
     var body_read = body_bytes != null;
@@ -109,6 +132,45 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         .header_names, .ip_raw => {},
     };
 
+    // ── fetch result (fetch_chunk): status/ok/done/fetchId + the body ──
+    var fetch_status: ?u16 = null;
+    var fetch_ok: ?bool = null;
+    var fetch_done: ?bool = null;
+    var fetch_id: ?[]const u8 = null;
+    var fetch_body: ?[]const u8 = null;
+    if (fetch_resp.len != 0) {
+        var body = std.ArrayList(u8){};
+        for (fetch_resp) |e| try body.appendSlice(a, e.inline_bytes);
+        fetch_body = body.items;
+        const last = fetch_resp[fetch_resp.len - 1];
+        fetch_id = last.fetch_id;
+        fetch_done = last.final;
+        if (last.final) {
+            fetch_status = last.terminal_status;
+            fetch_ok = last.terminal_ok;
+        }
+    }
+    // request.body: the fetch result body (fetch_chunk) else the inbound body.
+    const eff_body: ?[]const u8 = fetch_body orelse body_bytes;
+    const eff_body_present = fetch_body != null or body_read;
+
+    // ── ctx (from the trigger_payload `{"ctx": …}` envelope) ──
+    const ctx_json: ?[]const u8 = blk: {
+        if (trigger.len != 0 and trigger[0].batch_id == decode.NO_BATCH and trigger[0].inline_bytes.len != 0)
+            break :blk extractCtx(a, trigger[0].inline_bytes);
+        break :blk null;
+    };
+
+    // ── ws_message frame: activation_bytes = [opcode][data] ──
+    var ws_opcode: ?u8 = null;
+    var ws_data: ?[]const u8 = null;
+    if (std.mem.eql(u8, activation, "ws_message")) {
+        if (activation_bytes) |ab| if (ab.len >= 1) {
+            ws_opcode = ab[0];
+            ws_data = ab[1..];
+        };
+    }
+
     // ── emit the world ──
     var aw = std.Io.Writer.Allocating.fromArrayList(a, out);
     defer out.* = aw.toArrayList();
@@ -118,6 +180,10 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     try jsonStr(w, entry);
     try w.writeAll(",\n  \"activation\": ");
     try jsonStr(w, activation);
+    if (export_name) |e| {
+        try w.writeAll(",\n  \"export\": ");
+        try jsonStr(w, e);
+    }
     try w.writeAll(",\n  \"missPolicy\": \"fail\",\n  \"request\": {\n    \"method\": ");
     try jsonStr(w, method);
     try w.writeAll(", \"path\": ");
@@ -135,15 +201,40 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         }
         try w.writeAll(" }");
     }
-    if (body_read) {
+    if (eff_body_present) {
         try w.writeAll(",\n    \"body\": ");
-        try jsonStr(w, body_bytes orelse "");
+        try jsonStr(w, eff_body orelse "");
     }
     if (ip) |v| {
         try w.writeAll(",\n    \"ip\": ");
         try jsonStr(w, v);
     }
-    try w.writeAll("\n  },\n  \"kv\": {");
+    // flattened fetch-result surface (fetch_chunk)
+    if (fetch_status) |s| try w.print(",\n    \"status\": {d}", .{s});
+    if (fetch_ok) |b| try w.writeAll(if (b) ",\n    \"ok\": true" else ",\n    \"ok\": false");
+    if (fetch_done) |b| try w.writeAll(if (b) ",\n    \"done\": true" else ",\n    \"done\": false");
+    if (fetch_id) |id| {
+        try w.writeAll(",\n    \"fetchId\": ");
+        try jsonStr(w, id);
+    }
+    // ws frame → request.activation {opcode, data | dataB64}
+    if (ws_opcode) |op| {
+        try w.print(",\n    \"activation\": {{ \"opcode\": {d}, ", .{op});
+        if (op == 2) { // binary → base64 (Uint8Array)
+            try w.writeAll("\"dataB64\": ");
+            try jsonB64(a, w, ws_data orelse "");
+        } else {
+            try w.writeAll("\"data\": ");
+            try jsonStr(w, ws_data orelse "");
+        }
+        try w.writeAll(" }");
+    }
+    try w.writeAll("\n  }");
+    if (ctx_json) |cj| {
+        try w.writeAll(",\n  \"ctx\": ");
+        try w.writeAll(cj);
+    }
+    try w.writeAll(",\n  \"kv\": {");
     for (kv.items, 0..) |p, i| {
         if (i != 0) try w.writeByte(',');
         try w.writeAll("\n    ");
@@ -161,6 +252,34 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         }
         try w.writeAll(" ]");
     }
+    if (prefixes.items.len != 0) {
+        try w.writeAll(",\n  \"kvPrefix\": {");
+        for (prefixes.items, 0..) |pe, pi| {
+            if (pi != 0) try w.writeByte(',');
+            try w.writeAll("\n    ");
+            try jsonStr(w, pe.prefix);
+            try w.writeAll(": [");
+            for (pe.rows, 0..) |row, ri| {
+                if (ri != 0) try w.writeByte(',');
+                try w.writeAll("{\"key\": ");
+                try jsonStr(w, row.key);
+                try w.writeAll(", \"value\": ");
+                try jsonStr(w, row.value);
+                try w.writeByte('}');
+            }
+            try w.writeByte(']');
+        }
+        try w.writeAll("\n  }");
+    }
+    if (recorded) |r| {
+        try w.writeAll(",\n  \"recorded\": {\"status\": ");
+        if (r.get("status")) |sv| (if (sv == .integer) try w.print("{d}", .{sv.integer}) else try w.writeAll("null")) else try w.writeAll("null");
+        try w.writeAll(", \"console\": ");
+        try jsonStr(w, jStr(r, "console") orelse "");
+        try w.writeAll(", \"exception\": ");
+        try jsonStr(w, jStr(r, "exception") orelse "");
+        try w.writeByte('}');
+    }
     if (seed) |s| {
         const n = std.fmt.parseInt(u64, s, 10) catch 0;
         try w.print(",\n  \"seed\": {d}", .{n});
@@ -169,14 +288,32 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         const ns = std.fmt.parseInt(i64, s, 10) catch 0;
         if (ns > 0) try w.print(",\n  \"now_ms\": {d}", .{@divTrunc(ns, std.time.ns_per_ms)});
     }
-    // sources: pass through verbatim so the world is self-contained (no
-    // --source-dir needed). The pull fixture's `sources` is already the
-    // {path,kind,source} array world.zig reads.
+    // sources: pass through verbatim so the world is self-contained.
     if (obj.get("sources")) |sv| {
         try w.writeAll(",\n  \"sources\": ");
         try std.json.Stringify.value(sv, .{}, w);
     }
     try w.writeAll("\n}\n");
+}
+
+const PrefixEntry = struct { prefix: []const u8, rows: []const decode.KvPair };
+
+/// Extract the threaded ctx from a trigger_payload `{"ctx": <value>}` envelope —
+/// the inner value re-serialised as JSON text (→ `world.ctx`). null when not a
+/// ctx envelope.
+fn extractCtx(a: std.mem.Allocator, envelope: []const u8) ?[]const u8 {
+    const p = std.json.parseFromSlice(std.json.Value, a, envelope, .{}) catch return null;
+    if (p.value != .object) return null;
+    const c = p.value.object.get("ctx") orelse return null;
+    return std.json.Stringify.valueAlloc(a, c, .{}) catch null;
+}
+
+fn jsonB64(a: std.mem.Allocator, w: *std.Io.Writer, bytes: []const u8) !void {
+    const enc = std.base64.standard.Encoder;
+    const buf = try a.alloc(u8, enc.calcSize(bytes.len));
+    defer a.free(buf);
+    _ = enc.encode(buf, bytes);
+    try jsonStr(w, buf);
 }
 
 const KvPair = struct { key: []const u8, value: []const u8 };

@@ -26,7 +26,12 @@ those are *why* replay/sim can exist.
 
 - **world** — everything one activation reads (see §2). A **recording** is a
   world that was *captured*; a **fixture** is one that was *authored*. Same
-  shape, different provenance.
+  shape, different provenance — and now literally **one on-disk format**
+  (`world.json`): `pull` transcodes the captured record into it, `replay` and
+  `sim` both consume it. There is no separate base64-tape "fixture" artifact any
+  more (the RTAP tape survives only as the durable capture/storage format and
+  the browser/WASM replay's wire input). `export-fixture` is the offline
+  transcoder (base64 record → `world.json`) that `pull` uses online.
 - **code** — the handler module (the recorded source, or a working-tree
   override — the `--source-dir` "does my change still satisfy this?" lever).
 - **on-miss** — what a read the world doesn't supply does: `fail` (refuse to

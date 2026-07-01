@@ -86,6 +86,11 @@ pub const Host = struct {
     /// Declarative world: key→value map reads resolve against (`.map` mode).
     /// `kv.get` is a lookup; `kv.prefix` scans for matching keys.
     kv_map: std.StringHashMapUnmanaged([]const u8) = .{},
+    /// Recorded `kv.prefix` scan results by prefix (`.map` mode). Served
+    /// verbatim when the scanned prefix is recorded — faithful (a flat `kv_map`
+    /// re-scan can over-include a key read individually after the scan, or under
+    /// a `limit`). A prefix not present here falls back to scanning `kv_map`.
+    prefix_results: std.StringHashMapUnmanaged([]const decode.KvPair) = .{},
     /// What a missed `kv.get` does in `.map` mode (`.tape` is always fail-loud).
     miss: MissPolicy = .fail,
     /// Keys the world declares explicitly **absent** (recorded `not_found`
@@ -263,7 +268,29 @@ fn kvPrefix(
     const h = hostOf(user);
     const p = prefix[0..@intCast(prefix_len)];
     if (h.mode == .map) {
-        // Scan the declared map for keys under the prefix, sorted for a
+        // Recorded prefix result → serve the exact rows verbatim (faithful).
+        if (h.prefix_results.get(p)) |rows| {
+            var buf = std.ArrayList(u8){};
+            defer buf.deinit(h.a);
+            var aw = std.Io.Writer.Allocating.fromArrayList(h.a, &buf);
+            const w = &aw.writer;
+            w.writeByte('[') catch return -1;
+            for (rows, 0..) |row, i| {
+                if (i != 0) w.writeByte(',') catch return -1;
+                w.writeAll("{\"key\":") catch return -1;
+                writeJsonString(w, row.key) catch return -1;
+                w.writeAll(",\"value\":") catch return -1;
+                writeJsonString(w, row.value) catch return -1;
+                w.writeByte('}') catch return -1;
+            }
+            w.writeByte(']') catch return -1;
+            buf = aw.toArrayList();
+            out_json.* = dupC(buf.items, true) orelse return -1;
+            out_json_len.* = @intCast(buf.items.len);
+            out_outcome.* = 0;
+            return 0;
+        }
+        // Else scan the declared map for keys under the prefix, sorted for a
         // deterministic result. An empty match is a legitimate answer (the
         // world declares no such keys), so a prefix scan never holes/diverges.
         var keys = std.ArrayList([]const u8){};

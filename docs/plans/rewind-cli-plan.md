@@ -152,12 +152,17 @@ The `rewind` binary also carries the **customer debugging surface** — one engi
 engine directly (`rove-replay`) — **fully offline**: no OIDC, no network, no
 cluster — which is why they shipped ahead of the auth plane (§7).
 
+**One format: `world.json`.** A captured recording and an authored scenario are
+the same declarative document; `pull` transcodes the record into it, and
+`replay`/`sim` are the SAME engine (`runWorld`) over it — differing only in the
+default miss-policy. There is no separate base64-tape "fixture" artifact.
+
 ```
 rewind logs <tenant> [--limit N] [--after CURSOR]        # list recorded requests (LLM-friendly JSON)
-rewind pull <tenant> <req_id> [-o FILE]                  # a recording → a self-contained fixture
-rewind replay <fixture> [--source-dir DIR] [-o FILE]     # re-run the recording offline; fail-loud on divergence
-rewind sim <world.json> [--source-dir DIR] [--miss-policy fail|resolve] [-o FILE]   # run a DECLARATIVE authored world
-rewind export-fixture <pulled-fixture.json> [-o world.json]   # a recording → an editable declarative world
+rewind pull <tenant> <req_id> [-o FILE]                  # a recording → world.json (editable, self-contained)
+rewind replay <world.json> [--source-dir DIR] [--miss-policy fail|resolve] [-o FILE]   # re-materialise (default miss=fail)
+rewind sim <world.json> [--source-dir DIR] [--miss-policy fail|resolve] [-o FILE]      # same engine, default miss=resolve
+rewind export-fixture <base64-record.json> [-o world.json]   # OFFLINE transcoder (what pull does online)
 ```
 
 Design notes:
@@ -179,10 +184,12 @@ Design notes:
   `not_found` + reporting a typed **hole**) instead of diverging. `--miss-policy
   fail|resolve` *is* the replay↔sim axis over the one engine. Primary user: an
   LLM (deterministic feedback, structured JSON I/O).
-- **`export-fixture` bridges the two** — transcodes a captured recording into an
-  editable, offline, fail-loud declarative world (KV read cursor → initial-
-  snapshot map + `kvAbsent`), so "what happened in prod" becomes a reusable sim
-  scenario / regression fixture.
+- **`export-fixture` is the offline transcoder** (base64 record → `world.json`) —
+  the same transcode `pull` runs online, exposed for offline/manual use (and the
+  smokes). KV reads → an initial-snapshot map + `kvAbsent`; **`kv.prefix` scans →
+  `kvPrefix`** (the exact recorded rows, served verbatim so a scan is faithful,
+  not an over-inclusive map re-scan); the fetch result / ws frame / ctx / `{to}`
+  export / `recorded` block all transcode too.
 - **Guardrails**: the worker asserts L3 at capture time (a callback that records
   no Msg panics in debug / loud-logs in prod), and `scripts/smoke/replay_matrix_smoke_v2.py`
   captures + replays one recording per activation kind as a regression gate.

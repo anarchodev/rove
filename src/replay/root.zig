@@ -1,12 +1,20 @@
-//! Native replay driver (Phase 2 §2c) — the entry the `rewind replay` verb
-//! calls. Decodes a self-contained fixture (the JSON `rewind pull` writes),
-//! drives arenajs's native replay engine over the recorded tape, and emits one
-//! LLM-friendly JSON artifact: the replayed response / result / console / error,
-//! the produced kv write-set, any tape divergence, and replayed-vs-recorded
-//! status. No Node, no WASM, no network — the engine is linked in.
+//! The ONE replay/sim engine — `runWorld(world, code, on-miss)`. Both `rewind
+//! replay` (default on-miss=fail) and `rewind sim` (default on-miss=resolve)
+//! call it over the SAME declarative `world.json` (`world.zig`): the request
+//! surface, a key→value KV map (+ `kvAbsent`, + recorded `kvPrefix` results),
+//! ctx, the flattened fetch/callback result, the resolved export, seed, and
+//! optionally the `recorded` output. KV reads resolve BY KEY with a write-
+//! through overlay (order-independent — `replay-and-sim.md` §1); faithfulness is
+//! the output-level `status_match`, not a per-read check. It emits one LLM-JSON
+//! bundle: the run's response / result / console / effects, the write-set, typed
+//! `holes` (resolve), and the recorded comparison. No Node/WASM/network — the
+//! arenajs engine is linked in.
 //!
-//! `run` is one-shot: arena_init installs process-global engine state, so a CLI
-//! invocation replays exactly one request (which is the whole use case).
+//! `runWorld` is one-shot: arena_init installs process-global engine state, so a
+//! CLI invocation runs exactly one activation (which is the whole use case).
+//! The base64-tape → world transcode lives in `export_fixture.zig` (used by
+//! `pull` online + `export-fixture` offline). The old ordered-cursor `run` +
+//! its `.tape` host mode are retired — resolution is by-key.
 
 const std = @import("std");
 const decode = @import("tape_decode.zig");
@@ -15,8 +23,9 @@ const epilogue = @import("epilogue.zig");
 const world = @import("world.zig");
 const export_fixture = @import("export_fixture.zig");
 
-/// Transcode a captured `rewind pull` fixture into a declarative sim world.
-/// Re-exported for the `rewind export-fixture` verb.
+/// Transcode a captured record (base64 tapes) into the declarative `world.json`
+/// — the ONE format `replay`/`sim` consume. Used by `pull` (online) and the
+/// `export-fixture` verb (offline).
 pub const exportFixture = export_fixture.transcode;
 pub const exportFixtureActivation = export_fixture.activationOf;
 pub const exportFixtureIsInbound = export_fixture.isInboundFamily;
@@ -41,271 +50,6 @@ pub const Error = error{
     WriteFailed, // std.Io.Writer.Allocating sink (OOM surfaced as WriteFailed)
 } || decode.Error || std.mem.Allocator.Error;
 
-/// Replay the fixture and write the LLM-JSON artifact to `out`. `source_dir`,
-/// when non-null, serves working-tree module source instead of the pulled
-/// source — the "does my local change still satisfy this request?" lever.
-pub fn run(
-    a: std.mem.Allocator,
-    fixture_json: []const u8,
-    source_dir: ?[]const u8,
-    miss: hostmod.MissPolicy,
-    out: *std.ArrayList(u8),
-) Error!void {
-    const parsed = std.json.parseFromSlice(std.json.Value, a, fixture_json, .{}) catch
-        return Error.BadFixture;
-    const root = parsed.value;
-    if (root != .object) return Error.BadFixture;
-    const obj = root.object;
-
-    const request_id = jStr(obj, "request_id") orelse "";
-    const tenant = jStr(obj, "tenant") orelse "";
-    const activation = jStr(obj, "activation") orelse "inbound";
-    const entry = jStr(obj, "entry") orelse "index.mjs";
-
-    const req = if (obj.get("request")) |v| (if (v == .object) v.object else null) else null;
-    const method = if (req) |r| (jStr(r, "method") orelse "GET") else "GET";
-    const path = if (req) |r| (jStr(r, "path") orelse "/") else "/";
-    const host_hdr = if (req) |r| (jStr(r, "host") orelse "") else "";
-
-    // ── decode the tapes the replay host needs ──
-    const tapes = if (obj.get("tapes")) |v| (if (v == .object) v.object else null) else null;
-    const kv_entries: []const decode.KvEntry = blk: {
-        const b64 = if (tapes) |t| jStr(t, "kv_b64") else null;
-        if (b64) |s| break :blk try decode.decodeKv(a, try b64decode(a, s));
-        break :blk &.{};
-    };
-    const reads: []const decode.RequestReadEntry = blk: {
-        const b64 = if (tapes) |t| jStr(t, "request_reads_b64") else null;
-        if (b64) |s| break :blk try decode.decodeRequestReads(a, try b64decode(a, s));
-        break :blk &.{};
-    };
-    const body_bytes: ?[]const u8 = blk: {
-        const b64 = if (tapes) |t| jStr(t, "request_body_b64") else null;
-        if (b64) |s| break :blk try b64decode(a, s);
-        break :blk null;
-    };
-
-    // ── non-inbound activation surface (replay-and-sim.md §2-§3) ──
-    // For a callback/continuation the inputs ride two channels the inbound path
-    // ignores: trigger_payload carries the threaded ctx as a `{"ctx": …}`
-    // envelope; fetch_responses carries a fetch result (status/ok/final + body).
-    // Both are reconstructed here and handed to the SAME epilogue the sim path
-    // uses. (BodyRef-to-blob bytes aren't fetchable offline — inline only.)
-    const is_inbound = std.mem.eql(u8, activation, "inbound") or
-        std.mem.eql(u8, activation, "inbound_headers") or
-        std.mem.eql(u8, activation, "inbound_chunk");
-    const ctx_json: ?[]const u8 = if (is_inbound) null else blk: {
-        const b64 = if (tapes) |t| jStr(t, "trigger_payload_b64") else null;
-        const s = b64 orelse break :blk null;
-        const tp = decode.decodeTriggerPayload(a, try b64decode(a, s)) catch break :blk null;
-        if (tp.len == 0 or tp[0].batch_id != decode.NO_BATCH or tp[0].inline_bytes.len == 0)
-            break :blk null;
-        break :blk extractCtx(a, tp[0].inline_bytes);
-    };
-    var fetch_result: ?epilogue.Result = null;
-    var fetch_body: ?[]const u8 = null;
-    var resolved_export: ?[]const u8 = null;
-    if (!is_inbound) {
-        const b64 = if (tapes) |t| jStr(t, "fetch_responses_b64") else null;
-        if (b64) |s| {
-            const fr = decode.decodeFetchResponses(a, try b64decode(a, s)) catch &.{};
-            if (fr.len != 0) {
-                var body = std.ArrayList(u8){};
-                for (fr) |e| try body.appendSlice(a, e.inline_bytes);
-                fetch_body = body.items;
-                const last = fr[fr.len - 1];
-                fetch_result = .{
-                    .status = if (last.final) @as(i64, last.terminal_status) else null,
-                    .ok = if (last.final) last.terminal_ok else null,
-                    .done = last.final,
-                    .fetch_id = last.fetch_id,
-                    .chunk_seq = @as(i64, last.seq),
-                };
-                // Resolve the export by event shape. The `{to}` override is not
-                // recorded (replay-and-sim.md §5 G3), so an overridden callback
-                // replays under its conventional export — a known limit.
-                resolved_export = if (!last.final)
-                    "onFetchChunk"
-                else if (last.seq == 0) "onFetchResult" else "onFetchDone";
-            }
-        }
-    }
-
-    // ws_message: the frame is `request.activation = {opcode, data}`, taped as
-    // activation_bytes = [opcode:u8][data]. Rebuild it into an activation-meta
-    // JSON the epilogue installs. Text frames (opcode 1) reproduce faithfully;
-    // binary frames (opcode 2) would need a Uint8Array surface (follow-up).
-    var ws_activation_json: ?[]const u8 = null;
-    if (std.mem.eql(u8, activation, "ws_message")) {
-        const b64 = if (tapes) |t| jStr(t, "activation_bytes_b64") else null;
-        if (b64) |s| {
-            const ab = try b64decode(a, s);
-            if (ab.len >= 1) {
-                const opcode = ab[0];
-                const data = ab[1..];
-                var buf = std.ArrayList(u8){};
-                var aw = std.Io.Writer.Allocating.fromArrayList(a, &buf);
-                const w = &aw.writer;
-                // Binary frame (opcode 2) → `request.activation.data` is a
-                // Uint8Array; carry the bytes as base64 and let the epilogue
-                // rebuild the array. Text frame (1) → a decoded string.
-                if (opcode == 2) {
-                    try w.print("{{\"opcode\":{d},\"dataB64\":", .{opcode});
-                    try jsonB64(a, w, data);
-                } else {
-                    try w.print("{{\"opcode\":{d},\"data\":", .{opcode});
-                    try jsonStr(w, data);
-                }
-                try w.writeByte('}');
-                buf = aw.toArrayList();
-                ws_activation_json = buf.items;
-            }
-        }
-    }
-
-    // ── module sources (path → handler source) ──
-    var sources = std.StringHashMapUnmanaged([]const u8){};
-    if (obj.get("sources")) |sv| if (sv == .array) {
-        for (sv.array.items) |e| {
-            if (e != .object) continue;
-            const p = jStr(e.object, "path") orelse continue;
-            const kind = jStr(e.object, "kind") orelse "";
-            if (!std.mem.eql(u8, kind, "handler")) continue;
-            const src = jStr(e.object, "source") orelse continue;
-            try sources.put(a, p, src);
-        }
-    };
-    // The entry module is run directly via `arena_run_module` (only its imports
-    // go through `module_load`). So `--source-dir` must override the ENTRY here
-    // too, or a changed top-level handler would silently replay the pulled
-    // source. With a source-dir set, the entry MUST come from the working tree
-    // (a missing local entry is an error, not a fall-back to the recording).
-    const entry_src = blk: {
-        if (source_dir) |dir| {
-            const ep = std.fs.path.join(a, &.{ dir, entry }) catch return Error.OutOfMemory;
-            break :blk std.fs.cwd().readFileAlloc(a, ep, 8 << 20) catch
-                return Error.EntrySourceMissing;
-        }
-        break :blk sources.get(entry) orelse return Error.EntrySourceMissing;
-    };
-
-    const binary_body = std.mem.eql(u8, activation, "inbound_chunk") or
-        std.mem.eql(u8, activation, "fetch_chunk");
-    // A fetch_chunk's `request.body` is the FETCH result body (from
-    // fetch_responses), not the inbound request body.
-    const eff_body = fetch_body orelse body_bytes;
-    const epi = try epilogue.build(a, .{
-        .method = method,
-        .path = path,
-        .host = host_hdr,
-        .request_reads = reads,
-        .body_bytes = eff_body,
-        // The recorded resolved export ({to} override) wins, so an overridden
-        // callback replays under its actual export (G3); else derive it.
-        .export_name = jStr(obj, "export") orelse resolved_export orelse epilogue.exportForActivation(activation),
-        .binary_body = binary_body,
-        .ctx_json = ctx_json,
-        .activation_json = ws_activation_json,
-        .result = fetch_result,
-    });
-
-    const full_src = try std.mem.concatWithSentinel(a, u8, &.{ entry_src, epi }, 0);
-    const entry_z = try a.dupeZ(u8, entry);
-
-    // ── KV: the recorded reads → an initial-snapshot MAP (not an ordered
-    // cursor). Replay re-materialises the run by serving each recorded VALUE
-    // by KEY; the write-through overlay reproduces the handler's own writes. So
-    // the JS behaves byte-identically while re-execution is robust to benign
-    // reordering of independent reads (which the cursor spuriously flagged) —
-    // faithfulness is checked at the observable OUTPUT (status/response/writes),
-    // not per-read (docs/architecture/replay-and-sim.md). `miss` = fail (a read
-    // the recording never captured — honest divergence) or resolve (best-effort).
-    var kv_map = std.StringHashMapUnmanaged([]const u8){};
-    var absent = std.StringHashMapUnmanaged(void){};
-    {
-        var seen = std.StringHashMapUnmanaged(void){};
-        for (kv_entries) |e| switch (e.op) {
-            .get => {
-                if (seen.contains(e.key)) continue; // first read = the initial value
-                try seen.put(a, e.key, {});
-                switch (e.outcome) {
-                    .ok => try kv_map.put(a, e.key, e.value),
-                    .not_found => try absent.put(a, e.key, {}),
-                    .err => {},
-                }
-            },
-            .prefix => for (e.results) |row| {
-                if (seen.contains(row.key)) continue;
-                try seen.put(a, row.key, {});
-                try kv_map.put(a, row.key, row.value);
-            },
-            else => {}, // set/delete never appear in a read tape
-        };
-    }
-
-    // ── drive the engine ──
-    if (arena_init(8192, 8192) != 0) return Error.ArenaInit;
-    // One-shot: deliberately NO arena_destroy — under the dual-arena allocator
-    // JS_FreeRuntime trips a debug-only gc_obj_list assert; process exit
-    // reclaims everything (spike.zig §teardown).
-
-    var host = hostmod.Host{
-        .a = a,
-        .mode = .map,
-        .kv = &.{},
-        .kv_map = kv_map,
-        .absent = absent,
-        .miss = miss,
-        .sources = sources,
-        .source_dir = source_dir,
-    };
-    host.install();
-
-    const seed = parseU64(jStr(obj, "seed")) orelse 0;
-    const ts_ns = parseI64(jStr(obj, "timestamp_ns")) orelse 0;
-    const date_ms: u64 = if (ts_ns > 0) @intCast(@divTrunc(ts_ns, std.time.ns_per_ms)) else 0;
-    arena_set_random_seed(@truncate(seed), @truncate(seed >> 32));
-    arena_set_date_now(@truncate(date_ms), @truncate(date_ms >> 32));
-    arena_set_trace_mode(0); // result capture only — no scan/drill timeline
-
-    const rc = arena_run_module(entry_z.ptr, full_src.ptr);
-
-    // ── extract + emit ──
-    const replay_json = host.output orelse {
-        // No sentinel write — the run died before the epilogue's capture (e.g.
-        // a module-load divergence or a syntax error). Emit a structured
-        // failure rather than nothing.
-        try emitNoOutput(a, out, .{
-            .request_id = request_id,
-            .tenant = tenant,
-            .activation = activation,
-            .entry = entry,
-            .rc = rc,
-            .divergence = host.diverged,
-        });
-        return;
-    };
-
-    // Replayed status: the handler's returned `result.status`, falling back to
-    // the mutated `response.status`. Parsed for the recorded-vs-replayed match.
-    const replayed_status = statusOf(a, replay_json);
-    const recorded = if (obj.get("recorded")) |v| (if (v == .object) v.object else null) else null;
-    const recorded_status: ?i64 = if (recorded) |r| jInt(r, "status") else null;
-
-    try emit(a, out, .{
-        .request_id = request_id,
-        .tenant = tenant,
-        .activation = activation,
-        .entry = entry,
-        .rc = rc,
-        .divergence = host.diverged,
-        .writes = host.writes.items,
-        .replay_json = replay_json,
-        .recorded = recorded,
-        .replayed_status = replayed_status,
-        .recorded_status = recorded_status,
-    });
-}
 
 /// Run a **declarative** world (an *authored* fixture, not a captured tape) —
 /// the sim corner of the one engine. KV reads resolve order-independently
@@ -355,6 +99,13 @@ pub fn runWorld(
     for (wv.kv) |p| try kv_map.put(a, p.key, p.value);
     var kv_absent = std.StringHashMapUnmanaged(void){};
     for (wv.kv_absent) |k| try kv_absent.put(a, k, {});
+    // Recorded prefix results, served verbatim (faithful prefix scans).
+    var prefix_results = std.StringHashMapUnmanaged([]const decode.KvPair){};
+    for (wv.kv_prefix) |pe| {
+        const rows = try a.alloc(decode.KvPair, pe.rows.len);
+        for (pe.rows, 0..) |row, i| rows[i] = .{ .key = row.key, .value = row.value };
+        try prefix_results.put(a, pe.prefix, rows);
+    }
 
     // ── module sources (inline) ──
     var sources = std.StringHashMapUnmanaged([]const u8){};
@@ -406,6 +157,7 @@ pub fn runWorld(
         .kv = &.{},
         .kv_map = kv_map,
         .absent = kv_absent,
+        .prefix_results = prefix_results,
         .miss = miss,
         .sources = sources,
         .source_dir = source_dir,
@@ -429,103 +181,11 @@ pub fn runWorld(
         .writes = host.writes.items,
         .holes = host.holes.items,
         .run_json = host.output,
+        .recorded = wv.recorded,
     });
 }
 
 // ── emit helpers ──
-
-const NoOutputArgs = struct {
-    request_id: []const u8,
-    tenant: []const u8,
-    activation: []const u8,
-    entry: []const u8,
-    rc: c_int,
-    divergence: ?[]const u8,
-};
-
-fn emitNoOutput(a: std.mem.Allocator, out: *std.ArrayList(u8), args: NoOutputArgs) !void {
-    var aw = std.Io.Writer.Allocating.fromArrayList(a, out);
-    defer out.* = aw.toArrayList();
-    const w = &aw.writer;
-    try w.writeAll("{\"request_id\":");
-    try jsonStr(w, args.request_id);
-    try w.writeAll(",\"tenant\":");
-    try jsonStr(w, args.tenant);
-    try w.writeAll(",\"activation\":");
-    try jsonStr(w, args.activation);
-    try w.writeAll(",\"entry\":");
-    try jsonStr(w, args.entry);
-    try w.print(",\"run_rc\":{d},\"ok\":false,\"divergence\":", .{args.rc});
-    try optStr(w, args.divergence);
-    try w.writeAll(",\"replay\":null,\"error\":\"the replayed run produced no output (it failed before the handler completed — see divergence / run_rc)\"}");
-}
-
-const EmitArgs = struct {
-    request_id: []const u8,
-    tenant: []const u8,
-    activation: []const u8,
-    entry: []const u8,
-    rc: c_int,
-    divergence: ?[]const u8,
-    writes: []const hostmod.KvWrite,
-    replay_json: []const u8,
-    recorded: ?std.json.ObjectMap,
-    replayed_status: ?i64,
-    recorded_status: ?i64,
-};
-
-fn emit(a: std.mem.Allocator, out: *std.ArrayList(u8), args: EmitArgs) !void {
-    var aw = std.Io.Writer.Allocating.fromArrayList(a, out);
-    defer out.* = aw.toArrayList();
-    const w = &aw.writer;
-
-    try w.writeAll("{\"request_id\":");
-    try jsonStr(w, args.request_id);
-    try w.writeAll(",\"tenant\":");
-    try jsonStr(w, args.tenant);
-    try w.writeAll(",\"activation\":");
-    try jsonStr(w, args.activation);
-    try w.writeAll(",\"entry\":");
-    try jsonStr(w, args.entry);
-    try w.print(",\"run_rc\":{d},\"divergence\":", .{args.rc});
-    try optStr(w, args.divergence);
-
-    // kv writes the replayed handler produced.
-    try w.writeAll(",\"kv_writes\":[");
-    for (args.writes, 0..) |wr, i| {
-        if (i != 0) try w.writeByte(',');
-        try w.writeAll("{\"op\":");
-        try jsonStr(w, @tagName(wr.op));
-        try w.writeAll(",\"key\":");
-        try jsonStr(w, wr.key);
-        if (wr.op == .set) {
-            try w.writeAll(",\"value\":");
-            try jsonStr(w, wr.value);
-        }
-        try w.writeByte('}');
-    }
-    try w.writeByte(']');
-
-    // The handler run's parked output (response / result / error / console) —
-    // already valid JSON, embedded verbatim.
-    try w.writeAll(",\"replay\":");
-    try w.writeAll(args.replay_json);
-
-    // recorded summary + the headline match.
-    try w.writeAll(",\"recorded\":{\"status\":");
-    if (args.recorded_status) |s| try w.print("{d}", .{s}) else try w.writeAll("null");
-    try w.writeAll(",\"console\":");
-    try optStr(w, if (args.recorded) |r| jStr(r, "console") else null);
-    try w.writeAll(",\"exception\":");
-    try optStr(w, if (args.recorded) |r| jStr(r, "exception") else null);
-    try w.writeByte('}');
-
-    try w.writeAll(",\"replayed_status\":");
-    if (args.replayed_status) |s| try w.print("{d}", .{s}) else try w.writeAll("null");
-    const status_match = args.replayed_status != null and args.recorded_status != null and
-        args.replayed_status.? == args.recorded_status.?;
-    try w.print(",\"status_match\":{s}}}", .{if (status_match) "true" else "false"});
-}
 
 const EmitWorldArgs = struct {
     entry: []const u8,
@@ -540,6 +200,9 @@ const EmitWorldArgs = struct {
     /// run died before the epilogue captured it (e.g. a fail-policy divergence
     /// or a syntax error).
     run_json: ?[]const u8,
+    /// The recorded output, when this world came from a capture — drives the
+    /// output-level faithfulness check (`status_match`).
+    recorded: ?world.Recorded = null,
 };
 
 /// Emit a sim bundle. Same engine output as `emit`, minus the recorded-vs-
@@ -591,13 +254,32 @@ fn emitWorld(a: std.mem.Allocator, out: *std.ArrayList(u8), args: EmitWorldArgs)
 
     // the run output (response / result / error / console), or null + ok=false
     // when the run died before capture (e.g. a fail-policy divergence).
+    const replayed_status: ?i64 = if (args.run_json) |rj| statusOf(a, rj) else null;
     if (args.run_json) |rj| {
         try w.writeAll(",\"run\":");
         try w.writeAll(rj);
-        try w.writeAll(",\"ok\":true}");
+        try w.writeAll(",\"ok\":true");
     } else {
-        try w.writeAll(",\"run\":null,\"ok\":false,\"error\":\"the run produced no output (it failed before the handler completed — see divergence / run_rc; a fail miss-policy on an under-specified world lands here)\"}");
+        try w.writeAll(",\"run\":null,\"ok\":false,\"error\":\"the run produced no output (it failed before the handler completed — see divergence / run_rc; a fail miss-policy on an under-specified world lands here)\"");
     }
+
+    // Output-level faithfulness — when the world carries a recording, compare
+    // the re-run's observable status to the recorded one (`replay-and-sim.md`
+    // §1: faithfulness lives at the output, not per-read).
+    if (args.recorded) |rec| {
+        try w.writeAll(",\"recorded\":{\"status\":");
+        if (rec.status) |s| try w.print("{d}", .{s}) else try w.writeAll("null");
+        try w.writeAll(",\"console\":");
+        try optStr(w, rec.console);
+        try w.writeAll(",\"exception\":");
+        try optStr(w, rec.exception);
+        try w.writeByte('}');
+        try w.writeAll(",\"replayed_status\":");
+        if (replayed_status) |s| try w.print("{d}", .{s}) else try w.writeAll("null");
+        const match = replayed_status != null and rec.status != null and replayed_status.? == rec.status.?;
+        try w.print(",\"status_match\":{s}", .{if (match) "true" else "false"});
+    }
+    try w.writeByte('}');
 }
 
 /// Pull `result.status` (handler return), falling back to `response.status`,

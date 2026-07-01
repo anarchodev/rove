@@ -63,8 +63,21 @@ def _srcdir(source: str) -> str:
     return d
 
 
-def _replay(fixture: str, srcdir: str, miss: str | None = None) -> dict:
-    cmd = [str(REWIND_BIN), "replay", fixture, "--source-dir", srcdir]
+def _export_to_world(fixture: str) -> str:
+    """Transcode the base64-tape fixture → the declarative world (what pull does
+    online). This is the ONE format replay/sim consume."""
+    p = subprocess.run([str(REWIND_BIN), "export-fixture", fixture],
+                       capture_output=True, text=True, timeout=30)
+    if p.returncode != 0:
+        raise SystemExit(f"export-fixture failed:\n{p.stdout}\n{p.stderr}")
+    f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    f.write(p.stdout)
+    f.close()
+    return f.name
+
+
+def _replay(world: str, srcdir: str, miss: str | None = None) -> dict:
+    cmd = [str(REWIND_BIN), "replay", world, "--source-dir", srcdir]
     if miss:
         cmd += ["--miss-policy", miss]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -86,15 +99,15 @@ def main() -> int:
         if not ok:
             failures.append(label)
 
-    # Recorded read order: a, b.
+    # Recorded read order: a, b → base64 tape → transcode to the ONE format.
     tape = _kv_tape([("a", "1"), ("b", "2")])
     orig = 'export default function(){ const a=kv.get("a"); const b=kv.get("b"); return JSON.stringify({a,b}); }'
-    fixture = _fixture(tape, orig)
+    world = _export_to_world(_fixture(tape, orig))
 
     # 1. Reordered reads (b then a) — must NOT diverge.
     reordered = 'export default function(){ const b=kv.get("b"); const a=kv.get("a"); return JSON.stringify({a,b}); }'
-    art = _replay(fixture, _srcdir(reordered))
-    res = (art.get("replay") or {}).get("result")
+    art = _replay(world, _srcdir(reordered))
+    res = (art.get("run") or {}).get("result")
     check("reordered independent reads do not diverge",
           art.get("divergence") is None and res == '{"a":"1","b":"2"}',
           f"div={art.get('divergence')!r} result={res!r}")
@@ -102,14 +115,14 @@ def main() -> int:
     # 2. New read (key 'c', never recorded) — must diverge under fail (default).
     newkey = 'export default function(){ const a=kv.get("a"); const c=kv.get("c"); return JSON.stringify({a,c}); }'
     d = _srcdir(newkey)
-    art = _replay(fixture, d)
+    art = _replay(world, d)
     check("a genuinely new read diverges (miss-policy fail)",
           art.get("divergence") is not None,
           f"div={art.get('divergence')!r}")
 
     # 3. Same new read is best-effort under resolve.
-    art = _replay(fixture, d, miss="resolve")
-    res = (art.get("replay") or {}).get("result")
+    art = _replay(world, d, miss="resolve")
+    res = (art.get("run") or {}).get("result")
     check("the new read resolves to not_found under --miss-policy resolve",
           art.get("divergence") is None and res == '{"a":"1","c":null}',
           f"div={art.get('divergence')!r} result={res!r}")

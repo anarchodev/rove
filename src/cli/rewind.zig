@@ -613,30 +613,39 @@ fn cmdPull(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, req_id: []
     w.writeAll("}") catch c.oom();
     buf = aw.toArrayList();
 
+    // Transcode the captured record (base64 tapes) into the ONE editable format
+    // — a declarative `world.json` that `rewind replay` (fail) and `rewind sim`
+    // (resolve) both consume. The wire/tape form never reaches a human.
+    var world = std.ArrayList(u8){};
+    replay.exportFixture(a, buf.items, &world) catch |e|
+        c.fatal("pull: transcode to world failed: {s}", .{@errorName(e)});
+
     if (out_file) |path| {
-        std.fs.cwd().writeFile(.{ .sub_path = path, .data = buf.items }) catch |e|
+        std.fs.cwd().writeFile(.{ .sub_path = path, .data = world.items }) catch |e|
             c.fatal("pull: write {s}: {s}", .{ path, @errorName(e) });
-        std.debug.print("wrote fixture → {s}  ({s}, dep {s})\n", .{ path, req_id, dep_hex });
+        std.debug.print("wrote world → {s}  ({s}, dep {s})\n", .{ path, req_id, dep_hex });
     } else {
-        std.debug.print("{s}\n", .{buf.items});
+        std.debug.print("{s}\n", .{world.items});
     }
 }
 
-/// `rewind replay <fixture> [--source-dir DIR] [--miss-policy fail|resolve] [-o FILE]`
-/// — re-materialise the recorded request natively (links the arenajs replay
-/// engine; no Node/WASM/network) and emit the LLM-JSON result. KV reads resolve
-/// by KEY against the recorded values (order-independent) with a write-through
-/// overlay, so re-execution is faithful to the JS while robust to benign
-/// reordering; `--source-dir` swaps in working-tree source ("does my change
-/// still behave the same on the real inputs?"). A read the recording never
-/// captured is the `miss-policy` decision (default `fail`).
-fn cmdReplay(a: std.mem.Allocator, fixture_path: []const u8, source_dir: ?[]const u8, miss: replay.MissPolicy, out_file: ?[]const u8) void {
-    const bytes = std.fs.cwd().readFileAlloc(a, fixture_path, 64 << 20) catch |e|
-        c.fatal("replay: read {s}: {s}", .{ fixture_path, @errorName(e) });
+/// `rewind replay <world.json> [--source-dir DIR] [--miss-policy fail|resolve] [-o FILE]`
+/// — re-materialise a recorded request natively (links the arenajs replay
+/// engine; no Node/WASM/network) and emit the LLM-JSON result. Replay and sim
+/// are the SAME engine over the SAME format (the declarative world `pull`
+/// writes) — they differ only in the default miss-policy: `replay` = `fail`
+/// (honest divergence on a read the recording never captured), `sim` = `resolve`.
+/// KV reads resolve by KEY (order-independent) with a write-through overlay, so
+/// re-execution is faithful to the JS yet robust to benign reordering;
+/// `--source-dir` swaps in working-tree source ("does my change still behave the
+/// same on the real inputs?"). Faithfulness is the output-level `status_match`.
+fn cmdReplay(a: std.mem.Allocator, world_path: []const u8, source_dir: ?[]const u8, miss: replay.MissPolicy, out_file: ?[]const u8) void {
+    const bytes = std.fs.cwd().readFileAlloc(a, world_path, 64 << 20) catch |e|
+        c.fatal("replay: read {s}: {s}", .{ world_path, @errorName(e) });
     var out = std.ArrayList(u8){};
-    replay.run(a, bytes, source_dir, miss, &out) catch |e| switch (e) {
-        error.EntrySourceMissing => c.fatal("replay: the fixture has no entry source (index.mjs) — re-pull, or pass --source-dir", .{}),
-        error.BadFixture => c.fatal("replay: fixture JSON is malformed", .{}),
+    replay.runWorld(a, bytes, source_dir, miss, &out) catch |e| switch (e) {
+        error.EntrySourceMissing => c.fatal("replay: the world has no entry source (index.mjs) — re-pull, or pass --source-dir", .{}),
+        error.BadFixture => c.fatal("replay: world JSON is malformed", .{}),
         error.ArenaInit => c.fatal("replay: JS engine failed to initialise", .{}),
         else => c.fatal("replay: {s}", .{@errorName(e)}),
     };
