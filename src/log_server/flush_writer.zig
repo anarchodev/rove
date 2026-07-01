@@ -422,6 +422,12 @@ fn writeTapePayloads(
     try writeBytesField(allocator, w, "activation_bytes_b64", t.activation_bytes, false);
     try w.writeAll(",\"activation_bytes_truncated\":");
     try w.writeAll(if (t.activation_bytes_truncated) "true" else "false");
+    // Resolved export ({to} / onFetch*) — a plain name, emitted only when set
+    // (replay uses it verbatim so an overridden callback replays faithfully).
+    if (t.export_name.len != 0) {
+        try w.writeAll(",\"export\":");
+        try writeJsonString(w, t.export_name);
+    }
     // Response body is intentionally NOT serialized — replay
     // re-produces it deterministically; storing it would just
     // bloat every S3 batch PUT.

@@ -261,12 +261,19 @@ pub const TapePayloads = struct {
     activation_bytes: []const u8 = &.{},
     /// True iff `activation_bytes` is a truncated prefix.
     activation_bytes_truncated: bool = false,
+    /// The **resolved export** the activation dispatched to (a callback's
+    /// `{to}` override / `onFetchResult`/`Chunk`/`Done`), when it isn't
+    /// derivable from the activation kind alone. Lets replay invoke the SAME
+    /// export instead of the conventional one (`replay-and-sim.md` §5 G3).
+    /// Empty when the conventional export applies. Allocator-owned.
+    export_name: []const u8 = &.{},
     // Response body is NOT captured — deterministic replay
     // re-produces it from (request body, tapes, source). Storing
     // it on every batch PUT would be pure duplication on the S3
     // bill.
 
     pub fn deinit(self: *TapePayloads, allocator: std.mem.Allocator) void {
+        if (self.export_name.len != 0) allocator.free(self.export_name);
         if (self.kv_tape_bytes.len != 0) allocator.free(self.kv_tape_bytes);
         if (self.module_tree_bytes.len != 0) allocator.free(self.module_tree_bytes);
         if (self.fetch_responses_tape_bytes.len != 0) allocator.free(self.fetch_responses_tape_bytes);

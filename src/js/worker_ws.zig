@@ -804,6 +804,7 @@ pub fn resumeBoundFetchChainWs(
         .terminal_status = if (ev.final) ev.terminal_status else 0,
         .terminal_ok = if (ev.final) ev.terminal_ok else false,
         .body_truncated = if (ev.final) ev.body_truncated else false,
+        .export_name = ev.resolvedExport(), // record the resolved export ({to}) — G3
     };
     const request: Request = .{
         .method = "POST",

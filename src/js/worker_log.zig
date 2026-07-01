@@ -238,6 +238,10 @@ pub const FetchEvent = struct {
     terminal_status: u16,
     terminal_ok: bool,
     body_truncated: bool = false,
+    /// The resolved export this fetch resume dispatched to (`ev.resolvedExport()`
+    /// — a `{to}` override, or onFetchResult/Chunk/Done). Recorded so replay
+    /// invokes the same export (`replay-and-sim.md` §5 G3).
+    export_name: []const u8 = "",
 };
 
 /// Record a `fetch_chunk` activation's triggering event onto its readset's
@@ -270,7 +274,12 @@ pub fn captureFetchChunkTapes(
     ) catch |err| {
         std.log.warn("rove-js fetch-event capture failed: {s}", .{@errorName(err)});
     };
-    return captureTapes(worker, readset, ctx_body);
+    var payloads = captureTapes(worker, readset, ctx_body);
+    // Record the resolved export (G3) — owned, freed by TapePayloads.deinit.
+    if (ev.export_name.len > 0) {
+        payloads.export_name = worker.allocator.dupe(u8, ev.export_name) catch &.{};
+    }
+    return payloads;
 }
 
 /// Record an inbound WS frame (`ws_message`'s Msg) so `onMessage` is

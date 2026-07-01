@@ -568,6 +568,12 @@ fn cmdPull(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, req_id: []
         if (t.get("js_engine_version")) |jv| if (jv == .integer) {
             w.print(",\"js_engine_version\":{d}", .{jv.integer}) catch c.oom();
         };
+        // The resolved export ({to} / onFetch*) — so an overridden callback
+        // replays under its actual export, not the conventional one (G3).
+        if (jStrM(t, "export")) |s| {
+            w.writeAll(",\"export\":") catch c.oom();
+            emitStr(w, s);
+        }
         w.writeAll(",\"tapes\":{") catch c.oom();
         var first = true;
         // record-field → fixture-field remap; only emit present, non-null blobs.

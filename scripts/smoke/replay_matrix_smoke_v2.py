@@ -38,6 +38,9 @@ _REMAP = [
 ]
 
 INBOUND_SRC = 'export default function () { return "inbound-ok:" + (request.query || ""); }'
+# NB: a {to:'onUpstream'} override with NO onFetchResult export — this doubles as
+# the G3 check: if the resolved export weren't recorded, replay would call the
+# (missing) conventional onFetchResult and fail. Reproduction proves G3.
 FETCH_SRC = """
 export default function () {
   const q = request.query || "";
@@ -45,10 +48,10 @@ export default function () {
   for (const p of q.split("&")) { const i = p.indexOf("="); if (i<0) continue;
     if (decodeURIComponent(p.slice(0,i)) === "url") url = decodeURIComponent(p.slice(i+1)); }
   if (!url) { response.status = 400; return "no url"; }
-  on.fetch(url);
+  on.fetch(url, {}, { to: "onUpstream" });
   return next();
 }
-export function onFetchResult() {
+export function onUpstream() {
   response.status = 200;
   return JSON.stringify({ len: request.body.length, status: request.status });
 }
@@ -97,6 +100,8 @@ def replay(rec, tenant, activation, source):
         "tapes": {fx: tapes[rf] for rf, fx in _REMAP if tapes.get(rf)},
         "sources": [{"path": "index.mjs", "kind": "handler", "source": source}],
     }
+    if tapes.get("export"):  # the recorded resolved export ({to}) — G3
+        fixture["export"] = tapes["export"]
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump(fixture, f)
         path = f.name
@@ -134,7 +139,7 @@ def main() -> int:
         bulk_url = f"http://up.{PUBLIC_SUFFIX}:{c.front_port}/"
         r = c.get("fch", f"/?url={up.quote(bulk_url)}", timeout=30.0)
         live_len = (json.loads(r.body).get("len") if r.status == 200 else None)
-        check("[fetch_chunk] live on.fetch → onFetchResult", live_len == len(EXPECTED_BODY), f"{r.status} {r.body!r}")
+        check("[fetch_chunk] live on.fetch → onUpstream ({to})", live_len == len(EXPECTED_BODY), f"{r.status} {r.body!r}")
         rec = find_record(c, "fch", "fetch_chunk")
         art = replay(rec, "fch", "fetch_chunk", FETCH_SRC) if rec else None
         summ = {}
@@ -142,7 +147,7 @@ def main() -> int:
             summ = json.loads((art.get("replay") or {}).get("result") or "{}") if art else {}
         except (json.JSONDecodeError, TypeError):
             pass
-        check("[fetch_chunk] replay reproduces request.body + status",
+        check("[fetch_chunk+G3] replay uses recorded {to} export, reproduces body+status",
               art and art.get("divergence") is None and summ.get("len") == len(EXPECTED_BODY) and summ.get("status") == 200,
               f"summ={summ!r} div={art.get('divergence') if art else None}")
 

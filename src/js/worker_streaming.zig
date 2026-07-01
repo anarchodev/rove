@@ -1012,6 +1012,7 @@ pub fn resumeBoundFetchStream(
         .terminal_status = if (ev.final) ev.terminal_status else 0,
         .terminal_ok = if (ev.final) ev.terminal_ok else false,
         .body_truncated = if (ev.final) ev.body_truncated else false,
+        .export_name = fn_name, // record the resolved export ({to} / onFetch*) — G3
     };
     const req: Request = .{
         .method = "POST",

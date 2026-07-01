@@ -208,9 +208,13 @@ reproduces `request.activation.data` (asserted via the handler's `kv` write).
 resumes — `onWake`/`timer`/`onChunk` — already captured; they were never in this
 class.)
 
-Remaining: (a) a `{to}` override is still unrecorded (**G3** — the resolved
-export must be persisted; the no-`{to}` conventional-export case is covered by
-event-shape resolution); ~~(b) `TextDecoder`/`stream.*`/`next` absent in the bare
+Remaining: ~~(a) a `{to}` override is unrecorded (**G3**)~~ **FIXED** — the
+resolved export (`ev.resolvedExport()`) now rides `TapePayloads.export_name`
+(recorded per fetch resume, emitted as the record's `export` field), `pull`
+carries it, and `root.run` prefers it over the event-shape derivation. So an
+overridden callback replays under its actual export. Validated in the matrix
+(`replay_matrix_smoke_v2.py` uses `{to:'onUpstream'}` with **no** `onFetchResult`
+— reproduction proves the recorded export is used). ~~(b) `TextDecoder`/`stream.*`/`next` absent in the bare
 replay arena~~ **FIXED** — the epilogue now shims `TextDecoder`/`TextEncoder`,
 `stream.*`/`on.*`/`next`/`webhook`/`schedule`/`cron`/`blob`/`request.tag`; outputs
 are captured into the bundle (`stream`/`wakes`/`sends`) rather than fired.

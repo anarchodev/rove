@@ -199,7 +199,9 @@ pub fn run(
         .host = host_hdr,
         .request_reads = reads,
         .body_bytes = eff_body,
-        .export_name = resolved_export orelse epilogue.exportForActivation(activation),
+        // The recorded resolved export ({to} override) wins, so an overridden
+        // callback replays under its actual export (G3); else derive it.
+        .export_name = jStr(obj, "export") orelse resolved_export orelse epilogue.exportForActivation(activation),
         .binary_body = binary_body,
         .ctx_json = ctx_json,
         .activation_json = ws_activation_json,
