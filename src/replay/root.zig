@@ -130,6 +130,28 @@ pub fn run(
         }
     }
 
+    // ws_message: the frame is `request.activation = {opcode, data}`, taped as
+    // activation_bytes = [opcode:u8][data]. Rebuild it into an activation-meta
+    // JSON the epilogue installs. Text frames (opcode 1) reproduce faithfully;
+    // binary frames (opcode 2) would need a Uint8Array surface (follow-up).
+    var ws_activation_json: ?[]const u8 = null;
+    if (std.mem.eql(u8, activation, "ws_message")) {
+        const b64 = if (tapes) |t| jStr(t, "activation_bytes_b64") else null;
+        if (b64) |s| {
+            const ab = try b64decode(a, s);
+            if (ab.len >= 1) {
+                var buf = std.ArrayList(u8){};
+                var aw = std.Io.Writer.Allocating.fromArrayList(a, &buf);
+                const w = &aw.writer;
+                try w.print("{{\"opcode\":{d},\"data\":", .{ab[0]});
+                try jsonStr(w, ab[1..]);
+                try w.writeByte('}');
+                buf = aw.toArrayList();
+                ws_activation_json = buf.items;
+            }
+        }
+    }
+
     // ── module sources (path → handler source) ──
     var sources = std.StringHashMapUnmanaged([]const u8){};
     if (obj.get("sources")) |sv| if (sv == .array) {
@@ -170,6 +192,7 @@ pub fn run(
         .export_name = resolved_export orelse epilogue.exportForActivation(activation),
         .binary_body = binary_body,
         .ctx_json = ctx_json,
+        .activation_json = ws_activation_json,
         .result = fetch_result,
     });
 

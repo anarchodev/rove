@@ -425,6 +425,25 @@ pub fn serviceWsMessages(worker: anytype) !void {
 /// are identical, so they live here once. Consumes `oc`. NOTE:
 /// `fireWsDisconnect` does NOT use this — the socket is already gone, so it
 /// ignores the return shape and commits forgetfully.
+/// The activation's Msg to tape so a WS resume is replayable. `.none` (wake) →
+/// just readset + ctx; `.fetch` (fetch_chunk) → the fetch event; `.frame`
+/// (ws_message) → the WS frame (opcode + data).
+const WsMsgTape = union(enum) {
+    none,
+    fetch: worker_mod.FetchEvent,
+    frame: struct { opcode: u8, data: []const u8 },
+};
+
+/// Capture the readset + ctx + the kind-specific Msg for a WS resume. Called at
+/// exactly the one capture site that fires per `finishWsResume` invocation.
+fn wsResumeTapes(worker: anytype, readset: *tape_mod.Readset, ctx_body: []const u8, msg: WsMsgTape) log_mod.TapePayloads {
+    return switch (msg) {
+        .none => worker_mod.captureTapes(worker, readset, ctx_body),
+        .fetch => |fe| worker_mod.captureFetchChunkTapes(worker, readset, ctx_body, fe),
+        .frame => |f| worker_mod.captureWsFrameTapes(worker, readset, ctx_body, f.opcode, f.data),
+    };
+}
+
 fn finishWsResume(
     worker: anytype,
     chain_ent: rove.Entity,
@@ -439,20 +458,16 @@ fn finishWsResume(
     pending_wakes: *std.ArrayListUnmanaged(globals.PendingWakeReg),
     act: log_mod.ActivationSource,
     tag: []const u8,
-    /// Set only for the `.fetch_chunk` resume — the triggering fetch event to
-    /// tape (so the callback is replayable). null for `ws_message`/wake/
-    /// disconnect resumes (their input capture is a separate gap).
-    fetch_ev: ?worker_mod.FetchEvent,
+    /// The activation's Msg to tape so the resume is replayable (fetch event /
+    /// ws frame / none — see `WsMsgTape`).
+    msg: WsMsgTape,
 ) void {
     const allocator = worker.allocator;
     const tc = p.dep.tc;
     const path = chain_st.module_path;
-    // The `{"ctx":…}` envelope → trigger_payload (→ request.ctx) for a fetch
-    // resume's tape capture; empty otherwise. One capture site fires per call.
-    const ws_ctx_body: []const u8 = if (fetch_ev != null)
-        (worker_streaming.synthCtxBody(allocator, chain_st.ctx_json) catch "")
-    else
-        "";
+    // The `{"ctx":…}` envelope → trigger_payload (→ request.ctx). One capture
+    // site fires per call, via `wsResumeTapes(worker, &p.readset, ws_ctx_body, msg)`.
+    const ws_ctx_body: []const u8 = worker_streaming.synthCtxBody(allocator, chain_st.ctx_json) catch "";
     defer if (ws_ctx_body.len > 0) allocator.free(ws_ctx_body);
     switch (oc.*) {
         .terminal => |*r| {
@@ -460,7 +475,7 @@ fn finishWsResume(
             if (r.exception.len > 0) {
                 p.txn.rollback() catch {};
                 p.txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, r.console, r.exception, (if (fetch_ev) |fe| worker_mod.captureFetchChunkTapes(worker, &p.readset, ws_ctx_body, fe) else log_mod.TapePayloads{}), chain_ctx.correlation_id, &.{}, act, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, r.console, r.exception, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, &.{}, act, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
@@ -471,13 +486,13 @@ fn finishWsResume(
             const fw_seq = shipWsFrames(worker, conn_ent, stream_chunks, chunk_opcodes, &p.ws, p.txn, &p.txn_owned, chain_ctx.tenant_id, &p.readset, lh, true) catch |perr| {
                 std.log.warn("rove-js {s} (terminal+writes): propose failed: {s}", .{ tag, @errorName(perr) });
                 p.txn_done = true;
-                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, (if (fetch_ev) |fe| worker_mod.captureFetchChunkTapes(worker, &p.readset, ws_ctx_body, fe) else log_mod.TapePayloads{}), chain_ctx.correlation_id, &.{}, act, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, &.{}, act, 0);
                 tearDownWsChain(worker, conn_ent);
                 return;
             };
             p.txn_done = true;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, st, .ok, r.console, r.exception, (if (fetch_ev) |fe| worker_mod.captureFetchChunkTapes(worker, &p.readset, ws_ctx_body, fe) else log_mod.TapePayloads{}), chain_ctx.correlation_id, r.tags, act, fw_seq);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, st, .ok, r.console, r.exception, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, r.tags, act, fw_seq);
             r.console = &.{};
             r.exception = &.{};
             tearDownWsChain(worker, conn_ent);
@@ -491,7 +506,7 @@ fn finishWsResume(
                 std.log.warn("rove-js {s} (next+writes): propose failed: {s}", .{ tag, @errorName(perr) });
                 p.txn_done = true;
                 cval.deinit(allocator);
-                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, (if (fetch_ev) |fe| worker_mod.captureFetchChunkTapes(worker, &p.readset, ws_ctx_body, fe) else log_mod.TapePayloads{}), chain_ctx.correlation_id, &.{}, act, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, &.{}, act, 0);
                 effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
                 tearDownWsChain(worker, conn_ent);
                 return;
@@ -508,7 +523,7 @@ fn finishWsResume(
             // ws_message frames return next(), so this is the dominant
             // browser-agent capture path — without it the per-frame
             // activations carry no `session` tag.
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, (if (fetch_ev) |fe| worker_mod.captureFetchChunkTapes(worker, &p.readset, ws_ctx_body, fe) else log_mod.TapePayloads{}), chain_ctx.correlation_id, cval.tags, act, fw_seq);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, cval.tags, act, fw_seq);
             cval.deinit(allocator);
             // §4.5 input gate: a writing frame's output is commit-gated — close
             // the gate so later frames queue behind it in arrival order.
@@ -530,7 +545,7 @@ fn finishWsResume(
             s2.deinit(allocator);
             p.txn.rollback() catch {};
             p.txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 501, .handler_error, &.{}, &.{}, (if (fetch_ev) |fe| worker_mod.captureFetchChunkTapes(worker, &p.readset, ws_ctx_body, fe) else log_mod.TapePayloads{}), chain_ctx.correlation_id, &.{}, act, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 501, .handler_error, &.{}, &.{}, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, &.{}, act, 0);
             effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
             tearDownWsChain(worker, conn_ent);
         },
@@ -539,7 +554,7 @@ fn finishWsResume(
         .no_onheaders, .no_onchunk => {
             p.txn.rollback() catch {};
             p.txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, (if (fetch_ev) |fe| worker_mod.captureFetchChunkTapes(worker, &p.readset, ws_ctx_body, fe) else log_mod.TapePayloads{}), chain_ctx.correlation_id, &.{}, act, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, wsResumeTapes(worker, &p.readset, ws_ctx_body, msg), chain_ctx.correlation_id, &.{}, act, 0);
             effect_mod.cmd.emitWsSend(worker, .{ .conn_entity = conn_ent, .opcode = 8, .bytes = &.{} }) catch {};
             tearDownWsChain(worker, conn_ent);
         },
@@ -644,7 +659,7 @@ fn fireWsMessage(
     };
 
     var oc = run_oc;
-    finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, .ws_message, "ws-message", null);
+    finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, .ws_message, "ws-message", .{ .frame = .{ .opcode = opcode, .data = payload } });
 }
 
 /// Resolve the WS connection entity holding `chain_ent`, or null if it's not a
@@ -841,7 +856,7 @@ pub fn resumeBoundFetchChainWs(
     };
 
     var oc = run_oc;
-    finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, .fetch_chunk, "ws-fetch-resume", fetch_ev);
+    finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, .fetch_chunk, "ws-fetch-resume", .{ .fetch = fetch_ev });
 }
 
 /// Resume a held WS chain whose `on.kv`/`on.timer` wake fired (routed here by
@@ -942,7 +957,7 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     };
 
     var oc = run_oc;
-    finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, .wake_batch, "ws-wake", null);
+    finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, .wake_batch, "ws-wake", .none);
 }
 
 /// Ship the frames an `onMessage` produced to `ws_send_in`. Read-only frames
@@ -1068,7 +1083,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
     ) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .disconnect, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.correlation_id, &.{}, .disconnect, 0);
         return;
     };
 
@@ -1088,12 +1103,12 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
             std.log.warn("rove-js ws-disconnect: propose failed: {s}", .{@errorName(perr)});
             p.txn_owned = false;
             p.txn_done = true;
-            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .disconnect, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .fault, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.correlation_id, &.{}, .disconnect, 0);
             return;
         };
         p.txn_owned = false;
         p.txn_done = true;
-        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .disconnect, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.correlation_id, &.{}, .disconnect, 0);
         return;
     }
     p.txn.commit() catch |e| switch (e) {
@@ -1109,5 +1124,5 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         ),
     };
     p.txn_done = true;
-    captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .disconnect, 0);
+    captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 200, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.correlation_id, &.{}, .disconnect, 0);
 }

@@ -577,10 +577,12 @@ fn cmdPull(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, req_id: []
             .{ "request_reads_tape_b64", "request_reads_b64" },
             .{ "request_body_b64", "request_body_b64" },
             // Non-inbound activations: the fetch result + the threaded ctx
-            // envelope (replay-and-sim.md §4). Carried so a pulled callback
-            // fixture is replayable, not just inbound.
+            // envelope + the activation Msg payload (a ws_message frame)
+            // (replay-and-sim.md §4). Carried so a pulled callback fixture is
+            // replayable, not just inbound.
             .{ "fetch_responses_tape_b64", "fetch_responses_b64" },
             .{ "trigger_payload_tape_b64", "trigger_payload_b64" },
+            .{ "activation_bytes_b64", "activation_bytes_b64" },
         };
         for (map) |m| {
             if (jStrM(t, m[0])) |b64| {

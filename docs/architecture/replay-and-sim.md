@@ -194,14 +194,28 @@ REAL recording** (`scripts/smoke/replay_noninbound_smoke_v2.py`): a live
 replay` reproduces `request.body` + `request.status`. `on_fetch_smoke_v2` and
 `ws_fetch_smoke_v2` confirm the effect paths are unregressed.
 
+**Update 2026-06-30 (c) — the WS resume class fixed too.** The same empty-tape
+bug affected the WS `ws_message` / `wake_batch` / `disconnect` resumes (via
+`finishWsResume` + `fireWsDisconnect`). Fixed with the same shape — tape the
+activation's Msg: `ws_message` records the frame (`captureWsFrameTapes` →
+`activation_bytes = [opcode][data]`; `root.run` rebuilds
+`request.activation = {opcode, data}` — text frames reproduce, binary is a
+follow-up), `wake_batch` / `disconnect` record readset + ctx. `pull` carries
+`activation_bytes`. **Validated end-to-end** (`replay_ws_message_smoke_v2.py`): a
+live WS text frame → `onMessage` now tapes the frame and offline replay
+reproduces `request.activation.data` (asserted via the handler's `kv` write).
+`ws_worker`/`ws_wake`/`ws_fetch` smokes unregressed. (HTTP non-fetch continuation
+resumes — `onWake`/`timer`/`onChunk` — already captured; they were never in this
+class.)
+
 Remaining: (a) a `{to}` override is still unrecorded (**G3** — the resolved
 export must be persisted; the no-`{to}` conventional-export case is covered by
-event-shape resolution); (b) `TextDecoder` is absent in the bare replay arena;
-(c) a **broader class** — the WS `ws_message` / `wake_batch` / `disconnect`
-resumes (and likely other continuation kinds) *also* capture empty tapes in
-`finishWsResume`, so those activations aren't replayable yet either. Same fix
-shape (tape the activation's Msg). The **sim** path (authored worlds) never
-depended on any of this.
+event-shape resolution); (b) `TextDecoder` (and `stream.*`/`next`) are absent in
+the bare replay arena — a handler using them ReferenceErrors on replay; (c)
+binary WS frames need a `Uint8Array` `request.activation.data` surface. The
+**sim** path (authored worlds) never depended on any of this. The durable
+guard against regression would be an L3 capture-time assertion / per-kind replay
+test matrix.
 
 ## 6. Implications for the sim / export-fixture plan
 

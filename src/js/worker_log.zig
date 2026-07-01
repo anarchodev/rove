@@ -273,6 +273,27 @@ pub fn captureFetchChunkTapes(
     return captureTapes(worker, readset, ctx_body);
 }
 
+/// Record an inbound WS frame (`ws_message`'s Msg) so `onMessage` is
+/// replayable. The frame is `request.activation = {opcode, data}`; taped as
+/// `activation_bytes = [opcode:u8][data]` (inline ≤ `REQUEST_BODY_CAP`). `ctx`
+/// rides trigger_payload. Small frames replay offline; larger frames record
+/// metadata only (same inline rule as the rest).
+pub fn captureWsFrameTapes(
+    worker: anytype,
+    readset: *tape_mod.Readset,
+    ctx_body: []const u8,
+    opcode: u8,
+    data: []const u8,
+) log_mod.TapePayloads {
+    const allocator = worker.allocator;
+    if (data.len + 1 > REQUEST_BODY_CAP) return captureTapes(worker, readset, ctx_body);
+    const framed = allocator.alloc(u8, 1 + data.len) catch return captureTapes(worker, readset, ctx_body);
+    defer allocator.free(framed);
+    framed[0] = opcode;
+    @memcpy(framed[1..], data);
+    return captureTapesWithActivation(worker, readset, ctx_body, framed);
+}
+
 // ── Log record capture ────────────────────────────────────────────────
 
 /// Append a log record for a request that has finished its dispatch
