@@ -1922,6 +1922,21 @@ pub fn resumeBoundFetchChain(
         pending_fetches.deinit(allocator);
     }
 
+    // The fetch result is this activation's Msg (an input — L3), so it must be
+    // taped or the fetch_chunk can't be replayed. The capture sites below feed
+    // this to `worker_mod.captureFetchChunkTapes` (which records it inline for
+    // ≤16 KB) instead of the old empty `.{}` payloads.
+    const fetch_ev: worker_mod.FetchEvent = .{
+        .fetch_id = ev.fetch_id,
+        .seq = ev.seq,
+        .byte_offset = ev.byte_offset,
+        .bytes = ev.bytes,
+        .headers = ev.fetch_headers orelse "",
+        .final = ev.final,
+        .terminal_status = ev.terminal_status,
+        .terminal_ok = ev.terminal_ok,
+        .body_truncated = ev.body_truncated,
+    };
     const req: Request = .{
         .method = "POST",
         .path = spath,
@@ -2003,7 +2018,7 @@ pub fn resumeBoundFetchChain(
                 txn.rollback() catch {};
                 txn_done = true;
                 resolveParked(worker, ent, sid, sess, 500, "bound-fetch handler exception\n") catch {};
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, &.{}, .fetch_chunk, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, &.{}, .fetch_chunk, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -2050,12 +2065,12 @@ pub fn resumeBoundFetchChain(
                     txn_owned = false;
                     txn_done = true;
                     resolveParked(worker, ent, sid, sess, 500, "bound-fetch replication failed\n") catch {};
-                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, correlation_id, &.{}, .fetch_chunk, 0);
+                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .fault, console_owned, exception_owned, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, &.{}, .fetch_chunk, 0);
                     return;
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, .{}, correlation_id, &.{}, .fetch_chunk, seq);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, &.{}, .fetch_chunk, seq);
                 if (pending_fetches.items.len > 0) std.log.warn(
                     "rove-js bound-fetch resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ pending_fetches.items.len, tenant_id },
@@ -2072,7 +2087,7 @@ pub fn resumeBoundFetchChain(
             // fetches drop (scope rule), unbound ones still fire.
             flushResumeFetches(worker, ent, &pending_fetches, false);
             resolveParked(worker, ent, sid, sess, st, r.body) catch {};
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, &.{}, .fetch_chunk, 0);
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, &.{}, .fetch_chunk, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -2134,7 +2149,7 @@ pub fn resumeBoundFetchChain(
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, &.{}, .fetch_chunk, seq);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, &.{}, .fetch_chunk, seq);
                 if (pending_fetches.items.len > 0) std.log.warn(
                     "rove-js bound-fetch resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ pending_fetches.items.len, tenant_id },

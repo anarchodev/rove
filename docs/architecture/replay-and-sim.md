@@ -149,19 +149,59 @@ every activation runnable. Three gaps, in priority order:
   Faithful replay of callbacks therefore needs a **recording-side** change:
   persist the export actually invoked (it is an input per L3/§2.5). *(Recording-side fix.)*
 
-**Update 2026-06-30 — G1 closed, G2 closed for the no-`{to}` case.** The driver
-now decodes `trigger_payload` (the `{"ctx": …}` envelope → `request.ctx`) and
-`fetch_responses` (→ the flattened `request.status/.ok/.done/.fetchId` + body),
-and resolves a `fetch_chunk`'s export by event shape (`onFetchResult` /
-`onFetchChunk` / `onFetchDone`); `pull` carries the two channels. So a callback
-activation replays faithfully **as long as it used its conventional export**.
-What remains of **G3**: a `{to}` override is still unrecorded, so an overridden
-callback replays under its conventional export — closing that needs the
-recording to persist the dispatch target (a worker-side change). Inline-bytes
-only — a fetch result whose bytes are a `BodyRef` to a readset blob isn't
-fetchable offline. *Verified against a programmatically-built fixture
-(`replay-driver-smoke fetch`); end-to-end validation against a real worker
-recording is the open gate.*
+**Update 2026-06-30 — mechanism landed, then a REAL recording refuted the fetch
+data-path.** The driver gained decoders + install for `trigger_payload` (the
+`{"ctx": …}` envelope → `request.ctx`) and `fetch_responses` (→ the flattened
+`request.status/.ok/.done/.fetchId` + body), export-resolution by event shape,
+and `pull` carries the channels. That passed a *programmatic* fixture — but
+validating against a **real** `fetch_chunk` recording (a live `on.fetch` →
+`onFetchResult`, `scripts/smoke/replay_noninbound_smoke_v2.py`) refuted the
+assumption the fixture baked in:
+
+- **The pulled `fetch_chunk` record's tapes are ALL empty (0 B)** — not just
+  `fetch_responses`, but `activation_bytes`, `trigger_payload`, `request_body`,
+  `request_reads`, `kv` too. The handler demonstrably read the 170-byte fetch
+  result at runtime (`request.body = fc.bytes`, `globals.zig:2610`), yet none of
+  it is in the pulled record. So the gap is at the **recording/pull layer** —
+  what a callback activation persists for offline replay — not the decode layer.
+  `root.run` reading `fetch_responses` was doubly moot: the data isn't in *any*
+  channel of the pulled record.
+- **Open question: where (if anywhere) is a `fetch_chunk`'s result captured?**
+  Either it rides a record/field `pull` doesn't surface, or it lands on a
+  *different* record than the `fetch_chunk` one, or callback activations don't
+  fully self-capture their Msg. This needs a recording-side investigation
+  (the validation smoke dumps every record's tape sizes to start it).
+- **The reference is no further along.** `rewind-apps/replay/_static/request-replay.mjs`
+  also maps `fetch_chunk → "default"` and never reconstructs the fetch/ctx
+  surface. Faithful non-inbound replay is unimplemented *across the stack*, not
+  just in this port.
+- Secondary: the bare replay arena lacks `TextDecoder` (a handler using it
+  ReferenceErrors on replay) — an engine-global gap independent of this work.
+
+**Update 2026-06-30 (b) — FIXED (recording side) + validated.** The root cause
+was a capture bug: the bound-fetch resume paths logged the `fetch_chunk`
+activation with **empty tapes** (`.{}`), so its Msg — the fetch result, an input
+(L3) — was never recorded. Fixed by `captureFetchChunkTapes`
+(`worker_log.zig`): each `fetch_chunk` resume now records the fetch event onto
+its readset's `fetch_responses` channel (inline raw bytes for ≤16 KB → fully
+replayable offline; a `BodyRef` for larger, offline-out-of-scope) and captures
+the real tapes. Wired across **all three resume paths** — `resumeBoundFetchChain`
+(buffered HTTP), `resumeBoundFetchStream` (streaming HTTP),
+`resumeBoundFetchChainWs` (WS). Plus `pull` carries `fetch_responses` +
+`trigger_payload`, and `root.run` decodes them. **Validated end-to-end against a
+REAL recording** (`scripts/smoke/replay_noninbound_smoke_v2.py`): a live
+`on.fetch` → `onFetchResult` now tapes the fetch event and offline `rewind
+replay` reproduces `request.body` + `request.status`. `on_fetch_smoke_v2` and
+`ws_fetch_smoke_v2` confirm the effect paths are unregressed.
+
+Remaining: (a) a `{to}` override is still unrecorded (**G3** — the resolved
+export must be persisted; the no-`{to}` conventional-export case is covered by
+event-shape resolution); (b) `TextDecoder` is absent in the bare replay arena;
+(c) a **broader class** — the WS `ws_message` / `wake_batch` / `disconnect`
+resumes (and likely other continuation kinds) *also* capture empty tapes in
+`finishWsResume`, so those activations aren't replayable yet either. Same fix
+shape (tape the activation's Msg). The **sim** path (authored worlds) never
+depended on any of this.
 
 ## 6. Implications for the sim / export-fixture plan
 

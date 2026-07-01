@@ -27,6 +27,7 @@ const log_server_mod = @import("rove-log-server");
 const jwt_mod = @import("rove-jwt");
 const blob_mod = @import("rove-blob");
 const tape_mod = @import("rove-tape");
+const bodies_mod = @import("rove-bodies");
 const tenant_mod = @import("rove-tenant");
 
 const worker_mod = @import("worker.zig");
@@ -221,6 +222,55 @@ pub fn captureTapesWithActivation(
         std.log.warn("rove-js activation-bytes capture failed: {s}", .{@errorName(err)});
     }
     return payloads;
+}
+
+/// The fetch-event fields a `fetch_chunk` activation must record so replay can
+/// rebuild `request.body` (the chunk bytes) + the flattened result surface
+/// (`request.status/.ok/.done/.fetchId`). Decoupled from `UpstreamFetchEvent`
+/// so any resume path builds it from its own locals.
+pub const FetchEvent = struct {
+    fetch_id: []const u8,
+    seq: u32,
+    byte_offset: u64,
+    bytes: []const u8,
+    headers: []const u8 = "",
+    final: bool,
+    terminal_status: u16,
+    terminal_ok: bool,
+    body_truncated: bool = false,
+};
+
+/// Record a `fetch_chunk` activation's triggering event onto its readset's
+/// `fetch_responses` channel, then capture the log tapes. This is the recording
+/// half of non-inbound replay: the fetch result is the activation's Msg — an
+/// input (L3), so it must be taped or the activation can't be replayed. Small
+/// bodies (≤ `REQUEST_BODY_CAP`) ride **inline as raw bytes** → fully
+/// replayable offline; larger bodies record metadata only (the bytes would need
+/// a readset-blob `BodyRef` the offline driver can't fetch — the WASM/browser
+/// replay with S3 access is the path for those). `ctx_body` is the `{"ctx":…}`
+/// envelope → trigger_payload (→ `request.ctx`).
+pub fn captureFetchChunkTapes(
+    worker: anytype,
+    readset: *tape_mod.Readset,
+    ctx_body: []const u8,
+    ev: FetchEvent,
+) log_mod.TapePayloads {
+    const inline_ok = ev.bytes.len <= REQUEST_BODY_CAP;
+    readset.fetch_responses.appendFetchResponse(
+        ev.fetch_id,
+        ev.seq,
+        ev.byte_offset,
+        .{ .batch_id = bodies_mod.NO_BATCH, .offset = 0, .len = @intCast(if (inline_ok) ev.bytes.len else 0) },
+        ev.final,
+        ev.terminal_status,
+        ev.terminal_ok,
+        ev.body_truncated,
+        ev.headers,
+        if (inline_ok) ev.bytes else "",
+    ) catch |err| {
+        std.log.warn("rove-js fetch-event capture failed: {s}", .{@errorName(err)});
+    };
+    return captureTapes(worker, readset, ctx_body);
 }
 
 // ── Log record capture ────────────────────────────────────────────────

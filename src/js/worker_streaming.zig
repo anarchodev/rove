@@ -999,6 +999,20 @@ pub fn resumeBoundFetchStream(
         pending_fetches.deinit(allocator);
     }
 
+    // The fetch result is this activation's Msg (an input — L3) → tape it so the
+    // fetch_chunk is replayable. Fed to `captureFetchChunkTapes` at the capture
+    // sites below (was empty `.{}`).
+    const fetch_ev: worker_mod.FetchEvent = .{
+        .fetch_id = ev.fetch_id,
+        .seq = ev.seq,
+        .byte_offset = ev.byte_offset,
+        .bytes = ev.bytes,
+        .headers = ev.fetch_headers orelse "",
+        .final = ev.final,
+        .terminal_status = if (ev.final) ev.terminal_status else 0,
+        .terminal_ok = if (ev.final) ev.terminal_ok else false,
+        .body_truncated = if (ev.final) ev.body_truncated else false,
+    };
     const req: Request = .{
         .method = "POST",
         .path = spath,
@@ -1055,7 +1069,7 @@ pub fn resumeBoundFetchStream(
         txn.rollback() catch {};
         txn_done = true;
         markStreamDrainingAnywhere(server, ent);
-        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
+        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
         return;
     };
 
@@ -1070,7 +1084,7 @@ pub fn resumeBoundFetchStream(
                 txn.rollback() catch {};
                 txn_done = true;
                 markStreamDrainingAnywhere(server, ent);
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, r.tags, .fetch_chunk, 0);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, r.tags, .fetch_chunk, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1103,7 +1117,7 @@ pub fn resumeBoundFetchStream(
                     txn_owned = false;
                     txn_done = true;
                     markStreamDrainingAnywhere(server, ent);
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, chain_ctx.correlation_id, r.tags, .fetch_chunk, 0);
+                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, r.tags, .fetch_chunk, 0);
                     r.console = &.{};
                     r.exception = &.{};
                     return;
@@ -1112,7 +1126,7 @@ pub fn resumeBoundFetchStream(
                 txn_done = true;
                 chain_st.activation_count += 1;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, r.tags, .fetch_chunk, fw_seq);
+                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, r.tags, .fetch_chunk, fw_seq);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1136,7 +1150,7 @@ pub fn resumeBoundFetchStream(
             markStreamDrainingAnywhere(server, ent);
             chain_st.activation_count += 1;
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, r.tags, .fetch_chunk, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, r.tags, .fetch_chunk, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -1147,7 +1161,7 @@ pub fn resumeBoundFetchStream(
             txn.rollback() catch {};
             txn_done = true;
             markStreamDrainingAnywhere(server, ent);
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
         },
         .stream => |*s2| {
             // stream({write}) on a stream-state chain: append write
@@ -1185,7 +1199,7 @@ pub fn resumeBoundFetchStream(
                     txn_owned = false;
                     txn_done = true;
                     markStreamDrainingAnywhere(server, ent);
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
+                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
                     return;
                 };
                 txn_owned = false;
@@ -1227,7 +1241,7 @@ pub fn resumeBoundFetchStream(
             wakes_st.kv_prefixes = s2.kv_prefixes;
             s2.kv_prefixes = &.{};
             chain_st.activation_count += 1;
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .fetch_chunk, fw_seq);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, &.{}, .fetch_chunk, fw_seq);
         },
         // Only `.inbound_headers` / `.inbound_chunk` activations
         // produce these; stream resumes never dispatch as one.
@@ -1236,7 +1250,7 @@ pub fn resumeBoundFetchStream(
             txn.rollback() catch {};
             txn_done = true;
             markStreamDrainingAnywhere(server, ent);
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
+            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
         },
     }
 }
