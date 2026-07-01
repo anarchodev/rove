@@ -638,7 +638,7 @@ fn cmdPull(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, req_id: []
 /// faithful to the JS yet robust to benign reordering; `--source-dir` swaps in
 /// working-tree source ("does my change still behave the same on the real
 /// inputs?"). Faithfulness is the output-level `status_match` + the effect log.
-fn cmdReplay(a: std.mem.Allocator, world_path: []const u8, source_dir: ?[]const u8, out_file: ?[]const u8) void {
+fn cmdReplay(a: std.mem.Allocator, world_path: []const u8, source_dir: ?[]const u8, out_file: ?[]const u8, update: bool) void {
     const bytes = std.fs.cwd().readFileAlloc(a, world_path, 64 << 20) catch |e|
         c.fatal("replay: read {s}: {s}", .{ world_path, @errorName(e) });
     var out = std.ArrayList(u8){};
@@ -648,15 +648,7 @@ fn cmdReplay(a: std.mem.Allocator, world_path: []const u8, source_dir: ?[]const 
         error.ArenaInit => c.fatal("replay: JS engine failed to initialise", .{}),
         else => c.fatal("replay: {s}", .{@errorName(e)}),
     };
-    if (out_file) |path| {
-        std.fs.cwd().writeFile(.{ .sub_path = path, .data = out.items }) catch |e|
-            c.fatal("replay: write {s}: {s}", .{ path, @errorName(e) });
-        std.debug.print("wrote replay result → {s}\n", .{path});
-    } else {
-        std.debug.print("{s}\n", .{out.items});
-    }
-    // A failed `expected` assertion → non-zero exit (CI-usable).
-    if (std.mem.indexOf(u8, out.items, "\"verify\":{\"pass\":false") != null) std.process.exit(1);
+    doOutput(a, "replay", world_path, out.items, out_file, update);
 }
 
 /// `rewind sim <world.json> [--source-dir DIR] [-o FILE]`
@@ -665,7 +657,7 @@ fn cmdReplay(a: std.mem.Allocator, world_path: []const u8, source_dir: ?[]const 
 /// key→value KV map, seed/now); reads resolve order-independently against a
 /// **closed world** — a key not in the map is `not_found`. Same offline path as
 /// `replay` — no dashboard / IdP / network.
-fn cmdSim(a: std.mem.Allocator, world_path: []const u8, source_dir: ?[]const u8, out_file: ?[]const u8) void {
+fn cmdSim(a: std.mem.Allocator, world_path: []const u8, source_dir: ?[]const u8, out_file: ?[]const u8, update: bool) void {
     const bytes = std.fs.cwd().readFileAlloc(a, world_path, 64 << 20) catch |e|
         c.fatal("sim: read {s}: {s}", .{ world_path, @errorName(e) });
     var out = std.ArrayList(u8){};
@@ -675,19 +667,30 @@ fn cmdSim(a: std.mem.Allocator, world_path: []const u8, source_dir: ?[]const u8,
         error.ArenaInit => c.fatal("sim: JS engine failed to initialise", .{}),
         else => c.fatal("sim: {s}", .{@errorName(e)}),
     };
+    doOutput(a, "sim", world_path, out.items, out_file, update);
+}
+
+/// Shared tail for `sim`/`replay`: `--update` snapshots the bundle's facets as
+/// `expected` back into the world file (golden regen; no fail-exit). Otherwise
+/// emit the bundle (stdout or -o) and exit non-zero on a failed `expected`.
+fn doOutput(a: std.mem.Allocator, verb: []const u8, world_path: []const u8, bundle: []const u8, out_file: ?[]const u8, update: bool) void {
+    if (update) {
+        replay.updateExpected(a, world_path, bundle) catch |e|
+            c.fatal("{s}: --update failed: {s}", .{ verb, @errorName(e) });
+        std.debug.print("updated expected → {s}\n", .{world_path});
+        return;
+    }
     if (out_file) |path| {
-        std.fs.cwd().writeFile(.{ .sub_path = path, .data = out.items }) catch |e|
-            c.fatal("sim: write {s}: {s}", .{ path, @errorName(e) });
-        std.debug.print("wrote sim result → {s}\n", .{path});
+        std.fs.cwd().writeFile(.{ .sub_path = path, .data = bundle }) catch |e|
+            c.fatal("{s}: write {s}: {s}", .{ verb, path, @errorName(e) });
+        std.debug.print("wrote {s} result → {s}\n", .{ verb, path });
     } else {
-        // The bundle is the artifact a pipeline/LLM consumes — stdout, so
-        // `rewind sim ... | jq` works (the file-written notice stays on stderr).
         const stdout = std.fs.File.stdout();
-        stdout.writeAll(out.items) catch {};
+        stdout.writeAll(bundle) catch {};
         stdout.writeAll("\n") catch {};
     }
     // A failed `expected` assertion → non-zero exit (CI-usable).
-    if (std.mem.indexOf(u8, out.items, "\"verify\":{\"pass\":false") != null) std.process.exit(1);
+    if (std.mem.indexOf(u8, bundle, "\"verify\":{\"pass\":false") != null) std.process.exit(1);
 }
 
 /// `rewind export-fixture <pulled-fixture.json> [-o world.json]` — transcode a
@@ -821,8 +824,8 @@ const USAGE =
     \\  rewind [--env <file>] deployments <tenant>
     \\  rewind [--env <file>] logs <tenant> [--limit N] [--after CURSOR]
     \\  rewind [--env <file>] pull <tenant> <req_id> [-o FILE]
-    \\  rewind [--env <file>] replay <world.json> [--source-dir DIR] [-o FILE]
-    \\  rewind sim <world.json> [--source-dir DIR] [-o FILE]
+    \\  rewind [--env <file>] replay <world.json> [--source-dir DIR] [--update] [-o FILE]
+    \\  rewind sim <world.json> [--source-dir DIR] [--update] [-o FILE]
     \\  rewind export-fixture <base64-record.json> [-o world.json]
     \\  rewind [--env <file>] publish [--apps-dir D] [--only t1,t2] [--include-examples] [--no-release]
     \\  rewind [--env <file>] provision <tenant> [--cluster C] [--host H]
@@ -901,43 +904,49 @@ pub fn main() void {
     // `replay` is fully offline (no dashboard / IdP) — handle it before
     // loadCfg so it never demands REWIND_ADMIN_URL / REWIND_IDP_URL.
     if (std.mem.eql(u8, verb, "replay")) {
-        if (rest.len < 1) c.fatal("replay needs <fixture> [--source-dir DIR] [-o FILE]", .{});
+        if (rest.len < 1) c.fatal("replay needs <fixture> [--source-dir DIR] [--update] [-o FILE]", .{});
         var source_dir: ?[]const u8 = null;
         var out_file: ?[]const u8 = null;
+        var update = false;
         var j: usize = 1;
         while (j < rest.len) : (j += 1) {
             if (std.mem.eql(u8, rest[j], "--source-dir")) {
                 if (j + 1 >= rest.len) c.fatal("--source-dir needs a path", .{});
                 source_dir = rest[j + 1];
                 j += 1;
+            } else if (std.mem.eql(u8, rest[j], "--update")) {
+                update = true;
             } else if (std.mem.eql(u8, rest[j], "-o")) {
                 if (j + 1 >= rest.len) c.fatal("-o needs a path", .{});
                 out_file = rest[j + 1];
                 j += 1;
             } else c.fatal("replay: unknown option '{s}'", .{rest[j]});
         }
-        cmdReplay(a, rest[0], source_dir, out_file);
+        cmdReplay(a, rest[0], source_dir, out_file, update);
         return;
     }
 
     // `sim` is offline too — a declarative world through the same engine.
     if (std.mem.eql(u8, verb, "sim")) {
-        if (rest.len < 1) c.fatal("sim needs <world.json> [--source-dir DIR] [-o FILE]", .{});
+        if (rest.len < 1) c.fatal("sim needs <world.json> [--source-dir DIR] [--update] [-o FILE]", .{});
         var source_dir: ?[]const u8 = null;
         var out_file: ?[]const u8 = null;
+        var update = false;
         var j: usize = 1;
         while (j < rest.len) : (j += 1) {
             if (std.mem.eql(u8, rest[j], "--source-dir")) {
                 if (j + 1 >= rest.len) c.fatal("--source-dir needs a path", .{});
                 source_dir = rest[j + 1];
                 j += 1;
+            } else if (std.mem.eql(u8, rest[j], "--update")) {
+                update = true;
             } else if (std.mem.eql(u8, rest[j], "-o")) {
                 if (j + 1 >= rest.len) c.fatal("-o needs a path", .{});
                 out_file = rest[j + 1];
                 j += 1;
             } else c.fatal("sim: unknown option '{s}'", .{rest[j]});
         }
-        cmdSim(a, rest[0], source_dir, out_file);
+        cmdSim(a, rest[0], source_dir, out_file, update);
         return;
     }
 

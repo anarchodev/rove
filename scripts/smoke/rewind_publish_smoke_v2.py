@@ -428,32 +428,38 @@ def main() -> int:
                 art = json.loads(r.stdout)
             except (json.JSONDecodeError, ValueError):
                 art = {}
-            rec_console = (art.get("recorded") or {}).get("console", "")
             effects = art.get("effects", [])
             rep_console = " ".join(e.get("message", "") for e in effects if e.get("kind") == "log")
             writes = [e for e in effects if e.get("kind") == "write"]
             wrote_hits = any(w.get("key") == "hits" for w in writes)
+            verify = art.get("verify", {})
             check("rewind replay reproduces the run (no divergence)",
                   r.returncode == 0 and art.get("divergence") is None, r.stdout[:400])
-            check("replay reproduces the recorded console",
-                  rec_console.strip() != "" and rec_console.strip() == rep_console.strip(),
-                  f"recorded={rec_console!r} replay={rep_console!r}")
+            check("replay reproduces console output (in the effect log)",
+                  rep_console.strip() != "", f"console={rep_console!r}")
             check("replay reproduces the kv write-set (hits set)", wrote_hits, str(writes)[:200])
-            check("replay status matches the recording", art.get("status_match") is True,
-                  f"replayed={art.get('replayed_status')} match={art.get('status_match')}")
+            check("replay verifies the recorded status (expected → verify.pass)",
+                  verify.get("pass") is True, f"verify={json.dumps(verify)}")
 
-            # --source-dir: a working-tree handler that reads an OFF-TAPE key
-            # must surface a divergence (the simulate lever), not a silent pass.
+            # --source-dir: a working-tree handler that changes the status AND
+            # reads an off-tape key. Closed world: the off-tape read resolves to
+            # not_found (visible in the effects as present:false, not a hard
+            # divergence), and the status change makes the `expected` verify FAIL
+            # — the "does my change still behave?" lever.
             local = Path(tempfile.mkdtemp(prefix="local"))
             (local / "index.mjs").write_text(
-                "export default function(){ const x = kv.get('not-on-tape'); return 'x=' + x; }\n")
+                "export default function(){ const x = kv.get('not-on-tape');"
+                " response.status = 599; return 'x=' + x; }\n")
             r = rw("replay", str(fixture), "--source-dir", str(local))
             try:
                 art2 = json.loads(r.stdout)
             except (json.JSONDecodeError, ValueError):
                 art2 = {}
-            check("rewind replay --source-dir surfaces a divergence on an off-tape read",
-                  art2.get("divergence") is not None and art2.get("status_match") is False,
+            off = next((e for e in art2.get("effects", [])
+                        if e.get("kind") == "read" and e.get("key") == "not-on-tape"), None)
+            check("rewind replay --source-dir catches a behavior change (verify fails, off-tape read visible)",
+                  art2.get("verify", {}).get("pass") is False
+                  and off is not None and off.get("present") is False,
                   r.stdout[:400])
 
         # ── log-server metrics: scrape the loopback Prometheus endpoint ───

@@ -242,14 +242,12 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         try jsonStr(w, p.value);
     }
     try w.writeAll(if (kv.items.len != 0) "\n  }" else "}");
+    // The recorded status becomes an `expected` assertion — replay verifies the
+    // re-run reproduces it (this replaces the old `recorded`/`status_match`).
     if (recorded) |r| {
-        try w.writeAll(",\n  \"recorded\": {\"status\": ");
-        if (r.get("status")) |sv| (if (sv == .integer) try w.print("{d}", .{sv.integer}) else try w.writeAll("null")) else try w.writeAll("null");
-        try w.writeAll(", \"console\": ");
-        try jsonStr(w, jStr(r, "console") orelse "");
-        try w.writeAll(", \"exception\": ");
-        try jsonStr(w, jStr(r, "exception") orelse "");
-        try w.writeByte('}');
+        if (r.get("status")) |sv| if (sv == .integer) {
+            try w.print(",\n  \"expected\": {{ \"response\": {{ \"status\": {d} }} }}", .{sv.integer});
+        };
     }
     if (seed) |s| {
         const n = std.fmt.parseInt(u64, s, 10) catch 0;

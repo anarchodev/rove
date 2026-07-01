@@ -159,7 +159,6 @@ pub fn runWorld(
         .divergence = host.diverged,
         .writes = host.writes.items,
         .run_json = host.output,
-        .recorded = wv.recorded,
     });
 
     // Optional `expected` → append a `verify` result (partial, order-independent
@@ -306,6 +305,104 @@ fn matchCmd(a: std.mem.Allocator, effects: []const std.json.Value, want: std.jso
     return false;
 }
 
+// ── `--update`: snapshot the produced bundle's facets as `expected` and write
+// it back into the world file (golden regen; overwrites any existing expected) ──
+
+pub fn updateExpected(a: std.mem.Allocator, world_path: []const u8, bundle_json: []const u8) !void {
+    var es = std.ArrayList(u8){};
+    {
+        var ew = std.Io.Writer.Allocating.fromArrayList(a, &es);
+        try buildExpected(a, &ew.writer, bundle_json);
+        es = ew.toArrayList();
+    }
+    const ep = std.json.parseFromSlice(std.json.Value, a, es.items, .{}) catch return Error.BadFixture;
+    const wbytes = try std.fs.cwd().readFileAlloc(a, world_path, 64 << 20);
+    var wp = std.json.parseFromSlice(std.json.Value, a, wbytes, .{}) catch return Error.BadFixture;
+    if (wp.value != .object) return Error.BadFixture;
+    try wp.value.object.put("expected", ep.value);
+    var out = std.ArrayList(u8){};
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, &out);
+    try std.json.Stringify.value(wp.value, .{ .whitespace = .indent_2 }, &aw.writer);
+    out = aw.toArrayList();
+    try std.fs.cwd().writeFile(.{ .sub_path = world_path, .data = out.items });
+}
+
+/// Project the produced bundle → an `expected` object: response.status,
+/// disposition, and the writes / cmds from the effect log.
+fn buildExpected(a: std.mem.Allocator, w: *std.Io.Writer, bundle_json: []const u8) !void {
+    const bp = std.json.parseFromSlice(std.json.Value, a, bundle_json, .{}) catch {
+        try w.writeAll("{}");
+        return;
+    };
+    if (bp.value != .object) {
+        try w.writeAll("{}");
+        return;
+    }
+    const b = bp.value.object;
+
+    try w.writeAll("{\"response\":{\"status\":");
+    const status: ?std.json.Value = blk: {
+        if (b.get("response")) |rv| if (rv == .object) if (rv.object.get("status")) |sv| break :blk sv;
+        break :blk null;
+    };
+    if (status) |s| try std.json.Stringify.value(s, .{}, w) else try w.writeAll("null");
+    try w.writeByte('}');
+    if (b.get("disposition")) |dv| {
+        try w.writeAll(",\"disposition\":");
+        try std.json.Stringify.value(dv, .{}, w);
+    }
+
+    const effects: []const std.json.Value = if (b.get("effects")) |ev|
+        (if (ev == .array) ev.array.items else &.{})
+    else
+        &.{};
+    try w.writeAll(",\"writes\":[");
+    var nw: usize = 0;
+    for (effects) |e| {
+        if (e != .object) continue;
+        const kind = e.object.get("kind") orelse continue;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "write")) continue;
+        if (nw != 0) try w.writeByte(',');
+        nw += 1;
+        try w.writeAll("{\"key\":");
+        try std.json.Stringify.value(e.object.get("key") orelse .null, .{}, w);
+        if (e.object.get("value")) |v| {
+            try w.writeAll(",\"value\":");
+            try std.json.Stringify.value(v, .{}, w);
+        }
+        try w.writeByte('}');
+    }
+    try w.writeByte(']');
+    try w.writeAll(",\"cmds\":[");
+    var nc: usize = 0;
+    for (effects) |e| {
+        if (e != .object) continue;
+        const kind = e.object.get("kind") orelse continue;
+        if (kind != .string or !isCmdKind(kind.string)) continue;
+        if (nc != 0) try w.writeByte(',');
+        nc += 1;
+        try w.writeAll("{\"kind\":");
+        try std.json.Stringify.value(kind, .{}, w);
+        if (e.object.get("url")) |u| {
+            try w.writeAll(",\"url\":");
+            try std.json.Stringify.value(u, .{}, w);
+        }
+        if (e.object.get("to")) |t| if (t != .null) {
+            try w.writeAll(",\"to\":");
+            try std.json.Stringify.value(t, .{}, w);
+        };
+        try w.writeByte('}');
+    }
+    try w.writeByte(']');
+    try w.writeByte('}');
+}
+
+fn isCmdKind(k: []const u8) bool {
+    const kinds = [_][]const u8{ "fetch", "webhook", "email", "schedule", "cron", "timer", "kv-wake", "stream" };
+    for (kinds) |c| if (std.mem.eql(u8, k, c)) return true;
+    return false;
+}
+
 // ── emit helpers ──
 
 const EmitWorldArgs = struct {
@@ -318,9 +415,6 @@ const EmitWorldArgs = struct {
     /// The run's parked output (response/result/error/console), or null when the
     /// run died before the epilogue captured it (e.g. a syntax error).
     run_json: ?[]const u8,
-    /// The recorded output, when this world came from a capture — drives the
-    /// output-level faithfulness check (`status_match`).
-    recorded: ?world.Recorded = null,
 };
 
 /// Emit a sim bundle. Same engine output as `emit`, minus the recorded-vs-
@@ -406,41 +500,7 @@ fn emitWorld(a: std.mem.Allocator, out: *std.ArrayList(u8), args: EmitWorldArgs)
         try w.writeAll(",\"divergence\":");
         try jsonStr(w, d);
     }
-
-    // Output-level faithfulness — when the world carries a recording (replay).
-    const replayed_status: ?i64 = if (args.run_json) |rj| statusOf(a, rj) else null;
-    if (args.recorded) |rec| {
-        try w.writeAll(",\"recorded\":{\"status\":");
-        if (rec.status) |s| try w.print("{d}", .{s}) else try w.writeAll("null");
-        try w.writeAll(",\"console\":");
-        try optStr(w, rec.console);
-        try w.writeAll(",\"exception\":");
-        try optStr(w, rec.exception);
-        try w.writeByte('}');
-        try w.writeAll(",\"replayed_status\":");
-        if (replayed_status) |s| try w.print("{d}", .{s}) else try w.writeAll("null");
-        const match = replayed_status != null and rec.status != null and replayed_status.? == rec.status.?;
-        try w.print(",\"status_match\":{s}", .{if (match) "true" else "false"});
-    }
     try w.writeByte('}');
-}
-
-/// Pull `result.status` (handler return), falling back to `response.status`,
-/// from the parked output JSON. A run that threw (non-null `error`) has no
-/// meaningful replayed status — return null so a diverged/errored run never
-/// reports a spurious status match against the recording.
-fn statusOf(a: std.mem.Allocator, replay_json: []const u8) ?i64 {
-    const parsed = std.json.parseFromSlice(std.json.Value, a, replay_json, .{}) catch return null;
-    if (parsed.value != .object) return null;
-    const o = parsed.value.object;
-    if (o.get("error")) |e| if (e == .object) return null; // handler threw
-    if (o.get("result")) |r| if (r == .object) {
-        if (jInt(r.object, "status")) |s| return s;
-    };
-    if (o.get("response")) |r| if (r == .object) {
-        if (jInt(r.object, "status")) |s| return s;
-    };
-    return null;
 }
 
 /// Extract the threaded ctx from a trigger_payload envelope. A continuation

@@ -39,13 +39,6 @@ const std = @import("std");
 pub const Header = struct { name: []const u8, value: []const u8 };
 pub const KvPair = struct { key: []const u8, value: []const u8 };
 pub const Source = struct { path: []const u8, kind: []const u8, source: []const u8 };
-/// The recorded run's observable output — for the output-level faithfulness
-/// check (`status_match`), the honest place fidelity lives (not per-read).
-pub const Recorded = struct {
-    status: ?i64 = null,
-    console: ?[]const u8 = null,
-    exception: ?[]const u8 = null,
-};
 
 pub const World = struct {
     entry: []const u8 = "index.mjs",
@@ -67,8 +60,6 @@ pub const World = struct {
     /// The KV readset as a key→value map — a closed world: a key not present
     /// reads `not_found`.
     kv: []const KvPair = &.{},
-    /// The recorded run's output, for the `status_match` faithfulness check.
-    recorded: ?Recorded = null,
     /// Optional `expected` output — a PARTIAL, order-independent assertion over
     /// the produced bundle (response.status / writes / cmds / disposition). When
     /// present, `runWorld` appends a `verify` result. Stored as JSON text.
@@ -157,18 +148,6 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
             try ps.append(a, .{ .key = e.key_ptr.*, .value = try valueToStr(a, e.value_ptr.*) });
         }
         w.kv = try ps.toOwnedSlice(a);
-    }
-
-    // ── recorded output (for status_match) ──
-    if (obj.get("recorded")) |rv| {
-        if (rv == .object) {
-            const r = rv.object;
-            w.recorded = .{
-                .status = jInt(r, "status"),
-                .console = jStr(r, "console"),
-                .exception = jStr(r, "exception"),
-            };
-        }
     }
 
     // ── expected output — a partial assertion over the produced bundle ──

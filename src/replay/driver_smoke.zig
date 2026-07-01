@@ -52,7 +52,7 @@ fn runInbound(a: std.mem.Allocator) !void {
     try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",");
     try w.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/hello\",\"host\":\"ex.test\"},");
     try w.writeAll("\"kv\":{\"user\":\"ada\"},\"seed\":42,");
-    try w.writeAll("\"recorded\":{\"status\":200,\"console\":\"hello ada\",\"exception\":\"\"},");
+    try w.writeAll("\"expected\":{\"response\":{\"status\":200}},");
     try w.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
     try std.json.Stringify.value(HANDLER, .{}, w);
     try w.writeAll("}]}");
@@ -64,7 +64,7 @@ fn runInbound(a: std.mem.Allocator) !void {
     try stdout.writeAll(out.items);
     try stdout.writeAll("\n");
     check(out.items, &.{
-        "\"status_match\":true", "\"kind\":\"write\"", "\"key\":\"seen\"",
+        "\"verify\":{\"pass\":true", "\"kind\":\"write\"", "\"key\":\"seen\"",
         "\"value\":\"ada\"", "hello ada", "\"ok\":true",
     }, "DRIVER SMOKE");
 }
