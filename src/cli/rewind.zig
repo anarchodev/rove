@@ -629,21 +629,20 @@ fn cmdPull(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, req_id: []
     }
 }
 
-/// `rewind replay <world.json> [--source-dir DIR] [--miss-policy fail|resolve] [-o FILE]`
+/// `rewind replay <world.json> [--source-dir DIR] [-o FILE]`
 /// — re-materialise a recorded request natively (links the arenajs replay
 /// engine; no Node/WASM/network) and emit the LLM-JSON result. Replay and sim
 /// are the SAME engine over the SAME format (the declarative world `pull`
-/// writes) — they differ only in the default miss-policy: `replay` = `fail`
-/// (honest divergence on a read the recording never captured), `sim` = `resolve`.
-/// KV reads resolve by KEY (order-independent) with a write-through overlay, so
-/// re-execution is faithful to the JS yet robust to benign reordering;
-/// `--source-dir` swaps in working-tree source ("does my change still behave the
-/// same on the real inputs?"). Faithfulness is the output-level `status_match`.
-fn cmdReplay(a: std.mem.Allocator, world_path: []const u8, source_dir: ?[]const u8, miss: replay.MissPolicy, out_file: ?[]const u8) void {
+/// writes). KV reads resolve by KEY (order-independent, closed world: a key not
+/// in the map is not_found) with a write-through overlay, so re-execution is
+/// faithful to the JS yet robust to benign reordering; `--source-dir` swaps in
+/// working-tree source ("does my change still behave the same on the real
+/// inputs?"). Faithfulness is the output-level `status_match` + the effect log.
+fn cmdReplay(a: std.mem.Allocator, world_path: []const u8, source_dir: ?[]const u8, out_file: ?[]const u8) void {
     const bytes = std.fs.cwd().readFileAlloc(a, world_path, 64 << 20) catch |e|
         c.fatal("replay: read {s}: {s}", .{ world_path, @errorName(e) });
     var out = std.ArrayList(u8){};
-    replay.runWorld(a, bytes, source_dir, miss, &out) catch |e| switch (e) {
+    replay.runWorld(a, bytes, source_dir, &out) catch |e| switch (e) {
         error.EntrySourceMissing => c.fatal("replay: the world has no entry source (index.mjs) — re-pull, or pass --source-dir", .{}),
         error.BadFixture => c.fatal("replay: world JSON is malformed", .{}),
         error.ArenaInit => c.fatal("replay: JS engine failed to initialise", .{}),
@@ -658,18 +657,17 @@ fn cmdReplay(a: std.mem.Allocator, world_path: []const u8, source_dir: ?[]const 
     }
 }
 
-/// `rewind sim <world.json> [--source-dir DIR] [--miss-policy fail|resolve] [-o FILE]`
+/// `rewind sim <world.json> [--source-dir DIR] [-o FILE]`
 /// — run a DECLARATIVE world (an authored fixture, not a captured tape) through
 /// the same engine. The world is a plain JSON document (request surface, a
-/// key→value KV map, seed/now); reads resolve order-independently, and the
-/// `--miss-policy` (or the world's `missPolicy`) decides what an unsupplied read
-/// does: `resolve` answers not_found and reports a typed hole; `fail` refuses to
-/// invent. Same offline path as `replay` — no dashboard / IdP / network.
-fn cmdSim(a: std.mem.Allocator, world_path: []const u8, source_dir: ?[]const u8, miss: ?replay.MissPolicy, out_file: ?[]const u8) void {
+/// key→value KV map, seed/now); reads resolve order-independently against a
+/// **closed world** — a key not in the map is `not_found`. Same offline path as
+/// `replay` — no dashboard / IdP / network.
+fn cmdSim(a: std.mem.Allocator, world_path: []const u8, source_dir: ?[]const u8, out_file: ?[]const u8) void {
     const bytes = std.fs.cwd().readFileAlloc(a, world_path, 64 << 20) catch |e|
         c.fatal("sim: read {s}: {s}", .{ world_path, @errorName(e) });
     var out = std.ArrayList(u8){};
-    replay.runWorld(a, bytes, source_dir, miss, &out) catch |e| switch (e) {
+    replay.runWorld(a, bytes, source_dir, &out) catch |e| switch (e) {
         error.EntrySourceMissing => c.fatal("sim: the world has no entry source ('{s}') — add it under \"sources\", or pass --source-dir", .{"index.mjs"}),
         error.BadFixture => c.fatal("sim: world JSON is malformed", .{}),
         error.ArenaInit => c.fatal("sim: JS engine failed to initialise", .{}),
@@ -819,8 +817,8 @@ const USAGE =
     \\  rewind [--env <file>] deployments <tenant>
     \\  rewind [--env <file>] logs <tenant> [--limit N] [--after CURSOR]
     \\  rewind [--env <file>] pull <tenant> <req_id> [-o FILE]
-    \\  rewind [--env <file>] replay <world.json> [--source-dir DIR] [--miss-policy fail|resolve] [-o FILE]
-    \\  rewind sim <world.json> [--source-dir DIR] [--miss-policy fail|resolve] [-o FILE]
+    \\  rewind [--env <file>] replay <world.json> [--source-dir DIR] [-o FILE]
+    \\  rewind sim <world.json> [--source-dir DIR] [-o FILE]
     \\  rewind export-fixture <base64-record.json> [-o world.json]
     \\  rewind [--env <file>] publish [--apps-dir D] [--only t1,t2] [--include-examples] [--no-release]
     \\  rewind [--env <file>] provision <tenant> [--cluster C] [--host H]
@@ -899,20 +897,14 @@ pub fn main() void {
     // `replay` is fully offline (no dashboard / IdP) — handle it before
     // loadCfg so it never demands REWIND_ADMIN_URL / REWIND_IDP_URL.
     if (std.mem.eql(u8, verb, "replay")) {
-        if (rest.len < 1) c.fatal("replay needs <fixture> [--source-dir DIR] [--miss-policy fail|resolve] [-o FILE]", .{});
+        if (rest.len < 1) c.fatal("replay needs <fixture> [--source-dir DIR] [-o FILE]", .{});
         var source_dir: ?[]const u8 = null;
         var out_file: ?[]const u8 = null;
-        var miss: replay.MissPolicy = .fail;
         var j: usize = 1;
         while (j < rest.len) : (j += 1) {
             if (std.mem.eql(u8, rest[j], "--source-dir")) {
                 if (j + 1 >= rest.len) c.fatal("--source-dir needs a path", .{});
                 source_dir = rest[j + 1];
-                j += 1;
-            } else if (std.mem.eql(u8, rest[j], "--miss-policy")) {
-                if (j + 1 >= rest.len) c.fatal("--miss-policy needs fail|resolve", .{});
-                const v = rest[j + 1];
-                miss = if (std.mem.eql(u8, v, "fail")) .fail else if (std.mem.eql(u8, v, "resolve") or std.mem.eql(u8, v, "not_found")) .resolve else c.fatal("--miss-policy must be fail|resolve", .{});
                 j += 1;
             } else if (std.mem.eql(u8, rest[j], "-o")) {
                 if (j + 1 >= rest.len) c.fatal("-o needs a path", .{});
@@ -920,26 +912,20 @@ pub fn main() void {
                 j += 1;
             } else c.fatal("replay: unknown option '{s}'", .{rest[j]});
         }
-        cmdReplay(a, rest[0], source_dir, miss, out_file);
+        cmdReplay(a, rest[0], source_dir, out_file);
         return;
     }
 
     // `sim` is offline too — a declarative world through the same engine.
     if (std.mem.eql(u8, verb, "sim")) {
-        if (rest.len < 1) c.fatal("sim needs <world.json> [--source-dir DIR] [--miss-policy fail|resolve] [-o FILE]", .{});
+        if (rest.len < 1) c.fatal("sim needs <world.json> [--source-dir DIR] [-o FILE]", .{});
         var source_dir: ?[]const u8 = null;
         var out_file: ?[]const u8 = null;
-        var miss: ?replay.MissPolicy = null;
         var j: usize = 1;
         while (j < rest.len) : (j += 1) {
             if (std.mem.eql(u8, rest[j], "--source-dir")) {
                 if (j + 1 >= rest.len) c.fatal("--source-dir needs a path", .{});
                 source_dir = rest[j + 1];
-                j += 1;
-            } else if (std.mem.eql(u8, rest[j], "--miss-policy")) {
-                if (j + 1 >= rest.len) c.fatal("--miss-policy needs fail|resolve", .{});
-                const v = rest[j + 1];
-                miss = if (std.mem.eql(u8, v, "fail")) .fail else if (std.mem.eql(u8, v, "resolve") or std.mem.eql(u8, v, "not_found")) .resolve else c.fatal("--miss-policy must be fail|resolve", .{});
                 j += 1;
             } else if (std.mem.eql(u8, rest[j], "-o")) {
                 if (j + 1 >= rest.len) c.fatal("-o needs a path", .{});
@@ -947,7 +933,7 @@ pub fn main() void {
                 j += 1;
             } else c.fatal("sim: unknown option '{s}'", .{rest[j]});
         }
-        cmdSim(a, rest[0], source_dir, miss, out_file);
+        cmdSim(a, rest[0], source_dir, out_file);
         return;
     }
 

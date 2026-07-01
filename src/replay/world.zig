@@ -33,7 +33,6 @@
 //! are allocated from `a`.
 
 const std = @import("std");
-const host = @import("host.zig");
 
 pub const Header = struct { name: []const u8, value: []const u8 };
 pub const KvPair = struct { key: []const u8, value: []const u8 };
@@ -63,17 +62,13 @@ pub const World = struct {
     /// activation it is the *response* body (delivered on `request.body`).
     body: ?[]const u8 = null,
     ip: ?[]const u8 = null,
-    /// The KV readset as a key→value map.
+    /// The KV readset as a key→value map — a closed world: a key not present
+    /// reads `not_found`.
     kv: []const KvPair = &.{},
-    /// Keys explicitly declared **absent** — a read resolves to `not_found`
-    /// with no hole (so `miss-policy=fail` reproduces a recording's not-found
-    /// reads). `export-fixture` fills this from the recorded not-found reads.
-    kv_absent: []const []const u8 = &.{},
     /// The recorded run's output, for the `status_match` faithfulness check.
     recorded: ?Recorded = null,
     seed: u64 = 0,
     now_ms: u64 = 0,
-    miss: host.MissPolicy = .resolve,
     /// Inline handler sources (path/kind/source); empty when `--source-dir`
     /// serves the working tree instead.
     sources: []const Source = &.{},
@@ -107,13 +102,6 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
     if (jStr(obj, "export")) |s| w.export_name = s;
     if (obj.get("ctx")) |cv| {
         if (cv != .null) w.ctx_json = try jsonText(a, cv);
-    }
-    if (jStr(obj, "missPolicy")) |s| {
-        if (std.mem.eql(u8, s, "fail")) {
-            w.miss = .fail;
-        } else if (std.mem.eql(u8, s, "resolve") or std.mem.eql(u8, s, "not_found")) {
-            w.miss = .resolve;
-        } else return Error.BadWorld;
     }
     w.seed = jU64(obj, "seed") orelse 0;
     w.now_ms = jU64(obj, "now_ms") orelse 0;
@@ -163,16 +151,6 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
             try ps.append(a, .{ .key = e.key_ptr.*, .value = try valueToStr(a, e.value_ptr.*) });
         }
         w.kv = try ps.toOwnedSlice(a);
-    }
-
-    // ── explicitly-absent keys ──
-    if (obj.get("kvAbsent")) |ka| {
-        if (ka != .array) return Error.BadWorld;
-        var ks = std.ArrayList([]const u8){};
-        for (ka.array.items) |e| {
-            if (e == .string) try ks.append(a, e.string);
-        }
-        w.kv_absent = try ks.toOwnedSlice(a);
     }
 
     // ── recorded output (for status_match) ──
@@ -256,7 +234,7 @@ test "fromValue: full declarative world" {
         \\    "body": { "item": "book" }, "ip": "203.0.113.7"
         \\  },
         \\  "kv": { "user/jess": { "name": "Jess" }, "config/rate": "10" },
-        \\  "seed": 123, "now_ms": 1700000000000, "missPolicy": "fail"
+        \\  "seed": 123, "now_ms": 1700000000000
         \\}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
@@ -267,7 +245,6 @@ test "fromValue: full declarative world" {
     try testing.expectEqualStrings("/api/orders", w.path);
     try testing.expectEqualStrings("shop.example", w.host);
     try testing.expectEqualStrings("203.0.113.7", w.ip.?);
-    try testing.expectEqual(host.MissPolicy.fail, w.miss);
     try testing.expectEqual(@as(u64, 123), w.seed);
     try testing.expectEqual(@as(u64, 1700000000000), w.now_ms);
     // object body got JSON-stringified
@@ -329,7 +306,6 @@ test "fromValue: defaults + resolve policy" {
     try testing.expectEqualStrings("index.mjs", w.entry);
     try testing.expectEqualStrings("inbound", w.activation);
     try testing.expectEqualStrings("GET", w.method);
-    try testing.expectEqual(host.MissPolicy.resolve, w.miss);
     try testing.expect(w.body == null);
     try testing.expectEqual(@as(usize, 0), w.kv.len);
 }

@@ -99,7 +99,7 @@ def main():
     cmd = args[0] if args else sys.stdin.read()
     req = parse_curl(cmd)
     world = {"entry": entry, "activation": "inbound", "request": req,
-             "kv": {}, "missPolicy": "resolve", "seed": 0}
+             "kv": {}, "seed": 0}
     if scenario:
         world.update({"kind": "scenario", "fetches": [], "scheduler": {"mode": "seed"}})
     json.dump(world, sys.stdout, indent=2)

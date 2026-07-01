@@ -15,9 +15,9 @@ activation is the one-shot engine's native shape), so this exercises the ACTUAL
 engine, not a mock. Offline: no cluster, no network.
 
     scenario.json:
-      { kind, seed, entry, now_ms, missPolicy,
+      { kind, seed, entry, now_ms,
         request:{method,path,headers,body,ip},   # the inbound activation
-        kv:{...}, kvAbsent:[...],                 # initial state, folded forward
+        kv:{...},                                 # closed-world store, folded forward
         fetches:[ {id, match:{method?,url|urlPrefix|urlRegex},
                    latency_ms, responses:[ {status,body,headers?}, ... ]} ],
         scheduler:{ mode:"seed"|"order"|"fifo", order?:[ "ledger","stripe#1" ] } }
@@ -42,15 +42,13 @@ def match_fetch(fetches, wake):
     return None
 
 
-def synth_world(ev, kv, absent, base):
+def synth_world(ev, kv, base):
     """Build a single-activation world.json for the popped event."""
     w = {
         "entry": base["entry"],
         "seed": base["seed"],
         "now_ms": base["now_ms"],
-        "missPolicy": base["missPolicy"],
-        "kv": kv,
-        "kvAbsent": sorted(absent),
+        "kv": kv,   # closed world — a key not here reads absent
     }
     if ev["kind"] == "inbound":
         w["activation"] = "inbound"
@@ -75,7 +73,7 @@ def run_activation(rewind_bin, world, source_dir):
         json.dump(world, tf)
         wp = tf.name
     try:
-        cmd = [rewind_bin, "sim", wp, "--miss-policy", world["missPolicy"]]
+        cmd = [rewind_bin, "sim", wp]
         if source_dir:
             cmd += ["--source-dir", source_dir]
         p = subprocess.run(cmd, capture_output=True, text=True)
@@ -125,12 +123,11 @@ class Scheduler:
 
 def drive(scenario, rewind_bin, source_dir):
     base = {k: scenario.get(k, d) for k, d in
-            (("entry", "index.mjs"), ("seed", 0), ("now_ms", 0), ("missPolicy", "resolve"))}
+            (("entry", "index.mjs"), ("seed", 0), ("now_ms", 0))}
     base["request"] = scenario.get("request", {"method": "GET", "path": "/"})
     fetches = scenario.get("fetches", [])
     attempts = {}                       # fetch id -> next response index (retry sequencing)
-    kv = dict(scenario.get("kv", {}))   # the overlay, folded forward
-    absent = set(scenario.get("kvAbsent", []))
+    kv = dict(scenario.get("kv", {}))   # the closed-world store, folded forward
     sched = Scheduler(scenario.get("scheduler", {}), base["seed"], base["now_ms"])
 
     trace, sends, unmatched, delivery_order = [], [], [], []
@@ -140,17 +137,17 @@ def drive(scenario, rewind_bin, source_dir):
 
     while (ev := sched.pop()) is not None:
         delivery_order.append(ev["id"])
-        out = run_activation(rewind_bin, synth_world(ev, kv, absent, base), source_dir)
+        out = run_activation(rewind_bin, synth_world(ev, kv, base), source_dir)
         # The activation's EFFECT LOG — one ordered list (occurrence order) of
         # reads / writes / cmds. Everything below reads from it.
         effects = out.get("effects", [])
 
-        # 1. fold writes/deletes into the overlay (→ read-your-writes across acts)
+        # 1. fold writes/deletes into the closed-world store (read-your-writes)
         for e in effects:
             if e["kind"] == "write":
-                kv[e["key"]] = e["value"]; absent.discard(e["key"])
+                kv[e["key"]] = e["value"]
             elif e["kind"] == "delete":
-                kv.pop(e["key"], None); absent.add(e["key"])
+                kv.pop(e["key"], None)
 
         # 2. each emitted fetch → match a response → enqueue a resume (or unmatched)
         for e in effects:

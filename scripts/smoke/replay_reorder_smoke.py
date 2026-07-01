@@ -7,10 +7,10 @@ Asserts:
   1. Reordering two INDEPENDENT reads (recorded a,b; replayed b,a) does NOT
      diverge — the false negative the ordered cursor produced. Both keys resolve
      by key; the JS behaves the same.
-  2. A genuinely NEW read (a key the recording never captured) DOES diverge
-     under the default fail miss-policy — the honest "your code went somewhere
-     the recording doesn't cover" signal.
-  3. The same new read is best-effort (not_found) under --miss-policy resolve.
+  2. A genuinely NEW read (a key the recording never captured) resolves to
+     not_found (closed world) and surfaces in the effect log as a read with
+     present:false — the honest "your code read something the world doesn't
+     have" signal, visible rather than a hard divergence.
 """
 
 from __future__ import annotations
@@ -76,10 +76,8 @@ def _export_to_world(fixture: str) -> str:
     return f.name
 
 
-def _replay(world: str, srcdir: str, miss: str | None = None) -> dict:
+def _replay(world: str, srcdir: str) -> dict:
     cmd = [str(REWIND_BIN), "replay", world, "--source-dir", srcdir]
-    if miss:
-        cmd += ["--miss-policy", miss]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     raw = (p.stdout or "") + (p.stderr or "")
     for ln in raw.splitlines():
@@ -112,20 +110,19 @@ def main() -> int:
           art.get("divergence") is None and res == '{"a":"1","b":"2"}',
           f"div={art.get('divergence')!r} result={res!r}")
 
-    # 2. New read (key 'c', never recorded) — must diverge under fail (default).
+    # 2. New read (key 'c', never recorded) — closed world: resolves to
+    #    not_found (null), no divergence, and surfaces in the effect log as a
+    #    read with present:false (the honest "your code read something the world
+    #    doesn't have" signal — visible, not a hard divergence).
     newkey = 'export default function(){ const a=kv.get("a"); const c=kv.get("c"); return JSON.stringify({a,c}); }'
-    d = _srcdir(newkey)
-    art = _replay(world, d)
-    check("a genuinely new read diverges (miss-policy fail)",
-          art.get("divergence") is not None,
-          f"div={art.get('divergence')!r}")
-
-    # 3. Same new read is best-effort under resolve.
-    art = _replay(world, d, miss="resolve")
+    art = _replay(world, _srcdir(newkey))
     res = art.get("body")
-    check("the new read resolves to not_found under --miss-policy resolve",
-          art.get("divergence") is None and res == '{"a":"1","c":null}',
-          f"div={art.get('divergence')!r} result={res!r}")
+    read_c = next((e for e in art.get("effects", [])
+                   if e.get("kind") == "read" and e.get("key") == "c"), None)
+    check("a new read resolves to not_found (closed world) and shows in the effects",
+          art.get("divergence") is None and res == '{"a":"1","c":null}'
+          and read_c is not None and read_c.get("present") is False,
+          f"div={art.get('divergence')!r} result={res!r} read_c={read_c!r}")
 
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")

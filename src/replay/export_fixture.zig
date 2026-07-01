@@ -8,12 +8,12 @@
 //! A recording and an authored world are the same world, differently sourced
 //! (§1), so this is a transcode, not a re-run. The non-obvious part is the KV
 //! channel: the recording is an **ordered cursor** of reads (get/prefix +
-//! outcome), but a declarative world is a **key→value map** + an explicit
-//! absent set. The map seeds only the *initial* value per key (the first taped
-//! read); read-modify-read is reproduced by the sim host's write-through
-//! overlay, and recorded `not_found` reads become `kvAbsent` so a
-//! `missPolicy:"fail"` sim reproduces the recording exactly — any *new* read
-//! the original code never made then diverges (the regression-test sweet spot).
+//! outcome), but a declarative world is a **closed-world key→value map**. The
+//! map seeds the *initial* value per key (the first taped read) and the rows a
+//! prefix scan returned; read-modify-read is reproduced by the sim host's
+//! write-through overlay. A recorded `not_found` read is simply omitted — the
+//! key isn't in the map, so replay resolves it to not_found (a *new* read the
+//! original never made surfaces the same way, visible in the effect log).
 //!
 //! Scope: faithful for `inbound` activations. The pulled fixture carries only
 //! the kv / request_reads / request_body channels, so a non-inbound activation
@@ -94,21 +94,20 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     const seed = jStr(obj, "seed");
     const ts_ns = jStr(obj, "timestamp_ns");
 
-    // ── KV: get → initial-snapshot map / absent; prefix → seed the map with the
-    // returned rows (so a replay-time re-scan finds them). No exact-rows are
-    // kept: replay reconstructs the scan from the map (+ the handler's own
-    // re-executed writes), honoring cursor/limit. ──
+    // ── KV: get(ok) → seed the map; prefix → seed the map with the returned
+    // rows (so a replay-time re-scan finds them). Closed world: a not_found read
+    // is simply omitted (the key isn't in the map → not_found on replay). No
+    // exact prefix-rows are kept: replay reconstructs the scan from the map
+    // (+ the handler's own re-executed writes), honoring cursor/limit. ──
     var seen = std.StringHashMapUnmanaged(void){};
     var kv = std.ArrayList(KvPair){};
-    var absent = std.ArrayList([]const u8){};
     for (kv_entries) |e| switch (e.op) {
         .get => {
             if (seen.contains(e.key)) continue; // re-read / post-write — overlay reproduces it
             try seen.put(a, e.key, {});
             switch (e.outcome) {
                 .ok => try kv.append(a, .{ .key = e.key, .value = e.value }),
-                .not_found => try absent.append(a, e.key),
-                .err => {},
+                .not_found, .err => {}, // omit — closed world resolves to not_found
             }
         },
         .prefix => {
@@ -184,7 +183,7 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         try w.writeAll(",\n  \"export\": ");
         try jsonStr(w, e);
     }
-    try w.writeAll(",\n  \"missPolicy\": \"fail\",\n  \"request\": {\n    \"method\": ");
+    try w.writeAll(",\n  \"request\": {\n    \"method\": ");
     try jsonStr(w, method);
     try w.writeAll(", \"path\": ");
     try jsonStr(w, path);
@@ -243,15 +242,6 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         try jsonStr(w, p.value);
     }
     try w.writeAll(if (kv.items.len != 0) "\n  }" else "}");
-    if (absent.items.len != 0) {
-        try w.writeAll(",\n  \"kvAbsent\": [");
-        for (absent.items, 0..) |k, i| {
-            if (i != 0) try w.writeByte(',');
-            try w.writeAll(" ");
-            try jsonStr(w, k);
-        }
-        try w.writeAll(" ]");
-    }
     if (recorded) |r| {
         try w.writeAll(",\n  \"recorded\": {\"status\": ");
         if (r.get("status")) |sv| (if (sv == .integer) try w.print("{d}", .{sv.integer}) else try w.writeAll("null")) else try w.writeAll("null");
@@ -363,7 +353,7 @@ fn putLen(buf: *std.ArrayList(u8), a: std.mem.Allocator, s: []const u8) !void {
     try buf.appendSlice(a, s);
 }
 
-test "transcode: kv reads → map + kvAbsent; not-found becomes absent" {
+test "transcode: kv reads → closed-world map; not-found is omitted" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -387,15 +377,14 @@ test "transcode: kv reads → map + kvAbsent; not-found becomes absent" {
     // round-trip-parse the emitted world and assert the transcode
     const wp = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
     const wo = wp.value.object;
-    try testing.expectEqualStrings("fail", wo.get("missPolicy").?.string);
+    // no missPolicy / kvAbsent — closed world
+    try testing.expect(wo.get("missPolicy") == null);
+    try testing.expect(wo.get("kvAbsent") == null);
     // kv: the FIRST value for user/jess, not the re-read
     const kvm = wo.get("kv").?.object;
     try testing.expectEqualStrings("{\"n\":1}", kvm.get("user/jess").?.string);
+    // the not-found read is simply omitted (absent from the map → not_found)
     try testing.expect(kvm.get("user/ghost") == null);
-    // kvAbsent holds the not-found read
-    const ka = wo.get("kvAbsent").?.array;
-    try testing.expectEqual(@as(usize, 1), ka.items.len);
-    try testing.expectEqualStrings("user/ghost", ka.items[0].string);
     try testing.expectEqual(@as(i64, 42), wo.get("seed").?.integer);
     try testing.expectEqual(@as(i64, 1700000000000), wo.get("now_ms").?.integer);
 }

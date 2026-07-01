@@ -59,7 +59,7 @@ fn runInbound(a: std.mem.Allocator) !void {
     world = aw.toArrayList();
 
     var out = std.ArrayList(u8){};
-    try root.runWorld(a, world.items, null, .fail, &out);
+    try root.runWorld(a, world.items, null, &out);
     const stdout = std.fs.File.stdout();
     try stdout.writeAll(out.items);
     try stdout.writeAll("\n");
@@ -83,7 +83,7 @@ fn runFetchChunk(a: std.mem.Allocator) !void {
     world = aw.toArrayList();
 
     var out = std.ArrayList(u8){};
-    try root.runWorld(a, world.items, null, .fail, &out);
+    try root.runWorld(a, world.items, null, &out);
     const stdout = std.fs.File.stdout();
     try stdout.writeAll("FETCH_CHUNK: ");
     try stdout.writeAll(out.items);

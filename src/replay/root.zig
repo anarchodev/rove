@@ -1,14 +1,14 @@
-//! The ONE replay/sim engine — `runWorld(world, code, on-miss)`. Both `rewind
-//! replay` (default on-miss=fail) and `rewind sim` (default on-miss=resolve)
-//! call it over the SAME declarative `world.json` (`world.zig`): the request
-//! surface, a key→value KV map (+ `kvAbsent`, + recorded `kvPrefix` results),
-//! ctx, the flattened fetch/callback result, the resolved export, seed, and
-//! optionally the `recorded` output. KV reads resolve BY KEY with a write-
-//! through overlay (order-independent — `replay-and-sim.md` §1); faithfulness is
-//! the output-level `status_match`, not a per-read check. It emits one LLM-JSON
-//! bundle: the run's response / result / console / effects, the write-set, typed
-//! `holes` (resolve), and the recorded comparison. No Node/WASM/network — the
-//! arenajs engine is linked in.
+//! The ONE replay/sim engine — `runWorld(world, code)`. Both `rewind replay`
+//! and `rewind sim` call it over the SAME declarative `world.json` (`world.zig`):
+//! the request surface, a **closed-world** key→value KV map, ctx, the flattened
+//! fetch/callback result, the resolved export, seed, and optionally the
+//! `recorded` output. KV reads resolve BY KEY with a write-through overlay
+//! (order-independent — `replay-and-sim.md` §1); a key not in the map is
+//! `not_found`, never a divergence. Faithfulness is the output-level
+//! `status_match` + the ordered effect log, not a per-read check. It emits one
+//! LLM-JSON bundle: the response head, disposition, body/ctx, the ordered
+//! `effects`, and the recorded comparison. No Node/WASM/network — the arenajs
+//! engine is linked in.
 //!
 //! `runWorld` is one-shot: arena_init installs process-global engine state, so a
 //! CLI invocation runs exactly one activation (which is the whole use case).
@@ -37,11 +37,6 @@ extern fn arena_set_trace_mode(mode: c_int) void;
 extern fn arena_set_date_now(lo: u32, hi: u32) void;
 extern fn arena_set_random_seed(lo: u32, hi: u32) void;
 
-/// The on-miss policy a declarative `runWorld` runs under — the replay↔sim
-/// axis. Re-exported so CLI callers can pass `--miss-policy` without importing
-/// the host internals.
-pub const MissPolicy = hostmod.MissPolicy;
-
 pub const Error = error{
     BadFixture,
     EntrySourceMissing,
@@ -52,24 +47,21 @@ pub const Error = error{
 
 
 /// Run a **declarative** world (an *authored* fixture, not a captured tape) —
-/// the sim corner of the one engine. KV reads resolve order-independently
-/// against the world's key→value map; `miss_override` (when set) forces the
-/// on-miss policy, else the world's `missPolicy` is used (`fail` = refuse to
-/// invent / `resolve` = answer not_found + record a typed hole). The request
-/// surface is rebuilt by synthesizing `request_reads` entries from the declared
-/// request, so the SAME epilogue serves it — undeclared header reads are
-/// naturally `undefined` (resolve), declared ones serve their value.
+/// the one engine. KV reads resolve order-independently against the world's
+/// key→value map — a **closed world**: a key not in the map is `not_found`
+/// (never a divergence). Faithfulness lives at the output (`status_match`) + the
+/// effect log, not per-read. The request surface is rebuilt by synthesizing
+/// `request_reads` entries from the declared request, so the SAME epilogue
+/// serves it — undeclared header reads are naturally `undefined`.
 pub fn runWorld(
     a: std.mem.Allocator,
     world_json: []const u8,
     source_dir: ?[]const u8,
-    miss_override: ?hostmod.MissPolicy,
     out: *std.ArrayList(u8),
 ) Error!void {
     const parsed = std.json.parseFromSlice(std.json.Value, a, world_json, .{}) catch
         return Error.BadFixture;
     const wv = world.fromValue(a, parsed.value) catch return Error.BadFixture;
-    const miss = miss_override orelse wv.miss;
 
     // ── synthesize request_reads from the declared request ──
     var reads = std.ArrayList(decode.RequestReadEntry){};
@@ -97,8 +89,6 @@ pub fn runWorld(
     // ── kv readset → map (+ the explicitly-absent set) ──
     var kv_map = std.StringHashMapUnmanaged([]const u8){};
     for (wv.kv) |p| try kv_map.put(a, p.key, p.value);
-    var kv_absent = std.StringHashMapUnmanaged(void){};
-    for (wv.kv_absent) |k| try kv_absent.put(a, k, {});
 
     // ── module sources (inline) ──
     var sources = std.StringHashMapUnmanaged([]const u8){};
@@ -149,8 +139,6 @@ pub fn runWorld(
         .mode = .map,
         .kv = &.{},
         .kv_map = kv_map,
-        .absent = kv_absent,
-        .miss = miss,
         .sources = sources,
         .source_dir = source_dir,
     };
@@ -167,11 +155,9 @@ pub fn runWorld(
         .entry = wv.entry,
         .activation = wv.activation,
         .export_name = export_name,
-        .miss = miss,
         .rc = rc,
         .divergence = host.diverged,
         .writes = host.writes.items,
-        .holes = host.holes.items,
         .run_json = host.output,
         .recorded = wv.recorded,
     });
@@ -183,14 +169,11 @@ const EmitWorldArgs = struct {
     entry: []const u8,
     activation: []const u8,
     export_name: []const u8,
-    miss: hostmod.MissPolicy,
     rc: c_int,
     divergence: ?[]const u8,
     writes: []const hostmod.KvWrite,
-    holes: []const hostmod.Hole,
     /// The run's parked output (response/result/error/console), or null when the
-    /// run died before the epilogue captured it (e.g. a fail-policy divergence
-    /// or a syntax error).
+    /// run died before the epilogue captured it (e.g. a syntax error).
     run_json: ?[]const u8,
     /// The recorded output, when this world came from a capture — drives the
     /// output-level faithfulness check (`status_match`).
