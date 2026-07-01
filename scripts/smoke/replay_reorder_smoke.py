@@ -84,7 +84,7 @@ def _replay(world: str, srcdir: str, miss: str | None = None) -> dict:
     raw = (p.stdout or "") + (p.stderr or "")
     for ln in raw.splitlines():
         ln = ln.strip()
-        if ln.startswith("{") and '"run_rc"' in ln:
+        if ln.startswith("{") and '"effects"' in ln:
             return json.loads(ln)
     raise SystemExit(f"no artifact:\n{raw[:400]}")
 
@@ -107,7 +107,7 @@ def main() -> int:
     # 1. Reordered reads (b then a) — must NOT diverge.
     reordered = 'export default function(){ const b=kv.get("b"); const a=kv.get("a"); return JSON.stringify({a,b}); }'
     art = _replay(world, _srcdir(reordered))
-    res = (art.get("run") or {}).get("result")
+    res = art.get("body")
     check("reordered independent reads do not diverge",
           art.get("divergence") is None and res == '{"a":"1","b":"2"}',
           f"div={art.get('divergence')!r} result={res!r}")
@@ -122,7 +122,7 @@ def main() -> int:
 
     # 3. Same new read is best-effort under resolve.
     art = _replay(world, d, miss="resolve")
-    res = (art.get("run") or {}).get("result")
+    res = art.get("body")
     check("the new read resolves to not_found under --miss-policy resolve",
           art.get("divergence") is None and res == '{"a":"1","c":null}',
           f"div={art.get('divergence')!r} result={res!r}")

@@ -202,9 +202,12 @@ const quotedOutputKey = "\"" ++ host.OUTPUT_KEY ++ "\"";
 
 const EPILOGUE_BODY =
     \\  const miss = (what) => { throw new Error("REPLAY DIVERGENCE: " + what + " was read by the handler but is not on the capture tape — the handler observed an input the original run never read"); };
-    \\  const __logs = [];
-    \\  const __sink = (...a) => { __logs.push(a.map((x) => { try { return typeof x === "string" ? x : JSON.stringify(x); } catch (_) { return String(x); } }).join(" ")); };
-    \\  globalThis.console = { log: __sink, warn: __sink, error: __sink, info: __sink, debug: __sink };
+    \\  // One ordered effect log for the whole activation (reads/writes/cmds — see
+    \\  // the shims below). console.* lands here too, as {kind:"log"}, so the
+    \\  // developer's own log lines stay INTERLEAVED with the effects they annotate.
+    \\  const __effects = [];
+    \\  const __mklog = (level) => (...a) => { __effects.push({ kind: "log", level, message: a.map((x) => { try { return typeof x === "string" ? x : JSON.stringify(x); } catch (_) { return String(x); } }).join(" ") }); };
+    \\  globalThis.console = { log: __mklog("info"), warn: __mklog("warn"), error: __mklog("error"), info: __mklog("info"), debug: __mklog("debug") };
     \\  const headers = {};
     \\  for (const n of D.names) Object.defineProperty(headers, n, {
     \\    enumerable: true, configurable: true,
@@ -278,21 +281,30 @@ const EPILOGUE_BODY =
     \\    globalThis.TextEncoder = function () {};
     \\    globalThis.TextEncoder.prototype.encode = function (s) { s = String(s); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i) & 0xff; return u; };
     \\  }
-    \\  const __stream = [];
-    \\  globalThis.stream = { start() {}, write(c) { __stream.push(__b2s(c)); } };
-    \\  const __wakes = [];
+    \\  // Effect shims — each appends to the shared __effects log in call order, so
+    \\  // reads/writes/cmds/logs interleave as the handler performed them. Filter by
+    \\  // `kind` to recover a typed view.
+    \\  globalThis.stream = { start() {}, write(c) { __effects.push({ kind: "stream", bytes: __b2s(c).length }); } };
     \\  globalThis.on = {
-    \\    fetch(url, opts, to) { __wakes.push({ kind: "fetch", url, to: (to && to.to) || (opts && opts.to) || null }); },
-    \\    kv(prefix, to) { __wakes.push({ kind: "kv", prefix, to: (to && to.to) || null }); },
-    \\    timer(ms, to) { __wakes.push({ kind: "timer", ms, to: (to && to.to) || null }); },
+    \\    fetch(url, opts, to) { __effects.push({ kind: "fetch", url, method: (opts && opts.method) || "GET", body: (opts && opts.body !== undefined) ? opts.body : null, ctx: (opts && opts.ctx !== undefined) ? opts.ctx : ((to && to.ctx !== undefined) ? to.ctx : null), to: (to && to.to) || (opts && opts.to) || null }); },
+    \\    kv(prefix, to) { __effects.push({ kind: "kv-wake", prefix, to: (to && to.to) || null }); },
+    \\    timer(ms, to) { __effects.push({ kind: "timer", ms, to: (to && to.to) || null }); },
     \\  };
-    \\  const __sends = [];
-    \\  globalThis.webhook = { send(url, opts) { __sends.push({ kind: "webhook", url, onResult: (opts && opts.onResult) || null }); } };
-    \\  globalThis.email = { send(opts) { __sends.push({ kind: "email", to: (opts && opts.to) || null }); } };
-    \\  globalThis.schedule = (when, target) => { __sends.push({ kind: "schedule", when, target: target || null }); };
-    \\  globalThis.cron = (spec, target) => { __sends.push({ kind: "cron", spec, target: target || null }); };
+    \\  globalThis.webhook = { send(url, opts) { __effects.push({ kind: "webhook", url, onResult: (opts && opts.onResult) || null }); } };
+    \\  globalThis.email = { send(opts) { __effects.push({ kind: "email", to: (opts && opts.to) || null }); } };
+    \\  globalThis.schedule = (when, target) => { __effects.push({ kind: "schedule", when, target: target || null }); };
+    \\  globalThis.cron = (spec, target) => { __effects.push({ kind: "cron", spec, target: target || null }); };
     \\  globalThis.blob = { get() {}, put() {}, receive() {}, seal() {} };
     \\  globalThis.next = (ctx) => ({ __rove_disposition: "next", ctx: ctx === undefined ? null : ctx });
+    \\  // Wrap the native kv so reads/writes interleave with the cmds above in true
+    \\  // occurrence order. Restored before the OUTPUT_KEY write (which stays native).
+    \\  const __kvNative = globalThis.kv;
+    \\  globalThis.kv = {
+    \\    get(k) { const v = __kvNative.get(k); __effects.push({ kind: "read", key: k, present: v !== undefined && v !== null }); return v; },
+    \\    set(k, val) { __effects.push({ kind: "write", key: k, value: val }); return __kvNative.set(k, val); },
+    \\    delete(k) { __effects.push({ kind: "delete", key: k }); return __kvNative.delete(k); },
+    \\    prefix(p, opts) { const r = __kvNative.prefix(p, opts); __effects.push({ kind: "read", op: "prefix", key: p, present: true }); return r; },
+    \\  };
     \\  if (typeof request.tag !== "function") request.tag = function () { return request; };
     \\  globalThis.request = request;
     \\  globalThis.response = { status: 200, headers: {}, cookies: [] };
@@ -305,11 +317,12 @@ const EPILOGUE_BODY =
     \\  } catch (e) {
     \\    __err = { message: String((e && e.message) || e), stack: String((e && e.stack) || "") };
     \\  }
+    \\  globalThis.kv = __kvNative;   // restore before the native OUTPUT_KEY write
     \\  let __out;
     \\  try {
-    \\    __out = JSON.stringify({ response: globalThis.response, result: __result, error: __err, console: __logs, stream: __stream, wakes: __wakes, sends: __sends });
+    \\    __out = JSON.stringify({ response: globalThis.response, result: __result, error: __err, effects: __effects });
     \\  } catch (e) {
-    \\    __out = JSON.stringify({ response: null, result: null, console: __logs, stream: __stream, wakes: __wakes, sends: __sends,
+    \\    __out = JSON.stringify({ response: null, result: null, effects: __effects,
     \\      error: { message: "replay result not JSON-serialisable: " + String((e && e.message) || e), stack: "" } });
     \\  }
     \\

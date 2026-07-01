@@ -1,0 +1,20 @@
+{
+  "kind": "scenario",
+  "seed": 7,
+  "entry": "handler.mjs",
+  "now_ms": 1700000000000,
+  "missPolicy": "resolve",
+  "request": { "method": "POST", "path": "/checkout", "body": { "id": "c_1", "total": 4200 } },
+  "kv": {},
+  "fetches": [
+    { "id": "stripe",
+      "match": { "method": "POST", "url": "https://api.stripe.com/v1/charges" },
+      "latency_ms": 60,
+      "responses": [ { "status": 200, "body": { "id": "ch_1", "paid": true } } ] },
+    { "id": "ledger",
+      "match": { "urlPrefix": "https://ledger.internal/" },
+      "latency_ms": 60,
+      "responses": [ { "status": 200, "body": { "seq": 991 } } ] }
+  ],
+  "scheduler": { "mode": "seed" }
+}

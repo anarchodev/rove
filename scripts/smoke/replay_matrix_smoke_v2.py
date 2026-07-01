@@ -116,7 +116,7 @@ def replay(rec, tenant, activation, source):
     proc = subprocess.run([str(REWIND_BIN), "replay", world_path], capture_output=True, text=True, timeout=30)
     raw = (proc.stdout or "") + (proc.stderr or "")
     return next((json.loads(ln) for ln in raw.splitlines()
-                 if ln.strip().startswith("{") and '"run_rc"' in ln), None)
+                 if ln.strip().startswith("{") and '"effects"' in ln), None)
 
 
 def main() -> int:
@@ -140,7 +140,7 @@ def main() -> int:
         rec = find_record(c, "inb", "inbound")
         art = replay(rec, "inb", "inbound", INBOUND_SRC) if rec else None
         check("[inbound] replay reproduces request.query",
-              art and art.get("divergence") is None and (art.get("run") or {}).get("result") == "inbound-ok:probe=42",
+              art and art.get("divergence") is None and art.get("body") == "inbound-ok:probe=42",
               f"art={json.dumps(art)[:200] if art else None}")
 
         # ── fetch_chunk ──
@@ -152,7 +152,7 @@ def main() -> int:
         art = replay(rec, "fch", "fetch_chunk", FETCH_SRC) if rec else None
         summ = {}
         try:
-            summ = json.loads((art.get("run") or {}).get("result") or "{}") if art else {}
+            summ = json.loads(art.get("body") or "{}") if art else {}
         except (json.JSONDecodeError, TypeError):
             pass
         check("[fetch_chunk+G3] replay uses recorded {to} export, reproduces body+status",
@@ -173,7 +173,7 @@ def main() -> int:
             pass
         rec = find_record(c, "wsm", "ws_message")
         art = replay(rec, "wsm", "ws_message", WS_SRC) if rec else None
-        writes = (art.get("kv_writes") if art else None) or []
+        writes = [e for e in ((art.get("effects") if art else None) or []) if e.get("kind") == "write"]
         last = next((w for w in writes if w.get("key") == "last_frame"), None)
         check("[ws_message] replay reproduces request.activation.data",
               art and art.get("divergence") is None and last and last.get("value") == "hello-ws",

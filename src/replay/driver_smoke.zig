@@ -64,8 +64,8 @@ fn runInbound(a: std.mem.Allocator) !void {
     try stdout.writeAll(out.items);
     try stdout.writeAll("\n");
     check(out.items, &.{
-        "\"status_match\":true", "\"op\":\"set\"", "\"key\":\"seen\"",
-        "\"value\":\"ada\"", "hello ada", "\"divergence\":null",
+        "\"status_match\":true", "\"kind\":\"write\"", "\"key\":\"seen\"",
+        "\"value\":\"ada\"", "hello ada", "\"ok\":true",
     }, "DRIVER SMOKE");
 }
 
@@ -90,7 +90,7 @@ fn runFetchChunk(a: std.mem.Allocator) !void {
     try stdout.writeAll("\n");
     check(out.items, &.{
         "\"upstreamStatus\":502", "\"ctxAttempt\":2", "\"bodyLen\":4",
-        "\"done\":true", "\"divergence\":null",
+        "\"done\":true", "\"ok\":true",
     }, "FETCH_CHUNK SCENARIO");
 }
 

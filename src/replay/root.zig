@@ -213,59 +213,84 @@ fn emitWorld(a: std.mem.Allocator, out: *std.ArrayList(u8), args: EmitWorldArgs)
     defer out.* = aw.toArrayList();
     const w = &aw.writer;
 
-    try w.writeAll("{\"mode\":\"sim\",\"entry\":");
-    try jsonStr(w, args.entry);
-    try w.writeAll(",\"activation\":");
+    // Parse the JS run output so we can flatten it to the clean effect-log shape
+    // (one `response` head + `disposition` + an ordered `effects` list) instead
+    // of leaking the raw response/result/effects nesting.
+    var run: ?std.json.ObjectMap = null;
+    if (args.run_json) |rj| {
+        const p = std.json.parseFromSlice(std.json.Value, a, rj, .{}) catch null;
+        if (p) |pp| {
+            if (pp.value == .object) run = pp.value.object;
+        }
+    }
+
+    try w.writeAll("{\"activation\":");
     try jsonStr(w, args.activation);
     try w.writeAll(",\"export\":");
     try jsonStr(w, args.export_name);
-    try w.writeAll(",\"miss_policy\":");
-    try jsonStr(w, @tagName(args.miss));
-    try w.print(",\"run_rc\":{d},\"divergence\":", .{args.rc});
-    try optStr(w, args.divergence);
 
-    // kv writes the handler produced.
-    try w.writeAll(",\"kv_writes\":[");
-    for (args.writes, 0..) |wr, i| {
-        if (i != 0) try w.writeByte(',');
-        try w.writeAll("{\"op\":");
-        try jsonStr(w, @tagName(wr.op));
-        try w.writeAll(",\"key\":");
-        try jsonStr(w, wr.key);
-        if (wr.op == .set) {
-            try w.writeAll(",\"value\":");
-            try jsonStr(w, wr.value);
+    // response HEAD — status / headers / cookies — the ambient `response` global
+    // (matches the engine's dispatcher.extractResponseMetadata).
+    try w.writeAll(",\"response\":");
+    if (run) |r| {
+        if (r.get("response")) |rv| try std.json.Stringify.value(rv, .{}, w) else try w.writeAll("null");
+    } else try w.writeAll("null");
+
+    // disposition + body/ctx — from the RETURN value: a terminal body (commit +
+    // close) or `next({ctx})` (hold the connection). handler-shape §2.1.
+    var held = false;
+    var ctx_val: ?std.json.Value = null;
+    var body_val: ?std.json.Value = null;
+    if (run) |r| {
+        if (r.get("result")) |res| {
+            if (res == .object) {
+                if (res.object.get("__rove_disposition")) |disp| {
+                    if (disp == .string and std.mem.eql(u8, disp.string, "next")) {
+                        held = true;
+                        ctx_val = res.object.get("ctx");
+                    }
+                }
+            }
+            if (!held) body_val = res;
         }
-        try w.writeByte('}');
     }
-    try w.writeByte(']');
-
-    // typed holes — reads the declared world didn't supply (resolve mode).
-    try w.writeAll(",\"holes\":[");
-    for (args.holes, 0..) |hole, i| {
-        if (i != 0) try w.writeByte(',');
-        try w.writeAll("{\"op\":");
-        try jsonStr(w, @tagName(hole.op));
-        try w.writeAll(",\"key\":");
-        try jsonStr(w, hole.key);
-        try w.writeByte('}');
-    }
-    try w.writeByte(']');
-
-    // the run output (response / result / error / console), or null + ok=false
-    // when the run died before capture (e.g. a fail-policy divergence).
-    const replayed_status: ?i64 = if (args.run_json) |rj| statusOf(a, rj) else null;
-    if (args.run_json) |rj| {
-        try w.writeAll(",\"run\":");
-        try w.writeAll(rj);
-        try w.writeAll(",\"ok\":true");
+    try w.writeAll(",\"disposition\":");
+    try jsonStr(w, if (held) "held" else "terminal");
+    if (held) {
+        try w.writeAll(",\"ctx\":");
+        if (ctx_val) |cv| try std.json.Stringify.value(cv, .{}, w) else try w.writeAll("null");
     } else {
-        try w.writeAll(",\"run\":null,\"ok\":false,\"error\":\"the run produced no output (it failed before the handler completed — see divergence / run_rc; a fail miss-policy on an under-specified world lands here)\"");
+        try w.writeAll(",\"body\":");
+        if (body_val) |bv| {
+            if (bv == .null) try w.writeAll("null") else try std.json.Stringify.value(bv, .{}, w);
+        } else try w.writeAll("null");
     }
 
-    // Output-level faithfulness — when the world carries a recording, compare
-    // the re-run's observable status to the recorded one (`replay-and-sim.md`
-    // §1: faithfulness lives at the output, not per-read).
+    // effects — ONE ordered log (occurrence order), built in the epilogue: reads,
+    // writes, and cmds interleaved as the handler performed them.
+    try w.writeAll(",\"effects\":");
+    if (run) |r| {
+        if (r.get("effects")) |ev| try std.json.Stringify.value(ev, .{}, w) else try w.writeAll("[]");
+    } else try w.writeAll("[]");
+
+    try w.writeAll(",\"error\":");
+    if (run) |r| {
+        if (r.get("error")) |ev| {
+            if (ev == .null) try w.writeAll("null") else try std.json.Stringify.value(ev, .{}, w);
+        } else try w.writeAll("null");
+    } else try w.writeAll("{\"message\":\"the run produced no output — it failed before the handler completed (see divergence)\"}");
+
+    const ok_run = args.run_json != null and args.divergence == null;
+    try w.print(",\"ok\":{s}", .{if (ok_run) "true" else "false"});
+
+    // divergence — only when present (replay/fail signal; absent in a clean sim).
+    if (args.divergence) |d| {
+        try w.writeAll(",\"divergence\":");
+        try jsonStr(w, d);
+    }
+
+    // Output-level faithfulness — when the world carries a recording (replay).
+    const replayed_status: ?i64 = if (args.run_json) |rj| statusOf(a, rj) else null;
     if (args.recorded) |rec| {
         try w.writeAll(",\"recorded\":{\"status\":");
         if (rec.status) |s| try w.print("{d}", .{s}) else try w.writeAll("null");

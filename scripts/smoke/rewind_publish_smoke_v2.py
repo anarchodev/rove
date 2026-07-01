@@ -429,15 +429,16 @@ def main() -> int:
             except (json.JSONDecodeError, ValueError):
                 art = {}
             rec_console = (art.get("recorded") or {}).get("console", "")
-            rep_console = " ".join(art.get("replay", {}).get("console", []))
-            kv_writes = art.get("kv_writes", [])
-            wrote_hits = any(w.get("op") == "set" and w.get("key") == "hits" for w in kv_writes)
+            effects = art.get("effects", [])
+            rep_console = " ".join(e.get("message", "") for e in effects if e.get("kind") == "log")
+            writes = [e for e in effects if e.get("kind") == "write"]
+            wrote_hits = any(w.get("key") == "hits" for w in writes)
             check("rewind replay reproduces the run (no divergence)",
                   r.returncode == 0 and art.get("divergence") is None, r.stdout[:400])
             check("replay reproduces the recorded console",
                   rec_console.strip() != "" and rec_console.strip() == rep_console.strip(),
                   f"recorded={rec_console!r} replay={rep_console!r}")
-            check("replay reproduces the kv write-set (hits set)", wrote_hits, str(kv_writes)[:200])
+            check("replay reproduces the kv write-set (hits set)", wrote_hits, str(writes)[:200])
             check("replay status matches the recording", art.get("status_match") is True,
                   f"replayed={art.get('replayed_status')} match={art.get('status_match')}")
 
