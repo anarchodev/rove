@@ -216,8 +216,10 @@ replay arena~~ **FIXED** — the epilogue now shims `TextDecoder`/`TextEncoder`,
 are captured into the bundle (`stream`/`wakes`/`sends`) rather than fired.
 `stream`/`on`/`next`/`TextDecoder` are fully faithful; `webhook`/`schedule`/
 `cron`/`blob` record but don't re-run their durability shims (their kv markers
-aren't reproduced — the handler's own kv writes are). (c)
-binary WS frames need a `Uint8Array` `request.activation.data` surface. The
+aren't reproduced — the handler's own kv writes are). ~~(c) binary WS frames need
+a `Uint8Array` surface~~ **FIXED** — a binary frame (opcode 2) carries its bytes
+as base64 (`activation.dataB64`); the epilogue rebuilds the `Uint8Array` on
+`request.activation.data` (text frames keep their string). The
 **sim** path (authored worlds) never depended on any of this.
 
 **Update 2026-06-30 (d) — regression guards built.** So this class can't

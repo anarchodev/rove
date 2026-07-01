@@ -245,7 +245,17 @@ const EPILOGUE_BODY =
     \\  // the threaded ctx, the request.activation metadata bag, and the
     \\  // flattened fetch/callback result (request.status/.ok/.done/...).
     \\  if (D.ctx !== null) request.ctx = D.ctx;
-    \\  if (D.activation !== null) request.activation = D.activation;
+    \\  if (D.activation !== null) {
+    \\    // A binary WS frame carries its bytes as base64 → rebuild the
+    \\    // Uint8Array on request.activation.data (a text frame keeps its string).
+    \\    if (D.activation.dataB64 != null) {
+    \\      const bin = atob(D.activation.dataB64);
+    \\      const u = new Uint8Array(bin.length);
+    \\      for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+    \\      D.activation.data = u; delete D.activation.dataB64;
+    \\    }
+    \\    request.activation = D.activation;
+    \\  }
     \\  if (D.result !== null) {
     \\    if (D.result.status !== null) request.status = D.result.status;
     \\    if (D.result.ok !== null) request.ok = D.result.ok;

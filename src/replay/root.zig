@@ -140,11 +140,21 @@ pub fn run(
         if (b64) |s| {
             const ab = try b64decode(a, s);
             if (ab.len >= 1) {
+                const opcode = ab[0];
+                const data = ab[1..];
                 var buf = std.ArrayList(u8){};
                 var aw = std.Io.Writer.Allocating.fromArrayList(a, &buf);
                 const w = &aw.writer;
-                try w.print("{{\"opcode\":{d},\"data\":", .{ab[0]});
-                try jsonStr(w, ab[1..]);
+                // Binary frame (opcode 2) → `request.activation.data` is a
+                // Uint8Array; carry the bytes as base64 and let the epilogue
+                // rebuild the array. Text frame (1) → a decoded string.
+                if (opcode == 2) {
+                    try w.print("{{\"opcode\":{d},\"dataB64\":", .{opcode});
+                    try jsonB64(a, w, data);
+                } else {
+                    try w.print("{{\"opcode\":{d},\"data\":", .{opcode});
+                    try jsonStr(w, data);
+                }
                 try w.writeByte('}');
                 buf = aw.toArrayList();
                 ws_activation_json = buf.items;
@@ -619,6 +629,16 @@ fn jsonStr(w: *std.Io.Writer, s: []const u8) !void {
         else => try w.writeByte(b),
     };
     try w.writeByte('"');
+}
+
+/// Base64-encode `bytes` as a JSON string literal (for binary payloads that
+/// aren't valid UTF-8 — e.g. a binary WS frame's `request.activation.data`).
+fn jsonB64(a: std.mem.Allocator, w: *std.Io.Writer, bytes: []const u8) !void {
+    const enc = std.base64.standard.Encoder;
+    const out = try a.alloc(u8, enc.calcSize(bytes.len));
+    defer a.free(out);
+    _ = enc.encode(out, bytes);
+    try jsonStr(w, out);
 }
 
 test {
