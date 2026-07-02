@@ -2,8 +2,10 @@
 // bundle JSON file (composed by the Python orchestrator from a real
 // captured log record + deployment manifest), boots qjs_arena_wasm,
 // installs Module.tapes / Module.module_sources / Module.host_trace
-// the same way `web/replay/_static/wasm-app.mjs` does, runs the handler in
-// SCAN mode, and prints a one-line JSON summary on stdout.
+// the same way the replay shell's `wasm-app.mjs` does (resolved from
+// $REWIND_APPS_DIR — the porcelain moved to the private rewind-apps repo
+// when `web/` was extracted, commit fecf07b), runs the handler in SCAN
+// mode, and prints a one-line JSON summary on stdout.
 //
 // Exit 0 on rc=0 from arena_run_module; non-zero otherwise. The
 // orchestrator parses the stdout JSON to validate counts.
@@ -13,15 +15,28 @@
 
 import fs from "node:fs";
 import { Buffer } from "node:buffer";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 
-import { buildTapesFromBlobs } from "../web/replay/_static/rtap.mjs";
-import { buildRequestEpilogue } from "../web/replay/_static/request-replay.mjs";
-import getArenaJs from "../web/replay/_static/qjs_arena_wasm.js";
-
 const __filename = fileURLToPath(import.meta.url);
-const repo_root = path.resolve(path.dirname(__filename), "..");
+// scripts/smoke/ → the repo root is two levels up.
+const repo_root = path.resolve(path.dirname(__filename), "..", "..");
+
+// The WASM replay porcelain (rtap / request-replay / qjs_arena_wasm) moved
+// out of this repo when `web/` was extracted into the private rewind-apps
+// repo (commit fecf07b). Resolve it from $REWIND_APPS_DIR — the smoke
+// harness convention (smoke_lib_v2.APPS_DIR) — falling back to an in-repo
+// ./web for an operator who keeps apps in-tree. Dynamic import so the
+// path is resolved at runtime rather than hardcoded at parse time.
+const apps_dir = process.env.REWIND_APPS_DIR || path.join(repo_root, "web");
+const static_dir = path.join(apps_dir, "replay", "_static");
+
+const { buildTapesFromBlobs } =
+    await import(pathToFileURL(path.join(static_dir, "rtap.mjs")).href);
+const { buildRequestEpilogue } =
+    await import(pathToFileURL(path.join(static_dir, "request-replay.mjs")).href);
+const getArenaJs =
+    (await import(pathToFileURL(path.join(static_dir, "qjs_arena_wasm.js")).href)).default;
 
 // Trace event kinds — see vendor/arenajs/qjs-arena-trace.c.
 const K_NAME = 0, K_FUNC_ENTER = 1, K_FUNC_EXIT = 2, K_LINE = 3, K_THROW = 4;
@@ -53,7 +68,7 @@ const Module = await getArenaJs({
     // Emscripten's default locateFile resolves the .wasm next to the
     // .js, but Node's module loader can leave the cwd elsewhere — be
     // explicit so the driver works from any cwd.
-    locateFile: (name) => path.join(repo_root, "web/replay/_static", name),
+    locateFile: (name) => path.join(static_dir, name),
 });
 
 const arena_init           = Module.cwrap("arena_init",           "number", ["number","number"]);

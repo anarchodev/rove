@@ -67,11 +67,15 @@ const { chromium } = pw;
 
 // ── Paths + URLs ─────────────────────────────────────────────────────
 const SCRIPT_DIR  = dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT   = resolve(SCRIPT_DIR, "..");
-// The static server serves the deployed `_static/` subdir so URL
-// paths match what production files-server resolves under `_static/`
-// (a request for `/wasm.html` ↔ `_static/wasm.html` on disk).
-const REPLAY_DIR  = resolve(REPO_ROOT, "web/replay/_static");
+// scripts/smoke/ → the repo root is two levels up.
+const REPO_ROOT   = resolve(SCRIPT_DIR, "..", "..");
+// The replay porcelain moved to the private rewind-apps repo when `web/`
+// was extracted (commit fecf07b) — resolve it from $REWIND_APPS_DIR (the
+// smoke harness convention), falling back to an in-repo ./web. The static
+// server serves the `_static/` dir so `/` resolves index.html, matching
+// what production serves under the replay origin.
+const APPS_DIR    = process.env.REWIND_APPS_DIR || resolve(REPO_ROOT, "web");
+const REPLAY_DIR  = resolve(APPS_DIR, "replay", "_static");
 
 const PORT   = Number(process.env.REPLAY_SMOKE_PORT) || 8731;
 const ORIGIN = `http://127.0.0.1:${PORT}`;
@@ -140,6 +144,7 @@ const FIXTURE = {
     response:       { status: 202, outcome: "ok", exception: null },
     deployment_id:  "dep_aaae3d8c1f4d",
     recording_id:   "rec_aaae3d8c1f4d",
+    activation:     "inbound",
     entry_path:     "src/index.mjs",
     modules: [
         {
@@ -148,7 +153,9 @@ const FIXTURE = {
 `// Entry handler — inline, no imports (so this smoke doesn't depend
 // on arenajs's relative-import resolver). The other modules in the
 // bundle exist to populate the rail; they don't need to be invoked
-// for the trace stream to have content.
+// for the trace stream to have content. The shell invokes the
+// activation's export (here the inbound \`default\`) via the
+// request-replay epilogue, so the handler is a real default export.
 function processItem(x) { return x * 2; }
 function compute(items, taxRate) {
   const label = "subtotal";
@@ -158,7 +165,9 @@ function compute(items, taxRate) {
   }
   return { [label]: subtotal, total: subtotal * (1 + taxRate) };
 }
-compute([10, 20, 30], 0.0875);
+export default function handler() {
+  return compute([10, 20, 30], 0.0875);
+}
 `,
         },
         {
@@ -436,6 +445,7 @@ const FIXTURE_THROW = {
     response:       { status: 500, outcome: "handler_error", exception: "PaymentError" },
     deployment_id:  "dep_throw1234",
     recording_id:   "rec_throw1234abcd",
+    activation:     "inbound",
     entry_path:     "src/index.mjs",
     modules: [
         {
@@ -447,7 +457,9 @@ const FIXTURE_THROW = {
 function processCheckout() {
   declineCharge();
 }
-processCheckout();
+export default function handler() {
+  processCheckout();
+}
 `,
         },
     ],

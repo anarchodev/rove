@@ -35,7 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from smoke_lib_v2 import V2Cluster, _curl, rpc_wrap  # noqa: E402
+from smoke_lib_v2 import V2Cluster, _curl, rpc_wrap, APPS_DIR  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 TENANT = "replay-demo"
@@ -48,10 +48,19 @@ def _run_wasm_driver(bundle_path: Path, *, stop_at: int | None = None,
     timestamp, replays the handler against the captured tape, and prints a JSON
     summary before exit. `argv[3]` = stop_at_event (-1 = run to completion),
     `argv[4]` = trace_mode (1 SCAN / 2 DRILL)."""
-    args = ["node", str(REPO_ROOT / "scripts" / "replay_wasm_smoke.mjs"),
+    args = ["node", str(REPO_ROOT / "scripts" / "smoke" / "replay_wasm_smoke.mjs"),
             str(bundle_path), str(stop_at if stop_at is not None else -1),
             str(trace_mode)]
-    proc = subprocess.run(args, capture_output=True, timeout=60, cwd=REPO_ROOT)
+    # The .mjs resolves the replay porcelain (rtap / request-replay /
+    # qjs_arena_wasm) from $REWIND_APPS_DIR — the apps repo (rewind-apps)
+    # that `web/` was extracted into (commit fecf07b). Thread the harness's
+    # resolved APPS_DIR through so the driver finds it regardless of the
+    # caller's environment.
+    import os
+    env = dict(os.environ)
+    env["REWIND_APPS_DIR"] = str(APPS_DIR)
+    proc = subprocess.run(args, capture_output=True, timeout=60, cwd=REPO_ROOT,
+                          env=env)
     try:
         return json.loads(proc.stdout.decode())
     except json.JSONDecodeError:
