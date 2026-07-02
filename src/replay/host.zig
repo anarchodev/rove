@@ -1,15 +1,16 @@
-//! Native replay host — the input side of the arenajs replay ABI
+//! Native replay/sim host — the input side of the arenajs replay ABI
 //! (`qjs-arena-replay-bindings.h`), Phase 2 §2c.
 //!
-//! `arena_init` installs the replay bindings; the embedder registers a
-//! `ReplayHost` whose responders serve the recorded tape. The kv channel is
-//! READS-ONLY (`appendKv(.get)` / `appendKvPrefix` in `src/js/globals.zig` —
-//! `set`/`delete` are never taped, they are handler OUTPUTS), so `kv_get` /
-//! `kv_prefix` walk the decoded read cursor in recorded order (any op/key
-//! mismatch is a divergence, the exact lever Phase 3's `simulate` reuses) while
-//! `kv_set` / `kv_delete` are captured as the produced write-set. `module_load`
-//! serves source by specifier (path), optionally overridden from a working-tree
-//! `--source-dir` for "does my local change still satisfy this request?".
+//! `arena_init` installs the replay bindings; the embedder registers a `Host`
+//! whose responders serve a **closed-world** `world.json` (`world.zig`). KV
+//! reads resolve BY KEY against `kv_map` (order-independent — an authored world
+//! carries no access order to verify against): `kv_get` of a key not in the map
+//! is `not_found` (never a divergence), `kv_prefix` scans the map (cursor +
+//! limit). `kv_set` / `kv_delete` are handler OUTPUTS — captured as the
+//! write-set AND folded back into `kv_map` (read-your-writes overlay).
+//! `module_load` serves source by specifier (path), optionally overridden from a
+//! working-tree `--source-dir` for "does my local change still satisfy this
+//! request?" — a module the tree/fixture lacks IS a divergence.
 //!
 //! Responder contract (from the header): return 0 ok / 1 not-installed /
 //! 2 exhausted / <0 divergence; `out_outcome` is the JS-visible kv result
@@ -42,13 +43,6 @@ pub const KvWrite = struct {
     value: []const u8 = "",
 };
 
-/// How the kv read side resolves the world. `.tape` is replay's ordered cursor
-/// over a captured RTAP tape (any op/key mismatch is a divergence). `.map` is
-/// the declarative-sim mode: reads resolve order-independently against a
-/// key→value map (`kv_map`), and `kv.prefix` scans that map — the world is
-/// *authored*, so it carries no access order to verify against.
-pub const Mode = enum { tape, map };
-
 /// `malloc`+copy matching the responder ownership contract (engine `free()`s
 /// it). `nul` appends a trailing NUL for the buffers whose parser reads one
 /// sentinel byte past `len` (`out_src`, `out_json`).
@@ -60,23 +54,14 @@ fn dupC(bytes: []const u8, nul: bool) ?[*c]u8 {
     return p;
 }
 
-/// Per-replay host state, handed to each responder via the ABI `user` pointer.
+/// Per-run host state, handed to each responder via the ABI `user` pointer.
 /// Single-shot: one `Host` drives one `arena_run_module`.
 pub const Host = struct {
     a: std.mem.Allocator,
-    /// Read resolution strategy. `.tape` uses the ordered `kv` cursor below;
-    /// `.map` uses `kv_map` + `miss` (declarative sim). Default `.tape` keeps
-    /// the replay path byte-identical.
-    mode: Mode = .tape,
-    /// Recorded kv reads (`.get` / `.prefix`) in capture order. The cursor
-    /// advances on each served read; a live read that doesn't match the entry
-    /// at the cursor is a divergence. (`.tape` mode only.)
-    kv: []const decode.KvEntry,
-    kv_cursor: usize = 0,
-    /// Declarative world: key→value map reads resolve against (`.map` mode) —
-    /// a **closed world**: `kv.get` of a key not in the map is `not_found`;
-    /// `kv.prefix` scans the map (cursor + limit honored). A `delete` removes the
-    /// key from the map (read-your-deletes → a later get is not_found).
+    /// Closed-world key→value store reads resolve against: `kv.get` of a key not
+    /// in the map is `not_found`; `kv.prefix` scans the map (cursor + limit
+    /// honored). `kv.set`/`delete` update it in place (read-your-writes /
+    /// read-your-deletes).
     kv_map: std.StringHashMapUnmanaged([]const u8) = .{},
     /// Handler-produced writes (`kv.set` / `kv.delete`), in order.
     writes: std.ArrayList(KvWrite) = .{},
@@ -87,9 +72,9 @@ pub const Host = struct {
     /// When set, `module_load` reads `{source_dir}/{spec}` from the working
     /// tree instead of `sources` — the what-if lever for local changes.
     source_dir: ?[]const u8 = null,
-    /// First divergence message, if any. Distinct from a handler-thrown error:
-    /// a divergence means the replay asked for an input the capture never
-    /// recorded (or the local source tree diverged).
+    /// First divergence message, if any — only `module_load` can diverge now (a
+    /// module the source tree / fixture lacks). Distinct from a handler-thrown
+    /// error.
     diverged: ?[]const u8 = null,
 
     pub fn install(self: *Host) void {
@@ -124,43 +109,18 @@ fn kvGet(
 ) callconv(.c) c_int {
     const h = hostOf(user);
     const k = key[0..@intCast(key_len)];
-    if (h.mode == .map) {
-        if (h.kv_map.get(k)) |v| {
-            out_outcome.* = @intFromEnum(decode.KvOutcome.ok);
-            out_val.* = dupC(v, false) orelse return -1;
-            out_val_len.* = @intCast(v.len);
-            return 0;
-        }
-        // Closed world: a key not in the map is `not_found`. It's a legitimate
-        // answer, not a divergence — the effect log records the read (present
-        // false); faithfulness lives at the output (`status_match`).
-        out_outcome.* = @intFromEnum(decode.KvOutcome.not_found);
-        out_val.* = null;
-        out_val_len.* = 0;
+    if (h.kv_map.get(k)) |v| {
+        out_outcome.* = @intFromEnum(decode.KvOutcome.ok);
+        out_val.* = dupC(v, false) orelse return -1;
+        out_val_len.* = @intCast(v.len);
         return 0;
     }
-    if (h.kv_cursor >= h.kv.len) {
-        h.setDiv("kv.get('{s}') past end of recorded kv tape", .{k});
-        return 2; // exhausted
-    }
-    const e = h.kv[h.kv_cursor];
-    if (e.op != .get) {
-        h.setDiv("kv.get('{s}') but tape expected a .{s} next", .{ k, @tagName(e.op) });
-        return -3;
-    }
-    if (!std.mem.eql(u8, e.key, k)) {
-        h.setDiv("kv.get('{s}') but tape recorded key '{s}'", .{ k, e.key });
-        return -4;
-    }
-    h.kv_cursor += 1;
-    out_outcome.* = @intFromEnum(e.outcome);
-    if (e.outcome == .ok) {
-        out_val.* = dupC(e.value, false) orelse return -1;
-        out_val_len.* = @intCast(e.value.len);
-    } else {
-        out_val.* = null;
-        out_val_len.* = 0;
-    }
+    // Closed world: a key not in the map is `not_found` — a legitimate answer,
+    // not a divergence. The effect log records the read (present false);
+    // faithfulness lives at the output (the `expected` matcher).
+    out_outcome.* = @intFromEnum(decode.KvOutcome.not_found);
+    out_val.* = null;
+    out_val_len.* = 0;
     return 0;
 }
 
@@ -183,8 +143,8 @@ fn kvSet(
         h.writes.append(h.a, .{ .op = .set, .key = kc, .value = vc }) catch return -1;
         // Read-your-writes: a later get of this key in the same run sees the
         // value the handler just wrote (the kvexp overlay, in declarative form).
-        // Reuses the writes[] dups — no second copy. (`.map` mode.)
-        if (h.mode == .map) h.kv_map.put(h.a, kc, vc) catch return -1;
+        // Reuses the writes[] dups — no second copy.
+        h.kv_map.put(h.a, kc, vc) catch return -1;
     }
     out_outcome.* = 0; // ok
     return 0;
@@ -200,7 +160,7 @@ fn kvDelete(
     const kc = h.a.dupe(u8, key[0..@intCast(key_len)]) catch return -1;
     h.writes.append(h.a, .{ .op = .delete, .key = kc }) catch return -1;
     // Read-your-deletes: drop from the map so a later get is not_found.
-    if (h.mode == .map) _ = h.kv_map.remove(kc);
+    _ = h.kv_map.remove(kc);
     out_outcome.* = 0; // ok
     return 0;
 }
@@ -219,60 +179,25 @@ fn kvPrefix(
     const h = hostOf(user);
     const p = prefix[0..@intCast(prefix_len)];
     const cur = cursor[0..@intCast(cursor_len)]; // "" = from start; else strictly-greater
-    if (h.mode == .map) {
-        // Reconstruct the scan from the readset map: keys under the prefix,
-        // sorted, strictly after `cursor`, capped at `limit`. The map holds the
-        // foreign matches; the handler's own writes are refilled by re-execution
-        // (kvSet → kv_map), so no separate recorded-rows are needed. An empty
-        // match is a legitimate answer (a prefix scan never holes/diverges).
-        var keys = std.ArrayList([]const u8){};
-        defer keys.deinit(h.a);
-        var it = h.kv_map.iterator();
-        while (it.next()) |kv| {
-            const k = kv.key_ptr.*;
-            if (!std.mem.startsWith(u8, k, p)) continue;
-            if (cur.len != 0 and std.mem.order(u8, k, cur) != .gt) continue; // strictly > cursor
-            keys.append(h.a, k) catch return -1;
-        }
-        std.mem.sort([]const u8, keys.items, {}, lessThanStr);
-        const n: usize = if (limit > 0 and @as(usize, @intCast(limit)) < keys.items.len)
-            @intCast(limit)
-        else
-            keys.items.len;
-        var buf = std.ArrayList(u8){};
-        defer buf.deinit(h.a);
-        var aw = std.Io.Writer.Allocating.fromArrayList(h.a, &buf);
-        const w = &aw.writer;
-        w.writeByte('[') catch return -1;
-        for (keys.items[0..n], 0..) |kk, i| {
-            if (i != 0) w.writeByte(',') catch return -1;
-            w.writeAll("{\"key\":") catch return -1;
-            writeJsonString(w, kk) catch return -1;
-            w.writeAll(",\"value\":") catch return -1;
-            writeJsonString(w, h.kv_map.get(kk).?) catch return -1;
-            w.writeByte('}') catch return -1;
-        }
-        w.writeByte(']') catch return -1;
-        buf = aw.toArrayList();
-        out_json.* = dupC(buf.items, true) orelse return -1;
-        out_json_len.* = @intCast(buf.items.len);
-        out_outcome.* = 0; // ok
-        return 0;
+    // Reconstruct the scan from the closed-world map: keys under the prefix,
+    // sorted, strictly after `cursor`, capped at `limit`. The map holds the
+    // foreign matches; the handler's own writes are refilled by re-execution
+    // (kvSet → kv_map), so no separate recorded rows are needed. An empty match
+    // is a legitimate answer (a prefix scan never holes/diverges).
+    var keys = std.ArrayList([]const u8){};
+    defer keys.deinit(h.a);
+    var it = h.kv_map.iterator();
+    while (it.next()) |kv| {
+        const k = kv.key_ptr.*;
+        if (!std.mem.startsWith(u8, k, p)) continue;
+        if (cur.len != 0 and std.mem.order(u8, k, cur) != .gt) continue; // strictly > cursor
+        keys.append(h.a, k) catch return -1;
     }
-    if (h.kv_cursor >= h.kv.len) {
-        h.setDiv("kv.prefix('{s}') past end of recorded kv tape", .{p});
-        return 2;
-    }
-    const e = h.kv[h.kv_cursor];
-    if (e.op != .prefix) {
-        h.setDiv("kv.prefix('{s}') but tape expected a .{s} next", .{ p, @tagName(e.op) });
-        return -3;
-    }
-    if (!std.mem.eql(u8, e.key, p)) {
-        h.setDiv("kv.prefix('{s}') but tape recorded prefix '{s}'", .{ p, e.key });
-        return -4;
-    }
-    h.kv_cursor += 1;
+    std.mem.sort([]const u8, keys.items, {}, lessThanStr);
+    const n: usize = if (limit > 0 and @as(usize, @intCast(limit)) < keys.items.len)
+        @intCast(limit)
+    else
+        keys.items.len;
     // The binding parses `out_json` via JS_ParseJSON into the array of
     // {key, value} rows kv.prefix returns. Build it NUL-terminated.
     var buf = std.ArrayList(u8){};
@@ -280,12 +205,12 @@ fn kvPrefix(
     var aw = std.Io.Writer.Allocating.fromArrayList(h.a, &buf);
     const w = &aw.writer;
     w.writeByte('[') catch return -1;
-    for (e.results, 0..) |row, i| {
+    for (keys.items[0..n], 0..) |kk, i| {
         if (i != 0) w.writeByte(',') catch return -1;
         w.writeAll("{\"key\":") catch return -1;
-        writeJsonString(w, row.key) catch return -1;
+        writeJsonString(w, kk) catch return -1;
         w.writeAll(",\"value\":") catch return -1;
-        writeJsonString(w, row.value) catch return -1;
+        writeJsonString(w, h.kv_map.get(kk).?) catch return -1;
         w.writeByte('}') catch return -1;
     }
     w.writeByte(']') catch return -1;
@@ -349,36 +274,13 @@ fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
 
 const testing = std.testing;
 
-test "kv read cursor: ordered get hits + divergence on wrong key" {
-    var h = Host{
-        .a = testing.allocator,
-        .kv = &.{
-            .{ .op = .get, .outcome = .ok, .key = "user", .value = "ada" },
-            .{ .op = .get, .outcome = .not_found, .key = "missing" },
-        },
-    };
-    defer if (h.diverged) |d| testing.allocator.free(d);
-
-    var outcome: c_int = -1;
-    var val: [*c]u8 = null;
-    var vlen: c_int = -1;
-    // entry 0: get user -> ok ada
-    try testing.expectEqual(@as(c_int, 0), kvGet("user", 4, &outcome, &val, &vlen, &h));
-    try testing.expectEqual(@as(c_int, 0), outcome);
-    try testing.expectEqualStrings("ada", val[0..@intCast(vlen)]);
-    std.c.free(val);
-    // entry 1: get the wrong key -> divergence (-4), cursor not advanced past
-    try testing.expect(kvGet("elsewhere", 9, &outcome, &val, &vlen, &h) < 0);
-    try testing.expect(h.diverged != null);
-}
-
 test "map mode: get resolves by key, order-independent" {
     const a = testing.allocator;
     var map = std.StringHashMapUnmanaged([]const u8){};
     defer map.deinit(a);
     try map.put(a, "user/jess", "{\"name\":\"Jess\"}");
     try map.put(a, "config/rate", "10");
-    var h = Host{ .a = a, .mode = .map, .kv = &.{}, .kv_map = map };
+    var h = Host{ .a = a, .kv_map = map };
 
     var outcome: c_int = -1;
     var val: [*c]u8 = null;
@@ -398,7 +300,7 @@ test "map mode: closed world — a missing key is not_found, never a divergence"
     var val: [*c]u8 = null;
     var vlen: c_int = -1;
 
-    var h = Host{ .a = a, .mode = .map, .kv = &.{}, .kv_map = map };
+    var h = Host{ .a = a, .kv_map = map };
     try testing.expectEqual(@as(c_int, 0), kvGet("absent", 6, &outcome, &val, &vlen, &h));
     try testing.expectEqual(@intFromEnum(decode.KvOutcome.not_found), outcome);
     try testing.expect(h.diverged == null);
@@ -412,7 +314,7 @@ test "map mode: prefix scans the declared map, sorted (cursor + limit honored)" 
     try map.put(a, "orders/1", "a");
     try map.put(a, "orders/3", "c");
     try map.put(a, "users/9", "z");
-    var h = Host{ .a = a, .mode = .map, .kv = &.{}, .kv_map = map };
+    var h = Host{ .a = a, .kv_map = map };
 
     var outcome: c_int = -1;
     var json: [*c]u8 = null;
@@ -435,7 +337,7 @@ test "map mode: write-through overlay (read-your-writes / read-your-deletes)" {
     const a = testing.allocator;
     var map = std.StringHashMapUnmanaged([]const u8){};
     try map.put(a, "count", "1");
-    var h = Host{ .a = a, .mode = .map, .kv = &.{}, .kv_map = map };
+    var h = Host{ .a = a, .kv_map = map };
     defer {
         for (h.writes.items) |wr| {
             a.free(wr.key);
@@ -462,13 +364,16 @@ test "map mode: write-through overlay (read-your-writes / read-your-deletes)" {
 }
 
 test "kv writes captured; sentinel intercepted as output" {
-    var h = Host{ .a = testing.allocator, .kv = &.{} };
+    var h = Host{ .a = testing.allocator };
     defer {
         for (h.writes.items) |wr| {
             testing.allocator.free(wr.key);
             if (wr.value.len != 0) testing.allocator.free(wr.value);
         }
         h.writes.deinit(testing.allocator);
+        // kvSet folds each write into kv_map too (reusing the writes[] dups —
+        // no second copy), so free only the map's backing, not its values.
+        h.kv_map.deinit(testing.allocator);
         if (h.output) |o| testing.allocator.free(o);
     }
     var outcome: c_int = -1;
