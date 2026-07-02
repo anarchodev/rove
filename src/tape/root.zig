@@ -628,8 +628,8 @@ pub const Tape = struct {
 /// bindings append to the relevant channel.
 ///
 /// Channel shape mirrors the WASM replay engine's `Module.tapes`
-/// 1:1 (`docs/plans/replay-wasm-plan.md` §4) — same five channels, same
-/// names. No translation layer between capture and replay.
+/// 1:1 (rewind-apps repo `replay/replay-wasm-plan.md` §4) — same five
+/// channels, same names. No translation layer between capture and replay.
 ///
 /// `docs/readset-replication-plan.md` Phase 1 lifted this from
 /// `src/js/worker_log.zig:RequestTapes`; this revision adds the

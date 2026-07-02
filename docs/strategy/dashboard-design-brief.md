@@ -245,8 +245,8 @@ output) with source view, variable panel, and stepping controls.
 - **Stepping** — step-into / step-over / step-out; works by
   re-running from start with a different stop predicate.
 
-**Still open** (design opportunities — see
-[`replay-wasm-plan.md`](../plans/replay-wasm-plan.md) §8 for the
+**Still open** (design opportunities — see `replay-wasm-plan.md` §8, in
+the private rewind-apps repo at `replay/replay-wasm-plan.md`, for the
 implementation-side roadmap):
 
 - **Breakpoints** — gutter clicks on source lines; the next replay
@@ -493,7 +493,7 @@ needs to assume:
   and parsed by `web/replay/rtap.mjs`; design consumes the
   decoded shape).
 - The trace event ABI for the WASM scrubber (kinds + binary
-  layouts pinned in `replay-wasm-plan.md` §5).
+  layouts pinned in `replay-wasm-plan.md` §5, in the rewind-apps repo).
 
 Design is welcome to propose extensions to these — flag them
 explicitly in the mockup notes and the rove side will follow up.

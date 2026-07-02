@@ -71,7 +71,7 @@ them 2026-06-29: its as-built mechanism folded into
 - [websocket-plan.md](plans/websocket-plan.md) — **outbound** WS only (a handler as client of an upstream WS server — atproto firehose / Pub/Sub; unbuilt, ~1–2 weeks). Inbound WS shipped → `architecture/websockets.md`
 - [retention-and-gc.md](plans/retention-and-gc.md) — the one compacting GC across log-blobs / kv pages / `_pool` bodies / tape blobs; capacity-based retention; the input-home pinning obligation (unbuilt). The minimal-tape four-record-kinds synthesis now lives in `decisions.md` §3.9
 - [builtin-libs-docs-plan.md](plans/builtin-libs-docs-plan.md) — `_system.*` + JS shim docs
-- [replay-wasm-plan.md](plans/replay-wasm-plan.md) — WASM replay UI (§8.6+ deferred)
+- replay-wasm-plan.md — WASM replay UI (§8.6+ deferred); **moved 2026-07-01 to the private rewind-apps repo (`replay/replay-wasm-plan.md`), alongside the porcelain it describes**
 - [sim-test-framework.md](plans/sim-test-framework.md) · [fixture-lifecycle.md](plans/fixture-lifecycle.md) · [agent-surface.md](plans/agent-surface.md) — replay/sim/agent surface (Phase 12–14)
 - [consensus-robustness-backlog.md](plans/consensus-robustness-backlog.md) — open consensus hardening residue (fail-loud fixes, a CP move/provision UAF, the power-loss/`dm-flakey` crash-consistency validation gap) + the governing error-classification + pin-coordination conventions. Consolidates the retired `raft-correctness-plan` + 2026-06-20 storage triage
 

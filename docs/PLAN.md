@@ -537,7 +537,7 @@ labels** other docs cite and points to the current home. Launch sequencing
 | 10.9 | Fixture lifecycle (curated observations) | [fixture-lifecycle.md](plans/fixture-lifecycle.md) |
 | 10.10 | AI agent surface — CLI + skill file in v1, hosted MCP deferred | [agent-surface.md](plans/agent-surface.md); decisions.md §8 |
 | 10.11 | Worker dry-run dispatch mode | [fixture-lifecycle.md](plans/fixture-lifecycle.md) |
-| 10.12 | Replay — two paths (browser page + DAP CLI), one per audience | [replay-wasm-plan.md](plans/replay-wasm-plan.md); decisions.md §8 |
+| 10.12 | Replay — two paths (browser page + DAP CLI), one per audience | replay-wasm-plan.md (moved to the private rewind-apps repo, `replay/replay-wasm-plan.md`); decisions.md §8 |
 | 10.13 | files-server + log-server detached to their own processes | `architecture/deployment-and-logs.md`; §13 here |
 | 10.14 | Distributed Elm ports (webhook + callback + streaming) | [effect-algebra.md](effect-algebra.md); `architecture/effects-and-handlers.md` |
 | 10.15 | `analytics.track` / `metrics.*` — speculative, post-1.0 | decisions.md §12; `architecture/observability.md` |
