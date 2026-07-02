@@ -3579,6 +3579,15 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             const interrupted = err == dispatcher_mod.DispatchError.Interrupted;
             const invalidated = err == dispatcher_mod.DispatchError.KvFailed and
                 (if (worker.dispatcher.last_kv_error) |lke| lke == error.TxnInvalidated else false);
+            // Diagnostic: surface the kvexp error KvFailed WRAPS. The tape only
+            // records a `.kv_error` outcome and replay can't reproduce a
+            // write-layer failure (its kv writes hit a never-failing overlay), so
+            // this journald line is the ONLY place the actual cause is visible
+            // (e.g. what the __admin__ deploy-reset delete hit). Corr-tagged.
+            if (err == dispatcher_mod.DispatchError.KvFailed) std.log.warn(
+                "rove-js KvFailed cause: tenant={s} path={s} corr={s} kv_error={s}",
+                .{ scope_inst.id, path, correlation_id, if (worker.dispatcher.last_kv_error) |lke| @errorName(lke) else "(null)" },
+            );
             const outcome: log_mod.Outcome = if (interrupted) .timeout else if (invalidated) .fault else .handler_error;
             const status: u16 = if (interrupted) 504 else if (invalidated) 503 else 500;
             if (interrupted) {
