@@ -250,6 +250,13 @@ class V2Cluster:
     _voters: str = ""
     _peers: str = ""
     genesis: bool = False
+    # Worker→log-server batch push. Default ON (matches production + every
+    # existing smoke, which set REWIND_LOG_INTERNAL_BASE + the services secret
+    # on each worker unconditionally). Set False to omit those two vars so the
+    # worker's `log_public_base` is null → no push thread, `pushBatchKey`
+    # short-circuits, and the log-server's S3 LIST poll is the only path. Used
+    # by the log-push A/B perf bench to isolate the push cost.
+    worker_log_push: bool = True
 
     # ── lifecycle ──────────────────────────────────────────────────────
     @classmethod
@@ -259,7 +266,8 @@ class V2Cluster:
               unsafe_outbound: bool = True,
               tls_idp: bool = False,
               tls_cert: str = "", tls_key: str = "",
-              genesis: bool = False) -> "V2Cluster":
+              genesis: bool = False,
+              worker_log_push: bool = True) -> "V2Cluster":
         if not os.environ.get("S3_ENDPOINT"):
             raise SystemExit("S3 env not set — `set -a; . ./.env; set +a` first")
         for b in (REWIND, CP_BIN, FRONT_BIN):
@@ -293,6 +301,7 @@ class V2Cluster:
             log_data_dir=Path(f"{_DATA_BASE}/v2smoke-{tag}-log-{pid}"),
             unsafe_outbound=unsafe_outbound,
             genesis=genesis,
+            worker_log_push=worker_log_push,
         )
         for d in (*c.data_dirs, c.cp_data_dir):
             subprocess.run(["rm", "-rf", str(d)])
@@ -461,7 +470,8 @@ class V2Cluster:
         # at the log-server's deterministic port. Harmless when no door fetch
         # fires (the door is gated to `__admin__` outbound only).
         env["LOOP46_SERVICES_JWT_SECRET"] = JWT_SECRET_HEX
-        env["REWIND_LOG_INTERNAL_BASE"] = f"http://127.0.0.1:{self.log_port}"
+        if self.worker_log_push:
+            env["REWIND_LOG_INTERNAL_BASE"] = f"http://127.0.0.1:{self.log_port}"
         # Scope this cluster's request-log/tape batches under the same per-run
         # S3 prefix as its blobs (the shared bucket hosts every smoke run), so
         # a co-spawned `rewind-logs` reads exactly this cluster's
