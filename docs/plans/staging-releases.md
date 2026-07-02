@@ -1,59 +1,69 @@
 # Staging / preview releases — design plan
 
-Status: **proposal, 2026-06-30.** No code yet. This doc proposes a way to
-run a non-default version of a tenant's code, selected per-request by a
-signed cookie, so a developer can exercise newly-deployed code against the
-live tenant before flipping it to the default release.
+Status: **proposal, 2026-06-30 (restructured 2026-07-01).** No code yet.
+This doc explores how a developer can exercise candidate code against a
+live tenant — its real host, real data — before making it the default
+release. Three models emerged, each a refinement of the last. They are laid
+out in the order they were reasoned through. **Model C (the dev tunnel) is
+the recommended direction**; A and B are documented because C composes
+both and because either is a smaller stepping stone if C's transport
+dependency isn't ready.
 
 ## 0. The ask
 
 The workflow we want:
 
-1. A developer deploys a bundle. Today this already mints a `dep_id` and
-   does **not** flip the default release (`rewind deploy` without
-   `--release`). So the new code is live in storage but nothing serves it.
-2. The developer clicks a URL (printed by `rewind deploy`, or a button in
-   the editor / dashboard). Clicking it sets a cookie in their browser.
-3. From then on, that browser's requests to the tenant's normal host are
-   served by the **preview** deployment, while everyone else keeps getting
-   the default release.
-4. Happy with it, the developer runs `rewind release <dep_id>` and the
-   preview becomes the default for everyone. The preview cookie becomes a
-   no-op (it now points at what is already current).
+1. A developer has candidate code (newly deployed, or just sitting in their
+   editor — the models differ on this).
+2. The developer clicks a URL. Clicking it sets a cookie in their browser.
+3. From then on, that browser's requests to the tenant's **normal host**
+   are served by the candidate code, while everyone else keeps getting the
+   default release.
+4. Happy with it, the developer promotes the candidate to the default for
+   everyone (`rewind release`), and the cookie becomes a no-op.
 
-The point is to test *the real thing on the real host against real data*
-before making it the default — not a separate staging environment with its
-own URL and its own state.
+The point is to test *the real thing on the real host* before making it the
+default — not a separate staging environment with its own URL and its own
+state. The three models below differ in **where the candidate code runs**
+and **where its state lives**.
 
-## 1. Why this is a small change, not a big one
+## 1. What the existing system already gives us
 
-Three properties of the existing system do most of the work:
+Three properties do most of the work in every model:
 
 - **Deployments are content-addressed and coexist.** A "release" is just
   the kv key `_deploy/current` holding a hex `dep_id`
   (`src/js/starter.zig:200`). Every deploy mints a distinct `dep_id`, and
-  the compiled bytecode lives in a node-wide **content-addressed** cache
-  that is never overwritten (`src/js/deployment_cache.zig`). So a
-  non-default version already physically exists on the node the moment it
-  is deployed — we are not adding storage, only a way to *select* it.
+  compiled bytecode lives in a node-wide **content-addressed** cache that is
+  never overwritten (`src/js/deployment_cache.zig`). A non-default version
+  already physically exists the moment it is deployed.
 
-- **The deploy step already produces the staging artifact.** `rewind
-  deploy` stages a bundle and returns a `dep_id` without touching
-  `_deploy/current`; release is a separate flip. "Code that is live in
-  storage but not the default" is precisely a freshly-deployed,
-  not-yet-released `dep_id`. Nothing new to produce.
+- **The deploy step already produces a staging artifact.** `rewind deploy`
+  stages a bundle and returns a `dep_id` without touching `_deploy/current`;
+  release is a separate flip.
 
 - **The front door needs no changes.** `rewind-front` is a pure
-  Host→cluster reverse proxy (`src/front/main.zig`); it forwards all
-  headers and cookies verbatim and does not inspect them for routing. The
-  preview cookie flows straight through to the worker. The entire feature
-  lives in the worker plus a little JS — the ingress path is untouched.
+  Host→cluster reverse proxy (`src/front/main.zig`); it forwards headers and
+  cookies verbatim and does not inspect them for routing. A preview cookie
+  flows straight through to the worker. The whole feature lives worker-side
+  plus a little JS — ingress is untouched.
 
-## 2. The one piece of engine work
+- **Execution is a pure function of a recorded world.** A handler
+  activation is `update(Msg, KV snapshot, ctx, seed) → (writeset, Cmds,
+  disposition)`. `rewind sim` already runs candidate code locally on the
+  same JS engine (`arenajs-replay`) against an authored or captured world.
+  This is what makes Models B and C possible at all.
 
-### 2.1 Where version is chosen today
+## 2. Model A — prod-side cookie preview
 
-Request dispatch pins exactly one deployment snapshot per request:
+**Candidate runs:** on the prod worker. **State:** the tenant's real kv.
+
+Serve a non-default `dep_id` on the real host, selected per-request by a
+signed cookie.
+
+### 2.1 The engine change
+
+Dispatch pins exactly one deployment snapshot per request:
 
 ```zig
 // src/js/worker_dispatch.zig ~2832
@@ -63,139 +73,249 @@ defer tc.release();
 const dep_id = snap.deployment_id;
 ```
 
-`pinCurrent()` loads the tenant slot's `current` snapshot (an atomic
-pointer) and retains a refcount for the life of the request. Bytecode is
-then fetched from that pinned snapshot (`findBytecode(tc, …)` ~2975).
-Pinning **once per request** is exactly the property we want — it
-guarantees a single request sees one consistent code version end to end.
-
-The only real constraint is that a tenant slot holds **one** snapshot
-(`current`). To serve a preview we need a slot to be able to hold *more than
-one* live snapshot and choose which to pin.
-
-> Open question to confirm before coding: whether `dispatchOnce` pins once
-> per request or once per batched group of requests for a tenant. If
-> per-request (which the pin-then-`defer release` shape suggests), concurrent
-> preview and production requests need no special handling. If per-batch,
-> the batch key must include the selected `dep_id`. This is a
-> read-the-code confirmation, not a design fork.
-
-### 2.2 The change
-
-Teach the per-tenant deployment slot to hold the always-loaded `current`
-snapshot **plus a small, bounded set of preview snapshots**, and pick which
-to pin using a per-request cookie:
+`pinCurrent()` loads the tenant slot's `current` snapshot (atomic pointer)
+and retains a refcount for the life of the request. Pinning **once per
+request** is exactly the property we want — one request sees one consistent
+version end to end. The only constraint is that a slot holds **one**
+snapshot. The change: let a slot hold `current` **plus a bounded LRU of
+preview snapshots**, and pick which to pin from a cookie.
 
 - **Slot** (`deployment_cache.zig`): add `pinDeployment(dep_id)` alongside
-  `pinCurrent()`. It returns the snapshot for an arbitrary `dep_id`,
-  building it on demand via the existing loader (which already constructs a
-  snapshot from a `dep_id` + manifest, fully offline) and caching it under
-  an **LRU + TTL** keyed by `dep_id`. The bytecode leases it references are
-  already shared and content-addressed, so a preview snapshot mostly reuses
-  bytecode that may already be resident.
-
+  `pinCurrent()`, building the snapshot on demand via the existing offline
+  loader and caching it under LRU + TTL keyed by `dep_id`. Bytecode leases
+  are already shared and content-addressed, so a preview snapshot mostly
+  reuses resident bytecode.
 - **Dispatch** (`worker_dispatch.zig`): before pinning, read the preview
-  cookie from the already-parsed request headers (available well before
-  bytecode selection — `src/js/request.zig`). If present and valid, call
-  `pinDeployment(dep_id)`; otherwise `pinCurrent()` as today. Everything
-  downstream is unchanged — it just operates on a different pinned
-  snapshot.
+  cookie from the already-parsed request headers (`src/js/request.zig`).
+  Present and valid → `pinDeployment(dep_id)`; else `pinCurrent()`.
+  Everything downstream is unchanged.
 
-- **Selector storage**: simplest is for the cookie to carry the `dep_id`
-  directly (signed — see §3). A named indirection
-  (`_deploy/preview/{name}` → `dep_id` in kv, cookie carries `name`) is a
-  possible v2 nicety but adds a kv read on the hot path and is not needed
-  for the core workflow.
+> Confirm before coding: whether `dispatchOnce` pins once per request or
+> once per batched group of requests for a tenant. If per-request (which the
+> pin-then-`defer release` shape suggests), concurrent preview and
+> production requests need no special handling.
 
-That is the whole engine surface: one new pin method backed by a bounded
-snapshot cache, and one cookie read in dispatch.
+### 2.2 What's good and what isn't
 
-## 3. Security — the one thing that must be right
+- ✅ Real host, real ingress, **shareable link** — anyone with the URL sees
+  it on the real site.
+- ✅ Smallest engine change; no new transport.
+- ⚠️ **Preview writes hit the tenant's real kv.** A preview handler shares
+  the real namespace — usually the point (test against real data), but *not*
+  an isolated sandbox. This is the model's scariest edge.
+- ⚠️ Requires a deploy to produce the `dep_id` first — not a
+  code-on-the-laptop inner loop.
 
-An unauthenticated request must **not** be able to make a worker load an
-arbitrary `dep_id`. If it could, an attacker could force a worker to build
-and hold many snapshots (memory-growth denial of service), and — worse —
-run a stale or attacker-chosen deployment against live tenant data.
+## 3. Model B — client-side copy-on-write sim
 
-**The preview selector must be signed.** Options, cheapest first:
+**Candidate runs:** on the dev laptop (`arenajs-replay`). **State:** local
+overlay over a read-through to prod.
+
+Don't deploy at all. Run the candidate on the laptop, and back its KV with a
+**copy-on-write read-through**: reads that miss the local overlay resolve
+from prod; writes land in the local overlay and never touch prod.
+
+### 3.1 This is a sim read-source, not a new engine
+
+`rewind sim` already runs candidate code against a world, already has
+`--miss-policy {fail|resolve}`, and already carries per-read provenance
+(`{source}` layers). Model B decomposes entirely into pieces that exist:
+
+- **Copy-on-write writes** = the write overlay sim already has — the same
+  shape as the worker's speculative `TrackedTxn` overlay (volatile writes
+  over committed state) and sim's `world.kv` map.
+- **Read-through** = a new miss policy, `--miss-policy=live`: a KV miss
+  resolves by fetching the key from prod instead of failing/prompting. And
+  **resolving-a-miss-from-prod-and-recording-it is lazily authoring a
+  fixture** — after the first run each touched key is captured, so a second
+  run goes fully offline and deterministic. That is precisely the sim
+  framework's "resolve → record a typed hole" story with prod as the
+  resolver.
+
+### 3.2 What it reverses, and the costs
+
+Sim was consciously scoped **client-side only, no live-KV**. Model B
+reopens that, and the reasons that stance existed are its real costs:
+
+- **Determinism** — a live read-through over moving prod data is
+  non-reproducible *unless* you pin a snapshot (read at a fixed raft index,
+  or capture-on-first-read and freeze). Capture-on-read restores
+  determinism, so it's solvable, but it's the thing to design.
+- **A scoped, authed remote KV read endpoint** — KV reads happen *inside*
+  the worker today; reading from a laptop needs a real read API with
+  tenant-scoped auth and defined snapshot semantics. This is the actual new
+  surface.
+- **KV is only one effect.** A handler also does `http.fetch`, `blob.*`,
+  timers, WS, scheduler. COW solves KV; the rest still need mock-or-proxy.
+  Sim's typed-hole/miss-policy frames each, but "live" mode multiplies the
+  question (do you *also* live-proxy outbound fetches, firing real prod-side
+  side-effects from a laptop?).
+
+### 3.3 What's good and what isn't
+
+- ✅ **Writes are isolated** — fixes Model A's scariest edge.
+- ✅ No deploy; instant iteration on laptop code.
+- ✅ Mostly reuses the shipped sim engine.
+- ⚠️ **Developer-local only — no shareable URL, no real ingress.** You are
+  not exercising the real worker/front/TLS/h2 path.
+
+## 4. Model C — the dev tunnel (recommended)
+
+**Candidate runs:** on the dev laptop, as a real local `rewind-worker`.
+**State:** the laptop worker's COW read-through (Model B, nested).
+**Ingress:** the real prod host (Model A's cookie gating, nested).
+
+This is the synthesis. The industry pattern is the "personal dev
+override" / traffic intercept: `wrangler dev --remote`, Telepresence
+intercepts, ngrok-with-cookie-routing. Cookie-bearing requests to the real
+tenant host are **routed to the developer's laptop**, which executes and
+returns the response; the prod worker relays it back to the browser.
+Everyone without the cookie hits the real deployment, untouched.
+
+### 4.1 Why it dominates A and B
+
+It is the only model that satisfies every dimension at once:
+
+| | A · cookie preview | B · local COW sim | **C · dev tunnel** |
+|---|---|---|---|
+| Real host / ingress / shareable URL | ✅ | ❌ | ✅ |
+| No deploy; laptop-code inner loop | ❌ | ✅ | ✅ |
+| Real prod data available | ✅ | ✅ (read-through) | ✅ (read-through) |
+| **Writes isolated** | ❌ | ✅ | ✅ |
+| Exercises real runtime path | ✅ | ❌ | ✅ (real worker binary) |
+| Blast radius on real users | none¹ | none | none¹ |
+| New machinery | small | medium | largest |
+
+¹ only cookie-bearing requests diverge from the default deployment.
+
+It also **composes down** into A and B rather than replacing them: the thing
+on the laptop is a real `rewind-worker` (so effect semantics are identical,
+not simulated), its state backend is Model B's COW read-through, and the
+gating is Model A's signed cookie — now meaning "route me to my tunnel"
+instead of "pin dep_id X."
+
+### 4.2 The one question that doesn't disappear: effects and state
+
+The tunnel moves *where* you answer "where do `kv`/`fetch` go," not
+*whether*. Two options:
+
+- **Thick laptop (recommended):** the laptop runs a full local worker whose
+  KV is COW read-through to prod (Model B). Reads see real data; writes stay
+  in a local overlay thrown away or promoted on release; you test the actual
+  `rewind-worker` binary. The tunnel carries only the request/response
+  envelope.
+- **Thin laptop:** the laptop runs only handler logic and RPCs every effect
+  back to the prod worker as the real tenant. Simpler transport, but
+  reintroduces "writes hit prod" unless the tunnel session gets a
+  server-side speculative overlay.
+
+Go thick.
+
+### 4.3 It maps onto machinery that mostly exists
+
+- **Forward-request, relay-response** = the bound-fetch held-connection
+  resume pattern (the `platform.compile` / `rove-compile.internal`
+  bound-respond work). A cookie-gated request becomes a bound "fetch" whose
+  upstream is the tunnel; the held browser connection resumes when the
+  laptop answers. Same shape.
+- **Route the request to the node holding the tunnel** = the
+  continuation-affinity / connection-holder model (callbacks route to the
+  worker *holding* the continuation, not `hash(tenant)`). "Route to the node
+  holding the dev tunnel" is the identical primitive.
+- **The genuinely new piece** = an outbound-dialed, held tunnel. The laptop
+  is behind NAT, so it dials *out* to prod and the worker→laptop direction
+  rides that held connection. This is exactly the **outbound-WS /
+  connection-actor** gap already on the roadmap (the "firehose consumer"
+  forcing function, TEA gap 2.5) — so C is a concrete motivating use case
+  for a primitive already planned, not a new transport invented here.
+- **Signed cookie / tenant-scoped dev cap** = §5, unchanged from Model A.
+
+### 4.4 What C keeps, drops, absorbs
+
+- **Drops** Model A's §2.1 multi-snapshot slot work — unneeded; the code
+  lives on the laptop, prod never selects a preview version.
+- **Keeps** the signed-cookie gating (§5) and the `/__preview` set-cookie
+  route (now "route me to my tunnel").
+- **Absorbs** Model B as the laptop worker's state backend.
+
+### 4.5 Costs specific to C
+
+- **A prod↔laptop hop per request.** Fine for a dev loop; a shared
+  stakeholder demo eats one extra RTT, acceptable.
+- **Leans hard on the connection-actor primitive being solid** — the
+  outbound held tunnel is the real build. If that primitive isn't ready, ship
+  Model A first as a stepping stone.
+- **The tunnel holder sees real request traffic and (via COW) real read
+  data** — so the dev session must be a short-lived, tenant-scoped
+  capability (§5).
+
+## 5. Security — common to all models
+
+The selector (cookie / URL) that diverges a request from the default
+**must be signed**. Otherwise an unauthenticated request could:
+
+- in Model A, force a worker to load arbitrary `dep_id`s (memory-growth
+  denial of service, or run a stale/attacker-chosen deployment);
+- in Model C, route real prod traffic to an attacker's tunnel.
+
+Approach, cheapest first:
 
 - **Platform-HMAC signed cookie/URL** — the preview URL embeds
-  `{dep_id, exp}` and an HMAC over them using an existing platform key.
-  The worker verifies the signature and expiry before pinning. Only someone
-  holding a link minted by the deploy tooling can activate a preview. This
-  matches the "developer clicks a URL" workflow directly and needs no
-  login.
+  `{selector, exp}` and an HMAC over them using a platform key; the worker
+  verifies signature + expiry before diverging. Only someone holding a link
+  minted by the deploy/dev tooling can activate it. Fits "developer clicks a
+  URL," no login required.
+- **Scoped `deploy`-cap token** — reuse the tenant-scoped capability the
+  deploy path already mints. Stronger, but a worse fit for a browser click.
 
-- **Scoped `deploy`-cap token** — reuse the tenant-scoped capability token
-  the deploy path already mints; a preview is only selectable by a caller
-  who could have deployed it. Stronger, but requires the previewer to carry
-  a cap, which is a worse fit for "click a link in a browser."
-
-Recommendation: **signed URL → signed cookie**, minted by the deploy
-tooling, short expiry, HMAC with a platform key. Additionally, only allow
-pinning a `dep_id` whose manifest actually exists for this tenant (reject
-unknown ids loudly) so a valid signature can never load nonsense.
-
-## 4. The workflow layer (trivial JS, no engine work)
-
-- A small system route — `GET /__preview/{dep_id}?sig=…&exp=…` — validates
-  the signature, sets `Set-Cookie: rewind-preview=<signed>; HttpOnly;
-  Path=/`, and 302-redirects to `/`. A matching `GET /__preview/clear`
-  deletes the cookie.
-- `rewind deploy` prints the ready-to-click preview URL next to the
-  `dep_id` it already returns. The editor/dashboard can surface the same
-  URL as a button.
-
-Nothing here touches raft, storage, or the front door.
-
-## 5. Sharp edges (all bounded — decide before building)
-
-1. **Sign the selector.** §3. The one non-negotiable.
-2. **Snapshot budget.** Cap preview snapshots per tenant with LRU + TTL and
-   fail loud on exhaustion rather than growing unbounded. Preview
-   deployments hold bytecode leases in RAM until evicted.
-3. **Follower / any-node loading.** `current` auto-loads on every node via
-   `_deploy/current` replication. A preview `dep_id` referenced only by a
-   cookie must load on whichever node happens to serve the request — the
-   loader already builds snapshots lazily and offline, so this is a
-   confirm-the-path item, not new machinery.
-4. **Preview code writes to real kv.** A preview handler shares the
-   tenant's real kv namespace. This is usually the point (test new code
-   against real data), but it is **not** an isolated sandbox — state a
-   preview mutates is the tenant's actual state. If true isolation is ever
-   wanted, *that* is when a separate tenant/instance earns its cost; it is
-   explicitly out of scope here.
-5. **Observability.** Request logs / metrics should record which `dep_id`
-   served a request so preview traffic is distinguishable from production
-   in Grafana.
+Recommendation: **signed URL → signed cookie**, short expiry, HMAC with a
+platform key. For Model A additionally reject any `dep_id` whose manifest
+doesn't exist for this tenant, so a valid signature can never load nonsense.
+For Model C the cookie authorizes *routing to a registered tunnel* held by a
+short-lived tenant-scoped dev session.
 
 ## 6. Why not "make the preview a separate tenant"
 
-It is the obvious alternative and it is worse for this workflow: a separate
-instance means a different host, a different (empty) kv namespace, and a
-separate provision/move lifecycle. That is a *staging environment*, which is
-a different feature. The whole value of the cookie approach is that preview
-runs on the tenant's real host against the tenant's real data, differing
-*only* in which content-addressed code version executes — which the system
-is already built to represent.
+The obvious alternative, and worse for this workflow: a separate instance
+means a different host, a different (empty) kv namespace, and a separate
+provision/move lifecycle — a *staging environment*, a different feature. The
+value of all three models here is running on the tenant's real host and
+(reads of) real data, differing only in which code executes and where. If
+true isolation is ever wanted, *that* is when a separate tenant earns its
+cost; it is out of scope here.
 
-## 7. Effort estimate
+## 7. The workflow / JS layer (trivial in every model)
 
-- Engine: bounded snapshot cache + `pinDeployment` + cookie read in
-  dispatch + signature verify. The reused pieces (content-addressed
-  bytecode cache, offline snapshot loader, per-request pin) are the bulk of
-  the work and already exist.
-- Tooling/JS: the `__preview` set-cookie route and the `rewind deploy` URL
-  print.
-- Confirm-first items: §2.1 per-request vs per-batch pin; §5.3 any-node
-  lazy load.
+- A small system route — `GET /__preview/...?sig=…&exp=…` — validates the
+  signature and sets `Set-Cookie: rewind-preview=<signed>; HttpOnly;
+  Path=/`, then 302s to `/`. A matching `GET /__preview/clear` deletes it.
+  In Model A the cookie carries a `dep_id`; in Model C it names the dev
+  session / tunnel.
+- `rewind deploy` (A) or `rewind dev` (C) prints the ready-to-click URL.
 
-Rough order: a focused few days including a smoke test, not a rewrite.
+Nothing here touches raft, storage, or the front door.
 
-## 8. Fit with replay / sim
+## 8. Recommendation and sequencing
 
-A preview `dep_id` is exactly the object `rewind sim` already reasons about
-(a specific content-addressed code version run against a world). "Preview
-this deployment in the browser" and "sim this deployment offline" become two
-front-ends onto the same artifact, which is a nice consistency rather than a
-new concept.
+- **Target Model C.** It is the only model that is simultaneously
+  shareable-on-the-real-host, deploy-free, write-isolated, and runs the real
+  binary — and it reuses more machinery than it looks (bound-fetch resume +
+  connection-affinity + the already-planned outbound connection primitive).
+- **If the outbound-connection primitive isn't ready, ship Model A first**
+  as a genuinely useful stepping stone (small, no new transport), accepting
+  its real-kv-writes caveat, and layer C on later. A and C share the signed
+  cookie and the `/__preview` route, so A is not throwaway.
+- **Model B is worth building regardless** as the laptop-side state backend
+  for C and as a standalone offline-iteration tool — it's mostly a new sim
+  miss-policy on the shipped engine.
+- Confirm-first items: §2.1 per-request vs per-batch pin; §3.2 snapshot
+  pinning for deterministic read-through; the maturity of the connection-
+  actor / outbound-WS primitive C depends on.
+
+## 9. Fit with replay / sim
+
+Every model reasons about a specific content-addressed code version run
+against a world — exactly the object `rewind sim` already handles. "Preview
+this in the browser" (A), "run it locally against real data" (B), and
+"intercept my real traffic to my laptop" (C) become three front-ends onto
+the same artifact, which is a consistency win rather than a new concept.
