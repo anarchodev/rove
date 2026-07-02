@@ -7,7 +7,9 @@
 # interfaces) or via the API (scripts/ops/ovh-api.py).
 #
 # The private plane carries worker h2c (:8443), raft (:8501/:9101), CP http
-# (:9090) and the tenant door (worker→front :443) — none of which have
+# (:9090), the tenant door (worker→front :443) and the log-server push/query
+# (:8444, worker→peer log-server fan-out; services-JWT gated at the app layer,
+# but private-plane-only for defense in depth) — the h2c/raft/CP ports have no
 # app-layer auth, so the nftables rule written here IS the security
 # boundary (docs/architecture/configuration-and-network.md "Firewall / network plane"). It opens those ports
 # to the two peer addresses on the vRack NIC only; the public interface
@@ -78,7 +80,7 @@ fi
 PEERS_NFT=${PEERS_CSV//,/, }
 TAG="# private-plane peers (vrack-setup.sh)"
 sed -i "\\|$TAG|d" /etc/nftables.conf
-sed -i "/tcp dport { 22, 80, 443 } accept/a\\    iifname \"$IFACE\" ip saddr { $PEERS_NFT } tcp dport { 8443, 8501, 9090, 9101, 443 } accept  $TAG" /etc/nftables.conf
+sed -i "/tcp dport { 22, 80, 443 } accept/a\\    iifname \"$IFACE\" ip saddr { $PEERS_NFT } tcp dport { 8443, 8444, 8501, 9090, 9101, 443 } accept  $TAG" /etc/nftables.conf
 nft -c -f /etc/nftables.conf
 systemctl reload nftables
 
