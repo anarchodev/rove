@@ -618,6 +618,13 @@ pub fn Io(comptime opts: Options) type {
                     if (rr.data != null) {
                         self.returnBufferToRing(rr.buf_id, mask, armed);
                         armed += 1;
+                        // Clear so ReadResult.deinit (fired by the destroy below)
+                        // sees data==null and does NOT return this buffer a
+                        // SECOND time. A double buf_ring_add over-advances the
+                        // ring's producer tail, shrinks the distinct-buffer pool,
+                        // and manifests as recv ENOBUFS → the front crash-loop.
+                        // Same return-then-clear the healthy path uses (below).
+                        rr.* = .{};
                     }
                     try self.reg.destroy(ent);
                     continue;
@@ -627,6 +634,9 @@ pub fn Io(comptime opts: Options) type {
                     if (rr.data != null) {
                         self.returnBufferToRing(rr.buf_id, mask, armed);
                         armed += 1;
+                        // Clear so destroy's ReadResult.deinit doesn't return
+                        // this buffer a second time (see the isStale branch).
+                        rr.* = .{};
                     }
                     try self.reg.destroy(ent);
                     continue;
