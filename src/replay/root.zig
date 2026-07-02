@@ -10,8 +10,14 @@
 //! `effects`, and the recorded comparison. No Node/WASM/network — the arenajs
 //! engine is linked in.
 //!
-//! `runWorld` is one-shot: arena_init installs process-global engine state, so a
-//! CLI invocation runs exactly one activation (which is the whole use case).
+//! `runWorld` is **multi-shot**: the reactor is a *resettable* runtime — base is
+//! frozen once by `arena_init`, and every `arena_run_module` wipes the request
+//! arena (`JS_ResetRequestArena`), which is the production per-request model. So
+//! one process can run many worlds through it: init the arena at most once
+//! (`ensureArena`; a second `arena_init` would hard-fail on the process-global
+//! `g_rt`), then run+reset per world. This is the `simulate(world) → bundle`
+//! primitive — the in-process scenario driver and the JS-authored test runner
+//! both fold over repeated `runWorld` calls instead of one subprocess each.
 //! The base64-tape → world transcode lives in `export_fixture.zig` (used by
 //! `pull` online + `export-fixture` offline). The old ordered-cursor `run` +
 //! its `.tape` host mode are retired — resolution is by-key.
@@ -44,6 +50,20 @@ pub const Error = error{
     NoOutput,
     WriteFailed, // std.Io.Writer.Allocating sink (OOM surfaced as WriteFailed)
 } || decode.Error || std.mem.Allocator.Error;
+
+/// One-shot guard for `arena_init`. The reactor holds a *process-global* runtime
+/// (`g_rt`) and refuses a second init (`arena_init` returns -1 when `g_rt` is
+/// already set). Since `arena_run_module` resets the request arena on every
+/// call, one init + many runs IS the resettable runtime — so we init once and
+/// let each `runWorld` reset+run. Not thread-safe: the reactor is a single
+/// process-global runtime, so `runWorld` callers share one engine on one thread.
+var arena_ready: bool = false;
+
+fn ensureArena() Error!void {
+    if (arena_ready) return;
+    if (arena_init(8192, 8192) != 0) return Error.ArenaInit;
+    arena_ready = true;
+}
 
 
 /// Run a **declarative** world (an *authored* fixture, not a captured tape) —
@@ -132,8 +152,10 @@ pub fn runWorld(
     const full_src = try std.mem.concatWithSentinel(a, u8, &.{ entry_src, epi }, 0);
     const entry_z = try a.dupeZ(u8, wv.entry);
 
-    // ── drive the engine (one-shot; same caveats as `run`) ──
-    if (arena_init(8192, 8192) != 0) return Error.ArenaInit;
+    // ── drive the engine. Resettable runtime: init the frozen base at most once
+    // per process; `arena_run_module` below wipes the request arena, so repeated
+    // runWorld calls are isolated by construction (no cross-run kv/alloc leak). ──
+    try ensureArena();
     var host = hostmod.Host{
         .a = a,
         .mode = .map,
