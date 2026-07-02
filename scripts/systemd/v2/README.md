@@ -7,7 +7,7 @@ The V2 stack is **four** co-located processes per host:
 | `rewind-cp` | `:9090` + raft `:9101` | directory raft + `/_control` + `/_cp` |
 | `rewind-worker` | `:8443` h2c + raft `:8501` | DP multi-raft + JS dispatch |
 | `rewind-front` | `:443` + `:80` | stateless public TLS edge |
-| `rewind-logs` | `127.0.0.1:8444` h2c + metrics `:9113` | request-log / tape indexer + query API (per-node, S3-fed) |
+| `rewind-logs` | `:8444` h2c (loopback for single-node; node's private IP for multi-node push fan-out) + metrics `:9113` | request-log / tape indexer + query API (per-node, S3-fed) |
 
 ## Where the units live
 

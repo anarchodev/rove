@@ -145,11 +145,22 @@ storage's blob-replication rule).
   lets a single click-through decompress one record with one range-GET. One PUT
   per flush regardless of tenant count — the per-node interleaved layout collapses
   what would be `O(active tenants)` PUTs to one (see decisions.md §11).
-- **Indexer** (`src/log_server/indexer.zig`): a standalone process polls S3
-  (LIST → head range-GET the sidecar → `INSERT OR IGNORE` into SQLite). A worker
-  **push** (`POST /v1/_internal/batch-pushed`, services-JWT) indexes a batch
-  by-key immediately, closing the S3 LIST eventual-consistency window; polling is
-  the catch-up fallback.
+- **Indexer** (`src/log_server/indexer.zig`): **one log-server per node**, each
+  an independent COMPLETE replica — it polls the shared S3 store (LIST → head
+  range-GET the sidecar → `INSERT OR IGNORE` into its own local SQLite), so every
+  node can answer a query for any tenant's logs. It binds the node's
+  **private-plane IP** `:8444` (not loopback), so peer nodes' workers can reach
+  it — firewalled to the node IPs, same isolation as the raft/CP ports.
+- **Push fan-out** (`worker_log.zig` → `POST /v1/_internal/batch-pushed`,
+  services-JWT): a batch indexed by-key immediately, closing the S3 LIST
+  eventual-consistency window. Because a log query can land on **any** node's
+  `__admin__` leader → its LOCAL indexer, each worker fans out every flushed
+  batch key to **all** nodes' log-servers (`REWIND_LOG_PUSH_BASES`, a list;
+  unset → the single local base). The push carries only the S3 object keys (~62 B
+  each, ≤1024/POST), never record bytes — the records are already in the batch
+  object the flusher PUT; a target does one direct GET per key. A per-target
+  failure is soft: that node's LIST poll is the catch-up. Polling is the
+  fallback for every node regardless.
 - **Query** (`standalone.zig`): `list` is answered from the SQLite index (no S3);
   `show/{request_id}` range-GETs the one record's frame and inflates it. Logs are
   the customer-facing replay store (page-encrypted at rest); operator signals go

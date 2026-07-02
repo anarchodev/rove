@@ -81,11 +81,18 @@ secrets), loaded by the units via `EnvironmentFile=`:
     `REWIND_CP_VOTERS` / `REWIND_CP_PEERS` (directory raft) — the full static
     voter set, so each group is born knowing its members and elects on its own.
   - **Log indexer:** `REWIND_LOG_INTERNAL_BASE=http://127.0.0.1:8444` (the
-    worker's view of the LOCAL log-server — this one base drives both the
-    `__admin__` query door and the batch-push fast-path), `LOG_S3_KEY_PREFIX`
+    worker's view of the LOCAL log-server — drives the `__admin__` query door,
+    and by default the batch-push fast-path too), `LOG_S3_KEY_PREFIX`
     (a per-cluster prefix; node ids repeat across clusters, so a shared bucket
     needs a unique value here to keep `_logs/{node}/` from colliding), and
-    `REWIND_LOGS_METRICS_PORT` (default 9113).
+    `REWIND_LOGS_METRICS_PORT` (default 9113). **Single node → this is all you
+    need** (push-to-local). **Multi-node:** each node runs its own indexer and a
+    log query can land on any node's `__admin__` leader, so set
+    `REWIND_LOG_PUSH_BASES` to every node's log-server (`http://IP1:8444,…`) so
+    workers fan out each batch to all of them — which requires the log-servers to
+    bind a reachable address (not loopback): `--listen <private-ip>:8444` and set
+    `REWIND_LOG_INTERNAL_BASE` to that same private IP. See
+    [`architecture/deployment-and-logs.md`](../architecture/deployment-and-logs.md).
 - **`node.env`** — per-node, just the node identity. Copy
   [`scripts/systemd/v2/node.env.example`](../../scripts/systemd/v2/node.env.example).
 
@@ -192,10 +199,15 @@ WantedBy=default.target
 
 One per node, co-located with the worker. It reads the shared S3 batch store
 (every node's `_logs/{node}/` prefix) and indexes into a **local** SQLite cache,
-so each node's log-server is an independent **complete replica**. The local
-worker reaches it on loopback `:8444`; the batch-push fast-path warms this
-node's index immediately while the S3 poll fills in the other nodes. Stateless
-(no raft) — the SQLite index is a rebuildable cache; restart or wipe it freely.
+so each node's log-server is an independent **complete replica**. Stateless (no
+raft) — the SQLite index is a rebuildable cache; restart or wipe it freely.
+
+The example below binds loopback `:8444` — correct for a **single node**
+(push-to-local; the worker's batch-push warms the one index immediately). For
+**multi-node**, bind the node's private IP instead (`--listen <private-ip>:8444`)
+so peer workers can push to it, and set `REWIND_LOG_PUSH_BASES` on every worker
+to all the log-servers (see the env note above) — otherwise a peer's batches
+only reach this index via the S3 poll.
 
 ```ini
 [Unit]
