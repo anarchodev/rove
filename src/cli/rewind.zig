@@ -304,23 +304,25 @@ fn cmdDeploy(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, bundle: 
     if (release) cmdRelease(a, cfg, tenant, dep_id);
 }
 
-/// `rewind release <tenant> <dep_id_hex>` — flip the live pointer via the
-/// ownership-gated publishRelease RPC.
+/// `rewind release <tenant> <dep_id_hex>` — flip the live pointer via the admin
+/// app's ownership-gated release route.
 fn cmdRelease(a: std.mem.Allocator, cfg: *const Cfg, tenant: []const u8, dep_id: []const u8) void {
     // dep_id rides the wire as a HEX STRING, not a JSON number: dep_ids are
     // sha256-derived u64 (> 2^53), so a JSON number would lose precision at
     // JSON.parse / JS_ToFloat64 and release the wrong (rounded) manifest.
     _ = std.fmt.parseInt(u64, dep_id, 16) catch c.fatal("bad dep_id {s} (want hex)", .{dep_id});
+    // REST route: POST /v1/instances/{id}/release {"dep_id":"<hex>"} (admin app's
+    // ROUTES table). The old `{fn,args}` RPC to `/` was retired — posting it left
+    // dep_id in publishRelease's lossy number branch → 400 "must be a positive
+    // integer". Keep dep_id a hex string so it never round-trips through an f64.
     var body = std.ArrayList(u8){};
-    body.appendSlice(a, "{\"fn\":\"publishRelease\",\"args\":[") catch c.oom();
-    c.writeJsonString(&body, a, tenant);
-    body.append(a, ',') catch c.oom();
+    body.appendSlice(a, "{\"dep_id\":") catch c.oom();
     c.writeJsonString(&body, a, dep_id);
-    body.appendSlice(a, "]}") catch c.oom();
-    const url = std.fmt.allocPrint(a, "{s}/", .{cfg.admin_url}) catch c.oom();
+    body.append(a, '}') catch c.oom();
+    const url = std.fmt.allocPrint(a, "{s}/v1/instances/{s}/release", .{ cfg.admin_url, tenant }) catch c.oom();
     const r = httpCall(a, cfg, "POST", url, &.{JSON_CT}, body.items, true, 30);
     if (r.code == 401) c.fatal("not signed in — run `rewind login`", .{});
-    if (r.code == 403) c.fatal("you don't own {s}", .{tenant});
+    if (r.code == 403) c.fatal("you don't own {s} (system tenants are operator-only — use rewind-ops)", .{tenant});
     if (r.code != 202) c.fatal("release failed: {d} {s}", .{ r.code, c.trunc(r.body) });
     std.debug.print("released {s} @ {s}\n", .{ tenant, dep_id });
 }
