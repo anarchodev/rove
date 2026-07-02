@@ -1771,6 +1771,24 @@ fn scopeKvWrite(
     } else state.allocator.dupe(u8, "") catch return js_exception;
     defer state.allocator.free(val);
 
+    // Self-scope (the scope target IS the dispatching tenant, e.g. __admin__
+    // deploying ITSELF via handleWsReset's `scope(__admin__).kv.delete`): route
+    // through THIS dispatch's writeset like other platform writers, NOT the
+    // cross-tenant trampoline. The trampoline opens a second TrackedTxn on a
+    // store this dispatch already holds the single-writer lease for, so
+    // `ensureOpen`'s `tryAcquire` returns null → Error.Conflict → KvFailed (the
+    // __admin__ deploy-reset wedge). Riding the dispatch writeset also commits
+    // atomically with the handler's own batch.
+    if (std.mem.eql(u8, id, state.instance_id)) {
+        (switch (op) {
+            .put => state.writeset.addPut(key, val),
+            .delete => state.writeset.addDelete(key),
+        }) catch |err| {
+            state.pending_kv_error = err;
+        };
+        return js_undefined;
+    }
+
     fn_ptr(fn_ctx, state.allocator, id, op, key, val) catch |err| switch (err) {
         error.InstanceNotFound => return jsThrowInstanceNotFound(ctx),
         else => {
