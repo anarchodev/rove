@@ -158,8 +158,6 @@ pub fn runWorld(
     try ensureArena();
     var host = hostmod.Host{
         .a = a,
-        .mode = .map,
-        .kv = &.{},
         .kv_map = kv_map,
         .sources = sources,
         .source_dir = source_dir,
