@@ -1177,6 +1177,10 @@ pub const WorkerConfig = struct {
     /// Public origin the dashboard uses to reach the log-server.
     /// Returned in the `/_system/services-token` response. Borrowed.
     log_public_base: ?[]const u8 = null,
+    /// Worker→log-server push fan-out targets. The push thread POSTs each
+    /// flushed batch key to every base (multi-node prod = one per node). Empty
+    /// disables push. Borrowed.
+    log_push_bases: []const []const u8 = &.{},
     /// Public origin the dashboard / CLI uses to reach files-server.
     /// Returned in the `/_system/services-token` response. Borrowed.
     files_public_base: ?[]const u8 = null,
@@ -1759,14 +1763,17 @@ pub fn Worker(comptime opts: Options) type {
         cluster_id: ?[]const u8,
         cp_urls: []const []const u8,
         log_public_base: ?[]const u8,
+        /// Push fan-out targets (see `WorkerConfig.log_push_bases`). Empty →
+        /// no push thread; `pushBatchKey` short-circuits. Borrowed.
+        log_push_bases: []const []const u8,
         files_public_base: ?[]const u8,
         /// Internal-service POST insecure-TLS toggle (now log-push
         /// only — see the worker struct field doc).
         internal_insecure_tls: bool,
         /// libcurl handle for log-server push (`POST /v1/_internal/
-        /// batch-pushed`). Lazily created when `log_public_base` is
-        /// set. Null disables the push path; the indexer's 500ms
-        /// LIST polling is the catch-up.
+        /// batch-pushed`), reused sequentially across all `log_push_bases`.
+        /// Lazily created when `log_push_bases` is non-empty. Null disables the
+        /// push path; each indexer's LIST poll is the catch-up.
         log_push_curl: ?*blob_mod.curl.Easy,
 
         /// Background log flusher — owns its own thread, sleeps on
@@ -1873,10 +1880,11 @@ pub fn Worker(comptime opts: Options) type {
                 .cluster_id = config.cluster_id,
                 .cp_urls = config.cp_urls,
                 .log_public_base = config.log_public_base,
+                .log_push_bases = config.log_push_bases,
                 .files_public_base = config.files_public_base,
                 .internal_insecure_tls = config.internal_insecure_tls,
                 .log_push_curl = blk: {
-                    if (config.log_public_base == null) break :blk null;
+                    if (config.log_push_bases.len == 0) break :blk null;
                     break :blk blob_mod.curl.Easy.init(allocator) catch |err| {
                         std.log.warn("rove-js: log-push libcurl init failed: {s}; batch push disabled", .{@errorName(err)});
                         break :blk null;
@@ -1942,7 +1950,7 @@ pub fn Worker(comptime opts: Options) type {
             self.flusher_thread = try std.Thread.spawn(.{}, flusherLoop, .{self});
 
             // Spawn the push thread only if a libcurl handle was
-            // built (i.e. `log_public_base` is set). Without it
+            // built (i.e. `log_push_bases` is non-empty). Without it
             // pushBatchKey would short-circuit anyway; the thread
             // would just spin.
             if (self.log_push_curl != null) {

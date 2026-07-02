@@ -108,6 +108,11 @@ const WorkerCtx = struct {
     /// catch-up. Enables the worker's batch-pushed fast-path (off the main loop,
     /// on the dedicated push thread).
     log_public_base: ?[]const u8,
+    /// Worker→log-server push fan-out targets (`REWIND_LOG_PUSH_BASES`, a list;
+    /// default the single `log_public_base`). Empty disables push. The push
+    /// thread POSTs each flushed batch key to every base; per-target failure is
+    /// soft (that node's S3 LIST poll is the catch-up). Borrowed.
+    log_push_bases: []const []const u8,
     /// Services-JWT HMAC secret the push thread mints its bearer token with
     /// (the log-server verifies the same secret). Distinct from
     /// `node_state.services_jwt_secret` (the door-read copy) — the worker config
@@ -274,6 +279,7 @@ fn workerMain(args: *WorkerCtx) !void {
         .cluster_id = args.cluster_id,
         .cp_urls = args.cp_urls,
         .log_public_base = args.log_public_base,
+        .log_push_bases = args.log_push_bases,
         .services_jwt_secret = args.services_jwt_secret,
     });
     defer worker.destroy();
@@ -728,6 +734,28 @@ pub fn main() !void {
     // fan-out, not a single base — see the deployment notes.)
     const log_public_base: ?[]const u8 = std.posix.getenv("REWIND_LOG_PUBLIC_BASE") orelse log_internal_base;
 
+    // Worker→log-server push fan-out targets. Multi-node prod runs ONE
+    // per-node log-server indexer per node (loopback `:8444`), and a log query
+    // can land on any node's `__admin__` leader → its LOCAL indexer. So the
+    // worker pushes each flushed batch key to ALL nodes' log-servers; a node
+    // that misses the push still catches up via its S3 LIST poll (~5 s), so a
+    // per-target failure is soft. `REWIND_LOG_PUSH_BASES` is a `,`/`;`-list of
+    // internal origins (e.g. `http://10.0.0.1:8444,http://10.0.0.2:8444,…`),
+    // reachable on the private plane (the log-servers must bind it, not
+    // loopback). Unset → fall back to the single `log_public_base` (back-compat:
+    // dev + single-node push-to-local); both empty → push disabled, poll-only.
+    const log_push_bases: []const []const u8 = blk: {
+        const env = std.posix.getenv("REWIND_LOG_PUSH_BASES") orelse "";
+        if (env.len > 0) break :blk try parseUrlList(allocator, env);
+        if (log_public_base) |b| {
+            const one = try allocator.alloc([]const u8, 1);
+            one[0] = try allocator.dupe(u8, b);
+            break :blk one;
+        }
+        break :blk &.{};
+    };
+    defer if (log_push_bases.len > 0) freeUrlList(allocator, log_push_bases);
+
     // Blob backend (fs or s3) — process-wide, env-selected.
     var blob_owned = try blob_mod.env.loadFromEnv(allocator);
     defer blob_owned.deinit(allocator);
@@ -944,6 +972,7 @@ pub fn main() !void {
         .cluster_id = cluster_id,
         .cp_urls = cp_urls,
         .log_public_base = log_public_base,
+        .log_push_bases = log_push_bases,
         .services_jwt_secret = services_jwt_secret,
         .peer_urls = peer_urls,
         .ready = &ready,

@@ -699,9 +699,7 @@ fn pushBatchKey(
     batch_key: []const u8,
 ) !void {
     if (worker.log_push_curl == null) return;
-    if (worker.log_public_base) |base| {
-        if (base.len == 0) return;
-    } else return;
+    if (worker.log_push_bases.len == 0) return;
     const key_copy = try allocator.dupe(u8, batch_key);
     worker.push_queue_mutex.lock();
     defer worker.push_queue_mutex.unlock();
@@ -757,28 +755,30 @@ pub fn pushLoop(worker: anytype) void {
     }
 }
 
-/// POST a single chunk of newline-separated batch keys.
+/// POST a single chunk of newline-separated batch keys to EVERY configured
+/// log-server (`worker.log_push_bases` — one per node in multi-node prod).
+/// The token + body are built once and reused across targets; the curl handle
+/// is reused sequentially. A per-target failure is SOFT — that node's S3 LIST
+/// poll is the catch-up and the other targets still get the key — so we log and
+/// continue rather than abort the whole fan-out.
 fn sendPushChunk(
     worker: anytype,
     allocator: std.mem.Allocator,
     keys: []const []u8,
 ) !void {
     const easy = worker.log_push_curl orelse return;
-    const log_base = worker.log_public_base orelse return;
     const secret = worker.services_jwt_secret orelse return;
+    if (worker.log_push_bases.len == 0) return;
 
-    const url = try std.fmt.allocPrint(allocator, "{s}/v1/_internal/batch-pushed", .{log_base});
-    defer allocator.free(url);
-
-    // JWT is minted once per chunk (60 s exp). Reusing it across
-    // multiple chunks in the same tick would be cheaper, but the
-    // chunk loop almost always runs just once.
+    // JWT minted once per chunk (60 s exp) and reused across every fan-out
+    // target — the log-servers all verify the same services secret.
     const now_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
     const token = try jwt_mod.mint(allocator, secret, .{ .exp_ms = now_ms + 60 * 1000 });
     defer allocator.free(token);
     const auth_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
     defer allocator.free(auth_value);
 
+    // Body (newline-joined keys) built once, shared by every target.
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(allocator);
     for (keys, 0..) |k, i| {
@@ -790,23 +790,34 @@ fn sendPushChunk(
         .{ .name = "Authorization", .value = auth_value },
         .{ .name = "Content-Type", .value = "text/plain" },
     };
-    const use_h2c = std.mem.startsWith(u8, url, "http://");
-    var resp = try easy.request(allocator, .{
-        .method = .POST,
-        .url = url,
-        .headers = &headers,
-        .body = body.items,
-        .timeout_ms = 2000,
-        .connect_timeout_ms = 500,
-        .http_version = if (use_h2c) .h2c_prior_knowledge else .auto,
-        .verify_tls = !worker.internal_insecure_tls,
-    });
-    defer resp.deinit(allocator);
-    if (resp.status != 204) {
-        std.log.warn(
-            "rove-js push batch: {s} ({d} keys) → {d}",
-            .{ url, keys.len, resp.status },
-        );
+
+    for (worker.log_push_bases) |base| {
+        const url = std.fmt.allocPrint(allocator, "{s}/v1/_internal/batch-pushed", .{base}) catch continue;
+        defer allocator.free(url);
+        const use_h2c = std.mem.startsWith(u8, url, "http://");
+        var resp = easy.request(allocator, .{
+            .method = .POST,
+            .url = url,
+            .headers = &headers,
+            .body = body.items,
+            .timeout_ms = 2000,
+            .connect_timeout_ms = 500,
+            .http_version = if (use_h2c) .h2c_prior_knowledge else .auto,
+            .verify_tls = !worker.internal_insecure_tls,
+        }) catch |err| {
+            std.log.warn(
+                "rove-js push batch: {s} ({d} keys) failed: {s} (LIST poll catches up)",
+                .{ url, keys.len, @errorName(err) },
+            );
+            continue;
+        };
+        defer resp.deinit(allocator);
+        if (resp.status != 204) {
+            std.log.warn(
+                "rove-js push batch: {s} ({d} keys) → {d}",
+                .{ url, keys.len, resp.status },
+            );
+        }
     }
 }
 
