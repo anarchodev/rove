@@ -1780,12 +1780,37 @@ fn scopeKvWrite(
     // __admin__ deploy-reset wedge). Riding the dispatch writeset also commits
     // atomically with the handler's own batch.
     if (std.mem.eql(u8, id, state.instance_id)) {
-        (switch (op) {
-            .put => state.writeset.addPut(key, val),
-            .delete => state.writeset.addDelete(key),
-        }) catch |err| {
-            state.pending_kv_error = err;
-        };
+        // Write to BOTH the dispatch's speculative overlay (`state.txn`) and
+        // the writeset — exactly as `jsKvSet`/`jsKvDelete` do. `state.txn` is
+        // the local durability + read-your-write overlay AND what marks the
+        // batch dirty so `finalizeBatch` proposes it; the writeset is the raft
+        // payload for followers. The original d8362eb fix wrote ONLY the
+        // writeset, so a standalone self-scope write never entered the overlay:
+        // the dispatch looked clean, the 2xx was released, and the write was
+        // silently dropped (never locally durable, never proposed). `state.txn`
+        // is THIS dispatch's already-open txn, so there is no second
+        // `beginTrackedImmediate` acquire — that trampoline double-acquire was
+        // the wedge d8362eb set out to avoid.
+        switch (op) {
+            .put => {
+                state.txn.put(key, val) catch |err| {
+                    state.pending_kv_error = err;
+                    return js_undefined;
+                };
+                state.writeset.addPut(key, val) catch |err| {
+                    state.pending_kv_error = err;
+                };
+            },
+            .delete => {
+                state.txn.delete(key) catch |err| {
+                    state.pending_kv_error = err;
+                    return js_undefined;
+                };
+                state.writeset.addDelete(key) catch |err| {
+                    state.pending_kv_error = err;
+                };
+            },
+        }
         return js_undefined;
     }
 
