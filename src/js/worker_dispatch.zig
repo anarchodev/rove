@@ -1927,7 +1927,11 @@ fn handleRelease(
     // that's fine, the customer DID hit "deploy" again. Different
     // releases get different timestamps even if content collides.
     var ts_buf: [20]u8 = undefined;
-    const ts_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
+    // MUST be unsigned: `{d:0>20}` on a signed positive integer reserves a
+    // sign column and emits a leading `+` ("000000+<ms>"), which is not a
+    // digit — the dashboard reader's `parseInt(key.slice(9), 10)` then stops
+    // at the `+` and reads ts_ms as 0. u64 formats as pure digits.
+    const ts_ms: u64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
     const ts_str = std.fmt.bufPrint(&ts_buf, "{d:0>20}", .{ts_ms}) catch unreachable;
     var release_key_buf: [32]u8 = undefined;
     const release_key = std.fmt.bufPrint(&release_key_buf, "_release/{s}", .{ts_str}) catch unreachable;
@@ -4153,4 +4157,29 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         batch_readset_bytes,
     );
     return processed;
+}
+
+test "release-history key is pure digits (no sign) — regression for the i64 `+` bug" {
+    // Mirrors the key construction in `handleRelease` (and the
+    // `platform.releases.publish` trampoline in worker.zig). `ts_ms` MUST be
+    // unsigned: `{d:0>20}` on a signed positive integer reserves a sign column
+    // and emits a leading `+` ("_release/000000+<ms>"). That `+` is not a
+    // digit, so the dashboard reader's `parseInt(key.slice("_release/".len),
+    // 10)` stops at it and reports ts_ms = 0 for every release. Keep the type
+    // u64 so the key stays lex-sortable and round-trips through parseInt.
+    const ts_ms: u64 = 1783041027051;
+    var ts_buf: [20]u8 = undefined;
+    const ts_str = try std.fmt.bufPrint(&ts_buf, "{d:0>20}", .{ts_ms});
+    var key_buf: [32]u8 = undefined;
+    const release_key = try std.fmt.bufPrint(&key_buf, "_release/{s}", .{ts_str});
+
+    // 13-digit ms → 7 leading zeros to fill the 20-wide field. No `+`.
+    try std.testing.expectEqualStrings("_release/00000001783041027051", release_key);
+    try std.testing.expect(std.mem.indexOfScalar(u8, release_key, '+') == null);
+    // Every char after the `_release/` prefix is an ASCII digit, 20 wide …
+    const suffix = release_key["_release/".len..];
+    try std.testing.expectEqual(@as(usize, 20), suffix.len);
+    for (suffix) |ch| try std.testing.expect(ch >= '0' and ch <= '9');
+    // … and the suffix round-trips back to the original ms (what the reader does).
+    try std.testing.expectEqual(ts_ms, try std.fmt.parseInt(u64, suffix, 10));
 }

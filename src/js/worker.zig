@@ -2428,7 +2428,10 @@ pub fn Worker(comptime opts: Options) type {
             // JS `platform.releases.publish`). Lex-ordered by ts for a newest-
             // first reverse scan.
             var ts_buf: [20]u8 = undefined;
-            const ts_ms: i64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
+            // MUST be unsigned — see the note in worker_dispatch.zig's
+            // handleRelease: `{d:0>20}` on a signed positive int emits a
+            // leading `+` sign that breaks the dashboard reader's parseInt.
+            const ts_ms: u64 = @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
             const ts_str = std.fmt.bufPrint(&ts_buf, "{d:0>20}", .{ts_ms}) catch unreachable;
             var rk_buf: [32]u8 = undefined;
             const release_key = std.fmt.bufPrint(&rk_buf, "_release/{s}", .{ts_str}) catch unreachable;
