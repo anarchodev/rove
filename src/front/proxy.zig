@@ -186,11 +186,37 @@ pub fn isIdempotentMethod(method: []const u8) bool {
         std.mem.eql(u8, method, "OPTIONS");
 }
 
-/// Strip a `:port` suffix from an `:authority` / Host value, matching
-/// the worker's `hostOnly`. Leaves bare hostnames untouched.
+/// Strip a `:port` suffix from an `:authority` / Host value. Bracketed
+/// IPv6 literals (`[::1]`, `[::1]:443`) keep their brackets — the old
+/// bare `lastIndexOfScalar(':')` split a portless `[::1]` mid-address.
 pub fn hostOnly(authority: []const u8) []const u8 {
+    if (authority.len > 0 and authority[0] == '[') {
+        if (std.mem.indexOfScalar(u8, authority, ']')) |i| return authority[0 .. i + 1];
+        return authority; // malformed — normalizeHost's charset gate owns rejection
+    }
     if (std.mem.lastIndexOfScalar(u8, authority, ':')) |i| return authority[0..i];
     return authority;
+}
+
+/// Normalize a client-supplied `:authority` / Host into the canonical
+/// routing key (plan B9): port stripped (bracket-aware), LOWERCASED
+/// (DNS names are case-insensitive — un-normalized, `HOST.example` and
+/// `host.example` were distinct cache entries and distinct CP
+/// round-trips, and deliberate case-flipping bypassed the route
+/// cache), and charset-restricted so raw client bytes never reach
+/// cache keys, the `/_cp/route?host=` query string, or log lines.
+/// Null = junk; the caller answers 400. `buf` holds the lowered copy.
+pub fn normalizeHost(buf: *[255]u8, authority: []const u8) ?[]const u8 {
+    const raw = hostOnly(authority);
+    if (raw.len == 0 or raw.len > buf.len) return null;
+    for (raw, 0..) |ch, i| {
+        const low = std.ascii.toLower(ch);
+        const ok = (low >= 'a' and low <= 'z') or (ch >= '0' and ch <= '9') or
+            ch == '.' or ch == '-' or ch == '_' or ch == ':' or ch == '[' or ch == ']';
+        if (!ok) return null;
+        buf[i] = low;
+    }
+    return buf[0..raw.len];
 }
 
 /// hop-by-hop headers must not be forwarded across a proxy (RFC 7230
@@ -964,7 +990,11 @@ pub fn Proxy(comptime FrontH2: type) type {
                     self.server.wsUpgradeReject(ent, 400);
                     continue;
                 };
-                const host = hostOnly(authority_raw);
+                var host_buf: [255]u8 = undefined;
+                const host = normalizeHost(&host_buf, authority_raw) orelse {
+                    self.server.wsUpgradeReject(ent, 400);
+                    continue;
+                };
                 const route = self.resolveRoute(host, now_ns);
                 switch (route) {
                     .not_found => {
@@ -1294,7 +1324,11 @@ pub fn Proxy(comptime FrontH2: type) type {
                 try self.replyStatus(coll, ent, sid, sess, 400);
                 return null;
             };
-            const host = hostOnly(authority_raw);
+            var host_buf: [255]u8 = undefined;
+            const host = normalizeHost(&host_buf, authority_raw) orelse {
+                try self.replyStatus(coll, ent, sid, sess, 400);
+                return null;
+            };
 
             const route = self.resolveRoute(host, now_ns);
             switch (route) {
@@ -2764,6 +2798,22 @@ fn resolveOrigin(origin: []const u8) !std.net.Address {
 // ── Tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "normalizeHost: lowercases, strips port bracket-aware, rejects junk" {
+    var buf: [255]u8 = undefined;
+
+    try testing.expectEqualStrings("acme.example", normalizeHost(&buf, "ACME.Example:8443").?);
+    try testing.expectEqualStrings("acme.example", normalizeHost(&buf, "acme.example").?);
+    // IPv6 literal keeps its brackets, with and without a port (the
+    // old bare last-colon split broke the portless form).
+    try testing.expectEqualStrings("[::1]", normalizeHost(&buf, "[::1]:8443").?);
+    try testing.expectEqualStrings("[::1]", normalizeHost(&buf, "[::1]").?);
+    // Junk never reaches cache keys / the CP query string / logs.
+    try testing.expect(normalizeHost(&buf, "a b") == null);
+    try testing.expect(normalizeHost(&buf, "acme.example/evil?x=") == null);
+    try testing.expect(normalizeHost(&buf, "") == null);
+    try testing.expect(normalizeHost(&buf, "acme\r\nx-inject: 1") == null);
+}
 
 test "nominatedByConnection: Connection-listed headers are hop-by-hop (RFC 7230 §6.1)" {
     // A client smuggling `Connection: x-secret-hint` must not get
