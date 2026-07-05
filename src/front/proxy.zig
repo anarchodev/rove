@@ -83,6 +83,15 @@ pub const CHUNK_MAX: u32 = 64 * 1024;
 /// Reconnect backoff for a backend node whose connect failed.
 const CONNECT_BACKOFF_NS: i128 = 500 * std.time.ns_per_ms;
 
+/// Default deadline for an upstream connect to complete (overridable
+/// via `REWIND_FRONT_CONNECT_TIMEOUT_MS`). The io layer puts no
+/// timeout on the connect op, so a backend that blackholes SYNs (node
+/// down hard, partition, firewall drop) otherwise hangs every flow
+/// aimed at it for the kernel SYN-retry budget (~2 min) — no proxy
+/// deadline covered the waiting-on-connect window (plan A1). Backends
+/// are same-DC private-plane peers; 1 s is generous.
+const CONNECT_TIMEOUT_NS_DEFAULT: i128 = 1000 * std.time.ns_per_ms;
+
 /// How long a request parks waiting for a cold route resolution before
 /// it gives up with a retryable 503. Bounds the worst case for a
 /// never-seen host when the CP is slow/down (vs. the old behavior of
@@ -459,6 +468,9 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// Live-flow count (operator visibility / leak canary).
         live_flows: usize = 0,
         live_tunnels: usize = 0,
+        /// Upstream connect deadline (`REWIND_FRONT_CONNECT_TIMEOUT_MS`;
+        /// main.zig overrides after init).
+        connect_timeout_ns: i128 = CONNECT_TIMEOUT_NS_DEFAULT,
 
         const StreamKey = struct {
             idx: u32,
@@ -492,6 +504,11 @@ pub fn Proxy(comptime FrontH2: type) type {
             /// tunnels wait in `waiters`. 0 = unset (no tunnel awaiting
             /// SETTINGS). Stamped/cleared by `drainSettledTunnels`.
             settle_deadline_ns: i128 = 0,
+            /// Deadline for an in-flight connect to complete. Stamped at
+            /// dial time; swept by `expireStalledConnects` (a SYN-
+            /// blackholed backend otherwise pins its waiters for the
+            /// kernel connect budget). 0 = no connect in flight.
+            connect_deadline_ns: i128 = 0,
         };
 
         /// One WS tunnel: a downstream h1 Upgrade paired with an upstream
@@ -721,6 +738,8 @@ pub fn Proxy(comptime FrontH2: type) type {
             self.expireParkedRoutes(now_ns);
             // 504 any flow stuck awaiting upstream response headers.
             self.expireStalledResponses(now_ns);
+            // Fail over waiters whose upstream connect blew its deadline.
+            self.expireStalledConnects(now_ns);
             try self.reg.flush();
         }
 
@@ -1312,6 +1331,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             self.reg.set(ce, &self.server.client_connect_in, FlowRef, .{ .ptr = @ptrCast(up) }) catch {};
 
             up.state = .connecting;
+            up.connect_deadline_ns = now + self.connect_timeout_ns;
             up.waiters.append(self.allocator, waiter) catch {
                 // The connect proceeds (other waiters may join); this
                 // one fails over.
@@ -1492,6 +1512,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                         const up: *Upstream = @ptrCast(@alignCast(p));
                         up.state = .up;
                         up.sess = sess.entity;
+                        up.connect_deadline_ns = 0;
                         self.drainWaiters(up, true);
                     }
                     try self.reg.destroy(ent);
@@ -1507,6 +1528,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                         up.state = .down;
                         up.sess = Entity.nil;
                         up.last_fail_ns = now_ns;
+                        up.connect_deadline_ns = 0;
                         std.log.warn("front: connect to {s} failed", .{up.origin});
                         self.drainWaiters(up, false);
                     }
@@ -2412,6 +2434,47 @@ pub fn Proxy(comptime FrontH2: type) type {
                         i += 1;
                     }
                 }
+            }
+        }
+
+        /// Fail the waiters of any `.connecting` pool entry past its
+        /// connect deadline (plan A1). The io connect op has no timeout,
+        /// so a SYN-blackholed backend otherwise pins its waiters for
+        /// the kernel connect budget (~2 min); waiters fail over to the
+        /// next node instead (`attemptFailed` with nothing sent — safe
+        /// for any method). The entry is marked down with a fresh
+        /// backoff stamp so immediate re-dials don't hammer it. The
+        /// LATE io completion is harmless: a success flips the entry
+        /// back to `.up` (usable, waiters already gone; the conn is
+        /// idle-reaped if unused), an error re-marks it down. Snapshot
+        /// the heap-stable `*Upstream` set first — `drainWaiters` can
+        /// re-aim a flow and `poolEntry`-insert a new entry (the same
+        /// pattern as `drainSettledTunnels`).
+        fn expireStalledConnects(self: *Self, now_ns: i128) void {
+            var ups: [64]*Upstream = undefined;
+            var n: usize = 0;
+            var it = self.pool.valueIterator();
+            while (it.next()) |up_ptr| {
+                if (n >= ups.len) {
+                    std.log.warn("front: pool exceeds {d} entries — connect sweep deferred some", .{ups.len});
+                    break;
+                }
+                ups[n] = up_ptr.*;
+                n += 1;
+            }
+            for (ups[0..n]) |up| {
+                if (up.state != .connecting or up.connect_deadline_ns == 0) continue;
+                if (now_ns < up.connect_deadline_ns) continue;
+                std.log.warn("front: connect to {s} timed out after {d}ms — failing {d} waiter(s) over", .{
+                    up.origin,
+                    @divTrunc(self.connect_timeout_ns, std.time.ns_per_ms),
+                    up.waiters.items.len,
+                });
+                up.state = .down;
+                up.sess = Entity.nil;
+                up.last_fail_ns = now_ns;
+                up.connect_deadline_ns = 0;
+                self.drainWaiters(up, false);
             }
         }
 

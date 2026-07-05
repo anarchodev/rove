@@ -504,6 +504,9 @@ pub fn main() !void {
         .websocket_surface = true,
     });
     var proxy = Proxy.init(allocator, &reg, server, cp_urls, &cache, resolver);
+    // Upstream connect deadline (plan A1): a SYN-blackholed backend
+    // fails over in ~this long instead of the kernel connect budget.
+    proxy.connect_timeout_ns = envMs("REWIND_FRONT_CONNECT_TIMEOUT_MS", 1_000) * std.time.ns_per_ms;
     // Teardown order matters: `server.destroy()` releases any still-live
     // body sinks, and those callbacks walk proxy-owned Flow state — so the
     // server must go down while the proxy is still alive. One defer block
