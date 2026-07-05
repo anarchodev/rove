@@ -229,50 +229,117 @@ pub const RouteCache = struct {
     allocator: std.mem.Allocator,
     map: std.StringHashMapUnmanaged(CacheEntry) = .empty,
     ttl_ns: i128,
+    /// TTL for NEGATIVE entries (host the CP answered 404 for). Kept
+    /// separate from `ttl_ns`: a placement changes on a tenant move
+    /// (short TTL bounds move latency), but "this host doesn't exist"
+    /// only changes on provisioning — and negative caching is what
+    /// keeps internet scanners probing garbage Host values from
+    /// serially occupying the CP resolver (plan A6).
+    neg_ttl_ns: i128,
+    /// Live negative entries. Negative keys are attacker-controlled
+    /// (any Host header), so their count is capped — see NEG_CAP.
+    neg_count: usize = 0,
+
+    /// Max negative entries. At the cap, expired negatives are swept;
+    /// if still full the insert is skipped (a flood degrades to the
+    /// uncached behavior, never to unbounded memory).
+    const NEG_CAP: usize = 4096;
 
     const CacheEntry = struct {
+        /// Empty and unowned for a negative entry (`negative` guards
+        /// the free).
         nodes: [][]u8,
+        negative: bool,
         expires_ns: i128,
     };
 
-    pub fn init(allocator: std.mem.Allocator, ttl_ns: i128) RouteCache {
-        return .{ .allocator = allocator, .ttl_ns = ttl_ns };
+    pub const Hit = union(enum) {
+        nodes: []const []const u8,
+        not_found,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, ttl_ns: i128, neg_ttl_ns: i128) RouteCache {
+        return .{ .allocator = allocator, .ttl_ns = ttl_ns, .neg_ttl_ns = neg_ttl_ns };
     }
 
     pub fn deinit(self: *RouteCache) void {
         var it = self.map.iterator();
         while (it.next()) |e| {
             self.allocator.free(e.key_ptr.*);
-            freeNodes(self.allocator, e.value_ptr.nodes);
+            if (!e.value_ptr.negative) freeNodes(self.allocator, e.value_ptr.nodes);
         }
         self.map.deinit(self.allocator);
     }
 
-    fn get(self: *RouteCache, host: []const u8, now_ns: i128) ?[]const []const u8 {
+    fn get(self: *RouteCache, host: []const u8, now_ns: i128) ?Hit {
         const e = self.map.getPtr(host) orelse return null;
         if (now_ns >= e.expires_ns) return null;
-        return e.nodes;
+        if (e.negative) return .not_found;
+        return .{ .nodes = e.nodes };
     }
 
     fn putOwned(self: *RouteCache, host: []const u8, owned_nodes: [][]u8, now_ns: i128) !void {
         errdefer freeNodes(self.allocator, owned_nodes);
         const gop = try self.map.getOrPut(self.allocator, host);
         if (gop.found_existing) {
-            freeNodes(self.allocator, gop.value_ptr.nodes);
+            if (gop.value_ptr.negative) {
+                self.neg_count -= 1;
+            } else {
+                freeNodes(self.allocator, gop.value_ptr.nodes);
+            }
         } else {
             gop.key_ptr.* = self.allocator.dupe(u8, host) catch |e| {
                 self.map.removeByPtr(gop.key_ptr);
                 return e;
             };
         }
-        gop.value_ptr.nodes = owned_nodes;
-        gop.value_ptr.expires_ns = now_ns + self.ttl_ns;
+        gop.value_ptr.* = .{ .nodes = owned_nodes, .negative = false, .expires_ns = now_ns + self.ttl_ns };
+    }
+
+    /// Record a CP 404 for `host`. Best-effort (an allocation failure
+    /// or a full negative set just skips — the next request re-asks
+    /// the CP, which is today's behavior).
+    fn putNegative(self: *RouteCache, host: []const u8, now_ns: i128) void {
+        if (self.neg_count >= NEG_CAP) self.sweepExpiredNegatives(now_ns);
+        const gop = self.map.getOrPut(self.allocator, host) catch return;
+        if (gop.found_existing) {
+            if (!gop.value_ptr.negative) {
+                freeNodes(self.allocator, gop.value_ptr.nodes);
+                self.neg_count += 1;
+            }
+        } else {
+            if (self.neg_count >= NEG_CAP) {
+                self.map.removeByPtr(gop.key_ptr);
+                return;
+            }
+            gop.key_ptr.* = self.allocator.dupe(u8, host) catch {
+                self.map.removeByPtr(gop.key_ptr);
+                return;
+            };
+            self.neg_count += 1;
+        }
+        gop.value_ptr.* = .{ .nodes = &.{}, .negative = true, .expires_ns = now_ns + self.neg_ttl_ns };
+    }
+
+    fn sweepExpiredNegatives(self: *RouteCache, now_ns: i128) void {
+        var it = self.map.iterator();
+        var expired: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer expired.deinit(self.allocator);
+        while (it.next()) |e| {
+            if (e.value_ptr.negative and now_ns >= e.value_ptr.expires_ns)
+                expired.append(self.allocator, e.key_ptr.*) catch break;
+        }
+        for (expired.items) |key| self.invalidate(key);
     }
 
     pub fn invalidate(self: *RouteCache, host: []const u8) void {
         if (self.map.fetchRemove(host)) |kv| {
             self.allocator.free(kv.key);
-            freeNodes(self.allocator, kv.value.nodes);
+            if (kv.value.negative) {
+                self.neg_count -= 1;
+            } else {
+                freeNodes(self.allocator, kv.value.nodes);
+            }
         }
     }
 };
@@ -2170,13 +2237,17 @@ pub fn Proxy(comptime FrontH2: type) type {
 
         // ── Route resolution (off-loop; never blocks) ─────────────────
 
-        /// Non-blocking. A fresh cache hit returns nodes inline; a miss
-        /// (no entry or past TTL) enqueues an off-loop resolve and
-        /// returns `.pending` for the caller to park on. The CP is never
-        /// contacted on this thread, and a stale entry is never served
-        /// (so a tenant move re-resolves correctly past the TTL).
+        /// Non-blocking. A fresh cache hit (positive OR negative)
+        /// answers inline; a miss (no entry or past TTL) enqueues an
+        /// off-loop resolve and returns `.pending` for the caller to
+        /// park on. The CP is never contacted on this thread, and a
+        /// stale entry is never served (so a tenant move re-resolves
+        /// correctly past the TTL).
         fn resolveRoute(self: *Self, host: []const u8, now_ns: i128) RouteResult {
-            if (self.cache.get(host, now_ns)) |nodes| return .{ .nodes = nodes };
+            if (self.cache.get(host, now_ns)) |hit| switch (hit) {
+                .nodes => |nodes| return .{ .nodes = nodes },
+                .not_found => return .not_found,
+            };
             self.enqueueResolve(host);
             return .pending;
         }
@@ -2231,9 +2302,12 @@ pub fn Proxy(comptime FrontH2: type) type {
                             freeNodes(self.allocator, nodes);
                         };
                     },
-                    // Gone: stop serving the stale entry and surface 404.
+                    // Gone: replace any stale entry with a negative one
+                    // (short TTL) so scanner floods of garbage hosts
+                    // answer 404 from cache instead of serially
+                    // occupying the resolver (plan A6).
                     .not_found => {
-                        self.cache.invalidate(c.host);
+                        self.cache.putNegative(c.host, now_ns);
                         self.failRouteWaiters(c.host, 404);
                     },
                     // Transient CP failure: don't touch the cache (a
@@ -2426,14 +2500,14 @@ test "isIdempotentMethod: only read-shaped methods replay after ambiguous failur
 
 test "RouteCache: fresh hit within TTL, miss past it (re-resolve, no stale serve)" {
     const ttl_ns: i128 = 100;
-    var cache = RouteCache.init(testing.allocator, ttl_ns);
+    var cache = RouteCache.init(testing.allocator, ttl_ns, 500);
     defer cache.deinit();
 
     const nodes = try dupNodes(testing.allocator, &.{ "http://a:1", "http://b:1" });
     try cache.putOwned("acme.example", nodes, 1000); // expires at 1100
 
     // Within TTL: hit.
-    try testing.expectEqual(@as(usize, 2), cache.get("acme.example", 1050).?.len);
+    try testing.expectEqual(@as(usize, 2), cache.get("acme.example", 1050).?.nodes.len);
     // At/after expiry: miss → caller parks + re-resolves (never serves
     // the stale entry, so a move past the TTL routes correctly).
     try testing.expect(cache.get("acme.example", 1100) == null);
@@ -2443,17 +2517,43 @@ test "RouteCache: fresh hit within TTL, miss past it (re-resolve, no stale serve
 }
 
 test "RouteCache: putOwned refreshes the entry in place and frees the old nodes" {
-    var cache = RouteCache.init(testing.allocator, 100);
+    var cache = RouteCache.init(testing.allocator, 100, 500);
     defer cache.deinit();
 
     try cache.putOwned("h", try dupNodes(testing.allocator, &.{"http://old:1"}), 1000);
     // Re-store with a new list; the old one must be freed (testing
     // allocator catches a leak) and the expiry pushed out.
     try cache.putOwned("h", try dupNodes(testing.allocator, &.{ "http://new:1", "http://new:2" }), 1200);
-    try testing.expectEqual(@as(usize, 2), cache.get("h", 1250).?.len);
+    try testing.expectEqual(@as(usize, 2), cache.get("h", 1250).?.nodes.len);
 
     cache.invalidate("h");
     try testing.expect(cache.get("h", 1250) == null);
+}
+
+test "RouteCache: negative entries answer not_found within their own TTL" {
+    // Positive TTL 100, negative TTL 500 — independent windows.
+    var cache = RouteCache.init(testing.allocator, 100, 500);
+    defer cache.deinit();
+
+    cache.putNegative("ghost.example", 1000); // expires at 1500
+    try testing.expect(cache.get("ghost.example", 1100).? == .not_found);
+    try testing.expect(cache.get("ghost.example", 1499).? == .not_found);
+    // Past the negative TTL: miss → the CP is asked again.
+    try testing.expect(cache.get("ghost.example", 1500) == null);
+
+    // A negative entry is replaced by a later placement (host got
+    // provisioned) and vice versa (tenant deleted), with no leak.
+    cache.putNegative("flip.example", 1000);
+    try cache.putOwned("flip.example", try dupNodes(testing.allocator, &.{"http://a:1"}), 1010);
+    try testing.expectEqual(@as(usize, 1), cache.get("flip.example", 1050).?.nodes.len);
+    try testing.expectEqual(@as(usize, 1), cache.neg_count); // ghost only
+    cache.putNegative("flip.example", 1060);
+    try testing.expect(cache.get("flip.example", 1100).? == .not_found);
+    try testing.expectEqual(@as(usize, 2), cache.neg_count);
+
+    // invalidate keeps the count honest.
+    cache.invalidate("flip.example");
+    try testing.expectEqual(@as(usize, 1), cache.neg_count);
 }
 
 test "LeaderCache: note seeds the start index; stale origin falls back to 0" {

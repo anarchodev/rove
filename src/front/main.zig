@@ -435,7 +435,19 @@ pub fn main() !void {
     // (clean recycle between requests) rather than reacting to the
     // worker's GOAWAY mid-reuse (the front→worker 502 seen in repro).
     const upstream_idle_ms = envMs("REWIND_FRONT_UPSTREAM_IDLE_TIMEOUT_MS", 5_000);
-    var cache = proxy_mod.RouteCache.init(allocator, cache_ms * std.time.ns_per_ms);
+    // Negative-entry TTL: how long a CP 404 for a host is answered from
+    // cache. Longer than the positive TTL — a placement changes on a
+    // tenant move (move latency rides the positive TTL) but "no such
+    // host" only changes on provisioning, and the negative cache is
+    // what keeps scanner floods of garbage Host values from serially
+    // occupying the resolver (plan A6). A just-provisioned domain waits
+    // at most this long for its first serve.
+    const neg_cache_ms = envMs("REWIND_ROUTE_NEG_CACHE_MS", 5_000);
+    var cache = proxy_mod.RouteCache.init(
+        allocator,
+        cache_ms * std.time.ns_per_ms,
+        neg_cache_ms * std.time.ns_per_ms,
+    );
     defer cache.deinit();
 
     // Off-loop route resolver: CP `/_cp/route` queries run on this

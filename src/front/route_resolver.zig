@@ -56,7 +56,11 @@ pub const RouteResolver = struct {
     cp_urls: []const []const u8,
 
     /// Owned host copies waiting to be resolved (loop → resolver).
+    /// FIFO via `req_head` cursor: entries before it were already
+    /// handed to the resolver thread; the tail is compacted away when
+    /// the queue drains empty.
     req_queue: std.ArrayListUnmanaged([]u8),
+    req_head: usize,
     req_mu: std.Thread.Mutex,
 
     /// Finished resolutions (resolver → loop).
@@ -73,6 +77,7 @@ pub const RouteResolver = struct {
             .allocator = allocator,
             .cp_urls = cp_urls,
             .req_queue = .empty,
+            .req_head = 0,
             .req_mu = .{},
             .done_queue = .empty,
             .done_mu = .{},
@@ -101,7 +106,7 @@ pub const RouteResolver = struct {
         // Caller must have shut down by here. Free anything still
         // queued (a host the thread never popped, or a completion the
         // loop never drained) so nothing leaks.
-        for (self.req_queue.items) |h| self.allocator.free(h);
+        for (self.req_queue.items[self.req_head..]) |h| self.allocator.free(h);
         self.req_queue.deinit(self.allocator);
         for (self.done_queue.items) |c| self.freeCompletion(c);
         self.done_queue.deinit(self.allocator);
@@ -163,8 +168,18 @@ pub const RouteResolver = struct {
     fn popRequest(self: *RouteResolver) ?[]u8 {
         self.req_mu.lock();
         defer self.req_mu.unlock();
-        if (self.req_queue.items.len == 0) return null;
-        return self.req_queue.pop(); // order doesn't matter for resolution
+        // FIFO. The old LIFO `pop()` starved the OLDEST parked flows
+        // under backlog — the ones closest to their 503 deadline — so
+        // a burst of cold hosts 503'd from the back of the line even
+        // when the resolver caught up (plan A6).
+        if (self.req_head >= self.req_queue.items.len) {
+            self.req_queue.clearRetainingCapacity();
+            self.req_head = 0;
+            return null;
+        }
+        const host = self.req_queue.items[self.req_head];
+        self.req_head += 1;
+        return host;
     }
 
     fn pushCompletion(self: *RouteResolver, c: Completion) void {
@@ -245,6 +260,28 @@ fn freeNodes(a: std.mem.Allocator, nodes: [][]u8) void {
 // ── Tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "popRequest is FIFO — oldest parked flow resolves first" {
+    const r = try RouteResolver.init(testing.allocator, &.{});
+    defer r.deinit();
+
+    // No thread started — drive the queue directly.
+    try r.enqueue("first.example");
+    try r.enqueue("second.example");
+    const a = r.popRequest().?;
+    defer testing.allocator.free(a);
+    try testing.expectEqualStrings("first.example", a);
+    const b = r.popRequest().?;
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings("second.example", b);
+    try testing.expect(r.popRequest() == null);
+
+    // The drained queue compacts; a fresh enqueue starts at the head.
+    try r.enqueue("third.example");
+    const c = r.popRequest().?;
+    defer testing.allocator.free(c);
+    try testing.expectEqualStrings("third.example", c);
+}
 
 test "enqueue takes an owned copy; takeCompletions swaps the queue" {
     const r = try RouteResolver.init(testing.allocator, &.{});
