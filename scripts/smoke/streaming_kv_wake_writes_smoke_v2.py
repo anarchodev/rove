@@ -3,7 +3,7 @@
 write kv, on the `V2Cluster` harness.
 
 The "react to writes by writing" pattern: `/watchwrite` arms
-`on.kv("watchwrite/in/")`; on every kv-wake it reads the new value,
+`after.kv("watchwrite/in/")`; on every kv-wake it reads the new value,
 writes a processed mirror to `watchwrite/out/<id>` = `processed:<value>`,
 emits a `relayed` SSE frame, and re-arms. The stream-resume hop's writes
 propose asynchronously while the frame ships live.
@@ -48,7 +48,7 @@ export default function () {
     };
     stream.start();
     stream.write("event: ready\\ndata: 1\\n\\n");
-    on.kv("watchwrite/in/");
+    after.kv("watchwrite/in/");
     return next();
 }
 
@@ -61,7 +61,7 @@ export function onWake() {
         kv.set(out_key, "processed:" + value);
         stream.write(`event: relayed\\ndata: ${w.key}->${out_key}\\n\\n`);
     }
-    on.kv("watchwrite/in/");
+    after.kv("watchwrite/in/");
     return next();
 }
 """
@@ -136,7 +136,7 @@ def main() -> int:
 
         print("step 4: hold SSE GET /watchwrite, POST three writes ~0.15s apart")
         watcher = _stream_watch(c, "/watchwrite", max_time=3.0)
-        time.sleep(0.5)  # let the inbound hop arm on.kv("watchwrite/in/")
+        time.sleep(0.5)  # let the inbound hop arm after.kv("watchwrite/in/")
 
         ids = ["a", "b", "c"]
         for i, ident in enumerate(ids):

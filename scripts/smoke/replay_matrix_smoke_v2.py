@@ -38,7 +38,7 @@ _REMAP = [
 ]
 
 INBOUND_SRC = 'export default function () { return "inbound-ok:" + (request.query || ""); }'
-# NB: a {to:'onUpstream'} override with NO onFetchResult export — this doubles as
+# NB: a {on:'onUpstream'} override with NO onFetchResult export — this doubles as
 # the G3 check: if the resolved export weren't recorded, replay would call the
 # (missing) conventional onFetchResult and fail. Reproduction proves G3.
 FETCH_SRC = """
@@ -48,7 +48,7 @@ export default function () {
   for (const p of q.split("&")) { const i = p.indexOf("="); if (i<0) continue;
     if (decodeURIComponent(p.slice(0,i)) === "url") url = decodeURIComponent(p.slice(i+1)); }
   if (!url) { response.status = 400; return "no url"; }
-  on.fetch(url, {}, { to: "onUpstream" });
+  after.fetch(url, {}, { on: "onUpstream" });
   return next();
 }
 export function onUpstream() {

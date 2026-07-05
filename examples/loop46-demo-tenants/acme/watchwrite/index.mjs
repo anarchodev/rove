@@ -1,6 +1,6 @@
 // Phase 4b exerciser — stream-resume (kv-wake) writes kv (handler-
 // surface Phase 2 `stream.*` surface). On inbound, arms
-// `on.kv("watchwrite/in/")`. On every kv match, reads the incoming
+// `after.kv("watchwrite/in/")`. On every kv match, reads the incoming
 // value, writes to `watchwrite/out/<key>` = `processed:<value>` (the
 // customer's "react to writes" pattern), then emits a frame echoing
 // both keys.
@@ -17,7 +17,7 @@ export default function () {
     };
     stream.start();
     stream.write("event: ready\ndata: 1\n\n");
-    on.kv("watchwrite/in/");
+    after.kv("watchwrite/in/");
     return next();
 }
 
@@ -32,6 +32,6 @@ export function onWake() {
         kv.set(out_key, "processed:" + value);
         stream.write(`event: relayed\ndata: ${w.key}->${out_key}\n\n`);
     }
-    on.kv("watchwrite/in/");
+    after.kv("watchwrite/in/");
     return next();
 }

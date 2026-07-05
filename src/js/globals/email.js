@@ -76,10 +76,15 @@ globalThis.email = {
       },
       body: JSON.stringify(body),
     };
-    if (opts.on_result) env.on_result = opts.on_result;
-    if (opts.context !== undefined) env.context = opts.context;
+    // Canonical `on`/`ctx` keys; `on_result`/`context` are the
+    // dual-name-window aliases (handler-api-ergonomics-plan §2.3).
+    // NOTE: email's `to` is the RECIPIENT — the callback key is `on`.
+    const on_key = opts.on || opts.on_result;
+    if (on_key) env.on = on_key;
+    const ctx_val = opts.ctx !== undefined ? opts.ctx : opts.context;
+    if (ctx_val !== undefined) env.ctx = ctx_val;
     if (opts.max_attempts) env.max_attempts = opts.max_attempts;
     if (opts.timeout_ms != null) env.timeout_ms = opts.timeout_ms;
-    return webhook.send(env);
+    return webhook.send(env.url, env);
   },
 };

@@ -3,7 +3,7 @@
 `on.fetch` from `onMessage` and resume its `{to}` export over the SAME socket
 (the engine fix's on.fetch half; `ws_wake_smoke_v2.py` covers on.kv/on.timer).
 
-A deployed handler, on a `fetch:<url>` frame, issues `on.fetch(url)` from a
+A deployed handler, on a `fetch:<url>` frame, issues `after.fetch(url)` from a
 read-only frame and parks; when the result lands it resumes `onUpstream`,
 reads the bound-fetch surface (`request.body` + `request.status` +
 `request.done`), and `stream.write`s the body back. A threaded stub HTTP
@@ -47,7 +47,7 @@ export function onMessage() {
   if (data.startsWith("fetch:")) {
     // READ-ONLY frame: on.fetch binds to the held chain and the result
     // resumes onUpstream over this socket.
-    on.fetch(data.slice(6), { method: "GET" }, { to: "onUpstream" });
+    after.fetch(data.slice(6), { method: "GET" }, { on: "onUpstream" });
     return next();
   }
   stream.write("echo:" + data);

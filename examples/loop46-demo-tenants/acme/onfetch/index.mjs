@@ -1,5 +1,5 @@
 // on.fetch exerciser (handler-surface Phase 3 slice 3a). The NEW
-// connection-scoped outbound surface: `on.fetch(url, opts, {to})` binds
+// connection-scoped outbound surface: `after.fetch(url, opts, {to})` binds
 // the fetch to the held chain — each upstream chunk wakes the `{to}`
 // export ("onUpstream" here) while the chain holds the socket. Proves
 // the bind + the `{to}` export override + chunk resume end to end,
@@ -24,7 +24,7 @@ export default function () {
     }
     kv.set("onfetch/acc", ""); // fresh accumulator per run
     // Connection-scoped: binds to THIS held chain; chunks wake onUpstream.
-    on.fetch(url, { stream: true, max_response_chunk_bytes: 64 }, { to: "onUpstream" });
+    after.fetch(url, { stream: true, max_response_chunk_bytes: 64 }, { on: "onUpstream" });
     return next();
 }
 

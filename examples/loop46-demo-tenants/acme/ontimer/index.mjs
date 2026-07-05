@@ -1,6 +1,6 @@
 // on.timer connection-wake exerciser (handler-surface Phase 1).
 //
-// The inbound hop arms a connection timer with `on.timer(ms)` and
+// The inbound hop arms a connection timer with `after.ms(ms)` and
 // HOLDS the socket via `__rove_next` (no response). It does NO
 // webhook.send — so there is no send-callback binding; the ONLY thing
 // that can resume this parked continuation is the timer wake.
@@ -14,7 +14,7 @@
 // The single client request blocks for ~ms, then returns "woke:<tag>".
 export default function () {
     const req = request.body ? JSON.parse(request.body) : {};
-    on.timer(req.ms || 150);
+    after.ms(req.ms || 150);
     return next({ tag: req.tag || "t" });
 }
 

@@ -181,13 +181,12 @@ class OAuthProvider {
     if (this.cfg.client_secret) body_params.set("client_secret", this.cfg.client_secret);
     if (stored.verifier) body_params.set("code_verifier", stored.verifier);
 
-    webhook.send({
-      url: this.cfg.token_url,
+    webhook.send(this.cfg.token_url, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: body_params.toString(),
-      on_result: this.cfg.on_complete_module,
-      context: Object.assign({}, stored.context, {
+      on: this.cfg.on_complete_module,
+      ctx: Object.assign({}, stored.context, {
         return_to: stored.return_to,
       }),
     });
@@ -216,13 +215,12 @@ class OAuthProvider {
       client_id: this.cfg.client_id,
     });
     if (this.cfg.client_secret) body_params.set("client_secret", this.cfg.client_secret);
-    return webhook.send({
-      url: this.cfg.token_url,
+    return webhook.send(this.cfg.token_url, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: body_params.toString(),
-      on_result: this.cfg.on_complete_module,
-      context: Object.assign({ refresh: true }, extra_context || {}),
+      on: this.cfg.on_complete_module,
+      ctx: Object.assign({ refresh: true }, extra_context || {}),
     });
   }
 }
@@ -331,11 +329,10 @@ globalThis.oauth = {
    *   { id_token, sid: ctx.sid, return_to: ctx.return_to });
    */
   fetchJwks(opts, on_result_module, context) {
-    webhook.send({
-      url: opts.jwks_uri,
+    webhook.send(opts.jwks_uri, {
       method: "GET",
-      on_result: on_result_module,
-      context: context,
+      on: on_result_module,
+      ctx: context,
     });
   },
 

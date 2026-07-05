@@ -2,12 +2,12 @@
 """V2 port of `on_timer_smoke.py` — `on.timer` connection wakes
 (handler-surface Phase 1 Task 3, timer slice) on the `V2Cluster` harness.
 
-The `ontimer` handler arms `on.timer(ms)` and HOLDS the socket via `next()`
+The `ontimer` handler arms `after.ms(ms)` and HOLDS the socket via `next()`
 with NO webhook.send — so the only thing that can resume the parked
 continuation is the timer wake. One blocking client POST:
 
   client ──POST /ontimer {ms,tag}──▶ acme inbound hop
-     on.timer(ms) + return next(...onWake)
+     after.ms(ms) + return next(...onWake)
         → StreamWakes armed (interval=ms) on the held continuation
         → entity parks in worker.parked_continuations (held; no response)
      ~ms later: sweepParkedContinuations sees now >= next_wake_ns →
@@ -42,7 +42,7 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 ONTIMER_SRC = """\
 export default function () {
     const req = request.body ? JSON.parse(request.body) : {};
-    on.timer(req.ms || 150);
+    after.ms(req.ms || 150);
     return next({ tag: req.tag || "t" });
 }
 

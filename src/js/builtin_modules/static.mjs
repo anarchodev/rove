@@ -46,10 +46,10 @@ export default function () {
   }
   // GET: issue the bound streaming read and DO NOT commit the response here.
   // `opts.ctx` threads {hash,ct} to each onChunk as request.ctx.
-  on.fetch(
+  after.fetch(
     "http://rove-static.internal/" + c.hash,
     { method: "GET", stream: true, max_response_chunk_bytes: 256 * 1024, ctx: c },
-    { to: "onChunk" },
+    { on: "onChunk" },
   );
   return next();
 }

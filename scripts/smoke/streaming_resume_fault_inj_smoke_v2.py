@@ -17,7 +17,7 @@ the V2 multi-raft stack:
     write needs a 2-of-3 quorum.
   - Open the held SSE stream DIRECT to the leader node. The inbound
     activation is read-only (just `stream.write("event: ready…")` +
-    `on.timer(1500)`), so it commits without raft and `ready` ships.
+    `after.ms(1500)`), so it commits without raft and `ready` ships.
   - SIGSTOP the two FOLLOWERS. Quorum is now impossible: the leader is
     alone, so any subsequent propose parks on the commit-wait deadline.
   - At T+1.5s the timer wake fires. `onWake` does `kv.set("counter", …)`

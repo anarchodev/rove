@@ -23,7 +23,7 @@ export default function () {
         return "missing ?url=";
     }
     // Buffered (no stream:true) + conventional export (no {to}).
-    on.fetch(url);
+    after.fetch(url);
     return next();
 }
 

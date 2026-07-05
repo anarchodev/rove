@@ -45,7 +45,7 @@ TAG_SRC = r"""export default function () {
 # Self-tenant replay: fetch THIS tenant's own session-S1 activations. The door
 # pins the token to request.tenant; the URL names the same id, so it's allowed.
 REPLAY_SELF_SRC = r"""export default function () {
-    on.fetch("http://rewind-logs.internal/v1/" + request.tenant +
+    after.fetch("http://rewind-logs.internal/v1/" + request.tenant +
              "/session/S1?limit=20");
     return next();
 }
@@ -62,7 +62,7 @@ export function onFetchResult() {
 
 # Cross-tenant replay: name a DIFFERENT tenant — must be refused at the door.
 REPLAY_OTHER_SRC = r"""export default function () {
-    on.fetch("http://rewind-logs.internal/v1/__admin__/session/S1?limit=20");
+    after.fetch("http://rewind-logs.internal/v1/__admin__/session/S1?limit=20");
     return next();
 }
 export function onFetchResult() {

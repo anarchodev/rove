@@ -489,7 +489,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "retry_js", .path = "src/js/globals/retry.js" },
         .{ .name = "scheduler_js", .path = "src/js/globals/scheduler.js" },
         .{ .name = "schedule_js", .path = "src/js/globals/schedule.js" },
-        .{ .name = "on_js", .path = "src/js/globals/on.js" },
+        .{ .name = "after_js", .path = "src/js/globals/after.js" },
         .{ .name = "stream_js", .path = "src/js/globals/stream.js" },
         .{ .name = "next_js", .path = "src/js/globals/next.js" },
         .{ .name = "webhook_js", .path = "src/js/globals/webhook.js" },

@@ -1,5 +1,5 @@
 // Streaming-handlers — kv-write wake exerciser (handler-surface Phase 2
-// `stream.*` surface). The inbound hop arms `on.kv("watch/")` and emits
+// `stream.*` surface). The inbound hop arms `after.kv("watch/")` and emits
 // a snapshot frame; on every put/delete under that prefix it emits a
 // frame. The chain streams indefinitely until the client disconnects.
 //
@@ -24,7 +24,7 @@ export default function () {
     };
     stream.start();
     stream.write("event: snapshot\ndata: initial\n\n");
-    on.kv("watch/");
+    after.kv("watch/");
     return next();
 }
 
@@ -40,6 +40,6 @@ export function onWake() {
         const value = kv.get(w.key) ?? "(deleted)";
         stream.write(`event: update\ndata: ${w.key}=${value} (${w.op})\n\n`);
     }
-    on.kv("watch/");
+    after.kv("watch/");
     return next();
 }

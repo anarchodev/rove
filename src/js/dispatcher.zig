@@ -1546,6 +1546,110 @@ test "dispatch: ws_message frame payload on request.bytes/.text (§2.2)" {
     }
 }
 
+// ── handler-api-ergonomics-plan Phase 3 — the grammar sweep ──────────
+
+test "dispatch: after.fetch returns a ftch_-prefixed id; on.fetch alias matches (§2.3/§2.4)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var resp = try runOne(
+        &d,
+        kv,
+        \\const id = after.fetch("http://up.test/", {}, { on: "onR" });
+        \\if (typeof id !== "string" || !id.startsWith("ftch_")) return "new-bad:" + id;
+        \\const id2 = on.fetch("http://up.test/", {}, { to: "onR" });   // window alias
+        \\if (typeof id2 !== "string" || !id2.startsWith("ftch_")) return "alias-bad:" + id2;
+        \\if (typeof after.ms !== "function" || typeof after.kv !== "function") return "no-after";
+        \\if (typeof on.timer !== "function" || typeof on.kv !== "function") return "no-on-alias";
+        \\return "ok";
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings("ok", resp.body);
+}
+
+test "dispatch: webhook.send(url, {on, ctx}) canonical form writes the marker (§2.3)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var resp = try runOne(
+        &d,
+        kv,
+        \\const id = webhook.send("https://t.example/hook", {
+        \\  body: "x", on: "hooks/onDone", ctx: { a: 1 }, handle: "h-canon",
+        \\});
+        \\return id;
+    ,
+        .{ .method = "POST", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    const marker = try readOwedMarker(kv, resp.body);
+    defer testing.allocator.free(marker);
+    try testing.expect(std.mem.indexOf(u8, marker, "\"on_result\":\"hooks/onDone\"") != null);
+    try testing.expect(std.mem.indexOf(u8, marker, "\"context\":{\"a\":1}") != null);
+    try testing.expect(std.mem.indexOf(u8, marker, "\"url\":\"https://t.example/hook\"") != null);
+}
+
+test "dispatch: scheduler.in schedules; scheduler.after stays as the window alias (§2.3)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var resp = try runOne(
+        &d,
+        kv,
+        \\const a = scheduler.in(5000, "jobs/x", { p: 1 });
+        \\const b = scheduler.after(5000, "jobs/y", { p: 2 });
+        \\if (typeof a !== "string" || typeof b !== "string") return "bad";
+        \\return "ok:" + (kv.get("_sched/by_id/" + a) !== null) + ":" + (kv.get("_sched/by_id/" + b) !== null);
+    ,
+        .{ .method = "POST", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings("ok:true:true", resp.body);
+}
+
+test "dispatch: durable_wake msg reads as request.ctx (one-ctx §2.4; activation.msg = window alias)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var resp = try runOne(&d, kv,
+        \\return JSON.stringify([request.ctx, request.activation.msg,
+        \\  request.activation.scheduledAtNs === request.activation.scheduled_at_ns]);
+    , .{
+        .method = "POST",
+        .path = "/_wake",
+        .activation = .{ .durable_wake = .{ .id = "s1", .scheduled_at_ns = 7, .msg_json = "{\"a\":2}" } },
+        .trace = .{ .request_id = 1 },
+    });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings("[{\"a\":2},{\"a\":2},true]", resp.body);
+}
+
 test "dispatch: kv.set rejects platform-reserved prefixes" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

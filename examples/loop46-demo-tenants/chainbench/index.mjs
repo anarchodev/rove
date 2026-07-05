@@ -21,8 +21,7 @@ export function start(count, depth, url) {
     for (let i = 0; i < n; i++) {
         const cid = "c" + i;
         kv.set("chain/progress/" + cid, String(depth | 0));
-        webhook.send({
-            url: url,
+        webhook.send(url, {
             method: "POST",
             body: JSON.stringify({ id: cid, depth: depth | 0, url: url }),
             headers: { "content-type": "application/json" },
@@ -40,8 +39,7 @@ export default function () {
     kv.set("chain/progress/" + id, String(depth));
 
     if (depth > 0) {
-        webhook.send({
-            url: step.url,
+        webhook.send(step.url, {
             method: "POST",
             body: JSON.stringify({ id: id, depth: depth - 1, url: step.url }),
             headers: { "content-type": "application/json" },

@@ -214,8 +214,10 @@
      */
     getReplay(request, opts) {
       opts = opts || {};
+      // Canonical `on`; `to` is the dual-name-window alias.
+      const on_key = typeof opts.on === "string" ? opts.on : opts.to;
       const tenant = request && request.tenant;
-      if (!tenant || !opts.to) return false;
+      if (!tenant || !on_key) return false;
       const limit = opts.limit || 50;
       let url;
       if (opts.session) {
@@ -228,7 +230,7 @@
           "/list?tag._corr=" + encodeURIComponent(corr) + "&limit=" + limit;
       }
       if (opts.since) url += "&after_received_ns=" + opts.since;
-      on.fetch(url, { method: "GET" }, { to: opts.to });
+      after.fetch(url, { method: "GET" }, { on: on_key });
       return true;
     },
 

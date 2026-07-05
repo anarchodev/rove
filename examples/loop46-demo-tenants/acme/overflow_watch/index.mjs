@@ -1,5 +1,5 @@
 // Gap 2.2 §9.4 overflow exerciser (handler-surface Phase 2 `stream.*`
-// surface). Arms `on.kv("overflow/")`; on every wake_batch activation
+// surface). Arms `after.kv("overflow/")`; on every wake_batch activation
 // emits ONE status frame echoing `wakes.length` + `overflow.lost_oldest`
 // so the smoke can assert against them without parsing many frames.
 //
@@ -13,7 +13,7 @@ export default function () {
     };
     stream.start();
     stream.write("event: open\ndata: ok\n\n");
-    on.kv("overflow/");
+    after.kv("overflow/");
     return next();
 }
 
@@ -22,6 +22,6 @@ export function onWake() {
     const a = request.activation;
     stream.start();
     stream.write(`event: batch\ndata: wakes=${a.wakes.length} lost=${a.overflow.lost_oldest}\n\n`);
-    on.kv("overflow/");
+    after.kv("overflow/");
     return next();
 }

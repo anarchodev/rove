@@ -19,7 +19,7 @@ export default function () {
     };
     stream.start();                              // commit the head
     stream.write("event: ready\ndata: 1\n\n");   // first frame
-    on.kv("streamkv/in/");                        // wait for writes
+    after.kv("streamkv/in/");                        // wait for writes
     return next();     // hold the socket
 }
 
@@ -32,6 +32,6 @@ export function onWake() {
         const v = kv.get(w.key) ?? "(absent)";
         stream.write("event: update\ndata: " + w.key + "=" + v + "\n\n");
     }
-    on.kv("streamkv/in/");                        // re-arm
+    after.kv("streamkv/in/");                        // re-arm
     return next();
 }

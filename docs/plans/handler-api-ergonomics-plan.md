@@ -238,6 +238,36 @@ smokes that touch the changed surface).
   `ok` unification. One breaking sweep across bindings, shims,
   builtin modules, examples, loader validation (§6 export checks
   follow the new names), and first-party apps.
+  As-built (2026-07-04): landed with a **ONE-DEPLOY-CYCLE dual-name
+  window** so already-deployed rewind-apps bundles keep working across
+  the rollout. Canonical implementations live under the new names; the
+  old spellings are thin aliases. `blob.receive` needed no code — its
+  resume rides the bound-fetch path, which already carries top-level
+  `request.ok` (the `activation.ok` claim was doc fiction). The
+  internal namespace renamed `_system.on` → `_system.after` (lint(c)
+  pivots on it); the native option field stays `to` internally — the
+  shims normalize `{on}` → `{to}` at the boundary.
+
+  **Window-close checklist (the follow-up deploy, AFTER rewind-apps
+  migrates + publishes):**
+  - `globals/after.js`: delete `globalThis.on` + the `{to}` arm of
+    `tgt()`.
+  - `webhook.js`: delete the `{url,...}` single-object form and the
+    `on_result`/`context` keys. `email.js`/`retry.js`/`blob.js`
+    (`put`/`get`/`seal`/`receive`)/`segments.js` (`get`)/`browser.js`
+    (`getReplay`): delete the `on_result`/`on_result_module`/
+    `context`/`to` aliases.
+  - `scheduler.js`: delete the `after` alias.
+  - `globals.zig`: delete the snake aliases (`activation.fetch_id`,
+    `activation`/top-level `body_truncated`,
+    `activation.scheduled_at_ns`) and `activation.msg` — first migrate
+    the internal readers (`cron_tick.mjs`, `scheduler_tick.mjs`,
+    `webhook_fire.mjs`) to `request.ctx`.
+  - Migrate the deliberately-legacy window-teeth smokes
+    (`webhook_recovery_smoke_v2`, `ssrf_smoke_v2`,
+    `scheduler_heartbeat_smoke_v2`) and delete the alias unit tests.
+  - Then also retire `request.body` (needs the replay-driver accessor
+    parity — open question 4).
 - **Phase 4 — docs reconciliation.** `handler-shape.md` rewritten to
   the new surface (including honest `kv.prefix` examples,
   `request.fetchesPending`, the §5.6/§5.9 fixes); `effect-algebra.md`

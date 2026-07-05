@@ -188,9 +188,8 @@ class OIDCProvider {
   // sets the synthesized request's authority to the routed host), so
   // no explicitly-threaded host / genesis capture is needed.
   _armRotation(fire_at_ms) {
-    webhook.send({
+    webhook.send("https://" + request.host + "/_oidc/rotate", {
       handle: this.cfg.rot_handle,
-      url: "https://" + request.host + "/_oidc/rotate",
       method: "POST",
       body: "",
       fire_at_ns: BigInt(Math.floor(fire_at_ms)) * 1000000n,
@@ -963,13 +962,12 @@ class OIDCRelyingParty {
     });
     // `context` is a TOP-LEVEL webhook.send field (NOT nested in
     // on_result — matches oauth.js).
-    webhook.send({
-      url: this.cfg.issuer + "/token",
+    webhook.send(this.cfg.issuer + "/token", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: body.toString(),
-      on_result: this.cfg.complete_module,
-      context: { sid: st.sid, return_to: st.return_to },
+      on: this.cfg.complete_module,
+      ctx: { sid: st.sid, return_to: st.return_to },
     });
     return this._pollPage(st.return_to);
   }
@@ -1038,11 +1036,10 @@ class OIDCRelyingParty {
       }
     }
     // Unknown/absent kid → refetch JWKS, finish in completeJwks.
-    webhook.send({
-      url: this.cfg.issuer + "/.well-known/jwks.json",
+    webhook.send(this.cfg.issuer + "/.well-known/jwks.json", {
       method: "GET",
-      on_result: this.cfg.jwks_module,
-      context: { sid: ctx.sid, return_to: ctx.return_to, id_token },
+      on: this.cfg.jwks_module,
+      ctx: { sid: ctx.sid, return_to: ctx.return_to, id_token },
     });
     response.status = 200;
     return "fetching jwks";
@@ -1145,11 +1142,10 @@ class OIDCRelyingParty {
       }
     }
     // Unknown/absent kid → refetch JWKS, finish in completeJwks (callback).
-    webhook.send({
-      url: this.cfg.issuer + "/.well-known/jwks.json",
+    webhook.send(this.cfg.issuer + "/.well-known/jwks.json", {
       method: "GET",
-      on_result: this.cfg.jwks_module,
-      context: { sid, id_token },
+      on: this.cfg.jwks_module,
+      ctx: { sid, id_token },
     });
     response.status = 202;
     return { status: "verifying" };

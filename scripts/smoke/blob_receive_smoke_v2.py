@@ -46,7 +46,7 @@ export function onHeaders() {
         response.status = 401;
         return "unauthorized";
     }
-    blob.receive({ to: "onStored" });
+    blob.receive({ on: "onStored" });
     return next();
 }
 
@@ -63,7 +63,7 @@ export function onStored() {
 # blob.receive from a buffered (non-onHeaders) activation must throw.
 MISUSE_SRC = """\
 export default function () {
-    blob.receive({ to: "onStored" });
+    blob.receive({ on: "onStored" });
     return "should not reach";
 }
 """
@@ -73,7 +73,7 @@ export default function () {
 READER_SRC = """\
 export default function () {
     const hash = (request.query || "").replace("hash=", "");
-    blob.get(hash, { to: "onBlob" });
+    blob.get(hash, { on: "onBlob" });
     return next();
 }
 export function onBlob() {

@@ -4,7 +4,7 @@ streaming (docs/streaming-model.md §7 item 1 + docs/handler-shape.md §5.5)
 on the `V2Cluster` harness (`smoke_lib_v2`).
 
 Two tenants on a single node:
-  - `acme` opens a held `on.fetch(url, {stream, max_response_chunk_bytes:64})`
+  - `acme` opens a held `after.fetch(url, {stream, max_response_chunk_bytes:64})`
     that auto-binds to the held chain; each upstream chunk fires
     `onFetchChunk`, which streams a "chunk:<text>" frame back to the held
     socket via `stream.write`. Terminal closes the stream.

@@ -125,8 +125,11 @@ globalThis.retry = {
     if (typeof opts.url !== "string") {
       throw new TypeError("retry.send: `url` must be a string");
     }
-    if (typeof opts.on_result_module !== "string" || opts.on_result_module.length === 0) {
-      throw new TypeError("retry.send: `on_result_module` must be a non-empty string");
+    // Canonical `on`; `on_result_module` is the dual-name-window alias.
+    const on_key = typeof opts.on === "string" && opts.on.length
+      ? opts.on : opts.on_result_module;
+    if (typeof on_key !== "string" || on_key.length === 0) {
+      throw new TypeError("retry.send: `on` must be a non-empty string");
     }
     const max_attempts = opts.max_attempts ?? 1;
     if (!Number.isInteger(max_attempts) || max_attempts < 1) {
@@ -147,21 +150,21 @@ globalThis.retry = {
       body: opts.body,
       timeout_ms: opts.timeout_ms,
       fire_at_ns: opts.fire_at_ns,
-      on_result: opts.on_result_module,
+      on: on_key,
       // Suppress webhook.send's built-in retry — the customer drives
       // the chain explicitly through `retry.next`.
       max_attempts: 1,
-      context: Object.assign({}, opts.context || {}, {
+      ctx: Object.assign({}, (opts.ctx !== undefined ? opts.ctx : opts.context) || {}, {
         [RETRY_KEY]: {
           attempt: 1,
           max_attempts,
           backoff_ms: opts.backoff_ms,
-          on_result_module: opts.on_result_module,
+          on_result_module: on_key,
           original,
         },
       }),
     };
-    return webhook.send(send_opts);
+    return webhook.send(send_opts.url, send_opts);
   },
 
   /**
@@ -201,16 +204,15 @@ globalThis.retry = {
     // User-domain context is everything except _retry.
     const user_context = Object.assign({}, event.context);
     delete user_context[RETRY_KEY];
-    return webhook.send({
-      url: r.original.url,
+    return webhook.send(r.original.url, {
       method: r.original.method,
       headers: r.original.headers,
       body: r.original.body,
       timeout_ms: r.original.timeout_ms,
       fire_at_ns,
-      on_result: r.on_result_module,
+      on: r.on_result_module,
       max_attempts: 1,
-      context: Object.assign({}, user_context, {
+      ctx: Object.assign({}, user_context, {
         [RETRY_KEY]: Object.assign({}, r, { attempt: next_attempt }),
       }),
     });

@@ -415,12 +415,11 @@ class ActivityPubActor {
 
     // keyId is "<actor-url>#main-key" — fetch the actor doc itself.
     const actorUrl = sig.keyId.split("#")[0];
-    webhook.send({
-      url: actorUrl,
+    webhook.send(actorUrl, {
       method: "GET",
       headers: { accept: _AP_CT },
-      on_result: this.cfg.verified_module,
-      context: {
+      on: this.cfg.verified_module,
+      ctx: {
         ap_kind: "inbox_verify",
         keyId: sig.keyId,
         signature: sig.signature,
@@ -598,8 +597,7 @@ class ActivityPubActor {
       "content-type: " + _AP_CT,
     ].join("\n");
     const sigB64 = _b64std(base64url.decode(crypto.oidcSign(key.priv, signingStr)));
-    webhook.send({
-      url: targetInbox,
+    webhook.send(targetInbox, {
       method: "POST",
       headers: {
         host: u.host,

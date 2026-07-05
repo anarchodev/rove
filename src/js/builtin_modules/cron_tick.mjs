@@ -42,7 +42,7 @@ export default function () {
     // can't chain via the disposition return (those are inert on a
     // wake origin); routing through the scheduler keeps the target a
     // clean independent activation.
-    scheduler.after(0, target, ctx === undefined ? null : ctx);
+    scheduler.in(0, target, ctx === undefined ? null : ctx);
 
     return { status: 200 };
 }

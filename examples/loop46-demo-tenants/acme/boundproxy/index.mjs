@@ -34,7 +34,7 @@ export default function () {
     // so the fetch binds and chunks resume onFetchChunk. stream:true
     // splits the upstream body into multiple fetch_chunk events at
     // max_response_chunk_bytes granularity — the multi-chunk Gap #1 path.
-    on.fetch(url, { stream: true, max_response_chunk_bytes: 64 });
+    after.fetch(url, { stream: true, max_response_chunk_bytes: 64 });
     return next({ tag: "boundsmoke" });
 }
 

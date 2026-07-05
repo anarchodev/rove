@@ -3,13 +3,13 @@
 Phase 1 Task 3, kv half) on the `V2Cluster` harness.
 
 The `onkv` handler reads `<prefix>flag` (baselining the §8.4 read_version
-AFTER the read), arms `on.kv(prefix)`, and HOLDS the socket via `next()`
+AFTER the read), arms `after.kv(prefix)`, and HOLDS the socket via `next()`
 with NO webhook.send — so the ONLY thing that can resume the parked
 continuation is a kv write under the watched prefix landing at a
 write_version strictly greater than the baseline.
 
   client A ──POST /onkv {prefix}──▶ acme inbound hop          (HELD)
-     kv.get(prefix+flag) + on.kv(prefix) + return next(...onWake)
+     kv.get(prefix+flag) + after.kv(prefix) + return next(...onWake)
         → StreamWakes{read_version, kv_prefixes} on the held continuation
         → entity parks in worker.parked_continuations (no response yet)
 
@@ -58,7 +58,7 @@ export default function () {
     const req = request.body ? JSON.parse(request.body) : {};
     const prefix = req.prefix || "onkv/";
     kv.get(prefix + "flag");
-    on.kv(prefix, { to: "onWake" });
+    after.kv(prefix, { on: "onWake" });
     return next({ prefix });
 }
 

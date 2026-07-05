@@ -12,7 +12,7 @@ export default function () {
     response.headers = { "Content-Type": "text/plain" };
     stream.start();
     stream.write("drip\n");
-    on.timer(120);
+    after.ms(120);
     return next();
 }
 
@@ -21,6 +21,6 @@ export default function () {
 export function onWake() {
     stream.start();
     stream.write("drip\n");
-    on.timer(120);
+    after.ms(120);
     return next();
 }

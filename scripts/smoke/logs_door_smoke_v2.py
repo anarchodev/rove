@@ -34,7 +34,7 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 # a non-admin tenant) surface as a terminal `request.ok == false` event.
 PROBE_SRC = r"""export default function () {
     const t = new URLSearchParams(request.query || "").get("t") || "acme";
-    on.fetch("http://rewind-logs.internal/v1/" + t + "/list?limit=5");
+    after.fetch("http://rewind-logs.internal/v1/" + t + "/list?limit=5");
     return next();
 }
 

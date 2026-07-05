@@ -45,13 +45,12 @@ from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, rpc_wrap  # noqa: E402
 # acme's webhook-firing handler + on_result callback, verbatim from the demo
 # tenant (examples/loop46-demo-tenants/acme/cbfire/index.mjs + cbresult.mjs).
 CBFIRE_SRC = '''export function fire(url, tag) {
-    const id = webhook.send({
-        url: url,
+    const id = webhook.send(url, {
         method: "POST",
         body: "ping",
         headers: { "content-type": "text/plain" },
-        on_result: "cbresult",
-        context: { tag: tag },
+        on: "cbresult",
+        ctx: { tag: tag },
         max_attempts: 2,
     });
     kv.set("cb/last_fire", id);

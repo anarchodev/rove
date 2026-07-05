@@ -69,8 +69,7 @@ ONRESULT_SRC = r"""export function onResult() {
     const ctx = request.ctx || {};
     if (!request.ok) {
         if (ctx.retry_to && ctx.tries < 1) {
-            webhook.send({
-                url: ctx.retry_to,
+            webhook.send(ctx.retry_to, {
                 method: "POST",
                 body: JSON.stringify({ from: "heldsync-retry", tag: ctx.tag }),
                 headers: { "content-type": "application/json" },

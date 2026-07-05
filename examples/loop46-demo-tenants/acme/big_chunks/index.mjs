@@ -26,7 +26,7 @@ export default function () {
     };
     stream.start();
     emit(0);
-    on.timer(100);
+    after.ms(100);
     return next();
 }
 
@@ -35,6 +35,6 @@ export default function () {
 export function onWake() {
     stream.start();
     emit(request.activation.write_pressure.dropped_chunks);
-    on.timer(100);
+    after.ms(100);
     return next();
 }

@@ -106,10 +106,11 @@ globalThis.webhook = {
    * module sees one terminal result event (success or give-up after
    * the retry budget).
    *
-   * @param {object} opts
-   * @param {string} opts.url - Target URL.
+   * @param {string} url - Target URL.
+   * @param {object} [opts]
    * @param {string} [opts.method="POST"] - HTTP method.
-   * @param {string} [opts.body=""] - Request body.
+   * @param {string} [opts.body=""] - Request body (string only — the
+   *   durable marker is JSON).
    * @param {Object<string,string>} [opts.headers] - Extra headers.
    *   `X-Rove-Schedule-Id` and `X-Rove-Schedule-Version` are added
    *   by the platform on fire — don't set them yourself.
@@ -120,40 +121,60 @@ globalThis.webhook = {
    *   `> now` defers the fire to a durable scheduled wake (the marker
    *   is written but no `http.fetch` happens until the wake fires).
    *   Omit or `<= now` for fire-as-soon-as-handler-commits.
-   * @param {string} [opts.on_result] - Module path of a customer
-   *   result handler. Receives the terminal event on the unified
-   *   flattened surface (handler-shape §7): the response on
-   *   `request.body` / `request.status` / `request.ok` /
-   *   `request.body_truncated`, with `{attempts, error?, id, headers,
-   *   context}` on `request.ctx`. There is no `request.result`.
-   * @param {*} [opts.context] - Opaque customer payload echoed back
-   *   on the result event.
+   * @param {string} [opts.on] - Module path of a customer result
+   *   handler. Receives the terminal event on the unified flattened
+   *   surface (handler-shape §7): the response on `request.bytes` /
+   *   `.text` / `.json` (and `request.body` / `.status` / `.ok` /
+   *   `.body_truncated`); the threaded `ctx` value bare on
+   *   `request.ctx`; delivery metadata (`attempts`, `error?`, `id`,
+   *   `headers`) on `request.activation.*`. There is no
+   *   `request.result`. (`on_result` is the dual-name-window alias.)
+   * @param {*} [opts.ctx] - Opaque customer payload echoed back as
+   *   `request.ctx` on the result event. (`context` is the window
+   *   alias.)
    * @returns {string} The marker id. Same value as the `handle` when
    *   one was supplied.
-   * @throws {TypeError} If `opts` or `opts.url` is missing/wrong type.
+   * @throws {TypeError} If `url` is missing/wrong type.
    *
    * @example
-   * webhook.send({
-   *   url: "https://hooks.example.com/x",
+   * webhook.send("https://hooks.example.com/x", {
    *   body: JSON.stringify({ event: "order.paid", id }),
-   *   on_result: "hooks/onDelivered",
-   *   context: { order_id: id },
+   *   on: "hooks/onDelivered",
+   *   ctx: { order_id: id },
    * });
    *
    * @example
    * // Scheduled fire — write the marker now, fire in 5 minutes.
-   * webhook.send({
-   *   url: "https://example.test/reminder",
+   * webhook.send("https://example.test/reminder", {
    *   body: "ping",
    *   handle: "reminder/" + user_id,        // idempotent
    *   fire_at_ns: BigInt(Date.now() + 300_000) * 1_000_000n,
    * });
    */
-  send(opts) {
+  send(urlOrOpts, maybeOpts) {
+    // Canonical: webhook.send(url, opts) — positional url, matching
+    // after.fetch (handler-api-ergonomics-plan §2.3). The pre-rename
+    // webhook.send({url, ...}) single-object form is the dual-name-
+    // window alias; delete with the window.
+    let opts;
+    if (typeof urlOrOpts === "string") {
+      if (maybeOpts != null && typeof maybeOpts !== "object")
+        throw new TypeError("webhook.send: opts must be an object");
+      opts = Object.assign({}, maybeOpts || {}, { url: urlOrOpts });
+    } else {
+      opts = urlOrOpts;
+    }
     if (!opts || typeof opts !== "object")
       throw new TypeError("webhook.send requires an options object");
     if (typeof opts.url !== "string")
       throw new TypeError("webhook.send: `url` must be a string");
+
+    // Canonical option keys: `on` (callback target) + `ctx` (threaded
+    // value) — `on_result`/`context` are window aliases.
+    const on_key = typeof opts.on === "string" ? opts.on
+      : (typeof opts.on_result === "string" ? opts.on_result : null);
+    const ctx_val = opts.ctx !== undefined ? opts.ctx
+      : (opts.context !== undefined ? opts.context : null);
 
     // The body must be a string: it JSON-round-trips through the
     // durable `_send/owed/{id}` marker, which would silently mangle a
@@ -163,10 +184,10 @@ globalThis.webhook = {
     if (typeof body !== "string")
       throw new TypeError("webhook.send: `body` must be a string (encode bytes or JSON.stringify explicitly)");
 
-    // `on_result` is a module path string. Passed verbatim to
+    // `on` is a module path string. Passed verbatim to
     // `__rove_next(on_result, {ctx: {...}})` inside the
     // webhook_onresult.mjs shim.
-    const on_result = typeof opts.on_result === "string" ? opts.on_result : null;
+    const on_result = on_key;
 
     // Id derivation: deterministic from handle, else randomUUID
     // (taped → replay-deterministic).
@@ -209,7 +230,7 @@ globalThis.webhook = {
       attempts: 0,
       max_attempts: max_attempts,
       on_result: on_result,
-      context: opts.context !== undefined ? opts.context : null,
+      context: ctx_val,
     };
     kv.set("_send/owed/" + id, JSON.stringify(marker));
 
@@ -222,7 +243,7 @@ globalThis.webhook = {
     if (scheduled) {
       scheduler.at(fire_at_ns_big, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
     } else {
-      scheduler.after(WEBHOOK_WATCHDOG_MS, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
+      scheduler.in(WEBHOOK_WATCHDOG_MS, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
     }
 
     // Phase 4.1.2 (re-enabled inline fire). The earlier sweep-only
@@ -266,7 +287,7 @@ globalThis.webhook = {
         ctx: {
           id: id,
           on_result: on_result,
-          context: opts.context !== undefined ? opts.context : null,
+          context: ctx_val,
         },
       });
     }

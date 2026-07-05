@@ -4,13 +4,12 @@
 // kv so the smoke can assert end-to-end shape. Returns { id } so the
 // smoke can correlate the receipt.
 export function fire(target_url, tag) {
-    const id = webhook.send({
-        url: target_url,
+    const id = webhook.send(target_url, {
         method: "POST",
         body: JSON.stringify({ from: "acme", tag: tag }),
         headers: { "content-type": "application/json" },
-        on_result: "httpresult",
-        context: { tag: tag },
+        on: "httpresult",
+        ctx: { tag: tag },
     });
     kv.set("http/last_fire", id);
     return { id: id };
@@ -24,13 +23,12 @@ export function fire(target_url, tag) {
 export function fireDelayed(target_url, tag, delay_ms) {
     const now_ms = Date.now();
     const fire_at_ns = BigInt(now_ms) * 1_000_000n + BigInt(delay_ms) * 1_000_000n;
-    const id = webhook.send({
-        url: target_url,
+    const id = webhook.send(target_url, {
         method: "POST",
         body: JSON.stringify({ from: "acme", tag: tag }),
         headers: { "content-type": "application/json" },
-        on_result: "httpresult",
-        context: { tag: tag },
+        on: "httpresult",
+        ctx: { tag: tag },
         fire_at_ns: fire_at_ns,
     });
     kv.set("http/last_fire", id);

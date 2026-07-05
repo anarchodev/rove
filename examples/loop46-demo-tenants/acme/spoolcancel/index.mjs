@@ -27,7 +27,7 @@ export default function () {
         return "missing ?url=";
     }
     kv.set("sc/count", "0");
-    on.fetch(url, { stream: true, max_response_chunk_bytes: 64 });
+    after.fetch(url, { stream: true, max_response_chunk_bytes: 64 });
     return next();
 }
 

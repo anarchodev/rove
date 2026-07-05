@@ -16,7 +16,7 @@
   const sys = _system.platform;
   // `on.fetch` native (captured before `_harden.js` deletes `_system`) —
   // `platform.compile` lowers to a bound fetch to a trusted compile door.
-  const sysOn = _system.on;
+  const sysOn = _system.after;
   // `blob.receive` native — `platform.scope(t).blob.receive` lowers to a
   // cross-tenant streamed upload (extra target + ctx args, admin-gated).
   const sysBlobReceive = _system.blob.receive;

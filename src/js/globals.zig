@@ -1950,8 +1950,8 @@ pub fn installStatic(ctx: *c.JSContext) void {
     // scheduler.js + cron.js — reuses cron.parseDuration). `cron` the
     // recurring verb lives in cron.js (already eval'd above).
     evalSnippet(ctx, "schedule.js", SCHEDULE_JS);
-    // Handler-surface Phase 1: connection wake triggers.
-    evalSnippet(ctx, "on.js", ON_JS);
+    // The after.* connection wake triggers (canonical) + the on.* dual-name-window alias.
+    evalSnippet(ctx, "after.js", AFTER_JS);
     // Handler-surface Phase 2: connection output effects (`stream.*`).
     evalSnippet(ctx, "stream.js", STREAM_JS);
     // Handler-surface Phase 6: the public `next` disposition verb.
@@ -2026,11 +2026,11 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     .{ .path = &.{ "_system", "console" }, .fns = &.{
         .{ .name = "log", .cfunc = jsConsoleLog, .argc = 1 },
     } },
-    // Handler-surface Phase 1: connection wake triggers. `on.timer` /
+    // The after.* connection wake triggers (canonical) + the on.* dual-name-window alias. `on.timer` /
     // `on.kv` accumulate onto `DispatchState.pending_wakes`; the worker
     // arms them on the held entity at park. Inert when there's no held
     // connection (the accumulator is null).
-    .{ .path = &.{ "_system", "on" }, .fns = &.{
+    .{ .path = &.{ "_system", "after" }, .fns = &.{
         .{ .name = "timer", .cfunc = on_b.jsOnTimer,   .argc = 2 },
         .{ .name = "kv",    .cfunc = on_b.jsOnKv,      .argc = 2 },
         // Handler-surface Phase 3: connection-scoped outbound. Binds the
@@ -2220,7 +2220,7 @@ const CRON_JS = @embedFile("cron_js");
 const RETRY_JS = @embedFile("retry_js");
 const SCHEDULER_JS = @embedFile("scheduler_js");
 const SCHEDULE_JS = @embedFile("schedule_js");
-const ON_JS = @embedFile("on_js");
+const AFTER_JS = @embedFile("after_js");
 const STREAM_JS = @embedFile("stream_js");
 const NEXT_JS = @embedFile("next_js");
 const WEBHOOK_JS = @embedFile("webhook_js");
@@ -2256,7 +2256,7 @@ const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "retry", .src = RETRY_JS },
     .{ .name = "scheduler", .src = SCHEDULER_JS },
     .{ .name = "schedule", .src = SCHEDULE_JS },
-    .{ .name = "on", .src = ON_JS },
+    .{ .name = "after", .src = AFTER_JS },
     .{ .name = "stream", .src = STREAM_JS },
     .{ .name = "next", .src = NEXT_JS },
     .{ .name = "webhook", .src = WEBHOOK_JS },
@@ -2608,6 +2608,8 @@ pub fn installRequest(
             @memcpy(fid_buf[0..log_mod.FETCH_ID_PREFIX.len], log_mod.FETCH_ID_PREFIX);
             @memcpy(fid_buf[log_mod.FETCH_ID_PREFIX.len..][0..fid.len], fid);
             const fid_str = fid_buf[0 .. log_mod.FETCH_ID_PREFIX.len + fid.len];
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "fetchId", c.JS_NewStringLen(ctx, fid_str.ptr, fid_str.len));
+            // Dual-name window: snake_case alias (delete with the window).
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "fetch_id", c.JS_NewStringLen(ctx, fid_str.ptr, fid_str.len));
         }
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "seq", c.JS_NewInt64(ctx, @intCast(fc.seq)));
@@ -2657,6 +2659,8 @@ pub fn installRequest(
         if (fc.final) {
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "status", c.JS_NewInt64(ctx, @intCast(fc.terminal_status)));
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "ok", if (fc.terminal_ok) js_true else js_false);
+            _ = c.JS_SetPropertyStr(ctx, activation_obj, "bodyTruncated", if (fc.body_truncated) js_true else js_false);
+            // Dual-name window alias.
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "body_truncated", if (fc.body_truncated) js_true else js_false);
         }
         // `docs/handler-shape.md` §3 + §7: the customer's
@@ -2720,7 +2724,12 @@ pub fn installRequest(
             );
             _ = c.JS_SetPropertyStr(ctx, req_obj, "done", if (fc.final) js_true else js_false);
             if (fc.id) |fid| {
-                _ = c.JS_SetPropertyStr(ctx, req_obj, "fetchId", c.JS_NewStringLen(ctx, fid.ptr, fid.len));
+                // ftch_-prefixed — the SAME string after.fetch() returned
+                // (handler-api-ergonomics-plan §2.4).
+                var tfid_buf: [log_mod.FETCH_ID_PREFIX.len + 64]u8 = undefined;
+                @memcpy(tfid_buf[0..log_mod.FETCH_ID_PREFIX.len], log_mod.FETCH_ID_PREFIX);
+                @memcpy(tfid_buf[log_mod.FETCH_ID_PREFIX.len..][0..fid.len], fid);
+                _ = c.JS_SetPropertyStr(ctx, req_obj, "fetchId", c.JS_NewStringLen(ctx, &tfid_buf, log_mod.FETCH_ID_PREFIX.len + fid.len));
             }
             _ = c.JS_SetPropertyStr(ctx, req_obj, "chunkSeq", c.JS_NewInt64(ctx, @intCast(fc.seq)));
             // Pending bound-fetch count including this one.
@@ -2738,6 +2747,8 @@ pub fn installRequest(
             if (fc.final) {
                 _ = c.JS_SetPropertyStr(ctx, req_obj, "ok", if (fc.terminal_ok) js_true else js_false);
                 _ = c.JS_SetPropertyStr(ctx, req_obj, "status", c.JS_NewInt64(ctx, @intCast(fc.terminal_status)));
+                _ = c.JS_SetPropertyStr(ctx, req_obj, "bodyTruncated", if (fc.body_truncated) js_true else js_false);
+                // Dual-name window alias.
                 _ = c.JS_SetPropertyStr(ctx, req_obj, "body_truncated", if (fc.body_truncated) js_true else js_false);
             }
         }
@@ -2851,6 +2862,8 @@ pub fn installRequest(
         // Scheduled fire time fits comfortably in a JS Number until
         // the year 2262 (Date.now()*1e6); surface as a plain number
         // for ergonomic `scheduled_at_ns` math.
+        _ = c.JS_SetPropertyStr(ctx, activation_obj, "scheduledAtNs", c.JS_NewInt64(ctx, dw.scheduled_at_ns));
+        // Dual-name window alias.
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "scheduled_at_ns", c.JS_NewInt64(ctx, dw.scheduled_at_ns));
         const mjson = dw.msg_json orelse "null";
         if (state.allocator.allocSentinel(u8, mjson.len, 0)) |buf| {
@@ -2861,6 +2874,12 @@ pub fn installRequest(
                 _ = c.JS_GetException(ctx); // clear; fall through with null
                 _ = c.JS_SetPropertyStr(ctx, activation_obj, "msg", js_null);
             } else {
+                // One-ctx rule (handler-api-ergonomics-plan §2.4): the
+                // schedule/cron target reads its threaded payload as
+                // `request.ctx` like every other callback;
+                // `request.activation.msg` is the dual-name-window
+                // alias (delete with the window).
+                _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", c.JS_DupValue(ctx, msg_val));
                 _ = c.JS_SetPropertyStr(ctx, activation_obj, "msg", msg_val);
             }
         } else |_| {
@@ -2949,6 +2968,8 @@ pub fn installRequest(
         _ = c.JS_SetPropertyStr(ctx, req_obj, "status", c.JS_GetPropertyStr(ctx, result, "status"));
         _ = c.JS_SetPropertyStr(ctx, req_obj, "ok", c.JS_GetPropertyStr(ctx, result, "ok"));
         _ = c.JS_SetPropertyStr(ctx, req_obj, "done", js_true);
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "bodyTruncated", c.JS_GetPropertyStr(ctx, result, "body_truncated"));
+        // Dual-name window alias.
         _ = c.JS_SetPropertyStr(ctx, req_obj, "body_truncated", c.JS_GetPropertyStr(ctx, result, "body_truncated"));
 
         // request.ctx = the bare threaded value (what the customer passed

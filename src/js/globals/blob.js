@@ -80,8 +80,12 @@ globalThis.blob = {
     if (typeof bytes !== "string" && !(bytes instanceof Uint8Array))
       throw new TypeError("blob.put: bytes must be a string or Uint8Array");
     const hash = crypto.sha256(bytes);
-    const on_result = typeof opts.on_result === "string" ? opts.on_result : null;
-    const context = opts.context !== undefined ? opts.context : null;
+    // Canonical `on`/`ctx`; `on_result`/`context` are the dual-name-
+    // window aliases (handler-api-ergonomics-plan §2.3).
+    const on_result = typeof opts.on === "string" ? opts.on
+      : (typeof opts.on_result === "string" ? opts.on_result : null);
+    const context = opts.ctx !== undefined ? opts.ctx
+      : (opts.context !== undefined ? opts.context : null);
 
     const marker = {
       hash: hash,
@@ -146,8 +150,10 @@ globalThis.blob = {
     // composers (segments.get) thread slicing info to the `to`
     // export without kv round-trips.
     if (opts.ctx !== undefined) fetch_opts.ctx = opts.ctx;
-    return on.fetch(BLOB_ORIGIN + hash, fetch_opts,
-                    opts.to ? { to: opts.to } : undefined);
+    // Canonical `on`; `to` is the dual-name-window alias.
+    const get_on = typeof opts.on === "string" ? opts.on : opts.to;
+    return after.fetch(BLOB_ORIGIN + hash, fetch_opts,
+                       get_on ? { on: get_on } : undefined);
   },
 
   /**
@@ -240,9 +246,10 @@ globalThis.blob = {
    */
   seal(opts) {
     opts = opts || {};
-    if (typeof opts.to !== "string" || !opts.to.length)
-      throw new TypeError("blob.seal: `to` export name is required");
-    return sysBlob.seal(opts.to,
+    const on_key = typeof opts.on === "string" ? opts.on : opts.to; // `to` = window alias
+    if (typeof on_key !== "string" || !on_key.length)
+      throw new TypeError("blob.seal: `on` export name is required");
+    return sysBlob.seal(on_key,
                         opts.content_type != null ? opts.content_type : undefined);
   },
 
@@ -286,9 +293,10 @@ globalThis.blob = {
    */
   receive(opts) {
     opts = opts || {};
-    if (typeof opts.to !== "string" || !opts.to.length)
-      throw new TypeError("blob.receive: `to` export name is required");
-    return sysBlob.receive(opts.to);
+    const on_key = typeof opts.on === "string" ? opts.on : opts.to; // `to` = window alias
+    if (typeof on_key !== "string" || !on_key.length)
+      throw new TypeError("blob.receive: `on` export name is required");
+    return sysBlob.receive(on_key);
   },
 };
 

@@ -114,6 +114,9 @@ globalThis.segments = {
   get(stream, seq, opts) {
     assertStream(stream, "segments.get");
     opts = opts || {};
+    // Canonical `on`; `to` is the dual-name-window alias
+    // (handler-api-ergonomics-plan §2.3).
+    const on_key = typeof opts.on === "string" ? opts.on : opts.to;
     if (!Number.isInteger(seq) || seq < 0)
       throw new TypeError("segments.get: seq must be a non-negative integer");
     const hot = kv.get(HOT(stream) + pad(seq));
@@ -127,10 +130,10 @@ globalThis.segments = {
     for (const row of rows) {
       const idx = JSON.parse(row.value);
       if (seq >= idx.first_seq && seq <= idx.last_seq) {
-        if (typeof opts.to !== "string")
-          throw new TypeError("segments.get: record is sealed — pass { to } and finish in that export");
+        if (typeof on_key !== "string")
+          throw new TypeError("segments.get: record is sealed — pass { on } and finish in that export");
         blob.get(idx.hash, {
-          to: opts.to,
+          on: on_key,
           ctx: { stream: stream, seq: seq, idx: seq - idx.first_seq },
         });
         return undefined;

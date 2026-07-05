@@ -26,7 +26,7 @@ export default function () {
     };
     stream.start();
     stream.write(`event: hello\ndata: ${session_id}\n\n`);
-    on.timer(100);
+    after.ms(100);
     return next({ session_id });
 }
 
@@ -43,6 +43,6 @@ export function onWake() {
     for (const w of request.activation.wakes) {
         if (w.kind === "timer") stream.write(`event: tick\ndata: ${ctx.session_id}\n\n`);
     }
-    on.timer(100);
+    after.ms(100);
     return next(ctx);
 }

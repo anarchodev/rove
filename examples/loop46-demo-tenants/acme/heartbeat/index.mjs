@@ -1,7 +1,7 @@
 // Streaming-handlers — multi-frame timer-wake exerciser (handler-
 // surface Phase 2 `stream.*` surface). The inbound hop (`default`
 // export) opens the stream with a single SSE `:heartbeat\n\n` frame and
-// arms `on.timer(200)`; every 200ms the runtime runs `onWake` (Phase 4
+// arms `after.ms(200)`; every 200ms the runtime runs `onWake` (Phase 4
 // named-export dispatch) which emits another `:heartbeat\n\n`. The smoke
 // (scripts/streaming_heartbeat_smoke.py) reads at least three heartbeats
 // over ~700ms, then closes — verifying the chunked-DATA + timer-wake
@@ -19,7 +19,7 @@ export default function () {
     };
     stream.start();
     stream.write(":heartbeat\n\n");
-    on.timer(200);
+    after.ms(200);
     return next();
 }
 
@@ -29,6 +29,6 @@ export function onWake() {
     for (const w of request.activation.wakes) {
         if (w.kind === "timer") stream.write(":heartbeat\n\n");
     }
-    on.timer(200);
+    after.ms(200);
     return next();
 }

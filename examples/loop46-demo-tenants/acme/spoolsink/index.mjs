@@ -36,7 +36,7 @@ export default function () {
     // Fresh accumulator per run.
     kv.set("spoolsink/full", "");
     // Connection-scoped (held handler) → chunks resume onFetchChunk.
-    on.fetch(url, { stream: true, max_response_chunk_bytes: 64 });
+    after.fetch(url, { stream: true, max_response_chunk_bytes: 64 });
     return next({ tag: "spoolsink" });
 }
 

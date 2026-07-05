@@ -9,7 +9,7 @@ the chain resumes its `onWake`/`onTimer` export and `stream.write`s a frame
 back over the SAME socket.
 
 Asserts:
-  1. `watch:<prefix>` → on.kv(prefix) armed, reply "watching:<prefix>"
+  1. `watch:<prefix>` → after.kv(prefix) armed, reply "watching:<prefix>"
   2. a kv write under the prefix (via /_system/v2-kv) → onWake → "woke:<value>"
   3. `timer` → on.timer armed, reply "armed", then "tick" within ~2s
 
@@ -52,12 +52,12 @@ export function onMessage() {
   const { data } = request.activation;
   if (data.startsWith("watch:")) {            // arm an on.kv wake
     const prefix = data.slice(6);
-    on.kv(prefix, { to: "onWake" });
+    after.kv(prefix, { on: "onWake" });
     stream.write("watching:" + prefix);
     return next({ prefix });
   }
   if (data === "timer") {                      // arm an on.timer wake
-    on.timer(500, { to: "onTimer" });
+    after.ms(500, { on: "onTimer" });
     stream.write("armed");
     return next();
   }

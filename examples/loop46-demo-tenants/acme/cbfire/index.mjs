@@ -1,11 +1,10 @@
 export function fire(url, tag) {
-    const id = webhook.send({
-        url: url,
+    const id = webhook.send(url, {
         method: "POST",
         body: "ping",
         headers: { "content-type": "text/plain" },
-        on_result: "cbresult",
-        context: { tag: tag },
+        on: "cbresult",
+        ctx: { tag: tag },
         max_attempts: 2,
     });
     kv.set("cb/last_fire", id);

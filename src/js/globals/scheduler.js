@@ -14,7 +14,7 @@
 // is exactly that — kv guard + re-arm).
 //
 //   // Fire `jobs/reminder` in 30 minutes with a payload.
-//   scheduler.after(30 * 60_000, "jobs/reminder", { userId });
+//   scheduler.in(30 * 60_000, "jobs/reminder", { userId });
 //
 //   // Idempotent absolute wake; re-arming with the same key moves it.
 //   scheduler.at(cron.dailyAt(3, 0), "jobs/cleanup", null,
@@ -107,7 +107,7 @@ function _enforceOutstandingCap() {
  *
  * @namespace scheduler
  * @example
- * scheduler.after(30 * 60_000, "jobs/reminder", { userId });
+ * scheduler.in(30 * 60_000, "jobs/reminder", { userId });
  * scheduler.at(cron.dailyAt(3, 0), "jobs/cleanup", null,
  *              { key: "cleanup/daily" }); // idempotent, re-armable
  */
@@ -197,15 +197,25 @@ globalThis.scheduler = {
    * @returns {string} The stable schedule id.
    * @throws {TypeError} On a non-number `delayMs` or empty `target`.
    * @example
-   * scheduler.after(5000, "jobs/poll");
+   * scheduler.in(5000, "jobs/poll");
    */
-  after(delayMs, target, msg, opts) {
+  in(delayMs, target, msg, opts) {
     if (typeof delayMs !== "number" || !Number.isFinite(delayMs)) {
-      throw new TypeError("scheduler.after: delayMs must be a finite number");
+      throw new TypeError("scheduler.in: delayMs must be a finite number");
     }
     // Date.now() is replay-deterministic (pinned per activation).
     const whenNs = BigInt(Date.now() + Math.floor(delayMs)) * 1_000_000n;
     return this.at(whenNs, target, msg, opts);
+  },
+
+  /**
+   * Dual-name-window alias of {@link scheduler.in} (one deploy cycle;
+   * delete with the window). Renamed so "after" is exclusively the
+   * connection-scoped `after.*` namespace — the verb is the scope
+   * (handler-api-ergonomics-plan §2.3).
+   */
+  after(delayMs, target, msg, opts) {
+    return this.in(delayMs, target, msg, opts);
   },
 
   /**

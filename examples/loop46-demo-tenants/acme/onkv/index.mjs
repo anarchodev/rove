@@ -2,7 +2,7 @@
 // kv half, sibling of `ontimer`).
 //
 // The inbound hop READS the watched key first (so the §8.4 read_version
-// baseline is captured AFTER the read), arms `on.kv(prefix)`, and HOLDS
+// baseline is captured AFTER the read), arms `after.kv(prefix)`, and HOLDS
 // the socket via `__rove_next` with NO webhook.send. The ONLY thing that
 // can resume this parked continuation is a kv write under the watched
 // prefix landing at a write_version strictly greater than the baseline.
@@ -22,7 +22,7 @@ export default function () {
     // Read the watched key so read_version baselines AFTER this read —
     // only a write newer than what we just saw should wake us.
     kv.get(prefix + "flag");
-    on.kv(prefix, { to: "onWake" });
+    after.kv(prefix, { on: "onWake" });
     return next({ prefix });
 }
 

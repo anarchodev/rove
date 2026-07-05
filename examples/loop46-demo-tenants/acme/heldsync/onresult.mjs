@@ -17,8 +17,7 @@ export function onResult(ctx, outcome) {
         // Recipe-1: compose a retry yourself. One re-issue to a
         // known-good target, then re-park (allow_repark=true).
         if (ctx.retry_to && ctx.tries < 1) {
-            webhook.send({
-                url: ctx.retry_to,
+            webhook.send(ctx.retry_to, {
                 method: "POST",
                 body: JSON.stringify({ from: "heldsync-retry", tag: ctx.tag }),
                 headers: { "content-type": "application/json" },

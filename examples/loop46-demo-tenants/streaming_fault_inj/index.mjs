@@ -15,7 +15,7 @@ export default function () {
     // 1.5s timer — wide enough that the smoke can SIGSTOP followers
     // before the wake fires, narrow enough to exercise the gate within a
     // smoke's deadline.
-    on.timer(1500);
+    after.ms(1500);
     return next();
 }
 
@@ -27,6 +27,6 @@ export function onWake() {
     kv.set("counter", String(ctr));
     stream.start();
     stream.write(`event: tick\ndata: ${ctr}\n\n`);
-    on.timer(1500);
+    after.ms(1500);
     return next();
 }

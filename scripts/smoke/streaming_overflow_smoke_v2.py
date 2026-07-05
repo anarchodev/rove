@@ -2,7 +2,7 @@
 """V2 port of `streaming_overflow_smoke.py` — Gap 2.2 §9.4 `PendingWakes`
 ring overflow, on the `V2Cluster` harness.
 
-`/overflow_watch` arms `on.kv("overflow/")`; on every wake_batch activation
+`/overflow_watch` arms `after.kv("overflow/")`; on every wake_batch activation
 it emits ONE status frame echoing `request.activation.wakes.length` +
 `request.activation.overflow.lost_oldest`, then re-arms.
 `/overflow_burst` POSTs `{count}` and does `kv.set("overflow/k{i}", ...)`
@@ -45,7 +45,7 @@ export default function () {
     };
     stream.start();
     stream.write("event: open\\ndata: ok\\n\\n");
-    on.kv("overflow/");
+    after.kv("overflow/");
     return next();
 }
 
@@ -53,7 +53,7 @@ export function onWake() {
     const a = request.activation;
     stream.start();
     stream.write(`event: batch\\ndata: wakes=${a.wakes.length} lost=${a.overflow.lost_oldest}\\n\\n`);
-    on.kv("overflow/");
+    after.kv("overflow/");
     return next();
 }
 """
@@ -127,7 +127,7 @@ def main() -> int:
 
         print("step 4: hold SSE GET /overflow_watch, POST a 50-key burst")
         watcher = _stream_watch(c, "/overflow_watch", max_time=4.0)
-        time.sleep(0.5)  # let the inbound hop arm on.kv("overflow/")
+        time.sleep(0.5)  # let the inbound hop arm after.kv("overflow/")
 
         # The burst: 50 kv writes in ONE handler invocation → ONE writeset
         # → ONE apply broadcast → ONE drain of 50 events into the ring.

@@ -2,7 +2,7 @@
 """V2 port of `on_fetch_smoke.py` — the `on.fetch` surface (handler-surface
 Phase 3 slice 3a) on the `V2Cluster` harness (`smoke_lib_v2`).
 
-`on.fetch(url, opts, {to})` is the connection-scoped outbound: it binds the
+`after.fetch(url, opts, {to})` is the connection-scoped outbound: it binds the
 fetch to the held chain — each upstream chunk wakes the `{to}` export while
 the chain holds the socket. Proves bind + `{to}` export override + chunk
 resume WITHOUT stream.* output (the handler accumulates each chunk in kv and

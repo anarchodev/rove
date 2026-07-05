@@ -17,7 +17,7 @@ export default function () {
     };
     stream.start();
     stream.write(":hb\n\n");
-    on.timer(100);
+    after.ms(100);
     return next();
 }
 
@@ -36,6 +36,6 @@ export function onWake() {
     for (const w of request.activation.wakes) {
         if (w.kind === "timer") stream.write(":hb\n\n");
     }
-    on.timer(100);
+    after.ms(100);
     return next();
 }

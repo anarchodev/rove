@@ -2,9 +2,9 @@
 """V2 port of `streaming_kv_wake_smoke.py` — streaming-handlers kv-write
 wake, on the `V2Cluster` harness.
 
-The `/watch` handler arms `on.kv("watch/")` + emits a `snapshot` frame on
+The `/watch` handler arms `after.kv("watch/")` + emits a `snapshot` frame on
 the inbound hop, then one `update` frame per kv entry in each wake batch,
-re-arming `on.kv("watch/")` on every `next()` so it keeps streaming. The
+re-arming `after.kv("watch/")` on every `next()` so it keeps streaming. The
 smoke holds an SSE GET on `/watch` (via the front door) while a SECOND
 client POSTs three writes under `watch/` (DIRECT to the node — see below).
 
@@ -56,7 +56,7 @@ export default function () {
     };
     stream.start();
     stream.write("event: snapshot\\ndata: initial\\n\\n");
-    on.kv("watch/");
+    after.kv("watch/");
     return next();
 }
 
@@ -67,7 +67,7 @@ export function onWake() {
         const value = kv.get(w.key) ?? "(deleted)";
         stream.write(`event: update\\ndata: ${w.key}=${value} (${w.op})\\n\\n`);
     }
-    on.kv("watch/");
+    after.kv("watch/");
     return next();
 }
 """
@@ -143,7 +143,7 @@ def main() -> int:
 
         print("step 4: hold SSE GET /watch, POST three writes ~0.2s apart")
         watcher = _stream_watch(c, "/watch", max_time=4.0)
-        # Give the inbound hop time to arm on.kv("watch/") before writing.
+        # Give the inbound hop time to arm after.kv("watch/") before writing.
         time.sleep(0.5)
 
         for i, value in enumerate(["alpha", "bravo", "charlie"], start=1):

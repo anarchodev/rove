@@ -3,7 +3,7 @@
 exerciser (handler-surface Phase 2 `stream.*`) on the `V2Cluster` harness.
 
 The `acme/heartbeat` handler opens an SSE stream with one `:heartbeat\\n\\n`
-frame and arms `on.timer(200)`; every 200ms `onWake` emits another
+frame and arms `after.ms(200)`; every 200ms `onWake` emits another
 `:heartbeat\\n\\n`. The smoke opens the SSE request, holds it open ~0.7s
 (long enough for multiple chunks), disconnects (curl `--max-time`), and
 asserts the chunk count + framing + that the §4.4 disconnect activation

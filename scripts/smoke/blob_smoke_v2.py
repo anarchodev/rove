@@ -56,7 +56,7 @@ GET_SRC = """
 export default function () {
   const qpos = request.path.indexOf("?");
   const hash = request.path.slice(request.path.indexOf("hash=") + 5);
-  blob.get(hash, { to: "onBlob" });
+  blob.get(hash, { on: "onBlob" });
   return next();
 }
 
@@ -94,8 +94,8 @@ MIRROR_SRC = """
 export default function () {
   const src = new TextDecoder().decode(
     hex.decode(request.path.slice(request.path.indexOf("src=") + 4)));
-  on.fetch(src, { stream: true, max_response_chunk_bytes: 16384 },
-           { to: "onChunk" });
+  after.fetch(src, { stream: true, max_response_chunk_bytes: 16384 },
+           { on: "onChunk" });
   return next();
 }
 
@@ -104,7 +104,7 @@ export function onChunk() {
     if (request.body && request.body.length) blob.write(request.body);
     return next();
   }
-  const hash = blob.seal({ to: "onStored", content_type: "text/plain" });
+  const hash = blob.seal({ on: "onStored", content_type: "text/plain" });
   return next({ hash });
 }
 
@@ -126,7 +126,7 @@ export default function () {{
   let chunk = "";
   for (let i = 0; i < 1024; i++) chunk += "rewindjs-blob-p2!";
   for (let i = 0; i < 8; i++) blob.write(chunk);
-  const hash = blob.seal({{ to: "onStored" }});
+  const hash = blob.seal({{ on: "onStored" }});
   return next({{ hash }});
 }}
 
@@ -150,7 +150,7 @@ export default function () {
     const eq = pair.indexOf("=");
     if (eq > 0) q[pair.slice(0, eq)] = pair.slice(eq + 1);
   }
-  const v = segments.get(q.stream, Number(q.seq), { to: "onSeg" });
+  const v = segments.get(q.stream, Number(q.seq), { on: "onSeg" });
   if (typeof v === "string") return "hot:" + v;
   if (v === null) { response.status = 404; return "missing"; }
   return next();
@@ -178,8 +178,8 @@ export default function () {
     const body = request.body || "";
     const hash = blob.put(body, {
       content_type: "text/plain",
-      on_result: "putresult",
-      context: { tag: "smoke" },
+      on: "putresult",
+      ctx: { tag: "smoke" },
     });
     kv.set("last_put", hash);
     return hash;

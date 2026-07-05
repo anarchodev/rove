@@ -47,6 +47,7 @@ const qjs = @import("rove-qjs");
 const c = qjs.c;
 
 const globals = @import("../globals.zig");
+const log_mod = @import("rove-log");
 
 const js_undefined = globals.js_undefined;
 const js_exception = globals.js_exception;
@@ -223,7 +224,16 @@ pub fn jsOnFetch(
         },
     };
     state.http_fetch_index += 1;
-    const res = c.JS_NewStringLen(ctx, row.id.ptr, row.id.len);
+    // Customer-visible: the opaque `ftch_<hex>` form (§7.5) — the SAME
+    // string `request.fetchId` carries, so equality comparison works
+    // across the return value and the resume surface
+    // (handler-api-ergonomics-plan §2.4). Engine-internal keys (msg
+    // router, S3 upload) keep the bare hex.
+    std.debug.assert(row.id.len <= 64);
+    var fid_buf: [log_mod.FETCH_ID_PREFIX.len + 64]u8 = undefined;
+    @memcpy(fid_buf[0..log_mod.FETCH_ID_PREFIX.len], log_mod.FETCH_ID_PREFIX);
+    @memcpy(fid_buf[log_mod.FETCH_ID_PREFIX.len..][0..row.id.len], row.id);
+    const res = c.JS_NewStringLen(ctx, &fid_buf, log_mod.FETCH_ID_PREFIX.len + row.id.len);
     appendPendingFetch(state, &row) catch |err| {
         c.JS_FreeValue(ctx, res);
         row.deinit(state.allocator);
@@ -337,9 +347,15 @@ pub fn jsHttpCancelFetch(
         _ = c.JS_ThrowRangeError(ctx, "http.cancelFetch: `id` must be 1-256 utf8 bytes");
         return js_exception;
     }
+    // Accept the customer-visible `ftch_`-prefixed form (what
+    // after.fetch() returns); the engine keys fetches by bare hex.
+    var id_slice = @as([*]const u8, @ptrCast(cstr))[0..len];
+    if (std.mem.startsWith(u8, id_slice, log_mod.FETCH_ID_PREFIX)) {
+        id_slice = id_slice[log_mod.FETCH_ID_PREFIX.len..];
+    }
     if (state.cancel_fetch) |fn_ptr| {
         const fn_ctx = state.cancel_fetch_ctx orelse return js_undefined;
-        fn_ptr(fn_ctx, @as([*]const u8, @ptrCast(cstr))[0..len]);
+        fn_ptr(fn_ctx, id_slice);
     }
     // Engine null (test paths / non-worker dispatch) → silent
     // no-op; matches the pre-engine behavior the JS side already

@@ -4,14 +4,14 @@
 `v2`).
 
 The `streamkv` handler produces its SSE response with `stream.start()` /
-`stream.write()` effects, waits with `on.kv("streamkv/in/")`, and holds
+`stream.write()` effects, waits with `after.kv("streamkv/in/")`, and holds
 the socket with `next()`. The dispatcher's `finishResponse` bridges
 `(next() + stream_started)` to the same internal Stream descriptor, so the
 h2 stream pipeline drives it.
 
   client ──GET /streamkv (held, -N)──▶ acme inbound hop
      response.headers = {content-type: text/event-stream}
-     stream.start() + stream.write("ready") + on.kv("streamkv/in/") + next()
+     stream.start() + stream.write("ready") + after.kv("streamkv/in/") + next()
      → first frame ships; entity parks, kv-armed
 
   client ──POST /writekv {key: streamkv/in/<id>, value}──▶ 204  (DIRECT to node)
@@ -64,7 +64,7 @@ STREAMKV_SRC = r"""export default function () {
     };
     stream.start();
     stream.write("event: ready\ndata: 1\n\n");
-    on.kv("streamkv/in/");
+    after.kv("streamkv/in/");
     return next();
 }
 
@@ -75,7 +75,7 @@ export function onWake() {
         const v = kv.get(w.key) ?? "(absent)";
         stream.write("event: update\ndata: " + w.key + "=" + v + "\n\n");
     }
-    on.kv("streamkv/in/");
+    after.kv("streamkv/in/");
     return next();
 }
 """
