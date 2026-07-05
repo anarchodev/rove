@@ -511,6 +511,10 @@ pub fn main() !void {
     // Upstream connect deadline (plan A1): a SYN-blackholed backend
     // fails over in ~this long instead of the kernel connect budget.
     proxy.connect_timeout_ns = envMs("REWIND_FRONT_CONNECT_TIMEOUT_MS", 1_000) * std.time.ns_per_ms;
+    // Inbound request-body between-bytes budget (plan A5): a client
+    // that starts a body and stops sending is aborted; slow-but-moving
+    // uploads survive. 0 disables.
+    proxy.body_stall_ns = envMs("REWIND_FRONT_BODY_STALL_TIMEOUT_MS", 60_000) * std.time.ns_per_ms;
     // Teardown order matters: `server.destroy()` releases any still-live
     // body sinks, and those callbacks walk proxy-owned Flow state — so the
     // server must go down while the proxy is still alive. One defer block

@@ -83,6 +83,19 @@ pub const CHUNK_MAX: u32 = 64 * 1024;
 /// Reconnect backoff for a backend node whose connect failed.
 const CONNECT_BACKOFF_NS: i128 = 500 * std.time.ns_per_ms;
 
+/// Default between-bytes progress budget for an INBOUND request body
+/// (`REWIND_FRONT_BODY_STALL_TIMEOUT_MS`) — nginx's
+/// `client_body_timeout`. A client that starts a body and stops sending
+/// holds a front flow and a worker stream indefinitely: the per-CONN
+/// idle reap never fires as long as any one stream (or a PING) keeps
+/// the connection active, so per-stream progress is the only honest
+/// signal (plan A5). Between-bytes, not total: legitimate slow uploads
+/// survive as long as bytes keep arriving. Response-side progress is
+/// deliberately NOT policed at the front — a quiet held SSE stream is
+/// indistinguishable from a stall here, and held-connection deadlines
+/// are the worker's (see the plan doc).
+const BODY_STALL_NS_DEFAULT: i128 = 60_000 * std.time.ns_per_ms;
+
 /// Default deadline for an upstream connect to complete (overridable
 /// via `REWIND_FRONT_CONNECT_TIMEOUT_MS`). The io layer puts no
 /// timeout on the connect op, so a backend that blackholes SYNs (node
@@ -471,6 +484,9 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// Upstream connect deadline (`REWIND_FRONT_CONNECT_TIMEOUT_MS`;
         /// main.zig overrides after init).
         connect_timeout_ns: i128 = CONNECT_TIMEOUT_NS_DEFAULT,
+        /// Inbound request-body between-bytes budget
+        /// (`REWIND_FRONT_BODY_STALL_TIMEOUT_MS`; 0 disables).
+        body_stall_ns: i128 = BODY_STALL_NS_DEFAULT,
 
         const StreamKey = struct {
             idx: u32,
@@ -583,6 +599,10 @@ pub fn Proxy(comptime FrontH2: type) type {
             /// Absolute body bytes received from downstream so far.
             body_total: usize = 0,
             body_complete: bool = false,
+            /// Monotonic stamp of the last inbound body byte (or sink
+            /// attach). 0 = not armed (classic/bodyless flows). Swept
+            /// by `expireStalledBodies`.
+            last_body_progress_ns: i128 = 0,
             replayable: bool = true,
             /// The request method is safe to re-send after an AMBIGUOUS
             /// transport failure (upstream died after the head was
@@ -738,6 +758,8 @@ pub fn Proxy(comptime FrontH2: type) type {
             self.expireParkedRoutes(now_ns);
             // 504 any flow stuck awaiting upstream response headers.
             self.expireStalledResponses(now_ns);
+            // Abort any flow whose inbound request body stalled.
+            self.expireStalledBodies(now_ns);
             // Fail over waiters whose upstream connect blew its deadline.
             self.expireStalledConnects(now_ns);
             try self.reg.flush();
@@ -768,6 +790,9 @@ pub fn Proxy(comptime FrontH2: type) type {
                     .streaming => {
                         flow.down_sink_live = true;
                         flow.sink_refs += 1;
+                        // Arm the body-progress budget (a body is now
+                        // owed; `downSinkPush` refreshes per byte).
+                        flow.last_body_progress_ns = now_ns;
                     },
                     .eof => {
                         // push()es + finish() already ran synchronously.
@@ -2112,6 +2137,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             if (flow.down_gone) return false;
             flow.body.appendSlice(flow.proxy.allocator, bytes) catch return false;
             flow.body_total += bytes.len;
+            flow.last_body_progress_ns = std.time.nanoTimestamp();
             if (flow.replayable and !flow.body_complete and flow.body.items.len > REPLAY_CAP) {
                 flow.replayable = false;
             }
@@ -2434,6 +2460,44 @@ pub fn Proxy(comptime FrontH2: type) type {
                         i += 1;
                     }
                 }
+            }
+        }
+
+        /// Abort any flow whose inbound request body has made no
+        /// progress for `body_stall_ns` (plan A5; nginx
+        /// `client_body_timeout`). Per-STREAM: the conn-level idle reap
+        /// never fires while any sibling stream (or a PING) keeps the
+        /// connection active, so a stalled upload otherwise holds its
+        /// front flow and worker stream forever. Between-bytes budget —
+        /// slow-but-moving uploads survive. Exemptions: complete bodies
+        /// (nothing owed), flows the worker already answered
+        /// (`resp_started` — the h2 layer flips the remainder to
+        /// discard), and held/response-side streams (never armed).
+        /// `serverStreamAbort` reuses the downstream-death teardown:
+        /// the sink abort marks `down_gone`, the upstream pump RSTs so
+        /// the worker sees a broken stream (never a truncated-but-
+        /// complete body), and the entity routes out via the orphan
+        /// sweep. Collect first — the abort mutates flow state.
+        fn expireStalledBodies(self: *Self, now_ns: i128) void {
+            if (self.body_stall_ns == 0) return;
+            var stalled: [32]*Flow = undefined;
+            var n: usize = 0;
+            var it = self.flows_by_up.valueIterator();
+            while (it.next()) |fp| {
+                const flow = fp.*;
+                if (flow.body_complete or flow.resp_started) continue;
+                if (flow.down_gone or !flow.down_alive) continue;
+                if (flow.last_body_progress_ns == 0) continue;
+                if (now_ns - flow.last_body_progress_ns < self.body_stall_ns) continue;
+                stalled[n] = flow;
+                n += 1;
+                if (n == stalled.len) break;
+            }
+            for (stalled[0..n]) |flow| {
+                std.log.warn("front: request body stalled >{d}ms (host={s}) -> abort", .{
+                    @divTrunc(self.body_stall_ns, std.time.ns_per_ms), flow.host,
+                });
+                self.server.serverStreamAbort(flow.down_sess, flow.down_sid);
             }
         }
 

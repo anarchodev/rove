@@ -72,14 +72,20 @@ built to observe. Cure: handshake deadline (~10 s) swept in rove-h2.
 ### A5. No mid-stream progress timeouts
 
 `expireStalledResponses` covers exactly one window: body complete,
-response headers not yet arrived. Not covered: a worker stalling
-mid-response-body (skipped via `resp_started`) while the pooled conn
-stays busy so the 5 s upstream idle reap never fires; a client stalling
+response headers not yet arrived. Not covered: a client stalling
 mid-request-body (skipped via `!body_complete`) while holding worker
-resources. nginx: `proxy_read_timeout` (between reads, not just to
-first byte), `send_timeout`, `client_body_timeout`. Cure:
-progress-based deadlines — any flow with an open body direction that
-sees zero bytes for N seconds is aborted.
+resources — per-STREAM, so the conn-level idle reap never fires while
+any sibling stream (or a PING) keeps the connection active. nginx:
+`client_body_timeout`. Cure: a between-bytes request-body budget
+(`REWIND_FRONT_BODY_STALL_TIMEOUT_MS`, default 60 s).
+
+**Deliberate divergence (resolved during implementation):** the
+mid-RESPONSE-body window (`proxy_read_timeout` between reads) is NOT
+policed at the front. A quiet held SSE stream — a first-class product
+primitive (connection-actor) — is indistinguishable from a stalled
+worker at the proxy, and held-connection deadlines belong to the
+worker (parked chains carry their own budgets). A worker that dies
+mid-response already aborts the flow via the conn/stream teardown.
 
 ### A6. Cold-route resolution is a serial, unprotected bottleneck
 
