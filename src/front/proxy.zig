@@ -885,6 +885,27 @@ pub fn Proxy(comptime FrontH2: type) type {
             };
         }
 
+        /// Observability: total in-flight upstream streams summed across
+        /// every pooled leg, the live leg count, and the largest single-leg
+        /// inflight. `inflight` is submitted-but-not-terminated streams on a
+        /// leg (`enqueue`/terminal repay). If half-closed proxied streams
+        /// leak (their terminal never lands), this climbs monotonically and
+        /// never drains at idle — the pooled-conn leak canary.
+        pub const UpstreamStats = struct { inflight: u64 = 0, live_legs: u32 = 0, max_leg_inflight: u32 = 0 };
+        pub fn upstreamStats(self: *const Self) UpstreamStats {
+            var s: UpstreamStats = .{};
+            var it = self.pool.valueIterator();
+            while (it.next()) |up_ptr| {
+                const up = up_ptr.*;
+                for (up.legs[0..up.n_legs]) |*leg| {
+                    if (leg.state == .up) s.live_legs += 1;
+                    s.inflight += leg.inflight;
+                    if (leg.inflight > s.max_leg_inflight) s.max_leg_inflight = leg.inflight;
+                }
+            }
+            return s;
+        }
+
         pub fn deinit(self: *Self) void {
             var it = self.pool.valueIterator();
             while (it.next()) |up| {

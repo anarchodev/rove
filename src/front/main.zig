@@ -211,6 +211,23 @@ fn getEnvCfg(name: []const u8) []const u8 {
     return std.posix.getenv(name) orelse "";
 }
 
+/// Set `O_NONBLOCK` on stderr (and stdout) so the serving thread's
+/// `std.log` writes can never block on a backpressured log sink
+/// (journald / an undrained pipe). On a full sink the write returns
+/// `EAGAIN`, which `std.log`'s writer swallows — the line drops rather
+/// than freezing the poll loop. Best-effort: a fcntl failure just leaves
+/// the fd blocking (no worse than before). Shared file description with
+/// stdout when they're the same pipe, which is fine — both should be
+/// non-blocking on the serving thread.
+fn makeLogNonBlocking() void {
+    for ([_]std.posix.fd_t{ std.posix.STDERR_FILENO, std.posix.STDOUT_FILENO }) |fd| {
+        const cur = std.posix.fcntl(fd, std.posix.F.GETFL, 0) catch continue;
+        var o: std.posix.O = @bitCast(@as(u32, @truncate(cur)));
+        o.NONBLOCK = true;
+        _ = std.posix.fcntl(fd, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+    }
+}
+
 /// Parse a millisecond config env var, falling back to `default` when
 /// unset or unparseable.
 fn envMs(name: []const u8, default: i128) i128 {
@@ -389,6 +406,24 @@ fn buildFrontMetricsText(allocator: std.mem.Allocator, server: *FrontH2, proxy: 
         \\front_proxy_tunnels_active {d}
         \\
     , .{ proxy.live_flows, proxy.live_tunnels });
+    // Pooled upstream-leg state (leak canary): in-flight streams across
+    // all legs should track load and return to ~0 at idle. A monotonic
+    // climb = proxied streams whose upstream terminal never landed
+    // (e.g. half-closed streams not reaped on the pooled front→worker
+    // conn) — the mechanism behind the h2spec full-suite relay stall.
+    const us = proxy.upstreamStats();
+    try w.print(
+        \\# HELP front_upstream_inflight in-flight proxied streams summed across all pooled upstream legs (leak canary — climbs + never drains ⇒ a stream leak on the pooled conn).
+        \\# TYPE front_upstream_inflight gauge
+        \\front_upstream_inflight {d}
+        \\# HELP front_upstream_live_legs live pooled upstream connections (legs) across all backend nodes.
+        \\# TYPE front_upstream_live_legs gauge
+        \\front_upstream_live_legs {d}
+        \\# HELP front_upstream_max_leg_inflight largest single-leg in-flight stream count (approaches the per-leg cap as a leg fills).
+        \\# TYPE front_upstream_max_leg_inflight gauge
+        \\front_upstream_max_leg_inflight {d}
+        \\
+    , .{ us.inflight, us.live_legs, us.max_leg_inflight });
     // Per-request proxy events (plan C11): the counters that decompose
     // "the front is unreliable" into leadership churn vs dead nodes vs
     // stalls vs resolver trouble vs the ambiguous-retry gate.
@@ -457,6 +492,17 @@ pub fn main() !void {
     curl.globalInit();
     const allocator = std.heap.c_allocator;
     installSignalHandlers();
+    // Logging must NEVER block the poll loop. The front logs via std.log
+    // to stderr; in prod stderr → journald, in tests → a pipe. Either sink
+    // can backpressure under load (journald rate-limit / slow disk; an
+    // undrained pipe), and a BLOCKING write() on the single serving thread
+    // then freezes the ENTIRE front — every tenant — until the sink
+    // drains. (Root-caused from an h2spec wedge: the poll thread stuck in
+    // anon_pipe_write; the per-request access log was the volume trigger.)
+    // Make the log fd non-blocking so a write under backpressure drops
+    // (EAGAIN, swallowed by std.log's `catch`) instead of wedging the
+    // loop — dropped log lines are strictly better than a frozen edge.
+    makeLogNonBlocking();
 
     var arg_it = std.process.args();
     _ = arg_it.next();
