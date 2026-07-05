@@ -203,8 +203,23 @@ pub const Conn = struct {
     draining: bool = false,
     drain_deadline_ns: u64 = 0,
 
-    pub fn deinit(_: std.mem.Allocator, items: []Conn) void {
+    /// Egress serialization (h2 server DATA path). A single TCP socket is
+    /// one ordered byte stream, and for TLS every record's MAC binds an
+    /// implicit sequence number — so two concurrent `prep_send` SQEs for
+    /// the same conn that reach the socket out of order desync the peer's
+    /// record layer (`bad record mac`, anarchodev/rove#2). We therefore
+    /// keep AT MOST ONE io write in flight per connection and queue the
+    /// rest in FIFO order; `writesAccount` submits the next on completion.
+    /// `send_queue` owns each buffer until it is handed to `submitWrite`
+    /// (which takes ownership); a conn torn down mid-flight frees the
+    /// remainder here.
+    send_inflight: bool = false,
+    send_queue: std.ArrayListUnmanaged([]u8) = .empty,
+
+    pub fn deinit(allocator: std.mem.Allocator, items: []Conn) void {
         for (items) |*item| {
+            for (item.send_queue.items) |buf| allocator.free(buf);
+            item.send_queue.deinit(allocator);
             if (item.h1) |h1c| {
                 h1c.free();
                 item.h1 = null;
@@ -4831,6 +4846,41 @@ pub fn H2(comptime opts: Options) type {
             try self.reg.set(we, &self.io.write_in, rio.WriteBuf, .{ .data = data.ptr, .len = @intCast(data.len) });
         }
 
+        /// Serialized egress for the h2 server DATA path: hand `data` to the
+        /// connection's ordered send queue (takes ownership) and submit it
+        /// only if no write is in flight for that conn — otherwise it waits
+        /// its turn, submitted by `writesAccount` when the current write
+        /// completes. This is what keeps a multi-batch large response (or
+        /// TLS record stream) in wire order; see `Conn.send_queue`. On a
+        /// submit/enqueue failure the buffer is freed (the caller has
+        /// already relinquished it).
+        fn enqueueConnSend(self: *Self, conn_ptr: *Conn, conn_entity: Entity, data: []u8) void {
+            if (conn_ptr.send_inflight) {
+                conn_ptr.send_queue.append(self.allocator, data) catch self.allocator.free(data);
+                return;
+            }
+            self.submitWrite(conn_entity, data) catch {
+                self.allocator.free(data);
+                return;
+            };
+            conn_ptr.send_inflight = true;
+        }
+
+        /// A completed write drained (`writesAccount`): clear the in-flight
+        /// flag and submit the next queued buffer, if any, preserving order.
+        /// Called only on a live conn (a failed/destroyed conn frees the
+        /// queue in `Conn.deinit`).
+        fn pumpConnSend(self: *Self, conn_ptr: *Conn, conn_entity: Entity) void {
+            conn_ptr.send_inflight = false;
+            if (conn_ptr.send_queue.items.len == 0) return;
+            const next = conn_ptr.send_queue.orderedRemove(0);
+            self.submitWrite(conn_entity, next) catch {
+                self.allocator.free(next);
+                return;
+            };
+            conn_ptr.send_inflight = true;
+        }
+
         /// True if `bytes` look like the start of an HTTP/1.x request
         /// rather than the h2 connection preface. The h2 preface is
         /// `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`, so `PRI ` at byte 0 is
@@ -5020,6 +5070,13 @@ pub fn H2(comptime opts: Options) type {
                                     }
                                 }
                             }
+                        } else if (!failed) {
+                            // h2 server DATA path: the single in-flight
+                            // serialized send drained — submit the next queued
+                            // buffer in order (`enqueueConnSend`/`Conn.send_queue`).
+                            // A failed conn is destroyed below; its queue frees
+                            // in `Conn.deinit`.
+                            self.pumpConnSend(conn_ptr, conn_ent.entity);
                         }
                     }
                 }
@@ -5071,6 +5128,12 @@ pub fn H2(comptime opts: Options) type {
                 if (c.nghttp2_session_want_write(ng_session) == 0 and
                     c.nghttp2_session_want_read(ng_session) == 0)
                 {
+                    // nghttp2 is done, but our serialized send queue may still
+                    // hold response bytes not yet on the socket — destroying
+                    // now would drop them. Wait for `writesAccount` to drain
+                    // the queue; the draining-deadline force-destroy above is
+                    // the backstop for a peer that stops reading.
+                    if (conn_ptr.send_inflight or conn_ptr.send_queue.items.len > 0) continue;
                     try self.reg.destroy(ent);
                     continue;
                 }
@@ -5103,12 +5166,9 @@ pub fn H2(comptime opts: Options) type {
                                 broke = true;
                                 break;
                             };
-                            self.submitWrite(ent, cipher) catch {
-                                self.allocator.free(cipher);
-                                try self.reg.destroy(ent);
-                                broke = true;
-                                break;
-                            };
+                            // Ordered egress: the TLS record stream MUST reach
+                            // the socket in sequence or the peer's MAC desyncs.
+                            self.enqueueConnSend(conn_ptr, ent, cipher);
                             accum_len = 0;
                         }
                         @memcpy(accum_buf[accum_len .. accum_len + flen], frame_data[0..flen]);
@@ -5120,11 +5180,7 @@ pub fn H2(comptime opts: Options) type {
                             try self.reg.destroy(ent);
                             continue;
                         };
-                        self.submitWrite(ent, cipher) catch {
-                            self.allocator.free(cipher);
-                            try self.reg.destroy(ent);
-                            continue;
-                        };
+                        self.enqueueConnSend(conn_ptr, ent, cipher);
                     }
                 } else {
                     // Accumulate ALL frames nghttp2 wants to send into a
@@ -5149,20 +5205,17 @@ pub fn H2(comptime opts: Options) type {
                         const flen: usize = @intCast(len);
                         if (accum_len + flen > accum_buf.len) {
                             // Flush what we have so far, then continue
-                            // with a fresh buffer. Big responses can still
-                            // fan out into multiple segments — that's OK,
-                            // Nagle only bites on tiny trailing fragments.
+                            // with a fresh buffer. Serialized per-conn (same
+                            // as TLS): plaintext h2 frames must also reach the
+                            // socket in order, or the peer's frame stream is
+                            // corrupted — loopback masks it (buffers rarely
+                            // fill), a real network doesn't.
                             const copy = self.allocator.dupe(u8, accum_buf[0..accum_len]) catch {
                                 try self.reg.destroy(ent);
                                 broke = true;
                                 break;
                             };
-                            self.submitWrite(ent, copy) catch {
-                                self.allocator.free(copy);
-                                try self.reg.destroy(ent);
-                                broke = true;
-                                break;
-                            };
+                            self.enqueueConnSend(conn_ptr, ent, copy);
                             accum_len = 0;
                         }
                         @memcpy(accum_buf[accum_len .. accum_len + flen], frame_data[0..flen]);
@@ -5174,11 +5227,7 @@ pub fn H2(comptime opts: Options) type {
                             try self.reg.destroy(ent);
                             continue;
                         };
-                        self.submitWrite(ent, copy) catch {
-                            self.allocator.free(copy);
-                            try self.reg.destroy(ent);
-                            continue;
-                        };
+                        self.enqueueConnSend(conn_ptr, ent, copy);
                     }
                 }
 
