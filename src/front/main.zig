@@ -420,13 +420,16 @@ fn buildFrontMetricsText(allocator: std.mem.Allocator, server: *FrontH2, proxy: 
         \\# HELP front_ambiguous_502_total non-idempotent flows 502'd at the ambiguous transport-error gate instead of replayed.
         \\# TYPE front_ambiguous_502_total counter
         \\front_ambiguous_502_total {d}
+        \\# HELP front_upstream_sheds_total requests shed 503 with every upstream leg saturated (the visible form of what used to queue invisibly).
+        \\# TYPE front_upstream_sheds_total counter
+        \\front_upstream_sheds_total {d}
         \\
     , .{
         proxy.count_reaims_421,     proxy.count_connect_timeouts,
         proxy.count_conn_failures,  proxy.count_resp_timeouts,
         proxy.count_body_stalls,    proxy.count_route_not_found,
         proxy.count_route_errors,   proxy.count_route_expired,
-        proxy.count_ambiguous_502,
+        proxy.count_ambiguous_502,  proxy.count_upstream_sheds,
     });
     // Request-duration histogram (intake → flow teardown).
     try w.print(
@@ -572,6 +575,11 @@ pub fn main() !void {
     proxy.body_stall_ns = envMs("REWIND_FRONT_BODY_STALL_TIMEOUT_MS", 60_000) * std.time.ns_per_ms;
     // Per-flow access log (plan C11): one line per completed flow.
     proxy.access_log = !std.mem.eql(u8, getEnvCfg("REWIND_FRONT_ACCESS_LOG"), "0");
+    // Upstream legs per backend node (plan A3): more legs = less
+    // head-of-line blocking and smaller blast radius per conn death;
+    // 1 restores the single-conn behavior.
+    proxy.legs_per_node = @intCast(std.math.clamp(envMs("REWIND_FRONT_UPSTREAM_CONNS", 2), 1, @as(i128, proxy_mod.MAX_LEGS)));
+    proxy.leg_stream_cap = @intCast(std.math.clamp(envMs("REWIND_FRONT_UPSTREAM_STREAM_CAP", proxy_mod.LEG_STREAM_CAP), 1, 512));
     // Teardown order matters: `server.destroy()` releases any still-live
     // body sinks, and those callbacks walk proxy-owned Flow state — so the
     // server must go down while the proxy is still alive. One defer block

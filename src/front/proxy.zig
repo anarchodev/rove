@@ -67,6 +67,11 @@ pub const FlowRef = struct {
     /// `ptr` is a *WsTunnel, not a *Flow (Extended-CONNECT WS tunnel
     /// pump/terminal entities — architecture/websockets.md).
     tunnel: bool = false,
+    /// The upstream Leg this pump entity was submitted on (plan A3) —
+    /// its in-flight count is repaid when the terminal lands. Legs
+    /// live inside process-lifetime pool entries, so a late terminal
+    /// for an abandoned attempt still points at valid memory.
+    leg: ?*anyopaque = null,
 };
 
 /// Request-body bytes kept for 421 / transport-error replay. Streamed
@@ -86,6 +91,25 @@ pub const LAT_BOUNDS_MS = [_]u64{ 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 1
 
 /// Reconnect backoff for a backend node whose connect failed.
 const CONNECT_BACKOFF_NS: i128 = 500 * std.time.ns_per_ms;
+
+/// Upstream connection pool sizing (plan A3). One pooled h2c conn per
+/// backend node meant one TCP congestion window head-of-line-blocking
+/// every tenant's traffic to that node, one conn death failing all
+/// in-flight requests at once, and past the peer's
+/// max_concurrent_streams nghttp2 queued submissions invisibly with no
+/// depth bound. Now each node gets up to `REWIND_FRONT_UPSTREAM_CONNS`
+/// legs (default 2, max 4): submits pick the least-loaded live leg, a
+/// spare leg is dialed in the background once the chosen leg is busy,
+/// and when every leg is saturated the request is SHED with a
+/// retryable 503 (nothing was submitted) instead of queueing
+/// invisibly.
+pub const MAX_LEGS: usize = 4;
+/// Per-leg in-flight stream cap — below the worker's
+/// max_concurrent_streams (512) so nghttp2 never locally queues.
+pub const LEG_STREAM_CAP: u32 = 480;
+/// Chosen-leg in-flight count at which a spare down leg is dialed in
+/// the background (gradual scale-out under load).
+pub const LEG_GROW_THRESHOLD: u32 = 64;
 
 /// Default between-bytes progress budget for an INBOUND request body
 /// (`REWIND_FRONT_BODY_STALL_TIMEOUT_MS`) — nginx's
@@ -552,6 +576,12 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// Inbound request-body between-bytes budget
         /// (`REWIND_FRONT_BODY_STALL_TIMEOUT_MS`; 0 disables).
         body_stall_ns: i128 = BODY_STALL_NS_DEFAULT,
+        /// Upstream legs per backend node (`REWIND_FRONT_UPSTREAM_CONNS`,
+        /// clamped 1..MAX_LEGS). Applied at pool-entry creation.
+        legs_per_node: u8 = 2,
+        /// Per-leg in-flight stream cap
+        /// (`REWIND_FRONT_UPSTREAM_STREAM_CAP`; see LEG_STREAM_CAP).
+        leg_stream_cap: u32 = LEG_STREAM_CAP,
 
         // ── Observability (plan C11) ──────────────────────────────────
         /// One `front-access:` log line per completed flow
@@ -575,6 +605,9 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// Non-idempotent flows 502'd at the ambiguous-transport-error
         /// gate instead of replayed (plan A2).
         count_ambiguous_502: u64 = 0,
+        /// Requests shed 503 because every upstream leg was saturated
+        /// (plan A3) — the visible form of what used to queue invisibly.
+        count_upstream_sheds: u64 = 0,
         /// Request-duration histogram (intake → flow teardown).
         lat_counts: [LAT_BOUNDS_MS.len + 1]u64 = @splat(0),
         lat_sum_ms: u64 = 0,
@@ -597,13 +630,32 @@ pub fn Proxy(comptime FrontH2: type) type {
             tunnel: *WsTunnel,
         };
 
-        const Upstream = struct {
-            origin: []u8, // owned, also the pool key
+        /// One pooled h2c connection to a backend node (plan A3). Legs
+        /// live inline in their heap-allocated `Upstream`, so `*Leg`
+        /// is stable for the process lifetime — FlowRef.leg and connect
+        /// entities point at them across polls.
+        const Leg = struct {
+            up: *Upstream,
             state: enum { down, connecting, up } = .down,
             sess: Entity = Entity.nil,
-            addr: ?std.net.Address = null,
             last_fail_ns: i128 = 0,
-            /// Flows/tunnels waiting on the in-flight connect — AND tunnels
+            /// Deadline for an in-flight connect to complete. Stamped at
+            /// dial time; swept by `expireStalledConnects` (a SYN-
+            /// blackholed backend otherwise pins its waiters for the
+            /// kernel connect budget). 0 = no connect in flight.
+            connect_deadline_ns: i128 = 0,
+            /// Streams submitted on this leg whose terminals haven't
+            /// landed — the least-loaded pick key and the shed gate.
+            inflight: u32 = 0,
+        };
+
+        const Upstream = struct {
+            origin: []u8, // owned, also the pool key
+            addr: ?std.net.Address = null,
+            legs: [MAX_LEGS]Leg,
+            /// Configured leg count for this node (1..MAX_LEGS).
+            n_legs: u8,
+            /// Flows/tunnels waiting on an in-flight connect — AND tunnels
             /// re-parked here on a live conn whose peer hasn't yet advertised
             /// ENABLE_CONNECT_PROTOCOL (its SETTINGS trails connect-complete).
             /// `drainSettledTunnels` resumes those once the bit lands.
@@ -612,11 +664,13 @@ pub fn Proxy(comptime FrontH2: type) type {
             /// tunnels wait in `waiters`. 0 = unset (no tunnel awaiting
             /// SETTINGS). Stamped/cleared by `drainSettledTunnels`.
             settle_deadline_ns: i128 = 0,
-            /// Deadline for an in-flight connect to complete. Stamped at
-            /// dial time; swept by `expireStalledConnects` (a SYN-
-            /// blackholed backend otherwise pins its waiters for the
-            /// kernel connect budget). 0 = no connect in flight.
-            connect_deadline_ns: i128 = 0,
+
+            fn anyConnecting(up: *const Upstream) bool {
+                for (up.legs[0..up.n_legs]) |*leg| {
+                    if (leg.state == .connecting) return true;
+                }
+                return false;
+            }
         };
 
         /// One WS tunnel: a downstream h1 Upgrade paired with an upstream
@@ -1073,31 +1127,36 @@ pub fn Proxy(comptime FrontH2: type) type {
                 self.tunnelAttemptFailed(t);
                 return;
             };
-            switch (up.state) {
-                .up => {
-                    if (self.reg.isStale(up.sess)) {
-                        up.state = .down;
-                        up.sess = Entity.nil;
-                        self.connectUpstream(up, .{ .tunnel = t });
-                    } else {
-                        self.submitTunnel(t, up.sess);
-                    }
-                },
-                .connecting => {
-                    up.waiters.append(self.allocator, .{ .tunnel = t }) catch {
-                        self.tunnelAttemptFailed(t);
-                        return;
-                    };
-                    t.waiting_conn = true;
-                },
-                .down => self.connectUpstream(up, .{ .tunnel = t }),
+            const now = std.time.nanoTimestamp();
+            if (self.pickLeg(up)) |leg| {
+                self.submitTunnel(t, leg);
+                return;
             }
+            if (up.anyConnecting()) {
+                up.waiters.append(self.allocator, .{ .tunnel = t }) catch {
+                    self.tunnelAttemptFailed(t);
+                    return;
+                };
+                t.waiting_conn = true;
+                return;
+            }
+            if (dialableLeg(up, now)) |leg| {
+                self.dialLeg(leg, .{ .tunnel = t });
+                return;
+            }
+            if (self.anyLegUp(up)) {
+                // Saturated: refuse the Upgrade retryably (plan A3).
+                self.count_upstream_sheds += 1;
+                self.tunnelAttemptFailed(t);
+                return;
+            }
+            self.tunnelAttemptFailed(t);
         }
 
-        /// Open the Extended-CONNECT stream on a live pool conn. RFC 8441
+        /// Open the Extended-CONNECT stream on a live pool leg. RFC 8441
         /// requires the peer's ENABLE_CONNECT_PROTOCOL before submitting.
-        fn submitTunnel(self: *Self, t: *WsTunnel, sess: Entity) void {
-            if (!self.server.connExtendedConnect(sess)) {
+        fn submitTunnel(self: *Self, t: *WsTunnel, leg: *Leg) void {
+            if (!self.server.connExtendedConnect(leg.sess)) {
                 // Live conn, but the peer's ENABLE_CONNECT_PROTOCOL SETTINGS
                 // hasn't arrived yet — common on a freshly-`.up` leg (its
                 // SETTINGS trails connect-complete). Re-park on the pool
@@ -1105,11 +1164,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 // awaiting connect) rather than failing; drainSettledTunnels
                 // resumes it once the bit lands. The old immediate give-up
                 // surfaced a transient 502 on cold upstream connections.
-                const up = self.poolEntry(t.nodes[t.node_idx]) catch {
-                    self.tunnelAttemptFailed(t);
-                    return;
-                };
-                up.waiters.append(self.allocator, .{ .tunnel = t }) catch {
+                leg.up.waiters.append(self.allocator, .{ .tunnel = t }) catch {
                     self.tunnelAttemptFailed(t);
                     return;
                 };
@@ -1127,13 +1182,14 @@ pub fn Proxy(comptime FrontH2: type) type {
             };
             const coll = &self.server.client_stream_request_in;
             t.attempt += 1;
-            self.reg.set(pump, coll, h2.Session, .{ .entity = sess }) catch {};
+            self.reg.set(pump, coll, h2.Session, .{ .entity = leg.sess }) catch {};
             self.reg.set(pump, coll, h2.ReqHeaders, packed_hdrs) catch {};
             self.reg.set(pump, coll, h2.ReqBody, .{}) catch {};
             self.reg.set(pump, coll, h2.H2IoResult, .{ .err = 0 }) catch {};
             self.reg.set(pump, coll, h2.StreamId, .{ .id = 0 }) catch {};
-            self.reg.set(pump, coll, FlowRef, .{ .ptr = @ptrCast(t), .attempt = t.attempt, .tunnel = true }) catch {};
-            t.up_sess = sess;
+            self.reg.set(pump, coll, FlowRef, .{ .ptr = @ptrCast(t), .attempt = t.attempt, .tunnel = true, .leg = @ptrCast(leg) }) catch {};
+            leg.inflight += 1;
+            t.up_sess = leg.sess;
             t.attempt_live = true;
             t.pending_terminals += 1;
         }
@@ -1418,50 +1474,116 @@ pub fn Proxy(comptime FrontH2: type) type {
                 self.attemptFailed(flow, false, false);
                 return;
             };
-            switch (up.state) {
-                .up => {
-                    if (self.reg.isStale(up.sess)) {
-                        // Idle-reaped (or died quietly). Reconnect.
-                        up.state = .down;
-                        up.sess = Entity.nil;
-                        self.connectUpstream(up, .{ .flow = flow });
-                    } else {
-                        self.submitAttempt(flow, up.sess);
-                    }
-                },
-                .connecting => {
-                    up.waiters.append(self.allocator, .{ .flow = flow }) catch {
-                        self.attemptFailed(flow, false, false);
-                        return;
-                    };
-                    flow.waiting_conn = true;
-                },
-                .down => self.connectUpstream(up, .{ .flow = flow }),
+            const now = std.time.nanoTimestamp();
+            if (self.pickLeg(up)) |leg| {
+                // Background scale-out: the chosen leg is getting busy
+                // and a spare leg exists — dial it for FUTURE submits;
+                // this flow rides the live leg now.
+                if (leg.inflight >= LEG_GROW_THRESHOLD and !up.anyConnecting()) {
+                    if (dialableLeg(up, now)) |spare| self.dialLeg(spare, null);
+                }
+                self.submitAttempt(flow, leg);
+                return;
             }
+            if (up.anyConnecting()) {
+                up.waiters.append(self.allocator, .{ .flow = flow }) catch {
+                    self.attemptFailed(flow, false, false);
+                    return;
+                };
+                flow.waiting_conn = true;
+                return;
+            }
+            if (dialableLeg(up, now)) |leg| {
+                self.dialLeg(leg, .{ .flow = flow });
+                return;
+            }
+            if (self.anyLegUp(up)) {
+                // Every leg live but saturated: SHED with a retryable
+                // 503 (nothing submitted) — the bounded, visible form
+                // of what used to queue invisibly in nghttp2 (plan A3).
+                self.count_upstream_sheds += 1;
+                std.log.warn("front: all {d} leg(s) to {s} saturated — shedding", .{ up.n_legs, up.origin });
+                self.finishWithStatus(flow, 503);
+                return;
+            }
+            // All legs down inside backoff — fail over to the next node.
+            self.attemptFailed(flow, false, false);
         }
 
         fn poolEntry(self: *Self, origin: []const u8) !*Upstream {
             if (self.pool.get(origin)) |up| return up;
             const up = try self.allocator.create(Upstream);
             errdefer self.allocator.destroy(up);
-            up.* = .{ .origin = try self.allocator.dupe(u8, origin) };
+            up.* = .{
+                .origin = try self.allocator.dupe(u8, origin),
+                .legs = undefined,
+                .n_legs = @max(1, @min(self.legs_per_node, MAX_LEGS)),
+            };
+            for (&up.legs) |*leg| leg.* = .{ .up = up };
             try self.pool.put(self.allocator, up.origin, up);
             return up;
         }
 
-        /// Kick off (or join) a connect to a down upstream. Inside the
-        /// backoff window the attempt fails over immediately instead
-        /// of hammering a dead node.
-        fn connectUpstream(self: *Self, up: *Upstream, waiter: Waiter) void {
-            const now = std.time.nanoTimestamp();
-            if (up.state == .down and now - up.last_fail_ns < CONNECT_BACKOFF_NS) {
-                self.waiterFailed(waiter);
-                return;
+        /// Least-loaded live leg below the stream cap; stale legs are
+        /// marked down in passing (an idle reap is not a failure — no
+        /// backoff). Null = nothing submittable right now.
+        fn pickLeg(self: *Self, up: *Upstream) ?*Leg {
+            var best: ?*Leg = null;
+            for (up.legs[0..up.n_legs]) |*leg| {
+                if (leg.state != .up) continue;
+                if (self.reg.isStale(leg.sess)) {
+                    leg.state = .down;
+                    leg.sess = Entity.nil;
+                    leg.last_fail_ns = 0;
+                    continue;
+                }
+                if (leg.inflight >= self.leg_stream_cap) continue;
+                if (best == null or leg.inflight < best.?.inflight) best = leg;
             }
+            return best;
+        }
+
+        /// First down leg outside its reconnect backoff, or null.
+        fn dialableLeg(up: *Upstream, now_ns: i128) ?*Leg {
+            for (up.legs[0..up.n_legs]) |*leg| {
+                if (leg.state != .down) continue;
+                if (now_ns - leg.last_fail_ns < CONNECT_BACKOFF_NS) continue;
+                return leg;
+            }
+            return null;
+        }
+
+        /// True if any leg is live (even saturated) — distinguishes
+        /// "shed" from "node down" when nothing is submittable.
+        fn anyLegUp(self: *Self, up: *Upstream) bool {
+            for (up.legs[0..up.n_legs]) |*leg| {
+                if (leg.state == .up and !self.reg.isStale(leg.sess)) return true;
+            }
+            return false;
+        }
+
+        /// Mark any live leg whose session died (idle-reaped / conn
+        /// error) as down, without backoff.
+        fn markStaleLegsDown(self: *Self, up: *Upstream) void {
+            for (up.legs[0..up.n_legs]) |*leg| {
+                if (leg.state == .up and self.reg.isStale(leg.sess)) {
+                    leg.state = .down;
+                    leg.sess = Entity.nil;
+                    leg.last_fail_ns = 0;
+                }
+            }
+        }
+
+        /// Dial one down leg (caller checked backoff via `dialableLeg`).
+        /// `waiter` (if any) parks on the NODE's waiter list until any
+        /// leg comes up. A null waiter is the background scale-out dial.
+        fn dialLeg(self: *Self, leg: *Leg, waiter: ?Waiter) void {
+            const up = leg.up;
+            const now = std.time.nanoTimestamp();
             const addr = up.addr orelse blk: {
                 const a = resolveOrigin(up.origin) catch {
-                    up.last_fail_ns = now;
-                    self.waiterFailed(waiter);
+                    leg.last_fail_ns = now;
+                    if (waiter) |w| self.waiterFailed(w);
                     return;
                 };
                 up.addr = a;
@@ -1469,25 +1591,27 @@ pub fn Proxy(comptime FrontH2: type) type {
             };
 
             const ce = self.reg.create(&self.server.client_connect_in) catch {
-                self.waiterFailed(waiter);
+                if (waiter) |w| self.waiterFailed(w);
                 return;
             };
             self.reg.set(ce, &self.server.client_connect_in, h2.ConnectTarget, .{ .addr = addr }) catch {};
             self.reg.set(ce, &self.server.client_connect_in, h2.Session, .{}) catch {};
             self.reg.set(ce, &self.server.client_connect_in, h2.H2IoResult, .{ .err = 0 }) catch {};
-            self.reg.set(ce, &self.server.client_connect_in, FlowRef, .{ .ptr = @ptrCast(up) }) catch {};
+            self.reg.set(ce, &self.server.client_connect_in, FlowRef, .{ .ptr = @ptrCast(leg) }) catch {};
 
-            up.state = .connecting;
-            up.connect_deadline_ns = now + self.connect_timeout_ns;
-            up.waiters.append(self.allocator, waiter) catch {
-                // The connect proceeds (other waiters may join); this
-                // one fails over.
-                self.waiterFailed(waiter);
-                return;
-            };
-            switch (waiter) {
-                .flow => |f| f.waiting_conn = true,
-                .tunnel => |t| t.waiting_conn = true,
+            leg.state = .connecting;
+            leg.connect_deadline_ns = now + self.connect_timeout_ns;
+            if (waiter) |w| {
+                up.waiters.append(self.allocator, w) catch {
+                    // The connect proceeds (other waiters may join); this
+                    // one fails over.
+                    self.waiterFailed(w);
+                    return;
+                };
+                switch (w) {
+                    .flow => |f| f.waiting_conn = true,
+                    .tunnel => |t| t.waiting_conn = true,
+                }
             }
         }
 
@@ -1498,10 +1622,10 @@ pub fn Proxy(comptime FrontH2: type) type {
             }
         }
 
-        /// Submit the current attempt's request head on `sess` via the
+        /// Submit the current attempt's request head on `leg` via the
         /// streaming client leg. The body (whatever its state) follows
         /// through `pumpUpstream`.
-        fn submitAttempt(self: *Self, flow: *Flow, sess: Entity) void {
+        fn submitAttempt(self: *Self, flow: *Flow, leg: *Leg) void {
             const rh = self.reg.get(flow.down_ent, self.downColl(flow), h2.ReqHeaders) catch {
                 self.teardownFlow(flow);
                 return;
@@ -1518,7 +1642,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             };
             const coll = &self.server.client_stream_request_in;
             flow.attempt += 1;
-            self.reg.set(pump, coll, h2.Session, .{ .entity = sess }) catch {};
+            self.reg.set(pump, coll, h2.Session, .{ .entity = leg.sess }) catch {};
             self.reg.set(pump, coll, h2.ReqHeaders, packed_hdrs) catch {};
             // A bodyless request (GET/HEAD/DELETE — body complete with zero
             // bytes) must carry END_STREAM on its upstream HEADERS: a proxy
@@ -1531,10 +1655,11 @@ pub fn Proxy(comptime FrontH2: type) type {
             self.reg.set(pump, coll, h2.ReqBody, .{ .complete = bodyless }) catch {};
             self.reg.set(pump, coll, h2.H2IoResult, .{ .err = 0 }) catch {};
             self.reg.set(pump, coll, h2.StreamId, .{ .id = 0 }) catch {};
-            self.reg.set(pump, coll, FlowRef, .{ .ptr = @ptrCast(flow), .attempt = flow.attempt }) catch {};
+            self.reg.set(pump, coll, FlowRef, .{ .ptr = @ptrCast(flow), .attempt = flow.attempt, .leg = @ptrCast(leg) }) catch {};
             if (bodyless) flow.up_closed = true;
 
-            flow.up_sess = sess;
+            leg.inflight += 1;
+            flow.up_sess = leg.sess;
             flow.attempt_live = true;
             flow.pending_terminals += 1;
         }
@@ -1658,11 +1783,14 @@ pub fn Proxy(comptime FrontH2: type) type {
                 const flow_refs = coll.column(FlowRef);
                 for (entities, sessions, flow_refs) |ent, sess, fr| {
                     if (fr.ptr) |p| {
-                        const up: *Upstream = @ptrCast(@alignCast(p));
-                        up.state = .up;
-                        up.sess = sess.entity;
-                        up.connect_deadline_ns = 0;
-                        self.drainWaiters(up, true);
+                        const leg: *Leg = @ptrCast(@alignCast(p));
+                        leg.state = .up;
+                        leg.sess = sess.entity;
+                        // inflight is NOT reset: submits on the dead
+                        // predecessor conn still owe their (error)
+                        // terminals, each repaying exactly once.
+                        leg.connect_deadline_ns = 0;
+                        self.drainWaiters(leg.up, true);
                     }
                     try self.reg.destroy(ent);
                 }
@@ -1673,14 +1801,17 @@ pub fn Proxy(comptime FrontH2: type) type {
                 const flow_refs = coll.column(FlowRef);
                 for (entities, flow_refs) |ent, fr| {
                     if (fr.ptr) |p| {
-                        const up: *Upstream = @ptrCast(@alignCast(p));
-                        up.state = .down;
-                        up.sess = Entity.nil;
-                        up.last_fail_ns = now_ns;
-                        up.connect_deadline_ns = 0;
+                        const leg: *Leg = @ptrCast(@alignCast(p));
+                        leg.state = .down;
+                        leg.sess = Entity.nil;
+                        leg.last_fail_ns = now_ns;
+                        leg.connect_deadline_ns = 0;
                         self.count_conn_failures += 1;
-                        std.log.warn("front: connect to {s} failed", .{up.origin});
-                        self.drainWaiters(up, false);
+                        std.log.warn("front: connect to {s} failed", .{leg.up.origin});
+                        // Waiters stay parked while a sibling leg is
+                        // still dialing; they fail over only when the
+                        // whole node's dials are exhausted.
+                        if (!leg.up.anyConnecting()) self.drainWaiters(leg.up, false);
                     }
                     try self.reg.destroy(ent);
                 }
@@ -1698,7 +1829,9 @@ pub fn Proxy(comptime FrontH2: type) type {
                     if (flow.down_gone or !flow.down_alive) {
                         self.teardownFlow(flow);
                     } else if (ok) {
-                        self.submitAttempt(flow, up.sess);
+                        // Re-enter the pick (least-loaded leg / shed),
+                        // not a direct submit on any one session.
+                        self.startAttempt(flow);
                     } else {
                         self.attemptFailed(flow, false, false);
                     }
@@ -1708,7 +1841,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     if (t.down_gone or self.reg.isStale(t.down_conn)) {
                         self.finishTunnel(t);
                     } else if (ok) {
-                        self.submitTunnel(t, up.sess);
+                        self.startTunnelAttempt(t);
                     } else {
                         self.tunnelAttemptFailed(t);
                     }
@@ -1738,23 +1871,36 @@ pub fn Proxy(comptime FrontH2: type) type {
                 n += 1;
             }
             for (ups[0..n]) |up| {
-                if (up.state != .up or up.waiters.items.len == 0) {
+                if (up.waiters.items.len == 0) {
                     up.settle_deadline_ns = 0;
                     continue;
                 }
-                if (self.reg.isStale(up.sess)) {
-                    // Conn died under the waiters — fail them (they re-aim).
-                    up.state = .down;
-                    up.sess = Entity.nil;
-                    up.settle_deadline_ns = 0;
-                    self.drainWaiters(up, false);
-                } else if (self.server.connExtendedConnect(up.sess)) {
+                self.markStaleLegsDown(up);
+                var any_up = false;
+                var any_settled = false;
+                for (up.legs[0..up.n_legs]) |*leg| {
+                    if (leg.state != .up) continue;
+                    any_up = true;
+                    if (self.server.connExtendedConnect(leg.sess)) any_settled = true;
+                }
+                if (any_settled) {
                     up.settle_deadline_ns = 0;
                     self.drainWaiters(up, true);
-                } else if (up.settle_deadline_ns == 0) {
-                    up.settle_deadline_ns = now_ns + SETTLE_WAIT_NS;
-                } else if (now_ns >= up.settle_deadline_ns) {
-                    std.log.warn("front: {s} never advertised extended-connect within {d}ms — failing {d} waiting WS tunnel(s)", .{ up.origin, @divTrunc(SETTLE_WAIT_NS, std.time.ns_per_ms), up.waiters.items.len });
+                } else if (any_up) {
+                    if (up.settle_deadline_ns == 0) {
+                        up.settle_deadline_ns = now_ns + SETTLE_WAIT_NS;
+                    } else if (now_ns >= up.settle_deadline_ns) {
+                        std.log.warn("front: {s} never advertised extended-connect within {d}ms — failing {d} waiting WS tunnel(s)", .{ up.origin, @divTrunc(SETTLE_WAIT_NS, std.time.ns_per_ms), up.waiters.items.len });
+                        up.settle_deadline_ns = 0;
+                        self.drainWaiters(up, false);
+                    }
+                } else if (up.anyConnecting()) {
+                    // A dial is in flight; its completion drains the
+                    // waiters (either way).
+                    up.settle_deadline_ns = 0;
+                } else {
+                    // Every leg died under the waiters — fail them
+                    // (they re-aim).
                     up.settle_deadline_ns = 0;
                     self.drainWaiters(up, false);
                 }
@@ -2006,6 +2152,14 @@ pub fn Proxy(comptime FrontH2: type) type {
             for (entities, sids, statuses, resp_hdrs, resp_bodies, io_results, flow_refs) |ent, sid, status, rh, *rb, io_res, fr| {
                 defer self.reg.destroy(ent) catch {};
                 _ = sid;
+                // Repay the submitting leg's in-flight slot (plan A3) —
+                // exactly one terminal per submit, current attempt or
+                // abandoned. Legs live in process-lifetime pool entries,
+                // so a late terminal's pointer is always valid.
+                if (fr.leg) |lp| {
+                    const leg: *Leg = @ptrCast(@alignCast(lp));
+                    leg.inflight -|= 1;
+                }
                 const p = fr.ptr orelse continue;
                 // WS tunnel terminal: the CONNECT stream ended.
                 if (fr.tunnel) {
@@ -2033,11 +2187,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     if (status.code == 421 or io_res.err != 0) {
                         if (conn_died) {
                             if (self.pool.get(t.nodes[t.node_idx])) |up| {
-                                if (up.state == .up and self.reg.isStale(up.sess)) {
-                                    up.state = .down;
-                                    up.sess = Entity.nil;
-                                    up.last_fail_ns = 0;
-                                }
+                                self.markStaleLegsDown(up);
                             }
                         }
                         self.tunnelAttemptFailed(t);
@@ -2121,11 +2271,7 @@ pub fn Proxy(comptime FrontH2: type) type {
 
         fn markDown(self: *Self, flow: *Flow) void {
             if (self.pool.get(flow.nodes[flow.node_idx])) |up| {
-                if (up.state == .up and self.reg.isStale(up.sess)) {
-                    up.state = .down;
-                    up.sess = Entity.nil;
-                    up.last_fail_ns = 0; // a reap is not a failure — no backoff
-                }
+                self.markStaleLegsDown(up);
             }
         }
 
@@ -2715,19 +2861,29 @@ pub fn Proxy(comptime FrontH2: type) type {
                 n += 1;
             }
             for (ups[0..n]) |up| {
-                if (up.state != .connecting or up.connect_deadline_ns == 0) continue;
-                if (now_ns < up.connect_deadline_ns) continue;
-                std.log.warn("front: connect to {s} timed out after {d}ms — failing {d} waiter(s) over", .{
-                    up.origin,
-                    @divTrunc(self.connect_timeout_ns, std.time.ns_per_ms),
-                    up.waiters.items.len,
-                });
-                up.state = .down;
-                up.sess = Entity.nil;
-                up.last_fail_ns = now_ns;
-                up.connect_deadline_ns = 0;
-                self.count_connect_timeouts += 1;
-                self.drainWaiters(up, false);
+                var timed_out = false;
+                for (up.legs[0..up.n_legs]) |*leg| {
+                    if (leg.state != .connecting or leg.connect_deadline_ns == 0) continue;
+                    if (now_ns < leg.connect_deadline_ns) continue;
+                    std.log.warn("front: connect to {s} timed out after {d}ms", .{
+                        up.origin,
+                        @divTrunc(self.connect_timeout_ns, std.time.ns_per_ms),
+                    });
+                    leg.state = .down;
+                    leg.sess = Entity.nil;
+                    leg.last_fail_ns = now_ns;
+                    leg.connect_deadline_ns = 0;
+                    self.count_connect_timeouts += 1;
+                    timed_out = true;
+                }
+                if (!timed_out) continue;
+                // A dial just died. Waiters fail over only when no dial
+                // remains in flight; a live sibling leg (if any) serves
+                // them instead. (Waiters parked for extended-connect
+                // SETTLE stay owned by drainSettledTunnels.)
+                if (up.waiters.items.len > 0 and !up.anyConnecting()) {
+                    self.drainWaiters(up, self.anyLegUp(up));
+                }
             }
         }
 
