@@ -1153,6 +1153,19 @@ const StreamResumeCtx = struct {
     /// P5(a): the resume hop's `http.fetch` accumulator (see
     /// `proposeAndParkContResume.fetches_opt`).
     pending_fetches: ?*std.ArrayListUnmanaged(globals.PendingFetch) = null,
+    /// Pre-built tape payloads for this transition hop's log record, or
+    /// null for kinds whose Msg needs no dedicated capture (wakes /
+    /// send_callback — L3-exempt). `resumeIntoStream` CONSUMES it: the
+    /// `.ok` capture hands it to captureLogWithId; every other exit
+    /// deinits it. Callers with a taped Msg (`.fetch_chunk` — the
+    /// bound-fetch cont→stream transition — and `.inbound_chunk`) MUST
+    /// pass this, or the record ships empty tapes and the fetch_chunk
+    /// case aborts at `l3AssertMsgRecorded` (the boundproxy 502 +
+    /// rc=-6: dispatchSpoolHead → resumeBoundFetchChain `.stream` arm
+    /// never wired its captureFetchChunkTapes). Built by the CALLER so
+    /// the Msg lands on the readset BEFORE the write path's
+    /// `proposeAndParkContResume` serializes it into the propose.
+    tapes: ?log_mod.TapePayloads = null,
 };
 
 /// `docs/streaming-model.md` §7 item 1 (Phase 2b lift): the cont→stream
@@ -1173,6 +1186,12 @@ const StreamResumeCtx = struct {
 fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     const allocator = worker.allocator;
     const server = worker.h2;
+
+    // The hop's tape payloads (see StreamResumeCtx.tapes): consumed by
+    // whichever `.ok` capture runs; freed on every other exit.
+    var hop_tapes: log_mod.TapePayloads = ctx.tapes orelse .{};
+    var hop_tapes_consumed = false;
+    defer if (!hop_tapes_consumed) hop_tapes.deinit(allocator);
 
     // Parse the stream({headers}) wire-format buffer (`Key: Val\r\n…`)
     // into the typed list shape proposeAndParkContResume expects; the
@@ -1258,7 +1277,8 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
         };
         ctx.txn_owned.* = false;
         ctx.txn_done.* = true;
-        captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 0, .ok, &.{}, &.{}, .{}, ctx.correlation_id, &.{}, ctx.activation, stream_seq);
+        hop_tapes_consumed = true;
+        captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path, "", ctx.deployment_id, ctx.now_ns, 0, .ok, &.{}, &.{}, hop_tapes, ctx.correlation_id, &.{}, ctx.activation, stream_seq);
         return;
     }
 
@@ -1329,7 +1349,8 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     // collections; flushResumeFetches' parked_continuations count bump
     // soft-fails there) — they drop with a register failure.
     if (ctx.pending_fetches) |pf| flushResumeFetches(worker, ctx.ent, pf, false);
-    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", cont_path_for_log, "", ctx.deployment_id, ctx.now_ns, 0, .ok, &.{}, &.{}, .{}, ctx.correlation_id, &.{}, ctx.activation, 0);
+    hop_tapes_consumed = true;
+    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", cont_path_for_log, "", ctx.deployment_id, ctx.now_ns, 0, .ok, &.{}, &.{}, hop_tapes, ctx.correlation_id, &.{}, ctx.activation, 0);
 }
 
 /// 503 (retriable) when this activation's failure was an invalidated txn
@@ -2198,6 +2219,10 @@ pub fn resumeBoundFetchChain(
                 .txn_done = &txn_done,
                 .pending_fetches = &pending_fetches,
                 .activation = .fetch_chunk,
+                // The fetch result is this activation's Msg (L3) — tape
+                // it like every other resumeBoundFetchChain arm, and do
+                // so BEFORE the write path serializes the readset.
+                .tapes = worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev),
             });
         },
         // Only `.inbound_headers` / `.inbound_chunk` activations
@@ -3342,6 +3367,11 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
                 .txn_done = &txn_done,
                 .pending_fetches = &pending_fetches,
                 .activation = .inbound_chunk,
+                // The chunk is this activation's Msg — tape it like the
+                // repark arm above (L3-exempt today, but a cont→stream
+                // chunk record without its tapes is the same
+                // unreplayable-hop class).
+                .tapes = worker_mod.captureTapes(worker, &readset, chunk_bytes),
             });
         },
         // The probe ran on the FIRST fire (dispatchOnce); a parked
