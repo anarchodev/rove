@@ -163,16 +163,29 @@ is zero. Depends on B7 for identity when behind another hop.
 
 ## Phasing
 
-Phase 1 (this branch — the ⭐ items plus the small correctness fixes):
+Phase 1 (this branch) — **all shipped 2026-07-04**, each with a
+dedicated teeth smoke:
 
-1. C11 access log + metrics (turns complaints into data; cheapest).
-2. A1 connect timeout, A4 handshake reap, A5 mid-stream timeouts —
-   the timeout matrix.
-3. A2 idempotency-gated retry (correctness bug by our own standard).
-4. A6 negative cache + FIFO resolver.
-5. C10 graceful drain.
-6. B7 + B8 forwarding-header hygiene (B7 is also the prerequisite for
-   C13).
+1. ✅ C11 access log + metrics (`front-access:` lines; `front_*`
+   counters + duration histogram on :9112/metrics).
+2. ✅ A1 connect timeout (`front_connect_timeout_smoke.py`),
+   ✅ A4 handshake/silent-conn reap (`front_handshake_reap_smoke.py`
+   — turned out to be TWO unswept stages: silent pre-first-byte conns
+   in `io.connections` never reach `_read_init` either),
+   ✅ A5 request-body stall budget (`front_body_stall_smoke.py`;
+   response-side deliberately not policed — see A5).
+3. ✅ A2 idempotency-gated retry (unit tests; `front_ambiguous_502_total`).
+4. ✅ A6 negative cache + FIFO resolver (unit tests + timeout smoke leg C).
+5. ✅ C10 graceful drain (`front_drain_smoke.py`; h1 close-pending
+   conns get a 500 ms-quiet destroy — their Connection:-close path
+   otherwise waits on the 30 s idle GC).
+6. ✅ B7 + B8 forwarding-header hygiene (`front_headers_smoke.py`).
+   Peer capture required new io machinery: connections are io_uring
+   DIRECT descriptors and multishot accept can't carry an addr buffer
+   race-free, so accept now submits IORING_OP_FIXED_FD_INSTALL
+   (kernel 6.8+) and the CQE getpeername()s into a `PeerAddr` conn
+   component. B8 landed at h1→h2 synthesis (`http1BuildReqHeaders`),
+   the only layer that still sees the `Connection` value.
 
 Phase 2 (follow-ups, separate branches):
 
