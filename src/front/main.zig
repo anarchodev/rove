@@ -374,7 +374,7 @@ fn freeUrlList(a: std.mem.Allocator, urls: []const []const u8) void {
 /// on) are now scrapable instead of grep-only — plus the proxy's live-flow /
 /// tunnel leak canaries. Rendered + published on the :443 poll loop (the only
 /// thread that touches `server`/`proxy`); the MetricsServer thread serves bytes.
-fn buildFrontMetricsText(allocator: std.mem.Allocator, server: *FrontH2, flows: usize, tunnels: usize) ![]u8 {
+fn buildFrontMetricsText(allocator: std.mem.Allocator, server: *FrontH2, proxy: *const Proxy) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
@@ -388,7 +388,60 @@ fn buildFrontMetricsText(allocator: std.mem.Allocator, server: *FrontH2, flows: 
         \\# TYPE front_proxy_tunnels_active gauge
         \\front_proxy_tunnels_active {d}
         \\
-    , .{ flows, tunnels });
+    , .{ proxy.live_flows, proxy.live_tunnels });
+    // Per-request proxy events (plan C11): the counters that decompose
+    // "the front is unreliable" into leadership churn vs dead nodes vs
+    // stalls vs resolver trouble vs the ambiguous-retry gate.
+    try w.print(
+        \\# HELP front_reaims_421_total not-leader re-aims (leadership churn / cold leader cache).
+        \\# TYPE front_reaims_421_total counter
+        \\front_reaims_421_total {d}
+        \\# HELP front_connect_timeouts_total upstream connects that blew REWIND_FRONT_CONNECT_TIMEOUT_MS.
+        \\# TYPE front_connect_timeouts_total counter
+        \\front_connect_timeouts_total {d}
+        \\# HELP front_connect_failures_total upstream connect failures (refused/unreachable).
+        \\# TYPE front_connect_failures_total counter
+        \\front_connect_failures_total {d}
+        \\# HELP front_response_timeouts_total 504s from the response-headers deadline.
+        \\# TYPE front_response_timeouts_total counter
+        \\front_response_timeouts_total {d}
+        \\# HELP front_body_stalls_total inbound bodies aborted by the between-bytes budget.
+        \\# TYPE front_body_stalls_total counter
+        \\front_body_stalls_total {d}
+        \\# HELP front_route_not_found_total CP route lookups answered 404 (negative-cached).
+        \\# TYPE front_route_not_found_total counter
+        \\front_route_not_found_total {d}
+        \\# HELP front_route_errors_total CP route lookups that failed (all CP nodes unreachable/bad).
+        \\# TYPE front_route_errors_total counter
+        \\front_route_errors_total {d}
+        \\# HELP front_route_park_expired_total flows 503'd waiting on a cold route resolve.
+        \\# TYPE front_route_park_expired_total counter
+        \\front_route_park_expired_total {d}
+        \\# HELP front_ambiguous_502_total non-idempotent flows 502'd at the ambiguous transport-error gate instead of replayed.
+        \\# TYPE front_ambiguous_502_total counter
+        \\front_ambiguous_502_total {d}
+        \\
+    , .{
+        proxy.count_reaims_421,     proxy.count_connect_timeouts,
+        proxy.count_conn_failures,  proxy.count_resp_timeouts,
+        proxy.count_body_stalls,    proxy.count_route_not_found,
+        proxy.count_route_errors,   proxy.count_route_expired,
+        proxy.count_ambiguous_502,
+    });
+    // Request-duration histogram (intake → flow teardown).
+    try w.print(
+        \\# HELP front_request_duration_ms proxied request duration, intake to flow teardown.
+        \\# TYPE front_request_duration_ms histogram
+        \\
+    , .{});
+    var cumulative: u64 = 0;
+    inline for (proxy_mod.LAT_BOUNDS_MS, 0..) |bound, i| {
+        cumulative += proxy.lat_counts[i];
+        try w.print("front_request_duration_ms_bucket{{le=\"{d}\"}} {d}\n", .{ bound, cumulative });
+    }
+    try w.print("front_request_duration_ms_bucket{{le=\"+Inf\"}} {d}\n", .{proxy.lat_total});
+    try w.print("front_request_duration_ms_sum {d}\n", .{proxy.lat_sum_ms});
+    try w.print("front_request_duration_ms_count {d}\n", .{proxy.lat_total});
     buf = aw.toArrayList();
     return try buf.toOwnedSlice(allocator);
 }
@@ -515,6 +568,8 @@ pub fn main() !void {
     // that starts a body and stops sending is aborted; slow-but-moving
     // uploads survive. 0 disables.
     proxy.body_stall_ns = envMs("REWIND_FRONT_BODY_STALL_TIMEOUT_MS", 60_000) * std.time.ns_per_ms;
+    // Per-flow access log (plan C11): one line per completed flow.
+    proxy.access_log = !std.mem.eql(u8, getEnvCfg("REWIND_FRONT_ACCESS_LOG"), "0");
     // Teardown order matters: `server.destroy()` releases any still-live
     // body sinks, and those callbacks walk proxy-owned Flow state — so the
     // server must go down while the proxy is still alive. One defer block
@@ -641,7 +696,7 @@ pub fn main() !void {
         if (front_metrics_srv) |ms| {
             if (now - last_metrics_ns >= 2 * std.time.ns_per_s) {
                 last_metrics_ns = now;
-                if (buildFrontMetricsText(allocator, server, proxy.live_flows, proxy.live_tunnels)) |txt| {
+                if (buildFrontMetricsText(allocator, server, &proxy)) |txt| {
                     defer allocator.free(txt);
                     ms.publish(txt);
                 } else |_| {}

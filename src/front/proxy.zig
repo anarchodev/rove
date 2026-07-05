@@ -80,6 +80,10 @@ pub const REPLAY_CAP: usize = 256 * 1024;
 /// bounds the per-flow copy unit.
 pub const CHUNK_MAX: u32 = 64 * 1024;
 
+/// Latency histogram bucket bounds (ms) for `front_request_duration_ms`
+/// (plan C11). Fixed comptime bounds — no allocation on the record path.
+pub const LAT_BOUNDS_MS = [_]u64{ 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 10000 };
+
 /// Reconnect backoff for a backend node whose connect failed.
 const CONNECT_BACKOFF_NS: i128 = 500 * std.time.ns_per_ms;
 
@@ -523,6 +527,33 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// (`REWIND_FRONT_BODY_STALL_TIMEOUT_MS`; 0 disables).
         body_stall_ns: i128 = BODY_STALL_NS_DEFAULT,
 
+        // ── Observability (plan C11) ──────────────────────────────────
+        /// One `front-access:` log line per completed flow
+        /// (`REWIND_FRONT_ACCESS_LOG=0` disables).
+        access_log: bool = true,
+        /// 421 not-leader re-aims (leadership churn / cold leader cache).
+        count_reaims_421: u64 = 0,
+        /// Upstream connects that blew their deadline (plan A1).
+        count_connect_timeouts: u64 = 0,
+        /// Upstream connect failures (refused/unreachable).
+        count_conn_failures: u64 = 0,
+        /// 504s from the response-headers deadline.
+        count_resp_timeouts: u64 = 0,
+        /// Aborts from the inbound body-stall budget (plan A5).
+        count_body_stalls: u64 = 0,
+        /// CP route answers: not_found (negative-cached) / transient error.
+        count_route_not_found: u64 = 0,
+        count_route_errors: u64 = 0,
+        /// Flows 503'd out of a cold-route park past ROUTE_WAIT.
+        count_route_expired: u64 = 0,
+        /// Non-idempotent flows 502'd at the ambiguous-transport-error
+        /// gate instead of replayed (plan A2).
+        count_ambiguous_502: u64 = 0,
+        /// Request-duration histogram (intake → flow teardown).
+        lat_counts: [LAT_BOUNDS_MS.len + 1]u64 = @splat(0),
+        lat_sum_ms: u64 = 0,
+        lat_total: u64 = 0,
+
         const StreamKey = struct {
             idx: u32,
             gen: u32,
@@ -617,6 +648,15 @@ pub fn Proxy(comptime FrontH2: type) type {
             proxy: *Self,
             authority: []u8, // owned; raw (with :port), for :authority upstream
             host: []u8, // owned; portless, the cache/invalidate key
+
+            // Observability (plan C11): captured at intake, emitted as
+            // one access-log line + histogram sample at teardown.
+            t_start_ns: i128 = 0,
+            method: [8]u8 = undefined, // truncated copy; enough for OPTIONS
+            method_len: u8 = 0,
+            path: []u8 = &.{}, // owned dupe; empty on alloc failure
+            final_status: u16 = 0,
+            resp_bytes: u64 = 0,
 
             // Forwarding identity (plan B7), captured at intake from the
             // downstream connection; stamped upstream on every attempt.
@@ -1287,6 +1327,11 @@ pub fn Proxy(comptime FrontH2: type) type {
             const scheme = headerValue(rh, ":scheme") orelse "http";
             flow.fwd_proto = if (std.mem.eql(u8, scheme, "https")) "https" else "http";
             flow.via_entry = if (self.server.connIsHttp1(sess.entity)) "1.1 rewind-front" else "2 rewind-front";
+            flow.t_start_ns = now_ns;
+            const method = headerValue(rh, ":method") orelse "GET";
+            flow.method_len = @intCast(@min(method.len, flow.method.len));
+            @memcpy(flow.method[0..flow.method_len], method[0..flow.method_len]);
+            flow.path = self.allocator.dupe(u8, headerValue(rh, ":path") orelse "/") catch @constCast(@as([]const u8, &.{}));
             flow.host = self.allocator.dupe(u8, host) catch |e| {
                 self.allocator.free(flow.authority);
                 return e;
@@ -1485,6 +1530,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 // The dead node shouldn't seed future requests' start
                 // index, even though this flow can't re-aim.
                 if (conn_died) self.leaders.drop(self.allocator, flow.host);
+                self.count_ambiguous_502 += 1;
                 self.finishWithStatus(flow, 502);
                 return;
             }
@@ -1518,6 +1564,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             // Remember we were redirected: a later 2xx in this flow is
             // then provably from the leader (see `noteLeader`).
             flow.saw_421 = true;
+            self.count_reaims_421 += 1;
             // Learn the leader from the worker's `x-rewind-leader` redirect
             // hint — works even for a NON-replayable request, which can't
             // re-aim to discover the leader itself and would otherwise bounce
@@ -1597,6 +1644,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                         up.sess = Entity.nil;
                         up.last_fail_ns = now_ns;
                         up.connect_deadline_ns = 0;
+                        self.count_conn_failures += 1;
                         std.log.warn("front: connect to {s} failed", .{up.origin});
                         self.drainWaiters(up, false);
                     }
@@ -1783,6 +1831,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             self.reg.move(flow.down_ent, src, &self.server.stream_response_in) catch {};
             flow.down_home = .responding;
             flow.resp_started = true;
+            flow.final_status = code;
         }
 
         /// Upstream pump: feed request-body chunks / close, account
@@ -1985,8 +2034,10 @@ pub fn Proxy(comptime FrontH2: type) type {
                         // consumeResponseHeaders). The body tail rides
                         // this terminal entity.
                         if (rb.data) |d| {
-                            if (rb.len > 0)
+                            if (rb.len > 0) {
                                 flow.resp_queue.appendSlice(self.allocator, d[0..rb.len]) catch {};
+                                flow.resp_bytes += rb.len;
+                            }
                         }
                         if (io_res.err == 0) {
                             flow.resp_eof = true;
@@ -2090,6 +2141,8 @@ pub fn Proxy(comptime FrontH2: type) type {
             self.reg.move(flow.down_ent, src, &self.server.response_in) catch {};
             flow.down_home = .responding;
             flow.resp_started = true;
+            flow.final_status = code;
+            flow.resp_bytes += body.len;
         }
 
         fn finishWithStatus(self: *Self, flow: *Flow, code: u16) void {
@@ -2120,9 +2173,11 @@ pub fn Proxy(comptime FrontH2: type) type {
             if (!flow.detached) return;
             if (flow.attempt_live or flow.waiting_conn or flow.awaiting_route) return;
             if (flow.sink_refs != 0 or flow.pending_terminals != 0) return;
+            self.recordFlowDone(flow);
             self.unmapAttempt(flow);
             flow.body.deinit(self.allocator);
             flow.resp_queue.deinit(self.allocator);
+            if (flow.path.len != 0) self.allocator.free(flow.path);
             // A parked flow torn down before its route landed never got
             // a heap node list — its `.nodes` is still the empty default
             // (`&.{}`), which must not be passed to free.
@@ -2131,6 +2186,44 @@ pub fn Proxy(comptime FrontH2: type) type {
             self.allocator.free(flow.host);
             self.allocator.destroy(flow);
             self.live_flows -= 1;
+        }
+
+        /// One histogram sample + one access-log line per completed
+        /// flow (plan C11) — the RED signals the front was missing:
+        /// who was served what, how fast, by which node, in how many
+        /// attempts. `status=0` means the flow died before any
+        /// response (client gone / teardown).
+        fn recordFlowDone(self: *Self, flow: *Flow) void {
+            const dur_ns = std.time.nanoTimestamp() - flow.t_start_ns;
+            const dur_ms: u64 = if (dur_ns <= 0) 0 else @intCast(@divTrunc(dur_ns, std.time.ns_per_ms));
+            var bucket: usize = LAT_BOUNDS_MS.len; // +Inf
+            for (LAT_BOUNDS_MS, 0..) |bound, i| {
+                if (dur_ms <= bound) {
+                    bucket = i;
+                    break;
+                }
+            }
+            self.lat_counts[bucket] += 1;
+            self.lat_sum_ms += dur_ms;
+            self.lat_total += 1;
+
+            if (!self.access_log) return;
+            const node: []const u8 = if (flow.nodes.len > 0)
+                flow.nodes[@min(flow.node_idx, flow.nodes.len - 1)]
+            else
+                "-";
+            std.log.info("front-access: {s} {s} \"{s} {s}\" {d} {d}ms node={s} attempts={d} in={d}B out={d}B", .{
+                if (flow.peer_ip_len > 0) flow.peer_ip[0..flow.peer_ip_len] else "-",
+                flow.host,
+                flow.method[0..flow.method_len],
+                if (flow.path.len > 0) flow.path else "/",
+                flow.final_status,
+                dur_ms,
+                node,
+                flow.attempt,
+                flow.body_total,
+                flow.resp_bytes,
+            });
         }
 
         fn compactBody(self: *Self, flow: *Flow) void {
@@ -2208,6 +2301,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             // stream, which is exactly the cancel we want.
             if (flow.down_gone or !flow.down_alive or flow.down_closed) return false;
             flow.resp_queue.appendSlice(flow.proxy.allocator, bytes) catch return false;
+            flow.resp_bytes += bytes.len;
             return true;
         }
 
@@ -2409,13 +2503,17 @@ pub fn Proxy(comptime FrontH2: type) type {
                     // answer 404 from cache instead of serially
                     // occupying the resolver (plan A6).
                     .not_found => {
+                        self.count_route_not_found += 1;
                         self.cache.putNegative(c.host, now_ns);
                         self.failRouteWaiters(c.host, 404);
                     },
                     // Transient CP failure: don't touch the cache (a
                     // fresh entry, if any, keeps serving other requests);
                     // the cold parked flows get a retryable 503.
-                    .err => self.failRouteWaiters(c.host, 503),
+                    .err => {
+                        self.count_route_errors += 1;
+                        self.failRouteWaiters(c.host, 503);
+                    },
                 }
                 self.allocator.free(c.host);
             }
@@ -2499,6 +2597,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     };
                     if (now_ns >= deadline) {
                         _ = list.swapRemove(i);
+                        self.count_route_expired += 1;
                         switch (w) {
                             .flow => |flow| {
                                 flow.awaiting_route = false;
@@ -2551,6 +2650,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 std.log.warn("front: request body stalled >{d}ms (host={s}) -> abort", .{
                     @divTrunc(self.body_stall_ns, std.time.ns_per_ms), flow.host,
                 });
+                self.count_body_stalls += 1;
                 self.server.serverStreamAbort(flow.down_sess, flow.down_sid);
             }
         }
@@ -2592,6 +2692,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 up.sess = Entity.nil;
                 up.last_fail_ns = now_ns;
                 up.connect_deadline_ns = 0;
+                self.count_connect_timeouts += 1;
                 self.drainWaiters(up, false);
             }
         }
@@ -2623,6 +2724,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             }
             for (stalled[0..n]) |flow| {
                 std.log.warn("front: upstream response timeout (host={s}) -> 504", .{flow.host});
+                self.count_resp_timeouts += 1;
                 self.abandonAttempt(flow); // RST_STREAM to the stuck upstream
                 self.finishWithStatus(flow, 504); // 504 to the client + teardown
             }
