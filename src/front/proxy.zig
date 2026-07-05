@@ -608,6 +608,18 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// Requests shed 503 because every upstream leg was saturated
         /// (plan A3) — the visible form of what used to queue invisibly.
         count_upstream_sheds: u64 = 0,
+        /// Requests 429'd at the per-client-IP flow cap (plan C13).
+        count_client_limited: u64 = 0,
+        /// Per-client-IP live flow/tunnel cap
+        /// (`REWIND_FRONT_MAX_FLOWS_PER_IP`; 0 = off, the default —
+        /// this is an abuse-response knob: legitimate NAT/corp egress
+        /// can fan many users out of one address, so the operator
+        /// picks the ceiling). Requires the B7 peer capture; a conn
+        /// whose peer install hasn't landed yet is not counted.
+        max_flows_per_ip: u32 = 0,
+        /// peer IP → live flows+tunnels. Keys owned; entries removed
+        /// at zero, so the map is bounded by concurrent client IPs.
+        flows_by_peer: std.StringHashMapUnmanaged(u32) = .empty,
         /// Request-duration histogram (intake → flow teardown).
         lat_counts: [LAT_BOUNDS_MS.len + 1]u64 = @splat(0),
         lat_sum_ms: u64 = 0,
@@ -894,6 +906,9 @@ pub fn Proxy(comptime FrontH2: type) type {
             var rp = self.route_pending.keyIterator();
             while (rp.next()) |k| self.allocator.free(k.*);
             self.route_pending.deinit(self.allocator);
+            var pk = self.flows_by_peer.keyIterator();
+            while (pk.next()) |k| self.allocator.free(k.*);
+            self.flows_by_peer.deinit(self.allocator);
             self.leaders.deinit(self.allocator);
         }
 
@@ -1049,6 +1064,15 @@ pub fn Proxy(comptime FrontH2: type) type {
                     self.server.wsUpgradeReject(ent, 400);
                     continue;
                 };
+                var peer_buf: [46]u8 = undefined;
+                var peer_len: u8 = 0;
+                if (self.server.connPeerAddr(sess.entity)) |peer|
+                    peer_len = peerIpString(&peer_buf, peer);
+                if (peer_len > 0 and self.peerAtCap(peer_buf[0..peer_len])) {
+                    self.count_client_limited += 1;
+                    self.server.wsUpgradeReject(ent, 429);
+                    continue;
+                }
                 const route = self.resolveRoute(host, now_ns);
                 switch (route) {
                     .not_found => {
@@ -1075,8 +1099,8 @@ pub fn Proxy(comptime FrontH2: type) type {
                     .authority = undefined,
                     .host = undefined,
                 };
-                if (self.server.connPeerAddr(sess.entity)) |peer|
-                    t.peer_ip_len = peerIpString(&t.peer_ip, peer);
+                t.peer_ip_len = peer_len;
+                if (peer_len > 0) @memcpy(t.peer_ip[0..peer_len], peer_buf[0..peer_len]);
                 const ws_scheme = headerValue(rh, ":scheme") orelse "http";
                 t.fwd_proto = if (std.mem.eql(u8, ws_scheme, "https")) "https" else "http";
                 t.authority = self.allocator.dupe(u8, authority_raw) catch {
@@ -1112,6 +1136,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     else => unreachable,
                 }
                 self.live_tunnels += 1;
+                if (t.peer_ip_len > 0) self.peerFlowInc(t.peer_ip[0..t.peer_ip_len]);
                 fr.ptr = @ptrCast(t);
                 fr.tunnel = true;
                 if (!t.awaiting_route) self.startTunnelAttempt(t);
@@ -1264,6 +1289,7 @@ pub fn Proxy(comptime FrontH2: type) type {
 
         fn maybeDestroyTunnel(self: *Self, t: *WsTunnel) void {
             if (!t.done or t.pending_terminals != 0 or t.sink_refs != 0) return;
+            if (t.peer_ip_len > 0) self.peerFlowDec(t.peer_ip[0..t.peer_ip_len]);
             self.unmapTunnel(t);
             self.allocator.free(t.authority);
             self.allocator.free(t.host);
@@ -1366,6 +1392,38 @@ pub fn Proxy(comptime FrontH2: type) type {
             };
         }
 
+        // ── Per-client limits (plan C13) ──────────────────────────────
+
+        fn peerAtCap(self: *Self, peer: []const u8) bool {
+            if (self.max_flows_per_ip == 0 or peer.len == 0) return false;
+            const cnt = self.flows_by_peer.get(peer) orelse return false;
+            return cnt >= self.max_flows_per_ip;
+        }
+
+        /// Best-effort accounting (LeaderCache's discipline): an OOM
+        /// skip degrades the cap toward lenient, never toward wedged.
+        fn peerFlowInc(self: *Self, peer: []const u8) void {
+            if (self.max_flows_per_ip == 0 or peer.len == 0) return;
+            const gop = self.flows_by_peer.getOrPut(self.allocator, peer) catch return;
+            if (!gop.found_existing) {
+                gop.key_ptr.* = self.allocator.dupe(u8, peer) catch {
+                    self.flows_by_peer.removeByPtr(gop.key_ptr);
+                    return;
+                };
+                gop.value_ptr.* = 0;
+            }
+            gop.value_ptr.* += 1;
+        }
+
+        fn peerFlowDec(self: *Self, peer: []const u8) void {
+            if (self.max_flows_per_ip == 0 or peer.len == 0) return;
+            const e = self.flows_by_peer.getPtr(peer) orelse return;
+            e.* -|= 1;
+            if (e.* == 0) {
+                if (self.flows_by_peer.fetchRemove(peer)) |kv| self.allocator.free(kv.key);
+            }
+        }
+
         fn beginFlow(
             self: *Self,
             coll: anytype,
@@ -1385,6 +1443,16 @@ pub fn Proxy(comptime FrontH2: type) type {
                 try self.replyStatus(coll, ent, sid, sess, 400);
                 return null;
             };
+
+            var peer_buf: [46]u8 = undefined;
+            var peer_len: u8 = 0;
+            if (self.server.connPeerAddr(sess.entity)) |peer|
+                peer_len = peerIpString(&peer_buf, peer);
+            if (peer_len > 0 and self.peerAtCap(peer_buf[0..peer_len])) {
+                self.count_client_limited += 1;
+                try self.replyStatus(coll, ent, sid, sess, 429);
+                return null;
+            }
 
             const route = self.resolveRoute(host, now_ns);
             switch (route) {
@@ -1412,8 +1480,8 @@ pub fn Proxy(comptime FrontH2: type) type {
                 .down_home = home,
                 .idempotent = isIdempotentMethod(headerValue(rh, ":method") orelse "GET"),
             };
-            if (self.server.connPeerAddr(sess.entity)) |peer|
-                flow.peer_ip_len = peerIpString(&flow.peer_ip, peer);
+            flow.peer_ip_len = peer_len;
+            if (peer_len > 0) @memcpy(flow.peer_ip[0..peer_len], peer_buf[0..peer_len]);
             const scheme = headerValue(rh, ":scheme") orelse "http";
             flow.fwd_proto = if (std.mem.eql(u8, scheme, "https")) "https" else "http";
             flow.via_entry = if (self.server.connIsHttp1(sess.entity)) "1.1 rewind-front" else "2 rewind-front";
@@ -1450,6 +1518,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 else => unreachable,
             }
             self.live_flows += 1;
+            if (flow.peer_ip_len > 0) self.peerFlowInc(flow.peer_ip[0..flow.peer_ip_len]);
             return flow;
         }
 
@@ -2354,6 +2423,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             if (flow.attempt_live or flow.waiting_conn or flow.awaiting_route) return;
             if (flow.sink_refs != 0 or flow.pending_terminals != 0) return;
             self.recordFlowDone(flow);
+            if (flow.peer_ip_len > 0) self.peerFlowDec(flow.peer_ip[0..flow.peer_ip_len]);
             self.unmapAttempt(flow);
             flow.body.deinit(self.allocator);
             flow.resp_queue.deinit(self.allocator);

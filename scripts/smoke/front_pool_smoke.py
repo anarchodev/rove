@@ -20,6 +20,9 @@ Proof legs:
   B. the upstream saw MORE THAN ONE connection (the pool actually
      scaled out) and at most 2 (the configured leg count).
   C. after the burst drains, a fresh request serves 200 (pool healthy).
+  D. per-client cap (plan C13): a second front with
+     REWIND_FRONT_MAX_FLOWS_PER_IP=3 answers a 6-wide burst from one
+     IP with exactly 3 in flight — the rest 429.
 
 Build first: `zig build rewind-cp rewind-front`
 """
@@ -126,10 +129,10 @@ def stop_all():
             p.wait()
 
 
-def timed_get(results, idx):
+def timed_get(results, idx, port=None):
     out = subprocess.run(
         ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "15",
-         "-H", "Host: acme.example", f"http://127.0.0.1:{PF}/burst/{idx}"],
+         "-H", "Host: acme.example", f"http://127.0.0.1:{port or PF}/burst/{idx}"],
         capture_output=True, text=True,
     ).stdout.strip()
     try:
@@ -190,6 +193,29 @@ def main():
         r = [0]
         timed_get(r, 0)
         check("fresh request → 200", r[0] == 200, f"got {r[0]}")
+
+        print("leg D: per-client-IP cap (plan C13) — cap 3, burst 6")
+        pf2 = int(os.environ.get("FRONT2_PORT", "18303"))
+        spawn_front(procs, pf2, f"http://127.0.0.1:{PCP}", extra_env={
+            "REWIND_FRONT_MAX_FLOWS_PER_IP": "3",
+            "REWIND_FRONT_METRICS_PORT": "0",  # first front holds 9112
+        })
+        m = 6
+        results2 = [0] * m
+        threads2 = [threading.Thread(target=timed_get, args=(results2, i, pf2)) for i in range(m)]
+        for t in threads2:
+            t.start()
+            time.sleep(0.05)
+        for t in threads2:
+            t.join()
+        n200d = sum(1 for x in results2 if x == 200)
+        n429d = sum(1 for x in results2 if x == 429)
+        check("exactly 3 in flight served 200", n200d == 3, f"results={results2}")
+        check("the rest 429'd at the cap", n429d == m - 3, f"results={results2}")
+        # The cap releases with the flows: a follow-up request serves.
+        r2 = [0]
+        timed_get(r2, 0, pf2)
+        check("post-burst request under the cap → 200", r2[0] == 200, f"got {r2[0]}")
     finally:
         stop_all()
         subprocess.run(["rm", "-rf", cpd])

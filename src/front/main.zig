@@ -423,6 +423,9 @@ fn buildFrontMetricsText(allocator: std.mem.Allocator, server: *FrontH2, proxy: 
         \\# HELP front_upstream_sheds_total requests shed 503 with every upstream leg saturated (the visible form of what used to queue invisibly).
         \\# TYPE front_upstream_sheds_total counter
         \\front_upstream_sheds_total {d}
+        \\# HELP front_client_limited_total requests 429'd at the per-client-IP flow cap (REWIND_FRONT_MAX_FLOWS_PER_IP).
+        \\# TYPE front_client_limited_total counter
+        \\front_client_limited_total {d}
         \\
     , .{
         proxy.count_reaims_421,     proxy.count_connect_timeouts,
@@ -430,6 +433,7 @@ fn buildFrontMetricsText(allocator: std.mem.Allocator, server: *FrontH2, proxy: 
         proxy.count_body_stalls,    proxy.count_route_not_found,
         proxy.count_route_errors,   proxy.count_route_expired,
         proxy.count_ambiguous_502,  proxy.count_upstream_sheds,
+        proxy.count_client_limited,
     });
     // Request-duration histogram (intake → flow teardown).
     try w.print(
@@ -580,6 +584,10 @@ pub fn main() !void {
     // 1 restores the single-conn behavior.
     proxy.legs_per_node = @intCast(std.math.clamp(envMs("REWIND_FRONT_UPSTREAM_CONNS", 2), 1, @as(i128, proxy_mod.MAX_LEGS)));
     proxy.leg_stream_cap = @intCast(std.math.clamp(envMs("REWIND_FRONT_UPSTREAM_STREAM_CAP", proxy_mod.LEG_STREAM_CAP), 1, 512));
+    // Per-client-IP live flow cap (plan C13): 0 (default) = off. An
+    // abuse-response knob — legitimate NAT egress can fan many users
+    // out of one address, so the operator picks the ceiling.
+    proxy.max_flows_per_ip = @intCast(std.math.clamp(envMs("REWIND_FRONT_MAX_FLOWS_PER_IP", 0), 0, 1 << 30));
     // Teardown order matters: `server.destroy()` releases any still-live
     // body sinks, and those callbacks walk proxy-owned Flow state — so the
     // server must go down while the proxy is still alive. One defer block
