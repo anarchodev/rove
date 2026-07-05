@@ -654,6 +654,29 @@ fn valueToOwnedString(
     return out;
 }
 
+/// `valueToOwnedString` for kv WRITE inputs: primitives only. A string,
+/// number, boolean, or bigint has one faithful, deterministic string
+/// form; an object/array/typed array would silently mangle
+/// (`"[object Object]"`, a Uint8Array's `"1,2,3"`) and null/undefined
+/// at a write site is a handler bug — all throw TypeError instead of
+/// corrupting the durable store
+/// (docs/plans/handler-api-ergonomics-plan.md C2). JSON encoding stays
+/// the handler's explicit choice (`kv.set(k, JSON.stringify(v))`).
+fn kvWriteArgToOwnedString(
+    state: *DispatchState,
+    ctx: ?*c.JSContext,
+    val: c.JSValue,
+    comptime what: []const u8,
+) ![]u8 {
+    if (c.JS_IsUndefined(val) or c.JS_IsNull(val) or c.JS_IsObject(val)) {
+        _ = c.JS_ThrowTypeError(ctx, "kv: " ++ what ++
+            " must be a string (or number/boolean/bigint); " ++
+            "JSON.stringify objects explicitly");
+        return error.JsException;
+    }
+    return valueToOwnedString(state, ctx, val);
+}
+
 // ── kv.* ──────────────────────────────────────────────────────────────
 
 /// kv key / value size caps — THE canonical kvexp limits, referenced through
@@ -786,9 +809,9 @@ fn jsKvSet(
     if (argc < 2) return js_undefined;
     const state = getState(ctx);
 
-    const key_str = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    const key_str = kvWriteArgToOwnedString(state, ctx, argv[0], "key") catch return js_exception;
     defer state.allocator.free(key_str);
-    const val_str = valueToOwnedString(state, ctx, argv[1]) catch return js_exception;
+    const val_str = kvWriteArgToOwnedString(state, ctx, argv[1], "value") catch return js_exception;
     defer state.allocator.free(val_str);
 
     // Reject writes into platform-reserved namespaces. Platform writers
@@ -895,7 +918,7 @@ fn jsKvDelete(
     if (argc < 1) return js_undefined;
     const state = getState(ctx);
 
-    const key_str = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    const key_str = kvWriteArgToOwnedString(state, ctx, argv[0], "key") catch return js_exception;
     defer state.allocator.free(key_str);
 
     // Same reserved-namespace guard as jsKvSet — see the comment there.
@@ -1244,9 +1267,9 @@ fn jsPlatformRootSet(
         return js_exception;
     };
 
-    const key = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    const key = kvWriteArgToOwnedString(state, ctx, argv[0], "key") catch return js_exception;
     defer state.allocator.free(key);
-    const val = valueToOwnedString(state, ctx, argv[1]) catch return js_exception;
+    const val = kvWriteArgToOwnedString(state, ctx, argv[1], "value") catch return js_exception;
     defer state.allocator.free(val);
 
     tenant.root.put(key, val) catch |err| {
@@ -1277,7 +1300,7 @@ fn jsPlatformRootDelete(
         return js_exception;
     };
 
-    const key = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    const key = kvWriteArgToOwnedString(state, ctx, argv[0], "key") catch return js_exception;
     defer state.allocator.free(key);
 
     tenant.root.delete(key) catch |err| switch (err) {
@@ -1764,10 +1787,10 @@ fn scopeKvWrite(
 
     const id = scopeIdFromThis(state, ctx, this) catch return js_exception;
     defer state.allocator.free(id);
-    const key = valueToOwnedString(state, ctx, argv[0]) catch return js_exception;
+    const key = kvWriteArgToOwnedString(state, ctx, argv[0], "key") catch return js_exception;
     defer state.allocator.free(key);
     const val = if (op == .put) blk: {
-        break :blk valueToOwnedString(state, ctx, argv[1]) catch return js_exception;
+        break :blk kvWriteArgToOwnedString(state, ctx, argv[1], "value") catch return js_exception;
     } else state.allocator.dupe(u8, "") catch return js_exception;
     defer state.allocator.free(val);
 

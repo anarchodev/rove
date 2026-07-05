@@ -1240,6 +1240,138 @@ test "dispatch: request.session is null when no sid resolved" {
     try testing.expectEqualStrings("null", resp.body);
 }
 
+// ── docs/plans/handler-api-ergonomics-plan.md Phase 1 (C1–C4) ─────────
+
+test "dispatch: Uint8Array return ships raw bytes, not JSON (C1)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var resp = try runOne(
+        &d,
+        kv,
+        \\return new Uint8Array([104, 105, 0, 255]);
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualSlices(u8, &[_]u8{ 104, 105, 0, 255 }, resp.body);
+}
+
+test "dispatch: kv.set rejects object/array/bytes/null values fail-loud (C2)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var resp = try runOne(
+        &d,
+        kv,
+        \\const bad = [{ a: 1 }, [1, 2], new Uint8Array([1, 2, 3]), null, undefined];
+        \\for (const v of bad) {
+        \\  let threw = null;
+        \\  try { kv.set("k", v); } catch (e) { threw = e; }
+        \\  if (!(threw instanceof TypeError)) return "no-throw: " + String(v);
+        \\}
+        \\if (kv.get("k") !== null) return "wrote-anyway";
+        \\let kthrew = null;
+        \\try { kv.set({ oops: 1 }, "v"); } catch (e) { kthrew = e; }
+        \\if (!(kthrew instanceof TypeError)) return "key-no-throw";
+        \\let dthrew = null;
+        \\try { kv.delete({ oops: 1 }); } catch (e) { dthrew = e; }
+        \\if (!(dthrew instanceof TypeError)) return "delete-no-throw";
+        \\return "all-threw";
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings("all-threw", resp.body);
+}
+
+test "dispatch: kv.set still accepts number/boolean/bigint primitives (C2)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var resp = try runOne(
+        &d,
+        kv,
+        \\kv.set("count", 5);
+        \\kv.set("flag", true);
+        \\kv.set("big", 9007199254740993n);
+        \\return kv.get("count") + "|" + kv.get("flag") + "|" + kv.get("big");
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings("5|true|9007199254740993", resp.body);
+}
+
+test "dispatch: webhook.send rejects a non-string body (C3)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var resp = try runOne(
+        &d,
+        kv,
+        \\let threw = null;
+        \\try {
+        \\  webhook.send({ url: "https://x.test/hook", body: new Uint8Array([1, 2]) });
+        \\} catch (e) { threw = e; }
+        \\return threw instanceof TypeError ? "threw" : "no-throw";
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings("threw", resp.body);
+}
+
+test "dispatch: next({ctx}) with unserializable ctx throws, absent ctx stays legal (C4)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var resp = try runOne(
+        &d,
+        kv,
+        \\let threw = null;
+        \\try { __rove_next("", { ctx: { big: 10n } }); } catch (e) { threw = e; }
+        \\if (!(threw instanceof TypeError)) return "no-throw";
+        \\__rove_next("", {});   // absent ctx must not throw
+        \\__rove_next("");       // no opts at all must not throw
+        \\return "threw";
+    ,
+        .{ .method = "GET", .path = "/" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings("threw", resp.body);
+}
+
 test "dispatch: kv.set rejects platform-reserved prefixes" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

@@ -155,6 +155,14 @@ globalThis.webhook = {
     if (typeof opts.url !== "string")
       throw new TypeError("webhook.send: `url` must be a string");
 
+    // The body must be a string: it JSON-round-trips through the
+    // durable `_send/owed/{id}` marker, which would silently mangle a
+    // Uint8Array to `{"0":..}` (docs/plans/handler-api-ergonomics-plan.md
+    // C3; byte bodies on the durable path are a deferred follow-up).
+    const body = opts.body == null ? "" : opts.body;
+    if (typeof body !== "string")
+      throw new TypeError("webhook.send: `body` must be a string (encode bytes or JSON.stringify explicitly)");
+
     // `on_result` is a module path string. Passed verbatim to
     // `__rove_next(on_result, {ctx: {...}})` inside the
     // webhook_onresult.mjs shim.
@@ -196,7 +204,7 @@ globalThis.webhook = {
     const marker = {
       url: opts.url,
       method: opts.method || "POST",
-      body: opts.body || "",
+      body: body,
       headers: opts.headers || {},
       attempts: 0,
       max_attempts: max_attempts,
@@ -241,7 +249,7 @@ globalThis.webhook = {
       sysHttp.fetch({
         url: opts.url,
         method: opts.method || "POST",
-        body: opts.body || "",
+        body: body,
         headers: Object.assign({}, opts.headers || {}, {
           "X-Rove-Schedule-Id": id,
           "X-Rove-Schedule-Version": "1",

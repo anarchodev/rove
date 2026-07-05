@@ -123,11 +123,21 @@ pub fn jsNext(
 
         const ctx_v = c.JS_GetPropertyStr(ctx, opts, "ctx");
         defer c.JS_FreeValue(ctx, ctx_v);
-        const ctx_json = c.JS_JSONStringify(ctx, ctx_v, js_undefined, js_undefined);
-        if (c.JS_IsException(ctx_json) or c.JS_IsUndefined(ctx_json)) {
-            c.JS_FreeValue(ctx, ctx_json);
+        if (c.JS_IsUndefined(ctx_v)) {
+            // Absent ctx is legal (`next()` with nothing threaded).
             _ = c.JS_SetPropertyStr(ctx, obj, "ctx", c.JS_NewStringLen(ctx, "null", 4));
         } else {
+            const ctx_json = c.JS_JSONStringify(ctx, ctx_v, js_undefined, js_undefined);
+            if (c.JS_IsException(ctx_json) or c.JS_IsUndefined(ctx_json)) {
+                // A PROVIDED ctx that JSON can't carry (BigInt, function,
+                // circular) must fail loudly — storing "null" silently
+                // loses continuation state
+                // (docs/plans/handler-api-ergonomics-plan.md C4).
+                c.JS_FreeValue(ctx, ctx_json);
+                c.JS_FreeValue(ctx, obj);
+                _ = c.JS_ThrowTypeError(ctx, "next({ctx}): ctx must be JSON-serializable (no BigInt/function/circular values)");
+                return js_exception;
+            }
             _ = c.JS_SetPropertyStr(ctx, obj, "ctx", ctx_json); // steals ref
         }
     } else {

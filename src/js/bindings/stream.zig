@@ -115,8 +115,9 @@ pub fn jsStreamStart(
 
 /// `_system.stream.write(chunk)` — emit one chunk to the held socket.
 /// Commit-gated: the chunk reaches the wire only after this activation's
-/// writes commit (`streaming-model.md` §2). `chunk` is coerced to bytes
-/// (string or typed value → UTF-8). Inert when there's no connection.
+/// writes commit (`streaming-model.md` §2). `chunk` must be a string
+/// (UTF-8-encoded) or a Uint8Array (raw bytes); anything else throws
+/// TypeError. Inert when there's no connection.
 pub fn jsStreamWrite(
     ctx: ?*c.JSContext,
     _: c.JSValue,
@@ -130,9 +131,12 @@ pub fn jsStreamWrite(
         return js_exception;
     }
     var opcode: u8 = 0;
-    const bytes = jsValueAsOwnedBytes(state.allocator, ctx, argv[0], &opcode) catch {
-        _ = c.JS_ThrowInternalError(ctx, "stream.write: out of memory");
-        return js_exception;
+    const bytes = jsValueAsOwnedBytes(state.allocator, ctx, argv[0], &opcode) catch |err| switch (err) {
+        error.JsException => return js_exception, // TypeError already thrown
+        error.OutOfMemory => {
+            _ = c.JS_ThrowInternalError(ctx, "stream.write: out of memory");
+            return js_exception;
+        },
     };
     // Lossless backstop: a single activation can't be backpressured mid-run, so
     // cap its cumulative writes at the hard ceiling and throw (never drop). The
@@ -176,37 +180,75 @@ pub fn jsStreamWrite(
 /// `JS_GetUint8Array` — running binary through `JS_ToCStringLen` would
 /// truncate at embedded NULs and mangle non-UTF-8, so the type must be
 /// distinguished here (the same split `crypto.zig`'s `extractKeyOrDataBytes`
-/// makes). Any non-string that isn't a Uint8Array view falls back to the
-/// string coercion (e.g. numbers → their decimal text, a text frame).
+/// makes). Anything else throws TypeError — the former `String()`
+/// fallback shipped `"[object Object]"` as a wire chunk
+/// (docs/plans/handler-api-ergonomics-plan.md C5).
 fn jsValueAsOwnedBytes(
     allocator: std.mem.Allocator,
     ctx: ?*c.JSContext,
     v: c.JSValue,
     opcode_out: *u8,
-) error{OutOfMemory}![]u8 {
-    if (!c.JS_IsString(v)) {
-        var byte_len: usize = 0;
-        const buf_ptr = c.JS_GetUint8Array(ctx, &byte_len, v);
-        if (buf_ptr != null) {
-            opcode_out.* = 2; // binary frame
-            return try allocator.dupe(u8, buf_ptr[0..byte_len]);
-        }
-        // Not a typed array — clear the pending exception JS_GetUint8Array
-        // set and fall through to the string coercion (text frame).
-        const pending = c.JS_GetException(ctx);
-        c.JS_FreeValue(ctx, pending);
+) error{ OutOfMemory, JsException }![]u8 {
+    if (c.JS_IsString(v)) {
+        var len: usize = 0;
+        const s = c.JS_ToCStringLen(ctx, &len, v);
+        if (s == null) return error.OutOfMemory;
+        defer c.JS_FreeCString(ctx, s);
+        opcode_out.* = 1; // text frame
+        return try allocator.dupe(u8, s[0..len]);
     }
-    var len: usize = 0;
-    const s = c.JS_ToCStringLen(ctx, &len, v);
-    if (s == null) return error.OutOfMemory;
-    defer c.JS_FreeCString(ctx, s);
-    opcode_out.* = 1; // text frame
-    return try allocator.dupe(u8, s[0..len]);
+    var byte_len: usize = 0;
+    const buf_ptr = c.JS_GetUint8Array(ctx, &byte_len, v);
+    if (buf_ptr != null) {
+        opcode_out.* = 2; // binary frame
+        return try allocator.dupe(u8, buf_ptr[0..byte_len]);
+    }
+    // Not a string, not a typed array — clear the pending exception
+    // JS_GetUint8Array set, then reject.
+    const pending = c.JS_GetException(ctx);
+    c.JS_FreeValue(ctx, pending);
+    _ = c.JS_ThrowTypeError(ctx, "stream.write: chunk must be a string or Uint8Array");
+    return error.JsException;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "jsValueAsOwnedBytes: string→text, Uint8Array→binary, else TypeError (C5)" {
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var jctx = try rt.newContext();
+    defer jctx.deinit();
+    const a = testing.allocator;
+    var opcode: u8 = 0;
+
+    var s = try jctx.eval("'hi'", "t.js", .{});
+    defer s.deinit();
+    const b1 = try jsValueAsOwnedBytes(a, jctx.raw, s.raw, &opcode);
+    defer a.free(b1);
+    try testing.expectEqualStrings("hi", b1);
+    try testing.expectEqual(@as(u8, 1), opcode);
+
+    // Raw bytes incl. NUL + a non-UTF-8 byte survive verbatim.
+    var u = try jctx.eval("new Uint8Array([104, 0, 255])", "t.js", .{});
+    defer u.deinit();
+    const b2 = try jsValueAsOwnedBytes(a, jctx.raw, u.raw, &opcode);
+    defer a.free(b2);
+    try testing.expectEqualSlices(u8, &[_]u8{ 104, 0, 255 }, b2);
+    try testing.expectEqual(@as(u8, 2), opcode);
+
+    // Anything else throws instead of shipping "[object Object]".
+    var o = try jctx.eval("({})", "t.js", .{});
+    defer o.deinit();
+    try testing.expectError(
+        error.JsException,
+        jsValueAsOwnedBytes(a, jctx.raw, o.raw, &opcode),
+    );
+    const ex = c.JS_GetException(jctx.raw);
+    defer c.JS_FreeValue(jctx.raw, ex);
+    try testing.expect(!c.JS_IsNull(ex));
+}
 
 test "Stream.deinit frees all owned slices" {
     const a = testing.allocator;

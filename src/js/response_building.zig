@@ -39,6 +39,10 @@ pub fn unwrapPromise(ctx: *c.JSContext, v: c.JSValue) Unwrapped {
 
 /// Convert the handler's return value to bytes:
 ///   - string       → raw string (no JSON quoting); `is_json_out` = false
+///   - Uint8Array / typed-array view → raw backing bytes verbatim;
+///     `is_json_out` = false (returned bytes mean bytes — the former
+///     JSON.stringify fallthrough corrupted them to `{"0":..}`;
+///     docs/plans/handler-api-ergonomics-plan.md C1)
 ///   - undefined/null → empty body; `is_json_out` = false
 ///   - anything else → `JSON.stringify(ret)`; `is_json_out` = true
 pub fn bodyFromReturn(
@@ -53,6 +57,20 @@ pub fn bodyFromReturn(
     if (c.JS_IsString(ret)) {
         body_out.* = jsValueToOwned(allocator, ctx, ret) catch return error.OutOfMemory;
         return;
+    }
+    if (c.JS_IsObject(ret)) {
+        var byte_len: usize = 0;
+        const buf_ptr = c.JS_GetUint8Array(ctx, &byte_len, ret);
+        if (buf_ptr != null) {
+            const out = try allocator.alloc(u8, byte_len);
+            if (byte_len > 0) @memcpy(out, buf_ptr[0..byte_len]);
+            body_out.* = out;
+            return;
+        }
+        // Not a typed array — clear the pending exception
+        // JS_GetUint8Array set and fall through to JSON.stringify.
+        const pending = c.JS_GetException(ctx);
+        c.JS_FreeValue(ctx, pending);
     }
     // JSON.stringify via the C API.
     const json = c.JS_JSONStringify(ctx, ret, globals.js_undefined, globals.js_undefined);
@@ -204,6 +222,32 @@ fn isEmittableHeaderName(name: []const u8) bool {
     // downstream. See `reserved_headers.zig`.
     if (reserved_headers.isReservedInternalHeader(name)) return false;
     return true;
+}
+
+test "bodyFromReturn: Uint8Array ships raw bytes, objects still JSON (C1)" {
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var jctx = try rt.newContext();
+    defer jctx.deinit();
+    const a = testing.allocator;
+
+    var u = try jctx.eval("new Uint8Array([104, 0, 255])", "t.js", .{});
+    defer u.deinit();
+    var body: []u8 = &.{};
+    var is_json = true;
+    try bodyFromReturn(a, jctx.raw, u.raw, &body, &is_json);
+    defer a.free(body);
+    try testing.expectEqualSlices(u8, &[_]u8{ 104, 0, 255 }, body);
+    try testing.expect(!is_json);
+
+    var o = try jctx.eval("({a: 1})", "t.js", .{});
+    defer o.deinit();
+    var body2: []u8 = &.{};
+    var is_json2 = false;
+    try bodyFromReturn(a, jctx.raw, o.raw, &body2, &is_json2);
+    defer a.free(body2);
+    try testing.expectEqualStrings("{\"a\":1}", body2);
+    try testing.expect(is_json2);
 }
 
 test "isEmittableHeaderName rejects platform-reserved internal prefixes" {
