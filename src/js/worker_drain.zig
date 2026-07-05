@@ -1153,6 +1153,17 @@ const StreamResumeCtx = struct {
     /// P5(a): the resume hop's `http.fetch` accumulator (see
     /// `proposeAndParkContResume.fetches_opt`).
     pending_fetches: ?*std.ArrayListUnmanaged(globals.PendingFetch) = null,
+    /// The triggering fetch result, present ONLY when `activation ==
+    /// .fetch_chunk` (the `resumeBoundFetchChain` caller). It is this
+    /// activation's Msg — an input (L3) — so the success log MUST tape it
+    /// via `captureFetchChunkTapes`, or the record is unreplayable and
+    /// the L3 assert fires (a large static streaming through
+    /// `__system/static` is the path that exposed this). Null for the
+    /// `.send_callback` / `.inbound_chunk` callers, whose Msg channel the
+    /// L3 switch does not require. `ctx_body` is the `{"ctx":…}` envelope
+    /// that rides trigger_payload alongside it.
+    fetch_ev: ?worker_mod.FetchEvent = null,
+    ctx_body: []const u8 = "",
 };
 
 /// `docs/streaming-model.md` §7 item 1 (Phase 2b lift): the cont→stream
@@ -1329,7 +1340,17 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     // collections; flushResumeFetches' parked_continuations count bump
     // soft-fails there) — they drop with a register failure.
     if (ctx.pending_fetches) |pf| flushResumeFetches(worker, ctx.ent, pf, false);
-    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", cont_path_for_log, "", ctx.deployment_id, ctx.now_ns, 0, .ok, &.{}, &.{}, .{}, ctx.correlation_id, &.{}, ctx.activation, 0);
+    // A `.fetch_chunk` resume records the fetch result as its Msg (L3) —
+    // the cont→stream transition previously logged empty tapes here, an
+    // unreplayable record (silent in prod, an L3 panic in safety builds;
+    // exposed by large statics streaming via `__system/static`). The
+    // `.send_callback` / `.inbound_chunk` callers pass no `fetch_ev` and
+    // keep the empty tapes their Msg channel allows.
+    const stream_tapes = if (ctx.fetch_ev) |fe|
+        worker_mod.captureFetchChunkTapes(worker, ctx.readset, ctx.ctx_body, fe)
+    else
+        log_mod.TapePayloads{};
+    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", cont_path_for_log, "", ctx.deployment_id, ctx.now_ns, 0, .ok, &.{}, &.{}, stream_tapes, ctx.correlation_id, &.{}, ctx.activation, 0);
 }
 
 /// 503 (retriable) when this activation's failure was an invalidated txn
@@ -2198,6 +2219,9 @@ pub fn resumeBoundFetchChain(
                 .txn_done = &txn_done,
                 .pending_fetches = &pending_fetches,
                 .activation = .fetch_chunk,
+                // L3: tape the fetch result on the success log (the Msg).
+                .fetch_ev = fetch_ev,
+                .ctx_body = body,
             });
         },
         // Only `.inbound_headers` / `.inbound_chunk` activations
