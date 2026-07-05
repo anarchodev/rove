@@ -35,7 +35,7 @@ export function onUpstream() {
         response.status = 200;
         return kv.get("onfetch/acc") || "";
     }
-    const text = new TextDecoder().decode(request.body);
+    const text = request.text;
     kv.set("onfetch/acc", (kv.get("onfetch/acc") || "") + text);
     return next();
 }

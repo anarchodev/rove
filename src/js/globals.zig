@@ -1926,6 +1926,10 @@ pub fn installStatic(ctx: *c.JSContext) void {
     evalSnippet(ctx, "http.js", HTTP_JS);
     evalSnippet(ctx, "platform.js", PLATFORM_JS);
     evalSnippet(ctx, "textcodec.js", TEXTCODEC_JS);
+    // request.js needs TextDecoder (above): builds the shared
+    // `__rove_request_proto` whose `text`/`json` accessors derive from
+    // `request.bytes` (handler-api-ergonomics-plan §2.2).
+    evalSnippet(ctx, "request.js", REQUEST_JS);
     evalSnippet(ctx, "base64.js", BASE64_JS);
     evalSnippet(ctx, "urlsearchparams.js", URLSEARCHPARAMS_JS);
     // jwt depends on base64 + crypto.verifyRsa/Ecdsa.
@@ -2222,6 +2226,7 @@ const NEXT_JS = @embedFile("next_js");
 const WEBHOOK_JS = @embedFile("webhook_js");
 const EMAIL_JS = @embedFile("email_js");
 const TEXTCODEC_JS = @embedFile("textcodec_js");
+const REQUEST_JS = @embedFile("request_js");
 const USERS_JS = @embedFile("users_js");
 const ACTIVITYPUB_JS = @embedFile("activitypub_js");
 const BLOB_JS = @embedFile("blob_js");
@@ -2413,12 +2418,31 @@ pub fn installRequest(
     // alive (unread bodies are elided from the replay record —
     // `Readset.elideUnreadBody`).
     const req_obj = c.JS_NewObject(ctx);
+    // The shared payload prototype (globals/request.js): `text`/`json`
+    // accessors deriving from `request.bytes`
+    // (handler-api-ergonomics-plan §2.2). Baked into the base snapshot;
+    // one JS_SetPrototype per activation. Test contexts built without
+    // the globals install simply skip it.
+    const payload_proto = c.JS_GetPropertyStr(ctx, global, "__rove_request_proto");
+    if (!c.JS_IsUndefined(payload_proto)) _ = c.JS_SetPrototype(ctx, req_obj, payload_proto);
+    c.JS_FreeValue(ctx, payload_proto);
     state.req_headers = request.headers;
     state.req_body = request.body;
     _ = c.JS_SetPropertyStr(ctx, req_obj, "method", c.JS_NewStringLen(ctx, request.method.ptr, request.method.len));
     _ = c.JS_SetPropertyStr(ctx, req_obj, "path", c.JS_NewStringLen(ctx, request.path.ptr, request.path.len));
     _ = c.JS_SetPropertyStr(ctx, req_obj, "host", c.JS_NewStringLen(ctx, request.host.ptr, request.host.len));
     definePropertyGetter(ctx, req_obj, "body", c.JS_NewCFunction2(ctx, @ptrCast(&jsBodyGetter), "body", 0, c.JS_CFUNC_getter_magic, 0));
+    // `bytes` — the uniform payload view. On plain inbound (buffered or
+    // headers-first) `Request.body` IS the customer payload, so `bytes`
+    // is a read-recording lazy accessor exactly like `body`. Every other
+    // payload-carrying kind (`inbound_chunk`, bound `fetch_chunk`,
+    // `ws_message`, `send_callback`) defines its own `bytes` data
+    // property in its arm below; the remaining kinds carry an internal
+    // ctx envelope (or nothing) in `Request.body`, which must NOT leak
+    // through a payload surface — they get no `bytes` at all.
+    if (request.activation == .inbound or request.activation == .inbound_headers) {
+        definePropertyGetter(ctx, req_obj, "bytes", c.JS_NewCFunction2(ctx, @ptrCast(&jsBytesGetter), "bytes", 0, c.JS_CFUNC_getter_magic, 0));
+    }
     if (request.query) |q| {
         _ = c.JS_SetPropertyStr(ctx, req_obj, "query", c.JS_NewStringLen(ctx, q.ptr, q.len));
     } else {
@@ -2685,6 +2709,15 @@ pub fn installRequest(
                 c.JS_NewUint8ArrayCopy(ctx, fc.bytes.ptr, fc.bytes.len),
                 c.JS_PROP_C_W_E,
             );
+            // The uniform payload view (§2.2): `bytes` = the same chunk
+            // payload; `text`/`json` derive on the prototype.
+            _ = c.JS_DefinePropertyValueStr(
+                ctx,
+                req_obj,
+                "bytes",
+                c.JS_NewUint8ArrayCopy(ctx, fc.bytes.ptr, fc.bytes.len),
+                c.JS_PROP_C_W_E,
+            );
             _ = c.JS_SetPropertyStr(ctx, req_obj, "done", if (fc.final) js_true else js_false);
             if (fc.id) |fid| {
                 _ = c.JS_SetPropertyStr(ctx, req_obj, "fetchId", c.JS_NewStringLen(ctx, fid.ptr, fid.len));
@@ -2724,6 +2757,17 @@ pub fn installRequest(
         else
             c.JS_NewStringLen(ctx, wm.data.ptr, wm.data.len);
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "data", data_val);
+        // The uniform payload view (§2.2): `bytes` = the frame payload,
+        // raw, regardless of opcode (a text frame's bytes are its
+        // UTF-8); `opcode` stays on request.activation for handlers
+        // that care about text-vs-binary framing.
+        _ = c.JS_DefinePropertyValueStr(
+            ctx,
+            req_obj,
+            "bytes",
+            c.JS_NewUint8ArrayCopy(ctx, wm.data.ptr, wm.data.len),
+            c.JS_PROP_C_W_E,
+        );
     }
 
     // Endpoint A — uniform ctx threading (decisions.md, supersedes §4.7's
@@ -2764,6 +2808,14 @@ pub fn installRequest(
             ctx,
             req_obj,
             "body",
+            c.JS_NewUint8ArrayCopy(ctx, request.body.ptr, request.body.len),
+            c.JS_PROP_C_W_E,
+        );
+        // The uniform payload view (§2.2): `bytes` = this chunk.
+        _ = c.JS_DefinePropertyValueStr(
+            ctx,
+            req_obj,
+            "bytes",
             c.JS_NewUint8ArrayCopy(ctx, request.body.ptr, request.body.len),
             c.JS_PROP_C_W_E,
         );
@@ -2855,7 +2907,45 @@ pub fn installRequest(
         // [[Set]] no-ops); the bytes derive from the taped fetch response,
         // so no extra taping. JS_GetPropertyStr returns an owned ref that
         // Set/Define steals.
-        _ = c.JS_DefinePropertyValueStr(ctx, req_obj, "body", c.JS_GetPropertyStr(ctx, result, "body"), c.JS_PROP_C_W_E);
+        //
+        // Payload (§2.2): the envelope carries the response bytes as
+        // base64url-no-pad `body_b64` (a JSON envelope can't hold raw
+        // bytes — the old `body` string was a LOSSY TextDecoder of them).
+        // Decode once: `request.bytes` = the raw payload, `request.body`
+        // = the lenient text view (until its retirement). A legacy
+        // envelope with only a `body` string still works — bytes derive
+        // from its UTF-8.
+        var payload_done = false;
+        const b64_val = c.JS_GetPropertyStr(ctx, result, "body_b64");
+        if (c.JS_IsString(b64_val)) b64: {
+            var b64_len: usize = 0;
+            const b64_c = c.JS_ToCStringLen(ctx, &b64_len, b64_val);
+            if (b64_c == null) break :b64;
+            defer c.JS_FreeCString(ctx, b64_c);
+            const b64_slice = @as([*]const u8, @ptrCast(b64_c))[0..b64_len];
+            const dec = std.base64.url_safe_no_pad.Decoder;
+            const raw_len = dec.calcSizeForSlice(b64_slice) catch break :b64;
+            const raw = state.allocator.alloc(u8, raw_len) catch break :b64;
+            defer state.allocator.free(raw);
+            dec.decode(raw, b64_slice) catch break :b64;
+            _ = c.JS_DefinePropertyValueStr(ctx, req_obj, "bytes", c.JS_NewUint8ArrayCopy(ctx, raw.ptr, raw.len), c.JS_PROP_C_W_E);
+            _ = c.JS_DefinePropertyValueStr(ctx, req_obj, "body", textcodec_b.lenientUtf8JsString(state.allocator, ctx, raw), c.JS_PROP_C_W_E);
+            payload_done = true;
+        }
+        c.JS_FreeValue(ctx, b64_val);
+        if (!payload_done) {
+            _ = c.JS_DefinePropertyValueStr(ctx, req_obj, "body", c.JS_GetPropertyStr(ctx, result, "body"), c.JS_PROP_C_W_E);
+            const legacy_body = c.JS_GetPropertyStr(ctx, result, "body");
+            if (c.JS_IsString(legacy_body)) {
+                var lb_len: usize = 0;
+                const lb_c = c.JS_ToCStringLen(ctx, &lb_len, legacy_body);
+                if (lb_c != null) {
+                    defer c.JS_FreeCString(ctx, lb_c);
+                    _ = c.JS_DefinePropertyValueStr(ctx, req_obj, "bytes", c.JS_NewUint8ArrayCopy(ctx, @ptrCast(lb_c), lb_len), c.JS_PROP_C_W_E);
+                }
+            }
+            c.JS_FreeValue(ctx, legacy_body);
+        }
         _ = c.JS_SetPropertyStr(ctx, req_obj, "status", c.JS_GetPropertyStr(ctx, result, "status"));
         _ = c.JS_SetPropertyStr(ctx, req_obj, "ok", c.JS_GetPropertyStr(ctx, result, "ok"));
         _ = c.JS_SetPropertyStr(ctx, req_obj, "done", js_true);
@@ -3107,8 +3197,30 @@ fn jsBodyGetter(
     const state = getState(ctx);
     if (state.readset) |rs| rs.body_read = true;
     recordRequestRead(state, .body_read, "", "");
-    const body_val = c.JS_NewStringLen(ctx, state.req_body.ptr, state.req_body.len);
+    // Lenient WHATWG semantics (invalid UTF-8 → U+FFFD) — the same rule
+    // as `request.text`; bare JS_NewStringLen would silently fall back
+    // to latin-1 byte semantics (handler-api-ergonomics-plan C6).
+    const body_val = textcodec_b.lenientUtf8JsString(state.allocator, ctx, state.req_body);
     return selfReplaceWithValue(ctx, this_val, "body", body_val);
+}
+
+/// `request.bytes` accessor (plain inbound only — the other payload
+/// kinds define `bytes` as a data property at install): same
+/// read-recording as `jsBodyGetter` — the two record the SAME body-read
+/// fact, so reading either (or both) keeps the tape/log body reference
+/// alive exactly once — then self-replaces with a Uint8Array of the raw
+/// payload (handler-api-ergonomics-plan §2.2).
+fn jsBytesGetter(
+    ctx: ?*c.JSContext,
+    this_val: c.JSValue,
+    magic: c_int,
+) callconv(.c) c.JSValue {
+    _ = magic;
+    const state = getState(ctx);
+    if (state.readset) |rs| rs.body_read = true;
+    recordRequestRead(state, .body_read, "", "");
+    const bytes_val = c.JS_NewUint8ArrayCopy(ctx, state.req_body.ptr, state.req_body.len);
+    return selfReplaceWithValue(ctx, this_val, "bytes", bytes_val);
 }
 
 /// `request.cookies` accessor: counts as a read of the whole

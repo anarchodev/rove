@@ -44,7 +44,7 @@ export default function () {
 // Per intermediate upstream chunk on a bound, streaming fetch. The
 // terminal event dispatches to onFetchDone (handler-shape.md §3).
 export function onFetchChunk() {
-    const text = new TextDecoder().decode(request.body);
+    const text = request.text;
     // Headers ride only on the first activation (ignored once the head
     // is committed).
     response.headers = { "content-type": "text/plain" };

@@ -214,10 +214,24 @@ smokes that touch the changed surface).
   caller the new strictness catches.
 - **Phase 2 — payload accessors.** `request.bytes`/`.text`/`.json` on
   every payload activation; result bodies ride as bytes end-to-end
-  (`webhook_onresult.mjs` stops decoding; `blob.put` results carry the
-  body); WS `onMessage` gains the accessors; `request.body` retired;
-  first-party shims/handlers migrated off `TextDecoder` boilerplate;
-  latin-1 fallback retired with it.
+  (`webhook_onresult.mjs` carries base64url `body_b64` — the JSON
+  envelope can't hold raw bytes; `blob.put` results carry the body);
+  WS `onMessage` gains the accessors; first-party shims/handlers
+  migrated off `TextDecoder` boilerplate; latin-1 fallback retired.
+  Implementation notes (as-built): `bytes` is the only per-kind Zig
+  materialization (a read-recording accessor on plain inbound, a data
+  property on chunk/fetch/ws/send_callback); `text`/`json` derive on a
+  shared prototype (`globals/request.js`, `__rove_request_proto`) so
+  they are snapshot-baked. The held-sync positional
+  `onResult(ctx, outcome)` consumers read `outcome.body`, so the
+  send envelope carries BOTH `body_b64` and the text `body` until the
+  Phase-3 sweep revisits that surface. **`request.body` retirement is
+  deferred to a coordinated cross-repo step** — rewind-apps handlers
+  read it, and the replay/sim driver (arenajs shell + rewind-apps
+  porcelain) builds its own `request` object, which must grow the
+  accessor parity BEFORE first-party code depends on `.text`/`.json`
+  under replay (`scripts/sim/example/handler.mjs` deliberately not
+  migrated for this reason).
 - **Phase 3 — grammar sweep.** `on.*` → `after.*` (+ `after.ms`),
   universal `{on}`, `scheduler.after` → `scheduler.in`,
   `webhook.send(url, opts)`, id-prefix + camelCase + one-ctx + blob
@@ -239,6 +253,10 @@ smokes that touch the changed surface).
    ctx smuggled in a JSON body) is internal-only today; unify it with
    the bound shape when it next needs touching — not part of this
    sweep.
+4. Replay/sim driver parity for `request.bytes`/`.text`/`.json` (the
+   arenajs replay shell + rewind-apps porcelain synthesize `request`
+   from the tape) — required before the `request.body` retirement and
+   before shims that run under replay lean on the accessors.
 
 ## 5. Not changing
 

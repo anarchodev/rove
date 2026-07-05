@@ -41,7 +41,7 @@ export default function () {
 }
 
 export function onFetchChunk() {
-    const text = new TextDecoder().decode(request.body);
+    const text = request.text;
     const prev = kv.get("spoolsink/full") || "";
     kv.set("spoolsink/full", prev + text);
     // Stay parked as a cont — forces a raft round-trip per chunk.

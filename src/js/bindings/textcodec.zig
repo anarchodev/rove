@@ -93,6 +93,25 @@ pub fn jsTextDecode(
     return c.JS_NewStringLen(ctx, sanitized.ptr, sanitized.len);
 }
 
+/// Build a JS string from arbitrary bytes with WHATWG-lenient UTF-8
+/// semantics (invalid sequences → U+FFFD) — the `request.text` /
+/// `request.body` presentation rule (handler-api-ergonomics-plan §2.2;
+/// bare `JS_NewStringLen` on malformed UTF-8 falls back to latin-1
+/// byte semantics, which is neither WHATWG nor documented behavior).
+pub fn lenientUtf8JsString(
+    allocator: std.mem.Allocator,
+    ctx: ?*c.JSContext,
+    bytes: []const u8,
+) c.JSValue {
+    if (bytes.len == 0) return c.JS_NewStringLen(ctx, "", 0);
+    if (std.unicode.utf8ValidateSlice(bytes)) {
+        return c.JS_NewStringLen(ctx, bytes.ptr, bytes.len);
+    }
+    const sanitized = sanitizeUtf8(allocator, bytes) catch return c.JS_ThrowOutOfMemory(ctx);
+    defer allocator.free(sanitized);
+    return c.JS_NewStringLen(ctx, sanitized.ptr, sanitized.len);
+}
+
 const REPLACEMENT = "\xef\xbf\xbd"; // U+FFFD as UTF-8
 
 /// Replace every invalid sequence with U+FFFD (one replacement per

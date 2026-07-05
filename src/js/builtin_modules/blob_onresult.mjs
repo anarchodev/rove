@@ -49,9 +49,17 @@ export default function () {
     }
 
     if (on_result) {
+        // body_b64: the PUT response bytes (previously dropped — the
+        // blob.put on_result surface carried no body at all;
+        // handler-api-ergonomics-plan §2.2).
         return __rove_next(on_result, {
             ctx: {
-                result: { hash: hash, ok: ok, status: status },
+                result: {
+                    hash: hash,
+                    ok: ok,
+                    status: status,
+                    body_b64: (a.kind === "fetch_chunk") ? base64url.encode(a.bytes) : "",
+                },
                 context: context,
             },
         });

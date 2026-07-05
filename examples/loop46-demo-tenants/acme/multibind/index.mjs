@@ -50,7 +50,7 @@ export default function () {
 
 export function onFetchChunk() {
     const fid = request.fetchId;
-    const text = new TextDecoder().decode(request.body);
+    const text = request.text;
     const prev = kv.get("mb/acc/" + fid) || "";
     kv.set("mb/acc/" + fid, prev + text);
     return next();

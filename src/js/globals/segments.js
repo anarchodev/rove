@@ -150,7 +150,7 @@ globalThis.segments = {
   slice(req) {
     if (!req || !req.ctx || typeof req.ctx.idx !== "number")
       throw new TypeError("segments.slice: not a segments.get resume");
-    const seg = JSON.parse(new TextDecoder().decode(req.body));
+    const seg = req.json;
     const v = seg.values[req.ctx.idx];
     if (v === undefined)
       throw new RangeError("segments.slice: segment does not contain seq " + req.ctx.seq);

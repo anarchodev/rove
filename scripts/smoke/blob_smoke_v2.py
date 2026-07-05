@@ -62,9 +62,7 @@ export default function () {
 
 export function onBlob() {
   if (!request.done) return next();
-  const body = request.body instanceof Uint8Array
-    ? new TextDecoder().decode(request.body)
-    : String(request.body ?? "");
+  const body = request.text || "";
   if (request.status !== 200) {
     response.status = 502;
     return "blob.get failed: " + request.status;

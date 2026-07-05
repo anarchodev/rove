@@ -1372,6 +1372,180 @@ test "dispatch: next({ctx}) with unserializable ctx throws, absent ctx stays leg
     try testing.expectEqualStrings("threw", resp.body);
 }
 
+// ── handler-api-ergonomics-plan Phase 2 — the uniform payload surface ──
+
+test "dispatch: request.bytes/.text/.json on plain inbound (§2.2)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var resp = try runOne(
+        &d,
+        kv,
+        \\const b = request.bytes;
+        \\if (!(b instanceof Uint8Array)) return "not-bytes";
+        \\if (request.text !== '{"a":1}') return "text-mismatch: " + request.text;
+        \\if (request.json.a !== 1) return "json-mismatch";
+        \\if (request.body !== request.text) return "body-text-diverge";
+        \\return "ok:" + b.length;
+    ,
+        .{ .method = "POST", .path = "/", .body = "{\"a\":1}" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings("ok:7", resp.body);
+}
+
+test "dispatch: invalid UTF-8 inbound body reads lenient U+FFFD, bytes stay raw (C6)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var resp = try runOne(
+        &d,
+        kv,
+        \\const cp = request.body.charCodeAt(2).toString(16);
+        \\return request.body.length + ":" + cp + ":" + request.bytes[2];
+    ,
+        .{ .method = "POST", .path = "/", .body = "hi\xffbye" },
+    );
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    // 6 chars with a U+FFFD at index 2; the raw byte stays 0xff (255).
+    try testing.expectEqualStrings("6:fffd:255", resp.body);
+}
+
+test "dispatch: send_callback body_b64 → byte-true request.bytes + text request.body (§2.2)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    // body_b64 "aAD_" = bytes [0x68, 0x00, 0xff] (base64url, no pad) —
+    // a payload the old lossy string channel could not carry.
+    var resp = try runOne(&d, kv,
+        \\const b = request.bytes;
+        \\if (!(b instanceof Uint8Array)) return "not-bytes";
+        \\if (b.length !== 3 || b[0] !== 104 || b[1] !== 0 || b[2] !== 255) return "bytes-wrong";
+        \\if (typeof request.body !== "string") return "body-not-string";
+        \\if (request.text.length !== 3) return "text-wrong";
+        \\return "ok:" + request.status + ":" + request.ctx.o;
+    , .{
+        .method = "POST",
+        .path = "/_result",
+        .activation = .send_callback,
+        .trace = .{ .request_id = 1 },
+        .body =
+        \\{"ctx":{"result":{"id":"abc","ok":true,"status":200,"body_b64":"aAD_","body":"h","headers":{},"body_truncated":false,"attempts":1,"error":null},"context":{"o":1}}}
+        ,
+    });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings("ok:200:1", resp.body);
+}
+
+test "dispatch: send_callback legacy body-only envelope still yields bytes (§2.2)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var resp = try runOne(&d, kv,
+        \\if (request.body !== "PONG") return "body-wrong";
+        \\const b = request.bytes;
+        \\if (!(b instanceof Uint8Array) || b.length !== 4) return "bytes-wrong";
+        \\return "ok:" + request.text;
+    , .{
+        .method = "POST",
+        .path = "/_result",
+        .activation = .send_callback,
+        .trace = .{ .request_id = 1 },
+        .body =
+        \\{"ctx":{"result":{"id":"abc","ok":true,"status":200,"body":"PONG","headers":{},"body_truncated":false,"attempts":1,"error":null},"context":null}}
+        ,
+    });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings("ok:PONG", resp.body);
+}
+
+test "dispatch: no payload surface on a durable_wake activation (§2.2)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    // A wake's Request.body is internal plumbing (or empty) — it must
+    // NOT leak through the payload surface.
+    var resp = try runOne(&d, kv,
+        \\return [typeof request.bytes, typeof request.text, typeof request.json].join(",");
+    , .{
+        .method = "POST",
+        .path = "/_wake",
+        .activation = .{ .durable_wake = .{ .id = "sched1", .scheduled_at_ns = 1, .msg_json = "null" } },
+        .trace = .{ .request_id = 1 },
+    });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings("undefined,undefined,undefined", resp.body);
+}
+
+test "dispatch: ws_message frame payload on request.bytes/.text (§2.2)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var outcome = try runOneOutcome(&d, kv,
+        \\const b = request.bytes;
+        \\if (!(b instanceof Uint8Array) || b.length !== 5) return "bytes-wrong";
+        \\if (request.text !== "hello") return "text-wrong";
+        \\if (request.activation.data !== "hello") return "data-wrong";
+        \\return "ok";
+    , .{
+        .method = "GET",
+        .path = "/_ws",
+        .activation = .{ .ws_message = .{ .opcode = 1, .data = "hello" } },
+        .trace = .{ .request_id = 1 },
+    });
+    switch (outcome) {
+        .terminal => |*r| {
+            defer r.deinit(testing.allocator);
+            try testing.expectEqualStrings("", r.exception);
+            try testing.expectEqualStrings("ok", r.body);
+        },
+        .continuation => |*cont| {
+            cont.deinit(testing.allocator);
+            return error.TestExpectedTerminal;
+        },
+        .stream => |*s| {
+            s.deinit(testing.allocator);
+            return error.TestExpectedTerminal;
+        },
+        .no_onheaders, .no_onchunk => return error.TestExpectedTerminal,
+    }
+}
+
 test "dispatch: kv.set rejects platform-reserved prefixes" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

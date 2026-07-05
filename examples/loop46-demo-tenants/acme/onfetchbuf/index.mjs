@@ -30,5 +30,5 @@ export default function () {
 // The whole upstream body arrives here in one activation.
 export function onFetchResult() {
     response.status = 200;
-    return new TextDecoder().decode(request.body);
+    return request.text;
 }

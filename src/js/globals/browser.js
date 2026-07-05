@@ -55,13 +55,10 @@
     message(request) {
       const a = request && request.activation;
       if (!a || a.kind !== "ws_message") return null;
-      let raw = a.data;
+      // The uniform payload surface: `request.text` is the frame text
+      // regardless of opcode (handler-api-ergonomics-plan §2.2).
+      const raw = request.text;
       if (raw == null) return null;
-      if (typeof raw !== "string") {
-        // Agent frames are JSON text frames; binary is unexpected.
-        if (typeof TextDecoder === "undefined") return null;
-        try { raw = new TextDecoder().decode(raw); } catch (_) { return null; }
-      }
       try { return JSON.parse(raw); } catch (_) { return null; }
     },
 
@@ -246,11 +243,8 @@
      * @returns {{records: Array, next_cursor: object|null}}
      */
     replayResult(request) {
-      let raw = request && request.body;
+      const raw = request && request.text;
       if (raw == null) return { records: [] };
-      if (typeof raw !== "string") {
-        try { raw = new TextDecoder().decode(raw); } catch (_) { return { records: [] }; }
-      }
       try {
         const o = JSON.parse(raw);
         return { records: o.records || [], next_cursor: o.next_cursor || null };

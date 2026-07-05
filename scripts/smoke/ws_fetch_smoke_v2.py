@@ -57,7 +57,7 @@ export function onMessage() {
 export function onUpstream() {
   // Bound-fetch surface: bytes on request.body, status/done at top level.
   if (!request.done) return next();
-  const body = request.body ? new TextDecoder().decode(request.body) : "";
+  const body = request.text || "";
   stream.write("fetched:" + request.status + ":" + body);
   return next();
 }

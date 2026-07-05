@@ -64,7 +64,16 @@ export default function () {
 
     // Result shape — handed to __rove_next as {ctx:{result, context}};
     // the runtime then flattens it onto the customer's on_result request
-    // surface (request.body/.status/.ok + request.ctx; globals.zig).
+    // surface (request.bytes/.body/.status/.ok + request.ctx;
+    // globals.zig). The response bytes ride base64url-encoded
+    // (`body_b64`) — the JSON envelope can't carry raw bytes, and a
+    // TextDecoder'd string alone silently corrupts binary responses
+    // (handler-api-ergonomics-plan §2.2). `body` (the lenient text
+    // view) rides alongside for the §6.4 held-sync positional
+    // `onResult(ctx, outcome)` consumers, which read `outcome.body`.
+    const body_b64 = (a.kind === "fetch_chunk")
+        ? base64url.encode(a.bytes)
+        : base64url.encode(ctx.result_body || "");
     const body_text = (a.kind === "fetch_chunk")
         ? new TextDecoder().decode(a.bytes)
         : (ctx.result_body || "");
@@ -79,6 +88,7 @@ export default function () {
         id: id,
         ok: result_ok && result_status < 400,
         status: result_status,
+        body_b64: body_b64,
         body: body_text,
         headers: result_headers,
         body_truncated: result_truncated,
@@ -138,6 +148,7 @@ export default function () {
         id: id,
         ok: result.ok,
         status: result.status,
+        body_b64: result.body_b64,
         body: result.body,
         headers: result.headers,
         body_truncated: result.body_truncated,
