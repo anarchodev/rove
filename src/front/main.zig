@@ -618,6 +618,15 @@ pub fn main() !void {
     defer if (front_metrics_srv) |ms| ms.deinit();
     var last_metrics_ns: i128 = 0;
 
+    // Graceful drain budget (plan C10): after SIGTERM/SIGINT, GOAWAY
+    // live conns and keep serving until in-flight flows finish or this
+    // deadline fires — a rolling restart stops costing every in-flight
+    // request a mid-response cut. 0 = exit immediately (old behavior).
+    // Long-lived held streams (SSE/WS tunnels) intentionally don't pin
+    // the drain past the deadline. Keep it below the supervisor's kill
+    // timeout (systemd TimeoutStopSec default 90s).
+    const drain_ms = envMs("REWIND_FRONT_DRAIN_TIMEOUT_MS", 10_000);
+
     while (!stop_flag.load(.acquire)) {
         server.pollWithTimeout(10 * std.time.ns_per_ms) catch |err| switch (err) {
             error.SignalInterrupt => continue,
@@ -654,6 +663,29 @@ pub fn main() !void {
             diag_prev_admission = s.admission_denied;
             diag_last_ns = now;
         }
+    }
+
+    // ── Graceful drain (plan C10) ─────────────────────────────────────
+    // GOAWAY every live server conn and keep the poll loop + proxy
+    // running until in-flight work finishes or the budget fires.
+    // `drainServerConns` re-runs each iteration so a connection
+    // accepted mid-drain is drained too (there is no stop-accept API;
+    // the window is one GOAWAY round-trip).
+    if (drain_ms > 0 and (proxy.live_flows > 0 or proxy.live_tunnels > 0)) {
+        std.log.info("rewind-front: draining {d} flow(s) / {d} tunnel(s) (budget {d}ms)", .{
+            proxy.live_flows, proxy.live_tunnels, drain_ms,
+        });
+        const drain_deadline = std.time.nanoTimestamp() + drain_ms * std.time.ns_per_ms;
+        while (std.time.nanoTimestamp() < drain_deadline and
+            (proxy.live_flows > 0 or proxy.live_tunnels > 0))
+        {
+            server.drainServerConns(@intCast(2 * std.time.ns_per_s)) catch break;
+            server.pollWithTimeout(10 * std.time.ns_per_ms) catch break;
+            proxy.run(std.time.nanoTimestamp()) catch break;
+        }
+        std.log.info("rewind-front: drain done ({d} flow(s) / {d} tunnel(s) left)", .{
+            proxy.live_flows, proxy.live_tunnels,
+        });
     }
     std.log.info("rewind-front: shut down", .{});
 }

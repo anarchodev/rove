@@ -5186,6 +5186,60 @@ pub fn H2(comptime opts: Options) type {
             }
         }
 
+        /// Graceful shutdown drain (front-door hardening plan C10):
+        /// close ACTIVE server connections out from under waiting
+        /// clients GRACEFULLY so a rolling restart stops cutting
+        /// in-flight requests. h2: queue a GOAWAY (in-flight streams
+        /// finish; `grace_ns` bounds a dawdling peer before
+        /// `driveAllSends` force-destroys). h1 (no GOAWAY exists):
+        /// a conn idle BETWEEN requests is destroyed now (the kernel
+        /// flushes queued response bytes on the graceful close);
+        /// a conn mid-request gets `keep_alive = false` so its
+        /// response carries `Connection: close` and the NEXT sweep
+        /// destroys it. WS-mode h1 conns are left to the caller's
+        /// drain deadline. Idempotent — the caller re-invokes each
+        /// drain-loop iteration, which also covers connections
+        /// accepted after the first sweep.
+        pub fn drainServerConns(self: *Self, grace_ns: u64) !void {
+            const entities = self._conn_active.entitySlice();
+            const now = monotonicNs();
+            for (entities) |ent| {
+                if (self.reg.isStale(ent)) continue;
+                const conn_ptr = self.reg.get(ent, &self._conn_active, Conn) catch continue;
+                if (conn_ptr.direction != .server) continue;
+                if (conn_ptr.ng_session) |ng| {
+                    if (conn_ptr.draining) continue;
+                    _ = c.nghttp2_session_terminate_session(ng, c.NGHTTP2_NO_ERROR);
+                    conn_ptr.draining = true;
+                    conn_ptr.drain_deadline_ns = now + grace_ns;
+                } else if (conn_ptr.h1) |h1c| {
+                    if (h1c.ws_mode) continue;
+                    // Destroyable: idle between requests, or `closing`
+                    // (response served, Connection: close — that path
+                    // never resets `in_flight`; it normally waits for
+                    // the idle GC, far beyond a drain budget). The
+                    // 500 ms quiet window (last_active is the last
+                    // READ; the response write follows within ms) lets
+                    // the final write reach the kernel before the
+                    // graceful close flushes it out.
+                    const quiet_ns: u64 = 500 * std.time.ns_per_ms;
+                    const idle_between = !h1c.in_flight and !h1c.body_active and
+                        !h1c.streaming and h1c.sending_entity.isNil();
+                    const close_pending = h1c.closing and h1c.sending_entity.isNil();
+                    if ((idle_between or close_pending) and
+                        conn_ptr.last_active_ns != 0 and
+                        now -| conn_ptr.last_active_ns > quiet_ns)
+                    {
+                        try self.reg.destroy(ent);
+                    } else if (!h1c.closing) {
+                        // Mid-request: the response will carry
+                        // Connection: close; a later sweep reaps it.
+                        h1c.keep_alive = false;
+                    }
+                }
+            }
+        }
+
         /// Idle-connection reaper. Runs in `pollPostlude` AFTER inbound
         /// reads have been fed to nghttp2 (`readsFeedData`) — so a
         /// request that just arrived on an idle connection has already
