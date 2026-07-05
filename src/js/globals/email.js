@@ -25,9 +25,10 @@ globalThis.email = {
    * @param {string} [opts.reply_to] - Reply-To address.
    * @param {string|string[]} [opts.cc] - CC recipient(s).
    * @param {string|string[]} [opts.bcc] - BCC recipient(s).
-   * @param {string} [opts.on_result] - Result handler module in this
-   *   tenant (forwarded to `webhook.send`).
-   * @param {*} [opts.context] - Echoed back on the result event.
+   * @param {string} [opts.on] - Result handler module in this tenant
+   *   (forwarded to `webhook.send`; `on_result` = dual-name-window alias).
+   * @param {*} [opts.ctx] - Echoed back as `request.ctx` on the result
+   *   event (`context` = window alias).
    * @param {number} [opts.max_attempts] - Override the built-in
    *   webhook.send retry budget (default 5).
    * @param {number} [opts.timeout_ms] - Per-attempt timeout.

@@ -3,7 +3,7 @@
 > **Status:** SHIPPED (2026-06-03). All phases of the implementation plan
 > landed (the plan doc is folded-and-deleted; this doc is the contract):
 > `on.*` connection wakes (Phase 1), the `stream.*` effect surface with
-> `__rove_stream` retired (Phase 2), `on.fetch` + `detach` + the customer
+> `__rove_stream` retired (Phase 2), `on.fetch` (now `after.fetch`) + `detach` + the customer
 > `http.fetch` spelling retired (Phase 3), named-export dispatch by
 > activation kind (Phase 4), and `schedule`/`cron` (Phase 5). It
 > supersedes the `__rove_stream` / `request.activation.kind`-switch
@@ -14,6 +14,21 @@
 > the ambient `next` verb; the §6 export-coverage validation is CLI-side
 > (static analysis over arenajs-WASM), backstopped at runtime by the
 > missing-`onWake` 404.
+>
+> **Revised 2026-07-05 (rev 3 — the ergonomics arc,
+> `plans/handler-api-ergonomics-plan.md`).** The grammar is
+> `after.*` (was `on.*`; `after.ms` was `on.timer`) with ONE
+> callback-target key — `{on: "module.method"}` — across every effect;
+> `webhook.send(url, opts)` takes a positional url; the durable
+> scheduler's delay verb is `scheduler.in`; the payload is uniform
+> `request.bytes`/`.text`/`.json` on every payload-carrying activation;
+> threaded context is `ctx` in / `request.ctx` out everywhere (one-ctx,
+> no exceptions); fetch ids are `ftch_…` on all three surfaces. The
+> pre-rename spellings (`on.*`, `{to}`, `{on_result}`/`{context}`,
+> `webhook.send({url})`, `scheduler.after`, `request.activation.msg`,
+> snake_case field aliases, `request.body`) remain live for ONE deploy
+> cycle only (the dual-name window — close checklist in the plan doc);
+> this document describes the canonical surface.
 >
 > **Revised 2026-06-02 (rev 2 — `stream.*` model).** Organized around one
 > axis — **scope: current-connection vs connectionless** — derived in
@@ -44,7 +59,7 @@ named export**. The runtime knows the full set of Msg variants
 | `case msg of` | the runtime's dispatch on activation kind → named export |
 | each `case` arm | each `export function on…` |
 | `Model` update | `kv.*` (read-your-writes within the activation) |
-| Side-effects (`Cmd`) | effects called in the body — connection (`stream.*`, `on.*`) + connectionless (`webhook.send`/`schedule`/`cron`), queued during the activation, fired post-commit |
+| Side-effects (`Cmd`) | effects called in the body — connection (`stream.*`, `after.*`) + connectionless (`webhook.send`/`schedule`/`cron`), queued during the activation, fired post-commit |
 | `Cmd Msg` disposition | the return value: `next(...)` or a terminal body |
 
 A module exports the subset of variants it cares about; the runtime
@@ -72,12 +87,12 @@ The whole surface is five roles:
 |---|---|---|
 | **Model** | `kv.get` / `kv.set` / `kv.delete` | — (read-your-writes; the Model half of `(Model, Cmd)`) |
 | **Connection output** | `stream.start()` / `stream.write(chunk)` | current connection (commit-gated effects) |
-| **Connection triggers** | `on.timer(ms)` / `on.kv(prefix,{to?})` / `on.fetch(url,opts?,{to?})` | current connection (ephemeral) |
+| **Connection triggers** | `after.ms(ms,{on?})` / `after.kv(prefix,{on?})` / `after.fetch(url,opts?,{on?})` | current connection (ephemeral) |
 | **Connectionless triggers** | `webhook.send` / `schedule` / `cron` | connectionless (durable, new request) |
 | **Disposition (return)** | `next({ctx?})` · terminal body / `""` | the only return shapes |
 
 The body **accumulates** the Cmd as you compute — `kv.*` builds the
-Model; `stream.*`, `on.*`, and the connectionless verbs are effects that
+Model; `stream.*`, `after.*`, and the connectionless verbs are effects that
 fire post-commit — and the **return value** picks the connection's
 disposition. Together that's the TEA pair `(Model', Cmd)`
 (`effect-algebra.md` §6 is the derivation; §1 the determinism invariant).
@@ -150,39 +165,43 @@ close with a terminal return:
 
 ```js
 stream.start();
-on.kv(`notif/${user}/`, { to: 'onNotify' });
+after.kv(`notif/${user}/`, { on: 'onNotify' });
 return next({ since });
 ```
 
 `stream` is **only** a namespace — `stream.start()` / `stream.write()`,
 never `return stream(...)`.
 
-### 2.3 Connection triggers — `on.*`
+### 2.3 Connection triggers — `after.*`
 
-`on.*` registers a wake **for the current connection** — body builder
+`after.*` registers a ONE-SHOT wake **for the current connection** — body builder
 calls that re-invoke a handler still holding the socket. Ephemeral
 (drop with the connection); node-local (never touch raft).
 
-- `on.timer(ms)` — wake after `ms`.
-- `on.kv(prefix, { to? })` — wake when any key under `prefix` changes
+- `after.ms(ms)` — wake after `ms` milliseconds. Named for its unit
+  (durations are always ms; there is deliberately no `after.seconds`
+  family — write `after.ms(5 * 60_000)`).
+- `after.kv(prefix, { on? })` — wake when any key under `prefix` changes
   **since the version this activation read** (anchored to the read view,
   so a write between "you read" and "you parked" still fires it, and the
   common "wait on a key, write it from a connectionless callback"
   pattern is lossless — `effect-algebra.md` §6.4).
-- `on.fetch(url, opts?, { to? })` — perform an outbound request and wake
+- `after.fetch(url, opts?, { on? })` — perform an outbound request and wake
   on its result (whole or chunked). Connection-scoped outbound; its
   durable twin is `webhook.send` (§2.4).
 
-`{ to: "module.method" }` routes the wake to a different export (still
-holding *this* connection). Without `to`, an `on.kv`/`on.timer` wake
-defaults to `onWake`; `on.fetch` to `onFetchResult`/`onFetchChunk` (§3).
+`{ on: "module.method" }` routes the wake to a different export (still
+holding *this* connection) — the UNIVERSAL callback-target key, the
+same spelling every effect takes. Without `on`, an `after.kv`/
+`after.ms` wake defaults to `onWake`; `after.fetch` to
+`onFetchResult`/`onFetchChunk`/`onFetchDone` by event shape (§3).
 
 ```js
-for (const room of request.ctx.rooms) on.kv(`rooms/${room}/`);  // dynamic sets are natural
+for (const room of request.ctx.rooms) after.kv(`rooms/${room}/`);  // dynamic sets are natural
 return next({ rooms: request.ctx.rooms });
 ```
 
-The runtime arms `on.*` wakes **before** firing any connectionless
+The runtime arms `after.*` wakes **before** firing any connectionless
 effects of the same activation, so a wake can't be missed even when a
 connectionless callback writes the key it watches (`effect-algebra.md`
 §6.4).
@@ -193,7 +212,7 @@ These create a **connectionless request** — a fresh, durable activation
 with no held socket. They survive leader changes, route by tenant, and
 run whether or not anyone is connected. Each names the export it invokes:
 
-- `webhook.send(url, { onResult: "module.method", … })` — durable
+- `webhook.send(url, { on: "module.method", … })` — durable
   outbound; run the target as a new request when it completes.
 - `schedule({ at } | { in }, "module.method", ctx?)` — run the target
   once, at a time.
@@ -201,12 +220,12 @@ run whether or not anyone is connected. Each names the export it invokes:
 
 A connectionless request can read/write `kv`, register more
 connectionless triggers, and do work — but it has **no connection**, so
-the disposition verbs and `stream.*` / `on.*` are **inert** there. To
+the disposition verbs and `stream.*` / `after.*` are **inert** there. To
 surface a connectionless result *to* a still-connected client, compose:
-the callback writes `kv`, the connection watches that key with `on.kv`
+the callback writes `kv`, the connection watches that key with `after.kv`
 (the SSE example, §5.7; the model, `effect-algebra.md` §6.5).
 
-> `subscribe.kv` (a runtime durable kv-react) is **deferred** — `on.kv`
+> `subscribe.kv` (a runtime durable kv-react) is **deferred** — `after.kv`
 > covers the connection case; no runtime durable kv-react for now.
 
 ### 2.5 The Model — `kv`
@@ -217,13 +236,13 @@ in the body because they're **read-your-writes**: `kv.set('x',1);
 kv.get('x')` returns `1` in the same activation (the kvexp overlay).
 That immediate visibility is why a write can't be deferred — it builds
 the Model the rest of the activation reads. The trigger/output effects
-(`stream.*`, `on.*`, connectionless), by contrast, never return a result
+(`stream.*`, `after.*`, connectionless), by contrast, never return a result
 into *this* activation — their results arrive as future Msgs — which is
 why they're Cmd-builders, not Model mutations.
 
 ### 2.6 The rule, and why there are no scope flags
 
-> **All wakes registered through `on.*` are for the current connection.
+> **All wakes registered through `after.*` are for the current connection.
 > Every other trigger creates a connectionless request.**
 
 Scope must be a *verb*, not a flag, because a connectionless trigger is
@@ -234,7 +253,7 @@ that lifecycle; flipping scope with a flag is the `bind` mistake the
 model retired (§6.3). So:
 
 - **`detach` is retired.** "A fetch that outlives my connection" is the
-  connectionless verb (`webhook.send`), not `on.fetch({ detach:true })`.
+  connectionless verb (`webhook.send`), not `after.fetch({ detach:true })`.
 - Connectionless work is **durable by default**; a connectionless-
   ephemeral fire-and-forget fast path is intentionally not offered until
   a real high-volume case demands it ([[feedback_model_simplicity_safety]]).
@@ -244,33 +263,33 @@ model retired (§6.3). So:
 | Activation | Export | Scope | When it fires |
 |---|---|---|---|
 | inbound HTTP (buffered) | `default` | connection | body ≤ 1 MB; > 1 MB → 413 if no `onChunk` |
-| inbound HTTP, headers-first | `onHeaders` | connection | SHIPPED 2026-06-10 (`architecture/routing-and-ingress.md`): module exports `onHeaders` → every body-carrying request dispatches it with an EMPTY body before any body byte is accepted (the client is flow-control-held at the door). Decide from headers alone: early 4xx terminal, or `blob.receive({to}) + next()` to pipe the body socket→storage with zero chunk activations — `{to}` resumes with `request.ctx = {hash, len}` when the object is durable. Uniform regardless of body timing or size |
+| inbound HTTP, headers-first | `onHeaders` | connection | SHIPPED 2026-06-10 (`architecture/routing-and-ingress.md`): module exports `onHeaders` → every body-carrying request dispatches it with an EMPTY body before any body byte is accepted (the client is flow-control-held at the door). Decide from headers alone: early 4xx terminal, or `blob.receive({on}) + next()` to pipe the body socket→storage with zero chunk activations — `{on}` resumes with `request.ctx = {hash, len}` when the object is durable. Uniform regardless of body timing or size |
 | inbound HTTP chunk | `onChunk` | connection | per chunk (≤ 1 MB → fires once with the whole body) |
-| `on.fetch` result | `onFetchResult` (or `to`) | connection | a connection `on.fetch` returned its whole body |
-| `on.fetch` chunk | `onFetchChunk` (or `to`) | connection | per chunk of a streamed `on.fetch` |
-| `on.fetch` end | `onFetchDone` (or `to`) | connection | a streamed `on.fetch` terminated |
-| `on.kv` / `on.timer` wake | `onWake` (or `to`) | connection | a connection wake fired (held socket) |
-| inbound WebSocket frame | `onMessage` | connection | per complete WS data message; `request.activation = { opcode, data }` (opcode 1 = text → string, 2 = binary → Uint8Array); `stream.write` replies (string → text frame, bytes → binary), `next()` parks for the next frame, a terminal return closes. Replies are strictly in message order, and a frame behind an in-flight durable write activates only after that write commits — so each frame reads its predecessors' writes (`architecture/websockets.md`, the input gate) |
+| `after.fetch` result | `onFetchResult` (or `to`) | connection | a connection `after.fetch` returned its whole body |
+| `after.fetch` chunk | `onFetchChunk` (or `to`) | connection | per chunk of a streamed `after.fetch` |
+| `after.fetch` end | `onFetchDone` (or `to`) | connection | a streamed `after.fetch` terminated |
+| `after.kv` / `after.ms` wake | `onWake` (or `to`) | connection | a connection wake fired (held socket) |
+| inbound WebSocket frame | `onMessage` | connection | per complete WS data message; the frame payload reads as `request.bytes`/`.text`/`.json` (§7); `request.activation = { opcode, data }` keeps the framing detail (opcode 1 = text → `data` is a string, 2 = binary → Uint8Array); `stream.write` replies (string → text frame, bytes → binary), `next()` parks for the next frame, a terminal return closes. Replies are strictly in message order, and a frame behind an in-flight durable write activates only after that write commits — so each frame reads its predecessors' writes (`architecture/websockets.md`, the input gate) |
 | held client disconnected | `onDisconnect` | connection | the held stream closed early — or the WS client closed / dropped |
-| `webhook.send` result | the `onResult` target | connectionless | a `webhook.send` completed |
+| `webhook.send` result | the `{on}` target | connectionless | a `webhook.send` completed |
 | `cron` / `schedule` fire | the named target | connectionless | scheduled time arrived |
 | subscription fire (generic) | `onSubscription` | connectionless | external push (atproto firehose, etc.) |
 
 The set of *kinds* is closed (runtime-defined). The `to:` option on
-`on.*` (and the target on the connectionless verbs) chooses **which
+`after.*` (and the target on the connectionless verbs) chooses **which
 export** a trigger's activation lands in; it does not invent a kind.
 
 > **Shipped (Phase 4 + finer conventions):** the runtime maps
 > `activation_source → export` when the resume path didn't name one.
-> `wake_batch` (`on.kv`/`on.timer`) → `onWake`; `disconnect` →
+> `wake_batch` (`after.kv`/`after.ms`) → `onWake`; `disconnect` →
 > `onDisconnect` (a missing `onDisconnect` is a no-op — cleanup is
 > optional).
 >
-> **`on.fetch` (bound, connection-scoped) now splits by event shape**
-> when no `{to}` is given: a non-streaming fetch (one `final` event with
+> **`after.fetch` (bound, connection-scoped) now splits by event shape**
+> when no `{on}` is given: a non-streaming fetch (one `final` event with
 > the whole body) → `onFetchResult`; a streaming fetch's intermediate
 > chunks (`final == false`) → `onFetchChunk`; its terminal event
-> (`final == true`) → `onFetchDone`. An explicit `{to}` overrides for
+> (`final == true`) → `onFetchDone`. An explicit `{on}` overrides for
 > every event of the fetch (the handler then branches on
 > `request.done`).
 >
@@ -285,7 +304,7 @@ export** a trigger's activation lands in; it does not invent a kind.
 > seed registrations from any handler activation — they are
 > idempotent by key and `_sched/*` entries are durable kv that survive
 > deploys.) `webhook.send` results route through the shim's named
-> `onResult`; an unnamed cross-module `next({module})` chain legitimately
+> `{on}` target; an unnamed cross-module `next({module})` chain legitimately
 > targets that module's `default`, so there is no forced `onSendCallback`
 > default.
 >
@@ -295,18 +314,18 @@ export** a trigger's activation lands in; it does not invent a kind.
 > `request.activation` alongside the wake / source payload (`wakes` /
 > `overflow` / `write_pressure` / `source`). The inbound-chunk
 > (`onChunk`) split in the table above is SHIPPED (gap 2.4,
-> 2026-06-10): `request.body` for a chunk activation is a
-> **Uint8Array** (chunks are arbitrary bytes — same posture as bound
-> fetch chunks), and `next({ctx})` between chunks surfaces as
+> 2026-06-10): a chunk activation's payload is arbitrary bytes — read
+> it as `request.bytes` (or `.text`/`.json`, same as every payload
+> surface, §7) — and `next({ctx})` between chunks surfaces as
 > `request.ctx` on the following chunk.
 
 The scope column is load-bearing: a **connection** activation runs with
-the held socket (it can call `stream.*`/`on.*` and return `next`/a
+the held socket (it can call `stream.*`/`after.*` and return `next`/a
 terminal); a **connectionless** activation has no socket (those are
 inert — it does `kv` + connectionless triggers + returns nothing). The
-default for `on.kv`/`on.timer` is one generic `onWake` because they're
+default for `after.kv`/`after.ms` is one generic `onWake` because they're
 *edge* wakes — "go look"; the handler re-queries state regardless of
-which fired (the SSE cursor pattern, §5.7). `on.fetch` keeps per-result
+which fired (the SSE cursor pattern, §5.7). `after.fetch` keeps per-result
 exports because it carries a payload.
 
 ### 3.1 Named-function RPC is handler JS (the `rpc` recipe)
@@ -315,13 +334,13 @@ The platform invokes **only** the activation's export (the table
 above). The former platform-level `?fn=name&args=…` query and
 `{"fn":…,"args":[…]}` POST-body dispatch are RETIRED (decisions.md
 §4.5): `request.query` and `request.body` are opaque payload the
-engine never interprets. Internal resume targeting (`{to}`,
-`next({fn})`, `onResult`) is first-class on the runtime's Request and
+engine never interprets. Internal resume targeting (`{on}`,
+`next({fn})`) is first-class on the runtime's Request and
 unaffected.
 
 A handler that wants named-function routing composes it from
 primitives — and because the shim reads `request.query` /
-`request.body` in JS, the dispatch inputs land on the replay tape like
+`request.text` in JS, the dispatch inputs land on the replay tape like
 every other read:
 
 ```js
@@ -336,9 +355,9 @@ function rpc(fns) {
       if (k === "fn" && v) fn = v;
       else if (k === "args" && v) { try { args = JSON.parse(v); } catch (_) {} }
     }
-    if (!fn && request.body) {
+    if (!fn && request.text) {
       try {
-        const b = JSON.parse(request.body);
+        const b = request.json;
         if (b && typeof b.fn === "string") { fn = b.fn; args = Array.isArray(b.args) ? b.args : []; }
       } catch (_) {}
     }
@@ -361,7 +380,8 @@ just belongs to the app now (the `__admin__` dashboard handler,
 ## 4. Buffered vs streaming inbound — the 1 MB ceiling
 
 **Any inbound HTTP request body ≤ 1 MB is delivered in a single
-`default` activation** with `request.body` containing the full bytes.
+`default` activation** with the full payload readable as
+`request.bytes` / `.text` / `.json` (§7).
 The common case never has to think about streaming.
 
 - **`default` only:** body ≤ 1 MB → one `default` activation; body > 1 MB
@@ -381,7 +401,7 @@ facing; the 64 KiB internal chunk size is implementation detail.
 
 ```js
 export default function () {
-  return process(request.body);                 // returns the body; status defaults to 200
+  return process(request.text);                // read the payload; status defaults to 200
 }
 ```
 
@@ -390,7 +410,7 @@ export default function () {
 ```js
 export default function () {
   if (!authorized(request.headers)) { response.status = 401; return 'unauthorized'; }
-  return process(request.body);
+  return process(request.text);
 }
 ```
 
@@ -398,8 +418,8 @@ export default function () {
 
 ```js
 export function onChunk() {
-  on.fetch(`${STORAGE_URL}/${request.headers['x-key']}?seq=${request.chunkSeq}`,
-           { method: 'PUT', body: request.body }, { to: 'onPut' });
+  after.fetch(`${STORAGE_URL}/${request.headers['x-key']}?seq=${request.chunkSeq}`,
+           { method: 'PUT', body: request.bytes }, { on: 'onPut' });
   if (request.done) { response.status = 201; return 'uploaded'; }
   return next();                                 // await the next inbound chunk
 }
@@ -414,14 +434,14 @@ export function onPut() {                        // each PUT result resumes here
 
 ```js
 export default function () {
-  on.fetch('https://upstream.example.com', { method: 'POST', body: request.body },
-           { to: 'onUpstream' });
+  after.fetch('https://upstream.example.com', { method: 'POST', body: request.bytes },
+           { on: 'onUpstream' });
   return next();                                 // held, uncommitted — status still open
 }
 
 export function onUpstream() {
   response.status = request.status;              // forward upstream's status verbatim
-  return request.body;
+  return request.bytes;                          // raw response bytes, forwarded verbatim
 }
 ```
 
@@ -433,13 +453,13 @@ abandoning it is correct.
 
 ```js
 export default function () {
-  on.fetch(LLM_URL, { method: 'POST', body: request.body }, { to: 'onUpstream' });
+  after.fetch(LLM_URL, { method: 'POST', body: request.bytes }, { on: 'onUpstream' });
   return next();                                 // hold the client; wait for the first chunk
 }
 
 export function onUpstream() {
   if (request.done) return "";                   // close the held response
-  stream.write(transform(request.body));         // emit a chunk (commits the head on first write)
+  stream.write(transform(request.bytes));        // emit a chunk (commits the head on first write)
   return next();
 }
 ```
@@ -448,68 +468,89 @@ export function onUpstream() {
 
 ```js
 export default function () {
-  webhook.send('https://billing.example.com/charge', { body: request.body, onResult: 'onCharge' });
+  webhook.send('https://billing.example.com/charge', { body: request.text, on: 'onCharge' });
   schedule({ in: '24h' }, 'sendReminder', { user: request.user });
   response.status = 202;
   return 'queued';                               // respond immediately; the above outlive this request
 }
 
-export function onCharge() {                      // connectionless on_result — no socket; does work, returns nothing
-  if (!request.ok) return;                        // delivery failed (request.ctx.error says why)
-  const charge = JSON.parse(request.body);        // the response on the flattened surface
-  kv.set(`charges/${charge.id}`, charge);
+export function onCharge() {                      // connectionless {on} callback — no socket; does work, returns nothing
+  if (!request.ok) return;                        // delivery failed (request.activation.error says why)
+  const charge = request.json;                    // the response payload, parsed (§7)
+  kv.set(`charges/${charge.id}`, JSON.stringify(charge));
 }
-
 ```
 
 ### 5.7 SSE notifications — connection + connectionless composed
 
+Notifications are written under zero-padded sequence keys —
+`notif/{user}/{seq:020}` — so ascending key order IS delivery order and
+the last-seen KEY is the cursor. `kv.prefix(prefix, cursor)` resumes
+after the cursor key.
+
 ```js
-// Connect (or reconnect via Last-Event-ID).
+const PAD = (n) => String(n).padStart(20, '0');
+
+// Connect (or reconnect via Last-Event-ID = the last seq delivered).
 export default function () {
   response.headers = { 'content-type': 'text/event-stream' };       // ambient head
-  const since = Number(request.headers['last-event-id'] ?? latestSeq(`notif/${user}/`));
+  const last = request.headers['last-event-id'];
+  const cursor = last ? `notif/${user}/${PAD(Number(last))}` : null;
   stream.start();                                                    // open the stream (fires onopen)
-  on.kv(`notif/${user}/`, { to: 'onNotify' });
-  return next({ since });
+  after.kv(`notif/${user}/`, { on: 'onNotify' });
+  return next({ cursor });
 }
 
-// Connection-held resume: drain everything since the cursor.
+// Connection-held resume: drain everything past the cursor key.
 export function onNotify() {
-  const rows = kv.range(`notif/${user}/`, { afterSeq: request.ctx.since });
-  on.kv(`notif/${user}/`, { to: 'onNotify' });                      // re-arm
-  for (const r of rows) stream.write(`id:${r.seq}\ndata:${r.value}\n\n`);
-  return next({ since: rows.length ? rows.at(-1).seq : request.ctx.since });
+  const rows = kv.prefix(`notif/${user}/`, request.ctx.cursor);
+  after.kv(`notif/${user}/`, { on: 'onNotify' });                    // re-arm
+  for (const r of rows) {
+    const seq = Number(r.key.slice(r.key.lastIndexOf('/') + 1));
+    stream.write(`id:${seq}\ndata:${r.value}\n\n`);
+  }
+  return next({ cursor: rows.length ? rows.at(-1).key : request.ctx.cursor });
 }
 
-// Connectionless cleanup — registered once (e.g. cron('0 3 * * *', 'gcNotifs')).
+// Connectionless cleanup — cron('0 3 * * *', 'gcNotifs'); each value
+// carries its write time, so retention is a scan-and-delete.
 export function gcNotifs() {
-  for (const r of kv.range(`notif/`, { olderThan: '7d' })) kv.delete(r.key);
+  const horizon = Date.now() - 7 * 24 * 3600 * 1000;
+  let cursor = null;
+  for (;;) {
+    const page = kv.prefix('notif/', cursor, 1000);
+    if (page.length === 0) break;
+    for (const r of page) if (JSON.parse(r.value).at < horizon) kv.delete(r.key);
+    cursor = page.at(-1).key;
+  }
 }
 ```
 
-`on.kv` (connection, ephemeral) waits for changes *since the read
-cursor*; each wake **range-drains** from the cursor (so coalesced wakes
-never lose notifications) and advances it in `ctx`. The notifications
-live in `kv` (durable) and the client's resume point is its
-`Last-Event-ID`, so a dropped connection just reconnects — no durable
-server-side connection state. (`effect-algebra.md` §6.5; retention
-bounds the reconnect-replay window.)
+`after.kv` (connection, ephemeral) waits for changes *since the read
+view*; each wake **drains the prefix past the cursor** (so coalesced
+wakes never lose notifications) and advances the cursor in `ctx`. The
+notifications live in `kv` (durable) and the client's resume point is
+its `Last-Event-ID`, so a dropped connection just reconnects — no
+durable server-side connection state. (`effect-algebra.md` §6.5;
+retention bounds the reconnect-replay window.)
 
 ### 5.8 Fan-in / join — wait for all, then combine
 
 ```js
 export default function () {
-  on.fetch(API_A, {}, { to: 'onResult' });       // fetchId: 'a'
-  on.fetch(API_B, {}, { to: 'onResult' });       // fetchId: 'b'
-  on.timer(30_000, { to: 'onTimeout' });          // deadline
-  return next({ a: null, b: null });              // uncommitted: response unknown until both land
+  const a = after.fetch(API_A, {}, { on: 'onResult' });   // returns the fetch id (`ftch_…`)
+  const b = after.fetch(API_B, {}, { on: 'onResult' });
+  after.ms(30_000, { on: 'onTimeout' });                  // deadline
+  return next({ a, b, got: {} });                         // uncommitted: response unknown until both land
 }
 
 export function onResult() {
-  const ctx = { ...request.ctx, [request.fetchId]: { status: request.status, body: request.body } };
-  if (ctx.a && ctx.b) return combine(ctx.a, ctx.b);
-  return next(ctx);                               // still waiting on the other
+  // request.fetchId is the SAME `ftch_…` string after.fetch returned.
+  const got = { ...request.ctx.got,
+                [request.fetchId]: { status: request.status, body: request.text } };
+  if (got[request.ctx.a] && got[request.ctx.b])
+    return combine(got[request.ctx.a], got[request.ctx.b]);
+  return next({ ...request.ctx, got });                   // still waiting on the other
 }
 
 export function onTimeout() { response.status = 504; return 'upstream timeout'; }
@@ -530,7 +571,7 @@ for building "a Playwright for LLMs" **scoped to the customer's own app**: the
 in-page SDK (`_static/rove-agent.js`) opens a held WebSocket, sends an enriched,
 pixel-free DOM/accessibility **snapshot** (`[ref] role "name" = value (state)`),
 and executes ref-targeted actions the handler sends back. The handler is the
-*brain wiring*, not the brain — the LLM call is the customer's own `on.fetch`
+*brain wiring*, not the brain — the LLM call is the customer's own `after.fetch`
 with their key; durable reasoning state lives in `kv` (the durable-brain /
 ephemeral-hands split). Scope is **same-origin only by construction** — an agent
 acting inside the customer's own page is ~equivalent to JS they could already
@@ -546,16 +587,16 @@ export function onMessage() {
   if (frame.t !== "snapshot") return next(ctx);           // result/bye/confirm_result
 
   browser.status("thinking…");
-  on.fetch(LLM_URL, { method: "POST", headers: authHeaders(),
+  after.fetch(LLM_URL, { method: "POST", headers: authHeaders(),
     body: JSON.stringify({ model, tools: browser.tools(),  // vendor-neutral action schema
       messages: history(ctx.sid).concat({ role: "user", content: browser.render(frame) }) }) },
-    { to: "onLLM" });                                      // binds to THIS held chain
-  return next(ctx);                                        // read-only turn — a writing frame can't bind on.fetch
+    { on: "onLLM" });                                      // binds to THIS held chain
+  return next(ctx);                                        // read-only turn — a writing frame can't bind after.fetch
 }
 
-export function onLLM() {                                  // flattened result surface (§7): request.body/.status/.done
+export function onLLM() {                                  // flattened result surface (§7): request.json/.status/.done
   if (!request.done || request.status >= 400) { browser.status("LLM error"); return next(request.ctx); }
-  const reply = JSON.parse(new TextDecoder().decode(request.body));
+  const reply = request.json;
   const action = pickAction(reply);                        // adapt the model's tool call → {op, ref, ...}
   if (!action) { browser.done(reply.text); return next(request.ctx); }
   if (isDestructive(action)) { browser.confirm({ id: action.id, prompt: "Allow?", action }); }
@@ -579,10 +620,10 @@ reads/writes and effects, status + timing — from the durable log so the brain
 can root-cause a wrong UI instead of guessing from the symptom. It's a brain
 tool (`browser.tools({replay:true})`): the model emits `getReplay`, the handler
 issues it from a **read-only** frame (a writing frame can't bind the fetch — same
-rule as `on.fetch`), and feeds the result back as the tool's result.
+rule as `after.fetch`), and feeds the result back as the tool's result.
 
 ```js
-browser.getReplay(request, { to: "onReplay" });   // read-only frame; then return next(...)
+browser.getReplay(request, { on: "onReplay" });   // read-only frame; then return next(...)
 export function onReplay() {                        // fetch callback (read-only)
   const text = browser.renderReplay(browser.replayResult(request));
   return callLLM(request.ctx.sid, toolResult(text), parkCtx);  // feed it back to the model
@@ -612,10 +653,10 @@ The loader validates `module.exports` against the activations the
 module's verbs could trigger (deploy-time warnings/errors, not
 request-time):
 
-- If a handler calls `webhook.send` and its `onResult` target is missing
+- If a handler calls `webhook.send` and its `{on}` target is missing
   → warn (result discarded).
-- If a handler calls `on.fetch` / `on.kv` / `on.timer` whose `to` target
-  (or the conventional export for its kind — `onFetchResult`,
+- If a handler calls `after.fetch` / `after.kv` / `after.ms` whose `{on}`
+  target (or the conventional export for its kind — `onFetchResult`,
   `onWake`, …) is not exported → warn (wake has nowhere to land).
 - If a handler calls `schedule` / `cron` whose target is missing → error
   (a connectionless trigger with no handler is dead on arrival).
@@ -633,37 +674,59 @@ activations" is structural (your prior `request` is gone when the next
 fires; the arena reset wipes it). Cross-activation connection state
 rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
 
-- **`default`:** `request.body`, `.headers`, `.method`, `.path`,
-  `.query`, `.cookies`, `.ip`, `.unmaskedIp()`.
-- **`onChunk`:** `request.body` = THIS chunk; `request.done`;
+- **The payload, uniformly (`bytes` / `text` / `json`):** every
+  activation that carries a payload — inbound `default`, an `onChunk`
+  chunk, a bound `after.fetch`/`blob.get` resume, a result callback,
+  a WS `onMessage` frame — presents it through the SAME three views:
+  **`request.bytes`** (Uint8Array, the raw payload), **`request.text`**
+  (lenient UTF-8 — invalid sequences decode as U+FFFD), and
+  **`request.json`** (`JSON.parse(request.text)`; throws on non-JSON —
+  a handler asking for JSON that isn't JSON is a real error). All
+  three derive from the same recorded bytes. On a payload-less
+  activation (wakes, `cron`/`schedule` targets, `onDisconnect`) all
+  three read `undefined`. `request.body` is the legacy spelling of
+  the text-or-bytes view (its type varied by activation kind) —
+  **deprecated; it is removed with the dual-name window** — new code
+  reads `bytes`/`text`/`json`.
+- **`default`:** the payload views above, plus `.headers`, `.method`,
+  `.path`, `.query`, `.cookies`, `.ip`, `.unmaskedIp()`.
+- **`onChunk`:** `request.bytes` = THIS chunk; `request.done`;
   `request.chunkSeq` (from 0).
 - **`next()` continuations — one ctx rule (`decisions.md §4.9`):** every
   activation that exists because a prior activation called `next({ctx})`
   reads that payload as **`request.ctx`** — `onMessage`, `onChunk`,
-  `onWake` (`on.kv`/`on.timer`), `onDisconnect`, a bound `on.fetch`/
-  `blob.get` resume, and an `on_result` callback, all the same way.
+  `onWake` (`after.kv`/`after.ms`), `onDisconnect`, a bound `after.fetch`/
+  `blob.get` resume, and a `webhook.send`-family `{on}` callback, all the same way.
   `request.ctx` is `undefined` on the **first** activation of a chain
-  (nothing threaded yet) and on a standalone scheduled `durable_wake`
-  (which carries `request.activation.msg`). `on.kv`/`on.timer` are edge
+  (nothing threaded yet). A `cron`/`schedule` target reads the payload
+  it was scheduled with as `request.ctx` too — the one-ctx rule has no
+  exceptions (`request.activation.msg` is the deprecated dual-name-
+  window alias). `after.kv`/`after.ms` are edge
   ("go look") wakes — they carry **no** matched key/value; `onWake`
   re-reads authoritative `kv`, and which keys fired is on
   `request.activation.wakes[]` if you need it.
-- **Fetch / effect results — one flattened surface:** a bound `on.fetch` /
+- **Fetch / effect results — one flattened surface:** a bound `after.fetch` /
   `blob.get` resume **and** a `webhook.send` / `blob.put` / `retry`
-  `on_result` callback (and a §6.4 held-sync resume) present the result
-  identically — the response bytes on **`request.body`** (the whole body
-  for a non-streamed fetch, this chunk for a streamed one), with
-  `request.status` / `request.ok` / `request.done` (+ `request.fetchId` /
-  `request.chunkSeq` for fetch chunks) at the **top level**; the threaded
-  ctx / echoed `context` on **`request.ctx`** (bare); and per-delivery
-  metadata (`attempts`, `error`, `id`, `headers`, blob `hash`) on
-  **`request.activation.*`**. There is **no `request.result`**. (Exception:
+  `{on}` callback (and a §6.4 held-sync resume) present the result
+  identically — the response payload on **`request.bytes`/`.text`/
+  `.json`** (the whole body for a non-streamed fetch, this chunk for a
+  streamed one), with `request.status` / `request.ok` / `request.done`
+  (+ `request.fetchId` / `request.chunkSeq` for fetch chunks) at the
+  **top level**; the threaded `ctx` on **`request.ctx`** (bare); and
+  per-delivery metadata (`attempts`, `error`, `id`, `headers`, blob
+  `hash`) on **`request.activation.*`**. `request.fetchId` is the SAME
+  opaque `ftch_…` string `after.fetch()` returned, so the two compare
+  equal. `request.fetchesPending` counts this chain's in-flight bound
+  fetches including this one — branch on
+  `request.done && request.fetchesPending === 1` for "last chunk of
+  the last fetch". There is **no `request.result`**. (Exception:
   `blob.seal`/`blob.receive` resume with the threaded `{hash, len}` on
   `request.ctx` — that *is* the ctx you threaded, not delivery metadata.)
-- **Connectionless fires** (`onSubscription`, a `cron`/
-  `schedule` target): origin-specific fields (`deploymentId`,
-  `request.activation.msg`, …) but **no** inbound HTTP `headers`/`body`,
-  and the connection verbs are inert (§2.4).
+- **Connectionless fires** (`onSubscription`, a `cron`/`schedule`
+  target): the scheduled payload on `request.ctx`, origin-specific
+  metadata on `request.activation.*` (`scheduledAtNs`, the schedule
+  `id`/`key`, a kv-react fire's `source`), but **no** inbound HTTP
+  `headers`/payload, and the connection verbs are inert (§2.4).
 
 ### 7.1 The request surface is read-recorded
 
@@ -684,12 +747,14 @@ data-minimization story, see `decisions.md` §4.6):
   (`request.auth = …` still works).
 - `request.cookies` materializes on first access; the access counts
   as reading the whole `cookie` header.
-- `request.body` is an accessor too. A body your handler never reads
-  is **absent from the replay record entirely** (storage/durability
-  is unaffected — only the log-side reference is elided). Chunk
-  activations are the exception: the chunk payload IS the activation's
-  Msg (a binary Uint8Array, §3), so it is always recorded — read or
-  not.
+- The payload views (`request.bytes` / `.text` / `.json`, and legacy
+  `request.body`) are accessors too, and record ONE shared body-read
+  fact — reading any (or several) of them records once. An inbound
+  body your handler never reads is **absent from the replay record
+  entirely** (storage/durability is unaffected — only the log-side
+  reference is elided). Chunk / fetch-result / WS activations are the
+  exception: their payload IS the activation's Msg (§3), so it is
+  always recorded — read or not.
 - `request.ip` is the **masked** client IP — IPv4 with the last octet
   zeroed (`203.0.113.0`), IPv6 truncated to /48 (`2001:db8:85a3::`) —
   derived from `cf-connecting-ip`, else the rightmost (edge-appended,
@@ -715,7 +780,7 @@ identity and intent:
   "name": "link-shortener",
   "version": "1.0.0",
   "config":   { "schema": { "API_KEY": { "type": "string" } } },
-  "effects":  { "declared": ["kv", "on.fetch"] },
+  "effects":  { "declared": ["kv", "after.fetch"] },
   "metadata": { "description": "…", "homepage": "…" }
 }
 ```
@@ -763,7 +828,7 @@ change (Hyrum's law). See `format-versioning-audit.md` §7.1/§7.3/§7.6.
   the activation-handler namespace; `onError` / `onPanic` are specifically
   reserved for a future uncaught-exception callback (§12 open question; today a
   throw → runtime 500). Don't export `onError`/`onPanic` for your own use.
-- **Effect option keys.** Every effect options object (`on.fetch`,
+- **Effect option keys.** Every effect options object (`after.fetch`,
   `webhook.send`, `http.subscribe`, `blob.*`, `email.send`, …) reserves keys
   beginning with `$` for future platform directives (e.g. a `$rewind` hint
   block). Unknown keys are ignored today — keep your own option keys to plain
@@ -794,15 +859,43 @@ change (Hyrum's law). See `format-versioning-audit.md` §7.1/§7.3/§7.6.
 
 ## 10. What's gone (vs prior streaming revisions)
 
+Ergonomics arc (2026-07-04/05; old spellings live for ONE deploy cycle —
+the dual-name window):
+
+- `on.*` → `after.*`; `on.timer(ms)` → `after.ms(ms)`
+- `{to}` / `{on_result}` / positional-only targets → the universal
+  `{on: "module.method"}` callback key (exception: `schedule`/`cron`
+  keep their positional target — the target IS the payload there)
+- `{context}` → `{ctx}`; `request.activation.msg` → `request.ctx`
+  (one-ctx, no exceptions)
+- `webhook.send({url, …})` → `webhook.send(url, opts)`
+- `scheduler.after` → `scheduler.in` ("after" is exclusively the
+  connection-wake namespace — the verb is the scope)
+- bare-hex fetch ids → `ftch_…` on all three surfaces (the
+  `after.fetch()` return, `request.fetchId`,
+  `request.activation.fetchId`)
+- snake_case handler-visible fields → camelCase (`bodyTruncated`,
+  `scheduledAtNs`, `activation.fetchId`)
+- per-surface `request.body` types → uniform `request.bytes`/`.text`/
+  `.json`; `request.body` deprecated (removed with the window)
+- `kind=boot` subscriptions + `onBoot` → retired outright (unused):
+  seed registrations from any handler activation — idempotent by key,
+  `_sched/*` entries are durable kv that survive deploys
+- `return Uint8Array` now ships raw bytes; `kv.set` takes primitives
+  only; `stream.write` takes string|Uint8Array only; a provided
+  unserializable `next({ctx})` throws (the fail-loud sweep, plan §2.1)
+
+Prior streaming revisions:
+
 - `request.activation.kind` switch → runtime dispatches by export name
 - `__rove_stream({…})` / the `stream` **return verb** → `stream.start()`
   / `stream.write()` **effects** (§2.2); `stream` is now a namespace
 - `__rove_next()` → `next()`
-- `stream({until})` → `on.*` builder calls (§2.3)
+- `stream({until})` → `after.*` builder calls (§2.3)
 - `return { status, headers, body }` → body-only return; the head is
   ambient `response.*` (matches the engine `extractResponseMetadata`)
 - `detach: true` → retired; connectionless outbound is `webhook.send`
-- `subscribe.kv` → deferred (`on.kv` covers the connection case)
+- `subscribe.kv` → deferred (`after.kv` covers the connection case)
 - the three-way inbound choice → "1 MB ceiling, above → 413 or `onChunk`"
 - `ctx.state` scratchpad → forbidden; durable state in `kv`, ephemeral
   connection state in `ctx`
@@ -812,7 +905,7 @@ change (Hyrum's law). See `format-versioning-audit.md` §7.1/§7.3/§7.6.
 - The engine model: pure function per activation, arena reset between
   activations, no closure smuggling
 - Effects-accumulate / return-disposition: effects (`kv`, `stream.*`,
-  `on.*`, connectionless) accumulate during the activation and fire
+  `after.*`, connectionless) accumulate during the activation and fire
   post-commit; the return declares the disposition
 - The one rule (`architecture/routing-and-ingress.md`): a chunk reaches the wire only
   after the activation that produced it has committed — `stream.write()`
@@ -823,11 +916,11 @@ change (Hyrum's law). See `format-versioning-audit.md` §7.1/§7.3/§7.6.
 
 ## 12. Open questions
 
-1. **`stream.*` / `on.*` as ambient namespaces vs imports.** Current:
+1. **`stream.*` / `after.*` as ambient namespaces vs imports.** Current:
    `stream`/`on`/`kv`/`response` are ambient (effects/state); only `next`
    (the return ctor) is imported. Keep that split?
-2. **Wake re-arm vs persist.** Current model re-declares `on.*` each
-   activation (self-cleaning; the SSE loop re-calls `on.kv`). Persistent
+2. **Wake re-arm vs persist.** Current model re-declares `after.*` each
+   activation (self-cleaning; the SSE loop re-calls `after.kv`). Persistent
    registration (cancel to stop) is the alternative — re-arm chosen for
    simplicity; revisit if a use case wants persistence.
 3. **`onError` / module-level state / strict mode.** Thrown exceptions →

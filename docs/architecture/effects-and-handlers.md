@@ -49,7 +49,7 @@ arm).
   fetch, by event shape), `onDisconnect` (client close), plus the connectionless
   origins (`onSubscription`; `onBoot` retired 2026-07-05, unused; the manifest cron subscription and its
   `onCron` export retired with durable-wake P5(b) — recurrence is the `cron()`
-  verb); the bound-fetch `{to}` override names its export directly.
+  verb); the bound-fetch `{on}` override names its export directly.
   `activationKindForExport` maps kind → export name.
 - **Return is a disposition**: a terminal body closes the interaction;
   `next({ctx?})` parks it for the next wake. The response head is the ambient
@@ -152,7 +152,7 @@ durable next-fire watermark per tenant; everything else is the baked
   (`flushFireFetches`, `proposeForgetfulWrites` / `proposeAndParkContResume`
   grew a `fetches_opt`) — before this, a fetch issued from a wake or chained
   activation was silently dropped, masked by the old owed sweep. One known
-  narrow gap: a connection-scoped `on.fetch` bind from a *writing* resume —
+  narrow gap: a connection-scoped `after.fetch` bind from a *writing* resume —
   warns loudly.
 - **Smokes**: `scripts/smoke/durable_wake_smoke_v2.py` (fire + 3-node leader-kill
   failover survival + msg-byte cap), `scripts/smoke/scheduler_heartbeat_smoke_v2.py`
@@ -193,10 +193,10 @@ S3 PUT lands. A body-durability `.failed` returns 503 and does **not** re-submit
   `serviceParkedStreams`/`resumeStream`) survived the surface redesign unchanged.
   WS frame output bypasses the bridge (`ws_frame_output`; chunks lower to
   `ws_send_in` instead).
-- **Auto-bind** (decisions.md §4.2): `on.fetch` is **connection-scoped by
-  construction** — a held handler's `on.fetch` binds to the held chain (no
-  opt-out flag; a non-held `on.fetch` is dropped inert). Results dispatch by
-  event shape when no `{to}` is given: whole body → `onFetchResult`, streaming
+- **Auto-bind** (decisions.md §4.2): `after.fetch` is **connection-scoped by
+  construction** — a held handler's `after.fetch` binds to the held chain (no
+  opt-out flag; a non-held `after.fetch` is dropped inert). Results dispatch by
+  event shape when no `{on}` is given: whole body → `onFetchResult`, streaming
   chunk → `onFetchChunk`, streaming terminal → `onFetchDone`
   (`UpstreamFetchEvent.resolvedExport`, `src/js/components.zig`). Registration
   happens at the **handler-success seam** (`worker_dispatch.zig`), the only

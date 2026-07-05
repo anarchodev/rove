@@ -99,11 +99,11 @@ threaded **ctx**. That tuple *is* a world.
 Dispatch is **activation-kind → named export**.
 
 **The resolved-export nuance (the thing that is easy to get wrong).** For a
-*callback/continuation* activation — an `on.fetch` result, a `{to}` override, a
+*callback/continuation* activation — an `after.fetch` result, a `{on}` override, a
 `webhook.send` `onResult` — the export is the **resolved name carried on the
 wake**, *not* derived from the activation kind:
 
-- `UpstreamFetchEvent.resolvedExport()` (`src/js/components.zig:377`): `{to}`
+- `UpstreamFetchEvent.resolvedExport()` (`src/js/components.zig:377`): `{on}`
   name if given, else `onFetchResult` (whole body) / `onFetchChunk`
   (intermediate) / `onFetchDone` (terminal) by event shape.
 - `defaultExportForKind()` (`src/js/rpc_dispatch.zig:63`) is only the
@@ -134,8 +134,8 @@ declares/captures:
 |---|---|---|
 | `inbound` (default) | `default` | `request.method/.path/.headers/.body/.cookies/.ip` (read-recorded) |
 | `inbound_chunk` | `onChunk` | this chunk's bytes (binary), `request.done`, `request.chunkSeq`, `request.ctx` |
-| `on.fetch` result/chunk/done | `onFetchResult`/`Chunk`/`Done` or `{to}` | flattened: `request.body` (bytes), `request.status/.ok/.done/.fetchId`, threaded `request.ctx`, `request.activation.*` metadata |
-| `on.kv`/`on.timer` wake | `onWake` or `{to}` | `request.ctx`; matched keys on `request.activation.wakes[]` (edge — "go look") |
+| `after.fetch` result/chunk/done | `onFetchResult`/`Chunk`/`Done` or `{on}` | flattened: `request.bytes`/`.text`/`.json`, `request.status/.ok/.done/.fetchId`, threaded `request.ctx`, `request.activation.*` metadata |
+| `after.kv`/`after.ms` wake | `onWake` or `{on}` | `request.ctx`; matched keys on `request.activation.wakes[]` (edge — "go look") |
 | `ws_message` | `onMessage` | `request.activation = {opcode, data}`, `request.ctx` |
 | `disconnect` | `onDisconnect` | `request.ctx` |
 | `durable_wake` / `cron` / `schedule` | the named target | `request.activation.msg`; no inbound headers/body; connection verbs inert |
@@ -175,12 +175,12 @@ every activation runnable. Three gaps, in priority order:
   it. *(Replay-side fix.)*
 - **G2 — `epilogue.exportForActivation` can't select the right export.** It
   lacks `fetch_chunk` (falls to `default`) and has no way to honor a resolved
-  export / `{to}`. *(Replay-side fix, but depends on G3 for the input.)*
+  export / `{on}`. *(Replay-side fix, but depends on G3 for the input.)*
 - **G3 — the resolved export (the dispatch target) is not persisted.** The
   `LogRecord` stores only the `ActivationSource` *kind* (`src/log/root.zig:386`);
-  `resolvedExport`'s discriminators (`stream`/`final`, the `{to}` `name`) live
-  only in the live event. The no-`{to}` fetch export is *derivable* from the
-  `fetch_responses` terminal flag, but a **`{to}` override is lost entirely**.
+  `resolvedExport`'s discriminators (`stream`/`final`, the `{on}` `name`) live
+  only in the live event. The no-`{on}` fetch export is *derivable* from the
+  `fetch_responses` terminal flag, but a **`{on}` override is lost entirely**.
   Faithful replay of callbacks therefore needs a **recording-side** change:
   persist the export actually invoked (it is an input per L3/§2.5). *(Recording-side fix.)*
 
@@ -189,7 +189,7 @@ data-path.** The driver gained decoders + install for `trigger_payload` (the
 `{"ctx": …}` envelope → `request.ctx`) and `fetch_responses` (→ the flattened
 `request.status/.ok/.done/.fetchId` + body), export-resolution by event shape,
 and `pull` carries the channels. That passed a *programmatic* fixture — but
-validating against a **real** `fetch_chunk` recording (a live `on.fetch` →
+validating against a **real** `fetch_chunk` recording (a live `after.fetch` →
 `onFetchResult`, `scripts/smoke/replay_noninbound_smoke_v2.py`) refuted the
 assumption the fixture baked in:
 
@@ -225,7 +225,7 @@ the real tapes. Wired across **all three resume paths** — `resumeBoundFetchCha
 `resumeBoundFetchChainWs` (WS). Plus `pull` carries `fetch_responses` +
 `trigger_payload`, and `root.run` decodes them. **Validated end-to-end against a
 REAL recording** (`scripts/smoke/replay_noninbound_smoke_v2.py`): a live
-`on.fetch` → `onFetchResult` now tapes the fetch event and offline `rewind
+`after.fetch` → `onFetchResult` now tapes the fetch event and offline `rewind
 replay` reproduces `request.body` + `request.status`. `on_fetch_smoke_v2` and
 `ws_fetch_smoke_v2` confirm the effect paths are unregressed.
 
@@ -243,7 +243,7 @@ reproduces `request.activation.data` (asserted via the handler's `kv` write).
 resumes — `onWake`/`timer`/`onChunk` — already captured; they were never in this
 class.)
 
-Remaining: ~~(a) a `{to}` override is unrecorded (**G3**)~~ **FIXED** — the
+Remaining: ~~(a) a `{on}` override is unrecorded (**G3**)~~ **FIXED** — the
 resolved export (`ev.resolvedExport()`) now rides `TapePayloads.export_name`
 (recorded per fetch resume, emitted as the record's `export` field), `pull`
 carries it, and `root.run` prefers it over the event-shape derivation. So an
@@ -301,7 +301,7 @@ predicate `l3MissingChannel` has an inline unit test.
 Landed 2026-06-30: the declarative-world sim path (`world.zig`, the host's
 `.map` mode + miss policy, `runWorld`, `rewind sim`), now covering **all
 activation kinds** — a world declares the `activation` kind, the resolved
-`export` (the `{to}` / callback name), the threaded `ctx` (→ `request.ctx`), the
+`export` (the `{on}` / callback name), the threaded `ctx` (→ `request.ctx`), the
 flattened fetch/callback result (`request.status/.ok/.done/.fetchId/.chunkSeq`),
 and the `request.activation` metadata bag, per the §3 table. So G1/G2/G3 above
 constrain **replay** (captured worlds) only; **sim** of any activation needs no

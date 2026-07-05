@@ -93,15 +93,16 @@ globalThis.segments = {
    * @param {string} stream - Stream id.
    * @param {number} seq - Sequence number.
    * @param {object} [opts]
-   * @param {string} [opts.to] - Export resumed with the segment for
-   *   a sealed read. Required when the record may be sealed.
+   * @param {string} [opts.on] - Export resumed with the segment for
+   *   a sealed read. Required when the record may be sealed (`to` =
+   *   dual-name-window alias).
    * @returns {string|null|undefined} The value (hot), `null` (no
    *   such record), or `undefined` (sealed — the fetch is in flight,
    *   return `next()` and finish in `opts.to`).
    *
    * @example
    * export default function () {
-   *   const v = segments.get("room-7", 42, { to: "onSeg" });
+   *   const v = segments.get("room-7", 42, { on: "onSeg" });
    *   if (typeof v === "string") return v;          // hot
    *   if (v === null) { response.status = 404; return "gone"; }
    *   return next();                                 // sealed

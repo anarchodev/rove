@@ -1,10 +1,14 @@
 # Handler API ergonomics — one payload model, one grammar
 
-> **Status:** DRAFT (2026-07-04). Contract-change plan for the customer
-> handler surface (`handler-shape.md` is the contract this revises).
-> Pre-customer: every change here is a clean break, no compat shims
-> (per the no-pre-launch-back-compat rule). Phases land in order; each
-> phase leaves the tree green and the docs true.
+> **Status:** PHASES 1–4 LANDED (2026-07-05) on branch
+> `worktree-handler-api-ergonomics`; the DUAL-NAME WINDOW is OPEN —
+> remaining work is the rewind-apps migration + publish, then the
+> window-close checklist (Phase 3 as-built notes below) and the
+> `request.body` retirement (open question 4). Contract-change plan for
+> the customer handler surface (`handler-shape.md` is the contract this
+> revises, rewritten in Phase 4). Pre-customer: every change here is a
+> clean break; the one-deploy-cycle window is operational sequencing
+> across our own two repos, not customer back-compat.
 
 ## 0. Motivation
 
@@ -272,6 +276,18 @@ smokes that touch the changed surface).
   the new surface (including honest `kv.prefix` examples,
   `request.fetchesPending`, the §5.6/§5.9 fixes); `effect-algebra.md`
   §6 verb names; shim JSDoc; sibling docs per the docs-lag rule.
+  As-built (2026-07-05): handler-shape rev-3 status note + §2/§3/§5/§6/
+  §7/§10 rewritten (payload accessors are §7's lead; §5.7 SSE example
+  now uses real `kv.prefix` zero-padded-seq cursors; §5.6's
+  `request.ctx.error` and `JSON.parse(request.body)` bugs fixed;
+  `request.fetchesPending` documented; §10 lists the window). Docs
+  describe the CANONICAL surface only — the window is one status-note
+  paragraph, not a parallel reference. decisions.md gains ADR §4.11
+  (this arc + rejected alternatives); historical ADR entries keep
+  their period spellings. effect-algebra / architecture docs renamed
+  mechanically; shim JSDoc canonicalized with "window alias" notes.
+  `kv.range` stays unbuilt (§2.5 decision — examples rewritten
+  honestly instead).
 
 ## 4. Open questions
 

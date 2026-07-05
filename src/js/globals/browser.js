@@ -5,7 +5,7 @@
 // handler doesn't hand-roll frame JSON.
 //
 // It is the "hands/eyes wiring", NOT the brain: the LLM call stays the
-// customer's own `on.fetch`/`webhook.send` (their key), and durable
+// customer's own `after.fetch`/`webhook.send` (their key), and durable
 // loop state stays the customer's `kv`. Kept deliberately
 // vendor-neutral — `tools()` returns a generic action schema the
 // customer adapts to whatever model they drive (the reference handler
@@ -198,7 +198,7 @@
      * THIS handler's own tenant (it can't reach another tenant's logs).
      * The result wakes `opts.to`; the handler must `return next(...)`
      * after this to hold the connection across the round-trip — same
-     * shape as `on.fetch`.
+     * shape as `after.fetch`.
      *
      * Defaults to filtering by the engine per-connection session key
      * (`request.correlation_id`, indexed as the reserved `_corr` tag),
@@ -207,7 +207,7 @@
      * `request.tag("session", …)` value instead (survives reconnects).
      *
      * @param {object} request - the handler's `request`.
-     * @param {object} opts - `{to, since?, limit?, session?}`. `to` is the
+     * @param {object} opts - `{on, since?, limit?, session?}`. `on` is the
      *   callback export name (required); `since` an `after_received_ns`
      *   cursor; `limit` max records (default 50).
      * @returns {boolean} false if it couldn't issue (no tenant/connection).

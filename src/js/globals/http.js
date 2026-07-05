@@ -17,7 +17,7 @@
 
   /**
    * Held outbound subscriptions + fetch cancellation. The one-shot
-   * outbound primitives are {@link on.fetch} (connection-scoped — binds
+   * outbound primitives are {@link after.fetch} (connection-scoped — binds
    * to the held chain) and {@link webhook.send} (durable, connectionless);
    * the transient `http.fetch` spelling is retired. `http.subscribe`
    * remains for long-lived held outbound streams.
@@ -26,7 +26,7 @@
    */
   globalThis.http = {
     /**
-     * Cancel an in-flight fetch (an `on.fetch` id). No-op if it already
+     * Cancel an in-flight fetch (an `after.fetch` id — the `ftch_…` string it returned). No-op if it already
      * completed or was never issued. Cooperative: a chunk already
      * in flight at the engine may still land in `on_chunk` after
      * the cancel returns; track "we moved on" in your chain ctx

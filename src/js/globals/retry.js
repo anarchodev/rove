@@ -100,8 +100,8 @@ globalThis.retry = {
    *
    * @param {object} opts
    * @param {string} opts.url - Target URL.
-   * @param {string} opts.on_result_module - Result handler module
-   *   path in this tenant (non-empty).
+   * @param {string} opts.on - Result handler module path in this
+   *   tenant (non-empty; `on_result_module` = dual-name-window alias).
    * @param {number} [opts.max_attempts=1] - Total attempts incl. the
    *   first (positive integer).
    * @param {number|number[]} [opts.backoff_ms] - Constant delay, a
@@ -112,8 +112,8 @@ globalThis.retry = {
    * @param {string} [opts.body] - Request body.
    * @param {number} [opts.timeout_ms] - Per-request timeout.
    * @param {bigint} [opts.fire_at_ns] - Delay the first attempt.
-   * @param {*} [opts.context] - Echoed back (under your own keys;
-   *   `_retry` is reserved).
+   * @param {*} [opts.ctx] - Echoed back (under your own keys;
+   *   `_retry` is reserved; `context` = window alias).
    * @returns {string} The {@link webhook.send} schedule id.
    * @throws {TypeError} On missing/invalid `url`/`on_result_module`/
    *   `max_attempts`.

@@ -242,8 +242,8 @@ naming layer is the customer's kv (decisions.md §3.8). Engine pieces:
   collection, keyed `(tenant, correlation_id)`, **connection-scoped** — one
   implicit session per connection, abandoned on disconnect (pure RAM reclaim;
   nothing reaches storage before `seal`). `seal` hashes incrementally, returns
-  the hash synchronously, PUTs once through the door, and resumes `{to}` with
-  `request.ctx.hash`; the customer's `{to}` export writing its kv index *is*
+  the hash synchronously, PUTs once through the door, and resumes `{on}` with
+  `request.ctx.hash`; the customer's `{on}` export writing its kv index *is*
   the durability commit point.
 - **S3 multipart substrate** (`src/blob/s3.zig`): multipart verbs on a
   generalized `requestExt` (wire-encoded query signed verbatim so uploadId
@@ -264,7 +264,7 @@ naming layer is the customer's kv (decisions.md §3.8). Engine pieces:
   accepted; the body is untaped by construction); not exported (the cached
   common case) → attach-in-place + same-tick classic dispatch, zero hot-path
   cost. A 1 KiB and a 12 MiB upload to the same module take the same path.
-- **`blob.receive({to})`**: a connection-scoped PendingFetch through the
+- **`blob.receive({on})`**: a connection-scoped PendingFetch through the
   `rove-receive.internal` door (`blob.seal`'s exact pattern — bind-or-drop at
   handler success, commit-gating via `Cmd.http_fetch`, held-chain resume all
   reused). At its commit points the worker arms a per-upload **driver thread**

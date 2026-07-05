@@ -63,12 +63,13 @@ globalThis.blob = {
    * @param {object} [opts]
    * @param {string} [opts.content_type] - Stored Content-Type,
    *   returned on direct GETs of the object.
-   * @param {string} [opts.on_result] - Module path receiving the
+   * @param {string} [opts.on] - Module path receiving the
    *   terminal result on the unified flattened surface (handler-shape
    *   §7): `request.ok` / `request.status` top-level, the echoed
    *   `context` (the threaded value) IS `request.ctx`, and the stored
    *   `hash` is on `request.activation.hash`.
-   * @param {*} [opts.context] - Opaque payload echoed to `on_result`.
+   * @param {*} [opts.ctx] - Opaque payload echoed to the `on` module
+   *   as `request.ctx` (`on_result`/`context` = dual-name-window aliases).
    * @returns {string} The object's sha256 hash (64 hex chars).
    *
    * @example
@@ -109,7 +110,7 @@ globalThis.blob = {
   },
 
   /**
-   * Read an object. Connection-scoped (`on.fetch` semantics): the
+   * Read an object. Connection-scoped (`after.fetch` semantics): the
    * result resumes THIS held connection — by default in
    * `onFetchResult`, or the export named by `to`. Inert in a
    * connectionless activation. A missing object surfaces as a
@@ -117,7 +118,8 @@ globalThis.blob = {
    *
    * @param {string} hash - The object's sha256 hash.
    * @param {object} [opts]
-   * @param {string} [opts.to] - Export name to resume in.
+   * @param {string} [opts.on] - Export name to resume in (`to` =
+   *   dual-name-window alias).
    * @param {*} [opts.ctx] - Delivered as `request.ctx` on the
    *   resume (JSON round-trip).
    * @param {boolean} [opts.stream] - Per-chunk delivery (default
@@ -131,7 +133,7 @@ globalThis.blob = {
    *
    * @example
    * export default function () {
-   *   blob.get(JSON.parse(kv.get(`media/${id}`)).hash, { to: "onBlob" });
+   *   blob.get(JSON.parse(kv.get(`media/${id}`)).hash, { on: "onBlob" });
    *   return next();
    * }
    * export function onBlob() { return request.body; } // flattened: bytes on request.body, request.status top-level
@@ -186,7 +188,7 @@ globalThis.blob = {
   /**
    * Append bytes to this connection's upload session (created on
    * the first write). The session accumulates across the chain's
-   * activations — write each streamed `on.fetch` chunk from its
+   * activations — write each streamed `after.fetch` chunk from its
    * resume, or call repeatedly within one activation — then
    * {@link blob.seal} turns the whole accumulation into one
    * content-addressed object.
@@ -203,7 +205,7 @@ globalThis.blob = {
    * @example
    * export function onMirrorChunk() {
    *   if (!request.done) { blob.write(request.body); return next(); }
-   *   blob.seal({ to: "onStored", content_type: "image/png" });
+   *   blob.seal({ on: "onStored", content_type: "image/png" });
    *   return next();
    * }
    */
@@ -219,7 +221,7 @@ globalThis.blob = {
    * synchronously, and PUT the bytes content-addressed. The PUT's
    * result resumes THIS connection at the `to` export with
    * `request.status`; thread the hash there via `next({ hash })`
-   * (the chain-ctx idiom). Connection-scoped like `on.fetch`:
+   * (the chain-ctx idiom). Connection-scoped like `after.fetch`:
    * without a held connection the seal is inert.
    *
    * Durability contract: there is no owed marker — your `to` export
@@ -228,13 +230,13 @@ globalThis.blob = {
    * bytes is always safe (same hash, idempotent PUT).
    *
    * @param {object} opts
-   * @param {string} opts.to - Export resumed with the PUT result
-   *   (required).
+   * @param {string} opts.on - Export resumed with the PUT result
+   *   (required; `to` = dual-name-window alias).
    * @param {string} [opts.content_type] - Stored Content-Type.
    * @returns {string} The object's sha256 hash (64 hex chars).
    *
    * @example
-   * const hash = blob.seal({ to: "onStored", content_type: "image/png" });
+   * const hash = blob.seal({ on: "onStored", content_type: "image/png" });
    * return next({ hash });
    *
    * // ...
@@ -276,13 +278,13 @@ globalThis.blob = {
    * chunk path, which tapes what you read.
    *
    * @param {object} opts
-   * @param {string} opts.to - Export resumed with `{hash, len}`
-   *   when the object is durable (required).
+   * @param {string} opts.on - Export resumed with `{hash, len}`
+   *   when the object is durable (required; `to` = window alias).
    *
    * @example
    * export function onHeaders() {
    *   if (!authed(request.headers)) { response.status = 401; return "no"; }
-   *   blob.receive({ to: "onStored" });
+   *   blob.receive({ on: "onStored" });
    *   return next();
    * }
    * export function onStored() {

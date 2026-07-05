@@ -657,6 +657,55 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   bespoke `session_id` column threaded end-to-end — `correlation_id` already
   exists captured + replicated + in the ndjson, so it only needed indexing.
 
+### 4.11 The ergonomics arc — one grammar, one payload surface (2026-07-04/05)
+
+- **Decision** (the full spec + as-built notes:
+  `plans/handler-api-ergonomics-plan.md`): the connection-wake namespace
+  is **`after.*`** (`after.ms`/`after.kv`/`after.fetch`) — "after"
+  matches the one-shot re-armed-per-activation semantics ("on" falsely
+  connoted a persistent subscription) and frees `on` for the
+  **universal callback-target key `{on: "module.method"}`** across
+  every effect (`{to}`/`{on_result}` retired; `email.send`'s recipient
+  `to` was the collision that ruled out `to` as the universal key).
+  Threaded context is **`ctx` in / `request.ctx` out, no exceptions**
+  (completes §4.9; `request.activation.msg` folded in).
+  `webhook.send(url, opts)` takes a positional url; `scheduler.after`
+  → **`scheduler.in`** so "after" is exclusively connection-scoped
+  (the verb is the scope). `after.ms` is named for its unit —
+  deliberately no `after.seconds` family. Fetch ids are the opaque
+  `ftch_…` form on all three surfaces (return / `request.fetchId` /
+  `activation.fetchId`); handler-visible fields are camelCase.
+- **The payload surface is uniform**: `request.bytes` / `.text`
+  (lenient UTF-8, U+FFFD) / `.json` on every payload-carrying
+  activation — the tape stores raw bytes, the JS type is presentation,
+  so all three derive from one recorded read. Result bodies ride
+  byte-true end-to-end (base64url `body_b64` through the send-callback
+  JSON envelope — the prior TextDecoder'd string corrupted binary).
+  `request.body` (whose type varied per activation kind) is deprecated
+  and removed with the window.
+- **Fail-loud input sweep**: `return Uint8Array` ships raw bytes
+  (was JSON `{"0":..}`); `kv.set` takes primitives only (silent
+  `String()` mangle removed); `stream.write` takes string|Uint8Array
+  only; `webhook.send` body is string-only (the durable marker is
+  JSON); a provided-but-unserializable `next({ctx})` throws.
+- **Rollout**: a ONE-DEPLOY-CYCLE dual-name window (old spellings are
+  thin aliases) so deployed rewind-apps bundles survive; the close
+  checklist lives in the plan doc. `request.body` retirement
+  additionally waits on replay-driver accessor parity (the arenajs
+  shell synthesizes `request`).
+- **Retired outright alongside**: `kind=boot` subscriptions + `onBoot`
+  (2026-07-05, unused — audited zero rewind-apps consumers). Seeding
+  recipe: register `cron`/`scheduler.in` from any handler activation —
+  idempotent by key; `_sched/*` entries are durable kv that survive
+  deploys. A `kind=boot` manifest fails the deploy with a pointed
+  error (same posture as `kind=cron`).
+- **Rejected**: `to` as the universal callback key (email recipient
+  collision); a unit family on `after` (`after.seconds` — one
+  unit-bearing name beats a family); keeping `request.body` as a
+  permanent alias (would keep the "which type is it" question alive
+  forever); auto-JSON kv values (kv stays string-valued; JSON encoding
+  is the handler's explicit choice).
+
 ---
 
 ## 5. Readset replication

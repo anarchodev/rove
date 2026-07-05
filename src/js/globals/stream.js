@@ -31,7 +31,7 @@
    * response.headers = { 'content-type': 'text/event-stream' };
    * stream.start();
    * for (const r of rows) stream.write(`data: ${r}\n\n`);
-   * on.kv(`feed/${id}/`, { to: 'onNotify' });
+   * after.kv(`feed/${id}/`, { on: 'onNotify' });
    * return next({ since: rows.at(-1)?.seq });
    */
   globalThis.stream = {

@@ -14,7 +14,7 @@
 
 (function () {
   const sys = _system.platform;
-  // `on.fetch` native (captured before `_harden.js` deletes `_system`) —
+  // `after.fetch` native (captured before `_harden.js` deletes `_system`) —
   // `platform.compile` lowers to a bound fetch to a trusted compile door.
   const sysOn = _system.after;
   // `blob.receive` native — `platform.scope(t).blob.receive` lowers to a
@@ -56,7 +56,7 @@
     scope(id) {
       const s = sys.scope(id);
       // Cross-tenant blob READ — the read twin of `blob.put`. Bound, like
-      // {@link blob.get}: it lowers to an on.fetch at the admin-only
+      // {@link blob.get}: it lowers to an after.fetch at the admin-only
       // `rove-blob-read.internal` door (rewritten to `id`'s S3 prefix +
       // SigV4-signed natively). The bytes resume on `request.body` at the
       // `name` export (default onFetchResult); thread state with `opts.ctx`
@@ -89,7 +89,7 @@
         );
       };
       // deploy.stampManifest is the deploy's STAGING BARRIER — it lowers to
-      // a bound on.fetch (not a native sync call) so it resumes your handler
+      // a bound after.fetch (not a native sync call) so it resumes your handler
       // only once the manifest (the last staging write) AND every prior
       // bytecode/static PUT is durable. Return next() after it; the result
       // arrives at the `name` export (default onStamped) as

@@ -42,7 +42,7 @@ out of scope — held state is single-node by construction today
 | Operation | What | Mechanism | Owner |
 |---|---|---|---|
 | **point-to-point** | a chunk/disconnect/`send_callback` for *one* known continuation | holder locator (`worker_idx, slot, gen`) + cross-worker inbox | platform |
-| **broadcast** | push to *everyone* in a room | `on.kv` trigger + a durable write | customer recipe |
+| **broadcast** | push to *everyone* in a room | `after.kv` trigger + a durable write | customer recipe |
 
 The runtime knows the target of a point-to-point wake (it owns the
 continuation), so it routes to the worker that holds it — the existing
@@ -50,7 +50,7 @@ held-state routing shared by every held primitive, not a WS tax. Broadcast
 is the opposite: the connection-actor model **never exposes a connection
 handle** (`decisions.md` §13.2), so broadcast *cannot* be "enumerate the
 connections and push" — it must be pub-sub on a trigger. So broadcast is
-`on.kv`: subscribers park on a room key; a durable write fires the wake;
+`after.kv`: subscribers park on a room key; a durable write fires the wake;
 each parked continuation reads the new message and pushes it down its
 socket. The hidden-handle rule guarantees there is no other way to
 broadcast anyway, which is why fan-out is a customer recipe (a `channel.js`

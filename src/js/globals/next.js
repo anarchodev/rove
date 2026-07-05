@@ -3,7 +3,7 @@
 //
 // `next` parks the held connection: it keeps the socket open and asks
 // the runtime to re-invoke this handler on its next activation (a
-// kv/timer wake, an on.fetch chunk, a disconnect, …), routed to the
+// kv/timer wake, an after.fetch chunk, a disconnect, …), routed to the
 // conventional named export (onWake / onFetchChunk / onDisconnect / …).
 // You close instead by returning a terminal body.
 //
