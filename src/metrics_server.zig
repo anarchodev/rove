@@ -37,6 +37,16 @@ pub const MetricsServer = struct {
     mu: std.Thread.Mutex = .{},
     body: std.ArrayListUnmanaged(u8) = .empty,
 
+    /// Wall-clock ms of the last `publish` — the `/healthz` liveness
+    /// signal (front-door hardening plan C12). The main loop publishes
+    /// every ~2 s, so a snapshot older than `healthz_stale_ms` means
+    /// the loop is wedged and `/healthz` answers 503 — a REAL health
+    /// signal, not a bind check (this listener thread stays responsive
+    /// precisely when the main loop is stuck). 0 = nothing published
+    /// yet (boot) — also 503, so probes gate on first readiness.
+    last_publish_ms: std.atomic.Value(i64) = .init(0),
+    healthz_stale_ms: i64 = 10_000,
+
     /// Bind 127.0.0.1:`addr`, listen, and spawn the serving thread. Returns an
     /// error if the bind/listen fails — the caller treats metrics as optional
     /// (logs and runs without it). `addr` MUST be loopback (no auth here).
@@ -63,6 +73,7 @@ pub const MetricsServer = struct {
     /// rendered Prometheus text; copies it under the mutex. On OOM the previous
     /// snapshot is kept (a stale scrape beats a torn one).
     pub fn publish(self: *MetricsServer, text: []const u8) void {
+        self.last_publish_ms.store(std.time.milliTimestamp(), .release);
         self.mu.lock();
         defer self.mu.unlock();
         const old_len = self.body.items.len;
@@ -107,6 +118,17 @@ pub const MetricsServer = struct {
         var req: [2048]u8 = undefined;
         const n = posix.read(conn, &req) catch return;
         if (n == 0) return;
+        if (std.mem.startsWith(u8, req[0..n], "GET /healthz")) {
+            const last = self.last_publish_ms.load(.acquire);
+            const fresh = last != 0 and
+                std.time.milliTimestamp() - last <= self.healthz_stale_ms;
+            if (fresh) {
+                writeAll(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n");
+            } else {
+                writeAll(conn, "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nConnection: close\r\n\r\nstale\n");
+            }
+            return;
+        }
         const want_metrics = std.mem.startsWith(u8, req[0..n], "GET /metrics") or
             std.mem.startsWith(u8, req[0..n], "GET / ");
         if (!want_metrics) {
@@ -183,4 +205,51 @@ test "metrics server serves the published snapshot over HTTP/1.1" {
     }
     try testing.expect(std.mem.indexOf(u8, resp.items, "200 OK") != null);
     try testing.expect(std.mem.indexOf(u8, resp.items, "rove_test_metric 42") != null);
+}
+
+test "healthz: 503 before first publish and when stale, 200 while fresh" {
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    const srv = MetricsServer.init(testing.allocator, addr) catch |e| {
+        if (e == error.PermissionDenied or e == error.AccessDenied) return error.SkipZigTest;
+        return e;
+    };
+    defer srv.deinit();
+    var bound: std.net.Address = undefined;
+    var slen: posix.socklen_t = @sizeOf(std.net.Address);
+    try posix.getsockname(srv.listen_fd, &bound.any, &slen);
+
+    const probe = struct {
+        fn go(a: std.net.Address, alloc: std.mem.Allocator) ![]u8 {
+            const stream = try std.net.tcpConnectToAddress(a);
+            defer stream.close();
+            try stream.writeAll("GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n");
+            var resp: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer resp.deinit(alloc);
+            var buf: [512]u8 = undefined;
+            while (true) {
+                const n = try stream.read(&buf);
+                if (n == 0) break;
+                try resp.appendSlice(alloc, buf[0..n]);
+            }
+            return resp.toOwnedSlice(alloc);
+        }
+    }.go;
+
+    // Boot: nothing published → not ready.
+    const r1 = try probe(bound, testing.allocator);
+    defer testing.allocator.free(r1);
+    try testing.expect(std.mem.indexOf(u8, r1, "503") != null);
+
+    // Fresh publish → healthy.
+    srv.publish("x 1\n");
+    const r2 = try probe(bound, testing.allocator);
+    defer testing.allocator.free(r2);
+    try testing.expect(std.mem.indexOf(u8, r2, "200 OK") != null);
+
+    // Stale publish (tight threshold for the test) → wedged loop → 503.
+    srv.healthz_stale_ms = 1;
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+    const r3 = try probe(bound, testing.allocator);
+    defer testing.allocator.free(r3);
+    try testing.expect(std.mem.indexOf(u8, r3, "503") != null);
 }
