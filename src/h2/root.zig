@@ -698,6 +698,16 @@ pub const H2Options = struct {
     /// (clean recycle between requests) instead of reacting to the
     /// peer's GOAWAY mid-reuse. See the front-door TTFB investigation.
     client_idle_timeout_ns: u64 = 0,
+    /// TOTAL budget for a TLS handshake to complete (accept →
+    /// handshake_done). The idle reaper covers only `_conn_active`;
+    /// without this a peer that opens TCP and stalls mid-handshake
+    /// pins a connection slot forever — classic slowloris against
+    /// `max_connections` (front-door hardening plan A4). This is a
+    /// deadline from accept, not an idle window: `last_active_ns` is
+    /// stamped once at accept and never refreshed during the
+    /// handshake, so trickling one handshake byte at a time buys
+    /// nothing. 0 disables.
+    tls_handshake_timeout_ns: u64 = 10 * std.time.ns_per_s,
     tls_config: ?*TlsConfig = null,
     /// Headers-first request emission (`docs/architecture/routing-and-ingress.md`
     /// §3.5.1). Off (default): request entities appear in
@@ -908,6 +918,11 @@ pub fn H2(comptime opts: Options) type {
         // occurrence and every 10k events thereafter so the
         // misconfiguration is visible.
         recv_enobufs_total: u64 = 0,
+        /// Connections destroyed for blowing the TLS handshake budget
+        /// (`tls_handshake_timeout_ns`) — the slowloris canary: a
+        /// climbing rate under normal load means someone is holding
+        /// slots open with stalled handshakes.
+        handshake_reaped_total: u64 = 0,
         recv_enobufs_logged: bool = false,
         recv_enobufs_last_logged_decade: u64 = 0,
         /// Server-side response counts by HTTP status CLASS, indexed
@@ -2524,6 +2539,7 @@ pub fn H2(comptime opts: Options) type {
             response_out: usize,
             conn_active: usize,
             conn_tls_handshake: usize,
+            handshake_reaped: u64,
             io_connections: usize,
         };
 
@@ -2544,6 +2560,7 @@ pub fn H2(comptime opts: Options) type {
                 .response_out = self.response_out.entitySlice().len,
                 .conn_active = self._conn_active.entitySlice().len,
                 .conn_tls_handshake = self._conn_tls_handshake.entitySlice().len,
+                .handshake_reaped = self.handshake_reaped_total,
                 .io_connections = self.io.connections.entitySlice().len,
             };
         }
@@ -2587,6 +2604,9 @@ pub fn H2(comptime opts: Options) type {
                 \\# HELP h2_conn_tls_handshake_size connections still in TLS handshake.
                 \\# TYPE h2_conn_tls_handshake_size gauge
                 \\h2_conn_tls_handshake_size {d}
+                \\# HELP h2_handshake_reaped_total connections destroyed for blowing the TLS handshake budget (slowloris canary).
+                \\# TYPE h2_handshake_reaped_total counter
+                \\h2_handshake_reaped_total {d}
                 \\# HELP h2_io_connections_size raw tcp connections owned by the io layer (pre-handshake or post-handshake unclaimed).
                 \\# TYPE h2_io_connections_size gauge
                 \\h2_io_connections_size {d}
@@ -2604,6 +2624,7 @@ pub fn H2(comptime opts: Options) type {
                 s.response_out,
                 s.conn_active,
                 s.conn_tls_handshake,
+                s.handshake_reaped,
                 s.io_connections,
             });
 
@@ -3392,7 +3413,17 @@ pub fn H2(comptime opts: Options) type {
                     continue;
                 }
 
-                if (conn_ptr.ng_session == null) continue;
+                if (conn_ptr.ng_session == null) {
+                    // Not yet claimable — no first byte has arrived, so
+                    // neither TLS nor a session exists. Stamp the accept
+                    // time once so the pre-protocol sweep in
+                    // `reapIdleConnections` can bound a SILENT connection
+                    // (zero bytes → it never reaches `_read_init`, so it
+                    // would otherwise sit here holding a slot forever).
+                    if (conn_ptr.direction == .server and conn_ptr.last_active_ns == 0)
+                        conn_ptr.last_active_ns = monotonicNs();
+                    continue;
+                }
 
                 if (max > 0 and active_count >= max) {
                     try self.reg.destroy(ent);
@@ -5131,6 +5162,52 @@ pub fn H2(comptime opts: Options) type {
             const GOAWAY_DRAIN_GRACE_NS: u64 = 2 * std.time.ns_per_s;
             const entities = self._conn_active.entitySlice();
             const now = monotonicNs();
+
+            // Connection-setup deadline (plan A4), two stages sharing
+            // one budget (`tls_handshake_timeout_ns`; a peer straddling
+            // both gets at most 2×):
+            //
+            //   1. SILENT stage — a server conn still in
+            //      `io.connections` with no first byte (zero reads →
+            //      never reached `_read_init`, so no TLS conn and no
+            //      session). `last_active_ns` is the accept stamp from
+            //      `transitionNewConnections`.
+            //   2. TLS handshake stage — `_conn_tls_handshake`.
+            //      `readsTlsHandshake` never refreshes `last_active_ns`
+            //      (it's the stamp from the move), so this is a total
+            //      handshake budget, not an idle window — trickled
+            //      bytes buy nothing.
+            //
+            // Neither stage has a session to GOAWAY: destroy directly
+            // (the same teardown the handshake `.err` path uses). The
+            // idle reaper below only ever covered `_conn_active`;
+            // without these sweeps a stalled peer pinned one of the
+            // `max_connections` slots forever — classic slowloris.
+            if (self.h2_opts.tls_handshake_timeout_ns > 0) {
+                const budget = self.h2_opts.tls_handshake_timeout_ns;
+                const raw = self.io.connections.entitySlice();
+                for (raw) |ent| {
+                    if (self.reg.isStale(ent)) continue;
+                    const conn_ptr = self.reg.get(ent, &self.io.connections, Conn) catch continue;
+                    if (conn_ptr.direction != .server) continue;
+                    // Claimable / mid-transition conns belong to the
+                    // handshake or active sweeps.
+                    if (conn_ptr.tls_conn != null or conn_ptr.ng_session != null or conn_ptr.h1 != null) continue;
+                    if (conn_ptr.last_active_ns == 0) continue;
+                    if (now -| conn_ptr.last_active_ns <= budget) continue;
+                    self.handshake_reaped_total += 1;
+                    try self.reg.destroy(ent);
+                }
+                const hs = self._conn_tls_handshake.entitySlice();
+                for (hs) |ent| {
+                    if (self.reg.isStale(ent)) continue;
+                    const conn_ptr = self.reg.get(ent, &self._conn_tls_handshake, Conn) catch continue;
+                    if (conn_ptr.last_active_ns == 0) continue;
+                    if (now -| conn_ptr.last_active_ns <= budget) continue;
+                    self.handshake_reaped_total += 1;
+                    try self.reg.destroy(ent);
+                }
+            }
 
             for (entities) |ent| {
                 if (self.reg.isStale(ent)) continue;

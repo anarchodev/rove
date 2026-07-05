@@ -489,6 +489,10 @@ pub fn main() !void {
         .tls_config = tls_config,
         .idle_timeout_ns = @intCast(idle_ms * std.time.ns_per_ms),
         .client_idle_timeout_ns = @intCast(upstream_idle_ms * std.time.ns_per_ms),
+        // Total TLS-handshake budget (plan A4): a peer that stalls
+        // mid-handshake is destroyed at this deadline instead of
+        // pinning a connection slot forever.
+        .tls_handshake_timeout_ns = @intCast(envMs("REWIND_FRONT_TLS_HANDSHAKE_TIMEOUT_MS", 10_000) * std.time.ns_per_ms),
         // Streaming proxy: early-emit inbound h2 requests (server side)
         // and upstream responses (client side); the proxy relays both
         // as they arrive. Worker-matched 1 MiB stream windows bound
