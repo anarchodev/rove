@@ -147,6 +147,19 @@ fn leaderOriginHint(rh: h2.RespHeaders, nodes: []const []const u8) ?[]const u8 {
     return nodes[id - 1];
 }
 
+/// Methods a proxy may re-send after an ambiguous transport failure
+/// (request head handed to an upstream that died without responding —
+/// the worker may have executed the handler). Deliberately narrower
+/// than RFC 9110 §9.2.2: PUT/DELETE are formally idempotent, but a
+/// rewind handler's method semantics are customer code, so only the
+/// safe (read-shaped) methods get the benefit of the doubt. nginx's
+/// `proxy_next_upstream` draws the same line via `non_idempotent`.
+pub fn isIdempotentMethod(method: []const u8) bool {
+    return std.mem.eql(u8, method, "GET") or
+        std.mem.eql(u8, method, "HEAD") or
+        std.mem.eql(u8, method, "OPTIONS");
+}
+
 /// Strip a `:port` suffix from an `:authority` / Host value, matching
 /// the worker's `hostOnly`. Leaves bare hostnames untouched.
 pub fn hostOnly(authority: []const u8) []const u8 {
@@ -487,6 +500,14 @@ pub fn Proxy(comptime FrontH2: type) type {
             body_total: usize = 0,
             body_complete: bool = false,
             replayable: bool = true,
+            /// The request method is safe to re-send after an AMBIGUOUS
+            /// transport failure (upstream died after the head was
+            /// submitted, before any response). GET/HEAD/OPTIONS only —
+            /// rewind handlers make PUT/DELETE semantics customer-defined,
+            /// so they don't get the RFC 9110 idempotency benefit of the
+            /// doubt. 421 re-aim is NOT gated on this: a 421 proves
+            /// nothing executed (decisions.md §10.5).
+            idempotent: bool = false,
             down_sink_live: bool = false,
             /// Bytes forwarded upstream, not yet reported to the
             /// downstream sink's `drained` (window repayment).
@@ -1110,6 +1131,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 .down_sess = sess.entity,
                 .down_sid = sid.id,
                 .down_home = home,
+                .idempotent = isIdempotentMethod(headerValue(rh, ":method") orelse "GET"),
             };
             flow.host = self.allocator.dupe(u8, host) catch |e| {
                 self.allocator.free(flow.authority);
@@ -1160,7 +1182,7 @@ pub fn Proxy(comptime FrontH2: type) type {
 
             const origin = flow.nodes[flow.node_idx];
             const up = self.poolEntry(origin) catch {
-                self.attemptFailed(flow, false);
+                self.attemptFailed(flow, false, false);
                 return;
             };
             switch (up.state) {
@@ -1176,7 +1198,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 },
                 .connecting => {
                     up.waiters.append(self.allocator, .{ .flow = flow }) catch {
-                        self.attemptFailed(flow, false);
+                        self.attemptFailed(flow, false, false);
                         return;
                     };
                     flow.waiting_conn = true;
@@ -1237,7 +1259,7 @@ pub fn Proxy(comptime FrontH2: type) type {
 
         fn waiterFailed(self: *Self, waiter: Waiter) void {
             switch (waiter) {
-                .flow => |f| self.attemptFailed(f, false),
+                .flow => |f| self.attemptFailed(f, false, false),
                 .tunnel => |t| self.tunnelAttemptFailed(t),
             }
         }
@@ -1251,13 +1273,13 @@ pub fn Proxy(comptime FrontH2: type) type {
                 return;
             };
             const packed_hdrs = self.packUpstreamHeaders(rh.*, flow.authority) catch {
-                self.attemptFailed(flow, false);
+                self.attemptFailed(flow, false, false);
                 return;
             };
 
             const pump = self.reg.create(&self.server.client_stream_request_in) catch {
                 if (packed_hdrs._buf) |b| self.allocator.free(b[0..packed_hdrs._buf_len]);
-                self.attemptFailed(flow, false);
+                self.attemptFailed(flow, false, false);
                 return;
             };
             const coll = &self.server.client_stream_request_in;
@@ -1285,11 +1307,30 @@ pub fn Proxy(comptime FrontH2: type) type {
 
         /// The current attempt failed before any response. Re-aim or
         /// give up.
-        fn attemptFailed(self: *Self, flow: *Flow, conn_died: bool) void {
+        ///
+        /// `head_sent` says the request head was already handed to the
+        /// failed upstream. That makes the failure AMBIGUOUS for a
+        /// non-idempotent request: the worker may have dispatched the
+        /// handler (an `onHeaders` export activates on the head alone)
+        /// and committed before the connection died — a replay would
+        /// double-execute. Same discipline as the never-retried
+        /// post-propose 503 (decisions.md §10.5): the client's retry
+        /// policy owns the ambiguous case, so it gets a 502, not a
+        /// silent re-send. A 421 is NOT ambiguous (nothing entered the
+        /// log) and takes `handle421`, never this gate.
+        fn attemptFailed(self: *Self, flow: *Flow, conn_died: bool, head_sent: bool) void {
             self.unmapAttempt(flow);
             flow.attempt_live = false;
             if (flow.down_gone or !flow.down_alive) {
                 self.teardownFlow(flow);
+                return;
+            }
+            const replay_safe = flow.idempotent or !head_sent;
+            if (!replay_safe) {
+                // The dead node shouldn't seed future requests' start
+                // index, even though this flow can't re-aim.
+                if (conn_died) self.leaders.drop(self.allocator, flow.host);
+                self.finishWithStatus(flow, 502);
                 return;
             }
             if (conn_died and flow.reconnect_budget > 0 and flow.canRetry()) {
@@ -1420,7 +1461,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     } else if (ok) {
                         self.submitAttempt(flow, up.sess);
                     } else {
-                        self.attemptFailed(flow, false);
+                        self.attemptFailed(flow, false, false);
                     }
                 },
                 .tunnel => |t| {
@@ -1830,7 +1871,9 @@ pub fn Proxy(comptime FrontH2: type) type {
                 const conn_died = self.reg.isStale(flow.up_sess);
                 if (conn_died) self.markDown(flow);
                 std.log.warn("front: forward {s} → {s} failed", .{ flow.host, flow.nodes[flow.node_idx] });
-                self.attemptFailed(flow, conn_died);
+                // A terminal for a submitted request: the head reached
+                // the upstream leg — ambiguous for non-idempotent flows.
+                self.attemptFailed(flow, conn_died, true);
             }
         }
 
@@ -2364,6 +2407,22 @@ fn resolveOrigin(origin: []const u8) !std.net.Address {
 // ── Tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "isIdempotentMethod: only read-shaped methods replay after ambiguous failure" {
+    // Safe to re-send after an upstream died post-head, pre-response.
+    try testing.expect(isIdempotentMethod("GET"));
+    try testing.expect(isIdempotentMethod("HEAD"));
+    try testing.expect(isIdempotentMethod("OPTIONS"));
+    // Handler-executing methods must NOT silently replay (the worker may
+    // have committed before the connection died — decisions.md §10.5).
+    try testing.expect(!isIdempotentMethod("POST"));
+    try testing.expect(!isIdempotentMethod("PATCH"));
+    // PUT/DELETE are RFC-idempotent but customer-defined here: excluded.
+    try testing.expect(!isIdempotentMethod("PUT"));
+    try testing.expect(!isIdempotentMethod("DELETE"));
+    // Case-sensitive by design: h2 methods are uppercase on the wire.
+    try testing.expect(!isIdempotentMethod("get"));
+}
 
 test "RouteCache: fresh hit within TTL, miss past it (re-resolve, no stale serve)" {
     const ttl_ns: i128 = 100;
