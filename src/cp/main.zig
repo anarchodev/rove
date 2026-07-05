@@ -1899,6 +1899,10 @@ pub fn main() !void {
     curl.globalInit();
     const allocator = std.heap.c_allocator;
     installSignalHandlers();
+    // Logging must never block the poll loop: a backpressured log sink
+    // (journald) would otherwise freeze the CP on a synchronous std.log
+    // write. O_NONBLOCK drops the line instead. See `rove.logNonBlocking`.
+    rove.logNonBlocking();
 
     var arg_it = std.process.args();
     _ = arg_it.next();

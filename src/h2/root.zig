@@ -203,8 +203,23 @@ pub const Conn = struct {
     draining: bool = false,
     drain_deadline_ns: u64 = 0,
 
-    pub fn deinit(_: std.mem.Allocator, items: []Conn) void {
+    /// Egress serialization (h2 server DATA path). A single TCP socket is
+    /// one ordered byte stream, and for TLS every record's MAC binds an
+    /// implicit sequence number — so two concurrent `prep_send` SQEs for
+    /// the same conn that reach the socket out of order desync the peer's
+    /// record layer (`bad record mac`, anarchodev/rove#2). We therefore
+    /// keep AT MOST ONE io write in flight per connection and queue the
+    /// rest in FIFO order; `writesAccount` submits the next on completion.
+    /// `send_queue` owns each buffer until it is handed to `submitWrite`
+    /// (which takes ownership); a conn torn down mid-flight frees the
+    /// remainder here.
+    send_inflight: bool = false,
+    send_queue: std.ArrayListUnmanaged([]u8) = .empty,
+
+    pub fn deinit(allocator: std.mem.Allocator, items: []Conn) void {
         for (items) |*item| {
+            for (item.send_queue.items) |buf| allocator.free(buf);
+            item.send_queue.deinit(allocator);
             if (item.h1) |h1c| {
                 h1c.free();
                 item.h1 = null;
@@ -698,6 +713,16 @@ pub const H2Options = struct {
     /// (clean recycle between requests) instead of reacting to the
     /// peer's GOAWAY mid-reuse. See the front-door TTFB investigation.
     client_idle_timeout_ns: u64 = 0,
+    /// TOTAL budget for a TLS handshake to complete (accept →
+    /// handshake_done). The idle reaper covers only `_conn_active`;
+    /// without this a peer that opens TCP and stalls mid-handshake
+    /// pins a connection slot forever — classic slowloris against
+    /// `max_connections` (front-door hardening plan A4). This is a
+    /// deadline from accept, not an idle window: `last_active_ns` is
+    /// stamped once at accept and never refreshed during the
+    /// handshake, so trickling one handshake byte at a time buys
+    /// nothing. 0 disables.
+    tls_handshake_timeout_ns: u64 = 10 * std.time.ns_per_s,
     tls_config: ?*TlsConfig = null,
     /// Headers-first request emission (`docs/architecture/routing-and-ingress.md`
     /// §3.5.1). Off (default): request entities appear in
@@ -908,6 +933,11 @@ pub fn H2(comptime opts: Options) type {
         // occurrence and every 10k events thereafter so the
         // misconfiguration is visible.
         recv_enobufs_total: u64 = 0,
+        /// Connections destroyed for blowing the TLS handshake budget
+        /// (`tls_handshake_timeout_ns`) — the slowloris canary: a
+        /// climbing rate under normal load means someone is holding
+        /// slots open with stalled handshakes.
+        handshake_reaped_total: u64 = 0,
         recv_enobufs_logged: bool = false,
         recv_enobufs_last_logged_decade: u64 = 0,
         /// Server-side response counts by HTTP status CLASS, indexed
@@ -1466,6 +1496,25 @@ pub fn H2(comptime opts: Options) type {
             return c.nghttp2_session_get_remote_settings(ng, c.NGHTTP2_SETTINGS_ENABLE_CONNECT_PROTOCOL) == 1;
         }
 
+        /// Peer (remote) socket address of a connection entity, via
+        /// getpeername on its fd. Null when the entity or fd is gone.
+        /// Used by the front door to stamp `x-forwarded-for` at the
+        /// trust boundary (front-door hardening plan B7).
+        pub fn connPeerAddr(h2: *Self, conn_entity: Entity) ?std.net.Address {
+            if (h2.reg.isStale(conn_entity)) return null;
+            const pa = h2.reg.getAny(conn_entity, h2.connColls(), rio.PeerAddr) catch return null;
+            if (!pa.valid) return null;
+            return pa.addr;
+        }
+
+        /// True when the connection is driven by the HTTP/1.1 codec
+        /// (vs an nghttp2 session). Feeds the front door's `Via`
+        /// received-protocol version.
+        pub fn connIsHttp1(h2: *Self, conn_entity: Entity) bool {
+            const conn_ptr = getConn(h2, conn_entity) orelse return false;
+            return conn_ptr.h1 != null;
+        }
+
         pub const WsConnectDecision = enum { ok, gone };
 
         /// Accept a pending Extended-CONNECT tunnel: reply `:status
@@ -1663,6 +1712,14 @@ pub fn H2(comptime opts: Options) type {
         fn resolveFdThunk(ctx: *anyopaque, entity: Entity) ?*rio.Fd {
             const h2: *Self = @ptrCast(@alignCast(ctx));
             return h2.reg.getAny(entity, h2.connColls(), rio.Fd) catch null;
+        }
+
+        /// PeerAddr mirror of `resolveFdThunk` — the accept-time
+        /// fixed-fd-install CQE may land after the conn was promoted
+        /// out of `io.connections`.
+        fn resolvePeerThunk(ctx: *anyopaque, entity: Entity) ?*rio.PeerAddr {
+            const h2: *Self = @ptrCast(@alignCast(ctx));
+            return h2.reg.getAny(entity, h2.connColls(), rio.PeerAddr) catch null;
         }
 
         /// Extra-conns callback for io's admission control. Returns the
@@ -2524,6 +2581,7 @@ pub fn H2(comptime opts: Options) type {
             response_out: usize,
             conn_active: usize,
             conn_tls_handshake: usize,
+            handshake_reaped: u64,
             io_connections: usize,
         };
 
@@ -2544,6 +2602,7 @@ pub fn H2(comptime opts: Options) type {
                 .response_out = self.response_out.entitySlice().len,
                 .conn_active = self._conn_active.entitySlice().len,
                 .conn_tls_handshake = self._conn_tls_handshake.entitySlice().len,
+                .handshake_reaped = self.handshake_reaped_total,
                 .io_connections = self.io.connections.entitySlice().len,
             };
         }
@@ -2587,6 +2646,9 @@ pub fn H2(comptime opts: Options) type {
                 \\# HELP h2_conn_tls_handshake_size connections still in TLS handshake.
                 \\# TYPE h2_conn_tls_handshake_size gauge
                 \\h2_conn_tls_handshake_size {d}
+                \\# HELP h2_handshake_reaped_total connections destroyed for blowing the TLS handshake budget (slowloris canary).
+                \\# TYPE h2_handshake_reaped_total counter
+                \\h2_handshake_reaped_total {d}
                 \\# HELP h2_io_connections_size raw tcp connections owned by the io layer (pre-handshake or post-handshake unclaimed).
                 \\# TYPE h2_io_connections_size gauge
                 \\h2_io_connections_size {d}
@@ -2604,6 +2666,7 @@ pub fn H2(comptime opts: Options) type {
                 s.response_out,
                 s.conn_active,
                 s.conn_tls_handshake,
+                s.handshake_reaped,
                 s.io_connections,
             });
 
@@ -2639,6 +2702,7 @@ pub fn H2(comptime opts: Options) type {
             self.reg = reg;
             self.allocator = allocator;
             self.recv_enobufs_total = 0;
+            self.handshake_reaped_total = 0;
             self.recv_enobufs_logged = false;
             self.recv_enobufs_last_logged_decade = 0;
             self.recv_enobufs_low_outstanding_streak = 0;
@@ -2664,6 +2728,7 @@ pub fn H2(comptime opts: Options) type {
             // Register FD resolver with io so that processWriteIn/processReadIn
             // can find connection Fds when h2 has moved them to _conn_active etc.
             self.io.setFdResolver(@ptrCast(self), &resolveFdThunk);
+            self.io.setPeerResolver(@ptrCast(self), &resolvePeerThunk);
             // Admission control: io counts conns in `io.connections` +
             // whatever this callback returns. h2 holds promoted conns
             // in `_conn_tls_handshake` + `_conn_active`.
@@ -3392,7 +3457,17 @@ pub fn H2(comptime opts: Options) type {
                     continue;
                 }
 
-                if (conn_ptr.ng_session == null) continue;
+                if (conn_ptr.ng_session == null) {
+                    // Not yet claimable — no first byte has arrived, so
+                    // neither TLS nor a session exists. Stamp the accept
+                    // time once so the pre-protocol sweep in
+                    // `reapIdleConnections` can bound a SILENT connection
+                    // (zero bytes → it never reaches `_read_init`, so it
+                    // would otherwise sit here holding a slot forever).
+                    if (conn_ptr.direction == .server and conn_ptr.last_active_ns == 0)
+                        conn_ptr.last_active_ns = monotonicNs();
+                    continue;
+                }
 
                 if (max > 0 and active_count >= max) {
                     try self.reg.destroy(ent);
@@ -4062,6 +4137,24 @@ pub fn H2(comptime opts: Options) type {
             return false;
         }
 
+        /// RFC 7230 §6.1: any header NAMED in the request's `Connection`
+        /// value is hop-by-hop too and must not survive the h1→h2
+        /// synthesis (forwarding one is the request-smuggling /
+        /// cache-poisoning vector — front-door hardening plan B8). This
+        /// runs HERE (not in the proxy) because `http1IsHopByHop`
+        /// removes `connection` itself from the synthesized head, so
+        /// downstream consumers can never see the nomination list.
+        fn http1NominatedByConnection(head: http1.Head, name: []const u8) bool {
+            for (head.headers) |hh| {
+                if (!std.ascii.eqlIgnoreCase(hh.name, "connection")) continue;
+                var it = std.mem.tokenizeAny(u8, hh.value, ", \t");
+                while (it.next()) |tok| {
+                    if (std.ascii.eqlIgnoreCase(tok, name)) return true;
+                }
+            }
+            return false;
+        }
+
         /// Pack a parsed h1 head into an `h2.ReqHeaders` — four synthesized
         /// pseudo-headers followed by the request's end-to-end headers
         /// (names lowercased to match h2/handler lookups). One combined buffer
@@ -4080,6 +4173,7 @@ pub fn H2(comptime opts: Options) type {
             for (pseudo) |p| strbytes += p.name.len + p.value.len;
             for (head.headers) |hh| {
                 if (http1IsHopByHop(hh.name)) continue;
+                if (http1NominatedByConnection(head, hh.name)) continue;
                 n += 1;
                 strbytes += hh.name.len + hh.value.len;
             }
@@ -4116,6 +4210,7 @@ pub fn H2(comptime opts: Options) type {
             for (pseudo) |p| writeField(fields, strbase, &soff, &fi, p.name, p.value, false);
             for (head.headers) |hh| {
                 if (http1IsHopByHop(hh.name)) continue;
+                if (http1NominatedByConnection(head, hh.name)) continue;
                 writeField(fields, strbase, &soff, &fi, hh.name, hh.value, true);
             }
 
@@ -4752,6 +4847,41 @@ pub fn H2(comptime opts: Options) type {
             try self.reg.set(we, &self.io.write_in, rio.WriteBuf, .{ .data = data.ptr, .len = @intCast(data.len) });
         }
 
+        /// Serialized egress for the h2 server DATA path: hand `data` to the
+        /// connection's ordered send queue (takes ownership) and submit it
+        /// only if no write is in flight for that conn — otherwise it waits
+        /// its turn, submitted by `writesAccount` when the current write
+        /// completes. This is what keeps a multi-batch large response (or
+        /// TLS record stream) in wire order; see `Conn.send_queue`. On a
+        /// submit/enqueue failure the buffer is freed (the caller has
+        /// already relinquished it).
+        fn enqueueConnSend(self: *Self, conn_ptr: *Conn, conn_entity: Entity, data: []u8) void {
+            if (conn_ptr.send_inflight) {
+                conn_ptr.send_queue.append(self.allocator, data) catch self.allocator.free(data);
+                return;
+            }
+            self.submitWrite(conn_entity, data) catch {
+                self.allocator.free(data);
+                return;
+            };
+            conn_ptr.send_inflight = true;
+        }
+
+        /// A completed write drained (`writesAccount`): clear the in-flight
+        /// flag and submit the next queued buffer, if any, preserving order.
+        /// Called only on a live conn (a failed/destroyed conn frees the
+        /// queue in `Conn.deinit`).
+        fn pumpConnSend(self: *Self, conn_ptr: *Conn, conn_entity: Entity) void {
+            conn_ptr.send_inflight = false;
+            if (conn_ptr.send_queue.items.len == 0) return;
+            const next = conn_ptr.send_queue.orderedRemove(0);
+            self.submitWrite(conn_entity, next) catch {
+                self.allocator.free(next);
+                return;
+            };
+            conn_ptr.send_inflight = true;
+        }
+
         /// True if `bytes` look like the start of an HTTP/1.x request
         /// rather than the h2 connection preface. The h2 preface is
         /// `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`, so `PRI ` at byte 0 is
@@ -4941,6 +5071,13 @@ pub fn H2(comptime opts: Options) type {
                                     }
                                 }
                             }
+                        } else if (!failed) {
+                            // h2 server DATA path: the single in-flight
+                            // serialized send drained — submit the next queued
+                            // buffer in order (`enqueueConnSend`/`Conn.send_queue`).
+                            // A failed conn is destroyed below; its queue frees
+                            // in `Conn.deinit`.
+                            self.pumpConnSend(conn_ptr, conn_ent.entity);
                         }
                     }
                 }
@@ -4992,6 +5129,12 @@ pub fn H2(comptime opts: Options) type {
                 if (c.nghttp2_session_want_write(ng_session) == 0 and
                     c.nghttp2_session_want_read(ng_session) == 0)
                 {
+                    // nghttp2 is done, but our serialized send queue may still
+                    // hold response bytes not yet on the socket — destroying
+                    // now would drop them. Wait for `writesAccount` to drain
+                    // the queue; the draining-deadline force-destroy above is
+                    // the backstop for a peer that stops reading.
+                    if (conn_ptr.send_inflight or conn_ptr.send_queue.items.len > 0) continue;
                     try self.reg.destroy(ent);
                     continue;
                 }
@@ -5024,12 +5167,9 @@ pub fn H2(comptime opts: Options) type {
                                 broke = true;
                                 break;
                             };
-                            self.submitWrite(ent, cipher) catch {
-                                self.allocator.free(cipher);
-                                try self.reg.destroy(ent);
-                                broke = true;
-                                break;
-                            };
+                            // Ordered egress: the TLS record stream MUST reach
+                            // the socket in sequence or the peer's MAC desyncs.
+                            self.enqueueConnSend(conn_ptr, ent, cipher);
                             accum_len = 0;
                         }
                         @memcpy(accum_buf[accum_len .. accum_len + flen], frame_data[0..flen]);
@@ -5041,11 +5181,7 @@ pub fn H2(comptime opts: Options) type {
                             try self.reg.destroy(ent);
                             continue;
                         };
-                        self.submitWrite(ent, cipher) catch {
-                            self.allocator.free(cipher);
-                            try self.reg.destroy(ent);
-                            continue;
-                        };
+                        self.enqueueConnSend(conn_ptr, ent, cipher);
                     }
                 } else {
                     // Accumulate ALL frames nghttp2 wants to send into a
@@ -5070,20 +5206,17 @@ pub fn H2(comptime opts: Options) type {
                         const flen: usize = @intCast(len);
                         if (accum_len + flen > accum_buf.len) {
                             // Flush what we have so far, then continue
-                            // with a fresh buffer. Big responses can still
-                            // fan out into multiple segments — that's OK,
-                            // Nagle only bites on tiny trailing fragments.
+                            // with a fresh buffer. Serialized per-conn (same
+                            // as TLS): plaintext h2 frames must also reach the
+                            // socket in order, or the peer's frame stream is
+                            // corrupted — loopback masks it (buffers rarely
+                            // fill), a real network doesn't.
                             const copy = self.allocator.dupe(u8, accum_buf[0..accum_len]) catch {
                                 try self.reg.destroy(ent);
                                 broke = true;
                                 break;
                             };
-                            self.submitWrite(ent, copy) catch {
-                                self.allocator.free(copy);
-                                try self.reg.destroy(ent);
-                                broke = true;
-                                break;
-                            };
+                            self.enqueueConnSend(conn_ptr, ent, copy);
                             accum_len = 0;
                         }
                         @memcpy(accum_buf[accum_len .. accum_len + flen], frame_data[0..flen]);
@@ -5095,15 +5228,65 @@ pub fn H2(comptime opts: Options) type {
                             try self.reg.destroy(ent);
                             continue;
                         };
-                        self.submitWrite(ent, copy) catch {
-                            self.allocator.free(copy);
-                            try self.reg.destroy(ent);
-                            continue;
-                        };
+                        self.enqueueConnSend(conn_ptr, ent, copy);
                     }
                 }
 
                 conn_ptr.last_active_ns = now;
+            }
+        }
+
+        /// Graceful shutdown drain (front-door hardening plan C10):
+        /// close ACTIVE server connections out from under waiting
+        /// clients GRACEFULLY so a rolling restart stops cutting
+        /// in-flight requests. h2: queue a GOAWAY (in-flight streams
+        /// finish; `grace_ns` bounds a dawdling peer before
+        /// `driveAllSends` force-destroys). h1 (no GOAWAY exists):
+        /// a conn idle BETWEEN requests is destroyed now (the kernel
+        /// flushes queued response bytes on the graceful close);
+        /// a conn mid-request gets `keep_alive = false` so its
+        /// response carries `Connection: close` and the NEXT sweep
+        /// destroys it. WS-mode h1 conns are left to the caller's
+        /// drain deadline. Idempotent — the caller re-invokes each
+        /// drain-loop iteration, which also covers connections
+        /// accepted after the first sweep.
+        pub fn drainServerConns(self: *Self, grace_ns: u64) !void {
+            const entities = self._conn_active.entitySlice();
+            const now = monotonicNs();
+            for (entities) |ent| {
+                if (self.reg.isStale(ent)) continue;
+                const conn_ptr = self.reg.get(ent, &self._conn_active, Conn) catch continue;
+                if (conn_ptr.direction != .server) continue;
+                if (conn_ptr.ng_session) |ng| {
+                    if (conn_ptr.draining) continue;
+                    _ = c.nghttp2_session_terminate_session(ng, c.NGHTTP2_NO_ERROR);
+                    conn_ptr.draining = true;
+                    conn_ptr.drain_deadline_ns = now + grace_ns;
+                } else if (conn_ptr.h1) |h1c| {
+                    if (h1c.ws_mode) continue;
+                    // Destroyable: idle between requests, or `closing`
+                    // (response served, Connection: close — that path
+                    // never resets `in_flight`; it normally waits for
+                    // the idle GC, far beyond a drain budget). The
+                    // 500 ms quiet window (last_active is the last
+                    // READ; the response write follows within ms) lets
+                    // the final write reach the kernel before the
+                    // graceful close flushes it out.
+                    const quiet_ns: u64 = 500 * std.time.ns_per_ms;
+                    const idle_between = !h1c.in_flight and !h1c.body_active and
+                        !h1c.streaming and h1c.sending_entity.isNil();
+                    const close_pending = h1c.closing and h1c.sending_entity.isNil();
+                    if ((idle_between or close_pending) and
+                        conn_ptr.last_active_ns != 0 and
+                        now -| conn_ptr.last_active_ns > quiet_ns)
+                    {
+                        try self.reg.destroy(ent);
+                    } else if (!h1c.closing) {
+                        // Mid-request: the response will carry
+                        // Connection: close; a later sweep reaps it.
+                        h1c.keep_alive = false;
+                    }
+                }
             }
         }
 
@@ -5131,6 +5314,52 @@ pub fn H2(comptime opts: Options) type {
             const GOAWAY_DRAIN_GRACE_NS: u64 = 2 * std.time.ns_per_s;
             const entities = self._conn_active.entitySlice();
             const now = monotonicNs();
+
+            // Connection-setup deadline (plan A4), two stages sharing
+            // one budget (`tls_handshake_timeout_ns`; a peer straddling
+            // both gets at most 2×):
+            //
+            //   1. SILENT stage — a server conn still in
+            //      `io.connections` with no first byte (zero reads →
+            //      never reached `_read_init`, so no TLS conn and no
+            //      session). `last_active_ns` is the accept stamp from
+            //      `transitionNewConnections`.
+            //   2. TLS handshake stage — `_conn_tls_handshake`.
+            //      `readsTlsHandshake` never refreshes `last_active_ns`
+            //      (it's the stamp from the move), so this is a total
+            //      handshake budget, not an idle window — trickled
+            //      bytes buy nothing.
+            //
+            // Neither stage has a session to GOAWAY: destroy directly
+            // (the same teardown the handshake `.err` path uses). The
+            // idle reaper below only ever covered `_conn_active`;
+            // without these sweeps a stalled peer pinned one of the
+            // `max_connections` slots forever — classic slowloris.
+            if (self.h2_opts.tls_handshake_timeout_ns > 0) {
+                const budget = self.h2_opts.tls_handshake_timeout_ns;
+                const raw = self.io.connections.entitySlice();
+                for (raw) |ent| {
+                    if (self.reg.isStale(ent)) continue;
+                    const conn_ptr = self.reg.get(ent, &self.io.connections, Conn) catch continue;
+                    if (conn_ptr.direction != .server) continue;
+                    // Claimable / mid-transition conns belong to the
+                    // handshake or active sweeps.
+                    if (conn_ptr.tls_conn != null or conn_ptr.ng_session != null or conn_ptr.h1 != null) continue;
+                    if (conn_ptr.last_active_ns == 0) continue;
+                    if (now -| conn_ptr.last_active_ns <= budget) continue;
+                    self.handshake_reaped_total += 1;
+                    try self.reg.destroy(ent);
+                }
+                const hs = self._conn_tls_handshake.entitySlice();
+                for (hs) |ent| {
+                    if (self.reg.isStale(ent)) continue;
+                    const conn_ptr = self.reg.get(ent, &self._conn_tls_handshake, Conn) catch continue;
+                    if (conn_ptr.last_active_ns == 0) continue;
+                    if (now -| conn_ptr.last_active_ns <= budget) continue;
+                    self.handshake_reaped_total += 1;
+                    try self.reg.destroy(ent);
+                }
+            }
 
             for (entities) |ent| {
                 if (self.reg.isStale(ent)) continue;

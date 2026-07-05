@@ -632,6 +632,14 @@ pub fn main() !void {
             return;
         }
     }
+    // Logging must never block the poll loop: on a backpressured log sink
+    // (journald rate-limit / slow disk) a BLOCKING std.log write() on the
+    // single serving thread freezes the whole worker — every tenant —
+    // until it drains. O_NONBLOCK drops the line instead. See
+    // `rove.logNonBlocking` (root-caused from the front wedge). After the
+    // --version path so that output flushes normally.
+    rove.logNonBlocking();
+
     const data_dir = first_arg orelse "/tmp/rewind-data";
     const port_str = arg_it.next() orelse "8080";
     const port = try std.fmt.parseInt(u16, port_str, 10);

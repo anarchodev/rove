@@ -67,6 +67,11 @@ pub const FlowRef = struct {
     /// `ptr` is a *WsTunnel, not a *Flow (Extended-CONNECT WS tunnel
     /// pump/terminal entities — architecture/websockets.md).
     tunnel: bool = false,
+    /// The upstream Leg this pump entity was submitted on (plan A3) —
+    /// its in-flight count is repaid when the terminal lands. Legs
+    /// live inside process-lifetime pool entries, so a late terminal
+    /// for an abandoned attempt still points at valid memory.
+    leg: ?*anyopaque = null,
 };
 
 /// Request-body bytes kept for 421 / transport-error replay. Streamed
@@ -80,8 +85,53 @@ pub const REPLAY_CAP: usize = 256 * 1024;
 /// bounds the per-flow copy unit.
 pub const CHUNK_MAX: u32 = 64 * 1024;
 
+/// Latency histogram bucket bounds (ms) for `front_request_duration_ms`
+/// (plan C11). Fixed comptime bounds — no allocation on the record path.
+pub const LAT_BOUNDS_MS = [_]u64{ 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 10000 };
+
 /// Reconnect backoff for a backend node whose connect failed.
 const CONNECT_BACKOFF_NS: i128 = 500 * std.time.ns_per_ms;
+
+/// Upstream connection pool sizing (plan A3). One pooled h2c conn per
+/// backend node meant one TCP congestion window head-of-line-blocking
+/// every tenant's traffic to that node, one conn death failing all
+/// in-flight requests at once, and past the peer's
+/// max_concurrent_streams nghttp2 queued submissions invisibly with no
+/// depth bound. Now each node gets up to `REWIND_FRONT_UPSTREAM_CONNS`
+/// legs (default 2, max 4): submits pick the least-loaded live leg, a
+/// spare leg is dialed in the background once the chosen leg is busy,
+/// and when every leg is saturated the request is SHED with a
+/// retryable 503 (nothing was submitted) instead of queueing
+/// invisibly.
+pub const MAX_LEGS: usize = 4;
+/// Per-leg in-flight stream cap — below the worker's
+/// max_concurrent_streams (512) so nghttp2 never locally queues.
+pub const LEG_STREAM_CAP: u32 = 480;
+/// Chosen-leg in-flight count at which a spare down leg is dialed in
+/// the background (gradual scale-out under load).
+pub const LEG_GROW_THRESHOLD: u32 = 64;
+
+/// Default between-bytes progress budget for an INBOUND request body
+/// (`REWIND_FRONT_BODY_STALL_TIMEOUT_MS`) — nginx's
+/// `client_body_timeout`. A client that starts a body and stops sending
+/// holds a front flow and a worker stream indefinitely: the per-CONN
+/// idle reap never fires as long as any one stream (or a PING) keeps
+/// the connection active, so per-stream progress is the only honest
+/// signal (plan A5). Between-bytes, not total: legitimate slow uploads
+/// survive as long as bytes keep arriving. Response-side progress is
+/// deliberately NOT policed at the front — a quiet held SSE stream is
+/// indistinguishable from a stall here, and held-connection deadlines
+/// are the worker's (see the plan doc).
+const BODY_STALL_NS_DEFAULT: i128 = 60_000 * std.time.ns_per_ms;
+
+/// Default deadline for an upstream connect to complete (overridable
+/// via `REWIND_FRONT_CONNECT_TIMEOUT_MS`). The io layer puts no
+/// timeout on the connect op, so a backend that blackholes SYNs (node
+/// down hard, partition, firewall drop) otherwise hangs every flow
+/// aimed at it for the kernel SYN-retry budget (~2 min) — no proxy
+/// deadline covered the waiting-on-connect window (plan A1). Backends
+/// are same-DC private-plane peers; 1 s is generous.
+const CONNECT_TIMEOUT_NS_DEFAULT: i128 = 1000 * std.time.ns_per_ms;
 
 /// How long a request parks waiting for a cold route resolution before
 /// it gives up with a retryable 503. Bounds the worst case for a
@@ -147,25 +197,99 @@ fn leaderOriginHint(rh: h2.RespHeaders, nodes: []const []const u8) ?[]const u8 {
     return nodes[id - 1];
 }
 
-/// Strip a `:port` suffix from an `:authority` / Host value, matching
-/// the worker's `hostOnly`. Leaves bare hostnames untouched.
+/// Methods a proxy may re-send after an ambiguous transport failure
+/// (request head handed to an upstream that died without responding —
+/// the worker may have executed the handler). Deliberately narrower
+/// than RFC 9110 §9.2.2: PUT/DELETE are formally idempotent, but a
+/// rewind handler's method semantics are customer code, so only the
+/// safe (read-shaped) methods get the benefit of the doubt. nginx's
+/// `proxy_next_upstream` draws the same line via `non_idempotent`.
+pub fn isIdempotentMethod(method: []const u8) bool {
+    return std.mem.eql(u8, method, "GET") or
+        std.mem.eql(u8, method, "HEAD") or
+        std.mem.eql(u8, method, "OPTIONS");
+}
+
+/// Strip a `:port` suffix from an `:authority` / Host value. Bracketed
+/// IPv6 literals (`[::1]`, `[::1]:443`) keep their brackets — the old
+/// bare `lastIndexOfScalar(':')` split a portless `[::1]` mid-address.
 pub fn hostOnly(authority: []const u8) []const u8 {
+    if (authority.len > 0 and authority[0] == '[') {
+        if (std.mem.indexOfScalar(u8, authority, ']')) |i| return authority[0 .. i + 1];
+        return authority; // malformed — normalizeHost's charset gate owns rejection
+    }
     if (std.mem.lastIndexOfScalar(u8, authority, ':')) |i| return authority[0..i];
     return authority;
 }
 
+/// Normalize a client-supplied `:authority` / Host into the canonical
+/// routing key (plan B9): port stripped (bracket-aware), LOWERCASED
+/// (DNS names are case-insensitive — un-normalized, `HOST.example` and
+/// `host.example` were distinct cache entries and distinct CP
+/// round-trips, and deliberate case-flipping bypassed the route
+/// cache), and charset-restricted so raw client bytes never reach
+/// cache keys, the `/_cp/route?host=` query string, or log lines.
+/// Null = junk; the caller answers 400. `buf` holds the lowered copy.
+pub fn normalizeHost(buf: *[255]u8, authority: []const u8) ?[]const u8 {
+    const raw = hostOnly(authority);
+    if (raw.len == 0 or raw.len > buf.len) return null;
+    for (raw, 0..) |ch, i| {
+        const low = std.ascii.toLower(ch);
+        const ok = (low >= 'a' and low <= 'z') or (ch >= '0' and ch <= '9') or
+            ch == '.' or ch == '-' or ch == '_' or ch == ':' or ch == '[' or ch == ']';
+        if (!ok) return null;
+        buf[i] = low;
+    }
+    return buf[0..raw.len];
+}
+
 /// hop-by-hop headers must not be forwarded across a proxy (RFC 7230
 /// §6.1). `expect` rides along: the front does not implement
-/// 100-continue relaying and the worker's h2 server ignores it.
+/// 100-continue relaying and the worker's h2 server ignores it. The
+/// forwarding-identity headers (`x-forwarded-*`, `x-real-ip`,
+/// `forwarded`) are stripped because the front IS the trust boundary
+/// (plan B7): it terminates the public edge, so any inbound value is
+/// client-spoofed — the front re-stamps `x-forwarded-for` /
+/// `x-forwarded-proto` from the connection. (If an LB/CDN is ever put
+/// in front of the front, this needs a trusted-hops config instead.)
 fn dropFromRequest(name: []const u8) bool {
     const hop = [_][]const u8{
-        "connection",          "keep-alive", "proxy-authenticate",
-        "proxy-authorization", "te",         "trailer",
-        "transfer-encoding",   "upgrade",    "expect",
-        "host",
+        "connection",          "keep-alive",        "proxy-authenticate",
+        "proxy-authorization", "te",                "trailer",
+        "transfer-encoding",   "upgrade",           "expect",
+        "host",                "x-forwarded-for",   "x-forwarded-proto",
+        "x-forwarded-host",    "x-real-ip",         "forwarded",
     };
     for (hop) |h| if (std.ascii.eqlIgnoreCase(name, h)) return true;
     return false;
+}
+
+/// RFC 7230 §6.1: a proxy MUST also remove any header NAMED in the
+/// `Connection` header value (h1 ingress; h2 forbids the header but a
+/// synthesized h1 head carries it through). Forwarding
+/// connection-nominated headers is the mechanism behind published
+/// request-smuggling / cache-poisoning classes (plan B8).
+fn nominatedByConnection(connection_value: ?[]const u8, name: []const u8) bool {
+    const cv = connection_value orelse return false;
+    var it = std.mem.tokenizeAny(u8, cv, ", \t");
+    while (it.next()) |tok| {
+        if (std.ascii.eqlIgnoreCase(tok, name)) return true;
+    }
+    return false;
+}
+
+/// Render `addr`'s bare IP (no port, no IPv6 brackets — the
+/// conventional `x-forwarded-for` form) into `buf`; returns the
+/// length, 0 on failure/overflow.
+fn peerIpString(buf: []u8, addr: std.net.Address) u8 {
+    var tmp: [64]u8 = undefined;
+    const s = std.fmt.bufPrint(&tmp, "{f}", .{addr}) catch return 0;
+    var ip = s;
+    if (std.mem.lastIndexOfScalar(u8, ip, ':')) |i| ip = ip[0..i];
+    if (ip.len >= 2 and ip[0] == '[' and ip[ip.len - 1] == ']') ip = ip[1 .. ip.len - 1];
+    if (ip.len == 0 or ip.len > buf.len) return 0;
+    @memcpy(buf[0..ip.len], ip);
+    return @intCast(ip.len);
 }
 
 /// A response header that must NOT be relayed: hop-by-hop, pseudo
@@ -216,50 +340,117 @@ pub const RouteCache = struct {
     allocator: std.mem.Allocator,
     map: std.StringHashMapUnmanaged(CacheEntry) = .empty,
     ttl_ns: i128,
+    /// TTL for NEGATIVE entries (host the CP answered 404 for). Kept
+    /// separate from `ttl_ns`: a placement changes on a tenant move
+    /// (short TTL bounds move latency), but "this host doesn't exist"
+    /// only changes on provisioning — and negative caching is what
+    /// keeps internet scanners probing garbage Host values from
+    /// serially occupying the CP resolver (plan A6).
+    neg_ttl_ns: i128,
+    /// Live negative entries. Negative keys are attacker-controlled
+    /// (any Host header), so their count is capped — see NEG_CAP.
+    neg_count: usize = 0,
+
+    /// Max negative entries. At the cap, expired negatives are swept;
+    /// if still full the insert is skipped (a flood degrades to the
+    /// uncached behavior, never to unbounded memory).
+    const NEG_CAP: usize = 4096;
 
     const CacheEntry = struct {
+        /// Empty and unowned for a negative entry (`negative` guards
+        /// the free).
         nodes: [][]u8,
+        negative: bool,
         expires_ns: i128,
     };
 
-    pub fn init(allocator: std.mem.Allocator, ttl_ns: i128) RouteCache {
-        return .{ .allocator = allocator, .ttl_ns = ttl_ns };
+    pub const Hit = union(enum) {
+        nodes: []const []const u8,
+        not_found,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, ttl_ns: i128, neg_ttl_ns: i128) RouteCache {
+        return .{ .allocator = allocator, .ttl_ns = ttl_ns, .neg_ttl_ns = neg_ttl_ns };
     }
 
     pub fn deinit(self: *RouteCache) void {
         var it = self.map.iterator();
         while (it.next()) |e| {
             self.allocator.free(e.key_ptr.*);
-            freeNodes(self.allocator, e.value_ptr.nodes);
+            if (!e.value_ptr.negative) freeNodes(self.allocator, e.value_ptr.nodes);
         }
         self.map.deinit(self.allocator);
     }
 
-    fn get(self: *RouteCache, host: []const u8, now_ns: i128) ?[]const []const u8 {
+    fn get(self: *RouteCache, host: []const u8, now_ns: i128) ?Hit {
         const e = self.map.getPtr(host) orelse return null;
         if (now_ns >= e.expires_ns) return null;
-        return e.nodes;
+        if (e.negative) return .not_found;
+        return .{ .nodes = e.nodes };
     }
 
     fn putOwned(self: *RouteCache, host: []const u8, owned_nodes: [][]u8, now_ns: i128) !void {
         errdefer freeNodes(self.allocator, owned_nodes);
         const gop = try self.map.getOrPut(self.allocator, host);
         if (gop.found_existing) {
-            freeNodes(self.allocator, gop.value_ptr.nodes);
+            if (gop.value_ptr.negative) {
+                self.neg_count -= 1;
+            } else {
+                freeNodes(self.allocator, gop.value_ptr.nodes);
+            }
         } else {
             gop.key_ptr.* = self.allocator.dupe(u8, host) catch |e| {
                 self.map.removeByPtr(gop.key_ptr);
                 return e;
             };
         }
-        gop.value_ptr.nodes = owned_nodes;
-        gop.value_ptr.expires_ns = now_ns + self.ttl_ns;
+        gop.value_ptr.* = .{ .nodes = owned_nodes, .negative = false, .expires_ns = now_ns + self.ttl_ns };
+    }
+
+    /// Record a CP 404 for `host`. Best-effort (an allocation failure
+    /// or a full negative set just skips — the next request re-asks
+    /// the CP, which is today's behavior).
+    fn putNegative(self: *RouteCache, host: []const u8, now_ns: i128) void {
+        if (self.neg_count >= NEG_CAP) self.sweepExpiredNegatives(now_ns);
+        const gop = self.map.getOrPut(self.allocator, host) catch return;
+        if (gop.found_existing) {
+            if (!gop.value_ptr.negative) {
+                freeNodes(self.allocator, gop.value_ptr.nodes);
+                self.neg_count += 1;
+            }
+        } else {
+            if (self.neg_count >= NEG_CAP) {
+                self.map.removeByPtr(gop.key_ptr);
+                return;
+            }
+            gop.key_ptr.* = self.allocator.dupe(u8, host) catch {
+                self.map.removeByPtr(gop.key_ptr);
+                return;
+            };
+            self.neg_count += 1;
+        }
+        gop.value_ptr.* = .{ .nodes = &.{}, .negative = true, .expires_ns = now_ns + self.neg_ttl_ns };
+    }
+
+    fn sweepExpiredNegatives(self: *RouteCache, now_ns: i128) void {
+        var it = self.map.iterator();
+        var expired: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer expired.deinit(self.allocator);
+        while (it.next()) |e| {
+            if (e.value_ptr.negative and now_ns >= e.value_ptr.expires_ns)
+                expired.append(self.allocator, e.key_ptr.*) catch break;
+        }
+        for (expired.items) |key| self.invalidate(key);
     }
 
     pub fn invalidate(self: *RouteCache, host: []const u8) void {
         if (self.map.fetchRemove(host)) |kv| {
             self.allocator.free(kv.key);
-            freeNodes(self.allocator, kv.value.nodes);
+            if (kv.value.negative) {
+                self.neg_count -= 1;
+            } else {
+                freeNodes(self.allocator, kv.value.nodes);
+            }
         }
     }
 };
@@ -379,6 +570,60 @@ pub fn Proxy(comptime FrontH2: type) type {
         /// Live-flow count (operator visibility / leak canary).
         live_flows: usize = 0,
         live_tunnels: usize = 0,
+        /// Upstream connect deadline (`REWIND_FRONT_CONNECT_TIMEOUT_MS`;
+        /// main.zig overrides after init).
+        connect_timeout_ns: i128 = CONNECT_TIMEOUT_NS_DEFAULT,
+        /// Inbound request-body between-bytes budget
+        /// (`REWIND_FRONT_BODY_STALL_TIMEOUT_MS`; 0 disables).
+        body_stall_ns: i128 = BODY_STALL_NS_DEFAULT,
+        /// Upstream legs per backend node (`REWIND_FRONT_UPSTREAM_CONNS`,
+        /// clamped 1..MAX_LEGS). Applied at pool-entry creation.
+        legs_per_node: u8 = 2,
+        /// Per-leg in-flight stream cap
+        /// (`REWIND_FRONT_UPSTREAM_STREAM_CAP`; see LEG_STREAM_CAP).
+        leg_stream_cap: u32 = LEG_STREAM_CAP,
+
+        // ── Observability (plan C11) ──────────────────────────────────
+        /// One `front-access:` log line per completed flow
+        /// (`REWIND_FRONT_ACCESS_LOG=0` disables).
+        access_log: bool = true,
+        /// 421 not-leader re-aims (leadership churn / cold leader cache).
+        count_reaims_421: u64 = 0,
+        /// Upstream connects that blew their deadline (plan A1).
+        count_connect_timeouts: u64 = 0,
+        /// Upstream connect failures (refused/unreachable).
+        count_conn_failures: u64 = 0,
+        /// 504s from the response-headers deadline.
+        count_resp_timeouts: u64 = 0,
+        /// Aborts from the inbound body-stall budget (plan A5).
+        count_body_stalls: u64 = 0,
+        /// CP route answers: not_found (negative-cached) / transient error.
+        count_route_not_found: u64 = 0,
+        count_route_errors: u64 = 0,
+        /// Flows 503'd out of a cold-route park past ROUTE_WAIT.
+        count_route_expired: u64 = 0,
+        /// Non-idempotent flows 502'd at the ambiguous-transport-error
+        /// gate instead of replayed (plan A2).
+        count_ambiguous_502: u64 = 0,
+        /// Requests shed 503 because every upstream leg was saturated
+        /// (plan A3) — the visible form of what used to queue invisibly.
+        count_upstream_sheds: u64 = 0,
+        /// Requests 429'd at the per-client-IP flow cap (plan C13).
+        count_client_limited: u64 = 0,
+        /// Per-client-IP live flow/tunnel cap
+        /// (`REWIND_FRONT_MAX_FLOWS_PER_IP`; 0 = off, the default —
+        /// this is an abuse-response knob: legitimate NAT/corp egress
+        /// can fan many users out of one address, so the operator
+        /// picks the ceiling). Requires the B7 peer capture; a conn
+        /// whose peer install hasn't landed yet is not counted.
+        max_flows_per_ip: u32 = 0,
+        /// peer IP → live flows+tunnels. Keys owned; entries removed
+        /// at zero, so the map is bounded by concurrent client IPs.
+        flows_by_peer: std.StringHashMapUnmanaged(u32) = .empty,
+        /// Request-duration histogram (intake → flow teardown).
+        lat_counts: [LAT_BOUNDS_MS.len + 1]u64 = @splat(0),
+        lat_sum_ms: u64 = 0,
+        lat_total: u64 = 0,
 
         const StreamKey = struct {
             idx: u32,
@@ -397,13 +642,32 @@ pub fn Proxy(comptime FrontH2: type) type {
             tunnel: *WsTunnel,
         };
 
-        const Upstream = struct {
-            origin: []u8, // owned, also the pool key
+        /// One pooled h2c connection to a backend node (plan A3). Legs
+        /// live inline in their heap-allocated `Upstream`, so `*Leg`
+        /// is stable for the process lifetime — FlowRef.leg and connect
+        /// entities point at them across polls.
+        const Leg = struct {
+            up: *Upstream,
             state: enum { down, connecting, up } = .down,
             sess: Entity = Entity.nil,
-            addr: ?std.net.Address = null,
             last_fail_ns: i128 = 0,
-            /// Flows/tunnels waiting on the in-flight connect — AND tunnels
+            /// Deadline for an in-flight connect to complete. Stamped at
+            /// dial time; swept by `expireStalledConnects` (a SYN-
+            /// blackholed backend otherwise pins its waiters for the
+            /// kernel connect budget). 0 = no connect in flight.
+            connect_deadline_ns: i128 = 0,
+            /// Streams submitted on this leg whose terminals haven't
+            /// landed — the least-loaded pick key and the shed gate.
+            inflight: u32 = 0,
+        };
+
+        const Upstream = struct {
+            origin: []u8, // owned, also the pool key
+            addr: ?std.net.Address = null,
+            legs: [MAX_LEGS]Leg,
+            /// Configured leg count for this node (1..MAX_LEGS).
+            n_legs: u8,
+            /// Flows/tunnels waiting on an in-flight connect — AND tunnels
             /// re-parked here on a live conn whose peer hasn't yet advertised
             /// ENABLE_CONNECT_PROTOCOL (its SETTINGS trails connect-complete).
             /// `drainSettledTunnels` resumes those once the bit lands.
@@ -412,6 +676,13 @@ pub fn Proxy(comptime FrontH2: type) type {
             /// tunnels wait in `waiters`. 0 = unset (no tunnel awaiting
             /// SETTINGS). Stamped/cleared by `drainSettledTunnels`.
             settle_deadline_ns: i128 = 0,
+
+            fn anyConnecting(up: *const Upstream) bool {
+                for (up.legs[0..up.n_legs]) |*leg| {
+                    if (leg.state == .connecting) return true;
+                }
+                return false;
+            }
         };
 
         /// One WS tunnel: a downstream h1 Upgrade paired with an upstream
@@ -427,6 +698,11 @@ pub fn Proxy(comptime FrontH2: type) type {
             upgrade_ent: Entity,
             authority: []u8, // owned
             host: []u8, // owned
+            /// Forwarding identity (plan B7) — see `Flow.peer_ip`. WS
+            /// upgrades are h1 at the edge; TLS-ness rides `fwd_proto`.
+            peer_ip: [46]u8 = undefined,
+            peer_ip_len: u8 = 0,
+            fwd_proto: []const u8 = "http",
             nodes: [][]u8 = &.{},
             node_idx: usize = 0,
             attempt: u32 = 0,
@@ -465,6 +741,26 @@ pub fn Proxy(comptime FrontH2: type) type {
             authority: []u8, // owned; raw (with :port), for :authority upstream
             host: []u8, // owned; portless, the cache/invalidate key
 
+            // Observability (plan C11): captured at intake, emitted as
+            // one access-log line + histogram sample at teardown.
+            t_start_ns: i128 = 0,
+            method: [8]u8 = undefined, // truncated copy; enough for OPTIONS
+            method_len: u8 = 0,
+            path: []u8 = &.{}, // owned dupe; empty on alloc failure
+            final_status: u16 = 0,
+            resp_bytes: u64 = 0,
+
+            // Forwarding identity (plan B7), captured at intake from the
+            // downstream connection; stamped upstream on every attempt.
+            peer_ip: [46]u8 = undefined, // bare IP, no port/brackets
+            peer_ip_len: u8 = 0,
+            /// Downstream `:scheme` — "https" when the front terminated
+            /// TLS (static strings only; never a borrowed slice).
+            fwd_proto: []const u8 = "http",
+            /// The appended `Via` entry (RFC 7230 §5.7.1), versioned by
+            /// the received protocol.
+            via_entry: []const u8 = "2 rewind-front",
+
             // downstream identity
             down_ent: Entity,
             down_sess: Entity,
@@ -486,7 +782,19 @@ pub fn Proxy(comptime FrontH2: type) type {
             /// Absolute body bytes received from downstream so far.
             body_total: usize = 0,
             body_complete: bool = false,
+            /// Monotonic stamp of the last inbound body byte (or sink
+            /// attach). 0 = not armed (classic/bodyless flows). Swept
+            /// by `expireStalledBodies`.
+            last_body_progress_ns: i128 = 0,
             replayable: bool = true,
+            /// The request method is safe to re-send after an AMBIGUOUS
+            /// transport failure (upstream died after the head was
+            /// submitted, before any response). GET/HEAD/OPTIONS only —
+            /// rewind handlers make PUT/DELETE semantics customer-defined,
+            /// so they don't get the RFC 9110 idempotency benefit of the
+            /// doubt. 421 re-aim is NOT gated on this: a 421 proves
+            /// nothing executed (decisions.md §10.5).
+            idempotent: bool = false,
             down_sink_live: bool = false,
             /// Bytes forwarded upstream, not yet reported to the
             /// downstream sink's `drained` (window repayment).
@@ -577,6 +885,27 @@ pub fn Proxy(comptime FrontH2: type) type {
             };
         }
 
+        /// Observability: total in-flight upstream streams summed across
+        /// every pooled leg, the live leg count, and the largest single-leg
+        /// inflight. `inflight` is submitted-but-not-terminated streams on a
+        /// leg (`enqueue`/terminal repay). If half-closed proxied streams
+        /// leak (their terminal never lands), this climbs monotonically and
+        /// never drains at idle — the pooled-conn leak canary.
+        pub const UpstreamStats = struct { inflight: u64 = 0, live_legs: u32 = 0, max_leg_inflight: u32 = 0 };
+        pub fn upstreamStats(self: *const Self) UpstreamStats {
+            var s: UpstreamStats = .{};
+            var it = self.pool.valueIterator();
+            while (it.next()) |up_ptr| {
+                const up = up_ptr.*;
+                for (up.legs[0..up.n_legs]) |*leg| {
+                    if (leg.state == .up) s.live_legs += 1;
+                    s.inflight += leg.inflight;
+                    if (leg.inflight > s.max_leg_inflight) s.max_leg_inflight = leg.inflight;
+                }
+            }
+            return s;
+        }
+
         pub fn deinit(self: *Self) void {
             var it = self.pool.valueIterator();
             while (it.next()) |up| {
@@ -598,6 +927,9 @@ pub fn Proxy(comptime FrontH2: type) type {
             var rp = self.route_pending.keyIterator();
             while (rp.next()) |k| self.allocator.free(k.*);
             self.route_pending.deinit(self.allocator);
+            var pk = self.flows_by_peer.keyIterator();
+            while (pk.next()) |k| self.allocator.free(k.*);
+            self.flows_by_peer.deinit(self.allocator);
             self.leaders.deinit(self.allocator);
         }
 
@@ -633,6 +965,10 @@ pub fn Proxy(comptime FrontH2: type) type {
             self.expireParkedRoutes(now_ns);
             // 504 any flow stuck awaiting upstream response headers.
             self.expireStalledResponses(now_ns);
+            // Abort any flow whose inbound request body stalled.
+            self.expireStalledBodies(now_ns);
+            // Fail over waiters whose upstream connect blew its deadline.
+            self.expireStalledConnects(now_ns);
             try self.reg.flush();
         }
 
@@ -661,6 +997,9 @@ pub fn Proxy(comptime FrontH2: type) type {
                     .streaming => {
                         flow.down_sink_live = true;
                         flow.sink_refs += 1;
+                        // Arm the body-progress budget (a body is now
+                        // owed; `downSinkPush` refreshes per byte).
+                        flow.last_body_progress_ns = now_ns;
                     },
                     .eof => {
                         // push()es + finish() already ran synchronously.
@@ -741,7 +1080,20 @@ pub fn Proxy(comptime FrontH2: type) type {
                     self.server.wsUpgradeReject(ent, 400);
                     continue;
                 };
-                const host = hostOnly(authority_raw);
+                var host_buf: [255]u8 = undefined;
+                const host = normalizeHost(&host_buf, authority_raw) orelse {
+                    self.server.wsUpgradeReject(ent, 400);
+                    continue;
+                };
+                var peer_buf: [46]u8 = undefined;
+                var peer_len: u8 = 0;
+                if (self.server.connPeerAddr(sess.entity)) |peer|
+                    peer_len = peerIpString(&peer_buf, peer);
+                if (peer_len > 0 and self.peerAtCap(peer_buf[0..peer_len])) {
+                    self.count_client_limited += 1;
+                    self.server.wsUpgradeReject(ent, 429);
+                    continue;
+                }
                 const route = self.resolveRoute(host, now_ns);
                 switch (route) {
                     .not_found => {
@@ -768,6 +1120,10 @@ pub fn Proxy(comptime FrontH2: type) type {
                     .authority = undefined,
                     .host = undefined,
                 };
+                t.peer_ip_len = peer_len;
+                if (peer_len > 0) @memcpy(t.peer_ip[0..peer_len], peer_buf[0..peer_len]);
+                const ws_scheme = headerValue(rh, ":scheme") orelse "http";
+                t.fwd_proto = if (std.mem.eql(u8, ws_scheme, "https")) "https" else "http";
                 t.authority = self.allocator.dupe(u8, authority_raw) catch {
                     self.allocator.destroy(t);
                     self.server.wsUpgradeReject(ent, 503);
@@ -801,6 +1157,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     else => unreachable,
                 }
                 self.live_tunnels += 1;
+                if (t.peer_ip_len > 0) self.peerFlowInc(t.peer_ip[0..t.peer_ip_len]);
                 fr.ptr = @ptrCast(t);
                 fr.tunnel = true;
                 if (!t.awaiting_route) self.startTunnelAttempt(t);
@@ -816,31 +1173,36 @@ pub fn Proxy(comptime FrontH2: type) type {
                 self.tunnelAttemptFailed(t);
                 return;
             };
-            switch (up.state) {
-                .up => {
-                    if (self.reg.isStale(up.sess)) {
-                        up.state = .down;
-                        up.sess = Entity.nil;
-                        self.connectUpstream(up, .{ .tunnel = t });
-                    } else {
-                        self.submitTunnel(t, up.sess);
-                    }
-                },
-                .connecting => {
-                    up.waiters.append(self.allocator, .{ .tunnel = t }) catch {
-                        self.tunnelAttemptFailed(t);
-                        return;
-                    };
-                    t.waiting_conn = true;
-                },
-                .down => self.connectUpstream(up, .{ .tunnel = t }),
+            const now = std.time.nanoTimestamp();
+            if (self.pickLeg(up)) |leg| {
+                self.submitTunnel(t, leg);
+                return;
             }
+            if (up.anyConnecting()) {
+                up.waiters.append(self.allocator, .{ .tunnel = t }) catch {
+                    self.tunnelAttemptFailed(t);
+                    return;
+                };
+                t.waiting_conn = true;
+                return;
+            }
+            if (dialableLeg(up, now)) |leg| {
+                self.dialLeg(leg, .{ .tunnel = t });
+                return;
+            }
+            if (self.anyLegUp(up)) {
+                // Saturated: refuse the Upgrade retryably (plan A3).
+                self.count_upstream_sheds += 1;
+                self.tunnelAttemptFailed(t);
+                return;
+            }
+            self.tunnelAttemptFailed(t);
         }
 
-        /// Open the Extended-CONNECT stream on a live pool conn. RFC 8441
+        /// Open the Extended-CONNECT stream on a live pool leg. RFC 8441
         /// requires the peer's ENABLE_CONNECT_PROTOCOL before submitting.
-        fn submitTunnel(self: *Self, t: *WsTunnel, sess: Entity) void {
-            if (!self.server.connExtendedConnect(sess)) {
+        fn submitTunnel(self: *Self, t: *WsTunnel, leg: *Leg) void {
+            if (!self.server.connExtendedConnect(leg.sess)) {
                 // Live conn, but the peer's ENABLE_CONNECT_PROTOCOL SETTINGS
                 // hasn't arrived yet — common on a freshly-`.up` leg (its
                 // SETTINGS trails connect-complete). Re-park on the pool
@@ -848,11 +1210,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 // awaiting connect) rather than failing; drainSettledTunnels
                 // resumes it once the bit lands. The old immediate give-up
                 // surfaced a transient 502 on cold upstream connections.
-                const up = self.poolEntry(t.nodes[t.node_idx]) catch {
-                    self.tunnelAttemptFailed(t);
-                    return;
-                };
-                up.waiters.append(self.allocator, .{ .tunnel = t }) catch {
+                leg.up.waiters.append(self.allocator, .{ .tunnel = t }) catch {
                     self.tunnelAttemptFailed(t);
                     return;
                 };
@@ -870,63 +1228,47 @@ pub fn Proxy(comptime FrontH2: type) type {
             };
             const coll = &self.server.client_stream_request_in;
             t.attempt += 1;
-            self.reg.set(pump, coll, h2.Session, .{ .entity = sess }) catch {};
+            self.reg.set(pump, coll, h2.Session, .{ .entity = leg.sess }) catch {};
             self.reg.set(pump, coll, h2.ReqHeaders, packed_hdrs) catch {};
             self.reg.set(pump, coll, h2.ReqBody, .{}) catch {};
             self.reg.set(pump, coll, h2.H2IoResult, .{ .err = 0 }) catch {};
             self.reg.set(pump, coll, h2.StreamId, .{ .id = 0 }) catch {};
-            self.reg.set(pump, coll, FlowRef, .{ .ptr = @ptrCast(t), .attempt = t.attempt, .tunnel = true }) catch {};
-            t.up_sess = sess;
+            self.reg.set(pump, coll, FlowRef, .{ .ptr = @ptrCast(t), .attempt = t.attempt, .tunnel = true, .leg = @ptrCast(leg) }) catch {};
+            leg.inflight += 1;
+            t.up_sess = leg.sess;
             t.attempt_live = true;
             t.pending_terminals += 1;
         }
 
-        /// The five RFC 8441 CONNECT headers, one owned buffer.
+        /// The five RFC 8441 CONNECT headers + the forwarding identity
+        /// (plan B7), one owned buffer via `packFields`.
         fn packTunnelHeaders(self: *Self, t: *WsTunnel) !h2.ReqHeaders {
-            const Pair = struct { name: []const u8, value: []const u8 };
-            const pairs = [_]Pair{
-                .{ .name = ":method", .value = "CONNECT" },
-                .{ .name = ":protocol", .value = "websocket" },
-                .{ .name = ":scheme", .value = "http" },
-                .{ .name = ":authority", .value = t.authority },
-                .{ .name = ":path", .value = "/" }, // overwritten below
-            };
             // :path comes from the Upgrade head (still on the entity).
             const rh_src = self.reg.get(t.upgrade_ent, &self.server.ws_upgrade_out, h2.ReqHeaders) catch null;
             const path: []const u8 = if (rh_src) |rh| (headerValue(rh.*, ":path") orelse "/") else "/";
 
-            var strbytes: usize = 0;
-            for (pairs[0..4]) |p| strbytes += p.name.len + p.value.len;
-            strbytes += ":path".len + path.len;
-
-            const n = pairs.len;
-            const fields_size = n * @sizeOf(h2.HeaderField);
-            const buf = try self.allocator.alloc(u8, fields_size + strbytes);
-            errdefer self.allocator.free(buf);
-            const fields: [*]h2.HeaderField = @ptrCast(@alignCast(buf.ptr));
-            const strbase = buf.ptr + fields_size;
-            var soff: usize = 0;
-            var fi: usize = 0;
-            const put = struct {
-                fn go(f: [*]h2.HeaderField, sb: [*]u8, off: *usize, idx: *usize, name: []const u8, value: []const u8) void {
-                    @memcpy(sb[off.* .. off.* + name.len], name);
-                    const noff = off.*;
-                    off.* += name.len;
-                    @memcpy(sb[off.* .. off.* + value.len], value);
-                    const voff = off.*;
-                    off.* += value.len;
-                    f[idx.*] = .{
-                        .name = sb + noff,
-                        .name_len = @intCast(name.len),
-                        .value = sb + voff,
-                        .value_len = @intCast(value.len),
-                    };
-                    idx.* += 1;
-                }
-            }.go;
-            for (pairs[0..4]) |p| put(fields, strbase, &soff, &fi, p.name, p.value);
-            put(fields, strbase, &soff, &fi, ":path", path);
-            return .{ .fields = fields, .count = @intCast(n), ._buf = buf.ptr, ._buf_len = @intCast(buf.len) };
+            var pairs: [8]NameValue = undefined;
+            var n: usize = 0;
+            pairs[n] = .{ .name = ":method", .value = "CONNECT" };
+            n += 1;
+            pairs[n] = .{ .name = ":protocol", .value = "websocket" };
+            n += 1;
+            pairs[n] = .{ .name = ":scheme", .value = "http" };
+            n += 1;
+            pairs[n] = .{ .name = ":authority", .value = t.authority };
+            n += 1;
+            pairs[n] = .{ .name = ":path", .value = path };
+            n += 1;
+            if (t.peer_ip_len > 0) {
+                pairs[n] = .{ .name = "x-forwarded-for", .value = t.peer_ip[0..t.peer_ip_len] };
+                n += 1;
+            }
+            pairs[n] = .{ .name = "x-forwarded-proto", .value = t.fwd_proto };
+            n += 1;
+            pairs[n] = .{ .name = "via", .value = "1.1 rewind-front" }; // WS upgrades are h1 at the edge
+            n += 1;
+            const p = try packFields(self.allocator, pairs[0..n]);
+            return .{ .fields = p.fields, .count = p.count, ._buf = p.buf, ._buf_len = p.buf_len };
         }
 
         /// Current tunnel attempt failed before the 200: next node or
@@ -968,6 +1310,7 @@ pub fn Proxy(comptime FrontH2: type) type {
 
         fn maybeDestroyTunnel(self: *Self, t: *WsTunnel) void {
             if (!t.done or t.pending_terminals != 0 or t.sink_refs != 0) return;
+            if (t.peer_ip_len > 0) self.peerFlowDec(t.peer_ip[0..t.peer_ip_len]);
             self.unmapTunnel(t);
             self.allocator.free(t.authority);
             self.allocator.free(t.host);
@@ -1070,6 +1413,38 @@ pub fn Proxy(comptime FrontH2: type) type {
             };
         }
 
+        // ── Per-client limits (plan C13) ──────────────────────────────
+
+        fn peerAtCap(self: *Self, peer: []const u8) bool {
+            if (self.max_flows_per_ip == 0 or peer.len == 0) return false;
+            const cnt = self.flows_by_peer.get(peer) orelse return false;
+            return cnt >= self.max_flows_per_ip;
+        }
+
+        /// Best-effort accounting (LeaderCache's discipline): an OOM
+        /// skip degrades the cap toward lenient, never toward wedged.
+        fn peerFlowInc(self: *Self, peer: []const u8) void {
+            if (self.max_flows_per_ip == 0 or peer.len == 0) return;
+            const gop = self.flows_by_peer.getOrPut(self.allocator, peer) catch return;
+            if (!gop.found_existing) {
+                gop.key_ptr.* = self.allocator.dupe(u8, peer) catch {
+                    self.flows_by_peer.removeByPtr(gop.key_ptr);
+                    return;
+                };
+                gop.value_ptr.* = 0;
+            }
+            gop.value_ptr.* += 1;
+        }
+
+        fn peerFlowDec(self: *Self, peer: []const u8) void {
+            if (self.max_flows_per_ip == 0 or peer.len == 0) return;
+            const e = self.flows_by_peer.getPtr(peer) orelse return;
+            e.* -|= 1;
+            if (e.* == 0) {
+                if (self.flows_by_peer.fetchRemove(peer)) |kv| self.allocator.free(kv.key);
+            }
+        }
+
         fn beginFlow(
             self: *Self,
             coll: anytype,
@@ -1084,7 +1459,21 @@ pub fn Proxy(comptime FrontH2: type) type {
                 try self.replyStatus(coll, ent, sid, sess, 400);
                 return null;
             };
-            const host = hostOnly(authority_raw);
+            var host_buf: [255]u8 = undefined;
+            const host = normalizeHost(&host_buf, authority_raw) orelse {
+                try self.replyStatus(coll, ent, sid, sess, 400);
+                return null;
+            };
+
+            var peer_buf: [46]u8 = undefined;
+            var peer_len: u8 = 0;
+            if (self.server.connPeerAddr(sess.entity)) |peer|
+                peer_len = peerIpString(&peer_buf, peer);
+            if (peer_len > 0 and self.peerAtCap(peer_buf[0..peer_len])) {
+                self.count_client_limited += 1;
+                try self.replyStatus(coll, ent, sid, sess, 429);
+                return null;
+            }
 
             const route = self.resolveRoute(host, now_ns);
             switch (route) {
@@ -1110,7 +1499,18 @@ pub fn Proxy(comptime FrontH2: type) type {
                 .down_sess = sess.entity,
                 .down_sid = sid.id,
                 .down_home = home,
+                .idempotent = isIdempotentMethod(headerValue(rh, ":method") orelse "GET"),
             };
+            flow.peer_ip_len = peer_len;
+            if (peer_len > 0) @memcpy(flow.peer_ip[0..peer_len], peer_buf[0..peer_len]);
+            const scheme = headerValue(rh, ":scheme") orelse "http";
+            flow.fwd_proto = if (std.mem.eql(u8, scheme, "https")) "https" else "http";
+            flow.via_entry = if (self.server.connIsHttp1(sess.entity)) "1.1 rewind-front" else "2 rewind-front";
+            flow.t_start_ns = now_ns;
+            const method = headerValue(rh, ":method") orelse "GET";
+            flow.method_len = @intCast(@min(method.len, flow.method.len));
+            @memcpy(flow.method[0..flow.method_len], method[0..flow.method_len]);
+            flow.path = self.allocator.dupe(u8, headerValue(rh, ":path") orelse "/") catch @constCast(@as([]const u8, &.{}));
             flow.host = self.allocator.dupe(u8, host) catch |e| {
                 self.allocator.free(flow.authority);
                 return e;
@@ -1139,6 +1539,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 else => unreachable,
             }
             self.live_flows += 1;
+            if (flow.peer_ip_len > 0) self.peerFlowInc(flow.peer_ip[0..flow.peer_ip_len]);
             return flow;
         }
 
@@ -1160,53 +1561,119 @@ pub fn Proxy(comptime FrontH2: type) type {
 
             const origin = flow.nodes[flow.node_idx];
             const up = self.poolEntry(origin) catch {
-                self.attemptFailed(flow, false);
+                self.attemptFailed(flow, false, false);
                 return;
             };
-            switch (up.state) {
-                .up => {
-                    if (self.reg.isStale(up.sess)) {
-                        // Idle-reaped (or died quietly). Reconnect.
-                        up.state = .down;
-                        up.sess = Entity.nil;
-                        self.connectUpstream(up, .{ .flow = flow });
-                    } else {
-                        self.submitAttempt(flow, up.sess);
-                    }
-                },
-                .connecting => {
-                    up.waiters.append(self.allocator, .{ .flow = flow }) catch {
-                        self.attemptFailed(flow, false);
-                        return;
-                    };
-                    flow.waiting_conn = true;
-                },
-                .down => self.connectUpstream(up, .{ .flow = flow }),
+            const now = std.time.nanoTimestamp();
+            if (self.pickLeg(up)) |leg| {
+                // Background scale-out: the chosen leg is getting busy
+                // and a spare leg exists — dial it for FUTURE submits;
+                // this flow rides the live leg now.
+                if (leg.inflight >= LEG_GROW_THRESHOLD and !up.anyConnecting()) {
+                    if (dialableLeg(up, now)) |spare| self.dialLeg(spare, null);
+                }
+                self.submitAttempt(flow, leg);
+                return;
             }
+            if (up.anyConnecting()) {
+                up.waiters.append(self.allocator, .{ .flow = flow }) catch {
+                    self.attemptFailed(flow, false, false);
+                    return;
+                };
+                flow.waiting_conn = true;
+                return;
+            }
+            if (dialableLeg(up, now)) |leg| {
+                self.dialLeg(leg, .{ .flow = flow });
+                return;
+            }
+            if (self.anyLegUp(up)) {
+                // Every leg live but saturated: SHED with a retryable
+                // 503 (nothing submitted) — the bounded, visible form
+                // of what used to queue invisibly in nghttp2 (plan A3).
+                self.count_upstream_sheds += 1;
+                std.log.warn("front: all {d} leg(s) to {s} saturated — shedding", .{ up.n_legs, up.origin });
+                self.finishWithStatus(flow, 503);
+                return;
+            }
+            // All legs down inside backoff — fail over to the next node.
+            self.attemptFailed(flow, false, false);
         }
 
         fn poolEntry(self: *Self, origin: []const u8) !*Upstream {
             if (self.pool.get(origin)) |up| return up;
             const up = try self.allocator.create(Upstream);
             errdefer self.allocator.destroy(up);
-            up.* = .{ .origin = try self.allocator.dupe(u8, origin) };
+            up.* = .{
+                .origin = try self.allocator.dupe(u8, origin),
+                .legs = undefined,
+                .n_legs = @max(1, @min(self.legs_per_node, MAX_LEGS)),
+            };
+            for (&up.legs) |*leg| leg.* = .{ .up = up };
             try self.pool.put(self.allocator, up.origin, up);
             return up;
         }
 
-        /// Kick off (or join) a connect to a down upstream. Inside the
-        /// backoff window the attempt fails over immediately instead
-        /// of hammering a dead node.
-        fn connectUpstream(self: *Self, up: *Upstream, waiter: Waiter) void {
-            const now = std.time.nanoTimestamp();
-            if (up.state == .down and now - up.last_fail_ns < CONNECT_BACKOFF_NS) {
-                self.waiterFailed(waiter);
-                return;
+        /// Least-loaded live leg below the stream cap; stale legs are
+        /// marked down in passing (an idle reap is not a failure — no
+        /// backoff). Null = nothing submittable right now.
+        fn pickLeg(self: *Self, up: *Upstream) ?*Leg {
+            var best: ?*Leg = null;
+            for (up.legs[0..up.n_legs]) |*leg| {
+                if (leg.state != .up) continue;
+                if (self.reg.isStale(leg.sess)) {
+                    leg.state = .down;
+                    leg.sess = Entity.nil;
+                    leg.last_fail_ns = 0;
+                    continue;
+                }
+                if (leg.inflight >= self.leg_stream_cap) continue;
+                if (best == null or leg.inflight < best.?.inflight) best = leg;
             }
+            return best;
+        }
+
+        /// First down leg outside its reconnect backoff, or null.
+        fn dialableLeg(up: *Upstream, now_ns: i128) ?*Leg {
+            for (up.legs[0..up.n_legs]) |*leg| {
+                if (leg.state != .down) continue;
+                if (now_ns - leg.last_fail_ns < CONNECT_BACKOFF_NS) continue;
+                return leg;
+            }
+            return null;
+        }
+
+        /// True if any leg is live (even saturated) — distinguishes
+        /// "shed" from "node down" when nothing is submittable.
+        fn anyLegUp(self: *Self, up: *Upstream) bool {
+            for (up.legs[0..up.n_legs]) |*leg| {
+                if (leg.state == .up and !self.reg.isStale(leg.sess)) return true;
+            }
+            return false;
+        }
+
+        /// Mark any live leg whose session died (idle-reaped / conn
+        /// error) as down, without backoff.
+        fn markStaleLegsDown(self: *Self, up: *Upstream) void {
+            for (up.legs[0..up.n_legs]) |*leg| {
+                if (leg.state == .up and self.reg.isStale(leg.sess)) {
+                    leg.state = .down;
+                    leg.sess = Entity.nil;
+                    leg.last_fail_ns = 0;
+                }
+            }
+        }
+
+        /// Dial one down leg (caller checked backoff via `dialableLeg`).
+        /// `waiter` (if any) parks on the NODE's waiter list until any
+        /// leg comes up. A null waiter is the background scale-out dial.
+        fn dialLeg(self: *Self, leg: *Leg, waiter: ?Waiter) void {
+            const up = leg.up;
+            const now = std.time.nanoTimestamp();
             const addr = up.addr orelse blk: {
                 const a = resolveOrigin(up.origin) catch {
-                    up.last_fail_ns = now;
-                    self.waiterFailed(waiter);
+                    leg.last_fail_ns = now;
+                    if (waiter) |w| self.waiterFailed(w);
                     return;
                 };
                 up.addr = a;
@@ -1214,55 +1681,58 @@ pub fn Proxy(comptime FrontH2: type) type {
             };
 
             const ce = self.reg.create(&self.server.client_connect_in) catch {
-                self.waiterFailed(waiter);
+                if (waiter) |w| self.waiterFailed(w);
                 return;
             };
             self.reg.set(ce, &self.server.client_connect_in, h2.ConnectTarget, .{ .addr = addr }) catch {};
             self.reg.set(ce, &self.server.client_connect_in, h2.Session, .{}) catch {};
             self.reg.set(ce, &self.server.client_connect_in, h2.H2IoResult, .{ .err = 0 }) catch {};
-            self.reg.set(ce, &self.server.client_connect_in, FlowRef, .{ .ptr = @ptrCast(up) }) catch {};
+            self.reg.set(ce, &self.server.client_connect_in, FlowRef, .{ .ptr = @ptrCast(leg) }) catch {};
 
-            up.state = .connecting;
-            up.waiters.append(self.allocator, waiter) catch {
-                // The connect proceeds (other waiters may join); this
-                // one fails over.
-                self.waiterFailed(waiter);
-                return;
-            };
-            switch (waiter) {
-                .flow => |f| f.waiting_conn = true,
-                .tunnel => |t| t.waiting_conn = true,
+            leg.state = .connecting;
+            leg.connect_deadline_ns = now + self.connect_timeout_ns;
+            if (waiter) |w| {
+                up.waiters.append(self.allocator, w) catch {
+                    // The connect proceeds (other waiters may join); this
+                    // one fails over.
+                    self.waiterFailed(w);
+                    return;
+                };
+                switch (w) {
+                    .flow => |f| f.waiting_conn = true,
+                    .tunnel => |t| t.waiting_conn = true,
+                }
             }
         }
 
         fn waiterFailed(self: *Self, waiter: Waiter) void {
             switch (waiter) {
-                .flow => |f| self.attemptFailed(f, false),
+                .flow => |f| self.attemptFailed(f, false, false),
                 .tunnel => |t| self.tunnelAttemptFailed(t),
             }
         }
 
-        /// Submit the current attempt's request head on `sess` via the
+        /// Submit the current attempt's request head on `leg` via the
         /// streaming client leg. The body (whatever its state) follows
         /// through `pumpUpstream`.
-        fn submitAttempt(self: *Self, flow: *Flow, sess: Entity) void {
+        fn submitAttempt(self: *Self, flow: *Flow, leg: *Leg) void {
             const rh = self.reg.get(flow.down_ent, self.downColl(flow), h2.ReqHeaders) catch {
                 self.teardownFlow(flow);
                 return;
             };
-            const packed_hdrs = self.packUpstreamHeaders(rh.*, flow.authority) catch {
-                self.attemptFailed(flow, false);
+            const packed_hdrs = self.packUpstreamHeaders(rh.*, flow) catch {
+                self.attemptFailed(flow, false, false);
                 return;
             };
 
             const pump = self.reg.create(&self.server.client_stream_request_in) catch {
                 if (packed_hdrs._buf) |b| self.allocator.free(b[0..packed_hdrs._buf_len]);
-                self.attemptFailed(flow, false);
+                self.attemptFailed(flow, false, false);
                 return;
             };
             const coll = &self.server.client_stream_request_in;
             flow.attempt += 1;
-            self.reg.set(pump, coll, h2.Session, .{ .entity = sess }) catch {};
+            self.reg.set(pump, coll, h2.Session, .{ .entity = leg.sess }) catch {};
             self.reg.set(pump, coll, h2.ReqHeaders, packed_hdrs) catch {};
             // A bodyless request (GET/HEAD/DELETE — body complete with zero
             // bytes) must carry END_STREAM on its upstream HEADERS: a proxy
@@ -1275,21 +1745,42 @@ pub fn Proxy(comptime FrontH2: type) type {
             self.reg.set(pump, coll, h2.ReqBody, .{ .complete = bodyless }) catch {};
             self.reg.set(pump, coll, h2.H2IoResult, .{ .err = 0 }) catch {};
             self.reg.set(pump, coll, h2.StreamId, .{ .id = 0 }) catch {};
-            self.reg.set(pump, coll, FlowRef, .{ .ptr = @ptrCast(flow), .attempt = flow.attempt }) catch {};
+            self.reg.set(pump, coll, FlowRef, .{ .ptr = @ptrCast(flow), .attempt = flow.attempt, .leg = @ptrCast(leg) }) catch {};
             if (bodyless) flow.up_closed = true;
 
-            flow.up_sess = sess;
+            leg.inflight += 1;
+            flow.up_sess = leg.sess;
             flow.attempt_live = true;
             flow.pending_terminals += 1;
         }
 
         /// The current attempt failed before any response. Re-aim or
         /// give up.
-        fn attemptFailed(self: *Self, flow: *Flow, conn_died: bool) void {
+        ///
+        /// `head_sent` says the request head was already handed to the
+        /// failed upstream. That makes the failure AMBIGUOUS for a
+        /// non-idempotent request: the worker may have dispatched the
+        /// handler (an `onHeaders` export activates on the head alone)
+        /// and committed before the connection died — a replay would
+        /// double-execute. Same discipline as the never-retried
+        /// post-propose 503 (decisions.md §10.5): the client's retry
+        /// policy owns the ambiguous case, so it gets a 502, not a
+        /// silent re-send. A 421 is NOT ambiguous (nothing entered the
+        /// log) and takes `handle421`, never this gate.
+        fn attemptFailed(self: *Self, flow: *Flow, conn_died: bool, head_sent: bool) void {
             self.unmapAttempt(flow);
             flow.attempt_live = false;
             if (flow.down_gone or !flow.down_alive) {
                 self.teardownFlow(flow);
+                return;
+            }
+            const replay_safe = flow.idempotent or !head_sent;
+            if (!replay_safe) {
+                // The dead node shouldn't seed future requests' start
+                // index, even though this flow can't re-aim.
+                if (conn_died) self.leaders.drop(self.allocator, flow.host);
+                self.count_ambiguous_502 += 1;
+                self.finishWithStatus(flow, 502);
                 return;
             }
             if (conn_died and flow.reconnect_budget > 0 and flow.canRetry()) {
@@ -1322,6 +1813,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             // Remember we were redirected: a later 2xx in this flow is
             // then provably from the leader (see `noteLeader`).
             flow.saw_421 = true;
+            self.count_reaims_421 += 1;
             // Learn the leader from the worker's `x-rewind-leader` redirect
             // hint — works even for a NON-replayable request, which can't
             // re-aim to discover the leader itself and would otherwise bounce
@@ -1381,10 +1873,14 @@ pub fn Proxy(comptime FrontH2: type) type {
                 const flow_refs = coll.column(FlowRef);
                 for (entities, sessions, flow_refs) |ent, sess, fr| {
                     if (fr.ptr) |p| {
-                        const up: *Upstream = @ptrCast(@alignCast(p));
-                        up.state = .up;
-                        up.sess = sess.entity;
-                        self.drainWaiters(up, true);
+                        const leg: *Leg = @ptrCast(@alignCast(p));
+                        leg.state = .up;
+                        leg.sess = sess.entity;
+                        // inflight is NOT reset: submits on the dead
+                        // predecessor conn still owe their (error)
+                        // terminals, each repaying exactly once.
+                        leg.connect_deadline_ns = 0;
+                        self.drainWaiters(leg.up, true);
                     }
                     try self.reg.destroy(ent);
                 }
@@ -1395,12 +1891,17 @@ pub fn Proxy(comptime FrontH2: type) type {
                 const flow_refs = coll.column(FlowRef);
                 for (entities, flow_refs) |ent, fr| {
                     if (fr.ptr) |p| {
-                        const up: *Upstream = @ptrCast(@alignCast(p));
-                        up.state = .down;
-                        up.sess = Entity.nil;
-                        up.last_fail_ns = now_ns;
-                        std.log.warn("front: connect to {s} failed", .{up.origin});
-                        self.drainWaiters(up, false);
+                        const leg: *Leg = @ptrCast(@alignCast(p));
+                        leg.state = .down;
+                        leg.sess = Entity.nil;
+                        leg.last_fail_ns = now_ns;
+                        leg.connect_deadline_ns = 0;
+                        self.count_conn_failures += 1;
+                        std.log.warn("front: connect to {s} failed", .{leg.up.origin});
+                        // Waiters stay parked while a sibling leg is
+                        // still dialing; they fail over only when the
+                        // whole node's dials are exhausted.
+                        if (!leg.up.anyConnecting()) self.drainWaiters(leg.up, false);
                     }
                     try self.reg.destroy(ent);
                 }
@@ -1418,9 +1919,11 @@ pub fn Proxy(comptime FrontH2: type) type {
                     if (flow.down_gone or !flow.down_alive) {
                         self.teardownFlow(flow);
                     } else if (ok) {
-                        self.submitAttempt(flow, up.sess);
+                        // Re-enter the pick (least-loaded leg / shed),
+                        // not a direct submit on any one session.
+                        self.startAttempt(flow);
                     } else {
-                        self.attemptFailed(flow, false);
+                        self.attemptFailed(flow, false, false);
                     }
                 },
                 .tunnel => |t| {
@@ -1428,7 +1931,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     if (t.down_gone or self.reg.isStale(t.down_conn)) {
                         self.finishTunnel(t);
                     } else if (ok) {
-                        self.submitTunnel(t, up.sess);
+                        self.startTunnelAttempt(t);
                     } else {
                         self.tunnelAttemptFailed(t);
                     }
@@ -1458,23 +1961,36 @@ pub fn Proxy(comptime FrontH2: type) type {
                 n += 1;
             }
             for (ups[0..n]) |up| {
-                if (up.state != .up or up.waiters.items.len == 0) {
+                if (up.waiters.items.len == 0) {
                     up.settle_deadline_ns = 0;
                     continue;
                 }
-                if (self.reg.isStale(up.sess)) {
-                    // Conn died under the waiters — fail them (they re-aim).
-                    up.state = .down;
-                    up.sess = Entity.nil;
-                    up.settle_deadline_ns = 0;
-                    self.drainWaiters(up, false);
-                } else if (self.server.connExtendedConnect(up.sess)) {
+                self.markStaleLegsDown(up);
+                var any_up = false;
+                var any_settled = false;
+                for (up.legs[0..up.n_legs]) |*leg| {
+                    if (leg.state != .up) continue;
+                    any_up = true;
+                    if (self.server.connExtendedConnect(leg.sess)) any_settled = true;
+                }
+                if (any_settled) {
                     up.settle_deadline_ns = 0;
                     self.drainWaiters(up, true);
-                } else if (up.settle_deadline_ns == 0) {
-                    up.settle_deadline_ns = now_ns + SETTLE_WAIT_NS;
-                } else if (now_ns >= up.settle_deadline_ns) {
-                    std.log.warn("front: {s} never advertised extended-connect within {d}ms — failing {d} waiting WS tunnel(s)", .{ up.origin, @divTrunc(SETTLE_WAIT_NS, std.time.ns_per_ms), up.waiters.items.len });
+                } else if (any_up) {
+                    if (up.settle_deadline_ns == 0) {
+                        up.settle_deadline_ns = now_ns + SETTLE_WAIT_NS;
+                    } else if (now_ns >= up.settle_deadline_ns) {
+                        std.log.warn("front: {s} never advertised extended-connect within {d}ms — failing {d} waiting WS tunnel(s)", .{ up.origin, @divTrunc(SETTLE_WAIT_NS, std.time.ns_per_ms), up.waiters.items.len });
+                        up.settle_deadline_ns = 0;
+                        self.drainWaiters(up, false);
+                    }
+                } else if (up.anyConnecting()) {
+                    // A dial is in flight; its completion drains the
+                    // waiters (either way).
+                    up.settle_deadline_ns = 0;
+                } else {
+                    // Every leg died under the waiters — fail them
+                    // (they re-aim).
                     up.settle_deadline_ns = 0;
                     self.drainWaiters(up, false);
                 }
@@ -1585,6 +2101,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             self.reg.move(flow.down_ent, src, &self.server.stream_response_in) catch {};
             flow.down_home = .responding;
             flow.resp_started = true;
+            flow.final_status = code;
         }
 
         /// Upstream pump: feed request-body chunks / close, account
@@ -1725,6 +2242,14 @@ pub fn Proxy(comptime FrontH2: type) type {
             for (entities, sids, statuses, resp_hdrs, resp_bodies, io_results, flow_refs) |ent, sid, status, rh, *rb, io_res, fr| {
                 defer self.reg.destroy(ent) catch {};
                 _ = sid;
+                // Repay the submitting leg's in-flight slot (plan A3) —
+                // exactly one terminal per submit, current attempt or
+                // abandoned. Legs live in process-lifetime pool entries,
+                // so a late terminal's pointer is always valid.
+                if (fr.leg) |lp| {
+                    const leg: *Leg = @ptrCast(@alignCast(lp));
+                    leg.inflight -|= 1;
+                }
                 const p = fr.ptr orelse continue;
                 // WS tunnel terminal: the CONNECT stream ended.
                 if (fr.tunnel) {
@@ -1752,11 +2277,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     if (status.code == 421 or io_res.err != 0) {
                         if (conn_died) {
                             if (self.pool.get(t.nodes[t.node_idx])) |up| {
-                                if (up.state == .up and self.reg.isStale(up.sess)) {
-                                    up.state = .down;
-                                    up.sess = Entity.nil;
-                                    up.last_fail_ns = 0;
-                                }
+                                self.markStaleLegsDown(up);
                             }
                         }
                         self.tunnelAttemptFailed(t);
@@ -1787,8 +2308,10 @@ pub fn Proxy(comptime FrontH2: type) type {
                         // consumeResponseHeaders). The body tail rides
                         // this terminal entity.
                         if (rb.data) |d| {
-                            if (rb.len > 0)
+                            if (rb.len > 0) {
                                 flow.resp_queue.appendSlice(self.allocator, d[0..rb.len]) catch {};
+                                flow.resp_bytes += rb.len;
+                            }
                         }
                         if (io_res.err == 0) {
                             flow.resp_eof = true;
@@ -1830,17 +2353,15 @@ pub fn Proxy(comptime FrontH2: type) type {
                 const conn_died = self.reg.isStale(flow.up_sess);
                 if (conn_died) self.markDown(flow);
                 std.log.warn("front: forward {s} → {s} failed", .{ flow.host, flow.nodes[flow.node_idx] });
-                self.attemptFailed(flow, conn_died);
+                // A terminal for a submitted request: the head reached
+                // the upstream leg — ambiguous for non-idempotent flows.
+                self.attemptFailed(flow, conn_died, true);
             }
         }
 
         fn markDown(self: *Self, flow: *Flow) void {
             if (self.pool.get(flow.nodes[flow.node_idx])) |up| {
-                if (up.state == .up and self.reg.isStale(up.sess)) {
-                    up.state = .down;
-                    up.sess = Entity.nil;
-                    up.last_fail_ns = 0; // a reap is not a failure — no backoff
-                }
+                self.markStaleLegsDown(up);
             }
         }
 
@@ -1890,6 +2411,8 @@ pub fn Proxy(comptime FrontH2: type) type {
             self.reg.move(flow.down_ent, src, &self.server.response_in) catch {};
             flow.down_home = .responding;
             flow.resp_started = true;
+            flow.final_status = code;
+            flow.resp_bytes += body.len;
         }
 
         fn finishWithStatus(self: *Self, flow: *Flow, code: u16) void {
@@ -1920,9 +2443,12 @@ pub fn Proxy(comptime FrontH2: type) type {
             if (!flow.detached) return;
             if (flow.attempt_live or flow.waiting_conn or flow.awaiting_route) return;
             if (flow.sink_refs != 0 or flow.pending_terminals != 0) return;
+            self.recordFlowDone(flow);
+            if (flow.peer_ip_len > 0) self.peerFlowDec(flow.peer_ip[0..flow.peer_ip_len]);
             self.unmapAttempt(flow);
             flow.body.deinit(self.allocator);
             flow.resp_queue.deinit(self.allocator);
+            if (flow.path.len != 0) self.allocator.free(flow.path);
             // A parked flow torn down before its route landed never got
             // a heap node list — its `.nodes` is still the empty default
             // (`&.{}`), which must not be passed to free.
@@ -1931,6 +2457,44 @@ pub fn Proxy(comptime FrontH2: type) type {
             self.allocator.free(flow.host);
             self.allocator.destroy(flow);
             self.live_flows -= 1;
+        }
+
+        /// One histogram sample + one access-log line per completed
+        /// flow (plan C11) — the RED signals the front was missing:
+        /// who was served what, how fast, by which node, in how many
+        /// attempts. `status=0` means the flow died before any
+        /// response (client gone / teardown).
+        fn recordFlowDone(self: *Self, flow: *Flow) void {
+            const dur_ns = std.time.nanoTimestamp() - flow.t_start_ns;
+            const dur_ms: u64 = if (dur_ns <= 0) 0 else @intCast(@divTrunc(dur_ns, std.time.ns_per_ms));
+            var bucket: usize = LAT_BOUNDS_MS.len; // +Inf
+            for (LAT_BOUNDS_MS, 0..) |bound, i| {
+                if (dur_ms <= bound) {
+                    bucket = i;
+                    break;
+                }
+            }
+            self.lat_counts[bucket] += 1;
+            self.lat_sum_ms += dur_ms;
+            self.lat_total += 1;
+
+            if (!self.access_log) return;
+            const node: []const u8 = if (flow.nodes.len > 0)
+                flow.nodes[@min(flow.node_idx, flow.nodes.len - 1)]
+            else
+                "-";
+            std.log.info("front-access: {s} {s} \"{s} {s}\" {d} {d}ms node={s} attempts={d} in={d}B out={d}B", .{
+                if (flow.peer_ip_len > 0) flow.peer_ip[0..flow.peer_ip_len] else "-",
+                flow.host,
+                flow.method[0..flow.method_len],
+                if (flow.path.len > 0) flow.path else "/",
+                flow.final_status,
+                dur_ms,
+                node,
+                flow.attempt,
+                flow.body_total,
+                flow.resp_bytes,
+            });
         }
 
         fn compactBody(self: *Self, flow: *Flow) void {
@@ -1980,6 +2544,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             if (flow.down_gone) return false;
             flow.body.appendSlice(flow.proxy.allocator, bytes) catch return false;
             flow.body_total += bytes.len;
+            flow.last_body_progress_ns = std.time.nanoTimestamp();
             if (flow.replayable and !flow.body_complete and flow.body.items.len > REPLAY_CAP) {
                 flow.replayable = false;
             }
@@ -2007,6 +2572,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             // stream, which is exactly the cancel we want.
             if (flow.down_gone or !flow.down_alive or flow.down_closed) return false;
             flow.resp_queue.appendSlice(flow.proxy.allocator, bytes) catch return false;
+            flow.resp_bytes += bytes.len;
             return true;
         }
 
@@ -2079,8 +2645,10 @@ pub fn Proxy(comptime FrontH2: type) type {
         }
 
         /// Build the upstream request head: pseudo-headers first
-        /// (nghttp2 requires it), then the filtered originals.
-        fn packUpstreamHeaders(self: *Self, rh: h2.ReqHeaders, authority: []const u8) !h2.ReqHeaders {
+        /// (nghttp2 requires it), then the filtered originals, then the
+        /// forwarding identity stamped at the trust boundary (plan B7)
+        /// and the `Via` entry (§5.7.1).
+        fn packUpstreamHeaders(self: *Self, rh: h2.ReqHeaders, flow: *const Flow) !h2.ReqHeaders {
             const a = self.allocator;
             var list: std.ArrayListUnmanaged(NameValue) = .empty;
             defer list.deinit(a);
@@ -2090,7 +2658,11 @@ pub fn Proxy(comptime FrontH2: type) type {
             try list.append(a, .{ .name = ":method", .value = method });
             try list.append(a, .{ .name = ":scheme", .value = "http" });
             try list.append(a, .{ .name = ":path", .value = path });
-            try list.append(a, .{ .name = ":authority", .value = authority });
+            try list.append(a, .{ .name = ":authority", .value = flow.authority });
+
+            // Headers nominated by the client's `Connection` value are
+            // hop-by-hop too (plan B8).
+            const connection_value = headerValue(rh, "connection");
 
             if (rh.fields) |fields| {
                 var i: u32 = 0;
@@ -2099,9 +2671,14 @@ pub fn Proxy(comptime FrontH2: type) type {
                     const fname = f.name[0..f.name_len];
                     if (fname.len > 0 and fname[0] == ':') continue;
                     if (dropFromRequest(fname)) continue;
+                    if (nominatedByConnection(connection_value, fname)) continue;
                     try list.append(a, .{ .name = fname, .value = f.value[0..f.value_len] });
                 }
             }
+            if (flow.peer_ip_len > 0)
+                try list.append(a, .{ .name = "x-forwarded-for", .value = flow.peer_ip[0..flow.peer_ip_len] });
+            try list.append(a, .{ .name = "x-forwarded-proto", .value = flow.fwd_proto });
+            try list.append(a, .{ .name = "via", .value = flow.via_entry });
             const p = try packFields(a, list.items);
             return .{ .fields = p.fields, .count = p.count, ._buf = p.buf, ._buf_len = p.buf_len };
         }
@@ -2127,13 +2704,17 @@ pub fn Proxy(comptime FrontH2: type) type {
 
         // ── Route resolution (off-loop; never blocks) ─────────────────
 
-        /// Non-blocking. A fresh cache hit returns nodes inline; a miss
-        /// (no entry or past TTL) enqueues an off-loop resolve and
-        /// returns `.pending` for the caller to park on. The CP is never
-        /// contacted on this thread, and a stale entry is never served
-        /// (so a tenant move re-resolves correctly past the TTL).
+        /// Non-blocking. A fresh cache hit (positive OR negative)
+        /// answers inline; a miss (no entry or past TTL) enqueues an
+        /// off-loop resolve and returns `.pending` for the caller to
+        /// park on. The CP is never contacted on this thread, and a
+        /// stale entry is never served (so a tenant move re-resolves
+        /// correctly past the TTL).
         fn resolveRoute(self: *Self, host: []const u8, now_ns: i128) RouteResult {
-            if (self.cache.get(host, now_ns)) |nodes| return .{ .nodes = nodes };
+            if (self.cache.get(host, now_ns)) |hit| switch (hit) {
+                .nodes => |nodes| return .{ .nodes = nodes },
+                .not_found => return .not_found,
+            };
             self.enqueueResolve(host);
             return .pending;
         }
@@ -2188,15 +2769,22 @@ pub fn Proxy(comptime FrontH2: type) type {
                             freeNodes(self.allocator, nodes);
                         };
                     },
-                    // Gone: stop serving the stale entry and surface 404.
+                    // Gone: replace any stale entry with a negative one
+                    // (short TTL) so scanner floods of garbage hosts
+                    // answer 404 from cache instead of serially
+                    // occupying the resolver (plan A6).
                     .not_found => {
-                        self.cache.invalidate(c.host);
+                        self.count_route_not_found += 1;
+                        self.cache.putNegative(c.host, now_ns);
                         self.failRouteWaiters(c.host, 404);
                     },
                     // Transient CP failure: don't touch the cache (a
                     // fresh entry, if any, keeps serving other requests);
                     // the cold parked flows get a retryable 503.
-                    .err => self.failRouteWaiters(c.host, 503),
+                    .err => {
+                        self.count_route_errors += 1;
+                        self.failRouteWaiters(c.host, 503);
+                    },
                 }
                 self.allocator.free(c.host);
             }
@@ -2280,6 +2868,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                     };
                     if (now_ns >= deadline) {
                         _ = list.swapRemove(i);
+                        self.count_route_expired += 1;
                         switch (w) {
                             .flow => |flow| {
                                 flow.awaiting_route = false;
@@ -2294,6 +2883,97 @@ pub fn Proxy(comptime FrontH2: type) type {
                     } else {
                         i += 1;
                     }
+                }
+            }
+        }
+
+        /// Abort any flow whose inbound request body has made no
+        /// progress for `body_stall_ns` (plan A5; nginx
+        /// `client_body_timeout`). Per-STREAM: the conn-level idle reap
+        /// never fires while any sibling stream (or a PING) keeps the
+        /// connection active, so a stalled upload otherwise holds its
+        /// front flow and worker stream forever. Between-bytes budget —
+        /// slow-but-moving uploads survive. Exemptions: complete bodies
+        /// (nothing owed), flows the worker already answered
+        /// (`resp_started` — the h2 layer flips the remainder to
+        /// discard), and held/response-side streams (never armed).
+        /// `serverStreamAbort` reuses the downstream-death teardown:
+        /// the sink abort marks `down_gone`, the upstream pump RSTs so
+        /// the worker sees a broken stream (never a truncated-but-
+        /// complete body), and the entity routes out via the orphan
+        /// sweep. Collect first — the abort mutates flow state.
+        fn expireStalledBodies(self: *Self, now_ns: i128) void {
+            if (self.body_stall_ns == 0) return;
+            var stalled: [32]*Flow = undefined;
+            var n: usize = 0;
+            var it = self.flows_by_up.valueIterator();
+            while (it.next()) |fp| {
+                const flow = fp.*;
+                if (flow.body_complete or flow.resp_started) continue;
+                if (flow.down_gone or !flow.down_alive) continue;
+                if (flow.last_body_progress_ns == 0) continue;
+                if (now_ns - flow.last_body_progress_ns < self.body_stall_ns) continue;
+                stalled[n] = flow;
+                n += 1;
+                if (n == stalled.len) break;
+            }
+            for (stalled[0..n]) |flow| {
+                std.log.warn("front: request body stalled >{d}ms (host={s}) -> abort", .{
+                    @divTrunc(self.body_stall_ns, std.time.ns_per_ms), flow.host,
+                });
+                self.count_body_stalls += 1;
+                self.server.serverStreamAbort(flow.down_sess, flow.down_sid);
+            }
+        }
+
+        /// Fail the waiters of any `.connecting` pool entry past its
+        /// connect deadline (plan A1). The io connect op has no timeout,
+        /// so a SYN-blackholed backend otherwise pins its waiters for
+        /// the kernel connect budget (~2 min); waiters fail over to the
+        /// next node instead (`attemptFailed` with nothing sent — safe
+        /// for any method). The entry is marked down with a fresh
+        /// backoff stamp so immediate re-dials don't hammer it. The
+        /// LATE io completion is harmless: a success flips the entry
+        /// back to `.up` (usable, waiters already gone; the conn is
+        /// idle-reaped if unused), an error re-marks it down. Snapshot
+        /// the heap-stable `*Upstream` set first — `drainWaiters` can
+        /// re-aim a flow and `poolEntry`-insert a new entry (the same
+        /// pattern as `drainSettledTunnels`).
+        fn expireStalledConnects(self: *Self, now_ns: i128) void {
+            var ups: [64]*Upstream = undefined;
+            var n: usize = 0;
+            var it = self.pool.valueIterator();
+            while (it.next()) |up_ptr| {
+                if (n >= ups.len) {
+                    std.log.warn("front: pool exceeds {d} entries — connect sweep deferred some", .{ups.len});
+                    break;
+                }
+                ups[n] = up_ptr.*;
+                n += 1;
+            }
+            for (ups[0..n]) |up| {
+                var timed_out = false;
+                for (up.legs[0..up.n_legs]) |*leg| {
+                    if (leg.state != .connecting or leg.connect_deadline_ns == 0) continue;
+                    if (now_ns < leg.connect_deadline_ns) continue;
+                    std.log.warn("front: connect to {s} timed out after {d}ms", .{
+                        up.origin,
+                        @divTrunc(self.connect_timeout_ns, std.time.ns_per_ms),
+                    });
+                    leg.state = .down;
+                    leg.sess = Entity.nil;
+                    leg.last_fail_ns = now_ns;
+                    leg.connect_deadline_ns = 0;
+                    self.count_connect_timeouts += 1;
+                    timed_out = true;
+                }
+                if (!timed_out) continue;
+                // A dial just died. Waiters fail over only when no dial
+                // remains in flight; a live sibling leg (if any) serves
+                // them instead. (Waiters parked for extended-connect
+                // SETTLE stay owned by drainSettledTunnels.)
+                if (up.waiters.items.len > 0 and !up.anyConnecting()) {
+                    self.drainWaiters(up, self.anyLegUp(up));
                 }
             }
         }
@@ -2325,6 +3005,7 @@ pub fn Proxy(comptime FrontH2: type) type {
             }
             for (stalled[0..n]) |flow| {
                 std.log.warn("front: upstream response timeout (host={s}) -> 504", .{flow.host});
+                self.count_resp_timeouts += 1;
                 self.abandonAttempt(flow); // RST_STREAM to the stuck upstream
                 self.finishWithStatus(flow, 504); // 504 to the client + teardown
             }
@@ -2365,16 +3046,70 @@ fn resolveOrigin(origin: []const u8) !std.net.Address {
 
 const testing = std.testing;
 
+test "normalizeHost: lowercases, strips port bracket-aware, rejects junk" {
+    var buf: [255]u8 = undefined;
+
+    try testing.expectEqualStrings("acme.example", normalizeHost(&buf, "ACME.Example:8443").?);
+    try testing.expectEqualStrings("acme.example", normalizeHost(&buf, "acme.example").?);
+    // IPv6 literal keeps its brackets, with and without a port (the
+    // old bare last-colon split broke the portless form).
+    try testing.expectEqualStrings("[::1]", normalizeHost(&buf, "[::1]:8443").?);
+    try testing.expectEqualStrings("[::1]", normalizeHost(&buf, "[::1]").?);
+    // Junk never reaches cache keys / the CP query string / logs.
+    try testing.expect(normalizeHost(&buf, "a b") == null);
+    try testing.expect(normalizeHost(&buf, "acme.example/evil?x=") == null);
+    try testing.expect(normalizeHost(&buf, "") == null);
+    try testing.expect(normalizeHost(&buf, "acme\r\nx-inject: 1") == null);
+}
+
+test "nominatedByConnection: Connection-listed headers are hop-by-hop (RFC 7230 §6.1)" {
+    // A client smuggling `Connection: x-secret-hint` must not get
+    // x-secret-hint forwarded upstream.
+    try testing.expect(nominatedByConnection("x-secret-hint", "x-secret-hint"));
+    try testing.expect(nominatedByConnection("keep-alive, X-Secret-Hint", "x-secret-hint"));
+    try testing.expect(nominatedByConnection("a,\tb , c", "b"));
+    try testing.expect(!nominatedByConnection("keep-alive", "x-secret-hint"));
+    try testing.expect(!nominatedByConnection(null, "anything"));
+    // Substring is not membership.
+    try testing.expect(!nominatedByConnection("x-secret-hint-2", "x-secret-hint"));
+}
+
+test "peerIpString: bare IP, no port, no IPv6 brackets" {
+    var buf: [46]u8 = undefined;
+
+    const v4 = try std.net.Address.parseIp("192.168.1.7", 12345);
+    try testing.expectEqualStrings("192.168.1.7", buf[0..peerIpString(&buf, v4)]);
+
+    const v6 = try std.net.Address.parseIp("2001:db8::1", 443);
+    try testing.expectEqualStrings("2001:db8::1", buf[0..peerIpString(&buf, v6)]);
+}
+
+test "isIdempotentMethod: only read-shaped methods replay after ambiguous failure" {
+    // Safe to re-send after an upstream died post-head, pre-response.
+    try testing.expect(isIdempotentMethod("GET"));
+    try testing.expect(isIdempotentMethod("HEAD"));
+    try testing.expect(isIdempotentMethod("OPTIONS"));
+    // Handler-executing methods must NOT silently replay (the worker may
+    // have committed before the connection died — decisions.md §10.5).
+    try testing.expect(!isIdempotentMethod("POST"));
+    try testing.expect(!isIdempotentMethod("PATCH"));
+    // PUT/DELETE are RFC-idempotent but customer-defined here: excluded.
+    try testing.expect(!isIdempotentMethod("PUT"));
+    try testing.expect(!isIdempotentMethod("DELETE"));
+    // Case-sensitive by design: h2 methods are uppercase on the wire.
+    try testing.expect(!isIdempotentMethod("get"));
+}
+
 test "RouteCache: fresh hit within TTL, miss past it (re-resolve, no stale serve)" {
     const ttl_ns: i128 = 100;
-    var cache = RouteCache.init(testing.allocator, ttl_ns);
+    var cache = RouteCache.init(testing.allocator, ttl_ns, 500);
     defer cache.deinit();
 
     const nodes = try dupNodes(testing.allocator, &.{ "http://a:1", "http://b:1" });
     try cache.putOwned("acme.example", nodes, 1000); // expires at 1100
 
     // Within TTL: hit.
-    try testing.expectEqual(@as(usize, 2), cache.get("acme.example", 1050).?.len);
+    try testing.expectEqual(@as(usize, 2), cache.get("acme.example", 1050).?.nodes.len);
     // At/after expiry: miss → caller parks + re-resolves (never serves
     // the stale entry, so a move past the TTL routes correctly).
     try testing.expect(cache.get("acme.example", 1100) == null);
@@ -2384,17 +3119,43 @@ test "RouteCache: fresh hit within TTL, miss past it (re-resolve, no stale serve
 }
 
 test "RouteCache: putOwned refreshes the entry in place and frees the old nodes" {
-    var cache = RouteCache.init(testing.allocator, 100);
+    var cache = RouteCache.init(testing.allocator, 100, 500);
     defer cache.deinit();
 
     try cache.putOwned("h", try dupNodes(testing.allocator, &.{"http://old:1"}), 1000);
     // Re-store with a new list; the old one must be freed (testing
     // allocator catches a leak) and the expiry pushed out.
     try cache.putOwned("h", try dupNodes(testing.allocator, &.{ "http://new:1", "http://new:2" }), 1200);
-    try testing.expectEqual(@as(usize, 2), cache.get("h", 1250).?.len);
+    try testing.expectEqual(@as(usize, 2), cache.get("h", 1250).?.nodes.len);
 
     cache.invalidate("h");
     try testing.expect(cache.get("h", 1250) == null);
+}
+
+test "RouteCache: negative entries answer not_found within their own TTL" {
+    // Positive TTL 100, negative TTL 500 — independent windows.
+    var cache = RouteCache.init(testing.allocator, 100, 500);
+    defer cache.deinit();
+
+    cache.putNegative("ghost.example", 1000); // expires at 1500
+    try testing.expect(cache.get("ghost.example", 1100).? == .not_found);
+    try testing.expect(cache.get("ghost.example", 1499).? == .not_found);
+    // Past the negative TTL: miss → the CP is asked again.
+    try testing.expect(cache.get("ghost.example", 1500) == null);
+
+    // A negative entry is replaced by a later placement (host got
+    // provisioned) and vice versa (tenant deleted), with no leak.
+    cache.putNegative("flip.example", 1000);
+    try cache.putOwned("flip.example", try dupNodes(testing.allocator, &.{"http://a:1"}), 1010);
+    try testing.expectEqual(@as(usize, 1), cache.get("flip.example", 1050).?.nodes.len);
+    try testing.expectEqual(@as(usize, 1), cache.neg_count); // ghost only
+    cache.putNegative("flip.example", 1060);
+    try testing.expect(cache.get("flip.example", 1100).? == .not_found);
+    try testing.expectEqual(@as(usize, 2), cache.neg_count);
+
+    // invalidate keeps the count honest.
+    cache.invalidate("flip.example");
+    try testing.expectEqual(@as(usize, 1), cache.neg_count);
 }
 
 test "LeaderCache: note seeds the start index; stale origin falls back to 0" {

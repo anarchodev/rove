@@ -374,7 +374,7 @@ fn freeUrlList(a: std.mem.Allocator, urls: []const []const u8) void {
 /// on) are now scrapable instead of grep-only — plus the proxy's live-flow /
 /// tunnel leak canaries. Rendered + published on the :443 poll loop (the only
 /// thread that touches `server`/`proxy`); the MetricsServer thread serves bytes.
-fn buildFrontMetricsText(allocator: std.mem.Allocator, server: *FrontH2, flows: usize, tunnels: usize) ![]u8 {
+fn buildFrontMetricsText(allocator: std.mem.Allocator, server: *FrontH2, proxy: *const Proxy) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &buf);
@@ -388,7 +388,85 @@ fn buildFrontMetricsText(allocator: std.mem.Allocator, server: *FrontH2, flows: 
         \\# TYPE front_proxy_tunnels_active gauge
         \\front_proxy_tunnels_active {d}
         \\
-    , .{ flows, tunnels });
+    , .{ proxy.live_flows, proxy.live_tunnels });
+    // Pooled upstream-leg state (leak canary): in-flight streams across
+    // all legs should track load and return to ~0 at idle. A monotonic
+    // climb = proxied streams whose upstream terminal never landed
+    // (e.g. half-closed streams not reaped on the pooled front→worker
+    // conn) — the mechanism behind the h2spec full-suite relay stall.
+    const us = proxy.upstreamStats();
+    try w.print(
+        \\# HELP front_upstream_inflight in-flight proxied streams summed across all pooled upstream legs (leak canary — climbs + never drains ⇒ a stream leak on the pooled conn).
+        \\# TYPE front_upstream_inflight gauge
+        \\front_upstream_inflight {d}
+        \\# HELP front_upstream_live_legs live pooled upstream connections (legs) across all backend nodes.
+        \\# TYPE front_upstream_live_legs gauge
+        \\front_upstream_live_legs {d}
+        \\# HELP front_upstream_max_leg_inflight largest single-leg in-flight stream count (approaches the per-leg cap as a leg fills).
+        \\# TYPE front_upstream_max_leg_inflight gauge
+        \\front_upstream_max_leg_inflight {d}
+        \\
+    , .{ us.inflight, us.live_legs, us.max_leg_inflight });
+    // Per-request proxy events (plan C11): the counters that decompose
+    // "the front is unreliable" into leadership churn vs dead nodes vs
+    // stalls vs resolver trouble vs the ambiguous-retry gate.
+    try w.print(
+        \\# HELP front_reaims_421_total not-leader re-aims (leadership churn / cold leader cache).
+        \\# TYPE front_reaims_421_total counter
+        \\front_reaims_421_total {d}
+        \\# HELP front_connect_timeouts_total upstream connects that blew REWIND_FRONT_CONNECT_TIMEOUT_MS.
+        \\# TYPE front_connect_timeouts_total counter
+        \\front_connect_timeouts_total {d}
+        \\# HELP front_connect_failures_total upstream connect failures (refused/unreachable).
+        \\# TYPE front_connect_failures_total counter
+        \\front_connect_failures_total {d}
+        \\# HELP front_response_timeouts_total 504s from the response-headers deadline.
+        \\# TYPE front_response_timeouts_total counter
+        \\front_response_timeouts_total {d}
+        \\# HELP front_body_stalls_total inbound bodies aborted by the between-bytes budget.
+        \\# TYPE front_body_stalls_total counter
+        \\front_body_stalls_total {d}
+        \\# HELP front_route_not_found_total CP route lookups answered 404 (negative-cached).
+        \\# TYPE front_route_not_found_total counter
+        \\front_route_not_found_total {d}
+        \\# HELP front_route_errors_total CP route lookups that failed (all CP nodes unreachable/bad).
+        \\# TYPE front_route_errors_total counter
+        \\front_route_errors_total {d}
+        \\# HELP front_route_park_expired_total flows 503'd waiting on a cold route resolve.
+        \\# TYPE front_route_park_expired_total counter
+        \\front_route_park_expired_total {d}
+        \\# HELP front_ambiguous_502_total non-idempotent flows 502'd at the ambiguous transport-error gate instead of replayed.
+        \\# TYPE front_ambiguous_502_total counter
+        \\front_ambiguous_502_total {d}
+        \\# HELP front_upstream_sheds_total requests shed 503 with every upstream leg saturated (the visible form of what used to queue invisibly).
+        \\# TYPE front_upstream_sheds_total counter
+        \\front_upstream_sheds_total {d}
+        \\# HELP front_client_limited_total requests 429'd at the per-client-IP flow cap (REWIND_FRONT_MAX_FLOWS_PER_IP).
+        \\# TYPE front_client_limited_total counter
+        \\front_client_limited_total {d}
+        \\
+    , .{
+        proxy.count_reaims_421,     proxy.count_connect_timeouts,
+        proxy.count_conn_failures,  proxy.count_resp_timeouts,
+        proxy.count_body_stalls,    proxy.count_route_not_found,
+        proxy.count_route_errors,   proxy.count_route_expired,
+        proxy.count_ambiguous_502,  proxy.count_upstream_sheds,
+        proxy.count_client_limited,
+    });
+    // Request-duration histogram (intake → flow teardown).
+    try w.print(
+        \\# HELP front_request_duration_ms proxied request duration, intake to flow teardown.
+        \\# TYPE front_request_duration_ms histogram
+        \\
+    , .{});
+    var cumulative: u64 = 0;
+    inline for (proxy_mod.LAT_BOUNDS_MS, 0..) |bound, i| {
+        cumulative += proxy.lat_counts[i];
+        try w.print("front_request_duration_ms_bucket{{le=\"{d}\"}} {d}\n", .{ bound, cumulative });
+    }
+    try w.print("front_request_duration_ms_bucket{{le=\"+Inf\"}} {d}\n", .{proxy.lat_total});
+    try w.print("front_request_duration_ms_sum {d}\n", .{proxy.lat_sum_ms});
+    try w.print("front_request_duration_ms_count {d}\n", .{proxy.lat_total});
     buf = aw.toArrayList();
     return try buf.toOwnedSlice(allocator);
 }
@@ -397,6 +475,17 @@ pub fn main() !void {
     curl.globalInit();
     const allocator = std.heap.c_allocator;
     installSignalHandlers();
+    // Logging must NEVER block the poll loop. The front logs via std.log
+    // to stderr; in prod stderr → journald, in tests → a pipe. Either sink
+    // can backpressure under load (journald rate-limit / slow disk; an
+    // undrained pipe), and a BLOCKING write() on the single serving thread
+    // then freezes the ENTIRE front — every tenant — until the sink
+    // drains. (Root-caused from an h2spec wedge: the poll thread stuck in
+    // anon_pipe_write; the per-request access log was the volume trigger.)
+    // Make the log fd non-blocking so a write under backpressure drops
+    // (EAGAIN, swallowed by std.log's `catch`) instead of wedging the
+    // loop — dropped log lines are strictly better than a frozen edge.
+    rove.logNonBlocking();
 
     var arg_it = std.process.args();
     _ = arg_it.next();
@@ -435,7 +524,19 @@ pub fn main() !void {
     // (clean recycle between requests) rather than reacting to the
     // worker's GOAWAY mid-reuse (the front→worker 502 seen in repro).
     const upstream_idle_ms = envMs("REWIND_FRONT_UPSTREAM_IDLE_TIMEOUT_MS", 5_000);
-    var cache = proxy_mod.RouteCache.init(allocator, cache_ms * std.time.ns_per_ms);
+    // Negative-entry TTL: how long a CP 404 for a host is answered from
+    // cache. Longer than the positive TTL — a placement changes on a
+    // tenant move (move latency rides the positive TTL) but "no such
+    // host" only changes on provisioning, and the negative cache is
+    // what keeps scanner floods of garbage Host values from serially
+    // occupying the resolver (plan A6). A just-provisioned domain waits
+    // at most this long for its first serve.
+    const neg_cache_ms = envMs("REWIND_ROUTE_NEG_CACHE_MS", 5_000);
+    var cache = proxy_mod.RouteCache.init(
+        allocator,
+        cache_ms * std.time.ns_per_ms,
+        neg_cache_ms * std.time.ns_per_ms,
+    );
     defer cache.deinit();
 
     // Off-loop route resolver: CP `/_cp/route` queries run on this
@@ -444,7 +545,9 @@ pub fn main() !void {
     // completion outlives them; its own deinit frees undrained items.
     const resolver = try route_resolver_mod.RouteResolver.init(allocator, cp_urls);
     defer resolver.deinit();
-    try resolver.start();
+    // Resolver worker pool (plan A6b): parallel CP queries so one slow
+    // resolve doesn't serialize every other cold host behind it.
+    try resolver.start(@intCast(@max(1, envMs("REWIND_FRONT_RESOLVER_THREADS", route_resolver_mod.RouteResolver.DEFAULT_THREADS))));
     defer resolver.shutdown();
 
     var reg = try rove.Registry.init(allocator, .{
@@ -477,6 +580,10 @@ pub fn main() !void {
         .tls_config = tls_config,
         .idle_timeout_ns = @intCast(idle_ms * std.time.ns_per_ms),
         .client_idle_timeout_ns = @intCast(upstream_idle_ms * std.time.ns_per_ms),
+        // Total TLS-handshake budget (plan A4): a peer that stalls
+        // mid-handshake is destroyed at this deadline instead of
+        // pinning a connection slot forever.
+        .tls_handshake_timeout_ns = @intCast(envMs("REWIND_FRONT_TLS_HANDSHAKE_TIMEOUT_MS", 10_000) * std.time.ns_per_ms),
         // Streaming proxy: early-emit inbound h2 requests (server side)
         // and upstream responses (client side); the proxy relays both
         // as they arrive. Worker-matched 1 MiB stream windows bound
@@ -492,6 +599,24 @@ pub fn main() !void {
         .websocket_surface = true,
     });
     var proxy = Proxy.init(allocator, &reg, server, cp_urls, &cache, resolver);
+    // Upstream connect deadline (plan A1): a SYN-blackholed backend
+    // fails over in ~this long instead of the kernel connect budget.
+    proxy.connect_timeout_ns = envMs("REWIND_FRONT_CONNECT_TIMEOUT_MS", 1_000) * std.time.ns_per_ms;
+    // Inbound request-body between-bytes budget (plan A5): a client
+    // that starts a body and stops sending is aborted; slow-but-moving
+    // uploads survive. 0 disables.
+    proxy.body_stall_ns = envMs("REWIND_FRONT_BODY_STALL_TIMEOUT_MS", 60_000) * std.time.ns_per_ms;
+    // Per-flow access log (plan C11): one line per completed flow.
+    proxy.access_log = !std.mem.eql(u8, getEnvCfg("REWIND_FRONT_ACCESS_LOG"), "0");
+    // Upstream legs per backend node (plan A3): more legs = less
+    // head-of-line blocking and smaller blast radius per conn death;
+    // 1 restores the single-conn behavior.
+    proxy.legs_per_node = @intCast(std.math.clamp(envMs("REWIND_FRONT_UPSTREAM_CONNS", 2), 1, @as(i128, proxy_mod.MAX_LEGS)));
+    proxy.leg_stream_cap = @intCast(std.math.clamp(envMs("REWIND_FRONT_UPSTREAM_STREAM_CAP", proxy_mod.LEG_STREAM_CAP), 1, 512));
+    // Per-client-IP live flow cap (plan C13): 0 (default) = off. An
+    // abuse-response knob — legitimate NAT egress can fan many users
+    // out of one address, so the operator picks the ceiling.
+    proxy.max_flows_per_ip = @intCast(std.math.clamp(envMs("REWIND_FRONT_MAX_FLOWS_PER_IP", 0), 0, 1 << 30));
     // Teardown order matters: `server.destroy()` releases any still-live
     // body sinks, and those callbacks walk proxy-owned Flow state — so the
     // server must go down while the proxy is still alive. One defer block
@@ -595,6 +720,15 @@ pub fn main() !void {
     defer if (front_metrics_srv) |ms| ms.deinit();
     var last_metrics_ns: i128 = 0;
 
+    // Graceful drain budget (plan C10): after SIGTERM/SIGINT, GOAWAY
+    // live conns and keep serving until in-flight flows finish or this
+    // deadline fires — a rolling restart stops costing every in-flight
+    // request a mid-response cut. 0 = exit immediately (old behavior).
+    // Long-lived held streams (SSE/WS tunnels) intentionally don't pin
+    // the drain past the deadline. Keep it below the supervisor's kill
+    // timeout (systemd TimeoutStopSec default 90s).
+    const drain_ms = envMs("REWIND_FRONT_DRAIN_TIMEOUT_MS", 10_000);
+
     while (!stop_flag.load(.acquire)) {
         server.pollWithTimeout(10 * std.time.ns_per_ms) catch |err| switch (err) {
             error.SignalInterrupt => continue,
@@ -609,7 +743,7 @@ pub fn main() !void {
         if (front_metrics_srv) |ms| {
             if (now - last_metrics_ns >= 2 * std.time.ns_per_s) {
                 last_metrics_ns = now;
-                if (buildFrontMetricsText(allocator, server, proxy.live_flows, proxy.live_tunnels)) |txt| {
+                if (buildFrontMetricsText(allocator, server, &proxy)) |txt| {
                     defer allocator.free(txt);
                     ms.publish(txt);
                 } else |_| {}
@@ -631,6 +765,29 @@ pub fn main() !void {
             diag_prev_admission = s.admission_denied;
             diag_last_ns = now;
         }
+    }
+
+    // ── Graceful drain (plan C10) ─────────────────────────────────────
+    // GOAWAY every live server conn and keep the poll loop + proxy
+    // running until in-flight work finishes or the budget fires.
+    // `drainServerConns` re-runs each iteration so a connection
+    // accepted mid-drain is drained too (there is no stop-accept API;
+    // the window is one GOAWAY round-trip).
+    if (drain_ms > 0 and (proxy.live_flows > 0 or proxy.live_tunnels > 0)) {
+        std.log.info("rewind-front: draining {d} flow(s) / {d} tunnel(s) (budget {d}ms)", .{
+            proxy.live_flows, proxy.live_tunnels, drain_ms,
+        });
+        const drain_deadline = std.time.nanoTimestamp() + drain_ms * std.time.ns_per_ms;
+        while (std.time.nanoTimestamp() < drain_deadline and
+            (proxy.live_flows > 0 or proxy.live_tunnels > 0))
+        {
+            server.drainServerConns(@intCast(2 * std.time.ns_per_s)) catch break;
+            server.pollWithTimeout(10 * std.time.ns_per_ms) catch break;
+            proxy.run(std.time.nanoTimestamp()) catch break;
+        }
+        std.log.info("rewind-front: drain done ({d} flow(s) / {d} tunnel(s) left)", .{
+            proxy.live_flows, proxy.live_tunnels,
+        });
     }
     std.log.info("rewind-front: shut down", .{});
 }
