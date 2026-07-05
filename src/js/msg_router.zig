@@ -197,6 +197,10 @@ pub const MsgRouter = struct {
         const inbox_idx = std.hash.Wyhash.hash(0, tenant_id) % n;
         const inbox = self.msg_inboxes.items[inbox_idx];
         self.msg_inboxes_mutex.unlock();
+        std.log.debug(
+            "rove-js msg-route: kind={s} tenant={s} -> worker {d}/{d}",
+            .{ @tagName(msg.kind()), tenant_id, inbox_idx, n },
+        );
         try inbox.push(msg);
     }
 

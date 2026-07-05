@@ -1515,6 +1515,13 @@ pub fn runFire(
         .terminal => |*r| {
             defer r.deinit(allocator);
             if (r.exception.len > 0) {
+                // Surface connectionless-fire exceptions on stderr too —
+                // the log record alone made a failing onBoot/cron/wake
+                // handler invisible to an operator tailing the node.
+                std.log.warn(
+                    "rove-js " ++ spec.site ++ " ({s}): handler exception: {s}",
+                    .{ label, r.exception },
+                );
                 p.txn.rollback() catch {};
                 p.txn_done = true;
                 captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, r.console, r.exception, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, r.tags, spec.act, 0);
@@ -1523,6 +1530,20 @@ pub fn runFire(
                 return;
             }
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+            // A connectionless fire has no caller to see its status —
+            // a 4xx/5xx (e.g. the missing-export 404 backstop) would
+            // otherwise be visible only in the captured log record.
+            if (st >= 400) {
+                std.log.warn(
+                    "rove-js " ++ spec.site ++ " ({s}): terminal status={d} body={s}",
+                    .{ label, st, r.body },
+                );
+            } else {
+                std.log.debug(
+                    "rove-js " ++ spec.site ++ " ({s}): terminal status={d} wrote={} body_len={d}",
+                    .{ label, st, wrote, r.body.len },
+                );
+            }
             if (wrote) {
                 const lh = fireLogHeader(p.request_id, dep_id, st, spec.act, log_path, corr);
                 const fw_seq = proposeForgetfulWrites(worker, &p.ws, p.txn, tenant_id, null, &pending_fetches, &p.readset, lh) catch |perr| {
@@ -2919,6 +2940,10 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
         switch (msg) {
             .subscription_fire => |sf_const| {
                 var sf = sf_const;
+                std.log.debug(
+                    "rove-js sub-fire dispatch: tenant={s} sub={s} module={s}",
+                    .{ sf.tenant_id, sf.subscription_name, sf.module_path },
+                );
                 fireSubscriptionActivation(
                     worker,
                     sf.tenant_id,

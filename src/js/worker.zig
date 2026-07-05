@@ -3394,6 +3394,17 @@ pub fn findBytecode(
     var cur_owned: ?[]u8 = null;
     defer if (cur_owned) |o| allocator.free(o);
 
+    // Exact key first: subscription / trigger registrations carry the
+    // FULL file path ("_subscriptions/x/index.mjs"), not the
+    // extension-less route base. Without this, ".mjs" is appended to
+    // an already-extensioned path (".mjs.mjs" → miss) and the walk-up
+    // catch-all silently lands the fire on the tenant's root
+    // `index.mjs` — which 404s the conventional export AND (for a boot
+    // fire) still commits the pre-injected `_boot_fired` marker, so
+    // the subscription never fires again (the scheduler_heartbeat /
+    // streaming_subscription_boot smoke regression).
+    if (tc.snap.bytecodes.get(module_base)) |bb| return bb.bytes;
+
     while (true) {
         const mjs_key = try std.fmt.allocPrint(allocator, "{s}.mjs", .{cur});
         defer allocator.free(mjs_key);
@@ -3417,6 +3428,34 @@ pub fn findBytecode(
         cur_owned = new_cur;
         cur = new_cur;
     }
+}
+
+test "findBytecode: exact full-path key resolves before extension-append + walk-up" {
+    const a = std.testing.allocator;
+    var bb_sub = BlobBytes{ .bytes = @constCast("SUB"), .hash_hex = [_]u8{'0'} ** 64, .refcount = .{ .raw = 1 } };
+    var bb_root = BlobBytes{ .bytes = @constCast("ROOT"), .hash_hex = [_]u8{'0'} ** 64, .refcount = .{ .raw = 1 } };
+    var map: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
+    defer map.deinit(a);
+    try map.put(a, "_subscriptions/boot-seed/index.mjs", &bb_sub);
+    try map.put(a, "index.mjs", &bb_root);
+    var snap: deployment_cache.TenantFilesSnapshot = undefined;
+    snap.bytecodes = map;
+    const tc = TenantFiles{ .slot = undefined, .snap = &snap };
+
+    // Subscription/trigger registrations carry the FULL file path —
+    // the exact key must hit BEFORE ".mjs" is appended (".mjs.mjs" →
+    // miss) and the walk-up lands on the root index (which would 404
+    // the conventional export and, for boot, still commit the
+    // `_boot_fired` marker — the scheduler_heartbeat regression).
+    const sub = (try findBytecode(tc, "_subscriptions/boot-seed/index.mjs", a)).?;
+    try std.testing.expectEqualStrings("SUB", sub);
+
+    // Extension-less route bases still resolve, and the walk-up
+    // catch-all still lands unknown routes on the root index.
+    const root = (try findBytecode(tc, "nope/index", a)).?;
+    try std.testing.expectEqualStrings("ROOT", root);
+    const exact_root = (try findBytecode(tc, "index", a)).?;
+    try std.testing.expectEqualStrings("ROOT", exact_root);
 }
 
 test "triggerPathToPrefix: catch-all" {
