@@ -187,13 +187,29 @@ dedicated teeth smoke:
    component. B8 landed at h1→h2 synthesis (`http1BuildReqHeaders`),
    the only layer that still sees the `Connection` value.
 
-Phase 2 (follow-ups, separate branches):
+Phase 2 — **shipped 2026-07-04** (same branch, after the phase-1
+merge):
 
-- A3 upstream conn pool + bounded pending queue.
-- A6b parallel resolver (curl multi or small pool).
-- B9 host normalization.
-- C12 `/healthz` + active upstream probes.
-- C13 per-client connection/request limits.
+- ✅ A3 upstream conn pool + bounded pending
+  (`REWIND_FRONT_UPSTREAM_CONNS` legs/node, default 2;
+  `REWIND_FRONT_UPSTREAM_STREAM_CAP` per-leg in-flight, default 480;
+  least-loaded pick, background scale-out, shed 503 +
+  `front_upstream_sheds_total` when saturated;
+  `front_pool_smoke.py`).
+- ✅ A6b parallel resolver (`REWIND_FRONT_RESOLVER_THREADS`, default 4;
+  condition-variable work queue, per-thread curl handles).
+- ✅ B9 host normalization (`normalizeHost`: lowercase + bracket-aware
+  port strip + charset gate → 400; fixed uppercase Hosts not routing
+  at all).
+- ✅ C12 `/healthz` on the shared metrics listener (worker/CP/front):
+  200 while the main loop's publish is fresh, 503 at boot/wedge.
+  Active upstream probes NOT built — the connect deadline (A1),
+  per-leg stale marking, and dial backoff cover the passive gap;
+  revisit if guinea-pig-first-request pain shows up in the A1/A3
+  counters.
+- ✅ C13 per-client-IP flow cap (`REWIND_FRONT_MAX_FLOWS_PER_IP`,
+  default 0 = off; 429 + `front_client_limited_total`;
+  `front_pool_smoke.py` leg D).
 
 ## Verification
 
