@@ -2702,6 +2702,7 @@ pub fn H2(comptime opts: Options) type {
             self.reg = reg;
             self.allocator = allocator;
             self.recv_enobufs_total = 0;
+            self.handshake_reaped_total = 0;
             self.recv_enobufs_logged = false;
             self.recv_enobufs_last_logged_decade = 0;
             self.recv_enobufs_low_outstanding_streak = 0;
