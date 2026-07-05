@@ -35,7 +35,7 @@
 //!
 //! The `drain*` / `sweep*` / `service*` helpers re-exported below are the
 //! worker tick's phase-based dispatch stages — parked continuations,
-//! durability gates, subscription/cron/boot fires, owed-retry sweeps, and
+//! durability gates, subscription/cron fires, owed-retry sweeps, and
 //! response/log cleanup. They run between `poll()` and `reg.flush()`.
 
 const std = @import("std");
@@ -105,7 +105,6 @@ pub const drainOnLeadershipLoss = worker.drainOnLeadershipLoss;
 pub const cleanupResponses = worker.cleanupResponses;
 pub const flushLogs = worker.flushLogs;
 pub const serviceSubscriptionFires = worker.serviceSubscriptionFires;
-pub const sweepBootSubscriptions = worker.sweepBootSubscriptions;
 pub const sweepBlobSessions = worker.sweepBlobSessions;
 pub const sweepDurableWakes = worker.sweepDurableWakes;
 pub const sweepDurableWakesOnPromotion = worker.sweepDurableWakesOnPromotion;

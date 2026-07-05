@@ -43,7 +43,6 @@ pub const ActivationSource = log_mod.ActivationSource;
 /// `worker_streaming.SubscriptionFireSource` aliases this.
 pub const SubscriptionFireSource = union(enum) {
     kv: struct { key: []const u8, op: u8 },
-    boot: struct { deployment_id: u64 },
 };
 
 // ---------------------------------------------------------------------
@@ -406,7 +405,7 @@ pub const Request = struct {
     /// this activation runs against. The http.fetch binding reads it when
     /// `bind: true` to register the held entity. Cross-source: set on every
     /// activation path that can host a bound fetch; null on test paths and
-    /// subscription/cron/boot fires.
+    /// subscription/cron fires.
     activation_entity: ?rove.Entity = null,
     /// Bound-fetch count snapshot — surfaces as `request.fetchesPending` on
     /// onFetchChunk activations (includes the current fetch). Cross-source

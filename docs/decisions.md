@@ -241,7 +241,9 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   arm (`noteCommittedSchedWrites`), not a volatile set-on-call.
 - **Manifest `kind=cron` retired outright** (not re-platformed under the hood):
   a `kind=cron` spec.json fails the deploy loudly; sub-minute intervals are a
-  self-re-arming `scheduler.after` seeded from `onBoot`
+  self-re-arming `scheduler.in` seeded from any handler activation
+  (`onBoot`/`kind=boot` retired 2026-07-05 — unused; registrations are
+  idempotent by key and `_sched/*` entries survive deploys)
   (`scripts/smoke/scheduler_heartbeat_smoke_v2.py` is the recipe).
 - **Rejected**: a many-timer engine index (queue lives in the JS lib);
   at-least-once *completion* (engine absorbs the retry kernel); interval-cron
@@ -380,7 +382,7 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   body or `next({ctx?})`. The response head is the **ambient `response` global**,
   not a return argument. Dispatch is by named export keyed on activation kind
   (`onWake` / `onDisconnect` / `onFetchResult` / `onFetchChunk` / `onFetchDone` /
-  `onBoot` / `onSubscription` / default; `onCron` retired with durable-wake
+  `onSubscription` / default; `onCron` retired with durable-wake, `onBoot` retired 2026-07-05 (unused)
   P5(b); `{to}` overrides). The
   `stream` pipeline is unchanged — only the entry trigger, head, and disposition
   changed. The old `bind:true` / `stream`-return-verb / `detach` framings are

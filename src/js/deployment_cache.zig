@@ -266,9 +266,10 @@ fn translateSpec(
         // the durable scheduler. Fail the deploy loudly with the
         // migration recipe instead of silently ignoring the spec.
         std.log.err(
-            "rove-js: subscription `{s}` kind=cron is retired — register recurrence from a boot " ++
-                "subscription instead: `cron(\"*/1 * * * *\", \"module/path\")` (crontab, durable) or a " ++
-                "self-re-arming `scheduler.after(intervalMs, ...)` for sub-minute intervals",
+            "rove-js: subscription `{s}` kind=cron is retired — register recurrence from any " ++
+                "handler activation instead: `cron(\"*/1 * * * *\", \"module/path\")` (crontab, durable) " ++
+                "or a self-re-arming `scheduler.in(intervalMs, ...)` for sub-minute intervals; " ++
+                "registrations are idempotent by key and survive deploys",
             .{name},
         );
         return error.SubscriptionSpecUnknownKind;
@@ -285,7 +286,18 @@ fn translateSpec(
         return .{ .kv = .{ .prefix = try allocator.dupe(u8, prefix) } };
     }
     if (std.mem.eql(u8, raw.kind, "boot")) {
-        return .boot;
+        // Retired 2026-07-05 (handler-api-ergonomics arc; unused). The
+        // "run once on deploy" hook is gone — seed recurring
+        // registrations (`cron`, `scheduler.in`) from any handler
+        // activation; they are idempotent by key and `_sched/*`
+        // entries are durable kv that survive deploys. Fail the
+        // deploy loudly with the recipe, same posture as kind=cron.
+        std.log.err(
+            "rove-js: subscription `{s}` kind=boot is retired — seed registrations from any " ++
+                "handler activation instead (idempotent by key; durable across deploys)",
+            .{name},
+        );
+        return error.SubscriptionSpecUnknownKind;
     }
     std.log.err("rove-js: subscription `{s}` has unknown kind `{s}`", .{ name, raw.kind });
     return error.SubscriptionSpecUnknownKind;
@@ -463,10 +475,9 @@ pub const TenantSlot = struct {
     /// + `router`, decoupling it from NodeState entirely.)
     bytecode_cache: ?*BytecodeCache = null,
     /// Borrowed pointer to the node's async-activation router. Set by
-    /// `openTenantSlotNode`; used for cross-thread boot-subscription
-    /// firing (Gap 2.1 Phase D boot firing →
-    /// `router.enqueueSubscriptionFireForTenant`). Optional only in
-    /// unit-test slot literals.
+    /// `openTenantSlotNode`; used for cross-thread subscription
+    /// firing (`router.enqueueSubscriptionFireForTenant`). Optional
+    /// only in unit-test slot literals.
     router: ?*MsgRouter = null,
     /// Owned blob backend for file-blobs (source + bytecode bytes).
     blob_backend: blob_mod.BlobBackend,
@@ -686,7 +697,7 @@ pub const DeploymentCache = struct {
     blob_backend_cfg: blob_mod.BackendConfig,
 
     /// Borrowed pointer to the node's async-activation router. Stamped
-    /// onto each `TenantSlot.router` at open time for boot-subscription
+    /// onto each `TenantSlot.router` at open time for subscription
     /// firing. Wired post-init (`NodeState.wireInternal`) because it's a
     /// self-pointer into NodeState; null only before wiring / in unit
     /// contexts.
@@ -1479,81 +1490,5 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
         .{ slot.instance_id, manifest.id, new_snap.bytecodes.count(), new_snap.statics.count(), new_snap.triggers.len, new_snap.subscriptions.len },
     );
 
-    // Gap 2.1 Phase D: enqueue boot subscriptions that haven't
-    // yet fired against THIS deployment_id. Leader-only — boot
-    // is "once per deployment activation across the cluster," not
-    // "once per node." Followers see the `_boot_fired/<dep_id>`
-    // marker via the leader's raft propose and skip on their own
-    // reload.
-    if (slot.raft) |raft| {
-        // Per-TENANT leadership gate (see the config-mirror gate above —
-        // the no-arg `isLeader()` shim is unconditionally true).
-        const boot_gid = raft.registerTenant(slot.instance_id) catch 0;
-        if (boot_gid != 0 and raft.isLeaderOf(boot_gid)) {
-            enqueueBootSubscriptions(slot, new_snap) catch |err|
-                std.log.warn(
-                    "rove-js: tenant {s} boot enqueue: {s}",
-                    .{ slot.instance_id, @errorName(err) },
-                );
-        }
-    }
 }
 
-/// Gap 2.1 Phase D: leader-side scan of new snapshot's `.boot`
-/// subscriptions; enqueue each one that hasn't fired yet (no
-/// `_boot_fired/<dep_id>` marker in tenant kv). The actual firing
-/// runs on a worker that drains the cross-thread inbox.
-///
-/// Idempotency contract: the `_boot_fired/<dep_id>` marker is
-/// injected into the handler's writeset BEFORE the handler runs
-/// (`worker_streaming.zig:1105`) so marker + handler effects
-/// commit atomically through raft. A crash before commit leaves
-/// nothing applied — next reload sees no marker, refires once.
-/// A crash after commit leaves marker + handler effects both
-/// applied — next reload skips. Single-fire semantics; no
-/// "fired-but-not-marked" window.
-pub fn enqueueBootSubscriptions(slot: *TenantSlot, snap: *TenantFilesSnapshot) !void {
-    const router = slot.router orelse return; // unit-test slot: no router, no enqueue
-    for (snap.subscriptions) |sub| {
-        if (sub.spec != .boot) continue;
-
-        var key_buf: [64]u8 = undefined;
-        const marker_key = try std.fmt.bufPrint(&key_buf, "_boot_fired/{d}", .{snap.deployment_id});
-        const existing = slot.app_kv.get(marker_key) catch |err| switch (err) {
-            error.NotFound => null,
-            else => {
-                std.log.warn(
-                    "rove-js boot ({s}/{s}): marker check failed: {s}",
-                    .{ slot.instance_id, sub.name, @errorName(err) },
-                );
-                continue;
-            },
-        };
-        if (existing) |e| {
-            slot.allocator.free(e);
-            continue; // already fired for this deployment
-        }
-
-        std.log.info(
-            "rove-js boot enqueue: tenant={s} subscription={s} deployment={d}",
-            .{ slot.instance_id, sub.name, snap.deployment_id },
-        );
-
-        // Push to the node-wide inbox; hash-routed to one of the
-        // local workers. The worker's `drainSubFireInbox` moves the
-        // message onto an `effect.SubscriptionFire` payload (via
-        // `effect.enqueueMsg`) and `dispatchSubscriptionFires` fires
-        // it on the next tick.
-        router.enqueueSubscriptionFireForTenant(.{
-            .tenant_id = slot.instance_id,
-            .subscription_name = sub.name,
-            .module_path = sub.module_path,
-            .source = .{ .boot = .{ .deployment_id = snap.deployment_id } },
-        }) catch |err| {
-            std.log.warn(
-                "rove-js boot enqueue ({s}/{s}): {s}",
-                .{ slot.instance_id, sub.name, @errorName(err) },
-            );
-        };
-    }
-}

@@ -254,7 +254,6 @@ model retired (§6.3). So:
 | held client disconnected | `onDisconnect` | connection | the held stream closed early — or the WS client closed / dropped |
 | `webhook.send` result | the `onResult` target | connectionless | a `webhook.send` completed |
 | `cron` / `schedule` fire | the named target | connectionless | scheduled time arrived |
-| boot fire | `onBoot` | connectionless | once per fresh deployment |
 | subscription fire (generic) | `onSubscription` | connectionless | external push (atproto firehose, etc.) |
 
 The set of *kinds* is closed (runtime-defined). The `to:` option on
@@ -275,14 +274,17 @@ export** a trigger's activation lands in; it does not invent a kind.
 > every event of the fetch (the handler then branches on
 > `request.done`).
 >
-> **`_subscriptions/` fires now dispatch by trigger source:** a boot
-> fire → `onBoot`, a kv-react fire → `onSubscription` — so a
-> subscription module no longer branches on
-> `request.activation.source.kind`. (The manifest `kind=cron`
-> subscription and its `onCron` export RETIRED with durable-wake P5(b):
-> recurrence is the `cron(spec, target, …)` verb — durable, surviving
-> leader change — or a self-re-arming `scheduler.after` for sub-minute
-> intervals, seeded from `onBoot`.) `webhook.send` results route through the shim's named
+> **`_subscriptions/` fires dispatch to `onSubscription`** (kv-react —
+> the one live subscription kind), so a subscription module never
+> branches on `request.activation.source.kind`. (The manifest
+> `kind=cron` subscription and its `onCron` export RETIRED with
+> durable-wake P5(b): recurrence is the `cron(spec, target, …)` verb —
+> durable, surviving leader change — or a self-re-arming
+> `scheduler.in` for sub-minute intervals. The `kind=boot`
+> subscription and its `onBoot` export RETIRED 2026-07-05, unused:
+> seed registrations from any handler activation — they are
+> idempotent by key and `_sched/*` entries are durable kv that survive
+> deploys.) `webhook.send` results route through the shim's named
 > `onResult`; an unnamed cross-module `next({module})` chain legitimately
 > targets that module's `default`, so there is no forced `onSendCallback`
 > default.
@@ -458,7 +460,6 @@ export function onCharge() {                      // connectionless on_result �
   kv.set(`charges/${charge.id}`, charge);
 }
 
-export function onBoot()  { kv.set('booted_at', now()); }
 ```
 
 ### 5.7 SSE notifications — connection + connectionless composed
@@ -659,7 +660,7 @@ rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
   **`request.activation.*`**. There is **no `request.result`**. (Exception:
   `blob.seal`/`blob.receive` resume with the threaded `{hash, len}` on
   `request.ctx` — that *is* the ctx you threaded, not delivery metadata.)
-- **Connectionless fires** (`onBoot`, `onSubscription`, a `cron`/
+- **Connectionless fires** (`onSubscription`, a `cron`/
   `schedule` target): origin-specific fields (`deploymentId`,
   `request.activation.msg`, …) but **no** inbound HTTP `headers`/`body`,
   and the connection verbs are inert (§2.4).

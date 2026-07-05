@@ -6,8 +6,10 @@ The manifest `kind=cron` subscription (a non-durable in-memory interval
 clock, `CronState` + `sweepCronSubscriptions`) is RETIRED. This smoke
 proves the migration recipe gives the same behavior, durably:
 
-  - a `kind=boot` subscription's `onBoot` seeds
-    `scheduler.after(1000, "heartbeat", null, {key: "heartbeat"})`;
+  - a plain `/seed` handler activation seeds
+    `scheduler.in(1000, "heartbeat", null, {key: "heartbeat"})`
+    (kind=boot subscriptions are RETIRED too — seeding happens from any
+    handler activation; `_sched/*` entries are durable kv);
   - the `heartbeat` target increments `hb-fire-count`, stamps
     `hb-last-fired-at-ns`, and RE-ARMS itself with the same key
     ("recurring = a one-shot that re-arms itself").
@@ -35,12 +37,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_lib_v2 import V2Cluster  # noqa: E402
 
-# onBoot seed: registers the first heartbeat wake. The idempotency key
-# makes redeploys harmless (same key ⇒ same id ⇒ last-write-wins).
-BOOT_SEED_SRC = r'''export function onBoot() {
-    scheduler.after(1000, "heartbeat", { n: 0 }, { key: "heartbeat" });
+# Seed handler: registers the first heartbeat wake. The idempotency key
+# makes re-seeding harmless (same key ⇒ same id ⇒ last-write-wins).
+SEED_SRC = r'''export default function () {
+    scheduler.in(1000, "heartbeat", { n: 0 }, { key: "heartbeat" });
     kv.set("hb-seeded", "1");
-    return { status: 200 };
+    return "seeded";
 }'''
 
 # The recurring target: count + stamp + re-arm. `request.activation`
@@ -52,7 +54,7 @@ HEARTBEAT_SRC = r'''export default function () {
     kv.set("hb-fire-count", String(count));
     kv.set("hb-last-fired-at-ns", String(BigInt(Date.now()) * 1_000_000n));
     // Re-arm for the next interval — same key keeps it one entry.
-    scheduler.after(1000, "heartbeat", { n: count }, { key: a.key });
+    scheduler.in(1000, "heartbeat", { n: count }, { key: a.key });
     return { status: 200 };
 }'''
 
@@ -61,8 +63,14 @@ INDEX_SRC = r'''export default function () { return { status: 200, body: "ok" };
 HANDLERS = {
     "index.mjs": ("handler", INDEX_SRC),
     "heartbeat.mjs": ("handler", HEARTBEAT_SRC),
-    "_subscriptions/boot-seed/index.mjs": ("handler", BOOT_SEED_SRC),
-    "_subscriptions/boot-seed/spec.json": ("static", '{"kind":"boot"}'),
+    "seed/index.mjs": ("handler", SEED_SRC),
+}
+
+# The retired boot-subscription surface — must fail the deploy loudly.
+BOOT_SPEC_HANDLERS = {
+    "index.mjs": ("handler", INDEX_SRC),
+    "_subscriptions/old-boot/index.mjs": ("handler", INDEX_SRC),
+    "_subscriptions/old-boot/spec.json": ("static", '{"kind":"boot"}'),
 }
 
 # The retired surface — must fail the deploy loudly.
@@ -89,7 +97,7 @@ def main() -> int:
             failures.append(label)
 
     with V2Cluster.spawn("sched-hb", nodes=1) as c:
-        print("step 1: provision + deploy acme (boot-seeded scheduler heartbeat)")
+        print("step 1: provision + deploy acme (handler-seeded scheduler heartbeat)")
         r = c.provision("acme")
         check("provision → 204", r.status == 204, f"got {r.status} {r.body!r}")
         try:
@@ -108,8 +116,12 @@ def main() -> int:
             return 1
         print("ok  acme reachable")
 
+        # Seed the chain from an ordinary handler activation.
+        r = c.get("acme", "/seed")
+        check("seed handler → 200", r.status == 200, f"got {r.status} {r.body!r}")
+
         # ── 1. heartbeat fires >= 2 times (seed → fire → re-arm → fire). ──
-        # First fire ~1-2s after the boot seed commits (1s interval rounded
+        # First fire ~1-2s after the seed commits (1s interval rounded
         # up to the 1s tick + 1Hz sweep); each re-arm adds ~1-2s.
         print("waiting up to 25s for the heartbeat to fire 2+ times…")
         count = None
@@ -123,7 +135,7 @@ def main() -> int:
         check("heartbeat fired >= 2 times", count is not None and count >= 2,
               f"hb-fire-count={count}")
         if count is None or count < 2:
-            c.dump_node_log(grep=["sched", "wake", "boot", "fire", "error", "warn"])
+            c.dump_node_log(grep=["sched", "wake", "fire", "error", "warn"])
             print("\nFAILURES:", failures)
             return 1
         print(f"ok  heartbeat fired {count} time(s)")
@@ -167,11 +179,30 @@ def main() -> int:
               "kind=cron is retired" in log_text,
               "migration error line absent from node logs")
 
+        # ── 5. kind=boot spec.json fails the deploy loudly (retired 2026-07-05). ──
+        print("step 3: kind=boot spec.json is rejected at deploy")
+        r = c.provision("legacyboot")
+        check("provision legacyboot → 204", r.status == 204, f"got {r.status}")
+        try:
+            c.deploy_manifest("legacyboot", BOOT_SPEC_HANDLERS)
+        except RuntimeError as e:
+            print(f"ok  deploy rejected at release: {e}")
+        r = c.wait_for_handler("legacyboot", "/", want_status=200, timeout_s=8.0)
+        check("legacyboot tenant did NOT go live", r.status != 200,
+              f"got {r.status} (kind=boot should fail the deploy)")
+        log_text = ""
+        for name, path in c.log_paths.items():
+            if name.startswith("n"):
+                log_text += Path(path).read_text(errors="replace")
+        check("node log carries the kind=boot retirement error",
+              "kind=boot is retired" in log_text,
+              "retirement error line absent from node logs")
+
     if failures:
         print(f"\nFAILURES ({len(failures)}): {failures}")
         return 1
-    print("\nPASS scheduler-heartbeat smoke (v2): boot-seeded self-re-arming "
-          "scheduler.after interval recurrence + loud kind=cron retirement")
+    print("\nPASS scheduler-heartbeat smoke (v2): handler-seeded self-re-arming "
+          "scheduler.in interval recurrence + loud kind=cron/kind=boot retirement")
     return 0
 
 

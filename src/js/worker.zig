@@ -126,11 +126,6 @@ const owed_retry = @import("owed_retry.zig");
 // worker_drain/worker_dispatch (worker_mod.X) keep working unchanged.
 pub const OWED_PREFIX = owed_retry.OWED_PREFIX;
 pub const scanLoneOwedSendId = owed_retry.scanLoneOwedSendId;
-const subscription_sweep = @import("subscription_sweep.zig");
-// Boot subscription sweep lives in subscription_sweep.zig (the cron
-// half retired with durable-wake-plan P5(b) — recurrence rides the
-// durable scheduler).
-pub const sweepBootSubscriptions = subscription_sweep.sweepBootSubscriptions;
 const starter = @import("starter.zig");
 pub const sweepBlobSessions = @import("blob_sessions.zig").sweepBlobSessions;
 const durable_wake = @import("durable_wake.zig");
@@ -3399,10 +3394,8 @@ pub fn findBytecode(
     // extension-less route base. Without this, ".mjs" is appended to
     // an already-extensioned path (".mjs.mjs" → miss) and the walk-up
     // catch-all silently lands the fire on the tenant's root
-    // `index.mjs` — which 404s the conventional export AND (for a boot
-    // fire) still commits the pre-injected `_boot_fired` marker, so
-    // the subscription never fires again (the scheduler_heartbeat /
-    // streaming_subscription_boot smoke regression).
+    // `index.mjs` — which 404s the conventional export (the
+    // subscription-fire misresolution regression).
     if (tc.snap.bytecodes.get(module_base)) |bb| return bb.bytes;
 
     while (true) {
@@ -3436,7 +3429,7 @@ test "findBytecode: exact full-path key resolves before extension-append + walk-
     var bb_root = BlobBytes{ .bytes = @constCast("ROOT"), .hash_hex = [_]u8{'0'} ** 64, .refcount = .{ .raw = 1 } };
     var map: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
     defer map.deinit(a);
-    try map.put(a, "_subscriptions/boot-seed/index.mjs", &bb_sub);
+    try map.put(a, "_subscriptions/watch/index.mjs", &bb_sub);
     try map.put(a, "index.mjs", &bb_root);
     var snap: deployment_cache.TenantFilesSnapshot = undefined;
     snap.bytecodes = map;
@@ -3444,10 +3437,9 @@ test "findBytecode: exact full-path key resolves before extension-append + walk-
 
     // Subscription/trigger registrations carry the FULL file path —
     // the exact key must hit BEFORE ".mjs" is appended (".mjs.mjs" →
-    // miss) and the walk-up lands on the root index (which would 404
-    // the conventional export and, for boot, still commit the
-    // `_boot_fired` marker — the scheduler_heartbeat regression).
-    const sub = (try findBytecode(tc, "_subscriptions/boot-seed/index.mjs", a)).?;
+    // miss) and the walk-up lands on the root index, which would 404
+    // the conventional export (the subscription-fire regression).
+    const sub = (try findBytecode(tc, "_subscriptions/watch/index.mjs", a)).?;
     try std.testing.expectEqualStrings("SUB", sub);
 
     // Extension-less route bases still resolve, and the walk-up

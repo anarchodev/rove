@@ -12,7 +12,7 @@
 //! placeholder payload structs. Per-origin migration PRs (2B–2F) flesh
 //! out the variant payloads as each origin moves onto `enqueueMsg`:
 //!
-//! - 2B: cron / boot   → `SubscriptionFire`
+//! - 2B: cron / kv-react → `SubscriptionFire`
 //! - 2C: kv-react      → `SubscriptionFire` (same variant, kv source)
 //! - 2D: fetch-chunk   → `FetchChunk`
 //!                       (fetch-A bytes get taped here — closes the
@@ -135,9 +135,10 @@ pub const KvWake = struct {};
 /// resume. Migrates alongside the streaming origins.
 pub const WakeBatch = struct {};
 
-/// Subscription chain origin — kv-react / boot (primitive-gaps §2.1;
-/// the cron origin retired with durable-wake-plan P5(b) — recurrence
-/// is a `durable_wake`, not a subscription fire). Owns its strings;
+/// Subscription chain origin — kv-react (primitive-gaps §2.1; the
+/// cron origin retired with durable-wake-plan P5(b) — recurrence is a
+/// `durable_wake`, not a subscription fire — and the boot origin
+/// retired 2026-07-05, unused). Owns its strings;
 /// `deinit` is called by `MsgQueue.deinit` (drop-on-shutdown) and by
 /// the dispatch path after the fire completes.
 pub const SubscriptionFire = struct {
@@ -151,7 +152,6 @@ pub const SubscriptionFire = struct {
             key: []u8,
             op: u8,
         },
-        boot: struct { deployment_id: u64 },
     };
 
     /// Allocator-owned. The producer dupes onto the message; the
@@ -168,7 +168,6 @@ pub const SubscriptionFire = struct {
         allocator.free(self.module_path);
         switch (self.source) {
             .kv => |kv_src| if (kv_src.key.len > 0) allocator.free(kv_src.key),
-            else => {},
         }
         self.* = undefined;
     }
@@ -294,7 +293,7 @@ test "Msg covers every ActivationSource variant exhaustively" {
         .tenant_id = try testing.allocator.dupe(u8, "t"),
         .subscription_name = try testing.allocator.dupe(u8, "s"),
         .module_path = try testing.allocator.dupe(u8, "m"),
-        .source = .{ .boot = .{ .deployment_id = 0 } },
+        .source = .{ .kv = .{ .key = try testing.allocator.dupe(u8, "k"), .op = 'p' } },
     };
     defer sf.deinit(testing.allocator);
 

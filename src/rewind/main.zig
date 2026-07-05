@@ -200,20 +200,17 @@ fn drainSnapshotCatchupJobs(worker: anytype, catchup: *rjs.SnapshotCatchupThread
     }
 }
 
-fn runPromotionHook(worker: anytype, worker_idx: usize) void {
+fn runPromotionHook(worker: anytype) void {
     var buf: [64][]const u8 = undefined;
     const n = worker.raft.drainPromotions(&buf);
     if (n == 0) return;
     for (buf[0..n]) |tenant_id| {
         worker.node.deploy.enqueueCurrentDeployment(tenant_id);
     }
-    // Worker-0-only for the boot-subscription sweep (avoids duplicate enqueues
-    // across a node's workers); rewind runs a single worker, but keep the gate
-    // for forward-compat. The wake sweep is partitioned by
-    // `hash(tenant) % N_inboxes`, so every worker covers its own slice exactly
-    // once and it runs unconditionally. (The owed retry sweep retired with
-    // durable-wake-plan P5(a) — webhook recovery is a durable wake now.)
-    if (worker_idx == 0) rjs.sweepBootSubscriptions(worker);
+    // The wake sweep is partitioned by `hash(tenant) % N_inboxes`, so every
+    // worker covers its own slice exactly once. (The owed retry sweep retired
+    // with durable-wake-plan P5(a) — webhook recovery is a durable wake now;
+    // the boot-subscription sweep retired with kind=boot, 2026-07-05.)
     rjs.sweepDurableWakesOnPromotion(worker);
 }
 
@@ -333,7 +330,7 @@ fn workerMain(args: *WorkerCtx) !void {
         try rjs.drainFetchPendingDurability(worker);
         _ = try rjs.dispatchOnce(worker, &blocked_tenants);
         try rjs.drainRaftPending(worker);
-        runPromotionHook(worker, args.worker_idx);
+        runPromotionHook(worker);
         drainSnapshotCatchupJobs(worker, catchup);
         try rjs.drainForwardPending(worker);
         // raft Phase 2.5: finalize completed streamed-snapshot transfers

@@ -288,6 +288,18 @@ smokes that touch the changed surface).
    from the tape) — required before the `request.body` retirement and
    before shims that run under replay lean on the accessors.
 
+## 4.1 Retired alongside this arc
+
+- **`kind=boot` subscriptions + `onBoot`** (2026-07-05): audited unused
+  (no rewind-apps consumer; only its own example + smokes). The "run
+  once on deploy" hook is gone — recurring registrations (`cron`,
+  `scheduler.in`) seed from any handler activation; they are
+  idempotent by key and `_sched/*` entries are durable kv that survive
+  deploys. `kind=boot` in a manifest now fails the deploy with a
+  pointed retirement error (same posture as `kind=cron`). The
+  `_boot_fired/*` marker keys are dead (harmless residue in existing
+  stores). kv-react (`kind=kv` → `onSubscription`) is unchanged.
+
 ## 5. Not changing
 
 The engine model is untouched: activation purity, arena reset,

@@ -13,7 +13,7 @@
 //!     on a kernel-chosen worker (4-tuple hash); this routing only
 //!     guarantees that every producer of a given tenant's async
 //!     activations picks the same worker. For stateless activations
-//!     (cron / boot / kv-react / stateless callbacks) any worker can
+//!     (cron / kv-react / stateless callbacks) any worker can
 //!     service the message, so consistency is sufficient.
 //!   - held state (bound fetch / held-sync send): the owning worker
 //!     registered itself by id at binding time; routing consults the
@@ -381,7 +381,7 @@ pub const MsgRouter = struct {
     }
 
     /// Gap 2.1 Phase D + effect-reification Phase 2E: hash-route a
-    /// subscription fire (kv-react / boot) to the destination
+    /// subscription fire (kv-react) to the destination
     /// worker's unified `MsgInbox` as a `SubscriptionFire` variant.
     /// Producer (loader / sweeper) owns the input slices borrowed;
     /// this fn dupes onto the payload before pushing. Returns
@@ -404,7 +404,6 @@ pub const MsgRouter = struct {
                 const key_dup = try allocator.dupe(u8, k.key);
                 break :blk .{ .kv = .{ .key = key_dup, .op = k.op } };
             },
-            .boot => |b| .{ .boot = .{ .deployment_id = b.deployment_id } },
         };
         errdefer switch (source) {
             .kv => |kv| allocator.free(kv.key),

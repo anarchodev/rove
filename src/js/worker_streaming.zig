@@ -1516,7 +1516,7 @@ pub fn runFire(
             defer r.deinit(allocator);
             if (r.exception.len > 0) {
                 // Surface connectionless-fire exceptions on stderr too —
-                // the log record alone made a failing onBoot/cron/wake
+                // the log record alone made a failing cron/wake
                 // handler invisible to an operator tailing the node.
                 std.log.warn(
                     "rove-js " ++ spec.site ++ " ({s}): handler exception: {s}",
@@ -1809,7 +1809,6 @@ pub const SubscriptionFireSource = dispatcher_mod.SubscriptionFireSource;
 /// `default` that branches on `request.activation.source.kind`.
 fn subscriptionExport(source: SubscriptionFireSource) []const u8 {
     return switch (source) {
-        .boot => "onBoot",
         .kv => "onSubscription",
     };
 }
@@ -1834,32 +1833,6 @@ pub fn fireSubscriptionActivation(
     const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
     defer allocator.free(spath);
 
-    // Gap 2.1 Phase D: inject the `_boot_fired/<dep_id>` marker
-    // into the handler's writeset BEFORE the handler runs. The
-    // marker commits atomically with the handler's effects through
-    // raft, so any subsequent reload (cold start, leader change)
-    // sees the marker and skips the re-fire. Writing the marker
-    // BEFORE the handler also covers the "handler throws" case —
-    // we don't loop on a failing boot; customer redeploys to fix.
-    if (source == .boot) {
-        var key_buf: [64]u8 = undefined;
-        const marker_key = std.fmt.bufPrint(&key_buf, "_boot_fired/{d}", .{source.boot.deployment_id}) catch unreachable;
-        p.txn.put(marker_key, "fired") catch |err| {
-            std.log.warn(
-                "rove-js boot marker txn.put ({s}/{d}): {s}",
-                .{ tenant_id, source.boot.deployment_id, @errorName(err) },
-            );
-            return;
-        };
-        p.ws.addPut(marker_key, "fired") catch |err| {
-            std.log.warn(
-                "rove-js boot marker ws.addPut ({s}/{d}): {s}",
-                .{ tenant_id, source.boot.deployment_id, @errorName(err) },
-            );
-            return;
-        };
-    }
-
     // Mint a fresh correlation_id for this chain origin. Format:
     // `sub-{name-prefix}-{request_id-hex}` — name-scoped + unique
     // enough to dedup in the replay UX. Truncated to keep length
@@ -1874,12 +1847,12 @@ pub fn fireSubscriptionActivation(
 
     // Named-export dispatch by trigger source (handler-shape.md §3,
     // completing the Phase-4 activation-kind-switch retirement for
-    // connectionless fires): a boot fire lands in `onBoot`, a kv-react
-    // fire in `onSubscription`. The handler no longer has to branch on
-    // `request.activation.source.kind`. A missing conventional export
-    // is the fail-loud 404 backstop. Recurrence (`cron(spec, target)`)
-    // names its own target via the durable scheduler — not this path.
-    // First-class target (decisions.md §4.5) — no synthetic query.
+    // connectionless fires): a kv-react fire lands in `onSubscription`.
+    // The handler never branches on `request.activation.source.kind`.
+    // A missing conventional export is the fail-loud 404 backstop.
+    // Recurrence (`cron(spec, target)`) names its own target via the
+    // durable scheduler — not this path. First-class target
+    // (decisions.md §4.5) — no synthetic query.
 
     // Synthesize the Request carrying the subscription source union
     // (the variant IS the activation payload).
@@ -2430,7 +2403,6 @@ pub fn fireKvReactSubscriptions(worker: anytype, unit: *ParkedUnit) !void {
     for (snap.subscriptions) |sub| {
         const prefix = switch (sub.spec) {
             .kv => |k| k.prefix,
-            else => continue,
         };
         for (unit.buffered.items.items) |cmd| switch (cmd) {
             .kv_wake_broadcast => |w| {
@@ -2477,7 +2449,7 @@ pub fn fireKvReactSubscriptions(worker: anytype, unit: *ParkedUnit) !void {
 // ── Msg inbox + dispatch ──────────────────────────────────────────────
 
 /// Cross-thread enqueue parameters used by
-/// `NodeState.enqueueSubscriptionFireForTenant` (cron sweeper, boot
+/// `NodeState.enqueueSubscriptionFireForTenant` (cron sweeper,
 /// loader). Borrowed slices — the cross-thread enqueue dups onto a
 /// `PendingFireMessage` on the inbox; `drainSubFireInbox` then moves
 /// those owned slices onto an `effect.SubscriptionFire` payload
@@ -2492,7 +2464,7 @@ pub const SubscriptionFireQueueInput = struct {
 // `enqueueSubscriptionFire` (the prior collection-creation helper) was
 // retired in effect-reification Phase 2C. Every subscription origin
 // now routes through `effect.enqueueMsg`:
-// - cron / boot: cross-thread inbox → `drainSubFireInbox` →
+// - cron / kv-react: cross-thread inbox → `drainSubFireInbox` →
 //   `enqueueMsg` (move-semantics)
 // - kv-react: `fireKvReactSubscriptions` → `enqueueMsg` (dup-on-payload)
 
@@ -2506,7 +2478,7 @@ pub const SubscriptionFireQueueInput = struct {
 /// Effect-reification Phase 2E: drain the worker's unified
 /// cross-thread `msg_inbox`, moving each `effect.Msg` onto the
 /// in-thread `msg_queue`. One drain function for every cross-thread
-/// origin (cron + boot fires, fetch chunk / done / pipe_done events)
+/// origin (cron fires, fetch chunk / done / pipe_done events)
 /// — the pre-2E pair (`drainSubFireInbox` + `drainFetchChunkInbox`)
 /// collapsed into this. Producers built Msg variants on the way in
 /// (NodeState.enqueueXxxForTenant); this fn is variant-agnostic.
@@ -2516,7 +2488,7 @@ pub const SubscriptionFireQueueInput = struct {
 /// `dispatchPendingMsgs`). On `error.Full` we `freeOwnedMsg` and
 /// log — overflow drops are bounded by the cross-thread inbox's
 /// rate and the in-thread queue's cap; the per-origin policy is
-/// at-most-once for cron/boot (re-fire on next sweep) and at-most-
+/// at-most-once for cron (re-fire on next sweep) and at-most-
 /// once for fetch (sender already accepted the upstream chunk —
 /// loss surfaces as a fetch_done with mismatched byte counts).
 pub fn drainMsgInbox(worker: anytype) void {
@@ -2545,7 +2517,7 @@ pub fn drainMsgInbox(worker: anytype) void {
 /// Worker-tick combined pass: drain the cross-thread Msg inbox into
 /// the in-thread queue, then dispatch the queue. Called from the
 /// workerMain loop on every tick; covers cross-thread producers
-/// (boot via deployment_loader, cron via sweeper, FetchPool libcurl
+/// (cron via sweeper, FetchPool libcurl
 /// threads) AND in-thread producers (kv-react, which `enqueueMsg`s
 /// directly from `fireKvReactSubscriptions`).
 pub fn serviceSubscriptionFires(worker: anytype) void {
@@ -2923,7 +2895,7 @@ pub fn drainSpools(worker: anytype) void {
 /// subsequent ticks.
 ///
 /// Effect-reification Phase 2D: the unified dispatcher across every
-/// migrated Msg variant — subscription fires (cron / boot / kv-react,
+/// migrated Msg variant — subscription fires (cron / kv-react,
 /// Phase 2B/C) and outbound HTTP events (chunk / done / pipe_done,
 /// Phase 2D). Phases 2E-2F add send-callback / inbound-HTTP arms.
 ///
@@ -2951,7 +2923,6 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
                     sf.module_path,
                     switch (sf.source) {
                         .kv => |kv| SubscriptionFireSource{ .kv = .{ .key = kv.key, .op = kv.op } },
-                        .boot => |b| SubscriptionFireSource{ .boot = .{ .deployment_id = b.deployment_id } },
                     },
                 );
                 sf.deinit(allocator);

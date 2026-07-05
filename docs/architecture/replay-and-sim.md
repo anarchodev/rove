@@ -139,7 +139,7 @@ declares/captures:
 | `ws_message` | `onMessage` | `request.activation = {opcode, data}`, `request.ctx` |
 | `disconnect` | `onDisconnect` | `request.ctx` |
 | `durable_wake` / `cron` / `schedule` | the named target | `request.activation.msg`; no inbound headers/body; connection verbs inert |
-| `onBoot` / `onSubscription` | `onBoot` / `onSubscription` | origin-specific; no inbound surface |
+| `onSubscription` | `onSubscription` | origin-specific; no inbound surface (`onBoot` retired 2026-07-05) |
 
 `request.ctx` is `undefined` on the **first** activation of a chain. The
 request surface is **read-recorded** (`handler-shape.md` §7.1): names always

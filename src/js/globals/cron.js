@@ -293,7 +293,7 @@ function _parseField(field, min, max) {
  * connectionless trigger — the fire is a fresh durable activation with
  * no held socket, surviving leader changes (it rides the gap-2.6
  * scheduler). Idempotent: re-calling with the same `(spec, target)`
- * (e.g. on every request or boot) keeps exactly one cron registration.
+ * (e.g. on every request) keeps exactly one cron registration.
  *
  * The callable `cron` also carries the time/expr helpers as statics
  * (`cron.next`, `cron.dailyAt`, `cron.parseDuration`, …).

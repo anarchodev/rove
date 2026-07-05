@@ -76,10 +76,13 @@ pub const TriggerEntry = struct {
 /// /index.mjs` pairs. Implements `docs/primitive-gaps.md` §2.1 +
 /// `streaming-handlers-plan.md` §5.
 ///
-/// Two kinds (see `Spec` below): kv (apply-time fan-out from a
-/// watched tenant prefix), boot (once per deployment activation).
-/// The cron kind retired with durable-wake-plan P5(b) — recurrence
-/// is the `cron(spec, target)` verb over the durable scheduler. The handler is a normal TEA `update`; the
+/// One kind (see `Spec` below): kv (apply-time fan-out from a
+/// watched tenant prefix). The cron kind retired with
+/// durable-wake-plan P5(b) — recurrence is the `cron(spec, target)`
+/// verb over the durable scheduler; the boot kind retired 2026-07-05
+/// (unused — seed recurring registrations from any handler
+/// activation instead; `_sched/*` entries are durable kv and survive
+/// deploys). The handler is a normal TEA `update`; the
 /// difference is the activation source (`subscription_fire`) and
 /// the absence of a held socket — `Response`/`__rove_next`/
 /// `__rove_stream` returns are recorded on the tape but bytes
@@ -102,10 +105,6 @@ pub const SubscriptionEntry = struct {
         /// this tenant. Mirrors the §4.6 parked-stream wake but as
         /// a chain origin (no parked stream required).
         kv: struct { prefix: []u8 },
-        /// Fire once on deployment activation. Idempotent via the
-        /// `_boot_fired/{deployment_id}` marker the runtime writes
-        /// post-fire.
-        boot,
     };
 
     pub fn deinit(self: *SubscriptionEntry, allocator: std.mem.Allocator) void {
@@ -113,7 +112,6 @@ pub const SubscriptionEntry = struct {
         allocator.free(self.module_path);
         switch (self.spec) {
             .kv => |kv_spec| allocator.free(kv_spec.prefix),
-            .boot => {},
         }
         self.* = undefined;
     }
@@ -597,7 +595,7 @@ pub const DispatchState = struct {
     /// The entity owning the chain this dispatch runs against —
     /// what the binding registers under `fetch_id` when `bind:
     /// true`. Null when the activation has no held socket
-    /// (subscription / cron / boot / test paths); the binding
+    /// (subscription / cron / test paths); the binding
     /// rejects bind:true in that case.
     activation_entity: ?rove.Entity = null,
     /// Per-chain bound-fetch pending count snapshot — surfaced
@@ -2558,7 +2556,7 @@ pub fn installRequest(
 
     // Gap 2.1 subscription_fire payload. The activation's `name`
     // is the subscription's directory name; `source` carries the
-    // kind-specific payload (cron firedAt / kv key+op / boot
+    // kind-specific payload (kv key+op
     // deployment_id).
     if (request.activation == .subscription_fire) {
         const sf = request.activation.subscription_fire;
@@ -2578,16 +2576,6 @@ pub fn installRequest(
                 if (op_str.len > 0) {
                     _ = c.JS_SetPropertyStr(ctx, source_obj, "op", c.JS_NewStringLen(ctx, op_str.ptr, op_str.len));
                 }
-            },
-            .boot => |boot| {
-                _ = c.JS_SetPropertyStr(ctx, source_obj, "kind", c.JS_NewStringLen(ctx, "boot", 4));
-                // deployment_id is a u64 derived from sha256 — values
-                // routinely exceed 2^53 (losing precision as a JS Number)
-                // AND exceed 2^63 (flipping sign as a `JS_NewBigInt64`
-                // signed BigInt). `JS_NewBigUint64` preserves the
-                // unsigned semantics so `String(dep_id)` matches the
-                // Zig-side `{d}` formatting of the same u64.
-                _ = c.JS_SetPropertyStr(ctx, source_obj, "deployment_id", c.JS_NewBigUint64(ctx, boot.deployment_id));
             },
         };
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "source", source_obj);
@@ -3626,16 +3614,6 @@ test "SubscriptionEntry.deinit frees kv spec" {
         .name = try a.dupe(u8, "process-jobs"),
         .module_path = try a.dupe(u8, "_subscriptions/process-jobs/index.mjs"),
         .spec = .{ .kv = .{ .prefix = try a.dupe(u8, "jobs/") } },
-    };
-    entry.deinit(a);
-}
-
-test "SubscriptionEntry.deinit handles boot (no inner alloc)" {
-    const a = std.testing.allocator;
-    var entry: SubscriptionEntry = .{
-        .name = try a.dupe(u8, "migrate-v3"),
-        .module_path = try a.dupe(u8, "_subscriptions/migrate-v3/index.mjs"),
-        .spec = .boot,
     };
     entry.deinit(a);
 }

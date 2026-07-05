@@ -47,7 +47,7 @@ arm).
   `runOutcome` is the single re-entry point). `default` (inbound HTTP),
   `onWake` (timer/kv), `onFetchResult` / `onFetchChunk` / `onFetchDone` (bound
   fetch, by event shape), `onDisconnect` (client close), plus the connectionless
-  origins (`onBoot` / `onSubscription`; the manifest cron subscription and its
+  origins (`onSubscription`; `onBoot` retired 2026-07-05, unused; the manifest cron subscription and its
   `onCron` export retired with durable-wake P5(b) — recurrence is the `cron()`
   verb); the bound-fetch `{to}` override names its export directly.
   `activationKindForExport` maps kind → export name.
@@ -145,7 +145,7 @@ durable next-fire watermark per tenant; everything else is the baked
   entry, aimed at baked `__system/webhook_fire.mjs`; terminal results cancel
   it. Durable cron is the `cron(spec, target)` verb over `__system/cron_tick`,
   self-re-arming; a manifest `kind=cron` spec.json fails the deploy loudly
-  (sub-minute recurrence = `scheduler.after` seeded from `onBoot`, recipe in
+  (sub-minute recurrence = a self-re-arming `scheduler.in` seeded from any handler activation, recipe in
   `scripts/smoke/scheduler_heartbeat_smoke_v2.py`).
 - **Fetch-from-fire wiring**: every `runFire` / cont-resume / stream-resume
   origin owns a commit-gated `Cmd.http_fetch` accumulator
