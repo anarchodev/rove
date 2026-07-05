@@ -11,6 +11,27 @@ pub const Collection = collection_mod.Collection;
 pub const Registry = registry_mod.Registry;
 pub const effectiveAlign = collection_mod.effectiveAlign;
 
+/// Make the process's stderr/stdout non-blocking so `std.log` writes on a
+/// single-threaded poll loop can NEVER wedge it on a backpressured log
+/// sink. Every rove serving binary (front / worker / cp) runs its poll
+/// loop on one thread and logs via `std.log` → stderr; in prod stderr →
+/// journald, which rate-limits / stalls on slow disk, and a BLOCKING
+/// write() there freezes the whole process — every tenant — until the
+/// sink drains (root-caused from a front wedge: poll thread stuck in
+/// anon_pipe_write, the per-request access log the volume trigger). With
+/// O_NONBLOCK a write under backpressure returns EAGAIN, which `std.log`
+/// swallows — the line drops instead of freezing the serving thread, and
+/// a dropped log line always beats a frozen edge. Call once at startup.
+/// Best-effort: a fcntl failure just leaves the fd blocking (no regression).
+pub fn logNonBlocking() void {
+    for ([_]std.posix.fd_t{ std.posix.STDERR_FILENO, std.posix.STDOUT_FILENO }) |fd| {
+        const cur = std.posix.fcntl(fd, std.posix.F.GETFL, 0) catch continue;
+        var o: std.posix.O = @bitCast(@as(u32, @truncate(cur)));
+        o.NONBLOCK = true;
+        _ = std.posix.fcntl(fd, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
+    }
+}
+
 test {
     _ = entity_mod;
     _ = row_mod;

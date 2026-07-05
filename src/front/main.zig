@@ -211,23 +211,6 @@ fn getEnvCfg(name: []const u8) []const u8 {
     return std.posix.getenv(name) orelse "";
 }
 
-/// Set `O_NONBLOCK` on stderr (and stdout) so the serving thread's
-/// `std.log` writes can never block on a backpressured log sink
-/// (journald / an undrained pipe). On a full sink the write returns
-/// `EAGAIN`, which `std.log`'s writer swallows — the line drops rather
-/// than freezing the poll loop. Best-effort: a fcntl failure just leaves
-/// the fd blocking (no worse than before). Shared file description with
-/// stdout when they're the same pipe, which is fine — both should be
-/// non-blocking on the serving thread.
-fn makeLogNonBlocking() void {
-    for ([_]std.posix.fd_t{ std.posix.STDERR_FILENO, std.posix.STDOUT_FILENO }) |fd| {
-        const cur = std.posix.fcntl(fd, std.posix.F.GETFL, 0) catch continue;
-        var o: std.posix.O = @bitCast(@as(u32, @truncate(cur)));
-        o.NONBLOCK = true;
-        _ = std.posix.fcntl(fd, std.posix.F.SETFL, @as(u32, @bitCast(o))) catch {};
-    }
-}
-
 /// Parse a millisecond config env var, falling back to `default` when
 /// unset or unparseable.
 fn envMs(name: []const u8, default: i128) i128 {
@@ -502,7 +485,7 @@ pub fn main() !void {
     // Make the log fd non-blocking so a write under backpressure drops
     // (EAGAIN, swallowed by std.log's `catch`) instead of wedging the
     // loop — dropped log lines are strictly better than a frozen edge.
-    makeLogNonBlocking();
+    rove.logNonBlocking();
 
     var arg_it = std.process.args();
     _ = arg_it.next();
