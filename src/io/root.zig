@@ -49,6 +49,20 @@ pub const IoCleanupCtx = struct {
     recv_buffers_returned_via_deinit: u64 = 0,
 };
 
+/// Peer (remote) address of an accepted connection, resolved once at
+/// accept time. Direct descriptors have no process fd to getpeername
+/// on, and multishot accept's addr buffer is shared across
+/// completions (batched accepts would mis-attribute clients) — so
+/// the accept handler submits an IORING_OP_FIXED_FD_INSTALL and the
+/// install CQE getpeername()s the materialized fd, fills this, and
+/// closes it again. `valid` stays false until that CQE lands (a
+/// request racing the window just has no peer identity) and forever
+/// on client-direction connections.
+pub const PeerAddr = struct {
+    addr: std.net.Address = undefined,
+    valid: bool = false,
+};
+
 pub const Fd = struct {
     fd: i32 = -1,
 
@@ -187,7 +201,7 @@ pub const ReadCycleEntity = struct {
 // Base row types
 // =============================================================================
 
-pub const ConnectionBaseRow = Row(&.{ Fd, ReadCycleEntity });
+pub const ConnectionBaseRow = Row(&.{ Fd, ReadCycleEntity, PeerAddr });
 pub const ReadBaseRow = Row(&.{ ConnEntity, ReadResult });
 pub const WriteInBaseRow = Row(&.{ ConnEntity, WriteBuf });
 pub const WriteResultBaseRow = Row(&.{ ConnEntity, WriteBuf, IoResult });
@@ -307,6 +321,8 @@ pub fn Io(comptime opts: Options) type {
         /// up in `self.connections`.
         fd_resolver: ?*const fn (ctx: *anyopaque, entity: Entity) ?*Fd = null,
         fd_resolver_ctx: ?*anyopaque = null,
+        peer_resolver: ?*const fn (ctx: *anyopaque, entity: Entity) ?*PeerAddr = null,
+        peer_resolver_ctx: ?*anyopaque = null,
 
         /// Optional callback that returns the number of conn entities
         /// the upper layer (e.g. rove-h2) is currently holding outside
@@ -358,6 +374,22 @@ pub fn Io(comptime opts: Options) type {
         pub fn setFdResolver(self: *Self, ctx: *anyopaque, resolver: *const fn (*anyopaque, Entity) ?*Fd) void {
             self.fd_resolver_ctx = ctx;
             self.fd_resolver = resolver;
+        }
+
+        /// PeerAddr mirror of `getFd`: the conn entity may have moved
+        /// into an upper-layer collection (rove-h2's) by the time the
+        /// fixed-fd-install CQE lands, so resolution goes through the
+        /// same external-resolver hook.
+        pub fn getPeerAddr(self: *Self, entity: Entity) ?*PeerAddr {
+            if (self.peer_resolver) |resolver| {
+                return resolver(self.peer_resolver_ctx.?, entity);
+            }
+            return self.reg.get(entity, &self.connections, PeerAddr) catch null;
+        }
+
+        pub fn setPeerResolver(self: *Self, ctx: *anyopaque, resolver: *const fn (*anyopaque, Entity) ?*PeerAddr) void {
+            self.peer_resolver_ctx = ctx;
+            self.peer_resolver = resolver;
         }
 
         /// Register a callback returning the count of conn entities the
@@ -690,19 +722,44 @@ pub fn Io(comptime opts: Options) type {
 
             if (self.reg.isInCollection(entity, &self._read_pending)) {
                 try self.handleRecv(entity, cqe);
-            } else if (self.reg.isInCollection(entity, &self._write_pending)) {
+                return;
+            }
+            if (self.reg.isInCollection(entity, &self._write_pending)) {
                 try self.handleSend(entity, cqe);
-            } else if (has_connect) {
+                return;
+            }
+            if (has_connect) {
                 if (self.reg.isInCollection(entity, &self._connect_socket_pending)) {
                     try self.handleConnectSocket(entity, cqe);
-                } else if (self.reg.isInCollection(entity, &self._connect_pending)) {
-                    try self.handleConnect(entity, cqe);
-                } else {
-                    return error.UnexpectedEntityCollection;
+                    return;
                 }
-            } else {
-                return error.UnexpectedEntityCollection;
+                if (self.reg.isInCollection(entity, &self._connect_pending)) {
+                    try self.handleConnect(entity, cqe);
+                    return;
+                }
             }
+            // A conn-entity CQE is the accept-time fixed-fd install
+            // (the only op posted with a conn entity as user_data).
+            // The conn may already live in an upper-layer collection —
+            // resolve through the peer hook, not self.connections.
+            if (self.getPeerAddr(entity)) |pa| {
+                handlePeerInstall(pa, cqe);
+                return;
+            }
+            return error.UnexpectedEntityCollection;
+        }
+
+        /// Fixed-fd-install CQE: `res` is a real process fd for the
+        /// accepted socket. getpeername it, record, close. Failure at
+        /// any step just leaves the conn without a peer identity.
+        fn handlePeerInstall(pa: *PeerAddr, cqe: linux.io_uring_cqe) void {
+            if (cqe.res < 0) return;
+            const real_fd: posix.fd_t = @intCast(cqe.res);
+            defer posix.close(real_fd);
+            var storage: posix.sockaddr.storage align(4) = undefined;
+            var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+            posix.getpeername(real_fd, @ptrCast(&storage), &len) catch return;
+            pa.* = .{ .addr = std.net.Address.initPosix(@ptrCast(&storage)), .valid = true };
         }
 
         fn handleAccept(self: *Self, cqe: linux.io_uring_cqe) !void {
@@ -765,6 +822,17 @@ pub fn Io(comptime opts: Options) type {
 
             const conn = try self.reg.create(&self.connections);
             try self.reg.set(conn, &self.connections, Fd, .{ .fd = @intCast(file_slot) });
+            try self.reg.set(conn, &self.connections, PeerAddr, .{});
+
+            // Resolve the peer address (see `PeerAddr`): install the
+            // fixed file into the process fd table; the install CQE
+            // handler getpeername()s the real fd, records the address,
+            // and closes it again. Best-effort — a failed install just
+            // leaves the conn without a peer identity.
+            const install_sqe = try getSqeOrSubmit(&self.ring);
+            install_sqe.prep_rw(.FIXED_FD_INSTALL, @intCast(file_slot), 0, 0, 0);
+            install_sqe.flags |= linux.IOSQE_FIXED_FILE;
+            install_sqe.user_data = encodeEntity(conn);
 
             // Create read-cycle entity and link to connection
             const read_ent = try self.reg.create(&self._read_pending);

@@ -191,16 +191,51 @@ pub fn hostOnly(authority: []const u8) []const u8 {
 
 /// hop-by-hop headers must not be forwarded across a proxy (RFC 7230
 /// §6.1). `expect` rides along: the front does not implement
-/// 100-continue relaying and the worker's h2 server ignores it.
+/// 100-continue relaying and the worker's h2 server ignores it. The
+/// forwarding-identity headers (`x-forwarded-*`, `x-real-ip`,
+/// `forwarded`) are stripped because the front IS the trust boundary
+/// (plan B7): it terminates the public edge, so any inbound value is
+/// client-spoofed — the front re-stamps `x-forwarded-for` /
+/// `x-forwarded-proto` from the connection. (If an LB/CDN is ever put
+/// in front of the front, this needs a trusted-hops config instead.)
 fn dropFromRequest(name: []const u8) bool {
     const hop = [_][]const u8{
-        "connection",          "keep-alive", "proxy-authenticate",
-        "proxy-authorization", "te",         "trailer",
-        "transfer-encoding",   "upgrade",    "expect",
-        "host",
+        "connection",          "keep-alive",        "proxy-authenticate",
+        "proxy-authorization", "te",                "trailer",
+        "transfer-encoding",   "upgrade",           "expect",
+        "host",                "x-forwarded-for",   "x-forwarded-proto",
+        "x-forwarded-host",    "x-real-ip",         "forwarded",
     };
     for (hop) |h| if (std.ascii.eqlIgnoreCase(name, h)) return true;
     return false;
+}
+
+/// RFC 7230 §6.1: a proxy MUST also remove any header NAMED in the
+/// `Connection` header value (h1 ingress; h2 forbids the header but a
+/// synthesized h1 head carries it through). Forwarding
+/// connection-nominated headers is the mechanism behind published
+/// request-smuggling / cache-poisoning classes (plan B8).
+fn nominatedByConnection(connection_value: ?[]const u8, name: []const u8) bool {
+    const cv = connection_value orelse return false;
+    var it = std.mem.tokenizeAny(u8, cv, ", \t");
+    while (it.next()) |tok| {
+        if (std.ascii.eqlIgnoreCase(tok, name)) return true;
+    }
+    return false;
+}
+
+/// Render `addr`'s bare IP (no port, no IPv6 brackets — the
+/// conventional `x-forwarded-for` form) into `buf`; returns the
+/// length, 0 on failure/overflow.
+fn peerIpString(buf: []u8, addr: std.net.Address) u8 {
+    var tmp: [64]u8 = undefined;
+    const s = std.fmt.bufPrint(&tmp, "{f}", .{addr}) catch return 0;
+    var ip = s;
+    if (std.mem.lastIndexOfScalar(u8, ip, ':')) |i| ip = ip[0..i];
+    if (ip.len >= 2 and ip[0] == '[' and ip[ip.len - 1] == ']') ip = ip[1 .. ip.len - 1];
+    if (ip.len == 0 or ip.len > buf.len) return 0;
+    @memcpy(buf[0..ip.len], ip);
+    return @intCast(ip.len);
 }
 
 /// A response header that must NOT be relayed: hop-by-hop, pseudo
@@ -540,6 +575,11 @@ pub fn Proxy(comptime FrontH2: type) type {
             upgrade_ent: Entity,
             authority: []u8, // owned
             host: []u8, // owned
+            /// Forwarding identity (plan B7) — see `Flow.peer_ip`. WS
+            /// upgrades are h1 at the edge; TLS-ness rides `fwd_proto`.
+            peer_ip: [46]u8 = undefined,
+            peer_ip_len: u8 = 0,
+            fwd_proto: []const u8 = "http",
             nodes: [][]u8 = &.{},
             node_idx: usize = 0,
             attempt: u32 = 0,
@@ -577,6 +617,17 @@ pub fn Proxy(comptime FrontH2: type) type {
             proxy: *Self,
             authority: []u8, // owned; raw (with :port), for :authority upstream
             host: []u8, // owned; portless, the cache/invalidate key
+
+            // Forwarding identity (plan B7), captured at intake from the
+            // downstream connection; stamped upstream on every attempt.
+            peer_ip: [46]u8 = undefined, // bare IP, no port/brackets
+            peer_ip_len: u8 = 0,
+            /// Downstream `:scheme` — "https" when the front terminated
+            /// TLS (static strings only; never a borrowed slice).
+            fwd_proto: []const u8 = "http",
+            /// The appended `Via` entry (RFC 7230 §5.7.1), versioned by
+            /// the received protocol.
+            via_entry: []const u8 = "2 rewind-front",
 
             // downstream identity
             down_ent: Entity,
@@ -900,6 +951,10 @@ pub fn Proxy(comptime FrontH2: type) type {
                     .authority = undefined,
                     .host = undefined,
                 };
+                if (self.server.connPeerAddr(sess.entity)) |peer|
+                    t.peer_ip_len = peerIpString(&t.peer_ip, peer);
+                const ws_scheme = headerValue(rh, ":scheme") orelse "http";
+                t.fwd_proto = if (std.mem.eql(u8, ws_scheme, "https")) "https" else "http";
                 t.authority = self.allocator.dupe(u8, authority_raw) catch {
                     self.allocator.destroy(t);
                     self.server.wsUpgradeReject(ent, 503);
@@ -1013,52 +1068,35 @@ pub fn Proxy(comptime FrontH2: type) type {
             t.pending_terminals += 1;
         }
 
-        /// The five RFC 8441 CONNECT headers, one owned buffer.
+        /// The five RFC 8441 CONNECT headers + the forwarding identity
+        /// (plan B7), one owned buffer via `packFields`.
         fn packTunnelHeaders(self: *Self, t: *WsTunnel) !h2.ReqHeaders {
-            const Pair = struct { name: []const u8, value: []const u8 };
-            const pairs = [_]Pair{
-                .{ .name = ":method", .value = "CONNECT" },
-                .{ .name = ":protocol", .value = "websocket" },
-                .{ .name = ":scheme", .value = "http" },
-                .{ .name = ":authority", .value = t.authority },
-                .{ .name = ":path", .value = "/" }, // overwritten below
-            };
             // :path comes from the Upgrade head (still on the entity).
             const rh_src = self.reg.get(t.upgrade_ent, &self.server.ws_upgrade_out, h2.ReqHeaders) catch null;
             const path: []const u8 = if (rh_src) |rh| (headerValue(rh.*, ":path") orelse "/") else "/";
 
-            var strbytes: usize = 0;
-            for (pairs[0..4]) |p| strbytes += p.name.len + p.value.len;
-            strbytes += ":path".len + path.len;
-
-            const n = pairs.len;
-            const fields_size = n * @sizeOf(h2.HeaderField);
-            const buf = try self.allocator.alloc(u8, fields_size + strbytes);
-            errdefer self.allocator.free(buf);
-            const fields: [*]h2.HeaderField = @ptrCast(@alignCast(buf.ptr));
-            const strbase = buf.ptr + fields_size;
-            var soff: usize = 0;
-            var fi: usize = 0;
-            const put = struct {
-                fn go(f: [*]h2.HeaderField, sb: [*]u8, off: *usize, idx: *usize, name: []const u8, value: []const u8) void {
-                    @memcpy(sb[off.* .. off.* + name.len], name);
-                    const noff = off.*;
-                    off.* += name.len;
-                    @memcpy(sb[off.* .. off.* + value.len], value);
-                    const voff = off.*;
-                    off.* += value.len;
-                    f[idx.*] = .{
-                        .name = sb + noff,
-                        .name_len = @intCast(name.len),
-                        .value = sb + voff,
-                        .value_len = @intCast(value.len),
-                    };
-                    idx.* += 1;
-                }
-            }.go;
-            for (pairs[0..4]) |p| put(fields, strbase, &soff, &fi, p.name, p.value);
-            put(fields, strbase, &soff, &fi, ":path", path);
-            return .{ .fields = fields, .count = @intCast(n), ._buf = buf.ptr, ._buf_len = @intCast(buf.len) };
+            var pairs: [8]NameValue = undefined;
+            var n: usize = 0;
+            pairs[n] = .{ .name = ":method", .value = "CONNECT" };
+            n += 1;
+            pairs[n] = .{ .name = ":protocol", .value = "websocket" };
+            n += 1;
+            pairs[n] = .{ .name = ":scheme", .value = "http" };
+            n += 1;
+            pairs[n] = .{ .name = ":authority", .value = t.authority };
+            n += 1;
+            pairs[n] = .{ .name = ":path", .value = path };
+            n += 1;
+            if (t.peer_ip_len > 0) {
+                pairs[n] = .{ .name = "x-forwarded-for", .value = t.peer_ip[0..t.peer_ip_len] };
+                n += 1;
+            }
+            pairs[n] = .{ .name = "x-forwarded-proto", .value = t.fwd_proto };
+            n += 1;
+            pairs[n] = .{ .name = "via", .value = "1.1 rewind-front" }; // WS upgrades are h1 at the edge
+            n += 1;
+            const p = try packFields(self.allocator, pairs[0..n]);
+            return .{ .fields = p.fields, .count = p.count, ._buf = p.buf, ._buf_len = p.buf_len };
         }
 
         /// Current tunnel attempt failed before the 200: next node or
@@ -1244,6 +1282,11 @@ pub fn Proxy(comptime FrontH2: type) type {
                 .down_home = home,
                 .idempotent = isIdempotentMethod(headerValue(rh, ":method") orelse "GET"),
             };
+            if (self.server.connPeerAddr(sess.entity)) |peer|
+                flow.peer_ip_len = peerIpString(&flow.peer_ip, peer);
+            const scheme = headerValue(rh, ":scheme") orelse "http";
+            flow.fwd_proto = if (std.mem.eql(u8, scheme, "https")) "https" else "http";
+            flow.via_entry = if (self.server.connIsHttp1(sess.entity)) "1.1 rewind-front" else "2 rewind-front";
             flow.host = self.allocator.dupe(u8, host) catch |e| {
                 self.allocator.free(flow.authority);
                 return e;
@@ -1384,7 +1427,7 @@ pub fn Proxy(comptime FrontH2: type) type {
                 self.teardownFlow(flow);
                 return;
             };
-            const packed_hdrs = self.packUpstreamHeaders(rh.*, flow.authority) catch {
+            const packed_hdrs = self.packUpstreamHeaders(rh.*, flow) catch {
                 self.attemptFailed(flow, false, false);
                 return;
             };
@@ -2237,8 +2280,10 @@ pub fn Proxy(comptime FrontH2: type) type {
         }
 
         /// Build the upstream request head: pseudo-headers first
-        /// (nghttp2 requires it), then the filtered originals.
-        fn packUpstreamHeaders(self: *Self, rh: h2.ReqHeaders, authority: []const u8) !h2.ReqHeaders {
+        /// (nghttp2 requires it), then the filtered originals, then the
+        /// forwarding identity stamped at the trust boundary (plan B7)
+        /// and the `Via` entry (§5.7.1).
+        fn packUpstreamHeaders(self: *Self, rh: h2.ReqHeaders, flow: *const Flow) !h2.ReqHeaders {
             const a = self.allocator;
             var list: std.ArrayListUnmanaged(NameValue) = .empty;
             defer list.deinit(a);
@@ -2248,7 +2293,11 @@ pub fn Proxy(comptime FrontH2: type) type {
             try list.append(a, .{ .name = ":method", .value = method });
             try list.append(a, .{ .name = ":scheme", .value = "http" });
             try list.append(a, .{ .name = ":path", .value = path });
-            try list.append(a, .{ .name = ":authority", .value = authority });
+            try list.append(a, .{ .name = ":authority", .value = flow.authority });
+
+            // Headers nominated by the client's `Connection` value are
+            // hop-by-hop too (plan B8).
+            const connection_value = headerValue(rh, "connection");
 
             if (rh.fields) |fields| {
                 var i: u32 = 0;
@@ -2257,9 +2306,14 @@ pub fn Proxy(comptime FrontH2: type) type {
                     const fname = f.name[0..f.name_len];
                     if (fname.len > 0 and fname[0] == ':') continue;
                     if (dropFromRequest(fname)) continue;
+                    if (nominatedByConnection(connection_value, fname)) continue;
                     try list.append(a, .{ .name = fname, .value = f.value[0..f.value_len] });
                 }
             }
+            if (flow.peer_ip_len > 0)
+                try list.append(a, .{ .name = "x-forwarded-for", .value = flow.peer_ip[0..flow.peer_ip_len] });
+            try list.append(a, .{ .name = "x-forwarded-proto", .value = flow.fwd_proto });
+            try list.append(a, .{ .name = "via", .value = flow.via_entry });
             const p = try packFields(a, list.items);
             return .{ .fields = p.fields, .count = p.count, ._buf = p.buf, ._buf_len = p.buf_len };
         }
@@ -2608,6 +2662,28 @@ fn resolveOrigin(origin: []const u8) !std.net.Address {
 // ── Tests ──────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "nominatedByConnection: Connection-listed headers are hop-by-hop (RFC 7230 §6.1)" {
+    // A client smuggling `Connection: x-secret-hint` must not get
+    // x-secret-hint forwarded upstream.
+    try testing.expect(nominatedByConnection("x-secret-hint", "x-secret-hint"));
+    try testing.expect(nominatedByConnection("keep-alive, X-Secret-Hint", "x-secret-hint"));
+    try testing.expect(nominatedByConnection("a,\tb , c", "b"));
+    try testing.expect(!nominatedByConnection("keep-alive", "x-secret-hint"));
+    try testing.expect(!nominatedByConnection(null, "anything"));
+    // Substring is not membership.
+    try testing.expect(!nominatedByConnection("x-secret-hint-2", "x-secret-hint"));
+}
+
+test "peerIpString: bare IP, no port, no IPv6 brackets" {
+    var buf: [46]u8 = undefined;
+
+    const v4 = try std.net.Address.parseIp("192.168.1.7", 12345);
+    try testing.expectEqualStrings("192.168.1.7", buf[0..peerIpString(&buf, v4)]);
+
+    const v6 = try std.net.Address.parseIp("2001:db8::1", 443);
+    try testing.expectEqualStrings("2001:db8::1", buf[0..peerIpString(&buf, v6)]);
+}
 
 test "isIdempotentMethod: only read-shaped methods replay after ambiguous failure" {
     // Safe to re-send after an upstream died post-head, pre-response.

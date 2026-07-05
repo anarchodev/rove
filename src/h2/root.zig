@@ -1481,6 +1481,25 @@ pub fn H2(comptime opts: Options) type {
             return c.nghttp2_session_get_remote_settings(ng, c.NGHTTP2_SETTINGS_ENABLE_CONNECT_PROTOCOL) == 1;
         }
 
+        /// Peer (remote) socket address of a connection entity, via
+        /// getpeername on its fd. Null when the entity or fd is gone.
+        /// Used by the front door to stamp `x-forwarded-for` at the
+        /// trust boundary (front-door hardening plan B7).
+        pub fn connPeerAddr(h2: *Self, conn_entity: Entity) ?std.net.Address {
+            if (h2.reg.isStale(conn_entity)) return null;
+            const pa = h2.reg.getAny(conn_entity, h2.connColls(), rio.PeerAddr) catch return null;
+            if (!pa.valid) return null;
+            return pa.addr;
+        }
+
+        /// True when the connection is driven by the HTTP/1.1 codec
+        /// (vs an nghttp2 session). Feeds the front door's `Via`
+        /// received-protocol version.
+        pub fn connIsHttp1(h2: *Self, conn_entity: Entity) bool {
+            const conn_ptr = getConn(h2, conn_entity) orelse return false;
+            return conn_ptr.h1 != null;
+        }
+
         pub const WsConnectDecision = enum { ok, gone };
 
         /// Accept a pending Extended-CONNECT tunnel: reply `:status
@@ -1678,6 +1697,14 @@ pub fn H2(comptime opts: Options) type {
         fn resolveFdThunk(ctx: *anyopaque, entity: Entity) ?*rio.Fd {
             const h2: *Self = @ptrCast(@alignCast(ctx));
             return h2.reg.getAny(entity, h2.connColls(), rio.Fd) catch null;
+        }
+
+        /// PeerAddr mirror of `resolveFdThunk` — the accept-time
+        /// fixed-fd-install CQE may land after the conn was promoted
+        /// out of `io.connections`.
+        fn resolvePeerThunk(ctx: *anyopaque, entity: Entity) ?*rio.PeerAddr {
+            const h2: *Self = @ptrCast(@alignCast(ctx));
+            return h2.reg.getAny(entity, h2.connColls(), rio.PeerAddr) catch null;
         }
 
         /// Extra-conns callback for io's admission control. Returns the
@@ -2685,6 +2712,7 @@ pub fn H2(comptime opts: Options) type {
             // Register FD resolver with io so that processWriteIn/processReadIn
             // can find connection Fds when h2 has moved them to _conn_active etc.
             self.io.setFdResolver(@ptrCast(self), &resolveFdThunk);
+            self.io.setPeerResolver(@ptrCast(self), &resolvePeerThunk);
             // Admission control: io counts conns in `io.connections` +
             // whatever this callback returns. h2 holds promoted conns
             // in `_conn_tls_handshake` + `_conn_active`.
@@ -4093,6 +4121,24 @@ pub fn H2(comptime opts: Options) type {
             return false;
         }
 
+        /// RFC 7230 §6.1: any header NAMED in the request's `Connection`
+        /// value is hop-by-hop too and must not survive the h1→h2
+        /// synthesis (forwarding one is the request-smuggling /
+        /// cache-poisoning vector — front-door hardening plan B8). This
+        /// runs HERE (not in the proxy) because `http1IsHopByHop`
+        /// removes `connection` itself from the synthesized head, so
+        /// downstream consumers can never see the nomination list.
+        fn http1NominatedByConnection(head: http1.Head, name: []const u8) bool {
+            for (head.headers) |hh| {
+                if (!std.ascii.eqlIgnoreCase(hh.name, "connection")) continue;
+                var it = std.mem.tokenizeAny(u8, hh.value, ", \t");
+                while (it.next()) |tok| {
+                    if (std.ascii.eqlIgnoreCase(tok, name)) return true;
+                }
+            }
+            return false;
+        }
+
         /// Pack a parsed h1 head into an `h2.ReqHeaders` — four synthesized
         /// pseudo-headers followed by the request's end-to-end headers
         /// (names lowercased to match h2/handler lookups). One combined buffer
@@ -4111,6 +4157,7 @@ pub fn H2(comptime opts: Options) type {
             for (pseudo) |p| strbytes += p.name.len + p.value.len;
             for (head.headers) |hh| {
                 if (http1IsHopByHop(hh.name)) continue;
+                if (http1NominatedByConnection(head, hh.name)) continue;
                 n += 1;
                 strbytes += hh.name.len + hh.value.len;
             }
@@ -4147,6 +4194,7 @@ pub fn H2(comptime opts: Options) type {
             for (pseudo) |p| writeField(fields, strbase, &soff, &fi, p.name, p.value, false);
             for (head.headers) |hh| {
                 if (http1IsHopByHop(hh.name)) continue;
+                if (http1NominatedByConnection(head, hh.name)) continue;
                 writeField(fields, strbase, &soff, &fi, hh.name, hh.value, true);
             }
 
