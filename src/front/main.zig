@@ -509,7 +509,9 @@ pub fn main() !void {
     // completion outlives them; its own deinit frees undrained items.
     const resolver = try route_resolver_mod.RouteResolver.init(allocator, cp_urls);
     defer resolver.deinit();
-    try resolver.start();
+    // Resolver worker pool (plan A6b): parallel CP queries so one slow
+    // resolve doesn't serialize every other cold host behind it.
+    try resolver.start(@intCast(@max(1, envMs("REWIND_FRONT_RESOLVER_THREADS", route_resolver_mod.RouteResolver.DEFAULT_THREADS))));
     defer resolver.shutdown();
 
     var reg = try rove.Registry.init(allocator, .{

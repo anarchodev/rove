@@ -57,19 +57,28 @@ pub const RouteResolver = struct {
 
     /// Owned host copies waiting to be resolved (loop → resolver).
     /// FIFO via `req_head` cursor: entries before it were already
-    /// handed to the resolver thread; the tail is compacted away when
+    /// handed to a resolver thread; the tail is compacted away when
     /// the queue drains empty.
     req_queue: std.ArrayListUnmanaged([]u8),
     req_head: usize,
     req_mu: std.Thread.Mutex,
+    /// Wakes resolver threads when work arrives / on shutdown.
+    req_cond: std.Thread.Condition,
 
     /// Finished resolutions (resolver → loop).
     done_queue: std.ArrayListUnmanaged(Completion),
     done_mu: std.Thread.Mutex,
 
-    wake: std.Thread.ResetEvent,
     stop: std.atomic.Value(bool),
-    thread: ?std.Thread,
+    /// Resolver worker pool (plan A6b). One thread serialized every
+    /// cold resolve behind the slowest CP query (up to 2 s each) —
+    /// under a burst of distinct cold hosts the tail starved into its
+    /// park deadline. Each thread owns its own curl handle; the two
+    /// queues stay the only shared state.
+    threads: [MAX_THREADS]?std.Thread,
+
+    pub const MAX_THREADS = 8;
+    pub const DEFAULT_THREADS = 4;
 
     pub fn init(allocator: std.mem.Allocator, cp_urls: []const []const u8) !*RouteResolver {
         const self = try allocator.create(RouteResolver);
@@ -79,26 +88,33 @@ pub const RouteResolver = struct {
             .req_queue = .empty,
             .req_head = 0,
             .req_mu = .{},
+            .req_cond = .{},
             .done_queue = .empty,
             .done_mu = .{},
-            .wake = .{},
             .stop = std.atomic.Value(bool).init(false),
-            .thread = null,
+            .threads = @splat(null),
         };
         return self;
     }
 
-    pub fn start(self: *RouteResolver) !void {
-        std.debug.assert(self.thread == null);
-        self.thread = try std.Thread.spawn(.{}, threadMain, .{self});
+    pub fn start(self: *RouteResolver, n_threads: usize) !void {
+        std.debug.assert(self.threads[0] == null);
+        const n = @max(1, @min(n_threads, MAX_THREADS));
+        for (self.threads[0..n]) |*slot| {
+            slot.* = try std.Thread.spawn(.{}, threadMain, .{self});
+        }
     }
 
     pub fn shutdown(self: *RouteResolver) void {
         self.stop.store(true, .release);
-        self.wake.set();
-        if (self.thread) |t| {
-            t.join();
-            self.thread = null;
+        self.req_mu.lock();
+        self.req_cond.broadcast();
+        self.req_mu.unlock();
+        for (&self.threads) |*slot| {
+            if (slot.*) |t| {
+                t.join();
+                slot.* = null;
+            }
         }
     }
 
@@ -122,7 +138,7 @@ pub const RouteResolver = struct {
         self.req_mu.lock();
         defer self.req_mu.unlock();
         try self.req_queue.append(self.allocator, copy);
-        self.wake.set();
+        self.req_cond.signal();
     }
 
     /// Loop thread: take all finished completions. Ownership of the
@@ -145,33 +161,34 @@ pub const RouteResolver = struct {
     // ── Resolver thread ───────────────────────────────────────────────
 
     fn threadMain(self: *RouteResolver) void {
-        while (!self.stop.load(.acquire)) {
-            self.wake.wait();
-            self.wake.reset();
-            if (self.stop.load(.acquire)) break;
-            self.drainRequests();
-        }
-        // Final drain so a host queued between the last wake and
-        // `stop = true` still produces a completion (harmless on
-        // shutdown — deinit frees undrained completions).
-        self.drainRequests();
-    }
-
-    fn drainRequests(self: *RouteResolver) void {
-        while (self.popRequest()) |host| {
+        // Queued hosts drain even after `stop` (popRequestBlocking
+        // returns work before it returns null), so a host enqueued
+        // just before shutdown still produces a completion — deinit
+        // frees any the loop never took.
+        while (self.popRequestBlocking()) |host| {
             const outcome = self.query(host);
             // `host` ownership moves into the completion.
             self.pushCompletion(.{ .host = host, .outcome = outcome });
         }
     }
 
-    fn popRequest(self: *RouteResolver) ?[]u8 {
+    /// Worker thread: block until work or shutdown. Null = stopping
+    /// and the queue is empty.
+    fn popRequestBlocking(self: *RouteResolver) ?[]u8 {
         self.req_mu.lock();
         defer self.req_mu.unlock();
-        // FIFO. The old LIFO `pop()` starved the OLDEST parked flows
-        // under backlog — the ones closest to their 503 deadline — so
-        // a burst of cold hosts 503'd from the back of the line even
-        // when the resolver caught up (plan A6).
+        while (true) {
+            if (self.popLocked()) |host| return host;
+            if (self.stop.load(.acquire)) return null;
+            self.req_cond.wait(&self.req_mu);
+        }
+    }
+
+    /// Non-blocking pop; caller holds `req_mu` (tests call via
+    /// `popRequest`). FIFO — the old LIFO `pop()` starved the OLDEST
+    /// parked flows under backlog, the ones closest to their 503
+    /// deadline (plan A6).
+    fn popLocked(self: *RouteResolver) ?[]u8 {
         if (self.req_head >= self.req_queue.items.len) {
             self.req_queue.clearRetainingCapacity();
             self.req_head = 0;
@@ -180,6 +197,12 @@ pub const RouteResolver = struct {
         const host = self.req_queue.items[self.req_head];
         self.req_head += 1;
         return host;
+    }
+
+    fn popRequest(self: *RouteResolver) ?[]u8 {
+        self.req_mu.lock();
+        defer self.req_mu.unlock();
+        return self.popLocked();
     }
 
     fn pushCompletion(self: *RouteResolver, c: Completion) void {
