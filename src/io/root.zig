@@ -205,8 +205,11 @@ pub const ConnectionBaseRow = Row(&.{ Fd, ReadCycleEntity, PeerAddr });
 pub const ReadBaseRow = Row(&.{ ConnEntity, ReadResult });
 pub const WriteInBaseRow = Row(&.{ ConnEntity, WriteBuf });
 pub const WriteResultBaseRow = Row(&.{ ConnEntity, WriteBuf, IoResult });
-const ConnectInBaseRow = Row(&.{ ConnectAddr, Fd, IoResult, ReadCycleEntity });
-const ConnectErrorBaseRow = Row(&.{ ConnectAddr, Fd, IoResult });
+// PeerAddr rides along so the connection row stays a subset of the
+// connect rows (the `_connect_pending → connections` strip requires
+// it); client-direction conns just keep it invalid.
+const ConnectInBaseRow = Row(&.{ ConnectAddr, Fd, IoResult, ReadCycleEntity, PeerAddr });
+const ConnectErrorBaseRow = Row(&.{ ConnectAddr, Fd, IoResult, PeerAddr });
 
 // =============================================================================
 // CQE user_data encoding
