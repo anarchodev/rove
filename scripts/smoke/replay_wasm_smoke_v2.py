@@ -92,7 +92,12 @@ export function handler() {
 
 # Stamped on every driven request; the handler reads x-replay-probe (a
 # recorded header_value) and request.ip (derived from x-forwarded-for,
-# masked to /24 → 203.0.113.0).
+# masked to /24). Since the front's forwarding-header hygiene (plan
+# B7, commit 03e0a54) a client-sent x-forwarded-for is STRIPPED at the
+# trust boundary and the front stamps the true peer address — so the
+# worker sees XFF=127.0.0.1 and request.ip masks it to 127.0.0.0. The
+# spoofed header below proves the strip; the masking derivation is
+# exercised on the stamped value.
 PROBE_HEADERS = {"x-replay-probe": "p1", "x-forwarded-for": "203.0.113.7"}
 
 
@@ -136,10 +141,11 @@ def main() -> int:
                 else:
                     check("drove 3 more requests → 200", True)
                 # Read-taped IP surface: request.ip is the MASKED client
-                # IP (IPv4 last octet zeroed) derived from the edge's
-                # x-forwarded-for; the probe header round-trips.
-                check("request.ip returned the masked XFF (203.0.113.0)",
-                      "ip=203.0.113.0" in last_body, f"body={last_body!r}")
+                # IP (IPv4 last octet zeroed) derived from the front-
+                # STAMPED x-forwarded-for (the spoofed one is stripped
+                # at the trust boundary — plan B7).
+                check("request.ip masked the front-stamped peer (spoofed XFF stripped)",
+                      "ip=127.0.0.0" in last_body, f"body={last_body!r}")
                 check("request.headers probe value visible to the handler",
                       "probe=p1" in last_body, f"body={last_body!r}")
 
