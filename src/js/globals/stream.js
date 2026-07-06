@@ -28,11 +28,12 @@
    * @namespace stream
    * @example
    * // SSE: open, emit rows, then wait for more under a prefix.
+   * const rows = kv.prefix(`feed/${id}/`, request.ctx?.cursor);
    * response.headers = { 'content-type': 'text/event-stream' };
    * stream.start();
-   * for (const r of rows) stream.write(`data: ${r}\n\n`);
+   * for (const r of rows) stream.write(`data: ${r.value}\n\n`);
    * after.kv(`feed/${id}/`, { on: 'onNotify' });
-   * return next({ since: rows.at(-1)?.seq });
+   * return next({ cursor: rows.at(-1)?.key ?? request.ctx?.cursor });
    */
   globalThis.stream = {
     /**

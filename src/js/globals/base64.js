@@ -184,7 +184,8 @@ globalThis.base64url = {
    * @param {string} s - base64url (or standard) text.
    * @returns {Uint8Array} Decoded bytes. Invalid input throws.
    * @example
-   * const sig = base64url.decode(jwt.split(".")[2]);
+   * const token = "aGVhZA.cGF5bG9hZA.c2ln";
+   * const sig = base64url.decode(token.split(".")[2]);
    */
   decode(s) {
     if (typeof s !== "string") s = String(s);

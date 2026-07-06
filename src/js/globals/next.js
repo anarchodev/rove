@@ -23,7 +23,7 @@
    * @returns {object} The opaque park descriptor — return it.
    * @example
    * stream.write(`data: ${row.value}\n\n`);
-   * on.kv(`feed/${id}/`);
+   * after.kv(`feed/${id}/`);
    * return next({ since: row.seq });
    */
   globalThis.next = function (ctx) {

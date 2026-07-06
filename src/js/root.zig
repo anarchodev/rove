@@ -134,4 +134,5 @@ test {
     _ = @import("worker_inbound_chunk.zig");
     _ = @import("static_cache.zig");
     _ = @import("deploy_thread.zig");
+    _ = @import("doc_examples.zig");
 }

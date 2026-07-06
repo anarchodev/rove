@@ -205,7 +205,7 @@ pub fn jsOnFetch(
 ) callconv(.c) c.JSValue {
     const state = globals.getState(ctx);
     if (argc < 1 or !c.JS_IsString(argv[0])) {
-        _ = c.JS_ThrowTypeError(ctx, "on.fetch(url, opts?, {to?}) requires a url string");
+        _ = c.JS_ThrowTypeError(ctx, "after.fetch(url, opts?, {on?}) requires a url string");
         return js_exception;
     }
     // `opts` (arg1) is optional; the field readers need a real object

@@ -2238,7 +2238,7 @@ const BROWSER_JS = @embedFile("browser_js");
 /// `_system.*` namespace has an entry) and lint(b) enforces every
 /// export in `.src` carries a JSDoc block. Adding a `globals/*.js`
 /// shim means adding it here too (and to build.zig + installStatic).
-const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
+pub const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "kv", .src = KV_JS },
     .{ .name = "console", .src = CONSOLE_JS },
     .{ .name = "crypto", .src = CRYPTO_JS },

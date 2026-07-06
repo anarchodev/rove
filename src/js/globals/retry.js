@@ -74,13 +74,13 @@ function backoffMsFor(retry_state, next_attempt) {
  * // Fire with a policy.
  * retry.send({
  *   url: "https://stripe.com/charge",
- *   on_result_module: "charges/handler",
+ *   on: "charges/handler",
  *   max_attempts: 3,
  *   backoff_ms: [1000, 5000, 30000], // or a number, or omit
- *   context: { charge_id: 42 },
+ *   ctx: { charge_id: 42 },
  * });
  *
- * // charges/handler.mjs — the on_result handler. The result arrives
+ * // charges/handler.mjs — the {on} handler. The result arrives
  * // on the unified flattened surface (handler-shape §7).
  * export default function () {
  *   const event = {

@@ -69,7 +69,7 @@ globalThis.users = {
    * @throws {TypeError} Missing/invalid email.
    * @throws {Error} `email_exists` — an account already owns it.
    * @example
-   * const u = users.create({ email, email_verified: true });
+   * const u = users.create({ email: "ada@example.com", email_verified: true });
    */
   create(input) {
     input = input || {};

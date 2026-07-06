@@ -495,6 +495,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "webhook_js", .path = "src/js/globals/webhook.js" },
         .{ .name = "email_js", .path = "src/js/globals/email.js" },
         .{ .name = "textcodec_js", .path = "src/js/globals/textcodec.js" },
+        .{ .name = "handler_shape_md", .path = "docs/handler-shape.md" },
         .{ .name = "request_js", .path = "src/js/globals/request.js" },
         .{ .name = "users_js", .path = "src/js/globals/users.js" },
         .{ .name = "activitypub_js", .path = "src/js/globals/activitypub.js" },

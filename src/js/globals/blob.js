@@ -128,7 +128,8 @@ globalThis.blob = {
    *
    * @example
    * export default function () {
-   *   blob.get(JSON.parse(kv.get(`media/${id}`)).hash, { on: "onBlob" });
+   *   const rec = JSON.parse(kv.get(`media/${id}`) ?? "{}");
+   *   if (rec.hash) { blob.get(rec.hash, { on: "onBlob" }); return next(); }
    *   return next();
    * }
    * export function onBlob() { return request.bytes; } // flattened payload accessors; request.status top-level
@@ -230,10 +231,11 @@ globalThis.blob = {
    * @returns {string} The object's sha256 hash (64 hex chars).
    *
    * @example
-   * const hash = blob.seal({ on: "onStored", content_type: "image/png" });
-   * return next({ hash });
+   * export function onHeaders() {
+   *   blob.receive({ on: "onStored" });
+   *   return next();
+   * }
    *
-   * // ...
    * export function onStored() {
    *   if (request.status !== 200) { response.status = 502; return "store failed"; }
    *   kv.set(`media/${mxc()}`, JSON.stringify({ hash: request.ctx.hash }));

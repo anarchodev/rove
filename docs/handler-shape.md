@@ -200,8 +200,9 @@ same spelling every effect takes. Without `on`, an `after.kv`/
 `onFetchResult`/`onFetchChunk`/`onFetchDone` by event shape (§3).
 
 ```js
-for (const room of request.ctx.rooms) after.kv(`rooms/${room}/`);  // dynamic sets are natural
-return next({ rooms: request.ctx.rooms });
+const rooms = request.ctx?.rooms ?? [];
+for (const room of rooms) after.kv(`rooms/${room}/`);  // dynamic sets are natural
+return next({ rooms });
 ```
 
 The runtime arms `after.*` wakes **before** firing any connectionless
@@ -859,6 +860,12 @@ change (Hyrum's law). See `format-versioning-audit.md` §7.1/§7.3/§7.6.
   (`format-versioning-audit.md` §7.5).
 
 ## 10. What's gone (vs prior streaming revisions)
+
+> This list has teeth: `src/js/doc_examples.zig` fails `zig build test`
+> if any retired spelling below appears in a ```js example in this
+> document or in a `globals/*.js` `@example` — and it compiles +
+> executes the examples besides. Add a retirement here → add its
+> spelling to that lint's list.
 
 Ergonomics arc (2026-07-04/05; the old spellings lived for one deploy
 cycle — the dual-name window, closed 2026-07-06):

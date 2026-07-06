@@ -306,6 +306,24 @@ smokes that touch the changed surface).
    from the tape) — required before the `request.body` retirement and
    before shims that run under replay lean on the accessors.
 
+## 4.05 Follow-up shipped: the executable-examples lint (2026-07-06)
+
+The keep-docs-honest mechanism this arc's audit motivated:
+`src/js/doc_examples.zig` extracts every ```js fence in
+`handler-shape.md` and every `@example` in the `globals/*.js` JSDoc,
+then gates `zig build test` on (A) each example compiling, (B) no
+retired spelling from §10's list appearing, and (C) the drivable ones
+EXECUTING against the real baked globals (free variables stand in as
+chameleon stubs; SCREAMING_CASE placeholders as strings). Config-first
+library shims (oauth/oidc/sessions/activitypub/platform/crypto/jwt)
+are exec-exempt as a class — their fail-loud "config not found" IS
+the documented behavior — but still compile + spell-check. Its first
+run caught six stale examples the manual sweeps missed (cron's
+`http.send`, retry's `on_result_module`, next's `on.kv`, plus three
+non-self-contained ones). Remaining doc-honesty work (JSDoc→reference
+generation for the docs site; rendering the contract md into the
+site) is tracked in the recommendation of 2026-07-06, not this plan.
+
 ## 4.1 Retired alongside this arc
 
 - **`kind=boot` subscriptions + `onBoot`** (2026-07-05): audited unused

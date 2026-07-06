@@ -38,8 +38,10 @@ globalThis.email = {
    * @throws {TypeError} On missing/invalid `key`/`from`/`subject`/`to`.
    *
    * @example
+   * const key = kv.get("secret/resend") ?? "re_dev_placeholder";
+   * const user = { email: "ada@example.com", name: "Ada" };
    * email.send({
-   *   key: kv.get("secret/resend"),
+   *   key,
    *   from: "noreply@acme.dev",
    *   to: user.email,
    *   subject: "Welcome",

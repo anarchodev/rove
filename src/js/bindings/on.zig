@@ -58,20 +58,20 @@ pub fn jsOnTimer(
 ) callconv(.c) c.JSValue {
     const state = globals.getState(ctx);
     if (argc < 1) {
-        _ = c.JS_ThrowTypeError(ctx, "on.timer(ms) requires a millisecond interval");
+        _ = c.JS_ThrowTypeError(ctx, "after.ms(ms) requires a millisecond interval");
         return js_exception;
     }
     var ms: i64 = 0;
     if (c.JS_ToInt64(ctx, &ms, argv[0]) < 0) return js_exception;
     if (ms <= 0) {
-        _ = c.JS_ThrowTypeError(ctx, "on.timer(ms): ms must be > 0");
+        _ = c.JS_ThrowTypeError(ctx, "after.ms(ms): ms must be > 0");
         return js_exception;
     }
     const list = state.pending_wakes orelse return js_undefined; // connectionless ⇒ inert
     const to: ?[]u8 = if (argc >= 2) readTo(state, ctx, argv[1]) else null;
     list.append(state.allocator, .{ .kind = .timer, .interval_ms = ms, .to = to }) catch {
         if (to) |t| state.allocator.free(t);
-        _ = c.JS_ThrowInternalError(ctx, "on.timer: out of memory");
+        _ = c.JS_ThrowInternalError(ctx, "after.ms: out of memory");
         return js_exception;
     };
     return js_undefined;
@@ -98,14 +98,14 @@ pub fn jsOnKv(
 
     const list = state.pending_wakes orelse return js_undefined; // connectionless ⇒ inert
     const prefix = state.allocator.dupe(u8, s[0..len]) catch {
-        _ = c.JS_ThrowInternalError(ctx, "on.kv: out of memory");
+        _ = c.JS_ThrowInternalError(ctx, "after.kv: out of memory");
         return js_exception;
     };
     const to: ?[]u8 = if (argc >= 2) readTo(state, ctx, argv[1]) else null;
     list.append(state.allocator, .{ .kind = .kv, .prefix = prefix, .to = to }) catch {
         state.allocator.free(prefix);
         if (to) |t| state.allocator.free(t);
-        _ = c.JS_ThrowInternalError(ctx, "on.kv: out of memory");
+        _ = c.JS_ThrowInternalError(ctx, "after.kv: out of memory");
         return js_exception;
     };
     return js_undefined;
