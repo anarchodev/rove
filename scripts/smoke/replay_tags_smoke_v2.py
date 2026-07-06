@@ -56,7 +56,7 @@ export function onFetchResult() {
             (request.text || "");
     }
     response.status = 502;
-    return "fail:" + (request.error || request.reason || request.status || "?");
+    return "fail:" + (request.status || "?");
 }
 """
 
@@ -68,7 +68,7 @@ REPLAY_OTHER_SRC = r"""export default function () {
 export function onFetchResult() {
     if (request.ok) { response.status = 200; return "ok:" + request.status; }
     response.status = 502;
-    return "fail:" + (request.error || request.reason || request.status || "?");
+    return "fail:" + (request.status || "?");
 }
 """
 

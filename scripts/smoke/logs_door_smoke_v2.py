@@ -45,7 +45,7 @@ export function onFetchResult() {
             (request.text || "");
     }
     response.status = 502;
-    return "fail:" + (request.error || request.reason || request.status || "?");
+    return "fail:" + (request.status || "?");
 }
 """
 

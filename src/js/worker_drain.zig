@@ -2465,7 +2465,7 @@ pub fn sweepParkedContinuations(worker: anytype) !void {
     }
 
     for (expired.items) |e| {
-        resumeContinuation(worker, e.ent, e.sid, e.sess, "{\"ok\":false,\"reason\":\"deadline\"}", false, false) catch |err| {
+        resumeContinuation(worker, e.ent, e.sid, e.sess, "{\"ok\":false,\"error\":\"deadline\"}", false, false) catch |err| {
             std.log.warn(
                 "rove-js continuation: deadline resume failed ({s}); hard 504",
                 .{@errorName(err)},

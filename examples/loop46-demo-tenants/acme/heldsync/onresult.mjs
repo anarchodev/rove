@@ -3,8 +3,9 @@
 // Invoked by the resume engine when the bound webhook.send completes
 // (or the §6.4 deadline fires), on the Endpoint-A flattened surface
 // (handler-shape §7): the threaded ctx on `request.ctx`, the outcome
-// on `request.ok`/`.status`/`.text` (+ `request.activation.error` /
-// `.reason` metadata).
+// on `request.ok`/`.status`/`.text` (+ `request.activation.error` —
+// ONE failure-cause field: the webhook classifier's
+// transport_failed/upstream_5xx, or the platform's "deadline").
 //
 // Returning a value is TERMINAL — flushed to the still-open client
 // socket, completing the one synchronous request. Returning another
@@ -28,7 +29,7 @@ export function onResult() {
             });
         }
         response.status = 502;
-        return "heldsync upstream failed: " + (request.activation.error || request.activation.reason || request.status);
+        return "heldsync upstream failed: " + request.activation.error;
     }
     return "heldsync:" + ctx.tag + ":" + request.text;
 }
