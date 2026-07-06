@@ -43,7 +43,7 @@ function pad(seq) {
   return PAD.slice(d.length) + d;
 }
 
-function assertStream(log, verb) {
+function assertLog(log, verb) {
   if (typeof log !== "string" || !LOG_RE.test(log))
     throw new TypeError(verb + ": log must match [A-Za-z0-9_-]{1,64}");
 }
@@ -129,7 +129,7 @@ globalThis.segments = {
   },
 
   append(log, value) {
-    assertStream(log, "segments.append");
+    assertLog(log, "segments.append");
     if (typeof value !== "string")
       throw new TypeError("segments.append: value must be a string");
     const seq = Number(kv.get(NEXT(log)) ?? "0");
@@ -166,7 +166,7 @@ globalThis.segments = {
    * }
    */
   get(log, seq, opts) {
-    assertStream(log, "segments.get");
+    assertLog(log, "segments.get");
     opts = opts || {};
     const on_key = typeof opts.on === "string" ? opts.on : undefined;
     if (!Number.isInteger(seq) || seq < 0)
@@ -237,7 +237,7 @@ globalThis.segments = {
    * }
    */
   seal(log, opts) {
-    assertStream(log, "segments.seal");
+    assertLog(log, "segments.seal");
     opts = opts || {};
     const min = opts.min != null ? opts.min : 64;
     const max = opts.max != null ? opts.max : 1024;

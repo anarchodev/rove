@@ -4,8 +4,8 @@
 // only on success, performs the pointer swap in ONE atomic writeset:
 //
 //   - write the segment index row
-//     `_seg/{stream}/s/{first_seq:020}` → {hash, first_seq, last_seq, count}
-//   - delete the sealed hot rows `_seg/{stream}/h/{first..last}`
+//     `_seg/{log}/s/{first_seq:020}` → {hash, first_seq, last_seq, count}
+//   - delete the sealed hot rows `_seg/{log}/h/{first..last}`
 //
 // Ordering is the design's crash-safety: the hot rows are released
 // only after the segment blob — their sole home past tape retention —
@@ -35,21 +35,23 @@ export default function () {
         // retries. Nothing to clean.
         return { status: 200 };
     }
-    const stream = c.stream;
+    const log = c.log;
     const first = c.first_seq;
     const last = c.last_seq;
-    if (typeof stream !== "string" || !Number.isInteger(first) || !Number.isInteger(last)) {
-        return { status: 200 };
+    if (typeof log !== "string" || !Number.isInteger(first) || !Number.isInteger(last)) {
+        // Internal contract violation (shim/module skew) — never a
+        // customer input. Loud beats a silent un-swapped seal.
+        throw new Error("segments_onsealed: malformed seal ctx: " + JSON.stringify(c));
     }
 
-    kv.set("_seg/" + stream + "/s/" + pad(first), JSON.stringify({
+    kv.set("_seg/" + log + "/s/" + pad(first), JSON.stringify({
         hash: request.activation.hash,
         first_seq: first,
         last_seq: last,
         count: c.count,
     }));
     for (let seq = first; seq <= last; seq++) {
-        kv.delete("_seg/" + stream + "/h/" + pad(seq));
+        kv.delete("_seg/" + log + "/h/" + pad(seq));
     }
     return { status: 200 };
 }
