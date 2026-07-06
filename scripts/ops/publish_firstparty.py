@@ -99,6 +99,20 @@ def publish_tenant(t: dict, defaults: dict, ops_bin: str, env_path: str | None,
     if not bundle.is_dir():
         sys.exit(f"tenant {tenant}: source dir {bundle} not found")
 
+    # Optional pre-publish generator (argv list; `$ROVE_REPO` expands to
+    # this script's repo root, cwd = the apps dir). One-source content —
+    # e.g. the docs tenant's JSDoc-generated reference — regenerates on
+    # every publish, so the site can't ship stale.
+    gen = t.get("generate")
+    if gen:
+        rove_root = str(pathlib.Path(__file__).resolve().parents[2])
+        argv = [a.replace("$ROVE_REPO", rove_root) for a in gen]
+        print(f"    $ {' '.join(argv)}   (generate)")
+        if not dry_run:
+            r = subprocess.run(argv, cwd=WEB)
+            if r.returncode != 0:
+                sys.exit(f"tenant {tenant}: generate hook failed (exit {r.returncode})")
+
     hosts = t.get("hosts") or []
     cluster = t.get("cluster") or defaults.get("cluster", "prod")
     release = release_override if release_override is not None \
