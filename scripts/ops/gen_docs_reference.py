@@ -34,9 +34,11 @@ GLOBALS = ROVE / "src" / "js" / "globals"
 # page); a NEW shim must be added to a group or the generator fails
 # loudly below, so the reference can't silently omit surface.
 GROUPS = [
-    ("Effects & state", ["kv", "after", "next", "stream", "webhook", "email",
-                         "scheduler", "schedule", "cron", "retry", "blob",
-                         "segments", "browser"]),
+    ("Model & state", ["kv", "blob", "segments"]),
+    ("Connection & wakes", ["after", "next", "stream"]),
+    ("Durable effects", ["webhook", "email", "retry", "scheduler",
+                         "schedule", "cron"]),
+    ("Browser agent", ["browser"]),
     ("Utilities", ["crypto", "jwt", "base64", "textcodec", "urlsearchparams",
                    "console"]),
     ("Identity & federation", ["users", "sessions", "oauth", "oidc",
@@ -206,14 +208,15 @@ def render(all_groups) -> str:
              "examples are compiled and executed by the engine's test gate. "
              "This page cannot lag the code, because it is the code.",
     )]
-    # Jump index.
-    out.append("<p>")
-    links = []
-    for _heading, sections in all_groups:
-        for sec in sections:
-            links.append(f'<a href="#{anchor(sec["name"])}"><code>{esc(sec["name"])}</code></a>')
-    out.append(" · ".join(links))
-    out.append("</p>")
+    # Jump index — one row per system.
+    out.append("<table>")
+    for heading, sections in all_groups:
+        links = " · ".join(
+            f'<a href="#{anchor(sec["name"])}"><code>{esc(sec["name"])}</code></a>'
+            for sec in sections
+        )
+        out.append(f"<tr><td>{esc(heading)}</td><td>{links}</td></tr>")
+    out.append("</table>")
 
     for heading, sections in all_groups:
         out.append(f"<h2>{esc(heading)}</h2>")
