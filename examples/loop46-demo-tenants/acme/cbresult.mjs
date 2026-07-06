@@ -8,7 +8,7 @@ export default function () {
     const record = {
         ok: request.ok,
         status: request.status,
-        body: request.body,
+        body: request.text,
         context: request.ctx ?? null,
         error: a.error || null,
     };

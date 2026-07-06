@@ -7,7 +7,7 @@
 // Body shape: `{ "count": <int> }` (default 50, > CAP=32 so the
 // overflow signal fires). Response: 204.
 export default function () {
-    const body = JSON.parse(request.body || "{}");
+    const body = JSON.parse(request.text || "{}");
     const count = body.count ?? 50;
     for (let i = 0; i < count; i++) {
         kv.set("overflow/k" + i, "v" + i);

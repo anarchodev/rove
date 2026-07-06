@@ -44,7 +44,7 @@ N_CONCURRENT = 20
 # Handlers verbatim from the V1 demo tenant (heldsync open + onResult resume,
 # wb echo) — same JS the heldsync_smoke_v2 template provisions.
 HELDSYNC_SRC = r"""export default function () {
-    const req = JSON.parse(request.body);
+    const req = request.json;
     const opts = {
         method: "POST",
         body: JSON.stringify({ from: "heldsync", tag: req.tag }),
@@ -66,13 +66,13 @@ ONRESULT_SRC = r"""export function onResult() {
         response.status = 502;
         return "heldsync upstream failed: " + (request.activation.error || request.status);
     }
-    return "heldsync:" + ctx.tag + ":" + request.body;
+    return "heldsync:" + ctx.tag + ":" + request.text;
 }
 """
 
 WB_SRC = r"""export default function () {
     let payload = null;
-    try { payload = JSON.parse(request.body); } catch (_) {}
+    try { payload = request.json; } catch (_) {}
     const tag = (payload && payload.tag) || "<no-tag>";
     response.status = 200;
     return "echoed:" + tag;

@@ -81,7 +81,7 @@ export function handler() {
   const at = Date.now();
   const die = rollDie();
   const probe = request.headers["x-replay-probe"] ?? "none";
-  const blen = request.body.length;
+  const blen = request.text.length;
   const ip = request.ip;
   const prior = parseInt(kv.get("count") ?? "0", 10);
   const next = bumpCount(prior);

@@ -101,7 +101,7 @@ export default function () {
 
 export function onChunk() {
   if (!request.done) {
-    if (request.body && request.body.length) blob.write(request.body);
+    if (request.bytes && request.bytes.length) blob.write(request.bytes);
     return next();
   }
   const hash = blob.seal({ on: "onStored", content_type: "text/plain" });
@@ -175,7 +175,7 @@ export default function () {
     }
   }
   if (path === "/put") {
-    const body = request.body || "";
+    const body = request.text || "";
     const hash = blob.put(body, {
       content_type: "text/plain",
       on: "putresult",

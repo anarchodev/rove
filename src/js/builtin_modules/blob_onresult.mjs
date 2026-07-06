@@ -23,7 +23,7 @@ export default function () {
     }
     if (a.kind === "fetch_chunk" && !a.final) return { status: 200 };
 
-    const ctx = JSON.parse(request.body).ctx;
+    const ctx = request.ctx || {};
     const hash = ctx.hash;
     const on_result = ctx.on_result || null;
     const context = ctx.context !== undefined ? ctx.context : null;

@@ -4,7 +4,7 @@
 // the docs at https://loop46.me/docs for the full story.
 //
 // The current request is available on the `request` global
-// (request.method, request.path, request.body, request.query).
+// (request.method, request.path, request.text, request.query).
 // Return a string (or an object — we'll JSON.stringify it).
 export default function () {
   const count = parseInt(kv.get("starter_hits") ?? "0", 10) + 1;

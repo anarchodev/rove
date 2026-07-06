@@ -69,7 +69,7 @@ CBRESULT_SRC = r'''export default function () {
     const record = {
         ok: request.ok,
         status: request.status,
-        body: request.body,
+        body: request.text,
         context: request.ctx ?? null,
         error: a.error || null,
     };
@@ -82,7 +82,7 @@ ACME_INDEX_SRC = 'export function handler() { return "acme-ready"; }\n'
 WB_SRC = r"""export default function () {
     const id = request.headers["x-rove-schedule-id"] || "<none>";
     const ver = request.headers["x-rove-schedule-version"] || "<none>";
-    const body = request.body || "";
+    const body = request.text || "";
     kv.set("recv/last", JSON.stringify({ path: request.path, id: id, ver: ver, body: body }));
     response.status = 200;
     response.headers["content-type"] = "text/plain";

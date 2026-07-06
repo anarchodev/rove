@@ -55,7 +55,7 @@ WRITE_DELAY_S = 0.5
 # `__rove_next` already spelled `next()` (the V1 handler used `next()` too).
 ONKV_SRC = """\
 export default function () {
-    const req = request.body ? JSON.parse(request.body) : {};
+    const req = request.text ? request.json : {};
     const prefix = req.prefix || "onkv/";
     kv.get(prefix + "flag");
     after.kv(prefix, { on: "onWake" });
@@ -71,7 +71,7 @@ export function onWake() {
 
 WRITEKV_SRC = """\
 export default function () {
-    const body = JSON.parse(request.body || "{}");
+    const body = JSON.parse(request.text || "{}");
     if (!body.key || typeof body.key !== "string") {
         response.status = 400;
         return "missing key";

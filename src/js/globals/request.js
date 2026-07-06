@@ -17,7 +17,10 @@
 // Both go through `this.bytes`, so whatever read-recording the bytes
 // accessor does covers them; both self-replace with own data properties
 // so repeat reads cost nothing. On a payload-less activation they read
-// undefined (bytes is absent) and return undefined.
+// undefined (bytes is absent) and return undefined. (`request.body` is
+// RETIRED — these accessors are the only payload surface; the replay
+// driver alone still synthesizes a `body` so records from
+// pre-retirement deployments replay their pinned code.)
 (function () {
   "use strict";
   var proto = {};

@@ -41,7 +41,7 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 # (examples/loop46-demo-tenants/acme/ontimer/index.mjs).
 ONTIMER_SRC = """\
 export default function () {
-    const req = request.body ? JSON.parse(request.body) : {};
+    const req = request.text ? request.json : {};
     after.ms(req.ms || 150);
     return next({ tag: req.tag || "t" });
 }

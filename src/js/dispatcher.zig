@@ -1135,7 +1135,7 @@ test "dispatch: connectionless on_result presents the flattened result surface (
         \\  "status=" + request.status,
         \\  "ok=" + request.ok,
         \\  "done=" + request.done,
-        \\  "body=" + request.body,
+        \\  "body=" + request.text,
         \\  "ctx.order=" + request.ctx.order,
         \\  "act.attempts=" + request.activation.attempts,
         \\  "act.error=" + request.activation.error,
@@ -1163,7 +1163,7 @@ test "dispatch: connectionless on_result presents the flattened result surface (
 // is NOT `{"ctx":{result,…}}` (e.g. webhook_onresult's own bookkeeping
 // self-hop, `{"ctx":{id,…}}` with no `result` object) is left untouched:
 // `request.status` stays undefined and the raw body survives.
-test "dispatch: send_callback without a result object is left unflattened" {
+test "dispatch: send_callback without a result object lifts the whole envelope ctx" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1175,8 +1175,8 @@ test "dispatch: send_callback without a result object is left unflattened" {
     defer d.deinit();
 
     var resp = try runOne(&d, kv,
-        \\const parsed = JSON.parse(request.body);
-        \\return "status=" + request.status + " id=" + parsed.ctx.id;
+        \\return "status=" + request.status + " id=" + request.ctx.id +
+        \\  " note=" + request.ctx.note + " body=" + typeof request.body;
     , .{
         .method = "POST",
         .path = "/_result",
@@ -1189,7 +1189,7 @@ test "dispatch: send_callback without a result object is left unflattened" {
     defer resp.deinit(testing.allocator);
 
     try testing.expectEqualStrings("", resp.exception);
-    try testing.expectEqualStrings("status=undefined id=send-7", resp.body);
+    try testing.expectEqualStrings("status=undefined id=send-7 note=self-hop body=undefined", resp.body);
 }
 
 test "dispatch: request.session.id surfaces resolved sid" {
@@ -1390,7 +1390,7 @@ test "dispatch: request.bytes/.text/.json on plain inbound (§2.2)" {
         \\if (!(b instanceof Uint8Array)) return "not-bytes";
         \\if (request.text !== '{"a":1}') return "text-mismatch: " + request.text;
         \\if (request.json.a !== 1) return "json-mismatch";
-        \\if (request.body !== request.text) return "body-text-diverge";
+        \\if (typeof request.body !== "undefined") return "body-not-retired";
         \\return "ok:" + b.length;
     ,
         .{ .method = "POST", .path = "/", .body = "{\"a\":1}" },
@@ -1400,7 +1400,7 @@ test "dispatch: request.bytes/.text/.json on plain inbound (§2.2)" {
     try testing.expectEqualStrings("ok:7", resp.body);
 }
 
-test "dispatch: invalid UTF-8 inbound body reads lenient U+FFFD, bytes stay raw (C6)" {
+test "dispatch: invalid UTF-8 inbound text reads lenient U+FFFD, bytes stay raw (C6)" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1412,8 +1412,8 @@ test "dispatch: invalid UTF-8 inbound body reads lenient U+FFFD, bytes stay raw 
     var resp = try runOne(
         &d,
         kv,
-        \\const cp = request.body.charCodeAt(2).toString(16);
-        \\return request.body.length + ":" + cp + ":" + request.bytes[2];
+        \\const cp = request.text.charCodeAt(2).toString(16);
+        \\return request.text.length + ":" + cp + ":" + request.bytes[2];
     ,
         .{ .method = "POST", .path = "/", .body = "hi\xffbye" },
     );
@@ -1423,7 +1423,7 @@ test "dispatch: invalid UTF-8 inbound body reads lenient U+FFFD, bytes stay raw 
     try testing.expectEqualStrings("6:fffd:255", resp.body);
 }
 
-test "dispatch: send_callback body_b64 → byte-true request.bytes + text request.body (§2.2)" {
+test "dispatch: send_callback body_b64 → byte-true request.bytes (§2.2)" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1438,7 +1438,7 @@ test "dispatch: send_callback body_b64 → byte-true request.bytes + text reques
         \\const b = request.bytes;
         \\if (!(b instanceof Uint8Array)) return "not-bytes";
         \\if (b.length !== 3 || b[0] !== 104 || b[1] !== 0 || b[2] !== 255) return "bytes-wrong";
-        \\if (typeof request.body !== "string") return "body-not-string";
+        \\if (typeof request.body !== "undefined") return "body-not-retired";
         \\if (request.text.length !== 3) return "text-wrong";
         \\return "ok:" + request.status + ":" + request.ctx.o;
     , .{
@@ -1465,9 +1465,9 @@ test "dispatch: send_callback legacy body-only envelope still yields bytes (§2.
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
     var resp = try runOne(&d, kv,
-        \\if (request.body !== "PONG") return "body-wrong";
         \\const b = request.bytes;
         \\if (!(b instanceof Uint8Array) || b.length !== 4) return "bytes-wrong";
+        \\if (typeof request.body !== "undefined") return "body-not-retired";
         \\return "ok:" + request.text;
     , .{
         .method = "POST",
@@ -2849,7 +2849,7 @@ test "dispatch: POST with non-envelope JSON body invokes default, body in reques
     defer ctx.deinit();
     const bytecode = try ctx.compileToBytecode(
         \\export default function () {
-        \\    const parsed = JSON.parse(request.body);
+        \\    const parsed = request.json;
         \\    return "got name=" + parsed.name;
         \\}
     ,
@@ -2896,7 +2896,7 @@ test "dispatch: a {fn,args} POST body is opaque payload — default export runs"
         \\export default function () {
         \\    // The retired envelope is just a body now — visible,
         \\    // never interpreted (decisions.md §4.5).
-        \\    return "default saw " + JSON.parse(request.body).fn;
+        \\    return "default saw " + request.json.fn;
         \\}
     ,
         "h.mjs",
@@ -3313,7 +3313,7 @@ test "dispatch: request_reads — body flag set on read (incl. empty body), abse
     // Reads the body (non-empty).
     {
         const bytecode = try ctx.compileToBytecode(
-            \\export default function () { return "len=" + request.body.length; }
+            \\export default function () { return "len=" + request.text.length; }
         ,
             "h.mjs",
             testing.allocator,
@@ -3345,7 +3345,7 @@ test "dispatch: request_reads — body flag set on read (incl. empty body), abse
     // body" vs "never looked" are different replay inputs).
     {
         const bytecode = try ctx.compileToBytecode(
-            \\export default function () { return "len=" + request.body.length; }
+            \\export default function () { return "len=" + request.text.length; }
         ,
             "h.mjs",
             testing.allocator,
@@ -3788,7 +3788,7 @@ test "dispatch: request object fields populated" {
     var resp = try runOne(
         &d,
         kv,
-        \\return request.method + " " + request.path + " " + request.body;
+        \\return request.method + " " + request.path + " " + request.text;
     ,
         .{ .method = "PUT", .path = "/x", .body = "payload" },
     );

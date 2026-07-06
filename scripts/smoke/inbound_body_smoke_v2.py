@@ -32,7 +32,7 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap  # noqa: E402
 
 HASH_SRC = """\
 export default function () {
-    const data = request.body || "";
+    const data = request.text || "";
     return crypto.sha256(data) + ":" + data.length;
 }
 """
@@ -47,7 +47,7 @@ export function onHeaders() {
         response.status = 401;
         return "unauthorized";
     }
-    return "accepted:" + (request.body || "").length;
+    return "accepted:" + (request.text || "").length;
 }
 export default function () {
     return "default-ran";

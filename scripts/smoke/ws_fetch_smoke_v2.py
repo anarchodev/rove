@@ -5,7 +5,7 @@
 
 A deployed handler, on a `fetch:<url>` frame, issues `after.fetch(url)` from a
 read-only frame and parks; when the result lands it resumes `onUpstream`,
-reads the bound-fetch surface (`request.body` + `request.status` +
+reads the bound-fetch surface (`request.text` + `request.status` +
 `request.done`), and `stream.write`s the body back. A threaded stub HTTP
 server stands in for the upstream (reached via REWIND_UNSAFE_OUTBOUND).
 

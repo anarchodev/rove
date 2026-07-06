@@ -81,7 +81,7 @@ export function onWake() {
 """
 
 WRITEKV_SRC = r"""export default function () {
-    const body = JSON.parse(request.body || "{}");
+    const body = JSON.parse(request.text || "{}");
     if (!body.key || typeof body.key !== "string") {
         response.status = 400;
         return "missing key";

@@ -692,9 +692,10 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   thin aliases) so deployed rewind-apps bundles survived the platform
   roll; opened with the 2026-07-06 deploy, **closed the same day**
   after the rewind-apps publish (`kv.set` of the aliases deleted,
-  internal readers migrated). `request.body` retirement additionally
-  waits on replay-driver accessor parity (the arenajs shell
-  synthesizes `request`).
+  internal readers migrated). `request.body` retired 2026-07-06 once
+  the replay driver (native epilogue + WASM shell) gained
+  bytes/text/json parity; the driver alone keeps synthesizing a
+  `body` so pre-retirement records replay their pinned code.
 - **Retired outright alongside**: `kind=boot` subscriptions + `onBoot`
   (2026-07-05, unused — audited zero rewind-apps consumers). Seeding
   recipe: register `cron`/`scheduler.in` from any handler activation —

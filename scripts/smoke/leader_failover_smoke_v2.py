@@ -54,7 +54,7 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap, metric_counter, metric_hist_mean_u
 HANDLER_SRC = """\
 export function handler() {
     if (request.method === "POST") {
-        const body = JSON.parse(request.body || "{}");
+        const body = JSON.parse(request.text || "{}");
         kv.set("failover/value", body.value ?? "");
         response.status = 204;
         return "";

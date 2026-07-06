@@ -60,7 +60,7 @@ export function onWake() {
 
 OVERFLOW_BURST_SRC = """\
 export default function () {
-    const body = JSON.parse(request.body || "{}");
+    const body = JSON.parse(request.text || "{}");
     const count = body.count ?? 50;
     for (let i = 0; i < count; i++) {
         kv.set("overflow/k" + i, "v" + i);

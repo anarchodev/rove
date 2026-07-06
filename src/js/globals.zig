@@ -2429,7 +2429,6 @@ pub fn installRequest(
     _ = c.JS_SetPropertyStr(ctx, req_obj, "method", c.JS_NewStringLen(ctx, request.method.ptr, request.method.len));
     _ = c.JS_SetPropertyStr(ctx, req_obj, "path", c.JS_NewStringLen(ctx, request.path.ptr, request.path.len));
     _ = c.JS_SetPropertyStr(ctx, req_obj, "host", c.JS_NewStringLen(ctx, request.host.ptr, request.host.len));
-    definePropertyGetter(ctx, req_obj, "body", c.JS_NewCFunction2(ctx, @ptrCast(&jsBodyGetter), "body", 0, c.JS_CFUNC_getter_magic, 0));
     // `bytes` — the uniform payload view. On plain inbound (buffered or
     // headers-first) `Request.body` IS the customer payload, so `bytes`
     // is a read-recording lazy accessor exactly like `body`. Every other
@@ -2647,6 +2646,14 @@ pub fn installRequest(
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "ok", if (fc.terminal_ok) js_true else js_false);
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "bodyTruncated", if (fc.body_truncated) js_true else js_false);
         }
+        // UNBOUND (Pattern-A `on_chunk:"module"`) fires carry the
+        // synthesized `{"ctx":…}` envelope in `Request.body`; with
+        // `request.body` retired, lift it so the internal shim modules
+        // (webhook/blob onresult) read `request.ctx` like every other
+        // callback.
+        if (request.activation_entity == null) {
+            liftThreadedCtx(ctx, req_obj, request.body, state.allocator);
+        }
         // `docs/handler-shape.md` §3 + §7: the customer's
         // onFetchChunk handler (BOUND fetch path — bind:true) reads
         // `request.body` (chunk bytes), `request.done` (final),
@@ -2684,21 +2691,10 @@ pub fn installRequest(
                     }
                 } else |_| {}
             }
-            // DEFINE (not set): `body` is a setter-less accessor by
-            // default (the read-taping getter) — a plain [[Set]]
-            // silently fails against it; defining replaces it. Chunk
-            // bytes are arbitrary binary → Uint8Array, and the chunk
-            // payload is the activation's Msg itself, recorded on
-            // the fetch_responses tape — never read-elided.
-            _ = c.JS_DefinePropertyValueStr(
-                ctx,
-                req_obj,
-                "body",
-                c.JS_NewUint8ArrayCopy(ctx, fc.bytes.ptr, fc.bytes.len),
-                c.JS_PROP_C_W_E,
-            );
-            // The uniform payload view (§2.2): `bytes` = the same chunk
-            // payload; `text`/`json` derive on the prototype.
+            // The uniform payload view (§2.2): `bytes` = the chunk
+            // payload (the activation's Msg, recorded on the
+            // fetch_responses tape — never read-elided); `text`/`json`
+            // derive on the prototype. (`request.body` retired.)
             _ = c.JS_DefinePropertyValueStr(
                 ctx,
                 req_obj,
@@ -2794,17 +2790,9 @@ pub fn installRequest(
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "seq", c.JS_NewInt64(ctx, @intCast(ic.seq)));
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "byteOffset", c.JS_NewInt64(ctx, @intCast(ic.byte_offset)));
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "done", if (ic.done) js_true else js_false);
-        // DEFINE (not set) — see the fetch_chunk body comment: the
-        // default `body` accessor has no setter, so a plain [[Set]]
-        // silently no-ops; defining replaces it with the binary view.
-        _ = c.JS_DefinePropertyValueStr(
-            ctx,
-            req_obj,
-            "body",
-            c.JS_NewUint8ArrayCopy(ctx, request.body.ptr, request.body.len),
-            c.JS_PROP_C_W_E,
-        );
         // The uniform payload view (§2.2): `bytes` = this chunk.
+        // (`request.body` retired — the accessors are the payload
+        // surface; handler-api-ergonomics-plan §2.2.)
         _ = c.JS_DefinePropertyValueStr(
             ctx,
             req_obj,
@@ -2892,21 +2880,21 @@ pub fn installRequest(
         if (!c.JS_IsObject(cb_ctx)) break :hoist;
         const result = c.JS_GetPropertyStr(ctx, cb_ctx, "result");
         defer c.JS_FreeValue(ctx, result);
-        if (!c.JS_IsObject(result)) break :hoist; // not a result delivery
-                                                  // (webhook_onresult self-hops)
+        if (!c.JS_IsObject(result)) {
+            // Not a result delivery (a webhook_onresult self-hop /
+            // internal chained dispatch): the envelope's ctx IS the
+            // hop's payload — lift it whole so the target reads
+            // `request.ctx` (request.body is retired).
+            _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", c.JS_DupValue(ctx, cb_ctx));
+            break :hoist;
+        }
 
-        // Result → the universal response surface. `body` is a setter-less
-        // read-taping accessor by default — DEFINE replaces it (a plain
-        // [[Set]] no-ops); the bytes derive from the taped fetch response,
-        // so no extra taping. JS_GetPropertyStr returns an owned ref that
-        // Set/Define steals.
-        //
-        // Payload (§2.2): the envelope carries the response bytes as
-        // base64url-no-pad `body_b64` (a JSON envelope can't hold raw
-        // bytes — the old `body` string was a LOSSY TextDecoder of them).
-        // Decode once: `request.bytes` = the raw payload, `request.body`
-        // = the lenient text view (until its retirement). A legacy
-        // envelope with only a `body` string still works — bytes derive
+        // Result → the universal response surface (§2.2): the envelope
+        // carries the response bytes as base64url-no-pad `body_b64` (a
+        // JSON envelope can't hold raw bytes); decode once onto
+        // `request.bytes` — `text`/`json` derive on the prototype.
+        // (`request.body` retired.) A producer that only carries a
+        // `body` string (held-sync deadline events) still yields bytes
         // from its UTF-8.
         var payload_done = false;
         const b64_val = c.JS_GetPropertyStr(ctx, result, "body_b64");
@@ -2922,12 +2910,10 @@ pub fn installRequest(
             defer state.allocator.free(raw);
             dec.decode(raw, b64_slice) catch break :b64;
             _ = c.JS_DefinePropertyValueStr(ctx, req_obj, "bytes", c.JS_NewUint8ArrayCopy(ctx, raw.ptr, raw.len), c.JS_PROP_C_W_E);
-            _ = c.JS_DefinePropertyValueStr(ctx, req_obj, "body", textcodec_b.lenientUtf8JsString(state.allocator, ctx, raw), c.JS_PROP_C_W_E);
             payload_done = true;
         }
         c.JS_FreeValue(ctx, b64_val);
         if (!payload_done) {
-            _ = c.JS_DefinePropertyValueStr(ctx, req_obj, "body", c.JS_GetPropertyStr(ctx, result, "body"), c.JS_PROP_C_W_E);
             const legacy_body = c.JS_GetPropertyStr(ctx, result, "body");
             if (c.JS_IsString(legacy_body)) {
                 var lb_len: usize = 0;
@@ -3173,28 +3159,6 @@ fn selfReplaceWithValue(
 ) c.JSValue {
     _ = c.JS_DefinePropertyValueStr(ctx, this_val, name, c.JS_DupValue(ctx, value), c.JS_PROP_C_W_E);
     return value;
-}
-
-/// `request.body` accessor: records the body-read marker (which is
-/// what keeps the body's tape/log reference alive — unread bodies
-/// are elided by `Readset.elideUnreadBody`), then self-replaces with
-/// the materialized string. Reading an EMPTY body still records:
-/// "read an empty body" and "never looked" are different replay
-/// facts.
-fn jsBodyGetter(
-    ctx: ?*c.JSContext,
-    this_val: c.JSValue,
-    magic: c_int,
-) callconv(.c) c.JSValue {
-    _ = magic;
-    const state = getState(ctx);
-    if (state.readset) |rs| rs.body_read = true;
-    recordRequestRead(state, .body_read, "", "");
-    // Lenient WHATWG semantics (invalid UTF-8 → U+FFFD) — the same rule
-    // as `request.text`; bare JS_NewStringLen would silently fall back
-    // to latin-1 byte semantics (handler-api-ergonomics-plan C6).
-    const body_val = textcodec_b.lenientUtf8JsString(state.allocator, ctx, state.req_body);
-    return selfReplaceWithValue(ctx, this_val, "body", body_val);
 }
 
 /// `request.bytes` accessor (plain inbound only — the other payload

@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, rpc_wrap  # noqa: E402
 
 HELDSYNC_SRC = r"""export default function () {
-    const req = JSON.parse(request.body);
+    const req = request.json;
     webhook.send(req.target, {
         method: "POST",
         body: JSON.stringify({ from: "ssrf-smoke", tag: req.tag }),
@@ -68,7 +68,7 @@ ONRESULT_SRC = r"""export function onResult() {
 
 WB_SRC = r"""export default function () {
     let payload = null;
-    try { payload = JSON.parse(request.body); } catch (_) {}
+    try { payload = request.json; } catch (_) {}
     const tag = (payload && payload.tag) || "<no-tag>";
     response.status = 200;
     return "echoed:" + tag;

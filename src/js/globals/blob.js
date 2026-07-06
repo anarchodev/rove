@@ -131,7 +131,7 @@ globalThis.blob = {
    *   blob.get(JSON.parse(kv.get(`media/${id}`)).hash, { on: "onBlob" });
    *   return next();
    * }
-   * export function onBlob() { return request.body; } // flattened: bytes on request.body, request.status top-level
+   * export function onBlob() { return request.bytes; } // flattened payload accessors; request.status top-level
    */
   get(hash, opts) {
     opts = opts || {};
@@ -198,7 +198,7 @@ globalThis.blob = {
    *
    * @example
    * export function onMirrorChunk() {
-   *   if (!request.done) { blob.write(request.body); return next(); }
+   *   if (!request.done) { blob.write(request.bytes); return next(); }
    *   blob.seal({ on: "onStored", content_type: "image/png" });
    *   return next();
    * }

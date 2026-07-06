@@ -519,7 +519,7 @@ class OIDCProvider {
   // device_code (its polling handle) + a short user_code the human enters in a
   // browser. The user_code only NAMES a pending request — not a credential.
   _deviceAuth() {
-    const f = new URLSearchParams(request.body || "");
+    const f = new URLSearchParams(request.text || "");
     const client_id = f.get("client_id");
     const scope = f.get("scope") || "openid";
     const client = this._client(client_id);
@@ -578,7 +578,7 @@ class OIDCProvider {
 
     let user_code, action = null;
     if (m === "POST") {
-      const f = new URLSearchParams(request.body || "");
+      const f = new URLSearchParams(request.text || "");
       user_code = (f.get("user_code") || "").trim().toUpperCase();
       action = f.get("action");
     } else {
@@ -677,7 +677,7 @@ class OIDCProvider {
   }
 
   _token() {
-    const f = new URLSearchParams(request.body || "");
+    const f = new URLSearchParams(request.text || "");
     const grant = f.get("grant_type");
     const keyset = this._keyset();
 
@@ -974,7 +974,7 @@ class OIDCRelyingParty {
 
   // The callback event the on_result modules receive. The webhook.send
   // result arrives on the unified flattened surface (handler-shape §7):
-  // `request.body`/`.status`/`.ok` top-level, with the delivery
+  // `request.text`/`.status`/`.ok` top-level, with the delivery
   // metadata + echoed `context` on `request.ctx`. We assemble the
   // `{ok, status, body, context, ...}` event the OIDC RP's
   // `completeToken` / `completeJwks` expect.
@@ -985,8 +985,8 @@ class OIDCRelyingParty {
     return {
       ok: request.ok,
       status: request.status,
-      body: request.body,
-      body_truncated: request.body_truncated,
+      body: request.text,
+      body_truncated: request.bodyTruncated,
       headers: a.headers || {},
       attempts: a.attempts,
       error: a.error,

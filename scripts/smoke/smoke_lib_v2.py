@@ -90,9 +90,9 @@ function __rpc(fns) {
       if (k === "fn" && v) fn = v;
       else if (k === "args" && v) { try { args = JSON.parse(v); } catch (_) {} }
     }
-    if (!fn && request.body) {
+    if (!fn && request.text) {
       try {
-        const b = JSON.parse(request.body);
+        const b = request.json;
         if (b && typeof b.fn === "string") { fn = b.fn; args = Array.isArray(b.args) ? b.args : []; }
       } catch (_) {}
     }

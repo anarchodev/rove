@@ -208,24 +208,42 @@ const EPILOGUE_BODY =
     \\  const __effects = [];
     \\  const __mklog = (level) => (...a) => { __effects.push({ kind: "log", level, message: a.map((x) => { try { return typeof x === "string" ? x : JSON.stringify(x); } catch (_) { return String(x); } }).join(" ") }); };
     \\  globalThis.console = { log: __mklog("info"), warn: __mklog("warn"), error: __mklog("error"), info: __mklog("info"), debug: __mklog("debug") };
+    \\  const __b2s = (c) => { if (typeof c === "string") return c; let s = ""; for (let i = 0; i < c.length; i++) s += String.fromCharCode(c[i]); return s; };
     \\  const headers = {};
     \\  for (const n of D.names) Object.defineProperty(headers, n, {
     \\    enumerable: true, configurable: true,
     \\    get() { if (!(n in D.values)) miss("header '" + n + "'"); return D.values[n]; },
     \\  });
     \\  const request = { method: D.method, path: D.path, host: D.host, query: D.query, headers };
-    \\  Object.defineProperty(request, "body", { enumerable: true, configurable: true,
+    \\  // The uniform payload surface (handler-shape §7): bytes/text/json
+    \\  // derive from the ONE recorded payload; reading any of them is the
+    \\  // same recorded fact the original run's body-read flag captured.
+    \\  // `request.body` stays available on the DRIVER (only) so records
+    \\  // from pre-retirement deployments still replay their pinned code.
+    \\  const __rawPayload = () => {
+    \\    if (!D.bodyRead) miss("request payload (bytes/text/json/body)");
+    \\    if (D.bodyB64 != null) {
+    \\      const bin = atob(D.bodyB64);
+    \\      const u = new Uint8Array(bin.length);
+    \\      for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+    \\      return u;
+    \\    }
+    \\    const st = D.body ?? "";
+    \\    const u = new Uint8Array(st.length);
+    \\    for (let i = 0; i < st.length; i++) u[i] = st.charCodeAt(i) & 0xff;
+    \\    return u;
+    \\  };
+    \\  const __defPayload = (name, compute) => Object.defineProperty(request, name, {
+    \\    enumerable: true, configurable: true,
     \\    get() {
-    \\      if (!D.bodyRead) miss("request.body");
-    \\      let v;
-    \\      if (D.bodyB64 != null) {
-    \\        const bin = atob(D.bodyB64);
-    \\        v = new Uint8Array(bin.length);
-    \\        for (let i = 0; i < bin.length; i++) v[i] = bin.charCodeAt(i);
-    \\      } else { v = D.body ?? ""; }
-    \\      Object.defineProperty(request, "body", { enumerable: true, configurable: true, writable: true, value: v });
+    \\      const v = compute();
+    \\      Object.defineProperty(request, name, { enumerable: true, configurable: true, writable: true, value: v });
     \\      return v;
     \\    } });
+    \\  __defPayload("bytes", () => __rawPayload());
+    \\  __defPayload("text", () => { const u = __rawPayload(); try { return decodeURIComponent(escape(__b2s(u))); } catch (_) { return __b2s(u); } });
+    \\  __defPayload("json", () => JSON.parse(request.text));
+    \\  __defPayload("body", () => (D.bodyB64 != null) ? __rawPayload() : (D.body ?? ""));
     \\  Object.defineProperty(request, "cookies", { enumerable: true, configurable: true,
     \\    get() {
     \\      const out = {};
@@ -274,7 +292,6 @@ const EPILOGUE_BODY =
     \\  // fully faithful (no side effects to reproduce); webhook/email/schedule/
     \\  // cron/blob are recorded but do NOT re-run their durability shims (their
     \\  // kv markers / bytes aren't reproduced — the handler's own kv writes are).
-    \\  const __b2s = (c) => { if (typeof c === "string") return c; let s = ""; for (let i = 0; i < c.length; i++) s += String.fromCharCode(c[i]); return s; };
     \\  if (typeof globalThis.TextDecoder === "undefined") {
     \\    globalThis.TextDecoder = function () {};
     \\    globalThis.TextDecoder.prototype.decode = function (u) { if (u == null) return ""; try { return decodeURIComponent(escape(__b2s(u))); } catch (_) { return __b2s(u); } };
@@ -285,12 +302,16 @@ const EPILOGUE_BODY =
     \\  // reads/writes/cmds/logs interleave as the handler performed them. Filter by
     \\  // `kind` to recover a typed view.
     \\  globalThis.stream = { start() {}, write(c) { __effects.push({ kind: "stream", bytes: __b2s(c).length }); } };
-    \\  globalThis.on = {
-    \\    fetch(url, opts, to) { __effects.push({ kind: "fetch", url, method: (opts && opts.method) || "GET", body: (opts && opts.body !== undefined) ? opts.body : null, ctx: (opts && opts.ctx !== undefined) ? opts.ctx : ((to && to.ctx !== undefined) ? to.ctx : null), to: (to && to.to) || (opts && opts.to) || null }); },
-    \\    kv(prefix, to) { __effects.push({ kind: "kv-wake", prefix, to: (to && to.to) || null }); },
-    \\    timer(ms, to) { __effects.push({ kind: "timer", ms, to: (to && to.to) || null }); },
+    \\  const __tgt = (d) => (d && (d.on || d.to)) || null;
+    \\  globalThis.after = {
+    \\    fetch(url, opts, dst) { __effects.push({ kind: "fetch", url, method: (opts && opts.method) || "GET", body: (opts && opts.body !== undefined) ? opts.body : null, ctx: (opts && opts.ctx !== undefined) ? opts.ctx : null, on: __tgt(dst) }); },
+    \\    kv(prefix, dst) { __effects.push({ kind: "kv-wake", prefix, on: __tgt(dst) }); },
+    \\    ms(ms, dst) { __effects.push({ kind: "timer", ms, on: __tgt(dst) }); },
     \\  };
-    \\  globalThis.webhook = { send(url, opts) { __effects.push({ kind: "webhook", url, onResult: (opts && opts.onResult) || null }); } };
+    \\  // Pre-rename `on.*` — kept on the DRIVER only, so records from
+    \\  // pre-rename deployments still replay their pinned code.
+    \\  globalThis.on = { fetch: globalThis.after.fetch, kv: globalThis.after.kv, timer: globalThis.after.ms };
+    \\  globalThis.webhook = { send(url, opts) { __effects.push({ kind: "webhook", url, on: (opts && (opts.on || opts.on_result)) || null }); } };
     \\  globalThis.email = { send(opts) { __effects.push({ kind: "email", to: (opts && opts.to) || null }); } };
     \\  globalThis.schedule = (when, target) => { __effects.push({ kind: "schedule", when, target: target || null }); };
     \\  globalThis.cron = (spec, target) => { __effects.push({ kind: "cron", spec, target: target || null }); };

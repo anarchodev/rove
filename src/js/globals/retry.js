@@ -21,7 +21,7 @@
 //
 //   // The on_result handler. The event arrives on the unified
 //   // flattened surface (handler-shape §7): the response on
-//   // `request.body` / `request.status` / `request.ok`, with the
+//   // `request.text` / `request.status` / `request.ok`, with the
 //   // delivery metadata + echoed `context` on `request.ctx`.
 //   // `retry.shouldRetry` / `retry.next` accept the flat event shape;
 //   // assemble it from that surface:
@@ -29,7 +29,7 @@
 //   //   charges/handler.mjs
 //   //   export default function () {
 //   //     const event = {
-//   //       ok: request.ok, status: request.status, body: request.body,
+//   //       ok: request.ok, status: request.status, body: request.text,
 //   //       error: request.activation.error, context: request.ctx,
 //   //     };
 //   //     if (retry.shouldRetry(event)) { retry.next(event); return; }
@@ -84,7 +84,7 @@ function backoffMsFor(retry_state, next_attempt) {
  * // on the unified flattened surface (handler-shape §7).
  * export default function () {
  *   const event = {
- *     ok: request.ok, status: request.status, body: request.body,
+ *     ok: request.ok, status: request.status, body: request.text,
  *     error: request.activation.error, context: request.ctx,
  *   };
  *   if (retry.shouldRetry(event)) { retry.next(event); return; }
@@ -172,7 +172,7 @@ globalThis.retry = {
    *
    * @param {object} event - The (flat) result event with `ok` +
    *   `context._retry`. See the module comment for how to flatten
-   *   from `request.body.ctx`.
+   *   from `request.ctx`.
    * @returns {boolean}
    */
   shouldRetry(event) {

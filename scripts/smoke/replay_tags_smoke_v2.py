@@ -53,7 +53,7 @@ export function onFetchResult() {
     if (request.ok) {
         response.status = 200;
         return "ok:" + request.status + ":" +
-            new TextDecoder().decode(request.body || new Uint8Array());
+            (request.text || "");
     }
     response.status = 502;
     return "fail:" + (request.error || request.reason || request.status || "?");

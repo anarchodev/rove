@@ -10,7 +10,7 @@
 // node-agnostic.)
 export default function () {
     let payload = null;
-    try { payload = JSON.parse(request.body); } catch (_) {}
+    try { payload = request.json; } catch (_) {}
     const tag = (payload && payload.tag) || "<no-tag>";
     response.status = 200;
     return "echoed:" + tag;

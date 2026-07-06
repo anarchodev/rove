@@ -19,7 +19,7 @@
 //                  point target at an unreachable IP to exercise the
 //                  §6.4 mandatory-timeout (deadline) path
 export default function () {
-    const req = JSON.parse(request.body);
+    const req = request.json;
     const opts = {
         method: "POST",
         body: JSON.stringify({ from: "heldsync", tag: req.tag }),

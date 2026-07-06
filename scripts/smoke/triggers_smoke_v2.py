@@ -56,7 +56,7 @@ export function afterDelete(event) {
 HANDLER_SRC = '''export default function () {
   const path = request.path;
   if (path === "/create") {
-    const body = JSON.parse(request.body);
+    const body = request.json;
     kv.set("users/sessions/" + body.sid, JSON.stringify({ user_id: body.user_id }));
     return { ok: true };
   }
@@ -69,7 +69,7 @@ HANDLER_SRC = '''export default function () {
     }
   }
   if (path === "/delete") {
-    const body = JSON.parse(request.body);
+    const body = request.json;
     kv.delete("users/sessions/" + body.sid);
     return { ok: true };
   }

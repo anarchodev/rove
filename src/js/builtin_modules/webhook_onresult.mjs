@@ -46,13 +46,10 @@ export default function () {
     }
     if (a.kind === "fetch_chunk" && !a.final) return { status: 200 };
 
-    // Pull the shim's bookkeeping ctx (the originating webhook.send
-    // stuffed it onto the fetch's `ctx`). Tolerate the retry-sweep
-    // path too: when fired via __rove_next, the same ctx rides as
-    // request.body.ctx.
-    const ctx = a.kind === "fetch_chunk"
-        ? JSON.parse(request.body).ctx
-        : JSON.parse(request.body).ctx;
+    // The shim's bookkeeping ctx (the originating webhook.send
+    // stuffed it onto the fetch's `ctx`) — lifted to `request.ctx`
+    // on both the unbound-fetch and the chained-hop paths.
+    const ctx = request.ctx || {};
     const { id, on_result, context } = ctx;
 
     // Read the owed marker — if absent, this is a duplicate fire
@@ -63,20 +60,14 @@ export default function () {
     const owed = JSON.parse(owed_raw);
 
     // Result shape — handed to __rove_next as {ctx:{result, context}};
-    // the runtime then flattens it onto the customer's on_result request
-    // surface (request.bytes/.body/.status/.ok + request.ctx;
-    // globals.zig). The response bytes ride base64url-encoded
-    // (`body_b64`) — the JSON envelope can't carry raw bytes, and a
-    // TextDecoder'd string alone silently corrupts binary responses
-    // (handler-api-ergonomics-plan §2.2). `body` (the lenient text
-    // view) rides alongside for the §6.4 held-sync positional
-    // `onResult(ctx, outcome)` consumers, which read `outcome.body`.
+    // the runtime then flattens it onto the customer's `{on}` request
+    // surface (request.bytes/.status/.ok + request.ctx; globals.zig).
+    // The response bytes ride base64url-encoded (`body_b64`) — the
+    // JSON envelope can't carry raw bytes (handler-api-ergonomics-plan
+    // §2.2); the consumer's text view derives from the bytes.
     const body_b64 = (a.kind === "fetch_chunk")
         ? base64url.encode(a.bytes)
         : base64url.encode(ctx.result_body || "");
-    const body_text = (a.kind === "fetch_chunk")
-        ? new TextDecoder().decode(a.bytes)
-        : (ctx.result_body || "");
     const result_status = (a.kind === "fetch_chunk") ? a.status : ctx.result_status;
     const result_ok = (a.kind === "fetch_chunk") ? a.ok : ctx.result_ok;
     const result_headers = (a.kind === "fetch_chunk")
@@ -89,7 +80,6 @@ export default function () {
         ok: result_ok && result_status < 400,
         status: result_status,
         body_b64: body_b64,
-        body: body_text,
         headers: result_headers,
         body_truncated: result_truncated,
         attempts: owed.attempts + 1,
@@ -149,7 +139,6 @@ export default function () {
         ok: result.ok,
         status: result.status,
         body_b64: result.body_b64,
-        body: result.body,
         headers: result.headers,
         body_truncated: result.body_truncated,
         attempts: result.attempts,

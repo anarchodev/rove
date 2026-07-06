@@ -12,7 +12,7 @@ const NAME_RE = /^[a-z0-9_-]{1,32}$/i;
 
 export default function () {
   if (request.method === "POST") {
-    const body = JSON.parse(request.body || "{}");
+    const body = JSON.parse(request.text || "{}");
     const name = String(body.name || "").trim();
     const score = parseInt(body.score, 10);
     if (!NAME_RE.test(name)) {

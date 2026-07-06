@@ -87,7 +87,7 @@
      * @returns {string} Lowercase hex, 64 characters.
      *
      * @example
-     * const sig = crypto.hmacSha256(webhookSecret, request.body);
+     * const sig = crypto.hmacSha256(webhookSecret, request.bytes);
      * if (sig !== request.headers["x-signature"]) return unauthorized();
      */
     hmacSha256(key, data) {

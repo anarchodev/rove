@@ -1,11 +1,12 @@
 # Handler API ergonomics — one payload model, one grammar
 
-> **Status:** COMPLETE except `request.body` retirement. Phases 1–4
-> landed 2026-07-05; platform deployed + rewind-apps migrated/published
-> 2026-07-06; the DUAL-NAME WINDOW CLOSED 2026-07-06 (every checklist
-> item below done — the old spellings are gone). The one remaining
-> item is the `request.body` retirement, blocked on replay-driver
-> accessor parity (open question 4). Contract-change plan for
+> **Status: COMPLETE.** Phases 1–4 landed 2026-07-05; platform deployed
+> + rewind-apps migrated/published 2026-07-06; the DUAL-NAME WINDOW
+> closed 2026-07-06; `request.body` retired 2026-07-06 after the replay
+> driver (native epilogue + WASM shell) gained bytes/text/json parity —
+> the driver alone still synthesizes a `body` so pre-retirement records
+> replay their pinned code. The payload surface is
+> `request.bytes`/`.text`/`.json`, everywhere. Contract-change plan for
 > the customer handler surface (`handler-shape.md` is the contract this
 > revises, rewritten in Phase 4). Pre-customer: every change here is a
 > clean break; the one-deploy-cycle window is operational sequencing
@@ -271,8 +272,8 @@ smokes that touch the changed surface).
   - Migrate the deliberately-legacy window-teeth smokes
     (`webhook_recovery_smoke_v2`, `ssrf_smoke_v2`,
     `scheduler_heartbeat_smoke_v2`) and delete the alias unit tests.
-  - Still open: retire `request.body` (needs the replay-driver
-    accessor parity — open question 4).
+  - `request.body` retired 2026-07-06 (replay-driver parity landed
+    with it).
 - **Phase 4 — docs reconciliation.** `handler-shape.md` rewritten to
   the new surface (including honest `kv.prefix` examples,
   `request.fetchesPending`, the §5.6/§5.9 fixes); `effect-algebra.md`

@@ -13,7 +13,7 @@
 //
 // The single client request blocks for ~ms, then returns "woke:<tag>".
 export default function () {
-    const req = request.body ? JSON.parse(request.body) : {};
+    const req = request.text ? request.json : {};
     after.ms(req.ms || 150);
     return next({ tag: req.tag || "t" });
 }

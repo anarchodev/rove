@@ -6,7 +6,7 @@
 // the global `response.status` — the handler's return value
 // becomes the response body when it's not a Response object.)
 export default function () {
-    const body = JSON.parse(request.body || "{}");
+    const body = JSON.parse(request.text || "{}");
     const id = body.id ?? "x";
     const value = body.value ?? "";
     kv.set("watch/" + id, value);

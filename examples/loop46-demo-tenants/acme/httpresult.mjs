@@ -13,7 +13,7 @@ export default function () {
         status: request.status,
         version: a.attempts, // attempts ~ legacy `version`
         context: request.ctx ?? null,
-        body: request.body,
+        body: request.text,
         error: a.error || null,
     };
     kv.set("http/result/" + a.id, JSON.stringify(record));

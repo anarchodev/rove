@@ -235,7 +235,7 @@
 
     /**
      * Decode the replay-fetch result delivered to your `getReplay`
-     * callback. Reads the bound-fetch `request.body` (JSON) into
+     * callback. Reads the bound-fetch `request.json` into
      * `{records: [...], next_cursor}`. Each record:
      * `{request_id, received_ns, duration_ns, status, method, path,
      * host, outcome}`. Returns `{records: []}` on any decode failure.

@@ -27,10 +27,11 @@
 > pre-rename spellings (`on.*`, `{to}`, `{on_result}`/`{context}`,
 > `webhook.send({url})`, `scheduler.after`, `request.activation.msg`,
 > snake_case field aliases) lived for one deploy cycle and are **GONE**
-> (window closed 2026-07-06). The one survivor is `request.body` — the
-> legacy text/bytes payload view — which outlives the window only until
-> the replay driver grows `bytes`/`text`/`json` parity (plan doc, open
-> question 4); new code reads the accessors.
+> (window closed 2026-07-06), and **`request.body` is retired too**
+> (2026-07-06, once the replay driver gained accessor parity) — the
+> payload surface is `request.bytes`/`.text`/`.json`, full stop. The
+> replay driver alone still synthesizes a `body` so records from
+> pre-retirement deployments replay their pinned code.
 >
 > **Revised 2026-06-02 (rev 2 — `stream.*` model).** Organized around one
 > axis — **scope: current-connection vs connectionless** — derived in
@@ -686,10 +687,9 @@ rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
   a handler asking for JSON that isn't JSON is a real error). All
   three derive from the same recorded bytes. On a payload-less
   activation (wakes, `cron`/`schedule` targets, `onDisconnect`) all
-  three read `undefined`. `request.body` is the legacy spelling of
-  the text-or-bytes view (its type varied by activation kind) —
-  **deprecated; it is removed once the replay driver has accessor
-  parity** — new code reads `bytes`/`text`/`json`.
+  three read `undefined`. (`request.body` — whose type varied by
+  activation kind — is RETIRED; the accessors are the only payload
+  surface.)
 - **`default`:** the payload views above, plus `.headers`, `.method`,
   `.path`, `.query`, `.cookies`, `.ip`, `.unmaskedIp()`.
 - **`onChunk`:** `request.bytes` = THIS chunk; `request.done`;
@@ -748,9 +748,9 @@ data-minimization story, see `decisions.md` §4.6):
   (`request.auth = …` still works).
 - `request.cookies` materializes on first access; the access counts
   as reading the whole `cookie` header.
-- The payload views (`request.bytes` / `.text` / `.json`, and legacy
-  `request.body`) are accessors too, and record ONE shared body-read
-  fact — reading any (or several) of them records once. An inbound
+- The payload views (`request.bytes` / `.text` / `.json`) are
+  accessors too, and record ONE shared body-read fact — reading any
+  (or several) of them records once. An inbound
   body your handler never reads is **absent from the replay record
   entirely** (storage/durability is unaffected — only the log-side
   reference is elided). Chunk / fetch-result / WS activations are the
@@ -878,8 +878,7 @@ cycle — the dual-name window, closed 2026-07-06):
 - snake_case handler-visible fields → camelCase (`bodyTruncated`,
   `scheduledAtNs`, `activation.fetchId`)
 - per-surface `request.body` types → uniform `request.bytes`/`.text`/
-  `.json`; `request.body` deprecated (removed once the replay driver
-  has accessor parity)
+  `.json`; `request.body` retired outright (2026-07-06)
 - `kind=boot` subscriptions + `onBoot` → retired outright (unused):
   seed registrations from any handler activation — idempotent by key,
   `_sched/*` entries are durable kv that survive deploys

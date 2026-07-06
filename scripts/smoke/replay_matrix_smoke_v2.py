@@ -53,7 +53,7 @@ export default function () {
 }
 export function onUpstream() {
   response.status = 200;
-  return JSON.stringify({ len: request.body.length, status: request.status });
+  return JSON.stringify({ len: request.bytes.length, status: request.status });
 }
 """
 WS_SRC = """

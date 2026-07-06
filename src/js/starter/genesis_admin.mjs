@@ -104,7 +104,7 @@ export default function () {
     return "unauthenticated\n";
   }
   let b;
-  try { b = JSON.parse(request.body); }
+  try { b = request.json; }
   catch (e) { return jerr(400, "expected JSON body"); }
   const p = request.path;
   if (p === "/v1/deploy/reset") return wsReset(b);

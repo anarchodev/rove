@@ -52,7 +52,7 @@ export function onChunk() {
   const count = (prev ? Number(prev) : 0) + 1;
   kv.set(key, String(count));
   const rw = ctx.rw && count === request.chunkSeq + 1;
-  const total = ctx.len + request.body.length;
+  const total = ctx.len + request.bytes.length;
   if (request.done) {
     response.status = 200;
     response.headers["content-type"] = "application/json";
@@ -76,7 +76,7 @@ export function onChunk() {
 
 DEFAULT_SRC = """
 export default function () {
-  return "classic:" + request.body.length;
+  return "classic:" + request.text.length;
 }
 """
 

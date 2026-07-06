@@ -4,7 +4,7 @@
 // prefix for the kv-wake smoke and can't be repurposed without
 // breaking that smoke).
 export default function () {
-    const body = JSON.parse(request.body || "{}");
+    const body = JSON.parse(request.text || "{}");
     if (!body.key || typeof body.key !== "string") {
         response.status = 400;
         return "missing key";

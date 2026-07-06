@@ -32,7 +32,7 @@ export function start(count, depth, url) {
 
 // POST `/` body {id, depth, url}: one chain link.
 export default function () {
-    const step = JSON.parse(request.body);
+    const step = request.json;
     const id = step.id;
     const depth = step.depth | 0;
 

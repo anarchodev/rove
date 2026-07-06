@@ -39,7 +39,7 @@ from smoke_lib_v2 import V2Cluster, rpc_wrap, MOVE_SECRET  # noqa: E402
 HANDLER_SRC = """\
 export function handler() {
     if (request.method === "POST") {
-        const body = JSON.parse(request.body || "{}");
+        const body = JSON.parse(request.text || "{}");
         if (body.del) { kv.delete(body.del); response.status = 204; return ""; }
         kv.set(body.key ?? "cc/value", body.value ?? "");
         response.status = 204;

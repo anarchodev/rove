@@ -17,7 +17,7 @@
 // The held client request blocks until a SECOND request writes
 // `<prefix>flag`, then returns "woke:<value>".
 export default function () {
-    const req = request.body ? JSON.parse(request.body) : {};
+    const req = request.text ? request.json : {};
     const prefix = req.prefix || "onkv/";
     // Read the watched key so read_version baselines AFTER this read —
     // only a write newer than what we just saw should wake us.

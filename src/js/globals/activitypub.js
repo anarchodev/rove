@@ -387,7 +387,7 @@ class ActivityPubActor {
     }
     let activity;
     try {
-      activity = JSON.parse(request.body || "{}");
+      activity = JSON.parse(request.text || "{}");
     } catch (_) {
       response.status = 400;
       return "bad activity JSON";
@@ -410,7 +410,7 @@ class ActivityPubActor {
       method: request.method,
       path: request.path,
       headers: snapHeaders,
-      body: request.body || "",
+      body: request.text || "",
     };
 
     // keyId is "<actor-url>#main-key" — fetch the actor doc itself.
@@ -532,7 +532,7 @@ class ActivityPubActor {
    * @example
    * // POST /post  (authenticate this yourself)
    * export default function () {
-   *   const { content } = JSON.parse(request.body);
+   *   const { content } = request.json;
    *   return JSON.stringify(activitypub.fromConfig().publishNote(content));
    * }
    */

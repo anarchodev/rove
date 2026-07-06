@@ -8,7 +8,7 @@
 // Resume hops receive ctx via the synthesized request body shape
 // `{ctx:<json>}` — parse it back out.
 function resumeCtx() {
-    return JSON.parse(request.body || "{}").ctx || {};
+    return JSON.parse(request.text || "{}").ctx || {};
 }
 
 // Inbound: register the session + open the SSE tick stream.

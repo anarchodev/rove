@@ -8,7 +8,7 @@
 // `next()` (hold). So we set `response.status` and return a terminal body.
 
 export default function () {
-  const cart = JSON.parse(request.body || "{}");
+  const cart = JSON.parse(request.text || "{}");
   on.fetch("https://api.stripe.com/v1/charges",
     { method: "POST", body: { amount: cart.total }, ctx: { cartId: cart.id } },
     { to: "onCharge" });
@@ -21,7 +21,7 @@ export default function () {
 
 // A fetch result's body arrives as bytes (a `fetch_chunk` is a binary
 // activation), so decode before parsing — real handler code.
-const body = () => JSON.parse(new TextDecoder().decode(request.body) || "{}");
+const body = () => JSON.parse(request.text || "{}");
 
 export function onCharge() {
   const ctx = request.ctx, charge = body();

@@ -58,7 +58,7 @@
       // Cross-tenant blob READ — the read twin of `blob.put`. Bound, like
       // {@link blob.get}: it lowers to an after.fetch at the admin-only
       // `rove-blob-read.internal` door (rewritten to `id`'s S3 prefix +
-      // SigV4-signed natively). The bytes resume on `request.body` at the
+      // SigV4-signed natively). The bytes resume on `request.bytes` at the
       // `on` export (default onFetchResult); thread state with `opts.ctx`
       // (→ `request.ctx`). Return next() after it. Compose the replay bundle /
       // Code-tab sources from these reads in JS — no native assembly.
@@ -105,7 +105,7 @@
         },
         // readManifest is the READ twin of stampManifest: it reads `id`'s
         // deployment manifest for `dep_id` (16-hex) off the read door. The raw
-        // manifest JSON resumes on `request.body` at `on` (default
+        // manifest JSON resumes on `request.json` at `on` (default
         // onFetchResult) — parse it in JS, then read each handler entry's
         // source with `scope(id).blob.get(hash)`. The current dep_id is
         // `scope(id).kv.get("_deploy/current")`.
