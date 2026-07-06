@@ -38,6 +38,14 @@ function assertHash(hash, verb) {
 /**
  * Content-addressed tenant object storage.
  *
+ * Two shapes: one-shot (`put`/`get`) for values you hold in hand, and
+ * the upload session (`receive` → `write` → `seal`) for large inbound
+ * bodies that stream in chunk by chunk. "Seal" = freeze the bytes into
+ * an immutable blob and get back its hash (`segments.seal` is the same
+ * metaphor applied to a log tail). `blob.write` appends INTO an upload
+ * session — the opposite direction from `stream.write`, which emits
+ * response bytes OUT over the held connection.
+ *
  * @namespace blob
  */
 globalThis.blob = {

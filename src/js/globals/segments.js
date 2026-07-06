@@ -10,13 +10,13 @@
 // cadence is the knob trading kv-cap consumption against byte-ring
 // consumption.
 //
-// Key layout (per stream; `_seg/` is shim-managed but NOT platform-
+// Key layout (per log; `_seg/` is shim-managed but NOT platform-
 // reserved — same `_send/`/`_blob/` rule, the shim writes via
 // ordinary customer kv.set):
 //
-//   _seg/{stream}/n             → next seq (string int)
-//   _seg/{stream}/h/{seq:020}   → hot record value (string)
-//   _seg/{stream}/s/{first:020} → segment index row
+//   _seg/{log}/n             → next seq (string int)
+//   _seg/{log}/h/{seq:020}   → hot record value (string)
+//   _seg/{log}/s/{first:020} → segment index row
 //                                 {hash, first_seq, last_seq, count}
 //
 // Crash safety — the design's load-bearing joint: a sealed segment is
@@ -35,7 +35,7 @@
 const HOT = (s) => "_seg/" + s + "/h/";
 const IDX = (s) => "_seg/" + s + "/s/";
 const NEXT = (s) => "_seg/" + s + "/n";
-const STREAM_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const LOG_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const PAD = "00000000000000000000";
 
 function pad(seq) {
@@ -43,9 +43,9 @@ function pad(seq) {
   return PAD.slice(d.length) + d;
 }
 
-function assertStream(stream, verb) {
-  if (typeof stream !== "string" || !STREAM_RE.test(stream))
-    throw new TypeError(verb + ": stream must match [A-Za-z0-9_-]{1,64}");
+function assertStream(log, verb) {
+  if (typeof log !== "string" || !LOG_RE.test(log))
+    throw new TypeError(verb + ": log must match [A-Za-z0-9_-]{1,64}");
 }
 
 /**
@@ -56,31 +56,85 @@ function assertStream(stream, verb) {
  * writeset; a cron-driven `seal` compacts old rows into blob storage
  * so the kv footprint stays bounded by the working set.
  *
+ * "Seal" here is the same metaphor as `blob.seal`: freeze bytes into
+ * an immutable, content-addressed blob — there it seals an upload,
+ * here it seals a log tail. Not related to `stream.*` (connection
+ * output): a segments log is named state, not a socket.
+ *
+ * A log id is a name YOU choose, exactly like a kv key — there is no
+ * allocation step; the log exists once something has been appended to
+ * it. Enumerate existing logs with `segments.logs()`.
+ *
  * @namespace segments
  */
 globalThis.segments = {
   /**
-   * Append one record to a stream's hot tail. An ordinary kv write —
+   * Append one record to a log's hot tail. An ordinary kv write —
    * atomic with the rest of this activation's writeset, read-your-
    * writes within it.
    *
-   * @param {string} stream - Stream id (`[A-Za-z0-9_-]{1,64}`).
+   * @param {string} log - Log id (`[A-Za-z0-9_-]{1,64}`).
    * @param {string} value - The record. Non-strings are rejected —
    *   serialize yourself (`JSON.stringify`) so reads are symmetric.
    * @returns {number} The record's sequence number (0-based,
-   *   monotonic per stream).
+   *   monotonic per log).
    *
    * @example
    * const seq = segments.append(`room-${id}`, JSON.stringify(event));
    * kv.set(`latest/${id}`, String(seq));
    */
-  append(stream, value) {
-    assertStream(stream, "segments.append");
+  /**
+   * List the log ids that currently exist (kv-visible: hot rows,
+   * sealed-segment index rows, or a seq counter). Paged: pass the
+   * returned `cursor` back to continue; `cursor: null` means done.
+   * Ids come back in byte order. Cost is one point read per id per
+   * page — a seek-scan over the `_seg/` key space, not a full scan.
+   *
+   * @param {string} [cursor] - Opaque resume cursor from a prior call.
+   * @param {number} [limit] - Max ids per page (default 20, cap 200).
+   * @returns {{logs: string[], cursor: (string|null)}}
+   *
+   * @example
+   * segments.append("inbox", "a");
+   * segments.append("audit-2026", "b");
+   * const page = segments.logs();
+   * // page.logs → ["audit-2026", "inbox"], page.cursor → null
+   * if (page.logs.indexOf("inbox") < 0) throw new Error("missing log");
+   */
+  logs(cursor, limit) {
+    limit = Math.min(Math.max(Number(limit) || 20, 1), 200);
+    const P = "_seg/";
+    const out = [];
+    let cur = typeof cursor === "string" && cursor ? cursor : null;
+    while (out.length < limit) {
+      const page = kv.prefix(P, cur, 1);
+      if (!page.length) {
+        cur = null;
+        break;
+      }
+      const rest = page[0].key.slice(P.length);
+      const slash = rest.indexOf("/");
+      if (slash < 0) {
+        cur = page[0].key; // stray non-log key under _seg/ — step past it
+        continue;
+      }
+      const log = rest.slice(0, slash);
+      out.push(log);
+      // Seek past every key of this log: '0' is the first id character
+      // above '/' in byte order, so `_seg/<log>0` sorts after all
+      // `_seg/<log>/...` rows and before every other id's rows.
+      cur = P + log + "0";
+    }
+    return { logs: out, cursor: cur };
+  },
+
+  append(log, value) {
+    assertStream(log, "segments.append");
     if (typeof value !== "string")
       throw new TypeError("segments.append: value must be a string");
-    const seq = Number(kv.get(NEXT(stream)) ?? "0");
-    kv.set(HOT(stream) + pad(seq), value);
-    kv.set(NEXT(stream), String(seq + 1));
+    const seq = Number(kv.get(NEXT(log)) ?? "0");
+    kv.set(HOT(log) + pad(seq), value);
+    kv.set(NEXT(log), String(seq + 1));
     return seq;
   },
 
@@ -90,7 +144,7 @@ globalThis.segments = {
    * connection at `opts.to` — use {@link segments.slice} there to
    * extract the record from the segment.
    *
-   * @param {string} stream - Stream id.
+   * @param {string} log - Log id.
    * @param {number} seq - Sequence number.
    * @param {object} [opts]
    * @param {string} [opts.on] - Export resumed with the segment for
@@ -111,20 +165,20 @@ globalThis.segments = {
    *   return segments.slice(request);
    * }
    */
-  get(stream, seq, opts) {
-    assertStream(stream, "segments.get");
+  get(log, seq, opts) {
+    assertStream(log, "segments.get");
     opts = opts || {};
     const on_key = typeof opts.on === "string" ? opts.on : undefined;
     if (!Number.isInteger(seq) || seq < 0)
       throw new TypeError("segments.get: seq must be a non-negative integer");
-    const hot = kv.get(HOT(stream) + pad(seq));
+    const hot = kv.get(HOT(log) + pad(seq));
     if (hot !== null && hot !== undefined) return hot;
 
     // Sealed? Find the segment whose [first, last] covers seq.
     // O(index rows) prefix scan — fine into the thousands of
-    // segments; fork the recipe with a cursor-seek if a stream
+    // segments; fork the recipe with a cursor-seek if a log
     // outgrows that.
-    const rows = kv.prefix(IDX(stream), null, 4096);
+    const rows = kv.prefix(IDX(log), null, 4096);
     for (const row of rows) {
       const idx = JSON.parse(row.value);
       if (seq >= idx.first_seq && seq <= idx.last_seq) {
@@ -132,7 +186,7 @@ globalThis.segments = {
           throw new TypeError("segments.get: record is sealed — pass { on } and finish in that export");
         blob.get(idx.hash, {
           on: on_key,
-          ctx: { stream: stream, seq: seq, idx: seq - idx.first_seq },
+          ctx: { log: log, seq: seq, idx: seq - idx.first_seq },
         });
         return undefined;
       }
@@ -160,14 +214,14 @@ globalThis.segments = {
 
   /**
    * Seal the oldest hot records into one content-addressed segment.
-   * Call from a cron target per stream (the cadence IS your kv-cap ↔
+   * Call from a cron target per log (the cadence IS your kv-cap ↔
    * object-storage trade-off knob). The call only serializes + fires
    * the durable PUT; the swap — index row written, hot rows deleted,
    * one atomic writeset — runs in `__system/segments_onsealed`
    * strictly after storage confirmed the bytes, so a crash anywhere
    * leaves the log readable and the next seal retries idempotently.
    *
-   * @param {string} stream - Stream id.
+   * @param {string} log - Log id.
    * @param {object} [opts]
    * @param {number} [opts.min=64] - Skip the seal entirely when
    *   fewer hot rows than this (avoids confetti segments).
@@ -182,22 +236,22 @@ globalThis.segments = {
    *     segments.seal(`room-${s}`);
    * }
    */
-  seal(stream, opts) {
-    assertStream(stream, "segments.seal");
+  seal(log, opts) {
+    assertStream(log, "segments.seal");
     opts = opts || {};
     const min = opts.min != null ? opts.min : 64;
     const max = opts.max != null ? opts.max : 1024;
-    const rows = kv.prefix(HOT(stream), null, max);
+    const rows = kv.prefix(HOT(log), null, max);
     if (rows.length < Math.max(min, 1)) return 0;
 
-    const hot_prefix_len = HOT(stream).length;
+    const hot_prefix_len = HOT(log).length;
     const first_seq = Number(rows[0].key.slice(hot_prefix_len));
     const last_seq = Number(rows[rows.length - 1].key.slice(hot_prefix_len));
     const values = rows.map((r) => r.value);
 
     const payload = JSON.stringify({
       v: 1,
-      stream: stream,
+      log: log,
       first_seq: first_seq,
       values: values,
     });
@@ -205,7 +259,7 @@ globalThis.segments = {
       content_type: "application/json",
       on: "__system/segments_onsealed",
       ctx: {
-        stream: stream,
+        log: log,
         first_seq: first_seq,
         last_seq: last_seq,
         count: rows.length,

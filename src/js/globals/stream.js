@@ -20,10 +20,14 @@
 
   /**
    * Connection output — produce a streamed response over time. Pair
-   * with `on.*` (to wait for more) and `return next()` (to keep the
+   * with `after.*` (to wait for more) and `return next()` (to keep the
    * socket); close by returning a terminal body. The response head is
    * the ambient `response.*` global, committed to the wire by the first
    * `stream.start()` / `stream.write()` (or a terminal return).
+   *
+   * This is the OUTBOUND direction only. Taking a large body IN is
+   * `blob.receive`/`blob.write` (an upload session); an append log you
+   * name and query is `segments.*` — neither involves this namespace.
    *
    * @namespace stream
    * @example

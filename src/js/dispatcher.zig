@@ -1192,6 +1192,36 @@ test "dispatch: send_callback without a result object lifts the whole envelope c
     try testing.expectEqualStrings("status=undefined id=send-7 note=self-hop body=undefined", resp.body);
 }
 
+test "dispatch: segments.logs seek-scan — adjacent ids, pagination, id containing '0'" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    // Byte-order traps: "xyz-a" sorts BEFORE "xyz" ('-' < '/'), "xyz0"
+    // sorts after the seek cursor for "xyz" and must not be skipped.
+    var resp = try runOne(&d, kv,
+        \\for (const id of ["xyz", "xyz-a", "xyz0", "aaa"]) segments.append(id, "v");
+        \\const one = segments.logs(undefined, 2);
+        \\const two = segments.logs(one.cursor, 10);
+        \\if (two.cursor !== null) return "cursor-not-drained";
+        \\return one.logs.concat(two.logs).join(",");
+    , .{
+        .method = "POST",
+        .path = "/",
+        .trace = .{ .request_id = 1 },
+    });
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings("aaa,xyz-a,xyz,xyz0", resp.body);
+}
+
 test "dispatch: request.session.id surfaces resolved sid" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

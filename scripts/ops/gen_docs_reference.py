@@ -34,16 +34,31 @@ GLOBALS = ROVE / "src" / "js" / "globals"
 # page); a NEW shim must be added to a group or the generator fails
 # loudly below, so the reference can't silently omit surface.
 GROUPS = [
-    ("Model & state", ["kv", "blob", "segments"]),
-    ("Connection & wakes", ["after", "next", "stream"]),
-    ("Durable effects", ["webhook", "email", "retry", "scheduler",
-                         "schedule", "cron"]),
-    ("Browser agent", ["browser"]),
-    ("Utilities", ["crypto", "jwt", "base64", "textcodec", "urlsearchparams",
-                   "console"]),
-    ("Identity & federation", ["users", "sessions", "oauth", "oidc",
-                               "activitypub"]),
-    ("Admin (the __admin__ tenant only)", ["platform"]),
+    ("Model & state",
+     "Durable, replicated tenant state. `kv` is the Model; `blob` is "
+     "content-addressed object storage (one-shot `put`/`get`, or the "
+     "`receive` → `write` → `seal` upload session for large inbound "
+     "bodies); `segments` is the append-log recipe on top of both — a "
+     "hot kv tail whose history is sealed into blobs.",
+     ["kv", "blob", "segments"]),
+    ("Connection & wakes",
+     "The held socket. `stream` pushes response bytes out over time; "
+     "`after.*` arms one-shot wakes; `next()` keeps the connection "
+     "held between activations. All ephemeral — they die with the "
+     "caller.",
+     ["after", "next", "stream"]),
+    ("Durable effects",
+     "Connectionless work that survives anything: outbound delivery "
+     "(`webhook`, `email`, `retry`) and future activations "
+     "(`scheduler`, `schedule`/`cron`).",
+     ["webhook", "email", "retry", "scheduler", "schedule", "cron"]),
+    ("Browser agent", None, ["browser"]),
+    ("Utilities", None,
+     ["crypto", "jwt", "base64", "textcodec", "urlsearchparams",
+      "console"]),
+    ("Identity & federation", None,
+     ["users", "sessions", "oauth", "oidc", "activitypub"]),
+    ("Admin (the __admin__ tenant only)", None, ["platform"]),
 ]
 SKIPPED = {"request", "http"}  # documented by the Handlers page / contract
 
@@ -210,7 +225,7 @@ def render(all_groups) -> str:
     )]
     # Jump index — one row per system.
     out.append("<table>")
-    for heading, sections in all_groups:
+    for heading, _gdesc, sections in all_groups:
         links = " · ".join(
             f'<a href="#{anchor(sec["name"])}"><code>{esc(sec["name"])}</code></a>'
             for sec in sections
@@ -218,8 +233,10 @@ def render(all_groups) -> str:
         out.append(f"<tr><td>{esc(heading)}</td><td>{links}</td></tr>")
     out.append("</table>")
 
-    for heading, sections in all_groups:
+    for heading, gdesc, sections in all_groups:
         out.append(f"<h2>{esc(heading)}</h2>")
+        if gdesc:
+            out.append(render_prose([gdesc]))
         for sec in sections:
             out.append(f'<h3 id="{anchor(sec["name"])}"><code>{esc(sec["name"])}</code></h3>')
             out.append(render_prose(sec["desc"]))
@@ -260,7 +277,7 @@ def main() -> int:
     args = ap.parse_args()
 
     grouped = set(SKIPPED)
-    for _h, stems in GROUPS:
+    for _h, _d, stems in GROUPS:
         grouped.update(stems)
     on_disk = {p.stem for p in GLOBALS.glob("*.js")}
     missing = sorted(on_disk - grouped)
@@ -270,7 +287,7 @@ def main() -> int:
                  f"add them to GROUPS in {__file__}")
 
     all_groups = []
-    for heading, stems in GROUPS:
+    for heading, gdesc, stems in GROUPS:
         sections = []
         for stem in stems:
             for sec in parse_shim(stem):
@@ -284,9 +301,9 @@ def main() -> int:
                     prior["example"] = prior["example"] or sec["example"]
                 else:
                     sections.append(sec)
-        all_groups.append((heading, sections))
+        all_groups.append((heading, gdesc, sections))
 
-    n_members = sum(len(s["members"]) for _h, ss in all_groups for s in ss)
+    n_members = sum(len(s["members"]) for _h, _d, ss in all_groups for s in ss)
     if n_members < 40:
         sys.exit(f"gen_docs_reference: only {n_members} members extracted — "
                  f"parser regression?")
@@ -300,7 +317,7 @@ def main() -> int:
         return 0
     dest.write_text(page)
     print(f"gen_docs_reference: wrote {dest} "
-          f"({sum(len(ss) for _h, ss in all_groups)} sections, {n_members} members)")
+          f"({sum(len(ss) for _h, _d, ss in all_groups)} sections, {n_members} members)")
     return 0
 
 
