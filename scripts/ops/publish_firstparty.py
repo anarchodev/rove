@@ -106,12 +106,14 @@ def publish_tenant(t: dict, defaults: dict, ops_bin: str, env_path: str | None,
     gen = t.get("generate")
     if gen:
         rove_root = str(pathlib.Path(__file__).resolve().parents[2])
-        argv = [a.replace("$ROVE_REPO", rove_root) for a in gen]
-        print(f"    $ {' '.join(argv)}   (generate)")
-        if not dry_run:
-            r = subprocess.run(argv, cwd=WEB)
-            if r.returncode != 0:
-                sys.exit(f"tenant {tenant}: generate hook failed (exit {r.returncode})")
+        cmds = gen if gen and isinstance(gen[0], list) else [gen]
+        for cmd in cmds:
+            argv = [a.replace("$ROVE_REPO", rove_root) for a in cmd]
+            print(f"    $ {' '.join(argv)}   (generate)")
+            if not dry_run:
+                r = subprocess.run(argv, cwd=WEB)
+                if r.returncode != 0:
+                    sys.exit(f"tenant {tenant}: generate hook failed (exit {r.returncode})")
 
     hosts = t.get("hosts") or []
     cluster = t.get("cluster") or defaults.get("cluster", "prod")
