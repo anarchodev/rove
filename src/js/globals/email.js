@@ -26,9 +26,9 @@ globalThis.email = {
    * @param {string|string[]} [opts.cc] - CC recipient(s).
    * @param {string|string[]} [opts.bcc] - BCC recipient(s).
    * @param {string} [opts.on] - Result handler module in this tenant
-   *   (forwarded to `webhook.send`; `on_result` = dual-name-window alias).
+   *   (forwarded to `webhook.send`).
    * @param {*} [opts.ctx] - Echoed back as `request.ctx` on the result
-   *   event (`context` = window alias).
+   *   event.
    * @param {number} [opts.max_attempts] - Override the built-in
    *   webhook.send retry budget (default 5).
    * @param {number} [opts.timeout_ms] - Per-attempt timeout.
@@ -77,13 +77,9 @@ globalThis.email = {
       },
       body: JSON.stringify(body),
     };
-    // Canonical `on`/`ctx` keys; `on_result`/`context` are the
-    // dual-name-window aliases (handler-api-ergonomics-plan §2.3).
     // NOTE: email's `to` is the RECIPIENT — the callback key is `on`.
-    const on_key = opts.on || opts.on_result;
-    if (on_key) env.on = on_key;
-    const ctx_val = opts.ctx !== undefined ? opts.ctx : opts.context;
-    if (ctx_val !== undefined) env.ctx = ctx_val;
+    if (opts.on) env.on = opts.on;
+    if (opts.ctx !== undefined) env.ctx = opts.ctx;
     if (opts.max_attempts) env.max_attempts = opts.max_attempts;
     if (opts.timeout_ms != null) env.timeout_ms = opts.timeout_ms;
     return webhook.send(env.url, env);

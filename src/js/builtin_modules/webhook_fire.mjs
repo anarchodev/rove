@@ -39,7 +39,7 @@ export default function () {
     const a = request.activation;
     if (a.kind !== "durable_wake") return { status: 200 };
 
-    const msg = a.msg || {};
+    const msg = request.ctx || {};
     const id = msg.id;
     if (typeof id !== "string" || id.length === 0) return { status: 200 };
 

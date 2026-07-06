@@ -47,14 +47,13 @@ from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, rpc_wrap  # noqa: E402
 HELDSYNC_SRC = r"""export default function () {
     const req = JSON.parse(request.body);
     const opts = {
-        url: req.target,
         method: "POST",
         body: JSON.stringify({ from: "heldsync", tag: req.tag }),
         headers: { "content-type": "application/json" },
         max_attempts: 1,
     };
     if (req.send_timeout_ms) opts.timeout_ms = req.send_timeout_ms;
-    webhook.send(opts);
+    webhook.send(req.target, opts);
     return __rove_next("heldsync/onresult", {
         fn: "onResult",
         ctx: { tag: req.tag, tries: 0, retry_to: req.retry_to || null },

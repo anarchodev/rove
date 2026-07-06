@@ -963,7 +963,7 @@ test "dispatch: webhook.send writes _send/owed/{id} marker (immediate fire path)
     defer d.deinit();
 
     var resp = try runOne(&d, kv,
-        \\const id = webhook.send({ url: "https://api.stripe.com/v1/charges", body: "x" });
+        \\const id = webhook.send("https://api.stripe.com/v1/charges", { body: "x" });
         \\return id;
     , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 7 } });
     defer resp.deinit(testing.allocator);
@@ -1026,8 +1026,8 @@ test "dispatch: webhook.send with handle derives a stable id; same handle overwr
 
     // Same handle → same id → last-write-wins on `_send/owed/{id}`.
     var resp = try runOne(&d, kv,
-        \\const id1 = webhook.send({ handle: "reminder-foo", url: "https://x/" });
-        \\const id2 = webhook.send({ handle: "reminder-foo", url: "https://y/", fire_at_ns: BigInt(Date.now() + 86400000) * 1000000n });
+        \\const id1 = webhook.send("https://x/", { handle: "reminder-foo" });
+        \\const id2 = webhook.send("https://y/", { handle: "reminder-foo", fire_at_ns: BigInt(Date.now() + 86400000) * 1000000n });
         \\return id1 + "|" + id2;
     , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
@@ -1059,9 +1059,9 @@ test "dispatch: retry.send wraps webhook.send + carries _retry meta" {
         \\return retry.send({
         \\  url: "https://api.stripe.com/v1/charges",
         \\  body: "x",
-        \\  on_result_module: "stripe_done",
+        \\  on: "stripe_done",
         \\  max_attempts: 3,
-        \\  context: { charge_id: 42 },
+        \\  ctx: { charge_id: 42 },
         \\});
     , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 7 } });
     defer resp.deinit(testing.allocator);
@@ -1335,7 +1335,7 @@ test "dispatch: webhook.send rejects a non-string body (C3)" {
         kv,
         \\let threw = null;
         \\try {
-        \\  webhook.send({ url: "https://x.test/hook", body: new Uint8Array([1, 2]) });
+        \\  webhook.send("https://x.test/hook", { body: new Uint8Array([1, 2]) });
         \\} catch (e) { threw = e; }
         \\return threw instanceof TypeError ? "threw" : "no-throw";
     ,
@@ -1548,7 +1548,7 @@ test "dispatch: ws_message frame payload on request.bytes/.text (§2.2)" {
 
 // ── handler-api-ergonomics-plan Phase 3 — the grammar sweep ──────────
 
-test "dispatch: after.fetch returns a ftch_-prefixed id; on.fetch alias matches (§2.3/§2.4)" {
+test "dispatch: after.fetch returns a ftch_-prefixed id (§2.3/§2.4)" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1562,10 +1562,8 @@ test "dispatch: after.fetch returns a ftch_-prefixed id; on.fetch alias matches 
         kv,
         \\const id = after.fetch("http://up.test/", {}, { on: "onR" });
         \\if (typeof id !== "string" || !id.startsWith("ftch_")) return "new-bad:" + id;
-        \\const id2 = on.fetch("http://up.test/", {}, { to: "onR" });   // window alias
-        \\if (typeof id2 !== "string" || !id2.startsWith("ftch_")) return "alias-bad:" + id2;
         \\if (typeof after.ms !== "function" || typeof after.kv !== "function") return "no-after";
-        \\if (typeof on.timer !== "function" || typeof on.kv !== "function") return "no-on-alias";
+        \\if (typeof globalThis.on !== "undefined") return "on-alias-still-installed";
         \\return "ok";
     ,
         .{ .method = "GET", .path = "/" },
@@ -1603,7 +1601,7 @@ test "dispatch: webhook.send(url, {on, ctx}) canonical form writes the marker (�
     try testing.expect(std.mem.indexOf(u8, marker, "\"url\":\"https://t.example/hook\"") != null);
 }
 
-test "dispatch: scheduler.in schedules; scheduler.after stays as the window alias (§2.3)" {
+test "dispatch: scheduler.in schedules; the scheduler.after alias is gone (§2.3)" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1616,18 +1614,18 @@ test "dispatch: scheduler.in schedules; scheduler.after stays as the window alia
         &d,
         kv,
         \\const a = scheduler.in(5000, "jobs/x", { p: 1 });
-        \\const b = scheduler.after(5000, "jobs/y", { p: 2 });
-        \\if (typeof a !== "string" || typeof b !== "string") return "bad";
-        \\return "ok:" + (kv.get("_sched/by_id/" + a) !== null) + ":" + (kv.get("_sched/by_id/" + b) !== null);
+        \\if (typeof a !== "string") return "bad";
+        \\if (typeof scheduler.after !== "undefined") return "after-alias-still-installed";
+        \\return "ok:" + (kv.get("_sched/by_id/" + a) !== null);
     ,
         .{ .method = "POST", .path = "/" },
     );
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("", resp.exception);
-    try testing.expectEqualStrings("ok:true:true", resp.body);
+    try testing.expectEqualStrings("ok:true", resp.body);
 }
 
-test "dispatch: durable_wake msg reads as request.ctx (one-ctx §2.4; activation.msg = window alias)" {
+test "dispatch: durable_wake payload reads as request.ctx ONLY (one-ctx §2.4)" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1637,8 +1635,8 @@ test "dispatch: durable_wake msg reads as request.ctx (one-ctx §2.4; activation
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
     var resp = try runOne(&d, kv,
-        \\return JSON.stringify([request.ctx, request.activation.msg,
-        \\  request.activation.scheduledAtNs === request.activation.scheduled_at_ns]);
+        \\return JSON.stringify([request.ctx, typeof request.activation.msg,
+        \\  typeof request.activation.scheduledAtNs, typeof request.activation.scheduled_at_ns]);
     , .{
         .method = "POST",
         .path = "/_wake",
@@ -1647,7 +1645,7 @@ test "dispatch: durable_wake msg reads as request.ctx (one-ctx §2.4; activation
     });
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("", resp.exception);
-    try testing.expectEqualStrings("[{\"a\":2},{\"a\":2},true]", resp.body);
+    try testing.expectEqualStrings("[{\"a\":2},\"undefined\",\"number\",\"undefined\"]", resp.body);
 }
 
 test "dispatch: kv.set rejects platform-reserved prefixes" {
@@ -3843,14 +3841,12 @@ test "dispatch: webhook.send (JS shim) writes _send/owed/{id} markers" {
     var resp = try runOne(
         &d,
         kv,
-        \\const id1 = webhook.send({
-        \\  url: "https://example.test/a",
+        \\const id1 = webhook.send("https://example.test/a", {
         \\  body: "one",
-        \\  on_result: "cb/a",
-        \\  context: { x: 1 },
+        \\  on: "cb/a",
+        \\  ctx: { x: 1 },
         \\});
-        \\const id2 = webhook.send({
-        \\  url: "https://example.test/b",
+        \\const id2 = webhook.send("https://example.test/b", {
         \\  method: "GET",
         \\});
         \\return id1 + "|" + id2;
@@ -3898,7 +3894,7 @@ test "dispatch: webhook.send rejects missing url" {
         &d,
         kv,
         \\try {
-        \\  webhook.send({ method: "POST" });
+        \\  webhook.send();
         \\  return "ok";
         \\} catch (e) {
         \\  return "threw:" + e.message;
@@ -3931,8 +3927,8 @@ test "dispatch: email.send wraps webhook.send (JS shim) with Resend shape" {
         \\  to: "user@example.com",
         \\  subject: "Verify",
         \\  text: "Click me.",
-        \\  on_result: "signup/email_result",
-        \\  context: { user_id: 42 },
+        \\  on: "signup/email_result",
+        \\  ctx: { user_id: 42 },
         \\});
     ,
         .{ .method = "POST", .path = "/", .trace = .{ .request_id = 7 } },

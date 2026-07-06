@@ -26,9 +26,11 @@
 > no exceptions); fetch ids are `ftch_…` on all three surfaces. The
 > pre-rename spellings (`on.*`, `{to}`, `{on_result}`/`{context}`,
 > `webhook.send({url})`, `scheduler.after`, `request.activation.msg`,
-> snake_case field aliases, `request.body`) remain live for ONE deploy
-> cycle only (the dual-name window — close checklist in the plan doc);
-> this document describes the canonical surface.
+> snake_case field aliases) lived for one deploy cycle and are **GONE**
+> (window closed 2026-07-06). The one survivor is `request.body` — the
+> legacy text/bytes payload view — which outlives the window only until
+> the replay driver grows `bytes`/`text`/`json` parity (plan doc, open
+> question 4); new code reads the accessors.
 >
 > **Revised 2026-06-02 (rev 2 — `stream.*` model).** Organized around one
 > axis — **scope: current-connection vs connectionless** — derived in
@@ -686,8 +688,8 @@ rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
   activation (wakes, `cron`/`schedule` targets, `onDisconnect`) all
   three read `undefined`. `request.body` is the legacy spelling of
   the text-or-bytes view (its type varied by activation kind) —
-  **deprecated; it is removed with the dual-name window** — new code
-  reads `bytes`/`text`/`json`.
+  **deprecated; it is removed once the replay driver has accessor
+  parity** — new code reads `bytes`/`text`/`json`.
 - **`default`:** the payload views above, plus `.headers`, `.method`,
   `.path`, `.query`, `.cookies`, `.ip`, `.unmaskedIp()`.
 - **`onChunk`:** `request.bytes` = THIS chunk; `request.done`;
@@ -700,8 +702,7 @@ rides `ctx` (§2.1); disconnect-surviving state rides `kv`.
   `request.ctx` is `undefined` on the **first** activation of a chain
   (nothing threaded yet). A `cron`/`schedule` target reads the payload
   it was scheduled with as `request.ctx` too — the one-ctx rule has no
-  exceptions (`request.activation.msg` is the deprecated dual-name-
-  window alias). `after.kv`/`after.ms` are edge
+  exceptions. `after.kv`/`after.ms` are edge
   ("go look") wakes — they carry **no** matched key/value; `onWake`
   re-reads authoritative `kv`, and which keys fired is on
   `request.activation.wakes[]` if you need it.
@@ -859,8 +860,8 @@ change (Hyrum's law). See `format-versioning-audit.md` §7.1/§7.3/§7.6.
 
 ## 10. What's gone (vs prior streaming revisions)
 
-Ergonomics arc (2026-07-04/05; old spellings live for ONE deploy cycle —
-the dual-name window):
+Ergonomics arc (2026-07-04/05; the old spellings lived for one deploy
+cycle — the dual-name window, closed 2026-07-06):
 
 - `on.*` → `after.*`; `on.timer(ms)` → `after.ms(ms)`
 - `{to}` / `{on_result}` / positional-only targets → the universal
@@ -877,7 +878,8 @@ the dual-name window):
 - snake_case handler-visible fields → camelCase (`bodyTruncated`,
   `scheduledAtNs`, `activation.fetchId`)
 - per-surface `request.body` types → uniform `request.bytes`/`.text`/
-  `.json`; `request.body` deprecated (removed with the window)
+  `.json`; `request.body` deprecated (removed once the replay driver
+  has accessor parity)
 - `kind=boot` subscriptions + `onBoot` → retired outright (unused):
   seed registrations from any handler activation — idempotent by key,
   `_sched/*` entries are durable kv that survive deploys

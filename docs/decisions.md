@@ -688,11 +688,13 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
   `String()` mangle removed); `stream.write` takes string|Uint8Array
   only; `webhook.send` body is string-only (the durable marker is
   JSON); a provided-but-unserializable `next({ctx})` throws.
-- **Rollout**: a ONE-DEPLOY-CYCLE dual-name window (old spellings are
-  thin aliases) so deployed rewind-apps bundles survive; the close
-  checklist lives in the plan doc. `request.body` retirement
-  additionally waits on replay-driver accessor parity (the arenajs
-  shell synthesizes `request`).
+- **Rollout**: a ONE-DEPLOY-CYCLE dual-name window (old spellings were
+  thin aliases) so deployed rewind-apps bundles survived the platform
+  roll; opened with the 2026-07-06 deploy, **closed the same day**
+  after the rewind-apps publish (`kv.set` of the aliases deleted,
+  internal readers migrated). `request.body` retirement additionally
+  waits on replay-driver accessor parity (the arenajs shell
+  synthesizes `request`).
 - **Retired outright alongside**: `kind=boot` subscriptions + `onBoot`
   (2026-07-05, unused — audited zero rewind-apps consumers). Seeding
   recipe: register `cron`/`scheduler.in` from any handler activation —

@@ -94,8 +94,7 @@ globalThis.segments = {
    * @param {number} seq - Sequence number.
    * @param {object} [opts]
    * @param {string} [opts.on] - Export resumed with the segment for
-   *   a sealed read. Required when the record may be sealed (`to` =
-   *   dual-name-window alias).
+   *   a sealed read. Required when the record may be sealed.
    * @returns {string|null|undefined} The value (hot), `null` (no
    *   such record), or `undefined` (sealed — the fetch is in flight,
    *   return `next()` and finish in `opts.to`).
@@ -115,9 +114,7 @@ globalThis.segments = {
   get(stream, seq, opts) {
     assertStream(stream, "segments.get");
     opts = opts || {};
-    // Canonical `on`; `to` is the dual-name-window alias
-    // (handler-api-ergonomics-plan §2.3).
-    const on_key = typeof opts.on === "string" ? opts.on : opts.to;
+    const on_key = typeof opts.on === "string" ? opts.on : undefined;
     if (!Number.isInteger(seq) || seq < 0)
       throw new TypeError("segments.get: seq must be a non-negative integer");
     const hot = kv.get(HOT(stream) + pad(seq));
@@ -206,8 +203,8 @@ globalThis.segments = {
     });
     blob.put(payload, {
       content_type: "application/json",
-      on_result: "__system/segments_onsealed",
-      context: {
+      on: "__system/segments_onsealed",
+      ctx: {
         stream: stream,
         first_seq: first_seq,
         last_seq: last_seq,

@@ -11,7 +11,7 @@ export default function () {
         return { status: 500, body: "unexpected activation " + a.kind };
     }
     if (a.final) {
-        kv.set("sub/done/" + a.fetch_id, JSON.stringify({
+        kv.set("sub/done/" + a.fetchId, JSON.stringify({
             ok: a.ok,
             status: a.status,
             body_truncated: a.body_truncated,
@@ -21,7 +21,7 @@ export default function () {
     const bytes = a.bytes;
     let text = "";
     for (let i = 0; i < bytes.length; i++) text += String.fromCharCode(bytes[i]);
-    kv.set("sub/chunk/" + a.fetch_id + "/" + a.seq, JSON.stringify({
+    kv.set("sub/chunk/" + a.fetchId + "/" + a.seq, JSON.stringify({
         seq: a.seq,
         text: text,
         len: bytes.length,

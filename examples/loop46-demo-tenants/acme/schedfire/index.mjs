@@ -21,6 +21,6 @@ export default function () {
     const big = parseInt(params.big || "0", 10);
     const tag = big > 0 ? "x".repeat(big) : (params.tag || "smoke");
     const opts = params.key ? { key: params.key } : undefined;
-    const id = scheduler.after(delay, "schedtarget", { tag }, opts);
+    const id = scheduler.in(delay, "schedtarget", { tag }, opts);
     return { id };
 }

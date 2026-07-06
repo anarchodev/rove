@@ -47,7 +47,7 @@ export function onHeaders() {
   if (!authFor(tenant)) return ""; // status already stamped (401/403)
   // Stream the body → target's file-blobs; onStored records the entry.
   platform.scope(tenant).blob.receive({
-    to: "onStored",
+    on: "onStored",
     ctx: { tenant: tenant, path: path, content_type: ct },
   });
   return next();

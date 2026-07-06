@@ -214,8 +214,7 @@
      */
     getReplay(request, opts) {
       opts = opts || {};
-      // Canonical `on`; `to` is the dual-name-window alias.
-      const on_key = typeof opts.on === "string" ? opts.on : opts.to;
+      const on_key = typeof opts.on === "string" ? opts.on : undefined;
       const tenant = request && request.tenant;
       if (!tenant || !on_key) return false;
       const limit = opts.limit || 50;

@@ -1,19 +1,18 @@
 // §6.4 held-synchronous third-party call — resume hop.
 //
 // Invoked by the resume engine when the bound webhook.send completes
-// (or the §6.4 deadline fires), RPC-style: `onResult(ctx, outcome)`.
-// `ctx` is what the open hop passed to __rove_next; `outcome` is the
-// call event built by the JS-shim `__system/webhook_onresult` module:
-// {id, ok, status, body, headers, body_truncated, attempts, error,
-//  context} on completion, or {ok:false, reason:"deadline"} when the
-// mandatory timeout fired.
+// (or the §6.4 deadline fires), on the Endpoint-A flattened surface
+// (handler-shape §7): the threaded ctx on `request.ctx`, the outcome
+// on `request.ok`/`.status`/`.text` (+ `request.activation.error` /
+// `.reason` metadata).
 //
 // Returning a value is TERMINAL — flushed to the still-open client
 // socket, completing the one synchronous request. Returning another
 // __rove_next RE-PARKS (recipe-1: customer-composed retry, exercised
 // via `ctx.retry_to`).
-export function onResult(ctx, outcome) {
-    if (!outcome.ok) {
+export function onResult() {
+    const ctx = request.ctx || {};
+    if (!request.ok) {
         // Recipe-1: compose a retry yourself. One re-issue to a
         // known-good target, then re-park (allow_repark=true).
         if (ctx.retry_to && ctx.tries < 1) {
@@ -29,7 +28,7 @@ export function onResult(ctx, outcome) {
             });
         }
         response.status = 502;
-        return "heldsync upstream failed: " + (outcome.error || outcome.reason || outcome.status);
+        return "heldsync upstream failed: " + (request.activation.error || request.activation.reason || request.status);
     }
-    return "heldsync:" + ctx.tag + ":" + outcome.body;
+    return "heldsync:" + ctx.tag + ":" + request.text;
 }

@@ -203,7 +203,7 @@ pub fn jsBlobSeal(
         return js_exception;
     };
     if (argc < 1 or !c.JS_IsString(argv[0])) {
-        _ = c.JS_ThrowTypeError(ctx, "blob.seal requires a `to` export name");
+        _ = c.JS_ThrowTypeError(ctx, "blob.seal requires an `on` export name");
         return js_exception;
     }
 
@@ -372,7 +372,7 @@ pub fn jsBlobReceive(
         return js_exception;
     };
     if (argc < 1 or !c.JS_IsString(argv[0])) {
-        _ = c.JS_ThrowTypeError(ctx, "blob.receive requires a `to` export name");
+        _ = c.JS_ThrowTypeError(ctx, "blob.receive requires an `on` export name");
         return js_exception;
     }
 

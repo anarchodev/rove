@@ -69,7 +69,7 @@ globalThis.blob = {
    *   `context` (the threaded value) IS `request.ctx`, and the stored
    *   `hash` is on `request.activation.hash`.
    * @param {*} [opts.ctx] - Opaque payload echoed to the `on` module
-   *   as `request.ctx` (`on_result`/`context` = dual-name-window aliases).
+   *   as `request.ctx`.
    * @returns {string} The object's sha256 hash (64 hex chars).
    *
    * @example
@@ -81,12 +81,8 @@ globalThis.blob = {
     if (typeof bytes !== "string" && !(bytes instanceof Uint8Array))
       throw new TypeError("blob.put: bytes must be a string or Uint8Array");
     const hash = crypto.sha256(bytes);
-    // Canonical `on`/`ctx`; `on_result`/`context` are the dual-name-
-    // window aliases (handler-api-ergonomics-plan §2.3).
-    const on_result = typeof opts.on === "string" ? opts.on
-      : (typeof opts.on_result === "string" ? opts.on_result : null);
-    const context = opts.ctx !== undefined ? opts.ctx
-      : (opts.context !== undefined ? opts.context : null);
+    const on_result = typeof opts.on === "string" ? opts.on : null;
+    const context = opts.ctx !== undefined ? opts.ctx : null;
 
     const marker = {
       hash: hash,
@@ -118,8 +114,7 @@ globalThis.blob = {
    *
    * @param {string} hash - The object's sha256 hash.
    * @param {object} [opts]
-   * @param {string} [opts.on] - Export name to resume in (`to` =
-   *   dual-name-window alias).
+   * @param {string} [opts.on] - Export name to resume in.
    * @param {*} [opts.ctx] - Delivered as `request.ctx` on the
    *   resume (JSON round-trip).
    * @param {boolean} [opts.stream] - Per-chunk delivery (default
@@ -152,8 +147,7 @@ globalThis.blob = {
     // composers (segments.get) thread slicing info to the `to`
     // export without kv round-trips.
     if (opts.ctx !== undefined) fetch_opts.ctx = opts.ctx;
-    // Canonical `on`; `to` is the dual-name-window alias.
-    const get_on = typeof opts.on === "string" ? opts.on : opts.to;
+    const get_on = typeof opts.on === "string" ? opts.on : undefined;
     return after.fetch(BLOB_ORIGIN + hash, fetch_opts,
                        get_on ? { on: get_on } : undefined);
   },
@@ -231,7 +225,7 @@ globalThis.blob = {
    *
    * @param {object} opts
    * @param {string} opts.on - Export resumed with the PUT result
-   *   (required; `to` = dual-name-window alias).
+   *   (required).
    * @param {string} [opts.content_type] - Stored Content-Type.
    * @returns {string} The object's sha256 hash (64 hex chars).
    *
@@ -248,7 +242,7 @@ globalThis.blob = {
    */
   seal(opts) {
     opts = opts || {};
-    const on_key = typeof opts.on === "string" ? opts.on : opts.to; // `to` = window alias
+    const on_key = opts.on;
     if (typeof on_key !== "string" || !on_key.length)
       throw new TypeError("blob.seal: `on` export name is required");
     return sysBlob.seal(on_key,
@@ -279,7 +273,7 @@ globalThis.blob = {
    *
    * @param {object} opts
    * @param {string} opts.on - Export resumed with `{hash, len}`
-   *   when the object is durable (required; `to` = window alias).
+   *   when the object is durable (required).
    *
    * @example
    * export function onHeaders() {
@@ -295,7 +289,7 @@ globalThis.blob = {
    */
   receive(opts) {
     opts = opts || {};
-    const on_key = typeof opts.on === "string" ? opts.on : opts.to; // `to` = window alias
+    const on_key = opts.on;
     if (typeof on_key !== "string" || !on_key.length)
       throw new TypeError("blob.receive: `on` export name is required");
     return sysBlob.receive(on_key);

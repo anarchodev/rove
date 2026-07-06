@@ -209,16 +209,6 @@ globalThis.scheduler = {
   },
 
   /**
-   * Dual-name-window alias of {@link scheduler.in} (one deploy cycle;
-   * delete with the window). Renamed so "after" is exclusively the
-   * connection-scoped `after.*` namespace — the verb is the scope
-   * (handler-api-ergonomics-plan §2.3).
-   */
-  after(delayMs, target, msg, opts) {
-    return this.in(delayMs, target, msg, opts);
-  },
-
-  /**
    * Cancel a scheduled wake by id. Removes both the `_sched/by_id` and
    * `_sched/by_time` entries. Idempotent: cancelling an unknown /
    * already-fired id returns `false`.

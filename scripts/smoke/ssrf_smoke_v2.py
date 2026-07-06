@@ -39,8 +39,7 @@ from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, rpc_wrap  # noqa: E402
 
 HELDSYNC_SRC = r"""export default function () {
     const req = JSON.parse(request.body);
-    webhook.send({
-        url: req.target,
+    webhook.send(req.target, {
         method: "POST",
         body: JSON.stringify({ from: "ssrf-smoke", tag: req.tag }),
         headers: { "content-type": "application/json" },
@@ -54,12 +53,16 @@ HELDSYNC_SRC = r"""export default function () {
 }
 """
 
-ONRESULT_SRC = r"""export function onResult(ctx, outcome) {
-    if (!outcome.ok) {
+ONRESULT_SRC = r"""export function onResult() {
+    // Endpoint A flattened surface: threaded ctx on request.ctx, the
+    // send outcome on request.ok/.text/.status, delivery metadata on
+    // request.activation.*.
+    const ctx = request.ctx || {};
+    if (!request.ok) {
         response.status = 502;
-        return "blocked:" + ctx.tag + ":" + (outcome.error || outcome.reason || outcome.status);
+        return "blocked:" + ctx.tag + ":" + (request.activation.error || request.status);
     }
-    return "passed:" + ctx.tag + ":" + outcome.body;
+    return "passed:" + ctx.tag + ":" + request.text;
 }
 """
 

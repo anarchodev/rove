@@ -50,13 +50,12 @@ from smoke_lib_v2 import V2Cluster, PUBLIC_SUFFIX, rpc_wrap  # noqa: E402
 CBFIRE_SRC = r'''export function fireDelayed(url, tag, delay_ms) {
     const now_ms = Date.now();
     const fire_at_ns = BigInt(now_ms) * 1_000_000n + BigInt(delay_ms) * 1_000_000n;
-    const id = webhook.send({
-        url: url,
+    const id = webhook.send(url, {
         method: "POST",
         body: "ping",
         headers: { "content-type": "text/plain" },
-        on_result: "cbresult",
-        context: { tag: tag },
+        on: "cbresult",
+        ctx: { tag: tag },
         fire_at_ns: fire_at_ns,
         max_attempts: 5,
     });

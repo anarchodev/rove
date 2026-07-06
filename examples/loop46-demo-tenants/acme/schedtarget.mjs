@@ -7,8 +7,8 @@
 // Records each fire to kv so the smoke can observe it via /readkey:
 //   sched-fire-count            total fires (string int)
 //   sched-last-id               id of the most recent fire
-//   sched-last-msg              JSON of the most recent activation.msg
-//   sched-last-scheduled-at-ns  scheduled_at_ns of the most recent fire
+//   sched-last-msg              JSON of the most recent request.ctx payload
+//   sched-last-scheduled-at-ns  scheduledAtNs of the most recent fire
 //   sched-fires/{id}            per-id fire count (idempotency observation)
 export default function () {
     const a = request.activation;
@@ -18,15 +18,16 @@ export default function () {
     const n = parseInt(kv.get("sched-fire-count") || "0", 10) + 1;
     kv.set("sched-fire-count", String(n));
     kv.set("sched-last-id", a.id);
-    kv.set("sched-last-msg", JSON.stringify(a.msg));
-    kv.set("sched-last-scheduled-at-ns", String(a.scheduled_at_ns));
+    kv.set("sched-last-msg", JSON.stringify(request.ctx));
+    kv.set("sched-last-scheduled-at-ns", String(a.scheduledAtNs));
 
     const perId = "sched-fires/" + a.id;
     const m = parseInt(kv.get(perId) || "0", 10) + 1;
     kv.set(perId, String(m));
 
     // Per-tag counter so a smoke can tell schedule vs cron fires apart.
-    const tag = (a.msg && typeof a.msg.tag === "string") ? a.msg.tag : "";
+    const c = request.ctx;
+    const tag = (c && typeof c.tag === "string") ? c.tag : "";
     if (tag) {
         const tk = "sched-tag/" + tag;
         kv.set(tk, String(parseInt(kv.get(tk) || "0", 10) + 1));

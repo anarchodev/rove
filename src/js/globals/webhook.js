@@ -124,14 +124,12 @@ globalThis.webhook = {
    * @param {string} [opts.on] - Module path of a customer result
    *   handler. Receives the terminal event on the unified flattened
    *   surface (handler-shape §7): the response on `request.bytes` /
-   *   `.text` / `.json` (and `request.body` / `.status` / `.ok` /
-   *   `.body_truncated`); the threaded `ctx` value bare on
-   *   `request.ctx`; delivery metadata (`attempts`, `error?`, `id`,
-   *   `headers`) on `request.activation.*`. There is no
-   *   `request.result`. (`on_result` is the dual-name-window alias.)
+   *   `.text` / `.json`, `request.status` / `.ok` / `.bodyTruncated`;
+   *   the threaded `ctx` value bare on `request.ctx`; delivery
+   *   metadata (`attempts`, `error?`, `id`, `headers`) on
+   *   `request.activation.*`. There is no `request.result`.
    * @param {*} [opts.ctx] - Opaque customer payload echoed back as
-   *   `request.ctx` on the result event. (`context` is the window
-   *   alias.)
+   *   `request.ctx` on the result event.
    * @returns {string} The marker id. Same value as the `handle` when
    *   one was supplied.
    * @throws {TypeError} If `url` is missing/wrong type.
@@ -151,30 +149,16 @@ globalThis.webhook = {
    *   fire_at_ns: BigInt(Date.now() + 300_000) * 1_000_000n,
    * });
    */
-  send(urlOrOpts, maybeOpts) {
-    // Canonical: webhook.send(url, opts) — positional url, matching
-    // after.fetch (handler-api-ergonomics-plan §2.3). The pre-rename
-    // webhook.send({url, ...}) single-object form is the dual-name-
-    // window alias; delete with the window.
-    let opts;
-    if (typeof urlOrOpts === "string") {
-      if (maybeOpts != null && typeof maybeOpts !== "object")
-        throw new TypeError("webhook.send: opts must be an object");
-      opts = Object.assign({}, maybeOpts || {}, { url: urlOrOpts });
-    } else {
-      opts = urlOrOpts;
-    }
-    if (!opts || typeof opts !== "object")
-      throw new TypeError("webhook.send requires an options object");
-    if (typeof opts.url !== "string")
-      throw new TypeError("webhook.send: `url` must be a string");
+  send(url, maybeOpts) {
+    // webhook.send(url, opts) — positional url, matching after.fetch.
+    if (typeof url !== "string")
+      throw new TypeError("webhook.send(url, opts): `url` must be a string");
+    if (maybeOpts != null && typeof maybeOpts !== "object")
+      throw new TypeError("webhook.send: opts must be an object");
+    const opts = Object.assign({}, maybeOpts || {}, { url: url });
 
-    // Canonical option keys: `on` (callback target) + `ctx` (threaded
-    // value) — `on_result`/`context` are window aliases.
-    const on_key = typeof opts.on === "string" ? opts.on
-      : (typeof opts.on_result === "string" ? opts.on_result : null);
-    const ctx_val = opts.ctx !== undefined ? opts.ctx
-      : (opts.context !== undefined ? opts.context : null);
+    const on_key = typeof opts.on === "string" ? opts.on : null;
+    const ctx_val = opts.ctx !== undefined ? opts.ctx : null;
 
     // The body must be a string: it JSON-round-trips through the
     // durable `_send/owed/{id}` marker, which would silently mangle a

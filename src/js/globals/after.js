@@ -13,21 +13,21 @@
 // callback) there is no connection, so `after.*` is inert.
 //
 // The callback-target option is `{on: "module.method"}` — the universal
-// spelling across every effect (`{to}` is the deprecated dual-name-
-// window alias; delete with the window).
+// spelling across every effect.
 //
 // Evaluated as a global script (no module/exports) after the native
-// bindings install. `globalThis.on` (the pre-rename namespace) is
-// installed as a deprecated alias below — one deploy cycle only.
+// bindings install. (The pre-rename `on.*` alias existed for one deploy
+// cycle and closed 2026-07-06.)
 
 (function () {
   const sys = _system.after;
 
-  // Normalize the target option: canonical `{on}`, window-alias `{to}`.
+  // Lower the public `{on}` key onto the native binding's field.
   function tgt(opts) {
-    if (!opts || typeof opts !== "object") return opts;
-    if (typeof opts.on === "string") return { to: opts.on };
-    return opts;
+    if (opts && typeof opts === "object" && typeof opts.on === "string") {
+      return { to: opts.on };
+    }
+    return undefined;
   }
 
   /**
@@ -111,25 +111,6 @@
      *             { on: 'onUpstream' });
      * return next();
      */
-    fetch(url, opts, dst) {
-      return sys.fetch(url, opts, tgt(dst));
-    },
-  };
-
-  /**
-   * Dual-name-window alias of {@link after} (one deploy cycle; delete
-   * with the window): `on.timer` → `after.ms`, `on.kv` → `after.kv`,
-   * `on.fetch` → `after.fetch`. Same natives, same semantics; `{to}`
-   * accepted via tgt() above.
-   * @namespace on
-   */
-  globalThis.on = {
-    timer(ms, opts) {
-      return sys.timer(ms, tgt(opts));
-    },
-    kv(prefix, opts) {
-      return sys.kv(prefix, tgt(opts));
-    },
     fetch(url, opts, dst) {
       return sys.fetch(url, opts, tgt(dst));
     },

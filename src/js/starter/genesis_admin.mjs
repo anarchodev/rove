@@ -47,7 +47,7 @@ function wsFile(b) {
   if (b.kind !== "handler")
     return jerr(400, "kind must be 'handler' (statics stream via PUT /v1/upload)");
   platform.compile([{ path: b.path, source: b.source || "" }], {
-    scope: b.tenant, name: "onFileStaged",
+    scope: b.tenant, on: "onFileStaged",
     ctx: { target: b.tenant, path: b.path, content_type: b.content_type || "" },
   });
   return next();
@@ -83,7 +83,7 @@ function wsCut(b) {
       source_hex: e.source_hex, bytecode_hex: e.bytecode_hex || "",
     };
   });
-  platform.scope(b.tenant).deploy.stampManifest(entries, { name: "onCut" });
+  platform.scope(b.tenant).deploy.stampManifest(entries, { on: "onCut" });
   return next();
 }
 

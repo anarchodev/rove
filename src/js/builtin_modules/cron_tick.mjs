@@ -14,13 +14,13 @@
 //
 // Resolved via `__system/` module resolution; compiled once at
 // NodeState init, shared across tenants. Runs as a `durable_wake`
-// activation carrying `{ spec, target, ctx }` as `request.activation.msg`
+// activation carrying `{ spec, target, ctx }` as `request.ctx`
 // and the cron's stable idempotency key as `request.activation.key`.
 export default function () {
     const a = request.activation;
     if (a.kind !== "durable_wake") return { status: 200 };
 
-    const { spec, target, ctx } = a.msg || {};
+    const { spec, target, ctx } = request.ctx || {};
     if (typeof spec !== "string" || typeof target !== "string") {
         // Malformed registration — drop it (the fired entry's cleanup
         // deletes already committed; not re-arming ends the cron).

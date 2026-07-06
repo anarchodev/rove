@@ -70,9 +70,8 @@
       // of base64-buffering through blob.put.
       s.blob.receive = function (opts) {
         opts = opts || {};
-        // Canonical `on`; `to` = dual-name-window alias.
         return sysBlobReceive(
-          typeof opts.on === "string" ? opts.on : opts.to, id,
+          typeof opts.on === "string" ? opts.on : undefined, id,
           JSON.stringify(opts.ctx !== undefined ? opts.ctx : null),
         );
       };
@@ -86,8 +85,7 @@
         return sysOn.fetch(
           "http://rove-blob-read.internal/" + id + "/blob/" + hash,
           fetch_opts,
-          // Canonical `on`; `name` = dual-name-window alias.
-          { to: opts.on || opts.name || "onFetchResult" },
+          { to: opts.on || "onFetchResult" },
         );
       };
       // deploy.stampManifest is the deploy's STAGING BARRIER — it lowers to
@@ -102,8 +100,7 @@
           return sysOn.fetch(
             "http://rove-stage.internal/",
             { method: "POST", body: JSON.stringify({ scope: id, entries }) },
-            // Canonical `on`; `name` = dual-name-window alias.
-            { to: opts.on || opts.name || "onStamped" },
+            { to: opts.on || "onStamped" },
           );
         },
         // readManifest is the READ twin of stampManifest: it reads `id`'s
@@ -119,8 +116,7 @@
           return sysOn.fetch(
             "http://rove-blob-read.internal/" + id + "/manifest/" + dep_id,
             fetch_opts,
-            // Canonical `on`; `name` = dual-name-window alias.
-            { to: opts.on || opts.name || "onFetchResult" },
+            { to: opts.on || "onFetchResult" },
           );
         },
       };
@@ -146,8 +142,7 @@
      * @param {Array<{path:string, source:string}>} files - Handler sources.
      * @param {object} opts
      * @param {string} opts.scope - Target instance id (where blobs stage).
-     * @param {string} [opts.on="onFetchResult"] - Resume export (`name` =
-     *   dual-name-window alias).
+     * @param {string} [opts.on="onFetchResult"] - Resume export.
      * @returns {string} The bound fetch id (`ftch_…`).
      *
      * @example
@@ -167,8 +162,7 @@
       return sysOn.fetch(
         "http://rove-compile.internal/",
         { method: "POST", body, ctx: opts.ctx },
-        // Canonical `on`; `name` = dual-name-window alias.
-        { to: opts.on || opts.name || "onFetchResult" },
+        { to: opts.on || "onFetchResult" },
       );
     },
 

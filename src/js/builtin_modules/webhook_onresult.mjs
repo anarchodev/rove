@@ -82,7 +82,7 @@ export default function () {
     const result_headers = (a.kind === "fetch_chunk")
         ? (a.headers || {})
         : (ctx.result_headers || {});
-    const result_truncated = (a.kind === "fetch_chunk") ? !!a.body_truncated : false;
+    const result_truncated = (a.kind === "fetch_chunk") ? !!a.bodyTruncated : false;
 
     const result = {
         id: id,

@@ -2597,8 +2597,6 @@ pub fn installRequest(
             @memcpy(fid_buf[log_mod.FETCH_ID_PREFIX.len..][0..fid.len], fid);
             const fid_str = fid_buf[0 .. log_mod.FETCH_ID_PREFIX.len + fid.len];
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "fetchId", c.JS_NewStringLen(ctx, fid_str.ptr, fid_str.len));
-            // Dual-name window: snake_case alias (delete with the window).
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "fetch_id", c.JS_NewStringLen(ctx, fid_str.ptr, fid_str.len));
         }
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "seq", c.JS_NewInt64(ctx, @intCast(fc.seq)));
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "byteOffset", c.JS_NewInt64(ctx, @intCast(fc.byte_offset)));
@@ -2648,8 +2646,6 @@ pub fn installRequest(
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "status", c.JS_NewInt64(ctx, @intCast(fc.terminal_status)));
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "ok", if (fc.terminal_ok) js_true else js_false);
             _ = c.JS_SetPropertyStr(ctx, activation_obj, "bodyTruncated", if (fc.body_truncated) js_true else js_false);
-            // Dual-name window alias.
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "body_truncated", if (fc.body_truncated) js_true else js_false);
         }
         // `docs/handler-shape.md` §3 + §7: the customer's
         // onFetchChunk handler (BOUND fetch path — bind:true) reads
@@ -2736,8 +2732,6 @@ pub fn installRequest(
                 _ = c.JS_SetPropertyStr(ctx, req_obj, "ok", if (fc.terminal_ok) js_true else js_false);
                 _ = c.JS_SetPropertyStr(ctx, req_obj, "status", c.JS_NewInt64(ctx, @intCast(fc.terminal_status)));
                 _ = c.JS_SetPropertyStr(ctx, req_obj, "bodyTruncated", if (fc.body_truncated) js_true else js_false);
-                // Dual-name window alias.
-                _ = c.JS_SetPropertyStr(ctx, req_obj, "body_truncated", if (fc.body_truncated) js_true else js_false);
             }
         }
     }
@@ -2851,28 +2845,20 @@ pub fn installRequest(
         // the year 2262 (Date.now()*1e6); surface as a plain number
         // for ergonomic `scheduled_at_ns` math.
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "scheduledAtNs", c.JS_NewInt64(ctx, dw.scheduled_at_ns));
-        // Dual-name window alias.
-        _ = c.JS_SetPropertyStr(ctx, activation_obj, "scheduled_at_ns", c.JS_NewInt64(ctx, dw.scheduled_at_ns));
         const mjson = dw.msg_json orelse "null";
         if (state.allocator.allocSentinel(u8, mjson.len, 0)) |buf| {
             defer state.allocator.free(buf);
             @memcpy(buf, mjson);
             const msg_val = c.JS_ParseJSON(ctx, buf.ptr, mjson.len, "<durable_wake msg>");
             if (c.JS_IsException(msg_val)) {
-                _ = c.JS_GetException(ctx); // clear; fall through with null
-                _ = c.JS_SetPropertyStr(ctx, activation_obj, "msg", js_null);
+                _ = c.JS_GetException(ctx); // clear; leave request.ctx unset
             } else {
                 // One-ctx rule (handler-api-ergonomics-plan §2.4): the
                 // schedule/cron target reads its threaded payload as
-                // `request.ctx` like every other callback;
-                // `request.activation.msg` is the dual-name-window
-                // alias (delete with the window).
-                _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", c.JS_DupValue(ctx, msg_val));
-                _ = c.JS_SetPropertyStr(ctx, activation_obj, "msg", msg_val);
+                // `request.ctx` like every other callback.
+                _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", msg_val);
             }
-        } else |_| {
-            _ = c.JS_SetPropertyStr(ctx, activation_obj, "msg", js_null);
-        }
+        } else |_| {}
     }
 
     // ── Unified effect-result surface (handler-shape.md §7, Endpoint A) ──
@@ -2957,8 +2943,6 @@ pub fn installRequest(
         _ = c.JS_SetPropertyStr(ctx, req_obj, "ok", c.JS_GetPropertyStr(ctx, result, "ok"));
         _ = c.JS_SetPropertyStr(ctx, req_obj, "done", js_true);
         _ = c.JS_SetPropertyStr(ctx, req_obj, "bodyTruncated", c.JS_GetPropertyStr(ctx, result, "body_truncated"));
-        // Dual-name window alias.
-        _ = c.JS_SetPropertyStr(ctx, req_obj, "body_truncated", c.JS_GetPropertyStr(ctx, result, "body_truncated"));
 
         // request.ctx = the bare threaded value (what the customer passed
         // as `context:` / `next({ctx})`) — NOT an envelope.

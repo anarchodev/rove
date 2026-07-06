@@ -101,7 +101,7 @@ globalThis.retry = {
    * @param {object} opts
    * @param {string} opts.url - Target URL.
    * @param {string} opts.on - Result handler module path in this
-   *   tenant (non-empty; `on_result_module` = dual-name-window alias).
+   *   tenant (non-empty).
    * @param {number} [opts.max_attempts=1] - Total attempts incl. the
    *   first (positive integer).
    * @param {number|number[]} [opts.backoff_ms] - Constant delay, a
@@ -113,7 +113,7 @@ globalThis.retry = {
    * @param {number} [opts.timeout_ms] - Per-request timeout.
    * @param {bigint} [opts.fire_at_ns] - Delay the first attempt.
    * @param {*} [opts.ctx] - Echoed back (under your own keys;
-   *   `_retry` is reserved; `context` = window alias).
+   *   `_retry` is reserved).
    * @returns {string} The {@link webhook.send} schedule id.
    * @throws {TypeError} On missing/invalid `url`/`on_result_module`/
    *   `max_attempts`.
@@ -125,9 +125,7 @@ globalThis.retry = {
     if (typeof opts.url !== "string") {
       throw new TypeError("retry.send: `url` must be a string");
     }
-    // Canonical `on`; `on_result_module` is the dual-name-window alias.
-    const on_key = typeof opts.on === "string" && opts.on.length
-      ? opts.on : opts.on_result_module;
+    const on_key = opts.on;
     if (typeof on_key !== "string" || on_key.length === 0) {
       throw new TypeError("retry.send: `on` must be a non-empty string");
     }
@@ -154,7 +152,7 @@ globalThis.retry = {
       // Suppress webhook.send's built-in retry — the customer drives
       // the chain explicitly through `retry.next`.
       max_attempts: 1,
-      ctx: Object.assign({}, (opts.ctx !== undefined ? opts.ctx : opts.context) || {}, {
+      ctx: Object.assign({}, opts.ctx || {}, {
         [RETRY_KEY]: {
           attempt: 1,
           max_attempts,
