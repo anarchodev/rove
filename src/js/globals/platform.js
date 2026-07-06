@@ -37,8 +37,8 @@
      * @returns {{kv:object, blob:object, deploy:object}}
      *   - `kv` — `{get, set, delete, prefix}`, the same as the global
      *     {@link kv}, bound to instance `id`.
-     *   - `blob` — `{get(hash, {to}), receive({to, ctx})}`: cross-tenant blob
-     *     READ (resumes `to` with the bytes) + STREAMED write (pipe the inbound
+     *   - `blob` — `{get(hash, {on}), receive({on, ctx})}`: cross-tenant blob
+     *     READ (resumes `on` with the bytes) + STREAMED write (pipe the inbound
      *     body straight into `id`'s file-blobs, no JS buffering). There is no
      *     sync `put` — cross-tenant writes stream via `receive`.
      *   - `deploy` — `{stampManifest(entries), readManifest(dep)}`: write/read a
@@ -59,19 +59,20 @@
       // {@link blob.get}: it lowers to an after.fetch at the admin-only
       // `rove-blob-read.internal` door (rewritten to `id`'s S3 prefix +
       // SigV4-signed natively). The bytes resume on `request.body` at the
-      // `name` export (default onFetchResult); thread state with `opts.ctx`
+      // `on` export (default onFetchResult); thread state with `opts.ctx`
       // (→ `request.ctx`). Return next() after it. Compose the replay bundle /
       // Code-tab sources from these reads in JS — no native assembly.
       // Cross-tenant STREAMED upload — the streaming twin of blob.put. Pipes
       // the inbound request body straight to `id`'s file-blobs (zero JS
-      // buffering, no chunk activations), resuming `to` with
+      // buffering, no chunk activations), resuming `on` with
       // `request.ctx = {hash, len, app:<opts.ctx>}` when durable. onHeaders-only
       // (like blob.receive); for large statics the deploy app uses this instead
       // of base64-buffering through blob.put.
       s.blob.receive = function (opts) {
         opts = opts || {};
+        // Canonical `on`; `to` = dual-name-window alias.
         return sysBlobReceive(
-          opts.to, id,
+          typeof opts.on === "string" ? opts.on : opts.to, id,
           JSON.stringify(opts.ctx !== undefined ? opts.ctx : null),
         );
       };
@@ -85,14 +86,15 @@
         return sysOn.fetch(
           "http://rove-blob-read.internal/" + id + "/blob/" + hash,
           fetch_opts,
-          { to: opts.name || "onFetchResult" },
+          // Canonical `on`; `name` = dual-name-window alias.
+          { to: opts.on || opts.name || "onFetchResult" },
         );
       };
       // deploy.stampManifest is the deploy's STAGING BARRIER — it lowers to
       // a bound after.fetch (not a native sync call) so it resumes your handler
       // only once the manifest (the last staging write) AND every prior
       // bytecode/static PUT is durable. Return next() after it; the result
-      // arrives at the `name` export (default onStamped) as
+      // arrives at the `on` export (default onStamped) as
       // `request.ctx = {ok, dep_id}`.
       s.deploy = {
         stampManifest(entries, opts) {
@@ -100,12 +102,13 @@
           return sysOn.fetch(
             "http://rove-stage.internal/",
             { method: "POST", body: JSON.stringify({ scope: id, entries }) },
-            { to: opts.name || "onStamped" },
+            // Canonical `on`; `name` = dual-name-window alias.
+            { to: opts.on || opts.name || "onStamped" },
           );
         },
         // readManifest is the READ twin of stampManifest: it reads `id`'s
         // deployment manifest for `dep_id` (16-hex) off the read door. The raw
-        // manifest JSON resumes on `request.body` at `name` (default
+        // manifest JSON resumes on `request.body` at `on` (default
         // onFetchResult) — parse it in JS, then read each handler entry's
         // source with `scope(id).blob.get(hash)`. The current dep_id is
         // `scope(id).kv.get("_deploy/current")`.
@@ -116,7 +119,8 @@
           return sysOn.fetch(
             "http://rove-blob-read.internal/" + id + "/manifest/" + dep_id,
             fetch_opts,
-            { to: opts.name || "onFetchResult" },
+            // Canonical `on`; `name` = dual-name-window alias.
+            { to: opts.on || opts.name || "onFetchResult" },
           );
         },
       };
@@ -133,7 +137,7 @@
      *
      * **Bound, like {@link on.fetch}:** the call binds to the held chain,
      * so you must `return next()` after it; the result resumes your
-     * handler at the `name` export (default `onFetchResult`) with
+     * handler at the `on` export (default `onFetchResult`) with
      * `request.ctx = {ok, results:[{path, source_hex, bytecode_hex}]}`
      * (or `{ok:false, status, error}`). Compose the manifest from those
      * hashes + your statics and stamp it there. Stage/activate is still a
@@ -142,11 +146,12 @@
      * @param {Array<{path:string, source:string}>} files - Handler sources.
      * @param {object} opts
      * @param {string} opts.scope - Target instance id (where blobs stage).
-     * @param {string} [opts.name="onFetchResult"] - Resume export.
-     * @returns {string} The bound fetch id.
+     * @param {string} [opts.on="onFetchResult"] - Resume export (`name` =
+     *   dual-name-window alias).
+     * @returns {string} The bound fetch id (`ftch_…`).
      *
      * @example
-     * platform.compile(handlers, { scope: tenant, name: "onCompiled" });
+     * platform.compile(handlers, { scope: tenant, on: "onCompiled" });
      * return next();
      * // export function onCompiled(request) {
      * //   const { results } = request.ctx; ...stamp manifest...
@@ -162,7 +167,8 @@
       return sysOn.fetch(
         "http://rove-compile.internal/",
         { method: "POST", body, ctx: opts.ctx },
-        { to: opts.name || "onFetchResult" },
+        // Canonical `on`; `name` = dual-name-window alias.
+        { to: opts.on || opts.name || "onFetchResult" },
       );
     },
 
