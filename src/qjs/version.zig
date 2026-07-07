@@ -44,6 +44,13 @@
 //!        format-versioning freeze, 2026-06-23). The first and, until a
 //!        semantics-affecting bump, only engine version — so replay
 //!        engine selection is a no-op today.
+//!        Still 1 at arenajs v0.3.0 (2026-07-07, #7458645): per-reset
+//!        allocator-mode selection (bump vs GC mspace) + per-request
+//!        date/random state slots. Verified no-bump: quickjs-opcode.h /
+//!        quickjs-atom.h / quickjs.h / dtoa.c / libregexp.c byte-
+//!        identical; the quickjs.c delta is allocator + state-slot
+//!        plumbing only ("allocator/arena internals, perf, GC" — the
+//!        SOP's explicit do-not-bump list).
 
 /// Current JS engine version. Stamped into every request's `LogRecord`
 /// and replicated readset header. See the bump SOP above before changing.

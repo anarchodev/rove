@@ -122,6 +122,14 @@ pub const Snapshot = struct {
         // sweep at vendor/arenajs/arena-test262.c).
         c.JS_FreezeRuntime(rt);
 
+        // arenajs 0.3.0 defaults the request allocator to GC mode
+        // (dlmalloc mspace + refcount/cycle GC). Rove runs handlers on
+        // the BUMP regime — ~3-instruction allocs, O(1) reset — and
+        // will opt churny handlers into GC per-request later (the
+        // header's intended oom→retry pattern). Selection takes effect
+        // at the next reset; restore() runs one before every request.
+        c.js_dual_arena_set_request_mode(c.JS_GetDualArena(rt), c.JS_ARENA_REQ_MODE_BUMP);
+
         return .{ .rt = rt, .ctx = ctx, .version = version_mod.JS_ENGINE_VERSION };
     }
 
@@ -243,6 +251,45 @@ test "Snapshot.restore: performance.now and Math.random work after restore" {
     defer rv2_result.deinit();
     const rv2 = try rv2_result.toF64();
     try testing.expect(rv2 != rv);
+}
+
+test "request allocator runs in BUMP mode (arenajs 0.3 defaults to GC)" {
+    var snap = try Snapshot.create(.{}, minimalInit, null);
+    defer snap.deinit();
+    const r = snap.restore();
+    _ = r;
+    try testing.expectEqual(
+        @as(c_uint, c.JS_ARENA_REQ_MODE_BUMP),
+        c.js_dual_arena_request_mode(c.JS_GetDualArena(snap.rt)),
+    );
+}
+
+test "BUMP semantics canary: cumulative allocation OOMs even when garbage" {
+    // The bump/GC discriminator: this loop's PEAK live set is ~1 MiB
+    // (each iteration drops the last string) but its CUMULATIVE
+    // allocation far exceeds the request arena. Under BUMP (ceiling =
+    // cumulative) it MUST OOM with oom_hit set; under GC (ceiling =
+    // peak) it would succeed — so this test failing "successfully"
+    // means the mode selection silently regressed to GC.
+    var snap = try Snapshot.create(.{}, minimalInit, null);
+    defer snap.deinit();
+    const r = snap.restore();
+    var result = r.context.eval(
+        \\let s = "";
+        \\for (let i = 0; i < 256; i++) { s = "x".repeat(1 << 20) + i; }
+        \\s.length
+    ,
+        "churny.js",
+        .{},
+    ) catch {
+        // Eval failed — the OOM propagated as an exception. The arena's
+        // exhaustion record must confirm this was capacity, not a JS
+        // throw.
+        try testing.expect(c.js_dual_arena_oom_hit(c.JS_GetDualArena(snap.rt)));
+        return;
+    };
+    result.deinit();
+    return error.TestExpectedOom;
 }
 
 test "Snapshot.restore preserves complex JS behavior" {
