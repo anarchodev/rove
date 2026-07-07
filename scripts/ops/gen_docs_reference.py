@@ -65,11 +65,11 @@ SKIPPED = {"request", "http"}  # documented by the Handlers page / contract
 # Files whose surface has no @namespace block: section name + one-line
 # description fallback (the file header covers the rest in-repo).
 BARE_FILES = {
-    "cron": ("cron helpers", "Fire-time helpers for durable scheduling."),
-    "next": ("next", "The held-connection disposition."),
-    "schedule": ("schedule / cron", "Durable, connectionless timers."),
-    "textcodec": ("TextEncoder / TextDecoder", "UTF-8 bytes ↔ string."),
-    "urlsearchparams": ("URLSearchParams", "Query/form-body parsing."),
+    "cron": ("cron helpers", "Fire-time helpers for durable scheduling.", "cron"),
+    "next": ("next", "The held-connection disposition.", ""),
+    "schedule": ("schedule / cron", "Durable, connectionless timers.", ""),
+    "textcodec": ("TextEncoder / TextDecoder", "UTF-8 bytes ↔ string.", ""),
+    "urlsearchparams": ("URLSearchParams", "Query/form-body parsing.", ""),
 }
 
 
@@ -152,7 +152,8 @@ def parse_shim(stem: str):
             else:
                 tagmap.setdefault(tag, text)
         if "namespace" in tagmap:
-            cur = {"name": tagmap["namespace"].strip(), "desc": desc,
+            ns = tagmap["namespace"].strip()
+            cur = {"name": ns, "desc": desc, "prefix": ns,
                    "example": examples[0] if examples else None, "members": []}
             sections.append(cur)
             continue
@@ -160,9 +161,9 @@ def parse_shim(stem: str):
         if not name or name.startswith("_"):
             continue
         if cur is None:
-            title, fallback = BARE_FILES.get(stem, (stem, ""))
-            cur = {"name": title, "desc": [fallback], "example": None,
-                   "members": []}
+            title, fallback, prefix = BARE_FILES.get(stem, (stem, "", stem))
+            cur = {"name": title, "desc": [fallback], "prefix": prefix,
+                   "example": None, "members": []}
             sections.append(cur)
         cur["members"].append({
             "name": name, "desc": desc, "params": params,
@@ -184,14 +185,17 @@ def param_pieces(p: str):
     return name, typ, opt, desc
 
 
-def signature(member) -> str:
+def signature(member, prefix: str = "") -> str:
     args = []
     for p in member["params"]:
         name, _typ, opt, _d = param_pieces(p)
         if "." in name:
             continue  # opts.on — folded into the params table
         args.append(name + ("?" if opt else ""))
-    return f"{member['name']}({', '.join(args)})"
+    dotted = member["name"]
+    if prefix and dotted != prefix:
+        dotted = f"{prefix}.{dotted}"
+    return f"{dotted}({', '.join(args)})"
 
 
 def esc(s: str) -> str:
@@ -243,7 +247,7 @@ def render(all_groups) -> str:
             if sec["example"]:
                 out.append(f"<pre><code>{esc(sec['example'])}</code></pre>")
             for m in sec["members"]:
-                out.append(f'<h4 id="{anchor(sec["name"] + "-" + m["name"])}"><code>{esc(signature(m))}</code></h4>')
+                out.append(f'<h4 id="{anchor(sec["name"] + "-" + m["name"])}"><code>{esc(signature(m, sec.get("prefix", "")))}</code></h4>')
                 out.append(render_prose(m["desc"]))
                 if m["params"]:
                     out.append("<table><tr><th>Param</th><th>Type</th><th></th></tr>")
