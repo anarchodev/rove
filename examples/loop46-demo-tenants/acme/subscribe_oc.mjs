@@ -14,7 +14,7 @@ export default function () {
         kv.set("sub/done/" + a.fetchId, JSON.stringify({
             ok: a.ok,
             status: a.status,
-            body_truncated: a.body_truncated,
+            bodyTruncated: a.bodyTruncated,
         }));
         return { status: 200 };
     }

@@ -1,5 +1,5 @@
 // Helper for the subscription smoke — calls
-// http.cancelSubscription({id}) given a query-string id. Separate
+// http.cancelSubscription(id) given a query-string id. Separate
 // endpoint so the smoke can issue the cancel as its own H2 request
 // (no need to thread cancellation through the subscriber chain).
 //
@@ -18,7 +18,7 @@ export default function () {
         response.status = 400;
         return "missing ?id=";
     }
-    http.cancelSubscription({ id: id });
+    http.cancelSubscription(id);
     response.status = 200;
     return "cancelled";
 }

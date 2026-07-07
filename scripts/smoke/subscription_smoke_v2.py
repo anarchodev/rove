@@ -23,12 +23,13 @@ Flow / essential assertions (unchanged from V1):
 Dropped from V1: TLS/https, 3-node leader election / discover_leader
 (single-node behavior smoke; front door is serve-or-forward).
 
-The held subscription fetches `http://wb.<suffix>:<node_port>/drip`. The
-worker binds `0.0.0.0`, so the on-box outbound libcurl reaches the same
-node over loopback; the `<tenant>.<suffix>` Host carries the tenant
-routing (`REWIND_PUBLIC_SUFFIX=localhost` → `wb.localhost` resolves to the
-`wb` tenant). No SSRF escape hatch is needed — the V2 fetch path doesn't
-enforce the loopback/plaintext block.
+The held subscription fetches `http://wb.<suffix>:<front_port>/drip` —
+through the FRONT, not the worker port: the worker is h2c-only (front-door
+streaming arc) and outbound libcurl speaks HTTP/1.1, so a direct worker
+fetch gets the h2-only 503. The front is the h1→h2 edge. The
+`<tenant>.<suffix>` Host carries tenant routing (`REWIND_PUBLIC_SUFFIX=
+localhost` → `wb.localhost`). No SSRF escape hatch is needed — the V2
+fetch path doesn't enforce the loopback/plaintext block.
 
 Needs S3 env: `set -a; . ./.env; set +a` first.
 """
@@ -106,7 +107,7 @@ def main() -> int:
         # node port; acme's worker fetches it over loopback h2c. The
         # `wb.<suffix>` Host carries the tenant routing (a bare 127.0.0.1
         # URL would 404 — no tenant in the Host).
-        drip_url = f"http://wb.{PUBLIC_SUFFIX}:{c.node_ports[0]}/drip"
+        drip_url = f"http://wb.{PUBLIC_SUFFIX}:{c.front_port}/drip"
 
         # ── 1. Open the subscription. ─────────────────────────────────
         r = c.get("acme", f"/subscribe?url={up.quote(drip_url)}",

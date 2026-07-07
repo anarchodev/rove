@@ -409,7 +409,15 @@ pub fn jsHttpSubscribe(
     row.held = true;
 
     state.http_fetch_index += 1;
-    const res = c.JS_NewStringLen(ctx, row.id.ptr, row.id.len);
+    // Customer-visible id: the same `ftch_<hex>` form as after.fetch's
+    // return and activation.fetchId (§7.5 — ONE id spelling on every
+    // surface; the audit found subscribe's bare-hex return breaking
+    // correlation with the chunk activations). cancelSubscription
+    // strips the prefix on the way back in.
+    var sid_buf: [log_mod.FETCH_ID_PREFIX.len + 64]u8 = undefined;
+    @memcpy(sid_buf[0..log_mod.FETCH_ID_PREFIX.len], log_mod.FETCH_ID_PREFIX);
+    @memcpy(sid_buf[log_mod.FETCH_ID_PREFIX.len..][0..row.id.len], row.id);
+    const res = c.JS_NewStringLen(ctx, &sid_buf, log_mod.FETCH_ID_PREFIX.len + row.id.len);
     appendPendingFetch(state, &row) catch |err| {
         c.JS_FreeValue(ctx, res);
         row.deinit(state.allocator);
