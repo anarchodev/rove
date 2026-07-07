@@ -304,7 +304,7 @@ function _parseField(field, min, max) {
  * @param {string} target - Module specifier to run each occurrence,
  *   e.g. `"jobs/cleanup"`.
  * @param {*} [ctx] - JSON-serializable value delivered to the target as
- *   `request.activation.msg`.
+ *   `request.ctx`.
  * @returns {string} The stable registration id (cancel via
  *   `schedule.cancel(id)`).
  * @throws {TypeError} On a non-string `spec`/`target` or malformed spec.

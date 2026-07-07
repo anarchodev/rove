@@ -339,7 +339,7 @@ exports because it carries a payload.
 The platform invokes **only** the activation's export (the table
 above). The former platform-level `?fn=name&args=…` query and
 `{"fn":…,"args":[…]}` POST-body dispatch are RETIRED (decisions.md
-§4.5): `request.query` and `request.body` are opaque payload the
+§4.5): `request.query` and the request payload are opaque bytes the
 engine never interprets. Internal resume targeting (`{on}`,
 `next({fn})`) is first-class on the runtime's Request and
 unaffected.

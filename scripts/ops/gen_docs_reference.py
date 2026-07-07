@@ -44,9 +44,10 @@ GROUPS = [
     ("Connection & wakes",
      "The held socket. `stream` pushes response bytes out over time; "
      "`after.*` arms one-shot wakes; `next()` keeps the connection "
-     "held between activations. All ephemeral — they die with the "
-     "caller.",
-     ["after", "next", "stream"]),
+     "held between activations; `http.subscribe` holds a long-lived "
+     "OUTBOUND stream (firehoses, SSE consumers). All ephemeral — "
+     "they die with the caller.",
+     ["after", "next", "stream", "http"]),
     ("Durable effects",
      "Connectionless work that survives anything: outbound delivery "
      "(`webhook`, `email`, `retry`) and future activations "
@@ -60,12 +61,12 @@ GROUPS = [
      ["users", "sessions", "oauth", "oidc", "activitypub"]),
     ("Admin (the __admin__ tenant only)", None, ["platform"]),
 ]
-SKIPPED = {"request", "http"}  # documented by the Handlers page / contract
+SKIPPED = {"request"}  # the request surface is the Handlers page / contract
 
 # Files whose surface has no @namespace block: section name + one-line
 # description fallback (the file header covers the rest in-repo).
 BARE_FILES = {
-    "cron": ("cron helpers", "Fire-time helpers for durable scheduling.", "cron"),
+    "cron": ("cron", "Recurring durable timer, plus the fire-time helpers it carries as statics.", "cron"),
     "next": ("next", "The held-connection disposition.", ""),
     "textcodec": ("TextEncoder / TextDecoder", "UTF-8 bytes ↔ string.", ""),
     "urlsearchparams": ("URLSearchParams", "Query/form-body parsing.", ""),
@@ -156,7 +157,9 @@ def parse_shim(stem: str):
                    "example": examples[0] if examples else None, "members": []}
             sections.append(cur)
             continue
-        name = member_name(code)
+        # `@function name` names a bare `function name(…)` declaration
+        # the code-line patterns can't see (the callable cron verb).
+        name = tagmap.get("function", "").strip() or member_name(code)
         if not name or name.startswith("_"):
             continue
         if cur is None:

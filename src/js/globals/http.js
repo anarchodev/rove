@@ -2,12 +2,11 @@
 // outbound HTTP primitive (docs/builtin-libs-docs-plan.md Phase A,
 // docs/effect-reification-plan.md Phase 5).
 //
-// Thin shim over the native `_system.http` binding. The legacy
-// `http.send` / `http.cancel` durable surface retired in Phase 5
-// PR-3: durability is now JS-shim'd in `webhook.send` (and
-// `email.send`) on top of `http.fetch` + `kv.set` + the per-worker
-// partitioned retry sweep. `_system.*` is the internal ABI and
-// customer code must never reference it directly.
+// Thin shim over the native `_system.http` binding. Durability is
+// JS-shim'd in `webhook.send` (and `email.send`) on top of the
+// internal fetch primitive + `kv` markers + durable scheduled wakes.
+// `_system.*` is the internal ABI and customer code must never
+// reference it directly.
 //
 // Evaluated as a global script (no module/exports) into every
 // dispatcher context after the native bindings install.
@@ -33,7 +32,7 @@
      * (the customer is the single source of truth for chain
      * progress).
      *
-     * @param {{id:string}} opts - The id `on.fetch` returned.
+     * @param {{id:string}} opts - The id `after.fetch` returned.
      * @returns {void}
      */
     cancelFetch(opts) {
@@ -41,13 +40,13 @@
     },
 
     /**
-     * Open a held outbound subscription — `http.fetch`'s symmetric
-     * twin for long-lived upstreams (atproto firehose, Pub/Sub
+     * Open a held outbound subscription — `after.fetch`'s held
+     * symmetric twin for long-lived upstreams (atproto firehose, Pub/Sub
      * long-poll, SSE consumers, any third-party push where the
      * provider holds the connection). Closes
      * `docs/primitive-gaps.md` §2.5.
      *
-     * Same shape as `http.fetch` minus `timeout_ms` (held
+     * Same options as `after.fetch` minus the timeout (held
      * subscriptions don't time out — they end on cancel or
      * upstream close) and `stream` (always true — held transfers
      * stream by definition). The `on_chunk` handler fires per
@@ -68,11 +67,11 @@
      * @param {Object<string,string>} [opts.headers] - Request headers.
      * @param {string} [opts.body] - Request body.
      * @param {string} opts.on_chunk - Module path for `on_chunk`
-     *   (REQUIRED). Same activation shape as `http.fetch`.
+     *   (REQUIRED). Same activation shape as a streamed `after.fetch`.
      * @param {number} [opts.max_response_chunk_bytes=262144] -
      *   Per-chunk cap.
      * @param {number} [opts.max_total_response_bytes=52428800] -
-     *   Cumulative response cap; exceeding sets `body_truncated`
+     *   Cumulative response cap; exceeding sets `bodyTruncated`
      *   on the terminal event.
      * @param {*} [opts.ctx] - Threaded forward to each activation
      *   as `request.ctx`.
@@ -82,7 +81,7 @@
      * @example
      * const id = http.subscribe({
      *   url: "https://bsky.network/xrpc/com.atproto.sync.subscribeRepos",
-     *   on_chunk: "ingest_firehose.mjs",
+     *   on_chunk: "ingest_firehose",
      *   ctx: { cursor: kv.get("firehose/cursor") },
      * });
      * kv.set("firehose/subscription_id", id);

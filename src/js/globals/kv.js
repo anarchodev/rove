@@ -36,7 +36,7 @@
      *
      * @example
      * const raw = kv.get(`user/${id}`);
-     * if (raw === null) return new Response("not found", { status: 404 });
+     * if (raw === null) { response.status = 404; return "not found"; }
      * const user = JSON.parse(raw);
      */
     get(key) {

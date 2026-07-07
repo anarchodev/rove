@@ -83,17 +83,16 @@ const WEBHOOK_WATCHDOG_MS = 40_000;
 
 /**
  * Durable outbound HTTP — at-least-once delivery, replay-deterministic.
- * Customer code that hardcoded the previous `http.send` surface should
- * migrate to `webhook.send`; the customer-visible API is the same call
- * shape (`url`/`method`/`body`/`headers`/`on_result`/`context` plus the
- * new `handle` and `fire_at_ns`).
+ * The connectionless counterpart to `after.fetch`: the send fires after
+ * the handler commits and is owned by the platform until a terminal
+ * result, surviving crashes and leader changes.
  *
  * @namespace webhook
  */
 globalThis.webhook = {
   /**
    * Send a webhook. Writes a durable `_send/owed/{id}` marker through
-   * raft, then fires the request via {@link http.fetch}. On failure
+   * raft, then fires the request post-commit. On failure
    * the platform retries with exponential backoff (1s, 2s, 4s, …,
    * capped at 60s, max 5 attempts) — controlled by the baked
    * `__system/webhook_onresult` shim, not customer code. Deferred
@@ -130,9 +129,17 @@ globalThis.webhook = {
    *   `request.activation.*`. There is no `request.result`.
    * @param {*} [opts.ctx] - Opaque customer payload echoed back as
    *   `request.ctx` on the result event.
-   * @returns {string} The marker id. Same value as the `handle` when
-   *   one was supplied.
+   * @returns {string} The marker id — random unless `handle` was
+   *   supplied, in which case it is base64url(sha256(handle)) (stable:
+   *   the same handle always yields the same id).
    * @throws {TypeError} If `url` is missing/wrong type.
+   *
+   * Lifecycle: enumerate in-flight sends with
+   * `kv.prefix("_send/owed/")` (each value is the marker JSON). To
+   * cancel a SCHEDULED send before it fires: `schedule.cancel(id)`
+   * kills the durable wake, then `kv.delete("_send/owed/" + id)`
+   * removes the marker — both in one handler, so the cancellation is
+   * atomic. An already-fired send cannot be recalled.
    *
    * @example
    * webhook.send("https://hooks.example.com/x", {

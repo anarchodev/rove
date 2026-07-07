@@ -38,6 +38,11 @@
    * same activation, so a wake is never missed even when a callback
    * writes the key it watches.
    *
+   * Wakes are one-shot and cannot be cancelled — they're ephemeral
+   * and node-local, so an unwanted wake is simply ignored (or the
+   * handler re-arms a different set). The exception is a fetch:
+   * cancel an in-flight `after.fetch` by its returned id.
+   *
    * @namespace after
    * @example
    * // SSE-style: stream rows, then wait for more under a prefix.

@@ -1,7 +1,7 @@
 // `email.send` — transactional email via Resend, layered on
-// `webhook.send` (which composes durable outbound HTTP from `kv.set`
-// + `http.fetch` + the per-worker retry sweep — see `webhook.js`).
-// Per-instance rate-limited.
+// `webhook.send` (which composes durable outbound HTTP from `kv`
+// markers + the internal fetch primitive + durable scheduled wakes —
+// see `webhook.js`). Per-instance rate-limited.
 
 /**
  * Transactional email through Resend.
@@ -32,7 +32,7 @@ globalThis.email = {
    * @param {number} [opts.max_attempts] - Override the built-in
    *   webhook.send retry budget (default 5).
    * @param {number} [opts.timeout_ms] - Per-attempt timeout.
-   * @returns {string} The schedule id from {@link webhook.send}.
+   * @returns {string} The marker id from {@link webhook.send}.
    * @throws {Error} `code:"rate_limited"` when the per-instance
    *   email bucket is exhausted.
    * @throws {TypeError} On missing/invalid `key`/`from`/`subject`/`to`.
