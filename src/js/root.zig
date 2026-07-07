@@ -135,4 +135,5 @@ test {
     _ = @import("static_cache.zig");
     _ = @import("deploy_thread.zig");
     _ = @import("doc_examples.zig");
+    _ = @import("surface_tests.zig");
 }
