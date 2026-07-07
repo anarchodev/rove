@@ -21,7 +21,7 @@ export function onResult() {
                 method: "POST",
                 body: JSON.stringify({ from: "heldsync-retry", tag: ctx.tag }),
                 headers: { "content-type": "application/json" },
-                max_attempts: 1,
+                maxAttempts: 1,
             });
             return __rove_next("heldsync/onresult", {
                 fn: "onResult",

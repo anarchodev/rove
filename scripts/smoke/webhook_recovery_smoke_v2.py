@@ -2,7 +2,7 @@
 """V2 `webhook.send` deferred-delivery contract — the durable-wake path
 (durable-wake-plan P5(a)), on the `V2Cluster` harness.
 
-`webhook.send({ fire_at_ns: now+Δ })` writes a durable `_send/owed/{id}` kv
+`webhook.send({ at: now+Δ })` writes a durable `_send/owed/{id}` kv
 marker AND a durable scheduler entry under key `_send/{id}` aimed at the baked
 `__system/webhook_fire`; because the fire time is in the FUTURE, no inline
 `http.fetch` happens — the durable wake is the sole fire mechanism for the
@@ -16,7 +16,7 @@ kill fires on the new leader).
 This smoke asserts the deferred-delivery LIFECYCLE on a single node, where it
 is deterministic:
 
-  1. Fire a DELAYED `webhook.send` (fire_at_ns ≈ now+Δ) at the `wb` echo
+  1. Fire a DELAYED `webhook.send` (at ≈ now+Δ) at the `wb` echo
      tenant. The marker lands in kv; nothing fires yet (verified: the marker
      is present BEFORE the fire time and wb has NOT received anything).
   2. Once the fire time falls due, the wake fires `__system/webhook_fire` —
@@ -56,8 +56,8 @@ CBFIRE_SRC = r'''export function fireDelayed(url, tag, delay_ms) {
         headers: { "content-type": "text/plain" },
         on: "cbresult",
         ctx: { tag: tag },
-        fire_at_ns: fire_at_ns,
-        max_attempts: 5,
+        at: fire_at_ns,
+        maxAttempts: 5,
     });
     kv.set("cb/last_fire", id);
     return { id: id, fire_at_ns: String(fire_at_ns), now_ms: now_ms };

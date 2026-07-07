@@ -425,7 +425,7 @@ export default function () {
 ```js
 export function onChunk() {
   after.fetch(`${STORAGE_URL}/${request.headers['x-key']}?seq=${request.chunkSeq}`,
-           { method: 'PUT', body: request.bytes }, { on: 'onPut' });
+           { method: 'PUT', body: request.bytes, on: 'onPut' });
   if (request.done) { response.status = 201; return 'uploaded'; }
   return next();                                 // await the next inbound chunk
 }
@@ -440,8 +440,8 @@ export function onPut() {                        // each PUT result resumes here
 
 ```js
 export default function () {
-  after.fetch('https://upstream.example.com', { method: 'POST', body: request.bytes },
-           { on: 'onUpstream' });
+  after.fetch('https://upstream.example.com',
+           { method: 'POST', body: request.bytes, on: 'onUpstream' });
   return next();                                 // held, uncommitted — status still open
 }
 
@@ -459,7 +459,7 @@ abandoning it is correct.
 
 ```js
 export default function () {
-  after.fetch(LLM_URL, { method: 'POST', body: request.bytes }, { on: 'onUpstream' });
+  after.fetch(LLM_URL, { method: 'POST', body: request.bytes, on: 'onUpstream' });
   return next();                                 // hold the client; wait for the first chunk
 }
 
@@ -544,8 +544,8 @@ retention bounds the reconnect-replay window.)
 
 ```js
 export default function () {
-  const a = after.fetch(API_A, {}, { on: 'onResult' });   // returns the fetch id (`ftch_…`)
-  const b = after.fetch(API_B, {}, { on: 'onResult' });
+  const a = after.fetch(API_A, { on: 'onResult' });   // returns the fetch id (`ftch_…`)
+  const b = after.fetch(API_B, { on: 'onResult' });
   after.ms(30_000, { on: 'onTimeout' });                  // deadline
   return next({ a, b, got: {} });                         // uncommitted: response unknown until both land
 }

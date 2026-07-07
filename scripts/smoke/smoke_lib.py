@@ -934,7 +934,7 @@ class Cluster:
         if r.status != 204:
             raise RuntimeError(f"upload {tenant}/{path}: {r.status} {r.body}")
 
-    def upload_static(self, tenant: str, path: str, content: bytes | str, content_type: str) -> None:
+    def upload_static(self, tenant: str, path: str, content: bytes | str, contentType: str) -> None:
         """POST {files_url}/{tenant}/upload-static."""
         if isinstance(content, str):
             content = content.encode()
@@ -990,7 +990,7 @@ class Cluster:
         self.release(tenant, dep_id)
         return dep_id
 
-    def put_file(self, tenant: str, path: str, content: bytes | str, *, content_type: str = "application/javascript") -> str:
+    def put_file(self, tenant: str, path: str, content: bytes | str, *, contentType: str = "application/javascript") -> str:
         """PUT {files_url}/{tenant}/file/{path} — single-file commit shortcut.
         Returns dep_id from the response body (201 status)."""
         if isinstance(content, str):

@@ -49,7 +49,7 @@ HELDSYNC_SRC = r"""export default function () {
         method: "POST",
         body: JSON.stringify({ from: "heldsync", tag: req.tag }),
         headers: { "content-type": "application/json" },
-        max_attempts: 1,
+        maxAttempts: 1,
     };
     webhook.send(req.target, opts);
     return __rove_next("heldsync/onresult", {

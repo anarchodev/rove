@@ -256,7 +256,7 @@ globalThis.segments = {
       values: values,
     });
     blob.put(payload, {
-      content_type: "application/json",
+      contentType: "application/json",
       on: "__system/segments_onsealed",
       ctx: {
         log: log,

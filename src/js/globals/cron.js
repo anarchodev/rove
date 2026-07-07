@@ -77,7 +77,7 @@ const _cronHelpers = {
    * @returns {bigint} Nanoseconds since epoch.
    * @throws {TypeError} If `s` isn't a duration.
    * @example
-   * webhook.send("https://hooks.example.com/x", { fire_at_ns: cron.fromNow("30m") });
+   * webhook.send("https://hooks.example.com/x", { at: cron.fromNow("30m") });
    */
   fromNow(s) {
     const dur_ms = _parseDuration(s);
@@ -145,7 +145,7 @@ const _cronHelpers = {
    *
    * @returns {bigint} Nanoseconds since epoch.
    * @example
-   * webhook.send("https://hooks.example.com/x", { fire_at_ns: cron.hourly() });
+   * webhook.send("https://hooks.example.com/x", { at: cron.hourly() });
    */
   hourly() {
     const now = new Date();
@@ -173,7 +173,7 @@ const _cronHelpers = {
    * @throws {TypeError} On a malformed expression/field.
    * @throws {Error} If no match within a 4-year window.
    * @example
-   * webhook.send("https://hooks.example.com/x", { fire_at_ns: cron.next("0 3 * * *") });
+   * webhook.send("https://hooks.example.com/x", { at: cron.next("0 3 * * *") });
    */
   next(expr, now_ms) {
     const fields = String(expr).trim().split(/\s+/);

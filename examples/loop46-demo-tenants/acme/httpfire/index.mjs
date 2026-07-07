@@ -29,7 +29,7 @@ export function fireDelayed(target_url, tag, delay_ms) {
         headers: { "content-type": "application/json" },
         on: "httpresult",
         ctx: { tag: tag },
-        fire_at_ns: fire_at_ns,
+        at: fire_at_ns,
     });
     kv.set("http/last_fire", id);
     // Return the computed fire_at_ns so the smoke can verify it's

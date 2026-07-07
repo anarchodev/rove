@@ -24,8 +24,8 @@ export default function () {
     }
     const id = http.subscribe({
         url: url,
-        on_chunk: "subscribe_oc",
-        max_response_chunk_bytes: 256,
+        on: "subscribe_oc",
+        maxChunkBytes: 256,
         ctx: { tag: "subscribesmoke" },
     });
     response.status = 200;

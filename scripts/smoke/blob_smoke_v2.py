@@ -94,8 +94,7 @@ MIRROR_SRC = """
 export default function () {
   const src = new TextDecoder().decode(
     hex.decode(request.path.slice(request.path.indexOf("src=") + 4)));
-  after.fetch(src, { stream: true, max_response_chunk_bytes: 16384 },
-           { on: "onChunk" });
+  after.fetch(src, { stream: true, maxChunkBytes: 16384, on: "onChunk" });
   return next();
 }
 
@@ -104,7 +103,7 @@ export function onChunk() {
     if (request.bytes && request.bytes.length) blob.write(request.bytes);
     return next();
   }
-  const hash = blob.seal({ on: "onStored", content_type: "text/plain" });
+  const hash = blob.seal({ on: "onStored", contentType: "text/plain" });
   return next({ hash });
 }
 
@@ -177,7 +176,7 @@ export default function () {
   if (path === "/put") {
     const body = request.text || "";
     const hash = blob.put(body, {
-      content_type: "text/plain",
+      contentType: "text/plain",
       on: "putresult",
       ctx: { tag: "smoke" },
     });
@@ -185,7 +184,7 @@ export default function () {
     return hash;
   }
   if (path === "/url") {
-    return blob.url(q.hash, { ttl: 300, content_type: "text/plain" });
+    return blob.url(q.hash, { ttl: 300, contentType: "text/plain" });
   }
   if (path === "/check") {
     const owed = kv.get("_blob/owed/" + q.hash);

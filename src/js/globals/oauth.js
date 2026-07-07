@@ -276,7 +276,7 @@ globalThis.oauth = {
    *   endpoint response.
    * @param {object} opts - `{issuer, client_id, jwks_uri}` required;
    *   optional `nonce` (checked manually — `validateClaims` doesn't
-   *   cover it), `leeway_s` (default 30), `algs` (extra allow-list on
+   *   cover it), `leewaySeconds` (default 30), `algs` (extra allow-list on
    *   top of jwt.js's RS/ES set), `cache_path`.
    * @returns {object} One of `{ok:true, claims}` /
    *   `{ok:false, error}` (hard reject — do NOT retry) /
@@ -374,7 +374,7 @@ function _verifyWithJwks(id_token, jwks, opts) {
   const claim_err = jwt.validateClaims(v.payload, {
     iss: opts.issuer,
     aud: opts.client_id,
-    leeway_s: opts.leeway_s != null ? opts.leeway_s : 30,
+    leewaySeconds: opts.leewaySeconds != null ? opts.leewaySeconds : 30,
   });
   if (claim_err) return { ok: false, error: "id_token " + claim_err };
   if (opts.nonce != null && v.payload.nonce !== opts.nonce) {

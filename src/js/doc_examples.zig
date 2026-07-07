@@ -67,6 +67,17 @@ const RETIRED_SPELLINGS = [_]RetiredSpelling{
     .{ .pattern = "scheduled_at_ns", .hint = "handler-visible fields are camelCase: scheduledAtNs" },
     .{ .pattern = "onBoot", .hint = "kind=boot subscriptions are retired; seed registrations from any handler activation" },
     .{ .pattern = "http.send(", .hint = "durable outbound is webhook.send(url, opts)" },
+    // Audit batch 3 (2026-07-06): option-key unification.
+    .{ .pattern = "fire_at_ns", .hint = "deferred fires are `{at}`/`{in}` (schedule's coercions)" },
+    .{ .pattern = "timeout_ms", .hint = "camelCase options: `timeoutMs`" },
+    .{ .pattern = "max_attempts", .hint = "camelCase options: `maxAttempts`" },
+    .{ .pattern = "backoff_ms", .hint = "camelCase options: `backoffMs`" },
+    .{ .pattern = "on_chunk:", .hint = "the universal callback key is `{on}` (http.subscribe too)" },
+    .{ .pattern = "content_type:", .hint = "camelCase options: `contentType` (blob.*)" },
+    .{ .pattern = "max_bytes", .hint = "camelCase options: `maxBytes`" },
+    .{ .pattern = "leeway_s", .hint = "jwt option is `leewaySeconds`" },
+    .{ .pattern = "handle:", .hint = "webhook.send's idempotency option is `key` (like schedule)" },
+    .{ .pattern = "cancelFetch", .hint = "cancel an after.fetch with after.cancel(id)" },
 };
 
 // ── Example extraction ──────────────────────────────────────────────

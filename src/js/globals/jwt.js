@@ -114,7 +114,7 @@ globalThis.jwt = {
    *   appears in `payload.aud` (string or array).
    * @param {number} [opts.now] - Now, ms since epoch (default
    *   `Date.now()`).
-   * @param {number} [opts.leeway_s=30] - Clock-skew tolerance for
+   * @param {number} [opts.leewaySeconds=30] - Clock-skew tolerance for
    *   `exp`/`nbf`.
    * @returns {string|null} `null` if all checks pass, else the first
    *   failure: `"no-payload"` | `"expired"` | `"not-yet-valid"` |
@@ -127,7 +127,8 @@ globalThis.jwt = {
     if (!payload || typeof payload !== "object") return "no-payload";
     opts = opts || {};
     const now_s = (opts.now || Date.now()) / 1000;
-    const leeway = opts.leeway_s != null ? opts.leeway_s : 30;
+    if ("leeway_s" in opts) throw new TypeError("jwt: option `leeway_s` was renamed — use `leewaySeconds`");
+    const leeway = opts.leewaySeconds != null ? opts.leewaySeconds : 30;
     if (typeof payload.exp === "number" && now_s - leeway >= payload.exp) {
       return "expired";
     }

@@ -1024,10 +1024,10 @@ test "dispatch: webhook.send with handle derives a stable id; same handle overwr
     var d = try Dispatcher.init(testing.allocator);
     defer d.deinit();
 
-    // Same handle → same id → last-write-wins on `_send/owed/{id}`.
+    // Same key → same id → last-write-wins on `_send/owed/{id}`.
     var resp = try runOne(&d, kv,
-        \\const id1 = webhook.send("https://x/", { handle: "reminder-foo" });
-        \\const id2 = webhook.send("https://y/", { handle: "reminder-foo", fire_at_ns: BigInt(Date.now() + 86400000) * 1000000n });
+        \\const id1 = webhook.send("https://x/", { key: "reminder-foo" });
+        \\const id2 = webhook.send("https://y/", { key: "reminder-foo", in: "24h" });
         \\return id1 + "|" + id2;
     , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
@@ -1060,7 +1060,7 @@ test "dispatch: retry.send wraps webhook.send + carries _retry meta" {
         \\  url: "https://api.stripe.com/v1/charges",
         \\  body: "x",
         \\  on: "stripe_done",
-        \\  max_attempts: 3,
+        \\  maxAttempts: 3,
         \\  ctx: { charge_id: 42 },
         \\});
     , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 7 } });
@@ -1084,7 +1084,7 @@ test "dispatch: retry.send wraps webhook.send + carries _retry meta" {
     try testing.expectEqualStrings("stripe_done", r.get("on_result_module").?.string);
 }
 
-test "dispatch: retry.shouldRetry / retry.stripContext logic" {
+test "dispatch: ambient retry.shouldRetry / retry.ctx logic" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1096,12 +1096,14 @@ test "dispatch: retry.shouldRetry / retry.stripContext logic" {
     defer d.deinit();
 
     var resp = try runOne(&d, kv,
-        \\const base = (ctx) => ({ context: ctx });
-        \\const ok = retry.shouldRetry({ ok: true, ...base({ _retry: { attempt: 1, max_attempts: 3 } }) });
-        \\const failed_with_attempts = retry.shouldRetry({ ok: false, ...base({ _retry: { attempt: 1, max_attempts: 3 } }) });
-        \\const failed_exhausted = retry.shouldRetry({ ok: false, ...base({ _retry: { attempt: 3, max_attempts: 3 } }) });
-        \\const no_retry_meta = retry.shouldRetry({ ok: false, context: { charge_id: 42 } });
-        \\const stripped = JSON.stringify(retry.stripContext({ context: { charge_id: 42, _retry: { attempt: 2 } } }));
+        \\const mk = (okv, r) => { request.ok = okv; request.ctx = { _retry: r }; return retry.shouldRetry(); };
+        \\const ok = mk(true, { attempt: 1, max_attempts: 3 });
+        \\const failed_with_attempts = mk(false, { attempt: 1, max_attempts: 3 });
+        \\const failed_exhausted = mk(false, { attempt: 3, max_attempts: 3 });
+        \\request.ok = false; request.ctx = { charge_id: 42 };
+        \\const no_retry_meta = retry.shouldRetry();
+        \\request.ctx = { charge_id: 42, _retry: { attempt: 2 } };
+        \\const stripped = JSON.stringify(retry.ctx());
         \\return [ok, failed_with_attempts, failed_exhausted, no_retry_meta].join(",") + "|" + stripped;
     , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1 } });
     defer resp.deinit(testing.allocator);
@@ -1616,7 +1618,7 @@ test "dispatch: webhook.send(url, {on, ctx}) canonical form writes the marker (�
         &d,
         kv,
         \\const id = webhook.send("https://t.example/hook", {
-        \\  body: "x", on: "hooks/onDone", ctx: { a: 1 }, handle: "h-canon",
+        \\  body: "x", on: "hooks/onDone", ctx: { a: 1 }, key: "h-canon",
         \\});
         \\return id;
     ,
@@ -3973,7 +3975,7 @@ test "dispatch: email.send wraps webhook.send (JS shim) with Resend shape" {
         &d,
         kv,
         \\return email.send({
-        \\  key: "re_test_abc",
+        \\  apiKey: "re_test_abc",
         \\  from: "noreply@loop46.me",
         \\  to: "user@example.com",
         \\  subject: "Verify",
@@ -4034,15 +4036,15 @@ test "dispatch: email.send rejects missing key/from/to/subject" {
         \\catch (e) { return "threw:" + e.message; }
         ,
         // Missing from.
-        \\try { email.send({ key: "re_x", to: "c@d.com", subject: "s" }); return "ok"; }
+        \\try { email.send({ apiKey: "re_x", to: "c@d.com", subject: "s" }); return "ok"; }
         \\catch (e) { return "threw:" + e.message; }
         ,
         // Missing to.
-        \\try { email.send({ key: "re_x", from: "a@b.com", subject: "s" }); return "ok"; }
+        \\try { email.send({ apiKey: "re_x", from: "a@b.com", subject: "s" }); return "ok"; }
         \\catch (e) { return "threw:" + e.message; }
         ,
         // Missing subject.
-        \\try { email.send({ key: "re_x", from: "a@b.com", to: "c@d.com" }); return "ok"; }
+        \\try { email.send({ apiKey: "re_x", from: "a@b.com", to: "c@d.com" }); return "ok"; }
         \\catch (e) { return "threw:" + e.message; }
         ,
     };
@@ -5598,7 +5600,7 @@ test "dispatch: email.send accepts array `to`, `cc`, `bcc`" {
         &d,
         kv,
         \\return email.send({
-        \\  key: "re_x",
+        \\  apiKey: "re_x",
         \\  from: "a@b.com",
         \\  to: ["c@d.com", "e@f.com"],
         \\  cc: "g@h.com",

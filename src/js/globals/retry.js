@@ -11,11 +11,11 @@
 //     body: "...",
 //     headers: { "content-type": "application/json" },
 //     on: "charges/handler",           // module path in this tenant
-//     max_attempts: 3,
-//     // backoff_ms can be a number (constant), an array (per-attempt
+//     maxAttempts: 3,
+//     // backoffMs can be a number (constant), an array (per-attempt
 //     // schedule), or omitted (default exponential 1s/4s/16s capped
 //     // at 1 minute).
-//     backoff_ms: [1000, 5000, 30000],
+//     backoffMs: [1000, 5000, 30000],
 //     ctx: { charge_id: 42 },
 //   });
 //
@@ -70,8 +70,8 @@ function backoffMsFor(retry_state, next_attempt) {
  * retry.send({
  *   url: "https://stripe.com/charge",
  *   on: "charges/handler",
- *   max_attempts: 3,
- *   backoff_ms: [1000, 5000, 30000], // or a number, or omit
+ *   maxAttempts: 3,
+ *   backoffMs: [1000, 5000, 30000], // or a number, or omit
  *   ctx: { charge_id: 42 },
  * });
  *
@@ -92,20 +92,22 @@ globalThis.retry = {
    * @param {string} opts.url - Target URL.
    * @param {string} opts.on - Result handler module path in this
    *   tenant (non-empty).
-   * @param {number} [opts.max_attempts=1] - Total attempts incl. the
+   * @param {number} [opts.maxAttempts=1] - Total attempts incl. the
    *   first (positive integer).
-   * @param {number|number[]} [opts.backoff_ms] - Constant delay, a
+   * @param {number|number[]} [opts.backoffMs] - Constant delay, a
    *   per-attempt schedule, or omit for exponential 1s/4s/16s…
    *   capped at 60s.
    * @param {string} [opts.method] - HTTP method.
    * @param {Object<string,string>} [opts.headers] - Request headers.
    * @param {string} [opts.body] - Request body.
-   * @param {number} [opts.timeout_ms] - Per-request timeout.
-   * @param {bigint} [opts.fire_at_ns] - Delay the first attempt.
+   * @param {number} [opts.timeoutMs] - Per-request timeout.
+   * @param {bigint|number|Date|string} [opts.at] - Fire time for the
+   *   first attempt (webhook.send's `{at}`); or use `{in}`.
+   * @param {number|string} [opts.in] - Delay the first attempt.
    * @param {*} [opts.ctx] - Echoed back (under your own keys;
    *   `_retry` is reserved).
    * @returns {string} The {@link webhook.send} schedule id.
-   * @throws {TypeError} On missing/invalid `url`/`on`/`max_attempts`.
+   * @throws {TypeError} On missing/invalid `url`/`on`/`maxAttempts`.
    */
   send(opts) {
     if (!opts || typeof opts !== "object") {
@@ -114,38 +116,43 @@ globalThis.retry = {
     if (typeof opts.url !== "string") {
       throw new TypeError("retry.send: `url` must be a string");
     }
+    for (const pair of [["max_attempts", "maxAttempts"], ["backoff_ms", "backoffMs"], ["timeout_ms", "timeoutMs"], ["fire_at_ns", "at (or in)"], ["on_result_module", "on"], ["context", "ctx"]]) {
+      if (pair[0] in opts) throw new TypeError("retry.send: option `" + pair[0] + "` was renamed — use `" + pair[1] + "`");
+    }
     const on_key = opts.on;
     if (typeof on_key !== "string" || on_key.length === 0) {
       throw new TypeError("retry.send: `on` must be a non-empty string");
     }
-    const max_attempts = opts.max_attempts ?? 1;
+    const max_attempts = opts.maxAttempts ?? 1;
     if (!Number.isInteger(max_attempts) || max_attempts < 1) {
-      throw new TypeError("retry.send: `max_attempts` must be a positive integer");
+      throw new TypeError("retry.send: `maxAttempts` must be a positive integer");
     }
 
+    // Internal chain state (`_retry` on the ctx) keeps its wire shape.
     const original = {
       url: opts.url,
       method: opts.method,
       headers: opts.headers,
       body: opts.body,
-      timeout_ms: opts.timeout_ms,
+      timeout_ms: opts.timeoutMs,
     };
     const send_opts = {
       url: opts.url,
       method: opts.method,
       headers: opts.headers,
       body: opts.body,
-      timeout_ms: opts.timeout_ms,
-      fire_at_ns: opts.fire_at_ns,
+      timeoutMs: opts.timeoutMs,
+      at: opts.at,
+      in: opts.in,
       on: on_key,
       // Suppress webhook.send's built-in retry — the customer drives
-      // the chain explicitly through `retry.next`.
-      max_attempts: 1,
+      // the chain explicitly through `retry.again`.
+      maxAttempts: 1,
       ctx: Object.assign({}, opts.ctx || {}, {
         [RETRY_KEY]: {
           attempt: 1,
           max_attempts,
-          backoff_ms: opts.backoff_ms,
+          backoff_ms: opts.backoffMs,
           on_result_module: on_key,
           original,
         },
@@ -184,10 +191,6 @@ globalThis.retry = {
     const r = req.ctx[RETRY_KEY];
     const next_attempt = (r.attempt || 1) + 1;
     const delay = backoffMsFor(r, next_attempt);
-    let fire_at_ns;
-    if (delay > 0) {
-      fire_at_ns = BigInt(Date.now()) * 1_000_000n + BigInt(delay) * 1_000_000n;
-    }
     // User-domain ctx is everything except _retry.
     const user_ctx = Object.assign({}, req.ctx);
     delete user_ctx[RETRY_KEY];
@@ -195,10 +198,10 @@ globalThis.retry = {
       method: r.original.method,
       headers: r.original.headers,
       body: r.original.body,
-      timeout_ms: r.original.timeout_ms,
-      fire_at_ns,
+      timeoutMs: r.original.timeout_ms,
+      in: delay > 0 ? delay : undefined,
       on: r.on_result_module,
-      max_attempts: 1,
+      maxAttempts: 1,
       ctx: Object.assign({}, user_ctx, {
         [RETRY_KEY]: Object.assign({}, r, { attempt: next_attempt }),
       }),

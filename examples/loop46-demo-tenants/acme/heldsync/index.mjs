@@ -26,7 +26,7 @@ export default function () {
         headers: { "content-type": "application/json" },
         // Disable webhook.send's built-in retry — held-sync owns
         // its own retry policy via __rove_next.
-        max_attempts: 1,
+        maxAttempts: 1,
     };
     if (req.send_timeout_ms) opts.timeout_ms = req.send_timeout_ms;
     // NO on_result here — the resume engine is bound to the lone

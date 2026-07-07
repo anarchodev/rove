@@ -31,7 +31,7 @@
      * provider holds the connection). Closes
      * `docs/primitive-gaps.md` §2.5.
      *
-     * Same options as `after.fetch` minus the timeout (held
+     * Same options as `after.fetch` minus `timeoutMs` (held
      * subscriptions don't time out — they end on cancel or
      * upstream close) and `stream` (always true — held transfers
      * stream by definition). The `on_chunk` handler fires per
@@ -51,13 +51,13 @@
      * @param {string} [opts.method="GET"] - HTTP method.
      * @param {Object<string,string>} [opts.headers] - Request headers.
      * @param {string} [opts.body] - Request body.
-     * @param {string} opts.on_chunk - Module path for `on_chunk`
-     *   (REQUIRED). Same activation shape as a streamed `after.fetch`.
-     * @param {number} [opts.max_response_chunk_bytes=262144] -
-     *   Per-chunk cap.
-     * @param {number} [opts.max_total_response_bytes=52428800] -
-     *   Cumulative response cap; exceeding sets `bodyTruncated`
-     *   on the terminal event.
+     * @param {string} opts.on - Module path each upstream writeback
+     *   wakes (REQUIRED — the universal callback key). Same
+     *   activation shape as a streamed `after.fetch`.
+     * @param {number} [opts.maxChunkBytes=262144] - Per-chunk cap.
+     * @param {number} [opts.maxTotalBytes=52428800] - Cumulative
+     *   response cap; exceeding sets `bodyTruncated` on the terminal
+     *   event.
      * @param {*} [opts.ctx] - Threaded forward to each activation
      *   as `request.ctx`.
      * @returns {string} The subscription id. Pass to
@@ -66,13 +66,24 @@
      * @example
      * const id = http.subscribe({
      *   url: "https://bsky.network/xrpc/com.atproto.sync.subscribeRepos",
-     *   on_chunk: "ingest_firehose",
+     *   on: "ingest_firehose",
      *   ctx: { cursor: kv.get("firehose/cursor") },
      * });
      * kv.set("firehose/subscription_id", id);
      */
     subscribe(opts) {
-      return sys.subscribe(opts);
+      opts = opts || {};
+      for (const pair of [["on_chunk", "on"], ["max_response_chunk_bytes", "maxChunkBytes"], ["max_total_response_bytes", "maxTotalBytes"]]) {
+        if (pair[0] in opts) throw new TypeError("http.subscribe: option `" + pair[0] + "` was renamed — use `" + pair[1] + "`");
+      }
+      const native = Object.assign({}, opts);
+      delete native.on;
+      delete native.maxChunkBytes;
+      delete native.maxTotalBytes;
+      if (typeof opts.on === "string") native.on_chunk = opts.on;
+      if (opts.maxChunkBytes != null) native.max_response_chunk_bytes = opts.maxChunkBytes;
+      if (opts.maxTotalBytes != null) native.max_total_response_bytes = opts.maxTotalBytes;
+      return sys.subscribe(native);
     },
 
     /**

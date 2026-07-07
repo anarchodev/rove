@@ -15,33 +15,34 @@ globalThis.email = {
    * commits).
    *
    * @param {object} opts
-   * @param {string} opts.key - Resend API key (sent as
-   *   `Authorization: Bearer`).
+   * @param {string} opts.apiKey - Resend API key (sent as
+   *   `Authorization: Bearer`). Named apiKey — `key` means an
+   *   idempotency key everywhere else on this surface.
    * @param {string} opts.from - Sender address.
    * @param {string|string[]} opts.to - Recipient(s).
    * @param {string} opts.subject - Subject line.
    * @param {string} [opts.text] - Plain-text body.
    * @param {string} [opts.html] - HTML body.
-   * @param {string} [opts.reply_to] - Reply-To address.
+   * @param {string} [opts.replyTo] - Reply-To address.
    * @param {string|string[]} [opts.cc] - CC recipient(s).
    * @param {string|string[]} [opts.bcc] - BCC recipient(s).
    * @param {string} [opts.on] - Result handler module in this tenant
    *   (forwarded to `webhook.send`).
    * @param {*} [opts.ctx] - Echoed back as `request.ctx` on the result
    *   event.
-   * @param {number} [opts.max_attempts] - Override the built-in
+   * @param {number} [opts.maxAttempts] - Override the built-in
    *   webhook.send retry budget (default 5).
-   * @param {number} [opts.timeout_ms] - Per-attempt timeout.
+   * @param {number} [opts.timeoutMs] - Per-attempt timeout.
    * @returns {string} The marker id from {@link webhook.send}.
    * @throws {Error} `code:"rate_limited"` when the per-instance
    *   email bucket is exhausted.
-   * @throws {TypeError} On missing/invalid `key`/`from`/`subject`/`to`.
+   * @throws {TypeError} On missing/invalid `apiKey`/`from`/`subject`/`to`.
    *
    * @example
-   * const key = kv.get("secret/resend") ?? "re_dev_placeholder";
+   * const apiKey = kv.get("secret/resend") ?? "re_dev_placeholder";
    * const user = { email: "ada@example.com", name: "Ada" };
    * email.send({
-   *   key,
+   *   apiKey,
    *   from: "noreply@acme.dev",
    *   to: user.email,
    *   subject: "Welcome",
@@ -52,8 +53,11 @@ globalThis.email = {
     __rove_check_email_rate();
     if (!opts || typeof opts !== "object")
       throw new TypeError("email.send requires an options object");
-    if (typeof opts.key !== "string" || opts.key.length === 0)
-      throw new TypeError("email.send: `key` must be a non-empty string");
+    for (const pair of [["key", "apiKey"], ["reply_to", "replyTo"], ["max_attempts", "maxAttempts"], ["timeout_ms", "timeoutMs"]]) {
+      if (pair[0] in opts) throw new TypeError("email.send: option `" + pair[0] + "` was renamed — use `" + pair[1] + "`");
+    }
+    if (typeof opts.apiKey !== "string" || opts.apiKey.length === 0)
+      throw new TypeError("email.send: `apiKey` must be a non-empty string");
     if (typeof opts.from !== "string")
       throw new TypeError("email.send: `from` must be a string");
     if (typeof opts.subject !== "string")
@@ -67,14 +71,14 @@ globalThis.email = {
     };
     if (opts.text) body.text = opts.text;
     if (opts.html) body.html = opts.html;
-    if (opts.reply_to) body.reply_to = opts.reply_to;
+    if (opts.replyTo) body.reply_to = opts.replyTo;
     if (opts.cc) body.cc = Array.isArray(opts.cc) ? opts.cc : [opts.cc];
     if (opts.bcc) body.bcc = Array.isArray(opts.bcc) ? opts.bcc : [opts.bcc];
     const env = {
       url: "https://api.resend.com/emails",
       method: "POST",
       headers: {
-        "Authorization": "Bearer " + opts.key,
+        "Authorization": "Bearer " + opts.apiKey,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
@@ -82,8 +86,8 @@ globalThis.email = {
     // NOTE: email's `to` is the RECIPIENT — the callback key is `on`.
     if (opts.on) env.on = opts.on;
     if (opts.ctx !== undefined) env.ctx = opts.ctx;
-    if (opts.max_attempts) env.max_attempts = opts.max_attempts;
-    if (opts.timeout_ms != null) env.timeout_ms = opts.timeout_ms;
+    if (opts.maxAttempts) env.maxAttempts = opts.maxAttempts;
+    if (opts.timeoutMs != null) env.timeoutMs = opts.timeoutMs;
     return webhook.send(env.url, env);
   },
 };

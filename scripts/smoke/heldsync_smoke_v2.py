@@ -50,7 +50,7 @@ HELDSYNC_SRC = r"""export default function () {
         method: "POST",
         body: JSON.stringify({ from: "heldsync", tag: req.tag }),
         headers: { "content-type": "application/json" },
-        max_attempts: 1,
+        maxAttempts: 1,
     };
     if (req.send_timeout_ms) opts.timeout_ms = req.send_timeout_ms;
     webhook.send(req.target, opts);
@@ -72,7 +72,7 @@ ONRESULT_SRC = r"""export function onResult() {
                 method: "POST",
                 body: JSON.stringify({ from: "heldsync-retry", tag: ctx.tag }),
                 headers: { "content-type": "application/json" },
-                max_attempts: 1,
+                maxAttempts: 1,
             });
             return __rove_next("heldsync/onresult", {
                 fn: "onResult",

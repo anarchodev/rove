@@ -48,7 +48,7 @@ export default function () {
   for (const p of q.split("&")) { const i = p.indexOf("="); if (i<0) continue;
     if (decodeURIComponent(p.slice(0,i)) === "url") url = decodeURIComponent(p.slice(i+1)); }
   if (!url) { response.status = 400; return "no url"; }
-  after.fetch(url, {}, { on: "onUpstream" });
+  after.fetch(url, { on: "onUpstream" });
   return next();
 }
 export function onUpstream() {

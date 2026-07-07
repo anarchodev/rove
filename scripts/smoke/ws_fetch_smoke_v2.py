@@ -47,7 +47,7 @@ export function onMessage() {
   if (data.startsWith("fetch:")) {
     // READ-ONLY frame: on.fetch binds to the held chain and the result
     // resumes onUpstream over this socket.
-    after.fetch(data.slice(6), { method: "GET" }, { on: "onUpstream" });
+    after.fetch(data.slice(6), { method: "GET", on: "onUpstream" });
     return next();
   }
   stream.write("echo:" + data);

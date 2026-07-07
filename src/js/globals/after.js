@@ -23,6 +23,16 @@
   const sys = _system.after;
   const sysHttp = _system.http;
 
+// Fail-loud on retired option spellings (audit batch 3): silence would
+// mean a silently-ignored option — worse than a break, pre-launch.
+function _rejectRenamed(verb, opts, renames) {
+  if (!opts || typeof opts !== "object") return;
+  for (const k in renames) {
+    if (k in opts) throw new TypeError(verb + ": option `" + k + "` was renamed — use `" + renames[k] + "`");
+  }
+}
+
+
   // Lower the public `{on}` key onto the native binding's field.
   function tgt(opts) {
     if (opts && typeof opts === "object" && typeof opts.on === "string") {
@@ -106,19 +116,40 @@
      * @param {string|Uint8Array} [opts.body] - Request body.
      * @param {boolean} [opts.stream=false] - false → one result event;
      *   true → one event per upstream chunk as it arrives.
-     * @param {number} [opts.timeout_ms=30000] - Per-request timeout.
-     * @param {object} [dst]
-     * @param {string} [dst.on] - Export the result wakes; overrides the
+     * @param {number} [opts.timeoutMs=30000] - Per-request timeout.
+     * @param {number} [opts.maxChunkBytes=262144] - Per-chunk cap
+     *   (streamed fetches).
+     * @param {number} [opts.maxTotalBytes=52428800] - Cumulative
+     *   response cap; exceeding sets `bodyTruncated`.
+     * @param {*} [opts.ctx] - Threaded to each wake as `request.ctx`.
+     * @param {string} [opts.on] - Export the result wakes; overrides the
      *   per-event-shape defaults for every event of this fetch.
      * @returns {string} The fetch id (`ftch_…`, opaque — compare to
      *   `request.fetchId`).
      * @example
-     * after.fetch('https://api.example.com/stream', { stream: true },
-     *             { on: 'onUpstream' });
+     * after.fetch('https://api.example.com/stream',
+     *             { stream: true, on: 'onUpstream' });
      * return next();
      */
-    fetch(url, opts, dst) {
-      return sys.fetch(url, opts, tgt(dst));
+    fetch(url, opts) {
+      opts = opts || {};
+      _rejectRenamed("after.fetch", opts, {
+        timeout_ms: "timeoutMs",
+        max_response_chunk_bytes: "maxChunkBytes",
+        max_total_response_bytes: "maxTotalBytes",
+        to: "on",
+      });
+      const native = {
+        method: opts.method,
+        headers: opts.headers,
+        body: opts.body,
+        stream: opts.stream,
+        ctx: opts.ctx,
+      };
+      if (opts.timeoutMs != null) native.timeout_ms = opts.timeoutMs;
+      if (opts.maxChunkBytes != null) native.max_response_chunk_bytes = opts.maxChunkBytes;
+      if (opts.maxTotalBytes != null) native.max_total_response_bytes = opts.maxTotalBytes;
+      return sys.fetch(url, native, tgt(opts));
     },
 
     /**
@@ -131,7 +162,8 @@
      * @param {string} id - The `ftch_…` id.
      * @returns {void}
      * @example
-     * after.cancel(request.fetchId); // enough chunks — stop the rest
+     * const id = after.fetch("https://api.example.test/slow", { on: "onSlow" });
+     * after.cancel(id); // changed our mind before it landed
      */
     cancel(id) {
       return sysHttp.cancelFetch({ id: id });

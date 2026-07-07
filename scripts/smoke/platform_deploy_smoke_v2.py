@@ -63,8 +63,8 @@ ADMIN_SRC = (
     + "  const entries = ctx.results.map(function (r) {\n"
     + "    return { path: r.path, kind: \"handler\", source_hex: r.source_hex, bytecode_hex: r.bytecode_hex };\n"
     + "  });\n"
-    + "  const h = platform.scope(TARGET).blob.put(%s, { content_type: \"text/plain; charset=utf-8\" });\n" % json.dumps(TARGET_STATIC)
-    + "  entries.push({ path: \"_static/hi.txt\", kind: \"static\", source_hex: h, content_type: \"text/plain; charset=utf-8\" });\n"
+    + "  const h = platform.scope(TARGET).blob.put(%s, { contentType: \"text/plain; charset=utf-8\" });\n" % json.dumps(TARGET_STATIC)
+    + "  entries.push({ path: \"_static/hi.txt\", kind: \"static\", source_hex: h, contentType: \"text/plain; charset=utf-8\" });\n"
     + "  platform.scope(TARGET).deploy.stampManifest(entries, { name: \"onStamped\" });\n"
     + "  return next();\n"
     + "  } catch (e) { response.status = 200; return JSON.stringify({ ok: false, error: String(e), stack: (e && e.stack) || null }); }\n"

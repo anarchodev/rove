@@ -51,7 +51,7 @@ CBFIRE_SRC = '''export function fire(url, tag) {
         headers: { "content-type": "text/plain" },
         on: "cbresult",
         ctx: { tag: tag },
-        max_attempts: 2,
+        maxAttempts: 2,
     });
     kv.set("cb/last_fire", id);
     return { id: id };

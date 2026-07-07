@@ -189,10 +189,10 @@ class OIDCProvider {
   // no explicitly-threaded host / genesis capture is needed.
   _armRotation(fire_at_ms) {
     webhook.send("https://" + request.host + "/_oidc/rotate", {
-      handle: this.cfg.rot_handle,
+      key: this.cfg.rot_handle,
       method: "POST",
       body: "",
-      fire_at_ns: BigInt(Math.floor(fire_at_ms)) * 1000000n,
+      at: BigInt(Math.floor(fire_at_ms)) * 1000000n,
     });
   }
 
@@ -814,7 +814,7 @@ class OIDCRelyingParty {
    * @param {object} config - Required: `issuer`, `client_id`,
    *   `redirect_uri`. Optional: `post_login` (default `/`),
    *   `operator_prefix` (empty ⇒ `is_root` always false), kv-path /
-   *   TTL / `leeway_s` overrides.
+   *   TTL / `leewaySeconds` overrides.
    * @param {string} name - Config name; namespaces the kv key paths.
    * @throws {TypeError} Missing `issuer`/`client_id`/`redirect_uri`.
    */
@@ -838,7 +838,7 @@ class OIDCRelyingParty {
       state_ttl_ms: config.state_ttl_ms || 10 * 60 * 1000,
       session_ttl_ms: config.session_ttl_ms || 7 * 24 * 60 * 60 * 1000,
       // jwt.validateClaims clock-skew tolerance.
-      leeway_s: config.leeway_s != null ? config.leeway_s : 30,
+      leewaySeconds: config.leewaySeconds != null ? config.leewaySeconds : 30,
     };
   }
 
@@ -1083,7 +1083,7 @@ class OIDCRelyingParty {
     const claim_err = jwt.validateClaims(v.payload, {
       iss: this.cfg.issuer,
       aud: this.cfg.client_id,
-      leeway_s: this.cfg.leeway_s,
+      leewaySeconds: this.cfg.leeway_s,
     });
     if (claim_err) { response.status = 200; return "id_token " + claim_err; }
 

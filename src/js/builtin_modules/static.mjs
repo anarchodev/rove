@@ -48,7 +48,7 @@ export default function () {
   // `opts.ctx` threads {hash,ct} to each onChunk as request.ctx.
   after.fetch(
     "http://rove-static.internal/" + c.hash,
-    { method: "GET", stream: true, max_response_chunk_bytes: 256 * 1024, ctx: c },
+    { method: "GET", stream: true, maxChunkBytes: 256 * 1024, ctx: c },
     { on: "onChunk" },
   );
   return next();

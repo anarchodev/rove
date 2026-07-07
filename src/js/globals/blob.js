@@ -27,6 +27,13 @@
 const sysHttp = _system.http;
 const sysBlob = _system.blob;
 
+function _rejectRenamedBlob(verb, opts) {
+  if (!opts || typeof opts !== "object") return;
+  for (const pair of [["content_type", "contentType"], ["max_bytes", "maxBytes"], ["on_result", "on"], ["context", "ctx"]]) {
+    if (pair[0] in opts) throw new TypeError(verb + ": option `" + pair[0] + "` was renamed — use `" + pair[1] + "`");
+  }
+}
+
 const BLOB_ORIGIN = "http://rove-blob.internal/";
 const HASH_RE = /^[0-9a-f]{64}$/;
 
@@ -69,7 +76,7 @@ globalThis.blob = {
    *   activation arena — multi-MB media wants the streaming verbs
    *   (P2/P3, not yet shipped).
    * @param {object} [opts]
-   * @param {string} [opts.content_type] - Stored Content-Type,
+   * @param {string} [opts.contentType] - Stored Content-Type,
    *   returned on direct GETs of the object.
    * @param {string} [opts.on] - Module path receiving the
    *   terminal result on the unified flattened surface (handler-shape
@@ -86,6 +93,7 @@ globalThis.blob = {
    */
   put(bytes, opts) {
     opts = opts || {};
+    _rejectRenamedBlob("blob.put", opts);
     if (typeof bytes !== "string" && !(bytes instanceof Uint8Array))
       throw new TypeError("blob.put: bytes must be a string or Uint8Array");
     const hash = crypto.sha256(bytes);
@@ -94,7 +102,7 @@ globalThis.blob = {
 
     const marker = {
       hash: hash,
-      content_type: opts.content_type || null,
+      content_type: opts.contentType || null,
       attempts: 1,
       on_result: on_result,
       context: context,
@@ -106,7 +114,7 @@ globalThis.blob = {
       url: BLOB_ORIGIN + hash,
       method: "PUT",
       body: bytes,
-      headers: opts.content_type ? { "content-type": opts.content_type } : {},
+      headers: opts.contentType ? { "content-type": opts.contentType } : {},
       on_chunk: "__system/blob_onresult",
       ctx: { hash: hash, on_result: on_result, context: context },
     });
@@ -126,8 +134,8 @@ globalThis.blob = {
    * @param {*} [opts.ctx] - Delivered as `request.ctx` on the
    *   resume (JSON round-trip).
    * @param {boolean} [opts.stream] - Per-chunk delivery (default
-   *   false: one whole-body result, up to `max_bytes`).
-   * @param {number} [opts.max_bytes] - Whole-body transport cap
+   *   false: one whole-body result, up to `maxBytes`).
+   * @param {number} [opts.maxBytes] - Whole-body transport cap
    *   (default 8 MB). The per-request arena (100 MiB allocation
    *   volume) comfortably covers decoding bodies this size; for
    *   serving bytes your handler doesn't execute on, prefer the
@@ -144,21 +152,21 @@ globalThis.blob = {
    */
   get(hash, opts) {
     opts = opts || {};
+    _rejectRenamedBlob("blob.get", opts);
     assertHash(hash, "blob.get");
     const fetch_opts = {
       method: "GET",
       stream: !!opts.stream,
-      max_response_chunk_bytes: opts.stream
-        ? (opts.max_chunk_bytes || 256 * 1024)
-        : (opts.max_bytes || 8 * 1024 * 1024),
+      maxChunkBytes: opts.stream
+        ? (opts.maxChunkBytes || 256 * 1024)
+        : (opts.maxBytes || 8 * 1024 * 1024),
     };
     // `ctx` rides the fetch and resumes as `request.ctx` — how
     // composers (segments.get) thread slicing info to the `to`
     // export without kv round-trips.
     if (opts.ctx !== undefined) fetch_opts.ctx = opts.ctx;
-    const get_on = typeof opts.on === "string" ? opts.on : undefined;
-    return after.fetch(BLOB_ORIGIN + hash, fetch_opts,
-                       get_on ? { on: get_on } : undefined);
+    if (typeof opts.on === "string") fetch_opts.on = opts.on;
+    return after.fetch(BLOB_ORIGIN + hash, fetch_opts);
   },
 
   /**
@@ -177,7 +185,7 @@ globalThis.blob = {
    * @param {object} [opts]
    * @param {number} [opts.ttl] - Validity in seconds (default 300,
    *   max 604800 = 7 days).
-   * @param {string} [opts.content_type] - Signed response
+   * @param {string} [opts.contentType] - Signed response
    *   Content-Type override (S3 returns exactly this).
    * @returns {string} The presigned URL.
    */
@@ -185,7 +193,7 @@ globalThis.blob = {
     opts = opts || {};
     assertHash(hash, "blob.url");
     return sysBlob.presign(hash, opts.ttl != null ? opts.ttl : null,
-                           opts.content_type != null ? opts.content_type : null);
+                           opts.contentType != null ? opts.contentType : null);
   },
 
   /**
@@ -208,7 +216,7 @@ globalThis.blob = {
    * @example
    * export function onMirrorChunk() {
    *   if (!request.done) { blob.write(request.bytes); return next(); }
-   *   blob.seal({ on: "onStored", content_type: "image/png" });
+   *   blob.seal({ on: "onStored", contentType: "image/png" });
    *   return next();
    * }
    */
@@ -235,7 +243,7 @@ globalThis.blob = {
    * @param {object} opts
    * @param {string} opts.on - Export resumed with the PUT result
    *   (required).
-   * @param {string} [opts.content_type] - Stored Content-Type.
+   * @param {string} [opts.contentType] - Stored Content-Type.
    * @returns {string} The object's sha256 hash (64 hex chars).
    *
    * @example
@@ -251,12 +259,13 @@ globalThis.blob = {
    * }
    */
   seal(opts) {
+    _rejectRenamedBlob("blob.seal", opts);
     opts = opts || {};
     const on_key = opts.on;
     if (typeof on_key !== "string" || !on_key.length)
       throw new TypeError("blob.seal: `on` export name is required");
     return sysBlob.seal(on_key,
-                        opts.content_type != null ? opts.content_type : undefined);
+                        opts.contentType != null ? opts.contentType : undefined);
   },
 
   /**
@@ -298,6 +307,7 @@ globalThis.blob = {
    * }
    */
   receive(opts) {
+    _rejectRenamedBlob("blob.receive", opts);
     opts = opts || {};
     const on_key = opts.on;
     if (typeof on_key !== "string" || !on_key.length)

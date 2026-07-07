@@ -304,7 +304,7 @@ const EPILOGUE_BODY =
     \\  globalThis.stream = { start() {}, write(c) { __effects.push({ kind: "stream", bytes: __b2s(c).length }); } };
     \\  const __tgt = (d) => (d && (d.on || d.to)) || null;
     \\  globalThis.after = {
-    \\    fetch(url, opts, dst) { __effects.push({ kind: "fetch", url, method: (opts && opts.method) || "GET", body: (opts && opts.body !== undefined) ? opts.body : null, ctx: (opts && opts.ctx !== undefined) ? opts.ctx : null, on: __tgt(dst) }); },
+    \\    fetch(url, opts) { __effects.push({ kind: "fetch", url, method: (opts && opts.method) || "GET", body: (opts && opts.body !== undefined) ? opts.body : null, ctx: (opts && opts.ctx !== undefined) ? opts.ctx : null, on: (opts && opts.on) || null }); },
     \\    kv(prefix, dst) { __effects.push({ kind: "kv-wake", prefix, on: __tgt(dst) }); },
     \\    ms(ms, dst) { __effects.push({ kind: "timer", ms, on: __tgt(dst) }); },
     \\  };

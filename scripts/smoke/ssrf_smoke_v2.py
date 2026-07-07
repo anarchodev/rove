@@ -43,8 +43,8 @@ HELDSYNC_SRC = r"""export default function () {
         method: "POST",
         body: JSON.stringify({ from: "ssrf-smoke", tag: req.tag }),
         headers: { "content-type": "application/json" },
-        max_attempts: 1,
-        timeout_ms: 8000,
+        maxAttempts: 1,
+        timeoutMs: 8000,
     });
     return __rove_next("probe/onresult", {
         fn: "onResult",

@@ -113,13 +113,19 @@ globalThis.webhook = {
    * @param {Object<string,string>} [opts.headers] - Extra headers.
    *   `X-Rove-Schedule-Id` and `X-Rove-Schedule-Version` are added
    *   by the platform on fire — don't set them yourself.
-   * @param {string} [opts.handle] - Customer-chosen idempotency
-   *   handle. Same handle → same id → same `_send/owed/{id}` row
-   *   (last write wins). Omit for a fresh random id.
-   * @param {bigint|number} [opts.fire_at_ns] - Epoch nanoseconds.
-   *   `> now` defers the fire to a durable scheduled wake (the marker
-   *   is written but no `http.fetch` happens until the wake fires).
-   *   Omit or `<= now` for fire-as-soon-as-handler-commits.
+   * @param {string} [opts.key] - Idempotency key — the same word it
+   *   is on `schedule`: same key → same id → same `_send/owed/{id}`
+   *   row (last write wins). Omit for a fresh random id.
+   * @param {bigint|number|Date|string} [opts.at] - Absolute fire time
+   *   (bigint ns, number ms-since-epoch, Date, or ISO-8601 — the
+   *   `schedule({at})` coercions). A future time defers the fire to a
+   *   durable scheduled wake; omitted/past = fire on commit.
+   * @param {number|string} [opts.in] - Delay from now (ms, or a
+   *   duration string `"30s"`/`"5m"` — the `schedule({in})` shape).
+   * @param {number} [opts.maxAttempts=5] - Retry budget (1 first
+   *   fire + up to 4 backoff retries).
+   * @param {number} [opts.timeoutMs] - Per-attempt timeout, applied
+   *   to every fire (first, deferred, retries).
    * @param {string} [opts.on] - Module path of a customer result
    *   handler. Receives the terminal event on the unified flattened
    *   surface (handler-shape §7): the response on `request.bytes` /
@@ -152,8 +158,8 @@ globalThis.webhook = {
    * // Scheduled fire — write the marker now, fire in 5 minutes.
    * webhook.send("https://example.test/reminder", {
    *   body: "ping",
-   *   handle: "reminder/" + user_id,        // idempotent
-   *   fire_at_ns: BigInt(Date.now() + 300_000) * 1_000_000n,
+   *   key: "reminder/" + userId,        // idempotent
+   *   in: "5m",
    * });
    */
   send(url, maybeOpts) {
@@ -163,6 +169,9 @@ globalThis.webhook = {
     if (maybeOpts != null && typeof maybeOpts !== "object")
       throw new TypeError("webhook.send: opts must be an object");
     const opts = Object.assign({}, maybeOpts || {}, { url: url });
+    for (const pair of [["handle", "key"], ["fire_at_ns", "at (or in)"], ["max_attempts", "maxAttempts"], ["timeout_ms", "timeoutMs"], ["on_result", "on"], ["context", "ctx"]]) {
+      if (pair[0] in opts) throw new TypeError("webhook.send: option `" + pair[0] + "` was renamed — use `" + pair[1] + "`");
+    }
 
     const on_key = typeof opts.on === "string" ? opts.on : null;
     const ctx_val = opts.ctx !== undefined ? opts.ctx : null;
@@ -180,37 +189,40 @@ globalThis.webhook = {
     // webhook_onresult.mjs shim.
     const on_result = on_key;
 
-    // Id derivation: deterministic from handle, else randomUUID
-    // (taped → replay-deterministic).
+    // Id derivation: deterministic from the idempotency key, else
+    // randomUUID (taped → replay-deterministic).
     let id;
-    if (typeof opts.handle === "string" && opts.handle.length > 0) {
-      // base64url(no pad)(sha256(handle)). 43 chars, URL-safe, no
+    if (typeof opts.key === "string" && opts.key.length > 0) {
+      // base64url(no pad)(sha256(key)). 43 chars, URL-safe, no
       // collisions in practice; deterministic so two webhook.sends
-      // with the same handle land on the same `_send/owed/{id}`.
-      id = base64url.encode(hex.decode(crypto.sha256(opts.handle)));
+      // with the same key land on the same `_send/owed/{id}`.
+      id = base64url.encode(hex.decode(crypto.sha256(opts.key)));
     } else {
       id = crypto.randomUUID();
     }
 
-    // Resolve fire_at_ns to a BigInt. now_ns is a BigInt (Date.now()
-    // is a Number; multiply by 1e6n converts).
+    // Resolve the fire time: {at} (absolute, schedule's coercions via
+    // cron.toFireAtNs) or {in} (delay: ms or duration string).
     const now_ns = BigInt(Date.now()) * 1_000_000n;
     let fire_at_ns_big = 0n;
-    if (opts.fire_at_ns != null) {
-      fire_at_ns_big = typeof opts.fire_at_ns === "bigint"
-        ? opts.fire_at_ns
-        : BigInt(Math.floor(opts.fire_at_ns));
+    if (opts.at != null) {
+      fire_at_ns_big = cron.toFireAtNs(opts.at);
+    } else if (opts.in != null) {
+      const ms = typeof opts.in === "number" ? Math.floor(opts.in) : cron.parseDuration(opts.in);
+      if (ms == null || typeof ms !== "number")
+        throw new TypeError('webhook.send: `in` must be a number (ms) or a duration string ("30s", "5m")');
+      fire_at_ns_big = now_ns + BigInt(ms) * 1_000_000n;
     }
     const scheduled = fire_at_ns_big > now_ns;
 
-    // `max_attempts` caps the built-in retry loop in
+    // `maxAttempts` caps the built-in retry loop in
     // `__system/webhook_onresult`. Default 5 (1 initial fire + 4
     // retries with exponential backoff capped at 60s). Customers
     // who want a different policy can set it explicitly; the
     // `retry.send` wrapper sets `1` to disable the built-in retry
     // and drive its own customer-side chain.
-    const max_attempts = (opts.max_attempts != null && opts.max_attempts >= 1)
-      ? Math.floor(opts.max_attempts)
+    const max_attempts = (opts.maxAttempts != null && opts.maxAttempts >= 1)
+      ? Math.floor(opts.maxAttempts)
       : 5;
 
     const marker = {
@@ -223,6 +235,7 @@ globalThis.webhook = {
       on_result: on_result,
       context: ctx_val,
     };
+    if (opts.timeoutMs != null) marker.timeout_ms = Math.floor(opts.timeoutMs);
     kv.set("_send/owed/" + id, JSON.stringify(marker));
 
     // The durable next-fire entry (one per send, idempotency key
@@ -275,6 +288,7 @@ globalThis.webhook = {
         // Platform-internal option — customers don't use it
         // directly.
         bound_send_id: id,
+        timeout_ms: marker.timeout_ms,
         ctx: {
           id: id,
           on_result: on_result,
