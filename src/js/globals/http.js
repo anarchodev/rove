@@ -60,8 +60,10 @@
      *   event.
      * @param {*} [opts.ctx] - Threaded forward to each activation
      *   as `request.ctx`.
-     * @returns {string} The subscription id. Pass to
-     *   {@link http.cancelSubscription}.
+     * @returns {string} The subscription id — the same `ftch_…` form
+     *   as `after.fetch`'s return and each chunk's
+     *   `request.activation.fetchId`, so you can correlate them
+     *   directly. Pass to {@link http.cancelSubscription}.
      *
      * @example
      * const id = http.subscribe({
