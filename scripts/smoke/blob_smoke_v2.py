@@ -159,7 +159,7 @@ export default function () {
 export function onSeg() {
   if (!request.done) return next();
   if (request.status !== 200) { response.status = 502; return "segment fetch failed"; }
-  return "sealed:" + segments.slice(request);
+  return "sealed:" + segments.record();
 }
 """
 

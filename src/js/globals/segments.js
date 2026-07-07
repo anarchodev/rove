@@ -141,8 +141,8 @@ globalThis.segments = {
   /**
    * Read one record. Hot records return synchronously; sealed
    * records need a blob fetch, so the result resumes THIS held
-   * connection at `opts.to` — use {@link segments.slice} there to
-   * extract the record from the segment.
+   * connection at the `{on}` export — call {@link segments.record}
+   * there to unpack your record from the fetched segment.
    *
    * @param {string} log - Log id.
    * @param {number} seq - Sequence number.
@@ -151,7 +151,7 @@ globalThis.segments = {
    *   a sealed read. Required when the record may be sealed.
    * @returns {string|null|undefined} The value (hot), `null` (no
    *   such record), or `undefined` (sealed — the fetch is in flight,
-   *   return `next()` and finish in `opts.to`).
+   *   return `next()` and finish in the `{on}` export).
    *
    * @example
    * export default function () {
@@ -162,7 +162,7 @@ globalThis.segments = {
    * }
    * export function onSeg() {
    *   if (!request.done) return next();
-   *   return segments.slice(request);
+   *   return segments.record();
    * }
    */
   get(log, seq, opts) {
@@ -195,20 +195,20 @@ globalThis.segments = {
   },
 
   /**
-   * Extract the requested record from a sealed-segment fetch resume.
-   * Call from the `to` export `segments.get` routed to, after
-   * `request.done`.
-   *
-   * @param {object} req - The `request` global of the resume.
+   * Unpack the requested record from a sealed-segment fetch resume —
+   * the completion half of {@link segments.get}. Call from the `{on}`
+   * export the get routed to, after `request.done`; reads the ambient
+   * `request` itself (no arguments).
    * @returns {string} The record value.
    */
-  slice(req) {
+  record() {
+    const req = globalThis.request;
     if (!req || !req.ctx || typeof req.ctx.idx !== "number")
-      throw new TypeError("segments.slice: not a segments.get resume");
+      throw new TypeError("segments.record: not a segments.get resume");
     const seg = req.json;
     const v = seg.values[req.ctx.idx];
     if (v === undefined)
-      throw new RangeError("segments.slice: segment does not contain seq " + req.ctx.seq);
+      throw new RangeError("segments.record: segment does not contain seq " + req.ctx.seq);
     return v;
   },
 
