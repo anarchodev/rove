@@ -50,8 +50,8 @@ GROUPS = [
     ("Durable effects",
      "Connectionless work that survives anything: outbound delivery "
      "(`webhook`, `email`, `retry`) and future activations "
-     "(`scheduler`, `schedule`/`cron`).",
-     ["webhook", "email", "retry", "scheduler", "schedule", "cron"]),
+     "(`schedule`, `cron`).",
+     ["webhook", "email", "retry", "schedule", "cron"]),
     ("Browser agent", None, ["browser"]),
     ("Utilities", None,
      ["crypto", "jwt", "base64", "textcodec", "urlsearchparams",
@@ -67,7 +67,6 @@ SKIPPED = {"request", "http"}  # documented by the Handlers page / contract
 BARE_FILES = {
     "cron": ("cron helpers", "Fire-time helpers for durable scheduling.", "cron"),
     "next": ("next", "The held-connection disposition.", ""),
-    "schedule": ("schedule / cron", "Durable, connectionless timers.", ""),
     "textcodec": ("TextEncoder / TextDecoder", "UTF-8 bytes ↔ string.", ""),
     "urlsearchparams": ("URLSearchParams", "Query/form-body parsing.", ""),
 }

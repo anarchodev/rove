@@ -219,7 +219,7 @@ rather than merely obeying them:
 - **`webhook.send` / `email.send` are JS shims, not Zig primitives.**
   They compose `kv.set("_send/owed/{id}", ...)` (rides envelope-0
   atomic with the handler's writes) + the outbound HTTP primitive + a
-  durable scheduled wake (the `scheduler` lib; re-arm = `scheduler.at`
+  durable scheduled wake (the `schedule` verb; re-arm = `schedule`
   with the same key). The original "durable-intent" framing (a
   baked-in Zig primitive) was a premature optimization: every piece
   composes from primitives that exist. The composition is **visible

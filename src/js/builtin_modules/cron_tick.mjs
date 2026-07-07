@@ -31,7 +31,7 @@ export default function () {
     // last-write-wins, so a cron stays exactly one durable entry.
     try {
         const nextNs = cron.next(spec);
-        scheduler.at(nextNs, "__system/cron_tick", { spec, target, ctx }, { key: a.key });
+        schedule({ at: nextNs }, "__system/cron_tick", { spec, target, ctx }, { key: a.key });
     } catch (_e) {
         // A spec that no longer parses (shouldn't happen — `cron()`
         // validated it) just stops recurring rather than crashing.
@@ -42,7 +42,7 @@ export default function () {
     // can't chain via the disposition return (those are inert on a
     // wake origin); routing through the scheduler keeps the target a
     // clean independent activation.
-    scheduler.in(0, target, ctx === undefined ? null : ctx);
+    schedule({ in: 0 }, target, ctx === undefined ? null : ctx);
 
     return { status: 200 };
 }

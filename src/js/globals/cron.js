@@ -292,7 +292,7 @@ function _parseField(field, min, max) {
  * occurrence of the crontab `spec` (docs/handler-shape.md §2.4). A
  * connectionless trigger — the fire is a fresh durable activation with
  * no held socket, surviving leader changes (it rides the gap-2.6
- * scheduler). Idempotent: re-calling with the same `(spec, target)`
+ * schedule verb). Idempotent: re-calling with the same `(spec, target)`
  * (e.g. on every request) keeps exactly one cron registration.
  *
  * The callable `cron` also carries the time/expr helpers as statics
@@ -306,7 +306,7 @@ function _parseField(field, min, max) {
  * @param {*} [ctx] - JSON-serializable value delivered to the target as
  *   `request.activation.msg`.
  * @returns {string} The stable registration id (cancel via
- *   `scheduler.cancel(id)`).
+ *   `schedule.cancel(id)`).
  * @throws {TypeError} On a non-string `spec`/`target` or malformed spec.
  * @example
  * cron("0 3 * * *", "jobs/cleanup");        // nightly cleanup
@@ -323,12 +323,12 @@ function cron(spec, target, ctx) {
   // malformed expression — fail at registration, not at fire time).
   const firstNs = cron.next(spec);
   // Stable id from (spec, target) so re-registering is idempotent —
-  // base64url(no pad)(sha256(...)), mirroring webhook/scheduler ids.
+  // base64url(no pad)(sha256(...)), mirroring webhook/schedule ids.
   const key = "cron/" + spec + " " + target;
-  // Return the scheduler ID (not the key) — that's what scheduler.get /
-  // scheduler.cancel take and what `_sched/by_id/{id}` is keyed by.
-  return scheduler.at(
-    firstNs,
+  // Return the schedule ID (not the key) — that's what schedule.get /
+  // schedule.cancel take and what `_sched/by_id/{id}` is keyed by.
+  return schedule(
+    { at: firstNs },
     "__system/cron_tick",
     { spec, target, ctx: ctx === undefined ? null : ctx },
     { key },

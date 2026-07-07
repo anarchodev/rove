@@ -54,7 +54,7 @@ const RETIRED_SPELLINGS = [_]RetiredSpelling{
     .{ .pattern = "on.fetch(", .hint = "the connection-wake namespace is `after.*` (after.fetch)" },
     .{ .pattern = "on.kv(", .hint = "the connection-wake namespace is `after.*` (after.kv)" },
     .{ .pattern = "on.timer(", .hint = "the connection-wake namespace is `after.*` (after.ms)" },
-    .{ .pattern = "scheduler.after(", .hint = "the durable delay verb is `scheduler.in`" },
+    .{ .pattern = "scheduler.", .hint = "the scheduler lib folded into `schedule` (schedule(when, target, ctx?, opts?) + schedule.cancel/get)" },
     .{ .pattern = "webhook.send({", .hint = "webhook.send takes a positional url: webhook.send(url, opts)" },
     .{ .pattern = "on_result", .hint = "the universal callback-target key is `{on}`" },
     .{ .pattern = "{ to:", .hint = "the universal callback-target key is `{on}`" },

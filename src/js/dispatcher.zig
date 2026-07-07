@@ -983,7 +983,7 @@ test "dispatch: webhook.send writes _send/owed/{id} marker (immediate fire path)
 
     // The immediate path arms a crash-recovery watchdog wake aimed at
     // the baked `__system/webhook_fire`. Schedule id =
-    // base64url-no-pad(sha256("_send/" + id)) (scheduler.at's
+    // base64url-no-pad(sha256("_send/" + id)) (schedule's opts.key
     // opts.key recipe).
     const sched_raw = try readSchedByKey(kv, resp.body);
     defer testing.allocator.free(sched_raw);
@@ -1631,7 +1631,7 @@ test "dispatch: webhook.send(url, {on, ctx}) canonical form writes the marker (�
     try testing.expect(std.mem.indexOf(u8, marker, "\"url\":\"https://t.example/hook\"") != null);
 }
 
-test "dispatch: scheduler.in schedules; the scheduler.after alias is gone (§2.3)" {
+test "dispatch: schedule verb owns the whole timer surface; scheduler global is gone" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
     defer {
@@ -1643,16 +1643,20 @@ test "dispatch: scheduler.in schedules; the scheduler.after alias is gone (§2.3
     var resp = try runOne(
         &d,
         kv,
-        \\const a = scheduler.in(5000, "jobs/x", { p: 1 });
+        \\const a = schedule({ in: 5000 }, "jobs/x", { p: 1 }, { key: "job-x" });
         \\if (typeof a !== "string") return "bad";
-        \\if (typeof scheduler.after !== "undefined") return "after-alias-still-installed";
-        \\return "ok:" + (kv.get("_sched/by_id/" + a) !== null);
+        \\if (typeof globalThis.scheduler !== "undefined") return "scheduler-still-installed";
+        \\const s = schedule.get(a);
+        \\if (!s || s.target !== "jobs/x" || s.key !== "job-x") return "get-wrong";
+        \\if (kv.get("_sched/by_id/" + a) === null) return "no-row";
+        \\if (!schedule.cancel(a)) return "cancel-missed";
+        \\return "ok:" + (kv.get("_sched/by_id/" + a) === null) + ":" + (schedule.get(a) === null);
     ,
         .{ .method = "POST", .path = "/" },
     );
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("", resp.exception);
-    try testing.expectEqualStrings("ok:true", resp.body);
+    try testing.expectEqualStrings("ok:true:true", resp.body);
 }
 
 test "dispatch: durable_wake payload reads as request.ctx ONLY (one-ctx §2.4)" {

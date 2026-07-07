@@ -268,7 +268,7 @@ fn translateSpec(
         std.log.err(
             "rove-js: subscription `{s}` kind=cron is retired — register recurrence from any " ++
                 "handler activation instead: `cron(\"*/1 * * * *\", \"module/path\")` (crontab, durable) " ++
-                "or a self-re-arming `scheduler.in(intervalMs, ...)` for sub-minute intervals; " ++
+                "or a self-re-arming `schedule({in: ms}, ..., {key})` for sub-minute intervals; " ++
                 "registrations are idempotent by key and survive deploys",
             .{name},
         );
@@ -288,7 +288,7 @@ fn translateSpec(
     if (std.mem.eql(u8, raw.kind, "boot")) {
         // Retired 2026-07-05 (handler-api-ergonomics arc; unused). The
         // "run once on deploy" hook is gone — seed recurring
-        // registrations (`cron`, `scheduler.in`) from any handler
+        // registrations (`cron`, `schedule`) from any handler
         // activation; they are idempotent by key and `_sched/*`
         // entries are durable kv that survive deploys. Fail the
         // deploy loudly with the recipe, same posture as kind=cron.

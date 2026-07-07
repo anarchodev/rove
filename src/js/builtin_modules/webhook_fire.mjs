@@ -63,7 +63,7 @@ export default function () {
 
     // (2) watchdog re-arm — covers a crash between this fire and the
     // onresult commit.
-    scheduler.in(WATCHDOG_MS, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
+    schedule({ in: WATCHDOG_MS }, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
 
     // (3) the attempt.
     const attempts = typeof owed.attempts === "number" ? owed.attempts : 0;

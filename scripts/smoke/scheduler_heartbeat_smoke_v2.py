@@ -7,7 +7,7 @@ clock, `CronState` + `sweepCronSubscriptions`) is RETIRED. This smoke
 proves the migration recipe gives the same behavior, durably:
 
   - a plain `/seed` handler activation seeds
-    `scheduler.in(1000, "heartbeat", null, {key: "heartbeat"})`
+    `schedule({in: 1000}, "heartbeat", null, {key: "heartbeat"})`
     (kind=boot subscriptions are RETIRED too — seeding happens from any
     handler activation; `_sched/*` entries are durable kv);
   - the `heartbeat` target increments `hb-fire-count`, stamps
@@ -40,7 +40,7 @@ from smoke_lib_v2 import V2Cluster  # noqa: E402
 # Seed handler: registers the first heartbeat wake. The idempotency key
 # makes re-seeding harmless (same key ⇒ same id ⇒ last-write-wins).
 SEED_SRC = r'''export default function () {
-    scheduler.in(1000, "heartbeat", { n: 0 }, { key: "heartbeat" });
+    schedule({ in: 1000 }, "heartbeat", { n: 0 }, { key: "heartbeat" });
     kv.set("hb-seeded", "1");
     return "seeded";
 }'''
@@ -54,7 +54,7 @@ HEARTBEAT_SRC = r'''export default function () {
     kv.set("hb-fire-count", String(count));
     kv.set("hb-last-fired-at-ns", String(BigInt(Date.now()) * 1_000_000n));
     // Re-arm for the next interval — same key keeps it one entry.
-    scheduler.in(1000, "heartbeat", { n: count }, { key: a.key });
+    schedule({ in: 1000 }, "heartbeat", { n: count }, { key: a.key });
     return { status: 200 };
 }'''
 
@@ -202,7 +202,7 @@ def main() -> int:
         print(f"\nFAILURES ({len(failures)}): {failures}")
         return 1
     print("\nPASS scheduler-heartbeat smoke (v2): handler-seeded self-re-arming "
-          "scheduler.in interval recurrence + loud kind=cron/kind=boot retirement")
+          "schedule({in}) opts.key interval recurrence + loud kind=cron/kind=boot retirement")
     return 0
 
 

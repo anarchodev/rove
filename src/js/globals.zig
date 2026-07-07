@@ -1943,7 +1943,6 @@ pub fn installStatic(ctx: *c.JSContext) void {
     evalSnippet(ctx, "cron.js", CRON_JS);
     evalSnippet(ctx, "retry.js", RETRY_JS);
     // §2.6 durable scheduled wake. After base64/crypto/kv (its deps).
-    evalSnippet(ctx, "scheduler.js", SCHEDULER_JS);
     // Handler-surface Phase 5: connectionless `schedule` verb (after
     // scheduler.js + cron.js — reuses cron.parseDuration). `cron` the
     // recurring verb lives in cron.js (already eval'd above).
@@ -2216,7 +2215,6 @@ const OIDC_JS = @embedFile("oidc_js");
 const SESSIONS_JS = @embedFile("sessions_js");
 const CRON_JS = @embedFile("cron_js");
 const RETRY_JS = @embedFile("retry_js");
-const SCHEDULER_JS = @embedFile("scheduler_js");
 const SCHEDULE_JS = @embedFile("schedule_js");
 const AFTER_JS = @embedFile("after_js");
 const STREAM_JS = @embedFile("stream_js");
@@ -2252,7 +2250,6 @@ pub const GLOBALS_FILES = [_]struct { name: []const u8, src: []const u8 }{
     .{ .name = "sessions", .src = SESSIONS_JS },
     .{ .name = "cron", .src = CRON_JS },
     .{ .name = "retry", .src = RETRY_JS },
-    .{ .name = "scheduler", .src = SCHEDULER_JS },
     .{ .name = "schedule", .src = SCHEDULE_JS },
     .{ .name = "after", .src = AFTER_JS },
     .{ .name = "stream", .src = STREAM_JS },

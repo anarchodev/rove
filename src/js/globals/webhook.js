@@ -98,7 +98,7 @@ globalThis.webhook = {
    * capped at 60s, max 5 attempts) — controlled by the baked
    * `__system/webhook_onresult` shim, not customer code. Deferred
    * fires (scheduled sends, retries, crash recovery) ride the durable
-   * {@link scheduler} and survive leader changes.
+   * {@link schedule} and survive leader changes.
    *
    * The handler's commit gates the marker: if the handler throws or
    * raft faults, no marker is written and no request fires. After
@@ -225,9 +225,9 @@ globalThis.webhook = {
     // it on the terminal event; a retry re-arm moves it to the
     // backoff time).
     if (scheduled) {
-      scheduler.at(fire_at_ns_big, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
+      schedule({ at: fire_at_ns_big }, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
     } else {
-      scheduler.in(WEBHOOK_WATCHDOG_MS, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
+      schedule({ in: WEBHOOK_WATCHDOG_MS }, "__system/webhook_fire", { id: id }, { key: "_send/" + id });
     }
 
     // Phase 4.1.2 (re-enabled inline fire). The earlier sweep-only

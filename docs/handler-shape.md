@@ -20,7 +20,8 @@
 > `after.*` (was `on.*`; `after.ms` was `on.timer`) with ONE
 > callback-target key — `{on: "module.method"}` — across every effect;
 > `webhook.send(url, opts)` takes a positional url; the durable
-> scheduler's delay verb is `scheduler.in`; the payload is uniform
+> the timer surface is ONE verb (`schedule`, with `.cancel`/`.get` —
+> the `scheduler` lib folded in 2026-07-06); the payload is uniform
 > `request.bytes`/`.text`/`.json` on every payload-carrying activation;
 > threaded context is `ctx` in / `request.ctx` out everywhere (one-ctx,
 > no exceptions); fetch ids are `ftch_…` on all three surfaces. The
@@ -303,7 +304,8 @@ export** a trigger's activation lands in; it does not invent a kind.
 > `kind=cron` subscription and its `onCron` export RETIRED with
 > durable-wake P5(b): recurrence is the `cron(spec, target, …)` verb —
 > durable, surviving leader change — or a self-re-arming
-> `scheduler.in` for sub-minute intervals. The `kind=boot`
+> `schedule({in}, …, {key})` re-arming for sub-minute intervals. The
+> `kind=boot`
 > subscription and its `onBoot` export RETIRED 2026-07-05, unused:
 > seed registrations from any handler activation — they are
 > idempotent by key and `_sched/*` entries are durable kv that survive
@@ -877,7 +879,10 @@ cycle — the dual-name window, closed 2026-07-06):
 - `{context}` → `{ctx}`; `request.activation.msg` → `request.ctx`
   (one-ctx, no exceptions)
 - `webhook.send({url, …})` → `webhook.send(url, opts)`
-- `scheduler.after` → `scheduler.in` ("after" is exclusively the
+- `scheduler.*` → folded into `schedule` (2026-07-06): `schedule(when,
+  target, ctx?, opts?)` + `schedule.cancel`/`schedule.get`; there is no
+  `scheduler` global. Interim history: `scheduler.after` had already
+  become `scheduler.in` in the window ("after" is exclusively the
   connection-wake namespace — the verb is the scope)
 - bare-hex fetch ids → `ftch_…` on all three surfaces (the
   `after.fetch()` return, `request.fetchId`,

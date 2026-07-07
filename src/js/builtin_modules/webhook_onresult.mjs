@@ -104,17 +104,17 @@ export default function () {
         owed.attempts += 1;
         delete owed.next_at_ns; // legacy timing field — scheduler owns timing now
         kv.set("_send/owed/" + id, JSON.stringify(owed));
-        scheduler.at(computeNextAtNs(owed.attempts), "__system/webhook_fire",
+        schedule({ at: computeNextAtNs(owed.attempts) }, "__system/webhook_fire",
                      { id: id }, { key: "_send/" + id });
         return { status: 200 };
     }
 
     // Terminal: clear marker + cancel the send's scheduler entry (the
     // crash-recovery watchdog / pending retry). The schedule id is
-    // deterministic from the key — same recipe as scheduler.at's
+    // deterministic from the key — same recipe as schedule's opts.key
     // opts.key handling (base64url-no-pad(sha256(key))).
     kv.delete("_send/owed/" + id);
-    scheduler.cancel(base64url.encode(hex.decode(crypto.sha256("_send/" + id))));
+    schedule.cancel(base64url.encode(hex.decode(crypto.sha256("_send/" + id))));
 
     // Mark as a give-up vs success in the result the customer sees.
     if (transport_failed || upstream_5xx) {
