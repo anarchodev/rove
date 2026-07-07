@@ -1631,6 +1631,23 @@ test "dispatch: webhook.send(url, {on, ctx}) canonical form writes the marker (Â
     try testing.expect(std.mem.indexOf(u8, marker, "\"url\":\"https://t.example/hook\"") != null);
 }
 
+test "PROBE after.cancel" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var resp = try runOne(&d, kv,
+        \\try { after.cancel("ftch_00aabb"); return "ok"; } catch (e) { return "threw: " + e.message; }
+    , .{ .method = "POST", .path = "/" });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings("ok", resp.body);
+}
+
 test "dispatch: schedule verb owns the whole timer surface; scheduler global is gone" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

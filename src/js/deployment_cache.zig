@@ -268,7 +268,7 @@ fn translateSpec(
         std.log.err(
             "rove-js: subscription `{s}` kind=cron is retired — register recurrence from any " ++
                 "handler activation instead: `cron(\"*/1 * * * *\", \"module/path\")` (crontab, durable) " ++
-                "or a self-re-arming `schedule({in: ms}, ..., {key})` for sub-minute intervals; " ++
+                "or a self-re-arming `schedule({{in: ms}}, ..., {{key}})` for sub-minute intervals; " ++
                 "registrations are idempotent by key and survive deploys",
             .{name},
         );
