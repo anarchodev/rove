@@ -66,6 +66,11 @@ pub const World = struct {
     expected_json: ?[]const u8 = null,
     seed: u64 = 0,
     now_ms: u64 = 0,
+    /// The live request completed under the GC arena regime (the
+    /// churny-handler fallback) — the driver must replay under it
+    /// (under bump the same execution would OOM). Carried from the
+    /// record's engine word by export_fixture; absent = bump.
+    arena_gc: bool = false,
     /// Inline handler sources (path/kind/source); empty when `--source-dir`
     /// serves the working tree instead.
     sources: []const Source = &.{},
@@ -102,6 +107,7 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
     }
     w.seed = jU64(obj, "seed") orelse 0;
     w.now_ms = jU64(obj, "now_ms") orelse 0;
+    if (obj.get("arena_gc")) |gv| w.arena_gc = (gv == .bool and gv.bool);
 
     // ── request surface ──
     if (obj.get("request")) |rv| {

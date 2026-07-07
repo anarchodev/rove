@@ -1248,6 +1248,13 @@ pub fn build(b: *std.Build) void {
     const driver_smoke_multi = b.addRunArtifact(driver_smoke_exe);
     driver_smoke_multi.addArg("multi");
     driver_smoke_step.dependOn(&driver_smoke_multi.step);
+    // `arena-gc`: the allocator-regime round-trip — a world stamped
+    // arena_gc replays under GC (succeeds where bump OOMs), the
+    // unstamped twin OOMs under bump, and a following bump world proves
+    // the mode doesn't leak across runs.
+    const driver_smoke_gc = b.addRunArtifact(driver_smoke_exe);
+    driver_smoke_gc.addArg("arena-gc");
+    driver_smoke_step.dependOn(&driver_smoke_gc.step);
 
     // ── rewind: the OIDC customer CLI (docs/plans/rewind-cli-plan.md §6, Track 3).
     // The customer-shippable half of the split — carries an OIDC session

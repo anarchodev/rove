@@ -32,6 +32,8 @@ pub const InitFn = snap.InitFn;
 /// code reads one canonical constant.
 pub const version = @import("version.zig");
 pub const JS_ENGINE_VERSION = version.JS_ENGINE_VERSION;
+pub const ENGINE_ARENA_GC_BIT = version.ENGINE_ARENA_GC_BIT;
+pub const ENGINE_VERSION_MASK = version.ENGINE_VERSION_MASK;
 
 pub const Error = error{
     RuntimeCreateFailed,

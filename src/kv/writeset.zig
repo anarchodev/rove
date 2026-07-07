@@ -56,6 +56,20 @@ pub const WriteSet = struct {
         self.ops.deinit(self.allocator);
     }
 
+    /// Truncate back to a caller-captured (ops_len, owned_len)
+    /// boundary, freeing the truncated copies — the arena-OOM retry
+    /// discards ONLY the doomed attempt's contribution (the writeset
+    /// is shared across a batch; a wholesale clear would eat sibling
+    /// handlers' ops).
+    pub fn truncateTo(self: *WriteSet, ops_len: usize, owned_len: usize) void {
+        var i = self.owned.items.len;
+        while (i > owned_len) : (i -= 1) {
+            self.allocator.free(self.owned.items[i - 1]);
+        }
+        self.owned.shrinkRetainingCapacity(owned_len);
+        self.ops.shrinkRetainingCapacity(ops_len);
+    }
+
     pub fn addPut(self: *WriteSet, key: []const u8, value: []const u8) !void {
         const k = try self.copyBytes(key);
         errdefer self.popOwned();

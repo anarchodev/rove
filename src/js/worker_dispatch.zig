@@ -3452,6 +3452,10 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         }
 
         const request: Request = .{
+            // Known-churny handlers (a prior dispatch OOMed the bump
+            // arena and re-executed under GC) skip the doomed bump
+            // attempt entirely.
+            .arena_mode = if (worker_mod.isChurny(worker, scope_inst.id, dep_id, route.module_base)) .gc else .auto,
             .method = method,
             .path = path,
             .host = authority,
@@ -3568,6 +3572,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             request,
             &budget,
         ) catch |err| {
+            if (worker.dispatcher.last_arena_gc_retry)
+                worker_mod.markChurny(worker, scope_inst.id, dep_id, route.module_base);
             txn.?.rollbackTo() catch |re| panic_mod.invariantViolated(
                 "dispatchOnce.rollbackTo(after_dispatch_error)",
                 "tenant={s} err={s}",
@@ -3626,6 +3632,8 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             processed += 1;
             continue;
         };
+        if (worker.dispatcher.last_arena_gc_retry)
+            worker_mod.markChurny(worker, scope_inst.id, dep_id, route.module_base);
         // Trampoline: `.continuation` rides the SAME txn/writeset/raft
         // path as a terminal success — only the final entity
         // destination differs (`parked_continuations`, no response

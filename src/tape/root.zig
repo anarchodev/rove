@@ -381,6 +381,16 @@ pub const Tape = struct {
         };
     }
 
+    /// Drop every entry but keep the tape usable — the arena-OOM
+    /// retry (dispatcher.runOutcome) discards a doomed attempt's
+    /// recording so the GC-mode rerun re-records from a clean tape
+    /// (double entries would corrupt replay).
+    pub fn reset(self: *Tape) void {
+        for (self.entries.items) |*e| freeEntry(self.allocator, e);
+        self.entries.clearRetainingCapacity();
+        self.owned_bytes = 0;
+    }
+
     pub fn deinit(self: *Tape) void {
         for (self.entries.items) |*e| freeEntry(self.allocator, e);
         self.entries.deinit(self.allocator);
@@ -710,6 +720,20 @@ pub const Readset = struct {
         self.fetch_responses.deinit();
         self.trigger_payload.deinit();
         self.request_reads.deinit();
+    }
+
+    /// Clear everything a dispatch ATTEMPT records — the arena-OOM
+    /// retry path. kv/module/request-surface tapes and the body-read
+    /// flag are per-attempt (the GC rerun re-records them); the
+    /// identity scalars (timestamp/seed/engine) and the WORKER-owned
+    /// tapes (trigger_payload — the pre-dispatch body ref;
+    /// fetch_responses — the activation's chunk capture) survive, so
+    /// the retried attempt replays against the same inputs.
+    pub fn resetAttempt(self: *Readset) void {
+        self.kv.reset();
+        self.module.reset();
+        self.request_reads.reset();
+        self.body_read = false;
     }
 
     /// Drop the body reference from the readset when the handler

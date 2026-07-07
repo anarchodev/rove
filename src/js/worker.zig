@@ -1330,6 +1330,16 @@ pub fn Worker(comptime opts: Options) type {
         allocator: std.mem.Allocator,
         reg: *rove.Registry,
         h2: *H2Type,
+        /// Handlers that exhausted the bump request arena — the
+        /// dispatcher re-executed them under GC (`last_arena_gc_retry`)
+        /// and this map remembers, so their NEXT dispatch skips the
+        /// doomed bump attempt (`request.arena_mode = .gc`).
+        /// Worker-thread-local (no locking); keyed
+        /// "{tenant}\x00{dep_id:x}\x00{module_base}" — a redeploy mints
+        /// a new dep_id, so a fixed handler sheds the mark
+        /// automatically. In-memory only: worth one extra
+        /// double-execution per worker after a restart.
+        churny_handlers: std.StringHashMapUnmanaged(void) = .empty,
         /// Entities waiting on raft commit, destined for `response_in`
         /// (terminal response, no cont/stream chain). Stored on the
         /// Worker (not inside h2) because this is rove-js state, not
@@ -3380,6 +3390,36 @@ pub fn hostOnly(authority: []const u8) []const u8 {
 /// (`index.js` or `tenant/index.mjs`) catch every sub-path below it,
 /// which is exactly what the admin handler needs — one JS module
 /// does its own path-based dispatch.
+/// Churny-map key: "{tenant}\x00{dep_id}\x00{module_base}". Caller
+/// frees (markChurny keeps its own copy).
+fn churnyKey(allocator: std.mem.Allocator, tenant_id: []const u8, dep_id: u64, module_base: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}\x00{x}\x00{s}", .{ tenant_id, dep_id, module_base });
+}
+
+/// Should this handler skip the doomed bump attempt? Consulted at
+/// request build; see `Worker.churny_handlers`.
+pub fn isChurny(worker: anytype, tenant_id: []const u8, dep_id: u64, module_base: []const u8) bool {
+    var key_buf: [512]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}\x00{x}\x00{s}", .{ tenant_id, dep_id, module_base }) catch return false;
+    return worker.churny_handlers.contains(key);
+}
+
+/// Remember an arena-OOM-retried handler so its next dispatch goes
+/// straight to GC. Idempotent; allocation failure only forgoes the
+/// optimization (the per-request retry still guarantees correctness).
+pub fn markChurny(worker: anytype, tenant_id: []const u8, dep_id: u64, module_base: []const u8) void {
+    const key = churnyKey(worker.allocator, tenant_id, dep_id, module_base) catch return;
+    const gop = worker.churny_handlers.getOrPut(worker.allocator, key) catch {
+        worker.allocator.free(key);
+        return;
+    };
+    if (gop.found_existing) {
+        worker.allocator.free(key);
+        return;
+    }
+    std.log.warn("rove-js churny: tenant={s} dep={x} module={s} marked GC-mode after arena OOM retry", .{ tenant_id, dep_id, module_base });
+}
+
 pub fn findBytecode(
     tc: TenantFiles,
     module_base: []const u8,

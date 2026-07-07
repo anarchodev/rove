@@ -711,6 +711,39 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
 
 ---
 
+
+### 4.12 Per-request arena regime: bump-first with a GC fallback (2026-07-07)
+
+**Decision.** Handlers run on arenajs's bump allocator (ceiling =
+CUMULATIVE allocation, ~3-instruction allocs, O(1) reset). When a
+request exhausts the arena (`js_dual_arena_oom_hit` — the
+capacity-vs-user-error discriminator), the dispatcher discards the
+attempt wholesale — savepoint-rolled kv staging, attempt-scoped
+readset tapes, effect accumulators, writeset contribution — and
+re-executes ONCE under the GC regime (dlmalloc mspace +
+refcount/cycle GC; ceiling = PEAK live set; ~20-30% slower). The
+worker's in-memory churny map (keyed tenant + dep_id + module, so a
+redeploy sheds the mark) routes known-churny handlers straight to GC.
+Re-execution is safe because a failed attempt is pre-commit and
+deterministic (same seed, same pinned clock, same inputs); an attempt
+that fired an immediate worker-side effect (blob streaming,
+cancel_fetch, fire_wake, resume_if_bound) is NOT retried and fails
+as before.
+
+**Replay.** The regime is part of the execution identity (a
+GC-completed churny request OOMs under bump), stamped as the HIGH BIT
+of the readset's `js_engine_version` word (same-width interpretation
+per the wire-width rule — zero frozen-format changes; old records
+read as bump). `export-fixture` carries it into world.json
+(`arena_gc`); the native driver sets the reactor mode per run; the
+WASM shell errors clearly until its artifact is rebuilt from
+arenajs ≥ 0.3.2.
+
+**Rejected:** always-GC (a 20-30% tax on every handler for the rare
+churny one); a customer-visible mode knob (the platform can learn it —
+one safe semantic, no unsafe default); persisting the churny map
+(a restart re-learns for the cost of one retry).
+
 ## 5. Readset replication
 
 ### 5.1 Replicate readsets (not intents); gate the callback, not the propose

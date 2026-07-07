@@ -127,6 +127,15 @@ pub const Dispatcher = struct {
     /// `run`. Useful for tests and for the worker to log root causes.
     last_kv_error: ?anyerror = null,
 
+    /// Arena regime the most recent `runOutcome` COMPLETED under
+    /// (same read-after pattern as `last_kv_error`): `.gc` means either
+    /// the worker's churny hint or a bump-OOM retry. Stamped into the
+    /// LogRecord so replay re-runs under the same regime.
+    last_arena_mode: qjs.snap.ReqMode = .bump,
+    /// True iff the most recent `runOutcome` OOMed under bump and was
+    /// re-executed under GC — the worker's churny-map trigger.
+    last_arena_gc_retry: bool = false,
+
     fn snapshotInitFn(
         rt: *c.JSRuntime,
         ctx: *c.JSContext,
@@ -153,7 +162,14 @@ pub const Dispatcher = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator) !Dispatcher {
-        const snapshot = try qjs.Snapshot.create(.{}, snapshotInitFn, null);
+        return initWithSizes(allocator, .{});
+    }
+
+    /// `init` with explicit arena sizes — tests exercising the arena
+    /// OOM/retry path use a small request arena so the churny loop
+    /// stays fast.
+    pub fn initWithSizes(allocator: std.mem.Allocator, sizes: qjs.snap.Sizes) !Dispatcher {
+        const snapshot = try qjs.Snapshot.create(sizes, snapshotInitFn, null);
         return .{
             .allocator = allocator,
             .snapshot = snapshot,
@@ -199,7 +215,9 @@ pub const Dispatcher = struct {
     /// `runOutcome` directly. Splitting here keeps every existing
     /// `run` call site (≈30 tests + 3 production callers) unchanged
     /// while exposing the trampoline outcome where it's needed.
-    pub fn runOutcome(
+    /// One dispatch attempt under an explicit arena regime. The
+    /// public `runOutcome` wraps this with the bump→GC OOM retry.
+    fn runOutcomeAttempt(
         self: *Dispatcher,
         kv: *kv_mod.KvStore,
         txn: *kv_mod.TrackedTxn,
@@ -210,6 +228,8 @@ pub const Dispatcher = struct {
         triggers: ?[]const globals.TriggerEntry,
         request: Request,
         budget: *Budget,
+        mode: qjs.snap.ReqMode,
+        side_effects: *bool,
     ) DispatchError!RunOutcome {
         self.last_kv_error = null;
 
@@ -276,13 +296,14 @@ pub const Dispatcher = struct {
             .ws_frame_output = request.activation == .ws_message or
                 request.effects.pending_stream_chunk_opcodes != null,
             .is_system_module = request.is_system_module,
+            .side_effects_flag = side_effects,
         };
 
-        // Reset the per-request arena (one cursor write) and reseed
-        // time/random. The base arena (runtime, intrinsics, globals)
-        // is shared in place across all requests on this thread —
-        // no memcpy, no relocation.
-        const restored = self.snapshot.restore();
+        // Reset the per-request arena and reseed time/random. The base
+        // arena (runtime, intrinsics, globals) is shared in place across
+        // all requests on this thread — no memcpy, no relocation. The
+        // regime is per-attempt: bump for speed, GC for churny handlers.
+        const restored = self.snapshot.restoreMode(mode);
         var rt: qjs.Runtime = restored.runtime;
         var ctx: qjs.Context = restored.context;
         // Free any trigger-module namespaces we cached during this
@@ -371,6 +392,140 @@ pub const Dispatcher = struct {
         };
 
         return finishResponse(self, &state, &pending, &console_buf, &tags_buf);
+    }
+
+    /// Run one activation, with the arena-OOM fallback: attempt under
+    /// the bump regime (or GC directly when the worker's churny map
+    /// says so via `request.arena_mode`); if the bump attempt exhausts
+    /// the request arena, discard it wholesale — savepoint-rolled kv
+    /// staging, attempt-scoped readset tapes, effect accumulators —
+    /// and re-execute once under GC (ceiling = peak live set instead
+    /// of cumulative allocation). Re-execution is safe because a
+    /// failed attempt is pre-commit and deterministic (same seed,
+    /// same pinned clock, same inputs); the ONE exception is an
+    /// attempt that fired an immediate worker-side effect
+    /// (blob streaming, cancel_fetch, fire_wake, resume_if_bound) —
+    /// those don't retry and fail as before.
+    ///
+    /// After return, `last_arena_mode` / `last_arena_gc_retry` say
+    /// what happened (the worker's churny-map + LogRecord inputs).
+    pub fn runOutcome(
+        self: *Dispatcher,
+        kv: *kv_mod.KvStore,
+        txn: *kv_mod.TrackedTxn,
+        writeset: *kv_mod.WriteSet,
+        bytecode: []const u8,
+        bytecodes: ?*const std.StringHashMapUnmanaged(*BlobBytes),
+        source_hashes: ?*const std.StringHashMapUnmanaged([64]u8),
+        triggers: ?[]const globals.TriggerEntry,
+        request: Request,
+        budget: *Budget,
+    ) DispatchError!RunOutcome {
+        self.last_arena_gc_retry = false;
+        const first_mode: qjs.snap.ReqMode = if (request.arena_mode == .gc) .gc else .bump;
+        self.last_arena_mode = first_mode;
+        // The writeset is shared across a batch — a discarded attempt
+        // may only drop ITS OWN contribution.
+        const ws_ops_start = writeset.ops.items.len;
+        const ws_owned_start = writeset.owned.items.len;
+
+        // Savepoint so a doomed bump attempt's staged kv writes drop
+        // wholesale (attempt 2 must not read attempt 1's writes — the
+        // read-your-writes overlay would corrupt e.g. counters). If the
+        // savepoint can't open, run single-attempt: correctness never
+        // depends on the retry.
+        var sp_open = true;
+        txn.savepoint() catch {
+            sp_open = false;
+        };
+
+        var side_effects = false;
+        const first = self.runOutcomeAttempt(kv, txn, writeset, bytecode, bytecodes, source_hashes, triggers, request, budget, first_mode, &side_effects);
+
+        // The arena's exhaustion record is the capacity-vs-user-error
+        // discriminator; it survives until the NEXT reset, so read it
+        // here, before any further restore.
+        const oomed = self.snapshot.oomHit();
+        if (first_mode == .bump and oomed and sp_open and !side_effects) retry: {
+            const stats = self.snapshot.oomStats();
+            // Roll the doomed attempt's staging back FIRST — if this
+            // fails we must return the original outcome untouched.
+            txn.rollbackTo() catch break :retry;
+            std.log.warn(
+                "rove-js arena-oom: bump attempt exhausted the request arena (requested={d} used={d} limit={d}); re-executing under GC (churny handler)",
+                .{ stats.requested, stats.used, stats.limit },
+            );
+            // Discard everything attempt 1 produced.
+            if (first) |*outcome_const| {
+                var outcome = outcome_const.*;
+                discardOutcome(self.allocator, &outcome);
+            } else |_| {}
+            if (request.trace.readset) |rs| rs.resetAttempt();
+            clearAttemptEffects(self.allocator, request);
+            writeset.truncateTo(ws_ops_start, ws_owned_start);
+
+            txn.savepoint() catch {
+                sp_open = false;
+            };
+            self.last_arena_mode = .gc;
+            self.last_arena_gc_retry = true;
+            var side_effects2 = false;
+            const second = self.runOutcomeAttempt(kv, txn, writeset, bytecode, bytecodes, source_hashes, triggers, request, budget, .gc, &side_effects2);
+            if (sp_open) txn.release() catch {};
+            self.stampArenaMode(request);
+            return second;
+        }
+        if (oomed and (side_effects or !sp_open)) {
+            const stats = self.snapshot.oomStats();
+            std.log.warn(
+                "rove-js arena-oom: request arena exhausted (requested={d} used={d} limit={d}) but NOT retryable (immediate side effects or no savepoint) — failing as-is",
+                .{ stats.requested, stats.used, stats.limit },
+            );
+        }
+        if (sp_open) txn.release() catch {};
+        self.stampArenaMode(request);
+        return first;
+    }
+
+    /// Record the regime the request COMPLETED under on the readset's
+    /// engine word (`ENGINE_ARENA_GC_BIT`) — the LogRecord/bundle pick
+    /// it up from there and replay re-runs under the same regime.
+    fn stampArenaMode(self: *Dispatcher, request: Request) void {
+        if (self.last_arena_mode != .gc) return;
+        if (request.trace.readset) |rs| {
+            rs.js_engine_version |= qjs.ENGINE_ARENA_GC_BIT;
+        }
+    }
+
+    /// Free whatever a discarded attempt's outcome owns.
+    fn discardOutcome(allocator: std.mem.Allocator, outcome: *RunOutcome) void {
+        switch (outcome.*) {
+            .terminal => |*r| r.deinit(allocator),
+            .continuation => |*cont| cont.deinit(allocator),
+            .stream => |*s| s.deinit(allocator),
+            .no_onheaders, .no_onchunk => {},
+        }
+    }
+
+    /// Clear the caller-owned effect accumulators a discarded attempt
+    /// pushed into (the worker drains these post-outcome; a retry
+    /// must not double them).
+    fn clearAttemptEffects(allocator: std.mem.Allocator, request: Request) void {
+        if (request.effects.pending_fetches) |pf| {
+            for (pf.items) |*item| item.deinit(allocator);
+            pf.clearRetainingCapacity();
+        }
+        if (request.effects.pending_wakes) |pw| {
+            for (pw.items) |*item| item.deinit(allocator);
+            pw.clearRetainingCapacity();
+        }
+        if (request.effects.pending_stream_chunks) |pc| {
+            for (pc.items) |chunk| allocator.free(chunk);
+            pc.clearRetainingCapacity();
+        }
+        if (request.effects.pending_stream_chunk_opcodes) |po| {
+            po.clearRetainingCapacity();
+        }
     }
 
     /// Back-compat dispatch: run, and collapse a `.continuation` to a
@@ -1648,6 +1803,104 @@ test "PROBE after.cancel" {
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("", resp.exception);
     try testing.expectEqualStrings("ok", resp.body);
+}
+
+test "arena-oom retry: churny handler succeeds under GC re-execution" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.initWithSizes(testing.allocator, .{ .request_size = 8 * 1024 * 1024 });
+    defer d.deinit();
+
+    // Seed a counter the handler increments BEFORE churning: proves the
+    // GC rerun reads the ORIGINAL value (savepoint dropped attempt 1's
+    // staged write — read-your-writes across attempts would yield 7).
+    {
+        var txn = try kv.beginTrackedImmediate();
+        try txn.put("n", "5");
+        try txn.commit();
+    }
+
+    var rs = tape_mod.Readset.init(testing.allocator, 1_700_000_000_000_000_000, 42);
+    defer rs.deinit();
+    rs.js_engine_version = qjs.JS_ENGINE_VERSION;
+
+    var resp = try runOne(&d, kv,
+        \\const n = parseInt(kv.get("n") ?? "0", 10) + 1;
+        \\kv.set("n", String(n));
+        \\let s = "";
+        \\for (let i = 0; i < 32; i++) { s = "x".repeat(1 << 19) + i; }
+        \\return "n=" + n + " len=" + s.length;
+    , .{ .method = "POST", .path = "/", .trace = .{ .request_id = 1, .readset = &rs } });
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings("n=6 len=524290", resp.body);
+    try testing.expect(d.last_arena_gc_retry);
+    try testing.expectEqual(qjs.snap.ReqMode.gc, d.last_arena_mode);
+    // The engine word carries the regime for replay (high bit); the
+    // version bits stay intact. The doomed attempt's kv-tape entries
+    // were discarded: exactly ONE recorded read of "n" (the retry's).
+    try testing.expect(rs.js_engine_version & qjs.ENGINE_ARENA_GC_BIT != 0);
+    try testing.expectEqual(qjs.JS_ENGINE_VERSION, rs.js_engine_version & qjs.ENGINE_VERSION_MASK);
+    var n_reads: usize = 0;
+    for (rs.kv.entries.items) |e| {
+        if (std.mem.eql(u8, e.kv.key, "n")) n_reads += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), n_reads);
+    // The committed value is the retry's single increment.
+    const v = try kv.get("n");
+    defer testing.allocator.free(v);
+    try testing.expectEqualStrings("6", v);
+}
+
+test "arena-oom retry: the worker's churny hint skips the doomed bump attempt" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.initWithSizes(testing.allocator, .{ .request_size = 8 * 1024 * 1024 });
+    defer d.deinit();
+    var resp = try runOne(&d, kv,
+        \\let s = "";
+        \\for (let i = 0; i < 32; i++) { s = "x".repeat(1 << 19) + i; }
+        \\return "len=" + s.length;
+    , .{ .method = "POST", .path = "/", .arena_mode = .gc });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings("len=524290", resp.body);
+    try testing.expect(!d.last_arena_gc_retry);
+    try testing.expectEqual(qjs.snap.ReqMode.gc, d.last_arena_mode);
+}
+
+test "arena-oom retry: an immediate side effect vetoes re-execution" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.initWithSizes(testing.allocator, .{ .request_size = 8 * 1024 * 1024 });
+    defer d.deinit();
+    // after.cancel fires the cancel_fetch trampoline path — an
+    // immediate worker-side effect (raises side_effects_flag even when
+    // the test harness wires no trampoline). The subsequent OOM must
+    // NOT retry: re-execution would double the effect.
+    var resp = try runOne(&d, kv,
+        \\after.cancel("ftch_00aabb");
+        \\let s = "";
+        \\for (let i = 0; i < 32; i++) { s = "x".repeat(1 << 19) + i; }
+        \\return "unreachable " + s.length;
+    , .{ .method = "POST", .path = "/" });
+    defer resp.deinit(testing.allocator);
+    try testing.expect(resp.exception.len > 0);
+    try testing.expect(!d.last_arena_gc_retry);
+    try testing.expectEqual(qjs.snap.ReqMode.bump, d.last_arena_mode);
 }
 
 test "dispatch: console quartet lands level-prefixed lines in the request log" {

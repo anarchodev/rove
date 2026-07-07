@@ -364,6 +364,11 @@ pub const PendingEffects = struct {
 // ---------------------------------------------------------------------
 
 pub const Request = struct {
+    /// Per-request JS allocator regime. `.auto` = bump first, retry
+    /// once under GC on arena OOM (dispatcher.runOutcome). `.gc` =
+    /// skip the doomed bump attempt — the worker sets this for
+    /// handlers its churny map already caught OOMing.
+    arena_mode: enum { auto, gc } = .auto,
     method: []const u8,
     path: []const u8,
     /// Wire host (HTTP/2 `:authority`, or HTTP/1 `Host:`). Includes the

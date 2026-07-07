@@ -93,6 +93,15 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
     };
     const seed = jStr(obj, "seed");
     const ts_ns = jStr(obj, "timestamp_ns");
+    // The engine word's high bit = the request COMPLETED under the GC
+    // arena regime (qjs version.zig ENGINE_ARENA_GC_BIT). Carry it so
+    // the driver replays under the same regime — a GC-completed churny
+    // request OOMs under bump.
+    const arena_gc = blk: {
+        const ev = obj.get("js_engine_version") orelse break :blk false;
+        if (ev != .integer) break :blk false;
+        break :blk (ev.integer & 0x8000) != 0;
+    };
 
     // ── KV: get(ok) → seed the map; prefix → seed the map with the returned
     // rows (so a replay-time re-scan finds them). Closed world: a not_found read
@@ -253,6 +262,7 @@ pub fn transcode(a: std.mem.Allocator, fixture_json: []const u8, out: *std.Array
         const n = std.fmt.parseInt(u64, s, 10) catch 0;
         try w.print(",\n  \"seed\": {d}", .{n});
     }
+    if (arena_gc) try w.writeAll(",\n  \"arena_gc\": true");
     if (ts_ns) |s| {
         const ns = std.fmt.parseInt(i64, s, 10) catch 0;
         if (ns > 0) try w.print(",\n  \"now_ms\": {d}", .{@divTrunc(ns, std.time.ns_per_ms)});

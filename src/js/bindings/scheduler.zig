@@ -193,6 +193,7 @@ pub fn jsFireWake(
         .cleanup_keys = slices.items,
     };
 
+    if (state.side_effects_flag) |f| f.* = true;
     const fn_ptr = state.fire_wake orelse {
         // Test / non-worker dispatch: nothing to enqueue. Report
         // false so a caller can detect the no-op (scheduler_tick

@@ -422,6 +422,13 @@ pub const DispatchState = struct {
     /// at park, then frees the list. Null on connectionless / test paths
     /// ⇒ `stream.*` is inert (the model: connection-only output).
     pending_stream_chunks: ?*std.ArrayListUnmanaged([]u8) = null,
+    /// Raised by any binding that fires an IMMEDIATE worker-side
+    /// effect during dispatch (blob_write/blob_seal streaming,
+    /// cancel_fetch, fire_wake, resume_if_bound) — effects that are
+    /// NOT commit-gated and would double on a re-execution. The
+    /// arena-OOM bump→GC retry (dispatcher.runOutcome) refuses to
+    /// rerun an attempt that raised this.
+    side_effects_flag: ?*bool = null,
     /// architecture/websockets.md: per-chunk RFC 6455 data opcode, pushed in
     /// lockstep with `pending_stream_chunks` (1 = text, the arg was a
     /// string; 2 = binary, an ArrayBuffer/TypedArray). Non-null only on

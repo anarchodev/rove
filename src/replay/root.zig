@@ -42,6 +42,7 @@ extern fn arena_run_module(entry_name: [*c]const u8, entry_src: [*c]const u8) c_
 extern fn arena_set_trace_mode(mode: c_int) void;
 extern fn arena_set_date_now(lo: u32, hi: u32) void;
 extern fn arena_set_random_seed(lo: u32, hi: u32) void;
+extern fn arena_set_request_mode(mode: c_int) void;
 
 pub const Error = error{
     BadFixture,
@@ -165,6 +166,11 @@ pub fn runWorld(
     host.install();
 
     const date_ms: u64 = wv.now_ms;
+    // Replay under the regime the live request completed under (mode
+    // binds at arena_run_module's entry reset). Set EVERY run — the
+    // choice persists on the process-global arena, so a GC world must
+    // not leak GC mode into the next bump world.
+    arena_set_request_mode(if (wv.arena_gc) 0 else 1);
     arena_set_random_seed(@truncate(wv.seed), @truncate(wv.seed >> 32));
     arena_set_date_now(@truncate(date_ms), @truncate(date_ms >> 32));
     arena_set_trace_mode(0);

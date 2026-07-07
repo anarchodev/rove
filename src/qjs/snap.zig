@@ -73,6 +73,13 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// Per-request allocator regime (arenajs 0.3 `JSArenaReqMode`).
+/// `.bump`: ~3-instruction allocs, O(1) reset, ceiling = CUMULATIVE
+/// allocation. `.gc`: dlmalloc mspace + refcount/cycle GC, ~20-30%
+/// slower, costlier reset, ceiling = PEAK live set — the churny-
+/// handler fallback.
+pub const ReqMode = enum { bump, gc };
+
 /// Caller-supplied setup. Runs ONCE during Snapshot.create with the
 /// dual arena in BASE mode — every allocation lands in the immortal
 /// base arena. Install intrinsics, globals, and run any prelude eval
@@ -147,6 +154,20 @@ pub const Snapshot = struct {
     /// request arena in a clean state, and the reseed gets the
     /// per-request state to a sensible value.
     pub fn restore(self: *Snapshot) Restored {
+        return self.restoreMode(.bump);
+    }
+
+    /// `restore` with an explicit allocator regime for THIS request.
+    /// Mode selection binds at the reset (arenajs contract: a request
+    /// runs entirely under one regime), so set-then-reset. The mode
+    /// persists on the arena until the next restoreMode — which is why
+    /// the plain `restore()` pins `.bump` instead of inheriting
+    /// whatever the previous request chose.
+    pub fn restoreMode(self: *Snapshot, mode: ReqMode) Restored {
+        c.js_dual_arena_set_request_mode(c.JS_GetDualArena(self.rt), switch (mode) {
+            .bump => c.JS_ARENA_REQ_MODE_BUMP,
+            .gc => c.JS_ARENA_REQ_MODE_GC,
+        });
         c.JS_ResetRequestArena(self.rt);
 
         // performance.timeOrigin is a getter reading whatever we set
@@ -163,6 +184,27 @@ pub const Snapshot = struct {
         return .{
             .runtime = .{ .raw = self.rt },
             .context = .{ .raw = self.ctx },
+        };
+    }
+
+    /// True iff the request arena refused an allocation THIS request
+    /// (cleared by the next reset). The capacity-vs-user-error
+    /// discriminator: by the time the OOM propagates, QJS may have
+    /// mangled it into a bare `null` exception — this record is the
+    /// source of truth (and the bump→GC retry trigger).
+    pub fn oomHit(self: *const Snapshot) bool {
+        return c.js_dual_arena_oom_hit(c.JS_GetDualArena(self.rt));
+    }
+
+    pub const OomStats = struct { requested: usize, used: usize, limit: usize };
+
+    /// The refused allocation's numbers, for actionable logs.
+    pub fn oomStats(self: *const Snapshot) OomStats {
+        const da = c.JS_GetDualArena(self.rt);
+        return .{
+            .requested = c.js_dual_arena_oom_requested(da),
+            .used = c.js_dual_arena_oom_used(da),
+            .limit = c.js_dual_arena_oom_limit(da),
         };
     }
 };
@@ -251,6 +293,28 @@ test "Snapshot.restore: performance.now and Math.random work after restore" {
     defer rv2_result.deinit();
     const rv2 = try rv2_result.toF64();
     try testing.expect(rv2 != rv);
+}
+
+test "GC mode: the churny loop SUCCEEDS (ceiling = peak live set)" {
+    var snap = try Snapshot.create(.{}, minimalInit, null);
+    defer snap.deinit();
+    const r = snap.restoreMode(.gc);
+    var result = try r.context.eval(
+        \\let s = "";
+        \\for (let i = 0; i < 256; i++) { s = "x".repeat(1 << 20) + i; }
+        \\s.length
+    ,
+        "churny-gc.js",
+        .{},
+    );
+    defer result.deinit();
+    try testing.expect(!c.js_dual_arena_oom_hit(c.JS_GetDualArena(snap.rt)));
+    // A later plain restore() must pin the arena back to BUMP.
+    _ = snap.restore();
+    try testing.expectEqual(
+        @as(c_uint, c.JS_ARENA_REQ_MODE_BUMP),
+        c.js_dual_arena_request_mode(c.JS_GetDualArena(snap.rt)),
+    );
 }
 
 test "request allocator runs in BUMP mode (arenajs 0.3 defaults to GC)" {

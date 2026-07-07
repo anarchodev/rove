@@ -137,7 +137,7 @@ stream loop's cursor, a fan-in accumulator (§5.8). It is **not** heap
 state across activations (the arena resets); state that must survive a
 disconnect lives in `kv`.
 
-`next` is an **ambient global** (like `stream`, `on`, `kv`, `response`) —
+`next` is an **ambient global** (like `stream`, `after`, `kv`, `response`) —
 no import. `next()` resumes THIS module's conventional export for the
 activation kind; you never name the module or export.
 
@@ -400,6 +400,20 @@ The common case never has to think about streaming.
 `onChunk` is strictly more general; `default` is the optimization for
 handlers that never deal with chunks. The 1 MB ceiling is customer-
 facing; the 64 KiB internal chunk size is implementation detail.
+
+### 4.1 Memory: the per-activation allocation budget
+
+Each activation runs against a fixed-size request arena (100 MiB). The
+default allocator is a bump arena: **the budget is cumulative
+allocation, not live memory** — transient garbage counts in full, which
+is what buys the platform its per-request reset cost of one cursor
+write. A handler that exhausts it is transparently re-executed once
+under a reclaiming GC allocator (budget = peak live set, ~20-30%
+slower), and the platform remembers — subsequent activations of that
+handler skip straight to the GC regime until its next deploy. You never
+opt in or out; the visible effect of a "churny" handler is latency, not
+failure. Replays reproduce whichever regime the live request completed
+under.
 
 ## 5. Worked examples
 

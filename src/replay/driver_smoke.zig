@@ -128,6 +128,60 @@ fn runMulti(a: std.mem.Allocator) !void {
     std.debug.print("MULTI OK — resettable runtime: 3 runs, 1 process, isolated\n", .{});
 }
 
+/// A handler whose CUMULATIVE allocation (~16 MiB) exceeds the
+/// reactor's 8 MiB request arena while its peak live set stays ~512 KiB
+/// — the bump/GC regime discriminator (mirrors the dispatcher's
+/// arena-oom retry tests).
+const CHURNY_HANDLER =
+    \\export default function () {
+    \\  let s = "";
+    \\  for (let i = 0; i < 32; i++) { s = "x".repeat(1 << 19) + i; }
+    \\  return "len=" + s.length;
+    \\}
+;
+
+/// The regime round-trip: a world stamped `arena_gc` (a live churny
+/// request that completed under GC) must replay under GC and succeed;
+/// the SAME world without the stamp must OOM under bump; and a normal
+/// bump world AFTER the GC run must still succeed (the mode does not
+/// leak across runs).
+fn runArenaGc(a: std.mem.Allocator) !void {
+    var world = std.ArrayList(u8){};
+    var aw = std.Io.Writer.Allocating.fromArrayList(a, &world);
+    const w = &aw.writer;
+    try w.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",");
+    try w.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/churn\",\"host\":\"ex.test\"},");
+    try w.writeAll("\"seed\":7,\"arena_gc\":true,");
+    try w.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
+    try std.json.Stringify.value(CHURNY_HANDLER, .{}, w);
+    try w.writeAll("}]}");
+    world = aw.toArrayList();
+
+    var out = std.ArrayList(u8){};
+    try root.runWorld(a, world.items, null, &out);
+    check(out.items, &.{"len=524290"}, &.{}, "ARENA_GC (churny world replays under GC)");
+
+    // Same execution WITHOUT the stamp: bump regime → arena OOM. The
+    // driver must not silently succeed (that would mean the stamp is
+    // ignored and every replay runs GC).
+    var world2 = std.ArrayList(u8){};
+    var aw2 = std.Io.Writer.Allocating.fromArrayList(a, &world2);
+    const w2 = &aw2.writer;
+    try w2.writeAll("{\"entry\":\"index.mjs\",\"activation\":\"inbound\",");
+    try w2.writeAll("\"request\":{\"method\":\"GET\",\"path\":\"/churn\",\"host\":\"ex.test\"},");
+    try w2.writeAll("\"seed\":7,");
+    try w2.writeAll("\"sources\":[{\"path\":\"index.mjs\",\"kind\":\"handler\",\"source\":");
+    try std.json.Stringify.value(CHURNY_HANDLER, .{}, w2);
+    try w2.writeAll("}]}");
+    world2 = aw2.toArrayList();
+    var out2 = std.ArrayList(u8){};
+    try root.runWorld(a, world2.items, null, &out2);
+    check(out2.items, &.{}, &.{"len=524290"}, "ARENA_GC (unstamped world OOMs under bump)");
+
+    // And a normal world afterwards proves no GC leak across runs.
+    try runInboundUser(a, "eve", &.{}, "ARENA_GC (bump restored after GC run)");
+}
+
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -143,6 +197,10 @@ pub fn main() !void {
     }
     if (args.len > 1 and std.mem.eql(u8, args[1], "multi")) {
         try runMulti(a);
+        return;
+    }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "arena-gc")) {
+        try runArenaGc(a);
         return;
     }
     try runInbound(a);
