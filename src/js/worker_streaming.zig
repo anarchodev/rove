@@ -589,6 +589,7 @@ fn resumeStream(
         stream_chunks.deinit(allocator);
     }
     const request: Request = .{
+        .arena_mode = worker_mod.arenaModeFor(worker, inst.id, tc.snap.deployment_id, path),
         .method = "POST",
         .path = spath,
         .body = body,
@@ -631,6 +632,7 @@ fn resumeStream(
         captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, activation, 0);
         return;
     };
+    worker_mod.noteChurnyOutcome(worker, inst.id, tc.snap.deployment_id, path);
 
     const wrote = ws.ops.items.len > 0;
     var oc = run_oc;
@@ -1015,6 +1017,7 @@ pub fn resumeBoundFetchStream(
         .export_name = fn_name, // record the resolved export ({to} / onFetch*) — G3
     };
     const req: Request = .{
+        .arena_mode = worker_mod.arenaModeFor(worker, inst.id, tc.snap.deployment_id, path),
         .method = "POST",
         .path = spath,
         .body = body,
@@ -1073,6 +1076,7 @@ pub fn resumeBoundFetchStream(
         captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
         return;
     };
+    worker_mod.noteChurnyOutcome(worker, inst.id, tc.snap.deployment_id, path);
 
     const wrote = ws.ops.items.len > 0;
     switch (oc) {
@@ -1490,6 +1494,9 @@ pub fn runFire(
     }
     var req_w = req;
     if (req_w.effects.pending_fetches == null) req_w.effects.pending_fetches = &pending_fetches;
+    // Known-churny handlers skip the doomed bump attempt (the module
+    // identity is the same log_path key the inbound path uses).
+    req_w.arena_mode = worker_mod.arenaModeFor(worker, tenant_id, dep_id, log_path);
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
     const run_oc = worker.dispatcher.runOutcome(
@@ -1503,11 +1510,13 @@ pub fn runFire(
         req_w,
         &budget,
     ) catch {
+        worker_mod.noteChurnyOutcome(worker, tenant_id, dep_id, log_path);
         p.txn.rollback() catch {};
         p.txn_done = true;
         captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, &.{}, spec.act, 0);
         return;
     };
+    worker_mod.noteChurnyOutcome(worker, tenant_id, dep_id, log_path);
 
     const wrote = spec.always_propose or p.ws.ops.items.len > 0;
     var oc = run_oc;

@@ -1504,6 +1504,7 @@ fn resumeContinuation(
         pending_fetches.deinit(allocator);
     }
     const request: Request = .{
+        .arena_mode = worker_mod.arenaModeFor(worker, inst.id, tc.snap.deployment_id, path),
         .method = "POST",
         .path = spath,
         .body = body,
@@ -1541,6 +1542,7 @@ fn resumeContinuation(
         try resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "continuation handler error\n");
         return;
     };
+    worker_mod.noteChurnyOutcome(worker, inst.id, tc.snap.deployment_id, path);
 
     const wrote = ws.ops.items.len > 0;
     switch (oc) {
@@ -1960,6 +1962,7 @@ pub fn resumeBoundFetchChain(
         .export_name = fn_name, // record the resolved export ({to} / onFetch*) — G3
     };
     const req: Request = .{
+        .arena_mode = worker_mod.arenaModeFor(worker, inst.id, tc.snap.deployment_id, cont_path),
         .method = "POST",
         .path = spath,
         .body = body,
@@ -2022,6 +2025,7 @@ pub fn resumeBoundFetchChain(
         resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "bound-fetch handler error\n") catch {};
         return;
     };
+    worker_mod.noteChurnyOutcome(worker, inst.id, tc.snap.deployment_id, cont_path);
 
     const wrote = ws.ops.items.len > 0;
 
@@ -3136,6 +3140,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
     };
 
     const req: Request = .{
+        .arena_mode = worker_mod.arenaModeFor(worker, inst.id, tc.snap.deployment_id, cont_path),
         .method = "POST",
         .path = spath,
         .body = chunk_bytes,
@@ -3189,6 +3194,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
         resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "inbound-chunk handler error\n") catch {};
         return true;
     };
+    worker_mod.noteChurnyOutcome(worker, inst.id, tc.snap.deployment_id, cont_path);
 
     const wrote = ws.ops.items.len > 0;
 

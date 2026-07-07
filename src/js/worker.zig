@@ -3396,6 +3396,22 @@ fn churnyKey(allocator: std.mem.Allocator, tenant_id: []const u8, dep_id: u64, m
     return std.fmt.allocPrint(allocator, "{s}\x00{x}\x00{s}", .{ tenant_id, dep_id, module_base });
 }
 
+/// `Request.arena_mode` for a handler: `.gc` when the churny map says
+/// its bump attempt is doomed, else `.auto`. One call site per
+/// dispatch path, paired with `noteChurnyOutcome` after the run.
+pub fn arenaModeFor(worker: anytype, tenant_id: []const u8, dep_id: u64, module_base: []const u8) @FieldType(Request, "arena_mode") {
+    return if (isChurny(worker, tenant_id, dep_id, module_base)) .gc else .auto;
+}
+
+/// Post-dispatch pairing of `arenaModeFor`: if the run OOMed bump and
+/// re-executed under GC, remember the handler. Reads the dispatcher's
+/// last-run flag, so call it immediately after runOutcome (before any
+/// nested dispatch).
+pub fn noteChurnyOutcome(worker: anytype, tenant_id: []const u8, dep_id: u64, module_base: []const u8) void {
+    if (worker.dispatcher.last_arena_gc_retry)
+        markChurny(worker, tenant_id, dep_id, module_base);
+}
+
 /// Should this handler skip the doomed bump attempt? Consulted at
 /// request build; see `Worker.churny_handlers`.
 pub fn isChurny(worker: anytype, tenant_id: []const u8, dep_id: u64, module_base: []const u8) bool {

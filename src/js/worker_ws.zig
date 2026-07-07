@@ -622,6 +622,7 @@ fn fireWsMessage(
     }
 
     const request: Request = .{
+        .arena_mode = worker_mod.arenaModeFor(worker, p.dep.inst.id, p.dep.tc.snap.deployment_id, path),
         .method = "POST",
         .path = spath,
         .body = body,
@@ -657,6 +658,7 @@ fn fireWsMessage(
         tearDownWsChain(worker, conn_ent);
         return;
     };
+    worker_mod.noteChurnyOutcome(worker, p.dep.inst.id, p.dep.tc.snap.deployment_id, path);
 
     var oc = run_oc;
     finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, .ws_message, "ws-message", .{ .frame = .{ .opcode = opcode, .data = payload } });
@@ -807,6 +809,7 @@ pub fn resumeBoundFetchChainWs(
         .export_name = ev.resolvedExport(), // record the resolved export ({to}) — G3
     };
     const request: Request = .{
+        .arena_mode = worker_mod.arenaModeFor(worker, p.dep.inst.id, p.dep.tc.snap.deployment_id, path),
         .method = "POST",
         .path = spath,
         .body = body,
@@ -855,6 +858,7 @@ pub fn resumeBoundFetchChainWs(
         tearDownWsChain(worker, conn_ent);
         return;
     };
+    worker_mod.noteChurnyOutcome(worker, p.dep.inst.id, p.dep.tc.snap.deployment_id, path);
 
     var oc = run_oc;
     finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, .fetch_chunk, "ws-fetch-resume", .{ .fetch = fetch_ev });
@@ -920,6 +924,7 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     }
 
     const request: Request = .{
+        .arena_mode = worker_mod.arenaModeFor(worker, p.dep.inst.id, p.dep.tc.snap.deployment_id, path),
         .method = "POST",
         .path = spath,
         .body = body,
@@ -956,6 +961,7 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
         tearDownWsChain(worker, conn_ent);
         return;
     };
+    worker_mod.noteChurnyOutcome(worker, p.dep.inst.id, p.dep.tc.snap.deployment_id, path);
 
     var oc = run_oc;
     finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, .wake_batch, "ws-wake", .none);
@@ -1061,6 +1067,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
     defer allocator.free(spath);
 
     const request: Request = .{
+        .arena_mode = worker_mod.arenaModeFor(worker, p.dep.inst.id, p.dep.tc.snap.deployment_id, path),
         .method = "POST",
         .path = spath,
         .body = body,
@@ -1087,6 +1094,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.correlation_id, &.{}, .disconnect, 0);
         return;
     };
+    worker_mod.noteChurnyOutcome(worker, p.dep.inst.id, p.dep.tc.snap.deployment_id, path);
 
     const wrote = p.ws.ops.items.len > 0;
     var oc = run_oc;
