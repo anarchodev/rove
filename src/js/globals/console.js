@@ -36,5 +36,49 @@
     log(...args) {
       return sys.log(...args);
     },
+
+    /**
+     * `console.log` with a `[warn]` prefix — the standard quartet all
+     * land in the same request log (one stream, replay-deterministic);
+     * the prefix is the level.
+     *
+     * @param {...*} args - Values to log.
+     * @returns {void}
+     * @example
+     * console.warn("retrying", attempt);
+     */
+    warn(...args) {
+      return sys.log("[warn]", ...args);
+    },
+
+    /**
+     * `console.log` with an `[error]` prefix.
+     *
+     * @param {...*} args - Values to log.
+     * @returns {void}
+     * @example
+     * console.error("upstream failed", request.status);
+     */
+    error(...args) {
+      return sys.log("[error]", ...args);
+    },
+
+    /**
+     * `console.log` with an `[info]` prefix.
+     * @param {...*} args - Values to log.
+     * @returns {void}
+     */
+    info(...args) {
+      return sys.log("[info]", ...args);
+    },
+
+    /**
+     * `console.log` with a `[debug]` prefix.
+     * @param {...*} args - Values to log.
+     * @returns {void}
+     */
+    debug(...args) {
+      return sys.log("[debug]", ...args);
+    },
   };
 })();

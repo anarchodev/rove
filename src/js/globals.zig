@@ -2023,9 +2023,9 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     .{ .path = &.{ "_system", "console" }, .fns = &.{
         .{ .name = "log", .cfunc = jsConsoleLog, .argc = 1 },
     } },
-    // The after.* connection wake triggers (canonical) + the on.* dual-name-window alias. `on.timer` /
-    // `on.kv` accumulate onto `DispatchState.pending_wakes`; the worker
-    // arms them on the held entity at park. Inert when there's no held
+    // The after.* connection wake triggers. `after.ms` / `after.kv`
+    // accumulate onto `DispatchState.pending_wakes`; the worker arms
+    // them on the held entity at park. Inert when there's no held
     // connection (the accumulator is null).
     .{ .path = &.{ "_system", "after" }, .fns = &.{
         .{ .name = "timer", .cfunc = on_b.jsOnTimer,   .argc = 2 },

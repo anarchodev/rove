@@ -19,6 +19,13 @@
    * signature-verify operations are pure functions of their inputs and
    * are not taped.
    *
+   * Two signature families, named by their KEY FORMAT — don't mix
+   * them: `verifyEcdsa` / `verifyRsa` take a JWK (the JOSE world:
+   * JWTs, OIDC id_tokens, JWKS documents); `ecdsaSign` /
+   * `ecdsaVerify` / `ecdsaGenerateKey` take raw key bytes (the
+   * protocol-crypto world: your own signing recipes). `oidcSign`
+   * is the JOSE-side signer (PEM private key → compact JWS).
+   *
    * @namespace crypto
    */
   globalThis.crypto = {

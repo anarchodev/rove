@@ -1650,6 +1650,33 @@ test "PROBE after.cancel" {
     try testing.expectEqualStrings("ok", resp.body);
 }
 
+test "dispatch: console quartet lands level-prefixed lines in the request log" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var resp = try runOne(&d, kv,
+        \\console.log("plain", 1);
+        \\console.warn("careful");
+        \\console.error("boom", 2);
+        \\console.info("fyi");
+        \\console.debug("wire");
+        \\return "ok";
+    , .{ .method = "POST", .path = "/" });
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings("ok", resp.body);
+    try testing.expect(std.mem.indexOf(u8, resp.console, "plain 1") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.console, "[warn] careful") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.console, "[error] boom 2") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.console, "[info] fyi") != null);
+    try testing.expect(std.mem.indexOf(u8, resp.console, "[debug] wire") != null);
+}
+
 test "dispatch: schedule verb owns the whole timer surface; scheduler global is gone" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
