@@ -1339,6 +1339,14 @@ pub fn Worker(comptime opts: Options) type {
         /// a new dep_id, so a fixed handler sheds the mark
         /// automatically. In-memory only: worth one extra
         /// double-execution per worker after a restart.
+        ///
+        /// The module identity DIFFERS by activation path (route
+        /// module_base for inbound, cont module_path / `{on}` target
+        /// for continuations) — DELIBERATELY: a module's activation
+        /// kinds are independent memory profiles (an inbound that
+        /// parses a big payload churns while its onWake reads one key,
+        /// or vice versa), so a mark taxes only the code path that
+        /// actually OOMed, not the module's cheap paths.
         churny_handlers: std.StringHashMapUnmanaged(void) = .empty,
         /// Entities waiting on raft commit, destined for `response_in`
         /// (terminal response, no cont/stream chain). Stored on the
