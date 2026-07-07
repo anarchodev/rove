@@ -1083,7 +1083,7 @@ class OIDCRelyingParty {
     const claim_err = jwt.validateClaims(v.payload, {
       iss: this.cfg.issuer,
       aud: this.cfg.client_id,
-      leewaySeconds: this.cfg.leeway_s,
+      leewaySeconds: this.cfg.leewaySeconds,
     });
     if (claim_err) { response.status = 200; return "id_token " + claim_err; }
 

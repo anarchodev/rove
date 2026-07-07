@@ -144,6 +144,15 @@ function _sha256b64(body) {
   return _b64std(hex.decode(crypto.sha256(body)));
 }
 
+// Wire signature → bytes. HTTP-Signature `signature="…"` values arrive
+// standard-alphabet (`+/`, padded) — our own _deliver emits that too —
+// but base64url.decode rejects `+`/`/`, so normalize; tolerate
+// base64url senders as well.
+function _b64wire(s) {
+  return base64url.decode(
+    String(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""));
+}
+
 function _httpDate(ms) {
   return new Date(ms).toUTCString();
 }
@@ -481,7 +490,7 @@ class ActivityPubActor {
     const ok = crypto.verifyRsa(
       jwk, "sha256",
       new TextEncoder().encode(signingStr),
-      base64url.decode(ctx.signature),
+      _b64wire(ctx.signature),
     );
     if (!ok) return { ok: false, error: "bad signature" };
 

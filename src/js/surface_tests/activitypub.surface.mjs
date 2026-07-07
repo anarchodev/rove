@@ -74,7 +74,11 @@ export default function () {
   };
   const signingStr = "(request-target): post /actor/inbox\n" +
     "host: ap.example\ndate: Tue, 07 Jul 2026 00:00:00 GMT";
-  const signature = crypto.oidcSign(peerPriv, signingStr);
+  // The wire shape: HTTP-Signature values are STANDARD base64 (padded,
+  // `+/`) — real fediverse peers and our own _deliver both send that.
+  // oidcSign emits base64url; convert so this pins the interop path.
+  const sigUrl = crypto.oidcSign(peerPriv, signingStr);
+  const signature = btoa(String.fromCharCode(...base64url.decode(sigUrl)));
   const mkEvent = (activity, overrides) => Object.assign({
     ok: true,
     body: JSON.stringify(peerDoc),
