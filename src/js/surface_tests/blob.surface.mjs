@@ -56,17 +56,16 @@ export default function () {
   });
 
   check("blob.seal", () => {
-    throws(() => blob.seal(), /`on` export name is required/);
-    throws(() => blob.seal({ on: "not an ident" }), /`on` must be a JS identifier/);
+    throws(() => blob.seal(), /`on` module path is required/);
     throws(() => blob.seal({ on: "onStored", content_type: "t" }), /`content_type` was renamed/);
     // Seal freezes the recipe and returns the true hash synchronously,
     // finalized from the midstate — "hel"+"lo"+"é" accumulated above.
-    const hash = blob.seal({ on: "onStored", ctx: { id: 7 }, contentType: "text/plain" });
+    const hash = blob.seal({ on: "stored", ctx: { id: 7 }, contentType: "text/plain" });
     eq(hash, crypto.sha256("helloé"));
     const meta = JSON.parse(kv.get("_blob/recipe/local/meta"));
     eq(meta.state, "sealed");
     eq(meta.hash, hash);
-    eq(meta.on, "onStored");
+    eq(meta.on, "stored");
     eq(meta.ctx, { id: 7 });
     eq(meta.content_type, "text/plain");
     eq(meta.totalBytes, 7);
@@ -77,7 +76,7 @@ export default function () {
     throws(() => blob.get(hash), /sealed but not yet materialized/);
     // One seal per chain: both verbs refuse after the freeze.
     throws(() => blob.write("more"), /already sealed/);
-    throws(() => blob.seal({ on: "onStored" }), /already sealed/);
+    throws(() => blob.seal({ on: "stored" }), /already sealed/);
   });
 
   check("blob.receive", () => {

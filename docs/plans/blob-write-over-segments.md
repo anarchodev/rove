@@ -129,13 +129,21 @@ GC guard.
 There is no customer-visible "durably promised but not servable"
 state to reason about. Readiness is announced, never inferred:
 
-- `blob.seal({on: "onStored", ctx})` — the universal `{on}` key, with
-  **`webhook.send`'s delivery semantics, not `after.fetch`'s**. The
-  sealed marker (not the live connection) owes the callback, so the
-  completion arrives as a `send_callback`-class activation: it resumes
-  the held chain when the chain is still held (answer the waiting
-  client with a working URL), and runs connectionless when it isn't
-  (the pipeline continues). No moot-on-loss for a durable artifact.
+- `blob.seal({on: "stored", ctx})` — the universal `{on}` key, with
+  **`webhook.send`'s delivery semantics, not `after.fetch`'s**. And
+  its convention too (amended at build time, 2026-07-07): **`on` names
+  a MODULE, like `blob.put`'s and `webhook.send`'s**, not an export of
+  the sealing module — the sealed marker, not the live connection,
+  owes the callback, and a durable callback cannot name a sibling
+  export because the connectionless fire has no "current module."
+  Export-shaped `{on}` is the connection-scoped family's convention
+  (`after.*`); module-shaped `{on}` is the durable family's. The
+  completion arrives as a `send_callback`-class activation of that
+  module's default export. Resume-if-held (answer the waiting client
+  from the completion) needs the held-sync bind generalized beyond
+  `_send/owed` markers — deferred to phase E alongside the
+  materializer; until then a handler answers at seal (the fast mode)
+  and readiness lands connectionless.
 - No new verb, no `after.seal`: `after.*` is the connection-scoped
   wake family by grammar, and this callback is not droppable. The
   scope difference is carried by the noun's family, exactly as
@@ -146,19 +154,24 @@ state to reason about. Readiness is announced, never inferred:
   hits it:
 
 ```js
+// upload.mjs — respond at seal; readiness arrives at the module below.
 export function onChunk() {
   blob.write(request.bytes);
   if (!request.done) return next();
-  const hash = blob.seal({ on: "onStored", ctx: { id: request.ctx.id } });
+  const hash = blob.seal({ on: "stored", ctx: { id: request.ctx.id } });
   kv.set(`media/${request.ctx.id}`, JSON.stringify({ hash, status: "processing" }));
-  return next();
+  response.status = 202;
+  return JSON.stringify({ hash });
 }
+```
 
-export function onStored() {
+```js
+// stored.mjs — the completion activation (request.ctx = the seal ctx,
+// request.activation.hash = the object, request.json = {hash, totalBytes}).
+export default function () {
   const rec = JSON.parse(kv.get(`media/${request.ctx.id}`));
   kv.set(`media/${request.ctx.id}`, JSON.stringify({ ...rec, status: "ready" }));
-  response.status = 200;
-  return blob.url(rec.hash);
+  return "";
 }
 ```
 
@@ -348,6 +361,10 @@ semantics (the shim cutover in B is atomic).
 - **E — materializer + GC guard + deletions.** The dedicated pass,
   the high-water-mark check in retention/GC, the backstop metric;
   delete `blob_sessions.zig` + trampolines + DispatchState fields.
+  Plus **resume-if-held for the seal completion**: generalize the
+  held-sync bind (today keyed on `_send/owed` markers) so a chain
+  held after seal resumes from the completion instead of hanging to
+  its deadline.
 - **F — segments re-base.** `segments.seal` onto the substrate
   (record-index emission in the compose flip, hot-row deletes atomic
   with the sealed pointer); retire the in-arena assembly and the

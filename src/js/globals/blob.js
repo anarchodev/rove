@@ -57,8 +57,6 @@ const RECIPE_INLINE_TOTAL_MAX = 16 * 1024 * 1024;
 // Plan-tier input eventually (§12.2); one constant until plans carry it.
 const RECIPE_TOTAL_MAX = 1024 * 1024 * 1024;
 
-const EXPORT_NAME_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
-
 // One open recipe per chain: the sid IS the chain's correlation id
 // (recorded → replay-pure). Chain-less dispatch (test paths) shares
 // one local recipe, matching the one-session-per-chain semantics the
@@ -264,8 +262,8 @@ globalThis.blob = {
    * @example
    * export function onMirrorChunk() {
    *   if (!request.done) { blob.write(request.bytes); return next(); }
-   *   blob.seal({ on: "onStored", contentType: "image/png" });
-   *   return next();
+   *   const hash = blob.seal({ on: "stored", contentType: "image/png" });
+   *   return JSON.stringify({ hash });
    * }
    */
   write(bytes) {
@@ -313,12 +311,14 @@ globalThis.blob = {
    *
    * The hash is an identifier; **readiness is announced by your
    * `on` activation, never inferred.** Completion is durable
-   * (webhook.send semantics, not after.fetch's): the sealed recipe —
-   * not the live connection — owes the callback, so `on` fires even
-   * if this chain is gone by then (it resumes the chain when still
-   * held). It receives your `ctx` as `request.ctx` and
-   * `{hash, totalBytes}` as the result. There is no failure arm —
-   * materialization retries until it happens.
+   * (webhook.send's convention, not after.fetch's — `on` names a
+   * MODULE, like `blob.put`'s and `webhook.send`'s, because the
+   * sealed recipe, not the live connection, owes the callback): the
+   * module's default export fires connectionless once the object is
+   * servable, with your `ctx` as `request.ctx`, the hash on
+   * `request.activation.hash`, and `{hash, totalBytes}` as
+   * `request.json`. There is no failure arm — materialization
+   * retries until it happens.
    *
    * Index the hash in kv NOW if you want: the pointer write, the
    * seal marker, and the rest of your writeset commit atomically.
@@ -327,25 +327,29 @@ globalThis.blob = {
    * sealed-but-unmaterialized hash throw.
    *
    * @param {object} opts
-   * @param {string} opts.on - Export activated when the object is
-   *   servable (required).
+   * @param {string} opts.on - Module path activated when the object
+   *   is servable (required).
    * @param {*} [opts.ctx] - Threaded to the `on` activation as
    *   `request.ctx` (JSON round-trip).
    * @param {string} [opts.contentType] - Stored Content-Type.
    * @returns {string} The object's sha256 hash (64 hex chars).
    *
    * @example
+   * // doc-only
+   * // upload.mjs — respond at seal; readiness arrives at `stored`.
    * export function onChunk() {
    *   blob.write(request.bytes);
    *   if (!request.done) return next();
-   *   const hash = blob.seal({ on: "onStored", ctx: { id: request.ctx.id } });
+   *   const hash = blob.seal({ on: "stored", ctx: { id: request.ctx.id } });
    *   kv.set(`media/${request.ctx.id}`, JSON.stringify({ hash, status: "processing" }));
-   *   return next();
+   *   response.status = 202;
+   *   return JSON.stringify({ hash });
    * }
-   * export function onStored() {
+   * // stored.mjs — the completion activation.
+   * export default function () {
    *   const rec = JSON.parse(kv.get(`media/${request.ctx.id}`));
    *   kv.set(`media/${request.ctx.id}`, JSON.stringify({ ...rec, status: "ready" }));
-   *   return blob.url(rec.hash);
+   *   return "";
    * }
    */
   seal(opts) {
@@ -353,9 +357,7 @@ globalThis.blob = {
     opts = opts || {};
     const on_key = opts.on;
     if (typeof on_key !== "string" || !on_key.length)
-      throw new TypeError("blob.seal: `on` export name is required");
-    if (!EXPORT_NAME_RE.test(on_key))
-      throw new TypeError("blob.seal: `on` must be a JS identifier");
+      throw new TypeError("blob.seal: `on` module path is required");
     if (opts.contentType != null && typeof opts.contentType !== "string")
       throw new TypeError("blob.seal: contentType must be a string");
 

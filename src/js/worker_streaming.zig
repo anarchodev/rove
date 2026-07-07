@@ -1941,6 +1941,68 @@ pub fn fireSchedulerTick(worker: anytype, tenant_id: []const u8) void {
     }, module_path, corr_full, tenant_id, "");
 }
 
+// ── blob compose door (blob-write-over-segments.md §4) ─────────────
+
+const COMPOSE_URL_PREFIX = "http://rove-compose.internal/";
+
+pub fn isComposeUrl(url: []const u8) bool {
+    return std.mem.startsWith(u8, url, COMPOSE_URL_PREFIX);
+}
+
+/// The prompt-compose trigger: `blob.seal` emitted a post-commit fetch
+/// Cmd at `rove-compose.internal/{sid}`; `tryDoorFetch` routes it here
+/// instead of libcurl. Fire `__system/blob_compose` for the sealing
+/// tenant with the Cmd's ctx — the builtin assembles the recipe rows
+/// and hands the payload to blob.put (whose on_result flips the recipe
+/// and chains to the customer's `{on}`). Deliberately moot-on-loss:
+/// every failure here just logs and leaves the sealed meta row for the
+/// materializer, so nothing in this function may be load-bearing.
+pub fn fireBlobCompose(worker: anytype, pf_in: globals.PendingFetch) void {
+    var pf = pf_in;
+    defer pf.deinit(worker.allocator);
+    const allocator = worker.allocator;
+    const module_path = "__system/blob_compose";
+    std.log.info("rove-js blob_compose: door fired tenant={s} url={s}", .{ pf.tenant_id, pf.url });
+
+    var p = firePrep(worker, pf.tenant_id, module_path, "blob_compose") orelse return;
+    defer p.deinit(allocator);
+
+    const ctx_json = if (pf.ctx_json.len > 0) pf.ctx_json else "null";
+    const body = std.fmt.allocPrint(allocator, "{{\"ctx\":{s}}}", .{ctx_json}) catch return;
+    defer allocator.free(body);
+    const spath = std.fmt.allocPrint(allocator, "/{s}", .{module_path}) catch return;
+    defer allocator.free(spath);
+
+    var corr_buf: [48]u8 = undefined;
+    const corr_full = std.fmt.bufPrint(&corr_buf, "compose-{x:0>16}", .{p.request_id}) catch corr_buf[0..0];
+
+    const req: Request = .{
+        .method = "POST",
+        .path = spath,
+        .body = body,
+        .query = null,
+        .is_system_module = builtin_modules_mod.isBuiltinPath(module_path),
+        // durable_wake shape so the Cmd's ctx surfaces as `request.ctx`
+        // in the builtin (the webhook_fire convention — subscription
+        // fires carry no per-fire payload).
+        .activation = .{ .durable_wake = .{
+            .id = "blob_compose",
+            .key = "",
+            .scheduled_at_ns = 0,
+            .msg_json = ctx_json,
+        } },
+        .trace = .{ .readset = &p.readset, .request_id = p.request_id, .correlation_id = corr_full },
+        .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
+        .admin = .{ .platform = p.dep.inst.platform },
+    };
+    runFire(worker, &p, req, .{
+        .act = .durable_wake,
+        .site = "blob_compose",
+        .on_cont = .rollback_silent,
+        .on_stream = .rollback_silent,
+    }, module_path, corr_full, pf.tenant_id, "");
+}
+
 /// §2.6 durable-wake (P1): dispatch one due `_sched/by_time` entry's
 /// `target` handler as a `durable_wake` activation. Structural twin of
 /// `fireSubscriptionActivation` but: (1) it injects the entry's

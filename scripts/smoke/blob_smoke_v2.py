@@ -103,16 +103,39 @@ export function onChunk() {
     if (request.bytes && request.bytes.length) blob.write(request.bytes);
     return next();
   }
-  const hash = blob.seal({ on: "onStored", contentType: "text/plain" });
-  return next({ hash });
+  // Fast mode: respond at seal with the synchronous hash; readiness
+  // lands connectionless at the `sealednote` module (the smoke polls
+  // /sealcheck for the flip + the completion proof).
+  const hash = blob.seal({ on: "sealednote", ctx: { tag: "mirror" }, contentType: "text/plain" });
+  return hash;
 }
+"""
 
-export function onStored() {
-  if (request.status !== 200) {
-    response.status = 502;
-    return "seal PUT failed: " + request.status;
-  }
-  return request.ctx.hash;
+# The seal completion module — proves the durable {on} delivery: the
+# threaded ctx arrives as request.ctx, the object hash on
+# request.activation.hash, {hash, totalBytes} as the JSON body.
+SEALEDNOTE_SRC = """
+export default function () {
+  kv.set("sealed/" + (request.ctx && request.ctx.tag || "unknown"), JSON.stringify({
+    hash: request.activation.hash,
+    ok: request.ok,
+    body: request.json,
+  }));
+  return "";
+}
+"""
+
+# Reader route for the smoke's readiness poll: pending = the
+# _blob/pending/{hash} row still present (early dereference would
+# throw); note = the completion module's proof row.
+SEALCHECK_SRC = """
+export default function () {
+  const q = new URLSearchParams(request.query || "");
+  const raw = kv.get("sealed/" + q.get("tag"));
+  return JSON.stringify({
+    pending: kv.get("_blob/pending/" + q.get("hash")) != null,
+    note: raw == null ? null : JSON.parse(raw),
+  });
 }
 """
 
@@ -125,16 +148,8 @@ export default function () {{
   let chunk = "";
   for (let i = 0; i < 1024; i++) chunk += "rewindjs-blob-p2!";
   for (let i = 0; i < 8; i++) blob.write(chunk);
-  const hash = blob.seal({{ on: "onStored" }});
-  return next({{ hash }});
-}}
-
-export function onStored() {{
-  if (request.status !== 200) {{
-    response.status = 502;
-    return "seal PUT failed: " + request.status;
-  }}
-  return request.ctx.hash;
+  const hash = blob.seal({{ on: "sealednote", ctx: {{ tag: "gen" }} }});
+  return hash;
 }}
 """
 
@@ -244,6 +259,8 @@ def main() -> int:
                 "putresult.mjs": PUTRESULT_SRC,
                 "mirror/index.mjs": MIRROR_SRC,
                 "gen/index.mjs": GEN_SRC,
+                "sealednote.mjs": SEALEDNOTE_SRC,
+                "sealcheck/index.mjs": SEALCHECK_SRC,
                 "segget/index.mjs": SEGGET_SRC,
             })
         except Exception as e:  # noqa: BLE001
@@ -314,6 +331,26 @@ def main() -> int:
         r = c.request(TENANT, "/url?hash=nothex")
         check("bad hash → 500", r.status == 500, f"got {r.status} {r.body!r}")
 
+        def wait_sealed(tag: str, want_hash: str) -> None:
+            """Poll until the pending row flips AND the completion module ran."""
+            note = None
+            deadline = time.time() + 30.0
+            while time.time() < deadline:
+                rc = c.request(TENANT, f"/sealcheck?tag={tag}&hash={want_hash}")
+                if rc.status == 200:
+                    st = json.loads(rc.body)
+                    if not st["pending"] and st["note"] is not None:
+                        note = st["note"]
+                        break
+                time.sleep(0.5)
+            check(f"seal[{tag}]: compose flipped + {{on}} module fired", note is not None,
+                  "pending row never cleared / completion never ran in 30s")
+            if note is not None:
+                check(f"seal[{tag}]: completion carries hash + ok + body",
+                      note["hash"] == want_hash and note["ok"] is True
+                      and note["body"]["hash"] == want_hash,
+                      f"got {note!r}")
+
         print("step 6: P2 mirror — streamed fetch → blob.write per chunk → seal")
         src_hex = url.encode().hex()
         r = c.request(TENANT, f"/mirror?src={src_hex}", timeout=60.0)
@@ -321,6 +358,7 @@ def main() -> int:
         mirrored = (r.body.decode() if isinstance(r.body, bytes) else str(r.body)).strip()
         check("mirrored hash == original hash (CAS self-validation)",
               mirrored == expect_hash, f"got {mirrored!r} want {expect_hash!r}")
+        wait_sealed("mirror", expect_hash)
 
         print("step 7: P2 multi-write — 8 writes in one activation → seal")
         gen_expect = hashlib.sha256((GEN_CHUNK * 8).encode()).hexdigest()
@@ -329,6 +367,7 @@ def main() -> int:
         gen_hash = (r.body.decode() if isinstance(r.body, bytes) else str(r.body)).strip()
         check("gen hash == python sha256 of same content",
               gen_hash == gen_expect, f"got {gen_hash!r} want {gen_expect!r}")
+        wait_sealed("gen", gen_expect)
         # Round-trip the sealed object BOTH ways: through the door
         # (blob.get + native TextDecoder over a 139 KB body — this
         # exact read OOM'd the pre-native pure-JS decoder) and via

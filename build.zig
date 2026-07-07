@@ -523,6 +523,9 @@ pub fn build(b: *std.Build) void {
         // blob-storage P1 (docs/architecture/routing-and-ingress.md) — blob.put's marker-settling
         // result handler.
         .{ .name = "builtin_blob_onresult_mjs", .path = "src/js/builtin_modules/blob_onresult.mjs" },
+        // blob-write-over-segments.md §4 — the seal-time prompt compose + its flip.
+        .{ .name = "builtin_blob_compose_mjs", .path = "src/js/builtin_modules/blob_compose.mjs" },
+        .{ .name = "builtin_blob_compose_onresult_mjs", .path = "src/js/builtin_modules/blob_compose_onresult.mjs" },
         // blob-storage §6 (docs/architecture/routing-and-ingress.md) — segments.seal's swap half.
         .{ .name = "builtin_segments_onsealed_mjs", .path = "src/js/builtin_modules/segments_onsealed.mjs" },
         // Engine-fired deploy-static streamer ("onStatic") — cold/large static serve.

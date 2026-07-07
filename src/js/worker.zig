@@ -2892,6 +2892,10 @@ pub fn Worker(comptime opts: Options) type {
                 self.armBlobReceive(pf);
                 return true;
             }
+            if (worker_streaming.isComposeUrl(pf.url)) {
+                worker_streaming.fireBlobCompose(self, pf);
+                return true;
+            }
             if (deploy_thread_mod.isCompileUrl(pf.url)) {
                 self.submitCompile(pf);
                 return true;
