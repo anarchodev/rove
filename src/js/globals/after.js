@@ -21,6 +21,7 @@
 
 (function () {
   const sys = _system.after;
+  const sysHttp = _system.http;
 
   // Lower the public `{on}` key onto the native binding's field.
   function tgt(opts) {
@@ -118,6 +119,22 @@
      */
     fetch(url, opts, dst) {
       return sys.fetch(url, opts, tgt(dst));
+    },
+
+    /**
+     * Cancel an in-flight `after.fetch` by the id it returned (also on
+     * `request.fetchId` in its wake events). No-op if it already
+     * completed. Cooperative: a chunk already in flight at the engine
+     * may still land after the cancel returns — track "we moved on" in
+     * your chain ctx.
+     *
+     * @param {string} id - The `ftch_…` id.
+     * @returns {void}
+     * @example
+     * after.cancel(request.fetchId); // enough chunks — stop the rest
+     */
+    cancel(id) {
+      return sysHttp.cancelFetch({ id: id });
     },
   };
 })();

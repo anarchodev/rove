@@ -268,7 +268,7 @@ globalThis.oauth = {
    * Verify a third-party `id_token` against the cached JWKS only
    * (synchronous — there is no sync HTTP). `jwt.*` is
    * alg-confusion-safe (RS/ES only). On a cache miss / unknown `kid`
-   * the caller must run the async {@link oauth.fetchJwks} hop and
+   * the caller must run the async {@link oauth.fetchJwks} hop and,
    * retry; this mirrors `oidc.rp`'s `completeToken → completeJwks →
    * _finish` chain (auth-domain-plan §4.8).
    *
@@ -315,41 +315,40 @@ globalThis.oauth = {
   },
 
   /**
-   * Kick the async JWKS fetch. `on_result` lands in a module that
-   * re-runs {@link oauth.verifyIdToken} (now a cache hit) after
-   * calling {@link oauth.cacheJwksFromEvent}.
+   * Kick the async JWKS fetch. The result lands in the `{on}` module,
+   * which calls {@link oauth.cacheJwks} then re-runs
+   * {@link oauth.verifyIdToken} (now a cache hit).
    *
    * @param {object} opts - Must carry `jwks_uri`.
-   * @param {string} on_result_module - Module to receive the fetch
-   *   result event.
-   * @param {object} [context] - Threaded back on the event (carry
+   * @param {string} on - Module to receive the fetch result.
+   * @param {object} [ctx] - Threaded back as `request.ctx` (carry
    *   `id_token`, `sid`, `return_to`, …).
    * @example
    * oauth.fetchJwks(opts, "users/oauth_jwks",
    *   { id_token, sid: ctx.sid, return_to: ctx.return_to });
    */
-  fetchJwks(opts, on_result_module, context) {
+  fetchJwks(opts, on, ctx) {
     webhook.send(opts.jwks_uri, {
       method: "GET",
-      on: on_result_module,
-      ctx: context,
+      on: on,
+      ctx: ctx,
     });
   },
 
   /**
-   * Cache a JWKS fetch event's body. Call from the fetch `on_result`
-   * module, then re-run {@link oauth.verifyIdToken}.
+   * Cache the JWKS delivered to the {@link oauth.fetchJwks} `{on}`
+   * module. Reads the ambient result (`request.ok` / `request.text`) —
+   * call it, then re-run {@link oauth.verifyIdToken}.
    *
-   * @param {object} event - The webhook.send result event
-   *   (`{ok,status,body}`).
    * @param {string} [cache_path] - Same `cache_path` passed to
    *   {@link oauth.verifyIdToken}.
    * @returns {boolean} `true` when a well-formed JWKS was cached.
    */
-  cacheJwksFromEvent(event, cache_path) {
-    if (!event || !event.ok) return false;
+  cacheJwks(cache_path) {
+    const req = globalThis.request;
+    if (!req || !req.ok) return false;
     let jwks = null;
-    try { jwks = JSON.parse(event.body || "{}"); } catch (_) {}
+    try { jwks = JSON.parse(req.text || "{}"); } catch (_) {}
     if (!jwks || !Array.isArray(jwks.keys)) return false;
     kv.set((cache_path || "cache/oauth/_idtok") + "/jwks",
       JSON.stringify({ keys: jwks.keys, fetched_at: Date.now() }));

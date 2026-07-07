@@ -5,7 +5,7 @@
 //
 // Bound, streaming fetch consumed writes-per-chunk (raft round-trip
 // per chunk → the spool backs up behind the consumer). After a couple
-// of chunks the handler calls `http.cancelFetch(request.fetchId)` on
+// of chunks the handler calls `after.cancel(request.fetchId)` on
 // its OWN in-flight fetch and returns a terminal response. The spool
 // still holds the unconsumed tail chunks; the cancel path
 // (`cancelFetchTrampoline` → `dropSpool`) must discard them — counted
@@ -36,7 +36,7 @@ export function onFetchChunk() {
     if (seq >= 2) {
         // Cancel our own fetch mid-stream + terminate the held chain.
         // No kv write → wrote=false → ships immediately via resolveParked.
-        http.cancelFetch({ id: request.fetchId });
+        after.cancel(request.fetchId);
         response.status = 200;
         return "cancelled@" + seq;
     }

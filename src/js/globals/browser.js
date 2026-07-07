@@ -46,13 +46,14 @@
   globalThis.browser = {
     /**
      * Decode an inbound agent frame from an `onMessage` activation.
-     * Returns the parsed object (`{t, ...}`), or `null` if this
-     * activation is not a parseable agent frame.
+     * Reads the ambient `request` (no arguments). Returns the parsed
+     * object (`{t, ...}`), or `null` if this activation is not a
+     * parseable agent frame.
      *
-     * @param {object} request - The handler's `request`.
      * @returns {object|null}
      */
-    message(request) {
+    message() {
+      const request = globalThis.request;
       const a = request && request.activation;
       if (!a || a.kind !== "ws_message") return null;
       // The uniform payload surface: `request.text` is the frame text
@@ -206,13 +207,13 @@
      * tagging needed. Pass `opts.session` to filter by a
      * `request.tag("session", …)` value instead (survives reconnects).
      *
-     * @param {object} request - the handler's `request`.
      * @param {object} opts - `{on, since?, limit?, session?}`. `on` is the
      *   callback export name (required); `since` an `after_received_ns`
      *   cursor; `limit` max records (default 50).
      * @returns {boolean} false if it couldn't issue (no tenant/connection).
      */
-    getReplay(request, opts) {
+    getReplay(opts) {
+      const request = globalThis.request;
       opts = opts || {};
       const on_key = typeof opts.on === "string" ? opts.on : undefined;
       const tenant = request && request.tenant;
@@ -240,10 +241,12 @@
      * `{request_id, received_ns, duration_ns, status, method, path,
      * host, outcome}`. Returns `{records: []}` on any decode failure.
      *
-     * @param {object} request - the callback's `request`.
+     * Reads the ambient `request` (no arguments).
+     *
      * @returns {{records: Array, next_cursor: object|null}}
      */
-    replayResult(request) {
+    replayResult() {
+      const request = globalThis.request;
       const raw = request && request.text;
       if (raw == null) return { records: [] };
       try {

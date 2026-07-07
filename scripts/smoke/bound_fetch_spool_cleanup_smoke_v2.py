@@ -8,7 +8,7 @@ node survives) on the two non-terminal exits:
 
   1. Cancel mid-stream — `/spoolcancel` consumes a couple of chunks
      writes-per-chunk (so the spool backs up behind the consumer), then
-     calls `http.cancelFetch(request.fetchId)` on its OWN in-flight fetch
+     calls `after.cancel(request.fetchId)` on its OWN in-flight fetch
      and returns terminal "cancelled@<seq>". The tail chunks still in the
      spool must be dropped (`cancelFetchTrampoline` → `dropSpool`). Also
      exercises the reentrancy hazard: the spool's map key is freed by the

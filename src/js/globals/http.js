@@ -15,30 +15,15 @@
   const sys = _system.http;
 
   /**
-   * Held outbound subscriptions + fetch cancellation. The one-shot
-   * outbound primitives are {@link after.fetch} (connection-scoped — binds
-   * to the held chain) and {@link webhook.send} (durable, connectionless);
-   * the transient `http.fetch` spelling is retired. `http.subscribe`
-   * remains for long-lived held outbound streams.
+   * Long-lived held outbound subscriptions. The one-shot outbound
+   * primitives are {@link after.fetch} (connection-scoped; cancel via
+   * {@link after.cancel}) and {@link webhook.send} (durable,
+   * connectionless); `http.subscribe` holds an upstream that pushes to
+   * YOU.
    *
    * @namespace http
    */
   globalThis.http = {
-    /**
-     * Cancel an in-flight fetch (an `after.fetch` id — the `ftch_…` string it returned). No-op if it already
-     * completed or was never issued. Cooperative: a chunk already
-     * in flight at the engine may still land in `on_chunk` after
-     * the cancel returns; track "we moved on" in your chain ctx
-     * (the customer is the single source of truth for chain
-     * progress).
-     *
-     * @param {{id:string}} opts - The id `after.fetch` returned.
-     * @returns {void}
-     */
-    cancelFetch(opts) {
-      return sys.cancelFetch(opts);
-    },
-
     /**
      * Open a held outbound subscription — `after.fetch`'s held
      * symmetric twin for long-lived upstreams (atproto firehose, Pub/Sub
@@ -96,11 +81,11 @@
      * already in flight may still land in `on_chunk` after the
      * cancel returns.
      *
-     * @param {{id:string}} opts - The id `http.subscribe` returned.
+     * @param {string} id - The id `http.subscribe` returned.
      * @returns {void}
      */
-    cancelSubscription(opts) {
-      return sys.cancelSubscription(opts);
+    cancelSubscription(id) {
+      return sys.cancelSubscription({ id: id });
     },
   };
 })();

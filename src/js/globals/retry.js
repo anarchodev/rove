@@ -10,32 +10,24 @@
 //     url: "https://stripe.com/charge",
 //     body: "...",
 //     headers: { "content-type": "application/json" },
-//     on_result_module: "charges/handler",  // module path in this tenant
+//     on: "charges/handler",           // module path in this tenant
 //     max_attempts: 3,
 //     // backoff_ms can be a number (constant), an array (per-attempt
 //     // schedule), or omitted (default exponential 1s/4s/16s capped
 //     // at 1 minute).
 //     backoff_ms: [1000, 5000, 30000],
-//     context: { charge_id: 42 },
+//     ctx: { charge_id: 42 },
 //   });
 //
-//   // The on_result handler. The event arrives on the unified
-//   // flattened surface (handler-shape §7): the response on
-//   // `request.text` / `request.status` / `request.ok`, with the
-//   // delivery metadata + echoed `context` on `request.ctx`.
-//   // `retry.shouldRetry` / `retry.next` accept the flat event shape;
-//   // assemble it from that surface:
+//   // The {on} handler — every helper reads the ambient flattened
+//   // result surface (handler-shape §7) itself; no event assembly.
 //   //
 //   //   charges/handler.mjs
 //   //   export default function () {
-//   //     const event = {
-//   //       ok: request.ok, status: request.status, body: request.text,
-//   //       error: request.activation.error, context: request.ctx,
-//   //     };
-//   //     if (retry.shouldRetry(event)) { retry.next(event); return; }
-//   //     const ctx = retry.stripContext(event);
-//   //     if (event.ok) kv.set(`charge/${ctx.charge_id}`, event.body);
-//   //     else kv.set(`failed/${ctx.charge_id}`, event.error);
+//   //     if (retry.shouldRetry()) { retry.again(); return; }
+//   //     const ctx = retry.ctx();
+//   //     if (request.ok) kv.set(`charge/${ctx.charge_id}`, request.text);
+//   //     else kv.set(`failed/${ctx.charge_id}`, request.activation.error);
 //   //   }
 //
 // Why `retry.send` exists alongside `webhook.send`'s built-in retry:
@@ -45,7 +37,7 @@
 // CUSTOMER wants to drive the policy: custom backoff, custom max,
 // per-attempt context inspection. It sets `max_attempts: 1` on the
 // underlying `webhook.send` to suppress the built-in retry, then
-// composes its own chain via `retry.next` from the on_result module.
+// composes its own chain via `retry.again` from the {on} module.
 
 const RETRY_KEY = "_retry";
 
@@ -65,9 +57,12 @@ function backoffMsFor(retry_state, next_attempt) {
 
 /**
  * Customer-side retry policy layered on {@link webhook.send}. All retry
- * state lives in this tenant's own context — no platform retry loop,
- * no cross-tenant privileges. The chain only advances when the
- * on_result handler explicitly calls {@link retry.next}.
+ * state lives in this tenant's own ctx — no platform retry loop, no
+ * cross-tenant privileges. The chain only advances when the {on}
+ * handler explicitly calls {@link retry.again}. Every helper reads the
+ * ambient flattened result surface itself — no event assembly, no
+ * arguments (`retry.next` was renamed `retry.again` to stop colliding
+ * with the `next()` disposition).
  *
  * @namespace retry
  * @example
@@ -80,23 +75,18 @@ function backoffMsFor(retry_state, next_attempt) {
  *   ctx: { charge_id: 42 },
  * });
  *
- * // charges/handler.mjs — the {on} handler. The result arrives
- * // on the unified flattened surface (handler-shape §7).
+ * // charges/handler.mjs — the {on} handler.
  * export default function () {
- *   const event = {
- *     ok: request.ok, status: request.status, body: request.text,
- *     error: request.activation.error, context: request.ctx,
- *   };
- *   if (retry.shouldRetry(event)) { retry.next(event); return; }
- *   const ctx = retry.stripContext(event);
- *   // ... your terminal handling ...
+ *   if (retry.shouldRetry()) { retry.again(); return; }
+ *   const ctx = retry.ctx();
+ *   // ... your terminal handling on request.ok/.status/.text ...
  * }
  */
 globalThis.retry = {
   /**
    * Fire a one-shot `webhook.send` wrapped with a retry policy. The
-   * on_result module receives events with `event.context._retry`
-   * populated; drive the chain with the helpers below.
+   * {on} module drives the chain with the no-arg helpers below (the
+   * policy rides `request.ctx._retry`).
    *
    * @param {object} opts
    * @param {string} opts.url - Target URL.
@@ -115,8 +105,7 @@ globalThis.retry = {
    * @param {*} [opts.ctx] - Echoed back (under your own keys;
    *   `_retry` is reserved).
    * @returns {string} The {@link webhook.send} schedule id.
-   * @throws {TypeError} On missing/invalid `url`/`on_result_module`/
-   *   `max_attempts`.
+   * @throws {TypeError} On missing/invalid `url`/`on`/`max_attempts`.
    */
   send(opts) {
     if (!opts || typeof opts !== "object") {
@@ -166,42 +155,42 @@ globalThis.retry = {
   },
 
   /**
-   * Whether `event` should be retried: a failure with attempts
-   * remaining. Always `false` on success or when retry context is
-   * absent.
+   * Whether this result should be retried: a failure with attempts
+   * remaining. Reads the ambient flattened result (`request.ok`,
+   * `request.ctx._retry`) — no arguments. Always `false` on success or
+   * outside a retry.send result activation.
    *
-   * @param {object} event - The (flat) result event with `ok` +
-   *   `context._retry`. See the module comment for how to flatten
-   *   from `request.ctx`.
    * @returns {boolean}
    */
-  shouldRetry(event) {
-    if (!event || event.ok) return false;
-    const r = event.context && event.context[RETRY_KEY];
+  shouldRetry() {
+    const req = globalThis.request;
+    if (!req || req.ok) return false;
+    const r = req.ctx && req.ctx[RETRY_KEY];
     if (!r) return false;
     return (r.attempt || 1) < (r.max_attempts || 1);
   },
 
   /**
-   * Schedule the next attempt (applies the backoff). No-op returning
-   * `null` if the event isn't retryable — check {@link
-   * retry.shouldRetry} first.
+   * Schedule the next attempt (applies the backoff). Reads the ambient
+   * result — no arguments. No-op returning `null` if this result isn't
+   * retryable — check {@link retry.shouldRetry} first. (Named `again`,
+   * not `next`: `next()` is the hold-the-connection disposition.)
    *
-   * @param {object} event - The result event.
-   * @returns {string|null} New schedule id, or `null`.
+   * @returns {string|null} New marker id, or `null`.
    */
-  next(event) {
-    if (!retry.shouldRetry(event)) return null;
-    const r = event.context[RETRY_KEY];
+  again() {
+    if (!retry.shouldRetry()) return null;
+    const req = globalThis.request;
+    const r = req.ctx[RETRY_KEY];
     const next_attempt = (r.attempt || 1) + 1;
     const delay = backoffMsFor(r, next_attempt);
     let fire_at_ns;
     if (delay > 0) {
       fire_at_ns = BigInt(Date.now()) * 1_000_000n + BigInt(delay) * 1_000_000n;
     }
-    // User-domain context is everything except _retry.
-    const user_context = Object.assign({}, event.context);
-    delete user_context[RETRY_KEY];
+    // User-domain ctx is everything except _retry.
+    const user_ctx = Object.assign({}, req.ctx);
+    delete user_ctx[RETRY_KEY];
     return webhook.send(r.original.url, {
       method: r.original.method,
       headers: r.original.headers,
@@ -210,38 +199,39 @@ globalThis.retry = {
       fire_at_ns,
       on: r.on_result_module,
       max_attempts: 1,
-      ctx: Object.assign({}, user_context, {
+      ctx: Object.assign({}, user_ctx, {
         [RETRY_KEY]: Object.assign({}, r, { attempt: next_attempt }),
       }),
     });
   },
 
   /**
-   * `event.context` with the reserved `_retry` meta removed. Returns
-   * a fresh object (no mutation); idempotent on events that never
-   * went through {@link retry.send}.
+   * Your original ctx with the reserved `_retry` meta removed. Reads
+   * the ambient result — no arguments. Fresh object (no mutation);
+   * works on results that never went through {@link retry.send}.
    *
-   * @param {object} event - The result event.
-   * @returns {object|null} Your original context, or `null`.
+   * @returns {object|null}
    */
-  stripContext(event) {
-    if (!event || !event.context || !event.context[RETRY_KEY]) {
-      return event ? event.context : null;
+  ctx() {
+    const req = globalThis.request;
+    if (!req || !req.ctx || !req.ctx[RETRY_KEY]) {
+      return req ? (req.ctx === undefined ? null : req.ctx) : null;
     }
-    const out = Object.assign({}, event.context);
+    const out = Object.assign({}, req.ctx);
     delete out[RETRY_KEY];
     return out;
   },
 
   /**
    * Current 1-based attempt number (1 on the first fire, 2 on the
-   * first retry, …). `null` when retry context is missing.
+   * first retry, …). Reads the ambient result — no arguments. `null`
+   * when retry context is missing.
    *
-   * @param {object} event - The result event.
    * @returns {number|null}
    */
-  attempt(event) {
-    const r = event && event.context && event.context[RETRY_KEY];
+  attempt() {
+    const req = globalThis.request;
+    const r = req && req.ctx && req.ctx[RETRY_KEY];
     return r ? (r.attempt || 1) : null;
   },
 };
