@@ -279,25 +279,76 @@ log to the effect bundle or return values — contradicting the
 - **Sim**: the seal→`onStored` correlation as a saga-fold case once
   send-callback correlation lands.
 
-## 12. Open questions
+## 12. Decisions (settled 2026-07-07)
 
-1. **Recipe row layout & namespacing** — where recipe rows live
-   (`_upload/{sid}/…`?), how sid derives from the chain (today's
-   sessions key on tenant + correlation id), and the abandoned-recipe
-   sweep rule (unsealed recipes older than T get deleted — the analog
-   of today's 2-minute RAM sweep, now in kv).
-2. **Caps as policy** — with RAM out of the picture, what bounds
-   remain? Row count and total bytes per recipe, open recipes per
-   tenant, compose-job concurrency per node. Numbers TBD; they should
-   be plan-tier inputs like everything else.
-3. **`bodyRef` shape** — opaque token vs structured
-   `{worker, seq, offset, len}`; whether refs are rangeable (a fire
-   sliced from a larger coordinator batch object needs offset+len).
-4. **Completion payload** — `{ok, hash}` plus what? `totalBytes`?
-   Failure arm: can a compose fail terminally (refs GC'd under a
-   wedged materializer would be the only path, and the GC guard exists
-   to make it impossible) — is `ok: false` even reachable, and if not,
-   say so in the contract ("say what it's NOT").
-5. **Coordinator read path for compose** — ranged GETs per ref vs
-   batching adjacent refs from the same batch object; affects compose
-   cost for many-chunk uploads.
+1. **Recipe rows live under `_blob/recipe/{sid}/`** — `meta` (state,
+   hash-or-midstate, contentType, totals, updated_at) plus
+   `r/{seq, zero-padded}` rows. `_blob/` is already in
+   `SHIM_WRITABLE_PREFIXES` (reserved.zig), so the shim writes them as
+   ordinary tenant kv — no reserved changes. **sid = the chain's
+   correlation id** (recorded → replay-pure), with `req{request_id}`
+   as the chain-less fallback (test paths). **One open recipe per
+   chain**, matching today's session-per-chain semantics; a second
+   concurrent recipe on one chain is NOT supported. Abandoned unsealed
+   recipes are deleted by the materializer when idle > 15 min
+   (activation-clock `updated_at`) — the kv analog of today's
+   2-minute RAM sweep.
+2. **Caps are policy, plan-tier shaped**: ≤ 4096 rows per recipe
+   (1 GiB at 256 KiB fires); total bytes per recipe is a plan input
+   (default 1 GiB); inline appends ≤ 256 KiB each (mirrors
+   MAX_FIRE_BYTES) and ≤ 16 MiB inline total per recipe — large
+   *generated*-bytes accumulations wait for the rove-bodies staging
+   path (§8, phase 2); ≤ 8 open recipes per tenant; ≤ 2 compose jobs
+   per node.
+3. **`bodyRef` is an opaque, version-prefixed string token** on the
+   surface (`request.bodyRef`); internally `{worker, seq}` — fires map
+   1:1 to coordinator entries today, so no offset/len. Rangeability
+   is deferred; if it comes, it comes as a new token version
+   (same-width-plus-interpretation, not a wider wire).
+4. **The completion has no failure arm — say so.** Payload: the
+   seal-time `ctx` as `request.ctx`, `{hash, totalBytes}` as the
+   result body. `ok:false` is unreachable by design: the GC guard
+   makes refs immortal until composed, and the materializer retries
+   forever. A compose-time hash mismatch is data corruption — an
+   infallibility violation that wedges the high-water mark and pages
+   the operator (GC stops, alert fires); it is never translated into
+   a customer error.
+5. **Compose reads one coordinator payload per ref** (v1). Adjacent
+   refs sharing a batch object are a batching optimization, taken only
+   if the compose-duration metric says so; the job logs its duration
+   from day one.
+
+## 13. Build order
+
+Each phase lands green on its own; no coexisting old/new customer
+semantics (the shim cutover in B is atomic).
+
+- **A — streaming sha256.** `crypto.sha256Init() → token`,
+  `sha256Update(token, bytes) → token`, `sha256Final(token) → hex`:
+  pure functions over an opaque serializable midstate token
+  (base64url of Zig's Sha256 struct state). Surface tests + reflect
+  entry in the same change.
+- **B — the shim cutover (inline recipes).** `blob.write`/`seal`
+  rewritten as JS over `_blob/recipe/*` rows + midstate; seal writes
+  the marker, emits the compose Cmd, returns the hash. The
+  `blob_sessions` trampolines stop being called by the shim (deleted
+  in E). **This is the phase that makes `blob.write`/`seal`
+  surface-testable in-process** — rows, midstate progression, marker
+  contents, Cmd emission, synchronous hash, early-dereference
+  fail-loud all pin under `zig build test`.
+- **C — the compose door + completion.** Worker-side: intercept the
+  compose fetch (the `armBlobReceive` posture), read the recipe rows
+  on-thread (bounded by the inline caps), run the PUT job off-thread,
+  flip on success, deliver the completion through the existing
+  `_blob/owed`-style callback machinery (`__system` builtin → customer
+  `{on}` module). Smoke: upload → onStored → blob.url serves.
+- **D — bodyRef integration.** `request.bodyRef` on onChunk fires;
+  ref-typed rows; compose job reads refs via the coordinator. The
+  1 GiB cap becomes real.
+- **E — materializer + GC guard + deletions.** The dedicated pass,
+  the high-water-mark check in retention/GC, the backstop metric;
+  delete `blob_sessions.zig` + trampolines + DispatchState fields.
+- **F — segments re-base.** `segments.seal` onto the substrate
+  (record-index emission in the compose flip, hot-row deletes atomic
+  with the sealed pointer); retire the in-arena assembly and the
+  bookkeeping half of `__system/segments_onsealed`.
