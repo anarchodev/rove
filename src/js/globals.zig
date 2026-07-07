@@ -2069,6 +2069,12 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         .{ .name = "randomUUID",      .cfunc = crypto_b.jsCryptoRandomUuid,      .argc = 0 },
         .{ .name = "randomBytes",     .cfunc = crypto_b.jsCryptoRandomBytes,     .argc = 1 },
         .{ .name = "sha256",          .cfunc = crypto_b.jsCryptoSha256,          .argc = 1 },
+        // Streaming sha256 over serializable midstate tokens — pure
+        // functions, so an accumulation spanning activations can keep
+        // its hash state in kv (blob-write-over-segments.md §3).
+        .{ .name = "sha256Init",      .cfunc = crypto_b.jsCryptoSha256Init,      .argc = 0 },
+        .{ .name = "sha256Update",    .cfunc = crypto_b.jsCryptoSha256Update,    .argc = 2 },
+        .{ .name = "sha256Final",     .cfunc = crypto_b.jsCryptoSha256Final,     .argc = 1 },
         .{ .name = "hmacSha256",      .cfunc = crypto_b.jsCryptoHmacSha256,      .argc = 2 },
         // RSA-PKCS#1 v1.5 verify (RS256 / RS384 / RS512). Customer
         // composes JWT/OIDC verification on top — see retry.js +

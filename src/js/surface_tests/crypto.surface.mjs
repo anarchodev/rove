@@ -13,6 +13,54 @@ export default function () {
     throws(() => crypto.sha256(42), /string or Uint8Array/);
   });
 
+  check("crypto.sha256Init", () => {
+    const t = crypto.sha256Init();
+    ok(typeof t === "string" && t.startsWith("s2:"), "version-prefixed token");
+    // A fresh midstate finalizes to the empty-input digest.
+    eq(crypto.sha256Final(t),
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+  });
+
+  check("crypto.sha256Update", () => {
+    // Split-anywhere equivalence with the one-shot digest, including
+    // splits that straddle the 64-byte block boundary.
+    const msg = "x".repeat(150);
+    const want = crypto.sha256(msg);
+    for (const cut of [0, 1, 63, 64, 65, 128, 150]) {
+      let mid = crypto.sha256Init();
+      mid = crypto.sha256Update(mid, msg.slice(0, cut));
+      mid = crypto.sha256Update(mid, msg.slice(cut));
+      eq(crypto.sha256Final(mid), want);
+    }
+    // Uint8Array chunks hash the same bytes.
+    let mid = crypto.sha256Init();
+    mid = crypto.sha256Update(mid, new TextEncoder().encode("abc"));
+    eq(crypto.sha256Final(mid),
+      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    // Pure: the input token is unconsumed — fork the same midstate.
+    const base = crypto.sha256Update(crypto.sha256Init(), "ab");
+    eq(crypto.sha256Final(crypto.sha256Update(base, "c")),
+      crypto.sha256("abc"));
+    eq(crypto.sha256Final(crypto.sha256Update(base, "d")),
+      crypto.sha256("abd"));
+    throws(() => crypto.sha256Update("s2:AAAA", "x"), /invalid midstate token/);
+    throws(() => crypto.sha256Update(crypto.sha256Init(), 42),
+      /string or Uint8Array/);
+    // The shim forwards (token, undefined), so the type check answers
+    // rather than the arity check — the hmacSha256 pattern.
+    throws(() => crypto.sha256Update(crypto.sha256Init()),
+      /data must be a string or Uint8Array/);
+  });
+
+  check("crypto.sha256Final", () => {
+    // Finalize is pure too: the token keeps absorbing afterwards.
+    let mid = crypto.sha256Update(crypto.sha256Init(), "ab");
+    eq(crypto.sha256Final(mid), crypto.sha256("ab"));
+    mid = crypto.sha256Update(mid, "c");
+    eq(crypto.sha256Final(mid), crypto.sha256("abc"));
+    throws(() => crypto.sha256Final("nope"), /invalid midstate token/);
+  });
+
   check("crypto.hmacSha256", () => {
     eq(crypto.hmacSha256("key", "The quick brown fox jumps over the lazy dog"),
       "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8");

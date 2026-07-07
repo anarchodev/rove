@@ -84,6 +84,54 @@
     },
 
     /**
+     * Begin a streaming SHA-256. Returns an opaque midstate token —
+     * a plain string, so hash state can ride kv across activations
+     * (an accumulation built over many chunks finalizes to the same
+     * digest as hashing the whole payload at once). Pure and
+     * deterministic; feed it to {@link crypto.sha256Update}.
+     *
+     * @returns {string} Midstate token (version-prefixed, ≤ ~150
+     *   chars).
+     *
+     * @example
+     * let mid = crypto.sha256Init();
+     * mid = crypto.sha256Update(mid, "hello ");
+     * mid = crypto.sha256Update(mid, "world");
+     * const hash = crypto.sha256Final(mid); // === crypto.sha256("hello world")
+     */
+    sha256Init() {
+      return sys.sha256Init();
+    },
+
+    /**
+     * Absorb `data` into a streaming SHA-256. Pure: returns the NEW
+     * midstate token; the input token is unchanged and reusable (fork
+     * a hash by updating the same token twice).
+     *
+     * @param {string} token - Midstate from {@link crypto.sha256Init}
+     *   or a prior update.
+     * @param {string|Uint8Array} data - String (hashed as UTF-8
+     *   bytes) or raw bytes.
+     * @returns {string} The advanced midstate token.
+     */
+    sha256Update(token, data) {
+      return sys.sha256Update(token, data);
+    },
+
+    /**
+     * Finalize a streaming SHA-256 to its digest. The token itself is
+     * unconsumed (finalize is pure too — you can keep updating the
+     * same midstate afterwards).
+     *
+     * @param {string} token - Midstate token.
+     * @returns {string} Lowercase hex, 64 characters — identical to
+     *   `crypto.sha256` over the concatenated inputs.
+     */
+    sha256Final(token) {
+      return sys.sha256Final(token);
+    },
+
+    /**
      * HMAC-SHA256 of `data` under `key`. The vendor-neutral primitive
      * for Stripe-Signature / X-Slack-Signature / AWS SigV4 style
      * derivations (compose the provider's exact scheme in handler JS).

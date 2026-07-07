@@ -228,3 +228,177 @@ pub fn jsCryptoSha256(
     }
     return c.JS_NewStringLen(ctx, &out, 64);
 }
+
+// ── Streaming sha256 (midstate tokens) ─────────────────────────────
+//
+// `blob-write-over-segments.md` §3: an accumulation that spans
+// activations needs its hash state to live in kv, so the streaming
+// surface is three PURE functions over an opaque serialized midstate
+// token — no context handles, nothing process-local, replay-exact:
+//
+//   crypto.sha256Init()              → token
+//   crypto.sha256Update(token, data) → token
+//   crypto.sha256Final(token)        → hex digest (64 chars)
+//
+// Token wire format (version-prefixed; tokens persist in kv across
+// binary versions, so this layout is a compatibility contract —
+// change it only by adding a new prefix):
+//   "s2:" ‖ base64url_no_pad( s[0..8] as u32 BE (32 B)
+//                             ‖ total_len u64 BE (8 B)
+//                             ‖ buf_len u8 (1 B)
+//                             ‖ buf[0..buf_len] )
+
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const midstate_prefix = "s2:";
+/// 32 (state) + 8 (total_len) + 1 (buf_len) + ≤63 (partial block).
+const midstate_max_raw = 41 + 63;
+
+fn midstateToToken(ctx: ?*c.JSContext, st: *const Sha256) c.JSValue {
+    var raw: [midstate_max_raw]u8 = undefined;
+    for (st.s, 0..) |w, i| std.mem.writeInt(u32, raw[i * 4 ..][0..4], w, .big);
+    std.mem.writeInt(u64, raw[32..40], st.total_len, .big);
+    raw[40] = st.buf_len;
+    @memcpy(raw[41 .. 41 + @as(usize, st.buf_len)], st.buf[0..st.buf_len]);
+    const raw_len = 41 + @as(usize, st.buf_len);
+
+    const enc = std.base64.url_safe_no_pad.Encoder;
+    var out: [midstate_prefix.len + std.base64.url_safe_no_pad.Encoder.calcSize(midstate_max_raw)]u8 = undefined;
+    @memcpy(out[0..midstate_prefix.len], midstate_prefix);
+    const b64 = enc.encode(out[midstate_prefix.len..], raw[0..raw_len]);
+    return c.JS_NewStringLen(ctx, &out, midstate_prefix.len + b64.len);
+}
+
+fn midstateFromToken(token: []const u8) ?Sha256 {
+    if (!std.mem.startsWith(u8, token, midstate_prefix)) return null;
+    const b64 = token[midstate_prefix.len..];
+    const dec = std.base64.url_safe_no_pad.Decoder;
+    const raw_len = dec.calcSizeForSlice(b64) catch return null;
+    if (raw_len < 41 or raw_len > midstate_max_raw) return null;
+    var raw: [midstate_max_raw]u8 = undefined;
+    dec.decode(raw[0..raw_len], b64) catch return null;
+
+    const buf_len = raw[40];
+    if (buf_len > 63 or raw_len != 41 + @as(usize, buf_len)) return null;
+    var st = Sha256.init(.{});
+    for (&st.s, 0..) |*w, i| w.* = std.mem.readInt(u32, raw[i * 4 ..][0..4], .big);
+    st.total_len = std.mem.readInt(u64, raw[32..40], .big);
+    st.buf_len = buf_len;
+    @memcpy(st.buf[0..buf_len], raw[41 .. 41 + @as(usize, buf_len)]);
+    return st;
+}
+
+pub fn jsCryptoSha256Init(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    _: c_int,
+    _: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    var st = Sha256.init(.{});
+    return midstateToToken(ctx, &st);
+}
+
+pub fn jsCryptoSha256Update(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 2) {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.sha256Update requires (token, data)");
+        return js_exception;
+    }
+    var tok_len: usize = 0;
+    const tok_c = c.JS_ToCStringLen(ctx, &tok_len, argv[0]);
+    if (tok_c == null) {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.sha256Update: token must be a string");
+        return js_exception;
+    }
+    defer c.JS_FreeCString(ctx, tok_c);
+    var st = midstateFromToken(@as([*]const u8, @ptrCast(tok_c))[0..tok_len]) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.sha256Update: invalid midstate token");
+        return js_exception;
+    };
+
+    var data_cstr: [*c]const u8 = null;
+    defer if (data_cstr != null) c.JS_FreeCString(ctx, data_cstr);
+    const data_bytes = extractKeyOrDataBytes(ctx, argv[1], &data_cstr) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.sha256Update: data must be a string or Uint8Array");
+        return js_exception;
+    };
+
+    st.update(data_bytes);
+    return midstateToToken(ctx, &st);
+}
+
+pub fn jsCryptoSha256Final(
+    ctx: ?*c.JSContext,
+    _: c.JSValue,
+    argc: c_int,
+    argv: [*c]c.JSValue,
+) callconv(.c) c.JSValue {
+    if (argc < 1) {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.sha256Final requires (token)");
+        return js_exception;
+    }
+    var tok_len: usize = 0;
+    const tok_c = c.JS_ToCStringLen(ctx, &tok_len, argv[0]);
+    if (tok_c == null) {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.sha256Final: token must be a string");
+        return js_exception;
+    }
+    defer c.JS_FreeCString(ctx, tok_c);
+    var st = midstateFromToken(@as([*]const u8, @ptrCast(tok_c))[0..tok_len]) orelse {
+        _ = c.JS_ThrowTypeError(ctx, "crypto.sha256Final: invalid midstate token");
+        return js_exception;
+    };
+
+    var digest: [32]u8 = undefined;
+    st.final(&digest);
+    var out: [64]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (digest, 0..) |b, i| {
+        out[i * 2] = hex_chars[b >> 4];
+        out[i * 2 + 1] = hex_chars[b & 0x0f];
+    }
+    return c.JS_NewStringLen(ctx, &out, 64);
+}
+
+test "sha256 midstate: split-anywhere equivalence with one-shot" {
+    // Cross the 64-byte block boundary at every split of a 200-byte
+    // message — buffered-partial-block state must round-trip exactly.
+    var msg: [200]u8 = undefined;
+    for (&msg, 0..) |*b, i| b.* = @truncate(i * 31 + 7);
+    var want: [32]u8 = undefined;
+    Sha256.hash(&msg, &want, .{});
+
+    var split: usize = 0;
+    while (split <= msg.len) : (split += 1) {
+        var st = Sha256.init(.{});
+        st.update(msg[0..split]);
+        // Round-trip through the wire format at the split point.
+        var raw_buf: [midstate_max_raw]u8 = undefined;
+        for (st.s, 0..) |w, i| std.mem.writeInt(u32, raw_buf[i * 4 ..][0..4], w, .big);
+        std.mem.writeInt(u64, raw_buf[32..40], st.total_len, .big);
+        raw_buf[40] = st.buf_len;
+        @memcpy(raw_buf[41 .. 41 + @as(usize, st.buf_len)], st.buf[0..st.buf_len]);
+        const enc = std.base64.url_safe_no_pad.Encoder;
+        var tok: [midstate_prefix.len + std.base64.url_safe_no_pad.Encoder.calcSize(midstate_max_raw)]u8 = undefined;
+        @memcpy(tok[0..midstate_prefix.len], midstate_prefix);
+        const b64 = enc.encode(tok[midstate_prefix.len..], raw_buf[0 .. 41 + @as(usize, st.buf_len)]);
+
+        var st2 = midstateFromToken(tok[0 .. midstate_prefix.len + b64.len]).?;
+        st2.update(msg[split..]);
+        var got: [32]u8 = undefined;
+        st2.final(&got);
+        try std.testing.expectEqualSlices(u8, &want, &got);
+    }
+}
+
+test "sha256 midstate: malformed tokens rejected" {
+    try std.testing.expect(midstateFromToken("") == null);
+    try std.testing.expect(midstateFromToken("s2:") == null);
+    try std.testing.expect(midstateFromToken("s3:AAAA") == null);
+    try std.testing.expect(midstateFromToken("s2:!!!not-base64!!!") == null);
+    // Valid base64, wrong length.
+    try std.testing.expect(midstateFromToken("s2:AAAA") == null);
+}
