@@ -355,9 +355,13 @@ semantics (the shim cutover in B is atomic).
   flip on success, deliver the completion through the existing
   `_blob/owed`-style callback machinery (`__system` builtin → customer
   `{on}` module). Smoke: upload → onStored → blob.url serves.
-- **D — bodyRef integration.** `request.bodyRef` on onChunk fires;
-  ref-typed rows; compose job reads refs via the coordinator. The
-  1 GiB cap becomes real.
+- **D — >16 MiB via part-blobs — BLOCKED (2026-07-07), see §14.** The
+  intended shape: `blob.write` flushes accumulated inline rows into
+  content-addressed part-blobs at an 8 MiB threshold (bulk leaves
+  raft), and a native S3 multipart-copy compose job assembles them
+  server-side. Built and unit/surface-green, but it hit a platform
+  limitation on the streaming path — reverted to keep HEAD at C. The
+  fix is a prerequisite platform change (§14), not a retry of D.
 - **E — materializer + GC guard + deletions.** The dedicated pass,
   the high-water-mark check in retention/GC, the backstop metric;
   delete `blob_sessions.zig` + trampolines + DispatchState fields.
@@ -369,3 +373,61 @@ semantics (the shim cutover in B is atomic).
   (record-index emission in the compose flip, hot-row deletes atomic
   with the sealed pointer); retire the in-arena assembly and the
   bookkeeping half of `__system/segments_onsealed`.
+
+## 14. Phase-D blocker: no outbound fetch from a mid-stream activation
+
+The whole compose arc (A–C) is built and shipped for **pure-inline**
+recipes (≤ the flush threshold): the shim accumulates kv rows, seal
+finalizes the midstate hash and emits the compose Cmd, the door fires
+the JS `blob_compose` which `blob.put`s the assembled payload, and
+`blob_compose_finish` flips the recipe + fires the durable `{on}`.
+Green in-process (surface suite) and on a live cluster (blob smoke).
+
+Phase D — the > 16 MiB path — needs the bulk to leave raft **during**
+the upload, because otherwise a 1 GiB upload writes 1 GiB of inline
+rows through the raft log (the exact budget blowout §1.1 forbids). The
+design flushes accumulated rows into content-addressed **part-blobs**
+via `blob.put` at an 8 MiB threshold, then a native **multipart-copy**
+compose job (`UploadPartCopy` of the parts, server-side — zero bulk
+bytes on the worker) assembles the final object. All of that was
+built and compiled; the S3 `uploadPartCopy` method, the
+`blob_compose.Job`, and the door's inline-vs-parts branch all worked
+in isolation.
+
+**Where it broke:** the flush calls `blob.put`, and `blob.put` emits
+an outbound `http.fetch` (the signed PUT). A flush only ever happens
+**inside a streaming `onChunk` / `fetch_chunk` activation that returns
+`next()`** (that is the only way a recipe accumulates past 8 MiB — a
+single terminal activation can't hold that much in the arena). And a
+mid-stream `next()` activation that emits an outbound fetch **faults**
+— a canned 500 on the send path — across both streaming vehicles
+(inbound `onChunk` POST and a bound `fetch_chunk` mirror). Every
+non-flushing path (the `gen` multi-write, the small mirror, all inline
+recipes) works, isolating the cause to fetch-emission from a mid-stream
+activation. The dispatch handles handler-emitted `pending_fetches` on
+the **terminal** path (that is how `blob.put`/`webhook.send`/seal's own
+compose Cmd all work), but the streaming-chunk dispatch does not.
+
+This is a **prerequisite platform capability**, not a retry of D:
+either (1) make streaming-chunk dispatch drain a handler's emitted
+`pending_fetches` the way the terminal path does (the smallest fix —
+`blob.put`, `webhook.send`, `after.fetch` would then all compose from
+inside `onChunk`, useful well beyond blobs), or (2) give the flush a
+staging primitive that is NOT a JS fetch — a native "stage these bytes
+to `app-blobs/{hash}` off-thread" door the shim calls without emitting
+a `Cmd`. (1) is the more general win and is likely where the value is.
+
+The originally-sketched `request.bodyRef` (ref an inbound chunk's
+already-staged coordinator copy instead of re-staging) is a **third**
+option but stays rejected for D: the coordinator pool is cross-tenant
+and its entries are released when the spool consumes them, so a recipe
+ref would be both a forgeable cross-tenant read and a
+use-after-release — it needs its own tenant-binding + deferred-release
+design before it is safe (§ the 2026-07-07 analysis).
+
+Until one of those lands, `blob.write` should keep phase B's clean
+behavior: accumulate inline and **fail loud** if a recipe would exceed
+the inline ceiling (a >16 MiB streaming upload that must be *stored*
+whole, without per-chunk processing, already has a working path today —
+`blob.receive`, which streams the inbound body straight to S3 with no
+recipe, no arena, no flush).
