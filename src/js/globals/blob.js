@@ -35,11 +35,55 @@ function _rejectRenamedBlob(verb, opts) {
 }
 
 const BLOB_ORIGIN = "http://rove-blob.internal/";
+const COMPOSE_ORIGIN = "http://rove-compose.internal/";
 const HASH_RE = /^[0-9a-f]{64}$/;
 
 function assertHash(hash, verb) {
   if (typeof hash !== "string" || !HASH_RE.test(hash))
     throw new TypeError(verb + ": hash must be 64 lowercase hex chars (a sha256 digest)");
+}
+
+// ── The recipe substrate (blob-write-over-segments.md) ─────────────
+//
+// An open accumulation is kv rows, not worker RAM: `write` appends a
+// row + advances a sha256 midstate, `seal` freezes the recipe (the
+// durable marker) and emits the compose Cmd. Everything load-bearing
+// is replicated kv — replayable by construction, and the caps below
+// are policy, not memory protection.
+
+const RECIPE_MAX_ROWS = 4096;
+const RECIPE_INLINE_APPEND_MAX = 256 * 1024;   // mirrors MAX_FIRE_BYTES
+const RECIPE_INLINE_TOTAL_MAX = 16 * 1024 * 1024;
+// Plan-tier input eventually (§12.2); one constant until plans carry it.
+const RECIPE_TOTAL_MAX = 1024 * 1024 * 1024;
+
+const EXPORT_NAME_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+// One open recipe per chain: the sid IS the chain's correlation id
+// (recorded → replay-pure). Chain-less dispatch (test paths) shares
+// one local recipe, matching the one-session-per-chain semantics the
+// RAM implementation had.
+function _recipeSid() {
+  return request.correlation_id || "local";
+}
+
+function _recipeMetaKey(sid) { return "_blob/recipe/" + sid + "/meta"; }
+
+function _recipeRowKey(sid, seq) {
+  return "_blob/recipe/" + sid + "/r/" + String(seq).padStart(4, "0");
+}
+
+function _recipeMeta(sid) {
+  const raw = kv.get(_recipeMetaKey(sid));
+  return raw == null ? null : JSON.parse(raw);
+}
+
+// Sealed-but-unmaterialized hashes fail loud on dereference —
+// readiness is announced by the seal's `on` activation, never
+// inferred (the row is deleted by the compose flip).
+function _assertMaterialized(hash, verb) {
+  if (kv.get("_blob/pending/" + hash) != null)
+    throw new Error(verb + ": " + hash + " is sealed but not yet materialized — wait for your seal `on` activation");
 }
 
 /**
@@ -154,6 +198,7 @@ globalThis.blob = {
     opts = opts || {};
     _rejectRenamedBlob("blob.get", opts);
     assertHash(hash, "blob.get");
+    _assertMaterialized(hash, "blob.get");
     const fetch_opts = {
       method: "GET",
       stream: !!opts.stream,
@@ -192,26 +237,29 @@ globalThis.blob = {
   url(hash, opts) {
     opts = opts || {};
     assertHash(hash, "blob.url");
+    _assertMaterialized(hash, "blob.url");
     return sysBlob.presign(hash, opts.ttl != null ? opts.ttl : null,
                            opts.contentType != null ? opts.contentType : null);
   },
 
   /**
-   * Append bytes to this connection's upload session (created on
-   * the first write). The session accumulates across the chain's
-   * activations — write each streamed `after.fetch` chunk from its
+   * Append bytes to this chain's open recipe (created on the first
+   * write). The accumulation is kv rows + a sha256 midstate — nothing
+   * lives in worker RAM, so it spans activations, replicates, and
+   * replays like any other state. Write each streamed chunk from its
    * resume, or call repeatedly within one activation — then
-   * {@link blob.seal} turns the whole accumulation into one
-   * content-addressed object.
+   * {@link blob.seal} freezes the recipe into one content-addressed
+   * object.
    *
-   * Caps (P2): 64 MiB per session, 2 open sessions per tenant —
-   * exceeding either throws. A session whose chain dies without
-   * sealing is swept after ~2 minutes idle; nothing reaches storage
-   * before `seal`, so abandonment costs nothing.
+   * Caps (policy, blob-write-over-segments.md §12): 4096 rows and
+   * 1 GiB per recipe, 256 KiB per inline append, 16 MiB inline total
+   * — exceeding any throws. A recipe whose chain dies without
+   * sealing is swept after ~15 min idle; nothing reaches storage
+   * before `seal`, so abandonment costs a few kv rows, briefly.
    *
    * @param {string|Uint8Array} bytes - Chunk to append. Strings
    *   append their UTF-8 bytes; use Uint8Array for binary.
-   * @returns {number} Total session bytes after the append.
+   * @returns {number} Total recipe bytes after the append.
    *
    * @example
    * export function onMirrorChunk() {
@@ -223,39 +271,81 @@ globalThis.blob = {
   write(bytes) {
     if (typeof bytes !== "string" && !(bytes instanceof Uint8Array))
       throw new TypeError("blob.write: bytes must be a string or Uint8Array");
-    return sysBlob.write(bytes);
+    const len = typeof bytes === "string"
+      ? new TextEncoder().encode(bytes).length
+      : bytes.length;
+    if (len > RECIPE_INLINE_APPEND_MAX)
+      throw new Error("blob.write: append exceeds the 256 KiB inline cap");
+
+    const sid = _recipeSid();
+    const meta = _recipeMeta(sid) || {
+      state: "open", mid: crypto.sha256Init(),
+      rows: 0, total: 0, inline_total: 0, updated_at: 0,
+    };
+    if (meta.state !== "open")
+      throw new Error("blob.write: recipe already sealed — one seal per chain");
+    if (meta.rows >= RECIPE_MAX_ROWS)
+      throw new Error("blob.write: recipe exceeds " + RECIPE_MAX_ROWS + " rows");
+    if (meta.total + len > RECIPE_TOTAL_MAX)
+      throw new Error("blob.write: recipe exceeds the 1 GiB cap");
+    if (meta.inline_total + len > RECIPE_INLINE_TOTAL_MAX)
+      throw new Error("blob.write: recipe exceeds the 16 MiB inline cap");
+
+    const row = typeof bytes === "string"
+      ? { s: bytes }
+      : { b: base64url.encode(bytes) };
+    kv.set(_recipeRowKey(sid, meta.rows), JSON.stringify(row));
+
+    meta.mid = crypto.sha256Update(meta.mid, bytes);
+    meta.rows += 1;
+    meta.total += len;
+    meta.inline_total += len;
+    meta.updated_at = Date.now();
+    kv.set(_recipeMetaKey(sid), JSON.stringify(meta));
+    return meta.total;
   },
 
   /**
-   * Seal this connection's upload session: hash the accumulated
-   * bytes (sha256 = the object's key), return the hash
-   * synchronously, and PUT the bytes content-addressed. The PUT's
-   * result resumes THIS connection at the `to` export with
-   * `request.status`; thread the hash there via `next({ hash })`
-   * (the chain-ctx idiom). Connection-scoped like `after.fetch`:
-   * without a held connection the seal is inert.
+   * Seal this chain's recipe: freeze it (the durable marker), return
+   * the object's sha256 synchronously — finalized from the recipe's
+   * midstate, no byte is re-read — and emit the compose that
+   * materializes the object in storage.
    *
-   * Durability contract: there is no owed marker — your `to` export
-   * observing a 2xx status IS the signal the object is durable;
-   * write your kv index there. On failure, re-uploading the same
-   * bytes is always safe (same hash, idempotent PUT).
+   * The hash is an identifier; **readiness is announced by your
+   * `on` activation, never inferred.** Completion is durable
+   * (webhook.send semantics, not after.fetch's): the sealed recipe —
+   * not the live connection — owes the callback, so `on` fires even
+   * if this chain is gone by then (it resumes the chain when still
+   * held). It receives your `ctx` as `request.ctx` and
+   * `{hash, totalBytes}` as the result. There is no failure arm —
+   * materialization retries until it happens.
+   *
+   * Index the hash in kv NOW if you want: the pointer write, the
+   * seal marker, and the rest of your writeset commit atomically.
+   * Just don't hand the hash to anything that dereferences it before
+   * your `on` activation ran — `blob.url`/`blob.get` on a
+   * sealed-but-unmaterialized hash throw.
    *
    * @param {object} opts
-   * @param {string} opts.on - Export resumed with the PUT result
-   *   (required).
+   * @param {string} opts.on - Export activated when the object is
+   *   servable (required).
+   * @param {*} [opts.ctx] - Threaded to the `on` activation as
+   *   `request.ctx` (JSON round-trip).
    * @param {string} [opts.contentType] - Stored Content-Type.
    * @returns {string} The object's sha256 hash (64 hex chars).
    *
    * @example
-   * export function onHeaders() {
-   *   blob.receive({ on: "onStored" });
+   * export function onChunk() {
+   *   blob.write(request.bytes);
+   *   if (!request.done) return next();
+   *   const hash = blob.seal({ on: "onStored", ctx: { id: request.ctx.id } });
+   *   kv.set(`media/${request.ctx.id}`, JSON.stringify({ hash, status: "processing" }));
    *   return next();
    * }
-   *
    * export function onStored() {
-   *   if (request.status !== 200) { response.status = 502; return "store failed"; }
-   *   kv.set(`media/${mxc()}`, JSON.stringify({ hash: request.ctx.hash }));
-   *   return JSON.stringify({ content_uri: request.ctx.hash });
+   *   const rec = JSON.parse(kv.get(`media/${request.ctx.id}`));
+   *   kv.set(`media/${request.ctx.id}`, JSON.stringify({ ...rec, status: "ready" }));
+   *   return blob.url(rec.hash);
    * }
    */
   seal(opts) {
@@ -264,8 +354,46 @@ globalThis.blob = {
     const on_key = opts.on;
     if (typeof on_key !== "string" || !on_key.length)
       throw new TypeError("blob.seal: `on` export name is required");
-    return sysBlob.seal(on_key,
-                        opts.contentType != null ? opts.contentType : undefined);
+    if (!EXPORT_NAME_RE.test(on_key))
+      throw new TypeError("blob.seal: `on` must be a JS identifier");
+    if (opts.contentType != null && typeof opts.contentType !== "string")
+      throw new TypeError("blob.seal: contentType must be a string");
+
+    const sid = _recipeSid();
+    // No open recipe = sealing an empty accumulation — a legitimate
+    // (empty) object, same as blob.put("").
+    const meta = _recipeMeta(sid) || {
+      state: "open", mid: crypto.sha256Init(),
+      rows: 0, total: 0, inline_total: 0, updated_at: 0,
+    };
+    if (meta.state !== "open")
+      throw new Error("blob.seal: recipe already sealed — one seal per chain");
+
+    const hash = crypto.sha256Final(meta.mid);
+    const ctx = opts.ctx !== undefined ? opts.ctx : null;
+    kv.set(_recipeMetaKey(sid), JSON.stringify({
+      state: "sealed", hash: hash,
+      content_type: opts.contentType || null,
+      rows: meta.rows, totalBytes: meta.total,
+      on: on_key, ctx: ctx,
+      updated_at: Date.now(),
+    }));
+    // Deleted by the compose flip; blob.url/get check it so an early
+    // dereference fails loud instead of racing storage.
+    kv.set("_blob/pending/" + hash, sid);
+
+    // The prompt compose trigger — leader-local, moot-on-loss; the
+    // sealed marker above is what guarantees materialization (the
+    // materializer sweeps sealed-but-unmaterialized recipes).
+    sysHttp.fetch({
+      url: COMPOSE_ORIGIN + sid,
+      method: "PUT",
+      body: "",
+      headers: {},
+      on_chunk: "__system/blob_compose_onresult",
+      ctx: { sid: sid, hash: hash, on: on_key, ctx: ctx },
+    });
+    return hash;
   },
 
   /**

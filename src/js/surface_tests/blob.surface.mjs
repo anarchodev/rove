@@ -36,17 +36,48 @@ export default function () {
   });
 
   check("blob.write", () => {
-    throws(() => blob.write(42), /bytes must be a string or Uint8Array/); // shim-side validation
-    // Upload sessions live in worker state (the blob_write trampoline);
-    // the in-process dispatcher has none — the fail-loud context error
-    // is the contract here. Session behavior is blob_smoke_v2's job.
-    throws(() => blob.write("chunk-1"), /not supported in this context/);
+    throws(() => blob.write(42), /bytes must be a string or Uint8Array/);
+    // The recipe substrate: appends are kv rows + a sha256 midstate —
+    // replicated, replayable, no worker RAM (blob-write-over-segments.md).
+    // Chain-less dispatch uses the "local" sid.
+    eq(blob.write("hel"), 3);
+    eq(blob.write(new TextEncoder().encode("lo")), 5); // running total
+    const meta = JSON.parse(kv.get("_blob/recipe/local/meta"));
+    eq(meta.state, "open");
+    eq(meta.rows, 2);
+    eq(meta.total, 5);
+    ok(meta.mid.startsWith("s2:"), "midstate token rides the meta row");
+    // Rows carry the bytes: strings raw, binary base64url.
+    eq(JSON.parse(kv.get("_blob/recipe/local/r/0000")), { s: "hel" });
+    eq(JSON.parse(kv.get("_blob/recipe/local/r/0001")), { b: base64url.encode(new TextEncoder().encode("lo")) });
+    // Multi-byte UTF-8 counts encoded bytes, not JS chars.
+    eq(blob.write("é"), 7);
+    throws(() => blob.write("x".repeat(256 * 1024 + 1)), /256 KiB inline cap/);
   });
 
   check("blob.seal", () => {
     throws(() => blob.seal(), /`on` export name is required/);
+    throws(() => blob.seal({ on: "not an ident" }), /`on` must be a JS identifier/);
     throws(() => blob.seal({ on: "onStored", content_type: "t" }), /`content_type` was renamed/);
-    throws(() => blob.seal({ on: "onStored" }), /not supported in this context/); // needs the worker's seal trampoline
+    // Seal freezes the recipe and returns the true hash synchronously,
+    // finalized from the midstate — "hel"+"lo"+"é" accumulated above.
+    const hash = blob.seal({ on: "onStored", ctx: { id: 7 }, contentType: "text/plain" });
+    eq(hash, crypto.sha256("helloé"));
+    const meta = JSON.parse(kv.get("_blob/recipe/local/meta"));
+    eq(meta.state, "sealed");
+    eq(meta.hash, hash);
+    eq(meta.on, "onStored");
+    eq(meta.ctx, { id: 7 });
+    eq(meta.content_type, "text/plain");
+    eq(meta.totalBytes, 7);
+    // The pending row makes early dereference fail loud — readiness
+    // is announced by the `on` activation, never inferred.
+    eq(kv.get("_blob/pending/" + hash), "local");
+    throws(() => blob.url(hash), /sealed but not yet materialized/);
+    throws(() => blob.get(hash), /sealed but not yet materialized/);
+    // One seal per chain: both verbs refuse after the freeze.
+    throws(() => blob.write("more"), /already sealed/);
+    throws(() => blob.seal({ on: "onStored" }), /already sealed/);
   });
 
   check("blob.receive", () => {
