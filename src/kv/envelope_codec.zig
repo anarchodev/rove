@@ -6,22 +6,25 @@
 //! Type 0 = writeset against the store named by `id`; type 1 = the
 //! multi-envelope wrapper; types 2+ are application-defined.
 //!
-//! Extracted out of `cluster.zig` (the V1 willemt-raft spine) into this
-//! standalone, dependency-free file (v2-build-order §Phase 2) so
-//! the codec has a **spine-free home** that both V1 and the V2 facade can
-//! share: `cluster.zig` re-exports it (V1 unchanged), and `kvlimbs.zig`
-//! re-exports it so the rove-js worker (`apply.zig`) and `files-server`
-//! get the codec without dragging in willemt-raft + io_uring. Its only
-//! dependency is `std`.
-//!
-//! Byte-identical to `src/consensus/envelope.zig` (the V2 spine's own copy):
-//! the two stay in sync until the V1 cutover merges `src-v2/ → src/` and
-//! collapses them. Keeping the format here means the worker can encode an
-//! envelope through this codec and the V2 bridge can decode it through
-//! `src/consensus/envelope.zig` with no interpretation drift.
+//! This std-only file is **the** single copy of the wire format —
+//! `kvlimbs.zig` re-exports it so the rove-js worker (`apply.zig`) gets
+//! the codec without dragging in the consensus spine, and
+//! `src/consensus/envelope.zig` delegates its header / multi / writeset-
+//! payload primitives here, layering only the V2-spine additions
+//! (`EntryFrame`, the typed `Type` enum) on top. There is no second
+//! implementation to keep in sync: a producer encoding through either
+//! surface and a follower decoding through the other read the same bytes
+//! under the same caps by construction.
 
 const std = @import("std");
 
+/// Max length of an envelope `id` (the tenant store id string). The
+/// 2-byte big-endian length field caps it at 65535 regardless; this is
+/// the tighter sanity bound. Enforced on ENCODE only (`IdTooLong`) —
+/// `decodeEnvelope` accepts whatever the length field says, so the cap
+/// can tighten without stranding old log entries. One value for every
+/// encoder (worker and consensus spine alike; they briefly diverged
+/// 256 vs 512, making ids in the gap encodable on one path only).
 pub const MAX_ID_LEN: usize = 256;
 
 pub const ENVELOPE_TYPE_WRITESET: u8 = 0;
@@ -31,6 +34,7 @@ pub const ENVELOPE_TYPE_MULTI: u8 = 1;
 /// re-exported functions coerce cleanly into its wider set.
 pub const Error = error{
     Truncated,
+    IdTooLong,
     UnknownEnvelopeType,
     NestedMulti,
     OutOfMemory,
@@ -62,7 +66,7 @@ pub fn encodeEnvelope(
     id: []const u8,
     payload: []const u8,
 ) ![]u8 {
-    if (id.len > MAX_ID_LEN) return error.OutOfMemory;
+    if (id.len > MAX_ID_LEN) return Error.IdTooLong;
     const total = 1 + 2 + id.len + payload.len;
     const out = try allocator.alloc(u8, total);
     out[0] = t;
@@ -122,6 +126,54 @@ pub fn decodeMultiInner(
     return out;
 }
 
+/// Type-0 envelope payload layout (`docs/readset-replication-plan.md`
+/// Phase 3):
+///
+///   `[u32 LE ws_len][ws_bytes][u32 LE rs_len][rs_bytes]`
+///
+/// The type-0 payload is NOT raw writeset bytes — it interleaves the
+/// writeset with the request's serialized readset so the tape can be
+/// reconstructed on any follower that applies the entry. Apply only
+/// needs `ws_bytes`; the readset rides for the tape. `rs_len == 0` is
+/// valid + frequent: non-handler producers (ACME, the move surface's
+/// `v2-kv`, the secondary inners of a batched propose) carry an empty
+/// readset — the readset is per-dispatch, not per-envelope, and lives
+/// on the batch's anchor envelope.
+pub const WriteSetPayload = struct {
+    /// Borrowed slice into the input payload — the writeset bytes.
+    ws_bytes: []const u8,
+    /// Borrowed slice into the input payload — the readset list bytes.
+    /// When non-empty: a `tape_mod.encodeReadsetList` blob (one
+    /// `Readset.serialize` entry per successful request in the batched
+    /// dispatch that produced this envelope).
+    rs_bytes: []const u8,
+};
+
+pub fn decodeWriteSetPayload(payload: []const u8) Error!WriteSetPayload {
+    if (payload.len < 4) return Error.Truncated;
+    const ws_len = std.mem.readInt(u32, payload[0..4], .little);
+    if (payload.len < 4 + @as(usize, ws_len) + 4) return Error.Truncated;
+    const ws_bytes = payload[4 .. 4 + ws_len];
+    const rs_len = std.mem.readInt(u32, payload[4 + ws_len ..][0..4], .little);
+    const rs_start: usize = 4 + ws_len + 4;
+    if (payload.len != rs_start + rs_len) return Error.Truncated;
+    return .{ .ws_bytes = ws_bytes, .rs_bytes = payload[rs_start .. rs_start + rs_len] };
+}
+
+pub fn encodeWriteSetPayload(
+    allocator: std.mem.Allocator,
+    ws_bytes: []const u8,
+    rs_bytes: []const u8,
+) Error![]u8 {
+    const total = 4 + ws_bytes.len + 4 + rs_bytes.len;
+    const out = allocator.alloc(u8, total) catch return Error.OutOfMemory;
+    std.mem.writeInt(u32, out[0..4], @intCast(ws_bytes.len), .little);
+    @memcpy(out[4..][0..ws_bytes.len], ws_bytes);
+    std.mem.writeInt(u32, out[4 + ws_bytes.len ..][0..4], @intCast(rs_bytes.len), .little);
+    @memcpy(out[4 + ws_bytes.len + 4 ..][0..rs_bytes.len], rs_bytes);
+    return out;
+}
+
 test "envelope header round-trips" {
     const a = std.testing.allocator;
     const env = try encodeEnvelope(a, ENVELOPE_TYPE_WRITESET, "tenant-1", "PAYLOAD");
@@ -130,6 +182,29 @@ test "envelope header round-trips" {
     try std.testing.expectEqual(ENVELOPE_TYPE_WRITESET, dec.type);
     try std.testing.expectEqualStrings("tenant-1", dec.id);
     try std.testing.expectEqualStrings("PAYLOAD", dec.payload);
+}
+
+test "writeset payload round-trips, empty and non-empty readset" {
+    const a = std.testing.allocator;
+    const p0 = try encodeWriteSetPayload(a, "WS", "");
+    defer a.free(p0);
+    const d0 = try decodeWriteSetPayload(p0);
+    try std.testing.expectEqualStrings("WS", d0.ws_bytes);
+    try std.testing.expectEqual(@as(usize, 0), d0.rs_bytes.len);
+
+    const p1 = try encodeWriteSetPayload(a, "WS", "READSET");
+    defer a.free(p1);
+    const d1 = try decodeWriteSetPayload(p1);
+    try std.testing.expectEqualStrings("WS", d1.ws_bytes);
+    try std.testing.expectEqualStrings("READSET", d1.rs_bytes);
+
+    try std.testing.expectError(Error.Truncated, decodeWriteSetPayload("abc"));
+}
+
+test "encode rejects an over-long id" {
+    const a = std.testing.allocator;
+    const big = [_]u8{'x'} ** (MAX_ID_LEN + 1);
+    try std.testing.expectError(Error.IdTooLong, encodeEnvelope(a, 0, &big, "x"));
 }
 
 test "multi wrapper round-trips inner envelopes in order" {

@@ -1,30 +1,22 @@
 //! V2 raft-log envelope codec — the typed byte blob that travels through
 //! a tenant's raft group and is decoded at apply time (`node.zig`).
 //!
-//! This is the V2 spine's own copy of the wire format V1 owns in
-//! `src/kv/cluster.zig` + `src/js/apply.zig`. The format is held
-//! byte-identical on purpose (`[1B type][2B id_len BE][id][payload]`,
-//! type numbering matching V1's `EnvelopeType`) so the apply payload is
-//! unchanged across the rewrite — but the V2 spine owns its codec
-//! outright because V1's `cluster.zig` is deleted at cutover
-//! (v2-build-order "clean-slate the spine, reuse the limbs").
-//!
-//! The type-0 payload is the **readset-framed** `WriteSetPayload`
-//! (`[u32 ws_len][ws][u32 rs_len][rs]`), byte-identical to the worker's
-//! `src/js/apply.zig` so a worker propose applies unchanged on a V2
-//! follower (`decodeWriteSetPayload` strips the frame; apply uses
-//! `ws_bytes`, the readset rides for the tape). The header codec
-//! (`[1B type][2B id_len BE][id][payload]`) is unchanged. (Earlier Phase-1
-//! slices carried a raw-writeset payload; that only ever flowed on a
-//! single-node leader, which skips apply, so the mismatch was latent until
-//! a real follower applied a worker entry in Phase 5 multi-node.)
+//! The byte layout (`[1B type][2B id_len BE][id][payload]`, the multi
+//! wrapper, and the readset-framed type-0 `WriteSetPayload`) lives ONCE
+//! in `src/kv/envelope_codec.zig` (std-only, re-exported by `kvlimbs`);
+//! this file delegates those primitives and layers the V2-spine
+//! additions on top: the origin-identity `EntryFrame` and the typed
+//! `Type` enum whose decode rejects retired V1 slots loudly. A worker
+//! propose (encoded via `apply.zig` → the same codec) applies unchanged
+//! on any follower by construction — there is no second implementation
+//! to hold in sync.
 
 const std = @import("std");
+const codec = @import("kvlimbs").envelope_codec;
 
-/// Max length of an envelope `id` (the tenant store id string). Mirrors
-/// V1's `MAX_ID_LEN`; the 2-byte big-endian length field caps it at
-/// 65535 regardless, this is the tighter sanity bound.
-pub const MAX_ID_LEN: usize = 512;
+/// Single-sourced from the shared codec (enforced on encode only; see
+/// its doc there). One value for every encoder — worker and spine.
+pub const MAX_ID_LEN: usize = codec.MAX_ID_LEN;
 
 pub const Error = error{
     Truncated,
@@ -137,18 +129,17 @@ pub const Envelope = struct {
     payload: []const u8,
 };
 
-/// Decode the `[1B type][2B id_len BE][id][payload]` header. Returned
-/// slices alias `bytes`; valid only while `bytes` lives.
+/// Decode the `[1B type][2B id_len BE][id][payload]` header (shared
+/// codec) and map the raw type byte onto the typed enum — a retired /
+/// unknown slot is `UnknownEnvelopeType`. Returned slices alias
+/// `bytes`; valid only while `bytes` lives.
 pub fn decode(bytes: []const u8) Error!Envelope {
-    if (bytes.len < 3) return Error.Truncated;
-    const raw_type = bytes[0];
-    const id_len = std.mem.readInt(u16, bytes[1..3], .big);
-    if (bytes.len < 3 + @as(usize, id_len)) return Error.Truncated;
-    const t = std.meta.intToEnum(Type, raw_type) catch return Error.UnknownEnvelopeType;
+    const raw = try codec.decodeEnvelope(bytes);
+    const t = std.meta.intToEnum(Type, raw.type) catch return Error.UnknownEnvelopeType;
     return .{
         .type = t,
-        .id = bytes[3 .. 3 + id_len],
-        .payload = bytes[3 + id_len ..],
+        .id = raw.id,
+        .payload = raw.payload,
     };
 }
 
@@ -158,58 +149,16 @@ fn encodeTyped(
     id: []const u8,
     payload: []const u8,
 ) Error![]u8 {
-    if (id.len > MAX_ID_LEN) return Error.IdTooLong;
-    const total = 1 + 2 + id.len + payload.len;
-    const out = allocator.alloc(u8, total) catch return Error.OutOfMemory;
-    out[0] = @intFromEnum(t);
-    std.mem.writeInt(u16, out[1..3], @intCast(id.len), .big);
-    @memcpy(out[3 .. 3 + id.len], id);
-    @memcpy(out[3 + id.len ..], payload);
-    return out;
+    return codec.encodeEnvelope(allocator, @intFromEnum(t), id, payload);
 }
 
-/// Type-0 payload layout (`docs/readset-replication-plan.md` Phase 3),
-/// byte-identical to the worker's `src/js/apply.zig` `WriteSetPayload`:
-///
-///   `[u32 LE ws_len][ws_bytes][u32 LE rs_len][rs_bytes]`
-///
-/// The type-0 envelope payload is NOT raw writeset bytes — it interleaves
-/// the writeset with the request's serialized readset so the tape can be
-/// reconstructed on any follower that applies the entry. `rs_len == 0` is
-/// valid + frequent (non-handler producers — ACME, the move surface's
-/// `v2-kv`, the secondary inners of a batch — carry an empty readset). The
-/// V2 spine owns this codec because V1's `apply.zig` is deleted at cutover;
-/// it is held identical so the bytes the worker proposes apply unchanged.
-/// Apply only needs `ws_bytes`; the readset rides for the tape (Phase 5+).
-pub const WriteSetPayload = struct {
-    ws_bytes: []const u8,
-    rs_bytes: []const u8,
-};
-
-pub fn decodeWriteSetPayload(payload: []const u8) Error!WriteSetPayload {
-    if (payload.len < 4) return Error.Truncated;
-    const ws_len = std.mem.readInt(u32, payload[0..4], .little);
-    if (payload.len < 4 + @as(usize, ws_len) + 4) return Error.Truncated;
-    const ws_bytes = payload[4 .. 4 + ws_len];
-    const rs_len = std.mem.readInt(u32, payload[4 + ws_len ..][0..4], .little);
-    const rs_start: usize = 4 + ws_len + 4;
-    if (payload.len != rs_start + rs_len) return Error.Truncated;
-    return .{ .ws_bytes = ws_bytes, .rs_bytes = payload[rs_start .. rs_start + rs_len] };
-}
-
-pub fn encodeWriteSetPayload(
-    allocator: std.mem.Allocator,
-    ws_bytes: []const u8,
-    rs_bytes: []const u8,
-) Error![]u8 {
-    const total = 4 + ws_bytes.len + 4 + rs_bytes.len;
-    const out = allocator.alloc(u8, total) catch return Error.OutOfMemory;
-    std.mem.writeInt(u32, out[0..4], @intCast(ws_bytes.len), .little);
-    @memcpy(out[4..][0..ws_bytes.len], ws_bytes);
-    std.mem.writeInt(u32, out[4 + ws_bytes.len ..][0..4], @intCast(rs_bytes.len), .little);
-    @memcpy(out[4 + ws_bytes.len + 4 ..][0..rs_bytes.len], rs_bytes);
-    return out;
-}
+/// Type-0 readset-framed payload — single-sourced from the shared codec
+/// (`[u32 LE ws_len][ws_bytes][u32 LE rs_len][rs_bytes]`; see the doc
+/// there). Re-exported so the spine's apply path (`node.zig`) keeps its
+/// natural import.
+pub const WriteSetPayload = codec.WriteSetPayload;
+pub const decodeWriteSetPayload = codec.decodeWriteSetPayload;
+pub const encodeWriteSetPayload = codec.encodeWriteSetPayload;
 
 /// Build a type-0 writeset envelope. `ws_bytes` is the output of
 /// `writeset.WriteSet.encode`; it is wrapped in the readset-framed payload
@@ -234,52 +183,21 @@ pub fn encodeRootWriteSet(
 }
 
 /// Build a type-1 multi wrapper carrying `inner` already-encoded
-/// envelopes. Inner envelopes must not themselves be type-1
-/// (`NestedMulti`). Caller owns the returned slice.
+/// envelopes (shared codec; `codec.ENVELOPE_TYPE_MULTI` == `Type.multi`).
+/// Inner envelopes must not themselves be type-1 (`NestedMulti`).
+/// Caller owns the returned slice.
 pub fn encodeMulti(
     allocator: std.mem.Allocator,
     inner: []const []const u8,
 ) Error![]u8 {
-    if (inner.len > 0xff) return Error.OutOfMemory;
-    var inner_total: usize = 0;
-    for (inner) |b| inner_total += 4 + b.len;
-    const payload = allocator.alloc(u8, 1 + inner_total) catch return Error.OutOfMemory;
-    defer allocator.free(payload);
-    payload[0] = @intCast(inner.len);
-    var pos: usize = 1;
-    for (inner) |b| {
-        std.mem.writeInt(u32, payload[pos..][0..4], @intCast(b.len), .little);
-        pos += 4;
-        @memcpy(payload[pos..][0..b.len], b);
-        pos += b.len;
-    }
-    return encodeTyped(allocator, .multi, "", payload);
+    return codec.encodeMulti(allocator, inner);
 }
 
 /// Decode the inner-envelope byte slices from a `multi` payload (i.e.
 /// `Envelope.payload` where `type == .multi`). Returned slices alias
 /// `payload`; caller frees only the outer `[][]const u8` with
 /// `allocator.free`.
-pub fn decodeMultiInner(
-    allocator: std.mem.Allocator,
-    payload: []const u8,
-) Error![][]const u8 {
-    if (payload.len < 1) return Error.Truncated;
-    const count = payload[0];
-    const out = allocator.alloc([]const u8, count) catch return Error.OutOfMemory;
-    errdefer allocator.free(out);
-    var pos: usize = 1;
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        if (payload.len < pos + 4) return Error.Truncated;
-        const len = std.mem.readInt(u32, payload[pos..][0..4], .little);
-        pos += 4;
-        if (payload.len < pos + len) return Error.Truncated;
-        out[i] = payload[pos .. pos + len];
-        pos += len;
-    }
-    return out;
-}
+pub const decodeMultiInner = codec.decodeMultiInner;
 
 // ── Tests ────────────────────────────────────────────────────────────
 

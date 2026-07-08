@@ -113,61 +113,16 @@ pub const EnvelopeType = enum(u8) {
     //            SendDispatch kernel either (PR-3 deleted it).
 };
 
-/// Type-0 envelope payload layout
-/// (`docs/readset-replication-plan.md` Phase 3). The original layout
-/// was just the writeset bytes; the extended layout interleaves the
-/// writeset with the request's serialized readset so the tape can
-/// be reconstructed on any follower that ever applies this entry.
-///
-/// Wire format:
-///   `[u32 LE ws_len][ws_bytes][u32 LE rs_len][rs_bytes]`
-///
-/// `rs_len == 0` is valid + frequent — non-handler producers (ACME,
-/// background trampolines) and the secondary inner envelopes of a
-/// batched propose carry an empty readset section. The anchor
-/// envelope in a batch carries the dispatch's readset; targets and
-/// root_writeset in the same batch carry empty (the readset is
-/// per-dispatch, not per-envelope).
-pub const WriteSetPayload = struct {
-    /// Borrowed slice into the input payload — the writeset bytes.
-    ws_bytes: []const u8,
-    /// Borrowed slice into the input payload — the readset list bytes
-    /// (empty for non-handler producers). When non-empty, the bytes
-    /// are a `tape_mod.encodeReadsetList` blob containing one or more
-    /// `Readset.serialize` entries (one per successful request in the
-    /// batched dispatch that produced this envelope);
-    /// `tape_mod.parseReadsetList` validates the outer shape, and
-    /// `tape_mod.parseReadset` validates each per-readset blob.
-    rs_bytes: []const u8,
-};
-
-pub fn decodeWriteSetPayload(payload: []const u8) Error!WriteSetPayload {
-    if (payload.len < 4) return Error.Truncated;
-    const ws_len = std.mem.readInt(u32, payload[0..4], .little);
-    if (payload.len < 4 + ws_len + 4) return Error.Truncated;
-    const ws_bytes = payload[4 .. 4 + ws_len];
-    const rs_len = std.mem.readInt(u32, payload[4 + ws_len ..][0..4], .little);
-    const rs_start: usize = 4 + ws_len + 4;
-    if (payload.len != rs_start + rs_len) return Error.Truncated;
-    return .{
-        .ws_bytes = ws_bytes,
-        .rs_bytes = payload[rs_start .. rs_start + rs_len],
-    };
-}
-
-pub fn encodeWriteSetPayload(
-    allocator: std.mem.Allocator,
-    ws_bytes: []const u8,
-    rs_bytes: []const u8,
-) ![]u8 {
-    const total = 4 + ws_bytes.len + 4 + rs_bytes.len;
-    const out = try allocator.alloc(u8, total);
-    std.mem.writeInt(u32, out[0..4], @intCast(ws_bytes.len), .little);
-    @memcpy(out[4..][0..ws_bytes.len], ws_bytes);
-    std.mem.writeInt(u32, out[4 + ws_bytes.len ..][0..4], @intCast(rs_bytes.len), .little);
-    @memcpy(out[4 + ws_bytes.len + 4 ..][0..rs_bytes.len], rs_bytes);
-    return out;
-}
+/// Type-0 readset-framed payload — single-sourced from the shared codec
+/// (`kv.envelope_codec`; `[u32 LE ws_len][ws_bytes][u32 LE rs_len][rs_bytes]`,
+/// see the doc there). When `rs_bytes` is non-empty, it is a
+/// `tape_mod.encodeReadsetList` blob (one `Readset.serialize` entry per
+/// successful request in the batched dispatch that produced this
+/// envelope); `tape_mod.parseReadsetList` validates the outer shape,
+/// `tape_mod.parseReadset` each per-readset blob.
+pub const WriteSetPayload = kv.WriteSetPayload;
+pub const decodeWriteSetPayload = kv.decodeWriteSetPayload;
+pub const encodeWriteSetPayload = kv.encodeWriteSetPayload;
 
 /// Build a type-0 writeset envelope. `id_len` and `id` plus a leading
 /// type=0 byte; payload is `encodeWriteSetPayload(ws_bytes, rs_bytes)`.

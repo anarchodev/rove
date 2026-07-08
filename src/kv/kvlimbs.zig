@@ -91,6 +91,9 @@ pub const decodeEnvelope = envelope_codec.decodeEnvelope;
 pub const encodeEnvelope = envelope_codec.encodeEnvelope;
 pub const encodeMulti = envelope_codec.encodeMulti;
 pub const decodeMultiInner = envelope_codec.decodeMultiInner;
+pub const WriteSetPayload = envelope_codec.WriteSetPayload;
+pub const decodeWriteSetPayload = envelope_codec.decodeWriteSetPayload;
+pub const encodeWriteSetPayload = envelope_codec.encodeWriteSetPayload;
 
 // Pull the imported files' inline tests into the `raft-kv` test build —
 // a bare `pub const = @import(...)` does NOT (Zig only runs tests from files
