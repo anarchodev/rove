@@ -355,13 +355,15 @@ semantics (the shim cutover in B is atomic).
   flip on success, deliver the completion through the existing
   `_blob/owed`-style callback machinery (`__system` builtin → customer
   `{on}` module). Smoke: upload → onStored → blob.url serves.
-- **D — >16 MiB via part-blobs — BLOCKED (2026-07-07), see §14.** The
-  intended shape: `blob.write` flushes accumulated inline rows into
-  content-addressed part-blobs at an 8 MiB threshold (bulk leaves
-  raft), and a native S3 multipart-copy compose job assembles them
-  server-side. Built and unit/surface-green, but it hit a platform
-  limitation on the streaming path — reverted to keep HEAD at C. The
-  fix is a prerequisite platform change (§14), not a retry of D.
+- **D — >16 MiB via part-blobs — NEEDS REDESIGN (2026-07-07), see
+  §14.** The intended shape: `blob.write` flushes accumulated inline
+  rows into content-addressed part-blobs at an 8 MiB threshold (bulk
+  leaves raft), and a native S3 multipart-copy compose job assembles
+  them server-side. Built + reverted. The failure was NOT a platform
+  limitation (that first diagnosis was wrong) — it was a base64url
+  O(n²) arena bug (now fixed, `2b29873`) plus the deeper design smell
+  that chunk bytes shouldn't be base64url-encoded into kv rows at all.
+  §14 has the corrected root cause + the redesign direction.
 - **E — materializer + GC guard + deletions.** The dedicated pass,
   the high-water-mark check in retention/GC, the backstop metric;
   delete `blob_sessions.zig` + trampolines + DispatchState fields.
@@ -394,40 +396,53 @@ built and compiled; the S3 `uploadPartCopy` method, the
 `blob_compose.Job`, and the door's inline-vs-parts branch all worked
 in isolation.
 
-**Where it broke:** the flush calls `blob.put`, and `blob.put` emits
-an outbound `http.fetch` (the signed PUT). A flush only ever happens
-**inside a streaming `onChunk` / `fetch_chunk` activation that returns
-`next()`** (that is the only way a recipe accumulates past 8 MiB — a
-single terminal activation can't hold that much in the arena). And a
-mid-stream `next()` activation that emits an outbound fetch **faults**
-— a canned 500 on the send path — across both streaming vehicles
-(inbound `onChunk` POST and a bound `fetch_chunk` mirror). Every
-non-flushing path (the `gen` multi-write, the small mirror, all inline
-recipes) works, isolating the cause to fetch-emission from a mid-stream
-activation. The dispatch handles handler-emitted `pending_fetches` on
-the **terminal** path (that is how `blob.put`/`webhook.send`/seal's own
-compose Cmd all work), but the streaming-chunk dispatch does not.
+**The real root cause (corrected 2026-07-07 by decisive
+reproduction — the first diagnosis below was WRONG).** The first pass
+blamed a platform limitation ("a mid-stream `next()` activation that
+emits an outbound fetch faults; streaming-chunk dispatch doesn't drain
+`pending_fetches`"). That was misdiagnosed-by-elimination without ever
+reading the actual exception. It is **false**: `proposeForgetfulWrites`
+already stages a streaming activation's emitted fetches as commit-gated
+`Cmd.http_fetch` on the parked unit (worker_streaming.zig), and a
+minimal repro (an `onChunk` that does `kv.set` + `blob.put` per chunk,
+and one that reads back 31 rows + `blob.put`s an 8 MiB concat
+mid-stream) both **pass**. Emitting a fetch from a mid-stream
+activation is fine.
 
-This is a **prerequisite platform capability**, not a retry of D:
-either (1) make streaming-chunk dispatch drain a handler's emitted
-`pending_fetches` the way the terminal path does (the smallest fix —
-`blob.put`, `webhook.send`, `after.fetch` would then all compose from
-inside `onChunk`, useful well beyond blobs), or (2) give the flush a
-staging primitive that is NOT a JS fetch — a native "stage these bytes
-to `app-blobs/{hash}` off-thread" door the shim calls without emitting
-a `Cmd`. (1) is the more general win and is likely where the value is.
+The actual fault was a **base64url O(n²) arena blowup**, unrelated to
+fetches. `blob.write` stored each binary chunk as
+`base64url.encode(request.bytes)`; the encoder built its output with
+`out += …` in a per-byte loop, and in the bump arena every `+=`
+allocates a never-freed-until-reset string → O(n²) arena *volume* →
+above ~128 KiB of output the arena exhausts and the handler silently
+returns an empty body (in Release) or the CPU-budget interrupt of the
+now-slow activation wedges the parked continuation (in Debug, 1 s
+wall-clock budget — the "canned 500 / wedge" the first diagnosis
+misread). Bisected with minimal repros down to base64url alone
+(`blob.put(Uint8Array)`, sha256 streaming, large writesets, and
+`+=`-free string builds all pass; only base64url/hex fail). **Fixed in
+commit `2b29873`** (array+join encode; symbol-walk decode with no
+stripped copy) — a real, general bug that hit any handler
+base64/hex-ing large data, not just phase D.
 
-The originally-sketched `request.bodyRef` (ref an inbound chunk's
-already-staged coordinator copy instead of re-staging) is a **third**
-option but stays rejected for D: the coordinator pool is cross-tenant
-and its entries are released when the spool consumes them, so a recipe
-ref would be both a forgeable cross-tenant read and a
-use-after-release — it needs its own tenant-binding + deferred-release
-design before it is safe (§ the 2026-07-07 analysis).
+**Residual, and the design lesson.** With the O(n²) bug fixed the
+silent-empty and wedge are gone (they become clean errors), but a
+recipe that base64url-round-trips many chunk rows still pressures the
+per-activation arena (reading N ~30 KiB base64 strings back from kv to
+decode+concat in one flush activation). This is inherent to the
+**store-chunk-bytes-as-base64url-rows** design and confirms the smell
+flagged at the very start of phase D: binary chunk bytes do not belong
+base64url-encoded in kv rows (33 % bloat + encode/decode arena cost).
+A correct phase D should stage each large chunk to storage *directly*
+(its own content-addressed part) and keep only a tiny `{part: hash}`
+pointer in the recipe — no base64url of bulk bytes through kv at all.
+The originally-sketched `request.bodyRef` stays rejected (the
+coordinator pool is cross-tenant and releases entries on consumption —
+a forgeable cross-tenant read + use-after-release).
 
-Until one of those lands, `blob.write` should keep phase B's clean
-behavior: accumulate inline and **fail loud** if a recipe would exceed
-the inline ceiling (a >16 MiB streaming upload that must be *stored*
-whole, without per-chunk processing, already has a working path today —
-`blob.receive`, which streams the inbound body straight to S3 with no
-recipe, no arena, no flush).
+Until a phase-D redesign along those lines, `blob.write` keeps phase
+B's clean behavior: accumulate inline and **fail loud** if a recipe
+would exceed the inline ceiling. A >16 MiB streaming upload that must
+be *stored* whole (no per-chunk processing) already has a working path
+today — `blob.receive`, which streams the inbound body straight to S3
+with no recipe, no arena, no flush.
