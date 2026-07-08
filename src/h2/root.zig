@@ -824,6 +824,75 @@ const Stream = struct {
         return self.hdr.finalize(self.allocator, out_fields, out_count, out_buf_len);
     }
 
+    /// Outcome of routing one inbound body chunk per `body_mode` — §4.4:
+    /// the ONE routing decision both protocols share (`onDataChunkRecvCb`
+    /// for h2 DATA, `http1RouteBody` for h1 wire bytes). Callers own the
+    /// transport-specific flow-control repayment and failure verbs (h2:
+    /// consume / RST; h1: nothing-to-repay / error-close / conn teardown).
+    const RouteOutcome = enum {
+        /// Accepted (accumulated or discarded); repay flow-control credit
+        /// now — the client keeps streaming.
+        consume,
+        /// Accepted as held debt (`unconsumed` charged): the consumer's
+        /// decision (.hold) or the sink's drain report repays it later.
+        held,
+        /// Accumulation allocation failed.
+        append_failed,
+        /// Accumulating would exceed `max_buffer` (h1's 413 edge backstop;
+        /// h2 passes null — the stream window bounds accumulation).
+        over_cap,
+        /// The sink rejected the push (consumer gone).
+        sink_failed,
+    };
+
+    fn routeInbound(self: *Stream, bytes: []const u8, max_buffer: ?usize) RouteOutcome {
+        switch (self.body_mode) {
+            .auto, .buffer => {
+                if (max_buffer) |cap| if (self.body_len + bytes.len > cap) return .over_cap;
+                if (!self.bodyAppend(bytes.ptr, bytes.len)) return .append_failed;
+                return .consume;
+            },
+            .hold => {
+                // Window-hold: buffer but do NOT repay. The client is held
+                // at the door after at most one window's worth while the
+                // consumer decides.
+                if (!self.bodyAppend(bytes.ptr, bytes.len)) return .append_failed;
+                self.unconsumed +|= @intCast(bytes.len);
+                return .held;
+            },
+            .discard => return .consume,
+            .sink => {
+                // Route to the upload driver; credit is repaid by
+                // `sweepBodySinks` as the sink reports drained bytes — the
+                // client's send rate follows the upload rate.
+                const sk = self.sink orelse return .consume;
+                if (!sk.push(sk.ctx, bytes)) return .sink_failed;
+                self.unconsumed +|= @intCast(bytes.len);
+                return .held;
+            },
+        }
+    }
+
+    /// Flip an undecided/accumulating inbound body to discard (a response
+    /// is going out mid-body): drop the accumulator, keep draining wire
+    /// bytes so framing survives. Returns the held debt the caller repays
+    /// (h2: nghttp2 consume; h1: nothing — its debt is read-pause
+    /// accounting, cleared here). Null (no-op) unless mode ∈ {hold,
+    /// buffer} — a `.sink` keeps draining (the driver owns the bytes).
+    fn flipToDiscard(self: *Stream) ?u32 {
+        if (self.body_mode != .hold and self.body_mode != .buffer) return null;
+        self.body_mode = .discard;
+        if (self.body_data) |p| {
+            self.allocator.free(p[0..self.body_cap]);
+            self.body_data = null;
+            self.body_len = 0;
+            self.body_cap = 0;
+        }
+        const repaid = self.unconsumed;
+        self.unconsumed = 0;
+        return repaid;
+    }
+
     fn bodyAppend(self: *Stream, data: [*]const u8, len: usize) bool {
         const need: u32 = @intCast(len);
         const required = self.body_len + need;
@@ -2046,40 +2115,17 @@ pub fn H2(comptime opts: Options) type {
                 nctx.h2.wsStreamDrive(session, s);
                 return 0;
             }
-            switch (s.body_mode) {
-                .auto, .buffer => {
-                    // Classic accumulate path; consume immediately so
-                    // the client keeps streaming (the WINDOW_UPDATE
-                    // goes out on the next send drive).
-                    if (!s.bodyAppend(data, len))
-                        return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-                    _ = c.nghttp2_session_consume(session, stream_id, len);
-                },
-                .hold => {
-                    // Window-hold: buffer but do NOT consume. The
-                    // client is held at the door after at most one
-                    // window's worth while the consumer decides.
-                    if (!s.bodyAppend(data, len))
-                        return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-                    s.unconsumed += @intCast(len);
-                },
-                .discard => {
-                    _ = c.nghttp2_session_consume(session, stream_id, len);
-                },
-                .sink => {
-                    // Route to the upload driver. Window credit is
-                    // repaid by `sweepBodySinks` as the sink reports
-                    // drained bytes — the client's send rate follows
-                    // the upload rate. A push failure is fatal for
-                    // this stream only (RST), not the connection.
-                    const sk = s.sink orelse {
-                        _ = c.nghttp2_session_consume(session, stream_id, len);
-                        return 0;
-                    };
-                    if (!sk.push(sk.ctx, data[0..len]))
-                        return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
-                    s.unconsumed += @intCast(len);
-                },
+            // Shared routing core (`Stream.routeInbound`); this arm owns
+            // only the h2-specific repayment + failure verbs: consume =
+            // WINDOW_UPDATE on the next send drive; append failure kills
+            // the callback; a sink push failure is fatal for this stream
+            // only (RST via temporal failure), not the connection.
+            switch (s.routeInbound(data[0..len], null)) {
+                .consume => _ = c.nghttp2_session_consume(session, stream_id, len),
+                .held => {},
+                .append_failed => return c.NGHTTP2_ERR_CALLBACK_FAILURE,
+                .over_cap => unreachable, // no cap passed on h2 (the window bounds it)
+                .sink_failed => return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE,
             }
             return 0;
         }
@@ -3238,17 +3284,9 @@ pub fn H2(comptime opts: Options) type {
                 c.nghttp2_session_get_stream_user_data(ng_session, @intCast(stream_id)),
             ));
             const s = stream orelse return;
-            if (s.body_mode != .hold and s.body_mode != .buffer) return;
-            s.body_mode = .discard;
-            if (s.body_data) |p| {
-                s.allocator.free(p[0..s.body_cap]);
-                s.body_data = null;
-                s.body_len = 0;
-                s.body_cap = 0;
-            }
-            if (s.unconsumed > 0) {
-                _ = c.nghttp2_session_consume(ng_session, @intCast(stream_id), s.unconsumed);
-                s.unconsumed = 0;
+            const repaid = s.flipToDiscard() orelse return;
+            if (repaid > 0) {
+                _ = c.nghttp2_session_consume(ng_session, @intCast(stream_id), repaid);
             }
         }
 
@@ -4149,39 +4187,28 @@ pub fn H2(comptime opts: Options) type {
             const st = &h1c.state.http1; // only reachable mid streaming body
             const s = st.stream.?;
             st.body_seen += bytes.len;
-            switch (s.body_mode) {
-                .hold => {
-                    if (!s.bodyAppend(bytes.ptr, bytes.len)) {
-                        self.http1ErrorClose(conn_ptr, conn_entity, 500);
-                        return false;
-                    }
-                    s.unconsumed +|= @intCast(bytes.len);
+            // Shared routing core (`Stream.routeInbound`); this arm owns only
+            // the h1-specific verbs. No repayment on .consume — the wire
+            // bytes are already read; h1's "debt" (`unconsumed`) is purely
+            // the read-pause accounting. The cap is the Content-Length
+            // analog of the chunked decode backstop (413). A sink failure
+            // tears the CONNECTION down — for h1 the stream IS the
+            // connection (`serverStreamAbort`'s rule); `closing` makes the
+            // rest of this drive inert while the destroy is in flight.
+            switch (s.routeInbound(bytes, Http1Conn.MAX_BODY_BYTES)) {
+                .consume, .held => {},
+                .append_failed => {
+                    self.http1ErrorClose(conn_ptr, conn_entity, 500);
+                    return false;
                 },
-                .buffer, .auto => {
-                    // The Content-Length analog of the chunked decode cap —
-                    // accumulated bytes never exceed the edge backstop.
-                    if (s.body_len + bytes.len > Http1Conn.MAX_BODY_BYTES) {
-                        self.http1ErrorClose(conn_ptr, conn_entity, 413);
-                        return false;
-                    }
-                    if (!s.bodyAppend(bytes.ptr, bytes.len)) {
-                        self.http1ErrorClose(conn_ptr, conn_entity, 500);
-                        return false;
-                    }
+                .over_cap => {
+                    self.http1ErrorClose(conn_ptr, conn_entity, 413);
+                    return false;
                 },
-                .discard => {},
-                .sink => {
-                    const sk = s.sink orelse return true;
-                    if (!sk.push(sk.ctx, bytes)) {
-                        // Fatal sink failure. h2 RSTs the stream; for h1 the
-                        // stream IS the connection (`serverStreamAbort`'s
-                        // rule) — tear it down. `closing` makes the rest of
-                        // this drive inert while the destroy is in flight.
-                        h1c.closing = true;
-                        self.reg.destroy(conn_entity) catch {};
-                        return false;
-                    }
-                    s.unconsumed +|= @intCast(bytes.len);
+                .sink_failed => {
+                    h1c.closing = true;
+                    self.reg.destroy(conn_entity) catch {};
+                    return false;
                 },
             }
             return true;
@@ -4275,17 +4302,7 @@ pub fn H2(comptime opts: Options) type {
             if (st.expect_continue and !st.continue_sent and st.body_seen == 0) {
                 st.keep_alive = false;
             }
-            // A `.sink` keeps draining (the driver owns the bytes); only the
-            // undecided / accumulate modes flip.
-            if (s.body_mode != .hold and s.body_mode != .buffer) return;
-            s.body_mode = .discard;
-            if (s.body_data) |p| {
-                s.allocator.free(p[0..s.body_cap]);
-                s.body_data = null;
-                s.body_len = 0;
-                s.body_cap = 0;
-            }
-            s.unconsumed = 0;
+            _ = s.flipToDiscard() orelse return;
             self.http1UnparkRead(h1c);
         }
 
