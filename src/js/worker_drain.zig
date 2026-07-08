@@ -1533,6 +1533,9 @@ fn resumeContinuation(
         txn.rollback() catch {};
         txn_done = true;
         try resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "continuation handler error\n");
+        // Log the failed hop — a resume that dies at dispatch was invisible
+        // in tenant logs while every other family records a 500 here.
+        captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, correlation_id, &.{}, act_src, 0);
         return;
     };
 
@@ -1769,6 +1772,7 @@ fn resumeContinuation(
             txn.rollback() catch {};
             txn_done = true;
             try resolveParked(worker, ent, sid, sess, 500, "export probe on a resume path\n");
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, correlation_id, &.{}, act_src, 0);
         },
     }
 }
@@ -1982,6 +1986,7 @@ pub fn resumeBoundFetchChain(
         txn.rollback() catch {};
         txn_done = true;
         resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "bound-fetch handler error\n") catch {};
+        captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, &.{}, .fetch_chunk, 0);
         return;
     };
 
@@ -2173,6 +2178,7 @@ pub fn resumeBoundFetchChain(
             txn.rollback() catch {};
             txn_done = true;
             resolveParked(worker, ent, sid, sess, 500, "export probe on a resume path\n") catch {};
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, &.{}, .fetch_chunk, 0);
         },
     }
 }
@@ -3119,6 +3125,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
         txn.rollback() catch {};
         txn_done = true;
         resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "inbound-chunk handler error\n") catch {};
+        captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, &.{}, .inbound_chunk, 0);
         return true;
     };
 
@@ -3291,6 +3298,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
             txn.rollback() catch {};
             txn_done = true;
             resolveParked(worker, ent, sid, sess, 500, "export probe on a resume path\n") catch {};
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, &.{}, .inbound_chunk, 0);
         },
     }
     return true;
