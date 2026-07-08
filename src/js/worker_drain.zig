@@ -1751,6 +1751,10 @@ fn resumeContinuation(
             if (desc.cont) |*old_c| old_c.deinit(allocator);
             desc.cont = c2m;
             desc.deadline_ns = refreshed_deadline_ns;
+            // A read-only repark is still a recorded activation — without
+            // this record the hop is unreplayable. Status 0 = the
+            // parked-hop convention (matches the inbound-chunk resume).
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, .{}, correlation_id, &.{}, act_src, 0);
         },
         .stream => |*s| {
             resumeIntoStream(worker, s, .{
@@ -2155,6 +2159,10 @@ pub fn resumeBoundFetchChain(
             // submit any fetches this resume issued — `blob.seal`'s
             // PUT, chained `on.fetch` (handler-shape §5.3).
             flushResumeFetches(worker, ent, &pending_fetches, true);
+            // A read-only repark is still a recorded activation — the
+            // consumed fetch chunk is unreplayable without this record.
+            // Status 0 = the parked-hop convention.
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, &.{}, .fetch_chunk, 0);
         },
         .stream => |*s| {
             resumeIntoStream(worker, s, .{
