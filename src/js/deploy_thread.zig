@@ -410,7 +410,7 @@ fn freeJob(allocator: std.mem.Allocator, job: *DeployThread.Job) void {
 //
 // These cover the queue + result-map plumbing in isolation (no network,
 // no thread timing). The real compile+stage+S3 path is covered by
-// rove-files' `stageDeployment` tests + the deploy smoke.
+// rove-files' `compileAndStage` tests + the deploy smoke.
 
 const testing = std.testing;
 

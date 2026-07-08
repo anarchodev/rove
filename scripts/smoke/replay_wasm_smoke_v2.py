@@ -211,7 +211,7 @@ def main() -> int:
                     # so there's no /deployments + /source read-back surface.
                     # The smoke already HAS the deployed source locally, so
                     # compose the replay bundle from it directly — the hash is
-                    # just sha256 of the source bytes (what stageDeployment
+                    # just sha256 of the source bytes (what compileAndStage
                     # content-addresses on).
                     import hashlib
                     deployed = {"index.mjs": rpc_wrap(HANDLER_SRC)}
