@@ -249,119 +249,228 @@ pub const Conn = struct {
 /// Per-connection HTTP/1.1 state (docs/v2-edge-http1-ingress.md, Phase 2).
 /// Accumulates inbound bytes, drives the pure `http1` codec, and tracks the
 /// single in-flight request (no pipelining). Heap-owned; freed by `Conn.deinit`.
+///
+/// A connection lives in exactly ONE of three lifecycles, structural via
+/// `state` (refactor-audit §4.1): plain HTTP/1.1 request/response (including
+/// the parked websocket_surface Upgrade — a SUB-state, see
+/// `Http1State.pending_upgrade`), RFC 6455 framed WebSocket (worker
+/// `websocket_upgrades` instances), or the raw-relay tunnel (front
+/// `websocket_surface` instances). Framed vs tunnel are per-instance disjoint
+/// (comptime opts), and an upgrade head only ever parses from the
+/// idle-between-requests state, so cross-phase combinations (`body_active`
+/// while framed, a tunnel sink mid-body, …) were never legal — now they are
+/// unrepresentable. Deliberately TOP-LEVEL because more than one phase
+/// consults them:
+///   - `buf` — the inbound accumulator across the whole life: request bytes,
+///     then the coalesced early frame bytes that ride across an upgrade,
+///     then the frame stream (framed) / nothing (tunnel pushes straight
+///     through).
+///   - `closing` — every phase's fatal/teardown path, the feed gate, and the
+///     idle-GC reap all consult it.
+///   - `paused_read` — the parked read entity; h1 streaming bodies AND
+///     tunnel backpressure park here, and the unpark sweeps are phase-blind.
 pub const Http1Conn = struct {
     allocator: std.mem.Allocator,
     /// Inbound bytes not yet fully consumed by an emitted request. The head of
     /// a complete request is dropped (compacted out) at emit time; any trailing
     /// bytes (a coalesced next request) stay buffered until the response drains.
+    /// After an upgrade, carries RFC 6455 frame bytes instead.
     buf: std.ArrayList(u8),
-    /// True while a request entity is emitted and awaiting its response. No
-    /// second request is parsed until the first responds.
-    in_flight: bool = false,
-    /// Keep-alive decision captured from the in-flight request's head, applied
-    /// when its response is serialized.
-    keep_alive: bool = true,
     /// Set once a response with `Connection: close` (or a fatal error response)
-    /// has been queued; the connection is reaped by the idle-timeout GC after
-    /// the write drains (same path the old 426 used).
+    /// has been queued, or a phase's fatal path fired; the connection is reaped
+    /// by the idle-timeout GC after the write drains (same path the old 426
+    /// used).
     closing: bool = false,
-    /// Chunked-request decode state (Phase 4). `chunk_body` accumulates the
-    /// assembled body across reads; `chunk_pos` is the resume offset into the
-    /// post-head region so consumed chunks are never re-scanned. Reset per
-    /// request at emit. `continue_sent` guards against re-emitting `100
-    /// Continue` for an `Expect: 100-continue` request on every read.
-    chunk_body: std.ArrayList(u8) = .empty,
-    chunk_pos: usize = 0,
-    continue_sent: bool = false,
-    /// A chunked streaming response (SSE / ReadableStream) is in progress: the
-    /// head went out with `Transfer-Encoding: chunked` and body pieces are being
-    /// written as chunks. Cleared at the terminating zero-chunk.
-    streaming: bool = false,
-    /// Backpressure: the stream entity parked in `_stream_data_sending` whose
-    /// chunk (or head) write is in flight. Released back to `stream_data_out`
-    /// (the worker's "push the next piece" signal) only when that write drains
-    /// to the socket — so exactly one write is outstanding per stream, which
-    /// both paces the producer and keeps the chunks correctly ordered on the
-    /// wire. `nil` when no write is in flight.
-    sending_entity: Entity = Entity.nil,
-
-    // ── Inbound body streaming (headers_first instances only) ────────────────
-    /// The in-flight request's stream state while its body is still inbound —
-    /// the same `Stream` accumulator the h2 path keeps as nghttp2 stream user
-    /// data (`body_mode` routing, accumulated bytes, sink ref + drain debt,
-    /// `inbound_eof`), so `requestBodyBuffer` / `requestBodySink` /
-    /// `sweepBodySinks` drive both protocols through one shape. Created at
-    /// early-emit, freed at request-cycle end (`http1FinishCycle`) or conn
-    /// teardown. Null when no streaming body is in flight.
-    stream: ?*Stream = null,
-    /// True from early-emit until the last body byte is consumed off the wire.
-    /// While set, inbound bytes route to `http1DriveBody` and no next request
-    /// is parsed (`buf` holds body framing, not a request head).
-    body_active: bool = false,
-    /// Content-Length bytes still owed. Null while the in-flight body is
-    /// chunked (`chunk_pos` / `chunk_body` carry the framing state instead).
-    body_remaining: ?usize = null,
-    body_chunked: bool = false,
-    /// Total body bytes routed so far (the `Expect: 100-continue` early-reply
-    /// close-out below needs "has the client started sending?").
-    body_seen: usize = 0,
-    /// `Expect: 100-continue` captured from the head — the head bytes are
-    /// compacted away at early-emit, and the decision-gated `100 Continue`
-    /// (sent when the consumer commits to the body) fires later.
-    expect_continue: bool = false,
     /// The read entity parked in `_read_h1_paused` while inbound bytes have
-    /// outrun the consumer. nil = reads armed. TCP receive-window pushback is
-    /// h1's flow-control window; not re-arming the socket read is how we stop
-    /// repaying it.
+    /// outrun the consumer (streaming h1 body OR tunnel relay). nil = reads
+    /// armed. TCP receive-window pushback is h1's flow-control window; not
+    /// re-arming the socket read is how we stop repaying it.
     paused_read: Entity = Entity.nil,
+    state: State = .{ .http1 = .{} },
 
-    // ── WebSocket mode (docs/architecture/websockets.md) ────────────────────
-    /// Set once the `101` Upgrade has been queued: the connection has left the
-    /// HTTP request/response model and `buf` now accumulates RFC 6455 frames
-    /// (parsed by `wsDrive`, not `http1Drive`).
-    ws_mode: bool = false,
-    /// Reassembly buffer for a fragmented data message (a non-FIN opener +
-    /// `continuation` frames). Empty between messages. `ws_msg_opcode` records
-    /// the opener's opcode (text/binary); 0 means no message is in progress.
-    ws_msg: std.ArrayList(u8) = .empty,
-    ws_msg_opcode: u8 = 0,
-    /// Outbound framed-byte queue. Every server→client write (the `101`, WS data
-    /// frames, auto-pongs, the Close echo) is appended here and flushed by
-    /// `wsFlush` with exactly one socket write in flight (`ws_write_inflight`),
-    /// which both preserves frame order on the wire and coalesces a burst into
-    /// one write. Reused (capacity retained) across flushes.
-    ws_out: std.ArrayList(u8) = .empty,
-    ws_write_inflight: bool = false,
-    /// A Close frame has been queued (client-initiated or protocol error); the
-    /// connection is destroyed once `ws_out` drains.
-    ws_closing: bool = false,
-    /// Routing captured from the `101` Upgrade request (piece D, the worker
-    /// seam). The handshake completes at the transport layer without the worker,
-    /// then drops the request head — so without this the first inbound frame has
-    /// no tenant/module context. The worker reads these via `wsConnRouting` off
-    /// the `ws_message_out` entity's `Session`, resolves the tenant from
-    /// `ws_authority`, and the handler module from `ws_path`. Owned (duped at
-    /// handshake); `""` until then; freed in `free`.
-    ws_authority: []u8 = &.{},
-    ws_path: []u8 = &.{},
+    pub const State = union(enum) {
+        http1: Http1State,
+        ws_framed: WsFramed,
+        ws_tunnel: WsTunnel,
+    };
 
-    // ── WS upgrade surface / raw tunnel (front door; architecture/websockets.md) ────
-    /// `websocket_surface`: the Upgrade head was emitted to the consumer
-    /// (`ws_upgrade_out`) and the connection is parked — no request parse, no
-    /// 101 — until `wsUpgradeAccept` / `wsUpgradeReject` decides. Early frame
-    /// bytes the client coalesced after the handshake accumulate in `buf`.
-    ws_pending: bool = false,
-    /// `Sec-WebSocket-Key` captured for the deferred 101 (owned; freed in
-    /// `free`).
-    ws_key: []u8 = &.{},
-    /// Raw-relay tunnel (set by `wsUpgradeAccept`): socket bytes push to this
-    /// consumer sink VERBATIM — no RFC 6455 parsing at this hop; masking
-    /// survives to the far end. Outbound tunnel bytes ride `ws_out` /
-    /// `wsTunnelWrite`. Backpressure: `tunnel_unconsumed` (pushed-but-
-    /// undrained) parks the socket read at the same 1 MiB cap streamed
-    /// bodies use; `sweepBodySinks` repays from the sink's `drained`.
-    tunnel_sink: ?BodySink = null,
-    tunnel_unconsumed: u32 = 0,
+    /// Plain HTTP/1.1 request/response state — including the parked
+    /// websocket_surface Upgrade (`pending_upgrade`), which is a sub-state
+    /// rather than a union arm because the REJECT path resumes this exact
+    /// machinery: `http1ErrorClose` serializes over `keep_alive`/`closing`,
+    /// and the drain/idle reaps read `in_flight`/`sending_entity`.
+    pub const Http1State = struct {
+        /// True while a request entity is emitted and awaiting its response. No
+        /// second request is parsed until the first responds. (Also set while a
+        /// surfaced Upgrade is parked — no further parse on this conn.)
+        in_flight: bool = false,
+        /// Keep-alive decision captured from the in-flight request's head, applied
+        /// when its response is serialized.
+        keep_alive: bool = true,
+        /// Chunked-request decode state (Phase 4). `chunk_body` accumulates the
+        /// assembled body across reads; `chunk_pos` is the resume offset into the
+        /// post-head region so consumed chunks are never re-scanned. Reset per
+        /// request at emit. `continue_sent` guards against re-emitting `100
+        /// Continue` for an `Expect: 100-continue` request on every read.
+        chunk_body: std.ArrayList(u8) = .empty,
+        chunk_pos: usize = 0,
+        continue_sent: bool = false,
+        /// A chunked streaming response (SSE / ReadableStream) is in progress: the
+        /// head went out with `Transfer-Encoding: chunked` and body pieces are being
+        /// written as chunks. Cleared at the terminating zero-chunk.
+        streaming: bool = false,
+        /// Backpressure: the stream entity parked in `_stream_data_sending` whose
+        /// chunk (or head) write is in flight. Released back to `stream_data_out`
+        /// (the worker's "push the next piece" signal) only when that write drains
+        /// to the socket — so exactly one write is outstanding per stream, which
+        /// both paces the producer and keeps the chunks correctly ordered on the
+        /// wire. `nil` when no write is in flight.
+        sending_entity: Entity = Entity.nil,
+
+        // ── Inbound body streaming (headers_first instances only) ────────────
+        /// The in-flight request's stream state while its body is still inbound —
+        /// the same `Stream` accumulator the h2 path keeps as nghttp2 stream user
+        /// data (`body_mode` routing, accumulated bytes, sink ref + drain debt,
+        /// `inbound_eof`), so `requestBodyBuffer` / `requestBodySink` /
+        /// `sweepBodySinks` drive both protocols through one shape. Created at
+        /// early-emit, freed at request-cycle end (`http1FinishCycle`) or conn
+        /// teardown. Null when no streaming body is in flight.
+        stream: ?*Stream = null,
+        /// True from early-emit until the last body byte is consumed off the wire.
+        /// While set, inbound bytes route to `http1DriveBody` and no next request
+        /// is parsed (`buf` holds body framing, not a request head).
+        body_active: bool = false,
+        /// Content-Length bytes still owed. Null while the in-flight body is
+        /// chunked (`chunk_pos` / `chunk_body` carry the framing state instead).
+        body_remaining: ?usize = null,
+        body_chunked: bool = false,
+        /// Total body bytes routed so far (the `Expect: 100-continue` early-reply
+        /// close-out needs "has the client started sending?").
+        body_seen: usize = 0,
+        /// `Expect: 100-continue` captured from the head — the head bytes are
+        /// compacted away at early-emit, and the decision-gated `100 Continue`
+        /// (sent when the consumer commits to the body) fires later.
+        expect_continue: bool = false,
+        /// `websocket_surface`: non-null once the Upgrade head was emitted to the
+        /// consumer (`ws_upgrade_out`) and the connection is parked — no request
+        /// parse, no 101 — until `wsUpgradeAccept` / `wsUpgradeReject` decides.
+        /// Holds the owned `Sec-WebSocket-Key` for the deferred 101. Early frame
+        /// bytes the client coalesced after the handshake accumulate in `buf`.
+        pending_upgrade: ?[]u8 = null,
+    };
+
+    /// Outbound framed-byte queue shared by BOTH ws arms. Every server→client
+    /// write (the 101, WS data frames, auto-pongs, the Close echo, tunnel relay
+    /// bytes) is appended to `out` and flushed by `wsFlush` with exactly one
+    /// socket write in flight (`write_inflight`), which both preserves frame
+    /// order on the wire and coalesces a burst into one write. Reused (capacity
+    /// retained) across flushes. `closing`: a Close frame has been queued (or
+    /// the tunnel's far end hung up); the connection is destroyed once `out`
+    /// drains.
+    pub const WsWrite = struct {
+        out: std.ArrayList(u8) = .empty,
+        write_inflight: bool = false,
+        closing: bool = false,
+
+        fn deinit(self: *WsWrite, allocator: std.mem.Allocator) void {
+            self.out.deinit(allocator);
+        }
+    };
+
+    /// RFC 6455 fragmentation core (refactor-audit §4.3): reassembles one
+    /// fragmented data message at a time. `feed` enforces the §5.4 rules (no
+    /// nested opener, no orphan continuation) plus the running size cap, and
+    /// yields the completed message at FIN. Deliberately transport-free so the
+    /// WS-over-h2 reassembler (`WsReassembler`) can adopt it.
+    pub const WsFragments = struct {
+        /// Reassembly buffer for a fragmented data message (a non-FIN opener +
+        /// `continuation` frames). Empty between messages.
+        msg: std.ArrayList(u8) = .empty,
+        /// The opener's opcode (text/binary); 0 means no message in progress.
+        msg_opcode: u8 = 0,
+
+        const Fed = union(enum) {
+            /// Frame consumed; the message is still assembling.
+            pending,
+            /// A complete message. `payload` borrows the caller's frame payload
+            /// (unfragmented case) or `msg` (fragmented case) — consume it, then
+            /// call `reset` before the next `feed`.
+            message: struct { opcode: u8, payload: []const u8 },
+        };
+
+        fn deinit(self: *WsFragments, allocator: std.mem.Allocator) void {
+            self.msg.deinit(allocator);
+        }
+
+        /// Feed one DATA-class frame (text / binary / continuation only).
+        fn feed(
+            self: *WsFragments,
+            allocator: std.mem.Allocator,
+            opcode: ws.Opcode,
+            fin: bool,
+            payload: []const u8,
+            max_message: usize,
+        ) error{ WsProtocol, OutOfMemory }!Fed {
+            switch (opcode) {
+                .text, .binary => {
+                    // A new data opener while a fragmented message is open is a
+                    // protocol error (§5.4).
+                    if (self.msg_opcode != 0) return error.WsProtocol;
+                    if (fin) return .{ .message = .{ .opcode = @intFromEnum(opcode), .payload = payload } };
+                    self.msg.clearRetainingCapacity();
+                    try self.msg.appendSlice(allocator, payload);
+                    self.msg_opcode = @intFromEnum(opcode);
+                    return .pending;
+                },
+                .continuation => {
+                    // A continuation with no opener is a protocol error (§5.4).
+                    if (self.msg_opcode == 0) return error.WsProtocol;
+                    if (self.msg.items.len + payload.len > max_message)
+                        return error.WsProtocol;
+                    try self.msg.appendSlice(allocator, payload);
+                    if (fin) return .{ .message = .{ .opcode = self.msg_opcode, .payload = self.msg.items } };
+                    return .pending;
+                },
+                else => unreachable, // control frames are dispatched before feed
+            }
+        }
+
+        /// Consume a completed message (clears the buffer + opener). No-op for
+        /// the unfragmented case (nothing was buffered).
+        fn reset(self: *WsFragments) void {
+            self.msg.clearRetainingCapacity();
+            self.msg_opcode = 0;
+        }
+    };
+
+    /// RFC 6455 framed mode (worker `websocket_upgrades` instances): `buf`
+    /// accumulates frames (parsed by `wsDrive`, not `http1Drive`).
+    pub const WsFramed = struct {
+        frag: WsFragments = .{},
+        /// Routing captured from the `101` Upgrade request (piece D, the worker
+        /// seam). The handshake completes at the transport layer without the
+        /// worker, then drops the request head — so without this the first
+        /// inbound frame has no tenant/module context. The worker reads these
+        /// via `wsConnRouting` off the `ws_message_out` entity's `Session`,
+        /// resolves the tenant from `authority`, and the handler module from
+        /// `path`. Owned (duped at handshake).
+        authority: []u8 = &.{},
+        path: []u8 = &.{},
+        wr: WsWrite = .{},
+    };
+
+    /// Raw-relay tunnel (front `websocket_surface` instances, set by
+    /// `wsUpgradeAccept`): socket bytes push to the consumer `sink` VERBATIM —
+    /// no RFC 6455 parsing at this hop; masking survives to the far end.
+    /// Outbound tunnel bytes ride `wr.out` / `wsTunnelWrite`. Backpressure:
+    /// `unconsumed` (pushed-but-undrained) parks the socket read at the same
+    /// 1 MiB cap streamed bodies use; `sweepBodySinks` repays from the sink's
+    /// `drained`.
+    pub const WsTunnel = struct {
+        sink: BodySink,
+        unconsumed: u32 = 0,
+        wr: WsWrite = .{},
+    };
 
     /// Hard ceiling on a single reassembled WebSocket message at the edge — the
     /// per-frame cap fed to `ws.parseFrame` and the running cap on a fragmented
@@ -390,15 +499,76 @@ pub const Http1Conn = struct {
     }
 
     fn free(self: *Http1Conn) void {
-        if (self.stream) |s| s.free();
         self.buf.deinit(self.allocator);
-        self.chunk_body.deinit(self.allocator);
-        self.ws_msg.deinit(self.allocator);
-        self.ws_out.deinit(self.allocator);
-        if (self.ws_authority.len > 0) self.allocator.free(self.ws_authority);
-        if (self.ws_path.len > 0) self.allocator.free(self.ws_path);
-        if (self.ws_key.len > 0) self.allocator.free(self.ws_key);
+        switch (self.state) {
+            .http1 => |*st| {
+                if (st.stream) |s| s.free();
+                st.chunk_body.deinit(self.allocator);
+                if (st.pending_upgrade) |k| self.allocator.free(k);
+            },
+            .ws_framed => |*fr| {
+                fr.frag.deinit(self.allocator);
+                fr.wr.deinit(self.allocator);
+                if (fr.authority.len > 0) self.allocator.free(fr.authority);
+                if (fr.path.len > 0) self.allocator.free(fr.path);
+            },
+            .ws_tunnel => |*tn| tn.wr.deinit(self.allocator),
+        }
         self.allocator.destroy(self);
+    }
+
+    /// The active ws arm's outbound queue, or null in plain-http1 phase
+    /// (callers treat that as "not a WS connection").
+    fn wsWrite(self: *Http1Conn) ?*WsWrite {
+        return switch (self.state) {
+            .http1 => null,
+            .ws_framed => |*fr| &fr.wr,
+            .ws_tunnel => |*tn| &tn.wr,
+        };
+    }
+
+    // ── Phase transitions ─────────────────────────────────────────────
+
+    /// http1 → parked Upgrade (websocket_surface). Stays `.http1` — see
+    /// `Http1State.pending_upgrade` for why pending is a sub-state. Takes
+    /// ownership of `key`. The request cycle is idle by construction (an
+    /// upgrade head only parses when `!in_flight and !body_active`).
+    fn beginPendingUpgrade(self: *Http1Conn, key: []u8, keep_alive: bool) void {
+        const st = &self.state.http1;
+        std.debug.assert(st.pending_upgrade == null and !st.in_flight and !st.body_active);
+        st.pending_upgrade = key;
+        st.in_flight = true; // no further request parse on this conn
+        st.keep_alive = keep_alive;
+    }
+
+    /// Abandon a parked Upgrade (the reject path): free the key and resume
+    /// the plain http1 machinery — the caller serializes the error response
+    /// over the still-live request/response state.
+    fn rejectPendingUpgrade(self: *Http1Conn) void {
+        const st = &self.state.http1;
+        if (st.pending_upgrade) |k| self.allocator.free(k);
+        st.pending_upgrade = null;
+    }
+
+    /// http1 (parked Upgrade) → raw-relay tunnel. The http1 arm dies here;
+    /// its only owned allocations at this point are the key + the (empty)
+    /// chunk accumulator — the idle-cycle assertions pin that.
+    fn acceptTunnel(self: *Http1Conn, sink: BodySink) void {
+        const st = &self.state.http1;
+        std.debug.assert(st.pending_upgrade != null);
+        std.debug.assert(st.stream == null and !st.body_active);
+        if (st.pending_upgrade) |k| self.allocator.free(k);
+        st.chunk_body.deinit(self.allocator);
+        self.state = .{ .ws_tunnel = .{ .sink = sink } };
+    }
+
+    /// http1 → framed WebSocket (worker websocket_upgrades; no pending step —
+    /// the 101 is immediate). Takes ownership of `authority` + `path`.
+    fn acceptFramed(self: *Http1Conn, authority: []u8, path: []u8) void {
+        const st = &self.state.http1;
+        std.debug.assert(st.pending_upgrade == null and st.stream == null and !st.body_active);
+        st.chunk_body.deinit(self.allocator);
+        self.state = .{ .ws_framed = .{ .authority = authority, .path = path } };
     }
 };
 
@@ -859,8 +1029,9 @@ pub fn H2(comptime opts: Options) type {
         // WebSocket seam (docs/architecture/websockets.md). `ws_message_out` holds a
         // completed inbound message for the consumer (piece D → `onMessage`);
         // `ws_send_in` holds an outbound frame the consumer queued (piece E ←
-        // `stream.write`). Outbound backpressure is on the per-conn `ws_out`
-        // byte queue + `ws_write_inflight` (one socket write at a time), not on
+        // `stream.write`). Outbound backpressure is on the per-conn ws arm's
+        // `WsWrite.out` byte queue + `write_inflight` (one socket write at a
+        // time), not on
         // these entities — so control frames (pong/close) interleave with data
         // frames in wire order, which a per-entity `sending_entity` can't model.
         ws_message_out: WsColl,
@@ -1214,7 +1385,11 @@ pub fn H2(comptime opts: Options) type {
                     // committing to the body: send the gated 100 Continue
                     // and re-arm a parked read.
                     if (conn_ptr.h1) |h1c| {
-                        const s = h1c.stream orelse return .gone;
+                        const hst = switch (h1c.state) {
+                            .http1 => |*hst| hst,
+                            else => return .gone,
+                        };
+                        const s = hst.stream orelse return .gone;
                         if (!s.entity.eql(ent)) return .gone;
                         if (s.inbound_eof) {
                             h2.reg.set(ent, coll, ReqBody, takeBody(s)) catch return .gone;
@@ -1283,7 +1458,11 @@ pub fn H2(comptime opts: Options) type {
             // place of window repayment (the sweep paces reads off
             // `drained` exactly as it repays h2 window).
             if (conn_ptr.h1) |h1c| {
-                const s = h1c.stream orelse return .gone;
+                const hst = switch (h1c.state) {
+                    .http1 => |*hst| hst,
+                    else => return .gone,
+                };
+                const s = hst.stream orelse return .gone;
                 if (s.ng_stream_id != @as(i32, @intCast(stream_id))) return .gone;
                 if (s.body_data) |p| {
                     if (s.body_len > 0) {
@@ -1372,15 +1551,22 @@ pub fn H2(comptime opts: Options) type {
                         // repay = read unpark off `tunnel_unconsumed`;
                         // no Stream involved.
                         if (ref.stream_id == 0) {
-                            const sk = h.tunnel_sink orelse break :blk null;
-                            if (sk.ctx != ref.sink.ctx) break :blk null;
+                            const tn = switch (h.state) {
+                                .ws_tunnel => |*tn| tn,
+                                else => break :blk null,
+                            };
+                            if (tn.sink.ctx != ref.sink.ctx) break :blk null;
                             const delta = ref.sink.drained(ref.sink.ctx);
-                            if (delta > 0) h.tunnel_unconsumed -|= @min(delta, h.tunnel_unconsumed);
-                            if (h.tunnel_unconsumed < Http1Conn.STREAM_PAUSE_BYTES) self.http1UnparkRead(h);
+                            if (delta > 0) tn.unconsumed -|= @min(delta, tn.unconsumed);
+                            if (tn.unconsumed < Http1Conn.STREAM_PAUSE_BYTES) self.http1UnparkRead(h);
                             i += 1;
                             continue;
                         }
-                        const s = h.stream orelse break :blk null;
+                        const hst = switch (h.state) {
+                            .http1 => |*hst| hst,
+                            else => break :blk null,
+                        };
+                        const s = hst.stream orelse break :blk null;
                         const sk = s.sink orelse break :blk null;
                         if (sk.ctx != ref.sink.ctx) break :blk null;
                         break :blk s;
@@ -1446,8 +1632,10 @@ pub fn H2(comptime opts: Options) type {
         pub fn wsConnRouting(h2: *Self, conn_entity: Entity) ?struct { authority: []const u8, path: []const u8 } {
             const cp = getConn(h2, conn_entity) orelse return null;
             const h1c = cp.h1 orelse return null;
-            if (!h1c.ws_mode) return null;
-            return .{ .authority = h1c.ws_authority, .path = h1c.ws_path };
+            return switch (h1c.state) {
+                .ws_framed => |*fr| .{ .authority = fr.authority, .path = fr.path },
+                else => null,
+            };
         }
 
         // ── Extended-CONNECT WS (architecture/websockets.md) ─────────────────
@@ -3613,37 +3801,38 @@ pub fn H2(comptime opts: Options) type {
         fn http1Feed(self: *Self, conn_ptr: *Conn, conn_entity: Entity, bytes: []const u8) void {
             const h1c = conn_ptr.h1.?;
             if (h1c.closing) return;
-            // Raw-relay tunnel: bytes go straight to the consumer sink —
-            // no buffering, no parsing. A push failure means the far end
-            // is gone; tear the conn down.
-            if (h1c.ws_mode) {
-                if (h1c.tunnel_sink) |sink| {
-                    if (!sink.push(sink.ctx, bytes)) {
+            switch (h1c.state) {
+                // Raw-relay tunnel: bytes go straight to the consumer sink —
+                // no buffering, no parsing. A push failure means the far end
+                // is gone; tear the conn down.
+                .ws_tunnel => |*tn| {
+                    if (!tn.sink.push(tn.sink.ctx, bytes)) {
                         h1c.closing = true;
                         self.reg.destroy(conn_entity) catch {};
                         return;
                     }
-                    h1c.tunnel_unconsumed +|= @intCast(bytes.len);
-                    return;
-                }
-            }
-            h1c.buf.appendSlice(self.allocator, bytes) catch {
-                if (h1c.ws_mode)
-                    self.wsClose(conn_ptr, conn_entity, ws.CloseCode.internal_error)
-                else
-                    self.http1ErrorClose(conn_ptr, conn_entity, 500);
-                return;
-            };
-            // Once upgraded, `buf` carries RFC 6455 frames, not HTTP requests.
-            // A streaming inbound body consumes its framing first; if that
-            // completes the body AND the response already went out,
-            // `http1BodyComplete` re-enters `http1Drive` for a pipelined next
-            // request, so the plain call below stays a no-op double-check.
-            if (h1c.ws_mode) {
-                self.wsDrive(conn_ptr, conn_entity);
-            } else {
-                if (h1c.body_active) self.http1DriveBody(conn_ptr, conn_entity);
-                self.http1Drive(conn_ptr, conn_entity);
+                    tn.unconsumed +|= @intCast(bytes.len);
+                },
+                // Upgraded: `buf` carries RFC 6455 frames, not HTTP requests.
+                .ws_framed => {
+                    h1c.buf.appendSlice(self.allocator, bytes) catch {
+                        self.wsClose(conn_ptr, conn_entity, ws.CloseCode.internal_error);
+                        return;
+                    };
+                    self.wsDrive(conn_ptr, conn_entity);
+                },
+                // A streaming inbound body consumes its framing first; if that
+                // completes the body AND the response already went out,
+                // `http1BodyComplete` re-enters `http1Drive` for a pipelined next
+                // request, so the plain call below stays a no-op double-check.
+                .http1 => |*st| {
+                    h1c.buf.appendSlice(self.allocator, bytes) catch {
+                        self.http1ErrorClose(conn_ptr, conn_entity, 500);
+                        return;
+                    };
+                    if (st.body_active) self.http1DriveBody(conn_ptr, conn_entity);
+                    self.http1Drive(conn_ptr, conn_entity);
+                },
             }
         }
 
@@ -3652,7 +3841,11 @@ pub fn H2(comptime opts: Options) type {
         /// drains (to pick up a coalesced next request).
         fn http1Drive(self: *Self, conn_ptr: *Conn, conn_entity: Entity) void {
             const h1c = conn_ptr.h1.?;
-            if (h1c.in_flight or h1c.body_active or h1c.closing) return;
+            const st = switch (h1c.state) {
+                .http1 => |*st| st,
+                else => return,
+            };
+            if (st.in_flight or st.body_active or h1c.closing) return;
 
             var store: [http1.MAX_HEADERS]http1.Header = undefined;
             const res = http1.parseHead(h1c.buf.items, &store) catch |err| {
@@ -3707,12 +3900,12 @@ pub fn H2(comptime opts: Options) type {
                 const chunk_input = h1c.buf.items[head.head_len..];
                 const r = http1.decodeChunked(
                     chunk_input,
-                    h1c.chunk_pos,
-                    &h1c.chunk_body,
+                    st.chunk_pos,
+                    &st.chunk_body,
                     self.allocator,
                     Http1Conn.MAX_BODY_BYTES,
                 );
-                h1c.chunk_pos = r.consumed; // resume offset for the next read
+                st.chunk_pos = r.consumed; // resume offset for the next read
                 switch (r.status) {
                     .need_more => {
                         if (self.h2_opts.headers_first) {
@@ -3732,7 +3925,7 @@ pub fn H2(comptime opts: Options) type {
                     },
                     .complete => {},
                 }
-                body = h1c.chunk_body.items;
+                body = st.chunk_body.items;
                 total = head.head_len + r.consumed;
             } else {
                 const body_len = head.content_length orelse 0;
@@ -3761,12 +3954,12 @@ pub fn H2(comptime opts: Options) type {
                 self.http1ErrorClose(conn_ptr, conn_entity, 503);
                 return;
             };
-            h1c.keep_alive = head.keep_alive;
-            h1c.in_flight = true;
+            st.keep_alive = head.keep_alive;
+            st.in_flight = true;
             // Reset per-request framing state for the next keep-alive request.
-            h1c.chunk_pos = 0;
-            h1c.chunk_body.clearRetainingCapacity();
-            h1c.continue_sent = false;
+            st.chunk_pos = 0;
+            st.chunk_body.clearRetainingCapacity();
+            st.continue_sent = false;
 
             // Drop the consumed request from the front of the buffer; the body
             // bytes are now owned by the request entity. Any trailing bytes
@@ -3783,8 +3976,12 @@ pub fn H2(comptime opts: Options) type {
         /// `continue_sent` so repeated reads don't re-emit it.
         fn http1MaybeContinue(self: *Self, conn_ptr: *Conn, conn_entity: Entity, head: http1.Head) void {
             const h1c = conn_ptr.h1.?;
-            if (!head.expect_continue or h1c.continue_sent) return;
-            h1c.continue_sent = true;
+            const st = switch (h1c.state) {
+                .http1 => |*st| st,
+                else => return,
+            };
+            if (!head.expect_continue or st.continue_sent) return;
+            st.continue_sent = true;
             const msg = self.allocator.dupe(u8, "HTTP/1.1 100 Continue\r\n\r\n") catch return;
             self.http1Send(conn_ptr, conn_entity, msg);
         }
@@ -3807,6 +4004,10 @@ pub fn H2(comptime opts: Options) type {
         /// the consumer commits to the body via buffer/sink), not sent here.
         fn http1BeginStreamingBody(self: *Self, conn_ptr: *Conn, conn_entity: Entity, head: http1.Head, scheme: []const u8) void {
             const h1c = conn_ptr.h1.?;
+            const st = switch (h1c.state) {
+                .http1 => |*st| st,
+                else => return,
+            };
             const s = Stream.create(conn_entity, self.allocator) orelse {
                 self.http1ErrorClose(conn_ptr, conn_entity, 503);
                 return;
@@ -3821,15 +4022,15 @@ pub fn H2(comptime opts: Options) type {
                 return;
             };
             s.entity = req_entity;
-            h1c.stream = s;
+            st.stream = s;
 
-            h1c.keep_alive = head.keep_alive;
-            h1c.expect_continue = head.expect_continue;
-            h1c.in_flight = true;
-            h1c.body_active = true;
-            h1c.body_chunked = head.chunked;
-            h1c.body_remaining = if (head.chunked) null else (head.content_length orelse 0);
-            h1c.body_seen = 0;
+            st.keep_alive = head.keep_alive;
+            st.expect_continue = head.expect_continue;
+            st.in_flight = true;
+            st.body_active = true;
+            st.body_chunked = head.chunked;
+            st.body_remaining = if (head.chunked) null else (head.content_length orelse 0);
+            st.body_seen = 0;
 
             // Drop the head; `buf` now starts at the body region (the chunked
             // resume offset `chunk_pos` is relative to it). The head's slices
@@ -3840,9 +4041,9 @@ pub fn H2(comptime opts: Options) type {
 
             // Chunked: the parse attempt already decoded a prefix into
             // `chunk_body` — route it (under `.hold`) before continuing.
-            if (head.chunked and h1c.chunk_body.items.len > 0) {
-                const ok = self.http1RouteBody(conn_ptr, conn_entity, h1c.chunk_body.items);
-                h1c.chunk_body.clearRetainingCapacity();
+            if (head.chunked and st.chunk_body.items.len > 0) {
+                const ok = self.http1RouteBody(conn_ptr, conn_entity, st.chunk_body.items);
+                st.chunk_body.clearRetainingCapacity();
                 if (!ok) return;
             }
             // Consume whatever body bytes already arrived.
@@ -3855,10 +4056,14 @@ pub fn H2(comptime opts: Options) type {
         /// chunk-framing tail / a pipelined next request).
         fn http1DriveBody(self: *Self, conn_ptr: *Conn, conn_entity: Entity) void {
             const h1c = conn_ptr.h1.?;
-            if (!h1c.body_active or h1c.closing) return;
-            const s = h1c.stream orelse return;
+            const st = switch (h1c.state) {
+                .http1 => |*st| st,
+                else => return,
+            };
+            if (!st.body_active or h1c.closing) return;
+            const s = st.stream orelse return;
 
-            if (h1c.body_chunked) {
+            if (st.body_chunked) {
                 // The decode cap guards ACCUMULATION: `.hold`/`.buffer` grow
                 // the stream's buffer, so bound their remaining allowance at
                 // the edge backstop; `.sink`/`.discard` route bytes straight
@@ -3867,10 +4072,10 @@ pub fn H2(comptime opts: Options) type {
                     .hold, .buffer, .auto => Http1Conn.MAX_BODY_BYTES -| s.body_len,
                     .sink, .discard => std.math.maxInt(usize),
                 };
-                const r = http1.decodeChunked(h1c.buf.items, h1c.chunk_pos, &h1c.chunk_body, self.allocator, cap);
-                if (h1c.chunk_body.items.len > 0) {
-                    const ok = self.http1RouteBody(conn_ptr, conn_entity, h1c.chunk_body.items);
-                    h1c.chunk_body.clearRetainingCapacity();
+                const r = http1.decodeChunked(h1c.buf.items, st.chunk_pos, &st.chunk_body, self.allocator, cap);
+                if (st.chunk_body.items.len > 0) {
+                    const ok = self.http1RouteBody(conn_ptr, conn_entity, st.chunk_body.items);
+                    st.chunk_body.clearRetainingCapacity();
                     if (!ok) return;
                 }
                 switch (r.status) {
@@ -3882,7 +4087,7 @@ pub fn H2(comptime opts: Options) type {
                             if (leftover > 0) std.mem.copyForwards(u8, h1c.buf.items[0..leftover], h1c.buf.items[r.consumed..]);
                             h1c.buf.shrinkRetainingCapacity(leftover);
                         }
-                        h1c.chunk_pos = 0;
+                        st.chunk_pos = 0;
                         if (r.status == .complete) self.http1BodyComplete(conn_ptr, conn_entity);
                     },
                     .malformed => self.http1ErrorClose(conn_ptr, conn_entity, 400),
@@ -3891,16 +4096,16 @@ pub fn H2(comptime opts: Options) type {
                 return;
             }
 
-            const remaining = h1c.body_remaining orelse 0;
+            const remaining = st.body_remaining orelse 0;
             const take = @min(h1c.buf.items.len, remaining);
             if (take > 0) {
                 if (!self.http1RouteBody(conn_ptr, conn_entity, h1c.buf.items[0..take])) return;
                 const leftover = h1c.buf.items.len - take;
                 if (leftover > 0) std.mem.copyForwards(u8, h1c.buf.items[0..leftover], h1c.buf.items[take..]);
                 h1c.buf.shrinkRetainingCapacity(leftover);
-                h1c.body_remaining = remaining - take;
+                st.body_remaining = remaining - take;
             }
-            if ((h1c.body_remaining orelse 0) == 0) self.http1BodyComplete(conn_ptr, conn_entity);
+            if ((st.body_remaining orelse 0) == 0) self.http1BodyComplete(conn_ptr, conn_entity);
         }
 
         /// Route streamed body bytes per the in-flight stream's mode. Returns
@@ -3908,8 +4113,9 @@ pub fn H2(comptime opts: Options) type {
         /// queued / connection torn down) — callers stop driving.
         fn http1RouteBody(self: *Self, conn_ptr: *Conn, conn_entity: Entity, bytes: []const u8) bool {
             const h1c = conn_ptr.h1.?;
-            const s = h1c.stream.?;
-            h1c.body_seen += bytes.len;
+            const st = &h1c.state.http1; // only reachable mid streaming body
+            const s = st.stream.?;
+            st.body_seen += bytes.len;
             switch (s.body_mode) {
                 .hold => {
                     if (!s.bodyAppend(bytes.ptr, bytes.len)) {
@@ -3952,8 +4158,12 @@ pub fn H2(comptime opts: Options) type {
         /// h2 END_STREAM block in `onFrameRecvCb`.
         fn http1BodyComplete(self: *Self, conn_ptr: *Conn, conn_entity: Entity) void {
             const h1c = conn_ptr.h1.?;
-            const s = h1c.stream orelse return;
-            h1c.body_active = false;
+            const st = switch (h1c.state) {
+                .http1 => |*st| st,
+                else => return,
+            };
+            const s = st.stream orelse return;
+            st.body_active = false;
             s.inbound_eof = true;
             self.http1UnparkRead(h1c);
             switch (s.body_mode) {
@@ -3979,8 +4189,8 @@ pub fn H2(comptime opts: Options) type {
             }
             // The response already went out (early reply mid-body): the cycle
             // is over — reset and pick up a pipelined next request.
-            if (!h1c.in_flight and !h1c.closing) {
-                if (h1c.keep_alive) {
+            if (!st.in_flight and !h1c.closing) {
+                if (st.keep_alive) {
                     self.http1FinishCycle(conn_ptr);
                     self.http1Drive(conn_ptr, conn_entity);
                 } else {
@@ -3997,18 +4207,22 @@ pub fn H2(comptime opts: Options) type {
         fn http1FinishCycle(self: *Self, conn_ptr: *Conn) void {
             _ = self;
             const h1c = conn_ptr.h1.?;
-            if (h1c.stream) |s| {
+            const st = switch (h1c.state) {
+                .http1 => |*st| st,
+                else => return,
+            };
+            if (st.stream) |s| {
                 s.free();
-                h1c.stream = null;
+                st.stream = null;
             }
-            h1c.body_active = false;
-            h1c.body_remaining = null;
-            h1c.body_chunked = false;
-            h1c.body_seen = 0;
-            h1c.expect_continue = false;
-            h1c.continue_sent = false;
-            h1c.chunk_pos = 0;
-            h1c.chunk_body.clearRetainingCapacity();
+            st.body_active = false;
+            st.body_remaining = null;
+            st.body_chunked = false;
+            st.body_seen = 0;
+            st.expect_continue = false;
+            st.continue_sent = false;
+            st.chunk_pos = 0;
+            st.chunk_body.clearRetainingCapacity();
         }
 
         /// h1 mirror of `flipInboundBodyToDiscard`: a response is going out
@@ -4019,10 +4233,14 @@ pub fn H2(comptime opts: Options) type {
         /// Runs BEFORE the response serializes (it may clear `keep_alive`).
         fn http1FlipInboundToDiscard(self: *Self, conn_ptr: *Conn) void {
             const h1c = conn_ptr.h1.?;
-            if (!h1c.body_active) return;
-            const s = h1c.stream orelse return;
-            if (h1c.expect_continue and !h1c.continue_sent and h1c.body_seen == 0) {
-                h1c.keep_alive = false;
+            const st = switch (h1c.state) {
+                .http1 => |*st| st,
+                else => return,
+            };
+            if (!st.body_active) return;
+            const s = st.stream orelse return;
+            if (st.expect_continue and !st.continue_sent and st.body_seen == 0) {
+                st.keep_alive = false;
             }
             // A `.sink` keeps draining (the driver owns the bytes); only the
             // undecided / accumulate modes flip.
@@ -4042,8 +4260,12 @@ pub fn H2(comptime opts: Options) type {
         /// consumer commits to reading it (buffer / sink attach).
         fn http1MaybeContinueStored(self: *Self, conn_ptr: *Conn, conn_entity: Entity) void {
             const h1c = conn_ptr.h1.?;
-            if (!h1c.expect_continue or h1c.continue_sent or !h1c.body_active) return;
-            h1c.continue_sent = true;
+            const st = switch (h1c.state) {
+                .http1 => |*st| st,
+                else => return,
+            };
+            if (!st.expect_continue or st.continue_sent or !st.body_active) return;
+            st.continue_sent = true;
             const msg = self.allocator.dupe(u8, "HTTP/1.1 100 Continue\r\n\r\n") catch return;
             self.http1Send(conn_ptr, conn_entity, msg);
         }
@@ -4064,19 +4286,22 @@ pub fn H2(comptime opts: Options) type {
             _ = self;
             const h1c = conn_ptr.h1 orelse return false;
             if (h1c.closing) return false;
-            // Tunnel backpressure: pushed-but-undrained relay bytes.
-            if (h1c.ws_mode) {
-                if (h1c.tunnel_sink != null)
-                    return h1c.tunnel_unconsumed >= Http1Conn.STREAM_PAUSE_BYTES;
-                return false;
+            switch (h1c.state) {
+                // Tunnel backpressure: pushed-but-undrained relay bytes.
+                .ws_tunnel => |*tn| return tn.unconsumed >= Http1Conn.STREAM_PAUSE_BYTES,
+                // Framed mode has no inbound read backpressure (pre-existing;
+                // flagged in the §4.1 analysis as a separate audit note).
+                .ws_framed => return false,
+                .http1 => |*st| {
+                    if (!st.body_active) return false;
+                    const s = st.stream orelse return false;
+                    return switch (s.body_mode) {
+                        .hold => s.body_len >= Http1Conn.STREAM_PAUSE_BYTES,
+                        .sink => s.unconsumed >= Http1Conn.STREAM_PAUSE_BYTES,
+                        else => false,
+                    };
+                },
             }
-            if (!h1c.body_active) return false;
-            const s = h1c.stream orelse return false;
-            return switch (s.body_mode) {
-                .hold => s.body_len >= Http1Conn.STREAM_PAUSE_BYTES,
-                .sink => s.unconsumed >= Http1Conn.STREAM_PAUSE_BYTES,
-                else => false,
-            };
         }
 
         /// Return parked h1 reads whose connection died to the io pool, the
@@ -4238,7 +4463,10 @@ pub fn H2(comptime opts: Options) type {
             const h1c = conn_ptr.h1.?;
             if (h1c.closing) return;
             h1c.closing = true;
-            h1c.keep_alive = false;
+            switch (h1c.state) {
+                .http1 => |*st| st.keep_alive = false,
+                else => {},
+            }
             var out: std.ArrayList(u8) = .empty;
             http1.writeResponse(&out, self.allocator, status, &.{}, "", false) catch {
                 out.deinit(self.allocator);
@@ -4267,8 +4495,13 @@ pub fn H2(comptime opts: Options) type {
             // A streaming body that error-closed mid-flight (malformed chunk,
             // cap) already queued its 4xx and doomed the conn — a worker
             // response for that request has nowhere to go. (Unreachable on
-            // the classic path: parse errors precede emission there.)
-            if (h1c.closing) {
+            // the classic path: parse errors precede emission there. The
+            // non-http1 arms are equally response-less by construction.)
+            const st = switch (h1c.state) {
+                .http1 => |*st| st,
+                else => null,
+            };
+            if (h1c.closing or st == null) {
                 io_res.err = -1;
                 try self.reg.move(ent, &self.response_in, &self.response_out);
                 return;
@@ -4295,16 +4528,16 @@ pub fn H2(comptime opts: Options) type {
             }
 
             const body = if (rb.data) |d| d[0..rb.len] else "";
-            try http1.writeResponse(&out, self.allocator, status.code, hdr_store[0..hn], body, h1c.keep_alive);
+            try http1.writeResponse(&out, self.allocator, status.code, hdr_store[0..hn], body, st.?.keep_alive);
             const data = try out.toOwnedSlice(self.allocator);
             self.http1Send(conn_ptr, conn_entity, data);
 
             io_res.err = 0;
             try self.reg.move(ent, &self.response_in, &self.response_out);
 
-            if (h1c.keep_alive) {
-                h1c.in_flight = false;
-                if (!h1c.body_active) {
+            if (st.?.keep_alive) {
+                st.?.in_flight = false;
+                if (!st.?.body_active) {
                     // Cycle over (body already complete / never had one);
                     // pick up a coalesced next request. When the body is
                     // still draining post-flip, `http1BodyComplete` finishes
@@ -4333,7 +4566,11 @@ pub fn H2(comptime opts: Options) type {
         fn http1StreamBegin(self: *Self, ent: Entity, conn_ptr: *Conn, conn_entity: Entity, status: Status, rh: RespHeaders, io_res: *H2IoResult) !void {
             const h1c = conn_ptr.h1.?;
             // Same mid-flight error-close guard as `http1WriteResponse`.
-            if (h1c.closing) {
+            const st = switch (h1c.state) {
+                .http1 => |*st| st,
+                else => null,
+            };
+            if (h1c.closing or st == null) {
                 io_res.err = -1;
                 try self.reg.move(ent, &self.stream_response_in, &self.response_out);
                 return;
@@ -4361,12 +4598,12 @@ pub fn H2(comptime opts: Options) type {
             try http1.writeStreamHead(&out, self.allocator, status.code, hdr_store[0..hn]);
             const data = try out.toOwnedSlice(self.allocator);
             self.http1Send(conn_ptr, conn_entity, data);
-            h1c.streaming = true;
+            st.?.streaming = true;
             io_res.err = 0;
             // Backpressure: hold the entity until the head write drains, so the
             // worker can't push the first chunk until the head is on the wire
             // (keeps the single-write-in-flight invariant from the very start).
-            h1c.sending_entity = ent;
+            st.?.sending_entity = ent;
             try self.reg.move(ent, &self.stream_response_in, &self._stream_data_sending);
         }
 
@@ -4376,6 +4613,19 @@ pub fn H2(comptime opts: Options) type {
         /// same ownership transfer the h2 path does onto its `Stream`).
         fn http1StreamChunk(self: *Self, ent: Entity, conn_ptr: *Conn, conn_entity: Entity, rb: *RespBody) !void {
             const h1c = conn_ptr.h1.?;
+            const st = switch (h1c.state) {
+                .http1 => |*st| st,
+                // Non-http1 arms never host stream entities; drop the piece.
+                else => {
+                    if (rb.data) |d| {
+                        self.allocator.free(d[0..rb.len]);
+                        rb.data = null;
+                        rb.len = 0;
+                    }
+                    try self.reg.move(ent, &self.stream_data_in, &self.stream_data_out);
+                    return;
+                },
+            };
             if (rb.data) |d| {
                 if (rb.len > 0) {
                     var out: std.ArrayList(u8) = .empty;
@@ -4388,7 +4638,7 @@ pub fn H2(comptime opts: Options) type {
                     rb.len = 0;
                     // Backpressure: hold the entity until this chunk's write
                     // drains; `writesAccount` releases it back to stream_data_out.
-                    h1c.sending_entity = ent;
+                    st.sending_entity = ent;
                     try self.reg.move(ent, &self.stream_data_in, &self._stream_data_sending);
                     return;
                 }
@@ -4406,14 +4656,24 @@ pub fn H2(comptime opts: Options) type {
         /// can serve the next request) vs close.
         fn http1StreamEnd(self: *Self, ent: Entity, conn_ptr: *Conn, conn_entity: Entity, io_res: *H2IoResult) !void {
             const h1c = conn_ptr.h1.?;
+            const st = switch (h1c.state) {
+                .http1 => |*st| st,
+                // Non-http1 arms never host stream entities; finalize the
+                // entity without touching conn state.
+                else => {
+                    io_res.err = 0;
+                    try self.reg.move(ent, &self.stream_close_in, &self.response_out);
+                    return;
+                },
+            };
             const term = try self.allocator.dupe(u8, http1.CHUNK_TERMINATOR);
             self.http1Send(conn_ptr, conn_entity, term);
-            h1c.streaming = false;
+            st.streaming = false;
             io_res.err = 0;
             try self.reg.move(ent, &self.stream_close_in, &self.response_out);
-            if (h1c.keep_alive) {
-                h1c.in_flight = false;
-                if (!h1c.body_active) {
+            if (st.keep_alive) {
+                st.in_flight = false;
+                if (!st.body_active) {
                     self.http1FinishCycle(conn_ptr);
                     self.http1Drive(conn_ptr, conn_entity);
                 }
@@ -4465,18 +4725,17 @@ pub fn H2(comptime opts: Options) type {
             for (head.headers) |h| {
                 if (std.ascii.eqlIgnoreCase(h.name, "sec-websocket-key")) key = h.value;
             }
-            h1c.ws_key = self.allocator.dupe(u8, key) catch {
+            const key_owned = self.allocator.dupe(u8, key) catch {
                 self.http1ErrorClose(conn_ptr, conn_entity, 500);
                 return;
             };
             const scheme: []const u8 = if (conn_ptr.tls_conn != null) "https" else "http";
             _ = self.http1CreateEntity(&self.ws_upgrade_out, conn_entity, head, scheme) catch {
+                self.allocator.free(key_owned);
                 self.http1ErrorClose(conn_ptr, conn_entity, 503);
                 return;
             };
-            h1c.ws_pending = true;
-            h1c.in_flight = true; // no further request parse on this conn
-            h1c.keep_alive = head.keep_alive;
+            h1c.beginPendingUpgrade(key_owned, head.keep_alive);
             // Drop the head; anything left in `buf` is early frame bytes.
             const leftover = h1c.buf.items.len - head.head_len;
             if (leftover > 0) std.mem.copyForwards(u8, h1c.buf.items[0..leftover], h1c.buf.items[head.head_len..]);
@@ -4497,31 +4756,38 @@ pub fn H2(comptime opts: Options) type {
             defer h2.reg.destroy(ent) catch {};
             const conn_ptr = getConn(h2, sess.entity) orelse return .gone;
             const h1c = conn_ptr.h1 orelse return .gone;
-            if (!h1c.ws_pending or h1c.closing) return .gone;
+            const pending_key = switch (h1c.state) {
+                .http1 => |*st| st.pending_upgrade orelse return .gone,
+                else => return .gone,
+            };
+            if (h1c.closing) return .gone;
 
             var accept_buf: [ws.ACCEPT_LEN]u8 = undefined;
-            const accept = ws.acceptKey(h1c.ws_key, &accept_buf);
+            const accept = ws.acceptKey(pending_key, &accept_buf);
             var resp: std.ArrayList(u8) = .empty;
             defer resp.deinit(h2.allocator);
             resp.appendSlice(h2.allocator, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ") catch return .gone;
             resp.appendSlice(h2.allocator, accept) catch return .gone;
             resp.appendSlice(h2.allocator, "\r\n\r\n") catch return .gone;
 
+            // Materialize the 101 BEFORE any state flips so every failure arm
+            // leaves the conn in its parked-pending shape (the old code rolled
+            // back by hand and briefly held a half-flipped conn).
+            const out = resp.toOwnedSlice(h2.allocator) catch return .gone;
+
             h2.body_sinks.append(h2.allocator, .{
                 .conn_entity = sess.entity,
                 .stream_id = 0, // sentinel: h1 tunnel sink (no h2 stream)
                 .sink = sink,
-            }) catch return .gone;
-
-            h1c.ws_pending = false;
-            h1c.ws_mode = true;
-            h1c.tunnel_sink = sink;
-
-            const out = resp.toOwnedSlice(h2.allocator) catch {
-                h1c.tunnel_sink = null;
-                _ = h2.body_sinks.pop();
+            }) catch {
+                h2.allocator.free(out);
                 return .gone;
             };
+
+            // Flip to tunnel BEFORE sending the 101: the write completion must
+            // land in the ws arm of `writesAccount` (→ wsFlush) so tunnel bytes
+            // queued behind the 101 ship as soon as it drains.
+            h1c.acceptTunnel(sink);
             h2.http1Send(conn_ptr, sess.entity, out);
 
             // Early frame bytes that rode in with the handshake.
@@ -4530,7 +4796,7 @@ pub fn H2(comptime opts: Options) type {
                     h2.reg.destroy(sess.entity) catch {};
                     return .ok; // sink owns the failure; conn is going down
                 }
-                h1c.tunnel_unconsumed +|= @intCast(h1c.buf.items.len);
+                h1c.state.ws_tunnel.unconsumed +|= @intCast(h1c.buf.items.len);
                 h1c.buf.clearRetainingCapacity();
             }
             return .ok;
@@ -4545,20 +4811,27 @@ pub fn H2(comptime opts: Options) type {
             const conn_ptr = getConn(h2, sess.entity) orelse return;
             self_reject: {
                 const h1c = conn_ptr.h1 orelse break :self_reject;
-                if (!h1c.ws_pending) break :self_reject;
-                h1c.ws_pending = false;
+                switch (h1c.state) {
+                    .http1 => |*st| if (st.pending_upgrade == null) break :self_reject,
+                    else => break :self_reject,
+                }
+                h1c.rejectPendingUpgrade();
             }
             h2.http1ErrorClose(conn_ptr, sess.entity, status);
         }
 
         /// Write raw bytes down a tunnel connection (the upstream leg's
         /// relay). Order-preserving, one socket write in flight (the
-        /// `ws_out` queue).
+        /// `WsWrite.out` queue).
         pub fn wsTunnelWrite(h2: *Self, conn_entity: Entity, bytes: []const u8) void {
             const conn_ptr = getConn(h2, conn_entity) orelse return;
             const h1c = conn_ptr.h1 orelse return;
-            if (!h1c.ws_mode or h1c.tunnel_sink == null or h1c.ws_closing) return;
-            h1c.ws_out.appendSlice(h2.allocator, bytes) catch return;
+            const tn = switch (h1c.state) {
+                .ws_tunnel => |*tn| tn,
+                else => return,
+            };
+            if (tn.wr.closing) return;
+            tn.wr.out.appendSlice(h2.allocator, bytes) catch return;
             h2.wsFlush(conn_ptr, conn_entity);
         }
 
@@ -4568,11 +4841,11 @@ pub fn H2(comptime opts: Options) type {
         pub fn wsTunnelClose(h2: *Self, conn_entity: Entity) void {
             const conn_ptr = getConn(h2, conn_entity) orelse return;
             const h1c = conn_ptr.h1 orelse return;
-            if (!h1c.ws_mode) {
+            const wr = h1c.wsWrite() orelse {
                 h2.reg.destroy(conn_entity) catch {};
                 return;
-            }
-            h1c.ws_closing = true;
+            };
+            wr.closing = true;
             h2.wsFlush(conn_ptr, conn_entity);
         }
 
@@ -4597,25 +4870,26 @@ pub fn H2(comptime opts: Options) type {
             // first inbound frame (the handshake completes here without it).
             // OOM duping either fails the connection, same as the response
             // appends below.
-            h1c.ws_authority = self.allocator.dupe(u8, head.host orelse "") catch {
+            const authority = self.allocator.dupe(u8, head.host orelse "") catch {
                 self.reg.destroy(conn_entity) catch {};
                 return;
             };
-            h1c.ws_path = self.allocator.dupe(u8, head.target) catch {
+            const path = self.allocator.dupe(u8, head.target) catch {
+                self.allocator.free(authority);
                 self.reg.destroy(conn_entity) catch {};
                 return;
             };
 
             // Drop the consumed request head; what's left in `buf` is the start of
-            // the frame stream. Do this before flipping `ws_mode` so a parse never
+            // the frame stream. Do this before switching arms so a parse never
             // sees the HTTP head as frame bytes.
             const head_len = head.head_len;
             const leftover = h1c.buf.items.len - head_len;
             if (leftover > 0) std.mem.copyForwards(u8, h1c.buf.items[0..leftover], h1c.buf.items[head_len..]);
             h1c.buf.shrinkRetainingCapacity(leftover);
 
-            h1c.ws_mode = true;
-            h1c.in_flight = false;
+            h1c.acceptFramed(authority, path);
+            const fr = &h1c.state.ws_framed;
 
             var resp: std.ArrayList(u8) = .empty;
             defer resp.deinit(self.allocator);
@@ -4640,7 +4914,7 @@ pub fn H2(comptime opts: Options) type {
                 return;
             };
 
-            h1c.ws_out.appendSlice(self.allocator, resp.items) catch {
+            fr.wr.out.appendSlice(self.allocator, resp.items) catch {
                 self.reg.destroy(conn_entity) catch {};
                 return;
             };
@@ -4656,7 +4930,11 @@ pub fn H2(comptime opts: Options) type {
         /// protocol/size error or OOM fails the connection with a Close frame.
         fn wsDrive(self: *Self, conn_ptr: *Conn, conn_entity: Entity) void {
             const h1c = conn_ptr.h1.?;
-            if (h1c.ws_closing) return;
+            const fr = switch (h1c.state) {
+                .ws_framed => |*fr| fr,
+                else => return,
+            };
+            if (fr.wr.closing) return;
 
             var pos: usize = 0;
             while (true) {
@@ -4681,7 +4959,7 @@ pub fn H2(comptime opts: Options) type {
                     break;
                 };
                 pos += frame.consumed;
-                if (h1c.ws_closing) break;
+                if (fr.wr.closing) break;
             }
 
             // Compact the consumed prefix out of `buf` (the unconsumed tail is the
@@ -4696,45 +4974,36 @@ pub fn H2(comptime opts: Options) type {
 
         /// Dispatch one parsed inbound frame. `frame.payload` borrows the
         /// (unmasked-in-place) connection buffer, so anything retained past this
-        /// call is copied (into `ws_msg` or a `ws_message_out` entity).
+        /// call is copied (into the fragment buffer or a `ws_message_out` entity).
         fn wsHandleFrame(self: *Self, conn_ptr: *Conn, conn_entity: Entity, frame: ws.Frame) !void {
             const h1c = conn_ptr.h1.?;
+            const fr = switch (h1c.state) {
+                .ws_framed => |*fr| fr,
+                else => return,
+            };
             switch (frame.opcode) {
                 // Auto-pong: bounce the application data back; the handler never
                 // sees ping/pong (architecture/websockets.md).
-                .ping => try ws.writeFrame(&h1c.ws_out, self.allocator, .pong, frame.payload),
+                .ping => try ws.writeFrame(&fr.wr.out, self.allocator, .pong, frame.payload),
                 .pong => {},
                 .close => {
                     // Surface the disconnect (piece D → `onDisconnect`) then echo a
                     // Close and tear down once it drains.
                     try self.wsEmitMessage(conn_entity, @intFromEnum(ws.Opcode.close), "");
-                    if (!h1c.ws_closing) {
-                        ws.writeClose(&h1c.ws_out, self.allocator, ws.CloseCode.normal, "") catch {};
-                        h1c.ws_closing = true;
+                    if (!fr.wr.closing) {
+                        ws.writeClose(&fr.wr.out, self.allocator, ws.CloseCode.normal, "") catch {};
+                        fr.wr.closing = true;
                     }
                 },
-                .text, .binary => {
-                    // A new data opener while a fragmented message is open is a
-                    // protocol error (§5.4).
-                    if (h1c.ws_msg_opcode != 0) return error.WsProtocol;
-                    if (frame.fin) {
-                        try self.wsEmitMessage(conn_entity, @intFromEnum(frame.opcode), frame.payload);
-                    } else {
-                        h1c.ws_msg.clearRetainingCapacity();
-                        try h1c.ws_msg.appendSlice(self.allocator, frame.payload);
-                        h1c.ws_msg_opcode = @intFromEnum(frame.opcode);
-                    }
-                },
-                .continuation => {
-                    // A continuation with no opener is a protocol error (§5.4).
-                    if (h1c.ws_msg_opcode == 0) return error.WsProtocol;
-                    if (h1c.ws_msg.items.len + frame.payload.len > Http1Conn.MAX_WS_MESSAGE)
-                        return error.WsProtocol;
-                    try h1c.ws_msg.appendSlice(self.allocator, frame.payload);
-                    if (frame.fin) {
-                        try self.wsEmitMessage(conn_entity, h1c.ws_msg_opcode, h1c.ws_msg.items);
-                        h1c.ws_msg.clearRetainingCapacity();
-                        h1c.ws_msg_opcode = 0;
+                // Data frames: the fragmentation core owns the §5.4 rules + the
+                // running size cap; a completed message surfaces to the consumer.
+                .text, .binary, .continuation => {
+                    switch (try fr.frag.feed(self.allocator, frame.opcode, frame.fin, frame.payload, Http1Conn.MAX_WS_MESSAGE)) {
+                        .pending => {},
+                        .message => |m| {
+                            try self.wsEmitMessage(conn_entity, m.opcode, m.payload);
+                            fr.frag.reset();
+                        },
                     }
                 },
                 _ => return error.WsProtocol,
@@ -4761,34 +5030,36 @@ pub fn H2(comptime opts: Options) type {
         /// `wsFlush` once the Close (and anything ahead of it) drains.
         fn wsClose(self: *Self, conn_ptr: *Conn, conn_entity: Entity, code: u16) void {
             const h1c = conn_ptr.h1.?;
-            if (!h1c.ws_closing) {
-                ws.writeClose(&h1c.ws_out, self.allocator, code, "") catch {};
-                h1c.ws_closing = true;
+            const wr = h1c.wsWrite() orelse return;
+            if (!wr.closing) {
+                ws.writeClose(&wr.out, self.allocator, code, "") catch {};
+                wr.closing = true;
             }
             self.wsFlush(conn_ptr, conn_entity);
         }
 
         /// Flush the per-connection outbound byte queue with exactly one socket
-        /// write in flight (`ws_write_inflight`): preserves frame order on the
+        /// write in flight (`WsWrite.write_inflight`): preserves frame order on the
         /// wire and coalesces a burst into one write. The completion lands in
         /// `writesAccount`, which clears the flag and re-flushes. When a closing
         /// connection has fully drained, reap it.
         fn wsFlush(self: *Self, conn_ptr: *Conn, conn_entity: Entity) void {
             const h1c = conn_ptr.h1.?;
-            if (h1c.ws_write_inflight) return;
-            if (h1c.ws_out.items.len == 0) {
-                if (h1c.ws_closing) self.reg.destroy(conn_entity) catch {};
+            const wr = h1c.wsWrite() orelse return;
+            if (wr.write_inflight) return;
+            if (wr.out.items.len == 0) {
+                if (wr.closing) self.reg.destroy(conn_entity) catch {};
                 return;
             }
-            const data = h1c.ws_out.toOwnedSlice(self.allocator) catch return;
-            h1c.ws_write_inflight = true;
+            const data = wr.out.toOwnedSlice(self.allocator) catch return;
+            wr.write_inflight = true;
             self.http1Send(conn_ptr, conn_entity, data);
         }
 
         /// Piece E (h2 side): drain `ws_send_in` — frames the consumer queued via
         /// `stream.write` — RFC-6455-framing each by opcode onto the connection's
         /// outbound queue. A `close` opcode requests a clean teardown. The entity
-        /// is one-shot (destroyed here); backpressure lives on `ws_out`.
+        /// is one-shot (destroyed here); backpressure lives on `WsWrite.out`.
         fn consumeWsSends(self: *Self) !void {
             const entities = self.ws_send_in.entitySlice();
             const sessions = self.ws_send_in.column(Session);
@@ -4817,7 +5088,11 @@ pub fn H2(comptime opts: Options) type {
                     try self.reg.destroy(ent);
                     continue;
                 };
-                if (!h1c.ws_mode or h1c.ws_closing) {
+                const wr = h1c.wsWrite() orelse {
+                    try self.reg.destroy(ent);
+                    continue;
+                };
+                if (wr.closing) {
                     try self.reg.destroy(ent);
                     continue;
                 }
@@ -4827,7 +5102,7 @@ pub fn H2(comptime opts: Options) type {
                 if (opcode == .close) {
                     self.wsClose(conn_ptr, sess.entity, ws.CloseCode.normal);
                 } else {
-                    ws.writeFrame(&h1c.ws_out, self.allocator, opcode, payload) catch {
+                    ws.writeFrame(&wr.out, self.allocator, opcode, payload) catch {
                         try self.reg.destroy(ent);
                         continue;
                     };
@@ -5048,16 +5323,20 @@ pub fn H2(comptime opts: Options) type {
                 if (!self.reg.isStale(conn_ent.entity)) {
                     if (getConn(self, conn_ent.entity)) |conn_ptr| {
                         if (conn_ptr.h1) |h1c| {
-                            if (h1c.ws_mode) {
-                                // WS backpressure: the single in-flight `ws_out`
-                                // flush drained. Clear the flag and push whatever
+                            if (h1c.wsWrite()) |wr| {
+                                // WS backpressure: the single in-flight flush
+                                // drained. Clear the flag and push whatever
                                 // queued behind it (and reap a drained closing
                                 // conn). On failure the conn is destroyed below.
-                                h1c.ws_write_inflight = false;
+                                // NB: the tunnel 101 lands HERE (wsUpgradeAccept
+                                // flips the arm before sending it) — its
+                                // completion must trigger the first tunnel
+                                // flush, exactly as it always has.
+                                wr.write_inflight = false;
                                 if (!failed) self.wsFlush(conn_ptr, conn_ent.entity);
-                            } else if (!h1c.sending_entity.isNil()) {
-                                const sent = h1c.sending_entity;
-                                h1c.sending_entity = Entity.nil;
+                            } else if (!h1c.state.http1.sending_entity.isNil()) {
+                                const sent = h1c.state.http1.sending_entity;
+                                h1c.state.http1.sending_entity = Entity.nil;
                                 if (self.reg.isInCollection(sent, &self._stream_data_sending)) {
                                     if (failed) {
                                         // The write failed (conn is about to be
@@ -5263,7 +5542,11 @@ pub fn H2(comptime opts: Options) type {
                     conn_ptr.draining = true;
                     conn_ptr.drain_deadline_ns = now + grace_ns;
                 } else if (conn_ptr.h1) |h1c| {
-                    if (h1c.ws_mode) continue;
+                    const st = switch (h1c.state) {
+                        // Live WS conns (framed or tunnel) ride out a drain.
+                        .ws_framed, .ws_tunnel => continue,
+                        .http1 => |*st| st,
+                    };
                     // Destroyable: idle between requests, or `closing`
                     // (response served, Connection: close — that path
                     // never resets `in_flight`; it normally waits for
@@ -5273,18 +5556,21 @@ pub fn H2(comptime opts: Options) type {
                     // the final write reach the kernel before the
                     // graceful close flushes it out.
                     const quiet_ns: u64 = 500 * std.time.ns_per_ms;
-                    const idle_between = !h1c.in_flight and !h1c.body_active and
-                        !h1c.streaming and h1c.sending_entity.isNil();
-                    const close_pending = h1c.closing and h1c.sending_entity.isNil();
+                    const idle_between = !st.in_flight and !st.body_active and
+                        !st.streaming and st.sending_entity.isNil();
+                    const close_pending = h1c.closing and st.sending_entity.isNil();
                     if ((idle_between or close_pending) and
                         conn_ptr.last_active_ns != 0 and
                         now -| conn_ptr.last_active_ns > quiet_ns)
                     {
                         try self.reg.destroy(ent);
                     } else if (!h1c.closing) {
-                        // Mid-request: the response will carry
-                        // Connection: close; a later sweep reaps it.
-                        h1c.keep_alive = false;
+                        // Mid-request — INCLUDING a parked pending Upgrade
+                        // (pending_upgrade ⇒ in_flight): the eventual
+                        // response carries Connection: close; a later sweep
+                        // reaps it. Explicit choice: a drain refuses to
+                        // leave an undecided tunnel park open.
+                        st.keep_alive = false;
                     }
                 }
             }
