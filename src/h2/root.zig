@@ -581,8 +581,9 @@ pub const Http1Conn = struct {
 const WsReassembler = struct {
     allocator: std.mem.Allocator,
     buf: std.ArrayList(u8) = .empty,
-    msg: std.ArrayList(u8) = .empty,
-    msg_opcode: u8 = 0,
+    /// Fragmented-message reassembly — the same `WsFragments` core the h1
+    /// framed arm uses (§4.3: ONE fragmentation state machine, not two).
+    frag: Http1Conn.WsFragments = .{},
     send_buf: std.ArrayList(u8) = .empty,
     /// Our side is done after `send_buf` drains (Close sent / END_STREAM
     /// requested): the provider returns EOF instead of deferring.
@@ -599,7 +600,7 @@ const WsReassembler = struct {
 
     fn free(self: *WsReassembler) void {
         self.buf.deinit(self.allocator);
-        self.msg.deinit(self.allocator);
+        self.frag.deinit(self.allocator);
         self.send_buf.deinit(self.allocator);
         self.allocator.destroy(self);
     }
@@ -1827,36 +1828,24 @@ pub fn H2(comptime opts: Options) type {
                         }
                         resume_send = true;
                     },
-                    .text, .binary => blk: {
-                        if (wr.msg_opcode != 0) {
-                            // Data opener while fragmented msg open.
+                    // Data frames: the shared `WsFragments` core owns the §5.4
+                    // rules + the running size cap. Any feed error — a protocol
+                    // violation, or OOM mid-reassembly (previously a silent
+                    // frame drop that desynced the fragment state) — closes
+                    // with 1002, matching this parser's oversize posture above.
+                    .text, .binary, .continuation => blk: {
+                        const fed = wr.frag.feed(h2.allocator, frame.opcode, frame.fin, frame.payload, Http1Conn.MAX_WS_MESSAGE) catch {
                             ws.writeClose(&wr.send_buf, h2.allocator, ws.CloseCode.protocol_error, "") catch {};
                             wr.closing = true;
                             resume_send = true;
                             break :blk;
-                        }
-                        if (frame.fin) {
-                            h2.wsEmitMessage(s.entity, @intFromEnum(frame.opcode), frame.payload) catch {};
-                        } else {
-                            wr.msg.clearRetainingCapacity();
-                            wr.msg.appendSlice(h2.allocator, frame.payload) catch break :blk;
-                            wr.msg_opcode = @intFromEnum(frame.opcode);
-                        }
-                    },
-                    .continuation => blk: {
-                        if (wr.msg_opcode == 0 or
-                            wr.msg.items.len + frame.payload.len > Http1Conn.MAX_WS_MESSAGE)
-                        {
-                            ws.writeClose(&wr.send_buf, h2.allocator, ws.CloseCode.protocol_error, "") catch {};
-                            wr.closing = true;
-                            resume_send = true;
-                            break :blk;
-                        }
-                        wr.msg.appendSlice(h2.allocator, frame.payload) catch break :blk;
-                        if (frame.fin) {
-                            h2.wsEmitMessage(s.entity, wr.msg_opcode, wr.msg.items) catch {};
-                            wr.msg.clearRetainingCapacity();
-                            wr.msg_opcode = 0;
+                        };
+                        switch (fed) {
+                            .pending => {},
+                            .message => |m| {
+                                h2.wsEmitMessage(s.entity, m.opcode, m.payload) catch {};
+                                wr.frag.reset();
+                            },
                         }
                     },
                     _ => {
