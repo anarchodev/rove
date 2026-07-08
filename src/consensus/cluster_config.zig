@@ -20,9 +20,9 @@
 //! must fail at startup, not elect strangely later.
 
 const std = @import("std");
-const node_mod = @import("node.zig");
+const transport_mod = @import("transport.zig");
 
-pub const PeerAddr = node_mod.PeerAddr;
+pub const PeerAddr = transport_mod.PeerAddr;
 
 pub const Error = error{
     MissingVoters,
