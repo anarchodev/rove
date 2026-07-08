@@ -484,6 +484,314 @@ fn matchEventsToWakes(
 /// AND stage their chunks on the parked unit so the chunks reach the
 /// wire only after raft commits. A fault arm discards both the txn
 /// (rollback) and the staged chunks (`BufferedSendKvOps.deinit`).
+/// Which Msg-tape the stream-family log records carry (per-capture
+/// materialization; see `finishContResume`'s twin in worker_drain.zig
+/// for why the order is part of the wire format).
+const StreamTape = enum { none, fetch };
+
+inline fn streamTapes(worker: anytype, comptime tape: StreamTape, ctx: *const StreamFinishCtx) log_mod.TapePayloads {
+    return switch (tape) {
+        .none => .{},
+        .fetch => worker_mod.captureFetchChunkTapes(worker, ctx.readset, ctx.tape_body, ctx.tape_ev.?),
+    };
+}
+
+/// Comptime per-site axes of `finishStreamResume` — everything else the
+/// two stream-family sites do is identical.
+const StreamFinishSpec = struct {
+    /// Operator warn-log tag ("stream-resume" / "bound-fetch stream").
+    site: []const u8,
+    /// Invariant-violation site prefix ("resumeStream" /
+    /// "resumeBoundFetchStream").
+    panic_site: []const u8,
+    /// Cancel sibling bound-fetch binds when the chain goes terminal.
+    cancel_binds: bool,
+    tape: StreamTape,
+};
+
+/// Runtime context for `finishStreamResume` (the stream-family sibling
+/// of worker_drain's `ContFinishCtx`). All pointers borrow the caller's
+/// locals for the duration of the call.
+const StreamFinishCtx = struct {
+    ent: rove.Entity,
+    ws: *kv_mod.WriteSet,
+    txn: *kv_mod.KvStore.TrackedTxn,
+    readset: *tape_mod.Readset,
+    chain_ctx: *components_mod.ChainContext,
+    chain_st: *components_mod.StreamChain,
+    chunks_st: *components_mod.StreamChunks,
+    wakes_st: *components_mod.StreamWakes,
+    request_id: u64,
+    now_ns: i64,
+    deployment_id: u64,
+    wrote: bool,
+    txn_owned: *bool,
+    txn_done: *bool,
+    /// Runtime activation source (`resumeStream` flips wake kinds;
+    /// the bound-fetch site is always `.fetch_chunk`).
+    act: log_mod.ActivationSource,
+    pending_fetches: *std.ArrayListUnmanaged(globals.PendingFetch),
+    /// Tape sources for `StreamTape.fetch`.
+    tape_body: []const u8 = "",
+    tape_ev: ?worker_mod.FetchEvent = null,
+};
+
+/// §2.2 (refactor-audit): the ONE outcome-finishing switch for the two
+/// stream-family resume sites — `resumeStream` (timer/kv/send wakes on a
+/// live stream) and `resumeBoundFetchStream` (bound-fetch chunks after
+/// the cont→stream transition). Siblings: `finishContResume`
+/// (worker_drain.zig) and `finishWsResume` (worker_ws.zig).
+///
+/// Arms: terminal-with-exception → rollback + drain + log; terminal-with-
+/// writes → stage body + draining flag on the parked unit, propose via
+/// `proposeForgetfulWrites` (commit-gated release, streaming-model.md §2);
+/// terminal-read-only → commit + flush + final chunk + drain;
+/// continuation → 501 (stream→cont transition out of scope); stream →
+/// stage/ship chunks + swap ctx/interval/kv-prefix registrations;
+/// no-export probe → defined 500. Draining always via
+/// `markStreamDrainingAnywhere` (it handles both the steady-state
+/// `stream_data_out` home and the post-commit `stream_response_in`
+/// stopover — the narrower verb the wake site used was vestigial).
+/// Read-only commits panic on failure (resumes run inside the chain
+/// lease; `commitReadOnlyFire` is the out-of-lease exception).
+fn finishStreamResume(
+    worker: anytype,
+    comptime spec: StreamFinishSpec,
+    oc: *dispatcher_mod.RunOutcome,
+    ctx: StreamFinishCtx,
+) void {
+    const allocator = worker.allocator;
+    const server = worker.h2;
+    const dep_id = ctx.deployment_id;
+    const tid = ctx.chain_ctx.tenant_id;
+    const corr = ctx.chain_ctx.correlation_id;
+    const mpath = ctx.chain_st.module_path;
+    switch (oc.*) {
+        .terminal => |*r| {
+            defer r.deinit(allocator);
+            if (comptime spec.cancel_binds) worker_mod.scanAndCancelBoundFetches(worker, ctx.ent);
+            if (r.exception.len > 0) {
+                ctx.txn.rollback() catch {};
+                ctx.txn_done.* = true;
+                markStreamDrainingAnywhere(server, ctx.ent);
+                captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, r.console, r.exception, streamTapes(worker, spec.tape, &ctx), corr, r.tags, ctx.act, 0);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            if (ctx.wrote) {
+                // Terminal + writes — stage the body chunk + the draining
+                // flag on the parked unit so they apply only after raft
+                // commits (`streaming-model.md` §2 rule): the parked_units
+                // commit arm (via `transferStagedChunks`) is the single
+                // release point; a raft fault during the commit-wait window
+                // must not ship a terminal frame whose writes never landed.
+                var stage: StreamResumeStage = .{ .entity = ctx.ent, .mark_draining = true };
+                defer {
+                    for (stage.chunks.items) |c| allocator.free(c);
+                    stage.chunks.deinit(allocator);
+                }
+                if (r.body.len > 0) {
+                    staged: {
+                        const owned = allocator.dupe(u8, r.body) catch break :staged;
+                        stage.chunks.append(allocator, owned) catch {
+                            allocator.free(owned);
+                            break :staged;
+                        };
+                        break :staged;
+                    }
+                    if (stage.chunks.items.len == 0) {
+                        // Defined failure: never propagate out of a resume
+                        // with the stream half-mutated, never silently drop
+                        // the writes.
+                        ctx.txn.rollback() catch {};
+                        ctx.txn_done.* = true;
+                        markStreamDrainingAnywhere(server, ctx.ent);
+                        captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, r.console, r.exception, streamTapes(worker, spec.tape, &ctx), corr, r.tags, ctx.act, 0);
+                        r.console = &.{};
+                        r.exception = &.{};
+                        return;
+                    }
+                }
+                const lh_term = fireLogHeader(ctx.request_id, dep_id, @intCast(@max(@min(r.status, 599), 100)), ctx.act, mpath, corr);
+                const fw_seq = proposeForgetfulWrites(worker, ctx.ws, ctx.txn, tid, &stage, ctx.pending_fetches, ctx.readset, lh_term) catch |perr| {
+                    std.log.warn("rove-js " ++ spec.site ++ " (terminal + writes): propose failed: {s}", .{@errorName(perr)});
+                    ctx.txn_owned.* = false;
+                    ctx.txn_done.* = true;
+                    // No commit gate to wait for — close the stream now so
+                    // the customer sees a defined 500 rather than a
+                    // half-open stream. The helper already freed
+                    // `stage.chunks`; the defer is a no-op.
+                    markStreamDrainingAnywhere(server, ctx.ent);
+                    captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .fault, r.console, r.exception, streamTapes(worker, spec.tape, &ctx), corr, r.tags, ctx.act, 0);
+                    r.console = &.{};
+                    r.exception = &.{};
+                    return;
+                };
+                ctx.txn_owned.* = false;
+                ctx.txn_done.* = true;
+                // `markStreamDrainingAnywhere` does NOT fire here — the
+                // commit arm flips it via `stage.mark_draining` strictly
+                // after the body lands in StreamChunks. Until then the
+                // stream stays alive; on commit the serviceParkedStreams
+                // tick drains the chunk and closes (chunks-empty +
+                // is_draining).
+                ctx.chain_st.activation_count += 1;
+                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+                captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, st, .ok, r.console, r.exception, streamTapes(worker, spec.tape, &ctx), corr, r.tags, ctx.act, fw_seq);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            // Clean read-only terminal: flush the body as one last chunk +
+            // flag close_pending. Empty body = close immediately on the
+            // next service tick.
+            ctx.txn.commit() catch |e| panic_mod.invariantViolated(
+                spec.panic_site ++ ".commit(terminal_ro)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            ctx.txn_done.* = true;
+            flushFireFetches(worker, ctx.pending_fetches);
+            if (r.body.len > 0) {
+                // Post-commit: never propagate (half-mutated chain state)
+                // and never silently return — close loudly without the
+                // final chunk if it can't be staged. tryAppend frees the
+                // chunk on error — no free here.
+                if (allocator.dupe(u8, r.body)) |owned| {
+                    ctx.chunks_st.tryAppend(allocator, owned) catch |e| {
+                        std.log.err("rove-js " ++ spec.site ++ ": terminal chunk append failed ({s}) — closing", .{@errorName(e)});
+                    };
+                } else |e| std.log.err("rove-js " ++ spec.site ++ ": terminal body dupe failed ({s}) — closing without it", .{@errorName(e)});
+            }
+            markStreamDrainingAnywhere(server, ctx.ent);
+            ctx.chain_st.activation_count += 1;
+            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+            captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, st, .ok, r.console, r.exception, streamTapes(worker, spec.tape, &ctx), corr, r.tags, ctx.act, 0);
+            r.console = &.{};
+            r.exception = &.{};
+        },
+        .continuation => |*cval| {
+            // Stream-resume → __rove_next: would transition the chain from
+            // a stream into a one-shot continuation, which requires moving
+            // the entity out of the stream pipeline and into
+            // parked_continuations. Out of scope — a defined 501.
+            cval.deinit(allocator);
+            ctx.txn.rollback() catch {};
+            ctx.txn_done.* = true;
+            markStreamDrainingAnywhere(server, ctx.ent);
+            captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 501, .handler_error, &.{}, &.{}, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0);
+        },
+        .stream => |*s2| {
+            // stream + writes — stage `s2.chunks` on the parked unit so
+            // they ship only after raft commits (§2 rule). The internal-
+            // state updates below (ctx_json / interval / kv_prefixes /
+            // activation_count) stay eager — the rule covers chunks
+            // reaching the wire, not per-stream runtime state; handlers
+            // re-read kv every activation so a fault leaving ctx ahead of
+            // durable kv is recoverable by the customer.
+            var stage: StreamResumeStage = .{ .entity = ctx.ent, .mark_draining = false };
+            defer {
+                for (stage.chunks.items) |c| allocator.free(c);
+                stage.chunks.deinit(allocator);
+            }
+            // fw_seq: the propose seq in the wrote case, 0 read-only.
+            var fw_seq: u64 = 0;
+            if (ctx.wrote) {
+                // Move s2.chunks → stage.chunks BEFORE the propose so a
+                // propose failure frees them via the helper.
+                if (s2.chunks.len > 0) {
+                    stage.chunks.ensureUnusedCapacity(allocator, s2.chunks.len) catch {
+                        // Defined failure (one site propagated here, the
+                        // other swallowed the error and then
+                        // appendAssumeCapacity'd into missing capacity).
+                        s2.deinit(allocator);
+                        ctx.txn.rollback() catch {};
+                        ctx.txn_done.* = true;
+                        markStreamDrainingAnywhere(server, ctx.ent);
+                        captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, &.{}, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0);
+                        return;
+                    };
+                    for (s2.chunks) |c| stage.chunks.appendAssumeCapacity(c);
+                    allocator.free(s2.chunks);
+                    s2.chunks = &.{};
+                }
+                const lh_stream = fireLogHeader(ctx.request_id, dep_id, 200, ctx.act, mpath, corr);
+                fw_seq = proposeForgetfulWrites(worker, ctx.ws, ctx.txn, tid, &stage, ctx.pending_fetches, ctx.readset, lh_stream) catch |perr| {
+                    std.log.warn("rove-js " ++ spec.site ++ " (stream + writes): propose failed: {s}", .{@errorName(perr)});
+                    // Helper already freed `stage.chunks` (the outer defer
+                    // is now a no-op). Free what's left on the outcome
+                    // struct (headers / ctx_json / kv_prefixes — the
+                    // chunks slice is already `&.{}`).
+                    s2.deinit(allocator);
+                    ctx.txn_owned.* = false;
+                    ctx.txn_done.* = true;
+                    markStreamDrainingAnywhere(server, ctx.ent);
+                    captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .fault, &.{}, &.{}, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0);
+                    return;
+                };
+                ctx.txn_owned.* = false;
+                ctx.txn_done.* = true;
+            } else {
+                ctx.txn.commit() catch |e| panic_mod.invariantViolated(
+                    spec.panic_site ++ ".commit(stream_ro)",
+                    "err={s}",
+                    .{@errorName(e)},
+                );
+                ctx.txn_done.* = true;
+                flushFireFetches(worker, ctx.pending_fetches);
+            }
+            // Headers on subsequent hops are ignored (the stream's initial
+            // response headers already shipped); free them.
+            if (s2.headers) |h| allocator.free(h);
+            s2.headers = null;
+            // Ship read-only chunks immediately via the §9.4 cap-aware
+            // enqueue (on the wrote path `s2.chunks` is already `&.{}` —
+            // moved into `stage` above; this loop no-ops). Lossless: the
+            // producer-pacing gate keeps the queue below the soft cap, so
+            // the hard cap is only reachable if one chunk alone exceeds it
+            // — close loudly, never silently drop. tryAppend owns/frees
+            // the chunk on error.
+            for (s2.chunks) |c| ctx.chunks_st.tryAppend(allocator, c) catch |e| {
+                std.log.err("rove-js " ++ spec.site ++ ": chunk append failed ({s}) — closing", .{@errorName(e)});
+                markStreamDrainingAnywhere(server, ctx.ent);
+            };
+            if (s2.chunks.len > 0) allocator.free(s2.chunks);
+            s2.chunks = &.{};
+            // Replace ctx + interval on the component (ownership
+            // transfers from the descriptor).
+            if (ctx.chain_st.ctx_json.len > 0) allocator.free(ctx.chain_st.ctx_json);
+            ctx.chain_st.ctx_json = s2.ctx_json;
+            s2.ctx_json = &.{};
+            if (s2.interval_ms) |iv| {
+                ctx.wakes_st.interval_ms = iv;
+                ctx.wakes_st.next_wake_ns = ctx.now_ns + iv * std.time.ns_per_ms;
+            } else {
+                ctx.wakes_st.interval_ms = 0;
+                ctx.wakes_st.next_wake_ns = std.math.maxInt(i64);
+            }
+            // Replace the StreamWakes kv-wake registration with whatever
+            // the handler returned: free old prefixes, take ownership of
+            // the new ones (the (tenant, prefix) registry is a derived
+            // view recomputed on every match scan — no unregister step).
+            for (ctx.wakes_st.kv_prefixes) |p| allocator.free(p);
+            if (ctx.wakes_st.kv_prefixes.len > 0) allocator.free(ctx.wakes_st.kv_prefixes);
+            ctx.wakes_st.kv_prefixes = s2.kv_prefixes;
+            s2.kv_prefixes = &.{};
+            ctx.chain_st.activation_count += 1;
+            captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 200, .ok, &.{}, &.{}, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, fw_seq);
+        },
+        // Only `.inbound_headers` / `.inbound_chunk` activations produce
+        // these; stream resumes never dispatch as one. Defined failure.
+        .no_onheaders, .no_onchunk => {
+            ctx.txn.rollback() catch {};
+            ctx.txn_done.* = true;
+            markStreamDrainingAnywhere(server, ctx.ent);
+            captureLogWithId(worker, tid, ctx.request_id, "POST", mpath, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, &.{}, streamTapes(worker, spec.tape, &ctx), corr, &.{}, ctx.act, 0);
+        },
+    }
+}
+
 fn resumeStream(
     worker: anytype,
     ent: rove.Entity,
@@ -625,247 +933,29 @@ fn resumeStream(
 
     const wrote = ws.ops.items.len > 0;
     var oc = run_oc;
-    switch (oc) {
-        .terminal => |*r| {
-            defer r.deinit(allocator);
-            if (r.exception.len > 0) {
-                txn.rollback() catch {};
-                txn_done = true;
-                markStreamDraining(server, ent);
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, r.tags, activation, 0);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            // Effect-reification Phase 4.0.b: terminal + writes —
-            // stage the body chunk + the draining flag on the
-            // parked unit so they apply only after raft commits
-            // (`streaming-model.md` §2 rule). Pre-fix this arm
-            // queued the body into StreamChunks AND fired
-            // `markStreamDraining` immediately, both eagerly — a
-            // raft fault during the commit-wait window would close
-            // the stream and ship the terminal frame whose writes
-            // never durably landed. Post-fix the parked_units
-            // commit arm (via `transferStagedChunks`) is the single
-            // release point.
-            if (wrote) {
-                var stage: StreamResumeStage = .{
-                    .entity = ent,
-                    .mark_draining = true,
-                };
-                defer {
-                    for (stage.chunks.items) |c| allocator.free(c);
-                    stage.chunks.deinit(allocator);
-                }
-                if (r.body.len > 0) {
-                    staged: {
-                        const owned = allocator.dupe(u8, r.body) catch break :staged;
-                        stage.chunks.append(allocator, owned) catch {
-                            allocator.free(owned);
-                            break :staged;
-                        };
-                        break :staged;
-                    }
-                    if (stage.chunks.items.len == 0) {
-                        // Defined failure (matches the cont-family posture):
-                        // never propagate out of a resume with the stream
-                        // half-mutated, never silently drop the writes.
-                        txn.rollback() catch {};
-                        txn_done = true;
-                        markStreamDraining(server, ent);
-                        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, r.tags, activation, 0);
-                        r.console = &.{};
-                        r.exception = &.{};
-                        return;
-                    }
-                }
-                const lh_term = fireLogHeader(request_id, tc.snap.deployment_id, @intCast(@max(@min(r.status, 599), 100)), activation, chain_st.module_path, chain_ctx.correlation_id);
-                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &pending_fetches, &readset, lh_term) catch |perr| {
-                    std.log.warn("rove-js stream-resume (terminal + writes): propose failed: {s}", .{@errorName(perr)});
-                    txn_owned = false;
-                    txn_done = true;
-                    // No commit gate to wait for — close the stream
-                    // now so the customer sees a defined 500 rather
-                    // than a half-open stream. Helper has already
-                    // freed `stage.chunks`; the defer is a no-op.
-                    markStreamDraining(server, ent);
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, .{}, chain_ctx.correlation_id, r.tags, activation, 0);
-                    r.console = &.{};
-                    r.exception = &.{};
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                // `markStreamDraining` does NOT fire here — the
-                // commit arm flips it via `stage.mark_draining`
-                // strictly after the body lands in StreamChunks.
-                // Until then the stream stays alive; on commit the
-                // serviceParkedStreams tick drains the chunk and
-                // then closes (chunks-empty + is_draining).
-                chain_st.activation_count += 1;
-                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, r.tags, activation, fw_seq);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            // Clean read-only terminal: flush the body as one last
-            // chunk + flag close_pending. Empty body = close
-            // immediately on the next service tick.
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "resumeStream.commit(terminal)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            flushFireFetches(worker, &pending_fetches);
-            if (r.body.len > 0) {
-                // Post-commit: never propagate (half-mutated chain state) and
-                // never silently return — close loudly without the final
-                // chunk if it can't be staged (matches the bound-fetch
-                // stream's posture).
-                if (allocator.dupe(u8, r.body)) |owned| {
-                    // tryAppend frees the chunk on error — no free here.
-                    chunks_st.tryAppend(allocator, owned) catch |e| {
-                        std.log.err("rove-js stream-resume: terminal chunk append failed ({s}) — closing", .{@errorName(e)});
-                    };
-                } else |e| std.log.err("rove-js stream-resume: terminal body dupe failed ({s}) — closing without it", .{@errorName(e)});
-            }
-            markStreamDraining(server, ent);
-            chain_st.activation_count += 1;
-            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, chain_ctx.correlation_id, r.tags, activation, 0);
-            r.console = &.{};
-            r.exception = &.{};
-        },
-        .continuation => |*cval| {
-            // Stream-resume → __rove_next: would transition the
-            // chain from a stream into a one-shot continuation,
-            // which requires moving the entity out of the stream
-            // pipeline and into parked_continuations. Out of scope
-            // for Phase 4 — close with a defined 501.
-            cval.deinit(allocator);
-            txn.rollback() catch {};
-            txn_done = true;
-            markStreamDraining(server, ent);
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, activation, 0);
-        },
-        .stream => |*s2| {
-            // Effect-reification Phase 4.0.b: stream + writes —
-            // stage `s2.chunks` on the parked unit so they ship
-            // only after raft commits (`streaming-model.md` §2
-            // rule). The internal-state updates further down
-            // (ctx_json / interval / kv_prefixes / activation_count)
-            // stay eager — the §2 rule covers chunks reaching the
-            // wire, not per-stream runtime state; handlers re-read
-            // kv on every activation so a fault leaving ctx
-            // ahead of durable kv is recoverable by the customer.
-            var stage: StreamResumeStage = .{
-                .entity = ent,
-                .mark_draining = false,
-            };
-            defer {
-                for (stage.chunks.items) |c| allocator.free(c);
-                stage.chunks.deinit(allocator);
-            }
-            // Phase 5b-1: hoist fw_seq so the post-block captureLog
-            // stamps the propose seq in the wrote case and 0 in the
-            // read-only case (no propose ran).
-            var fw_seq: u64 = 0;
-            if (wrote) {
-                // Move s2.chunks → stage.chunks BEFORE the propose
-                // so a propose failure frees them via the helper.
-                if (s2.chunks.len > 0) {
-                    try stage.chunks.ensureUnusedCapacity(allocator, s2.chunks.len);
-                    for (s2.chunks) |c| stage.chunks.appendAssumeCapacity(c);
-                    allocator.free(s2.chunks);
-                    s2.chunks = &.{};
-                }
-                const lh_stream = fireLogHeader(request_id, tc.snap.deployment_id, 200, activation, chain_st.module_path, chain_ctx.correlation_id);
-                fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &pending_fetches, &readset, lh_stream) catch |perr| {
-                    std.log.warn("rove-js stream-resume (stream + writes): propose failed: {s}", .{@errorName(perr)});
-                    // Helper already freed `stage.chunks` (the
-                    // outer defer is now a no-op). Free what's
-                    // left on the outcome struct (headers /
-                    // ctx_json / kv_prefixes — chunks slice is
-                    // already `&.{}`).
-                    s2.deinit(allocator);
-                    txn_owned = false;
-                    txn_done = true;
-                    markStreamDraining(server, ent);
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, activation, 0);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-            } else {
-                txn.commit() catch |e| panic_mod.invariantViolated(
-                    "resumeStream.commit(stream)",
-                    "err={s}",
-                    .{@errorName(e)},
-                );
-                txn_done = true;
-                flushFireFetches(worker, &pending_fetches);
-            }
-            // Headers on subsequent hops are ignored (the stream's
-            // initial response headers already shipped); free them.
-            if (s2.headers) |h| allocator.free(h);
-            s2.headers = null;
-            // Transfer chunks into the StreamChunks component's
-            // queue via the §9.4 cap-aware enqueue. `tryAppend`
-            // takes ownership of each chunk pointer; cap-overflow
-            // frees the chunk + increments `dropped_chunks` (the
-            // next activation surfaces it via write_pressure).
-            // Phase 4.0.b: on the `wrote` path, `s2.chunks` is
-            // already `&.{}` (moved into `stage` above); this loop
-            // no-ops there. On the read-only path it ships the
-            // chunks immediately — no raft propose, no commit gate.
-            // tryAppend frees the chunk on error. Lossless posture (matches
-            // the bound-fetch stream): a failed append closes the stream
-            // loudly rather than silently continuing minus a chunk.
-            for (s2.chunks) |c| chunks_st.tryAppend(allocator, c) catch |e| {
-                std.log.err("rove-js stream-resume: chunk append failed ({s}) — closing", .{@errorName(e)});
-                markStreamDraining(server, ent);
-            };
-            if (s2.chunks.len > 0) allocator.free(s2.chunks);
-            s2.chunks = &.{};
-            // Replace ctx + interval on the component. Old ctx_json
-            // is freed; new one is taken from the descriptor
-            // (transfer ownership).
-            if (chain_st.ctx_json.len > 0) allocator.free(chain_st.ctx_json);
-            chain_st.ctx_json = s2.ctx_json;
-            s2.ctx_json = &.{};
-            if (s2.interval_ms) |iv| {
-                wakes_st.interval_ms = iv;
-                wakes_st.next_wake_ns = now_ns + iv * std.time.ns_per_ms;
-            } else {
-                wakes_st.interval_ms = 0;
-                wakes_st.next_wake_ns = std.math.maxInt(i64);
-            }
-            // Replace the StreamWakes' kv-wake registration with
-            // whatever the handler returned. Phase 3 v1 keeps
-            // re-registration simple: free old prefixes, take
-            // ownership of the new ones. The (tenant, prefix)
-            // registry is a derived view recomputed on every match
-            // scan, so there's no separate unregister/re-register
-            // step needed.
-            for (wakes_st.kv_prefixes) |p| allocator.free(p);
-            if (wakes_st.kv_prefixes.len > 0) allocator.free(wakes_st.kv_prefixes);
-            wakes_st.kv_prefixes = s2.kv_prefixes;
-            s2.kv_prefixes = &.{};
-            chain_st.activation_count += 1;
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, activation, fw_seq);
-        },
-        // Only `.inbound_headers` / `.inbound_chunk` activations
-        // produce these; stream resumes never dispatch as one.
-        // Defined failure.
-        .no_onheaders, .no_onchunk => {
-            txn.rollback() catch {};
-            txn_done = true;
-            markStreamDraining(server, ent);
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, activation, 0);
-        },
-    }
+    finishStreamResume(worker, .{
+        .site = "stream-resume",
+        .panic_site = "resumeStream",
+        .cancel_binds = false,
+        .tape = .none,
+    }, &oc, .{
+        .ent = ent,
+        .ws = &ws,
+        .txn = txn,
+        .readset = &readset,
+        .chain_ctx = chain_ctx,
+        .chain_st = chain_st,
+        .chunks_st = chunks_st,
+        .wakes_st = wakes_st,
+        .request_id = request_id,
+        .now_ns = now_ns,
+        .deployment_id = tc.snap.deployment_id,
+        .wrote = wrote,
+        .txn_owned = &txn_owned,
+        .txn_done = &txn_done,
+        .act = activation,
+        .pending_fetches = &pending_fetches,
+    });
 }
 
 /// `docs/streaming-model.md` §7 item 1 (Gap #1 follow-up):
@@ -1066,184 +1156,31 @@ pub fn resumeBoundFetchStream(
     };
 
     const wrote = ws.ops.items.len > 0;
-    switch (oc) {
-        .terminal => |*r| {
-            defer r.deinit(allocator);
-            // Chain going terminal — cancel sibling binds (same
-            // pattern as resumeBoundFetchChain's terminal arm).
-            worker_mod.scanAndCancelBoundFetches(worker, ent);
-            if (r.exception.len > 0) {
-                txn.rollback() catch {};
-                txn_done = true;
-                markStreamDrainingAnywhere(server, ent);
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, r.tags, .fetch_chunk, 0);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            if (wrote) {
-                var stage: StreamResumeStage = .{ .entity = ent, .mark_draining = true };
-                defer {
-                    for (stage.chunks.items) |c| allocator.free(c);
-                    stage.chunks.deinit(allocator);
-                }
-                if (r.body.len > 0) {
-                    staged: {
-                        const owned = allocator.dupe(u8, r.body) catch break :staged;
-                        stage.chunks.append(allocator, owned) catch {
-                            allocator.free(owned);
-                            break :staged;
-                        };
-                        break :staged;
-                    }
-                    if (stage.chunks.items.len == 0) {
-                        // Defined failure (was a SILENT return: no draining
-                        // mark, no log — the held stream just hung).
-                        txn.rollback() catch {};
-                        txn_done = true;
-                        markStreamDrainingAnywhere(server, ent);
-                        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, r.tags, .fetch_chunk, 0);
-                        r.console = &.{};
-                        r.exception = &.{};
-                        return;
-                    }
-                }
-                const lh_term = fireLogHeader(request_id, tc.snap.deployment_id, @intCast(@max(@min(r.status, 599), 100)), .fetch_chunk, chain_st.module_path, chain_ctx.correlation_id);
-                const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &pending_fetches, &readset, lh_term) catch |perr| {
-                    std.log.warn("rove-js bound-fetch stream (terminal + writes): propose failed: {s}", .{@errorName(perr)});
-                    txn_owned = false;
-                    txn_done = true;
-                    markStreamDrainingAnywhere(server, ent);
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, r.console, r.exception, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, r.tags, .fetch_chunk, 0);
-                    r.console = &.{};
-                    r.exception = &.{};
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                chain_st.activation_count += 1;
-                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, r.tags, .fetch_chunk, fw_seq);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            // Read-only terminal: flush + drain-then-close.
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "resumeBoundFetchStream.commit(terminal_ro)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            flushFireFetches(worker, &pending_fetches);
-            if (r.body.len > 0) {
-                // Lossless: never silently drop. The producer-pacing gate
-                // keeps the queue below the soft cap, so this can only fail if
-                // a single chunk blows the hard cap — close loudly, don't drop
-                // (a dupe failure was a SILENT return that skipped the
-                // draining mark + log below).
-                if (allocator.dupe(u8, r.body)) |owned| {
-                    // tryAppend frees the chunk on error — no free here.
-                    chunks_st.tryAppend(allocator, owned) catch |e| {
-                        std.log.err("rove-js bound-fetch stream: terminal chunk append failed ({s}) — closing", .{@errorName(e)});
-                    };
-                } else |e| std.log.err("rove-js bound-fetch stream: terminal body dupe failed ({s}) — closing without it", .{@errorName(e)});
-            }
-            markStreamDrainingAnywhere(server, ent);
-            chain_st.activation_count += 1;
-            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, r.tags, .fetch_chunk, 0);
-            r.console = &.{};
-            r.exception = &.{};
-        },
-        .continuation => |*cval| {
-            // Stream→cont transition out of scope (same as
-            // resumeStream's .continuation arm — 501 + draining).
-            cval.deinit(allocator);
-            txn.rollback() catch {};
-            txn_done = true;
-            markStreamDrainingAnywhere(server, ent);
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 501, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
-        },
-        .stream => |*s2| {
-            // stream({write}) on a stream-state chain: append write
-            // bytes to StreamChunks (commit-gated on the wrote path,
-            // immediate on read-only). Mirrors resumeStream's
-            // .stream arm exactly.
-            var stage: StreamResumeStage = .{ .entity = ent, .mark_draining = false };
-            defer {
-                for (stage.chunks.items) |c| allocator.free(c);
-                stage.chunks.deinit(allocator);
-            }
-            var fw_seq: u64 = 0;
-            if (wrote) {
-                if (s2.chunks.len > 0) {
-                    stage.chunks.ensureUnusedCapacity(allocator, s2.chunks.len) catch {};
-                    for (s2.chunks) |c| stage.chunks.appendAssumeCapacity(c);
-                    allocator.free(s2.chunks);
-                    s2.chunks = &.{};
-                }
-                const lh_stream = fireLogHeader(request_id, tc.snap.deployment_id, 200, .fetch_chunk, chain_st.module_path, chain_ctx.correlation_id);
-                fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &pending_fetches, &readset, lh_stream) catch |perr| {
-                    std.log.warn("rove-js bound-fetch stream (stream + writes): propose failed: {s}", .{@errorName(perr)});
-                    s2.deinit(allocator);
-                    txn_owned = false;
-                    txn_done = true;
-                    markStreamDrainingAnywhere(server, ent);
-                    captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .fault, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-            } else {
-                txn.commit() catch |e| panic_mod.invariantViolated(
-                    "resumeBoundFetchStream.commit(stream_ro)",
-                    "err={s}",
-                    .{@errorName(e)},
-                );
-                txn_done = true;
-                flushFireFetches(worker, &pending_fetches);
-            }
-            // Headers on subsequent hops ignored; free.
-            if (s2.headers) |h| allocator.free(h);
-            s2.headers = null;
-            // Lossless: the producer-pacing gate (dispatchSpoolHead) keeps the
-            // queue below the soft cap before dispatching this chunk, so the
-            // hard cap is only reachable if one chunk alone exceeds it — close
-            // loudly rather than silently drop (tryAppend frees `c` on error).
-            for (s2.chunks) |c| chunks_st.tryAppend(allocator, c) catch |e| {
-                std.log.err("rove-js bound-fetch stream: chunk append failed ({s}) — closing", .{@errorName(e)});
-                markStreamDrainingAnywhere(server, ent);
-            };
-            if (s2.chunks.len > 0) allocator.free(s2.chunks);
-            s2.chunks = &.{};
-            if (chain_st.ctx_json.len > 0) allocator.free(chain_st.ctx_json);
-            chain_st.ctx_json = s2.ctx_json;
-            s2.ctx_json = &.{};
-            if (s2.interval_ms) |iv| {
-                wakes_st.interval_ms = iv;
-                wakes_st.next_wake_ns = now_ns + iv * std.time.ns_per_ms;
-            } else {
-                wakes_st.interval_ms = 0;
-                wakes_st.next_wake_ns = std.math.maxInt(i64);
-            }
-            for (wakes_st.kv_prefixes) |p| allocator.free(p);
-            if (wakes_st.kv_prefixes.len > 0) allocator.free(wakes_st.kv_prefixes);
-            wakes_st.kv_prefixes = s2.kv_prefixes;
-            s2.kv_prefixes = &.{};
-            chain_st.activation_count += 1;
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 200, .ok, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, &.{}, .fetch_chunk, fw_seq);
-        },
-        // Only `.inbound_headers` / `.inbound_chunk` activations
-        // produce these; stream resumes never dispatch as one.
-        // Defined failure.
-        .no_onheaders, .no_onchunk => {
-            txn.rollback() catch {};
-            txn_done = true;
-            markStreamDrainingAnywhere(server, ent);
-            captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
-        },
-    }
+    finishStreamResume(worker, .{
+        .site = "bound-fetch stream",
+        .panic_site = "resumeBoundFetchStream",
+        .cancel_binds = true,
+        .tape = .fetch,
+    }, &oc, .{
+        .ent = ent,
+        .ws = &ws,
+        .txn = txn,
+        .readset = &readset,
+        .chain_ctx = chain_ctx,
+        .chain_st = chain_st,
+        .chunks_st = chunks_st,
+        .wakes_st = wakes_st,
+        .request_id = request_id,
+        .now_ns = now_ns,
+        .deployment_id = tc.snap.deployment_id,
+        .wrote = wrote,
+        .txn_owned = &txn_owned,
+        .txn_done = &txn_done,
+        .act = .fetch_chunk,
+        .pending_fetches = &pending_fetches,
+        .tape_body = body,
+        .tape_ev = fetch_ev,
+    });
 }
 
 // ── Activation firers ───────────────────────────────────────────────────
