@@ -74,6 +74,7 @@ them 2026-06-29: its as-built mechanism folded into
 - replay-wasm-plan.md — WASM replay UI (§8.6+ deferred); **moved 2026-07-01 to the private rewind-apps repo (`replay/replay-wasm-plan.md`), alongside the porcelain it describes**
 - [sim-test-framework.md](plans/sim-test-framework.md) · [fixture-lifecycle.md](plans/fixture-lifecycle.md) · [agent-surface.md](plans/agent-surface.md) — replay/sim/agent surface (Phase 12–14)
 - [consensus-robustness-backlog.md](plans/consensus-robustness-backlog.md) — open consensus hardening residue (fail-loud fixes, a CP move/provision UAF, the power-loss/`dm-flakey` crash-consistency validation gap) + the governing error-classification + pin-coordination conventions. Consolidates the retired `raft-correctness-plan` + 2026-06-20 storage triage
+- [refactor-audit-2026-07.md](plans/refactor-audit-2026-07.md) — whole-codebase correctness/clarity audit: 4 latent drift bugs (§1), the finishOutcome unification (§2), god-struct/file splits + cross-binary dedup per subsystem, Zig→JS status ("no new lifts"), verified non-findings (§9), sequenced waves (§10)
 
 ## Product & strategy
 
