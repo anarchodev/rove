@@ -59,6 +59,25 @@ export default function () {
 // chunk relays its bytes. The final event closes the held connection.
 export function onChunk() {
   const a = request.activation;
+  // Honor the upstream read's outcome on the terminal event. A failed
+  // (missing blob / S3 error / timeout) or truncated file-blobs read
+  // must NOT be served — and strong-ETag cached — as a well-formed 200.
+  // Every sibling {on} builtin gates on request.ok; static must too.
+  // (`ok`/`status`/`bodyTruncated` are only set on the final event.)
+  if (a.final && (!a.ok || a.status < 200 || a.status >= 300 || a.bodyTruncated)) {
+    if (a.seq === 0) {
+      // First-and-final chunk (e.g. a missing blob): nothing streamed,
+      // the response head isn't committed yet — send a clean 502.
+      response.status = 502;
+      return "static asset read failed (status " + a.status + ")";
+    }
+    // The head was committed on an earlier chunk, so the status can't
+    // change; abort the held stream (throw → RST) so the client sees an
+    // incomplete transfer rather than a well-formed empty/partial 200.
+    throw new Error(
+      "static asset read failed mid-stream (status " + a.status +
+      ", truncated " + a.bodyTruncated + ")");
+  }
   response.status = 200;
   response.headers = headersFor(request.ctx || {});
   stream.start(); // commits the head with the headers above (idempotent after first)

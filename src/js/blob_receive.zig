@@ -358,6 +358,14 @@ pub const Job = struct {
             if (at_eof) break;
         }
 
+        // An OOM inside `eofSafeDrain` on the FINAL batch flips `aborted`
+        // but the loop breaks (at_eof) before the top-of-loop recheck —
+        // without this, a chunk whose bytes were hashed but never landed
+        // in `part_buf` would be completed + reported as a successful 200
+        // with a hash that doesn't match the (truncated) stored object.
+        // Fail loud instead: the held chain resumes with `ok:false`.
+        if (self.aborted) return error.ReceiveAborted;
+
         // Tail part — any size (including a zero-byte only part for
         // an empty body; S3 requires at least one part).
         if (part_buf.items.len > 0 or etags.items.len == 0) {

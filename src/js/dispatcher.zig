@@ -1950,6 +1950,60 @@ test "arena-oom: loud 500 when even GC can't fit the request (no silent empty bo
     try testing.expect(d.last_arena_gc_retry);
 }
 
+test "static onChunk: a failed upstream read fails loud (502), never a silent 200" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    // The static.mjs onChunk guard (the audit fix): a terminal fetch event
+    // reporting failure MUST 502 on the first (head-not-yet-committed)
+    // chunk, not serve a well-formed 200 for a broken/missing blob.
+    const bc = try ctx.compileToBytecode(
+        \\export function onChunk() {
+        \\  const a = request.activation;
+        \\  if (a.final && (!a.ok || a.status < 200 || a.status >= 300 || a.bodyTruncated)) {
+        \\    if (a.seq === 0) { response.status = 502; return "static asset read failed (status " + a.status + ")"; }
+        \\    throw new Error("static read failed mid-stream");
+        \\  }
+        \\  response.status = 200; stream.start();
+        \\  if (a.bytes && a.bytes.length) stream.write(a.bytes);
+        \\  if (a.final) return "";
+        \\  return next();
+        \\}
+    , "s.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(bc);
+
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+
+    // A missing blob: the single terminal event is ok:false, status 404,
+    // seq 0 — the head hasn't been committed, so a clean 502 is possible.
+    var resp = try d.run(kv, &txn, &ws, bc, null, null, null, .{
+        .method = "GET",
+        .path = "/",
+        .fn_override = "onChunk",
+        .activation = .{ .fetch_chunk = .{ .final = true, .terminal_ok = false, .terminal_status = 404, .seq = 0 } },
+        .trace = .{ .request_id = 1 },
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 502), resp.status);
+    try testing.expect(std.mem.indexOf(u8, resp.body, "read failed") != null);
+    try testing.expectEqualStrings("", resp.exception);
+}
+
 test "arena-oom retry: the worker's churny hint skips the doomed bump attempt" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);
