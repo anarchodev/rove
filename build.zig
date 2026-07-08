@@ -170,6 +170,19 @@ pub fn build(b: *std.Build) void {
     // rove-kv is only used in bundle.zig's tests (to open a fresh
     // LogStore). Production bundle code never touches kv directly.
     tape_mod.addImport("raft-kv", kv_mod);
+    // The lean CLI's std-only decoder for this same per-Tape wire format
+    // (`rewind replay` can't link rove-tape — it would drag rove-log +
+    // rove-blob + libcurl into the CLI, see tape_decode.zig's header).
+    // Imported HERE so root.zig can comptime-assert MAGIC/VERSION/Channel
+    // equality and round-trip serialize→tape_decode in its tests — format
+    // drift between the two files is a compile/test failure, not a
+    // runtime tape rejection.
+    const tape_decode_mod = b.createModule(.{
+        .root_source_file = b.path("src/replay/tape_decode.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tape_mod.addImport("tape-decode", tape_decode_mod);
 
     // ── rove-qjs: arenajs (quickjs-ng fork) wrapper ──
     //

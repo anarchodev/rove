@@ -6,13 +6,18 @@
 //! request. This is a deliberately small, version-guarded reader rather than a
 //! link against `rove-tape` (which would drag rove-log + rove-blob + libcurl
 //! into the otherwise-lean CLI). It mirrors `src/tape/root.zig`'s
-//! `encodeEntry` / per-`Tape` `serialize` exactly; the VERSION guard fails loud
-//! if that format ever moves so this copy can't silently mis-decode.
+//! `encodeEntry` / per-`Tape` `serialize` exactly — and that mirroring is
+//! ENFORCED, not hand-synced: `tape/root.zig` imports this file (as the
+//! std-only `tape-decode` module), comptime-asserts MAGIC/VERSION/Channel
+//! equality, and round-trips its serializer through these decoders in its
+//! tests. Bumping the format there without moving this file is a
+//! compile/test failure. The VERSION guard below additionally fails loud
+//! at runtime on any tape recorded under a different format.
 
 const std = @import("std");
 
 pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
-pub const VERSION: u16 = 5; // src/tape/root.zig:82 (per-Tape)
+pub const VERSION: u16 = 5; // lockstep-asserted against src/tape/root.zig
 
 pub const Channel = enum(u16) {
     kv = 0,
