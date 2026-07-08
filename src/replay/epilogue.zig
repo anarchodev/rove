@@ -301,7 +301,7 @@ const EPILOGUE_BODY =
     \\  // Effect shims — each appends to the shared __effects log in call order, so
     \\  // reads/writes/cmds/logs interleave as the handler performed them. Filter by
     \\  // `kind` to recover a typed view.
-    \\  globalThis.stream = { start() {}, write(c) { __effects.push({ kind: "stream", bytes: __b2s(c).length }); } };
+    \\  globalThis.stream = { start() {}, write(c) { const __t = (typeof c === "string") ? c : __b2s(c); __effects.push({ kind: "stream", bytes: __t.length, data: __t }); } };
     \\  const __tgt = (d) => (d && (d.on || d.to)) || null;
     \\  globalThis.after = {
     \\    fetch(url, opts) { __effects.push({ kind: "fetch", url, method: (opts && opts.method) || "GET", body: (opts && opts.body !== undefined) ? opts.body : null, ctx: (opts && opts.ctx !== undefined) ? opts.ctx : null, on: (opts && opts.on) || null }); },

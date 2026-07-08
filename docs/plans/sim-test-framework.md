@@ -393,6 +393,15 @@ the test.
     change folds into the overlay and shows on `request.activation.wakes`).
   - client disconnect → `.disconnect()` (the `onDisconnect` resume).
   A resume on a non-held node throws (after.* is inert without a hold).
+- **The held-WebSocket fold** — `scenario().ws({ path }).receive(frame)` runs the
+  frame's `onMessage`; the connection threads its ctx via each `next({ctx})` and
+  folds KV writes forward across frames (the upgrade runs no code — the chain
+  parks with ctx `{}`, so the fold starts at the first frame). `.receive(...)`
+  chains the next frame, `.disconnect()` runs `onDisconnect`. Outbound frames are
+  `stream.write` — asserted with `node.frames` / `toHaveSentFrame(re)` (the
+  epilogue now captures frame CONTENT, not just length). Binary frames via
+  `.receive(bytes, { binary: true })`. Subscriptions (`http.subscribe`) park on a
+  kv key, so they're already covered by the `after.kv` fold.
 - **Detached delivery callback** — `scenario().sendCallback({ on, result, ctx })`
   authors the `send_callback` world directly (the flattened surface from
   `dispatcher.zig`: response on `request.status/.ok/.bytes`, echoed ctx bare on
@@ -403,13 +412,6 @@ the test.
 
 ## What's left
 
-- **The held-SOCKET family (WebSocket + subscriptions)** — `ws_message` /
-  `subscription_fire` / `ws.send` are still effect-log assertions only. These ARE
-  held cases and belong in the fold, but the shape is distinct from `after.*`:
-  the handler is invoked per inbound frame (`onMessage`, `opcode`/binary data),
-  sends frames back, and `ws_message` is gated like inbound (`isContinuation ==
-  false`), so it needs its own fold (frame in → node; assert frames sent) rather
-  than a bolt-on.
 - **A detached `wake` helper** for `schedule` / `cron` callbacks — the
   `durable_wake` analogue of `sendCallback` (author the wake world directly).
   Deferred only because its exact `request.*` surface wasn't re-confirmed this

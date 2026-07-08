@@ -205,6 +205,15 @@ class Scenario {
       },
     }));
   }
+
+  /** A held WebSocket connection. The upgrade runs NO code (the chain parks
+   *  with ctx `{}`); each inbound frame runs `onMessage`, so the fold starts at
+   *  the first `.receive(frame)`. Per-connection ctx threads via each frame's
+   *  `next({ctx})` and KV writes fold forward (read-your-writes across frames);
+   *  outbound frames are `stream.write` (assert with `toHaveSentFrame`). */
+  ws(cfg = {}) {
+    return new WsConnection(this, cfg);
+  }
 }
 
 /** One activation — a lazy thunk over `simulate(world)`, memoized on force. */
@@ -238,6 +247,11 @@ class Node {
   get ctx() { const b = this.force(); return b.disposition === "held" ? b.ctx : undefined; }
 
   _byKind(kind) { return this.effects.filter((e) => e.kind === kind); }
+
+  /** Outbound frames/chunks this activation wrote (`stream.write`), in order —
+   *  the content, not just the byte count. WS replies and SSE lines both land
+   *  here. */
+  get frames() { return this._byKind("stream").map((e) => e.data); }
 
   /** Effective value of `key` after this activation (base kv + its writes).
    *  Absent/deleted keys read `null` — the same `kv.get` returns to the handler
@@ -421,6 +435,98 @@ function carrySources(parentWorld, world) {
   return world;
 }
 
+// ── WebSocket held-socket fold ────────────────────────────────────────────
+
+/** A held WS connection: a stateful cursor over ctx + KV overlay that folds
+ *  forward one frame at a time. Not a node itself (the upgrade runs no code). */
+class WsConnection {
+  constructor(scn, cfg) {
+    this.scenario = scn;
+    this.path = cfg.path || "/";
+    this.host = cfg.host || "";
+  }
+
+  /** Deliver an inbound frame → the `onMessage` activation for it. Text by
+   *  default; `{ binary: true }` delivers `data` as a binary frame. */
+  receive(data, opts = {}) {
+    return this._frame(this.scenario.baseKv, {}, 0, data, opts);
+  }
+
+  /** Client close before any frame → `onDisconnect` (ctx `{}`). */
+  disconnect() {
+    return this._disc(this.scenario.baseKv, {}, 0);
+  }
+
+  // Build one ws_message world. `ctx` is the connection ctx this frame runs
+  // under; `kv` is the folded overlay; `seed` is the prior activation's seed.
+  _frame(kv, ctx, seed, data, opts) {
+    const binary = !!(opts && opts.binary);
+    const activation = binary
+      ? { kind: "ws_message", opcode: 2, dataB64: b64(data) }
+      : { kind: "ws_message", opcode: 1, data: String(data) };
+    const world = this.scenario._base({
+      entry: this.scenario.entry,
+      activation: "ws_message",
+      export: "onMessage",
+      ctx,
+      kv,
+      seed: seed + 1,
+      request: { activation },
+    });
+    return new WsNode(this.scenario, world, this);
+  }
+
+  _disc(kv, ctx, seed) {
+    const world = this.scenario._base({
+      entry: this.scenario.entry,
+      activation: "disconnect",
+      export: "onDisconnect",
+      ctx,
+      kv,
+      seed: seed + 1,
+      request: { activation: { kind: "disconnect" } },
+    });
+    return new WsNode(this.scenario, world, this);
+  }
+}
+
+/** A ws_message / onDisconnect activation node that can fold the NEXT frame:
+ *  the connection ctx after this frame is its `next({ctx})` if it re-held, else
+ *  the ctx it ran under; its KV writes fold into the next frame's overlay. */
+class WsNode extends Node {
+  constructor(scn, world, conn) {
+    super(scn, world);
+    this._conn = conn;
+  }
+  _nextCtx() {
+    const b = this.force();
+    if (b.disposition === "held") return b.ctx === undefined ? {} : b.ctx;
+    return this.world.ctx; // terminal onMessage: connection ctx unchanged
+  }
+  receive(data, opts) {
+    return this._conn._frame(foldKv(this.world.kv, this.force().effects), this._nextCtx(), this.world.seed || 0, data, opts);
+  }
+  disconnect() {
+    return this._conn._disc(foldKv(this.world.kv, this.force().effects), this._nextCtx(), this.world.seed || 0);
+  }
+}
+
+/** Standard base64 (matches the epilogue's `atob`) — for binary WS frames,
+ *  without depending on a `btoa` in the reactor base. */
+function b64(u) {
+  const bytes = typeof u === "string" ? Array.from(u, (c) => c.charCodeAt(0) & 0xff) : Array.from(u);
+  const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i], b1 = bytes[i + 1], b2 = bytes[i + 2];
+    out += A[b0 >> 2];
+    out += A[((b0 & 3) << 4) | ((b1 || 0) >> 4)];
+    out += i + 1 < bytes.length ? A[((b1 & 15) << 2) | ((b2 || 0) >> 6)] : "=";
+    out += i + 2 < bytes.length ? A[b2 & 63] : "=";
+  }
+  return out;
+}
+
 // ── expect ────────────────────────────────────────────────────────────────
 
 let snapCounter = 0;
@@ -481,6 +587,15 @@ class Matcher {
     return this._record(`toHaveFetched ${matcher == null ? "" : matcher}`, fx.some((e) => matchUrl(e.url, matcher)), {
       fetched: fx.map((e) => e.url),
     });
+  }
+
+  /** A `stream.write` frame/line whose content matches (WS reply or SSE line). */
+  toHaveSentFrame(matcher) {
+    const node = this._node("toHaveSentFrame");
+    if (!node) return false;
+    const frames = node.frames;
+    const pass = frames.some((f) => matchUrl(f == null ? "" : f, matcher));
+    return this._record(`toHaveSentFrame ${matcher == null ? "" : matcher}`, pass, { frames });
   }
 
   toHaveSent(kind, subset) {
