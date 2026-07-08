@@ -640,17 +640,7 @@ fn fireWsMessage(
         },
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker.dispatcher.runOutcome(
-        p.dep.inst.kv,
-        p.txn,
-        &p.ws,
-        p.dep.bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
-        request,
-        &budget,
-    ) catch {
+    const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget, path) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
         captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .ws_message, 0);
@@ -658,7 +648,6 @@ fn fireWsMessage(
         tearDownWsChain(worker, conn_ent);
         return;
     };
-    worker_mod.noteChurnyOutcome(worker, p.dep.inst.id, p.dep.tc.snap.deployment_id, path);
 
     var oc = run_oc;
     finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, .ws_message, "ws-message", .{ .frame = .{ .opcode = opcode, .data = payload } });
@@ -840,17 +829,7 @@ pub fn resumeBoundFetchChainWs(
     };
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker.dispatcher.runOutcome(
-        p.dep.inst.kv,
-        p.txn,
-        &p.ws,
-        p.dep.bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
-        request,
-        &budget,
-    ) catch {
+    const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget, path) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
         captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &p.readset, body, fetch_ev), chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
@@ -858,7 +837,6 @@ pub fn resumeBoundFetchChainWs(
         tearDownWsChain(worker, conn_ent);
         return;
     };
-    worker_mod.noteChurnyOutcome(worker, p.dep.inst.id, p.dep.tc.snap.deployment_id, path);
 
     var oc = run_oc;
     finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, .fetch_chunk, "ws-fetch-resume", .{ .fetch = fetch_ev });
@@ -943,17 +921,7 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
     };
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker.dispatcher.runOutcome(
-        p.dep.inst.kv,
-        p.txn,
-        &p.ws,
-        p.dep.bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
-        request,
-        &budget,
-    ) catch {
+    const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget, path) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
         captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, .wake_batch, 0);
@@ -961,7 +929,6 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
         tearDownWsChain(worker, conn_ent);
         return;
     };
-    worker_mod.noteChurnyOutcome(worker, p.dep.inst.id, p.dep.tc.snap.deployment_id, path);
 
     var oc = run_oc;
     finishWsResume(worker, chain_ent, conn_ent, &p, &oc, chain_ctx, chain_st, &stream_chunks, &chunk_opcodes, &pending_fetches, &pending_wakes, .wake_batch, "ws-wake", .none);
@@ -1078,23 +1045,12 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         .admin = .{ .platform = p.dep.inst.platform },
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker.dispatcher.runOutcome(
-        p.dep.inst.kv,
-        p.txn,
-        &p.ws,
-        p.dep.bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
-        request,
-        &budget,
-    ) catch {
+    const run_oc = worker_mod.runResume(worker, p.dep.inst, tc, p.dep.bc, p.txn, &p.ws, request, &budget, path) catch {
         p.txn.rollback() catch {};
         p.txn_done = true;
         captureLogWithId(worker, chain_ctx.tenant_id, p.request_id, "POST", path, "", tc.snap.deployment_id, p.now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &p.readset, body), chain_ctx.correlation_id, &.{}, .disconnect, 0);
         return;
     };
-    worker_mod.noteChurnyOutcome(worker, p.dep.inst.id, p.dep.tc.snap.deployment_id, path);
 
     const wrote = p.ws.ops.items.len > 0;
     var oc = run_oc;

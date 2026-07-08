@@ -615,24 +615,13 @@ fn resumeStream(
         },
     };
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
-        request,
-        &budget,
-    ) catch {
+    const run_oc = worker_mod.runResume(worker, inst, tc, bc, txn, &ws, request, &budget, path) catch {
         txn.rollback() catch {};
         txn_done = true;
         markStreamDraining(server, ent);
         captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, chain_ctx.correlation_id, &.{}, activation, 0);
         return;
     };
-    worker_mod.noteChurnyOutcome(worker, inst.id, tc.snap.deployment_id, path);
 
     const wrote = ws.ops.items.len > 0;
     var oc = run_oc;
@@ -1059,24 +1048,13 @@ pub fn resumeBoundFetchStream(
     };
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    var oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
-        req,
-        &budget,
-    ) catch {
+    var oc = worker_mod.runResume(worker, inst, tc, bc, txn, &ws, req, &budget, path) catch {
         txn.rollback() catch {};
         txn_done = true;
         markStreamDrainingAnywhere(server, ent);
         captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, &.{}, .fetch_chunk, 0);
         return;
     };
-    worker_mod.noteChurnyOutcome(worker, inst.id, tc.snap.deployment_id, path);
 
     const wrote = ws.ops.items.len > 0;
     switch (oc) {
@@ -1499,24 +1477,13 @@ pub fn runFire(
     req_w.arena_mode = worker_mod.arenaModeFor(worker, tenant_id, dep_id, log_path);
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    const run_oc = worker.dispatcher.runOutcome(
-        p.dep.inst.kv,
-        p.txn,
-        &p.ws,
-        p.dep.bc,
-        &p.dep.tc.snap.bytecodes,
-        &p.dep.tc.snap.source_hashes,
-        &.{ .triggers = p.dep.tc.snap.triggers, .subscriptions = p.dep.tc.snap.subscriptions },
-        req_w,
-        &budget,
-    ) catch {
+    const run_oc = worker_mod.runResume(worker, p.dep.inst, p.dep.tc, p.dep.bc, p.txn, &p.ws, req_w, &budget, log_path) catch {
         worker_mod.noteChurnyOutcome(worker, tenant_id, dep_id, log_path);
         p.txn.rollback() catch {};
         p.txn_done = true;
         captureLogWithId(worker, tenant_id, p.request_id, "POST", log_path, "", dep_id, p.now_ns, 500, .handler_error, &.{}, &.{}, fireTapes(worker, spec.with_tape, &p.readset, req.body, activation_bytes), corr, &.{}, spec.act, 0);
         return;
     };
-    worker_mod.noteChurnyOutcome(worker, tenant_id, dep_id, log_path);
 
     const wrote = spec.always_propose or p.ws.ops.items.len > 0;
     var oc = run_oc;

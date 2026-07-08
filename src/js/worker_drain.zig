@@ -1539,23 +1539,12 @@ fn resumeContinuation(
     };
     std.log.info("rove-js corr: resume corr={s} request_id={d} tenant={s}", .{ correlation_id orelse "(none)", request_id, inst.id });
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    var oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
-        request,
-        &budget,
-    ) catch {
+    var oc = worker_mod.runResume(worker, inst, tc, bc, txn, &ws, request, &budget, path) catch {
         txn.rollback() catch {};
         txn_done = true;
         try resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "continuation handler error\n");
         return;
     };
-    worker_mod.noteChurnyOutcome(worker, inst.id, tc.snap.deployment_id, path);
 
     const wrote = ws.ops.items.len > 0;
     switch (oc) {
@@ -2022,23 +2011,12 @@ pub fn resumeBoundFetchChain(
     const sess = sess_ptr.*;
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    var oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
-        req,
-        &budget,
-    ) catch {
+    var oc = worker_mod.runResume(worker, inst, tc, bc, txn, &ws, req, &budget, cont_path) catch {
         txn.rollback() catch {};
         txn_done = true;
         resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "bound-fetch handler error\n") catch {};
         return;
     };
-    worker_mod.noteChurnyOutcome(worker, inst.id, tc.snap.deployment_id, cont_path);
 
     const wrote = ws.ops.items.len > 0;
 
@@ -3191,23 +3169,12 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
     const sess = sess_ptr.*;
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    var oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
-        req,
-        &budget,
-    ) catch {
+    var oc = worker_mod.runResume(worker, inst, tc, bc, txn, &ws, req, &budget, cont_path) catch {
         txn.rollback() catch {};
         txn_done = true;
         resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "inbound-chunk handler error\n") catch {};
         return true;
     };
-    worker_mod.noteChurnyOutcome(worker, inst.id, tc.snap.deployment_id, cont_path);
 
     const wrote = ws.ops.items.len > 0;
 
