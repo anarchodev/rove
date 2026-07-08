@@ -168,6 +168,43 @@ class Scenario {
       },
     }));
   }
+
+  /** A DETACHED durable delivery callback (`webhook.send` / `email.send` `on`),
+   *  authored directly — NOT folded from an emitter. The send fires after the
+   *  handler commits and its `on` module runs later as its own activation, so
+   *  you test that module in isolation given a delivery result. Mirrors the
+   *  flattened send_callback surface (dispatcher.zig): the response on
+   *  `request.status`/`.ok`/`.bytes`, the echoed `ctx` bare on `request.ctx`,
+   *  and delivery metadata on `request.activation.*`.
+   *
+   *  spec: { on: "<result-module path>", result?: {status, ok?, body?, attempts?,
+   *          error?, id?, headers?}, ctx?: <echoed context> }
+   */
+  sendCallback(spec = {}) {
+    if (typeof spec.on !== "string")
+      throw new Error("sendCallback({ on }): `on` must be the result-handler module path");
+    const r = spec.result || {};
+    const status = r.status != null ? r.status : 200;
+    return new Node(this, this._base({
+      entry: spec.on, // the on_result module IS this activation's entry
+      activation: "send_callback",
+      export: "default",
+      ctx: spec.ctx === undefined ? null : spec.ctx,
+      request: {
+        status,
+        ok: r.ok != null ? r.ok : (status >= 200 && status < 300),
+        done: true,
+        body: r.body != null ? r.body : null,
+        activation: {
+          kind: "send_callback",
+          attempts: r.attempts != null ? r.attempts : 1,
+          error: r.error != null ? r.error : null,
+          id: r.id != null ? r.id : null,
+          headers: r.headers || {},
+        },
+      },
+    }));
+  }
 }
 
 /** One activation — a lazy thunk over `simulate(world)`, memoized on force. */
@@ -210,18 +247,28 @@ class Node {
     return key in eff ? tryParse(eff[key]) : null;
   }
 
-  /** Locate an emitted fetch by url matcher → a handle that resolves it. */
+  // ── held-connection resume folds ──
+  // Every `after.*` wake fires ONLY while the connection is held (the handler
+  // returned `next()` or is streaming) — inert otherwise. So each resume below
+  // requires this node to be held, and threads the held continuation forward:
+  // the parent's writes fold into the child's KV overlay, and the child's
+  // `request.ctx` is the effect's own ctx (fetch) or the held `next({ctx})`
+  // (timer/kv/disconnect — they carry no ctx of their own).
+
+  /** Locate an emitted `after.fetch` by url matcher → a handle that resolves
+   *  its upstream result into the dependent `fetch_chunk` resume. */
   fetch(matcher) {
+    requireHeld(this, "fetch");
     const fx = this._byKind("fetch");
     const hit = fx.find((e) => matchUrl(e.url, matcher));
     if (!hit) {
       const seen = fx.map((f) => f.url).join(", ") || "none";
-      throw new Error(`fetch(${matcher}): no emitted fetch matched (saw: ${seen})`);
+      throw new Error(`fetch(${matcher}): no emitted after.fetch matched (saw: ${seen})`);
     }
     return new FetchHandle(this, hit);
   }
 
-  /** Advance the clock; `.fire()` delivers due scheduled/timer wakes. */
+  /** Advance the clock; `.fire()` delivers the due `after.ms` timer wake. */
   get clock() {
     const node = this;
     return {
@@ -231,6 +278,71 @@ class Node {
       },
     };
   }
+
+  /** An `after.kv` wake: a change under a watched prefix resumes the held
+   *  connection. `changes` is a `{ key: value | null }` map folded into the KV
+   *  overlay (null = delete); each surfaces on `request.activation.wakes`.
+   *  `opts.prefix` selects which armed `after.kv` fires when several are armed. */
+  wakeKv(changes = {}, opts = {}) {
+    requireHeld(this, "wakeKv");
+    const parent = this;
+    const pb = parent.force();
+    const armed = parent._byKind("kv-wake");
+    if (!armed.length) throw new Error("wakeKv(): the activation armed no after.kv wake");
+    const kw = opts.prefix ? armed.find((e) => matchUrl(e.prefix, opts.prefix)) : armed[0];
+    if (!kw) throw new Error(`wakeKv(): no armed after.kv matched prefix ${opts.prefix}`);
+    const kv = foldKv(parent.world.kv, pb.effects);
+    const now = (parent.world.now_ms || 0) + 1;
+    const entries = [];
+    for (const key of Object.keys(changes)) {
+      const v = changes[key];
+      if (v === null) { delete kv[key]; entries.push({ kind: "kv", key, op: "d", firedAt: now }); }
+      else { kv[key] = typeof v === "string" ? v : JSON.stringify(v); entries.push({ kind: "kv", key, op: "p", firedAt: now }); }
+    }
+    return new Node(parent.scenario, carrySources(parent.world, {
+      entry: parent.world.entry,
+      activation: "wake_batch",
+      export: kw.on || "onWake",
+      ctx: heldCtx(parent),
+      kv,
+      seed: (parent.world.seed || 0) + 1,
+      now_ms: now,
+      request: { activation: { kind: "wake_batch", wakes: entries, overflow: { lost_oldest: 0 } } },
+    }));
+  }
+
+  /** The client disconnected while the connection was held → the `onDisconnect`
+   *  resume (a held stream's terminal cleanup activation). */
+  disconnect() {
+    requireHeld(this, "disconnect");
+    const parent = this;
+    const pb = parent.force();
+    return new Node(parent.scenario, carrySources(parent.world, {
+      entry: parent.world.entry,
+      activation: "disconnect",
+      export: "onDisconnect",
+      ctx: heldCtx(parent),
+      kv: foldKv(parent.world.kv, pb.effects),
+      seed: (parent.world.seed || 0) + 1,
+      now_ms: (parent.world.now_ms || 0) + 1,
+      request: { activation: { kind: "disconnect" } },
+    }));
+  }
+}
+
+/** A resume fold is meaningful only on a HELD node — `after.*` wakes never
+ *  armed on an activation that returned a terminal response. */
+function requireHeld(node, verb) {
+  if (node.force().disposition !== "held")
+    throw new Error(`${verb}: this activation returned a terminal response (it did not next()/hold), so its connection wakes never armed — after.* fires only while the socket is held`);
+}
+
+/** The held continuation's parked `next({ctx})` — the ctx a timer/kv/disconnect
+ *  resume observes on `request.ctx` (these triggers carry no ctx of their own). */
+function heldCtx(node) {
+  const b = node.force();
+  const c = b.disposition === "held" ? b.ctx : null;
+  return c === undefined ? null : c;
 }
 
 function parseDuration(s) {
@@ -242,32 +354,26 @@ function parseDuration(s) {
 
 class Clock {
   constructor(node, ms) { this.node = node; this.ms = ms; }
-  /** Fire the earliest due schedule/timer as its wake activation. */
+  /** Fire the due `after.ms` timer as a wake_batch resume, clock advanced. */
   fire() {
-    const wakes = this.node.effects.filter((e) =>
-      e.kind === "schedule" || e.kind === "timer" || e.kind === "cron" || e.kind === "kv-wake");
-    if (!wakes.length) throw new Error("clock.fire(): the activation scheduled no wake");
-    const w = wakes[0];
     const parent = this.node;
+    requireHeld(parent, "clock.advance().fire()");
     const pb = parent.force();
-    const world = carrySources(parent.world, {
+    const timers = parent._byKind("timer");
+    if (!timers.length) throw new Error("clock.advance().fire(): the activation armed no after.ms timer wake");
+    const t = timers[0];
+    const now = (parent.world.now_ms || 0) + this.ms;
+    return new Node(parent.scenario, carrySources(parent.world, {
       entry: parent.world.entry,
-      activation: wakeActivation(w.kind),
-      export: (w.on || w.target || "onWake"),
-      ctx: null,
+      activation: "wake_batch",
+      export: t.on || "onWake",
+      ctx: heldCtx(parent),
       kv: foldKv(parent.world.kv, pb.effects),
       seed: (parent.world.seed || 0) + 1,
-      now_ms: (parent.world.now_ms || 0) + this.ms,
-      request: { activation: { kind: w.kind, wake: w } },
-    });
-    return new Node(parent.scenario, world);
+      now_ms: now,
+      request: { activation: { kind: "wake_batch", wakes: [{ kind: "timer", firedAt: now }], overflow: { lost_oldest: 0 } } },
+    }));
   }
-}
-
-function wakeActivation(kind) {
-  if (kind === "kv-wake") return "kv_wake";
-  if (kind === "timer") return "timer";
-  return "durable_wake";
 }
 
 /** A located fetch cmd → resolve its upstream response into the dependent

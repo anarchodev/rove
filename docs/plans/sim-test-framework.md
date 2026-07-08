@@ -363,23 +363,57 @@ the runtime can't be torn down mid-process — the CLIs are one-shot). Proven e2
 by `zig build rewind-test-smoke` over `src/replay/testdata/checkout` (wired into
 the aggregate `test` step).
 
-**Built + verified:** the eager surface (`s.inbound(...)`, `expect(node).toBe /
-toEqual / toMatch / toHaveWritten / toHaveFetched / toHaveSent / toHaveScheduled
-/ toMatchSnapshot`, `node.status/.body/.kv(k)`), the **fetch→fetch_chunk fold**
-(`.fetch(re).resolve(...)` / `.branch([...])` / `.cases([...]).forEachPath`), the
-**clock-advanced timer/schedule wake fold** (`.clock.advance("1h").fire()`), and
-**snapshots** (new writes / match / mismatch-fails / `--update` rebaselines,
-stored as opaque stable-JSON in `__snapshots__/<file>.json`). Clock + per-activation
-seed thread through every fold.
+### The saga fold is for HELD continuations; detached callbacks are standalone
+
+The design line that fell out of building it: **the same-context resume fold is
+load-bearing only for HELD-connection cases** — where a later activation resumes
+the same held socket and shapes the same response, so you can't know the outcome
+without folding forward. The handler API already draws this line: `after.fetch` /
+`after.ms` / `after.kv` (and `next()`) hold and resume; `webhook.send` /
+`email.send` / `schedule` / `cron` are **detached** — they fire after commit and
+their `on` module runs later as its own root activation. Detached callbacks are
+therefore tested as **standalone activations** (author the callback world
+directly), NOT folded from an emitter — which also avoids dragging the platform's
+retry/idempotency ladder (marker + schedule + internal fetch + classifier) into
+the test.
+
+**Built + verified** (`testdata/checkout/_tests/{checkout,held}.mjs`):
+- Eager surface — `s.inbound(...)`, `expect(node).toBe / toEqual / toMatch /
+  toHaveWritten / toHaveFetched / toHaveSent / toHaveScheduled / toMatchSnapshot`,
+  `node.status/.body/.ctx/.kv(k)`.
+- **The full `after.*` held-resume family**, each gated on the parent being held
+  and threading the held continuation forward (parent writes → child KV overlay;
+  ctx = the effect's own ctx for `after.fetch`, the held `next({ctx})` for
+  timer/kv/disconnect):
+  - `after.fetch` → `.fetch(re).resolve(resp)` / `.branch([...])` /
+    `.cases([...]).forEachPath` (the `fetch_chunk` resume).
+  - `after.ms` → `.clock.advance("30s").fire()` (a `wake_batch` timer resume,
+    clock advanced).
+  - `after.kv` → `.wakeKv({ key: value | null })` (a `wake_batch` kv resume; the
+    change folds into the overlay and shows on `request.activation.wakes`).
+  - client disconnect → `.disconnect()` (the `onDisconnect` resume).
+  A resume on a non-held node throws (after.* is inert without a hold).
+- **Detached delivery callback** — `scenario().sendCallback({ on, result, ctx })`
+  authors the `send_callback` world directly (the flattened surface from
+  `dispatcher.zig`: response on `request.status/.ok/.bytes`, echoed ctx bare on
+  `request.ctx`, delivery metadata on `request.activation.*`). Covers
+  `webhook.send` / `email.send` result handlers.
+- **Snapshots** — new writes / match / mismatch-fails / `--update` rebaselines,
+  opaque stable-JSON in `__snapshots__/<file>.json`.
 
 ## What's left
 
-- **Correlation beyond fetch + timer** — `webhook.send` / `email.send`
-  **send-callbacks** (the durable retry/idempotency ladder) and **ws.send /
-  subscription → connection** activations are asserted at the effect-log level
-  (`toHaveSent`) but not yet *folded* into their dependent activation the way
-  `fetch`/timer are. These are the highest-value remaining folds (the durable
-  scheduler + retry ladder are otherwise unexercised end-to-end).
+- **The held-SOCKET family (WebSocket + subscriptions)** — `ws_message` /
+  `subscription_fire` / `ws.send` are still effect-log assertions only. These ARE
+  held cases and belong in the fold, but the shape is distinct from `after.*`:
+  the handler is invoked per inbound frame (`onMessage`, `opcode`/binary data),
+  sends frames back, and `ws_message` is gated like inbound (`isContinuation ==
+  false`), so it needs its own fold (frame in → node; assert frames sent) rather
+  than a bolt-on.
+- **A detached `wake` helper** for `schedule` / `cron` callbacks — the
+  `durable_wake` analogue of `sendCallback` (author the wake world directly).
+  Deferred only because its exact `request.*` surface wasn't re-confirmed this
+  pass; `sendCallback` is the confirmed one.
 - **`whenConcurrent(...).interleavings()`** — the model-check combinator over
   concurrent-effect delivery orders (the plan's `toBeConsistent` example) is not
   built; `branch`/`cases` cover single-effect forking today.
