@@ -714,6 +714,40 @@ const ContResumeNext = union(enum) {
     },
 };
 
+/// Free everything `proposeAndParkContResume` owns when it bails at or
+/// before the propose: roll back + destroy the txn and free the
+/// resources the caller handed into `next`. `.terminal` keeps its body
+/// on the caller (the caller's catch frees it).
+fn discardContResume(
+    allocator: std.mem.Allocator,
+    txn: *kv_mod.KvStore.TrackedTxn,
+    next: ContResumeNext,
+) void {
+    txn.rollback() catch {};
+    allocator.destroy(txn);
+    switch (next) {
+        .terminal => {},
+        .repark => |*r| {
+            if (r.new_bound_sched_id) |b| allocator.free(b);
+            var c = r.new_cont;
+            c.deinit(allocator);
+        },
+        .stream => |*s| {
+            for (s.resp_headers) |h| {
+                allocator.free(h.name);
+                allocator.free(h.value);
+            }
+            if (s.resp_headers.len > 0) allocator.free(s.resp_headers);
+            for (s.chunks) |c| allocator.free(c);
+            if (s.chunks.len > 0) allocator.free(s.chunks);
+            allocator.free(s.ctx_json);
+            allocator.free(s.module_path);
+            for (s.kv_prefixes) |p| allocator.free(p);
+            if (s.kv_prefixes.len > 0) allocator.free(s.kv_prefixes);
+        },
+    }
+}
+
 fn proposeAndParkContResume(
     worker: anytype,
     ent: rove.Entity,
@@ -773,39 +807,33 @@ fn proposeAndParkContResume(
         break :blk &.{};
     };
     defer if (rs_bytes.len > 0) allocator.free(rs_bytes);
+    // Reserve the move-routing Cmd's slot (1 respond + the resume's
+    // non-connection-scoped fetches) BEFORE the propose. The `.respond`
+    // Cmd is what routes the committed entity to its response — if its
+    // alloc fails AFTER the propose commits, the commit-arm can't ship
+    // the response and the client waits out the full RaftWait deadline
+    // for a misleading 503, silently. Reserving here means the
+    // post-propose appends can't fail; an OOM now is a clean pre-propose
+    // failure the caller degrades to a defined 500.
+    const respond_dest: effect_mod.cmd.RespondOut.DestColl = switch (next) {
+        .terminal => .response_in,
+        .repark => .parked_continuations,
+        .stream => .stream_response_in,
+    };
+    const fetch_count: usize = if (fetches_opt) |f| f.items.len else 0;
+    var cont_cmds: effect_mod.cmd.BufferedCmds = .{};
+    cont_cmds.items.ensureTotalCapacityPrecise(allocator, 1 + fetch_count) catch |err| {
+        discardContResume(allocator, txn, next);
+        return err;
+    };
+
     const seq = (raft_propose.proposeBatch(worker, writeset, tenant_id, rs_bytes) catch |err| {
-        // On propose failure: rollback txn, destroy it (caller's
-        // ownership is implicit — we promised to consume it on
-        // success OR free it on failure), free any owned resources in
-        // `next`. ContDescriptor on the entity deinits structurally
-        // when the entity is destroyed. Caller's catch path handles
-        // the 500 flush + log.
-        txn.rollback() catch {};
-        allocator.destroy(txn);
-        switch (next) {
-            .terminal => {}, // caller still owns `body`; caller's catch frees.
-            .repark => |*r| {
-                if (r.new_bound_sched_id) |b| allocator.free(b);
-                var c = r.new_cont;
-                c.deinit(allocator);
-            },
-            .stream => |*s| {
-                // Caller passed ownership of every slice into the
-                // .stream payload; we own freeing them on the
-                // propose-fail path.
-                for (s.resp_headers) |h| {
-                    allocator.free(h.name);
-                    allocator.free(h.value);
-                }
-                if (s.resp_headers.len > 0) allocator.free(s.resp_headers);
-                for (s.chunks) |c| allocator.free(c);
-                if (s.chunks.len > 0) allocator.free(s.chunks);
-                allocator.free(s.ctx_json);
-                allocator.free(s.module_path);
-                for (s.kv_prefixes) |p| allocator.free(p);
-                if (s.kv_prefixes.len > 0) allocator.free(s.kv_prefixes);
-            },
-        }
+        // On propose failure: rollback txn, destroy it, free `next`'s
+        // owned resources. ContDescriptor on the entity deinits
+        // structurally when the entity is destroyed. Caller's catch path
+        // handles the 500 flush + log.
+        cont_cmds.items.deinit(allocator);
+        discardContResume(allocator, txn, next);
         return err;
     }).seq;
     // V2 Phase 2c: resolve the tenant's group id (registered by the
@@ -842,17 +870,11 @@ fn proposeAndParkContResume(
     //   - repark → `parked_continuations`: the chain awaits its next
     //     bound-fetch chunk / callback.
     //   - cont→stream → `stream_response_in`: h2 picks up the stream.
-    const respond_dest: effect_mod.cmd.RespondOut.DestColl = switch (next) {
-        .terminal => .response_in,
-        .repark => .parked_continuations,
-        .stream => .stream_response_in,
-    };
-    var cont_cmds: effect_mod.cmd.BufferedCmds = .{};
-    cont_cmds.items.append(allocator, .{ .respond = .{
+    cont_cmds.items.appendAssumeCapacity(.{ .respond = .{
         .entity = ent,
         .source = .raft_pending_cont,
         .dest = respond_dest,
-    } }) catch {};
+    } });
     // P5(a): commit-gate the resume's unbound fetches. Compact the
     // connection-scoped ones (which we can't stage) to the front of
     // the caller's list; everything else transfers into the unit.
@@ -864,14 +886,9 @@ fn proposeAndParkContResume(
                 keep += 1;
                 continue;
             }
-            cont_cmds.items.append(allocator, .{ .http_fetch = pf }) catch {
-                // OOM: leave it on the caller's list (freed there,
-                // chain never fires — at-least-once recovery is the
-                // producer's own wake).
-                fetches.items[keep] = pf;
-                keep += 1;
-                continue;
-            };
+            // Capacity for these was reserved before the propose
+            // (1 + fetch_count), so the append can't fail.
+            cont_cmds.items.appendAssumeCapacity(.{ .http_fetch = pf });
         }
         fetches.items.len = keep;
     }

@@ -2030,6 +2030,27 @@ fn handleRelease(
     // The worker thread is free to dispatch the next stream
     // immediately; this is what lets proposeBatcher actually
     // batch multiple in-flight release POSTs.
+    // Phase 4.1.3 Option-2 (full Pattern B): a move-only Cmd.respond on
+    // a parked_unit routes the commit-arm move through `interpretCmd
+    // .respond` (matching every other entity park path). BUILD IT FIRST:
+    // if its (1-slot) alloc fails after the entity is committed to
+    // raft_pending_response, the commit-arm can't ship the 204 and the
+    // client waits out the full RaftWait deadline for a misleading 503,
+    // silently. Fail loud now while the entity is still in request_out.
+    var release_cmds: effect_mod.cmd.BufferedCmds = .{};
+    release_cmds.items.append(allocator, .{ .respond = .{
+        .entity = ent,
+        .source = .raft_pending_response,
+        .dest = .response_in,
+    } }) catch |err| {
+        std.log.warn(
+            "release: respond Cmd alloc failed (tenant={s} seq={d}): {s} — failing loud (500)",
+            .{ parsed.value.tenant_id, seq, @errorName(err) },
+        );
+        try respb.setSimpleResponse(server, ent, sid, sess, 500, "release response dispatch alloc failed\n", allocator);
+        return;
+    };
+
     try respb.stageSystemResponse(server, ent, sid, sess, 204, "", allocator, cors_origin, null);
     const deadline_ns: i64 = @intCast(std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns)));
     const group_id = worker.raft.gidForTenant(parsed.value.tenant_id) orelse 0;
@@ -2039,18 +2060,9 @@ fn handleRelease(
         .deadline_ns = deadline_ns,
     });
     try server.reg.move(ent, &server.request_out, &worker.raft_pending_response);
-    // Phase 4.1.3 Option-2 (full Pattern B): emit a move-only
-    // Cmd.respond on a parked_unit so the commit-arm move routes
-    // through `interpretCmd .respond` (matching every other entity
-    // park path). Pass empty writeset — handleRelease's actual kv
-    // writes (`_deploy/current`) ride on the entity's own txn in
-    // pending_txns; the parked_unit here is move-routing-only.
-    var release_cmds: effect_mod.cmd.BufferedCmds = .{};
-    release_cmds.items.append(allocator, .{ .respond = .{
-        .entity = ent,
-        .source = .raft_pending_response,
-        .dest = .response_in,
-    } }) catch {};
+    // Pass empty writeset — handleRelease's actual kv writes
+    // (`_deploy/current`) ride on the entity's own txn in pending_txns;
+    // the parked_unit here is move-routing-only.
     const empty_ws = kv_mod.WriteSet.init(allocator);
     var ws_local = empty_ws;
     defer ws_local.deinit();
