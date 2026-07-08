@@ -664,3 +664,24 @@ test "tenant scope is back-compatible: plain verify + verifyWithCap ignore it" {
     try testing.expectEqual(@as(i64, 1_000_000), p.exp_ms);
     _ = try verifyWithCap("k", tok, 0, "logs-read");
 }
+
+/// Load a hex-encoded HMAC secret from the environment, decoded to raw
+/// key bytes (the form `mint`/`verify` take). Returns null when
+/// `var_name` is unset (callers decide whether that disables a feature
+/// or is fatal); exits(2) loudly on malformed hex — that's a boot config
+/// error, and both the worker (writer) and log-server (verifier) must
+/// die on it rather than run with a key that can never match the other
+/// side's. Caller frees the returned bytes.
+pub fn loadSecretFromEnvOpt(allocator: std.mem.Allocator, var_name: []const u8) error{OutOfMemory}!?[]u8 {
+    const hex = std.posix.getenv(var_name) orelse return null;
+    if (hex.len == 0 or hex.len % 2 != 0) {
+        std.log.err("{s} must be even-length hex", .{var_name});
+        std.process.exit(2);
+    }
+    const bytes = allocator.alloc(u8, hex.len / 2) catch return error.OutOfMemory;
+    _ = std.fmt.hexToBytes(bytes, hex) catch {
+        std.log.err("{s} is not valid hex", .{var_name});
+        std.process.exit(2);
+    };
+    return bytes;
+}

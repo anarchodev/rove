@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const rove = @import("rove");
+const boot = @import("rove-boot");
 const h2 = @import("rove-h2");
 const blob = @import("rove-blob");
 
@@ -53,19 +54,7 @@ fn constantTimeEql(a: []const u8, b: []const u8) bool {
 // ── Signal-driven shutdown ────────────────────────────────────────────
 var stop_flag: std.atomic.Value(bool) = .init(false);
 
-fn handleSignal(_: c_int) callconv(.c) void {
-    stop_flag.store(true, .release);
-}
-
-fn installSignalHandlers() void {
-    const act: std.posix.Sigaction = .{
-        .handler = .{ .handler = handleSignal },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.INT, &act, null);
-    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
-}
+// SIGINT/SIGTERM → stop_flag wiring lives in rove-boot (shared by all four binaries).
 
 // ── Multi-node CP (HA) config ─────────────────────────────────────────
 
@@ -1729,25 +1718,8 @@ fn getEnvCfg(name: []const u8) []const u8 {
 
 /// Parse a `;`/`,`-separated list of origins into an owned, owned-element
 /// slice. Empty input → empty slice. Whitespace trimmed; blanks skipped.
-fn parseUrlList(a: std.mem.Allocator, config: []const u8) ![]const []const u8 {
-    var list: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer {
-        for (list.items) |u| a.free(u);
-        list.deinit(a);
-    }
-    var it = std.mem.tokenizeAny(u8, config, ";,");
-    while (it.next()) |raw| {
-        const url = std.mem.trim(u8, raw, " \t\r\n");
-        if (url.len == 0) continue;
-        try list.append(a, try a.dupe(u8, url));
-    }
-    return list.toOwnedSlice(a);
-}
-
-fn freeUrlList(a: std.mem.Allocator, urls: []const []const u8) void {
-    for (urls) |u| a.free(u);
-    a.free(urls);
-}
+const parseUrlList = boot.parseUrlList;
+const freeUrlList = boot.freeUrlList;
 
 /// Render the CP operator metrics in Prometheus text (caller frees). Two
 /// halves, both node-wide with no per-tenant labels (the observability.md
@@ -1828,7 +1800,7 @@ fn buildCpMetricsText(allocator: std.mem.Allocator, router: *Router, bridge: *Br
 pub fn main() !void {
     curl.globalInit();
     const allocator = std.heap.c_allocator;
-    installSignalHandlers();
+    boot.installSignalHandlers(&stop_flag);
     // Logging must never block the poll loop: a backpressured log sink
     // (journald) would otherwise freeze the CP on a synchronous std.log
     // write. O_NONBLOCK drops the line instead. See `rove.logNonBlocking`.
@@ -2045,22 +2017,10 @@ pub fn main() !void {
     // thread + socket, so /metrics stays scrapable while the CP loop is wedged
     // — exactly the directory-election incident this surfaces. A bind failure
     // logs and runs without it (metrics are optional).
-    const cp_metrics_srv: ?*MetricsServer = blk: {
-        const mport: u16 = if (std.posix.getenv("REWIND_CP_METRICS_PORT")) |s|
-            (std.fmt.parseInt(u16, std.mem.trim(u8, s, " \t"), 10) catch 9111)
-        else
-            9111;
-        if (mport == 0) break :blk null;
-        const maddr = std.net.Address.parseIp("127.0.0.1", mport) catch break :blk null;
-        const srv = MetricsServer.init(allocator, maddr) catch |err| {
-            std.log.warn("rewind-cp: metrics listener bind :{d} failed ({s}) — running without /metrics", .{ mport, @errorName(err) });
-            break :blk null;
-        };
-        std.log.info("rewind-cp: operator metrics on 127.0.0.1:{d}/metrics", .{mport});
-        break :blk srv;
-    };
+    const cp_metrics_srv: ?*MetricsServer =
+        boot.metricsFromEnv(allocator, "REWIND_CP_METRICS_PORT", boot.METRICS_PORT_CP, "rewind-cp");
     defer if (cp_metrics_srv) |ms| ms.deinit();
-    var last_metrics_ns: i128 = 0;
+    var metrics_cadence: boot.Cadence = .{};
 
     std.log.info("rewind-cp: listening on 0.0.0.0:{d} (move control {s}, reconcile {s})", .{
         port,
@@ -2088,9 +2048,7 @@ pub fn main() !void {
         // Re-render + publish the metrics snapshot ~every 2s (the CP loop is the
         // only thread that may read the counters; the listener serves bytes).
         if (cp_metrics_srv) |ms| {
-            const now_ns = std.time.nanoTimestamp();
-            if (now_ns - last_metrics_ns > 2 * std.time.ns_per_s) {
-                last_metrics_ns = now_ns;
+            if (metrics_cadence.due(std.time.nanoTimestamp())) {
                 if (buildCpMetricsText(allocator, &router, cp_bridge, server)) |txt| {
                     defer allocator.free(txt);
                     ms.publish(txt);

@@ -311,6 +311,19 @@ pub fn build(b: *std.Build) void {
     const metrics_server_tests = b.addTest(.{ .root_module = metrics_server_mod });
     const run_metrics_server_tests = b.addRunArtifact(metrics_server_tests);
 
+    // ── rove-boot: shared process-boot scaffolding for the four serving
+    //    binaries (signal→stop-flag wiring, URL-list env parsing, the
+    //    operator-metrics listener bring-up + the disjoint default-port
+    //    table, the 2s publish cadence gate). See src/boot/root.zig.
+    const boot_mod = b.addModule("rove-boot", .{
+        .root_source_file = b.path("src/boot/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    boot_mod.addImport("metrics-server", metrics_server_mod);
+    const boot_tests = b.addTest(.{ .root_module = boot_mod });
+    const run_boot_tests = b.addRunArtifact(boot_tests);
+
     // rove-files-server was dissolved into the worker's `/_system/deploy`
     // endpoint (docs/plans/rewind-cli-plan.md §4): the worker already links
     // rove-files + rove-qjs + rove-blob, so compile + content-address +
@@ -322,6 +335,8 @@ pub fn build(b: *std.Build) void {
 
     // metrics-server (shared by rewind-worker + rewind-cp)
     test_step.dependOn(&run_metrics_server_tests.step);
+    // rove-boot (shared by all four serving binaries)
+    test_step.dependOn(&run_boot_tests.step);
 
     // rove tests
     const rove_tests = b.addTest(.{ .root_module = rove_mod });
@@ -645,7 +660,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    ls_standalone_mod.addImport("rove-boot", boot_mod);
     ls_standalone_mod.addImport("rove-log-server", log_server_mod);
+    ls_standalone_mod.addImport("rove-jwt", jwt_mod);
     ls_standalone_mod.addImport("rove-blob", blob_mod);
     ls_standalone_mod.addImport("rove-h2", h2_mod);
     ls_standalone_mod.addImport("metrics-server", metrics_server_mod);
@@ -1125,6 +1142,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     rewind_mod.addImport("rove", rove_mod);
+    rewind_mod.addImport("rove-boot", boot_mod);
+    rewind_mod.addImport("rove-jwt", jwt_mod);
     rewind_mod.addImport("rove-js", js_mod);
     rewind_mod.addImport("bridge", v2_bridge_mod);
     rewind_mod.addImport("raft-kv", kv_mod);
@@ -1153,6 +1172,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     front_mod.addImport("rove", rove_mod);
+    front_mod.addImport("rove-boot", boot_mod);
     front_mod.addImport("rove-h2", h2_mod);
     front_mod.addImport("rove-blob", blob_mod);
     front_mod.addImport("metrics-server", metrics_server_mod);
@@ -1183,6 +1203,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     cp_mod.addImport("rove", rove_mod);
+    cp_mod.addImport("rove-boot", boot_mod);
     cp_mod.addImport("rove-h2", h2_mod);
     cp_mod.addImport("rove-blob", blob_mod);
     cp_mod.addImport("cp-directory", v2_cp_dir_mod);
