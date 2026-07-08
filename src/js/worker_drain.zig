@@ -1571,7 +1571,15 @@ fn resumeContinuation(
                 const corr_id = correlation_id;
                 const dep_id = tc.snap.deployment_id;
                 const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                const body_dup = try allocator.dupe(u8, r.body);
+                const body_dup = allocator.dupe(u8, r.body) catch {
+                    txn.rollback() catch {};
+                    txn_done = true;
+                    try resolveParked(worker, ent, sid, sess, 500, "continuation alloc failed\n");
+                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", dep_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, r.tags, act_src, 0);
+                    r.console = &.{};
+                    r.exception = &.{};
+                    return;
+                };
                 errdefer allocator.free(body_dup);
                 const console_owned = r.console;
                 const exception_owned = r.exception;

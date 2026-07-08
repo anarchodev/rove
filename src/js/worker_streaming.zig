@@ -658,9 +658,26 @@ fn resumeStream(
                     stage.chunks.deinit(allocator);
                 }
                 if (r.body.len > 0) {
-                    const owned = try allocator.dupe(u8, r.body);
-                    errdefer allocator.free(owned);
-                    try stage.chunks.append(allocator, owned);
+                    staged: {
+                        const owned = allocator.dupe(u8, r.body) catch break :staged;
+                        stage.chunks.append(allocator, owned) catch {
+                            allocator.free(owned);
+                            break :staged;
+                        };
+                        break :staged;
+                    }
+                    if (stage.chunks.items.len == 0) {
+                        // Defined failure (matches the cont-family posture):
+                        // never propagate out of a resume with the stream
+                        // half-mutated, never silently drop the writes.
+                        txn.rollback() catch {};
+                        txn_done = true;
+                        markStreamDraining(server, ent);
+                        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, chain_ctx.correlation_id, r.tags, activation, 0);
+                        r.console = &.{};
+                        r.exception = &.{};
+                        return;
+                    }
                 }
                 const lh_term = fireLogHeader(request_id, tc.snap.deployment_id, @intCast(@max(@min(r.status, 599), 100)), activation, chain_st.module_path, chain_ctx.correlation_id);
                 const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &pending_fetches, &readset, lh_term) catch |perr| {
@@ -703,8 +720,16 @@ fn resumeStream(
             txn_done = true;
             flushFireFetches(worker, &pending_fetches);
             if (r.body.len > 0) {
-                const owned = try allocator.dupe(u8, r.body);
-                try chunks_st.tryAppend(allocator, owned);
+                // Post-commit: never propagate (half-mutated chain state) and
+                // never silently return — close loudly without the final
+                // chunk if it can't be staged (matches the bound-fetch
+                // stream's posture).
+                if (allocator.dupe(u8, r.body)) |owned| {
+                    chunks_st.tryAppend(allocator, owned) catch |e| {
+                        allocator.free(owned);
+                        std.log.err("rove-js stream-resume: terminal chunk append failed ({s}) — closing", .{@errorName(e)});
+                    };
+                } else |e| std.log.err("rove-js stream-resume: terminal body dupe failed ({s}) — closing without it", .{@errorName(e)});
             }
             markStreamDraining(server, ent);
             chain_st.activation_count += 1;
@@ -795,7 +820,10 @@ fn resumeStream(
             // already `&.{}` (moved into `stage` above); this loop
             // no-ops there. On the read-only path it ships the
             // chunks immediately — no raft propose, no commit gate.
-            for (s2.chunks) |c| try chunks_st.tryAppend(allocator, c);
+            for (s2.chunks) |c| chunks_st.tryAppend(allocator, c) catch |e| {
+                allocator.free(c);
+                std.log.err("rove-js stream-resume: chunk append failed ({s}) — dropping this chunk, stream continues", .{@errorName(e)});
+            };
             if (s2.chunks.len > 0) allocator.free(s2.chunks);
             s2.chunks = &.{};
             // Replace ctx + interval on the component. Old ctx_json
@@ -1057,9 +1085,25 @@ pub fn resumeBoundFetchStream(
                     stage.chunks.deinit(allocator);
                 }
                 if (r.body.len > 0) {
-                    const owned = allocator.dupe(u8, r.body) catch return;
-                    errdefer allocator.free(owned);
-                    stage.chunks.append(allocator, owned) catch return;
+                    staged: {
+                        const owned = allocator.dupe(u8, r.body) catch break :staged;
+                        stage.chunks.append(allocator, owned) catch {
+                            allocator.free(owned);
+                            break :staged;
+                        };
+                        break :staged;
+                    }
+                    if (stage.chunks.items.len == 0) {
+                        // Defined failure (was a SILENT return: no draining
+                        // mark, no log — the held stream just hung).
+                        txn.rollback() catch {};
+                        txn_done = true;
+                        markStreamDrainingAnywhere(server, ent);
+                        captureLogWithId(worker, chain_ctx.tenant_id, request_id, "POST", chain_st.module_path, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), chain_ctx.correlation_id, r.tags, .fetch_chunk, 0);
+                        r.console = &.{};
+                        r.exception = &.{};
+                        return;
+                    }
                 }
                 const lh_term = fireLogHeader(request_id, tc.snap.deployment_id, @intCast(@max(@min(r.status, 599), 100)), .fetch_chunk, chain_st.module_path, chain_ctx.correlation_id);
                 const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &pending_fetches, &readset, lh_term) catch |perr| {
@@ -1090,12 +1134,17 @@ pub fn resumeBoundFetchStream(
             txn_done = true;
             flushFireFetches(worker, &pending_fetches);
             if (r.body.len > 0) {
-                const owned = allocator.dupe(u8, r.body) catch return;
                 // Lossless: never silently drop. The producer-pacing gate
                 // keeps the queue below the soft cap, so this can only fail if
-                // a single chunk blows the hard cap — close loudly, don't drop.
-                chunks_st.tryAppend(allocator, owned) catch |e|
-                    std.log.err("rove-js bound-fetch stream: terminal chunk append failed ({s}) — closing", .{@errorName(e)});
+                // a single chunk blows the hard cap — close loudly, don't drop
+                // (a dupe failure was a SILENT return that skipped the
+                // draining mark + log below).
+                if (allocator.dupe(u8, r.body)) |owned| {
+                    chunks_st.tryAppend(allocator, owned) catch |e| {
+                        allocator.free(owned);
+                        std.log.err("rove-js bound-fetch stream: terminal chunk append failed ({s}) — closing", .{@errorName(e)});
+                    };
+                } else |e| std.log.err("rove-js bound-fetch stream: terminal body dupe failed ({s}) — closing without it", .{@errorName(e)});
             }
             markStreamDrainingAnywhere(server, ent);
             chain_st.activation_count += 1;

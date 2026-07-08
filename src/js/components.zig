@@ -59,9 +59,13 @@ pub const ContDescriptor = struct {
     /// §6.4 mandatory-timeout deadline (absolute monotonic ns).
     /// Zero when `cont == null`.
     deadline_ns: i64 = 0,
-    /// §6.4 binding: the single `_send/owed/{id}` this hop wrote
-    /// (allocator-owned). null = deadline-only resume (no send
-    /// bound, or >1 sends written — ambiguous, no implicit pick).
+    /// §6.4 binding: the single `_send/owed/{id}` the chain's most
+    /// recent WRITING hop wrote (allocator-owned). null = deadline-only
+    /// resume (no send bound, or >1 sends written — ambiguous, no
+    /// implicit pick). PERSISTS across read-only reparks: a hop that
+    /// wrote nothing fired no send, and the chain may still be awaiting
+    /// an earlier hop's owed send — its callback must keep resuming
+    /// this park. Only a writing repark rewrites it.
     bound_schedule_id: ?[]u8 = null,
 
     pub fn deinit(allocator: std.mem.Allocator, items: []ContDescriptor) void {
