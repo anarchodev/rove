@@ -1294,4 +1294,15 @@ pub fn build(b: *std.Build) void {
     const smoke_step = b.step("rewind-test-smoke", "Run `rewind test` over the checkout fixture (saga test runner e2e)");
     smoke_step.dependOn(&smoke.step);
     test_step.dependOn(&smoke.step);
+
+    // Cross-check: the same acme on.fetch handlers on_fetch_smoke_v2.py deploys,
+    // run offline via `rewind test` (examples/loop46-demo-tenants/acme/_tests/).
+    // Agreement with the smoke's through-the-stack body reconstruction proves the
+    // streaming-bind + buffered fetch folds faithful against a REAL handler.
+    const xcheck = b.addRunArtifact(cli_exe);
+    xcheck.addArg("test");
+    xcheck.addDirectoryArg(b.path("examples/loop46-demo-tenants/acme"));
+    xcheck.expectExitCode(0);
+    smoke_step.dependOn(&xcheck.step);
+    test_step.dependOn(&xcheck.step);
 }

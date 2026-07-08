@@ -419,6 +419,48 @@ class FetchHandle {
     return new Node(parent.scenario, world);
   }
 
+  /** Deliver a STREAMED fetch (`after.fetch({ stream: true })`): one
+   *  `fetch_chunk` resume per chunk (`done:false`, the chunk on
+   *  `request.text`/`.bytes`), then a terminal empty `done:true` event — the
+   *  shape `fetch_engine` emits (per-writeback chunks + a final empty). Each
+   *  resume threads the fetch's ctx and folds the prior chunk's KV writes
+   *  forward (read-your-writes across the stream), so an accumulate-in-kv
+   *  handler reconstructs the body. Returns the terminal node (the one that
+   *  responds). `chunks` are strings (or `{ binary }` bytes via `opts`).
+   *  Assumes the handler re-holds (`next()`) between chunks until `done`. */
+  stream(chunks, opts = {}) {
+    const scn = this.node.scenario;
+    const pw = this.node.world;
+    const on = this.fx.on;
+    const ctx = this.fx.ctx === undefined ? null : this.fx.ctx;
+    let kv = foldKv(pw.kv, this.node.force().effects);
+    let seed = pw.seed || 0;
+    let now = pw.now_ms || 0;
+    let node = null;
+    const step = (body, done, seq) => {
+      node = new Node(scn, carrySources(pw, {
+        entry: pw.entry,
+        activation: "fetch_chunk",
+        export: on || (done ? "onFetchDone" : "onFetchChunk"),
+        ctx,
+        kv,
+        seed: ++seed,
+        now_ms: ++now,
+        request: {
+          status: opts.status != null ? opts.status : 200,
+          ok: opts.ok != null ? opts.ok : true,
+          done,
+          chunkSeq: seq,
+          body,
+        },
+      }));
+      kv = foldKv(kv, node.force().effects); // thread writes to the next chunk
+    };
+    chunks.forEach((c, i) => step(c, false, i));
+    step(null, true, chunks.length); // terminal empty done event
+    return node;
+  }
+
   /** Fork the shared prefix into one dependent node per response. */
   branch(responses) { return responses.map((r) => this.resolve(r)); }
 

@@ -386,7 +386,11 @@ the test.
   ctx = the effect's own ctx for `after.fetch`, the held `next({ctx})` for
   timer/kv/disconnect):
   - `after.fetch` → `.fetch(re).resolve(resp)` / `.branch([...])` /
-    `.cases([...]).forEachPath` (the `fetch_chunk` resume).
+    `.cases([...]).forEachPath` (the whole-body `fetch_chunk` resume), and
+    `.stream([chunk,…])` for a `stream:true` fetch — one `done:false` chunk
+    resume each (chunk on `request.text`) then a terminal empty `done:true`,
+    threading ctx + KV writes across the sequence (accumulate-in-kv handlers
+    reconstruct the body).
   - `after.ms` → `.clock.advance("30s").fire()` (a `wake_batch` timer resume,
     clock advanced).
   - `after.kv` → `.wakeKv({ key: value | null })` (a `wake_batch` kv resume; the
@@ -409,6 +413,18 @@ the test.
   `webhook.send` / `email.send` result handlers.
 - **Snapshots** — new writes / match / mismatch-fails / `--update` rebaselines,
   opaque stable-JSON in `__snapshots__/<file>.json`.
+
+### Smoke cross-checks (the dogfood + faithfulness oracle)
+
+The handler-behavior smokes double as a faithfulness oracle: take the handler a
+smoke deploys, write a `rewind test` asserting the same behavior offline, and
+confirm they agree — proving the fold faithful against the REAL distributed
+stack (not just a self-authored fixture). First one landed:
+`examples/loop46-demo-tenants/acme/_tests/onfetch.mjs` cross-checks
+`on_fetch_smoke_v2.py` (streaming-bind + buffered fetch → the same byte-exact
+170B reconstruction), wired into `zig build test` via `rewind-test-smoke`.
+Writing this surfaced the streaming fetch gap above (`.stream()`) — exactly what
+dogfooding is for. Next oracles: `on_kv` / `on_timer` / `ws_*`.
 
 ## What's left
 
