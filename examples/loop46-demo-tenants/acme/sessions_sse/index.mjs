@@ -5,10 +5,11 @@
 // through raft via the normal write-batch path; `drainRaftPending`
 // registers the chain cell + moves the entity into `stream_response_in`
 // once the writes commit.
-// Resume hops receive ctx via the synthesized request body shape
-// `{ctx:<json>}` — parse it back out.
+// Resume hops receive the threaded ctx on `request.ctx` (the handler
+// surface unwraps the engine's ctx envelope; `request.text` is the
+// customer payload, empty on wake/disconnect activations).
 function resumeCtx() {
-    return JSON.parse(request.text || "{}").ctx || {};
+    return request.ctx || {};
 }
 
 // Inbound: register the session + open the SSE tick stream.
