@@ -725,8 +725,8 @@ fn resumeStream(
                 // chunk if it can't be staged (matches the bound-fetch
                 // stream's posture).
                 if (allocator.dupe(u8, r.body)) |owned| {
+                    // tryAppend frees the chunk on error — no free here.
                     chunks_st.tryAppend(allocator, owned) catch |e| {
-                        allocator.free(owned);
                         std.log.err("rove-js stream-resume: terminal chunk append failed ({s}) — closing", .{@errorName(e)});
                     };
                 } else |e| std.log.err("rove-js stream-resume: terminal body dupe failed ({s}) — closing without it", .{@errorName(e)});
@@ -820,9 +820,12 @@ fn resumeStream(
             // already `&.{}` (moved into `stage` above); this loop
             // no-ops there. On the read-only path it ships the
             // chunks immediately — no raft propose, no commit gate.
+            // tryAppend frees the chunk on error. Lossless posture (matches
+            // the bound-fetch stream): a failed append closes the stream
+            // loudly rather than silently continuing minus a chunk.
             for (s2.chunks) |c| chunks_st.tryAppend(allocator, c) catch |e| {
-                allocator.free(c);
-                std.log.err("rove-js stream-resume: chunk append failed ({s}) — dropping this chunk, stream continues", .{@errorName(e)});
+                std.log.err("rove-js stream-resume: chunk append failed ({s}) — closing", .{@errorName(e)});
+                markStreamDraining(server, ent);
             };
             if (s2.chunks.len > 0) allocator.free(s2.chunks);
             s2.chunks = &.{};
@@ -1140,8 +1143,8 @@ pub fn resumeBoundFetchStream(
                 // (a dupe failure was a SILENT return that skipped the
                 // draining mark + log below).
                 if (allocator.dupe(u8, r.body)) |owned| {
+                    // tryAppend frees the chunk on error — no free here.
                     chunks_st.tryAppend(allocator, owned) catch |e| {
-                        allocator.free(owned);
                         std.log.err("rove-js bound-fetch stream: terminal chunk append failed ({s}) — closing", .{@errorName(e)});
                     };
                 } else |e| std.log.err("rove-js bound-fetch stream: terminal body dupe failed ({s}) — closing without it", .{@errorName(e)});
