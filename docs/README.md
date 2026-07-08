@@ -87,3 +87,4 @@ them 2026-06-29: its as-built mechanism folded into
 
 - [self-host.md](guides/self-host.md) — run the V2 stack on your own hosts: build, env, example systemd units, cluster bring-up
 - [activitypub-tutorial.md](guides/activitypub-tutorial.md) — ActivityPub bot in ~30 lines
+- [testing.md](guides/testing.md) — test handlers offline with `rewind test`: the `_tests/*.mjs` saga surface (`scenario`/`expect`, held-resume folds, WS, snapshots)
