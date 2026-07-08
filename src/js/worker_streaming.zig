@@ -1834,24 +1834,21 @@ pub fn fireSubscriptionActivation(
     /// the clear commits atomically with the handler's effects — and
     /// same-tenant serialization makes the plain delete safe (no CAS:
     /// a later write's marker-set is ordered after this delete and
-    /// re-arms). Null = a fire with no marker (the producer-less
-    /// legacy msg path).
-    cleanup_key: ?[]const u8,
+    /// re-arms).
+    cleanup_key: []const u8,
 ) void {
     const allocator = worker.allocator;
     var p = firePrep(worker, tenant_id, module_path, "subscription-fire") orelse return;
     defer p.deinit(allocator);
 
-    if (cleanup_key) |ck| {
-        p.txn.delete(ck) catch |err| {
-            std.log.warn("rove-js kv-react ({s}/{s}): marker txn.delete failed: {s}", .{ tenant_id, subscription_name, @errorName(err) });
-            return; // marker survives -> sweep re-fires
-        };
-        p.ws.addDelete(ck) catch |err| {
-            std.log.warn("rove-js kv-react ({s}/{s}): marker ws.addDelete failed: {s}", .{ tenant_id, subscription_name, @errorName(err) });
-            return;
-        };
-    }
+    p.txn.delete(cleanup_key) catch |err| {
+        std.log.warn("rove-js kv-react ({s}/{s}): marker txn.delete failed: {s}", .{ tenant_id, subscription_name, @errorName(err) });
+        return; // marker survives -> sweep re-fires
+    };
+    p.ws.addDelete(cleanup_key) catch |err| {
+        std.log.warn("rove-js kv-react ({s}/{s}): marker ws.addDelete failed: {s}", .{ tenant_id, subscription_name, @errorName(err) });
+        return;
+    };
 
     // Subscription chains start fresh — empty ctx, fresh
     // correlation_id. (The handler can pass ctx forward via its
@@ -1895,23 +1892,14 @@ pub fn fireSubscriptionActivation(
         .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
     };
-    if (cleanup_key != null) {
-        // The marker delete must land even for a read-only handler.
-        runFire(worker, &p, req, .{
-            .act = .subscription_fire,
-            .site = "subscription-fire",
-            .on_cont = .warn,
-            .on_stream = .warn,
-            .always_propose = true,
-        }, module_path, corr_full, subscription_name, "");
-    } else {
-        runFire(worker, &p, req, .{
-            .act = .subscription_fire,
-            .site = "subscription-fire",
-            .on_cont = .warn,
-            .on_stream = .warn,
-        }, module_path, corr_full, subscription_name, "");
-    }
+    // The marker delete must land even for a read-only handler.
+    runFire(worker, &p, req, .{
+        .act = .subscription_fire,
+        .site = "subscription-fire",
+        .on_cont = .warn,
+        .on_stream = .warn,
+        .always_propose = true,
+    }, module_path, corr_full, subscription_name, "");
 }
 
 /// §2.6 durable-wake (P1): fire the baked `__system/scheduler_tick`
@@ -2638,33 +2626,14 @@ pub fn sweepDirtySubscriptionsOnPromotion(worker: anytype) void {
 
 // ── Msg inbox + dispatch ──────────────────────────────────────────────
 
-/// Cross-thread enqueue parameters used by
-/// `NodeState.enqueueSubscriptionFireForTenant` (cron sweeper,
-/// loader). Borrowed slices — the cross-thread enqueue dups onto a
-/// `PendingFireMessage` on the inbox; `drainSubFireInbox` then moves
-/// those owned slices onto an `effect.SubscriptionFire` payload
-/// (Phase 2B/2C: no per-tick dup on the worker side).
-pub const SubscriptionFireQueueInput = struct {
-    tenant_id: []const u8,
-    subscription_name: []const u8,
-    module_path: []const u8,
-    source: SubscriptionFireSource,
-};
+// `SubscriptionFireQueueInput` + the router's
+// `enqueueSubscriptionFireForTenant` producer were REMOVED with
+// decisions §4.13 (durable-kv-subscriptions): kv-react was the last
+// subscription-fire producer, and it now rides the dirty-marker path
+// (`fireKvReactSubscriptions` marks; `drainPendingSubscriptionFires`
+// dispatches). The Msg variant survives as an empty placeholder for
+// the ActivationSource exhaustiveness contract.
 
-// `enqueueSubscriptionFire` (the prior collection-creation helper) was
-// retired in effect-reification Phase 2C. Every subscription origin
-// now routes through `effect.enqueueMsg`:
-// - cron / kv-react: cross-thread inbox → `drainSubFireInbox` →
-//   `enqueueMsg` (move-semantics)
-// - kv-react: `fireKvReactSubscriptions` → `enqueueMsg` (dup-on-payload)
-
-/// Gap 2.1 Phase D: drain the worker's cross-thread
-/// `sub_fire_inbox`, **moving** each `PendingFireMessage`'s owned
-/// slices onto an `effect.SubscriptionFire` payload and enqueueing
-/// via `effect.enqueueMsg`. Called once per worker tick (from
-/// `serviceSubscriptionFires`); cheap when the inbox is empty (one
-/// mutex try + length check).
-///
 /// Effect-reification Phase 2E: drain the worker's unified
 /// cross-thread `msg_inbox`, moving each `effect.Msg` onto the
 /// in-thread `msg_queue`. One drain function for every cross-thread
@@ -3104,25 +3073,12 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
     while (fired < BATCH) {
         const msg = worker.msg_queue.dequeue() orelse break;
         switch (msg) {
-            .subscription_fire => |sf_const| {
-                var sf = sf_const;
-                std.log.debug(
-                    "rove-js sub-fire dispatch: tenant={s} sub={s} module={s}",
-                    .{ sf.tenant_id, sf.subscription_name, sf.module_path },
-                );
-                fireSubscriptionActivation(
-                    worker,
-                    sf.tenant_id,
-                    sf.subscription_name,
-                    sf.module_path,
-                    switch (sf.source) {
-                        .kv => |kv| SubscriptionFireSource{ .kv = .{ .prefix = kv.prefix } },
-                    },
-                    null,
-                );
-                sf.deinit(allocator);
-                fired += 1;
-            },
+            // Producer-less since decisions §4.13: kv-react fires ride
+            // the durable dirty-marker path (post-commit arm → pending
+            // set → drainPendingSubscriptionFires), never this queue.
+            // The variant stays for the Msg-over-ActivationSource
+            // exhaustiveness contract; the empty payload owns nothing.
+            .subscription_fire => {},
             .fetch_chunk => |ev_const| {
                 // Phase 5 PR-1: single fetch activation kind. Every
                 // event fires `on_chunk` against the handler; `event.final`

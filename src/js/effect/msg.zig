@@ -141,38 +141,14 @@ pub const WakeBatch = struct {};
 /// retired 2026-07-05, unused). Owns its strings;
 /// `deinit` is called by `MsgQueue.deinit` (drop-on-shutdown) and by
 /// the dispatch path after the fire completes.
-pub const SubscriptionFire = struct {
-    /// Source-of-fire discriminant + per-source payload. Mirrors
-    /// `worker.SubscriptionFireSource` but lives in the effect module
-    /// so the algebra surface doesn't reach back into the dispatch
-    /// internals.
-    pub const Source = union(enum) {
-        kv: struct {
-            /// The watched (dirty) prefix — coalesced level-trigger,
-            /// no key/op (durable-kv-subscriptions). Owned by the
-            /// parent `SubscriptionFire`; freed in `deinit`.
-            prefix: []u8,
-        },
-    };
-
-    /// Allocator-owned. The producer dupes onto the message; the
-    /// consumer's dispatch path borrows during the fire and the
-    /// message's `deinit` frees after.
-    tenant_id: []u8,
-    subscription_name: []u8,
-    module_path: []u8,
-    source: Source,
-
-    pub fn deinit(self: *SubscriptionFire, allocator: std.mem.Allocator) void {
-        allocator.free(self.tenant_id);
-        allocator.free(self.subscription_name);
-        allocator.free(self.module_path);
-        switch (self.source) {
-            .kv => |kv_src| if (kv_src.prefix.len > 0) allocator.free(kv_src.prefix),
-        }
-        self.* = undefined;
-    }
-};
+pub const SubscriptionFire = struct {};
+// ^ Empty placeholder since decisions §4.13 (durable-kv-subscriptions):
+// kv-react — the last producer — now rides the durable dirty-marker
+// path (write-time `_sub/dirty/{name}` marker → post-commit pending
+// set → drainPendingSubscriptionFires), never this queue. The variant
+// stays for the Msg-over-ActivationSource exhaustiveness contract
+// (same posture as Inbound / Timer / KvWake). Cron + boot producers
+// retired earlier (P5(b) / 2026-07-05).
 
 /// `http.fetch` `on_chunk` activation (primitive-gaps §2.3).
 /// FetchPool libcurl → `enqueueFetchEventForTenant` → MsgQueue →
@@ -287,16 +263,8 @@ test "Msg covers every ActivationSource variant exhaustively" {
     // slice of the §4 six-question contract enforced by the
     // compiler.
     const testing = std.testing;
-    // SubscriptionFire + SendCallback own strings; build/free
-    // explicitly so the test exercises the real payload shape, not
-    // a placeholder.
-    var sf: SubscriptionFire = .{
-        .tenant_id = try testing.allocator.dupe(u8, "t"),
-        .subscription_name = try testing.allocator.dupe(u8, "s"),
-        .module_path = try testing.allocator.dupe(u8, "m"),
-        .source = .{ .kv = .{ .prefix = try testing.allocator.dupe(u8, "k") } },
-    };
-    defer sf.deinit(testing.allocator);
+    // SendCallback + DurableWake own strings; build/free explicitly
+    // so the test exercises the real payload shapes, not placeholders.
 
     var sc: SendCallback = .{
         .tenant_id = try testing.allocator.dupe(u8, "t"),
@@ -325,7 +293,7 @@ test "Msg covers every ActivationSource variant exhaustively" {
             .disconnect => .{ .disconnect = .{} },
             .kv_wake => .{ .kv_wake = .{} },
             .wake_batch => .{ .wake_batch = .{} },
-            .subscription_fire => .{ .subscription_fire = sf },
+            .subscription_fire => .{ .subscription_fire = .{} },
             .fetch_chunk => .{ .fetch_chunk = .{} },
             .durable_wake => .{ .durable_wake = dw },
             .ws_message => .{ .ws_message = .{} },

@@ -1290,7 +1290,7 @@ pub fn Worker(comptime opts: Options) type {
 
     // Effect-reification Phase 2C: the `subscription_fire_pending`
     // collection that lived here is gone. Every producer (cron + boot
-    // via `drainSubFireInbox`, kv-react via `fireKvReactSubscriptions`)
+    // kv-react via the durable dirty-marker path, decisions §4.13)
     // now routes through `effect.enqueueMsg` onto `Worker.msg_queue`;
     // `dispatchSubscriptionFires` drains the queue. The cross-thread
     // `SubscriptionFireInbox` stays as the boundary for non-worker
@@ -3383,7 +3383,6 @@ pub const scanAndCancelBoundFetches = worker_drain.scanAndCancelBoundFetches;
 // Msg-queue dispatch. See `worker_streaming.zig`'s module doc for the
 // full scope.
 pub const SubscriptionFireSource = worker_streaming.SubscriptionFireSource;
-pub const SubscriptionFireQueueInput = worker_streaming.SubscriptionFireQueueInput;
 pub const StreamResumeStage = worker_streaming.StreamResumeStage;
 pub const setStreamComponents = worker_streaming.setStreamComponents;
 pub const serviceParkedStreams = worker_streaming.serviceParkedStreams;

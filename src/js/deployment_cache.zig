@@ -476,7 +476,7 @@ pub const TenantSlot = struct {
     bytecode_cache: ?*BytecodeCache = null,
     /// Borrowed pointer to the node's async-activation router. Set by
     /// `openTenantSlotNode`; used for cross-thread subscription
-    /// firing (`router.enqueueSubscriptionFireForTenant`). Optional
+    /// firing (the durable dirty-marker path, decisions §4.13). Optional
     /// only in unit-test slot literals.
     router: ?*MsgRouter = null,
     /// Owned blob backend for file-blobs (source + bytecode bytes).

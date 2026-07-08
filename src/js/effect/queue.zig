@@ -60,7 +60,6 @@ const Msg = msg_mod.Msg;
 /// payload-owning variant without an arm here is a build break.
 pub fn freeOwnedMsg(allocator: std.mem.Allocator, msg: *Msg) void {
     switch (msg.*) {
-        .subscription_fire => |*sf| sf.deinit(allocator),
         .fetch_chunk => |*ev| components_mod.UpstreamFetchEvent.deinitItem(ev, allocator),
         .send_callback => |*sc| sc.deinit(allocator),
         .durable_wake => |*dw| dw.deinit(allocator),
@@ -73,6 +72,9 @@ pub fn freeOwnedMsg(allocator: std.mem.Allocator, msg: *Msg) void {
         .disconnect,
         .kv_wake,
         .wake_batch,
+        // subscription_fire: empty placeholder since decisions §4.13
+        // (kv-react rides the durable dirty-marker path).
+        .subscription_fire,
         // ws_message is never enqueued (serviceWsMessages drains the h2
         // collection in-line); the empty payload owns nothing.
         .ws_message,
@@ -215,15 +217,14 @@ test "MsgInbox: deinit on non-empty walks variant-aware free" {
     const testing = std.testing;
     var inbox = MsgInbox.init(testing.allocator);
 
-    const sf: msg_mod.SubscriptionFire = .{
+    const sc: msg_mod.SendCallback = .{
         .tenant_id = try testing.allocator.dupe(u8, "t"),
-        .subscription_name = try testing.allocator.dupe(u8, "s"),
         .module_path = try testing.allocator.dupe(u8, "m"),
-        .source = .{ .kv = .{ .prefix = try testing.allocator.dupe(u8, "k") } },
+        .ctx_json = try testing.allocator.dupe(u8, "{}"),
     };
-    try inbox.push(.{ .subscription_fire = sf });
+    try inbox.push(.{ .send_callback = sc });
     // No drain: deinit walks the items and calls freeOwnedMsg —
-    // the testing allocator surfaces a leak if the SubscriptionFire
+    // the testing allocator surfaces a leak if the SendCallback
     // arm is missed.
     inbox.deinit();
 }
@@ -250,13 +251,12 @@ test "MsgQueue: SubscriptionFire payload freed on shutdown deinit" {
     // No defer q.deinit() — calling it manually below to exercise
     // the drop-on-shutdown path on a non-empty queue.
 
-    const sf: msg_mod.SubscriptionFire = .{
+    const sc: msg_mod.SendCallback = .{
         .tenant_id = try testing.allocator.dupe(u8, "acme"),
-        .subscription_name = try testing.allocator.dupe(u8, "cron-sub"),
-        .module_path = try testing.allocator.dupe(u8, "_subscriptions/cron-sub/index.mjs"),
-        .source = .{ .kv = .{ .prefix = try testing.allocator.dupe(u8, "watched/") } },
+        .module_path = try testing.allocator.dupe(u8, "hooks/onDelivered"),
+        .ctx_json = try testing.allocator.dupe(u8, "{\"ok\":true}"),
     };
-    try enqueueMsg(&q, .{ .subscription_fire = sf });
+    try enqueueMsg(&q, .{ .send_callback = sc });
     try testing.expectEqual(@as(usize, 1), q.len());
 
     // deinit must free the SubscriptionFire's owned strings — the

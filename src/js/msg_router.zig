@@ -23,7 +23,7 @@
 //!
 //! Dependency surface is intentionally tiny: `allocator` only. The
 //! typed input/payload types come from `effect`, `components`, and the
-//! `KvWakeInbox` / `SubscriptionFireQueueInput` definitions that still
+//! `KvWakeInbox` definitions that still
 //! live next to their producers in `worker.zig` / `worker_streaming.zig`.
 
 const std = @import("std");
@@ -34,7 +34,6 @@ const worker_streaming = @import("worker_streaming.zig");
 const globals = @import("globals.zig");
 
 const KvWakeInbox = worker_mod.KvWakeInbox;
-const SubscriptionFireQueueInput = worker_streaming.SubscriptionFireQueueInput;
 
 pub const MsgRouter = struct {
     allocator: std.mem.Allocator,
@@ -57,7 +56,6 @@ pub const MsgRouter = struct {
     /// Producers from non-worker threads (`deployment_loader` for
     /// boot, the `FetchEngine` libcurl thread) call
     /// `enqueueMsgForTenant`; the typed wrappers
-    /// `enqueueSubscriptionFireForTenant` /
     /// `enqueueFetchEventForTenant` build the matching `effect.Msg`
     /// variant and route through it.
     msg_inboxes_mutex: std.Thread.Mutex = .{},
@@ -179,7 +177,7 @@ pub const MsgRouter = struct {
 
     /// Hash-route `msg` onto the destination worker's `MsgInbox` by
     /// `hash(tenant_id) % N`. The typed wrappers
-    /// (`enqueueSubscriptionFireForTenant`, `enqueueFetchEventForTenant`)
+    /// (`enqueueFetchEventForTenant`, `enqueueDurableWakeForTenant`)
     /// build the variant + call this. On success ownership of `msg`'s
     /// owned bytes transfers to the inbox; on error.NoWorkers the
     /// caller retains and MUST `effect.freeOwnedMsg` to free.
@@ -378,45 +376,6 @@ pub const MsgRouter = struct {
         const inbox = self.msg_inboxes.items[worker_idx];
         self.msg_inboxes_mutex.unlock();
         try inbox.push(msg);
-    }
-
-    /// Gap 2.1 Phase D + effect-reification Phase 2E: hash-route a
-    /// subscription fire (kv-react) to the destination
-    /// worker's unified `MsgInbox` as a `SubscriptionFire` variant.
-    /// Producer (loader / sweeper) owns the input slices borrowed;
-    /// this fn dupes onto the payload before pushing. Returns
-    /// `error.NoWorkers` if no inbox is registered yet (cold start
-    /// before any worker spawned).
-    pub fn enqueueSubscriptionFireForTenant(
-        self: *MsgRouter,
-        in: SubscriptionFireQueueInput,
-    ) !void {
-        const allocator = self.allocator;
-        const tid = try allocator.dupe(u8, in.tenant_id);
-        errdefer allocator.free(tid);
-        const name = try allocator.dupe(u8, in.subscription_name);
-        errdefer allocator.free(name);
-        const path = try allocator.dupe(u8, in.module_path);
-        errdefer allocator.free(path);
-
-        const source: effect_mod.msg.SubscriptionFire.Source = switch (in.source) {
-            .kv => |k| blk: {
-                const key_dup = try allocator.dupe(u8, k.key);
-                break :blk .{ .kv = .{ .key = key_dup, .op = k.op } };
-            },
-        };
-        errdefer switch (source) {
-            .kv => |kv| allocator.free(kv.key),
-            else => {},
-        };
-
-        const payload: effect_mod.msg.SubscriptionFire = .{
-            .tenant_id = tid,
-            .subscription_name = name,
-            .module_path = path,
-            .source = source,
-        };
-        try self.enqueueMsgForTenant(in.tenant_id, .{ .subscription_fire = payload });
     }
 
     /// Phase 5 PR-2: hash-route a chained dispatch — a `__rove_next`
