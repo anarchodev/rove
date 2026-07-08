@@ -1117,7 +1117,19 @@ pub fn H2(comptime opts: Options) type {
         // The io instance (heap-allocated by rio.Io.create)
         io: *IoType,
 
-        // H2-specific collections: server request/response
+        // ── Collections, grouped by the poll phase that drives them ──
+        // (§4.5: the field ORDER is the poll loop's shape. Phase names
+        // are `poll`'s: 1 = consume user inputs (pollPrelude), 2 = drive
+        // nghttp2 sends, 3 = io.poll, 4 = read triage / conn transitions
+        // (pollPostlude), 5 = readsFeedData → nghttp2 callbacks emit
+        // entities. `*_out` = h2 produces, the consumer reads between
+        // polls; `*_in` = the consumer produces, Phase 1 drains;
+        // `_underscore` collections are h2-internal parking.)
+
+        // Server request/response: Phase 5 emits `request_out` (+ the
+        // headers_first receiving/buffering stopovers); the consumer
+        // answers on `response_in`, drained by Phase 1's
+        // `consumeResponses` and shipped by Phase 2.
         request_out: StreamColl,
         // headers_first early-emission pipeline (h2_opts.headers_first
         // doc). A request entity whose body is still inbound lives in
@@ -1133,7 +1145,12 @@ pub fn H2(comptime opts: Options) type {
         response_out: StreamColl,
         _response_sending: StreamColl,
 
-        // Streaming response collections
+        // Streaming responses: consumer feeds `stream_response_in` /
+        // `stream_data_in` / `stream_close_in`; Phase 1's
+        // `consumeStream*` drain them; `stream_data_out` is the
+        // "push the next piece" signal back to the consumer, released
+        // by write completions (`writesAccount`) — one write in
+        // flight per stream is the backpressure.
         stream_response_in: StreamColl,
         stream_data_out: StreamColl,
         stream_data_in: StreamColl,
@@ -1166,7 +1183,9 @@ pub fn H2(comptime opts: Options) type {
         // `wsUpgradeReject`). Session = conn, ReqHeaders = the head.
         ws_upgrade_out: StreamColl,
 
-        // Read triage
+        // Read triage (h2-internal): Phase 4 `readsTriage` routes each
+        // completed read here by connection state; Phase 5 feeds
+        // `_read_active` data to the parsers.
         _read_errors: ReadColl,
         _read_init: ReadColl,
         _read_active: ReadColl,
@@ -1177,17 +1196,23 @@ pub fn H2(comptime opts: Options) type {
         // one entry per h1 conn (`Http1Conn.paused_read`).
         _read_h1_paused: ReadColl,
 
-        // Connection pipeline
+        // Connection pipeline (h2-internal): Phase 4 transitions
+        // accepted conns through TLS handshake into active.
         _conn_tls_handshake: ConnColl,
         _conn_active: ConnColl,
 
-        // Client connect lifecycle (conditional)
+        // Client connect lifecycle (client instances): consumer feeds
+        // `client_connect_in` (Phase 1 drains); Phase 4's
+        // `processConnectResults`/`Errors` emit `_out`/`_errors`.
         client_connect_in: ClientConnectColl,
         client_connect_out: ClientConnectColl,
         client_connect_errors: ClientConnectColl,
         _client_connect_pending: ClientConnectColl,
 
-        // Client request/response (conditional)
+        // Client request/response (client instances): consumer feeds
+        // `client_request_in` (Phase 1); Phase 5 emits
+        // `client_response_out` (+ the client_headers_first
+        // receiving stopover).
         client_request_in: ClientStreamColl,
         client_response_out: ClientStreamColl,
         _client_request_sending: ClientStreamColl,
@@ -1199,7 +1224,9 @@ pub fn H2(comptime opts: Options) type {
         // client_headers_first is off.
         client_response_receiving: ClientStreamColl,
 
-        // Client streaming (conditional)
+        // Client streaming (client instances): same shape as the
+        // server streaming group, mirrored (consumer-fed `_in`s
+        // drained by Phase 1; `_out` released by write completions).
         client_stream_request_in: ClientStreamColl,
         client_stream_data_out: ClientStreamColl,
         client_stream_data_in: ClientStreamColl,
