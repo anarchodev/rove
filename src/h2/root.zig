@@ -606,6 +606,131 @@ const WsReassembler = struct {
     }
 };
 
+/// The ONE builder for the `{HeaderField[] | string blob}` combined
+/// allocation that request/response headers ship as (`ReqHeaders._buf`
+/// layout: the field array, then the name/value bytes it points into).
+/// Both protocols build headers through this — h2 incrementally from
+/// nghttp2 header callbacks, h1 from a parsed head — so the growth
+/// hardening lives ONCE:
+///
+///   - `append`'s string-buffer growth loops the doubling until the new
+///     capacity actually fits: a single header (reassembled across h2
+///     CONTINUATION frames) can exceed double the current cap, and a
+///     single doubling would leave the @memcpy writing past the
+///     allocation — a remote heap overflow (h2spec http2/6.10).
+///   - Pre-finalize, field name/value pointers are OFFSETS+1 into
+///     `strbuf` (not addresses — the buffer reallocs); `value` decodes
+///     them for the HEADERS-frame-time lookups. `finalize` rewrites
+///     them into real pointers inside the combined allocation.
+const HeaderBuf = struct {
+    fields: ?[*]HeaderField = null,
+    count: u32 = 0,
+    cap: u32 = 0,
+    strbuf: ?[*]u8 = null,
+    strbuf_len: u32 = 0,
+    strbuf_cap: u32 = 0,
+
+    fn deinit(self: *HeaderBuf, allocator: std.mem.Allocator) void {
+        if (self.fields) |f| allocator.free(@as([*]HeaderField, @ptrCast(@alignCast(f)))[0..self.cap]);
+        if (self.strbuf) |b| allocator.free(b[0..self.strbuf_cap]);
+        self.* = .{};
+    }
+
+    /// Append one header. `lower_name` folds the name to lowercase while
+    /// copying (h1 heads arrive mixed-case; h2 names are already lower).
+    fn append(self: *HeaderBuf, allocator: std.mem.Allocator, name: []const u8, value_bytes: []const u8, lower_name: bool) bool {
+        if (self.count == self.cap) {
+            const new_cap = if (self.cap > 0) self.cap * 2 else 16;
+            const old = if (self.fields) |f| @as([*]HeaderField, @ptrCast(@alignCast(f)))[0..self.cap] else @as([]HeaderField, &.{});
+            const new_buf = allocator.realloc(old, new_cap) catch return false;
+            self.fields = @ptrCast(new_buf.ptr);
+            self.cap = @intCast(new_buf.len);
+        }
+
+        const need: u32 = @intCast(name.len + value_bytes.len);
+        if (self.strbuf_len + need > self.strbuf_cap) {
+            // Grow until the buffer actually fits (see the struct doc).
+            var new_cap: u32 = if (self.strbuf_cap > 0) self.strbuf_cap else 1024;
+            while (new_cap < self.strbuf_len + need) new_cap *|= 2;
+            const old = if (self.strbuf) |b| b[0..self.strbuf_cap] else @as([]u8, &.{});
+            const new_buf = allocator.realloc(old, new_cap) catch return false;
+            self.strbuf = new_buf.ptr;
+            self.strbuf_cap = @intCast(new_buf.len);
+        }
+
+        const name_off = self.strbuf_len;
+        const name_dst = self.strbuf.?[name_off .. name_off + @as(u32, @intCast(name.len))];
+        @memcpy(name_dst, name);
+        if (lower_name) for (name_dst) |*ch| {
+            ch.* = std.ascii.toLower(ch.*);
+        };
+        self.strbuf_len += @intCast(name.len);
+
+        const value_off = self.strbuf_len;
+        @memcpy(self.strbuf.?[value_off .. value_off + @as(u32, @intCast(value_bytes.len))], value_bytes);
+        self.strbuf_len += @intCast(value_bytes.len);
+
+        self.fields.?[self.count] = .{
+            .name = @ptrFromInt(name_off + 1),
+            .name_len = @intCast(name.len),
+            .value = @ptrFromInt(value_off + 1),
+            .value_len = @intCast(value_bytes.len),
+        };
+        self.count += 1;
+        return true;
+    }
+
+    /// Pre-finalize lookup (offset-encoded pointers; see the struct doc).
+    fn value(self: *const HeaderBuf, name: []const u8) ?[]const u8 {
+        const fields = self.fields orelse return null;
+        const sb = self.strbuf orelse return null;
+        for (fields[0..self.count]) |f| {
+            const n = sb[(@intFromPtr(f.name) - 1)..][0..f.name_len];
+            if (std.mem.eql(u8, n, name)) {
+                return sb[(@intFromPtr(f.value) - 1)..][0..f.value_len];
+            }
+        }
+        return null;
+    }
+
+    /// Copy into the combined `{fields|strbuf}` allocation, rewriting the
+    /// offset-encoded pointers into real ones. The accumulator stays
+    /// intact (freed by `deinit`); the caller owns the returned buffer.
+    fn finalize(self: *const HeaderBuf, allocator: std.mem.Allocator, out_fields: *?[*]HeaderField, out_count: *u32, out_buf_len: *u32) ?[*]u8 {
+        const n = self.count;
+        if (n == 0) {
+            out_fields.* = null;
+            out_count.* = 0;
+            out_buf_len.* = 0;
+            return null;
+        }
+
+        const fields_size = @as(usize, n) * @sizeOf(HeaderField);
+        const total = fields_size + self.strbuf_len;
+        const buf_slice = allocator.alloc(u8, total) catch return null;
+        const buf_ptr: [*]u8 = buf_slice.ptr;
+
+        const strbuf_base = buf_ptr + fields_size;
+        @memcpy(strbuf_base[0..self.strbuf_len], self.strbuf.?[0..self.strbuf_len]);
+
+        const result_fields: [*]HeaderField = @ptrCast(@alignCast(buf_ptr));
+        for (0..n) |i| {
+            const src = self.fields.?[i];
+            result_fields[i] = .{
+                .name = strbuf_base + (@intFromPtr(src.name) - 1),
+                .name_len = src.name_len,
+                .value = strbuf_base + (@intFromPtr(src.value) - 1),
+                .value_len = src.value_len,
+            };
+        }
+
+        out_fields.* = result_fields;
+        out_count.* = n;
+        out_buf_len.* = @intCast(total);
+        return buf_ptr;
+    }
+};
+
 // =============================================================================
 // Stream accumulator (nghttp2 stream user_data)
 // =============================================================================
@@ -613,12 +738,7 @@ const WsReassembler = struct {
 const Stream = struct {
     conn_entity: Entity,
     allocator: std.mem.Allocator,
-    hdr_fields: ?[*]HeaderField = null,
-    hdr_count: u32 = 0,
-    hdr_cap: u32 = 0,
-    hdr_strbuf: ?[*]u8 = null,
-    hdr_strbuf_len: u32 = 0,
-    hdr_strbuf_cap: u32 = 0,
+    hdr: HeaderBuf = .{},
     body_data: ?[*]u8 = null,
     body_len: u32 = 0,
     body_cap: u32 = 0,
@@ -680,8 +800,7 @@ const Stream = struct {
 
     fn free(self: *Stream) void {
         const allocator = self.allocator;
-        if (self.hdr_fields) |f| allocator.free(@as([*]HeaderField, @ptrCast(@alignCast(f)))[0..self.hdr_cap]);
-        if (self.hdr_strbuf) |b| allocator.free(b[0..self.hdr_strbuf_cap]);
+        self.hdr.deinit(allocator);
         if (self.body_data) |p| allocator.free(p[0..self.body_cap]);
         if (self.send_data) |d| d.destroy();
         if (self.stream_chunk_data) |cd| allocator.free(cd[0..self.stream_chunk_len]);
@@ -689,95 +808,20 @@ const Stream = struct {
         allocator.destroy(self);
     }
 
-    /// Look up a header value in the PRE-finalize accumulator (names and
-    /// values are offset-encoded into `hdr_strbuf` until `hdrFinalize`).
-    /// Used at HEADERS-frame time, before any entity exists.
+    /// Pre-finalize header lookup (HEADERS-frame time, before any entity
+    /// exists). Delegates to the shared builder.
     fn hdrValue(self: *const Stream, name: []const u8) ?[]const u8 {
-        const fields = self.hdr_fields orelse return null;
-        const sb = self.hdr_strbuf orelse return null;
-        for (fields[0..self.hdr_count]) |f| {
-            const n = sb[(@intFromPtr(f.name) - 1)..][0..f.name_len];
-            if (std.mem.eql(u8, n, name)) {
-                return sb[(@intFromPtr(f.value) - 1)..][0..f.value_len];
-            }
-        }
-        return null;
+        return self.hdr.value(name);
     }
 
+    /// nghttp2 header-callback shape over `HeaderBuf.append` (names from
+    /// nghttp2 are already lowercase).
     fn hdrAppend(self: *Stream, name: [*]const u8, name_len: usize, value: [*]const u8, value_len: usize) bool {
-        if (self.hdr_count == self.hdr_cap) {
-            const new_cap = if (self.hdr_cap > 0) self.hdr_cap * 2 else 16;
-            const old = if (self.hdr_fields) |f| @as([*]HeaderField, @ptrCast(@alignCast(f)))[0..self.hdr_cap] else @as([]HeaderField, &.{});
-            const new_buf = self.allocator.realloc(old, new_cap) catch return false;
-            self.hdr_fields = @ptrCast(new_buf.ptr);
-            self.hdr_cap = @intCast(new_buf.len);
-        }
-
-        const need: u32 = @intCast(name_len + value_len);
-        if (self.hdr_strbuf_len + need > self.hdr_strbuf_cap) {
-            // Grow until the buffer actually fits: a single header field
-            // (reassembled across CONTINUATION frames) can exceed double the
-            // current cap, in which case one doubling leaves the @memcpy below
-            // writing past the allocation — a remote heap overflow (h2spec
-            // http2/6.10). Loop the doubling so new_cap >= len + need.
-            var new_cap: u32 = if (self.hdr_strbuf_cap > 0) self.hdr_strbuf_cap else 1024;
-            while (new_cap < self.hdr_strbuf_len + need) new_cap *|= 2;
-            const old = if (self.hdr_strbuf) |b| b[0..self.hdr_strbuf_cap] else @as([]u8, &.{});
-            const new_buf = self.allocator.realloc(old, new_cap) catch return false;
-            self.hdr_strbuf = new_buf.ptr;
-            self.hdr_strbuf_cap = @intCast(new_buf.len);
-        }
-
-        const name_off = self.hdr_strbuf_len;
-        @memcpy(self.hdr_strbuf.?[name_off .. name_off + @as(u32, @intCast(name_len))], name[0..name_len]);
-        self.hdr_strbuf_len += @intCast(name_len);
-
-        const value_off = self.hdr_strbuf_len;
-        @memcpy(self.hdr_strbuf.?[value_off .. value_off + @as(u32, @intCast(value_len))], value[0..value_len]);
-        self.hdr_strbuf_len += @intCast(value_len);
-
-        self.hdr_fields.?[self.hdr_count] = .{
-            .name = @ptrFromInt(name_off + 1),
-            .name_len = @intCast(name_len),
-            .value = @ptrFromInt(value_off + 1),
-            .value_len = @intCast(value_len),
-        };
-        self.hdr_count += 1;
-        return true;
+        return self.hdr.append(self.allocator, name[0..name_len], value[0..value_len], false);
     }
 
     fn hdrFinalize(self: *Stream, out_fields: *?[*]HeaderField, out_count: *u32, out_buf_len: *u32) ?[*]u8 {
-        const n = self.hdr_count;
-        if (n == 0) {
-            out_fields.* = null;
-            out_count.* = 0;
-            out_buf_len.* = 0;
-            return null;
-        }
-
-        const fields_size = @as(usize, n) * @sizeOf(HeaderField);
-        const total = fields_size + self.hdr_strbuf_len;
-        const buf_slice = self.allocator.alloc(u8, total) catch return null;
-        const buf_ptr: [*]u8 = buf_slice.ptr;
-
-        const strbuf_base = buf_ptr + fields_size;
-        @memcpy(strbuf_base[0..self.hdr_strbuf_len], self.hdr_strbuf.?[0..self.hdr_strbuf_len]);
-
-        const result_fields: [*]HeaderField = @ptrCast(@alignCast(buf_ptr));
-        for (0..n) |i| {
-            const src = self.hdr_fields.?[i];
-            result_fields[i] = .{
-                .name = strbuf_base + (@intFromPtr(src.name) - 1),
-                .name_len = src.name_len,
-                .value = strbuf_base + (@intFromPtr(src.value) - 1),
-                .value_len = src.value_len,
-            };
-        }
-
-        out_fields.* = result_fields;
-        out_count.* = n;
-        out_buf_len.* = @intCast(total);
-        return buf_ptr;
+        return self.hdr.finalize(self.allocator, out_fields, out_count, out_buf_len);
     }
 
     fn bodyAppend(self: *Stream, data: [*]const u8, len: usize) bool {
@@ -4373,62 +4417,32 @@ pub fn H2(comptime opts: Options) type {
         /// pseudo-headers followed by the request's end-to-end headers
         /// (names lowercased to match h2/handler lookups). One combined buffer
         /// holds the field array + name/value bytes, freed by `ReqHeaders.deinit`.
+        /// Build the h1 request's ReqHeaders through the SAME `HeaderBuf`
+        /// the h2 path uses — one hardened growth/pack implementation, one
+        /// combined-allocation layout (§4.2: the h1 copy used to hand-roll
+        /// the layout and could drift from the h2spec-hardened builder).
+        /// Pseudo-headers first (h2 ordering rules), then the head's real
+        /// headers lowercased, minus hop-by-hop + Connection-nominated.
         fn http1BuildReqHeaders(self: *Self, head: http1.Head, scheme: []const u8) !ReqHeaders {
-            const Pair = struct { name: []const u8, value: []const u8 };
-            const pseudo = [_]Pair{
-                .{ .name = ":method", .value = head.method },
-                .{ .name = ":path", .value = head.target },
-                .{ .name = ":scheme", .value = scheme },
-                .{ .name = ":authority", .value = head.host orelse "" },
-            };
+            var hb: HeaderBuf = .{};
+            defer hb.deinit(self.allocator);
 
-            var n: usize = pseudo.len;
-            var strbytes: usize = 0;
-            for (pseudo) |p| strbytes += p.name.len + p.value.len;
+            if (!hb.append(self.allocator, ":method", head.method, false)) return error.OutOfMemory;
+            if (!hb.append(self.allocator, ":path", head.target, false)) return error.OutOfMemory;
+            if (!hb.append(self.allocator, ":scheme", scheme, false)) return error.OutOfMemory;
+            if (!hb.append(self.allocator, ":authority", head.host orelse "", false)) return error.OutOfMemory;
             for (head.headers) |hh| {
                 if (http1IsHopByHop(hh.name)) continue;
                 if (http1NominatedByConnection(head, hh.name)) continue;
-                n += 1;
-                strbytes += hh.name.len + hh.value.len;
+                if (!hb.append(self.allocator, hh.name, hh.value, true)) return error.OutOfMemory;
             }
 
-            const fields_size = n * @sizeOf(HeaderField);
-            const total = fields_size + strbytes;
-            const buf = try self.allocator.alloc(u8, total);
-            const fields: [*]HeaderField = @ptrCast(@alignCast(buf.ptr));
-            const strbase = buf.ptr + fields_size;
-
-            var soff: usize = 0;
-            var fi: usize = 0;
-            const writeField = struct {
-                fn go(f: [*]HeaderField, sb: [*]u8, off: *usize, idx: *usize, name: []const u8, value: []const u8, lower: bool) void {
-                    const noff = off.*;
-                    @memcpy(sb[noff .. noff + name.len], name);
-                    if (lower) for (sb[noff .. noff + name.len]) |*ch| {
-                        ch.* = std.ascii.toLower(ch.*);
-                    };
-                    off.* += name.len;
-                    const voff = off.*;
-                    @memcpy(sb[voff .. voff + value.len], value);
-                    off.* += value.len;
-                    f[idx.*] = .{
-                        .name = sb + noff,
-                        .name_len = @intCast(name.len),
-                        .value = sb + voff,
-                        .value_len = @intCast(value.len),
-                    };
-                    idx.* += 1;
-                }
-            }.go;
-
-            for (pseudo) |p| writeField(fields, strbase, &soff, &fi, p.name, p.value, false);
-            for (head.headers) |hh| {
-                if (http1IsHopByHop(hh.name)) continue;
-                if (http1NominatedByConnection(head, hh.name)) continue;
-                writeField(fields, strbase, &soff, &fi, hh.name, hh.value, true);
-            }
-
-            return .{ .fields = fields, .count = @intCast(n), ._buf = buf.ptr, ._buf_len = @intCast(total) };
+            var fields: ?[*]HeaderField = null;
+            var count: u32 = 0;
+            var buf_len: u32 = 0;
+            const buf = hb.finalize(self.allocator, &fields, &count, &buf_len) orelse
+                return error.OutOfMemory; // count >= 4 (pseudo) — null here is alloc failure
+            return .{ .fields = fields, .count = count, ._buf = buf, ._buf_len = buf_len };
         }
 
         /// Encrypt (when the connection is TLS) and queue an owned plaintext
@@ -6126,7 +6140,7 @@ test "stream accumulator — headers and body" {
     try testing.expect(stream.hdrAppend(":method", 7, "GET", 3));
     try testing.expect(stream.hdrAppend(":path", 5, "/hello", 6));
     try testing.expect(stream.hdrAppend("host", 4, "localhost", 9));
-    try testing.expectEqual(@as(u32, 3), stream.hdr_count);
+    try testing.expectEqual(@as(u32, 3), stream.hdr.count);
 
     try testing.expect(stream.bodyAppend("hello world", 11));
     try testing.expectEqual(@as(u32, 11), stream.body_len);
