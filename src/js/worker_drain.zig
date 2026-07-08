@@ -1552,7 +1552,7 @@ fn resumeContinuation(
                 // source = send_callback so the row shares the chain
                 // id with the inbound entry and the replay UX groups
                 // them.
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, &.{}, act_src, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, r.tags, act_src, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -1606,7 +1606,7 @@ fn resumeContinuation(
                 // into pending_txns) and body_dup (stamped onto entity).
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", dep_id, now_ns, st, .ok, console_owned, exception_owned, .{}, corr_id, &.{}, act_src, cont_seq);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", dep_id, now_ns, st, .ok, console_owned, exception_owned, .{}, corr_id, r.tags, act_src, cont_seq);
                 if (pending_fetches.items.len > 0) std.log.warn(
                     "rove-js cont-resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ pending_fetches.items.len, tenant_id },
@@ -1624,7 +1624,7 @@ fn resumeContinuation(
             flushResumeFetches(worker, ent, &pending_fetches, false);
             const st: u16 = @intCast(@max(@min(r.status, 599), 100));
             try resolveParked(worker, ent, sid, sess, st, r.body);
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, &.{}, act_src, 0);
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, r.tags, act_src, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -2002,7 +2002,7 @@ pub fn resumeBoundFetchChain(
                 txn.rollback() catch {};
                 txn_done = true;
                 resolveParked(worker, ent, sid, sess, 500, "bound-fetch handler exception\n") catch {};
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, &.{}, .fetch_chunk, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, r.tags, .fetch_chunk, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return;
@@ -2043,7 +2043,7 @@ pub fn resumeBoundFetchChain(
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, &.{}, .fetch_chunk, seq);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, r.tags, .fetch_chunk, seq);
                 if (pending_fetches.items.len > 0) std.log.warn(
                     "rove-js bound-fetch resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
                     .{ pending_fetches.items.len, tenant_id },
@@ -2060,7 +2060,7 @@ pub fn resumeBoundFetchChain(
             // fetches drop (scope rule), unbound ones still fire.
             flushResumeFetches(worker, ent, &pending_fetches, false);
             resolveParked(worker, ent, sid, sess, st, r.body) catch {};
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, &.{}, .fetch_chunk, 0);
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, r.tags, .fetch_chunk, 0);
             r.console = &.{};
             r.exception = &.{};
         },
@@ -3132,7 +3132,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
                 txn.rollback() catch {};
                 txn_done = true;
                 resolveParked(worker, ent, sid, sess, 500, "inbound-chunk handler exception\n") catch {};
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, &.{}, .inbound_chunk, 0);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, r.tags, .inbound_chunk, 0);
                 r.console = &.{};
                 r.exception = &.{};
                 return true;
@@ -3173,7 +3173,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
                 };
                 txn_owned = false;
                 txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, &.{}, .inbound_chunk, seq);
+                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, r.tags, .inbound_chunk, seq);
                 return true;
             }
             txn.commit() catch |e| panic_mod.invariantViolated(
@@ -3184,7 +3184,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
             txn_done = true;
             flushResumeFetches(worker, ent, &pending_fetches, false);
             resolveParked(worker, ent, sid, sess, st, r.body) catch {};
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, &.{}, .inbound_chunk, 0);
+            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, r.tags, .inbound_chunk, 0);
             r.console = &.{};
             r.exception = &.{};
         },
