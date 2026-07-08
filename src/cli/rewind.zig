@@ -725,6 +725,78 @@ fn cmdExportFixture(a: std.mem.Allocator, fixture_path: []const u8, out_file: ?[
     }
 }
 
+/// `rewind test [dir] [--source-dir DIR] [--update]` — run every
+/// `{dir}/_tests/*.mjs` through the JS saga test library (`rewind:test`),
+/// offline. Each test body runs on a harness reactor and drives the sim engine
+/// via `simulate()`; assertions stream back per file. Handler code a test
+/// simulates resolves from `--source-dir` (default: `dir`) unless the scenario
+/// declares its own `sourceDir`. `--update` rebaselines snapshots. Exits
+/// non-zero if any assertion fails or a file aborts (CI-usable).
+fn cmdTest(a: std.mem.Allocator, dir: []const u8, source_dir: ?[]const u8, update: bool) void {
+    const report = replay.runTests(a, dir, .{
+        .update = update,
+        // An explicit --source-dir overrides a world's inline sources; `dir` is
+        // the fallback for worlds that declare neither sourceDir nor sources.
+        .source_dir = source_dir,
+        .base_dir = dir,
+    }) catch |e| switch (e) {
+        error.NoTestsDir => c.fatal("test: no _tests/ directory under '{s}'", .{dir}),
+        error.ArenaInit => c.fatal("test: JS engine failed to initialise", .{}),
+        else => c.fatal("test: {s}", .{@errorName(e)}),
+    };
+
+    if (report.files.len == 0) {
+        std.debug.print("test: no _tests/*.mjs files under '{s}'\n", .{dir});
+        return;
+    }
+
+    var total_pass: usize = 0;
+    var total_fail: usize = 0;
+    var files_failed: usize = 0;
+    for (report.files) |f| {
+        const p = f.passed();
+        const fl = f.failed();
+        total_pass += p;
+        total_fail += fl;
+        const file_ok = f.ok();
+        if (!file_ok) files_failed += 1;
+        std.debug.print("{s} {s}\n", .{ if (file_ok) "PASS" else "FAIL", f.path });
+        for (f.asserts) |as_| {
+            const name = jsonField(a, as_.json, "name") orelse "?";
+            if (as_.pass) {
+                std.debug.print("  ✓ {s}\n", .{name});
+            } else {
+                const detail = jsonField(a, as_.json, "detail") orelse "";
+                std.debug.print("  ✗ {s}  {s}\n", .{ name, detail });
+            }
+        }
+        if (!f.completed) std.debug.print(
+            "  ⚠ file aborted before completion (uncaught error, rc={d}) — run it directly to see the throw\n",
+            .{f.rc},
+        );
+    }
+
+    std.debug.print(
+        "\n{d} file(s): {d} passed, {d} failed ({d} file(s) with failures)\n",
+        .{ report.files.len, total_pass, total_fail, files_failed },
+    );
+    if (!report.ok()) std.process.exit(1);
+}
+
+/// Pull one top-level field out of a small assertion JSON as its serialized
+/// text (a string field comes back unquoted; objects/scalars as-is). Best-effort
+/// for the human report — returns null when absent or on a parse error.
+fn jsonField(a: std.mem.Allocator, json: []const u8, key: []const u8) ?[]const u8 {
+    const p = std.json.parseFromSlice(std.json.Value, a, json, .{}) catch return null;
+    if (p.value != .object) return null;
+    const v = p.value.object.get(key) orelse return null;
+    return switch (v) {
+        .string => v.string,
+        .null => null,
+        else => std.json.Stringify.valueAlloc(a, v, .{}) catch null,
+    };
+}
+
 fn emitStr(w: *std.Io.Writer, s: []const u8) void {
     std.json.Stringify.value(s, .{}, w) catch c.oom();
 }
@@ -828,6 +900,7 @@ const USAGE =
     \\  rewind [--env <file>] pull <tenant> <req_id> [-o FILE]
     \\  rewind [--env <file>] replay <world.json> [--source-dir DIR] [--update] [-o FILE]
     \\  rewind sim <world.json> [--source-dir DIR] [--update] [-o FILE]
+    \\  rewind test [dir] [--source-dir DIR] [--update]
     \\  rewind export-fixture <base64-record.json> [-o world.json]
     \\  rewind [--env <file>] publish [--apps-dir D] [--only t1,t2] [--include-examples] [--no-release]
     \\  rewind [--env <file>] provision <tenant> [--cluster C] [--host H]
@@ -895,7 +968,7 @@ pub fn main() void {
         std.mem.eql(u8, verb, "move") or std.mem.eql(u8, verb, "route") or
         std.mem.eql(u8, verb, "logs") or std.mem.eql(u8, verb, "pull") or
         std.mem.eql(u8, verb, "replay") or std.mem.eql(u8, verb, "sim") or
-        std.mem.eql(u8, verb, "export-fixture");
+        std.mem.eql(u8, verb, "test") or std.mem.eql(u8, verb, "export-fixture");
     if (!known) {
         std.debug.print("rewind: unknown command '{s}'\n\n{s}", .{ verb, USAGE });
         std.process.exit(2);
@@ -949,6 +1022,31 @@ pub fn main() void {
             } else c.fatal("sim: unknown option '{s}'", .{rest[j]});
         }
         cmdSim(a, rest[0], source_dir, out_file, update);
+        return;
+    }
+
+    // `test` is offline — the JS saga test runner (harness + sim reactors).
+    if (std.mem.eql(u8, verb, "test")) {
+        var dir: []const u8 = ".";
+        var source_dir: ?[]const u8 = null;
+        var update = false;
+        var got_dir = false;
+        var j: usize = 0;
+        while (j < rest.len) : (j += 1) {
+            if (std.mem.eql(u8, rest[j], "--source-dir")) {
+                if (j + 1 >= rest.len) c.fatal("--source-dir needs a path", .{});
+                source_dir = rest[j + 1];
+                j += 1;
+            } else if (std.mem.eql(u8, rest[j], "--update")) {
+                update = true;
+            } else if (std.mem.startsWith(u8, rest[j], "-")) {
+                c.fatal("test: unknown option '{s}'", .{rest[j]});
+            } else if (!got_dir) {
+                dir = rest[j];
+                got_dir = true;
+            } else c.fatal("test: unexpected argument '{s}'", .{rest[j]});
+        }
+        cmdTest(a, dir, source_dir, update);
         return;
     }
 

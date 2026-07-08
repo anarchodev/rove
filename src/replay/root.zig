@@ -10,14 +10,16 @@
 //! `effects`, and the recorded comparison. No Node/WASM/network — the arenajs
 //! engine is linked in.
 //!
-//! `runWorld` is **multi-shot**: the reactor is a *resettable* runtime — base is
-//! frozen once by `arena_init`, and every `arena_run_module` wipes the request
-//! arena (`JS_ResetRequestArena`), which is the production per-request model. So
-//! one process can run many worlds through it: init the arena at most once
-//! (`ensureArena`; a second `arena_init` would hard-fail on the process-global
-//! `g_rt`), then run+reset per world. This is the `simulate(world) → bundle`
-//! primitive — the in-process scenario driver and the JS-authored test runner
-//! both fold over repeated `runWorld` calls instead of one subprocess each.
+//! The engine is an `Engine` holding a *resettable* **sim** reactor (arenajs
+//! 0.3.3's instance API, `arena_reactor_new` + `arena_run_module_r`): base is
+//! frozen once at `Engine.init`, and every run wipes the request arena
+//! (`JS_ResetRequestArena`) — the production per-request model — so one reactor
+//! runs many worlds isolated by construction. `Engine.simulate(world) → bundle`
+//! is the atom; `runWorld` is the one-shot wrapper (`rewind sim`/`replay`), and
+//! the JS-authored test runner (`harness.zig`, `runTests`) holds ONE persistent
+//! `Engine` and folds a whole saga over repeated `simulate` calls, running the
+//! test body itself on a SEPARATE harness reactor — two reactors, one thread,
+//! the de-singletoned instance API's headline use case.
 //! The base64-tape → world transcode lives in `export_fixture.zig` (used by
 //! `pull` online + `export-fixture` offline). The old ordered-cursor `run` +
 //! its `.tape` host mode are retired — resolution is by-key.
@@ -36,13 +38,28 @@ pub const exportFixture = export_fixture.transcode;
 pub const exportFixtureActivation = export_fixture.activationOf;
 pub const exportFixtureIsInbound = export_fixture.isInboundFamily;
 
-// ── arenajs native ABI (qjs-arena-reactor.c) ──
-extern fn arena_init(base_kb: c_int, request_kb: c_int) c_int;
-extern fn arena_run_module(entry_name: [*c]const u8, entry_src: [*c]const u8) c_int;
-extern fn arena_set_trace_mode(mode: c_int) void;
-extern fn arena_set_date_now(lo: u32, hi: u32) void;
-extern fn arena_set_random_seed(lo: u32, hi: u32) void;
-extern fn arena_set_request_mode(mode: c_int) void;
+// ── the JS-authored test runner (harness reactor + saga library) ──
+const harness = @import("harness.zig");
+pub const runTests = harness.runTests;
+pub const TestOptions = harness.Options;
+pub const TestReport = harness.Report;
+pub const TestFileResult = harness.FileResult;
+
+// ── arenajs native ABI — instance API (qjs-arena-reactor.h) ──
+// The reactor was de-singletoned in arenajs 0.3.3 (`arena_reactor_new` + the
+// `_r` variants): each `ArenaReactor*` owns its own runtime, so two can coexist
+// on one thread and runs may NEST across them. That is exactly the shape the
+// rewind test runner needs — a long-lived harness runtime whose test body
+// synchronously drives a reset-reused sim runtime via `simulate()` — so we drop
+// the old process-global singleton (`arena_init`/`arena_run_module`) entirely
+// and consume the instance surface (converge to one path, no coexistence).
+pub const ArenaReactor = opaque {};
+extern fn arena_reactor_new(base_kb: c_int, request_kb: c_int) ?*ArenaReactor;
+extern fn arena_run_module_r(r: *ArenaReactor, entry_name: [*c]const u8, entry_src: [*c]const u8) c_int;
+extern fn arena_set_trace_mode_r(r: *ArenaReactor, mode: c_int) void;
+extern fn arena_set_date_now_r(r: *ArenaReactor, ms: i64) void;
+extern fn arena_set_random_seed_r(r: *ArenaReactor, seed: u64) void;
+extern fn arena_set_request_mode_r(r: *ArenaReactor, mode: c_int) void;
 
 pub const Error = error{
     BadFixture,
@@ -52,145 +69,205 @@ pub const Error = error{
     WriteFailed, // std.Io.Writer.Allocating sink (OOM surfaced as WriteFailed)
 } || decode.Error || std.mem.Allocator.Error;
 
-/// One-shot guard for `arena_init`. The reactor holds a *process-global* runtime
-/// (`g_rt`) and refuses a second init (`arena_init` returns -1 when `g_rt` is
-/// already set). Since `arena_run_module` resets the request arena on every
-/// call, one init + many runs IS the resettable runtime — so we init once and
-/// let each `runWorld` reset+run. Not thread-safe: the reactor is a single
-/// process-global runtime, so `runWorld` callers share one engine on one thread.
-var arena_ready: bool = false;
+/// The one replay/sim engine, holding a resettable **sim** reactor. Each
+/// `simulate()` resets that reactor's request arena and runs one world through
+/// it, so repeated calls are isolated by construction (no cross-run kv/alloc
+/// leak). One `Engine` runs many worlds on one thread; the harness runner
+/// (`harness.zig`) holds ONE persistent `Engine` and folds a whole saga over
+/// repeated `simulate()` calls, while `runWorld` below is the one-shot wrapper
+/// for `rewind sim` / `rewind replay`.
+pub const Engine = struct {
+    sim: *ArenaReactor,
 
-fn ensureArena() Error!void {
-    if (arena_ready) return;
-    if (arena_init(8192, 8192) != 0) return Error.ArenaInit;
-    arena_ready = true;
-}
+    pub fn init() Error!Engine {
+        const s = arena_reactor_new(8192, 8192) orelse return Error.ArenaInit;
+        return .{ .sim = s };
+    }
 
+    /// The sim reactor is **process-lived** and deliberately NOT torn down here.
+    /// Each `simulate` run's epilogue roots the handler surface (`request`,
+    /// `kv`, `response`, `after`, …) on the reactor's base global object, so
+    /// those objects outlive the request arena but are referenced from base —
+    /// `JS_FreeRuntime`'s leak check would abort if we freed the runtime with
+    /// them still rooted. The replay/sim/test CLIs are one-shot processes, so
+    /// the reactor is reclaimed at exit (the same lifetime the pre-0.3.3
+    /// singleton had — it never freed either). `deinit` stays for API symmetry
+    /// and to mark the owning scope.
+    pub fn deinit(self: *Engine) void {
+        _ = self;
+    }
 
-/// Run a **declarative** world (an *authored* fixture, not a captured tape) —
-/// the one engine. KV reads resolve order-independently against the world's
-/// key→value map — a **closed world**: a key not in the map is `not_found`
-/// (never a divergence). Faithfulness lives at the output (`status_match`) + the
-/// effect log, not per-read. The request surface is rebuilt by synthesizing
-/// `request_reads` entries from the declared request, so the SAME epilogue
-/// serves it — undeclared header reads are naturally `undefined`.
+    /// Run a **declarative** world (an *authored* fixture, not a captured tape)
+    /// on the sim reactor, appending the LLM-JSON bundle to `out`. KV reads
+    /// resolve order-independently against the world's key→value map — a
+    /// **closed world**: a key not in the map is `not_found` (never a
+    /// divergence). Faithfulness lives at the output (`expected`) + the effect
+    /// log, not per-read. The request surface is rebuilt by synthesizing
+    /// `request_reads` entries from the declared request, so the SAME epilogue
+    /// serves it — undeclared header reads are naturally `undefined`.
+    ///
+    /// Installs the sim reactor's replay host for the duration of the run. When
+    /// a nested caller (the harness) had its own host installed, it must
+    /// re-install after this returns — the host registration is process-global
+    /// by arenajs's contract (one thread, N instances, save/restore at the
+    /// call site).
+    /// Source resolution precedence (highest first): the world's own
+    /// `source_dir` (`scenario({ sourceDir })`), then an explicit
+    /// `source_dir` override (`--source-dir`), then the world's inline
+    /// `sources`, then `base_dir` (the `rewind test` app dir — a fallback used
+    /// only when nothing more specific applies). An explicit dir wins over
+    /// inline sources so `rewind sim --source-dir ./tree` stays the working-tree
+    /// "what-if" lever; inline sources win over the bare `base_dir` fallback so
+    /// `scenario({ sources })` runs its own code.
+    pub fn simulate(
+        self: *Engine,
+        a: std.mem.Allocator,
+        world_json: []const u8,
+        source_dir: ?[]const u8,
+        base_dir: ?[]const u8,
+        out: *std.ArrayList(u8),
+    ) Error!void {
+        const parsed = std.json.parseFromSlice(std.json.Value, a, world_json, .{}) catch
+            return Error.BadFixture;
+        const wv = world.fromValue(a, parsed.value) catch return Error.BadFixture;
+
+        // ── synthesize request_reads from the declared request ──
+        var reads = std.ArrayList(decode.RequestReadEntry){};
+        // header_names: a JSON array of the declared header names.
+        var names_buf = std.ArrayList(u8){};
+        {
+            var aw = std.Io.Writer.Allocating.fromArrayList(a, &names_buf);
+            const w = &aw.writer;
+            try w.writeByte('[');
+            for (wv.headers, 0..) |hh, i| {
+                if (i != 0) try w.writeByte(',');
+                try jsonStr(w, hh.name);
+            }
+            try w.writeByte(']');
+            names_buf = aw.toArrayList();
+        }
+        try reads.append(a, .{ .kind = .header_names, .name = "", .value = names_buf.items });
+        for (wv.headers) |hh|
+            try reads.append(a, .{ .kind = .header_value, .name = hh.name, .value = hh.value });
+        if (wv.body != null)
+            try reads.append(a, .{ .kind = .body_read, .name = "", .value = "" });
+        if (wv.ip) |ip|
+            try reads.append(a, .{ .kind = .ip_masked, .name = "", .value = ip });
+
+        // ── kv readset → map ──
+        var kv_map = std.StringHashMapUnmanaged([]const u8){};
+        for (wv.kv) |p| try kv_map.put(a, p.key, p.value);
+
+        // ── module sources (inline) ──
+        var sources = std.StringHashMapUnmanaged([]const u8){};
+        for (wv.sources) |s| {
+            if (!std.mem.eql(u8, s.kind, "handler")) continue;
+            try sources.put(a, s.path, s.source);
+        }
+
+        // Source resolution (see the doc-comment): world source_dir / explicit
+        // override win over inline `sources`, which win over the `base_dir`
+        // fallback. `src_dir` non-null ⇒ resolve from disk; null ⇒ inline.
+        const explicit_dir = wv.source_dir orelse source_dir;
+        const src_dir = explicit_dir orelse (if (sources.count() != 0) null else base_dir);
+
+        // Entry source: working tree (if a source dir) else the inline world.
+        const entry_src = blk: {
+            if (src_dir) |dir| {
+                const ep = std.fs.path.join(a, &.{ dir, wv.entry }) catch return Error.OutOfMemory;
+                break :blk std.fs.cwd().readFileAlloc(a, ep, 8 << 20) catch
+                    return Error.EntrySourceMissing;
+            }
+            break :blk sources.get(wv.entry) orelse return Error.EntrySourceMissing;
+        };
+
+        const binary_body = std.mem.eql(u8, wv.activation, "inbound_chunk") or
+            std.mem.eql(u8, wv.activation, "fetch_chunk");
+        // The resolved export: the world's explicit `export` (the `{to}` /
+        // resolved name a callback needs) wins; else the conventional export.
+        const export_name = wv.export_name orelse epilogue.exportForActivation(wv.activation);
+        const result: ?epilogue.Result = if (wv.status != null or wv.ok != null or
+            wv.done != null or wv.fetch_id != null or wv.chunk_seq != null)
+            .{ .status = wv.status, .ok = wv.ok, .done = wv.done, .fetch_id = wv.fetch_id, .chunk_seq = wv.chunk_seq }
+        else
+            null;
+        const epi = try epilogue.build(a, .{
+            .method = wv.method,
+            .path = wv.path,
+            .host = wv.host,
+            .request_reads = reads.items,
+            .body_bytes = wv.body,
+            .export_name = export_name,
+            .binary_body = binary_body,
+            .ctx_json = wv.ctx_json,
+            .activation_json = wv.activation_json,
+            .result = result,
+        });
+        const full_src = try std.mem.concatWithSentinel(a, u8, &.{ entry_src, epi }, 0);
+        const entry_z = try a.dupeZ(u8, wv.entry);
+
+        // ── drive the sim reactor. `arena_run_module_r` resets the request
+        // arena on entry, so repeated simulate() calls on `self.sim` are
+        // isolated (no cross-run kv/alloc leak). ──
+        var host = hostmod.Host{
+            .a = a,
+            .kv_map = kv_map,
+            .sources = sources,
+            .source_dir = src_dir,
+        };
+        host.install();
+
+        // Replay under the regime the live request completed under (mode binds
+        // at the entry reset). Set EVERY run — the choice is sticky on the
+        // reactor, so a GC world must not leak GC mode into the next bump world.
+        arena_set_request_mode_r(self.sim, if (wv.arena_gc) 0 else 1);
+        arena_set_random_seed_r(self.sim, wv.seed);
+        // Reinterpret the u64 ms bit-pattern as the i64 the API takes (matches
+        // the pre-instance lo/hi split, which passed the same 64 bits); a plain
+        // @intCast would panic on a pathological now_ms ≥ 2^63.
+        arena_set_date_now_r(self.sim, @bitCast(wv.now_ms));
+        arena_set_trace_mode_r(self.sim, 0);
+
+        const rc = arena_run_module_r(self.sim, entry_z.ptr, full_src.ptr);
+
+        try emitWorld(a, out, .{
+            .entry = wv.entry,
+            .activation = wv.activation,
+            .export_name = export_name,
+            .rc = rc,
+            .divergence = host.diverged,
+            .writes = host.writes.items,
+            .run_json = host.output,
+        });
+
+        // Optional `expected` → append a `verify` result (partial,
+        // order-independent match over the bundle). Present ⇒ test/replay
+        // assertion; absent ⇒ plain sim (bundle only).
+        if (wv.expected_json) |ej| appendVerify(a, out, ej) catch {};
+    }
+};
+
+/// Process-global sim engine backing `runWorld`. Lazily created once and
+/// **reused** (each `simulate` resets the sim reactor's request arena), so
+/// repeated `runWorld` calls in one process share one reactor rather than
+/// leaking a fresh ~16 MiB runtime per call — the pre-0.3.3 init-once behavior.
+/// Not thread-safe (one thread, per the reactor contract). The harness runner
+/// holds its OWN separate `Engine`; this is only `rewind sim`/`replay`.
+var g_run_engine: ?Engine = null;
+
+/// Run a single declarative world and emit its bundle — `rewind sim` / `rewind
+/// replay`. Reuses the process-global engine. Callers folding MANY worlds
+/// should hold their own persistent `Engine` and call `simulate` directly
+/// rather than looping `runWorld` (each call would otherwise re-parse and the
+/// intent — one reused reactor — is clearer with an explicit `Engine`).
 pub fn runWorld(
     a: std.mem.Allocator,
     world_json: []const u8,
     source_dir: ?[]const u8,
     out: *std.ArrayList(u8),
 ) Error!void {
-    const parsed = std.json.parseFromSlice(std.json.Value, a, world_json, .{}) catch
-        return Error.BadFixture;
-    const wv = world.fromValue(a, parsed.value) catch return Error.BadFixture;
-
-    // ── synthesize request_reads from the declared request ──
-    var reads = std.ArrayList(decode.RequestReadEntry){};
-    // header_names: a JSON array of the declared header names.
-    var names_buf = std.ArrayList(u8){};
-    {
-        var aw = std.Io.Writer.Allocating.fromArrayList(a, &names_buf);
-        const w = &aw.writer;
-        try w.writeByte('[');
-        for (wv.headers, 0..) |hh, i| {
-            if (i != 0) try w.writeByte(',');
-            try jsonStr(w, hh.name);
-        }
-        try w.writeByte(']');
-        names_buf = aw.toArrayList();
-    }
-    try reads.append(a, .{ .kind = .header_names, .name = "", .value = names_buf.items });
-    for (wv.headers) |hh|
-        try reads.append(a, .{ .kind = .header_value, .name = hh.name, .value = hh.value });
-    if (wv.body != null)
-        try reads.append(a, .{ .kind = .body_read, .name = "", .value = "" });
-    if (wv.ip) |ip|
-        try reads.append(a, .{ .kind = .ip_masked, .name = "", .value = ip });
-
-    // ── kv readset → map (+ the explicitly-absent set) ──
-    var kv_map = std.StringHashMapUnmanaged([]const u8){};
-    for (wv.kv) |p| try kv_map.put(a, p.key, p.value);
-
-    // ── module sources (inline) ──
-    var sources = std.StringHashMapUnmanaged([]const u8){};
-    for (wv.sources) |s| {
-        if (!std.mem.eql(u8, s.kind, "handler")) continue;
-        try sources.put(a, s.path, s.source);
-    }
-
-    // Entry source: working tree (if --source-dir) else the inline world.
-    const entry_src = blk: {
-        if (source_dir) |dir| {
-            const ep = std.fs.path.join(a, &.{ dir, wv.entry }) catch return Error.OutOfMemory;
-            break :blk std.fs.cwd().readFileAlloc(a, ep, 8 << 20) catch
-                return Error.EntrySourceMissing;
-        }
-        break :blk sources.get(wv.entry) orelse return Error.EntrySourceMissing;
-    };
-
-    const binary_body = std.mem.eql(u8, wv.activation, "inbound_chunk") or
-        std.mem.eql(u8, wv.activation, "fetch_chunk");
-    // The resolved export: the world's explicit `export` (the `{to}` / resolved
-    // name a callback needs) wins; else the conventional export for the kind.
-    const export_name = wv.export_name orelse epilogue.exportForActivation(wv.activation);
-    const result: ?epilogue.Result = if (wv.status != null or wv.ok != null or
-        wv.done != null or wv.fetch_id != null or wv.chunk_seq != null)
-        .{ .status = wv.status, .ok = wv.ok, .done = wv.done, .fetch_id = wv.fetch_id, .chunk_seq = wv.chunk_seq }
-    else
-        null;
-    const epi = try epilogue.build(a, .{
-        .method = wv.method,
-        .path = wv.path,
-        .host = wv.host,
-        .request_reads = reads.items,
-        .body_bytes = wv.body,
-        .export_name = export_name,
-        .binary_body = binary_body,
-        .ctx_json = wv.ctx_json,
-        .activation_json = wv.activation_json,
-        .result = result,
-    });
-    const full_src = try std.mem.concatWithSentinel(a, u8, &.{ entry_src, epi }, 0);
-    const entry_z = try a.dupeZ(u8, wv.entry);
-
-    // ── drive the engine. Resettable runtime: init the frozen base at most once
-    // per process; `arena_run_module` below wipes the request arena, so repeated
-    // runWorld calls are isolated by construction (no cross-run kv/alloc leak). ──
-    try ensureArena();
-    var host = hostmod.Host{
-        .a = a,
-        .kv_map = kv_map,
-        .sources = sources,
-        .source_dir = source_dir,
-    };
-    host.install();
-
-    const date_ms: u64 = wv.now_ms;
-    // Replay under the regime the live request completed under (mode
-    // binds at arena_run_module's entry reset). Set EVERY run — the
-    // choice persists on the process-global arena, so a GC world must
-    // not leak GC mode into the next bump world.
-    arena_set_request_mode(if (wv.arena_gc) 0 else 1);
-    arena_set_random_seed(@truncate(wv.seed), @truncate(wv.seed >> 32));
-    arena_set_date_now(@truncate(date_ms), @truncate(date_ms >> 32));
-    arena_set_trace_mode(0);
-
-    const rc = arena_run_module(entry_z.ptr, full_src.ptr);
-
-    try emitWorld(a, out, .{
-        .entry = wv.entry,
-        .activation = wv.activation,
-        .export_name = export_name,
-        .rc = rc,
-        .divergence = host.diverged,
-        .writes = host.writes.items,
-        .run_json = host.output,
-    });
-
-    // Optional `expected` → append a `verify` result (partial, order-independent
-    // match over the bundle). Present ⇒ this is a test/replay assertion; absent
-    // ⇒ plain sim (bundle only).
-    if (wv.expected_json) |ej| appendVerify(a, out, ej) catch {};
+    if (g_run_engine == null) g_run_engine = try Engine.init();
+    try g_run_engine.?.simulate(a, world_json, source_dir, null, out);
 }
 
 /// Partial, order-independent matcher: for each facet the `expected` object
@@ -602,4 +679,5 @@ test {
     _ = epilogue;
     _ = world;
     _ = export_fixture;
+    _ = harness;
 }

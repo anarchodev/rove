@@ -74,6 +74,11 @@ pub const World = struct {
     /// Inline handler sources (path/kind/source); empty when `--source-dir`
     /// serves the working tree instead.
     sources: []const Source = &.{},
+    /// Per-world working-tree source dir. When present it overrides the
+    /// caller's `--source-dir` for this run — the channel the JS test library's
+    /// `scenario({ sourceDir })` uses to resolve handler code (the harness reads
+    /// each world's own dir before dispatching to the shared sim reactor).
+    source_dir: ?[]const u8 = null,
 
     // ── non-inbound activation surface (`architecture/replay-and-sim.md` §3) ──
     /// The threaded `Ctx` → `request.ctx`. JSON text (any value). `undefined`
@@ -102,6 +107,7 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
     if (jStr(obj, "entry")) |s| w.entry = s;
     if (jStr(obj, "activation")) |s| w.activation = s;
     if (jStr(obj, "export")) |s| w.export_name = s;
+    if (jStr(obj, "source_dir")) |s| w.source_dir = s;
     if (obj.get("ctx")) |cv| {
         if (cv != .null) w.ctx_json = try jsonText(a, cv);
     }

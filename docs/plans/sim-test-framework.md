@@ -343,24 +343,49 @@ tree composition on top. A test fixture and a slice of real production traffic
 are interchangeable inputs — a captured recording *is* a runnable, forkable test
 world.
 
+## Built 2026-07-08 — the JS test runner (`rewind test`)
+
+The second-runtime blocker is gone: **arenajs 0.3.3** shipped the de-singletoned
+instance reactor (`arena_reactor_new` + the `_r` variants,
+`qjs-arena-reactor.h`), and rove now consumes it. `src/replay/root.zig` moved off
+the process-global singleton onto an `Engine` holding a resettable **sim**
+reactor (`Engine.simulate` is the atom; `runWorld` is its one-shot wrapper for
+`rewind sim`/`replay`). `src/replay/harness.zig` runs each `_tests/*.mjs` on a
+separate **harness** reactor and bridges `simulate()` over the KV channel — no
+bespoke native, no further arenajs change (the `arena_multi_reactor.c` shape: a
+`kv.get` responder synchronously runs a module on the sibling instance). The
+saga library `src/replay/rewind_test.mjs` (imported as `rewind:test`) is the JS
+layer: `scenario`, lazy memoized `Node`s, the `expect` matchers, and the folds.
+`rewind test [dir] [--source-dir DIR] [--update]` discovers and runs them,
+streaming per-assertion outcomes; a failure exits non-zero. Reactors are
+process-lived (the run epilogue roots the handler surface on the base global, so
+the runtime can't be torn down mid-process — the CLIs are one-shot). Proven e2e
+by `zig build rewind-test-smoke` over `src/replay/testdata/checkout` (wired into
+the aggregate `test` step).
+
+**Built + verified:** the eager surface (`s.inbound(...)`, `expect(node).toBe /
+toEqual / toMatch / toHaveWritten / toHaveFetched / toHaveSent / toHaveScheduled
+/ toMatchSnapshot`, `node.status/.body/.kv(k)`), the **fetch→fetch_chunk fold**
+(`.fetch(re).resolve(...)` / `.branch([...])` / `.cases([...]).forEachPath`), the
+**clock-advanced timer/schedule wake fold** (`.clock.advance("1h").fire()`), and
+**snapshots** (new writes / match / mismatch-fails / `--update` rebaselines,
+stored as opaque stable-JSON in `__snapshots__/<file>.json`). Clock + per-activation
+seed thread through every fold.
+
 ## What's left
 
-- **The JS test runner** (`rewind test` + `_tests/*.mjs`) — the saga model above,
-  authored as JS. Blocked on a **second runtime**: the test body runs its own
-  `expect`/control flow in a harness runtime while `simulate()` drives worlds in
-  a separate reset-reused sim runtime (you can't reset the harness's own request
-  arena mid-test). arenajs arena state is per-runtime, so two runtimes on one
-  thread are safe (verified 2026-07-01); the work is de-singletoning the reactor
-  (`g_rt`/`g_ctx` → instance-based + a `simulate` native bridging to `runWorld`).
-  That is an arenajs C change (push-then-pin).
-- **Correlation beyond fetch** — the saga fold today (`scenario_driver.py`) only
-  resolves `fetch → fetch_chunk`. Add **clock-advanced timer/schedule wakes** and
-  **webhook/email send-callbacks** (the durable scheduler + retry ladder,
-  otherwise unexercised end-to-end), plus threading the clock into `now_ms` and a
-  per-activation seed. See the correlation catalog above.
+- **Correlation beyond fetch + timer** — `webhook.send` / `email.send`
+  **send-callbacks** (the durable retry/idempotency ladder) and **ws.send /
+  subscription → connection** activations are asserted at the effect-log level
+  (`toHaveSent`) but not yet *folded* into their dependent activation the way
+  `fetch`/timer are. These are the highest-value remaining folds (the durable
+  scheduler + retry ladder are otherwise unexercised end-to-end).
+- **`whenConcurrent(...).interleavings()`** — the model-check combinator over
+  concurrent-effect delivery orders (the plan's `toBeConsistent` example) is not
+  built; `branch`/`cases` cover single-effect forking today.
 - **In-process scenario driver** — port `scripts/sim/scenario_driver.py` onto the
-  now-multi-shot `runWorld` (no more subprocess per activation). Cheap adjacent
-  win, no dep change.
+  now-multi-shot engine (no more subprocess per activation). Cheap adjacent win,
+  superseded in practice by the JS runner for authored tests.
 - **Production-strip of `_tests/`** — exclude `_tests/`, `__snapshots__/`,
   `__fixtures__/` from deploy manifests (client-side strip in the deploy path +
   server-side reject in the worker's `/_system/deploy`). The client-side strip
@@ -368,16 +393,25 @@ world.
 
 ## Critical files (current)
 
-- `src/replay/root.zig` — `runWorld` (the engine), `appendVerify`/`updateExpected`
-  (the `expected` matcher + `--update`), bundle emit. Multi-shot.
-- `src/replay/world.zig` — the closed-world `world.json` schema + parser.
-- `src/replay/host.zig` — map-mode KV host (reads/writes/prefix, overlay). Still
-  carries a vestigial `.tape` mode + a stale `miss` doc-comment — dead code.
+- `src/replay/root.zig` — the `Engine` (instance-API sim reactor) + `Engine.simulate`
+  (the atom), `runWorld` (one-shot wrapper), `appendVerify`/`updateExpected` (the
+  `expected` matcher + `--update`), bundle emit.
+- `src/replay/harness.zig` — the JS test runner: harness reactor + the magic-KV
+  `simulate()` bridge, `_tests/*.mjs` discovery, streamed assertions, snapshots.
+- `src/replay/rewind_test.mjs` — the embedded `rewind:test` saga library
+  (`scenario`, lazy `Node`s + folds, the `expect` matchers).
+- `src/replay/world.zig` — the closed-world `world.json` schema + parser (now with
+  a per-world `source_dir` for the JS lib's `scenario({ sourceDir })`).
+- `src/replay/host.zig` — map-mode KV host (reads/writes/prefix, overlay) for sim
+  runs. Still carries a vestigial `.tape` mode + a stale `miss` doc-comment.
 - `src/replay/epilogue.zig` — request/ctx/result reconstruction + export invoke.
 - `src/replay/export_fixture.zig` — capture → closed-world transcode.
 - `src/replay/driver_smoke.zig` — end-to-end native smoke (`inbound`/`fetch`/`multi`).
-- `src/cli/rewind.zig` — the `sim`/`replay`/`export-fixture`/`pull` verbs.
-- `scripts/sim/scenario_driver.py` — the saga fold prototype (to be ported to JS).
+- `src/replay/testdata/checkout/` — the `rewind-test-smoke` fixture (handler +
+  `_tests/checkout.mjs`).
+- `src/cli/rewind.zig` — the `sim`/`replay`/`test`/`export-fixture`/`pull` verbs.
+- `scripts/sim/scenario_driver.py` — the saga fold prototype (superseded by the
+  JS runner for authored tests).
 
 ## Open questions (current)
 

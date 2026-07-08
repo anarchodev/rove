@@ -45,8 +45,9 @@ pub const KvWrite = struct {
 
 /// `malloc`+copy matching the responder ownership contract (engine `free()`s
 /// it). `nul` appends a trailing NUL for the buffers whose parser reads one
-/// sentinel byte past `len` (`out_src`, `out_json`).
-fn dupC(bytes: []const u8, nul: bool) ?[*c]u8 {
+/// sentinel byte past `len` (`out_src`, `out_json`). Shared with the harness
+/// host (`harness.zig`), which serves the same ABI.
+pub fn dupC(bytes: []const u8, nul: bool) ?[*c]u8 {
     const n = bytes.len + @as(usize, if (nul) 1 else 0);
     const p: [*c]u8 = @ptrCast(std.c.malloc(n) orelse return null);
     if (bytes.len != 0) @memcpy(p[0..bytes.len], bytes);

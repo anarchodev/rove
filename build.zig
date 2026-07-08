@@ -1281,4 +1281,17 @@ pub fn build(b: *std.Build) void {
     const cli_exe = b.addExecutable(.{ .name = "rewind", .root_module = cli_mod });
     const cli_step = b.step("rewind", "Build the rewind customer CLI");
     cli_step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);
+
+    // ── rewind-test-smoke: drive `rewind test` end-to-end over the checkout
+    // fixture (src/replay/testdata/checkout). Proves the two-reactor saga runner
+    // — a harness reactor runs the JS test body, driving the sim reactor via
+    // `simulate()`, with the fetch→fetch_chunk fold + branch + snapshot surface.
+    // Offline (no cluster). A failing assertion exits non-zero and fails here.
+    const smoke = b.addRunArtifact(cli_exe);
+    smoke.addArg("test");
+    smoke.addDirectoryArg(b.path("src/replay/testdata/checkout"));
+    smoke.expectExitCode(0);
+    const smoke_step = b.step("rewind-test-smoke", "Run `rewind test` over the checkout fixture (saga test runner e2e)");
+    smoke_step.dependOn(&smoke.step);
+    test_step.dependOn(&smoke.step);
 }
