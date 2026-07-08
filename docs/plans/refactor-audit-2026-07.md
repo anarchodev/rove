@@ -1,6 +1,8 @@
 # Refactoring audit — correctness & clarity pass, 2026-07
 
-Status: **findings, 2026-07-08.** No code yet. This doc records a
+Status: **Wave 1 landed, 2026-07-08** (branch `worktree-refactor-audit-doc`,
+8 commits — one per item, see §10; §1.3 shipped as lockstep-enforcement
+rather than re-export, noted inline). Waves 2–4 not started. This doc records a
 whole-codebase audit for refactoring opportunities: god structs, oversized
 files, duplicated machinery where one thing should be expressed in terms of
 another, and any remaining Zig that should be JS. Six subsystem sweeps fed it
@@ -860,7 +862,10 @@ Grouped so each branch is independently landable and testable. Ordering
 within a group is by (clarity × correctness-risk-reduction) / effort.
 
 **Wave 1 — correctness quartet + near-free extractions** (small,
-independent, no behavior change beyond the §1.1 fix):
+independent, no behavior change beyond the §1.1 fix). **DONE 2026-07-08**,
+one commit per item on this branch; §1.3 landed as comptime/test lockstep
+enforcement instead of the re-export inversion (replay_mod's
+self-containment is deliberate — the CLI must not link rove-tape):
 
 1. §1.1 `bridge.awaitCommit` (fixes the fault gap)
 2. §1.2 envelope codec unification (one `MAX_ID_LEN`)
