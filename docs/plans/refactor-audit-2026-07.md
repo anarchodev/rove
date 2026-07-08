@@ -577,6 +577,15 @@ socket-read unpark). Removes the twin `*FlipInboundToDiscard` pair.
 comptime collection-registry loop (:998) already treats them uniformly, so
 this is low-medium effort; documents which poll phase touches which group.
 
+**RE-SCOPED 2026-07-08 (Wave 3, branch `refactor/h2-illegal-states`):** the
+estimate above only counted the in-file registry loop; the collections are
+accessed at **216 sites across src/js / src/front / src/cp /
+src/log_server** (`server.request_out` etc.), so sub-structs would churn
+~300 spellings across five modules for a documentation win. Do the
+documentation directly instead: section-banner + poll-phase doc-comment
+grouping inside the struct, zero churn. Revisit sub-structs only if a
+mechanical need appears. (§4.1+§4.2+§4.3+§4.4 are DONE on that branch.)
+
 ### 4.6 File split for `h2/root.zig`
 
 - Zero-risk first step: move the non-generic leaf types (`Stream`,
@@ -587,6 +596,12 @@ this is low-medium effort; documents which poll phase touches which group.
   (25 fns, :3595–4439), `runtime_ws.zig` (36 fns, :1446–1739 + :4439–4792),
   `runtime_client.zig` (:5400–5791) — ~2,500 lines out; root keeps the
   struct, the poll loop, and the nghttp2 server callbacks.
+  **BLOCKED as sketched (noted 2026-07-08):** Zig 0.15 removed
+  `usingnamespace`, so mixin methods can't land on the struct — every
+  internal call site would need `H1.fn(self, …)` qualification plus pub
+  re-export wrappers. If still wanted, the honest shape is free functions
+  taking `h2: anytype` (the worker_*.zig pattern) — a different, larger
+  refactor. The leaf-type move above remains valid and worthwhile.
 
 Do §4.1 first — it shrinks the biggest struct that would otherwise move.
 
