@@ -48,5 +48,21 @@ export default function () {
     eq(base64url.encode(hex.decode(digest_hex)).length, 43); // 32 bytes → 43 chars
   });
 
+  // Large-input round-trip: the encoders must be O(n), not O(n²).
+  // `+=` string-building allocates O(n²) in the per-request bump arena
+  // (never freed until reset), which exhausted it above ~128 KiB — a
+  // big base64/hex then silently returned an EMPTY response, and it
+  // wedged the phase-D streaming upload. 128 KiB is just past that
+  // cliff; the array+join build handles it (and MiB-scale — smoke).
+  check("base64url.encode", () => {
+    const big = new Uint8Array(128 * 1024);
+    for (let i = 0; i < big.length; i++) big[i] = (i * 31 + 7) & 0xff;
+    const enc = base64url.encode(big);
+    ok(enc.length > 170000, "128 KiB encodes fully, got " + enc.length);
+    const dec = base64url.decode(enc);
+    eq(dec.length, big.length);
+    eq(dec[big.length - 1], big[big.length - 1]);
+  });
+
   return done();
 }

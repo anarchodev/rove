@@ -13,69 +13,70 @@
 const STD_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
+// Build via an array + join, NOT `out += `. In the per-request bump
+// arena every `+=` allocates a fresh (never-freed-until-reset) string,
+// so `+=`-building an n-char string costs O(n²) arena volume and
+// exhausts the arena for large inputs (a big base64/hex of a chunk or
+// payload then silently yields an empty response). Array push + join
+// is O(n). Same reason `_decodeBase`, `_bytesToString`, `hex.encode`
+// avoid `+=` below.
 function _encodeBase(bytes, alphabet, padding) {
-  let out = "";
+  const out = [];
   let i = 0;
   while (i + 2 < bytes.length) {
     const b0 = bytes[i++], b1 = bytes[i++], b2 = bytes[i++];
-    out += alphabet[b0 >> 2];
-    out += alphabet[((b0 & 0x03) << 4) | (b1 >> 4)];
-    out += alphabet[((b1 & 0x0f) << 2) | (b2 >> 6)];
-    out += alphabet[b2 & 0x3f];
+    out.push(alphabet[b0 >> 2]);
+    out.push(alphabet[((b0 & 0x03) << 4) | (b1 >> 4)]);
+    out.push(alphabet[((b1 & 0x0f) << 2) | (b2 >> 6)]);
+    out.push(alphabet[b2 & 0x3f]);
   }
   const remaining = bytes.length - i;
   if (remaining === 1) {
     const b0 = bytes[i];
-    out += alphabet[b0 >> 2];
-    out += alphabet[(b0 & 0x03) << 4];
-    if (padding) out += "==";
+    out.push(alphabet[b0 >> 2]);
+    out.push(alphabet[(b0 & 0x03) << 4]);
+    if (padding) out.push("==");
   } else if (remaining === 2) {
     const b0 = bytes[i], b1 = bytes[i + 1];
-    out += alphabet[b0 >> 2];
-    out += alphabet[((b0 & 0x03) << 4) | (b1 >> 4)];
-    out += alphabet[(b1 & 0x0f) << 2];
-    if (padding) out += "=";
+    out.push(alphabet[b0 >> 2]);
+    out.push(alphabet[((b0 & 0x03) << 4) | (b1 >> 4)]);
+    out.push(alphabet[(b1 & 0x0f) << 2]);
+    if (padding) out.push("=");
   }
-  return out;
+  return out.join("");
 }
 
 function _decodeBase(str, lookup) {
-  // Strip padding + any whitespace (atob tolerates both).
-  let s = "";
-  for (let i = 0; i < str.length; i++) {
-    const ch = str[i];
-    if (ch === "=" || ch === " " || ch === "\n" || ch === "\r" || ch === "\t") continue;
-    s += ch;
-  }
-  const out_len = (s.length * 3) >> 2;
-  const out = new Uint8Array(out_len);
+  // Decode symbol-at-a-time over the ORIGINAL string, skipping padding
+  // + whitespace in place — no stripped copy. The earlier `+=` strip
+  // (O(n²) arena) and its array+join replacement (a per-char array,
+  // still heavy enough to exhaust the arena when many values are
+  // decoded in one activation) both allocated O(n) scratch per call;
+  // this allocates only the output Uint8Array.
+  const out = new Uint8Array((str.length * 3) >> 2); // upper bound
   let oi = 0;
-  let i = 0;
-  while (i + 3 < s.length) {
-    const v0 = lookup[s.charCodeAt(i)],
-          v1 = lookup[s.charCodeAt(i + 1)],
-          v2 = lookup[s.charCodeAt(i + 2)],
-          v3 = lookup[s.charCodeAt(i + 3)];
-    if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0) {
-      throw new Error("invalid base64 input");
+  const quad = [0, 0, 0, 0];
+  let q = 0;
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    // Skip '=' padding and ASCII whitespace (space/\t/\n/\v/\f/\r).
+    if (code === 0x3d || code === 0x20 || (code >= 0x09 && code <= 0x0d)) continue;
+    const v = code < 128 ? lookup[code] : -1;
+    if (v < 0) throw new Error("invalid base64 input");
+    quad[q++] = v;
+    if (q === 4) {
+      out[oi++] = (quad[0] << 2) | (quad[1] >> 4);
+      out[oi++] = ((quad[1] & 0x0f) << 4) | (quad[2] >> 2);
+      out[oi++] = ((quad[2] & 0x03) << 6) | quad[3];
+      q = 0;
     }
-    out[oi++] = (v0 << 2) | (v1 >> 4);
-    out[oi++] = ((v1 & 0x0f) << 4) | (v2 >> 2);
-    out[oi++] = ((v2 & 0x03) << 6) | v3;
-    i += 4;
   }
-  const tail = s.length - i;
-  if (tail === 2) {
-    const v0 = lookup[s.charCodeAt(i)], v1 = lookup[s.charCodeAt(i + 1)];
-    if (v0 < 0 || v1 < 0) throw new Error("invalid base64 input");
-    out[oi++] = (v0 << 2) | (v1 >> 4);
-  } else if (tail === 3) {
-    const v0 = lookup[s.charCodeAt(i)],
-          v1 = lookup[s.charCodeAt(i + 1)],
-          v2 = lookup[s.charCodeAt(i + 2)];
-    if (v0 < 0 || v1 < 0 || v2 < 0) throw new Error("invalid base64 input");
-    out[oi++] = (v0 << 2) | (v1 >> 4);
-    out[oi++] = ((v1 & 0x0f) << 4) | (v2 >> 2);
+  // Trailing 2 or 3 symbols (an unpadded or padded final group).
+  if (q === 2) {
+    out[oi++] = (quad[0] << 2) | (quad[1] >> 4);
+  } else if (q === 3) {
+    out[oi++] = (quad[0] << 2) | (quad[1] >> 4);
+    out[oi++] = ((quad[1] & 0x0f) << 4) | (quad[2] >> 2);
   }
   return out.subarray(0, oi);
 }
@@ -112,10 +113,14 @@ function _stringToBytes(s) {
 
 function _bytesToString(bytes) {
   // Inverse of _stringToBytes — binary string out. Use TextDecoder
-  // if you want UTF-8 interpretation.
-  let s = "";
-  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-  return s;
+  // if you want UTF-8 interpretation. Chunked fromCharCode.apply,
+  // not `+=` (O(n²) arena volume — see _encodeBase).
+  const parts = [];
+  const CH = 8192; // stay under the argument-count limit
+  for (let i = 0; i < bytes.length; i += CH) {
+    parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + CH)));
+  }
+  return parts.join("");
 }
 
 /**
@@ -213,12 +218,12 @@ globalThis.hex = {
   encode(bytes) {
     if (!(bytes instanceof Uint8Array)) bytes = new Uint8Array(bytes);
     const tab = "0123456789abcdef";
-    let out = "";
+    const out = [];  // array+join, not `+=` (O(n²) arena — see base64 _encodeBase)
     for (let i = 0; i < bytes.length; i++) {
-      out += tab[bytes[i] >> 4];
-      out += tab[bytes[i] & 0x0f];
+      out.push(tab[bytes[i] >> 4]);
+      out.push(tab[bytes[i] & 0x0f]);
     }
-    return out;
+    return out.join("");
   },
 
   /**
