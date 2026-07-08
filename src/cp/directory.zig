@@ -71,7 +71,7 @@ const DIR_STORE_ID = "__directory__";
 /// surfacing `Replication`. A single-node commit is sub-ms; the generous
 /// ceiling only guards a wedged pump (then the move 500s and the operator
 /// retries).
-const COMMIT_TIMEOUT_NS: i128 = 10 * std.time.ns_per_s;
+const COMMIT_TIMEOUT_NS: u64 = 10 * std.time.ns_per_s;
 
 /// Max member nodes per cluster (matches `seedClusters`' parse buffer).
 const MAX_CLUSTER_NODES = 16;
@@ -488,12 +488,7 @@ pub const Directory = struct {
     fn applyDirWrite(self: *Directory, key: []const u8, value: []const u8) Error!void {
         if (self.bridge) |bridge| {
             const seq = bridge.proposePut(self.dir_gid, key, value) catch return Error.Replication;
-            const deadline: i128 = std.time.nanoTimestamp() + COMMIT_TIMEOUT_NS;
-            while (bridge.committedSeq(self.dir_gid) < seq) {
-                if (bridge.faultedSeq(self.dir_gid) >= seq) return Error.Replication;
-                if (std.time.nanoTimestamp() > deadline) return Error.Replication;
-                std.Thread.sleep(200 * std.time.ns_per_us);
-            }
+            bridge.awaitCommit(self.dir_gid, seq, COMMIT_TIMEOUT_NS) catch return Error.Replication;
         } else {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -1611,7 +1606,14 @@ test "directory: a leader's write replicates to FOLLOWER projections (Slice 2A)"
     var s2: u32 = 0;
     while (s2 < 3000 and !done) : (s2 += 1) {
         for (bridges) |b| _ = try b.pumpOnce();
-        if (bridges[li].committedSeq(dir_gid) >= pseq) done = true;
+        if (bridges[li].committedSeq(dir_gid) >= pseq) {
+            done = true;
+        } else {
+            // Manual-pump loop, so `Bridge.awaitCommit` (which sleeps) can't
+            // be used here — but keep its fail-fast: a faulted seq will
+            // never commit, so spinning out the full 3000 rounds is noise.
+            try testing.expect(bridges[li].faultedSeq(dir_gid) < pseq);
+        }
         std.Thread.sleep(1 * std.time.ns_per_ms);
     }
     try testing.expect(done);

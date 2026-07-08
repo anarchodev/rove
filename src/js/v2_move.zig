@@ -908,15 +908,11 @@ fn applyPlanBlob(worker: anytype, allocator: std.mem.Allocator, tenant: []const 
 }
 
 /// Block (bounded by `commit_wait_timeout_ns`) until the tenant's raft
-/// watermark reaches `target_seq`. The bridge pump thread advances it.
+/// watermark reaches `target_seq`. Fails fast (false) if the bridge
+/// faults the seq — leadership lost mid-move; the mover retries.
 fn awaitCommit(worker: anytype, gid: u64, target_seq: u64) bool {
-    if (target_seq == 0) return true;
-    const deadline: i128 = std.time.nanoTimestamp() + @as(i128, @intCast(worker.commit_wait_timeout_ns));
-    while (std.time.nanoTimestamp() < deadline) {
-        if (worker.raft.committedSeq(gid) >= target_seq) return true;
-        std.Thread.sleep(200 * std.time.ns_per_us);
-    }
-    return worker.raft.committedSeq(gid) >= target_seq;
+    worker.raft.awaitCommit(gid, target_seq, worker.commit_wait_timeout_ns) catch return false;
+    return true;
 }
 
 /// Parse `{"tenant":"..."}`; returns an owned dup the caller frees, or
