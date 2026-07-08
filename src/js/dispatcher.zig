@@ -471,20 +471,83 @@ pub const Dispatcher = struct {
             self.last_arena_gc_retry = true;
             var side_effects2 = false;
             const second = self.runOutcomeAttempt(kv, txn, writeset, bytecode, bytecodes, source_hashes, triggers, request, budget, .gc, &side_effects2);
+            // Even the GC regime (ceiling = peak live set) can be too
+            // small for a genuinely huge request. If it OOM'd too, the
+            // outcome is a mangled/empty terminal — DON'T return it as a
+            // silent success; fail loud (decisions.md §4.12 + the
+            // fail-loud-on-resource-exhaustion rule).
+            if (self.snapshot.oomHit()) {
+                const stats2 = self.snapshot.oomStats();
+                std.log.warn(
+                    "rove-js arena-oom: GC re-execution ALSO exhausted the arena (requested={d} used={d} limit={d}) — failing loud (500)",
+                    .{ stats2.requested, stats2.used, stats2.limit },
+                );
+                dropDoomedOutcome(self.allocator, second, request, writeset, ws_ops_start, ws_owned_start);
+                if (sp_open) txn.release() catch {};
+                self.stampArenaMode(request);
+                return self.oomFailureOutcome();
+            }
             if (sp_open) txn.release() catch {};
             self.stampArenaMode(request);
             return second;
         }
-        if (oomed and (side_effects or !sp_open)) {
+        if (oomed) {
+            // OOM that the GC retry couldn't rescue: the bump attempt
+            // fired an immediate worker-side effect (retry vetoed) or no
+            // savepoint was open. Its outcome is mangled/empty — surface
+            // a clean 500 rather than the silent empty body it would
+            // otherwise produce (the OOM-swallowing bug).
             const stats = self.snapshot.oomStats();
             std.log.warn(
-                "rove-js arena-oom: request arena exhausted (requested={d} used={d} limit={d}) but NOT retryable (immediate side effects or no savepoint) — failing as-is",
+                "rove-js arena-oom: request arena exhausted (requested={d} used={d} limit={d}), not retryable (immediate side effects or no savepoint) — failing loud (500)",
                 .{ stats.requested, stats.used, stats.limit },
             );
+            dropDoomedOutcome(self.allocator, first, request, writeset, ws_ops_start, ws_owned_start);
+            if (sp_open) txn.release() catch {};
+            self.stampArenaMode(request);
+            return self.oomFailureOutcome();
         }
         if (sp_open) txn.release() catch {};
         self.stampArenaMode(request);
         return first;
+    }
+
+    /// The loud terminal returned when the request arena is exhausted
+    /// and neither the bump nor the GC regime could complete it. A
+    /// non-empty `exception` makes every dispatch site emit a 5xx (the
+    /// worker turns it into a 500) — never the silent empty 200 a
+    /// mangled OOM outcome otherwise yields. Strings come from the
+    /// dispatcher allocator, NOT the exhausted JS arena.
+    fn oomFailureOutcome(self: *Dispatcher) DispatchError!RunOutcome {
+        return .{ .terminal = .{
+            .status = 500,
+            .body = try self.allocator.dupe(u8, ""),
+            .body_is_json = false,
+            .console = try self.allocator.dupe(u8, ""),
+            .exception = try self.allocator.dupe(u8, "handler exhausted the request memory arena (OOM)"),
+        } };
+    }
+
+    /// Discard a doomed OOM attempt's outputs before returning a loud
+    /// failure: free the mangled outcome, roll back the attempt-scoped
+    /// readset/effects, and truncate the batch-shared writeset to this
+    /// attempt's boundary (mirrors the pre-retry cleanup — a wholesale
+    /// clear would eat sibling handlers' ops).
+    fn dropDoomedOutcome(
+        allocator: std.mem.Allocator,
+        outcome: DispatchError!RunOutcome,
+        request: Request,
+        writeset: *kv_mod.WriteSet,
+        ws_ops_start: usize,
+        ws_owned_start: usize,
+    ) void {
+        if (outcome) |*oc_const| {
+            var oc = oc_const.*;
+            discardOutcome(allocator, &oc);
+        } else |_| {}
+        if (request.trace.readset) |rs| rs.resetAttempt();
+        clearAttemptEffects(allocator, request);
+        writeset.truncateTo(ws_ops_start, ws_owned_start);
     }
 
     /// Record the regime the request COMPLETED under on the readset's
@@ -1855,6 +1918,36 @@ test "arena-oom retry: churny handler succeeds under GC re-execution" {
     const v = try kv.get("n");
     defer testing.allocator.free(v);
     try testing.expectEqualStrings("6", v);
+}
+
+test "arena-oom: loud 500 when even GC can't fit the request (no silent empty body)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.initWithSizes(testing.allocator, .{ .request_size = 8 * 1024 * 1024 });
+    defer d.deinit();
+
+    // Peak LIVE set (all 32 × 512 KiB strings held at once) = 16 MiB >
+    // the 8 MiB arena — the churny reassign trick wouldn't help (GC's
+    // ceiling is peak live). Bump OOMs → GC retry OOMs too → must fail
+    // LOUD (a 500 with an exception), never the silent empty 200 a
+    // mangled OOM outcome used to yield.
+    var resp = try runOne(&d, kv,
+        \\const a = [];
+        \\for (let i = 0; i < 32; i++) a.push("x".repeat(1 << 19));
+        \\return "len=" + a.length;
+    , .{ .method = "POST", .path = "/" });
+    defer resp.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i32, 500), resp.status);
+    try testing.expect(resp.exception.len > 0);
+    try testing.expect(std.mem.indexOf(u8, resp.exception, "exhausted") != null);
+    try testing.expectEqualStrings("", resp.body); // not a silent partial
+    // The GC retry was attempted (and also OOM'd).
+    try testing.expect(d.last_arena_gc_retry);
 }
 
 test "arena-oom retry: the worker's churny hint skips the doomed bump attempt" {

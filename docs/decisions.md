@@ -727,8 +727,19 @@ redeploy sheds the mark) routes known-churny handlers straight to GC.
 Re-execution is safe because a failed attempt is pre-commit and
 deterministic (same seed, same pinned clock, same inputs); an attempt
 that fired an immediate worker-side effect (blob streaming,
-cancel_fetch, fire_wake, resume_if_bound) is NOT retried and fails
-as before.
+cancel_fetch, fire_wake, resume_if_bound) is NOT retried.
+
+**An unrecoverable OOM fails LOUD, never silently.** When the GC
+re-execution ALSO exhausts the arena (a genuinely too-large request),
+or the OOM was non-retryable (immediate side effect, or no savepoint),
+the dispatcher discards the doomed attempt's outputs and returns a
+terminal carrying a non-empty `exception` ("handler exhausted the
+request memory arena (OOM)") → every dispatch site emits a **500**.
+This closes the pre-existing swallow bug where a mangled OOM outcome
+surfaced as a silent empty 200 (the fail-loud-on-resource-exhaustion
+rule: an infallibility violation must be a loud 5xx, not a plausible
+success). The error strings come from the worker allocator, not the
+exhausted JS arena.
 
 **Replay.** The regime is part of the execution identity (a
 GC-completed churny request OOMs under bump), stamped as the HIGH BIT
