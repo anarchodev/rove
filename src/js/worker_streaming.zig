@@ -2502,9 +2502,18 @@ pub fn fireKvReactSubscriptions(worker: anytype, unit: *ParkedUnit) !void {
                 };
                 effect_mod.enqueueMsg(&worker.msg_queue, .{ .subscription_fire = payload }) catch |err| {
                     payload.deinit(allocator);
+                    // The committed write matched this subscription but
+                    // the fire couldn't be queued (msg_queue at cap →
+                    // error.Full, tracked in overflow_count; or OOM).
+                    // There is NO re-scan backstop, so the subscription
+                    // MISSES this event — an at-least-once gap under
+                    // sustained back-pressure (unlike durable wakes /
+                    // cron, which re-fire). Loud so it's not invisible;
+                    // durable delivery is a design decision (see the
+                    // silent-failure audit → M3).
                     std.log.warn(
-                        "rove-js kv-react enqueueMsg (tenant={s}, sub={s}): {s}",
-                        .{ unit.tenant_id, sub.name, @errorName(err) },
+                        "rove-js kv-react: subscription '{s}' (tenant={s}) MISSED the committed write to '{s}': {s} (no re-scan backstop)",
+                        .{ sub.name, unit.tenant_id, w.key, @errorName(err) },
                     );
                     return err;
                 };

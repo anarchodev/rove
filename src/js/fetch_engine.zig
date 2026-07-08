@@ -518,10 +518,15 @@ pub const FetchEngine = struct {
                     // Per-tenant cap rejection: defined `final: true,
                     // ok: false` event so the customer's `on_chunk`
                     // handler fires once and can surface the
-                    // condition. NOT logged as a warning — this is
-                    // the customer's responsibility to handle (same
-                    // posture as rate-limit rejection).
-                    emitFailedSetupEvent(self, &pf) catch {};
+                    // condition. The REJECTION isn't warn-logged (the
+                    // customer's to handle, like a rate-limit) — but if
+                    // the event itself can't be delivered, that IS loud
+                    // (the held chain then never resolves until its
+                    // hold deadline, with the customer blind to why).
+                    emitFailedSetupEvent(self, &pf) catch |eerr| std.log.warn(
+                        "rove-js fetch_engine: cap-reject terminal event NOT delivered tenant={s} id={s}: {s} — held chain hangs to its deadline",
+                        .{ pf.tenant_id, pf.id, @errorName(eerr) },
+                    );
                 } else {
                     std.log.warn(
                         "rove-js fetch_engine: startTransfer tenant={s} id={s}: {s}",
@@ -529,7 +534,10 @@ pub const FetchEngine = struct {
                     );
                     // Setup failure: same single-final-event posture
                     // so the customer's handler chain still runs.
-                    emitFailedSetupEvent(self, &pf) catch {};
+                    emitFailedSetupEvent(self, &pf) catch |eerr| std.log.warn(
+                        "rove-js fetch_engine: setup-failure terminal event NOT delivered tenant={s} id={s}: {s} — held chain hangs to its deadline",
+                        .{ pf.tenant_id, pf.id, @errorName(eerr) },
+                    );
                 }
                 pf.deinit(self.allocator);
             };
