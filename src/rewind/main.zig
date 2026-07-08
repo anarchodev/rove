@@ -18,6 +18,8 @@
 const std = @import("std");
 const rove = @import("rove");
 const rjs = @import("rove-js");
+const boot = @import("rove-boot");
+const jwt = @import("rove-jwt");
 const bridge_mod = @import("bridge");
 const kv = @import("raft-kv");
 const h2_mod = @import("rove-h2");
@@ -46,19 +48,7 @@ const DEFAULT_ADMIN_ROOT_TOKEN = "rewindtestroottokenpadding0123456789abcd";
 // ── Signal-driven shutdown ────────────────────────────────────────────
 var stop_flag: std.atomic.Value(bool) = .init(false);
 
-fn handleSignal(_: c_int) callconv(.c) void {
-    stop_flag.store(true, .release);
-}
-
-fn installSignalHandlers() void {
-    const act: std.posix.Sigaction = .{
-        .handler = .{ .handler = handleSignal },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.INT, &act, null);
-    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
-}
+// SIGINT/SIGTERM → stop_flag wiring lives in rove-boot (shared by all four binaries).
 
 // ── Per-worker QuickJS compiler (mirrors loop46/main.zig) ─────────────
 const QjsCompiler = struct {
@@ -129,13 +119,6 @@ const WorkerCtx = struct {
     /// (port 0, or the bind failed — metrics are optional).
     metrics: ?*rjs.MetricsServer = null,
 };
-
-/// Parse a `u16` port from `name`, falling back to `default` when unset or
-/// malformed. `0` is a valid value (disables the listener at the call site).
-fn parsePortEnv(name: []const u8, default: u16) u16 {
-    const s = std.posix.getenv(name) orelse return default;
-    return std.fmt.parseInt(u16, s, 10) catch default;
-}
 
 /// V2 on-promotion recovery hook — closes the two failover-recovery gaps the
 /// smoke audit surfaced (`leader_failover_smoke_v2` / `durable_wake_smoke_v2`).
@@ -469,85 +452,15 @@ const PumpStores = struct {
 
 // ── Multi-node (Phase 5) config ───────────────────────────────────────
 
-/// Parsed multi-node bridge config (Phase 5 HA), owned for the lifetime of
-/// the `initMultiNode` call. `null` when this is a single-node deployment.
-const MultiNode = struct {
-    node_id: u64,
-    voters: []u64,
-    peers: []bridge_mod.PeerAddr,
-    /// Backing storage for the peer host slices (`host:port` left of `:`).
-    peer_bufs: [][]u8,
-    listen_addr: std.net.Address,
-    listen_str: []u8,
+/// Parsed multi-node bridge config (Phase 5 HA) — the shared
+/// `consensus/cluster_config.zig` parser under the worker's `REWIND_`
+/// env prefix (`REWIND_NODE_ID` / `REWIND_VOTERS` / `REWIND_PEERS`; the
+/// raft ports are DISTINCT from the HTTP listen port, argv[2]). `null`
+/// when this is a single-node deployment.
+const MultiNode = bridge_mod.cluster_config.MultiNode;
 
-    fn deinit(self: *const MultiNode, a: std.mem.Allocator) void {
-        a.free(self.voters);
-        a.free(self.peers);
-        for (self.peer_bufs) |b| a.free(b);
-        a.free(self.peer_bufs);
-        a.free(self.listen_str);
-    }
-};
-
-/// Build multi-node config from env, or return null if `REWIND_NODE_ID` is
-/// unset (single-node). Required together:
-///   - `REWIND_NODE_ID`   this node's 1-based raft id (∈ the voter set).
-///   - `REWIND_VOTERS`    comma-separated voter ids, e.g. `1,2,3`.
-///   - `REWIND_PEERS`     comma-separated raft transport `host:port`s,
-///                        indexed by raft id − 1 (peer i ⇒ raft id i+1).
-///                        These are the cross-node consensus ports, DISTINCT
-///                        from the HTTP listen port (argv[2]).
-/// The listen address is `peers[node_id − 1]`. Errors on malformed /
-/// inconsistent config (a misconfigured cluster must fail loud at startup).
 fn parseMultiNode(a: std.mem.Allocator) !?MultiNode {
-    const node_id_s = std.posix.getenv("REWIND_NODE_ID") orelse return null;
-    const voters_s = std.posix.getenv("REWIND_VOTERS") orelse return error.MissingVoters;
-    const peers_s = std.posix.getenv("REWIND_PEERS") orelse return error.MissingPeers;
-
-    const node_id = try std.fmt.parseInt(u64, std.mem.trim(u8, node_id_s, " \t"), 10);
-
-    var voters: std.ArrayListUnmanaged(u64) = .empty;
-    errdefer voters.deinit(a);
-    var vit = std.mem.tokenizeScalar(u8, voters_s, ',');
-    while (vit.next()) |tok| {
-        const t = std.mem.trim(u8, tok, " \t");
-        if (t.len == 0) continue;
-        try voters.append(a, try std.fmt.parseInt(u64, t, 10));
-    }
-    if (voters.items.len == 0) return error.MissingVoters;
-
-    var peers: std.ArrayListUnmanaged(bridge_mod.PeerAddr) = .empty;
-    errdefer peers.deinit(a);
-    var peer_bufs: std.ArrayListUnmanaged([]u8) = .empty;
-    errdefer {
-        for (peer_bufs.items) |b| a.free(b);
-        peer_bufs.deinit(a);
-    }
-    var pit = std.mem.tokenizeScalar(u8, peers_s, ',');
-    while (pit.next()) |tok| {
-        const t = std.mem.trim(u8, tok, " \t");
-        if (t.len == 0) continue;
-        const colon = std.mem.lastIndexOfScalar(u8, t, ':') orelse return error.BadPeer;
-        const host = try a.dupe(u8, t[0..colon]);
-        errdefer a.free(host);
-        const port = try std.fmt.parseInt(u16, t[colon + 1 ..], 10);
-        try peer_bufs.append(a, host);
-        try peers.append(a, .{ .host = host, .port = port });
-    }
-    if (node_id == 0 or node_id > peers.items.len) return error.BadNodeId;
-
-    const listen = peers.items[node_id - 1];
-    const listen_addr = try std.net.Address.parseIp(listen.host, listen.port);
-    const listen_str = try std.fmt.allocPrint(a, "{s}:{d}", .{ listen.host, listen.port });
-
-    return MultiNode{
-        .node_id = node_id,
-        .voters = try voters.toOwnedSlice(a),
-        .peers = try peers.toOwnedSlice(a),
-        .peer_bufs = try peer_bufs.toOwnedSlice(a),
-        .listen_addr = listen_addr,
-        .listen_str = listen_str,
-    };
+    return bridge_mod.cluster_config.fromEnv(a, "REWIND_");
 }
 
 /// Genesis first-boot config (consensus-and-storage.md "Cluster genesis &
@@ -578,9 +491,8 @@ fn parseGenesis(a: std.mem.Allocator) !?Genesis {
     const node_id = try std.fmt.parseInt(u64, std.mem.trim(u8, node_id_s, " \t"), 10);
     if (node_id == 0) return error.BadNodeId;
     const t = std.mem.trim(u8, raft_addr_s, " \t");
-    const colon = std.mem.lastIndexOfScalar(u8, t, ':') orelse return error.BadRaftAddr;
-    const port = try std.fmt.parseInt(u16, t[colon + 1 ..], 10);
-    const listen_addr = try std.net.Address.parseIp(t[0..colon], port);
+    const hp = bridge_mod.cluster_config.splitHostPort(t) catch return error.BadRaftAddr;
+    const listen_addr = try std.net.Address.parseIp(hp.host, hp.port);
     return Genesis{
         .node_id = node_id,
         .listen_addr = listen_addr,
@@ -590,25 +502,8 @@ fn parseGenesis(a: std.mem.Allocator) !?Genesis {
 
 /// Parse a `;`/`,`-separated list of origins into an owned, owned-element
 /// slice (a single URL → a one-element list; empty input → empty slice).
-fn parseUrlList(a: std.mem.Allocator, config: []const u8) ![]const []const u8 {
-    var list: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer {
-        for (list.items) |u| a.free(u);
-        list.deinit(a);
-    }
-    var it = std.mem.tokenizeAny(u8, config, ";,");
-    while (it.next()) |raw| {
-        const url = std.mem.trim(u8, raw, " \t\r\n");
-        if (url.len == 0) continue;
-        try list.append(a, try a.dupe(u8, url));
-    }
-    return list.toOwnedSlice(a);
-}
-
-fn freeUrlList(a: std.mem.Allocator, urls: []const []const u8) void {
-    for (urls) |u| a.free(u);
-    a.free(urls);
-}
+const parseUrlList = boot.parseUrlList;
+const freeUrlList = boot.freeUrlList;
 
 // ── main ──────────────────────────────────────────────────────────────
 pub fn main() !void {
@@ -616,7 +511,7 @@ pub fn main() !void {
     // GPA's global mutex is the wall under multi-raft).
     const allocator = std.heap.c_allocator;
 
-    installSignalHandlers();
+    boot.installSignalHandlers(&stop_flag);
 
     var arg_it = std.process.args();
     _ = arg_it.next(); // argv[0]
@@ -713,19 +608,8 @@ pub fn main() !void {
     // hex `LOOP46_SERVICES_JWT_SECRET` the log-server verifies with (hex-decoded
     // to raw HMAC bytes here, matching the log-server). Both optional: unset →
     // the door is disabled (`error.LogsDoorUnconfigured`).
-    const services_jwt_secret: ?[]const u8 = blk: {
-        const hex = std.posix.getenv("LOOP46_SERVICES_JWT_SECRET") orelse break :blk null;
-        if (hex.len == 0 or hex.len % 2 != 0) {
-            std.log.err("rewind: LOOP46_SERVICES_JWT_SECRET must be even-length hex", .{});
-            std.process.exit(2);
-        }
-        const bytes = try allocator.alloc(u8, hex.len / 2);
-        _ = std.fmt.hexToBytes(bytes, hex) catch {
-            std.log.err("rewind: LOOP46_SERVICES_JWT_SECRET is not valid hex", .{});
-            std.process.exit(2);
-        };
-        break :blk bytes;
-    };
+    const services_jwt_secret: ?[]const u8 =
+        try jwt.loadSecretFromEnvOpt(allocator, "LOOP46_SERVICES_JWT_SECRET");
     defer if (services_jwt_secret) |s| allocator.free(s);
     // Worker's internal-plane view of the standalone log-server (no trailing
     // slash, e.g. `http://127.0.0.1:9000`). Env memory lives for the process,
@@ -882,18 +766,7 @@ pub fn main() !void {
     // worker's single background flusher thread serializes all PUTs through
     // this store's one libcurl handle (rewind runs a single worker — see
     // below; a multi-worker node would need a per-flusher handle).
-    const log_key_prefix = (try blob_mod.env.envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
-        try allocator.dupe(u8, "");
-    defer allocator.free(log_key_prefix);
-    const log_s3 = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
-        .endpoint = blob_owned.cfg.endpoint,
-        .region = blob_owned.cfg.region,
-        .bucket = blob_owned.cfg.bucket,
-        .key_prefix = log_key_prefix,
-        .access_key = blob_owned.cfg.access_key,
-        .secret_key = blob_owned.cfg.secret_key,
-        .use_tls = blob_owned.cfg.use_tls,
-    });
+    const log_s3 = try log_server.batch_store_s3.S3BatchStore.fromBlobCfg(allocator, blob_owned.cfg);
     defer log_s3.deinit();
     const log_batch_store = log_s3.batchStore();
 
@@ -951,17 +824,8 @@ pub fn main() !void {
     // speak h2c), and so `/metrics` stays answerable when the main h2 path is
     // wedged. Bound to 127.0.0.1 (node-local Alloy scrapes; network isolation is
     // the auth). `REWIND_METRICS_PORT=0` disables it; default 9110.
-    const metrics_srv: ?*rjs.MetricsServer = blk: {
-        const ms_port = parsePortEnv("REWIND_METRICS_PORT", 9110);
-        if (ms_port == 0) break :blk null;
-        const ms_addr = std.net.Address.parseIp("127.0.0.1", ms_port) catch break :blk null;
-        const srv = rjs.MetricsServer.init(allocator, ms_addr) catch |err| {
-            std.log.warn("rewind: operator metrics listener disabled — bind 127.0.0.1:{d} failed ({s})", .{ ms_port, @errorName(err) });
-            break :blk null;
-        };
-        std.log.info("rewind: operator metrics on http://127.0.0.1:{d}/metrics", .{ms_port});
-        break :blk srv;
-    };
+    const metrics_srv: ?*rjs.MetricsServer =
+        boot.metricsFromEnv(allocator, "REWIND_METRICS_PORT", boot.METRICS_PORT_WORKER, "rewind");
     defer if (metrics_srv) |m| m.deinit();
 
     var ready = std.Thread.ResetEvent{};

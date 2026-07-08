@@ -64,6 +64,27 @@ pub const S3BatchStore = struct {
     /// background flusher serializes through one thread).
     curl: *curl_mod.Easy,
 
+    /// Build the store from the SAME S3 connection params as the blob
+    /// backend (rove blob is S3-only), plus the optional `LOG_S3_KEY_PREFIX`
+    /// namespace read HERE — once — so the worker (writer) and the
+    /// log-server (reader) construct byte-identical stores from the same
+    /// env and can't disagree on endpoint/prefix (disagreement = captured
+    /// tapes that can never be queried back out).
+    pub fn fromBlobCfg(allocator: std.mem.Allocator, cfg: @import("rove-blob").BackendConfig) !*S3BatchStore {
+        const key_prefix = (try @import("rove-blob").env.envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
+            try allocator.dupe(u8, "");
+        defer allocator.free(key_prefix);
+        return init(allocator, .{
+            .endpoint = cfg.endpoint,
+            .region = cfg.region,
+            .bucket = cfg.bucket,
+            .key_prefix = key_prefix,
+            .access_key = cfg.access_key,
+            .secret_key = cfg.secret_key,
+            .use_tls = cfg.use_tls,
+        });
+    }
+
     pub fn init(allocator: std.mem.Allocator, config: Config) !*S3BatchStore {
         if (config.endpoint.len == 0) return Error.Io;
         if (config.bucket.len == 0) return Error.Io;

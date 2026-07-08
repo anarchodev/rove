@@ -34,19 +34,12 @@ const log_server = @import("rove-log-server");
 const blob_mod = @import("rove-blob");
 const h2 = @import("rove-h2");
 const MetricsServer = @import("metrics-server").MetricsServer;
+const boot = @import("rove-boot");
+const jwt = @import("rove-jwt");
 
 var stop_flag: std.atomic.Value(bool) = .init(false);
 
-fn handleSignal(_: c_int) callconv(.c) void {
-    stop_flag.store(true, .release);
-}
-
-fn metricsPort() u16 {
-    // 9113 — distinct from worker 9110 / CP 9111 / front 9112 so all four
-    // coexist on a co-located host.
-    const s = std.posix.getenv("REWIND_LOGS_METRICS_PORT") orelse return 9113;
-    return std.fmt.parseInt(u16, std.mem.trim(u8, s, " \t"), 10) catch 9113;
-}
+// SIGINT/SIGTERM → stop_flag wiring lives in rove-boot (shared by all four binaries).
 
 /// Re-render + publish the process-global counters every ~2 s until shutdown.
 /// Sleeps in short slices so it wakes promptly when `stop_flag` is set.
@@ -62,16 +55,6 @@ fn metricsPublishLoop(allocator: std.mem.Allocator, ms: *MetricsServer) void {
             slept += 100;
         }
     }
-}
-
-fn installSignalHandlers() !void {
-    const act: std.posix.Sigaction = .{
-        .handler = .{ .handler = handleSignal },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.INT, &act, null);
-    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 }
 
 const ENV_JWT_SECRET = "LOOP46_SERVICES_JWT_SECRET";
@@ -166,26 +149,14 @@ fn parseHostPort(allocator: std.mem.Allocator, hp: []const u8) !std.net.Address 
     return try std.net.Address.parseIp(host_z, port);
 }
 
+/// The verifier half of the worker's push credential — same hex env, same
+/// decode (`jwt.loadSecretFromEnvOpt`); unset is fatal HERE because a
+/// log-server without the secret can never authenticate any reader.
 fn loadJwtSecret(allocator: std.mem.Allocator) ![]u8 {
-    const hex = std.process.getEnvVarOwned(allocator, ENV_JWT_SECRET) catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => {
-            std.debug.print("error: {s} not set\n", .{ENV_JWT_SECRET});
-            std.process.exit(2);
-        },
-        else => return err,
-    };
-    defer allocator.free(hex);
-    if (hex.len == 0 or hex.len % 2 != 0) {
-        std.debug.print("error: {s} must be even-length hex\n", .{ENV_JWT_SECRET});
-        std.process.exit(2);
-    }
-    const bytes = try allocator.alloc(u8, hex.len / 2);
-    errdefer allocator.free(bytes);
-    _ = std.fmt.hexToBytes(bytes, hex) catch {
-        std.debug.print("error: {s} is not valid hex\n", .{ENV_JWT_SECRET});
+    return (try jwt.loadSecretFromEnvOpt(allocator, ENV_JWT_SECRET)) orelse {
+        std.debug.print("error: {s} not set\n", .{ENV_JWT_SECRET});
         std.process.exit(2);
     };
-    return bytes;
 }
 
 fn loadBlobBackend(allocator: std.mem.Allocator) !blob_mod.BlobBackendOwned {
@@ -230,23 +201,12 @@ pub fn main() !void {
     // an optional LOG_S3_KEY_PREFIX namespace, matching what the
     // worker's flushLogs path uses.
     const s3cfg = blob_owned.cfg;
-    const key_prefix = (try blob_mod.env.envOpt(allocator, "LOG_S3_KEY_PREFIX")) orelse
-        try allocator.dupe(u8, "");
-    defer allocator.free(key_prefix);
-    var s3_handle = try log_server.batch_store_s3.S3BatchStore.init(allocator, .{
-        .endpoint = s3cfg.endpoint,
-        .region = s3cfg.region,
-        .bucket = s3cfg.bucket,
-        .key_prefix = key_prefix,
-        .access_key = s3cfg.access_key,
-        .secret_key = s3cfg.secret_key,
-        .use_tls = s3cfg.use_tls,
-    });
+    var s3_handle = try log_server.batch_store_s3.S3BatchStore.fromBlobCfg(allocator, s3cfg);
     defer s3_handle.deinit();
     const batch_store: log_server.batch_store.BatchStore = s3_handle.batchStore();
     std.log.info(
         "batch backend: s3 endpoint={s} region={s} bucket={s} key_prefix='{s}'",
-        .{ s3cfg.endpoint, s3cfg.region, s3cfg.bucket, key_prefix },
+        .{ s3cfg.endpoint, s3cfg.region, s3cfg.bucket, s3_handle.config.key_prefix },
     );
 
     var tls_config: ?*h2.TlsConfig = null;
@@ -306,17 +266,8 @@ pub fn main() !void {
     // port is h2c-only (stock Prometheus/Alloy can't scrape it), same split the
     // worker uses. A small thread re-renders the process-global counters every
     // ~2 s. `REWIND_LOGS_METRICS_PORT=0` disables it; default 9113.
-    const metrics_srv: ?*MetricsServer = blk: {
-        const mp = metricsPort();
-        if (mp == 0) break :blk null;
-        const ma = std.net.Address.parseIp("127.0.0.1", mp) catch break :blk null;
-        const srv = MetricsServer.init(allocator, ma) catch |err| {
-            std.log.warn("rewind-logs: metrics listener disabled — bind 127.0.0.1:{d} failed ({s})", .{ mp, @errorName(err) });
-            break :blk null;
-        };
-        std.log.info("rewind-logs: operator metrics on http://127.0.0.1:{d}/metrics", .{mp});
-        break :blk srv;
-    };
+    const metrics_srv: ?*MetricsServer =
+        boot.metricsFromEnv(allocator, "REWIND_LOGS_METRICS_PORT", boot.METRICS_PORT_LOGS, "rewind-logs");
     defer if (metrics_srv) |m| m.deinit();
     var metrics_thread: ?std.Thread = null;
     if (metrics_srv) |ms| metrics_thread = std.Thread.spawn(.{}, metricsPublishLoop, .{ allocator, ms }) catch |err| nblk: {
@@ -325,6 +276,6 @@ pub fn main() !void {
     };
     defer if (metrics_thread) |t| t.join(); // joins BEFORE deinit (LIFO)
 
-    try installSignalHandlers();
+    boot.installSignalHandlers(&stop_flag);
     h2.TlsConfig.runReloadPoll(tls_config, &stop_flag);
 }

@@ -1246,18 +1246,8 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     s.kv_prefixes = &.{};
 
     if (ctx.wrote) {
-        const lh: log_mod.LogHeader = .{
-            .request_id = ctx.request_id,
-            .deployment_id = ctx.deployment_id,
-            .duration_ns = 0,
-            .status = 0, // parked-hop convention (matches repark)
-            .outcome = .ok,
-            .activation = ctx.activation,
-            .method = "POST",
-            .path = ctx.cont_path,
-            .host = "",
-            .correlation_id = ctx.correlation_id orelse "",
-        };
+        // status=0: parked-hop convention (matches repark).
+        const lh = worker_streaming.fireLogHeader(ctx.request_id, ctx.deployment_id, 0, ctx.activation, ctx.cont_path, ctx.correlation_id);
         const stream_seq = proposeAndParkContResume(
             worker,
             ctx.ent,
@@ -1381,6 +1371,331 @@ fn resumeErrStatus(worker: anytype) u16 {
 
 /// The deadline trigger passes `allow_repark = false`.
 /// `error.Resume*` → caller falls back to a hard 504.
+/// Which Msg-tape the site's log records carry (per-capture
+/// materialization — the capture may append the activation's Msg to the
+/// readset, and the write arms serialize the readset into the propose,
+/// so materialization order is part of the wire format; keep it exactly
+/// where each capture runs).
+const ContTape = enum { none, chunk, fetch };
+
+/// Comptime per-site axes of `finishContResume` — everything else the
+/// three cont-family sites do is identical (that identity is the point:
+/// the arms had drifted apart in five ways before this extraction; see
+/// docs/plans/refactor-audit-2026-07.md §2.3).
+const ContFinishSpec = struct {
+    /// Operator warn-log tag ("cont-resume" / "bound-fetch" / "inbound-chunk").
+    site: []const u8,
+    /// Client-visible noun in the defined-failure response bodies
+    /// ("<noun> handler error\n", "<noun> alloc failed\n",
+    /// "<noun> write replication failed\n").
+    noun: []const u8,
+    /// Cancel sibling bound-fetch binds when the chain goes terminal —
+    /// the bound-fetch + inbound-chunk sites (their chains can hold
+    /// binds); plain continuations have none.
+    cancel_binds: bool,
+    tape: ContTape,
+};
+
+/// Runtime context for `finishContResume` (the cont-family sibling of
+/// `StreamResumeCtx`). All slices borrow the caller's locals for the
+/// duration of the call.
+const ContFinishCtx = struct {
+    ent: rove.Entity,
+    sid: h2.StreamId,
+    sess: h2.Session,
+    ws: *kv_mod.WriteSet,
+    txn: *kv_mod.KvStore.TrackedTxn,
+    tenant_id: []const u8,
+    readset: *tape_mod.Readset,
+    /// The resume target module path (feeds LogHeaders + the ambient
+    /// `next(ctx)` empty-path fixup). May borrow desc.cont backing
+    /// memory — freed by a write-repark — hence the separate
+    /// `cont_path_log` snapshot for post-mutation log records.
+    cont_path: []const u8,
+    cont_path_log: []const u8,
+    correlation_id: ?[]const u8,
+    request_id: u64,
+    now_ns: i64,
+    deployment_id: u64,
+    wrote: bool,
+    txn_owned: *bool,
+    txn_done: *bool,
+    /// `.send_callback` / `.wake_batch` (resumeContinuation) /
+    /// `.fetch_chunk` / `.inbound_chunk`.
+    act: log_mod.ActivationSource,
+    /// §6.4 mandatory-timeout gate: false ⇒ a returned continuation is
+    /// rejected with a defined 504 (the deadline path must terminate,
+    /// not extend). Only resumeContinuation's sweep passes false.
+    allow_repark: bool = true,
+    pending_fetches: *std.ArrayListUnmanaged(globals.PendingFetch),
+    /// Tape sources, read per `ContFinishSpec.tape`: `.chunk` reads
+    /// `tape_bytes`; `.fetch` reads `tape_body` + `tape_ev`.
+    tape_bytes: []const u8 = "",
+    tape_body: []const u8 = "",
+    tape_ev: ?worker_mod.FetchEvent = null,
+};
+
+inline fn contTapes(worker: anytype, comptime tape: ContTape, ctx: *const ContFinishCtx) log_mod.TapePayloads {
+    return switch (tape) {
+        .none => .{},
+        .chunk => worker_mod.captureTapes(worker, ctx.readset, ctx.tape_bytes),
+        .fetch => worker_mod.captureFetchChunkTapes(worker, ctx.readset, ctx.tape_body, ctx.tape_ev.?),
+    };
+}
+
+/// §2.2 (refactor-audit): the ONE outcome-finishing switch for the three
+/// cont-family resume sites — send_callback/wake (`resumeContinuation`),
+/// bound-fetch chunk (`resumeBoundFetchChain`), and the inbound-chunk
+/// resume. The WS family's sibling is `finishWsResume` (worker_ws.zig);
+/// the stream family's arms live in worker_streaming.zig; the
+/// cont→stream transition is the already-shared `resumeIntoStream`.
+///
+/// Arms: terminal-with-exception → rollback + defined 500 + log;
+/// terminal-with-writes → propose + park on `raft_pending_cont` (the
+/// helper owns the txn on success AND failure — `txn_owned` flips false
+/// either way); terminal-read-only → commit + flush fetches + resolve;
+/// continuation → repark (write: propose `.repark`; read-only: in-place
+/// desc swap, `bound_schedule_id` UNTOUCHED — see the component's
+/// contract); stream → `resumeIntoStream`; no-export probe → defined 500.
+///
+/// Read-only commits panic on failure (`error.Conflict` included):
+/// resumes run inside the chain lease, so a clean read-only commit
+/// cannot legitimately conflict — unlike `commitReadOnlyFire`, whose
+/// connectionless fires run outside the lease and tolerate it.
+fn finishContResume(
+    worker: anytype,
+    comptime spec: ContFinishSpec,
+    oc: *dispatcher_mod.RunOutcome,
+    ctx: ContFinishCtx,
+) void {
+    const allocator = worker.allocator;
+    const server = worker.h2;
+    const dep_id = ctx.deployment_id;
+    switch (oc.*) {
+        .terminal => |*r| {
+            defer r.deinit(allocator);
+            if (comptime spec.cancel_binds) scanAndCancelBoundFetches(worker, ctx.ent);
+            // A thrown resume hop is an EXPECTED condition (author
+            // error). It must be a defined 5xx, never a flushed
+            // 200-empty (that masked the recipe-1 effectful-resume
+            // gap) — feedback_infallibility_violations.
+            if (r.exception.len > 0) {
+                ctx.txn.rollback() catch {};
+                ctx.txn_done.* = true;
+                resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, spec.noun ++ " handler error\n") catch {};
+                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .handler_error, r.console, r.exception, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, r.tags, ctx.act, 0);
+                r.console = &.{};
+                r.exception = &.{};
+                return;
+            }
+            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
+            if (ctx.wrote) {
+                // Terminal + writes — propose through raft, park the
+                // entity on `raft_pending_cont` with the response staged;
+                // its drainEntityArm ships the response at commit.
+                const body_dup = allocator.dupe(u8, r.body) catch {
+                    ctx.txn.rollback() catch {};
+                    ctx.txn_done.* = true;
+                    resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, spec.noun ++ " alloc failed\n") catch {};
+                    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .handler_error, r.console, r.exception, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, r.tags, ctx.act, 0);
+                    r.console = &.{};
+                    r.exception = &.{};
+                    return;
+                };
+                const console_owned = r.console;
+                const exception_owned = r.exception;
+                r.console = &.{};
+                r.exception = &.{};
+                const lh = worker_streaming.fireLogHeader(ctx.request_id, dep_id, st, ctx.act, ctx.cont_path, ctx.correlation_id);
+                const seq = proposeAndParkContResume(
+                    worker,
+                    ctx.ent,
+                    ctx.sid,
+                    ctx.sess,
+                    ctx.ws,
+                    ctx.txn,
+                    ctx.tenant_id,
+                    .{ .terminal = .{ .status = st, .body = body_dup } },
+                    ctx.pending_fetches,
+                    ctx.readset,
+                    lh,
+                ) catch |perr| {
+                    // Propose-fail / pre-park alloc failure: degrade to a
+                    // defined 500 over the held socket. The helper rolled
+                    // back + destroyed the txn.
+                    std.log.warn("rove-js " ++ spec.site ++ ": propose failed: {s}", .{@errorName(perr)});
+                    allocator.free(body_dup);
+                    ctx.txn_owned.* = false;
+                    ctx.txn_done.* = true;
+                    resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, spec.noun ++ " write replication failed\n") catch {};
+                    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .fault, console_owned, exception_owned, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, &.{}, ctx.act, 0);
+                    return;
+                };
+                // Helper took ownership of txn (moved into pending_txns)
+                // and body_dup (stamped onto the entity).
+                ctx.txn_owned.* = false;
+                ctx.txn_done.* = true;
+                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, st, .ok, console_owned, exception_owned, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, r.tags, ctx.act, seq);
+                if (ctx.pending_fetches.items.len > 0) std.log.warn(
+                    "rove-js " ++ spec.site ++ ": {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
+                    .{ ctx.pending_fetches.items.len, ctx.tenant_id },
+                );
+                return;
+            }
+            // Clean read-only commit cannot fault (mirrors finalizeBatch's
+            // read-only invariant) — panic, never soft.
+            ctx.txn.commit() catch |e| panic_mod.invariantViolated(
+                spec.site ++ ".commit(terminal_ro)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            ctx.txn_done.* = true;
+            // Terminal ⇒ the connection is closing: connection-scoped
+            // fetches drop (scope rule), unbound ones still fire.
+            flushResumeFetches(worker, ctx.ent, ctx.pending_fetches, false);
+            resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, st, r.body) catch {};
+            captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, st, .ok, r.console, r.exception, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, r.tags, ctx.act, 0);
+            r.console = &.{};
+            r.exception = &.{};
+        },
+        .continuation => |c2| {
+            var c2m = c2;
+            // Handler-surface Phase 6: an ambient `next(ctx)` repark emits
+            // an empty path — resolve it to the resuming module (the chain
+            // re-invokes itself). Explicit cross-module `__rove_next` keeps
+            // its path. OOM: leave empty (resume resolves to a clean error).
+            if (c2m.path.len == 0) {
+                if (allocator.dupe(u8, ctx.cont_path)) |dup| {
+                    allocator.free(c2m.path);
+                    c2m.path = dup;
+                } else |_| {}
+            }
+            if (!ctx.allow_repark) {
+                // Deadline path: §6.4 mandatory timeout must terminate,
+                // not extend. Reject any new cont with a defined 504.
+                c2m.deinit(allocator);
+                ctx.txn.rollback() catch {};
+                ctx.txn_done.* = true;
+                resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 504, "hold deadline exceeded\n") catch {};
+                return;
+            }
+            if (ctx.wrote) {
+                // Repark + writes — propose, park on `raft_pending_cont`;
+                // at commit the entity routes back to
+                // `parked_continuations` with the in-place-updated
+                // descriptor (new cont, refreshed binding + deadline).
+                // §6.4 binding for the repark: scan the writeset for the
+                // single `_send/owed/{id}` put. 0 / >1 → null; OOM → null
+                // (a deadline-only resume beats propagating).
+                const new_bound_sched_id: ?[]u8 = blk: {
+                    const only = worker_mod.scanLoneOwedSendId(ctx.ws.ops.items) orelse break :blk null;
+                    break :blk allocator.dupe(u8, only) catch null;
+                };
+                // `docs/cross-worker-held-state-plan.md` Phase 1: repark
+                // re-binds to a (possibly new) send_id — stamp the owner
+                // (same dependency as the worker_dispatch open-hop site).
+                if (new_bound_sched_id) |send_id| {
+                    _ = worker.node.router.registerBoundSendOwner(send_id, worker.msg_inbox_idx);
+                    // Phase 3 mirror.
+                    worker.registerBoundSendEntity(send_id, ctx.ent);
+                }
+                // status=0: the parked-hop convention (same shape as the
+                // inbound trampoline open hop) so replay surfaces it.
+                const lh = worker_streaming.fireLogHeader(ctx.request_id, dep_id, 0, ctx.act, ctx.cont_path, ctx.correlation_id);
+                const seq = proposeAndParkContResume(
+                    worker,
+                    ctx.ent,
+                    ctx.sid,
+                    ctx.sess,
+                    ctx.ws,
+                    ctx.txn,
+                    ctx.tenant_id,
+                    .{ .repark = .{ .new_cont = c2m, .new_bound_sched_id = new_bound_sched_id } },
+                    ctx.pending_fetches,
+                    ctx.readset,
+                    lh,
+                ) catch |perr| {
+                    // Helper rolled back + destroyed txn + freed c2m +
+                    // new_bound_sched_id on failure; log + degrade.
+                    std.log.warn("rove-js " ++ spec.site ++ " (repark): propose failed: {s}", .{@errorName(perr)});
+                    ctx.txn_owned.* = false;
+                    ctx.txn_done.* = true;
+                    resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, spec.noun ++ " write replication failed\n") catch {};
+                    captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .fault, &.{}, &.{}, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, &.{}, ctx.act, 0);
+                    return;
+                };
+                ctx.txn_owned.* = false;
+                ctx.txn_done.* = true;
+                // The repark hop's tape row: status=0, parked.
+                captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 0, .ok, &.{}, &.{}, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, &.{}, ctx.act, seq);
+                if (ctx.pending_fetches.items.len > 0) std.log.warn(
+                    "rove-js " ++ spec.site ++ ": {d} connection-scoped fetch(es) from a WRITING repark dropped (bind-from-writing-resume not wired) tenant={s}",
+                    .{ ctx.pending_fetches.items.len, ctx.tenant_id },
+                );
+                return;
+            }
+            ctx.txn.commit() catch |e| panic_mod.invariantViolated(
+                spec.site ++ ".commit(repark_ro)",
+                "err={s}",
+                .{@errorName(e)},
+            );
+            ctx.txn_done.* = true;
+            // Re-park in place: swap the descriptor, refresh the deadline;
+            // the entity stays in `parked_continuations`. Ownership of c2m
+            // transfers to the component. bound_schedule_id is UNTOUCHED
+            // on the read-only path: a hop that wrote nothing fired no
+            // send, and clearing would strand a chain still awaiting an
+            // EARLIER hop's owed send — its callback must keep resuming
+            // this park. Only the write-batch repark rewrites the binding.
+            const desc = server.reg.get(ctx.ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return;
+            if (desc.cont) |*old_c| old_c.deinit(allocator);
+            desc.cont = c2m;
+            desc.deadline_ns = ctx.now_ns + CONT_HOLD_DEADLINE_NS;
+            // Still held (repark) + committed (read-only): bind + submit
+            // any fetches this resume issued (handler-shape §5.3).
+            flushResumeFetches(worker, ctx.ent, ctx.pending_fetches, true);
+            // A read-only repark is still a recorded activation — without
+            // this record the hop is unreplayable (a ctx-only accumulating
+            // handler hops read-only on EVERY chunk). Status 0 = the
+            // parked-hop convention.
+            captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 0, .ok, &.{}, &.{}, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, &.{}, ctx.act, 0);
+        },
+        .stream => |*s| {
+            resumeIntoStream(worker, s, .{
+                .ent = ctx.ent,
+                .sid = ctx.sid,
+                .sess = ctx.sess,
+                .ws = ctx.ws,
+                .txn = ctx.txn,
+                .tenant_id = ctx.tenant_id,
+                .readset = ctx.readset,
+                .cont_path = ctx.cont_path,
+                .correlation_id = ctx.correlation_id,
+                .request_id = ctx.request_id,
+                .now_ns = ctx.now_ns,
+                .deployment_id = dep_id,
+                .wrote = ctx.wrote,
+                .txn_owned = ctx.txn_owned,
+                .txn_done = ctx.txn_done,
+                .pending_fetches = ctx.pending_fetches,
+                .activation = ctx.act,
+                // The activation's Msg tape, built BEFORE the write path
+                // serializes the readset into the propose (see
+                // StreamResumeCtx.tapes for why that ordering matters).
+                .tapes = if (comptime spec.tape == .none) null else contTapes(worker, spec.tape, &ctx),
+            });
+        },
+        // Only `.inbound_headers` / `.inbound_chunk` activations produce
+        // these; the probe ran on the FIRST fire. Defined failure.
+        .no_onheaders, .no_onchunk => {
+            ctx.txn.rollback() catch {};
+            ctx.txn_done.* = true;
+            resolveParked(worker, ctx.ent, ctx.sid, ctx.sess, 500, "export probe on a resume path\n") catch {};
+            captureLogWithId(worker, ctx.tenant_id, ctx.request_id, "POST", ctx.cont_path_log, "", dep_id, ctx.now_ns, 500, .handler_error, &.{}, &.{}, contTapes(worker, spec.tape, &ctx), ctx.correlation_id, &.{}, ctx.act, 0);
+        },
+    }
+}
+
 fn resumeContinuation(
     worker: anytype,
     ent: rove.Entity,
@@ -1539,282 +1854,43 @@ fn resumeContinuation(
     };
     std.log.info("rove-js corr: resume corr={s} request_id={d} tenant={s}", .{ correlation_id orelse "(none)", request_id, inst.id });
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    var oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
-        request,
-        &budget,
-    ) catch {
+    var oc = worker_mod.runResume(worker, inst, tc, bc, txn, &ws, request, &budget, path) catch {
         txn.rollback() catch {};
         txn_done = true;
         try resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "continuation handler error\n");
+        // Log the failed hop — a resume that dies at dispatch was invisible
+        // in tenant logs while every other family records a 500 here.
+        captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, .{}, correlation_id, &.{}, act_src, 0);
         return;
     };
-    worker_mod.noteChurnyOutcome(worker, inst.id, tc.snap.deployment_id, path);
 
     const wrote = ws.ops.items.len > 0;
-    switch (oc) {
-        .terminal => |*r| {
-            defer r.deinit(allocator);
-            // A thrown resume hop is an EXPECTED condition (author
-            // error). It must be a defined 5xx, never a flushed
-            // 200-empty (that masked the recipe-1 effectful-resume
-            // gap) — feedback_infallibility_violations.
-            if (r.exception.len > 0) {
-                txn.rollback() catch {};
-                txn_done = true;
-                try resolveParked(worker, ent, sid, sess, 500, "continuation handler error\n");
-                // Phase 1b: record the resume's tape entry. Activation
-                // source = send_callback so the row shares the chain
-                // id with the inbound entry and the replay UX groups
-                // them.
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, .{}, correlation_id, &.{}, act_src, 0);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            if (wrote) {
-                // Phase 4: terminal + writes — propose the writes
-                // through raft, park the entity on `raft_pending_cont`
-                // with the response components staged on it. The
-                // raft_pending_cont drainEntityArm routes the
-                // committed entity back to `parked_continuations`,
-                // where the subsequent resume / sweep / resolve
-                // site ships the response.
-                const corr_id = correlation_id;
-                const dep_id = tc.snap.deployment_id;
-                const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-                const body_dup = try allocator.dupe(u8, r.body);
-                errdefer allocator.free(body_dup);
-                const console_owned = r.console;
-                const exception_owned = r.exception;
-                r.console = &.{};
-                r.exception = &.{};
-                const lh_terminal: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = dep_id,
-                    .duration_ns = 0,
-                    .status = st,
-                    .outcome = .ok,
-                    .activation = act_src,
-                    .method = "POST",
-                    .path = cont_path,
-                    .host = "",
-                    .correlation_id = corr_id orelse "",
-                };
-                const cont_seq = proposeAndParkContResume(
-                    worker,
-                    ent,
-                    sid,
-                    sess,
-                    &ws,
-                    txn,
-                    tenant_id,
-                    .{ .terminal = .{
-                        .status = st,
-                        .body = body_dup,
-                    } },
-                    &pending_fetches,
-                    &readset,
-                    lh_terminal,
-                ) catch |perr| {
-                    // Propose-fail / pre-park alloc failure: degrade
-                    // to a 500 over the held socket. The txn was
-                    // rolled back + destroyed inside the helper.
-                    std.log.warn("rove-js cont-resume: propose failed: {s}", .{@errorName(perr)});
-                    allocator.free(body_dup);
-                    txn_owned = false; // helper destroyed it
-                    txn_done = true;
-                    resolveParked(worker, ent, sid, sess, 500, "continuation write replication failed\n") catch {};
-                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", dep_id, now_ns, 500, .fault, console_owned, exception_owned, .{}, corr_id, &.{}, act_src, 0);
-                    return;
-                };
-                // proposeAndParkContResume took ownership of txn (moved
-                // into pending_txns) and body_dup (stamped onto entity).
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", dep_id, now_ns, st, .ok, console_owned, exception_owned, .{}, corr_id, &.{}, act_src, cont_seq);
-                if (pending_fetches.items.len > 0) std.log.warn(
-                    "rove-js cont-resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
-                    .{ pending_fetches.items.len, tenant_id },
-                );
-                return;
-            }
-            // Clean read-only commit cannot fault (mirrors
-            // finalizeBatch read-only invariant) — panic, never soft.
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "resumeContinuation.commit(read_only)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            flushResumeFetches(worker, ent, &pending_fetches, false);
-            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            try resolveParked(worker, ent, sid, sess, st, r.body);
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, .{}, correlation_id, &.{}, act_src, 0);
-            r.console = &.{};
-            r.exception = &.{};
-        },
-        .continuation => |c2| {
-            var c2m = c2;
-            // Handler-surface Phase 6: an ambient `next(ctx)` repark emits
-            // an empty path — resolve it to the resuming module (the chain
-            // re-invokes itself). Explicit cross-module `__rove_next` keeps
-            // its path. OOM: leave empty (resume resolves to a clean error).
-            if (c2m.path.len == 0) {
-                if (allocator.dupe(u8, cont_path)) |dup| {
-                    allocator.free(c2m.path);
-                    c2m.path = dup;
-                } else |_| {}
-            }
-            if (!allow_repark) {
-                // Deadline path: §6.4 mandatory timeout must
-                // terminate, not extend. Reject any new cont with
-                // a defined 504 over the held socket.
-                c2m.deinit(allocator);
-                txn.rollback() catch {};
-                txn_done = true;
-                try resolveParked(worker, ent, sid, sess, 504, "hold deadline exceeded\n");
-                return;
-            }
-            if (wrote) {
-                // Phase 4: continuation + writes — propose, park
-                // on `raft_pending_cont`; on commit the
-                // raft_pending_cont drainEntityArm routes the
-                // entity back to `parked_continuations`
-                // with the in-place-updated ContDescriptor (new
-                // cont, refreshed bound_schedule_id, refreshed
-                // deadline). The new bound_schedule_id (the lone
-                // `_send/owed/` this hop wrote, if exactly one)
-                // becomes the wake the next callback resolves on.
-                // Same fail-fast posture as the terminal+writes
-                // branch.
-                const corr_id = correlation_id;
-                const dep_id = tc.snap.deployment_id;
-                // §6.4 binding for the repark: scan the writeset
-                // for the single _send/owed/{id} put. 0 / >1 → null
-                // (deadline-only resume).
-                const new_bound_sched_id: ?[]u8 = blk: {
-                    const only = worker_mod.scanLoneOwedSendId(ws.ops.items) orelse break :blk null;
-                    break :blk try allocator.dupe(u8, only);
-                };
-                // `docs/cross-worker-held-state-plan.md` Phase 1:
-                // repark re-binds to a (possibly new) send_id —
-                // stamp the owner. Same Phase 2 dependency as the
-                // open-hop site in worker_dispatch.zig.
-                if (new_bound_sched_id) |send_id| {
-                    _ = worker.node.router.registerBoundSendOwner(send_id, worker.msg_inbox_idx);
-                    // Phase 3 mirror.
-                    worker.registerBoundSendEntity(send_id, ent);
-                }
-                const lh_repark: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = dep_id,
-                    .duration_ns = 0,
-                    // captureLogWithId on this branch records status=0
-                    // (the parked-hop convention — same shape as the
-                    // inbound trampoline open hop). Mirror that here
-                    // so replay surfaces the same value.
-                    .status = 0,
-                    .outcome = .ok,
-                    .activation = act_src,
-                    .method = "POST",
-                    .path = cont_path,
-                    .host = "",
-                    .correlation_id = corr_id orelse "",
-                };
-                const repark_seq = proposeAndParkContResume(
-                    worker,
-                    ent,
-                    sid,
-                    sess,
-                    &ws,
-                    txn,
-                    tenant_id,
-                    .{ .repark = .{
-                        .new_cont = c2m,
-                        .new_bound_sched_id = new_bound_sched_id,
-                    } },
-                    &pending_fetches,
-                    &readset,
-                    lh_repark,
-                ) catch |perr| {
-                    // Helper rolled back + destroyed txn + freed
-                    // c2m + new_bound_sched_id on failure; we just
-                    // log + degrade.
-                    std.log.warn("rove-js cont-resume (repark): propose failed: {s}", .{@errorName(perr)});
-                    txn_owned = false;
-                    txn_done = true;
-                    resolveParked(worker, ent, sid, sess, 500, "continuation write replication failed\n") catch {};
-                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", dep_id, now_ns, 500, .fault, &.{}, &.{}, .{}, corr_id, &.{}, act_src, 0);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                // Log the repark hop's tape row. status=0 (parked,
-                // same as the inbound trampoline open hop's
-                // captureSuccess shape).
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", dep_id, now_ns, 0, .ok, &.{}, &.{}, .{}, corr_id, &.{}, act_src, repark_seq);
-                if (pending_fetches.items.len > 0) std.log.warn(
-                    "rove-js cont-resume: {d} connection-scoped fetch(es) from a WRITING repark dropped (bind-from-writing-resume not wired) tenant={s}",
-                    .{ pending_fetches.items.len, tenant_id },
-                );
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "resumeContinuation.commit(repark_ro)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            flushResumeFetches(worker, ent, &pending_fetches, true);
-            // Re-park: swap the descriptor in place on the entity's
-            // ContDescriptor component, refresh the deadline; the
-            // entity stays in `parked_continuations`. Ownership of
-            // c2m transfers directly to the component;
-            // bound_schedule_id is untouched on the read-only path
-            // (only the write-batch repark in
-            // `proposeAndParkContResume` rewrites it).
-            const refreshed_deadline_ns: i64 = now_ns + CONT_HOLD_DEADLINE_NS;
-            if (desc.cont) |*old_c| old_c.deinit(allocator);
-            desc.cont = c2m;
-            desc.deadline_ns = refreshed_deadline_ns;
-        },
-        .stream => |*s| {
-            resumeIntoStream(worker, s, .{
-                .ent = ent,
-                .sid = sid,
-                .sess = sess,
-                .ws = &ws,
-                .txn = txn,
-                .tenant_id = tenant_id,
-                .readset = &readset,
-                .cont_path = cont_path,
-                .correlation_id = correlation_id,
-                .request_id = request_id,
-                .now_ns = now_ns,
-                .deployment_id = tc.snap.deployment_id,
-                .wrote = wrote,
-                .txn_owned = &txn_owned,
-                .txn_done = &txn_done,
-                .pending_fetches = &pending_fetches,
-                .activation = act_src,
-            });
-        },
-        // Only `.inbound_headers` / `.inbound_chunk` activations
-        // produce these; resume hops never dispatch as one. Defined
-        // failure, not a panic.
-        .no_onheaders, .no_onchunk => {
-            txn.rollback() catch {};
-            txn_done = true;
-            try resolveParked(worker, ent, sid, sess, 500, "export probe on a resume path\n");
-        },
-    }
+    finishContResume(worker, .{
+        .site = "cont-resume",
+        .noun = "continuation",
+        .cancel_binds = false,
+        .tape = .none,
+    }, &oc, .{
+        .ent = ent,
+        .sid = sid,
+        .sess = sess,
+        .ws = &ws,
+        .txn = txn,
+        .tenant_id = tenant_id,
+        .readset = &readset,
+        .cont_path = cont_path,
+        .cont_path_log = cont_path_log,
+        .correlation_id = correlation_id,
+        .request_id = request_id,
+        .now_ns = now_ns,
+        .deployment_id = tc.snap.deployment_id,
+        .wrote = wrote,
+        .txn_owned = &txn_owned,
+        .txn_done = &txn_done,
+        .act = act_src,
+        .allow_repark = allow_repark,
+        .pending_fetches = &pending_fetches,
+    });
 }
 
 /// `docs/streaming-model.md` §7 item 1 + `docs/handler-shape.md`
@@ -2022,235 +2098,43 @@ pub fn resumeBoundFetchChain(
     const sess = sess_ptr.*;
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    var oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
-        req,
-        &budget,
-    ) catch {
+    var oc = worker_mod.runResume(worker, inst, tc, bc, txn, &ws, req, &budget, cont_path) catch {
         txn.rollback() catch {};
         txn_done = true;
         resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "bound-fetch handler error\n") catch {};
+        captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, &.{}, .fetch_chunk, 0);
         return;
     };
-    worker_mod.noteChurnyOutcome(worker, inst.id, tc.snap.deployment_id, cont_path);
 
     const wrote = ws.ops.items.len > 0;
 
-    switch (oc) {
-        .terminal => |*r| {
-            defer r.deinit(allocator);
-            // Chain is going terminal — cancel any sibling binds
-            // pointing at this entity so their in-flight chunks
-            // don't tail-drop into the "mid-transition" branch.
-            // Idempotent + safe for the single-bind case (the
-            // dispatch wrapper's `if (final) unregisterBoundFetch`
-            // would have done it anyway). Per-fetch counter (4)
-            // will hook the same call path.
-            scanAndCancelBoundFetches(worker, ent);
-            if (r.exception.len > 0) {
-                txn.rollback() catch {};
-                txn_done = true;
-                resolveParked(worker, ent, sid, sess, 500, "bound-fetch handler exception\n") catch {};
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, &.{}, .fetch_chunk, 0);
-                r.console = &.{};
-                r.exception = &.{};
-                return;
-            }
-            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            if (wrote) {
-                const body_dup = allocator.dupe(u8, r.body) catch {
-                    txn.rollback() catch {};
-                    txn_done = true;
-                    resolveParked(worker, ent, sid, sess, 500, "bound-fetch alloc failed\n") catch {};
-                    return;
-                };
-                const lh: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = st,
-                    .outcome = .ok,
-                    .activation = .fetch_chunk,
-                    .method = "POST",
-                    .path = cont_path,
-                    .host = "",
-                    .correlation_id = correlation_id orelse "",
-                };
-                const console_owned = r.console;
-                const exception_owned = r.exception;
-                r.console = &.{};
-                r.exception = &.{};
-                const seq = proposeAndParkContResume(
-                    worker,
-                    ent,
-                    sid,
-                    sess,
-                    &ws,
-                    txn,
-                    tenant_id,
-                    .{ .terminal = .{ .status = st, .body = body_dup } },
-                    &pending_fetches,
-                    &readset,
-                    lh,
-                ) catch |perr| {
-                    std.log.warn("rove-js bound-fetch propose failed: {s}", .{@errorName(perr)});
-                    allocator.free(body_dup);
-                    txn_owned = false;
-                    txn_done = true;
-                    resolveParked(worker, ent, sid, sess, 500, "bound-fetch replication failed\n") catch {};
-                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .fault, console_owned, exception_owned, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, &.{}, .fetch_chunk, 0);
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, &.{}, .fetch_chunk, seq);
-                if (pending_fetches.items.len > 0) std.log.warn(
-                    "rove-js bound-fetch resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
-                    .{ pending_fetches.items.len, tenant_id },
-                );
-                return;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "resumeBoundFetchChain.commit(terminal_ro)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            // Terminal ⇒ the connection is closing: connection-scoped
-            // fetches drop (scope rule), unbound ones still fire.
-            flushResumeFetches(worker, ent, &pending_fetches, false);
-            resolveParked(worker, ent, sid, sess, st, r.body) catch {};
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, &.{}, .fetch_chunk, 0);
-            r.console = &.{};
-            r.exception = &.{};
-        },
-        .continuation => |c2| {
-            // Re-park: refresh the cont descriptor + deadline. The
-            // chain stays awaiting the next bound-fetch chunk.
-            var c2m = c2;
-            // Phase 6: ambient `next(ctx)` repark → resolve the empty
-            // path to the chain's module (re-invoke itself).
-            if (c2m.path.len == 0) {
-                if (allocator.dupe(u8, cont_path)) |dup| {
-                    allocator.free(c2m.path);
-                    c2m.path = dup;
-                } else |_| {}
-            }
-            const new_bound_sched_id: ?[]u8 = blk: {
-                const only = worker_mod.scanLoneOwedSendId(ws.ops.items) orelse break :blk null;
-                break :blk allocator.dupe(u8, only) catch null;
-            };
-            // Phase 1 NodeState owner registration for the new
-            // bound send (same as the worker_dispatch open-hop and
-            // resumeContinuation repark sites).
-            if (new_bound_sched_id) |send_id| {
-                _ = worker.node.router.registerBoundSendOwner(send_id, worker.msg_inbox_idx);
-                // Phase 3 mirror.
-                worker.registerBoundSendEntity(send_id, ent);
-            }
-            if (wrote) {
-                const lh: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = 0,
-                    .outcome = .ok,
-                    .activation = .fetch_chunk,
-                    .method = "POST",
-                    .path = cont_path,
-                    .host = "",
-                    .correlation_id = correlation_id orelse "",
-                };
-                const seq = proposeAndParkContResume(
-                    worker,
-                    ent,
-                    sid,
-                    sess,
-                    &ws,
-                    txn,
-                    tenant_id,
-                    .{ .repark = .{ .new_cont = c2m, .new_bound_sched_id = new_bound_sched_id } },
-                    &pending_fetches,
-                    &readset,
-                    lh,
-                ) catch |perr| {
-                    std.log.warn("rove-js bound-fetch repark: propose failed: {s}", .{@errorName(perr)});
-                    txn_owned = false;
-                    txn_done = true;
-                    resolveParked(worker, ent, sid, sess, 500, "bound-fetch replication failed\n") catch {};
-                    return;
-                };
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev), correlation_id, &.{}, .fetch_chunk, seq);
-                if (pending_fetches.items.len > 0) std.log.warn(
-                    "rove-js bound-fetch resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
-                    .{ pending_fetches.items.len, tenant_id },
-                );
-                return;
-            }
-            // Read-only repark — refresh cont in place.
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "resumeBoundFetchChain.commit(repark_ro)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            const mutable_desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return;
-            if (mutable_desc.cont) |*old_c| old_c.deinit(allocator);
-            mutable_desc.cont = c2m;
-            if (mutable_desc.bound_schedule_id) |old_b| {
-                worker.node.router.unregisterBoundSendOwner(old_b);
-                worker.unregisterBoundSendEntity(old_b);
-                allocator.free(old_b);
-            }
-            mutable_desc.bound_schedule_id = new_bound_sched_id;
-            mutable_desc.deadline_ns = now_ns + CONT_HOLD_DEADLINE_NS;
-            // Still held (repark) + committed (read-only): bind +
-            // submit any fetches this resume issued — `blob.seal`'s
-            // PUT, chained `on.fetch` (handler-shape §5.3).
-            flushResumeFetches(worker, ent, &pending_fetches, true);
-        },
-        .stream => |*s| {
-            resumeIntoStream(worker, s, .{
-                .ent = ent,
-                .sid = sid,
-                .sess = sess,
-                .ws = &ws,
-                .txn = txn,
-                .tenant_id = tenant_id,
-                .readset = &readset,
-                .cont_path = cont_path,
-                .correlation_id = correlation_id,
-                .request_id = request_id,
-                .now_ns = now_ns,
-                .deployment_id = tc.snap.deployment_id,
-                .wrote = wrote,
-                .txn_owned = &txn_owned,
-                .txn_done = &txn_done,
-                .pending_fetches = &pending_fetches,
-                .activation = .fetch_chunk,
-                // The fetch result is this activation's Msg (L3) — tape
-                // it like every other resumeBoundFetchChain arm, and do
-                // so BEFORE the write path serializes the readset.
-                .tapes = worker_mod.captureFetchChunkTapes(worker, &readset, body, fetch_ev),
-            });
-        },
-        // Only `.inbound_headers` / `.inbound_chunk` activations
-        // produce these; bound-fetch resumes never dispatch as one.
-        // Defined failure.
-        .no_onheaders, .no_onchunk => {
-            txn.rollback() catch {};
-            txn_done = true;
-            resolveParked(worker, ent, sid, sess, 500, "export probe on a resume path\n") catch {};
-        },
-    }
+    finishContResume(worker, .{
+        .site = "bound-fetch",
+        .noun = "bound-fetch",
+        .cancel_binds = true,
+        .tape = .fetch,
+    }, &oc, .{
+        .ent = ent,
+        .sid = sid,
+        .sess = sess,
+        .ws = &ws,
+        .txn = txn,
+        .tenant_id = tenant_id,
+        .readset = &readset,
+        .cont_path = cont_path,
+        .cont_path_log = cont_path_log,
+        .correlation_id = correlation_id,
+        .request_id = request_id,
+        .now_ns = now_ns,
+        .deployment_id = tc.snap.deployment_id,
+        .wrote = wrote,
+        .txn_owned = &txn_owned,
+        .txn_done = &txn_done,
+        .act = .fetch_chunk,
+        .pending_fetches = &pending_fetches,
+        .tape_body = body,
+        .tape_ev = fetch_ev,
+    });
 }
 
 /// blob-storage-plan P2 (+ handler-shape §5.3; `docs/architecture/routing-and-ingress.md`): submit the
@@ -3191,215 +3075,41 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
     const sess = sess_ptr.*;
 
     var budget = dispatcher_mod.Budget.fromNow(dispatcher_mod.Budget.default_duration_ns);
-    var oc = worker.dispatcher.runOutcome(
-        inst.kv,
-        txn,
-        &ws,
-        bc,
-        &tc.snap.bytecodes,
-        &tc.snap.source_hashes,
-        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
-        req,
-        &budget,
-    ) catch {
+    var oc = worker_mod.runResume(worker, inst, tc, bc, txn, &ws, req, &budget, cont_path) catch {
         txn.rollback() catch {};
         txn_done = true;
         resolveParked(worker, ent, sid, sess, resumeErrStatus(worker), "inbound-chunk handler error\n") catch {};
+        captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, &.{}, .inbound_chunk, 0);
         return true;
     };
-    worker_mod.noteChurnyOutcome(worker, inst.id, tc.snap.deployment_id, cont_path);
 
     const wrote = ws.ops.items.len > 0;
 
-    switch (oc) {
-        .terminal => |*r| {
-            defer r.deinit(allocator);
-            scanAndCancelBoundFetches(worker, ent);
-            if (r.exception.len > 0) {
-                txn.rollback() catch {};
-                txn_done = true;
-                resolveParked(worker, ent, sid, sess, 500, "inbound-chunk handler exception\n") catch {};
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .handler_error, r.console, r.exception, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, &.{}, .inbound_chunk, 0);
-                r.console = &.{};
-                r.exception = &.{};
-                return true;
-            }
-            const st: u16 = @intCast(@max(@min(r.status, 599), 100));
-            if (wrote) {
-                const body_dup = allocator.dupe(u8, r.body) catch {
-                    txn.rollback() catch {};
-                    txn_done = true;
-                    resolveParked(worker, ent, sid, sess, 500, "inbound-chunk alloc failed\n") catch {};
-                    return true;
-                };
-                const lh: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = st,
-                    .outcome = .ok,
-                    .activation = .inbound_chunk,
-                    .method = "POST",
-                    .path = cont_path,
-                    .host = "",
-                    .correlation_id = correlation_id orelse "",
-                };
-                const console_owned = r.console;
-                const exception_owned = r.exception;
-                r.console = &.{};
-                r.exception = &.{};
-                const seq = proposeAndParkContResume(
-                    worker,
-                    ent,
-                    sid,
-                    sess,
-                    &ws,
-                    txn,
-                    tenant_id,
-                    .{ .terminal = .{ .status = st, .body = body_dup } },
-                    &pending_fetches,
-                    &readset,
-                    lh,
-                ) catch |perr| {
-                    std.log.warn("rove-js inbound-chunk propose failed: {s}", .{@errorName(perr)});
-                    allocator.free(body_dup);
-                    txn_owned = false;
-                    txn_done = true;
-                    resolveParked(worker, ent, sid, sess, 500, "inbound-chunk replication failed\n") catch {};
-                    captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 500, .fault, console_owned, exception_owned, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, &.{}, .inbound_chunk, 0);
-                    return true;
-                };
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, console_owned, exception_owned, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, &.{}, .inbound_chunk, seq);
-                return true;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "resumeInboundChunk.commit(terminal_ro)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            flushResumeFetches(worker, ent, &pending_fetches, false);
-            resolveParked(worker, ent, sid, sess, st, r.body) catch {};
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, st, .ok, r.console, r.exception, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, &.{}, .inbound_chunk, 0);
-            r.console = &.{};
-            r.exception = &.{};
-        },
-        .continuation => |c2| {
-            var c2m = c2;
-            if (c2m.path.len == 0) {
-                if (allocator.dupe(u8, cont_path)) |dup| {
-                    allocator.free(c2m.path);
-                    c2m.path = dup;
-                } else |_| {}
-            }
-            const new_bound_sched_id: ?[]u8 = blk: {
-                const only = worker_mod.scanLoneOwedSendId(ws.ops.items) orelse break :blk null;
-                break :blk allocator.dupe(u8, only) catch null;
-            };
-            if (new_bound_sched_id) |send_id| {
-                _ = worker.node.router.registerBoundSendOwner(send_id, worker.msg_inbox_idx);
-                worker.registerBoundSendEntity(send_id, ent);
-            }
-            if (wrote) {
-                const lh: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = 0,
-                    .outcome = .ok,
-                    .activation = .inbound_chunk,
-                    .method = "POST",
-                    .path = cont_path,
-                    .host = "",
-                    .correlation_id = correlation_id orelse "",
-                };
-                const seq = proposeAndParkContResume(
-                    worker,
-                    ent,
-                    sid,
-                    sess,
-                    &ws,
-                    txn,
-                    tenant_id,
-                    .{ .repark = .{ .new_cont = c2m, .new_bound_sched_id = new_bound_sched_id } },
-                    &pending_fetches,
-                    &readset,
-                    lh,
-                ) catch |perr| {
-                    std.log.warn("rove-js inbound-chunk repark: propose failed: {s}", .{@errorName(perr)});
-                    txn_owned = false;
-                    txn_done = true;
-                    resolveParked(worker, ent, sid, sess, 500, "inbound-chunk replication failed\n") catch {};
-                    return true;
-                };
-                txn_owned = false;
-                txn_done = true;
-                captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, &.{}, .inbound_chunk, seq);
-                if (pending_fetches.items.len > 0) std.log.warn(
-                    "rove-js inbound-chunk resume: {d} connection-scoped fetch(es) from a WRITING resume dropped (bind-from-writing-resume not wired) tenant={s}",
-                    .{ pending_fetches.items.len, tenant_id },
-                );
-                return true;
-            }
-            txn.commit() catch |e| panic_mod.invariantViolated(
-                "resumeInboundChunk.commit(repark_ro)",
-                "err={s}",
-                .{@errorName(e)},
-            );
-            txn_done = true;
-            const mutable_desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return true;
-            if (mutable_desc.cont) |*old_c| old_c.deinit(allocator);
-            mutable_desc.cont = c2m;
-            if (mutable_desc.bound_schedule_id) |old_b| {
-                worker.node.router.unregisterBoundSendOwner(old_b);
-                worker.unregisterBoundSendEntity(old_b);
-                allocator.free(old_b);
-            }
-            mutable_desc.bound_schedule_id = new_bound_sched_id;
-            mutable_desc.deadline_ns = now_ns + CONT_HOLD_DEADLINE_NS;
-            flushResumeFetches(worker, ent, &pending_fetches, true);
-            // Chunk-tape: a read-only repark is still a recorded
-            // activation (a ctx-only accumulating handler hops
-            // read-only on EVERY chunk — without this record the
-            // upload would be unreplayable). Status 0 = the
-            // parked-hop convention.
-            captureLogWithId(worker, tenant_id, request_id, "POST", cont_path_log, "", tc.snap.deployment_id, now_ns, 0, .ok, &.{}, &.{}, worker_mod.captureTapes(worker, &readset, chunk_bytes), correlation_id, &.{}, .inbound_chunk, 0);
-        },
-        .stream => |*s| {
-            resumeIntoStream(worker, s, .{
-                .ent = ent,
-                .sid = sid,
-                .sess = sess,
-                .ws = &ws,
-                .txn = txn,
-                .tenant_id = tenant_id,
-                .readset = &readset,
-                .cont_path = cont_path,
-                .correlation_id = correlation_id,
-                .request_id = request_id,
-                .now_ns = now_ns,
-                .deployment_id = tc.snap.deployment_id,
-                .wrote = wrote,
-                .txn_owned = &txn_owned,
-                .txn_done = &txn_done,
-                .pending_fetches = &pending_fetches,
-                .activation = .inbound_chunk,
-                // The chunk is this activation's Msg — tape it like the
-                // repark arm above (L3-exempt today, but a cont→stream
-                // chunk record without its tapes is the same
-                // unreplayable-hop class).
-                .tapes = worker_mod.captureTapes(worker, &readset, chunk_bytes),
-            });
-        },
-        // The probe ran on the FIRST fire (dispatchOnce); a parked
-        // chain's module proved its `onChunk` there. Defensive arm.
-        .no_onheaders, .no_onchunk => {
-            txn.rollback() catch {};
-            txn_done = true;
-            resolveParked(worker, ent, sid, sess, 500, "export probe on a resume path\n") catch {};
-        },
-    }
+    finishContResume(worker, .{
+        .site = "inbound-chunk",
+        .noun = "inbound-chunk",
+        .cancel_binds = true,
+        .tape = .chunk,
+    }, &oc, .{
+        .ent = ent,
+        .sid = sid,
+        .sess = sess,
+        .ws = &ws,
+        .txn = txn,
+        .tenant_id = tenant_id,
+        .readset = &readset,
+        .cont_path = cont_path,
+        .cont_path_log = cont_path_log,
+        .correlation_id = correlation_id,
+        .request_id = request_id,
+        .now_ns = now_ns,
+        .deployment_id = tc.snap.deployment_id,
+        .wrote = wrote,
+        .txn_owned = &txn_owned,
+        .txn_done = &txn_done,
+        .act = .inbound_chunk,
+        .pending_fetches = &pending_fetches,
+        .tape_bytes = chunk_bytes,
+    });
     return true;
 }

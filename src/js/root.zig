@@ -119,6 +119,7 @@ pub const MetricsServer = @import("metrics-server").MetricsServer;
 
 test {
     _ = dispatcher;
+    _ = @import("dispatcher_test.zig");
     _ = effect;
     _ = globals;
     _ = worker;

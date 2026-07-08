@@ -3573,17 +3573,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
         // the hop (see `cont_bound_sched_id` below). The customer
         // never sees the id (`http.send`'s value is unused by §6.4),
         // so the binding is runtime-internal.
-        const run_oc = worker.dispatcher.runOutcome(
-            scope_inst.kv,
-            txn.?,
-            &writeset,
-            bytecode,
-            &tc.snap.bytecodes,
-            &tc.snap.source_hashes,
-            &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
-            request,
-            &budget,
-        ) catch |err| {
+        const run_oc = worker_mod.runResume(worker, scope_inst, tc, bytecode, txn.?, &writeset, request, &budget, route.module_base) catch |err| {
             if (worker.dispatcher.last_arena_gc_retry)
                 worker_mod.markChurny(worker, scope_inst.id, dep_id, route.module_base);
             txn.?.rollbackTo() catch |re| panic_mod.invariantViolated(
@@ -3644,8 +3634,6 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             processed += 1;
             continue;
         };
-        if (worker.dispatcher.last_arena_gc_retry)
-            worker_mod.markChurny(worker, scope_inst.id, dep_id, route.module_base);
         // Trampoline: `.continuation` rides the SAME txn/writeset/raft
         // path as a terminal success — only the final entity
         // destination differs (`parked_continuations`, no response

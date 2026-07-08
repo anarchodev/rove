@@ -136,7 +136,7 @@ pub const FileStore = struct {
     }
 
     /// Content-addressed PUT (method form): delegates to the free
-    /// `putBlobIfMissingTo` so the stateless `stageDeployment` path
+    /// `putBlobIfMissingTo` so the stateless `compileAndStage` path
     /// shares the exact skip-if-present + race-retry behaviour.
     fn putBlobIfMissing(self: *FileStore, key: []const u8, bytes: []const u8) Error!void {
         return putBlobIfMissingTo(self.blob, key, bytes);
@@ -518,88 +518,6 @@ pub const DeployInput = struct {
     /// Handler source (compiled here) or static content bytes.
     bytes: []const u8,
 };
-
-/// Stateless deploy: compile + content-address + stamp a manifest with
-/// NO persistent working-tree kv (unlike `FileStore`, which keeps a
-/// `file/` + `bytecode/` index). For each input, write its blob
-/// content-addressed (skip-if-present); for handlers also compile to
-/// bytecode and write that blob. Then compute the content-addressed
-/// deployment id over the entry set, encode the manifest JSON, and write
-/// it to `manifest_backend` at `manifest_json.manifestKey`. Returns the
-/// dep_id. Does NOT flip `_deploy/current` — release is a separate,
-/// raft-replicated step.
-///
-/// `blob` is the tenant's file-blobs backend (source + bytecode);
-/// `manifest_backend` is the tenant's `deployments/` backend. Idempotent
-/// at the storage layer: identical inputs → identical dep_id → PUTs land
-/// on the same keys with identical bytes.
-///
-/// Bounded to 256 entries (matches `computeDeploymentId`). Rejects
-/// invalid or duplicate paths so the manifest is unambiguous.
-pub fn stageDeployment(
-    allocator: std.mem.Allocator,
-    blob: BlobStore,
-    manifest_backend: BlobStore,
-    compile: CompileFn,
-    compile_ctx: ?*anyopaque,
-    inputs: []const DeployInput,
-) Error!u64 {
-    if (inputs.len > 256) return Error.InvalidManifest;
-
-    // Validate + reject duplicate paths up front.
-    for (inputs, 0..) |in_a, i| {
-        try validatePath(in_a.path);
-        if (in_a.path.len > MAX_PATH_LEN) return Error.InvalidPath;
-        if (in_a.kind == .static and in_a.content_type.len > MAX_CT_LEN)
-            return Error.InvalidPath;
-        for (inputs[0..i]) |in_b| {
-            if (std.mem.eql(u8, in_a.path, in_b.path)) return Error.InvalidManifest;
-        }
-    }
-
-    const entries = allocator.alloc(FileStore.Entry, inputs.len) catch return Error.OutOfMemory;
-    defer allocator.free(entries);
-
-    for (inputs, 0..) |in, i| {
-        var src_hex: [HASH_HEX_LEN]u8 = undefined;
-        hashHex(in.bytes, &src_hex);
-        try putBlobIfMissingTo(blob, &src_hex, in.bytes);
-
-        var bc_hex: [HASH_HEX_LEN]u8 = @splat(0);
-        if (in.kind == .handler) {
-            // Filename must be NUL-terminated for quickjs.
-            var fname_buf: [MAX_PATH_LEN + 1]u8 = undefined;
-            @memcpy(fname_buf[0..in.path.len], in.path);
-            fname_buf[in.path.len] = 0;
-            const fname: [:0]const u8 = fname_buf[0..in.path.len :0];
-
-            const bytecode = compile(compile_ctx, in.bytes, fname, allocator) catch
-                return Error.CompileFailed;
-            defer allocator.free(bytecode);
-            hashHex(bytecode, &bc_hex);
-            try putBlobIfMissingTo(blob, &bc_hex, bytecode);
-        }
-
-        entries[i] = .{
-            .path = @constCast(in.path),
-            .kind = in.kind,
-            .content_type = @constCast(if (in.kind == .static) in.content_type else ""),
-            .source_hex = src_hex,
-            .bytecode_hex = bc_hex,
-        };
-    }
-
-    const dep_id = manifest_json.computeDeploymentId(entries);
-    const manifest_bytes = manifest_json.encode(allocator, dep_id, entries) catch
-        return Error.OutOfMemory;
-    defer allocator.free(manifest_bytes);
-
-    var key_buf: [25]u8 = undefined;
-    const key = manifest_json.manifestKey(&key_buf, dep_id);
-    try putBlobIfMissingTo(manifest_backend, key, manifest_bytes);
-
-    return dep_id;
-}
 
 /// One compiled handler's content-addressed hashes (the result of
 /// `compileAndStage`). `path` borrows the caller's input slice.
@@ -1164,102 +1082,6 @@ test "assembleManifest produces mixed handler + static entries with content-type
 test {
     _ = manifest_json;
     _ = app_manifest;
-}
-
-// ── stageDeployment (stateless deploy) tests ───────────────────────────
-
-test "stageDeployment: stages handler + static, writes manifest, content-addressed id" {
-    const a = testing.allocator;
-    var blob = MemBlobStore.init(a);
-    defer blob.deinit();
-    var mani = MemBlobStore.init(a);
-    defer mani.deinit();
-
-    const inputs = [_]DeployInput{
-        .{ .path = "index.mjs", .kind = .handler, .bytes = "export default () => 1;" },
-        .{ .path = "_static/x.html", .kind = .static, .content_type = "text/html; charset=utf-8", .bytes = "<h1>hi</h1>" },
-    };
-    const dep_id = try stageDeployment(a, blob.blobStore(), mani.blobStore(), passthroughCompile, null, &inputs);
-
-    // Manifest written + decodes to our two entries (input order preserved).
-    var key_buf: [25]u8 = undefined;
-    const key = manifest_json.manifestKey(&key_buf, dep_id);
-    const mbytes = try mani.blobStore().get(key, a);
-    defer a.free(mbytes);
-    var m = try manifest_json.decode(a, mbytes);
-    defer m.deinit();
-    try testing.expectEqual(dep_id, m.id);
-    try testing.expectEqual(@as(usize, 2), m.entries.len);
-    try testing.expectEqualStrings("index.mjs", m.entries[0].path);
-    try testing.expectEqual(Kind.handler, m.entries[0].kind);
-    try testing.expectEqualStrings("_static/x.html", m.entries[1].path);
-    try testing.expectEqual(Kind.static, m.entries[1].kind);
-    try testing.expectEqualStrings("text/html; charset=utf-8", m.entries[1].content_type);
-
-    // Source blobs present for both; bytecode blob present only for the handler.
-    try testing.expect(try blob.blobStore().exists(&m.entries[0].source_hex));
-    try testing.expect(try blob.blobStore().exists(&m.entries[0].bytecode_hex));
-    try testing.expect(try blob.blobStore().exists(&m.entries[1].source_hex));
-    const zero: [HASH_HEX_LEN]u8 = @splat(0);
-    try testing.expectEqualSlices(u8, &zero, &m.entries[1].bytecode_hex);
-}
-
-test "stageDeployment: idempotent — identical inputs yield the same dep_id" {
-    const a = testing.allocator;
-    var b = MemBlobStore.init(a);
-    defer b.deinit();
-    var m = MemBlobStore.init(a);
-    defer m.deinit();
-    const inputs = [_]DeployInput{.{ .path = "index.mjs", .kind = .handler, .bytes = "x" }};
-    const id1 = try stageDeployment(a, b.blobStore(), m.blobStore(), passthroughCompile, null, &inputs);
-    const id2 = try stageDeployment(a, b.blobStore(), m.blobStore(), passthroughCompile, null, &inputs);
-    try testing.expectEqual(id1, id2);
-}
-
-test "stageDeployment: different content yields a different dep_id" {
-    const a = testing.allocator;
-    var b = MemBlobStore.init(a);
-    defer b.deinit();
-    var m = MemBlobStore.init(a);
-    defer m.deinit();
-    const in_a = [_]DeployInput{.{ .path = "index.mjs", .kind = .handler, .bytes = "one" }};
-    const in_b = [_]DeployInput{.{ .path = "index.mjs", .kind = .handler, .bytes = "two" }};
-    const id_a = try stageDeployment(a, b.blobStore(), m.blobStore(), passthroughCompile, null, &in_a);
-    const id_b = try stageDeployment(a, b.blobStore(), m.blobStore(), passthroughCompile, null, &in_b);
-    try testing.expect(id_a != id_b);
-}
-
-test "stageDeployment: compile failure surfaces as CompileFailed" {
-    const a = testing.allocator;
-    var b = MemBlobStore.init(a);
-    defer b.deinit();
-    var m = MemBlobStore.init(a);
-    defer m.deinit();
-    const inputs = [_]DeployInput{.{ .path = "bad.mjs", .kind = .handler, .bytes = "syntax(" }};
-    try testing.expectError(Error.CompileFailed, stageDeployment(a, b.blobStore(), m.blobStore(), failingCompile, null, &inputs));
-}
-
-test "stageDeployment: rejects duplicate paths" {
-    const a = testing.allocator;
-    var b = MemBlobStore.init(a);
-    defer b.deinit();
-    var m = MemBlobStore.init(a);
-    defer m.deinit();
-    const inputs = [_]DeployInput{
-        .{ .path = "index.mjs", .kind = .handler, .bytes = "a" },
-        .{ .path = "index.mjs", .kind = .handler, .bytes = "b" },
-    };
-    try testing.expectError(Error.InvalidManifest, stageDeployment(a, b.blobStore(), m.blobStore(), passthroughCompile, null, &inputs));
-}
-
-test "stageDeployment: rejects path traversal" {
-    const a = testing.allocator;
-    var b = MemBlobStore.init(a);
-    defer b.deinit();
-    var m = MemBlobStore.init(a);
-    defer m.deinit();
-    const inputs = [_]DeployInput{.{ .path = "../etc/passwd", .kind = .static, .bytes = "x" }};
-    try testing.expectError(Error.InvalidPath, stageDeployment(a, b.blobStore(), m.blobStore(), passthroughCompile, null, &inputs));
 }
 
 // ── compileAndStage (batch compile → per-file hashes) tests ────────────

@@ -3433,6 +3433,48 @@ pub fn arenaModeFor(worker: anytype, tenant_id: []const u8, dep_id: u64, module_
 /// re-executed under GC, remember the handler. Reads the dispatcher's
 /// last-run flag, so call it immediately after runOutcome (before any
 /// nested dispatch).
+/// The ONE invocation shape for re-entering the engine on a parked
+/// chain's deployment — every resume/fire activation family (HTTP
+/// continuation, bound fetch, inbound chunk, stream, WS message/wake/
+/// disconnect, connectionless fire) routes here instead of hand-rolling
+/// the 9-arg `Dispatcher.runOutcome` call. Folds the snapshot-derived
+/// args (bytecode cache, source hashes, deploy hooks) and the mandatory
+/// `noteChurnyOutcome` bookkeeping — a family that forgot the latter
+/// silently disabled the churny-arena optimization for its handlers.
+/// An error returns to the caller untouched: rollback + teardown
+/// legitimately differ per family (resolveParked vs stream-drain vs WS
+/// teardown), so the catch arm stays at the call site.
+///
+/// `inst` is the tenant instance (`.kv`, `.id`); `tc` the deployment
+/// cache entry (`.snap`); `churny_path` the module-base key the churny
+/// map is keyed on (the same one `arenaModeFor` was consulted with at
+/// request build).
+pub fn runResume(
+    worker: anytype,
+    inst: anytype,
+    tc: anytype,
+    bc: []const u8,
+    txn: *kv_mod.TrackedTxn,
+    ws: *kv_mod.WriteSet,
+    request: dispatcher_mod.Request,
+    budget: *dispatcher_mod.Budget,
+    churny_path: []const u8,
+) dispatcher_mod.DispatchError!dispatcher_mod.RunOutcome {
+    const oc = try worker.dispatcher.runOutcome(
+        inst.kv,
+        txn,
+        ws,
+        bc,
+        &tc.snap.bytecodes,
+        &tc.snap.source_hashes,
+        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
+        request,
+        budget,
+    );
+    noteChurnyOutcome(worker, inst.id, tc.snap.deployment_id, churny_path);
+    return oc;
+}
+
 pub fn noteChurnyOutcome(worker: anytype, tenant_id: []const u8, dep_id: u64, module_base: []const u8) void {
     if (worker.dispatcher.last_arena_gc_retry)
         markChurny(worker, tenant_id, dep_id, module_base);

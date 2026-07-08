@@ -38,6 +38,7 @@
 
 const std = @import("std");
 const rove = @import("rove");
+const boot = @import("rove-boot");
 const h2 = @import("rove-h2");
 const blob = @import("rove-blob");
 const proxy_mod = @import("proxy.zig");
@@ -56,19 +57,7 @@ const Proxy = proxy_mod.Proxy(FrontH2);
 // ── Signal-driven shutdown ────────────────────────────────────────────
 var stop_flag: std.atomic.Value(bool) = .init(false);
 
-fn handleSignal(_: c_int) callconv(.c) void {
-    stop_flag.store(true, .release);
-}
-
-fn installSignalHandlers() void {
-    const act: std.posix.Sigaction = .{
-        .handler = .{ .handler = handleSignal },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.INT, &act, null);
-    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
-}
+// SIGINT/SIGTERM → stop_flag wiring lives in rove-boot (shared by all four binaries).
 
 // ── Cert sync (gap #3 slice 2): pull per-host certs from the CP ────────
 //
@@ -344,27 +333,8 @@ fn processPort80(server: *FrontH2, a: std.mem.Allocator, cp_urls: []const []cons
     }
 }
 
-/// Parse a `;`/`,`-separated list of origins into an owned, owned-element
-/// slice. Empty input → empty slice. Whitespace trimmed; blanks skipped.
-fn parseUrlList(a: std.mem.Allocator, config: []const u8) ![]const []const u8 {
-    var list: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer {
-        for (list.items) |u| a.free(u);
-        list.deinit(a);
-    }
-    var it = std.mem.tokenizeAny(u8, config, ";,");
-    while (it.next()) |raw| {
-        const url = std.mem.trim(u8, raw, " \t\r\n");
-        if (url.len == 0) continue;
-        try list.append(a, try a.dupe(u8, url));
-    }
-    return list.toOwnedSlice(a);
-}
-
-fn freeUrlList(a: std.mem.Allocator, urls: []const []const u8) void {
-    for (urls) |u| a.free(u);
-    a.free(urls);
-}
+const parseUrlList = boot.parseUrlList;
+const freeUrlList = boot.freeUrlList;
 
 /// Render the front operator metrics in Prometheus text (caller frees). The
 /// front is a stateless proxy (no raft), so this is the shared rove-h2
@@ -474,7 +444,7 @@ fn buildFrontMetricsText(allocator: std.mem.Allocator, server: *FrontH2, proxy: 
 pub fn main() !void {
     curl.globalInit();
     const allocator = std.heap.c_allocator;
-    installSignalHandlers();
+    boot.installSignalHandlers(&stop_flag);
     // Logging must NEVER block the poll loop. The front logs via std.log
     // to stderr; in prod stderr → journald, in tests → a pipe. Either sink
     // can backpressure under load (journald rate-limit / slow disk; an
@@ -703,22 +673,10 @@ pub fn main() !void {
     // 9110 / CP 9111 so all three coexist on a host; 0 disables). Independent
     // thread+socket so /metrics answers even while the :443 loop is saturated —
     // exactly the connection-setup-collapse the front-diag log warns about.
-    const front_metrics_srv: ?*MetricsServer = blk: {
-        const mport: u16 = if (std.posix.getenv("REWIND_FRONT_METRICS_PORT")) |s|
-            (std.fmt.parseInt(u16, std.mem.trim(u8, s, " \t"), 10) catch 9112)
-        else
-            9112;
-        if (mport == 0) break :blk null;
-        const maddr = std.net.Address.parseIp("127.0.0.1", mport) catch break :blk null;
-        const srv = MetricsServer.init(allocator, maddr) catch |err| {
-            std.log.warn("rewind-front: metrics listener bind :{d} failed ({s}) — running without /metrics", .{ mport, @errorName(err) });
-            break :blk null;
-        };
-        std.log.info("rewind-front: operator metrics on 127.0.0.1:{d}/metrics", .{mport});
-        break :blk srv;
-    };
+    const front_metrics_srv: ?*MetricsServer =
+        boot.metricsFromEnv(allocator, "REWIND_FRONT_METRICS_PORT", boot.METRICS_PORT_FRONT, "rewind-front");
     defer if (front_metrics_srv) |ms| ms.deinit();
-    var last_metrics_ns: i128 = 0;
+    var metrics_cadence: boot.Cadence = .{};
 
     // Graceful drain budget (plan C10): after SIGTERM/SIGINT, GOAWAY
     // live conns and keep serving until in-flight flows finish or this
@@ -741,8 +699,7 @@ pub fn main() !void {
         // the only thread that may read server/proxy state; the listener thread
         // serves the published bytes).
         if (front_metrics_srv) |ms| {
-            if (now - last_metrics_ns >= 2 * std.time.ns_per_s) {
-                last_metrics_ns = now;
+            if (metrics_cadence.due(now)) {
                 if (buildFrontMetricsText(allocator, server, &proxy)) |txt| {
                     defer allocator.free(txt);
                     ms.publish(txt);

@@ -69,6 +69,27 @@
 const std = @import("std");
 const bodies_mod = @import("rove-bodies");
 const log_mod = @import("rove-log");
+// The lean CLI's std-only decoder for this same per-Tape wire format
+// (`src/replay/tape_decode.zig` — it can't link this module; that would
+// drag rove-log + rove-blob + libcurl into `rewind replay`). Held in
+// lockstep by the comptime assert below + the cross-decoder tests at the
+// bottom of this file, so a format change here that doesn't move the
+// decoder is a compile/test failure instead of a runtime "BadVersion on
+// every recorded tape".
+const tape_decode = @import("tape-decode");
+
+comptime {
+    std.debug.assert(tape_decode.MAGIC == MAGIC);
+    std.debug.assert(tape_decode.VERSION == VERSION);
+    const here = @typeInfo(Channel).@"enum".fields;
+    const there = @typeInfo(tape_decode.Channel).@"enum".fields;
+    std.debug.assert(here.len == there.len);
+    for (here) |f| {
+        // Same name ↔ same wire id on both sides (@field fails the
+        // build outright if a name is missing over there).
+        std.debug.assert(@intFromEnum(@field(tape_decode.Channel, f.name)) == f.value);
+    }
+}
 
 pub const MAGIC: u32 = 0x52544150; // 'R' 'T' 'A' 'P'
 /// Bumped 1 → 2 by `docs/primitive-gaps.md` §8 (minimal kv read set);
@@ -2016,4 +2037,117 @@ test "owned_bytes tracks dup'd storage" {
     try testing.expectEqual(@as(usize, 8), tape.owned_bytes);
     try tape.appendKv(.get, "x", "", .not_found);
     try testing.expectEqual(@as(usize, 9), tape.owned_bytes);
+}
+
+// ── Cross-decoder reflection: the CLI's std-only `tape_decode` must read
+// this serializer's bytes (the other half of the comptime lockstep assert
+// at the top of the file — the assert pins MAGIC/VERSION/Channel; these
+// pin the per-entry byte layouts).
+
+test "cross-decoder: kv channel (get/set + prefix) reads back via tape_decode" {
+    const a = testing.allocator;
+    var tape = Tape.init(a, .kv);
+    defer tape.deinit();
+    try tape.appendKv(.get, "user", "ada", .ok);
+    try tape.appendKv(.set, "seen", "1", .ok);
+    try tape.appendKvPrefix("todo/", "todo/9", 10, &.{
+        .{ .key = "todo/1", .value = "a" },
+        .{ .key = "todo/2", .value = "b" },
+    }, .ok);
+    const bytes = try tape.serialize(a);
+    defer a.free(bytes);
+
+    const out = try tape_decode.decodeKv(a, bytes);
+    defer {
+        for (out) |e| if (e.results.len > 0) a.free(e.results);
+        a.free(out);
+    }
+    try testing.expectEqual(@as(usize, 3), out.len);
+    try testing.expectEqual(tape_decode.KvOp.get, out[0].op);
+    try testing.expectEqualStrings("user", out[0].key);
+    try testing.expectEqualStrings("ada", out[0].value);
+    try testing.expectEqual(tape_decode.KvOp.set, out[1].op);
+    try testing.expectEqual(tape_decode.KvOp.prefix, out[2].op);
+    try testing.expectEqualStrings("todo/", out[2].key);
+    try testing.expectEqual(@as(usize, 2), out[2].results.len);
+    try testing.expectEqualStrings("todo/2", out[2].results[1].key);
+    try testing.expectEqualStrings("b", out[2].results[1].value);
+}
+
+test "cross-decoder: module channel reads back via tape_decode" {
+    const a = testing.allocator;
+    var tape = Tape.init(a, .module);
+    defer tape.deinit();
+    const hash = "ab" ** 32;
+    try tape.appendModule("lib/util.mjs", hash);
+    const bytes = try tape.serialize(a);
+    defer a.free(bytes);
+
+    const out = try tape_decode.decodeModule(a, bytes);
+    defer a.free(out);
+    try testing.expectEqual(@as(usize, 1), out.len);
+    try testing.expectEqualStrings("lib/util.mjs", out[0].specifier);
+    try testing.expectEqualStrings(hash, out[0].source_hash_hex);
+}
+
+test "cross-decoder: request_reads channel reads back via tape_decode" {
+    const a = testing.allocator;
+    var tape = Tape.init(a, .request_reads);
+    defer tape.deinit();
+    try tape.appendRequestReadOnce(.header_value, "content-type", "application/json");
+    try tape.appendRequestReadOnce(.ip_masked, "", "10.0.0.0");
+    const bytes = try tape.serialize(a);
+    defer a.free(bytes);
+
+    const out = try tape_decode.decodeRequestReads(a, bytes);
+    defer a.free(out);
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqual(tape_decode.RequestReadKind.header_value, out[0].kind);
+    try testing.expectEqualStrings("content-type", out[0].name);
+    try testing.expectEqualStrings("application/json", out[0].value);
+    try testing.expectEqual(tape_decode.RequestReadKind.ip_masked, out[1].kind);
+}
+
+test "cross-decoder: fetch_responses channel reads back via tape_decode" {
+    const a = testing.allocator;
+    var tape = Tape.init(a, .fetch_responses);
+    defer tape.deinit();
+    // Seq-0 inline chunk with headers; then a BodyRef terminal.
+    try tape.appendFetchResponse("ftch_1", 0, 0, .{ .batch_id = 0, .offset = 0, .len = 4 }, false, 0, false, false, "{\"content-type\":\"text/plain\"}", "body");
+    try tape.appendFetchResponse("ftch_1", 1, 4, .{ .batch_id = 7, .offset = 100, .len = 256 }, true, 200, true, false, "", "");
+    const bytes = try tape.serialize(a);
+    defer a.free(bytes);
+
+    const out = try tape_decode.decodeFetchResponses(a, bytes);
+    defer a.free(out);
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqualStrings("ftch_1", out[0].fetch_id);
+    try testing.expectEqual(tape_decode.NO_BATCH, out[0].batch_id);
+    try testing.expectEqualStrings("{\"content-type\":\"text/plain\"}", out[0].headers);
+    try testing.expectEqualStrings("body", out[0].inline_bytes);
+    try testing.expectEqual(@as(u32, 1), out[1].seq);
+    try testing.expectEqual(@as(u64, 4), out[1].byte_offset);
+    try testing.expectEqual(@as(u64, 7), out[1].batch_id);
+    try testing.expect(out[1].final);
+    try testing.expectEqual(@as(u16, 200), out[1].terminal_status);
+    try testing.expect(out[1].terminal_ok);
+}
+
+test "cross-decoder: trigger_payload channel reads back via tape_decode" {
+    const a = testing.allocator;
+    var tape = Tape.init(a, .trigger_payload);
+    defer tape.deinit();
+    const body = "{\"ctx\":{\"n\":1}}";
+    try tape.appendTriggerPayload(.{ .batch_id = 0, .offset = 0, .len = @intCast(body.len) }, body);
+    try tape.appendTriggerPayload(.{ .batch_id = 42, .offset = 4096, .len = 1024 }, "");
+    const bytes = try tape.serialize(a);
+    defer a.free(bytes);
+
+    const out = try tape_decode.decodeTriggerPayload(a, bytes);
+    defer a.free(out);
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqual(tape_decode.NO_BATCH, out[0].batch_id);
+    try testing.expectEqualStrings(body, out[0].inline_bytes);
+    try testing.expectEqual(@as(u64, 42), out[1].batch_id);
+    try testing.expectEqualStrings("", out[1].inline_bytes);
 }

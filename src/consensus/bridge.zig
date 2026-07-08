@@ -85,6 +85,10 @@ const raft = @import("raft_rs_zig");
 /// worker's `bridge` import (`src/version.zig`).
 pub const envelope = @import("envelope.zig");
 pub const transport = @import("transport.zig");
+/// Env-driven multi-node bootstrap config (`{prefix}NODE_ID/VOTERS/PEERS`),
+/// shared by the worker (`REWIND_`) and the CP (`REWIND_CP_`) so the
+/// voter/peer parsing can't drift between binaries.
+pub const cluster_config = @import("cluster_config.zig");
 const kvlimbs = @import("kvlimbs");
 
 pub const Node = node_mod.Node;
@@ -785,6 +789,31 @@ pub const Bridge = struct {
         const env = envelope.encodeWriteSet(self.allocator, id_str, ws_bytes) catch return Error.OutOfMemory;
         defer self.allocator.free(env);
         return self.propose(gid, env);
+    }
+
+    /// Block until the group's commit watermark reaches `seq`, checking the
+    /// fault watermark and a deadline each spin. Returns immediately for
+    /// `seq == 0` (nothing proposed). `Error.NotCommitted` on either failure
+    /// arm: the bridge faulted the seq (leadership loss / shutdown — fail
+    /// fast, the caller can re-aim) or `timeout_ns` elapsed first.
+    ///
+    /// This is the ONE blocking "propose, spin until commit" loop; every
+    /// synchronous caller (directory writes, tenant-move barriers) routes
+    /// here so the `faultedSeq` check can't be dropped from a hand-rolled
+    /// copy — one copy missing it turned a fast, retryable failover into a
+    /// full-timeout stall on the move critical path. The async parked-entity
+    /// model (`drainRaftPending`) is a different, non-blocking design and
+    /// checks both watermarks itself. Not for pump-less contexts (manual
+    /// `pumpOnce` tests): nothing would advance the watermark while this
+    /// thread sleeps.
+    pub fn awaitCommit(self: *Bridge, gid: u64, seq: u64, timeout_ns: u64) Error!void {
+        if (seq == 0) return;
+        const deadline: i128 = std.time.nanoTimestamp() + timeout_ns;
+        while (self.committedSeq(gid) < seq) {
+            if (self.faultedSeq(gid) >= seq) return Error.NotCommitted;
+            if (std.time.nanoTimestamp() > deadline) return Error.NotCommitted;
+            std.Thread.sleep(200 * std.time.ns_per_us);
+        }
     }
 
     /// Drop `gid` from `in_flight` (its pending FIFO emptied). Caller holds
@@ -1901,6 +1930,12 @@ fn encodeWs(a: std.mem.Allocator, id_str: []const u8, ws: *const WriteSet) ![]u8
     const ws_bytes = try ws.encode(a);
     defer a.free(ws_bytes);
     return envelope.encodeWriteSet(a, id_str, ws_bytes);
+}
+
+test {
+    // Pull the config parser's inline tests into the bridge test build
+    // (a bare `pub const = @import(...)` alone does not).
+    _ = cluster_config;
 }
 
 test "bridge: propose → pumpOnce commits → committedSeq advances, read sees write" {

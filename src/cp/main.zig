@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const rove = @import("rove");
+const boot = @import("rove-boot");
 const h2 = @import("rove-h2");
 const blob = @import("rove-blob");
 
@@ -53,101 +54,19 @@ fn constantTimeEql(a: []const u8, b: []const u8) bool {
 // ── Signal-driven shutdown ────────────────────────────────────────────
 var stop_flag: std.atomic.Value(bool) = .init(false);
 
-fn handleSignal(_: c_int) callconv(.c) void {
-    stop_flag.store(true, .release);
-}
-
-fn installSignalHandlers() void {
-    const act: std.posix.Sigaction = .{
-        .handler = .{ .handler = handleSignal },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.INT, &act, null);
-    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
-}
+// SIGINT/SIGTERM → stop_flag wiring lives in rove-boot (shared by all four binaries).
 
 // ── Multi-node CP (HA) config ─────────────────────────────────────────
 
-/// Parsed multi-node CP bridge config, owned for the lifetime of the
-/// `initMultiNode` call (the slices are duped by the node/transport, so this
-/// is freed right after). `null` = single-node CP.
-const CpMultiNode = struct {
-    node_id: u64,
-    voters: []u64,
-    peers: []bridge_mod.PeerAddr,
-    /// Backing storage for the peer host slices (`host:port` left of `:`).
-    peer_bufs: [][]u8,
-    listen_addr: std.net.Address,
-    listen_str: []u8,
+/// Parsed multi-node CP bridge config — the shared
+/// `consensus/cluster_config.zig` parser under the CP's `REWIND_CP_` env
+/// prefix (`REWIND_CP_NODE_ID` / `REWIND_CP_VOTERS` / `REWIND_CP_PEERS`;
+/// the directory raft group spans these nodes, and the raft ports are
+/// distinct from the HTTP listen port, argv[1]). `null` = single-node CP.
+const CpMultiNode = bridge_mod.cluster_config.MultiNode;
 
-    fn deinit(self: *const CpMultiNode, a: std.mem.Allocator) void {
-        a.free(self.voters);
-        a.free(self.peers);
-        for (self.peer_bufs) |b| a.free(b);
-        a.free(self.peer_bufs);
-        a.free(self.listen_str);
-    }
-};
-
-/// Build multi-node CP config from env, or null if `REWIND_CP_NODE_ID` is
-/// unset (single-node CP). Required together — the CP's directory raft group
-/// spans these nodes:
-///   - `REWIND_CP_NODE_ID`  this CP node's 1-based raft id (∈ the voter set).
-///   - `REWIND_CP_VOTERS`   comma-separated voter ids, e.g. `1,2,3`.
-///   - `REWIND_CP_PEERS`    comma-separated raft transport `host:port`s,
-///                          indexed by raft id − 1. Distinct from the HTTP
-///                          listen port (argv[1]).
-/// Errors loud on malformed / inconsistent config.
 fn parseCpMultiNode(a: std.mem.Allocator) !?CpMultiNode {
-    const node_id_s = std.posix.getenv("REWIND_CP_NODE_ID") orelse return null;
-    const voters_s = std.posix.getenv("REWIND_CP_VOTERS") orelse return error.MissingCpVoters;
-    const peers_s = std.posix.getenv("REWIND_CP_PEERS") orelse return error.MissingCpPeers;
-
-    const node_id = try std.fmt.parseInt(u64, std.mem.trim(u8, node_id_s, " \t"), 10);
-
-    var voters: std.ArrayListUnmanaged(u64) = .empty;
-    errdefer voters.deinit(a);
-    var vit = std.mem.tokenizeScalar(u8, voters_s, ',');
-    while (vit.next()) |tok| {
-        const t = std.mem.trim(u8, tok, " \t");
-        if (t.len == 0) continue;
-        try voters.append(a, try std.fmt.parseInt(u64, t, 10));
-    }
-    if (voters.items.len == 0) return error.MissingCpVoters;
-
-    var peers: std.ArrayListUnmanaged(bridge_mod.PeerAddr) = .empty;
-    errdefer peers.deinit(a);
-    var peer_bufs: std.ArrayListUnmanaged([]u8) = .empty;
-    errdefer {
-        for (peer_bufs.items) |b| a.free(b);
-        peer_bufs.deinit(a);
-    }
-    var pit = std.mem.tokenizeScalar(u8, peers_s, ',');
-    while (pit.next()) |tok| {
-        const t = std.mem.trim(u8, tok, " \t");
-        if (t.len == 0) continue;
-        const colon = std.mem.lastIndexOfScalar(u8, t, ':') orelse return error.BadCpPeer;
-        const host = try a.dupe(u8, t[0..colon]);
-        errdefer a.free(host);
-        const port = try std.fmt.parseInt(u16, t[colon + 1 ..], 10);
-        try peer_bufs.append(a, host);
-        try peers.append(a, .{ .host = host, .port = port });
-    }
-    if (node_id == 0 or node_id > peers.items.len) return error.BadCpNodeId;
-
-    const listen = peers.items[node_id - 1];
-    const listen_addr = try std.net.Address.parseIp(listen.host, listen.port);
-    const listen_str = try std.fmt.allocPrint(a, "{s}:{d}", .{ listen.host, listen.port });
-
-    return CpMultiNode{
-        .node_id = node_id,
-        .voters = try voters.toOwnedSlice(a),
-        .peers = try peers.toOwnedSlice(a),
-        .peer_bufs = try peer_bufs.toOwnedSlice(a),
-        .listen_addr = listen_addr,
-        .listen_str = listen_str,
-    };
+    return bridge_mod.cluster_config.fromEnv(a, "REWIND_CP_");
 }
 
 // The domain index (host → tenant) is no longer a static in-memory map: it
@@ -1799,25 +1718,8 @@ fn getEnvCfg(name: []const u8) []const u8 {
 
 /// Parse a `;`/`,`-separated list of origins into an owned, owned-element
 /// slice. Empty input → empty slice. Whitespace trimmed; blanks skipped.
-fn parseUrlList(a: std.mem.Allocator, config: []const u8) ![]const []const u8 {
-    var list: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer {
-        for (list.items) |u| a.free(u);
-        list.deinit(a);
-    }
-    var it = std.mem.tokenizeAny(u8, config, ";,");
-    while (it.next()) |raw| {
-        const url = std.mem.trim(u8, raw, " \t\r\n");
-        if (url.len == 0) continue;
-        try list.append(a, try a.dupe(u8, url));
-    }
-    return list.toOwnedSlice(a);
-}
-
-fn freeUrlList(a: std.mem.Allocator, urls: []const []const u8) void {
-    for (urls) |u| a.free(u);
-    a.free(urls);
-}
+const parseUrlList = boot.parseUrlList;
+const freeUrlList = boot.freeUrlList;
 
 /// Render the CP operator metrics in Prometheus text (caller frees). Two
 /// halves, both node-wide with no per-tenant labels (the observability.md
@@ -1898,7 +1800,7 @@ fn buildCpMetricsText(allocator: std.mem.Allocator, router: *Router, bridge: *Br
 pub fn main() !void {
     curl.globalInit();
     const allocator = std.heap.c_allocator;
-    installSignalHandlers();
+    boot.installSignalHandlers(&stop_flag);
     // Logging must never block the poll loop: a backpressured log sink
     // (journald) would otherwise freeze the CP on a synchronous std.log
     // write. O_NONBLOCK drops the line instead. See `rove.logNonBlocking`.
@@ -2115,22 +2017,10 @@ pub fn main() !void {
     // thread + socket, so /metrics stays scrapable while the CP loop is wedged
     // — exactly the directory-election incident this surfaces. A bind failure
     // logs and runs without it (metrics are optional).
-    const cp_metrics_srv: ?*MetricsServer = blk: {
-        const mport: u16 = if (std.posix.getenv("REWIND_CP_METRICS_PORT")) |s|
-            (std.fmt.parseInt(u16, std.mem.trim(u8, s, " \t"), 10) catch 9111)
-        else
-            9111;
-        if (mport == 0) break :blk null;
-        const maddr = std.net.Address.parseIp("127.0.0.1", mport) catch break :blk null;
-        const srv = MetricsServer.init(allocator, maddr) catch |err| {
-            std.log.warn("rewind-cp: metrics listener bind :{d} failed ({s}) — running without /metrics", .{ mport, @errorName(err) });
-            break :blk null;
-        };
-        std.log.info("rewind-cp: operator metrics on 127.0.0.1:{d}/metrics", .{mport});
-        break :blk srv;
-    };
+    const cp_metrics_srv: ?*MetricsServer =
+        boot.metricsFromEnv(allocator, "REWIND_CP_METRICS_PORT", boot.METRICS_PORT_CP, "rewind-cp");
     defer if (cp_metrics_srv) |ms| ms.deinit();
-    var last_metrics_ns: i128 = 0;
+    var metrics_cadence: boot.Cadence = .{};
 
     std.log.info("rewind-cp: listening on 0.0.0.0:{d} (move control {s}, reconcile {s})", .{
         port,
@@ -2158,9 +2048,7 @@ pub fn main() !void {
         // Re-render + publish the metrics snapshot ~every 2s (the CP loop is the
         // only thread that may read the counters; the listener serves bytes).
         if (cp_metrics_srv) |ms| {
-            const now_ns = std.time.nanoTimestamp();
-            if (now_ns - last_metrics_ns > 2 * std.time.ns_per_s) {
-                last_metrics_ns = now_ns;
+            if (metrics_cadence.due(std.time.nanoTimestamp())) {
                 if (buildCpMetricsText(allocator, &router, cp_bridge, server)) |txt| {
                     defer allocator.free(txt);
                     ms.publish(txt);
