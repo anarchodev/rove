@@ -225,6 +225,50 @@ through it.
 This arc touches the dispatch hot path; it wants its own branch with smoke
 coverage (`rewind_smoke`, `three_node_smoke`, plus the WS smokes).
 
+### 2.3 Wave-2 progress + the drift list (added 2026-07-08, branch `refactor/finish-outcome`)
+
+Landed: step 1 (`worker.runResume`, all 11 sites) and the step-2 warm-up
+(all 11 inline LogHeader literals → `fireLogHeader`). A full per-arm
+variance pass over the five HTTP switches found the five sites split into
+TWO families (cont-family: S1 `resumeContinuation`, S2
+`resumeBoundFetchChain`, S3 inbound-chunk — `resolveParked` +
+`proposeAndParkContResume`; stream-family: S4 `resumeStream`, S5
+`resumeBoundFetchStream` — `markStreamDraining*` +
+`proposeForgetfulWrites`), so step 2 is two shared finishers, not one.
+Drifted arms found (fix as small commits BEFORE extracting):
+
+1. **DONE** — cont-family dispatch-error + no-export arms logged nothing
+   (six arms; stream/WS/fire all record a 500 `.handler_error`).
+2. **OPEN, needs a semantics call** — read-only repark `bound_schedule_id`:
+   S2/S3 recompute from the (empty) hop writeset and CLEAR the chain's
+   §6.4 binding (unregister old, install null → the owed send's callback
+   arrives as a connectionless fire); S1 leaves the previous hop's binding
+   in place (→ the callback still resumes the parked chain). The
+   `cont_bound_sched_id` doc-comment ("the single http.send THIS hop
+   fired; null = fired 0") supports S2/S3 — but the "timer wake reparks
+   read-only while hop-1's send is still owed" pattern argues for S1.
+   Decide, then unify.
+3. **OPEN** — body-dupe OOM posture: S1/S4 propagate (`try`, held
+   socket/stream gets no defined close), S2/S3 defined 500, S5 silently
+   returns with no draining mark and no log. Unify on defined-failure.
+4. **DONE** — cont-family captures dropped `r.tags` (nine sites).
+5. **OPEN** — S3 logs the read-only repark hop (unreplayable-hop
+   rationale); S1/S2 don't. Adopt everywhere.
+6. **OPEN** — stream-family `tryAppend` posture: S4 `try` (propagates
+   mid-mutation) vs S5 catch + loud close. Unify on S5.
+7. **OPEN, minor** — flushResumeFetches before (S1) vs after (S2/S3) the
+   desc swap; S1's `scanLoneOwedSendId` dupe `try` vs S2/S3 `catch null`.
+8. **Deliberate, keep** — resumes commit-or-panic on `error.Conflict`;
+   `commitReadOnlyFire` tolerates it (fires run outside the chain lease).
+   Document on the shared finisher.
+
+Then: `finishContResume(worker, oc, ctx, comptime spec)` (spec:
+`cancel_sibling_binds`, `log_readonly_repark`, site name; S3 keeps its
+`return true` at the call site; the `.stream` arm stays the already-shared
+`resumeIntoStream`) and `finishStreamResume` (unify the draining verb on
+`markStreamDrainingAnywhere` — S4's restriction is vestigial). runResume's
+catch-arm log record moves into the shared helper at extraction time.
+
 ---
 
 ## 3. Cross-binary duplication (rewind / cp / front / log-server)
