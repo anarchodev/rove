@@ -45,11 +45,15 @@ export default function () {
     return "";
   }
   // GET: issue the bound streaming read and DO NOT commit the response here.
-  // `opts.ctx` threads {hash,ct} to each onChunk as request.ctx.
+  // `on` names the resume export and `ctx` threads {hash,ct} to each
+  // onChunk as request.ctx — BOTH ride in the single opts object
+  // (after.fetch(url, opts); there is NO third argument). Passing `on`
+  // as a stray third arg left the target defaulting to `onFetchChunk`,
+  // which this module doesn't export → every cold/oversized static read
+  // 404'd ("module export onFetchChunk not found").
   after.fetch(
     "http://rove-static.internal/" + c.hash,
-    { method: "GET", stream: true, maxChunkBytes: 256 * 1024, ctx: c },
-    { on: "onChunk" },
+    { method: "GET", stream: true, maxChunkBytes: 256 * 1024, ctx: c, on: "onChunk" },
   );
   return next();
 }
