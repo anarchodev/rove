@@ -427,8 +427,18 @@ stack (not just a self-authored fixture). Landed in
   gap above (`.stream()`) — exactly what dogfooding is for.
 - `onkv.mjs` ↔ `on_kv_smoke_v2.py` — `after.kv` held resume → `"woke:hello"`.
 - `ontimer.mjs` ↔ `on_timer_smoke_v2.py` — `after.ms` held resume → `"woke:x"`.
-Both after.kv/after.ms cross-checks passed with no gap (the folds already
-matched the real handlers). Next oracles: the `ws_*` smokes.
+- `wsworker/` ↔ `ws_worker_smoke_v2.py` — the full WS surface (text/binary echo,
+  kv read/write across frames, terminal close, `onDisconnect`).
+- `wsfetch/` ↔ `ws_fetch_smoke_v2.py` — WS ∘ fetch (an `onMessage` issues
+  `after.fetch`, the result resumes `onUpstream` over the socket).
+- `wswake/` ↔ `ws_wake_smoke_v2.py` — WS ∘ wake (an `onMessage` arms
+  `after.kv`/`after.ms`, the wakes resume `onWake`/`onTimer` over the socket).
+Every `after.*` trigger and the WS held-socket fold (incl. both compositions)
+now cross-checked against a real handler; only `on_fetch` surfaced a gap
+(`.stream()`). Each smoke's handler is extracted to a shared
+`examples/loop46-demo-tenants/<t>/index.mjs` the smoke reads via `_src`, so the
+offline test and the through-the-stack smoke share ONE source. `ws_ordering` is
+NOT cross-checkable — it tests commit-ordering machinery (raft), not logic.
 
 ## What's left
 

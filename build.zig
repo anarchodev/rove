@@ -1282,35 +1282,27 @@ pub fn build(b: *std.Build) void {
     const cli_step = b.step("rewind", "Build the rewind customer CLI");
     cli_step.dependOn(&b.addInstallArtifact(cli_exe, .{}).step);
 
-    // ── rewind-test-smoke: drive `rewind test` end-to-end over the checkout
-    // fixture (src/replay/testdata/checkout). Proves the two-reactor saga runner
-    // — a harness reactor runs the JS test body, driving the sim reactor via
-    // `simulate()`, with the fetch→fetch_chunk fold + branch + snapshot surface.
-    // Offline (no cluster). A failing assertion exits non-zero and fails here.
-    const smoke = b.addRunArtifact(cli_exe);
-    smoke.addArg("test");
-    smoke.addDirectoryArg(b.path("src/replay/testdata/checkout"));
-    smoke.expectExitCode(0);
-    const smoke_step = b.step("rewind-test-smoke", "Run `rewind test` over the checkout fixture (saga test runner e2e)");
-    smoke_step.dependOn(&smoke.step);
-    test_step.dependOn(&smoke.step);
-
-    // Cross-check: the same acme on.fetch handlers on_fetch_smoke_v2.py deploys,
-    // run offline via `rewind test` (examples/loop46-demo-tenants/acme/_tests/).
-    // Agreement with the smoke's through-the-stack body reconstruction proves the
-    // streaming-bind + buffered fetch folds faithful against a REAL handler.
-    const xcheck = b.addRunArtifact(cli_exe);
-    xcheck.addArg("test");
-    xcheck.addDirectoryArg(b.path("examples/loop46-demo-tenants/acme"));
-    xcheck.expectExitCode(0);
-    smoke_step.dependOn(&xcheck.step);
-    test_step.dependOn(&xcheck.step);
-
-    // WS held-socket cross-check: the same handler ws_worker_smoke_v2.py deploys.
-    const xcheck_ws = b.addRunArtifact(cli_exe);
-    xcheck_ws.addArg("test");
-    xcheck_ws.addDirectoryArg(b.path("examples/loop46-demo-tenants/wsworker"));
-    xcheck_ws.expectExitCode(0);
-    smoke_step.dependOn(&xcheck_ws.step);
-    test_step.dependOn(&xcheck_ws.step);
+    // ── rewind-test-smoke: drive `rewind test` end-to-end (offline, no cluster)
+    // over the checkout fixture (proves the two-reactor saga runner) PLUS the
+    // smoke cross-checks — the SAME first-party handlers the `*_smoke_v2.py`
+    // suites deploy, run offline and asserting the same results the smokes assert
+    // through the real stack. Agreement proves each fold faithful against a real
+    // handler (writing on_fetch's surfaced the streaming-fetch gap). A failing
+    // assertion exits non-zero and fails the build.
+    const smoke_step = b.step("rewind-test-smoke", "Run `rewind test` over the fixtures + smoke cross-checks (saga runner e2e)");
+    const test_dirs = [_][]const u8{
+        "src/replay/testdata/checkout", // the saga-runner fixture
+        "examples/loop46-demo-tenants/acme", // ↔ on_fetch / on_kv / on_timer smokes
+        "examples/loop46-demo-tenants/wsworker", // ↔ ws_worker_smoke_v2
+        "examples/loop46-demo-tenants/wsfetch", // ↔ ws_fetch_smoke_v2 (WS+fetch)
+        "examples/loop46-demo-tenants/wswake", // ↔ ws_wake_smoke_v2 (WS+wake)
+    };
+    for (test_dirs) |dir| {
+        const run = b.addRunArtifact(cli_exe);
+        run.addArg("test");
+        run.addDirectoryArg(b.path(dir));
+        run.expectExitCode(0);
+        smoke_step.dependOn(&run.step);
+        test_step.dependOn(&run.step);
+    }
 }

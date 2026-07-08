@@ -33,35 +33,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_lib_v2 import V2Cluster  # noqa: E402
 
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+DEMO = REPO_ROOT / "examples" / "loop46-demo-tenants"
+
+
+def _src(rel: str) -> str:
+    return (DEMO / rel).read_text()
+
 TENANT = "wsfetch"
 OP_TEXT = 0x1
 OP_CLOSE = 0x8
 ACCEPT_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 UPSTREAM_BODY = "hello-upstream"
 
-HANDLER_SRC = """\
-export default function () { return "ready"; }
-
-export function onMessage() {
-  const { data } = request.activation;
-  if (data.startsWith("fetch:")) {
-    // READ-ONLY frame: on.fetch binds to the held chain and the result
-    // resumes onUpstream over this socket.
-    after.fetch(data.slice(6), { method: "GET", on: "onUpstream" });
-    return next();
-  }
-  stream.write("echo:" + data);
-  return next();
-}
-
-export function onUpstream() {
-  // Bound-fetch surface: bytes on request.body, status/done at top level.
-  if (!request.done) return next();
-  const body = request.text || "";
-  stream.write("fetched:" + request.status + ":" + body);
-  return next();
-}
-"""
+HANDLER_SRC = _src("wsfetch/index.mjs")
 
 
 class Stub(BaseHTTPRequestHandler):
