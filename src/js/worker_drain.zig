@@ -2134,12 +2134,14 @@ pub fn resumeBoundFetchChain(
             const mutable_desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return;
             if (mutable_desc.cont) |*old_c| old_c.deinit(allocator);
             mutable_desc.cont = c2m;
-            if (mutable_desc.bound_schedule_id) |old_b| {
-                worker.node.router.unregisterBoundSendOwner(old_b);
-                worker.unregisterBoundSendEntity(old_b);
-                allocator.free(old_b);
-            }
-            mutable_desc.bound_schedule_id = new_bound_sched_id;
+            // bound_schedule_id is untouched on the read-only path (matches
+            // resumeContinuation): a hop that wrote nothing fired no send, and
+            // clearing here would strand a chain still awaiting an EARLIER
+            // hop's owed send — its callback must keep resuming this park.
+            // Only the write-batch repark (proposeAndParkContResume) rewrites
+            // the binding. (`new_bound_sched_id` is null here by construction:
+            // the scan ran over an empty writeset.)
+            std.debug.assert(new_bound_sched_id == null);
             mutable_desc.deadline_ns = now_ns + CONT_HOLD_DEADLINE_NS;
             // Still held (repark) + committed (read-only): bind +
             // submit any fetches this resume issued — `blob.seal`'s
@@ -3251,12 +3253,14 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
             const mutable_desc = server.reg.get(ent, &worker.parked_continuations, components_mod.ContDescriptor) catch return true;
             if (mutable_desc.cont) |*old_c| old_c.deinit(allocator);
             mutable_desc.cont = c2m;
-            if (mutable_desc.bound_schedule_id) |old_b| {
-                worker.node.router.unregisterBoundSendOwner(old_b);
-                worker.unregisterBoundSendEntity(old_b);
-                allocator.free(old_b);
-            }
-            mutable_desc.bound_schedule_id = new_bound_sched_id;
+            // bound_schedule_id is untouched on the read-only path (matches
+            // resumeContinuation): a hop that wrote nothing fired no send, and
+            // clearing here would strand a chain still awaiting an EARLIER
+            // hop's owed send — its callback must keep resuming this park.
+            // Only the write-batch repark (proposeAndParkContResume) rewrites
+            // the binding. (`new_bound_sched_id` is null here by construction:
+            // the scan ran over an empty writeset.)
+            std.debug.assert(new_bound_sched_id == null);
             mutable_desc.deadline_ns = now_ns + CONT_HOLD_DEADLINE_NS;
             flushResumeFetches(worker, ent, &pending_fetches, true);
             // Chunk-tape: a read-only repark is still a recorded
