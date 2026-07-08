@@ -270,7 +270,8 @@ call sites). Note: `streaming_first_hop_writes_smoke_v2`'s onDisconnect
 leg fails on main at `da7b26f` too (clean bisect) — pre-existing, not
 from this branch.
 
-**Step 3 (`finishOutcome` core) — RECOMMEND CLOSING as not warranted.**
+**Step 3 (`finishOutcome` core) — CLOSED, not warranted (user ack
+2026-07-08).**
 The premise was three-plus drifting copies of one machine; after steps
 1–2 each family's switch exists exactly once (`finishContResume`,
 `finishStreamResume`, `finishWsResume`, `runFire`) and the cross-family
