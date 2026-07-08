@@ -148,9 +148,10 @@ pub const SubscriptionFire = struct {
     /// internals.
     pub const Source = union(enum) {
         kv: struct {
-            /// Owned by the parent `SubscriptionFire`; freed in `deinit`.
-            key: []u8,
-            op: u8,
+            /// The watched (dirty) prefix — coalesced level-trigger,
+            /// no key/op (durable-kv-subscriptions). Owned by the
+            /// parent `SubscriptionFire`; freed in `deinit`.
+            prefix: []u8,
         },
     };
 
@@ -167,7 +168,7 @@ pub const SubscriptionFire = struct {
         allocator.free(self.subscription_name);
         allocator.free(self.module_path);
         switch (self.source) {
-            .kv => |kv_src| if (kv_src.key.len > 0) allocator.free(kv_src.key),
+            .kv => |kv_src| if (kv_src.prefix.len > 0) allocator.free(kv_src.prefix),
         }
         self.* = undefined;
     }
@@ -293,7 +294,7 @@ test "Msg covers every ActivationSource variant exhaustively" {
         .tenant_id = try testing.allocator.dupe(u8, "t"),
         .subscription_name = try testing.allocator.dupe(u8, "s"),
         .module_path = try testing.allocator.dupe(u8, "m"),
-        .source = .{ .kv = .{ .key = try testing.allocator.dupe(u8, "k"), .op = 'p' } },
+        .source = .{ .kv = .{ .prefix = try testing.allocator.dupe(u8, "k") } },
     };
     defer sf.deinit(testing.allocator);
 

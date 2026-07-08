@@ -212,6 +212,7 @@ fn runPromotionHook(worker: anytype) void {
     // with durable-wake-plan P5(a) — webhook recovery is a durable wake now;
     // the boot-subscription sweep retired with kind=boot, 2026-07-05.)
     rjs.sweepDurableWakesOnPromotion(worker);
+    rjs.sweepDirtySubscriptionsOnPromotion(worker);
 }
 
 fn workerThreadEntry(args: *WorkerCtx) void {

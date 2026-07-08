@@ -42,7 +42,11 @@ pub const ActivationSource = log_mod.ActivationSource;
 /// (`fireSubscriptionActivation`) owns the bytes for the dispatch.
 /// `worker_streaming.SubscriptionFireSource` aliases this.
 pub const SubscriptionFireSource = union(enum) {
-    kv: struct { key: []const u8, op: u8 },
+    /// Coalesced level-trigger (durable-kv-subscriptions): the fire
+    /// says "this watched prefix is dirty", never which key/op — N
+    /// writes coalesce into ≥1 fire and the handler reads current
+    /// committed state (the readset IS the payload).
+    kv: struct { prefix: []const u8 },
 };
 
 // ---------------------------------------------------------------------

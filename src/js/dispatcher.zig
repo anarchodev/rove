@@ -225,7 +225,7 @@ pub const Dispatcher = struct {
         bytecode: []const u8,
         bytecodes: ?*const std.StringHashMapUnmanaged(*BlobBytes),
         source_hashes: ?*const std.StringHashMapUnmanaged([64]u8),
-        triggers: ?[]const globals.TriggerEntry,
+        hooks: ?*const globals.DeployHooks,
         request: Request,
         budget: *Budget,
         mode: qjs.snap.ReqMode,
@@ -260,7 +260,8 @@ pub const Dispatcher = struct {
             .session_id = request.session_id,
             .platform = request.admin.platform,
             .root_writeset = request.admin.root_writeset,
-            .triggers = triggers,
+            .triggers = if (hooks) |h| h.triggers else null,
+            .subscriptions = if (hooks) |h| h.subscriptions else &.{},
             .bytecodes = bytecodes,
             .limiter = request.plan.limiter,
             .instance_id = request.plan.instance_id,
@@ -417,7 +418,7 @@ pub const Dispatcher = struct {
         bytecode: []const u8,
         bytecodes: ?*const std.StringHashMapUnmanaged(*BlobBytes),
         source_hashes: ?*const std.StringHashMapUnmanaged([64]u8),
-        triggers: ?[]const globals.TriggerEntry,
+        hooks: ?*const globals.DeployHooks,
         request: Request,
         budget: *Budget,
     ) DispatchError!RunOutcome {
@@ -440,7 +441,7 @@ pub const Dispatcher = struct {
         };
 
         var side_effects = false;
-        const first = self.runOutcomeAttempt(kv, txn, writeset, bytecode, bytecodes, source_hashes, triggers, request, budget, first_mode, &side_effects);
+        const first = self.runOutcomeAttempt(kv, txn, writeset, bytecode, bytecodes, source_hashes, hooks, request, budget, first_mode, &side_effects);
 
         // The arena's exhaustion record is the capacity-vs-user-error
         // discriminator; it survives until the NEXT reset, so read it
@@ -470,7 +471,7 @@ pub const Dispatcher = struct {
             self.last_arena_mode = .gc;
             self.last_arena_gc_retry = true;
             var side_effects2 = false;
-            const second = self.runOutcomeAttempt(kv, txn, writeset, bytecode, bytecodes, source_hashes, triggers, request, budget, .gc, &side_effects2);
+            const second = self.runOutcomeAttempt(kv, txn, writeset, bytecode, bytecodes, source_hashes, hooks, request, budget, .gc, &side_effects2);
             // Even the GC regime (ceiling = peak live set) can be too
             // small for a genuinely huge request. If it OOM'd too, the
             // outcome is a mangled/empty terminal — DON'T return it as a
@@ -606,11 +607,11 @@ pub const Dispatcher = struct {
         bytecode: []const u8,
         bytecodes: ?*const std.StringHashMapUnmanaged(*BlobBytes),
         source_hashes: ?*const std.StringHashMapUnmanaged([64]u8),
-        triggers: ?[]const globals.TriggerEntry,
+        hooks: ?*const globals.DeployHooks,
         request: Request,
         budget: *Budget,
     ) DispatchError!Response {
-        var outcome = try self.runOutcome(kv, txn, writeset, bytecode, bytecodes, source_hashes, triggers, request, budget);
+        var outcome = try self.runOutcome(kv, txn, writeset, bytecode, bytecodes, source_hashes, hooks, request, budget);
         switch (outcome) {
             .terminal => |r| return r,
             .continuation => |*cont| {
@@ -1866,6 +1867,76 @@ test "PROBE after.cancel" {
     defer resp.deinit(testing.allocator);
     try testing.expectEqualStrings("", resp.exception);
     try testing.expectEqualStrings("ok", resp.body);
+}
+
+test "kv subscriptions: watched-prefix writes inject ONE durable dirty marker (coalesced, atomic, recursion-guarded)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    const bc = try ctx.compileToBytecode(
+        \\export function go() {
+        \\  kv.set("orders/1", "a");
+        \\  kv.set("orders/2", "b");   // same sub - marker deduped
+        \\  kv.set("other/1", "c");    // unwatched - no marker
+        \\  kv.delete("orders/1");     // deletes trigger too (already marked)
+        \\  return "ok";
+        \\}
+    , "s.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(bc);
+
+    const prefix_owned = try testing.allocator.dupe(u8, "orders/");
+    defer testing.allocator.free(prefix_owned);
+    const name_owned = try testing.allocator.dupe(u8, "orders-react");
+    defer testing.allocator.free(name_owned);
+    const mod_owned = try testing.allocator.dupe(u8, "_subscriptions/orders-react/index.mjs");
+    defer testing.allocator.free(mod_owned);
+    const subs = [_]globals.SubscriptionEntry{.{
+        .name = name_owned,
+        .module_path = mod_owned,
+        .spec = .{ .kv = .{ .prefix = prefix_owned } },
+    }};
+
+    var txn = try kv.beginTrackedImmediate();
+    var txn_done = false;
+    defer if (!txn_done) txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, bc, null, null, &.{ .subscriptions = &subs }, .{
+        .method = "POST",
+        .path = "/",
+        .fn_override = "go",
+        .trace = .{ .request_id = 1 },
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    try txn.commit();
+    txn_done = true;
+
+    // The durable marker landed (value = the watched prefix)...
+    const marker = try kv.get("_sub/dirty/orders-react");
+    defer testing.allocator.free(marker);
+    try testing.expectEqualStrings("orders/", marker);
+    // ...exactly ONCE in the writeset despite three matching ops (the
+    // activation-level dedup), atomic with the writes it announces.
+    var marker_puts: usize = 0;
+    for (ws.ops.items) |op| switch (op) {
+        .put => |pp| {
+            if (std.mem.startsWith(u8, pp.key, "_sub/dirty/")) marker_puts += 1;
+        },
+        .delete => {},
+    };
+    try testing.expectEqual(@as(usize, 1), marker_puts);
 }
 
 test "arena-oom retry: churny handler succeeds under GC re-execution" {
@@ -6104,7 +6175,7 @@ test "trigger: afterPut fires after a kv.set inside the handler" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &triggers, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &.{ .triggers = &triggers }, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -6167,7 +6238,7 @@ test "trigger: afterDelete fires with previousValue" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &triggers, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &.{ .triggers = &triggers }, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -6239,7 +6310,7 @@ test "trigger: tree-traversal order — outer + inner both fire on AFTER" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &triggers, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &.{ .triggers = &triggers }, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -6300,7 +6371,7 @@ test "trigger: cascade depth limit halts runaway recursion" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &triggers, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &.{ .triggers = &triggers }, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -6358,7 +6429,7 @@ test "trigger: platform-key writes do not fire customer triggers" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &triggers, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &.{ .triggers = &triggers }, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -6421,7 +6492,7 @@ test "trigger: beforePut throw is catchable in handler with code='trigger_reject
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &triggers, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &.{ .triggers = &triggers }, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -6482,7 +6553,7 @@ test "trigger: beforePut return-value mutates the written value" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &triggers, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &.{ .triggers = &triggers }, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -6545,7 +6616,7 @@ test "trigger: beforePut throw rolls back trigger-internal writes (the audit got
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &triggers, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &.{ .triggers = &triggers }, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -6610,7 +6681,7 @@ test "trigger: afterPut throw is catchable AND rolls back the originating write"
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &triggers, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &.{ .triggers = &triggers }, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -6681,7 +6752,7 @@ test "trigger: BEFORE chain runs outermost-first (broad validates before narrow)
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &triggers, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &.{ .triggers = &triggers }, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -6745,7 +6816,7 @@ test "trigger: default export is the catchall when no named export matches" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &triggers, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &.{ .triggers = &triggers }, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -6812,7 +6883,7 @@ test "trigger: BEFORE sees previousValue on update" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &triggers, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &.{ .triggers = &triggers }, .{
         .method = "GET",
         .path = "/",
     }, &budget);
@@ -6885,7 +6956,7 @@ test "trigger: well-bounded cascade (depth 2, no runaway)" {
     var ws = kv_mod.WriteSet.init(testing.allocator);
     defer ws.deinit();
     var budget = Budget.fromNow(Budget.default_duration_ns);
-    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &triggers, .{
+    var resp = try d.run(kv, &txn, &ws, handler_bc, &bytecodes, null, &.{ .triggers = &triggers }, .{
         .method = "GET",
         .path = "/",
     }, &budget);

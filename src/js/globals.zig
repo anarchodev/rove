@@ -70,6 +70,17 @@ pub const TriggerEntry = struct {
     module_path: []u8,
 };
 
+/// The per-deployment hooks a dispatch consults DURING an activation
+/// (both borrowed from the pinned snapshot): middleware triggers
+/// (`_triggers/`, the kv.set before/after chains) and kv subscriptions
+/// (`_subscriptions/`, whose watched-prefix writes inject the durable
+/// `_sub/dirty/{name}` marker — durable-kv-subscriptions). Passed as
+/// one optional pointer so test paths keep passing `null`.
+pub const DeployHooks = struct {
+    triggers: ?[]const TriggerEntry = null,
+    subscriptions: []const SubscriptionEntry = &.{},
+};
+
 /// One row in a tenant's subscription registry — chain origins that
 /// fire WITHOUT an inbound HTTP request. Built at deploy-load time
 /// from `_subscriptions/<name>/spec.json` + `_subscriptions/<name>
@@ -473,6 +484,18 @@ pub const DispatchState = struct {
     /// forward order, BEFORE chain reverses. Null = no triggers
     /// (test paths that don't care).
     triggers: ?[]const TriggerEntry = null,
+    /// Subscription registry for the active deployment
+    /// (durable-kv-subscriptions): a customer write under a watched
+    /// prefix injects the durable `_sub/dirty/{name}` marker into this
+    /// activation's txn+writeset, atomic with the write. Borrowed from
+    /// the pinned snapshot. Empty = none (test paths).
+    subscriptions: []const SubscriptionEntry = &.{},
+    /// Dedup bitmask: bit i set ⇒ subscription i's dirty marker was
+    /// already written by THIS activation (one marker per sub per
+    /// activation regardless of how many matching writes — the
+    /// writeset-level half of the coalescing). Subs past 64 skip the
+    /// dedup and just rewrite (rare; same key, idempotent).
+    subs_marked: u64 = 0,
     /// Per-deployment bytecode map. Same map the module loader
     /// uses for handler imports — trigger modules live in it under
     /// their `_triggers/.../index.{mjs,js}` paths. Needed by the
@@ -805,6 +828,46 @@ fn jsKvGet(
     return c.JS_NewStringLen(ctx, value.ptr, value.len);
 }
 
+/// durable-kv-subscriptions: a successful customer write under a
+/// watched subscription prefix injects the durable dirty marker
+/// (`_sub/dirty/{name}` → the watched prefix) into THIS activation's
+/// txn + writeset — atomic with the triggering write, which is the
+/// whole at-least-once guarantee (a commit either carries both or
+/// neither; there is no window where the write is durable but the owed
+/// fire isn't). The marker key is one-per-subscription, so N matching
+/// writes coalesce at the storage level; `subs_marked` also dedups the
+/// redundant rewrites within one activation. `_sub/`-keys themselves
+/// never re-trigger (recursion guard — the fire's own marker delete
+/// must not re-arm it).
+fn markSubscriptionsDirty(state: *DispatchState, key: []const u8) void {
+    if (state.subscriptions.len == 0) return;
+    if (std.mem.startsWith(u8, key, "_sub/")) return;
+    for (state.subscriptions, 0..) |sub, i| {
+        const prefix = switch (sub.spec) {
+            .kv => |k| k.prefix,
+        };
+        if (!std.mem.startsWith(u8, key, prefix)) continue;
+        if (i < 64) {
+            const bit = @as(u64, 1) << @intCast(i);
+            if (state.subs_marked & bit != 0) continue;
+            state.subs_marked |= bit;
+        }
+        const mkey = std.fmt.allocPrint(state.allocator, "_sub/dirty/{s}", .{sub.name}) catch |err| {
+            state.pending_kv_error = err;
+            return;
+        };
+        defer state.allocator.free(mkey);
+        state.txn.put(mkey, prefix) catch |err| {
+            state.pending_kv_error = err;
+            return;
+        };
+        state.writeset.addPut(mkey, prefix) catch |err| {
+            state.pending_kv_error = err;
+            return;
+        };
+    }
+}
+
 fn jsKvSet(
     ctx: ?*c.JSContext,
     _: c.JSValue,
@@ -855,6 +918,7 @@ fn jsKvSet(
         state.writeset.addPut(key_str, val_str) catch |err| {
             state.pending_kv_error = err;
         };
+        markSubscriptionsDirty(state, key_str);
         return js_undefined;
     }
 
@@ -902,6 +966,7 @@ fn jsKvSet(
     state.writeset.addPut(key_str, write_value) catch |err| {
         state.pending_kv_error = err;
     };
+    markSubscriptionsDirty(state, key_str);
 
     if (td.runAfterChain(state, ctx, key_str, .put, write_value, prev_owned)) |trigger_path| {
         td.rollbackInnerSavepoint(state);
@@ -950,6 +1015,7 @@ fn jsKvDelete(
         state.writeset.addDelete(key_str) catch |err| {
             state.pending_kv_error = err;
         };
+        markSubscriptionsDirty(state, key_str);
         return js_undefined;
     }
 
@@ -989,6 +1055,7 @@ fn jsKvDelete(
     state.writeset.addDelete(key_str) catch |err| {
         state.pending_kv_error = err;
     };
+    markSubscriptionsDirty(state, key_str);
 
     if (td.runAfterChain(state, ctx, key_str, .delete, null, prev_owned)) |trigger_path| {
         td.rollbackInnerSavepoint(state);
@@ -2575,16 +2642,12 @@ pub fn installRequest(
         const source_obj = c.JS_NewObject(ctx);
         if (sf.source) |src| switch (src) {
             .kv => |kv| {
+                // Coalesced level-trigger (durable-kv-subscriptions):
+                // the fire names the DIRTY PREFIX, never a key/op — N
+                // writes coalesce into ≥1 fire; the handler reads
+                // current committed state under the prefix.
                 _ = c.JS_SetPropertyStr(ctx, source_obj, "kind", c.JS_NewStringLen(ctx, "kv", 2));
-                _ = c.JS_SetPropertyStr(ctx, source_obj, "key", c.JS_NewStringLen(ctx, kv.key.ptr, kv.key.len));
-                const op_str: []const u8 = switch (kv.op) {
-                    'p' => "put",
-                    'd' => "delete",
-                    else => "",
-                };
-                if (op_str.len > 0) {
-                    _ = c.JS_SetPropertyStr(ctx, source_obj, "op", c.JS_NewStringLen(ctx, op_str.ptr, op_str.len));
-                }
+                _ = c.JS_SetPropertyStr(ctx, source_obj, "prefix", c.JS_NewStringLen(ctx, kv.prefix.ptr, kv.prefix.len));
             },
         };
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "source", source_obj);

@@ -351,11 +351,7 @@ pub fn drainRaftPending(worker: anytype) !void {
                 // fires onto worker.msg_queue; releaseAll interprets
                 // every Cmd in order (the firePendingKvWakes +
                 // transferStagedChunks collapse).
-                worker_streaming.fireKvReactSubscriptions(self.worker, unit) catch |err|
-                    std.log.warn(
-                        "rove-js kv-react ({s}): {s}",
-                        .{ unit.tenant_id, @errorName(err) },
-                    );
+                worker_streaming.fireKvReactSubscriptions(self.worker, unit);
                 // §2.6 P2: commit-gated durable-wake watermark bootstrap.
                 // Reads the same committed `kv_wake_broadcast` Cmds (still
                 // intact — releaseAll consumes them next) and lowers
@@ -1550,7 +1546,7 @@ fn resumeContinuation(
         bc,
         &tc.snap.bytecodes,
         &tc.snap.source_hashes,
-        tc.snap.triggers,
+        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
         request,
         &budget,
     ) catch {
@@ -2033,7 +2029,7 @@ pub fn resumeBoundFetchChain(
         bc,
         &tc.snap.bytecodes,
         &tc.snap.source_hashes,
-        tc.snap.triggers,
+        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
         req,
         &budget,
     ) catch {
@@ -3202,7 +3198,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
         bc,
         &tc.snap.bytecodes,
         &tc.snap.source_hashes,
-        tc.snap.triggers,
+        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
         req,
         &budget,
     ) catch {

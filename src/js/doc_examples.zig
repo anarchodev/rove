@@ -78,6 +78,10 @@ const RETIRED_SPELLINGS = [_]RetiredSpelling{
     .{ .pattern = "leeway_s", .hint = "jwt option is `leewaySeconds`" },
     .{ .pattern = "handle:", .hint = "webhook.send's idempotency option is `key` (like schedule)" },
     .{ .pattern = "cancelFetch", .hint = "cancel an after.fetch with after.cancel(id)" },
+    // durable-kv-subscriptions (decisions §4.13): fires carry only the
+    // dirty prefix — per-write key/op payloads retired.
+    .{ .pattern = "source.key", .hint = "subscription fires are coalesced level triggers: request.activation.source.prefix (read the prefix, reconcile)" },
+    .{ .pattern = "source.op", .hint = "subscription fires carry no op — read current state under source.prefix" },
 };
 
 // ── Example extraction ──────────────────────────────────────────────

@@ -1524,6 +1524,14 @@ pub fn Worker(comptime opts: Options) type {
         /// below). Inbound-HTTP dispatch stays entity-driven through
         /// h2 — Phase 3's reconciler scope.
         msg_queue: effect_mod.MsgQueue = undefined,
+        /// durable-kv-subscriptions: the immediate-fire pending set —
+        /// "tenant\x1fname" keys (owned), one entry max per dirty
+        /// (tenant, subscription). Volatile latency state only: the
+        /// durable `_sub/dirty/` marker + sweep are the guarantee.
+        pending_sub_fires: std.StringArrayHashMapUnmanaged(void) = .empty,
+        /// Throttle for `sweepDirtySubscriptions` (0 forces a sweep —
+        /// the promotion hook uses that).
+        last_sub_sweep_ns: i64 = 0,
         /// Effect-reification Phase 2E: unified cross-thread Msg
         /// inbox. Replaces the pre-2E pair (`sub_fire_inbox` +
         /// `fetch_chunk_inbox`). Producers from non-worker threads
@@ -2090,6 +2098,8 @@ pub fn Worker(comptime opts: Options) type {
             // fetch_chunk / fetch_done / fetch_pipe_done) to free
             // in-flight Msg payloads at shutdown.
             self.msg_queue.deinit();
+            for (self.pending_sub_fires.keys()) |k| self.allocator.free(k);
+            self.pending_sub_fires.deinit(self.allocator);
             // Phase 5 PR-3: any pending bound-resumes left at shutdown
             // — the leader change drain would have surfaced these, but
             // be defensive.

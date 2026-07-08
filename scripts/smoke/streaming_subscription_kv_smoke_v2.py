@@ -4,9 +4,10 @@ chain origin (Gap 2.1 Phase E), on the `V2Cluster` harness.
 
 `acme/_subscriptions/sub-react/{spec.json,index.mjs}` declares a kv-react
 subscription on prefix `sub-react-in/`. On a write under that prefix the
-runtime's apply-time hook fires the subscription handler (`onSubscription`),
-which reads `request.activation.source = {kind:"kv",key,op}` and writes a
-marker to `sub-react-out/<key-tail>`. No inbound HTTP request drives it —
+durable dirty marker + post-commit arm fire the subscription handler
+(`onSubscription`) as a coalesced level trigger: it reads
+`request.activation.source = {kind:"kv",prefix}`, reconciles the prefix, and
+writes a marker per row to `sub-react-out/`. No inbound HTTP drives it —
 the chain origin runs purely from the apply-time hook (leader-gated; single
 node here is always leader).
 
@@ -15,10 +16,10 @@ tenant (`examples/loop46-demo-tenants/acme/…`).
 
 Essential assertions kept from V1:
   1. POST sub-react-in/k1=hello via /writekv → subscription fires →
-     `sub-react-out/k1` == "put:hello" (chain origin fired + source payload
+     `sub-react-out/k1` == "hello" (chain origin fired + level-read
      correctly populated).
   2. A second write fires the subscription again (sub-react-out/k2 ==
-     "put:world") — proves the apply-time hook re-fires.
+     "world") — proves the marker re-arms and re-fires.
 
 Dropped from V1: TLS/https, 3-node leader/follower addressing (single-node
 behavior smoke). The trigger write goes DIRECT to the node (`node_request`)
@@ -110,10 +111,10 @@ def main() -> int:
                 marker = rr.body.strip()
                 break
             time.sleep(0.4)
-        check("kv subscription fired (sub-react-out/k1 == put:hello)",
-              marker == "put:hello",
+        check("kv subscription fired (sub-react-out/k1 == hello)",
+              marker == "hello",
               f"marker={marker!r}" if marker is not None else "marker absent after 20s")
-        if marker != "put:hello":
+        if marker != "hello":
             c.dump_node_log(grep=["subscription", "kv", "wake", "apply",
                                   "resolve", "404", "error", "warn"])
             print("\nFAILURES:", failures)
@@ -135,8 +136,8 @@ def main() -> int:
                 marker2 = rr.body.strip()
                 break
             time.sleep(0.4)
-        check("kv subscription re-fires (sub-react-out/k2 == put:world)",
-              marker2 == "put:world",
+        check("kv subscription re-fires (sub-react-out/k2 == world)",
+              marker2 == "world",
               f"marker={marker2!r}" if marker2 is not None else "marker absent after 20s")
 
     if failures:

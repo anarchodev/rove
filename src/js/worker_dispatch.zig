@@ -3580,7 +3580,7 @@ pub fn dispatchOnce(worker: anytype, blocked: anytype) !usize {
             bytecode,
             &tc.snap.bytecodes,
             &tc.snap.source_hashes,
-            tc.snap.triggers,
+            &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
             request,
             &budget,
         ) catch |err| {

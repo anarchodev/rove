@@ -647,7 +647,7 @@ fn fireWsMessage(
         p.dep.bc,
         &tc.snap.bytecodes,
         &tc.snap.source_hashes,
-        tc.snap.triggers,
+        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
         request,
         &budget,
     ) catch {
@@ -847,7 +847,7 @@ pub fn resumeBoundFetchChainWs(
         p.dep.bc,
         &tc.snap.bytecodes,
         &tc.snap.source_hashes,
-        tc.snap.triggers,
+        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
         request,
         &budget,
     ) catch {
@@ -950,7 +950,7 @@ pub fn resumeWakeChainWs(worker: anytype, chain_ent: rove.Entity, conn_ent: rove
         p.dep.bc,
         &tc.snap.bytecodes,
         &tc.snap.source_hashes,
-        tc.snap.triggers,
+        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
         request,
         &budget,
     ) catch {
@@ -1085,7 +1085,7 @@ fn fireWsDisconnect(worker: anytype, chain_ent: rove.Entity) void {
         p.dep.bc,
         &tc.snap.bytecodes,
         &tc.snap.source_hashes,
-        tc.snap.triggers,
+        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
         request,
         &budget,
     ) catch {

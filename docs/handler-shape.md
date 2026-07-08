@@ -300,7 +300,16 @@ export** a trigger's activation lands in; it does not invent a kind.
 >
 > **`_subscriptions/` fires dispatch to `onSubscription`** (kv-react —
 > the one live subscription kind), so a subscription module never
-> branches on `request.activation.source.kind`. (The manifest
+> branches on `request.activation.source.kind`. A fire is a
+> **coalesced level trigger with at-least-once delivery**
+> (durable-kv-subscriptions): a write under the watched prefix sets a
+> durable dirty marker in the SAME writeset (the owed fire survives
+> crashes and leader changes), N writes coalesce into ≥1 fire, and the
+> payload names only the dirty prefix —
+> `request.activation.source = {kind:"kv", prefix}`, never a key/op.
+> The handler reads current committed state under the prefix and
+> reconciles; it must tolerate a redundant re-fire and must NOT assume
+> one fire per write. (The manifest
 > `kind=cron` subscription and its `onCron` export RETIRED with
 > durable-wake P5(b): recurrence is the `cron(spec, target, …)` verb —
 > durable, surviving leader change — or a self-re-arming

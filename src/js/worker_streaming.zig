@@ -622,7 +622,7 @@ fn resumeStream(
         bc,
         &tc.snap.bytecodes,
         &tc.snap.source_hashes,
-        tc.snap.triggers,
+        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
         request,
         &budget,
     ) catch {
@@ -1066,7 +1066,7 @@ pub fn resumeBoundFetchStream(
         bc,
         &tc.snap.bytecodes,
         &tc.snap.source_hashes,
-        tc.snap.triggers,
+        &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
         req,
         &budget,
     ) catch {
@@ -1506,7 +1506,7 @@ pub fn runFire(
         p.dep.bc,
         &p.dep.tc.snap.bytecodes,
         &p.dep.tc.snap.source_hashes,
-        p.dep.tc.snap.triggers,
+        &.{ .triggers = p.dep.tc.snap.triggers, .subscriptions = p.dep.tc.snap.subscriptions },
         req_w,
         &budget,
     ) catch {
@@ -1828,10 +1828,30 @@ pub fn fireSubscriptionActivation(
     subscription_name: []const u8,
     module_path: []const u8,
     source: SubscriptionFireSource,
+    /// durable-kv-subscriptions: the `_sub/dirty/{name}` marker this
+    /// fire retires. Injected as a delete into the fire's writeset
+    /// BEFORE the handler runs (the durable-wake cleanup pattern), so
+    /// the clear commits atomically with the handler's effects — and
+    /// same-tenant serialization makes the plain delete safe (no CAS:
+    /// a later write's marker-set is ordered after this delete and
+    /// re-arms). Null = a fire with no marker (the producer-less
+    /// legacy msg path).
+    cleanup_key: ?[]const u8,
 ) void {
     const allocator = worker.allocator;
     var p = firePrep(worker, tenant_id, module_path, "subscription-fire") orelse return;
     defer p.deinit(allocator);
+
+    if (cleanup_key) |ck| {
+        p.txn.delete(ck) catch |err| {
+            std.log.warn("rove-js kv-react ({s}/{s}): marker txn.delete failed: {s}", .{ tenant_id, subscription_name, @errorName(err) });
+            return; // marker survives -> sweep re-fires
+        };
+        p.ws.addDelete(ck) catch |err| {
+            std.log.warn("rove-js kv-react ({s}/{s}): marker ws.addDelete failed: {s}", .{ tenant_id, subscription_name, @errorName(err) });
+            return;
+        };
+    }
 
     // Subscription chains start fresh — empty ctx, fresh
     // correlation_id. (The handler can pass ctx forward via its
@@ -1875,12 +1895,23 @@ pub fn fireSubscriptionActivation(
         .plan = .{ .limiter = &worker.limiter, .instance_id = p.dep.inst.id, .blob_cfg = &worker.node.blob_backend_cfg },
         .admin = .{ .platform = p.dep.inst.platform },
     };
-    runFire(worker, &p, req, .{
-        .act = .subscription_fire,
-        .site = "subscription-fire",
-        .on_cont = .warn,
-        .on_stream = .warn,
-    }, module_path, corr_full, subscription_name, "");
+    if (cleanup_key != null) {
+        // The marker delete must land even for a read-only handler.
+        runFire(worker, &p, req, .{
+            .act = .subscription_fire,
+            .site = "subscription-fire",
+            .on_cont = .warn,
+            .on_stream = .warn,
+            .always_propose = true,
+        }, module_path, corr_full, subscription_name, "");
+    } else {
+        runFire(worker, &p, req, .{
+            .act = .subscription_fire,
+            .site = "subscription-fire",
+            .on_cont = .warn,
+            .on_stream = .warn,
+        }, module_path, corr_full, subscription_name, "");
+    }
 }
 
 /// §2.6 durable-wake (P1): fire the baked `__system/scheduler_tick`
@@ -2464,66 +2495,145 @@ pub fn proposeForgetfulWrites(
 ///
 /// Leader-only by caller convention (this site only runs on the
 /// worker that committed the original writeset).
-pub fn fireKvReactSubscriptions(worker: anytype, unit: *ParkedUnit) !void {
-    const slot = worker.node.deploy.tenant_files_map.get(unit.tenant_id) orelse return;
+pub const SUB_DIRTY_PREFIX = "_sub/dirty/";
+
+/// durable-kv-subscriptions: the post-commit IMMEDIATE-fire arm (the
+/// latency path). Prefix matching already happened at WRITE time — the
+/// kv binding injected the durable `_sub/dirty/{name}` marker into the
+/// writer's own writeset — so this arm just watches the committed unit
+/// for those marker puts and marks the sub pending in the worker's
+/// in-memory set. The set is bounded (≤ one entry per tenant+sub, no
+/// matter the write volume — what the overflow-prone shared msg_queue
+/// path could never guarantee) and DROPPABLE: the durable marker +
+/// `sweepDirtySubscriptions` are the at-least-once guarantee; losing
+/// an insert here only costs latency (the old path lost the event).
+pub fn fireKvReactSubscriptions(worker: anytype, unit: *ParkedUnit) void {
+    for (unit.buffered.items.items) |cmd| switch (cmd) {
+        .kv_wake_broadcast => |w| {
+            if (!std.mem.startsWith(u8, w.key, SUB_DIRTY_PREFIX)) continue;
+            if (w.op != 'p') continue; // the fire's own marker delete
+            markSubPending(worker, unit.tenant_id, w.key[SUB_DIRTY_PREFIX.len..]);
+        },
+        // Other Cmd kinds (stream_chunk, stream_close, http_fetch,
+        // respond) ride through interpretCmd in releaseAll.
+        else => {},
+    };
+}
+
+/// Insert (tenant, sub) into the pending set. Key = "tenant\x1fname"
+/// (owned). Best-effort by design: on OOM the durable marker is still
+/// set and the sweep re-discovers it.
+fn markSubPending(worker: anytype, tenant_id: []const u8, name: []const u8) void {
+    const allocator = worker.allocator;
+    const key = std.fmt.allocPrint(allocator, "{s}\x1f{s}", .{ tenant_id, name }) catch return;
+    const gop = worker.pending_sub_fires.getOrPut(allocator, key) catch {
+        allocator.free(key);
+        return;
+    };
+    if (gop.found_existing) allocator.free(key);
+}
+
+/// Fire every pending dirty subscription (the immediate path's second
+/// half — the post-commit arm only MARKS; dispatch happens here on the
+/// tick, like every other fire origin). The set is moved out first so
+/// a fire that writes another watched prefix re-inserts cleanly.
+pub fn drainPendingSubscriptionFires(worker: anytype) void {
+    if (worker.pending_sub_fires.count() == 0) return;
+    const allocator = worker.allocator;
+    var pending = worker.pending_sub_fires;
+    worker.pending_sub_fires = .empty;
+    defer {
+        for (pending.keys()) |k| allocator.free(k);
+        pending.deinit(allocator);
+    }
+    for (pending.keys()) |combined| {
+        const sep = std.mem.indexOfScalar(u8, combined, 0x1f) orelse continue;
+        fireDirtySubscription(worker, combined[0..sep], combined[sep + 1 ..]);
+    }
+}
+
+fn fireDirtySubscription(worker: anytype, tenant_id: []const u8, name: []const u8) void {
+    const allocator = worker.allocator;
+    const slot = worker.node.deploy.tenant_files_map.get(tenant_id) orelse return;
     const snap = slot.pinCurrent() orelse return;
     defer snap.release();
-    if (snap.subscriptions.len == 0) return;
+    const sub = for (snap.subscriptions) |s| {
+        if (std.mem.eql(u8, s.name, name)) break s;
+    } else {
+        // Undeployed while its marker was dirty — nothing to fire. The
+        // stale marker is harmless (skipped here and by the sweep).
+        std.log.debug("rove-js kv-react: dirty marker for unregistered subscription {s}/{s}; skipping", .{ tenant_id, name });
+        return;
+    };
+    const prefix = switch (sub.spec) {
+        .kv => |k| k.prefix,
+    };
+    const marker_key = std.fmt.allocPrint(allocator, SUB_DIRTY_PREFIX ++ "{s}", .{name}) catch return;
+    defer allocator.free(marker_key);
+    std.log.info("rove-js kv-react fire: tenant={s} subscription={s} prefix={s}", .{ tenant_id, name, prefix });
+    fireSubscriptionActivation(
+        worker,
+        tenant_id,
+        name,
+        sub.module_path,
+        .{ .kv = .{ .prefix = prefix } },
+        marker_key,
+    );
+}
 
-    const allocator = worker.allocator;
-    for (snap.subscriptions) |sub| {
-        const prefix = switch (sub.spec) {
-            .kv => |k| k.prefix,
-        };
-        for (unit.buffered.items.items) |cmd| switch (cmd) {
-            .kv_wake_broadcast => |w| {
-                if (!std.mem.startsWith(u8, w.key, prefix)) continue;
-                std.log.info(
-                    "rove-js kv-react queue: tenant={s} subscription={s} key={s} op={c}",
-                    .{ unit.tenant_id, sub.name, w.key, w.op },
-                );
-                // Dup onto the payload; payload owns + frees these
-                // strings via `SubscriptionFire.deinit` after the
-                // fire completes (or on MsgQueue drop-on-shutdown).
-                const tid = try allocator.dupe(u8, unit.tenant_id);
-                errdefer allocator.free(tid);
-                const name = try allocator.dupe(u8, sub.name);
-                errdefer allocator.free(name);
-                const path = try allocator.dupe(u8, sub.module_path);
-                errdefer allocator.free(path);
-                const key_dup = try allocator.dupe(u8, w.key);
-                errdefer allocator.free(key_dup);
+/// durable-kv-subscriptions: the sweep GUARANTEE. Scans `_sub/dirty/`
+/// for every tenant in this worker's partition that has subscriptions
+/// registered, re-marking anything the immediate path dropped (crash
+/// between commit and fire, faulted fire, OOM on the pending-set
+/// insert). Steady-state it finds nothing; sustained finds mean the
+/// immediate path is dropping. Throttled — a backstop, not the
+/// delivery path.
+const SUB_SWEEP_INTERVAL_NS: i64 = 10 * std.time.ns_per_s;
 
-                var payload: effect_mod.msg.SubscriptionFire = .{
-                    .tenant_id = tid,
-                    .subscription_name = name,
-                    .module_path = path,
-                    .source = .{ .kv = .{ .key = key_dup, .op = w.op } },
-                };
-                effect_mod.enqueueMsg(&worker.msg_queue, .{ .subscription_fire = payload }) catch |err| {
-                    payload.deinit(allocator);
-                    // The committed write matched this subscription but
-                    // the fire couldn't be queued (msg_queue at cap →
-                    // error.Full, tracked in overflow_count; or OOM).
-                    // There is NO re-scan backstop, so the subscription
-                    // MISSES this event — an at-least-once gap under
-                    // sustained back-pressure (unlike durable wakes /
-                    // cron, which re-fire). Loud so it's not invisible;
-                    // durable delivery is a design decision (see the
-                    // silent-failure audit → M3).
-                    std.log.warn(
-                        "rove-js kv-react: subscription '{s}' (tenant={s}) MISSED the committed write to '{s}': {s} (no re-scan backstop)",
-                        .{ sub.name, unit.tenant_id, w.key, @errorName(err) },
-                    );
-                    return err;
-                };
-            },
-            // Other Cmd kinds (stream_chunk, stream_close,
-            // http_fetch, respond) don't trigger kv-react — they
-            // ride through interpretCmd in releaseAll.
-            else => {},
+pub fn sweepDirtySubscriptions(worker: anytype) void {
+    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    if (now_ns - worker.last_sub_sweep_ns < SUB_SWEEP_INTERVAL_NS) return;
+    worker.last_sub_sweep_ns = now_ns;
+
+    const n_inboxes = blk: {
+        worker.node.router.msg_inboxes_mutex.lock();
+        defer worker.node.router.msg_inboxes_mutex.unlock();
+        break :blk worker.node.router.msg_inboxes.items.len;
+    };
+    if (n_inboxes == 0) return;
+
+    var it = worker.node.deploy.tenant_files_map.iterator();
+    while (it.next()) |entry| {
+        const slot = entry.value_ptr.*;
+        const inbox_idx = std.hash.Wyhash.hash(0, slot.instance_id) % n_inboxes;
+        if (inbox_idx != worker.msg_inbox_idx) continue;
+        // Gate the kv scan on the registry — tenants without
+        // subscriptions never pay a read.
+        const has_subs = blk: {
+            const snap = slot.pinCurrent() orelse break :blk false;
+            defer snap.release();
+            break :blk snap.subscriptions.len > 0;
         };
+        if (!has_subs) continue;
+        var page = slot.app_kv.prefix(SUB_DIRTY_PREFIX, "", 64) catch |err| {
+            std.log.warn("rove-js kv-react sweep: prefix scan tenant={s}: {s}", .{ slot.instance_id, @errorName(err) });
+            continue;
+        };
+        defer page.deinit();
+        for (page.entries) |e| {
+            if (e.key.len <= SUB_DIRTY_PREFIX.len) continue;
+            markSubPending(worker, slot.instance_id, e.key[SUB_DIRTY_PREFIX.len..]);
+        }
     }
+}
+
+/// Leadership false→true: force an immediate full sweep — the pending
+/// set is volatile, so a freshly-promoted leader must re-discover any
+/// dirty markers the old leader hadn't fired (same posture as
+/// `sweepDurableWakesOnPromotion`).
+pub fn sweepDirtySubscriptionsOnPromotion(worker: anytype) void {
+    worker.last_sub_sweep_ns = 0;
+    sweepDirtySubscriptions(worker);
 }
 
 // ── Msg inbox + dispatch ──────────────────────────────────────────────
@@ -2603,6 +2713,10 @@ pub fn drainMsgInbox(worker: anytype) void {
 pub fn serviceSubscriptionFires(worker: anytype) void {
     drainMsgInbox(worker);
     dispatchPendingMsgs(worker);
+    // durable-kv-subscriptions: the immediate path (pending set filled
+    // by the post-commit arm) + the throttled sweep guarantee.
+    drainPendingSubscriptionFires(worker);
+    sweepDirtySubscriptions(worker);
 }
 
 // ── Bound-fetch chunk spool ───────────────────────────────────────────
@@ -3002,8 +3116,9 @@ pub fn dispatchPendingMsgs(worker: anytype) void {
                     sf.subscription_name,
                     sf.module_path,
                     switch (sf.source) {
-                        .kv => |kv| SubscriptionFireSource{ .kv = .{ .key = kv.key, .op = kv.op } },
+                        .kv => |kv| SubscriptionFireSource{ .kv = .{ .prefix = kv.prefix } },
                     },
+                    null,
                 );
                 sf.deinit(allocator);
                 fired += 1;

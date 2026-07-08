@@ -108,6 +108,7 @@ pub const serviceSubscriptionFires = worker.serviceSubscriptionFires;
 pub const sweepBlobSessions = worker.sweepBlobSessions;
 pub const sweepDurableWakes = worker.sweepDurableWakes;
 pub const sweepDurableWakesOnPromotion = worker.sweepDurableWakesOnPromotion;
+pub const sweepDirtySubscriptionsOnPromotion = @import("worker_streaming.zig").sweepDirtySubscriptionsOnPromotion;
 pub const serviceFetchEvents = worker.serviceFetchEvents;
 pub const drainSpools = worker.drainSpools;
 

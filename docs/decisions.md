@@ -757,6 +757,45 @@ one safe semantic, no unsafe default); persisting the churny map
 
 ## 5. Readset replication
 
+### 4.13 kv subscriptions: durable coalesced level-trigger (2026-07-07)
+
+**Decision.** A kv-react subscription fire is a **coalesced level
+trigger with at-least-once delivery**, not a per-write event. A
+customer write under a watched prefix injects a durable
+`_sub/dirty/{name}` marker into the WRITER'S OWN writeset (the kv
+binding does this; atomic — a commit carries the write and the owed
+fire together or neither). The post-commit arm marks the sub pending
+in a bounded in-memory set (≤1 entry per tenant+sub — this replaces
+the shared-msg-queue enqueue whose `error.Full` under back-pressure
+silently LOST events, the silent-failure audit's M3); the tick drains
+the set and fires `onSubscription` with the marker's delete injected
+into the fire's writeset before the handler runs (the durable-wake
+cleanup pattern) — clear commits atomically with the handler's
+effects. A throttled sweep of `_sub/dirty/` (gated to tenants with
+registrations; forced on promotion) is the guarantee; the immediate
+path is pure latency and may be lost freely.
+
+**Payload is the prefix only** — `source = {kind:"kv", prefix}`; key
+and op are gone. The handler reads current committed state under the
+prefix and reconciles. This makes the durable state O(subscriptions)
+(a dirty bit, not per-key markers), makes write storms coalesce for
+free, and matches the model (a handler is a pure function of its
+readset — "the prefix is dirty, go read" hands it exactly that).
+
+**Why no version-CAS on the clear:** same-tenant activations are
+serialized into a total order, so a fire's read-reconcile-clear is one
+point in that order — a write ordered before it is read; one ordered
+after it re-arms the marker after the clear. The plain delete is safe.
+This serialization is the load-bearing assumption; if per-tenant
+execution ever becomes concurrent, the clear needs a version-CAS (or
+handler-owned watermark) back.
+
+**Rejected:** per-event delivery with a durable per-write marker
+(O(writes) state, no coalescing); panicking on the old enqueue-full
+(transient back-pressure would crash every tenant on the worker);
+best-effort-with-metric (a reaction primitive that silently misses
+under load is a footgun — the audit found exactly that).
+
 ### 5.1 Replicate readsets (not intents); gate the callback, not the propose
 - **Decision** (Phases 1–6 shipped 2026-05-25/27; see
   `architecture/effects-and-handlers.md` §Readset replication): the three-substrate model is **Raft = inputs +
