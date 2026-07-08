@@ -419,12 +419,16 @@ the test.
 The handler-behavior smokes double as a faithfulness oracle: take the handler a
 smoke deploys, write a `rewind test` asserting the same behavior offline, and
 confirm they agree — proving the fold faithful against the REAL distributed
-stack (not just a self-authored fixture). First one landed:
-`examples/loop46-demo-tenants/acme/_tests/onfetch.mjs` cross-checks
-`on_fetch_smoke_v2.py` (streaming-bind + buffered fetch → the same byte-exact
-170B reconstruction), wired into `zig build test` via `rewind-test-smoke`.
-Writing this surfaced the streaming fetch gap above (`.stream()`) — exactly what
-dogfooding is for. Next oracles: `on_kv` / `on_timer` / `ws_*`.
+stack (not just a self-authored fixture). Landed in
+`examples/loop46-demo-tenants/acme/_tests/` (wired into `zig build test` via
+`rewind-test-smoke`), each mirroring its smoke's assertion offline:
+- `onfetch.mjs` ↔ `on_fetch_smoke_v2.py` — streaming-bind + buffered fetch → the
+  same byte-exact 170B reconstruction. Writing this surfaced the streaming fetch
+  gap above (`.stream()`) — exactly what dogfooding is for.
+- `onkv.mjs` ↔ `on_kv_smoke_v2.py` — `after.kv` held resume → `"woke:hello"`.
+- `ontimer.mjs` ↔ `on_timer_smoke_v2.py` — `after.ms` held resume → `"woke:x"`.
+Both after.kv/after.ms cross-checks passed with no gap (the folds already
+matched the real handlers). Next oracles: the `ws_*` smokes.
 
 ## What's left
 
