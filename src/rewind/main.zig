@@ -469,85 +469,15 @@ const PumpStores = struct {
 
 // ── Multi-node (Phase 5) config ───────────────────────────────────────
 
-/// Parsed multi-node bridge config (Phase 5 HA), owned for the lifetime of
-/// the `initMultiNode` call. `null` when this is a single-node deployment.
-const MultiNode = struct {
-    node_id: u64,
-    voters: []u64,
-    peers: []bridge_mod.PeerAddr,
-    /// Backing storage for the peer host slices (`host:port` left of `:`).
-    peer_bufs: [][]u8,
-    listen_addr: std.net.Address,
-    listen_str: []u8,
+/// Parsed multi-node bridge config (Phase 5 HA) — the shared
+/// `consensus/cluster_config.zig` parser under the worker's `REWIND_`
+/// env prefix (`REWIND_NODE_ID` / `REWIND_VOTERS` / `REWIND_PEERS`; the
+/// raft ports are DISTINCT from the HTTP listen port, argv[2]). `null`
+/// when this is a single-node deployment.
+const MultiNode = bridge_mod.cluster_config.MultiNode;
 
-    fn deinit(self: *const MultiNode, a: std.mem.Allocator) void {
-        a.free(self.voters);
-        a.free(self.peers);
-        for (self.peer_bufs) |b| a.free(b);
-        a.free(self.peer_bufs);
-        a.free(self.listen_str);
-    }
-};
-
-/// Build multi-node config from env, or return null if `REWIND_NODE_ID` is
-/// unset (single-node). Required together:
-///   - `REWIND_NODE_ID`   this node's 1-based raft id (∈ the voter set).
-///   - `REWIND_VOTERS`    comma-separated voter ids, e.g. `1,2,3`.
-///   - `REWIND_PEERS`     comma-separated raft transport `host:port`s,
-///                        indexed by raft id − 1 (peer i ⇒ raft id i+1).
-///                        These are the cross-node consensus ports, DISTINCT
-///                        from the HTTP listen port (argv[2]).
-/// The listen address is `peers[node_id − 1]`. Errors on malformed /
-/// inconsistent config (a misconfigured cluster must fail loud at startup).
 fn parseMultiNode(a: std.mem.Allocator) !?MultiNode {
-    const node_id_s = std.posix.getenv("REWIND_NODE_ID") orelse return null;
-    const voters_s = std.posix.getenv("REWIND_VOTERS") orelse return error.MissingVoters;
-    const peers_s = std.posix.getenv("REWIND_PEERS") orelse return error.MissingPeers;
-
-    const node_id = try std.fmt.parseInt(u64, std.mem.trim(u8, node_id_s, " \t"), 10);
-
-    var voters: std.ArrayListUnmanaged(u64) = .empty;
-    errdefer voters.deinit(a);
-    var vit = std.mem.tokenizeScalar(u8, voters_s, ',');
-    while (vit.next()) |tok| {
-        const t = std.mem.trim(u8, tok, " \t");
-        if (t.len == 0) continue;
-        try voters.append(a, try std.fmt.parseInt(u64, t, 10));
-    }
-    if (voters.items.len == 0) return error.MissingVoters;
-
-    var peers: std.ArrayListUnmanaged(bridge_mod.PeerAddr) = .empty;
-    errdefer peers.deinit(a);
-    var peer_bufs: std.ArrayListUnmanaged([]u8) = .empty;
-    errdefer {
-        for (peer_bufs.items) |b| a.free(b);
-        peer_bufs.deinit(a);
-    }
-    var pit = std.mem.tokenizeScalar(u8, peers_s, ',');
-    while (pit.next()) |tok| {
-        const t = std.mem.trim(u8, tok, " \t");
-        if (t.len == 0) continue;
-        const colon = std.mem.lastIndexOfScalar(u8, t, ':') orelse return error.BadPeer;
-        const host = try a.dupe(u8, t[0..colon]);
-        errdefer a.free(host);
-        const port = try std.fmt.parseInt(u16, t[colon + 1 ..], 10);
-        try peer_bufs.append(a, host);
-        try peers.append(a, .{ .host = host, .port = port });
-    }
-    if (node_id == 0 or node_id > peers.items.len) return error.BadNodeId;
-
-    const listen = peers.items[node_id - 1];
-    const listen_addr = try std.net.Address.parseIp(listen.host, listen.port);
-    const listen_str = try std.fmt.allocPrint(a, "{s}:{d}", .{ listen.host, listen.port });
-
-    return MultiNode{
-        .node_id = node_id,
-        .voters = try voters.toOwnedSlice(a),
-        .peers = try peers.toOwnedSlice(a),
-        .peer_bufs = try peer_bufs.toOwnedSlice(a),
-        .listen_addr = listen_addr,
-        .listen_str = listen_str,
-    };
+    return bridge_mod.cluster_config.fromEnv(a, "REWIND_");
 }
 
 /// Genesis first-boot config (consensus-and-storage.md "Cluster genesis &
@@ -578,9 +508,8 @@ fn parseGenesis(a: std.mem.Allocator) !?Genesis {
     const node_id = try std.fmt.parseInt(u64, std.mem.trim(u8, node_id_s, " \t"), 10);
     if (node_id == 0) return error.BadNodeId;
     const t = std.mem.trim(u8, raft_addr_s, " \t");
-    const colon = std.mem.lastIndexOfScalar(u8, t, ':') orelse return error.BadRaftAddr;
-    const port = try std.fmt.parseInt(u16, t[colon + 1 ..], 10);
-    const listen_addr = try std.net.Address.parseIp(t[0..colon], port);
+    const hp = bridge_mod.cluster_config.splitHostPort(t) catch return error.BadRaftAddr;
+    const listen_addr = try std.net.Address.parseIp(hp.host, hp.port);
     return Genesis{
         .node_id = node_id,
         .listen_addr = listen_addr,

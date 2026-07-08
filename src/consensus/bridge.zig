@@ -85,6 +85,10 @@ const raft = @import("raft_rs_zig");
 /// worker's `bridge` import (`src/version.zig`).
 pub const envelope = @import("envelope.zig");
 pub const transport = @import("transport.zig");
+/// Env-driven multi-node bootstrap config (`{prefix}NODE_ID/VOTERS/PEERS`),
+/// shared by the worker (`REWIND_`) and the CP (`REWIND_CP_`) so the
+/// voter/peer parsing can't drift between binaries.
+pub const cluster_config = @import("cluster_config.zig");
 const kvlimbs = @import("kvlimbs");
 
 pub const Node = node_mod.Node;
@@ -1926,6 +1930,12 @@ fn encodeWs(a: std.mem.Allocator, id_str: []const u8, ws: *const WriteSet) ![]u8
     const ws_bytes = try ws.encode(a);
     defer a.free(ws_bytes);
     return envelope.encodeWriteSet(a, id_str, ws_bytes);
+}
+
+test {
+    // Pull the config parser's inline tests into the bridge test build
+    // (a bare `pub const = @import(...)` alone does not).
+    _ = cluster_config;
 }
 
 test "bridge: propose → pumpOnce commits → committedSeq advances, read sees write" {

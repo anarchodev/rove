@@ -69,85 +69,15 @@ fn installSignalHandlers() void {
 
 // ── Multi-node CP (HA) config ─────────────────────────────────────────
 
-/// Parsed multi-node CP bridge config, owned for the lifetime of the
-/// `initMultiNode` call (the slices are duped by the node/transport, so this
-/// is freed right after). `null` = single-node CP.
-const CpMultiNode = struct {
-    node_id: u64,
-    voters: []u64,
-    peers: []bridge_mod.PeerAddr,
-    /// Backing storage for the peer host slices (`host:port` left of `:`).
-    peer_bufs: [][]u8,
-    listen_addr: std.net.Address,
-    listen_str: []u8,
+/// Parsed multi-node CP bridge config — the shared
+/// `consensus/cluster_config.zig` parser under the CP's `REWIND_CP_` env
+/// prefix (`REWIND_CP_NODE_ID` / `REWIND_CP_VOTERS` / `REWIND_CP_PEERS`;
+/// the directory raft group spans these nodes, and the raft ports are
+/// distinct from the HTTP listen port, argv[1]). `null` = single-node CP.
+const CpMultiNode = bridge_mod.cluster_config.MultiNode;
 
-    fn deinit(self: *const CpMultiNode, a: std.mem.Allocator) void {
-        a.free(self.voters);
-        a.free(self.peers);
-        for (self.peer_bufs) |b| a.free(b);
-        a.free(self.peer_bufs);
-        a.free(self.listen_str);
-    }
-};
-
-/// Build multi-node CP config from env, or null if `REWIND_CP_NODE_ID` is
-/// unset (single-node CP). Required together — the CP's directory raft group
-/// spans these nodes:
-///   - `REWIND_CP_NODE_ID`  this CP node's 1-based raft id (∈ the voter set).
-///   - `REWIND_CP_VOTERS`   comma-separated voter ids, e.g. `1,2,3`.
-///   - `REWIND_CP_PEERS`    comma-separated raft transport `host:port`s,
-///                          indexed by raft id − 1. Distinct from the HTTP
-///                          listen port (argv[1]).
-/// Errors loud on malformed / inconsistent config.
 fn parseCpMultiNode(a: std.mem.Allocator) !?CpMultiNode {
-    const node_id_s = std.posix.getenv("REWIND_CP_NODE_ID") orelse return null;
-    const voters_s = std.posix.getenv("REWIND_CP_VOTERS") orelse return error.MissingCpVoters;
-    const peers_s = std.posix.getenv("REWIND_CP_PEERS") orelse return error.MissingCpPeers;
-
-    const node_id = try std.fmt.parseInt(u64, std.mem.trim(u8, node_id_s, " \t"), 10);
-
-    var voters: std.ArrayListUnmanaged(u64) = .empty;
-    errdefer voters.deinit(a);
-    var vit = std.mem.tokenizeScalar(u8, voters_s, ',');
-    while (vit.next()) |tok| {
-        const t = std.mem.trim(u8, tok, " \t");
-        if (t.len == 0) continue;
-        try voters.append(a, try std.fmt.parseInt(u64, t, 10));
-    }
-    if (voters.items.len == 0) return error.MissingCpVoters;
-
-    var peers: std.ArrayListUnmanaged(bridge_mod.PeerAddr) = .empty;
-    errdefer peers.deinit(a);
-    var peer_bufs: std.ArrayListUnmanaged([]u8) = .empty;
-    errdefer {
-        for (peer_bufs.items) |b| a.free(b);
-        peer_bufs.deinit(a);
-    }
-    var pit = std.mem.tokenizeScalar(u8, peers_s, ',');
-    while (pit.next()) |tok| {
-        const t = std.mem.trim(u8, tok, " \t");
-        if (t.len == 0) continue;
-        const colon = std.mem.lastIndexOfScalar(u8, t, ':') orelse return error.BadCpPeer;
-        const host = try a.dupe(u8, t[0..colon]);
-        errdefer a.free(host);
-        const port = try std.fmt.parseInt(u16, t[colon + 1 ..], 10);
-        try peer_bufs.append(a, host);
-        try peers.append(a, .{ .host = host, .port = port });
-    }
-    if (node_id == 0 or node_id > peers.items.len) return error.BadCpNodeId;
-
-    const listen = peers.items[node_id - 1];
-    const listen_addr = try std.net.Address.parseIp(listen.host, listen.port);
-    const listen_str = try std.fmt.allocPrint(a, "{s}:{d}", .{ listen.host, listen.port });
-
-    return CpMultiNode{
-        .node_id = node_id,
-        .voters = try voters.toOwnedSlice(a),
-        .peers = try peers.toOwnedSlice(a),
-        .peer_bufs = try peer_bufs.toOwnedSlice(a),
-        .listen_addr = listen_addr,
-        .listen_str = listen_str,
-    };
+    return bridge_mod.cluster_config.fromEnv(a, "REWIND_CP_");
 }
 
 // The domain index (host → tenant) is no longer a static in-memory map: it
