@@ -1305,4 +1305,12 @@ pub fn build(b: *std.Build) void {
     xcheck.expectExitCode(0);
     smoke_step.dependOn(&xcheck.step);
     test_step.dependOn(&xcheck.step);
+
+    // WS held-socket cross-check: the same handler ws_worker_smoke_v2.py deploys.
+    const xcheck_ws = b.addRunArtifact(cli_exe);
+    xcheck_ws.addArg("test");
+    xcheck_ws.addDirectoryArg(b.path("examples/loop46-demo-tenants/wsworker"));
+    xcheck_ws.expectExitCode(0);
+    smoke_step.dependOn(&xcheck_ws.step);
+    test_step.dependOn(&xcheck_ws.step);
 }

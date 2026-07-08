@@ -44,6 +44,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_lib_v2 import V2Cluster  # noqa: E402
 
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+DEMO = REPO_ROOT / "examples" / "loop46-demo-tenants"
+
+
+def _src(rel: str) -> str:
+    return (DEMO / rel).read_text()
+
 ACCEPT_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 OP_CONT = 0x0
@@ -63,45 +70,7 @@ TENANT = "wstest"
 # surfaces `data` as a string, opcode 2 as a Uint8Array. `stream.write`
 # emits a text frame for a string, a binary frame for bytes. `next()`
 # parks the chain for the next frame; any terminal return closes.
-HANDLER_SRC = """\
-export default function () { return "ready"; }
-
-export function onMessage() {
-  const { opcode, data } = request.activation;
-  if (opcode === 2) {              // binary → echo bytes back verbatim
-    stream.write(data);
-    return next();
-  }
-  if (data.startsWith("persist:")) {   // durable frame: reply commit-gated
-    const v = data.slice(8);
-    kv.set("ws/last", v);
-    stream.write("persisted:" + v);
-    return next();
-  }
-  if (data.startsWith("read:")) {      // kv read-back inside onMessage
-    const v = kv.get("ws/last");
-    stream.write("value:" + (v ?? "<none>"));
-    return next();
-  }
-  if (data.startsWith("tag:")) {       // stamp who the next disconnect is
-    const t = data.slice(4);
-    kv.set("ws/tag", t);
-    stream.write("tagged:" + t);
-    return next();
-  }
-  if (data === "bye") {                // terminal return → server Close
-    stream.write("closing");
-    return "";
-  }
-  stream.write("echo:" + data);
-  return next();
-}
-
-export function onDisconnect() {
-  const tag = kv.get("ws/tag") ?? "none";
-  kv.set("ws/disc_" + tag, "1");
-}
-"""
+HANDLER_SRC = _src("wsworker/index.mjs")
 
 
 # ── raw RFC 6455 client (same shape as ws_echo_smoke.py) ──────────────
