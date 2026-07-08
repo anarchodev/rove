@@ -258,12 +258,28 @@ Drifted arms found (fix as small commits BEFORE extracting):
    `commitReadOnlyFire` tolerates it (fires run outside the chain lease).
    Document on the shared finisher.
 
-Then: `finishContResume(worker, oc, ctx, comptime spec)` (spec:
-`cancel_sibling_binds`, `log_readonly_repark`, site name; S3 keeps its
-`return true` at the call site; the `.stream` arm stays the already-shared
-`resumeIntoStream`) and `finishStreamResume` (unify the draining verb on
-`markStreamDrainingAnywhere` — S4's restriction is vestigial). runResume's
-catch-arm log record moves into the shared helper at extraction time.
+**Extractions LANDED 2026-07-08:** `finishContResume` (worker_drain.zig —
+S1/S2/S3, comptime spec {site, noun, cancel_binds, tape-kind}, the
+`.stream` arm stays `resumeIntoStream`; −450 lines) and
+`finishStreamResume` (worker_streaming.zig — S4/S5, draining unified on
+`markStreamDrainingAnywhere`, the S5 ensure-then-assumeCapacity latent UB
+closed; −330 lines). #7's minors normalized in the collapse. Found + fixed
+along the way: the #3/#6 posture commit had added double-frees around
+`tryAppend` (it frees its chunk on error — contract now documented at the
+call sites). Note: `streaming_first_hop_writes_smoke_v2`'s onDisconnect
+leg fails on main at `da7b26f` too (clean bisect) — pre-existing, not
+from this branch.
+
+**Step 3 (`finishOutcome` core) — RECOMMEND CLOSING as not warranted.**
+The premise was three-plus drifting copies of one machine; after steps
+1–2 each family's switch exists exactly once (`finishContResume`,
+`finishStreamResume`, `finishWsResume`, `runFire`) and the cross-family
+differences that remain are real semantics (park machinery:
+`proposeAndParkContResume` vs `proposeForgetfulWrites` vs WS chains;
+teardown: resolveParked vs draining vs tearDownWsChain), not drift. A
+callbacks-core would abstract a ~30-line classification skeleton at the
+cost of indirection across three files. The drift bug-class died with
+the copies. Revisit only if a NEW activation family appears.
 
 ---
 
