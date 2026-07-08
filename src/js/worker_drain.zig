@@ -1246,18 +1246,8 @@ fn resumeIntoStream(worker: anytype, s: anytype, ctx: StreamResumeCtx) void {
     s.kv_prefixes = &.{};
 
     if (ctx.wrote) {
-        const lh: log_mod.LogHeader = .{
-            .request_id = ctx.request_id,
-            .deployment_id = ctx.deployment_id,
-            .duration_ns = 0,
-            .status = 0, // parked-hop convention (matches repark)
-            .outcome = .ok,
-            .activation = ctx.activation,
-            .method = "POST",
-            .path = ctx.cont_path,
-            .host = "",
-            .correlation_id = ctx.correlation_id orelse "",
-        };
+        // status=0: parked-hop convention (matches repark).
+        const lh = worker_streaming.fireLogHeader(ctx.request_id, ctx.deployment_id, 0, ctx.activation, ctx.cont_path, ctx.correlation_id);
         const stream_seq = proposeAndParkContResume(
             worker,
             ctx.ent,
@@ -1584,18 +1574,7 @@ fn resumeContinuation(
                 const exception_owned = r.exception;
                 r.console = &.{};
                 r.exception = &.{};
-                const lh_terminal: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = dep_id,
-                    .duration_ns = 0,
-                    .status = st,
-                    .outcome = .ok,
-                    .activation = act_src,
-                    .method = "POST",
-                    .path = cont_path,
-                    .host = "",
-                    .correlation_id = corr_id orelse "",
-                };
+                const lh_terminal = worker_streaming.fireLogHeader(request_id, dep_id, st, act_src, cont_path, corr_id);
                 const cont_seq = proposeAndParkContResume(
                     worker,
                     ent,
@@ -1701,22 +1680,10 @@ fn resumeContinuation(
                     // Phase 3 mirror.
                     worker.registerBoundSendEntity(send_id, ent);
                 }
-                const lh_repark: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = dep_id,
-                    .duration_ns = 0,
-                    // captureLogWithId on this branch records status=0
-                    // (the parked-hop convention — same shape as the
-                    // inbound trampoline open hop). Mirror that here
-                    // so replay surfaces the same value.
-                    .status = 0,
-                    .outcome = .ok,
-                    .activation = act_src,
-                    .method = "POST",
-                    .path = cont_path,
-                    .host = "",
-                    .correlation_id = corr_id orelse "",
-                };
+                // status=0: captureLogWithId on this branch records status=0 (the
+                // parked-hop convention — same shape as the inbound trampoline open
+                // hop). Mirror it so replay surfaces the same value.
+                const lh_repark = worker_streaming.fireLogHeader(request_id, dep_id, 0, act_src, cont_path, corr_id);
                 const repark_seq = proposeAndParkContResume(
                     worker,
                     ent,
@@ -2048,18 +2015,7 @@ pub fn resumeBoundFetchChain(
                     resolveParked(worker, ent, sid, sess, 500, "bound-fetch alloc failed\n") catch {};
                     return;
                 };
-                const lh: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = st,
-                    .outcome = .ok,
-                    .activation = .fetch_chunk,
-                    .method = "POST",
-                    .path = cont_path,
-                    .host = "",
-                    .correlation_id = correlation_id orelse "",
-                };
+                const lh = worker_streaming.fireLogHeader(request_id, tc.snap.deployment_id, st, .fetch_chunk, cont_path, correlation_id);
                 const console_owned = r.console;
                 const exception_owned = r.exception;
                 r.console = &.{};
@@ -2133,18 +2089,8 @@ pub fn resumeBoundFetchChain(
                 worker.registerBoundSendEntity(send_id, ent);
             }
             if (wrote) {
-                const lh: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = 0,
-                    .outcome = .ok,
-                    .activation = .fetch_chunk,
-                    .method = "POST",
-                    .path = cont_path,
-                    .host = "",
-                    .correlation_id = correlation_id orelse "",
-                };
+                // status=0: parked-hop convention.
+                const lh = worker_streaming.fireLogHeader(request_id, tc.snap.deployment_id, 0, .fetch_chunk, cont_path, correlation_id);
                 const seq = proposeAndParkContResume(
                     worker,
                     ent,
@@ -3199,18 +3145,7 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
                     resolveParked(worker, ent, sid, sess, 500, "inbound-chunk alloc failed\n") catch {};
                     return true;
                 };
-                const lh: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = st,
-                    .outcome = .ok,
-                    .activation = .inbound_chunk,
-                    .method = "POST",
-                    .path = cont_path,
-                    .host = "",
-                    .correlation_id = correlation_id orelse "",
-                };
+                const lh = worker_streaming.fireLogHeader(request_id, tc.snap.deployment_id, st, .inbound_chunk, cont_path, correlation_id);
                 const console_owned = r.console;
                 const exception_owned = r.exception;
                 r.console = &.{};
@@ -3270,18 +3205,8 @@ fn resumeInboundChunk(worker: anytype, ent: rove.Entity, job: anytype) bool {
                 worker.registerBoundSendEntity(send_id, ent);
             }
             if (wrote) {
-                const lh: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = 0,
-                    .outcome = .ok,
-                    .activation = .inbound_chunk,
-                    .method = "POST",
-                    .path = cont_path,
-                    .host = "",
-                    .correlation_id = correlation_id orelse "",
-                };
+                // status=0: parked-hop convention.
+                const lh = worker_streaming.fireLogHeader(request_id, tc.snap.deployment_id, 0, .inbound_chunk, cont_path, correlation_id);
                 const seq = proposeAndParkContResume(
                     worker,
                     ent,

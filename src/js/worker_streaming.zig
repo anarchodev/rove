@@ -662,18 +662,7 @@ fn resumeStream(
                     errdefer allocator.free(owned);
                     try stage.chunks.append(allocator, owned);
                 }
-                const lh_term: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = @intCast(@max(@min(r.status, 599), 100)),
-                    .outcome = .ok,
-                    .activation = activation,
-                    .method = "POST",
-                    .path = chain_st.module_path,
-                    .host = "",
-                    .correlation_id = chain_ctx.correlation_id orelse "",
-                };
+                const lh_term = fireLogHeader(request_id, tc.snap.deployment_id, @intCast(@max(@min(r.status, 599), 100)), activation, chain_st.module_path, chain_ctx.correlation_id);
                 const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &pending_fetches, &readset, lh_term) catch |perr| {
                     std.log.warn("rove-js stream-resume (terminal + writes): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
@@ -767,18 +756,7 @@ fn resumeStream(
                     allocator.free(s2.chunks);
                     s2.chunks = &.{};
                 }
-                const lh_stream: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = 200,
-                    .outcome = .ok,
-                    .activation = activation,
-                    .method = "POST",
-                    .path = chain_st.module_path,
-                    .host = "",
-                    .correlation_id = chain_ctx.correlation_id orelse "",
-                };
+                const lh_stream = fireLogHeader(request_id, tc.snap.deployment_id, 200, activation, chain_st.module_path, chain_ctx.correlation_id);
                 fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &pending_fetches, &readset, lh_stream) catch |perr| {
                     std.log.warn("rove-js stream-resume (stream + writes): propose failed: {s}", .{@errorName(perr)});
                     // Helper already freed `stage.chunks` (the
@@ -1083,18 +1061,7 @@ pub fn resumeBoundFetchStream(
                     errdefer allocator.free(owned);
                     stage.chunks.append(allocator, owned) catch return;
                 }
-                const lh_term: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = @intCast(@max(@min(r.status, 599), 100)),
-                    .outcome = .ok,
-                    .activation = .fetch_chunk,
-                    .method = "POST",
-                    .path = chain_st.module_path,
-                    .host = "",
-                    .correlation_id = chain_ctx.correlation_id orelse "",
-                };
+                const lh_term = fireLogHeader(request_id, tc.snap.deployment_id, @intCast(@max(@min(r.status, 599), 100)), .fetch_chunk, chain_st.module_path, chain_ctx.correlation_id);
                 const fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &pending_fetches, &readset, lh_term) catch |perr| {
                     std.log.warn("rove-js bound-fetch stream (terminal + writes): propose failed: {s}", .{@errorName(perr)});
                     txn_owned = false;
@@ -1164,18 +1131,7 @@ pub fn resumeBoundFetchStream(
                     allocator.free(s2.chunks);
                     s2.chunks = &.{};
                 }
-                const lh_stream: log_mod.LogHeader = .{
-                    .request_id = request_id,
-                    .deployment_id = tc.snap.deployment_id,
-                    .duration_ns = 0,
-                    .status = 200,
-                    .outcome = .ok,
-                    .activation = .fetch_chunk,
-                    .method = "POST",
-                    .path = chain_st.module_path,
-                    .host = "",
-                    .correlation_id = chain_ctx.correlation_id orelse "",
-                };
+                const lh_stream = fireLogHeader(request_id, tc.snap.deployment_id, 200, .fetch_chunk, chain_st.module_path, chain_ctx.correlation_id);
                 fw_seq = proposeForgetfulWrites(worker, &ws, txn, chain_ctx.tenant_id, &stage, &pending_fetches, &readset, lh_stream) catch |perr| {
                     std.log.warn("rove-js bound-fetch stream (stream + writes): propose failed: {s}", .{@errorName(perr)});
                     s2.deinit(allocator);
