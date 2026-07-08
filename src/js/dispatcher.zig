@@ -1869,6 +1869,53 @@ test "PROBE after.cancel" {
     try testing.expectEqualStrings("ok", resp.body);
 }
 
+test "kv subscriptions: the fire activation surfaces name + source {kind:kv, prefix} (no key/op)" {
+    var buf: [64]u8 = undefined;
+    const kv = try openTempKv(testing.allocator, &buf);
+    defer {
+        kv.close();
+        cleanupTempKv(&buf);
+    }
+    var d = try Dispatcher.init(testing.allocator);
+    defer d.deinit();
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+    const bc = try ctx.compileToBytecode(
+        \\export function onSubscription() {
+        \\  const a = request.activation;
+        \\  return JSON.stringify({
+        \\    kind: a.kind, name: a.name,
+        \\    srcKind: a.source.kind, prefix: a.source.prefix,
+        \\    key: a.source.key === undefined, op: a.source.op === undefined,
+        \\  });
+        \\}
+    , "sub.mjs", testing.allocator, .{ .kind = .module });
+    defer testing.allocator.free(bc);
+
+    var txn = try kv.beginTrackedImmediate();
+    defer txn.rollback() catch {};
+    var ws = kv_mod.WriteSet.init(testing.allocator);
+    defer ws.deinit();
+    var budget = Budget.fromNow(Budget.default_duration_ns);
+    var resp = try d.run(kv, &txn, &ws, bc, null, null, null, .{
+        .method = "POST",
+        .path = "/_subscriptions/orders-react/index",
+        .fn_override = "onSubscription",
+        .activation = .{ .subscription_fire = .{
+            .name = "orders-react",
+            .source = .{ .kv = .{ .prefix = "orders/" } },
+        } },
+        .trace = .{ .request_id = 1 },
+    }, &budget);
+    defer resp.deinit(testing.allocator);
+    try testing.expectEqualStrings("", resp.exception);
+    try testing.expectEqualStrings(
+        \\{"kind":"subscription_fire","name":"orders-react","srcKind":"kv","prefix":"orders/","key":true,"op":true}
+    , resp.body);
+}
+
 test "kv subscriptions: watched-prefix writes inject ONE durable dirty marker (coalesced, atomic, recursion-guarded)" {
     var buf: [64]u8 = undefined;
     const kv = try openTempKv(testing.allocator, &buf);

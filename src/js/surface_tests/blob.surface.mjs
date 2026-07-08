@@ -30,9 +30,19 @@ export default function () {
 
   check("blob.url", () => {
     throws(() => blob.url("nope"), /hash must be 64 lowercase hex chars/);
-    // No blob backend in the in-process dispatcher — the documented
-    // fail-loud error IS the contract here.
-    throws(() => blob.url(SHA_HELLO), /blob storage backend is not configured/);
+    throws(() => blob.url(SHA_HELLO, { ttl: 0 }), /ttl must be 1\.\.604800/);
+    // The harness supplies a synthetic backend config (presign is pure
+    // SigV4 computation — no network), so the REAL signing path runs:
+    // per-tenant prefix isolation + query-mode SigV4 params.
+    const url = blob.url(SHA_HELLO, { ttl: 300, contentType: "text/plain" });
+    ok(url.startsWith("https://s3.test.example/surface-bucket/sfx/surface/app-blobs/" + SHA_HELLO),
+      "tenant-prefixed content-addressed path, got " + url);
+    for (const param of ["X-Amz-Algorithm=AWS4-HMAC-SHA256", "X-Amz-Credential=SURFACEKEY",
+                         "X-Amz-Expires=300", "X-Amz-Signature=", "X-Amz-Date="]) {
+      ok(url.includes(param), "presigned URL carries " + param);
+    }
+    // response-content-type rides the signed query (S3 echoes it).
+    ok(url.includes("text%2Fplain") || url.includes("text/plain"), "signed content-type present");
   });
 
   check("blob.write", () => {

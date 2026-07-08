@@ -138,6 +138,22 @@ const Report = struct {
     failures: [][]const u8 = &.{},
 };
 
+/// Synthetic blob backend config: presign (`blob.url`) is PURE
+/// computation given a config + instance id (no network — SigV4 over
+/// these strings), so supplying one turns blob.url from an
+/// error-contract pin into real behavioral coverage. Values are
+/// obviously fake; the tests assert URL structure + signing params.
+const blob_mod = @import("rove-blob");
+const TEST_BLOB_CFG: blob_mod.BackendConfig = .{
+    .endpoint = "s3.test.example",
+    .region = "test-1",
+    .bucket = "surface-bucket",
+    .key_prefix_base = "sfx/",
+    .access_key = "SURFACEKEY",
+    .secret_key = "surface-secret",
+    .use_tls = true,
+};
+
 /// Compile and dispatch one surface module; returns the parsed report.
 /// A module may end terminally (report = returned body) or held
 /// (report = the `next({ctx})` ctx). Anything else is a failure.
@@ -180,6 +196,7 @@ fn runSurfaceModule(
         .body = STD_BODY,
         .headers = hdrs,
         .trace = .{ .request_id = 1 },
+        .plan = .{ .instance_id = "surface", .blob_cfg = &TEST_BLOB_CFG },
     };
 
     var outcome = d.runOutcome(kv, &txn, &ws, bytecode, null, null, null, request, &budget) catch |err| {
@@ -341,6 +358,7 @@ test "surface tests: behavior + two-way inventory gate" {
             .body = STD_BODY,
             .headers = hdrs,
             .trace = .{ .request_id = 2 },
+            .plan = .{ .instance_id = "surface", .blob_cfg = &TEST_BLOB_CFG },
         }, &budget);
         defer resp.deinit(testing.allocator);
         if (resp.exception.len > 0) {
