@@ -747,6 +747,17 @@ pub fn validatePath(path: []const u8) Error!void {
     }
 }
 
+/// Test-framework artifacts (`_tests/`, which holds its own `__snapshots__/`
+/// and `__fixtures__/`) are dev-repo-only and must never be deployed. The
+/// customer CLI strips them at classify time (`cli/common.zig`); this is the
+/// server-side defensive reject the `/_system/deploy` handler applies so a
+/// direct poster can't smuggle them in (`docs/plans/sim-test-framework.md`).
+/// Inputs here are already `validatePath`'d (lowercase `[a-z0-9-_./]`, no
+/// traversal / `//`), so a root-prefix check is sufficient and unspoofable.
+pub fn isTestArtifactPath(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "_tests/");
+}
+
 // ── file/{path} value encoding ────────────────────────────────────────
 //
 // Layout:
@@ -1094,6 +1105,15 @@ test "validatePath rejects uppercase, double-slash, percent-encoded slash" {
     try validatePath("_static/index.html");
     try validatePath("_404/index.mjs");
     try validatePath("_triggers/audit.mjs");
+}
+
+test "isTestArtifactPath flags _tests/ deploy artifacts, not real files" {
+    try testing.expect(isTestArtifactPath("_tests/orders.mjs"));
+    try testing.expect(isTestArtifactPath("_tests/__snapshots__/orders.json"));
+    try testing.expect(isTestArtifactPath("_tests/__fixtures__/world.json"));
+    try testing.expect(!isTestArtifactPath("index.mjs"));
+    try testing.expect(!isTestArtifactPath("_static/app.css"));
+    try testing.expect(!isTestArtifactPath("lib/_helpers.mjs")); // not a _tests/ root
 }
 
 test "putStatic stores raw bytes + content-type, no bytecode" {

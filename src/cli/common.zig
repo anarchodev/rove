@@ -336,9 +336,10 @@ pub fn classify(a: std.mem.Allocator, bundle_path: []const u8) Bundle {
             fatal("read {s}: {s}", .{ full, @errorName(err) });
 
         // Handler test files (`_tests/`, incl. `__snapshots__/` + `__fixtures__/`)
-        // live in the dev repo only — never ship them (sim-test-framework.md T11,
-        // client half). The server-side defensive reject lands with the rest of
-        // the test framework (Phase 3).
+        // live in the dev repo only — never ship them (sim-test-framework.md).
+        // The server enforces the same rule defensively (`files.isTestArtifactPath`,
+        // rejected in the worker's `/_system/deploy`), so a direct poster can't
+        // bypass this client-side strip.
         if (std.mem.startsWith(u8, rel, "_tests/")) {
             skipped.append(a, rel) catch oom();
         } else if (std.mem.startsWith(u8, rel, "_static/") or std.mem.startsWith(u8, rel, "_config/")) {

@@ -2573,6 +2573,11 @@ pub fn Worker(comptime opts: Options) type {
             defer a.free(entries);
             for (p.entries, 0..) |it, i| {
                 files_mod.validatePath(it.path) catch return fail(router, a, &pf, 400, "invalid path");
+                // Defensive reject of test-framework artifacts (`_tests/`): the
+                // customer CLI strips them at classify time, but a direct poster
+                // must not be able to deploy them (sim-test-framework.md).
+                if (files_mod.isTestArtifactPath(it.path))
+                    return fail(router, a, &pf, 400, "test files (_tests/) must not be deployed");
                 const kind: files_mod.Kind = if (std.mem.eql(u8, it.kind, "handler"))
                     .handler
                 else if (std.mem.eql(u8, it.kind, "static"))

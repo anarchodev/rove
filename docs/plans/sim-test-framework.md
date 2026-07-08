@@ -422,10 +422,11 @@ the test.
 - **In-process scenario driver** — port `scripts/sim/scenario_driver.py` onto the
   now-multi-shot engine (no more subprocess per activation). Cheap adjacent win,
   superseded in practice by the JS runner for authored tests.
-- **Production-strip of `_tests/`** — exclude `_tests/`, `__snapshots__/`,
-  `__fixtures__/` from deploy manifests (client-side strip in the deploy path +
-  server-side reject in the worker's `/_system/deploy`). The client-side strip
-  already lives in `common.classify`.
+- ~~**Production-strip of `_tests/`**~~ — DONE. The customer CLI strips `_tests/`
+  (with its `__snapshots__/` / `__fixtures__/`) at classify time
+  (`cli/common.classify`), and the worker's `/_system/deploy` now enforces the
+  same rule defensively (`files.isTestArtifactPath` → 400), so a direct poster
+  can't smuggle test artifacts into a deployment.
 
 ## Critical files (current)
 
