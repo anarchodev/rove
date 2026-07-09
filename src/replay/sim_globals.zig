@@ -10,15 +10,20 @@
 //! the 0.3.4 sha256/hmacSha256). Streaming sha + RSA/ECDSA aren't in the
 //! portable replay engine, so those `_system.crypto` slots throw a clear error.
 //!
-//! The effect globals split two ways. `http`/`platform`/`browser` (NOT stubbed
-//! by the epilogue) are installed here real, over `_system.*` RECORDERS that
+//! The effect globals are installed here real, over `_system.*` RECORDERS that
 //! push the same `{kind:…}` shapes into a per-run global effect sink
 //! (`globalThis.__rove_effects`, which the epilogue aliases as `__effects`) — so
-//! base globals and per-request stubs share one ordered log. The rest
-//! (after/webhook/email/schedule/cron/blob/stream/next/kv) stay the epilogue's
-//! stubs — installing the REAL shims would decompose `webhook.send` into
-//! `http.fetch`+`kv`+`schedule` and shift the effect log to primitive level,
-//! which is a separate (breaking) step.
+//! base globals and per-request shims share one ordered log:
+//!   - `http`/`platform`/`browser` and the connection/continuation trio
+//!     `after`/`stream`/`next` are faithful recorders (they don't decompose),
+//!     installed unconditionally — the epilogue no longer stubs them;
+//!   - the durable-effect verbs `cron`/`schedule`/`webhook`/`email` are the REAL
+//!     shims. Under a world's `realEffects` flag the epilogue leaves them in
+//!     place, so `webhook.send`/`email.send` decompose into `http.fetch`+`kv`
+//!     (`_send/owed`) + a watchdog `schedule` (`_sched/*`); without the flag the
+//!     epilogue shadows them with high-level `{kind}` stubs.
+//! Still epilogue-local: `blob` (its recipe path needs streaming sha256, absent
+//! offline) and the `kv` recorder wrapper.
 
 // The `_system.*` primitives the globals compose over. `crypto` maps onto the
 // native replay crypto (sha256/hmac/random real; sign/verify not yet). The
@@ -33,6 +38,13 @@ const SYSTEM_SHIM =
     \\  var nat = globalThis.crypto;
     \\  var no = function(n){ return function(){ throw new Error("crypto." + n + " is not available in `rewind test` (the offline sim has SHA-256/HMAC + random only — no streaming sha, RSA or ECDSA)"); }; };
     \\  var push = function(e){ (globalThis.__rove_effects || (globalThis.__rove_effects = [])).push(e); };
+    \\  var b2s = function(c){ if (typeof c === "string") return c; var s = ""; for (var i = 0; i < c.length; i++) s += String.fromCharCode(c[i]); return s; };
+    \\  // Native continuation + rate-limit builtins the base globals bottom out on
+    \\  // (worker-native — the sim supplies faithful equivalents). `__rove_next`
+    \\  // mirrors the disposition the epilogue used to synthesize inline; the email
+    \\  // rate limiter is a no-op offline (there's no per-worker bucket to exhaust).
+    \\  globalThis.__rove_next = function(_, o){ return { __rove_disposition: "next", ctx: (o && o.ctx !== undefined) ? o.ctx : null }; };
+    \\  globalThis.__rove_check_email_rate = function(){};
     \\  // RS256 verify (RSASSA-PKCS1-v1.5 + SHA-256) in pure JS over BigInt — the
     \\  // common OIDC alg. Portable (no OpenSSL). sha384/512 + ECDSA not covered.
     \\  var __sim_verifyRsa = function(jwk, alg, data, sig){
@@ -144,6 +156,10 @@ const SYSTEM_SHIM =
     \\      write: function(){}, seal: function(){ return {}; },
     \\      receive: function(){ push({ kind: "blob", op: "receive" }); },
     \\    },
+    \\    stream: {
+    \\      start: function(){},
+    \\      write: function(c){ var t = b2s(c); push({ kind: "stream", bytes: t.length, data: t }); },
+    \\    },
     \\    platform: {
     \\      scope: function(id){ push({ kind: "platform", op: "scope", id: id }); return { kv: { get: function(k){ return globalThis.kv.get(k); }, set: function(k,v){ globalThis.kv.set(k,v); }, delete: function(k){ globalThis.kv.delete(k); }, prefix: function(p,o){ return globalThis.kv.prefix(p,o); } } }; },
     \\      root: { get: function(k){ return globalThis.kv.get(k); }, set: function(k,v){ globalThis.kv.set(k,v); }, delete: function(k){ globalThis.kv.delete(k); }, prefix: function(p,o){ return globalThis.kv.prefix(p,o); } },
@@ -178,17 +194,26 @@ pub const PRELUDE: [:0]const u8 = SYSTEM_SHIM ++
     "\n;" ++ @embedFile("g_browser") ++
     "\n;" ++ @embedFile("g_users") ++
     "\n;" ++ @embedFile("g_activitypub") ++
-    // The REAL durable-effect shims (unification prototype, gated per-run by the
-    // world's `realEffects` flag — the epilogue installs its high-level stubs
-    // over these unless the flag is set). Order mirrors the worker's
-    // GLOBALS_FILES: `cron` (fire-time helpers + the recurring verb) → `schedule`
-    // (reuses `cron.parseDuration`) → `webhook` (composes over `kv`+`schedule`+
-    // the `_system.http` fetch primitive it captures at eval — so it MUST land
-    // before the `delete globalThis._system` below). `webhook.js` isn't
-    // IIFE-wrapped (top-level `const sysHttp`), so wrap it here to keep its
-    // lexicals out of the base-snapshot's global lexical scope (the freeze
-    // corrupts on bare top-level bindings — see globals-shim-iife-required).
+    // The connection/continuation shims — `after` (wake triggers), `stream`
+    // (output frames), `next` (park disposition). Faithful recorders (they don't
+    // decompose), installed unconditionally; the epilogue no longer stubs them.
+    // All three are IIFE-wrapped upstream, so freeze-safe as embedded.
+    "\n;" ++ @embedFile("g_after") ++
+    "\n;" ++ @embedFile("g_stream") ++
+    "\n;" ++ @embedFile("g_next") ++
+    // The durable-effect shims, gated per-run by the world's `realEffects` flag
+    // (the epilogue installs high-level stubs over these unless the flag is set).
+    // Order mirrors the worker's GLOBALS_FILES: `cron` (fire-time helpers + the
+    // recurring verb) → `schedule` (reuses `cron.parseDuration`) → `webhook`
+    // (composes over `kv`+`schedule`+the `_system.http` fetch primitive it
+    // captures at eval — so it MUST land before the `delete globalThis._system`
+    // below) → `email` (layers on `webhook.send`). `webhook.js` isn't IIFE-wrapped
+    // (top-level `const sysHttp`), so wrap it here to keep its lexicals out of the
+    // base-snapshot's global lexical scope (the freeze corrupts on bare top-level
+    // bindings — see globals-shim-iife-required); `email.js` is a plain
+    // `globalThis.email = {…}` assignment, freeze-safe as-is.
     "\n;" ++ @embedFile("g_cron") ++
     "\n;" ++ @embedFile("g_schedule") ++
     "\n;(function(){\n" ++ @embedFile("g_webhook") ++ "\n})();" ++
+    "\n;" ++ @embedFile("g_email") ++
     "\n;delete globalThis._system;\n";

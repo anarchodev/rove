@@ -320,43 +320,35 @@ const EPILOGUE_BODY =
     \\    if (D.result.chunkSeq !== null) request.chunkSeq = D.result.chunkSeq;
     \\  }
     \\  // ── effect shims ──
-    \\  // The bare replay arena has no ambient effect globals, so a real handler
-    \\  // (TextDecoder / stream.* / on.* / next / webhook.send) would ReferenceError.
-    \\  // Outputs are CAPTURED (not fired) so the bundle shows what the handler did
-    \\  // and re-execution stays deterministic. stream/on/next/TextDecoder are
-    \\  // fully faithful (no side effects to reproduce); webhook/email/schedule/
-    \\  // cron/blob are recorded but do NOT re-run their durability shims (their
-    \\  // kv markers / bytes aren't reproduced — the handler's own kv writes are).
+    \\  // The connection/continuation + durable-effect globals come from the sim
+    \\  // BASE (sim_globals.zig), over `_system.*` recorders that push into the same
+    \\  // shared __effects log (globalThis.__rove_effects) as this epilogue: `after`/
+    \\  // `stream`/`next` are faithful recorders installed unconditionally there, and
+    \\  // `cron`/`schedule`/`webhook`/`email` are the REAL shims — left in place under
+    \\  // `realEffects` (so the verbs decompose to primitives), otherwise shadowed by
+    \\  // the high-level stubs below. Outputs are CAPTURED (not fired) so re-execution
+    \\  // stays deterministic. Still epilogue-local: TextDecoder/TextEncoder (no base
+    \\  // textcodec), `blob` (its recipe path needs streaming sha256, absent offline),
+    \\  // the `on.*` pre-rename alias, and the kv recorder wrapper below.
     \\  if (typeof globalThis.TextDecoder === "undefined") {
     \\    globalThis.TextDecoder = function () {};
     \\    globalThis.TextDecoder.prototype.decode = function (u) { if (u == null) return ""; try { return decodeURIComponent(escape(__b2s(u))); } catch (_) { return __b2s(u); } };
     \\    globalThis.TextEncoder = function () {};
     \\    globalThis.TextEncoder.prototype.encode = function (s) { s = String(s); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i) & 0xff; return u; };
     \\  }
-    \\  // Effect shims — each appends to the shared __effects log in call order, so
-    \\  // reads/writes/cmds/logs interleave as the handler performed them. Filter by
-    \\  // `kind` to recover a typed view.
-    \\  globalThis.stream = { start() {}, write(c) { const __t = (typeof c === "string") ? c : __b2s(c); __effects.push({ kind: "stream", bytes: __t.length, data: __t }); } };
-    \\  const __tgt = (d) => (d && (d.on || d.to)) || null;
-    \\  globalThis.after = {
-    \\    fetch(url, opts) { __effects.push({ kind: "fetch", url, method: (opts && opts.method) || "GET", body: (opts && opts.body !== undefined) ? opts.body : null, ctx: (opts && opts.ctx !== undefined) ? opts.ctx : null, on: (opts && opts.on) || null }); },
-    \\    kv(prefix, dst) { __effects.push({ kind: "kv-wake", prefix, on: __tgt(dst) }); },
-    \\    ms(ms, dst) { __effects.push({ kind: "timer", ms, on: __tgt(dst) }); },
-    \\  };
-    \\  // Pre-rename `on.*` — kept on the DRIVER only, so records from
-    \\  // pre-rename deployments still replay their pinned code.
+    \\  // Pre-rename `on.*` — kept on the DRIVER only, so records from pre-rename
+    \\  // deployments still replay their pinned code. Aliases the base `after`.
     \\  globalThis.on = { fetch: globalThis.after.fetch, kv: globalThis.after.kv, timer: globalThis.after.ms };
-    \\  globalThis.email = { send(opts) { __effects.push({ kind: "email", to: (opts && opts.to) || null }); } };
-    \\  // webhook/schedule/cron: high-level stubs UNLESS realEffects is set, in
+    \\  // webhook/schedule/cron/email: high-level stubs UNLESS realEffects is set, in
     \\  // which case the sim base's REAL shims (composing to _send/owed + _sched/*
     \\  // kv writes + http.fetch) stay installed and the effect log goes primitive.
     \\  if (!D.realEffects) {
     \\    globalThis.webhook = { send(url, opts) { __effects.push({ kind: "webhook", url, on: (opts && (opts.on || opts.on_result)) || null }); } };
     \\    globalThis.schedule = (when, target) => { __effects.push({ kind: "schedule", when, target: target || null }); };
     \\    globalThis.cron = (spec, target) => { __effects.push({ kind: "cron", spec, target: target || null }); };
+    \\    globalThis.email = { send(opts) { __effects.push({ kind: "email", to: (opts && opts.to) || null }); } };
     \\  }
     \\  globalThis.blob = { get() {}, put() {}, receive() {}, seal() {} };
-    \\  globalThis.next = (ctx) => ({ __rove_disposition: "next", ctx: ctx === undefined ? null : ctx });
     \\  // Wrap the native kv so reads/writes interleave with the cmds above in true
     \\  // occurrence order. Restored before the OUTPUT_KEY write (which stays native).
     \\  const __kvNative = globalThis.kv;

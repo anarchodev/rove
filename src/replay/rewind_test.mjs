@@ -159,6 +159,28 @@ function sentEffects(effects) {
   return out;
 }
 
+/** Emails sent by this activation. Stub mode: `{kind:"email", to}` entries.
+ *  Real mode (`realEffects`): `email.send` layers on `webhook.send`, so it's a
+ *  `_send/owed/{id}` marker pointed at the Resend API — parse its request body
+ *  back to a readable `{to, from, subject, cc, bcc}` (the Resend `to` is always
+ *  an array). Only resend-url markers are emails; other durable sends are
+ *  webhooks (read those with `toHaveSent("webhook", …)`). */
+function emailSent(effects) {
+  const out = [];
+  for (const e of effects || []) {
+    if (e.kind === "email") out.push({ to: e.to });
+    else if (e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_send/owed/")) {
+      try {
+        const m = JSON.parse(e.value);
+        if (m.url !== "https://api.resend.com/emails") continue;
+        const b = JSON.parse(m.body);
+        out.push({ to: b.to, from: b.from, subject: b.subject, cc: b.cc, bcc: b.bcc, on: m.on_result, context: m.context });
+      } catch (_) { /* skip a non-JSON marker */ }
+    }
+  }
+  return out;
+}
+
 function fmt(x) {
   try { return typeof x === "string" ? JSON.stringify(x) : JSON.stringify(x); }
   catch (_) { return String(x); }
@@ -748,11 +770,14 @@ class Matcher {
   toHaveSent(kind, subset) {
     const node = this._node("toHaveSent");
     if (!node) return false;
-    // `webhook` reads through the effect view, so a `toHaveSent("webhook", {url})`
-    // matches whether the sim ran the stub or the real shim (a _send/owed marker).
-    // Other kinds (email/blob/stream) match the raw effect entry as before.
+    // `webhook`/`email` read through effect VIEWS, so a `toHaveSent(kind, subset)`
+    // matches whether the sim ran the stub or the real shim (a _send/owed marker;
+    // email layers on webhook so it's a resend-url marker). Other kinds (blob/…)
+    // match the raw effect entry as before.
     const sent = kind === "webhook"
       ? sentEffects(node.effects)
+      : kind === "email"
+      ? emailSent(node.effects)
       : node.effects.filter((e) => e.kind === kind);
     const pass = sent.some((e) => subsetMatch(e, subset));
     return this._record(`toHaveSent ${fmt(kind)}`, pass, { subset: subset === undefined ? null : subset, sent });
