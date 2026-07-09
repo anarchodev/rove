@@ -33,6 +33,35 @@ const SYSTEM_SHIM =
     \\  var nat = globalThis.crypto;
     \\  var no = function(n){ return function(){ throw new Error("crypto." + n + " is not available in `rewind test` (the offline sim has SHA-256/HMAC + random only — no streaming sha, RSA or ECDSA)"); }; };
     \\  var push = function(e){ (globalThis.__rove_effects || (globalThis.__rove_effects = [])).push(e); };
+    \\  // RS256 verify (RSASSA-PKCS1-v1.5 + SHA-256) in pure JS over BigInt — the
+    \\  // common OIDC alg. Portable (no OpenSSL). sha384/512 + ECDSA not covered.
+    \\  var __sim_verifyRsa = function(jwk, alg, data, sig){
+    \\    try {
+    \\      if (!jwk || jwk.kty !== "RSA") return false;
+    \\      if ((alg || "sha256").toLowerCase() !== "sha256") return false;
+    \\      var b64u = globalThis.base64url;
+    \\      var toBig = function(b){ var x = 0n; for (var i = 0; i < b.length; i++) x = (x << 8n) | BigInt(b[i]); return x; };
+    \\      var n = toBig(b64u.decode(jwk.n)), e = toBig(b64u.decode(jwk.e));
+    \\      var sb = (typeof sig === "string") ? b64u.decode(sig) : sig;
+    \\      var s = toBig(sb);
+    \\      if (s >= n) return false;
+    \\      var r = 1n, base = s % n, ee = e;
+    \\      while (ee > 0n){ if (ee & 1n) r = (r * base) % n; ee >>= 1n; base = (base * base) % n; }
+    \\      var klen = 0, nn = n; while (nn > 0n){ nn >>= 8n; klen++; }
+    \\      var em = new Uint8Array(klen), mm = r;
+    \\      for (var i2 = klen - 1; i2 >= 0; i2--){ em[i2] = Number(mm & 0xffn); mm >>= 8n; }
+    \\      if (em[0] !== 0x00 || em[1] !== 0x01) return false;
+    \\      var p = 2; while (p < em.length && em[p] === 0xff) p++;
+    \\      if (em[p] !== 0x00) return false; p++;
+    \\      var PFX = [0x30,0x31,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x01,0x05,0x00,0x04,0x20];
+    \\      var hex = nat.sha256(data), hash = new Uint8Array(32);
+    \\      for (var j = 0; j < 32; j++) hash[j] = parseInt(hex.substr(j*2, 2), 16);
+    \\      if (em.length - p !== PFX.length + 32) return false;
+    \\      for (var k = 0; k < PFX.length; k++) if (em[p + k] !== PFX[k]) return false;
+    \\      for (var k2 = 0; k2 < 32; k2++) if (em[p + PFX.length + k2] !== hash[k2]) return false;
+    \\      return true;
+    \\    } catch (_) { return false; }
+    \\  };
     \\  globalThis._system = {
     \\    crypto: {
     \\      getRandomValues: function(a){ return nat.getRandomValues(a); },
@@ -41,7 +70,8 @@ const SYSTEM_SHIM =
     \\      sha256: function(d){ return nat.sha256(d); },
     \\      hmacSha256: function(k,d){ return nat.hmacSha256(k,d); },
     \\      sha256Init: no("sha256Init"), sha256Update: no("sha256Update"), sha256Final: no("sha256Final"),
-    \\      verifyRsa: no("verifyRsa"), verifyEcdsa: no("verifyEcdsa"),
+    \\      verifyRsa: function(jwk, alg, data, sig){ return __sim_verifyRsa(jwk, alg, data, sig); },
+    \\      verifyEcdsa: no("verifyEcdsa"),
     \\      ecdsaGenerateKey: no("ecdsaGenerateKey"), ecdsaSign: no("ecdsaSign"), ecdsaVerify: no("ecdsaVerify"),
     \\      oidcGenerateKey: no("oidcGenerateKey"), oidcSign: no("oidcSign"),
     \\    },

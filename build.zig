@@ -1348,6 +1348,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/authsurface", // compute globals (crypto/base64url/jwt/oidc/sessions) in the sim base
         "src/replay/testdata/middleware", // real _middlewares/before + request.session injection
         "src/replay/testdata/platformsurface", // http/platform/browser globals (effect recorders)
+        "src/replay/testdata/oidcverify", // RS256 crypto.verifyRsa + jwt.verify offline
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);
