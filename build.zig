@@ -1349,6 +1349,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/middleware", // real _middlewares/before + request.session injection
         "src/replay/testdata/platformsurface", // http/platform/browser globals (effect recorders)
         "src/replay/testdata/oidcverify", // RS256 crypto.verifyRsa + jwt.verify offline
+        "src/replay/testdata/ecdsaverify", // ES256 crypto.verifyEcdsa (P-256) + jwt.verify offline
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);

@@ -451,9 +451,11 @@ native replay crypto (getRandomValues/randomBytes/randomUUID + 0.3.4 native
 (base64url/jwt/oidc/oauth/sessions/request/users/activitypub/urlsearchparams/
 segments/retry) evaled in dep order, then hardened (`src/replay/sim_globals.zig`,
 embedded via build.zig anonymous imports — one source with the worker). Crypto is
-byte-faithful (NIST vectors through `globals/crypto.js`); streaming-sha + RSA/ECDSA
-throw a clear "not available offline" error. Effect globals stay the epilogue's
-recorders (effect log unchanged).
+byte-faithful (NIST vectors through `globals/crypto.js`); **RS256 and ES256**
+verify offline in pure JS (BigInt modexp for RSA; Jacobian-coordinate P-256 point
+math for ECDSA — one modular inverse per verify, so the bump arena survives it);
+streaming-sha + RS384/512 throw a clear "not available offline" error. Effect
+globals stay the epilogue's recorders (effect log unchanged).
 
 **Middleware runs for real.** For inbound-family activations the epilogue imports
 and runs the tenant's `_middlewares/index.mjs` `before` (async IIFE) — it mutates
@@ -465,13 +467,14 @@ too. Fixtures `testdata/{authsurface,middleware}`.
 ## What's left
 
 - **The last of the sim base surface.** Compute globals + middleware + `http` /
-  `platform` / `browser` (effect recorders) + **RS256** OIDC verify
-  (`crypto.verifyRsa`, pure-JS BigInt) are all in. Remaining: **ES256/ECDSA**
-  verify (EC point math or a crypto host-bridge) and **RS384/512** (need native
-  sha384/512); `platform.*` reads hit the one closed-world kv (no per-instance
-  store isolation) and `auth.checkRootToken` assumes root — first-pass. And the
-  clean end-state — install the REAL effect globals so `webhook.send` decomposes
-  to `http.fetch`+`kv`+`schedule` — would shift the effect log to primitive level
+  `platform` / `browser` (effect recorders) + **RS256 and ES256** OIDC verify
+  (`crypto.verifyRsa` / `crypto.verifyEcdsa`, pure-JS BigInt) are all in — the
+  common OIDC signature algs (HS256/RS256/ES256) all verify offline. Remaining:
+  **RS384/512 + ES384/512** (need native sha384/512, and P-384/521 curves for the
+  EC ones); `platform.*` reads hit the one closed-world kv (no per-instance store
+  isolation) and `auth.checkRootToken` assumes root — first-pass. And the clean
+  end-state — install the REAL effect globals so `webhook.send` decomposes to
+  `http.fetch`+`kv`+`schedule` — would shift the effect log to primitive level
   and needs the matchers/cross-checks updated; kept as stubs.
 - **A detached `wake` helper** for `schedule` / `cron` callbacks — the
   `durable_wake` analogue of `sendCallback` (author the wake world directly).

@@ -62,6 +62,59 @@ const SYSTEM_SHIM =
     \\      return true;
     \\    } catch (_) { return false; }
     \\  };
+    \\  // ES256 verify (ECDSA P-256 + SHA-256) in pure JS over BigInt. Point math
+    \\  // uses Jacobian coordinates so the whole verify costs ONE modular inverse
+    \\  // (at the end) instead of one per point op — affine would churn the bump
+    \\  // arena past any sane ceiling. Accepts JWS raw r||s (64B) or DER.
+    \\  var __sim_verifyEcdsa = function(jwk, alg, data, sig){
+    \\    try {
+    \\      if (!jwk || jwk.kty !== "EC" || jwk.crv !== "P-256") return false;
+    \\      if ((alg || "sha256").toLowerCase() !== "sha256") return false;
+    \\      var b64u = globalThis.base64url;
+    \\      var toBig = function(b){ var x = 0n; for (var i = 0; i < b.length; i++) x = (x << 8n) | BigInt(b[i]); return x; };
+    \\      var p = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn;
+    \\      var acurve = p - 3n;
+    \\      var n = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n;
+    \\      var Gx = 0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296n;
+    \\      var Gy = 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5n;
+    \\      var mod = function(x, m){ x %= m; return x < 0n ? x + m : x; };
+    \\      var inv = function(x, m){ var r = 1n, b = mod(x, m), e = m - 2n; while (e > 0n){ if (e & 1n) r = (r * b) % m; e >>= 1n; b = (b * b) % m; } return r; };
+    \\      // Jacobian point [X, Y, Z]; Z === 0n is the point at infinity.
+    \\      var jdbl = function(P){
+    \\        if (P[2] === 0n || P[1] === 0n) return [0n, 0n, 0n];
+    \\        var YY = (P[1] * P[1]) % p; var S = mod(4n * P[0] * YY, p); var ZZ = (P[2] * P[2]) % p;
+    \\        var M = mod(3n * P[0] * P[0] + acurve * ZZ % p * ZZ, p);
+    \\        var X3 = mod(M * M - 2n * S, p);
+    \\        return [X3, mod(M * (S - X3) - 8n * YY % p * YY, p), mod(2n * P[1] * P[2], p)];
+    \\      };
+    \\      var jadd = function(P, Q){
+    \\        if (P[2] === 0n) return Q; if (Q[2] === 0n) return P;
+    \\        var Z1Z1 = (P[2] * P[2]) % p, Z2Z2 = (Q[2] * Q[2]) % p;
+    \\        var U1 = mod(P[0] * Z2Z2, p), U2 = mod(Q[0] * Z1Z1, p);
+    \\        var S1 = mod(P[1] * Q[2] % p * Z2Z2, p), S2 = mod(Q[1] * P[2] % p * Z1Z1, p);
+    \\        if (U1 === U2){ if (S1 !== S2) return [0n, 0n, 0n]; return jdbl(P); }
+    \\        var H = mod(U2 - U1, p); var I = mod(2n * H % p * (2n * H), p); var J = mod(H * I, p);
+    \\        var rr = mod(2n * (S2 - S1), p); var V = mod(U1 * I, p);
+    \\        var X3 = mod(rr * rr - J - 2n * V, p);
+    \\        var ZS = mod(P[2] + Q[2], p);
+    \\        return [X3, mod(rr * (V - X3) - 2n * S1 % p * J, p), mod((ZS * ZS % p - Z1Z1 - Z2Z2) * H, p)];
+    \\      };
+    \\      var jmul = function(k, P){ var R = [0n, 0n, 0n]; k = mod(k, n); while (k > 0n){ if (k & 1n) R = jadd(R, P); P = jdbl(P); k >>= 1n; } return R; };
+    \\      var Q = [toBig(b64u.decode(jwk.x)), toBig(b64u.decode(jwk.y)), 1n];
+    \\      var sb = (typeof sig === "string") ? b64u.decode(sig) : sig;
+    \\      var r, s;
+    \\      if (sb.length === 64){ r = toBig(sb.slice(0, 32)); s = toBig(sb.slice(32, 64)); }
+    \\      else if (sb[0] === 0x30){ var i = 2; if (sb[1] & 0x80) i = 2 + (sb[1] & 0x7f); var rl = sb[i + 1]; r = toBig(sb.slice(i + 2, i + 2 + rl)); i = i + 2 + rl; var sl = sb[i + 1]; s = toBig(sb.slice(i + 2, i + 2 + sl)); }
+    \\      else return false;
+    \\      if (r <= 0n || r >= n || s <= 0n || s >= n) return false;
+    \\      var e = BigInt("0x" + nat.sha256(data));
+    \\      var w = inv(s, n);
+    \\      var R = jadd(jmul(mod(e * w, n), [Gx, Gy, 1n]), jmul(mod(r * w, n), Q));
+    \\      if (R[2] === 0n) return false;
+    \\      var zi = inv(R[2], p);
+    \\      return mod(mod(R[0] * zi % p * zi, p), n) === r;
+    \\    } catch (_) { return false; }
+    \\  };
     \\  globalThis._system = {
     \\    crypto: {
     \\      getRandomValues: function(a){ return nat.getRandomValues(a); },
@@ -71,7 +124,7 @@ const SYSTEM_SHIM =
     \\      hmacSha256: function(k,d){ return nat.hmacSha256(k,d); },
     \\      sha256Init: no("sha256Init"), sha256Update: no("sha256Update"), sha256Final: no("sha256Final"),
     \\      verifyRsa: function(jwk, alg, data, sig){ return __sim_verifyRsa(jwk, alg, data, sig); },
-    \\      verifyEcdsa: no("verifyEcdsa"),
+    \\      verifyEcdsa: function(jwk, alg, data, sig){ return __sim_verifyEcdsa(jwk, alg, data, sig); },
     \\      ecdsaGenerateKey: no("ecdsaGenerateKey"), ecdsaSign: no("ecdsaSign"), ecdsaVerify: no("ecdsaVerify"),
     \\      oidcGenerateKey: no("oidcGenerateKey"), oidcSign: no("oidcSign"),
     \\    },
