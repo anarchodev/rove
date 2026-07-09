@@ -440,8 +440,39 @@ now cross-checked against a real handler; only `on_fetch` surfaced a gap
 offline test and the through-the-stack smoke share ONE source. `ws_ordering` is
 NOT cross-checkable — it tests commit-ordering machinery (raft), not logic.
 
+### The handler surface in the sim base (2026-07-09)
+
+The sim reactor's base was thin (only the replay bindings + the epilogue's
+effect stubs), so auth/platform handlers ReferenceError'd offline. Now the base
+installs the **compute** handler globals for real (arenajs 0.3.4's deferred-freeze
+`arena_reactor_new_open`/`eval_base`/`freeze`): a `_system.crypto` shim over the
+native replay crypto (getRandomValues/randomBytes/randomUUID + 0.3.4 native
+`sha256`/`hmacSha256`) + the pure `globals/*.js`
+(base64url/jwt/oidc/oauth/sessions/request/users/activitypub/urlsearchparams/
+segments/retry) evaled in dep order, then hardened (`src/replay/sim_globals.zig`,
+embedded via build.zig anonymous imports — one source with the worker). Crypto is
+byte-faithful (NIST vectors through `globals/crypto.js`); streaming-sha + RSA/ECDSA
+throw a clear "not available offline" error. Effect globals stay the epilogue's
+recorders (effect log unchanged).
+
+**Middleware runs for real.** For inbound-family activations the epilogue imports
+and runs the tenant's `_middlewares/index.mjs` `before` (async IIFE) — it mutates
+`request` (e.g. `request.auth`) or short-circuits with a response, exactly like
+prod. Not hardcoded. `request.session` is injected (`scenario.inbound({session})`
+— worker-resolved from a cookie in prod, no code to run). Async handlers now work
+too. Fixtures `testdata/{authsurface,middleware}`.
+
 ## What's left
 
+- **The rest of the sim base surface.** Compute globals + middleware are in;
+  still missing: `platform.*` (admin's instance/deploy management — needs a
+  `_system.platform` recorder), the public `http` global (`http.send`/`subscribe`
+  over `_system.http`), and `browser.*`. And native **ECDSA/RSA** for OIDC RS256/
+  ES256 verify (`std.crypto` has ecdsa but not RSA; a crypto host-bridge or a
+  portable impl). The clean end-state — install the REAL effect globals over
+  `_system` recorders so `webhook.send` decomposes to its primitives — would
+  shift the effect log to primitive-level and needs the matchers/cross-checks
+  updated; kept as stubs for now.
 - **A detached `wake` helper** for `schedule` / `cron` callbacks — the
   `durable_wake` analogue of `sendCallback` (author the wake world directly).
   Deferred only because its exact `request.*` surface wasn't re-confirmed this
