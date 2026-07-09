@@ -227,7 +227,7 @@ pub fn build(b: *std.Build) void {
     // them registered (replay_mod, driver_smoke_mod).
     const addSimGlobalEmbeds = struct {
         fn f(bb: *std.Build, mod: *std.Build.Module) void {
-            const names = [_][]const u8{ "crypto", "http", "request", "base64", "urlsearchparams", "jwt", "oauth", "oidc", "sessions", "platform", "retry", "segments", "browser", "users", "activitypub", "cron", "schedule", "webhook", "email", "after", "stream", "next" };
+            const names = [_][]const u8{ "crypto", "http", "request", "base64", "urlsearchparams", "jwt", "oauth", "oidc", "sessions", "platform", "retry", "segments", "browser", "users", "activitypub", "cron", "schedule", "webhook", "email", "after", "stream", "next", "blob" };
             inline for (names) |nm| {
                 mod.addAnonymousImport("g_" ++ nm, .{ .root_source_file = bb.path("src/js/globals/" ++ nm ++ ".js") });
             }
@@ -1352,6 +1352,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/ecdsaverify", // ES256 crypto.verifyEcdsa (P-256) + jwt.verify offline
         "src/replay/testdata/effects", // real webhook/schedule shims → primitive effect log
         "src/replay/testdata/email", // email.send → webhook _send/owed marker (Resend)
+        "src/replay/testdata/blobrecipe", // blob put/write/seal/url — streaming sha256 offline
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);

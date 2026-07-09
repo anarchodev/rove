@@ -7,8 +7,10 @@
 //! These `globals/*.js` are PURE (no effects) — the only primitive they bottom
 //! out on is `_system.crypto`, which we map onto the native `crypto.*` the
 //! `arenajs-replay` bindings install (getRandomValues/randomBytes/randomUUID +
-//! the 0.3.4 sha256/hmacSha256). Streaming sha + RSA/ECDSA aren't in the
-//! portable replay engine, so those `_system.crypto` slots throw a clear error.
+//! the 0.3.4 sha256/hmacSha256). Streaming sha256 (`sha256Init/Update/Final`,
+//! for `blob`'s recipe midstate) + RSA/ECDSA verify aren't in the portable
+//! replay engine, so they're supplied here in pure JS; sign / sha384/512 slots
+//! still throw a clear error.
 //!
 //! The effect globals are installed here real, over `_system.*` RECORDERS that
 //! push the same `{kind:…}` shapes into a per-run global effect sink
@@ -20,12 +22,15 @@
 //!   - the durable-effect verbs `cron`/`schedule`/`webhook`/`email` are the REAL
 //!     shims, so `webhook.send`/`email.send` decompose into `http.fetch`+`kv`
 //!     (`_send/owed`) + a watchdog `schedule` (`_sched/*`), and `schedule`/`cron`
-//!     into `_sched/*` kv rows — the primitives that actually replicate.
-//! Still epilogue-local: `blob` (its recipe path needs streaming sha256, absent
-//! offline) and the `kv` recorder wrapper.
+//!     into `_sched/*` kv rows — the primitives that actually replicate;
+//!   - `blob` is the real shim too, over the `_system.blob` recorder + the pure-JS
+//!     streaming sha256 above (recipe rows + owed markers land in `kv`, the
+//!     PUT/compose as `http.fetch`).
+//! Still epilogue-local: the `kv` recorder wrapper.
 
 // The `_system.*` primitives the globals compose over. `crypto` maps onto the
-// native replay crypto (sha256/hmac/random real; sign/verify not yet). The
+// native replay crypto (sha256/hmac/random real; streaming-sha + RSA/ECDSA
+// verify pure-JS above; sign not yet). The
 // effect primitives (`http`/`after`/`blob`/`platform`) are RECORDERS: they push
 // the same `{kind:…}` shapes the epilogue's stubs do, into the per-run global
 // sink `__rove_effects` (base globals can't reach the epilogue's local array),
@@ -44,6 +49,39 @@ const SYSTEM_SHIM =
     \\  // rate limiter is a no-op offline (there's no per-worker bucket to exhaust).
     \\  globalThis.__rove_next = function(_, o){ return { __rove_disposition: "next", ctx: (o && o.ctx !== undefined) ? o.ctx : null }; };
     \\  globalThis.__rove_check_email_rate = function(){};
+    \\  // Streaming SHA-256 in pure JS (the portable replay engine has one-shot
+    \\  // `nat.sha256` only). Same posture as the RSA/ECDSA verify above; drives
+    \\  // `crypto.sha256Init/Update/Final` so `blob.write`/`blob.seal` (recipe
+    \\  // midstate) work offline. Final(Update*(Init())) === nat.sha256(concat) —
+    \\  // string chunks UTF-8-encoded to match nat.sha256's string handling. The
+    \\  // midstate token ("js2:" H32hex : totalLen : bufHex) is sim-internal
+    \\  // (never crosses to native) — its own format, not the worker's `s2:`.
+    \\  var K256 = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+    \\  var H256_0 = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+    \\  var rotr = function(x, n){ return ((x >>> n) | (x << (32 - n))) >>> 0; };
+    \\  var shaCompress = function(H, blk){
+    \\    var w = new Array(64), i;
+    \\    for (i = 0; i < 16; i++) w[i] = ((blk[i*4] << 24) | (blk[i*4+1] << 16) | (blk[i*4+2] << 8) | blk[i*4+3]) >>> 0;
+    \\    for (i = 16; i < 64; i++) { var s0 = rotr(w[i-15],7) ^ rotr(w[i-15],18) ^ (w[i-15] >>> 3); var s1 = rotr(w[i-2],17) ^ rotr(w[i-2],19) ^ (w[i-2] >>> 10); w[i] = (((w[i-16] + s0) >>> 0) + ((w[i-7] + s1) >>> 0)) >>> 0; }
+    \\    var a=H[0],b=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];
+    \\    for (i = 0; i < 64; i++) {
+    \\      var S1 = rotr(e,6) ^ rotr(e,11) ^ rotr(e,25); var ch = (e & f) ^ ((~e) & g);
+    \\      var t1 = (((h + S1) >>> 0) + ((ch + ((K256[i] + w[i]) >>> 0)) >>> 0)) >>> 0;
+    \\      var S0 = rotr(a,2) ^ rotr(a,13) ^ rotr(a,22); var maj = (a & b) ^ (a & c) ^ (b & c);
+    \\      var t2 = (S0 + maj) >>> 0;
+    \\      h=g; g=f; f=e; e=(d + t1) >>> 0; d=c; c=b; b=a; a=(t1 + t2) >>> 0;
+    \\    }
+    \\    H[0]=(H[0]+a)>>>0; H[1]=(H[1]+b)>>>0; H[2]=(H[2]+c)>>>0; H[3]=(H[3]+d)>>>0; H[4]=(H[4]+e)>>>0; H[5]=(H[5]+f)>>>0; H[6]=(H[6]+g)>>>0; H[7]=(H[7]+h)>>>0;
+    \\  };
+    \\  var shaStrU8 = function(s){ var out = [], i, cp; for (i = 0; i < s.length; i++) { cp = s.charCodeAt(i); if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < s.length) { var lo = s.charCodeAt(i+1); if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); i++; } } if (cp < 0x80) out.push(cp); else if (cp < 0x800) out.push(0xC0 | (cp >> 6), 0x80 | (cp & 0x3F)); else if (cp < 0x10000) out.push(0xE0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F)); else out.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F)); } return out; };
+    \\  var shaBytes = function(d){ if (typeof d === "string") return shaStrU8(d); var out = [], i; for (i = 0; i < d.length; i++) out.push(d[i] & 0xff); return out; };
+    \\  var hx8 = function(x){ return ("00000000" + (x >>> 0).toString(16)).slice(-8); };
+    \\  var hx2 = function(x){ return ("0" + (x & 0xff).toString(16)).slice(-2); };
+    \\  var shaSer = function(st){ var i, hs = ""; for (i = 0; i < 8; i++) hs += hx8(st.h[i]); var bh = ""; for (i = 0; i < st.buf.length; i++) bh += hx2(st.buf[i]); return "js2:" + hs + ":" + st.len + ":" + bh; };
+    \\  var shaParse = function(tok){ if (typeof tok !== "string" || tok.indexOf("js2:") !== 0) throw new Error("crypto.sha256: invalid midstate token"); var p = tok.slice(4).split(":"); var hs = p[0], len = Number(p[1]), bh = p[2] || ""; var h = [], i; for (i = 0; i < 8; i++) h.push(parseInt(hs.substr(i*8, 8), 16) >>> 0); var buf = []; for (i = 0; i < bh.length; i += 2) buf.push(parseInt(bh.substr(i, 2), 16)); return { h: h, len: len, buf: buf }; };
+    \\  var shaInit = function(){ return shaSer({ h: H256_0.slice(), len: 0, buf: [] }); };
+    \\  var shaUpdate = function(tok, data){ var st = shaParse(tok); var bytes = shaBytes(data); var buf = st.buf.concat(bytes); var i = 0; while (buf.length - i >= 64) { shaCompress(st.h, buf.slice(i, i + 64)); i += 64; } st.buf = buf.slice(i); st.len += bytes.length; return shaSer(st); };
+    \\  var shaFinal = function(tok){ var st = shaParse(tok); var buf = st.buf.slice(); buf.push(0x80); while (buf.length % 64 !== 56) buf.push(0x00); var bitHi = Math.floor(st.len / 0x20000000), bitLo = (st.len * 8) >>> 0; buf.push((bitHi >>> 24) & 0xff, (bitHi >>> 16) & 0xff, (bitHi >>> 8) & 0xff, bitHi & 0xff, (bitLo >>> 24) & 0xff, (bitLo >>> 16) & 0xff, (bitLo >>> 8) & 0xff, bitLo & 0xff); for (var i = 0; i < buf.length; i += 64) shaCompress(st.h, buf.slice(i, i + 64)); var out = ""; for (i = 0; i < 8; i++) out += hx8(st.h[i]); return out; };
     \\  // RS256 verify (RSASSA-PKCS1-v1.5 + SHA-256) in pure JS over BigInt — the
     \\  // common OIDC alg. Portable (no OpenSSL). sha384/512 + ECDSA not covered.
     \\  var __sim_verifyRsa = function(jwk, alg, data, sig){
@@ -133,7 +171,9 @@ const SYSTEM_SHIM =
     \\      randomUUID: function(){ return nat.randomUUID(); },
     \\      sha256: function(d){ return nat.sha256(d); },
     \\      hmacSha256: function(k,d){ return nat.hmacSha256(k,d); },
-    \\      sha256Init: no("sha256Init"), sha256Update: no("sha256Update"), sha256Final: no("sha256Final"),
+    \\      sha256Init: function(){ return shaInit(); },
+    \\      sha256Update: function(t,d){ return shaUpdate(t,d); },
+    \\      sha256Final: function(t){ return shaFinal(t); },
     \\      verifyRsa: function(jwk, alg, data, sig){ return __sim_verifyRsa(jwk, alg, data, sig); },
     \\      verifyEcdsa: function(jwk, alg, data, sig){ return __sim_verifyEcdsa(jwk, alg, data, sig); },
     \\      ecdsaGenerateKey: no("ecdsaGenerateKey"), ecdsaSign: no("ecdsaSign"), ecdsaVerify: no("ecdsaVerify"),
@@ -151,9 +191,9 @@ const SYSTEM_SHIM =
     \\      timer: function(ms, tgt){ push({ kind: "timer", ms: ms, on: (tgt && tgt.to) || null }); },
     \\    },
     \\    blob: {
-    \\      presign: function(){ return "https://sim.invalid/presign"; },
+    \\      presign: function(hash, ttl, ct){ return "https://sim.invalid/blob/" + hash + (ttl != null ? "?ttl=" + ttl : ""); },
     \\      write: function(){}, seal: function(){ return {}; },
-    \\      receive: function(){ push({ kind: "blob", op: "receive" }); },
+    \\      receive: function(on){ push({ kind: "blob", op: "receive", on: on || null }); },
     \\    },
     \\    stream: {
     \\      start: function(){},
@@ -216,4 +256,10 @@ pub const PRELUDE: [:0]const u8 = SYSTEM_SHIM ++
     "\n;" ++ @embedFile("g_schedule") ++
     "\n;(function(){\n" ++ @embedFile("g_webhook") ++ "\n})();" ++
     "\n;" ++ @embedFile("g_email") ++
+    // `blob` — real shim over the `_system.blob` recorder + `_system.http` (PUT /
+    // compose) + the pure-JS streaming sha256; `blob.get` composes on the base
+    // `after.fetch`, so it lands after `g_after`. Its recipe rows / owed markers
+    // are ordinary kv writes. IIFE-wrapped upstream (`(() => { … })()`), so it
+    // captures `_system` before the delete below and stays freeze-safe.
+    "\n;" ++ @embedFile("g_blob") ++
     "\n;delete globalThis._system;\n";

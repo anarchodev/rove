@@ -473,6 +473,13 @@ too. Fixtures `testdata/{authsurface,middleware}`.
   **RS384/512 + ES384/512** (need native sha384/512, and P-384/521 curves for the
   EC ones); `platform.*` reads hit the one closed-world kv (no per-instance store
   isolation) and `auth.checkRootToken` assumes root — first-pass.
+- **Request-body UTF-8 gap (found while wiring `blob`).** The sim reconstructs an
+  inline request body as a *latin1 byte* string (`D.body.charCodeAt(i) & 0xff` in
+  `epilogue.zig`), so a JSON body containing multibyte UTF-8 (e.g. `"✓"` → byte
+  `0x13`) corrupts `request.text` and `request.json` throws "Bad control
+  character". ASCII bodies are unaffected. Fix is in the harness body-encoding /
+  epilogue reconstruction path (encode the body to UTF-8 bytes, or carry it
+  base64 like the binary-chunk path already does), not in any effect global.
 - ~~**The clean effect-global unification.**~~ — DONE (except `blob`). The sim
   base now installs the REAL effect globals unconditionally — there is no
   `realEffects` flag and the epilogue no longer stubs these verbs. `webhook.send`
@@ -491,11 +498,16 @@ too. Fixtures `testdata/{authsurface,middleware}`.
   making it real are now baked into the fixtures, not pending churn: bare
   `toHaveScheduled()` sees a `webhook.send`/`email.send` watchdog schedule, and
   `email.send` requires `apiKey`/`from` (the real shim's contract).
-  **Still stubbed / blocked:** `blob` stays the epilogue no-op — its recipe path
-  (`blob.write`/`blob.seal`) needs streaming sha256 (`crypto.sha256Init/Update/
-  Final`), which the portable replay crypto explicitly `no()`s; `blob.put`/`get`/
-  `url` would move but a half-migrated verb is worse than none. Migrating it
-  needs streaming SHA-256 in the replay engine first.
+  `blob` is now real too: the recipe path (`blob.write`/`blob.seal`) needs
+  streaming sha256 (`crypto.sha256Init/Update/Final`), which is supplied as a
+  pure-JS streaming SHA-256 in the sim base (same posture as the RSA/ECDSA
+  verify); `blob.put`/`get`/`url` compose over the `_system.blob`/`http`
+  recorders + the base `after.fetch`. Fixture `testdata/blobrecipe/` proves the
+  streamed recipe hash equals one-shot `crypto.sha256` over the concatenation
+  across block boundaries + UTF-8, and that the durable markers (`_blob/owed`,
+  `_blob/recipe/*`) + PUT/compose fetches land in the log. Only `kv` stays an
+  epilogue wrapper now (it must wrap the native per-run + restore before the
+  sentinel write).
 - ~~**A detached `wake` helper** for `schedule` / `cron` callbacks~~ — DONE.
   `scenario().wake({ on, ctx, key?, id?, scheduledAtNs?, method? })` authors a
   `durable_wake` world directly — the analogue of `sendCallback` for the durable

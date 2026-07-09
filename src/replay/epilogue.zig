@@ -319,9 +319,8 @@ const EPILOGUE_BODY =
     \\  // `email` are the REAL shims, so those verbs decompose to primitives
     \\  // (`_send/owed` + `_sched/*` kv writes + `http.fetch`) in the effect log.
     \\  // Outputs are CAPTURED (not fired) so re-execution stays deterministic. Still
-    \\  // epilogue-local: TextDecoder/TextEncoder (no base textcodec), `blob` (its
-    \\  // recipe path needs streaming sha256, absent offline), the `on.*` pre-rename
-    \\  // alias, and the kv recorder wrapper below.
+    \\  // epilogue-local: TextDecoder/TextEncoder (no base textcodec), the `on.*`
+    \\  // pre-rename alias, and the kv recorder wrapper below.
     \\  if (typeof globalThis.TextDecoder === "undefined") {
     \\    globalThis.TextDecoder = function () {};
     \\    globalThis.TextDecoder.prototype.decode = function (u) { if (u == null) return ""; try { return decodeURIComponent(escape(__b2s(u))); } catch (_) { return __b2s(u); } };
@@ -331,7 +330,6 @@ const EPILOGUE_BODY =
     \\  // Pre-rename `on.*` — kept on the DRIVER only, so records from pre-rename
     \\  // deployments still replay their pinned code. Aliases the base `after`.
     \\  globalThis.on = { fetch: globalThis.after.fetch, kv: globalThis.after.kv, timer: globalThis.after.ms };
-    \\  globalThis.blob = { get() {}, put() {}, receive() {}, seal() {} };
     \\  // Wrap the native kv so reads/writes interleave with the cmds above in true
     \\  // occurrence order. Restored before the OUTPUT_KEY write (which stays native).
     \\  const __kvNative = globalThis.kv;
