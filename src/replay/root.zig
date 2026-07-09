@@ -55,7 +55,14 @@ pub const TestFileResult = harness.FileResult;
 // and consume the instance surface (converge to one path, no coexistence).
 pub const ArenaReactor = opaque {};
 extern fn arena_reactor_new(base_kb: c_int, request_kb: c_int) ?*ArenaReactor;
+// arenajs 0.3.4 deferred-freeze construction — lets us install the compute
+// globals (`sim_globals.PRELUDE`) into the base before it freezes.
+extern fn arena_reactor_new_open(base_kb: c_int, request_kb: c_int) ?*ArenaReactor;
+extern fn arena_reactor_eval_base(r: *ArenaReactor, src: [*c]const u8) c_int;
+extern fn arena_reactor_freeze(r: *ArenaReactor) void;
 extern fn arena_run_module_r(r: *ArenaReactor, entry_name: [*c]const u8, entry_src: [*c]const u8) c_int;
+
+const sim_globals = @import("sim_globals.zig");
 extern fn arena_set_trace_mode_r(r: *ArenaReactor, mode: c_int) void;
 extern fn arena_set_date_now_r(r: *ArenaReactor, ms: i64) void;
 extern fn arena_set_random_seed_r(r: *ArenaReactor, seed: u64) void;
@@ -80,7 +87,12 @@ pub const Engine = struct {
     sim: *ArenaReactor,
 
     pub fn init() Error!Engine {
-        const s = arena_reactor_new(8192, 8192) orelse return Error.ArenaInit;
+        // Build the base unfrozen, eval the compute-globals prelude into it, then
+        // seal — so every handler run gets crypto/base64url/jwt/oidc/sessions/…
+        // from a shared frozen base (one install, not per-request).
+        const s = arena_reactor_new_open(8192, 8192) orelse return Error.ArenaInit;
+        if (arena_reactor_eval_base(s, sim_globals.PRELUDE.ptr) != 0) return Error.ArenaInit;
+        arena_reactor_freeze(s);
         return .{ .sim = s };
     }
 

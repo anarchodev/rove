@@ -221,6 +221,19 @@ pub fn build(b: *std.Build) void {
         }
     }.f;
 
+    // The sim base prelude (`src/replay/sim_globals.zig`) embeds the compute
+    // `globals/*.js` — which live outside the replay module's package — via
+    // anonymous imports. Every module that compiles `src/replay/root.zig` needs
+    // them registered (replay_mod, driver_smoke_mod).
+    const addSimGlobalEmbeds = struct {
+        fn f(bb: *std.Build, mod: *std.Build.Module) void {
+            const names = [_][]const u8{ "crypto", "request", "base64", "urlsearchparams", "jwt", "oauth", "oidc", "sessions", "retry", "segments", "users", "activitypub" };
+            inline for (names) |nm| {
+                mod.addAnonymousImport("g_" ++ nm, .{ .root_source_file = bb.path("src/js/globals/" ++ nm ++ ".js") });
+            }
+        }
+    }.f;
+
     // replay-spike: de-risk the native link + console/result extraction (§2a).
     const spike_mod = b.createModule(.{
         .root_source_file = b.path("src/replay/spike.zig"),
@@ -1257,6 +1270,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     linkReplayEngine(replay_mod, arenajs_dep);
+    addSimGlobalEmbeds(b, replay_mod);
 
     const replay_tests = b.addTest(.{ .root_module = replay_mod });
     const replay_test_step = b.step("replay-test", "Run the native replay driver unit tests");
@@ -1271,6 +1285,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     linkReplayEngine(driver_smoke_mod, arenajs_dep);
+    addSimGlobalEmbeds(b, driver_smoke_mod);
     const driver_smoke_exe = b.addExecutable(.{ .name = "replay-driver-smoke", .root_module = driver_smoke_mod });
     const driver_smoke_step = b.step("replay-driver-smoke", "Native replay driver end-to-end smoke (Phase 2 §2c)");
     driver_smoke_step.dependOn(&b.addRunArtifact(driver_smoke_exe).step);
@@ -1330,6 +1345,7 @@ pub fn build(b: *std.Build) void {
         "examples/loop46-demo-tenants/wsworker", // ↔ ws_worker_smoke_v2
         "examples/loop46-demo-tenants/wsfetch", // ↔ ws_fetch_smoke_v2 (WS+fetch)
         "examples/loop46-demo-tenants/wswake", // ↔ ws_wake_smoke_v2 (WS+wake)
+        "src/replay/testdata/authsurface", // compute globals (crypto/base64url/jwt/oidc/sessions) in the sim base
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);
