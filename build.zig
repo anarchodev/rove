@@ -227,7 +227,7 @@ pub fn build(b: *std.Build) void {
     // them registered (replay_mod, driver_smoke_mod).
     const addSimGlobalEmbeds = struct {
         fn f(bb: *std.Build, mod: *std.Build.Module) void {
-            const names = [_][]const u8{ "crypto", "request", "base64", "urlsearchparams", "jwt", "oauth", "oidc", "sessions", "retry", "segments", "users", "activitypub" };
+            const names = [_][]const u8{ "crypto", "http", "request", "base64", "urlsearchparams", "jwt", "oauth", "oidc", "sessions", "platform", "retry", "segments", "browser", "users", "activitypub" };
             inline for (names) |nm| {
                 mod.addAnonymousImport("g_" ++ nm, .{ .root_source_file = bb.path("src/js/globals/" ++ nm ++ ".js") });
             }
@@ -1347,6 +1347,7 @@ pub fn build(b: *std.Build) void {
         "examples/loop46-demo-tenants/wswake", // ↔ ws_wake_smoke_v2 (WS+wake)
         "src/replay/testdata/authsurface", // compute globals (crypto/base64url/jwt/oidc/sessions) in the sim base
         "src/replay/testdata/middleware", // real _middlewares/before + request.session injection
+        "src/replay/testdata/platformsurface", // http/platform/browser globals (effect recorders)
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);

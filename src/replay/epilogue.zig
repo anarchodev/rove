@@ -224,7 +224,10 @@ const EPILOGUE_BODY =
     \\  // One ordered effect log for the whole activation (reads/writes/cmds — see
     \\  // the shims below). console.* lands here too, as {kind:"log"}, so the
     \\  // developer's own log lines stay INTERLEAVED with the effects they annotate.
-    \\  const __effects = [];
+    \\  // The effect sink is a per-run global array so BASE-installed globals
+    \\  // (the sim_globals `_system.*` recorders) push to the SAME ordered log
+    \\  // as these per-request shims. `__effects` is a local alias to it.
+    \\  const __effects = (globalThis.__rove_effects = []);
     \\  const __mklog = (level) => (...a) => { __effects.push({ kind: "log", level, message: a.map((x) => { try { return typeof x === "string" ? x : JSON.stringify(x); } catch (_) { return String(x); } }).join(" ") }); };
     \\  globalThis.console = { log: __mklog("info"), warn: __mklog("warn"), error: __mklog("error"), info: __mklog("info"), debug: __mklog("debug") };
     \\  const __b2s = (c) => { if (typeof c === "string") return c; let s = ""; for (let i = 0; i < c.length; i++) s += String.fromCharCode(c[i]); return s; };
