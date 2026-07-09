@@ -238,6 +238,7 @@ pub const Engine = struct {
             .activation_json = wv.activation_json,
             .session_json = wv.session_json,
             .run_middleware = run_middleware,
+            .real_effects = wv.real_effects,
             .result = result,
         });
         const full_src = try std.mem.concatWithSentinel(a, u8, &.{ entry_src, epi }, 0);

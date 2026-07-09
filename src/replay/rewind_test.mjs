@@ -111,6 +111,54 @@ function foldKv(base, effects) {
   return kvOut;
 }
 
+// ── effect views: read a verb's effects whether the sim ran the high-level
+// STUB (one {kind:"schedule"|"webhook"} entry) or the REAL shim (primitives —
+// _sched/*/_send/owed/* kv writes + http.fetch). Keeping these two shapes behind
+// one view is what lets a test read identically in either mode (realEffects). ──
+
+/** Schedules armed by this activation, each as `{ target, kind, key?, msg? }`.
+ *  Stub mode: the high-level `schedule`/`cron` (+ the still-stubbed `timer`/
+ *  `kv-wake`) entries. Real mode: `_sched/by_id/{id}` writes — and since
+ *  `cron(spec, t)` composes as `schedule(_, "__system/cron_tick", {spec,
+ *  target:t})`, the customer target is unwrapped from `msg.target`. */
+function scheduledEffects(effects) {
+  const out = [];
+  for (const e of effects || []) {
+    if (e.kind === "schedule") out.push({ target: e.target, kind: "schedule" });
+    else if (e.kind === "cron") out.push({ target: e.target, kind: "cron" });
+    else if (e.kind === "timer") out.push({ target: e.on, kind: "timer" });
+    else if (e.kind === "kv-wake") out.push({ target: e.on, kind: "kv-wake" });
+    else if (e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_sched/by_id/")) {
+      try {
+        const r = JSON.parse(e.value);
+        // Unwrap the cron indirection so `toHaveScheduled(customerTarget)` still
+        // matches; a plain schedule keeps its own target.
+        if (r.target === "__system/cron_tick" && r.msg && r.msg.target)
+          out.push({ target: r.msg.target, kind: "cron", key: r.key, msg: r.msg });
+        else
+          out.push({ target: r.target, kind: "schedule", key: r.key, msg: r.msg });
+      } catch (_) { /* skip a non-JSON _sched row */ }
+    }
+  }
+  return out;
+}
+
+/** Durable sends (`webhook.send`, and `email.send` which layers on it) armed by
+ *  this activation. Stub mode: `{kind:"webhook"}` entries. Real mode: the parsed
+ *  `_send/owed/{id}` marker ({url, method, body, on_result, context, …}) — the
+ *  durable artifact that actually replicates. */
+function sentEffects(effects) {
+  const out = [];
+  for (const e of effects || []) {
+    if (e.kind === "webhook") out.push({ url: e.url, on: e.on });
+    else if (e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_send/owed/")) {
+      try { const m = JSON.parse(e.value); out.push({ url: m.url, method: m.method, body: m.body, on: m.on_result, context: m.context }); }
+      catch (_) { /* skip */ }
+    }
+  }
+  return out;
+}
+
 function fmt(x) {
   try { return typeof x === "string" ? JSON.stringify(x) : JSON.stringify(x); }
   catch (_) { return String(x); }
@@ -138,6 +186,11 @@ class Scenario {
     this.now = toMs(cfg.now);
     this.seed = cfg.seed || 0;
     this.entry = cfg.entry || "index.mjs";
+    // Effect-global unification prototype: run the REAL webhook/schedule/cron
+    // shims so those verbs decompose to primitives (_send/owed + _sched/* kv
+    // writes + http.fetch) in the effect log. The matchers below read either
+    // shape, so a test reads the same whichever mode it's in.
+    this.realEffects = cfg.realEffects || false;
   }
 
   _base(partial) {
@@ -146,6 +199,7 @@ class Scenario {
       partial,
     );
     if (this.sourceDir) w.source_dir = this.sourceDir;
+    if (this.realEffects) w.realEffects = true;
     if (this.inlineSources) {
       w.sources = Object.keys(this.inlineSources).map((path) => ({
         path, kind: "handler", source: this.inlineSources[path],
@@ -694,7 +748,12 @@ class Matcher {
   toHaveSent(kind, subset) {
     const node = this._node("toHaveSent");
     if (!node) return false;
-    const sent = node.effects.filter((e) => e.kind === kind);
+    // `webhook` reads through the effect view, so a `toHaveSent("webhook", {url})`
+    // matches whether the sim ran the stub or the real shim (a _send/owed marker).
+    // Other kinds (email/blob/stream) match the raw effect entry as before.
+    const sent = kind === "webhook"
+      ? sentEffects(node.effects)
+      : node.effects.filter((e) => e.kind === kind);
     const pass = sent.some((e) => subsetMatch(e, subset));
     return this._record(`toHaveSent ${fmt(kind)}`, pass, { subset: subset === undefined ? null : subset, sent });
   }
@@ -702,10 +761,8 @@ class Matcher {
   toHaveScheduled(matcher) {
     const node = this._node("toHaveScheduled");
     if (!node) return false;
-    const sch = node.effects.filter((e) =>
-      e.kind === "schedule" || e.kind === "timer" || e.kind === "cron" || e.kind === "kv-wake");
-    const pass = sch.some((e) => matcher == null
-      || matchUrl(e.target || e.on || e.prefix || String(e.when || e.ms || ""), matcher));
+    const sch = scheduledEffects(node.effects);
+    const pass = sch.some((e) => matcher == null || matchUrl(e.target, matcher));
     return this._record(`toHaveScheduled ${matcher == null ? "" : matcher}`, pass, { scheduled: sch });
   }
 

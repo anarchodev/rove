@@ -53,6 +53,12 @@ pub const Opts = struct {
     /// `request.auth`) or short-circuit. Set by the caller iff the middleware
     /// module is resolvable AND this is an inbound-family activation.
     run_middleware: bool = false,
+    /// Effect-global unification prototype: when set, the epilogue does NOT
+    /// install its high-level `webhook`/`schedule`/`cron` stubs, leaving the
+    /// REAL shims the sim base evaled (`sim_globals.zig`) in place — so those
+    /// verbs decompose to primitives (`_send/owed/*` + `_sched/*` kv writes +
+    /// `http.fetch`) in the effect log instead of one high-level `{kind}` entry.
+    real_effects: bool = false,
     /// The flattened fetch/callback result → top-level `request.*`.
     result: ?Result = null,
 };
@@ -201,6 +207,8 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     } else try w.writeAll("null");
     try w.writeAll(",\"fn\":");
     try jsonStr(w, opts.export_name);
+    try w.writeAll(",\"realEffects\":");
+    try w.writeAll(if (opts.real_effects) "true" else "false");
     try w.writeAll("};\n");
 
     // ── the fixed reconstruction + invoke + side-channel capture ──
@@ -338,10 +346,15 @@ const EPILOGUE_BODY =
     \\  // Pre-rename `on.*` — kept on the DRIVER only, so records from
     \\  // pre-rename deployments still replay their pinned code.
     \\  globalThis.on = { fetch: globalThis.after.fetch, kv: globalThis.after.kv, timer: globalThis.after.ms };
-    \\  globalThis.webhook = { send(url, opts) { __effects.push({ kind: "webhook", url, on: (opts && (opts.on || opts.on_result)) || null }); } };
     \\  globalThis.email = { send(opts) { __effects.push({ kind: "email", to: (opts && opts.to) || null }); } };
-    \\  globalThis.schedule = (when, target) => { __effects.push({ kind: "schedule", when, target: target || null }); };
-    \\  globalThis.cron = (spec, target) => { __effects.push({ kind: "cron", spec, target: target || null }); };
+    \\  // webhook/schedule/cron: high-level stubs UNLESS realEffects is set, in
+    \\  // which case the sim base's REAL shims (composing to _send/owed + _sched/*
+    \\  // kv writes + http.fetch) stay installed and the effect log goes primitive.
+    \\  if (!D.realEffects) {
+    \\    globalThis.webhook = { send(url, opts) { __effects.push({ kind: "webhook", url, on: (opts && (opts.on || opts.on_result)) || null }); } };
+    \\    globalThis.schedule = (when, target) => { __effects.push({ kind: "schedule", when, target: target || null }); };
+    \\    globalThis.cron = (spec, target) => { __effects.push({ kind: "cron", spec, target: target || null }); };
+    \\  }
     \\  globalThis.blob = { get() {}, put() {}, receive() {}, seal() {} };
     \\  globalThis.next = (ctx) => ({ __rove_disposition: "next", ctx: ctx === undefined ? null : ctx });
     \\  // Wrap the native kv so reads/writes interleave with the cmds above in true

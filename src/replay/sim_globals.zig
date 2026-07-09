@@ -178,4 +178,17 @@ pub const PRELUDE: [:0]const u8 = SYSTEM_SHIM ++
     "\n;" ++ @embedFile("g_browser") ++
     "\n;" ++ @embedFile("g_users") ++
     "\n;" ++ @embedFile("g_activitypub") ++
+    // The REAL durable-effect shims (unification prototype, gated per-run by the
+    // world's `realEffects` flag — the epilogue installs its high-level stubs
+    // over these unless the flag is set). Order mirrors the worker's
+    // GLOBALS_FILES: `cron` (fire-time helpers + the recurring verb) → `schedule`
+    // (reuses `cron.parseDuration`) → `webhook` (composes over `kv`+`schedule`+
+    // the `_system.http` fetch primitive it captures at eval — so it MUST land
+    // before the `delete globalThis._system` below). `webhook.js` isn't
+    // IIFE-wrapped (top-level `const sysHttp`), so wrap it here to keep its
+    // lexicals out of the base-snapshot's global lexical scope (the freeze
+    // corrupts on bare top-level bindings — see globals-shim-iife-required).
+    "\n;" ++ @embedFile("g_cron") ++
+    "\n;" ++ @embedFile("g_schedule") ++
+    "\n;(function(){\n" ++ @embedFile("g_webhook") ++ "\n})();" ++
     "\n;delete globalThis._system;\n";

@@ -472,10 +472,31 @@ too. Fixtures `testdata/{authsurface,middleware}`.
   common OIDC signature algs (HS256/RS256/ES256) all verify offline. Remaining:
   **RS384/512 + ES384/512** (need native sha384/512, and P-384/521 curves for the
   EC ones); `platform.*` reads hit the one closed-world kv (no per-instance store
-  isolation) and `auth.checkRootToken` assumes root — first-pass. And the clean
-  end-state — install the REAL effect globals so `webhook.send` decomposes to
-  `http.fetch`+`kv`+`schedule` — would shift the effect log to primitive level
-  and needs the matchers/cross-checks updated; kept as stubs.
+  isolation) and `auth.checkRootToken` assumes root — first-pass.
+- **The clean effect-global unification — PROTOTYPED behind `realEffects`.** The
+  end-state is installing the REAL effect globals so `webhook.send` decomposes to
+  `kv` (the `_send/owed/{id}` marker) + `http.fetch` + `schedule` (the `_sched/*`
+  rows) in the effect log, instead of one high-level `{kind:"webhook"}` stub. A
+  prototype landed for `webhook`/`schedule`/`cron`: the real shims eval into the
+  sim base (`sim_globals.zig`, over the existing `_system.http` recorder +
+  per-request `kv`), and a per-world `realEffects` flag (`scenario({ realEffects:
+  true })`) tells the epilogue to leave them in place instead of installing its
+  stubs. `toHaveSent`/`toHaveScheduled` became polymorphic **views** (read either
+  the stub `{kind}` entries OR the primitive `_send/owed/*` / `_sched/by_id/*`
+  writes — unwrapping the `cron → __system/cron_tick` indirection), so the
+  readable API is unchanged. Fixture `testdata/effects/`.
+  **Churn measured = effectively zero forced test changes:** the whole existing
+  suite stayed green in stub mode, and an experimental flip of `checkout` to
+  `realEffects` stayed 100% green too (email/`after` kept as stubs = partial
+  migration; the polymorphic matchers absorb the rest). The remaining real churn
+  is narrow and known: (1) **snapshots** of a handler using `webhook`/`schedule`
+  must be re-baselined (the effect log goes primitive); (2) **bare
+  `toHaveScheduled()`** flips to true after a `webhook.send` (its crash-recovery
+  watchdog is a real `schedule`); (3) **`email` is a `webhook` at primitive
+  level** — full email conversion needs `g_email` in the base + a body-parsing
+  `toHaveSent("email")` view. To finish: add `email`/`after`/`stream`/`blob` to
+  the base, make `realEffects` the default, delete the epilogue stubs, and
+  re-record affected snapshots.
 - ~~**A detached `wake` helper** for `schedule` / `cron` callbacks~~ — DONE.
   `scenario().wake({ on, ctx, key?, id?, scheduledAtNs?, method? })` authors a
   `durable_wake` world directly — the analogue of `sendCallback` for the durable
