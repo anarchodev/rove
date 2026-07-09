@@ -74,7 +74,10 @@ pub fn exportForActivation(activation: []const u8) []const u8 {
         .{ "wake_batch", "onWake" },
         .{ "kv_wake", "onWake" },
         .{ "timer", "onWake" },
-        .{ "durable_wake", "onWake" },
+        // `durable_wake` (a fired schedule/cron target) is NOT here: like the
+        // runtime (`rpc_dispatch.defaultExportForKind`), it falls through to
+        // `default` — a schedule `target` is a module invoked at its default
+        // export (a `module.method` target names the export explicitly).
         .{ "disconnect", "onDisconnect" },
         .{ "ws_message", "onMessage" },
         .{ "inbound_headers", "onHeaders" },
@@ -437,6 +440,10 @@ test "exportForActivation maps activation kinds" {
     try testing.expectEqualStrings("onWake", exportForActivation("kv_wake"));
     try testing.expectEqualStrings("onMessage", exportForActivation("ws_message"));
     try testing.expectEqualStrings("onChunk", exportForActivation("inbound_chunk"));
+    // A fired schedule/cron target invokes the target module's default export
+    // (mirrors `rpc_dispatch.defaultExportForKind`); a `module.method` target
+    // names its export explicitly on the world.
+    try testing.expectEqualStrings("default", exportForActivation("durable_wake"));
 }
 
 test "build: GET embeds request meta + parks output under sentinel" {

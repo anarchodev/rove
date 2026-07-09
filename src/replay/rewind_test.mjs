@@ -210,6 +210,53 @@ class Scenario {
     }));
   }
 
+  /** A DETACHED durable schedule/cron callback (`schedule(...)` / `cron(...)`
+   *  target), authored directly — NOT folded from an emitter. A due schedule
+   *  fires its `target` as a fresh `durable_wake` activation: connectionless,
+   *  no held socket, surviving crashes and leader changes. So — like a
+   *  `sendCallback` — you test that target module in isolation, given a fire.
+   *
+   *  Mirrors the runtime surface (globals.zig durable-wake block): the payload
+   *  arrives on `request.ctx` (the one-ctx rule — the same slot every callback
+   *  reads, NOT `request.activation.msg`), with delivery metadata on
+   *  `request.activation.{kind, id, key, scheduledAtNs}`. `key` is present only
+   *  when the schedule carried an idempotency key (`opts.key`) — omitted
+   *  otherwise, matching the runtime and `schedule.get`. A recurring `cron`
+   *  target fires the same way (via the baked `cron_tick`, which the customer
+   *  never sees); each occurrence is one `wake(...)`.
+   *
+   *  spec: { on: "<target module path>", ctx?: <payload>, method?: "<export>",
+   *          id?: "<schedule id>", key?: "<idempotency key>",
+   *          scheduledAtNs?: <ns since epoch>, now?: <fire time> }
+   */
+  wake(spec = {}) {
+    if (typeof spec.on !== "string")
+      throw new Error("wake({ on }): `on` must be the scheduled target module path");
+    // The fire happens AT/AFTER the scheduled time; run the activation with the
+    // clock at the fire time so the target's `Date.now()` is deterministic.
+    const fireMs = spec.now !== undefined ? toMs(spec.now) : this.now;
+    const scheduledAtNs = spec.scheduledAtNs != null ? spec.scheduledAtNs : fireMs * 1_000_000;
+    const activation = {
+      kind: "durable_wake",
+      // A fired schedule always carries its id; default a stable placeholder so
+      // `request.activation.id` is the string a real target reads.
+      id: spec.id != null ? spec.id : "sched_test",
+      scheduledAtNs,
+    };
+    // Present only when the schedule was armed with an idempotency key.
+    if (spec.key != null) activation.key = spec.key;
+    return new Node(this, this._base({
+      entry: spec.on, // the scheduled target module IS this activation's entry
+      activation: "durable_wake",
+      // durable_wake dispatches at the target's default export (rpc_dispatch);
+      // a `module.method` target overrides via `method`.
+      export: spec.method || "default",
+      ctx: spec.ctx === undefined ? null : spec.ctx,
+      now_ms: fireMs,
+      request: { activation },
+    }));
+  }
+
   /** A held WebSocket connection. The upgrade runs NO code (the chain parks
    *  with ctx `{}`); each inbound frame runs `onMessage`, so the fold starts at
    *  the first `.receive(frame)`. Per-connection ctx threads via each frame's

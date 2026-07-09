@@ -476,10 +476,21 @@ too. Fixtures `testdata/{authsurface,middleware}`.
   end-state — install the REAL effect globals so `webhook.send` decomposes to
   `http.fetch`+`kv`+`schedule` — would shift the effect log to primitive level
   and needs the matchers/cross-checks updated; kept as stubs.
-- **A detached `wake` helper** for `schedule` / `cron` callbacks — the
-  `durable_wake` analogue of `sendCallback` (author the wake world directly).
-  Deferred only because its exact `request.*` surface wasn't re-confirmed this
-  pass; `sendCallback` is the confirmed one.
+- ~~**A detached `wake` helper** for `schedule` / `cron` callbacks~~ — DONE.
+  `scenario().wake({ on, ctx, key?, id?, scheduledAtNs?, method? })` authors a
+  `durable_wake` world directly — the analogue of `sendCallback` for the durable
+  scheduler. Surface re-confirmed against the runtime (`globals.zig` durable-wake
+  block + `rpc_dispatch`): the payload arrives on **`request.ctx`** (the one-ctx
+  rule, NOT `request.activation.msg`) and delivery metadata on
+  `request.activation.{kind, id, key, scheduledAtNs}` (`key` omitted when the
+  schedule carried none). Both `schedule` and `cron` deliver the customer target
+  the same way — `cron_tick` is a `__system` re-dispatcher the customer never
+  sees, so one `wake(...)` models one occurrence. A fired target dispatches at
+  the target module's **default** export (fixed a mirror bug in
+  `epilogue.exportForActivation`, which had `durable_wake → onWake`); a
+  `module.method` target names its export via `method`. Fixture
+  `testdata/checkout/{jobs/reminder.mjs, _tests/wake.mjs}` (self-rescheduling
+  reminder recipe), wired into `rewind-test-smoke`.
 - **`whenConcurrent(...).interleavings()`** — the model-check combinator over
   concurrent-effect delivery orders (the plan's `toBeConsistent` example) is not
   built; `branch`/`cases` cover single-effect forking today.

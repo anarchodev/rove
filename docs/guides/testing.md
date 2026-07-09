@@ -184,6 +184,24 @@ const delivered = s.sendCallback({
 expect(delivered).toHaveWritten("delivery/o9", { ok: true });
 ```
 
+A `schedule(...)` or `cron(...)` target fires the same way — later, as its own
+connectionless activation, with your payload on `request.ctx` and delivery
+metadata on `request.activation`. Author that fire directly with `wake`:
+
+```js
+const fired = s.wake({
+  on: "jobs/reminder.mjs",
+  ctx: { user: "ada" },        // arrives as request.ctx
+  key: "reminder/ada",         // request.activation.key (omit if none)
+});
+expect(fired).toHaveWritten("reminder/ada", { count: 1 });
+expect(fired).toHaveScheduled("jobs/reminder");   // it re-armed the next one
+```
+
+Both `schedule` and `cron` deliver a target this way, so one `wake(...)` is one
+firing. As with `sendCallback`, the target is tested in isolation — the
+scheduler's own queueing and at-least-once firing aren't re-run.
+
 ## Snapshots
 
 `toMatchSnapshot(name)` captures a node's response, disposition, body, and
