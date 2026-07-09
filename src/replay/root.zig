@@ -195,6 +195,24 @@ pub const Engine = struct {
 
         const binary_body = std.mem.eql(u8, wv.activation, "inbound_chunk") or
             std.mem.eql(u8, wv.activation, "fetch_chunk");
+
+        // Run the real `_middlewares/index.mjs` `before` iff it's resolvable AND
+        // this is an inbound-family (trust-boundary) activation — the worker
+        // skips middleware for continuations (a resume already ran behind the
+        // gate). Resolvable = inline in `sources`, or on disk under `src_dir`.
+        const MW_PATH = "_middlewares/index.mjs";
+        const is_trust_boundary = std.mem.eql(u8, wv.activation, "inbound") or
+            std.mem.eql(u8, wv.activation, "inbound_headers") or
+            std.mem.eql(u8, wv.activation, "inbound_chunk") or
+            std.mem.eql(u8, wv.activation, "ws_message");
+        const has_middleware = if (sources.get(MW_PATH) != null)
+            true
+        else if (src_dir) |dir| blk: {
+            const mp = std.fs.path.join(a, &.{ dir, MW_PATH }) catch break :blk false;
+            std.fs.cwd().access(mp, .{}) catch break :blk false;
+            break :blk true;
+        } else false;
+        const run_middleware = is_trust_boundary and has_middleware;
         // The resolved export: the world's explicit `export` (the `{to}` /
         // resolved name a callback needs) wins; else the conventional export.
         const export_name = wv.export_name orelse epilogue.exportForActivation(wv.activation);
@@ -213,6 +231,8 @@ pub const Engine = struct {
             .binary_body = binary_body,
             .ctx_json = wv.ctx_json,
             .activation_json = wv.activation_json,
+            .session_json = wv.session_json,
+            .run_middleware = run_middleware,
             .result = result,
         });
         const full_src = try std.mem.concatWithSentinel(a, u8, &.{ entry_src, epi }, 0);

@@ -1346,6 +1346,7 @@ pub fn build(b: *std.Build) void {
         "examples/loop46-demo-tenants/wsfetch", // ↔ ws_fetch_smoke_v2 (WS+fetch)
         "examples/loop46-demo-tenants/wswake", // ↔ ws_wake_smoke_v2 (WS+wake)
         "src/replay/testdata/authsurface", // compute globals (crypto/base64url/jwt/oidc/sessions) in the sim base
+        "src/replay/testdata/middleware", // real _middlewares/before + request.session injection
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);

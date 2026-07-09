@@ -87,6 +87,11 @@ pub const World = struct {
     /// `request.activation.*` metadata bag (wakes / msg / error / attempts / …).
     /// JSON text.
     activation_json: ?[]const u8 = null,
+    /// Injected `request.session` — normally the worker resolves this from a
+    /// session cookie (there's no handler-side code to run for it), so a test
+    /// supplies it. `request.auth`, by contrast, is set by the REAL
+    /// `_middlewares/index.mjs` the sim runs — never injected. JSON text.
+    session_json: ?[]const u8 = null,
     /// The flattened fetch/callback result surface — top-level on `request`.
     status: ?i64 = null,
     ok: ?bool = null,
@@ -139,6 +144,10 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
         // `request.activation.*` metadata bag.
         if (r.get("activation")) |av| {
             if (av != .null) w.activation_json = try jsonText(a, av);
+        }
+        // Injected `request.session` (worker-resolved in prod; no code to run).
+        if (r.get("session")) |sv| {
+            if (sv != .null) w.session_json = try jsonText(a, sv);
         }
         if (r.get("headers")) |hv| {
             if (hv != .object) return Error.BadWorld;

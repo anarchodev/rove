@@ -154,7 +154,10 @@ class Scenario {
     return w;
   }
 
-  /** An inbound HTTP activation → the root node. */
+  /** An inbound HTTP activation → the root node. If the app has a
+   *  `_middlewares/index.mjs`, its real `before` runs first (it may set
+   *  `request.auth` or short-circuit). `session` is injected (the worker
+   *  resolves it from a cookie in prod — no code to run offline). */
   inbound(req = {}) {
     return new Node(this, this._base({
       activation: "inbound",
@@ -165,6 +168,7 @@ class Scenario {
         headers: req.headers || {},
         body: req.body,
         ip: req.ip,
+        session: req.session,
       },
     }));
   }

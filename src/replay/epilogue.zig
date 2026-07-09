@@ -46,6 +46,13 @@ pub const Opts = struct {
     ctx_json: ?[]const u8 = null,
     /// `request.activation.*` metadata as JSON text (wakes / msg / …).
     activation_json: ?[]const u8 = null,
+    /// Injected `request.session` as JSON text (worker-resolved in prod).
+    session_json: ?[]const u8 = null,
+    /// Run the tenant's real `_middlewares/index.mjs` `before` ahead of the
+    /// handler (inbound trust boundary only) — it may mutate `request` (e.g.
+    /// `request.auth`) or short-circuit. Set by the caller iff the middleware
+    /// module is resolvable AND this is an inbound-family activation.
+    run_middleware: bool = false,
     /// The flattened fetch/callback result → top-level `request.*`.
     result: ?Result = null,
 };
@@ -128,7 +135,9 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     const w = &aw.writer;
 
     // ── the data object `D` (a JS object literal, JSON-safe) ──
-    try w.writeAll("\n;(() => {\n  const D = {");
+    // Async IIFE — the handler (and middleware `before`) may be async; the
+    // driver drains microtasks before returning, so the OUTPUT_KEY write lands.
+    try w.writeAll("\n;(async () => {\n  const D = {");
     try w.writeAll("\"method\":");
     try jsonStr(w, opts.method);
     try w.writeAll(",\"path\":");
@@ -171,6 +180,8 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     try w.writeAll(opts.ctx_json orelse "null");
     try w.writeAll(",\"activation\":");
     try w.writeAll(opts.activation_json orelse "null");
+    try w.writeAll(",\"session\":");
+    try w.writeAll(opts.session_json orelse "null");
     try w.writeAll(",\"result\":");
     if (opts.result) |r| {
         try w.writeAll("{\"status\":");
@@ -192,6 +203,14 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     // ── the fixed reconstruction + invoke + side-channel capture ──
     try w.writeAll(EPILOGUE_BODY);
     try w.print("  kv.set({s}, __out);\n}})();\n", .{quotedOutputKey});
+
+    // The real middleware, imported as a namespace so the async IIFE can run its
+    // `before`. A static import (hoisted, loaded before the module body) — only
+    // when it's resolvable AND this is an inbound-family activation, so a handler
+    // without `_middlewares` never triggers a load divergence.
+    if (opts.run_middleware) {
+        try w.writeAll("import * as __rove_mw from \"_middlewares/index.mjs\";\n");
+    }
 
     buf = aw.toArrayList();
     return buf.toOwnedSlice(a);
@@ -266,6 +285,8 @@ const EPILOGUE_BODY =
     \\  // the threaded ctx, the request.activation metadata bag, and the
     \\  // flattened fetch/callback result (request.status/.ok/.done/...).
     \\  if (D.ctx !== null) request.ctx = D.ctx;
+    \\  // Injected request.session (worker-resolved in prod — no code to run).
+    \\  if (D.session !== null) request.session = D.session;
     \\  if (D.activation !== null) {
     \\    // A binary WS frame carries its bytes as base64 → rebuild the
     \\    // Uint8Array on request.activation.data (a text frame keeps its string).
@@ -331,11 +352,22 @@ const EPILOGUE_BODY =
     \\  if (typeof request.tag !== "function") request.tag = function () { return request; };
     \\  globalThis.request = request;
     \\  globalThis.response = { status: 200, headers: {}, cookies: [] };
-    \\  let __result = null, __err = null;
+    \\  let __result = null, __err = null, __short = false;
     \\  try {
     \\    const ns = __arena_entry_ns();
-    \\    if (typeof ns[D.fn] !== "function") throw new Error("replay: entry module has no '" + D.fn + "' export");
-    \\    __result = ns[D.fn]();
+    \\    // Real middleware (inbound trust boundary): run `_middlewares`' `before`
+    \\    // first — it sees globalThis.request/response and may MUTATE the request
+    \\    // (e.g. request.auth = {...}) or SHORT-CIRCUIT by returning a response.
+    \\    // `__rove_mw` is imported only when run_middleware (build() appends it);
+    \\    // `typeof` is safe when it isn't declared.
+    \\    if (typeof __rove_mw !== "undefined" && __rove_mw && typeof __rove_mw.before === "function") {
+    \\      const __mwr = await __rove_mw.before();
+    \\      if (__mwr !== undefined && __mwr !== null) { __result = __mwr; __short = true; }
+    \\    }
+    \\    if (!__short) {
+    \\      if (typeof ns[D.fn] !== "function") throw new Error("replay: entry module has no '" + D.fn + "' export");
+    \\      __result = await ns[D.fn]();
+    \\    }
     \\    globalThis.__replay_result = __result;
     \\  } catch (e) {
     \\    __err = { message: String((e && e.message) || e), stack: String((e && e.stack) || "") };
