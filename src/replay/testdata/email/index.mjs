@@ -1,8 +1,8 @@
-// realEffects email decomposition fixture. `email.send` layers on
-// `webhook.send`, so under `realEffects` it decomposes to the SAME durable
-// primitive webhook does — one `_send/owed/{id}` marker whose url is the Resend
-// API and whose body is the built Resend request. The `toHaveSent("email", …)`
-// view reads that marker back into a readable {to, from, subject} shape.
+// email decomposition fixture. `email.send` layers on `webhook.send`, so it
+// decomposes to the SAME durable primitive webhook does — one `_send/owed/{id}`
+// marker whose url is the Resend API and whose body is the built Resend request.
+// The `toHaveSent("email", …)` view reads that marker back into a readable
+// {to, from, subject} shape.
 export default function () {
   const user = request.json.user;
   email.send({

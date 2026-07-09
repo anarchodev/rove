@@ -1,6 +1,6 @@
 // Effect-global unification prototype fixture. Exercises the two durable verbs
 // the unification converts — `webhook.send` and `schedule` — DIRECTLY, so the
-// `_tests/effects.mjs` test (run with `realEffects: true`) sees them decompose
+// `_tests/effects.mjs` test sees them decompose
 // into primitives (`_send/owed/*` + `_sched/*` kv writes + an `http.fetch`)
 // instead of one high-level `{kind:"webhook"|"schedule"}` effect each.
 export default function () {

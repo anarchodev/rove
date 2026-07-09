@@ -1,15 +1,14 @@
-// Effect-global unification prototype (docs/plans/sim-test-framework.md
-// "what's left" → the clean effect-global unification). With realEffects: true
-// the sim runs the REAL webhook.send / schedule shims from its base, so those
-// verbs decompose to primitives in the effect log. This test proves TWO things:
+// Effect-global unification (docs/plans/sim-test-framework.md). The sim runs the
+// REAL webhook.send / schedule shims from its base, so those verbs decompose to
+// primitives in the effect log. This test proves TWO things:
 //   1. the readable matchers (toHaveSent/toHaveScheduled/toHaveFetched) read the
-//      SAME as in stub mode — the customer-facing API is unchanged; and
+//      customer-facing shape unchanged; and
 //   2. under the hood the durable primitives that actually replicate through
 //      raft (the _send/owed marker + the _sched rows + the fetch) are really
 //      what the verbs produced.
 import { scenario, expect } from "rewind:test";
 
-const s = scenario({ realEffects: true, now: "2026-07-01T00:00:00Z" });
+const s = scenario({ now: "2026-07-01T00:00:00Z" });
 const r = s.inbound({ method: "POST", path: "/signup", body: { user: "ada" } });
 
 expect(r.ok).toBe(true);

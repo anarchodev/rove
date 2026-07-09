@@ -1,11 +1,9 @@
-// email.send under realEffects — proves email joins the durable-send
-// decomposition (docs/plans/sim-test-framework.md "what's left"). The readable
-// matcher reads the same whether the sim ran the stub or the real shim; under
-// the hood email IS a webhook at the primitive level (one _send/owed marker
-// pointed at the Resend API).
+// email.send decomposition (docs/plans/sim-test-framework.md). The readable
+// matcher surfaces recipient + subject; under the hood email IS a webhook at the
+// primitive level (one _send/owed marker pointed at the Resend API).
 import { scenario, expect } from "rewind:test";
 
-const s = scenario({ realEffects: true, now: "2026-07-01T00:00:00Z" });
+const s = scenario({ now: "2026-07-01T00:00:00Z" });
 const r = s.inbound({ method: "POST", path: "/signup", body: { user: "ada" } });
 
 expect(r.ok).toBe(true);

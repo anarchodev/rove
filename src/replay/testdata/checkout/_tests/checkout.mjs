@@ -21,7 +21,7 @@ expect(req).toHaveFetched(/stripe/);
 // the parent's writes/ctx/clock folded forward.
 const charged = req.fetch(/stripe/).resolve({ status: 200, body: { id: "ch_1" } });
 expect(charged).toHaveWritten("order/jess", { status: "paid" });
-expect(charged).toHaveSent("email", { to: "jess@example.com" });
+expect(charged).toHaveSent("email", { to: ["jess@example.com"], subject: "Your order is paid" });
 expect(charged.kv("order/jess")).toEqual({ status: "paid" });
 
 // Fork the shared prefix over two upstream outcomes.

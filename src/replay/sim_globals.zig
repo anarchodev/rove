@@ -18,10 +18,9 @@
 //!     `after`/`stream`/`next` are faithful recorders (they don't decompose),
 //!     installed unconditionally — the epilogue no longer stubs them;
 //!   - the durable-effect verbs `cron`/`schedule`/`webhook`/`email` are the REAL
-//!     shims. Under a world's `realEffects` flag the epilogue leaves them in
-//!     place, so `webhook.send`/`email.send` decompose into `http.fetch`+`kv`
-//!     (`_send/owed`) + a watchdog `schedule` (`_sched/*`); without the flag the
-//!     epilogue shadows them with high-level `{kind}` stubs.
+//!     shims, so `webhook.send`/`email.send` decompose into `http.fetch`+`kv`
+//!     (`_send/owed`) + a watchdog `schedule` (`_sched/*`), and `schedule`/`cron`
+//!     into `_sched/*` kv rows — the primitives that actually replicate.
 //! Still epilogue-local: `blob` (its recipe path needs streaming sha256, absent
 //! offline) and the `kv` recorder wrapper.
 
@@ -201,8 +200,9 @@ pub const PRELUDE: [:0]const u8 = SYSTEM_SHIM ++
     "\n;" ++ @embedFile("g_after") ++
     "\n;" ++ @embedFile("g_stream") ++
     "\n;" ++ @embedFile("g_next") ++
-    // The durable-effect shims, gated per-run by the world's `realEffects` flag
-    // (the epilogue installs high-level stubs over these unless the flag is set).
+    // The durable-effect shims — the real webhook/schedule/cron/email verbs, so
+    // they decompose to primitives (`_send/owed` + `_sched/*` kv writes +
+    // `http.fetch`) in the effect log; the epilogue no longer stubs them.
     // Order mirrors the worker's GLOBALS_FILES: `cron` (fire-time helpers + the
     // recurring verb) → `schedule` (reuses `cron.parseDuration`) → `webhook`
     // (composes over `kv`+`schedule`+the `_system.http` fetch primitive it

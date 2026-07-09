@@ -111,22 +111,23 @@ function foldKv(base, effects) {
   return kvOut;
 }
 
-// ── effect views: read a verb's effects whether the sim ran the high-level
-// STUB (one {kind:"schedule"|"webhook"} entry) or the REAL shim (primitives —
-// _sched/*/_send/owed/* kv writes + http.fetch). Keeping these two shapes behind
-// one view is what lets a test read identically in either mode (realEffects). ──
+// ── effect views: the durable verbs run their REAL shims from the sim base, so
+// they decompose to primitives in the effect log. These views read that
+// primitive shape back into the readable form the matchers assert against —
+// `webhook`/`email` from `_send/owed/*` markers, `schedule`/`cron` from
+// `_sched/by_id/*` rows. The connection wakes `after.ms`/`after.kv` remain
+// direct `{kind:"timer"|"kv-wake"}` recorder entries. ──
 
 /** Schedules armed by this activation, each as `{ target, kind, key?, msg? }`.
- *  Stub mode: the high-level `schedule`/`cron` (+ the still-stubbed `timer`/
- *  `kv-wake`) entries. Real mode: `_sched/by_id/{id}` writes — and since
+ *  Durable `schedule`/`cron` are `_sched/by_id/{id}` writes — and since
  *  `cron(spec, t)` composes as `schedule(_, "__system/cron_tick", {spec,
- *  target:t})`, the customer target is unwrapped from `msg.target`. */
+ *  target:t})`, the customer target is unwrapped from `msg.target`. The
+ *  connection wakes `after.ms`/`after.kv` are direct `{kind:"timer"|"kv-wake"}`
+ *  recorder entries. */
 function scheduledEffects(effects) {
   const out = [];
   for (const e of effects || []) {
-    if (e.kind === "schedule") out.push({ target: e.target, kind: "schedule" });
-    else if (e.kind === "cron") out.push({ target: e.target, kind: "cron" });
-    else if (e.kind === "timer") out.push({ target: e.on, kind: "timer" });
+    if (e.kind === "timer") out.push({ target: e.on, kind: "timer" });
     else if (e.kind === "kv-wake") out.push({ target: e.on, kind: "kv-wake" });
     else if (e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_sched/by_id/")) {
       try {
@@ -144,32 +145,28 @@ function scheduledEffects(effects) {
 }
 
 /** Durable sends (`webhook.send`, and `email.send` which layers on it) armed by
- *  this activation. Stub mode: `{kind:"webhook"}` entries. Real mode: the parsed
- *  `_send/owed/{id}` marker ({url, method, body, on_result, context, …}) — the
- *  durable artifact that actually replicates. */
+ *  this activation — the parsed `_send/owed/{id}` marker ({url, method, body,
+ *  on_result, context, …}), the durable artifact that actually replicates. */
 function sentEffects(effects) {
   const out = [];
   for (const e of effects || []) {
-    if (e.kind === "webhook") out.push({ url: e.url, on: e.on });
-    else if (e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_send/owed/")) {
+    if (e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_send/owed/")) {
       try { const m = JSON.parse(e.value); out.push({ url: m.url, method: m.method, body: m.body, on: m.on_result, context: m.context }); }
-      catch (_) { /* skip */ }
+      catch (_) { /* skip a non-JSON marker */ }
     }
   }
   return out;
 }
 
-/** Emails sent by this activation. Stub mode: `{kind:"email", to}` entries.
- *  Real mode (`realEffects`): `email.send` layers on `webhook.send`, so it's a
- *  `_send/owed/{id}` marker pointed at the Resend API — parse its request body
- *  back to a readable `{to, from, subject, cc, bcc}` (the Resend `to` is always
- *  an array). Only resend-url markers are emails; other durable sends are
+/** Emails sent by this activation. `email.send` layers on `webhook.send`, so
+ *  it's a `_send/owed/{id}` marker pointed at the Resend API — parse its request
+ *  body back to a readable `{to, from, subject, cc, bcc}` (the Resend `to` is
+ *  always an array). Only resend-url markers are emails; other durable sends are
  *  webhooks (read those with `toHaveSent("webhook", …)`). */
 function emailSent(effects) {
   const out = [];
   for (const e of effects || []) {
-    if (e.kind === "email") out.push({ to: e.to });
-    else if (e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_send/owed/")) {
+    if (e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_send/owed/")) {
       try {
         const m = JSON.parse(e.value);
         if (m.url !== "https://api.resend.com/emails") continue;
@@ -208,11 +205,6 @@ class Scenario {
     this.now = toMs(cfg.now);
     this.seed = cfg.seed || 0;
     this.entry = cfg.entry || "index.mjs";
-    // Effect-global unification prototype: run the REAL webhook/schedule/cron
-    // shims so those verbs decompose to primitives (_send/owed + _sched/* kv
-    // writes + http.fetch) in the effect log. The matchers below read either
-    // shape, so a test reads the same whichever mode it's in.
-    this.realEffects = cfg.realEffects || false;
   }
 
   _base(partial) {
@@ -221,7 +213,6 @@ class Scenario {
       partial,
     );
     if (this.sourceDir) w.source_dir = this.sourceDir;
-    if (this.realEffects) w.realEffects = true;
     if (this.inlineSources) {
       w.sources = Object.keys(this.inlineSources).map((path) => ({
         path, kind: "handler", source: this.inlineSources[path],
@@ -770,10 +761,9 @@ class Matcher {
   toHaveSent(kind, subset) {
     const node = this._node("toHaveSent");
     if (!node) return false;
-    // `webhook`/`email` read through effect VIEWS, so a `toHaveSent(kind, subset)`
-    // matches whether the sim ran the stub or the real shim (a _send/owed marker;
-    // email layers on webhook so it's a resend-url marker). Other kinds (blob/…)
-    // match the raw effect entry as before.
+    // `webhook`/`email` read through effect VIEWS over the durable `_send/owed`
+    // marker the real shims produce (email layers on webhook, so it's a
+    // resend-url marker). Other kinds (blob/…) match the raw effect entry.
     const sent = kind === "webhook"
       ? sentEffects(node.effects)
       : kind === "email"

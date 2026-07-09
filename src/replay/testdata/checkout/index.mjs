@@ -20,7 +20,7 @@ export function onCharge() {
   const user = request.ctx.user;
   if (request.ok) {
     kv.set("order/" + user, JSON.stringify({ status: "paid" }));
-    email.send({ to: user + "@example.com", subject: "Your order is paid" });
+    email.send({ apiKey: "re_test_key", from: "orders@shop.test", to: user + "@example.com", subject: "Your order is paid" });
     return { ok: true };
   }
   kv.set("order/" + user, JSON.stringify({ status: "failed" }));

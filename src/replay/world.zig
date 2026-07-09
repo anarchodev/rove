@@ -66,11 +66,6 @@ pub const World = struct {
     expected_json: ?[]const u8 = null,
     seed: u64 = 0,
     now_ms: u64 = 0,
-    /// Effect-global unification prototype: run the REAL durable-effect shims
-    /// (`webhook`/`schedule`/`cron`) from the sim base instead of the epilogue's
-    /// high-level stubs, so those verbs decompose to primitive kv writes +
-    /// `http.fetch` in the effect log. Threaded to `epilogue.Opts.real_effects`.
-    real_effects: bool = false,
     /// The live request completed under the GC arena regime (the
     /// churny-handler fallback) — the driver must replay under it
     /// (under bump the same execution would OOM). Carried from the
@@ -124,7 +119,6 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
     w.seed = jU64(obj, "seed") orelse 0;
     w.now_ms = jU64(obj, "now_ms") orelse 0;
     if (obj.get("arena_gc")) |gv| w.arena_gc = (gv == .bool and gv.bool);
-    if (obj.get("realEffects")) |rv| w.real_effects = (rv == .bool and rv.bool);
 
     // ── request surface ──
     if (obj.get("request")) |rv| {

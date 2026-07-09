@@ -473,43 +473,29 @@ too. Fixtures `testdata/{authsurface,middleware}`.
   **RS384/512 + ES384/512** (need native sha384/512, and P-384/521 curves for the
   EC ones); `platform.*` reads hit the one closed-world kv (no per-instance store
   isolation) and `auth.checkRootToken` assumes root — first-pass.
-- **The clean effect-global unification — behind `realEffects`; base migration
-  now COMPLETE except `blob`.** The end-state is installing the REAL effect
-  globals so `webhook.send` decomposes to `kv` (the `_send/owed/{id}` marker) +
-  `http.fetch` + `schedule` (the `_sched/*` rows) in the effect log, instead of
-  one high-level `{kind:"webhook"}` stub. What's in the base now:
-  - `webhook`/`schedule`/`cron` — the real shims eval into the sim base
-    (`sim_globals.zig`, over the `_system.http` recorder + per-request `kv`); a
-    per-world `realEffects` flag (`scenario({ realEffects: true })`) tells the
-    epilogue to leave them in place instead of installing its stubs. Fixture
-    `testdata/effects/`.
-  - **`email`** — layers on `webhook.send`, so under `realEffects` it decomposes
-    to the SAME `_send/owed` primitive (one marker pointed at the Resend API,
-    body = the built request). `g_email` in the base + a `__rove_check_email_rate`
-    no-op; `toHaveSent("email", …)` is a body-parsing **view** over the marker
-    (Resend `to` is an array) that still reads `{kind:"email"}` stubs in stub
-    mode. Fixture `testdata/email/`.
-  - **`after`/`stream`/`next`** — faithful recorders (they don't decompose), so
-    installed **unconditionally** in the base and the epilogue no longer stubs
-    them (`_system.stream` recorder + `__rove_next` added to the base). Verified
-    via `checkout` (held/ws/wake), the `ws*` smoke tenants, and `acme`.
-  `toHaveSent`/`toHaveScheduled` are polymorphic **views** (read either the stub
-  `{kind}` entries OR the primitive `_send/owed/*` / `_sched/by_id/*` writes —
-  unwrapping the `cron → __system/cron_tick` indirection), so the readable API is
-  unchanged.
+- ~~**The clean effect-global unification.**~~ — DONE (except `blob`). The sim
+  base now installs the REAL effect globals unconditionally — there is no
+  `realEffects` flag and the epilogue no longer stubs these verbs. `webhook.send`
+  decomposes to `kv` (the `_send/owed/{id}` marker) + `http.fetch` + a watchdog
+  `schedule` (`_sched/*` rows); `schedule`/`cron` decompose to `_sched/*` kv rows;
+  `email.send` layers on `webhook.send` (one `_send/owed` marker pointed at the
+  Resend API, body = the built request). `after`/`stream`/`next` are faithful
+  recorders installed the same way (added a `_system.stream` recorder +
+  `__rove_next` to the base). `toHaveSent`/`toHaveScheduled` are **views** over
+  the primitive log (`_send/owed/*` markers, `_sched/by_id/*` rows — unwrapping
+  the `cron → __system/cron_tick` indirection; `after.ms`/`after.kv` stay direct
+  `{kind:"timer"|"kv-wake"}` recorder entries), and `toHaveSent("email", …)`
+  parses the Resend marker body back to `{to (array), from, subject}`. Fixtures
+  `testdata/effects/` (webhook+schedule) + `testdata/email/`; whole suite green
+  (`checkout` now sends a real durable email by default). Two consequences of
+  making it real are now baked into the fixtures, not pending churn: bare
+  `toHaveScheduled()` sees a `webhook.send`/`email.send` watchdog schedule, and
+  `email.send` requires `apiKey`/`from` (the real shim's contract).
   **Still stubbed / blocked:** `blob` stays the epilogue no-op — its recipe path
   (`blob.write`/`blob.seal`) needs streaming sha256 (`crypto.sha256Init/Update/
   Final`), which the portable replay crypto explicitly `no()`s; `blob.put`/`get`/
   `url` would move but a half-migrated verb is worse than none. Migrating it
   needs streaming SHA-256 in the replay engine first.
-  **To finish the unification:** make `realEffects` the default, delete the gated
-  epilogue stubs (webhook/schedule/cron/email), re-baseline affected snapshots,
-  and migrate `blob` once streaming sha256 lands. Known churn at the flip: (1)
-  **snapshots** of a webhook/schedule/email handler re-baseline (effect log goes
-  primitive); (2) **bare `toHaveScheduled()`** flips true after a `webhook.send`/
-  `email.send` (their crash-recovery watchdog is a real `schedule`); (3) handlers
-  calling `email.send` without `apiKey`/`from` (e.g. `checkout`'s stub-mode call)
-  break under the real shim — update the call or keep the fixture stub-mode.
 - ~~**A detached `wake` helper** for `schedule` / `cron` callbacks~~ — DONE.
   `scenario().wake({ on, ctx, key?, id?, scheduledAtNs?, method? })` authors a
   `durable_wake` world directly — the analogue of `sendCallback` for the durable
