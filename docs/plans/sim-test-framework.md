@@ -464,15 +464,15 @@ too. Fixtures `testdata/{authsurface,middleware}`.
 
 ## What's left
 
-- **The rest of the sim base surface.** Compute globals + middleware are in;
-  still missing: `platform.*` (admin's instance/deploy management — needs a
-  `_system.platform` recorder), the public `http` global (`http.send`/`subscribe`
-  over `_system.http`), and `browser.*`. And native **ECDSA/RSA** for OIDC RS256/
-  ES256 verify (`std.crypto` has ecdsa but not RSA; a crypto host-bridge or a
-  portable impl). The clean end-state — install the REAL effect globals over
-  `_system` recorders so `webhook.send` decomposes to its primitives — would
-  shift the effect log to primitive-level and needs the matchers/cross-checks
-  updated; kept as stubs for now.
+- **The last of the sim base surface.** Compute globals + middleware + `http` /
+  `platform` / `browser` (effect recorders) + **RS256** OIDC verify
+  (`crypto.verifyRsa`, pure-JS BigInt) are all in. Remaining: **ES256/ECDSA**
+  verify (EC point math or a crypto host-bridge) and **RS384/512** (need native
+  sha384/512); `platform.*` reads hit the one closed-world kv (no per-instance
+  store isolation) and `auth.checkRootToken` assumes root — first-pass. And the
+  clean end-state — install the REAL effect globals so `webhook.send` decomposes
+  to `http.fetch`+`kv`+`schedule` — would shift the effect log to primitive level
+  and needs the matchers/cross-checks updated; kept as stubs.
 - **A detached `wake` helper** for `schedule` / `cron` callbacks — the
   `durable_wake` analogue of `sendCallback` (author the wake world directly).
   Deferred only because its exact `request.*` surface wasn't re-confirmed this
