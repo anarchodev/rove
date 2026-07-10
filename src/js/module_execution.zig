@@ -26,6 +26,7 @@ const rpc_dispatch = @import("rpc_dispatch.zig");
 const response_building = @import("response_building.zig");
 const continuation_mod = @import("bindings/continuation.zig");
 const bytecode_cache_mod = @import("bytecode_cache.zig");
+const files_mod = @import("rove-files"); // manifest_json (PM P0 resolver build)
 const BlobBytes = bytecode_cache_mod.BlobBytes;
 
 const RunError = error{ Interrupted, OutOfMemory, JsException };
@@ -577,7 +578,86 @@ pub const PackageResolver = struct {
         // Importer is an app handler → the flat app surface.
         return self.app_imports.get(specifier);
     }
+
+    /// Free every owned key/value (buildResolver allocates them all).
+    pub fn deinit(self: *PackageResolver, allocator: std.mem.Allocator) void {
+        var ai = self.app_imports.iterator();
+        while (ai.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            allocator.free(e.value_ptr.*);
+        }
+        self.app_imports.deinit(allocator);
+        var pi = self.pkg_imports.iterator();
+        while (pi.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            var inner = e.value_ptr;
+            var ii = inner.iterator();
+            while (ii.next()) |ie| {
+                allocator.free(ie.key_ptr.*);
+                allocator.free(ie.value_ptr.*);
+            }
+            inner.deinit(allocator);
+        }
+        self.pkg_imports.deinit(allocator);
+    }
 };
+
+/// The entry-module key for a package: `/pkg/<pkg_hash>/index.mjs`.
+fn pkgEntryKey(allocator: std.mem.Allocator, pkg_hash_hex: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "/pkg/{s}/index.mjs", .{pkg_hash_hex});
+}
+
+/// The virtual-dir key for a package: `/pkg/<pkg_hash>/` (the `pkg_imports` key).
+fn pkgDirKey(allocator: std.mem.Allocator, pkg_hash_hex: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "/pkg/{s}/", .{pkg_hash_hex});
+}
+
+/// Build a `PackageResolver` from a decoded manifest (PM P1). `app_imports`
+/// becomes the flat app surface; each package's `imports` becomes its
+/// encapsulated per-importer map (keyed by its `/pkg/<hash>/` dir). Values
+/// are entry keys (`/pkg/<dep_hash>/index.mjs`). Caller owns the result —
+/// `resolver.deinit(allocator)` frees it. On error, everything allocated
+/// so far is freed.
+pub fn buildResolver(
+    allocator: std.mem.Allocator,
+    manifest: *const files_mod.manifest_json.Manifest,
+) !PackageResolver {
+    var r = PackageResolver{ .app_imports = .empty, .pkg_imports = .empty };
+    errdefer r.deinit(allocator);
+
+    for (manifest.app_imports) |ie| {
+        const spec = try allocator.dupe(u8, ie.specifier);
+        errdefer allocator.free(spec);
+        const key = try pkgEntryKey(allocator, &ie.pkg_hash_hex);
+        errdefer allocator.free(key);
+        try r.app_imports.put(allocator, spec, key);
+    }
+
+    for (manifest.packages) |p| {
+        var inner: std.StringHashMapUnmanaged([]const u8) = .empty;
+        // On failure mid-package, free `inner`'s own entries before the
+        // outer errdefer (which only knows the packages already in the map).
+        errdefer {
+            var it = inner.iterator();
+            while (it.next()) |e| {
+                allocator.free(e.key_ptr.*);
+                allocator.free(e.value_ptr.*);
+            }
+            inner.deinit(allocator);
+        }
+        for (p.imports) |ie| {
+            const spec = try allocator.dupe(u8, ie.specifier);
+            errdefer allocator.free(spec);
+            const val = try pkgEntryKey(allocator, &ie.pkg_hash_hex);
+            errdefer allocator.free(val);
+            try inner.put(allocator, spec, val);
+        }
+        const dir = try pkgDirKey(allocator, &p.pkg_hash_hex);
+        errdefer allocator.free(dir);
+        try r.pkg_imports.put(allocator, dir, inner);
+    }
+    return r;
+}
 
 /// `/pkg/<hash>/lib/x.mjs` → `/pkg/<hash>/` (the package's virtual dir,
 /// the `pkg_imports` key). Null when `base` isn't a package-virtual path.
@@ -645,5 +725,109 @@ test "PackageResolver: app vs package importer (flat surface + encapsulation)" {
     try testing.expect(r.resolve("/pkg/OIDC/index.mjs", "@rewind/unknown") == null);
     // An importer under an unknown /pkg/ dir → null (no import map).
     try testing.expect(r.resolve("/pkg/NOPE/index.mjs", "@rewind/jwt") == null);
+}
+
+fn expectGlobalStr(ctx_raw: ?*c.JSContext, global: c.JSValue, name: [*:0]const u8, want: []const u8) !void {
+    const v = c.JS_GetPropertyStr(ctx_raw, global, name);
+    defer c.JS_FreeValue(ctx_raw, v);
+    var len: usize = 0;
+    const cstr = c.JS_ToCStringLen(ctx_raw, &len, v);
+    defer c.JS_FreeCString(ctx_raw, cstr);
+    try testing.expectEqualStrings(want, @as([*]const u8, @ptrCast(cstr))[0..len]);
+}
+
+test "PM P1 fixture smoke: manifest → buildResolver → quickjs resolves an encapsulated multi-version chain" {
+    const a = testing.allocator;
+    var rt = try qjs.Runtime.init();
+    defer rt.deinit();
+    var ctx = try rt.newContext();
+    defer ctx.deinit();
+
+    // Two jwt versions + oidc. oidc imports @rewind/jwt (→ its OWN jwt@1.4);
+    // the app also imports @rewind/jwt (→ jwt@1.9). Same specifier, two
+    // versions coexisting — the encapsulation guarantee, end to end.
+    const OIDC = "a" ** 64;
+    const JWT19 = "b" ** 64;
+    const JWT14 = "c" ** 64;
+    const H = "d" ** 64; // filler file hashes (unused by resolution)
+
+    // Build the resolver from a REAL v2 manifest (exercises decode + buildResolver).
+    const mbytes =
+        "{\"v\":2,\"deployment_id\":\"0000000000000001\",\"entries\":[]," ++
+        "\"packages\":[" ++
+        "{\"spec\":\"@rewind/oidc\",\"version\":\"2.0.0\",\"pkg_hash\":\"" ++ OIDC ++ "\"," ++
+        "\"files\":[{\"path\":\"index.mjs\",\"bytecode_hash\":\"" ++ H ++ "\",\"source_hash\":\"" ++ H ++ "\"}]," ++
+        "\"imports\":{\"@rewind/jwt\":\"" ++ JWT14 ++ "\"},\"capabilities\":[]}," ++
+        "{\"spec\":\"@rewind/jwt\",\"version\":\"1.9.0\",\"pkg_hash\":\"" ++ JWT19 ++ "\"," ++
+        "\"files\":[{\"path\":\"index.mjs\",\"bytecode_hash\":\"" ++ H ++ "\",\"source_hash\":\"" ++ H ++ "\"}]," ++
+        "\"imports\":{},\"capabilities\":[]}," ++
+        "{\"spec\":\"@rewind/jwt\",\"version\":\"1.4.0\",\"pkg_hash\":\"" ++ JWT14 ++ "\"," ++
+        "\"files\":[{\"path\":\"index.mjs\",\"bytecode_hash\":\"" ++ H ++ "\",\"source_hash\":\"" ++ H ++ "\"}]," ++
+        "\"imports\":{},\"capabilities\":[],\"private\":true}" ++
+        "]," ++
+        "\"app_imports\":{\"@rewind/oidc\":\"" ++ OIDC ++ "\",\"@rewind/jwt\":\"" ++ JWT19 ++ "\"}}";
+    var manifest = try files_mod.manifest_json.decode(a, mbytes);
+    defer manifest.deinit();
+    var resolver = try buildResolver(a, &manifest);
+    defer resolver.deinit(a);
+
+    // quickjs resolves + loads module imports at COMPILE time, so the loader
+    // (resolver + map) must be live before compiling, and packages compile in
+    // dependency order (leaves first). A package compiles under its own
+    // `/pkg/<hash>/` filename so its bare imports normalize in PACKAGE context
+    // (oidc's `@rewind/jwt` → jwt@1.4), baking the resolved key into its bytecode.
+    var bytecodes: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
+    defer bytecodes.deinit(a);
+    var lctx = module_loader.Ctx{ .allocator = a, .bytecodes = &bytecodes, .resolver = &resolver };
+    c.JS_SetModuleLoaderFunc(rt.raw, module_loader.normalize, module_loader.load, &lctx);
+
+    const j19_bc = try ctx.compileToBytecode(
+        "globalThis.__log=(globalThis.__log||'')+'j19;'; export const v='jwt19';",
+        "/pkg/" ++ JWT19 ++ "/index.mjs", a, .{ .kind = .module });
+    defer a.free(j19_bc);
+    var j19_bb = BlobBytes{ .bytes = j19_bc, .hash_hex = @splat('9'), .refcount = std.atomic.Value(u32).init(1) };
+    try bytecodes.put(a, "/pkg/" ++ JWT19 ++ "/index.mjs", &j19_bb);
+
+    const j14_bc = try ctx.compileToBytecode(
+        "globalThis.__log=(globalThis.__log||'')+'j14;'; export const v='jwt14';",
+        "/pkg/" ++ JWT14 ++ "/index.mjs", a, .{ .kind = .module });
+    defer a.free(j14_bc);
+    var j14_bb = BlobBytes{ .bytes = j14_bc, .hash_hex = @splat('4'), .refcount = std.atomic.Value(u32).init(1) };
+    try bytecodes.put(a, "/pkg/" ++ JWT14 ++ "/index.mjs", &j14_bb);
+
+    const oidc_bc = ctx.compileToBytecode(
+        "import {v} from '@rewind/jwt'; globalThis.__oidcJwt=v; export const p='oidc';",
+        "/pkg/" ++ OIDC ++ "/index.mjs", a, .{ .kind = .module }) catch |e| {
+        if (ctx.takeExceptionMessage(a)) |m| {
+            defer a.free(m);
+            std.debug.print("\noidc compile failed: {s}\n", .{m});
+        } else |_| {}
+        return e;
+    };
+    defer a.free(oidc_bc);
+    var oidc_bb = BlobBytes{ .bytes = oidc_bc, .hash_hex = @splat('O'), .refcount = std.atomic.Value(u32).init(1) };
+    try bytecodes.put(a, "/pkg/" ++ OIDC ++ "/index.mjs", &oidc_bb);
+
+    const app_src = "import {p} from '@rewind/oidc'; import {v} from '@rewind/jwt'; globalThis.__appJwt=v; globalThis.__appOidc=p;";
+    const app_z = try a.allocSentinel(u8, app_src.len, 0);
+    defer a.free(app_z);
+    @memcpy(app_z, app_src);
+    var res = ctx.eval(app_z, "index.mjs", .{ .kind = .module }) catch |e| {
+        if (ctx.takeExceptionMessage(a)) |msg| {
+            defer a.free(msg);
+            std.debug.print("\nmodule eval failed: {s}\n", .{msg});
+        } else |_| {}
+        return e;
+    };
+    res.deinit();
+    // Drain any deferred module jobs so top-level side effects are visible.
+    var pctx: ?*c.JSContext = null;
+    while (c.JS_ExecutePendingJob(rt.raw, &pctx) > 0) {}
+
+    const global = c.JS_GetGlobalObject(ctx.raw);
+    defer c.JS_FreeValue(ctx.raw, global);
+    try expectGlobalStr(ctx.raw, global, "__appOidc", "oidc"); // app resolved oidc
+    try expectGlobalStr(ctx.raw, global, "__appJwt", "jwt19"); // app's @rewind/jwt → 1.9
+    try expectGlobalStr(ctx.raw, global, "__oidcJwt", "jwt14"); // oidc's @rewind/jwt → 1.4 (encapsulated)
 }
 
