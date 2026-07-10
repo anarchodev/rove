@@ -706,18 +706,6 @@ pub const BlockedTenants = struct {
     }
 };
 
-/// Worker never uploads code, so the `CompileFn` it passes into
-/// `FileStore.init` just errors out — making accidental put-source
-/// calls impossible to ignore.
-fn stubCompile(
-    _: ?*anyopaque,
-    _: []const u8,
-    _: [:0]const u8,
-    _: std.mem.Allocator,
-) anyerror![]u8 {
-    return error.CompileNotSupportedOnWorker;
-}
-
 /// Per-tenant log state held by the worker — currently just the
 /// per-tenant `RequestIdMinter`. Opened eagerly in `Worker.create`,
 /// closed in `Worker.destroy`.
@@ -2292,7 +2280,6 @@ pub fn Worker(comptime opts: Options) type {
             defer release_ws.deinit();
             const starter_dep_id = try starter.deployStarterContent(
                 allocator,
-                inst.dir,
                 inst.id,
                 self.node.blob_backend_cfg,
                 compile_fn,
@@ -2348,7 +2335,6 @@ pub fn Worker(comptime opts: Options) type {
             defer release_ws.deinit();
             const dep_id = starter.deployGenesisAdminContent(
                 a,
-                inst.dir,
                 inst.id,
                 self.node.blob_backend_cfg,
                 compile_fn,
@@ -2568,7 +2554,7 @@ pub fn Worker(comptime opts: Options) type {
             if (p.scope.len == 0 or p.entries.len == 0 or p.entries.len > 256)
                 return fail(router, a, &pf, 400, "scope required + 1..256 entries");
 
-            const entries = a.alloc(files_mod.FileStore.Entry, p.entries.len) catch
+            const entries = a.alloc(files_mod.Entry, p.entries.len) catch
                 return fail(router, a, &pf, 500, "out of memory");
             defer a.free(entries);
             for (p.entries, 0..) |it, i| {
@@ -2585,7 +2571,7 @@ pub fn Worker(comptime opts: Options) type {
                 else
                     return fail(router, a, &pf, 400, "kind must be handler|static");
                 if (it.source_hex.len != files_mod.HASH_HEX_LEN) return fail(router, a, &pf, 400, "bad source_hex");
-                var e: files_mod.FileStore.Entry = .{
+                var e: files_mod.Entry = .{
                     .path = @constCast(it.path),
                     .kind = kind,
                     .content_type = @constCast(it.content_type),

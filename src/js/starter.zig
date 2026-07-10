@@ -42,24 +42,14 @@ const GENESIS_UPLOAD_MJS = @embedFile("upload_mjs");
 pub const BakedHandler = struct { path: []const u8, source: []const u8 };
 pub const BakedStatic = struct { path: []const u8, content: []const u8, content_type: []const u8 };
 
-/// Write the initial deployment for a freshly-created instance. Opens
-/// its own short-lived kv + blob-store connections, pushes the two
-/// starter files through FileStore (which compiles + blob-addresses
-/// them), and commits a deployment row. Closes everything on the way
-/// out — the main worker and files-server lazy-open their own
-/// connections later, so we're not holding onto any state that would
-/// conflict.
-/// Drop the starter content into the freshly-created tenant's
-/// working tree, encode the resulting manifest as JSON, write it to
-/// the per-tenant `deployments/` BlobBackend, and stage a `_deploy/
-/// current = 1` write into `release_ws` so the caller can propose
+/// Write the initial deployment for a freshly-created instance:
+/// compile + content-address the starter files into the tenant's
+/// `file-blobs` backend, encode the resulting manifest as JSON, write
+/// it to the per-tenant `deployments/` BlobBackend, and stage a
+/// `_deploy/current` write into `release_ws` so the caller can propose
 /// it through raft alongside the rest of the signup writeset.
-/// Phase 5.5(e) F2-storage retired the per-tenant files writeset
-/// (envelope 3); the runtime release pointer rides envelope 0 with
-/// the rest of the customer kv writes.
 pub fn deployStarterContent(
     allocator: std.mem.Allocator,
-    inst_dir: []const u8,
     inst_id: []const u8,
     blob_cfg: blob_mod.BackendConfig,
     compile_fn: files_mod.CompileFn,
@@ -68,7 +58,6 @@ pub fn deployStarterContent(
 ) !u64 {
     return deployBakedBundle(
         allocator,
-        inst_dir,
         inst_id,
         blob_cfg,
         compile_fn,
@@ -85,7 +74,6 @@ pub fn deployStarterContent(
 /// `release_ws`'s `_deploy/current` through raft.
 pub fn deployGenesisAdminContent(
     allocator: std.mem.Allocator,
-    inst_dir: []const u8,
     inst_id: []const u8,
     blob_cfg: blob_mod.BackendConfig,
     compile_fn: files_mod.CompileFn,
@@ -94,7 +82,6 @@ pub fn deployGenesisAdminContent(
 ) !u64 {
     return deployBakedBundle(
         allocator,
-        inst_dir,
         inst_id,
         blob_cfg,
         compile_fn,
@@ -111,11 +98,11 @@ pub fn deployGenesisAdminContent(
 /// Stage a baked bundle (compile + content-address each file, write the
 /// manifest to the tenant's `deployments/` backend) and stage
 /// `_deploy/current = dep_id` into `release_ws`. Shared by the starter +
-/// genesis-admin deploys. Opens its own short-lived scratch kv + blob
-/// connections and closes them on the way out.
+/// genesis-admin deploys. Opens its own short-lived blob connections and
+/// closes them on the way out — the same stateless staging shape as the
+/// worker's deploy thread (`compileAndStage`), just with baked inputs.
 pub fn deployBakedBundle(
     allocator: std.mem.Allocator,
-    inst_dir: []const u8,
     inst_id: []const u8,
     blob_cfg: blob_mod.BackendConfig,
     compile_fn: files_mod.CompileFn,
@@ -124,26 +111,6 @@ pub fn deployBakedBundle(
     handlers: []const BakedHandler,
     statics: []const BakedStatic,
 ) !u64 {
-    // Same scratch-only role as bootstrap.zig's
-    // `.bootstrap-scratch.kv` — `files_mod.FileStore.init` demands
-    // a KvStore but nothing persists here (the manifest goes to
-    // S3). Use a per-call tmp kvexp file that gets deleted on
-    // return.
-    const files_db_path = try std.fmt.allocPrintSentinel(
-        allocator,
-        "{s}/.starter-scratch.kv",
-        .{inst_dir},
-        0,
-    );
-    defer {
-        std.fs.cwd().deleteFile(files_db_path) catch {};
-        allocator.free(files_db_path);
-    }
-    std.fs.cwd().deleteFile(files_db_path) catch {};
-
-    const files_kv = try kv_mod.KvStore.open(allocator, files_db_path);
-    defer files_kv.close();
-
     var blob_backend = try blob_mod.BlobBackend.openPerTenant(
         allocator,
         blob_cfg,
@@ -152,19 +119,42 @@ pub fn deployBakedBundle(
     );
     defer blob_backend.deinit();
 
-    var store = files_mod.FileStore.init(
+    const inputs = try allocator.alloc(files_mod.DeployInput, handlers.len);
+    defer allocator.free(inputs);
+    for (handlers, 0..) |h, i|
+        inputs[i] = .{ .path = h.path, .kind = .handler, .bytes = h.source };
+
+    const compiled = try files_mod.compileAndStage(
         allocator,
-        files_kv,
         blob_backend.blobStore(),
         compile_fn,
         compile_ctx,
+        inputs,
     );
+    defer allocator.free(compiled);
 
-    for (handlers) |h| try store.putSource(h.path, h.source);
-    for (statics) |s| try store.putStatic(s.path, s.content, s.content_type);
-
-    const entries = try store.assembleManifest();
-    defer store.freeEntries(entries);
+    const entries = try allocator.alloc(files_mod.Entry, handlers.len + statics.len);
+    defer allocator.free(entries);
+    for (compiled, 0..) |cf, i| entries[i] = .{
+        .path = cf.path,
+        .kind = .handler,
+        .content_type = "",
+        .source_hex = cf.source_hex,
+        .bytecode_hex = cf.bytecode_hex,
+    };
+    for (statics, 0..) |s, i| {
+        try files_mod.validatePath(s.path);
+        var src_hex: [files_mod.HASH_HEX_LEN]u8 = undefined;
+        files_mod.hashHex(s.content, &src_hex);
+        try files_mod.putBlobIfMissingTo(blob_backend.blobStore(), &src_hex, s.content);
+        entries[handlers.len + i] = .{
+            .path = s.path,
+            .kind = .static,
+            .content_type = s.content_type,
+            .source_hex = src_hex,
+            .bytecode_hex = @splat(0),
+        };
+    }
 
     // Content-addressed dep_id (truncated sha-256). The starter content
     // is byte-identical across every tenant, so every starter deploy
@@ -187,8 +177,6 @@ pub fn deployBakedBundle(
     var key_buf: [25]u8 = undefined;
     const key = files_mod.manifest_json.manifestKey(&key_buf, next_id);
     try manifest_be.blobStore().put(key, json_bytes);
-
-    try store.setCurrentDeploymentId(next_id);
 
     // Stage `_deploy/current = next_id` so the caller's raft propose
     // sees it. Followers' apply path commits it into their copies of

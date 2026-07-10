@@ -87,7 +87,7 @@ pub const Package = struct {
 /// empty for a v1 (package-less) manifest.
 pub const Manifest = struct {
     id: u64,
-    entries: []root.FileStore.Entry,
+    entries: []root.Entry,
     packages: []Package = &.{},
     app_imports: []ImportEntry = &.{},
     allocator: std.mem.Allocator,
@@ -121,7 +121,7 @@ pub const Manifest = struct {
 pub fn encode(
     allocator: std.mem.Allocator,
     dep_id: u64,
-    entries: []const root.FileStore.Entry,
+    entries: []const root.Entry,
     packages: []const Package,
     app_imports: []const ImportEntry,
 ) error{OutOfMemory}![]u8 {
@@ -238,7 +238,7 @@ pub fn decode(
         else => return Error.InvalidManifest,
     };
 
-    var entries = allocator.alloc(root.FileStore.Entry, arr.items.len) catch
+    var entries = allocator.alloc(root.Entry, arr.items.len) catch
         return Error.OutOfMemory;
     var filled: usize = 0;
     errdefer {
@@ -550,7 +550,7 @@ pub fn manifestKey(buf: *[25]u8, dep_id: u64) []const u8 {
 /// the same content but different encode-order would otherwise hash
 /// to different ids.
 pub fn computeDeploymentId(
-    entries: []const root.FileStore.Entry,
+    entries: []const root.Entry,
     packages: []const Package,
     app_imports: []const ImportEntry,
 ) u64 {
@@ -560,7 +560,7 @@ pub fn computeDeploymentId(
     for (0..n) |i| sorted_indices[i] = i;
     const idx_slice = sorted_indices[0..n];
     std.mem.sort(usize, idx_slice, entries, struct {
-        fn lt(ctx: []const root.FileStore.Entry, a: usize, b: usize) bool {
+        fn lt(ctx: []const root.Entry, a: usize, b: usize) bool {
             return std.mem.lessThan(u8, ctx[a].path, ctx[b].path);
         }
     }.lt);
@@ -634,7 +634,7 @@ pub fn computeDeploymentId(
 const testing = std.testing;
 
 test "encode + decode round-trip" {
-    var entries = [_]root.FileStore.Entry{
+    var entries = [_]root.Entry{
         .{
             .path = @constCast("index.mjs"),
             .kind = .handler,
@@ -697,7 +697,7 @@ test "manifestKey produces zero-padded {N:020d}.json" {
 }
 
 test "computeDeploymentId: same entries → same id (idempotent)" {
-    var entries = [_]root.FileStore.Entry{
+    var entries = [_]root.Entry{
         .{
             .path = @constCast("index.mjs"),
             .kind = .handler,
@@ -719,7 +719,7 @@ test "computeDeploymentId: same entries → same id (idempotent)" {
 }
 
 test "computeDeploymentId: entry order doesn't matter (sorts by path)" {
-    var entries_a = [_]root.FileStore.Entry{
+    var entries_a = [_]root.Entry{
         .{
             .path = @constCast("a.mjs"), .kind = .handler,
             .content_type = @constCast(""),
@@ -731,7 +731,7 @@ test "computeDeploymentId: entry order doesn't matter (sorts by path)" {
             .source_hex = @splat('3'), .bytecode_hex = @splat('4'),
         },
     };
-    var entries_b = [_]root.FileStore.Entry{
+    var entries_b = [_]root.Entry{
         .{
             .path = @constCast("b.mjs"), .kind = .handler,
             .content_type = @constCast(""),
@@ -750,12 +750,12 @@ test "computeDeploymentId: entry order doesn't matter (sorts by path)" {
 }
 
 test "computeDeploymentId: changing content yields different id" {
-    var entries_a = [_]root.FileStore.Entry{.{
+    var entries_a = [_]root.Entry{.{
         .path = @constCast("index.mjs"), .kind = .handler,
         .content_type = @constCast(""),
         .source_hex = @splat('a'), .bytecode_hex = @splat('b'),
     }};
-    var entries_b = [_]root.FileStore.Entry{.{
+    var entries_b = [_]root.Entry{.{
         .path = @constCast("index.mjs"), .kind = .handler,
         .content_type = @constCast(""),
         .source_hex = @splat('a'), .bytecode_hex = @splat('c'), // different bytecode
@@ -766,7 +766,7 @@ test "computeDeploymentId: changing content yields different id" {
 }
 
 test "computeDeploymentId: empty entries is stable" {
-    const empty: []const root.FileStore.Entry = &.{};
+    const empty: []const root.Entry = &.{};
     const id_a = computeDeploymentId(empty, &.{}, &.{});
     const id_b = computeDeploymentId(empty, &.{}, &.{});
     try testing.expectEqual(id_a, id_b);
@@ -780,7 +780,7 @@ fn findPkg(m: Manifest, spec: []const u8) ?Package {
 }
 
 test "v2: encode+decode round-trip with packages + app_imports" {
-    var entries = [_]root.FileStore.Entry{.{
+    var entries = [_]root.Entry{.{
         .path = @constCast("index.mjs"), .kind = .handler,
         .content_type = @constCast(""),
         .source_hex = @splat('a'), .bytecode_hex = @splat('b'),
@@ -842,7 +842,7 @@ test "v2: decode rejects v1 (no back-compat — complete redeploy)" {
 }
 
 test "v2: a package-less deploy has no packages/app_imports sections" {
-    var entries = [_]root.FileStore.Entry{.{
+    var entries = [_]root.Entry{.{
         .path = @constCast("index.mjs"), .kind = .handler,
         .content_type = @constCast(""),
         .source_hex = @splat('a'), .bytecode_hex = @splat('b'),
