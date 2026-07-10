@@ -18,7 +18,7 @@
 //      watchdog is the recovery primitive the deleted promotion sweep
 //      used to be. Same key ⇒ same entry; onresult later moves it
 //      (retry backoff) or cancels it (terminal).
-//   3. Fire the fetch via the capability-scoped `__rove_fetch`, aimed
+//   3. Fire the fetch via the gated `__rove.fetch`, aimed
 //      at `__system/webhook_onresult`, stamping the same
 //      `X-Rove-Schedule-Id` / `X-Rove-Schedule-Version` headers the
 //      Zig sweep stamped — upstream (id, version) dedup keys keep
@@ -67,7 +67,7 @@ export default function () {
 
     // (3) the attempt.
     const attempts = typeof owed.attempts === "number" ? owed.attempts : 0;
-    __rove_fetch({
+    __rove.fetch({
         url: owed.url,
         method: owed.method || "POST",
         body: owed.body || "",

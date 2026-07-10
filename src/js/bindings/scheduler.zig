@@ -66,7 +66,7 @@ pub fn jsSetWake(
 ) callconv(.c) c.JSValue {
     const state = globals.getState(ctx);
     if (!state.is_system_module) {
-        _ = c.JS_ThrowTypeError(ctx, "__rove_set_wake is not available to customer code");
+        _ = c.JS_ThrowTypeError(ctx, "__rove.wake.set is not available to customer code");
         return js_exception;
     }
     if (argc < 1) {
@@ -105,7 +105,7 @@ pub fn jsFireWake(
 ) callconv(.c) c.JSValue {
     const state = globals.getState(ctx);
     if (!state.is_system_module) {
-        _ = c.JS_ThrowTypeError(ctx, "__rove_fire_wake is not available to customer code");
+        _ = c.JS_ThrowTypeError(ctx, "__rove.wake.fire is not available to customer code");
         return js_exception;
     }
     if (argc < 6) {

@@ -36,16 +36,16 @@ export default function () {
     kv.delete("_blob/pending/" + hash);
 
     const userCtx = c.ctx !== undefined ? c.ctx : null;
-    return __rove_next(c.on, {
-        ctx: {
-            result: {
-                hash: hash,
-                ok: true,
-                status: 200,
-                body_b64: base64url.encode(new TextEncoder().encode(
-                    JSON.stringify({ hash: hash, totalBytes: c.totalBytes }))),
-            },
-            context: userCtx,
+    // Cross-module continuation into the customer's `on` handler — the
+    // widened public `next(target, ctx)` (no bare `__rove_next`).
+    return next(c.on, {
+        result: {
+            hash: hash,
+            ok: true,
+            status: 200,
+            body_b64: base64url.encode(new TextEncoder().encode(
+                JSON.stringify({ hash: hash, totalBytes: c.totalBytes }))),
         },
+        context: userCtx,
     });
 }

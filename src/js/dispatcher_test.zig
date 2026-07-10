@@ -195,7 +195,7 @@ test "dispatch: next(...) return is classified as a continuation" {
     var outcome = try runOneOutcome(
         &d,
         kv,
-        \\return __rove_next("handlers/login", { fn: "onToken", ctx: { u: "alice", tries: 0 } });
+        \\return next("handlers/login", { u: "alice", tries: 0 });
     ,
         .{ .method = "GET", .path = "/" },
     );
@@ -208,7 +208,9 @@ test "dispatch: next(...) return is classified as a continuation" {
         .continuation => |*cont| {
             defer cont.deinit(testing.allocator);
             try testing.expectEqualStrings("handlers/login", cont.path);
-            try testing.expectEqualStrings("onToken", cont.fn_name.?);
+            // The public `next(target, ctx)` targets the conventional
+            // export (no `fn` — that native option has no public caller).
+            try testing.expect(cont.fn_name == null);
             // ctx is JSON-serialized verbatim.
             try testing.expect(std.mem.indexOf(u8, cont.ctx_json, "\"u\":\"alice\"") != null);
             try testing.expect(std.mem.indexOf(u8, cont.ctx_json, "\"tries\":0") != null);
@@ -238,7 +240,7 @@ test "dispatch: ordinary return stays terminal (trampoline does not engage)" {
     var outcome = try runOneOutcome(
         &d,
         kv,
-        \\return __rove_next("m", { ctx: {} });
+        \\return next("m", {});
     ,
         .{ .method = "GET", .path = "/" },
     );
@@ -728,10 +730,10 @@ test "dispatch: next({ctx}) with unserializable ctx throws, absent ctx stays leg
         &d,
         kv,
         \\let threw = null;
-        \\try { __rove_next("", { ctx: { big: 10n } }); } catch (e) { threw = e; }
+        \\try { next("", { big: 10n }); } catch (e) { threw = e; }
         \\if (!(threw instanceof TypeError)) return "no-throw";
-        \\__rove_next("", {});   // absent ctx must not throw
-        \\__rove_next("");       // no opts at all must not throw
+        \\next("", {});   // ctx present-but-empty must not throw
+        \\next("");       // same-module, empty ctx must not throw
         \\return "threw";
     ,
         .{ .method = "GET", .path = "/" },

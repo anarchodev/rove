@@ -145,20 +145,23 @@ export default function () {
         error: result.error || null,
         context: context,
     };
-    // §6.4 held-sync resume hook. `__rove_resume_if_bound` is a
-    // persistent global builtin (wired in `globals.zig`'s
-    // `GLOBAL_BUILTINS`; survives the `_harden.js` deletion of
-    // `_system`). Returns true when a parked continuation on this
-    // worker is bound to this send-id (the open hop wrote ONE
-    // `_send/owed/` marker and returned `__rove_next`). On match we
-    // SKIP the customer's `on_result` — held-sync's `onResult(ctx,
-    // outcome)` already received the event via the deferred resume.
-    if (__rove_resume_if_bound(id, JSON.stringify(event_for_heldsync))) {
+    // §6.4 held-sync resume hook. `__rove.resumeIfBound` is a gated
+    // privileged op (STATIC_NAMESPACES `__rove.*`; persistent across the
+    // `_harden.js` deletion of `_system`; throws for customer code).
+    // Returns true when a parked continuation on this worker is bound to
+    // this send-id (the open hop wrote ONE `_send/owed/` marker and
+    // parked via `next()`). On match we SKIP the customer's `on_result`
+    // — held-sync's `onResult(ctx, outcome)` already received the event
+    // via the deferred resume.
+    if (__rove.resumeIfBound(id, JSON.stringify(event_for_heldsync))) {
         return { status: 200 };
     }
 
     if (on_result) {
-        return __rove_next(on_result, { ctx: { result: result, context: context } });
+        // Cross-module continuation into the customer's on_result handler
+        // — the widened public `next(target, ctx)` (baked modules use the
+        // public shim; no bare native).
+        return next(on_result, { result: result, context: context });
     }
     return { status: 200 };
 }

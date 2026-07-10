@@ -2194,12 +2194,11 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
         // `onHeaders` activation.
         .{ .name = "receive", .cfunc = blob_b.jsBlobReceive, .argc = 1 },
     } },
-    // Phase 5 PR-3: the `_system.continuation.resumeIfBound` shim was
-    // a stillborn — the `_harden.js` step (`delete globalThis._system;`
-    // at the end of `evalShimSources`) runs BEFORE customer + baked
-    // modules eval, so a `_system.*` reference wouldn't be reachable
-    // from `__system/webhook_onresult.mjs`. The trampoline lives as
-    // a persistent global builtin (`__rove_resume_if_bound`) below.
+    // Phase 5 PR-3: `resumeIfBound` can't live under `_system.*` — the
+    // `_harden.js` `delete globalThis._system` runs BEFORE baked modules
+    // eval, so `__system/webhook_onresult.mjs` couldn't reach a
+    // `_system.*` reference. It lives (persistent, gated) as
+    // `__rove.resumeIfBound` in the `__rove.*` holder further below.
     // platform = { root, instances }. Installed on every context;
     // the C callbacks check `state.platform` and throw for non-admin
     // handlers.
@@ -2225,6 +2224,42 @@ const STATIC_NAMESPACES = [_]NamespaceBindings{
     .{ .path = &.{ "_system", "platform", "auth" }, .fns = &.{
         .{ .name = "checkRootToken", .cfunc = jsPlatformAuthCheckRootToken, .argc = 1 },
     } },
+    // The continuation primitive behind the public `next()` disposition.
+    // A `_system.*` capability (deleted after base-eval): the `next.js`
+    // shim captures it in a closure; baked `__system/` modules that need
+    // cross-module dispatch call the public `next(target, ctx)` shim (they
+    // have the ambient globals + the shim holds the captured ref), so
+    // there is NO persistent bare `__rove_next`. Exempt from the
+    // shim-name lint via `ns_exceptions` ("continuation" → next.js).
+    .{ .path = &.{ "_system", "continuation" }, .fns = &.{
+        .{ .name = "next", .cfunc = cont_b.jsNext, .argc = 2 },
+    } },
+    // ── `__rove.*` — the privileged-ops surface ────────────────────────
+    // Persistent (NOT deleted by `_harden.js`) because badged
+    // `__system/*.mjs` modules, dispatched from the snapshot AFTER the
+    // delete, reach these as live globals — they can't see a shim's
+    // captured closure. Every entry is `is_system_module`-gated: a
+    // customer naming `__rove.X` gets a throw at call time. No
+    // customer-facing shim touches this surface (the one that used to —
+    // `next` — was widened into `_system.continuation.next`). See
+    // `docs/plans/privileged-surface-and-ratelimit-spec.md`.
+    .{ .path = &.{"__rove"}, .fns = &.{
+        // §6.4 held-sync resume hook — `webhook_onresult` wakes a handler
+        // parked on a synchronous `webhook.send`. Gated (see continuation.zig).
+        .{ .name = "resumeIfBound", .cfunc = cont_b.jsContinuationResumeIfBound, .argc = 2 },
+        // Raw privileged outbound fetch for baked delivery modules
+        // (`__system/webhook_fire`); delegates to `_system.http.fetch`
+        // internals so staging/commit-gating/limits are identical.
+        .{ .name = "fetch", .cfunc = http_b.jsSystemFetch, .argc = 1 },
+    } },
+    // §2.6 durable-wake tick ops — only `__system/scheduler_tick` calls
+    // them. `set` installs the tenant's single next-fire watermark;
+    // `fire` enqueues one `durable_wake` activation per due entry. Both
+    // gated (throw unless is_system_module).
+    .{ .path = &.{ "__rove", "wake" }, .fns = &.{
+        .{ .name = "set",  .cfunc = scheduler_b.jsSetWake,  .argc = 1 },
+        .{ .name = "fire", .cfunc = scheduler_b.jsFireWake, .argc = 6 },
+    } },
 };
 
 const INTRINSIC_EXTENSIONS = [_]NamespaceBindings{
@@ -2240,44 +2275,18 @@ const GLOBAL_BUILTINS = [_]FnBinding{
     // email.send JS wrapper before queuing the webhook row. Throws
     // Error{code:"rate_limited"} on exhaustion; no-op (returns
     // undefined) when state.limiter is null (test paths).
+    //
+    // The one remaining bare `__rove_*` global — kept because it's
+    // called by the base-eval `email.js` shim (so by the surface rule
+    // it should be `_system.email`, not `__rove.*`), and the
+    // rate-limit rework that removes it is deferred
+    // (`docs/plans/privileged-surface-and-ratelimit-spec.md` §3). The
+    // continuation / wake / systemFetch natives that used to live here
+    // moved into `_system.continuation.*` (widened `next`) and the
+    // gated `__rove.*` holder (STATIC_NAMESPACES) — every remaining
+    // privileged op reached by baked `__system/` modules is now under
+    // `__rove.*`, not a scattered bare global.
     .{ .name = "__rove_check_email_rate", .cfunc = email_rate_b.jsCheckEmailRate, .argc = 0 },
-    // Trampoline continuation primitive (connection-actor §6.1/§6.4
-    // unified return-as-continuation model). Pure constructor of a
-    // branded descriptor; classified on the handler's return path,
-    // not an effect. Internal-only today; the public `next` JS shim
-    // over this lands in Phase 3b-iii.
-    .{ .name = "__rove_next", .cfunc = cont_b.jsNext, .argc = 2 },
-    // Handler-surface Phase 2: the `__rove_stream(...)` return verb is
-    // RETIRED — streamed output is the `stream.start()`/`stream.write()`
-    // effect surface (`_system.stream`, registered above) + `on.*` +
-    // `return next()`. The dispatcher's `finishResponse` bridge builds
-    // the internal Stream descriptor from those effects.
-    // Phase 5 PR-3: deferred-resume hook for the baked
-    // `__system/webhook_onresult` shim. Has to be a persistent
-    // global (survives the `_harden.js` `delete globalThis._system`
-    // step) because customer + baked modules eval AFTER the harden
-    // step — `_system.continuation.resumeIfBound` is gone by then.
-    // Trampoline appends to `pending_bound_resumes` (drained on the
-    // next worker tick after the shim's batch txn commits — see
-    // `drainPendingBoundResumes`). Same posture as `__rove_next`:
-    // bypass the `_harden.js` deletion via the `builtin_exceptions`
-    // list in the globals-lint allowlist.
-    .{ .name = "__rove_resume_if_bound", .cfunc = cont_b.jsContinuationResumeIfBound, .argc = 2 },
-    // §2.6 durable scheduled wake (durable-wake P0; docs/architecture/effects-and-handlers.md).
-    // Capability-scoped (throw unless is_system_module) so only the
-    // baked `__system/scheduler_tick` reaches them — that scoping
-    // closes the clobber footgun. Persistent globals like the others
-    // above (survive `_harden.js`'s `delete globalThis._system`).
-    // `set_wake` sets this tenant's single next-fire watermark;
-    // `fire_wake` enqueues one `durable_wake` activation per due entry.
-    .{ .name = "__rove_set_wake", .cfunc = scheduler_b.jsSetWake, .argc = 1 },
-    .{ .name = "__rove_fire_wake", .cfunc = scheduler_b.jsFireWake, .argc = 6 },
-    // durable-wake-plan P5(a): outbound-fetch reach for baked modules
-    // (`__system/webhook_fire` — the wake-fired half of webhook.send).
-    // Same gate (throws unless is_system_module); delegates to the
-    // `_system.http.fetch` binding, so staging/commit-gating/limits
-    // are identical to a handler-issued fetch.
-    .{ .name = "__rove_fetch", .cfunc = http_b.jsSystemFetch, .argc = 1 },
 };
 
 // Public shims (docs/plans/builtin-libs-docs-plan.md Phase A). JSDoc-carrying
@@ -3460,15 +3469,17 @@ fn lintPrecededByJsdoc(src: []const u8, decl_start: usize) bool {
 test "lint(c): every native binding has a globals/ shim (Phase A)" {
     // Documented exceptions (builtin-libs-docs-plan.md): Date.now /
     // Math.random are INTRINSIC_EXTENSIONS (out of scope — intrinsic
-    // determinism overrides); __rove_check_email_rate is an internal
-    // GLOBAL_BUILTIN (called only by globals/email.js).
-    const builtin_exceptions = [_][]const u8{ "__rove_check_email_rate", "__rove_next", "__rove_resume_if_bound", "__rove_set_wake", "__rove_fire_wake", "__rove_fetch" };
+    // determinism overrides); __rove_check_email_rate is the one
+    // remaining internal GLOBAL_BUILTIN (called only by globals/email.js;
+    // the privileged-surface cleanup moved the rest under `__rove.*` /
+    // `_system.continuation.*`).
+    const builtin_exceptions = [_][]const u8{"__rove_check_email_rate"};
 
-    // Documented namespace exceptions: `_system.continuation` is an
-    // internal binding called only by the baked
-    // `__system/webhook_onresult` module (the §6.4 held-sync resume
-    // hook from the JS-shim webhook path — effect-reification-plan.md
-    // Phase 5 PR-3); not a public customer surface, no shim needed.
+    // Documented namespace exceptions: `_system.continuation.next` backs
+    // the public `next()` disposition (shim is next.js, not
+    // continuation.js, so the shim-name pivot needs the exemption). The
+    // gated `__rove.*` holder is skipped by this loop entirely (it pivots
+    // on `_system.*` paths only).
     const ns_exceptions = [_][]const u8{"continuation"};
 
     for (STATIC_NAMESPACES) |ns| {

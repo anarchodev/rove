@@ -129,7 +129,7 @@ pub fn jsSystemFetch(
 ) callconv(.c) c.JSValue {
     const state = globals.getState(ctx);
     if (!state.is_system_module) {
-        _ = c.JS_ThrowTypeError(ctx, "__rove_fetch is not available to customer code");
+        _ = c.JS_ThrowTypeError(ctx, "__rove.fetch is not available to customer code");
         return js_exception;
     }
     return jsHttpFetch(ctx, this, argc, argv);
