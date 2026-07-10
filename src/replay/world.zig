@@ -66,6 +66,10 @@ pub const World = struct {
     expected_json: ?[]const u8 = null,
     seed: u64 = 0,
     now_ms: u64 = 0,
+    /// The request payload is binary (a binary WS frame / a chunk activation):
+    /// `body` holds the raw bytes and the driver delivers them base64 so
+    /// `request.bytes` is byte-exact. Set when the world carries `bodyB64`.
+    body_is_binary: bool = false,
     /// The live request completed under the GC arena regime (the
     /// churny-handler fallback) — the driver must replay under it
     /// (under bump the same execution would OOM). Carried from the
@@ -137,6 +141,16 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
         if (jStr(r, "ip")) |s| w.ip = s;
         if (r.get("body")) |bv| {
             if (bv != .null) w.body = try valueToStr(a, bv);
+        }
+        // A binary payload (binary WS frame) rides base64 so arbitrary bytes
+        // survive JSON — decode to the raw body bytes + flag it binary.
+        if (jStr(r, "bodyB64")) |b64| {
+            const dec = std.base64.standard.Decoder;
+            const n = dec.calcSizeForSlice(b64) catch return Error.BadWorld;
+            const buf = try a.alloc(u8, n);
+            dec.decode(buf, b64) catch return Error.BadWorld;
+            w.body = buf;
+            w.body_is_binary = true;
         }
         // Flattened fetch/callback result surface (`request.status` etc.).
         w.status = jInt(r, "status");

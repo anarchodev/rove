@@ -947,6 +947,14 @@ class WsConnection {
     const activation = binary
       ? { kind: "ws_message", opcode: 2, dataB64: b64(data) }
       : { kind: "ws_message", opcode: 1, data: String(data) };
+    // The frame IS the request payload: `request.text` is the frame text
+    // regardless of opcode (the runtime contract `browser.message()` reads), and
+    // a binary frame's `request.bytes` is the decoded bytes. Deliver it as the
+    // body (a binary frame rides base64 → request.bytes, like activation.dataB64);
+    // `activation.data` carries it too, so handlers read either.
+    const req = binary
+      ? { activation, bodyB64: b64(data) }
+      : { activation, body: String(data) };
     const world = this.scenario._base({
       entry: this.scenario.entry,
       activation: "ws_message",
@@ -954,9 +962,7 @@ class WsConnection {
       ctx,
       kv,
       seed: seed + 1,
-      // The frame rides `request.activation.data`; the request payload itself is
-      // empty (readable "") — a handler that reads request.text mustn't throw.
-      request: { activation, body: "" },
+      request: req,
     });
     return new WsNode(this.scenario, world, this);
   }

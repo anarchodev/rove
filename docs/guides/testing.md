@@ -222,6 +222,11 @@ const closed = m1.disconnect();          // → onDisconnect
 ws.receive(new Uint8Array([1, 2, 3]), { binary: true });   // a binary frame
 ```
 
+The frame is the request payload: inside `onMessage`, `request.text` is the
+frame text (what `browser.message()` parses as JSON), a binary frame's
+`request.bytes` is the decoded bytes, and the frame is on
+`request.activation.data` too — read whichever the handler uses.
+
 ### A streamed upload (headers-first)
 
 A handler that exports `onHeaders` runs *before* the body is accepted, and the

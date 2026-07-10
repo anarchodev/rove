@@ -198,7 +198,8 @@ pub const Engine = struct {
             break :blk sources.get(wv.entry) orelse return Error.EntrySourceMissing;
         };
 
-        const binary_body = std.mem.eql(u8, wv.activation, "inbound_chunk") or
+        const binary_body = wv.body_is_binary or
+            std.mem.eql(u8, wv.activation, "inbound_chunk") or
             std.mem.eql(u8, wv.activation, "fetch_chunk");
 
         // Run the real `_middlewares/index.mjs` `before` iff it's resolvable AND
