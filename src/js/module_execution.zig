@@ -413,6 +413,11 @@ pub const module_loader = struct {
         /// Per-request module-resolution tape. Each successful `load`
         /// appends one entry. Null when capture is disabled.
         module_tape: ?*tape_mod.Tape = null,
+        /// Package-manager resolution (PM P0). Maps `@scope/pkg` bare
+        /// specifiers to package-virtual keys (`/pkg/<pkg_hash>/index.mjs`)
+        /// per-importer. Null ⇒ no packages ⇒ pre-PM behavior (every
+        /// current deployment). See `docs/plans/pm-p0-resolution-spec.md`.
+        resolver: ?*const PackageResolver = null,
     };
 
     /// Normalize `specifier` (relative or bare) against the importing
@@ -422,16 +427,36 @@ pub const module_loader = struct {
         ctx: ?*c.JSContext,
         base: [*c]const u8,
         name: [*c]const u8,
-        _: ?*anyopaque,
+        opaque_ptr: ?*anyopaque,
     ) callconv(.c) [*c]u8 {
         const base_s = if (base != null) std.mem.span(base) else "";
         const name_s = if (name != null) std.mem.span(name) else "";
-        const resolved = resolveSpecifier(base_s, name_s, static_buf[0..]);
 
-        // Copy into a qjs-allocated buffer so quickjs can free it.
-        const out = c.js_malloc(ctx, resolved.len + 1) orelse return null;
-        @memcpy(@as([*]u8, @ptrCast(out))[0..resolved.len], resolved);
-        @as([*]u8, @ptrCast(out))[resolved.len] = 0;
+        // PM P0: a bare `@scope/pkg` specifier resolves via the
+        // per-importer package resolver (app_imports for an app handler,
+        // the importing package's own imports for a `/pkg/…` importer).
+        // A miss falls through to the string resolver below, so relative
+        // imports and `__system/*` builtins are untouched.
+        if (opaque_ptr) |op| {
+            const self: *const Ctx = @ptrCast(@alignCast(op));
+            if (self.resolver) |r| {
+                if (!std.mem.startsWith(u8, name_s, "./") and !std.mem.startsWith(u8, name_s, "../")) {
+                    if (r.resolve(base_s, name_s)) |key| {
+                        return dupToJs(ctx, key);
+                    }
+                }
+            }
+        }
+
+        const resolved = resolveSpecifier(base_s, name_s, static_buf[0..]);
+        return dupToJs(ctx, resolved);
+    }
+
+    /// Copy `s` into a qjs-allocated NUL-terminated buffer quickjs owns.
+    fn dupToJs(ctx: ?*c.JSContext, s: []const u8) [*c]u8 {
+        const out = c.js_malloc(ctx, s.len + 1) orelse return null;
+        @memcpy(@as([*]u8, @ptrCast(out))[0..s.len], s);
+        @as([*]u8, @ptrCast(out))[s.len] = 0;
         return @ptrCast(out);
     }
 
@@ -523,5 +548,102 @@ fn resolveSpecifier(base: []const u8, specifier: []const u8, scratch: []u8) []co
     @memcpy(scratch[w .. w + tail], rest[0..tail]);
     w += tail;
     return scratch[0..w];
+}
+
+/// Per-importer `@scope/pkg` resolution (PM P0). Package modules live in
+/// the deployment bytecode map under `/pkg/<pkg_hash>/…`; this maps a
+/// bare specifier to the resolved package's entry key. Resolution is
+/// keyed on the *importer* (`base`) — which is the whole flat-surface /
+/// encapsulated-internals guarantee (`docs/plans/pm-p0-resolution-spec.md`
+/// §2, §4): the same specifier resolves to the app's pinned version from
+/// an app handler, and to the package's own frozen dep from inside a
+/// package. Owned by the tenant snapshot; slices returned by `resolve`
+/// live as long as the maps (the whole request).
+pub const PackageResolver = struct {
+    /// bare specifier → package-virtual entry key, for app-context importers.
+    app_imports: std.StringHashMapUnmanaged([]const u8),
+    /// package-virtual dir ("/pkg/<hash>/") → that package's own
+    /// {specifier → entry key} map (its encapsulated, frozen-at-publish deps).
+    pkg_imports: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged([]const u8)),
+
+    /// Resolve `specifier` for the module at `base`, or null to pass
+    /// through (relative imports, `__system/*`, undeclared specifiers).
+    pub fn resolve(self: *const PackageResolver, base: []const u8, specifier: []const u8) ?[]const u8 {
+        if (packageDirOf(base)) |pkg_dir| {
+            // Importer is a package → its own encapsulated imports.
+            const inner = self.pkg_imports.getPtr(pkg_dir) orelse return null;
+            return inner.get(specifier);
+        }
+        // Importer is an app handler → the flat app surface.
+        return self.app_imports.get(specifier);
+    }
+};
+
+/// `/pkg/<hash>/lib/x.mjs` → `/pkg/<hash>/` (the package's virtual dir,
+/// the `pkg_imports` key). Null when `base` isn't a package-virtual path.
+fn packageDirOf(base: []const u8) ?[]const u8 {
+    const prefix = "/pkg/";
+    if (!std.mem.startsWith(u8, base, prefix)) return null;
+    const rest = base[prefix.len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    return base[0 .. prefix.len + slash + 1]; // include the trailing '/'
+}
+
+// ── PM P0: resolution tests ────────────────────────────────────────
+
+const testing = std.testing;
+
+test "resolveSpecifier: bare passthrough + relative resolution (regression)" {
+    var buf: [512]u8 = undefined;
+    // Bare / builtin specifiers pass through unchanged.
+    try testing.expectEqualStrings("@rewind/oidc", resolveSpecifier("index.mjs", "@rewind/oidc", &buf));
+    try testing.expectEqualStrings("__system/x", resolveSpecifier("index.mjs", "__system/x", &buf));
+    // Relative resolution against the importer's dir.
+    try testing.expectEqualStrings("lib/util.mjs", resolveSpecifier("index.mjs", "./lib/util.mjs", &buf));
+    try testing.expectEqualStrings("util.mjs", resolveSpecifier("lib/index.mjs", "../util.mjs", &buf));
+    // A package's internal relative import stays within its /pkg/<hash>/ dir.
+    try testing.expectEqualStrings("/pkg/OIDC/lib/token.mjs", resolveSpecifier("/pkg/OIDC/index.mjs", "./lib/token.mjs", &buf));
+}
+
+test "packageDirOf: extracts the package-virtual dir" {
+    try testing.expectEqualStrings("/pkg/abc/", packageDirOf("/pkg/abc/index.mjs").?);
+    try testing.expectEqualStrings("/pkg/abc/", packageDirOf("/pkg/abc/lib/token.mjs").?);
+    try testing.expect(packageDirOf("index.mjs") == null);
+    try testing.expect(packageDirOf("_triggers/users/index.mjs") == null);
+    try testing.expect(packageDirOf("/pkg/abc") == null); // no file segment
+}
+
+test "PackageResolver: app vs package importer (flat surface + encapsulation)" {
+    const a = testing.allocator;
+    var app_imports: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer app_imports.deinit(a);
+    try app_imports.put(a, "@rewind/oidc", "/pkg/OIDC/index.mjs");
+    try app_imports.put(a, "@rewind/jwt", "/pkg/JWT19/index.mjs"); // app pins jwt 1.9
+
+    var oidc_imports: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer oidc_imports.deinit(a);
+    try oidc_imports.put(a, "@rewind/jwt", "/pkg/JWT14/index.mjs"); // oidc's OWN frozen jwt 1.4
+
+    var pkg_imports: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged([]const u8)) = .empty;
+    defer pkg_imports.deinit(a);
+    try pkg_imports.put(a, "/pkg/OIDC/", oidc_imports);
+
+    const r = PackageResolver{ .app_imports = app_imports, .pkg_imports = pkg_imports };
+
+    // App handler → the flat app surface.
+    try testing.expectEqualStrings("/pkg/OIDC/index.mjs", r.resolve("index.mjs", "@rewind/oidc").?);
+    try testing.expectEqualStrings("/pkg/JWT19/index.mjs", r.resolve("index.mjs", "@rewind/jwt").?);
+    // Inside oidc, @rewind/jwt resolves to oidc's OWN pinned jwt 1.4 — the
+    // encapsulation guarantee (app pins 1.9, oidc keeps 1.4).
+    try testing.expectEqualStrings("/pkg/JWT14/index.mjs", r.resolve("/pkg/OIDC/index.mjs", "@rewind/jwt").?);
+    // A package file deeper than index still resolves via its dir key.
+    try testing.expectEqualStrings("/pkg/JWT14/index.mjs", r.resolve("/pkg/OIDC/lib/token.mjs", "@rewind/jwt").?);
+    // Undeclared / builtin specifiers pass through (null → normalize falls
+    // to resolveSpecifier): __system/*, unknown app dep, unknown pkg dep.
+    try testing.expect(r.resolve("index.mjs", "__system/scheduler_tick") == null);
+    try testing.expect(r.resolve("index.mjs", "@rewind/unknown") == null);
+    try testing.expect(r.resolve("/pkg/OIDC/index.mjs", "@rewind/unknown") == null);
+    // An importer under an unknown /pkg/ dir → null (no import map).
+    try testing.expect(r.resolve("/pkg/NOPE/index.mjs", "@rewind/jwt") == null);
 }
 

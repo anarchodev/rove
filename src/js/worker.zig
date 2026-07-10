@@ -2600,8 +2600,8 @@ pub fn Worker(comptime opts: Options) type {
                 entries[i] = e;
             }
 
-            const dep_id = files_mod.manifest_json.computeDeploymentId(entries);
-            const json = files_mod.manifest_json.encode(a, dep_id, entries) catch
+            const dep_id = files_mod.manifest_json.computeDeploymentId(entries, &.{}, &.{});
+            const json = files_mod.manifest_json.encode(a, dep_id, entries, &.{}, &.{}) catch
                 return fail(router, a, &pf, 500, "manifest encode failed");
             // `json` is owned → transferred to the job below (or freed on any
             // dupe/enqueue failure before then).
