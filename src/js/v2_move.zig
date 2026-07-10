@@ -339,7 +339,7 @@ fn commitWrite(worker: anytype, allocator: std.mem.Allocator, tenant: []const u8
 // The CP calls this (move-secret S2S) after recording `host → tenant` in its
 // directory, so a worker on the owning cluster can resolve a CUSTOM host →
 // instance locally (`tenant.resolveDomain`). Replaces the retired
-// `ADMIN_OPS_SECRET`-gated `/ops/assign-domain` JS route (step3-auth-plan.md
+// `ADMIN_OPS_SECRET`-gated `/ops/assign-domain` JS route (docs/architecture/auth-consolidation.md
 // B3): the CP now owns host→tenant end-to-end and propagates the worker alias,
 // so `host add` is a single CP call and there's no second operator secret. The
 // alias is a `__root__` write — leader-gated, replicated as a type-2

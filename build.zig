@@ -338,7 +338,7 @@ pub fn build(b: *std.Build) void {
     const run_boot_tests = b.addRunArtifact(boot_tests);
 
     // rove-files-server was dissolved into the worker's `/_system/deploy`
-    // endpoint (docs/plans/rewind-cli-plan.md §4): the worker already links
+    // endpoint (docs/architecture/cli-and-deploy.md §4): the worker already links
     // rove-files + rove-qjs + rove-blob, so compile + content-address +
     // stamp-manifest now runs IN the worker (on the background
     // DeployThread). The separate binary + its trust domain are gone.
@@ -580,7 +580,7 @@ pub fn build(b: *std.Build) void {
         // a Zig rebuild for trivial copy edits.
         .{ .name = "starter_index_mjs", .path = "src/js/starter/index.mjs" },
         .{ .name = "starter_static_index_html", .path = "src/js/starter/_static/index.html" },
-        // The genesis __admin__ deploy app (rewind-cli-plan §4.1 (f)) — baked
+        // The genesis __admin__ deploy app (docs/architecture/cli-and-deploy.md §4.1 (f)) — baked
         // so a virgin cluster self-bootstraps deploy capability with no
         // external push; the full admin is then published THROUGH it.
         .{ .name = "genesis_admin_mjs", .path = "src/js/starter/genesis_admin.mjs" },
@@ -651,7 +651,7 @@ pub fn build(b: *std.Build) void {
 
     // files-server (V1 `files-server-standalone` and the cluster-free V2
     // `files-server-v2`) is RETIRED — dissolved into the worker's
-    // `/_system/deploy` endpoint (docs/plans/rewind-cli-plan.md §4). Compile +
+    // `/_system/deploy` endpoint (docs/architecture/cli-and-deploy.md §4). Compile +
     // manifest + blob-write run IN the worker on the background
     // DeployThread; the `_deploy/current` flip stays the worker's
     // `/_system/release`. No separate deploy binary or trust domain.
@@ -1240,7 +1240,7 @@ pub fn build(b: *std.Build) void {
     const cp_test_step = b.step("rewind-cp-test", "Run the rewind-cp unit tests");
     cp_test_step.dependOn(&b.addRunArtifact(cp_tests).step);
 
-    // ── rewind-ops: the platform/operator CLI (docs/plans/rewind-cli-plan.md §2–§3,
+    // ── rewind-ops: the platform/operator CLI (docs/architecture/cli-and-deploy.md §2–§3,
     // §6). The privileged half of the split (root + move-secret + ops-secret);
     // the OIDC-scoped customer `rewind` binary lands later, sharing
     // src/cli/common.zig. std-only — operator env reader + curl/ssh transport +
@@ -1308,7 +1308,7 @@ pub fn build(b: *std.Build) void {
     driver_smoke_gc.addArg("arena-gc");
     driver_smoke_step.dependOn(&driver_smoke_gc.step);
 
-    // ── rewind: the OIDC customer CLI (docs/plans/rewind-cli-plan.md §6, Track 3).
+    // ── rewind: the OIDC customer CLI (docs/architecture/cli-and-deploy.md §6, Track 3).
     // The customer-shippable half of the split — carries an OIDC session
     // (device-grant login → /v1/cli/exchange), never a platform secret.
     // Shares src/cli/common.zig with rewind-ops; std-only transport (TLS curl +

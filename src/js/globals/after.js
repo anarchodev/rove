@@ -1,5 +1,5 @@
 // Public `after` surface — connection wake triggers (docs/handler-shape.md
-// §2.3; handler-api-ergonomics-plan §2.3). Thin shim over the native
+// §2.3; decisions.md §4.11). Thin shim over the native
 // `_system.after` binding.
 //
 // `after.*` registers a ONE-SHOT wake **for the current connection**: a

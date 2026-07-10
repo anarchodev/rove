@@ -659,8 +659,7 @@ Each entry: **Decision · Why · Status/date · Rejected** (where applicable).
 
 ### 4.11 The ergonomics arc — one grammar, one payload surface (2026-07-04/05)
 
-- **Decision** (the full spec + as-built notes:
-  `plans/handler-api-ergonomics-plan.md`): the connection-wake namespace
+- **Decision** (as-built surface: `handler-shape.md`): the connection-wake namespace
   is **`after.*`** (`after.ms`/`after.kv`/`after.fetch`) — "after"
   matches the one-shot re-armed-per-activation semantics ("on" falsely
   connoted a persistent subscription) and frees `on` for the
@@ -1441,3 +1440,39 @@ projections (the centralized fan-out side-process) are unbuilt; outbound
 WebSocket is unstarted; the fairness policy for the callback execution phase
 (a held-sync continuation is a user waiting synchronously — plain FIFO against
 fresh requests is not obviously right) is undecided.
+
+## 14. Format & protocol versioning (pre-launch freeze)
+
+The locked rules from the pre-launch versioning sweep. **Full as-built spec —
+every wire/on-disk format, the JS-engine-version tag, and the freeze-list
+mechanics — is [`architecture/format-versioning.md`](architecture/format-versioning.md);
+the source cites its `§`-anchors directly.** Shipped 2026-06-23; prod
+re-genesis'd under the frozen v1 formats 2026-06-26.
+
+- **Version-byte + interpretation-switch, never silent widening** (`§3`): every
+  wire/persisted format that can change carries an explicit version byte/field
+  (frames, packed certs, node-address frames, readset/tape bundles); the reader
+  switches interpretation on it. Prefer same-width + a version switch over
+  widening a field (see also `feedback` wire-width-vs-interpretation). Freeze v1
+  now + wipe dev/prod so there is never a v0→v1 migration — the field just has to
+  be *in place* so the *next* change is backward-compatible (this is why
+  no-pre-launch-back-compat is safe here).
+- **JS engine version tag** (`§4`): every request records which engine ran it,
+  so replay can pull the matching engine for an old record — a genuine net-new
+  field, plumbed through the tape/log.
+- **Reserved `_`-leading KV namespace** (`§7.1`): the entire leading-`_` keyspace
+  is platform-only for **writes** (JS shims write it via a privileged path);
+  customers own all non-`_` keys. Reads of `_` are not blocked. One rule,
+  forever-extensible.
+- **Reserved internal headers + URL paths/hostnames** (`§7.3`/`§7.7`): `x-rove-*`
+  request headers and `/_system/*` paths + `*.internal` hosts are platform-owned
+  and stripped/blocked at the boundary.
+- **Customer-facing IDs are opaque prefixed strings** (`§7.5`): `req_`/`dep_`/
+  `ftch_`/… — prefixed, not bare integers, so the internal representation stays
+  free to change (Hyrum's-law insurance).
+- **Widen-don't-tighten on customer-observable constraints** (`§7.4`): loosening
+  a limit (tenant-id charset/length, write-size caps `§7.2`) is always safe;
+  tightening one is a breaking change and needs a version gate.
+- **Crypto algorithm agility** (`§7.8`): the signing algorithm is detectable in
+  the artifact; verifiers ignore an unknown alg rather than hard-failing, so a
+  new alg can roll without a flag day.

@@ -22,8 +22,8 @@ relevant section so the next design pass doesn't fight the code.
 shell (commit 8565634), the `web/*/_static/` path move (commits
 3c0f456/df83636), and the rewind.js rename.
 
-**Implementation note (2026-06-17, rewind-cli-plan Track 2):** the
-files-server was dissolved (rewind-cli-plan §4); deploy is now a single
+**Implementation note (2026-06-17, ../architecture/cli-and-deploy.md Track 2):** the
+files-server was dissolved (../architecture/cli-and-deploy.md §4); deploy is now a single
 ownership-gated `POST /v1/deploy` (handlers+statics in one bundle →
 `platform.compile` + content-address + stampManifest barrier → `{ok,
 dep_id}`), released via the `publishRelease` RPC. The Code tab is now an

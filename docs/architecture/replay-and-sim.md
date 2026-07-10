@@ -307,8 +307,8 @@ and the `request.activation` metadata bag, per the §3 table. So G1/G2/G3 above
 constrain **replay** (captured worlds) only; **sim** of any activation needs no
 recording change, because the authored world supplies the export and the
 result/ctx surface directly. See
-[`../plans/sim-test-framework.md`](../plans/sim-test-framework.md)
-§"Built 2026-06-30" and §"The model — one run, parameterized".
+[`../guides/testing.md`](../guides/testing.md) for the authored-world
+(`scenario`) surface in practice.
 
 ## 7. See also
 

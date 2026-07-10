@@ -294,7 +294,7 @@ def main() -> int:
             check("non-operator cluster-status read → 403", r.status == 403,
                   f"got {r.status}")
 
-        # ── B5: publishRelease ownership gate (step3-auth-plan.md B5). ─────
+        # ── B5: publishRelease ownership gate (docs/architecture/auth-consolidation.md B5). ─────
         # Same call, different principal: an operator (is_root) bypasses
         # ownership and falls through to the not-found check (404); a
         # non-operator who doesn't own the tenant is blocked at the gate (403,

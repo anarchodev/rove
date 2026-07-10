@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""e2e smoke for the STANDING __admin__ deploy app (rewind-cli-plan §4.1 (f)) —
+"""e2e smoke for the STANDING __admin__ deploy app (docs/architecture/cli-and-deploy.md §4.1 (f)) —
 the request-driven composed deployer that publish_tenant + the smoke harness
 will POST bundles to (replacing the Zig /_system/deploy for customer tenants).
 
@@ -64,7 +64,7 @@ def main() -> int:
         r = c.provision(TARGET)
         check("provision target → 204", r.status == 204, f"got {r.status} {r.body!r}")
         # /_system/reset (root, no body) deployed the BAKED deploy app
-        # (rewind-cli-plan §4). The app answers on "/" — a GET → 405 POST-only
+        # (docs/architecture/cli-and-deploy.md §4). The app answers on "/" — a GET → 405 POST-only
         # confirms it's live.
         r = c.wait_for_handler("__admin__", "/", want_status=405, timeout_s=30.0)
         check("reset deploy app live (GET / → 405 POST-only)", r.status == 405, f"got {r.status} {r.body!r}")

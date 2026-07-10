@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Stand up the `__auth__` OIDC IdP on a V2 cluster and verify the IdP
-conformance end to end (step3-auth-plan.md B1 + B5a). V2 port of the
+conformance end to end (docs/architecture/auth-consolidation.md B1 + B5a). V2 port of the
 IdP-conformance half of the (V1, retired) scripts/oidc_smoke.py.
 
 What it proves:

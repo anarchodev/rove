@@ -50,6 +50,13 @@ The maintained set. Subsystem-owned, kept current with the code.
 - **[observability.md](architecture/observability.md)** — operator telemetry (Grafana Cloud)
 
 > Design-rationale reference (not a primary subsystem doc, but cited by ~10 source files): [raft-native-alignment.md](architecture/raft-native-alignment.md) — how membership + catch-up were re-aligned onto raft-rs's native model (all phases landed; Phase 3 in `decisions.md` §10.12).
+>
+> Cross-cutting reference (cited by ~17 source files via its `§`-anchors): [format-versioning.md](architecture/format-versioning.md) — the as-built wire/on-disk/key-schema version scheme, the JS-engine-version tag, and the pre-launch freeze rules (shipped; the locked rules are also in `decisions.md` §14).
+>
+> Design-of-record references (graduated from `plans/`; cited by source + downstream plans via their `§`/label anchors):
+> - [cli-and-deploy.md](architecture/cli-and-deploy.md) — the `rewind-ops`/`rewind` CLIs + the deploy/publish split + the in-tenant `/_system/deploy` seam (shipped).
+> - [auth-consolidation.md](architecture/auth-consolidation.md) — the two auth planes + the `rewind-logs.internal`/`rewind-cp.internal` trusted doors + tenant-scoped caps (shipped; cited by `A*`/`B*` labels). Subsystem doc is `auth-and-domains.md`.
+> - [raft-best-practices.md](architecture/raft-best-practices.md) — election/heartbeat sizing (the `configuration-and-network.md` sizing authority) + the RawNode-FFI hardening backlog.
 
 ### Customer-facing contracts (kept alongside)
 
@@ -66,13 +73,12 @@ them 2026-06-29: its as-built mechanism folded into
 `architecture/effects-and-handlers.md`, "Streaming inbound body".)
 
 - _The operator deploy plan (this operator's topology, hardware spec, DNS/TLS distribution, rollout history) moved to the private `rewind-infra` repo. The operator-neutral binary/port/firewall/TLS reference is [architecture/configuration-and-network.md](architecture/configuration-and-network.md)._
-- [step3-auth-plan.md](plans/step3-auth-plan.md) — Step 3 auth consolidation: sequenced execution plan (OIDC machinery is written; remaining = wire + deploy + close the log-server tenant-scoping gap). Design rationale in `rewind-cli-plan.md` §7
 - [cp-desired-state-target.md](plans/cp-desired-state-target.md) — north-star (not yet built): CP owns all per-tenant desired-state incl. release; workers reconcile; one S2S key (move-secret); root token retires. The arc B3/B4 point at
 - [websocket-plan.md](plans/websocket-plan.md) — **outbound** WS only (a handler as client of an upstream WS server — atproto firehose / Pub/Sub; unbuilt, ~1–2 weeks). Inbound WS shipped → `architecture/websockets.md`
 - [retention-and-gc.md](plans/retention-and-gc.md) — the one compacting GC across log-blobs / kv pages / `_pool` bodies / tape blobs; capacity-based retention; the input-home pinning obligation (unbuilt). The minimal-tape four-record-kinds synthesis now lives in `decisions.md` §3.9
 - [builtin-libs-docs-plan.md](plans/builtin-libs-docs-plan.md) — `_system.*` + JS shim docs
 - replay-wasm-plan.md — WASM replay UI (§8.6+ deferred); **moved 2026-07-01 to the private rewind-apps repo (`replay/replay-wasm-plan.md`), alongside the porcelain it describes**
-- [sim-test-framework.md](plans/sim-test-framework.md) · [fixture-lifecycle.md](plans/fixture-lifecycle.md) · [agent-surface.md](plans/agent-surface.md) — replay/sim/agent surface (Phase 12–14)
+- [fixture-lifecycle.md](plans/fixture-lifecycle.md) · [agent-surface.md](plans/agent-surface.md) — fixture-lifecycle + agent surface (Phase 13–14). The sim/test framework (Phase 12) SHIPPED → as-built in [architecture/replay-and-sim.md](architecture/replay-and-sim.md) + [guides/testing.md](guides/testing.md)
 - [consensus-robustness-backlog.md](plans/consensus-robustness-backlog.md) — open consensus hardening residue (fail-loud fixes, a CP move/provision UAF, the power-loss/`dm-flakey` crash-consistency validation gap) + the governing error-classification + pin-coordination conventions. Consolidates the retired `raft-correctness-plan` + 2026-06-20 storage triage
 - [refactor-audit-2026-07.md](plans/refactor-audit-2026-07.md) — whole-codebase correctness/clarity audit: 4 latent drift bugs (§1), the finishOutcome unification (§2), god-struct/file splits + cross-binary dedup per subsystem, Zig→JS status ("no new lifts"), verified non-findings (§9), sequenced waves (§10)
 

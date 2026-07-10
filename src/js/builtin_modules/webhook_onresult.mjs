@@ -63,8 +63,8 @@ export default function () {
     // the runtime then flattens it onto the customer's `{on}` request
     // surface (request.bytes/.status/.ok + request.ctx; globals.zig).
     // The response bytes ride base64url-encoded (`body_b64`) — the
-    // JSON envelope can't carry raw bytes (handler-api-ergonomics-plan
-    // §2.2); the consumer's text view derives from the bytes.
+    // JSON envelope can't carry raw bytes (decisions.md
+    // §4.11); the consumer's text view derives from the bytes.
     const body_b64 = (a.kind === "fetch_chunk")
         ? base64url.encode(a.bytes)
         : base64url.encode(ctx.result_body || "");

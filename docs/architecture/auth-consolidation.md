@@ -1,17 +1,22 @@
-# Step 3 — auth consolidation: execution plan
+# Auth consolidation — as-built reference (the two auth planes + trusted doors)
 
-`rewind-cli-plan.md` §7 is the *design* (the two-planes target, the
-tenant-scoped capability token, the log-server-as-chokepoint rationale,
-the rejected alternatives). This doc is the *execution* plan: what is
-already built, what is left, and the order to do it in.
+> **Shipped** (graduated from `plans/`). The OIDC plane is live in prod; the
+> `rewind-logs.internal` / `rewind-cp.internal` trusted doors and the
+> tenant-scoped capability token are deployed. This began as the Step 3
+> execution plan; it now stands as the **as-built reference** the source +
+> smokes cite by its `A*`/`B*` item labels. Design rationale (the two-planes
+> target, the log-server-as-chokepoint, the rejected alternatives) is
+> `cli-and-deploy.md` §7.
 
-**The headline:** Step 3 is much closer to done than "finish OIDC"
-implies. The OIDC machinery is *written* — the provider+RP library, the
+The map below is what got built and the order it went in — retained as the
+record of the consolidation.
+
+**The headline:** the OIDC machinery is the provider+RP library, the
 `__auth__` IdP app, the admin dashboard's RP guard, and the
-tenant-scoped JWT mint/verify primitives all exist in the tree. What
-remains is **wiring three written pieces together, deploying one tenant,
-and closing one security gap** — not designing or building OIDC from
-scratch.
+tenant-scoped JWT mint/verify primitives. The consolidation wired those
+pieces together, deployed the `__auth__` tenant, and closed one security
+gap (the cross-tenant log-read hole) — it did not design or build OIDC
+from scratch.
 
 Locked decisions live in `architecture/auth-and-domains.md` (the
 two-planes model, `platform.scope` cross-tenant grant, no `X-Rove-Scope`)
@@ -129,7 +134,7 @@ host-rewrite (`fetch_engine.zig:708`, SigV4 attach at `:567`) but:
 - privileged: only `__admin__` may form the host;
 - **cross-tenant**: admin → *any* tenant's logs, vs `blob.internal`'s
   own-tenant scope — analogous to `platform.scope`'s admin cross-tenant
-  kv grant (§7, `rewind-cli-plan.md:540`);
+  kv grant (§7, `cli-and-deploy.md`);
 - the worker attaches the A2 tenant-scoped `logs-read` token; the
   handler JS never touches key material.
 Independent of A2's exact mint shape; can be built in parallel.

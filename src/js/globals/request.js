@@ -1,5 +1,5 @@
 // The uniform payload surface — `request.text` / `request.json` derived
-// from `request.bytes` (docs/plans/handler-api-ergonomics-plan.md §2.2).
+// from `request.bytes` (decisions.md §4.11).
 //
 // `bytes` (a Uint8Array) is materialized per activation kind in Zig
 // (`installRequest`): a lazy read-recording accessor on plain inbound,

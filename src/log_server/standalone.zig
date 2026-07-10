@@ -415,7 +415,7 @@ fn handleOne(
     //     TENANT-SCOPED `logs-read` capability token —
     //     `verifyWithCapAndTenant` rejects an unscoped ("any tenant")
     //     token AND a token scoped to a different tenant. This is the
-    //     chokepoint guarantee (rewind-cli-plan.md §7; step3-auth-plan.md
+    //     chokepoint guarantee (docs/architecture/cli-and-deploy.md §7; docs/architecture/auth-consolidation.md
     //     A4): the worker's fetch engine mints the scoped token when it
     //     rewrites the `rewind-logs.internal` host the `__admin__`
     //     chokepoint issues. Closes the audit's open latent-critical —

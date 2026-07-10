@@ -857,7 +857,7 @@ pub const NodeState = struct {
     /// `rewind-logs.internal` door (`fetch_engine.rewriteAndAuthLogsFetch`).
     /// The same secret the log-server verifies with. Borrowed; owned by
     /// `main.zig`. Null → the internal-logs door returns
-    /// `error.LogsDoorUnconfigured`. (step3-auth-plan.md A2/A3.)
+    /// `error.LogsDoorUnconfigured`. (docs/architecture/auth-consolidation.md A2/A3.)
     services_jwt_secret: ?[]const u8 = null,
 
     /// Worker's internal-plane base URL for the standalone log-server
@@ -870,7 +870,7 @@ pub const NodeState = struct {
     /// the `rewind-cp.internal` door so the `__admin__` dashboard drives CP
     /// control ops without an operator-held CP secret. Borrowed; owned by
     /// `main.zig`. Null → the CP door returns `error.CpDoorUnconfigured`.
-    /// (step3-auth-plan.md B4.)
+    /// (docs/architecture/auth-consolidation.md B4.)
     move_secret: ?[]const u8 = null,
 
     /// Worker's internal-plane base URL for the control plane (a CP node origin,
@@ -1381,7 +1381,7 @@ pub fn Worker(comptime opts: Options) type {
         /// h2 sid/session/headers the response needs.
         forward_pending: StreamColl,
         /// Background compile/stage thread backing the `platform.*` deploy
-        /// primitives (`docs/plans/rewind-cli-plan.md` §4). Owns its own QuickJS
+        /// primitives (`docs/architecture/cli-and-deploy.md` §4). Owns its own QuickJS
         /// runtime (the poll-loop `compile_fn` is used by
         /// `deployStarterTrampoline` — can't share one runtime across
         /// threads). Null until `startDeployThread`; library / test builds
@@ -2184,7 +2184,7 @@ pub fn Worker(comptime opts: Options) type {
         }
 
         /// Start the background compile+stage thread that backs
-        /// `/_system/deploy` (`docs/plans/rewind-cli-plan.md` §4). Idempotent
+        /// `/_system/deploy` (`docs/architecture/cli-and-deploy.md` §4). Idempotent
         /// guard: a second call is a no-op. Opens the thread against the
         /// node's shared blob backend config so each job writes the
         /// target tenant's own `file-blobs/` + `deployments/` keys.
@@ -2308,7 +2308,7 @@ pub fn Worker(comptime opts: Options) type {
 
         pub const ResetError = error{ AdminNotInitialized, NotLeader, StageFailed, ProposeFailed };
 
-        /// `POST /_system/reset` (rewind-cli-plan §4) — bootstrap + break-glass.
+        /// `POST /_system/reset` (docs/architecture/cli-and-deploy.md §4) — bootstrap + break-glass.
         /// (Re)deploy the BAKED `__admin__` deploy app and stamp
         /// `_deploy/current`, so a virgin OR bricked control tenant recovers
         /// deploy capability with no external bundle. The full admin and every
@@ -2510,7 +2510,7 @@ pub fn Worker(comptime opts: Options) type {
         }
 
         /// `platform.scope(t).deploy.stampManifest(entries)` submit door
-        /// (rewind-cli-plan §4.1) — the deploy's STAGING BARRIER. Bound like
+        /// (docs/architecture/cli-and-deploy.md §4.1) — the deploy's STAGING BARRIER. Bound like
         /// `platform.compile`: lowers to an on.fetch to `rove-stage.internal`;
         /// the handler `next()`s so the finalize seam binds it. We compute the
         /// content-addressed dep_id + encode the manifest (the native format)
@@ -2565,7 +2565,7 @@ pub fn Worker(comptime opts: Options) type {
                 files_mod.validatePath(it.path) catch return fail(router, a, &pf, 400, "invalid path");
                 // Defensive reject of test-framework artifacts (`_tests/`): the
                 // customer CLI strips them at classify time, but a direct poster
-                // must not be able to deploy them (sim-test-framework.md).
+                // must not be able to deploy them (docs/architecture/replay-and-sim.md).
                 if (files_mod.isTestArtifactPath(it.path))
                     return fail(router, a, &pf, 400, "test files (_tests/) must not be deployed");
                 const kind: files_mod.Kind = if (std.mem.eql(u8, it.kind, "handler"))

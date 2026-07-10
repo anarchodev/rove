@@ -554,7 +554,7 @@ class OIDCProvider {
   }
 
   // GET/POST /device — the human verification + EXPLICIT confirm page. The
-  // anti-phishing controls (rewind-cli-plan §… / the device-code phishing
+  // anti-phishing controls (docs/architecture/cli-and-deploy.md §… / the device-code phishing
   // class): (1) require an authenticated IdP session, (2) require a conscious
   // Approve click that shows the code so the user confirms it matches their
   // terminal — a pre-filled `?user_code=` link NEVER auto-approves.
@@ -1106,7 +1106,7 @@ class OIDCRelyingParty {
   }
 
   /**
-   * CLI/device gateway (rewind-cli-plan Track 3): exchange an IdP
+   * CLI/device gateway (docs/architecture/cli-and-deploy.md Track 3): exchange an IdP
    * `id_token` — obtained by the `rewind` CLI via the RFC 8628 device
    * grant — for an RP session bound to THIS request's sid. No browser
    * redirect: the CLI POSTs `{id_token}`; we read `request.session.id`

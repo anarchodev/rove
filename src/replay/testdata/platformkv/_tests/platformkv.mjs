@@ -1,4 +1,4 @@
-// platform.* per-store kv isolation (docs/plans/sim-test-framework.md). Seeds a
+// platform.* per-store kv isolation (docs/architecture/replay-and-sim.md). Seeds a
 // tenant store + two instance stores + the root store, then asserts the admin
 // handler's writes stayed isolated per store and the seeds read back through the
 // matching facade.

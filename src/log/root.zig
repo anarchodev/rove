@@ -214,7 +214,7 @@ pub const TapePayloads = struct {
     /// non-handler paths.
     timestamp_ns: i64 = 0,
     /// The JS engine version that executed this request
-    /// (`docs/plans/format-versioning-audit.md` §4). Copied from
+    /// (`docs/architecture/format-versioning.md` §4). Copied from
     /// `Readset.js_engine_version` at capture; surfaced in the log
     /// JSON so the replayer can later fetch the matching engine.
     /// Zero = unknown (non-handler / pre-stamp paths). A passenger on
@@ -285,7 +285,7 @@ pub const TapePayloads = struct {
     }
 };
 
-// ── Customer-facing ID formatting (format-versioning-audit.md §7.5) ────
+// ── Customer-facing ID formatting (docs/architecture/format-versioning.md §7.5) ────
 //
 // All customer-visible IDs carry a Stripe-style type prefix so every ID
 // format stays versionable behind its prefix and reads as opaque. The

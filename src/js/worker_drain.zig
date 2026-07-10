@@ -592,7 +592,7 @@ pub fn resolveDeployment(
         // path-derived module doesn't exist as a file — walk up to the
         // `index.mjs` that actually ran, where `onFetchResult` lives. Without
         // this a bound `on.fetch` from such a handler resumes to
-        // ResumeNoBytecode (step3-auth-plan.md A5).
+        // ResumeNoBytecode (docs/architecture/auth-consolidation.md A5).
         if (try worker_mod.findBytecode(tc, module_path, allocator)) |b| break :blk b;
         return error.ResumeNoBytecode;
     };

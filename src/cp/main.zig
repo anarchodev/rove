@@ -722,7 +722,7 @@ const Router = struct {
             return;
         };
         // Propagate the worker-side `__root__/domain/{host}` alias to the
-        // tenant's serving cluster (step3-auth-plan.md B3). The CP owns
+        // tenant's serving cluster (docs/architecture/auth-consolidation.md B3). The CP owns
         // host→tenant, so it pushes the alias the workers need for local
         // custom-host resolution (`resolveDomain`) — no operator-held worker
         // secret (`ADMIN_OPS_SECRET` retired). If it didn't land (tenant
@@ -800,7 +800,7 @@ const Router = struct {
     /// accepts (204) and the rest answer 421 — fan out, succeed on the first
     /// 204. Returns false if the tenant is unplaced or no node took it (the
     /// caller surfaces that). Mirror of `pushPlanToServingCluster`, but GATED
-    /// (a half-mapped host must not report success — step3-auth-plan.md B3).
+    /// (a half-mapped host must not report success — docs/architecture/auth-consolidation.md B3).
     fn pushDomainToServingCluster(self: *Router, tenant: []const u8, host: []const u8) bool {
         const res = self.directory.resolve(tenant) orelse return false; // unplaced
         return self.pushDomainToNodes(res.cluster.nodes, tenant, host);
@@ -1835,7 +1835,7 @@ pub fn main() !void {
     // Raft logical-tick cadence (ms). Keep the CP directory group's election
     // timing in lockstep with the workers' tenant groups — same hardware, same
     // number — so election timeout ≈ election_tick × this is uniform across the
-    // node (docs/plans/raft-best-practices.md "how to size election/heartbeat"). The
+    // node (docs/architecture/raft-best-practices.md "how to size election/heartbeat"). The
     // default preserves the historical ~1ms cadence. Set BEFORE startPump.
     if (std.posix.getenv("REWIND_RAFT_TICK_MS")) |v| {
         if (std.fmt.parseInt(i64, v, 10)) |ms| {

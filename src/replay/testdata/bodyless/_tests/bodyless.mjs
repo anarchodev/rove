@@ -1,5 +1,5 @@
 // An authored bodyless inbound reads as empty, not "missing"
-// (docs/plans/sim-test-framework.md). Reading request.text/.bytes on a request
+// (docs/architecture/replay-and-sim.md). Reading request.text/.bytes on a request
 // created with no `body` used to throw REPLAY DIVERGENCE — the handler aborted
 // and the run reported a swallowed 200/terminal/null, so a test asserted against
 // a response the handler never produced. An authored initial activation now

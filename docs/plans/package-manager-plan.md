@@ -9,7 +9,7 @@ Related: `docs/strategy/saas-in-a-box.md` §6 (the three rungs — this is
 the machinery under Rung 3), `docs/decisions.md` §3.3 (durability as
 JS-shim — this finishes it, doesn't contradict it),
 `src/files/app_manifest.zig` (the reserved-inert bundle manifest this
-plan makes the deploy path *consume*), `docs/plans/rewind-cli-plan.md`
+plan makes the deploy path *consume*), `../architecture/cli-and-deploy.md`
 (the deploy/publish client that becomes the resolver bridge).
 
 ---
@@ -31,7 +31,7 @@ change (in `rove`) is deliberately narrow:
 | What | **Engine support for *deploying* packages**: consume a manifest's `dependencies`, bake a hash-pinned resolved graph into a tenant's deployment, route `@scope/pkg` specifiers through the module loader, gate capabilities. Plus the **two durability chores** (§1.C) that make the wrapper libs packageable. | **The package store / registry**: naming → versions → hashes, publish API, discovery, storage-of-record. A rewind-app (a tenant that serves packages), dogfooded like docs/auth/admin. |
 | Talks to a registry? | **No.** The engine consumes a hermetic, hash-locked bundle — content-addressed, exactly like handler bytecode today. | Yes — it *is* the registry. |
 
-The **CLI/deploy client is the bridge** (`docs/plans/rewind-cli-plan.md`):
+The **CLI/deploy client is the bridge** (`../architecture/cli-and-deploy.md`):
 it resolves specifiers against the registry app, writes the lockfile, and
 hands the engine a self-contained, hash-locked deployment. **Resolution
 is client/app-side; the engine only does deterministic baking +

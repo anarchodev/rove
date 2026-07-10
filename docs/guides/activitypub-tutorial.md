@@ -247,7 +247,7 @@ they stitch together through the carried context).
 
 Open that recorded request in the replay/sim surface (`rewind replay
 <id>` / the sim-test framework — PLAN §10.12,
-`docs/plans/sim-test-framework.md`) and you can re-run the verification path
+`docs/guides/testing.md`) and you can re-run the verification path
 deterministically and synthesize a regression test from it: a test
 that pins "this real Follow, this real signature, still verifies and
 still produces the right `Accept`" — **without** the remote server,

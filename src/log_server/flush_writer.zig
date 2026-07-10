@@ -406,7 +406,7 @@ fn writeTapePayloads(
     // 2^53. JSON.parse → Number truncates the low bits; reading a
     // string + BigInt() is precise.
     try w.print("\"seed\":\"{d}\",\"timestamp_ns\":\"{d}\"", .{ t.seed, t.timestamp_ns });
-    // The JS engine version that ran the request (`format-versioning-audit.md`
+    // The JS engine version that ran the request (`docs/architecture/format-versioning.md`
     // §4). A small u16 — safe as a plain JSON number. The replay driver reads
     // it to fetch the matching engine WASM (a no-op today: one engine, so the
     // bundled engine always matches; the stamp keeps old requests attributable).

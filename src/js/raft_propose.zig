@@ -91,7 +91,7 @@ pub fn proposeWriteSet(
 
 /// Propose a single `__root__` writeset (type=2 → `{data_dir}/__root__.db`)
 /// through `anchor_id`'s raft group. Narrow standalone proposer re-added for
-/// the control-plane domain-alias write (`/_system/v2-domain`, step3-auth-plan
+/// the control-plane domain-alias write (`/_system/v2-domain`, docs/architecture/auth-consolidation.md
 /// B3): the caller must have already committed the write to its root overlay
 /// speculatively (so the leader sees it; the durabilize floor folds it on the
 /// `noteWorkerCommitted` ack); followers apply this envelope. Returns the

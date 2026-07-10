@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke for the `rewind-ops` operator CLI (docs/plans/rewind-cli-plan.md §2–§3) — the
+"""Smoke for the `rewind-ops` operator CLI (docs/architecture/cli-and-deploy.md §2–§3) — the
 Zig binary (zig-out/bin/rewind-ops) driven against a live V2Cluster with the
 DIRECT transport (no ROVE_PUBLISH_SSH). Exercises the verb set audited against
 the live server primitives:
@@ -12,7 +12,7 @@ the live server primitives:
   - `plan set acme <blob>`   set the tenant's plan/limits blob (CP)
   - `host add <custom> acme`  map a custom domain → tenant; the CP records the
     directory index AND propagates the worker `__root__/domain` alias, so the
-    worker resolves the custom host locally (step3-auth-plan.md B3 —
+    worker resolves the custom host locally (docs/architecture/auth-consolidation.md B3 —
     `ADMIN_OPS_SECRET` retired; a single move-secret CP call now).
   - `move acme … ` (no --yes) refuses (the risk guard)
   - `reset`                  idempotent re-deploy of the baked app

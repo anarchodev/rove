@@ -49,7 +49,7 @@ python3 scripts/smoke/tenant_move_smoke.py   # live tenant move cluster-1 → cl
 `scripts/smoke/smoke_lib_v2.py` is the V2 harness — `V2Cluster.spawn` brings up
 rewind-cp + front door + rewind node(s) and exposes `provision` /
 `deploy_handlers` / `wait_for_handler` (deploys go through the worker's
-`/_system/deploy` — files-server dissolved, `docs/plans/rewind-cli-plan.md` §4);
+`/_system/deploy` — files-server dissolved, `docs/architecture/cli-and-deploy.md` §4);
 `scripts/smoke/v2_topology.py`
 holds the per-binary spawn primitives. The functional smokes are the
 `*_smoke_v2.py` set; the original un-suffixed versions spawned the retired
@@ -92,7 +92,7 @@ binaries:  rewind-worker (src/rewind/)  the worker — rove-js on the bridge
            rewind-front  (src/front/)   stateless Host→cluster proxy — no raft state
            rewind-logs   (src/log_server/main.zig)  log query surface
            (deploy/publish is the worker's /_system/deploy — no separate
-            files-server binary; docs/plans/rewind-cli-plan.md §4)
+            files-server binary; docs/architecture/cli-and-deploy.md §4)
 ```
 
 **`raft-kv` is the spine-free KV facade** (`src/kv/kvlimbs.zig`) — the

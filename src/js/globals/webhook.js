@@ -178,7 +178,7 @@ globalThis.webhook = {
 
     // The body must be a string: it JSON-round-trips through the
     // durable `_send/owed/{id}` marker, which would silently mangle a
-    // Uint8Array to `{"0":..}` (docs/plans/handler-api-ergonomics-plan.md
+    // Uint8Array to `{"0":..}` (docs/decisions.md §4.11
     // C3; byte bodies on the durable path are a deferred follow-up).
     const body = opts.body == null ? "" : opts.body;
     if (typeof body !== "string")

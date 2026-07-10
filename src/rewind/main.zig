@@ -266,7 +266,7 @@ fn workerMain(args: *WorkerCtx) !void {
     defer worker.destroy();
 
     // Background compile+stage thread for `/_system/deploy`
-    // (docs/plans/rewind-cli-plan.md §4 — files-server dissolution). Owns its
+    // (docs/architecture/cli-and-deploy.md §4 — files-server dissolution). Owns its
     // own QuickJS runtime so it never races the poll-loop compiler.
     try worker.startDeployThread();
 
@@ -299,7 +299,7 @@ fn workerMain(args: *WorkerCtx) !void {
     // buildMetricsText reads live h2/dispatch + raft state only it may touch.
     var last_metrics_ns: i64 = 0;
     // Deploy capability is bootstrapped explicitly via `POST /_system/reset`
-    // (rewind-cli-plan §4) — the operator/harness deploys the baked `__admin__`
+    // (docs/architecture/cli-and-deploy.md §4) — the operator/harness deploys the baked `__admin__`
     // app once, then publishes the full admin + customers THROUGH it. The same
     // endpoint is break-glass (re-run to recover a bricked control tenant). No
     // auto-deploy-on-boot magic.
@@ -517,7 +517,7 @@ pub fn main() !void {
     _ = arg_it.next(); // argv[0]
     const first_arg = arg_it.next();
     // `rewind --version` dumps the format-version registry and exits
-    // (`docs/plans/format-versioning-audit.md` §3.8). Done before any data-dir
+    // (`docs/architecture/format-versioning.md` §3.8). Done before any data-dir
     // / port handling so it works with no environment set up.
     if (first_arg) |a| {
         if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "version")) {
@@ -602,7 +602,7 @@ pub fn main() !void {
     const peer_urls = try parseUrlList(allocator, std.posix.getenv("REWIND_PEER_URLS") orelse "");
     defer freeUrlList(allocator, peer_urls);
 
-    // Step 3 (step3-auth-plan.md A2/A3): wire the `rewind-logs.internal`
+    // Step 3 (docs/architecture/auth-consolidation.md A2/A3): wire the `rewind-logs.internal`
     // fetch-engine door so the `__admin__` chokepoint reads tenant logs with a
     // worker-minted, tenant-scoped `logs-read` token. The secret is the SAME
     // hex `LOOP46_SERVICES_JWT_SECRET` the log-server verifies with (hex-decoded
@@ -736,7 +736,7 @@ pub fn main() !void {
     // `election_tick × this` (see node.zig DEFAULT_TICK_NS); the default
     // preserves the historical ~1ms cadence. Raise it once a soak has measured
     // the broadcast-time + pause-jitter tail it must clear
-    // (docs/plans/raft-best-practices.md "how to size election/heartbeat").
+    // (docs/architecture/raft-best-practices.md "how to size election/heartbeat").
     if (std.posix.getenv("REWIND_RAFT_TICK_MS")) |v| {
         if (std.fmt.parseInt(i64, v, 10)) |ms| {
             if (ms > 0) {

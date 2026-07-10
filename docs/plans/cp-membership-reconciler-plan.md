@@ -7,7 +7,7 @@ non-event, and the `REWIND_VOTERS` / `REWIND_CLUSTERS` drift class disappears.
 
 Status: design locked (this doc), not yet built. Substrate it builds on
 (conf_change, snapshot/baseline bootstrap, `voter_progress`) is **already
-shipped** — see `docs/plans/raft-best-practices.md` and the promote-back work
+shipped** — see `../architecture/raft-best-practices.md` and the promote-back work
 (`27beb49`, `b1367ee`).
 
 ## Why

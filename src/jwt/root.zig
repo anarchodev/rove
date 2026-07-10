@@ -75,7 +75,7 @@ pub const Cap = struct {
     /// so an unscoped token can't read across tenants. Minted by the
     /// worker's fetch engine when it rewrites the privileged
     /// `rewind-logs.internal` host the `__admin__` chokepoint issues
-    /// (rewind-cli-plan.md §7; step3-auth-plan.md A2/A3).
+    /// (docs/architecture/cli-and-deploy.md §7; docs/architecture/auth-consolidation.md A2/A3).
     pub const LOGS_READ = "logs-read";
 };
 
@@ -135,7 +135,7 @@ pub fn mint(allocator: std.mem.Allocator, secret: []const u8, opts: MintOptions)
     var payload_json = std.ArrayList(u8).empty;
     defer payload_json.deinit(allocator);
     // `"v":1` versions the claims schema so a future claim change is
-    // detectable (format-versioning-audit.md §7.8). Verifiers ignore it
+    // detectable (docs/architecture/format-versioning.md §7.8). Verifiers ignore it
     // (substring-based parse), so it's back-compatible across mixed binaries
     // during a rolling deploy. The `kid` + multi-secret rotation window is the
     // heavier half of §7.8 and stays deferred (needs an N-secret config).

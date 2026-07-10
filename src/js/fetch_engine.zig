@@ -99,8 +99,8 @@ const HELD_MAX_PER_TENANT: u32 = 16;
 /// binding can name it without an import cycle.
 pub const BLOB_ORIGIN_PREFIX = @import("blob_sessions.zig").BLOB_ORIGIN_PREFIX;
 
-/// The `rewind-logs.internal` trusted door (step3-auth-plan.md A2/A3;
-/// rewind-cli-plan.md §7). The `__admin__` chokepoint fetches
+/// The `rewind-logs.internal` trusted door (docs/architecture/auth-consolidation.md A2/A3;
+/// docs/architecture/cli-and-deploy.md §7). The `__admin__` chokepoint fetches
 /// `http://rewind-logs.internal/v1/{tenant}/...`; the fetch engine mints a
 /// tenant-scoped `logs-read` capability token, rewrites the host to the
 /// platform-configured internal log-server base, and attaches the token as
@@ -108,7 +108,7 @@ pub const BLOB_ORIGIN_PREFIX = @import("blob_sessions.zig").BLOB_ORIGIN_PREFIX;
 /// `BLOB_ORIGIN_PREFIX`'s own-tenant door, but cross-tenant by design.
 pub const LOGS_ORIGIN_PREFIX = "http://rewind-logs.internal/";
 
-/// The `rewind-cp.internal` trusted door (step3-auth-plan.md B4;
+/// The `rewind-cp.internal` trusted door (docs/architecture/auth-consolidation.md B4;
 /// cp-desired-state-target.md). The `__admin__` chokepoint fetches
 /// `http://rewind-cp.internal/_control/…` (or `/_cp/…` reads); the fetch engine
 /// attaches the platform move-secret (`X-Rewind-Move-Secret`) and rewrites the
@@ -983,14 +983,14 @@ pub const FetchEngine = struct {
         try self.signAndAttachS3(method_name, path, pf.body, headers_list);
     }
 
-    /// `rewind-logs.internal` trusted door (step3-auth-plan.md A2/A3). The
+    /// `rewind-logs.internal` trusted door (docs/architecture/auth-consolidation.md A2/A3). The
     /// `__admin__` chokepoint fetches `http://rewind-logs.internal/v1/{tenant}/…`;
     /// here we mint a TENANT-SCOPED `logs-read` capability token, rewrite the
     /// host to the platform-configured internal log-server base, and attach the
     /// token as `Authorization: Bearer`. The log-server then verifies cap +
     /// tenant (`standalone.zig`, `verifyWithCapAndTenant`).
     ///
-    /// Two grants, decided by the calling tenant (step3-auth-plan.md §4,
+    /// Two grants, decided by the calling tenant (docs/architecture/auth-consolidation.md §4,
     /// Option A):
     ///   • ANY tenant may read its OWN logs — the URL tenant in
     ///     `/v1/{tenant}/…` MUST equal `pf.tenant_id`. This is what the
@@ -1063,7 +1063,7 @@ pub const FetchEngine = struct {
         headers_list.appendAssumeCapacity(.{ .name = owned_name, .value = auth_value });
     }
 
-    /// `rewind-cp.internal` trusted door (step3-auth-plan.md B4). The `__admin__`
+    /// `rewind-cp.internal` trusted door (docs/architecture/auth-consolidation.md B4). The `__admin__`
     /// dashboard fetches `http://rewind-cp.internal/_control/…` (control ops) or
     /// `/_cp/…` (reads); here we attach the platform move-secret and rewrite the
     /// host to the configured CP base. So an operator drives CP control ops

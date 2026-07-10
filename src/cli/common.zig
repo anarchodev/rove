@@ -1,6 +1,6 @@
 //! Shared infrastructure for the rewind operator CLIs (`rewind-ops` now; the
 //! OIDC-scoped customer `rewind` later). The split is by credential/audience
-//! (docs/plans/rewind-cli-plan.md §6): platform verbs that carry root +
+//! (docs/architecture/cli-and-deploy.md §6): platform verbs that carry root +
 //! move-secret + ops-secret live in `rewind-ops`; tenant verbs that carry an
 //! OIDC session will live in `rewind`. This module is the credential-agnostic
 //! core both reuse: operator env loader, curl/ssh transport, JSON helpers, and
@@ -336,7 +336,7 @@ pub fn classify(a: std.mem.Allocator, bundle_path: []const u8) Bundle {
             fatal("read {s}: {s}", .{ full, @errorName(err) });
 
         // Handler test files (`_tests/`, incl. `__snapshots__/` + `__fixtures__/`)
-        // live in the dev repo only — never ship them (sim-test-framework.md).
+        // live in the dev repo only — never ship them (docs/architecture/replay-and-sim.md).
         // The server enforces the same rule defensively (`files.isTestArtifactPath`,
         // rejected in the worker's `/_system/deploy`), so a direct poster can't
         // bypass this client-side strip.

@@ -1,4 +1,4 @@
-// platform.auth.checkRootToken (docs/plans/sim-test-framework.md). The sim now
+// platform.auth.checkRootToken (docs/architecture/replay-and-sim.md). The sim now
 // validates the token against the configured operator root token rather than
 // always succeeding, so an admin gate can actually be tested for rejection.
 import { scenario, expect } from "rewind:test";

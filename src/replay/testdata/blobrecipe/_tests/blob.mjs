@@ -1,4 +1,4 @@
-// blob recipe correctness offline (docs/plans/sim-test-framework.md). The
+// blob recipe correctness offline (docs/architecture/replay-and-sim.md). The
 // pure-JS streaming sha256 driving blob.write/seal must agree bit-for-bit with
 // one-shot crypto.sha256 over the concatenation — across block boundaries and
 // UTF-8 — and the durable primitives (owed marker + recipe rows + the PUT/compose

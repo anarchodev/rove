@@ -132,7 +132,7 @@ pub fn jsNext(
                 // A PROVIDED ctx that JSON can't carry (BigInt, function,
                 // circular) must fail loudly — storing "null" silently
                 // loses continuation state
-                // (docs/plans/handler-api-ergonomics-plan.md C4).
+                // (docs/decisions.md Â§4.11).
                 c.JS_FreeValue(ctx, ctx_json);
                 c.JS_FreeValue(ctx, obj);
                 _ = c.JS_ThrowTypeError(ctx, "next({ctx}): ctx must be JSON-serializable (no BigInt/function/circular values)");

@@ -1,4 +1,4 @@
-//! `rewind` — the OIDC customer CLI (rewind-cli-plan §6 + Track 3). The
+//! `rewind` — the OIDC customer CLI (docs/architecture/cli-and-deploy.md §6 + Track 3). The
 //! customer-shippable twin of `rewind-ops`: it carries an OIDC session, never
 //! a platform secret. Auth is the GATEWAY / session-bearer model — `login`
 //! runs the RFC 8628 device grant against the IdP, exchanges the resulting

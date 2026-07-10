@@ -1,6 +1,6 @@
 //! The rewind **test harness** — the second-runtime runner that turns the
 //! `simulate(world) → bundle` atom into a JS-authored test surface
-//! (`docs/plans/sim-test-framework.md` "The saga test model").
+//! (`docs/architecture/replay-and-sim.md` "The saga test model").
 //!
 //! Two reactors, one thread (unblocked by arenajs 0.3.3's de-singletoned
 //! instance API, `qjs-arena-reactor.h`):

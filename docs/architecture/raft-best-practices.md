@@ -1,6 +1,12 @@
-# Raft best practices — done, reachable, and blocked
+# Raft best practices — as-built reference + hardening backlog
 
-Status of raft hardening for the V2 multi-raft engine (raft-rs 0.7 via the
+> **As-built reference** (graduated from `plans/` — the shipped hardening
+> landed on `main`). The source cites this doc by its "how to size
+> election/heartbeat" anchor for the election/quorum tuning; the "Blocked on
+> NEW FFI methods" section is the live backlog of items that need new
+> `raft_rs_zig` FFI before they're reachable.
+
+Raft hardening for the V2 multi-raft engine (raft-rs 0.7 via the
 `raft_rs_zig` fork). Written after the strict-serializable-read work landed
 (merge `raft-config-ffi`). Read this before picking up "the other raft best
 practices" — the key framing is **config knobs vs. RawNode methods**: opening

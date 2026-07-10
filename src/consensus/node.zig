@@ -168,7 +168,7 @@ pub const DEFAULT_AUTO_DEMOTE_NS: i64 = 5 * std.time.ns_per_s;
 /// justifiable number. The default preserves the historical ~1ms idle cadence
 /// (so behavior is unchanged) while also CAPPING the rate under load; raise it
 /// (env `REWIND_RAFT_TICK_MS`) once a soak has measured the broadcast-time +
-/// pause-jitter tail this must clear (see docs/plans/raft-best-practices.md).
+/// pause-jitter tail this must clear (see docs/architecture/raft-best-practices.md).
 pub const DEFAULT_TICK_NS: i64 = 1 * std.time.ns_per_ms;
 
 /// Resolves the store a replicated entry applies to, keyed by the

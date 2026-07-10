@@ -1,4 +1,4 @@
-// A WS frame's data is readable as request.text (docs/plans/sim-test-framework.md).
+// A WS frame's data is readable as request.text (docs/architecture/replay-and-sim.md).
 // The sim once put the frame ONLY on request.activation.data and left the payload
 // empty, so request.text was "" and browser.message() (which reads request.text)
 // returned null — every request.text-based WS handler (the agent-SDK pattern)

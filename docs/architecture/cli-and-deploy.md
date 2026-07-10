@@ -1,9 +1,17 @@
-# rewind CLI — tenant operations, design plan
+# CLI & deploy — as-built reference (design-of-record)
 
-Status: **proposal, 2026-06-15.** No code yet. This doc proposes a Zig
-`rewind` operator CLI to replace `scripts/ops/publish_tenant.py` and the
-hand-run curl that surrounds it, and names the server-side seam the CLI
-should eventually consolidate onto.
+> **Shipped** (graduated from `plans/`). The `rewind-ops` operator CLI and the
+> `rewind` OIDC customer CLI are built (`v0.1` released); the files-server
+> dissolved into the worker's `/_system/deploy` (§4). This is the
+> **design-of-record** the source, `build.zig`, `CLAUDE.md`, and downstream
+> plans cite by section (`§2`–`§7`, `Track 2/3`) — the deploy/publish split,
+> the in-tenant `/_system/deploy` + `/_system/release` seam, and the
+> two-planes / capability-token design rationale (`§7`, the design basis for
+> `auth-consolidation.md`). "Still ahead" notes below are historical.
+
+This began as the design proposal for a Zig `rewind` CLI to replace
+`scripts/ops/publish_tenant.py` and the hand-run curl around it, and to name
+the server-side seam the CLI consolidates onto. That seam shipped.
 
 ## 0. The problem
 
@@ -148,7 +156,7 @@ Design notes:
 
 The `rewind` binary also carries the **customer debugging surface** — one engine,
 `run(world, code, on-miss)` (`docs/architecture/replay-and-sim.md`,
-`docs/plans/sim-test-framework.md`). These verbs link the native arenajs replay
+`docs/architecture/replay-and-sim.md`). These verbs link the native arenajs replay
 engine directly (`rove-replay`) — **fully offline**: no OIDC, no network, no
 cluster — which is why they shipped ahead of the auth plane (§7).
 
@@ -194,7 +202,7 @@ Design notes:
   no Msg panics in debug / loud-logs in prod), and `scripts/smoke/replay_matrix_smoke_v2.py`
   captures + replays one recording per activation kind as a regression gate.
 
-Still ahead (Phase 12/13, `sim-test-framework.md`): the `_tests/` runner
+Still ahead (Phase 12/13, `docs/architecture/replay-and-sim.md`): the `_tests/` runner
 (`rewind test` + `expect`/`snapshot`) and the server-side `_tests/` strip.
 
 ## 3. Phase A — thin CLI (no server changes)
@@ -427,7 +435,7 @@ likewise POSTs bundles to the app; only `/_system/reset` is operator-native.
 
 ## 5. `/ops/assign-domain` — RETIRED (resolved by step3 B3)
 
-> **Update (step3-auth-plan.md B3):** `/ops/assign-domain` + `ADMIN_OPS_SECRET`
+> **Update (auth-consolidation.md B3):** `/ops/assign-domain` + `ADMIN_OPS_SECRET`
 > are **gone**. `host add` is now a **single** move-secret CP call: the CP
 > (which owns `host → tenant`) propagates the worker `__root__/domain` alias to
 > the serving cluster over its existing S2S channel (`/_system/v2-domain`), so
@@ -519,7 +527,7 @@ back-compat — `feedback_no_prelaunch_backcompat`):
 
 > **Execution plan:** the sequenced, dependency-ordered "what's built /
 > what's left" breakdown lives in
-> [`step3-auth-plan.md`](step3-auth-plan.md). This section is the design
+> [`auth-consolidation.md`](auth-consolidation.md). This section is the design
 > rationale; that doc is the build order.
 
 The auth sprawl is a symptom of the same disease as the deploy ad-hoc-ness:

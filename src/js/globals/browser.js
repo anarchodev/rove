@@ -57,7 +57,7 @@
       const a = request && request.activation;
       if (!a || a.kind !== "ws_message") return null;
       // The uniform payload surface: `request.text` is the frame text
-      // regardless of opcode (handler-api-ergonomics-plan §2.2).
+      // regardless of opcode (decisions.md §4.11).
       const raw = request.text;
       if (raw == null) return null;
       try { return JSON.parse(raw); } catch (_) { return null; }

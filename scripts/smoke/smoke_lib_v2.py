@@ -6,7 +6,7 @@ leader-direct addressing + follower-503 semantics. V2 is a different shape:
 per-tenant raft groups behind a CP (directory + provisioning) and a stateless
 front door (Host→cluster proxy, serve-or-forward), plaintext h2c, with deploys
 compiled + staged IN the worker (`/_system/deploy` — files-server dissolved,
-docs/plans/rewind-cli-plan.md §4). So this is a purpose-built V2 harness rather than
+docs/architecture/cli-and-deploy.md §4). So this is a purpose-built V2 harness rather than
 a drop-in for the V1 `Cluster`.
 
 `V2Cluster` brings up the topology and exposes the deploy contract the
@@ -238,7 +238,7 @@ class V2Cluster:
     # (rove-ssrf, wired 2026-06-11) blocks in production. ssrf_smoke_v2
     # passes unsafe_outbound=False to test the production posture.
     unsafe_outbound: bool = True
-    # Optional second, TLS-terminating front (step3-auth-plan.md B2). When set,
+    # Optional second, TLS-terminating front (docs/architecture/auth-consolidation.md B2). When set,
     # a `rewind-front` runs with REWIND_TLS_CERT/KEY on this port, and every
     # worker's tenant door (REWIND_INTERNAL_FRONT) pins outbound tenant-host
     # fetches HERE — so a server-side hop like the OIDC RP→IdP token exchange
@@ -463,7 +463,7 @@ class V2Cluster:
         # (the door only needs cp_urls), so existing smokes' miss behavior is
         # unchanged.
         env["REWIND_CP_URL"] = f"http://127.0.0.1:{self.cp_port}"
-        # Step 3 (step3-auth-plan.md A2/A3): wire the `rewind-logs.internal`
+        # Step 3 (docs/architecture/auth-consolidation.md A2/A3): wire the `rewind-logs.internal`
         # fetch-engine door so the `__admin__` chokepoint reads tenant logs
         # with a worker-minted, tenant-scoped `logs-read` token. The secret is
         # the SAME hex the co-spawned log-server verifies with; the base points
@@ -576,7 +576,7 @@ class V2Cluster:
     def log_scoped_token(self, tenant: str, *, caps=("logs-read",),
                          ttl_s: int = 300) -> str:
         """Mint a TENANT-SCOPED `logs-read` services token. The log-server
-        verifies cap + tenant (step3-auth-plan.md A4 / rewind-cli-plan.md §7),
+        verifies cap + tenant (docs/architecture/auth-consolidation.md A4 / docs/architecture/cli-and-deploy.md §7),
         so a read token must carry both `caps:[logs-read]` and the tenant it
         reads. Exposed so negative tests can mint deliberately-mismatched
         tokens (wrong tenant / missing cap / unscoped)."""
@@ -620,7 +620,7 @@ class V2Cluster:
         """Idempotently bring up the standing __admin__ deploy app. Provision
         __admin__ (forms its raft group), then POST /_system/reset (root-gated,
         no body) — the worker's bootstrap+break-glass endpoint that (re)deploys
-        the BAKED deploy app and stamps _deploy/current (rewind-cli-plan §4).
+        the BAKED deploy app and stamps _deploy/current (docs/architecture/cli-and-deploy.md §4).
         reset stamps the release via raft, so a follower 503s — try each node
         until the leader accepts. The app answers POST on "/" — a GET → 405
         confirms it's live. Runs once per cluster."""

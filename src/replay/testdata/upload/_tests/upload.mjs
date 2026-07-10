@@ -1,5 +1,5 @@
 // Headers-first inbound (`onHeaders`) + the `blob.receive` → `onStored`
-// continuation, offline (docs/plans/sim-test-framework.md). Before the harness
+// continuation, offline (docs/architecture/replay-and-sim.md). Before the harness
 // gained `scenario.inboundHeaders` + `node.receive().stored()`, neither leg of a
 // streamed-upload handler was reachable, so the whole path (auth branches, the
 // receive→store handoff, the scoped workspace write) was dark. This exercises all

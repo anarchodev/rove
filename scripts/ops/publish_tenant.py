@@ -2,7 +2,7 @@
 """publish_tenant.py — publish a tenant bundle to the production cluster.
 
 DEPRECATED / BROKEN (2026-06-16): the `/_system/deploy` route this posts to was
-removed when deploy moved into the standing __admin__ app (rewind-cli-plan §4.2).
+removed when deploy moved into the standing __admin__ app (docs/architecture/cli-and-deploy.md §4.2).
 Use the `rewind-ops` operator CLI instead: `zig build rewind-ops` then
 `rewind-ops bootstrap` / `provision <tenant> --host H` / `deploy <tenant> <bundle>
 --release` / `move` / `plan set` / `status` / `host add` — it covers every
@@ -12,7 +12,7 @@ historical reference.
 
 The codified form of the proven publish path (deploy-plan §8 item 4). The
 build/stage step now lives IN the worker (files-server dissolved,
-docs/plans/rewind-cli-plan.md §4): one `POST /_system/deploy` over the private plane
+docs/architecture/cli-and-deploy.md §4): one `POST /_system/deploy` over the private plane
 hands the whole bundle (handlers + statics, base64) to a worker, which
 compiles, content-addresses every file into the tenant's own blobs, and stamps
 an EXPLICIT manifest (the bundle is the source of truth — no carry-forward).
@@ -194,7 +194,7 @@ def main() -> int:
             sys.exit(f"provision failed: {code} {out}")
 
     # ── compile + stage on a worker (/_system/deploy) over the private plane ─
-    # files-server is dissolved (docs/plans/rewind-cli-plan.md §4): one POST hands
+    # files-server is dissolved (docs/architecture/cli-and-deploy.md §4): one POST hands
     # the whole bundle (handlers + statics, base64) to the worker, which
     # compiles, content-addresses every file into the tenant's own blobs, and
     # stamps an EXPLICIT manifest (no carry-forward). Deploy isn't raft-gated
@@ -248,7 +248,7 @@ def main() -> int:
 
     # ── custom hosts (optional) ──────────────────────────────────────
     # One move-secret call: the CP records the directory index AND propagates
-    # the worker `__root__/domain` alias to the serving cluster (step3-auth-plan
+    # the worker `__root__/domain` alias to the serving cluster (docs/architecture/auth-consolidation.md
     # B3). 503 = the alias didn't land (tenant unplaced / no leader) — provision
     # first, then retry. `ADMIN_OPS_SECRET` + the worker /ops/assign-domain call
     # are retired.

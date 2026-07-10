@@ -1,4 +1,4 @@
-// Engine-pinned per-chain identity (docs/plans/sim-test-framework.md). A handler
+// Engine-pinned per-chain identity (docs/architecture/replay-and-sim.md). A handler
 // branch keyed on request.tenant + request.correlation_id (browser.getReplay) was
 // undriveable — the sim never set either, so getReplay always returned false. Now
 // scenario({tenant, correlationId}) supplies them and every activation (WS frame,

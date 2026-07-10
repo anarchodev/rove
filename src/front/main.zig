@@ -180,7 +180,7 @@ const CertSyncThread = struct {
 /// deliberately does not link `cp-directory` (rove + h2 + curl only), so
 /// this mirrors `Directory.unpackCert` / `CERT_PACK_VERSION` by hand —
 /// keep the two in lockstep when the cert frame changes
-/// (`docs/plans/format-versioning-audit.md` §3.4).
+/// (`docs/architecture/format-versioning.md` §3.4).
 const CERT_PACK_VERSION: u8 = 1;
 const UnpackedCert = struct { cert: []const u8, key: []const u8 };
 fn unpackCert(frame: []const u8) ?UnpackedCert {

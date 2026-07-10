@@ -1,35 +1,27 @@
 ---
-title: Format & Protocol Versioning Audit (pre-launch)
-status: all 5 MUST + all 9 SHOULD landed (build + unit + e2e smoke verified); pre-prod-deploy data wipe still required
+title: Format & protocol versioning (as-built reference)
+status: SHIPPED — the freeze landed 2026-06-23; prod re-genesis'd 2026-06-26. This is the as-built spec-of-record for rove's version scheme; the §-anchors here are what the source cites.
 date: 2026-06-18
-updated: 2026-06-23
+updated: 2026-07-10
 ---
 
-# Format & Protocol Versioning Audit
+# Format & protocol versioning — as-built reference
 
-> **Resume note (2026-06-23).** Implementation lives on the unmerged worktree
-> branch `worktree-docs+format-versioning-audit` (do **not** merge/deploy — other
-> deploy work is in flight). **All 5 MUST and all 9 SHOULD items are now landed**
-> (the item-10 format-version-bytes + js-engine-version slice and item-6 id
-> prefixes were completed 2026-06-23). `zig build test` + `rewind-worker`/`-cp`/
-> `-front` + `v2-test` all green; `inbound_chunk_smoke_v2` passes end-to-end
-> (deploy → serve → log-server `/list`→`/show` round-trip on the prefixed ids,
-> 562 readset-v7 records indexed). `rewind-worker --version` dumps the registry.
-> Status of every item is in §8. **One operational task remains before any prod
-> deploy of this branch: a coordinated data-dir wipe** — `READSET_VERSION` 6→7
-> rides in the durable raft log (type-0 envelopes carry the readset), so old v6
-> entries are rejected loudly after upgrade. Smokes wipe automatically (fresh
-> temp dirs); prod does not. See §6 (Validation) and `decisions.md`
-> no-pre-launch-back-compat.
+> **Shipped.** This began as a pre-launch audit; the freeze it recommended is
+> **built and deployed** (all format-version bytes + the JS engine version +
+> the id prefixes landed 2026-06-23; prod was re-genesis'd 2026-06-26 under the
+> frozen v1 formats — `decisions.md` no-pre-launch-back-compat). It now stands
+> as the **as-built reference** the source cites by section: the wire/on-disk
+> version-byte scheme (§3), the JS engine version tag (§4), and the
+> customer-observable freeze rules (§7). The locked *rules* are also recorded in
+> `decisions.md` (Format & protocol versioning); this doc is the full spec.
 
-Pre-launch sweep of every wire protocol, on-disk format, and persisted
-key-schema in `rove`, with the current versioning status of each and a
-recommended path to a uniform, backward-compatible versioning scheme. Also
-scopes the new **JS engine version** concept so replay can pull the matching
-engine for an old request.
-
-This is the survey + strategy. Implementation is phased in the last section;
-nothing here is built yet.
+Sweep of every wire protocol, on-disk format, and persisted key-schema in
+`rove` — the current versioning of each and the uniform, backward-compatible
+scheme now in place. Also defines the **JS engine version** concept so replay
+can pull the matching engine for an old request. §6 (phasing) and §8
+(consolidated change list) are retained as the historical record of what
+shipped.
 
 ## TL;DR — what we found
 

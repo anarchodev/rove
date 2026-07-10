@@ -95,7 +95,7 @@ pub fn jsTextDecode(
 
 /// Build a JS string from arbitrary bytes with WHATWG-lenient UTF-8
 /// semantics (invalid sequences → U+FFFD) — the `request.text` /
-/// `request.body` presentation rule (handler-api-ergonomics-plan §2.2;
+/// `request.body` presentation rule (decisions.md §4.11;
 /// bare `JS_NewStringLen` on malformed UTF-8 falls back to latin-1
 /// byte semantics, which is neither WHATWG nor documented behavior).
 pub fn lenientUtf8JsString(

@@ -16,7 +16,7 @@
 > missing-`onWake` 404.
 >
 > **Revised 2026-07-05 (rev 3 — the ergonomics arc,
-> `plans/handler-api-ergonomics-plan.md`).** The grammar is
+> `decisions.md` §4.11).** The grammar is
 > `after.*` (was `on.*`; `after.ms` was `on.timer`) with ONE
 > callback-target key — `{on: "module.method"}` — across every effect;
 > `webhook.send(url, opts)` takes a positional url; the durable
@@ -849,7 +849,7 @@ self-hosters marketplace plan for the consuming side.
 Pre-customer, the platform claims these namespaces so it can grow the surface
 later without colliding with anything a handler already relies on. Reserving a
 name now is free; reclaiming one after handlers depend on it is a breaking
-change (Hyrum's law). See `format-versioning-audit.md` §7.1/§7.3/§7.6.
+change (Hyrum's law). See `architecture/format-versioning.md` §7.1/§7.3/§7.6.
 
 - **Export names.** Handlers dispatch by export name (§3). The `on*` prefix is
   the activation-handler namespace; `onError` / `onPanic` are specifically
@@ -864,10 +864,10 @@ change (Hyrum's law). See `format-versioning-audit.md` §7.1/§7.3/§7.6.
   namespace for future platform-provided per-activation metadata. Your own
   per-chain state lives on `request.ctx` (your shape, threaded via `next({ctx})`).
 - **`kv` keys.** Any leading-`_` key is platform-reserved (§2.5;
-  `format-versioning-audit.md` §7.1). Customer keys use the non-`_` space.
+  `architecture/format-versioning.md` §7.1). Customer keys use the non-`_` space.
 - **HTTP headers.** `x-rewind-*` and `x-rove-internal-*` are stripped from the
   inbound `request.headers` and rejected from responses
-  (`format-versioning-audit.md` §7.3). `x-rove-correlation-id` is the one
+  (`architecture/format-versioning.md` §7.3). `x-rove-correlation-id` is the one
   platform-set header you may read.
 - **Reserved identities.** The `__name__` tenant form (`__admin__`, `__auth__`,
   `__replay__`) and `__system/*` module paths are platform-only.
@@ -882,7 +882,7 @@ change (Hyrum's law). See `format-versioning-audit.md` §7.1/§7.3/§7.6.
   `activation.fetch_id` is `ftch_…` — precisely so the format stays versionable
   behind the prefix. Treat everything after the prefix as opaque; a handler that
   depends on a bare-hex shape (or the prefix's exact contents) will break
-  (`format-versioning-audit.md` §7.5).
+  (`architecture/format-versioning.md` §7.5).
 
 ## 10. What's gone (vs prior streaming revisions)
 

@@ -1,9 +1,9 @@
 # Target: CP-owned tenant desired-state + key consolidation
 
 **Status: north-star, not yet built.** This captures an architecture target
-that emerged from the Step 3 auth work (`step3-auth-plan.md` B4). It is the
+that emerged from the Step 3 auth work (`../architecture/auth-consolidation.md` B4). It is the
 direction the B3/B4 increments point at; it is *not* an active build plan. B3
-and B4 (the `rewind-cp.internal` door) are both done (`step3-auth-plan.md`
+and B4 (the `rewind-cp.internal` door) are both done (`../architecture/auth-consolidation.md`
 §B4 — door done/verified; only its delivery rides a prod publish); the
 declarative core below (steps 3–5) is the unstarted arc.
 
@@ -75,7 +75,7 @@ the root token. Capture here so the incremental B3/B4 work stays pointed at it.
 ## Considered
 
 - **Why not fold move-secret into the services-JWT HMAC** — rejected in
-  `rewind-cli-plan.md` §7 (the HMAC is the busy key, likeliest to leak; the
+  `../architecture/cli-and-deploy.md` §7 (the HMAC is the busy key, likeliest to leak; the
   rarely-used high-destruction orchestration key stays separate). This target
   does the opposite consolidation — it removes the *root token*, not the
   move-secret, and keeps move-secret as the single quiet high-privilege key.

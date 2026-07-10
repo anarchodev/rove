@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""`rewind-logs.internal` fetch-engine door integration smoke (step3-auth-plan
+"""`rewind-logs.internal` fetch-engine door integration smoke (docs/architecture/auth-consolidation.md
 A2/A3). Proves the worker chokepoint end to end:
 
   - An `__admin__` handler fetching `http://rewind-logs.internal/v1/{t}/list`

@@ -32,7 +32,7 @@ against `src/{cp,front,rewind}/main.zig` + `src/blob/env.zig`.
 | `REWIND_PUBLIC_SUFFIX` | customer tenant wildcard eTLD+1 (e.g. `rewindjs.app`) |
 | `REWIND_INTERNAL_FRONT` | tenant door: comma-sep **bare IPs** of the fronts on the private plane (vRack/WireGuard); outbound fetches to `*.{public/system suffix}` hosts pin their connect here instead of resolving public DNS, so tenant→tenant calls never hairpin through the public edge ([effects-and-handlers.md](effects-and-handlers.md)). The door fires **only for the front's TLS port** (so a `…:9090` URL can't be pinned at the co-located CP) — `:443` by default; set `REWIND_INTERNAL_FRONT_PORT` only if the front's TLS port differs (test topologies). Unset = inert |
 | `REWIND_INTERNAL_FRONT_PORT` | tenant door: the front TLS port the door accepts + pins (default `443`). Operators leave it unset in prod; test harnesses set it to the front's high port |
-| `REWIND_RAFT_TICK_MS` | raft logical-tick cadence (ms); election timeout ≈ `election_tick(10) × this`. Default `1` (~15-20ms election, aggressive); production should set `10` (~100-300ms, the industry band). See [raft-best-practices.md](../plans/raft-best-practices.md) "how to size" |
+| `REWIND_RAFT_TICK_MS` | raft logical-tick cadence (ms); election timeout ≈ `election_tick(10) × this`. Default `1` (~15-20ms election, aggressive); production should set `10` (~100-300ms, the industry band). See [raft-best-practices.md](raft-best-practices.md) "how to size" |
 | `S3_*` / `AWS_*` | blob/log/tape backend (see below) |
 
 ### `rewind-cp` (control plane) — `rewind-cp <port>`

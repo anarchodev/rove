@@ -1,4 +1,4 @@
-// Effect-global unification (docs/plans/sim-test-framework.md). The sim runs the
+// Effect-global unification (docs/architecture/replay-and-sim.md). The sim runs the
 // REAL webhook.send / schedule shims from its base, so those verbs decompose to
 // primitives in the effect log. This test proves TWO things:
 //   1. the readable matchers (toHaveSent/toHaveScheduled/toHaveFetched) read the

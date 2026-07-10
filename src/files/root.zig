@@ -313,7 +313,7 @@ pub fn validatePath(path: []const u8) Error!void {
 /// and `__fixtures__/`) are dev-repo-only and must never be deployed. The
 /// customer CLI strips them at classify time (`cli/common.zig`); this is the
 /// server-side defensive reject the `/_system/deploy` handler applies so a
-/// direct poster can't smuggle them in (`docs/plans/sim-test-framework.md`).
+/// direct poster can't smuggle them in (`docs/architecture/replay-and-sim.md`).
 /// Inputs here are already `validatePath`'d (lowercase `[a-z0-9-_./]`, no
 /// traversal / `//`), so a root-prefix check is sufficient and unspoofable.
 pub fn isTestArtifactPath(path: []const u8) bool {

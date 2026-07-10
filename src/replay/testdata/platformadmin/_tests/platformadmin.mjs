@@ -1,4 +1,4 @@
-// platform.* admin-only gating, fail-closed (docs/plans/sim-test-framework.md).
+// platform.* admin-only gating, fail-closed (docs/architecture/replay-and-sim.md).
 // A non-admin run has every sync platform method throw; an admin run has them
 // all succeed. `platform.compile` is ungated in both (door-side check in prod).
 import { scenario, expect } from "rewind:test";

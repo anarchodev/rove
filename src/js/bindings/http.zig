@@ -227,7 +227,7 @@ pub fn jsOnFetch(
     // Customer-visible: the opaque `ftch_<hex>` form (§7.5) — the SAME
     // string `request.fetchId` carries, so equality comparison works
     // across the return value and the resume surface
-    // (handler-api-ergonomics-plan §2.4). Engine-internal keys (msg
+    // (decisions.md §4.9). Engine-internal keys (msg
     // router, S3 upload) keep the bare hex.
     std.debug.assert(row.id.len <= 64);
     var fid_buf: [log_mod.FETCH_ID_PREFIX.len + 64]u8 = undefined;

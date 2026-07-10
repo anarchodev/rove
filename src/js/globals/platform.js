@@ -130,7 +130,7 @@
 
     /**
      * Compile handler sources to bytecode + content-address them into
-     * `scope`'s blobs, off the hot path (`rewind-cli-plan.md` §4.1).
+     * `scope`'s blobs, off the hot path (`docs/architecture/cli-and-deploy.md` §4.1).
      * Admin-only (the issuing tenant is checked natively). Source →
      * bytecode is the one irreducibly-native deploy step; it's async
      * (compile is slow) but its result is deterministic + idempotent, so

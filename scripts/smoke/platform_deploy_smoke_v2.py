@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """e2e smoke for a deploy COMPOSED IN JS on the __admin__ tenant
-(rewind-cli-plan.md §4.1 (e)) — the capstone of the dissolution: a customer
+(docs/architecture/cli-and-deploy.md §4.1 (e)) — the capstone of the dissolution: a customer
 deploy assembled from the three privileged primitives, no Zig deploy route.
 
 An __admin__ handler:

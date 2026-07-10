@@ -1,4 +1,4 @@
-// Cross-module fetch continuations (docs/plans/sim-test-framework.md). A fetch
+// Cross-module fetch continuations (docs/architecture/replay-and-sim.md). A fetch
 // whose `on` names a DIFFERENT module file must resume in THAT module, and a bare
 // continuation module must be drivable in isolation. Both were impossible before
 // `FetchHandle.resolve` learned to switch entry on a module-path `on` and

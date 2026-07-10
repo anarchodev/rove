@@ -1,4 +1,4 @@
-// The saga test surface (docs/plans/sim-test-framework.md). Eager by default —
+// The saga test surface (docs/architecture/replay-and-sim.md). Eager by default —
 // `expect` forces its node and fails locally; the tree combinators (fetch
 // resolve / branch / cases) are opt-in. Run by `rewind test` on a harness
 // reactor; each `simulate` runs on a separate sim reactor.

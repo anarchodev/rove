@@ -10,7 +10,7 @@ fsynced-majority), §10.12, and §10.13, plus
 [`../architecture/consensus-and-storage.md`](../architecture/consensus-and-storage.md).
 Sibling docs that carry adjacent leads:
 [`../architecture/raft-native-alignment.md`](../architecture/raft-native-alignment.md)
-(as-built), `raft-best-practices.md`.
+(as-built), `../architecture/raft-best-practices.md`.
 
 ## Governing conventions
 
@@ -211,7 +211,7 @@ justified) and are recorded there + in `decisions.md` §10.12.
       gate. Justified *only* while we don't need read scaling — re-scrutinize if
       we do. The full analysis (why it is consciously deferred, the bounded
       partition-window staleness, and the exact code path `read_index` would
-      wire into) lives in `raft-best-practices.md`, "Blocked on NEW FFI methods"
+      wire into) lives in `../architecture/raft-best-practices.md`, "Blocked on NEW FFI methods"
       item 1.
 
 ## Design notes

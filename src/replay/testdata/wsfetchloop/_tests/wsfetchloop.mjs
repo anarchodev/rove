@@ -1,4 +1,4 @@
-// Continuing a WS conversation past a fetch resume (docs/plans/sim-test-framework.md).
+// Continuing a WS conversation past a fetch resume (docs/architecture/replay-and-sim.md).
 // A held WS handler issues an after.fetch mid-chain; resolving it once returned a
 // plain Node, so `.receive(nextFrame)` hit the blob.receive driver and threw
 // ("armed no blob.receive"). The fetch resume off a WS frame is now a WsNode bound

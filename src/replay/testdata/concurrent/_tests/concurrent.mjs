@@ -1,4 +1,4 @@
-// Concurrent-effect interleavings (docs/plans/sim-test-framework.md). Two
+// Concurrent-effect interleavings (docs/architecture/replay-and-sim.md). Two
 // after.fetches race on one held chain; `whenConcurrent` folds BOTH arrival
 // orders, threading each leg's writes into the next resume's overlay, and checks
 // the cross-order invariant. Before this combinator, "leg B resolves into an

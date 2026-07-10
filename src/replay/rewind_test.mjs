@@ -1,4 +1,4 @@
-// rewind:test — the saga test library (docs/plans/sim-test-framework.md,
+// rewind:test — the saga test library (docs/architecture/replay-and-sim.md,
 // "The saga test model"). This is the JS layer over the ONE native atom,
 // `simulate(world) → bundle`: the scenario, the lazy activation tree, the
 // fetch→fetch_chunk fold, the clock, and the `expect` matchers all live here.

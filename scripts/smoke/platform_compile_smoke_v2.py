@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""e2e smoke for the `platform.compile` primitive (rewind-cli-plan.md §4.1) —
+"""e2e smoke for the `platform.compile` primitive (docs/architecture/cli-and-deploy.md §4.1) —
 the bound-respond shape.
 
 `platform.compile(files, {scope, name})` is the admin-only, off-hot-path,

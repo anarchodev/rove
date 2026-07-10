@@ -306,7 +306,7 @@ CP plan axis (`architecture/control-plane.md` "Operational state").
 - **SQLite page encryption — vendored AES-GCM VFS (preferred) vs SQLCipher (decide in this phase)**.
 - Blob encryption paths.
 - Tape encryption.
-- **DESIGN GATE (pre-customer, format-versioning-audit.md §7.8):** every
+- **DESIGN GATE (pre-customer, architecture/format-versioning.md §7.8):** every
   ciphertext written by this phase MUST carry a self-describing envelope —
   `[alg_id][key_version][nonce/iv]…[tag]` — with a documented `alg_id` space,
   from the very first byte persisted. This is the one-shot window: once customer
@@ -341,7 +341,9 @@ Client-side simulator library + deterministic handler test framework: `rewind
 simulate` (synthetic request + kv overlay + mode → bundle), `rewind test`
 (`_tests/`, snapshots), `rewind export-fixture`. Purely client-side — the
 worker is a recording device, never a simulator; no live-KV pass-through.
-**[sim-test-framework.md](plans/sim-test-framework.md) is the authoritative plan**
+The sim-test framework **SHIPPED**; the as-built reference is
+**[architecture/replay-and-sim.md](architecture/replay-and-sim.md)** +
+**[guides/testing.md](guides/testing.md)**
 (CLI host since re-decided as the `rewind` npm package — decisions.md §8.3).
 
 ### Phase 13 — Fixture lifecycle + worker dry-run (§10.9, §10.11) — UNBUILT, post-1.0
@@ -430,7 +432,7 @@ raft participation, state in S3) while the per-tenant consensus stays in
 `rewind`. (Deploy/publish was *also* a separate binary — `files-server-v2` —
 on the same reasoning, but it folded back into the worker's `/_system/deploy`
 once it turned out to need no cross-tenant reach: compile + content-address +
-stamp run in-tenant on the worker, `rewind-cli-plan.md` §4.) The V1 examples
+stamp run in-tenant on the worker, `architecture/cli-and-deploy.md` §4.) The V1 examples
 that used to live in a table here
 (the single `loop46` binary, the leader-pinned `webhook-server` thread) are
 retired — durability is now a JS shim, not a raft-participating subsystem. The
@@ -532,8 +534,8 @@ labels** other docs cite and points to the current home. Launch sequencing
 | 10.4 | `webhook.send` vendor-neutral; `email.send` takes the key as a parameter | decisions.md §3.3; `architecture/effects-and-handlers.md` |
 | 10.5 | Replication-ready blob backend (shared object store, not raft-carried bytes) | `architecture/consensus-and-storage.md` ("Blob replication"); decisions.md §11 |
 | 10.6 | `dispatchOnce` refactored into phase-shaped helpers | V1 mechanics — superseded by the V2 single-re-entry `runOutcome` dispatcher in `architecture/effects-and-handlers.md` |
-| 10.7 | Simulator primitive (purely client-side, KV-less) | [sim-test-framework.md](plans/sim-test-framework.md); decisions.md §8 |
-| 10.8 | Sim test framework (deterministic, local-only) | [sim-test-framework.md](plans/sim-test-framework.md); decisions.md §8 |
+| 10.7 | Simulator primitive (purely client-side, KV-less) | [architecture/replay-and-sim.md](architecture/replay-and-sim.md); decisions.md §8 |
+| 10.8 | Sim test framework (deterministic, local-only) | [architecture/replay-and-sim.md](architecture/replay-and-sim.md); decisions.md §8 |
 | 10.9 | Fixture lifecycle (curated observations) | [fixture-lifecycle.md](plans/fixture-lifecycle.md) |
 | 10.10 | AI agent surface — CLI + skill file in v1, hosted MCP deferred | [agent-surface.md](plans/agent-surface.md); decisions.md §8 |
 | 10.11 | Worker dry-run dispatch mode | [fixture-lifecycle.md](plans/fixture-lifecycle.md) |
@@ -794,14 +796,14 @@ rewind.js ships as **five binaries**, all `zig build` steps from this repo:
 
 | Binary | Source | Build step | Owns |
 |---|---|---|---|
-| `rewind-worker` | `src/rewind/main.zig` | `zig build rewind-worker` | The **worker / data-plane node**: per-worker QuickJS (arenajs) dispatcher; the per-tenant `Bridge` over the multi-raft `Node`; HTTP/2 serving; held-connection + streaming state; the durable-wake scheduler sweep (`_sched/`, gap 2.6 — webhook/email deferred fires, durable cron, and crash-recovery watchdogs all ride it; the per-feature owed/cron sweeps are deleted); `/_system/deploy` (compile + content-address + stamp manifest, on a background `DeployThread` off the poll loop — files-server dissolved, `rewind-cli-plan.md` §4), `/_system/release`, `/_system/v2-*` (move), `/_system/services-token` machine-to-machine endpoints. Hosts the DP system tenants `__admin__` / `__replay__` / `__auth__`. |
+| `rewind-worker` | `src/rewind/main.zig` | `zig build rewind-worker` | The **worker / data-plane node**: per-worker QuickJS (arenajs) dispatcher; the per-tenant `Bridge` over the multi-raft `Node`; HTTP/2 serving; held-connection + streaming state; the durable-wake scheduler sweep (`_sched/`, gap 2.6 — webhook/email deferred fires, durable cron, and crash-recovery watchdogs all ride it; the per-feature owed/cron sweeps are deleted); `/_system/deploy` (compile + content-address + stamp manifest, on a background `DeployThread` off the poll loop — files-server dissolved, `architecture/cli-and-deploy.md` §4), `/_system/release`, `/_system/v2-*` (move), `/_system/services-token` machine-to-machine endpoints. Hosts the DP system tenants `__admin__` / `__replay__` / `__auth__`. |
 | `rewind-front` | `src/front/main.zig` + `src/front/proxy.zig` | `zig build rewind-front` | The **front door** (stateless edge): terminates TLS (own ACME), routes `Host → cluster` from the CP directory (cached, off the hot path), STREAMING leader-aware proxy (pooled h2c client legs, bodies relay both directions as they arrive, 421 re-aim with replay buffer). (Tenant moves are the CP's `POST /_control/move`.) |
 | `rewind-cp` | `src/cp/main.zig` | `zig build rewind-cp` | The **control plane** (a small dedicated raft cluster, 3–5 voters): the replicated `__directory__` group — authoritative `Host → cluster` placement, per-tenant `plan/*`, ACME `cert/*`. Sequences tenant moves; the directory flip is the move commit point. |
 | `log-server` | `src/log_server/*` | (standalone) | The **request-log query surface**: polls S3 for per-node `.ndjson` log batches + sidecars, maintains a local SQLite `log_index.db`, serves `/v1/{tenant}/{list,show,count}` to the dashboard. No raft. |
 
 Deploy/publish is **not** a separate binary: the worker's `/_system/deploy`
 endpoint compiles + content-addresses + stamps the manifest in-tenant on a
-background thread (files-server dissolved — `rewind-cli-plan.md` §4); the
+background thread (files-server dissolved — `architecture/cli-and-deploy.md` §4); the
 `_deploy/current` flip stays `/_system/release`.
 
 The CP/DP split is the V2 structural call (decisions.md §10.1): per-tenant

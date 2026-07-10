@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Log-server tenant-scope gate smoke (step3-auth-plan.md A4 / A6).
+"""Log-server tenant-scope gate smoke (docs/architecture/auth-consolidation.md A4 / A6).
 
 Proves the audit's open latent-critical is closed: the standalone log-server
 no longer treats "any signed token" as authorized for every tenant. Read

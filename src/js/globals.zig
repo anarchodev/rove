@@ -688,7 +688,7 @@ fn valueToOwnedString(
 /// (`"[object Object]"`, a Uint8Array's `"1,2,3"`) and null/undefined
 /// at a write site is a handler bug — all throw TypeError instead of
 /// corrupting the durable store
-/// (docs/plans/handler-api-ergonomics-plan.md C2). JSON encoding stays
+/// (docs/decisions.md Â§4.11). JSON encoding stays
 /// the handler's explicit choice (`kv.set(k, JSON.stringify(v))`).
 fn kvWriteArgToOwnedString(
     state: *DispatchState,
@@ -713,7 +713,7 @@ fn kvWriteArgToOwnedString(
 /// (`StreamKeyTooLarge` / `StreamValueTooLarge`), which would surface as an
 /// opaque replication failure, not a handler error. We reject it fail-fast
 /// here at write time with a clean, branchable JS error instead
-/// (docs/plans/format-versioning-audit.md §7.2). Conservative by design: these can
+/// (docs/architecture/format-versioning.md §7.2). Conservative by design: these can
 /// be RAISED later without breaking anyone, never lowered.
 const KV_KEY_MAX: usize = kv_mod.snapshot_stream.STREAM_KEY_MAX;
 const KV_VAL_MAX: usize = kv_mod.snapshot_stream.STREAM_VAL_MAX;
@@ -2000,7 +2000,7 @@ pub fn installStatic(ctx: *c.JSContext) void {
     evalSnippet(ctx, "textcodec.js", TEXTCODEC_JS);
     // request.js needs TextDecoder (above): builds the shared
     // `__rove_request_proto` whose `text`/`json` accessors derive from
-    // `request.bytes` (handler-api-ergonomics-plan §2.2).
+    // `request.bytes` (decisions.md §4.11).
     evalSnippet(ctx, "request.js", REQUEST_JS);
     evalSnippet(ctx, "base64.js", BASE64_JS);
     evalSnippet(ctx, "urlsearchparams.js", URLSEARCHPARAMS_JS);
@@ -2504,7 +2504,7 @@ pub fn installRequest(
     const req_obj = c.JS_NewObject(ctx);
     // The shared payload prototype (globals/request.js): `text`/`json`
     // accessors deriving from `request.bytes`
-    // (handler-api-ergonomics-plan §2.2). Baked into the base snapshot;
+    // (decisions.md §4.11). Baked into the base snapshot;
     // one JS_SetPrototype per activation. Test contexts built without
     // the globals install simply skip it.
     const payload_proto = c.JS_GetPropertyStr(ctx, global, "__rove_request_proto");
@@ -2787,7 +2787,7 @@ pub fn installRequest(
             _ = c.JS_SetPropertyStr(ctx, req_obj, "done", if (fc.final) js_true else js_false);
             if (fc.id) |fid| {
                 // ftch_-prefixed — the SAME string after.fetch() returned
-                // (handler-api-ergonomics-plan §2.4).
+                // (decisions.md §4.9).
                 var tfid_buf: [log_mod.FETCH_ID_PREFIX.len + 64]u8 = undefined;
                 @memcpy(tfid_buf[0..log_mod.FETCH_ID_PREFIX.len], log_mod.FETCH_ID_PREFIX);
                 @memcpy(tfid_buf[log_mod.FETCH_ID_PREFIX.len..][0..fid.len], fid);
@@ -2874,7 +2874,7 @@ pub fn installRequest(
         _ = c.JS_SetPropertyStr(ctx, activation_obj, "done", if (ic.done) js_true else js_false);
         // The uniform payload view (§2.2): `bytes` = this chunk.
         // (`request.body` retired — the accessors are the payload
-        // surface; handler-api-ergonomics-plan §2.2.)
+        // surface; decisions.md §4.11.)
         _ = c.JS_DefinePropertyValueStr(
             ctx,
             req_obj,
@@ -2923,7 +2923,7 @@ pub fn installRequest(
             if (c.JS_IsException(msg_val)) {
                 _ = c.JS_GetException(ctx); // clear; leave request.ctx unset
             } else {
-                // One-ctx rule (handler-api-ergonomics-plan §2.4): the
+                // One-ctx rule (decisions.md §4.9): the
                 // schedule/cron target reads its threaded payload as
                 // `request.ctx` like every other callback.
                 _ = c.JS_SetPropertyStr(ctx, req_obj, "ctx", msg_val);
@@ -3248,7 +3248,7 @@ fn selfReplaceWithValue(
 /// read-recording as `jsBodyGetter` — the two record the SAME body-read
 /// fact, so reading either (or both) keeps the tape/log body reference
 /// alive exactly once — then self-replaces with a Uint8Array of the raw
-/// payload (handler-api-ergonomics-plan §2.2).
+/// payload (decisions.md §4.11).
 fn jsBytesGetter(
     ctx: ?*c.JSContext,
     this_val: c.JSValue,

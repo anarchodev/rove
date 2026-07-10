@@ -51,7 +51,7 @@ export default function () {
     if (on_result) {
         // body_b64: the PUT response bytes (previously dropped — the
         // blob.put on_result surface carried no body at all;
-        // handler-api-ergonomics-plan §2.2). Cross-module continuation via
+        // decisions.md §4.11). Cross-module continuation via
         // the widened public `next(target, ctx)` (no bare `__rove_next`).
         return next(on_result, {
             result: {

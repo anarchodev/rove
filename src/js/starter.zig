@@ -28,7 +28,7 @@ const files_mod = @import("rove-files");
 
 const STARTER_INDEX_MJS = @embedFile("starter_index_mjs");
 const STARTER_STATIC_INDEX_HTML = @embedFile("starter_static_index_html");
-/// The genesis `__admin__` deploy app (rewind-cli-plan §4.1 (f)) — the
+/// The genesis `__admin__` deploy app (docs/architecture/cli-and-deploy.md §4.1 (f)) — the
 /// minimal handler that composes deploys from `platform.*`. Baked so a
 /// virgin cluster self-bootstraps deploy capability; the full admin is then
 /// published THROUGH it.
@@ -68,7 +68,7 @@ pub fn deployStarterContent(
     );
 }
 
-/// Deploy the genesis `__admin__` deploy app (rewind-cli-plan §4.1 (f)) — the
+/// Deploy the genesis `__admin__` deploy app (docs/architecture/cli-and-deploy.md §4.1 (f)) — the
 /// baked minimal handler that composes deploys from `platform.*`. One handler,
 /// no statics. Same staging path as the starter; the caller proposes
 /// `release_ws`'s `_deploy/current` through raft.

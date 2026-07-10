@@ -1,4 +1,4 @@
-//! `rewind-ops` — the platform/operator CLI (docs/plans/rewind-cli-plan.md §2–§3,
+//! `rewind-ops` — the platform/operator CLI (docs/architecture/cli-and-deploy.md §2–§3,
 //! §6). The privileged half of the split: every verb here carries an operator
 //! secret (root token → workers + deploy app; REWIND_MOVE_SECRET → CP control,
 //! which now also propagates the worker domain alias). Never shipped to
@@ -421,7 +421,7 @@ fn cmdMove(a: std.mem.Allocator, env: *const c.Env, tenant: []const u8, cluster:
 /// alias to the tenant's serving cluster (`/_system/v2-domain`), so a worker
 /// recognizes the custom host on direct/relayed requests. The CP owns
 /// host→tenant end-to-end now — no second operator secret (`ADMIN_OPS_SECRET`
-/// retired, step3-auth-plan.md B3). A 503 means the alias didn't land (tenant
+/// retired, docs/architecture/auth-consolidation.md B3). A 503 means the alias didn't land (tenant
 /// unplaced / no reachable leader) — provision the tenant first, then retry.
 fn cmdHostAdd(a: std.mem.Allocator, env: *const c.Env, host: []const u8, tenant: []const u8) void {
     var body = std.ArrayList(u8){};
@@ -478,7 +478,7 @@ fn cmdStatus(a: std.mem.Allocator, env: *const c.Env, host: []const u8) void {
 // ── arg parsing + dispatch ──────────────────────────────────────────────────
 
 const usage =
-    \\rewind-ops — platform/operator CLI (docs/plans/rewind-cli-plan.md)
+    \\rewind-ops — platform/operator CLI (docs/architecture/cli-and-deploy.md)
     \\
     \\usage:
     \\  rewind-ops genesis [--cluster C]              cold bring-up from empty (needs ROVE_GENESIS_NODES)

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""rewind customer CLI gateway flow (rewind-cli-plan Track 3).
+"""rewind customer CLI gateway flow (docs/architecture/cli-and-deploy.md Track 3).
 
 Proves the `rewind` customer CLI's auth model end-to-end at the protocol
-level — the gateway / session-bearer design (step3-auth-plan.md cap-mint
+level — the gateway / session-bearer design (docs/architecture/auth-consolidation.md cap-mint
 fork, resolved to gateway):
 
   1. device grant — the CLI POSTs __auth__ /device_authorization → a

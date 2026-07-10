@@ -151,7 +151,7 @@ fn buildTriggerEvent(
     if (state.request_id != 0) {
         const actor = c.JS_NewObject(ctx);
         // Customer-visible: opaque `req_<16hex>` prefixed form, never the
-        // bare integer (format-versioning-audit.md §7.5).
+        // bare integer (docs/architecture/format-versioning.md §7.5).
         var rid_buf: [log_mod.PREFIXED_ID_BUF]u8 = undefined;
         const rid = log_mod.formatPrefixedId(&rid_buf, log_mod.REQUEST_ID_PREFIX, state.request_id);
         _ = c.JS_SetPropertyStr(ctx, actor, "request_id", c.JS_NewStringLen(ctx, rid.ptr, rid.len));

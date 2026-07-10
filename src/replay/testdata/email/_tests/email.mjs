@@ -1,4 +1,4 @@
-// email.send decomposition (docs/plans/sim-test-framework.md). The readable
+// email.send decomposition (docs/architecture/replay-and-sim.md). The readable
 // matcher surfaces recipient + subject; under the hood email IS a webhook at the
 // primitive level (one _send/owed marker pointed at the Resend API).
 import { scenario, expect } from "rewind:test";
