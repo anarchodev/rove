@@ -230,7 +230,12 @@
           "/list?tag._corr=" + encodeURIComponent(corr) + "&limit=" + limit;
       }
       if (opts.since) url += "&after_received_ns=" + opts.since;
-      after.fetch(url, { method: "GET" }, { on: on_key });
+      // The result-target `on` rides IN opts — `after.fetch(url, opts)` takes two
+      // args and lowers `opts.on` to the native `{to}`. Passing `{on}` as a third
+      // arg (as this once did) is silently dropped, so the reply resumes at the
+      // default `onFetchResult` instead of the caller's `on` — the success bounce
+      // never reaches it.
+      after.fetch(url, { method: "GET", on: on_key });
       return true;
     },
 

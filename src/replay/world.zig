@@ -92,6 +92,13 @@ pub const World = struct {
     /// supplies it. `request.auth`, by contrast, is set by the REAL
     /// `_middlewares/index.mjs` the sim runs — never injected. JSON text.
     session_json: ?[]const u8 = null,
+    /// Per-chain identity the engine pins on every activation (the worker sets
+    /// them, there's no handler code to run) — `request.tenant` (this handler's
+    /// tenant id) and `request.correlation_id` (minted by inbound, inherited by
+    /// every resume). A test supplies them so a handler branch keyed on either is
+    /// driveable (e.g. `browser.getReplay`). Plain strings.
+    tenant: ?[]const u8 = null,
+    correlation_id: ?[]const u8 = null,
     /// The flattened fetch/callback result surface — top-level on `request`.
     status: ?i64 = null,
     ok: ?bool = null,
@@ -149,6 +156,9 @@ pub fn fromValue(a: std.mem.Allocator, root: std.json.Value) Error!World {
         if (r.get("session")) |sv| {
             if (sv != .null) w.session_json = try jsonText(a, sv);
         }
+        // Per-chain identity the engine pins (worker-set; no code to run).
+        if (jStr(r, "tenant")) |s| w.tenant = s;
+        if (jStr(r, "correlationId")) |s| w.correlation_id = s;
         if (r.get("headers")) |hv| {
             if (hv != .object) return Error.BadWorld;
             var hs = std.ArrayList(Header){};

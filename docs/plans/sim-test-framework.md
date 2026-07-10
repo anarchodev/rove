@@ -451,9 +451,11 @@ native replay crypto (getRandomValues/randomBytes/randomUUID + 0.3.4 native
 (base64url/jwt/oidc/oauth/sessions/request/users/activitypub/urlsearchparams/
 segments/retry) evaled in dep order, then hardened (`src/replay/sim_globals.zig`,
 embedded via build.zig anonymous imports — one source with the worker). Crypto is
-byte-faithful (NIST vectors through `globals/crypto.js`); streaming-sha + RSA/ECDSA
-throw a clear "not available offline" error. Effect globals stay the epilogue's
-recorders (effect log unchanged).
+byte-faithful (NIST vectors through `globals/crypto.js`); **RS256 and ES256**
+verify offline in pure JS (BigInt modexp for RSA; Jacobian-coordinate P-256 point
+math for ECDSA — one modular inverse per verify, so the bump arena survives it);
+streaming-sha + RS384/512 throw a clear "not available offline" error. Effect
+globals stay the epilogue's recorders (effect log unchanged).
 
 **Middleware runs for real.** For inbound-family activations the epilogue imports
 and runs the tenant's `_middlewares/index.mjs` `before` (async IIFE) — it mutates
@@ -465,18 +467,78 @@ too. Fixtures `testdata/{authsurface,middleware}`.
 ## What's left
 
 - **The last of the sim base surface.** Compute globals + middleware + `http` /
-  `platform` / `browser` (effect recorders) + **RS256** OIDC verify
-  (`crypto.verifyRsa`, pure-JS BigInt) are all in. Remaining: **ES256/ECDSA**
-  verify (EC point math or a crypto host-bridge) and **RS384/512** (need native
-  sha384/512); `platform.*` reads hit the one closed-world kv (no per-instance
-  store isolation) and `auth.checkRootToken` assumes root — first-pass. And the
-  clean end-state — install the REAL effect globals so `webhook.send` decomposes
-  to `http.fetch`+`kv`+`schedule` — would shift the effect log to primitive level
-  and needs the matchers/cross-checks updated; kept as stubs.
-- **A detached `wake` helper** for `schedule` / `cron` callbacks — the
-  `durable_wake` analogue of `sendCallback` (author the wake world directly).
-  Deferred only because its exact `request.*` surface wasn't re-confirmed this
-  pass; `sendCallback` is the confirmed one.
+  `platform` / `browser` (effect recorders) + **RS256 and ES256** OIDC verify
+  (`crypto.verifyRsa` / `crypto.verifyEcdsa`, pure-JS BigInt) are all in — the
+  common OIDC signature algs (HS256/RS256/ES256) all verify offline. Remaining:
+  **RS384/512 + ES384/512** (need native sha384/512, and P-384/521 curves for the
+  EC ones). `platform.*` per-store kv isolation is now DONE: `platform.scope(id).kv`
+  and `platform.root` get isolated stores (each namespaces its keys under
+  `__rove_store/{tag}/` in the one closed-world map — `storeKv` in `sim_globals`,
+  with the epilogue kv wrapper hiding those keys from tenant reads/scans), seeded
+  via `scenario({ instances: { <id>: { kv } }, root: { kv } })` and asserted with
+  `node.instanceKv(id, key)` / `node.rootKv(key)`; scoped writes carry a `store`
+  tag in the effect log. Fixture `testdata/platformkv/`. `platform.auth
+  .checkRootToken(token)` also now validates against the configured operator root
+  token — seed it with `scenario({ rootToken })` (a hidden reserved kv key);
+  unconfigured → nothing authenticates as root. Fixture `testdata/roottoken/`.
+  `platform.*` is also **admin-gated, fail-closed**: every sync method throws
+  `TypeError("platform is only available on the admin handler")` unless the run
+  opts in with `scenario({ admin: true })` (a hidden `__rove_store/admin` key),
+  matching prod's `__admin__`-only rule; `platform.compile` stays ungated (it
+  lowers to a bound fetch, admin-checked door-side). Fixture
+  `testdata/platformadmin/`.
+- ~~**Request-body UTF-8 gap.**~~ — FIXED. The sim reconstructed an inline request
+  body as a *latin1 byte* string (`D.body.charCodeAt(i) & 0xff` in `epilogue.zig`),
+  so a JSON body with multibyte UTF-8 (e.g. `"✓"` → byte `0x13`) corrupted
+  `request.text` and made `request.json` throw "Bad control character". `D.body`
+  is the *decoded* text (the appended `.js` source is read as UTF-8), so
+  `__rawPayload` now re-encodes it to its UTF-8 wire bytes via
+  `unescape(encodeURIComponent(...))` — `request.bytes`/`text`/`json` all decode
+  correctly (2/3/4-byte incl. surrogate pairs). This also fixed replay of any
+  captured non-ASCII text body, not just the sim. Fixture `testdata/utf8body/`.
+- ~~**The clean effect-global unification.**~~ — DONE (except `blob`). The sim
+  base now installs the REAL effect globals unconditionally — there is no
+  `realEffects` flag and the epilogue no longer stubs these verbs. `webhook.send`
+  decomposes to `kv` (the `_send/owed/{id}` marker) + `http.fetch` + a watchdog
+  `schedule` (`_sched/*` rows); `schedule`/`cron` decompose to `_sched/*` kv rows;
+  `email.send` layers on `webhook.send` (one `_send/owed` marker pointed at the
+  Resend API, body = the built request). `after`/`stream`/`next` are faithful
+  recorders installed the same way (added a `_system.stream` recorder +
+  `__rove_next` to the base). `toHaveSent`/`toHaveScheduled` are **views** over
+  the primitive log (`_send/owed/*` markers, `_sched/by_id/*` rows — unwrapping
+  the `cron → __system/cron_tick` indirection; `after.ms`/`after.kv` stay direct
+  `{kind:"timer"|"kv-wake"}` recorder entries), and `toHaveSent("email", …)`
+  parses the Resend marker body back to `{to (array), from, subject}`. Fixtures
+  `testdata/effects/` (webhook+schedule) + `testdata/email/`; whole suite green
+  (`checkout` now sends a real durable email by default). Two consequences of
+  making it real are now baked into the fixtures, not pending churn: bare
+  `toHaveScheduled()` sees a `webhook.send`/`email.send` watchdog schedule, and
+  `email.send` requires `apiKey`/`from` (the real shim's contract).
+  `blob` is now real too: the recipe path (`blob.write`/`blob.seal`) needs
+  streaming sha256 (`crypto.sha256Init/Update/Final`), which is supplied as a
+  pure-JS streaming SHA-256 in the sim base (same posture as the RSA/ECDSA
+  verify); `blob.put`/`get`/`url` compose over the `_system.blob`/`http`
+  recorders + the base `after.fetch`. Fixture `testdata/blobrecipe/` proves the
+  streamed recipe hash equals one-shot `crypto.sha256` over the concatenation
+  across block boundaries + UTF-8, and that the durable markers (`_blob/owed`,
+  `_blob/recipe/*`) + PUT/compose fetches land in the log. Only `kv` stays an
+  epilogue wrapper now (it must wrap the native per-run + restore before the
+  sentinel write).
+- ~~**A detached `wake` helper** for `schedule` / `cron` callbacks~~ — DONE.
+  `scenario().wake({ on, ctx, key?, id?, scheduledAtNs?, method? })` authors a
+  `durable_wake` world directly — the analogue of `sendCallback` for the durable
+  scheduler. Surface re-confirmed against the runtime (`globals.zig` durable-wake
+  block + `rpc_dispatch`): the payload arrives on **`request.ctx`** (the one-ctx
+  rule, NOT `request.activation.msg`) and delivery metadata on
+  `request.activation.{kind, id, key, scheduledAtNs}` (`key` omitted when the
+  schedule carried none). Both `schedule` and `cron` deliver the customer target
+  the same way — `cron_tick` is a `__system` re-dispatcher the customer never
+  sees, so one `wake(...)` models one occurrence. A fired target dispatches at
+  the target module's **default** export (fixed a mirror bug in
+  `epilogue.exportForActivation`, which had `durable_wake → onWake`); a
+  `module.method` target names its export via `method`. Fixture
+  `testdata/checkout/{jobs/reminder.mjs, _tests/wake.mjs}` (self-rescheduling
+  reminder recipe), wired into `rewind-test-smoke`.
 - **`whenConcurrent(...).interleavings()`** — the model-check combinator over
   concurrent-effect delivery orders (the plan's `toBeConsistent` example) is not
   built; `branch`/`cases` cover single-effect forking today.

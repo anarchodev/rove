@@ -65,6 +65,26 @@ expect(req).toHaveFetched(/stripe/);
 - `sourceDir` — where handler code resolves from (defaults to the app dir you
   ran `rewind test` in). Use it to point a scenario at a different tree.
 - `entry` — the handler module (defaults to `index.mjs`).
+- `instances` / `root` — seed other stores for a `platform.*` handler:
+  `instances: { acme: { kv: {…} } }` seeds another instance's store, `root: { kv: {…} }`
+  the platform root store (see [Platform and admin handlers](#platform-and-admin-handlers)).
+- `rootToken` — the operator token `platform.auth.checkRootToken` validates against.
+- `admin` — mark the run as the admin handler so `platform.*` is allowed. It's
+  admin-only and **off by default**, so a normal handler that touches it throws.
+- `tenant` / `correlationId` — the per-chain identity the engine pins on every
+  activation (`request.tenant` and `request.correlation_id`). The worker sets them
+  in prod — inbound mints the correlation id, every resume inherits it — so a
+  scenario supplies them once and they thread through inbound → WS frame →
+  fetch/receive resumes automatically. Set them when a handler branches on the
+  per-connection identity (e.g. `browser.getReplay`, which needs both). A single
+  activation can override with `inbound({ correlationId })`.
+
+The **request body** is whatever you pass as `inbound({ body })` (JSON-stringified
+if it's not a string). Omit it and the request is bodyless — reading `request.text`
+/ `.bytes` / `.json` returns empty (`""`, 0-length), exactly as a real bodyless
+request (a GET, an empty POST) does. (A *replayed* recording is stricter: reading a
+body the original run never read is a divergence — but an authored world asserts a
+real empty request, not a missing one.)
 
 ## A node's surface
 
@@ -75,6 +95,9 @@ expect(req).toHaveFetched(/stripe/);
   `next()` and is waiting).
 - `req.kv(key)` — the effective value of `key` after this activation (starting KV
   plus its writes), so `req.kv("order/jess").status` reads what the handler left.
+- `req.instanceKv(id, key)` / `req.rootKv(key)` — the same, for another instance's
+  isolated store (`platform.scope(id).kv`) / the platform root store
+  (`platform.root`). See [Platform and admin handlers](#platform-and-admin-handlers).
 - `req.effects` / `req.frames` — the raw effect log / the frames it `stream.write`'d.
 
 ## Assertions
@@ -86,7 +109,8 @@ expect(node.status).toBe(200);
 expect(node.kv("order/jess")).toEqual({ status: "paid" });
 expect(node).toHaveWritten("order/jess", { status: "pending" });  // subset match; arrays are exact
 expect(node).toHaveFetched(/stripe/);
-expect(node).toHaveSent("email", { to: "jess@example.com" });     // webhook / email cmd
+expect(node).toHaveSent("webhook", { url: "https://hooks.example.com/notify" }); // webhook.send
+expect(node).toHaveSent("email", { to: ["jess@example.com"] });    // email.send (to is a list)
 expect(node).toHaveScheduled();                                    // a timer / kv / cron wake
 expect(node).toHaveSentFrame(/welcome/);                           // a stream.write / WS frame
 expect(node).toMatchSnapshot("checkout-inbound");
@@ -141,6 +165,35 @@ const done = req.fetch(/upstream/).stream(["chunk-1", "chunk-2", "chunk-3"]);
 expect(done.body).toBe("chunk-1chunk-2chunk-3");   // an accumulate-in-kv handler reconstructs it
 ```
 
+When the fetch's `on` names a **different module** (a path like `hooks/onX.mjs`,
+not a bare same-module export), `.resolve()` runs that module at its `default`
+export — the same entry-switch `sendCallback`/`wake` use. So a continuation that
+lives in its own file (an `oidc.rp()` internal, a shared hook) resolves correctly,
+and you can also drive one in isolation with `scenario.fetchResult` (below).
+
+### Concurrent effects that race
+
+When one held activation emits **two or more** fetches whose results race, an
+invariant may need to hold no matter which upstream answers first. `whenConcurrent`
+folds every arrival order, threading each leg's writes into the next resume's
+overlay (so a later leg reads an earlier leg's write — read-your-writes across the
+race):
+
+```js
+const inter = req.whenConcurrent([
+  { match: /a\.example/, resolve: { status: 200 }, label: "A" },
+  { match: /b\.example/, resolve: { status: 200 }, label: "B" },
+]);
+
+inter.forEachOrder((terminal, order) => {   // once per arrival order (all permutations)
+  expect(terminal.body).toEqual({ total: 30 });
+});
+inter.invariant((terminal) => terminal.body.total);   // one pass iff every order agrees
+```
+
+`forEachOrder` enumerates all permutations (capped at 5 legs); past that, pass the
+orders you care about explicitly with `.orders([["B", "A"], …])`.
+
 ### A timer, a watched key, a disconnect
 
 These carry no external payload — they resume the held connection with its
@@ -169,6 +222,30 @@ const closed = m1.disconnect();          // → onDisconnect
 ws.receive(new Uint8Array([1, 2, 3]), { binary: true });   // a binary frame
 ```
 
+### A streamed upload (headers-first)
+
+A handler that exports `onHeaders` runs *before* the body is accepted, and the
+only body-accepting move from there is `blob.receive({ on })` then `return
+next()` — the body streams straight to storage with no chunk activations, and the
+chain resumes at `on` once the object is durable. Drive the entry with
+`scenario.inboundHeaders`, then resume the receive with `.receive().stored(...)`:
+
+```js
+const h = s.inboundHeaders({ method: "PUT", path: "/upload?path=logo.png",
+                             headers: { authorization: "Bearer …" } });
+expect(h.disposition).toBe("held");            // onHeaders armed the receive + held
+
+const stored = h.receive().stored({ hash: "abc123", len: 4096 });
+expect(stored.status).toBe(200);               // onStored ran with request.ctx = {hash, len, app}
+```
+
+`stored({ hash, len })` resumes at the receive's `on` with `request.activation.ok
+=== true` and `request.ctx = { hash, len, app }`, where `app` echoes the issue-time
+ctx (for a scoped `platform.scope(t).blob.receive({ ctx })`, that's how `onStored`
+recovers the target path). A torn upload is `stored({ ok: false })` — the resume
+runs with `request.activation.ok === false` and `request.ctx = { error, app }`,
+nothing stored.
+
 ## Detached delivery callbacks
 
 `webhook.send` and `email.send` fire *after* the handler commits — their `on`
@@ -183,6 +260,89 @@ const delivered = s.sendCallback({
 });
 expect(delivered).toHaveWritten("delivery/o9", { ok: true });
 ```
+
+A `schedule(...)` or `cron(...)` target fires the same way — later, as its own
+connectionless activation, with your payload on `request.ctx` and delivery
+metadata on `request.activation`. Author that fire directly with `wake`:
+
+```js
+const fired = s.wake({
+  on: "jobs/reminder.mjs",
+  ctx: { user: "ada" },        // arrives as request.ctx
+  key: "reminder/ada",         // request.activation.key (omit if none)
+});
+expect(fired).toHaveWritten("reminder/ada", { count: 1 });
+expect(fired).toHaveScheduled("jobs/reminder");   // it re-armed the next one
+```
+
+Both `schedule` and `cron` deliver a target this way, so one `wake(...)` is one
+firing. As with `sendCallback`, the target is tested in isolation — the
+scheduler's own queueing and at-least-once firing aren't re-run.
+
+A bare **fetch continuation module** — the `on` of an `after.fetch`/`http.fetch`,
+in its own file — is drivable the same way with `scenario.fetchResult`, given an
+upstream result on the flattened `request.{status, ok, done, body}` surface:
+
+```js
+const done = s.fetchResult({
+  on: "hooks/onFetched.mjs",
+  status: 502, ok: false,
+  ctx: { key: "beta" },        // arrives as request.ctx
+});
+expect(done).toHaveWritten("result/beta", { ok: false, status: 502 });
+```
+
+## Platform and admin handlers
+
+Handlers on the `__admin__` control plane use `platform.*` — cross-tenant KV, the
+platform root store, instance lifecycle, root-token auth. That surface is
+**admin-only**: off a normal tenant handler every call throws, so a scenario has
+to opt in with `admin: true` before `platform.*` is allowed.
+
+Each store is isolated, exactly like production: a tenant's own `kv`, another
+instance's store (`platform.scope(id).kv`), and the root store (`platform.root`)
+never bleed into one another. Seed the other stores on the scenario, and read
+their post-state back with `instanceKv` / `rootKv`:
+
+```js
+const s = scenario({
+  admin: true,                                    // platform.* is admin-only
+  rootToken: "op-secret",                         // what checkRootToken validates
+  instances: { acme: { kv: { profile: "{}" } } }, // seed acme's isolated store
+});
+
+const r = s.inbound({
+  method: "POST", path: "/provision",
+  headers: { authorization: "op-secret" },
+});
+expect(r.instanceKv("acme", "profile")).toEqual({ plan: "pro" });  // a platform.scope write
+expect(r.rootKv("instance/acme")).toEqual({ created: true });      // a platform.root write
+
+// A wrong (or missing) root token is rejected — checkRootToken returns true only
+// for the configured token, so both paths are testable:
+const denied = s.inbound({
+  method: "POST", path: "/provision",
+  headers: { authorization: "wrong" },
+});
+expect(denied.status).toBe(403);
+```
+
+The handler behind this writes into the scoped and root stores and gates on the
+token:
+
+```js
+export default function () {
+  if (!platform.auth.checkRootToken(request.headers["authorization"])) {
+    response.status = 403; return "forbidden";
+  }
+  platform.scope("acme").kv.set("profile", JSON.stringify({ plan: "pro" }));
+  platform.root.set("instance/acme", JSON.stringify({ created: true }));
+  return { ok: true };
+}
+```
+
+Leaving out `admin` (the default) makes every `platform.*` call throw — which is
+itself worth asserting if a handler is supposed to stay off that surface.
 
 ## Snapshots
 

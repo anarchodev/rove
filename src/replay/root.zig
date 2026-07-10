@@ -90,7 +90,12 @@ pub const Engine = struct {
         // Build the base unfrozen, eval the compute-globals prelude into it, then
         // seal — so every handler run gets crypto/base64url/jwt/oidc/sessions/…
         // from a shared frozen base (one install, not per-request).
-        const s = arena_reactor_new_open(8192, 8192) orelse return Error.ArenaInit;
+        // A 16 MiB request arena (vs the worker's 8): the bump allocator never
+        // frees mid-run, so BigInt-heavy pure-JS crypto (ES256/RS256 verify)
+        // churns more than a typical handler. The worker survives such churn via
+        // its GC-on-OOM fallback, which the sim lacks — this headroom stands in
+        // for it. Reset per run, so it's a ceiling, not steady growth.
+        const s = arena_reactor_new_open(8192, 16384) orelse return Error.ArenaInit;
         if (arena_reactor_eval_base(s, sim_globals.PRELUDE.ptr) != 0) return Error.ArenaInit;
         arena_reactor_freeze(s);
         return .{ .sim = s };
@@ -232,6 +237,8 @@ pub const Engine = struct {
             .ctx_json = wv.ctx_json,
             .activation_json = wv.activation_json,
             .session_json = wv.session_json,
+            .tenant = wv.tenant,
+            .correlation_id = wv.correlation_id,
             .run_middleware = run_middleware,
             .result = result,
         });
