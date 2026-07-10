@@ -371,22 +371,24 @@ defense-in-depth.** Every privileged native self-gates (`is_system_module`
     on the platform, never the author's machine. A lockfile/manifest
     `bytecode_hash` is a *reference to platform-compiled output*, never
     an upload.
-  - **Hash-laundering closed by the `bc-` prefix split (SHIPPED
+  - **Hash-laundering closed by the `bc/` prefix split (SHIPPED
     2026-07-09).** Uploads (statics via `blob.receive`) and compiled
     bytecode used to share the per-tenant `file-blobs` namespace at
     bare-hash keys, so a manifest referencing an uploaded blob's hash as
     `bytecode_hash` would feed attacker bytes to `JS_ReadObject` (gated
     only by the admin-only manifest-stamp door — vigilance). Now
-    `compileAndStage` is the ONLY writer of `bc-{hash}` keys
+    `compileAndStage` is the ONLY writer of `bc/{hash}` keys
     (`files_mod.BC_KEY_PREFIX`), and every bytecode fetch (loader,
-    package staging) reads ONLY `bc-{hash}`; upload paths compute native
-    64-hex keys and structurally cannot produce a `bc-` key, so a
+    package staging) reads ONLY `bc/{hash}`; upload paths compute native
+    64-hex keys and structurally cannot produce a `bc/` key, so a
     laundered hash finds nothing and fails loud. "Referenced bytecode is
-    compiler output" now holds by construction. (`bc-`, not `bc/` —
-    rove-blob's `validateKey` forbids `/`. `bytecode_hash` in manifests
-    stays the bare content hash; the prefix is a storage namespace.)
-    Storage-layout change: pre-launch, no back-compat — wipe +
-    re-genesis dev; coordinate the prod re-genesis.
+    compiler output" now holds by construction. (`bytecode_hash` in
+    manifests stays the bare content hash; `bc/` is a storage-key
+    namespace, not identity. The `/` separator is S3-idiomatic —
+    rove-blob's `validateKey` allows `/` as of the same change;
+    confinement is the `..` reject + fixed prefix, not banning `/`, and
+    no customer picks a raw key.) Storage-layout change: pre-launch, no
+    back-compat — wipe + re-genesis dev; coordinate the prod re-genesis.
 
 ---
 

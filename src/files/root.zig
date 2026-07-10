@@ -19,8 +19,8 @@
 //! Blob keys are the hex sha-256 of the bytes:
 //!
 //!   `{source_sha256_hex}`        → raw source / static bytes
-//!   `bc-{bytecode_sha256_hex}`   → serialized quickjs bytecode — the
-//!                                  `bc-` namespace is writable ONLY by
+//!   `bc/{bytecode_sha256_hex}`   → serialized quickjs bytecode — the
+//!                                  `bc/` namespace is writable ONLY by
 //!                                  `compileAndStage` (see BC_KEY_PREFIX:
 //!                                  the JS_ReadObject trust boundary)
 //!
@@ -82,19 +82,19 @@ pub const HASH_HEX_LEN: usize = 64; // sha256 hex
 /// Storage-key prefix for compiled bytecode blobs — the trust boundary
 /// for `JS_ReadObject`. quickjs's bytecode reader is not hardened
 /// against adversarial input, so bytecode must be platform-compiled BY
-/// CONSTRUCTION: `compileAndStage` is the only writer of `bc-{hash}`
+/// CONSTRUCTION: `compileAndStage` is the only writer of `bc/{hash}`
 /// keys, and every upload path (statics via blob.receive etc.) writes
 /// natively-computed bare 64-hex content-hash keys — it CANNOT produce
-/// a `bc-` key. Every bytecode fetch (deployment loader, deploy-thread
-/// package staging) reads ONLY `bc-{hash}`, so a manifest that
+/// a `bc/` key. Every bytecode fetch (deployment loader, deploy-thread
+/// package staging) reads ONLY `bc/{hash}`, so a manifest that
 /// references an uploaded blob's hash as `bytecode_hash` finds nothing
 /// and fails loud instead of feeding attacker bytes to the reader.
 /// (`bytecode_hash` in manifests stays the bare content hash — the
 /// prefix is a storage-key namespace, not part of the identity.)
-pub const BC_KEY_PREFIX = "bc-";
+pub const BC_KEY_PREFIX = "bc/";
 pub const BC_KEY_LEN: usize = BC_KEY_PREFIX.len + HASH_HEX_LEN;
 
-/// Build the `bc-{hash}` storage key for a bytecode content hash.
+/// Build the `bc/{hash}` storage key for a bytecode content hash.
 pub fn bcKey(buf: *[BC_KEY_LEN]u8, hash_hex: *const [HASH_HEX_LEN]u8) []const u8 {
     @memcpy(buf[0..BC_KEY_PREFIX.len], BC_KEY_PREFIX);
     @memcpy(buf[BC_KEY_PREFIX.len..], hash_hex);
@@ -492,8 +492,8 @@ test "compileAndStage: stages source + bytecode blobs, returns hashes" {
     try testing.expectEqualStrings("index.mjs", out[0].path);
     try testing.expectEqualStrings("api/index.mjs", out[1].path);
     // Both the source AND bytecode blobs landed for every handler —
-    // source at its bare content hash, bytecode ONLY under `bc-` (the
-    // JS_ReadObject trust boundary: uploads can't produce bc- keys, so
+    // source at its bare content hash, bytecode ONLY under `bc/` (the
+    // JS_ReadObject trust boundary: uploads can't produce bc/ keys, so
     // everything there is compiler output by construction).
     for (out) |cf| {
         try testing.expect(try blob.blobStore().exists(&cf.source_hex));
