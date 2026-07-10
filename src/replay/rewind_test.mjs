@@ -277,7 +277,11 @@ class Scenario {
         path: req.path || "/",
         host: req.host || "",
         headers: req.headers || {},
-        body: req.body,
+        // An AUTHORED bodyless request reads as empty in prod (request.text ===
+        // "", 0-length bytes), NOT "missing" — so default to "" when the caller
+        // omits `body`. (Only the initial authored activation; the replay path's
+        // read-your-tape `miss()` is untouched, and a supplied body is kept.)
+        body: req.body !== undefined ? req.body : "",
         ip: req.ip,
         session: req.session,
         // Per-activation override (undefined ⇒ inherit the scenario default).
@@ -302,6 +306,8 @@ class Scenario {
         path: req.path || "/",
         host: req.host || "",
         headers: req.headers || {},
+        // Empty (readable) payload by default — see `inbound`.
+        body: req.body !== undefined ? req.body : "",
         ip: req.ip,
         session: req.session,
         tenant: req.tenant,
@@ -948,7 +954,9 @@ class WsConnection {
       ctx,
       kv,
       seed: seed + 1,
-      request: { activation },
+      // The frame rides `request.activation.data`; the request payload itself is
+      // empty (readable "") — a handler that reads request.text mustn't throw.
+      request: { activation, body: "" },
     });
     return new WsNode(this.scenario, world, this);
   }

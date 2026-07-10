@@ -79,6 +79,13 @@ expect(req).toHaveFetched(/stripe/);
   per-connection identity (e.g. `browser.getReplay`, which needs both). A single
   activation can override with `inbound({ correlationId })`.
 
+The **request body** is whatever you pass as `inbound({ body })` (JSON-stringified
+if it's not a string). Omit it and the request is bodyless — reading `request.text`
+/ `.bytes` / `.json` returns empty (`""`, 0-length), exactly as a real bodyless
+request (a GET, an empty POST) does. (A *replayed* recording is stricter: reading a
+body the original run never read is a divergence — but an authored world asserts a
+real empty request, not a missing one.)
+
 ## A node's surface
 
 - `req.status` — the response status (the ambient `response.status`).
