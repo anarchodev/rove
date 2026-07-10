@@ -477,8 +477,12 @@ too. Fixtures `testdata/{authsurface,middleware}`.
   with the epilogue kv wrapper hiding those keys from tenant reads/scans), seeded
   via `scenario({ instances: { <id>: { kv } }, root: { kv } })` and asserted with
   `node.instanceKv(id, key)` / `node.rootKv(key)`; scoped writes carry a `store`
-  tag in the effect log. Fixture `testdata/platformkv/`. Still first-pass:
-  `auth.checkRootToken` assumes root.
+  tag in the effect log. Fixture `testdata/platformkv/`. `platform.auth
+  .checkRootToken(token)` also now validates against the configured operator root
+  token — seed it with `scenario({ rootToken })` (a hidden reserved kv key);
+  unconfigured → nothing authenticates as root. Fixture `testdata/roottoken/`.
+  Remaining `platform.*` gap: no admin-only gating (every method is callable in
+  the single-tenant closed world, where prod throws off the admin handler).
 - ~~**Request-body UTF-8 gap.**~~ — FIXED. The sim reconstructed an inline request
   body as a *latin1 byte* string (`D.body.charCodeAt(i) & 0xff` in `epilogue.zig`),
   so a JSON body with multibyte UTF-8 (e.g. `"✓"` → byte `0x13`) corrupted

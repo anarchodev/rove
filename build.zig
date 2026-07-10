@@ -1355,6 +1355,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/blobrecipe", // blob put/write/seal/url — streaming sha256 offline
         "src/replay/testdata/utf8body", // multibyte UTF-8 request body round-trips (json/text/bytes)
         "src/replay/testdata/platformkv", // platform.scope(id)/root per-store kv isolation
+        "src/replay/testdata/roottoken", // platform.auth.checkRootToken validates the configured token
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);

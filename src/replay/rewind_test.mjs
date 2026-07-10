@@ -213,6 +213,10 @@ class Scenario {
     // `__rove_store/{tag}/` layout the base facades + host use at runtime.
     this.instances = cfg.instances || {}; // { "<id>": { kv: {…} } }
     this.rootKv = (cfg.root && cfg.root.kv) || {};
+    // The operator root token `platform.auth.checkRootToken(t)` validates against
+    // (env-supplied in prod). Carried as a hidden reserved kv key; unset → nothing
+    // authenticates as root.
+    this.rootToken = cfg.rootToken || null;
     this.now = toMs(cfg.now);
     this.seed = cfg.seed || 0;
     this.entry = cfg.entry || "index.mjs";
@@ -225,6 +229,7 @@ class Scenario {
       for (const k of Object.keys(ikv)) kv["__rove_store/i/" + id + "/" + k] = ikv[k];
     }
     for (const k of Object.keys(this.rootKv)) kv["__rove_store/r/" + k] = this.rootKv[k];
+    if (this.rootToken) kv["__rove_store/auth/token"] = this.rootToken;
     const w = Object.assign(
       { entry: this.entry, seed: this.seed, now_ms: this.now, kv },
       partial,

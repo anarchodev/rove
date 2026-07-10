@@ -37,7 +37,8 @@
 // so the ordered effect log stays coherent. `platform.scope(id)` / `platform.root`
 // get ISOLATED kv stores (each namespaces under `__rove_store/{tag}/` in the one
 // map — see `storeKv` below), so cross-tenant/root writes never collide with the
-// tenant's own kv. `checkRootToken` still assumes root — a known first-pass limit.
+// tenant's own kv. `checkRootToken(token)` validates against the configured
+// operator root token (a hidden reserved kv key), not blanket success.
 const SYSTEM_SHIM =
     \\;(function(){
     \\  var nat = globalThis.crypto;
@@ -222,7 +223,10 @@ const SYSTEM_SHIM =
     \\      root: storeKv(NS_STORE + "r/", "r"),
     \\      instances: { create: function(spec){ push({ kind: "platform", op: "instances.create", spec: spec }); return (spec && spec.id) || "inst_sim"; }, deployStarter: function(){ push({ kind: "platform", op: "instances.deployStarter" }); } },
     \\      releases: { publish: function(){ push({ kind: "platform", op: "releases.publish" }); } },
-    \\      auth: { checkRootToken: function(){ push({ kind: "platform", op: "auth.checkRootToken" }); return true; } },
+    \\      // checkRootToken(token) → true iff it matches the operator root token
+    \\      // (env-supplied in prod); the sim carries it as a hidden reserved kv key
+    \\      // seeded by `scenario({ rootToken })`. Unconfigured → nothing is root.
+    \\      auth: { checkRootToken: function(token){ var rt = globalThis.kv.get(NS_STORE + "auth/token"); var ok = (typeof rt === "string" && rt.length > 0 && token === rt); push({ kind: "platform", op: "auth.checkRootToken", ok: ok }); return ok; } },
     \\    },
     \\  };
     \\})();
