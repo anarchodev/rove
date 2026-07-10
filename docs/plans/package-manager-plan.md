@@ -56,17 +56,23 @@ everything is resolved and content-addressed.)
 5. **Content-addressed, hash-locked** — multiple versions coexist as
    distinct blobs at distinct hashes; the loader resolves hash-qualified
    specifiers with no ambiguity (§4).
-6. **Resolution is baked at compile time** (CORRECTED 2026-07-09 — the
-   original "compile ⟂ resolution / bytecode = pure function of source"
-   claim was WRONG). quickjs resolves + normalizes module imports during
-   *compilation* and bakes the resolved module name into the bytecode. So
-   a module that imports `@scope/pkg` has version-specific bytecode. For
-   **packages** this is fine (frozen at publish). For **handlers** it
-   means the deploy compile-cache MUST key package-importing bytecode by
-   `source_hash + resolved-imports`, not `source_hash` alone — else a
-   second tenant with the same handler source but different pins would be
-   served the first's bytecode. (P1-deploy concern; the runtime resolver
-   in P0/P1-core is unaffected — verified by the fixture smoke.)
+6. **Compile validates resolution; runtime re-resolves per load**
+   (RE-CORRECTED 2026-07-09, verified — supersedes both the original
+   "compile ⟂ resolution" claim AND the interim "resolved names bake
+   into bytecode" correction; full model in `pm-compile-cache-fix.md`).
+   quickjs resolves + LOADS every import at *compile* — compile is the
+   deploy's import-validation gate, so packages must be staged (leaves
+   first) with the resolver live before handlers compile. But the
+   serialized bytecode carries only the as-written specifiers plus the
+   module's OWN filename; every load re-resolves through the live
+   loader with that filename as base. So `bytecode = f(source,
+   filename)` — version pins live in the snapshot's resolver, and a
+   package compiles under its `/pkg/<pkg_hash>/…` name (its module
+   identity + its imports' resolution base). Consequence: the deploy
+   path keeps NO source-keyed compile cache (it would skip validation
+   and conflate filename contexts), and recompile-per-deploy is correct
+   by construction. Enforced by a byte-equality test + the PM deploy
+   smoke's repin leg.
 
 **B. The tiering rule (primitives vs wrappers).**
 7. **Ambient iff it's a *primitive*** (privileged capability surface *or*
