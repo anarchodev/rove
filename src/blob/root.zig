@@ -11,9 +11,15 @@
 //! any ASCII string that passes `validateKey` is accepted — but it
 //! does enforce path-traversal safety.
 //!
-//! **What "key" means**: a short ASCII string. The validator rejects
-//! path separators (`/`, `\`), parent-dir references (`..`), leading
-//! dots, and non-printable bytes.
+//! **What "key" means**: a short ASCII string. `/` is allowed as a
+//! namespace separator (S3 keys are flat strings — `/` is the idiomatic
+//! "folder" convention and SigV4 preserves it in the canonical path;
+//! e.g. `bc/{hash}`). The validator rejects the escape/footgun shapes:
+//! `..` (traversal), `\`, leading/trailing `/`, empty segments (`//`),
+//! leading `.`, and non-printable bytes. Tenant confinement comes from
+//! the fixed internal key prefix + the `..` rejection, NOT from banning
+//! `/` — and no customer chooses a raw key anyway (uploads key by native
+//! sha256).
 
 const std = @import("std");
 
@@ -59,19 +65,23 @@ pub const MAX_KEY_LEN: usize = 256;
 /// Validate that `key` is safe to pass to any backend. Enforces:
 ///   - 1..MAX_KEY_LEN bytes
 ///   - printable ASCII only (0x20..0x7e)
-///   - no `/` or `\` (path separators)
-///   - not `.` or `..` literally
-///   - doesn't contain `..` as a substring (defensive against
-///     constructions like `foo../bar`)
-///   - doesn't start with `.` (hidden files, defense-in-depth on fs
-///     backends)
+///   - `/` allowed as a namespace separator, BUT no leading/trailing `/`
+///     and no `//` (empty segments — an S3 footgun that makes
+///     `prefix//key` a distinct object from `prefix/key`)
+///   - no `\` (not a separator on S3; only invites path confusion)
+///   - doesn't contain `..` as a substring (traversal — this, plus the
+///     fixed internal key prefix, is what confines a key to its
+///     namespace; `/` alone can only go deeper, never up or sideways)
+///   - doesn't start with `.` (hidden-file shapes)
 pub fn validateKey(key: []const u8) Error!void {
     if (key.len == 0 or key.len > MAX_KEY_LEN) return Error.InvalidKey;
     if (key[0] == '.') return Error.InvalidKey;
+    if (key[0] == '/' or key[key.len - 1] == '/') return Error.InvalidKey;
     if (std.mem.indexOf(u8, key, "..") != null) return Error.InvalidKey;
+    if (std.mem.indexOf(u8, key, "//") != null) return Error.InvalidKey;
     for (key) |b| {
         if (b < 0x20 or b > 0x7e) return Error.InvalidKey;
-        if (b == '/' or b == '\\') return Error.InvalidKey;
+        if (b == '\\') return Error.InvalidKey;
     }
 }
 
@@ -132,18 +142,25 @@ test "validateKey accepts plausible blob keys" {
     try validateKey("request-42-tape");
     try validateKey("mixed_case-and.dots_ok_in_middle"); // dot in middle ok
     try validateKey("hex-64chars-" ++ ("0" ** 52));
+    // `/` is a namespace separator (S3-idiomatic; the bc/ + pkg/ layouts).
+    try validateKey("bc/" ++ ("0" ** 64));
+    try validateKey("pkg/" ++ ("a" ** 64) ++ "/index.mjs");
+    try validateKey("deployments/00000000000000000001.json");
 }
 
-test "validateKey rejects path-traversal patterns" {
+test "validateKey allows `/` but rejects the escape/footgun shapes" {
+    // Confinement is the `..` reject + fixed prefix, not banning `/`.
     try testing.expectError(Error.InvalidKey, validateKey(""));
     try testing.expectError(Error.InvalidKey, validateKey("a" ** 257));
     try testing.expectError(Error.InvalidKey, validateKey("."));
     try testing.expectError(Error.InvalidKey, validateKey(".."));
     try testing.expectError(Error.InvalidKey, validateKey(".hidden"));
-    try testing.expectError(Error.InvalidKey, validateKey("a/b"));
-    try testing.expectError(Error.InvalidKey, validateKey("a\\b"));
-    try testing.expectError(Error.InvalidKey, validateKey("foo../bar"));
+    try testing.expectError(Error.InvalidKey, validateKey("a\\b")); // backslash still out
+    try testing.expectError(Error.InvalidKey, validateKey("foo../bar")); // traversal
     try testing.expectError(Error.InvalidKey, validateKey("../etc/passwd"));
+    try testing.expectError(Error.InvalidKey, validateKey("/leading")); // leading slash
+    try testing.expectError(Error.InvalidKey, validateKey("trailing/")); // trailing slash
+    try testing.expectError(Error.InvalidKey, validateKey("a//b")); // empty segment
 }
 
 test "validateKey rejects non-printable bytes" {

@@ -349,7 +349,7 @@ pub const DeployThread = struct {
                         a.free(key);
                         continue;
                     }
-                    // `bc-{hash}` — engine-only bytecode namespace (the
+                    // `bc/{hash}` — engine-only bytecode namespace (the
                     // JS_ReadObject trust boundary): an uploaded blob's
                     // hash laundered into `bytecode_hash` finds nothing
                     // here and fails loud.

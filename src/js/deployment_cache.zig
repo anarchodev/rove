@@ -1356,7 +1356,7 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
                 // load sees the existing `*BlobBytes` and just bumps
                 // refcount.
                 const bb: *BlobBytes = if (cache.acquire(&entry.bytecode_hex)) |hit| hit else blk: {
-                    // `bc-{hash}` — the engine-only bytecode namespace
+                    // `bc/{hash}` — the engine-only bytecode namespace
                     // (JS_ReadObject trust boundary; files_mod.BC_KEY_PREFIX).
                     var bc_key_buf: [files_mod.BC_KEY_LEN]u8 = undefined;
                     const bytes = try bs.get(files_mod.bcKey(&bc_key_buf, &entry.bytecode_hex), allocator);
