@@ -779,6 +779,86 @@ class V2Cluster:
             raise RuntimeError(f"release {tenant}/{dep_hex}: {r.status} {r.body}")
         return str(int(dep_hex, 16))
 
+    def deploy_with_packages(self, tenant: str, handler_files: dict[str, str],
+                             packages: list[dict], app_imports: dict[str, str],
+                             *, node: int = 0) -> str:
+        """PM P1: deploy handlers that import `@scope/pkg` packages.
+
+        `packages` entries (IN DEPENDENCY ORDER, leaves first — a package's
+        files compile with the loader live, so its deps must already be
+        staged): `{"spec", "version", "pkg_hash", "files": {path: source},
+        "imports": {specifier: dep_pkg_hash}}`. `app_imports` maps the
+        app-surface specifiers to pkg_hashes. Stages each package file via
+        /v1/deploy/pkgfile (compiled under its /pkg/<pkg_hash>/ virtual
+        name), then handlers via /v1/deploy/file with the full resolution
+        (imports VALIDATE at compile — a bad import fails the deploy here),
+        then cuts with the lockfile + releases. Returns dep_id (decimal
+        str). (Tenant must be provisioned.)"""
+        import json
+        self._ensure_admin_app()
+
+        def post(sub: str, body: dict, timeout: float = 30.0):
+            return _curl(f"{self.front_url()}/v1/deploy/{sub}", method="POST",
+                         host=self.host_for("__admin__"),
+                         headers={"Authorization": f"Bearer {self.root_token}",
+                                  "Content-Type": "application/json"},
+                         data=json.dumps(body), timeout=timeout)
+
+        r = post("reset", {"tenant": tenant})
+        if r.status != 200:
+            raise RuntimeError(f"deploy {tenant} reset: {r.status} {r.body}")
+
+        # Lockfile skeleton (no files — the deploy app joins those in at cut
+        # from what /pkgfile staged; hashes stay server-authoritative).
+        lock = {"packages": [{"spec": p["spec"], "version": p["version"],
+                              "pkg_hash": p["pkg_hash"],
+                              "imports": p.get("imports", {})}
+                             for p in packages],
+                "app_imports": app_imports}
+
+        # Growing resolution for compile-time validation: packages staged so
+        # far, WITH their staged file hashes.
+        staged: dict[str, list[dict]] = {}
+
+        def resolution() -> dict:
+            return {"packages": [{"spec": p["spec"], "version": p["version"],
+                                  "pkg_hash": p["pkg_hash"],
+                                  "imports": p.get("imports", {}),
+                                  "files": staged.get(p["pkg_hash"], [])}
+                                 for p in packages],
+                    "app_imports": app_imports}
+
+        for p in packages:
+            for path, source in p["files"].items():
+                r = post("pkgfile", {"tenant": tenant, "pkg_hash": p["pkg_hash"],
+                                     "path": path, "source": source,
+                                     "resolution": resolution()})
+                if r.status != 200:
+                    raise RuntimeError(
+                        f"deploy {tenant} pkgfile {p['spec']}/{path}: {r.status} {r.body}")
+                got = json.loads(r.body)
+                staged.setdefault(p["pkg_hash"], []).append(
+                    {"path": path, "source_hash": got["source_hex"],
+                     "bytecode_hash": got["bytecode_hex"]})
+
+        for path, source in handler_files.items():
+            r = post("file", {"tenant": tenant, "path": path, "kind": "handler",
+                              "source": source, "resolution": resolution()})
+            if r.status != 200:
+                raise RuntimeError(f"deploy {tenant} file {path}: {r.status} {r.body}")
+
+        r = post("cut", {"tenant": tenant, "resolution": lock})
+        if r.status != 200:
+            raise RuntimeError(f"deploy {tenant} cut: {r.status} {r.body}")
+        payload = json.loads(r.body)
+        if payload.get("ok") is not True or not payload.get("dep_id"):
+            raise RuntimeError(f"deploy {tenant} cut: bad payload {r.body[:200]!r}")
+        dep_hex = payload["dep_id"]
+        rr = self.release(tenant, int(dep_hex, 16), node=node)
+        if rr.status != 204:
+            raise RuntimeError(f"release {tenant}/{dep_hex}: {rr.status} {rr.body}")
+        return str(int(dep_hex, 16))
+
     # ── serving ────────────────────────────────────────────────────────
     def request(self, tenant: str, path: str = "/", *, method: str = "GET",
                 data: Optional[bytes | str] = None, host: Optional[str] = None,
