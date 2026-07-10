@@ -65,6 +65,12 @@ expect(req).toHaveFetched(/stripe/);
 - `sourceDir` — where handler code resolves from (defaults to the app dir you
   ran `rewind test` in). Use it to point a scenario at a different tree.
 - `entry` — the handler module (defaults to `index.mjs`).
+- `instances` / `root` — seed other stores for a `platform.*` handler:
+  `instances: { acme: { kv: {…} } }` seeds another instance's store, `root: { kv: {…} }`
+  the platform root store (see [Platform and admin handlers](#platform-and-admin-handlers)).
+- `rootToken` — the operator token `platform.auth.checkRootToken` validates against.
+- `admin` — mark the run as the admin handler so `platform.*` is allowed. It's
+  admin-only and **off by default**, so a normal handler that touches it throws.
 
 ## A node's surface
 
@@ -75,6 +81,9 @@ expect(req).toHaveFetched(/stripe/);
   `next()` and is waiting).
 - `req.kv(key)` — the effective value of `key` after this activation (starting KV
   plus its writes), so `req.kv("order/jess").status` reads what the handler left.
+- `req.instanceKv(id, key)` / `req.rootKv(key)` — the same, for another instance's
+  isolated store (`platform.scope(id).kv`) / the platform root store
+  (`platform.root`). See [Platform and admin handlers](#platform-and-admin-handlers).
 - `req.effects` / `req.frames` — the raw effect log / the frames it `stream.write`'d.
 
 ## Assertions
@@ -86,7 +95,8 @@ expect(node.status).toBe(200);
 expect(node.kv("order/jess")).toEqual({ status: "paid" });
 expect(node).toHaveWritten("order/jess", { status: "pending" });  // subset match; arrays are exact
 expect(node).toHaveFetched(/stripe/);
-expect(node).toHaveSent("email", { to: "jess@example.com" });     // webhook / email cmd
+expect(node).toHaveSent("webhook", { url: "https://hooks.example.com/notify" }); // webhook.send
+expect(node).toHaveSent("email", { to: ["jess@example.com"] });    // email.send (to is a list)
 expect(node).toHaveScheduled();                                    // a timer / kv / cron wake
 expect(node).toHaveSentFrame(/welcome/);                           // a stream.write / WS frame
 expect(node).toMatchSnapshot("checkout-inbound");
@@ -201,6 +211,58 @@ expect(fired).toHaveScheduled("jobs/reminder");   // it re-armed the next one
 Both `schedule` and `cron` deliver a target this way, so one `wake(...)` is one
 firing. As with `sendCallback`, the target is tested in isolation — the
 scheduler's own queueing and at-least-once firing aren't re-run.
+
+## Platform and admin handlers
+
+Handlers on the `__admin__` control plane use `platform.*` — cross-tenant KV, the
+platform root store, instance lifecycle, root-token auth. That surface is
+**admin-only**: off a normal tenant handler every call throws, so a scenario has
+to opt in with `admin: true` before `platform.*` is allowed.
+
+Each store is isolated, exactly like production: a tenant's own `kv`, another
+instance's store (`platform.scope(id).kv`), and the root store (`platform.root`)
+never bleed into one another. Seed the other stores on the scenario, and read
+their post-state back with `instanceKv` / `rootKv`:
+
+```js
+const s = scenario({
+  admin: true,                                    // platform.* is admin-only
+  rootToken: "op-secret",                         // what checkRootToken validates
+  instances: { acme: { kv: { profile: "{}" } } }, // seed acme's isolated store
+});
+
+const r = s.inbound({
+  method: "POST", path: "/provision",
+  headers: { authorization: "op-secret" },
+});
+expect(r.instanceKv("acme", "profile")).toEqual({ plan: "pro" });  // a platform.scope write
+expect(r.rootKv("instance/acme")).toEqual({ created: true });      // a platform.root write
+
+// A wrong (or missing) root token is rejected — checkRootToken returns true only
+// for the configured token, so both paths are testable:
+const denied = s.inbound({
+  method: "POST", path: "/provision",
+  headers: { authorization: "wrong" },
+});
+expect(denied.status).toBe(403);
+```
+
+The handler behind this writes into the scoped and root stores and gates on the
+token:
+
+```js
+export default function () {
+  if (!platform.auth.checkRootToken(request.headers["authorization"])) {
+    response.status = 403; return "forbidden";
+  }
+  platform.scope("acme").kv.set("profile", JSON.stringify({ plan: "pro" }));
+  platform.root.set("instance/acme", JSON.stringify({ created: true }));
+  return { ok: true };
+}
+```
+
+Leaving out `admin` (the default) makes every `platform.*` call throw — which is
+itself worth asserting if a handler is supposed to stay off that surface.
 
 ## Snapshots
 
