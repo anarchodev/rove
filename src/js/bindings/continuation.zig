@@ -256,7 +256,7 @@ test "BENCH tryExtract per-request hot-path tax (ROVE_BENCH=1)" {
 // terminal — if any parked continuation on this worker has
 // `bound_schedule_id == send_id`, the call dispatches a
 // `resumeContinuation` with `outcome_json = event_json`. Returns
-// `true` when it matched (caller skips its own __rove_next chain);
+// `true` when it matched (caller skips its own `next()` chain);
 // `false` for the ordinary webhook path (no held-sync open hop).
 //
 // Tenant scoping: every parked-continuation entity carries its
@@ -271,10 +271,19 @@ pub fn jsContinuationResumeIfBound(
     argv: [*c]c.JSValue,
 ) callconv(.c) c.JSValue {
     const state = globals.getState(ctx);
+    // `__rove.resumeIfBound` — gated like the other `__rove.*` ops: only
+    // the baked `__system/webhook_onresult` module (is_system_module)
+    // may drive a held-sync resume. Closes the customer-forge gap (a
+    // handler injecting a fabricated result into its own parked
+    // sync-webhook continuation).
+    if (!state.is_system_module) {
+        _ = c.JS_ThrowTypeError(ctx, "__rove.resumeIfBound is not available to customer code");
+        return js_exception;
+    }
     if (argc < 2 or !c.JS_IsString(argv[0]) or !c.JS_IsString(argv[1])) {
         _ = c.JS_ThrowTypeError(
             ctx,
-            "_system.continuation.resumeIfBound(send_id, event_json) requires two strings",
+            "__rove.resumeIfBound(send_id, event_json) requires two strings",
         );
         return js_exception;
     }

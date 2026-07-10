@@ -1,0 +1,184 @@
+# Principled privileged surface + generic rate limiting — spec
+
+Status: **proposal, 2026-07-09.** No code yet. Two coupled cleanups that
+support the package manager (`docs/plans/package-manager-plan.md`):
+(A) collapse the `_system.*` / `__rove_*` duality into ONE principled
+privileged surface with a clear assignment rule (no gated getter — see
+§0), and (B) remove the email-specific `__rove_check_email_rate`,
+replacing it with generic rate limiting + platform-quota enforcement that
+survives email becoming a pinnable package.
+
+Supersedes package-manager-plan §1.C.10 (chore 2) with a sharper design.
+
+---
+
+## 0. Why no gated getter
+
+The natives split into two groups by *protection need*, and neither needs
+a getter:
+
+- **Dangerous ops** (`set_wake`, `fire_wake`, `systemFetch`) already
+  **self-gate** — `if (!state.is_system_module) throw` inside the native
+  (`scheduler.zig:68`, `http.zig:131`). That check is the real boundary
+  and works regardless of naming/visibility.
+- **Benign ops** (`next`, `resumeIfBound`) are already customer-reachable
+  today (bare globals the `next()` shim calls) and are harmless
+  (within-tenant dispatch).
+
+So hiding the ops behind a getter buys nothing. The only thing the
+`delete globalThis._system` protects is the **capability** natives
+(`_system.kv`/`crypto`/`http`) from being *named* by customer code — pure
+hygiene (they're tenant-scoped; reaching them isn't escalation). We keep
+that delete as-is. This is the low-risk unification: **make the surface
+principled, don't change the enforcement mechanism.**
+
+## 1. The two-surface model + assignment rule
+
+There are — and should remain — **two** physical binding surfaces,
+distinguished by a single mechanical rule:
+
+| Surface | Lifecycle | Who reaches it | Rule |
+|---|---|---|---|
+| **`_system.*`** (capabilities) | deleted after base-eval (hygiene) | ambient shims, by **closure capture** at base-eval | a native belongs here iff the **customer API exposes it** (a public shim wraps it) |
+| **`__rove.*`** (privileged ops) | **persistent** (never deleted) | **badged activations only** (baked `__system/` modules), by live global ref | a native belongs here iff it is **called ONLY by badged handlers** AND is **`is_system_module`-gated** |
+
+The `__rove.*` surface is **uniformly gated and system-only** — every entry
+throws for customer code, and no customer-facing shim reaches it. Security
+is (a) tenant-scoping via `getState(ctx)`, (b) the `is_system_module`
+self-gate (now on *every* `__rove.*` entry), (c) `state.platform` on admin
+natives; `_system`-deletion is hygiene.
+
+**The dual-use resolution.** A native needed by *both* a customer shim and
+baked modules (the classic case: `next`) does NOT get dual-homed. Instead
+**widen the customer API** so the *public shim* serves both — baked modules
+reach it by calling the public verb (they have the ambient globals; the
+shim holds the captured `_system.*` ref). That keeps `__rove.*` purely
+system-only. Applied to `next` in §2.
+
+**Cleanup: collapse the remaining bare `__rove_*` globals into ONE gated
+`__rove` namespace object.** Today they're 6 separate `globalThis`
+properties (`GLOBAL_BUILTINS`, `globals.zig:2238`). After §2, the survivors
+are `__rove.{resumeIfBound, wake:{set,fire}, fetch}` — one persistent
+holder, every member `is_system_module`-gated, mirroring how `_system.*` is
+one holder. Less global pollution; the lint/determinism allowlist
+(`globals.zig:3465`) shrinks to one name.
+
+## 2. Applying the rule — the audit
+
+Run every current `__rove_*` through the rule (does a **baked module**
+consume it?):
+
+| Native | Callers | Verdict |
+|---|---|---|
+| `__rove_next` | **both** — the `next.js` *shim* AND baked modules (`webhook_onresult.mjs:161`, `blob_compose_onresult.mjs:39`) | **WIDEN the customer API** → `_system.continuation.next` (deleted, shim-captured). Widen `next(target?, ctx?)` so baked modules call the *public* `next()`. **No bare native.** |
+| `__rove_resume_if_bound` | baked only — `webhook_onresult.mjs:156` (held-sync resume) | **`__rove.resumeIfBound`** — **ADD an `is_system_module` gate** (currently ungated; closes a customer-forge gap) |
+| `__rove_set_wake` | baked only — `scheduler_tick.mjs` | **`__rove.wake.set`** (already gated) |
+| `__rove_fire_wake` | baked only — `scheduler_tick.mjs` | **`__rove.wake.fire`** (already gated) |
+| `__rove_fetch` | baked only — delivery modules | **`__rove.fetch`** (already gated) |
+| `__rove_check_email_rate` | shim only — `email.js` | **REMOVE** — §3 |
+| `__rove_request_proto` | (data object, not a native; engine reads it from Zig) | leave as-is (out of scope) |
+
+`next` is the dual-use case: rather than dual-home it, **widen the public
+`next` verb** (a target module — already a customer-facing shape via
+`schedule`/`webhook.send({on})`) so both customers and baked modules use
+the public shim, and the bare native disappears. `resumeIfBound`,
+`wake.set`, `wake.fire`, `fetch` are genuinely baked-only → the gated
+`__rove.*` holder. `check_email_rate` → §3.
+
+## 3. `check_email_rate` → generic rate limiting + platform quota
+
+`__rove_check_email_rate` tangles two different things into one
+email-specific native (`email_rate.zig`): it's a **per-worker in-memory
+bucket sized by the tenant's PLAN** (`state.plan_rate`). Untangle them.
+
+### 3a. Platform plan-quota (the part that must not be bypassable)
+
+The plan-rate check is the **platform** limiting the tenant per their
+plan. Once `email` is a **tenant-pinnable package** (package-manager-plan
+§2), a package that simply *doesn't call* the quota native would bypass
+it. So plan-quota enforcement **must move out of the email lib to a
+platform enforcement point** the tenant can't replace:
+
+- Email composes over the frozen `webhook.send` / outbound primitive
+  (durability-as-JS-shim, `decisions.md §3.3`). Enforce the per-tenant
+  outbound plan-rate **there**, at the frozen boundary — it already runs
+  with platform trust and already sees `state.plan_rate`. This subsumes
+  the email-specific bucket into a general per-tenant *outbound* limit
+  that covers email because email *is* outbound.
+- **Open question (§5.1):** is there already a per-tenant outbound rate
+  limit at `webhook.send`/`http.fetch`, or only the inbound request-side
+  check + this email bucket? If only the latter, this adds a general
+  outbound limit (reusing the existing per-worker `state.limiter`
+  machinery, just keyed generally rather than `.email`).
+
+### 3b. Generic customer rate limiting (the part the user wants)
+
+For a tenant to rate-limit **its own** operations (customer-chosen limit,
+not a plan quota): **compose over kv** — a token bucket in a kv key. This
+is *correct under contention* because kv validates the readset
+(§ grounding: `apply.zig` readset + `SeqCounter`), so a losing
+read-modify-write retries rather than double-spends. **No new native.**
+Ship as `@rewind/ratelimit` (a package) or document the recipe:
+
+```js
+// token bucket in kv — durable, accurate, tenant-owned
+function take(key, limit, windowMs, cost = 1) {
+  const now = Date.now();
+  const b = JSON.parse(kv.get(key) || "null") || { tokens: limit, ts: now };
+  const refill = ((now - b.ts) / windowMs) * limit;
+  const tokens = Math.min(limit, b.tokens + refill);
+  if (tokens < cost) { kv.set(key, JSON.stringify({ tokens, ts: now })); return false; }
+  kv.set(key, JSON.stringify({ tokens: tokens - cost, ts: now }));
+  return true;
+}
+```
+
+### 3c. Optional: a per-worker best-effort primitive (defer)
+
+`check_email_rate`'s *only* advantage over the kv recipe is that it's
+**in-memory/per-worker** — no kv op on the hot path. If a proven hot-path
+need appears (loss-tolerant, per-worker, no durability), expose ONE
+**generic** primitive — `__rove`-tier is wrong (it's a customer
+capability); it'd be a frozen public `ratelimit.take(name, {limit,
+windowMs})` shim over a per-worker native. **Defer** per
+`feedback_compose_from_primitives`: email doesn't need it (it's already a
+durable/kv-touching op, so the kv recipe's cost is marginal), and adding a
+per-worker primitive is a forever commitment. Build only on demand.
+
+**Net for `check_email_rate`:** delete the native; plan-quota → the frozen
+outbound boundary (3a); customer rate limiting → kv recipe / `@rewind/
+ratelimit` (3b); per-worker primitive deferred (3c).
+
+## 4. Migration steps
+
+1. **Collapse `__rove_*` → `__rove.*`** (globals.zig `GLOBAL_BUILTINS` →
+   one holder object, like `installNamespace`); rewrite baked-module +
+   shim call sites (`__rove_next` → `__rove.next`, etc.).
+2. **Delete `__rove_check_email_rate`** + `email_rate.zig`'s shim entry;
+   move the plan-rate check to the outbound boundary (3a).
+3. **Update `email.js`** — drop the `check_email_rate` call; (if email
+   stays a frozen shim for now) it no longer self-limits. Customer-facing
+   limiting → the kv recipe/package.
+4. **Update lint/determinism allowlist** (`globals.zig:3465`) to the one
+   `__rove` name; update the "`_system` unreachable" test (`:3587`) — no
+   behavior change to the delete.
+5. **Docs:** the two-surface model + assignment rule (§1) into
+   `decisions.md` (they're one ABI, split by the mechanical rule, secured
+   by self-gate/tenant-scope — not by the names).
+
+Keep every `is_system_module` self-gate and `state.platform` gate exactly
+as-is — this cleanup does not touch the enforcement mechanism.
+
+## 5. Open questions
+
+1. **Outbound plan-rate** (3a) — does a per-tenant outbound limit already
+   exist at `webhook.send`/`http.fetch`? Determines whether 3a *moves* the
+   email bucket or *adds* a general outbound limit. Verify before coding.
+2. **Collapse churn vs. keep bare** — is the `__rove_*` → `__rove.*`
+   holder worth the call-site churn, or is "principled assignment rule +
+   docs + the check_email_rate fix" enough with the bare-global shape
+   kept? Lean: do the collapse (one clear surface object is the point),
+   but it's severable from the rest.
+3. **`@rewind/ratelimit` package vs. recipe** — ship the token bucket as a
+   first-party package or just document the recipe. Lean: package (it's a
+   real reusable lib; rung-1 of saas-in-a-box §6).

@@ -39,20 +39,57 @@
 const std = @import("std");
 const root = @import("root.zig");
 
-pub const VERSION: u32 = 1;
+/// `v:2` — handlers/statics + the optional `packages` / `app_imports`
+/// sections (package manager P0). No v1 back-compat: the package-manager
+/// rollout is a complete redeploy (pre-launch, no customers), so the
+/// decoder rejects anything that isn't v2 and `encode` always emits v2.
+/// (A package-less deploy is simply a v2 manifest with no `packages`.)
+pub const VERSION: u32 = 2;
 
 pub const Error = error{
     InvalidManifest,
     OutOfMemory,
 };
 
+/// One file a package ships (path within the package + its hashes). The
+/// P1 populator stages the bytecode at `/pkg/<pkg_hash>/<path>`.
+pub const PkgFile = struct {
+    path: []const u8,
+    bytecode_hex: [root.HASH_HEX_LEN]u8,
+    source_hex: [root.HASH_HEX_LEN]u8,
+};
+
+/// One `{ specifier → dep pkg_hash }` resolution pair — used for both a
+/// package's own `imports` and the deployment's `app_imports`.
+pub const ImportEntry = struct {
+    specifier: []const u8,
+    pkg_hash_hex: [root.HASH_HEX_LEN]u8,
+};
+
+/// A resolved package version. `pkg_hash_hex` is its content identity +
+/// the `/pkg/<pkg_hash>/` virtual dir its files live under. `imports`
+/// values point at *dep* pkg_hashes (encapsulated, frozen-at-publish);
+/// see `docs/plans/pm-p0-resolution-spec.md`.
+pub const Package = struct {
+    spec: []const u8,
+    version: []const u8,
+    pkg_hash_hex: [root.HASH_HEX_LEN]u8,
+    files: []PkgFile,
+    imports: []ImportEntry,
+    capabilities: [][]const u8,
+    private: bool,
+};
+
 /// In-memory manifest as the worker / files-server consume it after
 /// parsing. Owns its `entries` slice + each entry's `path` and
-/// `content_type` allocations. Mirrors `FileStore.Manifest` so callers
-/// that already accept the binary-format struct can switch over.
+/// `content_type` allocations, plus (v2) the `packages` / `app_imports`
+/// sections and every string they own. `packages`/`app_imports` are
+/// empty for a v1 (package-less) manifest.
 pub const Manifest = struct {
     id: u64,
-    entries: []root.FileStore.Entry,
+    entries: []root.Entry,
+    packages: []Package = &.{},
+    app_imports: []ImportEntry = &.{},
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *Manifest) void {
@@ -61,6 +98,19 @@ pub const Manifest = struct {
             self.allocator.free(e.content_type);
         }
         self.allocator.free(self.entries);
+        for (self.packages) |p| {
+            self.allocator.free(p.spec);
+            self.allocator.free(p.version);
+            for (p.files) |f| self.allocator.free(f.path);
+            self.allocator.free(p.files);
+            for (p.imports) |ie| self.allocator.free(ie.specifier);
+            self.allocator.free(p.imports);
+            for (p.capabilities) |cap| self.allocator.free(cap);
+            self.allocator.free(p.capabilities);
+        }
+        self.allocator.free(self.packages);
+        for (self.app_imports) |ie| self.allocator.free(ie.specifier);
+        self.allocator.free(self.app_imports);
         self.* = undefined;
     }
 };
@@ -71,7 +121,9 @@ pub const Manifest = struct {
 pub fn encode(
     allocator: std.mem.Allocator,
     dep_id: u64,
-    entries: []const root.FileStore.Entry,
+    entries: []const root.Entry,
+    packages: []const Package,
+    app_imports: []const ImportEntry,
 ) error{OutOfMemory}![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -80,9 +132,6 @@ pub fn encode(
     // dep_id is a content-addressed u64 (truncated sha-256). High-
     // bit-set hashes don't fit cleanly in JSON `integer` (i64 in the
     // std.json parser) so encode as a 16-char zero-padded hex string.
-    // Wire-incompatible with the pre-2026-05-13 number format —
-    // existing manifests in S3 from before that cutover need a
-    // re-deploy. Acceptable pre-launch.
     try w.print("{{\"v\":{d},\"deployment_id\":\"{x:0>16}\",\"entries\":[", .{ VERSION, dep_id });
     for (entries, 0..) |e, i| {
         if (i > 0) try w.writeByte(',');
@@ -97,7 +146,52 @@ pub fn encode(
         }
         try w.writeByte('}');
     }
-    try w.writeAll("]}");
+    try w.writeByte(']');
+
+    if (packages.len > 0) {
+        try w.writeAll(",\"packages\":[");
+        for (packages, 0..) |p, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.writeAll("{\"spec\":");
+            try writeJsonString(&w, p.spec);
+            try w.writeAll(",\"version\":");
+            try writeJsonString(&w, p.version);
+            try w.print(",\"pkg_hash\":\"{s}\",\"files\":[", .{p.pkg_hash_hex});
+            for (p.files, 0..) |f, j| {
+                if (j > 0) try w.writeByte(',');
+                try w.writeAll("{\"path\":");
+                try writeJsonString(&w, f.path);
+                try w.print(",\"bytecode_hash\":\"{s}\",\"source_hash\":\"{s}\"}}", .{ f.bytecode_hex, f.source_hex });
+            }
+            try w.writeAll("],\"imports\":{");
+            for (p.imports, 0..) |ie, j| {
+                if (j > 0) try w.writeByte(',');
+                try writeJsonString(&w, ie.specifier);
+                try w.print(":\"{s}\"", .{ie.pkg_hash_hex});
+            }
+            try w.writeAll("},\"capabilities\":[");
+            for (p.capabilities, 0..) |cap, j| {
+                if (j > 0) try w.writeByte(',');
+                try writeJsonString(&w, cap);
+            }
+            try w.writeByte(']');
+            if (p.private) try w.writeAll(",\"private\":true");
+            try w.writeByte('}');
+        }
+        try w.writeByte(']');
+    }
+
+    if (app_imports.len > 0) {
+        try w.writeAll(",\"app_imports\":{");
+        for (app_imports, 0..) |ie, i| {
+            if (i > 0) try w.writeByte(',');
+            try writeJsonString(&w, ie.specifier);
+            try w.print(":\"{s}\"", .{ie.pkg_hash_hex});
+        }
+        try w.writeByte('}');
+    }
+
+    try w.writeByte('}');
     return buf.toOwnedSlice(allocator);
 }
 
@@ -129,7 +223,7 @@ pub fn decode(
         .integer => |i| i,
         else => return Error.InvalidManifest,
     };
-    if (v_num != @as(i64, @intCast(VERSION))) return Error.InvalidManifest;
+    if (v_num != @as(i64, VERSION)) return Error.InvalidManifest;
 
     const id_val = obj.get("deployment_id") orelse return Error.InvalidManifest;
     const id_str = switch (id_val) {
@@ -144,7 +238,7 @@ pub fn decode(
         else => return Error.InvalidManifest,
     };
 
-    var entries = allocator.alloc(root.FileStore.Entry, arr.items.len) catch
+    var entries = allocator.alloc(root.Entry, arr.items.len) catch
         return Error.OutOfMemory;
     var filled: usize = 0;
     errdefer {
@@ -219,7 +313,235 @@ pub fn decode(
         filled += 1;
     }
 
-    return .{ .id = id, .entries = entries, .allocator = allocator };
+    // v2 (package manager P0): optional `packages` / `app_imports`. A v1
+    // manifest omits both → empty slices → today's behavior. Allocate
+    // 0-length (not `&.{}`) so the errdefers / deinit free unconditionally.
+    const packages = if (obj.get("packages")) |pv|
+        try parsePackages(allocator, pv)
+    else
+        allocator.alloc(Package, 0) catch return Error.OutOfMemory;
+    errdefer {
+        for (packages) |p| freePackage(allocator, p);
+        allocator.free(packages);
+    }
+
+    const app_imports = if (obj.get("app_imports")) |av|
+        try parseImportMap(allocator, av)
+    else
+        allocator.alloc(ImportEntry, 0) catch return Error.OutOfMemory;
+
+    return .{
+        .id = id,
+        .entries = entries,
+        .packages = packages,
+        .app_imports = app_imports,
+        .allocator = allocator,
+    };
+}
+
+/// A deploy-time resolution context (PM P1-deploy): just the `packages` +
+/// `app_imports` sections of a manifest, wire-identical to their v2
+/// manifest shapes. The deploy path carries this alongside a compile
+/// batch so package imports resolve (= are validated + loadable) at
+/// handler-compile time, and alongside a manifest stamp so the sections
+/// bake into the deployment. Owns everything it holds — `deinit` frees.
+pub const Resolution = struct {
+    packages: []Package = &.{},
+    app_imports: []ImportEntry = &.{},
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *Resolution) void {
+        for (self.packages) |p| freePackage(self.allocator, p);
+        self.allocator.free(self.packages);
+        for (self.app_imports) |ie| self.allocator.free(ie.specifier);
+        self.allocator.free(self.app_imports);
+        self.* = undefined;
+    }
+};
+
+/// Decode a `{packages?, app_imports?}` JSON object (the resolution
+/// side-channel of the deploy wire). Absent sections decode empty.
+pub fn decodeResolution(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) Error!Resolution {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch
+        return Error.InvalidManifest;
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return Error.InvalidManifest,
+    };
+
+    const packages = if (obj.get("packages")) |pv|
+        try parsePackages(allocator, pv)
+    else
+        allocator.alloc(Package, 0) catch return Error.OutOfMemory;
+    errdefer {
+        for (packages) |p| freePackage(allocator, p);
+        allocator.free(packages);
+    }
+
+    const app_imports = if (obj.get("app_imports")) |av|
+        try parseImportMap(allocator, av)
+    else
+        allocator.alloc(ImportEntry, 0) catch return Error.OutOfMemory;
+
+    return .{ .packages = packages, .app_imports = app_imports, .allocator = allocator };
+}
+
+fn freePackage(allocator: std.mem.Allocator, p: Package) void {
+    allocator.free(p.spec);
+    allocator.free(p.version);
+    for (p.files) |f| allocator.free(f.path);
+    allocator.free(p.files);
+    for (p.imports) |ie| allocator.free(ie.specifier);
+    allocator.free(p.imports);
+    for (p.capabilities) |cap| allocator.free(cap);
+    allocator.free(p.capabilities);
+}
+
+fn dupeStr(allocator: std.mem.Allocator, val: ?std.json.Value) Error![]const u8 {
+    const s = switch (val orelse return Error.InvalidManifest) {
+        .string => |x| x,
+        else => return Error.InvalidManifest,
+    };
+    return allocator.dupe(u8, s) catch return Error.OutOfMemory;
+}
+
+fn hex64(val: ?std.json.Value) Error![root.HASH_HEX_LEN]u8 {
+    const s = switch (val orelse return Error.InvalidManifest) {
+        .string => |x| x,
+        else => return Error.InvalidManifest,
+    };
+    if (s.len != root.HASH_HEX_LEN) return Error.InvalidManifest;
+    var out: [root.HASH_HEX_LEN]u8 = undefined;
+    @memcpy(&out, s[0..root.HASH_HEX_LEN]);
+    return out;
+}
+
+/// Parse a `{ specifier: pkg_hash }` object into `[]ImportEntry` (used
+/// for a package's `imports` and the deployment's `app_imports`).
+fn parseImportMap(allocator: std.mem.Allocator, val: std.json.Value) Error![]ImportEntry {
+    const obj = switch (val) {
+        .object => |o| o,
+        else => return Error.InvalidManifest,
+    };
+    var list: std.ArrayList(ImportEntry) = .empty;
+    errdefer {
+        for (list.items) |ie| allocator.free(ie.specifier);
+        list.deinit(allocator);
+    }
+    var it = obj.iterator();
+    while (it.next()) |kv| {
+        const hash = try hex64(kv.value_ptr.*);
+        const spec = allocator.dupe(u8, kv.key_ptr.*) catch return Error.OutOfMemory;
+        errdefer allocator.free(spec);
+        list.append(allocator, .{ .specifier = spec, .pkg_hash_hex = hash }) catch return Error.OutOfMemory;
+    }
+    return list.toOwnedSlice(allocator) catch return Error.OutOfMemory;
+}
+
+fn parseFiles(allocator: std.mem.Allocator, val: ?std.json.Value) Error![]PkgFile {
+    const arr = switch (val orelse return Error.InvalidManifest) {
+        .array => |a| a,
+        else => return Error.InvalidManifest,
+    };
+    var list: std.ArrayList(PkgFile) = .empty;
+    errdefer {
+        for (list.items) |f| allocator.free(f.path);
+        list.deinit(allocator);
+    }
+    for (arr.items) |item| {
+        const o = switch (item) {
+            .object => |x| x,
+            else => return Error.InvalidManifest,
+        };
+        const bc = try hex64(o.get("bytecode_hash"));
+        const src = try hex64(o.get("source_hash"));
+        const path = try dupeStr(allocator, o.get("path"));
+        errdefer allocator.free(path);
+        list.append(allocator, .{ .path = path, .bytecode_hex = bc, .source_hex = src }) catch
+            return Error.OutOfMemory;
+    }
+    return list.toOwnedSlice(allocator) catch return Error.OutOfMemory;
+}
+
+fn parseCapabilities(allocator: std.mem.Allocator, val: ?std.json.Value) Error![][]const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (list.items) |c| allocator.free(c);
+        list.deinit(allocator);
+    }
+    if (val) |v| {
+        const arr = switch (v) {
+            .array => |a| a,
+            else => return Error.InvalidManifest,
+        };
+        for (arr.items) |item| {
+            const s = switch (item) {
+                .string => |x| x,
+                else => return Error.InvalidManifest,
+            };
+            const c = allocator.dupe(u8, s) catch return Error.OutOfMemory;
+            errdefer allocator.free(c);
+            list.append(allocator, c) catch return Error.OutOfMemory;
+        }
+    }
+    return list.toOwnedSlice(allocator) catch return Error.OutOfMemory;
+}
+
+fn parsePackages(allocator: std.mem.Allocator, val: std.json.Value) Error![]Package {
+    const arr = switch (val) {
+        .array => |a| a,
+        else => return Error.InvalidManifest,
+    };
+    var list: std.ArrayList(Package) = .empty;
+    errdefer {
+        for (list.items) |p| freePackage(allocator, p);
+        list.deinit(allocator);
+    }
+    for (arr.items) |item| {
+        const o = switch (item) {
+            .object => |x| x,
+            else => return Error.InvalidManifest,
+        };
+        const pkg_hash = try hex64(o.get("pkg_hash"));
+        var private = false;
+        if (o.get("private")) |pv| switch (pv) {
+            .bool => |b| private = b,
+            else => {},
+        };
+        const spec = try dupeStr(allocator, o.get("spec"));
+        errdefer allocator.free(spec);
+        const version = try dupeStr(allocator, o.get("version"));
+        errdefer allocator.free(version);
+        const files = try parseFiles(allocator, o.get("files"));
+        errdefer {
+            for (files) |f| allocator.free(f.path);
+            allocator.free(files);
+        }
+        const imports = try parseImportMap(allocator, o.get("imports") orelse return Error.InvalidManifest);
+        errdefer {
+            for (imports) |ie| allocator.free(ie.specifier);
+            allocator.free(imports);
+        }
+        const caps = try parseCapabilities(allocator, o.get("capabilities"));
+        errdefer {
+            for (caps) |c| allocator.free(c);
+            allocator.free(caps);
+        }
+        list.append(allocator, .{
+            .spec = spec,
+            .version = version,
+            .pkg_hash_hex = pkg_hash,
+            .files = files,
+            .imports = imports,
+            .capabilities = caps,
+            .private = private,
+        }) catch return Error.OutOfMemory;
+    }
+    return list.toOwnedSlice(allocator) catch return Error.OutOfMemory;
 }
 
 fn writeJsonString(w: anytype, s: []const u8) !void {
@@ -278,14 +600,18 @@ pub fn manifestKey(buf: *[25]u8, dep_id: u64) []const u8 {
 /// wire format (decoder accepts any order), so two manifests with
 /// the same content but different encode-order would otherwise hash
 /// to different ids.
-pub fn computeDeploymentId(entries: []const root.FileStore.Entry) u64 {
+pub fn computeDeploymentId(
+    entries: []const root.Entry,
+    packages: []const Package,
+    app_imports: []const ImportEntry,
+) u64 {
     var sorted_indices: [256]usize = undefined;
     const n = entries.len;
     std.debug.assert(n <= sorted_indices.len);
     for (0..n) |i| sorted_indices[i] = i;
     const idx_slice = sorted_indices[0..n];
     std.mem.sort(usize, idx_slice, entries, struct {
-        fn lt(ctx: []const root.FileStore.Entry, a: usize, b: usize) bool {
+        fn lt(ctx: []const root.Entry, a: usize, b: usize) bool {
             return std.mem.lessThan(u8, ctx[a].path, ctx[b].path);
         }
     }.lt);
@@ -304,6 +630,52 @@ pub fn computeDeploymentId(entries: []const root.FileStore.Entry) u64 {
         if (e.kind == .handler) hasher.update(&e.bytecode_hex);
         hasher.update(&.{0});
     }
+
+    // `pkg_hash` is the package's content identity (over its files +
+    // imports), so hashing (spec, version, pkg_hash) captures each package
+    // version fully — no nested sort. Skipped entirely when there are no
+    // packages (cheap common case).
+    if (packages.len > 0 or app_imports.len > 0) {
+        var pkg_idx: [256]usize = undefined;
+        std.debug.assert(packages.len <= pkg_idx.len);
+        for (0..packages.len) |i| pkg_idx[i] = i;
+        const pkg_slice = pkg_idx[0..packages.len];
+        std.mem.sort(usize, pkg_slice, packages, struct {
+            fn lt(ctx: []const Package, a: usize, b: usize) bool {
+                const c = std.mem.order(u8, ctx[a].spec, ctx[b].spec);
+                if (c != .eq) return c == .lt;
+                const cv = std.mem.order(u8, ctx[a].version, ctx[b].version);
+                if (cv != .eq) return cv == .lt;
+                return std.mem.lessThan(u8, &ctx[a].pkg_hash_hex, &ctx[b].pkg_hash_hex);
+            }
+        }.lt);
+        for (pkg_slice) |i| {
+            const p = packages[i];
+            hasher.update(p.spec);
+            hasher.update(&.{0});
+            hasher.update(p.version);
+            hasher.update(&.{0});
+            hasher.update(&p.pkg_hash_hex);
+            hasher.update(&.{0});
+        }
+
+        var ai_idx: [256]usize = undefined;
+        std.debug.assert(app_imports.len <= ai_idx.len);
+        for (0..app_imports.len) |i| ai_idx[i] = i;
+        const ai_slice = ai_idx[0..app_imports.len];
+        std.mem.sort(usize, ai_slice, app_imports, struct {
+            fn lt(ctx: []const ImportEntry, a: usize, b: usize) bool {
+                return std.mem.lessThan(u8, ctx[a].specifier, ctx[b].specifier);
+            }
+        }.lt);
+        for (ai_slice) |i| {
+            hasher.update(app_imports[i].specifier);
+            hasher.update(&.{0});
+            hasher.update(&app_imports[i].pkg_hash_hex);
+            hasher.update(&.{0});
+        }
+    }
+
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     // First 8 bytes, big-endian → u64.
@@ -313,7 +685,7 @@ pub fn computeDeploymentId(entries: []const root.FileStore.Entry) u64 {
 const testing = std.testing;
 
 test "encode + decode round-trip" {
-    var entries = [_]root.FileStore.Entry{
+    var entries = [_]root.Entry{
         .{
             .path = @constCast("index.mjs"),
             .kind = .handler,
@@ -330,7 +702,7 @@ test "encode + decode round-trip" {
         },
     };
 
-    const bytes = try encode(testing.allocator, 7, &entries);
+    const bytes = try encode(testing.allocator, 7, &entries, &.{}, &.{});
     defer testing.allocator.free(bytes);
 
     var m = try decode(testing.allocator, bytes);
@@ -353,14 +725,14 @@ test "decode rejects wrong version" {
 }
 
 test "decode rejects missing bytecode_hash on handler" {
-    const bytes = "{\"v\":1,\"deployment_id\":\"0000000000000001\",\"entries\":[" ++
+    const bytes = "{\"v\":2,\"deployment_id\":\"0000000000000001\",\"entries\":[" ++
         "{\"path\":\"x.mjs\",\"kind\":\"handler\",\"content_type\":\"\"," ++
         "\"hash\":\"" ++ ("a" ** 64) ++ "\"}]}";
     try testing.expectError(Error.InvalidManifest, decode(testing.allocator, bytes));
 }
 
 test "decode allows missing bytecode_hash on static" {
-    const bytes = "{\"v\":1,\"deployment_id\":\"0000000000000001\",\"entries\":[" ++
+    const bytes = "{\"v\":2,\"deployment_id\":\"0000000000000001\",\"entries\":[" ++
         "{\"path\":\"_static/x.html\",\"kind\":\"static\",\"content_type\":\"text/html\"," ++
         "\"hash\":\"" ++ ("c" ** 64) ++ "\"}]}";
     var m = try decode(testing.allocator, bytes);
@@ -376,7 +748,7 @@ test "manifestKey produces zero-padded {N:020d}.json" {
 }
 
 test "computeDeploymentId: same entries → same id (idempotent)" {
-    var entries = [_]root.FileStore.Entry{
+    var entries = [_]root.Entry{
         .{
             .path = @constCast("index.mjs"),
             .kind = .handler,
@@ -392,13 +764,13 @@ test "computeDeploymentId: same entries → same id (idempotent)" {
             .bytecode_hex = @splat(0),
         },
     };
-    const id_a = computeDeploymentId(&entries);
-    const id_b = computeDeploymentId(&entries);
+    const id_a = computeDeploymentId(&entries, &.{}, &.{});
+    const id_b = computeDeploymentId(&entries, &.{}, &.{});
     try testing.expectEqual(id_a, id_b);
 }
 
 test "computeDeploymentId: entry order doesn't matter (sorts by path)" {
-    var entries_a = [_]root.FileStore.Entry{
+    var entries_a = [_]root.Entry{
         .{
             .path = @constCast("a.mjs"), .kind = .handler,
             .content_type = @constCast(""),
@@ -410,7 +782,7 @@ test "computeDeploymentId: entry order doesn't matter (sorts by path)" {
             .source_hex = @splat('3'), .bytecode_hex = @splat('4'),
         },
     };
-    var entries_b = [_]root.FileStore.Entry{
+    var entries_b = [_]root.Entry{
         .{
             .path = @constCast("b.mjs"), .kind = .handler,
             .content_type = @constCast(""),
@@ -423,30 +795,127 @@ test "computeDeploymentId: entry order doesn't matter (sorts by path)" {
         },
     };
     try testing.expectEqual(
-        computeDeploymentId(&entries_a),
-        computeDeploymentId(&entries_b),
+        computeDeploymentId(&entries_a, &.{}, &.{}),
+        computeDeploymentId(&entries_b, &.{}, &.{}),
     );
 }
 
 test "computeDeploymentId: changing content yields different id" {
-    var entries_a = [_]root.FileStore.Entry{.{
+    var entries_a = [_]root.Entry{.{
         .path = @constCast("index.mjs"), .kind = .handler,
         .content_type = @constCast(""),
         .source_hex = @splat('a'), .bytecode_hex = @splat('b'),
     }};
-    var entries_b = [_]root.FileStore.Entry{.{
+    var entries_b = [_]root.Entry{.{
         .path = @constCast("index.mjs"), .kind = .handler,
         .content_type = @constCast(""),
         .source_hex = @splat('a'), .bytecode_hex = @splat('c'), // different bytecode
     }};
     try testing.expect(
-        computeDeploymentId(&entries_a) != computeDeploymentId(&entries_b),
+        computeDeploymentId(&entries_a, &.{}, &.{}) != computeDeploymentId(&entries_b, &.{}, &.{}),
     );
 }
 
 test "computeDeploymentId: empty entries is stable" {
-    const empty: []const root.FileStore.Entry = &.{};
-    const id_a = computeDeploymentId(empty);
-    const id_b = computeDeploymentId(empty);
+    const empty: []const root.Entry = &.{};
+    const id_a = computeDeploymentId(empty, &.{}, &.{});
+    const id_b = computeDeploymentId(empty, &.{}, &.{});
     try testing.expectEqual(id_a, id_b);
+}
+
+// ── package manager P0: manifest v2 ────────────────────────────────
+
+fn findPkg(m: Manifest, spec: []const u8) ?Package {
+    for (m.packages) |p| if (std.mem.eql(u8, p.spec, spec)) return p;
+    return null;
+}
+
+test "v2: encode+decode round-trip with packages + app_imports" {
+    var entries = [_]root.Entry{.{
+        .path = @constCast("index.mjs"), .kind = .handler,
+        .content_type = @constCast(""),
+        .source_hex = @splat('a'), .bytecode_hex = @splat('b'),
+    }};
+    var oidc_files = [_]PkgFile{
+        .{ .path = @constCast("index.mjs"), .bytecode_hex = @splat('1'), .source_hex = @splat('2') },
+        .{ .path = @constCast("lib/token.mjs"), .bytecode_hex = @splat('3'), .source_hex = @splat('4') },
+    };
+    var oidc_imports = [_]ImportEntry{
+        .{ .specifier = @constCast("@rewind/jwt"), .pkg_hash_hex = @splat('J') },
+    };
+    var oidc_caps = [_][]const u8{ @constCast("kv"), @constCast("crypto") };
+    var jwt_files = [_]PkgFile{
+        .{ .path = @constCast("index.mjs"), .bytecode_hex = @splat('5'), .source_hex = @splat('6') },
+    };
+    var packages = [_]Package{
+        .{ .spec = @constCast("@rewind/oidc"), .version = @constCast("2.3.1"), .pkg_hash_hex = @splat('O'), .files = &oidc_files, .imports = &oidc_imports, .capabilities = &oidc_caps, .private = false },
+        .{ .spec = @constCast("@rewind/jwt"), .version = @constCast("1.4.0"), .pkg_hash_hex = @splat('J'), .files = &jwt_files, .imports = &.{}, .capabilities = &.{}, .private = true },
+    };
+    var app_imports = [_]ImportEntry{
+        .{ .specifier = @constCast("@rewind/oidc"), .pkg_hash_hex = @splat('O') },
+    };
+
+    const bytes = try encode(testing.allocator, 42, &entries, &packages, &app_imports);
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"v\":2") != null);
+
+    var m = try decode(testing.allocator, bytes);
+    defer m.deinit();
+
+    try testing.expectEqual(@as(usize, 1), m.entries.len);
+    try testing.expectEqual(@as(usize, 2), m.packages.len);
+    try testing.expectEqual(@as(usize, 1), m.app_imports.len);
+
+    const oidc = findPkg(m, "@rewind/oidc") orelse return error.MissingPackage;
+    try testing.expectEqualStrings("2.3.1", oidc.version);
+    try testing.expectEqualSlices(u8, &@as([root.HASH_HEX_LEN]u8, @splat('O')), &oidc.pkg_hash_hex);
+    try testing.expectEqual(@as(usize, 2), oidc.files.len);
+    try testing.expectEqualStrings("index.mjs", oidc.files[0].path);
+    try testing.expectEqualStrings("lib/token.mjs", oidc.files[1].path);
+    try testing.expectEqual(@as(usize, 1), oidc.imports.len);
+    try testing.expectEqualStrings("@rewind/jwt", oidc.imports[0].specifier);
+    try testing.expectEqualSlices(u8, &@as([root.HASH_HEX_LEN]u8, @splat('J')), &oidc.imports[0].pkg_hash_hex);
+    try testing.expectEqual(@as(usize, 2), oidc.capabilities.len);
+    try testing.expectEqual(false, oidc.private);
+
+    const jwt = findPkg(m, "@rewind/jwt") orelse return error.MissingPackage;
+    try testing.expectEqual(true, jwt.private);
+    try testing.expectEqual(@as(usize, 0), jwt.imports.len);
+    try testing.expectEqual(@as(usize, 0), jwt.capabilities.len);
+
+    try testing.expectEqualStrings("@rewind/oidc", m.app_imports[0].specifier);
+    try testing.expectEqualSlices(u8, &@as([root.HASH_HEX_LEN]u8, @splat('O')), &m.app_imports[0].pkg_hash_hex);
+}
+
+test "v2: decode rejects v1 (no back-compat — complete redeploy)" {
+    const bytes = "{\"v\":1,\"deployment_id\":\"0000000000000001\",\"entries\":[]}";
+    try testing.expectError(Error.InvalidManifest, decode(testing.allocator, bytes));
+}
+
+test "v2: a package-less deploy has no packages/app_imports sections" {
+    var entries = [_]root.Entry{.{
+        .path = @constCast("index.mjs"), .kind = .handler,
+        .content_type = @constCast(""),
+        .source_hex = @splat('a'), .bytecode_hex = @splat('b'),
+    }};
+    const id_no_pkg = computeDeploymentId(&entries, &.{}, &.{});
+
+    const bytes = try encode(testing.allocator, id_no_pkg, &entries, &.{}, &.{});
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"v\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "packages") == null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "app_imports") == null);
+
+    // Adding a package must change the dep_id (content-addressed).
+    var files = [_]PkgFile{.{ .path = @constCast("index.mjs"), .bytecode_hex = @splat('1'), .source_hex = @splat('2') }};
+    var pkgs = [_]Package{.{ .spec = @constCast("@rewind/jwt"), .version = @constCast("1.0.0"), .pkg_hash_hex = @splat('J'), .files = &files, .imports = &.{}, .capabilities = &.{}, .private = false }};
+    const id_with_pkg = computeDeploymentId(&entries, &pkgs, &.{});
+    try testing.expect(id_no_pkg != id_with_pkg);
+}
+
+test "v2: rejects a package missing pkg_hash" {
+    const bytes = "{\"v\":2,\"deployment_id\":\"0000000000000001\",\"entries\":[]," ++
+        "\"packages\":[{\"spec\":\"@rewind/x\",\"version\":\"1.0.0\"," ++
+        "\"files\":[],\"imports\":{}}]}";
+    try testing.expectError(Error.InvalidManifest, decode(testing.allocator, bytes));
 }

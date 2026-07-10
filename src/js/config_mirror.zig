@@ -289,7 +289,7 @@ test "mirrorConfigToKv: writes new rows + drops stale rows" {
     try writeBlob(&fake, google_json, &google_hex);
     try writeBlob(&fake, sessions_json, &sessions_hex);
 
-    var entries = [_]files_mod.FileStore.Entry{
+    var entries = [_]files_mod.Entry{
         .{
             .path = try allocator.dupe(u8, "_config/oauth/google.json"),
             .kind = .static,
@@ -360,7 +360,7 @@ test "mirrorConfigToKv: re-running with same manifest is idempotent" {
     var hex: [64]u8 = undefined;
     try writeBlob(&fake, json_bytes, &hex);
 
-    var entries = [_]files_mod.FileStore.Entry{
+    var entries = [_]files_mod.Entry{
         .{
             .path = try allocator.dupe(u8, "_config/oauth/google.json"),
             .kind = .static,
@@ -424,7 +424,7 @@ test "mirrorConfigToKv: rejects oversized config file" {
     var hex: [64]u8 = undefined;
     try writeBlob(&fake, bloated, &hex);
 
-    var entries = [_]files_mod.FileStore.Entry{
+    var entries = [_]files_mod.Entry{
         .{
             .path = try allocator.dupe(u8, "_config/oauth/google.json"),
             .kind = .static,
@@ -471,7 +471,7 @@ test "mirrorConfigToKv: ignores handler files even under _config/" {
     defer fake.deinit();
     const blobs = fake.store();
 
-    var entries = [_]files_mod.FileStore.Entry{
+    var entries = [_]files_mod.Entry{
         .{
             .path = try allocator.dupe(u8, "_config/weird.json"),
             .kind = .handler, // category error — skipped

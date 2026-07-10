@@ -186,7 +186,10 @@ pub const Context = struct {
     pub fn takeException(self: Context) ?Value {
         const ex = c.JS_GetException(self.raw);
         const v: Value = .{ .raw = ex, .ctx = self.raw };
-        if (v.isNull()) return null;
+        // arenajs's "no exception pending" sentinel is JS_UNINITIALIZED
+        // (classic quickjs used JS_NULL) — treat both as absent, or the
+        // caller stringifies a literal "[uninitialized]".
+        if (v.isNull() or c.JS_IsUninitialized(ex)) return null;
         return v;
     }
 

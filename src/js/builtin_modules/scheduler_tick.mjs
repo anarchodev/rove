@@ -21,9 +21,8 @@
 // Resolved by the runtime via `__system/` module path resolution
 // (not in any tenant's deployment files); compiled to bytecode once
 // at NodeState init and shared across every tenant. Runs with
-// `is_system_module = true`, so the `__rove_set_wake` /
-// `__rove_fire_wake` builtins (which throw for customer code) are
-// reachable.
+// `is_system_module = true`, so the gated `__rove.wake.set` /
+// `__rove.wake.fire` ops (which throw for customer code) are reachable.
 
 const BY_TIME_PREFIX = "_sched/by_time/";
 const BY_ID_PREFIX = "_sched/by_id/";
@@ -100,7 +99,7 @@ export default function () {
         // Fan out. The two cleanup keys ride into the target's writeset
         // (see fireDurableWakeActivation) so the delete commits with the
         // handler's effects — exactly-once on the normal path.
-        __rove_fire_wake(
+        __rove.wake.fire(
             target,
             id,
             wakeKey,
@@ -123,6 +122,6 @@ export default function () {
     // gone. A backlog beyond the per-tick cap drains the same way (one
     // batch per tick). When nothing fired, the watermark is the first
     // future entry (or 0n for "no wake pending").
-    __rove_set_wake(String(fired > 0 ? nowNs : nextWatermark));
+    __rove.wake.set(String(fired > 0 ? nowNs : nextWatermark));
     return { status: 200 };
 }

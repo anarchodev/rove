@@ -179,8 +179,7 @@ const StandaloneStack = struct {
 
 /// LMDB mmap size cap for standalone-mode KvStores. Sparse — only
 /// touched pages cost memory. Default 1 GiB is plenty for the small
-/// scratch-only consumers (bootstrap.zig, deployStarterContent
-/// transients, tests).
+/// scratch-only consumers (bootstrap.zig, tests).
 const STANDALONE_MAP_SIZE: usize = 1 * 1024 * 1024 * 1024;
 
 /// Reserved store_id for standalone-mode KvStores. The file holds

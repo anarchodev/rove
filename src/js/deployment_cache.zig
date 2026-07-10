@@ -22,6 +22,7 @@ const config_mirror = @import("config_mirror.zig");
 const raft_propose = @import("raft_propose.zig");
 const reserved = @import("reserved.zig");
 const bytecode_cache_mod = @import("bytecode_cache.zig");
+const module_execution = @import("module_execution.zig");
 const deployment_loader_mod = @import("deployment_loader.zig");
 const msg_router_mod = @import("msg_router.zig");
 const plan_mod = @import("rove-plan");
@@ -365,6 +366,12 @@ pub const TenantFilesSnapshot = struct {
     /// `bytecodes`. Read by the QuickJS module loader for per-request
     /// module-resolution tapes.
     source_hashes: std.StringHashMapUnmanaged([64]u8),
+    /// Per-importer `@scope/pkg` resolution (PM P1). Built from the
+    /// manifest's `packages` / `app_imports` by `buildResolver`; the
+    /// package modules it points at live in `bytecodes` under their
+    /// `/pkg/<pkg_hash>/…` keys. Null for package-less deployments —
+    /// the module loader then behaves exactly pre-PM.
+    resolver: ?module_execution.PackageResolver = null,
     /// Static files keyed by stored path; bytes fetched on demand
     /// from the slot's `blob_backend`.
     statics: std.StringHashMapUnmanaged(StaticEntry),
@@ -412,6 +419,7 @@ pub const TenantFilesSnapshot = struct {
         var sh_it = self.source_hashes.iterator();
         while (sh_it.next()) |entry| allocator.free(entry.key_ptr.*);
         self.source_hashes.deinit(allocator);
+        if (self.resolver) |*r| r.deinit(allocator);
         var st_it = self.statics.iterator();
         while (st_it.next()) |entry| {
             allocator.free(entry.key_ptr.*);
@@ -1422,6 +1430,45 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
         }
     }
 
+    // PM P1: stage package modules into the bytecode map at their
+    // package-virtual keys (`/pkg/<pkg_hash>/<path>`) so the module
+    // loader can serve `@scope/pkg` imports. Same lease-or-fetch path
+    // as handler bytecode — packages are content-addressed, so two
+    // tenants pinning the same version share one cache entry.
+    for (manifest.packages) |p| {
+        for (p.files) |f| {
+            const key = try std.fmt.allocPrint(allocator, "/pkg/{s}/{s}", .{ &p.pkg_hash_hex, f.path });
+            // The same pkg_hash listed twice is content-identical by
+            // construction (spec: same-version dedup is free) — skip.
+            if (next_bc.contains(key)) {
+                allocator.free(key);
+                continue;
+            }
+            errdefer allocator.free(key);
+            const bb: *BlobBytes = if (cache.acquire(&f.bytecode_hex)) |hit| hit else blk: {
+                const bytes = try bs.get(&f.bytecode_hex, allocator);
+                errdefer allocator.free(bytes);
+                break :blk try cache.insert(&f.bytecode_hex, bytes);
+            };
+            errdefer cache.release(bb);
+            try next_bc.put(allocator, key, bb);
+
+            const sh_key = try allocator.dupe(u8, key);
+            errdefer allocator.free(sh_key);
+            try next_source_hashes.put(allocator, sh_key, f.source_hex);
+        }
+    }
+
+    // PM P1: per-importer package resolution for the module loader.
+    // Null when the deployment declares no packages — the loader then
+    // resolves exactly as pre-PM.
+    var next_resolver: ?module_execution.PackageResolver =
+        if (manifest.packages.len > 0 or manifest.app_imports.len > 0)
+            try module_execution.buildResolver(allocator, manifest.packages, manifest.app_imports)
+        else
+            null;
+    errdefer if (next_resolver) |*r| r.deinit(allocator);
+
     // Sort triggers by prefix length descending (longest/innermost
     // first). AFTER chain iterates forward; BEFORE chain iterates
     // reverse. See TenantFilesSnapshot.triggers.
@@ -1463,6 +1510,7 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
         .deployment_id = manifest.id,
         .bytecodes = next_bc,
         .source_hashes = next_source_hashes,
+        .resolver = next_resolver,
         .statics = next_statics,
         .statics_by_hash = next_statics_by_hash,
         .triggers = triggers_slice,

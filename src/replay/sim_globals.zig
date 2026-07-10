@@ -45,11 +45,11 @@ const SYSTEM_SHIM =
     \\  var no = function(n){ return function(){ throw new Error("crypto." + n + " is not available in `rewind test` (the offline sim has SHA-256/HMAC + random only — no streaming sha, RSA or ECDSA)"); }; };
     \\  var push = function(e){ (globalThis.__rove_effects || (globalThis.__rove_effects = [])).push(e); };
     \\  var b2s = function(c){ if (typeof c === "string") return c; var s = ""; for (var i = 0; i < c.length; i++) s += String.fromCharCode(c[i]); return s; };
-    \\  // Native continuation + rate-limit builtins the base globals bottom out on
-    \\  // (worker-native — the sim supplies faithful equivalents). `__rove_next`
-    \\  // mirrors the disposition the epilogue used to synthesize inline; the email
-    \\  // rate limiter is a no-op offline (there's no per-worker bucket to exhaust).
-    \\  globalThis.__rove_next = function(_, o){ return { __rove_disposition: "next", ctx: (o && o.ctx !== undefined) ? o.ctx : null }; };
+    \\  // Native rate-limit builtin the email global bottoms out on
+    \\  // (worker-native — no-op offline: there's no per-worker bucket to
+    \\  // exhaust). The continuation native lives on `_system.continuation`
+    \\  // below (next.js captures it at base-eval — privileged-surface
+    \\  // unification; the bare `__rove_next` global is gone).
     \\  globalThis.__rove_check_email_rate = function(){};
     \\  // Streaming SHA-256 in pure JS (the portable replay engine has one-shot
     \\  // `nat.sha256` only). Same posture as the RSA/ECDSA verify above; drives
@@ -190,6 +190,13 @@ const SYSTEM_SHIM =
     \\  var gate = function(fn){ return function(){ if (globalThis.kv.get(NS_STORE + "admin") !== "1") throw new TypeError(GATE_MSG); return fn.apply(null, arguments); }; };
     \\  var rootStore_r = storeKv(NS_STORE + "r/", "r");
     \\  globalThis._system = {
+    \\    // The park/continue native (`next.js` captures this at base-eval).
+    \\    // Mirrors the worker's disposition: target "" = same-module;
+    \\    // non-empty = cross-module re-entry (recorded for fidelity; the
+    \\    // sim consumer keys on `__rove_disposition` + `ctx`).
+    \\    continuation: {
+    \\      next: function(target, o){ return { __rove_disposition: "next", target: (target ? target : null), ctx: (o && o.ctx !== undefined) ? o.ctx : null }; },
+    \\    },
     \\    crypto: {
     \\      getRandomValues: function(a){ return nat.getRandomValues(a); },
     \\      randomBytes: function(n){ return nat.randomBytes(n); },
