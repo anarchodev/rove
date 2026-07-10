@@ -5,6 +5,6 @@ export default function () {
   return {
     surface: { http: typeof http, platform: typeof platform, browser: typeof browser },
     created: platform.instances.create({ id: "acme" }), // records a platform effect
-    rootRead: platform.root.get("cfg/x"),                // reads the closed-world kv
+    rootRead: platform.root.get("cfg/x"),                // reads the isolated root store
   };
 }

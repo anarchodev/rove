@@ -105,10 +105,83 @@ function subsetMatch(obj, subset) {
 function foldKv(base, effects) {
   const kvOut = Object.assign({}, base || {});
   for (const e of effects || []) {
-    if (e.kind === "write") kvOut[e.key] = e.value;
-    else if (e.kind === "delete") delete kvOut[e.key];
+    if (e.kind !== "write" && e.kind !== "delete") continue;
+    // A store-tagged write/delete (platform.scope(id) / platform.root) folds into
+    // that store's namespaced slot, so it never collides with the tenant's own
+    // kv or another instance's — the same `__rove_store/{tag}/` layout the sim
+    // base + host use at runtime.
+    const slot = e.store ? ("__rove_store/" + e.store + "/" + e.key) : e.key;
+    if (e.kind === "write") kvOut[slot] = e.value;
+    else delete kvOut[slot];
   }
   return kvOut;
+}
+
+// ── effect views: the durable verbs run their REAL shims from the sim base, so
+// they decompose to primitives in the effect log. These views read that
+// primitive shape back into the readable form the matchers assert against —
+// `webhook`/`email` from `_send/owed/*` markers, `schedule`/`cron` from
+// `_sched/by_id/*` rows. The connection wakes `after.ms`/`after.kv` remain
+// direct `{kind:"timer"|"kv-wake"}` recorder entries. ──
+
+/** Schedules armed by this activation, each as `{ target, kind, key?, msg? }`.
+ *  Durable `schedule`/`cron` are `_sched/by_id/{id}` writes — and since
+ *  `cron(spec, t)` composes as `schedule(_, "__system/cron_tick", {spec,
+ *  target:t})`, the customer target is unwrapped from `msg.target`. The
+ *  connection wakes `after.ms`/`after.kv` are direct `{kind:"timer"|"kv-wake"}`
+ *  recorder entries. */
+function scheduledEffects(effects) {
+  const out = [];
+  for (const e of effects || []) {
+    if (e.kind === "timer") out.push({ target: e.on, kind: "timer" });
+    else if (e.kind === "kv-wake") out.push({ target: e.on, kind: "kv-wake" });
+    else if (e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_sched/by_id/")) {
+      try {
+        const r = JSON.parse(e.value);
+        // Unwrap the cron indirection so `toHaveScheduled(customerTarget)` still
+        // matches; a plain schedule keeps its own target.
+        if (r.target === "__system/cron_tick" && r.msg && r.msg.target)
+          out.push({ target: r.msg.target, kind: "cron", key: r.key, msg: r.msg });
+        else
+          out.push({ target: r.target, kind: "schedule", key: r.key, msg: r.msg });
+      } catch (_) { /* skip a non-JSON _sched row */ }
+    }
+  }
+  return out;
+}
+
+/** Durable sends (`webhook.send`, and `email.send` which layers on it) armed by
+ *  this activation — the parsed `_send/owed/{id}` marker ({url, method, body,
+ *  on_result, context, …}), the durable artifact that actually replicates. */
+function sentEffects(effects) {
+  const out = [];
+  for (const e of effects || []) {
+    if (e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_send/owed/")) {
+      try { const m = JSON.parse(e.value); out.push({ url: m.url, method: m.method, body: m.body, on: m.on_result, context: m.context }); }
+      catch (_) { /* skip a non-JSON marker */ }
+    }
+  }
+  return out;
+}
+
+/** Emails sent by this activation. `email.send` layers on `webhook.send`, so
+ *  it's a `_send/owed/{id}` marker pointed at the Resend API — parse its request
+ *  body back to a readable `{to, from, subject, cc, bcc}` (the Resend `to` is
+ *  always an array). Only resend-url markers are emails; other durable sends are
+ *  webhooks (read those with `toHaveSent("webhook", …)`). */
+function emailSent(effects) {
+  const out = [];
+  for (const e of effects || []) {
+    if (e.kind === "write" && typeof e.key === "string" && e.key.startsWith("_send/owed/")) {
+      try {
+        const m = JSON.parse(e.value);
+        if (m.url !== "https://api.resend.com/emails") continue;
+        const b = JSON.parse(m.body);
+        out.push({ to: b.to, from: b.from, subject: b.subject, cc: b.cc, bcc: b.bcc, on: m.on_result, context: m.context });
+      } catch (_) { /* skip a non-JSON marker */ }
+    }
+  }
+  return out;
 }
 
 function fmt(x) {
@@ -135,14 +208,35 @@ class Scenario {
     this.sourceDir = cfg.sourceDir || null;
     this.inlineSources = cfg.sources || null; // { "index.mjs": "…source…" }
     this.baseKv = cfg.kv || {};
+    // Per-instance / root store seeds (read by platform.scope(id).kv /
+    // platform.root). Seeded into the closed-world map under the same
+    // `__rove_store/{tag}/` layout the base facades + host use at runtime.
+    this.instances = cfg.instances || {}; // { "<id>": { kv: {…} } }
+    this.rootKv = (cfg.root && cfg.root.kv) || {};
+    // The operator root token `platform.auth.checkRootToken(t)` validates against
+    // (env-supplied in prod). Carried as a hidden reserved kv key; unset → nothing
+    // authenticates as root.
+    this.rootToken = cfg.rootToken || null;
+    // `platform.*` is admin-only (prod throws off the `__admin__` handler). Fail
+    // closed: a run is admin only when opted in, so a non-admin handler that
+    // touches `platform.*` throws — like prod. Carried as a hidden reserved key.
+    this.admin = cfg.admin || false;
     this.now = toMs(cfg.now);
     this.seed = cfg.seed || 0;
     this.entry = cfg.entry || "index.mjs";
   }
 
   _base(partial) {
+    const kv = Object.assign({}, this.baseKv);
+    for (const id of Object.keys(this.instances)) {
+      const ikv = (this.instances[id] && this.instances[id].kv) || {};
+      for (const k of Object.keys(ikv)) kv["__rove_store/i/" + id + "/" + k] = ikv[k];
+    }
+    for (const k of Object.keys(this.rootKv)) kv["__rove_store/r/" + k] = this.rootKv[k];
+    if (this.rootToken) kv["__rove_store/auth/token"] = this.rootToken;
+    if (this.admin) kv["__rove_store/admin"] = "1";
     const w = Object.assign(
-      { entry: this.entry, seed: this.seed, now_ms: this.now, kv: this.baseKv },
+      { entry: this.entry, seed: this.seed, now_ms: this.now, kv },
       partial,
     );
     if (this.sourceDir) w.source_dir = this.sourceDir;
@@ -210,6 +304,53 @@ class Scenario {
     }));
   }
 
+  /** A DETACHED durable schedule/cron callback (`schedule(...)` / `cron(...)`
+   *  target), authored directly — NOT folded from an emitter. A due schedule
+   *  fires its `target` as a fresh `durable_wake` activation: connectionless,
+   *  no held socket, surviving crashes and leader changes. So — like a
+   *  `sendCallback` — you test that target module in isolation, given a fire.
+   *
+   *  Mirrors the runtime surface (globals.zig durable-wake block): the payload
+   *  arrives on `request.ctx` (the one-ctx rule — the same slot every callback
+   *  reads, NOT `request.activation.msg`), with delivery metadata on
+   *  `request.activation.{kind, id, key, scheduledAtNs}`. `key` is present only
+   *  when the schedule carried an idempotency key (`opts.key`) — omitted
+   *  otherwise, matching the runtime and `schedule.get`. A recurring `cron`
+   *  target fires the same way (via the baked `cron_tick`, which the customer
+   *  never sees); each occurrence is one `wake(...)`.
+   *
+   *  spec: { on: "<target module path>", ctx?: <payload>, method?: "<export>",
+   *          id?: "<schedule id>", key?: "<idempotency key>",
+   *          scheduledAtNs?: <ns since epoch>, now?: <fire time> }
+   */
+  wake(spec = {}) {
+    if (typeof spec.on !== "string")
+      throw new Error("wake({ on }): `on` must be the scheduled target module path");
+    // The fire happens AT/AFTER the scheduled time; run the activation with the
+    // clock at the fire time so the target's `Date.now()` is deterministic.
+    const fireMs = spec.now !== undefined ? toMs(spec.now) : this.now;
+    const scheduledAtNs = spec.scheduledAtNs != null ? spec.scheduledAtNs : fireMs * 1_000_000;
+    const activation = {
+      kind: "durable_wake",
+      // A fired schedule always carries its id; default a stable placeholder so
+      // `request.activation.id` is the string a real target reads.
+      id: spec.id != null ? spec.id : "sched_test",
+      scheduledAtNs,
+    };
+    // Present only when the schedule was armed with an idempotency key.
+    if (spec.key != null) activation.key = spec.key;
+    return new Node(this, this._base({
+      entry: spec.on, // the scheduled target module IS this activation's entry
+      activation: "durable_wake",
+      // durable_wake dispatches at the target's default export (rpc_dispatch);
+      // a `module.method` target overrides via `method`.
+      export: spec.method || "default",
+      ctx: spec.ctx === undefined ? null : spec.ctx,
+      now_ms: fireMs,
+      request: { activation },
+    }));
+  }
+
   /** A held WebSocket connection. The upgrade runs NO code (the chain parks
    *  with ctx `{}`); each inbound frame runs `onMessage`, so the fold starts at
    *  the first `.receive(frame)`. Per-connection ctx threads via each frame's
@@ -263,6 +404,23 @@ class Node {
   kv(key) {
     const eff = foldKv(this.world.kv, this.force().effects);
     return key in eff ? tryParse(eff[key]) : null;
+  }
+
+  /** Post-state of another instance's isolated store (`platform.scope(id).kv`) —
+   *  seeds via `scenario({ instances: { <id>: { kv } } })`, folded writes and
+   *  all. Absent keys read `null`, like `kv()`. */
+  instanceKv(id, key) {
+    const eff = foldKv(this.world.kv, this.force().effects);
+    const slot = "__rove_store/i/" + id + "/" + key;
+    return slot in eff ? tryParse(eff[slot]) : null;
+  }
+
+  /** Post-state of the platform root store (`platform.root`) — seeds via
+   *  `scenario({ root: { kv } })`. Absent keys read `null`. */
+  rootKv(key) {
+    const eff = foldKv(this.world.kv, this.force().effects);
+    const slot = "__rove_store/r/" + key;
+    return slot in eff ? tryParse(eff[slot]) : null;
   }
 
   // ── held-connection resume folds ──
@@ -618,7 +776,9 @@ class Matcher {
   toHaveWritten(key, subset) {
     const node = this._node("toHaveWritten");
     if (!node) return false;
-    const writes = node.effects.filter((e) => e.kind === "write" && e.key === key);
+    // Tenant store only — a `platform.scope(id)` / `platform.root` write carries
+    // a `store` tag and is asserted with `instanceKv(id, …)` / `rootKv(…)`.
+    const writes = node.effects.filter((e) => e.kind === "write" && e.key === key && !e.store);
     const pass = writes.some((w) => subsetMatch(tryParse(w.value), subset));
     return this._record(`toHaveWritten ${fmt(key)}`, pass, {
       subset: subset === undefined ? null : subset,
@@ -647,7 +807,14 @@ class Matcher {
   toHaveSent(kind, subset) {
     const node = this._node("toHaveSent");
     if (!node) return false;
-    const sent = node.effects.filter((e) => e.kind === kind);
+    // `webhook`/`email` read through effect VIEWS over the durable `_send/owed`
+    // marker the real shims produce (email layers on webhook, so it's a
+    // resend-url marker). Other kinds (blob/…) match the raw effect entry.
+    const sent = kind === "webhook"
+      ? sentEffects(node.effects)
+      : kind === "email"
+      ? emailSent(node.effects)
+      : node.effects.filter((e) => e.kind === kind);
     const pass = sent.some((e) => subsetMatch(e, subset));
     return this._record(`toHaveSent ${fmt(kind)}`, pass, { subset: subset === undefined ? null : subset, sent });
   }
@@ -655,10 +822,8 @@ class Matcher {
   toHaveScheduled(matcher) {
     const node = this._node("toHaveScheduled");
     if (!node) return false;
-    const sch = node.effects.filter((e) =>
-      e.kind === "schedule" || e.kind === "timer" || e.kind === "cron" || e.kind === "kv-wake");
-    const pass = sch.some((e) => matcher == null
-      || matchUrl(e.target || e.on || e.prefix || String(e.when || e.ms || ""), matcher));
+    const sch = scheduledEffects(node.effects);
+    const pass = sch.some((e) => matcher == null || matchUrl(e.target, matcher));
     return this._record(`toHaveScheduled ${matcher == null ? "" : matcher}`, pass, { scheduled: sch });
   }
 

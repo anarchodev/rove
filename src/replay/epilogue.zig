@@ -74,7 +74,10 @@ pub fn exportForActivation(activation: []const u8) []const u8 {
         .{ "wake_batch", "onWake" },
         .{ "kv_wake", "onWake" },
         .{ "timer", "onWake" },
-        .{ "durable_wake", "onWake" },
+        // `durable_wake` (a fired schedule/cron target) is NOT here: like the
+        // runtime (`rpc_dispatch.defaultExportForKind`), it falls through to
+        // `default` — a schedule `target` is a module invoked at its default
+        // export (a `module.method` target names the export explicitly).
         .{ "disconnect", "onDisconnect" },
         .{ "ws_message", "onMessage" },
         .{ "inbound_headers", "onHeaders" },
@@ -250,7 +253,12 @@ const EPILOGUE_BODY =
     \\      for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
     \\      return u;
     \\    }
-    \\    const st = D.body ?? "";
+    \\    // D.body is the DECODED request text — the appended `.js` source is read
+    \\    // as UTF-8, so a multibyte body (`jsonStr` embedded its wire bytes raw)
+    \\    // arrives here as characters, not bytes. Its wire bytes are the UTF-8
+    \\    // re-encoding; `unescape(encodeURIComponent(...))` yields those bytes as a
+    \\    // latin1 string. (A binary body rides D.bodyB64 above, never this path.)
+    \\    const st = unescape(encodeURIComponent(D.body ?? ""));
     \\    const u = new Uint8Array(st.length);
     \\    for (let i = 0; i < st.length; i++) u[i] = st.charCodeAt(i) & 0xff;
     \\    return u;
@@ -309,48 +317,41 @@ const EPILOGUE_BODY =
     \\    if (D.result.chunkSeq !== null) request.chunkSeq = D.result.chunkSeq;
     \\  }
     \\  // ── effect shims ──
-    \\  // The bare replay arena has no ambient effect globals, so a real handler
-    \\  // (TextDecoder / stream.* / on.* / next / webhook.send) would ReferenceError.
-    \\  // Outputs are CAPTURED (not fired) so the bundle shows what the handler did
-    \\  // and re-execution stays deterministic. stream/on/next/TextDecoder are
-    \\  // fully faithful (no side effects to reproduce); webhook/email/schedule/
-    \\  // cron/blob are recorded but do NOT re-run their durability shims (their
-    \\  // kv markers / bytes aren't reproduced — the handler's own kv writes are).
+    \\  // The connection/continuation + durable-effect globals ALL come from the sim
+    \\  // BASE (sim_globals.zig), over `_system.*` recorders that push into the same
+    \\  // shared __effects log (globalThis.__rove_effects) as this epilogue: `after`/
+    \\  // `stream`/`next` are faithful recorders and `cron`/`schedule`/`webhook`/
+    \\  // `email` are the REAL shims, so those verbs decompose to primitives
+    \\  // (`_send/owed` + `_sched/*` kv writes + `http.fetch`) in the effect log.
+    \\  // Outputs are CAPTURED (not fired) so re-execution stays deterministic. Still
+    \\  // epilogue-local: TextDecoder/TextEncoder (no base textcodec), the `on.*`
+    \\  // pre-rename alias, and the kv recorder wrapper below.
     \\  if (typeof globalThis.TextDecoder === "undefined") {
     \\    globalThis.TextDecoder = function () {};
     \\    globalThis.TextDecoder.prototype.decode = function (u) { if (u == null) return ""; try { return decodeURIComponent(escape(__b2s(u))); } catch (_) { return __b2s(u); } };
     \\    globalThis.TextEncoder = function () {};
     \\    globalThis.TextEncoder.prototype.encode = function (s) { s = String(s); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i) & 0xff; return u; };
     \\  }
-    \\  // Effect shims — each appends to the shared __effects log in call order, so
-    \\  // reads/writes/cmds/logs interleave as the handler performed them. Filter by
-    \\  // `kind` to recover a typed view.
-    \\  globalThis.stream = { start() {}, write(c) { const __t = (typeof c === "string") ? c : __b2s(c); __effects.push({ kind: "stream", bytes: __t.length, data: __t }); } };
-    \\  const __tgt = (d) => (d && (d.on || d.to)) || null;
-    \\  globalThis.after = {
-    \\    fetch(url, opts) { __effects.push({ kind: "fetch", url, method: (opts && opts.method) || "GET", body: (opts && opts.body !== undefined) ? opts.body : null, ctx: (opts && opts.ctx !== undefined) ? opts.ctx : null, on: (opts && opts.on) || null }); },
-    \\    kv(prefix, dst) { __effects.push({ kind: "kv-wake", prefix, on: __tgt(dst) }); },
-    \\    ms(ms, dst) { __effects.push({ kind: "timer", ms, on: __tgt(dst) }); },
-    \\  };
-    \\  // Pre-rename `on.*` — kept on the DRIVER only, so records from
-    \\  // pre-rename deployments still replay their pinned code.
+    \\  // Pre-rename `on.*` — kept on the DRIVER only, so records from pre-rename
+    \\  // deployments still replay their pinned code. Aliases the base `after`.
     \\  globalThis.on = { fetch: globalThis.after.fetch, kv: globalThis.after.kv, timer: globalThis.after.ms };
-    \\  globalThis.webhook = { send(url, opts) { __effects.push({ kind: "webhook", url, on: (opts && (opts.on || opts.on_result)) || null }); } };
-    \\  globalThis.email = { send(opts) { __effects.push({ kind: "email", to: (opts && opts.to) || null }); } };
-    \\  globalThis.schedule = (when, target) => { __effects.push({ kind: "schedule", when, target: target || null }); };
-    \\  globalThis.cron = (spec, target) => { __effects.push({ kind: "cron", spec, target: target || null }); };
-    \\  globalThis.blob = { get() {}, put() {}, receive() {}, seal() {} };
-    \\  globalThis.next = (ctx) => ({ __rove_disposition: "next", ctx: ctx === undefined ? null : ctx });
     \\  // Wrap the native kv so reads/writes interleave with the cmds above in true
     \\  // occurrence order. Restored before the OUTPUT_KEY write (which stays native).
     \\  const __kvNative = globalThis.kv;
+    \\  // `platform.scope(id)` / `platform.root` (sim_globals) namespace their keys
+    \\  // under `__rove_store/` for per-store isolation and push their OWN clean
+    \\  // store-tagged effect entries, so the wrapper neither records nor surfaces
+    \\  // those namespaced keys — a tenant read / prefix scan must never see them.
+    \\  const __NS = "__rove_store/";
     \\  globalThis.kv = {
-    \\    get(k) { const v = __kvNative.get(k); __effects.push({ kind: "read", key: k, present: v !== undefined && v !== null }); return v; },
-    \\    set(k, val) { __effects.push({ kind: "write", key: k, value: val }); return __kvNative.set(k, val); },
-    \\    delete(k) { __effects.push({ kind: "delete", key: k }); return __kvNative.delete(k); },
+    \\    get(k) { const v = __kvNative.get(k); if (!k.startsWith(__NS)) __effects.push({ kind: "read", key: k, present: v !== undefined && v !== null }); return v; },
+    \\    set(k, val) { if (!k.startsWith(__NS)) __effects.push({ kind: "write", key: k, value: val }); return __kvNative.set(k, val); },
+    \\    delete(k) { if (!k.startsWith(__NS)) __effects.push({ kind: "delete", key: k }); return __kvNative.delete(k); },
     \\    // Adapter: the worker's kv.prefix is positional; the replay
-    \\    // NATIVE takes (prefix, {cursor, limit}) — convert here.
-    \\    prefix(p, cursor, limit) { const r = __kvNative.prefix(p, { cursor, limit }); __effects.push({ kind: "read", op: "prefix", key: p, present: true }); return r; },
+    \\    // NATIVE takes (prefix, {cursor, limit}) — convert here. A scan under the
+    \\    // store namespace (a facade call) returns raw for the facade to strip;
+    \\    // any other scan filters the namespaced keys out.
+    \\    prefix(p, cursor, limit) { const r = __kvNative.prefix(p, { cursor, limit }); if (p.startsWith(__NS)) return r; __effects.push({ kind: "read", op: "prefix", key: p, present: true }); return (r || []).filter((e) => !e.key.startsWith(__NS)); },
     \\  };
     \\  if (typeof request.tag !== "function") request.tag = function () { return request; };
     \\  globalThis.request = request;
@@ -437,6 +438,10 @@ test "exportForActivation maps activation kinds" {
     try testing.expectEqualStrings("onWake", exportForActivation("kv_wake"));
     try testing.expectEqualStrings("onMessage", exportForActivation("ws_message"));
     try testing.expectEqualStrings("onChunk", exportForActivation("inbound_chunk"));
+    // A fired schedule/cron target invokes the target module's default export
+    // (mirrors `rpc_dispatch.defaultExportForKind`); a `module.method` target
+    // names its export explicitly on the world.
+    try testing.expectEqualStrings("default", exportForActivation("durable_wake"));
 }
 
 test "build: GET embeds request meta + parks output under sentinel" {
