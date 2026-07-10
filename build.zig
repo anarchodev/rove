@@ -1353,6 +1353,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/effects", // real webhook/schedule shims → primitive effect log
         "src/replay/testdata/email", // email.send → webhook _send/owed marker (Resend)
         "src/replay/testdata/blobrecipe", // blob put/write/seal/url — streaming sha256 offline
+        "src/replay/testdata/utf8body", // multibyte UTF-8 request body round-trips (json/text/bytes)
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);

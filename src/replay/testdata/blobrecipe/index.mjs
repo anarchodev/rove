@@ -5,9 +5,8 @@
 // invariant the whole recipe substrate rests on.
 //
 // The test drives one case per activation (a recipe is one-seal-per-chain), so
-// the UTF-8 test strings live here as literals selected by an ASCII index — NOT
-// through the request body, whose JSON path is latin1 in the sim and would
-// mangle multibyte content (a separate gap, unrelated to blob).
+// the cases live here as an array selected by an ASCII index rather than being
+// threaded through the request body.
 const CASES = [
   { one: "one-shot", parts: ["hello ", "world"] },                 // ASCII, sub-block
   { one: "A".repeat(100), parts: ["A".repeat(70), "B".repeat(50)] }, // >64B, block-cross

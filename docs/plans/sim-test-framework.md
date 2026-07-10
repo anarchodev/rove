@@ -473,13 +473,15 @@ too. Fixtures `testdata/{authsurface,middleware}`.
   **RS384/512 + ES384/512** (need native sha384/512, and P-384/521 curves for the
   EC ones); `platform.*` reads hit the one closed-world kv (no per-instance store
   isolation) and `auth.checkRootToken` assumes root — first-pass.
-- **Request-body UTF-8 gap (found while wiring `blob`).** The sim reconstructs an
-  inline request body as a *latin1 byte* string (`D.body.charCodeAt(i) & 0xff` in
-  `epilogue.zig`), so a JSON body containing multibyte UTF-8 (e.g. `"✓"` → byte
-  `0x13`) corrupts `request.text` and `request.json` throws "Bad control
-  character". ASCII bodies are unaffected. Fix is in the harness body-encoding /
-  epilogue reconstruction path (encode the body to UTF-8 bytes, or carry it
-  base64 like the binary-chunk path already does), not in any effect global.
+- ~~**Request-body UTF-8 gap.**~~ — FIXED. The sim reconstructed an inline request
+  body as a *latin1 byte* string (`D.body.charCodeAt(i) & 0xff` in `epilogue.zig`),
+  so a JSON body with multibyte UTF-8 (e.g. `"✓"` → byte `0x13`) corrupted
+  `request.text` and made `request.json` throw "Bad control character". `D.body`
+  is the *decoded* text (the appended `.js` source is read as UTF-8), so
+  `__rawPayload` now re-encodes it to its UTF-8 wire bytes via
+  `unescape(encodeURIComponent(...))` — `request.bytes`/`text`/`json` all decode
+  correctly (2/3/4-byte incl. surrogate pairs). This also fixed replay of any
+  captured non-ASCII text body, not just the sim. Fixture `testdata/utf8body/`.
 - ~~**The clean effect-global unification.**~~ — DONE (except `blob`). The sim
   base now installs the REAL effect globals unconditionally — there is no
   `realEffects` flag and the epilogue no longer stubs these verbs. `webhook.send`

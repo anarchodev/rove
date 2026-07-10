@@ -253,7 +253,12 @@ const EPILOGUE_BODY =
     \\      for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
     \\      return u;
     \\    }
-    \\    const st = D.body ?? "";
+    \\    // D.body is the DECODED request text — the appended `.js` source is read
+    \\    // as UTF-8, so a multibyte body (`jsonStr` embedded its wire bytes raw)
+    \\    // arrives here as characters, not bytes. Its wire bytes are the UTF-8
+    \\    // re-encoding; `unescape(encodeURIComponent(...))` yields those bytes as a
+    \\    // latin1 string. (A binary body rides D.bodyB64 above, never this path.)
+    \\    const st = unescape(encodeURIComponent(D.body ?? ""));
     \\    const u = new Uint8Array(st.length);
     \\    for (let i = 0; i < st.length; i++) u[i] = st.charCodeAt(i) & 0xff;
     \\    return u;
