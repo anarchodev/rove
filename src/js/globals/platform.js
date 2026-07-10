@@ -97,9 +97,14 @@
       s.deploy = {
         stampManifest(entries, opts) {
           opts = opts || {};
+          const req = { scope: id, entries };
+          // PM P1: `opts.resolution` bakes the deploy's `{packages,
+          // app_imports}` sections into the manifest (and its dep_id).
+          if (opts.resolution !== undefined)
+            req.resolution = JSON.stringify(opts.resolution);
           return sysOn.fetch(
             "http://rove-stage.internal/",
-            { method: "POST", body: JSON.stringify({ scope: id, entries }) },
+            { method: "POST", body: JSON.stringify(req) },
             { to: opts.on || "onStamped" },
           );
         },
@@ -154,7 +159,18 @@
      */
     compile(files, opts) {
       opts = opts || {};
-      const body = JSON.stringify({ scope: opts.scope, files });
+      const req = { scope: opts.scope, files };
+      // PM P1: `opts.resolution` = the deploy's `{packages, app_imports}`
+      // lockfile sections (manifest v2 shapes). The engine fetches the
+      // referenced package bytecodes so every `@scope/pkg` import in
+      // `files` resolves — and is VALIDATED — at compile. Pre-stringified
+      // so the native door needn't re-walk dynamic JSON.
+      if (opts.resolution !== undefined)
+        req.resolution = JSON.stringify(opts.resolution);
+      // PM P1: `opts.pkg_hash` compiles the batch as a PACKAGE's files
+      // under `/pkg/<pkg_hash>/…` virtual names (their module identity).
+      if (opts.pkg_hash !== undefined) req.pkg_hash = opts.pkg_hash;
+      const body = JSON.stringify(req);
       // `opts.ctx` threads forward across the compile re-entry — it's echoed
       // in the result as `request.ctx.app` (the bound resume otherwise only
       // surfaces the compile output). Use it to carry e.g. the deploy's

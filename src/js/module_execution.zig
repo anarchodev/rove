@@ -612,20 +612,22 @@ fn pkgDirKey(allocator: std.mem.Allocator, pkg_hash_hex: []const u8) ![]const u8
     return std.fmt.allocPrint(allocator, "/pkg/{s}/", .{pkg_hash_hex});
 }
 
-/// Build a `PackageResolver` from a decoded manifest (PM P1). `app_imports`
-/// becomes the flat app surface; each package's `imports` becomes its
-/// encapsulated per-importer map (keyed by its `/pkg/<hash>/` dir). Values
-/// are entry keys (`/pkg/<dep_hash>/index.mjs`). Caller owns the result —
+/// Build a `PackageResolver` from a manifest's (or a deploy-time
+/// `Resolution`'s) package sections (PM P1). `app_imports` becomes the
+/// flat app surface; each package's `imports` becomes its encapsulated
+/// per-importer map (keyed by its `/pkg/<hash>/` dir). Values are entry
+/// keys (`/pkg/<dep_hash>/index.mjs`). Caller owns the result —
 /// `resolver.deinit(allocator)` frees it. On error, everything allocated
 /// so far is freed.
 pub fn buildResolver(
     allocator: std.mem.Allocator,
-    manifest: *const files_mod.manifest_json.Manifest,
+    packages: []const files_mod.manifest_json.Package,
+    app_imports: []const files_mod.manifest_json.ImportEntry,
 ) !PackageResolver {
     var r = PackageResolver{ .app_imports = .empty, .pkg_imports = .empty };
     errdefer r.deinit(allocator);
 
-    for (manifest.app_imports) |ie| {
+    for (app_imports) |ie| {
         const spec = try allocator.dupe(u8, ie.specifier);
         errdefer allocator.free(spec);
         const key = try pkgEntryKey(allocator, &ie.pkg_hash_hex);
@@ -633,7 +635,7 @@ pub fn buildResolver(
         try r.app_imports.put(allocator, spec, key);
     }
 
-    for (manifest.packages) |p| {
+    for (packages) |p| {
         var inner: std.StringHashMapUnmanaged([]const u8) = .empty;
         // On failure mid-package, free `inner`'s own entries before the
         // outer errdefer (which only knows the packages already in the map).
@@ -736,6 +738,51 @@ fn expectGlobalStr(ctx_raw: ?*c.JSContext, global: c.JSValue, name: [*:0]const u
     try testing.expectEqualStrings(want, @as([*]const u8, @ptrCast(cstr))[0..len]);
 }
 
+test "PM: compile validates resolution but does NOT bake it — same source+filename → identical bytes under different pins" {
+    // quickjs's JS_Eval(COMPILE_ONLY) runs js_resolve_module (normalize +
+    // load every import — compile FAILS if the loader can't serve them),
+    // but JS_WriteModule serializes only the module's OWN name + the
+    // AS-WRITTEN specifiers; JS_ReadModule re-resolves through the live
+    // loader on every load. So bytecode = f(source, filename) — the pin
+    // lives in the snapshot resolver, never in the handler bytes. This
+    // test is the teeth on that claim (pm-compile-cache-fix.md).
+    const a = testing.allocator;
+    const J19 = "b" ** 64;
+    const J14 = "c" ** 64;
+
+    var bc_by_pin: [2][]u8 = undefined;
+    var got: usize = 0;
+    defer for (bc_by_pin[0..got]) |bc| a.free(bc);
+
+    inline for ([_][:0]const u8{ "/pkg/" ++ J19 ++ "/index.mjs", "/pkg/" ++ J14 ++ "/index.mjs" }) |jwt_key| {
+        var rt = try qjs.Runtime.init();
+        defer rt.deinit();
+        var ctx = try rt.newContext();
+        defer ctx.deinit();
+
+        var app_imports: std.StringHashMapUnmanaged([]const u8) = .empty;
+        defer app_imports.deinit(a);
+        try app_imports.put(a, "@rewind/jwt", jwt_key);
+        var resolver = PackageResolver{ .app_imports = app_imports, .pkg_imports = .empty };
+
+        var bytecodes: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
+        defer bytecodes.deinit(a);
+        const dep_bc = try ctx.compileToBytecode("export const v = 1;", jwt_key, a, .{ .kind = .module });
+        defer a.free(dep_bc);
+        var dep_bb = BlobBytes{ .bytes = dep_bc, .hash_hex = @splat('x'), .refcount = std.atomic.Value(u32).init(1) };
+        try bytecodes.put(a, jwt_key, &dep_bb);
+
+        var lctx = module_loader.Ctx{ .allocator = a, .bytecodes = &bytecodes, .resolver = &resolver };
+        c.JS_SetModuleLoaderFunc(rt.raw, module_loader.normalize, module_loader.load, &lctx);
+
+        bc_by_pin[got] = try ctx.compileToBytecode(
+            "import {v} from '@rewind/jwt'; export const out = v;",
+            "index.mjs", a, .{ .kind = .module });
+        got += 1;
+    }
+    try testing.expectEqualSlices(u8, bc_by_pin[0], bc_by_pin[1]);
+}
+
 test "PM P1 fixture smoke: manifest → buildResolver → quickjs resolves an encapsulated multi-version chain" {
     const a = testing.allocator;
     var rt = try qjs.Runtime.init();
@@ -768,14 +815,19 @@ test "PM P1 fixture smoke: manifest → buildResolver → quickjs resolves an en
         "\"app_imports\":{\"@rewind/oidc\":\"" ++ OIDC ++ "\",\"@rewind/jwt\":\"" ++ JWT19 ++ "\"}}";
     var manifest = try files_mod.manifest_json.decode(a, mbytes);
     defer manifest.deinit();
-    var resolver = try buildResolver(a, &manifest);
+    var resolver = try buildResolver(a, manifest.packages, manifest.app_imports);
     defer resolver.deinit(a);
 
-    // quickjs resolves + loads module imports at COMPILE time, so the loader
+    // quickjs resolves + loads module imports at COMPILE time (a validation
+    // gate — compile fails if an import can't resolve), so the loader
     // (resolver + map) must be live before compiling, and packages compile in
-    // dependency order (leaves first). A package compiles under its own
-    // `/pkg/<hash>/` filename so its bare imports normalize in PACKAGE context
-    // (oidc's `@rewind/jwt` → jwt@1.4), baking the resolved key into its bytecode.
+    // dependency order (leaves first). What bakes into the bytes is NOT the
+    // resolved targets (see the bake test above) but the module's OWN name:
+    // a package compiles under its `/pkg/<hash>/` filename so that (a) its
+    // bare imports normalize in PACKAGE context at compile AND at every
+    // runtime load (JS_ReadModule re-resolves with base = the baked name —
+    // oidc's `@rewind/jwt` → jwt@1.4), and (b) the loaded module registers
+    // under the exact key importers resolve to (one instance per version).
     var bytecodes: std.StringHashMapUnmanaged(*BlobBytes) = .empty;
     defer bytecodes.deinit(a);
     var lctx = module_loader.Ctx{ .allocator = a, .bytecodes = &bytecodes, .resolver = &resolver };

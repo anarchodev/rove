@@ -130,6 +130,7 @@ pub fn deployBakedBundle(
         compile_fn,
         compile_ctx,
         inputs,
+        "",
     );
     defer allocator.free(compiled);
 

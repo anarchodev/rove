@@ -22,12 +22,16 @@
 //!   `{bytecode_sha256_hex}`      → serialized quickjs bytecode
 //!
 //! There is deliberately NO source-keyed compile cache. quickjs
-//! resolves module imports at compile time and bakes the resolved
-//! module name into the bytecode, so once packages exist bytecode is a
-//! function of source + resolution — a `source → bytecode` memo would
-//! serve a stale resolution after a re-pin. Every deploy recompiles;
-//! blob PUTs dedup content-addressed (`putBlobIfMissingTo`) and the
-//! runtime `BytecodeCache` dedups in memory by bytecode hash. See
+//! resolves + LOADS every module import at compile time (compile is the
+//! validation gate — it fails when an import can't resolve against the
+//! deploy's package resolution), and it bakes the module's OWN filename
+//! into the bytecode as the base that imports re-resolve against at
+//! every runtime load. So bytecode = f(source, filename) — a
+//! `source → bytecode` memo would skip the per-deploy import validation
+//! and conflate same-source files compiled under different names (a
+//! package vs an app copy). Every deploy recompiles; blob PUTs dedup
+//! content-addressed (`putBlobIfMissingTo`) and the runtime
+//! `BytecodeCache` dedups in memory by bytecode hash. See
 //! docs/plans/pm-compile-cache-fix.md before adding any compile
 //! memoization here.
 //!
@@ -71,6 +75,10 @@ pub const CompileFn = *const fn (
 ) anyerror![]u8;
 
 pub const HASH_HEX_LEN: usize = 64; // sha256 hex
+
+/// Longest `virtual_dir` prefix `compileAndStage` accepts:
+/// `/pkg/` + 64-hex pkg hash + `/`.
+pub const MAX_VIRTUAL_DIR_LEN: usize = 5 + HASH_HEX_LEN + 1;
 
 /// Maximum file path length we'll accept. Keeps key construction bounded
 /// and matches blob-key invariants from rove-blob.
@@ -139,14 +147,24 @@ pub const CompiledFile = struct {
 /// `blob.put`. Bounded to 256 entries; rejects invalid/duplicate paths.
 /// Caller owns the returned slice (free with the same allocator); each
 /// `path` borrows the corresponding input.
+///
+/// `virtual_dir` is the compile-time filename prefix — empty for app
+/// handlers (module name = the deploy path), `/pkg/<pkg_hash>/` for a
+/// package compile (PM P1). The module's own name bakes into its
+/// bytecode and is the base quickjs re-resolves its imports against at
+/// every load, so a package MUST compile under its package-virtual name
+/// (per-importer encapsulation + one-instance-per-version identity);
+/// `path` itself stays relative (validated, and the manifest key).
 pub fn compileAndStage(
     allocator: std.mem.Allocator,
     blob: BlobStore,
     compile: CompileFn,
     compile_ctx: ?*anyopaque,
     inputs: []const DeployInput,
+    virtual_dir: []const u8,
 ) Error![]CompiledFile {
     if (inputs.len > 256) return Error.InvalidManifest;
+    if (virtual_dir.len > MAX_VIRTUAL_DIR_LEN) return Error.InvalidPath;
 
     for (inputs, 0..) |in_a, i| {
         try validatePath(in_a.path);
@@ -164,10 +182,12 @@ pub fn compileAndStage(
         try putBlobIfMissingTo(blob, &src_hex, in.bytes);
 
         // Filename must be NUL-terminated for quickjs.
-        var fname_buf: [MAX_PATH_LEN + 1]u8 = undefined;
-        @memcpy(fname_buf[0..in.path.len], in.path);
-        fname_buf[in.path.len] = 0;
-        const fname: [:0]const u8 = fname_buf[0..in.path.len :0];
+        var fname_buf: [MAX_VIRTUAL_DIR_LEN + MAX_PATH_LEN + 1]u8 = undefined;
+        @memcpy(fname_buf[0..virtual_dir.len], virtual_dir);
+        @memcpy(fname_buf[virtual_dir.len..][0..in.path.len], in.path);
+        const fname_len = virtual_dir.len + in.path.len;
+        fname_buf[fname_len] = 0;
+        const fname: [:0]const u8 = fname_buf[0..fname_len :0];
 
         const bytecode = compile(compile_ctx, in.bytes, fname, allocator) catch
             return Error.CompileFailed;
@@ -439,7 +459,7 @@ test "compileAndStage: stages source + bytecode blobs, returns hashes" {
         .{ .path = "index.mjs", .kind = .handler, .bytes = "export default () => 1;" },
         .{ .path = "api/index.mjs", .kind = .handler, .bytes = "export default () => 2;" },
     };
-    const out = try compileAndStage(a, blob.blobStore(), passthroughCompile, null, &inputs);
+    const out = try compileAndStage(a, blob.blobStore(), passthroughCompile, null, &inputs, "");
     defer a.free(out);
 
     try testing.expectEqual(@as(usize, 2), out.len);
@@ -461,9 +481,9 @@ test "compileAndStage: idempotent — identical inputs yield identical hashes" {
     defer blob.deinit();
     const inputs = [_]DeployInput{.{ .path = "index.mjs", .kind = .handler, .bytes = "x" }};
 
-    const o1 = try compileAndStage(a, blob.blobStore(), passthroughCompile, null, &inputs);
+    const o1 = try compileAndStage(a, blob.blobStore(), passthroughCompile, null, &inputs, "");
     defer a.free(o1);
-    const o2 = try compileAndStage(a, blob.blobStore(), passthroughCompile, null, &inputs);
+    const o2 = try compileAndStage(a, blob.blobStore(), passthroughCompile, null, &inputs, "");
     defer a.free(o2);
     try testing.expectEqualSlices(u8, &o1[0].source_hex, &o2[0].source_hex);
     try testing.expectEqualSlices(u8, &o1[0].bytecode_hex, &o2[0].bytecode_hex);
@@ -474,7 +494,7 @@ test "compileAndStage: compile failure surfaces as CompileFailed" {
     var blob = MemBlobStore.init(a);
     defer blob.deinit();
     const inputs = [_]DeployInput{.{ .path = "bad.mjs", .kind = .handler, .bytes = "syntax(" }};
-    try testing.expectError(Error.CompileFailed, compileAndStage(a, blob.blobStore(), failingCompile, null, &inputs));
+    try testing.expectError(Error.CompileFailed, compileAndStage(a, blob.blobStore(), failingCompile, null, &inputs, ""));
 }
 
 test "compileAndStage: rejects duplicate + traversal paths" {
@@ -485,7 +505,7 @@ test "compileAndStage: rejects duplicate + traversal paths" {
         .{ .path = "index.mjs", .kind = .handler, .bytes = "a" },
         .{ .path = "index.mjs", .kind = .handler, .bytes = "b" },
     };
-    try testing.expectError(Error.InvalidManifest, compileAndStage(a, blob.blobStore(), passthroughCompile, null, &dup));
+    try testing.expectError(Error.InvalidManifest, compileAndStage(a, blob.blobStore(), passthroughCompile, null, &dup, ""));
     const bad = [_]DeployInput{.{ .path = "../x.mjs", .kind = .handler, .bytes = "a" }};
-    try testing.expectError(Error.InvalidPath, compileAndStage(a, blob.blobStore(), passthroughCompile, null, &bad));
+    try testing.expectError(Error.InvalidPath, compileAndStage(a, blob.blobStore(), passthroughCompile, null, &bad, ""));
 }

@@ -16,12 +16,24 @@
 // web/admin app owns the same surface + ownership-gating once deployed.
 //
 // Wire (root bearer, POST JSON):
-//   /v1/deploy/reset  {tenant}                              → clear workspace
-//   /v1/deploy/file   {tenant, path, kind, source | b64,
-//                      content_type?}                       → stage one file
-//   /v1/deploy/cut    {tenant}                              → {ok, dep_id}
+//   /v1/deploy/reset   {tenant}                             → clear workspace
+//   /v1/deploy/file    {tenant, path, kind, source | b64,
+//                       content_type?, resolution?}         → stage one file
+//   /v1/deploy/pkgfile {tenant, pkg_hash, path, source,
+//                       resolution?}                        → stage one PACKAGE file
+//   /v1/deploy/cut     {tenant, resolution?}                → {ok, dep_id}
+//
+// Packages (PM P1): stage each package file via /pkgfile (compiled under
+// its /pkg/<pkg_hash>/ virtual name; dep-bearing packages pass their own
+// `resolution` so imports validate at compile — leaves first). Handler
+// files that import packages pass the deploy's `resolution` on /file.
+// `cut` takes the lockfile `resolution` = {packages:[{spec, version,
+// pkg_hash, imports}], app_imports} — package `files` are filled in
+// server-side from the staged _workspace_pkg rows, then the whole thing
+// bakes into the manifest v2 sections.
 
 const WS = "_workspace/";
+const WSPKG = "_workspace_pkg/";
 
 function jerr(status, msg) {
   response.status = status;
@@ -35,7 +47,9 @@ function wsReset(b) {
   const sk = platform.scope(b.tenant).kv;
   const rows = sk.prefix(WS, "", 1000);
   for (let i = 0; i < rows.length; i++) sk.delete(rows[i].key);
-  return JSON.stringify({ ok: true, cleared: rows.length });
+  const prows = sk.prefix(WSPKG, "", 1000);
+  for (let i = 0; i < prows.length; i++) sk.delete(prows[i].key);
+  return JSON.stringify({ ok: true, cleared: rows.length + prows.length });
 }
 
 // Stage one HANDLER into the workspace: compile (async, bound); onFileStaged
@@ -46,11 +60,49 @@ function wsFile(b) {
   if (!b.tenant || !b.path) return jerr(400, "tenant + path required");
   if (b.kind !== "handler")
     return jerr(400, "kind must be 'handler' (statics stream via PUT /v1/upload)");
-  platform.compile([{ path: b.path, source: b.source || "" }], {
+  const copts = {
     scope: b.tenant, on: "onFileStaged",
     ctx: { target: b.tenant, path: b.path, content_type: b.content_type || "" },
-  });
+  };
+  // A handler that imports packages compiles against the deploy's
+  // resolution (its imports validate at compile — deploy fails loud here,
+  // not at first request).
+  if (b.resolution !== undefined) copts.resolution = b.resolution;
+  platform.compile([{ path: b.path, source: b.source || "" }], copts);
   return next();
+}
+
+// Stage one PACKAGE file: compiled under /pkg/<pkg_hash>/<path> (its
+// module identity), recorded under _workspace_pkg/{pkg_hash}/{path} so
+// `cut` can assemble the manifest's packages[].files.
+function wsPkgFile(b) {
+  if (!b.tenant || !b.pkg_hash || !b.path)
+    return jerr(400, "tenant + pkg_hash + path required");
+  const copts = {
+    scope: b.tenant, pkg_hash: b.pkg_hash, on: "onPkgStaged",
+    ctx: { target: b.tenant, pkg_hash: b.pkg_hash, path: b.path },
+  };
+  if (b.resolution !== undefined) copts.resolution = b.resolution;
+  platform.compile([{ path: b.path, source: b.source || "" }], copts);
+  return next();
+}
+
+export function onPkgStaged() {
+  const ctx = request.ctx;
+  if (!ctx || !ctx.ok) {
+    response.status = 500;
+    return JSON.stringify({ stage: "pkg-compile", ctx: ctx || null });
+  }
+  const app = ctx.app || {};
+  const r = ctx.results[0];
+  platform.scope(app.target).kv.set(WSPKG + app.pkg_hash + "/" + app.path, JSON.stringify({
+    source_hex: r.source_hex, bytecode_hex: r.bytecode_hex,
+  }));
+  response.status = 200;
+  return JSON.stringify({
+    ok: true, pkg_hash: app.pkg_hash, path: app.path,
+    source_hex: r.source_hex, bytecode_hex: r.bytecode_hex,
+  });
 }
 
 export function onFileStaged() {
@@ -73,7 +125,8 @@ export function onFileStaged() {
 // barrier) → dep_id. Does NOT activate (that's the separate /_system/release).
 function wsCut(b) {
   if (!b.tenant) return jerr(400, "tenant required");
-  const rows = platform.scope(b.tenant).kv.prefix(WS, "", 1000);
+  const sk = platform.scope(b.tenant).kv;
+  const rows = sk.prefix(WS, "", 1000);
   if (rows.length === 0) return jerr(400, "workspace empty — nothing to cut");
   const entries = rows.map(function (row) {
     const e = JSON.parse(row.value);
@@ -83,7 +136,33 @@ function wsCut(b) {
       source_hex: e.source_hex, bytecode_hex: e.bytecode_hex || "",
     };
   });
-  platform.scope(b.tenant).deploy.stampManifest(entries, { on: "onCut" });
+  const sopts = { on: "onCut" };
+  // PM P1: join the client's lockfile with the staged package files —
+  // hashes stay server-authoritative (recorded by onPkgStaged).
+  if (b.resolution !== undefined) {
+    const res = { packages: [], app_imports: b.resolution.app_imports || {} };
+    const pkgs = b.resolution.packages || [];
+    for (let i = 0; i < pkgs.length; i++) {
+      const p = pkgs[i];
+      const staged = sk.prefix(WSPKG + p.pkg_hash + "/", "", 1000);
+      if (staged.length === 0)
+        return jerr(400, "package " + p.spec + "@" + p.version + " has no staged files");
+      const files = staged.map(function (row) {
+        const f = JSON.parse(row.value);
+        return {
+          path: row.key.slice((WSPKG + p.pkg_hash + "/").length),
+          source_hash: f.source_hex, bytecode_hash: f.bytecode_hex,
+        };
+      });
+      res.packages.push({
+        spec: p.spec, version: p.version, pkg_hash: p.pkg_hash,
+        files: files, imports: p.imports || {}, capabilities: p.capabilities || [],
+        private: !!p.private,
+      });
+    }
+    sopts.resolution = res;
+  }
+  platform.scope(b.tenant).deploy.stampManifest(entries, sopts);
   return next();
 }
 
@@ -109,6 +188,7 @@ export default function () {
   const p = request.path;
   if (p === "/v1/deploy/reset") return wsReset(b);
   if (p === "/v1/deploy/file") return wsFile(b);
+  if (p === "/v1/deploy/pkgfile") return wsPkgFile(b);
   if (p === "/v1/deploy/cut") return wsCut(b);
   return jerr(404, "unknown deploy route");
 }

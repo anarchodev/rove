@@ -339,6 +339,57 @@ pub fn decode(
     };
 }
 
+/// A deploy-time resolution context (PM P1-deploy): just the `packages` +
+/// `app_imports` sections of a manifest, wire-identical to their v2
+/// manifest shapes. The deploy path carries this alongside a compile
+/// batch so package imports resolve (= are validated + loadable) at
+/// handler-compile time, and alongside a manifest stamp so the sections
+/// bake into the deployment. Owns everything it holds — `deinit` frees.
+pub const Resolution = struct {
+    packages: []Package = &.{},
+    app_imports: []ImportEntry = &.{},
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *Resolution) void {
+        for (self.packages) |p| freePackage(self.allocator, p);
+        self.allocator.free(self.packages);
+        for (self.app_imports) |ie| self.allocator.free(ie.specifier);
+        self.allocator.free(self.app_imports);
+        self.* = undefined;
+    }
+};
+
+/// Decode a `{packages?, app_imports?}` JSON object (the resolution
+/// side-channel of the deploy wire). Absent sections decode empty.
+pub fn decodeResolution(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+) Error!Resolution {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch
+        return Error.InvalidManifest;
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return Error.InvalidManifest,
+    };
+
+    const packages = if (obj.get("packages")) |pv|
+        try parsePackages(allocator, pv)
+    else
+        allocator.alloc(Package, 0) catch return Error.OutOfMemory;
+    errdefer {
+        for (packages) |p| freePackage(allocator, p);
+        allocator.free(packages);
+    }
+
+    const app_imports = if (obj.get("app_imports")) |av|
+        try parseImportMap(allocator, av)
+    else
+        allocator.alloc(ImportEntry, 0) catch return Error.OutOfMemory;
+
+    return .{ .packages = packages, .app_imports = app_imports, .allocator = allocator };
+}
+
 fn freePackage(allocator: std.mem.Allocator, p: Package) void {
     allocator.free(p.spec);
     allocator.free(p.version);

@@ -2547,6 +2547,10 @@ pub fn Worker(comptime opts: Options) type {
                     bytecode_hex: []const u8 = "",
                     content_type: []const u8 = "",
                 },
+                /// PM P1: pre-stringified `{packages, app_imports}` JSON —
+                /// baked verbatim into the manifest's v2 sections (and the
+                /// dep_id). Empty → package-less deployment.
+                resolution: []const u8 = "",
             }, a, pf.body, .{ .ignore_unknown_fields = true }) catch
                 return fail(router, a, &pf, 400, "expected {scope, entries:[...]}");
             defer parsed.deinit();
@@ -2586,8 +2590,19 @@ pub fn Worker(comptime opts: Options) type {
                 entries[i] = e;
             }
 
-            const dep_id = files_mod.manifest_json.computeDeploymentId(entries, &.{}, &.{});
-            const json = files_mod.manifest_json.encode(a, dep_id, entries, &.{}, &.{}) catch
+            var resolution: ?files_mod.manifest_json.Resolution = if (p.resolution.len != 0)
+                (files_mod.manifest_json.decodeResolution(a, p.resolution) catch
+                    return fail(router, a, &pf, 400, "invalid resolution"))
+            else
+                null;
+            defer if (resolution) |*r| r.deinit();
+            const res_packages: []const files_mod.manifest_json.Package =
+                if (resolution) |r| r.packages else &.{};
+            const res_app_imports: []const files_mod.manifest_json.ImportEntry =
+                if (resolution) |r| r.app_imports else &.{};
+
+            const dep_id = files_mod.manifest_json.computeDeploymentId(entries, res_packages, res_app_imports);
+            const json = files_mod.manifest_json.encode(a, dep_id, entries, res_packages, res_app_imports) catch
                 return fail(router, a, &pf, 500, "manifest encode failed");
             // `json` is owned → transferred to the job below (or freed on any
             // dupe/enqueue failure before then).
@@ -2940,6 +2955,13 @@ pub fn Worker(comptime opts: Options) type {
             var parsed = std.json.parseFromSlice(struct {
                 scope: []const u8,
                 files: []const struct { path: []const u8, source: []const u8 },
+                /// PM P1: pre-stringified `{packages, app_imports}` JSON
+                /// (the shim JSON.stringify's it — manifest v2 section
+                /// shapes). Empty → package-less compile.
+                resolution: []const u8 = "",
+                /// PM P1: non-empty → compile the batch as PACKAGE files
+                /// under `/pkg/<pkg_hash>/…` virtual names.
+                pkg_hash: []const u8 = "",
             }, a, pf.body, .{ .ignore_unknown_fields = true }) catch
                 return fail(router, a, &pf, 400, "expected {scope, files:[{path,source}]}");
             defer parsed.deinit();
@@ -2947,6 +2969,14 @@ pub fn Worker(comptime opts: Options) type {
             if (p.scope.len == 0) return fail(router, a, &pf, 400, "scope required");
             if (p.files.len == 0) return fail(router, a, &pf, 400, "at least one file required");
             if (p.files.len > 256) return fail(router, a, &pf, 400, "too many files (max 256)");
+            if (p.pkg_hash.len != 0) {
+                if (p.pkg_hash.len != files_mod.HASH_HEX_LEN)
+                    return fail(router, a, &pf, 400, "pkg_hash must be 64 hex chars");
+                for (p.pkg_hash) |ch| {
+                    const hex_ok = (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f');
+                    if (!hex_ok) return fail(router, a, &pf, 400, "pkg_hash must be 64 hex chars");
+                }
+            }
 
             // Build owned DeployInput[] (all handlers).
             const inputs = a.alloc(files_mod.DeployInput, p.files.len) catch
@@ -3017,6 +3047,31 @@ pub fn Worker(comptime opts: Options) type {
                 })
             else
                 &.{};
+            const resolution_owned: []u8 = if (p.resolution.len != 0)
+                (a.dupe(u8, p.resolution) catch {
+                    a.free(scope_owned);
+                    a.free(chain_owned);
+                    a.free(fid_owned);
+                    if (name_owned.len != 0) a.free(name_owned);
+                    if (app_ctx_owned.len != 0) a.free(app_ctx_owned);
+                    freeInputs(a, inputs, built);
+                    return fail(router, a, &pf, 500, "out of memory");
+                })
+            else
+                &.{};
+            const pkg_hash_owned: []u8 = if (p.pkg_hash.len != 0)
+                (a.dupe(u8, p.pkg_hash) catch {
+                    a.free(scope_owned);
+                    a.free(chain_owned);
+                    a.free(fid_owned);
+                    if (name_owned.len != 0) a.free(name_owned);
+                    if (app_ctx_owned.len != 0) a.free(app_ctx_owned);
+                    if (resolution_owned.len != 0) a.free(resolution_owned);
+                    freeInputs(a, inputs, built);
+                    return fail(router, a, &pf, 500, "out of memory");
+                })
+            else
+                &.{};
 
             self.next_compile_id += 1;
             dt.enqueue(.{
@@ -3028,12 +3083,16 @@ pub fn Worker(comptime opts: Options) type {
                 .fetch_id = fid_owned,
                 .name = name_owned,
                 .app_ctx = app_ctx_owned,
+                .resolution_json = resolution_owned,
+                .pkg_hash = pkg_hash_owned,
             }) catch {
                 a.free(scope_owned);
                 a.free(chain_owned);
                 a.free(fid_owned);
                 if (name_owned.len != 0) a.free(name_owned);
                 if (app_ctx_owned.len != 0) a.free(app_ctx_owned);
+                if (resolution_owned.len != 0) a.free(resolution_owned);
+                if (pkg_hash_owned.len != 0) a.free(pkg_hash_owned);
                 freeInputs(a, inputs, built);
                 return fail(router, a, &pf, 503, "deploy queue unavailable");
             };

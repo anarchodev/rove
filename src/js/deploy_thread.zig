@@ -38,6 +38,8 @@ const files_mod = @import("rove-files");
 const qjs = @import("rove-qjs");
 const components_mod = @import("components.zig");
 const msg_router_mod = @import("msg_router.zig");
+const module_execution = @import("module_execution.zig");
+const bytecode_cache_mod = @import("bytecode_cache.zig");
 
 /// The trusted-door origin the `platform.compile` shim's `on.fetch`
 /// stamps on its PendingFetch. Never reaches libcurl — `interpretCmd`
@@ -142,6 +144,18 @@ pub const DeployThread = struct {
         payload: []u8 = &.{},
         /// manifest_put: the dep_id to carry in the bound completion event.
         dep_id: u64 = 0,
+        // ── compile_batch package context (PM P1) ──
+        /// Raw `{packages, app_imports}` JSON (the manifest v2 section
+        /// shapes) — the deploy's resolution side-channel. Referenced
+        /// package bytecodes are fetched into the compile loader's map so
+        /// every import resolves (= is validated) at compile. Empty → no
+        /// packages in play. Owned.
+        resolution_json: []u8 = &.{},
+        /// Non-empty → this batch compiles a PACKAGE's files: each input
+        /// compiles under its `/pkg/<pkg_hash>/<path>` virtual name (the
+        /// module's baked identity + runtime resolution base). 64-hex,
+        /// validated at the submit door. Owned.
+        pkg_hash: []u8 = &.{},
     };
 
     pub fn init(
@@ -193,27 +207,22 @@ pub const DeployThread = struct {
     }
 
     fn threadMain(self: *DeployThread) void {
-        // One compiler runtime/context for the whole thread lifetime,
-        // created on (and used only by) this thread. `null` if init
-        // fails — every job then resolves to a 500 "compiler
-        // unavailable" instead of hanging the parked request to its
-        // deadline.
+        // One compiler runtime for the whole thread lifetime, created on
+        // (and used only by) this thread. `null` if init fails — every
+        // job then resolves to a 500 "compiler unavailable" instead of
+        // hanging the parked request to its deadline. The CONTEXT is
+        // per-job (`processCompileBatch`): quickjs registers every
+        // compiled/loaded module in the context's module table, so a
+        // long-lived context would leak modules across jobs and let a
+        // stale same-name module from one tenant's batch satisfy (or
+        // pollute) another's import resolution.
         var rt_opt: ?qjs.Runtime = qjs.Runtime.init() catch |err| blk: {
             std.log.err("deploy thread: qjs runtime init failed: {s}", .{@errorName(err)});
             break :blk null;
         };
         defer if (rt_opt) |*rt| rt.deinit();
 
-        var ctx_opt: ?qjs.Context = if (rt_opt) |*rt|
-            (rt.newContext() catch |err| blk: {
-                std.log.err("deploy thread: qjs context init failed: {s}", .{@errorName(err)});
-                break :blk null;
-            })
-        else
-            null;
-        defer if (ctx_opt) |*c| c.deinit();
-
-        const ctx_ptr: ?*qjs.Context = if (ctx_opt) |*c| c else null;
+        const rt_ptr: ?*qjs.Runtime = if (rt_opt) |*rt| rt else null;
 
         while (!self.stop.load(.acquire)) {
             self.wake.wait();
@@ -222,7 +231,7 @@ pub const DeployThread = struct {
             while (self.popOne()) |job_val| {
                 var job = job_val;
                 switch (job.kind) {
-                    .compile_batch => self.processCompileBatch(ctx_ptr, &job),
+                    .compile_batch => self.processCompileBatch(rt_ptr, &job),
                     .manifest_put => self.processManifestPut(&job),
                 }
                 freeJob(self.allocator, &job);
@@ -261,7 +270,7 @@ pub const DeployThread = struct {
     /// terminal `UpstreamFetchEvent` through the router to resume the held
     /// chain on the CHAIN tenant (the `blob_receive` pattern). The hashes
     /// (or an error) ride `ctx_json` → the resume export's `request.ctx`.
-    fn processCompileBatch(self: *DeployThread, ctx_ptr: ?*qjs.Context, job: *Job) void {
+    fn processCompileBatch(self: *DeployThread, rt_ptr: ?*qjs.Runtime, job: *Job) void {
         const router = self.router orelse {
             std.log.err("deploy thread: compile_batch with no router; held chain id={s} will reap on deadline", .{job.fetch_id});
             return;
@@ -275,7 +284,13 @@ pub const DeployThread = struct {
             }
         }.emit;
 
-        const ctx = ctx_ptr orelse return fail(self, router, job, 500, "compiler unavailable");
+        const rt = rt_ptr orelse return fail(self, router, job, 500, "compiler unavailable");
+        // Fresh context per job — hermetic module table (see threadMain).
+        var jctx = rt.newContext() catch |err| {
+            std.log.err("deploy thread: qjs context init failed: {s}", .{@errorName(err)});
+            return fail(self, router, job, 500, "compiler unavailable");
+        };
+        defer jctx.deinit();
 
         var file_be = blob_mod.BlobBackend.openPerTenant(a, self.blob_cfg, job.tenant_id, "file-blobs") catch |err| {
             std.log.warn("deploy thread: open file-blobs for {s} failed: {s}", .{ job.tenant_id, @errorName(err) });
@@ -283,7 +298,83 @@ pub const DeployThread = struct {
         };
         defer file_be.deinit();
 
-        const compiled = files_mod.compileAndStage(a, file_be.blobStore(), compileThunk, ctx, job.inputs) catch |err| {
+        // PM P1: stage the job's resolution context BEFORE compiling.
+        // quickjs resolves + loads every import at compile (the deploy's
+        // import-validation gate), so the loader must be able to serve the
+        // referenced package bytecodes. Map values are job-local heap
+        // blobs, freed on the way out.
+        var pkg_bc: std.StringHashMapUnmanaged(*bytecode_cache_mod.BlobBytes) = .empty;
+        defer {
+            var it = pkg_bc.iterator();
+            while (it.next()) |e| {
+                a.free(e.value_ptr.*.bytes);
+                a.destroy(e.value_ptr.*);
+                a.free(e.key_ptr.*);
+            }
+            pkg_bc.deinit(a);
+        }
+        var resolver: ?module_execution.PackageResolver = null;
+        defer if (resolver) |*r| r.deinit(a);
+
+        if (job.resolution_json.len != 0) {
+            var resolution = files_mod.manifest_json.decodeResolution(a, job.resolution_json) catch
+                return fail(self, router, job, 400, "invalid resolution");
+            defer resolution.deinit();
+            resolver = module_execution.buildResolver(a, resolution.packages, resolution.app_imports) catch
+                return fail(self, router, job, 500, "out of memory");
+
+            const bs = file_be.blobStore();
+            for (resolution.packages) |p| {
+                for (p.files) |f| {
+                    const key = std.fmt.allocPrint(a, "/pkg/{s}/{s}", .{ &p.pkg_hash_hex, f.path }) catch
+                        return fail(self, router, job, 500, "out of memory");
+                    if (pkg_bc.contains(key)) {
+                        // Same pkg_hash listed twice — content-identical.
+                        a.free(key);
+                        continue;
+                    }
+                    const bytes = bs.get(&f.bytecode_hex, a) catch {
+                        std.log.warn("deploy thread: package bytecode {s} for {s} not staged", .{ &f.bytecode_hex, key });
+                        a.free(key);
+                        return fail(self, router, job, 400, "package bytecode not staged");
+                    };
+                    const bb = a.create(bytecode_cache_mod.BlobBytes) catch {
+                        a.free(key);
+                        a.free(bytes);
+                        return fail(self, router, job, 500, "out of memory");
+                    };
+                    bb.* = .{ .bytes = bytes, .hash_hex = f.bytecode_hex, .refcount = std.atomic.Value(u32).init(1) };
+                    pkg_bc.put(a, key, bb) catch {
+                        a.free(key);
+                        a.free(bytes);
+                        a.destroy(bb);
+                        return fail(self, router, job, 500, "out of memory");
+                    };
+                }
+            }
+        }
+
+        // Install the module loader for this job's compile calls, and
+        // clear it before `lctx` (stack) goes out of scope.
+        var lctx = module_execution.module_loader.Ctx{
+            .allocator = a,
+            .bytecodes = &pkg_bc,
+            .resolver = if (resolver) |*r| r else null,
+        };
+        qjs.c.JS_SetModuleLoaderFunc(rt.raw, module_execution.module_loader.normalize, module_execution.module_loader.load, &lctx);
+        defer qjs.c.JS_SetModuleLoaderFunc(rt.raw, null, null, null);
+
+        // A package batch compiles each file under its package-virtual
+        // name — the module's baked identity + the base its own imports
+        // (re-)resolve against, at compile and at every runtime load.
+        var vdir_buf: [files_mod.MAX_VIRTUAL_DIR_LEN]u8 = undefined;
+        const virtual_dir: []const u8 = if (job.pkg_hash.len != 0)
+            std.fmt.bufPrint(&vdir_buf, "/pkg/{s}/", .{job.pkg_hash}) catch
+                return fail(self, router, job, 400, "invalid pkg_hash")
+        else
+            "";
+
+        const compiled = files_mod.compileAndStage(a, file_be.blobStore(), compileThunk, &jctx, job.inputs, virtual_dir) catch |err| {
             std.log.warn("deploy thread: compile-batch scope={s} (compile {d}) failed: {s}", .{ job.tenant_id, job.compile_id, @errorName(err) });
             const status: u16, const msg: []const u8 = switch (err) {
                 error.CompileFailed => .{ 400, "compile failed" },
@@ -404,6 +495,9 @@ fn freeJob(allocator: std.mem.Allocator, job: *DeployThread.Job) void {
     // *_put-only payload (empty `&.{}` for other kinds).
     if (job.key.len != 0) allocator.free(job.key);
     if (job.payload.len != 0) allocator.free(job.payload);
+    // compile_batch package context (PM P1).
+    if (job.resolution_json.len != 0) allocator.free(job.resolution_json);
+    if (job.pkg_hash.len != 0) allocator.free(job.pkg_hash);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────

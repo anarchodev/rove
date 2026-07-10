@@ -1464,7 +1464,7 @@ fn reloadDeployment(slot: *TenantSlot, dep_id: u64) !void {
     // resolves exactly as pre-PM.
     var next_resolver: ?module_execution.PackageResolver =
         if (manifest.packages.len > 0 or manifest.app_imports.len > 0)
-            try module_execution.buildResolver(allocator, &manifest)
+            try module_execution.buildResolver(allocator, manifest.packages, manifest.app_imports)
         else
             null;
     errdefer if (next_resolver) |*r| r.deinit(allocator);
