@@ -3453,6 +3453,7 @@ pub fn runResume(
         bc,
         &tc.snap.bytecodes,
         &tc.snap.source_hashes,
+        if (tc.snap.resolver) |*r| r else null,
         &.{ .triggers = tc.snap.triggers, .subscriptions = tc.snap.subscriptions },
         request,
         budget,
