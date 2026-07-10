@@ -361,6 +361,29 @@ defense-in-depth.** Every privileged native self-gates (`is_system_module`
   §6.4 arrives with the mechanism.
 - **Frozen primitives are un-overridable** — `overrides` cannot retarget
   `@rewind/webhook`/`@rewind/wake`; the resolver rejects it.
+- **LOCKED (2026-07-09): the platform never accepts bytecode — only
+  source.** quickjs's bytecode reader (`JS_ReadObject`) is not hardened
+  against adversarial input; crafted bytecode is a sandbox-escape
+  primitive, so bytecode is trusted-input-only by construction:
+  - Every ingestion wire takes SOURCE and compiles engine-side
+    (`platform.compile` / `/v1/deploy/pkgfile`) — true today; keep it
+    that way. P-Reg accepts source only; publish-time compilation runs
+    on the platform, never the author's machine. A lockfile/manifest
+    `bytecode_hash` is a *reference to platform-compiled output*, never
+    an upload.
+  - **Known gap (hash-laundering), to close with the `bc/` prefix
+    split:** uploads (statics via `blob.receive`) and compiled bytecode
+    both land content-addressed in the same per-tenant `file-blobs`
+    namespace, so a manifest that references an uploaded blob's hash as
+    `bytecode_hash` would get attacker bytes into `JS_ReadObject`.
+    Today this is gated by trust (manifest stamping is admin-door-only
+    and the deploy apps only stamp engine-returned hashes) — vigilance,
+    not teeth. The fix: engine-produced bytecode PUTs under a `bc/`
+    key prefix that no upload path can write, and every bytecode fetch
+    (loader, deploy thread, snapshot populator) reads ONLY `bc/{hash}`
+    — then "referenced bytecode is compiler output" holds by
+    construction. Storage-layout change: pre-launch, no back-compat —
+    wipe + re-genesis dev clusters, coordinate the prod re-genesis.
 
 ---
 
