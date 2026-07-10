@@ -221,9 +221,26 @@ class Scenario {
     // closed: a run is admin only when opted in, so a non-admin handler that
     // touches `platform.*` throws — like prod. Carried as a hidden reserved key.
     this.admin = cfg.admin || false;
+    // Per-chain identity the engine pins on EVERY activation (worker-set in
+    // prod). `tenant` is this handler's tenant id; `correlationId` is minted by
+    // inbound and inherited by every resume — so it's scenario-level (set once,
+    // threads through inbound → frame → fetch/receive resumes, like the ctx). A
+    // per-activation `inbound({ correlationId })` override is honored over these.
+    this.tenant = cfg.tenant != null ? cfg.tenant : null;
+    this.correlationId = cfg.correlationId != null ? cfg.correlationId : null;
     this.now = toMs(cfg.now);
     this.seed = cfg.seed || 0;
     this.entry = cfg.entry || "index.mjs";
+  }
+
+  /** Stamp the scenario's per-chain identity onto a world's `request`, without
+   *  clobbering a per-activation override already present. */
+  _stampIdentity(w) {
+    if (this.tenant == null && this.correlationId == null) return w;
+    const r = (w.request = w.request || {});
+    if (this.tenant != null && r.tenant === undefined) r.tenant = this.tenant;
+    if (this.correlationId != null && r.correlationId === undefined) r.correlationId = this.correlationId;
+    return w;
   }
 
   _base(partial) {
@@ -245,7 +262,7 @@ class Scenario {
         path, kind: "handler", source: this.inlineSources[path],
       }));
     }
-    return w;
+    return this._stampIdentity(w);
   }
 
   /** An inbound HTTP activation → the root node. If the app has a
@@ -263,6 +280,9 @@ class Scenario {
         body: req.body,
         ip: req.ip,
         session: req.session,
+        // Per-activation override (undefined ⇒ inherit the scenario default).
+        tenant: req.tenant,
+        correlationId: req.correlationId,
       },
     }));
   }
@@ -284,6 +304,8 @@ class Scenario {
         headers: req.headers || {},
         ip: req.ip,
         session: req.session,
+        tenant: req.tenant,
+        correlationId: req.correlationId,
       },
     });
     // onHeaders normally carries no ctx; thread one only if the caller supplies
@@ -839,6 +861,15 @@ class Interleaving {
 function carrySources(parentWorld, world) {
   if (parentWorld.source_dir) world.source_dir = parentWorld.source_dir;
   if (parentWorld.sources) world.sources = parentWorld.sources;
+  // Per-chain identity (tenant / correlation_id) threads to every resume, like
+  // the connection ctx — inbound mints, resumes inherit. The parent world always
+  // carries it (stamped at construction), so copy it into the resume's request.
+  const pr = parentWorld.request || {};
+  if (pr.tenant !== undefined || pr.correlationId !== undefined) {
+    const r = (world.request = world.request || {});
+    if (pr.tenant !== undefined && r.tenant === undefined) r.tenant = pr.tenant;
+    if (pr.correlationId !== undefined && r.correlationId === undefined) r.correlationId = pr.correlationId;
+  }
   return world;
 }
 

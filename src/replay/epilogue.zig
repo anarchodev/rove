@@ -48,6 +48,10 @@ pub const Opts = struct {
     activation_json: ?[]const u8 = null,
     /// Injected `request.session` as JSON text (worker-resolved in prod).
     session_json: ?[]const u8 = null,
+    /// Per-chain identity the engine pins on every activation → `request.tenant`
+    /// / `request.correlation_id`. Plain strings (null → not set).
+    tenant: ?[]const u8 = null,
+    correlation_id: ?[]const u8 = null,
     /// Run the tenant's real `_middlewares/index.mjs` `before` ahead of the
     /// handler (inbound trust boundary only) — it may mutate `request` (e.g.
     /// `request.auth`) or short-circuit. Set by the caller iff the middleware
@@ -185,6 +189,10 @@ pub fn build(a: std.mem.Allocator, opts: Opts) ![]u8 {
     try w.writeAll(opts.activation_json orelse "null");
     try w.writeAll(",\"session\":");
     try w.writeAll(opts.session_json orelse "null");
+    try w.writeAll(",\"tenant\":");
+    if (opts.tenant) |t| try jsonStr(w, t) else try w.writeAll("null");
+    try w.writeAll(",\"correlationId\":");
+    if (opts.correlation_id) |cid| try jsonStr(w, cid) else try w.writeAll("null");
     try w.writeAll(",\"result\":");
     if (opts.result) |r| {
         try w.writeAll("{\"status\":");
@@ -298,6 +306,10 @@ const EPILOGUE_BODY =
     \\  if (D.ctx !== null) request.ctx = D.ctx;
     \\  // Injected request.session (worker-resolved in prod — no code to run).
     \\  if (D.session !== null) request.session = D.session;
+    \\  // Per-chain identity the engine pins (worker-set — no code to run): the
+    \\  // handler's tenant id and the correlation id inbound mints + resumes inherit.
+    \\  if (D.tenant !== null) request.tenant = D.tenant;
+    \\  if (D.correlationId !== null) request.correlation_id = D.correlationId;
     \\  if (D.activation !== null) {
     \\    // A binary WS frame carries its bytes as base64 → rebuild the
     \\    // Uint8Array on request.activation.data (a text frame keeps its string).

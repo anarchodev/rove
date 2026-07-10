@@ -71,6 +71,13 @@ expect(req).toHaveFetched(/stripe/);
 - `rootToken` — the operator token `platform.auth.checkRootToken` validates against.
 - `admin` — mark the run as the admin handler so `platform.*` is allowed. It's
   admin-only and **off by default**, so a normal handler that touches it throws.
+- `tenant` / `correlationId` — the per-chain identity the engine pins on every
+  activation (`request.tenant` and `request.correlation_id`). The worker sets them
+  in prod — inbound mints the correlation id, every resume inherits it — so a
+  scenario supplies them once and they thread through inbound → WS frame →
+  fetch/receive resumes automatically. Set them when a handler branches on the
+  per-connection identity (e.g. `browser.getReplay`, which needs both). A single
+  activation can override with `inbound({ correlationId })`.
 
 ## A node's surface
 

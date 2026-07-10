@@ -237,6 +237,8 @@ pub const Engine = struct {
             .ctx_json = wv.ctx_json,
             .activation_json = wv.activation_json,
             .session_json = wv.session_json,
+            .tenant = wv.tenant,
+            .correlation_id = wv.correlation_id,
             .run_middleware = run_middleware,
             .result = result,
         });
