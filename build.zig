@@ -1356,6 +1356,7 @@ pub fn build(b: *std.Build) void {
         "src/replay/testdata/utf8body", // multibyte UTF-8 request body round-trips (json/text/bytes)
         "src/replay/testdata/platformkv", // platform.scope(id)/root per-store kv isolation
         "src/replay/testdata/roottoken", // platform.auth.checkRootToken validates the configured token
+        "src/replay/testdata/platformadmin", // platform.* admin-only gating (fail-closed)
     };
     for (test_dirs) |dir| {
         const run = b.addRunArtifact(cli_exe);

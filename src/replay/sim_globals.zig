@@ -181,6 +181,14 @@ const SYSTEM_SHIM =
     \\      prefix: function(p, cursor, limit){ var r = globalThis.kv.prefix(P + (p || ""), cursor, limit); push({ kind: "read", op: "prefix", store: tag, key: (p || "") }); return (r || []).map(function(e){ return { key: e.key.slice(P.length), value: e.value }; }); },
     \\    };
     \\  };
+    \\  // platform.* is admin-only (prod: throws off the `__admin__` handler). Fail
+    \\  // closed — every sync method is gated unless the run is flagged admin
+    \\  // (`scenario({ admin: true })` → the hidden `__rove_store/admin` key). Note
+    \\  // `platform.compile` is NOT gated here: it lowers to a bound fetch (via the
+    \\  // real platform.js over `_system.after`), admin-checked door-side in prod.
+    \\  var GATE_MSG = "platform is only available on the admin handler";
+    \\  var gate = function(fn){ return function(){ if (globalThis.kv.get(NS_STORE + "admin") !== "1") throw new TypeError(GATE_MSG); return fn.apply(null, arguments); }; };
+    \\  var rootStore_r = storeKv(NS_STORE + "r/", "r");
     \\  globalThis._system = {
     \\    crypto: {
     \\      getRandomValues: function(a){ return nat.getRandomValues(a); },
@@ -219,14 +227,16 @@ const SYSTEM_SHIM =
     \\    platform: {
     \\      // scope(id).kv → instance `id`'s isolated store; `blob` is a bare object
     \\      // the real platform.js augments (receive/get). root → the __root__ store.
-    \\      scope: function(id){ push({ kind: "platform", op: "scope", id: id }); return { kv: storeKv(NS_STORE + "i/" + id + "/", "i/" + id), blob: {} }; },
-    \\      root: storeKv(NS_STORE + "r/", "r"),
-    \\      instances: { create: function(spec){ push({ kind: "platform", op: "instances.create", spec: spec }); return (spec && spec.id) || "inst_sim"; }, deployStarter: function(){ push({ kind: "platform", op: "instances.deployStarter" }); } },
-    \\      releases: { publish: function(){ push({ kind: "platform", op: "releases.publish" }); } },
+    \\      // Each is admin-gated (see `gate` above); the returned scope/root handle
+    \\      // is then a granted capability (its ops aren't re-checked).
+    \\      scope: gate(function(id){ push({ kind: "platform", op: "scope", id: id }); return { kv: storeKv(NS_STORE + "i/" + id + "/", "i/" + id), blob: {} }; }),
+    \\      root: { get: gate(rootStore_r.get), set: gate(rootStore_r.set), delete: gate(rootStore_r.delete), prefix: gate(rootStore_r.prefix) },
+    \\      instances: { create: gate(function(spec){ push({ kind: "platform", op: "instances.create", spec: spec }); return (spec && spec.id) || "inst_sim"; }), deployStarter: gate(function(){ push({ kind: "platform", op: "instances.deployStarter" }); }) },
+    \\      releases: { publish: gate(function(){ push({ kind: "platform", op: "releases.publish" }); }) },
     \\      // checkRootToken(token) → true iff it matches the operator root token
     \\      // (env-supplied in prod); the sim carries it as a hidden reserved kv key
     \\      // seeded by `scenario({ rootToken })`. Unconfigured → nothing is root.
-    \\      auth: { checkRootToken: function(token){ var rt = globalThis.kv.get(NS_STORE + "auth/token"); var ok = (typeof rt === "string" && rt.length > 0 && token === rt); push({ kind: "platform", op: "auth.checkRootToken", ok: ok }); return ok; } },
+    \\      auth: { checkRootToken: gate(function(token){ var rt = globalThis.kv.get(NS_STORE + "auth/token"); var ok = (typeof rt === "string" && rt.length > 0 && token === rt); push({ kind: "platform", op: "auth.checkRootToken", ok: ok }); return ok; }) },
     \\    },
     \\  };
     \\})();

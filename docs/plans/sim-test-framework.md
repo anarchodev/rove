@@ -481,8 +481,12 @@ too. Fixtures `testdata/{authsurface,middleware}`.
   .checkRootToken(token)` also now validates against the configured operator root
   token — seed it with `scenario({ rootToken })` (a hidden reserved kv key);
   unconfigured → nothing authenticates as root. Fixture `testdata/roottoken/`.
-  Remaining `platform.*` gap: no admin-only gating (every method is callable in
-  the single-tenant closed world, where prod throws off the admin handler).
+  `platform.*` is also **admin-gated, fail-closed**: every sync method throws
+  `TypeError("platform is only available on the admin handler")` unless the run
+  opts in with `scenario({ admin: true })` (a hidden `__rove_store/admin` key),
+  matching prod's `__admin__`-only rule; `platform.compile` stays ungated (it
+  lowers to a bound fetch, admin-checked door-side). Fixture
+  `testdata/platformadmin/`.
 - ~~**Request-body UTF-8 gap.**~~ — FIXED. The sim reconstructed an inline request
   body as a *latin1 byte* string (`D.body.charCodeAt(i) & 0xff` in `epilogue.zig`),
   so a JSON body with multibyte UTF-8 (e.g. `"✓"` → byte `0x13`) corrupted

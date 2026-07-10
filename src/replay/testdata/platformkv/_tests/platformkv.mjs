@@ -5,6 +5,7 @@
 import { scenario, expect } from "rewind:test";
 
 const s = scenario({
+  admin: true, // platform.* is admin-only
   kv: { "seed-own": "own-seed" },
   instances: { acme: { kv: { profile: "acme-old" } } },
   root: { kv: { cfg: "root-old" } },

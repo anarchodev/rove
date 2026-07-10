@@ -3,7 +3,7 @@
 // always succeeding, so an admin gate can actually be tested for rejection.
 import { scenario, expect } from "rewind:test";
 
-const s = scenario({ rootToken: "s3cret" });
+const s = scenario({ admin: true, rootToken: "s3cret" }); // platform.* is admin-only
 
 // Correct token → admitted.
 const good = s.inbound({ method: "GET", path: "/admin", headers: { "x-root-token": "s3cret" } });
@@ -19,8 +19,9 @@ expect(bad.body.ok).toBe(false);
 const none = s.inbound({ method: "GET", path: "/admin", headers: {} });
 expect(none.status).toBe(403);
 
-// No root token configured → nothing authenticates, even the "right" string.
-const unconf = scenario({}).inbound({ method: "GET", path: "/admin", headers: { "x-root-token": "s3cret" } });
+// Admin handler but no root token configured → nothing authenticates, even the
+// "right" string.
+const unconf = scenario({ admin: true }).inbound({ method: "GET", path: "/admin", headers: { "x-root-token": "s3cret" } });
 expect(unconf.status).toBe(403);
 
 // The check surfaces its result in the effect log.

@@ -217,6 +217,10 @@ class Scenario {
     // (env-supplied in prod). Carried as a hidden reserved kv key; unset → nothing
     // authenticates as root.
     this.rootToken = cfg.rootToken || null;
+    // `platform.*` is admin-only (prod throws off the `__admin__` handler). Fail
+    // closed: a run is admin only when opted in, so a non-admin handler that
+    // touches `platform.*` throws — like prod. Carried as a hidden reserved key.
+    this.admin = cfg.admin || false;
     this.now = toMs(cfg.now);
     this.seed = cfg.seed || 0;
     this.entry = cfg.entry || "index.mjs";
@@ -230,6 +234,7 @@ class Scenario {
     }
     for (const k of Object.keys(this.rootKv)) kv["__rove_store/r/" + k] = this.rootKv[k];
     if (this.rootToken) kv["__rove_store/auth/token"] = this.rootToken;
+    if (this.admin) kv["__rove_store/admin"] = "1";
     const w = Object.assign(
       { entry: this.entry, seed: this.seed, now_ms: this.now, kv },
       partial,
