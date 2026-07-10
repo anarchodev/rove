@@ -39,14 +39,12 @@
 const std = @import("std");
 const root = @import("root.zig");
 
-/// `v:1` = handlers/statics only (the historical shape). `v:2` adds the
-/// optional `packages` / `app_imports` sections (package manager P0).
-/// `encode` emits v1 when a deployment carries no packages, so
-/// package-less deploys stay byte-identical (and dep_id-identical) to
-/// pre-PM; v2 only appears once packages are present. `decode` accepts
-/// both.
-pub const VERSION_LEGACY: u32 = 1;
-pub const VERSION_LATEST: u32 = 2;
+/// `v:2` — handlers/statics + the optional `packages` / `app_imports`
+/// sections (package manager P0). No v1 back-compat: the package-manager
+/// rollout is a complete redeploy (pre-launch, no customers), so the
+/// decoder rejects anything that isn't v2 and `encode` always emits v2.
+/// (A package-less deploy is simply a v2 manifest with no `packages`.)
+pub const VERSION: u32 = 2;
 
 pub const Error = error{
     InvalidManifest,
@@ -131,17 +129,10 @@ pub fn encode(
     errdefer buf.deinit(allocator);
     var w = buf.writer(allocator);
 
-    // Package-less deploys stay v1 → byte-identical to pre-PM (and, with
-    // the packages-gated `computeDeploymentId`, dep_id-identical too).
-    const v = if (packages.len == 0 and app_imports.len == 0) VERSION_LEGACY else VERSION_LATEST;
-
     // dep_id is a content-addressed u64 (truncated sha-256). High-
     // bit-set hashes don't fit cleanly in JSON `integer` (i64 in the
     // std.json parser) so encode as a 16-char zero-padded hex string.
-    // Wire-incompatible with the pre-2026-05-13 number format —
-    // existing manifests in S3 from before that cutover need a
-    // re-deploy. Acceptable pre-launch.
-    try w.print("{{\"v\":{d},\"deployment_id\":\"{x:0>16}\",\"entries\":[", .{ v, dep_id });
+    try w.print("{{\"v\":{d},\"deployment_id\":\"{x:0>16}\",\"entries\":[", .{ VERSION, dep_id });
     for (entries, 0..) |e, i| {
         if (i > 0) try w.writeByte(',');
         const kind_str: []const u8 = if (e.kind == .handler) "handler" else "static";
@@ -232,9 +223,7 @@ pub fn decode(
         .integer => |i| i,
         else => return Error.InvalidManifest,
     };
-    if (v_num != @as(i64, VERSION_LEGACY) and v_num != @as(i64, VERSION_LATEST)) {
-        return Error.InvalidManifest;
-    }
+    if (v_num != @as(i64, VERSION)) return Error.InvalidManifest;
 
     const id_val = obj.get("deployment_id") orelse return Error.InvalidManifest;
     const id_str = switch (id_val) {
@@ -591,11 +580,10 @@ pub fn computeDeploymentId(
         hasher.update(&.{0});
     }
 
-    // Packages / app_imports fold in ONLY when present, so a package-less
-    // deployment hashes byte-for-byte as it did pre-PM → dep_id unchanged
-    // across the whole existing fleet. `pkg_hash` is the package's content
-    // identity (over its files + imports), so hashing (spec, version,
-    // pkg_hash) captures each package version fully — no nested sort.
+    // `pkg_hash` is the package's content identity (over its files +
+    // imports), so hashing (spec, version, pkg_hash) captures each package
+    // version fully — no nested sort. Skipped entirely when there are no
+    // packages (cheap common case).
     if (packages.len > 0 or app_imports.len > 0) {
         var pkg_idx: [256]usize = undefined;
         std.debug.assert(packages.len <= pkg_idx.len);
@@ -686,14 +674,14 @@ test "decode rejects wrong version" {
 }
 
 test "decode rejects missing bytecode_hash on handler" {
-    const bytes = "{\"v\":1,\"deployment_id\":\"0000000000000001\",\"entries\":[" ++
+    const bytes = "{\"v\":2,\"deployment_id\":\"0000000000000001\",\"entries\":[" ++
         "{\"path\":\"x.mjs\",\"kind\":\"handler\",\"content_type\":\"\"," ++
         "\"hash\":\"" ++ ("a" ** 64) ++ "\"}]}";
     try testing.expectError(Error.InvalidManifest, decode(testing.allocator, bytes));
 }
 
 test "decode allows missing bytecode_hash on static" {
-    const bytes = "{\"v\":1,\"deployment_id\":\"0000000000000001\",\"entries\":[" ++
+    const bytes = "{\"v\":2,\"deployment_id\":\"0000000000000001\",\"entries\":[" ++
         "{\"path\":\"_static/x.html\",\"kind\":\"static\",\"content_type\":\"text/html\"," ++
         "\"hash\":\"" ++ ("c" ** 64) ++ "\"}]}";
     var m = try decode(testing.allocator, bytes);
@@ -848,15 +836,12 @@ test "v2: encode+decode round-trip with packages + app_imports" {
     try testing.expectEqualSlices(u8, &@as([root.HASH_HEX_LEN]u8, @splat('O')), &m.app_imports[0].pkg_hash_hex);
 }
 
-test "v2: a v1 manifest decodes to empty packages/app_imports" {
+test "v2: decode rejects v1 (no back-compat — complete redeploy)" {
     const bytes = "{\"v\":1,\"deployment_id\":\"0000000000000001\",\"entries\":[]}";
-    var m = try decode(testing.allocator, bytes);
-    defer m.deinit();
-    try testing.expectEqual(@as(usize, 0), m.packages.len);
-    try testing.expectEqual(@as(usize, 0), m.app_imports.len);
+    try testing.expectError(Error.InvalidManifest, decode(testing.allocator, bytes));
 }
 
-test "v2: package-less deploy stays v1 + dep_id unchanged (zero churn)" {
+test "v2: a package-less deploy has no packages/app_imports sections" {
     var entries = [_]root.FileStore.Entry{.{
         .path = @constCast("index.mjs"), .kind = .handler,
         .content_type = @constCast(""),
@@ -866,7 +851,7 @@ test "v2: package-less deploy stays v1 + dep_id unchanged (zero churn)" {
 
     const bytes = try encode(testing.allocator, id_no_pkg, &entries, &.{}, &.{});
     defer testing.allocator.free(bytes);
-    try testing.expect(std.mem.indexOf(u8, bytes, "\"v\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, bytes, "\"v\":2") != null);
     try testing.expect(std.mem.indexOf(u8, bytes, "packages") == null);
     try testing.expect(std.mem.indexOf(u8, bytes, "app_imports") == null);
 
