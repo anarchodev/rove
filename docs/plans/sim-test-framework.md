@@ -471,8 +471,14 @@ too. Fixtures `testdata/{authsurface,middleware}`.
   (`crypto.verifyRsa` / `crypto.verifyEcdsa`, pure-JS BigInt) are all in — the
   common OIDC signature algs (HS256/RS256/ES256) all verify offline. Remaining:
   **RS384/512 + ES384/512** (need native sha384/512, and P-384/521 curves for the
-  EC ones); `platform.*` reads hit the one closed-world kv (no per-instance store
-  isolation) and `auth.checkRootToken` assumes root — first-pass.
+  EC ones). `platform.*` per-store kv isolation is now DONE: `platform.scope(id).kv`
+  and `platform.root` get isolated stores (each namespaces its keys under
+  `__rove_store/{tag}/` in the one closed-world map — `storeKv` in `sim_globals`,
+  with the epilogue kv wrapper hiding those keys from tenant reads/scans), seeded
+  via `scenario({ instances: { <id>: { kv } }, root: { kv } })` and asserted with
+  `node.instanceKv(id, key)` / `node.rootKv(key)`; scoped writes carry a `store`
+  tag in the effect log. Fixture `testdata/platformkv/`. Still first-pass:
+  `auth.checkRootToken` assumes root.
 - ~~**Request-body UTF-8 gap.**~~ — FIXED. The sim reconstructed an inline request
   body as a *latin1 byte* string (`D.body.charCodeAt(i) & 0xff` in `epilogue.zig`),
   so a JSON body with multibyte UTF-8 (e.g. `"✓"` → byte `0x13`) corrupted

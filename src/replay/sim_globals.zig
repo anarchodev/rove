@@ -34,9 +34,10 @@
 // effect primitives (`http`/`after`/`blob`/`platform`) are RECORDERS: they push
 // the same `{kind:…}` shapes the epilogue's stubs do, into the per-run global
 // sink `__rove_effects` (base globals can't reach the epilogue's local array),
-// so the ordered effect log stays coherent. Platform reads hit the one
-// closed-world kv (no per-instance store isolation yet) and `checkRootToken`
-// assumes root — known first-pass limitations.
+// so the ordered effect log stays coherent. `platform.scope(id)` / `platform.root`
+// get ISOLATED kv stores (each namespaces under `__rove_store/{tag}/` in the one
+// map — see `storeKv` below), so cross-tenant/root writes never collide with the
+// tenant's own kv. `checkRootToken` still assumes root — a known first-pass limit.
 const SYSTEM_SHIM =
     \\;(function(){
     \\  var nat = globalThis.crypto;
@@ -164,6 +165,21 @@ const SYSTEM_SHIM =
     \\      return mod(mod(R[0] * zi % p * zi, p), n) === r;
     \\    } catch (_) { return false; }
     \\  };
+    \\  // Per-instance / root kv isolation for `platform.*`. Each store namespaces
+    \\  // its keys under `__rove_store/{tag}/` in the one closed-world map, so a
+    \\  // scoped or root write never collides with the tenant's own kv (or another
+    \\  // instance's). The facade pushes CLEAN store-tagged effect entries; the
+    \\  // epilogue kv wrapper skips recording and hides the namespaced keys, so a
+    \\  // tenant read / prefix scan never sees another store.
+    \\  var NS_STORE = "__rove_store/";
+    \\  var storeKv = function(P, tag){
+    \\    return {
+    \\      get: function(k){ var v = globalThis.kv.get(P + k); push({ kind: "read", store: tag, key: k, present: v !== undefined && v !== null }); return v; },
+    \\      set: function(k, val){ push({ kind: "write", store: tag, key: k, value: val }); return globalThis.kv.set(P + k, val); },
+    \\      delete: function(k){ push({ kind: "delete", store: tag, key: k }); return globalThis.kv.delete(P + k); },
+    \\      prefix: function(p, cursor, limit){ var r = globalThis.kv.prefix(P + (p || ""), cursor, limit); push({ kind: "read", op: "prefix", store: tag, key: (p || "") }); return (r || []).map(function(e){ return { key: e.key.slice(P.length), value: e.value }; }); },
+    \\    };
+    \\  };
     \\  globalThis._system = {
     \\    crypto: {
     \\      getRandomValues: function(a){ return nat.getRandomValues(a); },
@@ -200,8 +216,10 @@ const SYSTEM_SHIM =
     \\      write: function(c){ var t = b2s(c); push({ kind: "stream", bytes: t.length, data: t }); },
     \\    },
     \\    platform: {
-    \\      scope: function(id){ push({ kind: "platform", op: "scope", id: id }); return { kv: { get: function(k){ return globalThis.kv.get(k); }, set: function(k,v){ globalThis.kv.set(k,v); }, delete: function(k){ globalThis.kv.delete(k); }, prefix: function(p,o){ return globalThis.kv.prefix(p,o); } } }; },
-    \\      root: { get: function(k){ return globalThis.kv.get(k); }, set: function(k,v){ globalThis.kv.set(k,v); }, delete: function(k){ globalThis.kv.delete(k); }, prefix: function(p,o){ return globalThis.kv.prefix(p,o); } },
+    \\      // scope(id).kv → instance `id`'s isolated store; `blob` is a bare object
+    \\      // the real platform.js augments (receive/get). root → the __root__ store.
+    \\      scope: function(id){ push({ kind: "platform", op: "scope", id: id }); return { kv: storeKv(NS_STORE + "i/" + id + "/", "i/" + id), blob: {} }; },
+    \\      root: storeKv(NS_STORE + "r/", "r"),
     \\      instances: { create: function(spec){ push({ kind: "platform", op: "instances.create", spec: spec }); return (spec && spec.id) || "inst_sim"; }, deployStarter: function(){ push({ kind: "platform", op: "instances.deployStarter" }); } },
     \\      releases: { publish: function(){ push({ kind: "platform", op: "releases.publish" }); } },
     \\      auth: { checkRootToken: function(){ push({ kind: "platform", op: "auth.checkRootToken" }); return true; } },

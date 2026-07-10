@@ -105,8 +105,14 @@ function subsetMatch(obj, subset) {
 function foldKv(base, effects) {
   const kvOut = Object.assign({}, base || {});
   for (const e of effects || []) {
-    if (e.kind === "write") kvOut[e.key] = e.value;
-    else if (e.kind === "delete") delete kvOut[e.key];
+    if (e.kind !== "write" && e.kind !== "delete") continue;
+    // A store-tagged write/delete (platform.scope(id) / platform.root) folds into
+    // that store's namespaced slot, so it never collides with the tenant's own
+    // kv or another instance's — the same `__rove_store/{tag}/` layout the sim
+    // base + host use at runtime.
+    const slot = e.store ? ("__rove_store/" + e.store + "/" + e.key) : e.key;
+    if (e.kind === "write") kvOut[slot] = e.value;
+    else delete kvOut[slot];
   }
   return kvOut;
 }
@@ -202,14 +208,25 @@ class Scenario {
     this.sourceDir = cfg.sourceDir || null;
     this.inlineSources = cfg.sources || null; // { "index.mjs": "…source…" }
     this.baseKv = cfg.kv || {};
+    // Per-instance / root store seeds (read by platform.scope(id).kv /
+    // platform.root). Seeded into the closed-world map under the same
+    // `__rove_store/{tag}/` layout the base facades + host use at runtime.
+    this.instances = cfg.instances || {}; // { "<id>": { kv: {…} } }
+    this.rootKv = (cfg.root && cfg.root.kv) || {};
     this.now = toMs(cfg.now);
     this.seed = cfg.seed || 0;
     this.entry = cfg.entry || "index.mjs";
   }
 
   _base(partial) {
+    const kv = Object.assign({}, this.baseKv);
+    for (const id of Object.keys(this.instances)) {
+      const ikv = (this.instances[id] && this.instances[id].kv) || {};
+      for (const k of Object.keys(ikv)) kv["__rove_store/i/" + id + "/" + k] = ikv[k];
+    }
+    for (const k of Object.keys(this.rootKv)) kv["__rove_store/r/" + k] = this.rootKv[k];
     const w = Object.assign(
-      { entry: this.entry, seed: this.seed, now_ms: this.now, kv: this.baseKv },
+      { entry: this.entry, seed: this.seed, now_ms: this.now, kv },
       partial,
     );
     if (this.sourceDir) w.source_dir = this.sourceDir;
@@ -377,6 +394,23 @@ class Node {
   kv(key) {
     const eff = foldKv(this.world.kv, this.force().effects);
     return key in eff ? tryParse(eff[key]) : null;
+  }
+
+  /** Post-state of another instance's isolated store (`platform.scope(id).kv`) —
+   *  seeds via `scenario({ instances: { <id>: { kv } } })`, folded writes and
+   *  all. Absent keys read `null`, like `kv()`. */
+  instanceKv(id, key) {
+    const eff = foldKv(this.world.kv, this.force().effects);
+    const slot = "__rove_store/i/" + id + "/" + key;
+    return slot in eff ? tryParse(eff[slot]) : null;
+  }
+
+  /** Post-state of the platform root store (`platform.root`) — seeds via
+   *  `scenario({ root: { kv } })`. Absent keys read `null`. */
+  rootKv(key) {
+    const eff = foldKv(this.world.kv, this.force().effects);
+    const slot = "__rove_store/r/" + key;
+    return slot in eff ? tryParse(eff[slot]) : null;
   }
 
   // ── held-connection resume folds ──
@@ -732,7 +766,9 @@ class Matcher {
   toHaveWritten(key, subset) {
     const node = this._node("toHaveWritten");
     if (!node) return false;
-    const writes = node.effects.filter((e) => e.kind === "write" && e.key === key);
+    // Tenant store only — a `platform.scope(id)` / `platform.root` write carries
+    // a `store` tag and is asserted with `instanceKv(id, …)` / `rootKv(…)`.
+    const writes = node.effects.filter((e) => e.kind === "write" && e.key === key && !e.store);
     const pass = writes.some((w) => subsetMatch(tryParse(w.value), subset));
     return this._record(`toHaveWritten ${fmt(key)}`, pass, {
       subset: subset === undefined ? null : subset,

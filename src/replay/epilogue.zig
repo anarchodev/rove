@@ -338,13 +338,20 @@ const EPILOGUE_BODY =
     \\  // Wrap the native kv so reads/writes interleave with the cmds above in true
     \\  // occurrence order. Restored before the OUTPUT_KEY write (which stays native).
     \\  const __kvNative = globalThis.kv;
+    \\  // `platform.scope(id)` / `platform.root` (sim_globals) namespace their keys
+    \\  // under `__rove_store/` for per-store isolation and push their OWN clean
+    \\  // store-tagged effect entries, so the wrapper neither records nor surfaces
+    \\  // those namespaced keys — a tenant read / prefix scan must never see them.
+    \\  const __NS = "__rove_store/";
     \\  globalThis.kv = {
-    \\    get(k) { const v = __kvNative.get(k); __effects.push({ kind: "read", key: k, present: v !== undefined && v !== null }); return v; },
-    \\    set(k, val) { __effects.push({ kind: "write", key: k, value: val }); return __kvNative.set(k, val); },
-    \\    delete(k) { __effects.push({ kind: "delete", key: k }); return __kvNative.delete(k); },
+    \\    get(k) { const v = __kvNative.get(k); if (!k.startsWith(__NS)) __effects.push({ kind: "read", key: k, present: v !== undefined && v !== null }); return v; },
+    \\    set(k, val) { if (!k.startsWith(__NS)) __effects.push({ kind: "write", key: k, value: val }); return __kvNative.set(k, val); },
+    \\    delete(k) { if (!k.startsWith(__NS)) __effects.push({ kind: "delete", key: k }); return __kvNative.delete(k); },
     \\    // Adapter: the worker's kv.prefix is positional; the replay
-    \\    // NATIVE takes (prefix, {cursor, limit}) — convert here.
-    \\    prefix(p, cursor, limit) { const r = __kvNative.prefix(p, { cursor, limit }); __effects.push({ kind: "read", op: "prefix", key: p, present: true }); return r; },
+    \\    // NATIVE takes (prefix, {cursor, limit}) — convert here. A scan under the
+    \\    // store namespace (a facade call) returns raw for the facade to strip;
+    \\    // any other scan filters the namespaced keys out.
+    \\    prefix(p, cursor, limit) { const r = __kvNative.prefix(p, { cursor, limit }); if (p.startsWith(__NS)) return r; __effects.push({ kind: "read", op: "prefix", key: p, present: true }); return (r || []).filter((e) => !e.key.startsWith(__NS)); },
     \\  };
     \\  if (typeof request.tag !== "function") request.tag = function () { return request; };
     \\  globalThis.request = request;
